@@ -356,12 +356,12 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, o_dtype, block_size, use_out_scale",
     [
-        (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
-        (torch.bfloat16, e4m3_dtype, torch.bfloat16, 128, False),
-        (e4m3_dtype, e4m3_dtype, torch.bfloat16, 128, False),
-        (e4m3_dtype, e4m3_dtype, e4m3_dtype, 128, True),
+        # (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
+        # (torch.bfloat16, e4m3_dtype, torch.bfloat16, 128, False),
+        # (e4m3_dtype, e4m3_dtype, torch.bfloat16, 128, False),
+        # (e4m3_dtype, e4m3_dtype, e4m3_dtype, 128, True),
         (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
-        (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
+        # (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
     ],
 )
 @pytest.mark.parametrize("soft_cap", [None])

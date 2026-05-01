@@ -8,6 +8,7 @@ import triton.experimental.gluon.language as gl
 from aiter.ops.triton.utils.types import e4m3_dtype
 from triton.language.core import _aggregate as aggregate
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+import math
 
 float8_info = torch.finfo(e4m3_dtype)
 
@@ -37,7 +38,7 @@ class MLAConfig:
     QK_WMMA_LAYOUT: gl.constexpr
     PV_WMMA_LAYOUT: gl.constexpr
     QK_WMMA_UNPACKED_LAYOUT: gl.constexpr
-    PV_WMMA_UNPACKED_LAYOUT: gl.constexpr
+    PV_WMMA_LAYOUT: gl.constexpr
 
     # Dot operand layouts
     Q_DOT_LAYOUT: gl.constexpr
@@ -48,6 +49,8 @@ class MLAConfig:
     Q_ROPE_SCALES_DOT_LAYOUT: gl.constexpr
     KV_LORA_SCALES_DOT_LAYOUT: gl.constexpr
     K_ROPE_SCALES_DOT_LAYOUT: gl.constexpr
+    KV_LORA_DOT_PACKED_LAYOUT: gl.constexpr
+    KV_LORA_SCALES_DOT_BROADCAST_LAYOUT: gl.constexpr
 
     # Layout for loading Q
     Q_LORA_LOAD_LAYOUT: gl.constexpr
@@ -77,6 +80,8 @@ class MLAConfig:
     SCALE_K_WIDTH_ROPE: gl.constexpr
     ALL_DECODE: gl.constexpr
     BLOCK_SCALES_SIZE: gl.constexpr
+
+    HEAD_SIZE_SPLIT: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -131,6 +136,7 @@ class MLAConfig:
         self.QK_SCALE = gl.constexpr(SCALE * self.RCP_LN2)
         self.USE_LOAD_BUFFER_OP = gl.constexpr(USE_LOAD_BUFFER_OP)
         self.USE_STORE_BUFFER_OP = gl.constexpr(USE_STORE_BUFFER_OP)
+        self.HEAD_SIZE_SPLIT = gl.constexpr(2)
 
         assert WARP_SIZE == 32
 
@@ -149,6 +155,24 @@ class MLAConfig:
             warp_bases_qk = [(1, 0), (2, 0), (4, 0)]
             warp_bases_pv = [(0, 1), (0, 2), (0, 4)]
 
+        """
+            A16W16:
+                QK -> BF16 WMMA
+                PV -> BF16 WMMA (downcast P)
+            A16W8:
+                QK -> BF16 WMMA (upcast K)
+                PV -> BF16 WMMA (downcast P, upcast V)
+            A8W8:
+                QK -> FP8 WMMA
+                PV -> FP8 WMMA (downcast P)
+            A8W4:
+                QK -> FP8-FP4 scaled WMMA (Q scales with all 1.0 in e8m0)
+                PV -> BF16 WMMA (downcast P, unpack and upcast V and multiply with V_scales)
+            A4W4:
+                QK -> FP4-FP4 scaled WMMA 
+                PV -> BF16 WMMA (downcast P, unpack and upcast V and multiply with V_scales)
+        """
+
         assert (
             self.QUERY_DTYPE == "bf16"
             or self.QUERY_DTYPE == "fp8"
@@ -156,15 +180,18 @@ class MLAConfig:
         )
 
         if self.QUERY_DTYPE == "bf16":
+            # A16W16 / A16W8
             assert self.KV_CACHE_DTYPE == "bf16" or self.KV_CACHE_DTYPE == "fp8"
             instr_width_qk = 32
             instr_width_pv = 32
         elif self.QUERY_DTYPE == "fp8":
             assert self.KV_CACHE_DTYPE == "fp8" or self.KV_CACHE_DTYPE == "nvfp4"
             if self.KV_CACHE_DTYPE == "fp8":
+                # A8W8
                 instr_width_qk = 64
                 instr_width_pv = 64
             else:
+                # A8W4
                 instr_width_qk = 128 // 2  # packed
                 instr_width_pv = 32
         else:
@@ -173,8 +200,13 @@ class MLAConfig:
             instr_width_qk = 128 // 2  # packed
             instr_width_pv = 32
 
-        if self.KV_CACHE_DTYPE == "nvfp4":
+        if self.KV_CACHE_DTYPE == "bf16":
+            assert K_WIDTH == 8
+        elif self.KV_CACHE_DTYPE == "fp8":
+            assert K_WIDTH == 16
+        else:
             assert SHUFFLED_KV_CACHE
+            assert K_WIDTH == 16
 
         self.QK_WMMA_LAYOUT = gl.constexpr(
             gl.amd.AMDWMMALayout(
@@ -208,10 +240,8 @@ class MLAConfig:
                     instr_shape=[16, 16, 128],
                 )
             )
-            self.PV_WMMA_UNPACKED_LAYOUT = self.PV_WMMA_LAYOUT
         else:
             self.QK_WMMA_UNPACKED_LAYOUT = self.QK_WMMA_LAYOUT
-            self.PV_WMMA_UNPACKED_LAYOUT = self.PV_WMMA_LAYOUT
 
         self.Q_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
@@ -232,15 +262,23 @@ class MLAConfig:
         self.P_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
                 operand_index=0,
-                parent=self.PV_WMMA_UNPACKED_LAYOUT,
-                k_width=self.K_WIDTH,
+                parent=self.PV_WMMA_LAYOUT,
+                k_width=(
+                    self.K_WIDTH
+                    if self.KV_CACHE_DTYPE != "nvfp4"
+                    else (self.K_WIDTH * 2)
+                ),
             )
         )
         self.V_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
                 operand_index=1,
-                parent=self.PV_WMMA_UNPACKED_LAYOUT,
-                k_width=self.K_WIDTH,
+                parent=self.PV_WMMA_LAYOUT,
+                k_width=(
+                    self.K_WIDTH
+                    if self.KV_CACHE_DTYPE != "nvfp4"
+                    else (self.K_WIDTH * 2)
+                ),
             )
         )
 
@@ -276,11 +314,59 @@ class MLAConfig:
                     scale_factor=16,
                 )
             )
+
+            self.KV_LORA_DOT_PACKED_LAYOUT = gl.constexpr(
+                gl.DotOperandLayout(
+                    operand_index=1,
+                    parent=(
+                        gl.amd.AMDWMMALayout(
+                            version=3,
+                            transposed=True,
+                            warp_bases=warp_bases_pv,
+                            reg_bases=[],
+                            instr_shape=[16, 16, 64],
+                        )
+                    ),
+                    k_width=self.K_WIDTH,
+                )
+            )
+
+            # BLOCK_SIZE == 128 and quantization block size == 16 is asserted, hence hardcoded the first and the last dimension of V_SCALES_DOT_BROADCAST_LAYOUT
+            log2_num_head_broadcast_chunk = int(
+                math.log2((self.KV_LORA_RANK // self.HEAD_SIZE_SPLIT) // 16)
+            )
+            log2_num_warps = int(math.log2(NUM_WARPS))
+            self.KV_LORA_SCALES_DOT_BROADCAST_LAYOUT = gl.constexpr(
+                gl.DistributedLinearLayout(
+                    reg_bases=[
+                        [1, 0, 0],
+                        [2, 0, 0],
+                        [4, 0, 0],
+                        [8, 0, 0],
+                        [16, 0, 0],
+                        [64, 0, 0],
+                    ]
+                    + [
+                        [0, 2**v, 0]
+                        for v in range(log2_num_warps, log2_num_head_broadcast_chunk)
+                    ],
+                    lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [32, 0, 0]],
+                    warp_bases=[[0, 2**v, 0] for v in range(log2_num_warps)],
+                    block_bases=[],
+                    shape=[
+                        self.BLOCK_SIZE,
+                        (self.KV_LORA_RANK // self.HEAD_SIZE_SPLIT) // 16,
+                        16,
+                    ],
+                )
+            )
         else:
             self.Q_LORA_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.Q_ROPE_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.KV_LORA_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.K_ROPE_SCALES_DOT_LAYOUT = gl.constexpr(None)
+            self.KV_LORA_DOT_PACKED_LAYOUT = gl.constexpr(None)
+            self.KV_LORA_SCALES_DOT_BROADCAST_LAYOUT = gl.constexpr(None)
 
         assert NUM_BLOCKS_GATHER_PER_TILE == 1
 
@@ -730,12 +816,25 @@ class MLAProgram:
             dtype=gl.float32,
             layout=gl.SliceLayout(1, self.cfg.QK_WMMA_UNPACKED_LAYOUT),
         )
-        acc = gl.zeros(
-            [self.cfg.BLOCK_M, self.cfg.KV_LORA_RANK],
-            dtype=gl.float32,
-            layout=self.cfg.PV_WMMA_UNPACKED_LAYOUT,
-        )
-        return L, M, acc
+        if self.cfg.KV_CACHE_DTYPE == "nvfp4":
+            acc0 = gl.zeros(
+                [self.cfg.BLOCK_M, self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT],
+                dtype=tl.float32,
+                layout=self.cfg.PV_WMMA_LAYOUT,
+            )
+            acc1 = gl.zeros(
+                [self.cfg.BLOCK_M, self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT],
+                dtype=tl.float32,
+                layout=self.cfg.PV_WMMA_LAYOUT,
+            )
+            return L, M, acc0, acc1
+        else:
+            acc = gl.zeros(
+                [self.cfg.BLOCK_M, self.cfg.KV_LORA_RANK],
+                dtype=gl.float32,
+                layout=self.cfg.PV_WMMA_LAYOUT,
+            )
+            return L, M, acc
 
     @gluon.jit
     def load_physical_block_idx_with_mod(
@@ -1014,6 +1113,15 @@ class MLAProgram:
         return p, L, acc_0
 
     @gluon.jit
+    def softmax_part1_split_head(self, p, L, acc0, acc1, alpha):
+        l_ij = gl.sum(p, 1)
+        alpha_ = gl.convert_layout(alpha[:, None], layout=self.cfg.PV_WMMA_LAYOUT)
+        acc0 = acc0 * alpha_
+        acc1 = acc1 * alpha_
+        L = L * alpha + l_ij
+        return p, L, acc0, acc1
+
+    @gluon.jit
     def compute_pkv_lora_trans(self, p, kv_lora_trans, kv_lora_scales, acc):
         if self.cfg.KV_CACHE_DTYPE == "nvfp4":
             # A8W4 / A4W4
@@ -1059,39 +1167,93 @@ class MLAProgram:
         return acc
 
     @gluon.jit
-    def store_output_3D(self, acc_0, M, L, segm_idx):
-        offs_q_d_lora_pv = gl.arange(
-            0,
-            self.cfg.KV_LORA_RANK,
-            layout=gl.SliceLayout(0, self.cfg.PV_WMMA_UNPACKED_LAYOUT),
+    def tdm_shared_load_and_compute_pv_lora_trans_split_head(
+        self, p, acc0, acc1, wait_count, buffer_id, scales_dtype
+    ):
+        gl.amd.gfx1250.tdm.async_wait(wait_count)
+        v_scales_dummy = gl.full(
+            (self.cfg.BLOCK_SIZE, self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT),
+            127,
+            dtype=tl.uint8,
+            layout=self.cfg.V_DOT_LAYOUT,
         )
+        p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
+        p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
+        for static_idx in gl.static_range(self.cfg.HEAD_SIZE_SPLIT):
+            v = gl.amd.gfx1250.local_load_packed_transposed(
+                self.kv_lora_shared.index(buffer_id)
+                .reshape(
+                    (
+                        1,
+                        self.cfg.BLOCK_SIZE // 16,
+                        (self.cfg.KV_LORA_RANK // 2) // (2 * 16),
+                        2,
+                        16,
+                        16,
+                    )
+                )
+                .permute((0, 1, 4, 2, 3, 5))
+                .reshape((self.cfg.BLOCK_SIZE, self.cfg.KV_LORA_RANK // 2))
+                .slice(
+                    static_idx
+                    * (self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT // 2),
+                    (self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT // 2),
+                    1,
+                ),
+                self.cfg.KV_LORA_DOT_PACKED_LAYOUT,
+            )
 
-        segm_output_offset = (
-            self.query_offset_0_pv[:, None]
-            * (
-                self.cfg.NUM_QUERY_HEADS
-                * self.cfg.NUM_SEGMENTS_PER_SEQ
-                * self.cfg.KV_LORA_RANK
-            )
-            + self.query_offset_1_pv[:, None]
-            * (self.cfg.NUM_SEGMENTS_PER_SEQ * self.cfg.KV_LORA_RANK)
-            + segm_idx * self.cfg.KV_LORA_RANK
-            + offs_q_d_lora_pv[None, :]
-        )
-        if self.cfg.USE_STORE_BUFFER_OP:
-            gl.amd.cdna4.buffer_store(
-                stored_value=acc_0.to(self.output_ptr.type.element_ty),
-                ptr=self.output_ptr,
-                offsets=segm_output_offset,
-                mask=self.query_mask_0_pv[:, None] & self.query_mask_1_pv[:, None],
-            )
-        else:
-            gl.store(
-                self.output_ptr + segm_output_offset.to(gl.int64),
-                acc_0.to(self.output_ptr.type.element_ty),
-                mask=self.query_mask_0_pv[:, None] & self.query_mask_1_pv[:, None],
+            v_scales = (
+                (
+                    self.kv_lora_scales_shared.index(buffer_id)
+                    .reshape(
+                        (
+                            1,
+                            self.cfg.BLOCK_SIZE // 128,
+                            (self.cfg.KV_LORA_RANK // 16)
+                            // self.cfg.SCALE_K_WIDTH_LORA,
+                            128 // 4,
+                            4,
+                            self.cfg.SCALE_K_WIDTH_LORA,
+                        )
+                    )
+                    .permute((0, 1, 4, 3, 2, 5))
+                    .reshape((self.cfg.BLOCK_SIZE, self.cfg.KV_LORA_RANK // 16, 1))
+                    .slice(
+                        static_idx
+                        * (self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT // 16),
+                        (self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT // 16),
+                        1,
+                    )
+                )
+                .load(layout=self.cfg.KV_LORA_SCALES_DOT_BROADCAST_LAYOUT)
+                .to(scales_dtype, bitcast=True)
             )
 
+            v = gl.amd.gfx1250.scaled_upcast(v, v_scales_dummy, gl.bfloat16, axis=0)
+            v = v.reshape(
+                (
+                    self.cfg.BLOCK_SIZE,
+                    self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT // 16,
+                    16,
+                )
+            )
+
+            v = v * v_scales
+            v = v.reshape(
+                (self.cfg.BLOCK_SIZE, self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT)
+            )
+            v = v.to(gl.bfloat16)
+            v = gl.convert_layout(v, self.cfg.V_DOT_LAYOUT, assert_trivial=True)
+
+            if static_idx == 0:
+                acc0 = gl.amd.gfx1250.wmma(p, v, acc0)
+            else:
+                acc1 = gl.amd.gfx1250.wmma(p, v, acc1)
+        return acc0, acc1
+
+    @gluon.jit
+    def store_L_M(self, L, M, segm_idx):
         segm_offset = (
             self.query_offset_0_qk
             * (self.cfg.NUM_QUERY_HEADS * self.cfg.NUM_SEGMENTS_PER_SEQ)
@@ -1129,6 +1291,101 @@ class MLAProgram:
                 L,
                 mask=self.query_mask_0_qk & self.query_mask_1_qk,
             )
+
+    @gluon.jit
+    def store_output_3D(self, acc, M, L, segm_idx):
+        offs_q_d_lora_pv = gl.arange(
+            0,
+            self.cfg.KV_LORA_RANK,
+            layout=gl.SliceLayout(0, self.cfg.PV_WMMA_LAYOUT),
+        )
+        mask = self.query_mask_0_pv[:, None] & self.query_mask_1_pv[:, None]
+
+        segm_output_offset = (
+            self.query_offset_0_pv[:, None]
+            * (
+                self.cfg.NUM_QUERY_HEADS
+                * self.cfg.NUM_SEGMENTS_PER_SEQ
+                * self.cfg.KV_LORA_RANK
+            )
+            + self.query_offset_1_pv[:, None]
+            * (self.cfg.NUM_SEGMENTS_PER_SEQ * self.cfg.KV_LORA_RANK)
+            + segm_idx * self.cfg.KV_LORA_RANK
+            + offs_q_d_lora_pv[None, :]
+        )
+        if self.cfg.USE_STORE_BUFFER_OP:
+            gl.amd.cdna4.buffer_store(
+                stored_value=acc.to(self.output_ptr.type.element_ty),
+                ptr=self.output_ptr,
+                offsets=segm_output_offset,
+                mask=mask,
+            )
+        else:
+            gl.store(
+                self.output_ptr + segm_output_offset.to(gl.int64),
+                acc.to(self.output_ptr.type.element_ty),
+                mask=mask,
+            )
+
+        self.store_L_M(L, M, segm_idx)
+
+    @gluon.jit
+    def store_output_3D_split_head(self, acc0, acc1, M, L, segm_idx):
+        offs_q_d_lora_pv = gl.arange(
+            0,
+            self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT,
+            layout=gl.SliceLayout(0, self.cfg.PV_WMMA_LAYOUT),
+        )
+        mask = self.query_mask_0_pv[:, None] & self.query_mask_1_pv[:, None]
+
+        segm_output_offset = (
+            self.query_offset_0_pv[:, None]
+            * (
+                self.cfg.NUM_QUERY_HEADS
+                * self.cfg.NUM_SEGMENTS_PER_SEQ
+                * self.cfg.KV_LORA_RANK
+            )
+            + self.query_offset_1_pv[:, None]
+            * (self.cfg.NUM_SEGMENTS_PER_SEQ * self.cfg.KV_LORA_RANK)
+            + segm_idx * self.cfg.KV_LORA_RANK
+        )
+        if self.cfg.USE_STORE_BUFFER_OP:
+            gl.amd.cdna4.buffer_store(
+                stored_value=acc0.to(self.output_ptr.dtype.element_ty),
+                ptr=self.output_ptr,
+                offsets=segm_output_offset + offs_q_d_lora_pv[None, :],
+                mask=mask,
+            )
+            gl.amd.cdna4.buffer_store(
+                stored_value=acc1.to(self.output_ptr.dtype.element_ty),
+                ptr=self.output_ptr,
+                offsets=segm_output_offset
+                + (
+                    offs_q_d_lora_pv + self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT
+                )[None, :],
+                mask=mask,
+            )
+        else:
+            gl.store(
+                self.output_ptr
+                + (segm_output_offset + offs_q_d_lora_pv[None, :]).to(gl.int64),
+                acc0.to(self.output_ptr.dtype.element_ty),
+                mask=mask,
+            )
+            gl.store(
+                self.output_ptr
+                + (
+                    segm_output_offset
+                    + (
+                        offs_q_d_lora_pv
+                        + self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT
+                    )[None, :]
+                ).to(gl.int64),
+                acc1.to(self.output_ptr.dtype.element_ty),
+                mask=mask,
+            )
+
+        self.store_L_M(L, M, segm_idx)
 
     @gluon.jit
     def store_output(
@@ -1518,16 +1775,16 @@ def _mla_decode_fwd_kernel(
     # query_mask_qk = query_mask_1_qk[:, None] & query_mask_0_qk[:, None]
 
     query_offset_0_pv = gl.convert_layout(
-        query_offset_0_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_UNPACKED_LAYOUT)
+        query_offset_0_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
     )
     query_offset_1_pv = gl.convert_layout(
-        query_offset_1_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_UNPACKED_LAYOUT)
+        query_offset_1_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
     )
     query_mask_0_pv = gl.convert_layout(
-        query_mask_0_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_UNPACKED_LAYOUT)
+        query_mask_0_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
     )
     query_mask_1_pv = gl.convert_layout(
-        query_mask_1_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_UNPACKED_LAYOUT)
+        query_mask_1_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
     )
 
     # compute the length of the longest sequence prefix spanned by any
@@ -1571,7 +1828,10 @@ def _mla_decode_fwd_kernel(
         stride_kv_buffer_3,
     )
 
-    L, M, acc = pgm.allocate_accumulator()
+    if KV_CACHE_DTYPE == "nvfp4":
+        L, M, acc0, acc1 = pgm.allocate_accumulator()
+    else:
+        L, M, acc = pgm.allocate_accumulator()
 
     j_hbm_start: gl.int32 = segm_idx * tiles_per_segment
     max_num_tiles_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
@@ -1625,21 +1885,32 @@ def _mla_decode_fwd_kernel(
         S = S * qk_factor
 
         p, alpha, M = pgm.softmax_part0(S, M)
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+        if KV_CACHE_DTYPE == "nvfp4":
+            p, L, acc0, acc1 = pgm.softmax_part1_split_head(p, L, acc0, acc1, alpha)
+        else:
+            p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
 
         if KV_CACHE_DTYPE == "nvfp4":
-            p0, p1 = p.reshape((BLOCK_M, 2, TILE_SIZE // 2)).permute((0, 2, 1)).split()
-            kv_lora_scales0, kv_lora_scales1 = (
-                kv_lora_scales.reshape(
-                    (2, TILE_SIZE // 2, cfg.KV_LORA_RANK // cfg.BLOCK_SCALES_SIZE)
-                )
-                .permute((1, 2, 0))
-                .split()
+            # p0, p1 = p.reshape((BLOCK_M, 2, TILE_SIZE // 2)).permute((0, 2, 1)).split()
+            # kv_lora_scales0, kv_lora_scales1 = (
+            #     kv_lora_scales.reshape(
+            #         (2, TILE_SIZE // 2, cfg.KV_LORA_RANK // cfg.BLOCK_SCALES_SIZE)
+            #     )
+            #     .permute((1, 2, 0))
+            #     .split()
+            # )
+            # kv_lora_trans0 = pgm.tdm_shared_load_kv_lora_trans_slice(4, buffer_id, 0)
+            # acc = pgm.compute_pkv_lora_trans(p0, kv_lora_trans0, kv_lora_scales0, acc)
+            # kv_lora_trans1 = pgm.tdm_shared_load_kv_lora_trans_slice(4, buffer_id, 1)
+            # acc = pgm.compute_pkv_lora_trans(p1, kv_lora_trans1, kv_lora_scales1, acc)
+            acc0, acc1 = pgm.tdm_shared_load_and_compute_pv_lora_trans_split_head(
+                p,
+                acc0,
+                acc1,
+                wait_count=4,
+                buffer_id=buffer_id,
+                scales_dtype=e4m3_dtype,
             )
-            kv_lora_trans0 = pgm.tdm_shared_load_kv_lora_trans_slice(4, buffer_id, 0)
-            acc = pgm.compute_pkv_lora_trans(p0, kv_lora_trans0, kv_lora_scales0, acc)
-            kv_lora_trans1 = pgm.tdm_shared_load_kv_lora_trans_slice(4, buffer_id, 1)
-            acc = pgm.compute_pkv_lora_trans(p1, kv_lora_trans1, kv_lora_scales1, acc)
         else:
             kv_lora_trans = pgm.tdm_shared_load_kv_lora_trans(2, buffer_id)
             acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
@@ -1675,34 +1946,53 @@ def _mla_decode_fwd_kernel(
     seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
     S = gl.where(seq_mask, S, float("-inf"))
     p, alpha, M = pgm.softmax_part0(S, M)
-    p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+    if KV_CACHE_DTYPE == "nvfp4":
+        p, L, acc0, acc1 = pgm.softmax_part1_split_head(p, L, acc0, acc1, alpha)
+    else:
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
 
     if KV_CACHE_DTYPE == "nvfp4":
-        p0, p1 = p.reshape((BLOCK_M, 2, TILE_SIZE // 2)).permute((0, 2, 1)).split()
-        kv_lora_scales0, kv_lora_scales1 = (
-            kv_lora_scales.reshape(
-                (2, TILE_SIZE // 2, cfg.KV_LORA_RANK // cfg.BLOCK_SCALES_SIZE)
-            )
-            .permute((1, 2, 0))
-            .split()
+        # p0, p1 = p.reshape((BLOCK_M, 2, TILE_SIZE // 2)).permute((0, 2, 1)).split()
+        # kv_lora_scales0, kv_lora_scales1 = (
+        #     kv_lora_scales.reshape(
+        #         (2, TILE_SIZE // 2, cfg.KV_LORA_RANK // cfg.BLOCK_SCALES_SIZE)
+        #     )
+        #     .permute((1, 2, 0))
+        #     .split()
+        # )
+        # kv_lora_trans0 = pgm.tdm_shared_load_kv_lora_trans_slice(0, buffer_id, 0)
+        # acc = pgm.compute_pkv_lora_trans(p0, kv_lora_trans0, kv_lora_scales0, acc)
+        # kv_lora_trans1 = pgm.tdm_shared_load_kv_lora_trans_slice(0, buffer_id, 1)
+        # acc = pgm.compute_pkv_lora_trans(p1, kv_lora_trans1, kv_lora_scales1, acc)
+        acc0, acc1 = pgm.tdm_shared_load_and_compute_pv_lora_trans_split_head(
+            p, acc0, acc1, wait_count=0, buffer_id=buffer_id, scales_dtype=e4m3_dtype
         )
-        kv_lora_trans0 = pgm.tdm_shared_load_kv_lora_trans_slice(0, buffer_id, 0)
-        acc = pgm.compute_pkv_lora_trans(p0, kv_lora_trans0, kv_lora_scales0, acc)
-        kv_lora_trans1 = pgm.tdm_shared_load_kv_lora_trans_slice(0, buffer_id, 1)
-        acc = pgm.compute_pkv_lora_trans(p1, kv_lora_trans1, kv_lora_scales1, acc)
     else:
         kv_lora_trans = pgm.tdm_shared_load_kv_lora_trans(0, buffer_id)
         acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
 
     if kv_scale_ptr is not None:
-        acc = acc * kv_scale
+        if KV_CACHE_DTYPE == "nvfp4":
+            acc0 = acc0 * kv_scale
+            acc1 = acc1 * kv_scale
+        else:
+            acc = acc * kv_scale
 
-    pgm.store_output_3D(
-        acc,
-        M,
-        L,
-        segm_idx,
-    )
+    if KV_CACHE_DTYPE == "nvfp4":
+        pgm.store_output_3D_split_head(
+            acc0,
+            acc1,
+            M,
+            L,
+            segm_idx,
+        )
+    else:
+        pgm.store_output_3D(
+            acc,
+            M,
+            L,
+            segm_idx,
+        )
 
 
 _mla_prefill_fwd_kernel_non_pipelined_repr = make_kernel_repr(

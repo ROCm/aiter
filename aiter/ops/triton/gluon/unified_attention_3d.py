@@ -99,6 +99,8 @@ class AttentionConfig:
     ALL_DECODE: gl.constexpr
     BLOCK_SCALES_SIZE: gl.constexpr
 
+    HEAD_SIZE_SPLIT: gl.constexpr
+
     @gluon.constexpr_function
     def __init__(
         self,
@@ -158,6 +160,9 @@ class AttentionConfig:
         self.USE_SINKS = gl.constexpr(USE_SINKS)
         self.USE_LOAD_BUFFER_OP = gl.constexpr(USE_LOAD_BUFFER_OP)
         self.USE_STORE_BUFFER_OP = gl.constexpr(USE_STORE_BUFFER_OP)
+        self.HEAD_SIZE_SPLIT = gl.constexpr(1)
+
+        assert WARP_SIZE == 32
 
         assert NUM_WARPS == 1 or NUM_WARPS == 2 or NUM_WARPS == 4
 
@@ -170,8 +175,6 @@ class AttentionConfig:
         elif NUM_WARPS == 4:
             warp_bases_qk = [(1, 0), (2, 0)]
             warp_bases_pv = [(0, 1), (0, 2)]
-
-        assert WARP_SIZE == 32
 
         """
             A16W16:
@@ -334,17 +337,19 @@ class AttentionConfig:
                         gl.amd.AMDWMMALayout(
                             version=3,
                             transposed=True,
-                            warp_bases=[],
+                            warp_bases=warp_bases_pv,
                             reg_bases=[],
                             instr_shape=[16, 16, 64],
                         )
                     ),
-                    k_width=16,
+                    k_width=self.K_WIDTH,
                 )
             )
 
             # BLOCK_SIZE == 128 and quantization block size == 16 is asserted, hence hardcoded the first and the last dimension of V_SCALES_DOT_BROADCAST_LAYOUT
-            log2_num_head_broadcast_chunk = int(math.log2(HEAD_SIZE // 16))
+            log2_num_head_broadcast_chunk = int(
+                math.log2((self.HEAD_SIZE // self.HEAD_SIZE_SPLIT) // 16)
+            )
             log2_num_warps = int(math.log2(NUM_WARPS))
             self.V_SCALES_DOT_BROADCAST_LAYOUT = gl.constexpr(
                 gl.DistributedLinearLayout(
@@ -363,7 +368,11 @@ class AttentionConfig:
                     lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [32, 0, 0]],
                     warp_bases=[[0, 2**v, 0] for v in range(log2_num_warps)],
                     block_bases=[],
-                    shape=[self.BLOCK_SIZE, self.HEAD_SIZE // 16, 16],
+                    shape=[
+                        self.BLOCK_SIZE,
+                        (self.HEAD_SIZE // self.HEAD_SIZE_SPLIT) // 16,
+                        16,
+                    ],
                 )
             )
         else:
@@ -975,7 +984,6 @@ class AttentionProgram:
         segm_idx,
         query_offset_1,
         query_mask_1,
-        # qk_factor,
     ):
         if self.cfg.USE_SINKS:
             if segm_idx == 0:
@@ -1010,13 +1018,25 @@ class AttentionProgram:
             dtype=tl.float32,
             layout=gl.SliceLayout(1, self.cfg.QK_WMMA_UNPACKED_LAYOUT),
         )
-        acc = gl.zeros(
-            [self.cfg.BLOCK_M, self.cfg.HEAD_SIZE],
-            dtype=tl.float32,
-            layout=self.cfg.PV_WMMA_LAYOUT,
-        )
-
-        return L, M, acc
+        if self.cfg.KV_CACHE_DTYPE == "nvfp4" and self.cfg.HEAD_SIZE_SPLIT == 2:
+            acc0 = gl.zeros(
+                [self.cfg.BLOCK_M, self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT],
+                dtype=tl.float32,
+                layout=self.cfg.PV_WMMA_LAYOUT,
+            )
+            acc1 = gl.zeros(
+                [self.cfg.BLOCK_M, self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT],
+                dtype=tl.float32,
+                layout=self.cfg.PV_WMMA_LAYOUT,
+            )
+            return L, M, acc0, acc1
+        else:
+            acc = gl.zeros(
+                [self.cfg.BLOCK_M, self.cfg.HEAD_SIZE],
+                dtype=tl.float32,
+                layout=self.cfg.PV_WMMA_LAYOUT,
+            )
+            return L, M, acc
 
     @gluon.jit
     def load_physical_block_idx_safe(
@@ -1456,6 +1476,15 @@ class AttentionProgram:
         return p, L, acc
 
     @gluon.jit
+    def softmax_part1_split_head(self, p, L, acc0, acc1, alpha):
+        l_ij = gl.sum(p, 1)
+        alpha_ = gl.convert_layout(alpha[:, None], layout=self.cfg.PV_WMMA_LAYOUT)
+        acc0 = acc0 * alpha_
+        acc1 = acc1 * alpha_
+        L = L * alpha + l_ij
+        return p, L, acc0, acc1
+
+    @gluon.jit
     def compute_pv(self, p, v, v_scales, acc):
         if self.cfg.KV_CACHE_DTYPE == "nvfp4":
             # A8W4 / A4W4
@@ -1487,45 +1516,91 @@ class AttentionProgram:
         return gl.amd.gfx1250.wmma(p, v, acc)
 
     @gluon.jit
-    def store_output_3D(self, acc, M, L, segm_idx):
-        # acc = gl.convert_layout(acc, layout=self.cfg.PV_WMMA_LAYOUT)
-        offs_q_d = gl.arange(
-            0,
-            self.cfg.HEAD_SIZE,
-            layout=gl.SliceLayout(0, self.cfg.PV_WMMA_LAYOUT),
+    def tdm_shared_load_and_compute_pv_split_head(
+        self, p, acc0, acc1, wait_count, buffer_id, scales_dtype
+    ):
+        gl.amd.gfx1250.tdm.async_wait(wait_count)
+        v_scales_dummy = gl.full(
+            (self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT),
+            127,
+            dtype=tl.uint8,
+            layout=self.cfg.V_DOT_LAYOUT,
         )
-        dim_mask = gl.full((1,), 1, dtype=tl.int1)
-
-        segm_output_offset = (
-            self.query_offset_0_pv[:, None]
-            * (
-                self.cfg.NUM_QUERY_HEADS
-                * self.cfg.NUM_SEGMENTS_PER_SEQ
-                * self.cfg.HEAD_SIZE
-            )
-            + self.query_offset_1_pv[:, None]
-            * (self.cfg.NUM_SEGMENTS_PER_SEQ * self.cfg.HEAD_SIZE)
-            + segm_idx * self.cfg.HEAD_SIZE
-            + offs_q_d[None, :]
-        )
-        if self.cfg.USE_STORE_BUFFER_OP:
-            gl.amd.cdna4.buffer_store(
-                stored_value=acc.to(self.output_ptr.dtype.element_ty),
-                ptr=self.output_ptr,
-                offsets=segm_output_offset,
-                mask=dim_mask[None, :]
-                & self.query_mask_0_pv[:, None]
-                & self.query_mask_1_pv[:, None],
-            )
-        else:
-            gl.store(
-                self.output_ptr + segm_output_offset.to(gl.int64),
-                acc.to(self.output_ptr.dtype.element_ty),
-                mask=dim_mask[None, :]
-                & self.query_mask_0_pv[:, None]
-                & self.query_mask_1_pv[:, None],
+        p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
+        p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
+        for static_idx in gl.static_range(self.cfg.HEAD_SIZE_SPLIT):
+            v = gl.amd.gfx1250.local_load_packed_transposed(
+                self.v_shared.index(buffer_id)
+                .reshape(
+                    (
+                        1,
+                        self.cfg.BLOCK_SIZE // 16,
+                        (self.cfg.HEAD_SIZE // 2) // (2 * 16),
+                        2,
+                        16,
+                        16,
+                    )
+                )
+                .permute((0, 1, 4, 2, 3, 5))
+                .reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // 2))
+                .slice(
+                    static_idx * (self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT // 2),
+                    (self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT // 2),
+                    1,
+                ),
+                self.cfg.V_DOT_PACKED_LAYOUT,
             )
 
+            v_scales = (
+                (
+                    self.v_scales_shared.index(buffer_id)
+                    .reshape(
+                        (
+                            1,
+                            self.cfg.BLOCK_SIZE // 128,
+                            (self.cfg.HEAD_SIZE // 16) // self.cfg.SCALE_K_WIDTH,
+                            128 // 4,
+                            4,
+                            self.cfg.SCALE_K_WIDTH,
+                        )
+                    )
+                    .permute((0, 1, 4, 3, 2, 5))
+                    .reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // 16, 1))
+                    .slice(
+                        static_idx
+                        * (self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT // 16),
+                        (self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT // 16),
+                        1,
+                    )
+                )
+                .load(layout=self.cfg.V_SCALES_DOT_BROADCAST_LAYOUT)
+                .to(scales_dtype, bitcast=True)
+            )
+
+            v = gl.amd.gfx1250.scaled_upcast(v, v_scales_dummy, gl.bfloat16, axis=0)
+            v = v.reshape(
+                (
+                    self.cfg.BLOCK_SIZE,
+                    self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT // 16,
+                    16,
+                )
+            )
+
+            v = v * v_scales
+            v = v.reshape(
+                (self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT)
+            )
+            v = v.to(gl.bfloat16)
+            v = gl.convert_layout(v, self.cfg.V_DOT_LAYOUT, assert_trivial=True)
+
+            if static_idx == 0:
+                acc0 = gl.amd.gfx1250.wmma(p, v, acc0)
+            else:
+                acc1 = gl.amd.gfx1250.wmma(p, v, acc1)
+        return acc0, acc1
+
+    @gluon.jit
+    def store_L_M(self, L, M, segm_idx):
         if self.cfg.NUM_SEGMENTS_PER_SEQ > 1:
             segm_offset = (
                 self.query_offset_0_qk
@@ -1564,6 +1639,101 @@ class AttentionProgram:
                     L,
                     mask=self.query_mask_0_qk & self.query_mask_1_qk,
                 )
+
+    @gluon.jit
+    def store_output_3D(self, acc, M, L, segm_idx):
+        offs_q_d = gl.arange(
+            0,
+            self.cfg.HEAD_SIZE,
+            layout=gl.SliceLayout(0, self.cfg.PV_WMMA_LAYOUT),
+        )
+        mask = self.query_mask_0_pv[:, None] & self.query_mask_1_pv[:, None]
+
+        segm_output_offset = (
+            self.query_offset_0_pv[:, None]
+            * (
+                self.cfg.NUM_QUERY_HEADS
+                * self.cfg.NUM_SEGMENTS_PER_SEQ
+                * self.cfg.HEAD_SIZE
+            )
+            + self.query_offset_1_pv[:, None]
+            * (self.cfg.NUM_SEGMENTS_PER_SEQ * self.cfg.HEAD_SIZE)
+            + segm_idx * self.cfg.HEAD_SIZE
+            + offs_q_d[None, :]
+        )
+        if self.cfg.USE_STORE_BUFFER_OP:
+            gl.amd.cdna4.buffer_store(
+                stored_value=acc.to(self.output_ptr.dtype.element_ty),
+                ptr=self.output_ptr,
+                offsets=segm_output_offset,
+                mask=mask,
+            )
+        else:
+            gl.store(
+                self.output_ptr + segm_output_offset.to(gl.int64),
+                acc.to(self.output_ptr.dtype.element_ty),
+                mask=mask,
+            )
+
+        self.store_L_M(L, M, segm_idx)
+
+    @gluon.jit
+    def store_output_3D_split_head(self, acc0, acc1, M, L, segm_idx):
+        offs_q_d = gl.arange(
+            0,
+            self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT,
+            layout=gl.SliceLayout(0, self.cfg.PV_WMMA_LAYOUT),
+        )
+        dim_mask = gl.full((1,), 1, dtype=tl.int1)
+        mask = (
+            dim_mask[None, :]
+            & self.query_mask_0_pv[:, None]
+            & self.query_mask_1_pv[:, None]
+        )
+        segm_output_offset = (
+            self.query_offset_0_pv[:, None]
+            * (
+                self.cfg.NUM_QUERY_HEADS
+                * self.cfg.NUM_SEGMENTS_PER_SEQ
+                * self.cfg.HEAD_SIZE
+            )
+            + self.query_offset_1_pv[:, None]
+            * (self.cfg.NUM_SEGMENTS_PER_SEQ * self.cfg.HEAD_SIZE)
+            + segm_idx * self.cfg.HEAD_SIZE
+        )
+        if self.cfg.USE_STORE_BUFFER_OP:
+            gl.amd.cdna4.buffer_store(
+                stored_value=acc0.to(self.output_ptr.dtype.element_ty),
+                ptr=self.output_ptr,
+                offsets=segm_output_offset + offs_q_d[None, :],
+                mask=mask,
+            )
+            gl.amd.cdna4.buffer_store(
+                stored_value=acc1.to(self.output_ptr.dtype.element_ty),
+                ptr=self.output_ptr,
+                offsets=segm_output_offset
+                + (offs_q_d + self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT)[None, :],
+                mask=mask,
+            )
+        else:
+            gl.store(
+                self.output_ptr + (segm_output_offset + offs_q_d[None, :]).to(gl.int64),
+                acc0.to(self.output_ptr.dtype.element_ty),
+                mask=mask,
+            )
+            gl.store(
+                self.output_ptr
+                + (
+                    segm_output_offset
+                    + (offs_q_d + self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT)[
+                        None, :
+                    ]
+                ).to(gl.int64),
+                acc1.to(self.output_ptr.dtype.element_ty),
+                mask=mask,
+            )
+
+        self.store_L_M(L, M, segm_idx)
 
     @gluon.jit
     def store_output(
@@ -2084,12 +2254,20 @@ def _unified_attention_gluon_kernel_3d(
     if cfg.USE_QQ_BIAS:
         qq_bias_row_ptrs = qq_bias_ptr + query_pos_qk[:, None] * qq_bias_stride_0
 
-    L, M, acc = pgm.allocate_accumulator(
-        sink_ptr,
-        segm_idx,
-        query_offset_1_qk,
-        query_mask_1_qk,
-    )
+    if KV_CACHE_DTYPE == "nvfp4" and cfg.HEAD_SIZE_SPLIT == 2:
+        L, M, acc0, acc1 = pgm.allocate_accumulator(
+            sink_ptr,
+            segm_idx,
+            query_offset_1_qk,
+            query_mask_1_qk,
+        )
+    else:
+        L, M, acc = pgm.allocate_accumulator(
+            sink_ptr,
+            segm_idx,
+            query_offset_1_qk,
+            query_mask_1_qk,
+        )
 
     j_hbm_start: gl.int32 = pgm.tile_start
     max_num_tiles_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
@@ -2143,17 +2321,31 @@ def _unified_attention_gluon_kernel_3d(
             )
 
         p, alpha, M = pgm.softmax_part0(S, M)
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+        if KV_CACHE_DTYPE == "nvfp4" and cfg.HEAD_SIZE_SPLIT == 2:
+            p, L, acc0, acc1 = pgm.softmax_part1_split_head(p, L, acc0, acc1, alpha)
+        else:
+            p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
 
         if KV_CACHE_DTYPE == "nvfp4":
-            v = pgm.tdm_shared_load_v(wait_count=5, buffer_id=buffer_id)
-            v_scales = pgm.tdm_shared_load_v_scales(
-                wait_count=4, buffer_id=buffer_id
-            ).to(e4m3_dtype, bitcast=True)
+            if cfg.HEAD_SIZE_SPLIT == 2:
+                acc0, acc1 = pgm.tdm_shared_load_and_compute_pv_split_head(
+                    p,
+                    acc0,
+                    acc1,
+                    wait_count=4,
+                    buffer_id=buffer_id,
+                    scales_dtype=e4m3_dtype,
+                )
+            else:
+                v = pgm.tdm_shared_load_v(wait_count=5, buffer_id=buffer_id)
+                v_scales = pgm.tdm_shared_load_v_scales(
+                    wait_count=4, buffer_id=buffer_id
+                ).to(e4m3_dtype, bitcast=True)
+                acc = pgm.compute_pv(p, v, v_scales, acc)
         else:
             v = pgm.tdm_shared_load_v(wait_count=2, buffer_id=buffer_id)
             v_scales = None
-        acc = pgm.compute_pv(p, v, v_scales, acc)
+            acc = pgm.compute_pv(p, v, v_scales, acc)
 
         buffer_id = next_buffer_id
         if need_addtional_mask:
@@ -2182,29 +2374,62 @@ def _unified_attention_gluon_kernel_3d(
         S = pgm.apply_addtional_mask_qk(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
 
     p, alpha, M = pgm.softmax_part0(S, M)
-    p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+    if KV_CACHE_DTYPE == "nvfp4" and cfg.HEAD_SIZE_SPLIT == 2:
+        p, L, acc0, acc1 = pgm.softmax_part1_split_head(p, L, acc0, acc1, alpha)
+    else:
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
 
     if KV_CACHE_DTYPE == "nvfp4":
-        v = pgm.tdm_shared_load_v(wait_count=1, buffer_id=buffer_id)
-        v_scales = pgm.tdm_shared_load_v_scales(wait_count=0, buffer_id=buffer_id).to(
-            e4m3_dtype, bitcast=True
-        )
+        if cfg.HEAD_SIZE_SPLIT == 2:
+            acc0, acc1 = pgm.tdm_shared_load_and_compute_pv_split_head(
+                p,
+                acc0,
+                acc1,
+                wait_count=0,
+                buffer_id=buffer_id,
+                scales_dtype=e4m3_dtype,
+            )
+        else:
+            v = pgm.tdm_shared_load_v(wait_count=1, buffer_id=buffer_id)
+            v_scales = pgm.tdm_shared_load_v_scales(
+                wait_count=0, buffer_id=buffer_id
+            ).to(e4m3_dtype, bitcast=True)
+            acc = pgm.compute_pv(p, v, v_scales, acc)
     else:
         v = pgm.tdm_shared_load_v(wait_count=0, buffer_id=buffer_id)
         v_scales = None
-    acc = pgm.compute_pv(p, v, v_scales, acc)
+        acc = pgm.compute_pv(p, v, v_scales, acc)
     # M = M * qk_factor
 
-    acc = acc * out_factor
     if cfg.NUM_SEGMENTS_PER_SEQ == 1:
         one_over_L = 1.0 / L[:, None]
-        acc = acc * gl.convert_layout(one_over_L, layout=cfg.PV_WMMA_LAYOUT)
-    if out_scale_ptr is not None:
-        acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+        one_over_L = gl.convert_layout(one_over_L, layout=cfg.PV_WMMA_LAYOUT)
+    if KV_CACHE_DTYPE == "nvfp4" and cfg.HEAD_SIZE_SPLIT == 2:
+        acc0 = acc0 * out_factor
+        acc1 = acc1 * out_factor
+        if cfg.NUM_SEGMENTS_PER_SEQ == 1:
+            acc0 = acc0 * one_over_L
+            acc1 = acc1 * one_over_L
+        if out_scale_ptr is not None:
+            acc0 = tl.clamp(acc0, FP8_MIN, FP8_MAX)
+            acc1 = tl.clamp(acc1, FP8_MIN, FP8_MAX)
+        pgm.store_output_3D_split_head(
+            acc0,
+            acc1,
+            M,
+            L,
+            segm_idx,
+        )
+    else:
+        acc = acc * out_factor
+        if cfg.NUM_SEGMENTS_PER_SEQ == 1:
+            acc = acc * one_over_L
+        if out_scale_ptr is not None:
+            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
-    pgm.store_output_3D(
-        acc,
-        M,
-        L,
-        segm_idx,
-    )
+        pgm.store_output_3D(
+            acc,
+            M,
+            L,
+            segm_idx,
+        )

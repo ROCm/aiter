@@ -83,6 +83,10 @@ def select_3d_config(
                     num_segments = 1
                 else:
                     num_segments = 2
+            if kv_dtype == torch.uint8:
+                assert (
+                    block_size == 128
+                ), "Only block_size == 128 is supported for FP4 KV cache"
         else:
             attn_warps = 2
             waves_per_eu = 1
@@ -286,6 +290,8 @@ def mla_decode_fwd(
     else:
         KV_CACHE_DTYPE = "bf16"
 
+    SCALE_K_WIDTH_LORA = 0
+    SCALE_K_WIDTH_ROPE = 0
     if shuffled_kv_cache:
         SCALE_K_WIDTH_LORA = 4
         SCALE_K_WIDTH_ROPE = 4
@@ -306,8 +312,10 @@ def mla_decode_fwd(
             )
         else:
             num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
+            K_WIDTH = 16 if kv_buffer_dtype == e4m3_dtype else 8
     else:
         num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
+        K_WIDTH = 16 if kv_buffer_dtype == e4m3_dtype else 8
 
     num_seqs = len(seqused_k)
     num_tokens_per_seq = total_num_tokens // num_seqs

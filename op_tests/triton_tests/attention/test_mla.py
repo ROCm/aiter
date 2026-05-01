@@ -255,7 +255,7 @@ def torch_mla_extend(
 # @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("decode_qlen", [1])
-@pytest.mark.parametrize("ctx_lens", [1328])
+@pytest.mark.parametrize("ctx_lens", [8192])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("num_blocks", [128])
@@ -344,7 +344,6 @@ def test_mla_decode_fwd(
         query = query.to(q_dtype)
         maybe_quant_query = query
 
-    # .to(q_dtype)
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
     q_descale = None
