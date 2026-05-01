@@ -831,8 +831,6 @@ namespace py = pybind11;
           py::arg("softmax_scale"),                      \
           py::arg("is_causal"),                          \
           py::arg("return_lse"),                         \
-          py::arg("i_perm") = 2,                         \
-          py::arg("o_perm") = 0,                         \
           py::arg("sink")   = std::nullopt,              \
           py::arg("out")    = std::nullopt);
 

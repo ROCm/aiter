@@ -3,11 +3,11 @@
 //
 // ASM FMHA forward (BF16, gfx1250 / MI4xx) — ported from poc_kl/mi400/fmha_fwd_f16.
 //
-// Layout convention (i_perm / o_perm):
-//   0 = bshd  [batch, seq,  head, dim]
-//   1 = bhsd  [batch, head, seq,  dim]sm_
-//   2 = sbhd  [seq,   batch,head, dim]   ← default input  (i_perm=2)
-//                                         ← default output (o_perm=0 → bshd)
+// Layout: q/k/v expected in **bshd shape** ([batch, seq, head, dim]).  The
+// kernel reads per-dim strides directly from the input tensor, so callers may
+// pass a non-contiguous bshd-shaped view backed by sbhd / bhsd memory and the
+// kernel will follow the strides correctly.  Only `tensor.stride(-1) == 1`
+// (last-dim contiguous) is required, matching flash_attn_func semantics.
 //
 // sink convention (AITER / CK-Tile post-scale):
 //   The user passes sink in the same domain as Q*K^T * softmax_scale (post-scale).
@@ -70,11 +70,14 @@ struct __attribute__((packed)) KernelArgs
 
 // ---- helpers ---------------------------------------------------------------
 
+// Kernel selection: only (dtype, hdim_q, hdim_v, mask) — we always use the
+// _brd (border) kernel variants which are a strict superset (handle aligned
+// + unaligned q_seq_len/kv_seq_len uniformly).  The csv schema therefore has
+// no `border` column.
 static std::string get_heuristic_kernel_fmha_fwd_f16(const std::string& dtype,
                                                      int hdim_q,
                                                      int hdim_v,
                                                      int mask_flag,
-                                                     int border_flag,
                                                      const std::string& arch_id,
                                                      CFG* cfgs)
 {
@@ -86,75 +89,25 @@ static std::string get_heuristic_kernel_fmha_fwd_f16(const std::string& dtype,
         if (cfg.hdim_q  != hdim_q)      continue;
         if (cfg.hdim_v  != hdim_v)      continue;
         if (cfg.mask    != mask_flag)   continue;
-        if (cfg.border  != border_flag) continue;
         return el.first;
     }
     TORCH_CHECK(false,
                 "fmha_fwd_f16_asm: no kernel for dtype=", dtype,
                 " hdim_q=", hdim_q, " hdim_v=", hdim_v,
-                " mask=", mask_flag, " border=", border_flag,
+                " mask=", mask_flag,
                 " arch=", arch_id);
     return "";
 }
 
-// Extract logical dimensions from tensor shape given the perm code.
-// perm: 0=bshd [b,s,h,d], 1=bhsd [b,h,s,d], 2=sbhd [s,b,h,d]
-static void dims_from_perm(const at::Tensor& t, int perm,
-                           int& batch, int& heads, int& seqlen, int& dim)
-{
-    switch (perm) {
-    case 0:  // bshd
-        batch = t.size(0); seqlen = t.size(1); heads = t.size(2); dim = t.size(3);
-        break;
-    case 1:  // bhsd
-        batch = t.size(0); heads  = t.size(1); seqlen = t.size(2); dim = t.size(3);
-        break;
-    default: // sbhd
-        seqlen = t.size(0); batch = t.size(1); heads = t.size(2); dim = t.size(3);
-        break;
-    }
-}
-
-// Stride (in bytes) of tensor t along its [batch, head, seq] logical dimensions
-// given perm (the physical dimension ordering stored in t.shape).
-static void strides_from_perm(const at::Tensor& t, int perm, int elem_size,
-                               int& s_batch, int& s_head, int& s_seq)
-{
-    switch (perm) {
-    case 0:  // bshd: dim0=b, dim1=s, dim2=h, dim3=d
-        s_batch = (int)t.stride(0) * elem_size;
-        s_seq   = (int)t.stride(1) * elem_size;
-        s_head  = (int)t.stride(2) * elem_size;
-        break;
-    case 1:  // bhsd: dim0=b, dim1=h, dim2=s, dim3=d
-        s_batch = (int)t.stride(0) * elem_size;
-        s_head  = (int)t.stride(1) * elem_size;
-        s_seq   = (int)t.stride(2) * elem_size;
-        break;
-    default: // sbhd: dim0=s, dim1=b, dim2=h, dim3=d
-        s_seq   = (int)t.stride(0) * elem_size;
-        s_batch = (int)t.stride(1) * elem_size;
-        s_head  = (int)t.stride(2) * elem_size;
-        break;
-    }
-}
-
-// Build the expected shape vector for a tensor given logical dims and perm.
-static std::vector<int64_t> shape_from_perm(int perm,
-                                            int batch, int heads,
-                                            int seqlen, int dim)
-{
-    switch (perm) {
-    case 0: return {batch, seqlen, heads, dim};   // bshd
-    case 1: return {batch, heads,  seqlen, dim};  // bhsd
-    default:return {seqlen, batch, heads, dim};   // sbhd
-    }
-}
-
 // ---- main entry ------------------------------------------------------------
 
-// q/k/v layouts are determined by i_perm (default sbhd=2).
-// Output layout is determined by o_perm (default bshd=0).
+// API contract: q/k/v have **bshd shape**, i.e. q.shape = [batch, seq_q, hq, d],
+// k/v.shape = [batch, seq_k, hk, d].  The kernel reads strides directly from
+// `tensor.stride(...)`, so the underlying memory layout is whatever the user
+// arranged — they may pass a non-contiguous bshd-shaped view of an sbhd / bhsd
+// allocation, and the kernel will follow strides correctly.  Only `stride(-1)
+// == 1` (last dim contiguous) is required, matching flash_attn_func.
+//
 // sink: optional [q_head_num] fp32 tensor in AITER post-scale convention.
 //       Internally converted to pre-scale: sink_raw = sink_user * sqrt(qk_head_dim).
 std::vector<at::Tensor> fmha_fwd_f16(at::Tensor&                      q,
@@ -163,40 +116,35 @@ std::vector<at::Tensor> fmha_fwd_f16(at::Tensor&                      q,
                                      float                            softmax_scale,
                                      bool                             is_causal,
                                      bool                             return_lse,
-                                     int                              i_perm,
-                                     int                              o_perm,
                                      std::optional<at::Tensor>        sink_,
                                      std::optional<at::Tensor>        out_)
 {
     // ---- basic validation --------------------------------------------------
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
-                "fmha_fwd_f16_asm: q/k/v must be 4-D tensors");
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
-                "fmha_fwd_f16_asm: q/k/v must be contiguous "
-                "(physical layout must match i_perm=", i_perm, ")");
-    TORCH_CHECK(i_perm >= 0 && i_perm <= 2, "i_perm must be 0, 1, or 2");
-    TORCH_CHECK(o_perm >= 0 && o_perm <= 2, "o_perm must be 0, 1, or 2");
+                "fmha_fwd_f16_asm: q/k/v must be 4-D tensors (bshd shape)");
+    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1,
+                "fmha_fwd_f16_asm: q/k/v must have contiguous last dim");
     TORCH_CHECK(q.scalar_type() == at::kBFloat16,
                 "fmha_fwd_f16_asm: only bf16 is supported");
     TORCH_CHECK(k.scalar_type() == at::kBFloat16 && v.scalar_type() == at::kBFloat16,
                 "fmha_fwd_f16_asm: k/v must also be bf16");
 
-    // ---- dimension extraction ----------------------------------------------
-    int batch, q_head_num, q_seq_len, qk_head_dim;
-    dims_from_perm(q, i_perm, batch, q_head_num, q_seq_len, qk_head_dim);
+    // ---- dimension extraction (bshd) ---------------------------------------
+    const int batch        = (int)q.size(0);
+    const int q_seq_len    = (int)q.size(1);
+    const int q_head_num   = (int)q.size(2);
+    const int qk_head_dim  = (int)q.size(3);
 
-    int kv_batch, kv_head_num, kv_seq_len, kv_head_dim_check;
-    dims_from_perm(k, i_perm, kv_batch, kv_head_num, kv_seq_len, kv_head_dim_check);
+    const int kv_seq_len   = (int)k.size(1);
+    const int kv_head_num  = (int)k.size(2);
+    const int v_head_dim   = (int)v.size(3);
 
-    int v_batch, v_heads_check, v_seq_check, v_head_dim;
-    dims_from_perm(v, i_perm, v_batch, v_heads_check, v_seq_check, v_head_dim);
-
-    TORCH_CHECK(kv_batch == batch,           "k batch mismatch");
-    TORCH_CHECK(v_batch  == batch,           "v batch mismatch");
-    TORCH_CHECK(kv_head_dim_check == qk_head_dim, "k head_dim mismatch");
-    TORCH_CHECK(v_heads_check == kv_head_num,     "v head_num mismatch with k");
-    TORCH_CHECK(v_seq_check   == kv_seq_len,      "v seq_len mismatch with k");
-    TORCH_CHECK(q_head_num % kv_head_num == 0,    "q_head_num must be a multiple of kv_head_num");
+    TORCH_CHECK((int)k.size(0) == batch,        "k batch mismatch");
+    TORCH_CHECK((int)v.size(0) == batch,        "v batch mismatch");
+    TORCH_CHECK((int)k.size(3) == qk_head_dim,  "k head_dim mismatch");
+    TORCH_CHECK((int)v.size(1) == kv_seq_len,   "v seq_len mismatch with k");
+    TORCH_CHECK((int)v.size(2) == kv_head_num,  "v head_num mismatch with k");
+    TORCH_CHECK(q_head_num % kv_head_num == 0,  "q_head_num must be a multiple of kv_head_num");
     TORCH_CHECK(qk_head_dim == 64 || qk_head_dim == 128,
                 "fmha_fwd_f16_asm: only head_dim 64 or 128 supported, got ", qk_head_dim);
     TORCH_CHECK(v_head_dim == qk_head_dim,
@@ -205,41 +153,47 @@ std::vector<at::Tensor> fmha_fwd_f16(at::Tensor&                      q,
     const int gqa       = q_head_num / kv_head_num;
     const int mask_flag = is_causal ? 1 : 0;
 
-    // ---- stride extraction (in bytes) from tensor's actual strides --------
+    // ---- stride extraction (in bytes), bshd dim layout --------------------
+    // bshd: dim0=b, dim1=s, dim2=h, dim3=d
     const int elem_size = q.element_size();  // 2 for bf16
 
-    int stride_q_batch, stride_q_head, stride_q_seq;
-    strides_from_perm(q, i_perm, elem_size, stride_q_batch, stride_q_head, stride_q_seq);
+    const int stride_q_batch = (int)q.stride(0) * elem_size;
+    const int stride_q_seq   = (int)q.stride(1) * elem_size;
+    const int stride_q_head  = (int)q.stride(2) * elem_size;
 
-    int stride_k_batch, stride_k_head, stride_k_seq;
-    strides_from_perm(k, i_perm, elem_size, stride_k_batch, stride_k_head, stride_k_seq);
+    const int stride_k_batch = (int)k.stride(0) * elem_size;
+    const int stride_k_seq   = (int)k.stride(1) * elem_size;
+    const int stride_k_head  = (int)k.stride(2) * elem_size;
 
-    int stride_v_batch, stride_v_head, stride_v_seq;
-    strides_from_perm(v, i_perm, elem_size, stride_v_batch, stride_v_head, stride_v_seq);
+    const int stride_v_batch = (int)v.stride(0) * elem_size;
+    const int stride_v_seq   = (int)v.stride(1) * elem_size;
+    const int stride_v_head  = (int)v.stride(2) * elem_size;
 
     const int sub_Q        = 128;  // ts_qo: Q-tile size used by all kernels
     const int stride_q_tg  = sub_Q * stride_q_seq;
     const int stride_lse_head = q_seq_len * (int)sizeof(float);  // fixed layout
 
-    // ---- output allocation -------------------------------------------------
+    // ---- output allocation (bshd) -----------------------------------------
     at::Tensor out;
     if (out_.has_value())
     {
         out = out_.value();
-        auto expected = shape_from_perm(o_perm, batch, q_head_num, q_seq_len, v_head_dim);
-        TORCH_CHECK(out.sizes() == at::IntArrayRef(expected),
-                    "fmha_fwd_f16_asm: pre-allocated out shape mismatch");
-        TORCH_CHECK(out.is_contiguous() && out.scalar_type() == q.scalar_type(),
-                    "fmha_fwd_f16_asm: out must be contiguous bf16");
+        TORCH_CHECK(out.dim() == 4 &&
+                    (int)out.size(0) == batch    && (int)out.size(1) == q_seq_len &&
+                    (int)out.size(2) == q_head_num && (int)out.size(3) == v_head_dim,
+                    "fmha_fwd_f16_asm: pre-allocated out shape must be "
+                    "[batch, q_seq_len, q_head_num, v_head_dim]");
+        TORCH_CHECK(out.stride(-1) == 1 && out.scalar_type() == q.scalar_type(),
+                    "fmha_fwd_f16_asm: out must have contiguous last dim and same dtype as q");
     }
     else
     {
-        auto shape = shape_from_perm(o_perm, batch, q_head_num, q_seq_len, v_head_dim);
-        out = at::empty(at::IntArrayRef(shape), q.options());
+        out = at::empty({batch, q_seq_len, q_head_num, v_head_dim}, q.options());
     }
 
-    int stride_o_batch, stride_o_head, stride_o_seq;
-    strides_from_perm(out, o_perm, elem_size, stride_o_batch, stride_o_head, stride_o_seq);
+    const int stride_o_batch = (int)out.stride(0) * elem_size;
+    const int stride_o_seq   = (int)out.stride(1) * elem_size;
+    const int stride_o_head  = (int)out.stride(2) * elem_size;
 
     // ---- LSE allocation (fixed layout [batch, q_head_num, q_seq_len] fp32) -
     // Always allocate even when not returned: the kernel may access ptr_LSE.
@@ -325,18 +279,16 @@ std::vector<at::Tensor> fmha_fwd_f16(at::Tensor&                      q,
     size_t arg_size = sizeof(args);
 
     // ---- kernel selection --------------------------------------------------
-    // border_flag: automatically detected from seq-len alignment.
-    //   q_seq_len must be a multiple of sub_Q (128) and
-    //   kv_seq_len a multiple of 256 for the non-border variants.
-    const int border_flag = ((q_seq_len % 128) != 0 || (kv_seq_len % 256) != 0) ? 1 : 0;
-
+    // Always use the _brd (border) kernel variant: it handles both aligned
+    // and unaligned q_seq_len/kv_seq_len uniformly (border path is a no-op
+    // when sequences are aligned), so there's no runtime branch on alignment.
     const std::string dtype   = "bf16";
     const std::string arch_id = get_gpu_arch();
     CFG* cfg_map              = &cfg_fmha_fwd_f16;
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     const std::string kernel_key = get_heuristic_kernel_fmha_fwd_f16(
-        dtype, qk_head_dim, v_head_dim, mask_flag, border_flag, arch_id, cfg_map);
+        dtype, qk_head_dim, v_head_dim, mask_flag, arch_id, cfg_map);
     auto it = cfg_map->find(kernel_key);
     TORCH_CHECK(it != cfg_map->end(),
                 "fmha_fwd_f16_asm: kernel not found in CFG: ", kernel_key);

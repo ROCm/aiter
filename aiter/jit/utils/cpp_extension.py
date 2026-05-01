@@ -91,7 +91,33 @@ def get_hip_version():
         output = subprocess.check_output([hipconfig, "--version"], text=True)
         return output
     except Exception:
-        raise RuntimeError("ROCm version file not found")
+        pass
+    # Fallback: try /opt/rocm/bin/hipconfig directly
+    rocm_hipconfig = "/opt/rocm/bin/hipconfig"
+    if os.path.isfile(rocm_hipconfig):
+        try:
+            output = subprocess.check_output([rocm_hipconfig, "--version"], text=True)
+            return output
+        except Exception:
+            pass
+    # Fallback: read HIP version from header file
+    for ver_path in [
+        "/opt/rocm/include/hip/hip_version.h",
+        "/opt/rocm/.info/version",
+    ]:
+        if os.path.isfile(ver_path):
+            with open(ver_path) as f:
+                content = f.read()
+            if "HIP_VERSION_MAJOR" in content:
+                import re
+                major = re.search(r"HIP_VERSION_MAJOR\s+(\d+)", content)
+                minor = re.search(r"HIP_VERSION_MINOR\s+(\d+)", content)
+                patch = re.search(r"HIP_VERSION_PATCH\s+(\d+)", content)
+                if major and minor and patch:
+                    return f"{major.group(1)}.{minor.group(1)}.{patch.group(1)}"
+            else:
+                return content.strip()
+    raise RuntimeError("ROCm version file not found")
 
 
 def _find_rocm_home() -> Optional[str]:

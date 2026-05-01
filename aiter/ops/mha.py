@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 from torch import Generator, Tensor
@@ -14,7 +14,6 @@ from ..jit.utils.mha_recipes import (
     get_mha_varlen_prebuild_variants_by_names,
 )
 from ..utility import dtypes
-
 
 def cmdGenFunc_mha_fwd(
     q: Tensor,
@@ -268,6 +267,57 @@ def fmha_v3_fwd(
     v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+
+
+# ---------------------------------------------------------------------------
+# fmha_fwd_f16 (BF16 ASM, gfx1250) — single-shot batched FMHA forward.
+#
+# API contract: q/k/v are **bshd shape** ([batch, seq, head, dim]); strides are
+# read directly from the tensor so non-contiguous bshd-shaped views (e.g. of
+# sbhd / bhsd allocations) are accepted.  Only `tensor.stride(-1) == 1` is
+# required.  The .cu host driver multiplies softmax_scale by sqrt(head_dim)
+# before kernel launch (kernel uses pre-scale convention).
+# ---------------------------------------------------------------------------
+def gen_fmha_fwd_f16_asm_fake_tensors(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    softmax_scale: float,
+    is_causal: bool,
+    return_lse: bool,
+    sink: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+) -> List[Tensor]:
+    batch, q_seq_len, q_head_num, _ = q.shape
+    d_v = v.size(3)
+    fake_out = (
+        out if out is not None
+        else torch.empty((batch, q_seq_len, q_head_num, d_v),
+                         dtype=q.dtype, device=q.device)
+    )
+    if return_lse:
+        fake_lse = torch.empty(
+            (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
+        )
+        return [fake_out, fake_lse]
+    return [fake_out]
+
+
+@compile_ops(
+    "module_fmha_fwd_f16_asm",
+    fc_name="fmha_fwd_f16_asm",
+    gen_fake=gen_fmha_fwd_f16_asm_fake_tensors,
+)
+def fmha_fwd_f16_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    softmax_scale: float,
+    is_causal: bool,
+    return_lse: bool,
+    sink: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+) -> List[Tensor]: ...
 
 
 def cmdGenFunc_mha_varlen_fwd(
@@ -1326,6 +1376,26 @@ def _flash_attn_forward(
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         return ret
 
+    def can_impl_fmha_fwd_f16():
+        # gfx1250 ASM bf16 forward (fmha_fwd_f16_asm).  Single-shot batched
+        # (no varlen / dropout / swa / quant / alibi / bias).  Sink logits
+        # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
+        ret = (get_gfx() == "gfx1250")
+        ret = ret and (q.dtype == dtypes.bf16)
+        ret = ret and (hdim_q in (64, 128))
+        ret = ret and (hdim_v == hdim_q)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (not swa)
+        ret = ret and (sink_size == 0)
+        ret = ret and (alibi_slopes is None and bias is None)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
+        # D128 kernel ignores sink; if user passed sink_ptr, fall back to CK
+        # (which honors it) so semantics are preserved.
+        ret = ret and (sink_ptr is None or hdim_q == 64)
+        return ret
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
     # Validate newly added optional cumulative length / padded arrays if provided.
@@ -1340,7 +1410,25 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_q", cu_seqlens_q)
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
-    if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
+    if can_impl_fmha_fwd_f16():
+        # gfx1250 ASM bf16 path: q/k/v are bshd; kernel reads strides directly,
+        # no API-side permute.  sink_ptr forwarded as-is (post-scale); the .cu
+        # multiplies by sqrt(qk_head_dim) before kernel launch.
+        sink_for_kernel = sink_ptr
+        if hdim_q == 64 and sink_for_kernel is None:
+            # D64 kernels always read SINK; auto-fill zero-logit so callers
+            # who don't care about sink still hit this fast path.
+            sink_for_kernel = torch.zeros(nhead_q, dtype=torch.float32, device=q.device)
+        _r = fmha_fwd_f16_asm(
+            q, k, v,
+            float(softmax_scale), bool(causal), True,
+            sink_for_kernel, out,
+        )
+        out_ = _r[0]
+        softmax_lse = _r[1]
+        S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    elif can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
         out_, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,
