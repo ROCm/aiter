@@ -13,7 +13,6 @@ import torch
 from torch import Tensor
 
 from aiter import logger
-from aiter.utility import dtypes
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.utils.chip_info import get_gfx
@@ -27,6 +26,13 @@ from .utils import get_shared_memory_per_block, is_flydsl_available
 __all__ = [
     "flydsl_hgemm",
 ]
+
+
+def _get_dtypes():
+    from aiter.utility import dtypes
+
+    return dtypes
+
 
 SPLIT_K_COUNTER_MAX_LEN = 128
 SPLIT_K_SIGNAL_STATE_COUNT = 3
@@ -965,6 +971,7 @@ def flydsl_preshuffle_gemm_a8(
     compile_fn = _get_compile_fn()
     if compile_fn is None:
         raise RuntimeError("[FlyDSL] compile function not available")
+    dtypes = _get_dtypes()
 
     m, k = XQ.shape[0], XQ.shape[-1]
     n = WQ.shape[0]

@@ -67,6 +67,16 @@ on:
         description: 'Use pytorch/manylinux2_28-builder ROCm image (AlmaLinux 8 + devtoolset, glibc 2.28). Produces wheels ABI-compatible with vLLM/Ubuntu 22 containers.'
         type: boolean
         default: false
+      torch_pin:
+        description: 'Optional torch version pin for the manylinux build (e.g. 2.10.0+rocm7.1). Empty = latest available for the detected ROCm flavor.'
+        type: string
+        required: false
+        default: ''
+      torch_index_url:
+        description: 'Optional override for the torch wheel index URL. Empty = auto-derive from the manylinux builder image tag (https://download.pytorch.org/whl/rocmX.Y).'
+        type: string
+        required: false
+        default: ''
   workflow_call:
     inputs:
       release_type:
@@ -111,6 +121,16 @@ on:
         type: boolean
         required: false
         default: false
+      torch_pin:
+        description: 'Optional torch version pin for the manylinux build (e.g. 2.10.0+rocm7.1). Empty = latest.'
+        type: string
+        required: false
+        default: ''
+      torch_index_url:
+        description: 'Optional torch index URL override. Empty = auto-derive from builder image tag.'
+        type: string
+        required: false
+        default: ''
     outputs:
       wheel_names:
         description: 'Space-separated list of built wheel filenames'
@@ -145,6 +165,8 @@ jobs:
       RELEASE_TYPE: ${{ inputs.release_type || github.event.inputs.release_type }}
       ADD_DATE_STAMP: ${{ inputs.add_date_stamp || github.event.inputs.add_date_stamp }}
       USE_MANYLINUX: ${{ inputs.use_manylinux || github.event.inputs.use_manylinux || (startsWith(matrix.docker_image, 'pytorch/manylinux') && 'true') || 'false' }}
+      TORCH_PIN: ${{ inputs.torch_pin || github.event.inputs.torch_pin }}
+      TORCH_INDEX_URL: ${{ inputs.torch_index_url || github.event.inputs.torch_index_url }}
 
     steps:
       - name: Checkout aiter repo
@@ -301,17 +323,32 @@ jobs:
           IMG="${BUILD_DOCKER_IMAGE}"
           ROCM_TAG="${IMG##*:}"           # rocm7.2 / rocm7.1 / rocm7.0
           ROCM_NUM="${ROCM_TAG#rocm}"      # 7.2
-          TORCH_INDEX="https://download.pytorch.org/whl/rocm${ROCM_NUM}"
+          # Allow caller to override the torch wheel index (e.g. pin a release
+          # to a specific ROCm flavor's PyTorch ABI). Defaults preserve the
+          # legacy auto-derived behavior.
+          if [ -n "${TORCH_INDEX_URL}" ]; then
+            TORCH_INDEX="${TORCH_INDEX_URL}"
+          else
+            TORCH_INDEX="https://download.pytorch.org/whl/rocm${ROCM_NUM}"
+          fi
+          # Optional torch version pin (e.g. 2.10.0+rocm7.1). Empty = latest.
+          if [ -n "${TORCH_PIN}" ]; then
+            TORCH_SPEC="torch==${TORCH_PIN}"
+          else
+            TORCH_SPEC="torch"
+          fi
           echo "Torch index: ${TORCH_INDEX}"
+          echo "Torch spec:  ${TORCH_SPEC}"
           docker exec \
             -w /workspace \
             -e PYBIN="${PYBIN}" \
             -e TORCH_INDEX="${TORCH_INDEX}" \
+            -e TORCH_SPEC="${TORCH_SPEC}" \
             aiter_build_${{ matrix.python_version }} \
             bash -c '
               set -e
               ${PYBIN}/pip install --upgrade --timeout=60 --retries=10 pip
-              ${PYBIN}/pip install --timeout=60 --retries=10 --index-url "${TORCH_INDEX}" torch
+              ${PYBIN}/pip install --timeout=60 --retries=10 --index-url "${TORCH_INDEX}" "${TORCH_SPEC}"
               # flydsl publishes only manylinux_2_35 wheels which cannot install
               # on AlmaLinux 8 (glibc 2.28). FlyDSL AOT pre-compilation in
               # setup.py is wrapped in try/except and is skipped gracefully when

@@ -293,10 +293,10 @@ static constexpr int nextPow2(unsigned int num)
         /* bf16/fp16 input: output must match input type */                                      \
         AITER_CHECK(input.dtype() == out.dtype(),                                                \
                     "For bf16/fp16 input, output type must match input type");                   \
-        AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "act_and_mul_kernel", [&] {               \
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "act_and_mul_kernel", [&] {               \
             using input_dtype  = typename aiter::hip2opus<scalar_t>::type;                       \
             using output_dtype = input_dtype;                                                    \
-            AITER_DISPATCH_CASE_VEC_SIZE(                                                        \
+            AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(                                                        \
                 vec_size,                                                                        \
                 aiter::                                                                          \
                     act_and_mul_kernel<input_dtype, output_dtype, KERNEL<input_dtype>, VEC_SIZE> \
@@ -320,7 +320,7 @@ static constexpr int nextPow2(unsigned int num)
     else                                                                                        \
     {                                                                                           \
         /* bf16/fp16 input: dispatch based on output type (fp8/bf16/fp16/fp32) */               \
-        AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "scaled_act_and_mul_kernel", [&] {       \
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_act_and_mul_kernel", [&] {       \
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;                       \
             auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());               \
             float inv_scale   = 1.0f / (*reinterpret_cast<float*>(scale.data_ptr()));           \
@@ -444,9 +444,9 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
     dim3 block(block_size);                                                                        \
     HipDeviceGuard device_guard(input.device_id);                                                  \
     const hipStream_t stream = aiter::getCurrentHIPStream();                                       \
-    AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "activation_kernel_vec", [&] {                  \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "activation_kernel_vec", [&] {                  \
         using input_dtype = typename aiter::hip2opus<scalar_t>::type;                              \
-        AITER_DISPATCH_CASE_VEC_SIZE(                                                              \
+        AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(                                                              \
             vec_size,                                                                              \
             aiter::activation_kernel_vec<input_dtype, KERNEL<input_dtype>, VEC_SIZE>               \
             <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),           \
