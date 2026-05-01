@@ -205,7 +205,19 @@ for candidate in "${SGL_IMAGES[@]}"; do
   fi
 
   # Smoke-test: verify AITER can actually be imported (catches ABI mismatches)
-  if docker exec ci_sglang python3 -c "import aiter; print('AITER import OK')" 2>&1; then
+  if docker exec ci_sglang python3 -c "
+import aiter
+from aiter.jit import aiter_core
+# Load all JIT modules to catch ABI mismatches early
+import importlib, pathlib
+jit_dir = pathlib.Path(aiter.__file__).parent / 'jit'
+for so in jit_dir.glob('*.so'):
+    try:
+        importlib.import_module(f'aiter.jit.{so.stem}')
+    except ImportError as e:
+        raise RuntimeError(f'ABI mismatch: {so.name}: {e}') from e
+print('AITER import OK — all JIT modules loaded')
+" 2>&1; then
     echo "AITER wheel is compatible with ${candidate}"
     SGL_IMAGE="${candidate}"
     break
