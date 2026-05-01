@@ -76,6 +76,15 @@ def _make_qkv(
         (2, 1024, 8, 128),
         # Unaligned shape — exercises the auto-padding path. 32760 → 32768.
         (1, 32760, 12, 128),
+        # Wan2.2 TI2V-5B self-attention shapes (H=24, D=128). vae_stride=16
+        # gives smaller latent S than Wan2.1 at the same pixel resolution.
+        # 480p:  S=8190  (T_lat=21, H_lat/2=15, W_lat/2=26)  -> pad 8192
+        # 720p:  S=18480 (T_lat=21, H_lat/2=22, W_lat/2=40)  -> pad 18560
+        # 1080p: S=42840 (T_lat=21, H_lat/2=34, W_lat/2=60)  -> pad 42880
+        # All padding ratios stay below the 0.5% non-causal safety threshold.
+        (1, 8190, 24, 128),
+        (1, 18480, 24, 128),
+        (1, 42840, 24, 128),
     ],
 )
 def test_flydsl_fmha_correctness_bf16(batch, seq_len, num_heads, head_dim):
@@ -176,7 +185,8 @@ def test_flydsl_fmha_correctness_multi_device():
     import subprocess
     import textwrap
 
-    script = textwrap.dedent("""
+    script = textwrap.dedent(
+        """
         import sys
         sys.path.insert(0, "/workspace/FlyDSL/python")
         import flydsl
@@ -215,7 +225,8 @@ def test_flydsl_fmha_correctness_multi_device():
         cm = cos.min().item()
         assert cm > 0.99, f"min_cos={cm:.6f}"
         print("MULTI_DEVICE_OK", flush=True)
-        """)
+        """
+    )
 
     proc = subprocess.run(
         ["python", "-c", script],

@@ -5,6 +5,12 @@
 
 Wraps the FlyDSL `flash_attn_func_gfx1201` kernel with:
   - Build cache keyed by (num_heads, head_dim, causal, dtype, waves_per_eu, daz).
+    A separate kernel variant is JIT-compiled per (num_heads, head_dim)
+    tuple, so model families with different head configurations share a
+    single wrapper without code changes. Validated production shapes:
+      - Wan2.1 1.3B: num_heads=12, head_dim=128, S=32760
+      - Wan2.2 TI2V-5B: num_heads=24, head_dim=128, S in {8190, 18480, 42840}
+        (480p / 720p / 1080p latent token counts at 81 frames)
   - Automatic seq_len padding to the kernel's tile size (multiple of 128).
   - BSHD ([B, S, H, D]) input/output convention to match upstream
     flash-attention layout.
@@ -13,11 +19,16 @@ Wraps the FlyDSL `flash_attn_func_gfx1201` kernel with:
     ``n_pad / seq_len_pad > 0.005`` (0.5%) and ``causal=False`` are rejected
     with a ``ValueError``. The 0.5% threshold is the bf16 mantissa precision
     floor plus 1 bit of margin; production Wan2.1 (S_real=32760, S_pad=32768,
-    ratio=0.024%) clears it by 20x. See option (d) in
-    ``2969_padded_softmax_rca.md``.
+    ratio=0.024%) and Wan2.2 720p (S=18480, S_pad=18560, ratio=0.43%) both
+    clear it. See option (d) in ``2969_padded_softmax_rca.md``.
 
 The kernel implements self-attention only (Lq == Lk). Cross-attention
-(Lq != Lk) is rejected; callers should fall back to PyTorch SDPA.
+(Lq != Lk) is rejected; callers should fall back to PyTorch SDPA. Wan2.2
+produces a mix of self-attention and cross-attention calls per layer; the
+caller is expected to dispatch only the self-attention branch through this
+function. fp32 inputs (e.g. RoPE-applied q/k that wan2.2 emits) must be
+cast to v.dtype (bf16 / fp16) by the caller — this matches the upstream
+``wan.modules.attention.flash_attention`` preprocessing.
 """
 
 from __future__ import annotations
