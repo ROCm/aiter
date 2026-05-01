@@ -594,8 +594,7 @@ class TestOnlineTuneE2E(unittest.TestCase):
             pass
 
         fp8, qtype = _get_platform_dtypes()
-        script = textwrap.dedent(
-            f"""\
+        script = textwrap.dedent(f"""\
             import torch
             from aiter.fused_moe import fused_moe, fused_topk
             from aiter.ops.shuffle import shuffle_weight
@@ -627,8 +626,7 @@ class TestOnlineTuneE2E(unittest.TestCase):
             )
             print(f"OUTPUT_SHAPE={{out.shape}}")
             print(f"OUTPUT_OK={{out.shape[0] == token and out.shape[1] == model_dim}}")
-        """
-        )
+        """)
 
         script_path = os.path.join(tmp_dir, "online_tune_e2e.py")
         with open(script_path, "w") as f:
