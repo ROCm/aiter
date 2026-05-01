@@ -37,6 +37,68 @@ def _moe_sorting_impl(
     use_opus,
 ):
     device = topk_ids.device
+_cached_gfx: str = get_gfx()
+_cached_cu_num: int = get_cu_num()
+
+_scale_t_cache: dict = {}
+
+
+def _get_scale_t_buf(scale: torch.Tensor) -> torch.Tensor:
+    """Return a [cols, rows] buffer for transpose of scale [rows, cols],
+    reusing a cached allocation when shape/dtype/device match."""
+    rows, cols = scale.shape
+    key = (scale.device.index, cols, rows, scale.dtype)
+    buf = _scale_t_cache.get(key)
+    if buf is None:
+        buf = torch.empty((cols, rows), dtype=scale.dtype, device=scale.device)
+        _scale_t_cache[key] = buf
+    return buf
+
+
+_moe_sorting_buf_cache: dict = {}
+
+
+def _get_moe_sorting_bufs(M, topk, num_experts, block_size, model_dim, moebuf_dtype, device):
+    key = (device, M, topk, num_experts, block_size, model_dim, moebuf_dtype)
+    bufs = _moe_sorting_buf_cache.get(key)
+    if bufs is None:
+        max_num_tokens_padded = int(M * topk + num_experts * block_size - topk)
+        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+        sorted_weights = torch.empty(max_num_tokens_padded, dtype=dtypes.fp32, device=device)
+        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        bufs = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+        _moe_sorting_buf_cache[key] = bufs
+    return bufs
+
+
+_quant_func_t_cache: dict = {}
+
+
+def _get_quant_func_transpose(quant_type):
+    func = _quant_func_t_cache.get(quant_type)
+    if func is None:
+        base = get_quant(quant_type)
+        func = functools.partial(base, transpose_scale=True)
+        _quant_func_t_cache[quant_type] = func
+    return func
+
+
+def _moe_sorting_impl(
+    topk_ids,
+    topk_weights,
+    num_experts,
+    model_dim,
+    moebuf_dtype,
+    block_size,
+    expert_mask,
+    num_local_tokens,
+    dispatch_policy,
+    use_opus,
+):
+    device = topk_ids.device
     M, topk = topk_ids.shape
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
 
@@ -79,6 +141,29 @@ def moe_sorting(
     dispatch_policy=0,
 ):
     try:
+        if expert_mask is None:
+            M, topk = topk_ids.shape
+            device = topk_ids.device
+            bufs = _get_moe_sorting_bufs(
+                M, topk, num_experts, block_size, model_dim, moebuf_dtype, device
+            )
+            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = bufs
+            fwd_fn = aiter.moe_sorting_opus_fwd if _USE_OPUS_MOE_SORTING else aiter.moe_sorting_fwd
+            fwd_fn(
+                topk_ids,
+                topk_weights,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                num_experts,
+                int(block_size),
+                expert_mask,
+                num_local_tokens,
+                dispatch_policy,
+            )
+            return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
         return _moe_sorting_impl(
             topk_ids,
             topk_weights,
@@ -105,7 +190,7 @@ def moe_sorting(
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
 # We can use torch.compile(dynamic=False) to avoid
-@functools.lru_cache(maxsize=2048)
+@functools.lru_cache(maxsize=1024)
 def get_inter_dim(w1_shape, w2_shape):
     E, _, model_dim = w1_shape
     E, model_dim, inter_dim = w2_shape
@@ -263,105 +348,50 @@ def fused_moe_(
         and a1_scale is not None
     ):
         q_dtype_a = dtypes.fp8
-    bf16_fp8_bound = 256
-    if quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Swiglu:
-            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
-                q_dtype_a = dtypes.bf16
-            elif M >= bf16_fp8_bound:
-                q_dtype_a = dtypes.fp8
-        else:
-            q_dtype_a = dtypes.fp4x2
 
-    metadata = get_2stage_cfgs(
-        get_padded_M(M),  # consider token_num > 1024 as prefill
-        model_dim,
-        inter_dim,
-        E,
-        topk,
-        dtype,
-        q_dtype_a,
-        q_dtype_w,
-        quant_type,
-        isG1U1,
-        activation,
-        doweight_stage1,
-        hidden_pad,
-        intermediate_pad,
-        isShuffled,
-    )
-
-    block_size_M = metadata.block_m if block_size_M is None else block_size_M
-    # Ensure block_size_M is int (metadata.block_m from CSV may be float)
-    if block_size_M is not None:
-        block_size_M = int(block_size_M)
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
         topk_weight,
         global_E,
         model_dim,
         dtype,
-        block_size_M,
+        block_size_M if block_size_M else BLOCK_SIZE_M,
         expert_mask,
         num_local_tokens,
         moe_sorting_dispatch_policy,
     )
 
-    if metadata.run_1stage:
-        return metadata.stage1(
-            hidden_states,
-            w1,
-            w2,
-            topk,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            isG1U1,
-            block_size_M,
-            # activation=activation,
-            # quant_type=quant_type,
-            q_dtype_a=q_dtype_a,
-            q_dtype_w=q_dtype_w,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-            num_local_tokens=num_local_tokens,
-            M=M,
-            device=topk_ids.device,
-            doweight_stage1=doweight_stage1,
-        )
-    else:
-        return fused_moe_2stages(
-            hidden_states,
-            w1,
-            w2,
-            topk,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            isG1U1,
-            block_size_M,
-            activation=activation,
-            quant_type=quant_type,
-            doweight_stage1=doweight_stage1,
-            q_dtype_a=q_dtype_a,
-            q_dtype_w=q_dtype_w,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-            num_local_tokens=num_local_tokens,
-            # following for cktile support
-            hidden_pad=hidden_pad,
-            intermediate_pad=intermediate_pad,
-            bias1=bias1,
-            bias2=bias2,
-        )
+    if block_size_M is None:
+        block_size_M = get_block_size_M(M, topk, E, inter_dim)
+
+    return fused_moe_2stages(
+        hidden_states,
+        w1,
+        w2,
+        topk,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        isG1U1,
+        block_size_M,
+        activation=activation,
+        quant_type=quant_type,
+        doweight_stage1=doweight_stage1,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        num_local_tokens=num_local_tokens,
+        # following for cktile support
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+    )
 
 
 def fused_moe_1stage(
@@ -439,7 +469,7 @@ def fused_moe_1stage(
             quant_func = get_quant(quant_type)
             if hidden_states.dtype != q_dtype_a:
                 if quant_type == QuantType.per_1x128:
-                    quant_func = functools.partial(quant_func, transpose_scale=True)
+                    quant_func = _get_quant_func_transpose(quant_type)
                 a1, a1_scale = quant_func(
                     hidden_states,
                     scale=a1_scale,
@@ -452,7 +482,7 @@ def fused_moe_1stage(
                 ), "a1_scale must be provided for quantized input for fused_moe"
                 a1 = hidden_states
                 if quant_type == QuantType.per_1x128:
-                    scale_t = torch.empty_like(a1_scale)
+                    scale_t = _get_scale_t_buf(a1_scale)
                     aiter.partial_transpose(
                         scale_t, a1_scale, num_rows=num_local_tokens
                     )
@@ -519,9 +549,9 @@ def fused_moe_1stage(
     return moe_buf
 
 
-@functools.lru_cache(maxsize=2048)
+@functools.lru_cache(maxsize=1024)
 def get_block_size_M(token, topk, expert, inter_dim):
-    cu_num = get_cu_num()
+    cu_num = _cached_cu_num
     tileN = 128
     tgN = (inter_dim + tileN - 1) // tileN
     support_list = [32, 64, 128]
@@ -544,7 +574,7 @@ def use_nt(token, topk, e):
     return (token * topk // e) < 64
 
 
-@functools.lru_cache(maxsize=2048)
+@functools.lru_cache(maxsize=1024)
 def get_ksplit(token, topk, expert, inter_dim, model_dim):
     aiter_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
     if aiter_ksplit != 0:
@@ -552,7 +582,7 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     # only for moe_blk gemm1 a8w8 decode scenario
     if token * topk > expert:
         return 0
-    cu_num = get_cu_num()
+    cu_num = _cached_cu_num
     tileN = 128
 
     tgM = token * topk  # decode tile num
@@ -641,23 +671,19 @@ def _flydsl_stage1_wrapper(
     num_valid_ids,
     out,
     topk,
+    block_m,
+    a1_scale,
+    w1_scale,
+    sorted_weights=None,
     kernelName="",
     activation=ActivationType.Silu,
-    w1_scale=None,
-    a1_scale=None,
-    sorted_weights=None,
-    out_scale=None,
-    out_scale_sorted=None,
-    bias1=None,
-    **_kwargs,
+    **kwargs,
 ):
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
-    act = "swiglu" if activation == ActivationType.Swiglu else "silu"
-    _a_scale_one = parsed.get("a_scale_one", False)
     return aiter.ops.flydsl.flydsl_moe_stage1(
-        a=hidden_states,
+        hidden_states=hidden_states,
         w1=w1,
         sorted_token_ids=sorted_token_ids,
         sorted_expert_ids=sorted_expert_ids,
@@ -670,17 +696,13 @@ def _flydsl_stage1_wrapper(
         a_dtype=parsed["a_dtype"],
         b_dtype=parsed["b_dtype"],
         out_dtype=parsed["out_dtype"],
-        act=act,
+        mode=parsed.get("mode", "atomic"),
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
-        use_async_copy=True,
-        k_batch=parsed.get("k_batch", 1),
-        waves_per_eu=parsed.get("waves_per_eu", 3),
-        b_nt=parsed.get("b_nt", 2),
-        gate_mode=parsed.get("gate_mode", "separated"),
-        bias=bias1,
-        a_scale_one=_a_scale_one,
+        sort_block_m=parsed.get("sort_block_m", 0),
+        b_nt=parsed.get("b_nt", 0),
+        persist=parsed.get("persist", None),
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
     )
 
@@ -694,14 +716,14 @@ def _flydsl_stage2_wrapper(
     num_valid_ids,
     out,
     topk,
-    kernelName="",
-    w2_scale=None,
-    a2_scale=None,
+    w2_scale,
+    a2_scale,
+    block_m,
     sorted_weights=None,
+    kernelName="",
     bias2=None,
-    **_kwargs,
+    **kwargs,
 ):
-
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
@@ -731,7 +753,7 @@ def _flydsl_stage2_wrapper(
     )
 
 
-@functools.lru_cache(maxsize=2048)
+@functools.lru_cache(maxsize=1024)
 def get_2stage_cfgs(
     token,
     model_dim,
@@ -804,7 +826,7 @@ def get_2stage_cfgs(
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
-    cu_num = get_cu_num()
+    cu_num = _cached_cu_num
     keys = (
         cu_num,
         token,
@@ -868,6 +890,7 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    gfx = _cached_gfx
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
@@ -883,7 +906,7 @@ def get_2stage_cfgs(
             q_dtype_w,
             use_g1u1,
             doweight_stage1,
-        ) in fused_moe_1stage_dict[get_gfx()]:
+        ) in fused_moe_1stage_dict[gfx]:
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = token > 32 and (inter_dim % 128 == 0)
@@ -894,7 +917,7 @@ def get_2stage_cfgs(
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
 
-            if run_1stage and q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
+            if run_1stage and q_type == QuantType.per_1x128 and gfx == "gfx950":
                 run_1stage_xbf16 = int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
 
         block_m = (
@@ -951,11 +974,6 @@ def get_2stage_cfgs(
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
     if run_1stage:
-        # never hard code block_m for 1-stage since it can be tuned by kernel itself, and we have different heuristics for different quant types
-        # # TODO: enable this approach for other quant types and archs
-        # if q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
-        #     tkn_per_epr = token * topk // expert
-        #     block_m = 64 if tkn_per_epr > 32 else block_m
         return MOEMetadata(
             functools.partial(
                 fused_moe_1stage,
@@ -1241,7 +1259,7 @@ def fused_moe_2stages(
             )
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
-            quant_func = functools.partial(quant_func, transpose_scale=True)
+            quant_func = _get_quant_func_transpose(quant_type)
         a1, a1_scale = quant_func(
             hidden_states,
             scale=a1_scale,
@@ -1743,29 +1761,23 @@ def ck_moe_stage1(
     aiter.ck_moe_stage1_fwd(
         hidden_states,
         w1,
-        w2,
         sorted_token_ids,
         sorted_expert_ids,
         num_valid_ids,
         tmp_out,
         topk,
-        kernelName,
-        w1_scale,
-        a1_scale,
         block_m,
+        a1_scale,
+        w1_scale,
+        kernelName,
         sorted_weights,
         quant_type,
         activation,
-        splitk if is_splitk else 0,
+        splitk,
         use_non_temporal_load,
-        out.dtype,
     )
     if is_splitk:
-        valid_out = tmp_out[: token_num * topk, :]
-        if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
-        else:
-            aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
+        out[:] = tmp_out.view(out.shape[0], out.shape[1], -1).sum(0).view(out.shape)
     return out
 
 
@@ -1784,41 +1796,16 @@ def cktile_moe_stage1(
     sorted_weights=None,
     n_pad_zeros=0,
     k_pad_zeros=0,
-    bias1=None,
     activation=ActivationType.Silu,
     split_k=1,
-    dtype=torch.bfloat16,
+    bias1=None,
     kernel_name="",
+    **kwargs,
 ):
-    token_num = hidden_states.shape[0]
-    _, n1, k1 = w1.shape
-    _, k2, n2 = w2.shape
-    D = n2 if k2 == k1 else n2 * 2  # bit4 format
-    # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
-
-    if w1.dtype is torch.uint32:
-        D = D * 8
-
-    out = torch.empty((token_num, topk, D), dtype=dtype, device=hidden_states.device)
-    # WARNING: when split_k > 1, this allocation has the same undersized buffer
-    # pattern fixed in ck_moe_stage1 (see ROCm/aiter#2508). If the CK tile
-    # kernel calls hipMemsetAsync with sorted_size rows, this will overflow.
-    # When fp32 splitk is enabled, apply the same fix: use sorted_size =
-    # min(token_num * topk * block_m, sorted_token_ids.shape[0]) and slice
-    # valid_out = tmp_out[:token_num * topk, :] before silu_and_mul/gelu_and_mul.
-    tmp_out = (
-        torch.zeros(
-            (token_num, topk, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
-        )
-        if split_k > 1
-        else out
-    )
-
-    # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
         w1,
-        tmp_out,
+        out,
         sorted_token_ids,
         sorted_expert_ids,
         num_valid_ids,
@@ -1832,19 +1819,13 @@ def cktile_moe_stage1(
         activation,
         block_m,
         split_k,
-        kernel_name,
+        kernel_name=kernel_name,
     )
-
-    if split_k > 1:
-        if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out)  # TODO: support fp32 splitk
-        else:
-            aiter.gelu_and_mul(out, tmp_out)
     return out
 
 
 def cktile_moe_stage2(
-    a2,
+    inter_states,
     w1,
     w2,
     sorted_token_ids,
@@ -1855,26 +1836,16 @@ def cktile_moe_stage2(
     w2_scale,
     a2_scale,
     block_m,
-    activation=ActivationType.Swiglu,
     sorted_weights=None,
-    zeros_out=False,
     n_pad_zeros=0,
     k_pad_zeros=0,
+    activation=ActivationType.Silu,
     bias2=None,
     kernel_name="",
+    **kwargs,
 ):
-    # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
-
-    # out = torch.empty(
-    #     (token_num, D),
-    #     dtype=a2.dtype,
-    #     device=a2.device,
-    # )
-    # if zeros_out:
-    #     out.fill_(0)
-    # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
     aiter.moe_cktile2stages_gemm2(
-        a2,
+        inter_states,
         w2,
         out,
         sorted_token_ids,
@@ -1912,7 +1883,7 @@ def fused_topk(
     )
 
     if (
-        get_gfx() in ["gfx942", "gfx950"]
+        _cached_gfx in ["gfx942", "gfx950"]
         and (expert, topk)
         in [
             (128, 4),
