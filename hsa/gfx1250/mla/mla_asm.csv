@@ -1,0 +1,5 @@
+qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,knl_name,co_name
+fp8,fp8,16,0,1,0,0,0,_ZN5aiter34mla_a8w8_qh16_1tg_16mx1_32nx4_np_3pE,mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p.co
+fp8,fp8,16,0,2,0,0,0,_ZN5aiter34mla_a8w8_qh16_1tg_16mx2_32nx4_np_3pE,mla_a8w8_qh16_1tg_16mx2_32nx4_np_3p.co
+fp8,fp8,16,0,4,0,0,0,_ZN5aiter31mla_a8w8_qh16_1tg_16mx4_64nx1_npE,mla_a8w8_qh16_1tg_16mx4_64nx1_np.co
+fp8,fp8,64,0,1,0,0,0,_ZN5aiter31mla_a8w8_qh64_1tg_16mx4_64nx1_npE,mla_a8w8_qh64_1tg_16mx4_64nx1_np.co

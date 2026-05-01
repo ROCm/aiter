@@ -4,6 +4,7 @@
 """General utilities shared across all FlyDSL kernel families."""
 
 import importlib.util
+import os
 from functools import lru_cache
 
 import torch
@@ -67,4 +68,9 @@ def get_shared_memory_per_block(device=None, fallback_gfx: str = "") -> int:
 
 
 def is_flydsl_available() -> bool:
+    # Runtime opt-out switch mirroring ENABLE_CK. Reads the env directly to
+    # avoid an import cycle with aiter.jit.core. ENABLE_FLYDSL=0 disables the
+    # FlyDSL backend entirely (no kernel imports, no runtime dispatch).
+    if int(os.environ.get("ENABLE_FLYDSL", "1")) == 0:
+        return False
     return importlib.util.find_spec("flydsl") is not None

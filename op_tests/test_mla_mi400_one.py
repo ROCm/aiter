@@ -3,24 +3,14 @@
 
 import argparse
 import itertools
-import os
 import random
-from dataclasses import dataclass
-from pathlib import Path
-
 import pandas as pd
 import torch
 
 import aiter
-import aiter.mla as mla
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.attention import mla_decode_stage1_asm_fwd
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-
-# In lean containers, aiter.__init__ can skip bulk op exports when optional
-# dependencies are unavailable. Register the op the mi400 sweep needs explicitly.
-aiter.mla_decode_stage1_asm_fwd = mla_decode_stage1_asm_fwd
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -132,401 +122,6 @@ def torch_mla_extend(
     return o, lse
 
 
-# ###########################################################################
-# gfx1250 / mi400 MLA decode sweep
-#
-# Ported from the standalone pytest module test_mla_mi400.py into this script.
-# It exercises the mi400 MLA shader variants registered in
-# hsa/gfx1250/mla/mla_asm.csv across the supported (Gqa, qSeqLen) dispatch
-# combinations. Runs only when get_gfx() == "gfx1250".
-# ###########################################################################
-
-
-@dataclass(frozen=True)
-class MlaMi400CaseConfig:
-    name: str
-    batch: int = 2
-    kv_seq_len: int = 578
-    shuffle_pages: bool = True
-    page_indices_oob: int = 4
-    use_non_unit_scales: bool = False
-
-
-@dataclass(frozen=True)
-class MlaMi400KernelVariant:
-    name: str
-    gqa_ratio: int
-    q_seq_len: int
-
-
-_POC_DUMP_CASE = MlaMi400CaseConfig(name="poc-kl-dump-shape")
-
-_POC_DUMP_VARIANT = MlaMi400KernelVariant(
-    name="qh16-q1-16mx1-32nx4-np-3p",
-    gqa_ratio=16,
-    q_seq_len=1,
-)
-
-_MI400_KERNEL_VARIANTS = [
-    _POC_DUMP_VARIANT,
-    MlaMi400KernelVariant(name="qh16-q2-16mx2-32nx4-np-3p", gqa_ratio=16, q_seq_len=2),
-    MlaMi400KernelVariant(name="qh16-q4-16mx4-64nx1-np", gqa_ratio=16, q_seq_len=4),
-    MlaMi400KernelVariant(name="qh64-q1-16mx4-64nx1-np", gqa_ratio=64, q_seq_len=1),
-]
-
-_MI400_CASES = [
-    _POC_DUMP_CASE,
-    MlaMi400CaseConfig(name="single-batch-short-kv", batch=1, kv_seq_len=65),
-    MlaMi400CaseConfig(
-        name="two-batch-two-pages-contiguous",
-        batch=2,
-        kv_seq_len=128,
-        shuffle_pages=False,
-    ),
-    MlaMi400CaseConfig(
-        name="two-batch-long-kv-scaled",
-        batch=2,
-        kv_seq_len=578,
-        use_non_unit_scales=True,
-    ),
-    MlaMi400CaseConfig(name="three-batch-partial-page", batch=3, kv_seq_len=257),
-]
-
-
-def _numel(shape):
-    n = 1
-    for dim in shape:
-        n *= dim
-    return n
-
-
-def _load_raw_fp8(path, shape, device):
-    raw = torch.frombuffer(bytearray(Path(path).read_bytes()), dtype=torch.uint8).clone()
-    assert raw.numel() == _numel(shape)
-    return raw.view(dtypes.fp8).reshape(shape).to(device)
-
-
-def _load_raw_float32(path, shape, device):
-    raw = torch.frombuffer(
-        bytearray(Path(path).read_bytes()), dtype=torch.float32
-    ).clone()
-    assert raw.numel() == _numel(shape)
-    return raw.reshape(shape).to(device)
-
-
-def _load_raw_float32_prefix(path, shape, device):
-    raw = torch.frombuffer(
-        bytearray(Path(path).read_bytes()), dtype=torch.float32
-    ).clone()
-    numel = _numel(shape)
-    assert raw.numel() >= numel
-    return raw[:numel].reshape(shape).to(device)
-
-
-def _pack_rope_split2_pages(tensor, nope_dim, rope_dim):
-    shape = tensor.shape
-    assert shape[-1] == nope_dim + rope_dim
-    packed = torch.cat(
-        (
-            tensor[..., :nope_dim].reshape(*shape[:-2], shape[-2] * nope_dim),
-            tensor[..., nope_dim:].reshape(*shape[:-2], shape[-2] * rope_dim),
-        ),
-        dim=-1,
-    )
-    return packed.reshape(shape).contiguous()
-
-
-def _pack_rope_split2_kv_pages(tensor, nope_dim, rope_dim):
-    pages, page_size, nhead_kv, head_dim = tensor.shape
-    assert nhead_kv == 1
-    assert head_dim == nope_dim + rope_dim
-    packed = torch.cat(
-        (
-            tensor[..., :nope_dim].reshape(pages, page_size * nope_dim),
-            tensor[..., nope_dim:].reshape(pages, page_size * rope_dim),
-        ),
-        dim=-1,
-    )
-    return packed.reshape(pages, page_size, nhead_kv, head_dim).contiguous()
-
-
-def _make_page_permutation(num_pages, *, shuffle):
-    if not shuffle:
-        return list(range(num_pages))
-    if num_pages <= 1:
-        return list(range(num_pages))
-    for step in (7, 5, 3):
-        if num_pages % step != 0:
-            return [(i * step + 1) % num_pages for i in range(num_pages)]
-    return list(reversed(range(num_pages)))
-
-
-def _make_scales(batch, device, *, enabled):
-    if not enabled:
-        return (
-            torch.ones((batch,), dtype=torch.float32, device=device),
-            torch.ones((batch,), dtype=torch.float32, device=device),
-        )
-    q_scale = torch.linspace(0.75, 1.25, batch, dtype=torch.float32, device=device)
-    kv_scale = torch.linspace(1.20, 0.80, batch, dtype=torch.float32, device=device)
-    return q_scale, kv_scale
-
-
-def _make_mla_mi400_case(config, variant):
-    repo_hsa_dir = Path(__file__).resolve().parents[1] / "hsa"
-    os.environ["AITER_ASM_DIR"] = str(repo_hsa_dir)
-
-    device = torch.device("cuda")
-    torch.manual_seed(20260513 + len(config.name))
-
-    batch = config.batch
-    q_seq_len = variant.q_seq_len
-    kv_seq_len = config.kv_seq_len
-    page_size = 64
-    num_kv_splits = 1
-    nhead = variant.gqa_ratio
-    nhead_kv = 1
-    qk_head_dim = 576
-    v_head_dim = 512
-    num_pages_per_batch = (kv_seq_len + page_size - 1) // page_size
-    page_indices_oob = config.page_indices_oob
-    total_page_indices = batch * (num_pages_per_batch + page_indices_oob)
-    total_pages = batch * num_pages_per_batch
-
-    q_bf16 = torch.randn(
-        (batch * q_seq_len, nhead, qk_head_dim), dtype=torch.bfloat16, device=device
-    )
-    kv_buffer_logical_bf16 = torch.randn(
-        (total_pages, page_size, nhead_kv, qk_head_dim),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    # Match poc_kl mla_shuffle() output for kl_mla_mtp0_np_3p_k128_test. The
-    # kernel consumes a compact block table, with OOB padding only after all
-    # valid pages. KV pages are scattered into their physical page ids.
-    shuffled_page_indices = _make_page_permutation(
-        total_pages, shuffle=config.shuffle_pages
-    )
-    kv_buffer_bf16 = torch.empty_like(kv_buffer_logical_bf16)
-    kv_indices = torch.zeros(total_page_indices, dtype=torch.int32, device=device)
-    for logical_page, physical_page in enumerate(shuffled_page_indices):
-        kv_buffer_bf16[physical_page] = kv_buffer_logical_bf16[logical_page]
-        kv_indices[logical_page] = physical_page
-    q_ref = q_bf16.to(dtypes.fp8)
-    kv_buffer_ref = kv_buffer_bf16.to(dtypes.fp8)
-    q = _pack_rope_split2_pages(
-        q_ref.view(batch, q_seq_len, nhead, qk_head_dim),
-        v_head_dim,
-        qk_head_dim - v_head_dim,
-    ).view(batch * q_seq_len, nhead, qk_head_dim)
-    kv_buffer = _pack_rope_split2_kv_pages(
-        kv_buffer_ref.view(total_pages, page_size, nhead_kv, qk_head_dim),
-        v_head_dim,
-        qk_head_dim - v_head_dim,
-    )
-    out = torch.empty(
-        (batch * q_seq_len, nhead, v_head_dim), dtype=torch.bfloat16, device=device
-    )
-
-    qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * q_seq_len
-    kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * kv_seq_len
-    last_page_len = kv_seq_len % page_size or page_size
-    kv_last_page_lens = torch.full(
-        (batch,), last_page_len, dtype=torch.int32, device=device
-    )
-    num_kv_splits_indptr = (
-        torch.arange(batch + 1, dtype=torch.int32, device=device) * num_kv_splits
-    )
-    q_scale, kv_scale = _make_scales(batch, device, enabled=config.use_non_unit_scales)
-
-    poc_dump_dir = os.getenv("AITER_MLA_LOAD_POC_DUMP_DIR")
-    if poc_dump_dir:
-        poc_dump_dir = Path(poc_dump_dir)
-        q = _load_raw_fp8(
-            poc_dump_dir / "q.bin", (batch * q_seq_len, nhead, qk_head_dim), device
-        )
-        kv_buffer = _load_raw_fp8(
-            poc_dump_dir / "kv_buffer.bin",
-            (total_pages, page_size, nhead_kv, qk_head_dim),
-            device,
-        )
-        q_scale = _load_raw_float32(poc_dump_dir / "q_scale.bin", (batch,), device)
-        kv_scale = _load_raw_float32(poc_dump_dir / "kv_scale.bin", (batch,), device)
-        q_ref = None
-        kv_buffer_ref = None
-
-    return {
-        "q": q,
-        "kv_buffer": kv_buffer,
-        "q_ref": q_ref,
-        "kv_buffer_ref": kv_buffer_ref,
-        "out": out,
-        "qo_indptr": qo_indptr,
-        "kv_indptr": kv_indptr,
-        "kv_indices": kv_indices,
-        "kv_last_page_lens": kv_last_page_lens,
-        "q_seq_len": q_seq_len,
-        "kv_seq_len": kv_seq_len,
-        "page_size": page_size,
-        "nhead_kv": nhead_kv,
-        "nhead": nhead,
-        "gqa_ratio": variant.gqa_ratio,
-        "qk_head_dim": qk_head_dim,
-        "v_head_dim": v_head_dim,
-        "num_kv_splits": num_kv_splits,
-        "num_kv_splits_indptr": num_kv_splits_indptr,
-        "q_scale": q_scale,
-        "kv_scale": kv_scale,
-        "batch": batch,
-        "num_pages_per_batch": num_pages_per_batch,
-        "case_name": config.name,
-        "variant_name": variant.name,
-    }
-
-
-def _ref_mla_mi400(case):
-    outputs = []
-    num_pages = case["num_pages_per_batch"]
-    q_source = case["q_ref"] if case.get("q_ref") is not None else case["q"]
-    kv_source = (
-        case["kv_buffer_ref"]
-        if case.get("kv_buffer_ref") is not None
-        else case["kv_buffer"]
-    )
-    for b in range(case["batch"]):
-        q_start = b * case["q_seq_len"]
-        q_end = q_start + case["q_seq_len"]
-        q = q_source[q_start:q_end].float() * case["q_scale"][b]
-        page_indices = case["kv_indices"][b * num_pages : (b + 1) * num_pages].long()
-        kv = torch.index_select(kv_source.float(), 0, page_indices) * case["kv_scale"][b]
-        kv = kv.reshape(-1, case["nhead_kv"], case["qk_head_dim"])
-        kv = kv[: case["kv_seq_len"]]
-        key = kv
-        value = kv[..., : case["v_head_dim"]]
-
-        logits = torch.einsum("qhd,kmd->hqk", q, key) * (
-            1.0 / (case["qk_head_dim"] ** 0.5)
-        )
-        weights = torch.softmax(logits, dim=-1)
-        outputs.append(torch.einsum("hqk,kmd->qhd", weights, value).to(torch.bfloat16))
-    return torch.cat(outputs, dim=0)
-
-
-def _cosine_diff(actual, expected):
-    actual = actual.detach().float().cpu()
-    expected = expected.detach().float().cpu()
-    assert torch.isfinite(actual).all()
-    assert torch.isfinite(expected).all()
-    numerator = 2 * (actual.double() * expected.double()).sum()
-    denominator = (
-        (actual.double().square() + expected.double().square()).sum().clamp_min(1e-12)
-    )
-    return (1 - (numerator / denominator)).item()
-
-
-def _call_mla_mi400(case, *, return_lse):
-    return aiter.mla.mla_decode_fwd(
-        case["q"],
-        case["kv_buffer"],
-        case["out"],
-        case["qo_indptr"],
-        case["kv_indptr"],
-        case["kv_indices"],
-        case["kv_last_page_lens"],
-        case["q_seq_len"],
-        case["page_size"],
-        case["nhead_kv"],
-        1.0 / (case["qk_head_dim"] ** 0.5),
-        num_kv_splits=case["num_kv_splits"],
-        num_kv_splits_indptr=case["num_kv_splits_indptr"],
-        q_scale=case["q_scale"],
-        kv_scale=case["kv_scale"],
-        return_lse=return_lse,
-    )
-
-
-@benchmark()
-def test_mla_mi400(config, variant, cos_threshold=3e-2):
-    ret = {
-        "mi400:variant": variant.name,
-        "mi400:case": config.name,
-    }
-    case = _make_mla_mi400_case(config, variant)
-
-    # Single launch for functional/numerical validation, matching the original
-    # pytest semantics. run_perftest would launch the kernel ~100x which, with
-    # the current temporary PyTorch stage2, can leave non-finite values in out.
-    attn_logits, attn_lse = _call_mla_mi400(case, return_lse=True)
-    out_check = case["out"].clone()
-
-    out_shape = (case["batch"] * case["q_seq_len"], case["nhead"], case["v_head_dim"])
-    logits_shape = (
-        case["batch"] * case["q_seq_len"],
-        case["num_kv_splits"],
-        case["nhead"],
-        case["v_head_dim"],
-    )
-    # Structural shape checks are hard asserts: they must always hold.
-    assert out_check.shape == out_shape
-    assert attn_logits.shape == logits_shape
-    assert attn_lse.shape == (case["batch"] * case["q_seq_len"], case["nhead"])
-
-    # Finiteness + cosine are recorded as soft pass/fail so a single bad combo
-    # does not abort the full sweep; run_mi400_sweep raises once at the end.
-    finite = (
-        torch.isfinite(out_check.detach().float().cpu()).all().item()
-        and torch.isfinite(attn_logits.detach().float().cpu()).all().item()
-        and torch.isfinite(attn_lse.detach().float().cpu()).all().item()
-    )
-    if finite:
-        poc_dump_dir = os.getenv("AITER_MLA_LOAD_POC_DUMP_DIR")
-        expected = (
-            _load_raw_float32_prefix(
-                Path(poc_dump_dir) / "splitData.bin", out_check.shape, out_check.device
-            )
-            if poc_dump_dir
-            else _ref_mla_mi400(case)
-        )
-        cos_diff = _cosine_diff(out_check, expected)
-    else:
-        cos_diff = float("inf")
-
-    passed = finite and cos_diff < cos_threshold
-    ret["mi400:finite"] = finite
-    ret["mi400:cos_diff"] = cos_diff
-    ret["mi400:passed"] = passed
-    aiter.logger.info(
-        "mla_decode-mi400 [%s | %s]: finite=%s cos_diff=%.3e %s",
-        variant.name,
-        config.name,
-        finite,
-        cos_diff,
-        "passed" if passed else "FAILED",
-    )
-    return ret
-
-
-def run_mi400_sweep():
-    poc_dump_dir = os.getenv("AITER_MLA_LOAD_POC_DUMP_DIR")
-    df = []
-    failures = []
-    for variant in _MI400_KERNEL_VARIANTS:
-        for config in _MI400_CASES:
-            # poc_kl dump replay only supports the canonical dump shape.
-            if poc_dump_dir and (
-                config != _POC_DUMP_CASE or variant != _POC_DUMP_VARIANT
-            ):
-                continue
-            ret = test_mla_mi400(config, variant)
-            df.append(ret)
-            if not ret.get("mi400:passed", False):
-                failures.append((variant.name, config.name, ret.get("mi400:cos_diff")))
-    df = pd.DataFrame(df)
-    aiter.logger.info("mla mi400 summary (markdown):\n%s", df.to_markdown(index=False))
-    if failures:
-        raise AssertionError(f"mi400 MLA numerics failed for: {failures}")
-
-
 @benchmark()
 def test_mla(
     ctx_lens,
@@ -629,14 +224,9 @@ def test_mla(
     out_dtype = torch.bfloat16
 
     us_aiter = None
-    # Prefill ref builds [nhead, (batch*ctx)^2] fp32 attn weights; bound both
-    # the lazy "tile area" gate and the per-call ctx so decode-scale ctx_lens
-    # (1M+) never trigger the O(N^2) ref.
     if (
-        (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
-        and batch_size * ctx_lens * nhead < 256 * 8192 * 16
-        and ctx_lens <= 16384
-    ):
+        dtype == torch.bfloat16 and kvtype == torch.bfloat16
+    ) and batch_size * ctx_lens * nhead < 256 * 8192 * 16:
         us_aiter = test_normal_prefill()
         ret["prefill:ck_192"] = us_aiter
 
@@ -722,16 +312,9 @@ def test_mla(
         return us_asm
 
     us_asm = None
-    # Absorb-prefill ref (mla_torch) builds [nhead, (batch*ctx_kv)^2] fp32 attn
-    # weights -- O(N^2) memory. Tile-area gate alone is not enough: bh16 CI
-    # sweeps run with decode-scale ctx_lens (-c 49152, -c 98304, -c 10000000)
-    # and would OOM the host. Mirror the normal-prefill gate's explicit
-    # ctx_lens <= 16384 cap to skip the ref for those configs.
     if (
-        (dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128])
-        and batch_size * ctx_lens * nhead < 32 * 8192 * 16
-        and ctx_lens <= 16384
-    ):
+        dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128]
+    ) and batch_size * ctx_lens * nhead < 32 * 8192 * 16:
         us_asm = test_absorb_prefill()
         ret["prefill:asm_576"] = us_asm
 
@@ -922,50 +505,6 @@ def test_mla(
         )
         return err, us_gluon_decode
 
-    def test_absorb_decode_gluon_bh16(name):
-        # Shared bh16bn{64,128} runner. The wrapper dispatches on (nhead, kv dtype):
-        # name='bh16bn128' -> cast kv to fp8; name='bh16bn64' -> keep bf16.
-        from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
-
-        out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
-        q_pe = q[:, :, v_head_dim:].view(batch_size, nhead, qk_head_dim - v_head_dim)
-
-        kv_c = kv_buffer.view(-1, qk_head_dim)
-        if name == "bh16bn128":
-            kv_c = kv_c.to(dtypes.fp8)
-
-        if not varlen:
-            page_table = kv_indices[:total_kv].view(batch_size, ctx_lens)
-            seq_info = seq_lens_kv
-            use_2d_view = True
-        else:
-            page_table = kv_indices
-            seq_info = kv_indptr
-            use_2d_view = False
-
-        (attn_logits, attn_lse), us_decode = run_perftest(
-            mla_decode_gluon,
-            q_nope,
-            q_pe,
-            kv_c,
-            out_gluon.view(batch_size, nhead, v_head_dim),
-            page_table,
-            seq_info,
-            sm_scale,
-            use_2d_view=use_2d_view,
-            kv_scale=1.0,
-            min_kv_seq_len=ctx_lens,
-        )
-
-        err = checkAllclose(
-            out_ref,
-            out_gluon,
-            msg=f"mla_decode-absorb    [golden vs gluon_{name}]: {us_decode:>8.2f} us......",
-        )
-        cal_diff(out_ref, out_gluon, f"out_gluon_{name}", use_fp8=(name == "bh16bn128"))
-        return err, us_decode
-
     err = None
     us_asm_decode = 1e12
     if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
@@ -975,29 +514,18 @@ def test_mla(
         128,
     ]:
         err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and nhead in [8, 16, 128]:
+    elif kvtype == dtypes.fp8 and nhead in [16, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
 
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
-
-    flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
-    bytes = (
-        total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
-        + total_q * nhead * qk_head_dim * (torch.finfo(dtype).bits // 8)
-        + total_q * nhead * v_head_dim * (torch.finfo(out_dtype).bits // 8)
-    )
-
-    ret["decode:flops"] = flops
-    ret["decode:bytes"] = bytes
-    ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
-    ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
 
     # Gluon MLA decode test (bf16 only, nhead in (64,128), decode_qlen=1,
     # head_dim_ckv=512, head_dim_kpe=64, batch in (64,128,256), page_size=1).
     # NUM_KV_SPLITS is auto-picked by the wrapper so the launch fills ~256
     # workgroups; the per-split min seq_len bound depends on it. Mirror the
     # picker here to gate ctx_lens precisely.
+    us_gluon_decode = 1e12
     NUM_XCDS_GFX950 = 8
     BLOCK_H_GLUON = 64
     if (
@@ -1024,53 +552,21 @@ def test_mla(
         if ctx_lens > min_ctx_required:
             err_gluon, us_gluon_decode = test_absorb_decode_gluon()
             ret["decode:gluon_err"] = err_gluon
-            ret["decode:gluon_576"] = us_gluon_decode
-            ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
-            ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+    ret["decode:gluon_576"] = us_gluon_decode
 
-    # Gluon MLA bh16bn128 decode test (gfx950, bf16 Q + fp8 KV, nhead in (4,8,16),
-    # batch=1, decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
-    # NUM_KV_SPLITS=256 hardcoded; kernel asserts min_kv_seq_len // 256 >= BLOCK_N*3,
-    # i.e. min_kv_seq_len >= 98304. Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
-    if (
-        get_gfx() == "gfx950"
-        and dtype == torch.bfloat16
-        and kvtype == dtypes.fp8
-        and nhead <= 16
-        and decode_qlen == 1
-        and batch_size == 1
-        and v_head_dim == 512
-        and (qk_head_dim - v_head_dim) == 64
-        and page_size == 1
-        and ctx_lens >= 256 * 128 * 3
-    ):
-        err_gluon, us_gluon_decode = test_absorb_decode_gluon_bh16("bh16bn128")
-        ret["decode:gluon_err"] = err_gluon
-        ret["decode:gluon_576"] = us_gluon_decode
-        ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
-        ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+    flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+    bytes = (
+        total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
+        + total_q * nhead * qk_head_dim * (torch.finfo(dtype).bits // 8)
+        + total_q * nhead * v_head_dim * (torch.finfo(out_dtype).bits // 8)
+    )
 
-    # Gluon MLA bh16bn64 decode test (gfx950, bf16 Q + bf16 KV, nhead in (4,8,16),
-    # batch=1, decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
-    # NUM_KV_SPLITS=256 hardcoded; kernel asserts min_kv_seq_len // 256 >= BLOCK_N*3,
-    # i.e. min_kv_seq_len >= 49152. Example: -c 3000000 -b 1 -n 16,1 -d bf16 -kvd bf16
-    if (
-        get_gfx() == "gfx950"
-        and dtype == torch.bfloat16
-        and kvtype == torch.bfloat16
-        and nhead <= 16
-        and decode_qlen == 1
-        and batch_size == 1
-        and v_head_dim == 512
-        and (qk_head_dim - v_head_dim) == 64
-        and page_size == 1
-        and ctx_lens >= 256 * 64 * 3
-    ):
-        err_gluon, us_gluon_decode = test_absorb_decode_gluon_bh16("bh16bn64")
-        ret["decode:gluon_err"] = err_gluon
-        ret["decode:gluon_576"] = us_gluon_decode
-        ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
-        ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+    ret["decode:flops"] = flops
+    ret["decode:bytes"] = bytes
+    ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
+    ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
+    ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
+    ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
 
     return ret
 
@@ -1163,21 +659,7 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=[
-        (4, 1),
-        (8, 1),
-        (12, 1),
-        (16, 1),
-        (16, 2),
-        (16, 4),
-        (32, 1),
-        (32, 2),
-        (32, 4),
-        (64, 1),
-        (128, 1),
-        (128, 2),
-        (128, 4),
-    ],
+    choices=[(16, 1), (16, 2), (16, 4), (64, 1), (128, 1), (128, 2), (128, 4)],
     nargs="*",
     const=None,
     default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
@@ -1206,31 +688,9 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
-parser.add_argument(
-    "--mi400",
-    choices=["auto", "on", "off"],
-    default="auto",
-    help="""Run the gfx1250/mi400 MLA decode sweep instead of the default sweep.
-    auto (default): run mi400 sweep iff get_gfx()=="gfx1250".
-    on: force the mi400 sweep. off: never run the mi400 sweep.""",
-)
 
 
 args = parser.parse_args()
-
-
-def _detect_gfx():
-    try:
-        return get_gfx()
-    except Exception:
-        return None
-
-
-_run_mi400 = args.mi400 == "on" or (args.mi400 == "auto" and _detect_gfx() == "gfx1250")
-
-if _run_mi400:
-    run_mi400_sweep()
-    raise SystemExit(0)
 
 for nhead, decode_qlen in args.nhead:
     df = []

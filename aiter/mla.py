@@ -4,6 +4,7 @@
 # user interface
 
 import functools
+import os
 from typing import Optional
 import torch
 import triton
@@ -13,6 +14,24 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.core import is_experimental_enabled
+
+
+def _dump_mla_debug_tensor(dump_dir, name, tensor):
+    if tensor is None:
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    contiguous = tensor.detach().contiguous()
+    raw = contiguous.view(torch.uint8).cpu().numpy()
+    raw.tofile(os.path.join(dump_dir, f"{name}.bin"))
+    with open(os.path.join(dump_dir, f"{name}.meta.txt"), "w") as f:
+        f.write(f"name={name}\n")
+        f.write(f"dtype={tensor.dtype}\n")
+        f.write(f"shape={tuple(tensor.shape)}\n")
+        f.write(f"stride={tuple(tensor.stride())}\n")
+        f.write(f"element_size={tensor.element_size()}\n")
+        f.write(f"numel={tensor.numel()}\n")
+        f.write(f"nbytes={raw.nbytes}\n")
+        f.write("layout=contiguous raw tensor bytes\n")
 
 
 @triton.jit
@@ -226,20 +245,24 @@ def mla_decode_fwd(
         if nhead in [8, 16] and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
 
+        # gfx1250 (mi400) MLA shader writes R as fp32; the bf16 `o.view(...)`
+        # alias optimization that gfx942/gfx950 use makes splitData only half
+        # the required size on gfx1250 and causes GPU page faults. Force a
+        # standalone fp32 splitData on gfx1250 and let the existing stage2
+        # reduction project it back to bf16 `o`.
+        _is_gfx1250 = get_gfx() == "gfx1250"
+        _can_alias_o_as_logits = (
+            num_kv_splits == 1
+            and (
+                q.dtype == dtypes.fp8
+                or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+            )
+            and not _is_gfx1250
+        )
+
         logits = (
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
-            if (
-                num_kv_splits == 1
-                and (
-                    q.dtype == dtypes.fp8
-                    or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
-                    or (
-                        q.dtype == dtypes.bf16
-                        and kv_buffer.dtype == dtypes.bf16
-                        and nhead == 32
-                    )
-                )
-            )
+            if _can_alias_o_as_logits
             else torch.empty(
                 (total_s, num_kv_splits, nhead, v_head_dim),
                 dtype=dtypes.fp32,
@@ -256,11 +279,23 @@ def mla_decode_fwd(
             else None
         )
 
+        kv_indptr_stage1 = kv_indptr
+        if _is_gfx1250:
+            kv_seq_lens = kv_indptr[1:] - kv_indptr[:-1]
+            kv_page_counts = torch.div(
+                kv_seq_lens + page_size - 1,
+                page_size,
+                rounding_mode="floor",
+            )
+            kv_indptr_stage1 = torch.empty_like(kv_indptr)
+            kv_indptr_stage1[0] = 0
+            kv_indptr_stage1[1:] = torch.cumsum(kv_page_counts, dim=0)
+
         aiter.mla_decode_stage1_asm_fwd(
             q,
             kv_buffer,
             qo_indptr,
-            kv_indptr,
+            kv_indptr_stage1,
             kv_indices,
             kv_last_page_lens,
             num_kv_splits_indptr,
@@ -279,17 +314,63 @@ def mla_decode_fwd(
             kv_scale,
         )
 
-        if num_kv_splits == 1 and (
-            q.dtype == dtypes.fp8
-            or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
-            or (
-                q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
-                and nhead == 32
-            )
-        ):
+        dump_dir = os.getenv("AITER_MLA_DEBUG_DUMP_DIR")
+        if dump_dir:
+            # The stage1 raw buffers the asm kernel consumes/produces
+            # (q, kv_buffer, qo_indptr, kv_indptr, kv_page_indices,
+            # kv_last_page_lens, num_kv_splits_indptr, q_scale, kv_scale,
+            # splitData, splitLse) are now dumped from the gfx1250 asm
+            # dispatcher in csrc/py_itfs_cu/asm_mla.cu under ASM_DEBUG, so the
+            # shared mla.py stays clean. Here we only dump the Python-only
+            # token-level kv_indptr that the asm kernel never receives;
+            # output/final_lse are dumped after the PyTorch stage2 below.
+            _dump_mla_debug_tensor(dump_dir, "kv_indptr_tokens", kv_indptr)
+
+        if _can_alias_o_as_logits:
             lse = final_lse if return_lse else attn_lse
             return logits.view(total_s, nhead, v_head_dim), lse
+
+        if _is_gfx1250:
+            if num_kv_splits == 1:
+                o.copy_(logits[:, 0].to(o.dtype))
+                if final_lse is not None:
+                    final_lse.copy_(attn_lse[:, 0, :, 0])
+            else:
+                for cur_batch in range(bs):
+                    cur_qo_start = int(qo_indptr[cur_batch].item())
+                    cur_qo_end = int(qo_indptr[cur_batch + 1].item())
+                    cur_split_start = int(num_kv_splits_indptr[cur_batch].item())
+                    cur_split_end = int(num_kv_splits_indptr[cur_batch + 1].item())
+                    cur_kv_seq_len = int((kv_indptr[cur_batch + 1] - kv_indptr[cur_batch]).item())
+                    num_valid_kv_splits = min(
+                        cur_split_end - cur_split_start,
+                        triton.cdiv(cur_kv_seq_len, mgc),
+                    )
+                    cur_logits = logits[
+                        cur_qo_start:cur_qo_end,
+                        cur_split_start : cur_split_start + num_valid_kv_splits,
+                    ]
+                    cur_lse = attn_lse[
+                        cur_qo_start:cur_qo_end,
+                        cur_split_start : cur_split_start + num_valid_kv_splits,
+                        :,
+                        0,
+                    ]
+                    cur_final_lse = torch.logsumexp(cur_lse, dim=1)
+                    weights = torch.exp(cur_lse - cur_final_lse[:, None, :])
+                    o[cur_qo_start:cur_qo_end].copy_(
+                        (cur_logits * weights[..., None]).sum(dim=1).to(o.dtype)
+                    )
+                    if final_lse is not None:
+                        final_lse[cur_qo_start:cur_qo_end].copy_(cur_final_lse)
+            if dump_dir:
+                _dump_mla_debug_tensor(dump_dir, "output", o)
+                _dump_mla_debug_tensor(dump_dir, "final_lse", final_lse)
+            print(
+                "[aiter][mi400][debug] _fwd_kernel_stage2_asm replaced by temporary PyTorch stage2",
+                flush=True,
+            )
+            return logits, final_lse if return_lse else None
 
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
