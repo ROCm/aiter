@@ -22,6 +22,7 @@ from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+_local_expert_count_cache = {}
 
 
 def _moe_sorting_impl(
@@ -38,14 +39,21 @@ def _moe_sorting_impl(
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
-    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
+    if expert_mask is not None:
+        key = (expert_mask.data_ptr(), expert_mask.numel())
+        if key not in _local_expert_count_cache:
+            _local_expert_count_cache[key] = int((expert_mask >= 0).sum().item())
+        n_experts = _local_expert_count_cache[key]
+    else:
+        n_experts = num_experts
+    max_num_tokens_padded = int(topk_ids.numel() + n_experts * block_size - topk)
 
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
     sorted_weights = torch.empty(
         max_num_tokens_padded, dtype=dtypes.fp32, device=device
     )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    sorted_expert_ids = torch.zeros(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
@@ -64,6 +72,8 @@ def _moe_sorting_impl(
         num_local_tokens,
         dispatch_policy,
     )
+    if expert_mask is not None:
+        sorted_expert_ids.clamp_(0, n_experts - 1)
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
