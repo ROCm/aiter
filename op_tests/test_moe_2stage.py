@@ -646,6 +646,15 @@ def test_fmoe(
             pass  # falls through to the flydsl branch below
         else:
             return
+    else:
+        # On gfx1250, non-per_1x32 quant types fall through to the aiter CK
+        # path which depends on Composable Kernel.  CK does not support
+        # gfx1250 yet (JIT-compiled module_moe_sorting fails to build, see
+        # ``ck_tile/core/config.hpp`` static_assert), so these cases either
+        # error out or hang.  Skip cleanly so a no-arg sweep on gfx1250
+        # only exercises the FlyDSL paths (q=4/6/7/8).
+        if _IS_GFX1250:
+            return
 
     # FlyDSL branch decision (Step 3) and dispatch (Step 4).
     fmt_label = _derive_flydsl_fmt(qType, AQDType, WQDType, dtype)
@@ -947,8 +956,10 @@ parser.add_argument(
     "-dim",
     type=dtypes.str2tuple,
     nargs="*",
-    default=[(7168, 256)],
+    default=None,
     help="""Model dimension.
+    Default: gfx1250 -> [(256, 128)] (FlyDSL smoke);
+             everything else -> [(7168, 256)].
     e.g.: -dim 6144,4096""",
 )
 
@@ -957,20 +968,10 @@ parser.add_argument(
     "--tokenNum",
     type=int,
     nargs="*",
-    default=[
-        1,
-        3,
-        5,
-        16,
-        32,
-        64,
-        128,
-        256,
-        1024,
-        4096,
-        163840,
-    ],
+    default=None,
     help="""Number of tokens.
+    Default: gfx1250 -> [1, 16, 64, 256] (FlyDSL smoke);
+             everything else -> [1, 3, 5, 16, 32, 64, 128, 256, 1024, 4096, 163840].
     e.g.: -t 1024""",
 )
 
@@ -1017,8 +1018,9 @@ parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    default=257,
+    default=None,
     help="""Number of experts.
+    Default: gfx1250 -> 4 (FlyDSL smoke); everything else -> 257.
     e.g.: -e 8""",
 )
 
@@ -1026,8 +1028,9 @@ parser.add_argument(
     "-k",
     "--topk",
     type=int,
-    default=9,
+    default=None,
     help="""Number of top experts.
+    Default: gfx1250 -> 2 (FlyDSL smoke); everything else -> 9.
     e.g.: -k 2""",
 )
 
@@ -1062,6 +1065,26 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+
+
+# Resolve sentinel defaults: pick gfx-appropriate values when the user did
+# not pass -dim / -t / -e / -k explicitly.  On gfx1250 we default to a tiny
+# FlyDSL smoke config (E=4, k=2, dim=(256,128), t=[1,16,64,256]) so that
+# ``python op_tests/test_moe_2stage.py`` finishes in ~5–10 min instead of
+# >1 h spent quantising 1.8 GB weights for the legacy DeepSeek defaults
+# (E=257, k=9, dim=(7168,256)).
+if args.dim is None:
+    args.dim = [(256, 128)] if _IS_GFX1250 else [(7168, 256)]
+if args.tokenNum is None:
+    args.tokenNum = (
+        [1, 16, 64, 256]
+        if _IS_GFX1250
+        else [1, 3, 5, 16, 32, 64, 128, 256, 1024, 4096, 163840]
+    )
+if args.expert is None:
+    args.expert = 4 if _IS_GFX1250 else 257
+if args.topk is None:
+    args.topk = 2 if _IS_GFX1250 else 9
 
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
@@ -1207,6 +1230,14 @@ def _iter_legacy_cases():
         doweight_stage1,
     ) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
         triple = (quant_type, aq_dtype, wq_dtype)
+
+        # On gfx1250 only per_1x32 paths have a working backend (FlyDSL).
+        # Filter non-per_1x32 quant types out at iter-time so we don't even
+        # print their ``calling test_fmoe`` banner.  This keeps a no-arg
+        # sweep (``python op_tests/test_moe_2stage.py``) focused on the
+        # FlyDSL paths.
+        if _IS_GFX1250 and quant_type != aiter.QuantType.per_1x32:
+            continue
 
         if triple in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
