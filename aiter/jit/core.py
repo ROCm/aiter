@@ -65,6 +65,54 @@ AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
 
+# AITER_LOG_MODULE: comma-separated list of module names to filter logs
+# When AITER_LOG_MORE > 0, only logs from specified modules will be output
+AITER_LOG_MODULE = os.getenv("AITER_LOG_MODULE", "")
+_AITER_LOG_MODULES = set()
+if AITER_LOG_MODULE:
+    _AITER_LOG_MODULES = set(m.strip() for m in AITER_LOG_MODULE.split(",") if m.strip())
+
+
+def should_log_module(module_name: str) -> bool:
+    """Check if a module should log when AITER_LOG_MORE > 0.
+
+    Args:
+        module_name: Name of the module to check
+
+    Returns:
+        True if logging is allowed for this module
+    """
+    if AITER_LOG_MORE <= 0:
+        return True
+    if not _AITER_LOG_MODULES:
+        return True
+    return module_name in _AITER_LOG_MODULES
+
+
+def log_module(msg: str, module: str = None, level: str = "info"):
+    """Log message with optional module filtering and prefix.
+
+    When AITER_LOG_MORE > 0 and AITER_LOG_MODULE is set, only logs from
+    specified modules will be output. Module name is prefixed to message.
+
+    Args:
+        msg: Message to log
+        module: Optional module name for filtering and prefixing
+        level: Log level (debug, info, warning, error)
+    """
+    if module and not should_log_module(module):
+        return
+    prefix = f"[{module}] " if module and AITER_LOG_MORE > 0 else ""
+    full_msg = f"{prefix}{msg}"
+    if level == "debug":
+        logger.debug(full_msg)
+    elif level == "warning":
+        logger.warning(full_msg)
+    elif level == "error":
+        logger.error(full_msg)
+    else:
+        logger.info(full_msg)
+
 
 # config_env start here
 AITER_CONFIG_GEMM_A4W4 = os.getenv(

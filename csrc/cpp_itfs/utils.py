@@ -54,7 +54,47 @@ AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
+AITER_LOG_MODULE = os.getenv("AITER_LOG_MODULE", "")
 AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
+
+# Parse module filter list (used when AITER_LOG_MORE > 0)
+_AITER_LOG_MODULES = set()
+if AITER_LOG_MODULE:
+    _AITER_LOG_MODULES = set(m.strip() for m in AITER_LOG_MODULE.split(",") if m.strip())
+
+
+def should_log_module(module_name: str) -> bool:
+    """Check if a module should log when AITER_LOG_MORE > 0.
+
+    Args:
+        module_name: Name of the module to check
+
+    Returns:
+        True if logging is allowed for this module
+    """
+    if AITER_LOG_MORE <= 0:
+        return True
+    if not _AITER_LOG_MODULES:
+        return True
+    return module_name in _AITER_LOG_MODULES
+
+
+def log_module(logger_func, msg: str, module: str = None):
+    """Log message with optional module filtering.
+
+    When AITER_LOG_MORE > 0 and AITER_LOG_MODULE is set, only logs from
+    specified modules will be output. Module name is prefixed to message.
+
+    Args:
+        logger_func: Logger function to use (e.g., logger.info)
+        msg: Message to log
+        module: Optional module name for filtering and prefixing
+    """
+    if module and not should_log_module(module):
+        return
+    if module and AITER_LOG_MORE > 0:
+        msg = f"[{module}] {msg}"
+    logger_func(msg)
 AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))
 
 if AITER_REBUILD >= 1:

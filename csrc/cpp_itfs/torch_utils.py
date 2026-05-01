@@ -6,7 +6,7 @@ import torch
 import ctypes
 from torch.library import Library
 from typing import Callable, Optional, Tuple
-from csrc.cpp_itfs.utils import AITER_LOG_MORE, logger
+from csrc.cpp_itfs.utils import AITER_LOG_MORE, logger, log_module
 
 
 def log_args(func, *args, **kwargs):
