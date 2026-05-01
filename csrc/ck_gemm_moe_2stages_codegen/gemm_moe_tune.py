@@ -74,6 +74,18 @@ TUNE_MOE_EXPERT_BALANCE = (
 COS_DIFF_THRESHOLD = 1e-1
 
 
+def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
+    """Map ``knl_name`` -> 0/1 when the manifest has a ``flat`` column.
+
+    If the column is absent, every kernel is treated as non-FLAT (equivalent
+    to all zeros). Only manifests that include FLAT 1-stage asm variants need
+    the column.
+    """
+    if "flat" not in df.columns:
+        return {}
+    return dict(zip(df["knl_name"], df["flat"].fillna(0).astype(int)))
+
+
 def torch_dynamic_mxfp8_quant(x: torch.Tensor):
     """MXFP8 quantization (e4m3fn + e8m0 block scale, block=32).
 
@@ -1844,18 +1856,24 @@ class FmoeTuner(TunerCommon):
         )
         kernels_list_csv_1stage = f"{get_asm_dir()}/fmoe/{acti_dir}/fmoe_bf16_{{quantDtype_1stage}}_g1u{up}_{acti_dir}{{extraInfo_1stage}}.csv"
         asm_kernels_1stage = {}
+        asm_1stage_csv_path = ""
         if (
             q_type != QuantType.No
             and q_type != QuantType.per_Tensor
             and q_dtype_w != torch.int4
         ):
+            asm_1stage_csv_path = kernels_list_csv_1stage.format(
+                quantDtype_1stage=quantDtype_1stage,
+                extraInfo_1stage=extraInfo_1stage,
+            )
             asm_kernels_1stage = self.get_kernels_dict(
-                kernels_list_csv_1stage.format(
-                    quantDtype_1stage=quantDtype_1stage,
-                    extraInfo_1stage=extraInfo_1stage,
-                ),
+                asm_1stage_csv_path,
                 key=["subGU_m", "subGU_n", "smf"],
             )
+        asm_1stage_flat = {}
+        if asm_1stage_csv_path and os.path.exists(asm_1stage_csv_path):
+            _df = pd.read_csv(asm_1stage_csv_path)
+            asm_1stage_flat = _manifest_flat_by_kernel(_df)
         fmoe_func = FmoeTuner.get_1stage_fmoe_func(
             q_type, q_dtype_a, act_type, use_g1u1, doweight_stage1
         )
@@ -1866,9 +1884,15 @@ class FmoeTuner(TunerCommon):
                 continue
 
             for el in asm_kernels_1stage.get((tile_m, tile_n, 0), []):
+                # Per-kernel ``flat`` in asm manifest (FLAT == raw topk, no host sort).
+                flat_flag = int(asm_1stage_flat.get(el, 0))
+                if flat_flag:
+                    _data_idx = [0, 1, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
+                else:
+                    _data_idx = [0, 1, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
                 task_1stage.append(
                     (
-                        (info, "asm_1stage", el, tile_m),
+                        (info, "asm_1stage", el, tile_m, flat_flag),
                         FmoeTuner.generate_data_1stage,
                         (
                             token,
@@ -1886,7 +1910,7 @@ class FmoeTuner(TunerCommon):
                         ),
                         fmoe_func,
                         (
-                            [0, 1, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17],
+                            _data_idx,
                             q_type,
                             use_g1u1,
                             act_type,
@@ -1937,13 +1961,23 @@ class FmoeTuner(TunerCommon):
             xbf16_kernels = self.get_kernels_dict(
                 xbf16_csv, key=["subGU_m", "subGU_n", "smf"]
             )
+            xbf16_flat = {}
+            if os.path.exists(xbf16_csv):
+                _df = pd.read_csv(xbf16_csv)
+                xbf16_flat = _manifest_flat_by_kernel(_df)
             for tile_m, tile_n, smf in xbf16_kernels.keys():
                 if inter_dim % tile_n != 0 or smf != 0:
                     continue
                 for el in xbf16_kernels.get((tile_m, tile_n, 0), []):
+                    # xbf16: internal quant; FLAT kernels (manifest flat=1) take raw topk.
+                    flat_flag = int(xbf16_flat.get(el, 0))
+                    if flat_flag:
+                        _data_idx = [0, 0, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
+                    else:
+                        _data_idx = [0, 0, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
                     task_1stage.append(
                         (
-                            (info, "asm_1stage_xbf16", el, tile_m),
+                            (info, "asm_1stage_xbf16", el, tile_m, flat_flag),
                             FmoeTuner.generate_data_1stage,
                             (
                                 token,
@@ -1961,7 +1995,7 @@ class FmoeTuner(TunerCommon):
                             ),
                             fmoe_func,
                             (
-                                [0, 0, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17],
+                                _data_idx,
                                 q_type,
                                 use_g1u1,
                                 act_type,
@@ -3195,6 +3229,9 @@ class FmoeTuner(TunerCommon):
         if "xbf16" not in resultdf.columns:
             resultdf["xbf16"] = 0
         resultdf["xbf16"] = resultdf["xbf16"].fillna(0).astype(int)
+        if "flat" not in resultdf.columns:
+            resultdf["flat"] = 0
+        resultdf["flat"] = resultdf["flat"].fillna(0).astype(int)
         if results is not None:
             resultdf = resultdf.astype(str).drop_duplicates(
                 subset=self.keys,
@@ -3247,7 +3284,11 @@ class FmoeTuner(TunerCommon):
             import re
 
             profileDF = []
-            for (stage, kernelName, block_m), us, err in rets:
+            for tail, us, err in rets:
+                stage = tail[0]
+                kernelName = tail[1]
+                block_m = tail[2]
+                flat_flag = int(tail[3]) if len(tail) > 3 else 0
                 tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))
                 row_ksplit = 0
                 sk_match = re.search(r"_sk(\d+)$", str(kernelName))
@@ -3277,6 +3318,7 @@ class FmoeTuner(TunerCommon):
                         err,
                         tflops,
                         bw,
+                        flat_flag,
                     ]
                 )
 
@@ -3285,7 +3327,16 @@ class FmoeTuner(TunerCommon):
                 columns=["stage"]
                 # + ["cu_num"]
                 + self.keys
-                + ["block_m", "ksplit", "us", "kernelName", "err", "tflops", "bw"],
+                + [
+                    "block_m",
+                    "ksplit",
+                    "us",
+                    "kernelName",
+                    "err",
+                    "tflops",
+                    "bw",
+                    "flat",
+                ],
             )
             prorfiles.append(profileDF)
 
@@ -3296,18 +3347,18 @@ class FmoeTuner(TunerCommon):
                 & (profileDF["us"] != -1)
                 & (profileDF["err"] <= args.errRatio)
             ]
-            # Keep best non-flydsl per (stage, block_m) for fallback before dedup
+            # Keep best non-flydsl per (stage, block_m, flat) for FLAT dedup.
             _non_flydsl = profileDF[
                 ~profileDF["kernelName"].astype(str).str.startswith("flydsl_")
             ]
             _non_flydsl_best = _non_flydsl.sort_values("us").drop_duplicates(
-                ["stage", "block_m"], keep="first"
+                ["stage", "block_m", "flat"], keep="first"
             )
             profileDF = profileDF.sort_values("us").drop_duplicates(
-                ["stage", "block_m"], keep="first"
+                ["stage", "block_m", "flat"], keep="first"
             )
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
-                columns=["stage"]
+                columns=["stage", "flat"]
             )
 
             stage1_profileDF = stage1_profileDF.rename(
@@ -3320,7 +3371,7 @@ class FmoeTuner(TunerCommon):
                 }
             )
             stage2_profileDF = profileDF[profileDF["stage"] == "stage2"].drop(
-                columns=["stage", "ksplit"]
+                columns=["stage", "ksplit", "flat"]
             )
             stage2_profileDF = stage2_profileDF.rename(
                 columns={
@@ -3388,6 +3439,7 @@ class FmoeTuner(TunerCommon):
             )
             profileDF["run_1stage"] = 0
             profileDF["xbf16"] = 0
+            profileDF["flat"] = 0
             profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
             if len(profileDF) == 0:
                 print(
@@ -3420,6 +3472,7 @@ class FmoeTuner(TunerCommon):
                         self.INVALID_TIME,
                         0,
                         0,
+                        -1,
                         -1,
                         -1,
                     ]
@@ -3528,6 +3581,223 @@ class FmoeTuner(TunerCommon):
                     profileDF.loc[non_xbf16, "us1"] + us_quant
                 )
 
+            # moe_sorting fairness: flat=1 kernels sort internally; add host sort cost to others.
+            has_flat = "flat" in profileDF.columns and (profileDF["flat"] == 1).any()
+            if has_flat:
+                from aiter.test_common import run_perftest
+                from aiter.fused_moe import moe_sorting
+
+                _topk_ids = torch.randint(
+                    0, expert, (token, topk), dtype=torch.int32, device="cuda"
+                )
+                _topk_w = torch.rand((token, topk), dtype=dtypes.fp32, device="cuda")
+                us_sort_cache = {}
+                for bm in profileDF["block_m"].unique():
+                    bm_int = int(bm)
+                    try:
+                        _, us_sort = run_perftest(
+                            moe_sorting,
+                            _topk_ids,
+                            _topk_w,
+                            expert,
+                            model_dim,
+                            dtype,
+                            bm_int,
+                        )
+                        us_sort_cache[bm] = round(us_sort, 4)
+                    except Exception as e:
+                        print(
+                            f"  moe_sorting benchmark failed for block_m={bm_int}: {e}"
+                        )
+                        us_sort_cache[bm] = 0.0
+                print(f"  moe_sorting benchmark per block_m: {us_sort_cache}")
+                profileDF["us_moe_sort"] = profileDF["block_m"].map(us_sort_cache)
+                non_flat = profileDF["flat"] == 0
+                profileDF.loc[non_flat, "us1"] = (
+                    profileDF.loc[non_flat, "us1"]
+                    + profileDF.loc[non_flat, "us_moe_sort"]
+                )
+                profileDF.drop(columns=["us_moe_sort"], inplace=True)
+
+            # Asymmetric head-to-head e2e to correct FLAT-vs-non-FLAT picks.
+            # The additive moe_sorting fairness above already inflates non-FLAT
+            # us1 (standalone benchmark over-estimates the in-context sort cost),
+            # which biases the inter-class pick toward FLAT. We only intervene
+            # when that bias could actually flip the outcome -- i.e. when FLAT
+            # is currently the additive-fairness winner. Then we measure the
+            # real sequences end-to-end and drop FLAT iff non-FLAT truly wins.
+            # We never touch non-FLAT rows, so non-FLAT-vs-non-FLAT ranking
+            # (additive fairness + idxmin) stays exactly as it was.
+            if has_flat:
+                try:
+                    flat_mask = profileDF["flat"] == 1
+                    nf_mask = profileDF["flat"] == 0
+                    if not (flat_mask.any() and nf_mask.any()):
+                        raise RuntimeError("missing FLAT or non-FLAT class")
+                    # Rank candidates by us1+us2 (us2 is 0 for 1-stage rows,
+                    # so this is equivalent to us1 there; for 2-stage rows
+                    # we need the combined cost to know who would win idxmin).
+                    flat_df = profileDF[flat_mask].copy()
+                    nf_df = profileDF[nf_mask].copy()
+                    flat_df["_us_total"] = flat_df["us1"] + flat_df["us2"]
+                    nf_df["_us_total"] = nf_df["us1"] + nf_df["us2"]
+                    best_flat_row = flat_df.sort_values("_us_total").iloc[0]
+                    best_nf_row = nf_df.sort_values("_us_total").iloc[0]
+                    if float(best_flat_row["_us_total"]) >= float(
+                        best_nf_row["_us_total"]
+                    ):
+                        raise RuntimeError(
+                            "non-FLAT already winning under additive fairness"
+                        )
+                    # Head-to-head currently supports only 1-stage non-FLAT
+                    # candidates dispatched through fmoe_fp8_blockscale_g1u1
+                    # (q_type==per_1x128). 2-stage non-FLAT requires a
+                    # different launch sequence (ck_moe_stage1 + ck_moe_stage2)
+                    # and is left to the additive-fairness ranking.
+                    if int(best_nf_row.get("run_1stage", 0)) != 1:
+                        raise RuntimeError(
+                            "best non-FLAT is 2-stage; head-to-head needs"
+                            " 1-stage non-FLAT"
+                        )
+                    if q_type != QuantType.per_1x128:
+                        raise RuntimeError(
+                            "head-to-head currently only supports per_1x128"
+                        )
+                    nf_block_m = int(best_nf_row["block_m"])
+                    gen = FmoeTuner.generate_data_1stage(
+                        token,
+                        model_dim,
+                        inter_dim,
+                        expert,
+                        topk,
+                        act_type,
+                        dtype,
+                        q_dtype_a,
+                        q_dtype_w,
+                        q_type,
+                        use_g1u1,
+                        nf_block_m,
+                    )
+                    (
+                        _input,
+                        _a1_qt,
+                        _w1_qt_s,
+                        _w2_qt_s,
+                        _sids,
+                        _sws,
+                        _seids,
+                        _nv,
+                        _moe_buf,
+                        _a1_scale,
+                        _w1_scale,
+                        _w2_scale,
+                        _w1_qt,
+                        _w2_qt,
+                        _topk_w,
+                        _topk_ids,
+                        _fc1_ss,
+                        _fc2_ss,
+                        _a1_scale_t,
+                    ) = gen
+                    _flat_kname = str(best_flat_row["kernelName1"])
+                    _nf_kname = str(best_nf_row["kernelName1"])
+                    nf_is_xbf16 = int(best_nf_row.get("xbf16", 0)) == 1
+                    _nf_a1 = _input if nf_is_xbf16 else _a1_qt
+                    _act_int = int(act_type.value)
+                    # Call aiter.fmoe_fp8_blockscale_g1u1 directly with the
+                    # moe_buf returned by moe_sorting -- this matches the
+                    # production fused_moe path (the wrapper-based call would
+                    # allocate a second moe_buf via torch.zeros, adding an
+                    # aten::fill_ kernel that isn't on the production stream).
+
+                    def _flat_seq():
+                        sids, sws, seids, nv, mbuf = moe_sorting(
+                            _topk_ids,
+                            _topk_w,
+                            expert,
+                            model_dim,
+                            dtype,
+                            1,
+                            flat=True,
+                        )
+                        aiter.fmoe_fp8_blockscale_g1u1(
+                            mbuf,
+                            _input,
+                            _w1_qt_s,
+                            _w2_qt_s,
+                            sids,
+                            sws,
+                            seids,
+                            nv,
+                            topk,
+                            _a1_scale_t,
+                            _w1_scale,
+                            _w2_scale,
+                            kernelName=_flat_kname,
+                            activation=_act_int,
+                        )
+                        return mbuf
+
+                    def _nf_seq():
+                        sids, sws, seids, nv, mbuf = moe_sorting(
+                            _topk_ids,
+                            _topk_w,
+                            expert,
+                            model_dim,
+                            dtype,
+                            nf_block_m,
+                        )
+                        aiter.fmoe_fp8_blockscale_g1u1(
+                            mbuf,
+                            _nf_a1,
+                            _w1_qt_s,
+                            _w2_qt_s,
+                            sids,
+                            sws,
+                            seids,
+                            nv,
+                            topk,
+                            _a1_scale_t,
+                            _w1_scale,
+                            _w2_scale,
+                            kernelName=_nf_kname,
+                            activation=_act_int,
+                        )
+                        return mbuf
+
+                    _, us_flat_e2e = run_perftest(_flat_seq)
+                    _, us_nf_e2e = run_perftest(_nf_seq)
+                    us_flat_e2e = round(us_flat_e2e, 4)
+                    us_nf_e2e = round(us_nf_e2e, 4)
+                    print(
+                        f"  e2e head-to-head: FLAT '{_flat_kname}' "
+                        f"us={us_flat_e2e}; non-FLAT '{_nf_kname}' "
+                        f"(bm={nf_block_m}) us={us_nf_e2e}",
+                        flush=True,
+                    )
+                    # Asymmetric override: only drop FLAT when non-FLAT truly
+                    # wins by a non-noise margin. Otherwise leave profileDF
+                    # untouched and let additive-fairness idxmin decide.
+                    margin_us = 0.5
+                    if us_flat_e2e > us_nf_e2e + margin_us:
+                        dropped = int(flat_mask.sum())
+                        profileDF = profileDF[~flat_mask].copy()
+                        print(
+                            f"  -> dropping {dropped} FLAT candidate(s); "
+                            f"non-FLAT wins e2e by "
+                            f"{us_flat_e2e - us_nf_e2e:.3f} us"
+                        )
+                    else:
+                        print(
+                            "  -> FLAT confirmed (or within noise); "
+                            "keeping additive-fairness ranking"
+                        )
+                except Exception as _e2e_err:
+                    print(
+                        f"  e2e head-to-head skipped/failed ({_e2e_err}); "
+                        "falling back to additive fairness"
+                    )
+
             profileDF["us"] = round(profileDF["us1"] + profileDF["us2"], 4)
             results = profileDF.apply(
                 lambda row: self.calculate(
@@ -3570,10 +3840,16 @@ class FmoeTuner(TunerCommon):
                 "flydsl_"
             ) or str(best_one.get("kernelName2", "")).startswith("flydsl_")
             if best_has_flydsl:
-                # Build fallback from best non-flydsl candidates (saved before dedup)
+                # Drop ``flat`` so merge is unambiguous; 2-stage fallbacks set flat=0.
                 _nf_s1 = (
                     _non_flydsl_best[_non_flydsl_best["stage"] == "stage1"]
-                    .drop(columns=["stage"])
+                    .drop(
+                        columns=[
+                            c
+                            for c in ["stage", "flat"]
+                            if c in _non_flydsl_best.columns
+                        ]
+                    )
                     .rename(
                         columns={
                             "kernelName": "kernelName1",
@@ -3586,7 +3862,13 @@ class FmoeTuner(TunerCommon):
                 )
                 _nf_s2 = (
                     _non_flydsl_best[_non_flydsl_best["stage"] == "stage2"]
-                    .drop(columns=["stage", "ksplit"])
+                    .drop(
+                        columns=[
+                            c
+                            for c in ["stage", "ksplit", "flat"]
+                            if c in _non_flydsl_best.columns
+                        ]
+                    )
                     .rename(
                         columns={
                             "kernelName": "kernelName2",
@@ -3615,6 +3897,7 @@ class FmoeTuner(TunerCommon):
                     )
                     non_flydsl_df["run_1stage"] = 0
                     non_flydsl_df["xbf16"] = 0
+                    non_flydsl_df["flat"] = 0
                     non_flydsl_df["tflops"] = 0
                     non_flydsl_df["bw"] = 0
                     fb = non_flydsl_df.loc[non_flydsl_df["us"].idxmin()].copy()
@@ -3695,6 +3978,8 @@ if __name__ == "__main__":
         "us",
         "run_1stage",
         "xbf16",
+        # 1 if FLAT 1stage (manifest flat); else 0.
+        "flat",
         "tflops",
         "bw",
     ]

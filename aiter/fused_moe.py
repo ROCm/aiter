@@ -27,6 +27,36 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 
+# FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
+# topk_weights through the sorted_* kernarg slots and accumulate via
+# global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
+
+
+def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
+    device = topk_ids.device
+    M = topk_ids.shape[0]
+    # torch.empty (not torch.zeros): the asm fmoe kernels write back via
+    # global_atomic_pk_add_bf16 (accumulator pattern), so moe_buf MUST start
+    # zeroed -- but we issue the zero as a hipMemsetAsync on the kernel's
+    # stream from asm_fmoe.cu right before launch_kernel. That keeps both
+    # ops in a single CUDA-graph node pair (host pays ~one launch instead
+    # of two) and avoids aten::fill_'s ~2 us PyTorch dispatch overhead at
+    # small M.
+    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    topk_ids_i32 = (
+        topk_ids
+        if topk_ids.dtype == dtypes.i32 and topk_ids.is_contiguous()
+        else topk_ids.to(dtypes.i32).contiguous()
+    )
+    topk_weights_f32 = (
+        topk_weights
+        if topk_weights.dtype == dtypes.fp32 and topk_weights.is_contiguous()
+        else topk_weights.to(dtypes.fp32).contiguous()
+    )
+    # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels,
+    # but must be valid device pointers -- alias topk_ids as scratch.
+    return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
+
 
 def _moe_sorting_impl(
     topk_ids,
@@ -116,7 +146,13 @@ def moe_sorting(
     num_local_tokens=None,
     dispatch_policy=0,
     return_local_topk_ids=False,
+    flat=False,
 ):
+    # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
+    if flat:
+        return _moe_prepare_unsorted_input(
+            topk_ids, topk_weights, model_dim, moebuf_dtype
+        )
     try:
         return _moe_sorting_impl(
             topk_ids,
@@ -371,6 +407,7 @@ def fused_moe_(
         num_local_tokens,
         moe_sorting_dispatch_policy,
         return_local_topk_ids=need_local_topk_ids,
+        flat=metadata.flat,
     )
     if need_local_topk_ids:
         (
@@ -400,8 +437,6 @@ def fused_moe_(
             moe_buf,
             isG1U1,
             block_size_M,
-            # activation=activation,
-            # quant_type=quant_type,
             q_dtype_a=q_dtype_a,
             q_dtype_w=q_dtype_w,
             w1_scale=w1_scale,
@@ -719,6 +754,7 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
     fuse_quant: str = ""
     stage2_has_bias: bool = False
+    flat: bool = False
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -1054,6 +1090,8 @@ def get_2stage_cfgs(
         kernelName2 = ""
         run_1stage = False
         run_1stage_xbf16 = False
+        # No tuned config => default host moe_sort. For FLAT, run tuner and set flat=1.
+        cfg_flat = False
         if (
             activation,
             q_type,
@@ -1117,6 +1155,10 @@ def get_2stage_cfgs(
             run_1stage_xbf16 = run_1stage and bool(int(cfg["xbf16"]))
         else:
             run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
+        if "flat" in cfg:
+            cfg_flat = run_1stage and bool(int(cfg["flat"]))
+        else:
+            cfg_flat = False
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
@@ -1147,6 +1189,7 @@ def get_2stage_cfgs(
             block_m,
             ksplit,
             run_1stage,
+            flat=cfg_flat,
         )
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
