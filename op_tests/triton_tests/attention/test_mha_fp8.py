@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 import torch
 import pytest
 import logging
@@ -21,9 +22,22 @@ from aiter.test_mha_common import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
 
+arch = get_arch()
+
 pytestmark = pytest.mark.skipif(
-    get_arch() not in FP8_ARCHS, reason=f"FP8 not supported on {get_arch()}"
+    arch not in FP8_ARCHS, reason=f"FP8 not supported on {arch}"
 )
+
+
+def _triton_async_copy_enabled():
+    # gfx950 enables async copy by default in the current Triton compiler flow.
+    # If the user explicitly disables it, keep running the tests.
+    return os.environ.get("TRITON_HIP_USE_ASYNC_COPY", "1") != "0"
+
+
+def _gfx950_async_copy_enabled():
+    return arch == "gfx950" and _triton_async_copy_enabled()
+
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -121,6 +135,12 @@ def test_mha_varlen(
     dtype=torch.bfloat16,
 ):
     HEAD_SZ: int = 128
+
+    # TO DO: remove once Triton/LLVM async-copy compiler issue is fixed
+    if _gfx950_async_copy_enabled() and CAUSAL:
+        pytest.skip(
+            "Known gfx950 FP8 varlen MHA compiler crash with async copy enabled"
+        )
 
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
@@ -292,6 +312,14 @@ def test_mha_backward_varlen(
 
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
+
+    # TO DO: Remove  once the Triton/LLVM async-copy compiler issue is fixed
+    if _gfx950_async_copy_enabled() and (
+        (CAUSAL and not FUSED) or (not CAUSAL and NUM_Q_HEADS == 32)
+    ):
+        pytest.skip(
+            "Known gfx950 FP8 backward varlen MHA compiler crash with async copy enabled"
+        )
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
