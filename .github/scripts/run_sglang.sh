@@ -109,6 +109,16 @@ install_aiter_wheel() {
 start_container() {
   local image="$1"
   docker rm -f ci_sglang 2>/dev/null || true
+  # Restore files consumed by previous candidate's install_dependency.
+  # The install script does `mv pyproject_rocm.toml pyproject.toml` (and similar),
+  # so these files are gone after the first candidate. We restore from the cp
+  # backup taken before the loop — more reliable than `git checkout` on a shallow
+  # clone whose working tree has been modified by hipify / build artifacts.
+  local bkdir="${SGLANG_WORKSPACE}/.file-backups"
+  if [ -d "${bkdir}" ]; then
+    cp -f "${bkdir}/pyproject_rocm.toml"  "${SGLANG_WORKSPACE}/sgl-kernel/pyproject_rocm.toml" 2>/dev/null || true
+    cp -f "${bkdir}/pyproject_other.toml" "${SGLANG_WORKSPACE}/python/pyproject_other.toml"    2>/dev/null || true
+  fi
   export SGLANG_CI_HOSTNAME_OVERRIDE="${SGLANG_CI_HOSTNAME}"
   GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${HF_TOKEN}" \
     bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${image}"
@@ -132,6 +142,9 @@ if [ -n "${SGL_IMAGE_OVERRIDE:-}" ]; then
   else
     install_aiter_from_source
   fi
+
+  # Verify AITER works on this runner (may differ from preflight runner)
+  docker exec ci_sglang python3 -c "import aiter; print('AITER import OK')"
 else
 # Resolve candidates by matching ROCm version from AITER_VERSION
 readarray -t SGL_IMAGES < <(python3 - "${GPU_TAG}" "${AITER_VERSION:-}" <<'PY'
@@ -188,6 +201,16 @@ PY
 
 echo "Candidate SGLang images: ${SGL_IMAGES[*]}"
 
+# Back up files that amd_ci_install_dependency.sh consumes via `mv`.
+# The install script renames pyproject_rocm.toml → pyproject.toml (and similar),
+# so after the first candidate these files are gone from the shared workspace.
+# A simple cp backup is more reliable than `git checkout` on a shallow clone
+# whose working tree has been modified by hipify / build artifacts.
+_backup_dir="${SGLANG_WORKSPACE}/.file-backups"
+mkdir -p "${_backup_dir}"
+cp -f "${SGLANG_WORKSPACE}/sgl-kernel/pyproject_rocm.toml" "${_backup_dir}/" 2>/dev/null || true
+cp -f "${SGLANG_WORKSPACE}/python/pyproject_other.toml"    "${_backup_dir}/" 2>/dev/null || true
+
 # ── Try each candidate image: start container, install wheel, smoke-test import ──
 SGL_IMAGE=""
 for candidate in "${SGL_IMAGES[@]}"; do
@@ -201,7 +224,10 @@ for candidate in "${SGL_IMAGES[@]}"; do
       continue
     fi
   else
-    install_aiter_from_source
+    if ! install_aiter_from_source; then
+      echo "WARNING: Source build failed on ${candidate}, trying next image..."
+      continue
+    fi
   fi
 
   # Smoke-test: verify AITER can actually be imported (catches ABI mismatches)
