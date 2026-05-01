@@ -45,8 +45,28 @@ def sparse_mqa_sink(
     assert attn_sink.shape == (q.shape[1],)
     assert kv.shape[2] == q.shape[2]
 
+    num_tokens, num_heads, head_dim = q.shape
+    block_size = kv.shape[1]
+    topk_count = topk_indices.shape[1]
+    num_seqs = seqused_k.shape[0]
+    assert (
+        cu_seqlens_q.shape[0] == num_seqs + 1
+    ), (
+        "cu_seqlens_q must have length num_seqs + 1, "
+        f"got {cu_seqlens_q.shape[0]} vs {num_seqs + 1}"
+    )
+    assert (
+        block_table.shape[0] == num_seqs
+    ), f"block_table rows {block_table.shape[0]} must match num_seqs {num_seqs}"
+
     if q.numel() == 0:
         return out
+
+    assert num_seqs > 0, "non-empty q requires at least one sequence"
+    assert cu_seqlens_q[0] == 0, "cu_seqlens_q must start with 0"
+    assert (
+        cu_seqlens_q[-1] == num_tokens
+    ), f"cu_seqlens_q[-1] {cu_seqlens_q[-1]} must equal num_tokens {num_tokens}"
 
     q = q.contiguous()
     kv = kv.contiguous()
@@ -55,11 +75,6 @@ def sparse_mqa_sink(
     seqused_k = seqused_k.contiguous()
     block_table = block_table.contiguous()
     attn_sink = attn_sink.contiguous()
-
-    num_tokens, num_heads, head_dim = q.shape
-    block_size = kv.shape[1]
-    topk_count = topk_indices.shape[1]
-    num_seqs = seqused_k.shape[0]
 
     # Keep the accumulator footprint comparable to the original 8x64 tile
     # while halving output-D tiles. That cuts repeated QK score work for

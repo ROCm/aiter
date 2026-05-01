@@ -56,17 +56,14 @@ def _sparse_mqa_sink_kernel(
     dimension tile. KV is MQA: all query heads share the same [topk, head_dim]
     key/value rows.
     """
-    head_blocks: tl.constexpr = (num_heads + BLOCK_H - 1) // BLOCK_H
     token_id = tl.program_id(0)
     head_block = tl.program_id(1)
     dim_block = tl.program_id(2)
 
     seq_idx = _find_seq_idx(cu_seqlens_q_ptr, token_id, num_seqs)
-    seq_start = tl.load(cu_seqlens_q_ptr + seq_idx)
     seq_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
     if token_id >= seq_end:
         return
-    local_token = token_id - seq_start
     kv_len = tl.load(seqused_k_ptr + seq_idx)
 
     offs_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
