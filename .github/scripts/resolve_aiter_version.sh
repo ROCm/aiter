@@ -7,11 +7,13 @@
 # Output: sets AITER_INSTALL_CMD (full pip install command for AITER)
 
 AITER_PYTHON_TAG="${AITER_PYTHON_TAG:-cp312}"
+# Trim whitespace from AITER_VERSION (workflow inputs can have trailing spaces)
+AITER_VERSION="$(echo -n "${AITER_VERSION:-}" | xargs)"
 
 if [ -n "${AITER_INDEX_URL:-}" ]; then
   # Export so the heredoc Python script can read them via os.environ
   export AITER_INDEX_URL AITER_PYTHON_TAG
-  export AITER_VERSION="${AITER_VERSION:-}"
+  export AITER_VERSION
 
   # Find the direct wheel URL from the index.
   # Some S3 buckets serve wheels under an /amd-aiter/ subdirectory (PEP 503 style),
@@ -82,8 +84,13 @@ PYEOF
     AITER_INSTALL_CMD="pip install --force-reinstall '${WHEEL_URL}'"
     echo "AITER wheel: ${WHEEL_URL}"
   else
-    echo "WARNING: Could not resolve ${AITER_PYTHON_TAG} wheel URL, falling back to pip install amd-aiter"
-    AITER_INSTALL_CMD="pip install --force-reinstall --extra-index-url '${AITER_INDEX_URL}' amd-aiter"
+    if [ -n "${AITER_VERSION}" ]; then
+      echo "WARNING: Could not resolve ${AITER_PYTHON_TAG} wheel URL, falling back to pip install amd-aiter==${AITER_VERSION}"
+      AITER_INSTALL_CMD="pip install --force-reinstall --extra-index-url '${AITER_INDEX_URL}' 'amd-aiter==${AITER_VERSION}'"
+    else
+      echo "WARNING: Could not resolve ${AITER_PYTHON_TAG} wheel URL, falling back to pip install amd-aiter (latest)"
+      AITER_INSTALL_CMD="pip install --force-reinstall --extra-index-url '${AITER_INDEX_URL}' amd-aiter"
+    fi
   fi
 else
   AITER_INSTALL_CMD="pip install amd-aiter"
