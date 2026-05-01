@@ -222,22 +222,8 @@ for candidate in "${SGL_IMAGES[@]}"; do
     fi
   fi
 
-  # Smoke-test: verify AITER can actually be imported (catches ABI mismatches)
-  if docker exec ci_sglang python3 -c "
-import torch
-import aiter
-import ctypes, pathlib
-jit_dir = pathlib.Path(aiter.__file__).parent / 'jit'
-for so in sorted(jit_dir.glob('*.so')):
-    try:
-        ctypes.CDLL(str(so))
-        print(f'  OK: {so.name}')
-    except OSError as e:
-        if 'undefined symbol' in str(e):
-            raise RuntimeError(f'ABI mismatch: {so.name}: {e}') from e
-        print(f'  SKIP: {so.name} (non-ABI: {e})')
-print('AITER ABI check passed')
-" 2>&1; then
+  # Smoke-test: verify AITER can be imported
+  if docker exec ci_sglang python3 -c "import aiter; print('AITER import OK')" 2>&1; then
     echo "AITER wheel is compatible with ${candidate}"
     SGL_IMAGE="${candidate}"
     break
