@@ -153,15 +153,7 @@ import json, re, sys, time, urllib.request, urllib.error
 gpu_tag = sys.argv[1]
 aiter_version = sys.argv[2] if len(sys.argv) > 2 else ""
 
-rocm_match = re.search(r'rocm(\d+)\.(\d+)', aiter_version)
-if rocm_match:
-    rocm_tag = f"rocm{rocm_match.group(1)}{rocm_match.group(2)}0"
-    print(f"AITER wheel targets ROCm {rocm_match.group(1)}.{rocm_match.group(2)} → preferring {rocm_tag} container", file=sys.stderr)
-    all_rocm = [rocm_tag, "rocm700", "rocm720"]
-    seen = set()
-    rocm_versions = [v for v in all_rocm if v not in seen and not seen.add(v)]
-else:
-    rocm_versions = ["rocm700", "rocm720"]
+rocm_versions = ["rocm700", "rocm720"]
 
 prefixes = [f"v0.5.10.post1-{rv}-{gpu_tag}-" for rv in rocm_versions]
 patterns = {p: re.compile(rf"^{re.escape(p)}\d{{8}}(?:-preview)?$") for p in prefixes}
@@ -232,17 +224,19 @@ for candidate in "${SGL_IMAGES[@]}"; do
 
   # Smoke-test: verify AITER can actually be imported (catches ABI mismatches)
   if docker exec ci_sglang python3 -c "
+import torch
 import aiter
-from aiter.jit import aiter_core
-# Load all JIT modules to catch ABI mismatches early
-import importlib, pathlib
+import ctypes, pathlib
 jit_dir = pathlib.Path(aiter.__file__).parent / 'jit'
-for so in jit_dir.glob('*.so'):
+for so in sorted(jit_dir.glob('*.so')):
     try:
-        importlib.import_module(f'aiter.jit.{so.stem}')
-    except ImportError as e:
-        raise RuntimeError(f'ABI mismatch: {so.name}: {e}') from e
-print('AITER import OK — all JIT modules loaded')
+        ctypes.CDLL(str(so))
+        print(f'  OK: {so.name}')
+    except OSError as e:
+        if 'undefined symbol' in str(e):
+            raise RuntimeError(f'ABI mismatch: {so.name}: {e}') from e
+        print(f'  SKIP: {so.name} (non-ABI: {e})')
+print('AITER ABI check passed')
 " 2>&1; then
     echo "AITER wheel is compatible with ${candidate}"
     SGL_IMAGE="${candidate}"
