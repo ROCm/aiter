@@ -317,11 +317,13 @@ def test_runtime_dispatch_key():
     csv_with_gfx = wrong_gfx_csv = old_csv = None
     try:
         # 3.1 New CSV schema (gfx column present) — correct target is found
-        csv_with_gfx = _make_temp_csv(f"""
+        csv_with_gfx = _make_temp_csv(
+            f"""
             gfx,cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio
             {gfx},{cu_num},128,1280,8192,42,0,10.0,correct_kernel,100.0,500.0,0.0
             {wrong_gfx},{wrong_cu_num},128,1280,8192,99,0,10.0,wrong_kernel,100.0,500.0,0.0
-        """)
+        """
+        )
         _mod._CKGEMM_CONFIG_CACHE = {}
         cfg = get_CKGEMM_config(128, 1280, 8192, tuned_file=csv_with_gfx)
         _check(
@@ -337,10 +339,12 @@ def test_runtime_dispatch_key():
             )
 
         # 3.2 Shape tuned only for a different gfx returns None on this target
-        wrong_gfx_csv = _make_temp_csv(f"""
+        wrong_gfx_csv = _make_temp_csv(
+            f"""
             gfx,cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio
             {wrong_gfx},{wrong_cu_num},128,1280,8192,99,0,10.0,wrong_kernel,100.0,500.0,0.0
-        """)
+        """
+        )
         _mod._CKGEMM_CONFIG_CACHE = {}
         cfg = get_CKGEMM_config(128, 1280, 8192, tuned_file=wrong_gfx_csv)
         _check(
@@ -350,10 +354,12 @@ def test_runtime_dispatch_key():
         )
 
         # 3.3 Old CSV (no gfx column) falls back to cu_num-only key with a warning
-        old_csv = _make_temp_csv(f"""
+        old_csv = _make_temp_csv(
+            f"""
             cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio
             {cu_num},128,1280,8192,7,0,10.0,old_kernel,100.0,500.0,0.0
-        """)
+        """
+        )
         import logging
         import io
 

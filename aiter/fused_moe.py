@@ -1722,9 +1722,7 @@ def ck_moe_stage1(
         # CK kernel uses sorted_size as its M dimension and scatters output via
         # sorted_token_ids.  The output buffer must have at least sorted_size rows
         # so that the kernel's tile-based writes stay in bounds.
-        sorted_size = min(
-            token_num * topk * block_m, sorted_token_ids.shape[0]
-        )
+        sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
         tmp_out = torch.zeros(
             (sorted_size, w1.shape[1]), dtype=dtypes.fp32, device=out.device
         )

@@ -126,7 +126,8 @@ def analyze_profile(profile_dir: str, name_filter: str | None = None):
     if name_filter:
         where_clause = f"WHERE ks.kernel_name LIKE '%{name_filter}%'"
 
-    c.execute(f"""
+    c.execute(
+        f"""
         SELECT ks.kernel_name, COUNT(*) as cnt,
                AVG(d.end - d.start) as avg_ns,
                MIN(d.end - d.start) as min_ns,
@@ -136,7 +137,8 @@ def analyze_profile(profile_dir: str, name_filter: str | None = None):
         {where_clause}
         GROUP BY ks.kernel_name
         ORDER BY avg_ns DESC
-    """)
+    """
+    )
     rows = c.fetchall()
 
     if not rows:
@@ -170,13 +172,15 @@ def analyze_profile(profile_dir: str, name_filter: str | None = None):
                 f"\n{'Kernel':<50s} {'VGPR':>6s} {'AGPR':>6s} {'SGPR':>6s} {'LDS':>8s}"
             )
             print("-" * 78)
-            c.execute(f"""
+            c.execute(
+                f"""
                 SELECT DISTINCT kernel_name, arch_vgpr_count, accum_vgpr_count,
                        sgpr_count, group_segment_size
                 FROM {symbol_table}
                 {where_clause.replace('ks.', '')}
                 ORDER BY kernel_name
-            """)
+            """
+            )
             for name, vgpr, agpr, sgpr, lds in c.fetchall():
                 display = name[:48]
                 print(f"  {display:<50s} {vgpr:>6d} {agpr:>6d} {sgpr:>6d} {lds:>8d}")
