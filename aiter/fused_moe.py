@@ -263,15 +263,7 @@ def fused_moe_(
         and a1_scale is not None
     ):
         q_dtype_a = dtypes.fp8
-    bf16_fp8_bound = 256
-    if quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Swiglu:
-            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
-                q_dtype_a = dtypes.bf16
-            elif M >= bf16_fp8_bound:
-                q_dtype_a = dtypes.fp8
-        else:
-            q_dtype_a = dtypes.fp4x2
+    q_dtype_a = dtypes.fp4x2 if quant_type == QuantType.per_1x32 else q_dtype_a
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
