@@ -1331,8 +1331,12 @@ def get_2stage_cfgs(
             default_tile_n = 128 if is_mxscale else 64
             default_tile_k = 128 if is_mxscale else 64
             default_block_m = 32
-            # For a8w4, intermediate activation is quantized to fp4 between stages
-            stage2_fmt = "fp4" if gfx1250_fmt == "a8w4" else gfx1250_fmt
+            # FlyDSL UT (test_moe_gemm_mxscale_gfx1250.py) quantises the
+            # stage-1 output for a8w4 with ``_per_1x32_fp8_quant`` (fp8
+            # activation × fp4 weight, i.e. another ``a8w4`` GEMM), not
+            # with fp4-quant.  Stage2's in_dtype must therefore equal the
+            # caller's gfx1250_fmt for fp4/fp8/a8w4 alike.
+            stage2_fmt = gfx1250_fmt
             stage2_is_mxscale = stage2_fmt in ("fp4", "fp8", "a8w4")
             stage2_tile_n = 128 if stage2_is_mxscale else 64
             stage2_tile_k = 128 if stage2_is_mxscale else 64
@@ -1895,19 +1899,47 @@ def fused_moe_2stages(
             a1 = a1.view(*hidden_states.shape[:-1], -1)
             a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
         elif q_dtype_a == dtypes.fp8:
-            # a8w4 / a8w8 path: produce fp8 activation in source-token
-            # layout, e8m0 scale of shape (M, K//32).  No HIP kernel for
-            # this combo today; fall back to the torch reference (it's
-            # only run once per MoE forward and over O(tokens*model_dim)
-            # elements, so it's not the per_1x32_f4_quant pathological
-            # case).
-            from aiter.ops.quant import per_1x32_f8_scale_f8_quant
-            a1_flat = hidden_states.view(-1, hidden_states.shape[-1])
-            a1, a1_scale = per_1x32_f8_scale_f8_quant(
-                a1_flat.to(dtypes.fp32), scale_type=dtypes.fp8_e8m0
+            # a8w4 / a8w8 path on gfx1250.  We MUST match the layout AND
+            # the byte encoding the FlyDSL kernel expects:
+            #
+            #   * dtype:       float8_e4m3fnuz  (fnuz, not fn).  Kernel
+            #                  marshalling on gfx1250 reinterprets the
+            #                  scale-x byte stream as fnuz (bias=8); using
+            #                  fn (bias=7) here under-shifts every value
+            #                  by 2x in the worst block and drives the
+            #                  output ~100x off after K-summation.
+            #   * scale algo:  scale = max_abs / finfo(fnuz).max, encoded
+            #                  to e8m0.  This is the same recipe as
+            #                  FlyDSL/tests/.../test_moe_gemm_mxscale_gfx1250.py::_per_1x32_fp8_quant.
+            #   * layout:      a1 = (M, K) fnuz bytes,
+            #                  a1_scale = (M, K//32) e8m0 in source-token order.
+            from aiter.utility import fp4_utils
+            assert hasattr(torch, "float8_e4m3fnuz"), (
+                "torch build does not expose float8_e4m3fnuz; "
+                "rebuild PyTorch or relax this branch to e4m3fn at the "
+                "cost of accuracy on gfx1250."
             )
-            a1 = a1.view(*hidden_states.shape[:-1], -1)
-            a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
+            FNUZ = torch.float8_e4m3fnuz
+            BLOCK = 32
+            dtype_max = float(torch.finfo(FNUZ).max)        # 240.0
+            a1_flat = hidden_states.view(-1, hidden_states.shape[-1]).to(
+                dtypes.fp32
+            )
+            M_, K_ = a1_flat.shape
+            assert K_ % BLOCK == 0, (
+                f"per_1x32 fp8 quant on gfx1250 requires K%{BLOCK}==0 "
+                f"(got K={K_})"
+            )
+            blk = a1_flat.view(-1, BLOCK)
+            blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
+            max_abs = blk.abs().amax(dim=1)
+            scale_e8m0 = fp4_utils.f32_to_e8m0(max_abs / dtype_max)
+            scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0)
+            a1 = (blk.float() / scale_f32.unsqueeze(1)).to(FNUZ).view(M_, K_)
+            a1 = a1.view(*hidden_states.shape[:-1], K_)
+            a1_scale = scale_e8m0.view(M_, K_ // BLOCK).view(torch.uint8).view(
+                dtypes.fp8_e8m0
+            )
         else:
             raise NotImplementedError(
                 f"gfx1250 fused_moe per_1x32 stage1 quant: unsupported "
@@ -2035,15 +2067,52 @@ def fused_moe_2stages(
     elif quant_type == QuantType.per_1x32 and get_gfx() == "gfx1250":
         # Stage2 FlyDSL kernel expects scale_x in source order of shape
         # (tokens*topk, inter_dim//32). See comment in stage1 path.
-        # Use the HIP kernel (orders-of-magnitude faster than the pure-torch
-        # reference at warmup-sized M).
-        from aiter.ops.quant import per_1x32_f4_quant_hip
-        a2_flat = a2.view(-1, inter_dim)
-        a2_flat, a2_scale = per_1x32_f4_quant_hip(
-            a2_flat, quant_dtype=dtypes.fp4x2, shuffle=False
-        )
-        a2_scale = a2_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
-        a2 = a2_flat.view(token_num, topk, -1)
+        # Pick the quant width to match the FlyDSL stage2 kernel (which
+        # uses the same gfx1250 format string as stage1):
+        #   * a8w4 / fp8 -> fp8 (e4m3fnuz)
+        #   * fp4        -> fp4x2
+        if q_dtype_a == dtypes.fp4x2:
+            # Use the HIP kernel (orders-of-magnitude faster than the
+            # pure-torch reference at warmup-sized M).
+            from aiter.ops.quant import per_1x32_f4_quant_hip
+            a2_flat = a2.view(-1, inter_dim)
+            a2_flat, a2_scale = per_1x32_f4_quant_hip(
+                a2_flat, quant_dtype=dtypes.fp4x2, shuffle=False
+            )
+            a2_scale = a2_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
+            a2 = a2_flat.view(token_num, topk, -1)
+        elif q_dtype_a == dtypes.fp8:
+            # Mirror the FlyDSL UT's _per_1x32_fp8_quant exactly
+            # (e4m3fnuz, max_abs/finfo(fnuz).max, e8m0 scale).
+            from aiter.utility import fp4_utils
+            assert hasattr(torch, "float8_e4m3fnuz"), (
+                "torch build does not expose float8_e4m3fnuz; required "
+                "for gfx1250 a8w4/fp8 stage2 quant."
+            )
+            FNUZ = torch.float8_e4m3fnuz
+            BLOCK = 32
+            dtype_max = float(torch.finfo(FNUZ).max)
+            a2_flat = a2.view(-1, inter_dim).to(dtypes.fp32)
+            assert inter_dim % BLOCK == 0
+            blk = a2_flat.view(-1, BLOCK)
+            blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
+            max_abs = blk.abs().amax(dim=1)
+            scale_e8m0 = fp4_utils.f32_to_e8m0(max_abs / dtype_max)
+            scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0)
+            a2_q = (blk.float() / scale_f32.unsqueeze(1)).to(FNUZ).view(
+                -1, inter_dim
+            )
+            a2 = a2_q.view(token_num, topk, -1)
+            a2_scale = (
+                scale_e8m0.view(token_num * topk, inter_dim // BLOCK)
+                .view(torch.uint8)
+                .view(dtypes.fp8_e8m0)
+            )
+        else:
+            raise NotImplementedError(
+                f"gfx1250 fused_moe per_1x32 stage2 quant: unsupported "
+                f"q_dtype_a={q_dtype_a}"
+            )
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
         a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
