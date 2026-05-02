@@ -1868,20 +1868,45 @@ def fused_moe_2stages(
         # K//32), which the FlyDSL kernel cannot address correctly and
         # produces numerically uncorrelated output. Keep the quantization
         # output in source-token layout for gfx1250.
-        # Upstream switched gfx1250 stage1 a1 quant to the triton kernel
-        # (per_1x32_f4_quant_triton) so that fused_moe is cuda-graph
-        # capturable (custom HIP ops with mutating kwargs break capture).
-        # Our earlier commit had moved to per_1x32_f4_quant_hip to avoid the
-        # 10-minute warmup of the original *pure-torch* fallback at M=16384;
-        # the triton path is fast enough at that M while preserving graph
-        # capture, so we accept upstream here.
-        from aiter.ops.quant import per_1x32_f4_quant_triton
-        if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
+        #
+        # Pick the quantization dtype to match the FlyDSL kernel's expected
+        # activation format (gfx1250_fmt):
+        #   * "fp4"   -> a1 must be fp4x2  (q_dtype_a == fp4x2)
+        #   * "a8w4"  -> a1 must be fp8    (q_dtype_a == fp8, w1 dtype fp4x2)
+        #   * "fp8"   -> a1 must be fp8    (q_dtype_a == fp8, w1 dtype fp8)
+        # Quantizing to the wrong width here (the original branch assumed
+        # fp4 for everything) makes the kernel read an fp8-stride buffer
+        # as fp4, scaling the output by ~2^7 and producing 100% mismatch.
+        if hidden_states.dtype == q_dtype_a and a1_scale is not None:
             a1 = hidden_states
             a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
-        else:
+        elif q_dtype_a == dtypes.fp4x2:
+            # Use the triton kernel (per_1x32_f4_quant_triton): it's
+            # cuda-graph capturable (custom HIP ops with mutating kwargs
+            # break capture) and fast enough at warmup-sized M (the
+            # earlier 10-minute hang we saw with this path was the *pure
+            # torch* reference, not the triton kernel).
+            from aiter.ops.quant import per_1x32_f4_quant_triton
             a1, a1_scale = per_1x32_f4_quant_triton(hidden_states, quant_dtype=dtypes.fp4x2)
+        elif q_dtype_a == dtypes.fp8:
+            # a8w4 / a8w8 path: produce fp8 activation in source-token
+            # layout, e8m0 scale of shape (M, K//32).  No HIP kernel for
+            # this combo today; fall back to the torch reference (it's
+            # only run once per MoE forward and over O(tokens*model_dim)
+            # elements, so it's not the per_1x32_f4_quant pathological
+            # case).
+            from aiter.ops.quant import per_1x32_f8_scale_f8_quant
+            a1_flat = hidden_states.view(-1, hidden_states.shape[-1])
+            a1, a1_scale = per_1x32_f8_scale_f8_quant(
+                a1_flat.to(dtypes.fp32), scale_type=dtypes.fp8_e8m0
+            )
+            a1 = a1.view(*hidden_states.shape[:-1], -1)
             a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
+        else:
+            raise NotImplementedError(
+                f"gfx1250 fused_moe per_1x32 stage1 quant: unsupported "
+                f"q_dtype_a={q_dtype_a}"
+            )
     elif quant_type == QuantType.per_1x32:
         if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
             # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
