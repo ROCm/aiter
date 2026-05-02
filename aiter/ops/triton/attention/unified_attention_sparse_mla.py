@@ -15,6 +15,7 @@ def unified_attention_sparse_mla(
     topk_indices,
     block_table,
     kv_lora_rank,
+    attn_sink=None,
 ):
     """
     This function computes the sparse attention.
@@ -90,6 +91,8 @@ def unified_attention_sparse_mla(
         KV_LORA_RANK=KV_LORA_RANK,
         TILE_SIZE=TILE_SIZE,
         ALL_DECODE=ALL_DECODE,
+        attn_sink_ptr=attn_sink,
+        HAS_ATTN_SINK=attn_sink is not None,
         num_warps=num_warps,
         num_stages=num_stages_2d,
     )

@@ -72,6 +72,8 @@ def _kernel_unified_attention_sparse_mla_2d(
     KV_LORA_RANK: tl.constexpr,
     TILE_SIZE: tl.constexpr,
     ALL_DECODE: tl.constexpr = False,
+    attn_sink_ptr=None,  # [num_query_heads], FP32; None => no sink
+    HAS_ATTN_SINK: tl.constexpr = False,
 ):
     """
     TODO:
@@ -101,7 +103,8 @@ def _kernel_unified_attention_sparse_mla_2d(
 
     # load Q in two parts with different dim offsets
     offs_lora = tl.arange(0, KV_LORA_RANK)
-    offs_rope = tl.arange(KV_LORA_RANK, KV_LORA_RANK + ROPE_RANK)
+    if ROPE_RANK > 0:
+        offs_rope = tl.arange(KV_LORA_RANK, KV_LORA_RANK + ROPE_RANK)
 
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
@@ -117,18 +120,19 @@ def _kernel_unified_attention_sparse_mla_2d(
         Q_cache_modifier: tl.constexpr = ""
 
     # load Q in two parts
-    # q_pe: (BLOCK_M, ROPE_RANK)
-    q_rope_offset = (
-        query_offset_0[:, None] * query_stride_0
-        + query_offset_1[:, None] * query_stride_1
-        + offs_rope[None, :]
-    )
-    Q_rope = tl.load(
-        query_ptr + q_rope_offset,
-        mask=query_mask_0[:, None] & query_mask_1[:, None],
-        other=0.0,
-        cache_modifier=Q_cache_modifier,
-    )
+    # q_pe: (BLOCK_M, ROPE_RANK) -- skipped entirely when ROPE_RANK == 0 (V4)
+    if ROPE_RANK > 0:
+        q_rope_offset = (
+            query_offset_0[:, None] * query_stride_0
+            + query_offset_1[:, None] * query_stride_1
+            + offs_rope[None, :]
+        )
+        Q_rope = tl.load(
+            query_ptr + q_rope_offset,
+            mask=query_mask_0[:, None] & query_mask_1[:, None],
+            other=0.0,
+            cache_modifier=Q_cache_modifier,
+        )
 
     # q_lora: (BLOCK_M, KV_LORA_RANK)
     q_lora_offset = (
@@ -171,21 +175,22 @@ def _kernel_unified_attention_sparse_mla_2d(
         # q_lora: (BLOCK_M, KV_LORA_RANK) k_lora: (KV_LORA_RANK, TILE_SIZE)
         S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
         # load k in two parts
-        # K_rope: (ROPE_RANK, TILE_SIZE)
-        k_rope_ptrs = (
-            key_cache_ptr
-            + physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_rope[:, None] * stride_k_cache_3
-            + slot[None, :] * stride_k_cache_1
-        )
-        K_rope = tl.load(
-            k_rope_ptrs,
-            mask=valid_t[None, :],
-            other=0.0,
-            cache_modifier=KV_cache_modifier,
-        )
-        S += scale * tl.dot(Q_rope, K_rope)
+        # K_rope: (ROPE_RANK, TILE_SIZE) -- skipped when ROPE_RANK == 0 (V4)
+        if ROPE_RANK > 0:
+            k_rope_ptrs = (
+                key_cache_ptr
+                + physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_rope[:, None] * stride_k_cache_3
+                + slot[None, :] * stride_k_cache_1
+            )
+            K_rope = tl.load(
+                k_rope_ptrs,
+                mask=valid_t[None, :],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+            S += scale * tl.dot(Q_rope, K_rope)
         # K_lora: (KV_LORA_RANK, TILE_SIZE)
         k_lora_ptrs = (
             key_cache_ptr
@@ -237,6 +242,15 @@ def _kernel_unified_attention_sparse_mla_2d(
         acc += tl.dot(P.to(V_lora.dtype), V_lora)
 
     # epilogue
+    if HAS_ATTN_SINK:
+        # Per-head learnable sink: contributes exp(sink - M) to softmax denominator only
+        # (sink token has score=sink, value=0 -> doesn't add to numerator).
+        sink = tl.load(
+            attn_sink_ptr + offs_m,
+            mask=query_mask_1,
+            other=float("-inf"),
+        )
+        L = L + tl.exp(sink.to(tl.float32) - M)
     one_over_L = 1.0 / L[:, None]
     acc = acc * one_over_L
 
