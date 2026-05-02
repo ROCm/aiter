@@ -74,6 +74,10 @@ def _kernel_unified_attention_sparse_mla_2d(
     ALL_DECODE: tl.constexpr = False,
     attn_sink_ptr=None,  # [num_query_heads], FP32; None => no sink
     HAS_ATTN_SINK: tl.constexpr = False,
+    lse_ptr=None,  # [num_tokens, num_query_heads] FP32; None => skip lse output
+    lse_stride_0: tl.int64 = 0,
+    lse_stride_1: tl.int64 = 0,
+    RETURN_LSE: tl.constexpr = False,
 ):
     """
     TODO:
@@ -242,6 +246,23 @@ def _kernel_unified_attention_sparse_mla_2d(
         acc += tl.dot(P.to(V_lora.dtype), V_lora)
 
     # epilogue
+    # Emit sink-FREE lse first, so external two-pool merge can fold sink in
+    # as a third logsumexp term. lse_val = log(L) + M with the convention
+    # log(0) -> -inf for "no valid topk" rows.
+    if RETURN_LSE:
+        # When no tile contributed, L=0 and M was clamped to 0 mid-loop;
+        # log(0)+0 = -inf, which is the right lse for an empty attention set.
+        lse_val = tl.log(L) + M
+        lse_offset = (
+            query_offset_0.to(tl.int64) * lse_stride_0
+            + query_offset_1.to(tl.int64) * lse_stride_1
+        )
+        tl.store(
+            lse_ptr + lse_offset,
+            lse_val,
+            mask=query_mask_0 & query_mask_1,
+        )
+
     if HAS_ATTN_SINK:
         # Per-head learnable sink: contributes exp(sink - M) to softmax denominator only
         # (sink token has score=sink, value=0 -> doesn't add to numerator).

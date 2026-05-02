@@ -16,6 +16,8 @@ def unified_attention_sparse_mla(
     block_table,
     kv_lora_rank,
     attn_sink=None,
+    return_lse=False,
+    lse_out=None,  # if provided, writes lse into this tensor (else allocates one when return_lse=True)
 ):
     """
     This function computes the sparse attention.
@@ -52,6 +54,20 @@ def unified_attention_sparse_mla(
 
     total_num_q_blocks = q.shape[0] * (num_query_heads // BLOCK_M)
     ALL_DECODE = max_seqlen_q == 1
+
+    # lse output: [num_tokens, num_query_heads] FP32 (sink-FREE; sink is folded
+    # back in by the caller for two-pool merge if needed).
+    if return_lse and lse_out is None:
+        import torch
+        lse_out = torch.empty(
+            (q.shape[0], num_query_heads), dtype=torch.float32, device=q.device
+        )
+    if lse_out is not None:
+        lse_stride_0 = lse_out.stride(0)
+        lse_stride_1 = lse_out.stride(1)
+    else:
+        lse_stride_0 = 0
+        lse_stride_1 = 0
 
     ROPE_RANK = head_size - kv_lora_rank
     KV_LORA_RANK = kv_lora_rank
@@ -93,6 +109,11 @@ def unified_attention_sparse_mla(
         ALL_DECODE=ALL_DECODE,
         attn_sink_ptr=attn_sink,
         HAS_ATTN_SINK=attn_sink is not None,
+        lse_ptr=lse_out,
+        lse_stride_0=lse_stride_0,
+        lse_stride_1=lse_stride_1,
+        RETURN_LSE=lse_out is not None,
         num_warps=num_warps,
         num_stages=num_stages_2d,
     )
+    return lse_out
