@@ -171,15 +171,19 @@ def test_fmoe(
     # pre-shuffle
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
-    # gfx1250 FlyDSL kernels (fp4/fp8/a8w4 mxscale + per_1x32) consume the
-    # *raw* (E, N, K[//2]) weight layout and the *raw* (E*N, K//32) e8m0
-    # scale layout (see FlyDSL UT test_moe_gemm_mxscale_gfx1250.py).
-    # They cannot decode the CK-style ``shuffle_weight_a16w4`` /
-    # ``shuffle_scale_a16w4`` packing nor the generic ``e8m0_shuffle``
-    # interleave — passing those produces a fully-correlated O(2^7) error
-    # band and 100% checkAllclose mismatch.  Keep the tensors raw on
-    # gfx1250 for FlyDSL-eligible quant configs.
-    _gfx1250_flydsl_skip_shuffle = (
+    # gfx1250 FlyDSL MXScale MoE kernels consume specific weight/scale
+    # layouts (see FlyDSL UT test_moe_gemm_mxscale_gfx1250.py:
+    # build_routing_buffers / preshuffle_b_16x16 / per_1x32_f4_quant
+    # call sites):
+    #   * fp4    -> w1, w2 RAW (no shuffle); scale RAW.
+    #   * fp8    -> w1, w2 preshuffled with preshuffle_b_16x16; scale RAW.
+    #   * a8w4   -> w1, w2 preshuffled with preshuffle_b_16x16; scale RAW.
+    # The CK-style ``shuffle_weight_a16w4`` / ``shuffle_scale_a16w4``
+    # packings and the generic ``e8m0_shuffle`` interleave are NOT
+    # accepted by the FlyDSL kernels and either return all-zero output
+    # (wrong weight layout -> kernel decodes garbage and atomic_add
+    # contributes ~0) or wildly-scaled output (wrong scale layout).
+    _gfx1250_flydsl_eligible = (
         get_gfx() == "gfx1250"
         and qType == aiter.QuantType.per_1x32
         and (
@@ -188,9 +192,58 @@ def test_fmoe(
             or (AQDType == dtypes.fp8 and WQDType == dtypes.fp8)             # fp8
         )
     )
-    if _gfx1250_flydsl_skip_shuffle:
-        # leave w{1,2}_qt_aiter / w{1,2}_scale_aiter untouched (== raw)
-        pass
+    if _gfx1250_flydsl_eligible:
+        _gfx1250_is_fp4 = (
+            AQDType == dtypes.fp4x2 and WQDType == dtypes.fp4x2
+        )
+        if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
+            print(
+                f"[probe-test] gfx1250 FlyDSL path: AQDType={AQDType} "
+                f"WQDType={WQDType} is_fp4={_gfx1250_is_fp4} "
+                f"will_preshuffle={not _gfx1250_is_fp4} "
+                f"w1_qt_aiter.shape={tuple(w1_qt_aiter.shape)} "
+                f"w2_qt_aiter.shape={tuple(w2_qt_aiter.shape)}",
+                flush=True,
+            )
+        if not _gfx1250_is_fp4:
+            # fp8 / a8w4: preshuffle weights with the FlyDSL helper.
+            try:
+                from FlyDSL.tests.kernels.utils import fp4_utils as _fly_fp4u
+            except ImportError:
+                # The FlyDSL Python tests live alongside the build tree;
+                # try a few likely locations before giving up.
+                import importlib, sys, os as _os
+                for _root in (
+                    "/app/FlyDSL",
+                    _os.path.join(_os.path.dirname(__file__), "..", "..", "FlyDSL"),
+                ):
+                    _p = _os.path.abspath(_root)
+                    if _p not in sys.path:
+                        sys.path.insert(0, _p)
+                _fly_fp4u = importlib.import_module(
+                    "tests.kernels.utils.fp4_utils"
+                )
+            E_, N1_, K1_packed_ = w1_qt_aiter.shape
+            w1_qt_aiter = _fly_fp4u.preshuffle_b_16x16(
+                w1_qt_aiter.contiguous().view(E_ * N1_, K1_packed_),
+                E_ * N1_,
+                K1_packed_,
+            ).view(E_, N1_, K1_packed_)
+            E2_, N2_, K2_packed_ = w2_qt_aiter.shape
+            w2_qt_aiter = _fly_fp4u.preshuffle_b_16x16(
+                w2_qt_aiter.contiguous().view(E2_ * N2_, K2_packed_),
+                E2_ * N2_,
+                K2_packed_,
+            ).view(E2_, N2_, K2_packed_)
+            if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
+                print(
+                    f"[probe-test] preshuffle done: w1.dtype={w1_qt_aiter.dtype} "
+                    f"w2.dtype={w2_qt_aiter.dtype} "
+                    f"w1.is_contiguous={w1_qt_aiter.is_contiguous()} "
+                    f"w2.is_contiguous={w2_qt_aiter.is_contiguous()}",
+                    flush=True,
+                )
+        # For all gfx1250 FlyDSL paths scales stay RAW (no e8m0_shuffle).
     elif WQDType == torch.int4:  # int4 w quant
         w1_qt_aiter = rearrange_4bit_elements(
             convert_int8_to_uint32_int4(
