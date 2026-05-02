@@ -408,8 +408,9 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     else:
         Q_WARPS_PER_CTA_DIM0: gl.constexpr = 1
         Q_WARPS_PER_CTA_DIM1: gl.constexpr = 4
+    QUERY_HEAD_SIZE_PER_THREAD: gl.constexpr = triton.cdiv(HEAD_SIZE_POW2, 16)
     mtp_blocked_query_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1, 8],
+        size_per_thread=[1, 1, QUERY_HEAD_SIZE_PER_THREAD],
         threads_per_warp=[1, 4, 16],
         warps_per_cta=[Q_WARPS_PER_CTA_DIM0, Q_WARPS_PER_CTA_DIM1, 1],
         order=[2, 1, 0],
@@ -1188,16 +1189,17 @@ def paged_attention_decode_sliding_window_head_1(
     else:
         Q_WARPS_PER_CTA_DIM0: gl.constexpr = 1
         Q_WARPS_PER_CTA_DIM1: gl.constexpr = 4
+    QUERY_HEAD_SIZE_PER_THREAD: gl.constexpr = triton.cdiv(HEAD_SIZE_POW2, 16)
     if QUERY_SEQ_LEN_POW2 == 1:
         blocked_query_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[1, 8],
+            size_per_thread=[1, QUERY_HEAD_SIZE_PER_THREAD],
             threads_per_warp=[4, 16],
             warps_per_cta=[Q_WARPS_PER_CTA_DIM0, Q_WARPS_PER_CTA_DIM1],
             order=[1, 0],
         )
     else:
         mtp_blocked_query_layout: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[1, 1, 8],
+            size_per_thread=[1, 1, QUERY_HEAD_SIZE_PER_THREAD],
             threads_per_warp=[1, 4, 16],
             warps_per_cta=[Q_WARPS_PER_CTA_DIM0, Q_WARPS_PER_CTA_DIM1, 1],
             order=[2, 1, 0],
@@ -2322,8 +2324,9 @@ def paged_attention_decode_sliding_window(
     else:
         Q_WARPS_PER_CTA_DIM0: gl.constexpr = 1
         Q_WARPS_PER_CTA_DIM1: gl.constexpr = 4
+    QUERY_HEAD_SIZE_PER_THREAD: gl.constexpr = triton.cdiv(HEAD_SIZE_POW2, 16)
     mtp_blocked_query_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1, 8],
+        size_per_thread=[1, 1, QUERY_HEAD_SIZE_PER_THREAD],
         threads_per_warp=[1, 4, 16],
         warps_per_cta=[Q_WARPS_PER_CTA_DIM0, Q_WARPS_PER_CTA_DIM1, 1],
         order=[2, 1, 0],
@@ -3304,15 +3307,16 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     else:
         Q_WARPS_PER_CTA_DIM0: gl.constexpr = 1
         Q_WARPS_PER_CTA_DIM1: gl.constexpr = 4
+    QUERY_HEAD_SIZE_PER_THREAD: gl.constexpr = triton.cdiv(HEAD_SIZE_POW2, 16)
     mtp_blocked_query_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1, 8],
+        size_per_thread=[1, 1, QUERY_HEAD_SIZE_PER_THREAD],
         threads_per_warp=[1, 4, 16],
         warps_per_cta=[Q_WARPS_PER_CTA_DIM0, Q_WARPS_PER_CTA_DIM1, 1],
         order=[2, 1, 0],
     )
     # [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     blocked_query_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
+        size_per_thread=[1, QUERY_HEAD_SIZE_PER_THREAD],
         threads_per_warp=[4, 16],
         warps_per_cta=[4, 1],
         order=[1, 0],
