@@ -201,11 +201,14 @@ def _moe_sorting_impl(
     dispatch_policy,
     use_opus,
 ):
-    # gfx1250: both the opus prebuilt kernel and the CK-tile fallback are
-    # broken (see _moe_sorting_torch_gfx1250 docstring).  Force the pure-torch
-    # path here so a misconfigured AITER_USE_OPUS_MOE_SORTING=1 does not
-    # silently deadlock the entire serving process.
-    if get_gfx() == "gfx1250":
+    # gfx1250: prefer the prebuilt opus moe-sorting kernel when it works,
+    # because the pure-torch fallback (_moe_sorting_torch_gfx1250) computes
+    # padded slot counts that disagree with the FlyDSL stage2 kernel layout
+    # (it over-counts blocks by ~1% which leaves stage2 atomic_add writing
+    # to garbage rows -> output stays at zero).  Only fall back to torch if
+    # the user explicitly disables opus (AITER_USE_OPUS_MOE_SORTING=0) or
+    # the opus kernel is not loadable on this build.
+    if get_gfx() == "gfx1250" and not use_opus:
         return _moe_sorting_torch_gfx1250(
             topk_ids,
             topk_weights,
@@ -1173,7 +1176,23 @@ def _gfx1250_moe_stage2(
         torch.cuda.current_stream(),
     )
 
+    if int(os.environ.get("AITER_GFX1250_PROBE", "0")):
+        logger.info(
+            f"[probe] stage2 launch: m_blocks={m_blocks} "
+            f"sorted_token_ids.shape={tuple(sorted_token_ids.shape)} "
+            f"sorted_expert_ids.shape={tuple(sorted_expert_ids.shape)} "
+            f"num_valid={num_valid_ids.tolist() if num_valid_ids.numel() < 8 else num_valid_ids.shape} "
+            f"a.dtype={inter_states.dtype} w2.dtype={w2.dtype} "
+            f"as.numel={flat_a_scale.numel()} ws.numel={flat_w_scale.numel()}"
+        )
     _run_compiled(exe, args)
+    if int(os.environ.get("AITER_GFX1250_PROBE", "0")):
+        torch.cuda.synchronize()
+        nz = int((out != 0).sum())
+        logger.info(
+            f"[probe] stage2 done: out nonzero={nz}/{out.numel()} "
+            f"absmax={float(out.float().abs().max()):.4f}"
+        )
     return out
 
 
@@ -1831,8 +1850,18 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
         and activation == aiter.ActivationType.Swiglu
+        # gfx1250 must NOT take the e4m3fn / power-of-2 dtypeMax path here:
+        # the FlyDSL a8w4 kernel decodes the activation byte stream as
+        # e4m3fnuz (bias 8) and reads the scale as max_abs/finfo(fnuz).max,
+        # so we let control fall through to the dedicated gfx1250 elif
+        # below which mirrors the FlyDSL UT _per_1x32_fp8_quant exactly.
+        and get_gfx() != "gfx1250"
     ):
         if get_gfx() == "gfx1250":
+            # Dead code: the outer guard above (``get_gfx() != "gfx1250"``)
+            # already excludes gfx1250 from this branch -- the gfx1250
+            # stage1 fp8 quant lives in the dedicated elif below that
+            # mirrors the FlyDSL UT exactly.  Kept for grep/back-compat.
             from aiter.ops.quant import _per_1x32_f8_e8m0_quant_triton
 
             a1, a1_scale = _per_1x32_f8_e8m0_quant_triton(
@@ -1863,6 +1892,12 @@ def fused_moe_2stages(
         a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
 
     elif quant_type == QuantType.per_1x32 and get_gfx() == "gfx1250":
+        if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
+            logger.info(
+                f"[probe] stage1 quant entry: q_dtype_a={q_dtype_a} "
+                f"q_dtype_w={q_dtype_w} hidden.dtype={hidden_states.dtype} "
+                f"a1_scale_is_None={a1_scale is None}"
+            )
         # FlyDSL gfx1250 MoE GEMM kernels address scale_x with buffer size
         # `tokens * K//32` in **source-token order** (see sx_nbytes in
         # moe_gemm_2stage_mxscale_gfx1250.py); the kernel gathers the
@@ -1893,29 +1928,35 @@ def fused_moe_2stages(
             from aiter.ops.quant import per_1x32_f4_quant_triton
             a1, a1_scale = per_1x32_f4_quant_triton(hidden_states, quant_dtype=dtypes.fp4x2)
         elif q_dtype_a == dtypes.fp8:
-            # a8w4 / a8w8 path on gfx1250.  We MUST match the layout AND
-            # the byte encoding the FlyDSL kernel expects:
+            # a8w4 / a8w8 path on gfx1250.  Match FlyDSL UT exactly
+            # (FlyDSL/tests/kernels/test_moe_gemm_mxscale_gfx1250.py::_per_1x32_fp8_quant):
             #
-            #   * dtype:       float8_e4m3fnuz  (fnuz, not fn).  Kernel
-            #                  marshalling on gfx1250 reinterprets the
-            #                  scale-x byte stream as fnuz (bias=8); using
-            #                  fn (bias=7) here under-shifts every value
-            #                  by 2x in the worst block and drives the
-            #                  output ~100x off after K-summation.
-            #   * scale algo:  scale = max_abs / finfo(fnuz).max, encoded
-            #                  to e8m0.  This is the same recipe as
-            #                  FlyDSL/tests/.../test_moe_gemm_mxscale_gfx1250.py::_per_1x32_fp8_quant.
-            #   * layout:      a1 = (M, K) fnuz bytes,
-            #                  a1_scale = (M, K//32) e8m0 in source-token order.
-            from aiter.utility import fp4_utils
-            assert hasattr(torch, "float8_e4m3fnuz"), (
-                "torch build does not expose float8_e4m3fnuz; "
-                "rebuild PyTorch or relax this branch to e4m3fn at the "
-                "cost of accuracy on gfx1250."
-            )
-            FNUZ = torch.float8_e4m3fnuz
+            #   * scale algo:  dtype_max = 240 (fnuz max), even though the
+            #                  byte encoding is fn (bias 7).
+            #   * byte encoding: bias-7 e4m3 (== float8_e4m3fn) via
+            #                    fp4_utils._f32_to_floatx_unpacked(_, 4, 3).
+            #                    NOTE: PyTorch's .to(e4m3fnuz) cast emits
+            #                    0x80 (NaN sentinel) for tiny negatives and
+            #                    poisons the whole next-stage GEMM K-sum;
+            #                    the unpacked fn encoder clamps to ±240 and
+            #                    never emits 0x80, matching what the FlyDSL
+            #                    kernel decodes.
+            #   * clamp before cast to ±240 (UT line 79).
+            #   * layout:      a1 = (M, K) fn bytes (uint8 view-equivalent),
+            #                  a1_scale = (M, K//32) e8m0 in src-token order.
+            from aiter.utility import fp4_utils as _aiter_fp4u
+            try:
+                from FlyDSL.tests.kernels.utils import fp4_utils as _fly_fp4u
+            except ImportError:
+                import importlib, sys, os as _os
+                for _root in ("/app/FlyDSL",):
+                    if _root not in sys.path:
+                        sys.path.insert(0, _root)
+                _fly_fp4u = importlib.import_module(
+                    "tests.kernels.utils.fp4_utils"
+                )
             BLOCK = 32
-            dtype_max = float(torch.finfo(FNUZ).max)        # 240.0
+            DTYPE_MAX = 240.0  # fnuz finfo.max -- matches UT
             a1_flat = hidden_states.view(-1, hidden_states.shape[-1]).to(
                 dtypes.fp32
             )
@@ -1927,9 +1968,22 @@ def fused_moe_2stages(
             blk = a1_flat.view(-1, BLOCK)
             blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
             max_abs = blk.abs().amax(dim=1)
-            scale_e8m0 = fp4_utils.f32_to_e8m0(max_abs / dtype_max)
-            scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0)
-            a1 = (blk.float() / scale_f32.unsqueeze(1)).to(FNUZ).view(M_, K_)
+            scale_e8m0 = _aiter_fp4u.f32_to_e8m0(max_abs / DTYPE_MAX)
+            scale_f32 = _aiter_fp4u.e8m0_to_f32(scale_e8m0)
+            scale_f32 = torch.nan_to_num(scale_f32, nan=1.0, posinf=1.0, neginf=1.0)
+            scale_f32[scale_f32 == 0] = 1.0
+            y_f32 = blk.float() / scale_f32.unsqueeze(1)
+            y_f32 = torch.clamp(y_f32, min=-DTYPE_MAX, max=DTYPE_MAX)
+            a1 = _fly_fp4u._f32_to_floatx_unpacked(
+                y_f32.contiguous().view(-1), 4, 3
+            ).view(M_, K_)
+            if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
+                _ub2 = a1.view(torch.uint8).to(torch.int32)
+                logger.info(
+                    f"[probe] stage1 a1 fn-encoded: shape={tuple(a1.shape)} "
+                    f"dtype={a1.dtype} 0x80_count={int((_ub2 == 0x80).sum())} "
+                    f"byte_min={int(_ub2.min())} byte_max={int(_ub2.max())}"
+                )
             a1 = a1.view(*hidden_states.shape[:-1], K_)
             a1_scale = scale_e8m0.view(M_, K_ // BLOCK).view(torch.uint8).view(
                 dtypes.fp8_e8m0
@@ -2074,32 +2128,70 @@ def fused_moe_2stages(
             a2_scale = a2_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
             a2 = a2_flat.view(token_num, topk, -1)
         elif q_dtype_a == dtypes.fp8:
-            # Mirror the FlyDSL UT's _per_1x32_fp8_quant exactly
-            # (e4m3fnuz, max_abs/finfo(fnuz).max, e8m0 scale).
-            from aiter.utility import fp4_utils
-            assert hasattr(torch, "float8_e4m3fnuz"), (
-                "torch build does not expose float8_e4m3fnuz; required "
-                "for gfx1250 a8w4/fp8 stage2 quant."
-            )
-            FNUZ = torch.float8_e4m3fnuz
+            # Mirror the FlyDSL UT's _per_1x32_fp8_quant exactly: scale
+            # uses dtype_max=240 (fnuz max) but the byte encoding is fn
+            # (bias 7, via _f32_to_floatx_unpacked).  See stage1 elif
+            # above for full rationale.
+            from aiter.utility import fp4_utils as _aiter_fp4u
+            try:
+                from FlyDSL.tests.kernels.utils import fp4_utils as _fly_fp4u
+            except ImportError:
+                import importlib, sys
+                for _root in ("/app/FlyDSL",):
+                    if _root not in sys.path:
+                        sys.path.insert(0, _root)
+                _fly_fp4u = importlib.import_module(
+                    "tests.kernels.utils.fp4_utils"
+                )
             BLOCK = 32
-            dtype_max = float(torch.finfo(FNUZ).max)
+            DTYPE_MAX = 240.0
+            if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
+                _af = a2.float()
+                logger.info(
+                    f"[probe] stage2 a2 pre-quant: shape={tuple(a2.shape)} "
+                    f"dtype={a2.dtype} min={float(_af.min()):.3f} "
+                    f"max={float(_af.max()):.3f} "
+                    f"absmax={float(_af.abs().max()):.3f} "
+                    f"nan={int(torch.isnan(_af).sum())} "
+                    f"inf={int(torch.isinf(_af).sum())}"
+                )
             a2_flat = a2.view(-1, inter_dim).to(dtypes.fp32)
             assert inter_dim % BLOCK == 0
             blk = a2_flat.view(-1, BLOCK)
             blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
             max_abs = blk.abs().amax(dim=1)
-            scale_e8m0 = fp4_utils.f32_to_e8m0(max_abs / dtype_max)
-            scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0)
-            a2_q = (blk.float() / scale_f32.unsqueeze(1)).to(FNUZ).view(
-                -1, inter_dim
-            )
+            scale_e8m0 = _aiter_fp4u.f32_to_e8m0(max_abs / DTYPE_MAX)
+            scale_f32 = _aiter_fp4u.e8m0_to_f32(scale_e8m0)
+            scale_f32 = torch.nan_to_num(scale_f32, nan=1.0, posinf=1.0, neginf=1.0)
+            scale_f32[scale_f32 == 0] = 1.0
+            y_f32 = blk.float() / scale_f32.unsqueeze(1)
+            y_f32 = torch.clamp(y_f32, min=-DTYPE_MAX, max=DTYPE_MAX)
+            a2_q = _fly_fp4u._f32_to_floatx_unpacked(
+                y_f32.contiguous().view(-1), 4, 3
+            ).view(-1, inter_dim)
+            if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
+                _ub2 = a2_q.view(torch.uint8).to(torch.int32)
+                logger.info(
+                    f"[probe] stage2 a2 fn-encoded: 0x80_count="
+                    f"{int((_ub2 == 0x80).sum())} "
+                    f"byte_min={int(_ub2.min())} byte_max={int(_ub2.max())}"
+                )
             a2 = a2_q.view(token_num, topk, -1)
             a2_scale = (
                 scale_e8m0.view(token_num * topk, inter_dim // BLOCK)
                 .view(torch.uint8)
                 .view(dtypes.fp8_e8m0)
             )
+            if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
+                _af = a2.view(torch.uint8).to(torch.int32)
+                _sf = a2_scale.view(torch.uint8).to(torch.int32)
+                logger.info(
+                    f"[probe] stage2 a2 post-quant: shape={tuple(a2.shape)} "
+                    f"dtype={a2.dtype} byte_min={int(_af.min())} "
+                    f"byte_max={int(_af.max())} "
+                    f"scale_shape={tuple(a2_scale.shape)} "
+                    f"scale_min={int(_sf.min())} scale_max={int(_sf.max())}"
+                )
         else:
             raise NotImplementedError(
                 f"gfx1250 fused_moe per_1x32 stage2 quant: unsupported "
