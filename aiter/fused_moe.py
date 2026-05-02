@@ -1242,7 +1242,7 @@ def fused_moe_2stages(
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        and activation == aiter.ActivationType.Swiglu
+        # and activation == aiter.ActivationType.Swiglu
     ):
         a1 = hidden_states.to(dtypes.fp8)
         M = sorted_ids.shape[0]
@@ -1308,7 +1308,7 @@ def fused_moe_2stages(
         and metadata.has_bias
         and dtype in [dtypes.bf16, dtypes.fp16]
         and quant_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
+        # and activation == ActivationType.Swiglu
     ):
         extra_stage1_args["bias1"] = bias1
         extra_stage2_args["bias2"] = bias2
