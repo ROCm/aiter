@@ -24,6 +24,7 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.ops.flydsl.moe_common import GateMode
 
 
 from aiter.ops.shuffle import (
@@ -48,6 +49,7 @@ def test_fmoe(
     E,
     topk,
     actType,
+    gateMode,
     qType,
     AQDType,
     WQDType,
@@ -269,6 +271,7 @@ def test_fmoe(
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
         swiglu_limit=swiglu_limit,
+        gate_mode=gateMode,
         num_iters=5,
         num_warmup=2,
     )
@@ -494,12 +497,8 @@ def _row_to_kwargs(row):
     q_type = _str2enum(row["q_type"], aiter.QuantType)
     aq_dtype = _str2dtype(row["q_dtype_a"])
     wq_dtype = _str2dtype(row["q_dtype_w"])
-    act_type = _effective_act_type(
-        q_type,
-        aq_dtype,
-        wq_dtype,
-        _str2enum(row["act_type"], aiter.ActivationType),
-    )
+    act_type = _str2enum(row["act_type"], aiter.ActivationType)
+    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
     return dict(
         dtype=_str2dtype(row["dtype"]),
         token=int(row["token"]),
@@ -508,6 +507,7 @@ def _row_to_kwargs(row):
         E=int(row["expert"]),
         topk=int(row["topk"]),
         actType=act_type,
+        gateMode=gate_mode,
         qType=q_type,
         AQDType=aq_dtype,
         WQDType=wq_dtype,
@@ -553,10 +553,10 @@ _PER1X32_FP8_FP4 = (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2)
 _PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
 
 
-def _effective_act_type(quant_type, aq_dtype, wq_dtype, act_type):
-    if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
-        return aiter.ActivationType.Swiglu
-    return act_type
+def _effective_gate_mode(aq_dtype, wq_dtype):
+    if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
+        return GateMode.INTERLEAVE.value
+    return GateMode.SEPARATED.value
 
 
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
@@ -588,7 +588,8 @@ def _iter_legacy_cases():
             inter_dim=inter_dim,
             E=args.expert,
             topk=args.topk,
-            actType=_effective_act_type(quant_type, aq_dtype, wq_dtype, act_type),
+            actType=act_type,
+            gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,

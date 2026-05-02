@@ -17,6 +17,7 @@ from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.flydsl.moe_common import GateMode
 from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 
 BLOCK_SIZE_M = 32
@@ -142,8 +143,8 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
-    q_dtype_a=None,
     swiglu_limit=0.0,
+    gate_mode: str = GateMode.SEPARATED.value,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -169,8 +170,8 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
-        q_dtype_a=q_dtype_a,
         swiglu_limit=swiglu_limit,
+        gate_mode=gate_mode,
     )
 
 
@@ -198,8 +199,8 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    q_dtype_a: Optional[torch.dtype] = None,
     swiglu_limit: float = 0.0,
+    gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -234,12 +235,13 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    q_dtype_a: Optional[torch.dtype] = None,
     swiglu_limit: float = 0.0,
+    gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
+    gate_mode = GateMode(gate_mode)
     if block_size_M == -1:
         block_size_M = None
     """user API"""
@@ -263,7 +265,7 @@ def fused_moe_(
     ], f"Fused_moe unsupported out dtype: {dtype}"
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
-    q_dtype_a = q_dtype_a if q_dtype_a is not None else w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
     # use FP8 as activation dtype to skip redundant re-quantization
     if (
@@ -274,7 +276,7 @@ def fused_moe_(
         q_dtype_a = dtypes.fp8
     bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
     if quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Swiglu or q_dtype_a == dtypes.fp8:
+        if activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
             elif M >= bf16_fp8_bound:
@@ -1553,6 +1555,8 @@ def torch_moe(
 
 # temp workaround for swiglu
 def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0):
+    if limit == 0.0:
+        limit = 7.0
     # Clamp the input values
     x_glu = x_glu.clamp(min=None, max=limit)
     x_linear = x_linear.clamp(min=-limit, max=limit)
