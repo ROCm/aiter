@@ -1325,6 +1325,13 @@ namespace py = pybind11;
           py::arg("input"),                                              \
           py::arg("num_rows"));
 
+#define DSV4_ROTATE_QUANT_PYBIND                                         \
+    m.def("rotate_activation_fp4quant_inplace",                          \
+          &aiter::rotate_activation_fp4quant_inplace,                    \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("group_size") = 32);
+
 #define QUICK_ALL_REDUCE_PYBIND                                                            \
     m.def("init_custom_qr",                                                                \
           &aiter::init_custom_qr,                                                          \

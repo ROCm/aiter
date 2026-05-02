@@ -714,3 +714,11 @@ def partial_transpose(
     input: Tensor,
     num_rows: Tensor,
 ) -> None: ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rotate_activation_fp4quant_inplace(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    group_size: int = 32,
+) -> None: ...
