@@ -61,18 +61,41 @@ def test_fmoe(
     if get_gfx() not in ["gfx950","gfx1250"] and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = aiter.get_torch_quant(qType)
-    input = torch.randn((token, model_dim), dtype=dtype)
+    # gfx1250 a8w4/fp8 + per_1x32 has very limited dynamic range
+    # (fp8 activation × fp4 weight, K=model_dim summation): with the
+    # default unit-stddev randn() inputs the per-channel K-sum saturates
+    # bf16 (~3e4) and the test's bf16 reference disagrees with the
+    # quantised kernel by 100x.  FlyDSL UT
+    # (test_moe_gemm_mxscale_gfx1250.py) uses init_scale=0.2 for exactly
+    # this reason; mirror that on gfx1250 FlyDSL-eligible configs to keep
+    # the accuracy window meaningful.
+    _input_scale = 1.0
+    if (
+        get_gfx() == "gfx1250"
+        and qType == aiter.QuantType.per_1x32
+        and (
+            (AQDType == dtypes.fp4x2 and WQDType == dtypes.fp4x2)
+            or (AQDType == dtypes.fp8 and WQDType == dtypes.fp4x2)
+            or (AQDType == dtypes.fp8 and WQDType == dtypes.fp8)
+        )
+    ):
+        _input_scale = 0.2
+    input = torch.randn((token, model_dim), dtype=dtype) * _input_scale
     if use_g1u1:
-        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
+        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) * _input_scale
         if hidden_pad != 0 and intermediate_pad != 0:
             w1[:, :, -hidden_pad:] = 0
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
         exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
     else:
-        w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
+        w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype) * _input_scale
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
+    # UT scales w2 by an additional 1/sqrt(inter_dim) to keep stage2
+    # output in range; replicate that on gfx1250 a8w4/fp8.
+    import math as _math
+    _w2_scale = (_input_scale / _math.sqrt(inter_dim)) if _input_scale != 1.0 else 1.0
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) * _w2_scale
     if hidden_pad != 0 and intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
