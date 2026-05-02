@@ -24,6 +24,171 @@ BLOCK_SIZE_M = 32
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
 
 
+def _moe_sorting_torch_gfx1250(
+    topk_ids,
+    topk_weights,
+    num_experts,
+    model_dim,
+    moebuf_dtype,
+    block_size,
+    expert_mask,
+    num_local_tokens,
+):
+    """Pure-torch moe_sorting fallback for gfx1250 (vectorised, no host syncs).
+
+    Both ``aiter.moe_sorting_opus_fwd`` (precompiled opus kernel) and
+    ``aiter.moe_sorting_fwd`` (CK-tile) are broken on gfx1250 today:
+
+      * The opus kernel submits to the HSA queue but never raises the
+        completion signal, so any subsequent op that synchronises against
+        that stream busy-waits inside ``rocr::core::InterruptSignal::WaitRelaxed``
+        forever.
+      * The CK-tile path calls into Composable Kernel which simply isn't
+        compiled for gfx1250 (NULL kernel pointer -> segfault).
+
+    The semantics match the reference ``moe_sorting_torch_native`` in
+    ``aiter/op_tests/test_moe_sorting.py``:
+      * tokens belonging to expert ``e`` are placed contiguously inside
+        ``sorted_ids``, padded to a multiple of ``block_size``;
+      * ``sorted_ids[i] = (topk_idx << 24) | token_idx`` for valid slots,
+        ``init_val = (topk << 24) | M`` for padding slots;
+      * ``sorted_expert_ids[b] = local_expert_idx`` (i.e. expert id with
+        masked-out experts removed) for the b-th tile;
+      * ``num_valid_ids = [num_valid_sorted_slots, num_valid_input_tokens]``.
+
+    Implementation is fully vectorised on the GPU -- O(num_experts) python-side
+    sync, but those are at most a few cheap shape lookups, not 256 ``.item()``
+    + ``torch.where`` calls per forward.
+    """
+    assert topk_ids.is_cuda
+    device = topk_ids.device
+    M, topk = topk_ids.shape
+    E = int(num_experts)
+    BS = int(block_size)
+
+    max_num_tokens_padded = int(topk_ids.numel() + E * BS - topk)
+    max_num_m_blocks = int((max_num_tokens_padded + BS - 1) // BS)
+
+    init_val = (int(topk) << 24) | int(M)
+    sorted_ids = torch.full(
+        (max_num_tokens_padded,), init_val, dtype=dtypes.i32, device=device
+    )
+    sorted_weights = torch.zeros(
+        max_num_tokens_padded, dtype=dtypes.fp32, device=device
+    )
+    sorted_expert_ids = torch.full(
+        (max_num_m_blocks,), -1, dtype=dtypes.i32, device=device
+    )
+    num_valid_ids = torch.zeros(2, dtype=dtypes.i32, device=device)
+    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+
+    # ---- Build per-token (expert, token, topk, weight) flat arrays ------
+    flat_expert = topk_ids.reshape(-1).to(torch.int64)            # (M*topk,)
+    flat_weight = topk_weights.reshape(-1).to(dtypes.fp32)        # (M*topk,)
+    arange_flat = torch.arange(
+        flat_expert.numel(), device=device, dtype=torch.int64
+    )
+    flat_token = arange_flat // topk                              # (M*topk,)
+    flat_topk_idx = arange_flat % topk                            # (M*topk,)
+
+    # mask out tokens past the local DP slice (only applies if caller passes
+    # a 1-elem tensor with num_local_tokens; matches opus semantics).
+    if num_local_tokens is not None:
+        # `num_local_tokens` is typically a 0-d int32 GPU tensor.
+        n_local = num_local_tokens.reshape(-1)[0].to(torch.int64)
+        valid_token_mask = flat_token < n_local
+    else:
+        valid_token_mask = torch.ones_like(flat_expert, dtype=torch.bool)
+
+    # ---- Build local-expert mapping (skip masked-out experts) -----------
+    if expert_mask is not None:
+        keep = (expert_mask.to(torch.int32) != 0)
+    else:
+        keep = torch.ones(E, dtype=torch.bool, device=device)
+    # `local_eid[i]` = position of expert i in the kept set (-1 if dropped)
+    keep_i32 = keep.to(torch.int32)
+    local_eid = torch.cumsum(keep_i32, dim=0).to(torch.int32) - 1
+    local_eid = torch.where(
+        keep, local_eid, torch.full_like(local_eid, -1)
+    )                                                              # (E,)
+
+    # token is "valid" iff its expert is kept *and* its token-id is < n_local
+    # (we encode dropped experts by mapping them to expert id E for sorting,
+    # so they end up at the end and never enter the valid prefix).
+    keep_tok = valid_token_mask & keep[flat_expert]
+    sort_key = torch.where(
+        keep_tok,
+        flat_expert,
+        torch.full_like(flat_expert, E),       # send to the end
+    )
+
+    # ---- Stable sort by expert, then take valid prefix ------------------
+    # `stable=True` keeps the natural (token, topk) order inside each bucket,
+    # matching the reference loop which iterates (token, topk) row-major.
+    perm = torch.argsort(sort_key, stable=True)
+    sorted_expert = flat_expert[perm]                              # (M*topk,)
+    sorted_token = flat_token[perm].to(torch.int32)
+    sorted_tk_idx = flat_topk_idx[perm].to(torch.int32)
+    sorted_w = flat_weight[perm]
+    sorted_keep = keep_tok[perm]
+
+    # ---- Per-expert counts and tile padding -----------------------------
+    counts = torch.bincount(
+        torch.where(keep_tok, flat_expert, torch.full_like(flat_expert, E)),
+        minlength=E + 1,
+    )[:E]                                                          # (E,)
+    counts_kept = counts * keep.to(counts.dtype)                   # (E,)
+    blocks_per_expert = (counts_kept + BS - 1) // BS               # (E,)
+    pad_per_expert = blocks_per_expert * BS                        # (E,)
+
+    # offset of each expert's first slot inside the *padded* layout
+    pad_offsets = torch.zeros(E, dtype=torch.int64, device=device)
+    pad_offsets[1:] = torch.cumsum(pad_per_expert[:-1], dim=0)
+
+    # offset of each expert's first valid (un-padded) slot inside sorted_*
+    valid_offsets = torch.zeros(E, dtype=torch.int64, device=device)
+    valid_offsets[1:] = torch.cumsum(counts_kept[:-1], dim=0)
+
+    n_valid_total = int(counts_kept.sum().item())                  # 1 sync
+    # destination index in `sorted_ids` for each valid sorted entry.
+    rank_within = (
+        torch.arange(flat_expert.numel(), device=device, dtype=torch.int64)
+        - valid_offsets[sorted_expert]
+    )
+    dest_idx = pad_offsets[sorted_expert] + rank_within
+
+    valid_prefix = sorted_keep[:n_valid_total]
+    if n_valid_total > 0:
+        d = dest_idx[:n_valid_total][valid_prefix]
+        packed = (
+            (sorted_tk_idx[:n_valid_total][valid_prefix].to(torch.int32) << 24)
+            | sorted_token[:n_valid_total][valid_prefix].to(torch.int32)
+        )
+        sorted_ids.index_copy_(0, d.to(torch.int64), packed)
+        sorted_weights.index_copy_(
+            0, d.to(torch.int64), sorted_w[:n_valid_total][valid_prefix]
+        )
+
+    # ---- Fill sorted_expert_ids with local expert id per tile ----------
+    block_offsets = torch.zeros(E, dtype=torch.int64, device=device)
+    block_offsets[1:] = torch.cumsum(blocks_per_expert[:-1], dim=0)
+    n_block_total = int(blocks_per_expert.sum().item())            # 1 sync
+    if n_block_total > 0:
+        # blow up `local_eid` per expert by `blocks_per_expert`:
+        block_expert = torch.repeat_interleave(local_eid, blocks_per_expert)
+        sorted_expert_ids[:n_block_total] = block_expert.to(dtypes.i32)
+
+    # `num_valid_ids[0]` is the number of *padded* valid slots (i.e. the
+    # total padded length actually used), which equals `n_block_total * BS`.
+    num_valid_ids[0] = int(n_block_total * BS)
+    if num_local_tokens is not None:
+        num_valid_ids[1] = num_local_tokens.reshape(-1)[0].to(dtypes.i32)
+    else:
+        num_valid_ids[1] = int(M)
+
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+
+
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -36,6 +201,22 @@ def _moe_sorting_impl(
     dispatch_policy,
     use_opus,
 ):
+    # gfx1250: both the opus prebuilt kernel and the CK-tile fallback are
+    # broken (see _moe_sorting_torch_gfx1250 docstring).  Force the pure-torch
+    # path here so a misconfigured AITER_USE_OPUS_MOE_SORTING=1 does not
+    # silently deadlock the entire serving process.
+    if get_gfx() == "gfx1250":
+        return _moe_sorting_torch_gfx1250(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask,
+            num_local_tokens,
+        )
+
     device = topk_ids.device
     M, topk = topk_ids.shape
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
@@ -1160,7 +1341,11 @@ def get_2stage_cfgs(
                 f"[fused_moe] gfx1250 FlyDSL dispatch: format={gfx1250_fmt}, "
                 f"{'mxscale' if is_mxscale else 'wmma'} kernel"
             )
-
+            logger.info(
+                f"[fused_moe] input shapes: token={token}, model_dim={model_dim}, "
+                f"inter_dim={inter_dim}, expert={expert}, topk={topk}"
+            )
+            
             return MOEMetadata(
                 stage1=functools.partial(
                     _gfx1250_moe_stage1,
@@ -1284,6 +1469,23 @@ def get_2stage_cfgs(
                     f"[fused_moe] flydsl unavailable and no fallback for {keys}, "
                     "using default heuristics"
                 )
+
+    # gfx1250 safety net: a tuned cfg whose stage1 OR stage2 kernelName is a
+    # CK kernel ("moe_ck2stages_*") will dispatch into ck_moe_stage1 /
+    # ck_moe_stage2_fwd, but Composable Kernel is not built for gfx1250 -- the
+    # call lands on a NULL kernel pointer and the process segfaults.  Drop any
+    # such cfg on gfx1250 so we fall back to the default-heuristics path that
+    # routes everything through the flydsl wrappers.
+    if cfg is not None and get_gfx() == "gfx1250":
+        kn1 = str(cfg.get("kernelName1", ""))
+        kn2 = str(cfg.get("kernelName2", ""))
+        if kn1.startswith("moe_ck2stages") or kn2.startswith("moe_ck2stages"):
+            logger.warning(
+                f"[fused_moe] gfx1250: tuned cfg for {keys} contains a CK "
+                f"kernel ({kn1=}, {kn2=}); CK is unsupported on gfx1250, "
+                "discarding cfg and falling back to default heuristics."
+            )
+            cfg = None
 
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
@@ -1666,12 +1868,22 @@ def fused_moe_2stages(
         # K//32), which the FlyDSL kernel cannot address correctly and
         # produces numerically uncorrelated output. Keep the quantization
         # output in source-token layout for gfx1250.
-        from aiter.ops.quant import per_1x32_f4_quant
+        # NOTE: prefer the HIP kernel (per_1x32_f4_quant_hip) over the pure
+        # torch reference (per_1x32_f4_quant): on warmup with M=16384 the
+        # torch path takes 10+ minutes (it builds a `.float()` reduction tree
+        # over hundreds of millions of elements) and the user perceives it as
+        # a hang.  The HIP kernel produces the same source-token layout the
+        # FlyDSL stage1 wrapper expects.
+        from aiter.ops.quant import per_1x32_f4_quant_hip
         if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
             a1 = hidden_states
             a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
         else:
-            a1, a1_scale = per_1x32_f4_quant(hidden_states, quant_dtype=dtypes.fp4x2)
+            a1_flat = hidden_states.view(-1, hidden_states.shape[-1])
+            a1, a1_scale = per_1x32_f4_quant_hip(
+                a1_flat, quant_dtype=dtypes.fp4x2, shuffle=False
+            )
+            a1 = a1.view(*hidden_states.shape[:-1], -1)
             a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
     elif quant_type == QuantType.per_1x32:
         if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
@@ -1795,9 +2007,13 @@ def fused_moe_2stages(
     elif quant_type == QuantType.per_1x32 and get_gfx() == "gfx1250":
         # Stage2 FlyDSL kernel expects scale_x in source order of shape
         # (tokens*topk, inter_dim//32). See comment in stage1 path.
-        from aiter.ops.quant import per_1x32_f4_quant
+        # Use the HIP kernel (orders-of-magnitude faster than the pure-torch
+        # reference at warmup-sized M).
+        from aiter.ops.quant import per_1x32_f4_quant_hip
         a2_flat = a2.view(-1, inter_dim)
-        a2_flat, a2_scale = per_1x32_f4_quant(a2_flat, quant_dtype=dtypes.fp4x2)
+        a2_flat, a2_scale = per_1x32_f4_quant_hip(
+            a2_flat, quant_dtype=dtypes.fp4x2, shuffle=False
+        )
         a2_scale = a2_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
         a2 = a2_flat.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x32:
