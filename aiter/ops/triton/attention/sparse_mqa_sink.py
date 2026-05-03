@@ -74,9 +74,7 @@ def sparse_mqa_sink(
     block_size = kv.shape[1]
     topk_count = topk_indices.shape[1]
     num_seqs = seqused_k.shape[0]
-    assert (
-        cu_seqlens_q.shape[0] == num_seqs + 1
-    ), (
+    assert cu_seqlens_q.shape[0] == num_seqs + 1, (
         "cu_seqlens_q must have length num_seqs + 1, "
         f"got {cu_seqlens_q.shape[0]} vs {num_seqs + 1}"
     )

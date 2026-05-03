@@ -31,9 +31,7 @@ def _reference(
     scores = (scores.relu_() * wf.unsqueeze(-1)).sum(dim=1)
     valid_limit = (positions.to(torch.long) + 1) // ratio
     if kv_lens is not None:
-        valid_limit = torch.minimum(
-            valid_limit, kv_lens[seq_ids.long()].to(torch.long)
-        )
+        valid_limit = torch.minimum(valid_limit, kv_lens[seq_ids.long()].to(torch.long))
     valid = torch.arange(max_committed, device=q.device).unsqueeze(
         0
     ) < valid_limit.unsqueeze(1)
