@@ -51,15 +51,18 @@ public:
                              int device_id,
                              hipStream_t stream = nullptr)
     {
-        (void)stream; // reserved for future async alloc
         AiterTensor t;
         t.init_shape(dims, dtype, device_id);
+        t.stream_ = stream;
 
         size_t nbytes = t.numel_ * AiterDtype_element_size(dtype);
         if(nbytes > 0)
         {
             HipDeviceGuard guard(device_id);
-            HIP_CALL(hipMalloc(&t.ptr, nbytes));
+            if(stream)
+                HIP_CALL(hipMallocAsync(&t.ptr, nbytes, stream));
+            else
+                HIP_CALL(hipMalloc(&t.ptr, nbytes));
         }
         t.owns_memory_ = true;
         return t;
@@ -71,7 +74,6 @@ public:
     static AiterTensor empty_like(const aiter_tensor_t* other,
                                   hipStream_t stream = nullptr)
     {
-        (void)stream; // reserved for future async alloc
         AITER_CHECK(other != nullptr, __func__, ": other must not be null");
         AITER_CHECK(other->ndim <= 8, __func__, ": ndim ", other->ndim, " exceeds max 8");
         AiterTensor t;
@@ -94,11 +96,16 @@ public:
                                  static_cast<size_t>(other->strides[i]);
         }
 
+        t.stream_ = stream;
+
         size_t nbytes = storage_nelem * AiterDtype_element_size(t.dtype_);
         if(nbytes > 0)
         {
             HipDeviceGuard guard(t.device_id);
-            HIP_CALL(hipMalloc(&t.ptr, nbytes));
+            if(stream)
+                HIP_CALL(hipMallocAsync(&t.ptr, nbytes, stream));
+            else
+                HIP_CALL(hipMalloc(&t.ptr, nbytes));
         }
         t.owns_memory_ = true;
         return t;
@@ -128,7 +135,10 @@ public:
         if(owns_memory_ && ptr)
         {
             HipDeviceGuard guard(device_id);
-            hipFree(ptr);
+            if(stream_)
+                hipFreeAsync(ptr, stream_);
+            else
+                hipFree(ptr);
             ptr = nullptr;
         }
     }
@@ -136,7 +146,8 @@ public:
     // Move constructor
     AiterTensor(AiterTensor&& other) noexcept
         : aiter_tensor_t(static_cast<aiter_tensor_t&>(other)),
-          owns_memory_(other.owns_memory_)
+          owns_memory_(other.owns_memory_),
+          stream_(other.stream_)
     {
         other.owns_memory_ = false;
         other.ptr = nullptr;
@@ -150,10 +161,14 @@ public:
             if(owns_memory_ && ptr)
             {
                 HipDeviceGuard guard(device_id);
-                hipFree(ptr);
+                if(stream_)
+                    hipFreeAsync(ptr, stream_);
+                else
+                    hipFree(ptr);
             }
             static_cast<aiter_tensor_t&>(*this) = static_cast<aiter_tensor_t&>(other);
             owns_memory_ = other.owns_memory_;
+            stream_ = other.stream_;
             other.owns_memory_ = false;
             other.ptr = nullptr;
         }
@@ -166,6 +181,7 @@ public:
 
 private:
     bool owns_memory_ = false;
+    hipStream_t stream_ = nullptr;
 
     AiterTensor()
     {
