@@ -27,6 +27,7 @@ from kernels.moe_gemm_2stage_common_gfx1250 import (
     _emit_stage1_gate_up_epilogue,
     _emit_stage1_gate_up_splitk_epilogue,
     _emit_stage2_store_epilogue,
+    _emit_swiglu,
     _extract_sub8,
     _finalize_alloc_and_launch_2d,
     _make_moe_wave_layout,
@@ -65,6 +66,16 @@ def _compile_stage1_mxscale_kernel_impl(
     cluster_m: int = 1,
     cluster_n: int = 1,
     k_batch: int = 1,
+    # ── Bias / activation ────────────────────────────────────────────
+    # ``enable_bias``: when True, the kernel signature includes an
+    # ``arg_bias`` operand of shape (E * 2*inter_dim,) f32. Stage1 adds
+    # ``bias[eid, gate_col]`` and ``bias[eid, inter_dim + up_col]``
+    # before activation. Layout matches torch's ``w1_bias`` (gate||up
+    # concatenation per expert).
+    # ``act``: ``"silu"`` (default) for ``silu(g)*u``; ``"swiglu"`` for
+    # GPT-OSS SwiGLU (``alpha=1.702``, ``limit=7.0``, hardcoded).
+    enable_bias: bool = False,
+    act: str = "silu",
 ):
     """Compile mxscale stage1 single kernel (route-pack + TDM + WMMA_SCALE + epilog).
 
@@ -127,6 +138,14 @@ def _compile_stage1_mxscale_kernel_impl(
     # silu/mul fusion, doweight_stage1 and TDM store must be disabled for
     # split-K; a separate reduction kernel fuses silu*mul and folds in
     # the per-slot routing weight.
+    # Activation kind: 'silu' (default; matches the historical kernel
+    # that fuses ``silu(gate) * up`` in epilogue) or 'swiglu' (GPT-OSS
+    # gated-linear-unit; emits clamp + Swish_alpha + (up+1) in epilogue).
+    _act_kind = str(act).strip().lower()
+    if _act_kind not in ("silu", "swiglu"):
+        raise ValueError(
+            f"stage1 mxscale: unsupported act={act!r}; expected 'silu' or 'swiglu'")
+    _enable_bias = bool(enable_bias)
     _is_splitk = int(k_batch) > 1
     if _is_splitk:
         if int(model_dim) % int(k_batch) != 0:
@@ -146,6 +165,14 @@ def _compile_stage1_mxscale_kernel_impl(
             raise ValueError(
                 "split-K stage1 does not support fused doweight_stage1; "
                 "apply routing weight in the external reduction kernel")
+        # split-K stage1 atomically accumulates raw gate/up partials and
+        # fuses silu/mul in an external reduction kernel; SwiGLU would
+        # have to be applied there too, which is not currently wired.
+        if _act_kind != "silu":
+            raise ValueError(
+                "split-K stage1 fuses activation in the external reduction "
+                "kernel; only act='silu' is supported. Disable split-K "
+                "(k_batch=1) to use SwiGLU.")
         _s1_out = str(out_dtype).strip().lower()
         if _s1_out not in ("f16", "fp16", "half", "bf16", "bfloat16"):
             raise ValueError(
@@ -280,6 +307,11 @@ def _compile_stage1_mxscale_kernel_impl(
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
         arg_num_valid_ids: fx.Tensor,
+        # ``arg_bias`` (f32, flat E*2*inter_dim) is unused when
+        # ``enable_bias=False`` at compile time but is always present in
+        # the kernel signature so the runtime tuple shape is stable.
+        # Callers should pass an empty tensor when bias is disabled.
+        arg_bias: fx.Tensor,
         i32_tokens_in: fx.Int32,
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -351,6 +383,11 @@ def _compile_stage1_mxscale_kernel_impl(
         sw_rsrc = buffer_ops.create_buffer_resource(arg_scale_w, max_size=False, num_records_bytes=sw_nbytes)
         out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
         tw_rsrc = buffer_ops.create_buffer_resource(arg_sorted_weights, max_size=True)
+        # bias resource: only meaningful when ``_enable_bias=True``. We
+        # always create it (with max_size=True so an empty tensor is
+        # tolerated) so the kernel signature stays stable; the epilogue
+        # only issues buffer_load on it when the constexpr flag is set.
+        bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
 
         eid_i32 = buffer_ops.buffer_load(eid_rsrc, arith.index_cast(T.i32, by), vec_width=1, dtype=T.i32)
         eid_ok0 = arith.cmpi(arith.CmpIPredicate.sge, eid_i32, arith.constant(0, type=T.i32))
@@ -1839,6 +1876,13 @@ def _compile_stage1_mxscale_kernel_impl(
                     pipeline_fence(outstanding=0, use_cluster=use_cluster)
                 rocdl.sched_barrier(0)
 
+                # TDM-store path also needs bias / SwiGLU. Per-tile column
+                # base (used to load gate/up bias from the per-expert slab)
+                # is the tile's N origin in the (blk_n + warp_n_base + wn*WMMA_N
+                # + lane_kgrp*8 + vi) coordinate system.
+                if const_expr(_enable_bias):
+                    _c2_n_i32 = arith.constant(2, type=T.i32)
+                    _bias_row_base_i32_s1 = eid_i32 * (i32_inter_in * _c2_n_i32)
                 for _acc_idx, _vec_base, _m_off, _wn in _sub_tiles:
                     _wm_idx = _m_off // WMMA_M
                     _sc = _scale_per_wm_s1[_wm_idx]
@@ -1852,6 +1896,9 @@ def _compile_stage1_mxscale_kernel_impl(
                         vector=vector,
                         range_constexpr=range_constexpr,
                         ACC_VEC_SIZE=ACC_VEC_SIZE)
+                    _col_base_s1 = (
+                        blk_n + warp_n_base + fx.Index(_wn * WMMA_N)
+                        + lane_kgrp * fx.Index(8))
                     _fused = []
                     for _vi in range_constexpr(8):
                         _vg = vector.extract(
@@ -1862,7 +1909,23 @@ def _compile_stage1_mxscale_kernel_impl(
                             _sub8u,
                             static_position=[_vi],
                             dynamic_position=[])
-                        _y = silu(_vg) * _vu * _sc
+                        if const_expr(_enable_bias):
+                            _col_i32_s1 = arith.index_cast(
+                                T.i32, _col_base_s1 + fx.Index(_vi))
+                            _bg = buffer_ops.buffer_load(
+                                bias_rsrc,
+                                _bias_row_base_i32_s1 + _col_i32_s1,
+                                vec_width=1, dtype=T.f32)
+                            _bu = buffer_ops.buffer_load(
+                                bias_rsrc,
+                                _bias_row_base_i32_s1 + i32_inter_in + _col_i32_s1,
+                                vec_width=1, dtype=T.f32)
+                            _vg = _vg + _bg
+                            _vu = _vu + _bu
+                        if const_expr(_act_kind == "swiglu"):
+                            _y = _emit_swiglu(_vg, _vu, arith=arith, rocdl=rocdl, T=T) * _sc
+                        else:
+                            _y = silu(_vg) * _vu * _sc
                         _fused.append(_y)
                     _fused_sub8 = vector.from_elements(
                         T.vec(8, T.f32), _fused)
@@ -2003,6 +2066,9 @@ def _compile_stage1_mxscale_kernel_impl(
                         range_constexpr=range_constexpr,
                         rocdl=rocdl,
                         T=T,
+                        bias_rsrc=bias_rsrc if _enable_bias else None,
+                        eid_i32=eid_i32 if _enable_bias else None,
+                        bias_scale=(1.0 / int(k_batch)) if _enable_bias else None,
                     )
                 else:
                     _emit_stage1_gate_up_epilogue(
@@ -2038,6 +2104,10 @@ def _compile_stage1_mxscale_kernel_impl(
                         vector=vector,
                         range_constexpr=range_constexpr,
                         T=T,
+                        bias_rsrc=bias_rsrc if _enable_bias else None,
+                        eid_i32=eid_i32 if _enable_bias else None,
+                        act_kind=_act_kind,
+                        rocdl=rocdl,
                     )
             scf.YieldOp([])
 
@@ -2052,6 +2122,7 @@ def _compile_stage1_mxscale_kernel_impl(
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
         arg_num_valid_ids: fx.Tensor,
+        arg_bias: fx.Tensor,
         i32_tokens_in: fx.Int32,
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -2067,6 +2138,7 @@ def _compile_stage1_mxscale_kernel_impl(
         launcher = moe_mxscale_stage1_single(
             arg_out, arg_x, arg_w, arg_scale_x, arg_scale_w,
             arg_sorted_token_ids, arg_expert_ids, arg_sorted_weights, arg_num_valid_ids,
+            arg_bias,
             i32_tokens_in, i32_inter_in, i32_k_in, i32_size_expert_ids_in,
         )
         _cluster_arg = (int(cluster_m), int(cluster_n), 1) if use_cluster else None
@@ -2119,6 +2191,12 @@ def _compile_stage2_mxscale_kernel_impl(
     wave_specialized_tdm: bool = False,
     cluster_m: int = 1,
     cluster_n: int = 1,
+    # ── Bias ────────────────────────────────────────────────────────
+    # Per-expert bias of shape (E, model_dim) applied after the GEMM.
+    # In atomic-accumulate mode the per-slot bias is divided by ``topk``
+    # in the epilogue so the sum across the ``topk`` per-token atomic
+    # adds reproduces a single ``+ bias`` per token (matches torch ref).
+    enable_bias: bool = False,
 ):
     """Compile mxscale stage2 single kernel (route-pack + TDM + WMMA_SCALE + epilog).
 
@@ -2141,6 +2219,15 @@ def _compile_stage2_mxscale_kernel_impl(
 
     if bool(use_tdm_store) and bool(accumulate):
         raise ValueError("use_tdm_store is not compatible with accumulate=True in moe mxscale stage2")
+    _enable_bias = bool(enable_bias)
+    if _enable_bias and bool(use_tdm_store):
+        # The TDM-store epilogue writes packed gather rows to LDS then to
+        # global memory, with no intermediate scalar add point matching
+        # how the standard epilogue applies bias. Disabling avoids
+        # silently dropping bias on this path.
+        raise ValueError(
+            "stage2 mxscale: enable_bias=True is not supported with "
+            "use_tdm_store=True; use the standard scatter-store path.")
 
     tp = _compute_mxscale_tiling(
         data_format=data_format, K=int(inter_dim),
@@ -2287,6 +2374,10 @@ def _compile_stage2_mxscale_kernel_impl(
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
         arg_num_valid_ids: fx.Tensor,
+        # Per-expert bias slab (E*model_dim, f32 flat). Pass an empty
+        # tensor when ``enable_bias=False``; only read when the
+        # constexpr flag is set.
+        arg_bias: fx.Tensor,
         i32_tokens_in: fx.Int32,
         i32_n_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -2356,6 +2447,9 @@ def _compile_stage2_mxscale_kernel_impl(
         sw_rsrc = buffer_ops.create_buffer_resource(arg_scale_w, max_size=False, num_records_bytes=sw_nbytes)
         out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=False, num_records_bytes=out_nbytes)
         tw_rsrc = buffer_ops.create_buffer_resource(arg_sorted_weights, max_size=True)
+        # bias: per-expert (E, model_dim) f32 slab, only read when
+        # ``_enable_bias`` constexpr is True (epilogue gates the load).
+        bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
 
         eid_i32 = buffer_ops.buffer_load(eid_rsrc, arith.index_cast(T.i32, by), vec_width=1, dtype=T.i32)
         eid_ok0 = arith.cmpi(arith.CmpIPredicate.sge, eid_i32, arith.constant(0, type=T.i32))
@@ -3630,6 +3724,8 @@ def _compile_stage2_mxscale_kernel_impl(
                     range_constexpr=range_constexpr,
                     rocdl=rocdl,
                     T=T,
+                    bias_rsrc=bias_rsrc if _enable_bias else None,
+                    eid_i32=eid_i32 if _enable_bias else None,
                 )
             scf.YieldOp([])
 
@@ -3644,6 +3740,7 @@ def _compile_stage2_mxscale_kernel_impl(
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
         arg_num_valid_ids: fx.Tensor,
+        arg_bias: fx.Tensor,
         i32_tokens_in: fx.Int32,
         i32_n_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -3659,6 +3756,7 @@ def _compile_stage2_mxscale_kernel_impl(
         launcher = moe_mxscale_stage2_single(
             arg_out, arg_x, arg_w, arg_scale_x, arg_scale_w,
             arg_sorted_token_ids, arg_expert_ids, arg_sorted_weights, arg_num_valid_ids,
+            arg_bias,
             i32_tokens_in, i32_n_in, i32_k_in, i32_size_expert_ids_in,
         )
         _cluster_arg = (int(cluster_m), int(cluster_n), 1) if use_cluster else None
@@ -3713,6 +3811,9 @@ def _compile_moe_mxscale_gemm(
     cluster_m: int = 1,
     cluster_n: int = 1,
     k_batch: int = 1,
+    # ── bias / activation (stage1 only consumes ``act``) ─────────────
+    enable_bias: bool = False,
+    act: str = "silu",
 ):
     _require_gfx1250()
     if waves_per_eu is not None and int(waves_per_eu) < 1:
@@ -3743,7 +3844,8 @@ def _compile_moe_mxscale_gemm(
 
     if stage == 1:
         exe = _compile_stage1_mxscale_kernel_impl(
-            doweight_stage1=bool(doweight), k_batch=int(k_batch), **common)
+            doweight_stage1=bool(doweight), k_batch=int(k_batch),
+            enable_bias=bool(enable_bias), act=str(act), **common)
         if (
             int(k_batch) == 1
             and in_dtype in ("fp8", "a8w4")
@@ -3761,18 +3863,25 @@ def _compile_moe_mxscale_gemm(
     if int(k_batch) != 1:
         raise ValueError(
             "split-K (k_batch>1) is only supported on stage1 for MXScale MoE")
+    # ``act`` is stage1-only; stage2 has no fused activation.
     return _compile_stage2_mxscale_kernel_impl(
-        doweight_stage2=bool(doweight), accumulate=bool(accumulate), **common,
+        doweight_stage2=bool(doweight), accumulate=bool(accumulate),
+        enable_bias=bool(enable_bias), **common,
     )
 
 
-def compile_moe_gemm1(*, doweight_stage1, group_size=-1, use_cshuffle_epilog=None, k_batch=1, **kw):
+def compile_moe_gemm1(*, doweight_stage1, group_size=-1, use_cshuffle_epilog=None,
+                      k_batch=1, enable_bias=False, act="silu", **kw):
     return _compile_moe_mxscale_gemm(
-        stage=1, doweight=doweight_stage1, k_batch=int(k_batch), **kw)
+        stage=1, doweight=doweight_stage1, k_batch=int(k_batch),
+        enable_bias=bool(enable_bias), act=str(act), **kw)
 
 
-def compile_moe_gemm2(*, doweight_stage2, accumulate=True, group_size=-1, use_cshuffle_epilog=None, **kw):
-    return _compile_moe_mxscale_gemm(stage=2, doweight=doweight_stage2, accumulate=accumulate, **kw)
+def compile_moe_gemm2(*, doweight_stage2, accumulate=True, group_size=-1,
+                      use_cshuffle_epilog=None, enable_bias=False, **kw):
+    return _compile_moe_mxscale_gemm(
+        stage=2, doweight=doweight_stage2, accumulate=accumulate,
+        enable_bias=bool(enable_bias), **kw)
 
 
 def compile_moe_gemm2_ex(*, mode=MoeGemm2Mode.ATOMIC, valid_mask=None, zero_intermediate=True, **kw):

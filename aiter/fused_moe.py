@@ -866,6 +866,11 @@ def _gfx1250_moe_stage1(
     tile_n=128,
     tile_k=128,
     activation=ActivationType.Silu,
+    # GPT-OSS style: per-expert bias (E, 2*inter_dim) f32, gate||up.
+    # Kept None in the SiLU path; ``fused_moe_2stages`` only forwards
+    # bias when ``activation == Swiglu`` (see ``MOEMetadata.has_bias``
+    # guard).
+    bias1=None,
     **_kwargs,
 ):
     """gfx1250 FlyDSL MOE stage1 wrapper (gate+up GEMM with activation)."""
@@ -925,7 +930,14 @@ def _gfx1250_moe_stage1(
                 256, 2 * inter_dim, inter_dim,
                 in_dtype=in_dtype, align=32,
             )
-        model_dim_padded = _mxscale_align_up(model_dim, tile_k)
+        # The weight's effective K may already be larger than model_dim
+        # (e.g. ATOM pads to multiples of 256 at load time: 2880→3072).
+        # model_dim_padded must be at least the weight's effective K so the
+        # kernel addresses both activation and weight with the same stride;
+        # otherwise every weight row after the first is read at the wrong
+        # offset, producing garbage and potential OOB access.
+        weight_k_eff = w1.shape[2] * pack_b
+        model_dim_padded = _mxscale_align_up(max(model_dim, weight_k_eff), tile_k)
         if model_dim_padded != model_dim:
             delta_k = model_dim_padded - model_dim
             # Activations (hidden_states, a1_scale) change every call -> skip
@@ -933,16 +945,18 @@ def _gfx1250_moe_stage1(
             # the padded copy so we don't redo a ~100MB memcpy on every fused_moe
             # invocation for shapes like GPT-OSS (model_dim=2880 -> 2944).
             hidden_states = _mxscale_zero_pad_last(hidden_states, delta_k // pack_a)
-            w1 = _mxscale_pad_weight_k(w1, delta_k // pack_b, weight_shuffled, cache=True)
-            # E8M0 scale pad: 0x00 = 2^-127 (mathematically neutral when paired
-            # with weight=0). Some HW may treat 0x00 as an exception sentinel;
-            # AITER_GFX1250_SCALE_PAD_ONE=1 forces 0x7F (= 1.0) instead so we
-            # can A/B test whether the pad sentinel is the source of NaN.
-            _scale_pad_val = 0x7F if int(os.environ.get("AITER_GFX1250_SCALE_PAD_ONE", "0")) else 0
             if a1_scale is not None and a1_scale.numel() > 0:
-                a1_scale = _mxscale_zero_pad_last(a1_scale, delta_k // 32, _scale_pad_val)
+                a1_scale = _mxscale_zero_pad_last(a1_scale, delta_k // 32,
+                    0x7F if int(os.environ.get("AITER_GFX1250_SCALE_PAD_ONE", "0")) else 0)
+        # Pad weight K only if the weight is still shorter than
+        # model_dim_padded (i.e. when ATOM did NOT pad to 256 but tile_k
+        # alignment added padding).
+        weight_delta = model_dim_padded - weight_k_eff
+        if weight_delta > 0:
+            w1 = _mxscale_pad_weight_k(w1, weight_delta // pack_b, weight_shuffled, cache=True)
+            _scale_pad_val = 0x7F if int(os.environ.get("AITER_GFX1250_SCALE_PAD_ONE", "0")) else 0
             if w1_scale is not None and w1_scale.numel() > 0:
-                w1_scale = _mxscale_zero_pad_last(w1_scale, delta_k // 32, _scale_pad_val, cache=True)
+                w1_scale = _mxscale_zero_pad_last(w1_scale, weight_delta // 32, _scale_pad_val, cache=True)
     else:
         tile_n_eff = tile_n
         model_dim_padded = model_dim
@@ -994,6 +1008,23 @@ def _gfx1250_moe_stage1(
             f"a1_scale={'yes' if a1_scale is not None and a1_scale.numel() > 0 else 'no'} "
             f"w1_scale={'yes' if w1_scale is not None and w1_scale.numel() > 0 else 'no'}"
         )
+    # FlyDSL kernel always takes an ``arg_bias`` tensor; pass an empty
+    # f32 buffer when bias is disabled. SwiGLU + bias is the GPT-OSS
+    # path; act='swiglu' is selected when the caller passes
+    # ``activation == ActivationType.Swiglu``.
+    _enable_bias = bias1 is not None and bias1.numel() > 0
+    if _enable_bias:
+        # Match the (E, 2*inter_dim) flat layout the kernel expects; in
+        # the K-padding path inter_dim is unchanged (only model_dim is
+        # padded), so bias dims stay valid. Cast to f32 since the kernel
+        # reads f32. Caller is expected to already provide f32.
+        flat_bias = bias1.contiguous().view(-1).to(dtypes.fp32)
+    else:
+        flat_bias = torch.empty(0, device=dev, dtype=dtypes.fp32)
+    _act_str = (
+        "swiglu" if activation == ActivationType.Swiglu else "silu"
+    )
+
     exe = compile_moe_gemm1(
         model_dim=model_dim_padded,
         inter_dim=inter_dim,
@@ -1005,6 +1036,8 @@ def _gfx1250_moe_stage1(
         doweight_stage1=(sorted_weights is not None),
         in_dtype=in_dtype,
         out_dtype=out_dtype_str,
+        enable_bias=_enable_bias,
+        act=_act_str,
     )
 
     args = (
@@ -1017,6 +1050,7 @@ def _gfx1250_moe_stage1(
         sorted_expert_ids,
         sw,
         num_valid_ids,
+        flat_bias,
         token_num,
         inter_dim,
         model_dim_padded,
@@ -1045,6 +1079,10 @@ def _gfx1250_moe_stage2(
     out_dtype_str="bf16",
     tile_n=128,
     tile_k=128,
+    # Per-expert bias (E, model_dim) f32. In atomic-accumulate mode the
+    # epilogue divides by ``topk`` so summing across the topk per-token
+    # atomic_adds reproduces a single ``+ bias`` (matches torch ref).
+    bias2=None,
     **_kwargs,
 ):
     """gfx1250 FlyDSL MOE stage2 wrapper (down-projection GEMM)."""
@@ -1090,16 +1128,20 @@ def _gfx1250_moe_stage2(
             tile_n_eff = _mxscale_pick_tile_n(
                 256, model_dim, in_dtype=in_dtype, align=32,
             )
-        inter_dim_padded = _mxscale_align_up(inter_dim, tile_k)
+        weight_k_eff = w2.shape[2] * pack_b
+        inter_dim_padded = _mxscale_align_up(max(inter_dim, weight_k_eff), tile_k)
         if inter_dim_padded != inter_dim:
             delta_k = inter_dim_padded - inter_dim
             inter_states = _mxscale_zero_pad_last(inter_states, delta_k // pack_a)
-            w2 = _mxscale_pad_weight_k(w2, delta_k // pack_b, weight_shuffled, cache=True)
-            _scale_pad_val = 0x7F if int(os.environ.get("AITER_GFX1250_SCALE_PAD_ONE", "0")) else 0
             if a2_scale is not None and a2_scale.numel() > 0:
-                a2_scale = _mxscale_zero_pad_last(a2_scale, delta_k // 32, _scale_pad_val)
+                a2_scale = _mxscale_zero_pad_last(a2_scale, delta_k // 32,
+                    0x7F if int(os.environ.get("AITER_GFX1250_SCALE_PAD_ONE", "0")) else 0)
+        weight_delta = inter_dim_padded - weight_k_eff
+        if weight_delta > 0:
+            w2 = _mxscale_pad_weight_k(w2, weight_delta // pack_b, weight_shuffled, cache=True)
+            _scale_pad_val = 0x7F if int(os.environ.get("AITER_GFX1250_SCALE_PAD_ONE", "0")) else 0
             if w2_scale is not None and w2_scale.numel() > 0:
-                w2_scale = _mxscale_zero_pad_last(w2_scale, delta_k // 32, _scale_pad_val, cache=True)
+                w2_scale = _mxscale_zero_pad_last(w2_scale, weight_delta // 32, _scale_pad_val, cache=True)
     else:
         tile_n_eff = tile_n
         inter_dim_padded = inter_dim
@@ -1145,6 +1187,12 @@ def _gfx1250_moe_stage2(
             f"a2_scale={'yes' if a2_scale is not None and a2_scale.numel() > 0 else 'no'} "
             f"w2_scale={'yes' if w2_scale is not None and w2_scale.numel() > 0 else 'no'}"
         )
+    _enable_bias_s2 = bias2 is not None and bias2.numel() > 0
+    if _enable_bias_s2:
+        flat_bias2 = bias2.contiguous().view(-1).to(dtypes.fp32)
+    else:
+        flat_bias2 = torch.empty(0, device=dev, dtype=dtypes.fp32)
+
     exe = compile_moe_gemm2(
         model_dim=model_dim,
         inter_dim=inter_dim_padded,
@@ -1157,6 +1205,7 @@ def _gfx1250_moe_stage2(
         in_dtype=in_dtype,
         out_dtype=out_dtype_str,
         accumulate=True,
+        enable_bias=_enable_bias_s2,
     )
 
     args = (
@@ -1169,6 +1218,7 @@ def _gfx1250_moe_stage2(
         sorted_expert_ids,
         sw,
         num_valid_ids,
+        flat_bias2,
         token_num,
         model_dim,
         inter_dim_padded,
@@ -1369,6 +1419,16 @@ def get_2stage_cfgs(
                 f"inter_dim={inter_dim}, expert={expert}, topk={topk}"
             )
             
+            # ``has_bias=True`` lets ``fused_moe_2stages`` forward
+            # ``bias1``/``bias2`` into ``extra_stage1_args`` /
+            # ``extra_stage2_args`` (the guard at the bias-forwarding
+            # site additionally checks activation==Swiglu and
+            # quant_type==per_1x32, matching GPT-OSS's path).
+            _gfx1250_has_bias = (
+                activation == ActivationType.Swiglu
+                and dtype in [dtypes.bf16, dtypes.fp16]
+                and is_mxscale
+            )
             return MOEMetadata(
                 stage1=functools.partial(
                     _gfx1250_moe_stage1,
@@ -1388,6 +1448,7 @@ def get_2stage_cfgs(
                 block_m=default_block_m,
                 ksplit=0,
                 run_1stage=False,
+                has_bias=_gfx1250_has_bias,
             )
 
     def get_cfg_2stages(tune_file):
