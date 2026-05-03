@@ -82,6 +82,7 @@ def flydsl_flash_attn_func(
     causal: bool = False,
     waves_per_eu: int = 2,
     daz: bool = True,
+    stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Run FlyDSL Flash Attention on RDNA4 (gfx1201).
 
@@ -92,6 +93,8 @@ def flydsl_flash_attn_func(
         causal: apply causal masking when ``True``.
         waves_per_eu: kernel occupancy hint passed to the FlyDSL builder.
         daz: enable denormals-are-zero on the kernel.
+        stream: optional CUDA/HIP stream to launch on. Defaults to the current
+            stream for ``q.device``.
 
     Returns:
         Output tensor with the same shape and dtype as ``q``.
@@ -173,6 +176,13 @@ def flydsl_flash_attn_func(
     # whose current device differs from q.device get the kernel compiled
     # and launched on the right device/stream.
     with torch.cuda.device(q.device.index):
+        launch_stream = (
+            torch.cuda.current_stream(q.device) if stream is None else stream
+        )
+        if launch_stream.device != q.device:
+            raise ValueError(
+                f"`stream` must be on {q.device}, got {launch_stream.device}"
+            )
         exe = _get_kernel(
             num_heads=num_heads,
             head_dim=head_dim,
@@ -188,6 +198,7 @@ def flydsl_flash_attn_func(
             o_p.reshape(-1),
             batch,
             seq_len_pad,
+            stream=launch_stream,
         )
 
     if seq_len_pad != seq_len_real:
