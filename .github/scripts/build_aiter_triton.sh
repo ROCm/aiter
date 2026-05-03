@@ -11,7 +11,8 @@ echo "==== Install dependencies and aiter ===="
 git config --global --add safe.directory /workspace
 pip config set global.retries 15
 pip config set global.timeout 120
-pip install --upgrade pandas pyzmq einops numpy==1.26.2
+pip install --upgrade pandas einops numpy==1.26.2
+pip install --upgrade pyzmq || echo "WARNING: pyzmq install failed (non-critical, only needed by aiter.dist.shm_broadcast)"
 pip uninstall -y aiter || true
 pip install --upgrade "pybind11>=3.0.1"
 pip install --upgrade "ninja>=1.11.1"
