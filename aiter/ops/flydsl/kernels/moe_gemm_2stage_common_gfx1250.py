@@ -161,6 +161,35 @@ def _finalize_alloc_and_launch_2d(*, ctx, alloc, launcher, gx, gy, block_threads
     )
 
 
+# GPT-OSS SwiGLU activation parameters. Matches
+# `aiter.fused_moe.swiglu(alpha=1.702, limit=7.0)` (the torch reference
+# used in `torch_moe_stage1`). Hardcoded because the corresponding torch
+# helper does not expose them as kwargs at the dispatch level either.
+_SWIGLU_ALPHA = 1.702
+_SWIGLU_LIMIT = 7.0
+# log2(e) = 1 / ln(2). exp(x) = exp2(x * log2(e)). For sigmoid(alpha*x) we
+# need exp(-alpha * x) = exp2(-alpha * x * log2(e)).
+_NEG_ALPHA_LOG2E = -float(_SWIGLU_ALPHA) * 1.4426950408889634
+
+
+def _emit_swiglu(vg, vu, *, arith, rocdl, T):
+    """Apply GPT-OSS SwiGLU: silu(clamp(g, max=L)) * (clamp(u, -L, L) + 1).
+
+    silu(x) here is x * sigmoid(alpha * x) with alpha=1.702 (matches
+    `aiter.fused_moe.swiglu`).
+    """
+    limit = arith.constant(float(_SWIGLU_LIMIT), type=T.f32)
+    neg_limit = arith.constant(-float(_SWIGLU_LIMIT), type=T.f32)
+    g_clamped = arith.minimumf(vg, limit)
+    u_clamped = arith.maximumf(arith.minimumf(vu, limit), neg_limit)
+    t = g_clamped * arith.constant(float(_NEG_ALPHA_LOG2E), type=T.f32)
+    emu = rocdl.exp2(T.f32, t)
+    one_f32 = arith.constant(1.0, type=T.f32)
+    sig = rocdl.rcp(T.f32, one_f32 + emu)
+    out_glu = g_clamped * sig
+    return out_glu * (u_clamped + one_f32)
+
+
 def _emit_stage1_gate_up_epilogue(
     *,
     sub_tiles,
@@ -195,6 +224,17 @@ def _emit_stage1_gate_up_epilogue(
     vector,
     range_constexpr,
     T,
+    # ── optional: bias + activation ─────────────────────────────────
+    # ``bias_rsrc``: f32 buffer resource of shape (E, 2*inter_dim) flat,
+    # gate-half then up-half per expert. ``eid_i32`` is the per-block
+    # expert id (already loaded from arg_expert_ids by caller). When
+    # both are provided, bias is added before activation. ``act_kind``
+    # controls activation: ``"silu"`` (default) uses ``silu_fn(vg)*vu``,
+    # ``"swiglu"`` uses GPT-OSS SwiGLU(g,u).
+    bias_rsrc=None,
+    eid_i32=None,
+    act_kind: str = "silu",
+    rocdl=None,
 ):
     # ``lds_tid``: optional memref<tile_m x i32, shared> holding the pre-decoded
     # ``sorted_token_ids`` for the current M-tile. Invalid rows (outside the
@@ -205,9 +245,20 @@ def _emit_stage1_gate_up_epilogue(
     # eliminating redundant VMEM traffic in the epilogue. When ``lds_tid`` is
     # ``None`` we fall back to the original per-row buffer_load.
     _use_lds = lds_tid is not None and memref is not None
+    _use_bias = bias_rsrc is not None and eid_i32 is not None
+    _use_swiglu = str(act_kind).lower() == "swiglu"
+    if _use_swiglu and rocdl is None:
+        raise ValueError("_emit_stage1_gate_up_epilogue: act_kind='swiglu' requires rocdl")
     c_topk_i32 = arith.constant(int(topk), type=T.i32)
+    c2_n_i32 = arith.constant(2, type=T.i32)
     default_block_row_start = arith.index_cast(T.i32, by * arith.index(int(route_tile_m)))
     row_base_i32 = block_row_start if block_row_start is not None else default_block_row_start
+    if _use_bias:
+        # Each expert's bias slab is (gate || up), 2*inter_dim f32 entries.
+        # Index gate at column ``c`` as eid * 2*inter + c, and up as
+        # eid * 2*inter + inter + c.
+        n_per_exp_i32 = i32_inter_in * c2_n_i32
+        bias_row_base_i32 = eid_i32 * n_per_exp_i32
     for acc_idx, vec_base, m_off, wn in sub_tiles:
         row_local = warp_m_base + fx.Index(m_off) + lane16
         sorted_row = by * arith.index(int(tile_m)) + row_local
@@ -243,18 +294,31 @@ def _emit_stage1_gate_up_epilogue(
         col_base = blk_n + warp_n_base + fx.Index(wn * WMMA_N) + lane_kgrp * fx.Index(8)
         for vi in range_constexpr(8):
             col = col_base + fx.Index(vi)
-            col_ok = arith.cmpi(arith.CmpIPredicate.ult, arith.index_cast(T.i32, col), i32_inter_in)
+            col_i32 = arith.index_cast(T.i32, col)
+            col_ok = arith.cmpi(arith.CmpIPredicate.ult, col_i32, i32_inter_in)
             out_ok = arith.andi(row_ok, col_ok)
             _if_out = scf.IfOp(out_ok)
             with ir.InsertionPoint(_if_out.then_block):
                 vg = vector.extract(sub8g, static_position=[vi], dynamic_position=[])
                 vu = vector.extract(sub8u, static_position=[vi], dynamic_position=[])
-                y = silu_fn(vg) * vu
+                if _use_bias:
+                    bg = buffer_ops.buffer_load(
+                        bias_rsrc, bias_row_base_i32 + col_i32,
+                        vec_width=1, dtype=T.f32)
+                    bu = buffer_ops.buffer_load(
+                        bias_rsrc, bias_row_base_i32 + i32_inter_in + col_i32,
+                        vec_width=1, dtype=T.f32)
+                    vg = vg + bg
+                    vu = vu + bu
+                if _use_swiglu:
+                    y = _emit_swiglu(vg, vu, arith=arith, rocdl=rocdl, T=T)
+                else:
+                    y = silu_fn(vg) * vu
                 if bool(doweight_stage1):
                     y = y * tw
                 out_v = arith.trunc_f(out_elem_ty, y)
                 out_idx = ((tok * c_topk_i32 + slot) * i32_inter_in
-                           + arith.index_cast(T.i32, col))
+                           + col_i32)
                 buffer_ops.buffer_store(out_v, out_rsrc, out_idx)
                 scf.YieldOp([])
 
@@ -291,6 +355,14 @@ def _emit_stage1_gate_up_splitk_epilogue(
     range_constexpr,
     rocdl,
     T,
+    # ── optional bias (split-K does not fuse activation, so swiglu is
+    # handled by the external silu_and_mul reduction; bias is added per
+    # K-slice so it must be scaled by 1/k_batch to match torch ref).
+    # Caller is responsible for passing ``bias_scale`` = 1/k_batch when
+    # split-K is enabled. ────────────────────────────────────────────
+    bias_rsrc=None,
+    eid_i32=None,
+    bias_scale: float | None = None,
 ):
     """Stage1 split-K epilogue.
 
@@ -307,6 +379,7 @@ def _emit_stage1_gate_up_splitk_epilogue(
     ``lds_tid`` (optional): see ``_emit_stage1_gate_up_epilogue``.
     """
     _use_lds = lds_tid is not None and memref is not None
+    _use_bias = bias_rsrc is not None and eid_i32 is not None
     c_topk_i32 = arith.constant(int(topk), type=T.i32)
     c2_i32 = arith.constant(2, type=T.i32)
     zero_i32 = arith.constant(0, type=T.i32)
@@ -316,6 +389,16 @@ def _emit_stage1_gate_up_splitk_epilogue(
         rocdl.raw_ptr_buffer_atomic_fadd(val_x2, out_rsrc, byte_off_i32, zero_i32, zero_i32)
 
     inter_stride_i32 = i32_inter_in * c2_i32  # row stride for [tokens*topk, 2*inter_dim]
+    if _use_bias:
+        # Each expert's bias slab is gate||up = 2*inter_dim f32 entries.
+        # Per-K-slice bias contribution must be scaled by 1/k_batch so the
+        # atomic-fadd accumulation reproduces ``+ bias`` once across all
+        # K-slices. Caller passes ``bias_scale = 1.0 / k_batch``.
+        bias_row_base_i32 = eid_i32 * inter_stride_i32
+        if bias_scale is None:
+            bias_scale_const = arith.constant(1.0, type=T.f32)
+        else:
+            bias_scale_const = arith.constant(float(bias_scale), type=T.f32)
 
     for acc_idx, vec_base, m_off, wn in sub_tiles:
         row_local = warp_m_base + fx.Index(m_off) + lane16
@@ -361,6 +444,16 @@ def _emit_stage1_gate_up_splitk_epilogue(
                 vg0 = vector.extract(sub8g, static_position=[vi0], dynamic_position=[])
                 vg1 = vector.extract(sub8g, static_position=[vi1], dynamic_position=[])
                 vg1 = arith.select(col1_ok, vg1, arith.constant(0.0, type=T.f32))
+                if _use_bias:
+                    bg0 = buffer_ops.buffer_load(
+                        bias_rsrc, bias_row_base_i32 + col0_i32,
+                        vec_width=1, dtype=T.f32) * bias_scale_const
+                    bg1 = buffer_ops.buffer_load(
+                        bias_rsrc, bias_row_base_i32 + col1_i32,
+                        vec_width=1, dtype=T.f32) * bias_scale_const
+                    bg1 = arith.select(col1_ok, bg1, arith.constant(0.0, type=T.f32))
+                    vg0 = vg0 + bg0
+                    vg1 = vg1 + bg1
                 g0 = arith.trunc_f(out_elem_ty, vg0)
                 g1 = arith.trunc_f(out_elem_ty, vg1)
                 frag_g = vector.from_elements(T.vec(2, out_elem_ty), [g0, g1])
@@ -373,6 +466,16 @@ def _emit_stage1_gate_up_splitk_epilogue(
                 vu0 = vector.extract(sub8u, static_position=[vi0], dynamic_position=[])
                 vu1 = vector.extract(sub8u, static_position=[vi1], dynamic_position=[])
                 vu1 = arith.select(col1_ok, vu1, arith.constant(0.0, type=T.f32))
+                if _use_bias:
+                    bu0 = buffer_ops.buffer_load(
+                        bias_rsrc, bias_row_base_i32 + i32_inter_in + col0_i32,
+                        vec_width=1, dtype=T.f32) * bias_scale_const
+                    bu1 = buffer_ops.buffer_load(
+                        bias_rsrc, bias_row_base_i32 + i32_inter_in + col1_i32,
+                        vec_width=1, dtype=T.f32) * bias_scale_const
+                    bu1 = arith.select(col1_ok, bu1, arith.constant(0.0, type=T.f32))
+                    vu0 = vu0 + bu0
+                    vu1 = vu1 + bu1
                 u0 = arith.trunc_f(out_elem_ty, vu0)
                 u1 = arith.trunc_f(out_elem_ty, vu1)
                 frag_u = vector.from_elements(T.vec(2, out_elem_ty), [u0, u1])
@@ -419,9 +522,25 @@ def _emit_stage2_store_epilogue(
     range_constexpr,
     rocdl,
     T,
+    # ── optional: per-expert bias of shape (E, model_dim). ``eid_i32`` is
+    # the per-block expert id; ``bias_rsrc`` is the f32 buffer resource.
+    #
+    # The torch reference (``aiter.fused_moe.torch_moe_stage2``) computes
+    # the per-slot contribution as ``topk_weight[slot] * (gemm[slot] +
+    # bias[expert_of_slot])`` and then sums across the ``topk`` slots
+    # for each output token. To reproduce this with a per-slot atomic
+    # add, the bias loaded from ``bias_rsrc`` must be scaled by the same
+    # factor that scales the GEMM term (``tw`` when
+    # ``doweight_stage2=True``, else ``1.0``). The split-K-style
+    # ``bias_scale`` override is intentionally unused on stage2 — pass
+    # ``None`` (the default) to use the routing-weight-aware scaling.
+    bias_rsrc=None,
+    eid_i32=None,
+    bias_scale: float | None = None,
 ):
     # ``lds_tid`` (optional): see ``_emit_stage1_gate_up_epilogue``.
     _use_lds = lds_tid is not None and memref is not None
+    _use_bias = bias_rsrc is not None and eid_i32 is not None
     c_topk_i32 = arith.constant(int(topk), type=T.i32)
     c2_i32 = arith.constant(2, type=T.i32)
     zero_i32 = arith.constant(0, type=T.i32)
@@ -429,6 +548,18 @@ def _emit_stage2_store_epilogue(
 
     def atomic_add_x2(val_x2, byte_off_i32):
         rocdl.raw_ptr_buffer_atomic_fadd(val_x2, out_rsrc, byte_off_i32, zero_i32, zero_i32)
+
+    if _use_bias:
+        # bias[e, n] f32; flat index = e * model_dim + n. Routing-weight
+        # awareness is handled per-slot below (multiply bias by ``tw``
+        # when ``doweight_stage2=True``); the optional ``bias_scale``
+        # override is kept for callers that need to inject an extra
+        # constant factor (currently unused on stage2).
+        bias_row_base_i32 = eid_i32 * i32_n_in
+        if bias_scale is None:
+            bias_scale_const = arith.constant(1.0, type=T.f32)
+        else:
+            bias_scale_const = arith.constant(float(bias_scale), type=T.f32)
 
     for acc_idx, vec_base, m_off, wn in sub_tiles:
         row_local = warp_m_base + fx.Index(m_off) + lane16
@@ -471,6 +602,25 @@ def _emit_stage2_store_epilogue(
                     if bool(doweight_stage2):
                         v0 = v0 * tw
                         v1 = v1 * tw
+                    if _use_bias:
+                        # Each per-slot atomic_add must contribute
+                        # ``tw * (gemm + bias)`` to match
+                        # ``torch_moe_stage2``: bias scales by the same
+                        # routing weight as GEMM. When doweight is off
+                        # ``tw == 1.0``, so this collapses to ``+ bias``
+                        # per slot, which matches the
+                        # doweight_stage1=True path of the torch
+                        # reference (bias added per slot, weight applied
+                        # in stage1).
+                        bias_w = bias_scale_const * tw
+                        b0 = buffer_ops.buffer_load(
+                            bias_rsrc, bias_row_base_i32 + col0_i32,
+                            vec_width=1, dtype=T.f32) * bias_w
+                        b1 = buffer_ops.buffer_load(
+                            bias_rsrc, bias_row_base_i32 + col1_i32,
+                            vec_width=1, dtype=T.f32) * bias_w
+                        v0 = v0 + b0
+                        v1 = v1 + b1
                     v1 = arith.select(col1_ok, v1, arith.constant(0.0, type=T.f32))
                     out0 = arith.trunc_f(out_elem_ty, v0)
                     out1 = arith.trunc_f(out_elem_ty, v1)
@@ -483,14 +633,22 @@ def _emit_stage2_store_epilogue(
         else:
             for vi in range_constexpr(8):
                 col = col_base + fx.Index(vi)
-                col_ok = arith.cmpi(arith.CmpIPredicate.ult, arith.index_cast(T.i32, col), i32_n_in)
+                col_i32 = arith.index_cast(T.i32, col)
+                col_ok = arith.cmpi(arith.CmpIPredicate.ult, col_i32, i32_n_in)
                 out_ok = arith.andi(row_store_ok, col_ok)
                 _if_out = scf.IfOp(out_ok)
                 with ir.InsertionPoint(_if_out.then_block):
                     v = vector.extract(sub8, static_position=[vi], dynamic_position=[])
                     if bool(doweight_stage2):
                         v = v * tw
-                    col_i32 = arith.index_cast(T.i32, col)
+                    if _use_bias:
+                        # See the accumulate=True branch above: bias
+                        # scales by ``tw`` to keep per-slot semantics
+                        # consistent with torch_moe_stage2.
+                        b = buffer_ops.buffer_load(
+                            bias_rsrc, bias_row_base_i32 + col_i32,
+                            vec_width=1, dtype=T.f32) * (bias_scale_const * tw)
+                        v = v + b
                     out_idx = ts * i32_n_in + col_i32
                     out_v = arith.trunc_f(out_elem_ty, v)
                     buffer_ops.buffer_store(out_v, out_rsrc, out_idx)
