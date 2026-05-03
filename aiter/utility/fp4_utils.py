@@ -53,8 +53,8 @@ def f32_to_e8m0(x):
     round_case = ((u32 & 0x400000) > 0) & (
         ((u32 & 0x200000) > 0) | ((u32 & 0x1FFFFF) > 0) | (exponent > 0)
     )
-    exponent[round_case] += 1
-    exponent[nan_case] = 0xFF
+    exponent = torch.where(round_case, exponent + 1, exponent)
+    exponent = torch.where(nan_case, torch.full_like(exponent, 0xFF), exponent)
     return exponent.view(dtypes.fp8_e8m0)
 
 
@@ -63,8 +63,8 @@ def e8m0_to_f32(scale_e8m0_biased):
     zero_case = scale_e8m0_biased == 0
     nan_case = scale_e8m0_biased == 0xFF
     scale_f32 = scale_e8m0_biased.to(torch.int32) << 23
-    scale_f32[zero_case] = 0x00400000
-    scale_f32[nan_case] = 0x7F800001
+    scale_f32 = torch.where(zero_case, torch.full_like(scale_f32, 0x00400000), scale_f32)
+    scale_f32 = torch.where(nan_case, torch.full_like(scale_f32, 0x7F800001), scale_f32)
     scale_f32 = scale_f32.view(dtypes.fp32)
     return scale_f32
 

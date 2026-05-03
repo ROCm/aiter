@@ -557,7 +557,7 @@ class _Stage1GateUpPackedWrapper:
                 setattr(self, attr, getattr(stage1_exe, attr))
 
     def _get_packed_operands(self, arg_w, arg_scale_w):
-        key = (id(arg_w), id(arg_scale_w))
+        key = (arg_w.data_ptr(), arg_scale_w.data_ptr() if hasattr(arg_scale_w, 'data_ptr') else id(arg_scale_w))
         cached = self._cache.get(key)
         if cached is not None:
             return cached[0]

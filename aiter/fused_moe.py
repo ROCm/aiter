@@ -1627,10 +1627,10 @@ def fused_moe_2stages(
         and activation == aiter.ActivationType.Swiglu
     ):
         if get_gfx() == "gfx1250":
-            from aiter.ops.quant import per_1x32_f8_scale_f8_quant
+            from aiter.ops.quant import _per_1x32_f8_e8m0_quant_triton
 
-            a1, a1_scale = per_1x32_f8_scale_f8_quant(
-                hidden_states.to(dtypes.fp32), scale_type=dtypes.fp8_e8m0
+            a1, a1_scale = _per_1x32_f8_e8m0_quant_triton(
+                hidden_states.to(dtypes.fp32)
             )
             a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
         else:
@@ -1649,10 +1649,10 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp8
     ):
-        from aiter.ops.quant import per_1x32_f8_scale_f8_quant
+        from aiter.ops.quant import _per_1x32_f8_e8m0_quant_triton
 
-        a1, a1_scale = per_1x32_f8_scale_f8_quant(
-            hidden_states.to(dtypes.fp32), scale_type=dtypes.fp8_e8m0
+        a1, a1_scale = _per_1x32_f8_e8m0_quant_triton(
+            hidden_states.to(dtypes.fp32)
         )
         a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
 
@@ -1666,12 +1666,12 @@ def fused_moe_2stages(
         # K//32), which the FlyDSL kernel cannot address correctly and
         # produces numerically uncorrelated output. Keep the quantization
         # output in source-token layout for gfx1250.
-        from aiter.ops.quant import per_1x32_f4_quant
+        from aiter.ops.quant import per_1x32_f4_quant_triton
         if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
             a1 = hidden_states
             a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
         else:
-            a1, a1_scale = per_1x32_f4_quant(hidden_states, quant_dtype=dtypes.fp4x2)
+            a1, a1_scale = per_1x32_f4_quant_triton(hidden_states, quant_dtype=dtypes.fp4x2)
             a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
     elif quant_type == QuantType.per_1x32:
         if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
@@ -1784,20 +1784,20 @@ def fused_moe_2stages(
         a2 = a2.to(dtypes.fp8)
         a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.fp8:
-        from aiter.ops.quant import per_1x32_f8_scale_f8_quant
+        from aiter.ops.quant import _per_1x32_f8_e8m0_quant_triton
 
         a2_flat = a2.view(-1, inter_dim)
-        a2_flat, a2_scale = per_1x32_f8_scale_f8_quant(
-            a2_flat.to(dtypes.fp32), scale_type=dtypes.fp8_e8m0
+        a2_flat, a2_scale = _per_1x32_f8_e8m0_quant_triton(
+            a2_flat.to(dtypes.fp32)
         )
         a2_scale = a2_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
         a2 = a2_flat.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x32 and get_gfx() == "gfx1250":
         # Stage2 FlyDSL kernel expects scale_x in source order of shape
         # (tokens*topk, inter_dim//32). See comment in stage1 path.
-        from aiter.ops.quant import per_1x32_f4_quant
+        from aiter.ops.quant import per_1x32_f4_quant_triton
         a2_flat = a2.view(-1, inter_dim)
-        a2_flat, a2_scale = per_1x32_f4_quant(a2_flat, quant_dtype=dtypes.fp4x2)
+        a2_flat, a2_scale = per_1x32_f4_quant_triton(a2_flat, quant_dtype=dtypes.fp4x2)
         a2_scale = a2_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
         a2 = a2_flat.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x32:
