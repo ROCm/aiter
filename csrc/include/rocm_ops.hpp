@@ -1656,7 +1656,8 @@ namespace py = pybind11;
           py::arg("values"),       \
           py::arg("numRows"),      \
           py::arg("stride0"),      \
-          py::arg("stride1"));     \
+          py::arg("stride1"),      \
+          py::arg("k") = -1);      \
     m.def("top_k_per_row_decode",  \
           &top_k_per_row_decode,   \
           py::arg("logits"),       \
@@ -1665,7 +1666,8 @@ namespace py = pybind11;
           py::arg("indices"),      \
           py::arg("numRows"),      \
           py::arg("stride0"),      \
-          py::arg("stride1"));
+          py::arg("stride1"),      \
+          py::arg("k") = -1);
 
 #define MLA_METADATA_PYBIND                              \
     m.def("get_mla_metadata_v1",                         \

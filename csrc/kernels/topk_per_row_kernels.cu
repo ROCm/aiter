@@ -2506,11 +2506,15 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
                            std::optional<torch::Tensor> values,
                            int64_t numRows,
                            int64_t stride0,
-                           int64_t stride1)
+                           int64_t stride1,
+                           int64_t k)
 {
     size_t buf_size = 0; // will be overwritten by the kernel
 
-    static constexpr int kTopK       = 2048;
+    const int kTopK = k > 0 ? static_cast<int>(k) : static_cast<int>(indices.size(1));
+    TORCH_CHECK(kTopK > 0, "top_k_per_row_prefill requires k > 0");
+    TORCH_CHECK(kTopK <= indices.size(1),
+                "top_k_per_row_prefill k exceeds indices width");
     static constexpr bool is_largest = true;
 
     const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -2630,11 +2634,15 @@ void top_k_per_row_decode(const torch::Tensor& logits,
                           torch::Tensor& indices,
                           int64_t numRows,
                           int64_t stride0,
-                          int64_t stride1)
+                          int64_t stride1,
+                          int64_t k)
 {
     size_t buf_size = 0; // will be overwritten by the kernel
 
-    static constexpr int kTopK       = 2048;
+    const int kTopK = k > 0 ? static_cast<int>(k) : static_cast<int>(indices.size(1));
+    TORCH_CHECK(kTopK > 0, "top_k_per_row_decode requires k > 0");
+    TORCH_CHECK(kTopK <= indices.size(1),
+                "top_k_per_row_decode k exceeds indices width");
     static constexpr bool is_largest = true;
 
     const hipStream_t stream = at::hip::getCurrentHIPStream();

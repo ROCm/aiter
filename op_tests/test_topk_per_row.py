@@ -146,6 +146,7 @@ def run_top_k_per_row_prefill(
         num_rows,
         stride_row,
         stride_col,
+        k=indices.size(1),
     )
 
 
@@ -182,6 +183,7 @@ def run_top_k_per_row_decode(
             numRows,
             stride0,
             stride1,
+            k=indices.size(1),
         )
 
 
