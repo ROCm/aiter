@@ -637,9 +637,14 @@ def _compile_stage1_mxscale_kernel_impl(
         #                          (built at global_byte_offset=None),
         #   "pred"[_gi]          — issue predicate (valid_count > 0, wave owner),
         #   "base_addr_lo"[_gi]  — dgroup0.lane2 at global_byte_offset=0,
+        #   "base_addr_hi"[_gi]  — dgroup0.lane3 at global_byte_offset=0
+        #                          (with the descriptor's type-field bits intact;
+        #                          consumed by tdm_ops.add_addr_with_carry to
+        #                          propagate the lo-32-bit overflow into hi).
         # populated once by ``_build_a_gather_base_descs()`` before the K loop
-        # so the hot path (``issue_a_load_tdm_gather``) only advances addr_lo
-        # via vector.insert each iteration.
+        # so the hot path (``issue_a_load_tdm_gather``) only advances the
+        # base address via the carry-safe ``update_*_addr64`` helper each
+        # iteration.
         _a_gather_cache = {}
 
         def _build_a_gather_base_descs(lds_bufs):
@@ -650,6 +655,7 @@ def _compile_stage1_mxscale_kernel_impl(
             _descs = []
             _preds = []
             _base_addr_lo = []
+            _base_addr_hi = []
             for _gi in range_constexpr(_TDM_GATHER_GROUPS):
                 _start = _gi * _TDM_GATHER_CHUNK
                 _cnt = min(_TDM_GATHER_CHUNK, int(tile_m) - _start)
@@ -693,47 +699,63 @@ def _compile_stage1_mxscale_kernel_impl(
                     )
                     _per_buf.append(_base_desc)
                 _descs.append(_per_buf)
-                # addr_lo is independent of buf_idx (only lds_addr differs), so
-                # we can extract it from any buffer's base descriptor.
+                # addr_lo / addr_hi are independent of buf_idx (only lds_addr
+                # differs), so we can extract them from any buffer's base
+                # descriptor.
                 _base_addr_lo.append(vector.extract(
                     _per_buf[0].dgroup0,
                     static_position=[2],
+                    dynamic_position=[],
+                ))
+                _base_addr_hi.append(vector.extract(
+                    _per_buf[0].dgroup0,
+                    static_position=[3],
                     dynamic_position=[],
                 ))
 
             _a_gather_cache["desc"] = _descs
             _a_gather_cache["pred"] = _preds
             _a_gather_cache["base_addr_lo"] = _base_addr_lo
+            _a_gather_cache["base_addr_hi"] = _base_addr_hi
 
         def issue_a_load_tdm_gather(k_base, buf_idx):
             """Hot path: advance addr_lo on the precomputed gather descriptor.
 
             Requires ``_build_a_gather_base_descs(lds_bufs)`` to have been
             called once before the K loop with the matching LDS buffer list.
+            Uses the carry-safe ``update_tensor_gather_descriptor_addr64`` so
+            that ``base_addr_lo + k_byte_off`` overflowing the i32 boundary
+            propagates into ``addr_hi`` instead of silently wrapping into a
+            wrong 4 GiB page (which on gfx1250 deadlocks the GPU in
+            ``amdgpu_mes_reg_write_reg_wait``).
             """
             k_packed_base = k_base if PACK_FACTOR_A == 1 else k_base // fx.Index(PACK_FACTOR_A)
             _k_byte_off_i32 = arith.index_cast(T.i32, k_packed_base)
             _descs = _a_gather_cache["desc"]
             _preds = _a_gather_cache["pred"]
             _base_addr_lo = _a_gather_cache["base_addr_lo"]
+            _base_addr_hi = _a_gather_cache["base_addr_hi"]
             for _gi in range_constexpr(_TDM_GATHER_GROUPS):
                 _if_issue = scf.IfOp(_preds[_gi])
                 with ir.InsertionPoint(_if_issue.then_block):
-                    _curr_addr_lo = arith.addi(
-                        _base_addr_lo[_gi], _k_byte_off_i32)
                     tdm_ops.tensor_load_gather(
-                        tdm_ops.update_tensor_gather_descriptor_addr_lo(
+                        tdm_ops.update_tensor_gather_descriptor_addr64(
                             _descs[_gi][buf_idx],
-                            _curr_addr_lo,
+                            _base_addr_lo[_gi],
+                            _base_addr_hi[_gi],
+                            _k_byte_off_i32,
                         )
                     )
                     scf.YieldOp([])
 
         # Cache of K-invariant 2D B / B-scale descriptors used by
         # ``_issue_b_tdm_only``. Each entry stores a base TDMDescriptor2D
-        # built at k_base=0 plus its extracted scalar addr_lo, so the hot
-        # path only computes ``curr_addr_lo = base_addr_lo + k_off`` and
-        # calls ``update_tensor_descriptor_2d_addr_lo`` -- mirroring the
+        # built at k_base=0 plus its extracted scalar addr_lo / addr_hi, so
+        # the hot path can call the carry-safe
+        # ``update_tensor_descriptor_2d_addr64`` directly and avoid the
+        # silent i32-wraparound bug that the addr-lo-only shortcut has on
+        # large MoE expert-weight buffers (~3.5 GiB fp4 tensors with E=257
+        # experts on gfx1250 reliably trigger the overflow). Mirrors the
         # hoist that wave_specialized_tdm already does internally via
         # ``_active_stage_desc_base``. ``_build_b_base_descs()`` is closed
         # over later-defined names (``_stage1_pair_row_base``, the
@@ -745,6 +767,13 @@ def _compile_stage1_mxscale_kernel_impl(
             return vector.extract(
                 desc.dgroup0,
                 static_position=[2],
+                dynamic_position=[],
+            )
+
+        def _extract_desc_addr_hi(desc):
+            return vector.extract(
+                desc.dgroup0,
+                static_position=[3],
                 dynamic_position=[],
             )
 
@@ -767,8 +796,14 @@ def _compile_stage1_mxscale_kernel_impl(
                 _b_desc_cache["bg_pair_addr_lo"] = [
                     _extract_desc_addr_lo(d) for d in _bg_pair
                 ]
+                _b_desc_cache["bg_pair_addr_hi"] = [
+                    _extract_desc_addr_hi(d) for d in _bg_pair
+                ]
                 _b_desc_cache["bs_pair_addr_lo"] = [
                     _extract_desc_addr_lo(d) for d in _bs_pair
+                ]
+                _b_desc_cache["bs_pair_addr_hi"] = [
+                    _extract_desc_addr_hi(d) for d in _bs_pair
                 ]
             else:
                 _eid_row = (
@@ -798,9 +833,13 @@ def _compile_stage1_mxscale_kernel_impl(
                 _b_desc_cache["bs"] = _bs
                 _b_desc_cache["bsu"] = _bsu
                 _b_desc_cache["bg_addr_lo"] = [_extract_desc_addr_lo(d) for d in _bg]
+                _b_desc_cache["bg_addr_hi"] = [_extract_desc_addr_hi(d) for d in _bg]
                 _b_desc_cache["bu_addr_lo"] = [_extract_desc_addr_lo(d) for d in _bu]
+                _b_desc_cache["bu_addr_hi"] = [_extract_desc_addr_hi(d) for d in _bu]
                 _b_desc_cache["bs_addr_lo"] = [_extract_desc_addr_lo(d) for d in _bs]
+                _b_desc_cache["bs_addr_hi"] = [_extract_desc_addr_hi(d) for d in _bs]
                 _b_desc_cache["bsu_addr_lo"] = [_extract_desc_addr_lo(d) for d in _bsu]
+                _b_desc_cache["bsu_addr_hi"] = [_extract_desc_addr_hi(d) for d in _bsu]
             _b_desc_cache["ready"] = True
 
         def _b_data_k_byte_off(k_base):
@@ -1558,9 +1597,14 @@ def _compile_stage1_mxscale_kernel_impl(
                         _scale_adv_i32,
                     )
 
-                # Pre-build per-stage TDMDescriptor2D bases at addr_lo=0 so the
-                # hot path only patches lane 2 via update_tensor_descriptor_2d_addr_lo,
-                # avoiding a fresh vector.from_elements + TDMDescriptor2D each issue.
+                # Pre-build per-stage TDMDescriptor2D bases. dgroup0 lanes 2/3
+                # carry placeholder addr_lo / addr_hi values that the hot path
+                # overwrites every iteration via the carry-safe
+                # ``update_tensor_descriptor_2d_addr_lo_hi`` helper, so the
+                # lane-3 placeholder here is only there to keep the descriptor
+                # well-typed -- ``_active_addr_hi`` is still consulted as the
+                # initial state of the hi register tracked through the pipeline
+                # so its type-field bits feed back into the carry helper.
                 _tdm_zero_addr_lo = arith.constant(0, type=T.i32)
                 _active_stage_desc_base = [
                     tdm_ops.TDMDescriptor2D(
@@ -1575,21 +1619,37 @@ def _compile_stage1_mxscale_kernel_impl(
                     for i in range_constexpr(_nb)
                 ]
 
-                def _issue_active_b_tdm_only(stage_idx, curr_addr_lo):
+                def _issue_active_b_tdm_only(stage_idx, curr_addr_lo, curr_addr_hi):
+                    """Issue one B-load and advance the carry-safe (lo, hi) pair.
+
+                    Both ``curr_addr_lo`` and ``curr_addr_hi`` come from the
+                    pipeline-carried state; the descriptor's lanes 2 and 3 are
+                    spliced from these every iteration so a lo-32-bit overflow
+                    in the K-loop accumulation propagates into hi instead of
+                    silently aliasing into the wrong 4 GiB page.
+                    """
                     _if_loader = scf.IfOp(_is_loader_wave)
                     with ir.InsertionPoint(_if_loader.then_block):
                         tdm_ops.tensor_load_2d(
-                            tdm_ops.update_tensor_descriptor_2d_addr_lo(
+                            tdm_ops.update_tensor_descriptor_2d_addr_lo_hi(
                                 _active_stage_desc_base[stage_idx],
                                 curr_addr_lo,
+                                curr_addr_hi,
                             )
                         )
                         scf.YieldOp([])
-                    _next_addr_lo = arith.addi(curr_addr_lo, _active_adv_i32)
-                    return arith.select(
-                        _is_loader_wave,
-                        _next_addr_lo,
-                        curr_addr_lo,
+                    _next_addr_lo, _next_addr_hi = tdm_ops.add_addr_with_carry(
+                        curr_addr_lo, curr_addr_hi, _active_adv_i32,
+                    )
+                    # Only loader waves advance the running address; non-loader
+                    # waves keep the current pair so the tracked SGPR state
+                    # stays in lockstep across waves (matching the original
+                    # addr-lo-only behaviour).
+                    return (
+                        arith.select(
+                            _is_loader_wave, _next_addr_lo, curr_addr_lo),
+                        arith.select(
+                            _is_loader_wave, _next_addr_hi, curr_addr_hi),
                     )
 
             if const_expr(_use_tdm_gather_a):
@@ -1606,40 +1666,58 @@ def _compile_stage1_mxscale_kernel_impl(
 
             # ── pipeline load helpers ─────────────────────────────────
             def _issue_b_tdm_only(k_base, buf_idx):
+                # Carry-safe: ``update_tensor_descriptor_2d_addr64`` performs
+                # ``(addr_lo : addr_hi) += k_off`` in i64 so an i32 wrap of
+                # ``base_addr_lo + k_off`` (common with ~3.5 GiB fp4 expert
+                # buffers on E=257 / gfx1250) propagates into addr_hi rather
+                # than silently redirecting the descriptor to a wrong 4 GiB
+                # page and deadlocking the GPU.
                 _k_data_off = _b_data_k_byte_off(k_base)
                 _k_scale_off = _b_scale_k_byte_off(k_base)
                 if const_expr(_merge_gate_up_tdm):
-                    _bg_addr = arith.addi(
-                        _b_desc_cache["bg_pair_addr_lo"][buf_idx], _k_data_off)
-                    _bs_addr = arith.addi(
-                        _b_desc_cache["bs_pair_addr_lo"][buf_idx], _k_scale_off)
                     tdm_ops.tensor_load_2d(
-                        tdm_ops.update_tensor_descriptor_2d_addr_lo(
-                            _b_desc_cache["bg_pair"][buf_idx], _bg_addr))
+                        tdm_ops.update_tensor_descriptor_2d_addr64(
+                            _b_desc_cache["bg_pair"][buf_idx],
+                            _b_desc_cache["bg_pair_addr_lo"][buf_idx],
+                            _b_desc_cache["bg_pair_addr_hi"][buf_idx],
+                            _k_data_off,
+                        ))
                     tdm_ops.tensor_load_2d(
-                        tdm_ops.update_tensor_descriptor_2d_addr_lo(
-                            _b_desc_cache["bs_pair"][buf_idx], _bs_addr))
+                        tdm_ops.update_tensor_descriptor_2d_addr64(
+                            _b_desc_cache["bs_pair"][buf_idx],
+                            _b_desc_cache["bs_pair_addr_lo"][buf_idx],
+                            _b_desc_cache["bs_pair_addr_hi"][buf_idx],
+                            _k_scale_off,
+                        ))
                 else:
-                    _bg_addr = arith.addi(
-                        _b_desc_cache["bg_addr_lo"][buf_idx], _k_data_off)
-                    _bu_addr = arith.addi(
-                        _b_desc_cache["bu_addr_lo"][buf_idx], _k_data_off)
-                    _bs_addr = arith.addi(
-                        _b_desc_cache["bs_addr_lo"][buf_idx], _k_scale_off)
-                    _bsu_addr = arith.addi(
-                        _b_desc_cache["bsu_addr_lo"][buf_idx], _k_scale_off)
                     tdm_ops.tensor_load_2d(
-                        tdm_ops.update_tensor_descriptor_2d_addr_lo(
-                            _b_desc_cache["bg"][buf_idx], _bg_addr))
+                        tdm_ops.update_tensor_descriptor_2d_addr64(
+                            _b_desc_cache["bg"][buf_idx],
+                            _b_desc_cache["bg_addr_lo"][buf_idx],
+                            _b_desc_cache["bg_addr_hi"][buf_idx],
+                            _k_data_off,
+                        ))
                     tdm_ops.tensor_load_2d(
-                        tdm_ops.update_tensor_descriptor_2d_addr_lo(
-                            _b_desc_cache["bu"][buf_idx], _bu_addr))
+                        tdm_ops.update_tensor_descriptor_2d_addr64(
+                            _b_desc_cache["bu"][buf_idx],
+                            _b_desc_cache["bu_addr_lo"][buf_idx],
+                            _b_desc_cache["bu_addr_hi"][buf_idx],
+                            _k_data_off,
+                        ))
                     tdm_ops.tensor_load_2d(
-                        tdm_ops.update_tensor_descriptor_2d_addr_lo(
-                            _b_desc_cache["bs"][buf_idx], _bs_addr))
+                        tdm_ops.update_tensor_descriptor_2d_addr64(
+                            _b_desc_cache["bs"][buf_idx],
+                            _b_desc_cache["bs_addr_lo"][buf_idx],
+                            _b_desc_cache["bs_addr_hi"][buf_idx],
+                            _k_scale_off,
+                        ))
                     tdm_ops.tensor_load_2d(
-                        tdm_ops.update_tensor_descriptor_2d_addr_lo(
-                            _b_desc_cache["bsu"][buf_idx], _bsu_addr))
+                        tdm_ops.update_tensor_descriptor_2d_addr64(
+                            _b_desc_cache["bsu"][buf_idx],
+                            _b_desc_cache["bsu_addr_lo"][buf_idx],
+                            _b_desc_cache["bsu_addr_hi"][buf_idx],
+                            _k_scale_off,
+                        ))
 
             def _issue_scalar_loads(k_base, buf_idx):
                 if const_expr(_use_tdm_gather_a):
@@ -1678,10 +1756,13 @@ def _compile_stage1_mxscale_kernel_impl(
             if const_expr(not _use_pipeline):
                 if const_expr(wave_specialized_tdm):
                     active_b_addr_lo = _active_addr_lo
+                    active_b_addr_hi = _active_addr_hi
                     for kt in range_constexpr(num_k_tiles_per_bz):
                         k_base = _k_off(fx.Index(kt * int(tile_k)))
-                        active_b_addr_lo = _issue_active_b_tdm_only(
-                            0, active_b_addr_lo)
+                        active_b_addr_lo, active_b_addr_hi = (
+                            _issue_active_b_tdm_only(
+                                0, active_b_addr_lo, active_b_addr_hi)
+                        )
                         _issue_scalar_loads(k_base, 0)
                         tdm_ops.tensor_wait(0)
                         workgroup_barrier(use_cluster=use_cluster)
@@ -1699,9 +1780,12 @@ def _compile_stage1_mxscale_kernel_impl(
                 # ── prologue ──
                 if const_expr(wave_specialized_tdm):
                     active_b_addr_lo = _active_addr_lo
+                    active_b_addr_hi = _active_addr_hi
                     for _pi in range_constexpr(pre_loaded):
-                        active_b_addr_lo = _issue_active_b_tdm_only(
-                            _pi, active_b_addr_lo)
+                        active_b_addr_lo, active_b_addr_hi = (
+                            _issue_active_b_tdm_only(
+                                _pi, active_b_addr_lo, active_b_addr_hi)
+                        )
                         _issue_scalar_loads(
                             _k_off(fx.Index(_pi * int(tile_k))), _pi)
                 else:
@@ -1713,11 +1797,18 @@ def _compile_stage1_mxscale_kernel_impl(
                 # ── main pipelined loop ──
                 if const_expr(loop_iters > 0):
                     if const_expr(wave_specialized_tdm):
-                        _init = list(acc_g) + list(acc_u) + [active_b_addr_lo]
+                        # Carry the (addr_lo, addr_hi) pair through the
+                        # pipeline state so the carry chain survives across
+                        # iterations.
+                        _init = (
+                            list(acc_g) + list(acc_u)
+                            + [active_b_addr_lo, active_b_addr_hi]
+                        )
                         for _li, _st in fx.range(0, loop_iters, 1, init=_init):
                             _ag = list(_st[:n_accs])
                             _au = list(_st[n_accs:2 * n_accs])
                             _cur_b_addr_lo = _st[2 * n_accs]
+                            _cur_b_addr_hi = _st[2 * n_accs + 1]
                             for _bi in range_constexpr(_nb):
                                 _lb = (_bi + _nb - 1) % _nb
                                 _kt = (_li * fx.Index(_nb)
@@ -1727,8 +1818,13 @@ def _compile_stage1_mxscale_kernel_impl(
                                     outstanding=_fence_outstanding,
                                     use_cluster=use_cluster)
                                 pipeline_fence_wait(use_cluster=use_cluster)
-                                _cur_b_addr_lo = _issue_active_b_tdm_only(
-                                    _lb, _cur_b_addr_lo)
+                                _cur_b_addr_lo, _cur_b_addr_hi = (
+                                    _issue_active_b_tdm_only(
+                                        _lb,
+                                        _cur_b_addr_lo,
+                                        _cur_b_addr_hi,
+                                    )
+                                )
 
                                 def _mid_issue_scalar(_mid_kb=_kb, _mid_lb=_lb):
                                     _issue_scalar_loads(_mid_kb, _mid_lb)
@@ -1743,10 +1839,14 @@ def _compile_stage1_mxscale_kernel_impl(
                                 )
                                 if const_expr(_use_scheduled_compute):
                                     _hot_loop_scheduler_scheduled()
-                            _res = yield list(_ag) + list(_au) + [_cur_b_addr_lo]
+                            _res = yield (
+                                list(_ag) + list(_au)
+                                + [_cur_b_addr_lo, _cur_b_addr_hi]
+                            )
                         acc_g = list(_res[:n_accs])
                         acc_u = list(_res[n_accs:2 * n_accs])
                         active_b_addr_lo = _res[2 * n_accs]
+                        active_b_addr_hi = _res[2 * n_accs + 1]
                     else:
                         _init = list(acc_g) + list(acc_u)
                         for _li, _st in fx.range(0, loop_iters, 1, init=_init):
@@ -1813,8 +1913,13 @@ def _compile_stage1_mxscale_kernel_impl(
                                 * int(tile_k)))
                             _tail_li += 1
                             if const_expr(wave_specialized_tdm):
-                                active_b_addr_lo = _issue_active_b_tdm_only(
-                                    _ls, active_b_addr_lo)
+                                active_b_addr_lo, active_b_addr_hi = (
+                                    _issue_active_b_tdm_only(
+                                        _ls,
+                                        active_b_addr_lo,
+                                        active_b_addr_hi,
+                                    )
+                                )
                             else:
                                 _issue_b_tdm_only(_tkb, _ls)
 
@@ -2664,6 +2769,7 @@ def _compile_stage2_mxscale_kernel_impl(
             _descs = []
             _preds = []
             _base_addr_lo = []
+            _base_addr_hi = []
             for _gi in range_constexpr(_TDM_GATHER_GROUPS):
                 _start = _gi * _TDM_GATHER_CHUNK
                 _cnt = min(_TDM_GATHER_CHUNK, int(tile_m) - _start)
@@ -2709,31 +2815,41 @@ def _compile_stage2_mxscale_kernel_impl(
                     static_position=[2],
                     dynamic_position=[],
                 ))
+                _base_addr_hi.append(vector.extract(
+                    _per_buf[0].dgroup0,
+                    static_position=[3],
+                    dynamic_position=[],
+                ))
 
             _a_gather_cache["desc"] = _descs
             _a_gather_cache["pred"] = _preds
             _a_gather_cache["base_addr_lo"] = _base_addr_lo
+            _a_gather_cache["base_addr_hi"] = _base_addr_hi
 
         def issue_a_load_tdm_gather(k_base, buf_idx):
-            """Hot path: advance addr_lo on the precomputed gather descriptor.
+            """Hot path: carry-safe advance of the precomputed gather descriptor.
 
             Requires ``_build_a_gather_base_descs(lds_bufs)`` to have been
             called once before the K loop with the matching LDS buffer list.
+            Uses ``update_tensor_gather_descriptor_addr64`` so a lo-32-bit
+            overflow of ``base_addr_lo + k_byte_off`` propagates into hi
+            instead of redirecting the descriptor to a wrong 4 GiB page.
             """
             k_packed_base = k_base if PACK_FACTOR_A == 1 else k_base // fx.Index(PACK_FACTOR_A)
             _k_byte_off_i32 = arith.index_cast(T.i32, k_packed_base)
             _descs = _a_gather_cache["desc"]
             _preds = _a_gather_cache["pred"]
             _base_addr_lo = _a_gather_cache["base_addr_lo"]
+            _base_addr_hi = _a_gather_cache["base_addr_hi"]
             for _gi in range_constexpr(_TDM_GATHER_GROUPS):
                 _if_issue = scf.IfOp(_preds[_gi])
                 with ir.InsertionPoint(_if_issue.then_block):
-                    _curr_addr_lo = arith.addi(
-                        _base_addr_lo[_gi], _k_byte_off_i32)
                     tdm_ops.tensor_load_gather(
-                        tdm_ops.update_tensor_gather_descriptor_addr_lo(
+                        tdm_ops.update_tensor_gather_descriptor_addr64(
                             _descs[_gi][buf_idx],
-                            _curr_addr_lo,
+                            _base_addr_lo[_gi],
+                            _base_addr_hi[_gi],
+                            _k_byte_off_i32,
                         )
                     )
                     scf.YieldOp([])
@@ -2983,16 +3099,29 @@ def _compile_stage2_mxscale_kernel_impl(
 
         # Cache of K-invariant 2D B / B-scale descriptors used by stage2's
         # ``_issue_b_tdm_only``. Stage2 has no merge_gate_up_tdm path, so the
-        # cache is single-branched. Mirrors the stage1 helper pair; closed
-        # over ``make_desc_b``, ``make_desc_bs``, ``lds_b_bufs``,
-        # ``lds_bs_bufs`` and ``eid_i32`` / ``n_idx`` / ``blk_n``, all
-        # resolved at call time inside ``_if_blk``.
+        # cache is single-branched. Each entry stores the base descriptor
+        # plus its addr_lo / addr_hi extracted into SGPRs; the hot path then
+        # uses ``update_tensor_descriptor_2d_addr64`` so a per-K-tile delta
+        # that overflows base_addr_lo carries into addr_hi instead of
+        # silently wrapping into a wrong 4 GiB page (which deadlocks the GPU
+        # in ``amdgpu_mes_reg_write_reg_wait``). Mirrors the stage1 helper
+        # pair; closed over ``make_desc_b``, ``make_desc_bs``,
+        # ``lds_b_bufs``, ``lds_bs_bufs`` and
+        # ``eid_i32`` / ``n_idx`` / ``blk_n``, all resolved at call time
+        # inside ``_if_blk``.
         _b_desc_cache = {}
 
         def _extract_desc_addr_lo(desc):
             return vector.extract(
                 desc.dgroup0,
                 static_position=[2],
+                dynamic_position=[],
+            )
+
+        def _extract_desc_addr_hi(desc):
+            return vector.extract(
+                desc.dgroup0,
+                static_position=[3],
                 dynamic_position=[],
             )
 
@@ -3013,7 +3142,9 @@ def _compile_stage2_mxscale_kernel_impl(
             _b_desc_cache["b"] = _b
             _b_desc_cache["bs"] = _bs
             _b_desc_cache["b_addr_lo"] = [_extract_desc_addr_lo(d) for d in _b]
+            _b_desc_cache["b_addr_hi"] = [_extract_desc_addr_hi(d) for d in _b]
             _b_desc_cache["bs_addr_lo"] = [_extract_desc_addr_lo(d) for d in _bs]
+            _b_desc_cache["bs_addr_hi"] = [_extract_desc_addr_hi(d) for d in _bs]
             _b_desc_cache["ready"] = True
 
         def _b_data_k_byte_off(k_base):
@@ -3380,8 +3511,11 @@ def _compile_stage2_mxscale_kernel_impl(
                 )
 
                 # See stage1 for rationale: pre-build per-stage TDMDescriptor2D
-                # bases so the hot path only patches lane 2 via
-                # update_tensor_descriptor_2d_addr_lo.
+                # bases so the hot path can splice in lanes 2 / 3 cheaply via
+                # ``update_tensor_descriptor_2d_addr_lo_hi``. The lane-3
+                # placeholder mirrors ``_active_addr_hi``, but the actual hi
+                # used at issue time comes from the (lo, hi) pair tracked
+                # through the pipeline state.
                 _tdm_zero_addr_lo = arith.constant(0, type=T.i32)
                 _active_stage_desc_base = [
                     tdm_ops.TDMDescriptor2D(
@@ -3396,21 +3530,26 @@ def _compile_stage2_mxscale_kernel_impl(
                     for i in range_constexpr(_nb)
                 ]
 
-                def _issue_active_b_tdm_only(stage_idx, curr_addr_lo):
+                def _issue_active_b_tdm_only(stage_idx, curr_addr_lo, curr_addr_hi):
+                    """Issue one B-load and advance the (lo, hi) pair carry-safely."""
                     _if_loader = scf.IfOp(_is_loader_wave)
                     with ir.InsertionPoint(_if_loader.then_block):
                         tdm_ops.tensor_load_2d(
-                            tdm_ops.update_tensor_descriptor_2d_addr_lo(
+                            tdm_ops.update_tensor_descriptor_2d_addr_lo_hi(
                                 _active_stage_desc_base[stage_idx],
                                 curr_addr_lo,
+                                curr_addr_hi,
                             )
                         )
                         scf.YieldOp([])
-                    _next_addr_lo = arith.addi(curr_addr_lo, _active_adv_i32)
-                    return arith.select(
-                        _is_loader_wave,
-                        _next_addr_lo,
-                        curr_addr_lo,
+                    _next_addr_lo, _next_addr_hi = tdm_ops.add_addr_with_carry(
+                        curr_addr_lo, curr_addr_hi, _active_adv_i32,
+                    )
+                    return (
+                        arith.select(
+                            _is_loader_wave, _next_addr_lo, curr_addr_lo),
+                        arith.select(
+                            _is_loader_wave, _next_addr_hi, curr_addr_hi),
                     )
 
             if const_expr(_use_tdm_gather_a):
@@ -3425,18 +3564,26 @@ def _compile_stage2_mxscale_kernel_impl(
 
             # ── pipeline load helpers ─────────────────────────────────
             def _issue_b_tdm_only(k_base, buf_idx):
+                # Carry-safe variant: ``update_tensor_descriptor_2d_addr64``
+                # adds the K-tile delta in i64 so an i32 wrap of base_addr_lo
+                # propagates into addr_hi rather than silently corrupting the
+                # descriptor address.
                 _k_data_off = _b_data_k_byte_off(k_base)
                 _k_scale_off = _b_scale_k_byte_off(k_base)
-                _b_addr = arith.addi(
-                    _b_desc_cache["b_addr_lo"][buf_idx], _k_data_off)
-                _bs_addr = arith.addi(
-                    _b_desc_cache["bs_addr_lo"][buf_idx], _k_scale_off)
                 tdm_ops.tensor_load_2d(
-                    tdm_ops.update_tensor_descriptor_2d_addr_lo(
-                        _b_desc_cache["b"][buf_idx], _b_addr))
+                    tdm_ops.update_tensor_descriptor_2d_addr64(
+                        _b_desc_cache["b"][buf_idx],
+                        _b_desc_cache["b_addr_lo"][buf_idx],
+                        _b_desc_cache["b_addr_hi"][buf_idx],
+                        _k_data_off,
+                    ))
                 tdm_ops.tensor_load_2d(
-                    tdm_ops.update_tensor_descriptor_2d_addr_lo(
-                        _b_desc_cache["bs"][buf_idx], _bs_addr))
+                    tdm_ops.update_tensor_descriptor_2d_addr64(
+                        _b_desc_cache["bs"][buf_idx],
+                        _b_desc_cache["bs_addr_lo"][buf_idx],
+                        _b_desc_cache["bs_addr_hi"][buf_idx],
+                        _k_scale_off,
+                    ))
 
             def _issue_scalar_loads(k_base, buf_idx):
                 if const_expr(_use_tdm_gather_a):
@@ -3468,10 +3615,13 @@ def _compile_stage2_mxscale_kernel_impl(
                 # Single-buffer path (num_buffers=1)
                 if const_expr(wave_specialized_tdm):
                     active_b_addr_lo = _active_addr_lo
+                    active_b_addr_hi = _active_addr_hi
                     for kt in range_constexpr(num_k_tiles):
                         k_base = fx.Index(kt * int(tile_k))
-                        active_b_addr_lo = _issue_active_b_tdm_only(
-                            0, active_b_addr_lo)
+                        active_b_addr_lo, active_b_addr_hi = (
+                            _issue_active_b_tdm_only(
+                                0, active_b_addr_lo, active_b_addr_hi)
+                        )
                         _issue_scalar_loads(k_base, 0)
                         tdm_ops.tensor_wait(0)
                         workgroup_barrier(use_cluster=use_cluster)
@@ -3490,9 +3640,12 @@ def _compile_stage2_mxscale_kernel_impl(
                 # ── prologue: pre-load first `pre_loaded` stages ──
                 if const_expr(wave_specialized_tdm):
                     active_b_addr_lo = _active_addr_lo
+                    active_b_addr_hi = _active_addr_hi
                     for _pi in range_constexpr(pre_loaded):
-                        active_b_addr_lo = _issue_active_b_tdm_only(
-                            _pi, active_b_addr_lo)
+                        active_b_addr_lo, active_b_addr_hi = (
+                            _issue_active_b_tdm_only(
+                                _pi, active_b_addr_lo, active_b_addr_hi)
+                        )
                         _issue_scalar_loads(fx.Index(_pi * int(tile_k)), _pi)
                 else:
                     for _pi in range_constexpr(pre_loaded):
@@ -3502,10 +3655,17 @@ def _compile_stage2_mxscale_kernel_impl(
                 # ── main pipelined loop ──
                 if const_expr(loop_iters > 0):
                     if const_expr(wave_specialized_tdm):
-                        _init = list(acc) + [active_b_addr_lo]
+                        # Carry the (addr_lo, addr_hi) pair through the
+                        # pipeline state so the carry chain survives across
+                        # iterations.
+                        _init = (
+                            list(acc)
+                            + [active_b_addr_lo, active_b_addr_hi]
+                        )
                         for _li, _st in fx.range(0, loop_iters, 1, init=_init):
                             _acc = list(_st[:n_accs])
                             _cur_b_addr_lo = _st[n_accs]
+                            _cur_b_addr_hi = _st[n_accs + 1]
                             for _bi in range_constexpr(_nb):
                                 _lb = (_bi + _nb - 1) % _nb
                                 _kt = (_li * fx.Index(_nb)
@@ -3516,8 +3676,13 @@ def _compile_stage2_mxscale_kernel_impl(
                                     use_cluster=use_cluster)
                                 pipeline_fence_wait(use_cluster=use_cluster)
 
-                                _cur_b_addr_lo = _issue_active_b_tdm_only(
-                                    _lb, _cur_b_addr_lo)
+                                _cur_b_addr_lo, _cur_b_addr_hi = (
+                                    _issue_active_b_tdm_only(
+                                        _lb,
+                                        _cur_b_addr_lo,
+                                        _cur_b_addr_hi,
+                                    )
+                                )
 
                                 def _mid_issue_scalar(_mid_kb=_kb, _mid_lb=_lb):
                                     _issue_scalar_loads(_mid_kb, _mid_lb)
@@ -3531,9 +3696,13 @@ def _compile_stage2_mxscale_kernel_impl(
                                 )
                                 if const_expr(_use_scheduled_compute):
                                     _hot_loop_scheduler_scheduled()
-                            _res = yield list(_acc) + [_cur_b_addr_lo]
+                            _res = yield (
+                                list(_acc)
+                                + [_cur_b_addr_lo, _cur_b_addr_hi]
+                            )
                         acc = list(_res[:n_accs])
                         active_b_addr_lo = _res[n_accs]
+                        active_b_addr_hi = _res[n_accs + 1]
                     else:
                         _init = list(acc)
                         for _li, _st in fx.range(0, loop_iters, 1, init=_init):
@@ -3597,8 +3766,13 @@ def _compile_stage2_mxscale_kernel_impl(
                             _tail_li += 1
 
                             if const_expr(wave_specialized_tdm):
-                                active_b_addr_lo = _issue_active_b_tdm_only(
-                                    _ls, active_b_addr_lo)
+                                active_b_addr_lo, active_b_addr_hi = (
+                                    _issue_active_b_tdm_only(
+                                        _ls,
+                                        active_b_addr_lo,
+                                        active_b_addr_hi,
+                                    )
+                                )
                             else:
                                 _issue_b_tdm_only(_tkb, _ls)
 
