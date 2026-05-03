@@ -64,6 +64,7 @@ def run_ref(q_bf16, k_bf16, v_bf16, causal=False):
     return out
 
 
+@pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("nheads, nheads_k", [(8, 1), (32, 8)])
 @pytest.mark.parametrize(
@@ -86,6 +87,7 @@ def test_mha_mxfp8_output(
     seqlen_q,
     seqlen_k,
     d,
+    causal,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -121,7 +123,7 @@ def test_mha_mxfp8_output(
         q_scale, k_scale, v_scale,
     )
 
-    out_ref = run_ref(q_ref, k_ref, v_ref)
+    out_ref = run_ref(q_ref, k_ref, v_ref, causal=causal)
 
     # Workaround: bf16 element-wise ops hang on gfx1250 (ROCm bf16 codegen bug).
     # Always compare in fp32.
@@ -167,48 +169,7 @@ parser.add_argument("-nk", "--nheads_k", type=int, default=-1)
 parser.add_argument("-q", "--seqlen_q", type=int, default=256)
 parser.add_argument("-k", "--seqlen_k", type=int, default=-1)
 parser.add_argument("-d", "--d_qk", type=int, default=128)
-
-def run_mxfp8_cli(batch_size, nheads, nheads_k, seqlen_q, seqlen_k, d):
-    """CLI entry: call kernel directly without torch.profiler (unstable on gfx1250)."""
-    torch.random.manual_seed(0)
-    torch.cuda.empty_cache()
-    d_v = d
-    sub_q = 256
-    sub_k = 128
-
-    q_bf16 = torch.randn(batch_size, nheads, seqlen_q, d, device="cuda", dtype=torch.bfloat16)
-    k_bf16 = torch.randn(batch_size, nheads_k, seqlen_k, d, device="cuda", dtype=torch.bfloat16)
-    v_bf16 = torch.randn(batch_size, nheads_k, seqlen_k, d_v, device="cuda", dtype=torch.bfloat16)
-
-    q_fp8 = q_bf16.to(dtypes.fp8)
-    k_fp8 = k_bf16.to(dtypes.fp8)
-    v_fp8 = v_bf16.to(dtypes.fp8)
-
-    q_ref = q_fp8.to(torch.bfloat16).transpose(1, 2)
-    k_ref = k_fp8.to(torch.bfloat16).transpose(1, 2)
-    v_ref = v_fp8.to(torch.bfloat16).transpose(1, 2)
-
-    q_in = q_fp8.transpose(1, 2)
-    k_in = k_fp8.transpose(1, 2)
-    v_in = v_fp8.transpose(1, 2)
-
-    q_scale = create_mxfp8_scale_buffer(batch_size, nheads, seqlen_q, d, BLOCK_SIZE, sub_q)
-    k_scale = create_mxfp8_scale_buffer(batch_size, nheads_k, seqlen_k, d, BLOCK_SIZE, sub_k)
-    v_scale = create_mxfp8_scale_buffer(batch_size, nheads_k, seqlen_k, d_v, BLOCK_SIZE, sub_k)
-
-    out = aiter.flash_attn_mxfp8_func(q_in, k_in, v_in, q_scale, k_scale, v_scale)
-    torch.cuda.synchronize()
-
-    out_ref, _, _ = attention_ref(q_ref, k_ref, v_ref, causal=False, upcast=True)
-
-    abs_diff = (out.float() - out_ref.float()).abs()
-    max_diff = abs_diff.max().item()
-    mean_diff = abs_diff.mean().item()
-
-    status = "PASS" if max_diff < 0.05 else "FAIL"
-    print(f"b={batch_size} sq={seqlen_q:>4} d={d:>3} nh={nheads:>2} nhk={nheads_k:>2} "
-          f"| max={max_diff:.4f} mean={mean_diff:.6f} [{status}]")
-    return max_diff
+parser.add_argument("--causal", action="store_true", default=False)
 
 
 if __name__ == "__main__":
@@ -217,11 +178,17 @@ if __name__ == "__main__":
     nheads_k = args.nheads_k if args.nheads_k > 0 else args.nheads
     seqlen_k = args.seqlen_k if args.seqlen_k > 0 else args.seqlen_q
 
-    run_mxfp8_cli(
+    collected = []
+    test_mha_mxfp8_output(
         args.batch_size,
         args.nheads,
         nheads_k,
         args.seqlen_q,
         seqlen_k,
         args.d_qk,
+        args.causal,
     )
+    collected.append(benchmark)
+
+    df = pd.DataFrame(collected)
+    aiter.logger.info(f"mha mxfp8 summary:\n{df}")

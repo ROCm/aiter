@@ -3257,7 +3257,7 @@ def flash_attn_mxfp8_func(
         q_descale=q_scale,
         k_descale=k_scale,
         v_descale=v_scale,
-        return_lse=True,
+        return_lse=False,
         return_softmax=False,
         out=out_view,
     )
