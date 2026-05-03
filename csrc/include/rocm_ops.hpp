@@ -451,8 +451,11 @@ namespace py = pybind11;
           "        int CuCount) -> ()");                                                        \
     m.def("wv_splitk_small_fp16_bf16",                                                          \
           &aiter::wv_splitk_small_fp16_bf16_wrapper,                                            \
-          "wv_splitk_small_fp16_bf16(Tensor in_a, Tensor in_b, Tensor! out_c, int N_in,"        \
-          "        int CuCount) -> ()");                                                        \
+          py::arg("in_a"),                                                                      \
+          py::arg("in_b"),                                                                      \
+          py::arg("out_c"),                                                                     \
+          py::arg("N_in"),                                                                      \
+          py::arg("CuCount"));                                                                  \
     m.def("LLMM1",                                                                              \
           &aiter::LLMM1,                                                                        \
           "LLMM1(Tensor in_a, Tensor in_b, Tensor! out_c, int rows_per_block) -> "              \
@@ -1421,8 +1424,17 @@ namespace py = pybind11;
 #define ROPE_1C_THD_BWD_PYBIND m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
 #define ROPE_1C_2D_BWD_PYBIND m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
 
-#define ROPE_1C_CACHED_POSITIONS_FWD_PYBIND \
-    m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl)
+#define ROPE_1C_CACHED_POSITIONS_FWD_PYBIND        \
+    m.def("rope_cached_positions_fwd_impl",        \
+          &rope_cached_positions_fwd_impl,         \
+          py::arg("output"),                       \
+          py::arg("input"),                        \
+          py::arg("cos"),                          \
+          py::arg("sin"),                          \
+          py::arg("positions"),                    \
+          py::arg("rotate_style"),                 \
+          py::arg("reuse_freqs_front_part"),       \
+          py::arg("nope_first"))
 #define ROPE_2C_CACHED_POSITIONS_FWD_PYBIND    \
     m.def("rope_cached_positions_2c_fwd_impl", \
           &rope_cached_positions_2c_fwd_impl,  \
@@ -1436,10 +1448,32 @@ namespace py = pybind11;
           py::arg("rotate_style"),             \
           py::arg("reuse_freqs_front_part"),   \
           py::arg("nope_first"))
-#define ROPE_1C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND \
-    m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl)
-#define ROPE_2C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND \
-    m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl)
+#define ROPE_1C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND        \
+    m.def("rope_cached_positions_offsets_fwd_impl",        \
+          &rope_cached_positions_offsets_fwd_impl,         \
+          py::arg("output"),                               \
+          py::arg("input"),                                \
+          py::arg("cos"),                                  \
+          py::arg("sin"),                                  \
+          py::arg("positions"),                            \
+          py::arg("offsets"),                              \
+          py::arg("rotate_style"),                         \
+          py::arg("reuse_freqs_front_part"),               \
+          py::arg("nope_first"))
+#define ROPE_2C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND        \
+    m.def("rope_cached_positions_offsets_2c_fwd_impl",     \
+          &rope_cached_positions_offsets_2c_fwd_impl,      \
+          py::arg("output_x"),                             \
+          py::arg("output_y"),                             \
+          py::arg("input_x"),                              \
+          py::arg("input_y"),                              \
+          py::arg("cos"),                                  \
+          py::arg("sin"),                                  \
+          py::arg("positions"),                            \
+          py::arg("offsets"),                              \
+          py::arg("rotate_style"),                         \
+          py::arg("reuse_freqs_front_part"),               \
+          py::arg("nope_first"))
 
 #define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND               \
     m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", \
