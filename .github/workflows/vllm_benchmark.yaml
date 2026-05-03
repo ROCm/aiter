@@ -146,10 +146,13 @@ jobs:
             extra_env_args: -e VLLM_USE_TRITON_FLASH_ATTN=0
         
     steps:
-      - name: Checkout aiter repo
-        uses: actions/checkout@v4
+      - name: Checkout Docker pull retry helper
+        uses: actions/checkout@v6
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          sparse-checkout: |
+            .github/scripts
 
       - name: Download Aiter wheel artifact
         uses: actions/download-artifact@v4
