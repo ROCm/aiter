@@ -57,6 +57,8 @@ WMMA_M = 16
 WMMA_N = 16
 WMMA_K = 32
 
+LDS_PAD_ELEMS = 8   # in bf16/f16 elements (= 16 bytes; encodes as 4 dwords)
+
 
 def compile_pa_decode_main(
     *,
@@ -134,13 +136,17 @@ def compile_pa_decode_main(
     # overlap with, so we collapse to a single stage and save half the K/V LDS.
     NUM_KV_STAGES = 2 if COMPUTES_PER_PARTITION > 1 else 1
 
-    # LDS layout (NUM_KV_STAGES double-buffer for K and V, sized by KV_COMPUTE_BLOCK_SIZE):
-    #   Q     [QG=16,  HEAD]                dtype       (persistent until read into q_frags)
-    #   K[0]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 0, holds BLOCKS_PER_COMPUTE blocks)
-    #   V[0]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 0)
-    #   K[1]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 1, only if NUM_KV_STAGES==2)
-    #   V[1]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 1, only if NUM_KV_STAGES==2)
-    #   P     [QG=16, KV_COMPUTE_BLOCK_SIZE] dtype
+    # Padded LDS row strides (in elements).
+    KV_LDS_ROW_STRIDE = HEAD_SIZE + LDS_PAD_ELEMS
+    P_LDS_ROW_STRIDE  = KV_COMPUTE_BLOCK_SIZE + LDS_PAD_ELEMS
+
+    # LDS layout (NUM_KV_STAGES double-buffer for K and V; +LDS_PAD_ELEMS bf16
+    # pad per row, applied via TDM `pad_interval`/`pad_amount` for Q/K/V and
+    # via the P-LDS addressing arithmetic for P):
+    #   Q     [WMMA_M=16,  HEAD+LDS_PAD]               dtype  (persistent until read into q_frags)
+    #   K[i]  [KV_COMPUTE_BLOCK_SIZE, HEAD+LDS_PAD]    dtype  (stage i, holds BLOCKS_PER_COMPUTE blocks)
+    #   V[i]  [KV_COMPUTE_BLOCK_SIZE, HEAD+LDS_PAD]    dtype  (stage i)
+    #   P     [WMMA_M=16, KV_COMPUTE_BLOCK_SIZE+LDS_PAD] dtype
     #
     # Cross-warp reduce scratch [NUM_WARPS, QG] f32 is aliased with Q LDS (Q is
     # unused after q_frags are read into registers at prologue; scratch only
@@ -150,19 +156,26 @@ def compile_pa_decode_main(
     # When the real `QUERY_GROUP_SIZE` is < WMMA_M, the unused rows in LDS
     # are simply never written (Q TDM only loads real rows; the row-mask in
     # QK + masked stores keep their data from leaking out).
-    q_lds_elems = WMMA_M * HEAD_SIZE
-    kv_lds_elems = KV_COMPUTE_BLOCK_SIZE * HEAD_SIZE
-    p_lds_elems = WMMA_M * KV_COMPUTE_BLOCK_SIZE
-    q_lds_offset = 0
-    q_lds_bytes = q_lds_elems * elem_bytes
+    q_lds_elems  = WMMA_M                * KV_LDS_ROW_STRIDE
+    kv_lds_elems = KV_COMPUTE_BLOCK_SIZE * KV_LDS_ROW_STRIDE
+    p_lds_elems  = WMMA_M                * P_LDS_ROW_STRIDE
+    q_lds_bytes  = q_lds_elems * elem_bytes
     kv_one_bytes = kv_lds_elems * elem_bytes
-    k_stage_offsets = [
-        q_lds_offset + q_lds_bytes + 2 * i * kv_one_bytes
-        for i in range(NUM_KV_STAGES)
-    ]
-    v_stage_offsets = [k + kv_one_bytes for k in k_stage_offsets]
-    p_lds_offset = q_lds_offset + q_lds_bytes + 2 * NUM_KV_STAGES * kv_one_bytes
-    p_lds_bytes = p_lds_elems * elem_bytes
+    p_lds_bytes  = p_lds_elems * elem_bytes
+
+    # Allocate each region with a 16-byte alignment
+    q_lds_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = q_lds_offset + q_lds_bytes
+    k_stage_offsets = []
+    v_stage_offsets = []
+    for _i in range(NUM_KV_STAGES):
+        k_off = allocator._align(allocator.ptr, 16)
+        allocator.ptr = k_off + kv_one_bytes
+        v_off = allocator._align(allocator.ptr, 16)
+        allocator.ptr = v_off + kv_one_bytes
+        k_stage_offsets.append(k_off)
+        v_stage_offsets.append(v_off)
+    p_lds_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = p_lds_offset + p_lds_bytes
 
 
@@ -460,6 +473,7 @@ def compile_pa_decode_main(
                     strides=(HEAD_SIZE, 1),
                     tile_shape=(KV_BLOCK_SIZE, HEAD_SIZE),
                     elem_bytes=elem_bytes,
+                    pad_interval=HEAD_SIZE, pad_amount=LDS_PAD_ELEMS,
                     num_warps=NUM_WARPS,
                     lds_byte_offset=lds_byte_off,
                 )
@@ -476,7 +490,10 @@ def compile_pa_decode_main(
 
                 Each block lands in a sub-region of the LDS stage (offset by block-index rows).
                 """
-                one_block_bytes = KV_BLOCK_SIZE * HEAD_SIZE * elem_bytes
+                # Use the padded row stride: TDM inserts LDS_PAD_ELEMS of pad
+                # after every HEAD_SIZE source elements, so each block in LDS
+                # is KV_BLOCK_SIZE rows × KV_LDS_ROW_STRIDE elements wide.
+                one_block_bytes = KV_BLOCK_SIZE * KV_LDS_ROW_STRIDE * elem_bytes
                 for b in range_constexpr(BLOCKS_PER_COMPUTE):
                     lds_sub_off = arith.index(b * one_block_bytes)
                     _issue_kv_load_single_block(
@@ -510,6 +527,7 @@ def compile_pa_decode_main(
                     strides=(HEAD_SIZE, 1),
                     tile_shape=(QUERY_GROUP_SIZE, HEAD_SIZE),
                     elem_bytes=elem_bytes,
+                    pad_interval=HEAD_SIZE, pad_amount=LDS_PAD_ELEMS,
                     num_warps=NUM_WARPS,
                 )
                 tdm_ops.tensor_load_2d(desc)
@@ -529,7 +547,7 @@ def compile_pa_decode_main(
             # Pre-load Q fragments from LDS (held in registers for the entire kernel).
             q_frags = []
             for ks in range_constexpr(K_QK_TILES):  # each warp has a complete copy of Q
-                q_frags.append(_load_wmma_A_frag(q_lds, lane16, ks * WMMA_K, HEAD_SIZE))
+                q_frags.append(_load_wmma_A_frag(q_lds, lane16, ks * WMMA_K, KV_LDS_ROW_STRIDE))
 
             # ---------------- Main loop over compute tiles in partition ----------------
             for compute_iter in range_constexpr(COMPUTES_PER_PARTITION):
@@ -589,7 +607,7 @@ def compile_pa_decode_main(
                     n_row_lds = n_tile_global * arith.index(WMMA_M) + lane16
                     for ks in range_constexpr(K_QK_TILES):
                         k_frag = _load_wmma_A_frag(
-                            k_lds, n_row_lds, ks * WMMA_K, HEAD_SIZE
+                            k_lds, n_row_lds, ks * WMMA_K, KV_LDS_ROW_STRIDE
                         )
                         # SWAPPED: K is A operand (M=KVB), Q is B operand (N=QGSP).
                         qk_accs[n_local] = wmma_op(
@@ -754,7 +772,7 @@ def compile_pa_decode_main(
                         + arith.index(n_local * WMMA_M)
                         + lane_kgrp * arith.index(8)
                     )
-                    off = lane16 * arith.index(KV_COMPUTE_BLOCK_SIZE) + kvb_col_base
+                    off = lane16 * arith.index(P_LDS_ROW_STRIDE) + kvb_col_base
                     vector.store(p_half, p_lds_mem, [off])
 
                 # Wait for current tile's V (its DMA was overlapped with QK + softmax + P-LDS write).
@@ -774,7 +792,7 @@ def compile_pa_decode_main(
                         # P fragment: feed as B operand (N=QGSP, K=KVB).
                         # P LDS [QGSP, KV_COMPUTE] read with row=lane16, K-cols varying.
                         p_frag = _load_wmma_A_frag(
-                            p_lds, lane16, ks * WMMA_K, KV_COMPUTE_BLOCK_SIZE
+                            p_lds, lane16, ks * WMMA_K, P_LDS_ROW_STRIDE
                         )
                         # V fragment: feed as A operand (M=HEAD, K=KVB).
                         # V LDS [KVB, HEAD] read via transpose-load: lane16 → HEAD-col,
@@ -784,7 +802,7 @@ def compile_pa_decode_main(
                             v_lds,
                             global_m_tile * arith.index(WMMA_M),  # base in HEAD dim
                             ks * WMMA_K,                          # base in KVB dim
-                            HEAD_SIZE,                            # row stride (V LDS layout [KVB, HEAD])
+                            KV_LDS_ROW_STRIDE,                    # row stride (V LDS [KVB, HEAD+pad])
                         )
                         # SWAPPED: V is A (M=HEAD), P is B (N=QGSP).
                         pv_accs[pv_n] = wmma_op(
