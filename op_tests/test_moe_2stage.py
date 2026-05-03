@@ -485,6 +485,7 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
+    _test_graph = int(os.environ.get("AITER_TEST_GRAPH", "1")) != 0
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
@@ -503,6 +504,7 @@ def test_fmoe(
         bias2=exp_bias2_aiter,
         num_iters=5,
         num_warmup=2,
+        testGraph=_test_graph,
     )
     # gfx1250 FlyDSL paths inherently have block-quant noise (mxfp8/mxfp4)
     # that compounds over K-sums.  FlyDSL UT

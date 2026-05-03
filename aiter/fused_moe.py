@@ -1025,6 +1025,8 @@ def _gfx1250_moe_stage1(
         "swiglu" if activation == ActivationType.Swiglu else "silu"
     )
 
+    _expert_sched = int(os.environ.get("AITER_GFX1250_EXPERT_SCHED", "1")) != 0
+    _tdm_gather = int(os.environ.get("AITER_GFX1250_TDM_GATHER", "1")) != 0
     exe = compile_moe_gemm1(
         model_dim=model_dim_padded,
         inter_dim=inter_dim,
@@ -1038,6 +1040,9 @@ def _gfx1250_moe_stage1(
         out_dtype=out_dtype_str,
         enable_bias=_enable_bias,
         act=_act_str,
+        expert_sched_mode=_expert_sched,
+        use_tdm_gather=_tdm_gather,
+        use_tdm_gather_as=_tdm_gather,
     )
 
     args = (
@@ -1193,6 +1198,15 @@ def _gfx1250_moe_stage2(
     else:
         flat_bias2 = torch.empty(0, device=dev, dtype=dtypes.fp32)
 
+    _expert_sched_s2 = int(os.environ.get("AITER_GFX1250_EXPERT_SCHED", "1")) != 0
+    _tdm_gather_s2 = int(os.environ.get("AITER_GFX1250_TDM_GATHER", "1")) != 0
+    _stage2_skip = int(os.environ.get("AITER_GFX1250_STAGE2_SKIP", "0")) != 0
+    if _stage2_skip:
+        # Diagnostic: skip the actual stage2 GEMM and return the zero-initialised
+        # ``out`` buffer. Used to bisect whether stage1 or stage2 is the hang.
+        if int(os.environ.get("AITER_GFX1250_PROBE", "0")):
+            logger.info("[probe] stage2 SKIPPED (AITER_GFX1250_STAGE2_SKIP=1)")
+        return out
     exe = compile_moe_gemm2(
         model_dim=model_dim,
         inter_dim=inter_dim_padded,
@@ -1206,6 +1220,9 @@ def _gfx1250_moe_stage2(
         out_dtype=out_dtype_str,
         accumulate=True,
         enable_bias=_enable_bias_s2,
+        expert_sched_mode=_expert_sched_s2,
+        use_tdm_gather=_tdm_gather_s2,
+        use_tdm_gather_as=_tdm_gather_s2,
     )
 
     args = (
