@@ -46,7 +46,11 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
     double epsilon,
     int num_tokens,
     int num_heads,
-    int head_dim)
+    int head_dim,
+    int64_t x_token_stride,              // x stride along token dim (elements)
+    int64_t x_head_stride,               // x stride along head dim (elements)
+    int64_t z_token_stride,              // z stride along token dim (elements)
+    int64_t z_head_stride)               // z stride along head dim (elements)
 {
     // Compile-time validation
     static_assert(GROUP_SIZE == 128, "Only GROUP_SIZE=128 is supported");
@@ -80,10 +84,15 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
 
     const int elem_id = thread_in_group * THREAD_DATA_SIZE;
 
-    // Input pointers for this (token, head)
-    const int input_base = token_id * (num_heads * head_dim) + head_id * head_dim;
-    const DTYPE_I* x_ptr = x + input_base;
-    const DTYPE_I* z_ptr = z + input_base;
+    // Input pointers for this (token, head). x and z may be strided slices of larger
+    // tensors, so use the per-tensor (token, head) strides. The inner head_dim must
+    // be unit-strided (validated on the host) so vector loads stay coalesced.
+    const int64_t x_offset = static_cast<int64_t>(token_id) * x_token_stride
+                           + static_cast<int64_t>(head_id) * x_head_stride;
+    const int64_t z_offset = static_cast<int64_t>(token_id) * z_token_stride
+                           + static_cast<int64_t>(head_id) * z_head_stride;
+    const DTYPE_I* x_ptr = x + x_offset;
+    const DTYPE_I* z_ptr = z + z_offset;
 
     // Load THREAD_DATA_SIZE elements per thread
     float x_vals[THREAD_DATA_SIZE];
@@ -207,6 +216,13 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
 
     hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
 
+    // Strides for x and z (token, head). The inner head_dim is required to be
+    // unit-stride (validated by the caller) so we don't need to thread it through.
+    const int64_t x_token_stride = x.stride(0);
+    const int64_t x_head_stride  = x.stride(1);
+    const int64_t z_token_stride = z.stride(0);
+    const int64_t z_head_stride  = z.stride(1);
+
     gated_rmsnorm_fp8_group_quant_kernel<DTYPE_I, DTYPE_O, GROUP_SIZE, THREAD_DATA_SIZE, BLOCK_SIZE, TRANSPOSE_SCALE>
         <<<grid, block, 0, stream>>>(
             reinterpret_cast<DTYPE_O*>(out.data_ptr()),
@@ -217,7 +233,11 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
             epsilon,
             num_tokens,
             num_heads,
-            head_dim
+            head_dim,
+            x_token_stride,
+            x_head_stride,
+            z_token_stride,
+            z_head_stride
         );
 }
 
@@ -244,6 +264,11 @@ void gated_rmsnorm_fp8_group_quant_launcher(
     TORCH_CHECK(head_dim == 128, "ONLY head_dim=128 is supported, got ", head_dim);
     TORCH_CHECK(group_size == 128, "ONLY group_size=128 is supported, got ", group_size);
     TORCH_CHECK(weight.size(0) == head_dim, "Weight size must match head_dim");
+
+    // x and z may be strided slices on the token/head dims, but the inner head_dim
+    // must be unit-stride for vectorized loads.
+    TORCH_CHECK(x.stride(2) == 1, "x.stride(2) must be 1 (head_dim contiguous), got ", x.stride(2));
+    TORCH_CHECK(z.stride(2) == 1, "z.stride(2) must be 1 (head_dim contiguous), got ", z.stride(2));
 
 
     // Use THREAD_DATA_SIZE=16 (8 groups/warp) for best bandwidth

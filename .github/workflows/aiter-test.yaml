@@ -382,6 +382,18 @@ jobs:
 
       - name: Install amd-triton
         run: |
+          # Ensure install_triton.sh is available even when the PR branch
+          # was created before the script was added to main (#2959).
+          # The workflow file always comes from the base branch, so we
+          # materialize the script from the base ref when missing.
+          if [ ! -f .github/scripts/install_triton.sh ]; then
+            BASE_REF="${{ github.event.pull_request.base.ref || github.ref_name }}"
+            mkdir -p .github/scripts
+            curl -fsSL \
+              "https://raw.githubusercontent.com/${{ github.repository }}/${BASE_REF}/.github/scripts/install_triton.sh" \
+              -o .github/scripts/install_triton.sh
+            chmod +x .github/scripts/install_triton.sh
+          fi
           docker exec -w /workspace aiter_test \
             bash -c "./.github/scripts/install_triton.sh && pip show amd-triton"
 
@@ -571,6 +583,18 @@ jobs:
 
       - name: Install amd-triton
         run: |
+          # Ensure install_triton.sh is available even when the PR branch
+          # was created before the script was added to main (#2959).
+          # The workflow file always comes from the base branch, so we
+          # materialize the script from the base ref when missing.
+          if [ ! -f .github/scripts/install_triton.sh ]; then
+            BASE_REF="${{ github.event.pull_request.base.ref || github.ref_name }}"
+            mkdir -p .github/scripts
+            curl -fsSL \
+              "https://raw.githubusercontent.com/${{ github.repository }}/${BASE_REF}/.github/scripts/install_triton.sh" \
+              -o .github/scripts/install_triton.sh
+            chmod +x .github/scripts/install_triton.sh
+          fi
           docker exec -w /workspace aiter_test \
             bash -c "./.github/scripts/install_triton.sh && pip show amd-triton"
 

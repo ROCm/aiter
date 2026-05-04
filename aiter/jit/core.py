@@ -216,7 +216,12 @@ class AITER_CONFIG(object):
                     df[c] = _FILL_DEFAULTS.get(c, 0)
             source_pairs[i] = (path, df[all_cols])
 
-        merge_df = pd.concat([df for _, df in source_pairs], ignore_index=True)
+        non_empty = [df for _, df in source_pairs if not df.empty]
+        merge_df = (
+            pd.concat(non_empty, ignore_index=True)
+            if non_empty
+            else source_pairs[0][1].iloc[0:0].copy()
+        )
         has_tag = "_tag" in merge_df.columns
         if has_tag:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
