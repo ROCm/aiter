@@ -78,6 +78,42 @@ def _kernel_unified_attention_sparse_mla_2d(
     lse_stride_0: tl.int64 = 0,
     lse_stride_1: tl.int64 = 0,
     RETURN_LSE: tl.constexpr = False,
+    # FP8 KV direct read (V4 storage: per-tile e8m0 block scales).
+    # When KV_FP8 is True, key_cache_ptr / value_cache_ptr point to FP8 storage
+    # for the first KV_LORA_RANK channels and kv_scales_cache_ptr points to
+    # the e8m0 byte view (uint8) shaped [num_blocks, block_size, num_tiles] where
+    # num_tiles = KV_LORA_RANK // FP8_TILE. Triton cannot bind float8_e8m0fnu
+    # directly (see vllm common.py:846), so the caller passes a uint8 view and
+    # the kernel decodes it as 2^(byte - 127).
+    #
+    # V4 also keeps a trailing BF16_HEAD_DIM-channel BF16 segment per token (the
+    # RoPE channels). When BF16_HEAD_DIM > 0 the kernel does TWO partial QK and
+    # PV dot products: (Q[:, :KV_LORA_RANK] @ K_fp8_dequant) plus
+    # (Q[:, KV_LORA_RANK:] @ K_bf16). Outputs are similarly split.
+    kv_scales_cache_ptr=None,
+    stride_kv_scales_0: tl.int64 = 0,
+    stride_kv_scales_1: tl.int64 = 0,
+    stride_kv_scales_2: tl.constexpr = 0,
+    KV_FP8: tl.constexpr = False,
+    FP8_TILE: tl.constexpr = 64,
+    key_bf16_cache_ptr=None,
+    value_bf16_cache_ptr=None,
+    stride_k_bf16_0: tl.int64 = 0,
+    stride_k_bf16_1: tl.int64 = 0,
+    stride_k_bf16_2: tl.int64 = 0,
+    stride_k_bf16_3: tl.constexpr = 1,
+    stride_v_bf16_0: tl.int64 = 0,
+    stride_v_bf16_1: tl.int64 = 0,
+    stride_v_bf16_2: tl.int64 = 0,
+    stride_v_bf16_3: tl.constexpr = 1,
+    BF16_HEAD_DIM: tl.constexpr = 0,
+    # When FP8_SEGMENT_DIM > 0 the FP8 K/V cache only spans the first
+    # FP8_SEGMENT_DIM channels of the rounded-up KV_LORA_RANK (which must be a
+    # power of 2 for tl.arange). Channels in [FP8_SEGMENT_DIM, KV_LORA_RANK) are
+    # masked out of the FP8 load (they don't exist in the FP8 storage); their
+    # contribution comes via the separate BF16 cache pointer above. Set to 0 to
+    # disable (default: full KV_LORA_RANK is FP8 / BF16 with no split).
+    FP8_SEGMENT_DIM: tl.constexpr = 0,
 ):
     """
     TODO:
@@ -109,6 +145,14 @@ def _kernel_unified_attention_sparse_mla_2d(
     offs_lora = tl.arange(0, KV_LORA_RANK)
     if ROPE_RANK > 0:
         offs_rope = tl.arange(KV_LORA_RANK, KV_LORA_RANK + ROPE_RANK)
+    # V4 split storage: Q is contiguous BF16 over [0, KV_LORA_RANK). The FP8 K
+    # cache only stores channels [0, FP8_SEGMENT_DIM); the trailing
+    # BF16_HEAD_DIM channels live in the separate BF16 K cache, occupying
+    # output channel range [FP8_SEGMENT_DIM, FP8_SEGMENT_DIM + BF16_HEAD_DIM).
+    if BF16_HEAD_DIM > 0:
+        offs_lora_bf16 = FP8_SEGMENT_DIM + tl.arange(0, BF16_HEAD_DIM)
+        offs_bf16_local = tl.arange(0, BF16_HEAD_DIM)
+        fp8_segment_mask = tl.arange(0, KV_LORA_RANK) < FP8_SEGMENT_DIM
 
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
 
@@ -151,9 +195,25 @@ def _kernel_unified_attention_sparse_mla_2d(
         cache_modifier=Q_cache_modifier,
     )
 
+    if BF16_HEAD_DIM > 0:
+        # Q's trailing BF16 channels live contiguously after the lora channels.
+        q_bf16_offset = (
+            query_offset_0[:, None] * query_stride_0
+            + query_offset_1[:, None] * query_stride_1
+            + offs_lora_bf16[None, :]
+        )
+        Q_bf16_part = tl.load(
+            query_ptr + q_bf16_offset,
+            mask=query_mask_0[:, None] & query_mask_1[:, None],
+            other=0.0,
+            cache_modifier=Q_cache_modifier,
+        )
+
     M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, KV_LORA_RANK], dtype=tl.float32)
+    if BF16_HEAD_DIM > 0:
+        acc_bf16 = tl.zeros([BLOCK_M, BF16_HEAD_DIM], dtype=tl.float32)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -203,14 +263,64 @@ def _kernel_unified_attention_sparse_mla_2d(
             + offs_lora[:, None] * stride_k_cache_3
             + slot[None, :] * stride_k_cache_1
         )
-        K_lora = tl.load(
-            k_lora_ptrs,
-            mask=valid_t[None, :],
-            other=0.0,
-            cache_modifier=KV_cache_modifier,
-        )
+        if KV_FP8 and BF16_HEAD_DIM > 0:
+            # Mask channels >= FP8_SEGMENT_DIM out of the FP8 load (they don't
+            # exist in FP8 storage; we'll add their contribution via K_bf16
+            # below). Pointers for those lanes can land out of bounds; tl.load
+            # respects the mask and returns `other` for masked lanes.
+            K_lora_raw = tl.load(
+                k_lora_ptrs,
+                mask=valid_t[None, :] & fp8_segment_mask[:, None],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+        else:
+            K_lora_raw = tl.load(
+                k_lora_ptrs,
+                mask=valid_t[None, :],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+
+        if KV_FP8:
+            # Per-channel scale-tile index: tile_idx = offs_lora // FP8_TILE.
+            # K_scale shape: (KV_LORA_RANK, TILE_SIZE) of e8m0 bytes.
+            k_tile_idx = offs_lora // FP8_TILE
+            k_scale_ptrs = (
+                kv_scales_cache_ptr
+                + physical_block_idx[None, :] * stride_kv_scales_0
+                + slot[None, :] * stride_kv_scales_1
+                + k_tile_idx[:, None] * stride_kv_scales_2
+            )
+            k_scale_byte = tl.load(
+                k_scale_ptrs, mask=valid_t[None, :], other=0
+            )
+            # e8m0: byte b → 2^(b - 127). 0 sentinel maps to 2^-127 (≈0); harmless
+            # for valid_t=False columns (already masked-out below).
+            k_scale = tl.exp2(k_scale_byte.to(tl.float32) - 127.0)
+            K_lora = (K_lora_raw.to(tl.float32) * k_scale).to(Q_lora.dtype)
+        else:
+            K_lora = K_lora_raw
 
         S += scale * tl.dot(Q_lora, K_lora)
+
+        if KV_FP8 and BF16_HEAD_DIM > 0:
+            # V4 split storage: load BF16 trailing K channels and add the second
+            # partial QK dot. Layout: K_bf16_part has shape (BF16_HEAD_DIM, TILE_SIZE).
+            k_bf16_ptrs = (
+                key_bf16_cache_ptr
+                + physical_block_idx[None, :] * stride_k_bf16_0
+                + kv_head_idx * stride_k_bf16_2
+                + offs_bf16_local[:, None] * stride_k_bf16_3
+                + slot[None, :] * stride_k_bf16_1
+            )
+            K_bf16_part = tl.load(
+                k_bf16_ptrs,
+                mask=valid_t[None, :],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+            S += scale * tl.dot(Q_bf16_part, K_bf16_part)
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & valid_t[None, :],
@@ -225,6 +335,8 @@ def _kernel_unified_attention_sparse_mla_2d(
         alpha = tl.exp(M - m_j)
 
         acc = acc * alpha[:, None]
+        if KV_FP8 and BF16_HEAD_DIM > 0:
+            acc_bf16 = acc_bf16 * alpha[:, None]
         L = L * alpha + l_j
         M = m_j
 
@@ -236,14 +348,59 @@ def _kernel_unified_attention_sparse_mla_2d(
             + slot[:, None] * stride_v_cache_1
             + offs_lora[None, :] * stride_v_cache_3
         )
-        V_lora = tl.load(
-            v_lora_ptrs,
-            mask=valid_t[:, None],
-            other=0.0,
-            cache_modifier=KV_cache_modifier,
-        )
+        if KV_FP8 and BF16_HEAD_DIM > 0:
+            V_lora_raw = tl.load(
+                v_lora_ptrs,
+                mask=valid_t[:, None] & fp8_segment_mask[None, :],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+        else:
+            V_lora_raw = tl.load(
+                v_lora_ptrs,
+                mask=valid_t[:, None],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+
+        if KV_FP8:
+            # V shares scales with K (V4 K=V latent). Layout is transposed vs K
+            # load: V_lora is (TILE_SIZE, KV_LORA_RANK), so scale broadcasts as
+            # [TILE_SIZE row, num_tiles] then expand along channels in the tile.
+            v_tile_idx = offs_lora // FP8_TILE
+            v_scale_ptrs = (
+                kv_scales_cache_ptr
+                + physical_block_idx[:, None] * stride_kv_scales_0
+                + slot[:, None] * stride_kv_scales_1
+                + v_tile_idx[None, :] * stride_kv_scales_2
+            )
+            v_scale_byte = tl.load(
+                v_scale_ptrs, mask=valid_t[:, None], other=0
+            )
+            v_scale = tl.exp2(v_scale_byte.to(tl.float32) - 127.0)
+            V_lora = (V_lora_raw.to(tl.float32) * v_scale).to(Q_lora.dtype)
+        else:
+            V_lora = V_lora_raw
 
         acc += tl.dot(P.to(V_lora.dtype), V_lora)
+
+        if KV_FP8 and BF16_HEAD_DIM > 0:
+            # V4 split storage: V's trailing BF16 channels feed acc_bf16.
+            # V_bf16_part shape: (TILE_SIZE, BF16_HEAD_DIM).
+            v_bf16_ptrs = (
+                value_bf16_cache_ptr
+                + physical_block_idx[:, None] * stride_v_bf16_0
+                + kv_head_idx * stride_v_bf16_2
+                + slot[:, None] * stride_v_bf16_1
+                + offs_bf16_local[None, :] * stride_v_bf16_3
+            )
+            V_bf16_part = tl.load(
+                v_bf16_ptrs,
+                mask=valid_t[:, None],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+            acc_bf16 += tl.dot(P.to(V_bf16_part.dtype), V_bf16_part)
 
     # epilogue
     # Emit sink-FREE lse first, so external two-pool merge can fold sink in
@@ -274,6 +431,8 @@ def _kernel_unified_attention_sparse_mla_2d(
         L = L + tl.exp(sink.to(tl.float32) - M)
     one_over_L = 1.0 / L[:, None]
     acc = acc * one_over_L
+    if KV_FP8 and BF16_HEAD_DIM > 0:
+        acc_bf16 = acc_bf16 * one_over_L
 
     output_offs_lora = (
         query_offset_0[:, None] * output_stride_0
@@ -285,3 +444,17 @@ def _kernel_unified_attention_sparse_mla_2d(
         acc,
         mask=query_mask_0[:, None] & query_mask_1[:, None],
     )
+
+    if KV_FP8 and BF16_HEAD_DIM > 0:
+        # Trailing BF16 channels live contiguously after the lora channels in
+        # the output tensor.
+        output_offs_bf16 = (
+            query_offset_0[:, None] * output_stride_0
+            + query_offset_1[:, None] * output_stride_1
+            + offs_lora_bf16[None, :]
+        )
+        tl.store(
+            output_ptr + output_offs_bf16,
+            acc_bf16,
+            mask=query_mask_0[:, None] & query_mask_1[:, None],
+        )
