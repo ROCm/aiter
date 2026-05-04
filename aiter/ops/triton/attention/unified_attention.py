@@ -232,11 +232,11 @@ def unified_attention(
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
 
-    if _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
-                                  seqused_k, max_seqlen_k, softmax_scale,
-                                  window_size, block_table, softcap,
-                                  alibi_slopes, sinks):
-        return
+    # if _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
+    #                               seqused_k, max_seqlen_k, softmax_scale,
+    #                               window_size, block_table, softcap,
+    #                               alibi_slopes, sinks):
+    #     return
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
