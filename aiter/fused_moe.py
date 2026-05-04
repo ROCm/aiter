@@ -1203,12 +1203,13 @@ def fused_moe_2stages(
                 quant_dtype=q_dtype_a,
                 num_rows=num_local_tokens,
             )
-            a1_scale = mxfp4_moe_sort_fwd(
+            from aiter.utility import fp4_utils
+            a1_scale = fp4_utils.moe_mxfp4_sort(
                 a1_scale,
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
-                cols=model_dim,
+                block_size=block_size_M,
             )
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
@@ -1322,12 +1323,13 @@ def fused_moe_2stages(
                 num_rows=num_local_tokens,
                 num_rows_factor=topk,
             )
-            a2_scale = mxfp4_moe_sort_fwd(
+            from aiter.utility import fp4_utils
+            a2_scale = fp4_utils.moe_mxfp4_sort(
                 a2_scale[: token_num * topk, :].view(token_num, topk, -1),
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
-                cols=inter_dim,
+                block_size=block_size_M,
             )
         a2 = a2.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
