@@ -87,6 +87,33 @@ def _assert_mhc_close(
         )
 
 
+def _config_for_large_n(n):
+    """Working config dict for the n>4 edge cases."""
+    if n >= 16:
+        # n=16 -> N_TOTAL_POW2=512; phi tile (BLOCK_K, 512) bf16 must fit LDS
+        return {
+            "BLOCK_M": 32,
+            "BLOCK_K": 32,
+            "BLOCK_C": 64,
+            "NUM_KSPLIT": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2,
+        }
+    if n >= 8:
+        # n=8 -> N_TOTAL_POW2=128
+        return {
+            "BLOCK_M": 32,
+            "BLOCK_K": 128,
+            "BLOCK_C": 64,
+            "NUM_KSPLIT": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2,
+        }
+    return None
+
+
 @pytest.mark.parametrize("M, n, C", get_test_shapes())
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mhc_correctness(M, n, C, dtype):
@@ -102,7 +129,16 @@ def test_mhc_correctness(M, n, C, dtype):
     )
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
+    triton_tuple = mhc(
+        x,
+        phi,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        n_streams,
+        config=_config_for_large_n(n),
+    )
 
     relaxed = C >= 1024
     _assert_mhc_close(
@@ -212,7 +248,16 @@ def test_mhc_small_shapes(M, n, C, dtype):
     )
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
+    triton_tuple = mhc(
+        x,
+        phi,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        n_streams,
+        config=_config_for_large_n(n),
+    )
 
     _assert_mhc_close(
         triton_tuple,
@@ -262,13 +307,40 @@ def test_mhc_output_range():
 # =============================================================================
 
 
-def _make_split_k_config(num_ksplit):
-    """Helper to create config with specified NUM_KSPLIT."""
+def _make_split_k_config(num_ksplit, n=4):
+    """Helper to create a working split-K config with the specified NUM_KSPLIT.
+
+    For n>4 the unified split kernel's phi tile (BLOCK_K, N_TOTAL_POW2) bf16
+    must fit in LDS, so BLOCK_K is shrunk accordingly. For n<=4 the wrapper's
+    fallback BLOCK_M default applies; we still pin BLOCK_C explicitly to keep
+    the test independent of the wrapper's BLOCK_C fallback.
+    """
+    if n >= 16:
+        return {
+            "BLOCK_M": 32,
+            "BLOCK_K": 32,
+            "BLOCK_C": 64,
+            "NUM_KSPLIT": num_ksplit,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2,
+        }
+    if n >= 8:
+        return {
+            "BLOCK_M": 32,
+            "BLOCK_K": 128,
+            "BLOCK_C": 64,
+            "NUM_KSPLIT": num_ksplit,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2,
+        }
     return {
-        "waves_per_eu": 1,
-        "num_stages": 1,
-        "num_warps": 4,
+        "BLOCK_C": 64,
         "NUM_KSPLIT": num_ksplit,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 1,
     }
 
 
@@ -304,7 +376,7 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
         bias,
         n_streams,
         sinkhorn_iters=0,
-        config=_make_split_k_config(num_ksplit),
+        config=_make_split_k_config(num_ksplit, n=n),
     )
 
     relaxed = C >= 1024
@@ -348,7 +420,7 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
         alpha_res,
         bias,
         n_streams,
-        config=_make_split_k_config(num_ksplit),
+        config=_make_split_k_config(num_ksplit, n=n),
     )
 
     _assert_mhc_close(

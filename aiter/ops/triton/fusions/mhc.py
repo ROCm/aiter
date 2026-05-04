@@ -94,26 +94,7 @@ def mhc(
     BLOCK_K = config.pop("BLOCK_K", 64)
     # Ensure BLOCK_K doesn't exceed K dimension
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
-
-    # The unified split-K kernel uses BLOCK_N = N_TOTAL_POW2 (the full unified
-    # phi width) instead of the old BLOCK_N=16. For large n (n=8 -> 128,
-    # n=16 -> 512) the (BLOCK_K, N_TOTAL_POW2) phi tile can exceed LDS.
-    # Cap BLOCK_K so the phi tile stays within a ~32 KB budget. Both
-    # N_TOTAL_POW2 and the budget are powers of 2, so the quotient is too.
-    # Floor at 32 to keep the MFMA path engaged. For n=4 (N_TOTAL_POW2=32)
-    # this is a no-op (max_block_k_split = 512 >> any tuned BLOCK_K).
-    phi_lds_budget_bytes = 32 * 1024
-    elem_size_bytes = 2  # bf16/fp16 phi
-    max_block_k_split = max(32, phi_lds_budget_bytes // (N_TOTAL_POW2 * elem_size_bytes))
-    BLOCK_K_split = min(BLOCK_K, max_block_k_split)
-
-    # Apply-tile budget. The 3D tile (BLOCK_M, N_POW2, BLOCK_C) f32 must stay within
-    # ~64 KB to avoid VGPR spills. Used by the inline pre-stream apply in
-    # `_mhc_fused_kernel` and by every pid in `_mhc_reduce_apply_kernel`.
-    BLOCK_C = min(BLOCK_K, triton.next_power_of_2(C))
-    apply_tile_budget = 64 * 1024
-    max_block_c = max(1, apply_tile_budget // (BLOCK_M * N_POW2))
-    BLOCK_C = min(BLOCK_C, 1 << (max_block_c.bit_length() - 1))
+    BLOCK_C = config.pop("BLOCK_C", min(64, triton.next_power_of_2(C)))
 
     # Pin h_post to pid_c == 0 and h_res (with the sinkhorn loop) to pid_c == 1
     # in `_mhc_reduce_apply_kernel`. When only one C-tile per M-tile exists,
@@ -126,8 +107,7 @@ def mhc(
         f"alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} "
         f"hc_pre_eps={hc_pre_eps} hc_post_mult_value={hc_post_mult_value} "
         f"sinkhorn_iters={sinkhorn_iters} num_ksplit={num_ksplit} "
-        f"BLOCK_M={BLOCK_M} BLOCK_N={BLOCK_N} BLOCK_K={BLOCK_K} "
-        f"BLOCK_K_split={BLOCK_K_split} BLOCK_C={BLOCK_C} "
+        f"BLOCK_M={BLOCK_M} BLOCK_N={BLOCK_N} BLOCK_K={BLOCK_K} BLOCK_C={BLOCK_C} "
         f"N_TOTAL_POW2={N_TOTAL_POW2} RES_PID_C={RES_PID_C}"
     )
 
@@ -211,7 +191,7 @@ def mhc(
             stride_acc_sq_m=acc_sq_partial.stride(1),
             BLOCK_M=BLOCK_M,
             N_TOTAL_POW2=N_TOTAL_POW2,
-            BLOCK_K=BLOCK_K_split,
+            BLOCK_K=BLOCK_K,
             SPLITK_BLOCK_SIZE=splitk_block_size,
             **config,
         )
