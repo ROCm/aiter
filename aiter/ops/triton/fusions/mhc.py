@@ -77,6 +77,7 @@ def mhc(
     n_squared = n * n
     N_POW2 = triton.next_power_of_2(n)
     N_POW2_RES = triton.next_power_of_2(n_squared)
+    N_TOTAL_POW2 = triton.next_power_of_2(n_squared + 2 * n)
 
     if config is None:
         config, _ = get_mhc_config("MHC_FUSED", M, C, mode="sinkhorn")
@@ -93,6 +94,18 @@ def mhc(
     BLOCK_K = config.pop("BLOCK_K", 64)
     # Ensure BLOCK_K doesn't exceed K dimension
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
+
+    # The unified split-K kernel uses BLOCK_N = N_TOTAL_POW2 (the full unified
+    # phi width) instead of the old BLOCK_N=16. For large n (n=8 -> 128,
+    # n=16 -> 512) the (BLOCK_K, N_TOTAL_POW2) phi tile can exceed LDS.
+    # Cap BLOCK_K so the phi tile stays within a ~32 KB budget. Both
+    # N_TOTAL_POW2 and the budget are powers of 2, so the quotient is too.
+    # Floor at 32 to keep the MFMA path engaged. For n=4 (N_TOTAL_POW2=32)
+    # this is a no-op (max_block_k_split = 512 >> any tuned BLOCK_K).
+    phi_lds_budget_bytes = 32 * 1024
+    elem_size_bytes = 2  # bf16/fp16 phi
+    max_block_k_split = max(32, phi_lds_budget_bytes // (N_TOTAL_POW2 * elem_size_bytes))
+    BLOCK_K_split = min(BLOCK_K, max_block_k_split)
 
     # Apply-tile budget. The 3D tile (BLOCK_M, N_POW2, BLOCK_C) f32 must stay within
     # ~64 KB to avoid VGPR spills. Used by the inline pre-stream apply in
@@ -113,8 +126,9 @@ def mhc(
         f"alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} "
         f"hc_pre_eps={hc_pre_eps} hc_post_mult_value={hc_post_mult_value} "
         f"sinkhorn_iters={sinkhorn_iters} num_ksplit={num_ksplit} "
-        f"BLOCK_M={BLOCK_M} BLOCK_N={BLOCK_N} BLOCK_K={BLOCK_K} BLOCK_C={BLOCK_C} "
-        f"RES_PID_C={RES_PID_C}"
+        f"BLOCK_M={BLOCK_M} BLOCK_N={BLOCK_N} BLOCK_K={BLOCK_K} "
+        f"BLOCK_K_split={BLOCK_K_split} BLOCK_C={BLOCK_C} "
+        f"N_TOTAL_POW2={N_TOTAL_POW2} RES_PID_C={RES_PID_C}"
     )
 
     assert K == K_phi, f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
@@ -175,7 +189,7 @@ def mhc(
             (num_ksplit, M), dtype=torch.float32, device=x.device
         )
 
-        grid_split = (triton.cdiv(M, BLOCK_M), total_n_blocks, num_ksplit)
+        grid_split = (triton.cdiv(M, BLOCK_M), num_ksplit)
         _mhc_fused_split_kernel[grid_split](
             x,
             phi,
@@ -183,6 +197,7 @@ def mhc(
             acc_sq_partial,
             M=M,
             K=K,
+            N=N_total,
             n=n,
             n_squared=n_squared,
             stride_xm=x.stride(0),
@@ -195,8 +210,8 @@ def mhc(
             stride_acc_sq_k=acc_sq_partial.stride(0),
             stride_acc_sq_m=acc_sq_partial.stride(1),
             BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
+            N_TOTAL_POW2=N_TOTAL_POW2,
+            BLOCK_K=BLOCK_K_split,
             SPLITK_BLOCK_SIZE=splitk_block_size,
             **config,
         )

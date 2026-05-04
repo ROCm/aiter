@@ -246,11 +246,12 @@ def _mhc_fused_kernel(
 @triton.jit
 def _mhc_fused_split_kernel(
     x_ptr,
-    phi_ptr,  # Unified phi: (K, n + n + n_res)
-    acc_ptr,  # Single unified output: (NUM_KSPLIT, M, n + n + n_res)
+    phi_ptr,  # Unified phi: (K, n + n + n_squared)
+    acc_ptr,  # Single unified output: (NUM_KSPLIT, M, n + n + n_squared)
     acc_sq_ptr,
     M: tl.constexpr,
     K: tl.constexpr,
+    N: tl.constexpr,  # = 2*n + n_squared (logical width of unified phi)
     n: tl.constexpr,
     n_squared: tl.constexpr,
     stride_xm,
@@ -263,51 +264,30 @@ def _mhc_fused_split_kernel(
     stride_acc_sq_k,
     stride_acc_sq_m,
     BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    N_TOTAL_POW2: tl.constexpr,  # = next_pow2(N), full N-tile per program
     BLOCK_K: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
 ):
     """
     Split-K kernel for mHC - computes partial results for equations 14-15.
 
-    Writes all streams to unified contiguous tensor: (NUM_KSPLIT, M, n + n + n_res)
-    Memory layout: [pre_0...pre_{n-1}, post_0...post_{n-1}, res_0...res_{n_res-1}]
+    Each program owns the *full* (BLOCK_M, N_TOTAL_POW2) tile for one
+    `(pid_m, pid_k)` pair: load each x-tile once, dot it against the unified
+    phi covering all 3 streams in a single MFMA, and write the entire output
+    row in one store. Compared to the old per-stream layout this drops the 3x
+    redundant x re-read and lifts MFMA utilization (the pre/post partial
+    columns are now subsumed by the same dot as the res columns).
 
-    Grid structure: (M_blocks, N_blocks_total, NUM_KSPLIT)
-    - pid_m: row block index
-    - pid_n: stream-aware column block index
-    - pid_k: K-split index
+    Writes all streams to unified contiguous tensor: (NUM_KSPLIT, M, N_total)
+    Memory layout: [pre_0..pre_{n-1}, post_0..post_{n-1}, res_0..res_{n_squared-1}]
+
+    Grid structure: (M_blocks, NUM_KSPLIT).
     """
     pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_k = tl.program_id(2)
+    pid_k = tl.program_id(1)
 
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-
-    n_blocks_pre = tl.cdiv(n, BLOCK_N)
-    n_blocks_post = n_blocks_pre
-
-    is_pre_program = pid_n < n_blocks_pre
-    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
-    is_res_program = ~is_pre_program & ~is_post_program
-
-    is_post_i32 = is_post_program.to(tl.int32)
-    is_res_i32 = is_res_program.to(tl.int32)
-
-    stream_offset = is_post_i32 * n_blocks_pre + is_res_i32 * (
-        n_blocks_pre + n_blocks_post
-    )
-    local_pid_n = pid_n - stream_offset
-
-    rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    n_out_res = n_squared
-
-    # Compute global column offset in unified tensor
-    # Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
-    stream_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
-
-    n_out = tl.where(is_pre_program, n, tl.where(is_post_program, n, n_out_res))
+    rn = tl.arange(0, N_TOTAL_POW2)
 
     split_k_start = pid_k * SPLITK_BLOCK_SIZE
     split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
@@ -315,16 +295,9 @@ def _mhc_fused_split_kernel(
     if split_k_start >= K:
         return
 
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    # Only compute acc_sq for first column block (shared across all streams)
-    compute_acc_sq = pid_n == 0
+    acc = tl.zeros([BLOCK_M, N_TOTAL_POW2], dtype=tl.float32)
     acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
 
-    # Compute phi column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
-    phi_col_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
-
-    # Loop over this split's K range
     k_span = split_k_end - split_k_start
     num_k_iter = tl.cdiv(k_span, BLOCK_K)
 
@@ -337,40 +310,29 @@ def _mhc_fused_split_kernel(
             mask=(rm[:, None] < M) & (rk[None, :] < split_k_end),
             other=0.0,
         )
-
-        phi_col_offset = phi_col_start + rn_local
         phi_tile = tl.load(
-            phi_ptr
-            + rk[:, None] * stride_phi_k
-            + phi_col_offset[None, :] * stride_phi_n,
-            mask=(rk[:, None] < split_k_end) & (rn_local[None, :] < n_out),
+            phi_ptr + rk[:, None] * stride_phi_k + rn[None, :] * stride_phi_n,
+            mask=(rk[:, None] < split_k_end) & (rn[None, :] < N),
             other=0.0,
         )
 
         acc += tl.dot(x_tile, phi_tile)
-
-        if compute_acc_sq:
-            x_tile_f32 = x_tile.to(tl.float32)
-            acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
-
-    # Unified contiguous write
-    col_offset = stream_start + rn_local
+        x_tile_f32 = x_tile.to(tl.float32)
+        acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
 
     tl.store(
         acc_ptr
         + pid_k * stride_acc_k
         + rm[:, None] * stride_acc_m
-        + col_offset[None, :] * stride_acc_n,
+        + rn[None, :] * stride_acc_n,
         acc,
-        mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
+        mask=(rm[:, None] < M) & (rn[None, :] < N),
     )
-
-    if compute_acc_sq:
-        tl.store(
-            acc_sq_ptr + pid_k * stride_acc_sq_k + rm * stride_acc_sq_m,
-            acc_sq,
-            mask=rm < M,
-        )
+    tl.store(
+        acc_sq_ptr + pid_k * stride_acc_sq_k + rm * stride_acc_sq_m,
+        acc_sq,
+        mask=rm < M,
+    )
 
 
 @triton.jit
