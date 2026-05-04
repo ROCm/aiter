@@ -41,8 +41,16 @@ template <typename... Args>
 [[noreturn]] inline void check_fail(const char* file, int line, Args&&... args)
 {
     std::ostringstream oss;
-    oss << "[AITER] " << file << ":" << line << " ";
-    (oss << ... << std::forward<Args>(args));
+    oss << "[AITER] " << file << ":" << line;
+    if constexpr(sizeof...(Args) > 0)
+    {
+        oss << " ";
+        (oss << ... << std::forward<Args>(args));
+    }
+    else
+    {
+        oss << " check failed";
+    }
     std::string msg = oss.str();
     std::cerr << msg << std::endl;
     if(g_aiter_can_throw)
@@ -58,11 +66,11 @@ template <typename... Args>
     {                                                                  \
         if(!(x)) [[unlikely]]                                          \
         {                                                              \
-            aiter_detail::check_fail(__FILE__, __LINE__, __VA_ARGS__); \
+            aiter_detail::check_fail(__FILE__, __LINE__ __VA_OPT__(, ) __VA_ARGS__); \
         }                                                              \
     } while(0)
 
-// Fatal on any HIP error — use for init/teardown/resource management where
+// Fatal on any HIP error -- use for init/teardown/resource management where
 // failure means unrecoverable state.
 #define HIP_CALL(call)                                                            \
     do                                                                            \
@@ -234,13 +242,14 @@ class AiterAsmKernel: private AiterAsmKernelFast
     private:
     std::unique_ptr<char[]> hsaco_data;
 
-    const void* load_hsaco_file(const char* hsaco_path)
+    const void* load_hsaco_file(const char* kernel_name, const char* hsaco_path)
     {
         const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
         std::string arch_name     = get_gpu_arch();
         if(AITER_ASM_DIR != nullptr)
         {
             std::string full_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco_path;
+            AITER_LOG_INFO("LoadKernel: " << kernel_name << " hsaco: " << full_path);
 
             std::ifstream file(full_path, std::ios::binary | std::ios::ate);
 
@@ -257,10 +266,11 @@ class AiterAsmKernel: private AiterAsmKernelFast
         else
         {
 #if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
-            std::string fname = "hsa/" + arch_name + "/" + hsaco;
+            std::string fname = "hsa/" + arch_name + "/" + hsaco_path;
             auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
             AITER_CHECK(hasco_obj != AITER_EMBEDDED_HSA_MAP.end(), "hasco_obj not found");
             AITER_CHECK(hasco_obj->second.data() != nullptr, "hasco_obj is nullptr");
+            AITER_LOG_INFO("LoadKernel: " << kernel_name << " hsaco: [embedded] " << fname);
             return hasco_obj->second.data();
 #else
             AITER_CHECK(AITER_ASM_DIR != nullptr, "AITER_ASM_DIR not set");
@@ -272,7 +282,7 @@ class AiterAsmKernel: private AiterAsmKernelFast
     public:
     AiterAsmKernel(const char* kernel_name, const char* hsaco_path)
     {
-        init(kernel_name, load_hsaco_file(hsaco_path));
+        init(kernel_name, load_hsaco_file(kernel_name, hsaco_path));
     };
 
     using AiterAsmKernelFast::launch_kernel;

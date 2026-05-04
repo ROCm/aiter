@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [aiter-1gpu-runner] # TODO: add more runners
+        runner: [linux-aiter-mi300x-1] # TODO: add more runners
     name: Operators tuning
     runs-on: ${{ matrix.runner }}
 
@@ -108,6 +108,7 @@ jobs:
         with:
           name: tuned-csvs
           path: aiter/configs/*.csv
+          retention-days: 7
       
       - name: Cleanup
         if: always()

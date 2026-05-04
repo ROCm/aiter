@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: 'Runner to use for the test, e.g. linux-aiter-mi355-1, aiter-1gpu-runner, etc.'
+        description: 'Runner to use for the test, e.g. linux-aiter-mi355-1, linux-aiter-mi300x-1, etc.'
         required: true
         default: 'linux-aiter-mi355-1'
 

@@ -3,6 +3,7 @@
 
 import torch
 import numpy as np
+import flydsl.compiler as flyc
 from itertools import product
 from abc import ABC, abstractmethod
 
@@ -10,6 +11,18 @@ from flydsl._mlir import ir
 from flydsl.expr.typing import T
 
 from flydsl.expr import buffer_ops, range_constexpr, vector
+
+
+def _run_compiled(exe, *args):
+    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
+    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+    """
+    cf = getattr(exe, "_cf", None)
+    if cf is None:
+        cf = flyc.compile(exe, *args)
+        exe._cf = cf
+    else:
+        cf(*args)
 
 
 def _to_raw(v):

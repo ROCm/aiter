@@ -8,7 +8,7 @@
 `FLATMM_HIP_CLANG_PATH=/data/llvm-project/build/bin/ python3 csrc/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_tune.py -i aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv -o aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv --libtype cktile`  
 If you want to use split K kernels, you can add the `-k` parameter at the end, notice that should change `bias` to `bias/(2^k)`.
 This will tune both ck and cktile implementations, if you want to tune cktile only, you can add the `--libtype cktile` parameter at the end.
-You can find the results of the tuning in `aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv`.
+You can find the results of the tuning in `aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv`. The output CSV includes a `gfx` column (e.g. `gfx942`, `gfx950`) as the first column, identifying the GPU architecture. `cu_num` distinguishes partitioned or binned variants of the same architecture (e.g. MI308X vs MI300X both use `gfx942`).
 
 3. Test the performance, modify the test instance in `op_tests/test_gemm_a8w8.py` and run it, please wait a few minutes as it will build gemm_a8w8_bpreshuffle_cktile kernels in `aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv` via jit：  
 `FLATMM_HIP_CLANG_PATH=/data/llvm-project/build/bin/ python3 op_tests/test_gemm_a8w8.py`

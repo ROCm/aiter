@@ -15,6 +15,7 @@ pip install --upgrade "pybind11>=3.0.1"
 pip install --upgrade "ninja>=1.11.1"
 pip install tabulate
 pip install -e .
+./.github/scripts/install_triton.sh
 
 # Read BUILD_TRITON env var, default to 1. If 1, install Triton; if 0, skip installation.
 BUILD_TRITON=${BUILD_TRITON:-1}
