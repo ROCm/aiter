@@ -17,8 +17,7 @@ from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
-from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
-from aiter.utility import fp4_utils
+from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 
 BLOCK_SIZE_M = 32
 
@@ -36,7 +35,6 @@ def _moe_sorting_impl(
     num_local_tokens,
     dispatch_policy,
     use_opus,
-    moe_buf=None,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -49,8 +47,7 @@ def _moe_sorting_impl(
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    if moe_buf is None:
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
     fwd_fn(
@@ -80,7 +77,6 @@ def moe_sorting(
     expert_mask=None,
     num_local_tokens=None,
     dispatch_policy=0,
-    moe_buf=None,
 ):
     try:
         return _moe_sorting_impl(
@@ -94,7 +90,6 @@ def moe_sorting(
             num_local_tokens,
             dispatch_policy,
             use_opus=_USE_OPUS_MOE_SORTING,
-            moe_buf=moe_buf,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -146,7 +141,6 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
-    moe_buf=None,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -172,7 +166,6 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
-        moe_buf=moe_buf,
     )
 
 
@@ -194,16 +187,13 @@ def fused_moe_fake(
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
-    moe_sorting_dispatch_policy: bool = 0,
+    moe_sorting_dispatch_policy: int = 0,
     dtype: Optional[torch.dtype] = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    moe_buf: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if moe_buf is not None:
-        return moe_buf
     device = topk_ids.device
     M, topk = topk_ids.shape
     dtype = hidden_states.dtype if dtype is None else dtype
@@ -231,13 +221,12 @@ def fused_moe_(
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
-    moe_sorting_dispatch_policy: bool = 0,
+    moe_sorting_dispatch_policy: int = 0,
     dtype: Optional[torch.dtype] = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    moe_buf: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -316,7 +305,6 @@ def fused_moe_(
         expert_mask,
         num_local_tokens,
         moe_sorting_dispatch_policy,
-        moe_buf=moe_buf,
     )
 
     if metadata.run_1stage:
@@ -465,12 +453,12 @@ def fused_moe_1stage(
         token_num = hidden_states.shape[0]
         E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
         if quant_type == QuantType.per_1x32:
-            a1_scale = fp4_utils.moe_mxfp4_sort(
+            a1_scale = mxfp4_moe_sort_fwd(
                 a1_scale,
-                sorted_ids,
-                num_valid_ids,
-                token_num,
-                block_size_M,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                cols=model_dim,
             )
             w1_scale = w1_scale.view(E, -1)
             w2_scale = w2_scale.view(E, -1)
@@ -1192,12 +1180,12 @@ def fused_moe_2stages(
             # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
             # skip re-quantization, only sort the scale
             a1 = hidden_states
-            a1_scale = fp4_utils.moe_mxfp4_sort(
+            a1_scale = mxfp4_moe_sort_fwd(
                 a1_scale,
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
-                block_size=block_size_M,
+                cols=model_dim,
             )
         elif token_num <= token_num_quant_moe_sort_switch:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
@@ -1215,12 +1203,12 @@ def fused_moe_2stages(
                 quant_dtype=q_dtype_a,
                 num_rows=num_local_tokens,
             )
-            a1_scale = fp4_utils.moe_mxfp4_sort(
+            a1_scale = mxfp4_moe_sort_fwd(
                 a1_scale,
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
-                block_size=block_size_M,
+                cols=model_dim,
             )
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
@@ -1334,12 +1322,12 @@ def fused_moe_2stages(
                 num_rows=num_local_tokens,
                 num_rows_factor=topk,
             )
-            a2_scale = fp4_utils.moe_mxfp4_sort(
+            a2_scale = mxfp4_moe_sort_fwd(
                 a2_scale[: token_num * topk, :].view(token_num, topk, -1),
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
-                block_size=block_size_M,
+                cols=inter_dim,
             )
         a2 = a2.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
