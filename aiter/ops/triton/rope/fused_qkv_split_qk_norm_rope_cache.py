@@ -38,8 +38,8 @@ def fused_qkv_split_qk_norm_rope_cache(
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
-    key_cache: torch.Tensor,  # Paged KV Cache [num_blocks, num_heads, block_size, head_dim]
-    value_cache: torch.Tensor,  # Paged KV Cache [num_blocks, num_heads, block_size, head_dim]
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,  # Mapping from token index to physical slot [T]
     qh: int,
     kvh: int,
@@ -52,10 +52,17 @@ def fused_qkv_split_qk_norm_rope_cache(
     v_scale: torch.Tensor = None,
     eps: float = 1e-5,
     gated_qkv_layout: str = "interleaved",
+    kv_cache_layout: str = "HND",
 ):
     """Split packed ``qkv``, RMSNorm Q and K, apply RoPE, write K/V into paged caches.
 
-    Shapes follow ``qh`` / ``kvh`` / ``head_dim``. For RoPE, ``rotary_dim_half`` refers
+    Shapes follow ``qh`` / ``kvh`` / ``head_dim``. Paged KV layout is selected by
+    ``kv_cache_layout``:
+
+    - ``"HND"``: ``[num_blocks, num_kv_heads, block_size, head_dim]`` (default).
+    - ``"NHD"``: ``[num_blocks, block_size, num_kv_heads, head_dim]``.
+
+    For RoPE, ``rotary_dim_half`` refers
     to the half-width of the rotated subspace. The required ``cos`` / ``sin`` last-dim
     shape depends on ``reuse_freqs_front_part``: when True, ``cos.shape[-1]`` and
     ``sin.shape[-1]`` are the half-width (that is, ``rotary_dim_half``); when False,
@@ -63,9 +70,8 @@ def fused_qkv_split_qk_norm_rope_cache(
     ``reuse_freqs_front_part`` flag must match how ``cos``/``sin`` were built for
     partial rotation. When ``attn_output_gate`` is True, ``gated_qkv_layout`` is
     ``"interleaved"`` (Q then gate per head in the flat Q+gate region) or ``"blocked"``
-    (all Q then all gate). Paged layout is inferred from ``key_cache`` /
-    ``value_cache`` (block size is ``shape[2]``); ``slot_mapping`` maps each token row
-    to a physical slot index.
+    (all Q then all gate). Block size and strides follow ``kv_cache_layout``;
+    ``slot_mapping`` maps each token row to a physical slot index.
 
     Args:
         qkv: ``[T, packed_dim]`` flat tensor (Q [+ gate], K, V).
@@ -73,7 +79,7 @@ def fused_qkv_split_qk_norm_rope_cache(
         cos, sin: RoPE tables. If ``reuse_freqs_front_part`` is True, the last dim is
             the rotary half-width; if False, the last dim is the full rotary width.
         positions: Token positions into the RoPE table.
-        key_cache, value_cache: ``[num_blocks, heads, block_size, head_dim]``.
+        key_cache, value_cache: Same rank-4 shape; layout per ``kv_cache_layout``.
         slot_mapping: ``[T]`` int32 (or index dtype), slot per token for cache write.
         qh: Total query heads; ``kvh`` key/value heads; ``head_dim`` per-head size.
         is_neox: NeoX vs GPT-J rotation style.
@@ -89,15 +95,57 @@ def fused_qkv_split_qk_norm_rope_cache(
             corresponds to ``cos.shape[-1]`` only in reuse mode; in non-reuse mode the
             table last dim is the full rotary width, ``2 * rotary_dim_half``.
         gated_qkv_layout: ``"interleaved"`` or ``"blocked"`` when ``attn_output_gate``.
+        kv_cache_layout: ``"HND"`` or ``"NHD"`` (case-insensitive).
     """
     T = qkv.shape[0]
     q_size = qh * head_dim
     kv_size = kvh * head_dim
 
-    # Get Paged Attention block size from cache shape (usually 16 or 32)
-    # Cache shape: [num_blocks, num_heads, block_size, head_dim]
+    layout = kv_cache_layout.upper()
+    if layout not in ("HND", "NHD"):
+        raise ValueError(
+            'kv_cache_layout must be "HND" or "NHD" '
+            f"(got {kv_cache_layout!r})."
+        )
+    if key_cache.shape != value_cache.shape:
+        raise ValueError(
+            "key_cache and value_cache must have the same shape "
+            f"(got {tuple(key_cache.shape)} vs {tuple(value_cache.shape)})."
+        )
     num_blocks = key_cache.shape[0]
-    block_size = key_cache.shape[2]
+    if layout == "HND":
+        if key_cache.shape[1] != kvh or key_cache.shape[3] != head_dim:
+            raise ValueError(
+                "HND key_cache expected "
+                f"[num_blocks, {kvh}, block_size, {head_dim}], "
+                f"got {tuple(key_cache.shape)}."
+            )
+        block_size = key_cache.shape[2]
+        key_cache_stride_t = key_cache.stride(0)
+        key_cache_stride_h = key_cache.stride(1)
+        key_cache_stride_b = key_cache.stride(2)
+        key_cache_stride_d = key_cache.stride(3)
+        value_cache_stride_t = value_cache.stride(0)
+        value_cache_stride_h = value_cache.stride(1)
+        value_cache_stride_b = value_cache.stride(2)
+        value_cache_stride_d = value_cache.stride(3)
+    else:
+        if key_cache.shape[2] != kvh or key_cache.shape[3] != head_dim:
+            raise ValueError(
+                "NHD key_cache expected "
+                f"[num_blocks, block_size, {kvh}, {head_dim}], "
+                f"got {tuple(key_cache.shape)}."
+            )
+        block_size = key_cache.shape[1]
+        key_cache_stride_t = key_cache.stride(0)
+        key_cache_stride_b = key_cache.stride(1)
+        key_cache_stride_h = key_cache.stride(2)
+        key_cache_stride_d = key_cache.stride(3)
+        value_cache_stride_t = value_cache.stride(0)
+        value_cache_stride_b = value_cache.stride(1)
+        value_cache_stride_h = value_cache.stride(2)
+        value_cache_stride_d = value_cache.stride(3)
+
     total_num_kv_cache_tokens = num_blocks * block_size
 
     assert qh >= kvh and qh % kvh == 0, "qh must be multiple of kvh"
@@ -162,14 +210,14 @@ def fused_qkv_split_qk_norm_rope_cache(
         stride_kv_t=k.stride(0),
         stride_kv_h=k.stride(1),
         stride_kv_d=k.stride(2),
-        key_cache_stride_t=key_cache.stride(0),
-        key_cache_stride_h=key_cache.stride(1),
-        key_cache_stride_d=key_cache.stride(3),  # head_dim stride
-        key_cache_stride_b=key_cache.stride(2),  # block_size stride
-        value_cache_stride_t=value_cache.stride(0),
-        value_cache_stride_h=value_cache.stride(1),
-        value_cache_stride_d=value_cache.stride(3),
-        value_cache_stride_b=value_cache.stride(2),
+        key_cache_stride_t=key_cache_stride_t,
+        key_cache_stride_h=key_cache_stride_h,
+        key_cache_stride_d=key_cache_stride_d,
+        key_cache_stride_b=key_cache_stride_b,
+        value_cache_stride_t=value_cache_stride_t,
+        value_cache_stride_h=value_cache_stride_h,
+        value_cache_stride_d=value_cache_stride_d,
+        value_cache_stride_b=value_cache_stride_b,
         REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
         IS_NEOX=is_neox,
         HAVE_POS=(positions is not None),

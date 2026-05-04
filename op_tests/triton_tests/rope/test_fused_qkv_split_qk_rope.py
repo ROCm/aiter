@@ -195,6 +195,7 @@ def run_torch_with_cache(
     k_scale,
     v_scale,
     qkv_layout: str = "interleaved",
+    cache_layout: str = "HND",
 ):
     """Reference: split QKV, RMSNorm Q/K, RoPE, optional KV de-scale, paged KV write.
 
@@ -219,6 +220,7 @@ def run_torch_with_cache(
         k_scale: Optional scalar scale for K before cache write (``None`` => 1).
         v_scale: Optional scalar scale for V before cache write (``None`` => 1).
         qkv_layout: ``"interleaved"`` or ``"blocked"`` gated layout; ignored when not gated.
+        cache_layout: ``"HND"`` or ``"NHD"`` paged KV tensor layout for the reference caches.
     """
     QH = QH_PER_KH * KH
     q_size = QH * D
@@ -273,20 +275,37 @@ def run_torch_with_cache(
     v_descaled = v * v_scale_rcprl
 
     # 4. Reference Caching (Paged)
-    k_cache = torch.zeros(
-        (num_blocks, KH, block_size, D), dtype=qkv.dtype, device="cuda"
-    )
-    v_cache = torch.zeros(
-        (num_blocks, KH, block_size, D), dtype=qkv.dtype, device="cuda"
-    )
-
-    for i in range(qkv.shape[0]):
-        slot = slot_mapping[i].item()
-        if slot >= 0:
-            b = slot // block_size
-            s = slot % block_size
-            k_cache[b, :, s, :] = k_descaled[i]
-            v_cache[b, :, s, :] = v_descaled[i]
+    cl = cache_layout.upper()
+    if cl == "HND":
+        k_cache = torch.zeros(
+            (num_blocks, KH, block_size, D), dtype=qkv.dtype, device="cuda"
+        )
+        v_cache = torch.zeros(
+            (num_blocks, KH, block_size, D), dtype=qkv.dtype, device="cuda"
+        )
+        for i in range(qkv.shape[0]):
+            slot = slot_mapping[i].item()
+            if slot >= 0:
+                b = slot // block_size
+                s = slot % block_size
+                k_cache[b, :, s, :] = k_descaled[i]
+                v_cache[b, :, s, :] = v_descaled[i]
+    elif cl == "NHD":
+        k_cache = torch.zeros(
+            (num_blocks, block_size, KH, D), dtype=qkv.dtype, device="cuda"
+        )
+        v_cache = torch.zeros(
+            (num_blocks, block_size, KH, D), dtype=qkv.dtype, device="cuda"
+        )
+        for i in range(qkv.shape[0]):
+            slot = slot_mapping[i].item()
+            if slot >= 0:
+                b = slot // block_size
+                s = slot % block_size
+                k_cache[b, s, :, :] = k_descaled[i]
+                v_cache[b, s, :, :] = v_descaled[i]
+    else:
+        raise ValueError(cache_layout)
 
     if attn_output_gate:
         return q, gate, k, v, k_cache, v_cache
@@ -312,6 +331,7 @@ def run_torch_with_cache(
 @pytest.mark.parametrize("use_kv_scale", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("qkv_layout", ["interleaved", "blocked"])
+@pytest.mark.parametrize("cache_layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
     "rotary_dim",
     [None, 32],
@@ -330,6 +350,7 @@ def test_fused_qkv_split_qk_rope_with_cache(
     use_kv_scale,
     dtype,
     qkv_layout,
+    cache_layout,
     rotary_dim,
 ):
     """E2E ``fused_qkv_split_qk_norm_rope_cache`` vs torch reference (norm, RoPE, paged KV).
@@ -351,6 +372,7 @@ def test_fused_qkv_split_qk_rope_with_cache(
         dtype: Tensor dtype (grid uses ``torch.bfloat16`` only).
         qkv_layout: Gated packing: ``"interleaved"`` or ``"blocked"``; non-gated
             ``blocked`` cases are skipped.
+        cache_layout: Paged KV tensor layout, ``"HND"`` or ``"NHD"``.
         rotary_dim: RoPE span in features along the head dim; ``None`` means full ``D``,
             ``32`` exercises partial RoPE when ``D`` is 64 or 128.
     """
@@ -394,8 +416,20 @@ def test_fused_qkv_split_qk_rope_with_cache(
 
     # Setup Paged Cache
     num_blocks = (B + block_size - 1) // block_size + 2  # Extra blocks for safety
-    k_cache = torch.zeros((num_blocks, KH, block_size, D), dtype=dtype, device="cuda")
-    v_cache = torch.zeros((num_blocks, KH, block_size, D), dtype=dtype, device="cuda")
+    if cache_layout.upper() == "HND":
+        k_cache = torch.zeros(
+            (num_blocks, KH, block_size, D), dtype=dtype, device="cuda"
+        )
+        v_cache = torch.zeros(
+            (num_blocks, KH, block_size, D), dtype=dtype, device="cuda"
+        )
+    else:
+        k_cache = torch.zeros(
+            (num_blocks, block_size, KH, D), dtype=dtype, device="cuda"
+        )
+        v_cache = torch.zeros(
+            (num_blocks, block_size, KH, D), dtype=dtype, device="cuda"
+        )
 
     # Random slot mapping (shuffled unique slots)
     slot_mapping = torch.randperm(num_blocks * block_size)[:B].to(torch.int32).cuda()
@@ -422,6 +456,7 @@ def test_fused_qkv_split_qk_rope_with_cache(
         v_scale=v_scale,
         attn_output_gate=attn_output_gate,
         gated_qkv_layout=qkv_layout,
+        kv_cache_layout=cache_layout,
     )
     if attn_output_gate:
         q_tri, gate_tri, k_tri, v_tri = tri_result
@@ -447,6 +482,7 @@ def test_fused_qkv_split_qk_rope_with_cache(
         k_scale,
         v_scale,
         qkv_layout=qkv_layout,
+        cache_layout=cache_layout,
     )
 
     if attn_output_gate:
