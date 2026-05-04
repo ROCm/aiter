@@ -522,7 +522,8 @@ def fused_moe_1stage(
 
 @functools.lru_cache(maxsize=2048)
 def get_block_size_M(token, topk, expert, inter_dim):
-    cu_num = get_cu_num()
+    # _cached_cu_num is a module-level constant: hardware is fixed for the process lifetime
+    cu_num = _cached_cu_num
     tileN = 128
     tgN = (inter_dim + tileN - 1) // tileN
     support_list = [32, 64, 128]
@@ -553,7 +554,8 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
     # only for moe_blk gemm1 a8w8 decode scenario
     if token * topk > expert:
         return 0
-    cu_num = get_cu_num()
+    # _cached_cu_num is a module-level constant: hardware is fixed for the process lifetime
+    cu_num = _cached_cu_num
     tileN = 128
 
     tgM = token * topk  # decode tile num
@@ -702,7 +704,6 @@ def _flydsl_stage2_wrapper(
     bias2=None,
     **_kwargs,
 ):
-
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
@@ -805,7 +806,8 @@ def get_2stage_cfgs(
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
-    cu_num = get_cu_num()
+    # Use module-level cached CU count — hardware constant, process-lifetime invariant.
+    cu_num = _cached_cu_num
     keys = (
         cu_num,
         token,
@@ -876,6 +878,8 @@ def get_2stage_cfgs(
         kernelName2 = ""
         run_1stage = False
         run_1stage_xbf16 = False
+        # Use module-level cached GFX string — hardware constant, process-lifetime invariant.
+        gfx = _cached_gfx
         if (
             activation,
             q_type,
@@ -884,7 +888,7 @@ def get_2stage_cfgs(
             q_dtype_w,
             use_g1u1,
             doweight_stage1,
-        ) in fused_moe_1stage_dict[get_gfx()]:
+        ) in fused_moe_1stage_dict[gfx]:
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = token > 32 and (inter_dim % 128 == 0)
@@ -895,7 +899,7 @@ def get_2stage_cfgs(
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
 
-            if run_1stage and q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
+            if run_1stage and q_type == QuantType.per_1x128 and gfx == "gfx950":
                 run_1stage_xbf16 = int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
 
         block_m = (
@@ -1864,8 +1868,6 @@ def cktile_moe_stage2(
     bias2=None,
     kernel_name="",
 ):
-    # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
-
     # out = torch.empty(
     #     (token_num, D),
     #     dtype=a2.dtype,
@@ -1913,7 +1915,7 @@ def fused_topk(
     )
 
     if (
-        get_gfx() in ["gfx942", "gfx950"]
+        _cached_gfx in ["gfx942", "gfx950"]
         and (expert, topk)
         in [
             (128, 4),
