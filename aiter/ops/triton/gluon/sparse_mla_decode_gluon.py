@@ -534,20 +534,37 @@ def sparse_mla_decode_gluon(
         f"if your caller emits unaligned topk, round up by padding with -1"
     )
 
-    # NUM_KV_SPLITS picker: preserves `gl.assume(num_iter > 3)`.
+    # NUM_KV_SPLITS picker.
+    #
+    # `gl.assume(num_iter > 3)` requires each split to have > PIPELINE_STAGES
+    # iterations, but the 3-stage software pipeline only earns back its
+    # startup+drain overhead in two regimes (calibrated by sweep on V4
+    # shapes batch ∈ {1..32}, topk ∈ {256, 512, 1024}, MI355X):
+    #
+    #   regime A: num_iter_total <  16  (covers SWA topk=128→256 pad, HCA topk=512)
+    #             → splits=1.  Each split would be too short, the launch +
+    #               Q-load + stage-2 reduce overhead dominates.  Empirically
+    #               splits=2 was ~20% slower for topk=512.
+    #   regime B: num_iter_total >= 16  (CSA topk=1024)
+    #             → splits up to min(target, num_iter_total//4, 4).
+    #               4 iters per split is enough to amortize, and we cap at 4
+    #               so the stage-2 reduce kernel doesn't dominate.
+    #
     # When attn_sink is in-kernel or return_lse is requested, force splits=1
     # (the stage-2 reduce kernel doesn't fold sink and doesn't emit lse).
+    SPLIT_BENEFIT_TOTAL_ITER_FLOOR = 16
+    SPLIT_MIN_ITER_PER_SPLIT = 4
     num_iter_total = topk_count // BLOCK_N
-    if attn_sink is not None or return_lse:
+    if attn_sink is not None or return_lse or num_iter_total < SPLIT_BENEFIT_TOTAL_ITER_FLOOR:
         NUM_KV_SPLITS = 1
     else:
         # Aim for ~256 workgroups (one wave on MI350) but cap so each split
-        # still has > 3 iterations.
+        # still has >= SPLIT_MIN_ITER_PER_SPLIT iterations.
         TARGET_GRID = 256
         max_xcds = max(1, NUM_XCDS)
         base_grid = max_xcds * triton.cdiv(nhead, BLOCK_H) * max(1, batch_size // max_xcds)
         target = max(1, triton.next_power_of_2(triton.cdiv(TARGET_GRID, base_grid)))
-        max_by_iter = max(1, num_iter_total // (PIPELINE_STAGES + 1))
+        max_by_iter = max(1, num_iter_total // SPLIT_MIN_ITER_PER_SPLIT)
         # Round down to power of 2 <= max_by_iter
         max_by_iter_p2 = 1
         while max_by_iter_p2 * 2 <= max_by_iter:
