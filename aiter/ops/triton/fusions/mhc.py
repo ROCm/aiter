@@ -6,10 +6,9 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.fusions import (
-    _mhc_reduce_splitc_kernel,
     _mhc_fused_kernel,
     _mhc_fused_split_kernel,
-    _mhc_fused_reduce_kernel,
+    _mhc_reduce_apply_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.mhc_config_utils import get_mhc_config
@@ -77,12 +76,13 @@ def mhc(
 
     n_squared = n * n
     N_POW2 = triton.next_power_of_2(n)
+    N_POW2_RES = triton.next_power_of_2(n_squared)
 
     if config is None:
         config, _ = get_mhc_config("MHC_FUSED", M, C, mode="sinkhorn")
     config = dict(config)  # Always copy to avoid mutating LRU cache
 
-    num_ksplit = config.get("NUM_KSPLIT", 1)
+    num_ksplit = config.pop("NUM_KSPLIT", 1)
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
     BLOCK_N = triton.next_power_of_2(config.pop("BLOCK_N", n_squared))
 
@@ -94,35 +94,27 @@ def mhc(
     # Ensure BLOCK_K doesn't exceed K dimension
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
 
-    # Hybrid dispatch for fusing layer_input in the pre-stream:
-    # - Large C: launch dedicated `_mhc_reduce_splitc_kernel` after the GEMM.
-    # - Small C: run apply inline inside the fused/reduce kernel (avoids ~10-20us launch overhead).
-    DEFAULT_REDUCE_SPLITC_THRESHOLD = 4096
-    use_reduce_splitc = bool(
-        config.pop("USE_REDUCE_SPLITC", C >= DEFAULT_REDUCE_SPLITC_THRESHOLD)
-    )
-
-    # Reduce-splitC kernel block sizes (only used when use_reduce_splitc)
-    BLOCK_M_SPLITC = config.pop(
-        "BLOCK_M_SPLITC", 32 if M >= 32 else triton.next_power_of_2(M)
-    )
-    BLOCK_C_SPLITC = config.pop("BLOCK_C_SPLITC", min(128, triton.next_power_of_2(C)))
-
-    # Inline-path apply-tile budget (only used when not use_reduce_splitc). The 3D tile
-    # (BLOCK_M, N_POW2, BLOCK_C) f32 must stay within ~64 KB to avoid VGPR spills.
+    # Apply-tile budget. The 3D tile (BLOCK_M, N_POW2, BLOCK_C) f32 must stay within
+    # ~64 KB to avoid VGPR spills. Used by the inline pre-stream apply in
+    # `_mhc_fused_kernel` and by every pid in `_mhc_reduce_apply_kernel`.
     BLOCK_C = min(BLOCK_K, triton.next_power_of_2(C))
     apply_tile_budget = 64 * 1024
     max_block_c = max(1, apply_tile_budget // (BLOCK_M * N_POW2))
     BLOCK_C = min(BLOCK_C, 1 << (max_block_c.bit_length() - 1))
+
+    # Pin h_post to pid_c == 0 and h_res (with the sinkhorn loop) to pid_c == 1
+    # in `_mhc_reduce_apply_kernel`. When only one C-tile per M-tile exists,
+    # fall back to pid_c == 0 doing both. Resolved at compile time via constexpr.
+    NUM_C_BLOCKS = triton.cdiv(C, BLOCK_C)
+    RES_PID_C = 0 if NUM_C_BLOCKS == 1 else 1
 
     _LOGGER.info(
         f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} "
         f"alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} "
         f"hc_pre_eps={hc_pre_eps} hc_post_mult_value={hc_post_mult_value} "
         f"sinkhorn_iters={sinkhorn_iters} num_ksplit={num_ksplit} "
-        f"BLOCK_N={BLOCK_N} BLOCK_C={BLOCK_C} "
-        f"use_reduce_splitc={use_reduce_splitc} "
-        f"BLOCK_M_SPLITC={BLOCK_M_SPLITC} BLOCK_C_SPLITC={BLOCK_C_SPLITC}"
+        f"BLOCK_M={BLOCK_M} BLOCK_N={BLOCK_N} BLOCK_K={BLOCK_K} BLOCK_C={BLOCK_C} "
+        f"RES_PID_C={RES_PID_C}"
     )
 
     assert K == K_phi, f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
@@ -145,12 +137,18 @@ def mhc(
         BLOCK_N >= n
     ), f"BLOCK_N ({BLOCK_N}) must be >= n ({n}) for the apply-pre fusion"
     # In-kernel SK requires a single program to own the full (n, n) res tile and
-    # uses tl.reshape((BLOCK_M, BLOCK_N) -> (BLOCK_M, n, n)), which needs the
-    # tile to be exactly n_squared columns wide.
+    # reshapes its res sub-tile to (BLOCK_M, n, n); both kernels need
+    # n_squared to be a power of 2 (i.e. N_POW2_RES == n_squared) for the reshape
+    # to compile, and the non-split-K kernel additionally needs BLOCK_N == n_squared.
     if sinkhorn_iters > 0:
         assert BLOCK_N == n_squared, (
             f"sinkhorn_iters>0 requires BLOCK_N ({BLOCK_N}) == n_squared "
             f"({n_squared}); for non-power-of-2 n, run with sinkhorn_iters=0."
+        )
+        assert N_POW2_RES == n_squared, (
+            f"sinkhorn_iters>0 requires n_squared ({n_squared}) to be a power of 2; "
+            f"got N_POW2_RES={N_POW2_RES}. For non-power-of-2 n, run with "
+            f"sinkhorn_iters=0."
         )
 
     N = N_total
@@ -158,19 +156,15 @@ def mhc(
     N_out_post_res = n + n_squared
     out = torch.empty(M, N_out_post_res, dtype=x.dtype, device=x.device)
     layer_input = torch.empty(M, C, dtype=x.dtype, device=x.device)
-    if use_reduce_splitc:
-        pre_mix_buf = torch.empty(M, n, dtype=torch.float32, device=x.device)
-    else:
-        # Dummy ptr; the kernel never reads/writes it when USE_REDUCE_SPLITC=False.
-        pre_mix_buf = layer_input
 
-    # Stream-aware grid: Each program processes exactly one stream
+    # Stream-aware grid for the non-split-K fused kernel: one program per stream per M-tile
     n_blocks_pre = triton.cdiv(n, BLOCK_N)
     n_blocks_post = triton.cdiv(n, BLOCK_N)
     total_n_blocks = n_blocks_pre + n_blocks_post + n_blocks_res
 
     if num_ksplit > 1:
-        # Split-K path: use split and reduce kernels.
+        # Split-K path: split GEMM kernel, then a single (M, C)-parallel reduce-apply
+        # kernel that fuses RMS reduce, all 3 stream activations, and the apply step.
         splitk_block_size = triton.cdiv(K, num_ksplit)
         actual_ksplit = triton.cdiv(K, splitk_block_size)
 
@@ -208,17 +202,16 @@ def mhc(
             **config,
         )
 
-        grid_reduce = (triton.cdiv(M, BLOCK_M), total_n_blocks)
-        _mhc_fused_reduce_kernel[grid_reduce](
+        grid_reduce_apply = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_C))
+        _mhc_reduce_apply_kernel[grid_reduce_apply](
             acc_partial,
             acc_sq_partial,
             alpha_pre,
             alpha_post,
             alpha_res,
             bias,
-            out,
-            pre_mix_buf,
             x,
+            out,
             layer_input,
             M=M,
             K=K,
@@ -234,21 +227,19 @@ def mhc(
             stride_acc_n=acc_partial.stride(2),
             stride_acc_sq_k=acc_sq_partial.stride(0),
             stride_acc_sq_m=acc_sq_partial.stride(1),
-            stride_out_m=out.stride(0),
-            stride_out_n=out.stride(1),
-            stride_pm=pre_mix_buf.stride(0),
-            stride_pn=pre_mix_buf.stride(1),
             stride_xm=x.stride(0),
             stride_xk=x.stride(1),
+            stride_out_m=out.stride(0),
+            stride_out_n=out.stride(1),
             stride_li_m=layer_input.stride(0),
             stride_li_c=layer_input.stride(1),
             BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
             BLOCK_C=BLOCK_C,
             N_POW2=N_POW2,
+            N_POW2_RES=N_POW2_RES,
             ACTUAL_KSPLIT=actual_ksplit,
             NUM_SINKHORN_ITERS=sinkhorn_iters,
-            USE_REDUCE_SPLITC=use_reduce_splitc,
+            RES_PID_C=RES_PID_C,
             **config,
         )
     else:
@@ -261,7 +252,6 @@ def mhc(
             alpha_res,
             bias,
             out,
-            pre_mix_buf,
             layer_input,
             M=M,
             K=K,
@@ -278,8 +268,6 @@ def mhc(
             stride_phi_n=phi.stride(1),
             stride_out_m=out.stride(0),
             stride_out_n=out.stride(1),
-            stride_pm=pre_mix_buf.stride(0),
-            stride_pn=pre_mix_buf.stride(1),
             stride_li_m=layer_input.stride(0),
             stride_li_c=layer_input.stride(1),
             BLOCK_M=BLOCK_M,
@@ -288,31 +276,7 @@ def mhc(
             BLOCK_C=BLOCK_C,
             N_POW2=N_POW2,
             NUM_SINKHORN_ITERS=sinkhorn_iters,
-            USE_REDUCE_SPLITC=use_reduce_splitc,
             **config,
-        )
-
-    if use_reduce_splitc:
-        # Apply step (Eq 17): layer_input[m, c] = sum_i pre_mix[m, i] * x[m, i*C + c].
-        # Dedicated kernel with an (M_blocks, C_blocks) grid that exposes C-axis
-        # parallelism the fused kernel cannot.
-        grid_apply = (triton.cdiv(M, BLOCK_M_SPLITC), triton.cdiv(C, BLOCK_C_SPLITC))
-        _mhc_reduce_splitc_kernel[grid_apply](
-            x,
-            pre_mix_buf,
-            layer_input,
-            M=M,
-            C=C,
-            n=n,
-            stride_xm=x.stride(0),
-            stride_xk=x.stride(1),
-            stride_pm=pre_mix_buf.stride(0),
-            stride_pn=pre_mix_buf.stride(1),
-            stride_om=layer_input.stride(0),
-            stride_oc=layer_input.stride(1),
-            BLOCK_M=BLOCK_M_SPLITC,
-            BLOCK_C=BLOCK_C_SPLITC,
-            N_POW2=N_POW2,
         )
 
     # `out` layout is [post + res]: out[:, :n] is H^post, out[:, n:] is H^res

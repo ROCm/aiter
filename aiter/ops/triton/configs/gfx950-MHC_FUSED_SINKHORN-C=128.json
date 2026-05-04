@@ -5,8 +5,7 @@
         "NUM_KSPLIT": 1,
         "num_warps": 8,
         "num_stages": 1,
-        "waves_per_eu": 2,
-        "USE_REDUCE_SPLITC": false
+        "waves_per_eu": 2
     },
     "M_LEQ_16": {
         "BLOCK_M": 32,
@@ -14,8 +13,7 @@
         "NUM_KSPLIT": 1,
         "num_warps": 8,
         "num_stages": 1,
-        "waves_per_eu": 2,
-        "USE_REDUCE_SPLITC": false
+        "waves_per_eu": 2
     },
     "M_LEQ_64": {
         "BLOCK_M": 32,
@@ -23,8 +21,7 @@
         "NUM_KSPLIT": 1,
         "num_warps": 8,
         "num_stages": 1,
-        "waves_per_eu": 2,
-        "USE_REDUCE_SPLITC": false
+        "waves_per_eu": 2
     },
     "M_LEQ_256": {
         "BLOCK_M": 32,
@@ -32,8 +29,7 @@
         "NUM_KSPLIT": 1,
         "num_warps": 8,
         "num_stages": 1,
-        "waves_per_eu": 1,
-        "USE_REDUCE_SPLITC": false
+        "waves_per_eu": 1
     },
     "M_LEQ_1024": {
         "BLOCK_M": 32,
@@ -41,8 +37,7 @@
         "NUM_KSPLIT": 1,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 1,
-        "USE_REDUCE_SPLITC": false
+        "waves_per_eu": 1
     },
     "M_LEQ_2048": {
         "BLOCK_M": 32,
@@ -50,8 +45,7 @@
         "NUM_KSPLIT": 1,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 1,
-        "USE_REDUCE_SPLITC": false
+        "waves_per_eu": 1
     },
     "M_LEQ_4096": {
         "BLOCK_M": 32,
@@ -59,8 +53,7 @@
         "NUM_KSPLIT": 1,
         "num_warps": 2,
         "num_stages": 1,
-        "waves_per_eu": 1,
-        "USE_REDUCE_SPLITC": false
+        "waves_per_eu": 1
     },
     "M_LEQ_8192": {
         "BLOCK_M": 64,
@@ -68,8 +61,7 @@
         "NUM_KSPLIT": 1,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 2,
-        "USE_REDUCE_SPLITC": false
+        "waves_per_eu": 2
     },
     "M_LEQ_16384": {
         "BLOCK_M": 64,
@@ -77,10 +69,7 @@
         "NUM_KSPLIT": 1,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 0,
-        "USE_REDUCE_SPLITC": true,
-        "BLOCK_M_SPLITC": 16,
-        "BLOCK_C_SPLITC": 128
+        "waves_per_eu": 0
     },
     "any": {
         "BLOCK_M": 64,
@@ -88,9 +77,6 @@
         "NUM_KSPLIT": 1,
         "num_warps": 4,
         "num_stages": 1,
-        "waves_per_eu": 0,
-        "USE_REDUCE_SPLITC": true,
-        "BLOCK_M_SPLITC": 16,
-        "BLOCK_C_SPLITC": 128
+        "waves_per_eu": 0
     }
 }

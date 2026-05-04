@@ -56,8 +56,7 @@ def _mhc_fused_kernel(
     alpha_res,
     bias_ptr,
     out_ptr,  # Shrunk output: (M, n + n_squared), layout [post | res]
-    pre_mix_ptr,  # (M, n) fp32; consumed by `_mhc_reduce_splitc_kernel` when USE_REDUCE_SPLITC=True
-    layer_input_ptr,  # (M, C); written directly when USE_REDUCE_SPLITC=False (inline apply)
+    layer_input_ptr,  # (M, C); written directly via the inline apply step
     M: tl.constexpr,
     K: tl.constexpr,
     N: tl.constexpr,
@@ -73,28 +72,22 @@ def _mhc_fused_kernel(
     stride_phi_n,  # Stride for N dimension (total_cols)
     stride_out_m,  # Stride for M dimension
     stride_out_n,  # Stride for N dimension (post + res)
-    stride_pm,  # Stride for M dimension of pre_mix
-    stride_pn,  # Stride for n dimension of pre_mix
-    stride_li_m,  # Stride for M dimension of layer_input (inline path)
-    stride_li_c,  # Stride for C dimension of layer_input (inline path)
+    stride_li_m,  # Stride for M dimension of layer_input
+    stride_li_c,  # Stride for C dimension of layer_input
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_C: tl.constexpr,
     N_POW2: tl.constexpr,
-    NUM_KSPLIT: tl.constexpr,
     NUM_SINKHORN_ITERS: tl.constexpr,
-    USE_REDUCE_SPLITC: tl.constexpr,
 ):
     """
-    Fused kernel for mHC equations 14-18 (pre/post/res streams).
+    Fused kernel for mHC equations 14-18 + the apply step (non-split-K path).
 
     Computes three separate outputs:
-    - H^pre: (M, n) - sigmoid activation (Eq 17) and dispatches on `USE_REDUCE_SPLITC`:
-        * True  -> stores `pre_mix = sigmoid(H_pre) + hc_pre_eps` to `pre_mix_ptr`
-                   for `_mhc_reduce_splitc_kernel` to consume (large-C path with C-axis parallelism).
-        * False -> runs the inline 3D-broadcast apply directly to `layer_input_ptr`
-                   (small-C path that avoids the extra apply-kernel launch overhead).
+    - H^pre: (M, n) - sigmoid activation (Eq 17). The pre-stream program runs
+      the inline 3D-broadcast apply directly to `layer_input_ptr`, producing
+      ``layer_input[m, c] = sum_i (sigmoid(H_pre[m, i]) + hc_pre_eps) * x[m, i*C + c]``.
     - H^post: (M, n) with hc_post_mult_value * sigmoid activation (Eq 18)
     - H^res: (M, n, n) doubly-stochastic Sinkhorn-Knopp output when
       NUM_SINKHORN_ITERS > 0 (Eq 19), or raw logits when 0.
@@ -176,42 +169,33 @@ def _mhc_fused_kernel(
 
     if is_pre_program:
         pre_mix = tl.sigmoid(out) + hc_pre_eps  # (BLOCK_M, BLOCK_N)
-        if USE_REDUCE_SPLITC:
-            # Stash `pre_mix` for `_mhc_reduce_splitc_kernel` to consume
-            tl.store(
-                pre_mix_ptr + rm[:, None] * stride_pm + rn_local[None, :] * stride_pn,
-                pre_mix,
-                mask=(rm[:, None] < M) & (rn_local[None, :] < n),
+        # Run the apply step inline via a 3D-broadcast reduction
+        i_n = tl.arange(0, N_POW2)
+        pre_mix_2d = tl.sum(
+            tl.where(
+                rn_local[None, None, :] == i_n[None, :, None],
+                pre_mix[:, None, :],
+                0.0,
+            ),
+            axis=2,
+        )  # (BLOCK_M, N_POW2)
+        for c0 in range(0, C, BLOCK_C):
+            rc = c0 + tl.arange(0, BLOCK_C)
+            _mhc_apply_pre_mix_tile(
+                x_ptr,
+                layer_input_ptr,
+                pre_mix_2d,
+                rm,
+                rc,
+                i_n,
+                M,
+                C,
+                n,
+                stride_xm,
+                stride_xk,
+                stride_li_m,
+                stride_li_c,
             )
-        else:
-            # Run the apply step inline via a 3D-broadcast reduction
-            pre_mix_n = tl.where(rn_local[None, :] < n, pre_mix, 0.0)
-            i_n = tl.arange(0, N_POW2)
-            pre_mix_2d = tl.sum(
-                tl.where(
-                    rn_local[None, None, :] == i_n[None, :, None],
-                    pre_mix_n[:, None, :],
-                    0.0,
-                ),
-                axis=2,
-            )  # (BLOCK_M, N_POW2)
-            for c0 in range(0, C, BLOCK_C):
-                rc = c0 + tl.arange(0, BLOCK_C)
-                _mhc_apply_pre_mix_tile(
-                    x_ptr,
-                    layer_input_ptr,
-                    pre_mix_2d,
-                    rm,
-                    rc,
-                    i_n,
-                    M,
-                    C,
-                    n,
-                    stride_xm,
-                    stride_xk,
-                    stride_li_m,
-                    stride_li_c,
-                )
     else:
         # Post or Res branch.
         if is_post_program:
@@ -283,7 +267,6 @@ def _mhc_fused_split_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -393,18 +376,17 @@ def _mhc_fused_split_kernel(
 
 
 @triton.jit
-def _mhc_fused_reduce_kernel(
-    acc_ptr,  # Unified input: (NUM_KSPLIT, M, n + n + n_res), layout [pre | post | res]
-    acc_sq_ptr,
+def _mhc_reduce_apply_kernel(
+    acc_ptr,  # Unified split-K partials: (NUM_KSPLIT, M, n + n + n_squared), layout [pre | post | res]
+    acc_sq_ptr,  # Sum-of-squares partials: (NUM_KSPLIT, M)
     alpha_pre,
     alpha_post,
     alpha_res,
-    bias_ptr,
+    bias_ptr,  # (n + n + n_squared,) fp32
+    x_ptr,  # (M, n*C)
     out_ptr,  # Unified output: (M, n + n_squared), layout [post | res]
-    pre_mix_ptr,  # (M, n) fp32; consumed by `_mhc_reduce_splitc_kernel` when USE_REDUCE_SPLITC=True
-    x_ptr,  # (M, n*C); needed for the inline apply path when USE_REDUCE_SPLITC=False
-    layer_input_ptr,  # (M, C); written directly when USE_REDUCE_SPLITC=False (inline apply)
-    M: tl.constexpr,
+    layer_input_ptr,  # (M, C) in x.dtype
+    M,
     K: tl.constexpr,
     N: tl.constexpr,
     n: tl.constexpr,
@@ -413,247 +395,179 @@ def _mhc_fused_reduce_kernel(
     eps: tl.constexpr,
     hc_pre_eps,
     hc_post_mult_value,
-    stride_acc_k,  # Stride for NUM_KSPLIT dimension
-    stride_acc_m,  # Stride for M dimension
-    stride_acc_n,  # Stride for N dimension (total_cols)
+    stride_acc_k,
+    stride_acc_m,
+    stride_acc_n,
     stride_acc_sq_k,
     stride_acc_sq_m,
-    stride_out_m,  # Stride for M dimension
-    stride_out_n,  # Stride for N dimension (post + res)
-    stride_pm,  # Stride for M dimension of pre_mix
-    stride_pn,  # Stride for n dimension of pre_mix
     stride_xm,
     stride_xk,
+    stride_out_m,
+    stride_out_n,
     stride_li_m,
     stride_li_c,
     BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
     BLOCK_C: tl.constexpr,
     N_POW2: tl.constexpr,
-    NUM_KSPLIT: tl.constexpr,
+    N_POW2_RES: tl.constexpr,
     ACTUAL_KSPLIT: tl.constexpr,
     NUM_SINKHORN_ITERS: tl.constexpr,
-    USE_REDUCE_SPLITC: tl.constexpr,
+    RES_PID_C: tl.constexpr,
 ):
     """
-    Reduce kernel for mHC - combines split-K partials and produces stream outputs.
+    Reduce-and-apply kernel for the split-K mHC pipeline (Eq 15-19 + apply).
 
-    Reads from unified `(NUM_KSPLIT, M, n + n + n_squared)` partials laid out as
-    `[pre | post | res]`. Sums partial dot products and sum-of-squares across
-    K-splits, then applies:
-    - RMS normalization (Eq 15)
-    - Bias + alpha scaling (Eq 16)
-    - Stream-specific activations (Eq 17-18) using hc_post_mult_value for post
-    - For pre: dispatches on `USE_REDUCE_SPLITC`:
-        * True  -> stores `pre_mix = sigmoid(H_pre) + hc_pre_eps` to `pre_mix_ptr`
-                   for `_mhc_reduce_splitc_kernel` to consume (large-C path with C-axis parallelism).
-        * False -> runs the inline 3D-broadcast apply directly to `layer_input_ptr`
-                   (small-C path that avoids the extra apply-kernel launch overhead).
-    - For res: optional inline log-domain Sinkhorn-Knopp (Eq 19) when
-      NUM_SINKHORN_ITERS > 0. Requires `BLOCK_N == n_squared`.
+    Grid: ``(cdiv(M, BLOCK_M), cdiv(C, BLOCK_C))``.
 
-    The final `out` tensor is shrunk to `(M, n + n_squared)` with layout
-    `[post | res]`.
+    Each program reads its M-slice of split-K partials once and computes:
 
-    Grid structure: (M_blocks, N_blocks_total).
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    - All pids: pre stream (RMS + bias + alpha + sigmoid + hc_pre_eps) and
+      the apply step ``layer_input[m, c] = sum_i pre_mix[m, i] * x[m, i*C + c]``
+      restricted to this pid's BLOCK_C slice of the hidden dimension.
+    - ``pid_c == 0``: post stream (``hc_post_mult_value * sigmoid``), writes to
+      ``out[:, :n]``.
+    - ``pid_c == RES_PID_C``: res stream (in-kernel log-domain Sinkhorn-Knopp
+      when ``NUM_SINKHORN_ITERS > 0``, else raw logits), writes to
+      ``out[:, n:n+n_squared]``.
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-
-    n_blocks_pre = tl.cdiv(n, BLOCK_N)
-    n_blocks_post = n_blocks_pre
-
-    is_pre_program = pid_n < n_blocks_pre
-    is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
-    is_res_program = ~is_pre_program & ~is_post_program
-    is_post_i32 = is_post_program.to(tl.int32)
-    is_res_i32 = is_res_program.to(tl.int32)
-
-    stream_offset = is_post_i32 * n_blocks_pre + is_res_i32 * (
-        n_blocks_pre + n_blocks_post
-    )
-    local_pid_n = pid_n - stream_offset
-
-    rn_local = local_pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    n_out = tl.where(is_pre_program, n, tl.where(is_post_program, n, n_squared))
-
-    # Partials buffer keeps the original [pre | post | res] layout
-    stream_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
-    col_offset = stream_start + rn_local
-    rn_bias_global = stream_start + rn_local
-
-    # Sum partial results across K-splits
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
-    for ks in range(ACTUAL_KSPLIT):
-        acc_partial = tl.load(
-            acc_ptr
-            + ks * stride_acc_k
-            + rm[:, None] * stride_acc_m
-            + col_offset[None, :] * stride_acc_n,
-            mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
-            other=0.0,
-        )
-        acc += acc_partial
-
-        acc_sq_partial = tl.load(
-            acc_sq_ptr + ks * stride_acc_sq_k + rm * stride_acc_sq_m,
-            mask=rm < M,
-            other=0.0,
-        )
-        acc_sq += acc_sq_partial
-
-    rms = tl.sqrt(acc_sq / K + eps)
-    rsigma = 1.0 / rms
-
-    bias = tl.load(bias_ptr + rn_bias_global, mask=rn_bias_global < N, other=0.0).to(
-        tl.float32
-    )
-    alpha_val = tl.where(
-        is_pre_program, alpha_pre, tl.where(is_post_program, alpha_post, alpha_res)
-    )
-
-    out = rsigma[:, None] * alpha_val * acc + bias[None, :]
-
-    if is_pre_program:
-        pre_mix = tl.sigmoid(out) + hc_pre_eps  # (BLOCK_M, BLOCK_N)
-        if USE_REDUCE_SPLITC:
-            # Stash `pre_mix` for `_mhc_reduce_splitc_kernel` to consume
-            tl.store(
-                pre_mix_ptr + rm[:, None] * stride_pm + rn_local[None, :] * stride_pn,
-                pre_mix,
-                mask=(rm[:, None] < M) & (rn_local[None, :] < n),
-            )
-        else:
-            # Run the apply step inline via a 3D-broadcast reduction
-            pre_mix_n = tl.where(rn_local[None, :] < n, pre_mix, 0.0)
-            i_n = tl.arange(0, N_POW2)
-            pre_mix_2d = tl.sum(
-                tl.where(
-                    rn_local[None, None, :] == i_n[None, :, None],
-                    pre_mix_n[:, None, :],
-                    0.0,
-                ),
-                axis=2,
-            )  # (BLOCK_M, N_POW2)
-            for c0 in range(0, C, BLOCK_C):
-                rc = c0 + tl.arange(0, BLOCK_C)
-                _mhc_apply_pre_mix_tile(
-                    x_ptr,
-                    layer_input_ptr,
-                    pre_mix_2d,
-                    rm,
-                    rc,
-                    i_n,
-                    M,
-                    C,
-                    n,
-                    stride_xm,
-                    stride_xk,
-                    stride_li_m,
-                    stride_li_c,
-                )
-    else:
-        # Post or Res branch.
-        if is_post_program:
-            out_activated = tl.sigmoid(out) * hc_post_mult_value
-            out_col_start = 0
-        else:
-            # Res branch: log-domain Sinkhorn-Knopp on (BLOCK_M, n, n) sub-tile,
-            # or raw logits when NUM_SINKHORN_ITERS == 0. Requires BLOCK_N == n_squared.
-            if NUM_SINKHORN_ITERS > 0:
-                LOG2_E: tl.constexpr = 1.4426950408889634
-                LN_2: tl.constexpr = 0.6931471805599453
-
-                log_A = tl.reshape(out, (BLOCK_M, n, n))
-
-                log_u = tl.zeros((BLOCK_M, n), dtype=tl.float32)
-                log_v = tl.zeros((BLOCK_M, n), dtype=tl.float32)
-
-                for _ in range(NUM_SINKHORN_ITERS):
-                    scaled_row = log_A + log_v[:, None, :]
-                    row_max = tl.max(scaled_row, axis=2)
-                    exp_shifted = tl.exp2((scaled_row - row_max[:, :, None]) * LOG2_E)
-                    row_sum_exp = tl.sum(exp_shifted, axis=2)
-                    log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2
-                    log_u = -log_row_sums
-
-                    scaled_col = log_A + log_u[:, :, None]
-                    col_max = tl.max(scaled_col, axis=1)
-                    exp_shifted = tl.exp2((scaled_col - col_max[:, None, :]) * LOG2_E)
-                    col_sum_exp = tl.sum(exp_shifted, axis=1)
-                    log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2
-                    log_v = -log_col_sums
-
-                log_P = log_A + log_u[:, :, None] + log_v[:, None, :]
-                P = tl.exp2(log_P * LOG2_E)
-                out_activated = tl.reshape(P, (BLOCK_M, n_squared))
-            else:
-                out_activated = out
-            out_col_start = n
-        out_col_offset = out_col_start + rn_local
-        tl.store(
-            out_ptr
-            + rm[:, None] * stride_out_m
-            + out_col_offset[None, :] * stride_out_n,
-            out_activated,
-            mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
-        )
-
-
-@triton.jit
-def _mhc_reduce_splitc_kernel(
-    x_ptr,  # (M, n*C)
-    pre_mix_ptr,  # (M, n) fp32
-    out_ptr,  # (M, C) layer_input in x.dtype
-    M,
-    C: tl.constexpr,
-    n: tl.constexpr,
-    stride_xm,
-    stride_xk,
-    stride_pm,
-    stride_pn,
-    stride_om,
-    stride_oc,
-    BLOCK_M: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    N_POW2: tl.constexpr,
-):
-    """
-    Reduce-splitC step for the pre-stream of mHC: produces
-        layer_input[m, c] = sum_i pre_mix[m, i] * x[m, i*C + c].
-
-    The (M, C) tiling exposes C-axis parallelism preceded by the fused_mhc
-    to more efficiently handle large C values.
+    Sinkhorn requires ``n_squared is`` a power of two; the wrapper enforces
+     this when ``NUM_SINKHORN_ITERS > 0``.
     """
     pid_m = tl.program_id(0)
     pid_c = tl.program_id(1)
 
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rc = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-    i_n = tl.arange(0, N_POW2)
+    rn_pre = tl.arange(0, N_POW2)
 
-    pre_mix_2d = tl.load(
-        pre_mix_ptr + rm[:, None] * stride_pm + i_n[None, :] * stride_pn,
-        mask=(rm[:, None] < M) & (i_n[None, :] < n),
-        other=0.0,
-    )  # (BLOCK_M, N_POW2) fp32
+    # --- 1) Reduce split-K partials: PRE columns + acc_sq ---
+    acc_pre = tl.zeros([BLOCK_M, N_POW2], dtype=tl.float32)
+    acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for ks in range(ACTUAL_KSPLIT):
+        acc_pre += tl.load(
+            acc_ptr
+            + ks * stride_acc_k
+            + rm[:, None] * stride_acc_m
+            + rn_pre[None, :] * stride_acc_n,
+            mask=(rm[:, None] < M) & (rn_pre[None, :] < n),
+            other=0.0,
+        )
+        acc_sq += tl.load(
+            acc_sq_ptr + ks * stride_acc_sq_k + rm * stride_acc_sq_m,
+            mask=rm < M,
+            other=0.0,
+        )
 
+    # --- 2) RMS normalization (Eq 15) ---
+    rms = tl.sqrt(acc_sq / K + eps)
+    rsigma = 1.0 / rms
+
+    # --- 3) Pre stream: bias + alpha + sigmoid + hc_pre_eps (Eq 16-17) ---
+    bias_pre = tl.load(bias_ptr + rn_pre, mask=rn_pre < n, other=0.0).to(tl.float32)
+    h_pre = rsigma[:, None] * alpha_pre * acc_pre + bias_pre[None, :]
+    pre_mix_2d = tl.sigmoid(h_pre) + hc_pre_eps
+
+    # --- 4) Apply step for this pid's BLOCK_C slice ---
     _mhc_apply_pre_mix_tile(
         x_ptr,
-        out_ptr,
+        layer_input_ptr,
         pre_mix_2d,
         rm,
         rc,
-        i_n,
+        rn_pre,
         M,
         C,
         n,
         stride_xm,
         stride_xk,
-        stride_om,
-        stride_oc,
+        stride_li_m,
+        stride_li_c,
     )
+
+    # --- 5) Post stream on pid_c == 0; Res stream on pid_c == RES_PID_C
+    if pid_c == 0:
+        # POST: cols [n, 2n) in the unified [pre | post | res] partials layout.
+        rn_post_local = tl.arange(0, N_POW2)
+        rn_post_global = n + rn_post_local
+        acc_post = tl.zeros([BLOCK_M, N_POW2], dtype=tl.float32)
+        for ks in range(ACTUAL_KSPLIT):
+            acc_post += tl.load(
+                acc_ptr
+                + ks * stride_acc_k
+                + rm[:, None] * stride_acc_m
+                + rn_post_global[None, :] * stride_acc_n,
+                mask=(rm[:, None] < M) & (rn_post_local[None, :] < n),
+                other=0.0,
+            )
+        bias_post = tl.load(
+            bias_ptr + rn_post_global,
+            mask=rn_post_local < n,
+            other=0.0,
+        ).to(tl.float32)
+        h_post = rsigma[:, None] * alpha_post * acc_post + bias_post[None, :]
+        out_post = tl.sigmoid(h_post) * hc_post_mult_value
+        tl.store(
+            out_ptr
+            + rm[:, None] * stride_out_m
+            + rn_post_local[None, :] * stride_out_n,
+            out_post,
+            mask=(rm[:, None] < M) & (rn_post_local[None, :] < n),
+        )
+
+    if pid_c == RES_PID_C:
+        # RES: cols [2n, 2n + n_squared) in the unified partials layout.
+        rn_res_local = tl.arange(0, N_POW2_RES)
+        rn_res_global = 2 * n + rn_res_local
+        acc_res = tl.zeros([BLOCK_M, N_POW2_RES], dtype=tl.float32)
+        for ks in range(ACTUAL_KSPLIT):
+            acc_res += tl.load(
+                acc_ptr
+                + ks * stride_acc_k
+                + rm[:, None] * stride_acc_m
+                + rn_res_global[None, :] * stride_acc_n,
+                mask=(rm[:, None] < M) & (rn_res_local[None, :] < n_squared),
+                other=0.0,
+            )
+        bias_res = tl.load(
+            bias_ptr + rn_res_global,
+            mask=rn_res_local < n_squared,
+            other=0.0,
+        ).to(tl.float32)
+        h_res = rsigma[:, None] * alpha_res * acc_res + bias_res[None, :]
+
+        if NUM_SINKHORN_ITERS > 0:
+            LOG2_E: tl.constexpr = 1.4426950408889634
+            LN_2: tl.constexpr = 0.6931471805599453
+
+            log_A = tl.reshape(h_res, (BLOCK_M, n, n))
+            log_u = tl.zeros((BLOCK_M, n), dtype=tl.float32)
+            log_v = tl.zeros((BLOCK_M, n), dtype=tl.float32)
+
+            for _ in range(NUM_SINKHORN_ITERS):
+                scaled_row = log_A + log_v[:, None, :]
+                row_max = tl.max(scaled_row, axis=2)
+                exp_shifted = tl.exp2((scaled_row - row_max[:, :, None]) * LOG2_E)
+                row_sum_exp = tl.sum(exp_shifted, axis=2)
+                log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2
+                log_u = -log_row_sums
+
+                scaled_col = log_A + log_u[:, :, None]
+                col_max = tl.max(scaled_col, axis=1)
+                exp_shifted = tl.exp2((scaled_col - col_max[:, None, :]) * LOG2_E)
+                col_sum_exp = tl.sum(exp_shifted, axis=1)
+                log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2
+                log_v = -log_col_sums
+
+            log_P = log_A + log_u[:, :, None] + log_v[:, None, :]
+            P = tl.exp2(log_P * LOG2_E)
+            out_res = tl.reshape(P, (BLOCK_M, n_squared))
+        else:
+            out_res = h_res
+
+        tl.store(
+            out_ptr
+            + rm[:, None] * stride_out_m
+            + (n + rn_res_local[None, :]) * stride_out_n,
+            out_res,
+            mask=(rm[:, None] < M) & (rn_res_local[None, :] < n_squared),
+        )
