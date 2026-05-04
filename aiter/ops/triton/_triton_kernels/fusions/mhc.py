@@ -64,8 +64,8 @@ def _mhc_fused_kernel(
     n_squared: tl.constexpr,
     C: tl.constexpr,
     eps: tl.constexpr,
-    hc_pre_eps,
-    hc_post_mult_value,
+    hc_pre_eps: tl.constexpr,
+    hc_post_mult_value: tl.constexpr,
     stride_xm,
     stride_xk,
     stride_phi_k,  # Stride for K dimension
@@ -206,30 +206,29 @@ def _mhc_fused_kernel(
             # or raw logits when NUM_SINKHORN_ITERS == 0. Requires BLOCK_N == n_squared.
             if NUM_SINKHORN_ITERS > 0:
                 LOG2_E: tl.constexpr = 1.4426950408889634
-                LN_2: tl.constexpr = 0.6931471805599453
 
-                log_A = tl.reshape(out, (BLOCK_M, n, n))
+                log2_A = tl.reshape(out, (BLOCK_M, n, n)) * LOG2_E
 
-                log_u = tl.zeros((BLOCK_M, n), dtype=tl.float32)
-                log_v = tl.zeros((BLOCK_M, n), dtype=tl.float32)
+                log2_u = tl.zeros((BLOCK_M, n), dtype=tl.float32)
+                log2_v = tl.zeros((BLOCK_M, n), dtype=tl.float32)
 
                 for _ in range(NUM_SINKHORN_ITERS):
-                    scaled_row = log_A + log_v[:, None, :]
+                    scaled_row = log2_A + log2_v[:, None, :]
                     row_max = tl.max(scaled_row, axis=2)
-                    exp_shifted = tl.exp2((scaled_row - row_max[:, :, None]) * LOG2_E)
+                    exp_shifted = tl.exp2(scaled_row - row_max[:, :, None])
                     row_sum_exp = tl.sum(exp_shifted, axis=2)
-                    log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2
-                    log_u = -log_row_sums
+                    log2_row_sums = row_max + tl.log2(row_sum_exp)
+                    log2_u = -log2_row_sums
 
-                    scaled_col = log_A + log_u[:, :, None]
+                    scaled_col = log2_A + log2_u[:, :, None]
                     col_max = tl.max(scaled_col, axis=1)
-                    exp_shifted = tl.exp2((scaled_col - col_max[:, None, :]) * LOG2_E)
+                    exp_shifted = tl.exp2(scaled_col - col_max[:, None, :])
                     col_sum_exp = tl.sum(exp_shifted, axis=1)
-                    log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2
-                    log_v = -log_col_sums
+                    log2_col_sums = col_max + tl.log2(col_sum_exp)
+                    log2_v = -log2_col_sums
 
-                log_P = log_A + log_u[:, :, None] + log_v[:, None, :]
-                P = tl.exp2(log_P * LOG2_E)
+                log2_P = log2_A + log2_u[:, :, None] + log2_v[:, None, :]
+                P = tl.exp2(log2_P)
                 out_activated = tl.reshape(P, (BLOCK_M, n_squared))
             else:
                 out_activated = out
@@ -252,7 +251,6 @@ def _mhc_fused_split_kernel(
     acc_sq_ptr,
     M: tl.constexpr,
     K: tl.constexpr,
-    N: tl.constexpr,
     n: tl.constexpr,
     n_squared: tl.constexpr,
     stride_xm,
@@ -376,6 +374,75 @@ def _mhc_fused_split_kernel(
 
 
 @triton.jit
+def _mhc_reduce_apply_res_block(
+    acc_res,  # (BLOCK_M, N_POW2_RES) fp32, already reduced over ks
+    rsigma,  # (BLOCK_M,) fp32
+    rm,
+    rn_res_local,
+    rn_res_global,
+    alpha_res,
+    bias_ptr,
+    out_ptr,
+    M,
+    n: tl.constexpr,
+    n_squared: tl.constexpr,
+    N_POW2_RES: tl.constexpr,
+    stride_out_m,
+    stride_out_n,
+    BLOCK_M: tl.constexpr,
+    NUM_SINKHORN_ITERS: tl.constexpr,
+):
+    """Compute h_res = rsigma * alpha_res * acc_res + bias_res, optionally run
+    log-domain Sinkhorn-Knopp, and store to ``out[:, n:n+n_squared]``.
+
+    Shared between the merged-CTA path (`RES_PID_C == 0`, fused with post on the
+    same `for-ks` loop) and the split-CTA path (`RES_PID_C != 0`).
+    """
+    bias_res = tl.load(
+        bias_ptr + rn_res_global,
+        mask=rn_res_local < n_squared,
+        other=0.0,
+    ).to(tl.float32)
+    h_res = rsigma[:, None] * alpha_res * acc_res + bias_res[None, :]
+
+    if NUM_SINKHORN_ITERS > 0:
+        LOG2_E: tl.constexpr = 1.4426950408889634
+
+        log2_A = tl.reshape(h_res, (BLOCK_M, n, n)) * LOG2_E
+        log2_u = tl.zeros((BLOCK_M, n), dtype=tl.float32)
+        log2_v = tl.zeros((BLOCK_M, n), dtype=tl.float32)
+
+        for _ in range(NUM_SINKHORN_ITERS):
+            scaled_row = log2_A + log2_v[:, None, :]
+            row_max = tl.max(scaled_row, axis=2)
+            exp_shifted = tl.exp2(scaled_row - row_max[:, :, None])
+            row_sum_exp = tl.sum(exp_shifted, axis=2)
+            log2_row_sums = row_max + tl.log2(row_sum_exp)
+            log2_u = -log2_row_sums
+
+            scaled_col = log2_A + log2_u[:, :, None]
+            col_max = tl.max(scaled_col, axis=1)
+            exp_shifted = tl.exp2(scaled_col - col_max[:, None, :])
+            col_sum_exp = tl.sum(exp_shifted, axis=1)
+            log2_col_sums = col_max + tl.log2(col_sum_exp)
+            log2_v = -log2_col_sums
+
+        log2_P = log2_A + log2_u[:, :, None] + log2_v[:, None, :]
+        P = tl.exp2(log2_P)
+        out_res = tl.reshape(P, (BLOCK_M, n_squared))
+    else:
+        out_res = h_res
+
+    tl.store(
+        out_ptr
+        + rm[:, None] * stride_out_m
+        + (n + rn_res_local[None, :]) * stride_out_n,
+        out_res,
+        mask=(rm[:, None] < M) & (rn_res_local[None, :] < n_squared),
+    )
+
+
+@triton.jit
 def _mhc_reduce_apply_kernel(
     acc_ptr,  # Unified split-K partials: (NUM_KSPLIT, M, n + n + n_squared), layout [pre | post | res]
     acc_sq_ptr,  # Sum-of-squares partials: (NUM_KSPLIT, M)
@@ -388,13 +455,12 @@ def _mhc_reduce_apply_kernel(
     layer_input_ptr,  # (M, C) in x.dtype
     M,
     K: tl.constexpr,
-    N: tl.constexpr,
     n: tl.constexpr,
     n_squared: tl.constexpr,
     C: tl.constexpr,
     eps: tl.constexpr,
-    hc_pre_eps,
-    hc_post_mult_value,
+    hc_pre_eps: tl.constexpr,
+    hc_post_mult_value: tl.constexpr,
     stride_acc_k,
     stride_acc_m,
     stride_acc_n,
@@ -484,90 +550,130 @@ def _mhc_reduce_apply_kernel(
         stride_li_c,
     )
 
-    # --- 5) Post stream on pid_c == 0; Res stream on pid_c == RES_PID_C
-    if pid_c == 0:
-        # POST: cols [n, 2n) in the unified [pre | post | res] partials layout.
-        rn_post_local = tl.arange(0, N_POW2)
-        rn_post_global = n + rn_post_local
-        acc_post = tl.zeros([BLOCK_M, N_POW2], dtype=tl.float32)
-        for ks in range(ACTUAL_KSPLIT):
-            acc_post += tl.load(
-                acc_ptr
-                + ks * stride_acc_k
-                + rm[:, None] * stride_acc_m
-                + rn_post_global[None, :] * stride_acc_n,
+    # --- 5) Post stream on pid_c == 0; Res stream on pid_c == RES_PID_C ---
+    # Two compile-time layouts:
+    #   RES_PID_C == 0 (single C-tile, shared CTA): one for-ks loop loads both
+    #     post and res partials, then post and res are computed back-to-back.
+    #   RES_PID_C != 0 (multi C-tile, separate CTAs): each CTA runs its own
+    #     for-ks loop. The res body is factored into _mhc_reduce_apply_res_block
+    #     to avoid duplication with the shared-CTA branch.
+    if RES_PID_C == 0:
+        if pid_c == 0:
+            rn_post_local = tl.arange(0, N_POW2)
+            rn_post_global = n + rn_post_local
+            rn_res_local = tl.arange(0, N_POW2_RES)
+            rn_res_global = 2 * n + rn_res_local
+
+            acc_post = tl.zeros([BLOCK_M, N_POW2], dtype=tl.float32)
+            acc_res = tl.zeros([BLOCK_M, N_POW2_RES], dtype=tl.float32)
+            for ks in range(ACTUAL_KSPLIT):
+                acc_post += tl.load(
+                    acc_ptr
+                    + ks * stride_acc_k
+                    + rm[:, None] * stride_acc_m
+                    + rn_post_global[None, :] * stride_acc_n,
+                    mask=(rm[:, None] < M) & (rn_post_local[None, :] < n),
+                    other=0.0,
+                )
+                acc_res += tl.load(
+                    acc_ptr
+                    + ks * stride_acc_k
+                    + rm[:, None] * stride_acc_m
+                    + rn_res_global[None, :] * stride_acc_n,
+                    mask=(rm[:, None] < M) & (rn_res_local[None, :] < n_squared),
+                    other=0.0,
+                )
+
+            bias_post = tl.load(
+                bias_ptr + rn_post_global,
+                mask=rn_post_local < n,
+                other=0.0,
+            ).to(tl.float32)
+            h_post = rsigma[:, None] * alpha_post * acc_post + bias_post[None, :]
+            out_post = tl.sigmoid(h_post) * hc_post_mult_value
+            tl.store(
+                out_ptr
+                + rm[:, None] * stride_out_m
+                + rn_post_local[None, :] * stride_out_n,
+                out_post,
                 mask=(rm[:, None] < M) & (rn_post_local[None, :] < n),
-                other=0.0,
             )
-        bias_post = tl.load(
-            bias_ptr + rn_post_global,
-            mask=rn_post_local < n,
-            other=0.0,
-        ).to(tl.float32)
-        h_post = rsigma[:, None] * alpha_post * acc_post + bias_post[None, :]
-        out_post = tl.sigmoid(h_post) * hc_post_mult_value
-        tl.store(
-            out_ptr
-            + rm[:, None] * stride_out_m
-            + rn_post_local[None, :] * stride_out_n,
-            out_post,
-            mask=(rm[:, None] < M) & (rn_post_local[None, :] < n),
-        )
 
-    if pid_c == RES_PID_C:
-        # RES: cols [2n, 2n + n_squared) in the unified partials layout.
-        rn_res_local = tl.arange(0, N_POW2_RES)
-        rn_res_global = 2 * n + rn_res_local
-        acc_res = tl.zeros([BLOCK_M, N_POW2_RES], dtype=tl.float32)
-        for ks in range(ACTUAL_KSPLIT):
-            acc_res += tl.load(
-                acc_ptr
-                + ks * stride_acc_k
-                + rm[:, None] * stride_acc_m
-                + rn_res_global[None, :] * stride_acc_n,
-                mask=(rm[:, None] < M) & (rn_res_local[None, :] < n_squared),
-                other=0.0,
+            _mhc_reduce_apply_res_block(
+                acc_res,
+                rsigma,
+                rm,
+                rn_res_local,
+                rn_res_global,
+                alpha_res,
+                bias_ptr,
+                out_ptr,
+                M,
+                n,
+                n_squared,
+                N_POW2_RES,
+                stride_out_m,
+                stride_out_n,
+                BLOCK_M,
+                NUM_SINKHORN_ITERS,
             )
-        bias_res = tl.load(
-            bias_ptr + rn_res_global,
-            mask=rn_res_local < n_squared,
-            other=0.0,
-        ).to(tl.float32)
-        h_res = rsigma[:, None] * alpha_res * acc_res + bias_res[None, :]
+    else:
+        if pid_c == 0:
+            rn_post_local = tl.arange(0, N_POW2)
+            rn_post_global = n + rn_post_local
+            acc_post = tl.zeros([BLOCK_M, N_POW2], dtype=tl.float32)
+            for ks in range(ACTUAL_KSPLIT):
+                acc_post += tl.load(
+                    acc_ptr
+                    + ks * stride_acc_k
+                    + rm[:, None] * stride_acc_m
+                    + rn_post_global[None, :] * stride_acc_n,
+                    mask=(rm[:, None] < M) & (rn_post_local[None, :] < n),
+                    other=0.0,
+                )
+            bias_post = tl.load(
+                bias_ptr + rn_post_global,
+                mask=rn_post_local < n,
+                other=0.0,
+            ).to(tl.float32)
+            h_post = rsigma[:, None] * alpha_post * acc_post + bias_post[None, :]
+            out_post = tl.sigmoid(h_post) * hc_post_mult_value
+            tl.store(
+                out_ptr
+                + rm[:, None] * stride_out_m
+                + rn_post_local[None, :] * stride_out_n,
+                out_post,
+                mask=(rm[:, None] < M) & (rn_post_local[None, :] < n),
+            )
 
-        if NUM_SINKHORN_ITERS > 0:
-            LOG2_E: tl.constexpr = 1.4426950408889634
-            LN_2: tl.constexpr = 0.6931471805599453
-
-            log_A = tl.reshape(h_res, (BLOCK_M, n, n))
-            log_u = tl.zeros((BLOCK_M, n), dtype=tl.float32)
-            log_v = tl.zeros((BLOCK_M, n), dtype=tl.float32)
-
-            for _ in range(NUM_SINKHORN_ITERS):
-                scaled_row = log_A + log_v[:, None, :]
-                row_max = tl.max(scaled_row, axis=2)
-                exp_shifted = tl.exp2((scaled_row - row_max[:, :, None]) * LOG2_E)
-                row_sum_exp = tl.sum(exp_shifted, axis=2)
-                log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2
-                log_u = -log_row_sums
-
-                scaled_col = log_A + log_u[:, :, None]
-                col_max = tl.max(scaled_col, axis=1)
-                exp_shifted = tl.exp2((scaled_col - col_max[:, None, :]) * LOG2_E)
-                col_sum_exp = tl.sum(exp_shifted, axis=1)
-                log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2
-                log_v = -log_col_sums
-
-            log_P = log_A + log_u[:, :, None] + log_v[:, None, :]
-            P = tl.exp2(log_P * LOG2_E)
-            out_res = tl.reshape(P, (BLOCK_M, n_squared))
-        else:
-            out_res = h_res
-
-        tl.store(
-            out_ptr
-            + rm[:, None] * stride_out_m
-            + (n + rn_res_local[None, :]) * stride_out_n,
-            out_res,
-            mask=(rm[:, None] < M) & (rn_res_local[None, :] < n_squared),
-        )
+        if pid_c == RES_PID_C:
+            rn_res_local = tl.arange(0, N_POW2_RES)
+            rn_res_global = 2 * n + rn_res_local
+            acc_res = tl.zeros([BLOCK_M, N_POW2_RES], dtype=tl.float32)
+            for ks in range(ACTUAL_KSPLIT):
+                acc_res += tl.load(
+                    acc_ptr
+                    + ks * stride_acc_k
+                    + rm[:, None] * stride_acc_m
+                    + rn_res_global[None, :] * stride_acc_n,
+                    mask=(rm[:, None] < M) & (rn_res_local[None, :] < n_squared),
+                    other=0.0,
+                )
+            _mhc_reduce_apply_res_block(
+                acc_res,
+                rsigma,
+                rm,
+                rn_res_local,
+                rn_res_global,
+                alpha_res,
+                bias_ptr,
+                out_ptr,
+                M,
+                n,
+                n_squared,
+                N_POW2_RES,
+                stride_out_m,
+                stride_out_n,
+                BLOCK_M,
+                NUM_SINKHORN_ITERS,
+            )
