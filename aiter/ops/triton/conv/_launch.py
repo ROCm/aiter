@@ -82,7 +82,6 @@ def _launch_1x1(
     Q,
     stride,
     padding,
-    out_dtype,
     activation,
     layout="nchw",
 ):
@@ -147,7 +146,6 @@ def _launch_3x3_nhwc(
     stride,
     padding,
     dilation,
-    out_dtype,
     activation,
 ):
     """Launch specialized 3x3 NHWC kernel (hardcoded stride_c=1, stride_k=1)."""
@@ -210,7 +208,6 @@ def _launch_3x3_cblocked(
     stride,
     padding,
     dilation,
-    out_dtype,
     activation,
 ):
     """Launch specialized 3x3 kernel for channel-blocked input."""
@@ -275,7 +272,6 @@ def _launch_general(
     stride,
     padding,
     dilation,
-    out_dtype,
     block_k,
     activation,
     layout="nchw",
@@ -343,7 +339,6 @@ def _launch_winograd_f4x3_fused(
     Q,
     C_pad,
     padding,
-    out_dtype,
     activation,
     layout="nchw",
 ):
@@ -420,7 +415,6 @@ def _launch_winograd_f4x3(
     Q,
     C_pad,
     padding,
-    out_dtype,
     activation,
     layout="nchw",
 ):
@@ -512,7 +506,6 @@ def _launch_winograd_f4x3_cblocked(
     Q,
     C_pad,
     padding,
-    out_dtype,
     activation,
     block_k,
 ):
