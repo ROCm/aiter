@@ -116,6 +116,20 @@ def compile_pa_decode_main(
     BT_NUM_LOADS = (BLOCKS_PER_COMPUTE + BT_VEC_WIDTH - 1) // BT_VEC_WIDTH
     BT_TAIL_WIDTH = BLOCKS_PER_COMPUTE - (BT_NUM_LOADS - 1) * BT_VEC_WIDTH
 
+    USE_PER_WARP_ISSUE = BLOCKS_PER_COMPUTE >= NUM_WARPS
+    if USE_PER_WARP_ISSUE:
+        if BLOCKS_PER_COMPUTE % NUM_WARPS != 0:
+            raise ValueError(
+                f"BLOCKS_PER_COMPUTE ({BLOCKS_PER_COMPUTE}) must be divisible by "
+                f"NUM_WARPS ({NUM_WARPS}) for per-warp TDM issue path"
+            )
+        BLOCKS_PER_WARP = BLOCKS_PER_COMPUTE // NUM_WARPS
+        K_OPS_PER_WAVE = BLOCKS_PER_WARP
+    else:
+        BLOCKS_PER_WARP = BLOCKS_PER_COMPUTE
+        K_OPS_PER_WAVE = BLOCKS_PER_COMPUTE  
+    KV_OPS_PER_WAVE = 2 * K_OPS_PER_WAVE     
+
     block_threads = NUM_WARPS * WAVE_SIZE          # 128
     K_QK_TILES = HEAD_SIZE // WMMA_K               # HEAD/32 = 4
     N_QK_TILES = KV_COMPUTE_BLOCK_SIZE // WMMA_N   # compute/16 (e.g. 4 for compute=64)
@@ -237,6 +251,8 @@ def compile_pa_decode_main(
 
             warp_id = tx / arith.index(WAVE_SIZE)
             lane_id = tx % arith.index(WAVE_SIZE)
+
+            wave_id_sgpr = arith.index_cast(T.index, rocdl.wave_id())
             lane_kgrp = lane_id / arith.index(WMMA_M)   # 0 or 1
             lane16 = lane_id % arith.index(WMMA_M)       # 0..15
 
@@ -461,7 +477,9 @@ def compile_pa_decode_main(
                             out.append(arith.index_cast(T.index, elem))
                 return out
 
-            def _issue_kv_load_single_block(kv_tensor, lds_memref, phys_blk, lds_byte_off):
+            def _issue_kv_load_single_block(
+                kv_tensor, lds_memref, phys_blk, lds_byte_off, tdm_num_warps
+            ):
                 """Issue one TDM async 2D load of [KVB, HEAD] into LDS at byte offset
                 `lds_byte_off` relative to the base of `lds_memref`."""
                 outer_off = (phys_blk * num_kv_heads + kv_head) * arith.index(KV_BLOCK_SIZE)
@@ -474,39 +492,85 @@ def compile_pa_decode_main(
                     tile_shape=(KV_BLOCK_SIZE, HEAD_SIZE),
                     elem_bytes=elem_bytes,
                     pad_interval=HEAD_SIZE, pad_amount=LDS_PAD_ELEMS,
-                    num_warps=NUM_WARPS,
+                    num_warps=tdm_num_warps,
                     lds_byte_offset=lds_byte_off,
                 )
                 tdm_ops.tensor_load_2d(desc)
 
             def _issue_kv_tile_loads(k_lds_mem, v_lds_mem, phys_blks_list):
-                """Issue TDM loads for one compute tile: BLOCKS_PER_COMPUTE K loads
-                followed by BLOCKS_PER_COMPUTE V loads (K-then-V issue order).
-
-                The split issue order matters: tensor_wait drains in FIFO, so
-                issuing all K's before all V's lets us drain just the K's later
-                (via tensor_wait(BPC + outstanding-after)) while V is still in
-                flight, overlapping V's DMA with QK + softmax compute.
-
-                Each block lands in a sub-region of the LDS stage (offset by block-index rows).
-                """
+                """Issue TDM loads for one compute tile: K loads first, then V
+                loads (K-then-V issue order so tensor_wait can drain just the
+                K's via FIFO while V's DMA continues in background)."""
                 # Use the padded row stride: TDM inserts LDS_PAD_ELEMS of pad
                 # after every HEAD_SIZE source elements, so each block in LDS
                 # is KV_BLOCK_SIZE rows × KV_LDS_ROW_STRIDE elements wide.
                 one_block_bytes = KV_BLOCK_SIZE * KV_LDS_ROW_STRIDE * elem_bytes
-                for b in range_constexpr(BLOCKS_PER_COMPUTE):
-                    lds_sub_off = arith.index(b * one_block_bytes)
-                    _issue_kv_load_single_block(
-                        arg_key_cache, k_lds_mem, phys_blks_list[b], lds_sub_off
-                    )
-                for b in range_constexpr(BLOCKS_PER_COMPUTE):
-                    lds_sub_off = arith.index(b * one_block_bytes)
-                    _issue_kv_load_single_block(
-                        arg_value_cache, v_lds_mem, phys_blks_list[b], lds_sub_off
+
+                if USE_PER_WARP_ISSUE:
+                    # select-chain on wave_id_sgpr looks smth like this:
+                    #  my_pb = phys_blks_list[3]
+                    #  my_pb = select(wave_id == 2, phys_blks_list[2], my_pb)                                                                                                   
+                    #  my_pb = select(wave_id == 1, phys_blks_list[1], my_pb)                                                                                                   
+                    #  my_pb = select(wave_id == 0, phys_blks_list[0], my_pb)   
+                    my_phys_blks = []
+                    for inner in range_constexpr(BLOCKS_PER_WARP):
+                        # Default = warp (NUM_WARPS-1)'s block at this inner index.
+                        my_pb = phys_blks_list[
+                            (NUM_WARPS - 1) * BLOCKS_PER_WARP + inner
+                        ]
+                        for ii in range_constexpr(NUM_WARPS - 1):
+                            w = NUM_WARPS - 2 - ii  # iterate w = NUM_WARPS-2 .. 0
+                            is_w = arith.cmpi(
+                                arith.CmpIPredicate.eq,
+                                _raw(wave_id_sgpr),
+                                _raw(arith.index(w)),
+                            )
+                            my_pb = arith.select(
+                                is_w,
+                                _raw(phys_blks_list[w * BLOCKS_PER_WARP + inner]),
+                                _raw(my_pb),
+                            )
+                        my_phys_blks.append(my_pb)
+
+                    # Per-warp LDS base: warp w's blocks live at
+                    #   byte_off = (w*BLOCKS_PER_WARP + inner) * one_block_bytes
+                    warp_lds_base = wave_id_sgpr * arith.index(
+                        BLOCKS_PER_WARP * one_block_bytes
                     )
 
-            # Fence counts: each compute tile issues 2*BLOCKS_PER_COMPUTE TDM ops (K+V for each block).
-            FENCE_OUTSTANDING = 2 * BLOCKS_PER_COMPUTE
+                    # K issues, then V issues (FIFO drain order).
+                    for inner in range_constexpr(BLOCKS_PER_WARP):
+                        lds_sub_off = warp_lds_base + arith.index(
+                            inner * one_block_bytes
+                        )
+                        _issue_kv_load_single_block(
+                            arg_key_cache, k_lds_mem,
+                            my_phys_blks[inner], lds_sub_off, tdm_num_warps=1,
+                        )
+                    for inner in range_constexpr(BLOCKS_PER_WARP):
+                        lds_sub_off = warp_lds_base + arith.index(
+                            inner * one_block_bytes
+                        )
+                        _issue_kv_load_single_block(
+                            arg_value_cache, v_lds_mem,
+                            my_phys_blks[inner], lds_sub_off, tdm_num_warps=1,
+                        )
+                else:
+                    # Cooperative split: every warp participates in each block.
+                    for b in range_constexpr(BLOCKS_PER_COMPUTE):
+                        lds_sub_off = arith.index(b * one_block_bytes)
+                        _issue_kv_load_single_block(
+                            arg_key_cache, k_lds_mem,
+                            phys_blks_list[b], lds_sub_off, tdm_num_warps=NUM_WARPS,
+                        )
+                    for b in range_constexpr(BLOCKS_PER_COMPUTE):
+                        lds_sub_off = arith.index(b * one_block_bytes)
+                        _issue_kv_load_single_block(
+                            arg_value_cache, v_lds_mem,
+                            phys_blks_list[b], lds_sub_off, tdm_num_warps=NUM_WARPS,
+                        )
+
+            FENCE_OUTSTANDING = KV_OPS_PER_WAVE
 
             def _issue_q_load():
                 """TDM load Q[seq, kv_head*QG : kv_head*QG + QG, :] into q_lds.
@@ -536,11 +600,6 @@ def compile_pa_decode_main(
             _issue_q_load()
             phys_blks_tile0 = _phys_blks_for_compute(arith.index(0)) # load physical blocks for compute iter 1
             _issue_kv_tile_loads(k_lds_stages[0].get(), v_lds_stages[0].get(), phys_blks_tile0)
-            # Drain ONLY Q so q_frags can be read; tile 0 stays in flight and overlaps
-            # with q_frags reads. Outstanding here = 1 (Q) + 2*BPC (tile 0) = 1 + FENCE_OUTSTANDING.
-            # tensor_wait(FENCE_OUTSTANDING) drains down to FENCE_OUTSTANDING, which
-            # drains the oldest op (Q) and leaves tile 0 still in flight. The next
-            # tensor_wait inside the loop will drain tile 0 before compute.
             tdm_ops.tensor_wait(FENCE_OUTSTANDING)
             gpu.barrier()
 
@@ -569,15 +628,17 @@ def compile_pa_decode_main(
                         v_lds_stages[nxt_stage].get(),
                         next_phys_blks,
                     )
-                    # Outstanding before wait_for_K: cur K + cur V + next K + next V = 4*BPC.
-                    # After wait_for_K: cur V + next K + next V = 3*BPC.
-                    outstanding_after_k_drain = 3 * BLOCKS_PER_COMPUTE
-                    # After wait_for_V: next K + next V = 2*BPC.
-                    outstanding_after_v_drain = 2 * BLOCKS_PER_COMPUTE
+                    # Outstanding-per-wave before wait_for_K:
+                    #   cur K + cur V + next K + next V = 4*K_OPS_PER_WAVE.
+                    # After wait_for_K: cur V + next K + next V = 3*K_OPS_PER_WAVE.
+                    outstanding_after_k_drain = 3 * K_OPS_PER_WAVE
+                    # After wait_for_V: next K + next V = 2*K_OPS_PER_WAVE.
+                    outstanding_after_v_drain = 2 * K_OPS_PER_WAVE
                 else:
-                    # Last iter: no prefetch. Outstanding = cur K + cur V = 2*BPC.
-                    # After wait_for_K: cur V = BPC. After wait_for_V: 0.
-                    outstanding_after_k_drain = BLOCKS_PER_COMPUTE
+                    # Last iter: no prefetch. Outstanding-per-wave = cur K + cur V
+                    # = 2*K_OPS_PER_WAVE. After wait_for_K: cur V = K_OPS_PER_WAVE.
+                    # After wait_for_V: 0.
+                    outstanding_after_k_drain = K_OPS_PER_WAVE
                     outstanding_after_v_drain = 0
 
                 # Wait for current tile's K (V continues loading in background).
