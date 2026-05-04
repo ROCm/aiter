@@ -44,7 +44,7 @@ def conv2d(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype=torch.float16,
+    out_dtype: Optional[torch.dtype] = None,
     layout="nchw",
 ):
     """Forward 2-D conv on AMD ROCm via Triton. Drop-in for the forward of
@@ -56,6 +56,9 @@ def conv2d(
     Inputs must be fp16 or bf16. ``layout="nhwc"`` runs an NHWC-native kernel
     with no internal layout conversion.
 
+    ``out_dtype=None`` (default) returns output in the input dtype, matching
+    ``torch.nn.Conv2d`` semantics.
+
     Notes
     -----
     - Only ``groups=1`` (depthwise/grouped raises ``AssertionError``).
@@ -63,17 +66,24 @@ def conv2d(
     - ``bias=None`` skips the with-bias kernel path; passing a zero tensor
       instead routes through the with-bias kernel and times differently.
     """
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"conv2d only supports fp16 and bf16 inputs, got {x.dtype}")
+    if out_dtype is None:
+        out_dtype = x.dtype
+    elif out_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"out_dtype must be torch.float16 or torch.bfloat16, got {out_dtype}"
+        )
+    layout = layout.lower()
+    if layout not in ("nchw", "nhwc"):
+        raise ValueError(f"layout must be 'nchw' or 'nhwc', got '{layout}'")
+
     _LOGGER.info(
         f"CONV2D: x={tuple(x.shape)} w={tuple(w_oihw.shape)} stride={stride} "
         f"padding={padding} dilation={dilation} layout={layout} "
         f"dtype={x.dtype} out_dtype={out_dtype} bias={'yes' if bias is not None else 'no'} "
         f"act={activation}"
     )
-    layout = layout.lower()
-    if layout not in ("nchw", "nhwc"):
-        raise ValueError(f"layout must be 'nchw' or 'nhwc', got '{layout}'")
-    if x.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(f"conv2d only supports fp16 and bf16 inputs, got {x.dtype}")
 
     if layout == "nhwc":
         return conv2d_nhwc(
@@ -93,12 +103,14 @@ def conv2d_winograd_f4x3(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype=torch.float16,
+    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
     layout="nchw",
 ):
     """NCHW/NHWC conv2d using Winograd F(4x4,3x3). Raises ValueError for non-eligible convs."""
     assert x.is_cuda and w_oihw.is_cuda
+    if out_dtype is None:
+        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -134,7 +146,6 @@ def conv2d_winograd_f4x3(
         Q,
         C_pad,
         padding,
-        out_dtype,
         activation,
         layout=layout,
     )
@@ -149,12 +160,14 @@ def conv2d_winograd_f4x3_cblocked(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype=torch.float16,
+    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
 ):
     """NCHW conv2d using Winograd F(4x4,3x3) with NCHWc input layout for coalesced loads.
     Raises ValueError for non-eligible convs."""
     assert x.is_cuda and w_oihw.is_cuda
+    if out_dtype is None:
+        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -187,7 +200,6 @@ def conv2d_winograd_f4x3_cblocked(
         Q,
         C_pad,
         padding,
-        out_dtype,
         activation,
         block_k,
     )
@@ -202,12 +214,14 @@ def conv2d_winograd_f4x3_fused(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype=torch.float16,
+    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
 ):
     """NCHW conv2d using Winograd F(4x4,3x3) with fused GEMM+output transform.
     Raises ValueError for non-eligible convs."""
     assert x.is_cuda and w_oihw.is_cuda
+    if out_dtype is None:
+        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -238,7 +252,6 @@ def conv2d_winograd_f4x3_fused(
         Q,
         C_pad,
         padding,
-        out_dtype,
         activation,
     )
     return y
@@ -252,12 +265,14 @@ def conv2d_1x1(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype=torch.float16,
+    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
     layout="nchw",
 ):
     """NCHW/NHWC conv2d for 1x1 kernels. Raises ValueError for non-1x1."""
     assert x.is_cuda and w_oihw.is_cuda
+    if out_dtype is None:
+        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -286,7 +301,6 @@ def conv2d_1x1(
         Q,
         stride,
         padding,
-        out_dtype,
         activation,
         layout=layout,
     )
@@ -301,12 +315,14 @@ def conv2d_general(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype=torch.float16,
+    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
     layout="nchw",
 ):
     """NCHW/NHWC conv2d using general kernel with prepacked weights (5x5, 7x7, etc.)."""
     assert x.is_cuda and w_oihw.is_cuda
+    if out_dtype is None:
+        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -338,7 +354,6 @@ def conv2d_general(
         stride,
         padding,
         dilation,
-        out_dtype,
         block_k,
         activation,
         layout=layout,
@@ -354,11 +369,13 @@ def conv2d_nhwc_3x3(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype=torch.float16,
+    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
 ):
     """NHWC conv2d for 3x3 kernels. Raises ValueError for non-3x3."""
     assert x.is_cuda and w_oihw.is_cuda
+    if out_dtype is None:
+        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -387,7 +404,6 @@ def conv2d_nhwc_3x3(
         stride,
         padding,
         dilation,
-        out_dtype,
         activation,
     )
     return y
@@ -401,11 +417,13 @@ def conv2d_nchw(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype=torch.float16,
+    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
 ):
     """Hybrid NCHW conv2d: routes to specialized 1x1, 3x3, or general kernel."""
     assert x.is_cuda and w_oihw.is_cuda
+    if out_dtype is None:
+        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -490,7 +508,7 @@ def conv2d_nhwc(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype=torch.float16,
+    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
 ):
     """Conv2d with NHWC (channels-last) input and output.
@@ -500,6 +518,8 @@ def conv2d_nhwc(
     in logical NCHW shape with channels_last strides.
     """
     assert x.is_cuda and w_oihw.is_cuda
+    if out_dtype is None:
+        out_dtype = x.dtype
     x = x.to(memory_format=torch.channels_last)
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
@@ -573,12 +593,14 @@ def conv2d_nchw_cblocked(
     padding=(0, 0),
     dilation=(1, 1),
     activation="none",
-    out_dtype=torch.float16,
+    out_dtype: Optional[torch.dtype] = None,
     block_k=BLOCK_K,
 ):
     """NCHW conv2d with channel-blocked input packing for 3x3 kernels.
     Raises ValueError for non-3x3."""
     assert x.is_cuda and w_oihw.is_cuda
+    if out_dtype is None:
+        out_dtype = x.dtype
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
@@ -613,7 +635,6 @@ def conv2d_nchw_cblocked(
         stride,
         padding,
         dilation,
-        out_dtype,
         activation,
     )
     return y

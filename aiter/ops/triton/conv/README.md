@@ -74,7 +74,7 @@ y = conv2d(
     x, w, bias=None,
     stride=(1, 1), padding=(1, 1), dilation=(1, 1),
     activation="relu",          # "none" | "relu" | "relu6" | "gelu"
-    out_dtype=torch.float16,
+    out_dtype=None,             # None → match input dtype (default)
     layout="nchw",              # "nchw" or "nhwc"
 )
 ```
