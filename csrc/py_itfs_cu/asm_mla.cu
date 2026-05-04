@@ -344,6 +344,13 @@ void mla_decode_stage1_asm_fwd(
                     ": fp8/fp8 with gqa_ratio=64 only supports decode_qlen=1 in persistent mode");
             }
         }
+    } else if (gqa_ratio == 8){
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(!persistent){
+                config_max_seqlen_q = 1;
+                sub_Q = 8;
+            }
+        }
     }
 
     if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio* max_seqlen_q % 128 == 0)){
