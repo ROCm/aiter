@@ -32,7 +32,10 @@ Sink mechanism (from common_fmha.h::fmha_merge_sink_rowwise):
 
 from __future__ import annotations
 
+import argparse
 import math
+import sys
+import time as _t
 from typing import Optional
 
 import pytest
@@ -45,30 +48,44 @@ pytestmark = pytest.mark.skipif(
 
 import aiter
 from aiter.test_common import checkAllclose, run_perftest
+from aiter.test_mha_common import attention_ref  # noqa: F401  (kept for easy swap-back; see doc-block below)
 
 
 # ---------------------------------------------------------------------------
-# Reference implementations.  Inputs accepted as bshd (matches kernel API);
-# output `out` is bshd; `lse` is [b, hq, sq] (matches kernel layout).
+# Reference implementation.  Inputs accepted as bshd (matches kernel API);
+# output `out` is bshd, `lse` is [b, hq, sq] (matches kernel layout).
 #
-# NB: we intentionally *do not* use `aiter.test_mha_common.attention_ref`
-# here — although it's mathematically equivalent (sink as virtual KV with
-# zero V, see test_mha_common.py:584), running it on gfx1250 + ROCm 7.13
-# triggers a downstream driver wedge that causes the *next* ASM kernel
-# launch to hang.  The pure-einsum impl below is hand-derived from
-# fmha_merge_sink_rowwise, runs reliably on gfx1250, and produces
-# bit-identical numerics to attention_ref(... .float() ...).
+# We default to the in-file `_ref_attn` rather than
+# `aiter.test_mha_common.attention_ref` because the latter casts its
+# returned `lse` back to q.dtype (bf16) — see test_mha_common.py:615 —
+# even when called with upcast=True.  That round-trip introduces ~1 bf16
+# ULP of quantization on lse (~3e-2 for sq=8192 d=128), which exceeds
+# tight comparison thresholds.  `_ref_attn` keeps lse in fp32 and
+# matches the kernel to ~5e-6 (essentially fp32 noise floor).
+#
+# attention_ref is still imported above so it is trivial to swap back
+# when (a) the upstream API stops casting lse to bf16, or (b) you only
+# need rtol-based comparison (rtol=1% absorbs the bf16 quantization).
+#
+# Historical aside: an earlier ROCm 7.13 driver could enter a wedged
+# state after many ASM kernel launches, after which ANY GPU op (incl.
+# attention_ref) would hang in uninterruptible sleep until
+# `rocm-smi --gpureset`.  The wedge is environmental, not a property
+# of attention_ref itself.
 # ---------------------------------------------------------------------------
 
-def _ref_attn(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
-    """bshd-in / bshd-out attention reference, sink optional.
 
-    Math:  attn = Q @ K^T,  scale = 1/sqrt(d),
-           denom = sum(exp((attn - max) * scale)) [+ exp((sink_raw - max) * scale)],
+def _ref_attn(q, k, v, *, is_causal: bool, sink: "Optional[torch.Tensor]" = None):
+    """bshd-in / bshd-out attention reference, sink optional.  Pure-einsum
+    fp32 implementation; lse is returned in fp32 (matches kernel's output).
+
+    Math:  attn  = Q @ K^T,   scale = 1/sqrt(d),
+           denom = sum(exp((attn - max) * scale))
+                 [+ exp((sink_raw - max) * scale)],
            out   = (exp((attn - max) * scale) / denom) @ V,
            lse   = max * scale + log(denom).
     sink (optional): [hq] fp32, AITER post-scale; converted internally to
-                     pre-scale raw via × sqrt(d) to match kernel ABI.
+                     pre-scale raw via x sqrt(d) to match kernel ABI.
     """
     b, sq, hq, d = q.shape
     _, sk, hk, _ = k.shape
@@ -77,14 +94,14 @@ def _ref_attn(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
         v = v.repeat_interleave(hq // hk, dim=2)
     qf, kf, vf = q.float(), k.float(), v.float()
     scale = 1.0 / math.sqrt(d)
-    attn = torch.einsum("bshd,bkhd->bhsk", qf, kf)              # raw, no scale
+    attn = torch.einsum("bshd,bkhd->bhsk", qf, kf)
     if is_causal:
         m = torch.triu(torch.ones(sq, sk, dtype=torch.bool, device=q.device),
                        sk - sq + 1)
         attn = attn.masked_fill(m, float("-inf"))
-    max_attn, _ = attn.max(dim=-1)                              # [b, hq, sq]
+    max_attn, _ = attn.max(dim=-1)
     if sink is not None:
-        sink_raw = sink.float() * math.sqrt(d)                  # [hq]
+        sink_raw = sink.float() * math.sqrt(d)
         sink_raw_bhs = sink_raw[None, :, None].expand(b, hq, sq)
         max_total = torch.maximum(max_attn, sink_raw_bhs)
     else:
@@ -95,11 +112,13 @@ def _ref_attn(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
         denom_total = denom_real + sink_term
     else:
         denom_total = denom_real
-    probs = torch.exp((attn - max_total.unsqueeze(-1)) * scale) \
-            / denom_total.unsqueeze(-1)
+    probs = torch.exp((attn - max_total.unsqueeze(-1)) * scale) / denom_total.unsqueeze(-1)
     out = torch.einsum("bhsk,bkhd->bshd", probs, vf).to(q.dtype)
-    lse = torch.log(denom_total) + max_total * scale            # [b, hq, sq]
+    lse = torch.log(denom_total) + max_total * scale
     return out, lse
+
+
+
 
 
 def _cmp(a: torch.Tensor, b: torch.Tensor, *, rtol=1e-2, atol=1e-2, msg: str = ""):
@@ -114,6 +133,45 @@ def _cmp(a: torch.Tensor, b: torch.Tensor, *, rtol=1e-2, atol=1e-2, msg: str = "
     a32 = a.detach().float().cpu()
     b32 = b.detach().float().cpu()
     checkAllclose(a32, b32, rtol=rtol, atol=atol, msg=msg)
+
+
+def _nrms(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    """Normalized RMS error on fp32 CPU tensors (avoids bf16 GPU element-wise hang).
+
+    Definition matches op_tests/test_mha_mxfp8.py:
+        nrms = sqrt(sum((|a-b| / max(|b|, eps))^2)) /
+               (sqrt(numel) * max(|a|.max, |b|.max, eps))
+    A small relative metric (~1e-3 for bf16, ~1e-6 for fp32) regardless of
+    output magnitude — useful complement to the absolute max-diff check.
+    """
+    a32 = actual.detach().float().cpu()
+    b32 = expected.detach().float().cpu()
+    abs_diff = (a32 - b32).abs()
+    eps      = 1e-7
+    max_item = max(a32.abs().max().item(), b32.abs().max().item(), eps)
+    sq_diff  = (abs_diff / b32.abs().clamp(min=eps)).pow(2)
+    return (sq_diff.sum().sqrt() / (math.sqrt(b32.numel()) * max_item)).item()
+
+
+def _bench(fn, *args, num_iters: int = 10, num_warmup: int = 2, **kwargs) -> float:
+    """CUDA-Event-based per-iter timing (us).
+
+    Bypasses run_perftest because torch.profiler / ROCTracer drops kernel
+    events on gfx1250 + ROCm 7.x (warning: "ROCTracer produced duplicate
+    flow start"), making run_perftest report 0 us / inf TFLOPS.
+    """
+    for _ in range(num_warmup):
+        fn(*args, **kwargs)
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(num_iters):
+        fn(*args, **kwargs)
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1000.0 / num_iters   # ms->us, per-iter
+
 
 
 # ---------------------------------------------------------------------------
@@ -152,26 +210,63 @@ def make_qkv_bshd(layout: int, sq: int, sk: int, batch: int, hq: int, hk: int, d
     return q, k, v
 
 
+def _d64_sink(hq: int, device: str) -> torch.Tensor:
+    """Non-zero sink for D64: fixed per-head values in AITER post-scale domain.
+
+    Values in [0.5, 2.0]; varies across heads to exercise broadcast.
+    """
+    return torch.linspace(0.5, 2.0, hq, dtype=torch.float32, device=device)
+
+
+# ---------------------------------------------------------------------------
+# Kernel / reference helpers (mxfp8-style: one-line wrappers used by tests).
+# ---------------------------------------------------------------------------
+
+def run_kernel(q, k, v, *, scale: float, is_causal: bool,
+               sink: Optional[torch.Tensor] = None,
+               via: str = "ops"):
+    """Call the kernel and return (out, lse).
+
+    via = "ops"        → low-level aiter.fmha_fwd_f16_asm
+    via = "public"     → public aiter.flash_attn_func (dispatcher → asm path)
+    """
+    if via == "ops":
+        return aiter.fmha_fwd_f16_asm(
+            q, k, v, scale, is_causal, True, sink=sink,
+        )
+    if via == "public":
+        r = aiter.flash_attn_func(
+            q, k, v,
+            softmax_scale=scale, causal=is_causal,
+            return_lse=True, sink_ptr=sink,
+        )
+        return r[0], r[1]
+    raise ValueError(f"unknown via={via!r}")
+
+
+def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
+    """Reference (out, lse) computed on the same bshd tensors via the in-file
+    `_ref_attn`.  See doc-block above for why we don't use
+    `aiter.test_mha_common.attention_ref` directly.
+    """
+    return _ref_attn(q, k, v, is_causal=is_causal, sink=sink)
+
+
 # ---------------------------------------------------------------------------
 # Correctness tests (sbhd input → bshd output, compare against bhsd reference)
 # ---------------------------------------------------------------------------
 
-def _d64_sink(hq: int, device: str) -> torch.Tensor:
-    """Non-zero sink for D64: fixed per-head values in AITER post-scale domain."""
-    # Use values in [0.5, 2.0] post-scale; vary across heads for thorough test
-    return torch.linspace(0.5, 2.0, hq, dtype=torch.float32, device=device)
-
-
+@pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize(
-    "batch,hq,hk,sq,sk",
+    "hq,hk,sq,sk",
     [
-        # Shapes from run.sh aligned tests: batch=1, kv_head_num=4, gqa=16
+        # Shapes from run.sh aligned tests: kv_head_num=4, gqa=16
         # → q_head_num = 4 * 16 = 64
-        (1, 8, 1,  128, 2048),   # aligned (test_d64 / test_d128)
-        (1, 8, 1,  130, 2048),   # q unaligned: sq not mult of 128
-        (1, 8, 1,  128, 2300),   # kv unaligned: sk not mult of 256
+        (8, 1,  128, 2048),   # aligned (test_d64 / test_d128)
+        (8, 1,  130, 2048),   # q unaligned: sq not mult of 128
+        (8, 1,  128, 2300),   # kv unaligned: sk not mult of 256
     ],
 )
 def test_fmha_fwd_f16_correctness(batch, hq, hk, sq, sk, head_dim, is_causal):
@@ -189,20 +284,19 @@ def test_fmha_fwd_f16_correctness(batch, hq, hk, sq, sk, head_dim, is_causal):
     # D128 -> no sink (kernel ignores it)
     sink = _d64_sink(hq, device) if head_dim == 64 else None
 
-    _r = aiter.flash_attn_func(
-        q, k, v,
-        softmax_scale=scale, causal=is_causal,
-        return_lse=True, sink_ptr=sink,
+    out_kernel, lse_asm = run_kernel(
+        q, k, v, scale=scale, is_causal=is_causal, sink=sink, via="public",
     )
-    out_kernel, lse_asm = _r[0], _r[1]
+    out_ref, lse_ref = run_ref(q, k, v, is_causal=is_causal, sink=sink)
 
-    # Reference: bshd in / bshd out (matches kernel layout, no permute needed)
-    out_ref, lse_ref = _ref_attn(q, k, v, is_causal=is_causal, sink=sink)
+    nrms_o = _nrms(out_kernel, out_ref)
+    print(f"[corr d={head_dim} causal={is_causal} b={batch} sq={sq} sk={sk}] "
+          f"nrms(out)={nrms_o:.3e}")
 
     _cmp(out_kernel, out_ref, rtol=1e-2, atol=1e-2,
-         msg=f"out mismatch (d={head_dim}, causal={is_causal})")
+         msg=f"out mismatch (d={head_dim}, causal={is_causal}, b={batch})")
     _cmp(lse_asm, lse_ref, rtol=1e-2, atol=1e-2,
-         msg=f"lse mismatch (d={head_dim}, causal={is_causal})")
+         msg=f"lse mismatch (d={head_dim}, causal={is_causal}, b={batch})")
 
 
 def test_fmha_fwd_f16_ops_layer():
@@ -217,11 +311,11 @@ def test_fmha_fwd_f16_ops_layer():
     scale = 1.0 / math.sqrt(d)
     sink  = _d64_sink(hq, device)
 
-    out_kernel, lse_asm = aiter.fmha_fwd_f16_asm(
-        q, k, v, scale, False, True, sink=sink,
+    out_kernel, lse_asm = run_kernel(
+        q, k, v, scale=scale, is_causal=False, sink=sink, via="ops",
     )
+    out_ref, lse_ref = run_ref(q, k, v, is_causal=False, sink=sink)
 
-    out_ref, lse_ref = _ref_attn(q, k, v, is_causal=False, sink=sink)
     _cmp(out_kernel, out_ref, rtol=1e-2, atol=1e-2)
     _cmp(lse_asm, lse_ref, rtol=1e-2, atol=1e-2)
 
@@ -261,13 +355,10 @@ def test_fmha_fwd_f16_layout(layout, head_dim):
     scale = 1.0 / math.sqrt(head_dim)
     sink  = _d64_sink(hq, device) if head_dim == 64 else None
 
-    _r = aiter.flash_attn_func(
-        q, k, v,
-        softmax_scale=scale, causal=False, return_lse=True, sink_ptr=sink,
+    out_kernel, lse_asm = run_kernel(
+        q, k, v, scale=scale, is_causal=False, sink=sink, via="public",
     )
-    out_kernel, lse_asm = _r[0], _r[1]
-
-    out_ref, lse_ref = _ref_attn(q, k, v, is_causal=False, sink=sink)
+    out_ref, lse_ref = run_ref(q, k, v, is_causal=False, sink=sink)
 
     _cmp(out_kernel, out_ref, rtol=1e-2, atol=1e-2,
          msg=f"out mismatch (layout={layout}, d={head_dim})")
@@ -303,22 +394,14 @@ def test_fmha_fwd_f16_via_flash_attn_func(head_dim, is_causal):
                              hq=hq, hk=hk, d=head_dim,
                              dtype=torch.bfloat16, device=device)
     scale = 1.0 / math.sqrt(head_dim)
-    sink_ptr = _d64_sink(hq, device) if head_dim == 64 else None
+    sink  = _d64_sink(hq, device) if head_dim == 64 else None
 
-    # Direct ops-layer
-    out_direct, lse_direct = aiter.fmha_fwd_f16_asm(
-        q, k, v, scale, is_causal, True, sink=sink_ptr,
+    out_direct, lse_direct = run_kernel(
+        q, k, v, scale=scale, is_causal=is_causal, sink=sink, via="ops",
     )
-
-    # Through public API
-    result = aiter.flash_attn_func(
-        q, k, v,
-        softmax_scale=scale,
-        causal=is_causal,
-        return_lse=True,
-        sink_ptr=sink_ptr,
+    out_via, lse_via = run_kernel(
+        q, k, v, scale=scale, is_causal=is_causal, sink=sink, via="public",
     )
-    out_via, lse_via = result[0], result[1]
 
     # Same kernel, same args -> bit-identical (cast to fp32 to avoid bf16
     # element-wise hang in some ROCm builds).
@@ -352,24 +435,104 @@ def test_fmha_fwd_f16_perf(head_dim, is_causal):
     scale = 1.0 / math.sqrt(head_dim)
     sink  = _d64_sink(hq, device) if head_dim == 64 else None
 
-    _, us = run_perftest(
+    us = _bench(
         aiter.fmha_fwd_f16_asm,
         q, k, v,
         scale, is_causal, False,
-        num_iters=10, num_warmup=2,
         sink=sink,
+        num_iters=10, num_warmup=2,
     )
     flops = 2.0 * batch * hq * sq * sk * (2 * head_dim)
     if is_causal:
         flops /= 2.0
     tflops = flops / (us * 1e-6) / 1e12
     print(f"[perf] d={head_dim} causal={is_causal}: {us:.1f}us, {tflops:.2f} TFLOPS")
+    # Sanity: catch silent-PASS when timing infrastructure breaks (e.g. profiler
+    # / ROCTracer drops events → us=0, TFLOPS=inf).  Without these asserts the
+    # test would PASS with bogus numbers.
+    assert us > 0.0, (
+        f"perf timing returned us={us}; timing path broken "
+        f"(run with -s to see live numbers)"
+    )
+    assert math.isfinite(tflops) and 0 < tflops < 5000, (
+        f"TFLOPS={tflops} not finite / out of plausible range; "
+        f"likely broken timing"
+    )
 
 
 # ---------------------------------------------------------------------------
-# __main__: CLI single-shape runner
+# CLI single-shape runner: shared by `__main__` invocation and ad-hoc usage.
 # ---------------------------------------------------------------------------
-import argparse
+
+def run_cli(*, batch: int, hq: int, hk: int, sq: int, sk: int, head_dim: int,
+            causal: bool = False, layout: int = 0,
+            do_ref: bool = False, do_perf: bool = False) -> int:
+    """Single-shape runner.
+
+    Returns 0 on success, 1 if --ref check fails.  Prints a one-line summary
+    of kernel shape / time and (if requested) ref / perf metrics.
+    """
+    device = "cuda"
+    torch.manual_seed(0)
+    assert hq % hk == 0, "q_head_num must be a multiple of kv_head_num"
+
+    print(f"Shape: b={batch} hq={hq} hk={hk} sq={sq} sk={sk} d={head_dim} "
+          f"causal={causal} layout={layout}", flush=True)
+
+    q, k, v = make_qkv_bshd(layout=layout, sq=sq, sk=sk, batch=batch,
+                             hq=hq, hk=hk, d=head_dim,
+                             dtype=torch.bfloat16, device=device)
+    scale = 1.0 / math.sqrt(head_dim)
+    sink  = _d64_sink(hq, device) if head_dim == 64 else None
+    torch.cuda.synchronize()
+
+    t0 = _t.time()
+    out_kernel, lse_asm = run_kernel(
+        q, k, v, scale=scale, is_causal=causal, sink=sink, via="ops",
+    )
+    torch.cuda.synchronize()
+    print(f"asm time: {(_t.time()-t0)*1000:.2f} ms", flush=True)
+    print(f"out.shape={tuple(out_kernel.shape)}  lse.shape={tuple(lse_asm.shape)}",
+          flush=True)
+
+    rc = 0
+    if do_ref:
+        out_ref, lse_ref = run_ref(q, k, v, is_causal=causal, sink=sink)
+        diff_o  = (out_kernel.float() - out_ref.float()).abs().max().item()
+        diff_l  = (lse_asm.float() - lse_ref.float()).abs().max().item()
+        nrms_o  = _nrms(out_kernel, out_ref)
+        # Pass criterion (bf16 attention conventional thresholds):
+        #   |dO|   <= 2e-2   |dLSE| <= 2e-2
+        ok_o = diff_o <= 2e-2
+        ok_l = diff_l <= 2e-2
+        print(f"ref:  max|dO|={diff_o:.4f} {'OK' if ok_o else 'FAIL'}   "
+              f"max|dLSE|={diff_l:.4f} {'OK' if ok_l else 'FAIL'}   "
+              f"nrms(O)={nrms_o:.3e}",
+              flush=True)
+        if not (ok_o and ok_l):
+            rc = 1
+
+    if do_perf:
+        us = _bench(
+            aiter.fmha_fwd_f16_asm,
+            q, k, v, scale, causal, False,
+            sink=sink,
+            num_iters=10, num_warmup=2,
+        )
+        flops = 2.0 * batch * hq * sq * sk * (2 * head_dim)
+        if causal:
+            flops /= 2.0
+        tflops = flops / (us * 1e-6) / 1e12
+        print(f"perf: {us:.1f} us  ({tflops:.2f} TFLOPS)", flush=True)
+        # CLI surfaces the same breakage pytest would: us=0 / TFLOPS=inf
+        # signals broken timing infra (profiler / ROCTracer event drop).
+        if not (us > 0.0 and math.isfinite(tflops) and 0 < tflops < 5000):
+            print(f"perf: WARNING — bogus timing (us={us}, tflops={tflops})",
+                  flush=True)
+            rc = 1
+
+    return rc
+
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -394,67 +557,22 @@ parser.add_argument("-l",  "--layout",     type=int, choices=[0, 1, 2], default=
                          "(API always sees bshd shape; non-zero layout returns a\n"
                          "non-contiguous bshd view of the underlying memory)")
 parser.add_argument("--ref",  action="store_true",
-                    help="also run PyTorch reference and print max diff")
+                    help="also run PyTorch reference and print max diff + nrms")
 parser.add_argument("--perf", action="store_true",
                     help="run perf benchmark for this shape (10 iters, 2 warmup)")
 
 if __name__ == "__main__":
     args = parser.parse_args()
-
-    device = "cuda"
-    torch.manual_seed(0)
-
-    b, hq, hk = args.batch, args.q_head_num, args.kv_head_num
-    sq, sk, d = args.seqlen_q, args.seqlen_k, args.head_dim
-    causal = args.causal
-    assert hq % hk == 0, "q_head_num must be a multiple of kv_head_num"
-    print(f"Shape: b={b} hq={hq} hk={hk} sq={sq} sk={sk} d={d} causal={causal} "
-          f"layout={args.layout}", flush=True)
-
-    q, k, v = make_qkv_bshd(layout=args.layout, sq=sq, sk=sk, batch=b,
-                             hq=hq, hk=hk, d=d,
-                             dtype=torch.bfloat16, device=device)
-    scale = 1.0 / math.sqrt(d)
-    sink  = _d64_sink(hq, device) if d == 64 else None
-    torch.cuda.synchronize()
-
-    import time as _t
-    t0 = _t.time()
-    out_kernel, lse_asm = aiter.fmha_fwd_f16_asm(
-        q, k, v, scale, causal, True, sink=sink,
+    rc = run_cli(
+        batch=args.batch,
+        hq=args.q_head_num,
+        hk=args.kv_head_num,
+        sq=args.seqlen_q,
+        sk=args.seqlen_k,
+        head_dim=args.head_dim,
+        causal=args.causal,
+        layout=args.layout,
+        do_ref=args.ref,
+        do_perf=args.perf,
     )
-    torch.cuda.synchronize()
-    print(f"asm time: {(_t.time()-t0)*1000:.2f} ms", flush=True)
-    print(f"out.shape={tuple(out_kernel.shape)}  lse.shape={tuple(lse_asm.shape)}", flush=True)
-
-    if args.ref:
-        # ref takes bshd directly (matches kernel layout).
-        out_ref, lse_ref = _ref_attn(q, k, v, is_causal=causal, sink=sink)
-        # cast asm output to fp32 to avoid bf16 element-wise hang in some ROCm builds
-        out_kernel_f = out_kernel.float()
-        out_ref_f    = out_ref.float()
-        diff_o = (out_kernel_f - out_ref_f).abs().max().item()
-        diff_l = (lse_asm - lse_ref).abs().max().item()
-        # Pass criterion (bf16 attention conventional thresholds):
-        #   |dO|   <= 2e-2   |dLSE| <= 2e-2
-        ok_o = diff_o <= 2e-2
-        ok_l = diff_l <= 2e-2
-        print(f"ref:  max|dO|={diff_o:.4f} {'OK' if ok_o else 'FAIL'}   "
-              f"max|dLSE|={diff_l:.4f} {'OK' if ok_l else 'FAIL'}",
-              flush=True)
-        if not (ok_o and ok_l):
-            import sys
-            sys.exit(1)
-
-    if args.perf:
-        _, us = run_perftest(
-            aiter.fmha_fwd_f16_asm,
-            q, k, v, scale, causal, False,
-            num_iters=10, num_warmup=2,
-            sink=sink,
-        )
-        flops = 2.0 * b * hq * sq * sk * (2 * d)
-        if causal:
-            flops /= 2.0
-        tflops = flops / (us * 1e-6) / 1e12
-        print(f"perf: {us:.1f} us  ({tflops:.2f} TFLOPS)", flush=True)
+    sys.exit(rc)

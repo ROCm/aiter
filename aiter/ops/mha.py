@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 from torch import Generator, Tensor
@@ -275,8 +275,10 @@ def fmha_v3_fwd(
 # API contract: q/k/v are **bshd shape** ([batch, seq, head, dim]); strides are
 # read directly from the tensor so non-contiguous bshd-shaped views (e.g. of
 # sbhd / bhsd allocations) are accepted.  Only `tensor.stride(-1) == 1` is
-# required.  The .cu host driver multiplies softmax_scale by sqrt(head_dim)
-# before kernel launch (kernel uses pre-scale convention).
+# required.  softmax_scale is forwarded to the kernel as-is (the kernel
+# applies it internally to Q·K^T before softmax).  sink (when provided) is
+# in AITER post-scale convention; the .cu host driver multiplies it by
+# sqrt(qk_head_dim) to convert to the kernel's pre-scale raw-logit domain.
 # ---------------------------------------------------------------------------
 def gen_fmha_fwd_f16_asm_fake_tensors(
     q: Tensor,
@@ -287,7 +289,7 @@ def gen_fmha_fwd_f16_asm_fake_tensors(
     return_lse: bool,
     sink: Optional[Tensor] = None,
     out: Optional[Tensor] = None,
-) -> List[Tensor]:
+) -> Tuple[Tensor, Tensor]:
     batch, q_seq_len, q_head_num, _ = q.shape
     d_v = v.size(3)
     fake_out = (
@@ -295,12 +297,10 @@ def gen_fmha_fwd_f16_asm_fake_tensors(
         else torch.empty((batch, q_seq_len, q_head_num, d_v),
                          dtype=q.dtype, device=q.device)
     )
-    if return_lse:
-        fake_lse = torch.empty(
-            (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
-        )
-        return [fake_out, fake_lse]
-    return [fake_out]
+    fake_lse = torch.empty(
+        (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
+    )
+    return (fake_out, fake_lse)
 
 
 @compile_ops(
@@ -317,7 +317,7 @@ def fmha_fwd_f16_asm(
     return_lse: bool,
     sink: Optional[Tensor] = None,
     out: Optional[Tensor] = None,
-) -> List[Tensor]: ...
+) -> Tuple[Tensor, Tensor]: ...
 
 
 def cmdGenFunc_mha_varlen_fwd(
@@ -1412,8 +1412,10 @@ def _flash_attn_forward(
 
     if can_impl_fmha_fwd_f16():
         # gfx1250 ASM bf16 path: q/k/v are bshd; kernel reads strides directly,
-        # no API-side permute.  sink_ptr forwarded as-is (post-scale); the .cu
-        # multiplies by sqrt(qk_head_dim) before kernel launch.
+        # no API-side permute.  softmax_scale is forwarded as-is (kernel applies
+        # it internally to Q·K^T).  sink_ptr is in AITER post-scale convention;
+        # the .cu host driver multiplies it by sqrt(qk_head_dim) to convert to
+        # the kernel's pre-scale raw-logit domain before launch.
         sink_for_kernel = sink_ptr
         if hdim_q == 64 and sink_for_kernel is None:
             # D64 kernels always read SINK; auto-fill zero-logit so callers

@@ -5,7 +5,7 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
-        "extra_ldflags": "['-L/opt/rocm/lib', '-Wl,-rpath,/opt/rocm/lib']",
+        "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
         "torch_exclude": "True",

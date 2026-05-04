@@ -257,7 +257,16 @@ std::vector<at::Tensor> fmha_fwd_f16(at::Tensor&                      q,
     args.stride_k_seq    = stride_k_seq;
     args.stride_k_head   = stride_k_head;
     args.stride_k_batch  = stride_k_batch;
-    args.opt             = 0;
+    // s_opt SGPR (kernarg dword @ offset 0xF0): packs three host-side switches.
+    // Bit layout must stay in lockstep with poc_kl/.../fmha_fwd_f16.cpp::opt_packed
+    // and the S_OPT_BIT_* defines in BF16_FMHA_FWD_*.sp3:
+    //   bit0: reverse_kv   (compile-time gated by CAS_MASK build; ignored by mask=0 kernels)
+    //   bit1: double_q     (compile-time gated by DOUBLE_Q   build; ignored by non-_dq kernels)
+    //   bit2: remap_xy     (must be 1 — we swap gdx/gdy at launch below)
+    // 7 = 0b111 enables all three.  Safe for the four shipped _brd_rxy /
+    // _cas_brd_rxy [_sink] .co binaries because bits 0/1 are compile-time
+    // gated off in those builds; bit2 matches the gdx/gdy swap on launch.
+    args.opt             = 7;
     args.lse             = return_lse ? 1 : 0;
     args.kv_seq_len      = kv_seq_len;
     args.qk_head_dim     = qk_head_dim;
@@ -353,7 +362,12 @@ std::vector<at::Tensor> fmha_fwd_f16(at::Tensor&                      q,
 
     std::vector<at::Tensor> ret;
     ret.push_back(out);
-    if (return_lse) ret.push_back(lse);
+    // Always return LSE in slot [1].  When return_lse==false the kernel skips
+    // writing it (args.lse=0) so the data is undefined; callers that don't
+    // need LSE should simply ignore the second tensor.  Keeping a fixed
+    // 2-tuple return matches torch.library schema requirements (compile_ops
+    // / infer_schema only accepts fixed-arity Tuple).
+    ret.push_back(lse);
     return ret;
 }
 
