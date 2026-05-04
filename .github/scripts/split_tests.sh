@@ -170,6 +170,16 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a8w8_per_token_scale.py]=17
     FILE_TIMES[op_tests/triton_tests/quant/test_fused_fp8_quant.py]=17
     FILE_TIMES[op_tests/triton_tests/test_gather_kv_b_proj.py]=16
+    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_gemm_a16w16.py]=19
+    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_activation.py]=11
+    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_moe_routing.py]=10
+    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_rope.py]=9
+    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_softmax.py]=8
+    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_fused_mul_add.py]=7
+    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_quant_per_tensor.py]=7
+    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_quant_per_token.py]=7
+    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_rmsnorm.py]=7
+    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_topk.py]=5
     FILE_TIMES[op_tests/triton_tests/attention/test_extend_attention.py]=7
     FILE_TIMES[op_tests/triton_tests/fusions/test_fused_qk_concat.py]=7
     FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a8w8_blockscale.py]=7

@@ -29,6 +29,7 @@ from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.utility.base_tuner import GemmCommonTuner
@@ -506,6 +507,13 @@ class Gemm:
                 )
                 if self.k / splitK < subK:
                     break
+                # splitK kernels use a semaphore array of size gdx*gdy; skip
+                # candidates where the grid exceeds the semaphore workspace limit.
+                if splitK > 1:
+                    gdx = (self.n + tile_n - 1) // tile_n
+                    gdy = (self.m + tile_m - 1) // tile_m
+                    if gdx * gdy > ASM_SPLITK_MAX_GRID:
+                        continue
                 task_asm.append(
                     (
                         info,
@@ -579,8 +587,11 @@ class Gemm:
         task = []
         flydsl_catalog = get_flydsl_bf16_catalog(self.m, self.n, self.k)
         weight_idx = 6 if self.is_shuffle else 1
+        min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
         for solidx, kernel_name, config in flydsl_catalog:
             if config["b_preshuffle"] != self.is_shuffle:
+                continue
+            if config["tile_m"] > max(self.m, min_tile_m):
                 continue
             if self.n < config["tile_n"] or self.n % config["tile_n"] != 0:
                 continue
