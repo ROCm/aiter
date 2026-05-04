@@ -1277,7 +1277,25 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
-    if (
+    # FlyDSL fused-quant kernels (e.g. flydsl_moe_stage1 with _fp4/_fp8
+    # suffix) return (out, out_scale_sorted) when fused quantization is
+    # active.  Unpack so downstream code treats a2 as a plain tensor.
+    _fused_a2_scale = None
+    if isinstance(a2, tuple):
+        a2_raw, _fused_a2_scale = a2
+        if a2_raw.dtype == dtypes.fp4x2:
+            _fp4_bytes = token_num * topk * (inter_dim // 2)
+            a2 = (
+                a2_raw.view(-1)
+                .view(torch.uint8)[:_fp4_bytes]
+                .view(dtypes.fp4x2)
+                .reshape(token_num, topk, -1)
+            )
+        else:
+            a2 = a2_raw.view(token_num, topk, -1)
+    if _fused_a2_scale is not None:
+        a2_scale = _fused_a2_scale
+    elif (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
