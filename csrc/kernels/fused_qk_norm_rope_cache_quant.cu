@@ -1925,7 +1925,29 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
     const int warp_id             = threadIdx.x / WARP_SIZE;
     const int num_warps_per_block = blockDim.x / WARP_SIZE;
     const int global_warp_id      = blockIdx.x * num_warps_per_block + warp_id;
-    if(global_warp_id >= total_warps_quad)
+
+    // ---------- branch hoist (uniform Q/K split, scalar cmp) ----------
+    // Block layout is 256 threads = 4 physical waves × 2 logical warps each
+    // (WARP_SIZE here is 32, half of the 64-lane physical wave). Within a
+    // physical wave the two halves have consecutive global_warp_id values
+    // X and X+1, so `is_q = global_warp_id < warp_q_end` is uniform across
+    // the full 64-lane wave iff `warp_q_end = T*QUAD_Q_CT` is even — which
+    // is guaranteed when QUAD_Q_CT is even. Same logic for total_warps_quad
+    // = T*(QUAD_Q_CT + QUAD_K_CT). For our deployed instances Q,K ∈ {4,6,8}
+    // both are even, so we can `readfirstlane` the warp_id and let the
+    // compiler emit `s_cmp + s_cbranch` instead of the per-lane
+    // `v_cmp + s_and_saveexec + s_xor + s_cbranch_execz` sequence (saves a
+    // few cycles + EXEC-mask thrash on every wave). For odd QUAD_*_CT (e.g.
+    // H=12 → QUAD=3) the boundary may cut a wave, so we keep the original
+    // divergent path. `spec` below stays per-lane (it differs between the
+    // two logical warps of a physical wave by design).
+    constexpr bool kBranchUniform =
+        (QUAD_Q_CT > 0) && (QUAD_Q_CT % 2 == 0) &&
+        (QUAD_K_CT > 0) && (QUAD_K_CT % 2 == 0);
+    const int branch_warp_id = kBranchUniform
+                                   ? __builtin_amdgcn_readfirstlane(global_warp_id)
+                                   : global_warp_id;
+    if(branch_warp_id >= total_warps_quad)
     {
         return;
     }
@@ -1944,7 +1966,7 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
     const int quad_q     = (QUAD_Q_CT > 0) ? QUAD_Q_CT : (num_heads_q / 4);
     const int quad_k     = (QUAD_K_CT > 0) ? QUAD_K_CT : (num_heads_k / 4);
     const int warp_q_end = num_tokens * quad_q;
-    const bool is_q      = global_warp_id < warp_q_end;
+    const bool is_q      = branch_warp_id < warp_q_end;
 
     const int lane_full        = threadIdx.x % WARP_SIZE; // 0..31
     const int lane_in_half     = lane_full & (LANES_PER_HEAD - 1); // 0..15
