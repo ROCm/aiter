@@ -23,6 +23,30 @@ BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
 
+_splitk_scratch_cache: dict[tuple[torch.dtype, torch.device], torch.Tensor] = {}
+
+
+def _get_splitk_scratch(
+    shape: tuple, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Return a zeroed scratch buffer, reusing a cached allocation when possible.
+
+    Avoids per-call hipMalloc by keeping a persistent flat buffer per
+    (dtype, device) pair.  The buffer grows monotonically to accommodate
+    the largest shape ever requested.
+    """
+    numel = 1
+    for s in shape:
+        numel *= s
+    key = (dtype, device)
+    buf = _splitk_scratch_cache.get(key)
+    if buf is None or buf.numel() < numel:
+        buf = torch.empty(numel, dtype=dtype, device=device)
+        _splitk_scratch_cache[key] = buf
+    out = buf[:numel].view(shape)
+    out.zero_()
+    return out
+
 
 def _moe_sorting_impl(
     topk_ids,
@@ -1418,10 +1442,8 @@ def asm_stage1(
 
     tmp_out = out
     if ksplit > 0:
-        tmp_out = torch.zeros(
-            (token_num, topk, w1.shape[1]),
-            dtype=dtypes.fp32,
-            device=device,
+        tmp_out = _get_splitk_scratch(
+            (token_num, topk, w1.shape[1]), dtypes.fp32, device
         ).view(dtype)
 
     aiter.moe_stage1_g1u1(
@@ -1733,10 +1755,9 @@ def ck_moe_stage1(
     token_num = hidden_states.shape[0]
     is_splitk = quant_type is aiter.QuantType.per_1x128 and splitk > 1
     if is_splitk:
-        # CK kernel zeros this buffer via hipMemsetAsync when KBatch > 1
         sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
-        tmp_out = torch.empty(
-            (sorted_size, w1.shape[1]), dtype=dtypes.fp32, device=out.device
+        tmp_out = _get_splitk_scratch(
+            (sorted_size, w1.shape[1]), dtypes.fp32, out.device
         )
     else:
         tmp_out = out
@@ -1807,8 +1828,8 @@ def cktile_moe_stage1(
     # min(token_num * topk * block_m, sorted_token_ids.shape[0]) and slice
     # valid_out = tmp_out[:token_num * topk, :] before silu_and_mul/gelu_and_mul.
     tmp_out = (
-        torch.zeros(
-            (token_num, topk, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
+        _get_splitk_scratch(
+            (token_num, topk, w1.shape[1]), hidden_states.dtype, out.device
         )
         if split_k > 1
         else out
