@@ -365,6 +365,30 @@ def fused_moe_(
         )
 
 
+_scale_t_cache: dict = {}
+
+
+def _get_scale_t_buf(scale: torch.Tensor) -> torch.Tensor:
+    rows, cols = scale.shape[-2], scale.shape[-1]
+    key = (scale.device.index, cols, rows, scale.dtype)
+    if key not in _scale_t_cache:
+        _scale_t_cache[key] = torch.empty(
+            (cols, rows), dtype=scale.dtype, device=scale.device
+        )
+    return _scale_t_cache[key]
+
+
+_quant_func_cache: dict = {}
+
+
+def _get_quant_func_transpose(quant_type):
+    if quant_type not in _quant_func_cache:
+        _quant_func_cache[quant_type] = functools.partial(
+            get_quant(quant_type), transpose_scale=True
+        )
+    return _quant_func_cache[quant_type]
+
+
 def fused_moe_1stage(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -440,7 +464,7 @@ def fused_moe_1stage(
             quant_func = get_quant(quant_type)
             if hidden_states.dtype != q_dtype_a:
                 if quant_type == QuantType.per_1x128:
-                    quant_func = functools.partial(quant_func, transpose_scale=True)
+                    quant_func = _get_quant_func_transpose(quant_type)
                 a1, a1_scale = quant_func(
                     hidden_states,
                     scale=a1_scale,
@@ -453,7 +477,7 @@ def fused_moe_1stage(
                 ), "a1_scale must be provided for quantized input for fused_moe"
                 a1 = hidden_states
                 if quant_type == QuantType.per_1x128:
-                    scale_t = torch.empty_like(a1_scale)
+                    scale_t = _get_scale_t_buf(a1_scale)
                     aiter.partial_transpose(
                         scale_t, a1_scale, num_rows=num_local_tokens
                     )
