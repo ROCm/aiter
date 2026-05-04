@@ -273,10 +273,14 @@ def run_hip(
     transpose_scale: bool,
     quant_out_dtype: torch.dtype,
     gemma_norm: bool = False,
+    no_quant: bool = False,
 ):
     m, n1 = x1.shape
     num_scale_cols = n1 // group_size
-    if quant_out_dtype == dtypes.fp8:
+    if no_quant:
+        x1_q = None
+        x1_s = None
+    elif quant_out_dtype == dtypes.fp8:
         x1_q = torch.empty((m, n1), dtype=dtypes.fp8, device=x1.device)
         if transpose_scale:
             # Match Triton's transposed-storage convention while keeping the public shape [m, g].
@@ -292,7 +296,8 @@ def run_hip(
         x1_s = torch.empty((m, num_scale_cols), dtype=torch.uint8, device=x1.device)
     else:
         raise ValueError(f"Unsupported quant_out_dtype={quant_out_dtype}")
-    x1_u = torch.empty_like(x1) if output_unquantized_inp1 else None
+    # In no-quant mode q_out_unquantized is the only x1 output; force-allocate it.
+    x1_u = torch.empty_like(x1) if (output_unquantized_inp1 or no_quant) else None
     x2_out = torch.empty_like(x2) if x2 is not None else None
     res_out = torch.empty_like(x1) if res1 is not None else None
 
@@ -329,7 +334,11 @@ def test_fused_qk_rmsnorm_group_quant(
     transpose_scale: bool = True,
     quant_out_dtype: torch.dtype = dtypes.fp8,
     gemma_norm: bool = False,
+    no_quant: bool = False,
 ):
+    # No-quant mode only writes q_out_unquantized; force unquantized output and skip Triton.
+    if no_quant:
+        output_unquantized_inp1 = True
     assert token > 0
     assert num_head1 > 0
     assert num_head2 >= 0
@@ -473,12 +482,13 @@ def test_fused_qk_rmsnorm_group_quant(
         quant_out_dtype,
         gemma_norm=gemma_norm,
     )
-    has_triton_fp8 = quant_out_dtype == dtypes.fp8 and not gemma_norm
+    has_triton_fp8 = quant_out_dtype == dtypes.fp8 and not gemma_norm and not no_quant
     has_triton_fp4 = (
         quant_out_dtype == dtypes.fp4x2
         and group_size == 32
         and not transpose_scale
         and not gemma_norm
+        and not no_quant
     )
     has_triton = has_triton_fp8 or has_triton_fp4
     if has_triton_fp8:
@@ -524,6 +534,7 @@ def test_fused_qk_rmsnorm_group_quant(
         transpose_scale,
         quant_out_dtype,
         gemma_norm=gemma_norm,
+        no_quant=no_quant,
     )
 
     (x1_q_torch, x1_s_torch), x1_torch, x2_torch, res_torch = torch_out
@@ -537,71 +548,79 @@ def test_fused_qk_rmsnorm_group_quant(
         res_triton = None
     (x1_q_hip, x1_s_hip), x1_hip, x2_hip, res_hip = hip_out
 
-    if quant_out_dtype == dtypes.fp8:
-        q_atol = 0.05
-        q_rtol = 0.05
-        x1_deq_torch = _upcast_group_fp8(
-            x1_q_torch,
-            _recover_row_major_scale(x1_s_torch, transpose_scale),
-            group_size,
-        )
-        x1_deq_hip = _upcast_group_fp8(
-            x1_q_hip, _recover_row_major_scale(x1_s_hip, transpose_scale), group_size
-        )
-        x1_deq_triton = (
-            _upcast_group_fp8(
-                x1_q_triton,
-                _recover_row_major_scale(x1_s_triton, transpose_scale),
+    triton_error_rate = None
+    hip_error_rate = None
+    if no_quant:
+        # Quant outputs are not produced; only x1_unquantized vs torch reference is meaningful.
+        # checkAllclose against x1_torch is performed below in the output_unquantized_inp1 block.
+        pass
+    else:
+        if quant_out_dtype == dtypes.fp8:
+            q_atol = 0.05
+            q_rtol = 0.05
+            x1_deq_torch = _upcast_group_fp8(
+                x1_q_torch,
+                _recover_row_major_scale(x1_s_torch, transpose_scale),
                 group_size,
             )
-            if has_triton
-            else None
-        )
-    elif quant_out_dtype == dtypes.fp4x2:
-        q_atol = 0.5
-        q_rtol = 0.5
-        x1_deq_torch = _upcast_group_fp4x2(x1_q_torch, x1_s_torch, group_size)
-        x1_deq_hip = _upcast_group_fp4x2(x1_q_hip, x1_s_hip, group_size)
-        x1_deq_triton = (
-            _upcast_group_fp4x2(x1_q_triton, x1_s_triton, group_size)
-            if has_triton
-            else None
-        )
-    else:
-        raise ValueError(f"Unsupported quant_out_dtype={quant_out_dtype}")
+            x1_deq_hip = _upcast_group_fp8(
+                x1_q_hip,
+                _recover_row_major_scale(x1_s_hip, transpose_scale),
+                group_size,
+            )
+            x1_deq_triton = (
+                _upcast_group_fp8(
+                    x1_q_triton,
+                    _recover_row_major_scale(x1_s_triton, transpose_scale),
+                    group_size,
+                )
+                if has_triton
+                else None
+            )
+        elif quant_out_dtype == dtypes.fp4x2:
+            q_atol = 0.5
+            q_rtol = 0.5
+            x1_deq_torch = _upcast_group_fp4x2(x1_q_torch, x1_s_torch, group_size)
+            x1_deq_hip = _upcast_group_fp4x2(x1_q_hip, x1_s_hip, group_size)
+            x1_deq_triton = (
+                _upcast_group_fp4x2(x1_q_triton, x1_s_triton, group_size)
+                if has_triton
+                else None
+            )
+        else:
+            raise ValueError(f"Unsupported quant_out_dtype={quant_out_dtype}")
 
-    if has_triton:
+        if has_triton:
+            checkAllclose(
+                x1_deq_torch,
+                x1_deq_triton,
+                rtol=q_rtol,
+                atol=q_atol,
+                msg=f"check dequantized x1 torch vs triton, m={m}, n1={n1}, n2={n2}",
+            )
         checkAllclose(
             x1_deq_torch,
-            x1_deq_triton,
-            rtol=q_rtol,
-            atol=q_atol,
-            msg=f"check dequantized x1 torch vs triton, m={m}, n1={n1}, n2={n2}",
-        )
-    checkAllclose(
-        x1_deq_torch,
-        x1_deq_hip,
-        rtol=q_rtol,
-        atol=q_atol,
-        msg=f"check dequantized x1 torch vs hip, m={m}, n1={n1}, n2={n2}",
-    )
-    if has_triton:
-        checkAllclose(
-            x1_deq_triton,
             x1_deq_hip,
             rtol=q_rtol,
             atol=q_atol,
-            msg=f"check dequantized x1, m={m}, n1={n1}, n2={n2}",
+            msg=f"check dequantized x1 torch vs hip, m={m}, n1={n1}, n2={n2}",
         )
+        if has_triton:
+            checkAllclose(
+                x1_deq_triton,
+                x1_deq_hip,
+                rtol=q_rtol,
+                atol=q_atol,
+                msg=f"check dequantized x1, m={m}, n1={n1}, n2={n2}",
+            )
 
-    triton_error_rate = None
-    hip_error_rate = checkAllclose(
-        x1_deq_torch, x1_deq_hip, rtol=q_rtol, atol=q_atol, printLog=False
-    )
-    if has_triton:
-        triton_error_rate = checkAllclose(
-            x1_deq_torch, x1_deq_triton, rtol=q_rtol, atol=q_atol, printLog=False
+        hip_error_rate = checkAllclose(
+            x1_deq_torch, x1_deq_hip, rtol=q_rtol, atol=q_atol, printLog=False
         )
+        if has_triton:
+            triton_error_rate = checkAllclose(
+                x1_deq_torch, x1_deq_triton, rtol=q_rtol, atol=q_atol, printLog=False
+            )
 
     if x2 is not None:
         if has_triton:
@@ -716,15 +735,16 @@ def test_fused_qk_rmsnorm_group_quant(
             hip_error_rate,
         )
     else:
+        hip_err_str = "N/A" if hip_error_rate is None else ("%.6f" % hip_error_rate)
         aiter.logger.info(
             "[result] %s | time(us): hip=%.2f | "
             "bw(TB/s): hip=%.3f hip/mi308_peak=%.1f%% | "
-            "err: hip_rate=%.6f",
+            "err: hip_rate=%s",
             info,
             hip_us,
             hip_bw_tbps,
             (hip_bw_tbps / MI308_BW_MAX_TBPS) * 100.0,
-            hip_error_rate,
+            hip_err_str,
         )
 
     return {
@@ -872,6 +892,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Test gemma-style RMSNorm: x * rsqrt(mean(x^2)+eps) * (1+w) instead of standard * w.",
     )
+    parser.add_argument(
+        "--no_quant",
+        action="store_true",
+        help=(
+            "Also exercise the no-quant path (q_out_scale=None): kernel only does RMSNorm "
+            "and writes q_out_unquantized. Adds the no_quant=True axis alongside no_quant=False."
+        ),
+    )
     args = parser.parse_args()
 
     if args.dtype is not None:
@@ -937,6 +965,9 @@ if __name__ == "__main__":
     if args.residual is not None:
         l_residual = args.residual
 
+    # When --no_quant, exercise both the quant and the no-quant code paths.
+    l_no_quant = [False, True] if args.no_quant else [False]
+
     df = []
     for dtype in [dtypes.d_dtypes[k] for k in l_dtype]:
         for quant_out_dtype_name in l_quant_type:
@@ -948,20 +979,25 @@ if __name__ == "__main__":
                     for num_head1 in l_num_head1:
                         for num_head2 in l_num_head2:
                             for add_residual in l_residual:
-                                row = test_fused_qk_rmsnorm_group_quant(
-                                    dtype=dtype,
-                                    token=token,
-                                    num_head1=num_head1,
-                                    num_head2=num_head2,
-                                    add_residual=bool(add_residual),
-                                    head_dim=head_dim,
-                                    group_size=args.group_size,
-                                    output_unquantized_inp1=args.output_unquantized_inp1,
-                                    transpose_scale=args.transpose_scale,
-                                    quant_out_dtype=quant_out_dtype,
-                                    gemma_norm=args.gemma_norm,
-                                )
-                                df.append(row)
+                                for no_quant in l_no_quant:
+                                    # Skip redundant fp4x2/no_quant pairs: no-quant ignores quant dtype.
+                                    if no_quant and quant_out_dtype_name == "fp4x2":
+                                        continue
+                                    row = test_fused_qk_rmsnorm_group_quant(
+                                        dtype=dtype,
+                                        token=token,
+                                        num_head1=num_head1,
+                                        num_head2=num_head2,
+                                        add_residual=bool(add_residual),
+                                        head_dim=head_dim,
+                                        group_size=args.group_size,
+                                        output_unquantized_inp1=args.output_unquantized_inp1,
+                                        transpose_scale=args.transpose_scale,
+                                        quant_out_dtype=quant_out_dtype,
+                                        gemma_norm=args.gemma_norm,
+                                        no_quant=no_quant,
+                                    )
+                                    df.append(row)
 
     df = pd.DataFrame(df)
     focus_df = _focus_summary_df(df)

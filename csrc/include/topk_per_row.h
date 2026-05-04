@@ -10,7 +10,7 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
                            int64_t numRows,
                            int64_t stride0,
                            int64_t stride1,
-                           int64_t k = -1);
+                           int64_t k = 2048);
 
 void top_k_per_row_decode(const torch::Tensor& logits,
                           int64_t next_n,
@@ -19,4 +19,4 @@ void top_k_per_row_decode(const torch::Tensor& logits,
                           int64_t numRows,
                           int64_t stride0,
                           int64_t stride1,
-                          int64_t k = -1);
+                          int64_t k = 2048);

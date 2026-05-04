@@ -207,7 +207,7 @@ def top_k_per_row_prefill(
     numRows: int,
     stride0: int,
     stride1: int,
-    k: int = -1,
+    k: int = 2048,
 ) -> None: ...
 
 
@@ -233,7 +233,7 @@ def top_k_per_row_decode(
     numRows: int,
     stride0: int,
     stride1: int,
-    k: int = -1,
+    k: int = 2048,
 ) -> None: ...
 
 
