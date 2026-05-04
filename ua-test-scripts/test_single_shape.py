@@ -177,6 +177,41 @@ def run_triton(out, tensors, args):
     )
 
 
+def compute_flops_and_bandwidth(args):
+    """Compute theoretical FLOPs and memory bandwidth for attention."""
+    total_q = args.batch * args.seqlen_q
+
+    # FLOPs calculation for attention: Q@K^T, softmax, attn@V
+    # Q@K^T: [total_q, num_q_heads, head_dim] @ [seqlen_k, num_kv_heads, head_dim]^T
+    # For GQA, each query head group shares KV heads
+    # FLOPs ≈ 2 * total_q * seqlen_k * head_dim * num_q_heads (QK^T matmul)
+    #       + 2 * total_q * seqlen_k * head_dim * num_q_heads (attn@V matmul)
+    flops = 4 * total_q * args.seqlen_k * args.head_size * args.num_q_heads
+
+    # Memory calculation (bytes transferred)
+    bytes_per_elem = 2 if args.dtype == 'bf16' else 2  # bf16 or fp16
+
+    # Read Q: total_q * num_q_heads * head_dim
+    mem_q = total_q * args.num_q_heads * args.head_size * bytes_per_elem
+
+    # Read K cache: batch * seqlen_k * num_kv_heads * head_dim
+    mem_k = args.batch * args.seqlen_k * args.num_kv_heads * args.head_size * bytes_per_elem
+
+    # Read V cache: batch * seqlen_k * num_kv_heads * head_dim
+    mem_v = args.batch * args.seqlen_k * args.num_kv_heads * args.head_size * bytes_per_elem
+
+    # Write O: total_q * num_q_heads * head_dim
+    mem_o = total_q * args.num_q_heads * args.head_size * bytes_per_elem
+
+    total_mem_bytes = mem_q + mem_k + mem_v + mem_o
+
+    return {
+        'flops': flops,
+        'mem_bytes': total_mem_bytes,
+        'mem_gb': total_mem_bytes / 1e9
+    }
+
+
 def time_kernel(fn, warmup, iters, use_graph=False):
     """Time a kernel function."""
     # Warmup
@@ -400,7 +435,25 @@ def main():
         elif run_triton_kernel:
             print(f"  Triton:  {triton_ms:8.4f} ms")
 
+        # Compute TFLOPs and bandwidth
+        compute_info = compute_flops_and_bandwidth(args)
+        print()
+        print("Performance Metrics:")
+
+        if run_ck_kernel and ck_ok and not math.isnan(ck_ms):
+            ck_tflops = (compute_info['flops'] / 1e12) / (ck_ms / 1e3)
+            ck_bw_gbs = compute_info['mem_gb'] / (ck_ms / 1e3)
+            print(f"  CK TFLOPs:       {ck_tflops:8.2f}")
+            print(f"  CK Bandwidth:    {ck_bw_gbs:8.2f} GB/s")
+
+        if run_triton_kernel and not math.isnan(triton_ms):
+            triton_tflops = (compute_info['flops'] / 1e12) / (triton_ms / 1e3)
+            triton_bw_gbs = compute_info['mem_gb'] / (triton_ms / 1e3)
+            print(f"  Triton TFLOPs:   {triton_tflops:8.2f}")
+            print(f"  Triton Bandwidth:{triton_bw_gbs:8.2f} GB/s")
+
         if args.test and ck_ok and run_ck_kernel and run_triton_kernel:
+            print()
             print(f"  Correctness: ✓ PASS")
 
         print_separator('=')
