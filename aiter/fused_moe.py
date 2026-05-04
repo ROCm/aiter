@@ -1204,6 +1204,7 @@ def fused_moe_2stages(
                 num_rows=num_local_tokens,
             )
             from aiter.utility import fp4_utils
+
             a1_scale = fp4_utils.moe_mxfp4_sort(
                 a1_scale,
                 sorted_ids=sorted_ids,
@@ -1324,6 +1325,7 @@ def fused_moe_2stages(
                 num_rows_factor=topk,
             )
             from aiter.utility import fp4_utils
+
             a2_scale = fp4_utils.moe_mxfp4_sort(
                 a2_scale[: token_num * topk, :].view(token_num, topk, -1),
                 sorted_ids=sorted_ids,
