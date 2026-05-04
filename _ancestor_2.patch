@@ -1,0 +1,141 @@
+--- a/aiter/fused_moe.py
++++ b/aiter/fused_moe.py
+@@ -68,6 +68,57 @@
+     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+ 
+ 
++# Cache for moe_sorting output buffers. Safe to reuse across decode steps because
++# decode is sequential (single-threaded forward pass) and buffer shapes are fixed
++# for a given model configuration.
++_moe_sorting_buf_cache: dict = {}
++
++
++def _get_moe_sorting_bufs(M, topk, num_experts, block_size, model_dim, moebuf_dtype, device):
++    key = (device.index, M, topk, num_experts, block_size, model_dim, moebuf_dtype)
++    if key not in _moe_sorting_buf_cache:
++        max_num_tokens_padded = int(M * topk + num_experts * block_size - topk)
++        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
++        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
++        sorted_weights = torch.empty(max_num_tokens_padded, dtype=dtypes.fp32, device=device)
++        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
++        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
++        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
++        _moe_sorting_buf_cache[key] = (
++            sorted_ids,
++            sorted_weights,
++            sorted_expert_ids,
++            num_valid_ids,
++            moe_buf,
++        )
++    return _moe_sorting_buf_cache[key]
++
++
++# Cache for transposed-scale quant functools.partial objects, keyed by quant_type.
++_quant_func_t_cache: dict = {}
++
++
++def _get_quant_func_transpose(quant_type):
++    if quant_type not in _quant_func_t_cache:
++        _quant_func_t_cache[quant_type] = functools.partial(
++            get_quant(quant_type), transpose_scale=True
++        )
++    return _quant_func_t_cache[quant_type]
++
++
++# Cache for transposed-shape scale buffers, keyed on (device.index, cols, rows, dtype).
++_scale_t_cache: dict = {}
++
++
++def _get_scale_t_buf(scale):
++    device = scale.device
++    # scale shape is (rows, cols) or similar; transposed buffer has same shape
++    key = (device.index, scale.shape[-1], scale.shape[0] if scale.dim() > 1 else 1, scale.dtype)
++    if key not in _scale_t_cache:
++        _scale_t_cache[key] = torch.empty_like(scale)
++    return _scale_t_cache[key]
++
++
+ def moe_sorting(
+     topk_ids,
+     topk_weights,
+@@ -79,29 +130,39 @@
+     num_local_tokens=None,
+     dispatch_policy=0,
+ ):
+-    try:
+-        return _moe_sorting_impl(
+-            topk_ids,
+-            topk_weights,
+-            num_experts,
+-            model_dim,
+-            moebuf_dtype,
+-            block_size,
+-            expert_mask,
+-            num_local_tokens,
+-            dispatch_policy,
+-            use_opus=not _USE_CK_MOE_SORTING,
+-        )
+-    except Exception as e:
+-        logger.error(f"Error in moe_sorting: {e}")
+-        max_num_tokens_padded = int(
+-            topk_ids.numel() + num_experts * block_size - topk_ids.shape[1]
+-        )
+-        topk = topk_ids.shape[1]
+-        logger.error(
+-            f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
+-        )
+-        raise e
++    M, topk = topk_ids.shape
++    device = topk_ids.device
++    use_opus = not _USE_CK_MOE_SORTING
++
++    if expert_mask is None:
++        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
++            _get_moe_sorting_bufs(M, topk, num_experts, block_size, model_dim, moebuf_dtype, device)
++        )
++    else:
++        max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
++        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
++        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
++        sorted_weights = torch.empty(max_num_tokens_padded, dtype=dtypes.fp32, device=device)
++        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
++        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
++        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
++
++    fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
++    fwd_fn(
++        topk_ids,
++        topk_weights,
++        sorted_ids,
++        sorted_weights,
++        sorted_expert_ids,
++        num_valid_ids,
++        moe_buf,
++        num_experts,
++        int(block_size),
++        expert_mask,
++        num_local_tokens,
++        dispatch_policy,
++    )
++    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+ 
+ 
+ # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
+@@ -440,7 +501,7 @@
+             quant_func = get_quant(quant_type)
+             if hidden_states.dtype != q_dtype_a:
+                 if quant_type == QuantType.per_1x128:
+-                    quant_func = functools.partial(quant_func, transpose_scale=True)
++                    quant_func = _get_quant_func_transpose(quant_type)
+                 a1, a1_scale = quant_func(
+                     hidden_states,
+                     scale=a1_scale,
+@@ -453,7 +514,7 @@
+                 ), "a1_scale must be provided for quantized input for fused_moe"
+                 a1 = hidden_states
+                 if quant_type == QuantType.per_1x128:
+-                    scale_t = torch.empty_like(a1_scale)
++                    scale_t = _get_scale_t_buf(a1_scale)
+                     aiter.partial_transpose(
+                         scale_t, a1_scale, num_rows=num_local_tokens
+                     )
