@@ -16,6 +16,8 @@ env:
   VLLM_BRANCH: "main"
   VLLM_REPOSITORY_URL: "https://github.com/vllm-project/vllm"
   BASE_IMAGE: rocm/vllm-dev:nightly
+  DOCKER_PULL_MAX_ATTEMPTS: "3"
+  DOCKER_PULL_RETRY_DELAY_SECONDS: "10"
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-whl-${{ github.run_id }}
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -81,7 +83,7 @@ jobs:
       - name: Build Aiter wheel in vLLM base image
         run: |
           set -euo pipefail
-          docker pull ${{ env.BASE_IMAGE }}
+          bash .github/scripts/docker_pull_with_retry.sh "${{ env.BASE_IMAGE }}"
           docker run --rm \
             --network=host \
             -v "${{ github.workspace }}:/workspace" \
@@ -144,6 +146,14 @@ jobs:
             extra_env_args: -e VLLM_USE_TRITON_FLASH_ATTN=0
         
     steps:
+      - name: Checkout Docker pull retry helper
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          sparse-checkout: |
+            .github/scripts
+
       - name: Download Aiter wheel artifact
         uses: actions/download-artifact@v4
         with:
@@ -170,7 +180,7 @@ jobs:
 
       - name: Download the vLLM base image
         run: |
-          docker pull ${{ env.BASE_IMAGE }}
+          bash .github/scripts/docker_pull_with_retry.sh "${{ env.BASE_IMAGE }}"
     
       - name: Run benchmarks
         run: |
