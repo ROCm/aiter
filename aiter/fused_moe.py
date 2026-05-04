@@ -21,7 +21,8 @@ from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 
 BLOCK_SIZE_M = 32
 
-_USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+# Default to Opus unless CK sorting is explicitly requested.
+_USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 
 
 def _moe_sorting_impl(
@@ -89,7 +90,7 @@ def moe_sorting(
             expert_mask,
             num_local_tokens,
             dispatch_policy,
-            use_opus=_USE_OPUS_MOE_SORTING,
+            use_opus=not _USE_CK_MOE_SORTING,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -263,7 +264,7 @@ def fused_moe_(
         and a1_scale is not None
     ):
         q_dtype_a = dtypes.fp8
-    bf16_fp8_bound = 512
+    bf16_fp8_bound = 256
     if quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
@@ -378,6 +379,7 @@ def fused_moe_1stage(
     block_size_M=32,
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
+    xbf16=False,
     kernelName: str = "",
     # following for quant
     q_dtype_a=None,
@@ -430,25 +432,32 @@ def fused_moe_1stage(
             activation,
         )
     else:
-        quant_func = get_quant(quant_type)
-        if hidden_states.dtype != q_dtype_a:
-            if quant_type == QuantType.per_1x128:
-                quant_func = functools.partial(quant_func, transpose_scale=True)
-            a1, a1_scale = quant_func(
-                hidden_states,
-                scale=a1_scale,
-                quant_dtype=q_dtype_a,
-                num_rows=num_local_tokens,
-            )
-        else:
-            assert (
-                a1_scale is not None or quant_type == QuantType.No
-            ), "a1_scale must be provided for quantized input for fused_moe"
+        if xbf16:
+            # xquant happens inside the asm kernel for per_1x128
             a1 = hidden_states
-            if quant_type == QuantType.per_1x128:
-                scale_t = torch.empty_like(a1_scale)
-                aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
-                a1_scale = scale_t
+            a1_scale = torch.empty(0, device="cuda")
+        else:
+            quant_func = get_quant(quant_type)
+            if hidden_states.dtype != q_dtype_a:
+                if quant_type == QuantType.per_1x128:
+                    quant_func = functools.partial(quant_func, transpose_scale=True)
+                a1, a1_scale = quant_func(
+                    hidden_states,
+                    scale=a1_scale,
+                    quant_dtype=q_dtype_a,
+                    num_rows=num_local_tokens,
+                )
+            else:
+                assert (
+                    a1_scale is not None or quant_type == QuantType.No
+                ), "a1_scale must be provided for quantized input for fused_moe"
+                a1 = hidden_states
+                if quant_type == QuantType.per_1x128:
+                    scale_t = torch.empty_like(a1_scale)
+                    aiter.partial_transpose(
+                        scale_t, a1_scale, num_rows=num_local_tokens
+                    )
+                    a1_scale = scale_t
 
         token_num = hidden_states.shape[0]
         E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -621,6 +630,7 @@ class MOEMetadata:
     run_1stage: bool = False
     has_bias: bool = False
     use_non_temporal_load: bool = True
+    fuse_quant: str = ""
 
 
 def _flydsl_stage1_wrapper(
@@ -637,12 +647,16 @@ def _flydsl_stage1_wrapper(
     w1_scale=None,
     a1_scale=None,
     sorted_weights=None,
+    out_scale=None,
+    out_scale_sorted=None,
+    bias1=None,
     **_kwargs,
 ):
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    _a_scale_one = parsed.get("a_scale_one", False)
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
         w1=w1,
@@ -661,6 +675,14 @@ def _flydsl_stage1_wrapper(
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
+        use_async_copy=True,
+        k_batch=parsed.get("k_batch", 1),
+        waves_per_eu=parsed.get("waves_per_eu", 3),
+        b_nt=parsed.get("b_nt", 2),
+        gate_mode=parsed.get("gate_mode", "separated"),
+        bias=bias1,
+        a_scale_one=_a_scale_one,
+        xcd_swizzle=parsed.get("xcd_swizzle", 0),
     )
 
 
@@ -677,6 +699,7 @@ def _flydsl_stage2_wrapper(
     w2_scale=None,
     a2_scale=None,
     sorted_weights=None,
+    bias2=None,
     **_kwargs,
 ):
 
@@ -701,6 +724,11 @@ def _flydsl_stage2_wrapper(
         w2_scale=w2_scale,
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
+        sort_block_m=parsed.get("sort_block_m", 0),
+        b_nt=parsed.get("b_nt", 0),
+        persist=parsed.get("persist", None),
+        bias=bias2,
+        xcd_swizzle=parsed.get("xcd_swizzle", 0),
     )
 
 
@@ -815,27 +843,11 @@ def get_2stage_cfgs(
         )
         logger.info("\033[0m")
 
-    def use_cfg():
-        problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
-        bypass_type = (
-            ActivationType.Silu,
-            dtypes.bf16,
-            dtypes.fp8,
-            dtypes.fp8,
-            QuantType.per_1x128,
-        )
-        if problem_type == bypass_type and (token * topk) <= 128:  # bypass tuned
-            aiter.logger.info("bypass tuned results for fp8 blockscale")
-            return False
-        return True
-
-    # cfg = cfg_2stages.get(keys, None)
-    cfg = cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None
+    cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
-        # cfg = cfg_2stages.get(keys, None)
         cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
@@ -863,6 +875,7 @@ def get_2stage_cfgs(
         kernelName1 = ""
         kernelName2 = ""
         run_1stage = False
+        run_1stage_xbf16 = False
         if (
             activation,
             q_type,
@@ -881,6 +894,9 @@ def get_2stage_cfgs(
                 run_1stage = token > 16 or inter_dim % 128 != 0
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
+
+            if run_1stage and q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
+                run_1stage_xbf16 = int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
 
         block_m = (
             BLOCK_SIZE_M
@@ -902,18 +918,31 @@ def get_2stage_cfgs(
         )
         use_non_temporal_load = use_nt(token, topk, expert)
         aiter.logger.info(
-            f"run_1stage = {run_1stage}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
+            f"run_1stage = {run_1stage}, xbf16 = {run_1stage_xbf16}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
     else:
         block_m = cfg["block_m"]
-        ksplit = cfg["ksplit"]
+        if int(os.environ.get("AITER_KSPLIT", "0")) != -1:
+            ksplit = cfg["ksplit"]
+        else:
+            ksplit = 0
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
+        if not is_shuffled and not run_1stage:
+            logger.warning(
+                f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
+                "Tuned kernels are optimized for preshuffled weights (preshuffle_on). "
+                "Running with preshuffle_off may produce incorrect results."
+            )
+        if "xbf16" in cfg:
+            run_1stage_xbf16 = run_1stage and bool(int(cfg["xbf16"]))
+        else:
+            run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
-        f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
+        f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
     )
 
     def get_block_m() -> int:
@@ -934,6 +963,7 @@ def get_2stage_cfgs(
                 kernelName=kernelName1,
                 activation=activation,
                 quant_type=q_type,
+                xbf16=run_1stage_xbf16,
             ),
             None,
             block_m,
@@ -943,6 +973,7 @@ def get_2stage_cfgs(
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
+        _s1_fq = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
         if is_flydsl1:
             stage1_func = functools.partial(
                 _flydsl_stage1_wrapper,
@@ -974,12 +1005,21 @@ def get_2stage_cfgs(
                 use_non_temporal_load=use_non_temporal_load,
             )
 
+        _has_bias = (
+            activation == ActivationType.Swiglu
+            and q_type == QuantType.per_1x32
+            and dtype in [dtypes.bf16, dtypes.fp16]
+        )
+        _s1_fp8q = is_flydsl1 and "_fp8" in kernelName1.split("_t")[-1]
+        _fuse_quant = "fp8" if _s1_fp8q else ("fp4" if _s1_fq else "")
         return MOEMetadata(
             stage1_func,
             stage2_func,
             block_m,
             int(ksplit),
             run_1stage,
+            has_bias=_has_bias,
+            fuse_quant=_fuse_quant,
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -992,6 +1032,7 @@ def get_2stage_cfgs(
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
+                split_k=max(ksplit, 1),
             ),
             functools.partial(
                 cktile_moe_stage2,
@@ -1128,7 +1169,6 @@ def fused_moe_2stages(
     bias2=None,
 ):
     quant_func = get_quant(quant_type)
-    token_num_quant_moe_sort_switch = 1024
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = moe_out.dtype
@@ -1173,7 +1213,10 @@ def fused_moe_2stages(
         a1 = hidden_states.to(dtypes.fp8)
         M = sorted_ids.shape[0]
         N = a1.shape[-1]
-        a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
+        if metadata.fuse_quant == "fp8":
+            a1_scale = torch.empty([1], dtype=dtypes.fp8_e8m0, device=a1.device)
+        else:
+            a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
 
     elif quant_type == QuantType.per_1x32:
         if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
@@ -1187,30 +1230,15 @@ def fused_moe_2stages(
                 token_num=token_num,
                 cols=model_dim,
             )
-        elif token_num <= token_num_quant_moe_sort_switch:
+        else:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
                 hidden_states,
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
-                topk=1,
+                topk=topk,
                 block_size=block_size_M,
-            )
-        else:
-            a1, a1_scale = quant_func(
-                hidden_states,
-                scale=a1_scale,
-                quant_dtype=q_dtype_a,
                 num_rows=num_local_tokens,
-            )
-            from aiter.utility import fp4_utils
-
-            a1_scale = fp4_utils.moe_mxfp4_sort(
-                a1_scale,
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=token_num,
-                block_size=block_size_M,
             )
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
@@ -1257,7 +1285,7 @@ def fused_moe_2stages(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        a2,
+        None if metadata.fuse_quant else a2,
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,
@@ -1267,24 +1295,18 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
-    # FlyDSL fused-quant kernels (e.g. flydsl_moe_stage1 with _fp4/_fp8
-    # suffix) return (out, out_scale_sorted) when fused quantization is
-    # active.  Unpack so downstream code treats a2 as a plain tensor.
-    _fused_a2_scale = None
-    if isinstance(a2, tuple):
-        a2_raw, _fused_a2_scale = a2
-        if a2_raw.dtype == dtypes.fp4x2:
-            _fp4_bytes = token_num * topk * (inter_dim // 2)
-            a2 = (
-                a2_raw.view(-1)
-                .view(torch.uint8)[:_fp4_bytes]
-                .view(dtypes.fp4x2)
-                .reshape(token_num, topk, -1)
-            )
-        else:
-            a2 = a2_raw.view(token_num, topk, -1)
-    if _fused_a2_scale is not None:
-        a2_scale = _fused_a2_scale
+    if metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
+        a2_raw, a2_scale = a2[0], a2[1]
+        _fp4_bytes = token_num * topk * (inter_dim // 2)
+        a2 = (
+            a2_raw.view(-1)
+            .view(torch.uint8)[:_fp4_bytes]
+            .view(dtypes.fp4x2)
+            .reshape(token_num, topk, -1)
+        )
+    elif metadata.fuse_quant == "fp8" and isinstance(a2, tuple):
+        a2, a2_scale = a2[0], a2[1]
+        a2 = a2.view(token_num, topk, -1)
     elif (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1307,32 +1329,15 @@ def fused_moe_2stages(
         a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
-        if token_num <= token_num_quant_moe_sort_switch:
-            a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
-                a2,
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=token_num,
-                topk=topk,
-                block_size=block_size_M,
-            )
-        else:
-            a2, a2_scale = quant_func(
-                a2,
-                scale=a2_scale,
-                quant_dtype=q_dtype_a,
-                num_rows=num_local_tokens,
-                num_rows_factor=topk,
-            )
-            from aiter.utility import fp4_utils
-
-            a2_scale = fp4_utils.moe_mxfp4_sort(
-                a2_scale[: token_num * topk, :].view(token_num, topk, -1),
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=token_num,
-                block_size=block_size_M,
-            )
+        a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
+            a2,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token_num,
+            topk=topk,
+            block_size=block_size_M,
+            num_rows=num_local_tokens,
+        )
         a2 = a2.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         a2_v = a2[:token_num, :, :]
@@ -1729,11 +1734,9 @@ def ck_moe_stage1(
     token_num = hidden_states.shape[0]
     is_splitk = quant_type is aiter.QuantType.per_1x128 and splitk > 1
     if is_splitk:
-        # CK kernel uses sorted_size as its M dimension and scatters output via
-        # sorted_token_ids.  The output buffer must have at least sorted_size rows
-        # so that the kernel's tile-based writes stay in bounds.
+        # CK kernel zeros this buffer via hipMemsetAsync when KBatch > 1
         sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
-        tmp_out = torch.zeros(
+        tmp_out = torch.empty(
             (sorted_size, w1.shape[1]), dtype=dtypes.fp32, device=out.device
         )
     else:
@@ -1761,9 +1764,9 @@ def ck_moe_stage1(
     if is_splitk:
         valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, valid_out)
+            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
         else:
-            aiter.gelu_and_mul(out, valid_out)
+            aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
     return out
 
 
@@ -1798,6 +1801,12 @@ def cktile_moe_stage1(
         D = D * 8
 
     out = torch.empty((token_num, topk, D), dtype=dtype, device=hidden_states.device)
+    # WARNING: when split_k > 1, this allocation has the same undersized buffer
+    # pattern fixed in ck_moe_stage1 (see ROCm/aiter#2508). If the CK tile
+    # kernel calls hipMemsetAsync with sorted_size rows, this will overflow.
+    # When fp32 splitk is enabled, apply the same fix: use sorted_size =
+    # min(token_num * topk * block_m, sorted_token_ids.shape[0]) and slice
+    # valid_out = tmp_out[:token_num * topk, :] before silu_and_mul/gelu_and_mul.
     tmp_out = (
         torch.zeros(
             (token_num, topk, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
@@ -1904,7 +1913,8 @@ def fused_topk(
     )
 
     if (
-        (expert, topk)
+        get_gfx() in ["gfx942", "gfx950"]
+        and (expert, topk)
         in [
             (128, 4),
             (128, 6),
