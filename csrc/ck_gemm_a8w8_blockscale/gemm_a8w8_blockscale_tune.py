@@ -86,19 +86,23 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
 
 
 def run_gemm_a8w8_blockscale_cktile(
-    x, weight, x_scale, w_scale, out, kernel_id, splitK, preshuffleB
+    x, weight, x_scale, w_scale, out, kernel_id, splitK, preshuffleB, y_is_zeroed=False
 ):
     """
     Run gemm a8w8 blockscale tuned kernel for ck_tile type.
+
+    When ``y_is_zeroed=True`` the kernel skips its internal ``Y.zero_()`` for
+    splitK>0; this models the producer-fused zero-init configuration so the
+    measured time reflects the GEMM-only cost the demo aims to deliver.
     """
 
     if preshuffleB:
         return aiter.gemm_a8w8_blockscale_bpreshuffle_cktile_tune(
-            x, weight, x_scale, w_scale, out, kernel_id, splitK
+            x, weight, x_scale, w_scale, out, kernel_id, splitK, True, y_is_zeroed
         )
     else:
         return aiter.gemm_a8w8_blockscale_cktile_tune(
-            x, weight, x_scale, w_scale, out, kernel_id, splitK
+            x, weight, x_scale, w_scale, out, kernel_id, splitK, False, y_is_zeroed
         )
 
 
@@ -162,7 +166,12 @@ def generate_data(m, n, k, seed, device="cuda"):
     x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device=device)
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device=device)
     weight_shuffle = shuffle_weight(weight, layout=(16, 16))
-    out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
+    # Use zeros(): when y_is_zeroed=True the cktile tune entry skips the
+    # in-kernel Y.zero_(); the harness needs Y to start zeroed for the first
+    # iteration to produce a representative GEMM measurement.  Subsequent
+    # iterations will see accumulated Y for splitK>0, but FP arithmetic still
+    # exercises the same instruction path so timing remains representative.
+    out = torch.zeros(m, n, dtype=dtypes.bf16, device=device)
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     zero_bias = torch.zeros((1, n), dtype=torch.float32, device=device)
     return {
@@ -194,6 +203,19 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         """
 
         super().__init__(name, keys, resultList, description)
+        # CKTile-only flag: pass y_is_zeroed=True to the cktile tune entry so
+        # the kernel skips its internal Y.zero_() for splitK>0.  Used to model
+        # the producer-fused zero-init configuration when picking the best
+        # kernel for the splitK_fused demo path.
+        self.parser.add_argument(
+            "--y_is_zeroed",
+            action="store_true",
+            default=False,
+            required=False,
+            help="(cktile only) Tune assuming Y is pre-zeroed by an upstream "
+            "producer; the cktile splitK>0 candidates skip Y.zero_() and the "
+            "measured time excludes the zero-init cost.",
+        )
 
     def run(self, args, fast_mode=False):
         if getattr(args, "preshuffle", False):
@@ -296,6 +318,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleB,
         block_per_cu,
         run_kwargs,
+        y_is_zeroed=False,
     ):
         gfx, cu_num, M, N, K = info_keys
         # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
@@ -347,6 +370,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             i,
                             splitK,
                             preshuffleB,
+                            y_is_zeroed,
                         ),
                         dict(run_kwargs),
                         run_torch,
@@ -627,6 +651,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         isPreshuffleB,
                         block_per_cu,
                         run_kwargs,
+                        y_is_zeroed=getattr(args, "y_is_zeroed", False),
                     )
                 )
             if lib in ("asm", "all"):

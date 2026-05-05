@@ -610,7 +610,8 @@ namespace py = pybind11;
           py::arg("Out"),                       \
           py::arg("kernelId")    = 0,           \
           py::arg("splitK")      = 0,           \
-          py::arg("preshuffleB") = false);
+          py::arg("preshuffleB") = false,       \
+          py::arg("y_is_zeroed") = false);
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_PYBIND \
     m.def("gemm_a8w8_blockscale_bpreshuffle",   \
@@ -660,7 +661,8 @@ namespace py = pybind11;
           py::arg("Out"),                                   \
           py::arg("kernelId")    = 0,                       \
           py::arg("splitK")      = 0,                       \
-          py::arg("preshuffleB") = true);
+          py::arg("preshuffleB") = true,                    \
+          py::arg("y_is_zeroed") = false);
 
 #define GEMM_A4W4_BLOCKSCALE_TUNE_PYBIND \
     m.def("gemm_a4w4_blockscale_tune",   \
@@ -1370,7 +1372,8 @@ namespace py = pybind11;
           py::arg("scale_ub")        = std::nullopt,                     \
           py::arg("shuffle_scale")   = false,                            \
           py::arg("num_rows")        = std::nullopt,                     \
-          py::arg("num_rows_factor") = 1);                               \
+          py::arg("num_rows_factor") = 1,                                \
+          py::arg("gemm_out_zero_init") = std::nullopt);                 \
     m.def("dynamic_per_group_scaled_quant_fp4",                          \
           &aiter::dynamic_per_group_scaled_quant_fp4,                    \
           py::arg("out"),                                                \

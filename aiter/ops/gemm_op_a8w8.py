@@ -768,6 +768,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     dtype: torch.dtype = dtypes.bf16,
     out: Optional[Tensor] = None,
     y_is_zeroed: bool = False,
+    tuned_file: Optional[str] = None,
 ) -> Tensor:
     """FP8 a8w8 blockscale GEMM with bpreshuffled weight layout.
 
@@ -783,6 +784,11 @@ def gemm_a8w8_blockscale_bpreshuffle(
             kernel will skip its internal Y.zero_() before the SplitK atomic_add.
             This is used by the producer-fused zero-init path.  Has no effect
             when splitK == 0.  Only honored by the cktile branch today.
+        tuned_file: optional path to a tuned CSV to consult for kernel/splitK
+            selection.  When None, uses the default
+            ``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE``.  Useful
+            when a caller wants to switch between e.g. a no-SplitK and a
+            with-SplitK tune at runtime.
     """
     assert dtype in [
         dtypes.bf16,
@@ -791,9 +797,9 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    config = get_CKGEMM_config(
-        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
-    )
+    if tuned_file is None:
+        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    config = get_CKGEMM_config(m, n, k, tuned_file)
     if out is None:
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     else:
@@ -916,6 +922,7 @@ def gemm_a8w8_blockscale_cktile_tune(
     kernelId: int = 0,
     splitK: int = 0,
     preshuffleB: bool = False,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -949,6 +956,7 @@ def gemm_a8w8_blockscale_bpreshuffle_cktile_tune(
     kernelId: int = 0,
     splitK: int = 0,
     preshuffleB: bool = True,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 

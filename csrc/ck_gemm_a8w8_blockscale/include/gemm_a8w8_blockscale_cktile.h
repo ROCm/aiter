@@ -23,4 +23,5 @@ torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
                                                torch::Tensor& Y,
                                                int kernelId,
                                                int splitK,
-                                               bool preshuffleB);
+                                               bool preshuffleB,
+                                               bool y_is_zeroed = false);
