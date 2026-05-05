@@ -176,6 +176,46 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
     )
 
 
+def test_blockscale_bpreshuffle_repeated_rows_invariant():
+    """DSv4 qkv-a projections must keep identical rows bitwise identical.
+
+    These shapes exercise the small partial-M path used by batched DSv4
+    prefill fragments. They map to padded tuned buckets (256/512); the wrapper
+    must not use an ASM path that leaks row-dependent ULP drift.
+    """
+    quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x128)
+    shapes = [
+        (176, 512, 7168),
+        (176, 1536, 7168),
+        (352, 512, 7168),
+        (352, 1536, 7168),
+    ]
+    for m, n, k in shapes:
+        x_bf16 = torch.randn((1, k), dtype=dtypes.bf16, device="cuda").repeat(m, 1)
+        x, x_scale = quant_func(
+            x_bf16,
+            quant_dtype=dtypes.fp8,
+            transpose_scale=True,
+        )
+        weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(
+            dtypes.fp8
+        )
+        weight = shuffle_weight(weight, layout=(16, 16))
+        w_scale = torch.rand(
+            ((n + block_shape[0] - 1) // block_shape[0], k // block_shape[1]),
+            dtype=dtypes.fp32,
+            device="cuda",
+        )
+
+        out = aiter.gemm_a8w8_blockscale_bpreshuffle(
+            x, weight, x_scale, w_scale, dtypes.bf16
+        )
+        diff = (out - out[:1]).abs().max()
+        assert diff.item() == 0, (
+            f"repeated-row drift for M={m}, N={n}, K={k}: " f"max_abs={diff.item()}"
+        )
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -349,6 +389,7 @@ print("=" * 150)
 
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a8w8_blockscale summary (markdown):\n%s", df_md)
+test_blockscale_bpreshuffle_repeated_rows_invariant()
 
 # Correctness check: verify split-K produces matching results
 print("\nRunning split-K correctness checks ...")
