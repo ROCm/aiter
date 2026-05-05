@@ -177,11 +177,11 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
 
 
 def test_blockscale_bpreshuffle_repeated_rows_invariant():
-    """DSv4 qkv-a projections must keep identical rows bitwise identical.
+    """DSv4 projections must keep identical rows bitwise identical.
 
-    These shapes exercise the small partial-M path used by batched DSv4
-    prefill fragments. They map to padded tuned buckets (256/512); the wrapper
-    must not use an ASM path that leaks row-dependent ULP drift.
+    These shapes exercise batched DSv4 prefill fragments. The qkv-a shapes map
+    to padded tuned buckets (256/512); wo_b uses a large partial-M row count
+    that must not fall through to a row-variant heuristic CK kernel.
     """
     quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x128)
     shapes = [
@@ -189,6 +189,7 @@ def test_blockscale_bpreshuffle_repeated_rows_invariant():
         (176, 1536, 7168),
         (352, 512, 7168),
         (352, 1536, 7168),
+        (5544, 7168, 2048),
     ]
     for m, n, k in shapes:
         x_bf16 = torch.randn((1, k), dtype=dtypes.bf16, device="cuda").repeat(m, 1)
