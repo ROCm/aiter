@@ -12,15 +12,14 @@
  * for opus-based kernels:
  *   * host pass: dim3, hipError_t, hipMalloc, hipLaunchKernelGGL, etc.
  *   * device pass: __launch_bounds__ / __global__ / __device__ /
- *     __forceinline__ keyword fallbacks, plus the HIP "magic" globals
- *     threadIdx / blockIdx / blockDim / gridDim implemented via
- *     __builtin_amdgcn_* (no HIP runtime header dependency).
+ *     __forceinline__ keyword fallbacks.
+ *
+ * For device intrinsics (threadIdx / blockIdx / __syncthreads etc.),
+ * include <opus/opus.hpp> and use opus::thread_id_x() / opus::block_id_x()
+ * / opus::sync_threads() etc.
  *
  * Usage:
  *   #include <opus/hip_minimal.hpp>   // both passes — drop-in replacement
- *
- * For higher-level device intrinsics (cross-lane shuffle, lane_id, etc.)
- * include <opus/opus.hpp>.
  *
  * Compile: hipcc kernel.cu -I<aiter_root>/csrc/include -D__HIPCC_RTC__ ...
  */
@@ -37,90 +36,23 @@
     __launch_bounds_select__(__VA_ARGS__, __launch_bounds_impl1__, __launch_bounds_impl0__, )(__VA_ARGS__)
 #endif
 #ifndef __shared__
-#define __shared__ __attribute__((shared))
+#define __shared__      __attribute__((shared))
 #endif
 #ifndef __device__
-#define __device__ __attribute__((device))
+#define __device__      __attribute__((device))
 #endif
 #ifndef __global__
-#define __global__ __attribute__((global))
+#define __global__      __attribute__((global))
 #endif
 #ifndef __host__
-#define __host__ __attribute__((host))
+#define __host__        __attribute__((host))
 #endif
 #ifndef __forceinline__
 #define __forceinline__ inline __attribute__((always_inline))
 #endif
 #ifndef __noinline__
-#define __noinline__ __attribute__((noinline))
+#define __noinline__    __attribute__((noinline))
 #endif
-
-// ========== Device-side "magic" globals (threadIdx / blockIdx / blockDim / gridDim) ==========
-//
-// HIP's <hip/hip_runtime.h> exposes threadIdx.x / blockIdx.x / etc. via a
-// fairly large __declspec(property) trick. That header alone is ~100K
-// preprocessed lines, which dominates the device-pass parse time on
-// every instance TU. Replicating just the four magic globals here lets
-// us skip the full runtime header on the device pass.
-//
-// Backed by __builtin_amdgcn_* directly so no HIP runtime symbols are
-// referenced. Behavior is identical to HIP's: `blockIdx.x` returns
-// the workgroup id along the X dim, etc.
-//
-// Guarded on HIP_INCLUDE_HIP_HIP_RUNTIME_API_H so callers that already
-// pulled in <hip/hip_runtime.h> get the real HIP definitions instead.
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(HIP_INCLUDE_HIP_HIP_RUNTIME_API_H)
-namespace opus_hip_minimal_detail {
-
-struct __opus_threadIdx_t {
-    __device__ __forceinline__ unsigned int get_x() const { return __builtin_amdgcn_workitem_id_x(); }
-    __device__ __forceinline__ unsigned int get_y() const { return __builtin_amdgcn_workitem_id_y(); }
-    __device__ __forceinline__ unsigned int get_z() const { return __builtin_amdgcn_workitem_id_z(); }
-    __declspec(property(get = get_x)) unsigned int x;
-    __declspec(property(get = get_y)) unsigned int y;
-    __declspec(property(get = get_z)) unsigned int z;
-};
-
-struct __opus_blockIdx_t {
-    __device__ __forceinline__ unsigned int get_x() const { return __builtin_amdgcn_workgroup_id_x(); }
-    __device__ __forceinline__ unsigned int get_y() const { return __builtin_amdgcn_workgroup_id_y(); }
-    __device__ __forceinline__ unsigned int get_z() const { return __builtin_amdgcn_workgroup_id_z(); }
-    __declspec(property(get = get_x)) unsigned int x;
-    __declspec(property(get = get_y)) unsigned int y;
-    __declspec(property(get = get_z)) unsigned int z;
-};
-
-struct __opus_blockDim_t {
-    __device__ __forceinline__ unsigned int get_x() const { return __builtin_amdgcn_workgroup_size_x(); }
-    __device__ __forceinline__ unsigned int get_y() const { return __builtin_amdgcn_workgroup_size_y(); }
-    __device__ __forceinline__ unsigned int get_z() const { return __builtin_amdgcn_workgroup_size_z(); }
-    __declspec(property(get = get_x)) unsigned int x;
-    __declspec(property(get = get_y)) unsigned int y;
-    __declspec(property(get = get_z)) unsigned int z;
-};
-
-struct __opus_gridDim_t {
-    __device__ __forceinline__ unsigned int get_x() const { return __builtin_amdgcn_grid_size_x() / __builtin_amdgcn_workgroup_size_x(); }
-    __device__ __forceinline__ unsigned int get_y() const { return __builtin_amdgcn_grid_size_y() / __builtin_amdgcn_workgroup_size_y(); }
-    __device__ __forceinline__ unsigned int get_z() const { return __builtin_amdgcn_grid_size_z() / __builtin_amdgcn_workgroup_size_z(); }
-    __declspec(property(get = get_x)) unsigned int x;
-    __declspec(property(get = get_y)) unsigned int y;
-    __declspec(property(get = get_z)) unsigned int z;
-};
-
-} // namespace opus_hip_minimal_detail
-
-// Match HIP runtime exactly: external linkage + weak so multiple TUs that
-// each reach this header don't ODR-clash. const because the underlying
-// builtins are pure reads of intrinsic state. The empty-brace initializer
-// is required by the language for const variables; the structs have no
-// state so no actual storage is generated.
-extern const __device__ __attribute__((weak)) opus_hip_minimal_detail::__opus_threadIdx_t threadIdx;
-extern const __device__ __attribute__((weak)) opus_hip_minimal_detail::__opus_blockIdx_t  blockIdx;
-extern const __device__ __attribute__((weak)) opus_hip_minimal_detail::__opus_blockDim_t  blockDim;
-extern const __device__ __attribute__((weak)) opus_hip_minimal_detail::__opus_gridDim_t   gridDim;
-
-#endif // __HIP_DEVICE_COMPILE__ && !HIP_INCLUDE_HIP_HIP_RUNTIME_API_H
 
 // ========== Host-side declarations (guarded to coexist with <hip/hip_runtime.h>) ==========
 #if !defined(HIP_INCLUDE_HIP_HIP_RUNTIME_API_H)
