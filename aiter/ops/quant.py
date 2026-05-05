@@ -353,7 +353,17 @@ def per_group_quant_hip(
     transpose_scale: bool = False,
     num_rows: Optional[torch.Tensor] = None,
     num_rows_factor: int = 1,
+    gemm_out_zero_init: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
+    """Per-group dynamic FP8 (or i8/fp4) quant.
+
+    When `gemm_out_zero_init` is provided, the kernel will additionally write
+    zeros over the entire byte range of that tensor as a side effect, so a
+    downstream SplitK GEMM can be invoked with `y_is_zeroed=True` and skip
+    its own `Y.zero_()` ATen launch.  The buffer's total byte size must be a
+    multiple of 16 (the kernel writes 16-byte vectors).  Only honored on the
+    fp8 per-group (per_1x128 / per_1x64 / per_1x32) path.
+    """
     shape = x.shape
     device = x.device
     if scale is None:
@@ -375,6 +385,7 @@ def per_group_quant_hip(
         shuffle_scale=transpose_scale,
         num_rows=num_rows,
         num_rows_factor=num_rows_factor,
+        gemm_out_zero_init=gemm_out_zero_init,
     )
     return y, scale
 
@@ -565,6 +576,7 @@ def dynamic_per_token_scaled_quant(
     shuffle_scale: bool = False,
     num_rows: Optional[torch.Tensor] = None,
     num_rows_factor: int = 1,
+    gemm_out_zero_init: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 
