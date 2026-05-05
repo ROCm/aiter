@@ -26,6 +26,22 @@ def get_warp_size(arch=None):
     return 32 if is_rdna_arch(arch) else 64
 
 
+def dtype_to_elem_type(dtype_str: str):
+    """Map a dtype string to its MLIR scalar type.
+
+    Supported: ``'f32'``, ``'f16'``, ``'bf16'``.
+    """
+    if dtype_str == "f32":
+        return T.f32
+    if dtype_str == "f16":
+        return T.f16
+    if dtype_str == "bf16":
+        return T.bf16
+    raise ValueError(
+        f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', or 'bf16')"
+    )
+
+
 def _create_llvm_ptr(value, address_space: int = 1):
     value = buffer_ops._unwrap_value(value)
     if isinstance(value.type, ir.IndexType):

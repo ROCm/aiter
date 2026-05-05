@@ -439,7 +439,6 @@ namespace aiter {
             lds_load_res_tile(1);
 
             opus::s_waitcnt_vmcnt(opus::number<lds_res_load_loop>{});
-            __builtin_amdgcn_s_barrier();
             
             static_assert(num_rows * hc_mult * residual_block % (pre_thread_num * 8) == 0, 
                 "num_rows * hc_mult * residual_block must be divisible by pre_thread_num * 8");
@@ -447,6 +446,7 @@ namespace aiter {
             const int row_hc_step = pre_thread_num / (num_rows * hc_mult) * 8;
             const int row_hc_iter = threadIdx.x / (num_rows * hc_mult);
             for(int i = 0; i < out_loop; i++) {
+                __builtin_amdgcn_s_barrier();
                 DTYPE_I* s_res_rd_ptr = s_res + (i & 1) * (num_rows * hc_mult * residual_block);
                 for(int j = 0; j < residual_block / row_hc_step; j++) {
                     int K_swizzled = (row_hc_iter * 8 + j * row_hc_step);

@@ -41,6 +41,8 @@ if is_flydsl_available():
     )
     from .rmsnorm import flydsl_rmsnorm
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
+    from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+    from .fmha_kernels import flydsl_flash_attn_func
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
@@ -50,5 +52,6 @@ if is_flydsl_available():
         "flydsl_moe_stage2",
         "flydsl_rmsnorm",
         "flydsl_hgemm",
+        "flydsl_flash_attn_func",
         # "flydsl_gdr_decode",
     ]
