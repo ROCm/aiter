@@ -65,21 +65,87 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 def rotate_fp4quant_inplace_torch(x: torch.Tensor, block_size: int = 32):
     x = rotate_activation(x)
-    # fp4_act_quant_inplace(x, block_size)
+    fp4_act_quant_inplace(x, block_size)
+    return x
+
+
+def rope_inplace_torch(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+):
+    rope = x[..., -rope_dim:]
+    rope_complex = torch.view_as_complex(rope.float().unflatten(-1, (-1, 2)))
+    freqs = torch.complex(cos[positions].float(), sin[positions].float())
+    rope_out = torch.view_as_real(rope_complex * freqs.view(-1, 1, rope_dim // 2))
+    rope.copy_(rope_out.flatten(-2).to(x.dtype))
+    return x
+
+
+def rope_rotate_fp4quant_inplace_torch(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    block_size: int = 32,
+):
+    rope_inplace_torch(x, cos, sin, positions, rope_dim)
+    x = rotate_activation(x)
+    fp4_act_quant_inplace(x, block_size)
     return x
 
 
 @benchmark()
-def test_rotate_fp4quant_inplace(M, N, dtype=torch.bfloat16):
+def test_rotate_fp4quant_inplace(M, head_num, N, dtype=torch.bfloat16):
     if get_gfx() == "gfx942":
         aiter.logger.info("gfx942 is not supported")
         return {}
-    x = torch.randn((M, N), dtype=dtype, device="cuda")
+    x = torch.randn((M, head_num, N), dtype=dtype, device="cuda")
     ref = rotate_fp4quant_inplace_torch(x.clone())
     y = torch.empty_like(x)
     _, us = run_perftest(aiter.rotate_activation_fp4quant_inplace, y, x, group_size=32)
     err = checkAllclose(ref, y, atol=1e-2, rtol=1e-2)
     ret = {}
+    ret["op"] = "rotate"
+    ret["err"] = err
+    ret["us"] = us
+    return ret
+
+
+@benchmark()
+def test_rope_rotate_fp4quant_inplace(M, head_num, N, dtype=torch.bfloat16):
+    if get_gfx() == "gfx942":
+        aiter.logger.info("gfx942 is not supported")
+        return {}
+    rope_dim = 64
+    max_pos = 2048
+    x = torch.randn((M, head_num, N), dtype=dtype, device="cuda")
+    positions = torch.randint(0, max_pos, (M,), dtype=torch.int64, device="cuda")
+    freqs = torch.randn((max_pos, rope_dim // 2), dtype=torch.float32, device="cuda")
+    cos = torch.cos(freqs).to(dtype)
+    sin = torch.sin(freqs).to(dtype)
+    ref = rope_rotate_fp4quant_inplace_torch(
+        x.clone(), cos, sin, positions, rope_dim, block_size=32
+    )
+    y = torch.empty_like(x)
+    _, us = run_perftest(
+        aiter.rope_rotate_activation_fp4quant_inplace,
+        y,
+        x,
+        cos,
+        sin,
+        positions,
+        rope_dim,
+        group_size=32,
+    )
+    err = checkAllclose(ref, y, atol=1e-2, rtol=1e-2)
+    ret = {}
+    ret["op"] = "rope_rotate"
+    ret["head_num"] = head_num
+    ret["rope_dim"] = rope_dim
     ret["err"] = err
     ret["us"] = us
     return ret
@@ -108,6 +174,17 @@ parser.add_argument(
     help="""M.
     e.g.: -m 32""",
 )
+
+parser.add_argument(
+    "-hn",
+    "--head_num",
+    type=int,
+    nargs="*",
+    default=[16],
+    help="""head_num.
+    e.g.: -hn 16""",
+)
+
 parser.add_argument(
     "-n",
     "--dim",
@@ -118,15 +195,28 @@ parser.add_argument(
     help="""dim.
     e.g.: -n 128""",
 )
+parser.add_argument(
+    "-r",
+    "--rope",
+    action="store_true",
+    help="""rope. Default: False.
+    --rope # True""",
+)
 
 args = parser.parse_args()
 
 df = []
 for dtype in args.dtype:
-    for m in args.m:
+    for head_num in args.head_num:
         for dim in args.dim:
-            ret = test_rotate_fp4quant_inplace(M=m, N=dim, dtype=dtype)
-            df.append(ret)
+            for m in args.m:
+                if args.rope:
+                    ret = test_rope_rotate_fp4quant_inplace(
+                        m, head_num, dim, dtype=dtype
+                    )
+                else:
+                    ret = test_rotate_fp4quant_inplace(m, head_num, dim, dtype=dtype)
+                df.append(ret)
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
