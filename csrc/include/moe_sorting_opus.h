@@ -6,20 +6,21 @@
 // No external kernel library dependency.
 
 #pragma once
-#include <torch/extension.h>
+#include "aiter_tensor.h"
+#include <optional>
 
-void moe_sorting_opus_fwd(torch::Tensor& topk_ids,
-                          torch::Tensor& topk_weights,
-                          torch::Tensor& sorted_token_ids,
-                          torch::Tensor& sorted_weights,
-                          torch::Tensor& sorted_expert_ids,
-                          torch::Tensor& num_valid_ids,
-                          torch::Tensor& moe_buf,
+void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
+                          aiter_tensor_t& topk_weights,
+                          aiter_tensor_t& sorted_token_ids,
+                          aiter_tensor_t& sorted_weights,
+                          aiter_tensor_t& sorted_expert_ids,
+                          aiter_tensor_t& num_valid_ids,
+                          aiter_tensor_t& moe_buf,
                           int num_experts,
                           int unit_size,
-                          std::optional<torch::Tensor> local_expert_mask = std::nullopt,
-                          std::optional<torch::Tensor> num_local_tokens  = std::nullopt,
-                          int dispatch_policy                            = 0);
+                          std::optional<aiter_tensor_t> local_expert_mask = std::nullopt,
+                          std::optional<aiter_tensor_t> num_local_tokens  = std::nullopt,
+                          int dispatch_policy                             = 0);
 
 #ifdef MOE_SORTING_OPUS_IMPL
 // ============================================================================
@@ -3421,7 +3422,7 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
 inline float
 moe_sorting_opus(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::stream_config s)
 {
-    if(t.weight_type == "fp32" && t.index_type == "int32")
+    if(t.weight_type == "fp32" && t.index_type == "i32")
     {
         if(moe_sorting_opus_get_workspace_size(
                a.tokens, a.num_experts, a.topk, t.dispatch_policy) != 0)
@@ -3444,7 +3445,7 @@ inline float
 moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::stream_config s)
 {
     bool is_local_token = a.p_local_tokens != nullptr;
-    if(t.weight_type == "fp32" && t.index_type == "int32")
+    if(t.weight_type == "fp32" && t.index_type == "i32")
     {
         using ms_index_t     = opus::index_t;
         using ms_weight_type = float;

@@ -21,6 +21,8 @@ env:
   ATOM_BRANCH: "main"
   ATOM_REPOSITORY_URL: "ROCm/ATOM"
   BASE_IMAGE: "rocm/atom-dev:latest"
+  DOCKER_PULL_MAX_ATTEMPTS: "3"
+  DOCKER_PULL_RETRY_DELAY_SECONDS: "10"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/Aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -95,7 +97,18 @@ jobs:
       - name: Download the ATOM base image
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
-          docker pull ${{ env.BASE_IMAGE }}
+          for attempt in $(seq 1 "${DOCKER_PULL_MAX_ATTEMPTS}"); do
+            if docker pull "${{ env.BASE_IMAGE }}"; then
+              echo "Docker pull succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker pull attempt ${attempt} failed"
+            if [ "${attempt}" -lt "${DOCKER_PULL_MAX_ATTEMPTS}" ]; then
+              sleep "${DOCKER_PULL_RETRY_DELAY_SECONDS}"
+            fi
+          done
+          echo "Docker pull failed after ${DOCKER_PULL_MAX_ATTEMPTS} attempts"
+          exit 1
 
       - name: Generate Dockerfile
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
