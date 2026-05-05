@@ -13,7 +13,8 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
                                           torch::Tensor& Y,
                                           bool preshuffleB,
                                           int splitK             = 0,
-                                          std::string kernelName = "");
+                                          std::string kernelName = "",
+                                          bool y_is_zeroed       = false);
 
 torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
                                                torch::Tensor& WQ,

@@ -11,8 +11,18 @@
 #include "gemm_a8w8_blockscale_cktile_lookup.h"
 #include "gemm_a8w8_blockscale_cktile_manifest.h"
 
+// Raw fn-ptr value type (matches main's POD lookup style from PR #3255) with
+// y_is_zeroed plumbed as the trailing bool so the kernel can skip its internal
+// Y.zero_() when an upstream producer has already pre-zeroed Y.
 using BlockwiseKernel = torch::Tensor (*)(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool, int);
+    torch::Tensor&,
+    torch::Tensor&,
+    torch::Tensor&,
+    torch::Tensor&,
+    torch::Tensor&,
+    bool,
+    int,
+    bool);
 
 // Name-keyed dispatch table; see gemm_a8w8_blockscale.cu for the rationale
 // behind std::string_view keys + raw fn-ptr values (constant-init into
@@ -66,7 +76,8 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
                                           torch::Tensor& Y,
                                           bool preshuffleB,
                                           int splitK,
-                                          std::string kernelName)
+                                          std::string kernelName,
+                                          bool y_is_zeroed)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -80,12 +91,12 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
         blockscale_dispatch<TILE_FP32, TILE_FP16>(kernelName)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch, y_is_zeroed);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
         blockscale_dispatch<TILE_FP32, TILE_BF16>(kernelName)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch, y_is_zeroed);
     }
     else
     {
@@ -100,8 +111,10 @@ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_cktile(torch::Tensor& XQ,
                                                       torch::Tensor& w_scale,
                                                       torch::Tensor& Y,
                                                       bool preshuffleB,
-                                                      std::string kernelName)
+                                                      int splitK,
+                                                      std::string kernelName,
+                                                      bool y_is_zeroed)
 {
     return gemm_a8w8_blockscale_cktile(
-        XQ, WQ, x_scale, w_scale, Y, preshuffleB, 0, std::move(kernelName));
+        XQ, WQ, x_scale, w_scale, Y, preshuffleB, splitK, std::move(kernelName), y_is_zeroed);
 }

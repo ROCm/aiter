@@ -12,7 +12,7 @@
 #include "gemm_a8w8_blockscale_cktile_manifest.h"
 
 using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool, int)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool, int, bool)>;
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -70,15 +70,18 @@ torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
     int K      = XQ.size(1);
     int KBatch = std::pow(2, splitK);
 
+    // Tune entry: caller manages Y init explicitly (zeroes externally if
+    // needed). Pass y_is_zeroed=false so the kernel's own Y.zero_() runs
+    // when KBatch>1, matching pre-existing tune semantics.
     if(Y.dtype() == at::ScalarType::BFloat16)
     {
         blockwise_dispatch_cktile<TILE_FP32, TILE_BF16>(kernelId)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch, false);
     }
     else if(Y.dtype() == at::ScalarType::Half)
     {
         blockwise_dispatch_cktile<TILE_FP32, TILE_FP16>(kernelId)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch, false);
     }
     else
     {

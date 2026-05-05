@@ -279,7 +279,8 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
                                                                torch::Tensor& w_scale,
                                                                torch::Tensor& Y,
                                                                bool PreshuffleB,
-                                                               int k_batch = 1)
+                                                               int k_batch        = 1,
+                                                               bool y_is_zeroed   = false)
 {
     // check
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
@@ -395,10 +396,14 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     args.stride_AQ = stride_AQ;
     args.stride_BQ = stride_BQ;
 
-    // Split-K uses atomic_add into C; zero the output buffer first.
-    // Use zero_() so all rows are cleared regardless of the leading-dimension
-    // stride (e.g. padded tensors produced by vLLM's _maybe_pad_fp8_weight).
-    if(k_batch > 1)
+    // Split-K uses atomic_add into C; the output buffer must be zero before
+    // launch.  When y_is_zeroed is true the caller has already zeroed Y
+    // (typically via a fused zero-init epilogue in the preceding producer
+    // kernel), so we skip the in-kernel Y.zero_() to avoid a redundant ATen
+    // fill launch.  Use zero_() so all rows are cleared regardless of the
+    // leading-dimension stride (e.g. padded tensors produced by vLLM's
+    // _maybe_pad_fp8_weight).
+    if(k_batch > 1 && !y_is_zeroed)
     {
         Y.zero_();
     }
