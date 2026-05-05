@@ -685,13 +685,14 @@ wall on this kernel.
 
 **What the codegen actually emits** (post-fusion):
 
-1. **`csrc/include/opus/hip_minimal.hpp`** — extended into a dual-pass
-   header. Adds device-pass replicas of `threadIdx` / `blockIdx` /
-   `blockDim` / `gridDim` (backed by `__builtin_amdgcn_*`, matching
-   the `extern const __device__ __attribute__((weak))` ABI HIP uses)
-   plus `__forceinline__` / `__noinline__` macro fallbacks. Lets the
-   device pass skip `<hip/hip_runtime.h>` (~100K preprocessed lines)
-   while keeping HIP source compatibility.
+1. **`csrc/include/opus/hip_minimal.hpp`** — kept torch-free + adds
+   `__forceinline__` / `__noinline__` keyword fallbacks on top of the
+   existing `__launch_bounds__` / `__shared__` / `__device__` /
+   `__global__` / `__host__` set. Pipeline files use the
+   `opus::thread_id_x()` / `opus::block_id_x()` etc. wrappers from
+   `opus.hpp` instead of HIP's `threadIdx` / `blockIdx` magic globals,
+   which lets the device pass skip `<hip/hip_runtime.h>` (~100K
+   preprocessed lines) entirely.
 
 2. **`csrc/opus_gemm/include/opus_gemm_utils.cuh`** — three include
    modes:
