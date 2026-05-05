@@ -181,7 +181,8 @@ def test_blockscale_bpreshuffle_repeated_rows_invariant():
 
     These shapes exercise batched DSv4 prefill fragments. The qkv-a shapes map
     to padded tuned buckets (256/512); wo_b uses a large partial-M row count
-    that must not fall through to a row-variant heuristic CK kernel.
+    that must not fall through to a row-variant padded CK kernel. Call the
+    public wrapper so the dispatch policy is covered, not only direct CK.
     """
     quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x128)
     shapes = [

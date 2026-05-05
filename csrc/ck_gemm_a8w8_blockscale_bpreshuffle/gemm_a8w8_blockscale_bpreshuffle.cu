@@ -77,11 +77,9 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
     }
 
     // DSv4-Pro wo_b under TP8 has local GEMM shape [M, 2048] x [7168, 2048].
-    // Its eval batches often land on partial-M values (for example 63 * 88
-    // tokens), which are not present in the tuned CSV. The generic heuristic
-    // kernel is valid but can leak row-dependent BF16 ULP drift for identical
-    // rows. Use the same larger-tile CK kernel as the tuned M=20480 wo_b row;
-    // the generated wrapper handles actual-M padding internally.
+    // The Python dispatch routes partial-M fragments through CKTile for stricter
+    // actual-M masking. If callers reach this direct CK entrypoint anyway, use
+    // the tuned full-shape kernel instead of the smaller generic heuristic.
     if(N == 7168 && K == 2048)
     {
         return a8w8_blockscale_bpreshuffle_1x128x128_256x64x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1<

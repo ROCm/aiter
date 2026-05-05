@@ -751,10 +751,21 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
+    # DSv4-Pro wo_b under TP8 uses local shape [M, 2048] x [7168, 2048].
+    # The tuned table only has the full M=20480 row. Batched eval/prefill emits
+    # partial-M fragments (for example M=5544) that route through padded CK
+    # dispatch and have shown row-dependent BF16 drift for identical rows.
+    # CKTile handles actual-M masking directly, so use it for these partial
+    # fragments while keeping the tuned full-shape CK path intact.
+    if dtype == dtypes.bf16 and n == 7168 and k == 2048 and m != 20480:
+        return gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
+
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
     if config is not None:
         libtype = config["libtype"]
         # The ASM blockscale kernels are tuned for exact or padded M buckets.
