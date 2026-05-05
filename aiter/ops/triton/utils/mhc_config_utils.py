@@ -178,29 +178,133 @@ def get_mhc_config(
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
-def get_mhc_post_config(hidden_size: int) -> dict:
+def get_mhc_post_config(M: int, C: int) -> tuple[dict, bool]:
     """
-    Return BLOCK_K config for mhc_post kernel.
+    Load mhc_post configuration with threshold matching of M_LEQ_x keys and C.
 
-    Matches HIP dispatch logic:
-      non-gfx942 + hidden_size % 1024 == 0  ->  BLOCK_K=1024
-      hidden_size % 512 == 0                 ->  BLOCK_K=512
-      hidden_size % 256 == 0                 ->  BLOCK_K=256
+    Selection logic mirrors :func:`get_mhc_config`:
+    - C: Finds the largest C-specific config file threshold <= input C value.
+      Available C configs are discovered from files named
+      ``{arch}-MHC_POST-C={value}.json``.
+    - M: Within the selected config, finds the largest M_LEQ_x threshold
+      <= input M value, falling back to the ``"any"`` section.
 
-    Args:
-        hidden_size: Hidden dimension per stream
+    Architecture fallback: If configs for the current GPU architecture don't
+    exist, falls back to gfx942 configs.
 
     Returns:
-        Config dict with BLOCK_K
+        Tuple of (config dict, bool indicating if C-specialized config was used).
 
     Raises:
-        ValueError: If hidden_size is not divisible by 256
+        KeyError: If no matching config found.
     """
+    if not hasattr(get_mhc_post_config, "_config_cache"):
+        get_mhc_post_config._config_cache = {}
+
     dev = arch_info.get_arch()
-    if dev != "gfx942" and hidden_size % 1024 == 0:
-        return {"BLOCK_K": 1024}
-    if hidden_size % 512 == 0:
-        return {"BLOCK_K": 512}
-    if hidden_size % 256 == 0:
-        return {"BLOCK_K": 256}
-    raise ValueError(f"hidden_size={hidden_size} must be divisible by 256 for mhc_post")
+    fallback_dev = "gfx942"
+    actual_config_name = "MHC_POST"
+
+    cache_key = f"{dev}_{actual_config_name}"
+
+    if cache_key not in get_mhc_post_config._config_cache:
+        get_mhc_post_config._config_cache[cache_key] = {}
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}.json"
+
+        if not _load_config_file(
+            get_mhc_post_config._config_cache,
+            cache_key,
+            fpath,
+            "default",
+            fpath_should_exist=False,
+        ):
+            fpath_fallback = (
+                f"{AITER_TRITON_CONFIGS_PATH}/{fallback_dev}-{actual_config_name}.json"
+            )
+            _load_config_file(
+                get_mhc_post_config._config_cache,
+                cache_key,
+                fpath_fallback,
+                "default",
+                fpath_should_exist=True,
+            )
+
+    config_dict_key = "default"
+    used_specialized = False
+
+    c_thresholds_key = f"{cache_key}_c_thresholds"
+
+    if c_thresholds_key not in get_mhc_post_config._config_cache:
+        c_thresholds = []
+
+        pattern = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}-C=*.json"
+        for fpath in glob.glob(pattern):
+            basename = os.path.basename(fpath)
+            match = re.search(r"-C=(\d+)\.json$", basename)
+            if match:
+                c_thresholds.append(int(match.group(1)))
+
+        if dev != fallback_dev:
+            pattern_fallback = f"{AITER_TRITON_CONFIGS_PATH}/{fallback_dev}-{actual_config_name}-C=*.json"
+            for fpath in glob.glob(pattern_fallback):
+                basename = os.path.basename(fpath)
+                match = re.search(r"-C=(\d+)\.json$", basename)
+                if match:
+                    c_val = int(match.group(1))
+                    if c_val not in c_thresholds:
+                        c_thresholds.append(c_val)
+
+        c_thresholds.sort()
+        get_mhc_post_config._config_cache[c_thresholds_key] = c_thresholds
+
+    for c_threshold in reversed(get_mhc_post_config._config_cache[c_thresholds_key]):
+        if C >= c_threshold:
+            c_key = f"C_{c_threshold}"
+            if c_key not in get_mhc_post_config._config_cache[cache_key]:
+                fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{actual_config_name}-C={c_threshold}.json"
+                if not _load_config_file(
+                    get_mhc_post_config._config_cache,
+                    cache_key,
+                    fpath,
+                    c_key,
+                    fpath_should_exist=False,
+                ):
+                    fpath_fallback = f"{AITER_TRITON_CONFIGS_PATH}/{fallback_dev}-{actual_config_name}-C={c_threshold}.json"
+                    _load_config_file(
+                        get_mhc_post_config._config_cache,
+                        cache_key,
+                        fpath_fallback,
+                        c_key,
+                        fpath_should_exist=False,
+                    )
+            if c_key in get_mhc_post_config._config_cache[cache_key]:
+                config_dict_key = c_key
+                used_specialized = True
+                break
+
+    config_dict = get_mhc_post_config._config_cache[cache_key][config_dict_key]
+
+    m_leq_keys = []
+    for key in config_dict.keys():
+        if key.startswith("M_LEQ_"):
+            try:
+                threshold = int(key[6:])
+                m_leq_keys.append((threshold, key))
+            except ValueError:
+                continue
+    m_leq_keys.sort()
+
+    matched_key = None
+    for threshold, key in m_leq_keys:
+        if M >= threshold:
+            matched_key = key
+        else:
+            break
+
+    if matched_key is not None:
+        return dict(config_dict[matched_key]), used_specialized
+
+    if "any" in config_dict:
+        return dict(config_dict["any"]), used_specialized
+
+    raise KeyError(f"No matching config for M={M}, C={C} in 'MHC_POST'")

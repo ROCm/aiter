@@ -34,15 +34,18 @@ from op_tests.triton_tests.utils.mhc_ref import (
     is_doubly_stochastic,
     mhc_post_torch,
     mhc_torch,
+    mhc_e2e_ref,
 )
 
 try:
     import aiter as _aiter
 
     _HAS_AITER_MHC_PRE = hasattr(_aiter, "mhc_pre")
+    _HAS_AITER_MHC_POST = hasattr(_aiter, "mhc_post")
 except ImportError:
     _aiter = None
     _HAS_AITER_MHC_PRE = False
+    _HAS_AITER_MHC_POST = False
 
 
 # =============================================================================
@@ -659,7 +662,7 @@ def test_triton_mhc_matches_hip(M, n, C):
 
 
 @pytest.mark.parametrize(
-    "m, hc_mult, hidden_size",
+    "M, n, C",
     [
         (1, 4, 256),
         (128, 4, 1024),
@@ -670,20 +673,20 @@ def test_triton_mhc_matches_hip(M, n, C):
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_mhc_post_correctness(m, hc_mult, hidden_size, dtype):
+def test_mhc_post_correctness(M, n, C, dtype):
     """Test mhc_post against PyTorch reference."""
-    x, residual, post_mix, comb_mix = generate_mhc_post_inputs(
-        m, hc_mult, hidden_size, dtype
+    layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(
+        M, n, C, dtype
     )
-    ref = mhc_post_torch(x, residual, post_mix, comb_mix)
-    out = mhc_post(None, x, residual, post_mix, comb_mix)
+    ref = mhc_post_torch(layer_input, residual, post_mix, comb_mix)
+    out = mhc_post(None, layer_input, residual, post_mix, comb_mix)
 
     torch.testing.assert_close(
         out.float(),
         ref.float(),
         atol=1e-2,
         rtol=1e-2,
-        msg=f"mhc_post output mismatch at (m={m}, hc_mult={hc_mult}, hidden_size={hidden_size}, dtype={dtype})",
+        msg=f"mhc_post output mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
     )
 
 
@@ -695,24 +698,20 @@ def test_mhc_post_preallocated_output():
         generate_mhc_post_inputs,
     )
 
-    m, hc_mult, hidden_size = 128, 4, 1024
+    M, n, C = 128, 4, 1024
     dtype = torch.bfloat16
 
-    x, residual, post_mix, comb_mix = generate_mhc_post_inputs(
-        m, hc_mult, hidden_size, dtype
+    layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(
+        M, n, C, dtype
     )
 
-    # Pre-allocate output
-    out = torch.empty(m, hc_mult, hidden_size, dtype=dtype, device=x.device)
+    out = torch.empty(M, n, C, dtype=dtype, device=layer_input.device)
 
-    # Call mhc_post with pre-allocated output
-    result = mhc_post(out, x, residual, post_mix, comb_mix)
+    result = mhc_post(out, layer_input, residual, post_mix, comb_mix)
 
-    # Verify result is the same object as out
     assert result is out, "mhc_post should return the pre-allocated output tensor"
 
-    # Verify correctness
-    ref = mhc_post_torch(x, residual, post_mix, comb_mix)
+    ref = mhc_post_torch(layer_input, residual, post_mix, comb_mix)
     torch.testing.assert_close(
         out.float(),
         ref.float(),
@@ -722,102 +721,132 @@ def test_mhc_post_preallocated_output():
     )
 
 
-def test_mhc_post_squeeze_post_layer_mix():
-    """Pass post_layer_mix as (m, hc_mult, 1) — as mhc_pre emits it."""
+def test_mhc_post_squeeze_post_mix():
+    """Pass post_mix as (M, n, 1) — as mhc() emits it."""
     from aiter.ops.triton.fusions.mhc import mhc_post
     from op_tests.triton_tests.utils.mhc_ref import (
         mhc_post_torch,
         generate_mhc_post_inputs,
     )
 
-    m, hc_mult, hidden_size = 64, 4, 512
+    M, n, C = 64, 4, 512
     dtype = torch.bfloat16
 
-    x, residual, post_mix, comb_mix = generate_mhc_post_inputs(
-        m, hc_mult, hidden_size, dtype
+    layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(
+        M, n, C, dtype
     )
 
-    # Add extra dimension to post_mix to simulate mhc_pre output
-    post_mix_3d = post_mix.unsqueeze(-1)  # (m, hc_mult, 1)
-    assert post_mix_3d.shape == (m, hc_mult, 1)
+    post_mix_3d = post_mix.unsqueeze(-1)  # (M, n, 1)
+    assert post_mix_3d.shape == (M, n, 1)
 
-    # Call mhc_post with 3D post_layer_mix
-    out = mhc_post(None, x, residual, post_mix_3d, comb_mix)
+    out = mhc_post(None, layer_input, residual, post_mix_3d, comb_mix)
 
-    # Verify correctness against reference with 2D post_mix
-    ref = mhc_post_torch(x, residual, post_mix, comb_mix)
+    ref = mhc_post_torch(layer_input, residual, post_mix, comb_mix)
     torch.testing.assert_close(
         out.float(),
         ref.float(),
         atol=1e-2,
         rtol=1e-2,
-        msg="mhc_post with 3D post_layer_mix mismatch",
+        msg="mhc_post with 3D post_mix mismatch",
     )
 
 
-# =============================================================================
-# End-to-End Pipeline Tests (mhc → mhc_post)
-# =============================================================================
-#
-# Pipeline Overview:
-#
-# x_l (m, n, C)  ──┐
-#                  │
-#                  ├──> mhc() ──> (h_post, h_res, layer_input)
-#                  │                                 │
-#                  │                                 ├──> layer_input (m, C)
-#                  │                                 │
-#                  │                                 v
-#                  └──────────────────────────> mhc_post() ──> x_l+1 (m, n, C)
-#                                                   │
-#                                                   └──> Uses (layer_input, x_l, h_post, h_res)
-#
+def _hip_post_dispatch_block(C, arch_id):
+    """Mirror ``aiter.mhc_post``'s residual_block dispatch.
 
+    Selection (from MHC_POST_KERNEL_DISPATCH in csrc/kernels/mhc_kernels.cu):
+      - non-gfx942 + C % 1024 == 0 -> 1024
+      - C % 512 == 0               -> 512
+      - C % 256 == 0               -> 256
+      - else                       -> None (unsupported)
 
-def mhc_e2e_ref(
-    x_l,
-    phi,
-    alpha_pre,
-    alpha_post,
-    alpha_res,
-    bias,
-    n,
-    eps=1e-6,
-    hc_pre_eps=0.0,
-    hc_post_mult_value=2.0,
-    sinkhorn_iters=20,
-):
+    The kernel additionally enforces ``C >= residual_block * 2``.
     """
-    Reference implementation using PyTorch
+    if arch_id != "gfx942" and C % 1024 == 0:
+        return 1024
+    if C % 512 == 0:
+        return 512
+    if C % 256 == 0:
+        return 256
+    return None
 
-    Pipeline:
-    x_l (m, n, C) → flatten → mhc → (h_post, h_res, layer_input) → mhc_post → x_l+1 (m, n, C)
+
+@pytest.mark.parametrize(
+    "M, n, C",
+    [
+        # block=256 dispatch path (C % 256 == 0, C % 512 != 0)
+        (64, 4, 768),
+        (128, 4, 768),
+        (256, 4, 768),
+        # block=1024 dispatch path on gfx950 (C % 1024 == 0, C >= 2048)
+        (64, 4, 2048),
+        (128, 4, 2048),
+        (256, 4, 2048),
+        # Larger M*C: with random inputs these match within 5% bad-element
+        # ratio. The HIP race that produces ~2e4 max-abs diffs only triggers
+        # with realistic post_mix / comb_mix from mhc() (sigmoid + Sinkhorn);
+        # see bench_mhc.py --op post --with-hip for that repro.
+        (1024, 4, 4096),
+        (2048, 4, 4096),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_triton_mhc_post_matches_hip(M, n, C, dtype):
+    """Triton ``mhc_post()`` matches HIP ``aiter.mhc_post()``.
+
+    Skips when:
+      - CUDA is unavailable
+      - ``aiter.mhc_post`` is not built in this environment
+      - ``n != 4`` (HIP kernel hardcodes ``hc_mult == 4``)
+      - The HIP dispatcher cannot pick a residual_block satisfying
+        ``C >= residual_block * 2`` (e.g. C=512 picks block=512 -> needs 1024).
     """
-    sinkhorn_iters = int(sinkhorn_iters)
-    m, n_check, C = x_l.shape
-    assert n_check == n, f"Stream count mismatch: {n_check} != {n}"
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required for mHC kernels")
+    if not _HAS_AITER_MHC_POST:
+        pytest.skip("aiter.mhc_post is not available in this environment")
+    if n != 4:
+        pytest.skip("aiter.mhc_post hardcodes hc_mult == 4")
 
-    x_l_flat = x_l.view(m, n * C)
+    import aiter.jit.utils.chip_info as chip_info
 
-    # Step 1: mhc - compute coefficients and layer_input
-    h_post, h_res, _h_pre, layer_input = mhc_torch(
-        x_l_flat,
-        phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
-        bias,
-        n,
-        eps,
-        hc_pre_eps,
-        hc_post_mult_value,
-        sinkhorn_iters,
+    arch_id = chip_info.get_gfx()
+    block = _hip_post_dispatch_block(C, arch_id)
+    if block is None:
+        pytest.skip(f"aiter.mhc_post requires C divisible by 256 (got C={C})")
+    if C < 2 * block:
+        pytest.skip(
+            f"aiter.mhc_post on {arch_id} picks residual_block={block} for C={C}; "
+            f"needs C >= {2 * block}"
+        )
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(
+        M, n, C, dtype
     )
 
-    # Step 2: mhc_post - merge layer_input back to multi-stream
-    x_l_plus_1 = mhc_post_torch(layer_input, x_l, h_post, h_res)
+    out_t = mhc_post(None, layer_input, residual, post_mix, comb_mix)
 
-    return layer_input, x_l_plus_1, h_post, h_res
+    out_h = torch.empty(M, n, C, dtype=dtype, device=layer_input.device)
+    with torch.device(layer_input.device):
+        _aiter.mhc_post(out_h, layer_input, residual, post_mix, comb_mix)
+
+    cfg = f"(M={M}, n={n}, C={C}, dtype={dtype})"
+    msg = f"mhc_post Triton vs aiter.mhc_post mismatch at {cfg}"
+    pct = checkAllclose(
+        out_t.float(),
+        out_h.float(),
+        atol=2e-2,
+        rtol=1e-2,
+        tol_err_ratio=0.05,
+        msg=msg,
+    )
+    assert (
+        pct <= 0.05
+    ), f"{msg} (atol=2e-2, rtol=1e-2, bad_element_ratio={pct:.2%})"
 
 
 def mhc_e2e_triton(
@@ -839,13 +868,11 @@ def mhc_e2e_triton(
     Triton implementation of full pipeline
 
     Pipeline:
-    x_l_flat (m, n*C) → mhc → (h_post, h_res, layer_input) → mhc_post → x_l+1 (m, n, C)
+    x_l_flat (M, n*C) → mhc → (h_post, h_res, layer_input) → mhc_post → x_l+1 (M, n, C)
     """
-    # Ensure sinkhorn_iters is an integer
     sinkhorn_iters = int(sinkhorn_iters)
-    m = x_l_flat.shape[0]
+    M = x_l_flat.shape[0]
 
-    # Step 1: mhc (Triton)
     h_post, h_res, layer_input = mhc(
         x_l_flat,
         phi,
@@ -862,7 +889,7 @@ def mhc_e2e_triton(
     )
 
     # Reconstruct x_l for mhc_post (it needs the original multi-stream)
-    x_l = x_l_flat.view(m, n, C)
+    x_l = x_l_flat.view(M, n, C)
 
     # Step 2: mhc_post (Triton)
     x_l_plus_1 = mhc_post(
@@ -878,19 +905,19 @@ def mhc_e2e_triton(
 
 
 @pytest.mark.parametrize(
-    "m, n, C",
+    "M, n, C",
     [
-        (1, 4, 256),  # hidden_size=1024
-        (32, 4, 256),  # hidden_size=1024
-        (64, 4, 512),  # hidden_size=2048
-        (128, 4, 1024),  # hidden_size=4096
-        (256, 4, 1024),  # hidden_size=4096
-        (512, 4, 512),  # hidden_size=2048
-        (1024, 4, 256),  # hidden_size=1024
+        (1, 4, 256),  # n*C=1024
+        (32, 4, 256),  # n*C=1024
+        (64, 4, 512),  # n*C=2048
+        (128, 4, 1024),  # n*C=4096
+        (256, 4, 1024),  # n*C=4096
+        (512, 4, 512),  # n*C=2048
+        (1024, 4, 256),  # n*C=1024
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_mhc_e2e_correctness(m, n, C, dtype):
+def test_mhc_e2e_correctness(M, n, C, dtype):
     """
     Test correctness of Triton mhc → mhc_post pipeline
 
@@ -903,9 +930,9 @@ def test_mhc_e2e_correctness(m, n, C, dtype):
     """
     sinkhorn_iters = 20
     x_l_flat, phi, alpha_pre, alpha_post, alpha_res, bias, _ = generate_mhc_inputs(
-        m, n, C, dtype
+        M, n, C, dtype
     )
-    x_l = x_l_flat.view(m, n, C)
+    x_l = x_l_flat.view(M, n, C)
 
     # Reference implementation
     layer_input_ref, x_l_plus_1_ref, h_post_ref, h_res_ref = mhc_e2e_ref(
@@ -932,45 +959,17 @@ def test_mhc_e2e_correctness(m, n, C, dtype):
         sinkhorn_iters=int(sinkhorn_iters),
     )
 
-    # Verify correctness
-    # Note: Tolerances adjusted for bf16 accumulation errors and Sinkhorn-Knopp differences
-    torch.testing.assert_close(
-        layer_input_triton.float(),
-        layer_input_ref.float(),
-        atol=2e-2,
-        rtol=5e-2,
-        msg="layer_input mismatch",
-    )
-
-    # h_res can have larger errors due to Sinkhorn-Knopp iteration differences
-    # Sinkhorn-Knopp normalization in Triton vs PyTorch can diverge numerically,
-    # especially at larger batch sizes where accumulation errors compound
-    # Scale tolerance with batch size
-    atol_h_res = 1.5 if m <= 128 else 2.0
-    rtol_h_res = 1.5 if m <= 128 else 2.0
-    torch.testing.assert_close(
-        h_res_triton.float(),
-        h_res_ref.float(),
-        atol=atol_h_res,
-        rtol=rtol_h_res,
-        msg="h_res mismatch",
-    )
-
-    # x_l+1 inherits h_res errors, so also needs larger tolerance
-    atol_x = 4.0 if m <= 128 else 6.0
-    rtol_x = 3.0 if m <= 128 else 4.0
-    torch.testing.assert_close(
-        x_l_plus_1_triton.float(),
-        x_l_plus_1_ref.float(),
-        atol=atol_x,
-        rtol=rtol_x,
-        msg="x_l+1 mismatch",
-    )
-
-    torch.testing.assert_close(
-        h_post_triton.float(),
-        h_post_ref.float(),
-        atol=1e-2,
-        rtol=1e-2,
-        msg="h_post mismatch",
-    )
+    common_atol, common_rtol = 2e-2, 2e-2
+    for name, t, ref in (
+        ("layer_input", layer_input_triton, layer_input_ref),
+        ("h_post", h_post_triton, h_post_ref),
+        ("h_res", h_res_triton, h_res_ref),
+        ("x_l+1", x_l_plus_1_triton, x_l_plus_1_ref),
+    ):
+        torch.testing.assert_close(
+            t.float(),
+            ref.float(),
+            atol=common_atol,
+            rtol=common_rtol,
+            msg=f"{name} mismatch at (M={M}, n={n}, C={C}, dtype={dtype})",
+        )

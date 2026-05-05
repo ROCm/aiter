@@ -643,75 +643,110 @@ def _mhc_reduce_apply_kernel(
 
 @triton.jit
 def _mhc_post_kernel(
-    out_ptr,  # (m, hc_mult, hidden_size)  bf16/fp16
-    x_ptr,  # (m, hidden_size)  bf16/fp16
-    residual_ptr,  # (m, hc_mult, hidden_size)  bf16/fp16
-    post_layer_mix_ptr,  # (m, hc_mult)  fp32
-    comb_res_mix_ptr,  # (m, hc_mult, hc_mult)  fp32  [dim1=src, dim2=dst]
-    M: tl.constexpr,
-    hidden_size: tl.constexpr,
+    out_ptr,  # (M, n, C)  bf16 / fp16
+    x_ptr,  # (M, C)     bf16 / fp16  (layer_input from mhc())
+    residual_ptr,  # (M, n, C)  bf16 / fp16
+    post_mix_ptr,  # (M, n)     fp32  (mhc()'s h_post)
+    comb_mix_ptr,  # (M, n, n)  fp32  [src, dst]  (mhc()'s h_res)
+    M,
+    C,
     stride_x_m,
+    stride_x_c,
     stride_res_m,
-    stride_res_hc,
+    stride_res_n,
+    stride_res_c,
     stride_out_m,
-    stride_out_hc,
-    stride_post_m,  # stride for post_layer_mix m-dim
-    stride_comb_m,  # stride for comb_res_mix m-dim
-    stride_comb_src,  # stride for comb_res_mix src-dim
-    HC: tl.constexpr,  # hc_mult, typically 4
-    BLOCK_K: tl.constexpr,  # tile size over hidden_size
+    stride_out_n,
+    stride_out_c,
+    stride_post_m,
+    stride_comb_m,
+    stride_comb_src,
+    n: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_C: tl.constexpr,
 ):
-    """
-    mhc_post kernel: compute out[m, hc, k] = post_mix[m, hc] * x[m, k] + sum_h( comb_mix[m, h, hc] * residual[m, h, k] )
+    """Fused mhc_post kernel: compute one M-tile across all `n` output
+    streams and the full hidden dim.
 
-    Grid: (m, hc_mult) — one program per (token, output-head)
+        out[m, j, c] = post_mix[m, j] * x[m, c]
+                     + sum_h comb_mix[m, h, j] * residual[m, h, c]
 
-    Implementation follows the 3-step strategy:
-    1. Multiply post-stream: post_mix[m, hc] * x[m, k] (element-wise)
-    2. Reduce res-stream: Σₕ comb_mix[m, h, hc] * residual[m, h, k] (weighted sum over source heads)
-    3. Write output: Store combined result to out[m, hc, k]
+    Grid: ``(cdiv(M, BLOCK_M),)``. Each program loads ``post_mix``
+    (BLOCK_M, n) and ``comb_mix`` (BLOCK_M, n, n) once and reuses them
+    across the persistent loop over ``BLOCK_C``-sized C-tiles. The
+    ``n``-source-head contraction inside each C-tile is unrolled via
+    ``tl.static_range``: each iteration loads a 2-D ``residual`` slice and
+    a 1-D ``comb_mix`` row and accumulates ``comb_h * res_h`` into
+    ``out_tile``. This avoids materializing a (BLOCK_M, n, n, BLOCK_C)
+    outer-product intermediate. Requires ``n`` to be a power of 2 so
+    ``tl.arange(0, n)`` compiles.
     """
     pid_m = tl.program_id(0)
-    pid_hc = tl.program_id(1)  # dst head
 
-    # Load HC scalars for comb_res_mix[:, :, pid_hc] — all source heads for this dst
-    src_heads = tl.arange(0, HC)
-    comb_ptrs = (
-        comb_res_mix_ptr + pid_m * stride_comb_m + src_heads * stride_comb_src + pid_hc
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    i_n = tl.arange(0, n)
+
+    m_mask = rm < M
+
+    post_mix_tile = tl.load(
+        post_mix_ptr + rm[:, None] * stride_post_m + i_n[None, :],
+        mask=m_mask[:, None],
+        other=0.0,
     )
-    comb_v = tl.load(comb_ptrs)  # shape [HC], fp32
 
-    post_mix_v = tl.load(
-        post_layer_mix_ptr + pid_m * stride_post_m + pid_hc
-    )  # scalar fp32
-
-    # Inner loop over hidden_size in tiles of BLOCK_K
-    for k_start in range(0, hidden_size, BLOCK_K):
-        k_offs = k_start + tl.arange(0, BLOCK_K)
-        mask = k_offs < hidden_size
-
-        x_tile = tl.load(
-            x_ptr + pid_m * stride_x_m + k_offs, mask=mask, other=0.0
-        )  # [BLOCK_K]
-
-        # Step 1: Accumulate post_mix * x
-        acc = post_mix_v * x_tile.to(tl.float32)
-
-        # Step 2: Accumulate sum_h( comb_v[h] * residual[m, h, k] )
-        for h in tl.static_range(HC):
-            res_tile = tl.load(
-                residual_ptr + pid_m * stride_res_m + h * stride_res_hc + k_offs,
-                mask=mask,
+    # Pre-load each row of the per-token (n_src, n_dst) comb_mix matrix into
+    # a tuple of 2-D tiles. Each ``comb_rows[h]`` has shape (BLOCK_M, n_dst)
+    # and lives in registers across the C-loop, eliminating per-C-tile
+    # reloads of the small per-token coefficients.
+    comb_rows = ()
+    for h in tl.static_range(n):
+        comb_rows = comb_rows + (
+            tl.load(
+                comb_mix_ptr
+                + rm[:, None] * stride_comb_m
+                + h * stride_comb_src
+                + i_n[None, :],
+                mask=m_mask[:, None],
                 other=0.0,
-            )
-            # Extract scalar from comb_v using tl.sum with masking instead of direct indexing
-            h_range = tl.arange(0, HC)
-            comb_scalar = tl.sum(tl.where(h_range == h, comb_v, 0.0))
-            acc += comb_scalar * res_tile.to(tl.float32)
+            ),
+        )
 
-        # Step 3: Store final output
+    for c_start in range(0, C, BLOCK_C):
+        rc = c_start + tl.arange(0, BLOCK_C)
+        c_mask = rc < C
+
+        # ``x`` and ``residual`` are bf16 / fp16 in production. Keeping them
+        # in their native dtype halves on-chip footprint vs an upfront fp32
+        # promotion; mixed-dtype multiply with fp32 ``post_mix`` / ``comb``
+        # is auto-promoted by Triton with an fp32 accumulator.
+        x_tile = tl.load(
+            x_ptr + rm[:, None] * stride_x_m + rc[None, :] * stride_x_c,
+            mask=m_mask[:, None] & c_mask[None, :],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+
+        out_tile = post_mix_tile[:, :, None] * x_tile[:, None, :].to(tl.float32)
+
+        for h in tl.static_range(n):
+            res_h = tl.load(
+                residual_ptr
+                + rm[:, None] * stride_res_m
+                + h * stride_res_n
+                + rc[None, :] * stride_res_c,
+                mask=m_mask[:, None] & c_mask[None, :],
+                other=0.0,
+                cache_modifier=".cg",
+            )
+            comb_h = comb_rows[h]  # (BLOCK_M, n_dst), pre-loaded 2-D tile
+            out_tile += comb_h[:, :, None] * res_h[:, None, :].to(tl.float32)
+
         tl.store(
-            out_ptr + pid_m * stride_out_m + pid_hc * stride_out_hc + k_offs,
-            acc.to(out_ptr.dtype.element_ty),
-            mask=mask,
+            out_ptr
+            + rm[:, None, None] * stride_out_m
+            + i_n[None, :, None] * stride_out_n
+            + rc[None, None, :] * stride_out_c,
+            out_tile.to(out_ptr.dtype.element_ty),
+            mask=m_mask[:, None, None] & c_mask[None, None, :],
+            cache_modifier=".cs",
         )

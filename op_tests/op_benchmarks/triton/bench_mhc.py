@@ -33,10 +33,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
 )
-from op_tests.triton_tests.utils.mhc_ref import (
-    generate_mhc_inputs,
-    generate_mhc_post_inputs,
-)
+from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs
 
 arg_to_torch_dtype = {
     "fp16": torch.float16,
@@ -64,12 +61,16 @@ def get_benchmark_configs(args):
         #   C: hidden dimension per stream
         Ms = [2**i for i in range(10, 15)]
         n = 4
-        # For --op post --with-hip, the HIP dispatcher requires C >= 1024 on
-        # gfx950 (residual_block=512 path). C=512 dispatches to block=512 and
-        # fails the kernel's `hidden_size >= residual_block * 2` check.
+        # For --op post --with-hip, align Cs with the HIP bench in
+        # op_tests/test_mhc.py (hidden_size choices = {1280, 2560, 4096, 7168}).
+        # These are the canonical "real model" hidden sizes and exercise all
+        # three HIP mhc_post dispatch paths:
+        #   1280 -> residual_block=256, 2560 -> 512, 4096/7168 -> 1024 (gfx950)
+        # C=512 is excluded because the greedy dispatcher selects block=512 and
+        # then fails the kernel's `hidden_size >= residual_block * 2` check.
         op = getattr(args, "op", "pre")
         if op == "post" and getattr(args, "with_hip", False):
-            Cs = [4096, 2**15]
+            Cs = [1280, 2560, 4096, 7168]
         else:
             Cs = [512, 4096, 2**15]
         # Sort by C (hidden dimension) to show scaling across C values
@@ -175,7 +176,7 @@ def _get_benchmark_config(args, operation):
 
     # Operation-specific x_names and x_vals
     if operation == "post":
-        x_names = ["M", "hidden_size"]
+        x_names = ["M", "C"]
         x_vals_list = [(M, C) for M, n, C in configs]
     else:  # "pre" or "e2e"
         x_names = ["M", "n", "C"]
@@ -365,56 +366,94 @@ def _create_benchmark_kernel(args, operation):
 
         elif operation == "post":
             M = benchmark_params["M"]
-            hidden_size = benchmark_params["hidden_size"]
+            C = benchmark_params["C"]
+            n = hc_mult
             torch.manual_seed(0)
-            x, residual, post_mix, comb_mix = generate_mhc_post_inputs(
-                M, hc_mult, hidden_size, dtype
-            )
 
-            # Compute metrics
-            elem_bytes = x.element_size()
+            # Build realistic post inputs by running one (untimed) Triton
+            # mhc_pre. This mirrors how mhc_post is fed in the model:
+            #   layer_input <- mhc_pre's layer_input (M, C)
+            #   residual    <- the original multi-stream input (M, n, C)
+            #   post_mix    <- mhc_pre's h_post (M, n, 1)
+            #   comb_mix    <- mhc_pre's h_res  (M, n, n)
+            (
+                x_l_flat,
+                phi,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                bias,
+                _,
+            ) = generate_mhc_inputs(M, n, C, dtype)
+            h_post, h_res, layer_input = mhc(
+                x_l_flat,
+                phi,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                bias,
+                n,
+                sinkhorn_iters=sinkhorn_iters,
+            )
+            residual = x_l_flat.view(M, n, C)
+            post_mix = h_post
+            comb_mix = h_res
+
+            elem_bytes = layer_input.element_size()
             total_flops, total_mem = _compute_metrics(
                 "post",
                 M,
-                hc_mult=hc_mult,
-                hidden_size=hidden_size,
+                hc_mult=n,
+                hidden_size=C,
                 elem_bytes=elem_bytes,
             )
 
             def triton_fn():
-                return mhc_post(None, x, residual, post_mix, comb_mix)
+                return mhc_post(None, layer_input, residual, post_mix, comb_mix)
 
             hip_fn = None
             if args.with_hip:
                 import aiter
 
+                # HIP aiter.mhc_post expects fp32 mixes (matches aiter.mhc_pre's
+                # native output dtype). Triton's mhc() emits bf16 mixes, so cast
+                # once here to match HIP's contract; passing bf16 silently
+                # reinterprets 4 bytes as fp32 and produces garbage output.
+                post_mix_hip = post_mix.float()
+                comb_mix_hip = comb_mix.float()
                 out_hip = torch.empty(
-                    M, hc_mult, hidden_size, dtype=dtype, device=x.device
+                    M, n, C, dtype=dtype, device=layer_input.device
                 )
 
                 def hip_fn():
-                    aiter.mhc_post(out_hip, x, residual, post_mix, comb_mix)
+                    aiter.mhc_post(
+                        out_hip,
+                        layer_input,
+                        residual,
+                        post_mix_hip,
+                        comb_mix_hip,
+                    )
                     return out_hip
 
-            config_key = (M, hidden_size)
+            config_key = (M, C)
             if args.with_hip and config_key not in _checked_configs:
                 from op_tests.triton_tests.utils.mhc_ref import mhc_post_torch
 
                 t_out = triton_fn()
                 h_out = hip_fn()
-                ref = mhc_post_torch(x, residual, post_mix, comb_mix)
+                ref = mhc_post_torch(layer_input, residual, post_mix, comb_mix)
                 t_vs_ref = (t_out.float() - ref.float()).abs().max().item()
                 h_vs_ref = (h_out.float() - ref.float()).abs().max().item()
                 logging.info(
-                    "mhc_post (M=%d, H=%d): triton-vs-ref max=%.4g  "
+                    "mhc_post (M=%d, C=%d): triton-vs-ref max=%.4g  "
                     "hip-vs-ref max=%.4g",
                     M,
-                    hidden_size,
+                    C,
                     t_vs_ref,
                     h_vs_ref,
                 )
                 _assert_triton_matches_hip(
-                    t_out, h_out, "post", M=M, hidden_size=hidden_size
+                    t_out, h_out, "post", M=M, C=C
                 )
                 _checked_configs.add(config_key)
 
@@ -610,8 +649,8 @@ def _assert_triton_matches_hip(triton_out, hip_out, operation, **params):
                 pct <= 0.05
             ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
     elif operation == "post":
-        M, hidden_size = params["M"], params["hidden_size"]
-        cfg = f"(M={M}, hidden_size={hidden_size})"
+        M, C = params["M"], params["C"]
+        cfg = f"(M={M}, C={C})"
         # Soft check: report max abs diff and warn instead of aborting, so the
         # benchmark can still profile mismatching configurations (e.g. when the
         # HIP kernel has a non-determinism / race issue at large M+H).
