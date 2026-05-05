@@ -187,14 +187,15 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
     using D_ACC = typename T::D_ACC;
     using D_SF  = typename T::D_SF;
 
-    int wgid = (blockIdx.y * gridDim.x) + blockIdx.x;
+    const int grid_dim_x = opus::grid_size_x() / opus::block_size_x();
+    int wgid = (opus::block_id_y() * grid_dim_x) + opus::block_id_x();
     const int num_tiles_n = ceil_div(kargs.n, T::B_N);
     int row = (wgid / num_tiles_n) * T::B_M;
     int col = (wgid % num_tiles_n) * T::B_N;
 
-    int batch_id = blockIdx.z;
-    int wave_id = __builtin_amdgcn_readfirstlane(threadIdx.x / get_warp_size());
-    int lane_id = threadIdx.x % get_warp_size();
+    int batch_id = opus::block_id_z();
+    int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
+    int lane_id = opus::thread_id_x() % get_warp_size();
 
     auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a) + batch_id*kargs.stride_a_batch + row*kargs.stride_a);
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b) + batch_id*kargs.stride_b_batch + col*kargs.stride_b);
