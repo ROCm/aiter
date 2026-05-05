@@ -99,7 +99,7 @@ jobs:
               pip config set global.retries 10
               pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
               pip install -r requirements.txt
-              pip install --upgrade pandas zmq einops numpy==1.26.2
+              pip install --upgrade pandas pyzmq einops numpy==1.26.2
               pip install --upgrade "pybind11>=3.0.1"
               pip install --upgrade "ninja>=1.11.1"
               pip install --upgrade "setuptools_scm[toml]>=6.2" wheel packaging psutil
