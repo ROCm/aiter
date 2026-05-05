@@ -216,6 +216,7 @@ def gemm_a8w8_blockscale_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
 ) -> torch.Tensor: ...
 
 
@@ -231,6 +232,7 @@ def gemm_a8w8_blockscale_cktile(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     isBpreshuffled: bool = False,
+    splitK: int = 0,
 ) -> torch.Tensor: ...
 
 
@@ -674,10 +676,15 @@ def gemm_a8w8_blockscale(
         )
         if config is not None:
             libtype = config["libtype"]
+            splitK = int(config.get("splitK", 0))
             if libtype == "ck":
-                return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+                return gemm_a8w8_blockscale_ck(
+                    XQ, WQ, x_scale, w_scale, Y, splitK=splitK
+                )
             elif libtype == "cktile":
-                return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y)
+                return gemm_a8w8_blockscale_cktile(
+                    XQ, WQ, x_scale, w_scale, Y, splitK=splitK
+                )
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
         return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
