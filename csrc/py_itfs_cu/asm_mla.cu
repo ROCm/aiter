@@ -185,8 +185,13 @@ void mla_decode_stage1_asm_fwd(
     }
     else
     {
-        args.out_16_nosplit = 0;
-        args.ptr_RP = nullptr;
+        // The legacy QH16 m32x1_n16x1 kernel (gqa_ratio=32, decode qseqlen=1)
+        // writes directly to output via ptr_RP when kv_split==1.  Passing
+        // nullptr causes GPU memory faults on gfx950.  Other non-persistent
+        // kernels (v3, stage1) use split-reduce and expect ptr_RP = nullptr.
+        bool legacy_qh16 = (gqa_ratio == 32 && max_seqlen_q == 1);
+        args.out_16_nosplit = legacy_qh16 ? kv_split : 0;
+        args.ptr_RP = legacy_qh16 ? output->data_ptr() : nullptr;
         args.ptr_STP = num_kv_splits_indptr->data_ptr();
     }
 
