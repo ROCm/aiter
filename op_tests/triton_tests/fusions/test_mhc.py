@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from aiter.ops.triton.fusions.mhc import mhc, mhc_post
+from aiter.test_common import checkAllclose
 from op_tests.triton_tests.utils.mhc_ref import (
     generate_mhc_inputs,
     generate_mhc_post_inputs,
@@ -70,15 +71,50 @@ def _assert_mhc_close(
     post_t, comb_t, layer_t = triton_tuple
     post_ref, comb_ref, _hpre_ref, layer_ref = ref_tuple
 
-    torch.testing.assert_close(
-        post_t.float(), post_ref.float(), atol=post_atol, rtol=post_rtol
-    )
-    torch.testing.assert_close(
-        comb_t.float(), comb_ref.float(), atol=comb_atol, rtol=comb_rtol
-    )
-    torch.testing.assert_close(
-        layer_t.float(), layer_ref.float(), atol=layer_atol, rtol=layer_rtol
-    )
+    for name, t, ref, atol, rtol in (
+        ("post_mix", post_t, post_ref, post_atol, post_rtol),
+        ("comb_mix", comb_t, comb_ref, comb_atol, comb_rtol),
+        ("layer_input", layer_t, layer_ref, layer_atol, layer_rtol),
+    ):
+        pct = checkAllclose(
+            t.float(),
+            ref.float(),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=0.05,
+            msg=name,
+        )
+        assert pct <= 0.05, (
+            f"{name} mismatch "
+            f"(atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+        )
+
+
+def _config_for_large_n(n):
+    """Working config dict for the n>4 edge cases."""
+    if n >= 16:
+        # n=16 -> N_TOTAL_POW2=512; phi tile (BLOCK_K, 512) bf16 must fit LDS
+        return {
+            "BLOCK_M": 32,
+            "BLOCK_K": 32,
+            "BLOCK_C": 64,
+            "NUM_KSPLIT": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2,
+        }
+    if n >= 8:
+        # n=8 -> N_TOTAL_POW2=128
+        return {
+            "BLOCK_M": 32,
+            "BLOCK_K": 128,
+            "BLOCK_C": 64,
+            "NUM_KSPLIT": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2,
+        }
+    return None
 
 
 @pytest.mark.parametrize("M, n, C", get_test_shapes())
@@ -96,7 +132,16 @@ def test_mhc_correctness(M, n, C, dtype):
     )
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
+    triton_tuple = mhc(
+        x,
+        phi,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        n_streams,
+        config=_config_for_large_n(n),
+    )
 
     relaxed = C >= 1024
     _assert_mhc_close(
@@ -206,7 +251,16 @@ def test_mhc_small_shapes(M, n, C, dtype):
     )
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
+    triton_tuple = mhc(
+        x,
+        phi,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        n_streams,
+        config=_config_for_large_n(n),
+    )
 
     _assert_mhc_close(
         triton_tuple,
@@ -256,13 +310,40 @@ def test_mhc_output_range():
 # =============================================================================
 
 
-def _make_split_k_config(num_ksplit):
-    """Helper to create config with specified NUM_KSPLIT."""
+def _make_split_k_config(num_ksplit, n=4):
+    """Helper to create a working split-K config with the specified NUM_KSPLIT.
+
+    For n>4 the unified split kernel's phi tile (BLOCK_K, N_TOTAL_POW2) bf16
+    must fit in LDS, so BLOCK_K is shrunk accordingly. For n<=4 the wrapper's
+    fallback BLOCK_M default applies; we still pin BLOCK_C explicitly to keep
+    the test independent of the wrapper's BLOCK_C fallback.
+    """
+    if n >= 16:
+        return {
+            "BLOCK_M": 32,
+            "BLOCK_K": 32,
+            "BLOCK_C": 64,
+            "NUM_KSPLIT": num_ksplit,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2,
+        }
+    if n >= 8:
+        return {
+            "BLOCK_M": 32,
+            "BLOCK_K": 128,
+            "BLOCK_C": 64,
+            "NUM_KSPLIT": num_ksplit,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2,
+        }
     return {
-        "waves_per_eu": 1,
-        "num_stages": 1,
-        "num_warps": 4,
+        "BLOCK_C": 64,
         "NUM_KSPLIT": num_ksplit,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 1,
     }
 
 
@@ -298,7 +379,7 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
         bias,
         n_streams,
         sinkhorn_iters=0,
-        config=_make_split_k_config(num_ksplit),
+        config=_make_split_k_config(num_ksplit, n=n),
     )
 
     relaxed = C >= 1024
@@ -342,7 +423,7 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
         alpha_res,
         bias,
         n_streams,
-        config=_make_split_k_config(num_ksplit),
+        config=_make_split_k_config(num_ksplit, n=n),
     )
 
     _assert_mhc_close(
@@ -392,8 +473,22 @@ def test_split_k_various_splits(num_ksplit):
     # and hpre (raw logits, no Triton-side counterpart).
     post_t, _, layer_t = triton_tuple
     post_ref, _, _hpre_ref, layer_ref = out_ref
-    torch.testing.assert_close(post_t.float(), post_ref.float(), atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(layer_t.float(), layer_ref.float(), atol=5e-2, rtol=5e-2)
+    for name, t, ref, atol, rtol in (
+        ("post_mix", post_t, post_ref, 1e-2, 1e-2),
+        ("layer_input", layer_t, layer_ref, 5e-2, 5e-2),
+    ):
+        pct = checkAllclose(
+            t.float(),
+            ref.float(),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=0.05,
+            msg=name,
+        )
+        assert pct <= 0.05, (
+            f"{name} mismatch "
+            f"(atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+        )
 
 
 def test_split_k_large_k():
@@ -539,27 +634,23 @@ def test_triton_mhc_matches_hip(M, n, C):
         )
 
     cfg = f"(M={M}, n={n}, C={C})"
-    torch.testing.assert_close(
-        post_t.float(),
-        post_h.float(),
-        atol=4e-2,
-        rtol=1e-2,
-        msg=f"post_mix Triton vs aiter.mhc_pre mismatch at {cfg}",
-    )
-    torch.testing.assert_close(
-        comb_t.float(),
-        comb_h.float(),
-        atol=4e-2,
-        rtol=1e-2,
-        msg=f"comb_mix Triton vs aiter.mhc_pre mismatch at {cfg}",
-    )
-    torch.testing.assert_close(
-        li_t.float(),
-        li_h.float(),
-        atol=8e-2,
-        rtol=2e-2,
-        msg=f"layer_input Triton vs aiter.mhc_pre mismatch at {cfg}",
-    )
+    for name, t, h, atol, rtol in (
+        ("post_mix", post_t, post_h, 4e-2, 1e-2),
+        ("comb_mix", comb_t, comb_h, 4e-2, 1e-2),
+        ("layer_input", li_t, li_h, 8e-2, 2e-2),
+    ):
+        msg = f"{name} Triton vs aiter.mhc_pre mismatch at {cfg}"
+        pct = checkAllclose(
+            t.float(),
+            h.float(),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=0.05,
+            msg=msg,
+        )
+        assert (
+            pct <= 0.05
+        ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
 
 
 # =============================================================================

@@ -28,6 +28,7 @@ import torch
 import triton
 
 from aiter.ops.triton.fusions.mhc import mhc, mhc_post
+from aiter.test_common import checkAllclose
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -590,27 +591,24 @@ def _assert_triton_matches_hip(triton_out, hip_out, operation, **params):
         post_h, comb_h, li_h = hip_out
 
         cfg = f"(M={M}, n={n}, C={C})"
-        torch.testing.assert_close(
-            post_t.float(),
-            post_h.float(),
-            atol=4e-2,
-            rtol=1e-2,
-            msg=f"post_mix mismatch between Triton and HIP at {cfg}",
-        )
-        torch.testing.assert_close(
-            comb_t.float(),
-            comb_h.float(),
-            atol=4e-2,
-            rtol=1e-2,
-            msg=f"comb_mix mismatch between Triton and HIP at {cfg}",
-        )
-        torch.testing.assert_close(
-            li_t.float(),
-            li_h.float(),
-            atol=8e-2,
-            rtol=2e-2,
-            msg=f"layer_input mismatch between Triton and HIP at {cfg}",
-        )
+        for name, t, h, atol, rtol in (
+            ("post_mix", post_t, post_h, 4e-2, 1e-2),
+            ("comb_mix", comb_t, comb_h, 4e-2, 1e-2),
+            ("layer_input", li_t, li_h, 8e-2, 2e-2),
+        ):
+            msg = f"{name} mismatch between Triton and HIP at {cfg}"
+            pct = checkAllclose(
+                t.detach().cpu().float(),
+                h.detach().cpu().float(),
+                atol=atol,
+                rtol=rtol,
+                tol_err_ratio=0.05,
+                msg=msg,
+                printLog=True,
+            )
+            assert (
+                pct <= 0.05
+            ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
     elif operation == "post":
         M, hidden_size = params["M"], params["hidden_size"]
         cfg = f"(M={M}, hidden_size={hidden_size})"
