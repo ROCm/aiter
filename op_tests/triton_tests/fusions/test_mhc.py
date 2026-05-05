@@ -675,9 +675,7 @@ def test_triton_mhc_matches_hip(M, n, C):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mhc_post_correctness(M, n, C, dtype):
     """Test mhc_post against PyTorch reference."""
-    layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(
-        M, n, C, dtype
-    )
+    layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(M, n, C, dtype)
     ref = mhc_post_torch(layer_input, residual, post_mix, comb_mix)
     out = mhc_post(None, layer_input, residual, post_mix, comb_mix)
 
@@ -701,9 +699,7 @@ def test_mhc_post_preallocated_output():
     M, n, C = 128, 4, 1024
     dtype = torch.bfloat16
 
-    layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(
-        M, n, C, dtype
-    )
+    layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(M, n, C, dtype)
 
     out = torch.empty(M, n, C, dtype=dtype, device=layer_input.device)
 
@@ -732,9 +728,7 @@ def test_mhc_post_squeeze_post_mix():
     M, n, C = 64, 4, 512
     dtype = torch.bfloat16
 
-    layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(
-        M, n, C, dtype
-    )
+    layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(M, n, C, dtype)
 
     post_mix_3d = post_mix.unsqueeze(-1)  # (M, n, 1)
     assert post_mix_3d.shape == (M, n, 1)
@@ -824,9 +818,7 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
-    layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(
-        M, n, C, dtype
-    )
+    layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(M, n, C, dtype)
 
     out_t = mhc_post(None, layer_input, residual, post_mix, comb_mix)
 
@@ -844,9 +836,7 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
         tol_err_ratio=0.05,
         msg=msg,
     )
-    assert (
-        pct <= 0.05
-    ), f"{msg} (atol=2e-2, rtol=1e-2, bad_element_ratio={pct:.2%})"
+    assert pct <= 0.05, f"{msg} (atol=2e-2, rtol=1e-2, bad_element_ratio={pct:.2%})"
 
 
 def mhc_e2e_triton(

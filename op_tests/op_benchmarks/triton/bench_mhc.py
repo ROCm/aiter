@@ -61,15 +61,16 @@ def get_benchmark_configs(args):
         #   C: hidden dimension per stream
         Ms = [2**i for i in range(10, 15)]
         n = 4
-        # For --op post --with-hip, align Cs with the HIP bench in
-        # op_tests/test_mhc.py (hidden_size choices = {1280, 2560, 4096, 7168}).
-        # These are the canonical "real model" hidden sizes and exercise all
-        # three HIP mhc_post dispatch paths:
+        # For --with-hip, align Cs with the HIP bench in op_tests/test_mhc.py
+        # (hidden_size choices = {1280, 2560, 4096, 7168}). These are the
+        # canonical "real model" hidden sizes and exercise all three HIP
+        # mhc_post dispatch paths:
         #   1280 -> residual_block=256, 2560 -> 512, 4096/7168 -> 1024 (gfx950)
-        # C=512 is excluded because the greedy dispatcher selects block=512 and
-        # then fails the kernel's `hidden_size >= residual_block * 2` check.
+        # C=512 is excluded because the greedy mhc_post dispatcher selects
+        # block=512 and then fails the kernel's `hidden_size >= residual_block
+        # * 2` check.
         op = getattr(args, "op", "pre")
-        if op == "post" and getattr(args, "with_hip", False):
+        if op in ("post", "pre") and getattr(args, "with_hip", False):
             Cs = [1280, 2560, 4096, 7168]
         else:
             Cs = [512, 4096, 2**15]
@@ -140,9 +141,14 @@ def _compute_metrics(
         total_memory = mem_read + mem_write
 
     elif operation == "post":
-        # Post operation has no FLOP metric, only memory
+        # mhc_post per output element out[m, j, c] is a length-(hc_mult+1) dot
+        # product:  out[m, j, c] = post_mix[m, j] * x[m, c]
+        #                        + sum_h comb_mix[m, h, j] * residual[m, h, c]
+        # Per (m, c) location there are hc_mult outputs, each a length-(hc_mult+1)
+        # dot product, so 2 * hc_mult * (hc_mult+1) FLOPs per (m, c) under the
+        # standard GEMV "2 FLOPs per MAC" convention used elsewhere in this file.
         mix_bytes = 4  # fp32
-        total_flops = None
+        total_flops = 2.0 * M * hc_mult * (hc_mult + 1) * hidden_size
         total_memory = (
             M * hidden_size * elem_bytes  # read x
             + M * hc_mult * hidden_size * elem_bytes  # read residual
@@ -184,15 +190,13 @@ def _get_benchmark_config(args, operation):
 
     # Determine metrics based on operation and args
     if args.metric == "all" or args.metric is None:
-        if operation == "pre":
+        if operation in ("pre", "post"):
             metrics = [
                 "time(ms)",
                 "throughput(TFLOPS)",
                 "bandwidth(GB/s)",
                 "arithmetic_intensity(FLOP/byte)",
             ]
-        elif operation == "post":
-            metrics = ["time(ms)", "bandwidth(GB/s)"]
         else:  # e2e
             metrics = ["time(ms)", "throughput(TFLOPS)", "bandwidth(GB/s)"]
     else:
@@ -421,9 +425,7 @@ def _create_benchmark_kernel(args, operation):
                 # reinterprets 4 bytes as fp32 and produces garbage output.
                 post_mix_hip = post_mix.float()
                 comb_mix_hip = comb_mix.float()
-                out_hip = torch.empty(
-                    M, n, C, dtype=dtype, device=layer_input.device
-                )
+                out_hip = torch.empty(M, n, C, dtype=dtype, device=layer_input.device)
 
                 def hip_fn():
                     aiter.mhc_post(
@@ -452,9 +454,7 @@ def _create_benchmark_kernel(args, operation):
                     t_vs_ref,
                     h_vs_ref,
                 )
-                _assert_triton_matches_hip(
-                    t_out, h_out, "post", M=M, C=C
-                )
+                _assert_triton_matches_hip(t_out, h_out, "post", M=M, C=C)
                 _checked_configs.add(config_key)
 
         else:  # e2e
