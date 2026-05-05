@@ -206,7 +206,7 @@ def mla_decode_fwd(
                 num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
             )
 
-        mgc = 64 if max_seqlen_q == 1 and nhead == 16 else 16
+        mgc = 64 if max_seqlen_q == 1 and nhead in [8, 16] else 16
         mgc = (
             32
             if (
@@ -223,7 +223,7 @@ def mla_decode_fwd(
 
         MAYBE_FINAL_OUT = True
 
-        if nhead == 16 and max_seqlen_q == 1:
+        if nhead in [8, 16] and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
 
         logits = (
