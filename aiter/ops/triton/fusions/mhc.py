@@ -30,45 +30,59 @@ def mhc(
     sinkhorn_iters: int = 20,
     config: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Single entry point ``mhc()`` runs equations 14-19 plus the layer_input apply
-    step in a single Triton launch (or split-K + reduce launch pair). The
-    log-domain Sinkhorn-Knopp projection of H^res (Eq 19) is fused into the
-    res-stream branch of the kernel.
+    """Fused mHC layer in one Triton launch (or a split-K + reduce-apply
+    launch pair when ``NUM_KSPLIT > 1``).
 
-        This function implements:
-        - Eq 14: H̃ = x̃φ (matrix multiplication)
-        - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
-        - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
-        - Eq 17: H^pre = σ(H^pre) + hc_pre_eps  (folded into layer_input below)
-        - Eq 18: H^post = hc_post_mult_value · σ(H^post)
-        - Eq 19: H^res = SinkhornKnopp(H^res)  (log-domain, in-kernel; skipped when
-          sinkhorn_iters == 0, in which case raw H^res logits are returned)
-        - layer_input[m, c] = Σᵢ (σ(H^pre[m, i]) + hc_pre_eps) · x[m, i, c]
+    Pipeline (per M-tile, ``alphas = (alpha_pre, alpha_post, alpha_res)``):
 
-        Args:
-            x: (M, K) input tensor where K = n*C
-            phi: (K, N) unified projection matrix where N = n + n + n²
-                 Layout: [pre | post | res] where res is n²
-            alpha_pre: Scaling factor for pre-stream
-            alpha_post: Scaling factor for post-stream
-            alpha_res: Scaling factor for residual stream
-            bias: (N,) bias vector (fp32)
-            n: Stream parameter (manifold dimension)
-            eps: Epsilon for RMS-norm numerical stability
-            hc_pre_eps: Additive epsilon on σ(H^pre) before the apply step
-                (default 0.0 for Eq-17 parity).
-            hc_post_mult_value: Multiplier on σ(H^post) (default 2.0 for Eq-18 parity).
-            sinkhorn_iters: Number of in-kernel log-domain Sinkhorn-Knopp iterations
-                on H^res. ``0`` returns raw H^res logits (skips Eq 19).
-            config: Optional kernel configuration dict
+        r = ||x||_2 / sqrt(n*C)                              # RMS-norm
+        H = ((x @ phi) * alphas) / r + bias                  # 3-stream projection
 
-        Returns:
-            Tuple `(h_post, h_res, layer_input)`:
-            - h_post:      (M, n, 1)  in x.dtype  - hc_post_mult_value · σ(H^post)
-            - h_res:       (M, n, n)  in x.dtype  - doubly-stochastic Sinkhorn output
-                                                     (or raw logits when sinkhorn_iters==0)
-            - layer_input: (M, C)     in x.dtype  - Σᵢ pre_mix_i · x_i
+                       [ H_pre ]            [ H_post ]            [ H_res ]
+                          (n)                   (n)                 (n*n)
+                           |                    |                     |
+                           v                    v                     v
+                  sigmoid + hc_pre_eps   hc_post * sigmoid        log-domain
+                                                                  Sinkhorn-Knopp
+                                                                  (sk_iters=0: raw)
+                           |                    |                     |
+                           v                    |                     |
+                  layer_input[m, c]             |                     |
+                    = sum_i pre_mix_i           |                     |
+                        * x[m, i, c]            |                     |
+                           |                    |                     |
+                           v                    v                     v
+                      layer_input             h_post                h_res
+                        (M, C)              (M, n, 1)             (M, n, n)
+
+    All outputs in ``x.dtype``. ``x`` and ``phi`` are bf16 / fp16; ``bias`` is fp32.
+
+    Execution paths (chosen by ``NUM_KSPLIT``):
+      - ``== 1``: ``_mhc_fused_kernel`` runs the full pipeline inline.
+      - ``>  1``: ``_mhc_fused_split_kernel`` writes per-K projection partials,
+                  then ``_mhc_reduce_apply_kernel`` does reduce + activations
+                  + apply.
+
+    Args:
+        x:                  (M, n*C) bf16 / fp16 input.
+        phi:                (K, N=n+n+n*n) bf16 / fp16; cols ``[pre|post|res]``.
+        alpha_pre/post/res: per-stream scaling factors.
+        bias:               (N,) fp32.
+        n:                  stream / manifold dimension.
+        eps:                RMS-norm epsilon (default 1e-6).
+        hc_pre_eps:         added to ``sigmoid(H_pre)`` (default 0.0).
+        hc_post_mult_value: multiplier on ``sigmoid(H_post)`` (default 2.0).
+        sinkhorn_iters:     log-domain SK iterations on H_res; ``0`` skips SK
+                            (default 20).
+        config:             optional config dict; loaded from per-arch tuned
+                            configs when ``None``.
+
+    Returns ``(h_post, h_res, layer_input)``:
+        h_post      : (M, n, 1)  hc_post_mult_value * sigmoid(H_post)
+        h_res       : (M, n, n)  Sinkhorn output (raw logits if sk_iters == 0)
+        layer_input : (M, C)     sum_i (sigmoid(H_pre[m,i]) + hc_pre_eps) * x[m,i,c]
+
+    Reference: arXiv:2512.24880.
     """
     M, K = x.shape
     C = K // n  # Derive C from K and n
