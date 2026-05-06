@@ -35,7 +35,7 @@ import enum
 import logging
 import sys
 from itertools import product
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import triton
