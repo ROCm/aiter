@@ -77,7 +77,7 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
     }
 
     // DSv4-Pro wo_b under TP8 has local GEMM shape [M, 2048] x [7168, 2048].
-    // The Python dispatch routes partial-M fragments through CKTile for stricter
+    // The Python dispatch routes partial-M fragments through generic CK for stricter
     // actual-M masking. If callers reach this direct CK entrypoint anyway, use
     // the tuned full-shape kernel instead of the smaller generic heuristic.
     if(N == 7168 && K == 2048)

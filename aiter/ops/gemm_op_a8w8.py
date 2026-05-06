@@ -755,12 +755,12 @@ def gemm_a8w8_blockscale_bpreshuffle(
 
     # DSv4-Pro wo_b under TP8 uses local shape [M, 2048] x [7168, 2048].
     # The tuned table only has the full M=20480 row. Batched eval/prefill emits
-    # partial-M fragments (for example M=5544) that route through padded CK
+    # partial-M fragments (for example M=5544) that route through padded tuned
     # dispatch and have shown row-dependent BF16 drift for identical rows.
-    # CKTile handles actual-M masking directly, so use it for these partial
-    # fragments while keeping the tuned full-shape CK path intact.
+    # Use generic CK for partial-M fragments; keep the tuned full-shape row
+    # intact for the throughput benchmark.
     if dtype == dtypes.bf16 and n == 7168 and k == 2048 and m != 20480:
-        return gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
+        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
