@@ -282,9 +282,6 @@ def fused_rms_fp8_group_quant(
         out1_bs_row_stride = out1_bs.stride(0)
         out1_bs_col_stride = out1_bs.stride(1)
 
-    num_groups_g = num_bs_cols
-    block_g_gated = triton.next_power_of_2(group_size)
-
     _fused_rms_fp8_group_quant_kernel[(M,)](
         inp1,
         inp1_weight,
@@ -330,9 +327,9 @@ def fused_rms_fp8_group_quant(
         GATED_RMS_FP8=False,
         RMS_TILE=512,
         ROWS_PER_BLOCK=1,
-        GROUP_SIZE_GATED=group_size,
-        NUM_GROUPS_GATED=num_groups_g,
-        BLOCK_G=block_g_gated,
+        GROUP_SIZE_GATED=1,
+        NUM_GROUPS_GATED=1,
+        BLOCK_G=1,
         HAS_BIAS_GATED=False,
         HAS_Z_GATED=False,
         NORM_BEFORE_GATE=False,
