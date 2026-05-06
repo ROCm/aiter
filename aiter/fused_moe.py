@@ -1026,9 +1026,6 @@ def get_2stage_cfgs(
         )
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
-    explicit_ck_2stage = (bool(kernelName1) and "ck2stages" in kernelName1) or (
-        bool(kernelName2) and "ck2stages" in kernelName2
-    )
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type, activation)
@@ -1150,8 +1147,7 @@ def get_2stage_cfgs(
             False,
         )
     if (
-        not explicit_ck_2stage
-        and dtype in [dtypes.bf16, dtypes.fp16]
+        dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and q_dtype_w in [dtypes.fp4x2]
         and is_shuffled
@@ -2031,23 +2027,7 @@ def cktile_moe_stage1(
         elif activation == ActivationType.Silu:
             aiter.silu_and_mul(out, valid_out)
         elif activation == ActivationType.Swiglu:
-            inter_dim = out.shape[-1]
-            from aiter.ops.flydsl.moe_kernels import (
-                _get_compiled_swiglu,
-                _run_compiled,
-            )
-
-            _swiglu_fn = _get_compiled_swiglu(inter_dim)
-            num_rows = valid_out.view(-1, inter_dim * 2).shape[0]
-            _run_compiled(
-                _swiglu_fn,
-                (
-                    valid_out.view(-1, inter_dim * 2),
-                    out.view(-1, inter_dim),
-                    num_rows,
-                    torch.cuda.current_stream(),
-                ),
-            )
+            aiter.swiglu_and_mul(out, valid_out)
         else:
             if bias1 is not None:
                 valid_out = valid_out + bias1[expert_ids.to(torch.long)].to(

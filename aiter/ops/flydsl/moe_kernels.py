@@ -981,6 +981,7 @@ def flydsl_moe_stage1(
         from aiter.ops.activation import (
             silu_and_mul,
             silu_and_mul_bias,
+            swiglu_and_mul,
             swiglu_and_mul_bias,
         )
 
@@ -991,17 +992,7 @@ def flydsl_moe_stage1(
         elif bias is not None and act == "silu":
             silu_and_mul_bias(post_out, post_input, topk_ids_arg, bias.contiguous())
         elif act == "swiglu":
-            _swiglu_fn = _get_compiled_swiglu(inter_dim)
-            num_rows = post_input.shape[0]
-            _run_compiled(
-                _swiglu_fn,
-                (
-                    post_input,
-                    post_out,
-                    num_rows,
-                    torch.cuda.current_stream(),
-                ),
-            )
+            swiglu_and_mul(post_out, post_input)
         else:
             if bias is not None:
                 post_input = post_input + bias[topk_ids.to(torch.long)].view(
