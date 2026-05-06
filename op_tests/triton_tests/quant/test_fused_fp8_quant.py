@@ -365,6 +365,66 @@ def test_fused_flatten_fp8_group_quant(M: int, N1: int, N2: int, dtype):
     torch.testing.assert_close(y_upcast_torch, y_upcast_triton, atol=0.1, rtol=0.1)
 
 
+@pytest.mark.parametrize("M", [1, 32, 256])
+@pytest.mark.parametrize("N1, N2", [(16, 128)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_flatten_fp8_group_quant_transpose_scale(
+    M: int, N1: int, N2: int, dtype
+):
+    """Test that transpose_scale parameter returns scale with transposed memory layout."""
+    torch.manual_seed(0)
+    group_size = 128
+    dtype_quant = aiter.dtypes.fp8
+    x = torch.randn((N1, M, N2), dtype=dtype, device="cuda") / 10
+    x = x.transpose(0, 1)
+
+    # Call with transpose_scale=False (original behavior)
+    y_q_orig, y_s_orig = fused_flatten_fp8_group_quant(
+        x,
+        group_size=group_size,
+        dtype_quant=dtype_quant,
+        transpose_scale=False,
+    )
+
+    # Call with transpose_scale=True
+    y_q_transposed, y_s_transposed = fused_flatten_fp8_group_quant(
+        x,
+        group_size=group_size,
+        dtype_quant=dtype_quant,
+        transpose_scale=True,
+    )
+
+    num_bs_cols = (N1 * N2 + group_size - 1) // group_size
+
+    # Verify that both outputs have the same shape
+    assert y_s_orig.shape == (
+        M,
+        num_bs_cols,
+    ), f"Expected shape (M, num_bs_cols), got {y_s_orig.shape}"
+    assert y_s_transposed.shape == (
+        M,
+        num_bs_cols,
+    ), f"Expected shape (M, num_bs_cols), got {y_s_transposed.shape}"
+
+    # Verify that transpose_scale=True version is equivalent to .transpose().contiguous().view()
+    y_s_expected = y_s_orig.transpose(0, 1).contiguous().view(*y_s_orig.shape)
+
+    # Verify that both have the same shape and strides (row-major after view)
+    assert (
+        y_s_orig.stride() == y_s_transposed.stride()
+    ), "Both should have row-major strides"
+    assert (
+        y_s_orig.is_contiguous() and y_s_transposed.is_contiguous()
+    ), "Both should be contiguous"
+
+    # Verify numerical correctness - values should match the transpose().contiguous().view() pattern
+    torch.testing.assert_close(y_s_transposed, y_s_expected, atol=1e-6, rtol=1e-6)
+
+    # Verify that the quantized fp8 tensor is identical
+    # For fp8 tensors, use exact bitwise comparison
+    torch.testing.assert_close(y_q_transposed, y_q_orig, atol=0, rtol=0)
+
+
 def run_torch_reduce_act_mul_fp8_group_quant(
     x, x2, activation, dtype, dtype_quant, group_size=128
 ):
