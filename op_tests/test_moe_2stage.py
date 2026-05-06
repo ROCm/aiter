@@ -798,8 +798,30 @@ parser.add_argument(
         "gfx1250)."
     ),
 )
+parser.add_argument(
+    "--num_buffers",
+    type=int,
+    default=1,
+    choices=[1, 2, 3, 4],
+    help=(
+        "Pipeline buffer depth for the gfx1250 MXScale / WMMA MoE kernels "
+        "(mirrors the FlyDSL UT --num_buffers flag in "
+        "FlyDSL/tests/kernels/test_moe_gemm_mxscale_gfx1250.py). "
+        "Exposed through the AITER_GFX1250_NUM_BUFFERS env var so the "
+        "stage1/stage2 wrappers in aiter.fused_moe can pass it down to "
+        "compile_moe_gemm1 / compile_moe_gemm2. Legal values: 1, 2, 3, 4 "
+        "(num_buffers >= 2 enables the multi-buffer pipeline plan; 1 "
+        "keeps the single-buffer path)."
+    ),
+)
 
 args = parser.parse_args()
+
+# Propagate gfx1250 kernel knobs to the fused_moe kernel-compile path via
+# env vars (consistent with the existing AITER_GFX1250_EXPERT_SCHED /
+# AITER_GFX1250_TDM_GATHER pattern). Set unconditionally so reruns from a
+# parent shell don't inherit a stale value when the user drops --num_buffers.
+os.environ["AITER_GFX1250_NUM_BUFFERS"] = str(int(args.num_buffers))
 
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
