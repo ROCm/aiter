@@ -212,9 +212,9 @@ def benchmark_topk_softplus(
 
 # Pytest-parametrized test functions -- topk_softplus
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("topk", [1, 2, 4, 8])
+@pytest.mark.parametrize("topk", [1, 2, 4, 6, 8])
 @pytest.mark.parametrize("num_tokens", [64, 1024, 2048])
-@pytest.mark.parametrize("num_experts", [64, 128, 256])
+@pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
 def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype):
     """Pytest test for correctness of topk_softplus (sqrtsoftplus) operation."""
     torch.random.manual_seed(0)
@@ -294,25 +294,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-experts",
         type=str2tuple,
-        default=[128],
+        default=[64, 128, 256, 384],
         help="Comma-separated list of number of experts (default: 128)",
     )
     parser.add_argument(
         "--num-tokens",
         type=str2tuple,
-        default=[1024],
+        default=[64, 1024, 2048],
         help="Comma-separated list of number of tokens (default: 1024)",
     )
     parser.add_argument(
         "--topk",
         type=str2tuple,
-        default=[8],
+        default=[1, 2, 4, 6, 8],
         help="Comma-separated list of topk values (default: 8)",
     )
     parser.add_argument(
         "--dtype",
         type=str2Dtype,
-        default=[torch.float16, torch.bfloat16],
+        default=[torch.float16, torch.bfloat16, torch.float32],
         help="Comma-separated list of dtypes: fp16, bf16 (default: fp16,bf16)",
     )
     parser.add_argument(

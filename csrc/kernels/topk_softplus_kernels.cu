@@ -30,6 +30,172 @@ __inline__ __device__ void warpReduceMax_softplus(float& val_o, int& idx)
         int, __builtin_amdgcn_readlane(result_kvp.key, WARP_SIZE - 1));
 }
 
+// ---- Register-only kernel for moderate expert counts (256 / 384) ----
+// Sorts each thread's partition in registers via an optimal sorting network,
+// then extracts global top-K through a warp-level k-way merge (iterative
+// argmax).  Shared memory and __syncthreads are completely eliminated.
+
+#define _CAS_DESC(v, o, id, i, j)                                    \
+    do                                                               \
+    {                                                                \
+        if((v)[i] < (v)[j])                                          \
+        {                                                            \
+            float _tv = (v)[i]; (v)[i] = (v)[j]; (v)[j] = _tv;      \
+            float _to = (o)[i]; (o)[i] = (o)[j]; (o)[j] = _to;      \
+            int _ti   = (id)[i]; (id)[i] = (id)[j]; (id)[j] = _ti;  \
+        }                                                            \
+    } while(0)
+
+template <int N>
+__device__ __forceinline__ void sort_network_desc(float* vals, float* orig, int* idxs)
+{
+    if constexpr(N == 4)
+    {
+        _CAS_DESC(vals, orig, idxs, 0, 1);
+        _CAS_DESC(vals, orig, idxs, 2, 3);
+        _CAS_DESC(vals, orig, idxs, 0, 2);
+        _CAS_DESC(vals, orig, idxs, 1, 3);
+        _CAS_DESC(vals, orig, idxs, 1, 2);
+    }
+    else if constexpr(N == 6)
+    {
+        _CAS_DESC(vals, orig, idxs, 0, 1);
+        _CAS_DESC(vals, orig, idxs, 2, 3);
+        _CAS_DESC(vals, orig, idxs, 4, 5);
+        _CAS_DESC(vals, orig, idxs, 0, 2);
+        _CAS_DESC(vals, orig, idxs, 1, 4);
+        _CAS_DESC(vals, orig, idxs, 3, 5);
+        _CAS_DESC(vals, orig, idxs, 0, 1);
+        _CAS_DESC(vals, orig, idxs, 2, 3);
+        _CAS_DESC(vals, orig, idxs, 4, 5);
+        _CAS_DESC(vals, orig, idxs, 1, 2);
+        _CAS_DESC(vals, orig, idxs, 3, 4);
+        _CAS_DESC(vals, orig, idxs, 2, 3);
+    }
+    else
+    {
+#pragma unroll
+        for(int i = 0; i < N - 1; i++)
+        {
+#pragma unroll
+            for(int j = 0; j < N - 1 - i; j++)
+            {
+                _CAS_DESC(vals, orig, idxs, j, j + 1);
+            }
+        }
+    }
+}
+
+#undef _CAS_DESC
+
+template <typename DTYPE_I, int NUM_EXPERTS, int TOPK, bool need_renorm>
+__global__ void topk_softplus_kernel_opt(
+    const DTYPE_I* __restrict__ gating_output,    // [num_tokens, NUM_EXPERTS]
+    const DTYPE_I* __restrict__ correction_bias,  // [NUM_EXPERTS] or nullptr
+    float* __restrict__ topk_weights,             // [num_tokens, TOPK]
+    int* __restrict__ topk_ids,                   // [num_tokens, TOPK]
+    const size_t stride_tk,
+    const int num_tokens,
+    const float routed_scaling_factor)
+{
+    using cktype_i               = typename t2opus<DTYPE_I>::type;
+    static constexpr int EPT     = NUM_EXPERTS / WARP_SIZE;
+    static_assert(NUM_EXPERTS % WARP_SIZE == 0);
+
+    const int token_idx = blockIdx.x;
+
+    auto const* input_ptr = reinterpret_cast<cktype_i const*>(
+        gating_output + token_idx * NUM_EXPERTS);
+
+    float vals[EPT];
+    float orig[EPT];
+    int   idxs[EPT];
+
+    // Step 1: load + softplus + bias — entirely in registers (strided access)
+    // orig[] caches the unbiased score so the merge phase never re-reads
+    // correction_bias from global memory (eliminates TOPK fp16→f32 conversions
+    // on the critical path).  Sorted alongside vals[]/idxs[] so that all three
+    // arrays share the same cursor index — the compiler emits one set of
+    // compare instructions for the dynamic register-array selects.
+#pragma unroll
+    for(int i = 0; i < EPT; i++)
+    {
+        int   e     = threadIdx.x + i * static_cast<int>(WARP_SIZE);
+        float x     = static_cast<float>(input_ptr[e]);
+        float sp    = x > 20.0f ? x : log1pf(expf(x));
+        float score = sqrtf(sp);
+        orig[i]     = score;
+        vals[i]     = score;
+        idxs[i]     = e;
+        if(correction_bias != nullptr)
+        {
+            vals[i] += static_cast<float>(
+                reinterpret_cast<cktype_i const*>(correction_bias)[e]);
+        }
+    }
+
+    // Step 2: sort thread-local partition descending (optimal sorting network)
+    sort_network_desc<EPT>(vals, orig, idxs);
+
+    // Step 3: warp-level k-way merge — iterative argmax across sorted lists
+    // The winning lane is derived from the expert index layout
+    // (e = threadIdx.x + i * WARP_SIZE  ⇒  lane = e & (WARP_SIZE-1)),
+    // so we broadcast the pre-cached unbiased score via readlane instead of
+    // loading + converting correction_bias[my_idx] each round.
+    int   cursor = 0;
+    float sum    = 0.0f;
+    int   topk_indice;
+    float topk_value;
+
+#pragma unroll
+    for(int k = 0; k < TOPK; ++k)
+    {
+        float my_val = (cursor < EPT) ? vals[cursor] : -INFINITY;
+        int   my_idx = (cursor < EPT) ? idxs[cursor] : 0;
+
+        warpReduceMax_softplus(my_val, my_idx);
+
+        bool  i_won   = (cursor < EPT && idxs[cursor] == my_idx);
+        float my_orig = i_won ? orig[cursor] : 0.0f;
+        if(i_won)
+            cursor++;
+
+        int   win_lane = my_idx & (static_cast<int>(WARP_SIZE) - 1);
+        float weight   = __builtin_bit_cast(
+            float,
+            __builtin_amdgcn_readlane(__builtin_bit_cast(int, my_orig), win_lane));
+
+        topk_indice = (threadIdx.x == k) ? my_idx : topk_indice;
+        topk_value  = (threadIdx.x == k) ? weight : topk_value;
+        if constexpr(need_renorm)
+        {
+            sum += weight;
+        }
+    }
+
+    // Step 4: apply renorm / route_scale and write
+    if constexpr(need_renorm)
+    {
+        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+    }
+    else
+    {
+        sum = routed_scaling_factor;
+    }
+
+    if(threadIdx.x < TOPK)
+    {
+        topk_weights[token_idx * stride_tk + threadIdx.x] = topk_value * sum;
+        topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_indice;
+    }
+}
+
+// ---- Generic fallback kernel (shared-memory based) ----
+// Uses shared memory to stage all expert scores, then runs topk sequential
+// passes: each pass scans the full shared-memory array to find the next
+// global maximum via warp reduce, marks the winner as -INF, and repeats.
+// Works for any (num_experts, topk) combination but performs topk full scans
+// of shared memory, which becomes the bottleneck for large topk values.
 template <typename DTYPE_I, typename f32vec, bool need_renorm>
 __global__ void topk_softplus_kernel(
     const DTYPE_I* __restrict__ gating_output,    // [num_tokens, num_experts]
@@ -136,7 +302,7 @@ __global__ void topk_softplus_kernel(
     // Step 3: apply renorm and route_scale
     if(need_renorm)
     {
-        sum = routed_scaling_factor / sum;
+        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
     }
     else
     {
@@ -169,6 +335,23 @@ __global__ void topk_softplus_kernel(
             routed_scaling_factor);                                                              \
     });
 
+#define LAUNCH_TOPK_SOFTPLUS_KERNEL_OPT(NUM_EXP, TK, need_renorm_val)                            \
+    VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "topk_softplus_kernel_opt", [&] {   \
+        hipLaunchKernelGGL(                                                                       \
+            (aiter::topk_softplus_kernel_opt<scalar_t, NUM_EXP, TK, need_renorm_val>),            \
+            dim3(grid),                                                                           \
+            dim3(block),                                                                          \
+            0,                                                                                    \
+            stream,                                                                               \
+            gating_output.data_ptr<scalar_t>(),                                                   \
+            has_bias ? correction_bias.data_ptr<scalar_t>() : nullptr,                            \
+            topk_weights.data_ptr<float>(),                                                       \
+            topk_indices.data_ptr<int>(),                                                         \
+            stride_tk,                                                                            \
+            num_tokens,                                                                           \
+            routed_scaling_factor);                                                               \
+    });
+
 void topk_softplus(torch::Tensor& topk_weights,    // [num_tokens, topk]
                    torch::Tensor& topk_indices,     // [num_tokens, topk]
                    torch::Tensor& gating_output,    // [num_tokens, num_experts]
@@ -183,11 +366,39 @@ void topk_softplus(torch::Tensor& topk_weights,    // [num_tokens, topk]
     bool has_bias   = correction_bias.numel() > 0;
 
     dim3 grid(num_tokens);
-    dim3 block(WARP_SIZE);
-    size_t shared_mem_size = num_experts * sizeof(float);
+    dim3 block(get_warp_size_func());
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    if(topk == 6 && (num_experts == 256 || num_experts == 384))
+    {
+        if(num_experts == 256)
+        {
+            if(need_renorm)
+            {
+                LAUNCH_TOPK_SOFTPLUS_KERNEL_OPT(256, 6, true)
+            }
+            else
+            {
+                LAUNCH_TOPK_SOFTPLUS_KERNEL_OPT(256, 6, false)
+            }
+        }
+        else
+        {
+            if(need_renorm)
+            {
+                LAUNCH_TOPK_SOFTPLUS_KERNEL_OPT(384, 6, true)
+            }
+            else
+            {
+                LAUNCH_TOPK_SOFTPLUS_KERNEL_OPT(384, 6, false)
+            }
+        }
+        return;
+    }
+
+    size_t shared_mem_size = num_experts * sizeof(float);
 
     switch(num_experts % 4)
     {
