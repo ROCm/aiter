@@ -612,6 +612,7 @@ class CustomAllreduce:
         eps: float,
         registered: bool = False,
         use_1stage: bool = False,
+        use_new: bool = True,
         post_per_token_quant: bool = False,
     ):
         if res_out is None:
@@ -633,6 +634,7 @@ class CustomAllreduce:
                 reg,
                 reg_bytes,
                 use_1stage,
+                use_new,
             )
             return out, res_out
         else:
@@ -665,6 +667,7 @@ class CustomAllreduce:
         weight: torch.Tensor,
         eps: float,
         use_1stage: bool,
+        use_new: bool = True,
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -678,6 +681,7 @@ class CustomAllreduce:
                     eps=eps,
                     registered=True,
                     use_1stage=use_1stage,
+                    use_new=use_new,
                 )
             else:
                 return torch.zeros_like(input), torch.zeros_like(input)
@@ -689,6 +693,7 @@ class CustomAllreduce:
                 eps=eps,
                 registered=False,
                 use_1stage=use_1stage,
+                use_new=use_new,
             )
 
     def custom_fused_ar_rms_quant(

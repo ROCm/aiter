@@ -194,7 +194,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      void* scale_out, void* w,
                                      AiterDtype dtype, float eps,
                                      int m, int n,
-                                     bool use_1stage)
+                                     bool use_1stage,
+                                     bool use_new)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -213,7 +214,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
             eps,                                                 \
             m,                                                   \
             n,                                                   \
-            use_1stage);                                         \
+            use_1stage,                                          \
+            use_new);                                            \
     }                                                            \
     else                                                         \
     {                                                            \
@@ -451,7 +453,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& w,
                              double eps,
                              int64_t reg_ptr, int64_t reg_bytes,
-                             bool use_1stage)
+                             bool use_1stage,
+                             bool use_new)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -470,14 +473,14 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, n, use_1stage);
+                                 dtype, (float)eps, m, n, use_1stage, use_new);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, n, use_1stage);
+                                 dtype, (float)eps, m, n, use_1stage, use_new);
     }
 }
 
@@ -509,14 +512,14 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, n, use_1stage);
+                                 dtype, (float)eps, m, n, use_1stage, true);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, n, use_1stage);
+                                 dtype, (float)eps, m, n, use_1stage, true);
     }
 }
 
