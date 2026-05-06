@@ -9,7 +9,7 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclass_replace
 
 import pytest
 import torch
@@ -60,6 +60,10 @@ class PrefillArgs:
     dtype: torch.dtype = torch.bfloat16
     is_varlen: bool = True
     output_final_state: bool = True
+    # SSM-state dtype for h0 / final_state. The kernel keeps the f32
+    # accumulator unchanged for both choices; bf16 only affects HBM
+    # bandwidth/footprint of the SSM state.
+    ssm_state_dtype: torch.dtype = torch.float32
 
     @property
     def Hg(self):
@@ -77,6 +81,8 @@ class PrefillArgs:
             tag += "_novarlen"
         if not self.output_final_state:
             tag += "_nofs"
+        if self.ssm_state_dtype == torch.bfloat16:
+            tag += "_stateBF16"
         return tag
 
 
@@ -221,6 +227,25 @@ PREFILL_PARAMS = [
 ]
 
 
+# Mirror every base shape with a bf16-SSM-state variant. The bf16 vs f32
+# kernel paths only differ in two ``if const_expr`` branches:
+#   - h0 load (gated by USE_INITIAL_STATE)
+#   - ht store (gated by STORE_FINAL_STATE)
+# The bf16 mirror keeps ``output_final_state`` from the base shape, so:
+#   - ``_nofs`` shapes (use_h0=True, store_fs=False) cover the h0 load path
+#   - default shapes (use_h0=True, store_fs=True) cover both paths
+# Only ``(use_h0=False, store_fs=False)`` would generate IR identical to
+# the f32 path; none of the current PREFILL_PARAMS hits that combo, so we
+# do not filter here. If you add such a case later, gate the mirror with
+# ``if _base.output_final_state or _make_inputs(...) provides h0``.
+PREFILL_PARAMS.extend(
+    [
+        _dataclass_replace(_base, ssm_state_dtype=torch.bfloat16)
+        for _base in list(PREFILL_PARAMS)
+    ]
+)
+
+
 # -- Helper functions ---------------------------------------------------
 
 
@@ -257,6 +282,7 @@ def _make_inputs(
     device="cuda",
     with_initial_state=True,
     is_varlen=True,
+    ssm_state_dtype=torch.float32,
 ):
     if args is not None:
         tp = args.tp
@@ -266,6 +292,7 @@ def _make_inputs(
         Hv_dim = args.Hv
         dtype = args.dtype
         is_varlen = args.is_varlen
+        ssm_state_dtype = args.ssm_state_dtype
 
     Hg = Hk_dim // tp
     H = Hv_dim // tp
@@ -293,9 +320,14 @@ def _make_inputs(
 
     initial_state = None
     if with_initial_state:
+        # Always allocate in f32 first to keep numerical noise small for
+        # references built off this tensor, then cast to the requested
+        # state dtype when it differs (e.g. bf16-state path).
         initial_state = (
             torch.randn(N, H, V_dim, K_dim, dtype=torch.float32, device=device) * 0.01
         )
+        if ssm_state_dtype != torch.float32:
+            initial_state = initial_state.to(ssm_state_dtype)
 
     return k, w_orig, u_orig, w_c, u_c, g, initial_state, cu_seqlens, scheduled_q_lens
 
@@ -437,34 +469,50 @@ PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
 
 
 def _assert_k5_outputs_match_ref(
-    h_out, vn_out, fs_out, h_ref, vn_ref, fs_ref, *, output_final_state, label
+    h_out,
+    vn_out,
+    fs_out,
+    h_ref,
+    vn_ref,
+    fs_ref,
+    *,
+    output_final_state,
+    label,
+    atol=5e-2,
+    rtol=5e-2,
 ):
     """Compare a K5 backend's outputs against the PyTorch FP32 reference.
 
     All backends in this file return VK-ordered ``h`` / ``final_state`` and
     ``v_new`` in head-major ``[B, H, T, V]`` layout (which we permute back to
     ``[B, T, H, V]`` for comparison via ``_normalize_opt_v_new``).
+
+    The same tolerance applies to all dtypes (f32-state and bf16-state) and
+    all three outputs. The bf16-state path's only extra noise relative to
+    f32-state is one ``truncf`` on the final_state, which stays well within
+    bf16 ULP for sane inputs and never exceeds the historical f32-state
+    margins.
     """
     torch.testing.assert_close(
         h_out.float(),
         h_ref.float(),
-        atol=1e-1,
-        rtol=1e-1,
+        atol=atol,
+        rtol=rtol,
         msg=f"{label}: h mismatch",
     )
     torch.testing.assert_close(
         _normalize_opt_v_new(vn_out).float(),
         vn_ref.float(),
-        atol=1e-1,
-        rtol=1e-1,
+        atol=atol,
+        rtol=rtol,
         msg=f"{label}: v_new mismatch",
     )
     if output_final_state:
         torch.testing.assert_close(
             fs_out.float(),
             fs_ref.float(),
-            atol=1e-1,
-            rtol=1e-1,
+            atol=atol,
+            rtol=rtol,
             msg=f"{label}: final_state mismatch",
         )
     else:
@@ -517,6 +565,8 @@ class TestCorrectness:
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_correctness_triton_vk(self, args: PrefillArgs):
         """Triton VK K5 (h: [V, K]) -- same input/output layout as FlyDSL."""
+        if args.ssm_state_dtype != torch.float32:
+            pytest.skip("Triton VK reference only supports f32 SSM state.")
         context_lens = _build_context_lens(
             args.full_prompt_len, args.max_num_batched_tokens
         )
@@ -563,6 +613,8 @@ class TestCorrectness:
         returned ``h`` / ``final_state`` back to VK so they compare to the
         common FP32 reference.
         """
+        if args.ssm_state_dtype != torch.float32:
+            pytest.skip("Triton KV reference only supports f32 SSM state.")
         context_lens = _build_context_lens(
             args.full_prompt_len, args.max_num_batched_tokens
         )
@@ -607,6 +659,202 @@ class TestCorrectness:
         )
 
 
+# -- bf16 SSM-state correctness ------------------------------------------
+
+
+# A small, fast subset of shapes used to validate the bf16-state code path
+# (h0 / final_state in bf16). Picked to cover both the non-varlen and varlen
+# launch routes while keeping kernel JIT compile time low.
+STATE_BF16_PARAMS = [
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=32,
+        tp=2,
+        full_prompt_len=2500,
+        model_name="Qwen3.5-35B-bf16state",
+        is_varlen=False,
+        output_final_state=True,
+        max_num_batched_tokens=2500,
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=4,
+        full_prompt_len=1024,
+        model_name="Qwen3.5-tp4-1k-bf16state",
+        is_varlen=True,
+        output_final_state=True,
+        max_num_batched_tokens=8192,
+    ),
+]
+STATE_BF16_TEST_IDS = [repr(p) for p in STATE_BF16_PARAMS]
+
+
+class TestStateDtypeBF16:
+    """Validate that ``state_dtype=bfloat16`` matches the ``float32`` path.
+
+    The bf16-state kernel keeps the f32 accumulator unchanged and only
+    rounds h0 (extf) and final_state (truncf) at the HBM boundary, so its
+    output should agree with the f32-state kernel up to one bf16 trunc
+    error on the SSM state plus accumulated round-off through the chunk
+    loop. We compare against the *flydsl f32-state* path on the exact same
+    shape rather than the PyTorch reference, which gives the tightest
+    regression signal for this specific feature.
+    """
+
+    @pytest.mark.parametrize("args", STATE_BF16_PARAMS, ids=STATE_BF16_TEST_IDS)
+    def test_state_bf16_matches_state_f32(self, args: PrefillArgs):
+        context_lens = _build_context_lens(
+            args.full_prompt_len, args.max_num_batched_tokens
+        )
+        k, _, _, w_c, u_c, g, h0_f32, cu, _ = _make_inputs(context_lens, args=args)
+        h0_bf16 = h0_f32.to(torch.bfloat16)
+
+        h_f32, vn_f32, fs_f32 = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0_f32,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_bf16, vn_bf16, fs_bf16 = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0_bf16,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        # final_state dtype must follow the input dtype.
+        if args.output_final_state:
+            assert (
+                fs_f32 is not None and fs_f32.dtype == torch.float32
+            ), f"f32 path produced {fs_f32.dtype} final_state"
+            assert (
+                fs_bf16 is not None and fs_bf16.dtype == torch.bfloat16
+            ), f"bf16 path produced {fs_bf16.dtype} final_state"
+        else:
+            assert fs_f32 is None and fs_bf16 is None
+
+        # h and v_new are bf16 in both paths (decoupled from state dtype).
+        assert h_f32.dtype == h_bf16.dtype == k.dtype
+        if vn_f32 is not None:
+            assert vn_f32.dtype == vn_bf16.dtype == u_c.dtype
+
+        # The two paths diverge only by the rounding applied to h0/ht. With
+        # f32 accumulation this stays well within bf16 ULP * (1 + chunk
+        # length) for sane inputs.
+        atol = 5e-2
+        rtol = 5e-2
+        torch.testing.assert_close(
+            h_bf16.float(),
+            h_f32.float(),
+            atol=atol,
+            rtol=rtol,
+            msg="bf16-state vs f32-state: h mismatch",
+        )
+        if vn_f32 is not None:
+            torch.testing.assert_close(
+                vn_bf16.float(),
+                vn_f32.float(),
+                atol=atol,
+                rtol=rtol,
+                msg="bf16-state vs f32-state: v_new mismatch",
+            )
+        if args.output_final_state:
+            torch.testing.assert_close(
+                fs_bf16.float(),
+                fs_f32.float(),
+                atol=atol,
+                rtol=rtol,
+                msg="bf16-state vs f32-state: final_state mismatch",
+            )
+
+    @pytest.mark.parametrize("args", STATE_BF16_PARAMS, ids=STATE_BF16_TEST_IDS)
+    def test_state_dtype_kwarg_no_initial_state(self, args: PrefillArgs):
+        """``state_dtype`` kwarg controls final_state dtype when h0 is None."""
+        if not args.output_final_state:
+            pytest.skip("kwarg only meaningful when final_state is requested")
+        context_lens = _build_context_lens(
+            args.full_prompt_len, args.max_num_batched_tokens
+        )
+        k, _, _, w_c, u_c, g, _, cu, _ = _make_inputs(
+            context_lens, args=args, with_initial_state=False
+        )
+
+        _, _, fs_f32 = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=None,
+            output_final_state=True,
+            cu_seqlens=cu,
+            # default -> f32
+        )
+        assert fs_f32 is not None and fs_f32.dtype == torch.float32
+
+        _, _, fs_bf16 = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=None,
+            output_final_state=True,
+            cu_seqlens=cu,
+            state_dtype=torch.bfloat16,
+        )
+        assert fs_bf16 is not None and fs_bf16.dtype == torch.bfloat16
+
+    def test_state_dtype_conflict_raises(self):
+        """Mismatched ``state_dtype`` and ``initial_state.dtype`` must raise."""
+        args = STATE_BF16_PARAMS[0]
+        context_lens = _build_context_lens(
+            args.full_prompt_len, args.max_num_batched_tokens
+        )
+        k, _, _, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
+        with pytest.raises(ValueError):
+            chunk_gated_delta_rule_fwd_h_flydsl(
+                k,
+                w_c,
+                u_c,
+                g=g,
+                initial_state=h0,  # f32
+                output_final_state=args.output_final_state,
+                cu_seqlens=cu,
+                state_dtype=torch.bfloat16,  # conflict
+            )
+
+    def test_state_dtype_unsupported_raises(self):
+        """Unsupported state dtypes must raise (e.g. fp16)."""
+        args = STATE_BF16_PARAMS[0]
+        context_lens = _build_context_lens(
+            args.full_prompt_len, args.max_num_batched_tokens
+        )
+        k, _, _, w_c, u_c, g, _, cu, _ = _make_inputs(
+            context_lens, args=args, with_initial_state=False
+        )
+        with pytest.raises(ValueError):
+            chunk_gated_delta_rule_fwd_h_flydsl(
+                k,
+                w_c,
+                u_c,
+                g=g,
+                initial_state=None,
+                output_final_state=True,
+                cu_seqlens=cu,
+                state_dtype=torch.float16,
+            )
+
+
 _perf_results: list[dict] = []
 
 
@@ -621,8 +869,21 @@ class TestPerformance:
         k, _, _, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
         total_tokens = sum(context_lens)
 
-        # Triton KV wrapper expects initial_state in [N, H, K, V]; tests carry VK.
-        h0_kv = h0.transpose(-2, -1).contiguous() if h0 is not None else None
+        # Triton K5 host wrappers only accept f32 ``initial_state`` and always
+        # produce an f32 ``final_state``. When FlyDSL is benched with a bf16
+        # SSM state, we still want a Triton baseline for comparison, so we
+        # promote h0 to f32 once (outside the timed window) and feed it to
+        # the Triton closures. The resulting "Triton(f32) vs FlyDSL(bf16)"
+        # row answers the practical question "how much does enabling
+        # bf16-state win against the existing Triton baseline?".
+        h0_triton_vk = (
+            h0.float() if (h0 is not None and h0.dtype != torch.float32) else h0
+        )
+        h0_kv = (
+            h0_triton_vk.transpose(-2, -1).contiguous()
+            if h0_triton_vk is not None
+            else None
+        )
 
         # K5 launch closures: each invokes the K5 host wrapper of its backend.
         def flydsl_launch():
@@ -642,7 +903,7 @@ class TestPerformance:
                 w=w_c,
                 u=u_c,
                 g=g,
-                initial_state=h0,
+                initial_state=h0_triton_vk,
                 output_final_state=args.output_final_state,
                 cu_seqlens=cu,
             )
@@ -683,6 +944,7 @@ class TestPerformance:
                 "T": total_tokens,
                 "varlen": args.is_varlen,
                 "final_st": args.output_final_state,
+                "state": "bf16" if args.ssm_state_dtype == torch.bfloat16 else "fp32",
                 "FlyDSL_vk(us)": us_fly,
                 "Triton_vk(us)": us_triton_vk,
                 "Triton_kv(us)": us_triton_opt3,
@@ -696,6 +958,8 @@ def _print_perf_table():
     if not _perf_results:
         return
 
+    # Columns shared by both per-state tables. ``state`` is omitted because
+    # each subtable describes a single SSM-state dtype in its title.
     cols = [
         ("Model", 16),
         ("TP", 4),
@@ -713,20 +977,11 @@ def _print_perf_table():
         ("vs_triton_vk", 13),
         ("vs_triton_kv", 13),
     ]
-
     header = " | ".join(name.rjust(width) for name, width in cols)
     sep = "-+-".join("-" * width for _, width in cols)
+    border = "=" * len(header)
 
-    lines = [
-        "",
-        "=" * len(header),
-        "K5 Prefill Performance Summary (K5 device kernel time only, via torch.profiler)",
-        "=" * len(header),
-        header,
-        sep,
-    ]
-
-    for row in _perf_results:
+    def _fmt_row(row):
         cells = []
         for name, width in cols:
             val = row[name]
@@ -739,9 +994,39 @@ def _print_perf_table():
                     cells.append(f"{val:.2f}".rjust(width))
             else:
                 cells.append(str(val).rjust(width))
-        lines.append(" | ".join(cells))
+        return " | ".join(cells)
 
-    lines.append(sep)
+    # Bucket rows by SSM-state dtype, keeping each bucket's ordering
+    # consistent with the original ``_perf_results.append`` order so that
+    # rows line up with the parametrize id order.
+    rows_fp32 = [r for r in _perf_results if r["state"] == "fp32"]
+    rows_bf16 = [r for r in _perf_results if r["state"] == "bf16"]
+
+    lines = ["", border]
+    lines.append(
+        "K5 Prefill Performance Summary "
+        "(K5 device kernel time only, via torch.profiler)"
+    )
+    lines.append(
+        "  Triton K5 references always use fp32 SSM state; only FlyDSL's "
+        "SSM-state dtype changes between the two tables below."
+    )
+    lines.append(border)
+
+    def _emit_subtable(title, rows):
+        if not rows:
+            return
+        lines.append("")
+        lines.append(title)
+        lines.append(sep)
+        lines.append(header)
+        lines.append(sep)
+        for row in rows:
+            lines.append(_fmt_row(row))
+        lines.append(sep)
+
+    _emit_subtable("[FlyDSL SSM state = fp32]", rows_fp32)
+    _emit_subtable("[FlyDSL SSM state = bf16]", rows_bf16)
     lines.append("")
     print("\n".join(lines))
 

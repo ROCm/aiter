@@ -284,6 +284,7 @@ def _get_or_compile(
     save_vn,
     is_varlen,
     wu_contig,
+    state_bf16=False,
 ):
     cache_key = (
         K,
@@ -299,6 +300,7 @@ def _get_or_compile(
         save_vn,
         is_varlen,
         wu_contig,
+        state_bf16,
     )
     if cache_key not in _compiled_kernels:
         _compiled_kernels[cache_key] = compile_chunk_gated_delta_h(
@@ -315,6 +317,7 @@ def _get_or_compile(
             SAVE_NEW_VALUE=save_vn,
             IS_VARLEN=is_varlen,
             WU_CONTIGUOUS=wu_contig,
+            STATE_DTYPE_BF16=state_bf16,
         )
     return _compiled_kernels[cache_key]
 
@@ -374,6 +377,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     chunk_size: int = 64,
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
 
@@ -404,6 +408,28 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # Layout is fixed to head-major contiguous (matches Triton VK wrapper).
     wu_contiguous = True
 
+    # SSM state dtype: derived from ``initial_state.dtype`` when provided,
+    # otherwise from ``state_dtype`` kwarg, otherwise default f32 (matches
+    # the legacy behaviour). Only ``torch.float32`` and ``torch.bfloat16``
+    # are supported by the kernel.
+    if initial_state is not None:
+        resolved_state_dtype = initial_state.dtype
+        if state_dtype is not None and state_dtype != resolved_state_dtype:
+            raise ValueError(
+                f"state_dtype={state_dtype} conflicts with "
+                f"initial_state.dtype={initial_state.dtype}; pass them consistently "
+                f"or omit state_dtype."
+            )
+    elif state_dtype is not None:
+        resolved_state_dtype = state_dtype
+    else:
+        resolved_state_dtype = torch.float32
+    if resolved_state_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            f"SSM state dtype must be float32 or bfloat16, got {resolved_state_dtype}."
+        )
+    state_bf16 = resolved_state_dtype == torch.bfloat16
+
     B, T, Hg, K = k.shape
     BT = chunk_size
 
@@ -432,7 +458,9 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 
     h = k.new_empty(B, NT, H, V, K)
     final_state = (
-        k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
+        k.new_empty(N, H, V, K, dtype=resolved_state_dtype)
+        if output_final_state
+        else None
     )
     v_new_buf = k.new_empty(B, H, T_flat, V, dtype=u.dtype)
     v_new = v_new_buf if save_new_value else None
@@ -487,6 +515,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         save_new_value,
         is_varlen,
         wu_contiguous,
+        state_bf16=state_bf16,
     )
     _launch_kernel(
         launch_fn,

@@ -64,6 +64,7 @@ def compile_chunk_gated_delta_h(
     SAVE_NEW_VALUE: bool = True,
     IS_VARLEN: bool = True,
     WU_CONTIGUOUS: bool = True,
+    STATE_DTYPE_BF16: bool = False,
 ):
     """Compile the GDN K5 kernel.
 
@@ -71,6 +72,14 @@ def compile_chunk_gated_delta_h(
         launch_fn(k, v, w, v_new, g, gk, h, h0, ht,
                   cu_seqlens, chunk_offsets,
                   T_val, T_flat, N_val, stream)
+
+    When ``STATE_DTYPE_BF16=False`` (default) the SSM state tensors ``h0`` /
+    ``ht`` are ``float32``. When ``STATE_DTYPE_BF16=True`` they are
+    ``bfloat16``: ``h0`` is ``extf``-promoted to f32 right after each load,
+    and ``ht`` is ``truncf``-demoted to bf16 right before each store. The
+    f32 accumulator (``h_accs``) and all intermediate LDS layouts are
+    unchanged, so this only affects HBM bandwidth / footprint of the SSM
+    state. Mirrors the pattern used by ``kernels/gdr_decode.py``.
     """
     assert K <= 256
     assert K % 64 == 0
@@ -168,10 +177,15 @@ def compile_chunk_gated_delta_h(
             gk_ = GTensor(gk_tensor, dtype=T.f32, shape=(-1,))
 
         vn_ = GTensor(v_new_tensor, dtype=T.bf16, shape=(-1,))
+        # SSM-state dtype is selected by the compile-time flag; ``T.f32`` /
+        # ``T.bf16`` must be evaluated *inside* the kernel body where an MLIR
+        # context is active (mirrors how ``gdr_decode.py`` resolves
+        # ``state_dtype_`` from inside its kernel function).
+        state_t = T.bf16 if STATE_DTYPE_BF16 else T.f32
         if const_expr(USE_INITIAL_STATE):
-            h0_ = GTensor(h0_tensor, dtype=T.f32, shape=(-1,))
+            h0_ = GTensor(h0_tensor, dtype=state_t, shape=(-1,))
         if const_expr(STORE_FINAL_STATE):
-            ht_ = GTensor(ht_tensor, dtype=T.f32, shape=(-1,))
+            ht_ = GTensor(ht_tensor, dtype=state_t, shape=(-1,))
 
         if const_expr(IS_VARLEN):
             cu_ = GTensor(cu_seqlens_tensor, dtype=T.i32, shape=(-1,))
@@ -312,6 +326,8 @@ def compile_chunk_gated_delta_h(
                     )
                     h0_off_base = h0_base + h0_col * fx.Int32(K) + h0_row_base
                     loaded_vec = h0_.vec_load((fx.Index(h0_off_base),), 4)
+                    if const_expr(STATE_DTYPE_BF16):
+                        loaded_vec = loaded_vec.extf(T.f32x4)
                     acc_idx = kb * N_REPEAT + nr
                     h_accs[acc_idx] = arith.addf(h_accs[acc_idx], loaded_vec)
 
@@ -736,7 +752,11 @@ def compile_chunk_gated_delta_h(
                         + lane_m_base * fx.Int32(4)
                     )
                     ht_off_base = ht_base + ht_col * fx.Int32(K) + ht_row_base
-                    ht_.vec_store((fx.Index(ht_off_base),), acc_val, 4)
+                    if const_expr(STATE_DTYPE_BF16):
+                        out_vec = acc_val.truncf(T.vec(4, T.bf16))
+                    else:
+                        out_vec = acc_val
+                    ht_.vec_store((fx.Index(ht_off_base),), out_vec, 4)
 
     # -- Host launcher ------------------------------------------------------
     @flyc.jit
