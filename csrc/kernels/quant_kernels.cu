@@ -39,7 +39,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // num_thread_per_group resolved at compile time; group_size is a power-of-two so this
     // compiles to a bit shift rather than a runtime division
     static constexpr int num_thread_per_group = group_size / thread_data_size;
-    int64_t row_offset       = blockIdx.x * groupQuantBlockSize;
+    int64_t row_offset       = blockIdx.x * blockDim.x;
     int64_t groupId          = (row_offset + threadIdx.x) / num_thread_per_group;
     int32_t scaleN           = ori_cols / group_size;
     int32_t scaleN_pad       = (std::is_same_v<DTYPE_O, opus::fp4_t> && shuffle_scale)
@@ -739,12 +739,12 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
     if(cols == 32 || cols == 64 || cols == 128)
     {
         // dispatch group_size to template parameter so the compiler resolves all derived
-        // constants (num_thread_per_group) at compile time
+        // constants (num_thread_per_group, num_group_per_tg) at compile time
         DISPATCH_GROUP_SIZE(cols,
             static constexpr int thread_data_size     = 32;
             static constexpr int num_thread_per_group = _GS / thread_data_size;
             // gfx942 (CDNA3/MI300X): 128 = 2 wavefronts, improves output-write coalescing
-            // gfx950 (CDNA4/MI350):  256 = 4 wavefronts, wider memory bus benefits larger TG
+            // gfx950 (CDNA4/MI350):  256 = 4 wavefronts (wider memory bus benefits larger TG)
             const int32_t dynGroupQuantBlockSize = []() -> int32_t {
                 const auto& gfx = get_device_gfx();
                 if(gfx == "gfx942") return 128;
@@ -894,7 +894,7 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
         static constexpr int thread_data_size     = 32;
         static constexpr int num_thread_per_group = _GS / thread_data_size;
         // gfx942 (CDNA3/MI300X): 128 = 2 wavefronts, improves output-write coalescing
-        // gfx950 (CDNA4/MI350):  256 = 4 wavefronts, wider memory bus benefits larger TG
+        // gfx950 (CDNA4/MI350):  256 = 4 wavefronts (wider memory bus benefits larger TG)
         const int32_t dynGroupQuantBlockSize = []() -> int32_t {
             const auto& gfx = get_device_gfx();
             if(gfx == "gfx942") return 128;
