@@ -63,6 +63,8 @@ KernelName = Literal[
     "aiter_bf16",
 ]
 
+ALL_KERNELS: List[str] = ["sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8", "aiter_bf16"]
+
 
 @dataclass
 class ShapeSpec:
@@ -830,7 +832,15 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.compare_to_ref and args.ref not in ("torch", "aiter_bf16"):
         raise ValueError("--ref must be one of: torch, aiter_bf16")
 
-    if args.kernel != "sage_mxfp4" and (
+    if args.kernel == "all":
+        if args.block_sparsity is not None or args.block_mask_file:
+            raise ValueError("--kernel=all does not support block-sparse mode")
+        if args.compare_to_ref:
+            raise ValueError("--kernel=all does not support --compare-to-ref")
+        if args.load_captured:
+            raise ValueError("--kernel=all does not support --load-captured")
+
+    if args.kernel not in ("sage_mxfp4", "all") and (
         args.e2e or args.qsmooth or args.hadamard_rotate is False
     ):
         logger.warning(
@@ -1114,8 +1124,8 @@ def parse_args() -> argparse.Namespace:
         "--kernel",
         type=str,
         default="sage_fp8",
-        choices=["sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8", "aiter_bf16"],
-        help="Kernel implementation to benchmark.",
+        choices=["sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8", "aiter_bf16", "all"],
+        help="Kernel implementation to benchmark. Use 'all' to compare all backends.",
     )
 
     parser.add_argument("--b", type=int, default=0, help="Batch size")
@@ -1286,6 +1296,59 @@ def print_vgpr_from_bench(runner: Any) -> None:
         print("No VGPR metadata found in Triton dump output.")
 
 
+def run_all_kernels(args: argparse.Namespace) -> None:
+    """Run all backends on the same QKV inputs and print a comparison table."""
+    dtype = arg_to_torch_dtype[args.dtype]
+    device = "cuda"
+    hk = args.hk if args.hk else args.hq
+    sk = args.sk if args.sk else args.sq
+    d_head = args.d if args.d else 128
+    d_head_v = args.dv if args.dv else d_head
+
+    q = torch.randn((args.b, args.hq, args.sq, d_head), device=device, dtype=dtype)
+    k = torch.randn((args.b, hk, sk, d_head), device=device, dtype=dtype)
+    v = torch.randn((args.b, hk, sk, d_head_v), device=device, dtype=dtype)
+    q.requires_grad = False
+    k.requires_grad = False
+    v.requires_grad = False
+    q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=args.layout)
+
+    shape = infer_shape_spec(q, v, args.layout)
+    total_flops = (
+        2.0
+        * shape.batch
+        * shape.hq
+        * shape.n_ctx_q
+        * shape.n_ctx_k
+        * (shape.d_head + shape.d_head_v)
+    )
+
+    saved_kernel = args.kernel
+    rows: List[Tuple[str, float, float]] = []
+
+    for kernel_name in ALL_KERNELS:
+        args.kernel = kernel_name
+        try:
+            fn = make_kernel_runner(args, q, k, v, block_lut=None)
+            ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+            tflops = total_flops / ms * 1e-9
+            rows.append((kernel_name, ms, tflops))
+        except Exception as e:
+            logger.warning("Skipping %s: %s", kernel_name, e)
+            rows.append((kernel_name, float("nan"), float("nan")))
+
+    args.kernel = saved_kernel
+
+    print(f"\nbench_sage --kernel=all  (b={args.b} hq={args.hq} sq={args.sq} sk={sk} d={d_head}):")
+    print(f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10}")
+    print("-" * 38)
+    for name, ms, tflops in rows:
+        if ms != ms:  # nan
+            print(f"{name:<16} {'SKIP':>10} {'SKIP':>10}")
+        else:
+            print(f"{name:<16} {ms:>10.4f} {tflops:>10.2f}")
+
+
 def run_with_optional_vgpr(args: argparse.Namespace, runner: Any) -> int:
     if args.print_vgpr:
         print_vgpr_from_bench(runner)
@@ -1317,6 +1380,9 @@ def main() -> int:
 
     if isinstance(loaded_masks, LoadedMask):
         loaded_single_mask = loaded_masks
+
+    if args.kernel == "all":
+        return run_with_optional_vgpr(args, lambda: run_all_kernels(args))
 
     if (
         args.block_sparsity is not None
