@@ -4,6 +4,7 @@
 #include "aiter_hip_common.h"
 #include "dispatch_utils.h"
 #include "aiter_opus_plus.h"
+#include "gemm_dispatch_utils.h"
 #include "py_itfs_common.h"
 #include "rocprim/rocprim.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -738,11 +739,19 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
     if(cols == 32 || cols == 64 || cols == 128)
     {
         // dispatch group_size to template parameter so the compiler resolves all derived
-        // constants (num_thread_per_group, num_group_per_tg) at compile time
+        // constants (num_thread_per_group) at compile time
         DISPATCH_GROUP_SIZE(cols,
             static constexpr int thread_data_size     = 32;
             static constexpr int num_thread_per_group = _GS / thread_data_size;
-            static constexpr int num_group_per_tg     = groupQuantBlockSize / num_thread_per_group;
+            // gfx942 (CDNA3/MI300X): 128 = 2 wavefronts, improves output-write coalescing
+            // gfx950 (CDNA4/MI350):  256 = 4 wavefronts, wider memory bus benefits larger TG
+            const int32_t dynGroupQuantBlockSize = []() -> int32_t {
+                const auto& gfx = get_device_gfx();
+                if(gfx == "gfx942") return 128;
+                if(gfx == "gfx950") return 256;
+                return 64;
+            }();
+            const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
             if(out.dtype() == torch_fp8)
             {
                 int ori_cols  = out.size(-1);
@@ -750,7 +759,7 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                 int ori_rows  = rows / scaleN;
                 int num_group = rows;
                 dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
-                dim3 const block(groupQuantBlockSize);
+                dim3 const block(dynGroupQuantBlockSize);
                 AITER_DISPATCH_FLOATING16_TYPES(
                     input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
                         using input_dtype = typename t2opus<scalar_t>::type;
@@ -775,7 +784,7 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                 int ori_rows  = rows / scaleN;
                 int num_group = rows;
                 dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
-                dim3 const block(groupQuantBlockSize);
+                dim3 const block(dynGroupQuantBlockSize);
                 AITER_DISPATCH_FLOATING16_TYPES(
                     input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
                         using input_dtype = typename t2opus<scalar_t>::type;
@@ -803,7 +812,7 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                 // int num_group = shuffle_scale ? ((ori_rows + 255) / 256 * 256) * ((scaleN + 7) / 8 *
                 // 8) : rows;
                 dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
-                dim3 const block(groupQuantBlockSize);
+                dim3 const block(dynGroupQuantBlockSize);
                 AITER_DISPATCH_FLOATING16_TYPES(
                     input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
                         using input_dtype = typename t2opus<scalar_t>::type;
@@ -884,14 +893,22 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
     DISPATCH_GROUP_SIZE(group_size,
         static constexpr int thread_data_size     = 32;
         static constexpr int num_thread_per_group = _GS / thread_data_size;
-        static constexpr int num_group_per_tg     = groupQuantBlockSize / num_thread_per_group;
+        // gfx942 (CDNA3/MI300X): 128 = 2 wavefronts, improves output-write coalescing
+        // gfx950 (CDNA4/MI350):  256 = 4 wavefronts, wider memory bus benefits larger TG
+        const int32_t dynGroupQuantBlockSize = []() -> int32_t {
+            const auto& gfx = get_device_gfx();
+            if(gfx == "gfx942") return 128;
+            if(gfx == "gfx950") return 256;
+            return 64;
+        }();
+        const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
 
         int scaleN    = cols / _GS;
         int num_group = shuffle_scale ? rows * ((scaleN + 7) / 8 * 8) : rows * scaleN;
         // int num_group = shuffle_scale ? ((rows + 255) / 256 * 256) * ((scaleN + 7) / 8 * 8) : rows *
         // scaleN;
         dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
-        dim3 const block(groupQuantBlockSize);
+        dim3 const block(dynGroupQuantBlockSize);
 
 #if defined(__Float4_e2m1fn_x2)
         AITER_DISPATCH_FLOATING16_TYPES(
