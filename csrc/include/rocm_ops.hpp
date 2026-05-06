@@ -977,8 +977,7 @@ namespace py = pybind11;
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
           py::arg("dst_type")          = std::nullopt, \
-          py::arg("is_shuffled")       = true,         \
-          py::arg("bias")              = std::nullopt); \
+          py::arg("is_shuffled")       = true);        \
                                                        \
     m.def("ck_moe_stage2",                             \
           &ck_moe_stage2,                              \
@@ -1000,8 +999,7 @@ namespace py = pybind11;
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
           py::arg("dst_type")          = std::nullopt, \
-          py::arg("is_shuffled")       = true,         \
-          py::arg("bias")              = std::nullopt);
+          py::arg("is_shuffled")       = true);
 
 #define MOE_CKTILE_2STAGES_PYBIND                    \
     m.def("cktile_moe_gemm1",                        \

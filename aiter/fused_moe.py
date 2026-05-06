@@ -26,9 +26,7 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_GENERIC_SWIGLU_MXFP4_LAYOUT = (
     os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "1") == "1"
 )
-_SWIGLU_MXFP4_BF16_BOUND = int(
-    os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256")
-)
+_SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 
 
 def _moe_sorting_impl(
@@ -299,9 +297,7 @@ def fused_moe_(
         q_dtype_a = dtypes.bf16
     elif quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu and _USE_GENERIC_SWIGLU_MXFP4_LAYOUT:
-            q_dtype_a = (
-                dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
-            )
+            q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
         elif activation == ActivationType.Swiglu:
             bf16_fp8_bound = 256
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
@@ -1063,7 +1059,7 @@ def get_2stage_cfgs(
             )
         else:
             stage2_func = functools.partial(
-                ck_moe_stage2,
+                aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
                 activation=activation,
                 quant_type=q_type,
@@ -1077,9 +1073,9 @@ def get_2stage_cfgs(
             block_m,
             int(ksplit),
             run_1stage,
-            has_bias=enable_bias,
+            has_bias=enable_bias and is_flydsl1,
             fuse_quant=_fuse_quant,
-            stage2_has_bias=enable_bias,
+            stage2_has_bias=enable_bias and is_flydsl2,
         )
     if (
         not _USE_GENERIC_SWIGLU_MXFP4_LAYOUT
@@ -1093,7 +1089,7 @@ def get_2stage_cfgs(
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
-                split_k=max(ksplit, 1),
+                split_k=1,
                 dtype=dtype,
             ),
             functools.partial(
@@ -1154,32 +1150,8 @@ def get_2stage_cfgs(
             False,
         )
     if (
-        dtype in [dtypes.bf16, dtypes.fp16]
-        and q_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
-    ):
-        _sk = max(ksplit, 1) if q_dtype_a in [dtypes.bf16, dtypes.fp16] else 1
-        return MOEMetadata(
-            functools.partial(
-                cktile_moe_stage1,
-                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
-                k_pad_zeros=hidden_pad // 128 * 128,
-                activation=activation,
-                split_k=_sk,
-            ),
-            functools.partial(
-                cktile_moe_stage2,
-                n_pad_zeros=hidden_pad // 64 * 64,
-                k_pad_zeros=intermediate_pad // 128 * 128,
-                activation=activation,
-            ),
-            get_block_m(),
-            ksplit if q_dtype_a in [dtypes.bf16, dtypes.fp16] else 0,
-            False,
-            True,
-        )
-    elif (
-        dtype in [dtypes.bf16, dtypes.fp16]
+        not explicit_ck_2stage
+        and dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and q_dtype_w in [dtypes.fp4x2]
         and is_shuffled
@@ -1189,7 +1161,10 @@ def get_2stage_cfgs(
         # GPT-OSS Swiglu can use bf16/fp16 activations for small batches while
         # keeping the generic preshuffled fp4 weights. CK2stages has no
         # heuristic kernel for that A16W4 combination, so use CK-Tile.
-        _split_k = max(int(ksplit), 1)
+        # Use CK-Tile's split-k epilogue for the generic preshuffled MXFP4
+        # layout. The non-split gate/up epilogue is reserved for legacy A16W4.
+        _min_split_k = 2 if swiglu_mxfp4_bf16_cktile else 1
+        _split_k = max(int(ksplit), _min_split_k)
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
             functools.partial(
@@ -1234,13 +1209,12 @@ def get_2stage_cfgs(
             )
         else:
             stage2_func = functools.partial(
-                ck_moe_stage2,
+                aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
                 activation=activation,
                 quant_type=q_type,
                 use_non_temporal_load=use_non_temporal_load,
             )
-        ck_has_bias = _needs_swiglu_bias_support(dtype, q_type, activation)
         return MOEMetadata(
             functools.partial(
                 ck_moe_stage1,
@@ -1255,8 +1229,6 @@ def get_2stage_cfgs(
             block_m,
             int(ksplit),
             run_1stage,
-            has_bias=ck_has_bias,
-            stage2_has_bias=ck_has_bias,
         )
 
     # TODO: remove when stage2 support more size
@@ -1265,7 +1237,6 @@ def get_2stage_cfgs(
         tag = ""
         block_m = ([el for el in tmpList if block_m < el] + [128])[0]
 
-    ck_has_bias = _needs_swiglu_bias_support(dtype, q_type, activation)
     return MOEMetadata(
         functools.partial(
             asm_stage1,
@@ -1274,7 +1245,7 @@ def get_2stage_cfgs(
             quant_type=q_type,
         ),
         functools.partial(
-            ck_moe_stage2,
+            aiter.ck_moe_stage2_fwd,
             kernelName=kernelName2,
             activation=activation,
             quant_type=q_type,
@@ -1283,7 +1254,6 @@ def get_2stage_cfgs(
         block_m,
         ksplit,
         run_1stage,
-        stage2_has_bias=ck_has_bias,
     )
 
 
@@ -1936,7 +1906,6 @@ def ck_moe_stage1(
     splitk=1,
     use_non_temporal_load=False,
     dtype=None,
-    bias1=None,
 ):
     token_num = hidden_states.shape[0]
     is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
@@ -1967,57 +1936,14 @@ def ck_moe_stage1(
         splitk if is_splitk else 0,
         use_non_temporal_load,
         out.dtype,
-        bias=bias1,
     )
     if is_splitk:
         valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
             aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
-        elif activation == ActivationType.Swiglu:
-            aiter.swiglu_and_mul(out, valid_out.view(dtypes.fp32))
         else:
             aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
     return out
-
-
-def ck_moe_stage2(
-    inter_states,
-    w1,
-    w2,
-    sorted_token_ids,
-    sorted_expert_ids,
-    num_valid_ids,
-    out,
-    topk,
-    block_m,
-    w2_scale,
-    a2_scale,
-    kernelName="",
-    sorted_weights=None,
-    quant_type=aiter.QuantType.No,
-    activation=ActivationType.Gelu,
-    use_non_temporal_load=False,
-    bias2=None,
-):
-    return aiter.ck_moe_stage2_fwd(
-        inter_states,
-        w1,
-        w2,
-        sorted_token_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        out,
-        topk,
-        kernelName,
-        w2_scale,
-        a2_scale,
-        block_m,
-        sorted_weights,
-        quant_type,
-        activation,
-        use_non_temporal_load,
-        bias=bias2,
-    )
 
 
 def cktile_moe_stage1(
@@ -2059,19 +1985,12 @@ def cktile_moe_stage1(
         or out.device != hidden_states.device
     ):
         out = torch.empty(expected_out_shape, dtype=dtype, device=hidden_states.device)
-    needs_post_activation = split_k > 1 or (
-        split_k == 1 and activation == ActivationType.Swiglu
-    )
-    # Split-k reduces into a token-topk workspace. For SwiGLU split_k=1 we
-    # still materialize full gate/up output and run the post activation kernel;
-    # that is currently faster than CK-Tile's generic gate/up fused epilogue.
+    needs_post_activation = split_k > 1
+    # Split-k reduces into a token-topk workspace and applies activation after
+    # reduction. Non-split legacy A16W4 keeps CK-Tile's fused gate/up epilogue.
     workspace_rows = token_num * topk
-    if split_k > 1:
+    if needs_post_activation:
         tmp_out = torch.zeros(
-            (workspace_rows, w1.shape[1]), dtype=dtype, device=out.device
-        )
-    elif needs_post_activation:
-        tmp_out = torch.empty(
             (workspace_rows, w1.shape[1]), dtype=dtype, device=out.device
         )
     else:
@@ -2079,10 +1998,7 @@ def cktile_moe_stage1(
     bias1 = _normalize_bias_for_kernel(
         bias1, tmp_out.dtype if needs_post_activation else out.dtype
     )
-    # A split_k value of 0 is used internally to select CK-Tile's full gate/up
-    # GEMM1 epilogue without actually splitting K.
-    kernel_split_k = 0 if needs_post_activation and split_k == 1 else split_k
-
+    # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
         w1,
@@ -2099,7 +2015,7 @@ def cktile_moe_stage1(
         None if needs_post_activation else bias1,
         activation,
         block_m,
-        kernel_split_k,
+        split_k,
         kernel_name,
     )
 

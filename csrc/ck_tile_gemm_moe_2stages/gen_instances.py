@@ -101,7 +101,7 @@ torch::Tensor
     int KBatch = k_batch.has_value() ? k_batch.value() : 1;
     int stride_A = K;
     int stride_B = K;
-    int stride_C = {"true" if k.SplitK else "false"} || KBatch > 1 ? N : N / {3 - k.stage}; //gemm1 gate+up need / 2.
+    int stride_C = KBatch > 1 ? N : N / {3 - k.stage}; //gemm1 gate+up need / 2.
     void *sorted_weights_ptr = topk_weight.has_value() ? topk_weight.value().data_ptr() : nullptr;
 
     {{INSTANCE_CONTENT}}

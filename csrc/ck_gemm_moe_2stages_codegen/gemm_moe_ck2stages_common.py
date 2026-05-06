@@ -29,7 +29,7 @@ class kernelInstanceGEMM1:
     GemmPipelineVersion: int
     Nswizzle: bool = False
     MulRoutedWeight: bool = False
-    ActOP: int = 0
+    ActOP: bool = False
     CDEElementOp: str = "TypeCast"
     QuantType: int = 1
     stage: int = 1
@@ -39,7 +39,6 @@ class kernelInstanceGEMM1:
 
     @property
     def name(self) -> str:
-        act_name = {0: "gelu", 1: "silu", 2: "swiglu"}[self.ActOP]
         return ("_").join(
             [
                 f"moe_ck2stages_gemm{self.stage}",
@@ -60,7 +59,7 @@ class kernelInstanceGEMM1:
                 "Nswizzle" + str(int(self.Nswizzle)),
                 "Quant" + str(self.QuantType),
                 "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
-                act_name,
+                "silu" if self.ActOP else "gelu",
                 self.Adtype.upper(),
                 self.Bdtype.upper(),
                 self.Cdtype.upper(),
@@ -376,7 +375,6 @@ def get_gemm1_kernels_list(
     preshuffle: bool = False,
     splitk: bool = False,
 ) -> list:
-    act_dict = {"gelu": 0, "silu": 1, "swiglu": 2}
     arch = get_gfx()
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
         if arch == "gfx950":
@@ -412,7 +410,7 @@ def get_gemm1_kernels_list(
     kernels_list = {k: copy.deepcopy(v) for k, v in gemm1_kernels_dict[tag].items()}
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
-        kernel.ActOP = act_dict[ActOP]
+        kernel.ActOP = ActOP == "silu"
         kernel.Nswizzle = Nswizzle
         kernel.QuantType = QuantType
         kernel.Adtype = Adtype

@@ -283,10 +283,7 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
 
     bool has_bias = exp_bias.has_value();
     int act_op    = activation.has_value() ? activation.value() : -1;
-    int requested_k_batch       = split_k.has_value() ? split_k.value() : 1;
-    bool force_splitk_epilogue  = requested_k_batch == 0;
-    int k_batch                 = force_splitk_epilogue ? 1 : requested_k_batch;
-    int dispatch_splitk_epilogue = force_splitk_epilogue ? 2 : k_batch;
+    int k_batch   = split_k.has_value() ? split_k.value() : 1;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Y));
 
@@ -336,21 +333,21 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
         if(WQ.dtype() == torch_fp4x2 && Y.dtype() == at::ScalarType::BFloat16)
         {
             moe_dispatch<fp8, pk_fp4, float, bf16, 1>(
-                M, N, K, MPerBlock, act_op, has_bias, dispatch_splitk_epilogue)(XQ,
-                                                                                WQ,
-                                                                                Y,
-                                                                                sorted_ids,
-                                                                                sorted_expert_ids,
-                                                                                max_token_ids,
-                                                                                topk,
-                                                                                n_padded_zeros,
-                                                                                k_padded_zeros,
-                                                                                topk_weight,
-                                                                                x_scale,
-                                                                                w_scale,
-                                                                                exp_bias,
-                                                                                act_op,
-                                                                                k_batch);
+                M, N, K, MPerBlock, act_op, has_bias, k_batch)(XQ,
+                                                               WQ,
+                                                               Y,
+                                                               sorted_ids,
+                                                               sorted_expert_ids,
+                                                               max_token_ids,
+                                                               topk,
+                                                               n_padded_zeros,
+                                                               k_padded_zeros,
+                                                               topk_weight,
+                                                               x_scale,
+                                                               w_scale,
+                                                               exp_bias,
+                                                               act_op,
+                                                               k_batch);
         }
     }
     else if((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) &&
@@ -364,21 +361,21 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
         if(Y.dtype() == at::ScalarType::BFloat16)
         {
             moe_dispatch<bf16, pk_fp4, float, bf16, 1>(
-                M, N, K, MPerBlock, act_op, has_bias, dispatch_splitk_epilogue)(XQ,
-                                                                                WQ,
-                                                                                Y,
-                                                                                sorted_ids,
-                                                                                sorted_expert_ids,
-                                                                                max_token_ids,
-                                                                                topk,
-                                                                                n_padded_zeros,
-                                                                                k_padded_zeros,
-                                                                                topk_weight,
-                                                                                x_scale,
-                                                                                w_scale,
-                                                                                exp_bias,
-                                                                                act_op,
-                                                                                k_batch);
+                M, N, K, MPerBlock, act_op, has_bias, k_batch)(XQ,
+                                                               WQ,
+                                                               Y,
+                                                               sorted_ids,
+                                                               sorted_expert_ids,
+                                                               max_token_ids,
+                                                               topk,
+                                                               n_padded_zeros,
+                                                               k_padded_zeros,
+                                                               topk_weight,
+                                                               x_scale,
+                                                               w_scale,
+                                                               exp_bias,
+                                                               act_op,
+                                                               k_batch);
         }
     }
     else

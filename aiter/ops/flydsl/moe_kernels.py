@@ -12,10 +12,12 @@ import torch
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
 
+
 def _get_dtypes():
     from aiter.utility import dtypes
 
     return dtypes
+
 
 _SUFFIX_RE = re.compile(r"(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$")
 
