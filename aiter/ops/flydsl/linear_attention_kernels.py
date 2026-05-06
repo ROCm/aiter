@@ -50,8 +50,10 @@ def flydsl_gdr_decode(
     out: torch.Tensor,
     use_qk_l2norm: bool,
     need_shuffle_state: bool,
-    stream: torch.cuda.Stream = torch.cuda.current_stream(),
+    stream: torch.cuda.Stream | None = None,
 ):
+    if stream is None:
+        stream = torch.cuda.current_stream(device=query.device)
     if need_shuffle_state:
         state_ = state.permute(0, 1, 3, 2).contiguous()
     else:
@@ -69,6 +71,7 @@ def flydsl_gdr_decode(
         head_v_dim,
         use_qk_l2norm,
         **kwargs,
+        device=str(query.device),
     )
     exe_compiled = exe.compile(
         query,
