@@ -3,7 +3,9 @@ import torch.nn.functional as F
 import pytest
 
 import aiter
-from aiter.ops.triton.fusions.fused_clamp_act_mul_quant import fused_clamp_act_mul_quant
+from aiter.ops.triton.fusions.fused_clamp_act_mul_quant import (
+    fused_clamp_act_mul_fp8_group_quant,
+)
 from op_tests.triton_tests.quant.test_fused_fp8_quant import (
     per_token_fp8_group_quant,
     upcast,
@@ -51,7 +53,7 @@ def test_fused_clamp_act_mul_quant(
     else:
         scale = torch.empty((M, (N + 127) // 128), dtype=torch.float32, device="cuda")
 
-    fused_clamp_act_mul_quant(
+    out_fp8, scale = fused_clamp_act_mul_fp8_group_quant(
         inp,
         out_fp8,
         scale,

@@ -17,12 +17,12 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-def fused_clamp_act_mul_quant(
+def fused_clamp_act_mul_fp8_group_quant(
     inp: torch.Tensor,
-    out_fp8: torch.Tensor,
-    scale: torch.Tensor,
-    swiglu_limit: float,
-    activation: Literal["silu", "gelu", "gelu_tanh"],
+    out_fp8: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    swiglu_limit: float = 0,
+    activation: Literal["silu", "gelu", "gelu_tanh"] = "silu",
     weights: Optional[torch.Tensor] = None,
     dtype_quant: torch.dtype | None = None,
     transpose_scale: bool = False,
@@ -44,24 +44,32 @@ def fused_clamp_act_mul_quant(
         ``N`` must be a power of two, ``N >= 128``, and ``N % 128 == 0`` so each row
         uses one ``_fp8_quant_op`` tile (``BLOCK_SIZE_M=1``, ``BLOCK_SIZE_N=N``).
     """
-    if dtype_quant is not None and dtype_quant != out_fp8.dtype:
+    if dtype_quant is not None and out_fp8 is not None and dtype_quant != out_fp8.dtype:
         _LOGGER.info(
             "fused_clamp_act_mul_quant: dtype_quant=%s ignored; using out_fp8.dtype=%s",
             dtype_quant,
             out_fp8.dtype,
         )
 
-    assert inp.is_cuda and out_fp8.is_cuda and scale.is_cuda
     assert inp.dim() == 2
     M, D = inp.shape
     assert D % 2 == 0
     n_half = D // 2
-    assert out_fp8.shape == (M, n_half)
-    num_blocks = (n_half + 127) // 128
-    if transpose_scale:
-        assert scale.shape == (num_blocks, M)
+    if out_fp8 is None:
+        out_fp8 = torch.empty((M, n_half), dtype=dtype_quant, device=inp.device)
     else:
-        assert scale.shape == (M, num_blocks)
+        assert out_fp8.shape == (M, n_half)
+    num_blocks = (n_half + 127) // 128
+    if scale is None:
+        if transpose_scale:
+            scale = torch.empty((num_blocks, M), dtype=torch.float32, device=inp.device)
+        else:
+            scale = torch.empty((M, num_blocks), dtype=torch.float32, device=inp.device)
+    else:
+        if transpose_scale:
+            assert scale.shape == (num_blocks, M)
+        else:
+            assert scale.shape == (M, num_blocks)
 
     assert n_half >= 128
     assert (n_half & (n_half - 1)) == 0, "N=D//2 must be a power of 2 for this kernel"
@@ -134,3 +142,5 @@ def fused_clamp_act_mul_quant(
     )
     if transpose_scale:
         scale = scale.view(M, num_bs_cols)
+
+    return out_fp8, scale

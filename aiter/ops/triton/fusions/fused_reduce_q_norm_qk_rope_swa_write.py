@@ -30,8 +30,6 @@ def fused_reduce_q_norm_qk_rope_swa_write(
     swa_kv: Optional[torch.Tensor] = None,
     win: int = 128,
     dtype: torch.dtype = torch.bfloat16,
-    num_warps: int = 4,
-    num_stages: int = 2,
 ) -> torch.Tensor:
     """Fused split-K reduce + per-head weighted RMSNorm + RoPE tail + KV norm/RoPE (+ SWA).
 
@@ -103,6 +101,8 @@ def fused_reduce_q_norm_qk_rope_swa_write(
         f"D={head_dim} rd={rope_head_dim} HAS_SWA={HAS_SWA}"
     )
 
+    num_warps = 4
+    waves_per_eu = 1
     grid = (M, num_local_heads + 1)
     _fused_reduce_q_norm_qk_rope_swa_write_kernel[grid](
         q,
@@ -139,6 +139,6 @@ def fused_reduce_q_norm_qk_rope_swa_write(
         IS_NEOX=is_neox,
         REUSE_FREQS_FRONT_PART=True,
         num_warps=num_warps,
-        num_stages=num_stages,
+        waves_per_eu=waves_per_eu,
     )
     return q_out
