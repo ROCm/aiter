@@ -199,7 +199,9 @@ def _sage_fwd_no_mask(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+        # Scale P and convert to int8 for int8 matmul with V
+        p_scaled = (p * 127.0).to(tl.int8)
+        acc += tl.dot(p_scaled, v, out_dtype=tl.float32)
 
     return acc, l_i, m_i
 
@@ -352,7 +354,9 @@ def _sage_fwd_blocksparse_nomask(
                 v = tl.load(v_ptrs)
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+        # Scale P and convert to int8 for int8 matmul with V
+        p_scaled = (p * 127.0).to(tl.int8)
+        acc += tl.dot(p_scaled, v, out_dtype=tl.float32)
     return acc, l_i, m_i
 
 
@@ -500,7 +504,9 @@ def _sage_fwd_blocksparse_mask(
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+        # Scale P and convert to int8 for int8 matmul with V
+        p_scaled = (p * 127.0).to(tl.int8)
+        acc += tl.dot(p_scaled, v, out_dtype=tl.float32)
     return acc, l_i, m_i
 
 
@@ -858,7 +864,9 @@ def _sage_fwd_mask(
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+        # Scale P and convert to int8 for int8 matmul with V
+        p_scaled = (p * 127.0).to(tl.int8)
+        acc += tl.dot(p_scaled, v, out_dtype=tl.float32)
 
     return acc, l_i, m_i
 
@@ -1769,7 +1777,8 @@ def sage_fwd(
         other=0.0,
     )
 
-    acc = acc * l_recip * v_descale
+    # Descale: acc needs to be divided by 127.0 (P scale) and multiplied by v_descale
+    acc = acc * l_recip * v_descale / 127.0
     z = 0.0
     acc = tl.where(invalid_mask[:, None], z.to(acc.type.element_ty), acc)
     if ENABLE_DROPOUT:

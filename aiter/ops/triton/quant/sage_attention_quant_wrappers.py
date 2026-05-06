@@ -77,7 +77,9 @@ def fused_sage_quant_mxfp4(
     K_NUM_BLKS = (kv_len + BLOCK_K - 1) // BLOCK_K
 
     # V tensor per channel quantization
-    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+    # V scale for int8: use 127 (int8 max)
+    INT8_MAX = 127.0
+    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / INT8_MAX
 
     v_task_count = b * h_kv * K_NUM_BLKS
     grid = (v_task_count,)
@@ -147,7 +149,9 @@ def sage_quant_mxfp4(
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
     # Apply K tensor smoothing following SageAttention approach
-    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+    # V scale for int8: use 127 (int8 max)
+    INT8_MAX = 127.0
+    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / INT8_MAX
 
     v_task_count = b * h_kv * K_NUM_BLKS
     grid = (v_task_count,)
@@ -230,7 +234,8 @@ def sage_quant(
     """
     q_int8 = torch.empty_like(q, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty_like(k, dtype=torch.int8, device=k.device)
-    v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
+    # Change V to int8 for P@V to be regular tt.dot
+    v_fp8 = torch.empty_like(v, dtype=torch.int8, device=v.device)
 
     if layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
@@ -257,7 +262,9 @@ def sage_quant(
     q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
 
-    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+    # V scale for int8: use 127 (int8 max)
+    INT8_MAX = 127.0
+    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / INT8_MAX
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
