@@ -222,8 +222,6 @@ jobs:
           mkdir -p benchmark_results
           result_prefix="${{ steps.prep.outputs.result_prefix }}"
           logFile="benchmark_results/${result_prefix}.log"
-          jsonFile="benchmark_results/${result_prefix}.json"
-          csvFile="benchmark_results/${result_prefix}.csv"
 
           MODEL_MOUNT=""
           if [ -d "/models" ]; then
@@ -268,24 +266,8 @@ jobs:
                   --model \"\${model_path}\" \
                   --batch-size 123 --input-len 456 --output-len 78 \
                   --num-iters-warmup 3 --num-iters 10 \
-                  -tp ${{ matrix.tp }} --load-format dummy \
-                  --output-json \"/workspace/benchmark_results/${result_prefix}.json\" \
-                  ${extraArgs}
+                  -tp ${{ matrix.tp }} --load-format dummy ${extraArgs}
               " |& tee "${logFile}"
-
-          python3 .github/scripts/vllm_benchmark_summary.py single \
-              --input-json "${jsonFile}" \
-              --output-csv "${csvFile}" \
-              --model "${{ matrix.model }}" \
-              --kv-cache-dtype "${{ matrix.kv_cache_dtype }}" \
-              --base-image "${{ env.BASE_IMAGE }}" \
-              --commit-sha "${{ env.GITHUB_COMMIT_SHA }}" \
-              --tp ${{ matrix.tp }} \
-              --batch-size 123 \
-              --input-len 456 \
-              --output-len 78 \
-              --num-iters-warmup 3 \
-              --num-iters 10
 
       - name: Ensure benchmark artifacts exist
         if: always()
@@ -410,14 +392,12 @@ jobs:
           PORT: "8006"
           MODEL: amd/Kimi-K2.5-MXFP4
           RESULTS: /benchmark_results/kimi_serve
-          BASE_IMAGE_VALUE: ${{ env.BASE_IMAGE }}
         run: |
           set -euxo pipefail
           docker exec \
             -e PORT="${PORT}" \
             -e MODEL="${MODEL}" \
             -e RESULTS="${RESULTS}" \
-            -e BASE_IMAGE="${BASE_IMAGE_VALUE}" \
             "${KIMI_CONTAINER_NAME}" bash -lc '
           mkdir -p "${RESULTS}"
           sweep=(
@@ -465,7 +445,6 @@ jobs:
               --trust-remote-code \
               --percentile-metrics ttft,tpot,itl,e2el \
               --ready-check-timeout-sec 7200 \
-              --metadata sweep_input_len="${isl}" sweep_output_len="${osl}" seed="${seed}" num_warmups="${warm}" \
               --save-result \
               --result-filename "${out}"
           done
@@ -478,16 +457,6 @@ jobs:
         run: |
           mkdir -p benchmark_results
           docker logs "${KIMI_CONTAINER_NAME}" > benchmark_results/kimi_serve_server.log 2>&1 || true
-
-      - name: Build Kimi serve benchmark summary
-        if: always()
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/vllm_benchmark_summary.py serve \
-              --input-dir benchmark_results/kimi_serve \
-              --output-csv benchmark_results/kimi_serve_summary.csv \
-              --base-image "${{ env.BASE_IMAGE }}" \
-              --model "amd/Kimi-K2.5-MXFP4"
 
       - name: Ensure benchmark artifacts exist
         if: always()
@@ -512,44 +481,3 @@ jobs:
         run: |
           docker rm -f "${KIMI_CONTAINER_NAME}" || true
           docker rmi "${{ env.BASE_IMAGE }}" || true
-
-  collect_vllm_benchmark_summary:
-    name: Collect vLLM Benchmark Summary
-    if: >-
-      always() &&
-      needs.vllm_benchmark.result != 'skipped'
-    needs: [vllm_benchmark]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout benchmark helpers
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          sparse-checkout: |
-            .github/scripts
-
-      - name: Download benchmark artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: vllm-benchmark-*
-          path: benchmark_artifacts
-          merge-multiple: true
-
-      - name: Build merged benchmark summary
-        run: |
-          set -euo pipefail
-          mkdir -p benchmark_summary
-          python3 .github/scripts/vllm_benchmark_summary.py merge \
-              --input-dir benchmark_artifacts \
-              --output-csv benchmark_summary/vllm_benchmark_summary.csv \
-              --base-image "${{ env.BASE_IMAGE }}" \
-              --commit-sha "${{ env.GITHUB_COMMIT_SHA }}"
-
-      - name: Upload merged benchmark summary
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: vllm-benchmark-summary
-          path: benchmark_summary/
-          retention-days: 7
