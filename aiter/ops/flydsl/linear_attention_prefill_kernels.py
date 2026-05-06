@@ -62,8 +62,50 @@ _TUNED_FILE = "chunk_gdn_h_tuned.jsonl"
 # (dtype_str, arch, K, V, BT, H, Hg, T_flat, N,
 #  use_g, use_gk, use_h0, store_fs, save_vn, is_varlen, wu_contig) -> {"BV": int}
 GDN_H_GLOBAL_CONFIG_MAP = None
+# Secondary index for the ``is_varlen=False`` nearest-T fallback. Keyed on the
+# full shape tuple but with ``T_flat`` removed; value is the list of
+# ``(T_flat, cfg)`` pairs sorted by ``T_flat``.
+GDN_H_T_INDEX = None
 GDN_H_GPU_ARCH = get_rocm_arch()
 _GDN_H_FALLBACK_WARNED = set()
+_GDN_H_NEAREST_WARNED = set()
+
+
+def _gdn_h_shape_key_no_T(
+    dtype_str,
+    arch,
+    K,
+    V,
+    BT,
+    H,
+    Hg,
+    N,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+):
+    """Lookup key with ``T_flat`` removed (used by nearest-T fallback)."""
+    return (
+        dtype_str,
+        arch,
+        K,
+        V,
+        BT,
+        H,
+        Hg,
+        N,
+        use_g,
+        use_gk,
+        use_h0,
+        store_fs,
+        save_vn,
+        is_varlen,
+        wu_contig,
+    )
 
 
 def _lookup_tuned_bv(
@@ -89,9 +131,10 @@ def _lookup_tuned_bv(
     per-shape warning). Mirrors the lookup-table pattern used by
     ``aiter.ops.flydsl.linear_attention_kernels.get_default_kwargs``.
     """
-    global GDN_H_GLOBAL_CONFIG_MAP
+    global GDN_H_GLOBAL_CONFIG_MAP, GDN_H_T_INDEX
     if GDN_H_GLOBAL_CONFIG_MAP is None:
         _dict = {}
+        _t_index = {}
         fname = os.path.join(Path(__file__).resolve().parent, _TUNED_FILE)
         if os.path.exists(fname):
             with open(fname, "r", encoding="utf-8") as f:
@@ -119,7 +162,28 @@ def _lookup_tuned_bv(
                         obj["wu_contig"],
                     )
                     _dict[key] = obj["config"]
+                    sk = _gdn_h_shape_key_no_T(
+                        obj["dtype"],
+                        obj["arch"],
+                        obj["K"],
+                        obj["V"],
+                        obj["BT"],
+                        obj["H"],
+                        obj["Hg"],
+                        obj["N"],
+                        obj["use_g"],
+                        obj["use_gk"],
+                        obj["use_h0"],
+                        obj["store_fs"],
+                        obj["save_vn"],
+                        obj["is_varlen"],
+                        obj["wu_contig"],
+                    )
+                    _t_index.setdefault(sk, []).append((obj["T_flat"], obj["config"]))
+        for _v in _t_index.values():
+            _v.sort(key=lambda x: x[0])
         GDN_H_GLOBAL_CONFIG_MAP = _dict
+        GDN_H_T_INDEX = _t_index
 
     key = (
         dtype_str,
@@ -144,6 +208,51 @@ def _lookup_tuned_bv(
         BV = int(cfg["BV"])
         if BV in _BV_CANDIDATES and BV <= V and V % BV == 0:
             return BV
+
+    # Nearest-T fallback (is_varlen=False only): for non-varlen prefill the
+    # optimal BV is essentially independent of T (parallel block count is
+    # ``H * V/BV``, T only scales the inner loop). When the exact T_flat is
+    # not tuned, look up the closest tuned T_flat for the same shape and
+    # reuse its BV. ``is_varlen=True`` still falls through to ``_DEFAULT_BV``
+    # to avoid mixing N/T_local effects across batches.
+    if not is_varlen:
+        sk = _gdn_h_shape_key_no_T(
+            dtype_str,
+            GDN_H_GPU_ARCH,
+            K,
+            V,
+            BT,
+            H,
+            Hg,
+            N,
+            use_g,
+            use_gk,
+            use_h0,
+            store_fs,
+            save_vn,
+            is_varlen,
+            wu_contig,
+        )
+        candidates_for_shape = (
+            GDN_H_T_INDEX.get(sk) if GDN_H_T_INDEX is not None else None
+        )
+        if candidates_for_shape:
+            # Tie-break: prefer the smaller T_flat, i.e. err on the side of the
+            # short-sequence config (which favours larger BV / lower register
+            # pressure regimes) rather than overshooting.
+            nearest_T, nearest_cfg = min(
+                candidates_for_shape,
+                key=lambda tc: (abs(tc[0] - T_flat), tc[0]),
+            )
+            BV = int(nearest_cfg["BV"])
+            if BV in _BV_CANDIDATES and BV <= V and V % BV == 0:
+                if sk not in _GDN_H_NEAREST_WARNED:
+                    print(
+                        f"[K5 lookup] no exact tuned BV for T_flat={T_flat} "
+                        f"on shape={sk}; using nearest-T={nearest_T} -> BV={BV}."
+                    )
+                    _GDN_H_NEAREST_WARNED.add(sk)
+                return BV
 
     # Fallback: pick a candidate that actually divides V, prefer _DEFAULT_BV.
     if key not in _GDN_H_FALLBACK_WARNED:
