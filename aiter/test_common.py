@@ -4,10 +4,20 @@ import torch
 import torch.profiler as tpf
 import os
 import copy
+import time
 import numpy as np
 import pandas as pd
 import multiprocessing as mp
 from aiter import logger
+
+# On the gfx1250 simulator (and any env that sets AITER_DISABLE_HIP_TIMER=1),
+# torch.cuda.Event(enable_timing=True) and torch.profiler.profile() both read
+# HIP event timestamps that the model does not provide, returning 0us and then
+# segfaulting on teardown. Fall back to wall-clock timing instead.
+_AITER_DISABLE_HIP_TIMER = (
+    os.environ.get("AITER_DISABLE_HIP_TIMER", "0") == "1"
+    or os.environ.get("HSA_MODEL_LIB", "") != ""
+)
 
 pd.set_option("display.max_rows", 200)
 ## debug ##
@@ -72,36 +82,64 @@ def perftest(
             torch.cuda.synchronize()
             if int(os.environ.get("AITER_LOG_MORE", 0)):
                 latencies = []
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                for _ in range(num_iters):
-                    start_event.record()
-                    data = func(*args, **kwargs)
-                    end_event.record()
-                    end_event.synchronize()
-                    latencies.append(start_event.elapsed_time(end_event))
-                    torch.cuda.empty_cache()
+                if _AITER_DISABLE_HIP_TIMER:
+                    for _ in range(num_iters):
+                        torch.cuda.synchronize()
+                        t0 = time.perf_counter()
+                        data = func(*args, **kwargs)
+                        torch.cuda.synchronize()
+                        latencies.append((time.perf_counter() - t0) * 1e3)  # ms
+                        torch.cuda.empty_cache()
+                else:
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    for _ in range(num_iters):
+                        start_event.record()
+                        data = func(*args, **kwargs)
+                        end_event.record()
+                        end_event.synchronize()
+                        latencies.append(start_event.elapsed_time(end_event))
+                        torch.cuda.empty_cache()
                 avg = np.mean(latencies) * 1000
-                logger.info(f"avg: {avg} us/iter from cuda.Event")
+                src = "time.perf_counter" if _AITER_DISABLE_HIP_TIMER else "cuda.Event"
+                logger.info(f"avg: {avg} us/iter from {src}")
 
-            with tpf.profile(
-                activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
-                profile_memory=False,
-                with_stack=False,
-                with_modules=True,
-                # record_shapes=True,
-                on_trace_ready=(
-                    tpf.tensorboard_trace_handler(f"./aiter_logs/gpu_id_{gpu_id}")
-                    if needTrace
-                    else None
-                ),
-            ) as prof:
-                data = run_iters_rotate(num_iters, func, rotate_args)
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-            avg = get_trace_perf(prof, num_iters)
+            if _AITER_DISABLE_HIP_TIMER:
+                # Skip torch.profiler -- it reads HIP event timestamps that
+                # the simulator does not provide, segfaulting on enter/exit.
+                # Also skip run_iters_rotate: the deep-copied rotate_args path
+                # has been observed to segfault on the simulator after a prior
+                # timing block has already exercised the kernel.
+                if int(os.environ.get("AITER_LOG_MORE", 0)):
+                    # data and per-iter latencies were already captured above;
+                    # reuse them and skip any further GPU work.
+                    avg = np.mean(latencies) * 1000  # us
+                else:
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                    data = func(*args, **kwargs)
+                    torch.cuda.synchronize()
+                    avg = (time.perf_counter() - t0) * 1e6  # us
+                    torch.cuda.empty_cache()
+            else:
+                with tpf.profile(
+                    activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
+                    profile_memory=False,
+                    with_stack=False,
+                    with_modules=True,
+                    # record_shapes=True,
+                    on_trace_ready=(
+                        tpf.tensorboard_trace_handler(f"./aiter_logs/gpu_id_{gpu_id}")
+                        if needTrace
+                        else None
+                    ),
+                ) as prof:
+                    data = run_iters_rotate(num_iters, func, rotate_args)
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                avg = get_trace_perf(prof, num_iters)
 
-            if testGraph:
+            if testGraph and not _AITER_DISABLE_HIP_TIMER:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     data = run_iters_rotate(num_iters, func, rotate_args)
