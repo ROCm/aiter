@@ -338,12 +338,6 @@ def _compile_stage1_mxscale_kernel_impl(
                     "\n".join(_prefetch_lines),
                     "", has_side_effects=True,
                 )
-        llvm_dialect.inline_asm(
-            None, [],
-            "s_setreg_imm32_b32 hwreg(26, 4, 1), 1",
-            "",
-            has_side_effects=True,
-        )
 
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
@@ -2509,12 +2503,6 @@ def _compile_stage2_mxscale_kernel_impl(
                     "\n".join(_prefetch_lines),
                     "", has_side_effects=True,
                 )
-        llvm_dialect.inline_asm(
-            None, [],
-            "s_setreg_imm32_b32 hwreg(26, 4, 1), 1",
-            "",
-            has_side_effects=True,
-        )
 
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
