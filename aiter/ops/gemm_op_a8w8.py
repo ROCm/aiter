@@ -216,6 +216,7 @@ def gemm_a8w8_blockscale_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
 ) -> torch.Tensor: ...
 
 
@@ -231,6 +232,7 @@ def gemm_a8w8_blockscale_cktile(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     isBpreshuffled: bool = False,
+    splitK: int = 0,
 ) -> torch.Tensor: ...
 
 
@@ -565,7 +567,13 @@ def gemm_a8w8_CK(
         else:
             splitK = 0
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return gemm_a8w8_ck(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
+    try:
+        return gemm_a8w8_ck(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"gemm_a8w8_CK failed for shape M={m}, N={n}, K={k}, "
+            f"{dtype=}, {splitK=}, config={ck_config}: {e}"
+        ) from e
 
 
 def gemm_a8w8_bpreshuffle_fake(
@@ -628,8 +636,13 @@ def gemm_a8w8_bpreshuffle(
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "flydsl" and is_flydsl_available():
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
-    else:
+    try:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
+            f"{dtype=}, config={config}: {e}"
+        ) from e
 
 
 def gemm_a8w8_blockscale_fake(
@@ -674,13 +687,24 @@ def gemm_a8w8_blockscale(
         )
         if config is not None:
             libtype = config["libtype"]
+            splitK = int(config.get("splitK", 0))
             if libtype == "ck":
-                return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+                return gemm_a8w8_blockscale_ck(
+                    XQ, WQ, x_scale, w_scale, Y, splitK=splitK
+                )
             elif libtype == "cktile":
-                return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y)
+                return gemm_a8w8_blockscale_cktile(
+                    XQ, WQ, x_scale, w_scale, Y, splitK=splitK
+                )
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
-        return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+        try:
+            return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"gemm_a8w8_blockscale failed for shape M={m}, N={n}, K={k}, "
+                f"{dtype=}, config={config}: {e}"
+            ) from e
 
 
 def flatmm_a8w8_blockscale_ASM(
@@ -741,7 +765,13 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return gemm_a8w8_blockscale_bpreshuffle_asm(
                 XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
             )
-    return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+    try:
+        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"gemm_a8w8_blockscale_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
+            f"{dtype=}, config={config}: {e}"
+        ) from e
 
 
 def gfx950_a8w8_blockscale_ASM(

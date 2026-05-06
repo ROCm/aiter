@@ -478,7 +478,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
          (max_seqlen_qo == 1)) ||
         ((arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 128 == 0) && !q_is_fp8 &&
          !kv_is_fp8) ||
-        ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8);
+        ((arch_id == "gfx942" || arch_id == "gfx950") && (num_heads == 128) && q_is_fp8 && kv_is_fp8);
 
     const bool use_qseqlen_fold =
         !natively_supported && (arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads > 16) &&
