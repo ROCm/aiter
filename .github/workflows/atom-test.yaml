@@ -79,6 +79,7 @@ jobs:
             extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
+              HSA_NO_SCRATCH_RECLAIM=1
             accuracy_test_threshold: "0.38"
             runner: linux-aiter-mi35x-1
             run_on_pr: true
