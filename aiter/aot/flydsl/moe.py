@@ -65,6 +65,48 @@ def _is_per1x32_fp4_weight(q_type_leaf: str, q_dtype_w_leaf: str) -> bool:
     return q_type_leaf == "per_1x32" and q_dtype_w_leaf == "float4_e2m1fn_x2"
 
 
+def _flydsl_stage1_fuse_quant(kernel_name: str) -> str:
+    suffix = kernel_name.split("_t", 1)[-1]
+    if "_fp8" in suffix:
+        return "fp8"
+    if "_fp4" in suffix:
+        return "fp4"
+    return ""
+
+
+def _stage2_runtime_a_inter_dim(
+    *,
+    inter_dim: int,
+    act: str,
+    q_type_leaf: str,
+    q_dtype_a_leaf: str,
+    q_dtype_w_leaf: str,
+    stage1_name: str,
+    stage2_params: dict,
+    ksplit: int,
+) -> int:
+    """Return the stage2 A operand width seen by runtime.
+
+    Most stage2 kernels see the CSV ``inter_dim``.  The exception mirrors
+    fused_moe_2stages: Silu per_1x32 FP8+FP4 rows whose stage1 kernel does not
+    fuse FP8/FP4 quantization fall through to MXFP4 inter-stage quantization,
+    so the packed A tensor has half as many logical columns.
+    """
+    if (
+        act != "silu"
+        or stage2_params.get("stage") != 2
+        or stage2_params.get("a_dtype") != "fp8"
+        or stage2_params.get("b_dtype") != "fp4"
+        or not _is_per1x32_fp4_weight(q_type_leaf, q_dtype_w_leaf)
+        or q_dtype_a_leaf not in ("float8_e4m3fn", "float8_e4m3fnuz")
+        or _flydsl_stage1_fuse_quant(stage1_name) != ""
+        or ksplit > 1
+    ):
+        return inter_dim
+
+    return inter_dim // 2
+
+
 def _default_ksplit(
     token: int,
     topk: int,
@@ -174,6 +216,7 @@ def parse_csv(csv_path: str):
             q_type = row.get("q_type", "")
             q_dtype_a = row.get("q_dtype_a", "")
             q_dtype_w = row.get("q_dtype_w", "")
+            q_dtype_a_leaf = _csv_leaf(q_dtype_a)
             act = (
                 "swiglu"
                 if _csv_leaf(act_type).lower() == "swiglu"
@@ -181,16 +224,7 @@ def parse_csv(csv_path: str):
             )
             dtype = row.get("dtype", "")
             q_type_leaf = _csv_leaf(q_type)
-            q_dtype_a_leaf = _csv_leaf(q_dtype_a)
             q_dtype_w_leaf = _csv_leaf(q_dtype_w)
-            if (
-                _is_per1x32_fp4_weight(q_type_leaf, q_dtype_w_leaf)
-                and q_dtype_a_leaf
-                in ("bfloat16", "float16", "float8_e4m3fn", "float8_e4m3fnuz")
-            ):
-                # Match test/runtime dispatch: per_1x32 BF16/FP8 + FP4 weight
-                # rows use Swiglu even when the CSV act_type column says Silu.
-                act = "swiglu"
             # TODO: Replace this GPT-OSS-specific bias inference with an
             # explicit CSV/config field once the model config can express it.
             enable_bias = (
@@ -203,6 +237,8 @@ def parse_csv(csv_path: str):
                 row.get(col, "").strip().startswith("flydsl_")
                 for col in ("kernelName1", "kernelName2")
             )
+            stage1_name = row.get("kernelName1", "").strip()
+            ksplit = int(row.get("ksplit", "0") or "0")
 
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
@@ -228,6 +264,18 @@ def parse_csv(csv_path: str):
                 if params["stage"] == 2:
                     job["token_num"] = token
                     job["block_m"] = block_m
+                    stage2_a_inter_dim = _stage2_runtime_a_inter_dim(
+                        inter_dim=inter_dim,
+                        act=act,
+                        q_type_leaf=q_type_leaf,
+                        q_dtype_a_leaf=q_dtype_a_leaf,
+                        q_dtype_w_leaf=q_dtype_w_leaf,
+                        stage1_name=stage1_name,
+                        stage2_params=params,
+                        ksplit=ksplit,
+                    )
+                    if stage2_a_inter_dim != inter_dim:
+                        job["a_inter_dim"] = stage2_a_inter_dim
                 elif (
                     params["stage"] == 1
                     and params.get("k_batch", 1) > 1
@@ -310,6 +358,7 @@ def _precompile_to_cache(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    a_inter_dim: int = 0,
     **kwargs,
 ):
     """Trigger MLIR compilation with dummy tensors and COMPILE_ONLY=1.
@@ -646,8 +695,9 @@ def _precompile_to_cache(
             accumulate = mode != "reduce"
             _m_blocks = _aot_stage2_m_blocks()
             _persist_m = _aot_stage2_persist_m(_m_blocks)
+            stage2_a_inter_dim = a_inter_dim if a_inter_dim > 0 else inter_dim
             n_in = model_dim
-            k_in = inter_dim
+            k_in = stage2_a_inter_dim
 
             if a_dtype == "bf16" and b_dtype == "int4":
                 from aiter import dtypes
@@ -658,7 +708,7 @@ def _precompile_to_cache(
                     dtype=torch.bfloat16,
                 )
                 a = torch.zeros(
-                    _aot_num_rows() * inter_dim,
+                    _aot_num_rows() * stage2_a_inter_dim,
                     device=dev,
                     dtype=torch.bfloat16,
                 )
@@ -688,7 +738,7 @@ def _precompile_to_cache(
                     dtype=torch.bfloat16,
                 )
                 a = torch.zeros(
-                    _storage_numel(_aot_num_rows() * inter_dim, a_dtype),
+                    _storage_numel(_aot_num_rows() * stage2_a_inter_dim, a_dtype),
                     device=dev,
                     dtype=_storage_dtype(a_dtype),
                 )
@@ -728,7 +778,11 @@ def _precompile_to_cache(
                     device=dev,
                     dtype=torch.bfloat16,
                 )
-                a = torch.zeros(_aot_num_rows() * inter_dim, device=dev, dtype=torch.int8)
+                a = torch.zeros(
+                    _aot_num_rows() * stage2_a_inter_dim,
+                    device=dev,
+                    dtype=torch.int8,
+                )
                 w = torch.zeros(E * model_dim * inter_dim, device=dev, dtype=torch.int8)
                 a_scale = torch.zeros(1, device=dev, dtype=torch.float32)
                 w_scale = torch.zeros(1, device=dev, dtype=torch.float32)
@@ -751,7 +805,7 @@ def _precompile_to_cache(
 
             exe = compile_flydsl_moe_stage2(
                 model_dim=model_dim,
-                inter_dim=inter_dim,
+                inter_dim=stage2_a_inter_dim,
                 experts=E,
                 topk=topk,
                 tile_m=tile_m,
