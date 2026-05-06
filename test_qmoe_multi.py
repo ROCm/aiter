@@ -261,8 +261,49 @@ def build_cli_case(args) -> CaseSpec:
     )
 
 
-def quantize_weight(weight: torch.Tensor, q_type: QuantType, q_dtype_w: torch.dtype):
+def quantize_weight(
+    weight: torch.Tensor,
+    q_type: QuantType,
+    q_dtype_w: torch.dtype,
+    chunk_experts: int = 0,
+):
     torch_quant = get_torch_quant(q_type)
+    if (
+        q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and chunk_experts > 0
+        and weight.dim() == 3
+        and weight.shape[0] > chunk_experts
+    ):
+        qt_shape = (*weight.shape[:-1], weight.shape[-1] // 2)
+        weight_qt = torch.empty(qt_shape, dtype=q_dtype_w, device=weight.device)
+        weight_scale = None
+        rows_per_expert = weight.shape[1]
+
+        for start in range(0, weight.shape[0], chunk_experts):
+            end = min(start + chunk_experts, weight.shape[0])
+            chunk_qt, chunk_scale = torch_quant(
+                weight[start:end], quant_dtype=q_dtype_w
+            )
+            weight_qt[start:end].copy_(chunk_qt.view(weight_qt[start:end].shape))
+            if weight_scale is None:
+                scale_shape = (
+                    weight.shape[0] * rows_per_expert,
+                    chunk_scale.shape[-1],
+                )
+                weight_scale = torch.empty(
+                    scale_shape, dtype=chunk_scale.dtype, device=weight.device
+                )
+            row_start = start * rows_per_expert
+            row_end = end * rows_per_expert
+            weight_scale[row_start:row_end].copy_(
+                chunk_scale.view(row_end - row_start, -1)
+            )
+            del chunk_qt, chunk_scale
+            torch.cuda.empty_cache()
+
+        return weight_qt, weight_scale
+
     weight_qt, weight_scale = torch_quant(weight, quant_dtype=q_dtype_w)
     if q_dtype_w == dtypes.fp4x2:
         weight_qt = weight_qt.view(weight.shape[0], weight.shape[1], weight.shape[2] // 2)
@@ -287,6 +328,7 @@ def generate_case_data(
     quant_specs: List[QuantSpec],
     seed: int,
     device: str = "cuda",
+    weight_quant_chunk_experts: int = 8,
 ):
     """Generate raw + quantized data for one MoE case.
 
@@ -314,8 +356,18 @@ def generate_case_data(
 
     quant_data = {}
     for quant in quant_specs:
-        w1_qt, w1_scale = quantize_weight(w1, quant.q_type, quant.q_dtype_w)
-        w2_qt, w2_scale = quantize_weight(w2, quant.stage2_q_type, quant.stage2_q_dtype_w)
+        w1_qt, w1_scale = quantize_weight(
+            w1,
+            quant.q_type,
+            quant.q_dtype_w,
+            chunk_experts=weight_quant_chunk_experts,
+        )
+        w2_qt, w2_scale = quantize_weight(
+            w2,
+            quant.stage2_q_type,
+            quant.stage2_q_dtype_w,
+            chunk_experts=weight_quant_chunk_experts,
+        )
         a1_qt, a1_scale = quantize_activation_stage1(hidden, quant)
         quant_data[quant.name] = {
             "quant": quant,
@@ -327,13 +379,13 @@ def generate_case_data(
             "a1_scale": a1_scale,
         }
 
+    del w1, w2, score
+    torch.cuda.empty_cache()
+
     return {
         "seed": seed,
         "raw": {
             "hidden": hidden,
-            "w1": w1,
-            "w2": w2,
-            "score": score,
             "topk_weight": topk_weight,
             "topk_ids": topk_ids,
         },
@@ -588,6 +640,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--weight-quant-chunk-experts",
+        type=int,
+        default=8,
+        help="Chunk FP4 weight quantization by this many experts to reduce peak memory; set 0 to disable.",
+    )
     parser.add_argument("--atol", type=float, default=1.0)
     parser.add_argument("--rtol", type=float, default=0.05)
     parser.add_argument("--pass-pct", type=float, default=95.0)
@@ -645,7 +703,13 @@ def main():
             continue
         seed = args.seed + global_idx
         global_idx += 1
-        case_data = generate_case_data(case, quant_list, seed, device="cuda")
+        case_data = generate_case_data(
+            case,
+            quant_list,
+            seed,
+            device="cuda",
+            weight_quant_chunk_experts=args.weight_quant_chunk_experts,
+        )
         hidden = case_data["raw"]["hidden"]
         topk_weight = case_data["raw"]["topk_weight"]
         topk_ids = case_data["raw"]["topk_ids"]

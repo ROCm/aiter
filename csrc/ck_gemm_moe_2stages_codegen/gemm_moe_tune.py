@@ -188,8 +188,43 @@ class FmoeTuner(TunerCommon):
         weight,
         qType,
         quant_dtype,
+        chunk_experts=None,
     ):
         E, dim1, dim2 = weight.shape
+        if chunk_experts is None:
+            chunk_experts = int(os.getenv("AITER_FMOE_WEIGHT_QUANT_CHUNK_EXPERTS", "8"))
+        if (
+            qType == QuantType.per_1x32
+            and quant_dtype == dtypes.fp4x2
+            and chunk_experts > 0
+            and E > chunk_experts
+        ):
+            torch_quant = aiter.get_torch_quant(qType)
+            weight_qt = torch.empty(
+                (E, dim1, dim2 // 2), dtype=quant_dtype, device=weight.device
+            )
+            weight_scale = None
+            for start in range(0, E, chunk_experts):
+                end = min(start + chunk_experts, E)
+                chunk_qt, chunk_scale = torch_quant(
+                    weight[start:end], quant_dtype=quant_dtype
+                )
+                weight_qt[start:end].copy_(chunk_qt.view(weight_qt[start:end].shape))
+                if weight_scale is None:
+                    weight_scale = torch.empty(
+                        (E * dim1, chunk_scale.shape[-1]),
+                        dtype=chunk_scale.dtype,
+                        device=weight.device,
+                    )
+                row_start = start * dim1
+                row_end = end * dim1
+                weight_scale[row_start:row_end].copy_(
+                    chunk_scale.view(row_end - row_start, -1)
+                )
+                del chunk_qt, chunk_scale
+                torch.cuda.empty_cache()
+            return weight_qt, weight_scale
+
         if qType == aiter.QuantType.per_Tensor and quant_dtype != torch.int4:
             weight_qt, weight_scale = aiter.pertoken_quant(
                 weight.view(E, -1), quant_dtype=quant_dtype
@@ -693,22 +728,28 @@ class FmoeTuner(TunerCommon):
             w1 = torch.randn((expert, inter_dim * 2, model_dim), dtype=dtype) / 10
         else:
             w1 = torch.randn((expert, inter_dim, model_dim), dtype=dtype) / 10
-        w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype)
         if q_dtype_w2 is None:
             q_dtype_w2 = q_dtype_w
         if q_type2 is None:
             q_type2 = q_type
 
         w1_qt, w1_scale = FmoeTuner.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
-        w2_qt, w2_scale = FmoeTuner.weight_quant(w2, q_type2, quant_dtype=q_dtype_w2)
         if q_dtype_w is not dtypes.fp4x2:
             w1_qt = w1_qt.view(w1.shape)
         else:
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+        del w1
+        torch.cuda.empty_cache()
+
+        w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype)
+        w2_qt, w2_scale = FmoeTuner.weight_quant(w2, q_type2, quant_dtype=q_dtype_w2)
         if q_dtype_w2 is not dtypes.fp4x2:
             w2_qt = w2_qt.view(w2.shape)
         else:
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+        del w2
+        torch.cuda.empty_cache()
+
         score = torch.randn((token, expert), dtype=dtype)
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
         if q_type == QuantType.per_1x128:
@@ -727,7 +768,8 @@ class FmoeTuner(TunerCommon):
         else:
             torch_quant = aiter.get_torch_quant(q_type)
             a1_qt, a1_scale = torch_quant(input, quant_dtype=q_dtype_a)
-        del w1, w2, score
+        del score
+        torch.cuda.empty_cache()
         if q_dtype_w is not dtypes.fp4x2:
             w1_qt_shffle = shuffle_weight(w1_qt, (16, 16))
         else:
@@ -2212,9 +2254,11 @@ class FmoeTuner(TunerCommon):
 
                 if kparams.get("gate_only", False) and not use_g1u1 and b_dtype_s1 == "fp4":
                     continue
+                    
+                enable_fq = os.getenv("AITER_FMOE_TUNE_ENABLE_FQ", "0") == "1"
 
                 s1_variants = [(kname, kparams, False)]
-                if b_dtype_s1 == "fp4" and ((not is_splitk) or (act_type != ActivationType.Gelu)):
+                if enable_fq and b_dtype_s1 == "fp4" and ((not is_splitk) or (act_type != ActivationType.Gelu)):
                     fq_params = {**kparams, "fuse_fp4_quant": True}
                     s1_variants.append((kname + "_fq", fq_params, True))
 
