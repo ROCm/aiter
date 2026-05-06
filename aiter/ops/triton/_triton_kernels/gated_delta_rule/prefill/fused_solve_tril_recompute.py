@@ -50,6 +50,7 @@ def fused_solve_tril_recompute_w_u_kernel(
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    USE_EXP2: tl.constexpr = False,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -216,10 +217,16 @@ def fused_solve_tril_recompute_w_u_kernel(
     p_g1 = tl.make_block_ptr(g_base, (T,), (H,), (i_t * BT + 16,), (16,), (0,))
     p_g2 = tl.make_block_ptr(g_base, (T,), (H,), (i_t * BT + 32,), (16,), (0,))
     p_g3 = tl.make_block_ptr(g_base, (T,), (H,), (i_t * BT + 48,), (16,), (0,))
-    eg0 = exp(tl.load(p_g0, boundary_check=(0,)))
-    eg1 = exp(tl.load(p_g1, boundary_check=(0,)))
-    eg2 = exp(tl.load(p_g2, boundary_check=(0,)))
-    eg3 = exp(tl.load(p_g3, boundary_check=(0,)))
+    if USE_EXP2:
+        eg0 = tl.math.exp2(tl.load(p_g0, boundary_check=(0,)))
+        eg1 = tl.math.exp2(tl.load(p_g1, boundary_check=(0,)))
+        eg2 = tl.math.exp2(tl.load(p_g2, boundary_check=(0,)))
+        eg3 = tl.math.exp2(tl.load(p_g3, boundary_check=(0,)))
+    else:
+        eg0 = exp(tl.load(p_g0, boundary_check=(0,)))
+        eg1 = exp(tl.load(p_g1, boundary_check=(0,)))
+        eg2 = exp(tl.load(p_g2, boundary_check=(0,)))
+        eg3 = exp(tl.load(p_g3, boundary_check=(0,)))
 
     v_base = v + (bos * H + i_h) * V
     if IS_VARLEN:
@@ -338,6 +345,7 @@ def fused_solve_tril_recompute_w_u(
     beta: torch.Tensor,
     g_cumsum: torch.Tensor,
     cu_seqlens: torch.LongTensor | None = None,
+    use_exp2: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused triangular solve + recompute w, u in a single kernel.
@@ -347,8 +355,9 @@ def fused_solve_tril_recompute_w_u(
         k: [B, T, Hg, K]
         v: [B, T, H, V]
         beta: [B, T, H]
-        g_cumsum: [B, T, H] FP32, cumulative gate
+        g_cumsum: [B, T, H] FP32, cumulative gate in the selected exponent base
         cu_seqlens: [N+1]
+        use_exp2: when True, interpret g_cumsum in log2 space
 
     Returns:
         w: [B, H, T, K], head-major contiguous layout
@@ -389,5 +398,6 @@ def fused_solve_tril_recompute_w_u(
         BK=BK,
         BV=BV,
         DOT_PRECISION=FLA_TRIL_PRECISION,
+        USE_EXP2=use_exp2,
     )
     return w_out, u_out

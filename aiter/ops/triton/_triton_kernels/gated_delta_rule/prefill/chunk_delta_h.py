@@ -28,6 +28,7 @@ from ..gated_delta_rule_utils import (
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 # Workaround: AMD ROCm Triton compiler fails with num_stages=4 in stream pipeline
 NUM_STAGES_FWD = [2, 3] if IS_AMD else [2, 3, 4]
+RCP_LN2 = 1.4426950408889634
 
 
 @triton.heuristics(
@@ -1029,6 +1030,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_EXP2: tl.constexpr = False,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -1160,8 +1162,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
                 g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
             )
             b_g = tl.load(p_g, boundary_check=(0,))
-            b_v = b_v * tl.where(m_t, exp(b_g_last - b_g), 0)[:, None]
-            b_g_last = exp(b_g_last)
+            if USE_EXP2:
+                b_v = b_v * tl.where(m_t, tl.math.exp2(b_g_last - b_g), 0)[:, None]
+                b_g_last = tl.math.exp2(b_g_last)
+            else:
+                b_v = b_v * tl.where(m_t, exp(b_g_last - b_g), 0)[:, None]
+                b_g_last = exp(b_g_last)
             b_h1 *= b_g_last
             if K > 64:
                 b_h2 *= b_g_last
@@ -1177,7 +1183,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
                 mask=(o_k1 < K),
                 other=0.0,
             )
-            b_h1 *= exp(b_gk_last1)[None, :]
+            b_h1 *= (tl.math.exp2(b_gk_last1) if USE_EXP2 else exp(b_gk_last1))[None, :]
             if K > 64:
                 o_k2 = 64 + o_k1
                 b_gk_last2 = tl.load(
@@ -1185,7 +1191,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
                     mask=(o_k2 < K),
                     other=0.0,
                 )
-                b_h2 *= exp(b_gk_last2)[None, :]
+                b_h2 *= (tl.math.exp2(b_gk_last2) if USE_EXP2 else exp(b_gk_last2))[
+                    None, :
+                ]
             if K > 128:
                 o_k3 = 128 + o_k1
                 b_gk_last3 = tl.load(
@@ -1193,7 +1201,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
                     mask=(o_k3 < K),
                     other=0.0,
                 )
-                b_h3 *= exp(b_gk_last3)[None, :]
+                b_h3 *= (tl.math.exp2(b_gk_last3) if USE_EXP2 else exp(b_gk_last3))[
+                    None, :
+                ]
             if K > 192:
                 o_k4 = 192 + o_k1
                 b_gk_last4 = tl.load(
@@ -1201,7 +1211,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
                     mask=(o_k4 < K),
                     other=0.0,
                 )
-                b_h4 *= exp(b_gk_last4)[None, :]
+                b_h4 *= (tl.math.exp2(b_gk_last4) if USE_EXP2 else exp(b_gk_last4))[
+                    None, :
+                ]
         b_v = b_v.to(k.dtype.element_ty)
 
         # h[V,K] += v_new^T @ k  →  [BV,64] += trans(dot(k[64,BT], v[BT,BV]))
@@ -1260,6 +1272,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     chunk_size: int = 64,
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
+    use_exp2: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Optimized hidden state forward with h layout [V, K].
@@ -1268,6 +1281,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     initial_state/final_state: [N, H, V, K].
     h snapshots: [B, NT, H, V, K].
     v_new output is [B, H, T_flat, V].
+    use_exp2 selects whether cumulative gates are interpreted in log2 space.
     """
     B, T, Hg, K = k.shape
     BT = chunk_size
@@ -1285,6 +1299,12 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
 
     assert K <= 256, "current kernel does not support head dimension larger than 256."
+
+    if gk is not None:
+        gk = gk.contiguous()
+        if use_exp2:
+            # gk is expressed in natural-log space, so pre-scale it for exp2 kernels.
+            gk = gk * RCP_LN2
 
     h = k.new_empty(B, NT, H, V, K)
     final_state = (
@@ -1314,6 +1334,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
         K=K,
         V=V,
         BT=BT,
+        USE_EXP2=use_exp2,
     )
     return h, v_new, final_state
 

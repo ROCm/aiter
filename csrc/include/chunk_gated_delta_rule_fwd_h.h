@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+#include <tuple>
 #include <torch/extension.h>
 
 namespace aiter {
 
-std::vector<torch::Tensor> chunk_gated_delta_rule_fwd_h_hip(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_fwd_h_hip(
     torch::Tensor k,
     torch::Tensor w,
     torch::Tensor u,

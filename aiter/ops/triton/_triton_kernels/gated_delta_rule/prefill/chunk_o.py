@@ -844,6 +844,7 @@ def chunk_fwd_kernel_o_opt_vk(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_EXP2: tl.constexpr = False,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -899,8 +900,12 @@ def chunk_fwd_kernel_o_opt_vk(
         g += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))
-        b_o = b_o * exp(b_g)[:, None]
-        b_A = b_A * exp(b_g[:, None] - b_g[None, :])
+        if USE_EXP2:
+            b_o = b_o * tl.math.exp2(b_g)[:, None]
+            b_A = b_A * tl.math.exp2(b_g[:, None] - b_g[None, :])
+        else:
+            b_o = b_o * exp(b_g)[:, None]
+            b_A = b_A * exp(b_g[:, None] - b_g[None, :])
 
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
@@ -926,6 +931,7 @@ def chunk_fwd_o_opt_vk(
     scale: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
+    use_exp2: bool = True,
 ) -> torch.Tensor:
     """
     Optimized output forward with h layout [V, K].
@@ -935,10 +941,11 @@ def chunk_fwd_o_opt_vk(
         k: [B, T, Hg, K]
         v: [B, H, T, V]  (token-major from opt_vk)
         h: [B, NT, H, V, K]  (h layout [V, K])
-        g: [B*T, H] FP32
+        g: [B, T, H] FP32 cumulative gate tensor
         scale: float
         cu_seqlens: [N+1]
         chunk_size: int
+        use_exp2: when True, interpret g in log2 space
 
     Returns:
         o: [B, T, H, V]
@@ -977,6 +984,7 @@ def chunk_fwd_o_opt_vk(
         K=K,
         V=V,
         BT=BT,
+        USE_EXP2=use_exp2,
     )
     return o
 

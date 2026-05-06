@@ -451,6 +451,7 @@ def chunk_gated_delta_rule_opt_vk(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
+    use_exp2: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Optimized chunk-based gated delta rule with h layout [V, K] (Forward only).
@@ -471,6 +472,7 @@ def chunk_gated_delta_rule_opt_vk(
         use_qk_l2norm_in_kernel (bool): Whether to use L2 normalization.
         cu_seqlens (torch.LongTensor, optional): Cumulative sequence lengths `[N+1]`.
         use_chunk_hip (bool): Use HIP kernel for hidden state computation.
+        use_exp2 (bool): Use exp2 instead of exp for gate computation.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]:
@@ -512,5 +514,6 @@ def chunk_gated_delta_rule_opt_vk(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         use_chunk_hip=use_chunk_hip,
+        use_exp2=use_exp2,
     )
     return o.to(q.dtype), final_state

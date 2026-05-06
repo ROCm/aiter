@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -280,16 +281,6 @@ __device__ __forceinline__ floatx4 mfma16x16x16_bf16(const _B16x4& a, const _B16
     return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
 }
 
-__device__ __forceinline__ float fast_exp(const float x)
-{
-    return __builtin_amdgcn_exp2f(x * LOG2E);
-}
-
-__device__ __forceinline__ float fast_exp2(const float x)
-{
-    return __builtin_amdgcn_exp2f(x);
-}
-
 template <bool USE_EXP2>
 __device__ __forceinline__ float gated_exp(const float x)
 {
@@ -426,24 +417,6 @@ __device__ __forceinline__ void write_k_panels_to_lds(
         store_b16x2_packed(byte_offset_ptr(k_panel1, off), d.k1_t0[i], d.k1_t1[i]);
     }
 }
-__device__ __forceinline__ void write_k_panel0_to_lds(
-    const KPanelLoadData& d, bf16_t* __restrict__ k_panel0) {
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const int row = d.k_row_base + i;
-        const int off = k_panel_rotating_pair_addr_bytes(row, d.pair_col);
-        store_b16x2_packed(byte_offset_ptr(k_panel0, off), d.k0_t0[i], d.k0_t1[i]);
-    }
-}
-__device__ __forceinline__ void write_k_panel1_to_lds(
-    const KPanelLoadData& d, bf16_t* __restrict__ k_panel1) {
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const int row = d.k_row_base + i;
-        const int off = k_panel_rotating_pair_addr_bytes(row, d.pair_col);
-        store_b16x2_packed(byte_offset_ptr(k_panel1, off), d.k1_t0[i], d.k1_t1[i]);
-    }
-}
 
 struct WPanelLoadData {
     _B16x8 w0_lo, w1_lo, w0_hi, w1_hi;
@@ -499,20 +472,6 @@ __device__ __forceinline__ void write_w_panels_to_lds(
     store_b16x4_aligned(byte_offset_ptr(w_panel1, d.row_hi_base_bytes), b16x8_low4(d.w1_hi));
     store_b16x4_aligned(byte_offset_ptr(w_panel1, d.row_hi_base_bytes ^ 8), b16x8_high4(d.w1_hi));
 }
-__device__ __forceinline__ void write_w_panel0_to_lds(
-    const WPanelLoadData& d, bf16_t* __restrict__ w_panel0) {
-    store_b16x4_aligned(byte_offset_ptr(w_panel0, d.row_lo_base_bytes), b16x8_low4(d.w0_lo));
-    store_b16x4_aligned(byte_offset_ptr(w_panel0, d.row_lo_base_bytes ^ 8), b16x8_high4(d.w0_lo));
-    store_b16x4_aligned(byte_offset_ptr(w_panel0, d.row_hi_base_bytes), b16x8_low4(d.w0_hi));
-    store_b16x4_aligned(byte_offset_ptr(w_panel0, d.row_hi_base_bytes ^ 8), b16x8_high4(d.w0_hi));
-}
-__device__ __forceinline__ void write_w_panel1_to_lds(
-    const WPanelLoadData& d, bf16_t* __restrict__ w_panel1) {
-    store_b16x4_aligned(byte_offset_ptr(w_panel1, d.row_lo_base_bytes), b16x8_low4(d.w1_lo));
-    store_b16x4_aligned(byte_offset_ptr(w_panel1, d.row_lo_base_bytes ^ 8), b16x8_high4(d.w1_lo));
-    store_b16x4_aligned(byte_offset_ptr(w_panel1, d.row_hi_base_bytes), b16x8_low4(d.w1_hi));
-    store_b16x4_aligned(byte_offset_ptr(w_panel1, d.row_hi_base_bytes ^ 8), b16x8_high4(d.w1_hi));
-}
 
 
 // BV-parameterized helpers
@@ -537,37 +496,6 @@ __device__ __forceinline__ _B16x4 load_b_shared2_bvp(
     const int col = (lane & 15) + bv_col_offset;
     const int row_block = (k_base >> 2) + (lane >> 4);
     return load_b16x4_aligned(base + shared2_offset_bvp<BV_P>(row_block, col));
-}
-
-template <int BV_P>
-__device__ __forceinline__ void stage_hstate_bvp(
-    int chunk_idx, int H, int i_h,
-    int global_v_base, int h_row_base_lo, int h_row_base_hi,
-    int wave_id, int lane_id, int v_idx,
-    const float* __restrict__ h_reg,
-    bf16_t* __restrict__ h_bf16,
-    bf16_t* __restrict__ h_state_panel0,
-    bf16_t* __restrict__ h_state_panel1)
-{
-    constexpr int NUM_BV_TILES = BV_P / MFMA_N;
-    const int hstate_row_block = h_row_base_lo >> 2;
-    for (int bv = 0; bv < NUM_BV_TILES; ++bv) {
-        const int lane_v = global_v_base + bv * 16 + v_idx;
-        bf16_t* h_chunk_base =
-            h_bf16 + (((static_cast<int64_t>(chunk_idx) * H + i_h) * K_DIM) * V_DIM) + lane_v;
-        _B16x4 shadow_lo{}, shadow_hi{};
-        for (int reg = 0; reg < 4; ++reg) {
-            const bf16_t s_lo = float_to_bf16(h_reg[bv * 8 + reg]);
-            const bf16_t s_hi = float_to_bf16(h_reg[bv * 8 + 4 + reg]);
-            shadow_lo[reg] = bf16_to_bits(s_lo);
-            shadow_hi[reg] = bf16_to_bits(s_hi);
-            h_chunk_base[(h_row_base_lo + reg) * V_DIM] = s_lo;
-            h_chunk_base[(h_row_base_hi + reg) * V_DIM] = s_hi;
-        }
-        store_shared2_bvp<BV_P>(h_state_panel0, hstate_row_block, bv * 16 + v_idx, shadow_lo);
-        store_shared2_bvp<BV_P>(h_state_panel1, hstate_row_block, bv * 16 + v_idx, shadow_hi);
-    }
-    __syncthreads();
 }
 
 template <bool IS_VARLEN>
@@ -1244,7 +1172,7 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
         }                                                                        \
     } while (0)
 
-std::vector<torch::Tensor> chunk_gated_delta_rule_fwd_h_hip_impl(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_fwd_h_hip_impl(
     torch::Tensor k,
     torch::Tensor w,
     torch::Tensor u,
@@ -1351,7 +1279,7 @@ std::vector<torch::Tensor> chunk_gated_delta_rule_fwd_h_hip_impl(
     }
     C10_HIP_KERNEL_LAUNCH_CHECK();
 
-    return {h, v_new, final_state};
+    return std::make_tuple(h, v_new, final_state);
 }
 
 }  // namespace
@@ -1359,7 +1287,7 @@ std::vector<torch::Tensor> chunk_gated_delta_rule_fwd_h_hip_impl(
 
 namespace aiter {
 
-std::vector<torch::Tensor> chunk_gated_delta_rule_fwd_h_hip(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_fwd_h_hip(
     torch::Tensor k,
     torch::Tensor w,
     torch::Tensor u,
