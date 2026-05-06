@@ -745,24 +745,9 @@ def test_mhc_post_squeeze_post_mix():
     )
 
 
-def _hip_post_dispatch_block(C, arch_id):
-    """Mirror ``aiter.mhc_post``'s residual_block dispatch.
-
-    Selection (from MHC_POST_KERNEL_DISPATCH in csrc/kernels/mhc_kernels.cu):
-      - non-gfx942 + C % 1024 == 0 -> 1024
-      - C % 512 == 0               -> 512
-      - C % 256 == 0               -> 256
-      - else                       -> None (unsupported)
-
-    The kernel additionally enforces ``C >= residual_block * 2``.
-    """
-    if arch_id != "gfx942" and C % 1024 == 0:
-        return 1024
-    if C % 512 == 0:
-        return 512
-    if C % 256 == 0:
-        return 256
-    return None
+from aiter.ops.triton.utils.mhc_config_utils import (
+    hip_post_dispatch_block as _hip_post_dispatch_block,
+)
 
 
 @pytest.mark.parametrize(
