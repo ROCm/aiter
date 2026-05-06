@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import itertools
 import aiter
@@ -15,9 +17,9 @@ from aiter.utility import fp4_utils
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_gfx, get_cu_num
 import argparse
-import os
 import pandas as pd
 import logging
+from contextlib import contextmanager
 
 from aiter.fused_moe import (
     fused_topk,
@@ -578,6 +580,7 @@ def _iter_csv_cases():
             continue
         kwargs["strict_accuracy"] = True
         yield kwargs, {
+            "model": "flydsl_csv",
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
         }
@@ -702,6 +705,19 @@ def _iter_legacy_cases():
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
+@contextmanager
+def _flydsl_run_only(enabled: bool):
+    prev = os.environ.get("FLYDSL_RUNTIME_RUN_ONLY")
+    os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = "1" if enabled else "0"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
+        else:
+            os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = prev
+
+
 _case_iters = []
 if not args.no_flydsl_csv:
     _case_iters.append(_iter_csv_cases())
@@ -713,7 +729,8 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
-    ret = test_fmoe(**kwargs)
+    with _flydsl_run_only(extras.get("model") != "legacy"):
+        ret = test_fmoe(**kwargs)
     if ret is None:
         continue
     ret.update(extras)

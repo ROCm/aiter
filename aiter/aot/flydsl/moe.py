@@ -41,6 +41,7 @@ from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
     _get_compiled_silu_fused,
+    _get_compiled_swiglu,
     _run_compiled,
     _s1_args_fp4,
     _s1_args_std,
@@ -79,21 +80,61 @@ def parse_csv(csv_path: str):
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
+            ksplit = int(row.get("ksplit", "0") or "0")
             act_type = row.get("act_type", "")
+            q_type = row.get("q_type", "")
+            q_dtype_a = row.get("q_dtype_a", "")
+            q_dtype_w = row.get("q_dtype_w", "")
             act = (
                 "swiglu"
                 if act_type.strip().split(".")[-1].lower() == "swiglu"
                 else "silu"
             )
-            q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
+            q_type_leaf = q_type.strip().split(".")[-1]
+            q_dtype_a_leaf = q_dtype_a.strip().split(".")[-1]
+            q_dtype_w_leaf = q_dtype_w.strip().split(".")[-1]
+            if (
+                q_type_leaf == "per_1x32"
+                and q_dtype_w_leaf == "float4_e2m1fn_x2"
+                and q_dtype_a_leaf
+                in ("bfloat16", "float16", "float8_e4m3fn", "float8_e4m3fnuz")
+            ):
+                # Match test/runtime dispatch: per_1x32 BF16/FP8 + FP4 weight
+                # rows use Swiglu even when the CSV act_type column says Silu.
+                act = "swiglu"
             # TODO: Replace this GPT-OSS-specific bias inference with an
             # explicit CSV/config field once the model config can express it.
             enable_bias = (
                 act == "swiglu"
-                and q_type.strip().split(".")[-1] == "per_1x32"
+                and q_type_leaf == "per_1x32"
                 and dtype in ("torch.bfloat16", "torch.float16")
             )
+
+            if act == "swiglu" and q_dtype_w_leaf == "float4_e2m1fn_x2":
+                post_job = {
+                    "kernel_name": "launch_swiglu_and_mul",
+                    "stage": 0,
+                    "model_dim": model_dim,
+                    "inter_dim": inter_dim,
+                    "experts": experts,
+                    "topk": topk,
+                    "doweight_stage1": doweight_stage1,
+                    "cu_num": cu_num,
+                    "act": act,
+                    "enable_bias": enable_bias,
+                    "token_num": token,
+                    "tile_m": block_m if block_m > 0 else 1,
+                    "tile_n": 0,
+                    "tile_k": 0,
+                    "k_batch": max(ksplit, 2),
+                    "b_dtype": "fp4",
+                    "out_dtype": "bf16",
+                }
+                key = job_identity(post_job)
+                if key not in seen:
+                    seen.add(key)
+                    jobs.append(post_job)
 
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
@@ -119,6 +160,13 @@ def parse_csv(csv_path: str):
                 if params["stage"] == 2:
                     job["token_num"] = token
                     job["block_m"] = block_m
+                elif (
+                    params["stage"] == 1
+                    and params.get("k_batch", 1) > 1
+                ):
+                    # Split-K stage1 materializes token-dependent temporary
+                    # tensors, so the AOT cache key must match runtime token.
+                    job["token_num"] = token
 
                 full_job = {**job, **params}
                 key = job_identity(full_job)
@@ -191,8 +239,12 @@ def _precompile_to_cache(
     def _aot_sort_blocks() -> int:
         token_count = token_num if token_num > 0 else tokens
         sorting_block_m = block_m if block_m > 0 else tile_m
-        max_tokens_padded = token_count * topk + E * sorting_block_m - topk
-        return (max_tokens_padded + sorting_block_m - 1) // sorting_block_m
+        return (_aot_sorted_len() + sorting_block_m - 1) // sorting_block_m
+
+    def _aot_sorted_len() -> int:
+        token_count = token_num if token_num > 0 else tokens
+        sorting_block_m = block_m if block_m > 0 else tile_m
+        return token_count * topk + E * sorting_block_m - topk
 
     def _aot_stage2_m_blocks() -> int:
         token_count = token_num if token_num > 0 else tokens
@@ -280,11 +332,30 @@ def _precompile_to_cache(
             ),
         )
 
+    def _precompile_swiglu_splitk():
+        if act != "swiglu" or k_batch <= 1:
+            return
+
+        swiglu = _get_compiled_swiglu(inter_dim)
+        token_count = token_num if token_num > 0 else tokens
+        num_rows = token_count * topk
+        tmp_out = torch.zeros(num_rows * inter_dim * 2, device=dev, dtype=torch.bfloat16)
+        out = torch.zeros(num_rows * inter_dim, device=dev, dtype=torch.bfloat16)
+        _run_compiled(
+            swiglu,
+            (
+                tmp_out.view(-1, inter_dim * 2),
+                out.view(-1, inter_dim),
+                num_rows,
+                _stream,
+            ),
+        )
+
     # Dummy routing tensors (shape matters, data doesn't)
-    sorted_ids = torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
-    sorted_expert_ids = torch.zeros(_grid_y, device=dev, dtype=torch.int32)
-    num_valid_ids = torch.zeros(1, device=dev, dtype=torch.int32)
-    sw = torch.zeros(tokens * topk, device=dev, dtype=torch.float32)
+    sorted_ids = torch.zeros(_aot_sorted_len(), device=dev, dtype=torch.int32)
+    sorted_expert_ids = torch.zeros(_aot_sort_blocks(), device=dev, dtype=torch.int32)
+    num_valid_ids = torch.zeros(2, device=dev, dtype=torch.int32)
+    sw = torch.zeros(_aot_sorted_len(), device=dev, dtype=torch.float32)
 
     _cu_num_str = str(cu_num) if cu_num > 0 else None
     with compile_only_env(), override_env("CU_NUM", _cu_num_str):
@@ -293,13 +364,41 @@ def _precompile_to_cache(
 
         get_cu_num.cache_clear()
 
-        if stage == 1:
+        if stage == 0:
+            _precompile_swiglu_splitk()
+
+        elif stage == 1:
 
             _is_splitk = k_batch > 1
             n_in = inter_dim * 2 if is_fp4_weight else inter_dim
             k_in = model_dim
 
-            if is_fp4_weight:
+            if a_dtype == "bf16" and b_dtype == "int4":
+                from aiter import dtypes
+
+                out_elems = tokens * topk * inter_dim * (2 if _is_splitk else 1)
+                out = torch.zeros(out_elems, device=dev, dtype=torch.bfloat16)
+                a = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
+                w = torch.empty(E * 2 * inter_dim * model_dim, device=dev, dtype=dtypes.i4x2)
+                a_scale = torch.empty(0, device=dev, dtype=torch.float32)
+                w_scale = torch.zeros(E * 2 * inter_dim * (model_dim // 32), device=dev, dtype=torch.bfloat16)
+                args = _s1_args_std(
+                    out,
+                    a,
+                    w,
+                    a_scale,
+                    w_scale,
+                    sorted_ids,
+                    sorted_expert_ids,
+                    sw if doweight_stage1 else torch.empty(0, device=dev, dtype=torch.float32),
+                    num_valid_ids,
+                    tokens,
+                    n_in,
+                    k_in,
+                    _aot_sort_blocks(),
+                    stream=_stream,
+                )
+            elif is_fp4_weight:
                 gemm_out_dtype = (
                     "bf16" if _is_splitk and out_dtype in ("fp4", "fp8") else out_dtype
                 )
@@ -400,6 +499,7 @@ def _precompile_to_cache(
             _run_compiled(exe, args)
             if is_fp4_weight:
                 _precompile_silu_fused()
+                _precompile_swiglu_splitk()
 
         elif stage == 2:
 
@@ -409,7 +509,31 @@ def _precompile_to_cache(
             n_in = model_dim
             k_in = inter_dim
 
-            if is_fp4_weight:
+            if a_dtype == "bf16" and b_dtype == "int4":
+                from aiter import dtypes
+
+                out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
+                a = torch.zeros(tokens * topk * inter_dim, device=dev, dtype=torch.bfloat16)
+                w = torch.empty(E * model_dim * inter_dim, device=dev, dtype=dtypes.i4x2)
+                a_scale = torch.empty(0, device=dev, dtype=torch.float32)
+                w_scale = torch.zeros(E * model_dim * (inter_dim // 32), device=dev, dtype=torch.bfloat16)
+                args = _s2_args_std(
+                    out,
+                    a,
+                    w,
+                    a_scale,
+                    w_scale,
+                    sorted_ids,
+                    sorted_expert_ids,
+                    sw,
+                    num_valid_ids,
+                    tokens,
+                    n_in,
+                    k_in,
+                    _m_blocks,
+                    stream=_stream,
+                )
+            elif is_fp4_weight:
                 out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
                 a = torch.zeros(
                     _storage_numel(tokens * topk * inter_dim, a_dtype),
@@ -569,6 +693,7 @@ def main():
 
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
+    post_jobs = [j for j in all_jobs if j["stage"] == 0]
     print("=" * 72)
     print("FlyDSL MoE AOT Pre-compilation")
     print("=" * 72)
@@ -576,6 +701,7 @@ def main():
         print(f"  CSV:          {csv_path}")
     print(f"  Stage1 jobs:  {len(stage1_jobs)}")
     print(f"  Stage2 jobs:  {len(stage2_jobs)}")
+    print(f"  Post-op jobs: {len(post_jobs)}")
     print(f"  Total jobs:   {len(all_jobs)}")
     print("  Compile arch: (from cu_num)")
     print(f"  Cache dir:    {cache_dir}")
@@ -596,6 +722,13 @@ def main():
         print(f"\n--- Stage 2 ({len(stage2_jobs)} kernels) ---")
         for i, job in enumerate(stage2_jobs, 1):
             print(f"\n[{i}/{len(stage2_jobs)}] ", end="")
+            r = compile_one_config(**job)
+            results.append(r)
+
+    if post_jobs:
+        print(f"\n--- Post-op ({len(post_jobs)} kernels) ---")
+        for i, job in enumerate(post_jobs, 1):
+            print(f"\n[{i}/{len(post_jobs)}] ", end="")
             r = compile_one_config(**job)
             results.append(r)
 
