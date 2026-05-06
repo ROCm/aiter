@@ -37,3 +37,21 @@ def gated_rmsnorm_fp8_group_quant(
     This is a JIT-compiled binding that will be replaced with the actual kernel.
     """
     ...
+
+
+@compile_ops("module_gated_rmsnorm_quant")
+def gated_rmsnorm_bf16(
+    out: Tensor,
+    x: Tensor,
+    z: Tensor,
+    weight: Tensor,
+    epsilon: float,
+) -> None:
+    """
+    HIP kernel for fused Gated RMSNorm with BF16/FP16 output (no quantization).
+
+    Performs: out = rms_norm(x, weight, eps) * silu(z)
+    Output dtype matches input dtype (bf16 or fp16).
+    Constraint: ONLY supports head_dim=128.
+    """
+    ...

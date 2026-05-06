@@ -1826,7 +1826,15 @@ namespace py = pybind11;
           py::arg("epsilon"),                                  \
           py::arg("group_size"),                               \
           py::arg("transpose_scale") = false,                  \
-          "Fused Gated RMSNorm + FP8 Group Quantization");
+          "Fused Gated RMSNorm + FP8 Group Quantization");     \
+    m.def("gated_rmsnorm_bf16",                                \
+          &aiter::gated_rmsnorm_bf16,                          \
+          py::arg("out"),                                      \
+          py::arg("x"),                                        \
+          py::arg("z"),                                        \
+          py::arg("weight"),                                   \
+          py::arg("epsilon"),                                  \
+          "Fused Gated RMSNorm with BF16/FP16 output");
 
 #define MHC_PYBIND                              \
     m.def("mhc_pre_gemm_sqrsum",                \
