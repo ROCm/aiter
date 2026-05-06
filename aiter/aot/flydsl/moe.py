@@ -54,6 +54,96 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
 ]
 MOE_AOT_ARCH_DEFAULT = "gfx950"
+BF16_FP8_MOE_BOUND_ENV = "AITER_BF16_FP8_MOE_BOUND"
+
+
+def _csv_leaf(value: str) -> str:
+    return value.strip().split(".")[-1]
+
+
+def _is_per1x32_fp4_weight(q_type_leaf: str, q_dtype_w_leaf: str) -> bool:
+    return q_type_leaf == "per_1x32" and q_dtype_w_leaf == "float4_e2m1fn_x2"
+
+
+def _default_ksplit(
+    token: int,
+    topk: int,
+    experts: int,
+    inter_dim: int,
+    model_dim: int,
+    cu_num: int,
+) -> int:
+    env_ksplit = int(os.environ.get("AITER_KSPLIT", "0"))
+    if env_ksplit != 0:
+        return env_ksplit
+    if token * topk > experts:
+        return 0
+    if cu_num <= 0:
+        return 0
+
+    tile_n = 128
+    tg_m = token * topk
+    tg_n = (inter_dim + tile_n - 1) // tile_n
+    tg_num = tg_n * tg_m
+    if tg_num >= cu_num:
+        return 0
+
+    tile_k = 256
+    split_max = (cu_num + tg_num - 1) // tg_num
+    for i in reversed(range(2, split_max + 1)):
+        if (model_dim % i == 0) and ((model_dim // i) % tile_k == 0):
+            return i
+    return 0
+
+
+def _runtime_switched_to_bf16_a_for_swiglu(
+    token: int,
+    cu_num: int,
+    q_type_leaf: str,
+    q_dtype_w_leaf: str,
+    act: str,
+) -> bool:
+    if act != "swiglu":
+        return False
+    if not _is_per1x32_fp4_weight(q_type_leaf, q_dtype_w_leaf):
+        return False
+
+    arch = cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
+    bf16_fp8_bound = int(os.environ.get(BF16_FP8_MOE_BOUND_ENV, "256"))
+    return arch != "gfx950" or token < bf16_fp8_bound
+
+
+def _needs_cktile_swiglu_post_job(
+    *,
+    has_flydsl_kernel: bool,
+    token: int,
+    topk: int,
+    experts: int,
+    inter_dim: int,
+    model_dim: int,
+    cu_num: int,
+    q_type_leaf: str,
+    q_dtype_w_leaf: str,
+    act: str,
+) -> bool:
+    """Mirror the default CKTile dispatch path that calls FlyDSL swiglu post-op.
+
+    Some CSV cases contain FlyDSL kernel names, but runtime switches small-token
+    Swiglu per_1x32 FP4-weight cases to BF16 activations before config lookup.
+    That can miss the tuned FlyDSL row and fall back to cktile_moe_stage1, which
+    invokes launch_swiglu_and_mul when split-K is enabled.
+    """
+    if not has_flydsl_kernel:
+        return False
+    if not _runtime_switched_to_bf16_a_for_swiglu(
+        token,
+        cu_num,
+        q_type_leaf,
+        q_dtype_w_leaf,
+        act,
+    ):
+        return False
+    return _default_ksplit(token, topk, experts, inter_dim, model_dim, cu_num) > 1
 
 
 def parse_csv(csv_path: str):
@@ -80,23 +170,21 @@ def parse_csv(csv_path: str):
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
-            ksplit = int(row.get("ksplit", "0") or "0")
             act_type = row.get("act_type", "")
             q_type = row.get("q_type", "")
             q_dtype_a = row.get("q_dtype_a", "")
             q_dtype_w = row.get("q_dtype_w", "")
             act = (
                 "swiglu"
-                if act_type.strip().split(".")[-1].lower() == "swiglu"
+                if _csv_leaf(act_type).lower() == "swiglu"
                 else "silu"
             )
             dtype = row.get("dtype", "")
-            q_type_leaf = q_type.strip().split(".")[-1]
-            q_dtype_a_leaf = q_dtype_a.strip().split(".")[-1]
-            q_dtype_w_leaf = q_dtype_w.strip().split(".")[-1]
+            q_type_leaf = _csv_leaf(q_type)
+            q_dtype_a_leaf = _csv_leaf(q_dtype_a)
+            q_dtype_w_leaf = _csv_leaf(q_dtype_w)
             if (
-                q_type_leaf == "per_1x32"
-                and q_dtype_w_leaf == "float4_e2m1fn_x2"
+                _is_per1x32_fp4_weight(q_type_leaf, q_dtype_w_leaf)
                 and q_dtype_a_leaf
                 in ("bfloat16", "float16", "float8_e4m3fn", "float8_e4m3fnuz")
             ):
@@ -111,30 +199,10 @@ def parse_csv(csv_path: str):
                 and dtype in ("torch.bfloat16", "torch.float16")
             )
 
-            if act == "swiglu" and q_dtype_w_leaf == "float4_e2m1fn_x2":
-                post_job = {
-                    "kernel_name": "launch_swiglu_and_mul",
-                    "stage": 0,
-                    "model_dim": model_dim,
-                    "inter_dim": inter_dim,
-                    "experts": experts,
-                    "topk": topk,
-                    "doweight_stage1": doweight_stage1,
-                    "cu_num": cu_num,
-                    "act": act,
-                    "enable_bias": enable_bias,
-                    "token_num": token,
-                    "tile_m": block_m if block_m > 0 else 1,
-                    "tile_n": 0,
-                    "tile_k": 0,
-                    "k_batch": max(ksplit, 2),
-                    "b_dtype": "fp4",
-                    "out_dtype": "bf16",
-                }
-                key = job_identity(post_job)
-                if key not in seen:
-                    seen.add(key)
-                    jobs.append(post_job)
+            has_flydsl_kernel = any(
+                row.get(col, "").strip().startswith("flydsl_")
+                for col in ("kernelName1", "kernelName2")
+            )
 
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
@@ -175,6 +243,42 @@ def parse_csv(csv_path: str):
                 seen.add(key)
 
                 jobs.append(full_job)
+
+            if _needs_cktile_swiglu_post_job(
+                has_flydsl_kernel=has_flydsl_kernel,
+                token=token,
+                topk=topk,
+                experts=experts,
+                inter_dim=inter_dim,
+                model_dim=model_dim,
+                cu_num=cu_num,
+                q_type_leaf=q_type_leaf,
+                q_dtype_w_leaf=q_dtype_w_leaf,
+                act=act,
+            ):
+                post_job = {
+                    "kernel_name": "launch_swiglu_and_mul",
+                    "stage": 0,
+                    "model_dim": model_dim,
+                    "inter_dim": inter_dim,
+                    "experts": experts,
+                    "topk": topk,
+                    "doweight_stage1": doweight_stage1,
+                    "cu_num": cu_num,
+                    "act": act,
+                    "enable_bias": enable_bias,
+                    "token_num": token,
+                    "tile_m": 1,
+                    "tile_n": 0,
+                    "tile_k": 0,
+                    "k_batch": 1,
+                    "b_dtype": "fp4",
+                    "out_dtype": "bf16",
+                }
+                key = job_identity(post_job)
+                if key not in seen:
+                    seen.add(key)
+                    jobs.append(post_job)
 
     return jobs
 
@@ -222,7 +326,6 @@ def _precompile_to_cache(
     is_fp4_weight = b_dtype == "fp4"
     tokens = tile_m
     E = experts
-    _grid_y = 1
 
     def _storage_numel(element_count: int, dtype: str) -> int:
         return element_count // 2 if dtype == "fp4" else element_count
@@ -236,24 +339,36 @@ def _precompile_to_cache(
             return torch.bfloat16
         return torch.int8
 
+    def _aot_token_count() -> int:
+        return token_num if token_num > 0 else tokens
+
+    def _aot_num_rows() -> int:
+        return _aot_token_count() * topk
+
+    def _sorting_block_m() -> int:
+        return block_m if block_m > 0 else tile_m
+
     def _aot_sort_blocks() -> int:
-        token_count = token_num if token_num > 0 else tokens
-        sorting_block_m = block_m if block_m > 0 else tile_m
+        sorting_block_m = _sorting_block_m()
         return (_aot_sorted_len() + sorting_block_m - 1) // sorting_block_m
 
+    def _aot_sorted_size() -> int:
+        return max(_aot_sorted_len(), _aot_sort_blocks() * tile_m)
+
     def _aot_sorted_len() -> int:
-        token_count = token_num if token_num > 0 else tokens
-        sorting_block_m = block_m if block_m > 0 else tile_m
-        return token_count * topk + E * sorting_block_m - topk
+        return _aot_num_rows() + E * _sorting_block_m() - topk
 
     def _aot_stage2_m_blocks() -> int:
-        token_count = token_num if token_num > 0 else tokens
         _sbm = sort_block_m if sort_block_m > 0 else tile_m
         sort_blocks = _aot_sort_blocks()
         if _sbm == tile_m:
-            return min(sort_blocks, token_count * topk)
+            return min(sort_blocks, _aot_num_rows())
         total_sorted = sort_blocks * _sbm
         return (total_sorted + tile_m - 1) // tile_m
+
+    def _aot_stage1_grid_y() -> int:
+        dense_blocks = min(_aot_num_rows() * tile_m, _aot_sorted_len()) // tile_m
+        return min(dense_blocks, _aot_sort_blocks())
 
     def _aot_stage2_persist_m(m_blocks: int) -> int:
         if persist is True:
@@ -296,17 +411,19 @@ def _precompile_to_cache(
             quant_mode,
             gui_layout,
         )
-        sorted_len = max(tokens * topk, _aot_sort_blocks() * tile_m)
+        num_rows = _aot_num_rows()
+        sorted_len = _aot_sorted_len()
+        sorted_size = _aot_sorted_size()
         padded_cols = ((inter_dim // 32) + 7) // 8 * 8
-        scale_rows = (sorted_len + 255) // 256 * 256
+        scale_rows = (sorted_size + 255) // 256 * 256
         tmp_out = torch.zeros(
-            tokens * topk * inter_dim * 2, device=dev, dtype=torch.bfloat16
+            num_rows * inter_dim * 2, device=dev, dtype=torch.bfloat16
         )
         out_buf = torch.zeros(
             (
-                tokens * topk * inter_dim * 2
+                num_rows * inter_dim * 2
                 if quant_mode == "none"
-                else _storage_numel(tokens * topk * inter_dim, quant_mode)
+                else _storage_numel(num_rows * inter_dim, quant_mode)
             ),
             device=dev,
             dtype=torch.uint8,
@@ -326,19 +443,15 @@ def _precompile_to_cache(
                 out_scale_sorted,
                 sorted_token_ids,
                 num_valid,
-                tokens,
+                _aot_token_count(),
                 sorted_len,
                 _stream,
             ),
         )
 
-    def _precompile_swiglu_splitk():
-        if act != "swiglu" or k_batch <= 1:
-            return
-
+    def _precompile_swiglu():
         swiglu = _get_compiled_swiglu(inter_dim)
-        token_count = token_num if token_num > 0 else tokens
-        num_rows = token_count * topk
+        num_rows = _aot_num_rows()
         tmp_out = torch.zeros(num_rows * inter_dim * 2, device=dev, dtype=torch.bfloat16)
         out = torch.zeros(num_rows * inter_dim, device=dev, dtype=torch.bfloat16)
         _run_compiled(
@@ -350,6 +463,25 @@ def _precompile_to_cache(
                 _stream,
             ),
         )
+
+    def _precompile_stage1_post_op_deps():
+        is_splitk = k_batch > 1
+        need_fp4 = out_dtype == "fp4"
+        need_fp8 = out_dtype == "fp8"
+        fuse_any_quant = need_fp4 or need_fp8
+        gate_up_interleave = gate_mode == "interleave"
+        splitk_fp4 = is_splitk and need_fp4
+        gui_sk = gate_up_interleave and is_splitk
+        gui_sk_fused = gui_sk and fuse_any_quant
+
+        if gui_sk_fused:
+            _precompile_silu_fused()
+        elif gui_sk:
+            _precompile_silu_fused()
+        elif splitk_fp4:
+            _precompile_silu_fused()
+        elif is_splitk and act == "swiglu":
+            _precompile_swiglu()
 
     # Dummy routing tensors (shape matters, data doesn't)
     sorted_ids = torch.zeros(_aot_sorted_len(), device=dev, dtype=torch.int32)
@@ -365,20 +497,30 @@ def _precompile_to_cache(
         get_cu_num.cache_clear()
 
         if stage == 0:
-            _precompile_swiglu_splitk()
+            _precompile_swiglu()
 
         elif stage == 1:
 
             _is_splitk = k_batch > 1
             n_in = inter_dim * 2 if is_fp4_weight else inter_dim
             k_in = model_dim
+            stage1_grid_y = _aot_stage1_grid_y()
+            sorted_weights = (
+                sw
+                if doweight_stage1
+                else torch.empty(0, device=dev, dtype=torch.float32)
+            )
 
             if a_dtype == "bf16" and b_dtype == "int4":
                 from aiter import dtypes
 
-                out_elems = tokens * topk * inter_dim * (2 if _is_splitk else 1)
+                out_elems = _aot_num_rows() * inter_dim * (2 if _is_splitk else 1)
                 out = torch.zeros(out_elems, device=dev, dtype=torch.bfloat16)
-                a = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
+                a = torch.zeros(
+                    _aot_token_count() * model_dim,
+                    device=dev,
+                    dtype=torch.bfloat16,
+                )
                 w = torch.empty(E * 2 * inter_dim * model_dim, device=dev, dtype=dtypes.i4x2)
                 a_scale = torch.empty(0, device=dev, dtype=torch.float32)
                 w_scale = torch.zeros(E * 2 * inter_dim * (model_dim // 32), device=dev, dtype=torch.bfloat16)
@@ -390,19 +532,19 @@ def _precompile_to_cache(
                     w_scale,
                     sorted_ids,
                     sorted_expert_ids,
-                    sw if doweight_stage1 else torch.empty(0, device=dev, dtype=torch.float32),
+                    sorted_weights,
                     num_valid_ids,
-                    tokens,
+                    _aot_token_count(),
                     n_in,
                     k_in,
-                    _aot_sort_blocks(),
+                    stage1_grid_y,
                     stream=_stream,
                 )
             elif is_fp4_weight:
                 gemm_out_dtype = (
                     "bf16" if _is_splitk and out_dtype in ("fp4", "fp8") else out_dtype
                 )
-                gemm_out_elems = tokens * topk * inter_dim
+                gemm_out_elems = _aot_num_rows() * inter_dim
                 if _is_splitk:
                     gemm_out_elems *= 2
                 out = torch.zeros(
@@ -411,7 +553,7 @@ def _precompile_to_cache(
                     dtype=_storage_dtype(gemm_out_dtype),
                 )
                 a = torch.zeros(
-                    _storage_numel(tokens * model_dim, a_dtype),
+                    _storage_numel(_aot_token_count() * model_dim, a_dtype),
                     device=dev,
                     dtype=_storage_dtype(a_dtype),
                 )
@@ -436,22 +578,22 @@ def _precompile_to_cache(
                     w_scale,
                     sorted_ids,
                     sorted_expert_ids,
-                    sw,
+                    sorted_weights,
                     num_valid_ids,
                     out_scale,
-                    tokens,
+                    _aot_token_count(),
                     n_in,
                     k_in,
-                    _grid_y,
+                    stage1_grid_y,
                     dev,
                     bias=bias if enable_bias else None,
                     stream=_stream,
                 )
             else:
                 out = torch.zeros(
-                    tokens * topk * inter_dim, device=dev, dtype=torch.bfloat16
+                    _aot_num_rows() * inter_dim, device=dev, dtype=torch.bfloat16
                 )
-                a = torch.zeros(tokens * model_dim, device=dev, dtype=torch.int8)
+                a = torch.zeros(_aot_token_count() * model_dim, device=dev, dtype=torch.int8)
                 w = torch.zeros(
                     E * 2 * inter_dim * model_dim, device=dev, dtype=torch.int8
                 )
@@ -465,12 +607,12 @@ def _precompile_to_cache(
                     w_scale,
                     sorted_ids,
                     sorted_expert_ids,
-                    sw,
+                    sorted_weights,
                     num_valid_ids,
-                    tokens,
+                    _aot_token_count(),
                     n_in,
                     k_in,
-                    _grid_y,
+                    stage1_grid_y,
                     stream=_stream,
                 )
 
@@ -497,9 +639,7 @@ def _precompile_to_cache(
                 enable_bias=enable_bias,
             )
             _run_compiled(exe, args)
-            if is_fp4_weight:
-                _precompile_silu_fused()
-                _precompile_swiglu_splitk()
+            _precompile_stage1_post_op_deps()
 
         elif stage == 2:
 
@@ -512,8 +652,16 @@ def _precompile_to_cache(
             if a_dtype == "bf16" and b_dtype == "int4":
                 from aiter import dtypes
 
-                out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
-                a = torch.zeros(tokens * topk * inter_dim, device=dev, dtype=torch.bfloat16)
+                out = torch.zeros(
+                    _aot_token_count() * model_dim,
+                    device=dev,
+                    dtype=torch.bfloat16,
+                )
+                a = torch.zeros(
+                    _aot_num_rows() * inter_dim,
+                    device=dev,
+                    dtype=torch.bfloat16,
+                )
                 w = torch.empty(E * model_dim * inter_dim, device=dev, dtype=dtypes.i4x2)
                 a_scale = torch.empty(0, device=dev, dtype=torch.float32)
                 w_scale = torch.zeros(E * model_dim * (inter_dim // 32), device=dev, dtype=torch.bfloat16)
@@ -527,16 +675,20 @@ def _precompile_to_cache(
                     sorted_expert_ids,
                     sw,
                     num_valid_ids,
-                    tokens,
+                    _aot_token_count(),
                     n_in,
                     k_in,
                     _m_blocks,
                     stream=_stream,
                 )
             elif is_fp4_weight:
-                out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
+                out = torch.zeros(
+                    _aot_token_count() * model_dim,
+                    device=dev,
+                    dtype=torch.bfloat16,
+                )
                 a = torch.zeros(
-                    _storage_numel(tokens * topk * inter_dim, a_dtype),
+                    _storage_numel(_aot_num_rows() * inter_dim, a_dtype),
                     device=dev,
                     dtype=_storage_dtype(a_dtype),
                 )
@@ -562,7 +714,7 @@ def _precompile_to_cache(
                     sorted_expert_ids,
                     sw,
                     num_valid_ids,
-                    tokens,
+                    _aot_token_count(),
                     n_in,
                     k_in,
                     _m_blocks,
@@ -571,8 +723,12 @@ def _precompile_to_cache(
                     stream=_stream,
                 )
             else:
-                out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
-                a = torch.zeros(tokens * topk * inter_dim, device=dev, dtype=torch.int8)
+                out = torch.zeros(
+                    _aot_token_count() * model_dim,
+                    device=dev,
+                    dtype=torch.bfloat16,
+                )
+                a = torch.zeros(_aot_num_rows() * inter_dim, device=dev, dtype=torch.int8)
                 w = torch.zeros(E * model_dim * inter_dim, device=dev, dtype=torch.int8)
                 a_scale = torch.zeros(1, device=dev, dtype=torch.float32)
                 w_scale = torch.zeros(1, device=dev, dtype=torch.float32)
@@ -586,10 +742,10 @@ def _precompile_to_cache(
                     sorted_expert_ids,
                     sw,
                     num_valid_ids,
-                    tokens,
+                    _aot_token_count(),
                     n_in,
                     k_in,
-                    _grid_y,
+                    _m_blocks,
                     stream=_stream,
                 )
 

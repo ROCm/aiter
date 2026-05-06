@@ -27,6 +27,7 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.ops.flydsl.moe_common import GateMode
 
 
 from aiter.ops.shuffle import (
@@ -53,6 +54,7 @@ def test_fmoe(
     E,
     topk,
     actType,
+    gateMode,
     qType,
     AQDType,
     WQDType,
@@ -62,6 +64,7 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=True,
     strict_accuracy=True,
+    swiglu_limit=0.0,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -256,6 +259,7 @@ def test_fmoe(
         w1_scale=w1_scale,
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
+        swiglu_limit=swiglu_limit,
     )
 
     # ######################## stage 2 start ###########
@@ -311,6 +315,8 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
+        swiglu_limit=swiglu_limit,
+        gate_mode=gateMode,
         num_iters=5,
         num_warmup=2,
     )
@@ -489,6 +495,13 @@ parser.add_argument(
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
 )
+parser.add_argument(
+    "--swiglu-limit",
+    "-sl",
+    type=float,
+    default=0.0,
+    help="Limit the number of experts for swiglu activation type. Default is 0.0.",
+)
 
 args = parser.parse_args()
 
@@ -531,12 +544,8 @@ def _row_to_kwargs(row):
     q_type = _str2enum(row["q_type"], aiter.QuantType)
     aq_dtype = _str2dtype(row["q_dtype_a"])
     wq_dtype = _str2dtype(row["q_dtype_w"])
-    act_type = _effective_act_type(
-        q_type,
-        aq_dtype,
-        wq_dtype,
-        _str2enum(row["act_type"], aiter.ActivationType),
-    )
+    act_type = _str2enum(row["act_type"], aiter.ActivationType)
+    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
     return dict(
         dtype=_str2dtype(row["dtype"]),
         token=int(row["token"]),
@@ -545,6 +554,7 @@ def _row_to_kwargs(row):
         E=int(row["expert"]),
         topk=int(row["topk"]),
         actType=act_type,
+        gateMode=gate_mode,
         qType=q_type,
         AQDType=aq_dtype,
         WQDType=wq_dtype,
@@ -581,6 +591,7 @@ def _iter_csv_cases():
         kwargs["strict_accuracy"] = True
         yield kwargs, {
             "model": "flydsl_csv",
+            "flydsl_run_only": True,
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
         }
@@ -592,15 +603,21 @@ _PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
 _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
 
-def _effective_act_type(quant_type, aq_dtype, wq_dtype, act_type):
+def _effective_gate_mode(aq_dtype, wq_dtype):
+    if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
+        return GateMode.INTERLEAVE.value
+    return GateMode.SEPARATED.value
+
+
+def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
-        return aiter.ActivationType.Swiglu
-    return act_type
+        return swiglu_limit
+    return 0.0
 
 
 def _iter_legacy_cases():
     """Yield (kwargs, extras) for the original CLI-driven sweep."""
-    extras = {"model": "legacy"}
+    extras = {"model": "legacy", "flydsl_run_only": False}
 
     def _kw(
         dtype,
@@ -621,7 +638,8 @@ def _iter_legacy_cases():
             inter_dim=inter_dim,
             E=args.expert,
             topk=args.topk,
-            actType=_effective_act_type(quant_type, aq_dtype, wq_dtype, act_type),
+            actType=act_type,
+            gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
@@ -729,8 +747,29 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
-    with _flydsl_run_only(extras.get("model") != "legacy"):
-        ret = test_fmoe(**kwargs)
+    swiglu_limit = _effective_swiglu_limit(
+        kwargs["qType"],
+        kwargs["AQDType"],
+        kwargs["WQDType"],
+        args.swiglu_limit,
+    )
+    _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
+    _force_moe_bound_zero = (
+        kwargs["qType"],
+        kwargs["AQDType"],
+        kwargs["WQDType"],
+    ) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4)
+    if _force_moe_bound_zero:
+        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+    try:
+        with _flydsl_run_only(extras.get("flydsl_run_only", False)):
+            ret = test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+    finally:
+        if _force_moe_bound_zero:
+            if _old_moe_bound is None:
+                os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
+            else:
+                os.environ["AITER_BF16_FP8_MOE_BOUND"] = _old_moe_bound
     if ret is None:
         continue
     ret.update(extras)

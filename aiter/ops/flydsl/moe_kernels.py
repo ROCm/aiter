@@ -298,10 +298,12 @@ def compile_flydsl_moe_stage1(
     enable_bias: bool = False,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    swiglu_limit: float = 0.0,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
-        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1, GateMode
+        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
+        from .moe_common import GateMode
 
         return compile_mixed_moe_gemm1(
             model_dim=model_dim,
@@ -327,6 +329,7 @@ def compile_flydsl_moe_stage1(
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
+            swiglu_limit=swiglu_limit,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -629,11 +632,14 @@ def _get_compiled_silu_fused(
     topk: int,
     quant_mode: str = "fp4",
     gui_layout: bool = False,
+    swiglu_limit: float = 0.0,
 ):
     """Compile and cache the fused silu_and_mul + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
-    return build_silu_and_mul_fq_module(inter_dim, topk, quant_mode, gui_layout)
+    return build_silu_and_mul_fq_module(
+        inter_dim, topk, quant_mode, gui_layout, swiglu_limit
+    )
 
 
 @functools.cache
@@ -677,6 +683,7 @@ def flydsl_moe_stage1(
     bias: Optional[torch.Tensor] = None,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    swiglu_limit: float = 0.0,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -855,6 +862,7 @@ def flydsl_moe_stage1(
         enable_bias=(bias is not None),
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
+        swiglu_limit=swiglu_limit,
     )
     _run_compiled(exe, args)
 
@@ -862,7 +870,7 @@ def flydsl_moe_stage1(
     if _gui_sk_fused:
         _quant_mode = "fp4" if _need_fp4 else "fp8"
         _silu_fused_k = _get_compiled_silu_fused(
-            inter_dim, topk, _quant_mode, gui_layout=True
+            inter_dim, topk, _quant_mode, gui_layout=True, swiglu_limit=swiglu_limit
         )
         _run_compiled(
             _silu_fused_k,
@@ -879,7 +887,7 @@ def flydsl_moe_stage1(
         )
     elif _gui_sk:
         _silu_fused_k = _get_compiled_silu_fused(
-            inter_dim, topk, "none", gui_layout=True
+            inter_dim, topk, "none", gui_layout=True, swiglu_limit=swiglu_limit
         )
         _run_compiled(
             _silu_fused_k,
@@ -895,7 +903,9 @@ def flydsl_moe_stage1(
             ),
         )
     elif _splitk_fp4:
-        _silu_fused_k = _get_compiled_silu_fused(inter_dim, topk)
+        _silu_fused_k = _get_compiled_silu_fused(
+            inter_dim, topk, swiglu_limit=swiglu_limit
+        )
         _run_compiled(
             _silu_fused_k,
             (
