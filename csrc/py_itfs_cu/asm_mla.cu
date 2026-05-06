@@ -272,6 +272,9 @@ void mla_decode_stage1_asm_fwd(
         if (q_type == "bf16" && kv_type == "bf16" && arch_id == "gfx942"){
             ps = 0; // not use ps
         }
+        if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && max_seqlen_q > 1){
+            causal = 1;
+        }
     }
     else if(gqa_ratio == 16){
         sub_Q = 128;
