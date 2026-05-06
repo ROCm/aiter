@@ -497,25 +497,46 @@ def fused_flatten_fp8_group_quant(
     x: torch.Tensor,
     group_size,
     dtype_quant=fp8_dtype,
+    transpose_scale: bool = False,
 ):
     """
     Flatten the last two dimension of x and perform FP8 per-token group quantization along the last dimension
 
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
+    - transpose_scale: If True, return scale with shape (M, cdiv(N1*N2, group_size))
+                       but stored in column-major (transposed) memory layout.
+                       Equivalent to: scale.transpose(0, 1).contiguous().view(*scale.shape)
+                       Mirrors the same flag on fused_rms_fp8_group_quant.
 
     Returns:
     - out: The output matrix with shape (M, N1 * N2).
     - out_block_scales: The output matrix with shape (M, cdiv((N1 * N2), group_size)).
+                        When transpose_scale=True, has column-major memory layout.
     """
     M, N1, N2 = x.shape
 
     BLOCK_SIZE_N2 = max(triton.next_power_of_2(N2), group_size)
     N = N1 * N2
+    num_bs_cols = triton.cdiv(N, group_size)
     out = torch.empty((M, N), dtype=dtype_quant, device=x.device)
-    out_block_scales = torch.empty(
-        (M, triton.cdiv(N, group_size)), dtype=torch.float32, device=x.device
-    )
+
+    if transpose_scale:
+        # Allocate as (num_bs_cols, M) so the row-major storage of this tensor
+        # is equivalent to a column-major (M, num_bs_cols) layout. We then
+        # tell the inner kernel to write with swapped strides, and view back
+        # to (M, num_bs_cols) at the end.
+        out_block_scales = torch.empty(
+            (num_bs_cols, M), dtype=torch.float32, device=x.device
+        )
+        out_bs_row_stride = out_block_scales.stride(1)  # = 1
+        out_bs_col_stride = out_block_scales.stride(0)  # = M
+    else:
+        out_block_scales = torch.empty(
+            (M, num_bs_cols), dtype=torch.float32, device=x.device
+        )
+        out_bs_row_stride = out_block_scales.stride(0)  # = num_bs_cols
+        out_bs_col_stride = out_block_scales.stride(1)  # = 1
 
     DTYPE_MAX = (
         torch.finfo(out.dtype).max
@@ -532,13 +553,21 @@ def fused_flatten_fp8_group_quant(
         out_block_scales,
         *x.stride(),
         *out.stride(),
-        *out_block_scales.stride(),
+        out_bs_row_stride,
+        out_bs_col_stride,
         N2,
         BLOCK_SIZE_N2=BLOCK_SIZE_N2,
         QUANT_BLOCK_SIZE=group_size,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
     )
+
+    if transpose_scale:
+        # Reinterpret the (num_bs_cols, M) row-major buffer back as
+        # (M, num_bs_cols) — same shape as default path, but data is now
+        # in column-major layout (consumers like CK bpreshuffle GEMM
+        # expect this layout when called with the new attribute marker).
+        out_block_scales = out_block_scales.view(M, num_bs_cols)
 
     return out, out_block_scales
 
