@@ -202,7 +202,13 @@ def gen_gemm_a8w8_blockscale_ck_fake_tensors(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    *args,
+    **kwargs,
 ) -> Tensor:
+    # Accept the trailing optional args (isBpreshuffled, splitK, y_is_zeroed)
+    # added by the cktile / bpreshuffle_cktile entry points so a single shared
+    # fake works for all blockscale FP8 GEMM JIT stubs. The kernel writes into
+    # `Out` regardless of those flags.
     return Out
 
 
@@ -753,6 +759,7 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     dtype: torch.dtype = dtypes.bf16,
     out: Optional[Tensor] = None,
     y_is_zeroed: bool = False,
+    tuned_file: Optional[str] = None,
 ) -> Tensor:
     if out is not None:
         return out
@@ -888,7 +895,12 @@ def gen_gemm_a8w8_blockscale_tune_fake_tensors(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+    *args,
+    **kwargs,
 ) -> torch.Tensor:
+    # Accept the trailing optional flags some tune entrypoints carry
+    # (``preshuffleB``, ``y_is_zeroed``) so a single shared fake works across
+    # all blockscale tune JIT stubs. The kernel writes into ``Out`` regardless.
     return Out
 
 
