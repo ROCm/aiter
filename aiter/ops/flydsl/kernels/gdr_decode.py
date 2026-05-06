@@ -2,9 +2,11 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 
 from flydsl.expr.typing import T
 from flydsl._mlir.dialects import (
@@ -41,6 +43,7 @@ def create_shuffle_gdr_decode_kernel(
     NUM_BLOCKS_PER_V_DIM: int = 1,
     NUM_WARPS: int = 4,
     WARP_THREADS_K: int = 8,
+    device: Optional[str] = None,
 ):
     SCALE_VALUE = float(1.0 / (float(head_k_dim) ** 0.5))
     WARP_THREADS_V = 64 // WARP_THREADS_K
@@ -78,7 +81,11 @@ def create_shuffle_gdr_decode_kernel(
         WARP_SIZE_SHFL_OFFSETS.append(int(offsets_))
         offsets_ /= 2
 
-    GPU_ARCH = get_rocm_arch()
+    if device is None:
+        GPU_ARCH = get_rocm_arch()
+    else:
+        with torch.cuda.device(device):
+            GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
     smem_sr_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_sr_offset + 2 * NUM_WARPS * 4
