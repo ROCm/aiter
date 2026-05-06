@@ -14,6 +14,10 @@ if [ -n "${AITER_INDEX_URL:-}" ]; then
   # Export so the heredoc Python script can read them via os.environ
   export AITER_INDEX_URL AITER_PYTHON_TAG
   export AITER_VERSION
+  # AITER_ROCM_TAG (e.g. rocm7.0 / rocm7.1 / rocm7.2) optionally narrows wheel
+  # selection so the picked wheel's c10/hip ABI matches the consumer container.
+  # Set by run_sglang.sh from SGL_IMAGE; safe to leave unset elsewhere.
+  export AITER_ROCM_TAG="${AITER_ROCM_TAG:-}"
 
   # Find the direct wheel URL from the index.
   # Some S3 buckets serve wheels under an /amd-aiter/ subdirectory (PEP 503 style),
@@ -24,6 +28,7 @@ import os, re, sys, urllib.parse, urllib.request
 index = os.environ.get("AITER_INDEX_URL", "").rstrip("/")
 version_filter = os.environ.get("AITER_VERSION", "")
 pytag = os.environ.get("AITER_PYTHON_TAG", "cp312")
+rocm_filter = os.environ.get("AITER_ROCM_TAG", "")  # e.g. "rocm7.0" / "rocm7.1" / "rocm7.2"
 
 def list_wheels(page_url):
     try:
@@ -66,6 +71,18 @@ if version_filter:
 
 if not filenames:
     sys.exit(0)
+
+# Narrow to the ROCm tag matching the consumer container (e.g. rocm7.0).
+# Without this filter, wheel sort below picks the highest +rocm<X.Y> tag
+# (e.g. +rocm7.2) and pip-installs it into the wrong-ABI container.
+if rocm_filter:
+    matched = [f for f in filenames if rocm_filter in f]
+    if matched:
+        filenames = matched
+    else:
+        print(f"WARNING: no wheel matches AITER_ROCM_TAG={rocm_filter}; "
+              f"falling back to all matching version (ABI mismatch risk).",
+              file=sys.stderr)
 
 best_name = sorted(filenames)[-1]
 best_encoded = best_name.replace("+", "%2B")

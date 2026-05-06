@@ -178,9 +178,21 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
           AITER_VERSION: ${{ github.event.inputs.aiter_version }}
         run: |
+          # Preflight test command: exercise the SGLang AITER hot path
+          # (rmsnorm forward) so that a wheel/image ABI mismatch surfaces here
+          # rather than later in 30+ shard jobs. `import aiter` alone cannot
+          # detect c10/hip undefined symbols because JIT .so files are loaded
+          # lazily on first dispatch.
+          PREFLIGHT_CMD='python3 -c "
+          import torch
+          from sglang.srt.layers.layernorm import RMSNorm
+          x = torch.randn(2, 1024, dtype=torch.bfloat16, device=\"cuda\")
+          RMSNorm(1024).cuda().to(torch.bfloat16)(x)
+          print(\"SGLang+AITER rmsnorm preflight OK\")
+          "'
           bash .github/scripts/run_sglang.sh \
             "${{ github.sha }}" \
-            "echo preflight-smoke-test-only" \
+            "${PREFLIGHT_CMD}" \
             "${{ github.event.inputs.aiter_index_url }}"
 
   # ── SGLang Integration ───────────────────────────────────────────────

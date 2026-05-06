@@ -25,6 +25,25 @@ AITER_INDEX_URL="${3:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # SGLang Docker images use Python 3.10
 export AITER_PYTHON_TAG=cp310
+
+# Derive AITER wheel ROCm tag from the SGLang image's ROCm tag so that the
+# wheel's c10/hip ABI matches the container's PyTorch ABI. Without this, e.g.
+# a +rocm7.2 wheel installed in a rocm700 container fails at JIT .so load with
+# `undefined symbol: c10::hip::c10_hip_check_implementation` (run 25202894144).
+derive_aiter_rocm_tag() {
+  case "$1" in
+    *rocm700*|*rocm702*) echo rocm7.0 ;;
+    *rocm710*|*rocm711*) echo rocm7.1 ;;
+    *rocm720*|*rocm721*|*rocm722*) echo rocm7.2 ;;
+    *) echo "" ;;
+  esac
+}
+if [ -n "${SGL_IMAGE_OVERRIDE:-}" ]; then
+  AITER_ROCM_TAG="$(derive_aiter_rocm_tag "${SGL_IMAGE_OVERRIDE}")"
+  [ -n "${AITER_ROCM_TAG}" ] && export AITER_ROCM_TAG \
+    && echo "Derived AITER_ROCM_TAG=${AITER_ROCM_TAG} from SGL_IMAGE_OVERRIDE"
+fi
+
 source "${SCRIPT_DIR}/resolve_aiter_version.sh"
 
 SGL_BRANCH="${SGL_BRANCH:-v0.5.10}"
@@ -143,8 +162,32 @@ if [ -n "${SGL_IMAGE_OVERRIDE:-}" ]; then
     install_aiter_from_source
   fi
 
-  # Verify AITER works on this runner (may differ from preflight runner)
-  docker exec ci_sglang python3 -c "import aiter; print('AITER import OK')"
+  # Verify AITER works on this runner (may differ from preflight runner).
+  # Deep smoke: dlopen every aiter/jit/*.so via ctypes (no torch op registration,
+  # no GPU required). Catches c10/hip ABI symbol mismatches that bare
+  # `import aiter` misses, because aiter's top-level package does not load
+  # the JIT shared objects until a tensor op is dispatched into them.
+  # See run 25202894144 for the failure mode this guards against.
+  docker exec ci_sglang python3 - <<'AITER_DEEP_SMOKE'
+import ctypes, glob, os, sys
+import aiter
+jit_dir = os.path.join(os.path.dirname(aiter.__file__), "jit")
+sos = sorted(glob.glob(os.path.join(jit_dir, "*.so")))
+if not sos:
+    sys.exit(f"AITER deep smoke FAILED: no .so found in {jit_dir} (wheel install broken)")
+fails = []
+for so in sos:
+    try:
+        ctypes.CDLL(so)  # RTLD_LOCAL — verify symbols without polluting global namespace
+    except OSError as e:
+        fails.append(f"  {os.path.basename(so)}: {e}")
+if fails:
+    print("AITER deep smoke FAILED — ABI mismatch (likely wheel ROCm != image ROCm):", file=sys.stderr)
+    for f in fails:
+        print(f, file=sys.stderr)
+    sys.exit(1)
+print(f"AITER deep smoke OK: {len(sos)} JIT .so files dlopen cleanly")
+AITER_DEEP_SMOKE
 else
 # Resolve candidates by matching ROCm version from AITER_VERSION
 readarray -t SGL_IMAGES < <(python3 - "${GPU_TAG}" "${AITER_VERSION:-}" <<'PY'
@@ -222,9 +265,29 @@ for candidate in "${SGL_IMAGES[@]}"; do
     fi
   fi
 
-  # Smoke-test: verify AITER can be imported
-  if docker exec ci_sglang python3 -c "import aiter; print('AITER import OK')" 2>&1; then
-    echo "AITER wheel is compatible with ${candidate}"
+  # Smoke-test: deep dlopen of every JIT .so to catch c10/hip ABI mismatches
+  # that bare `import aiter` misses (see run_sglang.sh:147 for rationale).
+  if docker exec ci_sglang python3 - <<'AITER_DEEP_SMOKE_CANDIDATE' 2>&1; then
+import ctypes, glob, os, sys
+import aiter
+jit_dir = os.path.join(os.path.dirname(aiter.__file__), "jit")
+sos = sorted(glob.glob(os.path.join(jit_dir, "*.so")))
+if not sos:
+    sys.exit(f"AITER deep smoke FAILED: no .so in {jit_dir}")
+fails = []
+for so in sos:
+    try:
+        ctypes.CDLL(so)
+    except OSError as e:
+        fails.append(f"  {os.path.basename(so)}: {e}")
+if fails:
+    print("ABI mismatch:", file=sys.stderr)
+    for f in fails:
+        print(f, file=sys.stderr)
+    sys.exit(1)
+print(f"AITER deep smoke OK: {len(sos)} JIT .so OK")
+AITER_DEEP_SMOKE_CANDIDATE
+    echo "AITER wheel is ABI-compatible with ${candidate}"
     SGL_IMAGE="${candidate}"
     break
   else
@@ -249,7 +312,29 @@ fi
 # ── Run test ──
 echo ""
 echo "=== Running: ${TEST_CMD} ==="
-bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout" bash -c "${TEST_CMD}"
+TEST_LOG="$(mktemp)"
+set +e
+bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout" bash -c "${TEST_CMD}" 2>&1 | tee "${TEST_LOG}"
+TEST_RC=${PIPESTATUS[0]}
+set -e
+
+# Empty-suite guard: SGLang's incremental migration prints "No tests found ...
+# Skipping." and exits 0. Without this guard those zero-test runs were counted
+# as PASS (run 25202894144 nightly-8gpu-deepseek-v32). Treat as SKIPPED via
+# GitHub Actions neutral exit code (78) so dashboards distinguish from a real
+# pass without flipping the job to red.
+if grep -qE "No tests found .*Skipping\.?" "${TEST_LOG}"; then
+  echo ""
+  echo "::warning title=Empty Suite::No tests found for this suite — marking SKIPPED, not PASSED"
+  echo "=== Test SKIPPED (no tests in suite) ==="
+  exit 78
+fi
+
+if [ "${TEST_RC}" -ne 0 ]; then
+  echo ""
+  echo "=== Test FAILED (exit ${TEST_RC}) ==="
+  exit "${TEST_RC}"
+fi
 
 echo ""
 echo "=== Test PASSED ==="
