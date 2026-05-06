@@ -10,6 +10,7 @@ from aiter.int4_utils import (
     rearrange_4bit_elements,
     convert_int8_to_uint32_int4,
 )
+from aiter.ops.quant import per_1x32_i4_quant
 from aiter.utility import fp4_utils
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_gfx, get_cu_num
@@ -30,6 +31,8 @@ from aiter.ops.shuffle import (
     shuffle_weight,
     shuffle_scale_a16w4,
     shuffle_weight_a16w4,
+    pack_int8_to_packed_int4,
+    shuffle_scale_for_int4,
 )
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
@@ -58,7 +61,7 @@ def test_fmoe(
     preshuffle=True,
     strict_accuracy=True,
 ):
-    if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
+    if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
     torch_quant = aiter.get_torch_quant(qType)
     input = torch.randn((token, model_dim), dtype=dtype)
@@ -98,6 +101,13 @@ def test_fmoe(
     elif qType == aiter.QuantType.per_Token and WQDType == torch.int4:  # int4 w quant
         w1_qt, w1_scale = aiter.pertoken_quant(w1, quant_dtype=dtypes.i8, dtypeMax=7)
         w2_qt, w2_scale = aiter.pertoken_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
+    elif (
+        qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2
+    ):  # a16wi4: int4 weights, bf16 activations
+        w1_qt, w1_scale = per_1x32_i4_quant(w1)
+        w1_qt = w1_qt.view(dtypes.i4x2)
+        w2_qt, w2_scale = per_1x32_i4_quant(w2)
+        w2_qt = w2_qt.view(dtypes.i4x2)
     elif qType == aiter.QuantType.per_128x128:
 
         def weight_per_128x128_quant(weight, quant_dtype):
@@ -132,12 +142,12 @@ def test_fmoe(
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
-    if qType != aiter.QuantType.per_1x32:
-        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
-        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
-    else:
+    if qType == aiter.QuantType.per_1x32 and WQDType != dtypes.i4x2:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+    else:
+        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
+        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
 
     # Quant-ing a
     if qType == aiter.QuantType.per_128x128:
@@ -153,6 +163,9 @@ def test_fmoe(
     ):  # a16w4 & a8w4
         a1_qt = input.to(dtypes.bf16)
         a1_scale = None
+    elif qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2:  # a16wi4
+        a1_qt = input.to(dtypes.bf16)
+        a1_scale = None
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
 
@@ -164,6 +177,11 @@ def test_fmoe(
     ):  # a16w4
         exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
         exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
+    elif (
+        qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2
+    ):  # a16wi4: no bias
+        exp_bias1_aiter = exp_bias1 = None
+        exp_bias2_aiter = exp_bias2 = None
     else:
         exp_bias1_aiter = exp_bias1 = None
         exp_bias2_aiter = exp_bias2 = None
@@ -171,7 +189,27 @@ def test_fmoe(
     # pre-shuffle
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
-    if WQDType == torch.int4:  # int4 w quant
+    if qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2:  # a16wi4
+        w1_qt_aiter = pack_int8_to_packed_int4(
+            shuffle_weight(w1_qt_aiter.view(dtypes.i8), (16, 16))
+        )
+        w1_qt_aiter = w1_qt_aiter.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2).view(
+            dtypes.i4x2
+        )
+        w2_qt_aiter = pack_int8_to_packed_int4(
+            shuffle_weight(w2_qt_aiter.view(dtypes.i8), (16, 16))
+        )
+        w2_qt_aiter = w2_qt_aiter.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2).view(
+            dtypes.i4x2
+        )
+        # groupwise scale: [E, K//32, N] bf16 -> shuffle and flatten for kernel
+        w1_scale_aiter = (
+            shuffle_scale_for_int4(w1_scale, group_size=32).view(-1).contiguous()
+        )
+        w2_scale_aiter = (
+            shuffle_scale_for_int4(w2_scale, group_size=32).view(-1).contiguous()
+        )
+    elif WQDType == torch.int4:  # int4 w quant (a8w4)
         w1_qt_aiter = rearrange_4bit_elements(
             convert_int8_to_uint32_int4(
                 shuffle_weight(w1_qt_aiter, (16, 16), use_int4=True)
@@ -229,6 +267,11 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4 & a8w4
+        a2_qt = out1_ref
+        a2_scale = None
+    elif (
+        qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2
+    ):  # a16wi4: bf16 pass-through
         a2_qt = out1_ref
         a2_scale = None
     else:
@@ -295,7 +338,7 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    return {"us": us2, "err": err}
+    return {"us": us2, "logits_diff": float(logits_diff)}
 
 
 l_quant = [
@@ -307,6 +350,7 @@ l_quant = [
     (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
+    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16wi4
 ]
 
 
@@ -370,7 +414,8 @@ parser.add_argument(
     4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
     5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8,
     6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2,  # a16w4,
-    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,""",
+    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,
+    8: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2,  # a16wi4,""",
 )
 
 parser.add_argument(
@@ -541,6 +586,7 @@ def _iter_csv_cases():
 _PER1X32_BF16_FP4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2)
 _PER1X32_FP8_FP4 = (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2)
 _PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
+_PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
 
 def _effective_act_type(quant_type, aq_dtype, wq_dtype, act_type):
@@ -624,6 +670,19 @@ def _iter_legacy_cases():
                             hidden_pad=0,
                             intermediate_pad=0,
                         ), extras
+        elif triple == _PER1X32_BF16_I4:
+            for m in args.tokenNum:
+                yield _kw(
+                    dtype,
+                    m,
+                    model_dim,
+                    inter_dim,
+                    quant_type,
+                    aq_dtype,
+                    wq_dtype,
+                    doweight_stage1,
+                    aiter.ActivationType.Silu,
+                ), extras
         else:
             for act_type in args.act:
                 for m in args.tokenNum:
