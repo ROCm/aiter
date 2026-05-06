@@ -107,6 +107,8 @@ def clean_directory_except_so(directory_path):
 
 def compile(
     compute_type: torch.dtype,
+    output_type: torch.dtype,
+    temporary_output_type: torch.dtype,
     query_seq_len: int,
     one_query_group_size: int,
     head_size: int,
@@ -123,6 +125,9 @@ def compile(
 ):
     """Compile the combined attention and reduce kernel for paged attention decode."""
     head_size_pow2 = triton.next_power_of_2(head_size)
+    compute_type_tl = torch_to_triton_dtype[compute_type]
+    output_type_tl = torch_to_triton_dtype[output_type]
+    temporary_output_type_tl = torch_to_triton_dtype[temporary_output_type]
 
     # Calculate QUERY_GROUP_SIZE_POW2 based on QUERY_SEQ_LEN and ONE_QUERY_GROUP_SIZE
     query_group_size_pow2 = triton.next_power_of_2(
@@ -134,6 +139,8 @@ def compile(
             MD_NAME,
             (
                 compute_type,
+                output_type,
+                temporary_output_type,
                 query_seq_len,
                 one_query_group_size,
                 head_size_pow2,
@@ -154,9 +161,6 @@ def compile(
             raise RuntimeError(
                 "This version triton is not support gluon aot compile, please upgrade to 3.5.0 or higher!"
             )
-
-        # Convert compute_type from torch.dtype to tl.dtype for AOT compilation
-        compute_type_tl = torch_to_triton_dtype[compute_type]
 
         waves_per_eu = 1
         kv_compute_block_size = context_partition_size
@@ -187,8 +191,6 @@ def compile(
             else:
                 key_cache_sig = "*bf16:16"
                 value_cache_sig = "*bf16:16"
-            logits_sig = "*bf16:16"
-            output_sig = "*bf16:16"
         elif compute_type_tl == tl.float16:
             if query_quant_mode >= 0:
                 query_sig = f"*{tl_fp8_type_sig}:16"
@@ -200,10 +202,10 @@ def compile(
             else:
                 key_cache_sig = "*fp16:16"
                 value_cache_sig = "*fp16:16"
-            logits_sig = "*fp16:16"
-            output_sig = "*fp16:16"
         else:
             raise ValueError(f"Unsupported compute type: {compute_type_tl}")
+        logits_sig = f"*{temporary_output_type_tl}:16"
+        output_sig = f"*{output_type_tl}:16"
         # Build signature based on kernel parameters (combined from both kernels)
         signature_parts = [
             "*fp32:16",  # exp_sums_ptr
@@ -262,6 +264,7 @@ def compile(
             f"{is_causal}",
             f"{cdna_version}",
             "0",
+            f"{output_type_tl}",
         ]
         signature = ",".join(signature_parts)
         gluon_kernel_name = "paged_attention_decode_v2_gluon_dot_kernel"
@@ -689,6 +692,8 @@ def pa_decode_gluon_aot(
     # Compile the combined attention and reduce kernel
     combined_func = compile(
         compute_type=compute_type,
+        output_type=output.dtype,
+        temporary_output_type=temporary_output.dtype,
         query_seq_len=query_length,
         one_query_group_size=query_group_size,
         head_size=head_size,
