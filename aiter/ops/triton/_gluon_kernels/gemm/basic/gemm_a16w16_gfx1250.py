@@ -217,20 +217,20 @@ def _gemm_a16w16_basic_kernel(
         # Walk the descriptors forward one K tile.
         if PHYSICAL_MK:
             a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K], update_bounds=False
+                a_desc, [0, BLOCK_K]
             )
         else:
             a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [BLOCK_K, 0], update_bounds=False
+                a_desc, [BLOCK_K, 0]
             )
 
         if PHYSICAL_KN:
             b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [BLOCK_K, 0], update_bounds=False
+                b_desc, [BLOCK_K, 0]
             )
         else:
             b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K], update_bounds=False
+                b_desc, [0, BLOCK_K]
             )
 
         load_idx += 1
@@ -251,20 +251,20 @@ def _gemm_a16w16_basic_kernel(
         # Walk the descriptors forward one K tile.
         if PHYSICAL_MK:
             a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K], update_bounds=False
+                a_desc, [0, BLOCK_K]
             )
         else:
             a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [BLOCK_K, 0], update_bounds=False
+                a_desc, [BLOCK_K, 0]
             )
 
         if PHYSICAL_KN:
             b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [BLOCK_K, 0], update_bounds=False
+                b_desc, [BLOCK_K, 0]
             )
         else:
             b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K], update_bounds=False
+                b_desc, [0, BLOCK_K]
             )
 
         load_idx += 1
@@ -1207,20 +1207,20 @@ def _gemm_a16w16_lds_pipeline_kernel(
         # Walk the descriptors forward one K tile.
         if PHYSICAL_MK:
             a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K], update_bounds=False
+                a_desc, [0, BLOCK_K]
             )
         else:
             a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [BLOCK_K, 0], update_bounds=False
+                a_desc, [BLOCK_K, 0]
             )
 
         if PHYSICAL_KN:
             b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [BLOCK_K, 0], update_bounds=False
+                b_desc, [BLOCK_K, 0]
             )
         else:
             b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K], update_bounds=False
+                b_desc, [0, BLOCK_K]
             )
 
         load_idx += 1
@@ -1271,20 +1271,20 @@ def _gemm_a16w16_lds_pipeline_kernel(
     # Walk the descriptors forward one K tile.
     if PHYSICAL_MK:
         a_desc = gl.amd.gfx1250.tdm.advance(
-            a_desc, [0, BLOCK_K], update_bounds=False
+            a_desc, [0, BLOCK_K]
         )
     else:
         a_desc = gl.amd.gfx1250.tdm.advance(
-            a_desc, [BLOCK_K, 0], update_bounds=False
+            a_desc, [BLOCK_K, 0]
         )
 
     if PHYSICAL_KN:
         b_desc = gl.amd.gfx1250.tdm.advance(
-            b_desc, [BLOCK_K, 0], update_bounds=False
+            b_desc, [BLOCK_K, 0]
         )
     else:
         b_desc = gl.amd.gfx1250.tdm.advance(
-            b_desc, [0, BLOCK_K], update_bounds=False
+            b_desc, [0, BLOCK_K]
         )
 
     # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
@@ -1353,20 +1353,20 @@ def _gemm_a16w16_lds_pipeline_kernel(
         # Walk the descriptors forward one K tile.
         if PHYSICAL_MK:
             a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K], update_bounds=False
+                a_desc, [0, BLOCK_K]
             )
         else:
             a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [BLOCK_K, 0], update_bounds=False
+                a_desc, [BLOCK_K, 0]
             )
 
         if PHYSICAL_KN:
             b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [BLOCK_K, 0], update_bounds=False
+                b_desc, [BLOCK_K, 0]
             )
         else:
             b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K], update_bounds=False
+                b_desc, [0, BLOCK_K]
             )
 
         # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
