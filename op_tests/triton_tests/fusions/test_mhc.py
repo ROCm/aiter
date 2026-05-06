@@ -654,9 +654,9 @@ def test_triton_mhc_matches_hip(M, n, C):
             tol_err_ratio=0.05,
             msg=msg,
         )
-        assert pct <= 0.05, (
-            f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
-        )
+        assert (
+            pct <= 0.05
+        ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
 
 
 # =============================================================================
