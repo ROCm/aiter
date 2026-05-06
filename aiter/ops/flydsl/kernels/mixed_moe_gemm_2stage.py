@@ -130,6 +130,8 @@ def compile_mixed_moe_gemm1(
     gate_mode: GateMode = GateMode.SEPARATED,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    num_b_tensors: int = 1,
+    b_tensor_l_offsets: tuple = (0, 1073741824, 1073741824, 1073741824, 1073741824),
 ):
     """Compile stage1 kernel (gate+up with silu/swiglu).
 
@@ -143,9 +145,16 @@ def compile_mixed_moe_gemm1(
     gate_mode controls the gate/up computation strategy — see GateMode enum.
     """
     gpu_arch = get_hip_arch()
-    allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem0")
-    allocator_ping = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem1")
+    # Unique SmemAllocator names for multi-B to avoid JIT symbol collision
+    _smem_suffix = f"_b{num_b_tensors}" if num_b_tensors > 1 else ""
+    allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name=f"smem0{_smem_suffix}")
+    allocator_ping = SmemAllocator(None, arch=gpu_arch, global_sym_name=f"smem1{_smem_suffix}")
     _state = {}
+
+    # Unique GPU kernel name per b_tensor_l_offsets to prevent AMDGPU code object
+    # symbol collision when multiple multi-B configs are compiled in the same process.
+    _s1_otag = "_".join(str(o) for o in b_tensor_l_offsets[:num_b_tensors])
+    _gpu_kn_s1 = f"moe_gemm1_b{num_b_tensors}_{_s1_otag}" if num_b_tensors > 1 else None
 
     if a_dtype not in ("fp8", "fp16", "int8", "fp4"):
         raise ValueError(
@@ -445,8 +454,22 @@ def compile_mixed_moe_gemm1(
             arg_out: fx.Tensor,
             arg_x: fx.Tensor,
             arg_w: fx.Tensor,
+            arg_w_1: fx.Tensor,
+            arg_w_2: fx.Tensor,
+            arg_w_3: fx.Tensor,
+            arg_w_4: fx.Tensor,
+            arg_w_5: fx.Tensor,
+            arg_w_6: fx.Tensor,
+            arg_w_7: fx.Tensor,
             arg_scale_x: fx.Tensor,
             arg_scale_w: fx.Tensor,
+            arg_scale_w_1: fx.Tensor,
+            arg_scale_w_2: fx.Tensor,
+            arg_scale_w_3: fx.Tensor,
+            arg_scale_w_4: fx.Tensor,
+            arg_scale_w_5: fx.Tensor,
+            arg_scale_w_6: fx.Tensor,
+            arg_scale_w_7: fx.Tensor,
             arg_sorted_token_ids: fx.Tensor,
             arg_expert_ids: fx.Tensor,
             arg_sorted_weights: fx.Tensor,
@@ -620,7 +643,15 @@ def compile_mixed_moe_gemm1(
                 arg_x, max_size=False, num_records_bytes=x_nbytes_i32
             )
 
-            w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+            w_rsrc_0 = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+            w_rsrc_1 = buffer_ops.create_buffer_resource(arg_w_1, max_size=False) if num_b_tensors > 1 else w_rsrc_0
+            w_rsrc_2 = buffer_ops.create_buffer_resource(arg_w_2, max_size=False) if num_b_tensors > 2 else w_rsrc_0
+            w_rsrc_3 = buffer_ops.create_buffer_resource(arg_w_3, max_size=False) if num_b_tensors > 3 else w_rsrc_0
+            w_rsrc_4 = buffer_ops.create_buffer_resource(arg_w_4, max_size=False) if num_b_tensors > 4 else w_rsrc_0
+            w_rsrc_5 = buffer_ops.create_buffer_resource(arg_w_5, max_size=False) if num_b_tensors > 5 else w_rsrc_0
+            w_rsrc_6 = buffer_ops.create_buffer_resource(arg_w_6, max_size=False) if num_b_tensors > 6 else w_rsrc_0
+            w_rsrc_7 = buffer_ops.create_buffer_resource(arg_w_7, max_size=False) if num_b_tensors > 7 else w_rsrc_0
+            w_rsrc = w_rsrc_0  # default for single-B path
 
             # Out: [tokens*topk, inter_dim]
             numids_rsrc = buffer_ops.create_buffer_resource(
@@ -650,9 +681,17 @@ def compile_mixed_moe_gemm1(
                 mn_w = arith.constant(experts * (2 * inter_dim), index=True)
                 sw_nbytes_idx = mn_w * kblk_w
                 sw_nbytes_i32 = arith.index_cast(T.i32, sw_nbytes_idx)
-                sw_rsrc = buffer_ops.create_buffer_resource(
+                sw_rsrc_0 = buffer_ops.create_buffer_resource(
                     arg_scale_w, max_size=False, num_records_bytes=sw_nbytes_i32
                 )
+                sw_rsrc_1 = buffer_ops.create_buffer_resource(arg_scale_w_1, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 1 else sw_rsrc_0
+                sw_rsrc_2 = buffer_ops.create_buffer_resource(arg_scale_w_2, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 2 else sw_rsrc_0
+                sw_rsrc_3 = buffer_ops.create_buffer_resource(arg_scale_w_3, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 3 else sw_rsrc_0
+                sw_rsrc_4 = buffer_ops.create_buffer_resource(arg_scale_w_4, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 4 else sw_rsrc_0
+                sw_rsrc_5 = buffer_ops.create_buffer_resource(arg_scale_w_5, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 5 else sw_rsrc_0
+                sw_rsrc_6 = buffer_ops.create_buffer_resource(arg_scale_w_6, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 6 else sw_rsrc_0
+                sw_rsrc_7 = buffer_ops.create_buffer_resource(arg_scale_w_7, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 7 else sw_rsrc_0
+                sw_rsrc = sw_rsrc_0  # default for single-B path
 
             sorted_nbytes_idx = size_expert_ids_in * arith.constant(
                 sort_block_m * 4, index=True
@@ -711,8 +750,87 @@ def compile_mixed_moe_gemm1(
             )
 
             def _moe_gemm1_body():
+                # Initialize buffer resources as locals (needed for Python closure scoping
+                # since multi-B block may assign them conditionally)
+                w_rsrc = w_rsrc_0
+                sw_rsrc = sw_rsrc_0 if const_expr(not is_f16_b) else 1
                 # Gate expert offset: first inter_dim rows of each expert's 2*inter_dim block
                 expert_off_idx = expert_idx * arith.constant(2 * inter_dim, index=True)
+
+                # Multi-B: select buffer resource and adjust expert offset
+                if const_expr(num_b_tensors > 1):
+                    # Compute partition-local expert offset
+                    _thresh_1 = arith.constant(b_tensor_l_offsets[1], index=True)
+                    _local_expert_1 = expert_idx - _thresh_1
+                    _local_off_1 = _local_expert_1 * arith.constant(2 * inter_dim, index=True)
+                    _in_part_1 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_1)
+
+                    if const_expr(num_b_tensors == 2):
+                        w_rsrc = arith.select(_in_part_1, w_rsrc_1, w_rsrc_0)
+                        sw_rsrc = arith.select(_in_part_1, sw_rsrc_1, sw_rsrc_0) if not is_f16_b else sw_rsrc
+                        expert_off_idx = arith.select(_in_part_1, _local_off_1, expert_off_idx)
+                    elif const_expr(num_b_tensors >= 3):
+                        _thresh_2 = arith.constant(b_tensor_l_offsets[2], index=True)
+                        _local_expert_2 = expert_idx - _thresh_2
+                        _local_off_2 = _local_expert_2 * arith.constant(2 * inter_dim, index=True)
+                        _in_part_2 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_2)
+
+                        if const_expr(num_b_tensors == 3):
+                            _sel_w_01 = arith.select(_in_part_1, w_rsrc_1, w_rsrc_0)
+                            w_rsrc = arith.select(_in_part_2, w_rsrc_2, _sel_w_01)
+                            if not is_f16_b:
+                                _sel_sw_01 = arith.select(_in_part_1, sw_rsrc_1, sw_rsrc_0)
+                                sw_rsrc = arith.select(_in_part_2, sw_rsrc_2, _sel_sw_01)
+                            _sel_off_01 = arith.select(_in_part_1, _local_off_1, expert_off_idx)
+                            expert_off_idx = arith.select(_in_part_2, _local_off_2, _sel_off_01)
+                        else:  # num_b_tensors >= 4
+                            _thresh_3 = arith.constant(b_tensor_l_offsets[3], index=True) if const_expr(num_b_tensors > 3) else arith.constant(0, index=True)
+                            _local_expert_3 = expert_idx - _thresh_3
+                            _local_off_3 = _local_expert_3 * arith.constant(2 * inter_dim, index=True)
+                            _in_part_3 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_3) if const_expr(num_b_tensors > 3) else _in_part_2
+                            _thresh_4 = arith.constant(b_tensor_l_offsets[4], index=True) if const_expr(num_b_tensors > 4) else arith.constant(0, index=True)
+                            _local_expert_4 = expert_idx - _thresh_4
+                            _local_off_4 = _local_expert_4 * arith.constant(2 * inter_dim, index=True)
+                            _in_part_4 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_4) if const_expr(num_b_tensors > 4) else _in_part_2
+                            _thresh_5 = arith.constant(b_tensor_l_offsets[5], index=True) if const_expr(num_b_tensors > 5) else arith.constant(0, index=True)
+                            _local_expert_5 = expert_idx - _thresh_5
+                            _local_off_5 = _local_expert_5 * arith.constant(2 * inter_dim, index=True)
+                            _in_part_5 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_5) if const_expr(num_b_tensors > 5) else _in_part_2
+                            _thresh_6 = arith.constant(b_tensor_l_offsets[6], index=True) if const_expr(num_b_tensors > 6) else arith.constant(0, index=True)
+                            _local_expert_6 = expert_idx - _thresh_6
+                            _local_off_6 = _local_expert_6 * arith.constant(2 * inter_dim, index=True)
+                            _in_part_6 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_6) if const_expr(num_b_tensors > 6) else _in_part_2
+                            _thresh_7 = arith.constant(b_tensor_l_offsets[7], index=True) if const_expr(num_b_tensors > 7) else arith.constant(0, index=True)
+                            _local_expert_7 = expert_idx - _thresh_7
+                            _local_off_7 = _local_expert_7 * arith.constant(2 * inter_dim, index=True)
+                            _in_part_7 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_7) if const_expr(num_b_tensors > 7) else _in_part_2
+
+                            # Cascaded select for w_rsrc
+                            _sel_w = arith.select(_in_part_1, w_rsrc_1, w_rsrc_0)
+                            _sel_w = arith.select(_in_part_2, w_rsrc_2, _sel_w)
+                            _sel_w = arith.select(_in_part_3, w_rsrc_3, _sel_w)
+                            _sel_w = arith.select(_in_part_4, w_rsrc_4, _sel_w) if const_expr(num_b_tensors > 4) else _sel_w
+                            _sel_w = arith.select(_in_part_5, w_rsrc_5, _sel_w) if const_expr(num_b_tensors > 5) else _sel_w
+                            _sel_w = arith.select(_in_part_6, w_rsrc_6, _sel_w) if const_expr(num_b_tensors > 6) else _sel_w
+                            _sel_w = arith.select(_in_part_7, w_rsrc_7, _sel_w) if const_expr(num_b_tensors > 7) else _sel_w
+                            w_rsrc = _sel_w
+                            if not is_f16_b:
+                                _sel_sw = arith.select(_in_part_1, sw_rsrc_1, sw_rsrc_0)
+                                _sel_sw = arith.select(_in_part_2, sw_rsrc_2, _sel_sw)
+                                _sel_sw = arith.select(_in_part_3, sw_rsrc_3, _sel_sw)
+                                _sel_sw = arith.select(_in_part_4, sw_rsrc_4, _sel_sw) if const_expr(num_b_tensors > 4) else _sel_sw
+                                _sel_sw = arith.select(_in_part_5, sw_rsrc_5, _sel_sw) if const_expr(num_b_tensors > 5) else _sel_sw
+                                _sel_sw = arith.select(_in_part_6, sw_rsrc_6, _sel_sw) if const_expr(num_b_tensors > 6) else _sel_sw
+                                _sel_sw = arith.select(_in_part_7, sw_rsrc_7, _sel_sw) if const_expr(num_b_tensors > 7) else _sel_sw
+                                sw_rsrc = _sel_sw
+                            _sel_off = arith.select(_in_part_1, _local_off_1, expert_off_idx)
+                            _sel_off = arith.select(_in_part_2, _local_off_2, _sel_off)
+                            _sel_off = arith.select(_in_part_3, _local_off_3, _sel_off)
+                            _sel_off = arith.select(_in_part_4, _local_off_4, _sel_off) if const_expr(num_b_tensors > 4) else _sel_off
+                            _sel_off = arith.select(_in_part_5, _local_off_5, _sel_off) if const_expr(num_b_tensors > 5) else _sel_off
+                            _sel_off = arith.select(_in_part_6, _local_off_6, _sel_off) if const_expr(num_b_tensors > 6) else _sel_off
+                            _sel_off = arith.select(_in_part_7, _local_off_7, _sel_off) if const_expr(num_b_tensors > 7) else _sel_off
+                            expert_off_idx = _sel_off
 
                 # X loading -- KEY DIFFERENCE from stage2: X row = token_id only
                 x_load_bytes = 16
@@ -2636,6 +2754,8 @@ def compile_mixed_moe_gemm1(
         gate_mode,
         a_scale_one,
         xcd_swizzle,
+        num_b_tensors,
+        b_tensor_l_offsets,
     )
 
     @flyc.jit
@@ -2643,8 +2763,22 @@ def compile_mixed_moe_gemm1(
         arg_out: fx.Tensor,
         arg_x: fx.Tensor,
         arg_w: fx.Tensor,
+        arg_w_1: fx.Tensor,
+        arg_w_2: fx.Tensor,
+        arg_w_3: fx.Tensor,
+        arg_w_4: fx.Tensor,
+        arg_w_5: fx.Tensor,
+        arg_w_6: fx.Tensor,
+        arg_w_7: fx.Tensor,
         arg_scale_x: fx.Tensor,
         arg_scale_w: fx.Tensor,
+        arg_scale_w_1: fx.Tensor,
+        arg_scale_w_2: fx.Tensor,
+        arg_scale_w_3: fx.Tensor,
+        arg_scale_w_4: fx.Tensor,
+        arg_scale_w_5: fx.Tensor,
+        arg_scale_w_6: fx.Tensor,
+        arg_scale_w_7: fx.Tensor,
         arg_sorted_token_ids: fx.Tensor,
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
@@ -2687,8 +2821,22 @@ def compile_mixed_moe_gemm1(
             arg_out,
             arg_x,
             arg_w,
+            arg_w_1,
+            arg_w_2,
+            arg_w_3,
+            arg_w_4,
+            arg_w_5,
+            arg_w_6,
+            arg_w_7,
             arg_scale_x,
             arg_scale_w,
+            arg_scale_w_1,
+            arg_scale_w_2,
+            arg_scale_w_3,
+            arg_scale_w_4,
+            arg_scale_w_5,
+            arg_scale_w_6,
+            arg_scale_w_7,
             arg_sorted_token_ids,
             arg_expert_ids,
             arg_sorted_weights,
@@ -2700,6 +2848,10 @@ def compile_mixed_moe_gemm1(
             i32_k_in,
             i32_size_expert_ids_in,
         ).launch(grid=(gx, gy, k_batch), block=(total_threads, 1, 1), stream=stream)
+
+    # Unique host function name for multi-B to avoid symbol collision
+    if _gpu_kn_s1:
+        launch_mixed_moe_gemm1.func.__name__ = f"launch_moe1_b{num_b_tensors}_{_s1_otag}"
 
     return launch_mixed_moe_gemm1
 
@@ -2730,6 +2882,8 @@ def compile_mixed_moe_gemm2(
     sort_block_m: int = 0,
     b_nt: int = 2,
     xcd_swizzle: int = 0,
+    num_b_tensors: int = 1,
+    b_tensor_l_offsets: tuple = (0, 1073741824, 1073741824, 1073741824, 1073741824),
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -2762,6 +2916,10 @@ def compile_mixed_moe_gemm2(
     assumed equal to `tile_m`. When set, stage2 can use a different tile_m from
     sorting/stage1. Requires sort_block_m % tile_m == 0.
     """
+    # Unique GPU kernel name per b_tensor_l_offsets (stage2)
+    _s2_otag = "_".join(str(o) for o in b_tensor_l_offsets[:num_b_tensors])
+    _gpu_kn_s2 = f"moe_gemm2_b{num_b_tensors}_{_s2_otag}" if num_b_tensors > 1 else None
+
     _sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
     if _sort_block_m != tile_m and _sort_block_m % tile_m != 0:
         raise ValueError(
@@ -2979,8 +3137,22 @@ def compile_mixed_moe_gemm2(
             arg_out: fx.Tensor,
             arg_x: fx.Tensor,
             arg_w: fx.Tensor,
+            arg_w_1: fx.Tensor,
+            arg_w_2: fx.Tensor,
+            arg_w_3: fx.Tensor,
+            arg_w_4: fx.Tensor,
+            arg_w_5: fx.Tensor,
+            arg_w_6: fx.Tensor,
+            arg_w_7: fx.Tensor,
             arg_scale_x: fx.Tensor,
             arg_scale_w: fx.Tensor,
+            arg_scale_w_1: fx.Tensor,
+            arg_scale_w_2: fx.Tensor,
+            arg_scale_w_3: fx.Tensor,
+            arg_scale_w_4: fx.Tensor,
+            arg_scale_w_5: fx.Tensor,
+            arg_scale_w_6: fx.Tensor,
+            arg_scale_w_7: fx.Tensor,
             arg_sorted_token_ids: fx.Tensor,
             arg_expert_ids: fx.Tensor,
             arg_sorted_weights: fx.Tensor,
@@ -3125,7 +3297,15 @@ def compile_mixed_moe_gemm2(
                 arg_x, max_size=False, num_records_bytes=x_nbytes_i32
             )
 
-            w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+            w_rsrc_0 = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+            w_rsrc_1 = buffer_ops.create_buffer_resource(arg_w_1, max_size=False) if num_b_tensors > 1 else w_rsrc_0
+            w_rsrc_2 = buffer_ops.create_buffer_resource(arg_w_2, max_size=False) if num_b_tensors > 2 else w_rsrc_0
+            w_rsrc_3 = buffer_ops.create_buffer_resource(arg_w_3, max_size=False) if num_b_tensors > 3 else w_rsrc_0
+            w_rsrc_4 = buffer_ops.create_buffer_resource(arg_w_4, max_size=False) if num_b_tensors > 4 else w_rsrc_0
+            w_rsrc_5 = buffer_ops.create_buffer_resource(arg_w_5, max_size=False) if num_b_tensors > 5 else w_rsrc_0
+            w_rsrc_6 = buffer_ops.create_buffer_resource(arg_w_6, max_size=False) if num_b_tensors > 6 else w_rsrc_0
+            w_rsrc_7 = buffer_ops.create_buffer_resource(arg_w_7, max_size=False) if num_b_tensors > 7 else w_rsrc_0
+            w_rsrc = w_rsrc_0  # default for single-B path
 
             # OUT: [tokens, model_dim] -> clamp to descriptor max (i32 bytes) to avoid overflow on huge tokens.
             out_elem_bytes = 4 if out_is_f32 else 2
@@ -3188,9 +3368,17 @@ def compile_mixed_moe_gemm2(
                 mn_w = arith.constant(experts * model_dim, index=True)
                 sw_nbytes_idx = mn_w * kblk_w  # bytes (e8m0)
                 sw_nbytes_i32 = arith.index_cast(T.i32, sw_nbytes_idx)
-                sw_rsrc = buffer_ops.create_buffer_resource(
+                sw_rsrc_0 = buffer_ops.create_buffer_resource(
                     arg_scale_w, max_size=False, num_records_bytes=sw_nbytes_i32
                 )
+                sw_rsrc_1 = buffer_ops.create_buffer_resource(arg_scale_w_1, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 1 else sw_rsrc_0
+                sw_rsrc_2 = buffer_ops.create_buffer_resource(arg_scale_w_2, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 2 else sw_rsrc_0
+                sw_rsrc_3 = buffer_ops.create_buffer_resource(arg_scale_w_3, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 3 else sw_rsrc_0
+                sw_rsrc_4 = buffer_ops.create_buffer_resource(arg_scale_w_4, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 4 else sw_rsrc_0
+                sw_rsrc_5 = buffer_ops.create_buffer_resource(arg_scale_w_5, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 5 else sw_rsrc_0
+                sw_rsrc_6 = buffer_ops.create_buffer_resource(arg_scale_w_6, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 6 else sw_rsrc_0
+                sw_rsrc_7 = buffer_ops.create_buffer_resource(arg_scale_w_7, max_size=False, num_records_bytes=sw_nbytes_i32) if num_b_tensors > 7 else sw_rsrc_0
+                sw_rsrc = sw_rsrc_0  # default
 
             # sorted_token_ids / sorted_weights: [blocks*tile_m] (padded length)
             sorted_nbytes_idx = (
@@ -3296,6 +3484,80 @@ def compile_mixed_moe_gemm2(
                 )
                 _expert_b_base = _prev_expert_b_base + _delta_b
 
+            # Multi-B: select buffer resource based on expert partition
+            if const_expr(num_b_tensors > 1):
+                _thresh_1 = arith.constant(b_tensor_l_offsets[1], index=True)
+                _local_expert_1 = expert_idx - _thresh_1
+                _local_b_base_1 = _local_expert_1 * arith.constant(_expert_b_stride, index=True)
+                _in_part_1 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_1)
+
+                if const_expr(num_b_tensors == 2):
+                    w_rsrc = arith.select(_in_part_1, w_rsrc_1, w_rsrc_0)
+                    if not is_f16_b:
+                        sw_rsrc = arith.select(_in_part_1, sw_rsrc_1, sw_rsrc_0)
+                    _expert_b_base = arith.select(_in_part_1, _local_b_base_1, _expert_b_base)
+                elif const_expr(num_b_tensors >= 3):
+                    _thresh_2 = arith.constant(b_tensor_l_offsets[2], index=True)
+                    _local_expert_2 = expert_idx - _thresh_2
+                    _local_b_base_2 = _local_expert_2 * arith.constant(_expert_b_stride, index=True)
+                    _in_part_2 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_2)
+
+                    if const_expr(num_b_tensors == 3):
+                        _sel_w_01 = arith.select(_in_part_1, w_rsrc_1, w_rsrc_0)
+                        w_rsrc = arith.select(_in_part_2, w_rsrc_2, _sel_w_01)
+                        if not is_f16_b:
+                            _sel_sw_01 = arith.select(_in_part_1, sw_rsrc_1, sw_rsrc_0)
+                            sw_rsrc = arith.select(_in_part_2, sw_rsrc_2, _sel_sw_01)
+                        _sel_base_01 = arith.select(_in_part_1, _local_b_base_1, _expert_b_base)
+                        _expert_b_base = arith.select(_in_part_2, _local_b_base_2, _sel_base_01)
+                    else:  # num_b_tensors >= 4
+                        _thresh_3 = arith.constant(b_tensor_l_offsets[3], index=True) if const_expr(num_b_tensors > 3) else arith.constant(0, index=True)
+                        _local_expert_3 = expert_idx - _thresh_3
+                        _local_b_base_3 = _local_expert_3 * arith.constant(_expert_b_stride, index=True)
+                        _in_part_3 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_3) if const_expr(num_b_tensors > 3) else _in_part_2
+                        _thresh_4 = arith.constant(b_tensor_l_offsets[4], index=True) if const_expr(num_b_tensors > 4) else arith.constant(0, index=True)
+                        _local_expert_4 = expert_idx - _thresh_4
+                        _local_b_base_4 = _local_expert_4 * arith.constant(_expert_b_stride, index=True)
+                        _in_part_4 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_4) if const_expr(num_b_tensors > 4) else _in_part_2
+                        _thresh_5 = arith.constant(b_tensor_l_offsets[5], index=True) if const_expr(num_b_tensors > 5) else arith.constant(0, index=True)
+                        _local_expert_5 = expert_idx - _thresh_5
+                        _local_b_base_5 = _local_expert_5 * arith.constant(_expert_b_stride, index=True)
+                        _in_part_5 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_5) if const_expr(num_b_tensors > 5) else _in_part_2
+                        _thresh_6 = arith.constant(b_tensor_l_offsets[6], index=True) if const_expr(num_b_tensors > 6) else arith.constant(0, index=True)
+                        _local_expert_6 = expert_idx - _thresh_6
+                        _local_b_base_6 = _local_expert_6 * arith.constant(_expert_b_stride, index=True)
+                        _in_part_6 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_6) if const_expr(num_b_tensors > 6) else _in_part_2
+                        _thresh_7 = arith.constant(b_tensor_l_offsets[7], index=True) if const_expr(num_b_tensors > 7) else arith.constant(0, index=True)
+                        _local_expert_7 = expert_idx - _thresh_7
+                        _local_b_base_7 = _local_expert_7 * arith.constant(_expert_b_stride, index=True)
+                        _in_part_7 = arith.cmpi(CmpIPredicate.uge, expert_idx, _thresh_7) if const_expr(num_b_tensors > 7) else _in_part_2
+
+                        _sel_w = arith.select(_in_part_1, w_rsrc_1, w_rsrc_0)
+                        _sel_w = arith.select(_in_part_2, w_rsrc_2, _sel_w)
+                        _sel_w = arith.select(_in_part_3, w_rsrc_3, _sel_w)
+                        _sel_w = arith.select(_in_part_4, w_rsrc_4, _sel_w) if const_expr(num_b_tensors > 4) else _sel_w
+                        _sel_w = arith.select(_in_part_5, w_rsrc_5, _sel_w) if const_expr(num_b_tensors > 5) else _sel_w
+                        _sel_w = arith.select(_in_part_6, w_rsrc_6, _sel_w) if const_expr(num_b_tensors > 6) else _sel_w
+                        _sel_w = arith.select(_in_part_7, w_rsrc_7, _sel_w) if const_expr(num_b_tensors > 7) else _sel_w
+                        w_rsrc = _sel_w
+                        if not is_f16_b:
+                            _sel_sw = arith.select(_in_part_1, sw_rsrc_1, sw_rsrc_0)
+                            _sel_sw = arith.select(_in_part_2, sw_rsrc_2, _sel_sw)
+                            _sel_sw = arith.select(_in_part_3, sw_rsrc_3, _sel_sw)
+                            _sel_sw = arith.select(_in_part_4, sw_rsrc_4, _sel_sw) if const_expr(num_b_tensors > 4) else _sel_sw
+                            _sel_sw = arith.select(_in_part_5, sw_rsrc_5, _sel_sw) if const_expr(num_b_tensors > 5) else _sel_sw
+                            _sel_sw = arith.select(_in_part_6, sw_rsrc_6, _sel_sw) if const_expr(num_b_tensors > 6) else _sel_sw
+                            _sel_sw = arith.select(_in_part_7, sw_rsrc_7, _sel_sw) if const_expr(num_b_tensors > 7) else _sel_sw
+                            sw_rsrc = _sel_sw
+                        _sel_base = arith.select(_in_part_1, _local_b_base_1, _expert_b_base)
+                        _sel_base = arith.select(_in_part_2, _local_b_base_2, _sel_base)
+                        _sel_base = arith.select(_in_part_3, _local_b_base_3, _sel_base)
+                        _sel_base = arith.select(_in_part_4, _local_b_base_4, _sel_base) if const_expr(num_b_tensors > 4) else _sel_base
+                        _sel_base = arith.select(_in_part_5, _local_b_base_5, _sel_base) if const_expr(num_b_tensors > 5) else _sel_base
+                        _sel_base = arith.select(_in_part_6, _local_b_base_6, _sel_base) if const_expr(num_b_tensors > 6) else _sel_base
+                        _sel_base = arith.select(_in_part_7, _local_b_base_7, _sel_base) if const_expr(num_b_tensors > 7) else _sel_base
+                        _expert_b_base = _sel_base
+
             # Early-exit: if the first row of this tile is a sentinel (all-padding tile),
             # skip the entire GEMM.
             _first_tok = buffer_ops.buffer_load(
@@ -3321,6 +3583,46 @@ def compile_mixed_moe_gemm2(
                 # Expert id for this M tile.
                 n_idx = arith.constant(model_dim, index=True)
                 expert_off_idx = expert_idx * n_idx  # index
+
+                # Multi-B: adjust expert_off_idx to be partition-local
+                if const_expr(num_b_tensors > 1):
+                    _s2_thresh_1 = arith.constant(b_tensor_l_offsets[1], index=True)
+                    _s2_local_off_1 = (expert_idx - _s2_thresh_1) * n_idx
+                    _s2_in_p1 = arith.cmpi(CmpIPredicate.uge, expert_idx, _s2_thresh_1)
+
+                    if const_expr(num_b_tensors == 2):
+                        expert_off_idx = arith.select(_s2_in_p1, _s2_local_off_1, expert_off_idx)
+                    elif const_expr(num_b_tensors >= 3):
+                        _s2_thresh_2 = arith.constant(b_tensor_l_offsets[2], index=True)
+                        _s2_local_off_2 = (expert_idx - _s2_thresh_2) * n_idx
+                        _s2_in_p2 = arith.cmpi(CmpIPredicate.uge, expert_idx, _s2_thresh_2)
+                        if const_expr(num_b_tensors == 3):
+                            _s2_sel_01 = arith.select(_s2_in_p1, _s2_local_off_1, expert_off_idx)
+                            expert_off_idx = arith.select(_s2_in_p2, _s2_local_off_2, _s2_sel_01)
+                        else:  # num_b_tensors >= 4
+                            _s2_thresh_3 = arith.constant(b_tensor_l_offsets[3], index=True) if const_expr(num_b_tensors > 3) else arith.constant(0, index=True)
+                            _s2_local_off_3 = (expert_idx - _s2_thresh_3) * n_idx
+                            _s2_in_p3 = arith.cmpi(CmpIPredicate.uge, expert_idx, _s2_thresh_3) if const_expr(num_b_tensors > 3) else _s2_in_p2
+                            _s2_thresh_4 = arith.constant(b_tensor_l_offsets[4], index=True) if const_expr(num_b_tensors > 4) else arith.constant(0, index=True)
+                            _s2_local_off_4 = (expert_idx - _s2_thresh_4) * n_idx
+                            _s2_in_p4 = arith.cmpi(CmpIPredicate.uge, expert_idx, _s2_thresh_4) if const_expr(num_b_tensors > 4) else _s2_in_p2
+                            _s2_thresh_5 = arith.constant(b_tensor_l_offsets[5], index=True) if const_expr(num_b_tensors > 5) else arith.constant(0, index=True)
+                            _s2_local_off_5 = (expert_idx - _s2_thresh_5) * n_idx
+                            _s2_in_p5 = arith.cmpi(CmpIPredicate.uge, expert_idx, _s2_thresh_5) if const_expr(num_b_tensors > 5) else _s2_in_p2
+                            _s2_thresh_6 = arith.constant(b_tensor_l_offsets[6], index=True) if const_expr(num_b_tensors > 6) else arith.constant(0, index=True)
+                            _s2_local_off_6 = (expert_idx - _s2_thresh_6) * n_idx
+                            _s2_in_p6 = arith.cmpi(CmpIPredicate.uge, expert_idx, _s2_thresh_6) if const_expr(num_b_tensors > 6) else _s2_in_p2
+                            _s2_thresh_7 = arith.constant(b_tensor_l_offsets[7], index=True) if const_expr(num_b_tensors > 7) else arith.constant(0, index=True)
+                            _s2_local_off_7 = (expert_idx - _s2_thresh_7) * n_idx
+                            _s2_in_p7 = arith.cmpi(CmpIPredicate.uge, expert_idx, _s2_thresh_7) if const_expr(num_b_tensors > 7) else _s2_in_p2
+                            _sel_off = arith.select(_s2_in_p1, _s2_local_off_1, expert_off_idx)
+                            _sel_off = arith.select(_s2_in_p2, _s2_local_off_2, _sel_off)
+                            _sel_off = arith.select(_s2_in_p3, _s2_local_off_3, _sel_off)
+                            _sel_off = arith.select(_s2_in_p4, _s2_local_off_4, _sel_off) if const_expr(num_b_tensors > 4) else _sel_off
+                            _sel_off = arith.select(_s2_in_p5, _s2_local_off_5, _sel_off) if const_expr(num_b_tensors > 5) else _sel_off
+                            _sel_off = arith.select(_s2_in_p6, _s2_local_off_6, _sel_off) if const_expr(num_b_tensors > 6) else _sel_off
+                            _sel_off = arith.select(_s2_in_p7, _s2_local_off_7, _sel_off) if const_expr(num_b_tensors > 7) else _sel_off
+                            expert_off_idx = _sel_off
 
                 # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
                 # Prefer 16B buffer-load (dwordx4). If the per-thread byte count isn't divisible by
@@ -4478,6 +4780,8 @@ def compile_mixed_moe_gemm2(
         _sort_block_m,
         _cu_num if _persistent else 0,
         xcd_swizzle,
+        num_b_tensors,
+        b_tensor_l_offsets,
     )
 
     @flyc.jit
@@ -4485,8 +4789,22 @@ def compile_mixed_moe_gemm2(
         arg_out: fx.Tensor,
         arg_x: fx.Tensor,
         arg_w: fx.Tensor,
+        arg_w_1: fx.Tensor,
+        arg_w_2: fx.Tensor,
+        arg_w_3: fx.Tensor,
+        arg_w_4: fx.Tensor,
+        arg_w_5: fx.Tensor,
+        arg_w_6: fx.Tensor,
+        arg_w_7: fx.Tensor,
         arg_scale_x: fx.Tensor,
         arg_scale_w: fx.Tensor,
+        arg_scale_w_1: fx.Tensor,
+        arg_scale_w_2: fx.Tensor,
+        arg_scale_w_3: fx.Tensor,
+        arg_scale_w_4: fx.Tensor,
+        arg_scale_w_5: fx.Tensor,
+        arg_scale_w_6: fx.Tensor,
+        arg_scale_w_7: fx.Tensor,
         arg_sorted_token_ids: fx.Tensor,
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
@@ -4526,8 +4844,22 @@ def compile_mixed_moe_gemm2(
             arg_out,
             arg_x,
             arg_w,
+            arg_w_1,
+            arg_w_2,
+            arg_w_3,
+            arg_w_4,
+            arg_w_5,
+            arg_w_6,
+            arg_w_7,
             arg_scale_x,
             arg_scale_w,
+            arg_scale_w_1,
+            arg_scale_w_2,
+            arg_scale_w_3,
+            arg_scale_w_4,
+            arg_scale_w_5,
+            arg_scale_w_6,
+            arg_scale_w_7,
             arg_sorted_token_ids,
             arg_expert_ids,
             arg_sorted_weights,
@@ -4542,5 +4874,9 @@ def compile_mixed_moe_gemm2(
             block=(256, 1, 1),
             stream=stream,
         )
+
+    # Unique host function name for multi-B
+    if _gpu_kn_s2:
+        launch_mixed_moe_gemm2.func.__name__ = f"launch_moe2_b{num_b_tensors}_{_s2_otag}"
 
     return launch_mixed_moe_gemm2

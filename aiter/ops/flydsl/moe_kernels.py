@@ -298,6 +298,8 @@ def compile_flydsl_moe_stage1(
     enable_bias: bool = False,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    num_b_tensors: int = 1,
+    b_tensor_l_offsets: tuple = (0, 1073741824, 1073741824, 1073741824, 1073741824),
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -327,6 +329,8 @@ def compile_flydsl_moe_stage1(
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
+            num_b_tensors=num_b_tensors,
+            b_tensor_l_offsets=b_tensor_l_offsets,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -377,6 +381,8 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    num_b_tensors: int = 1,
+    b_tensor_l_offsets: tuple = (0, 1073741824, 1073741824, 1073741824, 1073741824),
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -402,6 +408,8 @@ def compile_flydsl_moe_stage2(
             inter_dim_pad=inter_dim_pad,
             xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
+            num_b_tensors=num_b_tensors,
+            b_tensor_l_offsets=b_tensor_l_offsets,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -461,17 +469,41 @@ def _s1_args_fp4(
     dev,
     bias=None,
     stream=None,
+    w_extra=None,
+    w_scale_extra=None,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
     if stream is None:
         stream = torch.cuda.current_stream()
+    # Pad extra weight/scale lists to 7 entries for multi-B kernel args (up to 8 partitions)
+    _empty = torch.empty(0, device=dev, dtype=torch.uint8)
+    _w_extra = list(w_extra) if w_extra else []
+    _ws_extra = list(w_scale_extra) if w_scale_extra else []
+    while len(_w_extra) < 7:
+        _w_extra.append(_empty)
+    while len(_ws_extra) < 7:
+        _ws_extra.append(_empty)
     return (
         _view_safe(out),
         _view_safe(a),
         _view_safe(w),
+        _view_safe(_w_extra[0]),
+        _view_safe(_w_extra[1]),
+        _view_safe(_w_extra[2]),
+        _view_safe(_w_extra[3]),
+        _view_safe(_w_extra[4]),
+        _view_safe(_w_extra[5]),
+        _view_safe(_w_extra[6]),
         _view_safe(a_scale),
         _view_safe(w_scale),
+        _view_safe(_ws_extra[0]),
+        _view_safe(_ws_extra[1]),
+        _view_safe(_ws_extra[2]),
+        _view_safe(_ws_extra[3]),
+        _view_safe(_ws_extra[4]),
+        _view_safe(_ws_extra[5]),
+        _view_safe(_ws_extra[6]),
         sorted_ids,
         sorted_expert_ids,
         sorted_weights,
@@ -539,6 +571,8 @@ def _s2_args_fp4(
     dev,
     bias=None,
     stream=None,
+    w_extra=None,
+    w_scale_extra=None,
 ):
     _bias = (
         bias.view(-1)
@@ -547,12 +581,34 @@ def _s2_args_fp4(
     )
     if stream is None:
         stream = torch.cuda.current_stream()
+    # Pad extra weight/scale lists to 7 entries for multi-B kernel args (up to 8 partitions)
+    _empty = torch.empty(0, device=dev, dtype=torch.uint8)
+    _w_extra = list(w_extra) if w_extra else []
+    _ws_extra = list(w_scale_extra) if w_scale_extra else []
+    while len(_w_extra) < 7:
+        _w_extra.append(_empty)
+    while len(_ws_extra) < 7:
+        _ws_extra.append(_empty)
     return (
         _view_safe(target),
         _view_safe(a),
         _view_safe(w),
+        _view_safe(_w_extra[0]),
+        _view_safe(_w_extra[1]),
+        _view_safe(_w_extra[2]),
+        _view_safe(_w_extra[3]),
+        _view_safe(_w_extra[4]),
+        _view_safe(_w_extra[5]),
+        _view_safe(_w_extra[6]),
         _view_safe(a_scale),
         _view_safe(w_scale),
+        _view_safe(_ws_extra[0]),
+        _view_safe(_ws_extra[1]),
+        _view_safe(_ws_extra[2]),
+        _view_safe(_ws_extra[3]),
+        _view_safe(_ws_extra[4]),
+        _view_safe(_ws_extra[5]),
+        _view_safe(_ws_extra[6]),
         sorted_ids,
         sorted_expert_ids,
         sorted_weights,
@@ -649,7 +705,7 @@ def _get_compiled_swiglu(inter_dim: int):
 
 def flydsl_moe_stage1(
     a: torch.Tensor,
-    w1: torch.Tensor,
+    w1,  # torch.Tensor or List[torch.Tensor]
     sorted_token_ids: torch.Tensor,
     sorted_expert_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
@@ -663,7 +719,7 @@ def flydsl_moe_stage1(
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
     act: str = "silu",
-    w1_scale: Optional[torch.Tensor] = None,
+    w1_scale=None,  # Optional[torch.Tensor] or List[torch.Tensor]
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
     persist_m: int = 0,
@@ -699,9 +755,22 @@ def flydsl_moe_stage1(
         fuse_quant:                 (out, out_scale_sorted)
     """
     token_num = a.shape[0]
-    E = w1.shape[0]
-    inter_dim = w1.shape[1] // 2
+    # Normalize w1 to list for multi-B support
+    w1_list = list(w1) if isinstance(w1, (list, tuple)) else [w1]
+    w1_scale_list = list(w1_scale) if isinstance(w1_scale, (list, tuple)) else ([w1_scale] if w1_scale is not None else [None])
+    _num_b_tensors = len(w1_list)
+    E = sum(w.shape[0] for w in w1_list)
+    inter_dim = w1_list[0].shape[1] // 2
     model_dim = a.shape[1]
+    # Compute b_tensor_l_offsets: cumulative expert counts per partition
+    _offsets = [0]
+    for w in w1_list:
+        _offsets.append(_offsets[-1] + w.shape[0])
+    # Pad to 9 entries (kernel expects 9-tuple: [0, thresh1, ..., thresh8])
+    _big = 1073741824
+    while len(_offsets) < 9:
+        _offsets.append(_big)
+    _b_tensor_l_offsets = tuple(_offsets)
 
     if a_dtype == "fp4":
         model_dim = model_dim * 2
@@ -751,9 +820,13 @@ def flydsl_moe_stage1(
     flat_a_scale = (
         a1_scale.view(-1) if a1_scale is not None else torch.empty(0, device=dev)
     )
+    # For multi-B: flatten the first partition's scale (or single tensor)
+    _w1_scale_0 = w1_scale_list[0] if w1_scale_list else None
     flat_w_scale = (
-        w1_scale.view(-1) if w1_scale is not None else torch.empty(0, device=dev)
+        _w1_scale_0.view(-1) if _w1_scale_0 is not None else torch.empty(0, device=dev)
     )
+    # Extra weight scales for partitions 1..N-1
+    _w_scale_extra = [s.view(-1) for s in w1_scale_list[1:]] if len(w1_scale_list) > 1 else None
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -795,11 +868,14 @@ def flydsl_moe_stage1(
     _n_in = inter_dim * 2 if is_fp4 else inter_dim
     _k_in = model_dim
 
+    # Multi-B: prepare extra weight tensors (partitions 1..N-1)
+    _w_extra = [w.view(-1) for w in w1_list[1:]] if _num_b_tensors > 1 else None
+
     if is_fp4:
         args = _s1_args_fp4(
             _kernel_out.view(-1),
             a.view(-1),
-            w1.view(-1),
+            w1_list[0].view(-1),
             flat_a_scale,
             flat_w_scale,
             sorted_token_ids,
@@ -813,12 +889,14 @@ def flydsl_moe_stage1(
             _grid_y,
             dev,
             bias=bias.view(-1) if bias is not None else torch.empty(0, device=dev),
+            w_extra=_w_extra,
+            w_scale_extra=_w_scale_extra,
         )
     else:
         args = _s1_args_std(
             _kernel_out.view(-1),
             a.view(-1),
-            w1.view(-1),
+            w1_list[0].view(-1),
             flat_a_scale,
             flat_w_scale,
             sorted_token_ids,
@@ -855,6 +933,8 @@ def flydsl_moe_stage1(
         enable_bias=(bias is not None),
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
+        num_b_tensors=_num_b_tensors,
+        b_tensor_l_offsets=_b_tensor_l_offsets,
     )
     _run_compiled(exe, args)
 
@@ -940,7 +1020,7 @@ def flydsl_moe_stage1(
 
 def flydsl_moe_stage2(
     inter_states: torch.Tensor,
-    w2: torch.Tensor,
+    w2,  # torch.Tensor or List[torch.Tensor]
     sorted_token_ids: torch.Tensor,
     sorted_expert_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
@@ -954,7 +1034,7 @@ def flydsl_moe_stage2(
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
     mode: str = "atomic",
-    w2_scale: Optional[torch.Tensor] = None,
+    w2_scale=None,  # Optional[torch.Tensor] or List[torch.Tensor]
     a2_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
     sort_block_m: int = 0,
@@ -979,9 +1059,21 @@ def flydsl_moe_stage2(
     """
 
     token_num = inter_states.shape[0]
-    E = w2.shape[0]
-    model_dim = w2.shape[1]
+    # Normalize w2 to list for multi-B support
+    w2_list = list(w2) if isinstance(w2, (list, tuple)) else [w2]
+    w2_scale_list = list(w2_scale) if isinstance(w2_scale, (list, tuple)) else ([w2_scale] if w2_scale is not None else [None])
+    _num_b_tensors = len(w2_list)
+    E = sum(w.shape[0] for w in w2_list)
+    model_dim = w2_list[0].shape[1]
     inter_dim = inter_states.shape[2]
+    # Compute b_tensor_l_offsets
+    _offsets = [0]
+    for w in w2_list:
+        _offsets.append(_offsets[-1] + w.shape[0])
+    _big = 1073741824
+    while len(_offsets) < 9:
+        _offsets.append(_big)
+    _b_tensor_l_offsets = tuple(_offsets)
 
     accumulate = mode != "reduce"
 
@@ -1001,9 +1093,13 @@ def flydsl_moe_stage2(
     flat_a_scale = (
         a2_scale.view(-1) if a2_scale is not None else torch.empty(0, device=dev)
     )
+    # For multi-B: flatten the first partition's scale
+    _w2_scale_0 = w2_scale_list[0] if w2_scale_list else None
     flat_w_scale = (
-        w2_scale.view(-1) if w2_scale is not None else torch.empty(0, device=dev)
+        _w2_scale_0.view(-1) if _w2_scale_0 is not None else torch.empty(0, device=dev)
     )
+    # Extra weight scales for partitions 1..N-1
+    _w_scale_extra = [s.view(-1) for s in w2_scale_list[1:]] if len(w2_scale_list) > 1 else None
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -1038,11 +1134,14 @@ def flydsl_moe_stage2(
             dtype=out.dtype,
         )
 
+    # Multi-B: prepare extra weight tensors for stage2
+    _w_extra = [w.view(-1) for w in w2_list[1:]] if _num_b_tensors > 1 else None
+
     if is_fp4:
         args = _s2_args_fp4(
             target,
             inter_states,
-            w2,
+            w2_list[0],
             flat_a_scale,
             flat_w_scale,
             sorted_token_ids,
@@ -1055,12 +1154,14 @@ def flydsl_moe_stage2(
             m_blocks,
             dev,
             bias=bias,
+            w_extra=_w_extra,
+            w_scale_extra=_w_scale_extra,
         )
     else:
         args = _s2_args_std(
             target,
             inter_states,
-            w2,
+            w2_list[0],
             flat_a_scale,
             flat_w_scale,
             sorted_token_ids,
@@ -1093,6 +1194,8 @@ def flydsl_moe_stage2(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        num_b_tensors=_num_b_tensors,
+        b_tensor_l_offsets=_b_tensor_l_offsets,
     )
     _run_compiled(exe, args)
 

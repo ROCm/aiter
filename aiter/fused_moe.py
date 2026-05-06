@@ -116,6 +116,193 @@ def get_inter_dim(w1_shape, w2_shape):
     return E, model_dim, inter_dim
 
 
+def _fused_moe_multi_b(
+    hidden_states,
+    w1_list,  # list of [E_i, inter_dim*2, dim] tensors
+    w2_list,  # list of [E_i, dim, inter_dim] tensors
+    topk_weight,
+    topk_ids,
+    activation=ActivationType.Silu,
+    quant_type=QuantType.No,
+    doweight_stage1=False,
+    w1_scale=None,
+    w2_scale=None,
+    a1_scale=None,
+    a2_scale=None,
+    block_size_M=-1,
+    num_local_tokens=None,
+    moe_sorting_dispatch_policy=0,
+    dtype=None,
+    hidden_pad=0,
+    intermediate_pad=0,
+    bias1=None,
+    bias2=None,
+):
+    """Multi-B fused MOE: weight tensors are split across multiple buffers.
+    Uses FlyDSL kernels which support multiple buffer resources.
+    """
+    from aiter.ops.flydsl.utils import is_flydsl_available
+    from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+    assert is_flydsl_available(), "Multi-B fused_moe requires FlyDSL"
+
+    assert len(w1_list) <= 8, f"Multi-B fused_moe supports max 8 partitions, got {len(w1_list)}"
+    M, topk = topk_ids.shape
+    _w1_ref = w1_list[0]
+    _w2_ref = w2_list[0]
+    E = sum(t.shape[0] for t in w1_list)
+    _, model_dim_w2, inter_dim = _w2_ref.shape
+
+    # For fp4x2 packed weights, w1 last dim is model_dim//2, w2 dim1 is true model_dim
+    int4_war = model_dim_w2 // _w1_ref.shape[-1]
+    inter_dim *= int4_war
+    model_dim = model_dim_w2  # Use w2's dim1 as the true model_dim
+
+    isG1U1 = inter_dim != _w1_ref.shape[1]
+
+    dtype = hidden_states.dtype if dtype is None else dtype
+    quant_type_val = quant_remap.get(quant_type, quant_type)
+    q_dtype_w = _w1_ref.dtype
+    q_dtype_a = _w1_ref.dtype if _w1_ref.dtype != torch.uint32 else dtypes.fp8
+
+    if (
+        quant_type_val == QuantType.per_1x128
+        and hidden_states.dtype == dtypes.fp8
+        and a1_scale is not None
+    ):
+        q_dtype_a = dtypes.fp8
+    elif quant_type_val == QuantType.per_1x32:
+        # Multi-B always uses fp4x2 activation (native MXFP4 FlyDSL path)
+        q_dtype_a = dtypes.fp4x2
+
+    # Construct FlyDSL metadata for multi-B (only FlyDSL supports multi-buffer)
+    _dtype_map = {
+        dtypes.fp4x2: "fp4",
+        dtypes.bf16: "fp16",  # FlyDSL uses fp16 for both bf16/fp16 activations
+        dtypes.fp16: "fp16",
+        dtypes.fp8: "fp8",
+    }
+    _a_str = _dtype_map.get(q_dtype_a, "fp16")
+    _b_str = _dtype_map.get(q_dtype_w, "fp4")
+    _out_str = "bf16" if dtype == dtypes.bf16 else "f16"
+
+    # Default tile sizes for FlyDSL multi-B
+    _tile_m = 32
+    _tile_k = 256
+    # tile_n depends on activation dtype
+    if _a_str == "fp4":
+        _tile_n_s1 = 32  # fp4 activations use smaller tiles
+    elif _a_str == "fp8":
+        _tile_n_s1 = 128  # fp8 activations
+    else:
+        _tile_n_s1 = 64  # fp16 activations
+    _tile_n_s2 = 128  # stage2 typically uses 128
+
+    _kn1 = flydsl_kernel_name(1, _a_str, _b_str, _out_str, _tile_m, _tile_n_s1, _tile_k)
+    # Use waves_per_eu=3 (w3) which is the well-tested param from tuned configs
+    _kn1 += "_w3"
+    # fp8 activation kernels require _gui suffix (gate-up interleaved)
+    if _a_str == "fp8":
+        _kn1 += "_gui"
+    # Add _fp4 suffix for fused output quantization (fp4 activations)
+    if _a_str == "fp4":
+        _kn1 += "_fp4"
+    _kn2 = flydsl_kernel_name(2, _a_str, _b_str, _out_str, _tile_m, _tile_n_s2, _tile_k, mode="atomic")
+
+    _block_m = _tile_m
+    _ksplit = 0
+
+    # Try tuned config first for better tile sizes
+    metadata = get_2stage_cfgs(
+        get_padded_M(M),
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        quant_type_val,
+        isG1U1,
+        activation,
+        doweight_stage1,
+        hidden_pad,
+        intermediate_pad,
+        getattr(_w1_ref, "is_shuffled", False),
+    )
+
+    # Check if tuned config already uses FlyDSL
+    _is_flydsl = (
+        hasattr(metadata.stage1, 'func')
+        and metadata.stage1.func is _flydsl_stage1_wrapper
+    )
+
+    if not _is_flydsl:
+        # Force FlyDSL for multi-B
+        _fq = "fp4" if _a_str == "fp4" else ""
+        metadata = MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=_kn1,
+                activation=activation,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=_kn2,
+            ),
+            _block_m,
+            _ksplit,
+            False,
+            has_bias=False,
+            fuse_quant=_fq,
+        )
+
+    block_size_M_val = metadata.block_m if block_size_M in (None, -1) else block_size_M
+    if block_size_M_val is not None:
+        block_size_M_val = int(block_size_M_val)
+
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+        topk_ids,
+        topk_weight,
+        E,
+        model_dim,
+        dtype,
+        block_size_M_val,
+        None,  # expert_mask not supported for multi-B
+        num_local_tokens,
+        moe_sorting_dispatch_policy,
+    )
+
+    return fused_moe_2stages(
+        hidden_states,
+        w1_list,
+        w2_list,
+        topk,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        isG1U1,
+        block_size_M_val,
+        activation=activation,
+        quant_type=quant_type_val,
+        doweight_stage1=doweight_stage1,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        num_local_tokens=num_local_tokens,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        _metadata=metadata,
+    )
+
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -145,6 +332,32 @@ def fused_moe(
 ):
     if not block_size_M:
         block_size_M = -1
+
+    # Multi-B dispatch: when w1 is a list of tensors, route to multi-B path
+    if isinstance(w1, (list, tuple)):
+        return _fused_moe_multi_b(
+            hidden_states=hidden_states,
+            w1_list=w1,
+            w2_list=w2,
+            topk_weight=topk_weight,
+            topk_ids=topk_ids,
+            activation=activation,
+            quant_type=quant_type,
+            doweight_stage1=doweight_stage1,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_size_M=block_size_M,
+            num_local_tokens=num_local_tokens,
+            moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+            dtype=dtype,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            bias1=bias1,
+            bias2=bias2,
+        )
+
     return fused_moe_(
         hidden_states=hidden_states,
         w1=w1,
@@ -660,6 +873,9 @@ def _flydsl_stage1_wrapper(
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
     _a_scale_one = parsed.get("a_scale_one", False)
+    # For fp16/bf16 activations, no per-element scale is needed
+    if parsed["a_dtype"] in ("fp16", "bf16"):
+        _a_scale_one = True
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
         w1=w1,
@@ -1209,34 +1425,43 @@ def fused_moe_2stages(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
+    _metadata=None,
 ):
     quant_func = get_quant(quant_type)
     token_num, _ = hidden_states.shape
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    # Support multi-B: w1/w2 can be list of tensors
+    _w1_ref = w1[0] if isinstance(w1, (list, tuple)) else w1
+    _w2_ref = w2[0] if isinstance(w2, (list, tuple)) else w2
+    E, model_dim, inter_dim = get_inter_dim(_w1_ref.shape, _w2_ref.shape)
+    if isinstance(w1, (list, tuple)):
+        E = sum(t.shape[0] for t in w1)
     dtype = moe_out.dtype
     device = hidden_states.device
-    is_shuffled = getattr(w1, "is_shuffled", False)
-    metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
-        model_dim,
-        inter_dim,
-        E,
-        topk,
-        dtype,
-        q_dtype_a,
-        q_dtype_w,
-        quant_type,
-        isG1U1,
-        activation,
-        doweight_stage1,
-        hidden_pad,
-        intermediate_pad,
-        is_shuffled,
-    )
+    is_shuffled = getattr(_w1_ref, "is_shuffled", False)
+    if _metadata is not None:
+        metadata = _metadata
+    else:
+        metadata = get_2stage_cfgs(
+            get_padded_M(token_num),  # consider token_num > 1024 as prefill
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            quant_type,
+            isG1U1,
+            activation,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            is_shuffled,
+        )
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
-        and w1.dtype == dtypes.fp4x2
+        and _w1_ref.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
@@ -1249,7 +1474,7 @@ def fused_moe_2stages(
         quant_type == aiter.QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
-        and w1.dtype == dtypes.fp4x2
+        and _w1_ref.dtype == dtypes.fp4x2
         and activation == aiter.ActivationType.Swiglu
     ):
         a1 = hidden_states.to(dtypes.fp8)
@@ -1337,7 +1562,9 @@ def fused_moe_2stages(
         block_m=block_size_M,
         a1_scale=a1_scale,
         w1_scale=(
-            w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
+            [s.view(dtypes.fp8_e8m0) for s in w1_scale] if isinstance(w1_scale, (list, tuple))
+            else (w1_scale.view(dtypes.fp8_e8m0) if _w1_ref.dtype == dtypes.fp4x2 else w1_scale)
+            if w1_scale is not None else None
         ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
@@ -1357,7 +1584,7 @@ def fused_moe_2stages(
     elif (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
-        and w1.dtype == dtypes.fp4x2
+        and _w1_ref.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
@@ -1369,7 +1596,7 @@ def fused_moe_2stages(
         quant_type == aiter.QuantType.per_1x32
         and dtype in [dtypes.bf16]
         and q_dtype_a == dtypes.fp8
-        and w1.dtype == dtypes.fp4x2
+        and _w1_ref.dtype == dtypes.fp4x2
         and activation == aiter.ActivationType.Swiglu
     ):
         a2 = a2.to(dtypes.fp8)
@@ -1418,7 +1645,9 @@ def fused_moe_2stages(
         moe_out,
         topk,
         w2_scale=(
-            w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
+            [s.view(dtypes.fp8_e8m0) for s in w2_scale] if isinstance(w2_scale, (list, tuple))
+            else (w2_scale.view(dtypes.fp8_e8m0) if _w2_ref.dtype == dtypes.fp4x2 else w2_scale)
+            if w2_scale is not None else None
         ),
         a2_scale=a2_scale,
         block_m=block_size_M,
