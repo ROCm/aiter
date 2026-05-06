@@ -922,8 +922,12 @@ def get_2stage_cfgs(
         # kernel. For preshuffle_off, also force the V3 stage2 kernel by name.
         # Note: blockscale (per_1x128/per_1x32) dispatch only supports block_m<=64
         # and is not affected by the V1 bug, so exclude it from this override.
-        if not run_1stage and inter_dim > 192 and get_gfx() == "gfx950" \
-                and q_type not in (QuantType.per_1x128, QuantType.per_1x32):
+        if (
+            not run_1stage
+            and inter_dim > 192
+            and get_gfx() == "gfx950"
+            and q_type not in (QuantType.per_1x128, QuantType.per_1x32)
+        ):
             block_m = 128
             if not is_shuffled and not kernelName2:
                 kernelName2 = "moe_ck2stages_gemm2_256x128x128x64_1x4_TypeCast_v3_Nswizzle0_Quant0_MulRoutedWeight1_B16_B16_B16"
@@ -1470,7 +1474,9 @@ def apply_act_and_mul(out, act_input, activation=ActivationType.No):
     else:
         inter_dim = act_input.shape[-1] // 2
         torch_act = aiter.get_torch_act(activation)
-        out.copy_(torch_moe_act(act_input, torch_act, inter_dim, activation).to(out.dtype))
+        out.copy_(
+            torch_moe_act(act_input, torch_act, inter_dim, activation).to(out.dtype)
+        )
     return out
 
 

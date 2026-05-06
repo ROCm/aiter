@@ -81,7 +81,9 @@ def _normalize_activation(activation: str) -> str:
     return _normalize_enum_str(activation)
 
 
-def _infer_preshuffle_modes(b_dtype: str, quant_type: str, activation: str = "") -> List[bool]:
+def _infer_preshuffle_modes(
+    b_dtype: str, quant_type: str, activation: str = ""
+) -> List[bool]:
     """Infer preshuffle modes based on runtime behavior.
 
     - fp4x2: may or may not be pre-shuffled -> both off and on
