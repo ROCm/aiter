@@ -8,10 +8,24 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      benchmark_mode:
+        description: Benchmark suite to run for manual dispatch
+        required: false
+        default: standard
+        type: choice
+        options:
+          - standard
+          - kimi_serve
+          - all
       docker_image:
         description: Base Docker image to benchmark against (supports private images)
         required: false
         default: rocm/vllm-dev:nightly
+        type: string
+      kimi_host_hf_hub_cache:
+        description: Optional host HuggingFace cache path for manual Kimi runs
+        required: false
+        default: ""
         type: string
 
 concurrency:
@@ -31,10 +45,13 @@ env:
 jobs:
   check-signal:
     if: >-
-      github.event_name != 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.benchmark_mode != 'kimi_serve') ||
+      (github.event_name != 'workflow_dispatch' &&
+      (github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -49,10 +66,13 @@ jobs:
   build_aiter_wheel:
     name: Build Aiter wheel
     if: >-
-      github.event_name != 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.benchmark_mode != 'kimi_serve') ||
+      (github.event_name != 'workflow_dispatch' &&
+      (github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))))
     needs: check-signal
     runs-on: build-only-aiter
     steps:
@@ -125,10 +145,13 @@ jobs:
     name: vLLM Benchmark (8 GPU)
     timeout-minutes: 60
     if: >-
-      github.event_name != 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.benchmark_mode != 'kimi_serve') ||
+      (github.event_name != 'workflow_dispatch' &&
+      (github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))))
     needs: build_aiter_wheel
     runs-on: linux-aiter-mi300x-8
     strategy:
@@ -145,11 +168,6 @@ jobs:
             tp: 8
             extra_args: --block-size 1
             extra_env_args: ""
-          - model: moonshotai/Kimi-K2.5
-            kv_cache_dtype: default_kvcache
-            tp: 8
-            extra_args: --block-size 1 --trust-remote-code
-            extra_env_args: -e VLLM_USE_TRITON_FLASH_ATTN=0
 
     steps:
       - name: Checkout benchmark helpers
@@ -290,15 +308,216 @@ jobs:
         run: |
           docker rmi ${{ env.BASE_IMAGE }} || true
 
+  vllm_kimi_serve_benchmark:
+    name: vLLM Kimi Serve Benchmark (4 GPU)
+    timeout-minutes: 240
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (github.event.inputs.benchmark_mode == 'kimi_serve' ||
+      github.event.inputs.benchmark_mode == 'all')
+    runs-on: linux-aiter-mi300x-8
+    steps:
+      - name: Checkout benchmark helpers
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          sparse-checkout: |
+            .github/scripts
+
+      - name: Docker login
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
+      - name: Prepare Kimi benchmark directories
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark_results/kimi_serve
+
+      - name: Download the vLLM base image
+        run: |
+          bash .github/scripts/docker_pull_with_retry.sh "${{ env.BASE_IMAGE }}"
+
+      - name: Start Kimi serve container
+        env:
+          KIMI_CONTAINER_NAME: vllm-kimi-tp4
+          KIMI_HOST_HF_HUB_CACHE: ${{ github.event.inputs.kimi_host_hf_hub_cache }}
+        run: |
+          set -euxo pipefail
+          docker rm -f "${KIMI_CONTAINER_NAME}" || true
+
+          docker_args=(
+            --rm
+            -d
+            --name "${KIMI_CONTAINER_NAME}"
+            -e VLLM_ROCM_USE_AITER=1
+            -e VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4
+            -e VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1
+            -e VLLM_ROCM_USE_AITER_FUSED_AR_RMSNORM=1
+            -e VLLM_ROCM_AITER_FUSED_MLA_DECODE=1
+            -e HIP_VISIBLE_DEVICES=4,5,6,7
+            -e HF_HUB_CACHE=/root/.cache/huggingface/hub
+            -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }}
+            --entrypoint ""
+            --network host
+            --ipc host
+            --device /dev/dri:/dev/dri
+            --device /dev/kfd:/dev/kfd
+            --group-add video
+            --security-opt apparmor=unconfined
+            --security-opt seccomp=unconfined
+            --shm-size 128G
+            -v "${{ github.workspace }}/benchmark_results:/benchmark_results"
+          )
+
+          if [ -n "${KIMI_HOST_HF_HUB_CACHE}" ]; then
+            if [ -d "${KIMI_HOST_HF_HUB_CACHE}" ]; then
+              echo "Using host HF hub cache: ${KIMI_HOST_HF_HUB_CACHE}"
+              docker_args+=(-v "${KIMI_HOST_HF_HUB_CACHE}:/root/.cache/huggingface/hub")
+            else
+              echo "Warning: host HF hub cache path not found: ${KIMI_HOST_HF_HUB_CACHE}"
+            fi
+          fi
+
+          docker run "${docker_args[@]}" "${{ env.BASE_IMAGE }}" \
+            vllm serve amd/Kimi-K2.5-MXFP4 \
+              --port 8006 \
+              --tensor-parallel-size 4 \
+              --max-model-len 14976 \
+              --max-num-batched-tokens 16384 \
+              --gpu-memory-utilization 0.95 \
+              --kv-cache-dtype fp8 \
+              --no-enable-prefix-caching \
+              --trust-remote-code
+
+      - name: Run Kimi serve benchmark sweep
+        env:
+          KIMI_CONTAINER_NAME: vllm-kimi-tp4
+          PORT: "8006"
+          MODEL: amd/Kimi-K2.5-MXFP4
+          RESULTS: /benchmark_results/kimi_serve
+          BASE_IMAGE_VALUE: ${{ env.BASE_IMAGE }}
+        run: |
+          set -euxo pipefail
+          docker exec \
+            -e PORT="${PORT}" \
+            -e MODEL="${MODEL}" \
+            -e RESULTS="${RESULTS}" \
+            -e BASE_IMAGE="${BASE_IMAGE_VALUE}" \
+            "${KIMI_CONTAINER_NAME}" bash -lc '
+          mkdir -p "${RESULTS}"
+          sweep=(
+            "1000 100 4 1 4 32"
+            "5000 500 4 3 4 32"
+            "10000 1000 4 2 4 32"
+            "1000 100 8 4 8 64"
+            "5000 500 8 6 8 64"
+            "10000 1000 8 5 8 64"
+            "1000 100 16 7 16 96"
+            "5000 500 16 9 16 96"
+            "10000 1000 16 8 16 96"
+            "1000 100 32 10 32 128"
+            "5000 500 32 12 32 128"
+            "10000 1000 32 11 32 128"
+            "1000 100 64 13 64 256"
+            "5000 500 64 15 64 256"
+            "10000 1000 64 14 64 256"
+            "1000 100 128 16 128 384"
+            "5000 500 128 18 128 384"
+            "10000 1000 128 17 128 384"
+            "1000 100 256 19 256 768"
+            "5000 500 256 21 256 768"
+            "10000 1000 256 20 256 768"
+            "1000 100 512 22 512 1536"
+            "5000 500 512 24 512 1536"
+            "10000 1000 512 23 512 1536"
+          )
+          for row in "${sweep[@]}"; do
+            read isl osl conc seed warm np <<<"${row}"
+            out="${RESULTS}/isl${isl}_osl${osl}_c${conc}.json"
+            echo "=== ISL=${isl} OSL=${osl} conc=${conc} np=${np} warm=${warm} seed=${seed} ==="
+            vllm bench serve \
+              --backend vllm \
+              --host 127.0.0.1 --port "${PORT}" \
+              --model "${MODEL}" \
+              --dataset-name random \
+              --random-input-len "${isl}" \
+              --random-output-len "${osl}" \
+              --max-concurrency "${conc}" \
+              --num-prompts "${np}" \
+              --num-warmups "${warm}" \
+              --seed "${seed}" \
+              --ignore-eos \
+              --trust-remote-code \
+              --percentile-metrics ttft,tpot,itl,e2el \
+              --ready-check-timeout-sec 7200 \
+              --metadata sweep_input_len="${isl}" sweep_output_len="${osl}" seed="${seed}" num_warmups="${warm}" \
+              --save-result \
+              --result-filename "${out}"
+          done
+          '
+
+      - name: Collect Kimi serve logs
+        if: always()
+        env:
+          KIMI_CONTAINER_NAME: vllm-kimi-tp4
+        run: |
+          mkdir -p benchmark_results
+          docker logs "${KIMI_CONTAINER_NAME}" > benchmark_results/kimi_serve_server.log 2>&1 || true
+
+      - name: Build Kimi serve benchmark summary
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/vllm_benchmark_summary.py serve \
+              --input-dir benchmark_results/kimi_serve \
+              --output-csv benchmark_results/kimi_serve_summary.csv \
+              --base-image "${{ env.BASE_IMAGE }}" \
+              --model "amd/Kimi-K2.5-MXFP4"
+
+      - name: Ensure benchmark artifacts exist
+        if: always()
+        run: |
+          mkdir -p benchmark_results
+          if ! compgen -G "benchmark_results/*" > /dev/null; then
+            echo "No benchmark output was generated." > benchmark_results/README.txt
+          fi
+
+      - name: Upload Kimi benchmark output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-kimi-serve-benchmark
+          path: benchmark_results/
+          retention-days: 7
+
+      - name: Clean up
+        if: always()
+        env:
+          KIMI_CONTAINER_NAME: vllm-kimi-tp4
+        run: |
+          docker rm -f "${KIMI_CONTAINER_NAME}" || true
+          docker rmi "${{ env.BASE_IMAGE }}" || true
+
   collect_vllm_benchmark_summary:
     name: Collect vLLM Benchmark Summary
     if: >-
       always() &&
-      needs.vllm_benchmark.result != 'skipped' &&
-      (github.event_name != 'pull_request' ||
-      (github.event.pull_request.draft == false &&
-      (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all'))))
+      needs.vllm_benchmark.result != 'skipped'
     needs: [vllm_benchmark]
     runs-on: ubuntu-latest
     steps:
