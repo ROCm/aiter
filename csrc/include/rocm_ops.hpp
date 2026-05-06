@@ -1143,13 +1143,22 @@ namespace py = pybind11;
           "that it is divisible by the block size.");                          \
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
-#define MOE_TOPK_PYBIND             \
-    m.def("topk_sigmoid",           \
-          &aiter::topk_sigmoid,     \
-          py::arg("topk_weights"),  \
-          py::arg("topk_indices"),  \
-          py::arg("gating_output"), \
-          "Apply topk sigmoid to the gating outputs.");
+#define MOE_TOPK_PYBIND                                  \
+    m.def("topk_sigmoid",                                \
+          &aiter::topk_sigmoid,                          \
+          py::arg("topk_weights"),                       \
+          py::arg("topk_indices"),                       \
+          py::arg("gating_output"),                      \
+          "Apply topk sigmoid to the gating outputs.");  \
+    m.def("topk_softplus",                               \
+          &aiter::topk_softplus,                         \
+          py::arg("topk_weights"),                       \
+          py::arg("topk_indices"),                       \
+          py::arg("gating_output"),                      \
+          py::arg("correction_bias"),                    \
+          py::arg("need_renorm"),                        \
+          py::arg("routed_scaling_factor") = 1.0,        \
+          "Apply topk sqrtsoftplus to the gating outputs.");
 
 #define MOE_SORTING_PYBIND                             \
     m.def("moe_sorting_fwd",                           \
