@@ -2100,6 +2100,10 @@ def _flash_attn_varlen_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and logits_soft_cap == 0.0
+        # FP8 varlen (group-mode) ASM for gfx950 will be added later; for
+        # now route those calls through CK. gfx942 still has its own ASM
+        # group kernels and must keep using them.
+        ret = ret and not (is_fmha_v3_fp8() and get_gfx() == "gfx950")
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
