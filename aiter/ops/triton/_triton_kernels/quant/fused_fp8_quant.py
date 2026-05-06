@@ -262,7 +262,7 @@ def _fused_rms_fp8_group_quant_kernel(
         for g in range(NUM_GROUPS_GATED):
             col0 = g * GROUP_SIZE_GATED
             cols = tl.arange(0, BLOCK_G) + col0
-            col_mask = cols < N
+            col_mask = (cols < N) & (cols < col0 + GROUP_SIZE_GATED)
             mask_g = row_mask_1d[:, None] & col_mask[None, :]
             row_offsets = rows[:, None] * stride_x_row
             col_offsets = cols[None, :]
@@ -281,7 +281,7 @@ def _fused_rms_fp8_group_quant_kernel(
 
             x_hat = x_el * rstd[:, None]
 
-            w_mask = cols < N
+            w_mask = col_mask
             w_el = tl.load(W + cols, mask=w_mask, other=0.0).to(tl.float32)
             if HAS_BIAS_GATED:
                 b_el = tl.load(Bptr + cols, mask=w_mask, other=0.0).to(tl.float32)
