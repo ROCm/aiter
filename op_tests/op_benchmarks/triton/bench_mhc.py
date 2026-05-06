@@ -137,18 +137,15 @@ def get_benchmark_configs(args):
 def _compute_metrics(
     operation: str,
     M: int,
-    n: int | None = None,
-    C: int | None = None,
+    n: int,
+    C: int,
     sinkhorn_iters: int | None = None,
-    hc_mult: int | None = None,
-    hidden_size: int | None = None,
     elem_bytes: int | None = None,
 ) -> tuple[float, int]:
     """Analytic FLOPs and memory traffic; returns ``(flops, bytes)``.
 
     For ``operation == "e2e"`` the pre and post stages are accumulated
-    in-place using ``hc_mult = n`` and ``hidden_size = C`` (callers don't
-    pass them twice). ``elem_bytes`` defaults to 2 (bf16/fp16) when omitted.
+    in-place. ``elem_bytes`` defaults to 2 (bf16/fp16) when omitted.
     """
     if operation not in ("pre", "post", "e2e"):
         raise ValueError(f"Unsupported operation: {operation!r}")
@@ -185,20 +182,18 @@ def _compute_metrics(
         )
 
     if operation in ("post", "e2e"):
-        # out[m, j, c] = post_mix[m, j] * x[m, c]
-        #              + sum_h comb_mix[m, h, j] * residual[m, h, c]
-        # 2 * post_hc_mult * (post_hc_mult+1) FLOPs per (m, c) under the
-        # GEMV "2 FLOPs per MAC" convention.
-        post_hc_mult = n if operation == "e2e" else hc_mult
-        post_hidden = C if operation == "e2e" else hidden_size
+        # out[M, j, c] = post_mix[M, j] * layer_input[M, c]
+        #              + sum_h comb_mix[M, h, j] * residual[M, h, c]
+        # 2 * n * (n+1) FLOPs per (M, c) under the GEMV "2 FLOPs per MAC"
+        # convention.
         mix_bytes = 4  # fp32 mixes
-        total_flops += 2.0 * M * post_hc_mult * (post_hc_mult + 1) * post_hidden
+        total_flops += 2.0 * M * n * (n + 1) * C
         total_memory += (
-            M * post_hidden * elem_size  # read x
-            + M * post_hc_mult * post_hidden * elem_size  # read residual
-            + M * post_hc_mult * mix_bytes  # read post_layer_mix
-            + M * post_hc_mult * post_hc_mult * mix_bytes  # read comb_res_mix
-            + M * post_hc_mult * post_hidden * elem_size  # write out
+            M * C * elem_size  # read layer_input
+            + M * n * C * elem_size  # read residual
+            + M * n * mix_bytes  # read post_mix
+            + M * n * n * mix_bytes  # read comb_mix
+            + M * n * C * elem_size  # write out
         )
 
     return float(total_flops), int(total_memory)
@@ -247,8 +242,7 @@ class _MhcHandler:
         "post": ["M", "C"],
         "e2e": ["M", "n", "C"],
     }
-    HC_MULT = 4  # post hardcodes n=4 (enforced in parse_args; HIP also requires n=4).
-
+    POST_N = 4  
     def __init__(self, op: str):
         self.op = op
         self.name = op
@@ -275,7 +269,7 @@ class _MhcHandler:
     ) -> dict[str, Any]:
         op = self.op
         M = params["M"]
-        n = self.HC_MULT if op == "post" else params["n"]
+        n = self.POST_N if op == "post" else params["n"]
         C = params["C"]
         sinkhorn_iters = args.sinkhorn_iters
         if op == "post":
@@ -291,8 +285,6 @@ class _MhcHandler:
             n=n,
             C=C,
             sinkhorn_iters=sinkhorn_iters,
-            hc_mult=n if op == "post" else None,
-            hidden_size=C if op == "post" else None,
             elem_bytes=x.element_size(),
         )
 
@@ -667,8 +659,8 @@ def parse_args() -> argparse.Namespace:
     if args.op == "post" and args.n is not None and args.n != 4:
         parser.error(
             f"--op post requires n == 4 (got -n {args.n}). "
-            "Both the Triton mhc_post wrapper and aiter.mhc_post hardcode "
-            "hc_mult == 4."
+            "The post bench config pins n=4 to match aiter.mhc_post, which "
+            "hardcodes hc_mult == 4 via TORCH_CHECK."
         )
 
     return args
