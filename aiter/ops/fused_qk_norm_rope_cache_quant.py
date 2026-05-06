@@ -7,8 +7,11 @@ from ..jit.core import compile_ops
 from typing import Optional
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
-def fused_qk_norm_rope_cache_quant_shuffle(
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="fused_qk_norm_rope_cache_quant_shuffle",
+)
+def _fused_qk_norm_rope_cache_quant_shuffle_hip(
     qkv: Tensor,
     num_heads_q: int,
     num_heads_k: int,
@@ -26,7 +29,95 @@ def fused_qk_norm_rope_cache_quant_shuffle(
     kv_cache_dtype: str,
     k_scale: Tensor,
     v_scale: Tensor,
+    q: Optional[Tensor] = None,
+    k: Optional[Tensor] = None,
+    v: Optional[Tensor] = None,
 ) -> None: ...
+
+
+def fused_qk_norm_rope_cache_quant_shuffle(
+    qkv: Optional[Tensor] = None,
+    *,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    qw: Tensor,
+    kw: Tensor,
+    cos_sin_cache: Tensor,
+    is_neox_style: bool,
+    pos_ids: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    slot_mapping: Tensor,
+    kv_cache_dtype: str,
+    k_scale: Tensor,
+    v_scale: Tensor,
+    q: Optional[Tensor] = None,
+    k: Optional[Tensor] = None,
+    v: Optional[Tensor] = None,
+) -> None:
+    if q is None:
+        if qkv is None or qkv.numel() == 0:
+            raise TypeError(
+                "fused_qk_norm_rope_cache_quant_shuffle: non-empty `qkv` is required when "
+                "`q`, `k`, `v` are not all passed."
+            )
+        _fused_qk_norm_rope_cache_quant_shuffle_hip(
+            qkv,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_dim,
+            eps,
+            qw,
+            kw,
+            cos_sin_cache,
+            is_neox_style,
+            pos_ids,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            None,
+            None,
+            None,
+        )
+        return
+    if k is None or v is None:
+        raise TypeError(
+            "fused_qk_norm_rope_cache_quant_shuffle: q, k, v must be provided together."
+        )
+    qkv_hip: Tensor = (
+        qkv
+        if qkv is not None and qkv.numel() > 0
+        else torch.empty((0, 0), device=q.device, dtype=q.dtype)
+    )
+    _fused_qk_norm_rope_cache_quant_shuffle_hip(
+        qkv_hip,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        qw,
+        kw,
+        cos_sin_cache,
+        is_neox_style,
+        pos_ids,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        q,
+        k,
+        v,
+    )
 
 
 def gen_fused_qk_rmsnorm_fake_tensor(
