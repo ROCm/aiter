@@ -50,21 +50,45 @@ def _moe_sorting_impl(
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
-    fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
-    fwd_fn(
-        topk_ids,
-        topk_weights,
-        sorted_ids,
-        sorted_weights,
-        sorted_expert_ids,
-        num_valid_ids,
-        moe_buf,
-        num_experts,
-        int(block_size),
-        expert_mask,
-        num_local_tokens,
-        dispatch_policy,
-    )
+    if use_opus:
+        ws_size = aiter.moe_sorting_opus_get_workspace_size(
+            M, num_experts, topk, dispatch_policy
+        )
+        workspace = (
+            torch.empty(ws_size, dtype=torch.uint8, device=device)
+            if ws_size > 0
+            else None
+        )
+        aiter.moe_sorting_opus_fwd(
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            num_experts,
+            int(block_size),
+            expert_mask,
+            num_local_tokens,
+            workspace,
+            dispatch_policy,
+        )
+    else:
+        aiter.moe_sorting_fwd(
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            num_experts,
+            int(block_size),
+            expert_mask,
+            num_local_tokens,
+            dispatch_policy,
+        )
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
