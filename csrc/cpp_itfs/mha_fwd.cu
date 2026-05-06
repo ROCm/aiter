@@ -317,8 +317,10 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.hdim_v,
                        a.nhead_q,
                        a.nhead_k,
-                       0, // num_head_q_total
-                       0, // head_start
+                       // NOTE: ``num_head_q_total`` and ``head_start`` were removed from
+                       // ``fmha_fwd_args`` after the CK submodule bump on this branch
+                       // (see ``3rdparty/composable_kernel`` HEAD); ``scale_s`` follows
+                       // ``nhead_k`` directly in the struct now.
                        a.scale_s,
                        a.logits_soft_cap,
                        a.stride_q,
