@@ -67,6 +67,7 @@ arg_to_torch_dtype = {
     "fp32": torch.float32,
 }
 
+
 class Metric(enum.Enum):
     """Benchmark output metrics; ``value`` matches the perf_report column header."""
 
@@ -209,9 +210,7 @@ def _get_benchmark_config(args, operation):
     if args.metric == "all" or args.metric is None:
         metrics = [m.column_label for m in Metric]
     else:
-        metrics = [
-            _METRIC_BY_CLI.get(args.metric, Metric.THROUGHPUT).column_label
-        ]
+        metrics = [_METRIC_BY_CLI.get(args.metric, Metric.THROUGHPUT).column_label]
 
     backends = ["triton"] + (["hip"] if args.with_hip else [])
     if args.with_hip:
@@ -242,7 +241,8 @@ class _MhcHandler:
         "post": ["M", "C"],
         "e2e": ["M", "n", "C"],
     }
-    POST_N = 4  
+    POST_N = 4
+
     def __init__(self, op: str):
         self.op = op
         self.name = op
@@ -400,9 +400,7 @@ class _MhcHandler:
             "check_payload": check_payload,
         }
 
-    def correctness_check(
-        self, setup: dict[str, Any], params: dict[str, int]
-    ) -> None:
+    def correctness_check(self, setup: dict[str, Any], params: dict[str, int]) -> None:
         if setup["hip_fn"] is None:
             return
         op = self.op
