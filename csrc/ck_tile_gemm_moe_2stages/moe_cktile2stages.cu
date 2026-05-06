@@ -267,8 +267,8 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
                 "Out dtype only support BFloat16/Float16!");
     if(exp_bias.has_value())
     {
-        TORCH_CHECK(exp_bias.value().dtype() == Y.dtype(),
-                    "Bias dtype must match output dtype for CK-Tile MoE stage1.");
+        TORCH_CHECK(exp_bias.value().dtype() == at::ScalarType::Float,
+                    "CK-Tile MoE stage1 expects fp32 bias.");
     }
     if(x_scale.has_value() && w_scale.has_value())
     {
@@ -407,8 +407,8 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
                 "Out dtype only support BFloat16/Float16!");
     if(exp_bias.has_value())
     {
-        TORCH_CHECK(exp_bias.value().dtype() == Y.dtype(),
-                    "Bias dtype must match output dtype for CK-Tile MoE stage2.");
+        TORCH_CHECK(exp_bias.value().dtype() == at::ScalarType::Float,
+                    "CK-Tile MoE stage2 expects fp32 bias.");
     }
     int64_t token = XQ.size(0);
     int MPerBlock = block_m.has_value() ? block_m.value() : 32;

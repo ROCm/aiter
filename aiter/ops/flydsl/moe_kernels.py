@@ -299,7 +299,6 @@ def compile_flydsl_moe_stage1(
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     enable_bias: bool = False,
-    bias_dtype: str | None = None,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
 ):
@@ -329,7 +328,6 @@ def compile_flydsl_moe_stage1(
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
-            bias_dtype=bias_dtype,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
         )
@@ -446,14 +444,6 @@ def _view_safe(t: torch.Tensor) -> torch.Tensor:
         if t is not None and t.numel() > 0 and t.dtype not in _DLPACK_SAFE
         else t
     )
-
-
-def _normalize_bias_dtype(
-    bias: Optional[torch.Tensor], target_dtype: torch.dtype
-) -> Optional[torch.Tensor]:
-    if bias is None or bias.dtype == target_dtype:
-        return bias
-    return bias.to(target_dtype)
 
 
 def _s1_args_fp4(
@@ -644,7 +634,7 @@ def _get_compiled_silu_fused(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    bias_dtype: str = "bf16",
+    bias_dtype: str = "f32",
 ):
     """Compile and cache the fused gate activation + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
@@ -815,9 +805,9 @@ def flydsl_moe_stage1(
     # handles activation + quant + scale-sort after the GEMM completes.
     _gemm_out_dtype = _base_out_dtype if _is_splitk else out_dtype
 
+    if bias is not None and bias.dtype != torch.float32:
+        bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
-    kernel_bias_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
-    bias = _normalize_bias_dtype(bias, kernel_bias_dtype)
     kernel_bias = None if _is_splitk else bias
     is_fp4 = b_dtype == "fp4"
     _n_in = inter_dim * 2 if is_fp4 else inter_dim
@@ -885,7 +875,6 @@ def flydsl_moe_stage1(
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         enable_bias=(kernel_bias is not None),
-        bias_dtype=_base_out_dtype,
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
     )
@@ -912,7 +901,7 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
-            bias_dtype=_base_out_dtype,
+            bias_dtype="f32",
         )
         _run_compiled(
             _silu_fused_k,
@@ -937,7 +926,7 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
-            bias_dtype=_base_out_dtype,
+            bias_dtype="f32",
         )
         _run_compiled(
             _silu_fused_k,
@@ -960,7 +949,7 @@ def flydsl_moe_stage1(
             topk,
             act=act,
             enable_bias=use_splitk_bias,
-            bias_dtype=_base_out_dtype,
+            bias_dtype="f32",
         )
         _run_compiled(
             _silu_fused_k,
@@ -987,10 +976,11 @@ def flydsl_moe_stage1(
 
         post_input = tmp_out.view(-1, inter_dim * 2)
         post_out = out.view(-1, inter_dim)
+        post_bias = bias.contiguous() if bias is not None else None
         if bias is not None and act == "swiglu":
-            swiglu_and_mul_bias(post_out, post_input, topk_ids_arg, bias.contiguous())
+            swiglu_and_mul_bias(post_out, post_input, topk_ids_arg, post_bias)
         elif bias is not None and act == "silu":
-            silu_and_mul_bias(post_out, post_input, topk_ids_arg, bias.contiguous())
+            silu_and_mul_bias(post_out, post_input, topk_ids_arg, post_bias)
         elif act == "swiglu":
             swiglu_and_mul(post_out, post_input)
         else:
@@ -1099,6 +1089,8 @@ def flydsl_moe_stage2(
     if a_dtype == "fp8":
         _persist_m = 1
 
+    if bias is not None and bias.dtype != torch.float32:
+        bias = bias.to(torch.float32)
     is_fp4 = b_dtype == "fp4"
     _n_in = model_dim
     _k_in = inter_dim

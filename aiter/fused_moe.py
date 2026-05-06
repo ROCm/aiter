@@ -292,6 +292,7 @@ def fused_moe_(
         and a1_scale is not None
     ):
         q_dtype_a = dtypes.fp8
+    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_BOUND", "512"))
     if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
@@ -299,7 +300,6 @@ def fused_moe_(
         if activation == ActivationType.Swiglu and _USE_GENERIC_SWIGLU_MXFP4_LAYOUT:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
         elif activation == ActivationType.Swiglu:
-            bf16_fp8_bound = 256
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
             else:
@@ -678,11 +678,13 @@ def _needs_swiglu_bias_support(dtype, quant_type, activation):
 
 
 def _normalize_bias_for_kernel(
-    bias: Optional[torch.Tensor], target_dtype: torch.dtype
+    bias: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
-    if bias is None or bias.dtype == target_dtype:
+    if bias is None:
         return bias
-    return bias.to(target_dtype)
+    if bias.dtype != torch.float32:
+        raise TypeError(f"MoE bias must be fp32, got {bias.dtype}")
+    return bias
 
 
 def _flydsl_stage1_wrapper(
@@ -1146,6 +1148,83 @@ def get_2stage_cfgs(
             _ksplit,
             False,
         )
+    swiglu_mxfp4_flydsl = (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Swiglu
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+        and use_g1u1
+        and not doweight_stage1
+        and is_flydsl_available()
+    )
+    if swiglu_mxfp4_flydsl:
+        from aiter.ops.flydsl.moe_kernels import (
+            flydsl_kernel_name,
+            get_flydsl_kernel_params,
+        )
+
+        _out_str = "bf16" if dtype == dtypes.bf16 else "f16"
+        if token < 2048:
+            _tile_m = 32
+            _base_kn1 = flydsl_kernel_name(1, "fp4", "fp4", _out_str, 32, 128, 256)
+            _base_kn2 = flydsl_kernel_name(
+                2, "fp4", "fp4", _out_str, 32, 128, 256, "atomic"
+            )
+            kn1 = f"{_base_kn1}_w2"
+            kn2 = f"{_base_kn2}_bnt2"
+        elif token < 4096:
+            _tile_m = 64
+            _base_kn1 = flydsl_kernel_name(1, "fp4", "fp4", _out_str, 64, 128, 256)
+            _base_kn2 = flydsl_kernel_name(
+                2, "fp4", "fp4", _out_str, 64, 128, 256, "atomic"
+            )
+            kn1 = f"{_base_kn1}_w3_bnt0"
+            kn2 = _base_kn2
+        elif token < 16384:
+            _tile_m = 128
+            _base_kn1 = flydsl_kernel_name(1, "fp4", "fp4", _out_str, 128, 128, 256)
+            _base_kn2 = flydsl_kernel_name(
+                2, "fp4", "fp4", _out_str, 128, 128, 256, "atomic"
+            )
+            kn1 = f"{_base_kn1}_w2_bnt0"
+            kn2 = _base_kn2
+        else:
+            _tile_m = 64
+            _base_kn1 = flydsl_kernel_name(1, "fp4", "fp4", _out_str, 64, 128, 256)
+            _base_kn2 = flydsl_kernel_name(
+                2, "fp4", "fp4", _out_str, 64, 128, 256, "atomic"
+            )
+            kn1 = f"{_base_kn1}_w4_bnt0"
+            kn2 = _base_kn2
+
+        if get_flydsl_kernel_params(kn1) is None:
+            kn1 = _base_kn1
+        if get_flydsl_kernel_params(kn2) is None:
+            kn2 = _base_kn2
+
+        logger.warning(
+            f"[fused_moe] no tuned FlyDSL config for {keys}, "
+            f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
+        )
+        enable_bias = _needs_swiglu_bias_support(dtype, q_type, activation)
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kn1,
+                activation=activation,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kn2,
+            ),
+            _tile_m,
+            int(ksplit),
+            False,
+            has_bias=enable_bias,
+            stage2_has_bias=enable_bias,
+        )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
@@ -1170,6 +1249,9 @@ def get_2stage_cfgs(
                 activation=activation,
                 split_k=_split_k,
                 dtype=dtype,
+                post_activation_layout=(
+                    "standard" if swiglu_mxfp4_bf16_cktile else "auto"
+                ),
             ),
             functools.partial(
                 cktile_moe_stage2,
@@ -1394,11 +1476,11 @@ def fused_moe_2stages(
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:
-            extra_stage1_args["bias1"] = _normalize_bias_for_kernel(bias1, dtype)
+            extra_stage1_args["bias1"] = _normalize_bias_for_kernel(bias1)
             if stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1):
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
-            extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2, dtype)
+            extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     a2 = metadata.stage1(
         a1,
         w1,
@@ -1963,6 +2045,7 @@ def cktile_moe_stage1(
     split_k=1,
     dtype=torch.bfloat16,
     kernel_name="",
+    post_activation_layout="auto",
 ):
     token_num = hidden_states.shape[0]
     _, n1, k1 = w1.shape
@@ -1991,9 +2074,7 @@ def cktile_moe_stage1(
         )
     else:
         tmp_out = out
-    bias1 = _normalize_bias_for_kernel(
-        bias1, tmp_out.dtype if needs_post_activation else out.dtype
-    )
+    bias1 = _normalize_bias_for_kernel(bias1)
     # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
@@ -2017,23 +2098,71 @@ def cktile_moe_stage1(
 
     if needs_post_activation:
         valid_out = tmp_out[: token_num * topk, :]
-        if bias1 is not None and topk_ids is None:
-            raise ValueError("topk_ids are required for CK-Tile split-k bias handling")
-        expert_ids = topk_ids.view(-1) if topk_ids is not None else None
-        if bias1 is not None and activation == ActivationType.Silu:
-            aiter.silu_and_mul_bias(out, valid_out, expert_ids, bias1)
-        elif bias1 is not None and activation == ActivationType.Swiglu:
-            aiter.swiglu_and_mul_bias(out, valid_out, expert_ids, bias1)
-        elif activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, valid_out)
-        elif activation == ActivationType.Swiglu:
-            aiter.swiglu_and_mul(out, valid_out)
+        if post_activation_layout == "auto":
+            is_interleaved = (
+                hasattr(torch, "float4_e2m1fn_x2")
+                and w1.dtype == torch.float4_e2m1fn_x2
+            )
+        elif post_activation_layout == "interleaved":
+            is_interleaved = True
+        elif post_activation_layout == "standard":
+            is_interleaved = False
         else:
+            raise ValueError(
+                f"Unsupported CK-Tile post activation layout: {post_activation_layout}"
+            )
+
+        if is_interleaved:
             if bias1 is not None:
-                valid_out = valid_out + bias1[expert_ids.to(torch.long)].to(
-                    valid_out.dtype
+                raise ValueError("CK-Tile interleaved split-k bias is not supported")
+            inter_dim = out.shape[-1]
+            if activation == ActivationType.Swiglu:
+                from aiter.ops.flydsl.moe_kernels import (
+                    _get_compiled_swiglu,
+                    _run_compiled,
                 )
-            aiter.gelu_and_mul(out, valid_out)
+
+                _swiglu_fn = _get_compiled_swiglu(inter_dim)
+                num_rows = valid_out.view(-1, inter_dim * 2).shape[0]
+                _run_compiled(
+                    _swiglu_fn,
+                    (
+                        valid_out.view(-1, inter_dim * 2),
+                        out.view(-1, inter_dim),
+                        num_rows,
+                        torch.cuda.current_stream(),
+                    ),
+                )
+            else:
+                NLane = 16
+                N0 = inter_dim // NLane
+                flat = valid_out.view(-1, N0, 2, NLane)
+                gate = flat[:, :, 0, :].reshape(-1, inter_dim)
+                up = flat[:, :, 1, :].reshape(-1, inter_dim)
+                if activation == ActivationType.Gelu:
+                    out.view(-1, inter_dim).copy_(torch.nn.functional.gelu(gate) * up)
+                else:
+                    out.view(-1, inter_dim).copy_(torch.nn.functional.silu(gate) * up)
+        else:
+            if bias1 is not None and topk_ids is None:
+                raise ValueError(
+                    "topk_ids are required for CK-Tile split-k bias handling"
+                )
+            expert_ids = topk_ids.view(-1) if topk_ids is not None else None
+            if bias1 is not None and activation == ActivationType.Silu:
+                aiter.silu_and_mul_bias(out, valid_out, expert_ids, bias1)
+            elif bias1 is not None and activation == ActivationType.Swiglu:
+                aiter.swiglu_and_mul_bias(out, valid_out, expert_ids, bias1)
+            elif activation == ActivationType.Silu:
+                aiter.silu_and_mul(out, valid_out)
+            elif activation == ActivationType.Swiglu:
+                aiter.swiglu_and_mul(out, valid_out)
+            else:
+                if bias1 is not None:
+                    valid_out = valid_out + bias1[expert_ids.to(torch.long)].to(
+                        valid_out.dtype
+                    )
+                aiter.gelu_and_mul(out, valid_out)
     return out
 
 
@@ -2057,7 +2186,7 @@ def cktile_moe_stage2(
     bias2=None,
     kernel_name="",
 ):
-    bias2 = _normalize_bias_for_kernel(bias2, out.dtype)
+    bias2 = _normalize_bias_for_kernel(bias2)
     # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
     aiter.moe_cktile2stages_gemm2(
         a2,

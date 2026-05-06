@@ -120,7 +120,6 @@ def compile_mixed_moe_gemm1(
     act: str = "silu",
     use_cshuffle_epilog: bool | None = None,
     enable_bias: bool = False,
-    bias_dtype: str | None = None,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     persist_m: int = 1,
@@ -185,9 +184,6 @@ def compile_mixed_moe_gemm1(
     out_s = str(out_dtype).strip().lower()
     out_is_f32 = out_s in ("f32", "fp32", "float")
     out_is_bf16 = out_s in ("bf16", "bfloat16")
-    bias_s = str(bias_dtype if bias_dtype is not None else out_dtype).strip().lower()
-    bias_is_f32 = bias_s in ("f32", "fp32", "float")
-    bias_is_bf16 = bias_s in ("bf16", "bfloat16")
     is_int4 = b_dtype == "int4"
     is_int8 = False
 
@@ -204,14 +200,8 @@ def compile_mixed_moe_gemm1(
     def out_elem():
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
 
-    def bias_elem():
-        return T.f32 if bias_is_f32 else (T.bf16 if bias_is_bf16 else T.f16)
-
     def _load_bias_scalar(bias_rsrc, offset):
-        bias_val = buffer_ops.buffer_load(
-            bias_rsrc, offset, vec_width=1, dtype=bias_elem()
-        )
-        return bias_val if bias_is_f32 else arith.extf(T.f32, bias_val)
+        return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=T.f32)
 
     mock_gate_only = gate_mode is GateMode.MOCK_GATE_ONLY
     gate_up_interleave = gate_mode is GateMode.INTERLEAVE
@@ -2955,10 +2945,7 @@ def compile_mixed_moe_gemm2(
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
 
     def _load_bias_scalar(bias_rsrc, offset):
-        bias_val = buffer_ops.buffer_load(
-            bias_rsrc, offset, vec_width=1, dtype=out_elem()
-        )
-        return bias_val if out_is_f32 else arith.extf(T.f32, bias_val)
+        return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=T.f32)
 
     epilog_tag = "cshuffle"
     # IMPORTANT: include tiling in the module name to avoid accidentally reusing a compiled
