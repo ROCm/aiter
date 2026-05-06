@@ -134,7 +134,7 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/attention/test_mha.py]=1452
     FILE_TIMES[op_tests/triton_tests/test_pa_decode_gluon.py]=718
     FILE_TIMES[op_tests/triton_tests/attention/test_pa_decode.py]=635
-    FILE_TIMES[op_tests/triton_tests/test_causal_conv1d.py]=634
+    FILE_TIMES[op_tests/triton_tests/conv/test_causal_conv1d.py]=634
     FILE_TIMES[op_tests/triton_tests/gemm/batched/test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant.py]=402
     FILE_TIMES[op_tests/triton_tests/attention/test_flash_attn_kvcache.py]=357
     FILE_TIMES[op_tests/triton_tests/attention/test_chunked_pa_prefill.py]=336
