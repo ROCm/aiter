@@ -206,6 +206,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
+    use_exp2: bool = True,
 ):
     """
     Optimized chunk gated delta rule forward with h layout [V, K].
@@ -227,6 +228,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         output_final_state: bool
         cu_seqlens: [N+1] optional
         use_chunk_hip: bool — use HIP kernel for hidden state computation
+        use_exp2: bool — use exp2 instead of exp for gate computation
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:
@@ -239,6 +241,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         beta=beta,
         g=g,
         cu_seqlens=cu_seqlens,
+        use_exp2=use_exp2,
     )
 
     w, u = fused_solve_tril_recompute_w_u(
@@ -248,6 +251,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         beta=beta,
         g_cumsum=g_cumsum,
         cu_seqlens=cu_seqlens,
+        use_exp2=use_exp2,
     )
 
     if use_chunk_hip:
@@ -263,7 +267,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
-            use_exp2=False,
+            use_exp2=use_exp2,
         )
     else:
         h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(
@@ -274,6 +278,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
+            use_exp2=use_exp2,
         )
 
     o = chunk_fwd_o_opt_vk(
@@ -284,6 +289,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         g=g_cumsum,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        use_exp2=use_exp2,
     )
 
     return g_cumsum, o, final_state

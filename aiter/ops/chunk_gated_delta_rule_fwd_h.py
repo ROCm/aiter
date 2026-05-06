@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -10,6 +10,7 @@ from torch import Tensor
 from ..jit.core import compile_ops
 
 MD_NAME = "module_chunk_gdr_fwd_h"
+RCP_LN2 = 1.4426950408889634
 
 _BV_FIXED_LDS_BYTES = 32 * 1024
 _BV_LDS_BYTES_PER_BV = 512
@@ -103,7 +104,7 @@ def chunk_gated_delta_rule_fwd_h_hip(
     output_final_state: bool,
     save_new_value: bool,
     use_exp2: bool,
-) -> list[Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor]: ...
 
 
 def chunk_gated_delta_rule_fwd_h_hip_fn(
@@ -118,7 +119,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     save_new_value: bool = True,
     cu_seqlens: Optional[Tensor] = None,
     selected_bv: Optional[int] = None,
-    use_exp2: bool = False,
+    use_exp2: bool = True,
 ) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     """
     HIP hidden state forward with h layout [V, K].
@@ -130,9 +131,14 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     initial_state/final_state: [N, H, V, K].
     h snapshots: [B, NT, H, V, K].
     v_new output: [B, H, T_flat, V].
+    use_exp2 selects whether cumulative gates are interpreted in log2 space.
     """
-    assert chunk_size == 64
-    assert k.shape[-1] == 128 and u.shape[-1] == 128
+    if chunk_size != 64:
+        raise ValueError("HIP kernel requires chunk_size=64.")
+    if k.shape[-1] != 128 or w.shape[-1] != 128 or u.shape[-1] != 128:
+        raise ValueError("HIP kernel requires K=128 and V=128.")
+    if any(t.dtype != torch.bfloat16 for t in (k, w, u)):
+        raise TypeError("HIP kernel requires `k`, `w`, and `u` to be bfloat16.")
 
     B, T, Hg, K = k.shape
     H = w.shape[1]
@@ -185,7 +191,11 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     )
 
     if gk is not None:
-        gk_arg = gk.to(torch.float32).contiguous()
+        gk_arg = gk.to(torch.float32)
+        if use_exp2:
+            # gk is provided in natural-log space; convert once before exp2 kernels consume it.
+            gk_arg = gk_arg * RCP_LN2
+        gk_arg = gk_arg.contiguous()
     else:
         gk_arg = torch.empty(0, device=k.device, dtype=torch.float32)
 

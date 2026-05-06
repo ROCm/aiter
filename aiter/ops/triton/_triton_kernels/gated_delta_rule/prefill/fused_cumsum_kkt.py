@@ -6,6 +6,8 @@ from ..gated_delta_rule_utils import autotune_cache_kwargs, IS_AMD, maybe_autotu
 from ..utils import prepare_chunk_indices
 from ..utils.op import exp
 
+RCP_LN2: float = 1.0 / 0.6931471805599453
+
 
 @triton.jit
 def safe_exp(x):
@@ -164,6 +166,8 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_EXP2: tl.constexpr = False,
+    G_SCALE: tl.constexpr = 1.0,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -186,6 +190,8 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
     b_g_cumsum = tl.cumsum(b_g, axis=0)
+    if G_SCALE != 1.0:
+        b_g_cumsum = b_g_cumsum * G_SCALE
 
     p_go = tl.make_block_ptr(
         g_cumsum_out + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
@@ -213,7 +219,10 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
 
     b_g_diff = b_g_cumsum[:, None] - b_g_cumsum[None, :]
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
-    b_A = tl.where(m_A, b_A * exp(b_g_diff), 0.0)
+    if USE_EXP2:
+        b_A = tl.where(m_A, b_A * tl.math.exp2(b_g_diff), 0.0)
+    else:
+        b_A = tl.where(m_A, b_A * exp(b_g_diff), 0.0)
 
     p_A = tl.make_block_ptr(
         A_out + (bos * H + i_h) * BT,
@@ -234,6 +243,7 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
     chunk_size: int = 64,
     g_output_dtype: torch.dtype = torch.float32,
     A_output_dtype: torch.dtype = torch.float32,
+    use_exp2: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused cumsum + scaled dot KKT (optimized, with autotuning).
@@ -246,9 +256,10 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         chunk_size: int (must be 64)
         g_output_dtype: dtype for g_cumsum (default fp32)
         A_output_dtype: dtype for A_raw (default fp32)
+        use_exp2: when True, store cumulative gates in log2 space
 
     Returns:
-        g_cumsum: [B, T, H]
+        g_cumsum: [B, T, H], cumulative gate in the selected exponent base
         A_raw: [B, T, H, 64]
     """
     B, T, Hg, K = k.shape
@@ -278,5 +289,7 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         Hg=Hg,
         K=K,
         BT=BT,
+        USE_EXP2=use_exp2,
+        G_SCALE=RCP_LN2 if use_exp2 else 1.0,
     )
     return g_cumsum_out, A_out
