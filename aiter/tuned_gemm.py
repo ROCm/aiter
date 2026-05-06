@@ -136,6 +136,10 @@ def get_GEMM_A16W16_config(
                         config["kernelName"]
                     )
                     if flydsl_config is None:
+                        logger.warning(
+                            f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
+                            "recognized by the current catalog; falling back to next candidate."
+                        )
                         config = None
                 else:
                     config = None
@@ -485,7 +489,7 @@ def flydsl_gemm(
         stages=stages,
         async_copy=config.get("async_copy", False),
         b_to_lds=config["b_to_lds"],
-        b_preshuffle=config["b_preshuffle"],
+        b_preshuffle=config.get("b_preshuffle", False),
         c_to_lds=config.get("c_to_lds", False),
     )
 

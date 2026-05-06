@@ -115,7 +115,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    int KBatch
     )
 {{
     // Get M, N, K from input tensors.
@@ -186,7 +187,7 @@ torch::Tensor
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
 
         // Run kernel instance.
-        return gemm_a8w8_blockscale_impl<DDataType, EDataType, LegacyGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
+        return gemm_a8w8_blockscale_impl<DDataType, EDataType, LegacyGemmInstance>(XQ, WQ, x_scale, w_scale, Y, KBatch);
 """
         INSTANCE_IMPL_str = (
             LEGACY_INSTANCE_IMPL.replace(
@@ -238,7 +239,8 @@ template torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    int KBatch
     );
 
 """
@@ -312,7 +314,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y);
+    torch::Tensor &Y,
+    int KBatch);
 """
         MAINFEST_end = """
 

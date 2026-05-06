@@ -34,6 +34,8 @@ env:
   FA_REPOSITORY_URL: https://github.com/Dao-AILab/flash-attention.git
   BASE_IMAGE: rocm/pytorch:latest@sha256:683765a52c61341e1674fe730ab3be861a444a45a36c0a8caae7653a08a0e208
   AITER_SUBMODULE_PATH: third_party/aiter
+  DOCKER_PULL_MAX_ATTEMPTS: "3"
+  DOCKER_PULL_RETRY_DELAY_SECONDS: "10"
 
 jobs:
   check-signal:
@@ -133,7 +135,7 @@ jobs:
           exit 0
 
       - name: Pull base image
-        run: docker pull ${{ env.BASE_IMAGE }}
+        run: bash .github/scripts/docker_pull_with_retry.sh "${{ env.BASE_IMAGE }}"
 
       - name: Generate Dockerfile
         run: |
@@ -341,7 +343,7 @@ jobs:
           exit 0
 
       - name: Pull base image
-        run: docker pull ${{ env.BASE_IMAGE }}
+        run: bash .github/scripts/docker_pull_with_retry.sh "${{ env.BASE_IMAGE }}"
 
       - name: Generate Dockerfile
         run: |
