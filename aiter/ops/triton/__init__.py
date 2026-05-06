@@ -141,6 +141,9 @@ _BACKWARD_COMPAT_MAP = {
     # Quant modules (quant/)
     "fused_fp8_quant": "quant.fused_fp8_quant",
     "fused_mxfp4_quant": "quant.fused_mxfp4_quant",
+    # Conv modules (conv/)
+    "causal_conv1d": "conv.causal_conv1d",
+    "causal_conv1d_update_single_token": "conv.causal_conv1d_update_single_token",
 }
 
 

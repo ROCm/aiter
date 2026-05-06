@@ -19,8 +19,8 @@ import pytest
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.conv.causal_conv1d import PAD_SLOT_ID
-from aiter.ops.triton.conv.causal_conv1d_update_single_token import (
+from aiter.ops.triton.causal_conv1d import PAD_SLOT_ID
+from aiter.ops.triton.causal_conv1d_update_single_token import (
     causal_conv1d_update_single_token,
     fused_reshape_causal_conv1d_update_single_token,
 )

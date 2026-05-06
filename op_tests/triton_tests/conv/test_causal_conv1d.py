@@ -5,8 +5,11 @@ import torch.nn.functional as F
 from einops import rearrange
 import numpy as np
 
-from aiter.ops.triton.conv.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-from aiter.ops.triton._triton_kernels.conv.causal_conv1d import PAD_SLOT_ID
+from aiter.ops.triton.causal_conv1d import (
+    PAD_SLOT_ID,
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 
 
 def seed_everything(seed: int = 0) -> None:
