@@ -1177,6 +1177,12 @@ namespace py = pybind11;
           py::arg("dispatch_policy")   = 0);
 
 #define MOE_SORTING_OPUS_PYBIND                        \
+    m.def("moe_sorting_opus_get_workspace_size",       \
+          &moe_sorting_opus_get_workspace_size,        \
+          py::arg("tokens"),                           \
+          py::arg("num_experts"),                      \
+          py::arg("topk"),                             \
+          py::arg("dispatch_policy") = 0);             \
     m.def("moe_sorting_opus_fwd",                      \
           &moe_sorting_opus_fwd,                       \
           py::arg("topk_ids"),                         \
@@ -1190,6 +1196,7 @@ namespace py = pybind11;
           py::arg("unit_size"),                        \
           py::arg("local_expert_mask") = std::nullopt, \
           py::arg("num_local_tokens")  = std::nullopt, \
+          py::arg("workspace")         = std::nullopt, \
           py::arg("dispatch_policy")   = 0);
 
 #define NORM_PYBIND                                \
