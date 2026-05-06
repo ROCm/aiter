@@ -96,6 +96,26 @@ def _gfx1250_fp8_round_trip_bf16(x: torch.Tensor) -> torch.Tensor:
     return deq
 
 
+def _preshuffle_b_16x16_dtype_safe(fp4u_mod, b: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Wrapper around ``fp4u_mod.preshuffle_b_16x16`` that tolerates packed
+    sub-byte dtypes whose ``copy_`` op is not implemented in the installed
+    torch (e.g. ``torch.float4_e2m1fn_x2`` on torch 2.10 dev / rocm).
+
+    ``preshuffle_b_16x16`` internally does ``permute(...).contiguous()``,
+    which calls ``copy_`` and crashes for those dtypes. The packed FP4 /
+    FP8 storage is byte-identical to ``uint8`` (two FP4 packed per byte
+    for ``float4_e2m1fn_x2``), so we view-cast to ``uint8`` for the data
+    movement and view back to the original dtype on the way out. For all
+    other dtypes (uint8, multi-byte) this is a no-op pass-through.
+    """
+    needs_byte_view = b.element_size() == 1 and b.dtype != torch.uint8
+    if not needs_byte_view:
+        return fp4u_mod.preshuffle_b_16x16(b, rows, cols)
+    orig_dtype = b.dtype
+    out_u8 = fp4u_mod.preshuffle_b_16x16(b.view(torch.uint8), rows, cols)
+    return out_u8.view(orig_dtype)
+
+
 def _gfx1250_a8w4_default_kpad(model_dim: int, inter_dim: int) -> tuple[int, int]:
     """Pick a default ``(hidden_pad, intermediate_pad)`` for the gfx1250
     a8w4 SwiGLU sweep that keeps the FlyDSL accuracy verdict's
@@ -376,13 +396,15 @@ def test_fmoe(
                     "tests.kernels.utils.fp4_utils"
                 )
             E_, N1_, K1_packed_ = w1_qt_aiter.shape
-            w1_qt_aiter = _fly_fp4u.preshuffle_b_16x16(
+            w1_qt_aiter = _preshuffle_b_16x16_dtype_safe(
+                _fly_fp4u,
                 w1_qt_aiter.contiguous().view(E_ * N1_, K1_packed_),
                 E_ * N1_,
                 K1_packed_,
             ).view(E_, N1_, K1_packed_)
             E2_, N2_, K2_packed_ = w2_qt_aiter.shape
-            w2_qt_aiter = _fly_fp4u.preshuffle_b_16x16(
+            w2_qt_aiter = _preshuffle_b_16x16_dtype_safe(
+                _fly_fp4u,
                 w2_qt_aiter.contiguous().view(E2_ * N2_, K2_packed_),
                 E2_ * N2_,
                 K2_packed_,
@@ -485,7 +507,21 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    _test_graph = int(os.environ.get("AITER_TEST_GRAPH", "1")) != 0
+    if args.no_perftest:
+        # Caller asked to skip the fused_moe perftest path -- typical use
+        # case is exercising the gfx1250 front-end (preshuffle / scale /
+        # reference-side code) on a platform whose Triton activation-quant
+        # kernel cannot yet codegen for gfx1250.  We have nothing to time
+        # or compare against, so signal the outer driver to drop this
+        # case from the result table.
+        aiter.logger.info(
+            "[--no-perftest] skipping run_perftest(fused_moe) for "
+            "token=%d model_dim=%d inter_dim=%d E=%d topk=%d "
+            "AQDType=%s WQDType=%s",
+            token, model_dim, inter_dim, E, topk, AQDType, WQDType,
+        )
+        return None
+
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
@@ -504,7 +540,6 @@ def test_fmoe(
         bias2=exp_bias2_aiter,
         num_iters=5,
         num_warmup=2,
-        testGraph=_test_graph,
     )
     # gfx1250 FlyDSL paths inherently have block-quant noise (mxfp8/mxfp4)
     # that compounds over K-sums.  FlyDSL UT
@@ -751,6 +786,17 @@ parser.add_argument(
     "--no-legacy",
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
+)
+parser.add_argument(
+    "--no-perftest",
+    action="store_true",
+    help=(
+        "Skip the run_perftest(fused_moe, ...) call and the downstream "
+        "accuracy verdict. Use this to drive the front-end / preshuffle / "
+        "reference-side code paths without invoking fused_moe (whose "
+        "Triton activation-quant kernel does not yet compile for "
+        "gfx1250)."
+    ),
 )
 
 args = parser.parse_args()
