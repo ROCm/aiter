@@ -141,7 +141,7 @@ def compile_pa_decode_main(
 
     elem_bytes = 2  # bf16/f16
 
-    gpu_arch = str(get_hip_arch(timeout_s=300))
+    gpu_arch = str(get_hip_arch())
     assert gpu_arch.startswith("gfx1250"), f"Expected gfx1250, got {gpu_arch}"
 
     # NUM_KV_STAGES = 2 enables a software-pipelined prefetch of the next compute
@@ -628,18 +628,17 @@ def compile_pa_decode_main(
                         v_lds_stages[nxt_stage].get(),
                         next_phys_blks,
                     )
-                    # Outstanding-per-wave before wait_for_K:
-                    #   cur K + cur V + next K + next V = 4*K_OPS_PER_WAVE.
-                    # After wait_for_K: cur V + next K + next V = 3*K_OPS_PER_WAVE.
-                    outstanding_after_k_drain = 3 * K_OPS_PER_WAVE
-                    # After wait_for_V: next K + next V = 2*K_OPS_PER_WAVE.
-                    outstanding_after_v_drain = 2 * K_OPS_PER_WAVE
-                else:
-                    # Last iter: no prefetch. Outstanding-per-wave = cur K + cur V
-                    # = 2*K_OPS_PER_WAVE. After wait_for_K: cur V = K_OPS_PER_WAVE.
-                    # After wait_for_V: 0.
-                    outstanding_after_k_drain = K_OPS_PER_WAVE
-                    outstanding_after_v_drain = 0
+
+                outstanding_after_k_drain = (
+                    3 * K_OPS_PER_WAVE
+                    if compute_iter < COMPUTES_PER_PARTITION - 1
+                    else K_OPS_PER_WAVE
+                )
+                outstanding_after_v_drain = (
+                    2 * K_OPS_PER_WAVE
+                    if compute_iter < COMPUTES_PER_PARTITION - 1
+                    else 0
+                )
 
                 # Wait for current tile's K (V continues loading in background).
                 tdm_ops.tensor_wait(outstanding_after_k_drain)
