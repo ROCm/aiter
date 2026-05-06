@@ -1435,6 +1435,18 @@ __global__ void radix_topk_one_block_kernel(T const* in,
         return;
     }
 
+    // Long-row path: kernel internally treats in[0..row_len) as the valid
+    // window. Shift `in` (and `in_idx`) up by `rowStart` so that the radix
+    // pipeline reads the actual valid columns rather than the masked-out
+    // [0, rowStart) prefix that fp8_mqa_logits fills with -inf. Internal
+    // indices i are then relative to rowStart; we add rowStart back to
+    // out_idx at the end of this branch to get absolute column indices.
+    in += rowStart;
+    if(in_idx)
+    {
+        in_idx += rowStart;
+    }
+
     const IdxT buf_len = calc_buf_len<T, IdxT, unsigned>(len);
     bufs += batch_id * buf_len * 2 * (sizeof(T) + sizeof(IdxT));
 
@@ -1520,6 +1532,23 @@ __global__ void radix_topk_one_block_kernel(T const* in,
                 select_min,
                 pass);
             break;
+        }
+    }
+
+    // Long-row path was using rowStart-relative indices inside the radix
+    // pipeline (because we shifted `in` by rowStart above). Translate them
+    // back to absolute column indices for downstream consumers. Sentinels
+    // (-1, written when fewer than k valid candidates exist) are preserved.
+    if(rowStart > 0)
+    {
+        __syncthreads();
+        for(int i = threadIdx.x; i < k; i += BlockSize)
+        {
+            IdxT v = out_idx[i];
+            if(v >= 0)
+            {
+                out_idx[i] = v + rowStart;
+            }
         }
     }
 }
@@ -2406,7 +2435,9 @@ static __global__ void topk_per_row_decode(
 } // namespace aiter
 
 template <typename T, aiter::Phase phase = aiter::Phase::Prefill>
-int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0)
+int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows,
+                                              int32_t stride0,
+                                              int k_param = 2048)
 {
     using IdxT = int32_t;
 
@@ -2420,7 +2451,7 @@ int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0)
     constexpr bool fused_last_filter = false;
     constexpr bool sorted            = true;
     constexpr bool is_largest        = true;
-    constexpr int k                  = 2048;
+    int k                            = k_param;
 
     int sm_cnt = get_num_cu_func();
     unsigned grid_dim =
@@ -2468,7 +2499,9 @@ int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0)
 }
 
 // Explicit template instantiation to ensure the symbol is available for linking
-template int64_t invokeComputeTopkLastDimWorkspaceSize<float>(int32_t numRows, int32_t stride0);
+template int64_t invokeComputeTopkLastDimWorkspaceSize<float>(int32_t numRows,
+                                                              int32_t stride0,
+                                                              int k_param);
 
 void top_k_per_row_prefill(const torch::Tensor& logits,
                            const torch::Tensor& rowStarts,
@@ -2477,15 +2510,17 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
                            std::optional<torch::Tensor> values,
                            int64_t numRows,
                            int64_t stride0,
-                           int64_t stride1)
+                           int64_t stride1,
+                           int64_t k)
 {
     size_t buf_size = 0; // will be overwritten by the kernel
 
-    static constexpr int kTopK       = 2048;
+    int kTopK                        = static_cast<int>(k);
     static constexpr bool is_largest = true;
 
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    int64_t workspace_size   = invokeComputeTopkLastDimWorkspaceSize<float>(numRows, stride0);
+    int64_t workspace_size =
+        invokeComputeTopkLastDimWorkspaceSize<float>(numRows, stride0, kTopK);
     // int64_t workspace_size   = int64_t(1024)*1024*1024*2;
     auto options            = torch::TensorOptions().dtype(torch::kUInt8).device(logits.device());
     torch::Tensor workspace = torch::empty({workspace_size}, options);
@@ -2601,16 +2636,17 @@ void top_k_per_row_decode(const torch::Tensor& logits,
                           torch::Tensor& indices,
                           int64_t numRows,
                           int64_t stride0,
-                          int64_t stride1)
+                          int64_t stride1,
+                          int64_t k)
 {
     size_t buf_size = 0; // will be overwritten by the kernel
 
-    static constexpr int kTopK       = 2048;
+    int kTopK                        = static_cast<int>(k);
     static constexpr bool is_largest = true;
 
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    int64_t workspace_size =
-        invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Decode>(numRows, stride0);
+    int64_t workspace_size = invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Decode>(
+        numRows, stride0, kTopK);
     auto options            = torch::TensorOptions().dtype(torch::kUInt8).device(logits.device());
     torch::Tensor workspace = torch::empty({workspace_size}, options);
 

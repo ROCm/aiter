@@ -174,7 +174,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     QuantType qt = static_cast<QuantType>(quant_type);
 
     CFG *config_map = get_cfg(input, out, w1, qt, sorted_weights != nullptr);
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     int model_dim = input->size(1);
     int hidden_dim = inter_dim;
     int sub_X_cnt = sorted_expert_ids->size(0);
@@ -197,12 +197,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             "ASM kernel ", name, " is not supported for inter_dim=",
             inter_dim, " (tile_n=", cfg.tile_n, ", block_m=", block_m, ")");
 
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if (result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
     {

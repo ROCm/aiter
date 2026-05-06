@@ -75,7 +75,7 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
 
         if((cfg.dtype == data_type) && (cfg.hdim_q == padded_hdim_q) &&
            (cfg.hdim_v == padded_hdim_v) && (cfg.mask == mask_type) && (cfg.atomic32 == atomic32) &&
-           ((arch_id == "gfx950") || ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt))) &&
+           ((cfg.bf16_cvt == 3) || (cfg.bf16_cvt == bf16_cvt)) &&
            (cfg.mode == mode))
         {
             int tmp_ts_kv = 0;
@@ -115,7 +115,7 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
         const auto& cfg = el.second;
 
         if((cfg.hdim_q == padded_hdim_q) && (cfg.mode == mode) &&
-           ((arch_id == "gfx950") || ((data_type == "fp16") || (cfg.bf16_cvt == bf16_cvt))))
+           ((cfg.bf16_cvt == 3) || (cfg.bf16_cvt == bf16_cvt)))
         {
             if((cfg.dtype == data_type) || (atomic32 == 0))
             {
@@ -371,7 +371,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     AiterAsmKernel* impl_ptr_pre    = nullptr;
     AiterAsmKernel* impl_ptr_dqdkdv = nullptr;
     AiterAsmKernel* impl_ptr_post   = nullptr;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     auto it_pre = pre_cfgs->find(pre_kernel);
     if(it_pre != pre_cfgs->end())
@@ -381,13 +381,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         const char* co_name = cfg.co_name.c_str();
         ts_odo              = cfg.ts;
 
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-
-        impl_ptr_pre = result.first->second.get();
+        impl_ptr_pre =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
     {
@@ -402,13 +397,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         const char* co_name = cfg.co_name.c_str();
         ts_kv               = cfg.ts;
 
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-
-        impl_ptr_dqdkdv = result.first->second.get();
+        impl_ptr_dqdkdv =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
     {
@@ -425,13 +415,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             const char* co_name = cfg.co_name.c_str();
             ts_dq               = cfg.ts;
 
-            auto result = impl_ptr_map.emplace(name, nullptr);
-            if(result.second)
-            {
-                result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-            }
-
-            impl_ptr_post = result.first->second.get();
+            impl_ptr_post =
+                &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
         }
         else
         {

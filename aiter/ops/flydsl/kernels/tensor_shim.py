@@ -3,6 +3,7 @@
 
 import torch
 import numpy as np
+import flydsl.compiler as flyc
 from itertools import product
 from abc import ABC, abstractmethod
 
@@ -10,6 +11,18 @@ from flydsl._mlir import ir
 from flydsl.expr.typing import T
 
 from flydsl.expr import buffer_ops, range_constexpr, vector
+
+
+def _run_compiled(exe, *args):
+    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
+    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+    """
+    cf = getattr(exe, "_cf", None)
+    if cf is None:
+        cf = flyc.compile(exe, *args)
+        exe._cf = cf
+    else:
+        cf(*args)
 
 
 def _to_raw(v):
@@ -258,9 +271,12 @@ class TorchTensor(TensorBase):
 
 
 class GTensor(TensorBase):
-    def __init__(self, memref, dtype, shape, stride=None, base_offset=0):
+    def __init__(
+        self, memref, dtype, shape, stride=None, base_offset=0, cache_modifier=0
+    ):
         super().__init__(dtype, shape, stride, base_offset)
         self.rsrc = buffer_ops.create_buffer_resource(memref, max_size=True)
+        self.cache_modifier = cache_modifier
 
     def load(self, offset, vec_size=1):
         return buffer_ops.buffer_load(
@@ -268,7 +284,9 @@ class GTensor(TensorBase):
         )
 
     def store(self, offset, value, vec_size=1):
-        buffer_ops.buffer_store(value, self.rsrc, offset)
+        buffer_ops.buffer_store(
+            value, self.rsrc, offset, cache_modifier=self.cache_modifier
+        )
 
 
 class STensor(TensorBase):

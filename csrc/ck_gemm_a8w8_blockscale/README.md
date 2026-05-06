@@ -13,11 +13,11 @@
 Run the following cmd to start tuning, please wait a few minutes as it will build gemm_a8w8_blockscale_tune via jit:
 `python3 csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py -i aiter/configs/a8w8_blockscale_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_tuned_gemm.csv --libtype both`
 libtype can be `ck`, `cktile` or `both`. We recommend to tune together by setting `--libtype both` to get both ck legacy and tile implementations, then choose the best one, this will take more time but help to get better performance. You can find the results of the tuning in `aiter/configs/a8w8_blockscale_tuned_gemm.csv`, like this:
-    |**cu_num**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
-    |----------|-----|-----|-----|------------|----------|------|--------------|----------|------|------------|
-    |80        |128  |1536 |7168 |23          |0         |32.99 |xxxxxxxx      |125.4     |89.5  |0.01        |
+    |**gfx**  |**cu_num**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
+    |---------|----------|-----|-----|-----|------------|----------|------|--------------|----------|------|------------|
+    |gfx942   |80        |128  |1536 |7168 |23          |0         |32.99 |xxxxxxxx      |125.4     |89.5  |0.01        |
 
-    `cu_num` means the number of compute units, and it is used to distinguish between graphics.
+    `gfx` identifies the GPU architecture (e.g. `gfx942`, `gfx950`). `cu_num` is the number of compute units and distinguishes partitioned or binned variants of the same architecture (e.g. MI308X vs MI300X both use `gfx942`).
 
 4. Build tuned kernels and test:
 Test the performance, modify the test instance in `op_tests/test_gemm_a8w8_blockscale.py` and run it, please wait a few minutes as it will build gemm_a8w8_blockscale tuned kernels in `aiter/configs/a8w8_blockscale_tuned_gemm.csv` via jit:
@@ -103,6 +103,53 @@ If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `A
 ```bash
 --all
 ```
+
+#### `--run_config [TUNED_CSV]`
+- **Type**: Optional argument
+- **Default**: disabled
+- **Description**: Run production-operator benchmark only and exit (no tuning).
+  - `--run_config /path/to/tuned.csv`: read shapes from that tuned CSV and run tuned kernels from that file.
+  - `--run_config` (no path): read shapes from `-i/--untune_file` and run default kernels.
+
+**Examples**:
+```bash
+# benchmark tuned kernels from specified tuned config
+python3 csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py \
+  --run_config aiter/configs/a8w8_blockscale_tuned_gemm.csv
+
+# benchmark default kernels using shapes from -i
+python3 csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py \
+  -i aiter/configs/a8w8_blockscale_untuned_gemm.csv --run_config
+```
+
+#### `--compare`
+- **Type**: Flag (boolean)
+- **Default**: `False`
+- **Description**: Run pre-tune and post-tune production benchmark, print compare results, and keep a compare candidate CSV.
+  - Pre-tune reads shapes from `-i/--untune_file`.
+  - Post-tune uses configs written to `<tune_file>.candidate.csv` during the compare run.
+  - The final tuned CSV is only updated when `--update_improved` is also set.
+  - Shapes with no valid pre-run baseline can still update when the post-tune benchmark passes.
+
+**Example**:
+```bash
+--compare
+```
+
+#### `--update_improved`
+- **Type**: Flag (boolean)
+- **Default**: `False`
+- **Description**: With `--compare`, update the final tuned CSV for shapes improved by at least `--min_improvement_pct`, or for shapes with no valid pre-run baseline when the post-tune benchmark passes.
+
+**Example**:
+```bash
+--compare --update_improved
+```
+
+#### `--min_improvement_pct`
+- **Type**: Float
+- **Default**: `3.0`
+- **Description**: With `--compare --update_improved`, the minimum percentage improvement required before a compared result replaces the final tuned CSV entry when both pre/post benchmarks are valid. Shapes with no valid pre-run baseline but passing post-tune are still allowed to update.
 
 ### Profiling Configuration
 

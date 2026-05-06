@@ -50,6 +50,13 @@ void topk_softmax(torch::Tensor& topk_weights,
                   int num_shared_experts                        = 0,
                   const std::string& shared_expert_scoring_func = "");
 
+void topk_softplus(torch::Tensor& topk_weights,
+                    torch::Tensor& topk_indices,
+                    torch::Tensor& gating_output,
+                    torch::Tensor& correction_bias,
+                    bool need_renorm,
+                    float routed_scaling_factor = 1.0);
+
 void moe_align_block_size(torch::Tensor topk_ids,
                           int64_t num_experts,
                           int64_t block_size,

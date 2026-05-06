@@ -23,7 +23,7 @@ struct PaMetadataV12Traits
 };
 
 template <typename Traits>
-__launch_bounds__(ck_tile::get_warp_size(), 1) __global__
+__launch_bounds__(opus::get_warp_size(), 1) __global__
     void kn_get_pa_metadata_v1_2(PaMetadataV1KernelParameter params)
 {
     using QoState = QoState<Traits>;
@@ -36,12 +36,12 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     QoState qo_state(
         params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
 
-    const int32_t lane_idx = ck_tile::get_lane_id();
+    const int32_t lane_idx = opus::lane_id();
 
     PaWorkInfo* p_work_info_set = reinterpret_cast<PaWorkInfo*>(params.p_work_info_set_raw);
 
     int32_t sum_blocks = 0;
-    for(int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
+    for(int32_t bid = lane_idx; bid < params.num_batches; bid += opus::get_warp_size())
     {
         const int32_t bid_ori = Traits::kIsSparse
                                     ? (bid / params.ori_seqlen_qo / params.qk_batch_ratio)
@@ -79,7 +79,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     sum_blocks =
-        aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), ck_tile::get_warp_size()>(
+        aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), opus::get_warp_size()>(
             sum_blocks);
     sum_blocks += params.num_batches * Traits::kFixedOverheadNumBlocks;
 
@@ -140,7 +140,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                                                    Traits::kPackedQoLenPerWg_log2)
                                       : 1;
                 const int32_t qo_tile_size =
-                    ck_tile::integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
+                    integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
                 const int32_t num_kv_blocks    = curr_kv_pages;
                 const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
 
@@ -157,14 +157,14 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         work_info.batch_idx = curr_batch;
                         work_info.qo_start =
                             qo_state.get_begin(curr_batch) + qo_tile_idx * qo_tile_size;
-                        work_info.qo_end   = ck_tile::min(work_info.qo_start + qo_tile_size,
+                        work_info.qo_end   = opus::min(work_info.qo_start + qo_tile_size,
                                                         qo_state.get_end(curr_batch));
                         work_info.kv_start = curr_kv_begin + curr_kv_block;
-                        work_info.kv_end   = ck_tile::min(work_info.kv_start + consuming_blks),
+                        work_info.kv_end   = opus::min(work_info.kv_start + consuming_blks,
                         integer_divide_ceil_power2(curr_kv_end * params.kv_granularity -
                                                        (num_qo_tiles - 1 - qo_tile_idx),
                                                    params.kv_granularity,
-                                                   params.kv_granularity_log2);
+                                                   params.kv_granularity_log2));
                         work_info.kv_offset = 0;
                         work_info.q_head_range =
                             qo_state.get_q_head_range(khead_idx * params.qhead_granularity,
@@ -218,7 +218,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         if(curr_n_split_idx > 0)
                         {
                             for(int32_t idx = lane_idx; idx < num_splits * num_qo_tiles;
-                                idx += ck_tile::get_warp_size())
+                                idx += opus::get_warp_size())
                             {
                                 const int32_t qo_tile_idx = idx % num_qo_tiles;
                                 const int32_t split_idx   = idx / num_qo_tiles;
@@ -231,7 +231,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         else
                         {
                             for(int32_t idx = lane_idx; idx < num_qo_tiles;
-                                idx += ck_tile::get_warp_size())
+                                idx += opus::get_warp_size())
                             {
                                 fill_work_info(idx, 0, khead_idx);
                             }
@@ -242,7 +242,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         if(curr_n_split_idx > 0)
                         {
                             for(int32_t idx = lane_idx; idx < num_splits;
-                                idx += ck_tile::get_warp_size())
+                                idx += opus::get_warp_size())
                             {
                                 fill_work_info(0, idx, khead_idx);
                             }
@@ -305,10 +305,10 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                             work_info.batch_idx = curr_batch;
                             work_info.qo_start =
                                 qo_state.get_begin(curr_batch) + qo_tile_idx * qo_tile_size;
-                            work_info.qo_end   = ck_tile::min(work_info.qo_start + qo_tile_size,
+                            work_info.qo_end   = opus::min(work_info.qo_start + qo_tile_size,
                                                             qo_state.get_end(curr_batch));
                             work_info.kv_start = curr_kv_begin + curr_kv_block;
-                            work_info.kv_end   = ck_tile::min(
+                            work_info.kv_end   = opus::min(
                                 work_info.kv_start + consuming_blks,
                                 integer_divide_ceil_power2(curr_kv_end * params.kv_granularity -
                                                                (num_qo_tiles - 1 - qo_tile_idx),
@@ -332,7 +332,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         if constexpr(Traits::kQoSplits)
                         {
                             for(int32_t qo_tile_idx = lane_idx; qo_tile_idx < num_qo_tiles;
-                                qo_tile_idx += ck_tile::get_warp_size())
+                                qo_tile_idx += opus::get_warp_size())
                             {
                                 fill_work_info(qo_tile_idx, khead_idx);
                             }
@@ -361,14 +361,14 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         }
     }
 
-    for(int32_t i = cid + lane_idx; i <= params.num_cu; i += ck_tile::get_warp_size())
+    for(int32_t i = cid + lane_idx; i <= params.num_cu; i += opus::get_warp_size())
     {
         params.p_work_indptr[i] = num_works;
     }
 
     global_reduce_tile_idx = __shfl(global_reduce_tile_idx, 0);
     for(int32_t i = global_reduce_tile_idx + lane_idx; i < params.reduce_indptr_size;
-        i += ck_tile::get_warp_size())
+        i += opus::get_warp_size())
     {
         params.p_reduce_indptr[i] = last_reduce_indptr;
     }
@@ -388,7 +388,7 @@ void dispatch_pa_metadata_v1_2_device(const PaMetadataV1KernelParameter& params,
     const int32_t lds_bytes_per_batch =
         sizeof(int32_t) * (QoState<DummyTraits>::is_unique() ? 1 : 2);
     const int32_t max_qo_tiles =
-        kQoSplits ? (ck_tile::integer_divide_ceil(max_seqlen_qo, kPackedQoLenPerWg)) : 1;
+        kQoSplits ? (integer_divide_ceil(max_seqlen_qo, kPackedQoLenPerWg)) : 1;
     const int32_t lds_bytes_partial_info =
         kQoSplits ? params.num_cu * max_qo_tiles * sizeof(int32_t) : 0;
     const int32_t max_lds_batch_size = (lds_size - lds_bytes_partial_info) / lds_bytes_per_batch;

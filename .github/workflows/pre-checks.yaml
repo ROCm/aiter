@@ -78,6 +78,7 @@ jobs:
         with:
           name: checks-signal-${{ github.sha }}
           path: checks_signal.txt
+          retention-days: 1
 
   upload-failure-artifact:
     name: Upload Failure Signal
@@ -103,3 +104,4 @@ jobs:
         with:
           name: checks-signal-${{ github.sha }}
           path: checks_signal.txt
+          retention-days: 1

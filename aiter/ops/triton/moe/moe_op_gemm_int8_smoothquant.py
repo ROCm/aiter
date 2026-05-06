@@ -8,8 +8,12 @@ from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_int8_smoothquant import (
     _moe_gemm_int8_smoothquant,
-    _reduce_grouped,
 )
+from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_int8_smoothquant import (
+    _gluon_moe_gemm_int8_smoothquant,
+)
+from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.utils._triton import arch_info
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -114,7 +118,7 @@ def get_kernel_config(m, n, k, routing_data):
         block_k = 256
         num_warps = 4
         num_stages = 2
-        kpack = 2
+        kpack = 2 if arch_info.get_arch() == "gfx942" else 1
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
@@ -145,83 +149,6 @@ def get_kernel_config(m, n, k, routing_data):
         "kpack": kpack,
     }
     return ret
-
-
-def reduce_grouped(
-    x: torch.Tensor,
-    indx: torch.Tensor,
-    out: torch.Tensor,
-    alpha=1.0,
-    limit=1.0,
-    reduction_n=1,
-    apply_activation: bool = False,
-    out_dtype: torch.dtype = None,
-    add_residual: bool = False,
-):
-    """
-    In-place grouped row reduction.
-
-    Arguments
-    - x: Tensor[AnyFloat] of shape [(num_groups * K), N]
-    - indx: Tensor[Int] of shape [num_groups, K]
-
-    Description
-    For each group g in [0, num_groups), this routine sums the K rows of `x`
-    specified by `indx[g, :]` and overwrites the row corresponding to the first
-    valid (non-negative) index with the per-group sum. Accumulation is performed
-    in float32 for numerical stability, and the result is written back in the
-    dtype of `x`.
-
-    Behavior and edge cases
-    - Invalid (-1) entries are skipped during accumulation and do not generate
-      memory traffic. If a group has no valid entries, nothing is written for
-      that group.
-    - Reduction is performed tile-by-tile along the N dimension within a single
-      kernel launch (persistent along N) to minimize launch overhead.
-
-    Performance notes
-    - Memory traffic per group is approximately (valid_rows_read + 1) * N * sizeof(x),
-      plus index reads. With no invalid entries, this becomes (K + 1) reads/writes
-      of length N per group.
-
-    Returns
-    - The input tensor `x` (modified in place).
-    """
-    if indx is None and x.shape[0] == 1:
-        return x.squeeze(0)
-
-    if indx is not None:
-        num_groups = indx.shape[0]
-    else:
-        num_groups = x.shape[-2]
-    K = 1 if indx is None else indx.shape[1]
-    out_dtype = x.dtype if out_dtype is None else out_dtype
-    assert x.shape[-1] % reduction_n == 0
-    BLOCK_N = 512
-    num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
-
-    _reduce_grouped[(num_blocks, num_groups)](
-        x,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        out,
-        out.stride(0),
-        out.stride(1),
-        indx,
-        x.shape[0],
-        x.shape[-1],
-        alpha,
-        limit,
-        reduction_n,
-        BLOCK_N=BLOCK_N,
-        EVEN_N=(x.shape[-1] % BLOCK_N == 0),
-        K=K,
-        num_warps=2,
-        ADD_RESIDUAL=add_residual,
-        APPLY_ACTIVATION=apply_activation,
-    )
-    return out
 
 
 # -----------------------------------------------------------------------------
@@ -310,58 +237,138 @@ def moe_gemm_int8_smoothquant(
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
-    # launch kernel
-    _moe_gemm_int8_smoothquant[(grid,)](
-        y,
-        y.stride(0),
-        y.stride(1),
-        y.stride(2),
-        x,
-        x.stride(0),
-        x.stride(1),
-        x_scale,
-        x_scale.stride(0) if x_scale.ndim > 0 else 0,
-        w,
-        w.stride(0),
-        w.stride(1),
-        w.stride(2),
-        w_scale,
-        w_scale.stride(0),
-        w_scale.stride(1) if w_scale.ndim > 1 else 0,
-        bias,
-        stride_bias,
-        gammas,
-        N,
-        K,
-        gather_indx,
-        expt_hist,
-        expt_token_offs_raw,
-        expt_hist_sum,
-        expt_block_pid_map,
-        grid_m,
-        grid_n,
-        alpha,
-        limit,
-        reduction_n_matmul,
-        (alpha != 0) and (config["split_k"] == 1),  # APPLY_ACTIVATION
-        add_residual,
-        routing_data.n_expts_act,
-        config["block_m"],
-        config["block_n"],
-        config["block_k"],
-        config["group_m"],
-        PRESHUFFLED=preshuffled,
-        EVEN_K=K % config["block_k"] == 0,
-        MASK_K_LIMIT=K % config["block_k"],
-        SPLIT_K=config["split_k"],
-        W_CACHE_MODIFIER=config["w_cache_modifier"],
-        num_warps=config["num_warps"],
-        num_stages=config["num_stages"],
-        UPCAST_INDICES=should_upcast_indices(x, w, y),
-        waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        kpack=config["kpack"],
-    )
+
+    # Determine whether to use the Gluon-optimized kernel for small K
+    # Conditions: CDNA3 arch, K <= 192, N >= 1024, no preshuffling,
+    #             no activation (handled separately), no split_k,
+    #             all tensors within 2GB buffer limit
+    use_gluon = False
+
+    def _is_within_2gb(arg):
+        MAX_INT_32 = 2**31 - 1
+        if isinstance(arg, torch.Tensor) and hasattr(arg, "untyped_storage"):
+            return arg.untyped_storage().size() <= MAX_INT_32
+        return False
+
+    arch = arch_info.get_arch()
+    if (
+        arch == "gfx942"
+        and K <= 192
+        and N >= 1024
+        and M >= 4096
+        and not preshuffled
+        and gather_indx is None
+        and config["split_k"] == 1
+        and not apply_activation
+        and _is_within_2gb(x)
+        and _is_within_2gb(w)
+        and _is_within_2gb(y)
+    ):
+        use_gluon = True
+        gluon_block_k = 64
+        gluon_block_n = 1024 if N % 1024 == 0 else 512
+        gluon_num_warps = 4
+        grid_n = triton.cdiv(N, gluon_block_n)
+        grid = grid_m * grid_n
+
+    if use_gluon:
+        # launch Gluon-optimized kernel
+        _gluon_moe_gemm_int8_smoothquant[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scale,
+            x_scale.stride(0) if x_scale.ndim > 0 else 0,
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scale,
+            w_scale.stride(0),
+            w_scale.stride(1) if w_scale.ndim > 1 else 0,
+            bias,
+            stride_bias,
+            gammas,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            (alpha != 0) and (config["split_k"] == 1),  # APPLY_ACTIVATION
+            add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            gluon_block_n,
+            gluon_block_k,
+            config["group_m"],
+            EVEN_K=K % gluon_block_k == 0,
+            MASK_K_LIMIT=K % gluon_block_k,
+            num_warps=gluon_num_warps,
+        )
+    else:
+        # launch standard kernel
+        _moe_gemm_int8_smoothquant[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scale,
+            x_scale.stride(0) if x_scale.ndim > 0 else 0,
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scale,
+            w_scale.stride(0),
+            w_scale.stride(1) if w_scale.ndim > 1 else 0,
+            bias,
+            stride_bias,
+            gammas,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            (alpha != 0) and (config["split_k"] == 1),  # APPLY_ACTIVATION
+            add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            PRESHUFFLED=preshuffled,
+            EVEN_K=K % config["block_k"] == 0,
+            MASK_K_LIMIT=K % config["block_k"],
+            SPLIT_K=config["split_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+            kpack=config["kpack"],
+        )
     # Build grouped reduction inputs in a uniform way
     group_indx = (
         None
@@ -372,11 +379,10 @@ def moe_gemm_int8_smoothquant(
         y,
         group_indx,
         y_final,
+        apply_activation and (config["split_k"] > 1),  # apply activation if split_k > 1
         alpha,
         limit,
         reduction_n_reduction,
-        apply_activation=(alpha != 0)
-        and (config["split_k"] > 1),  # apply activation if split_k > 1
         out_dtype=out_dtype,
         add_residual=add_residual,
     )
