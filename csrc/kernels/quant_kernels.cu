@@ -744,8 +744,12 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
             static constexpr int thread_data_size     = 32;
             static constexpr int num_thread_per_group = _GS / thread_data_size;
             // gfx942 (CDNA3/MI300X): 128 = 2 wavefronts, improves output-write coalescing
-            // gfx950 (CDNA4/MI350):  256 = 4 wavefronts (wider memory bus benefits larger TG)
-            const int32_t dynGroupQuantBlockSize = []() -> int32_t {
+            // gfx950 (CDNA4/MI350):  256 = 4 wavefronts (wider memory bus benefits larger TG)            
+            const int32_t dynGroupQuantBlockSize = [&out]() -> int32_t {
+                #if defined(__Float4_e2m1fn_x2)
+                    if(out.dtype() == torch_fp4x2)
+                        return 64;
+                #endif
                 const auto& gfx = get_device_gfx();
                 if(gfx == "gfx942") return 128;
                 if(gfx == "gfx950") return 256;
