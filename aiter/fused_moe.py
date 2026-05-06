@@ -2845,6 +2845,25 @@ def cktile_moe_stage2(
     return out
 
 
+def _topk_softmax_torch_gfx1250(gating_output, topk, renormalize):
+    """Pure-torch topk-softmax fallback for gfx1250.
+
+    The HIP `aiter.topk_softmax` and asm `aiter.topk_softmax_asm` are
+    compiled for gfx950 / gfx942; loading and dispatching them under the
+    gfx1250 simulator segfaults inside `module_moe_asm.so` before any
+    completion signal is raised. Mirrors `_moe_sorting_torch_gfx1250`.
+
+    Semantics match `test_moeTopkSoftmax.test_nofuse` (the canonical
+    reference): softmax along expert dim, then top-k, then optional
+    renormalisation. Outputs are (fp32 weights, i32 ids), shape (M, topk).
+    """
+    probs = torch.nn.functional.softmax(gating_output.float(), dim=-1)
+    topk_weights, topk_ids = probs.topk(k=topk, dim=-1, largest=True, sorted=True)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
+
+
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -2857,6 +2876,18 @@ def fused_topk(
 
     M, _ = hidden_states.shape
     expert = gating_output.shape[1]
+
+    if get_gfx() == "gfx1250":
+        tw_t, ti_t = _topk_softmax_torch_gfx1250(gating_output, topk, renormalize)
+        if topk_weights is None:
+            topk_weights = tw_t
+        else:
+            topk_weights.copy_(tw_t)
+        if topk_ids is None:
+            topk_ids = ti_t
+        else:
+            topk_ids.copy_(ti_t)
+        return topk_weights, topk_ids
 
     token_expert_indicies = torch.empty(
         M, topk, dtype=dtypes.i32, device=hidden_states.device

@@ -502,8 +502,8 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
-        num_iters=5,
-        num_warmup=2,
+        num_iters=3,
+        num_warmup=1,
         testGraph=_test_graph,
     )
     # gfx1250 FlyDSL paths inherently have block-quant noise (mxfp8/mxfp4)

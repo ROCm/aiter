@@ -411,7 +411,11 @@ if multiprocessing.current_process().name == "MainProcess":
 
 
 def validate_and_update_archs():
-    archs = os.getenv("GPU_ARCHS", "native").split(";")
+    # Hardcoded to gfx1250 for the MI450 simulator: --offload-arch=native
+    # resolves to whatever real GPU hipcc detects on the host (gfx942 here),
+    # which produces .so files whose device kernels segfault under the
+    # gfx1250 emulator. Override via env GPU_ARCHS=... if building for real HW.
+    archs = os.getenv("GPU_ARCHS", "gfx1250").split(";")
     archs = [arch.strip() for arch in archs]
     # List of allowed architectures
     allowed_archs = [

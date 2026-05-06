@@ -3,8 +3,8 @@
 import torch
 from . import dtypes
 from torch import Tensor
-import triton
-import triton.language as tl
+# import triton
+# import triton.language as tl
 
 
 def f32_to_mxfp4(x):
@@ -235,389 +235,52 @@ def _f32_to_floatx_unpacked(x: Tensor, ebits: int, mbits: int) -> Tensor:
     return x.to(torch.uint8)
 
 
-@triton.jit
-def _dynamic_mxfp4_quant_kernel_asm_layout(
-    x_ptr,
-    x_fp4_ptr,
-    bs_ptr,
-    stride_x_m,
-    stride_x_n,
-    stride_x_fp4_m,
-    stride_x_fp4_n,
-    stride_bs_m,
-    stride_bs_n,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    scaleN: tl.constexpr,
-    scaleM_pad: tl.constexpr,
-    scaleN_pad: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
-    SCALING_MODE: tl.constexpr,
-    SHUFFLE: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    stride_x_m = tl.cast(stride_x_m, tl.int64)
-    stride_x_n = tl.cast(stride_x_n, tl.int64)
-    stride_x_fp4_m = tl.cast(stride_x_fp4_m, tl.int64)
-    stride_x_fp4_n = tl.cast(stride_x_fp4_n, tl.int64)
-
-    x_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x_offs_n = pid_n * MXFP4_QUANT_BLOCK_SIZE + tl.arange(0, MXFP4_QUANT_BLOCK_SIZE)
-    x_offs = x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
-    x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
-    x = tl.load(x_ptr + x_offs, mask=x_mask).to(tl.float32)
-
-    # Calculate scale
-    amax = tl.max(tl.abs(x), axis=1, keep_dims=True)
-    amax = amax.to(tl.int32, bitcast=True)
-    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-    amax = amax.to(tl.float32, bitcast=True)
-    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
-    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
-    quant_scale = tl.exp2(-scale_e8m0_unbiased)
-
-    # Compute quantized x
-    qx = x * quant_scale
-
-    # blockscale_e8m0
-    bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127
-
-    # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
-    # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
-    #   Zeros: S000 -> +/-0
-    #   Denormal Numbers: S001 -> +/- 0.5
-    #   Normal Numbers:
-    #           S010 -> +/- 1.0
-    #           S011 -> +/- 1.5
-    #           S100 -> +/- 2.0
-    #           S101 -> +/- 3.0
-    #           S110 -> +/- 4.0
-    #           S111 -> +/- 6.0
-    # FP4 format constants
-    EXP_BIAS_FP32: tl.constexpr = 127
-    EXP_BIAS_FP4: tl.constexpr = 1
-    EBITS_F32: tl.constexpr = 8
-    EBITS_FP4: tl.constexpr = 2
-    MBITS_F32: tl.constexpr = 23
-    MBITS_FP4: tl.constexpr = 1
-
-    max_normal: tl.constexpr = 6
-    min_normal: tl.constexpr = 1
-
-    qx = qx.to(tl.uint32, bitcast=True)
-
-    # Extract sign
-    s = qx & 0x80000000
-    # Set everything to positive, will add sign back at the end
-    qx = qx ^ s
-
-    qx_fp32 = qx.to(tl.float32, bitcast=True)
-    saturate_mask = qx_fp32 >= max_normal
-    denormal_mask = (not saturate_mask) & (qx_fp32 < min_normal)
-    normal_mask = not (saturate_mask | denormal_mask)
-
-    # Denormal numbers
-    denorm_exp: tl.constexpr = (
-        (EXP_BIAS_FP32 - EXP_BIAS_FP4) + (MBITS_F32 - MBITS_FP4) + 1
-    )
-    denorm_mask_int: tl.constexpr = denorm_exp << MBITS_F32
-    denorm_mask_float: tl.constexpr = tl.cast(denorm_mask_int, tl.float32, bitcast=True)
-
-    denormal_x = qx_fp32 + denorm_mask_float
-    denormal_x = denormal_x.to(tl.uint32, bitcast=True)
-    denormal_x -= denorm_mask_int
-    denormal_x = denormal_x.to(tl.uint8)
-
-    # Normal numbers
-    normal_x = qx
-    # resulting mantissa is odd
-    mant_odd = (normal_x >> (MBITS_F32 - MBITS_FP4)) & 1
-    # update exponent, rounding bias part 1
-    val_to_add = ((EXP_BIAS_FP4 - EXP_BIAS_FP32) << MBITS_F32) + (1 << 21) - 1
-    normal_x += val_to_add
-    # rounding bias part 2
-    normal_x += mant_odd
-    # take the bits!
-    normal_x = normal_x >> (MBITS_F32 - MBITS_FP4)
-    normal_x = normal_x.to(tl.uint8)
-
-    # Merge results
-    e2m1_value = tl.full(qx.type.get_block_shapes(), 0x7, dtype=tl.uint8)
-    e2m1_value = tl.where(normal_mask, normal_x, e2m1_value)
-    e2m1_value = tl.where(denormal_mask, denormal_x, e2m1_value)
-
-    # add sign back
-    sign_lp = s >> (MBITS_F32 + EBITS_F32 - MBITS_FP4 - EBITS_FP4)
-    sign_lp = sign_lp.to(tl.uint8)
-    e2m1_value = e2m1_value | sign_lp
-
-    e2m1_value = tl.reshape(e2m1_value, [BLOCK_SIZE, MXFP4_QUANT_BLOCK_SIZE // 2, 2])
-    evens, odds = tl.split(e2m1_value)
-    out_tensor = evens | (odds << 4)
-
-    out_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    out_offs_n = pid_n * MXFP4_QUANT_BLOCK_SIZE // 2 + tl.arange(
-        0, MXFP4_QUANT_BLOCK_SIZE // 2
-    )
-    out_offs = (
-        out_offs_m[:, None] * stride_x_fp4_m + out_offs_n[None, :] * stride_x_fp4_n
-    )
-    out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
-    tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
-
-    bs_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    bs_offs_n = pid_n
-
-    if SHUFFLE:
-        bs_offs_0 = bs_offs_m[:, None] // 32
-        bs_offs_1 = bs_offs_m[:, None] % 32
-        bs_offs_2 = bs_offs_1 % 16
-        bs_offs_1 = bs_offs_1 // 16
-        bs_offs_3 = bs_offs_n[None, :] // 8
-        bs_offs_4 = bs_offs_n[None, :] % 8
-        bs_offs_5 = bs_offs_4 % 4
-        bs_offs_4 = bs_offs_4 // 4
-        bs_offs = (
-            bs_offs_1
-            + bs_offs_4 * 2
-            + bs_offs_2 * 2 * 2
-            + bs_offs_5 * 2 * 2 * 16
-            + bs_offs_3 * 2 * 2 * 16 * 4
-            + bs_offs_0 * 2 * 16 * scaleN_pad
-        )
-        bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
-        bs_mask2 = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[None, :]
-        bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 0)
-        tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask2)
-    else:
-        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-        bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < N)[None, :]
-        tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask)
+# --------------------------------------------------------------------------
+# Triton kernels below were removed for the pure-PyTorch path; the wrappers
+# ``dynamic_mxfp4_quant`` and ``moe_mxfp4_sort`` further down are now plain
+# PyTorch. The original kernels were left as a doc-string for reference.
+# --------------------------------------------------------------------------
 
 
 def dynamic_mxfp4_quant(
     x: torch.Tensor, scaling_mode: str = "even", shuffle: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize a tensor to MX FP4 format.
+    """Pure-PyTorch port of the triton MXFP4 dynamic quant kernel.
 
-    Args:
-        x: The input tensor, typically fp16 or bf16.
-        scaling_mode: The method to calculate MX block scaling.
-            - "even" (default): `even_round` in `quark.torch.quantization.utils`.
-            - etc.
-    Returns:
-        A tuple of (x_fp4, blockscale_e8m0).
+    Quantize a 2-D tensor to MXFP4 (e2m1) with per-1x32 e8m0 block scales.
+    Output shapes match the original triton wrapper:
+        x_fp4:           (M, N // 2)    fp4x2
+        blockscale_e8m0: (M, ceil(N/32)) e8m0    when shuffle=False
+        blockscale_e8m0: padded + permuted layout when shuffle=True
     """
-    # Assume x is 2D-Tensor for now
     M, N = x.shape
-
     assert (N // 2) % 2 == 0
 
-    # This is fixed by spec for MXFP4. Do not tune this.
-    # For performance, perhaps, we should look at passing multiple of 32 column blocks
-    # that a triton program can process
     MXFP4_QUANT_BLOCK_SIZE = 32
+    F4E2M1_MAX = 6.0
+    MAX_POW2 = int(torch.log2(torch.tensor(F4E2M1_MAX, dtype=torch.float32)).item())
+    dtype_max_pow2 = 2.0 ** MAX_POW2
 
-    x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
-    scaleM = triton.cdiv(M, 32) * 32
-    scaleN_valid = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
-    scaleN = triton.cdiv(scaleN_valid, 8) * 8
-    blockscale_e8m0 = torch.empty(
-        (
-            triton.cdiv(M, 256) * 256,
-            scaleN,
-        ),
-        dtype=torch.uint8,
-        device=x.device,
-    )
+    scaleN_valid = (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
 
-    BLOCK_SIZE = 128
-    grid = (triton.cdiv(M, BLOCK_SIZE), scaleN)
-    _dynamic_mxfp4_quant_kernel_asm_layout[grid](
-        x,
-        x_fp4,
-        blockscale_e8m0,
-        *x.stride(),
-        *x_fp4.stride(),
-        *blockscale_e8m0.stride(),
-        M=M,
-        N=N,
-        scaleN=scaleN_valid,
-        scaleM_pad=scaleM,
-        scaleN_pad=scaleN,
-        BLOCK_SIZE=BLOCK_SIZE,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
-        SHUFFLE=shuffle,
-    )
+    x_blk = x.float().contiguous().view(-1, MXFP4_QUANT_BLOCK_SIZE)
+    max_abs = torch.amax(torch.abs(x_blk), dim=1)
+    scale_e8m0 = f32_to_e8m0(max_abs / dtype_max_pow2)
+    scale_f32 = e8m0_to_f32(scale_e8m0)
+    scale_f32 = torch.where(scale_f32 == 0, torch.ones_like(scale_f32), scale_f32)
+    y_f32 = x_blk / scale_f32.view(-1, 1)
+    y_fp4 = f32_to_mxfp4(y_f32).view(M, N // 2)
 
-    if not shuffle:
-        # Trim the padding if not shuffled
-        blockscale_e8m0 = blockscale_e8m0[:M, :scaleN_valid].contiguous()
-
-    return (x_fp4.view(dtypes.fp4x2), blockscale_e8m0.view(dtypes.fp8_e8m0))
+    scale = scale_e8m0.view(M, scaleN_valid).view(torch.uint8)
+    if shuffle:
+        scale = e8m0_shuffle(scale)
+    return y_fp4.view(dtypes.fp4x2), scale.view(dtypes.fp8_e8m0)
 
 
-@triton.jit
-def _moe_mxfp4_sort_kernel(
-    blockscale_e8m0_ptr,
-    sorted_ids_ptr,
-    num_valid_ids_ptr,
-    blockscale_e8m0_sorted_ptr,
-    stride_blockscale_e8m0_m: tl.int64,
-    stride_blockscale_e8m0_n: tl.int64,
-    stride_o3: tl.int64,
-    stride_o2: tl.int64,
-    stride_o1: tl.int64,
-    stride_o0: tl.int64,
-    token_num,
-    N_i,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    TOPK: tl.constexpr,
-):
-    """2D-grid kernel: one program per (M-tile, N-tile). Best for small token counts
-    where GPU needs many lightweight programs for parallelism."""
-    pid_m = tl.program_id(0) * 2
-    pid_n = tl.program_id(1) * 2
-    num_valid_ids = tl.load(num_valid_ids_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_valid_ids:
-        return
-
-    out = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.uint32)
-    for m_idx in range(2):
-        m = m_idx * BLOCK_SIZE_M
-        sorted_ids_offs_m = pid_m * BLOCK_SIZE_M + m + tl.arange(0, BLOCK_SIZE_M)
-        sorted_ids_mask = sorted_ids_offs_m < num_valid_ids
-        raw_ids = tl.load(
-            sorted_ids_ptr + sorted_ids_offs_m, mask=sorted_ids_mask, other=token_num
-        )
-        token_ids = raw_ids & 0xFFFFFF
-        if TOPK == 1:
-            blockscale_e8m0_offs_m = token_ids
-        else:
-            blockscale_e8m0_offs_m = token_ids * TOPK + (raw_ids >> 24)
-        row_addrs = blockscale_e8m0_offs_m[:, None] * stride_blockscale_e8m0_m
-        row_mask = (token_ids < token_num)[:, None]
-
-        for n_idx in range(2):
-            i = m_idx + n_idx * 2
-            col_offs = (
-                pid_n * BLOCK_SIZE_N + n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-            )
-            gather_offs = row_addrs + col_offs[None, :] * stride_blockscale_e8m0_n
-            col_mask = (col_offs < N_i)[None, :]
-            sub = tl.load(
-                blockscale_e8m0_ptr + gather_offs,
-                mask=row_mask & col_mask,
-            ).to(tl.uint8, bitcast=True)
-            out = out | (sub.to(tl.uint32) << (i * 8))
-
-    offs_0 = tl.arange(0, BLOCK_SIZE_M)
-    offs_1 = tl.arange(0, BLOCK_SIZE_N)
-    offs = (
-        offs_0[:, None] * stride_o0
-        + offs_1[None, :] * stride_o1
-        + pid_n // 2 * stride_o2
-        + pid_m // 2 * stride_o3
-    )
-    tl.store(blockscale_e8m0_sorted_ptr + offs, out)
-
-
-@triton.jit
-def _moe_mxfp4_sort_kernel_fused_n(
-    blockscale_e8m0_ptr,
-    sorted_ids_ptr,
-    num_valid_ids_ptr,
-    blockscale_e8m0_sorted_ptr,
-    stride_blockscale_e8m0_m: tl.int64,
-    stride_blockscale_e8m0_n: tl.int64,
-    stride_o3: tl.int64,
-    stride_o2: tl.int64,
-    stride_o1: tl.int64,
-    stride_o0: tl.int64,
-    token_num,
-    N_i,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    TOPK: tl.constexpr,
-    N_TILES: tl.constexpr,
-):
-    """1D-grid kernel: one program handles ALL N-tiles for an M-tile group.
-    Loads sorted_ids once and reuses row addresses across all N-tiles.
-    Best for large token counts where gather bandwidth dominates."""
-    pid_m = tl.program_id(0) * 2
-    num_valid_ids = tl.load(num_valid_ids_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_valid_ids:
-        return
-
-    # Pre-load sorted_ids for both m sub-blocks once.
-    offs_m0 = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    raw_0 = tl.load(
-        sorted_ids_ptr + offs_m0, mask=offs_m0 < num_valid_ids, other=token_num
-    )
-    tid_0 = raw_0 & 0xFFFFFF
-    if TOPK == 1:
-        ridx_0 = tid_0
-    else:
-        ridx_0 = tid_0 * TOPK + (raw_0 >> 24)
-    raddr_0 = ridx_0[:, None] * stride_blockscale_e8m0_m
-    rmask_0 = (tid_0 < token_num)[:, None]
-
-    offs_m1 = offs_m0 + BLOCK_SIZE_M
-    raw_1 = tl.load(
-        sorted_ids_ptr + offs_m1, mask=offs_m1 < num_valid_ids, other=token_num
-    )
-    tid_1 = raw_1 & 0xFFFFFF
-    if TOPK == 1:
-        ridx_1 = tid_1
-    else:
-        ridx_1 = tid_1 * TOPK + (raw_1 >> 24)
-    raddr_1 = ridx_1[:, None] * stride_blockscale_e8m0_m
-    rmask_1 = (tid_1 < token_num)[:, None]
-
-    offs_row = tl.arange(0, BLOCK_SIZE_M)
-    offs_col = tl.arange(0, BLOCK_SIZE_N)
-    store_base = pid_m // 2 * stride_o3
-
-    for n_tile in range(N_TILES):
-        pid_n = n_tile * 2
-        out = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.uint32)
-
-        for m_idx in range(2):
-            if m_idx == 0:
-                cur_raddr = raddr_0
-                cur_rmask = rmask_0
-            else:
-                cur_raddr = raddr_1
-                cur_rmask = rmask_1
-
-            for n_idx in range(2):
-                i = m_idx + n_idx * 2
-                col_offs = (
-                    pid_n * BLOCK_SIZE_N
-                    + n_idx * BLOCK_SIZE_N
-                    + tl.arange(0, BLOCK_SIZE_N)
-                )
-                gather_offs = cur_raddr + col_offs[None, :] * stride_blockscale_e8m0_n
-                col_mask = (col_offs < N_i)[None, :]
-                sub = tl.load(
-                    blockscale_e8m0_ptr + gather_offs,
-                    mask=cur_rmask & col_mask,
-                ).to(tl.uint8, bitcast=True)
-                out = out | (sub.to(tl.uint32) << (i * 8))
-
-        store_offs = (
-            offs_row[:, None] * stride_o0
-            + offs_col[None, :] * stride_o1
-            + n_tile * stride_o2
-            + store_base
-        )
-        tl.store(blockscale_e8m0_sorted_ptr + store_offs, out)
+# --------------------------------------------------------------------------
+# Triton sort kernels (kept as a docstring for reference; pytorch port lives
+# in ``moe_mxfp4_sort`` below).
+# --------------------------------------------------------------------------
 
 
 def moe_mxfp4_sort(
@@ -627,71 +290,82 @@ def moe_mxfp4_sort(
     token_num: int,
     block_size: int = 32,
 ) -> torch.Tensor:
-    """
-    Sort the blockscale_e8m0 tensor based on the sorted_ids tensor.
+    """Pure-PyTorch port of the triton MoE block-scale sort kernel.
+
+    Gathers ``blockscale_e8m0`` rows by ``sorted_ids`` and packs them into
+    32x8 super-tiles laid out as (PM, PN, 4, 16) uint32, matching the
+    consumer kernel's expected byte stream when reinterpreted as e8m0.
 
     Args:
-        blockscale_e8m0: The input tensor to be sorted.
-        sorted_ids: The indices used for sorting.
+        blockscale_e8m0: 2-D (M_i, N_i) or 3-D (token_num, topk, N_i) e8m0
+            scales (uint8 view-equivalent).
+        sorted_ids: (M_o,) int — low 24 bits = token id, high 8 bits = topk
+            index. Entries beyond ``num_valid_ids`` are ignored.
+        num_valid_ids: scalar tensor with the count of valid entries in
+            ``sorted_ids``.
+        token_num: source ``token_num`` for masking out-of-range gathers.
+        block_size: must be a multiple of 32.
 
     Returns:
-        A sorted tensor.
+        e8m0 tensor of shape ``(-1, N_i)`` in the tile-shuffled byte layout.
     """
-    # This is fixed by spec for MXFP4. Do not tune this.
     BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 8
-    BLOCK_SIZE_M_u32, BLOCK_SIZE_N_u32 = 16, 4
 
-    # Assume blockscale_e8m0 is 2D-Tensor for now
     topk = 1
-    if len(blockscale_e8m0.shape) == 3:
+    if blockscale_e8m0.ndim == 3:
         topk = blockscale_e8m0.shape[1]
-        blockscale_e8m0 = blockscale_e8m0.view(-1, blockscale_e8m0.shape[-1])
+        blockscale_e8m0 = blockscale_e8m0.reshape(-1, blockscale_e8m0.shape[-1])
     M_i, N_i = blockscale_e8m0.shape
     M_o, N_o = sorted_ids.shape[0], N_i
     assert (N_i // 2) % 2 == 0
     assert block_size % BLOCK_SIZE_M == 0
 
-    blockscale_e8m0_sorted = torch.empty(
-        (
-            triton.cdiv(M_o, BLOCK_SIZE_M),
-            triton.cdiv(N_o, BLOCK_SIZE_N),
-            BLOCK_SIZE_N_u32,
-            BLOCK_SIZE_M_u32,
-        ),
-        dtype=torch.uint32,
-        device=blockscale_e8m0.device,
-    )  # .fill_(0)
+    device = blockscale_e8m0.device
+    bse_u8 = blockscale_e8m0.contiguous().view(torch.uint8)
 
-    # Dispatch threshold: for small token counts the 2D-grid kernel has better
-    # parallelism; for large token counts the fused-N kernel wins by reusing
-    # sorted_ids row addresses across all N tiles.
-    _FUSED_N_THRESHOLD = 2048
-
-    common_args = (
-        blockscale_e8m0.view(torch.uint8),
-        sorted_ids,
-        num_valid_ids,
-        blockscale_e8m0_sorted,
-        *blockscale_e8m0.stride(),
-        *blockscale_e8m0_sorted.stride(),
-    )
-    common_kwargs = dict(
-        token_num=token_num,
-        N_i=N_i,
-        BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
-        BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
-        TOPK=topk,
-    )
-
-    if token_num > _FUSED_N_THRESHOLD:
-        N_TILES = triton.cdiv(N_i, BLOCK_SIZE_N)
-        grid = (triton.cdiv(M_o, BLOCK_SIZE_M),)
-        _moe_mxfp4_sort_kernel_fused_n[grid](
-            *common_args, **common_kwargs, N_TILES=N_TILES
-        )
+    raw = sorted_ids.to(torch.int64)
+    token_ids = raw & 0xFFFFFF
+    if topk == 1:
+        src_rows = token_ids
     else:
-        grid = (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_i, BLOCK_SIZE_N))
-        _moe_mxfp4_sort_kernel[grid](*common_args, **common_kwargs)
+        src_rows = token_ids * topk + (raw >> 24)
 
-    # Reshape the output to the final shape
-    return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o)
+    valid_pos = torch.arange(M_o, device=device, dtype=torch.int64) < num_valid_ids.to(torch.int64)
+    valid_tok = token_ids < token_num
+    valid = valid_pos & valid_tok
+
+    # Append a zero-row sentinel for safe out-of-bounds gather.
+    bse_padded_src = torch.cat(
+        [bse_u8, torch.zeros((1, N_i), dtype=torch.uint8, device=device)], dim=0
+    )
+    src_rows_safe = torch.where(
+        valid, src_rows, torch.full_like(src_rows, M_i)
+    )
+    gathered = bse_padded_src[src_rows_safe]  # (M_o, N_i) uint8
+
+    PM = (M_o + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    PN = (N_o + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+    M_o_pad = PM * BLOCK_SIZE_M
+    N_o_pad = PN * BLOCK_SIZE_N
+    if M_o_pad != M_o or N_o_pad != N_o:
+        padded = torch.zeros((M_o_pad, N_o_pad), dtype=torch.uint8, device=device)
+        padded[:M_o, :N_o] = gathered
+        gathered = padded
+
+    # (PM, 32, PN, 8) -> (PM, PN, 32, 8) super-tiles.
+    tile = gathered.view(PM, BLOCK_SIZE_M, PN, BLOCK_SIZE_N).permute(0, 2, 1, 3).contiguous()
+    # Split rows into (m_idx in {0,1}, i in 0..15), cols into (n_idx in {0,1}, j in 0..3).
+    sub = tile.view(PM, PN, 2, 16, 2, 4)
+    b0 = sub[:, :, 0, :, 0, :].to(torch.int64)  # (PM, PN, 16, 4)
+    b1 = sub[:, :, 1, :, 0, :].to(torch.int64)
+    b2 = sub[:, :, 0, :, 1, :].to(torch.int64)
+    b3 = sub[:, :, 1, :, 1, :].to(torch.int64)
+    # Pack 4 bytes into one uint32 (little-endian: b0 is LSB).
+    packed64 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    out_i32 = packed64.to(torch.int32)
+    # Permute (PM, PN, 16, 4) -> (PM, PN, 4, 16) to match storage layout (j, i).
+    out_i32 = out_i32.permute(0, 1, 3, 2).contiguous()
+
+    # Reinterpret bytes and reshape to (-1, N_o).
+    out_bytes = out_i32.view(torch.uint8).reshape(-1, N_o)
+    return out_bytes.view(dtypes.fp8_e8m0)
