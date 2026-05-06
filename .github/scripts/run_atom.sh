@@ -29,7 +29,7 @@ AITER_INDEX_URL="${5:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/resolve_aiter_version.sh"
 
-ATOM_BASE_IMAGE="${ATOM_BASE_IMAGE:-rocm/atom-dev:latest}"
+ATOM_BASE_IMAGE="${ATOM_IMAGE_OVERRIDE:-${ATOM_BASE_IMAGE:-rocm/atom-dev:latest}}"
 ATOM_BRANCH="${ATOM_BRANCH:-main}"
 ATOM_REPO="${ATOM_REPO:-ROCm/ATOM}"
 SHORT_SHA="${AITER_SHA:0:7}"

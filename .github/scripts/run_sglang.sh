@@ -196,7 +196,13 @@ import json, re, sys, time, urllib.request, urllib.error
 gpu_tag = sys.argv[1]
 aiter_version = sys.argv[2] if len(sys.argv) > 2 else ""
 
-rocm_versions = ["rocm700", "rocm720"]
+all_rocm_versions = ["rocm700", "rocm720"]
+if "rocm7.2" in aiter_version:
+    rocm_versions = ["rocm720"]
+elif "rocm7.0" in aiter_version or "rocm7.1" in aiter_version:
+    rocm_versions = ["rocm700"]
+else:
+    rocm_versions = all_rocm_versions
 
 prefixes = [f"v0.5.10.post1-{rv}-{gpu_tag}-" for rv in rocm_versions]
 patterns = {p: re.compile(rf"^{re.escape(p)}\d{{8}}(?:-preview)?$") for p in prefixes}

@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/resolve_aiter_version.sh"
 
 VLLM_INSTALL_MODE="${VLLM_INSTALL_MODE:-source}"
-VLLM_BASE_IMAGE="${VLLM_BASE_IMAGE:-rocm/vllm-dev:nightly}"
+VLLM_BASE_IMAGE="${VLLM_IMAGE_OVERRIDE:-${VLLM_BASE_IMAGE:-rocm/vllm-dev:nightly}}"
 VLLM_REPOSITORY_URL="${VLLM_REPOSITORY_URL:-https://github.com/vllm-project/vllm}"
 VLLM_GIT_REF="${VLLM_COMMIT:-${VLLM_BRANCH:-main}}"
 SHORT_SHA="${AITER_SHA:0:7}"

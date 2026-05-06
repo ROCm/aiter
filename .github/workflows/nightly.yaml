@@ -78,6 +78,21 @@ on:
         type: string
         required: false
         default: ''
+      sgl_image_override:
+        description: 'SGLang Docker image override (e.g. rocm/sgl-dev:v0.5.10.post1-rocm720-mi30x-20260505). Leave blank for auto-resolve.'
+        type: string
+        required: false
+        default: ''
+      vllm_image_override:
+        description: 'vLLM Docker image override (e.g. rocm/vllm-aiter-ci:nightly-abc1234). Leave blank for default.'
+        type: string
+        required: false
+        default: ''
+      atom_image_override:
+        description: 'ATOM Docker image override (e.g. rocm/atom-dev:latest). Leave blank for default.'
+        type: string
+        required: false
+        default: ''
 
 
 jobs:
@@ -177,6 +192,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
           AITER_VERSION: ${{ github.event.inputs.aiter_version }}
+          SGL_IMAGE_OVERRIDE: ${{ github.event.inputs.sgl_image_override }}
         run: |
           # Preflight test command: exercise the SGLang AITER hot path
           # (rmsnorm forward) so that a wheel/image ABI mismatch surfaces here
@@ -219,7 +235,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
           AITER_VERSION: ${{ github.event.inputs.aiter_version }}
-          SGL_IMAGE_OVERRIDE: ${{ needs.sglang-preflight.outputs.sgl_image }}
+          SGL_IMAGE_OVERRIDE: ${{ needs.sglang-preflight.outputs.sgl_image || github.event.inputs.sgl_image_override }}
         run: |
           bash .github/scripts/run_sglang.sh \
             "${{ github.sha }}" \
@@ -259,6 +275,7 @@ jobs:
           VLLM_COMMIT: ${{ env.VLLM_COMMIT }}
           VLLM_INSTALL_MODE: ${{ matrix.install_mode || 'source' }}
           VLLM_EXTRA_ARGS: ${{ matrix.extra_args || '' }}
+          VLLM_IMAGE_OVERRIDE: ${{ github.event.inputs.vllm_image_override }}
         run: |
           bash .github/scripts/run_vllm.sh \
             "${{ github.sha }}" \
@@ -305,6 +322,7 @@ jobs:
           VLLM_COMMIT: ${{ env.VLLM_COMMIT }}
           VLLM_INSTALL_MODE: ${{ matrix.install_mode || 'source' }}
           VLLM_EXTRA_ARGS: ${{ matrix.extra_args || '' }}
+          VLLM_IMAGE_OVERRIDE: ${{ github.event.inputs.vllm_image_override }}
         run: |
           bash .github/scripts/run_vllm_test.sh \
             "${{ github.sha }}" \
@@ -335,6 +353,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
           AITER_VERSION: ${{ github.event.inputs.aiter_version }}
           ATOM_ENV_VARS: ${{ matrix.env_vars }}
+          ATOM_IMAGE_OVERRIDE: ${{ github.event.inputs.atom_image_override }}
           GITHUB_WORKSPACE: ${{ github.workspace }}
         run: |
           bash .github/scripts/run_atom.sh \
