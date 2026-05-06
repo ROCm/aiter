@@ -44,17 +44,19 @@ def mhc_pre(
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
     hidden_size = residual.size(2)
     hc_mult3 = fn.size(0)
-    assert hc_mult3 == hc_mult * 2 + hc_mult * hc_mult
+    assert hc_mult3 == hc_mult * 2 + hc_mult * hc_mult or (
+        hc_mult3 == hc_mult and sinkhorn_repeat == 0
+    )
     hc_hidden_size = hc_mult * hidden_size
 
     prefetch_stages = 2
