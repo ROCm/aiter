@@ -78,22 +78,6 @@ def fused_allreduce_rmsnorm(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
-def fused_allreduce_rmsnorm_quant(
-    _fa: int,
-    inp,
-    res_inp,
-    res_out,
-    out,
-    scale_out,
-    w,
-    eps: float,
-    reg_ptr: int,
-    reg_bytes: int,
-    use_1stage: bool,
-) -> None: ...
-
-
-@compile_ops("module_custom_all_reduce", develop=True)
 def dispose(_fa: int) -> None: ...
 
 

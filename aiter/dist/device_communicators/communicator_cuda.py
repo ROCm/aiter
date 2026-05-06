@@ -263,26 +263,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
         prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        total_bytes = input_.numel() * input_.element_size()
-        if (
-            int(input_.shape[-1]) in [512, 1024, 2048, 4096]
-            and total_bytes <= 4096 * 1024
-            and (prefill_support or total_bytes <= 64 * 1024 * 1024)
-        ):
-            use_1stage = (
-                self._ar_1stage_override
-                if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
-            )
-            out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
-                input_, res_inp_, weight_, eps, use_1stage
-            )
-        else:
-            out_, res_out = self.fused_allreduce_rmsnorm(
-                input_, res_inp_, weight_, eps, prefill_support
-            )
-            hip_quant = get_hip_quant(QuantType.per_Token)
-            out, scale_out = hip_quant(out_, quant_dtype=fp8)
+        # The direct quant fused kernel only has a new-CA implementation.
+        # Keep the public API by routing through legacy fused RMSNorm plus quant.
+        out_, res_out = self.fused_allreduce_rmsnorm(
+            input_, res_inp_, weight_, eps, prefill_support
+        )
+        hip_quant = get_hip_quant(QuantType.per_Token)
+        out, scale_out = hip_quant(out_, quant_dtype=fp8)
         assert out is not None
         assert res_out is not None
         assert scale_out is not None
