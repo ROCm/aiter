@@ -104,8 +104,7 @@ def fused_qkv_split_qk_norm_rope_cache(
     layout = kv_cache_layout.upper()
     if layout not in ("HND", "NHD"):
         raise ValueError(
-            'kv_cache_layout must be "HND" or "NHD" '
-            f"(got {kv_cache_layout!r})."
+            'kv_cache_layout must be "HND" or "NHD" ' f"(got {kv_cache_layout!r})."
         )
     if key_cache.shape != value_cache.shape:
         raise ValueError(
