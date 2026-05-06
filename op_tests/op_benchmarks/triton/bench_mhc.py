@@ -35,7 +35,7 @@ import enum
 import logging
 import sys
 from itertools import product
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import triton
@@ -716,9 +716,9 @@ def _assert_triton_matches_hip(
             rtol,
         )
         if op == "pre":
-            assert (
-                ok
-            ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+            assert ok, (
+                f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+            )
 
 
 def _validate_with_hip_pre(args) -> None:

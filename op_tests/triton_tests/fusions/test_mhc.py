@@ -26,6 +26,9 @@ import pytest
 import torch
 
 from aiter.ops.triton.fusions.mhc import mhc, mhc_post
+from aiter.ops.triton.utils.mhc_config_utils import (
+    hip_post_dispatch_block as _hip_post_dispatch_block,
+)
 from aiter.test_common import checkAllclose
 from op_tests.triton_tests.utils.mhc_ref import (
     generate_mhc_inputs,
@@ -651,9 +654,9 @@ def test_triton_mhc_matches_hip(M, n, C):
             tol_err_ratio=0.05,
             msg=msg,
         )
-        assert (
-            pct <= 0.05
-        ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+        assert pct <= 0.05, (
+            f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+        )
 
 
 # =============================================================================
@@ -743,11 +746,6 @@ def test_mhc_post_squeeze_post_mix():
         rtol=1e-2,
         msg="mhc_post with 3D post_mix mismatch",
     )
-
-
-from aiter.ops.triton.utils.mhc_config_utils import (
-    hip_post_dispatch_block as _hip_post_dispatch_block,
-)
 
 
 @pytest.mark.parametrize(
