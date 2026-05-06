@@ -6,10 +6,12 @@
 This module hosts:
 
 * ``chunk_gated_delta_rule_fwd_h_flydsl`` -- host wrapper around the K5
-  hidden-state recurrence FlyDSL kernel (``compile_chunk_gated_delta_h``),
-  including PyTorch tensor preparation, BV autotune, kernel cache, and stream
-  handling. The kernel-compile module ``kernels.chunk_gated_delta_h`` is kept
-  ``torch``-free, mirroring the layering used by ``kernels.gdr_decode``.
+  hidden-state recurrence FlyDSL kernel (``compile_chunk_gated_delta_h``).
+  Performs PyTorch tensor preparation, looks up ``BV`` from the
+  offline-tuned table ``chunk_gdn_h_tuned.jsonl``, manages the compiled
+  kernel cache, and handles the launch stream. The kernel-compile module
+  ``kernels.chunk_gated_delta_h`` is kept ``torch``-free, mirroring the
+  layering used by ``kernels.gdr_decode``.
 
 * ``flydsl_gdr_prefill`` -- a drop-in replacement for
   ``aiter.ops.triton.gated_delta_net.chunk_gated_delta_rule_opt_vk`` where
@@ -20,8 +22,14 @@ This module hosts:
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
 import torch
 import triton
+
+from flydsl.runtime.device import get_rocm_arch
 
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 
@@ -44,13 +52,113 @@ __all__ = [
 ]
 
 
-# -- K5 host wrapper (FlyDSL kernel + autotune + tensor prep) -------------
+# -- K5 host wrapper (FlyDSL kernel + offline-tuned BV lookup) ------------
 
 _compiled_kernels = {}
-_autotune_cache = {}  # (shape_key) -> best BV
 _BV_CANDIDATES = [16, 32, 64]
-_AUTOTUNE_WARMUP = 5
-_AUTOTUNE_ITERS = 25
+_DEFAULT_BV = 16
+_TUNED_FILE = "chunk_gdn_h_tuned.jsonl"
+
+# (dtype_str, arch, K, V, BT, H, Hg, T_flat, N,
+#  use_g, use_gk, use_h0, store_fs, save_vn, is_varlen, wu_contig) -> {"BV": int}
+GDN_H_GLOBAL_CONFIG_MAP = None
+GDN_H_GPU_ARCH = get_rocm_arch()
+_GDN_H_FALLBACK_WARNED = set()
+
+
+def _lookup_tuned_bv(
+    dtype_str,
+    K,
+    V,
+    BT,
+    H,
+    Hg,
+    T_flat,
+    N,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+):
+    """Look up the best ``BV`` for this shape from the offline-tuned table.
+
+    Falls back to ``_DEFAULT_BV`` when no entry matches (with a one-time
+    per-shape warning). Mirrors the lookup-table pattern used by
+    ``aiter.ops.flydsl.linear_attention_kernels.get_default_kwargs``.
+    """
+    global GDN_H_GLOBAL_CONFIG_MAP
+    if GDN_H_GLOBAL_CONFIG_MAP is None:
+        _dict = {}
+        fname = os.path.join(Path(__file__).resolve().parent, _TUNED_FILE)
+        if os.path.exists(fname):
+            with open(fname, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if len(line) <= 10:
+                        continue
+                    obj = json.loads(line)
+                    key = (
+                        obj["dtype"],
+                        obj["arch"],
+                        obj["K"],
+                        obj["V"],
+                        obj["BT"],
+                        obj["H"],
+                        obj["Hg"],
+                        obj["T_flat"],
+                        obj["N"],
+                        obj["use_g"],
+                        obj["use_gk"],
+                        obj["use_h0"],
+                        obj["store_fs"],
+                        obj["save_vn"],
+                        obj["is_varlen"],
+                        obj["wu_contig"],
+                    )
+                    _dict[key] = obj["config"]
+        GDN_H_GLOBAL_CONFIG_MAP = _dict
+
+    key = (
+        dtype_str,
+        GDN_H_GPU_ARCH,
+        K,
+        V,
+        BT,
+        H,
+        Hg,
+        T_flat,
+        N,
+        use_g,
+        use_gk,
+        use_h0,
+        store_fs,
+        save_vn,
+        is_varlen,
+        wu_contig,
+    )
+    cfg = GDN_H_GLOBAL_CONFIG_MAP.get(key, None)
+    if cfg is not None:
+        BV = int(cfg["BV"])
+        if BV in _BV_CANDIDATES and BV <= V and V % BV == 0:
+            return BV
+
+    # Fallback: pick a candidate that actually divides V, prefer _DEFAULT_BV.
+    if key not in _GDN_H_FALLBACK_WARNED:
+        print(
+            f"[K5 lookup] no tuned BV for {key}, "
+            f"falling back to BV={_DEFAULT_BV}. "
+            f"Run the offline tuner to add this shape to {_TUNED_FILE}."
+        )
+        _GDN_H_FALLBACK_WARNED.add(key)
+    candidates = [bv for bv in _BV_CANDIDATES if bv <= V and V % bv == 0]
+    if not candidates:
+        return _DEFAULT_BV
+    if _DEFAULT_BV in candidates:
+        return _DEFAULT_BV
+    return candidates[0]
 
 
 def _get_or_compile(
@@ -179,12 +287,13 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         (h, v_new, final_state) in VK-ordered layout (``[..., V, K]`` on the
         last two dims).
 
-    BV-tile selection is internal; results of the very first call for a given
-    shape are cached in module-level ``_autotune_cache``.
+    BV-tile selection uses an offline-tuned lookup table
+    (``chunk_gdn_h_tuned.jsonl``) -- mirrors the pattern used by
+    ``flydsl_gdr_decode``. Shapes not present in the table fall back to
+    ``_DEFAULT_BV`` with a one-time warning.
     """
     # Layout is fixed to head-major contiguous (matches Triton VK wrapper).
     wu_contiguous = True
-    BV = 0  # 0 => autotune (cache hit on subsequent calls)
 
     B, T, Hg, K = k.shape
     BT = chunk_size
@@ -236,108 +345,24 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     use_h0 = initial_state is not None
     is_varlen = cu_seqlens is not None
 
-    # Resolve BV: explicit > autotune cache > benchmark
-    if BV <= 0:
-        shape_key = (
-            K,
-            V,
-            BT,
-            H,
-            Hg,
-            T_flat,
-            N,
-            use_g,
-            use_gk,
-            use_h0,
-            output_final_state,
-            save_new_value,
-            is_varlen,
-            wu_contiguous,
-        )
-
-        if shape_key in _autotune_cache:
-            BV = _autotune_cache[shape_key]
-        else:
-            candidates = [bv for bv in _BV_CANDIDATES if bv <= V and V % bv == 0]
-            if len(candidates) <= 1:
-                BV = candidates[0] if candidates else 16
-            else:
-                print(f"[K5 autotune] benchmarking BV in {candidates} ...")
-                best_bv, best_us = candidates[0], float("inf")
-                for bv in candidates:
-                    fn = _get_or_compile(
-                        K,
-                        V,
-                        BT,
-                        bv,
-                        H,
-                        Hg,
-                        use_g,
-                        use_gk,
-                        use_h0,
-                        output_final_state,
-                        save_new_value,
-                        is_varlen,
-                        wu_contiguous,
-                    )
-                    for _ in range(_AUTOTUNE_WARMUP):
-                        _launch_kernel(
-                            fn,
-                            bv,
-                            V,
-                            N,
-                            H,
-                            k,
-                            u,
-                            w,
-                            vn_arg,
-                            g_arg,
-                            gk_arg,
-                            h,
-                            h0_arg,
-                            ht_arg,
-                            cu_arg,
-                            co_arg,
-                            T,
-                            T_flat,
-                            stream,
-                        )
-                    torch.cuda.synchronize()
-                    s = torch.cuda.Event(enable_timing=True)
-                    e = torch.cuda.Event(enable_timing=True)
-                    s.record()
-                    for _ in range(_AUTOTUNE_ITERS):
-                        _launch_kernel(
-                            fn,
-                            bv,
-                            V,
-                            N,
-                            H,
-                            k,
-                            u,
-                            w,
-                            vn_arg,
-                            g_arg,
-                            gk_arg,
-                            h,
-                            h0_arg,
-                            ht_arg,
-                            cu_arg,
-                            co_arg,
-                            T,
-                            T_flat,
-                            stream,
-                        )
-                    e.record()
-                    torch.cuda.synchronize()
-                    us = s.elapsed_time(e) / _AUTOTUNE_ITERS * 1000
-                    print(f"  BV={bv:3d}: {us:.2f} us")
-                    if us < best_us:
-                        best_us = us
-                        best_bv = bv
-                BV = best_bv
-                print(f"[K5 autotune] best BV={BV} ({best_us:.2f} us)")
-            _autotune_cache[shape_key] = BV
+    # Resolve BV from the offline-tuned lookup table.
+    BV = _lookup_tuned_bv(
+        dtype_str=str(k.dtype),
+        K=K,
+        V=V,
+        BT=BT,
+        H=H,
+        Hg=Hg,
+        T_flat=T_flat,
+        N=N,
+        use_g=use_g,
+        use_gk=use_gk,
+        use_h0=use_h0,
+        store_fs=bool(output_final_state),
+        save_vn=bool(save_new_value),
+        is_varlen=is_varlen,
+        wu_contig=wu_contiguous,
+    )
 
     launch_fn = _get_or_compile(
         K,
