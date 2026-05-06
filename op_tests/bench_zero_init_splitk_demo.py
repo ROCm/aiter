@@ -258,6 +258,7 @@ def _maybe_capture_trace(
     tuned_file: str,
     trace_dir: str,
     seed: int,
+    trace_iters: int = 50,
 ) -> None:
     """Capture a single iteration with torch.profiler for trace inspection."""
     os.makedirs(trace_dir, exist_ok=True)
@@ -291,7 +292,7 @@ def _maybe_capture_trace(
         ],
         record_shapes=False,
     ) as prof:
-        for _ in range(5):
+        for _ in range(trace_iters):
             _producer_then_gemm(
                 x_bf16=x_bf16,
                 weight_shuffle=weight_shuffle,
@@ -338,6 +339,13 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="If set, capture one torch.profiler chrome trace per shape "
         "into this directory.",
+    )
+    p.add_argument(
+        "--trace-iters",
+        type=int,
+        default=50,
+        help="Number of iterations recorded inside the profiler region "
+        "(only matters when --trace-dir is set).",
     )
     p.add_argument(
         "--shape",
@@ -405,6 +413,7 @@ def main() -> int:
                 M=M, N=N, K=K,
                 mode=args.mode, tuned_file=args.tuned_csv,
                 trace_dir=args.trace_dir, seed=args.seed,
+                trace_iters=args.trace_iters,
             )
 
     if args.out is not None:
