@@ -60,11 +60,34 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.ops.quant import per_group_quant_hip
-from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
+from aiter.ops.gemm_op_a8w8 import (
+    gemm_a8w8_blockscale_bpreshuffle,
+    get_CKGEMM_config,
+)
 from aiter.ops.shuffle import shuffle_weight
 
 
 VALID_MODES = ("none", "splitk", "splitk_fused")
+
+
+def _shape_splitk(M: int, N: int, K: int, tuned_file: str) -> int:
+    """Return the splitK column from the tuned CSV for (M, N, K), or 0.
+
+    Mirrors the per-shape lookup ATOM's LinearBase.forward does so the
+    demo only stages the producer-side zero-init when the tuner picked
+    splitK > 0 (otherwise the kernel does no atomic-add pass and the
+    pre-zero is wasted bandwidth).
+    """
+    try:
+        cfg = get_CKGEMM_config(M, N, K, tuned_file=tuned_file)
+    except Exception:  # noqa: BLE001
+        return 0
+    if cfg is None:
+        return 0
+    try:
+        return int(cfg.get("splitK", 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _parse_shape(s: str) -> tuple[int, int, int]:
@@ -115,12 +138,18 @@ def _producer_then_gemm(
     M: int,
     N: int,
     out_buf: torch.Tensor | None,
+    do_fused_zero_init: bool,
 ):
     """One LinearBase-equivalent forward pass under ``mode``.
 
     ``out_buf`` must be supplied (and reused across iterations) for the
     splitk/splitk_fused modes so we measure the production-style code
     path where the caller owns Y.
+
+    ``do_fused_zero_init`` controls whether the producer absorbs the
+    zero-fill for this iteration. It only flips on when ``mode`` is
+    ``splitk_fused`` AND the tuned CSV picked splitK > 0 for the shape;
+    callers compute it once per (mode, shape) via :func:`_shape_splitk`.
     """
     if mode == "none":
         x_q, x_scale = per_group_quant_hip(
@@ -137,7 +166,7 @@ def _producer_then_gemm(
 
     assert out_buf is not None, "splitk modes need a pre-allocated out buffer"
 
-    zero_init = out_buf if mode == "splitk_fused" else None
+    zero_init = out_buf if do_fused_zero_init else None
     x_q, x_scale = per_group_quant_hip(
         x_bf16,
         quant_dtype=dtypes.fp8,
@@ -149,7 +178,7 @@ def _producer_then_gemm(
         x_q, weight_shuffle, x_scale, w_scale,
         dtype=dtypes.bf16,
         out=out_buf,
-        y_is_zeroed=(mode == "splitk_fused"),
+        y_is_zeroed=do_fused_zero_init,
         tuned_file=tuned_file,
     )
 
@@ -170,6 +199,10 @@ def _bench_shape(
     if mode != "none":
         out_buf = torch.empty(M, N, dtype=dtypes.bf16, device="cuda")
 
+    do_fused_zero_init = (
+        mode == "splitk_fused" and _shape_splitk(M, N, K, tuned_file) > 0
+    )
+
     for _ in range(warmup):
         _producer_then_gemm(
             x_bf16=x_bf16,
@@ -180,6 +213,7 @@ def _bench_shape(
             M=M,
             N=N,
             out_buf=out_buf,
+            do_fused_zero_init=do_fused_zero_init,
         )
     torch.cuda.synchronize()
 
@@ -197,6 +231,7 @@ def _bench_shape(
             M=M,
             N=N,
             out_buf=out_buf,
+            do_fused_zero_init=do_fused_zero_init,
         )
         end.record()
         end.synchronize()
@@ -210,6 +245,7 @@ def _bench_shape(
         "p90_us": samples_us[min(len(samples_us) - 1, int(0.90 * len(samples_us)))],
         "stdev_us": statistics.stdev(samples_us) if len(samples_us) > 1 else 0.0,
         "n": len(samples_us),
+        "do_fused_zero_init": int(do_fused_zero_init),
     }
 
 
@@ -231,6 +267,9 @@ def _maybe_capture_trace(
         if mode != "none"
         else None
     )
+    do_fused_zero_init = (
+        mode == "splitk_fused" and _shape_splitk(M, N, K, tuned_file) > 0
+    )
     for _ in range(3):
         _producer_then_gemm(
             x_bf16=x_bf16,
@@ -241,6 +280,7 @@ def _maybe_capture_trace(
             M=M,
             N=N,
             out_buf=out_buf,
+            do_fused_zero_init=do_fused_zero_init,
         )
     torch.cuda.synchronize()
 
@@ -261,6 +301,7 @@ def _maybe_capture_trace(
                 M=M,
                 N=N,
                 out_buf=out_buf,
+                do_fused_zero_init=do_fused_zero_init,
             )
         torch.cuda.synchronize()
     out_file = os.path.join(trace_dir, f"trace_{mode}_M{M}_N{N}_K{K}.json")
@@ -329,7 +370,11 @@ def main() -> int:
         f"iters={args.iters} warmup={args.warmup} "
         f"device={torch.cuda.get_device_name(0)}"
     )
-    cols = ("mode", "M", "N", "K", "median_us", "min_us", "p10_us", "p90_us", "stdev_us", "n")
+    cols = (
+        "mode", "M", "N", "K",
+        "median_us", "min_us", "p10_us", "p90_us", "stdev_us", "n",
+        "do_fused_zero_init",
+    )
     print("\t".join(cols))
 
     rows: list[dict] = []
@@ -351,7 +396,8 @@ def main() -> int:
             f"{args.mode}\t{M}\t{N}\t{K}\t"
             f"{stats['median_us']:.3f}\t{stats['min_us']:.3f}\t"
             f"{stats['p10_us']:.3f}\t{stats['p90_us']:.3f}\t"
-            f"{stats['stdev_us']:.3f}\t{stats['n']}"
+            f"{stats['stdev_us']:.3f}\t{stats['n']}\t"
+            f"{stats['do_fused_zero_init']}"
         )
 
         if args.trace_dir is not None:
