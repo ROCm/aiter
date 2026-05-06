@@ -11,12 +11,12 @@ on:
       benchmark_mode:
         description: Benchmark suite to run for manual dispatch
         required: false
-        default: standard
+        default: standard latency benchmark
         type: choice
         options:
-          - standard
-          - kimi_serve
-          - all
+          - standard latency benchmark
+          - performance benchmark (only kimi 2.5 is supported)
+          - all benchmarks
       docker_image:
         description: Base Docker image to benchmark against (supports private images)
         required: false
@@ -46,7 +46,7 @@ jobs:
   check-signal:
     if: >-
       (github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.benchmark_mode != 'kimi_serve') ||
+      github.event.inputs.benchmark_mode != 'performance benchmark (only kimi 2.5 is supported)') ||
       (github.event_name != 'workflow_dispatch' &&
       (github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
@@ -67,7 +67,7 @@ jobs:
     name: Build Aiter wheel
     if: >-
       (github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.benchmark_mode != 'kimi_serve') ||
+      github.event.inputs.benchmark_mode != 'performance benchmark (only kimi 2.5 is supported)') ||
       (github.event_name != 'workflow_dispatch' &&
       (github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
@@ -146,7 +146,7 @@ jobs:
     timeout-minutes: 60
     if: >-
       (github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.benchmark_mode != 'kimi_serve') ||
+      github.event.inputs.benchmark_mode != 'performance benchmark (only kimi 2.5 is supported)') ||
       (github.event_name != 'workflow_dispatch' &&
       (github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
@@ -295,8 +295,8 @@ jobs:
     timeout-minutes: 240
     if: >-
       github.event_name == 'workflow_dispatch' &&
-      (github.event.inputs.benchmark_mode == 'kimi_serve' ||
-      github.event.inputs.benchmark_mode == 'all')
+      (github.event.inputs.benchmark_mode == 'performance benchmark (only kimi 2.5 is supported)' ||
+      github.event.inputs.benchmark_mode == 'all benchmarks')
     runs-on: linux-aiter-mi300x-8
     steps:
       - name: Checkout benchmark helpers
