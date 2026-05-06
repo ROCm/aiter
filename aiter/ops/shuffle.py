@@ -35,10 +35,10 @@ def shuffle_weight_NK(
         kPerLane *= 2
     assert (
         x.shape[-2] % inst_N == 0
-    ), f"{x.shape[-2]} % {inst_N} == {x.shape[-2] % N_WARP_TILE }"
+    ), f"{x.shape[-2]} % {inst_N} == {x.shape[-2] % inst_N }"
     assert (
         x.shape[-1] % inst_K == 0
-    ), f"{x.shape[-1]} % {inst_K} == {x.shape[-1] % K_WARP_TILE }"
+    ), f"{x.shape[-1]} % {inst_K} == {x.shape[-1] % inst_K }"
 
     x_ = x
     x_ = x_.view(
@@ -111,3 +111,47 @@ def shuffle_scale_a16w4(
         shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
     # print("shf_scale shape:", shfl_scale.shape)
     return shfl_scale.view(*src.shape).contiguous()
+
+
+def pack_int8_to_packed_int4(x_shuf_i8: torch.Tensor) -> torch.Tensor:
+    """Pack a preshuffled int8 tensor (values in [-8, 7]) into packed int4 bytes.
+
+    Each contiguous 8-value block [v0..v7] -> 4 bytes:
+      b0=(v4<<4)|v0, b1=(v5<<4)|v1, b2=(v6<<4)|v2, b3=(v7<<4)|v3.
+
+    This matches the 7-op in-kernel unpack sequence used by FlyDSL int4_bf16.
+    """
+    flat = x_shuf_i8.contiguous().view(-1).to(torch.int16)
+    assert flat.numel() % 8 == 0
+    u = (flat & 0xF).to(torch.uint8).view(-1, 8)
+    out = torch.empty((u.shape[0], 4), device=u.device, dtype=torch.uint8)
+    out[:, 0] = u[:, 0] | (u[:, 4] << 4)
+    out[:, 1] = u[:, 1] | (u[:, 5] << 4)
+    out[:, 2] = u[:, 2] | (u[:, 6] << 4)
+    out[:, 3] = u[:, 3] | (u[:, 7] << 4)
+    return out.view(-1).to(torch.int8)
+
+
+def shuffle_scale_for_int4(scale: torch.Tensor, group_size: int = 32) -> torch.Tensor:
+    """Prepare groupwise scale tensor for W4A16 int4 kernel.
+
+    Input: scale tensor of shape ``[E, num_groups, N]``.
+
+    For **f32** scales the kernel uses ``(E, G, N)`` layout directly.
+
+    For **bf16** scales the kernel uses ``(E, G//2, N, 2)`` layout -- two
+    adjacent groups for the same N position are packed into one dword.
+
+    Only group_size=32 is supported due to int4 preshuffle layout constraints.
+    """
+    if group_size != 32:
+        raise ValueError(
+            f"shuffle_scale_for_int4 only supports group_size=32, got {group_size}. "
+            f"This is due to int4 preshuffle layout constraints."
+        )
+
+    if scale.dtype == torch.bfloat16:
+        E, G, N = scale.shape
+        return scale.view(E, G // 2, 2, N).permute(0, 1, 3, 2).contiguous()
+
+    return scale.contiguous()
