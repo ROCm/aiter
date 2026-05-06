@@ -9,6 +9,8 @@
 #include "aiter_tensor.h"
 #include <optional>
 
+int moe_sorting_opus_get_workspace_size(int tokens, int num_experts, int topk, int dispatch_policy);
+
 void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           aiter_tensor_t& topk_weights,
                           aiter_tensor_t& sorted_token_ids,
@@ -20,6 +22,7 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           int unit_size,
                           std::optional<aiter_tensor_t> local_expert_mask = std::nullopt,
                           std::optional<aiter_tensor_t> num_local_tokens  = std::nullopt,
+                          std::optional<aiter_tensor_t> workspace        = std::nullopt,
                           int dispatch_policy                             = 0);
 
 #ifdef MOE_SORTING_OPUS_IMPL
@@ -3157,7 +3160,7 @@ struct moe_sorting_opus_args : public aiter::MoeSortingHostArgs
 {
 };
 
-inline int
+int
 moe_sorting_opus_get_workspace_size(int tokens, int num_experts, int topk, int dispatch_policy)
 {
     return aiter::moe_sorting_get_workspace_size(tokens, num_experts, topk, dispatch_policy);
