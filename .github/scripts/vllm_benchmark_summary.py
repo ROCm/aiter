@@ -52,7 +52,9 @@ SERVE_FIELDNAMES = [
     "mean_e2el_ms",
     "p99_e2el_ms",
 ]
-SERVE_FILENAME_RE = re.compile(r"isl(?P<input_len>\d+)_osl(?P<output_len>\d+)_c(?P<concurrency>\d+)\.json$")
+SERVE_FILENAME_RE = re.compile(
+    r"isl(?P<input_len>\d+)_osl(?P<output_len>\d+)_c(?P<concurrency>\d+)\.json$"
+)
 
 
 def _format_float(value: object) -> str:
@@ -218,9 +220,7 @@ def _load_csv_rows(input_dir: Path, output_csv: Path) -> list[dict[str, str]]:
             if not reader.fieldnames:
                 continue
             for row in reader:
-                rows.append(
-                    {field: row.get(field, "") for field in LATENCY_FIELDNAMES}
-                )
+                rows.append({field: row.get(field, "") for field in LATENCY_FIELDNAMES})
     rows.sort(key=lambda row: (row["model"], row["kv_cache_dtype"]))
     return rows
 
