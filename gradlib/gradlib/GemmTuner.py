@@ -162,7 +162,7 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         stages=stages,
         async_copy=config.get("async_copy", False),
         b_to_lds=config["b_to_lds"],
-        b_preshuffle=config["b_preshuffle"],
+        b_preshuffle=config.get("b_preshuffle", False),
         auto_shuffle_b=False,
         c_to_lds=config.get("c_to_lds", False),
     )
@@ -589,7 +589,7 @@ class Gemm:
         weight_idx = 6 if self.is_shuffle else 1
         min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
         for solidx, kernel_name, config in flydsl_catalog:
-            if config["b_preshuffle"] != self.is_shuffle:
+            if config.get("b_preshuffle", False) != self.is_shuffle:
                 continue
             if config["tile_m"] > max(self.m, min_tile_m):
                 continue

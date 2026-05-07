@@ -202,7 +202,7 @@ namespace aiter {
 
         if (n_idx == 0) {
             float sqrsum_ = cross_row_sum_4(sqrsum_part, lane_id);
-            if ((warp_id * mfma_m + lane_id < m_oob)) {
+            if (lane_id < mfma_m && (warp_id * mfma_m + lane_id < m_oob)) {
                 sqrsum[k_split_idx * m + idx + warp_id * mfma_m + lane_id] = sqrsum_;
             }
         }
@@ -237,12 +237,12 @@ namespace aiter {
 
 #define MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k) \
     if (tile_k == 64) { \
-        if (cu_num * 2 > m_blocks * split_k) { \
+        if (cu_num * 2 > m_blocks * split_k || hc_mult3 <= 16) { \
             MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 64); \
         } else { \
             MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 32, 64); \
         } \
-    } else if (tile_k == 128) { \
+    } else if (tile_k == 128 || hc_mult3 <= 16) { \
         if (cu_num > m_blocks * split_k) { \
             MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 16, 128); \
         } else { \
@@ -472,7 +472,7 @@ namespace aiter {
                 }
             }
         }
-        else if (k_offset == 0){
+        else if (k_offset == 0 && sinkhorn_repeat > 0){
             // _pre_split_mixes_fwd (post & comb)
             float post_mix_v;
             if (land_id < num_rows * hc_mult) {
