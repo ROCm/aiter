@@ -40,6 +40,7 @@ def fused_moe_ptpc_fp8(
 ) -> Optional[torch.Tensor]:
     """Prebuilt ``.co`` MoE for ``1 <= B <= MOE_HSACO_SMALL_BATCH_MAX_B``; else ``None``."""
     B = int(hidden_states.shape[0])
+    HIDDEN_SIZE = hidden_states.shape[1]
     if not (1 <= B <= 32):
         return None
     if (
@@ -127,9 +128,9 @@ def fused_moe_ptpc_fp8(
             K2,
         )
         print("Call moe_gemm_batch1_down kernel end")
-    else:
+    elif 2 <= B < 16:
         BLOCK_M = 16
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
             topk_ids,
             topk_weight,
             E,
@@ -151,9 +152,9 @@ def fused_moe_ptpc_fp8(
         print("Get moe_gemm_batch kernel start")
         moe_gemm_batch = get_kernel(f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_pyhip/moe_gemm_batch-1-weight_dtype=torch.float8_e4m3fnuz-with_silu=True:moe_gemm_batch")
         print("Get moe_gemm_batch kernel end")
-        print("Get moe_gemm_batch and moe_2stage_splitk kernels start")
+        print("Get moe_2stage_splitk kernels start")
         moe_2stage_splitk = get_kernel(f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_pyhip/moe_2stage_splitk-1-weight_dtype=torch.float8_e4m3fnuz-TOPK=10-K=128-N=4096-with_silu=False-BLOCK_TILE_SIZE_M=16-BLOCK_TILE_SIZE_N=64-fp8_ptpc=True:moe_2stage_splitk")
-        print("Get moe_gemm_batch and moe_2stage_splitk kernels end")
+        print("Get moe_2stage_splitk kernels end")
         if moe_gemm_batch is None or moe_2stage_splitk is None:
             return None
 
@@ -194,8 +195,131 @@ def fused_moe_ptpc_fp8(
             B,
         )
         print("Call moe_2stage_splitk kernel end")
+    
+    elif 16 <= B <= 32:
+        # Prebuilt ``moe_2stage_down_loopn`` .co bakes constexprs; HIP entry is only
+        # ``(p_input, p_weight, p_output, p_sorted_ids, p_sorted_weights,
+        # p_sorted_expert_ids, p_num_valid_ids, p_w_scale, M)`` — use ``CallableKernel``
+        # with tensors + ``B``, not pyhip-style ``data_ptr`` / dtype / constexpr args.
+        BLOCK_M = 16
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
+            topk_ids,
+            topk_weight,
+            E,
+            K1,
+            hidden_states.dtype,
+            BLOCK_M,
+            expert_mask,
+            num_local_tokens,
+            moe_sorting_dispatch_policy,
+        )
+        grid = int(sorted_expert_ids.shape[0])
+        if B * TOPK <= E:
+            #grid = min(grid, B * TOPK)
+            grid = B * TOPK
 
-        
+        print("Get moe_gemm_batch kernel start")
+        moe_gemm_batch = get_kernel(
+            f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_pyhip/moe_gemm_batch-1-weight_dtype=torch.float8_e4m3fnuz-with_silu=True:moe_gemm_batch"
+        )
+        print("Get moe_gemm_batch kernel end")
+        if moe_gemm_batch is None:
+            return None
+
+        print("Call moe_gemm_batch kernel start")
+        moe_gemm_batch(
+            [N1 // 32, grid],
+            [256],
+            hidden_states,
+            w1,
+            gemm1_out,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            w1_scale,
+            B,
+            N1,
+            K1,
+            TOPK,
+        )
+        print("Call moe_gemm_batch kernel end")
+        assert torch.isfinite(gemm1_out).all(), "gemm1_out output contains NaN/Inf"
+        fp8_ptpc = w1.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        num_CU = torch.cuda.get_device_properties(hidden_states.device).multi_processor_count
+        BLOCK_N = 1024
+        use_down_loopn = (
+            fp8_ptpc
+            and (N2 // BLOCK_N) * grid >= num_CU
+            and N2 % BLOCK_N == 0
+            and TOPK == 10
+            and K2 == 128
+            and N2 == 4096
+            and B >= 16 and B <= 32
+        )
+
+        if use_down_loopn:
+            print("Get moe_2stage_down_loopn kernel start")
+            moe_2stage_down_loopn = get_kernel(
+                f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_pyhip/moe_2stage_down_loopn-1-weight_dtype=torch.float8_e4m3fnuz-TOPK=10-K=128-N=4096-BLOCK_TILE_SIZE_M=16-BLOCK_TILE_SIZE_N=16-fp8_ptpc=True-BLOCK_N=1024-atomic_write=False-STAGES=3:moe_2stage_down_loopn"
+            )
+            print("Get moe_2stage_down_loopn kernel end")
+            if moe_2stage_down_loopn is None:
+                return None
+            gemm2_out = torch.empty(
+                [B, TOPK, HIDDEN_SIZE],
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+            # gemm2_out = torch.zeros(
+            #     (B, TOPK, HIDDEN_SIZE),
+            #     dtype=torch.bfloat16,
+            #     device=hidden_states.device,
+            # )
+            print("Call moe_2stage_down_loopn kernel start")
+            moe_2stage_down_loopn(
+                [N2 // BLOCK_N, grid],
+                [256],
+                gemm1_out,
+                w2,
+                gemm2_out,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                w2_scale,
+                B,
+            )
+            print("Call moe_2stage_down_loopn kernel end")
+            assert torch.isfinite(gemm2_out).all(), "gemm2_out output contains NaN/Inf"
+            cur_out = torch.sum(gemm2_out, dim=1)
+        else:
+            print("Get moe_2stage_splitk kernel start")
+            moe_2stage_splitk = get_kernel(
+                f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_pyhip/"
+                f"moe_2stage_splitk-1-weight_dtype=torch.float8_e4m3fnuz-TOPK=10-K=128-N=4096-"
+                f"with_silu=False-BLOCK_TILE_SIZE_M=16-BLOCK_TILE_SIZE_N=64-fp8_ptpc=True:moe_2stage_splitk"
+            )
+            print("Get moe_2stage_splitk kernel end")
+            if moe_2stage_splitk is None:
+                return None
+            BLOCK_TILE_SIZE_N = 64
+            print("Call moe_2stage_splitk kernel start")
+            moe_2stage_splitk(
+                [N2 // BLOCK_TILE_SIZE_N, grid],
+                [64],
+                gemm1_out,
+                w2,
+                cur_out,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                w2_scale,
+                B,
+            )
+            print("Call moe_2stage_splitk kernel end")
+
     return cur_out
 
 
