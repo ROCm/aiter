@@ -49,8 +49,31 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     int q_out_u_stride,
     int k_out_stride,
     int q_res_out_stride,
-    int group_size)
+    int group_size,
+    void* __restrict__ gemm_out_zero_init = nullptr,
+    int64_t gemm_out_zero_init_num_uint4 = 0)
 {
+    // SplitK GEMM zero-init fusion: every thread participates in a grid-strided
+    // 16-byte zero fill of the downstream GEMM output buffer so SplitK can skip
+    // its own Y.zero_() launch.  Buffer must be 16-byte aligned and the count
+    // is in uint4 (16-byte) words.  Done before the early-return so all threads
+    // contribute regardless of (idx >= m) bounds checking.
+    if(gemm_out_zero_init != nullptr)
+    {
+        const int64_t total_threads =
+            static_cast<int64_t>(gridDim.x) * gridDim.y * blockDim.x;
+        const int64_t my_thread_id =
+            (static_cast<int64_t>(blockIdx.y) * gridDim.x + blockIdx.x) * blockDim.x
+            + threadIdx.x;
+        auto* y_vec       = reinterpret_cast<uint4*>(gemm_out_zero_init);
+        const uint4 zero4 = {0u, 0u, 0u, 0u};
+        for(int64_t i = my_thread_id; i < gemm_out_zero_init_num_uint4;
+            i += total_threads)
+        {
+            y_vec[i] = zero4;
+        }
+    }
+
     // Keep internal names stable to avoid touching tuned kernel body logic.
     auto* out1_q = q_out_quantized;
     auto* out1_scale = q_out_scale;
@@ -472,7 +495,9 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             out1_u_stride,                                                                                                        \
             out2_stride,                                                                                                          \
             out_res1_stride,                                                                                                      \
-            group_size);                                                                                                          \
+            group_size,                                                                                                            \
+            gemm_out_zero_init_ptr,                                                                                               \
+            gemm_out_zero_init_num_uint4);                                                                                        \
     });
 
 #define FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, interleave) \
@@ -623,8 +648,27 @@ void fused_qk_rmsnorm_group_quant(
     std::optional<aiter_tensor_t> q_residual,
     int64_t group_size,
     bool transpose_scale,
-    bool gemma_norm)
+    bool gemma_norm,
+    std::optional<torch::Tensor> gemm_out_zero_init)
 {
+    // SplitK GEMM zero-init fusion: optional buffer to zero-init at the start of
+    // the kernel, in 16-byte chunks. We only forward the pointer/word count to
+    // the kernel; everything below is the unmodified shape/dtype validation path.
+    void* gemm_out_zero_init_ptr = nullptr;
+    int64_t gemm_out_zero_init_num_uint4 = 0;
+    if(gemm_out_zero_init.has_value() && gemm_out_zero_init->defined())
+    {
+        const auto& y = gemm_out_zero_init.value();
+        TORCH_CHECK(y.is_cuda(), __func__, " gemm_out_zero_init must be on CUDA/HIP device");
+        TORCH_CHECK(y.is_contiguous(), __func__, " gemm_out_zero_init must be contiguous");
+        const int64_t total_bytes = y.numel() * y.element_size();
+        TORCH_CHECK(total_bytes % 16 == 0,
+                    __func__,
+                    " gemm_out_zero_init total bytes must be a multiple of 16, got ",
+                    total_bytes);
+        gemm_out_zero_init_ptr       = y.data_ptr();
+        gemm_out_zero_init_num_uint4 = total_bytes / 16;
+    }
     // q / q_weight / q_epsilon are surfaced as std::optional only so the pybind-generated
     // Python signature is valid (default-arg ordering is preserved for the existing public
     // interface). They are still required at runtime.

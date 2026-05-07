@@ -50,11 +50,33 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
     int64_t x_token_stride,              // x stride along token dim (elements)
     int64_t x_head_stride,               // x stride along head dim (elements)
     int64_t z_token_stride,              // z stride along token dim (elements)
-    int64_t z_head_stride)               // z stride along head dim (elements)
+    int64_t z_head_stride,                // z stride along head dim (elements)
+    void* __restrict__ gemm_out_zero_init = nullptr,
+    int64_t gemm_out_zero_init_num_uint4 = 0)
 {
     // Compile-time validation
     static_assert(GROUP_SIZE == 128, "Only GROUP_SIZE=128 is supported");
     static_assert(THREAD_DATA_SIZE >= 2 && THREAD_DATA_SIZE <= 32, "THREAD_DATA_SIZE must be 2-32");
+
+    // SplitK GEMM zero-init fusion: every thread participates in a grid-strided
+    // 16-byte zero fill of the downstream GEMM output buffer so SplitK can skip
+    // its own Y.zero_() launch.  Buffer must be 16-byte aligned and the count
+    // is in uint4 (16-byte) words.
+    if(gemm_out_zero_init != nullptr)
+    {
+        const int64_t total_threads =
+            static_cast<int64_t>(gridDim.x) * gridDim.y * blockDim.x;
+        const int64_t my_thread_id =
+            (static_cast<int64_t>(blockIdx.y) * gridDim.x + blockIdx.x) * blockDim.x
+            + threadIdx.x;
+        auto* y_vec       = reinterpret_cast<uint4*>(gemm_out_zero_init);
+        const uint4 zero4 = {0u, 0u, 0u, 0u};
+        for(int64_t i = my_thread_id; i < gemm_out_zero_init_num_uint4;
+            i += total_threads)
+        {
+            y_vec[i] = zero4;
+        }
+    }
 
     // Calculate groups per warp
     constexpr int WARP_SIZE = 64;
@@ -202,7 +224,9 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
     double epsilon,
     int num_tokens,
     int num_heads,
-    int head_dim)
+    int head_dim,
+    void* gemm_out_zero_init,
+    int64_t gemm_out_zero_init_num_uint4)
 {
     constexpr int GROUP_SIZE = 128;
     constexpr int WARP_SIZE = 64;
@@ -237,7 +261,9 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
             x_token_stride,
             x_head_stride,
             z_token_stride,
-            z_head_stride
+            z_head_stride,
+            gemm_out_zero_init,
+            gemm_out_zero_init_num_uint4
         );
 }
 
@@ -250,7 +276,9 @@ void gated_rmsnorm_fp8_group_quant_launcher(
     torch::Tensor const& weight,   // [head_dim] - RMSNorm weight
     double epsilon,
     int group_size,
-    bool transpose_scale)
+    bool transpose_scale,
+    void* gemm_out_zero_init,
+    int64_t gemm_out_zero_init_num_uint4)
 {
     // Validate constraints
     TORCH_CHECK(x.dim() == 3, "Input x must be 3D: [num_tokens, num_heads, head_dim]");
@@ -275,10 +303,12 @@ void gated_rmsnorm_fp8_group_quant_launcher(
     constexpr int thread_data_size = 16;
     if (transpose_scale) {
         gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size, 256, true>(
-            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
+            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim,
+            gemm_out_zero_init, gemm_out_zero_init_num_uint4);
     } else {
         gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size, 256, false>(
-            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
+            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim,
+            gemm_out_zero_init, gemm_out_zero_init_num_uint4);
     }
 }
 
@@ -293,7 +323,8 @@ void gated_rmsnorm_fp8_group_quant(
     torch::Tensor const& weight,   // [head_dim] - RMSNorm weight
     double epsilon,
     int group_size,
-    bool transpose_scale)
+    bool transpose_scale,
+    std::optional<torch::Tensor> gemm_out_zero_init)
 {
     // Validate input types
     TORCH_CHECK(x.is_cuda(), "Input x must be on CUDA device");
@@ -302,15 +333,33 @@ void gated_rmsnorm_fp8_group_quant(
     TORCH_CHECK(out.is_cuda(), "Output must be on CUDA device");
     TORCH_CHECK(scale.is_cuda(), "Scale must be on CUDA device");
 
+    // SplitK GEMM zero-init fusion: optional buffer to zero-init in this kernel
+    void* zero_init_ptr = nullptr;
+    int64_t zero_init_num_uint4 = 0;
+    if (gemm_out_zero_init.has_value() && gemm_out_zero_init->defined())
+    {
+        const auto& y = gemm_out_zero_init.value();
+        TORCH_CHECK(y.is_cuda(), "gemm_out_zero_init must be on CUDA device");
+        TORCH_CHECK(y.is_contiguous(), "gemm_out_zero_init must be contiguous");
+        const int64_t total_bytes = y.numel() * y.element_size();
+        TORCH_CHECK(total_bytes % 16 == 0,
+                    "gemm_out_zero_init total bytes must be a multiple of 16, got ",
+                    total_bytes);
+        zero_init_ptr        = y.data_ptr();
+        zero_init_num_uint4  = total_bytes / 16;
+    }
+
     // Dispatch based on input/output types
     if (x.scalar_type() == at::ScalarType::BFloat16 &&
         (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz || out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
         gated_rmsnorm_fp8_group_quant_launcher<opus::bf16_t, opus::fp8_t>(
-            out, scale, x, z, weight, epsilon, group_size, transpose_scale);
+            out, scale, x, z, weight, epsilon, group_size, transpose_scale,
+            zero_init_ptr, zero_init_num_uint4);
     } else if (x.scalar_type() == at::ScalarType::Half &&
                (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz || out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
         gated_rmsnorm_fp8_group_quant_launcher<opus::fp16_t, opus::fp8_t>(
-            out, scale, x, z, weight, epsilon, group_size, transpose_scale);
+            out, scale, x, z, weight, epsilon, group_size, transpose_scale,
+            zero_init_ptr, zero_init_num_uint4);
     } else {
         TORCH_CHECK(false, "Unsupported dtype combination. Input: ", x.scalar_type(),
                     ", Output: ", out.scalar_type());

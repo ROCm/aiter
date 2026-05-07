@@ -24,7 +24,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("q_residual")               = std::nullopt,
           py::arg("group_size")               = 128,
           py::arg("transpose_scale")          = false,
-          py::arg("gemma_norm")              = false);
+          py::arg("gemma_norm")               = false,
+          py::arg("gemm_out_zero_init")       = std::nullopt);
     m.def("fused_qk_rmsnorm_per_token_quant",
           &aiter::fused_qk_rmsnorm_per_token_quant,
           py::arg("q_out_quantized"),

@@ -1991,6 +1991,7 @@ namespace py = pybind11;
           py::arg("epsilon"),                                  \
           py::arg("group_size"),                               \
           py::arg("transpose_scale") = false,                  \
+          py::arg("gemm_out_zero_init") = std::nullopt,        \
           "Fused Gated RMSNorm + FP8 Group Quantization");
 
 #define MHC_PYBIND                              \

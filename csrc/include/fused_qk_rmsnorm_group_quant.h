@@ -22,7 +22,8 @@ void fused_qk_rmsnorm_group_quant(std::optional<aiter_tensor_t> q_out_quantized,
                                   std::optional<aiter_tensor_t> q_residual,
                                   int64_t group_size,
                                   bool transpose_scale,
-                                  bool gemma_norm);
+                                  bool gemma_norm,
+                                  std::optional<torch::Tensor> gemm_out_zero_init = std::nullopt);
 
 void fused_qk_rmsnorm_per_token_quant(aiter_tensor_t& q_out_quantized,
                                       aiter_tensor_t& q_out_scale,
