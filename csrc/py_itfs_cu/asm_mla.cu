@@ -117,7 +117,9 @@ void mla_decode_stage1_asm_fwd(
     aiter_tensor_t* q_scale,              //   [1] (nullable)
     aiter_tensor_t* kv_scale,             //   [1] (nullable)
     hipStream_t stream)
-{    
+{
+    auto q_dtype        = Q->dtype();
+    auto kv_dtype       = KV->dtype(); 
     int batch           = qo_indptr->size(0) - 1;
     int num_heads       = Q->size(1);
     int head_size       = Q->size(2);
@@ -145,6 +147,12 @@ void mla_decode_stage1_asm_fwd(
     args.ptr_QTP     = qo_indptr->data_ptr();
     args.scalar      = softmax_scale;
     args.s_MQA       = gqa_ratio * max_seqlen_q;
+    // Keep legacy behavior for FP8 qh32-like path:
+    // host passes gqa_ratio and kernel derives effective s_MQA.
+    if (q_dtype == AITER_DTYPE_fp8 && kv_dtype == AITER_DTYPE_fp8 && args.s_MQA == 32 && (gqa_ratio % 16 == 0))
+    {
+        args.s_MQA = gqa_ratio;
+    }
     args.s_kv_split  = kv_split;
     args.s_Q_Bs      =  stride_Q;
     args.s_Bs        = stride_Page;
@@ -217,9 +225,6 @@ void mla_decode_stage1_asm_fwd(
 
     AITER_CHECK(Q->is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
     AITER_CHECK(num_kv_heads == 1, __func__, ":only support num_kv_heads==1 for now");
-
-    auto q_dtype = Q->dtype();
-    auto kv_dtype = KV->dtype();
 
     if (kv_dtype != AITER_DTYPE_i8 && kv_dtype != AITER_DTYPE_u8) {
         AITER_CHECK(head_size == KV->size(3), __func__, ":only support head_size == KV.size(3) for now");
