@@ -8,7 +8,8 @@ torch::Tensor gemm_a4w4_blockscale(torch::Tensor& A,
                                    torch::Tensor& a_scale,
                                    torch::Tensor& b_scale,
                                    torch::Tensor& C,
-                                   int splitK);
+                                   int splitK,
+                                   std::string kernelName = "");
 
 torch::Tensor gemm_a4w4_blockscale_tune(torch::Tensor& XQ,
                                         torch::Tensor& WQ,
