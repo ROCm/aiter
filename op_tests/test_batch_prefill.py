@@ -2557,3 +2557,305 @@ if __name__ == "__main__":
     total = len(collected)
     print(f"\nTotal: {total}, Passed: {passed}, Skipped: {skipped}")
     print("=" * 100)
+
+
+# =============================================================================
+# StreamLLM Sink Token Tests
+# =============================================================================
+
+
+def ref_masked_attention_with_sink(
+    query,
+    key,
+    value,
+    window_left,
+    sink_size,
+    sink_ptr_value,
+):
+    """
+    Reference attention with StreamLLM sink semantics.
+
+    Args:
+        query:          [seqlen_q, num_heads, head_dim]
+        key:            [seqlen_k, num_heads, head_dim]
+        value:          [seqlen_k, num_heads, head_dim]
+        window_left:    left window size (-1 = infinite)
+        sink_size:      number of KV tokens at start always attended
+        sink_ptr_value: per-head float tensor [num_heads] or None.
+                        When not None, a virtual sink token with this scaled
+                        logit is appended to the attention matrix (it steals
+                        probability mass but has no V contribution).
+
+    Valid KV range for query at absolute position abs_q = seqlen_k - seqlen_q + i_q:
+        k < sink_size   (sink region, always valid)
+        OR
+        abs_q - window_left <= k <= abs_q   (window region, window_left=-1 means k >= 0)
+    """
+    head_dim = query.shape[2]
+    seqlen_q = query.shape[0]
+    seqlen_k = key.shape[0]
+    num_heads = query.shape[1]
+    scale = 1.0 / math.sqrt(head_dim)
+
+    # [num_heads, seqlen_q, seqlen_k]
+    attn = scale * torch.einsum("qhd,khd->hqk", query.float(), key.float())
+
+    # Build mask vectorized to avoid per-element GPU synchronization
+    # i_q: [seqlen_q, 1], i_k: [1, seqlen_k]
+    i_q = torch.arange(seqlen_q, device=query.device).unsqueeze(1)  # [sq, 1]
+    i_k = torch.arange(seqlen_k, device=query.device).unsqueeze(0)  # [1, sk]
+    abs_q = seqlen_k - seqlen_q + i_q  # [sq, 1]
+    k_end = abs_q  # causal boundary
+    if window_left < 0:
+        k_start_window = torch.zeros_like(abs_q)
+    else:
+        k_start_window = torch.clamp(abs_q - window_left, min=sink_size)
+    is_sink = i_k < sink_size  # [1, sk]
+    is_window = (i_k >= k_start_window) & (i_k <= k_end)  # [sq, sk]
+    valid = is_sink | is_window  # [sq, sk]
+    # attn: [H, sq, sk] — broadcast mask over heads
+    attn.masked_fill_(~valid.unsqueeze(0), float("-inf"))
+
+    if sink_ptr_value is not None:
+        # Append virtual sink token column: logit = sink_ptr_value[h] (scaled space)
+        # Shape: [num_heads, seqlen_q, 1]
+        virt = sink_ptr_value.float().view(num_heads, 1, 1).expand(-1, seqlen_q, 1)
+        attn_ext = torch.cat([attn, virt], dim=-1)  # [H, sq, sk+1]
+        P_ext = torch.softmax(attn_ext, dim=-1)
+        P = P_ext[:, :, :seqlen_k]  # drop virtual column (V contribution = 0)
+    else:
+        P = torch.softmax(attn, dim=-1)
+
+    out = torch.einsum("hqk,khd->qhd", P, value.float())
+    return out.to(query.dtype)
+
+
+def run_batch_prefill_sink(
+    batch_size,
+    qo_len,
+    kv_len,
+    page_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    window_left,
+    sink_size,
+    sink_ptr_value,
+    dtype,
+    seed,
+):
+    """
+    Run batch_prefill with sink tokens and compare against torch reference.
+
+    sink_ptr_value: float or None. When float, a sink_ptr tensor of shape
+                    [num_qo_heads] filled with this value is passed to the kernel.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    k_vector_size = get_vector_size(dtype)
+
+    # kv_len must be large enough to create a real gap between sink and window
+    if skip_test_if(
+        kv_len <= sink_size + window_left + 1,
+        f"kv_len={kv_len} too small for gap (need >{sink_size + window_left + 1})",
+    ):
+        return {"status": "skipped"}
+
+    qo_lens = build_qo_lens(batch_size, qo_len, randomize=batch_size > 1)
+    kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=batch_size > 1)
+    max_qo_len = qo_lens.max().item()
+    max_kv_len = kv_lens.max().item()
+    q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+
+    total_q = q_indptr_cpu[-1]
+    q = build_q_tensor(total_q, num_qo_heads, head_dim, dtype, -5, 5)
+
+    kv_cache = build_paged_kv_cache(
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_lens,
+        -5,
+        5,
+        dtype,
+        contiguous_kv=True,
+    )
+    kv_data_fp32 = kv_cache["kv_data_fp32"]
+    kv_indices_cpu = kv_cache["kv_indices_cpu"]
+    kv_indptr_cpu_cache = kv_cache["kv_indptr_cpu"]
+    kv_last_page_len_cpu = kv_cache["kv_last_page_len_cpu"]
+
+    k_cache_ref, v_cache_ref = extract_kv_caches(kv_cache, contiguous_kv=True)
+    k_cache, v_cache = apply_kv_layout(
+        k_cache_ref,
+        v_cache_ref,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        k_vector_size,
+        "vectorized",
+    )
+
+    # Build sink_ptr tensor
+    sink_ptr = None
+    if sink_ptr_value is not None:
+        sink_ptr = torch.full(
+            (num_qo_heads,), sink_ptr_value, dtype=torch.float32, device="cuda"
+        )
+
+    # ── Torch reference ──────────────────────────────────────────────────────
+    # kv_data_fp32: [total_pages, 2, page_size, num_kv_heads, head_dim]
+    #   dim 1: 0=K, 1=V
+    o_ref_list = []
+    for i in range(batch_size):
+        used_idx = kv_indices_cpu[kv_indptr_cpu_cache[i] : kv_indptr_cpu_cache[i + 1]]
+        last_len = kv_last_page_len_cpu[i].item()
+
+        # Full pages: [num_full_pages, page_size, num_kv_heads, head_dim]
+        # Last page: [:last_len, num_kv_heads, head_dim]
+        ki = torch.cat(
+            [
+                kv_data_fp32[used_idx[:-1], 0].reshape(-1, num_kv_heads, head_dim),
+                kv_data_fp32[used_idx[-1], 0, :last_len].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+            ],
+            dim=0,
+        ).to(dtype)
+        vi = torch.cat(
+            [
+                kv_data_fp32[used_idx[:-1], 1].reshape(-1, num_kv_heads, head_dim),
+                kv_data_fp32[used_idx[-1], 1, :last_len].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+            ],
+            dim=0,
+        ).to(dtype)
+
+        qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+
+        if num_qo_heads != num_kv_heads:
+            ratio = num_qo_heads // num_kv_heads
+            ki = ki.repeat_interleave(ratio, dim=1)
+            vi = vi.repeat_interleave(ratio, dim=1)
+
+        o_ref_list.append(
+            ref_masked_attention_with_sink(qi, ki, vi, window_left, sink_size, sink_ptr)
+        )
+    o_ref = torch.cat(o_ref_list, dim=0)
+
+    # ── CK kernel ─────────────────────────────────────────────────────────────
+    kv_indptr_gpu = kv_indptr_cpu_cache.to(0)
+    kv_indices_gpu = kv_indices_cpu.to(0)
+    kv_last_page_lens = kv_last_page_len_cpu.to(0)
+    cu_seqlens_q = q_indptr_cpu.to(0)
+
+    out = aiter.mha_batch_prefill_func(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        max_seqlen_q=max_qo_len,
+        max_seqlen_k=max_kv_len,
+        causal=True,
+        window_size=(window_left, -1),
+        sink_size=sink_size,
+        sink_ptr=sink_ptr,
+        kv_last_page_lens=kv_last_page_lens,
+        return_lse=False,
+    )
+
+    # ── Compare ───────────────────────────────────────────────────────────────
+    rtol, atol = get_tolerances(dtype)
+    assert_output_matches_reference(out, q_indptr_cpu, o_ref, rtol, atol)
+    return {"status": "passed"}
+
+
+@pytest.mark.parametrize("seed", [42])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "sink_ptr_value",
+    [None, 0.0, 2.0],
+    ids=["ptr=None", "ptr=0.0", "ptr=2.0"],
+)
+@pytest.mark.parametrize("sink_size", [4, 16])
+@pytest.mark.parametrize(
+    "window_left,kv_len",
+    [(128, 512), (1024, 2048)],
+    ids=["win=128/kv=512", "win=1024/kv=2048"],
+)
+@pytest.mark.parametrize("qo_len", [32, 128])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 1), (4, 4)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("page_size", [16])
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_batch_prefill_sink(
+    batch_size,
+    page_size,
+    head_dim,
+    num_qo_heads,
+    num_kv_heads,
+    qo_len,
+    window_left,
+    kv_len,
+    sink_size,
+    sink_ptr_value,
+    dtype,
+    seed,
+):
+    """
+    Test batch_prefill with StreamLLM sink token support.
+
+    Validates:
+    - sink_size: first sink_size KV positions always attended (never window-masked)
+    - sink_ptr: virtual sink token with fixed logit participates in softmax
+    - window_left + sink_size creates a real gap; gap tokens are correctly masked
+    """
+    run_batch_prefill_sink(
+        batch_size=batch_size,
+        qo_len=qo_len,
+        kv_len=kv_len,
+        page_size=page_size,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        window_left=window_left,
+        sink_size=sink_size,
+        sink_ptr_value=sink_ptr_value,
+        dtype=dtype,
+        seed=seed,
+    )
+
+
+# CI runs `python3 test_batch_prefill.py` (no pytest), so the __main__ block
+# above only executes the non-sink scenarios. Add a small representative sweep
+# of the StreamLLM sink scenarios here so they actually exercise in CI.
+if __name__ == "__main__":
+    sink_cases = list(
+        itertools.product(
+            [(128, 512), (1024, 2048)],  # (window_left, kv_len)
+            [4],  # sink_size
+            [None, 2.0],  # sink_ptr_value
+            [torch.bfloat16],  # dtype
+        )
+    )
+    for (window_left, kv_len), sink_size, sink_ptr_value, dtype in sink_cases:
+        run_batch_prefill_sink(
+            batch_size=1,
+            qo_len=128,
+            kv_len=kv_len,
+            page_size=16,
+            num_qo_heads=8,
+            num_kv_heads=1,
+            head_dim=128,
+            window_left=window_left,
+            sink_size=sink_size,
+            sink_ptr_value=sink_ptr_value,
+            dtype=dtype,
+            seed=42,
+        )
