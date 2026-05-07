@@ -307,6 +307,7 @@ def _compile_preshuffle_to_cache(
     out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
+    bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
     stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
 
     exe = compile_preshuffle_gemm_a8(
@@ -323,7 +324,7 @@ def _compile_preshuffle_to_cache(
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
         xcd_swizzle=xcd_swizzle,
     )
-    _compile_executable_to_cache(exe, out, a, b, scale_a, scale_b, m, n, stream)
+    _compile_executable_to_cache(exe, out, a, b, scale_a, scale_b, bias, m, n, stream)
 
 
 def compile_one_config(
