@@ -930,7 +930,18 @@ def get_2stage_cfgs(
         ):
             block_m = 128
             if not is_shuffled and not kernelName2:
-                kernelName2 = "moe_ck2stages_gemm2_256x128x128x64_1x4_TypeCast_v3_Nswizzle0_Quant0_MulRoutedWeight1_B16_B16_B16"
+                stage2_consumes_routed_weight = not doweight_stage1
+                stage2_op = (
+                    "TypeCastExpertWeight"
+                    if stage2_consumes_routed_weight
+                    else "TypeCast"
+                )
+                stage2_mul_routed_weight = 1 if stage2_consumes_routed_weight else 0
+                kernelName2 = (
+                    "moe_ck2stages_gemm2_256x128x128x64_1x4_"
+                    f"{stage2_op}_v3_Nswizzle0_Quant0_"
+                    f"MulRoutedWeight{stage2_mul_routed_weight}_B16_B16_B16"
+                )
         ksplit = (
             ksplit
             if (run_1stage)
