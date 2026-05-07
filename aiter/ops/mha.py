@@ -15,6 +15,7 @@ from ..jit.utils.mha_recipes import (
 )
 from ..utility import dtypes
 
+
 def cmdGenFunc_mha_fwd(
     q: Tensor,
     k: Tensor,
@@ -216,7 +217,8 @@ def mha_fwd(
     v_descale: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    ...
 
 
 def gen_fmha_v3_fwd_fake_tensors(
@@ -266,7 +268,8 @@ def fmha_v3_fwd(
     k_descale: Optional[Tensor] = None,
     v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    ...
 
 
 # ---------------------------------------------------------------------------
@@ -293,9 +296,11 @@ def gen_fmha_fwd_f16_asm_fake_tensors(
     batch, q_seq_len, q_head_num, _ = q.shape
     d_v = v.size(3)
     fake_out = (
-        out if out is not None
-        else torch.empty((batch, q_seq_len, q_head_num, d_v),
-                         dtype=q.dtype, device=q.device)
+        out
+        if out is not None
+        else torch.empty(
+            (batch, q_seq_len, q_head_num, d_v), dtype=q.dtype, device=q.device
+        )
     )
     fake_lse = torch.empty(
         (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
@@ -317,7 +322,8 @@ def fmha_fwd_f16_asm(
     return_lse: bool,
     sink: Optional[Tensor] = None,
     out: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor]: ...
+) -> Tuple[Tensor, Tensor]:
+    ...
 
 
 def cmdGenFunc_mha_varlen_fwd(
@@ -550,7 +556,8 @@ def mha_varlen_fwd(
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    ...
 
 
 def gen_fmha_v3_varlen_fwd_fake_tensor(
@@ -583,7 +590,6 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-
     device = q.device
     dtype = q.dtype
 
@@ -650,7 +656,8 @@ def fmha_v3_varlen_fwd(
     gen: Optional[torch.Generator] = None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    ...
 
 
 def cmdGenFunc_mha_bwd(
@@ -861,7 +868,8 @@ def mha_bwd(
     gen: Optional[Generator] = None,
     sink: Optional[Tensor] = None,
     d_sink: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    ...
 
 
 def gen_fmha_v3_bwd_fake_tensors(
@@ -913,7 +921,8 @@ def fmha_v3_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    ...
 
 
 def cmdGenFunc_mha_varlen_bwd(
@@ -1226,7 +1235,8 @@ def mha_varlen_bwd(
     cu_seqlens_k_padded: Optional[Tensor] = None,
     sink: Optional[Tensor] = None,
     d_sink: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    ...
 
 
 def gen_fmha_v3_varlen_bwd_fake_tensor(
@@ -1297,7 +1307,8 @@ def fmha_v3_varlen_bwd(
     gen: Optional[Generator] = None,
     cu_seqlens_q_padded: Optional[Tensor] = None,
     cu_seqlens_k_padded: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    ...
 
 
 def maybe_contiguous(x):
@@ -1327,7 +1338,6 @@ def _flash_attn_forward(
     sink_ptr: Optional[Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-
     batch_size, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
     if sink_ptr is not None:
@@ -1380,7 +1390,7 @@ def _flash_attn_forward(
         # gfx1250 ASM bf16 forward (fmha_fwd_f16_asm).  Single-shot batched
         # (no varlen / dropout / swa / quant / alibi / bias).  Sink logits
         # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
-        ret = (get_gfx() == "gfx1250")
+        ret = get_gfx() == "gfx1250"
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (hdim_q in (64, 128))
         ret = ret and (hdim_v == hdim_q)
@@ -1422,9 +1432,14 @@ def _flash_attn_forward(
             # who don't care about sink still hit this fast path.
             sink_for_kernel = torch.zeros(nhead_q, dtype=torch.float32, device=q.device)
         _r = fmha_fwd_f16_asm(
-            q, k, v,
-            float(softmax_scale), bool(causal), True,
-            sink_for_kernel, out,
+            q,
+            k,
+            v,
+            float(softmax_scale),
+            bool(causal),
+            True,
+            sink_for_kernel,
+            out,
         )
         out_ = _r[0]
         softmax_lse = _r[1]
@@ -1497,7 +1512,6 @@ def can_impl_fmha_v3_bwd(
     deterministic: bool,
     is_v3_atomic_fp32: Optional[bool] = True,
 ) -> bool:
-
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
     batch_stride_q = q.stride(0)
@@ -2147,7 +2161,6 @@ def _flash_attn_varlen_forward(
     zero_tensors: bool = False,
     sink_ptr: Optional[Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-
     _, nhead_q, hdim_q = q.shape
     batch_size = cu_seqlens_q.numel() - 1
 
@@ -2317,7 +2330,6 @@ def _flash_attn_varlen_backward(
     sink: Optional[Tensor] = None,
     d_sink: Optional[Tensor] = None,
 ) -> torch.Tensor:
-
     _, nhead_q, hdim_q = q.shape
 
     nhead_k = v.shape[-2]
@@ -2556,7 +2568,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             sink_ptr=sink_ptr,
         )
         if is_grad:
-
             assert return_lse
             ctx.save_for_backward(
                 q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
@@ -2953,7 +2964,8 @@ def mha_batch_prefill(
     seqlen_k: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    ...
 
 
 def _mha_batch_prefill(
@@ -2989,7 +3001,6 @@ def _mha_batch_prefill(
     ] = None,  # [num_block, num_kv_head, 2] per-page K/V descales
     sink_ptr: Optional[Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_batch_prefill(
         q,

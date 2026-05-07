@@ -48,7 +48,9 @@ pytestmark = pytest.mark.skipif(
 
 import aiter
 from aiter.test_common import checkAllclose, run_perftest
-from aiter.test_mha_common import attention_ref  # noqa: F401  (kept for easy swap-back; see doc-block below)
+from aiter.test_mha_common import (
+    attention_ref,
+)  # noqa: F401  (kept for easy swap-back; see doc-block below)
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +98,9 @@ def _ref_attn(q, k, v, *, is_causal: bool, sink: "Optional[torch.Tensor]" = None
     scale = 1.0 / math.sqrt(d)
     attn = torch.einsum("bshd,bkhd->bhsk", qf, kf)
     if is_causal:
-        m = torch.triu(torch.ones(sq, sk, dtype=torch.bool, device=q.device),
-                       sk - sq + 1)
+        m = torch.triu(
+            torch.ones(sq, sk, dtype=torch.bool, device=q.device), sk - sq + 1
+        )
         attn = attn.masked_fill(m, float("-inf"))
     max_attn, _ = attn.max(dim=-1)
     if sink is not None:
@@ -112,13 +115,12 @@ def _ref_attn(q, k, v, *, is_causal: bool, sink: "Optional[torch.Tensor]" = None
         denom_total = denom_real + sink_term
     else:
         denom_total = denom_real
-    probs = torch.exp((attn - max_total.unsqueeze(-1)) * scale) / denom_total.unsqueeze(-1)
+    probs = torch.exp((attn - max_total.unsqueeze(-1)) * scale) / denom_total.unsqueeze(
+        -1
+    )
     out = torch.einsum("bhsk,bkhd->bshd", probs, vf).to(q.dtype)
     lse = torch.log(denom_total) + max_total * scale
     return out, lse
-
-
-
 
 
 def _cmp(a: torch.Tensor, b: torch.Tensor, *, rtol=1e-2, atol=1e-2, msg: str = ""):
@@ -147,9 +149,9 @@ def _nrms(actual: torch.Tensor, expected: torch.Tensor) -> float:
     a32 = actual.detach().float().cpu()
     b32 = expected.detach().float().cpu()
     abs_diff = (a32 - b32).abs()
-    eps      = 1e-7
+    eps = 1e-7
     max_item = max(a32.abs().max().item(), b32.abs().max().item(), eps)
-    sq_diff  = (abs_diff / b32.abs().clamp(min=eps)).pow(2)
+    sq_diff = (abs_diff / b32.abs().clamp(min=eps)).pow(2)
     return (sq_diff.sum().sqrt() / (math.sqrt(b32.numel()) * max_item)).item()
 
 
@@ -164,22 +166,31 @@ def _bench(fn, *args, num_iters: int = 10, num_warmup: int = 2, **kwargs) -> flo
         fn(*args, **kwargs)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
-    end   = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(num_iters):
         fn(*args, **kwargs)
     end.record()
     end.synchronize()
-    return start.elapsed_time(end) * 1000.0 / num_iters   # ms->us, per-iter
-
+    return start.elapsed_time(end) * 1000.0 / num_iters  # ms->us, per-iter
 
 
 # ---------------------------------------------------------------------------
 # Layout helpers
 # ---------------------------------------------------------------------------
 
-def make_qkv_bshd(layout: int, sq: int, sk: int, batch: int, hq: int, hk: int, d: int,
-                   dtype=torch.bfloat16, device: str = "cuda"):
+
+def make_qkv_bshd(
+    layout: int,
+    sq: int,
+    sk: int,
+    batch: int,
+    hq: int,
+    hk: int,
+    d: int,
+    dtype=torch.bfloat16,
+    device: str = "cuda",
+):
     """Allocate (q, k, v) in `layout` memory, return **bshd-shaped views**.
 
     The API only accepts bshd shape ([b, s, h, d]).  But the kernel reads
@@ -193,18 +204,30 @@ def make_qkv_bshd(layout: int, sq: int, sk: int, batch: int, hq: int, hk: int, d
         1 = bhsd  → underlying [b,h,s,d], permute(0,2,1,3) → bshd view
         2 = sbhd  → underlying [s,b,h,d], permute(1,0,2,3) → bshd view
     """
-    if layout == 0:    # bshd allocation, naturally contiguous
+    if layout == 0:  # bshd allocation, naturally contiguous
         q = torch.randn(batch, sq, hq, d, dtype=dtype, device=device)
         k = torch.randn(batch, sk, hk, d, dtype=dtype, device=device)
         v = torch.randn(batch, sk, hk, d, dtype=dtype, device=device)
     elif layout == 1:  # bhsd allocation, view as bshd
-        q = torch.randn(batch, hq, sq, d, dtype=dtype, device=device).permute(0, 2, 1, 3)
-        k = torch.randn(batch, hk, sk, d, dtype=dtype, device=device).permute(0, 2, 1, 3)
-        v = torch.randn(batch, hk, sk, d, dtype=dtype, device=device).permute(0, 2, 1, 3)
+        q = torch.randn(batch, hq, sq, d, dtype=dtype, device=device).permute(
+            0, 2, 1, 3
+        )
+        k = torch.randn(batch, hk, sk, d, dtype=dtype, device=device).permute(
+            0, 2, 1, 3
+        )
+        v = torch.randn(batch, hk, sk, d, dtype=dtype, device=device).permute(
+            0, 2, 1, 3
+        )
     elif layout == 2:  # sbhd allocation, view as bshd
-        q = torch.randn(sq, batch, hq, d, dtype=dtype, device=device).permute(1, 0, 2, 3)
-        k = torch.randn(sk, batch, hk, d, dtype=dtype, device=device).permute(1, 0, 2, 3)
-        v = torch.randn(sk, batch, hk, d, dtype=dtype, device=device).permute(1, 0, 2, 3)
+        q = torch.randn(sq, batch, hq, d, dtype=dtype, device=device).permute(
+            1, 0, 2, 3
+        )
+        k = torch.randn(sk, batch, hk, d, dtype=dtype, device=device).permute(
+            1, 0, 2, 3
+        )
+        v = torch.randn(sk, batch, hk, d, dtype=dtype, device=device).permute(
+            1, 0, 2, 3
+        )
     else:
         raise ValueError(f"unsupported layout={layout}")
     return q, k, v
@@ -222,9 +245,17 @@ def _d64_sink(hq: int, device: str) -> torch.Tensor:
 # Kernel / reference helpers (mxfp8-style: one-line wrappers used by tests).
 # ---------------------------------------------------------------------------
 
-def run_kernel(q, k, v, *, scale: float, is_causal: bool,
-               sink: Optional[torch.Tensor] = None,
-               via: str = "ops"):
+
+def run_kernel(
+    q,
+    k,
+    v,
+    *,
+    scale: float,
+    is_causal: bool,
+    sink: Optional[torch.Tensor] = None,
+    via: str = "ops",
+):
     """Call the kernel and return (out, lse).
 
     via = "ops"        → low-level aiter.fmha_fwd_f16_asm
@@ -232,13 +263,23 @@ def run_kernel(q, k, v, *, scale: float, is_causal: bool,
     """
     if via == "ops":
         return aiter.fmha_fwd_f16_asm(
-            q, k, v, scale, is_causal, True, sink=sink,
+            q,
+            k,
+            v,
+            scale,
+            is_causal,
+            True,
+            sink=sink,
         )
     if via == "public":
         r = aiter.flash_attn_func(
-            q, k, v,
-            softmax_scale=scale, causal=is_causal,
-            return_lse=True, sink_ptr=sink,
+            q,
+            k,
+            v,
+            softmax_scale=scale,
+            causal=is_causal,
+            return_lse=True,
+            sink_ptr=sink,
         )
         return r[0], r[1]
     raise ValueError(f"unknown via={via!r}")
@@ -256,6 +297,7 @@ def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
 # Correctness tests (sbhd input → bshd output, compare against bhsd reference)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
@@ -264,9 +306,9 @@ def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
     [
         # Shapes from run.sh aligned tests: kv_head_num=4, gqa=16
         # → q_head_num = 4 * 16 = 64
-        (8, 1,  128, 2048),   # aligned (test_d64 / test_d128)
-        (8, 1,  130, 2048),   # q unaligned: sq not mult of 128
-        (8, 1,  128, 2300),   # kv unaligned: sk not mult of 256
+        (8, 1, 128, 2048),  # aligned (test_d64 / test_d128)
+        (8, 1, 130, 2048),  # q unaligned: sq not mult of 128
+        (8, 1, 128, 2300),  # kv unaligned: sk not mult of 256
     ],
 )
 def test_fmha_fwd_f16_correctness(batch, hq, hk, sq, sk, head_dim, is_causal):
@@ -275,9 +317,17 @@ def test_fmha_fwd_f16_correctness(batch, hq, hk, sq, sk, head_dim, is_causal):
 
     # Allocate in sbhd memory but return bshd-shaped views (kernel reads
     # strides directly so non-contiguous bshd views work).
-    q, k, v = make_qkv_bshd(layout=2, sq=sq, sk=sk, batch=batch,
-                             hq=hq, hk=hk, d=head_dim,
-                             dtype=torch.bfloat16, device=device)
+    q, k, v = make_qkv_bshd(
+        layout=2,
+        sq=sq,
+        sk=sk,
+        batch=batch,
+        hq=hq,
+        hk=hk,
+        d=head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
     scale = 1.0 / math.sqrt(head_dim)
 
     # D64 -> non-zero sink (exercises ENABLE_SINK code path)
@@ -285,18 +335,36 @@ def test_fmha_fwd_f16_correctness(batch, hq, hk, sq, sk, head_dim, is_causal):
     sink = _d64_sink(hq, device) if head_dim == 64 else None
 
     out_kernel, lse_asm = run_kernel(
-        q, k, v, scale=scale, is_causal=is_causal, sink=sink, via="public",
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=is_causal,
+        sink=sink,
+        via="public",
     )
     out_ref, lse_ref = run_ref(q, k, v, is_causal=is_causal, sink=sink)
 
     nrms_o = _nrms(out_kernel, out_ref)
-    print(f"[corr d={head_dim} causal={is_causal} b={batch} sq={sq} sk={sk}] "
-          f"nrms(out)={nrms_o:.3e}")
+    print(
+        f"[corr d={head_dim} causal={is_causal} b={batch} sq={sq} sk={sk}] "
+        f"nrms(out)={nrms_o:.3e}"
+    )
 
-    _cmp(out_kernel, out_ref, rtol=1e-2, atol=1e-2,
-         msg=f"out mismatch (d={head_dim}, causal={is_causal}, b={batch})")
-    _cmp(lse_asm, lse_ref, rtol=1e-2, atol=1e-2,
-         msg=f"lse mismatch (d={head_dim}, causal={is_causal}, b={batch})")
+    _cmp(
+        out_kernel,
+        out_ref,
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"out mismatch (d={head_dim}, causal={is_causal}, b={batch})",
+    )
+    _cmp(
+        lse_asm,
+        lse_ref,
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"lse mismatch (d={head_dim}, causal={is_causal}, b={batch})",
+    )
 
 
 def test_fmha_fwd_f16_ops_layer():
@@ -305,14 +373,28 @@ def test_fmha_fwd_f16_ops_layer():
     torch.manual_seed(0)
 
     sq, batch, hq, hk, sk, d = 128, 1, 8, 2, 2048, 64
-    q, k, v = make_qkv_bshd(layout=2, sq=sq, sk=sk, batch=batch,
-                             hq=hq, hk=hk, d=d,
-                             dtype=torch.bfloat16, device=device)
+    q, k, v = make_qkv_bshd(
+        layout=2,
+        sq=sq,
+        sk=sk,
+        batch=batch,
+        hq=hq,
+        hk=hk,
+        d=d,
+        dtype=torch.bfloat16,
+        device=device,
+    )
     scale = 1.0 / math.sqrt(d)
-    sink  = _d64_sink(hq, device)
+    sink = _d64_sink(hq, device)
 
     out_kernel, lse_asm = run_kernel(
-        q, k, v, scale=scale, is_causal=False, sink=sink, via="ops",
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=False,
+        sink=sink,
+        via="ops",
     )
     out_ref, lse_ref = run_ref(q, k, v, is_causal=False, sink=sink)
 
@@ -328,9 +410,17 @@ def test_fmha_fwd_f16_d64_requires_sink():
     API — we exercise it via the lower-level ops stub.
     """
     device = "cuda"
-    q, k, v = make_qkv_bshd(layout=0, sq=128, sk=2048, batch=1,
-                             hq=4, hk=4, d=64,
-                             dtype=torch.bfloat16, device=device)
+    q, k, v = make_qkv_bshd(
+        layout=0,
+        sq=128,
+        sk=2048,
+        batch=1,
+        hq=4,
+        hk=4,
+        d=64,
+        dtype=torch.bfloat16,
+        device=device,
+    )
     scale = 1.0 / math.sqrt(64)
     with pytest.raises(RuntimeError, match="D64.*sink"):
         aiter.fmha_fwd_f16_asm(q, k, v, scale, False, True, sink=None)
@@ -342,6 +432,7 @@ def test_fmha_fwd_f16_d64_requires_sink():
 # also produce correct results.  3 layouts x 2 head_dim = 6 cases.
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("layout", [0, 1, 2])
 def test_fmha_fwd_f16_layout(layout, head_dim):
@@ -349,21 +440,45 @@ def test_fmha_fwd_f16_layout(layout, head_dim):
     torch.manual_seed(0)
     batch, hq, hk, sq, sk = 1, 8, 1, 128, 2048
 
-    q, k, v = make_qkv_bshd(layout=layout, sq=sq, sk=sk, batch=batch,
-                             hq=hq, hk=hk, d=head_dim,
-                             dtype=torch.bfloat16, device=device)
+    q, k, v = make_qkv_bshd(
+        layout=layout,
+        sq=sq,
+        sk=sk,
+        batch=batch,
+        hq=hq,
+        hk=hk,
+        d=head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
     scale = 1.0 / math.sqrt(head_dim)
-    sink  = _d64_sink(hq, device) if head_dim == 64 else None
+    sink = _d64_sink(hq, device) if head_dim == 64 else None
 
     out_kernel, lse_asm = run_kernel(
-        q, k, v, scale=scale, is_causal=False, sink=sink, via="public",
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=False,
+        sink=sink,
+        via="public",
     )
     out_ref, lse_ref = run_ref(q, k, v, is_causal=False, sink=sink)
 
-    _cmp(out_kernel, out_ref, rtol=1e-2, atol=1e-2,
-         msg=f"out mismatch (layout={layout}, d={head_dim})")
-    _cmp(lse_asm, lse_ref, rtol=1e-2, atol=1e-2,
-         msg=f"lse mismatch (layout={layout}, d={head_dim})")
+    _cmp(
+        out_kernel,
+        out_ref,
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"out mismatch (layout={layout}, d={head_dim})",
+    )
+    _cmp(
+        lse_asm,
+        lse_ref,
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"lse mismatch (layout={layout}, d={head_dim})",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -372,16 +487,20 @@ def test_fmha_fwd_f16_layout(layout, head_dim):
 # matches a direct ops-layer call bit-for-bit (same kernel, same args).
 # ---------------------------------------------------------------------------
 
+
 def _is_gfx1250() -> bool:
     try:
         from aiter.jit.utils.chip_info import get_gfx
+
         return get_gfx() == "gfx1250"
     except Exception:
         return False
 
 
-@pytest.mark.skipif(not _is_gfx1250(),
-                    reason="flash_attn_func dispatch to fmha_fwd_f16_asm only on gfx1250")
+@pytest.mark.skipif(
+    not _is_gfx1250(),
+    reason="flash_attn_func dispatch to fmha_fwd_f16_asm only on gfx1250",
+)
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_fmha_fwd_f16_via_flash_attn_func(head_dim, is_causal):
@@ -390,17 +509,37 @@ def test_fmha_fwd_f16_via_flash_attn_func(head_dim, is_causal):
     batch, hq, hk, sq, sk = 1, 8, 1, 128, 2048
 
     # bshd input (flash_attn_func contract); contiguous.
-    q, k, v = make_qkv_bshd(layout=0, sq=sq, sk=sk, batch=batch,
-                             hq=hq, hk=hk, d=head_dim,
-                             dtype=torch.bfloat16, device=device)
+    q, k, v = make_qkv_bshd(
+        layout=0,
+        sq=sq,
+        sk=sk,
+        batch=batch,
+        hq=hq,
+        hk=hk,
+        d=head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
     scale = 1.0 / math.sqrt(head_dim)
-    sink  = _d64_sink(hq, device) if head_dim == 64 else None
+    sink = _d64_sink(hq, device) if head_dim == 64 else None
 
     out_direct, lse_direct = run_kernel(
-        q, k, v, scale=scale, is_causal=is_causal, sink=sink, via="ops",
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=is_causal,
+        sink=sink,
+        via="ops",
     )
     out_via, lse_via = run_kernel(
-        q, k, v, scale=scale, is_causal=is_causal, sink=sink, via="public",
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=is_causal,
+        sink=sink,
+        via="public",
     )
 
     # Same kernel, same args -> bit-identical (cast to fp32 to avoid bf16
@@ -421,6 +560,7 @@ def test_fmha_fwd_f16_via_flash_attn_func(head_dim, is_causal):
 # Performance tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_fmha_fwd_f16_perf(head_dim, is_causal):
@@ -429,18 +569,31 @@ def test_fmha_fwd_f16_perf(head_dim, is_causal):
 
     # perf_d64 / perf_d128 in run.sh: batch=2 kv_head_num=8 gqa=8 -> hq=64
     sq, batch, hq, hk, sk = 8192, 2, 64, 8, 8192
-    q, k, v = make_qkv_bshd(layout=2, sq=sq, sk=sk, batch=batch,
-                             hq=hq, hk=hk, d=head_dim,
-                             dtype=torch.bfloat16, device=device)
+    q, k, v = make_qkv_bshd(
+        layout=2,
+        sq=sq,
+        sk=sk,
+        batch=batch,
+        hq=hq,
+        hk=hk,
+        d=head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
     scale = 1.0 / math.sqrt(head_dim)
-    sink  = _d64_sink(hq, device) if head_dim == 64 else None
+    sink = _d64_sink(hq, device) if head_dim == 64 else None
 
     us = _bench(
         aiter.fmha_fwd_f16_asm,
-        q, k, v,
-        scale, is_causal, False,
+        q,
+        k,
+        v,
+        scale,
+        is_causal,
+        False,
         sink=sink,
-        num_iters=10, num_warmup=2,
+        num_iters=10,
+        num_warmup=2,
     )
     flops = 2.0 * batch * hq * sq * sk * (2 * head_dim)
     if is_causal:
@@ -455,8 +608,7 @@ def test_fmha_fwd_f16_perf(head_dim, is_causal):
         f"(run with -s to see live numbers)"
     )
     assert math.isfinite(tflops) and 0 < tflops < 5000, (
-        f"TFLOPS={tflops} not finite / out of plausible range; "
-        f"likely broken timing"
+        f"TFLOPS={tflops} not finite / out of plausible range; " f"likely broken timing"
     )
 
 
@@ -464,9 +616,20 @@ def test_fmha_fwd_f16_perf(head_dim, is_causal):
 # CLI single-shape runner: shared by `__main__` invocation and ad-hoc usage.
 # ---------------------------------------------------------------------------
 
-def run_cli(*, batch: int, hq: int, hk: int, sq: int, sk: int, head_dim: int,
-            causal: bool = False, layout: int = 0,
-            do_ref: bool = False, do_perf: bool = False) -> int:
+
+def run_cli(
+    *,
+    batch: int,
+    hq: int,
+    hk: int,
+    sq: int,
+    sk: int,
+    head_dim: int,
+    causal: bool = False,
+    layout: int = 0,
+    do_ref: bool = False,
+    do_perf: bool = False,
+) -> int:
     """Single-shape runner.
 
     Returns 0 on success, 1 if --ref check fails.  Prints a one-line summary
@@ -476,48 +639,75 @@ def run_cli(*, batch: int, hq: int, hk: int, sq: int, sk: int, head_dim: int,
     torch.manual_seed(0)
     assert hq % hk == 0, "q_head_num must be a multiple of kv_head_num"
 
-    print(f"Shape: b={batch} hq={hq} hk={hk} sq={sq} sk={sk} d={head_dim} "
-          f"causal={causal} layout={layout}", flush=True)
+    print(
+        f"Shape: b={batch} hq={hq} hk={hk} sq={sq} sk={sk} d={head_dim} "
+        f"causal={causal} layout={layout}",
+        flush=True,
+    )
 
-    q, k, v = make_qkv_bshd(layout=layout, sq=sq, sk=sk, batch=batch,
-                             hq=hq, hk=hk, d=head_dim,
-                             dtype=torch.bfloat16, device=device)
+    q, k, v = make_qkv_bshd(
+        layout=layout,
+        sq=sq,
+        sk=sk,
+        batch=batch,
+        hq=hq,
+        hk=hk,
+        d=head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
     scale = 1.0 / math.sqrt(head_dim)
-    sink  = _d64_sink(hq, device) if head_dim == 64 else None
+    sink = _d64_sink(hq, device) if head_dim == 64 else None
     torch.cuda.synchronize()
 
     t0 = _t.time()
     out_kernel, lse_asm = run_kernel(
-        q, k, v, scale=scale, is_causal=causal, sink=sink, via="ops",
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=causal,
+        sink=sink,
+        via="ops",
     )
     torch.cuda.synchronize()
     print(f"asm time: {(_t.time()-t0)*1000:.2f} ms", flush=True)
-    print(f"out.shape={tuple(out_kernel.shape)}  lse.shape={tuple(lse_asm.shape)}",
-          flush=True)
+    print(
+        f"out.shape={tuple(out_kernel.shape)}  lse.shape={tuple(lse_asm.shape)}",
+        flush=True,
+    )
 
     rc = 0
     if do_ref:
         out_ref, lse_ref = run_ref(q, k, v, is_causal=causal, sink=sink)
-        diff_o  = (out_kernel.float() - out_ref.float()).abs().max().item()
-        diff_l  = (lse_asm.float() - lse_ref.float()).abs().max().item()
-        nrms_o  = _nrms(out_kernel, out_ref)
+        diff_o = (out_kernel.float() - out_ref.float()).abs().max().item()
+        diff_l = (lse_asm.float() - lse_ref.float()).abs().max().item()
+        nrms_o = _nrms(out_kernel, out_ref)
         # Pass criterion (bf16 attention conventional thresholds):
         #   |dO|   <= 2e-2   |dLSE| <= 2e-2
         ok_o = diff_o <= 2e-2
         ok_l = diff_l <= 2e-2
-        print(f"ref:  max|dO|={diff_o:.4f} {'OK' if ok_o else 'FAIL'}   "
-              f"max|dLSE|={diff_l:.4f} {'OK' if ok_l else 'FAIL'}   "
-              f"nrms(O)={nrms_o:.3e}",
-              flush=True)
+        print(
+            f"ref:  max|dO|={diff_o:.4f} {'OK' if ok_o else 'FAIL'}   "
+            f"max|dLSE|={diff_l:.4f} {'OK' if ok_l else 'FAIL'}   "
+            f"nrms(O)={nrms_o:.3e}",
+            flush=True,
+        )
         if not (ok_o and ok_l):
             rc = 1
 
     if do_perf:
         us = _bench(
             aiter.fmha_fwd_f16_asm,
-            q, k, v, scale, causal, False,
+            q,
+            k,
+            v,
+            scale,
+            causal,
+            False,
             sink=sink,
-            num_iters=10, num_warmup=2,
+            num_iters=10,
+            num_warmup=2,
         )
         flops = 2.0 * batch * hq * sq * sk * (2 * head_dim)
         if causal:
@@ -527,8 +717,9 @@ def run_cli(*, batch: int, hq: int, hk: int, sq: int, sk: int, head_dim: int,
         # CLI surfaces the same breakage pytest would: us=0 / TFLOPS=inf
         # signals broken timing infra (profiler / ROCTracer event drop).
         if not (us > 0.0 and math.isfinite(tflops) and 0 < tflops < 5000):
-            print(f"perf: WARNING — bogus timing (us={us}, tflops={tflops})",
-                  flush=True)
+            print(
+                f"perf: WARNING — bogus timing (us={us}, tflops={tflops})", flush=True
+            )
             rc = 1
 
     return rc
@@ -538,28 +729,52 @@ parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="Run aiter.fmha_fwd_f16_asm on a single shape and dump kernel args.",
 )
-parser.add_argument("-b",  "--batch",      type=int, default=1,
-                    help="batch size (default 1)")
-parser.add_argument("-n",  "--q_head_num", type=int, default=8,
-                    help="q_head_num (default 8)")
-parser.add_argument("-kn", "--kv_head_num", type=int, default=1,
-                    help="kv_head_num (default 1, must divide q_head_num)")
-parser.add_argument("-q",  "--seqlen_q",   type=int, default=128,
-                    help="q seq length (default 128)")
-parser.add_argument("-k",  "--seqlen_k",   type=int, default=2048,
-                    help="kv seq length (default 2048)")
-parser.add_argument("-d",  "--head_dim",   type=int, choices=[64, 128], default=128,
-                    help="head dim, 64 or 128 (default 128)")
-parser.add_argument("-c",  "--causal",     action="store_true",
-                    help="enable causal mask")
-parser.add_argument("-l",  "--layout",     type=int, choices=[0, 1, 2], default=0,
-                    help="input memory layout: 0=bshd 1=bhsd 2=sbhd (default 0)\n"
-                         "(API always sees bshd shape; non-zero layout returns a\n"
-                         "non-contiguous bshd view of the underlying memory)")
-parser.add_argument("--ref",  action="store_true",
-                    help="also run PyTorch reference and print max diff + nrms")
-parser.add_argument("--perf", action="store_true",
-                    help="run perf benchmark for this shape (10 iters, 2 warmup)")
+parser.add_argument("-b", "--batch", type=int, default=1, help="batch size (default 1)")
+parser.add_argument(
+    "-n", "--q_head_num", type=int, default=8, help="q_head_num (default 8)"
+)
+parser.add_argument(
+    "-kn",
+    "--kv_head_num",
+    type=int,
+    default=1,
+    help="kv_head_num (default 1, must divide q_head_num)",
+)
+parser.add_argument(
+    "-q", "--seqlen_q", type=int, default=128, help="q seq length (default 128)"
+)
+parser.add_argument(
+    "-k", "--seqlen_k", type=int, default=2048, help="kv seq length (default 2048)"
+)
+parser.add_argument(
+    "-d",
+    "--head_dim",
+    type=int,
+    choices=[64, 128],
+    default=128,
+    help="head dim, 64 or 128 (default 128)",
+)
+parser.add_argument("-c", "--causal", action="store_true", help="enable causal mask")
+parser.add_argument(
+    "-l",
+    "--layout",
+    type=int,
+    choices=[0, 1, 2],
+    default=0,
+    help="input memory layout: 0=bshd 1=bhsd 2=sbhd (default 0)\n"
+    "(API always sees bshd shape; non-zero layout returns a\n"
+    "non-contiguous bshd view of the underlying memory)",
+)
+parser.add_argument(
+    "--ref",
+    action="store_true",
+    help="also run PyTorch reference and print max diff + nrms",
+)
+parser.add_argument(
+    "--perf",
+    action="store_true",
+    help="run perf benchmark for this shape (10 iters, 2 warmup)",
+)
 
 if __name__ == "__main__":
     args = parser.parse_args()

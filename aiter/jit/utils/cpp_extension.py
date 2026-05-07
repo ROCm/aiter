@@ -110,6 +110,7 @@ def get_hip_version():
                 content = f.read()
             if "HIP_VERSION_MAJOR" in content:
                 import re
+
                 major = re.search(r"HIP_VERSION_MAJOR\s+(\d+)", content)
                 minor = re.search(r"HIP_VERSION_MINOR\s+(\d+)", content)
                 patch = re.search(r"HIP_VERSION_PATCH\s+(\d+)", content)
