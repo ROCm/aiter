@@ -187,12 +187,13 @@ def build_tune_dict(
                           If None, no libtype filtering is applied.
         kernels_by_name:  Optional dict mapping kernelName string → kernelInstance.
                           When provided and the CSV has a "kernelName" column, kernel
-                          lookup uses the name instead of kernelId. If the name is not
-                          found in kernels_by_name, the entry is skipped (heuristic
-                          default used) and a warning is logged — no kernelId fallback
-                          is attempted, because kernelIds are not stable across kernel
-                          list reorderings. Falls back to kernelId if the kernelName
-                          column is absent from the CSV.
+                          lookup uses the name instead of kernelId. Falls back to
+                          kernelId if the kernelName column is absent from the CSV.
+
+    Strict on stale tuned-CSV rows: any row whose kernelName (or kernelId, in the
+    fallback path) is not present in the registry will raise RuntimeError listing
+    every offending row. A row that codegen silently drops would otherwise compile
+    into a .so guaranteed to TORCH_CHECK(false, ...) at runtime for that shape.
 
     Returns:
         dict with mixed keys: negative ints (from default_dict) and
@@ -208,6 +209,7 @@ def build_tune_dict(
         logger.warning(
             "kernels_by_name provided but CSV has no kernelName column, falling back to kernelId."
         )
+    bad_rows: list[str] = []
     for _, row in filtered.iterrows():
         key = (
             str(row["gfx"]),
@@ -222,10 +224,9 @@ def build_tune_dict(
             if kernel is not None:
                 tune_dict[key] = kernel
             else:
-                logger.warning(
-                    f"kernelName '{kname}' not found in kernels_by_name "
-                    f"(gfx={key[0]}, cu_num={key[1]}, M={key[2]}, N={key[3]}, K={key[4]}); "
-                    f"falling back to heuristic default."
+                bad_rows.append(
+                    f"  kernelName={kname!r} not in kernels_by_name "
+                    f"(gfx={key[0]}, cu_num={key[1]}, M={key[2]}, N={key[3]}, K={key[4]})"
                 )
         else:
             kid = int(row["kernelId"])
@@ -233,11 +234,19 @@ def build_tune_dict(
             if kernel is not None:
                 tune_dict[key] = kernel
             else:
-                logger.warning(
-                    f"kernelId {kid} not in kernels_list "
+                bad_rows.append(
+                    f"  kernelId={kid} not in kernels_list "
                     f"(gfx={key[0]}, cu_num={key[1]}, M={key[2]}, N={key[3]}, K={key[4]}, "
-                    f"kernels_list size={len(kernels_list)}); falling back to heuristic default."
+                    f"kernels_list size={len(kernels_list)})"
                 )
+    if bad_rows:
+        raise RuntimeError(
+            "build_tune_dict: tuned CSV references kernels not in the build registry. "
+            "Either re-tune the CSV against the current kernel list or restore the "
+            "missing kernel definition; the build refuses to produce a .so that would "
+            "TORCH_CHECK(false, ...) at runtime for these shapes:\n"
+            + "\n".join(bad_rows)
+        )
     return tune_dict
 
 
@@ -264,6 +273,7 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
     filtered = filter_tune_df(tune_df, targets)
     if libtype is not None and "libtype" in tune_df.columns:
         filtered = filtered[filtered["libtype"] == libtype]
+    bad_rows: list[str] = []
     for _, row in filtered.iterrows():
         key = (
             str(row["gfx"]),
@@ -278,11 +288,19 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
         if kernel is not None:
             tune_dict[key] = kernel
         else:
-            logger.warning(
-                f"kernelId {kid} not in kernels_list "
+            bad_rows.append(
+                f"  kernelId={kid} not in kernels_list "
                 f"(gfx={key[0]}, cu_num={key[1]}, B={key[2]}, M={key[3]}, N={key[4]}, K={key[5]}, "
-                f"kernels_list size={len(kernels_list)}); falling back to heuristic default."
+                f"kernels_list size={len(kernels_list)})"
             )
+    if bad_rows:
+        raise RuntimeError(
+            "build_tune_dict_batched: tuned CSV references kernels not in the build "
+            "registry. Either re-tune the CSV against the current kernel list or "
+            "restore the missing kernel definition; the build refuses to produce a "
+            ".so that would TORCH_CHECK(false, ...) at runtime for these shapes:\n"
+            + "\n".join(bad_rows)
+        )
     return tune_dict
 
 

@@ -27,6 +27,7 @@ from gemm_a8w8_blockscale_instance import (  # noqa: E402
     default_kernels_dict,
     KernelInstance,
     candidate_kernels_dict,
+    candidate_kernels_by_name,
 )
 
 """
@@ -55,6 +56,7 @@ class gemm_a8w8_blockscale_codegen:
                 default_kernels_dict,
                 candidate_kernels_dict,
                 libtype="ck",
+                kernels_by_name=candidate_kernels_by_name,
             )
         return default_kernels_dict
 

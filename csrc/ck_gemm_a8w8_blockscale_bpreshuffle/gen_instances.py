@@ -27,6 +27,7 @@ from gemm_a8w8_blockscale_bpreshuffle_common import (  # noqa: E402
     default_kernels_dict,
     kernelInstance,
     kernels_list,
+    kernels_by_name,
 )
 
 """
@@ -276,7 +277,11 @@ torch::Tensor
 def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
         return build_tune_dict(
-            pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list, libtype="ck"
+            pd.read_csv(tune_dict_csv),
+            default_kernels_dict,
+            kernels_list,
+            libtype="ck",
+            kernels_by_name=kernels_by_name,
         )
     return default_kernels_dict
 

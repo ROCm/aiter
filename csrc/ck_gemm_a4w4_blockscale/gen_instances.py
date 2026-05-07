@@ -27,6 +27,7 @@ from gemm_a4w4_blockscale_common import (  # noqa: E402
     default_kernels_dict,
     kernelInstance,
     kernels_list,
+    kernels_by_name,
 )
 
 """
@@ -267,8 +268,20 @@ torch::Tensor
 
 def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
+        df = pd.read_csv(tune_dict_csv)
+        # The a4w4 tuned CSV mixes CK kernels and ASM kernels in one file with
+        # no libtype column.  The Python dispatcher in
+        # aiter/ops/gemm_op_a4w4.py routes ASM rows by
+        # kernelName.startswith("_ZN") (mangled C++ symbol of the ASM kernel);
+        # apply the same filter here so the CK codegen sees only CK rows and
+        # build_tune_dict's strict validation stays effective on genuine CK
+        # references.
+        df = df[~df["kernelName"].astype(str).str.startswith("_ZN")]
         return build_tune_dict(
-            pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list
+            df,
+            default_kernels_dict,
+            kernels_list,
+            kernels_by_name=kernels_by_name,
         )
     return default_kernels_dict
 
