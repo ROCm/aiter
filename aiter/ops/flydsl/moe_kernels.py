@@ -634,7 +634,6 @@ def _get_compiled_silu_fused(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    bias_dtype: str = "f32",
 ):
     """Compile and cache the fused gate activation + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
@@ -646,7 +645,6 @@ def _get_compiled_silu_fused(
         gui_layout,
         act=act,
         enable_bias=enable_bias,
-        bias_dtype=bias_dtype,
     )
 
 
@@ -884,13 +882,21 @@ def flydsl_moe_stage1(
     use_splitk_bias = _is_splitk and bias is not None
     if use_splitk_bias and topk_ids is None:
         raise ValueError("topk_ids are required for split-K FlyDSL stage1 bias")
+    # sorted_token_ids only gives (token_id, slot_id). Bias is stored per expert,
+    # so the post-activation kernel needs topk_ids[token_id * topk + slot_id].
     topk_ids_arg = (
         topk_ids.to(torch.int32).contiguous().view(-1)
         if use_splitk_bias
         else sorted_token_ids.view(-1)
     )
     bias_arg = (
-        bias.contiguous().view(-1) if use_splitk_bias else sorted_token_ids.view(-1)
+        bias.contiguous().view(-1)
+        if use_splitk_bias
+        else (
+            bias.contiguous().view(-1)[:0]
+            if bias is not None
+            else torch.empty(0, device=sorted_token_ids.device, dtype=torch.float32)
+        )
     )
     if _gui_sk_fused:
         _quant_mode = "fp4" if _need_fp4 else "fp8"
@@ -901,7 +907,6 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
-            bias_dtype="f32",
         )
         _run_compiled(
             _silu_fused_k,
@@ -926,7 +931,6 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
-            bias_dtype="f32",
         )
         _run_compiled(
             _silu_fused_k,
@@ -949,7 +953,6 @@ def flydsl_moe_stage1(
             topk,
             act=act,
             enable_bias=use_splitk_bias,
-            bias_dtype="f32",
         )
         _run_compiled(
             _silu_fused_k,

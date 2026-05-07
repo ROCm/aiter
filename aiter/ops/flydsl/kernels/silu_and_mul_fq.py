@@ -7,7 +7,7 @@ Designed for split-K MOE stage1 post-processing:
 
   input   : tmp_out  (token_num * topk, inter_dim * 2) bf16
             topk_ids (token_num * topk) i32, optional
-            bias     (expert, inter_dim * 2) bf16/f16/f32, optional
+            bias     (expert, inter_dim * 2) f32, optional
   sorted  : sorted_token_ids (sorted_len,) i32 -- packed (token<<0 | slot<<24)
             num_valid_ids    (1,) i32
   output  : out              raw byte buffer (FP4x2, FP8, or BF16 depending on quant_mode)
@@ -42,7 +42,6 @@ def build_silu_and_mul_fq_module(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    bias_dtype: str = "bf16",
 ):
     """Return a JIT launcher for fused gate activation + optional quant + scale sort.
 
@@ -68,22 +67,6 @@ def build_silu_and_mul_fq_module(
     assert _need_fp4 or _need_fp8 or quant_mode == "none"
     if act not in ("silu", "swiglu"):
         raise ValueError(f"Unsupported activation for split-K path: {act!r}")
-    bias_s = str(bias_dtype).strip().lower()
-    if bias_s in ("bf16", "bfloat16"):
-        bias_is_f32 = False
-    elif bias_s in ("f16", "fp16", "half"):
-        bias_is_f32 = False
-    elif bias_s in ("f32", "fp32", "float"):
-        bias_is_f32 = True
-    else:
-        raise ValueError(f"Unsupported bias dtype for split-K path: {bias_dtype!r}")
-
-    def bias_elem():
-        if bias_s in ("bf16", "bfloat16"):
-            return T.bf16
-        if bias_s in ("f16", "fp16", "half"):
-            return T.f16
-        return T.f32
 
     scale_cols = inter_dim // 32
     ELEMS_PER_THREAD = (inter_dim + BLOCK_THREADS - 1) // BLOCK_THREADS
@@ -168,10 +151,7 @@ def build_silu_and_mul_fq_module(
             bias_rsrc = buffer_ops.create_buffer_resource(bias, max_size=True)
 
             def _load_bias_scalar(offset):
-                bias_val = buffer_ops.buffer_load(
-                    bias_rsrc, offset, vec_width=1, dtype=bias_elem()
-                )
-                return bias_val if bias_is_f32 else arith.extf(f32, bias_val)
+                return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=f32)
 
         num_valid = buffer_ops.buffer_load(nv_rsrc, c0_i32, vec_width=1, dtype=i32)
         token_num_i32 = ArithValue(token_num)
@@ -223,6 +203,8 @@ def build_silu_and_mul_fq_module(
                 with ir.InsertionPoint(_if_valid.then_block):
                     in_row = token_id * topk_i32 + slot_id
                     if enable_bias:
+                        # sorted_ids encodes token and slot, not expert. Use topk_ids
+                        # to recover the expert-specific bias row for this token slot.
                         expert_id = buffer_ops.buffer_load(
                             topk_rsrc, in_row, vec_width=1, dtype=i32
                         )
@@ -306,16 +288,15 @@ def build_silu_and_mul_fq_module(
                             u = u + _load_bias_scalar(
                                 bias_row + inter_dim_i32 + bias_col
                             )
+                        gate = g
+                        linear = u
+                        t = g * neg_log2e
                         if act == "swiglu":
                             gate = arith.minimumf(g, swiglu_limit)
                             linear = arith.maximumf(
                                 arith.minimumf(u, swiglu_limit), swiglu_neg_limit
                             )
                             t = gate * swiglu_neg_alpha_log2e
-                        else:
-                            gate = g
-                            linear = u
-                            t = g * neg_log2e
                         emu = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.exp2.f32", [t], [], []
                         )

@@ -735,7 +735,7 @@ def _flydsl_stage1_wrapper(
         waves_per_eu=parsed.get("waves_per_eu", 3),
         b_nt=parsed.get("b_nt", 2),
         gate_mode=parsed.get("gate_mode", "separated"),
-        bias=bias1,
+        bias=_normalize_bias_for_kernel(bias1),
         topk_ids=topk_ids,
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
