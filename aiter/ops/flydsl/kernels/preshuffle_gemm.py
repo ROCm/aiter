@@ -134,7 +134,7 @@ def compile_preshuffle_gemm_a8(
     """Compile the preshuffle GEMM kernel using the @flyc.kernel API.
 
     Returns a JitFunction that auto-compiles and executes when called.
-    Signature:  launch_fn(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, M, N, stream)
+    Signature:  launch_fn(arg_c, arg_a, arg_b, arg_bias, arg_scale_a, arg_scale_b, M, N, stream)
 
     Compile-time constants: K, tile_m/n/k, in_dtype, out_dtype (determine loop structure).
     Runtime parameters: M, N (passed as i32 kernel args).
