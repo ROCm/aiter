@@ -242,18 +242,18 @@ def mla_decode_fwd(
                     )
                 )
             )
-            else torch.empty(
+            else torch.zeros(
                 (total_s, num_kv_splits, nhead, v_head_dim),
                 dtype=dtypes.fp32,
                 device=device,
             )
         )
 
-        attn_lse = torch.empty(
+        attn_lse = torch.zeros(
             (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
         )
         final_lse = (
-            torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+            torch.zeros((total_s, nhead), dtype=dtypes.fp32, device=device)
             if return_lse
             else None
         )
@@ -431,18 +431,18 @@ def mla_decode_fwd(
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
 
-        logits = torch.empty(
+        logits = torch.zeros(
             (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
         )
-        attn_lse = torch.empty(
+        attn_lse = torch.zeros(
             (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
             dtype=dtypes.fp32,
             device=device,
         )
         final_lse = (
-            torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+            torch.zeros((total_s, nhead), dtype=dtypes.fp32, device=device)
             if return_lse
             else None
         )
