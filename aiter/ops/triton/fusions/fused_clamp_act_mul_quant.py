@@ -8,7 +8,6 @@ from typing import Literal, Optional
 import torch
 import triton
 
-from aiter import dtypes as aiter_dtypes
 from aiter.ops.triton._triton_kernels.fusions.fused_clamp_act_mul_quant import (
     _fused_clamp_silu_mul_fp8_group_quant_kernel,
 )

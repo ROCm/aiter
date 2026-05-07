@@ -22,7 +22,6 @@ last ``rope_head_dim`` elements in-place. Programs with
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import _unit_rope
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import _rmsmorm_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
