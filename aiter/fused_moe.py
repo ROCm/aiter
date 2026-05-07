@@ -784,22 +784,34 @@ def get_2stage_cfgs(
         import pandas as pd
 
         df = pd.read_csv(tune_file)
-        # Keep CSV schema unchanged but disable act_type during lookup.
-        if "act_type" in df.columns:
-            df["act_type"] = _ACT_TYPE_DISABLED_KEY
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
-        # Disabling act_type can merge multiple rows into the same lookup key.
-        # Keep the first row deterministically to avoid index collisions.
-        dup_mask = df.duplicated(subset=_INDEX_COLS, keep="first")
+
+        # Primary dict: keep original act_type for exact-match lookup.
+        df_primary = df.copy()
+        dup_mask = df_primary.duplicated(subset=_INDEX_COLS, keep="first")
+        if dup_mask.any():
+            logger.warning(
+                f"[fused_moe] duplicate tuned rows (primary) in {tune_file}; "
+                f"keeping first match for {int(dup_mask.sum())} rows"
+            )
+            df_primary = df_primary.loc[~dup_mask]
+        primary = df_primary.set_index(_INDEX_COLS).to_dict("index")
+
+        # Fallback dict: disable act_type so any activation can match.
+        df_fallback = df.copy()
+        if "act_type" in df_fallback.columns:
+            df_fallback["act_type"] = _ACT_TYPE_DISABLED_KEY
+        dup_mask = df_fallback.duplicated(subset=_INDEX_COLS, keep="first")
         if dup_mask.any():
             logger.warning(
                 f"[fused_moe] duplicate tuned rows after disabling act_type in {tune_file}; "
                 f"keeping first match for {int(dup_mask.sum())} rows"
             )
-            df = df.loc[~dup_mask]
-        df = df.set_index(_INDEX_COLS).to_dict("index")
-        return df
+            df_fallback = df_fallback.loc[~dup_mask]
+        fallback = df_fallback.set_index(_INDEX_COLS).to_dict("index")
+
+        return primary, fallback
 
     _flydsl_fallback_cache = {}
 
@@ -848,6 +860,21 @@ def get_2stage_cfgs(
         inter_dim,
         expert,
         topk,
+        activation,
+        str(dtype),
+        str(q_dtype_a),
+        str(q_dtype_w),
+        str(q_type),
+        use_g1u1,
+        doweight_stage1,
+    )
+    keys_disabled = (
+        cu_num,
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
         _ACT_TYPE_DISABLED_KEY,
         str(dtype),
         str(q_dtype_a),
@@ -878,12 +905,21 @@ def get_2stage_cfgs(
         )
         logger.info("\033[0m")
 
-    cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
+    def _lookup_cfg(c2s):
+        if not c2s:
+            return None
+        primary, fallback = c2s
+        result = primary.get(keys, None)
+        if result is None:
+            result = fallback.get(keys_disabled, None)
+        return result
+
+    cfg = _lookup_cfg(cfg_2stages)
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
-        cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
+        cfg = _lookup_cfg(cfg_2stages)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
     if cfg is not None and not is_flydsl_available():
@@ -891,7 +927,7 @@ def get_2stage_cfgs(
         kn2 = str(cfg.get("kernelName2", ""))
         if kn1.startswith("flydsl_") or kn2.startswith("flydsl_"):
             fallback_cfgs = get_flydsl_fallback_cfgs(tune_file)
-            fallback = fallback_cfgs.get(keys)
+            fallback = fallback_cfgs.get(keys, None) or fallback_cfgs.get(keys_disabled, None)
             if fallback is not None:
                 cfg = fallback
                 logger.info(
