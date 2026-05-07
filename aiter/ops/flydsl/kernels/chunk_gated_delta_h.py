@@ -119,7 +119,7 @@ def compile_chunk_gated_delta_h(
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    _K5_KERNEL_REVISION = 2  # OPT-D/H/F/7/4 applied
+    _K5_KERNEL_REVISION = 4  # +OPT-Pf: split w_next prefetch into 2 phases
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -515,7 +515,33 @@ def compile_chunk_gated_delta_h(
 
             K_STEPS_PER_BLOCK = 64 // WMMA_K
 
-            for kb in range_constexpr(NUM_K_BLOCKS):
+            # OPT-Pf: w_next prefetch is split into 2 phases (mirrors HIP K5).
+            # Phase-1 covers all but the LAST K-block of the next chunk, and
+            # is issued between GEMM1's kb iterations so its HBM latency is
+            # masked by the second half of GEMM1 MFMAs. Phase-2 covers the
+            # last K-block and stays in its original position (after the
+            # vn/k LDS write barrier, masked by GEMM2). Order in the final
+            # ``w_next_prefetch`` list is preserved [kb][batch] so the next
+            # iteration's lds_w writer can re-use ``w_prefetch_lds_all``
+            # unchanged.
+            next_i_t_i32 = i_t_i32 + fx.Int32(1)
+
+            def _prefetch_w_next_kb(kb):
+                out = []
+                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                    row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+                    abs_row = next_i_t_i32 * fx.Int32(BT) + row
+                    in_bounds = arith.cmpi(arith.CmpIPredicate.slt, abs_row, T_local)
+                    safe_row = arith.select(in_bounds, abs_row, fx.Int32(0))
+                    g_off = (
+                        w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
+                    )
+                    out.append(w_.vec_load((fx.Index(g_off),), LOAD_VEC_WIDTH))
+                return out
+
+            w_next_prefetch = []
+
+            def _gemm1_kb(kb):
                 for ks in range_constexpr(K_STEPS_PER_BLOCK):
                     w_lds_row_idx = wid_idx * arith.index(16) + lane_n_idx
                     w_lds_col_idx = arith.index(
@@ -548,6 +574,18 @@ def compile_chunk_gated_delta_h(
                         b_frag = vector.shuffle(h_lo, h_hi, [0, 1, 2, 3, 4, 5, 6, 7])
 
                         bv_accs[nr] = _mfma_bf16_16x16x32(a_frag, b_frag, bv_accs[nr])
+
+            # GEMM1 kb=0..NUM_K_BLOCKS-2, with phase-1 w_next prefetch
+            # injected BETWEEN kb iterations so the HBM load latency overlaps
+            # the next kb's MFMAs.
+            for kb in range_constexpr(NUM_K_BLOCKS - 1):
+                _gemm1_kb(kb)
+                # Issue this kb's w_next packets while the next kb's GEMM1
+                # MFMAs run.
+                w_next_prefetch.extend(_prefetch_w_next_kb(kb))
+
+            # GEMM1 last kb (its w_next prefetch is deferred to phase-2).
+            _gemm1_kb(NUM_K_BLOCKS - 1)
 
             # v_new = u - b_v (u values already prefetched)
             vn_frags = []
@@ -668,21 +706,10 @@ def compile_chunk_gated_delta_h(
 
             gpu.barrier()
 
-            # -- Prefetch NEXT iteration's w during state update MFMA --
-            next_i_t_i32 = i_t_i32 + fx.Int32(1)
-            w_next_prefetch = []
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                    row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                    abs_row = next_i_t_i32 * fx.Int32(BT) + row
-                    in_bounds = arith.cmpi(arith.CmpIPredicate.slt, abs_row, T_local)
-                    safe_row = arith.select(in_bounds, abs_row, fx.Int32(0))
-                    g_off = (
-                        w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
-                    )
-                    w_next_prefetch.append(
-                        w_.vec_load((fx.Index(g_off),), LOAD_VEC_WIDTH)
-                    )
+            # -- OPT-Pf phase-2: prefetch the LAST kb of next iteration's w
+            # here (its load latency is masked by the GEMM2 MFMAs below).
+            # The earlier kbs were already prefetched during GEMM1 above.
+            w_next_prefetch.extend(_prefetch_w_next_kb(NUM_K_BLOCKS - 1))
 
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for bt_s in range_constexpr(BT_STEPS):
