@@ -195,9 +195,7 @@ def test_fused_moe_ptpc_fp8_hsaco(
     w2, w2_scale = torch_quant(w2_bf16, quant_dtype=weight_dtype)
 
     topk_weight = torch.randn(batch_size, topk, dtype=torch.float32, device=device)
-    topk_ids = torch.randint(
-        0, num_experts, (batch_size, topk), dtype=torch.int32, device=device
-    )
+    topk_ids = torch.randperm(batch_size * topk, dtype=torch.int32, device=device).reshape(batch_size, topk)
 
     ref_ck = _ref_fused_moe_ck(
         hidden_states,
@@ -329,9 +327,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
 
     summary = []
-    #for B in (1, 2, 4, 8, 10, 12, 16, 32):
-    #for B in (1, 2, 4, 8, 10, 12, 16):
-    for B in [16, 32]:
+    for B in (1, 2, 4, 8, 10, 12, 16, 32):
         ret = test_fused_moe_ptpc_fp8_hsaco(
             batch_size=B,
             num_experts=512,

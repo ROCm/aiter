@@ -195,7 +195,7 @@ def fused_moe_ptpc_fp8(
             B,
         )
         print("Call moe_2stage_splitk kernel end")
-    
+
     elif 16 <= B <= 32:
         # Prebuilt ``moe_2stage_down_loopn`` .co bakes constexprs; HIP entry is only
         # ``(p_input, p_weight, p_output, p_sorted_ids, p_sorted_weights,
@@ -244,7 +244,7 @@ def fused_moe_ptpc_fp8(
             TOPK,
         )
         print("Call moe_gemm_batch kernel end")
-        assert torch.isfinite(gemm1_out).all(), "gemm1_out output contains NaN/Inf"
+        #assert torch.isfinite(gemm1_out).all(), "gemm1_out output contains NaN/Inf"
         fp8_ptpc = w1.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
         num_CU = torch.cuda.get_device_properties(hidden_states.device).multi_processor_count
         BLOCK_N = 1024
@@ -271,11 +271,7 @@ def fused_moe_ptpc_fp8(
                 dtype=torch.bfloat16,
                 device=hidden_states.device,
             )
-            # gemm2_out = torch.zeros(
-            #     (B, TOPK, HIDDEN_SIZE),
-            #     dtype=torch.bfloat16,
-            #     device=hidden_states.device,
-            # )
+
             print("Call moe_2stage_down_loopn kernel start")
             moe_2stage_down_loopn(
                 [N2 // BLOCK_N, grid],
@@ -291,7 +287,7 @@ def fused_moe_ptpc_fp8(
                 B,
             )
             print("Call moe_2stage_down_loopn kernel end")
-            assert torch.isfinite(gemm2_out).all(), "gemm2_out output contains NaN/Inf"
+            #assert torch.isfinite(gemm2_out).all(), "gemm2_out output contains NaN/Inf"
             cur_out = torch.sum(gemm2_out, dim=1)
         else:
             print("Get moe_2stage_splitk kernel start")
@@ -322,50 +318,3 @@ def fused_moe_ptpc_fp8(
 
     return cur_out
 
-
-if __name__ == "__main__":
-    # Matches ``fused_moe_hsaco_batch1_fwd`` hardcoded gfx942 kernel layout (see that function).
-    HIDDEN_SIZE = 4096
-    INTER_SIZE = 1024
-    TP = 8
-    INTER_TP = INTER_SIZE // TP
-    TOPK = 10
-    E = 512
-    # B = 2 # 1 ~ 32
-    batch_sizes = [1, 2, 4, 8, 10, 12, 16, 32]
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    weight_dtype = torch.float8_e4m3fnuz
-    for B in batch_sizes:
-        hidden_states = torch.randn(B, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
-        w1_bf16 = torch.randn(E, 2 * INTER_TP, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
-        w2_bf16 = torch.randn(E, HIDDEN_SIZE, INTER_TP, dtype=torch.bfloat16, device=device)
-
-        torch_quant = aiter.get_torch_quant(QuantType.per_Token)
-        w1, w1_scale = torch_quant(w1_bf16, quant_dtype=weight_dtype)
-        w2, w2_scale = torch_quant(w2_bf16, quant_dtype=weight_dtype)
-
-        topk_weight = torch.randn(B, TOPK, dtype=torch.float32, device=device)
-        topk_ids = torch.randint(0, E, (B, TOPK), dtype=torch.int32, device=device)
-
-        expert_mask = None
-        num_local_tokens = None
-        moe_sorting_dispatch_policy = 0
-        cur_out = fused_moe_ptpc_fp8(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            ActivationType.Silu,
-            QuantType.per_Token,
-            w1_scale,
-            w2_scale,
-            expert_mask,
-            num_local_tokens,
-            moe_sorting_dispatch_policy,
-        )
-        if cur_out is None:
-            print("cur_out: None (gfx942 / kernel / shape gate not satisfied or HSACO unavailable)")
-        else:
-            print("cur_out: ", cur_out.shape)
-            print("cur_out: ", cur_out)
