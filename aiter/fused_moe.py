@@ -652,13 +652,16 @@ def nextPow2(n):
     return 1 << (n - 1).bit_length()
 
 
+_PADDED_M_TIERS = [32768, 131072]
+
+
 def get_padded_M(M):
-    padded_m = M
-    if M < 32768:
-        padded_m = nextPow2(padded_m)
-    else:
-        padded_m = 32768
-    return padded_m
+    if M < _PADDED_M_TIERS[0]:
+        return nextPow2(M)
+    for tier in reversed(_PADDED_M_TIERS):
+        if M >= tier:
+            return tier
+    return _PADDED_M_TIERS[0]
 
 
 @dataclass
@@ -940,6 +943,17 @@ def get_2stage_cfgs(
         result = primary.get(keys, None)
         if result is None:
             result = fallback.get(keys_disabled, None)
+        # Tier fallback: if current tier not found, try smaller tiers in descending order
+        if result is None and token > _PADDED_M_TIERS[0]:
+            tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
+            for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
+                keys_fb = (keys[0], fallback_tier) + keys[2:]
+                keys_fb_disabled = (keys_disabled[0], fallback_tier) + keys_disabled[2:]
+                result = primary.get(keys_fb, None)
+                if result is None:
+                    result = fallback.get(keys_fb_disabled, None)
+                if result is not None:
+                    break
         return result
 
     cfg = _lookup_cfg(cfg_2stages)
@@ -1469,7 +1483,6 @@ def fused_moe_2stages(
         and dtype in [dtypes.bf16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        and activation == aiter.ActivationType.Swiglu
     ):
         a2 = a2.to(dtypes.fp8)
         a2_scale = a1_scale

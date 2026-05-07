@@ -401,6 +401,7 @@ parser.add_argument(
         256,
         1024,
         4096,
+        8192,
         163840,
     ],
     help="""Number of tokens.
