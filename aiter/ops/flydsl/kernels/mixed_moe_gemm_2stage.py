@@ -281,10 +281,11 @@ def compile_mixed_moe_gemm1(
         if _stage1_group_size_m > 1
         else ""
     )
+    _async_lds_tag = "_apldswait" if use_async_copy and a_elem_vec_pack > 1 else ""
     _wptr64_tag = "_wptr64" if is_f4_b else ""
     module_name = (
         f"mfma_moe1_{act}_a{a_dtype}_w{b_dtype}_{out_s}{_g_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v37_tidlds_aread{_gm_tag}{_wptr64_tag}_g1u0_splitk"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v37_tidlds_aread{_gm_tag}{_wptr64_tag}{_async_lds_tag}_g1u0_splitk"
     ).replace("-", "_")
 
     # -- LDS sizing (split ping/pong allocators) --
@@ -1506,11 +1507,12 @@ def compile_mixed_moe_gemm1(
                     _sk = _abs_k // arith.constant(pack_K * 128, index=True)
                     _k_off = _sk * layout_b_scale.stride_k0
 
-                    # rocdl.sched_barrier(0)
-                    # rocdl.s_waitcnt(3)
-                    _barrier()
-                    # gpu.barrier()
-                    # rocdl.sched_barrier(0)
+                    # Wait for the previous async global->LDS copy before reading
+                    # from lds_read. `s_barrier` alone does not wait for VMEM.
+                    if use_async_copy:
+                        _barrier(vmcnt=0, lgkmcnt=0)
+                    else:
+                        _barrier()
 
                     # DMA A to OTHER buffer (for next half), non-blocking
                     _abs_k_dma = k_base_idx + arith.constant(next_k_dma_py, index=True)
@@ -1717,8 +1719,10 @@ def compile_mixed_moe_gemm1(
                 _k0_b = k_base_idx // arith.constant(2, index=True)
                 gate_w0, up_w0 = load_b_tile(_k0_b)
                 # Prime the deep pipeline: DMA K=tile_k -> ping (1 tile ahead)
-                # rocdl.s_waitcnt(8)
-                gpu.barrier()
+                if use_async_copy:
+                    _barrier(vmcnt=0, lgkmcnt=0)
+                else:
+                    gpu.barrier()
                 # rocdl.sched_barrier(0)
                 a_tile_pong = prefetch_full_a_from_lds(lds_x_pong)
 
@@ -1936,7 +1940,10 @@ def compile_mixed_moe_gemm1(
                     if not use_async_copy:
                         store_x_tile_to_lds(x_regs_ping, lds_x_ping)
                     # rocdl.s_waitcnt(0)
-                    _barrier()
+                    if use_async_copy:
+                        _barrier(vmcnt=0, lgkmcnt=0)
+                    else:
+                        _barrier()
                     a_tile_ping = prefetch_full_a_from_lds(lds_x_ping)
                     acc_gate, acc_up, epilogue_pf = compute_tile(
                         acc_gate,
