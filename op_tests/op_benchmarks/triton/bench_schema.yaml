@@ -11,10 +11,16 @@ benchmarks:
   batched_gemm_afp4wfp4:
     input_columns: [batch, M, N, K]
     output_columns: [TFLOPS]
+  batched_gemm_a16wfp4:
+    input_columns: [batch, M, N, K]
+    output_columns: [TFLOPS]
   batch_extend_attention:
     input_columns: [B, H, prefix, extend, kv_lora_rank, qk_rope_head_dim, v_head_dim, attn_impl]
     output_columns: [fwd_Time_(ms)]
   gemm_a8w8_blockscale:
+    input_columns: [M, N, K]
+    output_columns: [TFLOPS]
+  gemm_a16w8_blockscale:
     input_columns: [M, N, K]
     output_columns: [TFLOPS]
   gemm_a8w8_per_token_scale:
@@ -79,16 +85,22 @@ benchmarks:
     output_columns: [upstream (TFLOPS), iglp_10 (TFLOPS), perf_report (TFLOPS)]
   pa_decode_gluon_normal_fp8_blk16_ql1:
     input_columns: [batch_size, context_length]
-    output_columns: [Time_(ms) (ms / TB/s), Bandwidth_(TB/s) (ms / TB/s)]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
   pa_decode_gluon_normal_fp8_blk16_ql4:
     input_columns: [batch_size, context_length]
-    output_columns: [Time_(ms) (ms / TB/s), Bandwidth_(TB/s) (ms / TB/s)]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
   pa_decode_gluon_normal_fp8_blk64_ql1:
     input_columns: [batch_size, context_length]
-    output_columns: [Time_(ms) (ms / TB/s), Bandwidth_(TB/s) (ms / TB/s)]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
   pa_decode_gluon_normal_fp8_blk64_ql4:
     input_columns: [batch_size, context_length]
-    output_columns: [Time_(ms) (ms / TB/s), Bandwidth_(TB/s) (ms / TB/s)]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
   pa_decode_gluon_normal_bf16_blk64_ql4:
     input_columns: [batch_size, context_length]
-    output_columns: [Time_(ms) (ms / TB/s), Bandwidth_(TB/s) (ms / TB/s)]
+    output_columns: [Time_(ms), Bandwidth_(TB/s)]
+  fp8_mqa_logits:
+    input_columns: [seq_q_l, seq_kv_l, num_heads_q, head_dim]
+    output_columns: [TFLOPs]
+  mla_decode:
+    input_columns: [model, B, H, S, kv_lora_rank, qk_rope_head_dim, rotary_dim, num_kv_splits]
+    output_columns: [mla_decode_fwd (ms)]
