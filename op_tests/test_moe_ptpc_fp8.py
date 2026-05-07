@@ -3,32 +3,19 @@
 
 """gfx942 HSACO ``fused_moe_ptpc_fp8`` op test.
 
-Torch reference follows ``qwen3.5_dev/aiter/op_tests/test_moe_2stage.py`` ``test_fmoe``
-(see commit ``5ddbcdd871440617820571114f6004bf14a3a700`` — *use use_raw_for_ref to compare
-with torch*): ``torch_moe_stage1`` / ``torch_moe_stage2`` with the same branching as
-``use_raw_for_ref``.
-
-- ``use_raw_for_ref=True``: bf16 ``hidden_states``, ``a1_scale`` / ``a2_scale`` = ``[1]``,
-  no activation requant between stages (same as ``test_fmoe`` lines 191–199, 223–231).
-- ``use_raw_for_ref=False``: quantize activations with ``torch_quant`` into stage 1 and
-  again after stage 1 into stage 2 (same as ``test_fmoe`` default).
-
 **Numeric gate:** HSACO vs CK ``fused_moe`` (``AITER_MOE_SMALL_BATCH=0``) — tight cosine.
-Torch refs are logged / optionally checked with looser tolerance (they differ from HSACO
-when weights are not preshuffled like CK).
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 from typing import Any, Optional
 
 import torch
 
 import aiter
-from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import fused_moe, torch_moe_stage1, torch_moe_stage2
+from aiter import ActivationType, QuantType
+from aiter.fused_moe import fused_moe
 from aiter.fused_moe_ptpc_fp8 import fused_moe_ptpc_fp8
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import checkAllclose, run_perftest
@@ -41,78 +28,6 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
         return 0.0
     sim = 2 * (x * y).sum() / denominator
     return float(1 - sim)
-
-
-def _scale_one(device: torch.device) -> torch.Tensor:
-    return torch.tensor([1.0], dtype=torch.float32, device=device)
-
-
-def ref_torch_two_stage_like_fmoe(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    topk_weight: torch.Tensor,
-    topk_ids: torch.Tensor,
-    *,
-    use_raw_for_ref: bool,
-    activation_quant_dtype: torch.dtype = dtypes.fp8,
-    dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Mirror ``test_fmoe`` reference construction (``use_raw_for_ref`` semantics)."""
-    torch_quant = aiter.get_torch_quant(QuantType.per_Token)
-    B = hidden_states.shape[0]
-    topk = topk_ids.shape[1]
-    dev = hidden_states.device
-    one = _scale_one(dev)
-
-    if use_raw_for_ref:
-        h1 = hidden_states
-        a1_s = one
-    else:
-        a1_qt, a1_scale = torch_quant(
-            hidden_states, quant_dtype=activation_quant_dtype
-        )
-        h1 = a1_qt
-        a1_s = a1_scale
-
-    out1 = torch_moe_stage1(
-        h1,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        dtype=dtype,
-        activation=ActivationType.Silu,
-        quant_type=QuantType.per_Token,
-        a1_scale=a1_s,
-        w1_scale=w1_scale,
-        w1_bias=None,
-        doweight=False,
-    )
-
-    if use_raw_for_ref:
-        h2 = out1
-        a2_s = one
-    else:
-        a2_qt, a2_scale = torch_quant(out1, quant_dtype=activation_quant_dtype)
-        h2 = a2_qt.view(B, topk, -1)
-        a2_s = a2_scale
-
-    return torch_moe_stage2(
-        h2,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        dtype=dtype,
-        quant_type=QuantType.per_Token,
-        w2_scale=w2_scale,
-        a2_scale=a2_s,
-        w2_bias=None,
-        doweight=True,
-    )
 
 
 def _ref_fused_moe_ck(
@@ -156,10 +71,8 @@ def test_fused_moe_ptpc_fp8_hsaco(
     hidden_size: int,
     inter_dim: int,
     *,
-    use_raw_for_ref: bool = True,
     num_iters: int = 11,
     num_warmup: int = 2,
-    assert_torch_vs_hsaco: bool = False,
 ) -> Optional[dict[str, Any]]:
     if not torch.cuda.is_available():
         print("skip test_fused_moe_ptpc_fp8_hsaco: CUDA not available")
@@ -206,16 +119,6 @@ def test_fused_moe_ptpc_fp8_hsaco(
         w1_scale,
         w2_scale,
     )
-    ref_torch = ref_torch_two_stage_like_fmoe(
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        topk_weight,
-        topk_ids,
-        use_raw_for_ref=use_raw_for_ref,
-    )
 
     hsaco_ret, dt_us = run_perftest(
         fused_moe_ptpc_fp8,
@@ -242,9 +145,7 @@ def test_fused_moe_ptpc_fp8_hsaco(
         )
         return None
 
-    assert ref_ck.shape == hsaco_ret.shape == ref_torch.shape, (
-        f"{ref_ck.shape=} {hsaco_ret.shape=} {ref_torch.shape=}"
-    )
+    assert ref_ck.shape == hsaco_ret.shape, f"{ref_ck.shape=} {hsaco_ret.shape=}"
     assert torch.isfinite(hsaco_ret).all(), "HSACO output contains NaN/Inf"
 
     err_ratio_ck = checkAllclose(
@@ -255,73 +156,26 @@ def test_fused_moe_ptpc_fp8_hsaco(
         msg="HSACO vs fused_moe (CK, AITER_MOE_SMALL_BATCH=0)",
     )
     diff_ck = calc_diff(ref_ck, hsaco_ret)
-    # diff_hsaco_vs_torch_ref: torch_moe_stage1/2 uses FP32 dequant matmul; PTPC HSACO
-    # does not match numerically — re-enable when a closer reference exists.
-    # diff_torch = calc_diff(ref_torch, hsaco_ret)
-    # err_ratio_torch = checkAllclose(
-    #     ref_torch,
-    #     hsaco_ret,
-    #     rtol=1e-2,
-    #     atol=1e-2,
-    #     msg=f"HSACO vs torch_moe_stage1/2 (use_raw_for_ref={use_raw_for_ref})",
-    # )
 
     print(
-        f"{batch_size=} use_raw_for_ref={use_raw_for_ref} {diff_ck=:.6f} "
+        f"{batch_size=} {diff_ck=:.6f} "
         f"close_mismatch_ratio_ck={err_ratio_ck:.6f} "
         f"time_us={dt_us:.1f}"
     )
 
-    # if diff_torch > 1e-3:
-    #     logging.warning(
-    #         "logits_diff HSACO vs torch ref: %s (use_raw_for_ref=%s); "
-    #         "see test_moe_2stage use_raw_for_ref discussion",
-    #         diff_torch,
-    #         use_raw_for_ref,
-    #     )
-
     assert diff_ck < 0.02, f"HSACO vs CK logits_diff too large: {diff_ck}"
-
-    # if assert_torch_vs_hsaco:
-    #     assert diff_torch < 0.02, (
-    #         f"HSACO vs torch ref logits_diff too large: {diff_torch} "
-    #         f"(use_raw_for_ref={use_raw_for_ref})"
-    #     )
 
     return {
         "batch_size": batch_size,
         "num_experts": num_experts,
         "topk": topk,
-        "use_raw_for_ref": use_raw_for_ref,
         "diff_hsaco_vs_ck": diff_ck,
-        # "diff_hsaco_vs_torch_ref": diff_torch,
         "close_mismatch_ratio_ck": err_ratio_ck,
-        # "close_mismatch_ratio_torch": err_ratio_torch,
         "time(us)": f"{dt_us:.0f}",
     }
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="HSACO fused_moe_ptpc_fp8 vs CK and torch_moe_stage1/2 reference."
-    )
-    parser.add_argument(
-        "--torch-ref-mode",
-        choices=("raw", "quant"),
-        default="raw",
-        help=(
-            "raw: same as test_fmoe use_raw_for_ref=True (bf16 hidden, scale=1). "
-            "quant: same as test_fmoe use_raw_for_ref=False (torch_quant between stages)."
-        ),
-    )
-    parser.add_argument(
-        "--assert-torch-vs-hsaco",
-        action="store_true",
-        help="Also assert HSACO close to torch ref (usually fails for PTPC HSACO).",
-    )
-    args = parser.parse_args()
-    use_raw = args.torch_ref_mode == "raw"
-
     torch.set_default_device("cuda")
     torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=4)
     torch.manual_seed(0)
@@ -334,10 +188,8 @@ if __name__ == "__main__":
             topk=10,
             hidden_size=4096,
             inter_dim=128,
-            use_raw_for_ref=use_raw,
             num_iters=11,
             num_warmup=2,
-            assert_torch_vs_hsaco=args.assert_torch_vs_hsaco,
         )
         if ret is not None:
             summary.append(ret)
