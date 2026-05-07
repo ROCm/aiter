@@ -51,6 +51,8 @@ def worker(
             print(f"Warning: try run {max_retries} times, but still get 0!")
         torch.cuda.synchronize()
         if ref is not None:
+            if res is None:
+                return info, -1, 1.0
             if isinstance(ref, torch.Tensor):
                 ref = [ref]
             if isinstance(res, torch.Tensor):

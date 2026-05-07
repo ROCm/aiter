@@ -217,12 +217,12 @@ def get_flydsl_stage2_kernels(
                                     "b_nt": bnt,
                                 }
                                 kernels[base_name] = base_params
-                                # Persistent variant: round-robin over M tiles, grid_y=cu_num.
-                                if is_fp4:
-                                    kernels[base_name + "_persist"] = {
-                                        **base_params,
-                                        "persist": True,
-                                    }
+                                # # Persistent variant: round-robin over M tiles, grid_y=cu_num.
+                                # if is_fp4:
+                                #     kernels[base_name + "_persist"] = {
+                                #         **base_params,
+                                #         "persist": True,
+                                #     }
     return kernels
 
 

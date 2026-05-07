@@ -2329,6 +2329,8 @@ class FmoeTuner(TunerCommon):
                     s2_tile_m = kparams["tile_m"]
                     if s2_tile_m != blockM:
                         continue
+                    if inter_dim % kparams["tile_k"] != 0:
+                        continue
                     # if blockM % s2_tile_m != 0:
                     #     continue
                     # # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
@@ -3000,7 +3002,7 @@ class FmoeTuner(TunerCommon):
                 continue
             if q_type == QuantType.per_1x32:
                 from aiter.test_common import run_perftest
-                from aiter.ops.triton.quant.fused_mxfp4_quant import (
+                from aiter.ops.quant import (
                     fused_dynamic_mxfp4_quant_moe_sort,
                 )
 
