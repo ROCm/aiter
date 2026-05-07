@@ -61,7 +61,7 @@ def mhc_pre_fake(
     return post_mix, comb_mix, layer_input
 
 
-@torch_compile_guard(gen_fake=mhc_pre_fake, mutates_args=[])
+@torch_compile_guard(gen_fake=mhc_pre_fake)
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
