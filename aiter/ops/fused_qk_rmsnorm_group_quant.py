@@ -195,6 +195,7 @@ def fused_qk_rmsnorm(
         _fused_qk_rmsnorm_kernel(
             q, q_weight, q_epsilon, k, k_weight, k_epsilon, q_out_unquantized, k_out
         )
+        return
     elif quant_type == QuantType.per_Tensor:
         raise NotImplementedError("fused_qk_rmsnorm + per_tensor quant not supported")
     elif quant_type == QuantType.per_Token:
