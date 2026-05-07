@@ -969,7 +969,9 @@ def get_2stage_cfgs(
         kn2 = str(cfg.get("kernelName2", ""))
         if kn1.startswith("flydsl_") or kn2.startswith("flydsl_"):
             fallback_cfgs = get_flydsl_fallback_cfgs(tune_file)
-            fallback = fallback_cfgs.get(keys, None) or fallback_cfgs.get(keys_disabled, None)
+            fallback = fallback_cfgs.get(keys, None) or fallback_cfgs.get(
+                keys_disabled, None
+            )
             if fallback is not None:
                 cfg = fallback
                 logger.info(
