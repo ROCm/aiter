@@ -8,72 +8,6 @@ from typing import Any, Callable, Optional, Union, List, get_args, get_origin
 aiter_lib = None
 
 
-_SCHEMA_ENUM_TYPES = {"ActivationType", "QuantType"}
-
-
-def _schema_safe_annotation(annotation):
-    if getattr(annotation, "__name__", None) in _SCHEMA_ENUM_TYPES:
-        return int
-
-    origin = get_origin(annotation)
-    if origin is Union:
-        args = get_args(annotation)
-        non_none_args = [arg for arg in args if arg is not type(None)]
-        if (
-            len(non_none_args) == 1
-            and getattr(non_none_args[0], "__name__", None) in _SCHEMA_ENUM_TYPES
-        ):
-            return Optional[int]
-    return annotation
-
-
-def _schema_safe_default(default):
-    if getattr(type(default), "__name__", None) in _SCHEMA_ENUM_TYPES and hasattr(
-        default, "value"
-    ):
-        return default.value
-    return default
-
-
-def _build_schema_safe_callable(func: Callable[..., Any]) -> Callable[..., Any]:
-    import inspect
-
-    sig = inspect.signature(func)
-    parameters = []
-    changed = False
-    for param in sig.parameters.values():
-        new_annotation = _schema_safe_annotation(param.annotation)
-        new_default = _schema_safe_default(param.default)
-        changed = changed or new_annotation is not param.annotation
-        changed = changed or new_default is not param.default
-        parameters.append(param.replace(annotation=new_annotation, default=new_default))
-
-    return_annotation = _schema_safe_annotation(sig.return_annotation)
-    changed = changed or return_annotation is not sig.return_annotation
-    if not changed:
-        return func
-
-    def schema_func(*args, **kwargs):
-        return func(*args, **kwargs)
-
-    schema_func.__name__ = func.__name__
-    schema_func.__qualname__ = func.__qualname__
-    schema_func.__module__ = func.__module__
-    schema_func.__defaults__ = getattr(func, "__defaults__", None)
-    schema_func.__kwdefaults__ = getattr(func, "__kwdefaults__", None)
-    schema_func.__signature__ = sig.replace(
-        parameters=parameters, return_annotation=return_annotation
-    )
-    schema_func.__annotations__ = {
-        param.name: param.annotation
-        for param in parameters
-        if param.annotation is not inspect.Signature.empty
-    }
-    if return_annotation is not inspect.Signature.empty:
-        schema_func.__annotations__["return"] = return_annotation
-    return schema_func
-
-
 def is_torch_equal_or_newer(target: str) -> bool:
     """Check if the installed torch version is >= the target version.
 
@@ -288,14 +222,13 @@ def torch_compile_guard(
             global aiter_lib
             aiter_lib = Library("aiter", "FRAGMENT") if aiter_lib is None else aiter_lib
             schema = ""
-            schema_func = _build_schema_safe_callable(calling_func)
             if calling_func.__name__ in MANUAL_SCHEMA_OPS:
-                schema = generate_schema(schema_func)
+                schema = generate_schema(calling_func)
             else:
-                sig = inspect.signature(schema_func)
+                sig = inspect.signature(calling_func)
                 if hasattr(torch.library, "infer_schema"):
                     schema = torch.library.infer_schema(
-                        schema_func, mutates_args=mutates_args
+                        calling_func, mutates_args=mutates_args
                     )
                 else:
                     # for pytorch 2.4
@@ -310,7 +243,7 @@ def torch_compile_guard(
                                 mutates_args_custom.append(param_name)
 
                     schema = torch._custom_op.impl.infer_schema(
-                        schema_func, mutates_args_custom
+                        calling_func, mutates_args_custom
                     )
             return schema
 
