@@ -234,9 +234,13 @@ struct opus_gemm_a16w16_flatmm_traits_gfx950 {
     // pfk<3 and break static_asserts.
     //
     // All aiter a16w16 kernels are gfx950-only today. Three-layer enforcement:
-    //   1. Python: aiter/ops/opus/__init__.py calls _arch._check_arch({"gfx950"})
-    //      at import time; non-gfx950 GPUs get a clean ImportError. The helper
-    //      is reusable for future opus submodules with different supported sets.
+    //   1. Python: aiter/ops/opus/__init__.py calls _arch._detect_arch({"gfx950"})
+    //      at import time. On non-gfx950 the import still succeeds (so it
+    //      cannot break the surrounding `from aiter.ops.opus import *` in
+    //      aiter/__init__.py) but gemm_a16w16_opus / opus_gemm_a16w16_tune
+    //      are replaced with stubs that raise RuntimeError on call, plus a
+    //      one-shot RuntimeWarning at import. Helper is reusable for future
+    //      opus submodules with different supported sets.
     //   2. Host:   opus_dispatch_a16w16<T> / opus_a16w16_tune_dispatch<T> in
     //      opus_gemm.cu are arch routers built on opus_get_gfx_arch(). Only
     //      the gfx950 branch is wired up today (delegates to
