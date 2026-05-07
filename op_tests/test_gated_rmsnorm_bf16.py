@@ -17,7 +17,6 @@ import torch
 import triton
 import triton.language as tl
 
-import aiter
 from aiter.test_common import checkAllclose, perftest
 
 
@@ -46,8 +45,12 @@ def gated_rmsnorm_bf16_reference(
 # ---------------------------------------------------------------------------
 @triton.jit
 def _rmsnorm_gated_triton_decode_kernel(
-    x_ptr, z_ptr, weight_ptr, out_ptr,
-    num_heads: tl.constexpr, eps: tl.constexpr,
+    x_ptr,
+    z_ptr,
+    weight_ptr,
+    out_ptr,
+    num_heads: tl.constexpr,
+    eps: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     head_id = tl.program_id(1)
@@ -65,8 +68,13 @@ def _rmsnorm_gated_triton_decode_kernel(
 
 @triton.jit
 def _rmsnorm_gated_triton_prefill_kernel(
-    x_ptr, z_ptr, weight_ptr, out_ptr,
-    num_rows: tl.constexpr, eps: tl.constexpr, block_rows: tl.constexpr,
+    x_ptr,
+    z_ptr,
+    weight_ptr,
+    out_ptr,
+    num_rows: tl.constexpr,
+    eps: tl.constexpr,
+    block_rows: tl.constexpr,
 ):
     row_offsets = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
     dim_offsets = tl.arange(0, 128)
@@ -90,11 +98,26 @@ def triton_gated_rmsnorm(x, z, weight, eps):
     if num_rows >= 65536:
         block_rows = 32
         _rmsnorm_gated_triton_prefill_kernel[(triton.cdiv(num_rows, block_rows),)](
-            x, z, weight, out, num_rows, eps, block_rows, num_warps=4, num_stages=1,
+            x,
+            z,
+            weight,
+            out,
+            num_rows,
+            eps,
+            block_rows,
+            num_warps=4,
+            num_stages=1,
         )
     else:
         _rmsnorm_gated_triton_decode_kernel[(num_tokens, num_heads)](
-            x, z, weight, out, num_heads, eps, num_warps=1, num_stages=1,
+            x,
+            z,
+            weight,
+            out,
+            num_heads,
+            eps,
+            num_warps=1,
+            num_stages=1,
         )
     return out
 
@@ -167,7 +190,7 @@ def run_test(num_tokens, num_heads, head_dim=128, dtype=torch.bfloat16, eps=1e-6
     hip_bw = calculate_bandwidth(num_tokens, num_heads, head_dim, hip_time)
     triton_bw = calculate_bandwidth(num_tokens, num_heads, head_dim, triton_time)
 
-    print(f"\nPerformance:")
+    print("\nPerformance:")
     print(f"  Reference:  {ref_time:8.2f} us  ({ref_bw:7.2f} GB/s)")
     print(f"  HIP bf16:   {hip_time:8.2f} us  ({hip_bw:7.2f} GB/s)")
     print(f"  Triton:     {triton_time:8.2f} us  ({triton_bw:7.2f} GB/s)")
@@ -201,7 +224,7 @@ if __name__ == "__main__":
         configs = [
             # Qwen3.5 GDN layer shapes (24 heads, head_dim=128)
             # Benchmark aligned with profile_test_1/rmsnorm_gated_fusion
-            (1, 24, 128),       # single-token decode
+            (1, 24, 128),  # single-token decode
             (4, 24, 128),
             (16, 24, 128),
             (64, 24, 128),
@@ -212,7 +235,7 @@ if __name__ == "__main__":
             (2048, 24, 128),
             (4096, 24, 128),
             (8192, 24, 128),
-            (16384, 24, 128),   # large prefill (benchmark default)
+            (16384, 24, 128),  # large prefill (benchmark default)
         ]
 
         results = []
