@@ -217,11 +217,7 @@ def parse_csv(csv_path: str):
             q_dtype_a = row.get("q_dtype_a", "")
             q_dtype_w = row.get("q_dtype_w", "")
             q_dtype_a_leaf = _csv_leaf(q_dtype_a)
-            act = (
-                "swiglu"
-                if _csv_leaf(act_type).lower() == "swiglu"
-                else "silu"
-            )
+            act = "swiglu" if _csv_leaf(act_type).lower() == "swiglu" else "silu"
             dtype = row.get("dtype", "")
             q_type_leaf = _csv_leaf(q_type)
             q_dtype_w_leaf = _csv_leaf(q_dtype_w)
@@ -276,10 +272,7 @@ def parse_csv(csv_path: str):
                     )
                     if stage2_a_inter_dim != inter_dim:
                         job["a_inter_dim"] = stage2_a_inter_dim
-                elif (
-                    params["stage"] == 1
-                    and params.get("k_batch", 1) > 1
-                ):
+                elif params["stage"] == 1 and params.get("k_batch", 1) > 1:
                     # Split-K stage1 materializes token-dependent temporary
                     # tensors, so the AOT cache key must match runtime token.
                     job["token_num"] = token
@@ -501,7 +494,9 @@ def _precompile_to_cache(
     def _precompile_swiglu():
         swiglu = _get_compiled_swiglu(inter_dim)
         num_rows = _aot_num_rows()
-        tmp_out = torch.zeros(num_rows * inter_dim * 2, device=dev, dtype=torch.bfloat16)
+        tmp_out = torch.zeros(
+            num_rows * inter_dim * 2, device=dev, dtype=torch.bfloat16
+        )
         out = torch.zeros(num_rows * inter_dim, device=dev, dtype=torch.bfloat16)
         _run_compiled(
             swiglu,
@@ -549,7 +544,6 @@ def _precompile_to_cache(
             _precompile_swiglu()
 
         elif stage == 1:
-
             _is_splitk = k_batch > 1
             n_in = inter_dim * 2 if is_fp4_weight else inter_dim
             k_in = model_dim
@@ -570,9 +564,15 @@ def _precompile_to_cache(
                     device=dev,
                     dtype=torch.bfloat16,
                 )
-                w = torch.empty(E * 2 * inter_dim * model_dim, device=dev, dtype=dtypes.i4x2)
+                w = torch.empty(
+                    E * 2 * inter_dim * model_dim, device=dev, dtype=dtypes.i4x2
+                )
                 a_scale = torch.empty(0, device=dev, dtype=torch.float32)
-                w_scale = torch.zeros(E * 2 * inter_dim * (model_dim // 32), device=dev, dtype=torch.bfloat16)
+                w_scale = torch.zeros(
+                    E * 2 * inter_dim * (model_dim // 32),
+                    device=dev,
+                    dtype=torch.bfloat16,
+                )
                 args = _s1_args_std(
                     out,
                     a,
@@ -642,7 +642,9 @@ def _precompile_to_cache(
                 out = torch.zeros(
                     _aot_num_rows() * inter_dim, device=dev, dtype=torch.bfloat16
                 )
-                a = torch.zeros(_aot_token_count() * model_dim, device=dev, dtype=torch.int8)
+                a = torch.zeros(
+                    _aot_token_count() * model_dim, device=dev, dtype=torch.int8
+                )
                 w = torch.zeros(
                     E * 2 * inter_dim * model_dim, device=dev, dtype=torch.int8
                 )
@@ -691,7 +693,6 @@ def _precompile_to_cache(
             _precompile_stage1_post_op_deps()
 
         elif stage == 2:
-
             accumulate = mode != "reduce"
             _m_blocks = _aot_stage2_m_blocks()
             _persist_m = _aot_stage2_persist_m(_m_blocks)
@@ -712,9 +713,13 @@ def _precompile_to_cache(
                     device=dev,
                     dtype=torch.bfloat16,
                 )
-                w = torch.empty(E * model_dim * inter_dim, device=dev, dtype=dtypes.i4x2)
+                w = torch.empty(
+                    E * model_dim * inter_dim, device=dev, dtype=dtypes.i4x2
+                )
                 a_scale = torch.empty(0, device=dev, dtype=torch.float32)
-                w_scale = torch.zeros(E * model_dim * (inter_dim // 32), device=dev, dtype=torch.bfloat16)
+                w_scale = torch.zeros(
+                    E * model_dim * (inter_dim // 32), device=dev, dtype=torch.bfloat16
+                )
                 args = _s2_args_std(
                     out,
                     a,

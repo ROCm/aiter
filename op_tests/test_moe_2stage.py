@@ -323,7 +323,7 @@ def test_fmoe(
     err = checkAllclose(
         out2_ref,
         out2_ck,
-        msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        msg=f"ck_moe_2stages:{us2:>8.2f} us, {token * model_dim * inter_dim * 3 * topk * 2 / us2 / 1000 / 1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
@@ -337,10 +337,11 @@ def test_fmoe(
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
+    accuracy_msg = (
+        f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
+    )
     if strict_accuracy:
-        assert not (
-            err != 0 and logits_diff > 0.01
-        ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
+        assert not (err != 0 and logits_diff > 0.01), accuracy_msg
     elif err != 0 and logits_diff > 0.01:
         logging.warning(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
@@ -589,12 +590,15 @@ def _iter_csv_cases():
             )
             continue
         kwargs["strict_accuracy"] = True
-        yield kwargs, {
-            "model": "flydsl_csv",
-            "flydsl_run_only": True,
-            "kernelName1": kernel_name1,
-            "kernelName2": kernel_name2,
-        }
+        yield (
+            kwargs,
+            {
+                "model": "flydsl_csv",
+                "flydsl_run_only": True,
+                "kernelName1": kernel_name1,
+                "kernelName2": kernel_name2,
+            },
+        )
 
 
 _PER1X32_BF16_FP4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2)
@@ -660,7 +664,47 @@ def _iter_legacy_cases():
         if triple in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
                 for m in args.tokenNum:
-                    yield _kw(
+                    yield (
+                        _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            aiter.ActivationType.Swiglu,
+                            hidden_pad=hidden_pad,
+                            intermediate_pad=intermediate_pad,
+                        ),
+                        extras,
+                    )
+        elif triple == _PER1X32_FP4_FP4:
+            for preshuffle in args.preshuffle:
+                for act_type in args.act:
+                    for m in args.tokenNum:
+                        yield (
+                            _kw(
+                                dtype,
+                                m,
+                                model_dim,
+                                inter_dim,
+                                quant_type,
+                                aq_dtype,
+                                wq_dtype,
+                                doweight_stage1,
+                                act_type,
+                                preshuffle=preshuffle,
+                                hidden_pad=0,
+                                intermediate_pad=0,
+                            ),
+                            extras,
+                        )
+        elif triple == _PER1X32_BF16_I4:
+            for m in args.tokenNum:
+                yield (
+                    _kw(
                         dtype,
                         m,
                         model_dim,
@@ -669,15 +713,15 @@ def _iter_legacy_cases():
                         aq_dtype,
                         wq_dtype,
                         doweight_stage1,
-                        aiter.ActivationType.Swiglu,
-                        hidden_pad=hidden_pad,
-                        intermediate_pad=intermediate_pad,
-                    ), extras
-        elif triple == _PER1X32_FP4_FP4:
-            for preshuffle in args.preshuffle:
-                for act_type in args.act:
-                    for m in args.tokenNum:
-                        yield _kw(
+                        aiter.ActivationType.Silu,
+                    ),
+                    extras,
+                )
+        else:
+            for act_type in args.act:
+                for m in args.tokenNum:
+                    yield (
+                        _kw(
                             dtype,
                             m,
                             model_dim,
@@ -687,37 +731,9 @@ def _iter_legacy_cases():
                             wq_dtype,
                             doweight_stage1,
                             act_type,
-                            preshuffle=preshuffle,
-                            hidden_pad=0,
-                            intermediate_pad=0,
-                        ), extras
-        elif triple == _PER1X32_BF16_I4:
-            for m in args.tokenNum:
-                yield _kw(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    doweight_stage1,
-                    aiter.ActivationType.Silu,
-                ), extras
-        else:
-            for act_type in args.act:
-                for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        act_type,
-                    ), extras
+                        ),
+                        extras,
+                    )
 
 
 # ---------------------------------------------------------------------------
