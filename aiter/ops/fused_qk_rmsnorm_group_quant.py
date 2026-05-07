@@ -4,6 +4,7 @@
 from typing import Optional
 
 from torch import Tensor
+from dataclasses import dataclass
 
 from ..jit.core import compile_ops
 from ..utility import dtypes
@@ -168,3 +169,66 @@ def fused_qk_rmsnorm_per_token_quant(
         q_residual,
         gemma_norm,
     )
+
+
+@dataclass
+class QKRMSQuantArgs:
+    group_quant: int = False
+    per_token_quant: int = False
+    group_size: int = 128
+    transpose_scale: bool = False
+
+
+def fused_qk_rmsnorm_quant(
+    q_out_quantized: Optional[Tensor] = None,
+    q_out_scale: Optional[Tensor] = None,
+    q: Optional[Tensor] = None,
+    q_weight: Optional[Tensor] = None,
+    q_epsilon: float = 1e-6,
+    q_out_unquantized: Optional[Tensor] = None,
+    k_out: Optional[Tensor] = None,
+    q_res_out: Optional[Tensor] = None,
+    k: Optional[Tensor] = None,
+    k_weight: Optional[Tensor] = None,
+    k_epsilon: Optional[float] = None,
+    q_residual: Optional[Tensor] = None,
+    gemma_norm: bool = False,
+    quant_args: Optional[QKRMSQuantArgs] = None,
+) -> None:
+    # Centralized interface
+    if quant_args.group_quant:
+        fused_qk_rmsnorm_group_quant(
+            q_out_quantized,
+            q_out_scale,
+            q,
+            q_weight,
+            q_epsilon,
+            q_out_unquantized,
+            k_out,
+            q_res_out,
+            k,
+            k_weight,
+            k_epsilon,
+            q_residual,
+            quant_args.group_size,
+            quant_args.transpose_scale,
+            gemma_norm,
+        )
+    elif quant_args.per_token_quant:
+        fused_qk_rmsnorm_per_token_quant(
+            q_out_quantized,
+            q_out_scale,
+            q,
+            q_weight,
+            q_epsilon,
+            q_out_unquantized,
+            k_out,
+            q_res_out,
+            k,
+            k_weight,
+            k_epsilon,
+            q_residual,
+            gemma_norm,
+        )
+    else:
+        raise RuntimeError("No quant args selected")
