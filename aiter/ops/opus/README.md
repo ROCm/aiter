@@ -166,12 +166,13 @@ similarly across `outdtype`). bias=True candidates are restricted to
 the bias-aware kid families (split-barrier 4..9 and splitk 200..299);
 flatmm kid 100..115 are filtered out before mp_tuner sees them.
 
-Verify winners work by running the lookup test (it reads the tuned CSV
-and launches every row through `opus_gemm_a16w16_tune`):
+Verify winners work by running the end-to-end test against any shape
+that should now hit your tuned entry; the dispatcher will pick it up
+once the JIT module is rebuilt:
 
 ```bash
-python3 op_tests/test_opus_a16w16_lookup.py
-# expected: 212/212 passed
+python3 op_tests/test_opus_a16w16_gemm.py -m 128 -n 256 -k 1024 -b 1
+# expected: allclose passed
 ```
 
 ### 3.2 Autolog: collect shapes first, tune later
@@ -260,20 +261,22 @@ longer recognized.
 All tests run inside the project's container
 (`docker exec -w /wksp/aiter demon_test bash -lc ...`).
 
+The single end-to-end test exercises `gemm_a16w16_opus` (shape-driven
+API). It supports both single-shape smoke runs and CSV sweeps (e.g.
+the gptoss untuned set).
+
 | Test | Purpose | Pass criterion |
 |---|---|---|
-| `op_tests/test_opus_a16w16_tune.py` | Per-kid correctness smoke (iterate every compiled kid, launch once at a kid-appropriate min-K) | 17/17 PASS |
-| `op_tests/test_opus_a16w16_lookup.py` | Iterate every row in `opus_gemm_a16w16_tuned.csv`, launch with `(solidx, splitK)` from CSV, compare against `torch.bmm` | 212/212 PASS (3 skipped if flatmm kids are not compiled in the current JIT) |
-| `op_tests/test_opus_a16w16_gemm.py` | End-to-end test of `gemm_a16w16_opus` (shape-driven API); supports single-shape smoke and CSV sweep (e.g. gptoss untuned) | `allclose` passes on all shapes |
-| `op_tests/check_opus_splitk_graph.py` | HIP graph capture + replay smoke on two splitk shapes | Both shapes complete |
+| `op_tests/test_opus_a16w16_gemm.py` | End-to-end test of `gemm_a16w16_opus` (shape-driven API); supports single-shape smoke and CSV sweep | `allclose` passes on all shapes |
 
-Filter flags on `test_opus_a16w16_lookup.py`:
+Examples:
 
 ```bash
-python3 op_tests/test_opus_a16w16_lookup.py --max-rows 30       # smoke subset
-python3 op_tests/test_opus_a16w16_lookup.py --kid-min 200       # only splitk kids
-python3 op_tests/test_opus_a16w16_lookup.py --tuned-csv /tmp/t.csv  # custom CSV
-python3 op_tests/test_opus_a16w16_lookup.py -v                  # per-row output
+# single-shape smoke
+python3 op_tests/test_opus_a16w16_gemm.py -m 128 -n 256 -k 1024 -b 1
+
+# CSV sweep (each row is one (M, N, K, batch) shape)
+python3 op_tests/test_opus_a16w16_gemm.py --csv /path/to/shapes.csv
 ```
 
 ---
@@ -532,8 +535,8 @@ dsv3+gptoss bf16 benchmark is unchanged across rounds 6+7
 (geomean +0.37% per shape, well within measurement noise; total
 +0.27% sum of best-kernel us).
 
-Functional regression: `op_tests/test_opus_a16w16_tune.py` 30/30 and
-`op_tests/test_opus_a16w16_lookup.py` 338/338 still pass.
+Functional regression: `op_tests/test_opus_a16w16_gemm.py` end-to-end
+shape sweep still passes (`allclose` on every shape).
 
 **Per-TU breakdown** (single-TU `-ftime-report` wall):
 
@@ -955,9 +958,8 @@ a bias-aware kid.
 
 The CSV references a kid that the current JIT build didn't compile
 (usually a flatmm kid 100..115 from an older tuning run, since
-`a16w16_flatmm_kernels_list` is currently empty). Either re-tune the
-affected shapes, or just let `test_opus_a16w16_lookup.py` report them
-as `SKIP` (it handles this explicitly).
+`a16w16_flatmm_kernels_list` is currently empty). Re-tune the affected
+shapes against the current build, or remove those rows from the CSV.
 
 ### Why the cross-family `K % 2 == 0` rule exists
 
@@ -983,9 +985,8 @@ fixed.
 
 splitk kernels allocate a fresh fp32 workspace via `torch::empty` per
 call (same pattern as triton `gemm_a16w16` uses for `y_pp`). This works
-under `torch.cuda.graph` capture + replay — validated by
-`op_tests/check_opus_splitk_graph.py` (first consumer of
-`testGraph=True` in aiter). See splitk plan §5.
+under `torch.cuda.graph` capture + replay. See splitk plan §5 for the
+design notes.
 
 ---
 
@@ -1002,11 +1003,8 @@ under `torch.cuda.graph` capture + replay — validated by
 | [csrc/opus_gemm/opus_gemm_tune.py](../../../csrc/opus_gemm/opus_gemm_tune.py) | Offline tuner |
 | [csrc/opus_gemm/gen_instances.py](../../../csrc/opus_gemm/gen_instances.py) | JIT codegen; `--tune_file` drives `opus_gemm_lookup.h` |
 | [csrc/opus_gemm/opus_gemm.cu](../../../csrc/opus_gemm/opus_gemm.cu) | Runtime dispatch (two-level) + pybind entries |
-| [csrc/opus_gemm/include/pipeline/](../../../csrc/opus_gemm/include/pipeline/) | Kernel source (a16w16, flatmm, flatmm_splitk) |
-| [op_tests/test_opus_a16w16_tune.py](../../../op_tests/test_opus_a16w16_tune.py) | Per-kid correctness |
-| [op_tests/test_opus_a16w16_lookup.py](../../../op_tests/test_opus_a16w16_lookup.py) | Tuned-CSV lookup correctness |
+| [csrc/opus_gemm/include/gfx950/](../../../csrc/opus_gemm/include/gfx950/) | Kernel source (a16w16, flatmm, flatmm_splitk) for gfx950 |
 | [op_tests/test_opus_a16w16_gemm.py](../../../op_tests/test_opus_a16w16_gemm.py) | End-to-end `gemm_a16w16_opus` (single-shape + CSV sweep) |
-| [op_tests/check_opus_splitk_graph.py](../../../op_tests/check_opus_splitk_graph.py) | HIP graph smoke |
 
 ---
 
