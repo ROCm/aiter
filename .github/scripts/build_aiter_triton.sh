@@ -9,12 +9,21 @@ dpkg -l | grep rocm || echo "No ROCm packages found."
 echo
 echo "==== Install dependencies and aiter ===="
 git config --global --add safe.directory /workspace
-pip install --upgrade pandas zmq einops numpy==1.26.2
+pip config set global.retries 15
+pip config set global.timeout 120
+pip install --upgrade pandas pyzmq einops numpy==1.26.2 || {
+    echo "WARNING: batch pip install failed, retrying packages individually..."
+    pip install --upgrade pandas || true
+    pip install --upgrade pyzmq || echo "WARNING: pyzmq unavailable (only needed by aiter.dist.shm_broadcast)"
+    pip install --upgrade einops
+    pip install --upgrade "numpy==1.26.2"
+}
 pip uninstall -y aiter || true
 pip install --upgrade "pybind11>=3.0.1"
 pip install --upgrade "ninja>=1.11.1"
 pip install tabulate
 pip install -e .
+./.github/scripts/install_triton.sh
 
 # Read BUILD_TRITON env var, default to 1. If 1, install Triton; if 0, skip installation.
 BUILD_TRITON=${BUILD_TRITON:-1}

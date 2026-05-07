@@ -8,7 +8,7 @@ from ..jit.core import compile_ops
 MD_NAME = "module_moe_sorting_opus"
 
 
-@compile_ops("module_moe_sorting_opus")
+@compile_ops("module_moe_sorting_opus", develop=True)
 def moe_sorting_opus_fwd(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
