@@ -56,7 +56,14 @@ echo "# AMDGCN_USE_BUFFER_OPS=${AMDGCN_USE_BUFFER_OPS} (workaround for triton ma
 JIT_DIR="${AITER_ROOT}/aiter/jit"
 SO_FILE="${JIT_DIR}/module_gemm_a8w8_blockscale_bpreshuffle_cktile.so"
 BUILD_DIR="${JIT_DIR}/build/module_gemm_a8w8_blockscale_bpreshuffle_cktile"
-
+# vLLM's torch.compile cache key does NOT include ATOM_BLOCKSCALE_SPLITK_MODE,
+# so a graph compiled in mode A is silently re-used in mode B even though the
+# Python branch logic in LinearBase.preallocate_y / forward depends on the
+# mode at trace time (e.g. "none" mode traces preallocate_y -> None ->
+# external_y -> None -> y_is_zeroed=False baked into the FX graph).  Without
+# busting the cache, splitk_fused inherits the none-mode graph and the
+# fusion is dead at runtime regardless of the env var.  Nuke between modes.
+ATOM_COMPILE_CACHE="${HOME}/.cache/atom/torch_compile_cache"
 LAST_CSV=""
 
 nuke_module_if_csv_changed() {
@@ -68,6 +75,13 @@ nuke_module_if_csv_changed() {
         LAST_CSV="${new_csv}"
     else
         echo "# CSV unchanged (${new_csv}); reusing existing .so"
+    fi
+}
+
+nuke_torch_compile_cache() {
+    if [[ -d "${ATOM_COMPILE_CACHE}" ]]; then
+        echo "# nuking torch.compile cache at ${ATOM_COMPILE_CACHE}"
+        rm -rf "${ATOM_COMPILE_CACHE}"
     fi
 }
 
@@ -103,6 +117,7 @@ run_config() {
     echo "=========================================================="
 
     nuke_module_if_csv_changed "${csv}"
+    nuke_torch_compile_cache
 
     local server_pid
     # Launch the server in its own session/process group via setsid + exec so

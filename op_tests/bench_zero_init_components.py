@@ -273,6 +273,59 @@ def _call_gemm(
 # -- timing primitives ----------------------------------------------------
 
 
+def _time_graph(closure, *, iters: int, warmup: int) -> dict:
+    """Time ``closure`` wrapped in a ``torch.cuda.CUDAGraph``.
+
+    The closure is called inside the capture context exactly once and its
+    side effects (kernel launches) are recorded; subsequent timed iterations
+    just call ``graph.replay()``. This mirrors what ATOM gets via vLLM's
+    full-decode-graph capture: the launch-overhead cost of small kernels
+    (incl. any standalone Y.zero_() fill) is amortized to a single
+    graph-replay launch, leaving only the in-graph GPU work.
+
+    Caller is responsible for ensuring the closure's tensors are statically
+    addressed (use the same out_buf/x_q/x_scale buffers each iteration).
+    """
+    # Eager warmup so the closure's lazy paths (JIT compile, kernel
+    # symbol lookup, tuned-CSV read, autotune) all run *before* capture.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            closure()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    # graph_pool_handle() lets multiple captures (e.g. across modes) share
+    # the caching allocator pool, but we only capture one graph per call,
+    # so default pool is fine.
+    with torch.cuda.graph(g, stream=s):
+        closure()
+
+    for _ in range(warmup):
+        g.replay()
+    torch.cuda.synchronize()
+
+    samples_us: list[float] = []
+    for _ in range(iters):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        g.replay()
+        end.record()
+        end.synchronize()
+        samples_us.append(start.elapsed_time(end) * 1000.0)
+    samples_us.sort()
+    return {
+        "median_us": statistics.median(samples_us),
+        "min_us": min(samples_us),
+        "p10_us": samples_us[max(0, int(0.10 * len(samples_us)) - 1)],
+        "p90_us": samples_us[min(len(samples_us) - 1, int(0.90 * len(samples_us)))],
+        "stdev_us": statistics.stdev(samples_us) if len(samples_us) > 1 else 0.0,
+    }
+
+
 def _time_phase(fn, *, iters: int, warmup: int, pre_iter=None) -> dict:
     """Time ``fn`` with cudaEvent.
 
@@ -318,6 +371,7 @@ def _bench_components(
     iters: int,
     warmup: int,
     seed: int,
+    graph: bool = False,
 ) -> dict:
     inputs = _gen_inputs(M, N, K, producer=producer, seed=seed)
     weight_shuffle = inputs["weight_shuffle"]
@@ -425,7 +479,7 @@ def _bench_components(
         total_stats["median_us"] - prod_stats["median_us"] - gemm_stats["median_us"]
     )
 
-    return {
+    result = {
         "splitK_csv": splitk_csv,
         "do_fused": int(do_fused),
         "prod_us": prod_stats["median_us"],
@@ -436,6 +490,74 @@ def _bench_components(
         "total_stdev": total_stats["stdev_us"],
         "fill_us_inferred": fill_inferred,
     }
+
+    # ----- total_us under HIP/CUDA graph capture ------------------------
+    # Same producer + GEMM as the eager total above, but wrapped in a
+    # CUDA graph so launch overhead is amortized to one
+    # cudaGraphLaunch per replay. This is the regime ATOM actually
+    # runs in (vLLM captures the whole decode forward as a graph), so
+    # ``total_us_graph`` is the apples-to-apples "expected impact on
+    # ATOM TPOT" number. The savings of the standalone Y.zero_() fill
+    # mostly *come from* its launch overhead, so we expect the
+    # splitk vs splitk_fused gap to shrink (often substantially) here.
+    if graph:
+        # x_q / x_scale must be statically-allocated for graph replay.
+        # P1 returns fresh tensors each call (its wrapper internally
+        # allocates xq+scale). To keep the graph's input/output set
+        # static we re-run a single eager producer call to get a pair
+        # we can reuse, then bind it into the graph closure via
+        # the in-place graph-friendly producer wrappers.
+        #
+        # For P1: per_group_quant_hip allocates a new xq each call;
+        # under torch.cuda.graph() the caching allocator routes those
+        # through the graph's private memory pool, so replay reuses
+        # the same pointers automatically. We simply call the public
+        # wrapper inside the closure and trust the pool.
+        # For P2/P3: x_q_pre / x_scale_pre are persistent and the
+        # producers write in-place. Already graph-safe.
+
+        out_buf_graph = (
+            torch.empty(M, N, dtype=dtypes.bf16, device="cuda")
+            if mode != "none"
+            else torch.empty(M, N, dtype=dtypes.bf16, device="cuda")
+            # In none mode the GEMM allocates its own out by default;
+            # for graph capture we need a stable buffer to write into.
+        )
+
+        def graph_total_call():
+            # In splitk_fused mode the producer writes zeros into Y as
+            # a side effect; in splitk mode the GEMM kernel internally
+            # zeros Y before atomic_add (y_is_zeroed=False). Both are
+            # captured as part of the graph here -- the captured
+            # kernel sequence will include the standalone fill in
+            # splitk mode and skip it in splitk_fused mode.
+            x_q_g, x_scale_g = _call_producer(
+                producer=producer,
+                inputs=inputs,
+                M=M,
+                K=K,
+                out_buf=out_buf_graph,
+                do_fused_zero_init=do_fused,
+                x_q=x_q_pre,
+                x_scale=x_scale_pre,
+            )
+            _call_gemm(
+                x_q=x_q_g,
+                x_scale=x_scale_g,
+                weight_shuffle=weight_shuffle,
+                w_scale=w_scale,
+                out_buf=out_buf_graph,
+                tuned_file=tuned_file,
+                y_is_zeroed=do_fused,
+            )
+
+        graph_stats = _time_graph(
+            graph_total_call, iters=iters, warmup=warmup,
+        )
+        result["total_graph_us"] = graph_stats["median_us"]
+        result["total_graph_stdev"] = graph_stats["stdev_us"]
+
+    return result
 
 
 # -- profiler-driven kernel-launch counting -------------------------------
@@ -515,6 +637,7 @@ def _capture_trace(
     trace_dir: str,
     trace_iters: int,
     seed: int,
+    graph: bool = False,
 ) -> tuple[str, dict]:
     os.makedirs(trace_dir, exist_ok=True)
     inputs = _gen_inputs(M, N, K, producer=producer, seed=seed)
@@ -544,17 +667,36 @@ def _capture_trace(
         )
     torch.cuda.synchronize()
 
+    suffix = "_graph" if graph else ""
     out_file = os.path.join(
-        trace_dir, f"trace_{mode}_{producer}_M{M}_N{N}_K{K}.json"
+        trace_dir, f"trace_{mode}_{producer}_M{M}_N{N}_K{K}{suffix}.json"
     )
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=False,
-    ) as prof:
-        for _ in range(trace_iters):
+
+    if graph:
+        # Capture once, then replay under the profiler. The same kernels
+        # show up in the chrome trace (replay re-issues them) so the
+        # fill-count classifier still works -- we simply observe whether
+        # a standalone fill kernel made it into the captured graph.
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                x_q, x_scale = _call_producer(
+                    producer=producer, inputs=inputs, M=M, K=K,
+                    out_buf=out_buf, do_fused_zero_init=do_fused,
+                    x_q=x_q_pre, x_scale=x_scale_pre,
+                )
+                _call_gemm(
+                    x_q=x_q, x_scale=x_scale,
+                    weight_shuffle=weight_shuffle, w_scale=w_scale,
+                    out_buf=out_buf, tuned_file=tuned_file,
+                    y_is_zeroed=do_fused,
+                )
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
             x_q, x_scale = _call_producer(
                 producer=producer, inputs=inputs, M=M, K=K,
                 out_buf=out_buf, do_fused_zero_init=do_fused,
@@ -566,8 +708,43 @@ def _capture_trace(
                 out_buf=out_buf, tuned_file=tuned_file,
                 y_is_zeroed=do_fused,
             )
+        for _ in range(3):
+            g.replay()
         torch.cuda.synchronize()
-    prof.export_chrome_trace(out_file)
+
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=False,
+        ) as prof:
+            for _ in range(trace_iters):
+                g.replay()
+            torch.cuda.synchronize()
+        prof.export_chrome_trace(out_file)
+    else:
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=False,
+        ) as prof:
+            for _ in range(trace_iters):
+                x_q, x_scale = _call_producer(
+                    producer=producer, inputs=inputs, M=M, K=K,
+                    out_buf=out_buf, do_fused_zero_init=do_fused,
+                    x_q=x_q_pre, x_scale=x_scale_pre,
+                )
+                _call_gemm(
+                    x_q=x_q, x_scale=x_scale,
+                    weight_shuffle=weight_shuffle, w_scale=w_scale,
+                    out_buf=out_buf, tuned_file=tuned_file,
+                    y_is_zeroed=do_fused,
+                )
+            torch.cuda.synchronize()
+        prof.export_chrome_trace(out_file)
 
     counts = _count_kernels_in_trace(out_file)
     counts["per_iter_prod"] = counts["prod"] / max(trace_iters, 1)
@@ -605,6 +782,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--trace-dir", default=None,
                    help="Directory for chrome traces (only with --profile).")
     p.add_argument("--trace-iters", type=int, default=10)
+    p.add_argument("--graph", action="store_true",
+                   help="Also time the producer+GEMM sequence wrapped in a "
+                        "torch.cuda.CUDAGraph (HIP graph on AMD). This "
+                        "amortizes kernel launch overhead -- it is the "
+                        "regime ATOM actually runs in via vLLM full-decode "
+                        "graph capture, so total_graph_us is the right "
+                        "predictor of e2e TPOT impact. When combined with "
+                        "--profile, the captured trace replays the graph "
+                        "instead of issuing the kernels eagerly.")
     return p.parse_args()
 
 
@@ -642,6 +828,8 @@ def main() -> int:
         "total_us", "total_stdev",
         "fill_us_inferred",
     )
+    if args.graph:
+        cols = cols + ("total_graph_us", "total_graph_stdev")
     if args.profile:
         cols = cols + ("trace_prod", "trace_fill", "trace_gemm",
                        "trace_other_top")
@@ -662,6 +850,7 @@ def main() -> int:
                         mode=args.mode, producer=producer,
                         tuned_file=args.tuned_csv,
                         iters=args.iters, warmup=args.warmup, seed=args.seed,
+                        graph=args.graph,
                     )
                 except Exception as e:  # noqa: BLE001
                     print(
@@ -686,6 +875,7 @@ def main() -> int:
                             trace_dir=args.trace_dir,
                             trace_iters=args.trace_iters,
                             seed=args.seed,
+                            graph=args.graph,
                         )
                     except Exception as e:  # noqa: BLE001
                         print(
@@ -713,6 +903,11 @@ def main() -> int:
                     f"{stats['total_us']:.3f}\t{stats['total_stdev']:.3f}\t"
                     f"{stats['fill_us_inferred']:.3f}"
                 )
+                if args.graph:
+                    line += (
+                        f"\t{stats.get('total_graph_us', float('nan')):.3f}"
+                        f"\t{stats.get('total_graph_stdev', float('nan')):.3f}"
+                    )
                 if args.profile:
                     line += (
                         f"\t{row['trace_prod']:.2f}"
