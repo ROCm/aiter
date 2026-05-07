@@ -105,26 +105,35 @@ run_config() {
     nuke_module_if_csv_changed "${csv}"
 
     local server_pid
-    (
-        cd "${ATOM_ROOT}"
-        PYTHONPATH="${PYTHONPATH_BASE}" \
-            ATOM_BLOCKSCALE_SPLITK_MODE="${mode}" \
-            ATOM_BLOCKSCALE_BPRESHUFFLE_TUNED_NOSPLITK_CSV="${NOSPLITK_CSV}" \
-            ATOM_BLOCKSCALE_BPRESHUFFLE_TUNED_SPLITK_CSV="${SPLITK_CSV}" \
-            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE="${csv}" \
+    # Launch the server in its own session/process group via setsid + exec so
+    # we can kill the whole tree (the openai_server python + its mp.spawn
+    # children + inductor workers) atomically with `kill -- -<pgid>`.  Without
+    # this, killing just the parent leaves children re-parented to PID 1 and
+    # they keep VRAM allocated, OOM'ing the next mode's weight load.
+    setsid bash -c "
+        cd \"${ATOM_ROOT}\"
+        exec env \
+            PYTHONPATH=\"${PYTHONPATH_BASE}\" \
+            ATOM_BLOCKSCALE_SPLITK_MODE=\"${mode}\" \
+            ATOM_BLOCKSCALE_BPRESHUFFLE_TUNED_NOSPLITK_CSV=\"${NOSPLITK_CSV}\" \
+            ATOM_BLOCKSCALE_BPRESHUFFLE_TUNED_SPLITK_CSV=\"${SPLITK_CSV}\" \
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE=\"${csv}\" \
             python -m atom.entrypoints.openai_server \
-                --model "${MODEL}" \
-                --tensor-parallel-size "${TP_SIZE}" \
-                --host "${HOST}" --server-port "${SERVER_PORT}" \
-                --gpu-memory-utilization "${GPU_MEM_UTIL}" \
-                >"${server_log}" 2>&1
-    ) &
+                --model \"${MODEL}\" \
+                --tensor-parallel-size \"${TP_SIZE}\" \
+                --host \"${HOST}\" --server-port \"${SERVER_PORT}\" \
+                --gpu-memory-utilization \"${GPU_MEM_UTIL}\" \
+                >\"${server_log}\" 2>&1
+    " &
     server_pid=$!
-    echo "# server pid: ${server_pid}"
-    trap "kill -TERM ${server_pid} 2>/dev/null || true" EXIT
+    echo "# server pid (pgid leader): ${server_pid}"
+    # The pgid equals the leader PID because we used setsid.
+    trap "kill -TERM -${server_pid} 2>/dev/null || true" EXIT
 
     if ! wait_for_server "${server_pid}"; then
-        kill -TERM "${server_pid}" 2>/dev/null || true
+        kill -TERM -"${server_pid}" 2>/dev/null || true
+        sleep 3
+        kill -KILL -"${server_pid}" 2>/dev/null || true
         wait "${server_pid}" 2>/dev/null || true
         trap - EXIT
         return 1
@@ -148,11 +157,39 @@ run_config() {
         2>&1 | tee "${bench_log}"
     cd - >/dev/null
 
-    echo "# stopping server pid ${server_pid}"
-    kill -TERM "${server_pid}" 2>/dev/null || true
-    wait "${server_pid}" 2>/dev/null || true
+    echo "# stopping server pgid ${server_pid}"
+    kill -TERM -"${server_pid}" 2>/dev/null || true
+    # Give the server up to 30 s for graceful shutdown of the whole pgroup.
+    for _i in $(seq 1 30); do
+        if ! kill -0 -"${server_pid}" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+    # Force-kill anything lingering in the pgroup.  Because we launched with
+    # setsid, this catches the openai_server python + all its mp.spawn /
+    # inductor workers atomically without risk of matching unrelated processes.
+    kill -KILL -"${server_pid}" 2>/dev/null || true
+    sleep 3
+    # Wait until both the port AND VRAM are actually released before the next
+    # iteration tries to bind / load weights.  VRAM is the critical one: the
+    # 80B FP8 weights need ~80 GB and lingering allocations will HIP-OOM.
+    for _i in $(seq 1 30); do
+        local port_busy=0
+        local vram_used_mib=0
+        if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${SERVER_PORT}\$"; then
+            port_busy=1
+        fi
+        vram_used_mib=$(rocm-smi --showmeminfo vram 2>/dev/null \
+            | awk '/VRAM Total Used Memory \(B\)/ {print int($NF/1024/1024)}' \
+            | head -1)
+        vram_used_mib=${vram_used_mib:-0}
+        if (( port_busy == 0 && vram_used_mib < 2048 )); then
+            break
+        fi
+        sleep 2
+    done
     trap - EXIT
-    sleep 5
 }
 
 run_config none         "${NOSPLITK_CSV}"
