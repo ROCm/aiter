@@ -268,7 +268,6 @@ def fmha_v3_fwd(
     v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
-    
 
 
 # ---------------------------------------------------------------------------
