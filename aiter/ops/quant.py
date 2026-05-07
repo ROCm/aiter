@@ -494,7 +494,9 @@ def get_torch_act(aType):
         ActivationType.Gelu: F.gelu,
         ActivationType.SwigluStep: _swiglustep_single,
     }
-    return tmp.get(aType, NotImplementedError)
+    if aType not in tmp:
+        raise NotImplementedError(f"Unsupported activation type: {aType!r}")
+    return tmp[aType]
 
 
 def moe_smooth_per_token_scaled_quant(
