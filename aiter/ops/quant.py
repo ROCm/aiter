@@ -737,3 +737,50 @@ def partial_transpose(
     input: Tensor,
     num_rows: Tensor,
 ) -> None: ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rotate_activation_fp4quant_inplace(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    group_size: int = 32,
+) -> None:
+    """Hadamard-rotate activation, FP4-quantize, then dequantize back to BF16 in-place."""
+    ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rotate_activation(
+    out: torch.Tensor,
+    input: torch.Tensor,
+) -> None:
+    """Apply Walsh-Hadamard transform along last dim with 1/sqrt(N) scaling."""
+    ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rope_rotate_activation_fp4quant_inplace(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    group_size: int = 32,
+) -> None:
+    """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate,
+    FP4-quantize, then dequantize back to BF16."""
+    ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rope_rotate_activation(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+) -> None:
+    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
+    ...
