@@ -1105,6 +1105,7 @@ def compile_preshuffle_gemm_a8(
                     av = i64x2_to_v8(a0, a1)
                     bv = i64x2_to_v8(b0, b1)
                     return mfma_fn_k32(mfma_res_ty, [av, bv, acc_in, 0, 0, 0])
+
             else:
                 if const_expr(is_int8):
                     mfma_fn = mfma_i32_k32
