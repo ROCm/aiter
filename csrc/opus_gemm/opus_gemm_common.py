@@ -198,8 +198,9 @@ a16w16_flatmm_splitk_kernels_list = {
     # COM_REP_M*COM_REP_N<=16 for WG=1) plus a refined VGPR estimate (consumer
     # wave: 2*v_a + 2*v_b + ~64 overhead; cap=512/WG_PER_CU). All 13 fit.
     # NOT YET PROFILED: COM_REP_M=3 / COM_REP_N=6 odd-loop unrolls are a new
-    # path; precision must be validated via op_tests/test_opus_a16w16_tune.py
-    # before relying on these in production heuristics.
+    # path; precision must be validated via op_tests/test_opus_a16w16_gemm.py
+    # (drive the kid through gemm_a16w16_opus by adding the relevant shape
+    # to the tuned CSV) before relying on these in production heuristics.
     211: _a16w16_flatmm_splitk( 32,  96,  64, 1),   # pfk=9, VGPR=176/512, AGPR=24
     212: _a16w16_flatmm_splitk( 32,  96,  64, 2),   # pfk=4, VGPR=176/256, AGPR=24
     213: _a16w16_flatmm_splitk( 32,  96, 128, 1),   # pfk=4, VGPR=288/512, AGPR=24
