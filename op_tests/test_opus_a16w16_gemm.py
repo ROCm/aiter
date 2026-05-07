@@ -24,10 +24,27 @@ Usage:
 """
 
 import argparse
+import sys
 import torch
 
-from aiter.test_common import checkAllclose, run_perftest
-from aiter.ops.opus import gemm_a16w16_opus
+# opus a16w16 is gfx950-only. Skip cleanly on any other device so this
+# script can sit in the regression set without failing on non-gfx950 CI
+# slots. Reuse opus's own probe (which honours GPU_ARCHS env first, then
+# rocminfo) so this skip stays in lock-step with what aiter.ops.opus does
+# at import time -- otherwise we'd hit the stub's RuntimeError instead of
+# a clean skip when GPU_ARCHS pins a non-supported arch on a gfx950 box.
+from aiter.ops.opus._arch import _detect_arch  # noqa: E402
+
+_arch_ok, _detected_gfx = _detect_arch({"gfx950"})
+if not _arch_ok:
+    print(
+        f"[skip] test_opus_a16w16_gemm requires gfx950 "
+        f"(detected {_detected_gfx!r})"
+    )
+    sys.exit(0)
+
+from aiter.test_common import checkAllclose, run_perftest  # noqa: E402
+from aiter.ops.opus import gemm_a16w16_opus  # noqa: E402
 
 
 def _torch_ref(A: torch.Tensor, B: torch.Tensor, out_dtype):

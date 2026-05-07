@@ -182,18 +182,18 @@ Edit [`aiter/ops/opus/__init__.py`](../../aiter/ops/opus/__init__.py)
 to widen the supported arch set:
 
 ```python
-_check_arch(
-    {"gfx950", "gfx942"},   # new
-    feature="aiter.ops.opus (a16w16)",
-    hint=...,
-)
+_SUPPORTED = {"gfx950", "gfx942"}   # new
 ```
 
-The helper at
-[`aiter/ops/opus/_arch.py`](../../aiter/ops/opus/_arch.py) accepts an
-arbitrary supported set; the only invariant is that at least one of the
-detected arches (from `GPU_ARCHS` env or `rocminfo`) must be in the
-set.
+The probe helper at
+[`aiter/ops/opus/_arch.py`](../../aiter/ops/opus/_arch.py) is
+non-raising: ``_detect_arch(supported)`` returns ``(ok, detected)`` so
+the package can install stubs and emit a ``RuntimeWarning`` instead of
+breaking ``from aiter.ops.opus import *`` (which sits inside the
+swallow-ImportError ``try`` block in ``aiter/__init__.py``). Calling a
+stub raises ``RuntimeError`` with the detected arch and the supported
+set. ``_check_arch`` (raising variant) is still available for callers
+that prefer hard failure.
 
 ### 7. Tuning data
 
