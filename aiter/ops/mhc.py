@@ -9,6 +9,7 @@ from torch import Tensor
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.torch_guard import torch_compile_guard
 
 
 @compile_ops("module_mhc")
@@ -39,6 +40,28 @@ def mhc_pre_big_fuse(
 ) -> None: ...
 
 
+def mhc_pre_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m = residual.size(0)
+    hc_mult = residual.size(1)
+    hidden_size = residual.size(2)
+    device = residual.device
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
+    layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
+    return post_mix, comb_mix, layer_input
+
+
+@torch_compile_guard(gen_fake=mhc_pre_fake)
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
