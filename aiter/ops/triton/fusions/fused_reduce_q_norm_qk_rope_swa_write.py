@@ -4,6 +4,7 @@
 from typing import Optional
 
 import torch
+import triton
 
 from aiter.ops.triton._triton_kernels.fusions.fused_reduce_q_norm_qk_rope_swa_write import (
     _fused_reduce_q_norm_qk_rope_swa_write_kernel,
@@ -11,6 +12,43 @@ from aiter.ops.triton._triton_kernels.fusions.fused_reduce_q_norm_qk_rope_swa_wr
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
+    """Pick BLOCK_SIZE_M for the fused reduce/norm/rope kernel.
+
+    Each program loads ``[NUM_SPLITK, BLOCK_SIZE_M, HEAD_DIM]`` of fp32 q-tile,
+    so register pressure scales with ``num_splitk * BLOCK_SIZE_M``. Wide head
+    grids (large ``num_local_heads``) amortize per-program constant work
+    (cos/sin offset prep, etc.) better with larger BM; small head grids need
+    more M-tiles for occupancy, which favors smaller BM.
+    """
+    # Register-pressure cap from the splitk fp32 q-tile.
+    if num_splitk >= 4:
+        cap = 4
+    elif num_splitk >= 2:
+        cap = 8
+    else:
+        cap = 16
+
+    if num_local_heads >= 64:
+        target = 16
+    elif num_local_heads >= 16:
+        target = 8
+    else:
+        target = 4
+
+    bm = min(target, cap)
+
+    # Shrink to a power-of-two not exceeding M so tiny inputs don't pay tail
+    # masking overhead for the whole tile.
+    while bm > 1 and bm > M:
+        bm //= 2
+
+    num_warps = 4
+    waves_per_eu = 1
+
+    return bm, num_warps, waves_per_eu
 
 
 def fused_reduce_q_norm_qk_rope_swa_write(
@@ -101,9 +139,10 @@ def fused_reduce_q_norm_qk_rope_swa_write(
         f"D={head_dim} rd={rope_head_dim} HAS_SWA={HAS_SWA}"
     )
 
-    num_warps = 4
-    waves_per_eu = 1
-    grid = (M, num_local_heads + 1)
+    BLOCK_SIZE_M, num_warps, waves_per_eu = _pick_block_size_m(
+        M, num_local_heads, num_splitk
+    )
+    grid = (triton.cdiv(M, BLOCK_SIZE_M), num_local_heads + 1)
     _fused_reduce_q_norm_qk_rope_swa_write_kernel[grid](
         q,
         q_out,
@@ -138,6 +177,7 @@ def fused_reduce_q_norm_qk_rope_swa_write(
         HAS_SWA=HAS_SWA,
         IS_NEOX=is_neox,
         REUSE_FREQS_FRONT_PART=True,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )
