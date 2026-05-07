@@ -767,10 +767,14 @@ __all__ = [
     "make_preshuffle_b_layout",
     "make_preshuffle_scale_layout",
     "load_b_pack_k32",
+    "load_b_raw_w4a16",
+    "unpack_b_w4a16",
+    "load_b_raw_w4a16_groupwise",
+    "unpack_b_w4a16_groupwise",
+    "extract_bf16_scale",
     "split_row_major_2d",
     "swizzle_xor16",
     "tile_chunk_coord_i32",
-    "unpack_b_w4a16",
     "xcd_remap_bx_by",
 ]
 
