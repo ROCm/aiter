@@ -89,6 +89,15 @@ def batched_gemm_a16wfp4_(
     assert Bx == Bw
     B = Bx
 
+    # The kernel accesses w with arbitrary strides (stride_bk, stride_bn). When w or
+    # w_scales are non-contiguous (e.g. layout "TT"/"NT" from a .permute() call), the
+    # combination of large stride_bk and the split-K index can compute addresses that
+    # fall outside the tensor's allocated storage, causing a GPU memory fault.
+    if not w.is_contiguous():
+        w = w.contiguous()
+    if not w_scales.is_contiguous():
+        w_scales = w_scales.contiguous()
+
     if config is None:
         config, _ = _get_config(M, N, K)
     else:
