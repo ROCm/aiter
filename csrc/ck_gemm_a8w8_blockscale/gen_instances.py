@@ -277,9 +277,7 @@ template torch::Tensor
           the resolved kernelName string in; C++ looks it up directly here.
         """
 
-        output_path = os.path.join(
-            self.working_path, "gemm_a8w8_blockscale_lookup.h"
-        )
+        output_path = os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup.h")
 
         if self.istune:
             LOOKUP_head = """#pragma once

@@ -158,9 +158,7 @@ template torch::Tensor
         - Non-tune mode: name-keyed registry for the Python-driven dispatch
           in gemm_a4w4_blockscale.cu.
         """
-        output_path = os.path.join(
-            self.working_path, "gemm_a4w4_blockscale_lookup.h"
-        )
+        output_path = os.path.join(self.working_path, "gemm_a4w4_blockscale_lookup.h")
 
         if self.istune:
             LOOKUP_head = """#pragma once

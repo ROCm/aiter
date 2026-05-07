@@ -411,9 +411,7 @@ def test_write_name_keyed_lookup_header():
         -1: k_default,  # default_dict entry — must be skipped
     }
 
-    LOOKUP_head = (
-        "#ifdef USE_ROCM\n#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE) {\\\n"
-    )
+    LOOKUP_head = "#ifdef USE_ROCM\n#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE) {\\\n"
     LOOKUP_template = '   {{"{kernel_name}", {kernel_name}<DTYPE, ETYPE>}},\\\n'
     LOOKUP_end = "}\n#endif\n"
 
@@ -452,7 +450,7 @@ def test_write_name_keyed_lookup_header():
         )
         _check(
             "name-keyed: no tuple-style C++ keys leak through",
-            "{\"gfx942\", 304" not in content and "{304" not in content,
+            '{"gfx942", 304' not in content and "{304" not in content,
             f"tuple-style key found in output:\n{content}",
         )
     finally:
@@ -560,7 +558,9 @@ def test_blockscale_kernel_name_forwarding():
 
         with _override_blockscale_csv(csv_ck):
             record.clear()
-            a8w8_mod.gemm_a8w8_blockscale(XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16)
+            a8w8_mod.gemm_a8w8_blockscale(
+                XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+            )
 
             _check(
                 "ck CSV: gemm_a8w8_blockscale dispatched to gemm_a8w8_blockscale_ck",
@@ -592,7 +592,9 @@ def test_blockscale_kernel_name_forwarding():
             a8w8_mod._CKGEMM_HAS_GFX = {}
             get_CKGEMM_config.cache_clear()
             record.clear()
-            a8w8_mod.gemm_a8w8_blockscale(XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16)
+            a8w8_mod.gemm_a8w8_blockscale(
+                XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+            )
 
             _check(
                 "edited CSV: new kernelName='my_other_ck_kernel' forwarded "
@@ -617,7 +619,9 @@ def test_blockscale_kernel_name_forwarding():
         get_CKGEMM_config.cache_clear()
         with _override_blockscale_csv(csv_cktile):
             record.clear()
-            a8w8_mod.gemm_a8w8_blockscale(XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16)
+            a8w8_mod.gemm_a8w8_blockscale(
+                XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+            )
             _check(
                 "cktile CSV: gemm_a8w8_blockscale routed to gemm_a8w8_blockscale_cktile",
                 record.get("libtype") == "cktile",
@@ -642,7 +646,9 @@ def test_blockscale_kernel_name_forwarding():
         get_CKGEMM_config.cache_clear()
         with _override_blockscale_csv(csv_empty):
             record.clear()
-            a8w8_mod.gemm_a8w8_blockscale(XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16)
+            a8w8_mod.gemm_a8w8_blockscale(
+                XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+            )
             # With no row matched, the dispatcher hits the "no config" fallback,
             # which calls gemm_a8w8_blockscale_ck without kernelName= — Python's
             # default kwarg ("") then propagates to C++.
