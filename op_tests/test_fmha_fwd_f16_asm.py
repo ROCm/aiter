@@ -52,7 +52,6 @@ from aiter.test_mha_common import (
     attention_ref,
 )  # noqa: F401  (kept for easy swap-back; see doc-block below)
 
-
 # ---------------------------------------------------------------------------
 # Reference implementation.  Inputs accepted as bshd (matches kernel API);
 # output `out` is bshd, `lse` is [b, hq, sq] (matches kernel layout).

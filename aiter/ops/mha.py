@@ -217,8 +217,7 @@ def mha_fwd(
     v_descale: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_fwd_fake_tensors(
@@ -268,8 +267,8 @@ def fmha_v3_fwd(
     k_descale: Optional[Tensor] = None,
     v_descale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+    
 
 
 # ---------------------------------------------------------------------------
@@ -322,8 +321,7 @@ def fmha_fwd_f16_asm(
     return_lse: bool,
     sink: Optional[Tensor] = None,
     out: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor]:
-    ...
+) -> Tuple[Tensor, Tensor]: ...
 
 
 def cmdGenFunc_mha_varlen_fwd(
@@ -556,8 +554,7 @@ def mha_varlen_fwd(
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_varlen_fwd_fake_tensor(
@@ -656,8 +653,7 @@ def fmha_v3_varlen_fwd(
     gen: Optional[torch.Generator] = None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def cmdGenFunc_mha_bwd(
@@ -868,8 +864,7 @@ def mha_bwd(
     gen: Optional[Generator] = None,
     sink: Optional[Tensor] = None,
     d_sink: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_bwd_fake_tensors(
@@ -921,8 +916,7 @@ def fmha_v3_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def cmdGenFunc_mha_varlen_bwd(
@@ -1235,8 +1229,7 @@ def mha_varlen_bwd(
     cu_seqlens_k_padded: Optional[Tensor] = None,
     sink: Optional[Tensor] = None,
     d_sink: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_varlen_bwd_fake_tensor(
@@ -1307,8 +1300,7 @@ def fmha_v3_varlen_bwd(
     gen: Optional[Generator] = None,
     cu_seqlens_q_padded: Optional[Tensor] = None,
     cu_seqlens_k_padded: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def maybe_contiguous(x):
@@ -2964,8 +2956,7 @@ def mha_batch_prefill(
     seqlen_k: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    ...
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def _mha_batch_prefill(
