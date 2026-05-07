@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Paged-attention decode kernel for gfx1250 (WMMA, 4-warp).
+"""Paged-attention decode kernel for gfx1250 (WMMA, 1-warp).
 
 Layout:
   query        [num_seqs, num_q_heads, HEAD_SIZE]             bf16/f16
@@ -11,24 +11,23 @@ Layout:
   seq_lens     [num_seqs]                                     i32
 
 Per workgroup (grid = num_seqs x num_kv_heads x num_partitions):
-  - 128 threads = 4 wave32 warps.
-  - QK is warp-split along the N (KVB) axis: each warp owns
-    N_QK_TILES_PER_WARP = (KV_COMPUTE_BLOCK_SIZE/WMMA_N) / NUM_WARPS contiguous
-    N-tiles, doing N_QK_TILES_PER_WARP * (HEAD_SIZE/WMMA_K) WMMAs.
-  - Online softmax is reduced cross-warp through LDS scratch (max + sum slabs)
-    aliased over the dead Q LDS region.
-  - PV is warp-split along the N (HEAD) axis: each warp owns
-    N_PV_TILES_PER_WARP = HEAD_SIZE/NUM_WARPS/WMMA_N output N-tiles, doing
-    N_PV_TILES_PER_WARP * (KV_COMPUTE_BLOCK_SIZE/WMMA_K) WMMAs.
+  - 32 threads = 1 wave32 warp.
+  - The single warp does ALL QK M-tiles along KVB and ALL PV M-tiles along
+    HEAD. Online softmax is a within-warp shfl_xor — no cross-warp LDS scratch.
+  - QK→PV layout transform is register-only: with the swapped-WMMA layout, two
+    consecutive QK output vec<8>'s already form the K-decomposition the PV
+    K-fragment expects (positions 0..7 from M-tile 2*ks, 8..15 from M-tile
+    2*ks+1, with lane_kgrp picking the right halves). One vector.shuffle
+    replaces the P-LDS round-trip.
 
 Requirements:
-  HEAD_SIZE             multiple of NUM_WARPS*WAVE_SIZE = 128
+  HEAD_SIZE             multiple of WMMA_N = 16
   KV_BLOCK_SIZE         multiple of 16
   KV_COMPUTE_BLOCK_SIZE multiple of WMMA_K = 32, multiple of KV_BLOCK_SIZE
   PARTITION_SIZE        multiple of KV_COMPUTE_BLOCK_SIZE
   BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE / KV_BLOCK_SIZE  (any positive int;
                                                               BPC > 4 issues multiple buffer_loads)
-  QUERY_GROUP_SIZE      exactly 16 (== WMMA_M)
+  QUERY_GROUP_SIZE      in [1, WMMA_M=16] (padded internally to WMMA_M)
 
 WMMA instruction: wmma_f32_16x16x32_bf16 (or f16), wave32.
 
@@ -52,7 +51,7 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 WAVE_SIZE = 32      # gfx1250 wave32
-NUM_WARPS = 4       # 4 warps = 128 threads
+NUM_WARPS = 1       # 1 warp = 32 threads
 WMMA_M = 16
 WMMA_N = 16
 WMMA_K = 32
@@ -96,17 +95,10 @@ def compile_pa_decode_main(
         )
     if dtype not in ("bf16", "f16"):
         raise ValueError(f"dtype must be 'bf16' or 'f16', got {dtype!r}")
-    # Each warp owns HEAD_SIZE/NUM_WARPS output cols — must be multiple of WMMA_N.
-    if HEAD_SIZE % (NUM_WARPS * WMMA_N) != 0:
+    # PV M-tiles along HEAD axis must tile cleanly.
+    if HEAD_SIZE % WMMA_N != 0:
         raise ValueError(
-            f"HEAD_SIZE must be multiple of NUM_WARPS*WMMA_N="
-            f"{NUM_WARPS * WMMA_N}, got {HEAD_SIZE}"
-        )
-    # QK warp-split along N requires N_QK_TILES divisible by NUM_WARPS.
-    if KV_COMPUTE_BLOCK_SIZE % (NUM_WARPS * WMMA_N) != 0:
-        raise ValueError(
-            f"KV_COMPUTE_BLOCK_SIZE must be multiple of NUM_WARPS*WMMA_N="
-            f"{NUM_WARPS * WMMA_N}, got {KV_COMPUTE_BLOCK_SIZE}"
+            f"HEAD_SIZE must be multiple of WMMA_N={WMMA_N}, got {HEAD_SIZE}"
         )
 
     BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE // KV_BLOCK_SIZE
@@ -116,27 +108,14 @@ def compile_pa_decode_main(
     BT_NUM_LOADS = (BLOCKS_PER_COMPUTE + BT_VEC_WIDTH - 1) // BT_VEC_WIDTH
     BT_TAIL_WIDTH = BLOCKS_PER_COMPUTE - (BT_NUM_LOADS - 1) * BT_VEC_WIDTH
 
-    USE_PER_WARP_ISSUE = BLOCKS_PER_COMPUTE >= NUM_WARPS
-    if USE_PER_WARP_ISSUE:
-        if BLOCKS_PER_COMPUTE % NUM_WARPS != 0:
-            raise ValueError(
-                f"BLOCKS_PER_COMPUTE ({BLOCKS_PER_COMPUTE}) must be divisible by "
-                f"NUM_WARPS ({NUM_WARPS}) for per-warp TDM issue path"
-            )
-        BLOCKS_PER_WARP = BLOCKS_PER_COMPUTE // NUM_WARPS
-        K_OPS_PER_WAVE = BLOCKS_PER_WARP
-    else:
-        BLOCKS_PER_WARP = BLOCKS_PER_COMPUTE
-        K_OPS_PER_WAVE = BLOCKS_PER_COMPUTE  
-    KV_OPS_PER_WAVE = 2 * K_OPS_PER_WAVE     
+    K_OPS_PER_WAVE = BLOCKS_PER_COMPUTE
+    KV_OPS_PER_WAVE = 2 * K_OPS_PER_WAVE
 
-    block_threads = NUM_WARPS * WAVE_SIZE          # 128
-    K_QK_TILES = HEAD_SIZE // WMMA_K               # HEAD/32 = 4
-    N_QK_TILES = KV_COMPUTE_BLOCK_SIZE // WMMA_N   # compute/16 (e.g. 4 for compute=64)
-    N_QK_TILES_PER_WARP = N_QK_TILES // NUM_WARPS  # 1 for compute=64, 2 for 128, 4 for 256
-    K_PV_TILES = KV_COMPUTE_BLOCK_SIZE // WMMA_K   # compute/32 (e.g. 2 for compute=64)
-    HEAD_PER_WARP = HEAD_SIZE // NUM_WARPS         # 32 for HEAD=128
-    N_PV_TILES_PER_WARP = HEAD_PER_WARP // WMMA_N  # 2 for HEAD=128
+    block_threads = NUM_WARPS * WAVE_SIZE          # 32
+    K_QK_TILES = HEAD_SIZE // WMMA_K               # HEAD/32
+    N_QK_TILES = KV_COMPUTE_BLOCK_SIZE // WMMA_N   # compute/16
+    K_PV_TILES = KV_COMPUTE_BLOCK_SIZE // WMMA_K   # compute/32
+    N_PV_TILES = HEAD_SIZE // WMMA_N               # HEAD/16
     COMPUTES_PER_PARTITION = PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
 
     elem_bytes = 2  # bf16/f16
@@ -150,32 +129,27 @@ def compile_pa_decode_main(
     # overlap with, so we collapse to a single stage and save half the K/V LDS.
     NUM_KV_STAGES = 2 if COMPUTES_PER_PARTITION > 1 else 1
 
-    # Padded LDS row strides (in elements).
+    # Padded LDS row stride (in elements).
     KV_LDS_ROW_STRIDE = HEAD_SIZE + LDS_PAD_ELEMS
-    P_LDS_ROW_STRIDE  = KV_COMPUTE_BLOCK_SIZE + LDS_PAD_ELEMS
 
     # LDS layout (NUM_KV_STAGES double-buffer for K and V; +LDS_PAD_ELEMS bf16
-    # pad per row, applied via TDM `pad_interval`/`pad_amount` for Q/K/V and
-    # via the P-LDS addressing arithmetic for P):
+    # pad per row, applied via TDM `pad_interval`/`pad_amount`):
     #   Q     [WMMA_M=16,  HEAD+LDS_PAD]               dtype  (persistent until read into q_frags)
     #   K[i]  [KV_COMPUTE_BLOCK_SIZE, HEAD+LDS_PAD]    dtype  (stage i, holds BLOCKS_PER_COMPUTE blocks)
     #   V[i]  [KV_COMPUTE_BLOCK_SIZE, HEAD+LDS_PAD]    dtype  (stage i)
-    #   P     [WMMA_M=16, KV_COMPUTE_BLOCK_SIZE+LDS_PAD] dtype
     #
-    # Cross-warp reduce scratch [NUM_WARPS, QG] f32 is aliased with Q LDS (Q is
-    # unused after q_frags are read into registers at prologue; scratch only
-    # lives during the softmax step, so they never overlap in time).
+    # P never goes through LDS: with the swapped-WMMA layout and 1 warp, the
+    # QK output's K-decomposition matches PV's K-fragment layout exactly, so
+    # we feed PV WMMAs directly from the QK accumulators via vector.shuffle.
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="pa_decode_main_lds")
-    # Use WMMA_M (the *padded* M-tile size) for the in-LDS Q and P heights.
+    # Use WMMA_M (the *padded* M-tile size) for the in-LDS Q height.
     # When the real `QUERY_GROUP_SIZE` is < WMMA_M, the unused rows in LDS
     # are simply never written (Q TDM only loads real rows; the row-mask in
     # QK + masked stores keep their data from leaking out).
     q_lds_elems  = WMMA_M                * KV_LDS_ROW_STRIDE
     kv_lds_elems = KV_COMPUTE_BLOCK_SIZE * KV_LDS_ROW_STRIDE
-    p_lds_elems  = WMMA_M                * P_LDS_ROW_STRIDE
     q_lds_bytes  = q_lds_elems * elem_bytes
     kv_one_bytes = kv_lds_elems * elem_bytes
-    p_lds_bytes  = p_lds_elems * elem_bytes
 
     # Allocate each region with a 16-byte alignment
     q_lds_offset = allocator._align(allocator.ptr, 16)
@@ -189,18 +163,6 @@ def compile_pa_decode_main(
         allocator.ptr = v_off + kv_one_bytes
         k_stage_offsets.append(k_off)
         v_stage_offsets.append(v_off)
-    p_lds_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = p_lds_offset + p_lds_bytes
-
-
-    # Cross-warp reduce scratch: two slabs (one for max, one for sum) of
-    # NUM_WARPS * WMMA_M f32 each. Alias both into Q's LDS region.
-    # WMMA_M (not QUERY_GROUP_SIZE) is the per-warp stride so warp-w's slot
-    # for row r is at `w*WMMA_M + r` regardless of real QGS — otherwise warps
-    # would alias each other when QGS < WMMA_M.
-    scratch_slab_elems = NUM_WARPS * WMMA_M   # f32 elements per slab
-    scratch_max_lds_offset = q_lds_offset
-    scratch_sum_lds_offset = q_lds_offset + scratch_slab_elems * 4
 
     @flyc.kernel
     def kernel_pa_decode_main(
@@ -249,10 +211,7 @@ def compile_pa_decode_main(
             tx = gpu.thread_id("x")
             kv_head = gpu.block_id("y")
 
-            warp_id = tx / arith.index(WAVE_SIZE)
-            lane_id = tx % arith.index(WAVE_SIZE)
-
-            wave_id_sgpr = arith.index_cast(T.index, rocdl.wave_id())
+            lane_id = tx  # NUM_WARPS=1, so threadIdx.x ∈ [0, WAVE_SIZE)
             lane_kgrp = lane_id / arith.index(WMMA_M)   # 0 or 1
             lane16 = lane_id % arith.index(WMMA_M)       # 0..15
 
@@ -290,23 +249,12 @@ def compile_pa_decode_main(
                 SmemPtr(base, v_stage_offsets[i], elem_ty, shape=(kv_lds_elems,))
                 for i in range(NUM_KV_STAGES)
             ]
-            p_lds = SmemPtr(base, p_lds_offset, elem_ty, shape=(p_lds_elems,))
-            # Cross-warp reduce scratch slabs (aliased with Q LDS region, f32)
-            scratch_max_lds = SmemPtr(
-                base, scratch_max_lds_offset, T.f32, shape=(scratch_slab_elems,)
-            )
-            scratch_sum_lds = SmemPtr(
-                base, scratch_sum_lds_offset, T.f32, shape=(scratch_slab_elems,)
-            )
             q_lds.get()
             k_lds_stages[0].get()
             v_lds_stages[0].get()
             if NUM_KV_STAGES == 2:
                 k_lds_stages[1].get()
                 v_lds_stages[1].get()
-            p_lds.get()
-            scratch_max_lds.get()
-            scratch_sum_lds.get()
 
             # --- qk_scale in log2 domain (so we can use exp2) ---
             qk_scale_f32 = arith.bitcast(T.f32, _raw(i32_qk_scale))
@@ -329,11 +277,11 @@ def compile_pa_decode_main(
             m_state = neg_inf_f32   # per-lane scalar (for row = lane16)
             l_state = zero_f32      # per-lane scalar
 
-            # PV accumulator: per warp N_PV_TILES_PER_WARP vec<8xf32>.
+            # PV accumulator: N_PV_TILES vec<8xf32>, one per HEAD M-tile.
             # Per-lane = 8 mi (HEAD-cols within M-tile) × 1 lane16 (QGSP-row).
             pv_accs = [
                 arith.constant_vector(0.0, T.vec(8, T.f32))
-                for _ in range(N_PV_TILES_PER_WARP)
+                for _ in range(N_PV_TILES)
             ]
 
             # lane decomposition for ds_load_tr16_b128 (B-operand transposed read)
@@ -506,69 +454,19 @@ def compile_pa_decode_main(
                 # is KV_BLOCK_SIZE rows × KV_LDS_ROW_STRIDE elements wide.
                 one_block_bytes = KV_BLOCK_SIZE * KV_LDS_ROW_STRIDE * elem_bytes
 
-                if USE_PER_WARP_ISSUE:
-                    # select-chain on wave_id_sgpr looks smth like this:
-                    #  my_pb = phys_blks_list[3]
-                    #  my_pb = select(wave_id == 2, phys_blks_list[2], my_pb)                                                                                                   
-                    #  my_pb = select(wave_id == 1, phys_blks_list[1], my_pb)                                                                                                   
-                    #  my_pb = select(wave_id == 0, phys_blks_list[0], my_pb)   
-                    my_phys_blks = []
-                    for inner in range_constexpr(BLOCKS_PER_WARP):
-                        # Default = warp (NUM_WARPS-1)'s block at this inner index.
-                        my_pb = phys_blks_list[
-                            (NUM_WARPS - 1) * BLOCKS_PER_WARP + inner
-                        ]
-                        for ii in range_constexpr(NUM_WARPS - 1):
-                            w = NUM_WARPS - 2 - ii  # iterate w = NUM_WARPS-2 .. 0
-                            is_w = arith.cmpi(
-                                arith.CmpIPredicate.eq,
-                                _raw(wave_id_sgpr),
-                                _raw(arith.index(w)),
-                            )
-                            my_pb = arith.select(
-                                is_w,
-                                _raw(phys_blks_list[w * BLOCKS_PER_WARP + inner]),
-                                _raw(my_pb),
-                            )
-                        my_phys_blks.append(my_pb)
-
-                    # Per-warp LDS base: warp w's blocks live at
-                    #   byte_off = (w*BLOCKS_PER_WARP + inner) * one_block_bytes
-                    warp_lds_base = wave_id_sgpr * arith.index(
-                        BLOCKS_PER_WARP * one_block_bytes
+                # Single-warp cooperative issue: this warp issues every block.
+                for b in range_constexpr(BLOCKS_PER_COMPUTE):
+                    lds_sub_off = arith.index(b * one_block_bytes)
+                    _issue_kv_load_single_block(
+                        arg_key_cache, k_lds_mem,
+                        phys_blks_list[b], lds_sub_off, tdm_num_warps=NUM_WARPS,
                     )
-
-                    # K issues, then V issues (FIFO drain order).
-                    for inner in range_constexpr(BLOCKS_PER_WARP):
-                        lds_sub_off = warp_lds_base + arith.index(
-                            inner * one_block_bytes
-                        )
-                        _issue_kv_load_single_block(
-                            arg_key_cache, k_lds_mem,
-                            my_phys_blks[inner], lds_sub_off, tdm_num_warps=1,
-                        )
-                    for inner in range_constexpr(BLOCKS_PER_WARP):
-                        lds_sub_off = warp_lds_base + arith.index(
-                            inner * one_block_bytes
-                        )
-                        _issue_kv_load_single_block(
-                            arg_value_cache, v_lds_mem,
-                            my_phys_blks[inner], lds_sub_off, tdm_num_warps=1,
-                        )
-                else:
-                    # Cooperative split: every warp participates in each block.
-                    for b in range_constexpr(BLOCKS_PER_COMPUTE):
-                        lds_sub_off = arith.index(b * one_block_bytes)
-                        _issue_kv_load_single_block(
-                            arg_key_cache, k_lds_mem,
-                            phys_blks_list[b], lds_sub_off, tdm_num_warps=NUM_WARPS,
-                        )
-                    for b in range_constexpr(BLOCKS_PER_COMPUTE):
-                        lds_sub_off = arith.index(b * one_block_bytes)
-                        _issue_kv_load_single_block(
-                            arg_value_cache, v_lds_mem,
-                            phys_blks_list[b], lds_sub_off, tdm_num_warps=NUM_WARPS,
-                        )
+                for b in range_constexpr(BLOCKS_PER_COMPUTE):
+                    lds_sub_off = arith.index(b * one_block_bytes)
+                    _issue_kv_load_single_block(
+                        arg_value_cache, v_lds_mem,
+                        phys_blks_list[b], lds_sub_off, tdm_num_warps=NUM_WARPS,
+                    )
 
             FENCE_OUTSTANDING = KV_OPS_PER_WAVE
 
@@ -652,29 +550,23 @@ def compile_pa_decode_main(
                 # `wmma(K, Q, …)` instead of `wmma(Q, K, …)` → output is S^T in
                 # WMMA C-layout. Per-lane post-WMMA: 8 mi (= KVB-tokens within
                 # M-tile) × 1 lane16 (= QGSP-row).
-                #
-                # Each warp owns N_QK_TILES_PER_WARP M-tiles along the KVB axis:
-                #   warp w handles M-tiles [w*N_QK_TILES_PER_WARP, (w+1)*N_QK_TILES_PER_WARP)
-                # KV_COMPUTE_PER_WARP = N_QK_TILES_PER_WARP * WMMA_M = warp's KVB-stripe size.
+                # The single warp does all N_QK_TILES M-tiles along KVB.
                 qk_accs = [
                     arith.constant_vector(0.0, T.vec(8, T.f32))
-                    for _ in range(N_QK_TILES_PER_WARP)
+                    for _ in range(N_QK_TILES)
                 ]
-                for n_local in range_constexpr(N_QK_TILES_PER_WARP):
-                    n_tile_global = (
-                        warp_id * arith.index(N_QK_TILES_PER_WARP) + arith.index(n_local)
-                    )
-                    n_row_lds = n_tile_global * arith.index(WMMA_M) + lane16
+                for n_tile in range_constexpr(N_QK_TILES):
+                    n_row_lds = arith.index(n_tile * WMMA_M) + lane16
                     for ks in range_constexpr(K_QK_TILES):
                         k_frag = _load_wmma_A_frag(
                             k_lds, n_row_lds, ks * WMMA_K, KV_LDS_ROW_STRIDE
                         )
                         # SWAPPED: K is A operand (M=KVB), Q is B operand (N=QGSP).
-                        qk_accs[n_local] = wmma_op(
+                        qk_accs[n_tile] = wmma_op(
                             T.vec(8, T.f32),
                             k_frag,
                             q_frags[ks],
-                            qk_accs[n_local],
+                            qk_accs[n_tile],
                             signA=False,
                             signB=False,
                             modC=0,
@@ -683,26 +575,22 @@ def compile_pa_decode_main(
                         ).result
 
                 # Scale by qk_scale * log2e so we can use exp2 later.
-                for n_local in range_constexpr(N_QK_TILES_PER_WARP):
-                    qk_accs[n_local] = arith.mulf(qk_accs[n_local], qk_scale_log2_vec)
+                for n_tile in range_constexpr(N_QK_TILES):
+                    qk_accs[n_tile] = arith.mulf(qk_accs[n_tile], qk_scale_log2_vec)
 
                 # Col mask (token < seq_len). In swapped layout, KVB-token varies
                 # per mi (not per lane16). Per-element mask:
-                #   tok_abs[mi] = tile_first_tok + n_tile_global * WMMA_M
-                #              + lane_kgrp*8 + mi
+                #   tok_abs[mi] = tile_first_tok + n_tile*WMMA_M + lane_kgrp*8 + mi
                 neg_inf_f32_local = arith.constant(float("-inf"), type=T.f32)
-                for n_local in range_constexpr(N_QK_TILES_PER_WARP):
-                    n_tile_global = (
-                        warp_id * arith.index(N_QK_TILES_PER_WARP) + arith.index(n_local)
-                    )
+                for n_tile in range_constexpr(N_QK_TILES):
                     new_vals = []
                     for mi in range_constexpr(8):
                         v = vector.extract(
-                            qk_accs[n_local], static_position=[mi], dynamic_position=[]
+                            qk_accs[n_tile], static_position=[mi], dynamic_position=[]
                         )
                         tok_abs_mi = (
                             tile_first_tok
-                            + n_tile_global * arith.index(WMMA_M)
+                            + arith.index(n_tile * WMMA_M)
                             + lane_kgrp * arith.index(8)
                             + arith.index(mi)
                         )
@@ -711,23 +599,24 @@ def compile_pa_decode_main(
                         )
                         v = arith.select(in_range, _raw(v), _raw(neg_inf_f32_local))
                         new_vals.append(v)
-                    qk_accs[n_local] = vector.from_elements(T.vec(8, T.f32), new_vals)
+                    qk_accs[n_tile] = vector.from_elements(T.vec(8, T.f32), new_vals)
 
                 # Row mask for QGSP padding (when QGS_real < WMMA_M). In swapped
                 # layout: row = lane16 (single per lane). One vec-wide select.
                 if QUERY_GROUP_SIZE < WMMA_M:
-                    for n_local in range_constexpr(N_QK_TILES_PER_WARP):
-                        qk_accs[n_local] = arith.select(
+                    for n_tile in range_constexpr(N_QK_TILES):
+                        qk_accs[n_tile] = arith.select(
                             is_row_valid,
-                            _raw(qk_accs[n_local]),
+                            _raw(qk_accs[n_tile]),
                             _raw(neg_finite_max_vec8),
                         )
 
-                # ------------------------ Online softmax (swapped layout) ------------------------
+                # ------------------------ Online softmax (1-warp) ------------------------
                 # Per-lane = 8 KVB-tokens × 1 QGSP-row. Reduction is along KVB.
                 # m_state, l_state, alpha are SCALAR per lane (lane16 = row).
+                # No cross-warp scratch — reduction collapses to local + shfl_xor.
 
-                # Step 1: per-lane local max across all (n_local, mi) → scalar.
+                # Step 1: per-lane local max across all (n_tile, mi) → scalar.
                 local_max = vector.extract(
                     qk_accs[0], static_position=[0], dynamic_position=[]
                 )
@@ -736,133 +625,84 @@ def compile_pa_decode_main(
                         qk_accs[0], static_position=[mi], dynamic_position=[]
                     )
                     local_max = arith.maximumf(local_max, v)
-                if N_QK_TILES_PER_WARP > 1:
-                    for n_local in range_constexpr(1, N_QK_TILES_PER_WARP):
+                if N_QK_TILES > 1:
+                    for n_tile in range_constexpr(1, N_QK_TILES):
                         for mi in range_constexpr(8):
                             v = vector.extract(
-                                qk_accs[n_local], static_position=[mi], dynamic_position=[]
+                                qk_accs[n_tile], static_position=[mi], dynamic_position=[]
                             )
                             local_max = arith.maximumf(local_max, v)
 
                 # Step 2: within-warp max via shfl_xor(by 16) — swaps lane_kgrp halves.
-                # After shfl, both lanes (kgrp=0/1, lane16=R) have the warp's row-max for row R.
+                # After shfl, both lanes (kgrp=0/1, lane16=R) have the row-max for row R.
                 x = fxFloat32(local_max)
                 peer = x.shuffle_xor(fxInt32(16), fxInt32(WAVE_SIZE))
-                warp_max = x.maximumf(peer).ir_value()
+                row_max = x.maximumf(peer).ir_value()
 
-                # Step 3: cross-warp reduce via LDS scratch. Each lane writes its
-                # row's partial to scratch[warp_id*WMMA_M + lane16]. Two lanes
-                # (kgrp=0/1) per row write the same value (benign-race).
-                scratch_max_lds.store(
-                    warp_max,
-                    [warp_id * arith.index(WMMA_M) + lane16],
-                )
-                gpu.barrier()
-
-                acc = fxFloat32(scratch_max_lds.load([arith.index(0) + lane16]))
-                for w in range_constexpr(1, NUM_WARPS):
-                    partial = fxFloat32(
-                        scratch_max_lds.load([arith.index(w * WMMA_M) + lane16])
-                    )
-                    acc = acc.maximumf(partial)
-                row_max_reduced = acc.ir_value()
-
-                # Step 4: update m_state, compute alpha (scalars).
-                new_m = arith.maximumf(m_state, row_max_reduced)
+                # Step 3: update m_state, compute alpha (scalars).
+                new_m = arith.maximumf(m_state, row_max)
                 alpha = rocdl.exp2(T.f32, arith.subf(m_state, new_m))
 
-                # Step 5: compute p = exp2(qk - new_m) and accumulate row_sum (scalar).
+                # Step 4: compute p = exp2(qk - new_m) IN-PLACE into qk_accs (now
+                # they hold p), and accumulate row_sum (scalar). Keeping P in the
+                # qk_accs registers avoids a separate p_accs allocation; the PV
+                # WMMA reads from these same registers via vector.shuffle.
                 row_sum_partial = zero_f32
-                p_accs = []
-                for n_local in range_constexpr(N_QK_TILES_PER_WARP):
+                for n_tile in range_constexpr(N_QK_TILES):
                     vals_new = []
                     for mi in range_constexpr(8):
                         q_ij = vector.extract(
-                            qk_accs[n_local], static_position=[mi], dynamic_position=[]
+                            qk_accs[n_tile], static_position=[mi], dynamic_position=[]
                         )
                         p_ij = rocdl.exp2(T.f32, arith.subf(q_ij, new_m))
                         vals_new.append(p_ij)
                         row_sum_partial = arith.addf(row_sum_partial, p_ij)
-                    p_accs.append(vector.from_elements(T.vec(8, T.f32), vals_new))
+                    qk_accs[n_tile] = vector.from_elements(T.vec(8, T.f32), vals_new)
 
-                # Step 6: within-warp sum via shfl_xor(by 16).
+                # Step 5: within-warp sum via shfl_xor(by 16).
                 x = fxFloat32(row_sum_partial)
                 peer = x.shuffle_xor(fxInt32(16), fxInt32(WAVE_SIZE))
-                warp_sum = (x + peer).ir_value()
+                row_sum = (x + peer).ir_value()
 
-                # Step 7: cross-warp sum reduce via LDS.
-                scratch_sum_lds.store(
-                    warp_sum,
-                    [warp_id * arith.index(WMMA_M) + lane16],
-                )
-                gpu.barrier()
-
-                acc = fxFloat32(scratch_sum_lds.load([arith.index(0) + lane16]))
-                for w in range_constexpr(1, NUM_WARPS):
-                    partial = fxFloat32(
-                        scratch_sum_lds.load([arith.index(w * WMMA_M) + lane16])
-                    )
-                    acc = acc + partial
-                row_sum_reduced = acc.ir_value()
-
-                # Step 8: update l_state and m_state (scalars).
-                l_state = arith.addf(arith.mulf(alpha, l_state), row_sum_reduced)
+                # Step 6: update l_state and m_state (scalars).
+                l_state = arith.addf(arith.mulf(alpha, l_state), row_sum)
                 m_state = new_m
 
-                # Step 9: rescale pv_accs by alpha (vec<8> *= scalar via broadcast).
+                # Step 7: rescale pv_accs by alpha (vec<8> *= scalar via broadcast).
                 alpha_vec = vector.broadcast(T.vec(8, T.f32), alpha)
-                for pv_n in range_constexpr(N_PV_TILES_PER_WARP):
+                for pv_n in range_constexpr(N_PV_TILES):
                     pv_accs[pv_n] = arith.mulf(pv_accs[pv_n], alpha_vec)
 
-                # Step 10: Write this warp's P slice to LDS — VECTORIZED.
-                # In swapped layout, per-lane has 8 mi (KVB-tokens within M-tile)
-                # × 1 lane16 (QGSP-row). In P LDS [QGSP, KV_COMPUTE] row-major,
-                # the 8 mi values land at 8 consecutive addresses → vec<8xbf16>
-                # store (1 instr instead of 8 scalar stores).
-                p_lds_mem = p_lds.get()
-                for n_local in range_constexpr(N_QK_TILES_PER_WARP):
-                    p_vec = p_accs[n_local]
-                    p_half = arith.trunc_f(T.vec(8, elem_ty), p_vec)
-                    # KVB-col base for this lane's vec<8>:
-                    #   warp_id * KV_COMPUTE_PER_WARP
-                    #   + n_local * WMMA_M  (M-tile within warp's KVB stripe)
-                    #   + lane_kgrp * 8     (which half of the M-tile)
-                    kvb_col_base = (
-                        warp_id * arith.index(N_QK_TILES_PER_WARP * WMMA_M)
-                        + arith.index(n_local * WMMA_M)
-                        + lane_kgrp * arith.index(8)
-                    )
-                    off = lane16 * arith.index(P_LDS_ROW_STRIDE) + kvb_col_base
-                    vector.store(p_half, p_lds_mem, [off])
-
-                # Wait for current tile's V (its DMA was overlapped with QK + softmax + P-LDS write).
-                # The barrier doubles as the LDS-fence for the P-LDS writes above.
+                # Wait for current tile's V (its DMA was overlapped with QK+softmax).
                 tdm_ops.tensor_wait(outstanding_after_v_drain)
                 gpu.barrier()
 
                 # ------------------------ PV WMMA (SWAPPED operands) ------------------------
-                # `wmma(V, P, …)` instead of `wmma(P, V, …)` → output is O^T in
-                # WMMA C-layout. Per-lane post-WMMA: 8 mi (= HEAD-cols within M-tile)
-                # × 1 lane16 (= QGSP-row). M=HEAD, N=QGSP, K=KVB.
-                # Each warp owns N_PV_TILES_PER_WARP M-tiles of the HEAD axis:
-                #   warp w handles HEAD-cols [w*HEAD_PER_WARP, (w+1)*HEAD_PER_WARP)
-                for pv_n in range_constexpr(N_PV_TILES_PER_WARP):
-                    global_m_tile = warp_id * arith.index(N_PV_TILES_PER_WARP) + arith.index(pv_n)
+                # `wmma(V, P, …)` → output is O^T in WMMA C-layout. Per-lane
+                # post-WMMA: 8 mi (= HEAD-cols within M-tile) × 1 lane16
+                # (= QGSP-row). M=HEAD, N=QGSP, K=KVB.
+                #
+                # P-fragment is built register-only from qk_accs. Per PV K-tile
+                # ks (K=WMMA_K=32 KVB tokens), the B-frag wants 16 K-elements
+                # per lane decomposed as positions[0..7]={K[0..7] for kgrp=0,
+                # K[8..15] for kgrp=1} and positions[8..15]={K[16..23] for kgrp=0,
+                # K[24..31] for kgrp=1}. Each lane's qk_accs[2*ks] holds 8 KVB
+                # tokens of QK M-tile 2*ks at this lane's kgrp-half (= positions
+                # 0..7 of the desired layout); qk_accs[2*ks+1] holds the next 8
+                # at the same kgrp-half (= positions 8..15). So a plain concat
+                # via vector.shuffle followed by trunc_f produces the bf16/f16
+                # B-fragment with no LDS round-trip and no cross-lane shuffles.
+                for pv_n in range_constexpr(N_PV_TILES):
                     for ks in range_constexpr(K_PV_TILES):
-                        # P fragment: feed as B operand (N=QGSP, K=KVB).
-                        # P LDS [QGSP, KV_COMPUTE] read with row=lane16, K-cols varying.
-                        p_frag = _load_wmma_A_frag(
-                            p_lds, lane16, ks * WMMA_K, P_LDS_ROW_STRIDE
+                        p_f32 = vector.shuffle(
+                            qk_accs[2 * ks], qk_accs[2 * ks + 1], list(range(16))
                         )
-                        # V fragment: feed as A operand (M=HEAD, K=KVB).
-                        # V LDS [KVB, HEAD] read via transpose-load: lane16 → HEAD-col,
-                        # K-rows = KVB-tokens. _load_wmma_B_frag_tr's "n_col_base"
-                        # is the offset along the row_stride dim (= HEAD here).
+                        p_frag = arith.trunc_f(T.vec(16, elem_ty), p_f32)
                         v_frag = _load_wmma_B_frag_tr(
                             v_lds,
-                            global_m_tile * arith.index(WMMA_M),  # base in HEAD dim
-                            ks * WMMA_K,                          # base in KVB dim
-                            KV_LDS_ROW_STRIDE,                    # row stride (V LDS [KVB, HEAD+pad])
+                            arith.index(pv_n * WMMA_M),  # base in HEAD dim
+                            ks * WMMA_K,                 # base in KVB dim
+                            KV_LDS_ROW_STRIDE,           # row stride (V LDS [KVB, HEAD+pad])
                         )
                         # SWAPPED: V is A (M=HEAD), P is B (N=QGSP).
                         pv_accs[pv_n] = wmma_op(
@@ -891,17 +731,16 @@ def compile_pa_decode_main(
                 + part_idx * stride_lse_part
             )
 
-            # Accumulator: each warp writes its N_PV_TILES_PER_WARP × vec<8xf32>.
+            # Accumulator: the warp writes all N_PV_TILES × vec<8xf32>.
             # Swapped layout: per-lane = 8 mi (HEAD-cols within M-tile) × 1
             # lane16 (QGSP-row). HEAD-cols are stride-1 in the row-major output
             # buffer → vector stores. RDNA4's largest buffer_store is b128 (16
             # bytes / vec<4xf32>), so split each vec<8xf32> into two vec<4>
             # stores at consecutive offsets.
             # Predicated by is_row_valid (= lane16 < QGSP_real) for QGS-padding.
-            for pv_n in range_constexpr(N_PV_TILES_PER_WARP):
+            for pv_n in range_constexpr(N_PV_TILES):
                 head_col_base = (
-                    warp_id * arith.index(HEAD_PER_WARP)
-                    + arith.index(pv_n * WMMA_M)
+                    arith.index(pv_n * WMMA_M)
                     + lane_kgrp * arith.index(8)
                 )
                 off_lo = out_base + lane16 * stride_o_row + head_col_base
