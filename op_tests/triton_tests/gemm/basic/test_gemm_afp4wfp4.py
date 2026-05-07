@@ -42,7 +42,7 @@ def un_shuffle_scales(scales_shuffled: torch.Tensor):
     return scales
 
 
-def shuffle_scales_gfx1250(scales: torch.Tensor, BLOCK_K = 256) -> torch.Tensor:
+def shuffle_scales_gfx1250(scales: torch.Tensor, BLOCK_K=256) -> torch.Tensor:
     # Per-tile preshuffle. Each tile T occupies a contiguous K-byte stripe
     # [T*K_GROUPS*4, (T+1)*K_GROUPS*4) in the output, with the 4 lanes packed
     # adjacently inside each stripe so the kernel's TDM read sees:
@@ -193,7 +193,7 @@ def get_x_vals():
     x_vals += [(v, 2112, 7168) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
     x_vals += [(2048, 8192, 4096)]
-    return [(256, 256, 1024), (64, 256, 256)]
+    return x_vals
 
 
 def mxfp4_to_f32(x):

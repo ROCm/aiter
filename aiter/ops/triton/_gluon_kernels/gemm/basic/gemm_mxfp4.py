@@ -239,28 +239,26 @@ def gemm_mxfp4_preshuffle_gfx1250(
     )
 
     # --- 1. Prologue: fill NUM_BUFFERS-1 LDS slots via TDM ---
-    for i in gl.static_range(NUM_BUFFERS - 1):
+    # Load-then-advance: each iter consumes the descriptor's current K
+    # position, then steps it forward for the next load (prologue or main).
+    for _ in gl.static_range(NUM_BUFFERS - 1):
         slot = load_idx % NUM_BUFFERS
-        if i > 0:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K_BYTES], update_bounds=False
-            )
         gl.amd.gfx1250.tdm.async_load(a_desc, [0, 0], smem_A.index(slot))
-        if i > 0:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K_BYTES * 16], update_bounds=False
-            )
         gl.amd.gfx1250.tdm.async_load(b_desc, [0, 0], smem_B.index(slot))
-        if i > 0:
-            as_desc = gl.amd.gfx1250.tdm.advance(
-                as_desc, [0, K_GROUPS * LANES_PER_B128], update_bounds=False
-            )
         gl.amd.gfx1250.tdm.async_load(as_desc, [0, 0], smem_AS.index(slot))
-        if i > 0:
-            bs_desc = gl.amd.gfx1250.tdm.advance(
-                bs_desc, [0, K_GROUPS * LANES_PER_B128], update_bounds=False
-            )
         gl.amd.gfx1250.tdm.async_load(bs_desc, [0, 0], smem_BS.index(slot))
+        a_desc = gl.amd.gfx1250.tdm.advance(
+            a_desc, [0, BLOCK_K_BYTES]
+        )
+        b_desc = gl.amd.gfx1250.tdm.advance(
+            b_desc, [0, BLOCK_K_BYTES * 16]
+        )
+        as_desc = gl.amd.gfx1250.tdm.advance(
+            as_desc, [0, K_GROUPS * LANES_PER_B128]
+        )
+        bs_desc = gl.amd.gfx1250.tdm.advance(
+            bs_desc, [0, K_GROUPS * LANES_PER_B128]
+        )
         load_idx += 1
 
     # --- 2. Pre-load tile 0 from LDS into registers ---
@@ -290,25 +288,26 @@ def gemm_mxfp4_preshuffle_gfx1250(
             cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
         )
 
-        # TDM load next tile
+        # TDM load next tile (descriptors are already positioned by
+        # the previous iter's / prologue's trailing advance)
         slot = load_idx % NUM_BUFFERS
 
-        a_desc = gl.amd.gfx1250.tdm.advance(
-            a_desc, [0, BLOCK_K_BYTES], update_bounds=False
-        )
         gl.amd.gfx1250.tdm.async_load(a_desc, [0, 0], smem_A.index(slot))
-        b_desc = gl.amd.gfx1250.tdm.advance(
-            b_desc, [0, BLOCK_K_BYTES * 16], update_bounds=False
-        )
         gl.amd.gfx1250.tdm.async_load(b_desc, [0, 0], smem_B.index(slot))
-        as_desc = gl.amd.gfx1250.tdm.advance(
-            as_desc, [0, K_GROUPS * LANES_PER_B128], update_bounds=False
-        )
         gl.amd.gfx1250.tdm.async_load(as_desc, [0, 0], smem_AS.index(slot))
-        bs_desc = gl.amd.gfx1250.tdm.advance(
-            bs_desc, [0, K_GROUPS * LANES_PER_B128], update_bounds=False
-        )
         gl.amd.gfx1250.tdm.async_load(bs_desc, [0, 0], smem_BS.index(slot))
+        a_desc = gl.amd.gfx1250.tdm.advance(
+            a_desc, [0, BLOCK_K_BYTES]
+        )
+        b_desc = gl.amd.gfx1250.tdm.advance(
+            b_desc, [0, BLOCK_K_BYTES * 16]
+        )
+        as_desc = gl.amd.gfx1250.tdm.advance(
+            as_desc, [0, K_GROUPS * LANES_PER_B128]
+        )
+        bs_desc = gl.amd.gfx1250.tdm.advance(
+            bs_desc, [0, K_GROUPS * LANES_PER_B128]
+        )
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 4)
         load_idx += 1
@@ -370,8 +369,6 @@ def gemm_mxfp4_preshuffle_gfx1250(
     # --- 5. Final WMMA ---
     acc = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc)
 
-    if NUM_BUFFERS > 2:
-        gl.amd.sched_barrier(0)
 
     # =====================================================================
     # Store output
