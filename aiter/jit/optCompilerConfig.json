@@ -534,7 +534,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_topk_pybind.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/topk_sigmoid_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/topk_softplus_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/topk_gating_kernels.cu'",
             "f'{CK_DIR}/example/ck_tile/09_topk_softmax/topk_softmax_api.cpp'"
         ],
         "flags_extra_cc": [],

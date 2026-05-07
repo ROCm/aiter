@@ -37,14 +37,23 @@ def run_torch(gating_output: torch.Tensor, topk: int):
 
 @perftest(num_iters=10, num_warmup=1)
 def run_fused(gating_output: torch.Tensor, topk: int):
-    tokens, _ = gating_output.shape
+    tokens, num_experts = gating_output.shape
     router_scores = torch.empty(
         (tokens, topk), dtype=torch.float32, device=gating_output.device
     )
     router_indices = torch.empty(
         (tokens, topk), dtype=torch.int32, device=gating_output.device
     )
-    aiter.topk_sigmoid(router_scores, router_indices, gating_output)
+    if num_experts <= 128:
+        aiter.topk_sigmoid(router_scores, router_indices, gating_output)
+    else:
+        aiter.topk_gating(
+            router_scores,
+            router_indices,
+            gating_output,
+            score_func="sigmoid",
+            need_renorm=False,
+        )
     return router_scores, router_indices
 
 
@@ -259,7 +268,7 @@ def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("topk", [1, 2, 4, 8])
 @pytest.mark.parametrize("num_tokens", [64, 1024, 2048])
-@pytest.mark.parametrize("num_experts", [64, 128])
+@pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
 def test_topk_sigmoid_correctness(num_experts, num_tokens, topk, dtype):
     """Pytest test for correctness of topk_sigmoid operation."""
     torch.random.manual_seed(0)
@@ -295,7 +304,7 @@ if __name__ == "__main__":
         "--num-experts",
         type=str2tuple,
         default=[64, 128, 256, 384],
-        help="Comma-separated list of number of experts (default: 128)",
+        help="Comma-separated list of number of experts (default: 64,128,256,384)",
     )
     parser.add_argument(
         "--num-tokens",
@@ -307,12 +316,12 @@ if __name__ == "__main__":
         "--topk",
         type=str2tuple,
         default=[1, 2, 4, 6, 8],
-        help="Comma-separated list of topk values (default: 8)",
+        help="Comma-separated list of topk values (default: 1,2,4,6,8)",
     )
     parser.add_argument(
         "--dtype",
         type=str2Dtype,
-        default=[torch.float16, torch.bfloat16, torch.float32],
+        default=[torch.float16, torch.bfloat16],
         help="Comma-separated list of dtypes: fp16, bf16 (default: fp16,bf16)",
     )
     parser.add_argument(
@@ -333,16 +342,19 @@ if __name__ == "__main__":
     topk_list = to_list(args.topk)
     dtype_list = to_list(args.dtype)
 
-    configs = list(
-        itertools.product(num_experts_list, num_tokens_list, topk_list, dtype_list)
-    )
-
     if args.test in ("sigmoid", "all"):
+        sigmoid_experts = [e for e in num_experts_list]
+        sigmoid_dtypes = [d for d in dtype_list if d != torch.float32]
+        sigmoid_configs = list(
+            itertools.product(
+                sigmoid_experts, num_tokens_list, topk_list, sigmoid_dtypes
+            )
+        )
         print("=" * 80)
         print("topk_sigmoid benchmark")
         print("=" * 80)
         collected = []
-        for num_experts, num_tokens, topk, dtype in configs:
+        for num_experts, num_tokens, topk, dtype in sigmoid_configs:
             result = benchmark_topk_sigmoid(
                 num_experts=num_experts, num_tokens=num_tokens, topk=topk, dtype=dtype
             )
@@ -352,11 +364,14 @@ if __name__ == "__main__":
         print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
 
     if args.test in ("softplus", "all"):
+        softplus_configs = list(
+            itertools.product(num_experts_list, num_tokens_list, topk_list, dtype_list)
+        )
         print("\n" + "=" * 80)
         print("topk_softplus benchmark")
         print("=" * 80)
         collected = []
-        for num_experts, num_tokens, topk, dtype in configs:
+        for num_experts, num_tokens, topk, dtype in softplus_configs:
             result = benchmark_topk_softplus(
                 num_experts=num_experts, num_tokens=num_tokens, topk=topk, dtype=dtype
             )
