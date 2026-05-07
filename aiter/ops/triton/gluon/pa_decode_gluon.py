@@ -25,13 +25,12 @@ FLYDSL_PS_REDUCE_AVAILABLE = True
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
-    from flydsl.expr import arith, gpu, rocdl, buffer_ops, range_constexpr
-    from flydsl.expr.typing import T, Int32
+    from flydsl.expr import arith, gpu, rocdl, buffer_ops, const_expr, range_constexpr
+    from flydsl.expr.typing import T
     from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
     from flydsl.runtime.device import get_rocm_arch as get_hip_arch
     from flydsl._mlir import ir
     from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl._mlir.dialects import arith as _mlir_arith
 except Exception:
     FLYDSL_PS_REDUCE_AVAILABLE = False
     flyc = None
@@ -40,15 +39,14 @@ except Exception:
     gpu = None
     rocdl = None
     buffer_ops = None
+    const_expr = None
     range_constexpr = None
     T = None
-    Int32 = None
     SmemAllocator = None
     SmemPtr = None
     get_hip_arch = None
     ir = None
     CompilationContext = None
-    _mlir_arith = None
 
 GLUON_JIT_KERNEL_ENABLED = True
 try:
@@ -716,7 +714,20 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     query_shared = gl.allocate_shared_memory(
         COMPUTE_TYPE, [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2], shared_query_layout
     )
-    mtp_query_tensor = mtp_query_tensor.to(COMPUTE_TYPE)
+    if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
+        # BF16/FP16 query tensor with FP8 MFMA: dynamic per-(query row) quant into FP8.
+        query_f32 = mtp_query_tensor.to(gl.float32)
+        query_abs = gl.abs(query_f32)
+        query_max_abs = gl.max(query_abs, axis=1, keep_dims=True)
+        inv_den = hip_libdevice.fast_dividef(1.0, query_max_abs + 1e-8)
+        query_f32_scaled = query_f32 * inv_den * float(FP8_MAX_VALUE)
+        mtp_query_tensor = query_f32_scaled.to(COMPUTE_TYPE)
+        query_scale_value = query_max_abs * (1.0 / float(FP8_MAX_VALUE))
+        query_scale_value = gl.convert_layout(
+            query_scale_value, layout=qk_linear_layout
+        )
+    else:
+        mtp_query_tensor = mtp_query_tensor.to(COMPUTE_TYPE)
     query_shared.store(mtp_query_tensor)
 
     if KV_QUANT_MODE == 1:
@@ -861,12 +872,12 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
                 )
                 # Expand key scale for broadcasting [1, KV_COMPUTE_BLOCK_SIZE]
                 key_scale_value = key_scale_value[None, :]
-            if QUERY_QUANT_MODE >= 0:
+            if QUERY_QUANT_MODE >= 0 or COMPUTE_TYPE.is_fp8():
                 qk_scale_value = softmax_scale * query_scale_value * key_scale_value
             else:
                 qk_scale_value = softmax_scale * key_scale_value
         else:
-            if QUERY_QUANT_MODE >= 0:
+            if QUERY_QUANT_MODE >= 0 or COMPUTE_TYPE.is_fp8():
                 qk_scale_value = softmax_scale * query_scale_value
             else:
                 qk_scale_value = softmax_scale
@@ -1024,7 +1035,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 #     cache_results=True,
 # )
 @gluon.jit
-def paged_attention_decode_sliding_window_head_1(
+def paged_attention_decode_ps_head_1(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     output_ptr,  # [batch_size, query_length, num_kv_heads, query_group_size, head_size]
@@ -1670,7 +1681,22 @@ def paged_attention_decode_sliding_window_head_1(
         key_scale_value = gl.load(key_scale)
         value_scale_value = gl.load(value_scale)
 
-    if QUERY_SEQ_LEN_POW2 == 1:
+    if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
+        # BF16/FP16 query tensor with FP8 MFMA: dynamic per-(query row) quant into FP8.
+        if QUERY_SEQ_LEN_POW2 == 1:
+            query_f32 = query_tensor.to(gl.float32)
+        else:
+            query_f32 = mtp_query_tensor.to(gl.float32)
+        query_abs = gl.abs(query_f32)
+        query_max_abs = gl.max(query_abs, axis=1, keep_dims=True)
+        inv_den = hip_libdevice.fast_dividef(1.0, query_max_abs + 1e-8)
+        query_f32_scaled = query_f32 * inv_den * float(FP8_MAX_VALUE)
+        mtp_query_tensor = query_f32_scaled.to(COMPUTE_TYPE)
+        query_scale_value = query_max_abs * (1.0 / float(FP8_MAX_VALUE))
+        query_scale_value = gl.convert_layout(
+            query_scale_value, layout=qk_linear_layout
+        )
+    elif QUERY_SEQ_LEN_POW2 == 1:
         mtp_query_tensor = query_tensor.to(COMPUTE_TYPE)
     else:
         mtp_query_tensor = mtp_query_tensor.to(COMPUTE_TYPE)
@@ -1848,12 +1874,12 @@ def paged_attention_decode_sliding_window_head_1(
                 )
                 # key_scale_value = gl.convert_layout(key_scale_value_blocked, layout=gl.SliceLayout(0, qk_linear_layout))
                 key_scale_value = key_scale_value[None, :]
-            if QUERY_QUANT_MODE >= 0:
+            if QUERY_QUANT_MODE >= 0 or COMPUTE_TYPE.is_fp8():
                 qk_scale_value = softmax_scale * query_scale_value * key_scale_value
             else:
                 qk_scale_value = softmax_scale * key_scale_value
         else:
-            if QUERY_QUANT_MODE >= 0:
+            if QUERY_QUANT_MODE >= 0 or COMPUTE_TYPE.is_fp8():
                 qk_scale_value = softmax_scale * query_scale_value
             else:
                 qk_scale_value = softmax_scale
@@ -2168,7 +2194,7 @@ def paged_attention_decode_sliding_window_head_1(
 #     cache_results=True,
 # )
 @gluon.jit
-def paged_attention_decode_sliding_window(
+def paged_attention_decode_ps(
     exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, q_group_size]
     output_ptr,  # [batch_size, query_length, num_kv_heads, query_group_size, head_size]
@@ -2718,17 +2744,17 @@ def paged_attention_decode_sliding_window(
         value_scale_value = gl.load(value_scale)
 
     if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
-        # Quantize bf16 query to fp8
-        # Convert query to float32 for computation
+        # BF16/FP16 query tensor with FP8 MFMA: dynamic per-(query row) quant into FP8.
         query_f32 = mtp_query_tensor.to(gl.float32)
-        # Compute max absolute value for scaling
         query_abs = gl.abs(query_f32)
         query_max_abs = gl.max(query_abs, axis=1, keep_dims=True)
-        # Compute scale factor: FP8_MAX_VALUE / max_abs_value
-        # Add epsilon to avoid division by zero
-        query_scale_value = query_max_abs / float(FP8_MAX_VALUE)
-        # Quantize: scale query to fp8 range and convert to fp8 type
-        mtp_query_tensor = query_f32.to(COMPUTE_TYPE)
+        inv_den = hip_libdevice.fast_dividef(1.0, query_max_abs + 1e-8)
+        query_f32_scaled = query_f32 * inv_den * float(FP8_MAX_VALUE)
+        mtp_query_tensor = query_f32_scaled.to(COMPUTE_TYPE)
+        query_scale_value = query_max_abs * (1.0 / float(FP8_MAX_VALUE))
+        query_scale_value = gl.convert_layout(
+            query_scale_value, layout=qk_linear_layout
+        )
     else:
         mtp_query_tensor = mtp_query_tensor.to(COMPUTE_TYPE)
 
@@ -2936,12 +2962,12 @@ def paged_attention_decode_sliding_window(
 
         # Apply quantization scaling to attention scores
         if KV_QUANT_MODE >= 0:
-            if QUERY_QUANT_MODE >= 0:
+            if QUERY_QUANT_MODE >= 0 or COMPUTE_TYPE.is_fp8():
                 qk_scale_value = softmax_scale * query_scale_value * key_scale_value
             else:
                 qk_scale_value = softmax_scale * key_scale_value
         else:
-            if QUERY_QUANT_MODE >= 0:
+            if QUERY_QUANT_MODE >= 0 or COMPUTE_TYPE.is_fp8():
                 qk_scale_value = softmax_scale * query_scale_value
             else:
                 qk_scale_value = softmax_scale
@@ -4380,7 +4406,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     if PS and not (SLIDING_WINDOW > 0 and KV_BLOCK_SIZE == 1024):
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
-            paged_attention_kernel = paged_attention_decode_sliding_window_head_1
+            paged_attention_kernel = paged_attention_decode_ps_head_1
             if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
                 grid = (num_sequences, query_seq_len * num_kv_heads, num_splits)
                 QUERY_SEQ_LEN_POW2 = 1
@@ -4392,7 +4418,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 grid = (num_sequences, mtp_splits, num_splits)
                 QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
         else:
-            paged_attention_kernel = paged_attention_decode_sliding_window
+            paged_attention_kernel = paged_attention_decode_ps
         paged_attention_kernel[grid](
             exp_sums_ptr,
             max_logits_ptr,
@@ -4574,27 +4600,27 @@ def compile_pa_decode_ps_reduce_flydsl(
         max_logits_ptr: fx.Tensor,
         logits_ptr: fx.Tensor,
         sink_token_ptr: fx.Tensor,
-        stride_output_bs: Int32,
-        stride_output_len: Int32,
-        stride_output_kv_head: Int32,
-        stride_output_group_size: Int32,
-        stride_exp_sums_seq: Int32,
-        stride_exp_sums_head: Int32,
-        stride_exp_sums_part: Int32,
-        stride_logits_seq: Int32,
-        stride_logits_head: Int32,
-        stride_logits_part: Int32,
-        stride_logits_group: Int32,
+        stride_output_bs: fx.Int32,
+        stride_output_len: fx.Int32,
+        stride_output_kv_head: fx.Int32,
+        stride_output_group_size: fx.Int32,
+        stride_exp_sums_seq: fx.Int32,
+        stride_exp_sums_head: fx.Int32,
+        stride_exp_sums_part: fx.Int32,
+        stride_logits_seq: fx.Int32,
+        stride_logits_head: fx.Int32,
+        stride_logits_part: fx.Int32,
+        stride_logits_group: fx.Int32,
     ):
-        tid = gpu.thread_idx.x
-        batch_idx = gpu.block_idx.x
-        kv_head_idx = gpu.block_idx.y
-        eqgs_idx = gpu.block_idx.z
+        tid = fx.Int32(gpu.thread_id("x"))
+        batch_idx = fx.Int32(gpu.block_id("x"))
+        kv_head_idx = fx.Int32(gpu.block_id("y"))
+        eqgs_idx = fx.Int32(gpu.block_id("z"))
 
         smem_base = allocator.get_base()
         red_scratch = SmemPtr(smem_base, red_off, T.f32, shape=(red_slots,))
         red_scratch.get()
-        if max_context_partition_num > FLYDSL_WARP_SIZE:
+        if const_expr(max_context_partition_num > FLYDSL_WARP_SIZE):
             part_weights_lds = SmemPtr(
                 smem_base, part_weights_off, T.f32, shape=(max_context_partition_num,)
             )
@@ -4604,104 +4630,102 @@ def compile_pa_decode_ps_reduce_flydsl(
         es_rsrc = buffer_ops.create_buffer_resource(exp_sums_ptr, max_size=True)
         ml_rsrc = buffer_ops.create_buffer_resource(max_logits_ptr, max_size=True)
         logits_rsrc = buffer_ops.create_buffer_resource(logits_ptr, max_size=True)
-        if use_sinks:
+        if const_expr(use_sinks):
             sink_rsrc = buffer_ops.create_buffer_resource(sink_token_ptr, max_size=True)
 
-        c_zero_f = arith.constant(0.0, type=T.f32)
-        c_one_f = arith.constant(1.0, type=T.f32)
-        c_neg_inf = arith.constant(float("-inf"), type=T.f32)
-        c_log2e = arith.constant(FLYDSL_LOG2E, type=T.f32)
+        c_zero_f = fx.Float32(0.0)
+        c_one_f = fx.Float32(1.0)
+        c_neg_inf = fx.Float32(float("-inf"))
+        c_log2e = fx.Float32(FLYDSL_LOG2E)
         fm_fast = arith.FastMathFlags.fast
-        c_zero_i = arith.constant(0, type=T.i32)
-        c_w = arith.constant(FLYDSL_WARP_SIZE, type=T.i32)
-        c_wave_mask = arith.constant(FLYDSL_WARP_SIZE - 1, type=T.i32)
-        c_wave_shift = arith.constant(6, type=T.i32)
-        c_red_slots = arith.constant(red_slots, type=T.i32)
+        c_zero_i = fx.Int32(0)
+        c_w = fx.Int32(FLYDSL_WARP_SIZE)
+        c_wave_mask = fx.Int32(FLYDSL_WARP_SIZE - 1)
+        c_wave_shift = fx.Int32(6)
+        c_red_slots = fx.Int32(red_slots)
         lane = tid & c_wave_mask
         wave = tid >> c_wave_shift
-        c_qgs = arith.constant(query_group_size, type=T.i32)
+        c_qgs = fx.Int32(query_group_size)
         group_idx = eqgs_idx % c_qgs
 
         def _wave_reduce_max_full(val):
             red = val
             for sh in [32, 16, 8, 4, 2, 1]:
-                red = red.maximumf(red.shuffle_xor(arith.constant(sh, type=T.i32), c_w))
+                red = red.maximumf(red.shuffle_xor(fx.Int32(sh), c_w))
             return red
 
         def _wave_reduce_sum_full(val):
             red = val
             for sh in [32, 16, 8, 4, 2, 1]:
                 red = red.addf(
-                    red.shuffle_xor(arith.constant(sh, type=T.i32), c_w),
+                    red.shuffle_xor(fx.Int32(sh), c_w),
                     fastmath=fm_fast,
                 )
             return red
 
         def _block_reduce(val, mode):
-            if red_slots == 1:
+            if const_expr(red_slots == 1):
                 return (
                     _wave_reduce_max_full(val)
-                    if mode == "max"
+                    if const_expr(mode == "max")
                     else _wave_reduce_sum_full(val)
                 )
 
-            neutral = c_neg_inf if mode == "max" else c_zero_f
+            neutral = c_neg_inf if const_expr(mode == "max") else c_zero_f
             w = (
                 _wave_reduce_max_full(val)
-                if mode == "max"
+                if const_expr(mode == "max")
                 else _wave_reduce_sum_full(val)
             )
 
-            if arith.cmpi(arith.CmpIPredicate.eq, lane, c_zero_i):
-                wave_idx = arith.index_cast(T.index, wave)
+            if lane == c_zero_i:
+                wave_idx = fx.Index(wave)
                 red_scratch.store(w, [wave_idx])
             gpu.barrier()
 
-            if arith.cmpi(arith.CmpIPredicate.eq, wave, c_zero_i):
-                in_range = arith.cmpi(arith.CmpIPredicate.slt, lane, c_red_slots)
-                lane_safe = arith.select(in_range, lane, c_zero_i)
-                lane_safe_idx = arith.index_cast(T.index, lane_safe)
+            if wave == c_zero_i:
+                in_range = lane < c_red_slots
+                lane_safe = in_range.select(lane, c_zero_i)
+                lane_safe_idx = fx.Index(lane_safe)
                 red_val = red_scratch.load([lane_safe_idx])
-                red_val = arith.select(in_range, red_val, neutral)
+                red_val = in_range.select(red_val, neutral)
                 red_val = (
                     _wave_reduce_max_full(red_val)
-                    if mode == "max"
+                    if const_expr(mode == "max")
                     else _wave_reduce_sum_full(red_val)
                 )
-                if arith.cmpi(arith.CmpIPredicate.eq, lane, c_zero_i):
-                    red_scratch.store(red_val, [arith.constant(0, index=True)])
+                if lane == c_zero_i:
+                    red_scratch.store(red_val, [fx.Index(0)])
             gpu.barrier()
 
-            return red_scratch.load([arith.constant(0, index=True)])
+            return red_scratch.load([fx.Index(0)])
 
-        if max_context_partition_num <= FLYDSL_WARP_SIZE:
-            c_part_num = arith.constant(max_context_partition_num, type=T.i32)
-            c_reduce_width = arith.constant(reduce_width, type=T.i32)
-            c_four = arith.constant(4, type=T.i32)
+        if const_expr(max_context_partition_num <= FLYDSL_WARP_SIZE):
+            c_part_num = fx.Int32(max_context_partition_num)
+            c_reduce_width = fx.Int32(reduce_width)
+            c_four = fx.Int32(4)
 
             def _wave_reduce_max(val):
                 red = val
                 for sh in reduce_shuffle_offsets:
-                    red = red.maximumf(
-                        red.shuffle_xor(arith.constant(sh, type=T.i32), c_w)
-                    )
+                    red = red.maximumf(red.shuffle_xor(fx.Int32(sh), c_w))
                 return red
 
             def _wave_reduce_sum(val):
                 red = val
                 for sh in reduce_shuffle_offsets:
                     red = red.addf(
-                        red.shuffle_xor(arith.constant(sh, type=T.i32), c_w),
+                        red.shuffle_xor(fx.Int32(sh), c_w),
                         fastmath=fm_fast,
                     )
                 return red
 
-            lane_in_range = arith.cmpi(arith.CmpIPredicate.slt, lane, c_part_num)
-            lane_in_reduce = arith.cmpi(arith.CmpIPredicate.slt, lane, c_reduce_width)
+            lane_in_range = lane < c_part_num
+            lane_in_reduce = lane < c_reduce_width
             part_sum = c_zero_f
             part_max = c_neg_inf
             if lane_in_reduce:
-                part_i32 = arith.select(lane_in_range, lane, c_zero_i)
+                part_i32 = lane_in_range.select(lane, c_zero_i)
                 es_off = (
                     batch_idx * stride_exp_sums_seq
                     + kv_head_idx * stride_exp_sums_head
@@ -4709,65 +4733,57 @@ def compile_pa_decode_ps_reduce_flydsl(
                     + eqgs_idx
                 )
                 part_sum_raw = buffer_ops.buffer_load(
-                    es_rsrc, es_off, vec_width=1, dtype=T.f32
+                    es_rsrc, es_off, vec_width=1, dtype=fx.Float32
                 )
                 part_max_raw = buffer_ops.buffer_load(
-                    ml_rsrc, es_off, vec_width=1, dtype=T.f32
+                    ml_rsrc, es_off, vec_width=1, dtype=fx.Float32
                 )
-                part_sum = arith.select(lane_in_range, part_sum_raw, c_zero_f)
-                part_max = arith.select(lane_in_range, part_max_raw, c_neg_inf)
+                part_sum = lane_in_range.select(part_sum_raw, c_zero_f)
+                part_max = lane_in_range.select(part_max_raw, c_neg_inf)
 
             global_max = _wave_reduce_max(part_max)
-            safe_global_max = arith.select(
-                global_max > c_neg_inf,
-                global_max,
-                c_zero_f,
-            )
-            part_scale = arith.select(
-                part_max > c_neg_inf,
+            safe_global_max = (global_max > c_neg_inf).select(global_max, c_zero_f)
+            part_scale = (part_max > c_neg_inf).select(
                 ((part_max - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
                 c_zero_f,
             )
             scaled_sum = part_sum * part_scale
             global_exp_sum = _wave_reduce_sum(scaled_sum)
-            if use_sinks:
+            if const_expr(use_sinks):
                 sink_off = kv_head_idx * c_qgs + group_idx
-                if sink_dtype_str == "f32":
+                if const_expr(sink_dtype_str == "f32"):
                     sink_value = buffer_ops.buffer_load(
-                        sink_rsrc, sink_off, vec_width=1, dtype=T.f32
+                        sink_rsrc, sink_off, vec_width=1, dtype=fx.Float32
                     )
-                elif sink_dtype_str == "f16":
+                elif const_expr(sink_dtype_str == "f16"):
                     sink_value_raw = buffer_ops.buffer_load(
-                        sink_rsrc, sink_off, vec_width=1, dtype=T.f16
+                        sink_rsrc, sink_off, vec_width=1, dtype=fx.Float16
                     )
-                    sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
+                    sink_value = fx.Float32(sink_value_raw)
                 else:
                     sink_value_raw = buffer_ops.buffer_load(
-                        sink_rsrc, sink_off, vec_width=1, dtype=T.bf16
+                        sink_rsrc, sink_off, vec_width=1, dtype=fx.BFloat16
                     )
-                    sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
-                sink_scale = arith.select(
-                    global_max > c_neg_inf,
+                    sink_value = fx.Float32(sink_value_raw)
+                sink_scale = (global_max > c_neg_inf).select(
                     ((sink_value - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
                     c_zero_f,
                 )
                 global_exp_sum = global_exp_sum + sink_scale
-            safe_global_exp_sum = arith.select(
-                global_exp_sum > c_zero_f,
-                global_exp_sum,
-                c_one_f,
+            safe_global_exp_sum = (global_exp_sum > c_zero_f).select(
+                global_exp_sum, c_one_f
             )
             weight_local = scaled_sum / safe_global_exp_sum
-            weight_local_i32 = arith.bitcast(T.i32, weight_local)
+            weight_local_i32 = arith.unwrap(weight_local).bitcast(T.i32)
 
             acc = c_zero_f
             for part_idx in range_constexpr(max_context_partition_num):
-                part_i32 = arith.constant(part_idx, type=T.i32)
+                part_i32 = fx.Int32(part_idx)
                 bcast_addr = part_i32 * c_four
                 weight_i32 = rocdl.ds_bpermute(
                     T.i32, arith.unwrap(bcast_addr), arith.unwrap(weight_local_i32)
                 )
-                weight = arith.bitcast(T.f32, weight_i32)
+                weight = fx.Float32(arith.unwrap(weight_i32).bitcast(T.f32))
                 logits_off = (
                     batch_idx * stride_logits_seq
                     + kv_head_idx * stride_logits_head
@@ -4775,29 +4791,31 @@ def compile_pa_decode_ps_reduce_flydsl(
                     + eqgs_idx * stride_logits_group
                     + tid
                 )
-                if logits_dtype_str == "f32":
+                if const_expr(logits_dtype_str == "f32"):
                     part_logits = buffer_ops.buffer_load(
-                        logits_rsrc, logits_off, vec_width=1, dtype=T.f32
+                        logits_rsrc, logits_off, vec_width=1, dtype=fx.Float32
                     )
-                elif logits_dtype_str == "f16":
+                elif const_expr(logits_dtype_str == "f16"):
                     part_logits_raw = buffer_ops.buffer_load(
-                        logits_rsrc, logits_off, vec_width=1, dtype=T.f16
+                        logits_rsrc, logits_off, vec_width=1, dtype=fx.Float16
                     )
-                    part_logits = _mlir_arith.ExtFOp(T.f32, part_logits_raw).result
+                    part_logits = fx.Float32(part_logits_raw)
                 else:
                     part_logits_raw = buffer_ops.buffer_load(
-                        logits_rsrc, logits_off, vec_width=1, dtype=T.bf16
+                        logits_rsrc, logits_off, vec_width=1, dtype=fx.BFloat16
                     )
-                    part_logits = _mlir_arith.ExtFOp(T.f32, part_logits_raw).result
+                    part_logits = fx.Float32(part_logits_raw)
                 acc = acc + part_logits * weight
         else:
             global_max = c_neg_inf
-            for chunk_base in range(0, max_context_partition_num, block_threads):
+            for chunk_base in range_constexpr(
+                0, max_context_partition_num, block_threads
+            ):
                 chunk_size = min(block_threads, max_context_partition_num - chunk_base)
-                c_chunk_size = arith.constant(chunk_size, type=T.i32)
-                c_chunk_base = arith.constant(chunk_base, type=T.i32)
-                in_chunk = arith.cmpi(arith.CmpIPredicate.slt, tid, c_chunk_size)
-                part_i32 = arith.select(in_chunk, tid + c_chunk_base, c_zero_i)
+                c_chunk_size = fx.Int32(chunk_size)
+                c_chunk_base = fx.Int32(chunk_base)
+                in_chunk = tid < c_chunk_size
+                part_i32 = in_chunk.select(tid + c_chunk_base, c_zero_i)
                 es_off = (
                     batch_idx * stride_exp_sums_seq
                     + kv_head_idx * stride_exp_sums_head
@@ -4805,24 +4823,22 @@ def compile_pa_decode_ps_reduce_flydsl(
                     + eqgs_idx
                 )
                 part_max_raw = buffer_ops.buffer_load(
-                    ml_rsrc, es_off, vec_width=1, dtype=T.f32
+                    ml_rsrc, es_off, vec_width=1, dtype=fx.Float32
                 )
-                part_max = arith.select(in_chunk, part_max_raw, c_neg_inf)
+                part_max = in_chunk.select(part_max_raw, c_neg_inf)
                 chunk_max = _block_reduce(part_max, "max")
                 global_max = global_max.maximumf(chunk_max)
 
-            safe_global_max = arith.select(
-                global_max > c_neg_inf,
-                global_max,
-                c_zero_f,
-            )
+            safe_global_max = (global_max > c_neg_inf).select(global_max, c_zero_f)
             global_exp_sum = c_zero_f
-            for chunk_base in range(0, max_context_partition_num, block_threads):
+            for chunk_base in range_constexpr(
+                0, max_context_partition_num, block_threads
+            ):
                 chunk_size = min(block_threads, max_context_partition_num - chunk_base)
-                c_chunk_size = arith.constant(chunk_size, type=T.i32)
-                c_chunk_base = arith.constant(chunk_base, type=T.i32)
-                in_chunk = arith.cmpi(arith.CmpIPredicate.slt, tid, c_chunk_size)
-                part_i32 = arith.select(in_chunk, tid + c_chunk_base, c_zero_i)
+                c_chunk_size = fx.Int32(chunk_size)
+                c_chunk_base = fx.Int32(chunk_base)
+                in_chunk = tid < c_chunk_size
+                part_i32 = in_chunk.select(tid + c_chunk_base, c_zero_i)
                 es_off = (
                     batch_idx * stride_exp_sums_seq
                     + kv_head_idx * stride_exp_sums_head
@@ -4830,56 +4846,54 @@ def compile_pa_decode_ps_reduce_flydsl(
                     + eqgs_idx
                 )
                 part_sum_raw = buffer_ops.buffer_load(
-                    es_rsrc, es_off, vec_width=1, dtype=T.f32
+                    es_rsrc, es_off, vec_width=1, dtype=fx.Float32
                 )
                 part_max_raw = buffer_ops.buffer_load(
-                    ml_rsrc, es_off, vec_width=1, dtype=T.f32
+                    ml_rsrc, es_off, vec_width=1, dtype=fx.Float32
                 )
-                part_sum = arith.select(in_chunk, part_sum_raw, c_zero_f)
-                part_max = arith.select(in_chunk, part_max_raw, c_neg_inf)
-                part_scale = arith.select(
-                    part_max > c_neg_inf,
+                part_sum = in_chunk.select(part_sum_raw, c_zero_f)
+                part_max = in_chunk.select(part_max_raw, c_neg_inf)
+                part_scale = (part_max > c_neg_inf).select(
                     ((part_max - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
                     c_zero_f,
                 )
                 chunk_sum = _block_reduce(part_sum * part_scale, "sum")
                 global_exp_sum = global_exp_sum + chunk_sum
 
-            if use_sinks:
+            if const_expr(use_sinks):
                 sink_off = kv_head_idx * c_qgs + group_idx
-                if sink_dtype_str == "f32":
+                if const_expr(sink_dtype_str == "f32"):
                     sink_value = buffer_ops.buffer_load(
-                        sink_rsrc, sink_off, vec_width=1, dtype=T.f32
+                        sink_rsrc, sink_off, vec_width=1, dtype=fx.Float32
                     )
-                elif sink_dtype_str == "f16":
+                elif const_expr(sink_dtype_str == "f16"):
                     sink_value_raw = buffer_ops.buffer_load(
-                        sink_rsrc, sink_off, vec_width=1, dtype=T.f16
+                        sink_rsrc, sink_off, vec_width=1, dtype=fx.Float16
                     )
-                    sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
+                    sink_value = fx.Float32(sink_value_raw)
                 else:
                     sink_value_raw = buffer_ops.buffer_load(
-                        sink_rsrc, sink_off, vec_width=1, dtype=T.bf16
+                        sink_rsrc, sink_off, vec_width=1, dtype=fx.BFloat16
                     )
-                    sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
-                sink_scale = arith.select(
-                    global_max > c_neg_inf,
+                    sink_value = fx.Float32(sink_value_raw)
+                sink_scale = (global_max > c_neg_inf).select(
                     ((sink_value - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
                     c_zero_f,
                 )
                 global_exp_sum = global_exp_sum + sink_scale
 
-            safe_global_exp_sum = arith.select(
-                global_exp_sum > c_zero_f,
-                global_exp_sum,
-                c_one_f,
+            safe_global_exp_sum = (global_exp_sum > c_zero_f).select(
+                global_exp_sum, c_one_f
             )
 
-            for chunk_base in range(0, max_context_partition_num, block_threads):
+            for chunk_base in range_constexpr(
+                0, max_context_partition_num, block_threads
+            ):
                 chunk_size = min(block_threads, max_context_partition_num - chunk_base)
-                c_chunk_size = arith.constant(chunk_size, type=T.i32)
-                c_chunk_base = arith.constant(chunk_base, type=T.i32)
-                in_chunk = arith.cmpi(arith.CmpIPredicate.slt, tid, c_chunk_size)
-                part_i32 = arith.select(in_chunk, tid + c_chunk_base, c_zero_i)
+                c_chunk_size = fx.Int32(chunk_size)
+                c_chunk_base = fx.Int32(chunk_base)
+                in_chunk = tid < c_chunk_size
+                part_i32 = in_chunk.select(tid + c_chunk_base, c_zero_i)
                 es_off = (
                     batch_idx * stride_exp_sums_seq
                     + kv_head_idx * stride_exp_sums_head
@@ -4887,29 +4901,28 @@ def compile_pa_decode_ps_reduce_flydsl(
                     + eqgs_idx
                 )
                 part_sum_raw = buffer_ops.buffer_load(
-                    es_rsrc, es_off, vec_width=1, dtype=T.f32
+                    es_rsrc, es_off, vec_width=1, dtype=fx.Float32
                 )
                 part_max_raw = buffer_ops.buffer_load(
-                    ml_rsrc, es_off, vec_width=1, dtype=T.f32
+                    ml_rsrc, es_off, vec_width=1, dtype=fx.Float32
                 )
                 if in_chunk:
                     part_sum = part_sum_raw
                     part_max = part_max_raw
-                    part_scale = arith.select(
-                        part_max > c_neg_inf,
+                    part_scale = (part_max > c_neg_inf).select(
                         ((part_max - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
                         c_zero_f,
                     )
                     weight = (part_sum * part_scale) / safe_global_exp_sum
-                    part_idx_idx = arith.index_cast(T.index, part_i32)
+                    part_idx_idx = fx.Index(part_i32)
                     part_weights_lds.store(weight, [part_idx_idx])
 
             gpu.barrier()
 
             acc = c_zero_f
             for part_idx in range_constexpr(max_context_partition_num):
-                part_i32 = arith.constant(part_idx, type=T.i32)
-                part_idx_idx = arith.constant(part_idx, index=True)
+                part_i32 = fx.Int32(part_idx)
+                part_idx_idx = fx.Index(part_idx)
                 weight = part_weights_lds.load([part_idx_idx])
                 logits_off = (
                     batch_idx * stride_logits_seq
@@ -4918,20 +4931,20 @@ def compile_pa_decode_ps_reduce_flydsl(
                     + eqgs_idx * stride_logits_group
                     + tid
                 )
-                if logits_dtype_str == "f32":
+                if const_expr(logits_dtype_str == "f32"):
                     part_logits = buffer_ops.buffer_load(
-                        logits_rsrc, logits_off, vec_width=1, dtype=T.f32
+                        logits_rsrc, logits_off, vec_width=1, dtype=fx.Float32
                     )
-                elif logits_dtype_str == "f16":
+                elif const_expr(logits_dtype_str == "f16"):
                     part_logits_raw = buffer_ops.buffer_load(
-                        logits_rsrc, logits_off, vec_width=1, dtype=T.f16
+                        logits_rsrc, logits_off, vec_width=1, dtype=fx.Float16
                     )
-                    part_logits = _mlir_arith.ExtFOp(T.f32, part_logits_raw).result
+                    part_logits = fx.Float32(part_logits_raw)
                 else:
                     part_logits_raw = buffer_ops.buffer_load(
-                        logits_rsrc, logits_off, vec_width=1, dtype=T.bf16
+                        logits_rsrc, logits_off, vec_width=1, dtype=fx.BFloat16
                     )
-                    part_logits = _mlir_arith.ExtFOp(T.f32, part_logits_raw).result
+                    part_logits = fx.Float32(part_logits_raw)
                 acc = acc + part_logits * weight
 
         query_idx = eqgs_idx // c_qgs
@@ -4943,12 +4956,12 @@ def compile_pa_decode_ps_reduce_flydsl(
             + group_idx * stride_output_group_size
             + tid
         )
-        if output_dtype_str == "f32":
+        if const_expr(output_dtype_str == "f32"):
             out_val = acc
-        elif output_dtype_str == "f16":
-            out_val = arith.trunc_f(T.f16, acc)
+        elif const_expr(output_dtype_str == "f16"):
+            out_val = acc.to(fx.Float16)
         else:
-            out_val = arith.trunc_f(T.bf16, acc)
+            out_val = acc.to(fx.BFloat16)
         buffer_ops.buffer_store(out_val, out_rsrc, out_off)
 
     @flyc.jit
@@ -5110,33 +5123,6 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
         All parameters from the reduction kernel plus execution grid configuration
     """
     if PS:
-        if CXX_PS_REDUCE_AVAILABLE:
-            try:
-                launch_pa_decode_ps_reduce_cxx(
-                    output_ptr,
-                    exp_sums_ptr,
-                    max_logits_ptr,
-                    logits_ptr,
-                    sink_token_ptr,
-                    stride_output_bs,
-                    stride_output_len,
-                    stride_output_kv_head,
-                    stride_output_group_size,
-                    stride_exp_sums_seq,
-                    stride_exp_sums_head,
-                    stride_exp_sums_part,
-                    stride_logits_seq,
-                    stride_logits_head,
-                    stride_logits_part,
-                    stride_logits_group,
-                    query_seq_len=query_seq_len,
-                    query_group_size=query_group_size,
-                    head_size=head_size,
-                    context_partition_num=context_partition_num,
-                )
-                return
-            except ImportError:
-                pass
         try:
             launch_pa_decode_ps_reduce_flydsl(
                 output_ptr,
@@ -5160,8 +5146,34 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 head_size=head_size,
                 context_partition_num=context_partition_num,
             )
-            return
-        except ImportError:
+        except Exception:
+            pass
+        try:
+            if CXX_PS_REDUCE_AVAILABLE:
+                launch_pa_decode_ps_reduce_cxx(
+                    output_ptr,
+                    exp_sums_ptr,
+                    max_logits_ptr,
+                    logits_ptr,
+                    sink_token_ptr,
+                    stride_output_bs,
+                    stride_output_len,
+                    stride_output_kv_head,
+                    stride_output_group_size,
+                    stride_exp_sums_seq,
+                    stride_exp_sums_head,
+                    stride_exp_sums_part,
+                    stride_logits_seq,
+                    stride_logits_head,
+                    stride_logits_part,
+                    stride_logits_group,
+                    query_seq_len=query_seq_len,
+                    query_group_size=query_group_size,
+                    head_size=head_size,
+                    context_partition_num=context_partition_num,
+                )
+                return
+        except Exception:
             ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
             paged_attention_decode_ps_reduce_kernel[ps_reduce_grid](
                 output_ptr,
