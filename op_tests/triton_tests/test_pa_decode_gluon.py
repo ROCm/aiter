@@ -2473,10 +2473,10 @@ def sliding_window_accuracy_test():
     SLIDING_WINDOW_OPTIONS = [0, 128]
     HEAD_DIMENSION_OPTIONS = [128]
     CONTEXT_LENGTH_OPTIONS = [1024, 8192]
-    BATCH_SIZE_OPTIONS = [1, 128]
-    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
-    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["bf16", False, True]]
-    QUANT_MODE_OPTIONS = ["per_tensor"]
+    BATCH_SIZE_OPTIONS = [1, 32, 128]
+    QUERY_LENGTH_OPTIONS = [1, 2, 3]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["bf16", False, True], ["fp8", False, True]]
+    QUANT_MODE_OPTIONS = ["per_tensor", "per_token"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [True]
     HEAD_CONFIGURATIONS = [(64, 8), (16, 1)]
@@ -2516,7 +2516,10 @@ def sliding_window_performance_test():
     HEAD_DIMENSION_OPTIONS = [64]
     HEAD_CONFIGURATIONS = [(64, 8)]
     QUERY_LENGTH_OPTIONS = [1]
-    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [
+        ["fp8", False, True],
+        ["bf16", False, False],
+    ]
     QUANT_MODE_OPTIONS = ["per_tensor"]
     CONTEXT_LENGTH_OPTIONS = [1024]
     BATCH_SIZE_OPTIONS = [4, 128]
