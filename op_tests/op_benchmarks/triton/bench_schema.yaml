@@ -104,3 +104,6 @@ benchmarks:
   mla_decode:
     input_columns: [model, B, H, S, kv_lora_rank, qk_rope_head_dim, rotary_dim, num_kv_splits]
     output_columns: [mla_decode_fwd (ms)]
+  mla_decode_gluon:
+    input_columns: [batch_size, ctx_lens, nhead]
+    output_columns: [Time_(ms), TFLOPS, Bandwidth_(TB/s)]
