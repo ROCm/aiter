@@ -184,10 +184,10 @@ __global__ void topk_softplus_kernel_opt(
     // Step 3: warp-level k-way merge
     // Winning lane = expert_idx & (WARP_SIZE-1) → readlane broadcasts
     // the pre-cached unbiased score (no per-round global memory access).
-    int   cursor = 0;
-    float sum    = 0.0f;
-    int   topk_indice;
-    float topk_value;
+    int   cursor      = 0;
+    float sum         = 0.0f;
+    int   topk_indice = 0;
+    float topk_value  = 0.0f;
 
     for(int k = 0; k < topk; ++k)
     {
@@ -204,8 +204,11 @@ __global__ void topk_softplus_kernel_opt(
         float weight   = __builtin_bit_cast(
             float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, my_orig), win_lane));
 
-        topk_indice = (threadIdx.x == k) ? my_idx : topk_indice;
-        topk_value  = (threadIdx.x == k) ? weight : topk_value;
+        if(static_cast<int>(threadIdx.x) == k)
+        {
+            topk_indice = my_idx;
+            topk_value  = weight;
+        }
         if constexpr(need_renorm) sum += weight;
     }
 
@@ -308,9 +311,9 @@ __global__ void topk_softplus_kernel(
         __syncthreads();
     }
 
-    float sum = 0.0f;
-    int topk_indice;
-    float topk_value;
+    float sum         = 0.0f;
+    int   topk_indice = 0;
+    float topk_value  = 0.0f;
     for(int k = 0; k < topk; ++k)
     {
         float max_val = -INFINITY;
@@ -328,8 +331,11 @@ __global__ void topk_softplus_kernel(
         if(correction_bias != nullptr)
             max_val -= static_cast<float>(correction_bias[max_idx]);
         scores[max_idx] = -INFINITY;
-        topk_indice     = threadIdx.x == k ? max_idx : topk_indice;
-        topk_value      = threadIdx.x == k ? max_val : topk_value;
+        if(static_cast<int>(threadIdx.x) == k)
+        {
+            topk_indice = max_idx;
+            topk_value  = max_val;
+        }
         if(need_renorm) sum += max_val;
     }
 

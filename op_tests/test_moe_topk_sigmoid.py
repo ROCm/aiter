@@ -310,7 +310,7 @@ if __name__ == "__main__":
         "--num-tokens",
         type=str2tuple,
         default=[64, 1024, 2048],
-        help="Comma-separated list of number of tokens (default: 1024)",
+        help="Comma-separated list of number of tokens (default: 64,1024,2048)",
     )
     parser.add_argument(
         "--topk",
