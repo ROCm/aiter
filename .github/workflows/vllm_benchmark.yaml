@@ -343,7 +343,6 @@ jobs:
           docker rm -f "${KIMI_CONTAINER_NAME}" || true
 
           docker_args=(
-            --rm
             -d
             --name "${KIMI_CONTAINER_NAME}"
             -e VLLM_ROCM_USE_AITER=1
@@ -385,6 +384,41 @@ jobs:
               --kv-cache-dtype fp8 \
               --no-enable-prefix-caching \
               --trust-remote-code
+
+      - name: Wait for Kimi serve readiness
+        env:
+          KIMI_CONTAINER_NAME: vllm-kimi-tp4
+          PORT: "8006"
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark_results
+
+          for attempt in $(seq 1 360); do
+            status="$(docker inspect -f '{{.State.Status}}' "${KIMI_CONTAINER_NAME}" 2>/dev/null || true)"
+            if [ "${status}" != "running" ]; then
+              echo "::error::Kimi serve container is not running. Current status: ${status:-missing}"
+              docker ps -a --filter "name=${KIMI_CONTAINER_NAME}" || true
+              docker inspect "${KIMI_CONTAINER_NAME}" > benchmark_results/kimi_serve_container_inspect.json 2>&1 || true
+              docker logs "${KIMI_CONTAINER_NAME}" > benchmark_results/kimi_serve_server.log 2>&1 || true
+              exit 1
+            fi
+
+            if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+              echo "Kimi serve is ready on port ${PORT}"
+              exit 0
+            fi
+
+            if [ $((attempt % 12)) -eq 0 ]; then
+              echo "Kimi serve is still starting after $((attempt * 5)) seconds; latest logs:"
+              docker logs --tail 80 "${KIMI_CONTAINER_NAME}" || true
+            fi
+            sleep 5
+          done
+
+          echo "::error::Kimi serve did not become ready within 30 minutes"
+          docker inspect "${KIMI_CONTAINER_NAME}" > benchmark_results/kimi_serve_container_inspect.json 2>&1 || true
+          docker logs "${KIMI_CONTAINER_NAME}" > benchmark_results/kimi_serve_server.log 2>&1 || true
+          exit 1
 
       - name: Run Kimi serve benchmark sweep
         env:
@@ -456,6 +490,7 @@ jobs:
           KIMI_CONTAINER_NAME: vllm-kimi-tp4
         run: |
           mkdir -p benchmark_results
+          docker inspect "${KIMI_CONTAINER_NAME}" > benchmark_results/kimi_serve_container_inspect.json 2>&1 || true
           docker logs "${KIMI_CONTAINER_NAME}" > benchmark_results/kimi_serve_server.log 2>&1 || true
 
       - name: Ensure benchmark artifacts exist
