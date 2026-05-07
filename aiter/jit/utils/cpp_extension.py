@@ -176,6 +176,16 @@ ROCM_VERSION = None
 if HIP_VERSION is not None:
     ROCM_VERSION = tuple(int(v) for v in HIP_VERSION.split(".")[:2])
 
+# Compress HIP device bundles (ROCm 6.2+) so `.hipFatBinSegment` stays smaller than the
+# ~2GiB span of R_X86_64_PC32 / GOTPCREL relocations in GCC crt/stubs when linking huge JIT libs.
+_HIP_OFFLOAD_COMPRESS_FLAGS: List[str] = []
+if (
+    os.environ.get("AITER_HIP_OFFLOAD_COMPRESS", "1") != "0"
+    and ROCM_VERSION is not None
+    and ROCM_VERSION >= (6, 2)
+):
+    _HIP_OFFLOAD_COMPRESS_FLAGS.append("--offload-compress")
+
 # PyTorch releases have the version pattern major.minor.patch, whereas when
 # PyTorch is built from source, we append the git commit hash, which gives
 # it the below pattern.
@@ -226,7 +236,7 @@ COMMON_HIPCC_FLAGS = [
     "-fno-unique-section-names",
     "-ffunction-sections",
     "-fdata-sections",
-]
+] + _HIP_OFFLOAD_COMPRESS_FLAGS
 
 if not int(os.environ.get("AITER_SYMBOL_VISIBLE", "0")):
     COMMON_HIPCC_FLAGS.extend(["-fvisibility=hidden", "-fvisibility-inlines-hidden"])
