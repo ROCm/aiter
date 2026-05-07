@@ -81,6 +81,7 @@ def _triton_gather_kv_b_proj(
     PaddedV: tl.constexpr,
     WEIGHT_PRESHUFFLE: tl.constexpr = False,
     PER_ROW_SCALE: tl.constexpr = False,
+    NO_SCALE: tl.constexpr = False,
 ):
     stride_k_buffer: tl.constexpr = KBlockSize * (KV_CDim + KV_PeDim)
     stride_k_prefix: tl.constexpr = TpNumHeads * (QkNopeHeadDim + KV_PeDim)
@@ -124,7 +125,10 @@ def _triton_gather_kv_b_proj(
     k_head_base = kv_proj_weight + pid_head * (QkNopeHeadDim + VHeadDim) * KV_CDim
     v_head_base = k_head_base + QkNopeHeadDim * KV_CDim
 
-    if PER_ROW_SCALE:
+    if NO_SCALE:
+        # weight is not quantized; skip scale loading entirely
+        pass
+    elif PER_ROW_SCALE:
         k_row0 = pid_head * (QkNopeHeadDim + VHeadDim)
         k_nope_scale_vec = tl.load(
             kv_proj_scale + k_row0 + offs_n_k, mask=mask_k, other=1.0
@@ -218,7 +222,7 @@ def _triton_gather_kv_b_proj(
             other=0.0,
         ).to(k_type)
 
-    if not PER_ROW_SCALE:
+    if (not NO_SCALE) and (not PER_ROW_SCALE):
         k_nope_scale_0 = tl.load(
             kv_proj_scale + k_scale_n_idx * num_scale_cols + 0,
             mask=mask_k,
@@ -291,7 +295,16 @@ def _triton_gather_kv_b_proj(
             + tl.arange(0, KV_PeDim)[None, :],
         )
 
-        if PER_ROW_SCALE:
+        if NO_SCALE:
+            accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T)
+            accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T)
+            accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T)
+            accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T)
+            accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T)
+            accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T)
+            accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T)
+            accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T)
+        elif PER_ROW_SCALE:
             accum_k += (
                 tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_vec[None, :]
             )

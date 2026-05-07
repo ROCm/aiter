@@ -143,6 +143,29 @@ def per_1x32_f4_quant(
     return y, scale
 
 
+def per_1x32_i4_quant(weight, group_size=32):
+    """Groupwise int4 [-7, 7] symmetric quantization along the last dim.
+
+    Input  : weight       [..., N, K]
+    Output : weight_qt    int8 container, same shape [..., N, K], values in [-7, 7]
+             weight_scale bf16, shape [..., K // group_size, N] (G/N transposed)
+    """
+    *batch_dims, N, K = weight.shape
+    G = K // group_size
+    w_groups = weight.view(*batch_dims, N, G, group_size)
+    w_group_max = w_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+    w_scale_raw = (w_group_max / 7.0).squeeze(-1)
+    weight_qt = (
+        (w_groups / w_scale_raw.unsqueeze(-1))
+        .round()
+        .clamp(-7, 7)
+        .to(dtypes.i8)
+        .view(*batch_dims, N, K)
+    )
+    weight_scale = w_scale_raw.transpose(-1, -2).contiguous().to(dtypes.bf16)
+    return weight_qt, weight_scale
+
+
 def per_1x32_f4_quant_for_dot_scaled(lhs, rhs, quant_dtype=dtypes.fp4x2, shuffle=False):
     """Convenience function: quantize both LHS and RHS for ``tl.dot_scaled``.
 
@@ -714,3 +737,50 @@ def partial_transpose(
     input: Tensor,
     num_rows: Tensor,
 ) -> None: ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rotate_activation_fp4quant_inplace(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    group_size: int = 32,
+) -> None:
+    """Hadamard-rotate activation, FP4-quantize, then dequantize back to BF16 in-place."""
+    ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rotate_activation(
+    out: torch.Tensor,
+    input: torch.Tensor,
+) -> None:
+    """Apply Walsh-Hadamard transform along last dim with 1/sqrt(N) scaling."""
+    ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rope_rotate_activation_fp4quant_inplace(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    group_size: int = 32,
+) -> None:
+    """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate,
+    FP4-quantize, then dequantize back to BF16."""
+    ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rope_rotate_activation(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+) -> None:
+    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
+    ...
