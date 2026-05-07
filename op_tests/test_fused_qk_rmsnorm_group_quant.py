@@ -301,10 +301,7 @@ def run_hip(
     x2_out = torch.empty_like(x2) if x2 is not None else None
     res_out = torch.empty_like(x1) if res1 is not None else None
 
-    quant_args = aiter.QKRMSQuantArgs(
-        group_quant=True, group_size=group_size, transpose_scale=transpose_scale
-    )
-    aiter.fused_qk_rmsnorm_quant(
+    aiter.fused_qk_rmsnorm(
         x1_q,
         x1_s,
         x1,
@@ -318,7 +315,9 @@ def run_hip(
         x2_epsilon,
         res1,
         gemma_norm,
-        quant_args,
+        aiter.QuantType.per_1x128,
+        group_size,
+        transpose_scale,
     )
     return (x1_q, x1_s), x1_u, x2_out, res_out
 

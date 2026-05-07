@@ -143,8 +143,7 @@ def _run_hip_impl(
     k_out = torch.empty_like(k) if k is not None else None
     q_res_out = torch.empty_like(q) if q_residual is not None else None
 
-    quant_args = aiter.QKRMSQuantArgs(per_token_quant=True)
-    aiter.fused_qk_rmsnorm_quant(
+    aiter.fused_qk_rmsnorm(
         q_quant,
         q_scale,
         q,
@@ -158,7 +157,7 @@ def _run_hip_impl(
         1e-6 if k is not None else None,
         q_residual,
         gemma_norm,
-        quant_args,
+        aiter.QuantType.per_Token,
     )
     return (q_quant, q_scale), q_unquant, k_out, q_res_out
 

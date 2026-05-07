@@ -4,8 +4,9 @@
 from typing import Optional
 
 from torch import Tensor
-from dataclasses import dataclass
+from aiter.ops.enum import QuantType
 
+from .fused_qk_norm_rope_cache_quant import _fused_qk_rmsnorm_kernel
 from ..jit.core import compile_ops
 from ..utility import dtypes
 
@@ -171,15 +172,7 @@ def fused_qk_rmsnorm_per_token_quant(
     )
 
 
-@dataclass
-class QKRMSQuantArgs:
-    group_quant: int = False
-    per_token_quant: int = False
-    group_size: int = 128
-    transpose_scale: bool = False
-
-
-def fused_qk_rmsnorm_quant(
+def fused_qk_rmsnorm(
     q_out_quantized: Optional[Tensor] = None,
     q_out_scale: Optional[Tensor] = None,
     q: Optional[Tensor] = None,
@@ -193,28 +186,18 @@ def fused_qk_rmsnorm_quant(
     k_epsilon: Optional[float] = None,
     q_residual: Optional[Tensor] = None,
     gemma_norm: bool = False,
-    quant_args: Optional[QKRMSQuantArgs] = None,
+    quant_type: Optional[QuantType] = QuantType.No,
+    group_size: Optional[int] = None,
+    transpose_scale: bool = False,
 ) -> None:
     # Centralized interface
-    if quant_args.group_quant:
-        fused_qk_rmsnorm_group_quant(
-            q_out_quantized,
-            q_out_scale,
-            q,
-            q_weight,
-            q_epsilon,
-            q_out_unquantized,
-            k_out,
-            q_res_out,
-            k,
-            k_weight,
-            k_epsilon,
-            q_residual,
-            quant_args.group_size,
-            quant_args.transpose_scale,
-            gemma_norm,
+    if quant_type == QuantType.No:
+        _fused_qk_rmsnorm_kernel(
+            q, q_weight, q_epsilon, k, k_weight, k_epsilon, q_out_unquantized, k_out
         )
-    elif quant_args.per_token_quant:
+    elif quant_type == QuantType.per_Tensor:
+        raise NotImplementedError("fused_qk_rmsnorm + per_tensor quant not supported")
+    elif quant_type == QuantType.per_Token:
         fused_qk_rmsnorm_per_token_quant(
             q_out_quantized,
             q_out_scale,
@@ -230,5 +213,31 @@ def fused_qk_rmsnorm_quant(
             q_residual,
             gemma_norm,
         )
-    else:
-        raise RuntimeError("No quant args selected")
+        return
+    elif group_size is None:
+        if quant_type in [
+            QuantType.per_1x128,
+            QuantType.per_128x128,
+            QuantType.per_256x128,
+            QuantType.per_1024x128,
+        ]:
+            group_size = 128
+        elif quant_type in [QuantType.per_1x32]:
+            group_size = 32
+    fused_qk_rmsnorm_group_quant(
+        q_out_quantized,
+        q_out_scale,
+        q,
+        q_weight,
+        q_epsilon,
+        q_out_unquantized,
+        k_out,
+        q_res_out,
+        k,
+        k_weight,
+        k_epsilon,
+        q_residual,
+        group_size,
+        transpose_scale,
+        gemma_norm,
+    )
