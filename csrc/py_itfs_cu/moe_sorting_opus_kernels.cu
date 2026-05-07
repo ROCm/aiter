@@ -22,6 +22,7 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           int unit_size,
                           std::optional<aiter_tensor_t> local_expert_mask,
                           std::optional<aiter_tensor_t> num_local_tokens,
+                          std::optional<aiter_tensor_t> workspace,
                           int dispatch_policy)
 {
     AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
@@ -34,15 +35,7 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
     HipDeviceGuard device_guard(topk_ids.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    int workspace_size = moe_sorting_opus_get_workspace_size(num_tokens, num_experts, topk, dispatch_policy);
-    std::optional<AiterTensor> ws;
-    void* ws_ptr = nullptr;
-    if (workspace_size > 0)
-    {
-        ws.emplace(AiterTensor::empty(
-            {workspace_size}, topk_ids.dtype(), topk_ids.device_id, stream));
-        ws_ptr = ws->data_ptr();
-    }
+    void* ws_ptr = workspace.has_value() ? workspace.value().data_ptr() : nullptr;
 
     moe_sorting_opus(
         {
