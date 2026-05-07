@@ -81,6 +81,7 @@ else:
         from .ops.batched_gemm_op_a8w8 import *  # noqa: F403,E402
         from .ops.batched_gemm_op_bf16 import *  # noqa: F403,E402
         from .ops.deepgemm import *  # noqa: F403,E402
+
         # opus is gfx950-only; isolate so a failure here does not skip the
         # imports below it inside the surrounding try/except.
         try:
