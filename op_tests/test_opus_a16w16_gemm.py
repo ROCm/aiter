@@ -37,10 +37,7 @@ from aiter.ops.opus._arch import _detect_arch  # noqa: E402
 
 _arch_ok, _detected_gfx = _detect_arch({"gfx950"})
 if not _arch_ok:
-    print(
-        f"[skip] test_opus_a16w16_gemm requires gfx950 "
-        f"(detected {_detected_gfx!r})"
-    )
+    print(f"[skip] test_opus_a16w16_gemm requires gfx950 (detected {_detected_gfx!r})")
     sys.exit(0)
 
 from aiter.test_common import checkAllclose, run_perftest  # noqa: E402
