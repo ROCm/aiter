@@ -3,16 +3,12 @@
 """
 End-to-end test of the a16w16 user-facing entry gemm_a16w16_opus.
 
-Complements the two other a16w16 tests:
-
-  * test_opus_a16w16_tune.py   — iterates every compiled kid via
-    opus_gemm_a16w16_tune (id-based low-level binding).
-  * test_opus_a16w16_lookup.py — iterates every row in the tuned CSV
-    and launches with explicit (solidx, splitK) from CSV.
-
-This file covers the user-facing path: gemm_a16w16_opus goes through
-CSV lookup and on miss delegates to the C++ opus_gemm() two-level
-dispatch. Compares against torch.bmm and prints per-shape TFLOPs.
+This is the single regression entry point for opus a16w16: it drives
+gemm_a16w16_opus end-to-end (Python CSV lookup → C++ tuned lookup →
+heuristic fallback → launcher → kernel), compares against torch.bmm,
+and prints per-shape TFLOPs. The id-based low-level binding
+(opus_gemm_a16w16_tune) is exercised indirectly when the CSV lookup
+hits, and the heuristic dispatch is exercised on miss.
 
 Usage:
 

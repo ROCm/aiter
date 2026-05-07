@@ -232,9 +232,9 @@ __global__ void gemm_a16w16_kernel_gfx942(...) {
 Run the standard regression on a gfx950 box:
 
 ```bash
-GPU_ARCHS=gfx950 python op_tests/test_opus_a16w16_lookup.py
-GPU_ARCHS=gfx950 python op_tests/test_opus_a16w16_tune.py
 GPU_ARCHS=gfx950 python op_tests/test_opus_a16w16_gemm.py -m 128 -n 256 -k 1024 -b 1
+# CSV sweep (optional, if you have a shapes file):
+GPU_ARCHS=gfx950 python op_tests/test_opus_a16w16_gemm.py --csv /path/to/shapes.csv
 ```
 
 Then, on the new arch hardware, repeat with `GPU_ARCHS=gfx942` and
