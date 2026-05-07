@@ -1149,7 +1149,15 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
         P rslt                           = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
         tmps[warp_id][rank * part + idx] = rslt;
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    // NOTE: must use final_sync=false (RELEASE/ACQUIRE) here. Stage 2
+    // (local_device_load_rmsnorm*) on each rank reads `tmps` on the
+    // rank's own memory which contains IPC writes from peer ranks'
+    // stage 1 kernels. With final_sync=true (RELAXED) those cross-device
+    // writes are not guaranteed to be visible even after we observe the
+    // peers' end flags, and the kernel produces progressively corrupted
+    // output at per-rank volumes above ~1.2 MB (verified via
+    // sglang/benchmark/kernels/all_reduce/repro_ar_rmsnorm_corruption.py).
+    end_sync<ngpus, false>(sg, self_sg, rank);
 }
 
 template <int reduce_range>
