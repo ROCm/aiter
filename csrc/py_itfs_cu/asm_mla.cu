@@ -355,6 +355,11 @@ void mla_decode_stage1_asm_fwd(
                 config_max_seqlen_q = 1;
                 sub_Q = 8;
             }
+        } else if (q_type == "fp8" && kv_type == "fp8"){
+            if(!persistent && max_seqlen_q == 1){
+                config_max_seqlen_q = 1;
+                sub_Q = 8;
+            }
         }
     }
 
