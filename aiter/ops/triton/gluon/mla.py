@@ -1239,6 +1239,7 @@ class MLAProgram:
                 )
             )
 
+            v_scales = v_scales.to(gl.bfloat16)
             v = v * v_scales
             v = v.reshape(
                 (self.cfg.BLOCK_SIZE, self.cfg.KV_LORA_RANK // self.cfg.HEAD_SIZE_SPLIT)

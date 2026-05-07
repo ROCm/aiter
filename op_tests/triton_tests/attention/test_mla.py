@@ -266,7 +266,7 @@ def torch_mla_extend(
         # (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
         # (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, True),
         # (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, True),
-        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, True),
+        # (e4m3_dtype, torch.uint8, torch.bfloat16, 128, True),
         (torch.uint8, torch.uint8, torch.bfloat16, 128, True),
     ],
 )

@@ -1496,6 +1496,7 @@ class AttentionProgram:
             )  # 1.0 in e8m0
             v = gl.amd.gfx1250.scaled_upcast(v, v_scales_dummy, gl.bfloat16, axis=0)
             v = v.reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // 16, 16))
+            v_scales = v_scales.to(gl.bfloat16)
             v = v * v_scales
             v = v.reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE))
             v = v.to(gl.bfloat16)
@@ -1586,6 +1587,7 @@ class AttentionProgram:
                 )
             )
 
+            v_scales = v_scales.to(gl.bfloat16)
             v = v * v_scales
             v = v.reshape(
                 (self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // self.cfg.HEAD_SIZE_SPLIT)
