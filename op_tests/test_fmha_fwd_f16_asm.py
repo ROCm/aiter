@@ -42,9 +42,11 @@ import pytest
 import torch
 
 import aiter
+
 from aiter.test_common import checkAllclose, run_perftest
 #from aiter.test_mha_common import (
 #    attention_ref,
+#
 #)  # noqa: F401  (kept for easy swap-back; see doc-block below)
 
 pytestmark = pytest.mark.skipif(
