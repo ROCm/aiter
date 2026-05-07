@@ -125,6 +125,7 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
     get_block_n_fp8 = {
+        8: 64,
         16: 128,
         32: 128,
         48: 64,
