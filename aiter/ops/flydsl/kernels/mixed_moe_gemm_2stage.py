@@ -281,9 +281,10 @@ def compile_mixed_moe_gemm1(
         if _stage1_group_size_m > 1
         else ""
     )
+    _wptr64_tag = "_wptr64" if is_f4_b else ""
     module_name = (
         f"mfma_moe1_{act}_a{a_dtype}_w{b_dtype}_{out_s}{_g_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v37_tidlds_aread{_gm_tag}_g1u0_splitk"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v37_tidlds_aread{_gm_tag}{_wptr64_tag}_g1u0_splitk"
     ).replace("-", "_")
 
     # -- LDS sizing (split ping/pong allocators) --
@@ -505,6 +506,21 @@ def compile_mixed_moe_gemm1(
                 # k_major=True,
             )
             layout_b = b_layout.layout_b
+            if is_f4_b:
+                c_k_b_layout = k_in // arith.constant(pack_K, index=True)
+                c_k0_b_layout = (
+                    c_k_b_layout * arith.constant(int(b_elem_bytes), index=True)
+                ) // arith.constant(64, index=True)
+                stride_nlane_b_layout = arith.constant(
+                    int(kpack_bytes) // int(b_elem_bytes), index=True
+                )
+                stride_klane_b_layout = (
+                    arith.constant(16, index=True) * stride_nlane_b_layout
+                )
+                stride_k0_b_layout = (
+                    arith.constant(4, index=True) * stride_klane_b_layout
+                )
+                stride_n0_b_layout = c_k0_b_layout * stride_k0_b_layout
 
             # A-scale: [sorted_size, K/32] -- pre-scattered by caller into sorted layout
             # Same as stage2: indexed by sorted_row position, not by token_id.
@@ -685,6 +701,14 @@ def compile_mixed_moe_gemm1(
             sorted_w_rsrc = buffer_ops.create_buffer_resource(
                 arg_sorted_weights, max_size=False, num_records_bytes=sorted_nbytes_i32
             )
+
+            if is_f4_b:
+                from flydsl._mlir.dialects import fly as _fly
+
+                _llvm_ptr_ty_as1 = ir.Type.parse("!llvm.ptr<1>")
+                w_base_ptr = _fly.extract_aligned_pointer_as_index(
+                    _llvm_ptr_ty_as1, arg_w
+                )
 
             eid_nbytes_idx = size_expert_ids_in * arith.constant(4, index=True)
             eid_nbytes_i32 = arith.index_cast(T.i32, eid_nbytes_idx)
@@ -883,20 +907,67 @@ def compile_mixed_moe_gemm1(
                     )
                     k0 = base_k_bytes // c64 + arith.constant(ku, index=True)
                     k1 = lane_div_16
-                    coord_pack = (n_blk, k0, k1, n_intra, arith.constant(0, index=True))
-                    idx_pack = crd2idx(coord_pack, layout_b)
                     vec_elems = kpack_bytes // int(b_elem_bytes)
-                    b16 = _buffer_load_vec(
-                        buffer_ops,
-                        vector,
-                        w_rsrc,
-                        idx_pack,
-                        elem_type=_w_elem_type(),
-                        vec_elems=vec_elems,
-                        elem_bytes=b_elem_bytes,
-                        offset_in_bytes=(b_elem_bytes == 1),
-                        cache_modifier=b_nt,
-                    )
+                    if is_f4_b:
+                        load_bytes = int(vec_elems) * int(b_elem_bytes)
+                        vec_width = load_bytes // 4
+                        # Recompute the preshuffle-B byte offset with index arithmetic
+                        # for the pointer-load path. `crd2idx(layout_b)` goes through
+                        # the layout's i32 strides; using that value as a 64-bit
+                        # address sign-extends at 2 GiB. Buffer loads can consume the
+                        # original i32 dword offset, but global pointer loads need the
+                        # full byte address.
+                        elem_idx_i = (
+                            n_blk * stride_n0_b_layout
+                            + k0 * stride_k0_b_layout
+                            + k1 * stride_klane_b_layout
+                            + n_intra * stride_nlane_b_layout
+                        )
+                        byte_idx = elem_idx_i * arith.constant(
+                            int(b_elem_bytes), index=True
+                        )
+                        ptr = llvm.GEPOp(
+                            _llvm_ptr_ty_as1,
+                            w_base_ptr,
+                            [arith.index_cast(T.i64, byte_idx)],
+                            [-2147483648],
+                            T.i8,
+                            llvm.GEPNoWrapFlags.none,
+                        ).result
+                        if vec_width == 1:
+                            raw_i32 = llvm.LoadOp(
+                                T.i32, ptr, alignment=load_bytes
+                            ).result
+                            raw_vec = vector.from_elements(T.vec(1, T.i32), [raw_i32])
+                        else:
+                            raw_vec = llvm.LoadOp(
+                                T.vec(vec_width, T.i32),
+                                ptr,
+                                alignment=load_bytes,
+                            ).result
+                        b16 = vector.bitcast(
+                            T.vec(int(vec_elems), _w_elem_type()), raw_vec
+                        )
+                    else:
+                        coord_pack = (
+                            n_blk,
+                            k0,
+                            k1,
+                            n_intra,
+                            arith.constant(0, index=True),
+                        )
+                        idx_pack = crd2idx(coord_pack, layout_b)
+                        b16 = _buffer_load_vec(
+                            buffer_ops,
+                            vector,
+                            w_rsrc,
+                            idx_pack,
+                            elem_type=_w_elem_type(),
+                            vec_elems=vec_elems,
+                            elem_bytes=b_elem_bytes,
+                            offset_in_bytes=(b_elem_bytes == 1),
+                            cache_modifier=b_nt,
+                        )
                     b_i64x2 = vector.bitcast(vec2_i64, b16)
                     b0 = vector.extract(
                         b_i64x2, static_position=[0], dynamic_position=[]
