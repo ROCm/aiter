@@ -43,7 +43,7 @@ import torch
 
 import aiter
 
-from aiter.test_common import checkAllclose, run_perftest
+from aiter.test_common import checkAllclose
 
 # from aiter.test_mha_common import (
 #    attention_ref,
