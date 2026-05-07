@@ -2247,7 +2247,7 @@ class FmoeTuner(TunerCommon):
         for blockM in blockMs:
             for kname, kparams in flydsl_s1_kernels.items():
                 ktm = kparams["tile_m"]
-                if ktm != blockM and not (ktm == 16 and blockM == 32 and token <= 16):
+                if ktm != blockM:
                     continue
 
                 is_splitk = kparams.get("k_batch", 1) > 1
