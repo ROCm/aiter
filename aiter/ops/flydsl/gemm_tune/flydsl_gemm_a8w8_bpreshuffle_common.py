@@ -51,7 +51,6 @@ class kernelInstance:
         qa = _DTYPE_SHORT.get(self.q_dtype_a, self.q_dtype_a.upper())
         qw = _DTYPE_SHORT.get(self.q_dtype_w, self.q_dtype_w.upper())
         dt = _DTYPE_SHORT.get(self.dtype, self.dtype.upper())
-        xcd_tag = f"_xcd{self.xcd_swizzle}" if self.xcd_swizzle > 0 else ""
         return "_".join(
             [
                 "flydsl",
@@ -68,12 +67,13 @@ class kernelInstance:
                             self.use_cshuffle_epilog,
                             self.use_async_copy,
                             self.waves_per_eu,
+                            self.xcd_swizzle,
                         ],
                     )
                 ),
                 self.sScheduler.lower(),
             ]
-        ) + xcd_tag
+        )
 
 
 def _ki(
@@ -84,11 +84,11 @@ def _ki(
     cshuffle=0,
     async_copy=0,
     waves_per_eu=0,
+    xcd_swizzle=0,
     scheduler="Default",
     q_dtype_a="fp8",
     q_dtype_w="fp8",
     dtype="bf16",
-    xcd_swizzle=0,
 ):
     return kernelInstance(
         tile_m,
@@ -296,8 +296,7 @@ def _build_kernels_list(tiles_lds2, tiles_lds1, total_vgpr=512):
                         for tm, tn, tk in tiles_by_lds[lds]:
                             if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, total_vgpr):
                                 continue
-                            kl[idx] = _ki(tm, tn, tk, lds, csh, acp, wpe,
-                                          xcd_swizzle=xcd)
+                            kl[idx] = _ki(tm, tn, tk, lds, csh, acp, wpe, xcd)
                             idx += 1
     return kl
 
@@ -311,20 +310,20 @@ kernels_list_950 = _build_kernels_list(
 # fmt: on
 
 default_kernels_dict_942 = {
-    (-1): _ki(128, 128, 128, 2, 0, 0, 2, "Default"),
-    (-2): _ki(16, 64, 512, 2, 0, 0, 2, "Default"),
-    (-3): _ki(32, 64, 512, 2, 0, 0, 2, "Default"),
-    (-4): _ki(64, 256, 64, 2, 0, 0, 2, "Default"),
-    (-5): _ki(128, 128, 64, 2, 0, 0, 2, "Default"),
-    (-6): _ki(128, 64, 128, 2, 0, 0, 2, "Default"),
-    (-7): _ki(64, 256, 128, 2, 0, 0, 2, "Default"),
+    (-1): _ki(128, 128, 128, 2, 0, 0, 2, 0, "Default"),
+    (-2): _ki(16, 64, 512, 2, 0, 0, 2, 0, "Default"),
+    (-3): _ki(32, 64, 512, 2, 0, 0, 2, 0, "Default"),
+    (-4): _ki(64, 256, 64, 2, 0, 0, 2, 0, "Default"),
+    (-5): _ki(128, 128, 64, 2, 0, 0, 2, 0, "Default"),
+    (-6): _ki(128, 64, 128, 2, 0, 0, 2, 0, "Default"),
+    (-7): _ki(64, 256, 128, 2, 0, 0, 2, 0, "Default"),
 }
 
 default_kernels_dict_950 = {
-    (-1): _ki(128, 256, 256, 2, 0, 0, 2, "Default"),
-    (-2): _ki(16, 64, 512, 2, 0, 0, 2, "Default"),
-    (-3): _ki(32, 64, 512, 2, 0, 0, 2, "Default"),
-    (-4): _ki(128, 128, 128, 2, 0, 0, 2, "Default"),
+    (-1): _ki(128, 256, 256, 2, 0, 0, 2, 0, "Default"),
+    (-2): _ki(16, 64, 512, 2, 0, 0, 2, 0, "Default"),
+    (-3): _ki(32, 64, 512, 2, 0, 0, 2, 0, "Default"),
+    (-4): _ki(128, 128, 128, 2, 0, 0, 2, 0, "Default"),
 }
 
 arch = get_gfx()

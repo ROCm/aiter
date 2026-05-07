@@ -103,25 +103,20 @@ def gemm_a8w8_bpreshuffle_cktile(
 
 
 def _parse_flydsl_kernel_name(kernel_name: str):
-    """Parse tile config from flydsl kernelName, e.g.
-    'flydsl_bpreshuflle_128x64x256_F8_F8_B16_2x0x1x1_default'
-    or with XCD remap tag:
-    'flydsl_bpreshuflle_128x64x256_F8_F8_B16_2x0x1x1_default_xcd4'
-    -> (tile_m=128, tile_n=64, tile_k=256, lds_stage=2, cshuffle=0,
-        async_copy=1, wpe=1, xcd_swizzle=4)
-    Returns None on parse failure. ``xcd_swizzle`` defaults to 0 when absent.
+    """Parse tile config from flydsl kernelName.
+    Returns ``(tile_m, tile_n, tile_k, lds_stage, cshuffle, async_copy,
+    waves_per_eu, xcd_swizzle)`` or None on parse failure.
     """
     import re
 
     m = re.match(
-        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)x(\d+)x(\d+)",
+        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_"
+        r"(\d+)x(\d+)x(\d+)x(\d+)x(\d+)",
         kernel_name,
     )
     if m is None:
         return None
-    x = re.search(r"_xcd(\d+)\b", kernel_name)
-    xcd = int(x.group(1)) if x is not None else 0
-    return tuple(int(m.group(i)) for i in range(1, 8)) + (xcd,)
+    return tuple(int(m.group(i)) for i in range(1, 9))
 
 
 def gemm_a8w8_bpreshuffle_flydsl(
