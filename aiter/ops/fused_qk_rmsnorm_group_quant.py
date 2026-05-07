@@ -186,11 +186,13 @@ def fused_qk_rmsnorm(
     k_epsilon: Optional[float] = None,
     q_residual: Optional[Tensor] = None,
     gemma_norm: bool = False,
-    quant_type: Optional[QuantType] = QuantType.No,
+    quant_type: int = QuantType.No.value,
     group_size: Optional[int] = None,
     transpose_scale: bool = False,
 ) -> None:
     # Centralized interface
+    if not isinstance(quant_type, QuantType):
+        quant_type = QuantType(quant_type)
     if quant_type == QuantType.No:
         _fused_qk_rmsnorm_kernel(
             q, q_weight, q_epsilon, k, k_weight, k_epsilon, q_out_unquantized, k_out
