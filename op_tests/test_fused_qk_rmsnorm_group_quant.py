@@ -301,7 +301,7 @@ def run_hip(
     x2_out = torch.empty_like(x2) if x2 is not None else None
     res_out = torch.empty_like(x1) if res1 is not None else None
 
-    aiter.fused_qk_rmsnorm(
+    aiter.fused_qk_rmsnorm_maybe_quant(
         x1_q,
         x1_s,
         x1,
