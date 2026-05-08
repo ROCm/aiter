@@ -121,7 +121,7 @@ def chunk_gated_delta_rule_fwd_opt(
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
-    initial_state: torch.Tensor,
+    initial_state: torch.Tensor | None,
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
 ):
@@ -141,7 +141,7 @@ def chunk_gated_delta_rule_fwd_opt(
         g: Gate tensor (in log space, pre-cumsum) of shape [B, T, H]
         beta: Beta parameter tensor of shape [B, T, H]
         scale: Scaling factor for queries
-        initial_state: Initial hidden state of shape [N, H, K, V]
+        initial_state: Optional initial hidden state of shape [N, H, K, V]
         output_final_state: Whether to output the final state
         cu_seqlens: Cumulative sequence lengths for variable-length inputs (optional) [N+1]
 
@@ -157,6 +157,7 @@ def chunk_gated_delta_rule_fwd_opt(
         beta=beta,
         g=g,
         cu_seqlens=cu_seqlens,
+        use_exp2=False,
     )
 
     # Step 2: Compute fused triangular solve and recompute w, u
@@ -168,6 +169,7 @@ def chunk_gated_delta_rule_fwd_opt(
         beta=beta,
         g_cumsum=g_cumsum,
         cu_seqlens=cu_seqlens,
+        use_exp2=False,
     )
 
     # Step 3: Compute hidden states
@@ -202,7 +204,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     g: torch.Tensor,
     beta: torch.Tensor,
     scale: float,
-    initial_state: torch.Tensor,
+    initial_state: torch.Tensor | None,
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
@@ -224,7 +226,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         g: [B, T, H] — raw gate (pre-cumsum)
         beta: [B, T, H]
         scale: float
-        initial_state: [N, H, V, K] — note transposed h layout
+        initial_state: optional [N, H, V, K] — note transposed h layout
         output_final_state: bool
         cu_seqlens: [N+1] optional
         use_chunk_hip: bool — use HIP kernel for hidden state computation

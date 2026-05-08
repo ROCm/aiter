@@ -17,6 +17,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gati
     fused_sigmoid_gating_delta_rule_update,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
+    IS_AMD,
     IS_INTEL_ALCHEMIST,
     assert_close,
     device,
@@ -668,6 +669,7 @@ def test_chunk_opt(
         ]
     ],
 )
+@pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
 def test_chunk_opt_hip(
     B: int,
     T: int,
@@ -827,6 +829,7 @@ def test_chunk_opt_varlen(
     os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
     reason="Skipping test_chunk_opt_varlen_hip because SKIP_TEST_CHUNK_VARLEN is set",
 )
+@pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
 def test_chunk_opt_varlen_hip(
     H: int,
     D: int,

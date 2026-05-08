@@ -51,10 +51,22 @@ def fused_solve_tril_recompute_w_u_kernel(
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
     USE_EXP2: tl.constexpr = False,
+    LOWP_DTYPE_IS_BF16: tl.constexpr = False,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     T_flat = T
+    # Preserve fp16 executions instead of unconditionally truncating to bf16.
+    tl.static_assert(
+        (k.dtype.element_ty == tl.float16 or k.dtype.element_ty == tl.bfloat16)
+        and (v.dtype.element_ty == tl.float16 or v.dtype.element_ty == tl.bfloat16),
+        "fused_solve_tril_recompute_w_u_kernel only supports fp16/bf16 k and v tensors.",
+    )
+    tl.static_assert(
+        k.dtype.element_ty == v.dtype.element_ty,
+        "fused_solve_tril_recompute_w_u_kernel expects k and v to have the same dtype.",
+    )
+    lowp_dtype = tl.bfloat16 if LOWP_DTYPE_IS_BF16 else tl.float16
 
     if IS_VARLEN:
         i_n, i_t = (
@@ -187,16 +199,16 @@ def fused_solve_tril_recompute_w_u_kernel(
         input_precision=DOT_PRECISION,
     )
 
-    h11 = b11.to(tl.bfloat16)
-    h22 = b22.to(tl.bfloat16)
-    h33 = b33.to(tl.bfloat16)
-    h44 = b44.to(tl.bfloat16)
-    h21 = b21.to(tl.bfloat16)
-    h31 = b31.to(tl.bfloat16)
-    h32 = b32.to(tl.bfloat16)
-    h41 = b41.to(tl.bfloat16)
-    h42 = b42.to(tl.bfloat16)
-    h43 = b43.to(tl.bfloat16)
+    h11 = b11.to(lowp_dtype)
+    h22 = b22.to(lowp_dtype)
+    h33 = b33.to(lowp_dtype)
+    h44 = b44.to(lowp_dtype)
+    h21 = b21.to(lowp_dtype)
+    h31 = b31.to(lowp_dtype)
+    h32 = b32.to(lowp_dtype)
+    h41 = b41.to(lowp_dtype)
+    h42 = b42.to(lowp_dtype)
+    h43 = b43.to(lowp_dtype)
 
     # ================================================================
     # Phase 2: u = Ai @ (v * beta), w = Ai @ (k * beta * exp(g))
@@ -247,10 +259,10 @@ def fused_solve_tril_recompute_w_u_kernel(
         pv3 = tl.make_block_ptr(
             v_base, (T, V), (H * V, 1), (i_t * BT + 48, i_v * BV), (16, BV), (1, 0)
         )
-        vb0 = (tl.load(pv0, boundary_check=(0, 1)) * bb0[:, None]).to(tl.bfloat16)
-        vb1 = (tl.load(pv1, boundary_check=(0, 1)) * bb1[:, None]).to(tl.bfloat16)
-        vb2 = (tl.load(pv2, boundary_check=(0, 1)) * bb2[:, None]).to(tl.bfloat16)
-        vb3 = (tl.load(pv3, boundary_check=(0, 1)) * bb3[:, None]).to(tl.bfloat16)
+        vb0 = (tl.load(pv0, boundary_check=(0, 1)) * bb0[:, None]).to(lowp_dtype)
+        vb1 = (tl.load(pv1, boundary_check=(0, 1)) * bb1[:, None]).to(lowp_dtype)
+        vb2 = (tl.load(pv2, boundary_check=(0, 1)) * bb2[:, None]).to(lowp_dtype)
+        vb3 = (tl.load(pv3, boundary_check=(0, 1)) * bb3[:, None]).to(lowp_dtype)
 
         u0 = tl.dot(h11, vb0, allow_tf32=False)
         u1 = tl.dot(h21, vb0, allow_tf32=False) + tl.dot(h22, vb1, allow_tf32=False)
@@ -303,16 +315,16 @@ def fused_solve_tril_recompute_w_u_kernel(
             k_base, (T, K), (Hg * K, 1), (i_t * BT + 48, i_k * BK), (16, BK), (1, 0)
         )
         kb0 = (tl.load(pk0, boundary_check=(0, 1)) * bb0[:, None] * eg0[:, None]).to(
-            tl.bfloat16
+            lowp_dtype
         )
         kb1 = (tl.load(pk1, boundary_check=(0, 1)) * bb1[:, None] * eg1[:, None]).to(
-            tl.bfloat16
+            lowp_dtype
         )
         kb2 = (tl.load(pk2, boundary_check=(0, 1)) * bb2[:, None] * eg2[:, None]).to(
-            tl.bfloat16
+            lowp_dtype
         )
         kb3 = (tl.load(pk3, boundary_check=(0, 1)) * bb3[:, None] * eg3[:, None]).to(
-            tl.bfloat16
+            lowp_dtype
         )
 
         w0 = tl.dot(h11, kb0)
@@ -399,5 +411,6 @@ def fused_solve_tril_recompute_w_u(
         BV=BV,
         DOT_PRECISION=FLA_TRIL_PRECISION,
         USE_EXP2=use_exp2,
+        LOWP_DTYPE_IS_BF16=k.dtype == torch.bfloat16,
     )
     return w_out, u_out

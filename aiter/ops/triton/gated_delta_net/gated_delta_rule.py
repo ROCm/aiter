@@ -343,12 +343,12 @@ def chunk_gated_delta_rule_opt(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    scale: float = None,
-    initial_state: torch.Tensor = None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Optimized chunk-based gated delta rule operation using Triton (Forward only).
 
@@ -387,10 +387,10 @@ def chunk_gated_delta_rule_opt(
             consistent with the FlashAttention API. Default: `None`.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]:
+        tuple[torch.Tensor, torch.Tensor | None]:
             - o (torch.Tensor): Outputs of shape `[B, T, H, V]`.
-            - final_state (torch.Tensor): Final state of shape `[N, H, K, V]` if
-              `output_final_state=True` else `None`.
+            - final_state (torch.Tensor | None): Final state of shape `[N, H, K, V]`
+              if `output_final_state=True` else `None`.
 
     Raises:
         ValueError: If input shapes are invalid when using cu_seqlens.
@@ -445,14 +445,14 @@ def chunk_gated_delta_rule_opt_vk(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    scale: float = None,
-    initial_state: torch.Tensor = None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
     use_exp2: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Optimized chunk-based gated delta rule with h layout [V, K] (Forward only).
 
@@ -475,7 +475,7 @@ def chunk_gated_delta_rule_opt_vk(
         use_exp2 (bool): Use exp2 instead of exp for gate computation.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]:
+        tuple[torch.Tensor, torch.Tensor | None]:
             - o: Outputs of shape `[B, T, H, V]`.
             - final_state: `[N, H, V, K]` if `output_final_state=True` else `None`.
     """

@@ -999,7 +999,7 @@ def chunk_gated_delta_rule_fwd_h_opt(
         for num_stages in NUM_STAGES_FWD
         for BV in [16, 32, 64]
     ],
-    key=["H", "K", "V", "BT"],
+    key=["H", "K", "V", "BT", "IS_VARLEN"],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
