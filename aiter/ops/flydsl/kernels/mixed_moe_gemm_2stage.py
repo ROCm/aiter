@@ -200,6 +200,9 @@ def compile_mixed_moe_gemm1(
     def out_elem():
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
 
+    def _load_bias_scalar(bias_rsrc, offset):
+        return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=T.f32)
+
     mock_gate_only = gate_mode is GateMode.MOCK_GATE_ONLY
     gate_up_interleave = gate_mode is GateMode.INTERLEAVE
 
@@ -1216,9 +1219,9 @@ def compile_mixed_moe_gemm1(
                     bias_pf = None
                     if const_expr(prefetch_epilogue):
                         if const_expr(enable_bias):
-                            bias_pf = []
-                            for ni in range_constexpr(num_acc_n):
-                                if const_expr(gate_up_interleave):
+                            if const_expr(gate_up_interleave):
+                                bias_pf = []
+                                for ni in range_constexpr(num_acc_n):
                                     _logical_col = (
                                         (by_n + n_tile_base)
                                         // arith.constant(2, index=True)
@@ -1233,19 +1236,34 @@ def compile_mixed_moe_gemm1(
                                     bias_offset = (
                                         expert_off_idx + _up_off + _logical_col
                                     )
-                                else:
+                                    bias_pf.append(
+                                        _load_bias_scalar(bias_rsrc, bias_offset)
+                                    )
+                            else:
+                                gate_bias_pf = []
+                                up_bias_pf = (
+                                    [] if const_expr(not mock_gate_only) else None
+                                )
+                                for ni in range_constexpr(num_acc_n):
                                     global_n = (
                                         by_n
                                         + n_tile_base
                                         + arith.constant(ni * 16, index=True)
                                         + lane_mod_16
                                     )
-                                    bias_offset = expert_off_idx + global_n
-                                bias_pf.append(
-                                    buffer_ops.buffer_load(
-                                        bias_rsrc, bias_offset, vec_width=1, dtype=f32
+                                    gate_bias_pf.append(
+                                        _load_bias_scalar(
+                                            bias_rsrc, expert_off_idx + global_n
+                                        )
                                     )
-                                )
+                                    if const_expr(not mock_gate_only):
+                                        up_bias_pf.append(
+                                            _load_bias_scalar(
+                                                bias_rsrc,
+                                                expert_off_idx + inter_idx + global_n,
+                                            )
+                                        )
+                                bias_pf = (gate_bias_pf, up_bias_pf)
                         tw_pf = None
                         if const_expr(doweight_stage1):
                             tw_pf = []
@@ -1983,8 +2001,12 @@ def compile_mixed_moe_gemm1(
                 # bias layout: [E, 2*inter_dim] flat f32 (non-interleaved: gate then up).
                 # For gate_up_interleave, map physical column to logical bias offset.
                 if const_expr(enable_bias and not _is_splitk):
+                    _bias_up_vals = None
                     if const_expr(bias_pf is not None):
-                        _bias_gate_vals = bias_pf
+                        if const_expr(gate_up_interleave):
+                            _bias_gate_vals = bias_pf
+                        else:
+                            _bias_gate_vals, _bias_up_vals = bias_pf
                     else:
                         _bias_gate_vals = []
                         for _ni in range_constexpr(num_acc_n):
@@ -2010,10 +2032,22 @@ def compile_mixed_moe_gemm1(
                                 )
                                 _bias_off = expert_off_idx + _bn
                             _bias_gate_vals.append(
-                                buffer_ops.buffer_load(
-                                    bias_rsrc, _bias_off, vec_width=1, dtype=f32
-                                )
+                                _load_bias_scalar(bias_rsrc, _bias_off)
                             )
+                        if const_expr(not (mock_gate_only or gate_up_interleave)):
+                            _bias_up_vals = []
+                            for _ni in range_constexpr(num_acc_n):
+                                _bn = (
+                                    by_n
+                                    + n_tile_base
+                                    + arith.constant(_ni * 16, index=True)
+                                    + lane_mod_16
+                                )
+                                _bias_up_vals.append(
+                                    _load_bias_scalar(
+                                        bias_rsrc, expert_off_idx + inter_idx + _bn
+                                    )
+                                )
                     for _mi in range_constexpr(m_repeat):
                         for _ni in range_constexpr(num_acc_n):
                             _aidx = _mi * num_acc_n + _ni
@@ -2023,22 +2057,6 @@ def compile_mixed_moe_gemm1(
                             acc_gate[_aidx] = arith.addf(acc_gate[_aidx], _bsplat)
 
                     if const_expr(not (mock_gate_only or gate_up_interleave)):
-                        _bias_up_vals = []
-                        for _ni in range_constexpr(num_acc_n):
-                            _bn = (
-                                by_n
-                                + n_tile_base
-                                + arith.constant(_ni * 16, index=True)
-                                + lane_mod_16
-                            )
-                            _bias_up_vals.append(
-                                buffer_ops.buffer_load(
-                                    bias_rsrc,
-                                    expert_off_idx + inter_idx + _bn,
-                                    vec_width=1,
-                                    dtype=f32,
-                                )
-                            )
                         for _mi in range_constexpr(m_repeat):
                             for _ni in range_constexpr(num_acc_n):
                                 _aidx = _mi * num_acc_n + _ni
@@ -2063,7 +2081,7 @@ def compile_mixed_moe_gemm1(
                     for _mi in range_constexpr(m_repeat):
                         for _ni in range_constexpr(num_acc_n):
                             _aidx = _mi * num_acc_n + _ni
-                            acc[_aidx] = _silu_mul_vec4(acc_gate[_aidx], acc_up[_aidx])
+                            acc[_aidx] = _act_vec4(acc_gate[_aidx], acc_up[_aidx])
 
                 # ---- Epilogue: CShuffle + direct store (accumulate=False) ----
                 # Output: out[(t*topk+s) * inter_dim + col] = silu(gate) * up
@@ -2246,7 +2264,9 @@ def compile_mixed_moe_gemm1(
                             local_max = arith.maximumf(local_max, peer)
 
                         max_i32 = local_max.bitcast(T.i32)
-                        max_rounded = (max_i32 + _c0x200000_i32) & _c0xFF800000_i32
+                        # Match fp4_utils.f32_to_e8m0(max_abs / 4): round the
+                        # exponent at the 1.5x threshold before dropping mantissa.
+                        max_rounded = (max_i32 + _c0x400000_i32) & _c0xFF800000_i32
                         exp_field = max_rounded >> _c23_i32
                         e8m0_biased = arith.maxsi(exp_field - _c_headroom_i32, _c0_i32)
 
@@ -2923,6 +2943,9 @@ def compile_mixed_moe_gemm2(
     # NOTE: Keep this as a callable so we don't require an MLIR Context at Python-time.
     def out_elem():
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
+
+    def _load_bias_scalar(bias_rsrc, offset):
+        return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=T.f32)
 
     epilog_tag = "cshuffle"
     # IMPORTANT: include tiling in the module name to avoid accidentally reusing a compiled
@@ -3784,11 +3807,7 @@ def compile_mixed_moe_gemm2(
                             for ni in range_constexpr(num_acc_n):
                                 global_n = by_n + n_tile_base + ni * 16 + lane_mod_16
                                 bias_offset = expert_off_idx + global_n
-                                bias.append(
-                                    buffer_ops.buffer_load(
-                                        bias_rsrc, bias_offset, vec_width=1, dtype=f32
-                                    )
-                                )
+                                bias.append(_load_bias_scalar(bias_rsrc, bias_offset))
                         tw_pf = None
                         if const_expr(doweight_stage2):
                             tw_pf = []

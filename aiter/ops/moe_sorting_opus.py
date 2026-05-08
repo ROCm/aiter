@@ -9,6 +9,15 @@ MD_NAME = "module_moe_sorting_opus"
 
 
 @compile_ops("module_moe_sorting_opus", develop=True)
+def moe_sorting_opus_get_workspace_size(
+    tokens: int,
+    num_experts: int,
+    topk: int,
+    dispatch_policy: int = 0,
+) -> int: ...
+
+
+@compile_ops("module_moe_sorting_opus", develop=True)
 def moe_sorting_opus_fwd(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -21,5 +30,6 @@ def moe_sorting_opus_fwd(
     unit_size: int,
     local_expert_mask: Optional[torch.Tensor] = None,
     num_local_tokens: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
     dispatch_policy: int = 0,
 ) -> None: ...
