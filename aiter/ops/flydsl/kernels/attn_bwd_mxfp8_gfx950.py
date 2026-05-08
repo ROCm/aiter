@@ -93,7 +93,6 @@ def compile_attn_bwd_mxfp8_gfx950(
     allocator_ds_shuffle = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem_ds_shuffle")
     allocator_ds_scale_shuffle = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem_ds_scale_shuffle")
 
-    num_waves = 4
     wave_size = 64
     total_threads = 256
 
