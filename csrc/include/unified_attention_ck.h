@@ -16,4 +16,9 @@ void unified_attention_fwd(
     float scale,
     float scale_k,
     float scale_v,
-    float scale_out);
+    float scale_out,
+    // Sliding-window-attention (FA convention): negative = unbounded on that side.
+    // Default (-1, -1) reproduces the historical "no SWA" behaviour and routes
+    // through the existing IsLocal=false instances.
+    int window_size_left  = -1,
+    int window_size_right = -1);

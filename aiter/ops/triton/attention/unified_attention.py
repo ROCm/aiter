@@ -126,11 +126,11 @@ def _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
       seqs=256 (8.0x CUs): CK-UA 10-22% faster
       seqs= 96 (3.0x CUs): CK-UA 26-34% SLOWER (below threshold)
       seqs=384 (12x  CUs): Triton wins (above threshold)
-    Sliding window is always routed to Triton (CK-UA iterates full KV).
+    SWA (window_size != (-1, -1)) is supported via the kernel's IsLocal=true
+    instances and KV-block pruning; the same shape gate as for plain causal
+    applies (d128 MHA / d64 GQA-8 large-tier).
     """
     if max_seqlen_q != 1:
-        return False
-    if window_size != (-1, -1):
         return False
     if softcap != 0:
         return False
@@ -166,7 +166,8 @@ def _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
         unified_attention_fwd(
             out, q, k, v, block_table, seqused_k, cu_seqlens_q,
             mask_type=2, scale_s=scale_s,
-            scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0)
+            scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0,
+            window_size_left=window_size[0], window_size_right=window_size[1])
         return True
     except Exception:
         return False

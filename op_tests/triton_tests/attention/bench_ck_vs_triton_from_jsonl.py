@@ -150,10 +150,12 @@ def bench_ck_ua(s, warmup, iters, inp, use_graph):
     q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = inp
     out = torch.empty_like(q)
     mask_type = 2 if s.window_size != (0, 0) else 0
+    win_l, win_r = s.window_size
     def fn():
         unified_attention_fwd(out, q, k, v, block_tables, seq_lens_k, cu_seqlens_q,
             mask_type=mask_type, scale_s=scale,
-            scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0)
+            scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0,
+            window_size_left=win_l, window_size_right=win_r)
     return _timed(fn, warmup, iters, use_graph)
 
 

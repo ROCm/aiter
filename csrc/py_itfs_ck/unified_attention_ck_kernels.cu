@@ -20,7 +20,9 @@ void unified_attention_fwd(
     float scale,
     float scale_k,
     float scale_v,
-    float scale_out)
+    float scale_out,
+    int window_size_left,
+    int window_size_right)
 {
     auto dtype = query.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
@@ -50,6 +52,22 @@ void unified_attention_fwd(
     ck_tile::unified_attention_args args;
     args.data_type          = dt;
     args.mask_type          = mask_type;
+    // Translate vLLM's window_size convention into the kernel's (left, right) edges.
+    //   - vLLM "no SWA"     : (-1, -1) → kernel sees (-1, 0)  for causal, (-1, -1) for no-mask
+    //   - vLLM "causal SWA" : ( N-1, 0) → kernel sees ( N-1, 0)
+    //   - vLLM "bidir SWA"  : ( L,  R) → kernel sees ( L,   R)
+    // mask_type still selects causal (1=top-left, 2=bottom-right) vs no-mask (0).
+    // For causal we coerce window_size_right<0 to 0 because the kernel's per-pixel
+    // mask uses (left,right) directly (mask_type only affects dispatch, not the mask).
+    if (mask_type == 0) {
+        args.window_size_left  = -1;
+        args.window_size_right = -1;
+        args.is_top_left       = false;
+    } else {
+        args.window_size_left  = window_size_left;
+        args.window_size_right = (window_size_right < 0) ? 0 : window_size_right;
+        args.is_top_left       = (mask_type == 1);
+    }
     args.num_tokens         = num_tokens;
     args.num_blks           = num_blks;
     args.num_head_q         = num_head_q;

@@ -22,6 +22,8 @@ def gen_unified_attention_fwd_fake(
     scale_k: float,
     scale_v: float,
     scale_out: float,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
 ) -> None:
     return None
 
@@ -35,10 +37,15 @@ def unified_attention_fwd(
     block_tables: torch.Tensor,    # [num_seqs, max_num_blocks_per_seq]
     seq_lens: torch.Tensor,        # [num_seqs]
     query_start_len: torch.Tensor, # [num_seqs + 1]
-    mask_type: int,                # 0: no mask, 2: causal
+    mask_type: int,                # 0: no mask, 1: causal top-left, 2: causal bottom-right
     scale_s: float,
     scale: float,
     scale_k: float,
     scale_v: float,
     scale_out: float,
+    # Sliding-window-attention (FA convention): negative = unbounded on that side.
+    # Default (-1, -1) means "no SWA" and reproduces the historical behaviour
+    # (routes through IsLocal=false instances).
+    window_size_left: int = -1,
+    window_size_right: int = -1,
 ) -> None: ...
