@@ -1496,7 +1496,7 @@ def fused_moe_2stages(
         M = sorted_ids.shape[0]
         N = a1.shape[-1]
         if metadata.fuse_quant == "fp8":
-            a1_scale = torch.empty([1], dtype=dtypes.fp8_e8m0, device=a1.device)
+            a1_scale = torch.empty(0, dtype=torch.uint8, device=a1.device)
         else:
             a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
 
@@ -1613,8 +1613,22 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
     ):
-        a2 = a2.to(dtypes.fp8)
-        a2_scale = a1_scale
+        if activation == ActivationType.Silu and swiglu_limit == 0.0:
+            from aiter.ops.triton.quant.fused_mxfp4_quant import fused_quant_fp8_sort
+
+            a2 = a2.view(-1, inter_dim)
+            a2, a2_scale = fused_quant_fp8_sort(
+                a2,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                block_size=32,
+                quant_dtype=dtypes.fp8,
+            )
+            a2 = a2.view(token_num, topk, -1)
+        else:
+            a2 = a2.to(dtypes.fp8)
+            a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
         a2_scale = None

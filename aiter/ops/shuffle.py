@@ -9,7 +9,6 @@ def shuffle_weight(
     layout=(16, 16),
     use_int4=False,
     is_guinterleave=False,
-    NLane: int = 16,
     gate_up: bool = False,
 ) -> torch.Tensor:
     x_type = x.dtype
@@ -20,7 +19,7 @@ def shuffle_weight(
         experts_cnt, N, K_pk = x.shape
         if gate_up:
             N = N // 2
-        KPack = 16
+        NLane, KPack = layout
         KLane = 64 // NLane
         N0 = N // NLane
         K0 = K_pk // (KLane * KPack)
@@ -53,7 +52,7 @@ def shuffle_weight(
 
 def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.Tensor:
     """Backward-compatible wrapper around `shuffle_weight(..., is_guinterleave=True)`."""
-    return shuffle_weight(src, is_guinterleave=True, NLane=NLane, gate_up=gate_up)
+    return shuffle_weight(src, layout=(NLane, 16), is_guinterleave=True, gate_up=gate_up)
 
 
 def shuffle_weight_NK(
