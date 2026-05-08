@@ -136,5 +136,3 @@ def fused_qk_rope_concat_and_cache_mla(
     is_neox: bool,
     is_nope_first: bool,
 ) -> None: ...
-
-
