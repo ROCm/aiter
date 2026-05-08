@@ -3,6 +3,7 @@
 import torch
 import multiprocessing as mp
 import time
+import os
 from multiprocessing import TimeoutError as MPTimeoutError
 from aiter.test_common import checkAllclose
 from aiter import dtypes
@@ -38,6 +39,9 @@ def worker(
 
         except RuntimeError as e:
             print(f"run gpu func warning: info:{info}\t {e}", flush=True)
+            msg = str(e)
+            if "does not support this GEMM problem" in msg or "not support" in msg:
+                return info, -1, 1.0
             us = -1  # not support or error
             max_err_ratio = 1.0
         max_retries = 3
@@ -357,6 +361,8 @@ def mp_tuner(
     # Track start time for each task
     task_start_times = {k: time.time() for k, _ in remaining_tasks}
     check_interval = 10  # Check every 10 seconds for responsive polling
+    progress_log_interval = 30
+    last_progress_log = time.time()
 
     timeout_msg = (
         f"timeout={timeout}s each" if timeout is not None else "no timeout limit"
@@ -377,6 +383,14 @@ def mp_tuner(
             info = task[0] if len(task) > 0 else f"task_{k}"
             results_list.append((info, float("inf"), 1.0))
 
+    def current_timeout_limit():
+        """Use a shorter cap for the final straggler after other tasks finish."""
+        limit = timeout
+        if len(remaining_tasks) == 1 and result_dict:
+            straggler_timeout = float(os.getenv("AITER_MP_STRAGGLER_TIMEOUT", "120"))
+            limit = straggler_timeout if limit is None else min(limit, straggler_timeout)
+        return limit
+
     # Process tasks as they complete
     pool_restart_needed = False
     logged_error_types = (
@@ -391,24 +405,25 @@ def mp_tuner(
 
         for k, async_result in remaining_tasks:
             try:
-                # Calculate appropriate timeout based on task's remaining time
-                if timeout is not None:
-                    elapsed = time.time() - task_start_times[k]
-                    remaining_time = timeout - elapsed
-                    # Use the smaller of check_interval and remaining_time, but at least 1 second
-                    actual_timeout = max(1, min(check_interval, remaining_time))
-                else:
-                    # No timeout set, use default check_interval
-                    actual_timeout = check_interval
+                elapsed = time.time() - task_start_times[k]
+                timeout_limit = current_timeout_limit()
+                if not async_result.ready():
+                    # Do not block on every outstanding task. With hundreds of
+                    # tasks, get(timeout=check_interval) per task can make one
+                    # polling pass look like a hang even when later tasks have
+                    # already finished.
+                    if timeout_limit is not None and elapsed > timeout_limit:
+                        raise MPTimeoutError()
+                    consecutive_timeouts = 0
+                    continue
 
-                # Non-blocking check with dynamic timeout
-                task_result = async_result.get(timeout=actual_timeout)
+                # Completed tasks can be collected without blocking.
+                task_result = async_result.get(timeout=0)
 
                 # Task completed successfully
                 result_dict[k] = task_result
                 completed_this_round.append((k, async_result))
                 consecutive_timeouts = 0
-                elapsed = time.time() - task_start_times[k]
                 if verbose:
                     print(
                         f"[Done] Task {k}/{len(rets)-1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)"
@@ -416,13 +431,14 @@ def mp_tuner(
 
             except MPTimeoutError:
                 # Check if this specific task has exceeded its timeout (only if timeout is set)
-                if timeout is not None:
+                timeout_limit = current_timeout_limit()
+                if timeout_limit is not None:
                     elapsed = time.time() - task_start_times[k]
 
-                    if elapsed > timeout:
+                    if elapsed > timeout_limit:
                         consecutive_timeouts += 1
 
-                        error_msg = f"[!] Task {k} timed out after {elapsed:.1f}s (limit: {timeout}s) - likely GPU hang or infinite loop"
+                        error_msg = f"[!] Task {k} timed out after {elapsed:.1f}s (limit: {timeout_limit}s) - likely GPU hang or infinite loop"
                         print(error_msg)
                         failed_tasks.append((k, "timeout"))
 
@@ -540,6 +556,18 @@ def mp_tuner(
 
         # Small sleep to avoid busy waiting
         if remaining_tasks:
+            now = time.time()
+            if now - last_progress_log >= progress_log_interval:
+                oldest_running = max(
+                    now - task_start_times[k] for k, _ in remaining_tasks
+                )
+                print(
+                    f"[Progress] {len(result_dict)}/{len(rets)} done, "
+                    f"{len(remaining_tasks)} remaining, "
+                    f"oldest running {oldest_running:.1f}s",
+                    flush=True,
+                )
+                last_progress_log = now
             time.sleep(1)
 
     # Reconstruct results in original task order
