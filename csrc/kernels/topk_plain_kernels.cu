@@ -92,10 +92,13 @@ void standalone_stable_radix_11bits(void* buf,
 
 // Forward declaration of workspace size calculation function (at global scope)
 template <typename T, aiter::Phase phase = aiter::Phase::Prefill>
-int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0);
+int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows,
+                                              int32_t stride0,
+                                              int k_param = 2048);
 extern template int64_t
 invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Prefill>(int32_t numRows,
-                                                                    int32_t stride0);
+                                                                    int32_t stride0,
+                                                                    int k_param);
 
 // Forward declaration of helper function to call topk_per_row kernel
 template <typename IdxT>

@@ -46,7 +46,10 @@ from aiter.aot.flydsl.common import (
     override_env,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.ops.flydsl.gemm_kernels import get_flydsl_splitk_hgemm_kernel_params
+from aiter.ops.flydsl.gemm_kernels import (
+    SPLIT_K_SEMAPHORE_MAX_LEN,
+    get_flydsl_splitk_hgemm_kernel_params,
+)
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 
@@ -67,8 +70,9 @@ _PRESHUFFLE_RE = re.compile(
     r"^flydsl_bpreshuflle_"
     r"(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
-    r"(?P<lds_stage>\d+)x(?P<cshuffle>\d+)x(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)_"
-    r"(?P<scheduler>[A-Za-z0-9_]+)$"
+    r"(?P<lds_stage>\d+)x(?P<cshuffle>\d+)x(?P<async_copy>\d+)x"
+    r"(?P<waves_per_eu>\d+)x(?P<xcd_swizzle>\d+)_"
+    r"(?P<scheduler>[A-Za-z][A-Za-z0-9]*)$"
 )
 _SHORT_DTYPE = {
     "F8": "fp8",
@@ -118,6 +122,7 @@ def _parse_preshuffle_kernel_name(name: str) -> Optional[Dict]:
         "use_async_copy": int(m.group("async_copy")),
         "waves_per_eu": int(m.group("waves_per_eu")),
         "scheduler": m.group("scheduler"),
+        "xcd_swizzle": int(m.group("xcd_swizzle")),
     }
 
 
@@ -230,8 +235,13 @@ def _compile_hgemm_to_cache(
     a = torch.empty((m, k), device=dev, dtype=torch_dtype)
     b = torch.empty((n, k), device=dev, dtype=torch_dtype)
     bias = torch.empty((n,), device=dev, dtype=torch_dtype)
-    counter = torch.zeros(
-        (128 * 3,),
+    semaphore = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,),
+        device=dev,
+        dtype=torch.int32,
+    )
+    signal = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,),
         device=dev,
         dtype=torch.int32,
     )
@@ -258,9 +268,12 @@ def _compile_hgemm_to_cache(
         c_to_lds=c_to_lds,
         has_bias=has_bias,
     )
-    # FlyDSL JIT does not accept None for tensor slots; pass a real buffer when
-    # bias fusion is disabled (matches runtime launcher dummy tensor behavior).
-    _compile_executable_to_cache(exe, out, a, b, bias, m, counter, 0, stream)
+    # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
+    # optional bias and split-K sync tensors.
+    launch_bias = bias if has_bias else b
+    _compile_executable_to_cache(
+        exe, out, a, b, launch_bias, m, semaphore, signal, stream
+    )
 
 
 def _compile_preshuffle_to_cache(
@@ -277,6 +290,7 @@ def _compile_preshuffle_to_cache(
     use_cshuffle_epilog: int,
     use_async_copy: int,
     waves_per_eu: int,
+    xcd_swizzle: int = 0,
     **kwargs,
 ):
     del kwargs
@@ -293,6 +307,7 @@ def _compile_preshuffle_to_cache(
     out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
+    bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
     stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
 
     exe = compile_preshuffle_gemm_a8(
@@ -307,8 +322,9 @@ def _compile_preshuffle_to_cache(
         use_cshuffle_epilog=bool(use_cshuffle_epilog),
         use_async_copy=bool(use_async_copy),
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
+        xcd_swizzle=xcd_swizzle,
     )
-    _compile_executable_to_cache(exe, out, a, b, scale_a, scale_b, m, n, stream)
+    _compile_executable_to_cache(exe, out, a, b, scale_a, scale_b, bias, m, n, stream)
 
 
 def compile_one_config(

@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fused silu_and_mul + quantization + sorted-scale write kernel (FlyDSL).
+"""Fused gate-activation-and-mul + quantization + sorted-scale write kernel (FlyDSL).
 
 Designed for split-K MOE stage1 post-processing:
 
   input   : tmp_out  (token_num * topk, inter_dim * 2) bf16
+            topk_ids (token_num * topk) i32, optional
+            bias     (expert, inter_dim * 2) f32, optional
   sorted  : sorted_token_ids (sorted_len,) i32 -- packed (token<<0 | slot<<24)
             num_valid_ids    (1,) i32
   output  : out              raw byte buffer (FP4x2, FP8, or BF16 depending on quant_mode)
@@ -15,6 +17,7 @@ Compile options:
   quant_mode : "fp4" | "fp8" | "none"
   gui_layout : False -> gate-up separated  [gate_0:N, up_0:N]
                True  -> block-interleaved  [gate_0:16, up_0:16, gate_16:32, ...]
+  act        : "silu" | "swiglu"
 """
 
 import flydsl.compiler as flyc
@@ -37,8 +40,10 @@ def build_silu_and_mul_fq_module(
     topk: int,
     quant_mode: str = "fp4",
     gui_layout: bool = False,
+    act: str = "silu",
+    enable_bias: bool = False,
 ):
-    """Return a JIT launcher for fused silu_and_mul + optional quant + scale sort.
+    """Return a JIT launcher for fused gate activation + optional quant + scale sort.
 
     Parameters
     ----------
@@ -60,6 +65,8 @@ def build_silu_and_mul_fq_module(
     _need_fp8 = quant_mode == "fp8"
     _need_quant = _need_fp4 or _need_fp8
     assert _need_fp4 or _need_fp8 or quant_mode == "none"
+    if act not in ("silu", "swiglu"):
+        raise ValueError(f"Unsupported activation for split-K path: {act!r}")
 
     scale_cols = inter_dim // 32
     ELEMS_PER_THREAD = (inter_dim + BLOCK_THREADS - 1) // BLOCK_THREADS
@@ -90,6 +97,8 @@ def build_silu_and_mul_fq_module(
         out_scale_sorted: fx.Tensor,
         sorted_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
+        topk_ids: fx.Tensor,
+        bias: fx.Tensor,
         token_num: Int32,
     ):
         bid = fx.block_idx.x
@@ -128,6 +137,7 @@ def build_silu_and_mul_fq_module(
 
         scale_cols_i32 = arith.constant(scale_cols, type=i32)
         inter_dim_i32 = arith.constant(inter_dim, type=i32)
+        inter_dim2_i32 = inter_dim_i32 * c2_i32
         topk_i32 = arith.constant(topk, type=i32)
         n32_sort = scale_cols_i32 * c32_i32
 
@@ -136,6 +146,12 @@ def build_silu_and_mul_fq_module(
         scale_rsrc = buffer_ops.create_buffer_resource(out_scale_sorted, max_size=True)
         tid_rsrc = buffer_ops.create_buffer_resource(sorted_ids, max_size=True)
         nv_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+        if enable_bias:
+            topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
+            bias_rsrc = buffer_ops.create_buffer_resource(bias, max_size=True)
+
+            def _load_bias_scalar(offset):
+                return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=f32)
 
         num_valid = buffer_ops.buffer_load(nv_rsrc, c0_i32, vec_width=1, dtype=i32)
         token_num_i32 = ArithValue(token_num)
@@ -186,6 +202,13 @@ def build_silu_and_mul_fq_module(
                 _if_valid = scf.IfOp(is_valid, has_else=True)
                 with ir.InsertionPoint(_if_valid.then_block):
                     in_row = token_id * topk_i32 + slot_id
+                    if enable_bias:
+                        # sorted_ids encodes token and slot, not expert. Use topk_ids
+                        # to recover the expert-specific bias row for this token slot.
+                        expert_id = buffer_ops.buffer_load(
+                            topk_rsrc, in_row, vec_width=1, dtype=i32
+                        )
+                        bias_row = expert_id * inter_dim2_i32
                     in_row_byte_base = in_row * arith.constant(
                         inter_dim * 2 * elem_bytes_bf16, type=i32
                     )
@@ -246,6 +269,11 @@ def build_silu_and_mul_fq_module(
                     up_f32 = up_bf16.extf(vec_f32_ty)
 
                     neg_log2e = arith.constant(-1.4426950408889634, type=f32)
+                    swiglu_neg_alpha_log2e = arith.constant(
+                        -1.4426950408889634 * 1.702, type=f32
+                    )
+                    swiglu_limit = arith.constant(7.0, type=f32)
+                    swiglu_neg_limit = arith.constant(-7.0, type=f32)
                     act_vals = []
                     for vi in range_constexpr(VEC):
                         g = vector.extract(
@@ -254,7 +282,21 @@ def build_silu_and_mul_fq_module(
                         u = vector.extract(
                             up_f32, static_position=[vi], dynamic_position=[]
                         )
+                        if enable_bias:
+                            bias_col = col0 + arith.constant(vi, type=i32)
+                            g = g + _load_bias_scalar(bias_row + bias_col)
+                            u = u + _load_bias_scalar(
+                                bias_row + inter_dim_i32 + bias_col
+                            )
+                        gate = g
+                        linear = u
                         t = g * neg_log2e
+                        if act == "swiglu":
+                            gate = arith.minimumf(g, swiglu_limit)
+                            linear = arith.maximumf(
+                                arith.minimumf(u, swiglu_limit), swiglu_neg_limit
+                            )
+                            t = gate * swiglu_neg_alpha_log2e
                         emu = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.exp2.f32", [t], [], []
                         )
@@ -262,7 +304,10 @@ def build_silu_and_mul_fq_module(
                         sig = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.rcp.f32", [den], [], []
                         )
-                        act_vals.append(g * sig * u)
+                        if act == "swiglu":
+                            act_vals.append(gate * sig * (linear + c1_f32))
+                        else:
+                            act_vals.append(gate * sig * linear)
 
                     if const_expr(_need_quant):
                         local_max = c0_f32
@@ -278,7 +323,9 @@ def build_silu_and_mul_fq_module(
                             local_max = arith.maximumf(local_max, peer)
 
                         max_i32_v = local_max.bitcast(i32)
-                        max_rounded = (max_i32_v + c0x200000_i32) & c0xFF800000_i32
+                        # Match fp4_utils.f32_to_e8m0(max_abs / 4): round the
+                        # exponent at the 1.5x threshold before dropping mantissa.
+                        max_rounded = (max_i32_v + c0x400000_i32) & c0xFF800000_i32
                         exp_field = max_rounded >> c23_i32
                         e8m0_biased = arith.maxsi(exp_field - c_headroom_i32, c0_i32)
                         quant_exp = c254_i32 - e8m0_biased
@@ -488,6 +535,8 @@ def build_silu_and_mul_fq_module(
         out_scale_sorted: fx.Tensor,
         sorted_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
+        topk_ids: fx.Tensor,
+        bias: fx.Tensor,
         token_num: fx.Int32,
         num_sorted_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -498,7 +547,14 @@ def build_silu_and_mul_fq_module(
 
         idx_rows = arith.index_cast(T.index, num_sorted_rows)
         launcher = silu_and_mul_fq_kernel(
-            x, out_buf, out_scale_sorted, sorted_ids, num_valid_ids, token_num
+            x,
+            out_buf,
+            out_scale_sorted,
+            sorted_ids,
+            num_valid_ids,
+            topk_ids,
+            bias,
+            token_num,
         )
         launcher.launch(
             grid=(idx_rows, 1, 1),
