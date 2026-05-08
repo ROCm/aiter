@@ -143,9 +143,9 @@ class QManager8bitsV2
         // Since dtype should be fp8, a buffer_load_dwordx4 is used to load all 1x16 elements.
         constexpr uint32_t kNumRowsPerWarp = 16;
         constexpr uint32_t kNumColsPerWarp = 64;
-        constexpr uint32_t kNumElemPerWarp = kNumRowsPerWarp * kNumColsPerWarp;      // 16*64=1024
+        constexpr uint32_t kNumElemPerWarp = kNumRowsPerWarp * kNumColsPerWarp;       // 16*64=1024
         constexpr uint32_t kNumElemPerLane = kNumElemPerWarp / opus::get_warp_size(); // 1024/64=16
-        constexpr uint32_t kNumLanesPerRow = kNumColsPerWarp / kNumElemPerLane;      // 64/16=4
+        constexpr uint32_t kNumLanesPerRow = kNumColsPerWarp / kNumElemPerLane;       // 64/16=4
 
         const uint32_t lane_idx = opus::lane_id();
 
@@ -266,9 +266,9 @@ class QManager8bitsV3
         // Since dtype should be fp8, a buffer_load_dwordx4 is used to load all 1x16 elements.
         constexpr uint32_t kNumRowsPerWarp = 16;
         constexpr uint32_t kNumColsPerWarp = 64;
-        constexpr uint32_t kNumElemPerWarp = kNumRowsPerWarp * kNumColsPerWarp;      // 16*64=1024
+        constexpr uint32_t kNumElemPerWarp = kNumRowsPerWarp * kNumColsPerWarp;       // 16*64=1024
         constexpr uint32_t kNumElemPerLane = kNumElemPerWarp / opus::get_warp_size(); // 1024/64=16
-        constexpr uint32_t kNumLanesPerRow = kNumColsPerWarp / kNumElemPerLane;      // 64/16=4
+        constexpr uint32_t kNumLanesPerRow = kNumColsPerWarp / kNumElemPerLane;       // 64/16=4
 
         const uint32_t lane_idx = opus::lane_id();
 
@@ -581,8 +581,8 @@ __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
         {
             const uint32_t page_idx   = row_kv_ld_idx / kPageSize;
             const uint32_t intra_page = row_kv_ld_idx % kPageSize;
-            const int32_t page_phys   = __builtin_amdgcn_raw_buffer_load_b32(
-                rsrc, page_idx * sizeof(int32_t), 0, 0);
+            const int32_t page_phys =
+                __builtin_amdgcn_raw_buffer_load_b32(rsrc, page_idx * sizeof(int32_t), 0, 0);
             row_kv_ld = page_phys * kPageSize + intra_page;
         }
     }
@@ -657,7 +657,9 @@ class KvManager8bitsV1
     // @param col_base: the base column index which should be:
     //        warp_idx * kNumColsPerWarp(8) + lane_idx % kNumColThreads(2) *
     //        kNumBytesPerThrPerRnd(4)
-    template <uint32_t kRowOffset, uint32_t kColOffset, bool kIsLastIter,
+    template <uint32_t kRowOffset,
+              uint32_t kColOffset,
+              bool kIsLastIter,
               bool kCheckBoundary = true>
     __device__ __forceinline__ static void async_load_k_tile(const uintptr_t p_lds_kv_warp_base,
                                                              const uint32_t warp_idx,
@@ -879,7 +881,9 @@ class KvManager8bitsV2
     // (30, 000 - 063) [W7L32 - W7L47] BANK 14-29
     // (31, 000 - 063) [W7L48 - W7L63] BANK 30-13
     // 2DW padding
-    template <uint32_t kRowOffset, uint32_t kColOffset, bool kIsLastIter,
+    template <uint32_t kRowOffset,
+              uint32_t kColOffset,
+              bool kIsLastIter,
               bool kCheckBoundary = true>
     __device__ __forceinline__ static void async_load_k_tile(const uintptr_t p_lds_kv_warp_base,
                                                              const uint32_t warp_idx,
@@ -972,10 +976,9 @@ class KvManager8bitsV2
                       "load_k_to_gpr(): Unsupported column offset!");
 
         // Canonical address (matches load_v_to_gpr() / store layout):
-        //   row     = kRowOffset + lane_idx % kMfmaRows;             // ? [kRowOffset, kRowOffset+16)
-        //   row_phy = ((row % 16) / 2) * 4 + 2 * (row / 16) + (row % 2);
-        //   col     = kColOffset + (lane_idx / kMfmaRows) * kMfmaElemPerThr;
-        //   p_lds_kv_lane = p_lds_kv +
+        //   row     = kRowOffset + lane_idx % kMfmaRows;             // ? [kRowOffset,
+        //   kRowOffset+16) row_phy = ((row % 16) / 2) * 4 + 2 * (row / 16) + (row % 2); col     =
+        //   kColOffset + (lane_idx / kMfmaRows) * kMfmaElemPerThr; p_lds_kv_lane = p_lds_kv +
         //       (row_phy / 4)         * kNumBytesPerSubBlock +
         //       (row_phy % 4)         * kNumBytesPerRow +
         //        col / kNumCols       * kNumBytesPerBlock +
@@ -988,16 +991,14 @@ class KvManager8bitsV2
         // kRowOffset/kColOffset terms are constexpr-folded into kFixedOffset.
         // kRowOffset==16 shifts row_phy by +2 (always lands in row_phy%4),
         // contributing +(kRowOffset/16) * 2 * kNumBytesPerRow.
-        const uint32_t lane_idx = opus::lane_id();
-        const uint32_t row      = lane_idx % kMfmaRows;
-        const uint32_t col      = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
+        const uint32_t lane_idx       = opus::lane_id();
+        const uint32_t row            = lane_idx % kMfmaRows;
+        const uint32_t col            = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
         const uintptr_t p_lds_kv_lane = p_lds_kv + (row / 2) * kNumBytesPerSubBlock +
-                                        (row % 2) * kNumBytesPerRow +
-                                        col * sizeof(kv_t);
-        constexpr uint32_t kFixedOffset =
-            (kRowOffset / 16) * 2 * kNumBytesPerRow +
-            (kColOffset / kNumCols) * kNumBytesPerBlock +
-            (kColOffset % kNumCols) * sizeof(kv_t);
+                                        (row % 2) * kNumBytesPerRow + col * sizeof(kv_t);
+        constexpr uint32_t kFixedOffset = (kRowOffset / 16) * 2 * kNumBytesPerRow +
+                                          (kColOffset / kNumCols) * kNumBytesPerBlock +
+                                          (kColOffset % kNumCols) * sizeof(kv_t);
 
         // RT must hold exactly one 2-vgpr range (one mfma A-tile). Caller passes the
         // appropriate sub-view per kRowOffset; the function always writes to range 0.
@@ -1051,22 +1052,23 @@ class KvManager8bitsV3
         kNumSubBlockRows * kNumSubBlockCols * sizeof(kv_t); // 4*32*1=128
     static constexpr uint32_t kNumBytesPer2SubBlocksWithPadding =
         kNumBytesPerSubBlock * 2 + kNumPaddingDw * sizeof(uint32_t); // 128*2+2*4=264
-    // LDS layout: kBlockN x 64 block split into kBlockN/4 sub-block slots; INDEPENDENT of kNumWarps.
+    // LDS layout: kBlockN x 64 block split into kBlockN/4 sub-block slots; INDEPENDENT of
+    // kNumWarps.
     static constexpr uint32_t kNum2SubBlocks = kNumRows / 4; // kBlockN=32 -> 8; kBlockN=64 -> 16
     static_assert(kNum2SubBlocks % T::kNumWarps == 0,
                   "kNum2SubBlocks must be a multiple of kNumWarps");
     static constexpr uint32_t kNumPassesPerWarp = kNum2SubBlocks / T::kNumWarps; // 1 or 2
     static constexpr uint32_t kNumBytesPerBlock =
-        kNumBytesPer2SubBlocksWithPadding * kNum2SubBlocks;                 // 264 * kNum2SubBlocks
-    static constexpr uint32_t kNumRowsPerWarp = kNumSubBlockRows * 2;       // 8
-    static constexpr uint32_t kNumWarpsPerCol = 32 / kNumRowsPerWarp;       // 4 (rows per pass / 8)
+        kNumBytesPer2SubBlocksWithPadding * kNum2SubBlocks;           // 264 * kNum2SubBlocks
+    static constexpr uint32_t kNumRowsPerWarp = kNumSubBlockRows * 2; // 8
+    static constexpr uint32_t kNumWarpsPerCol = 32 / kNumRowsPerWarp; // 4 (rows per pass / 8)
     // Slot stride between consecutive row-passes within a col-block. Equals
     // kNumWarpsPerCol * kNumColStripsPerBlock = 4 * 2 = 8 slots, i.e. one full row-pass
-    // covers all warp-rows × all col-strips before the next row-pass begins. Constant
+    // covers all warp-rows x all col-strips before the next row-pass begins. Constant
     // across kNumWarps so row-strip and col-strip slot offsets stay independent (col-strip
     // stride is 4 slots; row-strip stride must differ to avoid collision when both are used,
     // as in m16x4 kBlockN=64).
-    static constexpr uint32_t kRowPassSlotStride = kNumWarpsPerCol * 2;     // 8
+    static constexpr uint32_t kRowPassSlotStride = kNumWarpsPerCol * 2; // 8
     static constexpr uint32_t kNumBytesPerThrPerRnd =
         4; // use buffer_load_dword which loads 4B each time.
     static constexpr uint32_t kNumThrPerSubBlockRow =
@@ -1198,7 +1200,9 @@ class KvManager8bitsV3
     // KV rows [kv_tile_start + p*32, kv_tile_start + (p+1)*32) and writes to LDS
     // slot warp_idx + p*kNumWarps within the column-block (Layout B).
     // `row` is the physical KV row already resolved by get_kv_ld_row (-1 means OOB).
-    template <uint32_t kRowOffset, uint32_t kColOffset, bool kIsLastIter,
+    template <uint32_t kRowOffset,
+              uint32_t kColOffset,
+              bool kIsLastIter,
               bool kCheckBoundary = true>
     __device__ __forceinline__ static void async_load_k_tile(const uintptr_t p_lds_kv_warp_base,
                                                              const uint32_t warp_idx,
@@ -1224,10 +1228,9 @@ class KvManager8bitsV3
             const hk::i32x4 srsrc   = hk::make_srsrc(p_kv_buffer, 0xffffffff);
 
             const uintptr_t p_lds_kv_warp =
-                p_lds_kv_warp_base
-                + kPass * kRowPassSlotStride * kNumBytesPer2SubBlocksWithPadding
-                + kBlockIdx * kNumBytesPerBlock
-                - kColOffset;
+                p_lds_kv_warp_base +
+                kPass * kRowPassSlotStride * kNumBytesPer2SubBlocksWithPadding +
+                kBlockIdx * kNumBytesPerBlock - kColOffset;
 
             if(kCheckBoundary && (row == -1))
             {
@@ -1304,10 +1307,10 @@ class KvManager8bitsV3
         //   row = lane_idx % 16    ? [0, 16)
         //   col = (lane_idx / 16) * 8 ? {0, 8, 16, 24}
         // See get_block_lane_offset() / get_block_fixed_offset() for the address math.
-        const uint32_t lane_idx = opus::lane_id();
-        const uint32_t row      = lane_idx % kMfmaRows;
-        const uint32_t col      = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
-        const uintptr_t p_lds_kv_lane = p_lds_kv + get_block_lane_offset(row, col);
+        const uint32_t lane_idx         = opus::lane_id();
+        const uint32_t row              = lane_idx % kMfmaRows;
+        const uint32_t col              = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
+        const uintptr_t p_lds_kv_lane   = p_lds_kv + get_block_lane_offset(row, col);
         constexpr uint32_t kFixedOffset = get_block_fixed_offset<kRowOffset, kColOffset>();
 
         // RT must hold exactly one 2-vgpr range (one mfma A-tile = 16x32 = 2 vgprs).
@@ -1332,7 +1335,7 @@ class KvManager8bitsV3
         constexpr uint32_t kNumSubTiles = kNumRows / 32;
         const uint32_t col              = (lane_idx % 16) * 8 + warp_idx / 2 * 128;
 
-        #pragma unroll
+#pragma unroll
         for(uint32_t sub = 0; sub < kNumSubTiles; ++sub)
         {
             const uint32_t row = (warp_idx % 2) * 16 + lane_idx / 16 * 4 + sub * 32;
@@ -1343,8 +1346,7 @@ class KvManager8bitsV3
             //   sub_block    = (row % 32) / 16
             //   sub_row      = row % 4
             const uint32_t row_phy = ((row / 32) * kRowPassSlotStride + (row % 16) / 4) * 8 +
-                                     ((row % 32) / 16) * 4 +
-                                     (row % 4);
+                                     ((row % 32) / 16) * 4 + (row % 4);
             const uintptr_t p_lds_v_lane =
                 p_lds_v + (row_phy / 8) * kNumBytesPer2SubBlocksWithPadding +
                 (row_phy % 8) * kNumSubBlockCols * sizeof(kv_t) +
@@ -1397,11 +1399,11 @@ class KvManager8bitsV3
         //   row = (lane_idx / 16) * 4 + ((lane_idx % 16) / 2) % 4    ? [0, 16)
         //   col = ((lane_idx % 2) + ((lane_idx % 16) / 8) * 2) * 8   ? {0, 8, 16, 24}
         // See get_block_lane_offset() / get_block_fixed_offset() for the address math.
-        const uint32_t lane_idx        = opus::lane_id();
-        const uint32_t lane_idx_in_grp = lane_idx % 16;
-        const uint32_t row             = (lane_idx / 16) * 4 + (lane_idx_in_grp / 2) % 4;
-        const uint32_t col             = ((lane_idx % 2) + (lane_idx_in_grp / 8) * 2) * 8;
-        const uintptr_t p_lds_v_lane   = p_lds_v + get_block_lane_offset(row, col);
+        const uint32_t lane_idx         = opus::lane_id();
+        const uint32_t lane_idx_in_grp  = lane_idx % 16;
+        const uint32_t row              = (lane_idx / 16) * 4 + (lane_idx_in_grp / 2) % 4;
+        const uint32_t col              = ((lane_idx % 2) + (lane_idx_in_grp / 8) * 2) * 8;
+        const uintptr_t p_lds_v_lane    = p_lds_v + get_block_lane_offset(row, col);
         constexpr uint32_t kFixedOffset = get_block_fixed_offset<kRowOffset, kColOffset>();
 
         hkm::ds_read_b64_tr_b8<GPR>(p_lds_v_lane, kFixedOffset);
@@ -1432,12 +1434,11 @@ class KvManager8bitsV3
     __device__ __forceinline__ void static finalize_load_transposed_v_to_gpr()
     {
 #if defined(__gfx950__)
-        asm volatile("v_swap_b32 v[%0], v[%1]"
-                     :
-                     : "i"(GPR_0+1), "i"(GPR_1));
+        asm volatile("v_swap_b32 v[%0], v[%1]" : : "i"(GPR_0 + 1), "i"(GPR_1));
 #else
-        static_assert(false,
-                      "KVManager8bitsV3::finalize_load_transposed_v_to_gpr() is not expected to be called.");
+        static_assert(
+            false,
+            "KVManager8bitsV3::finalize_load_transposed_v_to_gpr() is not expected to be called.");
 #endif
     }
 };
@@ -1528,8 +1529,7 @@ class VtManager8bitsV1
         constexpr uint32_t kFixedColBlk      = kColOffset / kNumColsPerThr;
         constexpr uint32_t kFixedBlockOffset = kFixedColBlk * kNumElemsPerBlock * sizeof(kv_t);
 
-        static_assert(kRowOffset == 0,
-                      "load_transpose_v_to_gpr(): Unsupported row offset!");
+        static_assert(kRowOffset == 0, "load_transpose_v_to_gpr(): Unsupported row offset!");
         static_assert(((kColOffset % 16) == 0) && (kColOffset < 512),
                       "load_transpose_v_to_gpr(): Unsupported column offset!");
 
@@ -1597,10 +1597,10 @@ __device__ __forceinline__ uint32_t float_2_bf16_pair(uint32_t src_0, uint32_t s
 #if defined(__gfx950__)
     asm volatile("v_cvt_pk_bf16_f32 %0, v[%1], v[%2]" : "=v"(result) : "i"(src_0), "i"(src_1));
 #elif defined(__gfx942__)
-    static constexpr uint32_t FP32_NAN            = 0x7fff0000;
+    static constexpr uint32_t FP32_NAN = 0x7fff0000;
     static constexpr uint32_t ROUND_BIAS_FOR_BF16 = 0x7fff;
-    static constexpr uint32_t MERGE_MASK          = 0xffff0000;
-    static constexpr uint32_t PERM                = 0x07060302;
+    static constexpr uint32_t MERGE_MASK = 0xffff0000;
+    static constexpr uint32_t PERM = 0x07060302;
 
     using uint32x2_t = uint32_t __attribute__((ext_vector_type(2)));
     uint32x2_t check_nan;

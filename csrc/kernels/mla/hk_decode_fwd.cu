@@ -1,99 +1,93 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "mla.h"
-#include "hk/mi3xx_v32_fwd_decode_m16x8_fp8_fp8.cuh"
 #include "hk/mi35x_v32_fwd_decode_m16x4_fp8_fp8.cuh"
 #include "hk/mi35x_v32_fwd_decode_m16x8_fp8_fp8.cuh"
+#include "hk/mi3xx_v32_fwd_decode_m16x8_fp8_fp8.cuh"
+#include "mla.h"
 
-void hk_mla_decode_fwd(
-    torch::Tensor& query,
-    torch::Tensor& kv_buffer,
-    const torch::Tensor& qo_indptr,
-    const torch::Tensor& kv_indptr,
-    const torch::Tensor& kv_page_indices,
-    const torch::Tensor& kv_last_page_lens,
-    const torch::Tensor& work_indptr,
-    const torch::Tensor& work_info_set,
-    const int max_seqlen_q,
-    const float softmax_scale,
-    torch::Tensor& split_output,
-    torch::Tensor& split_lse,
-    torch::Tensor& final_output)
+void hk_mla_decode_fwd(torch::Tensor& query,
+                       torch::Tensor& kv_buffer,
+                       const torch::Tensor& qo_indptr,
+                       const torch::Tensor& kv_indptr,
+                       const torch::Tensor& kv_page_indices,
+                       const torch::Tensor& kv_last_page_lens,
+                       const torch::Tensor& work_indptr,
+                       const torch::Tensor& work_info_set,
+                       const int max_seqlen_q,
+                       const float softmax_scale,
+                       torch::Tensor& split_output,
+                       torch::Tensor& split_lse,
+                       torch::Tensor& final_output)
 {
     const int32_t num_head = query.size(1);
 
-    if ((num_head * max_seqlen_q) == 128)
+    if((num_head * max_seqlen_q) == 128)
     {
         const std::string gfx = get_gpu_arch();
-        if (gfx == "gfx942")
+        if(gfx == "gfx942")
         {
-            hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(
-                query,
-                kv_buffer,
-                qo_indptr,
-                kv_indptr,
-                kv_page_indices,
-                kv_last_page_lens,
-                work_indptr,
-                work_info_set,
-                max_seqlen_q,
-                softmax_scale,
-                split_output,
-                split_lse,
-                final_output);
+            hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(query,
+                                                      kv_buffer,
+                                                      qo_indptr,
+                                                      kv_indptr,
+                                                      kv_page_indices,
+                                                      kv_last_page_lens,
+                                                      work_indptr,
+                                                      work_info_set,
+                                                      max_seqlen_q,
+                                                      softmax_scale,
+                                                      split_output,
+                                                      split_lse,
+                                                      final_output);
         }
-        else if (gfx == "gfx950")
+        else if(gfx == "gfx950")
         {
-            hk_mi35x_mla_v32_fwd_decode_m16x8_fp8_fp8(
-                query,
-                kv_buffer,
-                qo_indptr,
-                kv_indptr,
-                kv_page_indices,
-                kv_last_page_lens,
-                work_indptr,
-                work_info_set,
-                max_seqlen_q,
-                softmax_scale,
-                split_output,
-                split_lse,
-                final_output);
+            hk_mi35x_mla_v32_fwd_decode_m16x8_fp8_fp8(query,
+                                                      kv_buffer,
+                                                      qo_indptr,
+                                                      kv_indptr,
+                                                      kv_page_indices,
+                                                      kv_last_page_lens,
+                                                      work_indptr,
+                                                      work_info_set,
+                                                      max_seqlen_q,
+                                                      softmax_scale,
+                                                      split_output,
+                                                      split_lse,
+                                                      final_output);
         }
         else
         {
-            TORCH_CHECK(
-                false,
-                "hk_mla_decode_fwd: unsupported GPU arch '", gfx,
-                "' (supported: gfx942, gfx950).");
+            TORCH_CHECK(false,
+                        "hk_mla_decode_fwd: unsupported GPU arch '",
+                        gfx,
+                        "' (supported: gfx942, gfx950).");
         }
     }
-    else if ((num_head * max_seqlen_q) == 64)
+    else if((num_head * max_seqlen_q) == 64)
     {
         const std::string gfx = get_gpu_arch();
-        if (gfx == "gfx950")
+        if(gfx == "gfx950")
         {
-            hk_mi35x_mla_v32_fwd_decode_m16x4_fp8_fp8(
-                query,
-                kv_buffer,
-                qo_indptr,
-                kv_indptr,
-                kv_page_indices,
-                kv_last_page_lens,
-                work_indptr,
-                work_info_set,
-                max_seqlen_q,
-                softmax_scale,
-                split_output,
-                split_lse,
-                final_output);
+            hk_mi35x_mla_v32_fwd_decode_m16x4_fp8_fp8(query,
+                                                      kv_buffer,
+                                                      qo_indptr,
+                                                      kv_indptr,
+                                                      kv_page_indices,
+                                                      kv_last_page_lens,
+                                                      work_indptr,
+                                                      work_info_set,
+                                                      max_seqlen_q,
+                                                      softmax_scale,
+                                                      split_output,
+                                                      split_lse,
+                                                      final_output);
         }
         else
         {
             TORCH_CHECK(
-                false,
-                "hk_mla_decode_fwd: unsupported GPU arch '", gfx,
-                "' (supported: gfx950).");
+                false, "hk_mla_decode_fwd: unsupported GPU arch '", gfx, "' (supported: gfx950).");
         }
     }
     else
@@ -101,6 +95,8 @@ void hk_mla_decode_fwd(
         TORCH_CHECK(
             false,
             "hk_mla_decode_fwd requires num_head * max_seqlen_q == 64 or 128, got num_head = ",
-            num_head, ", max_seqlen_q = ", max_seqlen_q);
+            num_head,
+            ", max_seqlen_q = ",
+            max_seqlen_q);
     }
 }

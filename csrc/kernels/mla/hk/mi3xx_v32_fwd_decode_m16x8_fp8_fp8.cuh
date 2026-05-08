@@ -8,13 +8,14 @@
 #include "mla.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/python.h>
 #include <assert.h>
+#include <torch/python.h>
 
 #if defined(__gfx942__)
 template <typename T>
-__global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
-    amdgpu_num_vgpr(72))) void kn_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(HkMlaDecodeFwdParams<T> params)
+__global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
+    __attribute__((amdgpu_num_vgpr(72))) void kn_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(
+        HkMlaDecodeFwdParams<T> params)
 {
     using q_t     = T::q_t;
     using kv_t    = T::kv_t;
@@ -74,14 +75,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
     // destinations. Each load_k_to_gpr writes one mfma A-tile; RT must
     // expose exactly one 2-vgpr range (function always writes range 0).
     // The full kv_0/kv_1 (4 vgprs each) are still consumed by mma_ABt.
-    using kv_0_top_ranges = hkdart::split_many_t<
-        hkdart::type_list<hkdart::range<k_kv_0_begin + 0, k_kv_0_begin + 1>>, 2>;
-    using kv_0_bot_ranges = hkdart::split_many_t<
-        hkdart::type_list<hkdart::range<k_kv_0_begin + 2, k_kv_0_begin + 3>>, 2>;
-    using kv_1_top_ranges = hkdart::split_many_t<
-        hkdart::type_list<hkdart::range<k_kv_1_begin + 0, k_kv_1_begin + 1>>, 2>;
-    using kv_1_bot_ranges = hkdart::split_many_t<
-        hkdart::type_list<hkdart::range<k_kv_1_begin + 2, k_kv_1_begin + 3>>, 2>;
+    using kv_0_top_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_kv_0_begin + 0, k_kv_0_begin + 1>>,
+                             2>;
+    using kv_0_bot_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_kv_0_begin + 2, k_kv_0_begin + 3>>,
+                             2>;
+    using kv_1_top_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_kv_1_begin + 0, k_kv_1_begin + 1>>,
+                             2>;
+    using kv_1_bot_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_kv_1_begin + 2, k_kv_1_begin + 3>>,
+                             2>;
     using p_comp_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin, k_p_comp_end>>,
                              4>; // 8 vgprs
@@ -117,8 +122,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
     hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
 
     // Runtime constants
-    const uint32_t warp_idx           = __builtin_amdgcn_readfirstlane(threadIdx.x / opus::get_warp_size());
-    const uint32_t lane_idx           = opus::lane_id();
+    const uint32_t warp_idx = __builtin_amdgcn_readfirstlane(threadIdx.x / opus::get_warp_size());
+    const uint32_t lane_idx = opus::lane_id();
     const uint32_t kv_ld_row_base_idx = kv_manager.get_kv_ld_row_base_idx(warp_idx);
     const uint32_t kv_ld_col_base     = kv_manager.get_kv_ld_col_base(warp_idx);
 
@@ -126,10 +131,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
     // num_wave_group = qseqlen = kBlockM / num_qheads
     // waves_per_head = num_qheads / kTileM
     // causal_offset = num_wave_group - 1 - (warp_idx / waves_per_head)
-    const int32_t log2_num_qheads = __builtin_amdgcn_readfirstlane(params.log2_num_qheads);
-    const int32_t num_qheads      = 1 << log2_num_qheads;
-    const int32_t num_wave_group  = T::kBlockM >> log2_num_qheads; // qseqlen
-    const int32_t log2_waves_per_head = log2_num_qheads - 4; // log2(kTileM) = 4
+    const int32_t log2_num_qheads     = __builtin_amdgcn_readfirstlane(params.log2_num_qheads);
+    const int32_t num_qheads          = 1 << log2_num_qheads;
+    const int32_t num_wave_group      = T::kBlockM >> log2_num_qheads; // qseqlen
+    const int32_t log2_waves_per_head = log2_num_qheads - 4;           // log2(kTileM) = 4
     const int32_t qpos_off_from_last  = num_wave_group - 1 - (warp_idx >> log2_waves_per_head);
 
     const uintptr_t out_as_int       = reinterpret_cast<uintptr_t>(params.final_output.raw_ptr);
@@ -195,8 +200,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
         {
             const int32_t batch_idx = __builtin_amdgcn_readfirstlane(
                 params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 0]);
-            const int32_t last_page_len = __builtin_amdgcn_readfirstlane(
-                params.p_kv_last_page_lens[batch_idx]);
+            const int32_t last_page_len =
+                __builtin_amdgcn_readfirstlane(params.p_kv_last_page_lens[batch_idx]);
             kv_end = (kv_end_page - 1) * T::kPageSize + last_page_len;
         }
         // Per-warp causal offset: warp at qpos i must clamp kv_end to its
@@ -204,9 +209,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
         // chunk, qpos i sees up to (kv_end + kv_offset - (Q - 1 - i)) =
         // kv_end - max(0, qpos_off_from_last - kv_offset).
         const int32_t causal_offset = opus::max(qpos_off_from_last - kv_offset, 0);
-        const int32_t kv_end_eff = kv_end - causal_offset;
-        const int32_t kv_len = kv_end - kv_start;
-        const int32_t kv_len_eff = kv_end_eff - kv_start;
+        const int32_t kv_end_eff    = kv_end - causal_offset;
+        const int32_t kv_len        = kv_end - kv_start;
+        const int32_t kv_len_eff    = kv_end_eff - kv_start;
 
         comp_t row_max;
         comp_t row_sum_e;
@@ -214,8 +219,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
         int32_t row_kv_ld;
         if(kv_len < T::kBlockN)
         {
-            row_kv_ld =
-                get_kv_ld_row<true, T::kPageSize>(params.p_kv_indices, kv_ld_row_base_idx, kv_start, kv_end);
+            row_kv_ld = get_kv_ld_row<true, T::kPageSize>(
+                params.p_kv_indices, kv_ld_row_base_idx, kv_start, kv_end);
         }
         else
         {
@@ -243,9 +248,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
         if(kv_len >= 2 * T::kBlockN)
         {
             row_kv_ld_next_next = get_kv_ld_row<false, T::kPageSize>(params.p_kv_indices,
-                                                       kv_ld_row_base_idx,
-                                                       kv_start + T::kBlockN,
-                                                       kv_start + 2 * T::kBlockN);
+                                                                     kv_ld_row_base_idx,
+                                                                     kv_start + T::kBlockN,
+                                                                     kv_start + 2 * T::kBlockN);
         }
         else if(kv_len > T::kBlockN)
         {
@@ -263,7 +268,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                             bool kSkipCompute,
                             PvGemmEpilogueType kEpilogueType,
                             bool kCheckBoundaryNext>(const int32_t kv_tile_start,
-                                                    const int32_t kv_tile_end) {
+                                                     const int32_t kv_tile_end) {
             constexpr bool kDoEpilogue = (kEpilogueType != PvGemmEpilogueType::None);
             // A warp only stops loading K / swapping LDS pong on the global last
             // tile. In the new design, "global last" coincides with either the
@@ -296,11 +301,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             {
                 opus::static_for<num_nope_iter>([&](auto idx) {
                     constexpr uint32_t reg_start = idx.value * 4 + k_q_nope_begin;
-                    using q_range_0 =
-                        hkdart::split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>,
-                                            2>;
-                    using q_range_1 = hkdart::
-                        split_many_t<hkdart::type_list<hkdart::range<reg_start + 2, reg_start + 3>>, 2>;
+                    using q_range_0              = hkdart::
+                        split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>, 2>;
+                    using q_range_1 = hkdart::split_many_t<
+                        hkdart::type_list<hkdart::range<reg_start + 2, reg_start + 3>>,
+                        2>;
                     hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
                     hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
 
@@ -315,10 +320,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     kv_manager.template load_k_to_gpr<16, (tile_idx + 1) * T::kBlockK>(
                         kv_1_bot, p_lds_kv_curr);
 
-                    kv_manager.template async_load_k_tile<0, (idx.value + 1) * 64,
-                                                        kIsGlobalLast,
-                                                        kCheckBoundaryNext>(
-                        p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+                    kv_manager.template async_load_k_tile<0,
+                                                          (idx.value + 1) * 64,
+                                                          kIsGlobalLast,
+                                                          kCheckBoundaryNext>(p_lds_kv_next_warp,
+                                                                              warp_idx,
+                                                                              params.kv_buffer,
+                                                                              row_kv_ld_next,
+                                                                              kv_ld_col_base);
 
                     asm volatile("s_waitcnt lgkmcnt(2)");
                     if constexpr(idx.value == 0)
@@ -341,11 +350,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             {
                 opus::static_for<num_rope_iter>([&](auto idx) {
                     constexpr uint32_t reg_start = idx.value * 4 + k_q_rope_begin;
-                    using q_range_0 =
-                        hkdart::split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>,
-                                            2>;
-                    using q_range_1 = hkdart::
-                        split_many_t<hkdart::type_list<hkdart::range<reg_start + 2, reg_start + 3>>, 2>;
+                    using q_range_0              = hkdart::
+                        split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>, 2>;
+                    using q_range_1 = hkdart::split_many_t<
+                        hkdart::type_list<hkdart::range<reg_start + 2, reg_start + 3>>,
+                        2>;
                     hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
                     hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
 
@@ -381,17 +390,19 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 {
                     if((kv_tile_start + 3 * T::kBlockN) <= kv_end)
                     {
-                        row_kv_ld_next_next = get_kv_ld_row<false, T::kPageSize>(params.p_kv_indices,
-                                                                   kv_ld_row_base_idx,
-                                                                   kv_tile_start + 2 * T::kBlockN,
-                                                                   kv_tile_end + 2 * T::kBlockN);
+                        row_kv_ld_next_next =
+                            get_kv_ld_row<false, T::kPageSize>(params.p_kv_indices,
+                                                               kv_ld_row_base_idx,
+                                                               kv_tile_start + 2 * T::kBlockN,
+                                                               kv_tile_end + 2 * T::kBlockN);
                     }
                     else
                     {
-                        row_kv_ld_next_next = get_kv_ld_row<true, T::kPageSize>(params.p_kv_indices,
-                                                                  kv_ld_row_base_idx,
-                                                                  kv_tile_start + 2 * T::kBlockN,
-                                                                  kv_end);
+                        row_kv_ld_next_next =
+                            get_kv_ld_row<true, T::kPageSize>(params.p_kv_indices,
+                                                              kv_ld_row_base_idx,
+                                                              kv_tile_start + 2 * T::kBlockN,
+                                                              kv_end);
                     }
                 }
             }
@@ -438,8 +449,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
             if constexpr(kSkipCompute == false)
             {
-                const comp_t new_row_max =
-                    kIsFirstIter ? local_max : opus::max(local_max, row_max);
+                const comp_t new_row_max = kIsFirstIter ? local_max : opus::max(local_max, row_max);
                 rescale =
                     kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((row_max - new_row_max) * log2e);
                 row_max = new_row_max;
@@ -576,10 +586,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     else
                     {
                         split_o_manager.template output_to_vram<oaccu_base, col_offset>(
-                            params.split_output.raw_ptr, warp_idx, partial_qo_loc, p_lds_o, num_qheads);
+                            params.split_output.raw_ptr,
+                            warp_idx,
+                            partial_qo_loc,
+                            p_lds_o,
+                            num_qheads);
                         split_o_manager
                             .template output_to_vram<oaccu_base + 8, col_offset + T::kBlockK>(
-                                params.split_output.raw_ptr, warp_idx, partial_qo_loc, p_lds_o, num_qheads);
+                                params.split_output.raw_ptr,
+                                warp_idx,
+                                partial_qo_loc,
+                                p_lds_o,
+                                num_qheads);
                     }
                 }
             });
@@ -621,9 +639,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
         {
             // Warp fully idle. kv_len <= causal_offset < kBlockN, so num_iters == 1.
             // One skip iter on the global last tile, no epilogue (no oaccu state).
-            mla_main.template
-            operator()<false, true, PvGemmEpilogueType::None, false>(
-                kv_start, kv_end);
+            mla_main.template operator()<false, true, PvGemmEpilogueType::None, false>(kv_start,
+                                                                                       kv_end);
         }
         else if(kv_len_eff < T::kBlockN)
         {
@@ -633,15 +650,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 // num_iters == 1: single real iter, also the epilogue iter.
                 if(partial_qo_loc < 0)
                 {
-                    mla_main.template
-                    operator()<true, false, PvGemmEpilogueType::OutputFinal, false>(
-                        kv_start, kv_end);
+                    mla_main
+                        .template operator()<true, false, PvGemmEpilogueType::OutputFinal, false>(
+                            kv_start, kv_end);
                 }
                 else
                 {
-                    mla_main.template
-                    operator()<true, false, PvGemmEpilogueType::OutputSplit, false>(
-                        kv_start, kv_end);
+                    mla_main
+                        .template operator()<true, false, PvGemmEpilogueType::OutputSplit, false>(
+                            kv_start, kv_end);
                 }
             }
             else
@@ -649,20 +666,19 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 // num_iters == 2: real (partial) iter on tile 0, then skip+epilogue
                 // on tile 1. Tile 1 is global last and partial since
                 // kv_len in [kBlockN, kBlockN + qseqlen - 1].
-                mla_main.template
-                operator()<true, false, PvGemmEpilogueType::None, true>(
+                mla_main.template operator()<true, false, PvGemmEpilogueType::None, true>(
                     kv_start, kv_start + T::kBlockN);
                 if(partial_qo_loc < 0)
                 {
-                    mla_main.template
-                    operator()<false, true, PvGemmEpilogueType::OutputFinal, false>(
-                        kv_start + T::kBlockN, kv_end);
+                    mla_main
+                        .template operator()<false, true, PvGemmEpilogueType::OutputFinal, false>(
+                            kv_start + T::kBlockN, kv_end);
                 }
                 else
                 {
-                    mla_main.template
-                    operator()<false, true, PvGemmEpilogueType::OutputSplit, false>(
-                        kv_start + T::kBlockN, kv_end);
+                    mla_main
+                        .template operator()<false, true, PvGemmEpilogueType::OutputSplit, false>(
+                            kv_start + T::kBlockN, kv_end);
                 }
             }
         }
@@ -674,15 +690,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 // num_iters == 1: single real iter, also the epilogue iter.
                 if(partial_qo_loc < 0)
                 {
-                    mla_main.template
-                    operator()<true, false, PvGemmEpilogueType::OutputFinal, false>(
-                        kv_start, kv_end);
+                    mla_main
+                        .template operator()<true, false, PvGemmEpilogueType::OutputFinal, false>(
+                            kv_start, kv_end);
                 }
                 else
                 {
-                    mla_main.template
-                    operator()<true, false, PvGemmEpilogueType::OutputSplit, false>(
-                        kv_start, kv_end);
+                    mla_main
+                        .template operator()<true, false, PvGemmEpilogueType::OutputSplit, false>(
+                            kv_start, kv_end);
                 }
             }
             else
@@ -692,27 +708,25 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 const bool boundary_next = (kv_len % T::kBlockN) != 0;
                 if(boundary_next)
                 {
-                    mla_main.template
-                    operator()<true, false, PvGemmEpilogueType::None, true>(
+                    mla_main.template operator()<true, false, PvGemmEpilogueType::None, true>(
                         kv_start, kv_start + T::kBlockN);
                 }
                 else
                 {
-                    mla_main.template
-                    operator()<true, false, PvGemmEpilogueType::None, false>(
+                    mla_main.template operator()<true, false, PvGemmEpilogueType::None, false>(
                         kv_start, kv_start + T::kBlockN);
                 }
                 if(partial_qo_loc < 0)
                 {
-                    mla_main.template
-                    operator()<false, true, PvGemmEpilogueType::OutputFinal, false>(
-                        kv_start + T::kBlockN, kv_end);
+                    mla_main
+                        .template operator()<false, true, PvGemmEpilogueType::OutputFinal, false>(
+                            kv_start + T::kBlockN, kv_end);
                 }
                 else
                 {
-                    mla_main.template
-                    operator()<false, true, PvGemmEpilogueType::OutputSplit, false>(
-                        kv_start + T::kBlockN, kv_end);
+                    mla_main
+                        .template operator()<false, true, PvGemmEpilogueType::OutputSplit, false>(
+                            kv_start + T::kBlockN, kv_end);
                 }
             }
         }
@@ -724,14 +738,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             // the tile being prefetched (tile 1) is the global last AND partial.
             if((kv_1st_end + T::kBlockN - 1) < kv_end)
             {
-                mla_main.template
-                operator()<true, false, PvGemmEpilogueType::None, false>(
+                mla_main.template operator()<true, false, PvGemmEpilogueType::None, false>(
                     kv_start, kv_1st_end);
             }
             else
             {
-                mla_main.template
-                operator()<true, false, PvGemmEpilogueType::None, true>(
+                mla_main.template operator()<true, false, PvGemmEpilogueType::None, true>(
                     kv_start, kv_1st_end);
             }
 
@@ -741,14 +753,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             {
                 if((kv_idx + 2 * T::kBlockN - 1) < kv_end)
                 {
-                    mla_main.template
-                    operator()<false, false, PvGemmEpilogueType::None, false>(
+                    mla_main.template operator()<false, false, PvGemmEpilogueType::None, false>(
                         kv_idx, kv_idx + T::kBlockN);
                 }
                 else
                 {
-                    mla_main.template
-                    operator()<false, false, PvGemmEpilogueType::None, true>(
+                    mla_main.template operator()<false, false, PvGemmEpilogueType::None, true>(
                         kv_idx, kv_idx + T::kBlockN);
                 }
                 kv_idx += T::kBlockN;
@@ -763,15 +773,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 // Warp's last real == global last -> real iter with epilogue.
                 if(partial_qo_loc < 0)
                 {
-                    mla_main.template
-                    operator()<false, false, PvGemmEpilogueType::OutputFinal, false>(
-                        kv_idx, kv_end);
+                    mla_main
+                        .template operator()<false, false, PvGemmEpilogueType::OutputFinal, false>(
+                            kv_idx, kv_end);
                 }
                 else
                 {
-                    mla_main.template
-                    operator()<false, false, PvGemmEpilogueType::OutputSplit, false>(
-                        kv_idx, kv_end);
+                    mla_main
+                        .template operator()<false, false, PvGemmEpilogueType::OutputSplit, false>(
+                            kv_idx, kv_end);
                 }
             }
             else
@@ -782,37 +792,36 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 const bool boundary_next = (kv_len % T::kBlockN) != 0;
                 if(boundary_next)
                 {
-                    mla_main.template
-                    operator()<false, false, PvGemmEpilogueType::None, true>(
+                    mla_main.template operator()<false, false, PvGemmEpilogueType::None, true>(
                         kv_idx, kv_idx + T::kBlockN);
                 }
                 else
                 {
-                    mla_main.template
-                    operator()<false, false, PvGemmEpilogueType::None, false>(
+                    mla_main.template operator()<false, false, PvGemmEpilogueType::None, false>(
                         kv_idx, kv_idx + T::kBlockN);
                 }
                 // Skip + epilogue on the global last tile.
                 if(partial_qo_loc < 0)
                 {
-                    mla_main.template
-                    operator()<false, true, PvGemmEpilogueType::OutputFinal, false>(
-                        kv_idx + T::kBlockN, kv_end);
+                    mla_main
+                        .template operator()<false, true, PvGemmEpilogueType::OutputFinal, false>(
+                            kv_idx + T::kBlockN, kv_end);
                 }
                 else
                 {
-                    mla_main.template
-                    operator()<false, true, PvGemmEpilogueType::OutputSplit, false>(
-                        kv_idx + T::kBlockN, kv_end);
+                    mla_main
+                        .template operator()<false, true, PvGemmEpilogueType::OutputSplit, false>(
+                            kv_idx + T::kBlockN, kv_end);
                 }
             }
         }
     }
 }
-#else  // !__gfx942__ -> stub so symbol exists in host pass / other-arch device pass
+#else // !__gfx942__ -> stub so symbol exists in host pass / other-arch device pass
 template <typename T>
-__global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
-void kn_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(HkMlaDecodeFwdParams<T> params)
+__global__ __launch_bounds__(
+    T::kNumThreads,
+    T::kOccupancy) void kn_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(HkMlaDecodeFwdParams<T> params)
 {
     assert(false);
 }
@@ -835,10 +844,17 @@ void mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
 {
     const int32_t num_qheads = query.size(1);
     TORCH_CHECK((num_qheads & (num_qheads - 1)) == 0 && num_qheads >= 16 && num_qheads <= 128,
-                "num_qheads must be a power of 2 in [16, 128], got ", num_qheads);
+                "num_qheads must be a power of 2 in [16, 128], got ",
+                num_qheads);
     TORCH_CHECK(num_qheads * max_seqlen_q == Traits::kBlockM,
-                "num_qheads * max_seqlen_q must equal ", Traits::kBlockM,
-                ", got ", num_qheads, " * ", max_seqlen_q, " = ", num_qheads * max_seqlen_q);
+                "num_qheads * max_seqlen_q must equal ",
+                Traits::kBlockM,
+                ", got ",
+                num_qheads,
+                " * ",
+                max_seqlen_q,
+                " = ",
+                num_qheads * max_seqlen_q);
     const int32_t log2_num_qheads = __builtin_ctz(num_qheads);
 
     hipDevice_t dev;
@@ -922,29 +938,30 @@ void hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
     {
         const int32_t page_size = kv_buffer.size(1);
 
-#define DISPATCH_PAGE_SIZE(PS)                                                                  \
-    case PS:                                                                                    \
-    {                                                                                           \
-        using Traits = HkMlaDecodeFwdTraits<hk::fp8e4m3, hk::fp8e4m3, hk::bf16,                 \
-                                            /*kBlockN_=*/32,                                    \
-                                            /*kNumWarps_=*/8,                                   \
-                                            /*kOccupancy_=*/1,                                  \
-                                            /*kBlockM_=*/128,                                   \
-                                            /*kPageSize_=*/PS>;                                 \
-        mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8<Traits>(query,                                   \
-                                                       kv_buffer,                               \
-                                                       qo_indptr,                               \
-                                                       kv_indptr,                               \
-                                                       kv_page_indices,                         \
-                                                       kv_last_page_lens,                       \
-                                                       work_indptr,                             \
-                                                       work_info_set,                           \
-                                                       max_seqlen_q,                            \
-                                                       softmax_scale,                           \
-                                                       split_output,                            \
-                                                       split_lse,                               \
-                                                       final_output);                           \
-        break;                                                                                  \
+#define DISPATCH_PAGE_SIZE(PS)                                            \
+    case PS: {                                                            \
+        using Traits = HkMlaDecodeFwdTraits<hk::fp8e4m3,                  \
+                                            hk::fp8e4m3,                  \
+                                            hk::bf16,                     \
+                                            /*kBlockN_=*/32,              \
+                                            /*kNumWarps_=*/8,             \
+                                            /*kOccupancy_=*/1,            \
+                                            /*kBlockM_=*/128,             \
+                                            /*kPageSize_=*/PS>;           \
+        mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8<Traits>(query,             \
+                                                       kv_buffer,         \
+                                                       qo_indptr,         \
+                                                       kv_indptr,         \
+                                                       kv_page_indices,   \
+                                                       kv_last_page_lens, \
+                                                       work_indptr,       \
+                                                       work_info_set,     \
+                                                       max_seqlen_q,      \
+                                                       softmax_scale,     \
+                                                       split_output,      \
+                                                       split_lse,         \
+                                                       final_output);     \
+        break;                                                            \
     }
 
         // Only page_size in {1, 64} are instantiated. 64 is the value used by
@@ -954,11 +971,11 @@ void hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
         {
             DISPATCH_PAGE_SIZE(1)
             DISPATCH_PAGE_SIZE(64)
-            default:
-                TORCH_CHECK(false,
-                            "hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8: unsupported page_size ",
-                            page_size,
-                            " (supported: 1, 64).");
+        default:
+            TORCH_CHECK(false,
+                        "hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8: unsupported page_size ",
+                        page_size,
+                        " (supported: 1, 64).");
         }
 
 #undef DISPATCH_PAGE_SIZE

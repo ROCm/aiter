@@ -178,25 +178,19 @@ softmax_scale_p_quad(const uint32_t col_start_idx, const uint32_t kv_end, const 
 
     if((kCheckBoundary == false) || (col_last_idx < kv_end))
     {
-        asm volatile("v_pk_mul_f32 v[%0:%1], %4, v[%0:%1]\n\t"
-                     "v_pk_mul_f32 v[%2:%3], %4, v[%2:%3]"
-                     :
-                     : "n"(GPR_4),
-                       "n"(GPR_4 + 1),
-                       "n"(GPR_4 + 2),
-                       "n"(GPR_4 + 3),
-                       "v"(softmax_scale_pk));
+        asm volatile(
+            "v_pk_mul_f32 v[%0:%1], %4, v[%0:%1]\n\t"
+            "v_pk_mul_f32 v[%2:%3], %4, v[%2:%3]"
+            :
+            : "n"(GPR_4), "n"(GPR_4 + 1), "n"(GPR_4 + 2), "n"(GPR_4 + 3), "v"(softmax_scale_pk));
     }
     else if(col_start_idx >= kv_end)
     {
-        asm volatile("v_pk_mov_b32 v[%0:%1], %4, %4 op_sel:[0, 0]\n\t"
-                     "v_pk_mov_b32 v[%2:%3], %4, %4 op_sel:[0, 0]"
-                     :
-                     : "n"(GPR_4),
-                       "n"(GPR_4 + 1),
-                       "n"(GPR_4 + 2),
-                       "n"(GPR_4 + 3),
-                       "v"(minus_inf_f32_pk));
+        asm volatile(
+            "v_pk_mov_b32 v[%0:%1], %4, %4 op_sel:[0, 0]\n\t"
+            "v_pk_mov_b32 v[%2:%3], %4, %4 op_sel:[0, 0]"
+            :
+            : "n"(GPR_4), "n"(GPR_4 + 1), "n"(GPR_4 + 2), "n"(GPR_4 + 3), "v"(minus_inf_f32_pk));
     }
     else if((col_start_idx + 2) < kv_end)
     {
@@ -241,9 +235,8 @@ softmax_scale_p_quad(const uint32_t col_start_idx, const uint32_t kv_end, const 
 }
 
 template <bool kCheckBoundary, uint32_t GPR>
-__device__ __forceinline__ void softmax_scale_p_16(const uint32_t col_0_start_idx,
-                                                   const uint32_t kv_end,
-                                                   const float softmax_scale)
+__device__ __forceinline__ void
+softmax_scale_p_16(const uint32_t col_0_start_idx, const uint32_t kv_end, const float softmax_scale)
 {
     constexpr uint32_t num_elem_per_tile = 4;
     const uint32_t col_1_start_idx       = col_0_start_idx + 16;

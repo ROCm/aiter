@@ -3,28 +3,27 @@
 
 #pragma once
 
-#include "opus/opus.hpp"
 #include "kittens.cuh"
-#include <hip/hip_runtime.h>
+#include "opus/opus.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <hip/hip_runtime.h>
 
 namespace hk     = kittens;
 namespace hkdart = hk::ducks::art;
 namespace hkm    = hk::macros;
 
 #ifndef HIP_CALL
-#define HIP_CALL(call)                                                          \
-    do                                                                          \
-    {                                                                           \
-        hipError_t err = (call);                                                \
-        if(err != hipSuccess)                                                   \
-        {                                                                       \
-            std::fprintf(stderr,                                                \
-                         "HIP error at %s:%d: %s\n",                            \
-                         __FILE__, __LINE__, hipGetErrorString(err));           \
-            std::abort();                                                       \
-        }                                                                       \
+#define HIP_CALL(call)                                                                           \
+    do                                                                                           \
+    {                                                                                            \
+        hipError_t err = (call);                                                                 \
+        if(err != hipSuccess)                                                                    \
+        {                                                                                        \
+            std::fprintf(                                                                        \
+                stderr, "HIP error at %s:%d: %s\n", __FILE__, __LINE__, hipGetErrorString(err)); \
+            std::abort();                                                                        \
+        }                                                                                        \
     } while(0)
 #endif
 
@@ -32,7 +31,9 @@ typedef uint32_t v2ui __attribute__((ext_vector_type(2)));
 typedef uint32_t v4ui __attribute__((ext_vector_type(4)));
 typedef uint32_t v8ui __attribute__((ext_vector_type(8)));
 
-template <typename q_t_, typename kv_t_, typename out_t_,
+template <typename q_t_,
+          typename kv_t_,
+          typename out_t_,
           int32_t kBlockN_,
           int32_t kNumWarps_,
           int32_t kOccupancy_,
@@ -49,18 +50,18 @@ struct HkMlaDecodeFwdTraits
     static constexpr int32_t kPageSize      = kPageSize_;
     static_assert(kPageSize >= 1 && (kPageSize & (kPageSize - 1)) == 0,
                   "kPageSize must be a positive power of 2.");
-    static constexpr int32_t kNumWarps      = kNumWarps_;
-    static constexpr int32_t kNumThreads    = kNumWarps * opus::get_warp_size();
-    static constexpr int32_t kOccupancy     = kOccupancy_;
-    static constexpr int32_t kBlockM        = kBlockM_; // Block=ThreadBlock
-    static constexpr int32_t kBlockN        = kBlockN_;
-    static constexpr int32_t kBlockK        = 32;
-    static constexpr int32_t kTileM         = kBlockM / kNumWarps; // Tile=ThreadWarp
-    static constexpr int32_t kNumTilesM     = kBlockM / kTileM;
+    static constexpr int32_t kNumWarps   = kNumWarps_;
+    static constexpr int32_t kNumThreads = kNumWarps * opus::get_warp_size();
+    static constexpr int32_t kOccupancy  = kOccupancy_;
+    static constexpr int32_t kBlockM     = kBlockM_; // Block=ThreadBlock
+    static constexpr int32_t kBlockN     = kBlockN_;
+    static constexpr int32_t kBlockK     = 32;
+    static constexpr int32_t kTileM      = kBlockM / kNumWarps; // Tile=ThreadWarp
+    static constexpr int32_t kNumTilesM  = kBlockM / kTileM;
     static_assert(kTileM == 16, "kTileM must be 16 (kBlockM / kNumWarps).");
-    static constexpr int32_t kRoundMode     = 1; // 0: round to nearest even.
-                                                 // 1: round to nearest away.
-                                                 // 2: round to zero
+    static constexpr int32_t kRoundMode = 1; // 0: round to nearest even.
+                                             // 1: round to nearest away.
+                                             // 2: round to zero
 
     // base types
     using q_t   = q_t_;
@@ -72,9 +73,11 @@ struct HkMlaDecodeFwdTraits
     using gl_q = hk::gl<q_t, -1, -1, kTileM, kQkHeadDim>;
     using gl_kv =
         hk::gl<kv_t, -1, kPageSize, kKvNumHead, kQkHeadDim>; // [#page, page_size, #head_kv, 576]
-    using gl_o    = hk::gl<out_t, 1, -1, kBlockM, kVoHeadDim>; // [1, #batch*#seqlen, #nhead*#qseqlen, 512]
-    using gl_so   = hk::gl<float, 1, -1, kBlockM, kVoHeadDim>; // [1, #partial_slots, #nhead*#qseqlen, 512]
-    using gl_slse = hk::gl<float, 1, -1, kBlockM, 1>;          // [1, #partial_slots, #nhead*#qseqlen, 1]
+    using gl_o =
+        hk::gl<out_t, 1, -1, kBlockM, kVoHeadDim>; // [1, #batch*#seqlen, #nhead*#qseqlen, 512]
+    using gl_so =
+        hk::gl<float, 1, -1, kBlockM, kVoHeadDim>;    // [1, #partial_slots, #nhead*#qseqlen, 512]
+    using gl_slse = hk::gl<float, 1, -1, kBlockM, 1>; // [1, #partial_slots, #nhead*#qseqlen, 1]
     // lds tiles
     static_assert(std::is_same_v<kv_t, hk::bf16> || std::is_same_v<kv_t, hk::fp8e4m3>);
     using st_kv_nope = std::conditional_t<std::is_same_v<kv_t, hk::fp8e4m3>,
@@ -172,8 +175,7 @@ __device__ __forceinline__ comp_t max_16()
                  "v_max3_f32 %1, %1, %2, %5\n\t"
                  "v_max3_f32 %2, %3, %4, %6\n\t"
                  "v_max_f32_e32 %0, %1, %2"
-                 : "=v"(result),
-                   "=v"(t0), "=v"(t1), "=v"(t2), "=v"(t3), "=v"(t4), "=v"(t5)
+                 : "=v"(result), "=v"(t0), "=v"(t1), "=v"(t2), "=v"(t3), "=v"(t4), "=v"(t5)
                  : "n"(GPR_START),
                    "n"(GPR_START + 1),
                    "n"(GPR_START + 2),
