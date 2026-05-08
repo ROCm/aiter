@@ -819,7 +819,7 @@ def chunk_fwd_o_opt(
         for num_warps in NUM_WARPS
         for num_stages in [2, 3, 4]
     ],
-    key=["H", "K", "V", "BT"],
+    key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "T_flat"])
