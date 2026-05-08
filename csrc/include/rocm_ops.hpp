@@ -124,7 +124,8 @@ namespace py = pybind11;
           py::arg("scale"),                \
           py::arg("scale_k"),              \
           py::arg("scale_v"),              \
-          py::arg("scale_out"));
+          py::arg("scale_out"),            \
+          py::arg("cache_ptr_int32_overflow_possible") = false);
 
 #define ATTENTION_PYBIND                                          \
     m.def("paged_attention_rocm",                                 \

@@ -16,4 +16,5 @@ void unified_attention_fwd(
     float scale,
     float scale_k,
     float scale_v,
-    float scale_out);
+    float scale_out,
+    bool cache_ptr_int32_overflow_possible = false);

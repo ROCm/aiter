@@ -20,7 +20,8 @@ void unified_attention_fwd(
     float scale,
     float scale_k,
     float scale_v,
-    float scale_out)
+    float scale_out,
+    bool cache_ptr_int32_overflow_possible)
 {
     auto dtype = query.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
@@ -93,6 +94,8 @@ void unified_attention_fwd(
     // Otherwise: use num_tokens as conservative upper bound (forces medium tier
     // which handles any seqlen_q correctly via 1D grid with Q tile iteration).
     args.max_seqlen_q = (num_tokens == num_seqs) ? 1 : num_tokens;
+
+    args.cache_ptr_int32_overflow_possible = cache_ptr_int32_overflow_possible;
 
     auto [launched, elapsed] = ck_tile::unified_attention(args, {stream});
     TORCH_CHECK(launched,

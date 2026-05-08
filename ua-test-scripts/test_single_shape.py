@@ -44,6 +44,8 @@ def parse_args():
     # Optional parameters
     p.add_argument("--block-size", type=int, default=32,
                    help="KV cache block size (default: 32)")
+    p.add_argument("--num-blocks", type=int, default=None,
+                   help="Total number of KV cache blocks (default: auto)")
     p.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16",
                    help="Data type (default: bf16)")
     p.add_argument("--causal", action="store_true", default=True,
@@ -100,7 +102,10 @@ def make_tensors(args, device="cuda"):
 
     total_q = b * sq
     max_blocks_per_seq = (sk + blk - 1) // blk
-    num_blocks = max(1024, 2 * max_blocks_per_seq)
+    if args.num_blocks is not None:
+        num_blocks = args.num_blocks
+    else:
+        num_blocks = max(1024, 2 * max_blocks_per_seq)
 
     scale = 1.0 / math.sqrt(d)
 
@@ -115,6 +120,10 @@ def make_tensors(args, device="cuda"):
     block_table = torch.randint(0, num_blocks, (b, max_blocks_per_seq),
                                 dtype=torch.int32, device=device)
 
+    # for 10 first samples add the num blocks as the first value in the row, in order to test possible overflow if the
+    # kv cache size is larger than the int32 max.
+    block_table[:10, 0] = num_blocks - 1
+    
     return {
         'q': q, 'k': k, 'v': v,
         'cu_seqlens_q': cu_seqlens_q,
@@ -130,6 +139,24 @@ def run_ck(out, tensors, args):
     """Run CK unified attention."""
     from aiter.ops.unified_attention import unified_attention_fwd
 
+    # Calculate if int32 overflow is possible
+    # Overflow occurs when: block_idx * stride_k_cache_0 > INT32_MAX
+    # where stride_k_cache_0 = block_size * num_kv_heads * head_size
+    num_blocks = tensors['k'].shape[0]
+    block_size = tensors['k'].shape[1]
+    num_kv_heads = tensors['k'].shape[2]
+    head_size = tensors['k'].shape[3]
+
+    stride_k_cache_0 = block_size * num_kv_heads * head_size
+    INT32_MAX = 2**31 - 1
+
+    # Maximum addressable cache size with int32 indexing
+    max_cache_size = INT32_MAX
+    # Actual cache size required for largest block index
+    cache_size = num_blocks * stride_k_cache_0
+
+    cache_ptr_int32_overflow_possible = cache_size > max_cache_size
+
     unified_attention_fwd(
         out,
         tensors['q'],
@@ -144,13 +171,15 @@ def run_ck(out, tensors, args):
         scale_k=1.0,
         scale_v=1.0,
         scale_out=1.0,
+        cache_ptr_int32_overflow_possible=cache_ptr_int32_overflow_possible,
     )
 
 
 def run_triton(out, tensors, args):
     """Run Triton unified attention."""
     from aiter.ops.triton.attention import unified_attention as ua_mod
-
+    # modify the ua_mods use_2d_kernel to return True no matter what the input is
+    ua_mod.use_2d_kernel = lambda *args, **kwargs: True
     window = (args.window_left, args.window_right)
 
     ua_mod.unified_attention(
@@ -175,6 +204,8 @@ def run_triton(out, tensors, args):
         qq_bias=None,
         sinks=None,
     )
+
+    
 
 
 def compute_flops_and_bandwidth(args):

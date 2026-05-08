@@ -22,6 +22,7 @@ def gen_unified_attention_fwd_fake(
     scale_k: float,
     scale_v: float,
     scale_out: float,
+    cache_ptr_int32_overflow_possible: bool = False,
 ) -> None:
     return None
 
@@ -41,4 +42,5 @@ def unified_attention_fwd(
     scale_k: float,
     scale_v: float,
     scale_out: float,
+    cache_ptr_int32_overflow_possible: bool = False,  # true = large cache with overflow checks
 ) -> None: ...
