@@ -84,27 +84,46 @@ KV_SCALE = 0.1  # round-trip-friendly: maps fp8 range to bf16 range
 # -- Model configs for sweep --
 # Configs confirmed supported (no fallback) in ATOM production.
 ALL_MODELS = [
-    ("Llama-8B-TP1",   32,  8, 128),
-    ("Llama-8B-TP8",    4,  1, 128),
-    ("Llama-70B-TP1",  64,  8, 128),
-    ("Llama-70B-TP8",   8,  1, 128),
+    ("Llama-8B-TP1", 32, 8, 128),
+    ("Llama-8B-TP8", 4, 1, 128),
+    ("Llama-70B-TP1", 64, 8, 128),
+    ("Llama-70B-TP8", 8, 1, 128),
     ("Llama-405B-TP1", 128, 8, 128),
-    ("Llama-405B-TP8",  16, 1, 128),
-    ("Qwen3-72B-TP1",  64,  4, 128),
-    ("Qwen3-72B-TP8",   8,  1, 128),
-    ("GPT-OSS-TP1",    64,  8,  64),
-    ("GPT-OSS-TP8",     8,  1,  64),
+    ("Llama-405B-TP8", 16, 1, 128),
+    ("Qwen3-72B-TP1", 64, 4, 128),
+    ("Qwen3-72B-TP8", 8, 1, 128),
+    ("GPT-OSS-TP1", 64, 8, 64),
+    ("GPT-OSS-TP8", 8, 1, 64),
 ]
 
 # -- Kernel cache for Category A (direct kernel) --
 _kernel_cache = {}
 
 
-def _get_kernel(D, QH, KH, block_size, flash_layout, dtype_str,
-                apply_scale=False, reuse_freqs_front_part=True, pos_dtype="i32",
-                x_size=16):
-    key = (D, QH, KH, block_size, flash_layout, dtype_str,
-           apply_scale, reuse_freqs_front_part, pos_dtype, x_size)
+def _get_kernel(
+    D,
+    QH,
+    KH,
+    block_size,
+    flash_layout,
+    dtype_str,
+    apply_scale=False,
+    reuse_freqs_front_part=True,
+    pos_dtype="i32",
+    x_size=16,
+):
+    key = (
+        D,
+        QH,
+        KH,
+        block_size,
+        flash_layout,
+        dtype_str,
+        apply_scale,
+        reuse_freqs_front_part,
+        pos_dtype,
+        x_size,
+    )
     if key not in _kernel_cache:
         _kernel_cache[key] = build_fused_rope_cache_module(
             head_dim=D,
@@ -277,8 +296,9 @@ def run_test(
         sin_2d = sin.squeeze(1).squeeze(1) if sin.ndim == 4 else sin
 
         dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
-        launch_fn = _get_kernel(D, QH, KH, block_size, flash_layout, dtype_str,
-                                x_size=x_size)
+        launch_fn = _get_kernel(
+            D, QH, KH, block_size, flash_layout, dtype_str, x_size=x_size
+        )
         _dummy_scale = torch.ones(1, dtype=torch.float32, device=DEVICE)
         launch_fn(
             q,
@@ -339,48 +359,83 @@ def run_test(
 # ---------------------------------------------------------------------------
 # Category C: fp8 KV cache helper
 # ---------------------------------------------------------------------------
-def _make_fp8_caches(num_tokens, num_kv_heads, head_dim, num_blocks, block_size,
-                     flash_layout):
+def _make_fp8_caches(
+    num_tokens, num_kv_heads, head_dim, num_blocks, block_size, flash_layout
+):
     x_size = 16  # fp8: 16 elements per x-group = 16 bytes
     if flash_layout:
         key_cache = torch.zeros(
-            num_blocks, block_size, num_kv_heads, head_dim,
-            device=DEVICE, dtype=FP8_DTYPE,
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_dim,
+            device=DEVICE,
+            dtype=FP8_DTYPE,
         )
         value_cache = torch.zeros(
-            num_blocks, block_size, num_kv_heads, head_dim,
-            device=DEVICE, dtype=FP8_DTYPE,
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_dim,
+            device=DEVICE,
+            dtype=FP8_DTYPE,
         )
     else:
         key_cache = torch.zeros(
-            num_blocks, num_kv_heads, head_dim // x_size, block_size, x_size,
-            device=DEVICE, dtype=FP8_DTYPE,
+            num_blocks,
+            num_kv_heads,
+            head_dim // x_size,
+            block_size,
+            x_size,
+            device=DEVICE,
+            dtype=FP8_DTYPE,
         )
         value_cache = torch.zeros(
-            num_blocks, num_kv_heads, head_dim, block_size,
-            device=DEVICE, dtype=FP8_DTYPE,
+            num_blocks,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            device=DEVICE,
+            dtype=FP8_DTYPE,
         )
     return key_cache, value_cache
 
 
-def run_fp8_test(num_tokens, head_dim=64, num_q_heads=8, num_kv_heads=1,
-                 block_size=BLOCK_SIZE, max_pos=MAX_POS, flash_layout=True,
-                 kv_scale=KV_SCALE):
+def run_fp8_test(
+    num_tokens,
+    head_dim=64,
+    num_q_heads=8,
+    num_kv_heads=1,
+    block_size=BLOCK_SIZE,
+    max_pos=MAX_POS,
+    flash_layout=True,
+    kv_scale=KV_SCALE,
+):
     """Run FlyDSL fp8 rope kernel and compare against Triton.
 
     Returns: (ok, max_kc_err, max_vc_err, flydsl_us, triton_us)
     """
     layout_name = "flash" if flash_layout else "non-flash"
-    print(f"\n[fp8] M={num_tokens}, BS={block_size}, QH={num_q_heads}, "
-          f"KH={num_kv_heads}, D={head_dim}, layout={layout_name}, scale={kv_scale}")
+    print(
+        f"\n[fp8] M={num_tokens}, BS={block_size}, QH={num_q_heads}, "
+        f"KH={num_kv_heads}, D={head_dim}, layout={layout_name}, scale={kv_scale}"
+    )
 
     torch.manual_seed(42)
-    q = torch.randn(num_tokens, num_q_heads, head_dim, device=DEVICE, dtype=torch.bfloat16)
-    k = torch.randn(num_tokens, num_kv_heads, head_dim, device=DEVICE, dtype=torch.bfloat16)
-    v = torch.randn(num_tokens, num_kv_heads, head_dim, device=DEVICE, dtype=torch.bfloat16)
+    q = torch.randn(
+        num_tokens, num_q_heads, head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        num_tokens, num_kv_heads, head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    v = torch.randn(
+        num_tokens, num_kv_heads, head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
     cos_cache = torch.randn(max_pos, head_dim // 2, device=DEVICE, dtype=torch.bfloat16)
     sin_cache = torch.randn(max_pos, head_dim // 2, device=DEVICE, dtype=torch.bfloat16)
-    positions = torch.randint(0, max_pos, (num_tokens,), device=DEVICE, dtype=torch.int32)
+    positions = torch.randint(
+        0, max_pos, (num_tokens,), device=DEVICE, dtype=torch.int32
+    )
     slot_mapping = torch.arange(num_tokens, device=DEVICE, dtype=torch.int32)
 
     num_blocks = max(32, (num_tokens + block_size - 1) // block_size + 4)
@@ -388,26 +443,38 @@ def run_fp8_test(num_tokens, head_dim=64, num_q_heads=8, num_kv_heads=1,
     v_scale = torch.tensor(kv_scale, dtype=torch.float32, device=DEVICE)
 
     # FlyDSL run
-    kc_fly, vc_fly = _make_fp8_caches(num_tokens, num_kv_heads, head_dim, num_blocks,
-                                       block_size, flash_layout)
+    kc_fly, vc_fly = _make_fp8_caches(
+        num_tokens, num_kv_heads, head_dim, num_blocks, block_size, flash_layout
+    )
     q_fly = torch.empty_like(q)
     k_fly = torch.empty_like(k)
 
     q_fly_out, k_fly_out, _, _ = flydsl_fused_qk_rope_reshape_and_cache(
-        q, k, v, kc_fly, vc_fly,
-        slot_mapping, positions,
-        cos_cache, sin_cache,
-        k_scale, v_scale,
-        is_neox=True, flash_layout=flash_layout,
+        q,
+        k,
+        v,
+        kc_fly,
+        vc_fly,
+        slot_mapping,
+        positions,
+        cos_cache,
+        sin_cache,
+        k_scale,
+        v_scale,
+        is_neox=True,
+        flash_layout=flash_layout,
         apply_scale=True,
-        offs=None, q_out=q_fly, k_out=k_fly,
+        offs=None,
+        q_out=q_fly,
+        k_out=k_fly,
         output_zeros=False,
     )
     torch.cuda.synchronize()
 
     # Triton reference run
-    kc_tri, vc_tri = _make_fp8_caches(num_tokens, num_kv_heads, head_dim, num_blocks,
-                                       block_size, flash_layout)
+    kc_tri, vc_tri = _make_fp8_caches(
+        num_tokens, num_kv_heads, head_dim, num_blocks, block_size, flash_layout
+    )
     q_tri = torch.empty_like(q)
     k_tri = torch.empty_like(k)
     cos_4d = cos_cache.unsqueeze(1).unsqueeze(1)
@@ -416,13 +483,23 @@ def run_fp8_test(num_tokens, head_dim=64, num_q_heads=8, num_kv_heads=1,
     slots_i64 = slot_mapping.to(torch.int64)
 
     fused_qk_rope_reshape_and_cache(
-        q, k, v, kc_tri, vc_tri,
-        slots_i64, pos_i64,
-        cos_4d, sin_4d,
-        k_scale, v_scale,
-        is_neox=True, flash_layout=flash_layout,
+        q,
+        k,
+        v,
+        kc_tri,
+        vc_tri,
+        slots_i64,
+        pos_i64,
+        cos_4d,
+        sin_4d,
+        k_scale,
+        v_scale,
+        is_neox=True,
+        flash_layout=flash_layout,
         apply_scale=True,
-        offs=None, q_out=q_tri, k_out=k_tri,
+        offs=None,
+        q_out=q_tri,
+        k_out=k_tri,
         output_zeros=False,
     )
     torch.cuda.synchronize()
@@ -432,32 +509,65 @@ def run_fp8_test(num_tokens, head_dim=64, num_q_heads=8, num_kv_heads=1,
     kc_err = (kc_fly.float() - kc_tri.float()).abs().max().item()
     vc_err = (vc_fly.float() - vc_tri.float()).abs().max().item()
 
-    print(f"  vs Triton → q_err={q_err:.4f} k_err={k_err:.4f} "
-          f"kc_err={kc_err:.4f} vc_err={vc_err:.4f}")
+    print(
+        f"  vs Triton → q_err={q_err:.4f} k_err={k_err:.4f} "
+        f"kc_err={kc_err:.4f} vc_err={vc_err:.4f}"
+    )
 
     flydsl_us = triton_us = 0.0
     if os.environ.get("FLYDSL_BENCH", "0") == "1":
+
         def run_fly():
             flydsl_fused_qk_rope_reshape_and_cache(
-                q, k, v, kc_fly, vc_fly, slot_mapping, positions,
-                cos_cache, sin_cache, k_scale, v_scale,
-                is_neox=True, flash_layout=flash_layout, apply_scale=True,
-                offs=None, q_out=q_fly, k_out=k_fly, output_zeros=False,
+                q,
+                k,
+                v,
+                kc_fly,
+                vc_fly,
+                slot_mapping,
+                positions,
+                cos_cache,
+                sin_cache,
+                k_scale,
+                v_scale,
+                is_neox=True,
+                flash_layout=flash_layout,
+                apply_scale=True,
+                offs=None,
+                q_out=q_fly,
+                k_out=k_fly,
+                output_zeros=False,
             )
 
         def run_tri():
             fused_qk_rope_reshape_and_cache(
-                q, k, v, kc_tri, vc_tri, slots_i64, pos_i64,
-                cos_4d, sin_4d, k_scale, v_scale,
-                is_neox=True, flash_layout=flash_layout, apply_scale=True,
-                offs=None, q_out=q_tri, k_out=k_tri, output_zeros=False,
+                q,
+                k,
+                v,
+                kc_tri,
+                vc_tri,
+                slots_i64,
+                pos_i64,
+                cos_4d,
+                sin_4d,
+                k_scale,
+                v_scale,
+                is_neox=True,
+                flash_layout=flash_layout,
+                apply_scale=True,
+                offs=None,
+                q_out=q_tri,
+                k_out=k_tri,
+                output_zeros=False,
             )
 
         flydsl_us = _bench_gpu_us(run_fly)
         triton_us = _bench_gpu_us(run_tri)
         speedup = triton_us / flydsl_us if flydsl_us > 0 else 0
-        print(f"  FlyDSL: {flydsl_us:.1f} us  Triton: {triton_us:.1f} us  "
-              f"speedup: {speedup:.2f}x")
+        print(
+            f"  FlyDSL: {flydsl_us:.1f} us  Triton: {triton_us:.1f} us  "
+            f"speedup: {speedup:.2f}x"
+        )
 
     atol = kv_scale * 0.1 + 1e-3
     ok = q_err < 1e-2 and k_err < 1e-2 and kc_err < atol and vc_err < atol
@@ -470,22 +580,31 @@ def run_fp8_test(num_tokens, head_dim=64, num_q_heads=8, num_kv_heads=1,
 
 
 @pytest.mark.skipif(not HAS_FLYDSL, reason="FlyDSL not installed")
-@pytest.mark.parametrize("num_q_heads,num_kv_heads,head_dim", [
-    (32,  8, 128),   # Llama-8B TP1
-    (4,   1, 128),   # Llama-8B TP8
-    (64,  8, 128),   # Llama-70B TP1
-    (8,   1, 128),   # Llama-70B TP8
-    (128, 8, 128),   # Llama-405B TP1
-    (16,  1, 128),   # Llama-405B TP8
-    (64,  4, 128),   # Qwen3-72B TP1
-    (64,  8,  64),   # GPT-OSS TP1
-    (8,   1,  64),   # GPT-OSS TP8
-], ids=[
-    "Llama8B-TP1", "Llama8B-TP8",
-    "Llama70B-TP1", "Llama70B-TP8",
-    "Llama405B-TP1", "Llama405B-TP8",
-    "Qwen72B-TP1", "GPTOSS-TP1", "GPTOSS-TP8",
-])
+@pytest.mark.parametrize(
+    "num_q_heads,num_kv_heads,head_dim",
+    [
+        (32, 8, 128),  # Llama-8B TP1
+        (4, 1, 128),  # Llama-8B TP8
+        (64, 8, 128),  # Llama-70B TP1
+        (8, 1, 128),  # Llama-70B TP8
+        (128, 8, 128),  # Llama-405B TP1
+        (16, 1, 128),  # Llama-405B TP8
+        (64, 4, 128),  # Qwen3-72B TP1
+        (64, 8, 64),  # GPT-OSS TP1
+        (8, 1, 64),  # GPT-OSS TP8
+    ],
+    ids=[
+        "Llama8B-TP1",
+        "Llama8B-TP8",
+        "Llama70B-TP1",
+        "Llama70B-TP8",
+        "Llama405B-TP1",
+        "Llama405B-TP8",
+        "Qwen72B-TP1",
+        "GPTOSS-TP1",
+        "GPTOSS-TP8",
+    ],
+)
 def test_flydsl_kernel_direct(num_q_heads, num_kv_heads, head_dim):
     """Category A: Direct FlyDSL kernel — T=1 decode, flash, bf16, NEOX."""
     QH_per_KH = num_q_heads // num_kv_heads
@@ -653,7 +772,10 @@ def test_fp8_nonflash(num_tokens):
 def test_fp8_gpt_oss_tp8(flash_layout):
     """Category C: GPT-OSS 120B TP=8 exact config (QH=8, KH=1, D=64)."""
     ok, kc_err, vc_err, _, _ = run_fp8_test(
-        num_tokens=1, head_dim=64, num_q_heads=8, num_kv_heads=1,
+        num_tokens=1,
+        head_dim=64,
+        num_q_heads=8,
+        num_kv_heads=1,
         flash_layout=flash_layout,
     )
     assert ok, f"FAILED GPT-OSS TP8: kc={kc_err:.4f} vc={vc_err:.4f}"
@@ -796,7 +918,9 @@ def test_fulldim_cos_sin(T, QH, KH, D):
     k = torch.randn(T, KH, D, device=DEVICE, dtype=torch.bfloat16)
     v = torch.randn_like(k)
     num_blocks = max(32, (T + BLOCK_SIZE - 1) // BLOCK_SIZE + 4)
-    kc_fly = torch.zeros(num_blocks, BLOCK_SIZE, KH, D, device=DEVICE, dtype=torch.bfloat16)
+    kc_fly = torch.zeros(
+        num_blocks, BLOCK_SIZE, KH, D, device=DEVICE, dtype=torch.bfloat16
+    )
     vc_fly = torch.zeros_like(kc_fly)
     kc_tri = torch.zeros_like(kc_fly)
     vc_tri = torch.zeros_like(vc_fly)
@@ -807,14 +931,40 @@ def test_fulldim_cos_sin(T, QH, KH, D):
     dummy = torch.ones(1, dtype=torch.float32, device=DEVICE)
 
     q_fly, k_fly, _, _ = flydsl_fused_qk_rope_reshape_and_cache(
-        q, k, v, kc_fly, vc_fly, slots, pos, cos, sin, dummy, dummy,
-        is_neox=True, flash_layout=True, apply_scale=False, output_zeros=False,
+        q,
+        k,
+        v,
+        kc_fly,
+        vc_fly,
+        slots,
+        pos,
+        cos,
+        sin,
+        dummy,
+        dummy,
+        is_neox=True,
+        flash_layout=True,
+        apply_scale=False,
+        output_zeros=False,
     )
     cos_4d = cos.unsqueeze(1).unsqueeze(1)
     sin_4d = sin.unsqueeze(1).unsqueeze(1)
     q_tri, k_tri, _, _ = fused_qk_rope_reshape_and_cache(
-        q, k, v, kc_tri, vc_tri, slots.long(), pos.long(), cos_4d, sin_4d, dummy, dummy,
-        is_neox=True, flash_layout=True, apply_scale=False, output_zeros=False,
+        q,
+        k,
+        v,
+        kc_tri,
+        vc_tri,
+        slots.long(),
+        pos.long(),
+        cos_4d,
+        sin_4d,
+        dummy,
+        dummy,
+        is_neox=True,
+        flash_layout=True,
+        apply_scale=False,
+        output_zeros=False,
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(q_fly, q_tri, atol=ATOL, rtol=RTOL)
@@ -847,7 +997,9 @@ def test_pos_dtype(pos_dtype, num_tokens):
     v = torch.randn_like(k)
     cos_cache = torch.randn(MAX_POS, D // 2, device=DEVICE, dtype=dtype)
     sin_cache = torch.randn(MAX_POS, D // 2, device=DEVICE, dtype=dtype)
-    positions_i32 = torch.randint(0, MAX_POS, (num_tokens,), device=DEVICE, dtype=torch.int32)
+    positions_i32 = torch.randint(
+        0, MAX_POS, (num_tokens,), device=DEVICE, dtype=torch.int32
+    )
     slot_mapping = torch.arange(num_tokens, device=DEVICE, dtype=torch.int32)
     kc = torch.zeros(num_blocks, BLOCK_SIZE, KH, D, device=DEVICE, dtype=dtype)
     vc = torch.zeros_like(kc)
@@ -859,15 +1011,37 @@ def test_pos_dtype(pos_dtype, num_tokens):
         positions_arg = positions_i32
         slot_arg = slot_mapping
 
-    launch_fn = _get_kernel(D, QH, KH, BLOCK_SIZE, True, "bf16",
-                            apply_scale=False, reuse_freqs_front_part=True,
-                            pos_dtype=pos_dtype)
+    launch_fn = _get_kernel(
+        D,
+        QH,
+        KH,
+        BLOCK_SIZE,
+        True,
+        "bf16",
+        apply_scale=False,
+        reuse_freqs_front_part=True,
+        pos_dtype=pos_dtype,
+    )
     dummy = torch.ones(1, dtype=torch.float32, device=DEVICE)
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
-    launch_fn(q, k, v, positions_arg, cos_cache, sin_cache, slot_arg,
-              kc, vc, q_out, k_out, num_tokens, dummy, dummy,
-              stream=torch.cuda.current_stream())
+    launch_fn(
+        q,
+        k,
+        v,
+        positions_arg,
+        cos_cache,
+        sin_cache,
+        slot_arg,
+        kc,
+        vc,
+        q_out,
+        k_out,
+        num_tokens,
+        dummy,
+        dummy,
+        stream=torch.cuda.current_stream(),
+    )
     torch.cuda.synchronize()
 
     # Reference: use i32 positions for indexing
@@ -876,12 +1050,22 @@ def test_pos_dtype(pos_dtype, num_tokens):
     cos_ref = torch.cat([cos_ref, cos_ref], dim=-1)
     sin_ref = torch.cat([sin_ref, sin_ref], dim=-1)
     hd = D
-    q1, q2 = q[..., :hd // 2], q[..., hd // 2:]
-    k1, k2 = k[..., :hd // 2], k[..., hd // 2:]
-    q_ref = torch.cat([q1 * cos_ref[..., :hd // 2] - q2 * sin_ref[..., :hd // 2],
-                       q2 * cos_ref[..., hd // 2:] + q1 * sin_ref[..., hd // 2:]], dim=-1)
-    k_ref = torch.cat([k1 * cos_ref[..., :hd // 2] - k2 * sin_ref[..., :hd // 2],
-                       k2 * cos_ref[..., hd // 2:] + k1 * sin_ref[..., hd // 2:]], dim=-1)
+    q1, q2 = q[..., : hd // 2], q[..., hd // 2 :]
+    k1, k2 = k[..., : hd // 2], k[..., hd // 2 :]
+    q_ref = torch.cat(
+        [
+            q1 * cos_ref[..., : hd // 2] - q2 * sin_ref[..., : hd // 2],
+            q2 * cos_ref[..., hd // 2 :] + q1 * sin_ref[..., hd // 2 :],
+        ],
+        dim=-1,
+    )
+    k_ref = torch.cat(
+        [
+            k1 * cos_ref[..., : hd // 2] - k2 * sin_ref[..., : hd // 2],
+            k2 * cos_ref[..., hd // 2 :] + k1 * sin_ref[..., hd // 2 :],
+        ],
+        dim=-1,
+    )
 
     torch.testing.assert_close(q_out, q_ref, atol=ATOL, rtol=RTOL)
     torch.testing.assert_close(k_out, k_ref, atol=ATOL, rtol=RTOL)
@@ -908,7 +1092,9 @@ def test_negative_slots(num_tokens, flash_layout):
     v = torch.randn_like(k)
     cos_cache = torch.randn(MAX_POS, D // 2, device=DEVICE, dtype=dtype)
     sin_cache = torch.randn(MAX_POS, D // 2, device=DEVICE, dtype=dtype)
-    positions = torch.randint(0, MAX_POS, (num_tokens,), device=DEVICE, dtype=torch.int32)
+    positions = torch.randint(
+        0, MAX_POS, (num_tokens,), device=DEVICE, dtype=torch.int32
+    )
     slot_mapping = torch.arange(num_tokens, device=DEVICE, dtype=torch.int32)
     slot_mapping[1::2] = -1  # odd slots skipped
 
@@ -916,30 +1102,64 @@ def test_negative_slots(num_tokens, flash_layout):
         kc = torch.zeros(num_blocks, BLOCK_SIZE, KH, D, device=DEVICE, dtype=dtype)
         vc = torch.zeros_like(kc)
     else:
-        kc = torch.zeros(num_blocks, KH, D // x_size, BLOCK_SIZE, x_size, device=DEVICE, dtype=dtype)
+        kc = torch.zeros(
+            num_blocks, KH, D // x_size, BLOCK_SIZE, x_size, device=DEVICE, dtype=dtype
+        )
         vc = torch.zeros(num_blocks, KH, D, BLOCK_SIZE, device=DEVICE, dtype=dtype)
 
     kc_ref = kc.clone()
     vc_ref = vc.clone()
 
-    launch_fn = _get_kernel(D, QH, KH, BLOCK_SIZE, flash_layout, "bf16",
-                            apply_scale=False, reuse_freqs_front_part=True, pos_dtype="i32",
-                            x_size=x_size)
+    launch_fn = _get_kernel(
+        D,
+        QH,
+        KH,
+        BLOCK_SIZE,
+        flash_layout,
+        "bf16",
+        apply_scale=False,
+        reuse_freqs_front_part=True,
+        pos_dtype="i32",
+        x_size=x_size,
+    )
     dummy = torch.ones(1, dtype=torch.float32, device=DEVICE)
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
-    launch_fn(q, k, v, positions, cos_cache, sin_cache, slot_mapping,
-              kc, vc, q_out, k_out, num_tokens, dummy, dummy,
-              stream=torch.cuda.current_stream())
+    launch_fn(
+        q,
+        k,
+        v,
+        positions,
+        cos_cache,
+        sin_cache,
+        slot_mapping,
+        kc,
+        vc,
+        q_out,
+        k_out,
+        num_tokens,
+        dummy,
+        dummy,
+        stream=torch.cuda.current_stream(),
+    )
     torch.cuda.synchronize()
 
     # Reference: manually write only even-indexed slots
-    cos_ref = torch.cat([cos_cache[positions.long()].unsqueeze(1).to(dtype)] * 2, dim=-1)
-    sin_ref = torch.cat([sin_cache[positions.long()].unsqueeze(1).to(dtype)] * 2, dim=-1)
+    cos_ref = torch.cat(
+        [cos_cache[positions.long()].unsqueeze(1).to(dtype)] * 2, dim=-1
+    )
+    sin_ref = torch.cat(
+        [sin_cache[positions.long()].unsqueeze(1).to(dtype)] * 2, dim=-1
+    )
     hd = D
-    k1, k2 = k[..., :hd // 2], k[..., hd // 2:]
-    k_rot = torch.cat([k1 * cos_ref[..., :hd // 2] - k2 * sin_ref[..., :hd // 2],
-                       k2 * cos_ref[..., hd // 2:] + k1 * sin_ref[..., hd // 2:]], dim=-1)
+    k1, k2 = k[..., : hd // 2], k[..., hd // 2 :]
+    k_rot = torch.cat(
+        [
+            k1 * cos_ref[..., : hd // 2] - k2 * sin_ref[..., : hd // 2],
+            k2 * cos_ref[..., hd // 2 :] + k1 * sin_ref[..., hd // 2 :],
+        ],
+        dim=-1,
+    )
 
     for i, slot in enumerate(slot_mapping.cpu().tolist()):
         if slot < 0:
@@ -960,9 +1180,17 @@ def test_negative_slots(num_tokens, flash_layout):
 # CLI: run all configs including fp8
 # ===========================================================================
 
-def run_bf16_bench(num_tokens, head_dim=128, num_q_heads=8, num_kv_heads=1,
-                   block_size=BLOCK_SIZE, max_pos=MAX_POS, flash_layout=True,
-                   dtype=torch.bfloat16):
+
+def run_bf16_bench(
+    num_tokens,
+    head_dim=128,
+    num_q_heads=8,
+    num_kv_heads=1,
+    block_size=BLOCK_SIZE,
+    max_pos=MAX_POS,
+    flash_layout=True,
+    dtype=torch.bfloat16,
+):
     """Benchmark FlyDSL vs Triton for bf16 KV cache (no fp8 quantization)."""
     dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
     layout_name = "flash" if flash_layout else "non-flash"
@@ -973,16 +1201,32 @@ def run_bf16_bench(num_tokens, head_dim=128, num_q_heads=8, num_kv_heads=1,
     v = torch.randn(num_tokens, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
     cos_cache = torch.randn(max_pos, head_dim // 2, device=DEVICE, dtype=dtype)
     sin_cache = torch.randn(max_pos, head_dim // 2, device=DEVICE, dtype=dtype)
-    positions = torch.randint(0, max_pos, (num_tokens,), device=DEVICE, dtype=torch.int32)
+    positions = torch.randint(
+        0, max_pos, (num_tokens,), device=DEVICE, dtype=torch.int32
+    )
     slot_mapping = torch.arange(num_tokens, device=DEVICE, dtype=torch.int32)
 
     num_blocks = max(32, (num_tokens + block_size - 1) // block_size + 4)
     if flash_layout:
-        kc = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
-        vc = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
+        kc = torch.zeros(
+            num_blocks, block_size, num_kv_heads, head_dim, device=DEVICE, dtype=dtype
+        )
+        vc = torch.zeros(
+            num_blocks, block_size, num_kv_heads, head_dim, device=DEVICE, dtype=dtype
+        )
     else:
-        kc = torch.zeros(num_blocks, num_kv_heads, head_dim // X_SIZE, block_size, X_SIZE, device=DEVICE, dtype=dtype)
-        vc = torch.zeros(num_blocks, num_kv_heads, head_dim, block_size, device=DEVICE, dtype=dtype)
+        kc = torch.zeros(
+            num_blocks,
+            num_kv_heads,
+            head_dim // X_SIZE,
+            block_size,
+            X_SIZE,
+            device=DEVICE,
+            dtype=dtype,
+        )
+        vc = torch.zeros(
+            num_blocks, num_kv_heads, head_dim, block_size, device=DEVICE, dtype=dtype
+        )
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
 
@@ -994,18 +1238,46 @@ def run_bf16_bench(num_tokens, head_dim=128, num_q_heads=8, num_kv_heads=1,
 
     def run_fly():
         flydsl_fused_qk_rope_reshape_and_cache(
-            q, k, v, kc, vc, slot_mapping, positions,
-            cos_cache, sin_cache, _dummy, _dummy,
-            is_neox=True, flash_layout=flash_layout, apply_scale=False,
-            offs=None, q_out=q_out, k_out=k_out, output_zeros=False,
+            q,
+            k,
+            v,
+            kc,
+            vc,
+            slot_mapping,
+            positions,
+            cos_cache,
+            sin_cache,
+            _dummy,
+            _dummy,
+            is_neox=True,
+            flash_layout=flash_layout,
+            apply_scale=False,
+            offs=None,
+            q_out=q_out,
+            k_out=k_out,
+            output_zeros=False,
         )
 
     def run_tri():
         fused_qk_rope_reshape_and_cache(
-            q, k, v, kc, vc, slots_i64, pos_i64,
-            cos_4d, sin_4d, _dummy, _dummy,
-            is_neox=True, flash_layout=flash_layout, apply_scale=False,
-            offs=None, q_out=q_out, k_out=k_out, output_zeros=False,
+            q,
+            k,
+            v,
+            kc,
+            vc,
+            slots_i64,
+            pos_i64,
+            cos_4d,
+            sin_4d,
+            _dummy,
+            _dummy,
+            is_neox=True,
+            flash_layout=flash_layout,
+            apply_scale=False,
+            offs=None,
+            q_out=q_out,
+            k_out=k_out,
+            output_zeros=False,
         )
 
     # Correctness check
@@ -1026,9 +1298,11 @@ def run_bf16_bench(num_tokens, head_dim=128, num_q_heads=8, num_kv_heads=1,
     speedup = tri_us / fly_us if fly_us > 0 else 0
 
     status = "PASS" if ok else "FAIL"
-    print(f"  [{status}] {layout_name:>9s} M={num_tokens:>4d} {dtype_str}  "
-          f"q_err={q_err:.4f} k_err={k_err:.4f}  "
-          f"FlyDSL={fly_us:.1f}us Triton={tri_us:.1f}us  speedup={speedup:.2f}x")
+    print(
+        f"  [{status}] {layout_name:>9s} M={num_tokens:>4d} {dtype_str}  "
+        f"q_err={q_err:.4f} k_err={k_err:.4f}  "
+        f"FlyDSL={fly_us:.1f}us Triton={tri_us:.1f}us  speedup={speedup:.2f}x"
+    )
     return ok, fly_us, tri_us
 
 
@@ -1045,9 +1319,15 @@ if __name__ == "__main__":
     for D in [64, 128]:
         for KH in [1, 8]:
             for QH_per_KH in [1, 8]:
-                run_test(T=1, QH_per_KH=QH_per_KH, KH=KH, D=D,
-                         reuse_freqs_front_part=True, flash_layout=True,
-                         use_wrapper=False)
+                run_test(
+                    T=1,
+                    QH_per_KH=QH_per_KH,
+                    KH=KH,
+                    D=D,
+                    reuse_freqs_front_part=True,
+                    flash_layout=True,
+                    use_wrapper=False,
+                )
                 print(f"  PASS  D={D} KH={KH} QH/KH={QH_per_KH} flash T=1")
 
     print()
@@ -1068,8 +1348,13 @@ if __name__ == "__main__":
                 if not HAS_AITER_TRITON:
                     print("  [SKIP] AITER Triton not available")
                     break
-                run_bf16_bench(m, head_dim=hd, num_q_heads=qh, num_kv_heads=kh,
-                               flash_layout=flash_layout)
+                run_bf16_bench(
+                    m,
+                    head_dim=hd,
+                    num_q_heads=qh,
+                    num_kv_heads=kh,
+                    flash_layout=flash_layout,
+                )
 
     print()
     print("=" * 60)
@@ -1089,11 +1374,20 @@ if __name__ == "__main__":
             layout = "flash" if flash_layout else "non-flash"
             for m in token_counts:
                 ok, kc_err, vc_err, fly_us, tri_us = run_fp8_test(
-                    m, head_dim=hd, num_q_heads=qh, num_kv_heads=kh,
+                    m,
+                    head_dim=hd,
+                    num_q_heads=qh,
+                    num_kv_heads=kh,
                     flash_layout=flash_layout,
                 )
                 status = "PASS" if ok else "FAIL"
-                bench = f"  FlyDSL={fly_us:.1f}us Triton={tri_us:.1f}us" if fly_us > 0 else ""
-                print(f"  [{status}] {layout:>9s} M={m:>4d} "
-                      f"kc={kc_err:.4f} vc={vc_err:.4f}{bench}")
+                bench = (
+                    f"  FlyDSL={fly_us:.1f}us Triton={tri_us:.1f}us"
+                    if fly_us > 0
+                    else ""
+                )
+                print(
+                    f"  [{status}] {layout:>9s} M={m:>4d} "
+                    f"kc={kc_err:.4f} vc={vc_err:.4f}{bench}"
+                )
     print("\nDone.")
