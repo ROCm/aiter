@@ -78,7 +78,7 @@ def flydsl_sage_attn_func(
     layout: str = "bshd",
     waves_per_eu: int = 2,
     block_m: int = 256,
-    block_n: int = 128,
+    block_n: int = 64,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
     """Run FlyDSL Sage Attention on CDNA (gfx942/MI300X, gfx950/MI350).
