@@ -55,8 +55,7 @@ void topk_softplus(torch::Tensor& topk_weights,
                     torch::Tensor& gating_output,
                     torch::Tensor& correction_bias,
                     bool need_renorm,
-                    float routed_scaling_factor = 1.0,
-                    const std::string& score_func = "sqrtsoftplus");
+                    float routed_scaling_factor = 1.0);
 
 void moe_align_block_size(torch::Tensor topk_ids,
                           int64_t num_experts,
