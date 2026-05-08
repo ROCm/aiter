@@ -129,10 +129,10 @@ def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
 
 
-def run_opus_gemm_bf16(inp, weight, out, kid=0, splitK=0):
+def run_opus_gemm_bf16(inp, weight, out, bias=None, kid=0, splitK=0):
     return _opus_gemm_a16w16_tune(
         inp.unsqueeze(0), weight.unsqueeze(0), out.unsqueeze(0),
-        bias=None, kernelId=kid, splitK=splitK,
+        bias=bias, kernelId=kid, splitK=splitK,
     )
 
 
@@ -647,7 +647,7 @@ class Gemm:
                             self.has_bias,
                         ),
                         run_opus_gemm_bf16,
-                        ([0, 1, 5], kid, sk),
+                        ([0, 1, 5, 3], kid, sk),
                         {
                             "num_warmup": self.num_warmup,
                             "num_iters": 101,

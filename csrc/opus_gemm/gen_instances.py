@@ -734,9 +734,9 @@ void
     #
     #   * bias is std::optional<aiter_tensor_t>; kargs.ptr_bias / stride_bias_batch
     #     are populated from it (or set to nullptr / 0 when absent).
-    #   * Shape protocol (matches plan + reduce / split-barrier kernel side):
-    #       [M]            ->  stride_bias_batch=0  AND batch must == 1
-    #       [batch, M]     ->  stride_bias_batch=M
+    #   * Shape protocol (F.linear convention, per-output-feature):
+    #       [N]            ->  stride_bias_batch=0  (broadcast across batches)
+    #       [batch, N]     ->  stride_bias_batch=N
     #     anything else (or non-contiguous, or dtype != Y.dtype()) hard-errors
     #     up front -- the kernel side has no further runtime check.
     #   * dtype: matched to Y.dtype() (the launcher template param D_C); this
@@ -753,19 +753,17 @@ void
             AiterDtype_to_str(bt.dtype()),
             " Y=", AiterDtype_to_str(Y.dtype()), ")");
         if (bt.dim() == 1) {{
-            AITER_CHECK(bt.size(0) == M,
-                "bias 1D length must equal M (got bias.size(0)=", bt.size(0),
-                " M=", M, ")");
-            AITER_CHECK(batch == 1,
-                "bias 1D [M] requires batch == 1; pass [batch, M] for batch>1");
+            AITER_CHECK(bt.size(0) == N,
+                "bias 1D length must equal N (got bias.size(0)=", bt.size(0),
+                " N=", N, ")");
             stride_bias_batch_ = 0;
         }} else if (bt.dim() == 2) {{
-            AITER_CHECK(bt.size(0) == batch && bt.size(1) == M,
-                "bias 2D shape must equal [batch, M] (got [", bt.size(0), ", ",
-                bt.size(1), "] vs batch=", batch, " M=", M, ")");
-            stride_bias_batch_ = M;
+            AITER_CHECK(bt.size(0) == batch && bt.size(1) == N,
+                "bias 2D shape must equal [batch, N] (got [", bt.size(0), ", ",
+                bt.size(1), "] vs batch=", batch, " N=", N, ")");
+            stride_bias_batch_ = N;
         }} else {{
-            AITER_CHECK(false, "bias must be 1D [M] or 2D [batch, M]; got dim=",
+            AITER_CHECK(false, "bias must be 1D [N] or 2D [batch, N]; got dim=",
                 bt.dim());
         }}
         ptr_bias_ = bt.data_ptr();

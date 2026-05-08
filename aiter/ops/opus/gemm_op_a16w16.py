@@ -29,8 +29,8 @@ Public entry points:
 * `opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kernelId, splitK)`
   Low-level pybind binding to the id-based tune dispatcher. Exposes a
   specific kernel instance by `kernelId` plus optional literal KBatch
-  via `splitK` and an optional bias tensor (D_OUT-typed, [M] or
-  [batch, M]). Intended for the tuner, for debugging a specific kid,
+  via `splitK` and an optional bias tensor (D_OUT-typed, [N] or
+  [batch, N]; F.linear convention). Intended for the tuner, for debugging a specific kid,
   and for aiter-global integrations (e.g. future tuned_gemm.solMap).
 
 All entry points share the JIT module `module_deepgemm_opus`, which
@@ -342,14 +342,10 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
         Y = torch.empty(batch, M, N, dtype=dtype, device=A.device)
 
     # Bias validation. dtype must match Y dtype (match_d_out convention).
-    # Shape protocol:
-    #   * batch == 1: accept [M] or [1, M]; both leave the C++ launcher
-    #     seeing stride_bias_batch == 0 (broadcast across batch).
-    #   * batch  > 1: require [batch, M]; the launcher will set
-    #     stride_bias_batch == M.
-    # This matches the C++-side BIAS_HOST_VALIDATE block in
-    # csrc/opus_gemm/gen_instances.py. Strict for now; can be relaxed once
-    # we have a real call site needing batch>1 + 1D broadcast.
+    # Bias is per-output-feature [N] (F.linear convention). Shape protocol:
+    #   * [N]          -> stride_bias_batch = 0 (broadcast across batch)
+    #   * [batch, N]   -> stride_bias_batch = N
+    # Matches the C++-side BIAS_HOST_VALIDATE in gen_instances.py.
     if bias is not None:
         if bias.dtype != dtype:
             raise ValueError(
@@ -362,25 +358,20 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
                 f"bias.stride()={tuple(bias.stride())})"
             )
         if bias.dim() == 1:
-            if bias.shape[0] != M:
+            if bias.shape[0] != N:
                 raise ValueError(
-                    f"gemm_a16w16_opus: 1D bias length must equal M (got "
-                    f"bias.shape={tuple(bias.shape)}, M={M})"
-                )
-            if batch != 1:
-                raise ValueError(
-                    f"gemm_a16w16_opus: 1D bias [M] requires batch==1; pass "
-                    f"[batch, M] for batch>1 (got A.shape={tuple(A.shape)})"
+                    f"gemm_a16w16_opus: 1D bias length must equal N (got "
+                    f"bias.shape={tuple(bias.shape)}, N={N})"
                 )
         elif bias.dim() == 2:
-            if tuple(bias.shape) != (batch, M):
+            if tuple(bias.shape) != (batch, N):
                 raise ValueError(
-                    f"gemm_a16w16_opus: 2D bias must be [batch, M] (got "
-                    f"bias.shape={tuple(bias.shape)}, batch={batch}, M={M})"
+                    f"gemm_a16w16_opus: 2D bias must be [batch, N] (got "
+                    f"bias.shape={tuple(bias.shape)}, batch={batch}, N={N})"
                 )
         else:
             raise ValueError(
-                f"gemm_a16w16_opus: bias must be 1D [M] or 2D [batch, M] "
+                f"gemm_a16w16_opus: bias must be 1D [N] or 2D [batch, N] "
                 f"(got bias.shape={tuple(bias.shape)})"
             )
 
@@ -416,12 +407,10 @@ def gemm_a16w16_opus(
                                ``stride_b_batch == N*K``; pass
                                ``.contiguous()`` if you need to broadcast
                                a single-batch weight across A.
-    bias : optional per-row bias, dtype must equal `dtype` (match_d_out).
-        Accepted shapes:
-        * [M]                  -- broadcast across batch; requires
-                                  batch == 1 (A is 2D or A is 3D with
-                                  leading dim 1).
-        * [batch, M]           -- per-batch row vector.
+    bias : optional per-output-feature bias (F.linear convention), dtype
+        must equal `dtype` (match_d_out). Accepted shapes:
+        * [N]                  -- broadcast across batch.
+        * [batch, N]           -- per-batch bias vector.
         bias is consumed by the a16w16 split-barrier (kid 4..9) and the
         a16w16_flatmm_splitk (kid 200..299) families. CSV-miss requests
         with bias fall back to the C++ heuristic dispatcher (which only

@@ -535,7 +535,7 @@ def opus_gemm(
         inp.unsqueeze(0),
         weights.unsqueeze(0),
         Y.unsqueeze(0),
-        bias=None,
+        bias=bias,
         kernelId=int(solidx),
         splitK=int(splitK),
     )
