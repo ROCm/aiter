@@ -154,7 +154,9 @@ jobs:
 
           # Override with PR aiter
           COPY . /aiter
-          RUN pip uninstall -y amd-aiter && pip install --no-build-isolation -e /aiter
+          RUN pip uninstall -y amd-aiter && \
+              cd /aiter && pip install -r requirements.txt && \
+              pip install --no-build-isolation -e /aiter
 
           # Verify aiter is installed from PR branch
           RUN pip show flash-attn && pip show amd-aiter && pip show triton && \
