@@ -10,6 +10,7 @@ from aiter.ops.triton.attention.mha import (
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
+from aiter.ops.triton.attention.mha_fused_bwd import bwd_preprocess_mxfp8
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_with_tol,
@@ -17,6 +18,7 @@ from aiter.test_mha_common import (
     generate_qkv,
 )
 from op_tests.triton_tests.attention.mha_test_utils import pad_rearrange_dropout_mask
+from aiter.ops.triton.quant.mxfp8_quant import downcast_to_mxfp8, upcast_from_mxfp8
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -443,6 +445,35 @@ def test_mha_varlen_with_dropout(
         CAUSAL=CAUSAL,
         dtype=dtype,
     )
+
+
+@pytest.mark.parametrize("BATCH", [1, 4, 32, 128])
+@pytest.mark.parametrize("SEQLEN", [512, 1024, 2048])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+def test_mha_backward_preprocess_mxfp8(
+    BATCH: int,
+    SEQLEN: int,
+    HEAD_SZ: int,
+):
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    o_fp32 = torch.randn(BATCH, SEQLEN, HEAD_SZ, device="cuda", dtype=torch.float32)
+    do_fp32 = torch.randn(BATCH, SEQLEN, HEAD_SZ, device="cuda", dtype=torch.float32)
+    o_fp8, o_scale = downcast_to_mxfp8(o_fp32, torch.float8_e4m3fn, -1)
+    do_fp8, do_scale = downcast_to_mxfp8(do_fp32, torch.float8_e4m3fn, -1)
+    o_fp32 = upcast_from_mxfp8(o_fp8, o_scale, torch.float32, -1)
+    do_fp32 = upcast_from_mxfp8(do_fp8, do_scale, torch.float32, -1)
+
+    triton_out = bwd_preprocess_mxfp8(
+        o_fp8,
+        o_scale,
+        do_fp8,
+        do_scale,
+    )
+    torch_out = (o_fp32 * do_fp32).sum(-1)
+
+    torch.testing.assert_close(triton_out, torch_out, atol=0.01, rtol=0.01)
 
 
 # Production shapes based on real models:
