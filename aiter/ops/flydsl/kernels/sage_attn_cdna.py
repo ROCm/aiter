@@ -34,6 +34,7 @@ from flydsl.expr import (
     gpu,
     range_constexpr,
     rocdl,
+    vector,
 )
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, Vector as Vec
@@ -46,6 +47,7 @@ from flydsl._mlir.dialects import (
     fly as _fly,
     llvm as _llvm,
     memref as _memref,
+    vector as _vector,
 )
 
 _LOG2E = host_math.log2(host_math.e)
@@ -194,8 +196,10 @@ def build_sage_attn_cdna_module(
     allocator.ptr = lds_base_offset + LDS_TOTAL_I8_ELEMS * 2  # *2 for safety
 
     # Architecture-specific FP8 type (gfx942: fnuz, gfx950: fn)
+    # Deferred: MLIR types must be constructed inside an active MLIR Context,
+    # which only exists inside the @flyc.kernel scope.
     _is_gfx950 = "gfx950" in gpu_arch
-    _fp8_mlir_type = T.f8e4m3fn if _is_gfx950 else T.f8e4m3fnuz
+    _fp8_mlir_type_cls = ir.Float8E4M3FNType if _is_gfx950 else ir.Float8E4M3FNUZType
 
     mfma_i32_k32 = getattr(rocdl, "mfma_i32_16x16x32i8", None) or getattr(
         rocdl, "mfma_i32_16x16x32_i8", None
@@ -254,6 +258,7 @@ def build_sage_attn_cdna_module(
         v4bf16_type = Vec.make_type(4, fx.BFloat16)
         v16i8_type = Vec.make_type(16, fx.Int8)
         v8bf16_type = Vec.make_type(8, fx.BFloat16)
+        v4i16_type = Vec.make_type(4, fx.Int16)
 
         seq_len_q_v = fx.Index(seq_len_q)
         seq_len_k_v = fx.Index(seq_len_k)
@@ -309,13 +314,23 @@ def build_sage_attn_cdna_module(
 
         def _load_ptr_i8_vec16(ptr, base_idx):
             gep = buffer_ops.get_element_ptr(ptr, fx.Int64(base_idx), elem_type=T.i8)
-            return _pointer_load(Vec.make_type(16, fx.Int8).ir_type, gep)
+            return _pointer_load(v16i8_type, gep)
+
+        def _load_ptr_i8_vec8(ptr, base_idx):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(base_idx), elem_type=T.i8)
+            return _pointer_load(v8i8_type, gep)
+
+        def _load_ptr_i64(ptr, base_idx):
+            """Load 8 contiguous bytes from `ptr+base_idx` as a scalar i64
+            (8xi8 packed). Used for MFMA i8 operands which require packed i64.
+            """
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(base_idx), elem_type=T.i8)
+            return _pointer_load(T.i64, gep)
 
         def _load_ptr_f8_vec8(ptr, base_idx):
-            # FP8 is loaded as raw bytes and bitcast; FlyDSL uses T.f8 or T.fp8e4m3
-            # Represent FP8 as i8 for load, then convert to BF16
-            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(base_idx), elem_type=T.i8)
-            return _pointer_load(Vec.make_type(8, fx.Int8).ir_type, gep)
+            # FP8 is loaded as raw bytes and bitcast; the actual ExtFOp uses the
+            # arch-specific FP8 type (FNUZ on gfx942, FN on gfx950).
+            return _load_ptr_i8_vec8(ptr, base_idx)
 
         def _store_ptr_bf16(ptr, base_idx, val):
             gep = buffer_ops.get_element_ptr(ptr, fx.Int64(base_idx), elem_type=T.bf16)
@@ -336,16 +351,16 @@ def build_sage_attn_cdna_module(
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_q_v))
         q_row_safe = fx.Index(ArithValue(q_in_bounds).select(q_row, fx.Index(0)))
 
-        c_zero_v8i8 = Vec.filled(8, 0, fx.Int8).ir_value()
+        c_zero_i64 = arith.constant(0, type=T.i64)
         q_packs = []
         for ks in range_constexpr(K_STEPS_QK):
-            # Each MFMA_K_INT8=32 step: klane selects 8-byte sub-pack (0 or 1)
+            # MFMA 16x16x32_i8 wave64: klane (0..3) picks the 8-byte K sub-pack.
+            # q_col already includes the klane*8 offset, so an 8-byte load gives
+            # this lane's 8 K elements as a packed scalar i64 (the MFMA operand).
             q_col = fx.Index(ks * MFMA_K_INT8) + klane * 8
             g_idx = q_global_idx(q_row_safe, q_col)
-            raw = _load_ptr_i8_vec16(q_ptr, g_idx)
-            # Extract the 8-byte half for this klane
-            half = Vec(raw).slice(klane * 8, 8).ir_value()
-            q_packs.append(ArithValue(q_in_bounds).select(half, c_zero_v8i8))
+            half = _load_ptr_i64(q_ptr, g_idx)
+            q_packs.append(ArithValue(q_in_bounds).select(half, c_zero_i64))
 
         # ---- Descale factors ----
         # q_descale: [batch, num_q_heads, num_q_blocks], index = [batch, head_q, q_tile]
@@ -401,20 +416,20 @@ def build_sage_attn_cdna_module(
         def coop_load_k(tile_start):
             for batch in range_constexpr(NUM_BATCHES_K):
                 row_offset = batch * ROWS_PER_BATCH_K
-                row_idx = tile_start + load_row_k_batch + row_offset
+                row_idx_raw = tile_start + load_row_k_batch + row_offset
+                # Clamp OOB rows to safe row 0 (we mask the resulting scores
+                # to -inf before softmax, so the K values are discarded).
+                kv_in_bounds = ArithValue(row_idx_raw < seq_len_k_v)
+                row_idx = fx.Index(kv_in_bounds.select(row_idx_raw, fx.Index(0)))
                 if const_expr(K_NEEDS_GUARD):
                     row_valid = load_row_k_batch < fx.Index(BLOCK_N)
-                    if row_valid:
-                        g_idx = kv_global_idx(row_idx, load_col_k_base)
-                        lds_row = load_row_k_batch + row_offset
-                        # Store 16 Int8 elements at byte offset lds_row*K_STRIDE + col
-                        lds_idx = fx.Index(lds_row * K_STRIDE + load_col_k_base)
-                        vec = _load_ptr_i8_vec16(k_ptr, g_idx)
-                        Vec(vec).store(lds, [lds_idx])
+                    do_load = row_valid
                 else:
+                    do_load = True
+                if do_load:
                     g_idx = kv_global_idx(row_idx, load_col_k_base)
                     lds_row = load_row_k_batch + row_offset
-                    lds_idx = fx.Index(lds_row * K_STRIDE + load_col_k_base)
+                    lds_idx = lds_row * K_STRIDE + load_col_k_base
                     vec = _load_ptr_i8_vec16(k_ptr, g_idx)
                     Vec(vec).store(lds, [lds_idx])
 
@@ -424,43 +439,41 @@ def build_sage_attn_cdna_module(
         # But we work entirely in byte offsets for i8 LDS array.
         LDS_V_BYTE_BASE = LDS_K_BYTES  # byte offset of V section
 
+        _fp8_mlir_type = _fp8_mlir_type_cls.get()
+
+        # Pick the rocdl FP8→F32 intrinsic matching the arch's FP8 variant:
+        #   gfx950 (E4M3FN/OCP) → rocdl.cvt.f32.fp8
+        #   gfx942 (E4M3FNUZ)   → rocdl.cvt.f32.fp8 (same op, different HW semantics)
+        # Both intrinsics take an i32 src and a byte selector (0..3).
+        _cvt_f32_fp8 = rocdl.CvtF32Fp8Op
+
         def _fp8_i8_to_bf16(raw_i8):
-            """Convert a raw Int8 FP8 value to BF16 via float32."""
-            fp8_val = arith.BitcastOp(_fp8_mlir_type, _raw(raw_i8)).result
-            f32_val = arith.ExtFOp(T.f32, fp8_val).result
+            """Convert a raw Int8 FP8 value to BF16 via float32 using the
+            rocdl.cvt.f32.fp8 intrinsic (LLVM lowering does not support
+            arith.extf on FP8 types directly)."""
+            i32_val = arith.ExtUIOp(T.i32, _raw(raw_i8)).result
+            f32_val = _cvt_f32_fp8(T.f32, i32_val, 0).res
             return arith.TruncFOp(T.bf16, f32_val).result
 
         def coop_load_v(tile_start):
-            """Load V from global memory (FP8) → convert to BF16 → store to LDS."""
+            """Load V from global memory (FP8) → convert to BF16 → store to LDS.
+
+            For rows beyond seq_len_k (last partial tile), we clamp the load
+            address to a safe row and force the bf16 LDS value to 0. This
+            prevents 0 * NaN = NaN in the PV MFMA when P is masked-to-zero.
+            """
+            zero_i8 = arith.constant(0, type=T.i8)
             for batch in range_constexpr(NUM_BATCHES_V):
                 row_offset = batch * ROWS_PER_BATCH_V
-                row_idx = tile_start + load_row_v_batch + row_offset
+                row_idx_raw = tile_start + load_row_v_batch + row_offset
+                kv_in_bounds = ArithValue(row_idx_raw < seq_len_k_v)
+                row_idx = fx.Index(kv_in_bounds.select(row_idx_raw, fx.Index(0)))
                 if const_expr(V_NEEDS_GUARD):
                     row_valid = load_row_v_batch < fx.Index(BLOCK_N)
-                    if row_valid:
-                        g_idx = kv_global_idx(row_idx, load_col_v_base)
-                        raw_v = _load_ptr_f8_vec8(v_ptr, g_idx)
-                        lds_row = load_row_v_batch + row_offset
-                        # BF16 byte offset: V_BYTE_BASE + lds_row * V_STRIDE * 2 + col * 2
-                        # Stored as individual bf16 elements in i8 LDS view
-                        for elem in range_constexpr(8):
-                            raw_elem = Vec(raw_v)[elem]
-                            bf16_elem = _fp8_i8_to_bf16(raw_elem)
-                            byte_off = (
-                                LDS_V_BYTE_BASE
-                                + (lds_row * V_STRIDE + load_col_v_base + elem) * 2
-                            )
-                            # Store via memref.store into i8 LDS (reinterpret as bf16)
-                            # Use bitcast at element level via i16
-                            bf16_as_i16 = arith.BitcastOp(T.i16, bf16_elem).result
-                            bf16_lo = arith.TruncIOp(T.i8, bf16_as_i16).result
-                            bf16_hi = arith.TruncIOp(
-                                T.i8,
-                                arith.ShRUIOp(bf16_as_i16, arith.constant(T.i16, 8)).result,
-                            ).result
-                            _memref.store(bf16_lo, lds, [_raw(fx.Index(LDS_V_BYTE_BASE + (lds_row * V_STRIDE + load_col_v_base + elem) * 2))])
-                            _memref.store(bf16_hi, lds, [_raw(fx.Index(LDS_V_BYTE_BASE + (lds_row * V_STRIDE + load_col_v_base + elem) * 2 + 1))])
+                    do_load = row_valid
                 else:
+                    do_load = True
+                if do_load:
                     g_idx = kv_global_idx(row_idx, load_col_v_base)
                     raw_v = _load_ptr_f8_vec8(v_ptr, g_idx)
                     lds_row = load_row_v_batch + row_offset
@@ -471,10 +484,14 @@ def build_sage_attn_cdna_module(
                         bf16_lo = arith.TruncIOp(T.i8, bf16_as_i16).result
                         bf16_hi = arith.TruncIOp(
                             T.i8,
-                            arith.ShRUIOp(bf16_as_i16, arith.constant(T.i16, 8)).result,
+                            arith.ShRUIOp(bf16_as_i16, arith.constant(8, type=T.i16)).result,
                         ).result
-                        _memref.store(bf16_lo, lds, [_raw(fx.Index(LDS_V_BYTE_BASE + (lds_row * V_STRIDE + load_col_v_base + elem) * 2))])
-                        _memref.store(bf16_hi, lds, [_raw(fx.Index(LDS_V_BYTE_BASE + (lds_row * V_STRIDE + load_col_v_base + elem) * 2 + 1))])
+                        # Force zero for OOB rows
+                        bf16_lo = kv_in_bounds.select(bf16_lo, zero_i8)
+                        bf16_hi = kv_in_bounds.select(bf16_hi, zero_i8)
+                        base_off = LDS_V_BYTE_BASE + (lds_row * V_STRIDE + load_col_v_base + elem) * 2
+                        _memref.store(bf16_lo, lds, [_raw(base_off)])
+                        _memref.store(bf16_hi, lds, [_raw(base_off + 1)])
 
         def load_k_frag(kv_block_row, ks):
             """Load v8i8 K fragment from LDS for mfma_i32_16x16x32i8.
@@ -496,11 +513,11 @@ def build_sage_attn_cdna_module(
             # Byte offset in LDS for this BF16 element
             byte_off = LDS_V_BYTE_BASE + (kv_row * V_STRIDE + d_col) * 2
             # Load as i16 (2 bytes) and bitcast to bf16
-            byte0 = fx.Int8(_memref.load(lds, [_raw(fx.Index(byte_off))]))
-            byte1 = fx.Int8(_memref.load(lds, [_raw(fx.Index(byte_off + 1))]))
+            byte0 = fx.Int8(_memref.load(lds, [_raw(byte_off)]))
+            byte1 = fx.Int8(_memref.load(lds, [_raw(byte_off + 1)]))
             b0_i16 = arith.ExtUIOp(T.i16, _raw(byte0)).result
             b1_i16 = arith.ExtUIOp(T.i16, _raw(byte1)).result
-            i16_val = arith.OrIOp(b0_i16, arith.ShLIOp(b1_i16, arith.constant(T.i16, 8)).result).result
+            i16_val = arith.OrIOp(b0_i16, arith.ShLIOp(b1_i16, arith.constant(8, type=T.i16)).result).result
             return arith.BitcastOp(T.bf16, i16_val).result
 
         def bf16_trunc_pack_v4(f32_vals):
@@ -509,7 +526,7 @@ def build_sage_attn_cdna_module(
             for j in range_constexpr(4):
                 f32_raw = _raw(f32_vals[j])
                 i32_val = arith.BitcastOp(T.i32, f32_raw).result
-                i16_val = arith.TruncIOp(T.i16, arith.ShRUIOp(i32_val, arith.constant(T.i32, 16)).result).result
+                i16_val = arith.TruncIOp(T.i16, arith.ShRUIOp(i32_val, arith.constant(16, type=T.i32)).result).result
                 bf16_val = arith.BitcastOp(T.bf16, i16_val).result
                 results.append(bf16_val)
             return Vec.from_elements(results, fx.BFloat16).ir_value()
@@ -542,10 +559,12 @@ def build_sage_attn_cdna_module(
                 for st in range_constexpr(N_SUBTILES):
                     kv_row = lane16 + st * MFMA_N
                     k_frag = load_k_frag(kv_row, ks)
-                    # mfma_i32_16x16x32i8(res_type, [A_v8i8, B_v8i8, C_v4i32, 0, 0, 0])
+                    # mfma_i32_16x16x32i8: A/B operands must be packed i64 (8xi8 → i64)
+                    k_i64v = vector.bitcast(Vec.make_type(1, fx.Int64), k_frag)
+                    k_i64 = vector.extract(k_i64v, static_position=[0], dynamic_position=[])
                     s_accs[st] = mfma_i32_k32(
-                        v4i32_type, [k_frag, q_packs[ks], s_accs[st], 0, 0, 0]
-                    ).result
+                        v4i32_type, [k_i64, q_packs[ks], s_accs[st], 0, 0, 0]
+                    )
 
             # Scale Int32 → Float32: S_f32 = S_i32 * q_descale[q_tile] * k_descale[kv_tile]
             kv_tile_idx = kv_block_start // BLOCK_N
@@ -567,30 +586,29 @@ def build_sage_attn_cdna_module(
             # ==== Causal masking ====
             NUM_S_VALS = N_SUBTILES * 4
 
-            if const_expr(CAUSAL):
-                kv_start_i32 = fx.Int32(kv_block_start)
-                klane_i32 = fx.Int32(klane)
-                q_start_i32 = fx.Int32(q_start)
-                max_kv_col_i32 = kv_start_i32 + fx.Int32(BLOCK_N - 1)
-                tile_needs_mask = max_kv_col_i32 > q_start_i32
-
-                # Unfold s_f32 into named scalars for SSA-safe conditional rewriting
-                s_named = list(s_f32)
-                if tile_needs_mask:
-                    klane_off_i32 = klane_i32 * fx.Int32(4)
-                    for st in range_constexpr(N_SUBTILES):
-                        for lane_r in range_constexpr(4):
-                            idx = st * 4 + lane_r
-                            kv_col_i32 = (
-                                kv_start_i32
-                                + fx.Int32(st * MFMA_N)
-                                + klane_off_i32
-                                + fx.Int32(lane_r)
-                            )
-                            s_named[idx] = ArithValue(kv_col_i32 > q_row_i32).select(
-                                c_neg_inf, s_named[idx]
-                            )
-                s_f32 = s_named
+            # Per-element masking: causal (if enabled) AND out-of-range KV
+            # columns (kv_col >= seq_len_k) get -inf so they don't affect
+            # softmax. Always apply the seq_len_k bound; only non-trivial in
+            # the last tile when seq_len_k % BLOCK_N != 0.
+            kv_start_i32 = fx.Int32(kv_block_start)
+            klane_i32 = fx.Int32(klane)
+            klane_off_i32 = klane_i32 * fx.Int32(4)
+            seq_len_k_i32 = fx.Int32(seq_len_k_v)
+            s_named = list(s_f32)
+            for st in range_constexpr(N_SUBTILES):
+                for lane_r in range_constexpr(4):
+                    idx = st * 4 + lane_r
+                    kv_col_i32 = (
+                        kv_start_i32
+                        + fx.Int32(st * MFMA_N)
+                        + klane_off_i32
+                        + fx.Int32(lane_r)
+                    )
+                    out_of_range = ArithValue(kv_col_i32 >= seq_len_k_i32)
+                    if const_expr(CAUSAL):
+                        out_of_range = out_of_range | ArithValue(kv_col_i32 > q_row_i32)
+                    s_named[idx] = out_of_range.select(c_neg_inf, s_named[idx])
+            s_f32 = s_named
 
             # ==== Online softmax ====
             local_max = s_f32[0]
@@ -599,18 +617,19 @@ def build_sage_attn_cdna_module(
             row_max = row_max_reduce(local_max)
             m_new = _fmax(m_running, row_max)
 
-            # Correction factor for previous accumulator
+            # Correction factor for previous accumulator.
+            # NOTE: s_f32 already contains (Q @ K.T) * sm_scale * log2(e) because
+            # sage_quant absorbs sm_scale_log2e into q_scale. Do NOT multiply by
+            # sm_scale_log2e again here.
             diff_m = _fsub(m_running, m_new)
-            diff_m_scaled = _fmul(diff_m, c_sm_scale_log2e)
-            corr = rocdl.exp2(ir.F32Type.get(), _raw(diff_m_scaled))
+            corr = rocdl.exp2(ir.F32Type.get(), _raw(diff_m))
 
-            # Compute P values (exp2 of scaled scores)
-            scaled_max = _fmul(c_sm_scale_log2e, m_new)
-            neg_scaled_max = _fsub(c_zero_f, scaled_max)
+            # Compute P values directly: p = exp2(s_f32 - m_new)
+            neg_max = _fsub(c_zero_f, m_new)
             p_vals = []
             local_sum = _raw(c_zero_f)
             for r in range_constexpr(NUM_S_VALS):
-                diff = fmath.fma(s_f32[r], _raw(c_sm_scale_log2e), neg_scaled_max)
+                diff = _fadd(s_f32[r], neg_max)
                 p = rocdl.exp2(ir.F32Type.get(), _raw(diff))
                 p_vals.append(p)
                 local_sum = _fadd(local_sum, p)
@@ -632,9 +651,11 @@ def build_sage_attn_cdna_module(
             # P is [N_SUBTILES * 4] f32 values; pack them into v4bf16 for MFMA B operand
             # Each PV_K_STEPS step covers 16 KV rows (MFMA_K_BF16)
             for pks in range_constexpr(PV_K_STEPS):
-                # P pack for this 16-row k-step: p_vals[pks*4 : pks*4+4] per lane
-                # In wave64 layout: klane selects which 4 of the 16 KV rows this lane owns
-                p_base = pks * MFMA_N + klane * 4  # = pks*16 + klane*4
+                # P pack for this 16-row k-step: 4 P values per lane.
+                # The QK MFMA output layout already places 4 KV rows per (klane,lane16)
+                # in subtile st, so subtile st=pks holds exactly the rows this lane
+                # needs to feed the PV MFMA's B operand (klane indexing is implicit).
+                p_base = pks * 4
                 p_slice = [p_vals[p_base + j] for j in range(4)]
                 p_pack_bf16 = bf16_trunc_pack_v4(p_slice)
 
@@ -647,10 +668,12 @@ def build_sage_attn_cdna_module(
                         v_elems.append(v_elem)
                     v_frag = Vec.from_elements(v_elems, fx.BFloat16).ir_value()
 
-                    # mfma_f32_16x16x16bf16_1k(res_type, [A_v4bf16, B_v4bf16, C_v4f32, 0, 0, 0])
+                    # mfma_f32_16x16x16bf16_1k: A/B operands must be vector<4xi16> (bitcast bf16)
+                    v_i16 = vector.bitcast(v4i16_type, v_frag)
+                    p_i16 = vector.bitcast(v4i16_type, p_pack_bf16)
                     o_accs[dc] = mfma_bf16_k16(
-                        v4f32_type, [v_frag, p_pack_bf16, o_accs[dc], 0, 0, 0]
-                    ).result
+                        v4f32_type, [v_i16, p_i16, o_accs[dc], 0, 0, 0]
+                    )
 
             m_running = m_new
             l_running = l_new
@@ -665,16 +688,34 @@ def build_sage_attn_cdna_module(
         inv_l = arith.divf(_raw(c_one_f), _raw(l_final), fastmath=fm_fast)
 
         if q_in_bounds:
+            # MFMA mfma_f32_16x16x16bf16_1k C/D layout (wave64): partition A,
+            # confirmed via splitk_hgemm.py reference. Lane (klane, lane16)
+            # holds 4 f32 values at M = klane*4 + 0..3, N = lane16.
+            # For PV output O (M=head_dim, N=Q_row), the lane's 4 elements are
+            # 4 head_dim positions (klane*4 + 0..3) at the SAME Q row (lane16).
             for dc in range_constexpr(D_CHUNKS):
-                d_col = fx.Index(dc * D_CHUNK) + lane16
-                v_ds_dc = fx.Float32(_load_ptr_f32(vds_ptr, v_descale_base + fx.Index(dc * D_CHUNK) + lane16))
-                inv_l_vds_dc = _fmul(inv_l, v_ds_dc)
-                inv_l_vec4_dc = Vec.from_elements([inv_l_vds_dc], fx.Float32).broadcast_to(4).ir_value()
-                o_norm_vec = _fmul(o_finals[dc], inv_l_vec4_dc)
-                # Truncate f32 → bf16 and store
-                o_bf16 = Vec(o_norm_vec).to(fx.BFloat16).ir_value()
-                o_global = q_global_idx(q_row, d_col)
-                _store_ptr_bf16(o_ptr, o_global, o_bf16)
+                d_col_base = fx.Index(dc * D_CHUNK) + klane * 4
+                bf16_elems = []
+                for elem in range_constexpr(4):
+                    v_ds = fx.Float32(_load_ptr_f32(
+                        vds_ptr, v_descale_base + fx.Index(dc * D_CHUNK) + klane * 4 + elem
+                    ))
+                    o_elem = vector.extract(
+                        o_finals[dc], static_position=[elem], dynamic_position=[]
+                    )
+                    scale = arith.mulf(_raw(inv_l), _raw(v_ds), fastmath=fm_fast)
+                    o_norm = arith.mulf(o_elem, scale, fastmath=fm_fast)
+                    # Bitwise f32 → bf16 truncation (take upper 16 bits)
+                    i32_val = arith.BitcastOp(T.i32, o_norm).result
+                    i16_val = arith.TruncIOp(
+                        T.i16,
+                        arith.ShRUIOp(i32_val, arith.constant(16, type=T.i32)).result,
+                    ).result
+                    o_bf16 = arith.BitcastOp(T.bf16, i16_val).result
+                    bf16_elems.append(o_bf16)
+                o_vec = Vec.from_elements(bf16_elems, fx.BFloat16).ir_value()
+                o_global = q_global_idx(q_row, d_col_base)
+                _store_ptr_bf16(o_ptr, o_global, o_vec)
 
     @flyc.jit
     def launch_sage_attn(
