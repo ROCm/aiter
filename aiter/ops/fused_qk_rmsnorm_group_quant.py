@@ -192,9 +192,7 @@ def fused_qk_rmsnorm_maybe_quant(
 ) -> None:
     # Centralized interface
     if quant_type == QuantType.No:
-        fused_qk_rmsnorm(
-            q, q_weight, q_epsilon, k, k_weight, k_epsilon
-        )
+        fused_qk_rmsnorm(q, q_weight, q_epsilon, k, k_weight, k_epsilon)
         return
     elif quant_type == QuantType.per_Tensor:
         raise NotImplementedError("fused_qk_rmsnorm + per_tensor quant not supported")
