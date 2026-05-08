@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// ASM FMHA forward (BF16, gfx1250 / MI4xx) — ported from poc_kl/mi400/fmha_fwd_f16.
+// ASM FMHA forward (BF16, gfx1250) — ported from poc_kl fmha_fwd_f16.
 //
 // Layout: q/k/v expected in **bshd shape** ([batch, seq, head, dim]).  The
 // kernel reads per-dim strides directly from the input tensor, so callers may
@@ -293,6 +293,9 @@ std::vector<at::Tensor> fmha_fwd_f16(at::Tensor&                      q,
     // when sequences are aligned), so there's no runtime branch on alignment.
     const std::string dtype   = "bf16";
     const std::string arch_id = get_gpu_arch();
+    if(arch_id != "gfx1250"){
+        AITER_CHECK(false, __func__, ": fmha_fwd_f16 is only supported on gfx1250");
+    }
     CFG* cfg_map              = &cfg_fmha_fwd_f16;
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
