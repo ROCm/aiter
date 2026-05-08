@@ -438,7 +438,7 @@ else:
         "einops",
         "psutil",
         "packaging",
-        FLYDSL_VERSION,
+        "flydsl>=0.1.5",
     ]
 
 setup(
