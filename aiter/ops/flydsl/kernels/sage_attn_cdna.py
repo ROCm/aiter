@@ -441,28 +441,30 @@ def build_sage_attn_cdna_module(
 
         _fp8_mlir_type = _fp8_mlir_type_cls.get()
 
-        # Pick the rocdl FP8→F32 intrinsic matching the arch's FP8 variant:
-        #   gfx950 (E4M3FN/OCP) → rocdl.cvt.f32.fp8
-        #   gfx942 (E4M3FNUZ)   → rocdl.cvt.f32.fp8 (same op, different HW semantics)
-        # Both intrinsics take an i32 src and a byte selector (0..3).
-        _cvt_f32_fp8 = rocdl.CvtF32Fp8Op
-
-        def _fp8_i8_to_bf16(raw_i8):
-            """Convert a raw Int8 FP8 value to BF16 via float32 using the
-            rocdl.cvt.f32.fp8 intrinsic (LLVM lowering does not support
-            arith.extf on FP8 types directly)."""
-            i32_val = arith.ExtUIOp(T.i32, _raw(raw_i8)).result
-            f32_val = _cvt_f32_fp8(T.f32, i32_val, 0).res
-            return arith.TruncFOp(T.bf16, f32_val).result
+        # Packed FP8→F32 conversion: rocdl.cvt.pk.f32.fp8 unpacks 2 of the 4
+        # FP8 bytes in an i32 src into vector<2xf32> per call (wordSel False/True).
+        # 8 FP8 bytes → 2 i32 words → 4 packed cvt ops → 8 f32. This is ~50 %
+        # fewer cvt instructions than the per-byte variant.
+        _cvt_pk_f32_fp8 = rocdl.CvtPkF32Fp8Op
+        v2f32_type = Vec.make_type(2, fx.Float32)
+        v2i32_type = Vec.make_type(2, fx.Int32)
 
         def coop_load_v(tile_start):
-            """Load V from global memory (FP8) → convert to BF16 → store to LDS.
+            """Load V from global (FP8) → convert to BF16 → single vec16 LDS store.
 
-            For rows beyond seq_len_k (last partial tile), we clamp the load
-            address to a safe row and force the bf16 LDS value to 0. This
-            prevents 0 * NaN = NaN in the PV MFMA when P is masked-to-zero.
+            Per cooperative-load batch:
+              1. v8i8 global load (8 FP8 bytes per thread)
+              2. Reinterpret as v2i32, run 4 packed CvtPkF32Fp8 ops → 8 f32
+              3. Truncate to v8bf16, bitcast to v16i8
+              4. One 16-byte LDS store (vs 16 single-byte stores previously)
+
+            For rows beyond seq_len_k we clamp the load address to row 0 and
+            zero the resulting v8bf16 to prevent 0 * NaN = NaN in the PV MFMA.
             """
-            zero_i8 = arith.constant(0, type=T.i8)
+            zero_v8bf16 = Vec.from_elements(
+                [arith.constant(0.0, type=T.bf16) for _ in range_constexpr(8)],
+                fx.BFloat16,
+            ).ir_value()
             for batch in range_constexpr(NUM_BATCHES_V):
                 row_offset = batch * ROWS_PER_BATCH_V
                 row_idx_raw = tile_start + load_row_v_batch + row_offset
@@ -475,23 +477,37 @@ def build_sage_attn_cdna_module(
                     do_load = True
                 if do_load:
                     g_idx = kv_global_idx(row_idx, load_col_v_base)
-                    raw_v = _load_ptr_f8_vec8(v_ptr, g_idx)
+                    raw_v = _load_ptr_f8_vec8(v_ptr, g_idx)  # v8i8
+
+                    # Reinterpret 8 FP8 bytes as 2 packed i32 words.
+                    pair_i32 = vector.bitcast(v2i32_type, raw_v)
+                    bf16_elems = []
+                    for word in range_constexpr(2):
+                        w_i32 = vector.extract(
+                            pair_i32, static_position=[word], dynamic_position=[]
+                        )
+                        # Lo pair (FP8 bytes 0,1) and hi pair (bytes 2,3).
+                        pk_lo = _cvt_pk_f32_fp8(v2f32_type, w_i32, False).res
+                        pk_hi = _cvt_pk_f32_fp8(v2f32_type, w_i32, True).res
+                        for half, pk in ((0, pk_lo), (1, pk_hi)):
+                            for elem in range_constexpr(2):
+                                f32_e = vector.extract(
+                                    pk, static_position=[elem], dynamic_position=[]
+                                )
+                                bf16_elems.append(arith.TruncFOp(T.bf16, f32_e).result)
+
+                    v8bf16 = Vec.from_elements(bf16_elems, fx.BFloat16).ir_value()
+                    # Force the whole vector to zero for OOB rows.
+                    v8bf16 = ArithValue(kv_in_bounds).select(v8bf16, zero_v8bf16)
+                    # Bitcast to v16i8 so we can store into the i8-typed LDS view.
+                    v16i8_val = vector.bitcast(v16i8_type, v8bf16)
+
                     lds_row = load_row_v_batch + row_offset
-                    for elem in range_constexpr(8):
-                        raw_elem = Vec(raw_v)[elem]
-                        bf16_elem = _fp8_i8_to_bf16(raw_elem)
-                        bf16_as_i16 = arith.BitcastOp(T.i16, bf16_elem).result
-                        bf16_lo = arith.TruncIOp(T.i8, bf16_as_i16).result
-                        bf16_hi = arith.TruncIOp(
-                            T.i8,
-                            arith.ShRUIOp(bf16_as_i16, arith.constant(8, type=T.i16)).result,
-                        ).result
-                        # Force zero for OOB rows
-                        bf16_lo = kv_in_bounds.select(bf16_lo, zero_i8)
-                        bf16_hi = kv_in_bounds.select(bf16_hi, zero_i8)
-                        base_off = LDS_V_BYTE_BASE + (lds_row * V_STRIDE + load_col_v_base + elem) * 2
-                        _memref.store(bf16_lo, lds, [_raw(base_off)])
-                        _memref.store(bf16_hi, lds, [_raw(base_off + 1)])
+                    base_off = (
+                        LDS_V_BYTE_BASE
+                        + (lds_row * V_STRIDE + load_col_v_base) * 2
+                    )
+                    Vec(v16i8_val).store(lds, [base_off])
 
         def load_k_frag(kv_block_row, ks):
             """Load v8i8 K fragment from LDS for mfma_i32_16x16x32i8.
@@ -503,22 +519,24 @@ def build_sage_attn_cdna_module(
             lds_idx = fx.Index(kv_block_row * K_STRIDE) + k_col
             return Vec.load(v8i8_type, lds, [lds_idx])
 
+        v2i8_type = Vec.make_type(2, fx.Int8)
+
         def load_v_frag_bf16(kv_row, d_chunk):
-            """Load v4bf16 V fragment from LDS for mfma_f32_16x16x16bf16_1k.
+            """Load 1 BF16 V value from LDS for mfma_f32_16x16x16bf16_1k.
 
             kv_row: row within BLOCK_N tile
             d_chunk: D output chunk index (selects HEAD_DIM/16 column group)
+
+            LDS is allocated as i8; load 2 contiguous bytes as v2i8 then
+            bitcast to bf16. This collapses the previous (2 separate i8 loads
+            + or/shift) sequence into a single 2-byte LDS load, called ~128
+            times per KV iteration in the PV MFMA loop.
             """
             d_col = d_chunk * D_CHUNK + lane16
-            # Byte offset in LDS for this BF16 element
             byte_off = LDS_V_BYTE_BASE + (kv_row * V_STRIDE + d_col) * 2
-            # Load as i16 (2 bytes) and bitcast to bf16
-            byte0 = fx.Int8(_memref.load(lds, [_raw(byte_off)]))
-            byte1 = fx.Int8(_memref.load(lds, [_raw(byte_off + 1)]))
-            b0_i16 = arith.ExtUIOp(T.i16, _raw(byte0)).result
-            b1_i16 = arith.ExtUIOp(T.i16, _raw(byte1)).result
-            i16_val = arith.OrIOp(b0_i16, arith.ShLIOp(b1_i16, arith.constant(8, type=T.i16)).result).result
-            return arith.BitcastOp(T.bf16, i16_val).result
+            v2i8_val = Vec.load(v2i8_type, lds, [byte_off])
+            v1bf16 = vector.bitcast(Vec.make_type(1, fx.BFloat16), v2i8_val)
+            return vector.extract(v1bf16, static_position=[0], dynamic_position=[])
 
         def bf16_trunc_pack_v4(f32_vals):
             """Pack 4 f32 values into v4bf16 via bitwise truncation (upper 16 bits)."""
