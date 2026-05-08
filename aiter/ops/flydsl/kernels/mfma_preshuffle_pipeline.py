@@ -11,6 +11,7 @@ Key primitives:
 from __future__ import annotations
 from dataclasses import dataclass
 from flydsl._mlir import ir
+from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
 from flydsl.expr import arith as _arith
 import flydsl.expr as fx
@@ -101,10 +102,10 @@ class PreshuffleScaleLayout:
         idx = mni * stride_n0 + ku * stride_k0 + k_lane * stride_klane + n_lane
     """
 
-    layout_scale: object  # fly layout value (same as PreshuffleBLayout.layout_b)
-    stride_n0: object  # index-typed MLIR value (dynamic)
-    stride_k0: object  # index-typed MLIR value (= 64)
-    stride_klane: object  # index-typed MLIR value (= 16)
+    layout_scale: object
+    stride_n0: object
+    stride_k0: object
+    stride_klane: object
 
 
 def make_preshuffle_scale_layout(
@@ -122,14 +123,12 @@ def make_preshuffle_scale_layout(
     Layout shape: ``(c_mn1, c_k1, 4, 16)`` where
     ``c_mn1 = c_mn / 16 / mn_pack`` and ``c_k1 = (c_k / scale_block_size) / 4 / k_pack``.
     """
-    from .layout_utils import _div_pow2
+    c16 = fx.Index(16)
+    c4 = fx.Index(4)
+    c_k_scale = c_k // fx.Index(scale_block_size)
 
-    c16 = arith.constant(16, index=True)
-    c4 = arith.constant(4, index=True)
-    c_k_scale = _div_pow2(c_k, scale_block_size)
-
-    c_mn1 = _div_pow2(_div_pow2(c_mn, 16), mn_pack)
-    c_k1 = _div_pow2(_div_pow2(c_k_scale, 4), k_pack)
+    c_mn1 = (c_mn // c16) // fx.Index(mn_pack)
+    c_k1 = (c_k_scale // c4) // fx.Index(k_pack)
     if elem_bytes != mn_pack * k_pack:
         raise ValueError(
             f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
@@ -139,7 +138,6 @@ def make_preshuffle_scale_layout(
     stride_k0 = c4 * stride_klane
     stride_n0 = c_k1 * stride_k0
 
-    # Build fly layout (i32 strides for fx.make_layout).
     c_mn1_i32 = arith.index_cast(T.i32, c_mn1)
     c_k1_i32 = arith.index_cast(T.i32, c_k1)
     stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
@@ -185,40 +183,39 @@ def make_preshuffle_b_layout(
     if kpack_bytes not in (8, 16):
         raise ValueError(f"kpack_bytes must be 8 or 16, got {kpack_bytes!r}")
 
-    c16 = arith.constant(16, index=True)
-    c_kpack = arith.constant(kpack_bytes, index=True)
-
-    from .layout_utils import _div_pow2
+    c16 = fx.Index(16)
+    c_kpack = fx.Index(kpack_bytes)
 
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     c_k_bytes = c_k * arith.constant(int(elem_bytes), index=True)
-    c_k0 = _div_pow2(c_k_bytes, 64)
-    n0 = _div_pow2(c_n, 16)
+    n0 = c_n // c16
 
-    c_kpack_elems = c_kpack if elem_bytes == 1 else _div_pow2(c_kpack, int(elem_bytes))
+    c_kpack_elems = (
+        c_kpack
+        if elem_bytes == 1
+        else (c_kpack // arith.constant(int(elem_bytes), index=True))
+    )
 
     stride_nlane = c_kpack_elems
 
     if k_major:
-        c32 = arith.constant(32, index=True)
-        c2 = arith.constant(2, index=True)
+        c32 = fx.Index(32)
+        c2 = fx.Index(2)
         c_k0 = c_k_bytes // c32
         klane_dim = 2
         stride_klane = c16 * stride_nlane
         stride_n0 = c2 * stride_klane
         stride_k0 = n0 * stride_n0
     else:
-        c64 = arith.constant(64, index=True)
-        c4 = arith.constant(4, index=True)
+        c64 = fx.Index(64)
+        c4 = fx.Index(4)
         c_k0 = c_k_bytes // c64
         klane_dim = 4
         stride_klane = c16 * stride_nlane
         stride_k0 = c4 * stride_klane
         stride_n0 = c_k0 * stride_k0
 
-    # fly.make_shape requires i32/i64 for dynamic operands (not index).
-    # Convert dynamic index values to i32; use Python ints for static constants.
     kpack_elems_static = kpack_bytes if elem_bytes == 1 else kpack_bytes // elem_bytes
     n0_i32 = arith.index_cast(T.i32, n0)
     c_k0_i32 = arith.index_cast(T.i32, c_k0)
@@ -325,6 +322,7 @@ def load_b_raw_w4a16(
     c4_idx = fx.Index(4)
 
     k0_base = base_k // c64
+
     k1_layout_offset = ku * 2
     lane_div_32 = lane_div_16 // c2_idx
     total_k1 = fx.Index(k1_layout_offset) + lane_div_32
@@ -699,6 +697,64 @@ def lds_load_pack_k32(
         return vector.extract(a_vec64, static_position=[0], dynamic_position=[])
 
 
+def xcd_remap_bx_by(
+    bx,
+    by,
+    c_m,
+    *,
+    tile_m: int,
+    tile_n: int,
+    N: int,
+    xcd_swizzle: int,
+    num_xcds: int = 8,
+):
+    """Remap (bx, by) for L2-cache reuse via XCD swizzle.
+
+    No-op when ``xcd_swizzle <= 0``. Otherwise:
+      1. Linearize the original (bx, by) grid round-robin across ``num_xcds``
+         XCDs so that contiguous workgroup ids stay on the same XCD.
+      2. Re-tile that 1-D order with an M-major group of size ``xcd_swizzle``,
+         folding the tail group when ``gy`` does not divide evenly.
+
+    Designed to be called inside a ``@flyc.kernel`` immediately after::
+
+        bx = gpu.block_id("x")
+        by = gpu.block_id("y")
+        bx, by = xcd_remap_bx_by(bx, by, c_m, tile_m=..., tile_n=..., N=...,
+                                 xcd_swizzle=xcd_swizzle)
+
+    ``c_m`` is the dynamic ``fx.Index`` for runtime ``M``; ``tile_m``,
+    ``tile_n``, ``N`` and ``xcd_swizzle`` are compile-time Python ints.
+    """
+    if xcd_swizzle <= 0:
+        return bx, by
+
+    _c1 = fx.arith.constant(1, index=True)
+    _c_tm = fx.arith.constant(tile_m, index=True)
+    _gx = fx.arith.constant(N // tile_n, index=True)
+    _gy = (c_m + _c_tm - _c1) / _c_tm
+
+    _linear_id = bx * _gx + by
+    _num_wgs = _gx * _gy
+
+    _c_xcds = fx.arith.constant(num_xcds, index=True)
+    _wgs_per_xcd = _num_wgs / _c_xcds
+    _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id / _c_xcds)
+
+    _c_wgm = fx.arith.constant(xcd_swizzle, index=True)
+    _num_wgid_in_group = _c_wgm * _gx
+    _group_id = _wgid / _num_wgid_in_group
+    _first_pid_m = _group_id * _c_wgm
+    _remaining_m = _gy - _first_pid_m
+    _cmp_m = fx.arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
+    _group_size_m = fx.arith.select(_cmp_m, _remaining_m, _c_wgm)
+
+    _wgid_in_group = _wgid % _num_wgid_in_group
+    new_bx = _first_pid_m + (_wgid_in_group % _group_size_m)
+    new_by = _wgid_in_group / _group_size_m
+    return new_bx, new_by
+
+
 __all__ = [
     "PreshuffleBLayout",
     "PreshuffleScaleLayout",
@@ -719,6 +775,7 @@ __all__ = [
     "split_row_major_2d",
     "swizzle_xor16",
     "tile_chunk_coord_i32",
+    "xcd_remap_bx_by",
 ]
 
 
@@ -764,9 +821,7 @@ def _load_groupwise_scale(
         # (E, G//2, N, 2) layout: dword at [e, pair, n] holds bf16 scales
         # for groups 2*pair and 2*pair+1.
         pair_idx = group_idx >> fx.Index(1)  # group_idx // 2
-        # Flat dword index: expert_offset * (num_pairs-1) + n_global
-        # The (num_pairs-1) cancels the expert part of n_global:
-        #   e*N*(G//2-1) + (e*N + n_local) = e*N*G//2 + n_local
+        # Dword index: same flat formula but with G//2 groups
         num_pairs = num_groups // 2
         c_npm1 = fx.Index(num_pairs - 1)
         dword_base = expert_offset * c_npm1 + n_global
@@ -778,9 +833,6 @@ def _load_groupwise_scale(
         )
     else:
         # (E, G, N) layout with f32 dtype
-        # Flat index: expert_offset * (G-1) + n_global
-        # The (G-1) cancels the expert part of n_global:
-        #   e*N*(G-1) + (e*N + n_local) = e*N*G + n_local
         c_gm1 = fx.Index(num_groups - 1)
         base_scale = expert_offset * c_gm1 + n_global
         elem_idx = base_scale + group_idx * c_npe

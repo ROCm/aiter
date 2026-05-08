@@ -243,6 +243,8 @@ def _precompile_to_cache(
             topk,
             quant_mode,
             gui_layout,
+            act=act,
+            enable_bias=enable_bias,
         )
         sorted_len = max(tokens * topk, _aot_sort_blocks() * tile_m)
         padded_cols = ((inter_dim // 32) + 7) // 8 * 8
@@ -266,6 +268,8 @@ def _precompile_to_cache(
         )
         sorted_token_ids = torch.zeros(sorted_len, device=dev, dtype=torch.int32)
         num_valid = torch.zeros(1, device=dev, dtype=torch.int32)
+        topk_ids = torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
+        bias = torch.zeros(E * inter_dim * 2, device=dev, dtype=torch.float32)
         _run_compiled(
             silu_fused,
             (
@@ -274,6 +278,8 @@ def _precompile_to_cache(
                 out_scale_sorted,
                 sorted_token_ids,
                 num_valid,
+                topk_ids,
+                bias,
                 tokens,
                 sorted_len,
                 _stream,
