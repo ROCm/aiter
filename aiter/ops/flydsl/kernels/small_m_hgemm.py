@@ -657,9 +657,7 @@ def compile_small_m_hgemm_kernel(
                     scf.YieldOp([])
 
         def get_llvm_ptr(ptr, offset, dtype_bytes):
-            base_ptr = fly.extract_aligned_pointer_as_index(
-                _ptr_type, ptr
-            )
+            base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, ptr)
             base_ptr = llvm.PtrToIntOp(_i64_type, base_ptr).result
             byte_offset = arith.index_cast(
                 T.i64, fx.Index(offset) * fx.Index(dtype_bytes)
@@ -1272,9 +1270,7 @@ def compile_small_m_hgemm_kernel(
                     2 + TOTAL_C_FRAGS_LEN : 2 + TOTAL_C_FRAGS_LEN + A_FRAGS_LEN
                 ]
                 b_frags = state[
-                    2
-                    + TOTAL_C_FRAGS_LEN
-                    + A_FRAGS_LEN : 2
+                    2 + TOTAL_C_FRAGS_LEN + A_FRAGS_LEN : 2
                     + TOTAL_C_FRAGS_LEN
                     + A_FRAGS_LEN
                     + TOTAL_B_FRAGS_LEN
@@ -1313,9 +1309,7 @@ def compile_small_m_hgemm_kernel(
                 2 + TOTAL_C_FRAGS_LEN : 2 + TOTAL_C_FRAGS_LEN + A_FRAGS_LEN
             ]
             b_frags = results[
-                2
-                + TOTAL_C_FRAGS_LEN
-                + A_FRAGS_LEN : 2
+                2 + TOTAL_C_FRAGS_LEN + A_FRAGS_LEN : 2
                 + TOTAL_C_FRAGS_LEN
                 + A_FRAGS_LEN
                 + TOTAL_B_FRAGS_LEN
