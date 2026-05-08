@@ -68,8 +68,16 @@ except ImportError:
 
 @functools.lru_cache(maxsize=64)
 def _get_launch_fn(
-    head_dim, num_q_heads, num_kv_heads, block_size, flash_layout, dtype_str,
-    apply_scale, reuse_freqs_front_part, pos_dtype, x_size,
+    head_dim,
+    num_q_heads,
+    num_kv_heads,
+    block_size,
+    flash_layout,
+    dtype_str,
+    apply_scale,
+    reuse_freqs_front_part,
+    pos_dtype,
+    x_size,
 ):
     """Compile and cache FlyDSL kernel for given configuration."""
     return build_fused_rope_cache_module(
@@ -133,9 +141,27 @@ def flydsl_fused_qk_rope_reshape_and_cache(
 
     # Common fallback args — avoids repeating the 18-arg list at every guard.
     if _DISABLED:
-        return _triton_fallback(q, k, v, key_cache, value_cache, slot_mapping, pos,
-                                cos, sin, k_scale, v_scale, is_neox, flash_layout,
-                                apply_scale, offs, q_out, k_out, output_zeros, zeros_out)
+        return _triton_fallback(
+            q,
+            k,
+            v,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            pos,
+            cos,
+            sin,
+            k_scale,
+            v_scale,
+            is_neox,
+            flash_layout,
+            apply_scale,
+            offs,
+            q_out,
+            k_out,
+            output_zeros,
+            zeros_out,
+        )
     _fb = (
         q,
         k,
@@ -185,7 +211,9 @@ def flydsl_fused_qk_rope_reshape_and_cache(
     elif cos_2d.shape[-1] == d:
         reuse_freqs_front_part = False
     else:
-        _LOGGER.debug(f"FlyDSL RoPE: unexpected cos/sin shape {cos.shape} for head_dim={d}, falling back")
+        _LOGGER.debug(
+            f"FlyDSL RoPE: unexpected cos/sin shape {cos.shape} for head_dim={d}, falling back"
+        )
         return _triton_fallback(*_fb)
 
     # -- Determine dtype --
@@ -216,16 +244,16 @@ def flydsl_fused_qk_rope_reshape_and_cache(
     # bits of element i sit at index 2*i.  The kernel compensates via
     # stride-2 indexing when pos_dtype == "i64".
     if pos.dtype == torch.int64:
-        pos_i32 = pos.view(torch.int32)       # shape [2*T], zero-copy
+        pos_i32 = pos.view(torch.int32)  # shape [2*T], zero-copy
         pos_dtype = "i64"
     else:
-        pos_i32 = pos                         # already int32
+        pos_i32 = pos  # already int32
         pos_dtype = "i32"
 
     if slot_mapping.dtype == torch.int64:
         slot_i32 = slot_mapping.view(torch.int32)  # shape [2*T], zero-copy
     else:
-        slot_i32 = slot_mapping                    # already int32
+        slot_i32 = slot_mapping  # already int32
 
     # -- Scale tensors: FlyDSL requires at least 1D; scalars must be reshaped --
     if _apply_scale:
@@ -243,8 +271,18 @@ def flydsl_fused_qk_rope_reshape_and_cache(
         v_scale_arg = _placeholder
 
     # -- Get compiled kernel --
-    launch_fn = _get_launch_fn(d, qh, kh, block_size, flash_layout, dtype_str,
-                               _apply_scale, reuse_freqs_front_part, pos_dtype, _x_size)
+    launch_fn = _get_launch_fn(
+        d,
+        qh,
+        kh,
+        block_size,
+        flash_layout,
+        dtype_str,
+        _apply_scale,
+        reuse_freqs_front_part,
+        pos_dtype,
+        _x_size,
+    )
 
     # -- Launch --
     stream = torch.cuda.current_stream()
