@@ -8,8 +8,9 @@
 //     Split-barrier pipeline used by opus_gemm_pipeline_a16w16_gfx950.cuh.
 //     Configurable TILE (T_M, T_N, T_K) and WAVE (W_M, W_N, W_K). 4-tuple DTYPE.
 //     HAS_BIAS / D_BIAS default off so existing instantiations remain valid.
-//     When HAS_BIAS=true the kernel reads kargs.ptr_bias as a D_BIAS* row vector
-//     (shape [M] or [batch, M]; selected via kargs.stride_bias_batch).
+//     When HAS_BIAS=true the kernel reads kargs.ptr_bias as a D_BIAS* vector
+//     along N (shape [N] or [batch, N]; F.linear convention; selected via
+//     kargs.stride_bias_batch).
 //
 //   opus_gemm_a16w16_flatmm_traits_gfx950<..., MFMA, WG_PER_CU, HAS_BIAS>
 //     4-wave warp-specialized pipeline (2 producer + 2 consumer) used by
@@ -101,11 +102,12 @@ struct opus_gemm_a16w16_traits_gfx950 {
 //
 // bias fields:
 //   ptr_bias          : null when HAS_BIAS=false; otherwise points to D_BIAS
-//                       buffer holding the per-row bias vector. dtype matches
-//                       T::D_BIAS (== T::D_C in default instantiations).
+//                       buffer holding the per-output-feature bias vector
+//                       (F.linear convention). dtype matches T::D_BIAS
+//                       (== T::D_C in default instantiations).
 //   stride_bias_batch : in elements of D_BIAS.
-//                       0  -> bias is shape [M] and broadcast across batches;
-//                       M  -> bias is shape [batch, M], one set per batch.
+//                       0  -> bias is shape [N] and broadcast across batches;
+//                       N  -> bias is shape [batch, N], one set per batch.
 //                       Reduce / split-barrier kernels read this stride only;
 //                       host validates shape <-> stride consistency.
 struct opus_gemm_noscale_kargs_gfx950 {
@@ -425,8 +427,8 @@ struct opus_gemm_flatmm_splitk_kargs_gfx950 {
     // ptr_bias = nullptr when HAS_BIAS=false; dtype matches D_BIAS (== D_C
     // for the user-facing matched-dtype convention).
     // stride_bias_batch in elements of D_BIAS:
-    //   0  -> bias shape [M], broadcast across batches;
-    //   M  -> bias shape [batch, M], per-batch row vector.
+    //   0  -> bias shape [N], broadcast across batches;
+    //   N  -> bias shape [batch, N], per-batch column vector (F.linear).
     const void* __restrict__ ptr_bias;
     int m;
     int n;
@@ -441,6 +443,6 @@ struct opus_gemm_flatmm_splitk_kargs_gfx950 {
     int stride_b_batch;
     int stride_ws_batch;                    // = padded_M * padded_N
     int stride_c_batch;                     // = M * N
-    int stride_bias_batch;                  // 0 (broadcast [M]) or M ([batch, M])
+    int stride_bias_batch;                  // 0 (broadcast [N]) or N ([batch, N])
 };
 #endif
