@@ -43,7 +43,6 @@ def run_torch_fused_norm_rope_group_quant(
     num_kv_heads = kv.shape[1] if kv.dim() == 3 else 1
     qk_rope_head_dim = 64
     nope_dim = head_dim - qk_rope_head_dim
-    num_heads = q.shape[1]
 
     if is_nope_first:
         q_nope = q[..., :nope_dim]
@@ -73,7 +72,9 @@ def run_torch_fused_norm_rope_group_quant(
         k_weight_pe = k_weight[:qk_rope_head_dim]
         k_weight_nope = k_weight[qk_rope_head_dim:]
 
-    k_nope_normed = (kv_nope.float() * kv_rms_scale * k_weight_nope.float()).to(kv.dtype)
+    k_nope_normed = (kv_nope.float() * kv_rms_scale * k_weight_nope.float()).to(
+        kv.dtype
+    )
     k_pe_normed = (kv_pe.float() * kv_rms_scale * k_weight_pe.float()).to(kv.dtype)
 
     q_pe_reshaped = q_pe_normed.unsqueeze(0)
@@ -141,9 +142,9 @@ def run_torch_fused_norm_rope_group_quant(
         for i in range(num_tokens):
             bi, bo = block_indices[i], block_offsets[i]
             kv_cache[bi, bo, :, :nope_dim] = k_quantized[i]
-            kv_cache.view(torch.uint8)[
-                bi, bo, :, nope_dim : nope_dim + num_tiles
-            ] = k_exponents[i].to(torch.uint8)
+            kv_cache.view(torch.uint8)[bi, bo, :, nope_dim : nope_dim + num_tiles] = (
+                k_exponents[i].to(torch.uint8)
+            )
 
     if is_nope_first:
         q_out = torch.cat((q_nope_normed, q_pe_roped), dim=-1)
@@ -208,12 +209,8 @@ def test_fused_qk_norm_rope_group_quant_cache(
     slot_mapping_lst = random.sample(range(total_slots), num_tokens)
     slot_mapping = torch.tensor(slot_mapping_lst, dtype=torch.long, device=device)
 
-    kv = torch.randn(
-        num_tokens, num_kv_heads, head_dim, dtype=dtype, device=device
-    )
-    q = torch.randn(
-        num_tokens, num_heads, head_dim, dtype=dtype, device=device
-    )
+    kv = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
+    q = torch.randn(num_tokens, num_heads, head_dim, dtype=dtype, device=device)
     k_weight = torch.ones(head_dim, dtype=dtype, device=device)
     cos_cache, sin_cache = compute_cache(num_tokens, qk_rope_head_dim // 2, dtype)
     cos_cache = cos_cache.to(device)
@@ -237,22 +234,20 @@ def test_fused_qk_norm_rope_group_quant_cache(
     is_nope_first = True
 
     ref_temp = torch.zeros(*kv_cache.shape, dtype=cache_dtype, device=device)
-    ref_kv_cache, ref_k_pe, ref_q_out = (
-        run_torch_fused_norm_rope_group_quant(
-            q,
-            kv,
-            k_weight,
-            ref_temp,
-            q_out,
-            slot_mapping,
-            pos,
-            cos_cache,
-            sin_cache,
-            1e-6,
-            is_neox,
-            is_nope_first,
-            kv_cache_dtype,
-        )
+    ref_kv_cache, ref_k_pe, ref_q_out = run_torch_fused_norm_rope_group_quant(
+        q,
+        kv,
+        k_weight,
+        ref_temp,
+        q_out,
+        slot_mapping,
+        pos,
+        cos_cache,
+        sin_cache,
+        1e-6,
+        is_neox,
+        is_nope_first,
+        kv_cache_dtype,
     )
     k_pe_out = torch.empty(
         num_tokens, num_kv_heads, qk_rope_head_dim, dtype=dtype, device=device
@@ -311,9 +306,7 @@ def test_fused_qk_norm_rope_group_quant_cache(
         )
         err_k_scale = checkAllclose(
             kv_cache.view(torch.uint8)[..., nope_dim : nope_dim + num_tiles],
-            ref_kv_cache.view(torch.uint8)[
-                ..., nope_dim : nope_dim + num_tiles
-            ],
+            ref_kv_cache.view(torch.uint8)[..., nope_dim : nope_dim + num_tiles],
             msg="fp8 kscale (in kv_cache) compared with ref",
         )
     else:
@@ -340,14 +333,8 @@ def test_fused_qk_norm_rope_group_quant_cache(
         num_tokens
         * (head_dim * num_kv_heads + num_heads * head_dim)
         * (torch.finfo(dtype).bits // 8)
-        + num_tokens
-        * head_dim
-        * num_kv_heads
-        * (torch.finfo(cache_dtype).bits // 8)
-        + num_tokens
-        * num_heads
-        * head_dim
-        * (torch.finfo(dtype).bits // 8)
+        + num_tokens * head_dim * num_kv_heads * (torch.finfo(cache_dtype).bits // 8)
+        + num_tokens * num_heads * head_dim * (torch.finfo(dtype).bits // 8)
     ) / (avg_us * 1e6)
     return ret
 

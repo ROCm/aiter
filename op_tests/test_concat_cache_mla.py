@@ -536,15 +536,6 @@ def test_fused_rope_concat_and_cache_mla(
     return ret
 
 
-def rms_norm_forward(x: torch.Tensor, weight: torch.Tensor, eps: float):
-    input_dtype = x.dtype
-    variance = x.float().pow(2).mean(-1, keepdim=True)
-    x = x * torch.rsqrt(variance + eps)
-    x = x.to(input_dtype)
-    return weight * x
-
-
-
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -607,7 +598,7 @@ parser.add_argument(
     "--token",
     type=int,
     nargs="*",
-    default=[4, 137, 512],
+    default=[4, 128, 256, 512, 1024, 2048],  # , 4096 , 8192, 16384,
     help="""token nums.
     e.g.: -t 128""",
 )
@@ -616,7 +607,7 @@ parser.add_argument(
     "--head",
     type=int,
     nargs="*",
-    default=[8],
+    default=[2, 8],
     help="""num heads.
     e.g.: -hd 1""",
 )
@@ -625,7 +616,7 @@ parser.add_argument(
     "--num_kv_heads",
     type=int,
     nargs="*",
-    default=[2],
+    default=[1, 2],
     help="""num kv heads.
     e.g.: -nkh 1""",
 )
@@ -644,7 +635,7 @@ parser.add_argument(
     "--is_neox",
     type=dtypes.str2bool,
     nargs="*",
-    default=[True],
+    default=[True, False],
     help="""true: GPT-NeoX style rotary embedding or false: GPT-J style rotary embedding.
     e.g.: --is_neox false
           or --is_neox true""",
@@ -654,15 +645,9 @@ parser.add_argument(
     "-c",
     "--case",
     type=str,
-    choices=[
-        "normal",
-        "fused_qk",
-    ],
+    choices=["normal", "fused_qk"],
     nargs="*",
-    default=[
-        "normal",
-        "fused_qk",
-    ],
+    default=["normal", "fused_qk"],
     help="""tests concat and cache or fused_qk.
     e.g.: -c normal""",
 )

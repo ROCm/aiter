@@ -18,7 +18,6 @@
 
 #include <hip/hip_bf16.h>
 
-
 namespace aiter {
 
 void swap_blocks(aiter_tensor_t& src, aiter_tensor_t& dst, const aiter_tensor_t& block_mapping)
@@ -2578,7 +2577,6 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
       }
     }
 
-
     // General version kernel wrapper with rope_dim parameter
     template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt>
     __global__ void fuse_qk_rope_concat_and_cache_mla_kernel_general(
@@ -3019,8 +3017,6 @@ void reshape_and_cache_flash(
                  reinterpret_cast<const float*>(k_scale.data_ptr()),                                     \
                  reinterpret_cast<const float*>(q_scale.data_ptr()),                                     \
                  is_neox, is_nope_first);
-
-
 #define CALL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA_GENERAL(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
                  aiter::fuse_qk_rope_concat_and_cache_mla_kernel_general<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE>      \
                        <<<grid, block, 0, stream>>>(                                                             \
@@ -3636,7 +3632,7 @@ void fused_qk_rope_concat_and_cache_mla(
     );
     
     if (use_optimized_prefill) {
-      dim3 grid(num_tokens, num_kv_heads);  // Use 2D grid: x=tokens, y=kv_heads
+      dim3 grid(num_tokens);
       dim3 block(OPTIMIZED_BLOCK_SIZE);
       DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(kv_c.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_PREFILL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA);
@@ -3659,6 +3655,4 @@ void fused_qk_rope_concat_and_cache_mla(
   }
 }
 
-
 } // namespace aiter
-
