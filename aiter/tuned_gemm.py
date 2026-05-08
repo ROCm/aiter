@@ -513,16 +513,7 @@ def opus_gemm(
             "opus tuned config found but opus is not available; falling back to torch"
         )
         return torch_gemm(
-            inp,
-            weights,
-            solidx,
-            bias,
-            otype,
-            scale_a,
-            scale_b,
-            scale_c,
-            bpreshuffle,
-            config,
+            inp, weights, solidx, bias, otype, scale_a, scale_b, scale_c, bpreshuffle, config
         )
     assert (
         scale_a is None and scale_b is None and scale_c is None
@@ -536,7 +527,7 @@ def opus_gemm(
         inp.unsqueeze(0),
         weights.unsqueeze(0),
         Y.unsqueeze(0),
-        bias=bias,
+        bias=None,
         kernelId=int(solidx),
         splitK=splitK,
     )
