@@ -15,7 +15,6 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.core import is_experimental_enabled
 
 
-
 @triton.jit
 def _fwd_kernel_stage2_asm(
     Mid_O,
