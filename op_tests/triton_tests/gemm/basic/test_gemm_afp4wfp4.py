@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import pytest
+import triton
 import torch
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
@@ -332,7 +333,7 @@ def test_gemm_afp4_wfp4(
     if triton_out.dim() == 3:
         triton_out = triton_out.sum(dim=0).to(dtype)
 
-    torch.testing.assert_close(torch_out, triton_out)
+    triton.testing.assert_close(torch_out, triton_out)
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
@@ -391,4 +392,4 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
         y if y is not None else torch.empty_like(torch_out),
     )
 
-    torch.testing.assert_close(torch_out, triton_out)
+    triton.testing.assert_close(torch_out, triton_out)
