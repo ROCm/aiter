@@ -31,6 +31,11 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.gemm_op_common import get_padded_m
 from torch import Tensor
 
+try:
+    from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
+except Exception:
+    _opus_tune = None
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -300,6 +305,21 @@ def gemm_a16w16(
             config=flydsl_config,
         )
 
+    if config is not None and config["libtype"] == "opus":
+        if _opus_tune is not None:
+            return opus_gemm(
+                inp_view,
+                B,
+                bias,
+                otype,
+                solidx=config.get("solidx", 0),
+                splitK=config.get("splitK", 0),
+            )
+        else:
+            logger.warning(
+                "opus tuned config found but opus is not available; falling back"
+            )
+
     gfx = get_gfx()
     _no_asm = gfx.startswith("gfx12")
     if config is not None and config["libtype"] == "asm" and not _no_asm:
@@ -498,6 +518,28 @@ def flydsl_gemm(
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
     return out
+
+
+def opus_gemm(
+    inp,
+    weights,
+    bias=None,
+    otype=None,
+    solidx=0,
+    splitK=0,
+):
+    m, k = inp.shape
+    n = weights.shape[0]
+    Y = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
+    _opus_tune(
+        inp.unsqueeze(0),
+        weights.unsqueeze(0),
+        Y.unsqueeze(0),
+        bias=None,
+        kernelId=int(solidx),
+        splitK=int(splitK),
+    )
+    return Y
 
 
 def triton_gemm(

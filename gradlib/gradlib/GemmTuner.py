@@ -49,6 +49,42 @@ except ImportError as exc:
     get_flydsl_splitk_hgemm_kernels = None
     FLYDSL_TUNE_ERROR = str(exc)
 
+OPUS_TUNE_ERROR = None
+try:
+    import sys as _sys
+
+    _opus_csrc = os.path.join(os.path.dirname(__file__), "../../csrc/opus_gemm")
+    if _opus_csrc not in _sys.path:
+        _sys.path.insert(0, os.path.abspath(_opus_csrc))
+    from opus_gemm_common import (
+        a16w16_kernels_list as _opus_a16w16_kernels_list,
+        a16w16_flatmm_kernels_list as _opus_a16w16_flatmm_kernels_list,
+        a16w16_flatmm_splitk_kernels_list as _opus_a16w16_flatmm_splitk_kernels_list,
+    )
+    from opus_gemm_tune import (
+        _kid_rejects_shape as _opus_kid_rejects_shape,
+        _kid_rejects_bias as _opus_kid_rejects_bias,
+        candidate_splitK as _opus_candidate_splitK,
+    )
+    from aiter.ops.opus.gemm_op_a16w16 import (
+        opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
+    )
+
+    _opus_all_kernels = {
+        **_opus_a16w16_kernels_list,
+        **_opus_a16w16_flatmm_kernels_list,
+        **_opus_a16w16_flatmm_splitk_kernels_list,
+    }
+    _opus_kernel_ids = sorted(_opus_all_kernels.keys())
+except Exception as _opus_exc:
+    _opus_gemm_a16w16_tune = None
+    _opus_all_kernels = None
+    _opus_kernel_ids = None
+    _opus_kid_rejects_shape = None
+    _opus_kid_rejects_bias = None
+    _opus_candidate_splitK = None
+    OPUS_TUNE_ERROR = str(_opus_exc)
+
 
 @lru_cache(maxsize=1)
 def init_hipblas():
@@ -91,6 +127,13 @@ def run_gemm_bf16_asm(
 
 def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
+
+
+def run_opus_gemm_bf16(inp, weight, out, kid=0, splitK=0):
+    return _opus_gemm_a16w16_tune(
+        inp.unsqueeze(0), weight.unsqueeze(0), out.unsqueeze(0),
+        bias=None, kernelId=kid, splitK=splitK,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -548,6 +591,81 @@ class Gemm:
         # ret = mp_tuner(task_asm, in_data, self.mp, False)
         return task_asm
 
+    def opus_gemm_all_sols(self):
+        if _opus_gemm_a16w16_tune is None:
+            logger.warning(
+                "opus is not available for tuning, skip. "
+                f"reason: {OPUS_TUNE_ERROR}"
+            )
+            return []
+        if self.scaleAB or self.indtype != dtypes.bf16:
+            return []
+        tasks = []
+        cu_num = get_cu_num()
+        for kid in _opus_kernel_ids:
+            k_inst = _opus_all_kernels[kid]
+            if _opus_kid_rejects_shape(k_inst, self.m, self.n, self.k):
+                continue
+            if _opus_kid_rejects_bias(k_inst, self.has_bias):
+                continue
+            if k_inst.kernel_tag == "a16w16_flatmm_splitk":
+                splitK_range = _opus_candidate_splitK(
+                    self.m, self.n, self.k, 1, cu_num, k_inst
+                )
+            else:
+                splitK_range = [0]
+            for sk in splitK_range:
+                info = (
+                    (
+                        self.m,
+                        self.n,
+                        self.k,
+                        self.has_bias,
+                        str(self.indtype),
+                        str(self.outdtype),
+                        self.scaleAB,
+                        self.is_shuffle,
+                    ),
+                    kid,
+                    sk,
+                    "opus",
+                    k_inst.name,
+                )
+                tasks.append(
+                    (
+                        info,
+                        generate_data,
+                        (
+                            self.m,
+                            self.n,
+                            self.k,
+                            self.indtype,
+                            self.outdtype,
+                            self.scaleAB,
+                            self.is_shuffle,
+                            0,
+                            self.has_bias,
+                        ),
+                        run_opus_gemm_bf16,
+                        ([0, 1, 5], kid, sk),
+                        {
+                            "num_warmup": self.num_warmup,
+                            "num_iters": 101,
+                        },
+                        get_gemm_ref,
+                        ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                        {},
+                        None,
+                        2e-2,
+                        1.0,
+                    )
+                )
+        logger.info(
+            f"opus candidate count for M={self.m}, N={self.n}, K={self.k}: "
+            f"{len(tasks)}"
+        )
+        return tasks
+
     def run_asm_triton_sols(self):
         tasks = []
         if "all" in self.libtype or "flydsl" in self.libtype:
@@ -560,6 +678,8 @@ class Gemm:
             tasks.extend(self.triton_gemm_all_sols())
         if "all" in self.libtype or "asm" in self.libtype:
             tasks.extend(self.asm_gemm_all_solutions())
+        if "all" in self.libtype or "opus" in self.libtype:
+            tasks.extend(self.opus_gemm_all_sols())
         solutions = len(tasks)
         in_data = [
             (
@@ -1002,6 +1122,7 @@ def libtype_list(string):
             "flydsl",
             "torch",
             "skinny",
+            "opus",
         ]:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
