@@ -77,6 +77,7 @@ def _is_triton_installed():
 
     for pkg in [
         "triton",
+        "amd-triton",
         "pytorch-triton",
         "pytorch-triton-rocm",
         "triton-rocm",
@@ -89,7 +90,7 @@ def _is_triton_installed():
 
 
 def _run_install_triton():
-    print("[aiter] Installing amd-triton via .github/scripts/install_triton.sh")
+    print("[aiter] Installing triton via .github/scripts/install_triton.sh")
     install_triton = os.path.join(this_dir, ".github", "scripts", "install_triton.sh")
     subprocess.check_call(["bash", install_triton])
 
