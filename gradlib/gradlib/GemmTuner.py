@@ -131,8 +131,12 @@ def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
 
 def run_opus_gemm_bf16(inp, weight, out, bias=None, kid=0, splitK=0):
     return _opus_gemm_a16w16_tune(
-        inp.unsqueeze(0), weight.unsqueeze(0), out.unsqueeze(0),
-        bias=bias, kernelId=kid, splitK=splitK,
+        inp.unsqueeze(0),
+        weight.unsqueeze(0),
+        out.unsqueeze(0),
+        bias=bias,
+        kernelId=kid,
+        splitK=splitK,
     )
 
 
@@ -594,8 +598,7 @@ class Gemm:
     def opus_gemm_all_sols(self):
         if _opus_gemm_a16w16_tune is None:
             logger.warning(
-                "opus is not available for tuning, skip. "
-                f"reason: {OPUS_TUNE_ERROR}"
+                "opus is not available for tuning, skip. " f"reason: {OPUS_TUNE_ERROR}"
             )
             return []
         if self.scaleAB or self.indtype != dtypes.bf16:
