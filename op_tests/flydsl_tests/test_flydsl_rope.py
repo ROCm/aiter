@@ -937,7 +937,6 @@ def test_negative_slots(num_tokens, flash_layout):
     cos_ref = torch.cat([cos_cache[positions.long()].unsqueeze(1).to(dtype)] * 2, dim=-1)
     sin_ref = torch.cat([sin_cache[positions.long()].unsqueeze(1).to(dtype)] * 2, dim=-1)
     hd = D
-    q1, q2 = q[..., :hd // 2], q[..., hd // 2:]
     k1, k2 = k[..., :hd // 2], k[..., hd // 2:]
     k_rot = torch.cat([k1 * cos_ref[..., :hd // 2] - k2 * sin_ref[..., :hd // 2],
                        k2 * cos_ref[..., hd // 2:] + k1 * sin_ref[..., hd // 2:]], dim=-1)
@@ -1010,10 +1009,14 @@ def run_bf16_bench(num_tokens, head_dim=128, num_q_heads=8, num_kv_heads=1,
         )
 
     # Correctness check
-    run_fly(); torch.cuda.synchronize()
-    q_fly = q_out.clone(); k_fly = k_out.clone()
-    run_tri(); torch.cuda.synchronize()
-    q_tri = q_out.clone(); k_tri = k_out.clone()
+    run_fly()
+    torch.cuda.synchronize()
+    q_fly = q_out.clone()
+    k_fly = k_out.clone()
+    run_tri()
+    torch.cuda.synchronize()
+    q_tri = q_out.clone()
+    k_tri = k_out.clone()
     q_err = (q_fly.float() - q_tri.float()).abs().max().item()
     k_err = (k_fly.float() - k_tri.float()).abs().max().item()
     ok = q_err < 1e-1 and k_err < 1e-1
