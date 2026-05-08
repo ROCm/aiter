@@ -169,9 +169,16 @@ def _fused_qk_rmsnorm(
 ) -> tuple[Tensor, Tensor]:
     m = q.size(0)
     if m >= _FUSED_QK_FALLBACK_M:
-        from .rmsnorm import rmsnorm2d_fwd
+        from .rmsnorm import rmsnorm
 
-        return rmsnorm2d_fwd(q, q_weight, q_eps), rmsnorm2d_fwd(k, k_weight, k_eps)
+        if q_out is None:
+            q_out = torch.empty_like(q, dtype=q.dtype, device=q.device)
+        if k_out is None:
+            k_out = torch.empty_like(k, dtype=k.dtype, device=k.device)
+
+        rmsnorm(q_out, q, q_weight, q_eps)
+        rmsnorm(k_out, k, k_weight, k_eps)
+        return q_out, k_out
     else:
         return _fused_qk_rmsnorm_kernel(
             q, q_weight, q_eps, k, k_weight, k_eps, q_out, k_out

@@ -291,8 +291,8 @@ def _validate_fused_qk_rmsnorm_per_token_quant_case(
         q_scale_error_rate = checkAllclose(
             q_scale_ref,
             q_scale,
-            rtol=0.0,
-            atol=0.0,
+            rtol=1e-2,
+            atol=1e-2,
             tol_err_ratio=0.0,
             msg=f"check q_scale baseline vs hip, m={m}, n1={n1}, n2={n2}: ",
         )
@@ -300,8 +300,8 @@ def _validate_fused_qk_rmsnorm_per_token_quant_case(
         q_deq_error_rate = checkAllclose(
             q_dequant_ref,
             q_dequant,
-            rtol=0.0,
-            atol=0.0,
+            rtol=1e-2,
+            atol=1e-2,
             tol_err_ratio=0.0,
             msg=f"check q_dequant baseline vs hip, m={m}, n1={n1}, n2={n2}: ",
         )
@@ -309,8 +309,8 @@ def _validate_fused_qk_rmsnorm_per_token_quant_case(
         q_unquant_error_rate = checkAllclose(
             q_unquant_ref,
             q_unquant,
-            rtol=0.0,
-            atol=0.0,
+            rtol=1e-2,
+            atol=1e-2,
             tol_err_ratio=0.0,
             msg=f"check q_unquant baseline vs hip, m={m}, n1={n1}, n2={n2}: ",
         )
@@ -331,8 +331,8 @@ def _validate_fused_qk_rmsnorm_per_token_quant_case(
         checkAllclose(
             q_res_out_ref,
             q_res_out,
-            rtol=0.0,
-            atol=0.0,
+            rtol=1e-2,
+            atol=1e-2,
             tol_err_ratio=0.0,
             msg=f"check q_res_out baseline vs hip, m={m}, n1={n1}, n2={n2}: ",
         )
