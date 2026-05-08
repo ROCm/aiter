@@ -6,7 +6,7 @@ from typing import Optional
 from torch import Tensor
 from aiter.ops.enum import QuantType
 
-from .fused_qk_norm_rope_cache_quant import fused_qk_rmsnorm
+from .fused_qk_norm_rope_cache_quant import _fused_qk_rmsnorm
 from ..jit.core import compile_ops
 from ..utility import dtypes
 
@@ -172,7 +172,7 @@ def fused_qk_rmsnorm_per_token_quant(
     )
 
 
-def fused_qk_rmsnorm_maybe_quant(
+def fused_qk_rmsnorm(
     q_out_quantized: Optional[Tensor] = None,
     q_out_scale: Optional[Tensor] = None,
     q: Optional[Tensor] = None,
@@ -192,7 +192,9 @@ def fused_qk_rmsnorm_maybe_quant(
 ) -> None:
     # Centralized interface
     if quant_type == QuantType.No:
-        fused_qk_rmsnorm(q, q_weight, q_epsilon, k, k_weight, k_epsilon)
+        _fused_qk_rmsnorm(
+            q_out_quantized, q, q_weight, q_epsilon, k_out, k, k_weight, k_epsilon
+        )
         return
     elif quant_type == QuantType.per_Tensor:
         raise NotImplementedError("fused_qk_rmsnorm + per_tensor quant not supported")

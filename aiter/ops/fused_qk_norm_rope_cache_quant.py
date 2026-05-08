@@ -157,10 +157,12 @@ def _fused_qk_rmsnorm_kernel(
 _FUSED_QK_FALLBACK_M = 16384
 
 
-def fused_qk_rmsnorm(
+def _fused_qk_rmsnorm(
+    q_out: Optional[Tensor],
     q: Tensor,
     q_weight: Tensor,
     q_eps: float,
+    k_out: Optional[Tensor],
     k: Tensor,
     k_weight: Tensor,
     k_eps: float,
@@ -172,7 +174,7 @@ def fused_qk_rmsnorm(
         return rmsnorm2d_fwd(q, q_weight, q_eps), rmsnorm2d_fwd(k, k_weight, k_eps)
     else:
         return _fused_qk_rmsnorm_kernel(
-            q, q_weight, q_eps, k, k_weight, k_eps, None, None
+            q, q_weight, q_eps, k, k_weight, k_eps, q_out, k_out
         )
 
 
