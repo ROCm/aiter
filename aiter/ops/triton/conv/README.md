@@ -41,14 +41,24 @@ negligible.
 
 ---
 
-## Headline results
+## Performance
 
-48 configurations: 3 models × 2 dtypes × 2 layouts × 4 batch sizes,
-10 runs each, on RDNA4.
+Designed to deliver strong throughput on AMD RDNA4 across both fp16 and
+bf16. The bench harness logs which MIOpen solver was selected per layer
+and reports aggregate TFLOPS for both backends, so you can verify the
+behavior on your stack.
 
-![SD3.5 VAE aggregate TFLOPS](images/sd35_vae_aggregate_tflops.png)
-![ResNet-50 aggregate TFLOPS](images/resnet50_aggregate_tflops.png)
-![FLUX.2 VAE aggregate TFLOPS](images/flux2_vae_aggregate_tflops.png)
+To measure on your stack:
+
+```bash
+python -m op_tests.op_benchmarks.triton.bench_conv2d \
+    --model-name <resnet50|sd35_vae|flux2_vae> \
+    --layout both --dtype <fp16|bf16> \
+    [--model-path <path>]   # required for sd35_vae / flux2_vae
+```
+
+The bench harness produces per-layer tables with kernel timings, shapes,
+the routing decision per layer, and aggregate TFLOPS for both backends.
 
 > **Note on TFLOPS**: numbers are *direct-convolution-equivalent* throughput
 > (the standard convention used by cuDNN, MIOpen, and the Winograd
@@ -96,13 +106,10 @@ The kernel families above are functional; wrapping them in an `nn.Module`
 calls `conv2d(...)` in its `forward`) works as expected and produces
 images visually indistinguishable from the PyTorch / MIOpen reference.
 
-Same prompt, same seed — left: PyTorch (MIOpen). Right: this op.
-
-| PyTorch / MIOpen | Triton (this op) |
-|---|---|
-| ![dog — PyTorch](images/flux2_pytorch.png) | ![dog — Triton](images/flux2_triton.png) |
-
-Pixel-level agreement: max diff **6 / 255**, mean diff **0.17 / 255**.
+Pixel-level agreement on FLUX.2-klein-9B (50 diffusion steps, same prompt
+and seed under both backends, only VAE convs swapped to Triton): max diff
+**6 / 255**, mean diff **0.17 / 255**. See `examples/flux2_inference.py`
+to reproduce and inspect the generated images.
 
 ---
 
@@ -201,7 +208,7 @@ aiter/ops/triton/conv/                Kernel library
   _launch.py                          Grid setup + _select_3x3_method
   _prepack.py                         Weight/input repack caches (LRU)
   _utils.py                           Shape math, tolerance model
-  README.md, DESIGN.md, images/
+  README.md, DESIGN.md
 
 aiter/ops/triton/_triton_kernels/conv/   @triton.jit kernels
   (1x1, 3x3 cblocked, 3x3 NHWC, general, 5 Winograd kernels)
