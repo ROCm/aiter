@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -107,6 +108,48 @@ def chunk_gated_delta_rule_fwd_h_hip(
 ) -> Tuple[Tensor, Tensor, Tensor]: ...
 
 
+@dataclass(frozen=True)
+class _StateArgs:
+    tensor: Tensor
+    has_initial_state: bool
+
+
+def _prepare_state_args(
+    *,
+    initial_state: Optional[Tensor],
+    state_dtype: Optional[torch.dtype],
+    device: torch.device,
+) -> _StateArgs:
+    if initial_state is not None and initial_state.dtype not in (
+        torch.float32,
+        torch.bfloat16,
+    ):
+        raise ValueError(
+            f"`initial_state.dtype` must be fp32 or bf16, got {initial_state.dtype}."
+        )
+    dtype = torch.float32 if state_dtype is None else state_dtype
+    if dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(f"`state_dtype` must be fp32 or bf16, got {dtype}.")
+    if (
+        state_dtype is not None
+        and initial_state is not None
+        and initial_state.dtype != dtype
+    ):
+        raise ValueError(
+            f"`initial_state.dtype` ({initial_state.dtype}) must match `state_dtype` ({dtype})."
+        )
+
+    tensor = (
+        initial_state.to(dtype=dtype).contiguous()
+        if initial_state is not None
+        else torch.empty(0, device=device, dtype=dtype)
+    )
+    return _StateArgs(
+        tensor=tensor,
+        has_initial_state=(initial_state is not None),
+    )
+
+
 def chunk_gated_delta_rule_fwd_h_hip_fn(
     k: Tensor,
     w: Tensor,
@@ -119,6 +162,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     save_new_value: bool = True,
     cu_seqlens: Optional[Tensor] = None,
     selected_bv: Optional[int] = None,
+    state_dtype: Optional[torch.dtype] = None,
     use_exp2: bool = True,
 ) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     """
@@ -146,8 +190,11 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     T_flat = w.shape[2]
     is_varlen = cu_seqlens is not None
     NT = triton.cdiv(T, chunk_size)
-
-    _has_initial_state = initial_state is not None
+    state = _prepare_state_args(
+        initial_state=initial_state,
+        state_dtype=state_dtype,
+        device=k.device,
+    )
 
     k_hip = k.contiguous()
     w_hip = w.contiguous()
@@ -184,12 +231,6 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
         else:
             selected_bv = _select_bv_for_dense(B, T_flat, chunk_size, H, k.device)
 
-    _initial_state = (
-        initial_state.to(torch.float32)
-        if initial_state is not None
-        else torch.empty(0, device=k.device, dtype=torch.float32)
-    )
-
     if gk is not None:
         gk_arg = gk.to(torch.float32)
         if use_exp2:
@@ -205,11 +246,11 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
         u_hip,
         g_hip,
         gk_arg,
-        _initial_state,
+        state.tensor,
         cu_seqlens_int32,
         chunk_offsets_int32,
         selected_bv,
-        _has_initial_state,
+        state.has_initial_state,
         output_final_state,
         save_new_value,
         use_exp2,

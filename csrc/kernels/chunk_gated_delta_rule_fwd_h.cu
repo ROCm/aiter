@@ -74,6 +74,12 @@ __device__ __forceinline__ bit16_t bf16_to_bits(const bf16_t x)
     return __builtin_bit_cast(bit16_t, x);
 }
 
+__device__ __forceinline__ float bf16_bits_to_float(const bit16_t x)
+{
+    const uint32_t bits = static_cast<uint32_t>(x) << 16;
+    return __builtin_bit_cast(float, bits);
+}
+
 __device__ __forceinline__ _B16x4 make_b16x4(bit16_t x0, bit16_t x1, bit16_t x2, bit16_t x3)
 {
     _B16x4 out;
@@ -165,10 +171,32 @@ __device__ __forceinline__ void store_f32x4_aligned(float* ptr, const float4& va
     *reinterpret_cast<float4*>(ptr) = value;
 }
 
-template <int BV_P>
+__device__ __forceinline__ float4 load_bf16x4_to_f32x4_aligned(const bf16_t* ptr)
+{
+    const _B16x4 packed = load_b16x4_aligned(ptr);
+    return float4{
+        bf16_bits_to_float(packed[0]),
+        bf16_bits_to_float(packed[1]),
+        bf16_bits_to_float(packed[2]),
+        bf16_bits_to_float(packed[3]),
+    };
+}
+
+__device__ __forceinline__ void store_f32x4_to_bf16x4_aligned(bf16_t* ptr, const float4& value)
+{
+    store_b16x4_aligned(
+        ptr,
+        make_b16x4(
+            bf16_to_bits(float_to_bf16(value.x)),
+            bf16_to_bits(float_to_bf16(value.y)),
+            bf16_to_bits(float_to_bf16(value.z)),
+            bf16_to_bits(float_to_bf16(value.w))));
+}
+
+template <int BV_P, bool STATE_BF16 = false>
 __device__ __forceinline__ void load_vk_hreg_from_global(
     float* __restrict__ h_reg,
-    const float* __restrict__ h0_base,
+    const void* __restrict__ h0_base_void,
     int global_v_base,
     int v_idx,
     int h_row_base_lo,
@@ -177,8 +205,17 @@ __device__ __forceinline__ void load_vk_hreg_from_global(
     constexpr int NUM_BV_TILES = BV_P / MFMA_N;
     for (int bv = 0; bv < NUM_BV_TILES; ++bv) {
         const int gv = global_v_base + bv * 16 + v_idx;
-        const float4 lo = load_f32x4_aligned(h0_base + gv * K_DIM + h_row_base_lo);
-        const float4 hi = load_f32x4_aligned(h0_base + gv * K_DIM + h_row_base_hi);
+        float4 lo;
+        float4 hi;
+        if constexpr (STATE_BF16) {
+            const bf16_t* h0_base = reinterpret_cast<const bf16_t*>(h0_base_void);
+            lo = load_bf16x4_to_f32x4_aligned(h0_base + gv * K_DIM + h_row_base_lo);
+            hi = load_bf16x4_to_f32x4_aligned(h0_base + gv * K_DIM + h_row_base_hi);
+        } else {
+            const float* h0_base = reinterpret_cast<const float*>(h0_base_void);
+            lo = load_f32x4_aligned(h0_base + gv * K_DIM + h_row_base_lo);
+            hi = load_f32x4_aligned(h0_base + gv * K_DIM + h_row_base_hi);
+        }
         h_reg[bv * 8 + 0] = lo.x;
         h_reg[bv * 8 + 1] = lo.y;
         h_reg[bv * 8 + 2] = lo.z;
@@ -190,10 +227,10 @@ __device__ __forceinline__ void load_vk_hreg_from_global(
     }
 }
 
-template <int BV_P>
+template <int BV_P, bool STATE_BF16 = false>
 __device__ __forceinline__ void store_vk_hreg_to_global(
     const float* __restrict__ h_reg,
-    float* __restrict__ ht_base,
+    void* __restrict__ ht_base_void,
     int global_v_base,
     int v_idx,
     int h_row_base_lo,
@@ -214,8 +251,15 @@ __device__ __forceinline__ void store_vk_hreg_to_global(
             h_reg[bv * 8 + 6],
             h_reg[bv * 8 + 7],
         };
-        store_f32x4_aligned(ht_base + gv * K_DIM + h_row_base_lo, lo);
-        store_f32x4_aligned(ht_base + gv * K_DIM + h_row_base_hi, hi);
+        if constexpr (STATE_BF16) {
+            bf16_t* ht_base = reinterpret_cast<bf16_t*>(ht_base_void);
+            store_f32x4_to_bf16x4_aligned(ht_base + gv * K_DIM + h_row_base_lo, lo);
+            store_f32x4_to_bf16x4_aligned(ht_base + gv * K_DIM + h_row_base_hi, hi);
+        } else {
+            float* ht_base = reinterpret_cast<float*>(ht_base_void);
+            store_f32x4_aligned(ht_base + gv * K_DIM + h_row_base_lo, lo);
+            store_f32x4_aligned(ht_base + gv * K_DIM + h_row_base_hi, hi);
+        }
     }
 }
 
@@ -935,7 +979,7 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
     }
 }
 
-template <int BV_P, bool USE_INITIAL_STATE, bool STORE_FINAL_STATE, bool SAVE_NEW_VALUE, bool IS_VARLEN, bool USE_EXP2, bool HAS_GK>
+template <int BV_P, bool USE_INITIAL_STATE, bool STORE_FINAL_STATE, bool SAVE_NEW_VALUE, bool IS_VARLEN, bool USE_EXP2, bool HAS_GK, bool STATE_BF16>
 __global__ __launch_bounds__(BLOCK_THREADS)
 void chunk_gated_delta_rule_fwd_h_hip_kernel(
     const __hip_bfloat16* __restrict__ k,
@@ -943,10 +987,10 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
     const __hip_bfloat16* __restrict__ u,
     const float* __restrict__ g,
     const float* __restrict__ gk,
-    const float* __restrict__ h0,
+    const void* __restrict__ h0,
     __hip_bfloat16* __restrict__ h,
     __hip_bfloat16* __restrict__ v_new,
-    float* __restrict__ ht,
+    void* __restrict__ ht,
     const int32_t* __restrict__ cu_seqlens,
     const int32_t* __restrict__ chunk_offsets,
     int total_chunks,
@@ -1006,8 +1050,10 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
     float h_reg[8 * NUM_BV_TILES];
 
     if constexpr (USE_INITIAL_STATE) {
-        const float* h0_base = h0 + (static_cast<int64_t>(i_n) * H + i_h) * V_DIM * K_DIM;
-        load_vk_hreg_from_global<BV_P>(
+        const void* h0_base = reinterpret_cast<const char*>(h0)
+            + (static_cast<int64_t>(i_n) * H + i_h) * V_DIM * K_DIM
+                * static_cast<int64_t>(STATE_BF16 ? sizeof(bf16_t) : sizeof(float));
+        load_vk_hreg_from_global<BV_P, STATE_BF16>(
             h_reg, h0_base, global_v_base, v_idx, h_row_base_lo, h_row_base_hi);
     } else {
         for (int i = 0; i < 8 * NUM_BV_TILES; ++i)
@@ -1106,14 +1152,16 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
     }
 
     if constexpr (STORE_FINAL_STATE) {
-        float* ht_base = ht + (static_cast<int64_t>(i_n) * H + i_h) * V_DIM * K_DIM;
-        store_vk_hreg_to_global<BV_P>(
+        void* ht_base = reinterpret_cast<char*>(ht)
+            + (static_cast<int64_t>(i_n) * H + i_h) * V_DIM * K_DIM
+                * static_cast<int64_t>(STATE_BF16 ? sizeof(bf16_t) : sizeof(float));
+        store_vk_hreg_to_global<BV_P, STATE_BF16>(
             h_reg, ht_base, global_v_base, v_idx, h_row_base_lo, h_row_base_hi);
     }
 }
 
-#define LAUNCH_HIP_KERNEL(BV_P, USE_INIT, STORE_FINAL, SAVE_NEW, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T)                \
-    hipLaunchKernelGGL((chunk_gated_delta_rule_fwd_h_hip_kernel<BV_P, USE_INIT, STORE_FINAL, SAVE_NEW, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T>), \
+#define LAUNCH_HIP_KERNEL(BV_P, USE_INIT, STORE_FINAL, SAVE_NEW, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, STATE_BF16_T)                \
+    hipLaunchKernelGGL((chunk_gated_delta_rule_fwd_h_hip_kernel<BV_P, USE_INIT, STORE_FINAL, SAVE_NEW, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, STATE_BF16_T>), \
         dim3(V_DIM / (BV_P), N * H),                                                                                                 \
         dim3(BLOCK_THREADS),                                                                                                          \
         0,                                                                                                                            \
@@ -1123,10 +1171,10 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
         reinterpret_cast<const __hip_bfloat16*>(u.data_ptr()),                                                                        \
         g.data_ptr<float>(),                                                                                                          \
         has_gk ? gk.data_ptr<float>() : nullptr,                                                                                     \
-        has_initial_state ? initial_state.data_ptr<float>() : nullptr,                                                                \
+        has_initial_state ? initial_state.data_ptr() : nullptr,                                                                       \
         reinterpret_cast<__hip_bfloat16*>(h.data_ptr()),                                                                              \
         save_new_value ? reinterpret_cast<__hip_bfloat16*>(v_new.data_ptr()) : nullptr,                                               \
-        output_final_state ? final_state.data_ptr<float>() : nullptr,                                                                 \
+        output_final_state ? final_state.data_ptr() : nullptr,                                                                        \
         cu_seqlens.data_ptr<int32_t>(),                                                                                               \
         chunk_offsets.data_ptr<int32_t>(),                                                                                            \
         total_chunks,                                                                                                                 \
@@ -1135,40 +1183,50 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
         Hg,                                                                                                                           \
         k_stride_t)
 
-#define DISPATCH_HIP_KERNEL_WITH_VARLEN(BV_P, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T)               \
+#define DISPATCH_HIP_KERNEL_WITH_VARLEN(BV_P, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, STATE_BF16_T)               \
     if (has_initial_state) {                                                                                   \
         if (output_final_state) {                                                                              \
-            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, true, true, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T); }    \
-            else                { LAUNCH_HIP_KERNEL(BV_P, true, true, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T); }   \
+            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, true, true, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, STATE_BF16_T); }    \
+            else                { LAUNCH_HIP_KERNEL(BV_P, true, true, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, STATE_BF16_T); }   \
         } else {                                                                                               \
-            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, true, false, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T); }   \
-            else                { LAUNCH_HIP_KERNEL(BV_P, true, false, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T); }  \
+            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, true, false, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, STATE_BF16_T); }   \
+            else                { LAUNCH_HIP_KERNEL(BV_P, true, false, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, STATE_BF16_T); }  \
         }                                                                                                      \
     } else {                                                                                                   \
         if (output_final_state) {                                                                              \
-            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, false, true, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T); }   \
-            else                { LAUNCH_HIP_KERNEL(BV_P, false, true, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T); }  \
+            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, false, true, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, STATE_BF16_T); }   \
+            else                { LAUNCH_HIP_KERNEL(BV_P, false, true, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, STATE_BF16_T); }  \
         } else {                                                                                               \
-            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, false, false, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T); }  \
-            else                { LAUNCH_HIP_KERNEL(BV_P, false, false, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T); } \
+            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, false, false, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, STATE_BF16_T); }  \
+            else                { LAUNCH_HIP_KERNEL(BV_P, false, false, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, STATE_BF16_T); } \
         }                                                                                                      \
     }
 
-#define DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, USE_EXP2_T, HAS_GK_T)  \
+#define DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, USE_EXP2_T, HAS_GK_T, STATE_BF16_T)  \
     if (is_varlen) {                                                               \
-        DISPATCH_HIP_KERNEL_WITH_VARLEN(BV_P, true, USE_EXP2_T, HAS_GK_T);   \
+        DISPATCH_HIP_KERNEL_WITH_VARLEN(BV_P, true, USE_EXP2_T, HAS_GK_T, STATE_BF16_T);   \
     } else {                                                                       \
-        DISPATCH_HIP_KERNEL_WITH_VARLEN(BV_P, false, USE_EXP2_T, HAS_GK_T);  \
+        DISPATCH_HIP_KERNEL_WITH_VARLEN(BV_P, false, USE_EXP2_T, HAS_GK_T, STATE_BF16_T);  \
     }
 
 #define DISPATCH_HIP_KERNEL(BV_P)                                  \
     do {                                                                         \
-        if (use_exp2) {                                                          \
-            if (has_gk) { DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, true, true); }   \
-            else        { DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, true, false); }  \
+        if (state_is_bf16) {                                                     \
+            if (use_exp2) {                                                      \
+                if (has_gk) { DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, true, true, true); }   \
+                else        { DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, true, false, true); }  \
+            } else {                                                             \
+                if (has_gk) { DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, false, true, true); }  \
+                else        { DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, false, false, true); } \
+            }                                                                    \
         } else {                                                                 \
-            if (has_gk) { DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, false, true); }  \
-            else        { DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, false, false); } \
+            if (use_exp2) {                                                      \
+                if (has_gk) { DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, true, true, false); }  \
+                else        { DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, true, false, false); } \
+            } else {                                                             \
+                if (has_gk) { DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, false, true, false); } \
+                else        { DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, false, false, false); }\
+            }                                                                    \
         }                                                                        \
     } while (0)
 
@@ -1238,10 +1296,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_f
         TORCH_CHECK(B == 1, "Varlen mode expects flattened B=1 inputs.");
     }
 
+    const auto state_scalar_type = initial_state.scalar_type();
+    TORCH_CHECK(
+        state_scalar_type == at::ScalarType::Float || state_scalar_type == at::ScalarType::BFloat16,
+        "`initial_state` must be float32 or bfloat16.");
+    const bool state_is_bf16 = state_scalar_type == at::ScalarType::BFloat16;
+
     if (has_initial_state) {
         TORCH_CHECK(initial_state.is_cuda(), "`initial_state` must be a CUDA/HIP tensor.");
-        TORCH_CHECK(initial_state.scalar_type() == at::ScalarType::Float,
-                    "`initial_state` must be float32.");
         TORCH_CHECK(initial_state.dim() == 4,
                     "`initial_state` must have shape [N, H, V, K].");
         TORCH_CHECK(initial_state.size(0) == N && initial_state.size(1) == H,
@@ -1251,7 +1313,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_f
     }
 
     auto bf16_opts = k.options().dtype(at::ScalarType::BFloat16);
-    auto fp32_opts = k.options().dtype(at::ScalarType::Float);
+    auto state_opts = k.options().dtype(state_scalar_type);
     torch::Tensor h = is_varlen
         ? torch::empty({1, total_chunks, H, V_DIM, K_DIM}, bf16_opts)
         : torch::empty({B, NT, H, V_DIM, K_DIM}, bf16_opts);
@@ -1259,7 +1321,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_f
         ? torch::empty({B, H, T_flat, V_DIM}, bf16_opts)
         : torch::Tensor();
     torch::Tensor final_state = output_final_state
-        ? torch::empty({N, H, V_DIM, K_DIM}, fp32_opts)
+        ? torch::empty({N, H, V_DIM, K_DIM}, state_opts)
         : torch::Tensor();
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(k));

@@ -208,6 +208,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
+    state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
 ):
     """
@@ -230,6 +231,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         output_final_state: bool
         cu_seqlens: [N+1] optional
         use_chunk_hip: bool — use HIP kernel for hidden state computation
+        state_dtype: optional output/input state dtype for HIP path (`fp32` or `bf16`)
         use_exp2: bool — use exp2 instead of exp for gate computation
 
     Returns:
@@ -269,9 +271,14 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
+            state_dtype=state_dtype,
             use_exp2=use_exp2,
         )
     else:
+        if state_dtype is not None:
+            raise ValueError(
+                "`state_dtype` is only supported when `use_chunk_hip=True`."
+            )
         h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(
             k=k,
             w=w,
