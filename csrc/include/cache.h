@@ -103,23 +103,4 @@ void fused_qk_rope_concat_and_cache_mla(
     bool is_neox,
     bool is_nope_first);
 
-void fused_qk_norm_rope_group_quant_cache_mla(
-    aiter_tensor_t& q_nope,        // [num_tokens, num_heads, qk_lora_rank]
-    aiter_tensor_t& q_pe,          // [num_tokens, num_heads, pe_dim] (read-only input)
-    aiter_tensor_t& kv_c,          // [num_tokens, k_num_heads, kv_lora_rank]
-    aiter_tensor_t& k_pe,          // [num_tokens, k_num_heads, pe_dim] (read-only input)
-    aiter_tensor_t& k_pe_out,      // [num_tokens, k_num_heads, pe_dim] (RoPE'd output)
-    aiter_tensor_t& k_weight,      // [kv_lora_rank] RMSNorm weights for K
-    aiter_tensor_t& kv_cache,      // [num_blocks, block_size, k_num_heads, kv_lora_rank + pe_dim)]
-    aiter_tensor_t& q_out,         // [num_tokens, num_heads, qk_lora_rank+pe_dim] (fp8: quant nope+pe; bf16: nope+RoPE'd pe)
-    aiter_tensor_t& q_scale_out,   // [num_tokens, num_heads, num_groups] uint8 e8m0 scales (fp8 path)
-    aiter_tensor_t& slot_mapping,  // [num_tokens] or [num_actual_tokens]
-    aiter_tensor_t& positions,     // [num_tokens]
-    aiter_tensor_t& cos_cache,     // [max_position, rot_dim//2]
-    aiter_tensor_t& sin_cache,     // [max_position, rot_dim//2]
-    double eps,                   // epsilon for RMS norm
-    int group_size,               // group size for group quantization (default 64)
-    bool is_neox,
-    bool is_nope_first);
-
 } // namespace aiter

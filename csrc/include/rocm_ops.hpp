@@ -328,41 +328,6 @@ namespace py = pybind11;
           py::arg("cos_cache"),                                                     \
           py::arg("sin_cache"),                                                     \
           py::arg("is_neox"),                                                       \
-          py::arg("is_nope_first"));                                                \
-    m.def("fused_qk_norm_rope_group_quant_cache_mla",                               \
-          &aiter::fused_qk_norm_rope_group_quant_cache_mla,                         \
-          "fused_qk_norm_rope_group_quant_cache_mla("                               \
-          "                     Tensor q_nope, Tensor q_pe,"                        \
-          "                     Tensor kv_c, Tensor k_pe,"                          \
-          "                     Tensor! k_pe_out,"                                  \
-          "                     Tensor k_weight,"                                   \
-          "                     Tensor! kv_cache,"                                  \
-          "                     Tensor! q_out,"                                     \
-          "                     Tensor! q_scale_out,"                               \
-          "                     Tensor slot_mapping,"                               \
-          "                     Tensor positions,"                                  \
-          "                     Tensor cos_cache,"                                  \
-          "                     Tensor sin_cache,"                                  \
-          "                     float eps,"                                         \
-          "                     int group_size,"                                    \
-          "                     bool is_neox,"                                      \
-          "                     bool is_nope_first)->()",                           \
-          py::arg("q_nope"),                                                        \
-          py::arg("q_pe"),                                                          \
-          py::arg("kv_c"),                                                          \
-          py::arg("k_pe"),                                                          \
-          py::arg("k_pe_out"),                                                      \
-          py::arg("k_weight"),                                                      \
-          py::arg("kv_cache"),                                                      \
-          py::arg("q_out"),                                                         \
-          py::arg("q_scale_out"),                                                   \
-          py::arg("slot_mapping"),                                                  \
-          py::arg("positions"),                                                     \
-          py::arg("cos_cache"),                                                     \
-          py::arg("sin_cache"),                                                     \
-          py::arg("eps"),                                                           \
-          py::arg("group_size"),                                                    \
-          py::arg("is_neox"),                                                       \
           py::arg("is_nope_first"));
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
@@ -1612,7 +1577,36 @@ namespace py = pybind11;
           py::arg("k_scale"),                                   \
           py::arg("v_scale"),                                   \
           py::arg("max_tokens_per_batch") = 0);                 \
-    m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);
+    m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);   \
+    m.def("fused_qk_norm_rope_group_quant_cache",                               \
+          &aiter::fused_qk_norm_rope_group_quant_cache,                         \
+          "fused_qk_norm_rope_group_quant_cache("                               \
+          "                     Tensor q,"                                          \
+          "                     Tensor kv,"                                         \
+          "                     Tensor! k_pe_out,"                                  \
+          "                     Tensor k_weight,"                                   \
+          "                     Tensor! kv_cache,"                                  \
+          "                     Tensor! q_out,"                                     \
+          "                     Tensor slot_mapping,"                               \
+          "                     Tensor positions,"                                  \
+          "                     Tensor cos_cache,"                                  \
+          "                     Tensor sin_cache,"                                  \
+          "                     float eps,"                                         \
+          "                     bool is_neox,"                                      \
+          "                     bool is_nope_first)->()",                           \
+          py::arg("q"),                                                             \
+          py::arg("kv"),                                                            \
+          py::arg("k_pe_out"),                                                      \
+          py::arg("k_weight"),                                                      \
+          py::arg("kv_cache"),                                                      \
+          py::arg("q_out"),                                                         \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("positions"),                                                     \
+          py::arg("cos_cache"),                                                     \
+          py::arg("sin_cache"),                                                     \
+          py::arg("eps"),                                                           \
+          py::arg("is_neox"),                                                       \
+          py::arg("is_nope_first"));
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \

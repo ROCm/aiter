@@ -162,3 +162,21 @@ def fused_qk_norm_rope_2way(
     out_q01: Tensor,
     out_k01: Tensor,
 ) -> None: ...
+
+
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+def fused_qk_norm_rope_group_quant_cache(
+    q: Tensor,  # [num_tokens, num_heads, head_dim]
+    kv: Tensor,  # [num_tokens, (k_num_heads,) head_dim]
+    k_pe_out: Tensor,  # [num_tokens, (k_num_heads,) pe_dim] (RoPE'd output)
+    k_weight: Tensor,  # [head_dim] RMSNorm weights
+    kv_cache: Tensor,  # [num_blocks, block_size, (k_num_heads,) head_dim]
+    q_out: Tensor,  # [num_tokens, num_heads, head_dim] bf16 output
+    slot_mapping: Tensor,  # [num_tokens]
+    positions: Tensor,  # [num_tokens]
+    cos_cache: Tensor,  # [max_position, rot_dim//2]
+    sin_cache: Tensor,  # [max_position, rot_dim//2]
+    eps: float,
+    is_neox: bool,
+    is_nope_first: bool,
+) -> None: ...

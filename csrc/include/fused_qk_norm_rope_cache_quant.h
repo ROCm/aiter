@@ -107,4 +107,19 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
     int64_t max_tokens_per_batch = 0   // max tokens in any single batch (0 = use avg)
 );
 
+void fused_qk_norm_rope_group_quant_cache(
+    at::Tensor& q,             // [num_tokens, num_heads, head_dim]
+    at::Tensor& kv,            // [num_tokens, (k_num_heads,) head_dim]
+    at::Tensor& k_pe_out,      // [num_tokens, (k_num_heads,) pe_dim] (RoPE'd output)
+    at::Tensor& k_weight,      // [head_dim] RMSNorm weights
+    at::Tensor& kv_cache,      // [num_blocks, block_size, (k_num_heads,) head_dim]
+    at::Tensor& q_out,         // [num_tokens, num_heads, head_dim] bf16 output (RMS norm + RoPE)
+    at::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
+    at::Tensor& positions,     // [num_tokens]
+    at::Tensor& cos_cache,     // [max_position, rot_dim//2]
+    at::Tensor& sin_cache,     // [max_position, rot_dim//2]
+    double eps,                   // epsilon for RMS norm
+    bool is_neox,
+    bool is_nope_first);
+
 } // namespace aiter
