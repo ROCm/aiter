@@ -659,8 +659,10 @@ def _mhc_post_kernel(
     stride_out_n,
     stride_out_c,
     stride_post_m,
+    stride_post_n,
     stride_comb_m,
     stride_comb_src,
+    stride_comb_dst,
     n: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -689,7 +691,7 @@ def _mhc_post_kernel(
     m_mask = rm < M
 
     post_mix_tile = tl.load(
-        post_mix_ptr + rm[:, None] * stride_post_m + i_n[None, :],
+        post_mix_ptr + rm[:, None] * stride_post_m + i_n[None, :] * stride_post_n,
         mask=m_mask[:, None],
         other=0.0,
     )
@@ -705,7 +707,7 @@ def _mhc_post_kernel(
                 comb_mix_ptr
                 + rm[:, None] * stride_comb_m
                 + h * stride_comb_src
-                + i_n[None, :],
+                + i_n[None, :] * stride_comb_dst,
                 mask=m_mask[:, None],
                 other=0.0,
             ),
