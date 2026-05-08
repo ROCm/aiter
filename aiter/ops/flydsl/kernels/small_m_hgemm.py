@@ -1270,7 +1270,9 @@ def compile_small_m_hgemm_kernel(
                     2 + TOTAL_C_FRAGS_LEN : 2 + TOTAL_C_FRAGS_LEN + A_FRAGS_LEN
                 ]
                 b_frags = state[
-                    2 + TOTAL_C_FRAGS_LEN + A_FRAGS_LEN : 2
+                    2
+                    + TOTAL_C_FRAGS_LEN
+                    + A_FRAGS_LEN : 2
                     + TOTAL_C_FRAGS_LEN
                     + A_FRAGS_LEN
                     + TOTAL_B_FRAGS_LEN
@@ -1309,7 +1311,9 @@ def compile_small_m_hgemm_kernel(
                 2 + TOTAL_C_FRAGS_LEN : 2 + TOTAL_C_FRAGS_LEN + A_FRAGS_LEN
             ]
             b_frags = results[
-                2 + TOTAL_C_FRAGS_LEN + A_FRAGS_LEN : 2
+                2
+                + TOTAL_C_FRAGS_LEN
+                + A_FRAGS_LEN : 2
                 + TOTAL_C_FRAGS_LEN
                 + A_FRAGS_LEN
                 + TOTAL_B_FRAGS_LEN
