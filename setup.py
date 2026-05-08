@@ -14,9 +14,7 @@ OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.
 PACKAGE_NAME = "amd-aiter"
 
 FLYDSL_VERSION = "flydsl==0.1.6.dev20260508"
-FLYDSL_FIND_LINKS = (
-    "https://rocm.frameworks-devreleases.amd.com/whl/gfx942-gfx950/flydsl/"
-)
+FLYDSL_WHEEL_URL = "https://rocm.frameworks-devreleases.amd.com/whl/gfx942-gfx950/flydsl/flydsl-0.1.6.dev20260508%2B05f188b-cp312-cp312-manylinux_2_27_x86_64.whl"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -73,9 +71,7 @@ if not IS_WINDOWS and is_develop_mode():
                     "install",
                     "--force-reinstall",
                     "--no-deps",
-                    FLYDSL_VERSION,
-                    "--find-links",
-                    FLYDSL_FIND_LINKS,
+                    FLYDSL_WHEEL_URL,
                 ]
             )
         except Exception:
