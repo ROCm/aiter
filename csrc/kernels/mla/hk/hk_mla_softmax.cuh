@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include "custom_all_reduce.cuh"
 #include "hk_mla_utils.cuh"
 
 template <bool kCheckBoundary, uint32_t GPR>
@@ -296,7 +295,7 @@ __device__ __forceinline__ void softmax_p0(comp_t* p_row_max,
     constexpr int32_t reduce_range = opus::get_warp_size();
     constexpr int32_t stop_stride  = opus::get_warp_size() / 4 - 1;
     local_max =
-        aiter::warpReduce<aiter::MaxFunctor, decltype(local_max), reduce_range, stop_stride>(
+        hk_mla::warp_reduce<aiter::MaxFunctor, decltype(local_max), reduce_range, stop_stride>(
             local_max);
 
     const comp_t new_row_max = kIsFirstIter ? local_max : opus::max(local_max, *p_row_max);
@@ -362,7 +361,7 @@ softmax_p1(comp_t* p_row_sum_e, const comp_t new_row_max, const comp_t rescale)
     constexpr int32_t reduce_range = opus::get_warp_size();
     constexpr int32_t stop_stride  = opus::get_warp_size() / 4 - 1;
     local_sum_e =
-        aiter::warpReduce<aiter::AddFunctor, decltype(local_sum_e), reduce_range, stop_stride>(
+        hk_mla::warp_reduce<aiter::AddFunctor, decltype(local_sum_e), reduce_range, stop_stride>(
             local_sum_e);
 
     *p_row_sum_e = kIsFirstIter ? local_sum_e : (rescale * (*p_row_sum_e) + local_sum_e);
@@ -462,7 +461,7 @@ softmax_p1_16(comp_t* p_row_sum_e, const comp_t new_row_max, const comp_t rescal
     constexpr int32_t reduce_range = opus::get_warp_size();
     constexpr int32_t stop_stride  = opus::get_warp_size() / 4 - 1;
     local_sum_e =
-        aiter::warpReduce<aiter::AddFunctor, decltype(local_sum_e), reduce_range, stop_stride>(
+        hk_mla::warp_reduce<aiter::AddFunctor, decltype(local_sum_e), reduce_range, stop_stride>(
             local_sum_e);
 
     *p_row_sum_e = kIsFirstIter ? local_sum_e : (rescale * (*p_row_sum_e) + local_sum_e);

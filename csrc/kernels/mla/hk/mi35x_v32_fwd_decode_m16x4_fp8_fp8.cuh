@@ -11,6 +11,8 @@
 #include <assert.h>
 #include <torch/python.h>
 
+using namespace hk_mla;
+
 #if defined(__gfx950__)
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
@@ -683,8 +685,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             {
                 constexpr int32_t reduce_range = opus::get_warp_size();
                 constexpr int32_t stop_stride  = opus::get_warp_size() / 4 - 1;
-                local_max                      = aiter::
-                    warpReduce<aiter::MaxFunctor, decltype(local_max), reduce_range, stop_stride>(
+                local_max =
+                    warp_reduce<aiter::MaxFunctor, decltype(local_max), reduce_range, stop_stride>(
                         local_max);
             }
 
@@ -1208,9 +1210,7 @@ template <typename T>
 __global__ __launch_bounds__(
     T::kNumThreads,
     T::kOccupancy) void kn_mi35x_mla_v32_fwd_decode_m16x4_fp8_fp8(HkMlaDecodeFwdParams<T> params)
-{
-    assert(false);
-}
+{ assert(false); }
 #endif
 
 template <typename Traits>
@@ -1318,8 +1318,8 @@ void hk_mi35x_mla_v32_fwd_decode_m16x4_fp8_fp8(torch::Tensor& query,
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(final_output));
 
-    const bool q_is_fp8 = (query.scalar_type() == at::ScalarType::Float8_e4m3fn) ||
-                          (query.scalar_type() == at::ScalarType::Float8_e4m3fnuz);
+    const bool q_is_fp8  = (query.scalar_type() == at::ScalarType::Float8_e4m3fn) ||
+                           (query.scalar_type() == at::ScalarType::Float8_e4m3fnuz);
     const bool kv_is_fp8 = (kv_buffer.scalar_type() == at::ScalarType::Float8_e4m3fn) ||
                            (kv_buffer.scalar_type() == at::ScalarType::Float8_e4m3fnuz);
 

@@ -11,6 +11,8 @@
 #include <assert.h>
 #include <torch/python.h>
 
+using namespace hk_mla;
+
 #if defined(__gfx942__)
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
@@ -822,9 +824,7 @@ template <typename T>
 __global__ __launch_bounds__(
     T::kNumThreads,
     T::kOccupancy) void kn_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(HkMlaDecodeFwdParams<T> params)
-{
-    assert(false);
-}
+{ assert(false); }
 #endif
 
 template <typename Traits>
@@ -929,8 +929,8 @@ void hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(final_output));
 
-    const bool q_is_fp8 = (query.scalar_type() == at::ScalarType::Float8_e4m3fn) ||
-                          (query.scalar_type() == at::ScalarType::Float8_e4m3fnuz);
+    const bool q_is_fp8  = (query.scalar_type() == at::ScalarType::Float8_e4m3fn) ||
+                           (query.scalar_type() == at::ScalarType::Float8_e4m3fnuz);
     const bool kv_is_fp8 = (kv_buffer.scalar_type() == at::ScalarType::Float8_e4m3fn) ||
                            (kv_buffer.scalar_type() == at::ScalarType::Float8_e4m3fnuz);
 
