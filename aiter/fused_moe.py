@@ -173,7 +173,7 @@ def fused_moe(
     bias2=None,
     splitk=0,
     swiglu_limit=0.0,
-    gate_mode: str = GateMode.SEPARATED.value,
+    gate_mode: Optional[str] = GateMode.SEPARATED.value,
 ):
     if not block_size_M:
         block_size_M = -1
