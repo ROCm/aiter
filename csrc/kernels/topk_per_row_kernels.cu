@@ -2382,6 +2382,51 @@ invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Prefill>(int32_t, int
 template int64_t
 invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Decode>(int32_t, int32_t, int);
 
+// Raw-pointer entry called by topk_plain_kernels.cu via topk_per_row_kernel_launcher.
+void radix_topk_dispatch(void* buf,
+                         size_t& buf_size,
+                         float const* in,
+                         int batch_size,
+                         int64_t len,
+                         int* rowStarts,
+                         int* rowEnds,
+                         int k,
+                         float* out,
+                         int* out_idx,
+                         bool greater,
+                         hipStream_t stream)
+{
+    const bool select_min = !greater;
+
+    if (aiter::should_use_mulblocks(batch_size, len)) {
+        if (out) {
+            aiter::mb::standalone_stable_radix_topk<float, int, true, true,
+                aiter::mb::Phase::Prefill>(
+                buf, buf_size, in, batch_size, len,
+                rowStarts, rowEnds, k, out, out_idx, greater, stream);
+        } else {
+            aiter::mb::standalone_stable_radix_topk<float, int, false, true,
+                aiter::mb::Phase::Prefill>(
+                buf, buf_size, in, batch_size, len,
+                rowStarts, rowEnds, k, nullptr, out_idx, greater, stream);
+        }
+    } else {
+        if (out) {
+            aiter::ob::dispatch_topk_oneblock<float, int, 1024, true,
+                aiter::ob::Phase::Prefill>(
+                buf, buf_size, in, static_cast<int*>(nullptr),
+                batch_size, len, rowStarts, rowEnds,
+                k, out, out_idx, select_min, stream, true);
+        } else {
+            aiter::ob::dispatch_topk_oneblock<float, int, 1024, false,
+                aiter::ob::Phase::Prefill>(
+                buf, buf_size, in, static_cast<int*>(nullptr),
+                batch_size, len, rowStarts, rowEnds,
+                k, nullptr, out_idx, select_min, stream, true);
+        }
+    }
+}
+
 // Prefill entry: dispatches to mb or ob based on batch size and seq_len.
 void top_k_per_row_prefill(const torch::Tensor& logits,
                            const torch::Tensor& rowStarts,
