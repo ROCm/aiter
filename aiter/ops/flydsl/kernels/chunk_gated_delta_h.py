@@ -119,7 +119,7 @@ def compile_chunk_gated_delta_h(
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    _K5_KERNEL_REVISION = 2  # OPT-D/H/F/7/4 applied
+    _K5_KERNEL_REVISION = 5  # OPT-D/H/F/7/4 + OPT-K (k prefetch interleaved into GEMM1)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -424,7 +424,13 @@ def compile_chunk_gated_delta_h(
             gpu.barrier()
 
             # -- 2. Delta correction: b_v = w @ h, then v_new = u - b_v --
-            k_prefetch = []
+            # OPT-K: k prefetch is interleaved into the GEMM1 main loop below
+            # so the 4 buffer_load_dwordx4 are issued one per (mfma_kb, ks)
+            # iteration and their HBM latency is hidden by the MFMA chain.
+            # Here we only precompute the per-batch HBM byte offsets and the
+            # LDS write offsets; the actual vec_load is emitted inside the
+            # GEMM1 loop.
+            k_prefetch_off = []
             k_prefetch_lds = []
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for batch in range_constexpr(NUM_LOAD_BATCHES_64):
@@ -432,13 +438,16 @@ def compile_chunk_gated_delta_h(
                     abs_row = i_t_i32 * fx.Int32(BT) + row
                     in_bounds = arith.cmpi(arith.CmpIPredicate.slt, abs_row, T_local)
                     safe_row = arith.select(in_bounds, abs_row, fx.Int32(0))
-                    g_off = (
+                    k_off = (
                         k_base + safe_row * stride_k + fx.Int32(kb * 64) + load_col_base
                     )
-                    k_prefetch.append(k_.vec_load((fx.Index(g_off),), LOAD_VEC_WIDTH))
+                    k_prefetch_off.append(k_off)
                     k_prefetch_lds.append(
                         row * fx.Int32(LDS_K_STRIDE) + fx.Int32(kb * 64) + load_col_base
                     )
+
+            # k_prefetch results are filled inside the GEMM1 main loop below.
+            k_prefetch = [None] * len(k_prefetch_off)
 
             # Compute last_idx for the current chunk (shared by USE_G / USE_GK)
             if const_expr(USE_G or USE_GK):
@@ -514,9 +523,19 @@ def compile_chunk_gated_delta_h(
                 bv_accs.append(arith.constant_vector(0.0, T.f32x4))
 
             K_STEPS_PER_BLOCK = 64 // WMMA_K
+            NUM_K_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
 
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for ks in range_constexpr(K_STEPS_PER_BLOCK):
+                    # OPT-K: issue one k_prefetch vec_load per (kb, ks) slot to
+                    # spread the 4 buffer_load_dwordx4 across the MFMA chain
+                    # so HBM latency is hidden by the MFMA dependency chain.
+                    mfma_slot = kb * K_STEPS_PER_BLOCK + ks
+                    if mfma_slot < NUM_K_LOADS:
+                        k_prefetch[mfma_slot] = k_.vec_load(
+                            (fx.Index(k_prefetch_off[mfma_slot]),), LOAD_VEC_WIDTH
+                        )
+
                     w_lds_row_idx = wid_idx * arith.index(16) + lane_n_idx
                     w_lds_col_idx = arith.index(
                         kb * 64 + ks * WMMA_K
