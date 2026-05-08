@@ -27,6 +27,12 @@ import torch
 
 _LOGGER = logging.getLogger(__name__)
 
+# Set FLYDSL_ROPE_DISABLE=1 to force Triton fallback (useful for perf A/B comparisons).
+_DISABLED = _os.environ.get("FLYDSL_ROPE_DISABLE", "0") == "1"
+# Set FLYDSL_ROPE_DEBUG=1 to log the first call's shapes/dtypes (one-shot).
+_DEBUG = _os.environ.get("FLYDSL_ROPE_DEBUG", "0") == "1"
+_debug_printed = False
+
 # Prefer dsl2 source kernel (editable install) over vendored copy,
 # because the dsl2 kernels/ package includes kernels_common side effects
 # needed for correct buffer_ops initialization.
@@ -62,7 +68,8 @@ except ImportError:
 
 @functools.lru_cache(maxsize=64)
 def _get_launch_fn(
-    head_dim, num_q_heads, num_kv_heads, block_size, flash_layout, dtype_str
+    head_dim, num_q_heads, num_kv_heads, block_size, flash_layout, dtype_str,
+    apply_scale, reuse_freqs_front_part, pos_dtype, x_size,
 ):
     """Compile and cache FlyDSL kernel for given configuration."""
     return build_fused_rope_cache_module(
@@ -73,6 +80,10 @@ def _get_launch_fn(
         is_neox=True,
         flash_layout=flash_layout,
         dtype_str=dtype_str,
+        apply_scale=apply_scale,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        pos_dtype=pos_dtype,
+        x_size=x_size,
     )
 
 
@@ -102,10 +113,29 @@ def flydsl_fused_qk_rope_reshape_and_cache(
     Supports the same interface as the Triton version. Unsupported features
     (offsets, scale, zeros, non-NeoX) fall back to Triton automatically.
     """
+    global _debug_printed
     t, qh, d = q.shape
     _, kh, _ = k.shape
 
+    if _DEBUG and not _debug_printed:
+        _debug_printed = True
+        print(
+            f"[FlyDSL RoPE DEBUG] q={tuple(q.shape)} dtype={q.dtype} "
+            f"k={tuple(k.shape)} v={tuple(v.shape)}\n"
+            f"  key_cache={tuple(key_cache.shape)} dtype={key_cache.dtype} "
+            f"  value_cache={tuple(value_cache.shape)}\n"
+            f"  cos={tuple(cos.shape)} sin={tuple(sin.shape)}\n"
+            f"  pos={tuple(pos.shape)} dtype={pos.dtype} "
+            f"  slot_mapping={tuple(slot_mapping.shape)} dtype={slot_mapping.dtype}\n"
+            f"  is_neox={is_neox} flash_layout={flash_layout} "
+            f"apply_scale={apply_scale} output_zeros={output_zeros} offs={offs is not None}"
+        )
+
     # Common fallback args — avoids repeating the 18-arg list at every guard.
+    if _DISABLED:
+        return _triton_fallback(q, k, v, key_cache, value_cache, slot_mapping, pos,
+                                cos, sin, k_scale, v_scale, is_neox, flash_layout,
+                                apply_scale, offs, q_out, k_out, output_zeros, zeros_out)
     _fb = (
         q,
         k,
@@ -128,21 +158,15 @@ def flydsl_fused_qk_rope_reshape_and_cache(
         zeros_out,
     )
 
+    # -- Adapt cos/sin to 2D [max_pos, cos_dim] --
+    if cos.ndim == 4:
+        cos_2d = cos.squeeze(1).squeeze(1)
+        sin_2d = sin.squeeze(1).squeeze(1)
+    else:
+        cos_2d = cos
+        sin_2d = sin
+
     # -- Fallback conditions --
-    # FlyDSL soffset codegen has issues for T>1 (prefill). Decode (T=1) is reliable.
-    if t > 1:
-        _LOGGER.debug("FlyDSL RoPE: T>1 not stable, falling back to Triton")
-        return _triton_fallback(*_fb)
-
-    # FlyDSL kernel only supports half-dim cos/sin (reuse_freqs_front_part=True).
-    if cos.shape[-1] != d // 2:
-        _LOGGER.debug("FlyDSL RoPE: full-dim cos/sin not supported, falling back")
-        return _triton_fallback(*_fb)
-
-    if not flash_layout:
-        _LOGGER.debug("FlyDSL RoPE: non-flash layout not supported, falling back")
-        return _triton_fallback(*_fb)
-
     if not is_neox:
         _LOGGER.debug("FlyDSL RoPE: GPT-J style not supported, falling back")
         return _triton_fallback(*_fb)
@@ -155,8 +179,13 @@ def flydsl_fused_qk_rope_reshape_and_cache(
         _LOGGER.debug("FlyDSL RoPE: zeros output not supported, falling back")
         return _triton_fallback(*_fb)
 
-    if apply_scale and (k_scale is not None or v_scale is not None):
-        _LOGGER.debug("FlyDSL RoPE: KV scale not supported, falling back")
+    # Detect half-dim [max_pos, D//2] or full-dim [max_pos, D] cos/sin.
+    if cos_2d.shape[-1] == d // 2:
+        reuse_freqs_front_part = True
+    elif cos_2d.shape[-1] == d:
+        reuse_freqs_front_part = False
+    else:
+        _LOGGER.debug(f"FlyDSL RoPE: unexpected cos/sin shape {cos.shape} for head_dim={d}, falling back")
         return _triton_fallback(*_fb)
 
     # -- Determine dtype --
@@ -168,8 +197,12 @@ def flydsl_fused_qk_rope_reshape_and_cache(
         _LOGGER.debug(f"FlyDSL RoPE: unsupported dtype {q.dtype}, falling back")
         return _triton_fallback(*_fb)
 
-    # -- Determine block_size (flash_layout guaranteed True here) --
-    block_size = key_cache.shape[1]
+    # apply_scale=True only when fp8 KV cache; k_scale/v_scale must be non-None tensors
+    _apply_scale = bool(apply_scale and k_scale is not None and v_scale is not None)
+
+    # -- Determine block_size and x_size --
+    block_size = key_cache.shape[1] if flash_layout else key_cache.shape[3]
+    _x_size = 16 if flash_layout else key_cache.shape[-1]
 
     # -- Allocate outputs if needed --
     if q_out is None:
@@ -177,27 +210,41 @@ def flydsl_fused_qk_rope_reshape_and_cache(
     if k_out is None:
         k_out = torch.empty_like(k)
 
-    # -- Adapt cos/sin to 2D [max_pos, D//2] --
-    if cos.ndim == 4:
-        cos_2d = cos.squeeze(1).squeeze(1)
-        sin_2d = sin.squeeze(1).squeeze(1)
-    elif cos.ndim == 2:
-        cos_2d = cos
-        sin_2d = sin
+    # Zero-copy int64 → int32 reinterpret: .view(torch.int32) changes dtype
+    # metadata without launching a CUDA cast kernel.  An int64 tensor of
+    # shape [T] becomes int32 of shape [2*T]; on little-endian the low 32
+    # bits of element i sit at index 2*i.  The kernel compensates via
+    # stride-2 indexing when pos_dtype == "i64".
+    if pos.dtype == torch.int64:
+        pos_i32 = pos.view(torch.int32)       # shape [2*T], zero-copy
+        pos_dtype = "i64"
     else:
-        cos_2d = cos
-        sin_2d = sin
+        pos_i32 = pos                         # already int32
+        pos_dtype = "i32"
 
-    # -- Cast positions and slot_mapping to int32 (FlyDSL kernel uses i32) --
-    pos_i32 = pos.to(torch.int32) if pos.dtype != torch.int32 else pos
-    slot_i32 = (
-        slot_mapping.to(torch.int32)
-        if slot_mapping.dtype != torch.int32
-        else slot_mapping
-    )
+    if slot_mapping.dtype == torch.int64:
+        slot_i32 = slot_mapping.view(torch.int32)  # shape [2*T], zero-copy
+    else:
+        slot_i32 = slot_mapping                    # already int32
+
+    # -- Scale tensors: FlyDSL requires at least 1D; scalars must be reshaped --
+    if _apply_scale:
+        k_scale_arg = k_scale if k_scale.dtype == torch.float32 else k_scale.float()
+        v_scale_arg = v_scale if v_scale.dtype == torch.float32 else v_scale.float()
+        if k_scale_arg.ndim == 0:
+            k_scale_arg = k_scale_arg.reshape(1)
+        if v_scale_arg.ndim == 0:
+            v_scale_arg = v_scale_arg.reshape(1)
+    else:
+        # Kernel compiled with apply_scale=False ignores these args entirely.
+        # torch.empty avoids a fill kernel (unlike torch.ones) — safe in CUDAGraph.
+        _placeholder = torch.empty(1, dtype=torch.float32, device=q.device)
+        k_scale_arg = _placeholder
+        v_scale_arg = _placeholder
 
     # -- Get compiled kernel --
-    launch_fn = _get_launch_fn(d, qh, kh, block_size, flash_layout, dtype_str)
+    launch_fn = _get_launch_fn(d, qh, kh, block_size, flash_layout, dtype_str,
+                               _apply_scale, reuse_freqs_front_part, pos_dtype, _x_size)
 
     # -- Launch --
     stream = torch.cuda.current_stream()
@@ -216,6 +263,8 @@ def flydsl_fused_qk_rope_reshape_and_cache(
         q_out,
         k_out,
         num_tokens,
+        k_scale_arg,
+        v_scale_arg,
         stream=stream,
     )
 
