@@ -373,7 +373,7 @@ def mhc_post(
     assert layer_input.device.type == "cuda", "mHC post kernel requires CUDA device"
 
     if config is None:
-        config, _ = get_mhc_post_config(M, C)
+        config = get_mhc_post_config(M, C)
     config = dict(config)  # Always copy to avoid mutating LRU cache
 
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)

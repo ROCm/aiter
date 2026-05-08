@@ -1,5 +1,5 @@
 {
-    "any": {
+    "default": {
         "BLOCK_M": 64,
         "BLOCK_C": 256,
         "num_warps": 4,
