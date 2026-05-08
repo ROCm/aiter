@@ -13,8 +13,10 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.1.6.dev20260508"
-FLYDSL_WHEEL_URL = "https://rocm.frameworks-devreleases.amd.com/whl/gfx942-gfx950/flydsl/flydsl-0.1.6.dev20260508%2B05f188b-cp312-cp312-manylinux_2_27_x86_64.whl"
+FLYDSL_VERSION = "flydsl==0.1.6.dev20260508+05f188b"
+FLYDSL_FIND_LINKS = (
+    "https://rocm.frameworks-devreleases.amd.com/whl/gfx942-gfx950/flydsl/"
+)
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -59,7 +61,9 @@ if not IS_WINDOWS and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
 
-        if pkg_version("flydsl") != FLYDSL_VERSION.split("==")[1]:
+        _installed = pkg_version("flydsl")
+        _required_base = FLYDSL_VERSION.split("==")[1].split("+")[0]
+        if not _installed or not _installed.startswith(_required_base):
             raise ImportError("version mismatch")
     except Exception:
         try:
@@ -71,7 +75,9 @@ if not IS_WINDOWS and is_develop_mode():
                     "install",
                     "--force-reinstall",
                     "--no-deps",
-                    FLYDSL_WHEEL_URL,
+                    FLYDSL_VERSION,
+                    "--find-links",
+                    FLYDSL_FIND_LINKS,
                 ]
             )
         except Exception:
