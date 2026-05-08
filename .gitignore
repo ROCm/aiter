@@ -80,3 +80,6 @@ scripts/results/*.csv
 # Jupyter notebook checkpoints and outputs
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
+
+*.swo
+*.swp
