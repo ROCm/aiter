@@ -1177,8 +1177,7 @@ namespace py = pybind11;
           py::arg("correction_bias"),                    \
           py::arg("need_renorm"),                        \
           py::arg("routed_scaling_factor") = 1.0,        \
-          py::arg("score_func") = "sqrtsoftplus",        \
-          "Fused topk gating: score_func='sqrtsoftplus'|'sigmoid'|'softmax'.");
+          "Apply topk sqrtsoftplus to the gating outputs.");
 
 #define MOE_SORTING_PYBIND                             \
     m.def("moe_sorting_fwd",                           \

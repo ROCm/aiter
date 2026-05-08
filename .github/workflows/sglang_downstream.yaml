@@ -159,7 +159,7 @@ jobs:
           set -ex
           cd "${SGLANG_WORKSPACE}"
           > github_summary.md
-          mapfile -t MODEL_ENV_ARGS < <(python3 ./.github/scripts/sglang_downstream.py model-env-args)
+          mapfile -t MODEL_ENV_ARGS < <(python3 "${GITHUB_WORKSPACE}/.github/scripts/sglang_downstream.py" model-env-args)
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             "${MODEL_ENV_ARGS[@]}" \
