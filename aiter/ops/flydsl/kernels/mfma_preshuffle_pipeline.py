@@ -117,7 +117,13 @@ def make_preshuffle_scale_layout(
     c_k_scale = _div_pow2(c_k, scale_block_size)
 
     c_mn1 = _div_pow2(_div_pow2(c_mn, 16), mn_pack)
-    c_k1 = _div_pow2(_div_pow2(c_k_scale, 4), k_pack)
+    # K scale blocks are not always a full (4 lanes * k_pack) group, e.g.
+    # inter_dim=384 has 12 MXFP4 scale blocks. Use ceil-div so the final
+    # partial K group remains addressable instead of aliasing/OOBing.
+    c_k1 = _div_pow2(
+        _div_pow2(c_k_scale + arith.constant(4 * k_pack - 1, index=True), 4),
+        k_pack,
+    )
     if elem_bytes != mn_pack * k_pack:
         raise ValueError(
             f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"

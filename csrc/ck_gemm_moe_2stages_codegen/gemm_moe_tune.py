@@ -503,6 +503,7 @@ class FmoeTuner(TunerCommon):
             use_async_copy=kparams.get("use_async_copy", False),
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
+            mfma_variant=kparams.get("mfma_variant", None),
         )
 
     @staticmethod
@@ -997,7 +998,11 @@ class FmoeTuner(TunerCommon):
         w1_qt_shffle_flydsl = w1_qt_shffle_ck
         w2_qt_shffle_flydsl = w2_qt_shffle_ck
         w1_scale_flydsl = w1_scale_aiter
-        w2_scale_flydsl = w2_scale_aiter
+        w2_scale_flydsl = (
+            shuffle_scale_a16w4(w2_scale, expert, False)
+            if q_dtype_w2 == dtypes.fp4x2
+            else w2_scale_aiter
+        )
         if stage == 1:
             if not doweight_stage1:
                 sorted_weights = None
@@ -1062,7 +1067,7 @@ class FmoeTuner(TunerCommon):
                 torch_quant = aiter.get_torch_quant(q_type2)
                 a2_qt, a2_scale = torch_quant(ref1, quant_dtype=q_dtype_a2)
                 a2_scale_mxfp4_sort = moe_mxfp4_sort(
-                    a2_scale[: token * topk, :].view(token, topk, -1),
+                    a2_scale[: token * topk].view(token, topk, -1),
                     sorted_ids=sorted_ids,
                     num_valid_ids=num_valid_ids,
                     token_num=token,
@@ -2841,6 +2846,21 @@ class FmoeTuner(TunerCommon):
             )
             prorfiles.append(profileDF)
 
+            # Keep FlyDSL stage2 correctness strict even when the CLI errRatio is
+            # relaxed for exploration. A failed stage2 can still report err<1.0,
+            # which would otherwise let an inaccurate kernel reach the final tune.
+            _bad_flydsl_s2 = (
+                (profileDF["stage"] == "stage2")
+                & profileDF["kernelName"].astype(str).str.startswith("flydsl_")
+                & (profileDF["err"] > 0.05)
+            )
+            if _bad_flydsl_s2.any():
+                print(
+                    "  drop inaccurate FlyDSL stage2 candidates:",
+                    int(_bad_flydsl_s2.sum()),
+                )
+                profileDF = profileDF.loc[~_bad_flydsl_s2].reset_index(drop=True)
+
             ## remove invalid candidate
             profileDF = profileDF[
                 (profileDF["us"] != float("-inf"))
@@ -3001,15 +3021,27 @@ class FmoeTuner(TunerCommon):
                 self.failed = pd.concat([self.failed, failedf], axis=0)
                 continue
             if q_type == QuantType.per_1x32:
-                from aiter.test_common import run_perftest
-                from aiter.ops.quant import (
-                    fused_dynamic_mxfp4_quant_moe_sort,
-                )
-
                 us_qs_cache = {}
                 for bm in profileDF["block_m"].unique():
                     bm_int = int(bm)
                     block_size = max(32, bm_int)
+                    skip_tiny_qs = (
+                        token * topk <= block_size
+                        and os.getenv("AITER_FMOE_BENCH_TINY_QUANT_SORT", "0") != "1"
+                    )
+                    if skip_tiny_qs:
+                        us_qs_cache[bm] = 0.0
+                        print(
+                            f"  skip quant_sort benchmark for tiny shape: "
+                            f"blockM={bm_int}, token*topk={token * topk}"
+                        )
+                        continue
+
+                    from aiter.test_common import run_perftest
+                    from aiter.ops.quant import (
+                        fused_dynamic_mxfp4_quant_moe_sort,
+                    )
+
                     num_sorted = (
                         (token * topk + block_size - 1) // block_size
                     ) * block_size

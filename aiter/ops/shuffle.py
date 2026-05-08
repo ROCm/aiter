@@ -35,10 +35,10 @@ def shuffle_weight_NK(
         kPerLane *= 2
     assert (
         x.shape[-2] % inst_N == 0
-    ), f"{x.shape[-2]} % {inst_N} == {x.shape[-2] % N_WARP_TILE }"
+    ), f"{x.shape[-2]} % {inst_N} == {x.shape[-2] % inst_N}"
     assert (
         x.shape[-1] % inst_K == 0
-    ), f"{x.shape[-1]} % {inst_K} == {x.shape[-1] % K_WARP_TILE }"
+    ), f"{x.shape[-1]} % {inst_K} == {x.shape[-1] % inst_K}"
 
     x_ = x
     x_ = x_.view(
@@ -87,6 +87,16 @@ def shuffle_scale_a16w4(
     src: torch.Tensor, experts_cnt: int, gate_up: bool
 ) -> torch.Tensor:
     n_experts, k_ = src.shape
+    if k_ % 8 != 0:
+        src_padded = torch.zeros(
+            n_experts,
+            (k_ + 7) // 8 * 8,
+            dtype=src.dtype,
+            device=src.device,
+        )
+        src_padded[:, :k_] = src
+        src = src_padded
+        k_ = src.shape[1]
     n_ = n_experts // experts_cnt
     # MXFP4 constants
     K_Pack = 2

@@ -693,5 +693,9 @@ def moe_mxfp4_sort(
         grid = (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_i, BLOCK_SIZE_N))
         _moe_mxfp4_sort_kernel[grid](*common_args, **common_kwargs)
 
-    # Reshape the output to the final shape
-    return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o)
+    # Reshape the output to the final padded shape. The kernel stores N in
+    # BLOCK_SIZE_N groups; for N that is not a multiple of 8 (e.g. inter_dim=384
+    # -> 12 scale columns), keeping the padded columns preserves the shuffled
+    # layout that FlyDSL/CK scale loads expect.
+    N_o_padded = triton.cdiv(N_o, BLOCK_SIZE_N) * BLOCK_SIZE_N
+    return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o_padded)

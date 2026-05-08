@@ -4,6 +4,7 @@
 """FlyDSL MOE kernel management: naming, compilation, and high-level API."""
 
 import functools
+import os
 import re
 
 from typing import Dict, Optional
@@ -15,6 +16,32 @@ import torch
 _KERNEL_PARAMS: Dict[str, Dict] = {}
 
 _SUFFIX_RE = re.compile(r"(?P<fq>_fq)?(?:_sbm(?P<sbm>\d+))?$")
+_KERNEL_NAME_RE = re.compile(
+    r"^flydsl_moe(?P<stage>[12])_a(?P<a>.+?)_w(?P<b>.+?)_"
+    r"(?P<out>bf16|f16)_t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)"
+    r"(?:_(?P<rest>.*))?$"
+)
+
+_MFMA16_ALIASES = {"16", "16x16", "16x16x128", "mfma16", "mfma16k128"}
+_MFMA32_ALIASES = {"32", "32x32", "32x32x64", "mfma32", "mfma32k64"}
+
+
+def _stage2_mfma_variant_tag(tile_k: int, a_dtype: str, b_dtype: str) -> str:
+    """Return the FP4 stage2 MFMA variant tag needed in kernel names."""
+    if a_dtype != "fp4" or b_dtype != "fp4":
+        return ""
+    if int(tile_k) == 128:
+        return "mfma32k64"
+
+    variant = os.environ.get("FLIR_MOE_STAGE2_MFMA", "16x16x128").strip().lower()
+    if not variant or variant in _MFMA16_ALIASES:
+        return ""
+    if variant in _MFMA32_ALIASES:
+        return "mfma32k64"
+    raise ValueError(
+        "FLIR_MOE_STAGE2_MFMA must be '16x16x128' or '32x32x64', "
+        f"got {variant!r}"
+    )
 
 
 def flydsl_kernel_name(
@@ -40,6 +67,62 @@ def flydsl_kernel_name(
     return name
 
 
+def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
+    match = _KERNEL_NAME_RE.match(name)
+    if match is None:
+        return None
+
+    stage = int(match.group("stage"))
+    a_dtype = match.group("a")
+    b_dtype = match.group("b")
+    params: Dict = {
+        "stage": stage,
+        "a_dtype": a_dtype,
+        "b_dtype": b_dtype,
+        "out_dtype": match.group("out"),
+        "tile_m": int(match.group("tm")),
+        "tile_n": int(match.group("tn")),
+        "tile_k": int(match.group("tk")),
+        "MPerBlock": int(match.group("tm")),
+        "use_async_copy": False,
+        "waves_per_eu": 1 if b_dtype == "fp4" else 0,
+        "b_nt": 2,
+    }
+    if stage == 1:
+        params.update({"k_batch": 1, "gate_only": False})
+    else:
+        params.update({"mode": "atomic", "sort_block_m": 0, "persist": False})
+
+    for token in (match.group("rest") or "").split("_"):
+        if not token:
+            continue
+        if token == "async":
+            params["use_async_copy"] = True
+        elif stage == 2 and token in ("atomic", "reduce"):
+            params["mode"] = token
+        elif token in ("mfma16k128", "mfma32k64"):
+            params["mfma_variant"] = token
+        elif token.startswith("w") and token[1:].isdigit():
+            params["waves_per_eu"] = int(token[1:])
+        elif token.startswith("bnt") and token[3:].isdigit():
+            params["b_nt"] = int(token[3:])
+        elif stage == 1 and token.startswith("kb") and token[2:].isdigit():
+            params["k_batch"] = int(token[2:])
+        elif stage == 1 and token == "go":
+            params["gate_only"] = True
+        elif stage == 1 and token == "fq":
+            params["fuse_fp4_quant"] = True
+        elif stage == 2 and token == "persist":
+            params["persist"] = True
+        elif token.startswith("sbm") and token[3:].isdigit():
+            params["sort_block_m"] = int(token[3:])
+        elif token == "fq":
+            params["fuse_fp4_quant"] = True
+        else:
+            return None
+    return params
+
+
 def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
     """Lookup kernel params by name. Strips ``_fq`` / ``_sbm{N}`` suffixes transparently."""
     params = _KERNEL_PARAMS.get(name)
@@ -56,7 +139,7 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
             if m.group("sbm") is not None:
                 extra["sort_block_m"] = int(m.group("sbm"))
             return {**params, **extra}
-    return None
+    return _parse_flydsl_kernel_name(name)
 
 
 def _x_load_supported(
@@ -168,7 +251,7 @@ def get_flydsl_stage2_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     tile_ns = [128, 256] if is_fp4 else [128, 256]
-    tile_ks = [256] if is_fp4 else [128, 256]
+    tile_ks = [128, 256] if is_fp4 else [128, 256]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
     waves_per_eus = [0] if is_fp4 else [0, 1, 2, 3, 4]
@@ -178,8 +261,22 @@ def get_flydsl_stage2_kernels(
     for tm in tile_ms:
         for tn in tile_ns:
             for tk in tile_ks:
+                mfma_variant_tag = _stage2_mfma_variant_tag(tk, a_dtype, b_dtype)
+                if is_fp4 and tk == 128:
+                    # tile_k=128 uses the dedicated MFMA32/K64 stage2 path.
+                    # Keep the candidate set deliberately small until layout
+                    # coverage is broadened.
+                    if a_dtype != "fp4" or tm not in (32, 64) or tn != 128:
+                        continue
                 for mode in modes:
+                    if mfma_variant_tag and mode == "atomic":
+                        # The MFMA32 path is validated with the reduce epilogue.
+                        # Keep atomic out of tuning until its padded-row handling
+                        # is fixed for this variant.
+                        continue
                     for async_copy in async_copies:
+                        if is_fp4 and tk == 128 and async_copy:
+                            continue
                         if not _x_load_supported(a_dtype, tm, tn, tk, async_copy):
                             continue
                         for wpe in waves_per_eus:
@@ -196,6 +293,8 @@ def get_flydsl_stage2_kernels(
                                 )
                                 if async_copy:
                                     base_name += "_async"
+                                if mfma_variant_tag:
+                                    base_name += f"_{mfma_variant_tag}"
                                 if is_fp4 and wpe != 1:
                                     base_name += f"_w{wpe}"
                                 elif not is_fp4 and wpe > 0:
@@ -216,6 +315,8 @@ def get_flydsl_stage2_kernels(
                                     "waves_per_eu": wpe,
                                     "b_nt": bnt,
                                 }
+                                if mfma_variant_tag:
+                                    base_params["mfma_variant"] = mfma_variant_tag
                                 kernels[base_name] = base_params
                                 # # Persistent variant: round-robin over M tiles, grid_y=cu_num.
                                 # if is_fp4:
@@ -333,6 +434,7 @@ def compile_flydsl_moe_stage2(
     use_async_copy: bool = False,
     waves_per_eu: int = 3,
     b_nt: int = 2,
+    mfma_variant: Optional[str] = None,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -354,6 +456,7 @@ def compile_flydsl_moe_stage2(
             persist_m=persist_m,
             sort_block_m=sort_block_m,
             use_async_copy=use_async_copy,
+            mfma_variant=mfma_variant,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm2
@@ -885,6 +988,7 @@ def flydsl_moe_stage2(
     use_async_copy: bool = False,
     waves_per_eu: int = 3,
     b_nt: int = 2,
+    mfma_variant: Optional[str] = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -934,13 +1038,14 @@ def flydsl_moe_stage2(
     else:
         total_sorted = sorted_expert_ids.shape[0] * _sbm
         m_blocks = (total_sorted + tile_m - 1) // tile_m
-    if persist is True:
-        _persist_m = -1
-    elif persist is False:
-        # _persist_m = 4 if m_blocks > 256 else 1
-        _persist_m = 1  # _persist_m = 1 is better for g1u0
-    else:
-        _persist_m = -1 if m_blocks > 256 else 1
+    # if persist is True:
+    #     _persist_m = -1
+    # elif persist is False:
+    #     # _persist_m = 4 if m_blocks > 256 else 1
+    #     _persist_m = 1  # _persist_m = 1 is better for g1u0
+    # else:
+    #     _persist_m = -1 if m_blocks > 256 else 1
+    _persist_m = 1
 
     is_fp4 = b_dtype == "fp4"
     _n_in = model_dim
@@ -1006,6 +1111,7 @@ def flydsl_moe_stage2(
         use_async_copy=use_async_copy,
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
+        mfma_variant=mfma_variant,
     )
     _run_compiled(exe, args)
 

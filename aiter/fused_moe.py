@@ -818,6 +818,7 @@ def _flydsl_stage2_wrapper(
         use_async_copy=parsed.get("use_async_copy", False),
         waves_per_eu=parsed.get("waves_per_eu", 3),
         b_nt=parsed.get("b_nt", 2),
+        mfma_variant=parsed.get("mfma_variant", None),
         # Keep stage2 persist behavior aligned with kernel naming.
         # For migrated old kernels (non `_persist` names), force legacy non-persistent path.
         persist=parsed.get("persist", False),
@@ -1294,6 +1295,51 @@ def get_2stage_cfgs(
     )
 
 
+def _quantize_stage2_per_1x32(
+    a2,
+    a2_scale,
+    quant_func2,
+    q_dtype_a2,
+    sorted_ids2,
+    num_valid_ids2,
+    token_num,
+    topk,
+    inter_dim,
+    num_local_tokens,
+    block_size_M2,
+    is_flydsl_stage2,
+):
+    a2 = a2.view(-1, inter_dim)
+    if is_flydsl_stage2 and q_dtype_a2 == dtypes.fp4x2:
+        # FlyDSL stage2 loads A2 by original token/topk row, but its scale
+        # buffer follows the sorted MoE row order.
+        a2, a2_scale_unsorted = quant_func2(
+            a2,
+            scale=a2_scale,
+            quant_dtype=q_dtype_a2,
+            num_rows=num_local_tokens,
+            num_rows_factor=topk,
+        )
+        a2_scale = mxfp4_moe_sort_fwd(
+            a2_scale_unsorted,
+            sorted_ids=sorted_ids2,
+            num_valid_ids=num_valid_ids2,
+            token_num=token_num,
+            cols=inter_dim,
+        )
+    else:
+        a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
+            a2,
+            sorted_ids=sorted_ids2,
+            num_valid_ids=num_valid_ids2,
+            token_num=token_num,
+            topk=topk,
+            block_size=block_size_M2,
+            num_rows=num_local_tokens,
+        )
+    return a2.view(token_num, topk, -1), a2_scale
+
+
 def fused_moe_2stages(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1503,17 +1549,20 @@ def fused_moe_2stages(
         a2 = a2.to(dtypes.fp8)
         a2_scale = a1_scale
     elif q_type2 == QuantType.per_1x32:
-        a2 = a2.view(-1, inter_dim)
-        a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
+        a2, a2_scale = _quantize_stage2_per_1x32(
             a2,
-            sorted_ids=sorted_ids2,
-            num_valid_ids=num_valid_ids2,
-            token_num=token_num,
-            topk=topk,
-            block_size=block_size_M2,
-            num_rows=num_local_tokens,
+            a2_scale,
+            quant_func2,
+            q_dtype_a2,
+            sorted_ids2,
+            num_valid_ids2,
+            token_num,
+            topk,
+            inter_dim,
+            num_local_tokens,
+            block_size_M2,
+            getattr(metadata.stage2, "func", None) is _flydsl_stage2_wrapper,
         )
-        a2 = a2.view(token_num, topk, -1)
     elif q_type2 == QuantType.per_1x128 and quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         a2_v = a2[:token_num, :, :]
         a2_scale = (
