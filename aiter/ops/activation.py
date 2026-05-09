@@ -8,7 +8,7 @@ MD_NAME = "module_activation"
 
 
 @compile_ops("module_activation", develop=True)
-def silu_and_mul(out: Tensor, input: Tensor) -> None: ...
+def silu_and_mul(out: Tensor, input: Tensor, limit: float = 0.0) -> None: ...
 
 
 @compile_ops("module_activation", develop=True)

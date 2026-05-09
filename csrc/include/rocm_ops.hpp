@@ -69,7 +69,8 @@ namespace py = pybind11;
           &aiter::silu_and_mul,                         \
           "Activation function used in SwiGLU.",        \
           py::arg("out"),                               \
-          py::arg("input"));                            \
+          py::arg("input"),                             \
+          py::arg("limit") = 0.0f);                    \
     m.def("scaled_silu_and_mul",                        \
           &aiter::scaled_silu_and_mul,                  \
           "Activation function used in scaled SwiGLU.", \
