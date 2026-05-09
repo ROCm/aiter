@@ -682,12 +682,23 @@ def build_sage_attn_cdna_module(
             #   n = lane32                                (q_row within wave; constant per lane)
             # Note: A=K (M=kv_row), B=Q (N=q_row). So m here is kv_row.
             ELEMS_PER_TILE = 16
+            # Vectorized SIToFP + scale-mul: do the i32->f32 convert and the
+            # qk_scale multiply on the full v16f32 subtile so the compiler can
+            # emit packed v_pk_mul_f32 (and packed v_cvt_pk*) instead of
+            # per-lane v_mul_f32 / v_cvt_f32_i32. Then extract scalars to keep
+            # the downstream s_f32 list-of-scalars interface unchanged.
+            qk_scale_v16 = (
+                Vec.from_elements([qk_scale], fx.Float32).broadcast_to(16)
+            )
             s_f32 = []
             for st in range_constexpr(N_SUBTILES):
+                s_i32_vec = Vec(s_accs[st])
+                s_f32_vec = s_i32_vec.to(fx.Float32)
+                s_scaled_vec = Vec(
+                    arith.mulf(s_f32_vec, qk_scale_v16, fastmath=fm_fast)
+                )
                 for elem in range_constexpr(ELEMS_PER_TILE):
-                    i32_elem = Vec(s_accs[st])[elem]
-                    f32_elem = _sitofp(i32_elem)
-                    s_f32.append(_fmul(f32_elem, qk_scale))
+                    s_f32.append(s_scaled_vec[elem])
 
             # ==== Causal masking ====
             NUM_S_VALS = N_SUBTILES * ELEMS_PER_TILE
@@ -800,18 +811,28 @@ def build_sage_attn_cdna_module(
             # a subtile (own's view, klane=0): word w holds bytes for the 4
             # contiguous QK output indices i=w*4..w*4+3, which correspond to
             # m={w*8+0, w*8+1, w*8+2, w*8+3} (klane=0) within the subtile.
-            c_fp8_max = arith.constant(FP8_MAX, type=T.f32)
             c0_i32 = arith.constant(0, type=T.i32)
+            # Vectorize p_vals * FP8_MAX as v16f32 multiplies per subtile so
+            # the compiler emits v_pk_mul_f32 (8 packed) instead of 16 scalar
+            # v_mul_f32 per subtile. Then extract scalars for cvt_pk_fp8_f32.
+            fp8_max_v16 = Vec.filled(16, FP8_MAX, fx.Float32)
             # p_words[subtile][word] : i32, packed 4xfp8 own bytes for this lane
             p_words = []
             for st in range_constexpr(N_SUBTILES):
+                p_sub_elems = [
+                    _raw(p_vals[st * ELEMS_PER_TILE + i])
+                    for i in range_constexpr(ELEMS_PER_TILE)
+                ]
+                p_sub_vec = Vec.from_elements(p_sub_elems, fx.Float32)
+                p_scaled_vec = Vec(
+                    arith.mulf(p_sub_vec, fp8_max_v16, fastmath=fm_fast)
+                )
                 sub_words = []
                 for w in range_constexpr(4):
-                    base = st * ELEMS_PER_TILE + w * 4
-                    s0 = arith.mulf(_raw(p_vals[base + 0]), c_fp8_max, fastmath=fm_fast)
-                    s1 = arith.mulf(_raw(p_vals[base + 1]), c_fp8_max, fastmath=fm_fast)
-                    s2 = arith.mulf(_raw(p_vals[base + 2]), c_fp8_max, fastmath=fm_fast)
-                    s3 = arith.mulf(_raw(p_vals[base + 3]), c_fp8_max, fastmath=fm_fast)
+                    s0 = _raw(p_scaled_vec[w * 4 + 0])
+                    s1 = _raw(p_scaled_vec[w * 4 + 1])
+                    s2 = _raw(p_scaled_vec[w * 4 + 2])
+                    s3 = _raw(p_scaled_vec[w * 4 + 3])
                     packed = c0_i32
                     packed = rocdl.cvt_pk_fp8_f32(T.i32, s0, s1, packed, 0)
                     packed = rocdl.cvt_pk_fp8_f32(T.i32, s2, s3, packed, 1)
