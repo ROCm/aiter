@@ -1520,6 +1520,21 @@ def compile_ops(
                         func.__signature__ = sig
                         ann = {k: v.annotation for k, v in sig.parameters.items()}
                         ann["return"] = sig.return_annotation
+                        # ``torch.Tensor`` and ``aiter_tensor_t`` are dispatcher
+                        # equivalents -- the C++ ops accept either.  Treat them
+                        # as a single "tensor-like" set when matching call args
+                        # so a torch.Tensor caller doesn't get rejected for an
+                        # ``aiter_tensor_t`` annotation (and vice versa).
+                        if aiter_tensor_t is object:
+                            tensor_like = (torch.Tensor,)
+                        else:
+                            tensor_like = (torch.Tensor, aiter_tensor_t)
+
+                        def _match_type(arg, expected):
+                            if expected in tensor_like:
+                                return isinstance(arg, tensor_like)
+                            return isinstance(arg, expected)
+
                         callargs = inspect.getcallargs(func, *args, **kwargs)
                         for el, arg in callargs.items():
                             expected_type = ann[el]
@@ -1528,7 +1543,7 @@ def compile_ops(
                             sub_t = typing.get_args(expected_type)
 
                             if origin is None:
-                                if not isinstance(arg, expected_type) and not (
+                                if not _match_type(arg, expected_type) and not (
                                     any(el in str(expected_type) for el in enum_types)
                                     and isinstance(arg, int)
                                 ):
@@ -1541,7 +1556,9 @@ def compile_ops(
                                         f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                     )
                             elif origin is typing.Union or origin is types.UnionType:
-                                if arg is not None and not isinstance(arg, sub_t):
+                                if arg is not None and not any(
+                                    _match_type(arg, t) for t in sub_t
+                                ):
                                     raise TypeError(
                                         f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
                                     )
@@ -1606,8 +1623,19 @@ def compile_ops(
                             )
                     return True
 
-                # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
-                if develop:
+                # ``develop=True`` is meant for the new-style C++ modules whose
+                # pybind signatures take ``aiter_tensor_t`` *and* expose
+                # ``_set_current_hip_stream``.  Several legacy modules (e.g.
+                # ``module_quant``) are tagged with ``develop=True`` but still
+                # have the classic ``torch.Tensor`` signature and don't bind
+                # the stream setter.  Detect that mismatch via the stream
+                # setter as a proxy and skip the torch -> aiter_tensor_t
+                # conversion in that case, otherwise pybind11 overload
+                # resolution rejects every call.
+                _develop_module_ok = develop and hasattr(
+                    module, "_set_current_hip_stream"
+                )
+                if _develop_module_ok:
                     import torch
 
                     from ..utility.dtypes import torch_to_aiter_pybind
@@ -1633,7 +1661,7 @@ def compile_ops(
 
                     log_args(func, *args, **kwargs)
 
-                if develop:
+                if _develop_module_ok:
                     module._set_current_hip_stream(
                         torch.cuda.current_stream().cuda_stream
                     )

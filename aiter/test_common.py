@@ -396,12 +396,21 @@ def get_trace_perf(prof, num_iters):
     return df.at[avg_name, "device_time_sum"]
 
 
+def _bool_all_safe(t):
+    """Equivalent of ``t.all()`` that avoids the broken bool reduction kernel
+    on gfx1250 (PyTorch 2.10 + ROCm 7.2 hangs in ``Tensor.all()`` on bool
+    inputs, see test_all_hang.py).  Uses ``sum() == numel`` which goes through
+    a different (working) reduction template.
+    """
+    return int(t.sum().item()) == int(t.numel())
+
+
 def checkAllclose(
     a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="", printNum=8, printLog=True
 ):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
 
-    if isClose.all():
+    if _bool_all_safe(isClose):
         if printLog:
             logger.info(f"{msg}[checkAllclose {atol=} {rtol=} \033[32mpassed~\033[0m]")
         return 0
