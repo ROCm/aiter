@@ -85,7 +85,7 @@ def test_fused_moe_ptpc_fp8_hsaco(
     if topk != 10 or inter_dim != 128 or hidden_size != 4096:
         print(
             "skip test_fused_moe_ptpc_fp8_hsaco: dimensions must match prebuilt "
-            f"HSACO (got topk={topk}, inter_dim={inter_dim}, hidden_size={hidden_size})"
+            f"fused_moe_ptpc_fp8 (got topk={topk}, inter_dim={inter_dim}, hidden_size={hidden_size})"
         )
         return None
 
@@ -146,14 +146,14 @@ def test_fused_moe_ptpc_fp8_hsaco(
         return None
 
     assert ref_ck.shape == hsaco_ret.shape, f"{ref_ck.shape=} {hsaco_ret.shape=}"
-    assert torch.isfinite(hsaco_ret).all(), "HSACO output contains NaN/Inf"
+    assert torch.isfinite(hsaco_ret).all(), "fused_moe_ptpc_fp8 output contains NaN/Inf"
 
     err_ratio_ck = checkAllclose(
         ref_ck,
         hsaco_ret,
         rtol=1e-2,
         atol=1e-2,
-        msg="HSACO vs fused_moe (CK, AITER_MOE_SMALL_BATCH=0)",
+        msg="fused_moe_ptpc_fp8 vs fused_moe (CK, AITER_MOE_SMALL_BATCH=0)",
     )
     diff_ck = calc_diff(ref_ck, hsaco_ret)
 
@@ -163,14 +163,13 @@ def test_fused_moe_ptpc_fp8_hsaco(
         f"time_us={dt_us:.1f}"
     )
 
-    assert diff_ck < 0.02, f"HSACO vs CK logits_diff too large: {diff_ck}"
+    assert diff_ck < 0.02, f"fused_moe_ptpc_fp8 vs CK logits_diff too large: {diff_ck}"
 
     return {
         "batch_size": batch_size,
         "num_experts": num_experts,
         "topk": topk,
         "diff_hsaco_vs_ck": diff_ck,
-        "close_mismatch_ratio_ck": err_ratio_ck,
         "time(us)": f"{dt_us:.0f}",
     }
 

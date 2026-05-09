@@ -153,19 +153,17 @@ def get_kernel(kernel_path_prefix, constexpr_args: tuple = ()):
         # file contain only one kernel, filename starts with kernel name
         _, kernel_name = os.path.split(kernel_path_prefix)
         lib_fpath = kernel_path_prefix + co_suffix
-    print("====================== get_kernel ======================")
-    print("lib_fpath: ", lib_fpath)
+    #print("====================== get_kernel ======================")
+    #print("lib_fpath: ", lib_fpath)
     p_lib = get_lib(lib_fpath)
 
-    print("p_lib: ", p_lib)
-    print("_is_hip_library_api_supported_: ", _is_hip_library_api_supported_)
     if _is_hip_library_api_supported_:
         kernel_cnt = ctypes.c_uint32()
         hip_check_error(hip.hipLibraryGetKernelCount(ctypes.byref(kernel_cnt), p_lib))
 
         assert kernel_cnt.value > 0
         kernels = (ctypes.c_void_p * kernel_cnt.value)()
-        print("kernels: ", kernels)
+        #print("kernels: ", kernels)
 
         hip_check_error(hip.hipLibraryEnumerateKernels(kernels, kernel_cnt, p_lib))
 
@@ -190,8 +188,8 @@ def get_kernel(kernel_path_prefix, constexpr_args: tuple = ()):
                 )
                 break
 
-    print("kernel_name: ", kernel_name)
-    print("p_func: ", p_func)
+    # print("kernel_name: ", kernel_name)
+    # print("p_func: ", p_func)
     assert p_func is not None, f"kernel {kernel_name} is not found in {lib_fpath}"
 
     def CallableKernel(

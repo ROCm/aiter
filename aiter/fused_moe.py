@@ -142,12 +142,23 @@ def fused_moe(
     bias2=None,
     splitk=0,
 ):
-    # Fast path for small batches for Qwen3.5 397B FP8 PTPC (Only used for decoding phase: batch size 1~32)
-    if os.environ.get("AITER_MOE_SMALL_BATCH", "0") == "1" and hidden_states.shape[0] <= 32 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and (
-        quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz and get_gfx() == "gfx942"
+    # Fast path for small batches for Qwen3.5 397B FP8 PTPC TP8 on gfx942 (only used for decoding phase: batch size 1~32)
+    # B=1~32, E=512, N1=256, K1=4096, N2=4096, K2=128, TOPK=10
+    if (os.environ.get("AITER_MOE_SMALL_BATCH", "0") == "1"
+        and 1 <= hidden_states.shape[0] <= 32
+        and hidden_states.dtype == torch.bfloat16
+        and expert_mask is None
+        and activation == ActivationType.Silu
+        and (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)
+        and get_gfx() == "gfx942"
+        and topk_ids.shape[1] == 10
+        and w1.shape[1] == 256
+        and w1.shape[2] == 4096
+        and w2.shape[1] == 4096
+        and w2.shape[2] == 128
     ):
         from aiter.fused_moe_ptpc_fp8 import fused_moe_ptpc_fp8
-
+        #print(f"------------------------------------------- fused_moe_ptpc_fp8 hitting -------------------------------------------")
         moe_buf = fused_moe_ptpc_fp8(
             hidden_states,
             w1,

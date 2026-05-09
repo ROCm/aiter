@@ -1,14 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""gfx942 MoE PTPC FP8: prebuilt ``.co`` via ``hsaco_tools.get_kernel``.
-
-``fused_moe()`` calls ``fused_moe_ptpc_fp8`` only when ``AITER_MOE_SMALL_BATCH=1`` and
-``1 <= B <= 32``.
-
-Requires matching artifacts under ``hsa/<gfx>/fmoe_ptpc_fp8/``.
+"""Qwen3.5 397B MoE PTPC FP8 TP8 run with prebuilt hasco artifacts on gfx942:
+``fused_moe()`` calls ``fused_moe_ptpc_fp8`` only when the following conditions are met:
+- B=1~32, E=512, N1=256, K1=4096, N2=4096, K2=128, TOPK=10
+- if (os.environ.get("AITER_MOE_SMALL_BATCH", "0") == "1"
+    and 1 <= hidden_states.shape[0] <= 32
+    and hidden_states.dtype == torch.bfloat16
+    and expert_mask is None
+    and activation == ActivationType.Silu
+    and (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)
+    and get_gfx() == "gfx942"
+    and topk_ids.shape[1] == 10
+    and w1.shape[1] == 256
+    and w1.shape[2] == 4096
+    and w2.shape[1] == 4096
+    and w2.shape[2] == 128)
+- Requires matching artifacts under ``hsa/gfx942/fmoe_ptpc_fp8/``, and loading via ``csrc.cpp_itfs.hsaco_tools.get_kernel``.
 """
-
-from __future__ import annotations
 
 import os
 from typing import Any, Optional
@@ -18,8 +26,10 @@ import torch
 import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.fused_moe import moe_sorting
 from csrc.cpp_itfs.hsaco_tools import get_kernel
 from csrc.cpp_itfs.utils import AITER_CORE_DIR
+
 
 def fused_moe_ptpc_fp8(
     hidden_states: torch.Tensor,
@@ -35,7 +45,6 @@ def fused_moe_ptpc_fp8(
     num_local_tokens: Any,
     moe_sorting_dispatch_policy: int,
 ) -> Optional[torch.Tensor]:
-    """Prebuilt ``.co`` MoE for ``1 <= B <= MOE_HSACO_SMALL_BATCH_MAX_B``; else ``None``."""
     B = int(hidden_states.shape[0])
     if not (1 <= B <= 32):
         return None
@@ -46,15 +55,15 @@ def fused_moe_ptpc_fp8(
     ):
         return None
     if not (
-        (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)
+        (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz and get_gfx() == "gfx942")
     ):
         return None
-
-    from aiter.fused_moe import moe_sorting
 
     E, N1, K1 = w1.shape
     N2, K2 = w2.shape[1], w2.shape[2]
     TOPK = topk_ids.shape[1]
+    fp8_ptpc = w1.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    num_CU = torch.cuda.get_device_properties(hidden_states.device).multi_processor_count
     assert N1 == 2 * K2
 
     topk_w_f32 = (
@@ -73,8 +82,8 @@ def fused_moe_ptpc_fp8(
         assert N1 == 2 * K2
         #print("Get moe_gemm_batch1_gate kernel start")
         moe_gemm_batch1_gate = get_kernel(f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/moe_gemm_batch1-1-weight_dtype=torch.float8_e4m3fnuz-with_silu=True:moe_gemm_batch1")
-        #print("Get moe_gemm_batch1_gate kernel end")
-        #print("Get moe_gemm_batch1_down kernel start")
+        # print("Get moe_gemm_batch1_gate kernel end")
+        # print("Get moe_gemm_batch1_down kernel start")
         moe_gemm_batch1_down = get_kernel(f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/moe_gemm_batch1-1-weight_dtype=torch.float8_e4m3fnuz-with_silu=False:moe_gemm_batch1")
         #print("Get moe_gemm_batch1_down kernel end")
 
@@ -116,8 +125,8 @@ def fused_moe_ptpc_fp8(
         )
         #print("Call moe_gemm_batch1_down kernel end")
     elif 2 <= B <= 32:
-        # Shared ``moe_sorting`` + ``moe_gemm_batch``; stage-2 is ``moe_2stage_down_loopn`` when
-        # ``use_down_loopn`` (large B + grid/CU + fixed TOPK/K/N), else ``moe_2stage_splitk``.
+        # Stage 1: Shared ``moe_sorting`` + ``moe_gemm_batch``;
+        # stage 2: Choose between ``moe_2stage_down_loopn`` and ``moe_2stage_splitk`` based on ``use_down_loopn`` condition.
         BLOCK_M = 16
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
             topk_ids,
@@ -132,7 +141,7 @@ def fused_moe_ptpc_fp8(
         )
         grid = int(sorted_expert_ids.shape[0])
         if B * TOPK <= E:
-            grid = min(grid, B * TOPK)
+            grid = B * TOPK
         cur_out = torch.zeros(
             (B, N2),
             dtype=hidden_states.dtype,
@@ -165,23 +174,16 @@ def fused_moe_ptpc_fp8(
         )
         #print("Call moe_gemm_batch kernel end")
 
-        fp8_ptpc = w1.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-        num_CU = torch.cuda.get_device_properties(hidden_states.device).multi_processor_count
+
         BLOCK_N = 1024
         use_down_loopn = (
             fp8_ptpc
             and (N2 // BLOCK_N) * grid >= num_CU
             and N2 % BLOCK_N == 0
-            and TOPK == 10
-            and K2 == 128
-            and N2 == 4096
             and 16 <= B <= 32
         )
 
         if use_down_loopn:
-            # Prebuilt ``moe_2stage_down_loopn`` .co bakes constexprs; HIP entry is
-            # ``(p_input, p_weight, p_output, p_sorted_ids, p_sorted_weights,
-            # p_sorted_expert_ids, p_num_valid_ids, p_w_scale, M)``.
             #print("Get moe_2stage_down_loopn kernel start")
             moe_2stage_down_loopn = get_kernel(
                 f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/"
@@ -241,4 +243,3 @@ def fused_moe_ptpc_fp8(
             #print("Call moe_2stage_splitk kernel end")
 
     return cur_out
-
