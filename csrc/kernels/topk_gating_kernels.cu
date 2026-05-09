@@ -412,6 +412,24 @@ void topk_softplus(torch::Tensor& topk_weights,
     const size_t stride_tk = topk_indices.stride(0);
     const bool has_bias    = correction_bias.numel() > 0;
 
+    // Both kernels assign one lane per top-K winner during writeout
+    // (`if (lane == k) topk_value = ...`), so topk must fit in a single warp
+    // and cannot exceed the number of routable experts.  Fail fast with a
+    // clear error rather than silently producing partial / wrong output.
+    AITER_CHECK(topk <= static_cast<int>(WARP_SIZE),
+                "topk (", topk, ") exceeds WARP_SIZE (", WARP_SIZE, ")");
+    AITER_CHECK(topk <= num_experts,
+                "topk (", topk, ") exceeds num_experts (", num_experts, ")");
+
+    // Softmax outputs are already a probability distribution that sums to 1
+    // across the routed top-K (post-selection); a second renorm would distort
+    // those weights.  Enforce here so direct C++ callers behave the same as
+    // the Python topk_gating() wrapper (which already forces this).
+    if(sf_code == SCORE_SOFTMAX)
+    {
+        need_renorm = false;
+    }
+
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());
 

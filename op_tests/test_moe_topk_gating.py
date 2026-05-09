@@ -15,6 +15,7 @@ This test can be run in two ways:
 
 import argparse
 import itertools
+import sys
 
 import pandas as pd
 import pytest
@@ -497,6 +498,10 @@ if __name__ == "__main__":
     topk_list = to_list(args.topk)
     dtype_list = to_list(args.dtype)
 
+    # Track whether any benchmark section saw a correctness regression
+    # (id_errors > 1%); exit non-zero at the end so CI catches it.
+    failed_sections: list[str] = []
+
     if args.test in ("sigmoid", "all"):
         sigmoid_experts = [e for e in num_experts_list]
         sigmoid_dtypes = [d for d in dtype_list if d != torch.float32]
@@ -517,6 +522,11 @@ if __name__ == "__main__":
         df = pd.DataFrame(collected)
         print(df.to_string(index=False))
         print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
+        errors = df[df["id_errors"] > 0.01]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} sigmoid config(s) had id errors > 1%!")
+            print(errors.to_string(index=False))
+            failed_sections.append("sigmoid")
 
     if args.test in ("softplus", "all"):
         softplus_configs = list(
@@ -536,10 +546,11 @@ if __name__ == "__main__":
         print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
         errors = df[df["id_errors"] > 0.01]
         if len(errors) > 0:
-            print(f"\nWARNING: {len(errors)} config(s) had id errors > 1%!")
+            print(f"\nERROR: {len(errors)} softplus config(s) had id errors > 1%!")
             print(errors.to_string(index=False))
+            failed_sections.append("softplus")
         else:
-            print("All tests passed!")
+            print("All softplus tests passed!")
 
     if args.test in ("softmax", "all"):
         softmax_configs = list(
@@ -559,8 +570,17 @@ if __name__ == "__main__":
         print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
         errors = df[df["id_errors"] > 0.01]
         if len(errors) > 0:
-            print(f"\nWARNING: {len(errors)} config(s) had id errors > 1%!")
+            print(f"\nERROR: {len(errors)} softmax config(s) had id errors > 1%!")
             print(errors.to_string(index=False))
+            failed_sections.append("softmax")
         else:
-            print("All tests passed!")
+            print("All softmax tests passed!")
     print("=" * 80)
+
+    if failed_sections:
+        print(
+            f"FAIL: correctness regression in section(s): "
+            f"{', '.join(failed_sections)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
