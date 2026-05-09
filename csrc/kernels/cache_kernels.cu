@@ -1315,16 +1315,20 @@ __global__ void cp_gather_indexer_k_quant_cache_kernel(
         src_inblock_offset = src_block_offset + block_offset * head_dim + head_idx;
     }
 
-    reinterpret_cast<float4*>(dst_k)[dst_inblock_offset / VEC_SIZE] =
-        reinterpret_cast<const float4*>(kv_cache)[src_inblock_offset / VEC_SIZE];
+    // Inference engines like ATOM and vLLM allocate head_size+4 bytes for each block in kv_cache to
+    // store cache and scales. In models like DSv3.2 and GLM5, this gives 128+4=132 bytes per block,
+    // which is not divisible by VEC_SIZE=16. Therefore, use byte addressing to advance through the
+    // block before casting to dwordx4 for read/write.
+    *reinterpret_cast<float4*>(dst_k + dst_inblock_offset) =
+        *reinterpret_cast<const float4*>(kv_cache + src_inblock_offset);
     if(threadIdx.x == 0)
     {
         // Scale layout is unchanged regardless of preshuffle
         const int64_t cache_inblock_offset = block_offset * head_dim + head_idx;
         const int64_t src_scale_offset = src_block_offset + cache_block_size * head_dim +
                                          cache_inblock_offset * 4 / quant_block_size;
-        reinterpret_cast<float*>(dst_scale)[dst_inblock_offset / quant_block_size] =
-            reinterpret_cast<const float*>(kv_cache)[src_scale_offset / 4];
+        *reinterpret_cast<float*>(dst_scale + dst_inblock_offset * 4 / quant_block_size) =
+            *reinterpret_cast<const float*>(kv_cache + src_scale_offset);
     }
 }
 
