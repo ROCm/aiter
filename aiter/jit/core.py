@@ -488,7 +488,9 @@ def check_and_set_ninja_worker():
     import psutil
 
     # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
+    free_memory_gb = psutil.virtual_memory().available / (
+        1024**3
+    )  # free memory in GB
     max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
@@ -1038,9 +1040,10 @@ def get_args_of_build(ops_name: str, exclude=[]):
             else:
                 pass
 
-        # undefined compile features will be replaced with default value
-        d_opt_build_args.update(d_ops)
-        return d_opt_build_args
+        # Use a fresh copy so keys from previous modules don't leak
+        result = dict(d_opt_build_args)
+        result.update(d_ops)
+        return result
 
     with open(this_dir + "/optCompilerConfig.json", "r") as file:
         data = json.load(file)
