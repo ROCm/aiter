@@ -153,22 +153,35 @@ def build_sage_attn_cdna_module(
 
     # LDS layout
     # K: row-major BLOCK_N × HEAD_DIM (Int8, 1 byte/elem). +8 byte pad per row.
-    # V: COLUMN-MAJOR HEAD_DIM × BLOCK_N (FP8 raw bytes, 1 byte/elem). +8 byte
-    #    pad per V "row" (= V "column" in the original BLOCK_N×HEAD_DIM view).
-    #    Storing V transposed in LDS makes per-lane PV reads contiguous in K
+    # V on gfx942: COLUMN-MAJOR HEAD_DIM × BLOCK_N (FP8 raw bytes, 1 byte/elem).
+    #    +8 byte pad per V "row" (= V "column" in the original BLOCK_N×HEAD_DIM
+    #    view). Storing V transposed makes per-lane PV reads contiguous in K
     #    (32 contiguous bytes at fixed d), enabling 2× ds_read_b128 instead of
     #    32× ds_read_u8.
+    # V on gfx950 (Stage IV-c): ROW-MAJOR BLOCK_N × HEAD_DIM (matches global
+    #    layout). Cooperative load is 1× ds_write_b128 per row instead of 16×
+    #    scattered ds_write_b8. PV per-lane gather uses ds_read_tr8_b64 (CDNA4-
+    #    only; performs a 16-lane in-instruction transpose) to deliver the
+    #    32 K-contiguous bytes per lane that the f8f6f4 MFMA expects.
+    _is_gfx950_kv = "gfx950" in gpu_arch
     K_STRIDE = HEAD_DIM + 8    # extra 8 bytes padding for Int8 K rows
-    # Pad V "row" stride to a 16-byte multiple so loads can issue as ds_read_b128.
-    # BLOCK_N=128 + 16 = 144 bytes per row.
-    V_STRIDE = BLOCK_N + 16
+    if _is_gfx950_kv:
+        # No padding needed: HEAD_DIM is already a multiple of 16 and the
+        # transposed-read path doesn't benefit from extra row padding.
+        V_STRIDE = HEAD_DIM
+    else:
+        # Pad V "row" stride to a 16-byte multiple so loads can issue as
+        # ds_read_b128. BLOCK_N=128 + 16 = 144 bytes per row.
+        V_STRIDE = BLOCK_N + 16
 
     # Cooperative load parameters
     VEC_WIDTH_K = 16   # 16 Int8 elements = 16 bytes per thread
-    # V coop load: each thread reads 16 contiguous FP8 bytes from one global
-    # V row (16 d-positions) and SCATTERS them as 16 separate bytes into the
-    # column-major LDS at 16 different LDS rows (the d-positions), same LDS
-    # column (the kv_row).
+    # V coop load (gfx942): each thread reads 16 contiguous FP8 bytes from one
+    # global V row (16 d-positions) and SCATTERS them as 16 separate bytes
+    # into column-major LDS at 16 different LDS rows (the d-positions), same
+    # LDS column (the kv_row).
+    # V coop load (gfx950): each thread reads 16 contiguous FP8 bytes and
+    # WRITES them contiguously into row-major LDS as one ds_write_b128.
     VEC_WIDTH_V = 16   # 16 FP8 bytes per thread (one global vec load)
     THREADS_PER_ROW_K = HEAD_DIM // VEC_WIDTH_K
     THREADS_PER_ROW_V = HEAD_DIM // VEC_WIDTH_V
@@ -189,9 +202,14 @@ def build_sage_attn_cdna_module(
         NUM_BATCHES_V = BLOCK_N // ROWS_PER_BATCH_V
         V_NEEDS_GUARD = False
 
-    # V LDS section: HEAD_DIM rows × V_STRIDE bytes per row.
+    # V LDS section.
+    # gfx942 (column-major): HEAD_DIM rows × V_STRIDE bytes per row.
+    # gfx950 (row-major):    BLOCK_N rows × V_STRIDE (=HEAD_DIM) bytes per row.
     LDS_K_BYTES = BLOCK_N * K_STRIDE * 1   # 1 byte per Int8
-    LDS_V_BYTES = HEAD_DIM * V_STRIDE * 1  # 1 byte per FP8 (column-major view)
+    if _is_gfx950_kv:
+        LDS_V_BYTES = BLOCK_N * V_STRIDE * 1   # row-major: BLOCK_N × HEAD_DIM
+    else:
+        LDS_V_BYTES = HEAD_DIM * V_STRIDE * 1  # column-major: HEAD_DIM × V_STRIDE
     # Stage III: 2-stage software pipeline. Allocate two ping-pong buffers for
     # K and V so the next KV block's loads can be issued while the current
     # block's MFMAs are still executing.
@@ -228,6 +246,7 @@ def build_sage_attn_cdna_module(
     from flydsl._mlir.dialects._rocdl_ops_gen import (
         mfma_i32_32x32x32_i8 as _ods_mfma_i32_32x32x32_i8,
         mfma_scale_f32_32x32x64_f8f6f4 as _ods_mfma_scale_f32_32x32x64_f8f6f4,
+        ds_read_tr8_b64 as _ods_ds_read_tr8_b64,
     )
 
     def mfma_i32_k32(result_type, operands):
@@ -506,12 +525,15 @@ def build_sage_attn_cdna_module(
         LDS_V_BYTE_BASE = LDS_K_BYTES  # byte offset of V section
 
         def coop_load_v(tile_start, buf_off):
-            """Load V from global (FP8 raw bytes) → write transposed to LDS.
+            """Load V from global (FP8 raw bytes) into LDS.
 
-            Each thread reads VEC_WIDTH_V=16 contiguous FP8 bytes from one
-            global V row (16 d-positions for one kv_row) and SCATTERS them as
-            16 individual byte writes to LDS at 16 different LDS rows
-            (the d-positions), same LDS column (= kv_row within the BLOCK_N tile).
+            gfx942 (column-major LDS): each thread reads VEC_WIDTH_V=16
+              contiguous FP8 bytes from one global V row and SCATTERS them as
+              16 individual byte writes to 16 different LDS rows.
+            gfx950 (row-major LDS): each thread reads VEC_WIDTH_V=16 contiguous
+              FP8 bytes and writes them contiguously as one ds_write_b128 —
+              same shape as global, no transpose. Reduces ~2048 ds_write_b8
+              transactions per KV iter down to ~128 ds_write_b128 transactions.
 
             For rows beyond seq_len_k, we clamp the load address to row 0 and
             zero the resulting bytes to prevent 0 * NaN = NaN in the PV MFMA.
@@ -531,21 +553,27 @@ def build_sage_attn_cdna_module(
                 if do_load:
                     g_idx = kv_global_idx(row_idx, load_col_v_base)
                     raw_v = _load_ptr_i8_vec16(v_ptr, g_idx)  # v16i8
-
-                    # Lane's kv_row within the BLOCK_N tile (= LDS column index).
-                    lds_col = load_row_v_batch + row_offset
-                    # Zero out the 16 bytes for OOB rows.
                     zero_v16i8 = Vec.filled(16, 0, fx.Int8).ir_value()
                     raw_v = ArithValue(kv_in_bounds).select(raw_v, zero_v16i8)
 
-                    # Scatter: 16 individual ds_write_u8 to 16 different LDS rows.
-                    for di in range_constexpr(VEC_WIDTH_V):
-                        d_idx = load_col_v_base + di
-                        v_off = buf_off + d_idx * V_STRIDE + lds_col
-                        b_i8 = vector.extract(
-                            raw_v, static_position=[di], dynamic_position=[]
-                        )
-                        Vec.from_elements([b_i8], fx.Int8).store(lds_v, [v_off])
+                    if const_expr(_is_gfx950):
+                        # Row-major: LDS[k_v * V_STRIDE + d]. Each thread writes
+                        # its 16 contiguous d-bytes for one k_v row as a single
+                        # ds_write_b128.
+                        lds_row = load_row_v_batch + row_offset  # = k_v
+                        v_off = buf_off + lds_row * V_STRIDE + load_col_v_base
+                        Vec(raw_v).store(lds_v, [v_off])
+                    else:
+                        # Column-major: LDS[d * V_STRIDE + k_v]. Scatter 16
+                        # individual ds_write_u8 to 16 different LDS rows.
+                        lds_col = load_row_v_batch + row_offset
+                        for di in range_constexpr(VEC_WIDTH_V):
+                            d_idx = load_col_v_base + di
+                            v_off = buf_off + d_idx * V_STRIDE + lds_col
+                            b_i8 = vector.extract(
+                                raw_v, static_position=[di], dynamic_position=[]
+                            )
+                            Vec.from_elements([b_i8], fx.Int8).store(lds_v, [v_off])
 
         def load_k_frag(kv_block_row, ks, buf_off):
             """Load v4i32 (=16xi8) K fragment from LDS for mfma_i32_32x32x32_i8.
@@ -563,13 +591,76 @@ def build_sage_attn_cdna_module(
             """Load v8i32 (=32xi8 fp8) V fragment from LDS for mfma_scale_f32_32x32x64.
 
             For lane (klane, lane32) at PV step `pks` and D chunk `dc`, the A
-            operand needs V[d=dc*32+lane32, k=pks*64+klane*32 .. +31]. With V
-            stored column-major (LDS row = d, LDS col = kv_row), this is 32
-            contiguous bytes at LDS[d_col_idx, k_start .. k_start+31].
+            operand needs V[d=dc*32+lane32, k=pks*64+klane*32 .. +31].
 
-            Issue as two 16-byte vector loads to give the compiler the same
-            shape it lowers to ds_read[2]_b64/b128 for K.
+            gfx942 path (column-major LDS, V_STRIDE = BLOCK_N+16):
+              LDS layout has d as the row index and k_v as the column index, so
+              the 32 K-bytes per lane are 32 LDS-contiguous bytes. Issue as
+              two 16-byte vector loads (compiler lowers to 2× ds_read_b128).
+
+            gfx950 path (row-major LDS, V_STRIDE = HEAD_DIM):
+              Use 4× ds_read_tr8_b64 (CDNA4-only). Each instruction is a
+              SIMD-64 op composed of 4 independent 16-lane sub-ops; within
+              each 16-lane group the instruction does an in-tile transpose so
+              that physical lane t outputs 8 K-bytes at fixed d=base_d + (t%16).
+
+              Per-lane LDS address (verified by /tmp/probe_ds_read_tr8_b64.py
+              against the Triton emitter at MemoryOpToLLVM.cpp:140-330):
+                g       = lane // 16    # which 16-lane sub-group
+                i       = lane %  16    # output position within sub-group
+                base_kv = pks*64 + (g//2)*32 + k_idx*8     # k_idx ∈ {0,1,2,3}
+                base_d  = dc*32  + (g%2)*16
+                addr    = (base_kv + i//2) * V_STRIDE + (base_d + (i%2)*8)
+              4 calls (k_idx 0..3) per lane gather 32 contiguous K-bytes.
             """
+            if const_expr(_is_gfx950):
+                from flydsl.expr.utils.arith import ArithValue as _AV
+                lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
+                v2i32_type = Vec.make_type(2, fx.Int32)
+                v8i8_type = Vec.make_type(8, fx.Int8)
+                lds_base = _memref.extract_aligned_pointer_as_index(
+                    _llvm_value(lds_v)
+                )
+
+                # Per-lane sub-group decomposition.
+                g = lane // fx.Index(16)
+                i = lane % fx.Index(16)
+                klane_g = g // fx.Index(2)
+                d_group = g % fx.Index(2)
+
+                # Hoist invariants of the per-k_idx loop.
+                base_kv_inv = (
+                    fx.Index(pks * MFMA_K_FP8)
+                    + klane_g * fx.Index(32)
+                )
+                base_d = fx.Index(dc * MFMA_M) + d_group * fx.Index(16)
+                row_off_within = i // fx.Index(2)
+                col_extra_within = (i % fx.Index(2)) * fx.Index(8)
+
+                words = []
+                for k_idx in range_constexpr(4):
+                    base_kv = base_kv_inv + fx.Index(k_idx * 8)
+                    addr_bytes = (base_kv + row_off_within) * fx.Index(V_STRIDE) \
+                                 + (base_d + col_extra_within)
+                    byte_off_val = _AV(arith.unwrap(buf_off + addr_bytes, index=True))
+                    total = _AV(lds_base) + byte_off_val
+                    addr_i32 = arith.unwrap(arith.index_cast(T.i32, total))
+                    ptr_val = _llvm.inttoptr(lds_ptr_ty, addr_i32)
+                    v2i32 = _ods_ds_read_tr8_b64(
+                        res=v2i32_type, ptr=ptr_val
+                    ).result
+                    words.append(v2i32)
+
+                # Pack 4× v2i32 → v8i32 (= 32 fp8 bytes per lane).
+                elems = []
+                for w_idx in range_constexpr(4):
+                    for sub in range_constexpr(2):
+                        elems.append(vector.extract(
+                            words[w_idx], static_position=[sub], dynamic_position=[]
+                        ))
+                return Vec.from_elements(elems, fx.Int32).ir_value()
+
+            # gfx942 column-major path (unchanged).
             d_col = dc * MFMA_M + lane32
             kv_k_start = fx.Index(pks * MFMA_K_FP8) + klane * 32
             v_off = buf_off + d_col * V_STRIDE + kv_k_start
