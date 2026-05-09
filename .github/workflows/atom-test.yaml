@@ -82,7 +82,7 @@ jobs:
                   "accuracy_test_threshold": "0.94",
                   "runner": "linux-aiter-mi300x-8",
                   "run_on_pr": True,
-                  "job_name": "ATOM Benchmark",
+                  "job_name": "ATOM Benchmark (DeepSeek-R1-0528, MI300X)",
               },
               {
                   "model_name": "DeepSeek-R1-0528",
@@ -93,7 +93,7 @@ jobs:
                   "accuracy_test_threshold": "0.94",
                   "runner": "linux-aiter-mi35x-8",
                   "run_on_pr": True,
-                  "job_name": "ATOM Benchmark",
+                  "job_name": "ATOM Benchmark (DeepSeek-R1-0528, MI35X)",
               },
               {
                   "model_name": "gpt-oss-120b",
@@ -104,7 +104,7 @@ jobs:
                   "accuracy_test_threshold": "0.38",
                   "runner": "linux-aiter-mi35x-1",
                   "run_on_pr": True,
-                  "job_name": "ATOM Benchmark",
+                  "job_name": "ATOM Benchmark (gpt-oss-120b, MI35X)",
               },
           ]
 
