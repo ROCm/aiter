@@ -95,13 +95,21 @@ def _run_install_triton():
     subprocess.check_call(["bash", install_triton])
 
 
-_triton_info = _is_triton_installed() if is_develop_mode() else None
-if _triton_info:
+AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", 0))
+
+_triton_info = _is_triton_installed()
+if AITER_USE_SYSTEM_TRITON and _triton_info:
     print(
-        f"[aiter] {_triton_info[0]}=={_triton_info[1]} is already installed,"
-        " recommend using .github/scripts/install_triton.sh to install triton"
+        f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping existing"
+        f" {_triton_info[0]}=={_triton_info[1]}"
     )
 else:
+    if _triton_info:
+        print(
+            f"[aiter] Replacing existing {_triton_info[0]}=={_triton_info[1]}"
+            " with aiter-compatible triton"
+            " (if needed, set AITER_USE_SYSTEM_TRITON=1 to keep your triton)"
+        )
     try:
         _run_install_triton()
     except Exception:
