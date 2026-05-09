@@ -10,7 +10,9 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.fusions.fused_routing_from_topk import (
-    _fused_routing_from_topk_kernel,
+    _fused_routing_from_topk_hist_kernel,
+    _fused_routing_from_topk_offset_kernel,
+    _fused_routing_from_topk_place_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -96,30 +98,46 @@ def fused_routing_from_topk(
     topk_indx = torch.empty(n_gates_pad, dtype=torch.int32, device=device)
     gate_indx = torch.empty(n_gates_pad, dtype=torch.int32, device=device)
     gate_scal = torch.empty(n_gates_pad, dtype=weights_dtype, device=device)
-    # hist MUST be zeroed: phase A is atomic_add into it.
-    hist = torch.zeros(n_expts_tot, dtype=torch.int32, device=device)
+    hist = torch.empty(n_expts_tot, dtype=torch.int32, device=device)
     offset_scratch = torch.empty(n_expts_tot, dtype=torch.int32, device=device)
 
     BLOCK_NK = max(triton.next_power_of_2(int(n_gates_pad)), 32)
     BLOCK_E = max(triton.next_power_of_2(int(n_expts_tot)), 32)
 
-    _fused_routing_from_topk_kernel[(1,)](
+    # Kernel 1 (Phase A): histogram via tl.histogram (warp-local
+    # shared-memory reduction). num_warps=1 keeps the reduction within a
+    # single wave, matching the CTA-local design of the original kernel.
+    _fused_routing_from_topk_hist_kernel[(1,)](
+        topk_ids_flat,
+        hist,
+        n_gates_pad,
+        E=n_expts_tot,
+        BLOCK_NK=BLOCK_NK,
+        BLOCK_E=BLOCK_E,
+        num_warps=1,
+    )
+
+    # Kernel 2 (Phase B): exclusive prefix-sum hist → offset. The kernel
+    # boundary above publishes hist without an explicit barrier.
+    _fused_routing_from_topk_offset_kernel[(1,)](
+        hist,
+        offset_scratch,
+        E=n_expts_tot,
+        BLOCK_E=BLOCK_E,
+        num_warps=1,
+    )
+
+    # Kernel 3 (Phase C): placement. The kernel boundary publishes the
+    # prefix-sum offsets without an explicit barrier or atomic_xchg.
+    _fused_routing_from_topk_place_kernel[(1,)](
         topk_ids_flat,
         topk_weights_flat,
-        hist,
         offset_scratch,
         topk_indx,
         gate_indx,
         gate_scal,
         n_gates_pad,
-        E=n_expts_tot,
         BLOCK_NK=BLOCK_NK,
-        BLOCK_E=BLOCK_E,
-        # num_warps=1 forces a single hardware wave per CTA, which removes
-        # cross-wave memory-ordering races on the global hist/offset
-        # atomics. Without this, Phase B can read a partial hist on AMD
-        # CDNA, producing wrong offsets and pos collisions in Phase C —
-        # caught by the inverse-permutation invariant at small E values.
         num_warps=1,
     )
 
