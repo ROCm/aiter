@@ -73,12 +73,11 @@ def fused_routing_from_topk(
     n_tokens, n_expts_act = topk_weights.shape
     n_gates_pad = n_tokens * n_expts_act
 
-    if n_gates_pad > _FUSED_ROUTING_MAX_NK:
-        raise ValueError(
-            f"fused_routing_from_topk: NK={n_gates_pad} exceeds the "
-            f"single-CTA budget of {_FUSED_ROUTING_MAX_NK}. Caller should "
-            f"dispatch to a reference implementation for NK above this."
-        )
+    assert n_gates_pad <= 4096, (
+        f"fused_routing_from_topk: NK={n_gates_pad} exceeds the "
+        f"single-CTA budget of 4096. Caller should "
+        f"dispatch to a reference implementation for NK above this."
+    )
 
     _LOGGER.info(
         f"FUSED_ROUTING_FROM_TOPK: n_tokens={n_tokens} K={n_expts_act} "
