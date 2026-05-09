@@ -266,11 +266,20 @@ def ref_masked_attention(
         scale *= q_scale
     if is_fp8_kvc and kv_scale is not None:
         scale *= kv_scale
+
+    s_q = query.shape[0]
+    s_k = key.shape[0]
+    nheads = query.shape[1]
+    headdim_v = value.shape[-1]
+
+    if s_k == 0:
+        out = torch.zeros(s_q, nheads, headdim_v, dtype=dtype, device=query.device)
+        lse = torch.full((nheads, s_q), float("-inf"), dtype=torch.float32, device=query.device)
+        return out, lse
+
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
 
     if is_causal:
-        s_q = query.shape[0]
-        s_k = key.shape[0]
         diagonal = causal_diagonal if causal_diagonal is not None else s_k - s_q
         attn_bias = torch.zeros(s_q, s_k, dtype=query.dtype)
         temp_mask = torch.ones(s_q, s_k, dtype=torch.bool).tril(diagonal=diagonal)
@@ -393,7 +402,7 @@ def torch_mla_extend(
             v,
             sm_scale,
             dtype,
-            is_causal=is_causal,
+            is_causal=True,
             is_fp8_q=is_fp8_q,
             is_fp8_kvc=is_fp8_kvc,
             q_scale=q_scale,
@@ -489,6 +498,13 @@ def torch_mla_extend_split_kv(
         or (
             get_gfx() == "gfx950"
             and nheads == 64
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q == 1
+        )
+        or (
+            get_gfx() == "gfx950"
+            and nheads == 32
             and is_fp8_q
             and is_fp8_kvc
             and max_seqlen_q == 1
@@ -595,7 +611,7 @@ def torch_mla_extend_split_kv(
             v,
             sm_scale,
             out_dtype,
-            is_causal=is_causal,
+            is_causal=True,
             is_fp8_q=is_fp8_q,
             is_fp8_kvc=is_fp8_kvc,
             q_scale=q_scale,
@@ -827,7 +843,7 @@ def torch_mla_split_kv_and_reduce(
             work_info_set=work_info_set,
             work_indptr=work_indptr,
             max_seqlen_q=max_seqlen_q,
-            is_causal=is_causal,
+            is_causal=True,
             q_scale=q_scale,
             kv_scale=kv_scale,
         )
@@ -1064,7 +1080,6 @@ def test_mla(
         is_causal=True,
         dtype=out_dtype,
     )
-
     # It is necessary to limit the size of the tensor in the DP mode
     # so reduce the split_num in the DP mode.
     if nhead >= 128:
@@ -1137,7 +1152,6 @@ def test_mla(
         dtype_q=dtype,
         dtype_kv=kvtype,
     )
-
     if os.environ.get("DUMP_MLA_METADATA", ""):
         kv_gran = max(page_size, 16)
         max_num_blocks = max(
@@ -1287,7 +1301,7 @@ def test_mla(
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
-                    is_causal=True,
+                    is_causal=bool(is_causal),
                     q_scale=None,
                     kv_scale=kv_scale,
                 )
@@ -1384,22 +1398,9 @@ def test_mla(
         kv_buffer_fp8 = kv_buffer.to(dtypes.fp8)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-        out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
-            q_fp8 if dtype == dtypes.fp8 else q,
-            kv_buffer_fp8,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            sm_scale,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            dtype=out_dtype,
-            is_causal=True,
-            q_scale=None,
-            kv_scale=kv_scale,
-        )
-
+        # Run perftest FIRST before golden ref to avoid GPU memory
+        # interaction between torch_mla_extend's float32 temporaries
+        # and copy.deepcopy in run_perftest.
         (attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q_fp8 if dtype == dtypes.fp8 else q,
@@ -1424,6 +1425,23 @@ def test_mla(
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
             return_lse=return_lse,
+        )
+
+        # Compute FP8 golden reference AFTER perftest
+        out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
+            q_fp8 if dtype == dtypes.fp8 else q,
+            kv_buffer_fp8,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            sm_scale,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype=out_dtype,
+            is_causal=True,
+            q_scale=None,
+            kv_scale=kv_scale,
         )
 
         err = checkAllclose(
@@ -1464,8 +1482,8 @@ def test_mla(
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     max_seqlen_q=max_seqlen_qo,
-                    is_causal=True,
-                    q_scale=q_scale,
+            is_causal=True,
+            q_scale=q_scale,
                     kv_scale=kv_scale,
                 )
             )
@@ -1719,7 +1737,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)],
+    default=[(16, 1), (16, 2), (16, 4), (32, 1), (48, 1), (128, 2)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )
@@ -1771,7 +1789,6 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
-
 args = parser.parse_args()
 for nhead, decode_qlen in args.nhead:
     df = []

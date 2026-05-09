@@ -382,6 +382,13 @@ def mla_decode_fwd(
                 and kv_buffer.dtype == dtypes.fp8
                 and max_seqlen_q == 1
             )
+            or (
+                get_gfx() == "gfx950"
+                and nhead == 32
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q == 1
+            )
         ):
             # Natively support cases
             pass
@@ -446,6 +453,13 @@ def mla_decode_fwd(
             if return_lse
             else None
         )
+
+        # Refresh GPU pointers in work_meta_data to handle copy.deepcopy
+        # scenarios where the tensor addresses change but the embedded
+        # pointer values become stale.
+        if work_meta_data is not None and work_indptr is not None and work_info_set is not None:
+            work_meta_data[0] = work_indptr.data_ptr()
+            work_meta_data[1] = work_info_set.data_ptr()
 
         use_hk = (
             nhead == 128

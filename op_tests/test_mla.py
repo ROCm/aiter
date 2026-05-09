@@ -446,6 +446,7 @@ def test_mla(
             q_scale=q_scale,
             kv_scale=kv_scale,
             num_kv_splits=split_per_batch,
+            return_lse=return_lse,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -515,7 +516,7 @@ def test_mla(
         128,
     ]:
         err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and nhead in [8, 16, 128]:
+    elif kvtype == dtypes.fp8 and nhead in [8, 16, 32, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
 
     ret["decode:err"] = err
@@ -660,10 +661,10 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=[(8, 1), (16, 1), (16, 2), (16, 4), (64, 1), (128, 1), (128, 2), (128, 4)],
+    choices=[(8, 1), (16, 1), (16, 2), (16, 4), (32, 1), (64, 1), (128, 1), (128, 2), (128, 4)],
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
+    default=[(16, 1), (16, 2), (16, 4), (32, 1), (128, 1), (128, 2)],
     help="""Number of nhead and decode_qlen.
     e.g.: -n 16,1""",
 )
@@ -689,8 +690,6 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
-
-
 args = parser.parse_args()
 
 for nhead, decode_qlen in args.nhead:

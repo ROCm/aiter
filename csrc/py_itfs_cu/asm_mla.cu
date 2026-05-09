@@ -193,35 +193,10 @@ void mla_decode_stage1_asm_fwd(
     }
     else
     {
-        // The legacy QH16 m32x1_n16x1 kernel (gqa_ratio=32, decode qseqlen=1)
-        // writes directly to output via ptr_RP when kv_split==1.  Passing
-        // nullptr causes GPU memory faults on gfx950.  Other non-persistent
-        // kernels (v3, stage1) use split-reduce and expect ptr_RP = nullptr.
-        bool legacy_qh16 = (gqa_ratio == 32 && max_seqlen_q == 1);
-        args.out_16_nosplit = legacy_qh16 ? kv_split : 0;
-        args.ptr_RP = legacy_qh16 ? output->data_ptr() : nullptr;
+        args.out_16_nosplit = (kv_split == 1) ? 1 : 0;
+        args.ptr_RP = reinterpret_cast<void*>((unsigned long)args.out_16_nosplit);
         args.ptr_STP = num_kv_splits_indptr->data_ptr();
     }
-
-    // std::cout << "mla args" << std::endl;
-    // std::cout << "ptr_R: " << args.ptr_R << std::endl;
-    // std::cout << "ptr_LSE: " << args.ptr_LSE << std::endl;
-    // std::cout << "ptr_Q: " << args.ptr_Q << std::endl;
-    // std::cout << "ptr_KV: " << args.ptr_KV << std::endl;
-    // std::cout << "ptr_LTP: " << args.ptr_LTP << std::endl;
-    // std::cout << "ptr_LTD: " << args.ptr_LTD << std::endl;
-    // std::cout << "ptr_LTL: " << args.ptr_LTL << std::endl;
-    // std::cout << "scalar: " << args.scalar << std::endl;
-    // std::cout << "s_MQA: " << args.s_MQA << std::endl;
-    // std::cout << "s_kv_split: " << args.s_kv_split << std::endl;
-    // std::cout << "s_Q_Bs: " << args.s_Q_Bs << std::endl;
-    // std::cout << "s_Bs: " << args.s_Bs << std::endl;
-    // std::cout << "s_log2_plen: " << args.s_log2_plen << std::endl;
-    // std::cout << "ptr_RP: " << args.ptr_RP << std::endl;
-    // std::cout << "ptr_QTP: " << args.ptr_QTP << std::endl;
-    // std::cout << "ptr_STP: " << args.ptr_STP << std::endl;
-    // std::cout << "out_16_nosplit: " << args.out_16_nosplit << std::endl;
-    // std::cout << "ptr_LSEP: " << args.ptr_LSEP << std::endl;
 
     AITER_CHECK(Q->is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
     AITER_CHECK(num_kv_heads == 1, __func__, ":only support num_kv_heads==1 for now");
@@ -331,9 +306,12 @@ void mla_decode_stage1_asm_fwd(
             } else if((max_seqlen_q == 2) && persistent){
                 config_max_seqlen_q = 2;
                 sub_Q = 128;
+            } else if(max_seqlen_q == 1){
+                config_max_seqlen_q = 1;
+                sub_Q = 16;
             } else {
                 AITER_CHECK(false, __func__, 
-                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=2,4 in persistent mode");
+                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=1 or persistent decode_qlen=2,4");
             }
         }
     } else if (gqa_ratio == 64){
