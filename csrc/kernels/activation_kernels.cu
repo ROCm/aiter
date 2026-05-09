@@ -702,6 +702,7 @@ void silu_and_mul(const aiter_tensor_t& out,   // [..., d]
                   const aiter_tensor_t& input, // [..., 2 * d]
                   float limit)
 {
+    AITER_CHECK(limit >= 0.0f, "silu_and_mul: limit must be >= 0");
     if(limit > 0.0f)
     {
         LAUNCH_ACTIVATION_GATE_KERNEL_IMPL(aiter::silu_kernel, true, limit);

@@ -314,7 +314,7 @@ df = df[
     ]
 ]
 df_md = df.to_markdown(index=False)
-aiter.logger.info("silu_and_mul with limit=30.0 summary (markdown):\n%s", df_md)
+aiter.logger.info("silu_and_mul with limit=10.0 summary (markdown):\n%s", df_md)
 
 df = []
 for dtype in args.dtype:
