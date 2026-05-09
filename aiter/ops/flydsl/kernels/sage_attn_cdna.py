@@ -191,13 +191,21 @@ def build_sage_attn_cdna_module(
     # V LDS section: HEAD_DIM rows × V_STRIDE bytes per row.
     LDS_K_BYTES = BLOCK_N * K_STRIDE * 1   # 1 byte per Int8
     LDS_V_BYTES = HEAD_DIM * V_STRIDE * 1  # 1 byte per FP8 (column-major view)
-    LDS_TOTAL_BYTES = LDS_K_BYTES + LDS_V_BYTES
+    # Stage III: 2-stage software pipeline. Allocate two ping-pong buffers for
+    # K and V so the next KV block's loads can be issued while the current
+    # block's MFMAs are still executing.
+    # Layout: [K0 | K1 | V0 | V1]. K and V groups are kept contiguous so each
+    # typed view (lds, lds_v) covers all of its buffers — that lets the LLVM
+    # backend keep the alignment hint that lowers V reads to ds_read_b128.
+    NUM_PIPE_STAGES = 2
+    LDS_K_TOTAL_BYTES = LDS_K_BYTES * NUM_PIPE_STAGES
+    LDS_V_TOTAL_BYTES = LDS_V_BYTES * NUM_PIPE_STAGES
+    LDS_TOTAL_BYTES = LDS_K_TOTAL_BYTES + LDS_V_TOTAL_BYTES
 
     # We store K as i8 and V as bf16. Because the SmemAllocator works in elements
     # and we share one LDS array, we allocate in Int8 units and use byte offsets.
-    # K section: LDS_K_BYTES bytes starting at lds_offset
-    # V section: LDS_V_BYTES bytes starting at lds_offset + LDS_K_BYTES
-    # Total: LDS_TOTAL_BYTES bytes
+    # K section: LDS_K_TOTAL_BYTES bytes starting at lds_offset
+    # V section: LDS_V_TOTAL_BYTES bytes starting at lds_offset + LDS_K_TOTAL_BYTES
     LDS_TOTAL_I8_ELEMS = LDS_TOTAL_BYTES  # 1:1 byte mapping for i8 allocator
 
     allocator = SmemAllocator(
@@ -310,23 +318,24 @@ def build_sage_attn_cdna_module(
         seq_len_k_v = fx.Index(seq_len_k)
 
         base_ptr = allocator.get_base()
-        # Shared LDS as Int8 view (K stored as i8 row-major; V as i8 column-major
-        # in the upper half).
+        # Shared LDS as Int8 view: covers BOTH K ping-pong buffers (K0 | K1).
+        # Buffer index is a runtime value; per-buffer LDS index = base_idx +
+        # buf_idx * LDS_K_BYTES.
         lds = SmemPtr(
             base_ptr,
             lds_base_offset,
             T.i8,
-            shape=(LDS_TOTAL_I8_ELEMS,),
+            shape=(LDS_K_TOTAL_BYTES,),
         ).get()
-        # Separate, smaller, statically-shaped view for V — gives the LLVM
-        # backend a tight bound that helps prove 16-byte alignment for
-        # vector loads, so they can lower to ds_read_b128 instead of
-        # 32× ds_read_u8.
+        # Separate, statically-shaped view for V — gives the LLVM backend a
+        # tight bound that helps prove 16-byte alignment for vector loads, so
+        # they can lower to ds_read_b128 instead of 32× ds_read_u8. Covers
+        # BOTH V ping-pong buffers (V0 | V1).
         lds_v = SmemPtr(
             base_ptr,
-            lds_base_offset + LDS_K_BYTES,
+            lds_base_offset + LDS_K_TOTAL_BYTES,
             T.i8,
-            shape=(LDS_V_BYTES,),
+            shape=(LDS_V_TOTAL_BYTES,),
         ).get()
 
         block_id = fx.Index(gpu.block_idx.x)
@@ -465,7 +474,9 @@ def build_sage_attn_cdna_module(
             kv_upper = seq_len_k_v
 
         # ---- Cooperative load helpers for K (Int8) ----
-        def coop_load_k(tile_start):
+        # buf_off: byte offset into the K-side LDS that selects the ping-pong
+        # buffer. 0 = buffer 0, LDS_K_BYTES = buffer 1.
+        def coop_load_k(tile_start, buf_off):
             for batch in range_constexpr(NUM_BATCHES_K):
                 row_offset = batch * ROWS_PER_BATCH_K
                 row_idx_raw = tile_start + load_row_k_batch + row_offset
@@ -481,7 +492,7 @@ def build_sage_attn_cdna_module(
                 if do_load:
                     g_idx = kv_global_idx(row_idx, load_col_k_base)
                     lds_row = load_row_k_batch + row_offset
-                    lds_idx = lds_row * K_STRIDE + load_col_k_base
+                    lds_idx = buf_off + lds_row * K_STRIDE + load_col_k_base
                     vec = _load_ptr_i8_vec16(k_ptr, g_idx)
                     Vec(vec).store(lds, [lds_idx])
 
@@ -493,7 +504,7 @@ def build_sage_attn_cdna_module(
         # (one ds_read_b256 = 2 ds_read_b128) at fixed d, kv_row=k_start..+31.
         LDS_V_BYTE_BASE = LDS_K_BYTES  # byte offset of V section
 
-        def coop_load_v(tile_start):
+        def coop_load_v(tile_start, buf_off):
             """Load V from global (FP8 raw bytes) → write transposed to LDS.
 
             Each thread reads VEC_WIDTH_V=16 contiguous FP8 bytes from one
@@ -503,6 +514,8 @@ def build_sage_attn_cdna_module(
 
             For rows beyond seq_len_k, we clamp the load address to row 0 and
             zero the resulting bytes to prevent 0 * NaN = NaN in the PV MFMA.
+
+            buf_off: byte offset into lds_v selecting the ping-pong V buffer.
             """
             for batch in range_constexpr(NUM_BATCHES_V):
                 row_offset = batch * ROWS_PER_BATCH_V
@@ -527,24 +540,25 @@ def build_sage_attn_cdna_module(
                     # Scatter: 16 individual ds_write_u8 to 16 different LDS rows.
                     for di in range_constexpr(VEC_WIDTH_V):
                         d_idx = load_col_v_base + di
-                        v_off = d_idx * V_STRIDE + lds_col
+                        v_off = buf_off + d_idx * V_STRIDE + lds_col
                         b_i8 = vector.extract(
                             raw_v, static_position=[di], dynamic_position=[]
                         )
                         Vec.from_elements([b_i8], fx.Int8).store(lds_v, [v_off])
 
-        def load_k_frag(kv_block_row, ks):
+        def load_k_frag(kv_block_row, ks, buf_off):
             """Load v4i32 (=16xi8) K fragment from LDS for mfma_i32_32x32x32_i8.
 
             kv_block_row: row within BLOCK_N tile (0..BLOCK_N-1)
             ks: K-step index (selects 32-wide K chunk; klane picks the 16-byte half)
+            buf_off: ping-pong K-buffer byte offset.
             """
             k_col = fx.Index(ks * MFMA_K_INT8) + klane * 16
-            lds_idx = fx.Index(kv_block_row * K_STRIDE) + k_col
+            lds_idx = buf_off + fx.Index(kv_block_row * K_STRIDE) + k_col
             v16i8 = Vec.load(v16i8_type, lds, [lds_idx])
             return vector.bitcast(v4i32_type, v16i8)
 
-        def load_v_frag_fp8(pks, dc):
+        def load_v_frag_fp8(pks, dc, buf_off):
             """Load v8i32 (=32xi8 fp8) V fragment from LDS for mfma_scale_f32_32x32x64.
 
             For lane (klane, lane32) at PV step `pks` and D chunk `dc`, the A
@@ -557,7 +571,7 @@ def build_sage_attn_cdna_module(
             """
             d_col = dc * MFMA_M + lane32
             kv_k_start = fx.Index(pks * MFMA_K_FP8) + klane * 32
-            v_off = d_col * V_STRIDE + kv_k_start
+            v_off = buf_off + d_col * V_STRIDE + kv_k_start
             lo_v16i8 = Vec.load(v16i8_type, lds_v, [v_off])
             hi_v16i8 = Vec.load(v16i8_type, lds_v, [v_off + 16])
             lo_v4i32 = vector.bitcast(v4i32_type, lo_v16i8)
@@ -579,19 +593,60 @@ def build_sage_attn_cdna_module(
             return arith.BitcastOp(T.bf16, i16_val).result
 
         # ---- Main loop: iterate over KV tiles ----
-        init_args = [_raw(c_neg_inf), _raw(c_zero_f)]
+        # Stage III: 2-stage software pipeline.
+        #   Prologue: prefetch KV block 0 into buffer 0.
+        #   Iter i:   barrier; if not last, prefetch block (i+1) into buf (i+1)%2;
+        #             then QK MFMA + softmax + PV MFMA on buf (i%2).
+        # Buffer parity is carried as a loop-state i32 (0 or 1) to keep the LDS
+        # offset on the fast scalar-broadcast path (no integer division by
+        # BLOCK_N inside the hot loop).
+        K_BUF1_OFF = fx.Index(LDS_K_BYTES)
+        V_BUF1_OFF = fx.Index(LDS_V_BYTES)
+        ZERO_INDEX = fx.Index(0)
+
+        def _buf_off(buf_idx_i32, stride_index):
+            """buf_idx ∈ {0,1} → byte offset in {0, stride}, returned as fx.Index."""
+            is_one = ArithValue(fx.Int32(buf_idx_i32) == fx.Int32(1))
+            return fx.Index(is_one.select(stride_index, ZERO_INDEX))
+
+        # Prologue: prefetch first KV block into buffer 0.
+        coop_load_k(ZERO_INDEX, ZERO_INDEX)
+        coop_load_v(ZERO_INDEX, ZERO_INDEX)
+
+        # i32 0 — current buffer index for the first iteration.
+        c0_i32_init = arith.constant(0, type=T.i32)
+
+        init_args = [c0_i32_init, _raw(c_neg_inf), _raw(c_zero_f)]
         for _ in range_constexpr(D_CHUNKS):
             init_args.append(_raw(c_zero_v16f32))
 
         loop_results = init_args
         for kv_block_start, inner_iter_args in range(0, kv_upper, BLOCK_N, init=init_args):
-            m_running = inner_iter_args[0]
-            l_running = inner_iter_args[1]
-            o_accs = [inner_iter_args[2 + i] for i in range_constexpr(D_CHUNKS)]
+            cur_buf_i32 = inner_iter_args[0]
+            m_running = inner_iter_args[1]
+            l_running = inner_iter_args[2]
+            o_accs = [inner_iter_args[3 + i] for i in range_constexpr(D_CHUNKS)]
 
-            # Load K tile (Int8) to LDS
-            coop_load_k(kv_block_start)
+            # Compute buffer byte offsets for current and next iterations.
+            cur_k_off = _buf_off(cur_buf_i32, K_BUF1_OFF)
+            cur_v_off = _buf_off(cur_buf_i32, V_BUF1_OFF)
+            # next_buf = 1 - cur_buf  (XOR 1)
+            next_buf_i32 = arith.XOrIOp(
+                _raw(cur_buf_i32), arith.constant(1, type=T.i32)
+            ).result
+            next_k_off = _buf_off(next_buf_i32, K_BUF1_OFF)
+            next_v_off = _buf_off(next_buf_i32, V_BUF1_OFF)
+
+            # Wait for the prologue/previous-iter prefetch into cur_buf to land
+            # AND for the previous iter's reads of next_buf to drain.
             gpu.barrier()
+
+            # Issue prefetch for the next KV block into the OTHER buffer. OOB
+            # rows are clamped to row 0 inside the coop loaders; the resulting
+            # garbage is never consumed because the loop terminates first.
+            next_kv_block_start = kv_block_start + BLOCK_N
+            coop_load_k(next_kv_block_start, next_k_off)
+            coop_load_v(next_kv_block_start, next_v_off)
 
             # ==== GEMM1: S_i32 = K_i8 @ Q_i8^T ====
             # s_accs[subtile]: v16i32 per lane (MFMA 32x32 output, wave64).
@@ -605,7 +660,7 @@ def build_sage_attn_cdna_module(
                 for st in range_constexpr(N_SUBTILES):
                     # K operand A: lane has 16 i8 at row m=lane32+st*32, K=ks*32+klane*16..+15
                     kv_row = lane32 + st * MFMA_N
-                    k_frag = load_k_frag(kv_row, ks)
+                    k_frag = load_k_frag(kv_row, ks, cur_k_off)
                     s_accs[st] = mfma_i32_k32(
                         v16i32_type, [k_frag, q_packs[ks], s_accs[st], 0, 0, 0]
                     )
@@ -694,9 +749,9 @@ def build_sage_attn_cdna_module(
             for dc in range_constexpr(D_CHUNKS):
                 o_accs[dc] = _fmul(o_accs[dc], corr_vec16)
 
-            # Load V tile (raw FP8 bytes, transposed → column-major in LDS)
-            coop_load_v(kv_block_start)
-            gpu.barrier()
+            # V was already loaded (either by the prologue or by the previous
+            # iteration's prefetch). The pre-MFMA barrier above already
+            # synchronized.
 
             # ==== P quant: f32 → fp8 (e4m3fn on gfx950) ====
             # P = exp2(s - m_new) ∈ [0, 1] by construction (row-max(P) = 1.0),
@@ -785,7 +840,7 @@ def build_sage_attn_cdna_module(
                 # Constant e8m0 scale = 127 → multiplier 1.0 (no scaling).
                 scale_127 = arith.constant(127, type=T.i32)
                 for dc in range_constexpr(D_CHUNKS):
-                    v_frag = load_v_frag_fp8(pks, dc)
+                    v_frag = load_v_frag_fp8(pks, dc, cur_v_off)
                     o_accs[dc] = mfma_fp8_k64(
                         v16f32_type, v_frag, p_pack_v8i32, o_accs[dc],
                         scale_127, scale_127,
@@ -794,12 +849,13 @@ def build_sage_attn_cdna_module(
             m_running = m_new
             l_running = l_new
 
-            _yield_args = [m_running, l_running] + o_accs
+            _yield_args = [next_buf_i32, m_running, l_running] + o_accs
             loop_results = yield _yield_args
 
         # ---- Normalize and store O ----
-        l_final = loop_results[1]
-        o_finals = [loop_results[2 + dc] for dc in range_constexpr(D_CHUNKS)]
+        # loop_results layout: [cur_buf_i32, m_running, l_running, o_acc_0, ...]
+        l_final = loop_results[2]
+        o_finals = [loop_results[3 + dc] for dc in range_constexpr(D_CHUNKS)]
 
         inv_l = arith.divf(_raw(c_one_f), _raw(l_final), fastmath=fm_fast)
         # Compensate for the FP8 P-quant scale: multiply output by 1/FP8_MAX.
