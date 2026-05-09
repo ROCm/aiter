@@ -118,7 +118,11 @@ jobs:
               selected = default_models
           else:
               with open(".github/benchmark/models_accuracy.json", encoding="utf-8") as f:
-                  selected = json.load(f)
+                  selected = [
+                      model
+                      for model in json.load(f)
+                      if str(model.get("test_level", "")).lower() == "pr"
+                  ]
               runner_overrides = {
                   "atom-mi355-8gpu.predownload": "linux-aiter-mi35x-8",
                   "linux-atom-mi35x-4": "linux-aiter-mi35x-4",
