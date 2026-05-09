@@ -264,6 +264,9 @@ def compile_mixed_moe_gemm1(
     # Stage1 output = [tokens*topk, inter_dim], direct store (accumulate=False).
     # G1U1 weight layout: [E * 2*inter_dim, model_dim] pre-shuffled.
     # G1U0 weight layout: [E * inter_dim, model_dim] pre-shuffled.
+    _w_physical_k_bytes = model_dim // 2 if is_f4_b else model_dim * int(b_elem_bytes)
+    _w_nbytes_static = experts * _weight_rows_per_expert * _w_physical_k_bytes
+    _use_wptr64 = is_f4_b and _w_nbytes_static >= (1 << 31)
 
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
     if bytes_x_per_tile % total_threads != 0:
@@ -320,7 +323,7 @@ def compile_mixed_moe_gemm1(
         else ""
     )
     _async_lds_tag = "_apldswait" if use_async_copy and a_elem_vec_pack > 1 else ""
-    _wptr64_tag = "_wptr64" if is_f4_b else ""
+    _wptr64_tag = "_wptr64" if _use_wptr64 else ""
     module_name = (
         f"mfma_moe1_{act}_a{a_dtype}_w{b_dtype}_{out_s}{_g_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v37_tidlds_aread{_gm_tag}{_wptr64_tag}{_async_lds_tag}_g1u0_splitk"
@@ -741,7 +744,7 @@ def compile_mixed_moe_gemm1(
                 arg_sorted_weights, max_size=False, num_records_bytes=sorted_nbytes_i32
             )
 
-            if is_f4_b:
+            if _use_wptr64:
                 from flydsl._mlir.dialects import fly as _fly
 
                 _llvm_ptr_ty_as1 = ir.Type.parse("!llvm.ptr<1>")
@@ -947,7 +950,7 @@ def compile_mixed_moe_gemm1(
                     k0 = base_k_bytes // c64 + arith.constant(ku, index=True)
                     k1 = lane_div_16
                     vec_elems = kpack_bytes // int(b_elem_bytes)
-                    if is_f4_b:
+                    if _use_wptr64:
                         load_bytes = int(vec_elems) * int(b_elem_bytes)
                         vec_width = load_bytes // 4
                         # Recompute the preshuffle-B byte offset with index arithmetic
