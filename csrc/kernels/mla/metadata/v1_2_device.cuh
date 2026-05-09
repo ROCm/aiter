@@ -59,7 +59,16 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     auto get_num_qo_tiles = [&](const int32_t batch_idx) {
         if constexpr(Traits::kQoSplits)
         {
-            const int32_t packed_qo_len = qo_state.get_seqlen(batch_idx) * params.num_heads;
+            const int32_t seqlen_qo = qo_state.get_seqlen(batch_idx);
+            // When num_heads * 2 > kPackedQoLenPerWg, each tile can hold at most
+            // 1 qo position (floor(kPackedQoLenPerWg / num_heads) == 1), so we
+            // need seqlen_qo tiles. The simple ceil(packed/kPackedQoLenPerWg)
+            // underestimates this for non-power-of-2 num_heads (e.g., 96, 112).
+            if(params.num_heads * 2 > Traits::kPackedQoLenPerWg)
+            {
+                return seqlen_qo;
+            }
+            const int32_t packed_qo_len = seqlen_qo * params.num_heads;
             return integer_divide_ceil_power2(
                 packed_qo_len, Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2);
         }
@@ -506,12 +515,11 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
             ((num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
             ((arch_id == "gfx950") && (num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 && kv_is_fp8) ||
             ((arch_id == "gfx942") && (num_heads == 8) && (max_seqlen_qo == 2) && !q_is_fp8 && !kv_is_fp8) ||
-            ((arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 128 == 0) && !q_is_fp8 &&
-             !kv_is_fp8),
+            ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8),
         __func__,
         ": only supports #heads in [16, 64, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
         "N is in [2, 8), or (#head, max_seqlen_qo) = (8, 4) where q and kv are fp8, "
-        "or (#head * max_seqlen_qo) %% 64 == 0 where q and kv are bf16 on gfx950.")
+        "or q and kv are bf16 on gfx950")
 
     int32_t num_splits = max_split_per_batch < 0
                              ? num_clusters
@@ -543,7 +551,13 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.fixed_over_head_num_blocks   = max(1, (16 + page_size - 1) / page_size);
     params.tail_done_threshold          = max_seqlen_qo;
 
-    const int32_t kPackedQoLenPerWg = 128;
+    int32_t kPackedQoLenPerWg = 128;
+    if ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8 &&
+        (num_heads * max_seqlen_qo >= 64) && (num_heads <= 64) &&
+        (((num_heads * max_seqlen_qo) < 128) ||
+         (num_heads == 48))) {
+        kPackedQoLenPerWg = 64;
+    }
 
     // launch kernel
     MLA_METADATA_DISPATCHER(

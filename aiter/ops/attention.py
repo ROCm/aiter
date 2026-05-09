@@ -934,6 +934,7 @@ def get_mla_metadata_info_v1(
     )
 
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
+    max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
     if (
         get_gfx() == "gfx950"
         and (num_head_qo * effective_seqlen_qo) % 128 == 0
@@ -944,12 +945,27 @@ def get_mla_metadata_info_v1(
         max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
     elif (
         get_gfx() == "gfx950"
-        and (num_head_qo * effective_seqlen_qo) % 64 == 0
+        and ((num_head_qo * effective_seqlen_qo) >= 64 or num_head_qo > 16)
         and kv_dtype == dtypes.bf16
         and q_dtype == dtypes.bf16
-        and ((num_head_qo & (num_head_qo - 1)) == 0)
     ):
-        max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 64))
+        # Mirror v1_2_device.cuh::get_num_qo_tiles upper bound. Non-power-of-2
+        # num_head_qo forces 1 qo per tile; power-of-2 with packed in the open
+        # range (64, 128) splits at /64; otherwise /128. Use upper bound /64
+        # to size the buffer conservatively.
+        packed = effective_seqlen_qo * num_head_qo
+        if (num_head_qo & (num_head_qo - 1)) != 0:
+            max_qo_tiles_per_batch = effective_seqlen_qo
+        elif packed > 64 and (packed % 128) != 0:
+            max_qo_tiles_per_batch = int(math.ceil(packed / 64))
+    elif (
+        get_gfx() == "gfx950"
+        and ((num_head_qo * effective_seqlen_qo) >= 128 or num_head_qo > 64)
+        and kv_dtype == dtypes.bf16
+        and q_dtype == dtypes.bf16
+    ):
+        if num_head_qo * 2 > 128:
+            max_qo_tiles_per_batch = effective_seqlen_qo
     elif (
         num_head_qo == 16
         or (
