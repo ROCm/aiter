@@ -17,12 +17,11 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-# Maximum NK supported by the single-CTA fused kernel. Above this the
+# Maximum NK supported by the single-CTA fused kernel is 4096. Above this the
 # wrapper raises rather than degrading silently — callers should fall
 # back to a multi-kernel reference path for prefill-shaped inputs (NK in
 # the tens of thousands). Decode (num_tokens × top_k) at typical batch
 # sizes is well within this budget.
-_FUSED_ROUTING_MAX_NK = 4096
 
 
 def fused_routing_from_topk(
