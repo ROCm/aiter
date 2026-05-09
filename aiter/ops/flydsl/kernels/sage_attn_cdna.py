@@ -4,12 +4,12 @@
 """FlyDSL Sage Attention kernel for CDNA (gfx942/gfx950).
 
 Implements Int8 Q/K × FP8 V flash attention using MFMA instructions:
-  - GEMM1 (Q×K^T): mfma_i32_16x16x32i8 → Int32 accum → scale to Float32
-  - GEMM2 (P×V):   mfma_f32_16x16x16bf16_1k → Float32 accum
+  - GEMM1 (Q×K^T): mfma_i32_32x32x32_i8 → Int32 accum → scale to Float32
+  - GEMM2 (P×V):   mfma_f32_32x32x16_bf16 → Float32 accum
 
 Architecture: gfx942 (MI300X) and gfx950 (MI350)
   - wave64 (64 threads/wave)
-  - MFMA 16x16x32 for Int8, 16x16x16 for BF16
+  - MFMA 32x32x32 for Int8, 32x32x16 for BF16 (gfx950 binding)
   - Block: (BLOCK_M // ROWS_PER_WAVE) waves × 64 threads = total threads
 
 Layout: Q/K/V/O are 1D-flattened from BSHD.
@@ -97,16 +97,16 @@ def build_sage_attn_cdna_module(
     gpu_arch = get_hip_arch()
     WARP_SIZE = get_warp_size(gpu_arch)  # 64 for CDNA
 
-    # MFMA 16x16 tile dimensions
-    MFMA_M = 16
-    MFMA_N = 16
+    # MFMA 32x32 tile dimensions (Stage A: both QK and PV use 32x32)
+    MFMA_M = 32
+    MFMA_N = 32
 
-    # For Int8 MFMA: mfma_i32_16x16x32i8 accumulates K=32 per call
+    # For Int8 MFMA: mfma_i32_32x32x32_i8 accumulates K=32 per call
     MFMA_K_INT8 = 32
-    # For BF16 MFMA: mfma_f32_16x16x16bf16_1k accumulates K=16 per call
+    # For BF16 MFMA: mfma_f32_32x32x16_bf16 accumulates K=16 per call
     MFMA_K_BF16 = 16
 
-    ROWS_PER_WAVE = MFMA_M  # 16 output rows per wave
+    ROWS_PER_WAVE = MFMA_M  # 32 output rows per wave
 
     BLOCK_M = block_m if block_m is not None else 256
     BLOCK_N = block_n if block_n is not None else 128
@@ -201,15 +201,36 @@ def build_sage_attn_cdna_module(
     _is_gfx950 = "gfx950" in gpu_arch
     _fp8_mlir_type_cls = ir.Float8E4M3FNType if _is_gfx950 else ir.Float8E4M3FNUZType
 
-    mfma_i32_k32 = getattr(rocdl, "mfma_i32_16x16x32i8", None) or getattr(
-        rocdl, "mfma_i32_16x16x32_i8", None
+    # The 32x32 MFMA variants don't have a flydsl.expr.rocdl wrapper, so we
+    # call the raw ODS class directly with positional arguments.
+    from flydsl._mlir.dialects._rocdl_ops_gen import (
+        mfma_i32_32x32x32_i8 as _ods_mfma_i32_32x32x32_i8,
+        mfma_f32_32x32x16_bf16 as _ods_mfma_f32_32x32x16_bf16,
     )
-    assert mfma_i32_k32 is not None, "INT8 K32 MFMA not found"
 
-    mfma_bf16_k16 = getattr(rocdl, "mfma_f32_16x16x16bf16_1k", None) or getattr(
-        rocdl, "mfma_f32_16x16x16_bf16_1k", None
-    )
-    assert mfma_bf16_k16 is not None, "BF16 K16 MFMA not found"
+    def mfma_i32_k32(result_type, operands):
+        a, b, c = operands[0], operands[1], operands[2]
+        cbsz = operands[3] if len(operands) > 3 else 0
+        abid = operands[4] if len(operands) > 4 else 0
+        blgp = operands[5] if len(operands) > 5 else 0
+        a_v = a.ir_value() if hasattr(a, "ir_value") and not isinstance(a, ir.Value) else a
+        b_v = b.ir_value() if hasattr(b, "ir_value") and not isinstance(b, ir.Value) else b
+        c_v = c.ir_value() if hasattr(c, "ir_value") and not isinstance(c, ir.Value) else c
+        return _ods_mfma_i32_32x32x32_i8(
+            res=result_type, a=a_v, b=b_v, c=c_v, cbsz=cbsz, abid=abid, blgp=blgp,
+        ).result
+
+    def mfma_bf16_k16(result_type, operands):
+        a, b, c = operands[0], operands[1], operands[2]
+        cbsz = operands[3] if len(operands) > 3 else 0
+        abid = operands[4] if len(operands) > 4 else 0
+        blgp = operands[5] if len(operands) > 5 else 0
+        a_v = a.ir_value() if hasattr(a, "ir_value") and not isinstance(a, ir.Value) else a
+        b_v = b.ir_value() if hasattr(b, "ir_value") and not isinstance(b, ir.Value) else b
+        c_v = c.ir_value() if hasattr(c, "ir_value") and not isinstance(c, ir.Value) else c
+        return _ods_mfma_f32_32x32x16_bf16(
+            res=result_type, a=a_v, b=b_v, c=c_v, cbsz=cbsz, abid=abid, blgp=blgp,
+        ).result
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def sage_attn_kernel(
@@ -252,13 +273,16 @@ def build_sage_attn_cdna_module(
         v4i32_type = Vec.make_type(4, fx.Int32)
         v4f32_type = Vec.make_type(4, fx.Float32)
         v8f32_type = Vec.make_type(8, fx.Float32)
-        # MFMA 16x16x32_i8: A/B = v8i8, C/D = v4i32 per lane (wave64)
+        v16i32_type = Vec.make_type(16, fx.Int32)
+        v16f32_type = Vec.make_type(16, fx.Float32)
+        # MFMA 32x32x32_i8: A/B = v4i32 (=16xi8 per lane), C/D = v16i32 per lane (wave64)
         v8i8_type = Vec.make_type(8, fx.Int8)
-        # MFMA 16x16x16_bf16_1k: A/B = v4bf16, C/D = v4f32 per lane (wave64)
+        # MFMA 32x32x16_bf16: A/B = v8bf16, C/D = v16f32 per lane (wave64)
         v4bf16_type = Vec.make_type(4, fx.BFloat16)
         v16i8_type = Vec.make_type(16, fx.Int8)
         v8bf16_type = Vec.make_type(8, fx.BFloat16)
         v4i16_type = Vec.make_type(4, fx.Int16)
+        v8i16_type = Vec.make_type(8, fx.Int16)
 
         seq_len_q_v = fx.Index(seq_len_q)
         seq_len_k_v = fx.Index(seq_len_k)
@@ -278,11 +302,11 @@ def build_sage_attn_cdna_module(
         wave_id = tid // WARP_SIZE
         lane = tid % WARP_SIZE
 
-        # MFMA 16x16 wave64 layout:
-        # lane[0:3]  = row within 16 (lane % 16)
-        # lane[4]    = k-group (lane // 16, gives 0 or 1 for k-step within MFMA_K)
-        lane16 = lane % MFMA_M
-        klane = lane // MFMA_M  # 0..3 for wave64
+        # MFMA 32x32 wave64 layout:
+        # lane32 = lane % 32  (row index in A operand, col index in B/output)
+        # klane  = lane // 32 (K-block selector, 0 or 1 for wave64)
+        lane32 = lane % MFMA_M
+        klane = lane // MFMA_M  # 0 or 1 for wave64
 
         wave_q_offset = wave_id * ROWS_PER_WAVE
 
@@ -340,27 +364,26 @@ def build_sage_attn_cdna_module(
             gep = buffer_ops.get_element_ptr(ptr, fx.Int64(base_idx), elem_type=T.f32)
             return _pointer_load(T.f32, gep)
 
-        # ---- Preload Q to registers (Int8, v8i8 packs for MFMA) ----
-        # Each wave owns ROWS_PER_WAVE=16 Q rows.
-        # For mfma_i32_16x16x32i8: A operand is v8i8 per lane.
-        # lane[0:3] = q_row within the 16-row tile
-        # Lane k-group selects the 8-byte half of the 32-wide K dimension.
-        # We preload K_STEPS_QK * 2 packs per lane (2 halves of K=32 per step).
-        q_row = q_start + wave_q_offset + lane16
+        # ---- Preload Q to registers (Int8, v4i32 = 16xi8 packs for MFMA) ----
+        # Each wave owns ROWS_PER_WAVE=32 Q rows.
+        # For mfma_i32_32x32x32_i8: A operand is vector<4xi32> = 16 i8 per lane.
+        # lane32 = q_row within the 32-row tile (0..31)
+        # klane (0,1) selects the 16-byte half of the 32-wide K dimension.
+        # We preload K_STEPS_QK packs per lane (each = 16 i8 = v4i32).
+        q_row = q_start + wave_q_offset + lane32
         q_row_i32 = fx.Int32(q_row)
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_q_v))
         q_row_safe = fx.Index(ArithValue(q_in_bounds).select(q_row, fx.Index(0)))
 
-        c_zero_i64 = arith.constant(0, type=T.i64)
+        _zero_v4i32_ir = Vec.filled(4, 0, fx.Int32).ir_value()
         q_packs = []
         for ks in range_constexpr(K_STEPS_QK):
-            # MFMA 16x16x32_i8 wave64: klane (0..3) picks the 8-byte K sub-pack.
-            # q_col already includes the klane*8 offset, so an 8-byte load gives
-            # this lane's 8 K elements as a packed scalar i64 (the MFMA operand).
-            q_col = fx.Index(ks * MFMA_K_INT8) + klane * 8
+            # klane in {0,1} picks the 16-byte K sub-pack (K=k_block*16 + 0..15).
+            q_col = fx.Index(ks * MFMA_K_INT8) + klane * 16
             g_idx = q_global_idx(q_row_safe, q_col)
-            half = _load_ptr_i64(q_ptr, g_idx)
-            q_packs.append(ArithValue(q_in_bounds).select(half, c_zero_i64))
+            v16i8 = _load_ptr_i8_vec16(q_ptr, g_idx)
+            v4i32 = vector.bitcast(v4i32_type, v16i8)
+            q_packs.append(ArithValue(q_in_bounds).select(v4i32, _zero_v4i32_ir))
 
         # ---- Descale factors ----
         # q_descale: [batch, num_q_heads, num_q_blocks], index = [batch, head_q, q_tile]
@@ -382,29 +405,25 @@ def build_sage_attn_cdna_module(
         c_zero_f = fx.Float32(0.0)
         c_one_f = fx.Float32(1.0)
         c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
-        c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
-        c_zero_v4i32 = Vec.filled(4, 0, fx.Int32)
+        c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
+        c_zero_v16i32 = Vec.filled(16, 0, fx.Int32)
 
-        # Warp shuffle for reduction: wave64 has 64 lanes; reduce across 4 klane groups
-        shuf16_i32 = fx.Int32(16)
+        # Warp shuffle for reduction: wave64 has 64 lanes; with 32x32 MFMA the
+        # only cross-lane partner of a (klane, lane32) is the lane at the same
+        # lane32 with the other klane (XOR distance = 32).
         shuf32_i32 = fx.Int32(32)
         width_i32 = fx.Int32(WARP_SIZE)
-
-        def reduction_peer16(v_f32):
-            return fx.Float32(v_f32).shuffle_xor(shuf16_i32, width_i32)
 
         def reduction_peer32(v_f32):
             return fx.Float32(v_f32).shuffle_xor(shuf32_i32, width_i32)
 
         def row_max_reduce(local_max):
-            """Reduce max across all 4 klane groups within wave64."""
-            m1 = _fmax(local_max, reduction_peer16(local_max))
-            return _fmax(m1, reduction_peer32(m1))
+            """Reduce max across the 2 klane halves within wave64."""
+            return _fmax(local_max, reduction_peer32(local_max))
 
         def row_sum_reduce(local_sum):
-            """Reduce sum across all 4 klane groups within wave64."""
-            s1 = _fadd(local_sum, reduction_peer16(local_sum))
-            return _fadd(s1, reduction_peer32(s1))
+            """Reduce sum across the 2 klane halves within wave64."""
+            return _fadd(local_sum, reduction_peer32(local_sum))
 
         _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
@@ -510,49 +529,51 @@ def build_sage_attn_cdna_module(
                     Vec(v16i8_val).store(lds, [base_off])
 
         def load_k_frag(kv_block_row, ks):
-            """Load v8i8 K fragment from LDS for mfma_i32_16x16x32i8.
+            """Load v4i32 (=16xi8) K fragment from LDS for mfma_i32_32x32x32_i8.
 
             kv_block_row: row within BLOCK_N tile (0..BLOCK_N-1)
-            ks: K-step index (selects 32-wide K chunk)
+            ks: K-step index (selects 32-wide K chunk; klane picks the 16-byte half)
             """
-            k_col = fx.Index(ks * MFMA_K_INT8) + klane * 8
+            k_col = fx.Index(ks * MFMA_K_INT8) + klane * 16
             lds_idx = fx.Index(kv_block_row * K_STRIDE) + k_col
-            return Vec.load(v8i8_type, lds, [lds_idx])
+            v16i8 = Vec.load(v16i8_type, lds, [lds_idx])
+            return vector.bitcast(v4i32_type, v16i8)
 
         v2i8_type = Vec.make_type(2, fx.Int8)
 
-        def load_v_frag_bf16(kv_row, d_chunk):
-            """Load 1 BF16 V value from LDS for mfma_f32_16x16x16bf16_1k.
+        def load_v_frag_bf16(pks, dc):
+            """Load v8bf16 V fragment from LDS for mfma_f32_32x32x16_bf16.
 
-            kv_row: row within BLOCK_N tile
-            d_chunk: D output chunk index (selects HEAD_DIM/16 column group)
+            For lane (klane, lane32) at PV step `pks` and D chunk `dc`, A operand
+            needs V[kv_row, d] for d=dc*32+lane32 (fixed) and 8 contiguous
+            kv_row = pks*16 + klane*8 + 0..7 (strided V_STRIDE in LDS).
 
-            LDS is allocated as i8; load 2 contiguous bytes as v2i8 then
-            bitcast to bf16. This collapses the previous (2 separate i8 loads
-            + or/shift) sequence into a single 2-byte LDS load, called ~128
-            times per KV iteration in the PV MFMA loop.
+            Returns a v8bf16 register (bitcast to v8i16 by caller for the MFMA).
             """
-            d_col = d_chunk * D_CHUNK + lane16
-            byte_off = LDS_V_BYTE_BASE + (kv_row * V_STRIDE + d_col) * 2
-            v2i8_val = Vec.load(v2i8_type, lds, [byte_off])
-            v1bf16 = vector.bitcast(Vec.make_type(1, fx.BFloat16), v2i8_val)
-            return vector.extract(v1bf16, static_position=[0], dynamic_position=[])
+            d_col = dc * MFMA_M + lane32
+            kv_row_base = fx.Index(pks * MFMA_K_BF16) + klane * 8
+            elems = []
+            for kk in range_constexpr(8):
+                row = kv_row_base + kk
+                byte_off = LDS_V_BYTE_BASE + (row * V_STRIDE + d_col) * 2
+                v2i8_val = Vec.load(v2i8_type, lds, [byte_off])
+                v1bf16 = vector.bitcast(Vec.make_type(1, fx.BFloat16), v2i8_val)
+                elems.append(vector.extract(v1bf16, static_position=[0], dynamic_position=[]))
+            return Vec.from_elements(elems, fx.BFloat16).ir_value()
 
-        def bf16_trunc_pack_v4(f32_vals):
-            """Pack 4 f32 values into v4bf16 via bitwise truncation (upper 16 bits)."""
-            results = []
-            for j in range_constexpr(4):
-                f32_raw = _raw(f32_vals[j])
-                i32_val = arith.BitcastOp(T.i32, f32_raw).result
-                i16_val = arith.TruncIOp(T.i16, arith.ShRUIOp(i32_val, arith.constant(16, type=T.i32)).result).result
-                bf16_val = arith.BitcastOp(T.bf16, i16_val).result
-                results.append(bf16_val)
-            return Vec.from_elements(results, fx.BFloat16).ir_value()
+        def f32_to_bf16_trunc(f32_raw):
+            """Bitwise f32 → bf16 truncation (upper 16 bits)."""
+            i32_val = arith.BitcastOp(T.i32, f32_raw).result
+            i16_val = arith.TruncIOp(
+                T.i16,
+                arith.ShRUIOp(i32_val, arith.constant(16, type=T.i32)).result,
+            ).result
+            return arith.BitcastOp(T.bf16, i16_val).result
 
         # ---- Main loop: iterate over KV tiles ----
         init_args = [_raw(c_neg_inf), _raw(c_zero_f)]
         for _ in range_constexpr(D_CHUNKS):
-            init_args.append(_raw(c_zero_v4f32))
+            init_args.append(_raw(c_zero_v16f32))
 
         loop_results = init_args
         for kv_block_start, inner_iter_args in range(0, kv_upper, BLOCK_N, init=init_args):
@@ -565,23 +586,20 @@ def build_sage_attn_cdna_module(
             gpu.barrier()
 
             # ==== GEMM1: S_i32 = K_i8 @ Q_i8^T ====
-            # s_accs[row_within_tile]: v4i32 per lane (MFMA 16x16 output, wave64)
-            # Each wave owns ROWS_PER_WAVE=16 Q rows. MFMA computes 16 Q rows × 16 KV rows.
-            # With BLOCK_N=128, we need BLOCK_N/MFMA_N=8 row-subtiles.
-            # Each subtile produces one v4i32 accumulator per lane.
+            # s_accs[subtile]: v16i32 per lane (MFMA 32x32 output, wave64).
+            # Each wave owns ROWS_PER_WAVE=32 Q rows. MFMA computes 32 Q rows × 32 KV rows.
+            # With BLOCK_N=128, we need BLOCK_N/MFMA_N = 4 row-subtiles.
             N_SUBTILES = BLOCK_N // MFMA_N
 
-            s_accs = [_raw(c_zero_v4i32) for _ in range(N_SUBTILES)]
+            s_accs = [_raw(c_zero_v16i32) for _ in range(N_SUBTILES)]
 
             for ks in range_constexpr(K_STEPS_QK):
                 for st in range_constexpr(N_SUBTILES):
-                    kv_row = lane16 + st * MFMA_N
+                    # K operand A: lane has 16 i8 at row m=lane32+st*32, K=ks*32+klane*16..+15
+                    kv_row = lane32 + st * MFMA_N
                     k_frag = load_k_frag(kv_row, ks)
-                    # mfma_i32_16x16x32i8: A/B operands must be packed i64 (8xi8 → i64)
-                    k_i64v = vector.bitcast(Vec.make_type(1, fx.Int64), k_frag)
-                    k_i64 = vector.extract(k_i64v, static_position=[0], dynamic_position=[])
                     s_accs[st] = mfma_i32_k32(
-                        v4i32_type, [k_i64, q_packs[ks], s_accs[st], 0, 0, 0]
+                        v16i32_type, [k_frag, q_packs[ks], s_accs[st], 0, 0, 0]
                     )
 
             # Scale Int32 → Float32: S_f32 = S_i32 * q_descale[q_tile] * k_descale[kv_tile]
@@ -594,33 +612,41 @@ def build_sage_attn_cdna_module(
             k_ds = fx.Float32(_load_ptr_f32(kds_ptr, k_descale_base))
             qk_scale = _fmul(q_ds, k_ds)
 
+            # 32x32 MFMA output layout: lane (klane, lane32) holds 16 elements
+            # per subtile. Output indexing for vector index i ∈ 0..15:
+            #   m = (i // 4) * 8 + klane * 4 + (i % 4)   (kv_row within subtile)
+            #   n = lane32                                (q_row within wave; constant per lane)
+            # Note: A=K (M=kv_row), B=Q (N=q_row). So m here is kv_row.
+            ELEMS_PER_TILE = 16
             s_f32 = []
             for st in range_constexpr(N_SUBTILES):
-                for lane_r in range_constexpr(4):
-                    i32_elem = Vec(s_accs[st])[lane_r]
+                for elem in range_constexpr(ELEMS_PER_TILE):
+                    i32_elem = Vec(s_accs[st])[elem]
                     f32_elem = _sitofp(i32_elem)
                     s_f32.append(_fmul(f32_elem, qk_scale))
 
             # ==== Causal masking ====
-            NUM_S_VALS = N_SUBTILES * 4
+            NUM_S_VALS = N_SUBTILES * ELEMS_PER_TILE
 
-            # Per-element masking: causal (if enabled) AND out-of-range KV
-            # columns (kv_col >= seq_len_k) get -inf so they don't affect
-            # softmax. Always apply the seq_len_k bound; only non-trivial in
-            # the last tile when seq_len_k % BLOCK_N != 0.
+            # Per-element masking: out-of-range KV columns (kv_col >= seq_len_k)
+            # and (if causal) kv_col > q_row get -inf.
+            # For each (st, elem): kv_col = kv_block_start + st*32 + (elem//4)*8 + klane*4 + (elem%4)
             kv_start_i32 = fx.Int32(kv_block_start)
             klane_i32 = fx.Int32(klane)
             klane_off_i32 = klane_i32 * fx.Int32(4)
             seq_len_k_i32 = fx.Int32(seq_len_k_v)
             s_named = list(s_f32)
             for st in range_constexpr(N_SUBTILES):
-                for lane_r in range_constexpr(4):
-                    idx = st * 4 + lane_r
+                for elem in range_constexpr(ELEMS_PER_TILE):
+                    idx = st * ELEMS_PER_TILE + elem
+                    msub = elem // 4
+                    erem = elem % 4
                     kv_col_i32 = (
                         kv_start_i32
                         + fx.Int32(st * MFMA_N)
+                        + fx.Int32(msub * 8)
                         + klane_off_i32
-                        + fx.Int32(lane_r)
+                        + fx.Int32(erem)
                     )
                     out_of_range = ArithValue(kv_col_i32 >= seq_len_k_i32)
                     if const_expr(CAUSAL):
@@ -655,42 +681,76 @@ def build_sage_attn_cdna_module(
             tile_sum = row_sum_reduce(local_sum)
             l_new = _fadd(_fmul(corr, l_running), tile_sum)
 
-            # Rescale O accumulators
-            corr_vec4 = Vec.from_elements([corr], fx.Float32).broadcast_to(4).ir_value()
+            # Rescale O accumulators (each is v16f32 per lane).
+            corr_vec16 = Vec.from_elements([corr], fx.Float32).broadcast_to(16).ir_value()
             for dc in range_constexpr(D_CHUNKS):
-                o_accs[dc] = _fmul(o_accs[dc], corr_vec4)
+                o_accs[dc] = _fmul(o_accs[dc], corr_vec16)
 
             # Load V tile (FP8 → BF16) to LDS
             coop_load_v(kv_block_start)
             gpu.barrier()
 
-            # ==== GEMM2: O += V_bf16^T @ P_bf16 ====
-            # Build P packs (v4bf16) for each MFMA_K_BF16=16 sub-step
-            # P is [N_SUBTILES * 4] f32 values; pack them into v4bf16 for MFMA B operand
-            # Each PV_K_STEPS step covers 16 KV rows (MFMA_K_BF16)
+            # ==== GEMM2: O += V @ P  (mfma_f32_32x32x16_bf16) ====
+            # A=V (v8bf16/lane: row m=lane32 of V_descaled[d, kv]; K=k_block*8+0..7
+            #     in kv dim). Loaded by load_v_frag_bf16(pks, dc).
+            # B=P (v8bf16/lane: column n=lane32 of P[kv, q]; K=k_block*8+0..7).
+            # Output: v16f32/lane covering 32 d positions × 32 q rows; same layout
+            # as QK output (m=(i//4)*8 + klane*4 + (i%4) for d index, n=lane32 for
+            # q index).
+            #
+            # P-handoff bridge: QK output gives lane (klane, lane32) the P values
+            # at q_row=lane32 and kv_rows m=(i//4)*8 + klane*4 + (i%4) within
+            # subtile st. The PV B operand needs kv_rows = pks*16 + klane*8 + 0..7
+            # contiguous in K. For each pks, half of the 8 needed values live in
+            # this lane's QK accumulator (i indices base..base+3 for own klane)
+            # and the other half live in the partner lane (same lane32, other
+            # klane) at the SAME i indices. shuffle_xor(width=64) by 32 swaps
+            # them.
+            #
+            # base index: pks_in_sub = pks % 2, base = klane*4 + pks_in_sub*8
+            #   (klane=0 own holds m={0..3 lo, 8..11 lo, 16..19 lo, 24..27 lo} at
+            #    i=0..3 / 4..7 / 8..11 / 12..15 of the v16 in subtile st;
+            #    so base is the i-offset where the 4 needed own elements start.)
+            # K layout in B operand:
+            #   klane=0 needs K=0..7  → [own[base..+3], partner[base..+3]]
+            #   klane=1 needs K=8..15 → [partner[base..+3], own[base..+3]]
+            klane_is_zero = ArithValue(klane == fx.Index(0))
             for pks in range_constexpr(PV_K_STEPS):
-                # P pack for this 16-row k-step: 4 P values per lane.
-                # The QK MFMA output layout already places 4 KV rows per (klane,lane16)
-                # in subtile st, so subtile st=pks holds exactly the rows this lane
-                # needs to feed the PV MFMA's B operand (klane indexing is implicit).
-                p_base = pks * 4
-                p_slice = [p_vals[p_base + j] for j in range(4)]
-                p_pack_bf16 = bf16_trunc_pack_v4(p_slice)
+                subtile_idx = pks // 2  # Python int (range_constexpr yields ints)
+                pks_in_sub = pks % 2
+                # For each j in 0..3, our_keep[j] and to_partner[j] are
+                # selected from p_vals (extracted at constexpr indices) by
+                # klane. Then to_partner is sent to the partner via
+                # shuffle_xor(32); we receive from_partner.
+                our_keep = []
+                from_partner = []
+                for j in range_constexpr(4):
+                    flat_lo = subtile_idx * ELEMS_PER_TILE + pks_in_sub * 8 + j
+                    flat_hi = subtile_idx * ELEMS_PER_TILE + pks_in_sub * 8 + 4 + j
+                    p_lo = p_vals[flat_lo]
+                    p_hi = p_vals[flat_hi]
+                    our = klane_is_zero.select(p_lo, p_hi)
+                    to_par = klane_is_zero.select(p_hi, p_lo)
+                    par = _raw(reduction_peer32(to_par))
+                    our_keep.append(_raw(our))
+                    from_partner.append(par)
+                # Build v8bf16: klane=0 uses [our, partner] for K=0..7;
+                # klane=1 uses [partner, our] for K=8..15.
+                p_bf16_elems = []
+                for j in range_constexpr(4):
+                    own_e = f32_to_bf16_trunc(our_keep[j])
+                    par_e = f32_to_bf16_trunc(from_partner[j])
+                    p_bf16_elems.append(klane_is_zero.select(own_e, par_e))
+                for j in range_constexpr(4):
+                    own_e = f32_to_bf16_trunc(our_keep[j])
+                    par_e = f32_to_bf16_trunc(from_partner[j])
+                    p_bf16_elems.append(klane_is_zero.select(par_e, own_e))
+                p_pack_v8bf16 = Vec.from_elements(p_bf16_elems, fx.BFloat16).ir_value()
 
                 for dc in range_constexpr(D_CHUNKS):
-                    # Load V fragment: v4bf16 for the (pks, dc) tile
-                    v_elems = []
-                    for k_sub in range_constexpr(4):
-                        kv_row_v = pks * MFMA_K_BF16 + klane * 4 + k_sub
-                        v_elem = load_v_frag_bf16(kv_row_v, dc)
-                        v_elems.append(v_elem)
-                    v_frag = Vec.from_elements(v_elems, fx.BFloat16).ir_value()
-
-                    # mfma_f32_16x16x16bf16_1k: A/B operands must be vector<4xi16> (bitcast bf16)
-                    v_i16 = vector.bitcast(v4i16_type, v_frag)
-                    p_i16 = vector.bitcast(v4i16_type, p_pack_bf16)
+                    v_frag = load_v_frag_bf16(pks, dc)
                     o_accs[dc] = mfma_bf16_k16(
-                        v4f32_type, [v_i16, p_i16, o_accs[dc], 0, 0, 0]
+                        v16f32_type, [v_frag, p_pack_v8bf16, o_accs[dc], 0, 0, 0]
                     )
 
             m_running = m_new
@@ -706,34 +766,37 @@ def build_sage_attn_cdna_module(
         inv_l = arith.divf(_raw(c_one_f), _raw(l_final), fastmath=fm_fast)
 
         if q_in_bounds:
-            # MFMA mfma_f32_16x16x16bf16_1k C/D layout (wave64): partition A,
-            # confirmed via splitk_hgemm.py reference. Lane (klane, lane16)
-            # holds 4 f32 values at M = klane*4 + 0..3, N = lane16.
-            # For PV output O (M=head_dim, N=Q_row), the lane's 4 elements are
-            # 4 head_dim positions (klane*4 + 0..3) at the SAME Q row (lane16).
+            # MFMA 32x32 C/D layout (wave64): lane (klane, lane32) holds 16 f32
+            # outputs covering 16 distinct M positions (d positions in PV output)
+            # at one fixed N position = lane32 (= q_row within wave).
+            # Vector index i ∈ 0..15:
+            #   d_offset = (i // 4) * 8 + klane * 4 + (i % 4)
+            # Each group of 4 consecutive i (i.e. msub=0..3) gives 4 contiguous
+            # d positions, so we can do 4 v4bf16 stores per dc instead of 16
+            # scalar stores.
             for dc in range_constexpr(D_CHUNKS):
-                d_col_base = fx.Index(dc * D_CHUNK) + klane * 4
-                bf16_elems = []
-                for elem in range_constexpr(4):
-                    v_ds = fx.Float32(_load_ptr_f32(
-                        vds_ptr, v_descale_base + fx.Index(dc * D_CHUNK) + klane * 4 + elem
-                    ))
-                    o_elem = vector.extract(
-                        o_finals[dc], static_position=[elem], dynamic_position=[]
-                    )
-                    scale = arith.mulf(_raw(inv_l), _raw(v_ds), fastmath=fm_fast)
-                    o_norm = arith.mulf(o_elem, scale, fastmath=fm_fast)
-                    # Bitwise f32 → bf16 truncation (take upper 16 bits)
-                    i32_val = arith.BitcastOp(T.i32, o_norm).result
-                    i16_val = arith.TruncIOp(
-                        T.i16,
-                        arith.ShRUIOp(i32_val, arith.constant(16, type=T.i32)).result,
-                    ).result
-                    o_bf16 = arith.BitcastOp(T.bf16, i16_val).result
-                    bf16_elems.append(o_bf16)
-                o_vec = Vec.from_elements(bf16_elems, fx.BFloat16).ir_value()
-                o_global = q_global_idx(q_row, d_col_base)
-                _store_ptr_bf16(o_ptr, o_global, o_vec)
+                for msub in range_constexpr(4):
+                    d_col_base = fx.Index(dc * MFMA_M) + fx.Index(msub * 8) + klane * 4
+                    bf16_elems = []
+                    for erem in range_constexpr(4):
+                        i_pos = msub * 4 + erem
+                        v_ds = fx.Float32(_load_ptr_f32(
+                            vds_ptr,
+                            v_descale_base
+                            + fx.Index(dc * MFMA_M)
+                            + fx.Index(msub * 8)
+                            + klane * 4
+                            + erem,
+                        ))
+                        o_elem = vector.extract(
+                            o_finals[dc], static_position=[i_pos], dynamic_position=[]
+                        )
+                        scale = arith.mulf(_raw(inv_l), _raw(v_ds), fastmath=fm_fast)
+                        o_norm = arith.mulf(o_elem, scale, fastmath=fm_fast)
+                        bf16_elems.append(f32_to_bf16_trunc(o_norm))
+                    o_vec = Vec.from_elements(bf16_elems, fx.BFloat16).ir_value()
+                    o_global = q_global_idx(q_row, d_col_base)
+                    _store_ptr_bf16(o_ptr, o_global, o_vec)
 
     @flyc.jit
     def launch_sage_attn(
