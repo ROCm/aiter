@@ -44,7 +44,7 @@ import torch
 import aiter
 
 from aiter.test_common import checkAllclose
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
 # from aiter.test_mha_common import (
 #    attention_ref,
