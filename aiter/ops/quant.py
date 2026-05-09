@@ -685,11 +685,12 @@ def fused_dynamic_mxfp4_quant_moe_sort_hip(
 
 
 @compile_ops("module_quant", develop=True)
-def quant_mxfp4_even_round(
+def quant_mxfp4(
     inp: torch.Tensor,
     out_packed: torch.Tensor,
     out_scale: torch.Tensor,
     group_size: int = 32,
+    round_mode: int = 0,
     e8m0_shuffle: bool = False,
     a16w4_shuffle: bool = False,
     gate_up: bool = False,
@@ -697,9 +698,10 @@ def quant_mxfp4_even_round(
 ) -> None: ...
 
 
-def quant_mxfp4_even_round_hip(
+def quant_mxfp4_hip(
     x: torch.Tensor,
     group_size: int = 32,
+    round_mode: int = 0,
     e8m0_shuffle: bool = False,
     a16w4_shuffle: bool = False,
     gate_up: bool = False,
@@ -727,11 +729,12 @@ def quant_mxfp4_even_round_hip(
             fp8_e8m0
         )
 
-    quant_mxfp4_even_round(
+    quant_mxfp4(
         x,
         out_packed,
         out_scale,
         group_size,
+        round_mode,
         e8m0_shuffle,
         a16w4_shuffle,
         gate_up,

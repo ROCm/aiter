@@ -9,6 +9,8 @@
 
 namespace aiter {
 
+enum class MxFp4RoundMode : int { Even = 0 };
+
 #define EVEN_ROUND_FP32_SIGN_EXP_MASK 0x7F800000u
 #define EVEN_ROUND_VAL_TO_ADD         0x00200000u
 #define EVEN_ROUND_FP4_EMAX           2
@@ -76,9 +78,9 @@ __device__ __forceinline__ int a16w4_shuffle_scale_id(
            K_Pack_idx * 2 + N_Pack_idx;
 }
 
-template <typename float_type, bool e8m0_shuffle, bool a16w4_shuffle, bool shuffle_weight>
+template <typename float_type, MxFp4RoundMode rmode, bool e8m0_shuffle, bool a16w4_shuffle, bool shuffle_weight>
 __global__ __launch_bounds__(kBlockThreads)
-void quant_mxfp4_even_round_kernel(
+void quant_mxfp4_kernel(
     const float_type* __restrict__ inp,
     uint8_t* __restrict__ out_packed,
     float* __restrict__ out_scale,
@@ -115,18 +117,17 @@ void quant_mxfp4_even_round_kernel(
 #endif
 
     uint32_t max_bits = __float_as_uint(group_max);
-    max_bits          = (max_bits + EVEN_ROUND_VAL_TO_ADD) & EVEN_ROUND_FP32_SIGN_EXP_MASK;
-
-    uint32_t raw_exp = max_bits >> 23;
     float dequant_scale;
     uint8_t biased_exp;
-    if (__builtin_expect(raw_exp >= 3, 1)) {
-        uint32_t exp_out = raw_exp - 2;
-        dequant_scale = __uint_as_float(exp_out << 23);
-        biased_exp = (uint8_t)exp_out;
-    } else {
-        dequant_scale = 0x1.0p-127f;
-        biased_exp = 0;
+
+    if constexpr (rmode == MxFp4RoundMode::Even) {
+        max_bits          = (max_bits + EVEN_ROUND_VAL_TO_ADD) & EVEN_ROUND_FP32_SIGN_EXP_MASK;
+        float max_rounded = __uint_as_float(max_bits);
+
+        float scale_unbiased = floorf(log2f(max_rounded)) - EVEN_ROUND_FP4_EMAX;
+        scale_unbiased       = fminf(fmaxf(scale_unbiased, -127.0f), 127.0f);
+        dequant_scale        = exp2f(scale_unbiased);
+        biased_exp           = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
     }
 
     u8x16_t packed;
@@ -191,30 +192,31 @@ void quant_mxfp4_even_round_kernel(
     reinterpret_cast<uint8_t*>(out_scale)[scale_idx] = biased_exp;
 }
 
-#define MXFP4_LAUNCH(ftype, ss, a16, sw)                                     \
-    quant_mxfp4_even_round_kernel<ftype, ss, a16, sw>                        \
+#define MXFP4_LAUNCH(ftype, rmode, ss, a16, sw)                              \
+    quant_mxfp4_kernel<ftype, rmode, ss, a16, sw>                            \
         <<<(int)grid_size, kBlockThreads, 0, stream>>>(                      \
             reinterpret_cast<const ftype*>(inp.data_ptr()),                   \
             reinterpret_cast<uint8_t*>(out_packed.data_ptr()),               \
             reinterpret_cast<float*>(out_scale.data_ptr()),                  \
             ori_rows, ori_cols, scaleN, scaleN_pad, gate_up)
 
-#define MXFP4_DISPATCH(ftype)                                                \
+#define MXFP4_DISPATCH(ftype, rmode)                                         \
     if (e8m0_shuffle) {                                                      \
-        if (shuffle_weight) { MXFP4_LAUNCH(ftype, true, false, true); }      \
-        else                { MXFP4_LAUNCH(ftype, true, false, false); }     \
+        if (shuffle_weight) { MXFP4_LAUNCH(ftype, rmode, true, false, true); }  \
+        else                { MXFP4_LAUNCH(ftype, rmode, true, false, false); } \
     } else if (a16w4_shuffle) {                                              \
-        if (shuffle_weight) { MXFP4_LAUNCH(ftype, false, true, true); }      \
-        else                { MXFP4_LAUNCH(ftype, false, true, false); }     \
+        if (shuffle_weight) { MXFP4_LAUNCH(ftype, rmode, false, true, true); }  \
+        else                { MXFP4_LAUNCH(ftype, rmode, false, true, false); } \
     } else {                                                                 \
-        MXFP4_LAUNCH(ftype, false, false, false);                            \
+        MXFP4_LAUNCH(ftype, rmode, false, false, false);                     \
     }
 
-void quant_mxfp4_even_round(
+void quant_mxfp4(
     const aiter_tensor_t& inp,
     aiter_tensor_t& out_packed,
     aiter_tensor_t& out_scale,
     int group_size,
+    int round_mode,
     bool e8m0_shuffle,
     bool a16w4_shuffle,
     bool gate_up,
@@ -225,6 +227,7 @@ void quant_mxfp4_even_round(
     AITER_CHECK(out_packed.is_contiguous(), __func__, " expected out_packed to be contiguous");
     AITER_CHECK(out_scale.is_contiguous(), __func__, " expected out_scale to be contiguous");
     AITER_CHECK(group_size == 32, __func__, " expected group_size=32");
+    AITER_CHECK(round_mode == 0, __func__, " only Even round mode (0) is supported");
     AITER_CHECK(!(e8m0_shuffle && a16w4_shuffle),
                 __func__, " e8m0_shuffle and a16w4_shuffle are mutually exclusive");
     AITER_CHECK(!shuffle_weight || e8m0_shuffle || a16w4_shuffle,
@@ -259,8 +262,8 @@ void quant_mxfp4_even_round(
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
-        inp.dtype(), "quant_mxfp4_even_round_kernel", [&] {
-            MXFP4_DISPATCH(scalar_t);
+        inp.dtype(), "quant_mxfp4_kernel", [&] {
+            MXFP4_DISPATCH(scalar_t, MxFp4RoundMode::Even);
         });
 }
 

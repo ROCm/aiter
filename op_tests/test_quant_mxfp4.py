@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from aiter.ops.quant import quant_mxfp4_even_round_hip
+from aiter.ops.quant import quant_mxfp4_hip
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight, shuffle_weight_a16w4
 
 
@@ -85,7 +85,7 @@ def test_no_shuffle(shape, float_dtype):
     torch.manual_seed(42)
     inp = torch.randn(shape, dtype=float_dtype, device="cuda")
 
-    packed_hip, scale_hip = quant_mxfp4_even_round_hip(inp, group_size=32)
+    packed_hip, scale_hip = quant_mxfp4_hip(inp, group_size=32)
 
     py_packed, py_scale = ref_quant_mxfp4_even_round(inp.cpu(), group_size=32)
 
@@ -127,10 +127,10 @@ def test_e8m0_shuffle(shape, float_dtype):
     torch.manual_seed(42)
     inp = torch.randn(shape, dtype=float_dtype, device="cuda")
 
-    packed_out, scale_out = quant_mxfp4_even_round_hip(
+    packed_out, scale_out = quant_mxfp4_hip(
         inp, group_size=32, e8m0_shuffle=True, shuffle_weight=True
     )
-    packed_ref, scale_ref = quant_mxfp4_even_round_hip(inp, group_size=32)
+    packed_ref, scale_ref = quant_mxfp4_hip(inp, group_size=32)
     expected_w = shuffle_weight(packed_ref)
 
     scaleN = cols // 32
@@ -188,10 +188,10 @@ def test_a16w4_shuffle(shape, float_dtype, gate_up):
     torch.manual_seed(42)
     inp = torch.randn(shape, dtype=float_dtype, device="cuda")
 
-    packed_out, scale_out = quant_mxfp4_even_round_hip(
+    packed_out, scale_out = quant_mxfp4_hip(
         inp, group_size=32, a16w4_shuffle=True, gate_up=gate_up, shuffle_weight=True
     )
-    packed_ref, scale_ref = quant_mxfp4_even_round_hip(inp, group_size=32)
+    packed_ref, scale_ref = quant_mxfp4_hip(inp, group_size=32)
     expected_w = shuffle_weight_a16w4(
         packed_ref.view(torch.uint8).unsqueeze(0), NLane=16, gate_up=gate_up
     ).squeeze(0)
@@ -221,25 +221,25 @@ def test_edge_values(float_dtype):
     rows, cols = 32, 64
 
     inp_zero = torch.zeros(rows, cols, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_even_round_hip(inp_zero, group_size=32)
+    packed, scale = quant_mxfp4_hip(inp_zero, group_size=32)
     assert packed.view(torch.uint8).sum() == 0
 
     inp_large = torch.full((rows, cols), 1e4, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_even_round_hip(inp_large, group_size=32)
+    packed, scale = quant_mxfp4_hip(inp_large, group_size=32)
     assert packed.view(torch.uint8).max() > 0
 
     inp_tiny = torch.full((rows, cols), 1e-10, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_even_round_hip(inp_tiny, group_size=32)
+    packed, scale = quant_mxfp4_hip(inp_tiny, group_size=32)
 
     inp_neg = torch.full((rows, cols), -3.0, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_even_round_hip(inp_neg, group_size=32)
+    packed, scale = quant_mxfp4_hip(inp_neg, group_size=32)
     py_packed, _ = ref_quant_mxfp4_even_round(inp_neg.cpu(), group_size=32)
     assert torch.equal(packed.view(torch.uint8).cpu(), py_packed)
 
 
 def test_single_group():
     inp = torch.randn(1, 32, dtype=torch.bfloat16, device="cuda")
-    packed, scale = quant_mxfp4_even_round_hip(inp, group_size=32)
+    packed, scale = quant_mxfp4_hip(inp, group_size=32)
     assert packed.view(torch.uint8).shape == (1, 16)
     assert scale.view(torch.uint8).shape == (1, 1)
     py_packed, py_scale = ref_quant_mxfp4_even_round(inp.cpu(), group_size=32)
@@ -283,7 +283,7 @@ def test_e2m1_boundary_values(float_dtype):
         -0.25,
     ]
     inp = torch.tensor([boundary_vals], dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_even_round_hip(inp, group_size=32)
+    packed, scale = quant_mxfp4_hip(inp, group_size=32)
     py_packed, py_scale = ref_quant_mxfp4_even_round(inp.cpu(), group_size=32)
     assert torch.equal(scale.view(torch.uint8).cpu(), py_scale)
     packed_u8 = packed.view(torch.uint8).cpu()
@@ -295,10 +295,10 @@ def test_e2m1_boundary_values(float_dtype):
 def test_e8m0_shuffle_scale_only():
     torch.manual_seed(42)
     inp = torch.randn(4096, 256, dtype=torch.bfloat16, device="cuda")
-    packed_shuf, scale_shuf = quant_mxfp4_even_round_hip(
+    packed_shuf, scale_shuf = quant_mxfp4_hip(
         inp, group_size=32, e8m0_shuffle=True, shuffle_weight=False
     )
-    packed_ref, scale_ref = quant_mxfp4_even_round_hip(inp, group_size=32)
+    packed_ref, scale_ref = quant_mxfp4_hip(inp, group_size=32)
     packed_shuf_u8 = packed_shuf.view(torch.uint8).cpu()
     packed_ref_u8 = packed_ref.view(torch.uint8).cpu()
     assert torch.equal(packed_shuf_u8, packed_ref_u8)
