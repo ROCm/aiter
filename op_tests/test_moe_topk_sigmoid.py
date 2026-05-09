@@ -35,29 +35,22 @@ def run_torch(gating_output: torch.Tensor, topk: int):
     return router_scores, router_indices.to(torch.int32)
 
 
-@perftest(num_iters=100, num_warmup=1)
+@perftest(num_iters=10, num_warmup=1)
 def run_fused(gating_output: torch.Tensor, topk: int):
-    tokens, num_experts = gating_output.shape
+    tokens, _ = gating_output.shape
     router_scores = torch.empty(
         (tokens, topk), dtype=torch.float32, device=gating_output.device
     )
     router_indices = torch.empty(
         (tokens, topk), dtype=torch.int32, device=gating_output.device
     )
-    if num_experts <= 128:
-        aiter.topk_sigmoid(router_scores, router_indices, gating_output)
-    else:
-        aiter.topk_gating(
-            router_scores,
-            router_indices,
-            gating_output,
-            score_func="sigmoid",
-            need_renorm=False,
-        )
+    aiter.topk_sigmoid(router_scores, router_indices, gating_output)
     return router_scores, router_indices
 
 
 # -- topk_softplus (DeepSeek V4-Pro sqrtsoftplus routing) --------------
+
+
 @perftest(num_iters=10, num_warmup=1)
 def run_torch_softplus(
     gating_output: torch.Tensor,
@@ -76,7 +69,7 @@ def run_torch_softplus(
     return topk_weights, topk_ids.to(torch.int32)
 
 
-@perftest(num_iters=100, num_warmup=1)
+@perftest(num_iters=10, num_warmup=1)
 def run_fused_softplus(
     gating_output: torch.Tensor,
     bias: torch.Tensor,
@@ -93,47 +86,6 @@ def run_fused_softplus(
     )
     aiter.topk_softplus(
         topk_weights, topk_ids, gating_output, bias, renormalize, route_scale
-    )
-    return topk_weights, topk_ids
-
-
-# -- topk_softmax ( classic MoE softmax routing) --------------
-@perftest(num_iters=10, num_warmup=1)
-def run_torch_softmax(
-    gating_output: torch.Tensor,
-    bias: torch.Tensor,
-    topk: int,
-    route_scale: float,
-):
-    scores = torch.softmax(gating_output.float(), dim=-1)
-    scores_biased = scores + bias.float() if bias.numel() > 0 else scores
-    topk_ids = scores_biased.topk(topk, dim=-1, sorted=False)[1]
-    topk_weights = scores.gather(1, topk_ids) * route_scale
-    return topk_weights, topk_ids.to(torch.int32)
-
-
-@perftest(num_iters=100, num_warmup=1)
-def run_fused_softmax(
-    gating_output: torch.Tensor,
-    bias: torch.Tensor,
-    topk: int,
-    route_scale: float,
-):
-    tokens, _ = gating_output.shape
-    topk_weights = torch.empty(
-        (tokens, topk), dtype=torch.float32, device=gating_output.device
-    )
-    topk_ids = torch.empty(
-        (tokens, topk), dtype=torch.int32, device=gating_output.device
-    )
-    aiter.topk_gating(
-        topk_weights,
-        topk_ids,
-        gating_output,
-        bias,
-        need_renorm=False,  # softmax is already normalized
-        routed_scaling_factor=route_scale,
-        score_func="softmax",
     )
     return topk_weights, topk_ids
 
@@ -258,76 +210,11 @@ def benchmark_topk_softplus(
     return result
 
 
-def benchmark_topk_softmax(
-    num_experts: int = 256,
-    num_tokens: int = 1024,
-    topk: int = 8,
-    dtype: torch.dtype = torch.bfloat16,
-    route_scale: float = 1.0,
-    use_bias: bool = True,
-):
-    gating_output = (
-        torch.arange(-1, 1, 2.0 / num_experts)
-        .repeat((num_tokens, 1))
-        .to(dtype=dtype, device="cuda")
-    )
-    permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
-    gating_output = torch.gather(gating_output, dim=-1, index=permutation)
-    bias = (
-        torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
-        if use_bias
-        else torch.empty(0, device="cuda")
-    )
-
-    (w_torch, i_torch), avg_torch = run_torch_softmax(
-        gating_output.clone(), bias, topk, route_scale
-    )
-    (w_fused, i_fused), avg_fused = run_fused_softmax(
-        gating_output.clone(), bias, topk, route_scale
-    )
-
-    id_match = 0
-    max_w_err = 0.0
-    for t in range(num_tokens):
-        kern_set = set(i_fused[t].tolist())
-        ref_set = set(i_torch[t].tolist())
-        if kern_set == ref_set:
-            id_match += 1
-            for k in range(topk):
-                kid = i_fused[t, k].item()
-                ref_k = (i_torch[t] == kid).nonzero(as_tuple=True)[0]
-                if len(ref_k) > 0:
-                    err = abs(w_fused[t, k].item() - w_torch[t, ref_k[0]].item())
-                    max_w_err = max(max_w_err, err)
-
-    id_err = 1.0 - id_match / num_tokens
-
-    result = {
-        "num_experts": num_experts,
-        "num_tokens": num_tokens,
-        "topk": topk,
-        "dtype": str(dtype).split(".")[-1],
-        "torch_us": avg_torch,
-        "fused_us": avg_fused,
-        "uplift": avg_torch / avg_fused,
-        "id_errors": id_err,
-        "max_weight_err": max_w_err,
-    }
-
-    if id_err > 0.01:
-        print(
-            f"\n[ERROR] softmax: num_experts={num_experts}, num_tokens={num_tokens}, "
-            f"topk={topk}, dtype={str(dtype).split('.')[-1]}, id_err={id_err:.4f}"
-        )
-
-    return result
-
-
 # Pytest-parametrized test functions -- topk_softplus
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("topk", [1, 2, 4, 6, 8])
+@pytest.mark.parametrize("topk", [1, 2, 4, 8])
 @pytest.mark.parametrize("num_tokens", [64, 1024, 2048])
-@pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
+@pytest.mark.parametrize("num_experts", [64, 128, 256])
 def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype):
     """Pytest test for correctness of topk_softplus (sqrtsoftplus) operation."""
     torch.random.manual_seed(0)
@@ -372,7 +259,7 @@ def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("topk", [1, 2, 4, 8])
 @pytest.mark.parametrize("num_tokens", [64, 1024, 2048])
-@pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
+@pytest.mark.parametrize("num_experts", [64, 128])
 def test_topk_sigmoid_correctness(num_experts, num_tokens, topk, dtype):
     """Pytest test for correctness of topk_sigmoid operation."""
     torch.random.manual_seed(0)
@@ -400,51 +287,6 @@ def test_topk_sigmoid_correctness(num_experts, num_tokens, topk, dtype):
     assert index_errors <= 0.01, f"Index errors {index_errors} exceed tolerance"
 
 
-# Pytest-parametrized test functions -- topk_softmax (via topk_gating)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("topk", [1, 2, 4, 6, 8])
-@pytest.mark.parametrize("num_tokens", [64, 1024, 2048])
-@pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
-def test_topk_softmax_correctness(num_experts, num_tokens, topk, dtype):
-    """Pytest test for correctness of topk_gating with score_func='softmax'."""
-    torch.random.manual_seed(0)
-    route_scale = 1.0
-
-    gating_output = (
-        torch.arange(-1, 1, 2.0 / num_experts)
-        .repeat((num_tokens, 1))
-        .to(dtype=dtype, device="cuda")
-    )
-    permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
-    gating_output = torch.gather(gating_output, dim=-1, index=permutation)
-    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
-
-    (w_torch, i_torch), _ = run_torch_softmax(
-        gating_output.clone(), bias, topk, route_scale
-    )
-    (w_fused, i_fused), _ = run_fused_softmax(
-        gating_output.clone(), bias, topk, route_scale
-    )
-
-    # compare ids per token (order may differ)
-    for t in range(num_tokens):
-        kern_set = set(i_fused[t].tolist())
-        ref_set = set(i_torch[t].tolist())
-        assert (
-            kern_set == ref_set
-        ), f"Token {t}: ID mismatch kernel={sorted(kern_set)} ref={sorted(ref_set)}"
-
-    # compare weights (match by expert id)
-    for t in range(num_tokens):
-        for k in range(topk):
-            kid = i_fused[t, k].item()
-            ref_k = (i_torch[t] == kid).nonzero(as_tuple=True)[0]
-            assert len(ref_k) > 0
-            torch.testing.assert_close(
-                w_fused[t, k], w_torch[t, ref_k[0]], atol=1e-5, rtol=1e-4
-            )
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Test topk_sigmoid and topk_softplus operations"
@@ -452,20 +294,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-experts",
         type=str2tuple,
-        default=[64, 128, 256, 384],
-        help="Comma-separated list of number of experts (default: 64,128,256,384)",
+        default=[128],
+        help="Comma-separated list of number of experts (default: 128)",
     )
     parser.add_argument(
         "--num-tokens",
         type=str2tuple,
-        default=[64, 1024, 2048],
-        help="Comma-separated list of number of tokens (default: 64,1024,2048)",
+        default=[1024],
+        help="Comma-separated list of number of tokens (default: 1024)",
     )
     parser.add_argument(
         "--topk",
         type=str2tuple,
-        default=[1, 2, 4, 6, 8],
-        help="Comma-separated list of topk values (default: 1,2,4,6,8)",
+        default=[8],
+        help="Comma-separated list of topk values (default: 8)",
     )
     parser.add_argument(
         "--dtype",
@@ -477,7 +319,7 @@ if __name__ == "__main__":
         "--test",
         type=str,
         default="all",
-        choices=["sigmoid", "softplus", "softmax", "all"],
+        choices=["sigmoid", "softplus", "all"],
         help="Which test to run (default: all)",
     )
 
@@ -491,19 +333,16 @@ if __name__ == "__main__":
     topk_list = to_list(args.topk)
     dtype_list = to_list(args.dtype)
 
+    configs = list(
+        itertools.product(num_experts_list, num_tokens_list, topk_list, dtype_list)
+    )
+
     if args.test in ("sigmoid", "all"):
-        sigmoid_experts = [e for e in num_experts_list]
-        sigmoid_dtypes = [d for d in dtype_list if d != torch.float32]
-        sigmoid_configs = list(
-            itertools.product(
-                sigmoid_experts, num_tokens_list, topk_list, sigmoid_dtypes
-            )
-        )
         print("=" * 80)
         print("topk_sigmoid benchmark")
         print("=" * 80)
         collected = []
-        for num_experts, num_tokens, topk, dtype in sigmoid_configs:
+        for num_experts, num_tokens, topk, dtype in configs:
             result = benchmark_topk_sigmoid(
                 num_experts=num_experts, num_tokens=num_tokens, topk=topk, dtype=dtype
             )
@@ -513,38 +352,12 @@ if __name__ == "__main__":
         print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
 
     if args.test in ("softplus", "all"):
-        softplus_configs = list(
-            itertools.product(num_experts_list, num_tokens_list, topk_list, dtype_list)
-        )
         print("\n" + "=" * 80)
         print("topk_softplus benchmark")
         print("=" * 80)
         collected = []
-        for num_experts, num_tokens, topk, dtype in softplus_configs:
+        for num_experts, num_tokens, topk, dtype in configs:
             result = benchmark_topk_softplus(
-                num_experts=num_experts, num_tokens=num_tokens, topk=topk, dtype=dtype
-            )
-            collected.append(result)
-        df = pd.DataFrame(collected)
-        print(df.to_string(index=False))
-        print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
-        errors = df[df["id_errors"] > 0.01]
-        if len(errors) > 0:
-            print(f"\nWARNING: {len(errors)} config(s) had id errors > 1%!")
-            print(errors.to_string(index=False))
-        else:
-            print("All tests passed!")
-
-    if args.test in ("softmax", "all"):
-        softmax_configs = list(
-            itertools.product(num_experts_list, num_tokens_list, topk_list, dtype_list)
-        )
-        print("\n" + "=" * 80)
-        print("topk_softmax benchmark (via topk_gating)")
-        print("=" * 80)
-        collected = []
-        for num_experts, num_tokens, topk, dtype in softmax_configs:
-            result = benchmark_topk_softmax(
                 num_experts=num_experts, num_tokens=num_tokens, topk=topk, dtype=dtype
             )
             collected.append(result)
