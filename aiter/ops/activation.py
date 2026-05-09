@@ -12,6 +12,22 @@ def silu_and_mul(out: Tensor, input: Tensor) -> None: ...
 
 
 @compile_ops("module_activation", develop=True)
+def swiglu_and_mul(out: Tensor, input: Tensor) -> None: ...
+
+
+@compile_ops("module_activation", develop=True)
+def silu_and_mul_bias(
+    out: Tensor, input: Tensor, expert_ids: Tensor, bias: Tensor
+) -> None: ...
+
+
+@compile_ops("module_activation", develop=True)
+def swiglu_and_mul_bias(
+    out: Tensor, input: Tensor, expert_ids: Tensor, bias: Tensor
+) -> None: ...
+
+
+@compile_ops("module_activation", develop=True)
 def scaled_silu_and_mul(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 

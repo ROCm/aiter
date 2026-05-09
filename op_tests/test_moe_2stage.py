@@ -576,6 +576,28 @@ def _iter_csv_cases():
                 e,
             )
             continue
+        # The reference path below uses the CSV q_dtype_a directly, while
+        # fused_moe selects q_dtype_a from the current Swiglu MXFP4 runtime mode.
+        # Skip CSV rows that are tuned for a different mode to avoid comparing
+        # e.g. an fp4x2 reference against a bf16/fp8 runtime dispatch.
+        expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
+            kwargs["token"],
+            kwargs["actType"],
+            kwargs["qType"],
+            kwargs["AQDType"],
+            kwargs["WQDType"],
+        )
+        if expected_aq_dtype is not None and kwargs["AQDType"] != expected_aq_dtype:
+            aiter.logger.info(
+                "skip row token=%s dim=(%s,%s): q_dtype_a=%s does not match "
+                "current Swiglu MXFP4 runtime mode (expected %s)",
+                row.get("token"),
+                row.get("model_dim"),
+                row.get("inter_dim"),
+                kwargs["AQDType"],
+                expected_aq_dtype,
+            )
+            continue
         kwargs["strict_accuracy"] = True
         yield kwargs, {
             "kernelName1": kernel_name1,
@@ -593,6 +615,23 @@ def _effective_act_type(quant_type, aq_dtype, wq_dtype, act_type):
     if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
         return aiter.ActivationType.Swiglu
     return act_type
+
+
+def _runtime_swiglu_mxfp4_q_dtype_a(token, act_type, q_type, aq_dtype, wq_dtype):
+    """Return the q_dtype_a that fused_moe will select for Swiglu MXFP4."""
+    if act_type != aiter.ActivationType.Swiglu:
+        return None
+    if q_type != aiter.QuantType.per_1x32 or wq_dtype != dtypes.fp4x2:
+        return None
+    if aq_dtype not in [dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.fp4x2]:
+        return None
+
+    if os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "0") == "1":
+        bound = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
+        return dtypes.bf16 if token < bound else dtypes.fp4x2
+
+    bound = int(os.environ.get("AITER_BF16_FP8_BOUND", "512"))
+    return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
 
 
 def _iter_legacy_cases():
