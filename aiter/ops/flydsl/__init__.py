@@ -11,11 +11,13 @@ whether the optional dependency exists before relying on FlyDSL kernels.
 from packaging.version import Version
 
 from .utils import is_flydsl_available
+from .moe_common import GateMode
 
 _MIN_FLYDSL_VERSION = Version("0.1.5.dev515")
 
 __all__ = [
     "is_flydsl_available",
+    "GateMode",
 ]
 
 if is_flydsl_available():

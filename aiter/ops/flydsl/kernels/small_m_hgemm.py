@@ -45,7 +45,6 @@ from aiter.jit.utils.chip_info import get_gfx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm, memref, scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.compiler.protocol import fly_values
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
@@ -658,9 +657,7 @@ def compile_small_m_hgemm_kernel(
                     scf.YieldOp([])
 
         def get_llvm_ptr(ptr, offset, dtype_bytes):
-            base_ptr = fly.extract_aligned_pointer_as_index(
-                _ptr_type, fly_values(ptr)[0]
-            )
+            base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, ptr)
             base_ptr = llvm.PtrToIntOp(_i64_type, base_ptr).result
             byte_offset = arith.index_cast(
                 T.i64, fx.Index(offset) * fx.Index(dtype_bytes)
@@ -936,7 +933,7 @@ def compile_small_m_hgemm_kernel(
             return c_frags_new
 
         def store_split_k_tile(c_tensor, c_g, c_s, tile_n_offset):
-            out_raw = fly_values(c_tensor)[0]
+            out_raw = c_tensor
             out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
             out_base_int = llvm.PtrToIntOp(_i64_type, out_base_ptr).result
             for i in range_constexpr(LDG_REG_C_COUNT):
