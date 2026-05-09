@@ -29,6 +29,10 @@ from flydsl.expr import arith, gpu, buffer_ops, vector, rocdl
 from flydsl._mlir.dialects import llvm, scf, memref
 from flydsl._mlir.dialects.arith import CmpIPredicate
 
+from aiter.ops.flydsl.rocdl_compat import (
+    ensure_mfma_scale_f32_32x32x64_f8f6f4,
+)
+
 from .mfma_preshuffle_pipeline import (
     _buffer_load_vec,
     buffer_copy_gmem16_dwordx4,
@@ -45,6 +49,8 @@ from .layout_utils import crd2idx, idx2crd, get as layout_get
 
 import functools
 
+
+ensure_mfma_scale_f32_32x32x64_f8f6f4()
 
 _MFMA16_ALIASES = {"16", "16x16", "16x16x128", "mfma16", "mfma16k128"}
 _MFMA32_ALIASES = {"32", "32x32", "32x32x64", "mfma32", "mfma32k64"}
