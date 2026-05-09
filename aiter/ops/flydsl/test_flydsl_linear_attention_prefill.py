@@ -9,7 +9,7 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace as _dataclass_replace
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -31,6 +31,7 @@ try:
         chunk_gated_delta_rule_fwd_h_flydsl,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+        chunk_gated_delta_rule_fwd_h,
         chunk_gated_delta_rule_fwd_h_opt,
         chunk_gated_delta_rule_fwd_h_opt_vk,
     )
@@ -251,6 +252,24 @@ PREFILL_PARAMS = [
         Hk=16,
         Hv=64,
         tp=4,
+        full_prompt_len=2048,
+        model_name="Qwen3.5-tp4-2k",
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=4,
+        full_prompt_len=4096,
+        model_name="Qwen3.5-tp4-4k",
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=4,
         full_prompt_len=8192,
         model_name="Qwen3.5-tp4-8k",
     ),
@@ -262,6 +281,24 @@ PREFILL_PARAMS = [
         tp=8,
         full_prompt_len=1024,
         model_name="Qwen3.5-tp8-1k",
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=8,
+        full_prompt_len=2048,
+        model_name="Qwen3.5-tp8-2k",
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=8,
+        full_prompt_len=4096,
+        model_name="Qwen3.5-tp8-4k",
     ),
     PrefillArgs(
         K=128,
@@ -286,12 +323,13 @@ PREFILL_PARAMS = [
 # the f32 path; none of the current PREFILL_PARAMS hits that combo, so we
 # do not filter here. If you add such a case later, gate the mirror with
 # ``if _base.output_final_state or _make_inputs(...) provides h0``.
-PREFILL_PARAMS.extend(
-    [
-        _dataclass_replace(_base, ssm_state_dtype=torch.bfloat16)
-        for _base in list(PREFILL_PARAMS)
-    ]
-)
+# NOTE: bf16 SSM-state mirrors disabled for focused perf profiling.
+# PREFILL_PARAMS.extend(
+#     [
+#         _dataclass_replace(_base, ssm_state_dtype=torch.bfloat16)
+#         for _base in list(PREFILL_PARAMS)
+#     ]
+# )
 
 
 # -- Helper functions ---------------------------------------------------
@@ -481,16 +519,23 @@ def _normalize_opt_v_new(vn_opt):
 # -- Performance benchmark ----------------------------------------------
 
 
-def _bench_fn(fn, *args, **kwargs):
-    """Average per-iter device kernel time (us) via torch.profiler.
+_K5_KERNEL_PREFIXES = [
+    "chunk_gdn_fwd_h_flydsl_vk",
+    "chunk_gated_delta_rule_fwd_kernel_h",
+]
 
-    Mirrors the methodology used by ``0422_gdr_prefill_kernel_bench.py``:
-    capture all CUDA events under ProfilerActivity.CUDA during a fixed-iter
-    measurement window, then sum each unique kernel's
-    ``self_device_time_total`` and divide by ``niters``. Because each
-    ``_launch()`` closure dispatches a single K5 device kernel (with all host
-    preparation lifted out), the resulting number is the per-iter K5 device
-    time, free of Python launcher overhead.
+
+def _is_k5_kernel(name: str) -> bool:
+    """Return True if *name* is a K5 hidden-state recurrence kernel."""
+    return any(name.startswith(p) for p in _K5_KERNEL_PREFIXES)
+
+
+def _bench_fn(fn, *args, **kwargs):
+    """Average per-iter K5 kernel time (us) via torch.profiler.
+
+    Only counts kernels whose name matches ``_K5_KERNEL_PREFIXES``
+    (chunk_gdn_fwd_h_flydsl_vk, chunk_gated_delta_rule_fwd_kernel_h*).
+    This excludes memset, dtype-cast, and any other non-K5 GPU work.
     """
     fn(*args, **kwargs)
     torch.cuda.synchronize()
@@ -507,7 +552,8 @@ def _bench_fn(fn, *args, **kwargs):
     for evt in prof.key_averages():
         if evt.device_type is None or "cuda" not in str(evt.device_type).lower():
             continue
-        total_us += evt.self_device_time_total / NUM_ITERS
+        if _is_k5_kernel(evt.key):
+            total_us += evt.self_device_time_total / NUM_ITERS
     return total_us
 
 
@@ -705,6 +751,78 @@ class TestCorrectness:
             output_final_state=args.output_final_state,
             label="triton_kv",
         )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_triton_origin(self, args: PrefillArgs):
+        """Triton origin K5 (h: [K, V]) -- unoptimized baseline kernel.
+
+        The origin kernel does not support GQA (it expects k shape [B, T, H, K]
+        where H is the value-head count). We expand k from [B, T, Hg, K] to
+        [B, T, H, K] via repeat_interleave when Hg != H.
+        """
+        if args.ssm_state_dtype != torch.float32:
+            pytest.skip("Triton origin reference only supports f32 SSM state.")
+        context_lens = _build_context_lens(
+            args.full_prompt_len, args.max_num_batched_tokens
+        )
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        H = args.Hv // args.tp
+        Hg = args.Hk // args.tp
+        gqa_ratio = H // Hg
+        k_origin = k.repeat_interleave(gqa_ratio, dim=2) if gqa_ratio > 1 else k
+
+        h0_kv = h0.transpose(-2, -1).contiguous() if h0 is not None else None
+
+        h_origin, vn_origin, fs_origin = chunk_gated_delta_rule_fwd_h(
+            k_origin,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0_kv,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        h_origin_vk = h_origin.transpose(-2, -1).contiguous()
+        fs_origin_vk = (
+            fs_origin.transpose(-2, -1).contiguous() if fs_origin is not None else None
+        )
+
+        atol, rtol = 5e-2, 5e-2
+        torch.testing.assert_close(
+            h_origin_vk.float(),
+            h_ref.float(),
+            atol=atol,
+            rtol=rtol,
+            msg="triton_origin: h mismatch",
+        )
+        torch.testing.assert_close(
+            vn_origin.float(),
+            vn_ref.float(),
+            atol=atol,
+            rtol=rtol,
+            msg="triton_origin: v_new mismatch",
+        )
+        if args.output_final_state:
+            torch.testing.assert_close(
+                fs_origin_vk.float(),
+                fs_ref.float(),
+                atol=atol,
+                rtol=rtol,
+                msg="triton_origin: final_state mismatch",
+            )
 
 
 # -- bf16 SSM-state correctness ------------------------------------------
@@ -914,7 +1032,9 @@ class TestPerformance:
         context_lens = _build_context_lens(
             args.full_prompt_len, args.max_num_batched_tokens
         )
-        k, _, _, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
         total_tokens = sum(context_lens)
 
         # Triton K5 host wrappers only accept f32 ``initial_state`` and always
@@ -932,6 +1052,14 @@ class TestPerformance:
             if h0_triton_vk is not None
             else None
         )
+
+        # For triton_origin: needs [B, T, H, K] layout for w/u and [N, H, K, V] for h0.
+        # Origin kernel doesn't support GQA, so expand k from [B,T,Hg,K] to [B,T,H,K].
+        H = args.Hv // args.tp
+        Hg = args.Hk // args.tp
+        gqa_ratio = H // Hg
+        k_origin = k.repeat_interleave(gqa_ratio, dim=2) if gqa_ratio > 1 else k
+        h0_origin_kv = h0_kv  # already [N, H, K, V] from transpose above
 
         # K5 launch closures: each invokes the K5 host wrapper of its backend.
         def flydsl_launch():
@@ -967,6 +1095,17 @@ class TestPerformance:
                 cu_seqlens=cu,
             )
 
+        def triton_origin_launch():
+            chunk_gated_delta_rule_fwd_h(
+                k=k_origin,
+                w=w_orig,
+                u=u_orig,
+                g=g,
+                initial_state=h0_origin_kv,
+                output_final_state=args.output_final_state,
+                cu_seqlens=cu,
+            )
+
         # Warmup FlyDSL once so its internal BV-autotune sweep does not
         # leak into the timed window. Triton's own ``triton.autotune`` is
         # already absorbed by ``_bench_fn``'s NUM_WARMUP=5 prelude.
@@ -976,9 +1115,17 @@ class TestPerformance:
         us_triton_opt3 = _bench_fn(triton_opt3_launch)
         us_fly = _bench_fn(flydsl_launch)
         us_triton_vk = _bench_fn(triton_vk_launch)
+        us_triton_origin = _bench_fn(triton_origin_launch)
 
-        speedup_vk = us_triton_vk / us_fly if us_fly > 0 else float("inf")
-        speedup_opt3 = us_triton_opt3 / us_fly if us_fly > 0 else float("inf")
+        fly_vs_vk = us_triton_vk / us_fly if us_fly > 0 else float("inf")
+        fly_vs_kv = us_triton_opt3 / us_fly if us_fly > 0 else float("inf")
+        fly_vs_origin = us_triton_origin / us_fly if us_fly > 0 else float("inf")
+        vk_vs_origin = (
+            us_triton_origin / us_triton_vk if us_triton_vk > 0 else float("inf")
+        )
+        kv_vs_origin = (
+            us_triton_origin / us_triton_opt3 if us_triton_opt3 > 0 else float("inf")
+        )
 
         _perf_results.append(
             {
@@ -996,8 +1143,12 @@ class TestPerformance:
                 "FlyDSL_vk(us)": us_fly,
                 "Triton_vk(us)": us_triton_vk,
                 "Triton_kv(us)": us_triton_opt3,
-                "vs_triton_vk": speedup_vk,
-                "vs_triton_kv": speedup_opt3,
+                "Triton_origin(us)": us_triton_origin,
+                "flydsl_vs_vk": fly_vs_vk,
+                "flydsl_vs_kv": fly_vs_kv,
+                "flydsl_vs_origin": fly_vs_origin,
+                "vk_vs_origin": vk_vs_origin,
+                "kv_vs_origin": kv_vs_origin,
             }
         )
 
@@ -1006,40 +1157,42 @@ def _print_perf_table():
     if not _perf_results:
         return
 
-    # Columns shared by both per-state tables. ``state`` is omitted because
-    # each subtable describes a single SSM-state dtype in its title.
+    # Columns: compact layout using short names.
+    # (display_name, data_key, width)
     cols = [
-        ("Model", 16),
-        ("TP", 4),
-        ("K", 5),
-        ("V", 5),
-        ("Hg", 4),
-        ("H", 4),
-        ("SeqLen", 7),
-        ("T", 7),
-        ("varlen", 7),
-        ("final_st", 9),
-        ("FlyDSL_vk(us)", 15),
-        ("Triton_vk(us)", 15),
-        ("Triton_kv(us)", 15),
-        ("vs_triton_vk", 13),
-        ("vs_triton_kv", 13),
+        ("Model", "Model", 16),
+        ("TP", "TP", 3),
+        ("Hg", "Hg", 3),
+        ("H", "H", 3),
+        ("SeqLen", "SeqLen", 7),
+        ("T", "T", 7),
+        ("var", "varlen", 3),
+        ("fs", "final_st", 3),
+        ("FlyDSL", "FlyDSL_vk(us)", 8),
+        ("Tri_vk", "Triton_vk(us)", 8),
+        ("Tri_kv", "Triton_kv(us)", 8),
+        ("Tri_orig", "Triton_origin(us)", 9),
+        ("fly/vk", "flydsl_vs_vk", 7),
+        ("fly/kv", "flydsl_vs_kv", 7),
+        ("fly/orig", "flydsl_vs_origin", 8),
+        ("vk/orig", "vk_vs_origin", 7),
+        ("kv/orig", "kv_vs_origin", 7),
     ]
-    header = " | ".join(name.rjust(width) for name, width in cols)
-    sep = "-+-".join("-" * width for _, width in cols)
+    header = " | ".join(display.rjust(width) for display, _, width in cols)
+    sep = "-+-".join("-" * width for _, _, width in cols)
     border = "=" * len(header)
 
     def _fmt_row(row):
         cells = []
-        for name, width in cols:
-            val = row[name]
+        for display, key, width in cols:
+            val = row[key]
             if isinstance(val, bool):
                 cells.append(("Y" if val else "N").rjust(width))
             elif isinstance(val, float):
-                if name in ("vs_triton_vk", "vs_triton_kv"):
-                    cells.append(f"{val:.3f}x".rjust(width))
+                if "_vs_" in key:
+                    cells.append(f"{val:.2f}x".rjust(width))
                 else:
-                    cells.append(f"{val:.2f}".rjust(width))
+                    cells.append(f"{val:.1f}".rjust(width))
             else:
                 cells.append(str(val).rjust(width))
         return " | ".join(cells)
