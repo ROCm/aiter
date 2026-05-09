@@ -47,6 +47,7 @@ from flydsl._mlir.dialects import (
     fly as _fly,
     llvm as _llvm,
     memref as _memref,
+    scf as _scf,
     vector as _vector,
 )
 
@@ -698,24 +699,61 @@ def build_sage_attn_cdna_module(
             klane_i32 = fx.Int32(klane)
             klane_off_i32 = klane_i32 * fx.Int32(4)
             seq_len_k_i32 = fx.Int32(seq_len_k_v)
-            s_named = list(s_f32)
-            for st in range_constexpr(N_SUBTILES):
-                for elem in range_constexpr(ELEMS_PER_TILE):
-                    idx = st * ELEMS_PER_TILE + elem
-                    msub = elem // 4
-                    erem = elem % 4
-                    kv_col_i32 = (
-                        kv_start_i32
-                        + fx.Int32(st * MFMA_N)
-                        + fx.Int32(msub * 8)
-                        + klane_off_i32
-                        + fx.Int32(erem)
-                    )
-                    out_of_range = ArithValue(kv_col_i32 >= seq_len_k_i32)
-                    if const_expr(CAUSAL):
+
+            if const_expr(CAUSAL):
+                # Causal mask is per-row (depends on q_row), so the per-tile fast
+                # path doesn't help — keep the slow per-element mask path.
+                s_named = list(s_f32)
+                for st in range_constexpr(N_SUBTILES):
+                    for elem in range_constexpr(ELEMS_PER_TILE):
+                        idx = st * ELEMS_PER_TILE + elem
+                        msub = elem // 4
+                        erem = elem % 4
+                        kv_col_i32 = (
+                            kv_start_i32
+                            + fx.Int32(st * MFMA_N)
+                            + fx.Int32(msub * 8)
+                            + klane_off_i32
+                            + fx.Int32(erem)
+                        )
+                        out_of_range = ArithValue(kv_col_i32 >= seq_len_k_i32)
                         out_of_range = out_of_range | ArithValue(kv_col_i32 > q_row_i32)
-                    s_named[idx] = out_of_range.select(c_neg_inf, s_named[idx])
-            s_f32 = s_named
+                        s_named[idx] = out_of_range.select(c_neg_inf, s_named[idx])
+                s_f32 = s_named
+            else:
+                # Non-causal: at most one tail tile is OOB (when seq_len_k is not
+                # a multiple of BLOCK_N). On the in-bounds fast path we skip the
+                # entire ~63 v_cmp + 94 v_cndmask per-element mask block.
+                tile_end = kv_block_start + fx.Index(BLOCK_N)
+                tile_oob_av = ArithValue(tile_end > seq_len_k_v)
+                cond_i1 = _raw(tile_oob_av)
+                f32_ty = ir.F32Type.get()
+                result_types = [f32_ty] * NUM_S_VALS
+                if_op = _scf.IfOp(
+                    cond_i1, result_types, has_else=True, loc=ir.Location.unknown()
+                )
+                # then-branch: tail tile, apply per-element OOB mask
+                with ir.InsertionPoint(if_op.then_block):
+                    masked = []
+                    for st in range_constexpr(N_SUBTILES):
+                        for elem in range_constexpr(ELEMS_PER_TILE):
+                            idx = st * ELEMS_PER_TILE + elem
+                            msub = elem // 4
+                            erem = elem % 4
+                            kv_col_i32 = (
+                                kv_start_i32
+                                + fx.Int32(st * MFMA_N)
+                                + fx.Int32(msub * 8)
+                                + klane_off_i32
+                                + fx.Int32(erem)
+                            )
+                            out_of_range = ArithValue(kv_col_i32 >= seq_len_k_i32)
+                            masked.append(_raw(out_of_range.select(c_neg_inf, s_f32[idx])))
+                    _scf.YieldOp(masked)
+                # else-branch: in-bounds fast path, pass through unchanged
+                with ir.InsertionPoint(if_op.else_block):
+                    _scf.YieldOp([_raw(v) for v in s_f32])
+                s_f32 = list(if_op.results)
 
             # ==== Online softmax ====
             local_max = s_f32[0]
