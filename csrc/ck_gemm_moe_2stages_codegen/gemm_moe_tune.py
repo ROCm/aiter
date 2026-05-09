@@ -2130,6 +2130,15 @@ class FmoeTuner(TunerCommon):
         if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
             return tasks_ck
 
+        # CK2stages codegen does not support SwiGLU activation. GPT-OSS MXFP4
+        # cases are covered by FlyDSL (or the a8w4 CK-Tile path above).
+        if (
+            act_type == ActivationType.Swiglu
+            and q_type == QuantType.per_1x32
+            and q_dtype_w == dtypes.fp4x2
+        ):
+            return tasks_ck
+
         _, ck_stage1_kernels = get_gemm1_kernels_list(
             dtype2str_dict[q_dtype_a],
             dtype2str_dict[q_dtype_w],
