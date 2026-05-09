@@ -67,6 +67,7 @@ def compile_pa_decode_main(
     PARTITION_SIZE: int = 256,
     KV_COMPUTE_BLOCK_SIZE: int = 64,
     dtype: str = "bf16",
+    waves_per_eu: int = 1,
 ):
     if HEAD_SIZE % 32 != 0:
         raise ValueError(f"HEAD_SIZE must be multiple of 32, got {HEAD_SIZE}")
@@ -151,18 +152,17 @@ def compile_pa_decode_main(
     q_lds_bytes  = q_lds_elems * elem_bytes
     kv_one_bytes = kv_lds_elems * elem_bytes
 
-    # Allocate each region with a 16-byte alignment
+    # Allocate each region with a 16-byte alignment.
+    # Layout: Q | K-slab (NUM_KV_STAGES contiguous stages) | V-slab (NUM_KV_STAGES contiguous stages).
+    # Keeping all K stages together (and all V stages together) lets us pick a
+    # stage at runtime by adding `stage * kv_one_bytes` to the slab base —
+    # required for the runtime (non-unrolled) compute loop.
     q_lds_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = q_lds_offset + q_lds_bytes
-    k_stage_offsets = []
-    v_stage_offsets = []
-    for _i in range(NUM_KV_STAGES):
-        k_off = allocator._align(allocator.ptr, 16)
-        allocator.ptr = k_off + kv_one_bytes
-        v_off = allocator._align(allocator.ptr, 16)
-        allocator.ptr = v_off + kv_one_bytes
-        k_stage_offsets.append(k_off)
-        v_stage_offsets.append(v_off)
+    k_slab_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = k_slab_offset + NUM_KV_STAGES * kv_one_bytes
+    v_slab_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = v_slab_offset + NUM_KV_STAGES * kv_one_bytes
 
     @flyc.kernel
     def kernel_pa_decode_main(
@@ -192,15 +192,21 @@ def compile_pa_decode_main(
         seq_len_i32 = buffer_ops.buffer_load(sl_rsrc, seq_idx, vec_width=1, dtype=T.i32)
         seq_len = arith.index_cast(T.index, seq_len_i32)
 
-        # Early-exit guard: if this partition starts past seq_len, every token in
-        # this workgroup's tile is out of range. The cmpi MUST be inlined into
-        # the if test (see note in the kernel docstring) so FlyDSL's AST
-        # rewriter converts this to scf.if rather than evaluating bool() at
-        # compile time.
+        # Live-partition guard. We previously wrapped the whole body in a
+        # dynamic `if arith.cmpi(...)`, but FlyDSL's AST rewriter turns that
+        # into a helper function whose body must execute eagerly — and a body
+        # containing `yield` (from the runtime scf.for compute loop) becomes a
+        # generator function that the rewriter can't dispatch. So instead we
+        # compute `is_live` here and clamp the runtime loop bound to 0 for
+        # past-seq_len partitions (see `iters_to_run` below). The body always
+        # runs but does no useful work for dead partitions; their initial
+        # m_state=-inf / l_state=0 / pv_accs=0 match the host-side pre-init,
+        # and the reduce kernel skips past-seq_len partitions anyway.
         part_first_tok = part_idx * arith.index(PARTITION_SIZE)
-        if arith.cmpi(
+        is_live = arith.cmpi(
             arith.CmpIPredicate.slt, _raw(part_first_tok), _raw(seq_len)
-        ):
+        )
+        if True:
             elem_ty = T.bf16 if dtype == "bf16" else T.f16
             wmma_op = (
                 rocdl.wmma_f32_16x16x32_bf16
@@ -239,22 +245,19 @@ def compile_pa_decode_main(
             ml_rsrc = buffer_ops.create_buffer_resource(arg_max_logits, max_size=True)
             es_rsrc = buffer_ops.create_buffer_resource(arg_exp_sums, max_size=True)
             # --- LDS setup ---
+            # K-slab and V-slab are each a single SmemPtr that spans NUM_KV_STAGES
+            # tiles back-to-back. Stage `s` lives at byte offset
+            # `s * kv_one_bytes` (= elem offset `s * kv_lds_elems`) from the
+            # slab base. Runtime stage selection is just an add on the offset.
             base = allocator.get_base()
             q_lds = SmemPtr(base, q_lds_offset, elem_ty, shape=(q_lds_elems,))
-            k_lds_stages = [
-                SmemPtr(base, k_stage_offsets[i], elem_ty, shape=(kv_lds_elems,))
-                for i in range(NUM_KV_STAGES)
-            ]
-            v_lds_stages = [
-                SmemPtr(base, v_stage_offsets[i], elem_ty, shape=(kv_lds_elems,))
-                for i in range(NUM_KV_STAGES)
-            ]
+            k_lds = SmemPtr(base, k_slab_offset, elem_ty,
+                            shape=(NUM_KV_STAGES * kv_lds_elems,))
+            v_lds = SmemPtr(base, v_slab_offset, elem_ty,
+                            shape=(NUM_KV_STAGES * kv_lds_elems,))
             q_lds.get()
-            k_lds_stages[0].get()
-            v_lds_stages[0].get()
-            if NUM_KV_STAGES == 2:
-                k_lds_stages[1].get()
-                v_lds_stages[1].get()
+            k_lds.get()
+            v_lds.get()
 
             # --- qk_scale in log2 domain (so we can use exp2) ---
             qk_scale_f32 = arith.bitcast(T.f32, _raw(i32_qk_scale))
@@ -301,7 +304,8 @@ def compile_pa_decode_main(
                 arith.CmpIPredicate.slt, _raw(lane16), _raw(qgs_idx)
             )
 
-            def _load_wmma_B_frag_tr(lds_ptr, n_col_base, k_base_elem, row_stride):
+            def _load_wmma_B_frag_tr(lds_ptr, n_col_base, k_base_elem, row_stride,
+                                     stage_elem_off=None):
                 """Load a vec<16xelem> WMMA B fragment via 2 × ds_load_tr16_b128.
 
                 For tensors stored in LDS as [K-rows, N-cols] row-major (K = matmul-K
@@ -315,6 +319,9 @@ def compile_pa_decode_main(
                   LDS col = n_col_base + lane_ngrp * 8           (8-col chunk in N)
                 One transposed load delivers vec<8xelem> = (8 K-rows × 1 N-col) per lane.
                 Two calls (k_half = 0, 1) cover 16 K-rows per lane = full K=32 fragment.
+
+                `stage_elem_off` (runtime, in elements) is added to every load offset
+                to pick a stage out of the V-slab.
                 """
                 lds_mem = lds_ptr.get()
                 k_row_in_lane = lane_kgrp * arith.index(8) + lane8
@@ -323,6 +330,8 @@ def compile_pa_decode_main(
                     (arith.index(k_base_elem) + k_row_in_lane) * arith.index(row_stride)
                     + n_col_in_lane
                 )
+                if stage_elem_off is not None:
+                    base = stage_elem_off + base
                 chunks = []
                 for k_half in range_constexpr(2):
                     k_row_extra = arith.index(k_half * 16) * arith.index(row_stride)
@@ -333,7 +342,8 @@ def compile_pa_decode_main(
                     chunks.append(v)
                 return vector.shuffle(chunks[0], chunks[1], list(range(16)))
 
-            def _load_wmma_A_frag(lds_ptr, row_base_idx, k_base_elem, row_stride):
+            def _load_wmma_A_frag(lds_ptr, row_base_idx, k_base_elem, row_stride,
+                                  stage_elem_off=None):
                 """Load a vec<16xelem> WMMA A fragment via 2 × ds_read_b128.
 
                 Per-lane layout: 16 elements at (row = row_base_idx,
@@ -343,6 +353,10 @@ def compile_pa_decode_main(
                 one vector.load_op of vec<8xelem> covers them — lowers to a single
                 ds_read_b128 (16 bytes). Two such loads + a shuffle give the full
                 vec<16xelem> WMMA A-operand fragment, replacing 16 scalar ds_read_u16's.
+
+                `stage_elem_off` (runtime, in elements) is added to every load
+                offset to pick a stage out of the K-slab. Q-frag loads (which
+                go to a separate `q_lds` SmemPtr that has no stages) pass None.
                 """
                 lds_mem = lds_ptr.get()
                 chunks = []
@@ -352,6 +366,8 @@ def compile_pa_decode_main(
                         + (arith.index(k0 * 2) + lane_kgrp) * arith.index(8)
                     )
                     elem_off = row_base_idx * arith.index(row_stride) + kk_base
+                    if stage_elem_off is not None:
+                        elem_off = stage_elem_off + elem_off
                     chunk = vector.load_op(T.vec(8, elem_ty), lds_mem, [elem_off])
                     chunks.append(chunk)
                 return vector.shuffle(chunks[0], chunks[1], list(range(16)))
@@ -445,10 +461,16 @@ def compile_pa_decode_main(
                 )
                 tdm_ops.tensor_load_2d(desc)
 
-            def _issue_kv_tile_loads(k_lds_mem, v_lds_mem, phys_blks_list):
+            def _issue_kv_tile_loads(k_lds_mem, v_lds_mem, phys_blks_list,
+                                     stage_byte_off):
                 """Issue TDM loads for one compute tile: K loads first, then V
                 loads (K-then-V issue order so tensor_wait can drain just the
-                K's via FIFO while V's DMA continues in background)."""
+                K's via FIFO while V's DMA continues in background).
+
+                `stage_byte_off` (runtime, in bytes) is added to every TDM
+                lds_byte_offset so the load lands in the right stage of the
+                K-slab / V-slab.
+                """
                 # Use the padded row stride: TDM inserts LDS_PAD_ELEMS of pad
                 # after every HEAD_SIZE source elements, so each block in LDS
                 # is KV_BLOCK_SIZE rows × KV_LDS_ROW_STRIDE elements wide.
@@ -456,13 +478,13 @@ def compile_pa_decode_main(
 
                 # Single-warp cooperative issue: this warp issues every block.
                 for b in range_constexpr(BLOCKS_PER_COMPUTE):
-                    lds_sub_off = arith.index(b * one_block_bytes)
+                    lds_sub_off = stage_byte_off + arith.index(b * one_block_bytes)
                     _issue_kv_load_single_block(
                         arg_key_cache, k_lds_mem,
                         phys_blks_list[b], lds_sub_off, tdm_num_warps=NUM_WARPS,
                     )
                 for b in range_constexpr(BLOCKS_PER_COMPUTE):
-                    lds_sub_off = arith.index(b * one_block_bytes)
+                    lds_sub_off = stage_byte_off + arith.index(b * one_block_bytes)
                     _issue_kv_load_single_block(
                         arg_value_cache, v_lds_mem,
                         phys_blks_list[b], lds_sub_off, tdm_num_warps=NUM_WARPS,
@@ -497,7 +519,10 @@ def compile_pa_decode_main(
             # ---------------- Prologue: Q + compute tile 0 loads (concurrent) ----------------
             _issue_q_load()
             phys_blks_tile0 = _phys_blks_for_compute(arith.index(0)) # load physical blocks for compute iter 1
-            _issue_kv_tile_loads(k_lds_stages[0].get(), v_lds_stages[0].get(), phys_blks_tile0)
+            _issue_kv_tile_loads(
+                k_lds.get(), v_lds.get(), phys_blks_tile0,
+                stage_byte_off=arith.index(0),  # tile 0 lands in stage 0
+            )
             tdm_ops.tensor_wait(FENCE_OUTSTANDING)
             gpu.barrier()
 
@@ -506,45 +531,79 @@ def compile_pa_decode_main(
             for ks in range_constexpr(K_QK_TILES):  # each warp has a complete copy of Q
                 q_frags.append(_load_wmma_A_frag(q_lds, lane16, ks * WMMA_K, KV_LDS_ROW_STRIDE))
 
+            # Pre-extract LDS memrefs once, outside the runtime loop. Keeping
+            # `k_lds.get()` / `v_lds.get()` calls inside scf.if branches makes
+            # FlyDSL's AST rewriter treat `k_lds` / `v_lds` as state variables
+            # crossing the if (because of the visit_Call → invoked_args path)
+            # and then fail with "state variable is SmemPtr, not an MLIR Value".
+            k_lds_mem = k_lds.get()
+            v_lds_mem = v_lds.get()
+
             # ---------------- Main loop over compute tiles in partition ----------------
-            for compute_iter in range_constexpr(COMPUTES_PER_PARTITION):
-                cur_stage = compute_iter % NUM_KV_STAGES
-                nxt_stage = (compute_iter + 1) % NUM_KV_STAGES
+            # Runtime scf.for (no constexpr unroll). Loop-carried state:
+            #   [m_state, l_state, *pv_accs (length N_PV_TILES), cur_stage]
+            # cur_stage toggles 0↔1 each iter and is used at runtime to pick the
+            # K/V slab byte-offset (since the LDS layout is K-slab|V-slab with
+            # both stages contiguous within each slab).
+            #
+            # iters_to_run replaces the old early-exit guard: live partitions
+            # run COMPUTES_PER_PARTITION iters, dead partitions run 0 (and the
+            # init_state values flow straight to the stores).
+            iters_to_run = arith.select(
+                is_live,
+                _raw(arith.index(COMPUTES_PER_PARTITION)),
+                _raw(arith.index(0)),
+            )
+            init_state = [m_state, l_state, *pv_accs, arith.index(0)]
+
+            for iv, state in range(
+                arith.index(0), iters_to_run, arith.index(1), init=init_state
+            ):
+                # Unpack loop-carried state.
+                m_state = state[0]
+                l_state = state[1]
+                pv_accs = list(state[2:2 + N_PV_TILES])
+                cur_stage = state[2 + N_PV_TILES]
+                nxt_stage = arith.index(1) - cur_stage
+
+                # Per-iter runtime stage offsets.
+                cur_stage_byte_off = cur_stage * arith.index(kv_one_bytes)
+                nxt_stage_byte_off = nxt_stage * arith.index(kv_one_bytes)
+                cur_stage_elem_off = cur_stage * arith.index(kv_lds_elems)
+
                 tile_first_tok = (
                     part_idx * arith.index(PARTITION_SIZE)
-                    + arith.index(compute_iter * KV_COMPUTE_BLOCK_SIZE)
+                    + iv * arith.index(KV_COMPUTE_BLOCK_SIZE)
                 )
 
-                # Prefetch next compute tile's BLOCKS_PER_COMPUTE K+V loads if it exists.
-                # _issue_kv_tile_loads issues all K's first, then all V's.
-                # FIFO drain semantics: wait_for_K drains everything down to (V's of cur tile + any prefetched).
-                if compute_iter < COMPUTES_PER_PARTITION - 1:
-                    next_iter_idx = arith.index(compute_iter + 1)
+                # is_not_last → (iv < COMPUTES_PER_PARTITION - 1)
+                is_not_last = arith.cmpi(
+                    arith.CmpIPredicate.slt,
+                    _raw(iv),
+                    _raw(arith.index(COMPUTES_PER_PARTITION - 1)),
+                )
+
+                # ---------- scf.if #1: prefetch next tile + drain current K ----------
+                # Both branches must use a constexpr literal for tensor_wait, so
+                # the last-vs-not-last split has to live inside scf.if branches.
+                # Note: we pass the pre-extracted `k_lds_mem` / `v_lds_mem`
+                # rather than calling `.get()` inside the branch, see comment
+                # at their definition.
+                if is_not_last:
+                    next_iter_idx = iv + arith.index(1)
                     next_phys_blks = _phys_blks_for_compute(next_iter_idx)
                     _issue_kv_tile_loads(
-                        k_lds_stages[nxt_stage].get(),
-                        v_lds_stages[nxt_stage].get(),
-                        next_phys_blks,
+                        k_lds_mem, v_lds_mem, next_phys_blks,
+                        stage_byte_off=nxt_stage_byte_off,
                     )
-
-                outstanding_after_k_drain = (
-                    3 * K_OPS_PER_WAVE
-                    if compute_iter < COMPUTES_PER_PARTITION - 1
-                    else K_OPS_PER_WAVE
-                )
-                outstanding_after_v_drain = (
-                    2 * K_OPS_PER_WAVE
-                    if compute_iter < COMPUTES_PER_PARTITION - 1
-                    else 0
-                )
-
-                # Wait for current tile's K (V continues loading in background).
-                tdm_ops.tensor_wait(outstanding_after_k_drain)
+                    # In flight before issue: 2*K_OPS (cur tile's K+V).
+                    # +2*K_OPS prefetched = 4*K_OPS total. Drain 1*K_OPS (= cur K).
+                    tdm_ops.tensor_wait(3 * K_OPS_PER_WAVE)
+                else:
+                    # In flight: 2*K_OPS (cur K+V, prefetched in prev iter or prologue).
+                    # No new prefetch. Drain 1*K_OPS (= cur K), leave V in flight.
+                    tdm_ops.tensor_wait(K_OPS_PER_WAVE)
                 gpu.barrier()
-
-                # Current stage pointers
-                k_lds = k_lds_stages[cur_stage]
-                v_lds = v_lds_stages[cur_stage]
 
                 # ------------------------ QK WMMA (SWAPPED operands) ------------------------
                 # `wmma(K, Q, …)` instead of `wmma(Q, K, …)` → output is S^T in
@@ -559,7 +618,8 @@ def compile_pa_decode_main(
                     n_row_lds = arith.index(n_tile * WMMA_M) + lane16
                     for ks in range_constexpr(K_QK_TILES):
                         k_frag = _load_wmma_A_frag(
-                            k_lds, n_row_lds, ks * WMMA_K, KV_LDS_ROW_STRIDE
+                            k_lds, n_row_lds, ks * WMMA_K, KV_LDS_ROW_STRIDE,
+                            stage_elem_off=cur_stage_elem_off,
                         )
                         # SWAPPED: K is A operand (M=KVB), Q is B operand (N=QGSP).
                         qk_accs[n_tile] = wmma_op(
@@ -673,8 +733,14 @@ def compile_pa_decode_main(
                 for pv_n in range_constexpr(N_PV_TILES):
                     pv_accs[pv_n] = arith.mulf(pv_accs[pv_n], alpha_vec)
 
-                # Wait for current tile's V (its DMA was overlapped with QK+softmax).
-                tdm_ops.tensor_wait(outstanding_after_v_drain)
+                # ---------- scf.if #2: drain current V ----------
+                # Same is_not_last condition, different constexpr wait counts.
+                if is_not_last:
+                    # 3*K_OPS in flight (V_cur + K_next + V_next). Drain V_cur.
+                    tdm_ops.tensor_wait(2 * K_OPS_PER_WAVE)
+                else:
+                    # K_OPS in flight (just V_cur). Drain everything.
+                    tdm_ops.tensor_wait(0)
                 gpu.barrier()
 
                 # ------------------------ PV WMMA (SWAPPED operands) ------------------------
@@ -703,6 +769,7 @@ def compile_pa_decode_main(
                             arith.index(pv_n * WMMA_M),  # base in HEAD dim
                             ks * WMMA_K,                 # base in KVB dim
                             KV_LDS_ROW_STRIDE,           # row stride (V LDS [KVB, HEAD+pad])
+                            stage_elem_off=cur_stage_elem_off,
                         )
                         # SWAPPED: V is A (M=HEAD), P is B (N=QGSP).
                         pv_accs[pv_n] = wmma_op(
@@ -718,6 +785,14 @@ def compile_pa_decode_main(
                         ).result
 
                 gpu.barrier()
+
+                # Yield updated state for next iter. cur_stage toggles to nxt_stage.
+                results = yield [m_state, l_state, *pv_accs, nxt_stage]
+
+            # After the loop: pull final state out of `results` (last yielded values).
+            m_state = results[0]
+            l_state = results[1]
+            pv_accs = list(results[2:2 + N_PV_TILES])
 
             # ---------------- Write per-partition results ----------------
             out_base = (
@@ -766,7 +841,7 @@ def compile_pa_decode_main(
                 buffer_ops.buffer_store(l_state, es_rsrc, off_lse)
 
     cache_tag = (HEAD_SIZE, KV_BLOCK_SIZE, QUERY_GROUP_SIZE, PARTITION_SIZE,
-                 KV_COMPUTE_BLOCK_SIZE, dtype, NUM_WARPS)
+                 KV_COMPUTE_BLOCK_SIZE, dtype, NUM_WARPS, waves_per_eu)
 
     @flyc.jit
     def launch_pa_decode_main(
@@ -795,13 +870,37 @@ def compile_pa_decode_main(
         gy = _raw(arith.index_cast(T.index, i32_num_kv_heads.ir_value()))
         gz = _raw(arith.index_cast(T.index, i32_num_parts.ir_value()))
 
-        kernel_pa_decode_main(
+        # Trace the kernel into the gpu module first so we can attach the
+        # `rocdl.waves_per_eu` attribute to its gpu.func before launching.
+        # Capping waves_per_eu lets the LLVM backend allocate more VGPRs per
+        # wave (avoiding spills on register-heavy configs like HEAD=128 +
+        # KVB>=128 where qk_accs + pv_accs together can exceed 200 VGPRs).
+        launcher = kernel_pa_decode_main(
             arg_out, arg_max_logits, arg_exp_sums,
             arg_query, arg_key_cache, arg_value_cache,
             arg_block_tables, arg_seq_lens,
             i32_qk_scale, i32_num_seqs, i32_num_kv_heads,
             i32_num_parts, i32_max_blocks_per_seq,
-        ).launch(
+        )
+
+        if waves_per_eu is not None:
+            for op in ctx.gpu_module_body.operations:
+                if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
+                    wpe = int(waves_per_eu)
+                    if wpe >= 1:
+                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                            ir.IntegerType.get_signless(32), wpe
+                        )
+
+        # Pin min == max == block_threads so the LLVM backend knows the
+        # workgroup is exactly this size (no need to budget registers for a
+        # larger upper bound). Launch always uses block=(block_threads,1,1).
+        flat_wg_attr = ir.StringAttr.get(f"{block_threads},{block_threads}")
+        for op in ctx.gpu_module_body.operations:
+            if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
+                op.attributes["rocdl.flat_work_group_size"] = flat_wg_attr
+
+        launcher.launch(
             grid=(gx, gy, gz),
             block=(block_threads, 1, 1),
             stream=stream,
