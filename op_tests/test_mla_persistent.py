@@ -479,7 +479,6 @@ def torch_mla_extend_split_kv(
             and is_fp8_kvc
             and max_seqlen_q == 4
         )
-        or (get_gfx() == "gfx950" and nheads == 64 and max_seqlen_q == 1)
         or (
             get_gfx() == "gfx942"
             and nheads == 8
@@ -487,11 +486,7 @@ def torch_mla_extend_split_kv(
             and not is_fp8_kvc
             and max_seqlen_q == 2
         )
-        or (
-            get_gfx() == "gfx950"
-            and not is_fp8_q
-            and not is_fp8_kvc
-        )
+        or (get_gfx() == "gfx950" and not is_fp8_q and not is_fp8_kvc)
     ):
         # Natively support cases
         pass
@@ -1337,41 +1332,41 @@ def test_mla(
                 attn_lse.reshape(total_q, nhead),
                 msg=f"mla_decode-absorb_fp8    [lse_ref vs attn_lse]: {us_asm_decode:>8.2f} us......",
             )
-        # if not non_persistent_mode:
-        #     partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
-        #         torch_mla_split_kv_and_reduce(
-        #             q,
-        #             kv_buffer,
-        #             qo_indptr,
-        #             kv_indptr,
-        #             kv_indices,
-        #             kv_last_page_lens,
-        #             sm_scale,
-        #             kv_lora_rank,
-        #             qk_rope_head_dim,
-        #             dtype=out_dtype,
-        #             work_meta_data=work_meta_data,
-        #             work_info_set=work_info_set,
-        #             work_indptr=work_indptr,
-        #             reduce_indptr=reduce_indptr,
-        #             reduce_final_map=reduce_final_map,
-        #             reduce_partial_map=reduce_partial_map,
-        #             max_seqlen_q=max_seqlen_qo,
-        #             is_causal=True,
-        #         )
-        #     )
+        if not non_persistent_mode:
+            partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
+                torch_mla_split_kv_and_reduce(
+                    q,
+                    kv_buffer,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    kv_last_page_lens,
+                    sm_scale,
+                    kv_lora_rank,
+                    qk_rope_head_dim,
+                    dtype=out_dtype,
+                    work_meta_data=work_meta_data,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    max_seqlen_q=max_seqlen_qo,
+                    is_causal=True,
+                )
+            )
 
-        #     checkAllclose(
-        #         split_out_ref,
-        #         out_asm,
-        #         msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        #     )
-        #     if partial_out_ref.shape[0] > 0:
-        #         checkAllclose(
-        #             partial_out_ref,
-        #             attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
-        #             msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
-        #         )
+            checkAllclose(
+                split_out_ref,
+                out_asm,
+                msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+            )
+            if partial_out_ref.shape[0] > 0:
+                checkAllclose(
+                    partial_out_ref,
+                    attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
+                    msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
+                )
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
