@@ -121,7 +121,7 @@ jobs:
                   selected = [
                       model
                       for model in json.load(f)
-                      if str(model.get("test_level", "")).lower() == "pr"
+                      if str(model.get("test_level", "")).lower() in {"pr", "main"}
                   ]
               runner_overrides = {
                   "atom-mi355-8gpu.predownload": "linux-aiter-mi35x-8",
