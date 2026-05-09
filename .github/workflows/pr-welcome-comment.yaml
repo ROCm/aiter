@@ -33,10 +33,8 @@ jobs:
             | \`ci:triton-300x\` | Run an additional Triton test job on MI300X in PRs; main branch always runs both MI35X and MI300X |
             | \`ci:sglang\` | SGLang integration tests |
             | \`ci:atom\` | ATOM benchmark (DeepSeek-R1 + GPT-OSS) |
-            | \`ci:atom_full\` | Full ATOM accuracy suite (native + vLLM + SGLang) |
             | \`ci:vllm\` | vLLM benchmark |
-            | \`ci:all\` | All standard extended tests (excludes \`ci:atom_full\`) |
+            | \`ci:all\` | All of the above |
 
-            > Only add \`ci:atom_full\` for FlyDSL or Triton upgrades.
             > Add labels via the sidebar or \`gh pr edit ${context.issue.number} --add-label <label>\``
             });
