@@ -802,11 +802,13 @@ void standalone_stable_radix_topk(void* buf,
         if(v >= 1) grid_dim = static_cast<unsigned>(v);
     } else {
         grid_dim = std::max(grid_dim, 2u);
-        // [DISABLED] Wave-cap heuristic: clamp grid_dim so all blocks fit in 1 wave.
-        // Disabled because G=1 degenerates to single-block behavior.
-        // const unsigned wave_cap = std::max(1u, static_cast<unsigned>(sm_cnt) / static_cast<unsigned>(batch_size));
-        // grid_dim = std::min(grid_dim, wave_cap);
-        // grid_dim = std::max(grid_dim, 1u);
+        // High-CU parts (MI355X, 256 CU): cap grid_dim so total launched blocks
+        // (grid_dim * batch_size) stay within one CU-wave.  Avoids excessive
+        // cross-block atomic-barrier contention on the persistent kernel.
+        if(large_bpp) {
+            const unsigned wave_cap = std::max(2u, static_cast<unsigned>(sm_cnt) / static_cast<unsigned>(batch_size));
+            grid_dim = std::max(std::min(grid_dim, wave_cap), 2u);
+        }
     }
 
     if (large_bpp) {
