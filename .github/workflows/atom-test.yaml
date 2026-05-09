@@ -119,7 +119,13 @@ jobs:
           else:
               with open(".github/benchmark/models_accuracy.json", encoding="utf-8") as f:
                   selected = json.load(f)
+              runner_overrides = {
+                  "atom-mi355-8gpu.predownload": "linux-aiter-mi35x-8",
+                  "linux-atom-mi35x-4": "linux-aiter-mi35x-4",
+                  "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
+              }
               for model in selected:
+                  model["runner"] = runner_overrides.get(model["runner"], model["runner"])
                   model["label"] = model.get("runner", "")
                   model["accuracy_test_threshold"] = str(model.get("accuracy_threshold", 0))
                   model["run_on_pr"] = True
