@@ -312,7 +312,34 @@ def quantize_weight(
     return weight_qt, weight_scale
 
 
-def quantize_activation_stage1(hidden: torch.Tensor, quant: QuantSpec):
+def make_shared_fc1_smooth_scale(case: CaseSpec, device: str):
+    # Keep the range moderate so the correctness tolerance stays comparable.
+    return 0.75 + 0.5 * torch.rand(
+        (case.model_dim,), dtype=torch.float32, device=device
+    )
+
+
+def quantize_activation_stage1(
+    hidden: torch.Tensor,
+    quant: QuantSpec,
+    fc1_smooth_scale: Optional[torch.Tensor] = None,
+):
+    smooth_scale = fused_moe_mod._normalize_shared_fc1_smooth_scale(
+        fc1_smooth_scale, hidden.shape[-1]
+    )
+    if smooth_scale is not None and quant.q_type not in {
+        QuantType.per_Token,
+        QuantType.per_1x32,
+    }:
+        raise ValueError(
+            "fc1_smooth_scale test only supports per_Token and per_1x32 stage1 quant"
+        )
+    if smooth_scale is not None and quant.q_type == QuantType.per_Token:
+        torch_quant = get_torch_quant(quant.q_type)
+        return torch_quant(hidden, x_scale=smooth_scale, quant_dtype=quant.q_dtype_a)
+    if smooth_scale is not None:
+        hidden = fused_moe_mod._apply_shared_fc1_smooth(hidden, fc1_smooth_scale)
+
     if quant.q_type == QuantType.per_1x128:
         token, model_dim = hidden.shape
         a1_qt, a1_scale = aiter.pertoken_quant(
@@ -329,6 +356,7 @@ def generate_case_data(
     seed: int,
     device: str = "cuda",
     weight_quant_chunk_experts: int = 8,
+    use_smooth_scale: bool = False,
 ):
     """Generate raw + quantized data for one MoE case.
 
@@ -353,6 +381,9 @@ def generate_case_data(
     topk_weight, topk_ids = fused_topk(hidden, score, case.topk, True)
     topk_weight = topk_weight.to(torch.float32)
     topk_ids = topk_ids.to(torch.int32)
+    fc1_smooth_scale = (
+        make_shared_fc1_smooth_scale(case, device) if use_smooth_scale else None
+    )
 
     quant_data = {}
     for quant in quant_specs:
@@ -368,7 +399,9 @@ def generate_case_data(
             quant.stage2_q_dtype_w,
             chunk_experts=weight_quant_chunk_experts,
         )
-        a1_qt, a1_scale = quantize_activation_stage1(hidden, quant)
+        a1_qt, a1_scale = quantize_activation_stage1(
+            hidden, quant, fc1_smooth_scale=fc1_smooth_scale
+        )
         quant_data[quant.name] = {
             "quant": quant,
             "w1_qt": w1_qt,
@@ -388,6 +421,7 @@ def generate_case_data(
             "hidden": hidden,
             "topk_weight": topk_weight,
             "topk_ids": topk_ids,
+            "fc1_smooth_scale": fc1_smooth_scale,
         },
         "quant_data": quant_data,
     }
@@ -443,12 +477,14 @@ def torch_moe_reference(
     w2_scale: Optional[torch.Tensor],
     a1_qt: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
+    fc1_smooth_scale: Optional[torch.Tensor] = None,
 ):
     # Prefer framework torch_moe reference for int8/fp8 paths.
     # fp4/per_1x32 keeps stage1/2 path because torch_moe does not directly
     # consume fp4x2 packed weights + e8m0 scales.
     if (
-        not quant.is_hybrid
+        fc1_smooth_scale is None
+        and not quant.is_hybrid
         and quant.q_type in {QuantType.per_Token, QuantType.per_Tensor}
         and quant.q_dtype_w != dtypes.fp4x2
     ):
@@ -464,7 +500,9 @@ def torch_moe_reference(
         )
 
     if a1_qt is None or a1_scale is None:
-        a1_qt, a1_scale = quantize_activation_stage1(hidden, quant)
+        a1_qt, a1_scale = quantize_activation_stage1(
+            hidden, quant, fc1_smooth_scale=fc1_smooth_scale
+        )
     ref_stage1 = torch_moe_stage1(
         a1_qt,
         w1_qt,
@@ -528,6 +566,7 @@ def run_fused_moe(
     topk_ids: torch.Tensor,
     w1_scale_fused: Optional[torch.Tensor],
     w2_scale_fused: Optional[torch.Tensor],
+    fc1_smooth_scale: Optional[torch.Tensor] = None,
 ):
     return fused_moe_mod.fused_moe(
         hidden,
@@ -544,6 +583,7 @@ def run_fused_moe(
         q_dtype_a2=quant.stage2_q_dtype_a,
         q_dtype_w2=quant.stage2_q_dtype_w,
         dtype=case.dtype,
+        fc1_smooth_scale=fc1_smooth_scale,
     )
 
 
@@ -637,6 +677,12 @@ def parse_args():
     parser.add_argument("--dtype", type=str, default="bf16")
     parser.add_argument("--use-g1u1", type=int, default=0)
     parser.add_argument("--doweight-stage1", type=int, default=0)
+    parser.add_argument(
+        "--smooth-scale",
+        action="store_true",
+        default=False,
+        help="Enable shared fc1_smooth_scale test for stage1 quantization.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
@@ -709,14 +755,17 @@ def main():
             seed,
             device="cuda",
             weight_quant_chunk_experts=args.weight_quant_chunk_experts,
+            use_smooth_scale=args.smooth_scale,
         )
         hidden = case_data["raw"]["hidden"]
         topk_weight = case_data["raw"]["topk_weight"]
         topk_ids = case_data["raw"]["topk_ids"]
+        fc1_smooth_scale = case_data["raw"]["fc1_smooth_scale"]
 
         for quant in quant_list:
             case_tag = (
                 f"{case.case_name} | {quant.name} | "
+                f"smooth={args.smooth_scale} | "
                 f"shape=({case.token},{case.model_dim},{case.inter_dim},E={case.expert},topk={case.topk})"
             )
             print(f"\n{'=' * 90}\n[RUN] {case_tag}\n{'=' * 90}")
@@ -742,6 +791,7 @@ def main():
                         w2_scale,
                         a1_qt=a1_qt,
                         a1_scale=a1_scale,
+                        fc1_smooth_scale=fc1_smooth_scale,
                     )
 
                 selected_layout = (
@@ -767,6 +817,7 @@ def main():
                     topk_ids,
                     w1_scale_fused,
                     w2_scale_fused,
+                    fc1_smooth_scale,
                 )
                 perf_us = None
                 selected_weights = (w1_fused, w2_fused, w1_scale_fused, w2_scale_fused)
@@ -784,6 +835,7 @@ def main():
                         topk_ids,
                         w1_scale_fused,
                         w2_scale_fused,
+                        fc1_smooth_scale,
                         num_warmup=args.warmup,
                         num_iters=args.iters,
                     )

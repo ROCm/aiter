@@ -103,6 +103,56 @@ def moe_sorting(
         raise e
 
 
+def _normalize_shared_fc1_smooth_scale(fc1_smooth_scale, model_dim):
+    if fc1_smooth_scale is None:
+        return None
+    if fc1_smooth_scale.shape[-1] != model_dim:
+        raise ValueError(
+            f"fc1_smooth_scale must have last dim {model_dim}, "
+            f"got {tuple(fc1_smooth_scale.shape)}"
+        )
+    if fc1_smooth_scale.numel() != model_dim:
+        raise ValueError(
+            "fused_moe only supports shared fc1_smooth_scale with shape "
+            f"[model_dim], [1, model_dim], or [1, 1, model_dim]; got "
+            f"{tuple(fc1_smooth_scale.shape)}"
+        )
+    return fc1_smooth_scale.view(1, model_dim).contiguous()
+
+
+def _smooth_per_token_quant_stage1(
+    hidden_states,
+    fc1_smooth_scale,
+    quant_dtype,
+    num_rows=None,
+):
+    model_dim = hidden_states.shape[-1]
+    smooth_scale = _normalize_shared_fc1_smooth_scale(fc1_smooth_scale, model_dim)
+    a1 = torch.empty_like(hidden_states, dtype=quant_dtype)
+    a1_scale = torch.empty(
+        (*hidden_states.shape[:-1], 1), dtype=dtypes.fp32, device=hidden_states.device
+    )
+    aiter.smooth_per_token_scaled_quant(
+        a1,
+        hidden_states,
+        a1_scale,
+        smooth_scale,
+        num_rows=num_rows,
+    )
+    return a1, a1_scale
+
+
+def _apply_shared_fc1_smooth(hidden_states, fc1_smooth_scale):
+    if hidden_states.dtype not in [dtypes.fp16, dtypes.bf16]:
+        raise ValueError(
+            "fc1_smooth_scale requires unquantized fp16/bf16 stage1 input; "
+            f"got {hidden_states.dtype}"
+        )
+    model_dim = hidden_states.shape[-1]
+    smooth_scale = _normalize_shared_fc1_smooth_scale(fc1_smooth_scale, model_dim)
+    return hidden_states * smooth_scale.to(dtype=hidden_states.dtype)
+
+
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
 # We can use torch.compile(dynamic=False) to avoid
 @functools.lru_cache(maxsize=2048)
@@ -151,6 +201,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
+    fc1_smooth_scale: Optional[torch.tensor] = None,  # shared [model_dim] or [1, model_dim]
 ):
     if not block_size_M:
         block_size_M = -1
@@ -179,6 +230,7 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        fc1_smooth_scale=fc1_smooth_scale,
     )
 
 
@@ -209,6 +261,7 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    fc1_smooth_scale: Optional[torch.Tensor] = None,  # shared [model_dim]
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -246,6 +299,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    fc1_smooth_scale: Optional[torch.Tensor] = None,  # shared [model_dim]
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -275,6 +329,14 @@ def fused_moe_(
     ], f"Fused_moe unsupported out dtype: {dtype}"
     quant_type = quant_remap.get(quant_type, quant_type)
     q_type2 = quant_remap.get(q_type2, q_type2)
+    if fc1_smooth_scale is not None and quant_type not in [
+        QuantType.per_Token,
+        QuantType.per_1x32,
+    ]:
+        raise ValueError(
+            "fc1_smooth_scale is only supported for per_Token and per_1x32 "
+            "stage1 quant"
+        )
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
@@ -409,6 +471,7 @@ def fused_moe_(
             M=M,
             device=topk_ids.device,
             doweight_stage1=doweight_stage1,
+            fc1_smooth_scale=fc1_smooth_scale,
         )
     else:
         return fused_moe_2stages(
@@ -446,6 +509,7 @@ def fused_moe_(
             intermediate_pad=intermediate_pad,
             bias1=bias1,
             bias2=bias2,
+            fc1_smooth_scale=fc1_smooth_scale,
         )
 
 
@@ -475,6 +539,7 @@ def fused_moe_1stage(
     M: int = None,
     device=None,
     doweight_stage1: bool = None,
+    fc1_smooth_scale=None,  # shared [model_dim] or [1, model_dim]
 ):
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
@@ -494,8 +559,22 @@ def fused_moe_1stage(
         _, model_dim, _ = w2.shape
 
         a8 = torch.empty((M, model_dim), dtype=a8_type, device=device)
-        a8_scale = torch.empty(M, dtype=dtypes.fp32, device=device)
-        aiter.dynamic_per_token_scaled_quant(a8, hidden_states, a8_scale)
+        a8_scale = torch.empty((M, 1), dtype=dtypes.fp32, device=device)
+        if fc1_smooth_scale is not None:
+            smooth_scale = _normalize_shared_fc1_smooth_scale(
+                fc1_smooth_scale, model_dim
+            )
+            aiter.smooth_per_token_scaled_quant(
+                a8,
+                hidden_states,
+                a8_scale,
+                smooth_scale,
+                num_rows=num_local_tokens,
+            )
+        else:
+            aiter.dynamic_per_token_scaled_quant(
+                a8, hidden_states, a8_scale, num_rows=num_local_tokens
+            )
 
         aiter.fmoe_g1u1_tkw1(
             moe_buf,
@@ -517,27 +596,69 @@ def fused_moe_1stage(
     else:
         quant_func = get_quant(quant_type)
         if hidden_states.dtype != q_dtype_a:
-            if quant_type == QuantType.per_1x128:
+            if fc1_smooth_scale is not None:
+                if quant_type == QuantType.per_Token:
+                    a1, a1_scale = _smooth_per_token_quant_stage1(
+                        hidden_states,
+                        fc1_smooth_scale,
+                        q_dtype_a,
+                        num_rows=num_local_tokens,
+                    )
+                elif quant_type == QuantType.per_1x32:
+                    hidden_states_for_quant = _apply_shared_fc1_smooth(
+                        hidden_states, fc1_smooth_scale
+                    )
+                    a1, a1_scale = quant_func(
+                        hidden_states_for_quant,
+                        scale=a1_scale,
+                        quant_dtype=q_dtype_a,
+                        num_rows=num_local_tokens,
+                    )
+                else:
+                    raise ValueError(
+                        "fc1_smooth_scale is only supported for per_Token "
+                        "and per_1x32 "
+                        "stage1 quant"
+                    )
+            elif quant_type == QuantType.per_1x128:
                 quant_func = functools.partial(quant_func, transpose_scale=True)
-            a1, a1_scale = quant_func(
-                hidden_states,
-                scale=a1_scale,
-                quant_dtype=q_dtype_a,
-                num_rows=num_local_tokens,
-            )
+                a1, a1_scale = quant_func(
+                    hidden_states,
+                    scale=a1_scale,
+                    quant_dtype=q_dtype_a,
+                    num_rows=num_local_tokens,
+                )
+            else:
+                a1, a1_scale = quant_func(
+                    hidden_states,
+                    scale=a1_scale,
+                    quant_dtype=q_dtype_a,
+                    num_rows=num_local_tokens,
+                )
         else:
-            assert (
-                a1_scale is not None or quant_type == QuantType.No
-            ), "a1_scale must be provided for quantized input for fused_moe"
-            a1 = hidden_states
-            if quant_type == QuantType.per_1x128:
-                scale_t = torch.empty_like(a1_scale)
-                aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
-                a1_scale = scale_t
+            if fc1_smooth_scale is not None:
+                if quant_type != QuantType.per_1x32:
+                    raise ValueError(
+                        "fc1_smooth_scale requires unquantized stage1 input; "
+                        "hidden_states already has the target quant dtype"
+                    )
+                a1 = _apply_shared_fc1_smooth(hidden_states, fc1_smooth_scale)
+                a1_scale = None
+            else:
+                assert (
+                    a1_scale is not None or quant_type == QuantType.No
+                ), "a1_scale must be provided for quantized input for fused_moe"
+                a1 = hidden_states
+                if quant_type == QuantType.per_1x128:
+                    scale_t = torch.empty_like(a1_scale)
+                    aiter.partial_transpose(
+                        scale_t, a1_scale, num_rows=num_local_tokens
+                    )
+                    a1_scale = scale_t
 
         token_num = hidden_states.shape[0]
         E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape, q_dtype_w=w2.dtype)
-        if quant_type == QuantType.per_1x32:
+        if quant_type == QuantType.per_1x32 and a1_scale is not None:
             a1_scale = mxfp4_moe_sort_fwd(
                 a1_scale,
                 sorted_ids=sorted_ids,
@@ -1376,6 +1497,7 @@ def fused_moe_2stages(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
+    fc1_smooth_scale=None,  # shared [model_dim]
 ):
     quant_func = get_quant(quant_type)
     q_type2 = quant_type if q_type2 is None else QuantType(q_type2)
@@ -1384,6 +1506,14 @@ def fused_moe_2stages(
     q_dtype_a2 = q_dtype_a if q_dtype_a2 is None else q_dtype_a2
     q_dtype_w2 = w2.dtype if q_dtype_w2 is None else q_dtype_w2
     token_num, _ = hidden_states.shape
+    if fc1_smooth_scale is not None and quant_type not in [
+        QuantType.per_Token,
+        QuantType.per_1x32,
+    ]:
+        raise ValueError(
+            "fc1_smooth_scale is only supported for per_Token and per_1x32 "
+            "stage1 quant"
+        )
     if sorted_ids2 is None:
         sorted_ids2 = sorted_ids
     if sorted_weights2 is None:
@@ -1428,7 +1558,11 @@ def fused_moe_2stages(
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
         )
     ):
-        a1 = hidden_states.to(dtype)
+        a1 = (
+            _apply_shared_fc1_smooth(hidden_states, fc1_smooth_scale)
+            if fc1_smooth_scale is not None
+            else hidden_states.to(dtype)
+        )
         a1_scale = None
     elif (
         quant_type == aiter.QuantType.per_1x32
@@ -1437,13 +1571,23 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and activation == aiter.ActivationType.Swiglu
     ):
-        a1 = hidden_states.to(dtypes.fp8)
+        a1_input = (
+            _apply_shared_fc1_smooth(hidden_states, fc1_smooth_scale)
+            if fc1_smooth_scale is not None
+            else hidden_states
+        )
+        a1 = a1_input.to(dtypes.fp8)
         M = sorted_ids.shape[0]
         N = a1.shape[-1]
         a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
 
     elif quant_type == QuantType.per_1x32:
         if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
+            if fc1_smooth_scale is not None:
+                raise ValueError(
+                    "fc1_smooth_scale requires unquantized fp16/bf16 stage1 "
+                    "input; hidden_states is already fp4x2"
+                )
             # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
             # skip re-quantization, only sort the scale
             a1 = hidden_states
@@ -1455,8 +1599,13 @@ def fused_moe_2stages(
                 cols=model_dim,
             )
         else:
+            a1_input = (
+                _apply_shared_fc1_smooth(hidden_states, fc1_smooth_scale)
+                if fc1_smooth_scale is not None
+                else hidden_states
+            )
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
-                hidden_states,
+                a1_input,
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
@@ -1465,15 +1614,34 @@ def fused_moe_2stages(
                 num_rows=num_local_tokens,
             )
     elif hidden_states.dtype != q_dtype_a:
-        if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+        if fc1_smooth_scale is not None:
+            a1, a1_scale = _smooth_per_token_quant_stage1(
+                hidden_states,
+                fc1_smooth_scale,
+                q_dtype_a,
+                num_rows=num_local_tokens,
+            )
+        elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
             quant_func = functools.partial(quant_func, transpose_scale=True)
-        a1, a1_scale = quant_func(
-            hidden_states,
-            scale=a1_scale,
-            quant_dtype=q_dtype_a,
-            num_rows=num_local_tokens,
-        )
+            a1, a1_scale = quant_func(
+                hidden_states,
+                scale=a1_scale,
+                quant_dtype=q_dtype_a,
+                num_rows=num_local_tokens,
+            )
+        else:
+            a1, a1_scale = quant_func(
+                hidden_states,
+                scale=a1_scale,
+                quant_dtype=q_dtype_a,
+                num_rows=num_local_tokens,
+            )
     else:
+        if fc1_smooth_scale is not None:
+            raise ValueError(
+                "fc1_smooth_scale requires unquantized stage1 input; "
+                "hidden_states already has the target quant dtype"
+            )
         assert (
             a1_scale is not None or quant_type == QuantType.No
         ), "a1_scale must be provided for quantized input for fused_moe"
@@ -1535,7 +1703,7 @@ def fused_moe_2stages(
         and (
             q_dtype_a2 in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
-            or (metadata.ksplit > 1 and is_shuffled)
+            or (q_dtype_a2 in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
         )
     ):
         a2_scale = None
