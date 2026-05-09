@@ -246,12 +246,15 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
     const bool is_last_split        = (split_id == kargs.split_k - 1);
     const int  k_valid_in_last_iter = kargs.k - (total_iters - 1) * T::B_K;  // in [1, B_K]
 
+    // num_records is sized from the post-k_start base, so subtract k_start to
+    // keep buffer-rsrc bounds inside the real tensor; otherwise splits with
+    // split_id>0 can expose unmapped VAs and trip a VM fault.
     auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a)
                          + batch_id * kargs.stride_a_batch + row * kargs.stride_a + k_start,
-                         (kargs.m - row) * kargs.stride_a * sizeof(D_A));
+                         ((kargs.m - row) * kargs.stride_a - k_start) * sizeof(D_A));
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b)
                          + batch_id * kargs.stride_b_batch + col * kargs.stride_b + k_start,
-                         (kargs.n - col) * kargs.stride_b * sizeof(D_B));
+                         ((kargs.n - col) * kargs.stride_b - k_start) * sizeof(D_B));
     auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_workspace)
                          + (size_t)split_id  * kargs.batch * kargs.stride_ws_batch
                          + (size_t)batch_id  * kargs.stride_ws_batch
