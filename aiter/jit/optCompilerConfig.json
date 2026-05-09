@@ -138,6 +138,17 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m mla --output_dir {{}}'"
     },
+    "module_mla_v4_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mla_v4.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m mla_v4 --output_dir {{}}'"
+    },
     "module_cache": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/cache_pybind.cu'",

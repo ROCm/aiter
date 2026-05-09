@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// v4 MLA decode kernel registry (mi350 nm-recompile family).
+//
+// Schema columns (consumed by hsa/codegen.py -m mla_v4):
+//   qType         : Q dtype string (fp8 / bf16)
+//   kvType        : KV dtype string (fp8 / bf16)
+//   gqa           : gqa_ratio
+//   sub_Q         : per-WG Q tile (= block_size_x divisor; matches poc_kl `sub_Q`)
+//   page_size     : KV page size
+//   num_kv_splits : == poc_kl `passes`
+//   prefill       : 0 for decode, reserved for future prefill variants
+//   causal        : 0 for non-causal, reserved
+//   knl_name      : kernel symbol in the .co
+//   co_name       : .co file path relative to this CSV's directory
+//
+// Required columns last (per codegen.py convention): knl_name, co_name.
+qType,kvType,gqa,sub_Q,page_size,num_kv_splits,prefill,causal,knl_name,co_name
+fp8,fp8,16,64,1,1,0,0,_ZN5aiter42mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmpE,mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmp.co

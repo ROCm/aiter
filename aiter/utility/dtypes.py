@@ -39,6 +39,15 @@ d_dtypes = {name: globals()[name] for name in aiter_dtypes}
 globals().update({f"AITER_DTYPE_{name}": idx for name, idx in aiter_dtypes.items()})
 _torch_to_aiter_dtype = {globals()[name]: idx for name, idx in aiter_dtypes.items()}
 
+# Both e4m3fn (OCP) and e4m3fnuz (ROCm NUZ) are valid FP8 variants at the
+# byte level for kernels that just read raw FP8 bytes. Map both torch dtypes
+# to the same AITER_DTYPE_fp8 enum so the strict dtype check in
+# torch_to_aiter() / torch_to_aiter_pybind() accepts whichever variant the
+# caller has — letting v3/v4 MLA tests use either dtype interchangeably.
+if "fp8" in aiter_dtypes:
+    for _alt_fp8 in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        _torch_to_aiter_dtype.setdefault(_alt_fp8, aiter_dtypes["fp8"])
+
 
 def torch_to_aiter_pybind(tensor: torch.Tensor):
     """Convert torch.Tensor to pybind aiter_tensor_t for passing to C++ ops.

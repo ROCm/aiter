@@ -973,3 +973,74 @@ def mla_prefill_reduce(
             )  # [tile_q, v_head_dim]
 
             output[qo_start:qo_end, head_idx, :] = final_output[:q_len, :]
+
+
+# ---------------------------------------------------------------------------
+# DSv4 MLA — additive entry point. Does NOT touch any existing
+#   gqa_ratio=16, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
+# ---------------------------------------------------------------------------
+def mla_decode_fwd_v4_nm(
+    q,                    # [total_query_len, num_heads, head_size]   FP8 packed Q+e8m0
+    qrope,                # [total_query_len, num_heads, kv_rotary]   BF16
+    kv_buffer,            # [num_page, page_size, num_kv_heads, dim_qk_packed]
+    kvrope,               # [num_page, page_size, num_kv_heads, kv_rotary]
+    output,               # [total_query_len, num_heads, v_head_dim]  BF16 (used for out_16_nosplit=1)
+    qo_indptr,            # [num_seqs+1]
+    kv_indptr,            # [num_seqs+1]
+    kv_page_indices,      # [num_page_used]
+    kv_last_page_lens,    # [num_seqs]
+    split_indptr,         # [num_seqs+1]
+    max_seqlen_q,
+    sm_scale=None,        # ignored on v4 nm; kernel hardcodes 1/sqrt(512)
+    out_16_nosplit=0,
+    num_kv_splits=1,
+    sub_Q=64,
+    logits=None,
+    attn_lse=None,
+):
+    """v4 nm-recompile MLA decode forward (mi350 / gfx950 wave64).
+
+    Routes through the canonical aiter JIT C-ABI module
+    `module_mla_v4_asm` (csrc/py_itfs_cu/asm_mla_v4.cu). Returns
+    (logits, attn_lse) — caller is responsible for any post-reduce /
+    final-O work.
+
+    logits/attn_lse may be pre-allocated (e.g. for SENTINEL pre-fill in
+    correctness tests); if not, we allocate the canonical 5D layout
+    `[num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim]`
+    (and `[..., 1]` for attn_lse) inferred from the input shapes.
+    """
+    num_seqs = qo_indptr.shape[0] - 1
+    num_heads = q.size(1)
+    v_head_dim = output.size(2)
+    num_kv_heads = kv_buffer.size(2)
+    gqa_ratio = num_heads // num_kv_heads
+    q_seq_lens_internal = gqa_ratio * max_seqlen_q
+
+    if logits is None:
+        logits = torch.empty(
+            (num_seqs, num_kv_splits, num_kv_heads, q_seq_lens_internal, v_head_dim),
+            dtype=dtypes.fp32, device=q.device,
+        )
+    if attn_lse is None:
+        attn_lse = torch.empty(
+            (num_seqs, num_kv_splits, num_kv_heads, q_seq_lens_internal, 1),
+            dtype=dtypes.fp32, device=q.device,
+        )
+
+    # softmax_scale is ignored by the v4 nm kernel (hardcodes 1/sqrt(512));
+    # we still pass *something* through to satisfy the C ABI.
+    sm_scale_arg = 0.0 if sm_scale is None else float(sm_scale)
+
+    aiter.mla_decode_v4_asm(
+        q, qrope, kv_buffer, kvrope,
+        qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens,
+        split_indptr,
+        max_seqlen_q,
+        sm_scale_arg,
+        int(out_16_nosplit),
+        int(sub_Q),
+        int(num_kv_splits),
+        logits, attn_lse, output,
+    )
+    return logits, attn_lse
