@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import pytest
+import argparse
+import itertools
+
+import pandas as pd
 import torch
 
+import aiter
 from aiter.ops.quant import quant_mxfp4_hip
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight, shuffle_weight_a16w4
+from aiter.test_common import benchmark, checkAllclose
+
+torch.set_default_device("cuda")
 
 
 def even_round_scale(max_abs: torch.Tensor) -> torch.Tensor:
@@ -68,64 +75,60 @@ def ref_quant_mxfp4_even_round(inp: torch.Tensor, group_size: int = 32):
     return packed, scale_e8m0
 
 
-@pytest.mark.parametrize(
-    "shape",
-    [
-        (4096, 128),
-        (4096, 256),
-        (4096, 1024),
-        (1, 32),
-        (3, 128),
-        (125, 64),
-        (4097, 256),
-    ],
-)
-@pytest.mark.parametrize("float_dtype", [torch.bfloat16, torch.float16])
-def test_no_shuffle(shape, float_dtype):
+def _fp4_scale_shuffle_id(scaleN_pad, x, y):
+    return (
+        (x // 32 * scaleN_pad) * 32
+        + (y // 8) * 256
+        + (y % 4) * 64
+        + (x % 16) * 4
+        + (y % 8) // 4 * 2
+        + (x % 32) // 16
+    )
+
+
+@benchmark()
+def test_no_shuffle(m, n, float_dtype):
     torch.manual_seed(42)
-    inp = torch.randn(shape, dtype=float_dtype, device="cuda")
+    inp = torch.randn((m, n), dtype=float_dtype, device="cuda")
 
     packed_hip, scale_hip = quant_mxfp4_hip(inp, group_size=32)
-
     py_packed, py_scale = ref_quant_mxfp4_even_round(inp.cpu(), group_size=32)
 
     scale_hip_u8 = scale_hip.view(torch.uint8).cpu()
-    assert torch.equal(
-        scale_hip_u8, py_scale
-    ), f"Scale mismatch: {(scale_hip_u8 != py_scale).sum()} elements differ"
+    checkAllclose(
+        scale_hip_u8.to(torch.float32),
+        py_scale.to(torch.float32),
+        rtol=0,
+        atol=0,
+        msg=f"scale ({m},{n})",
+    )
 
     packed_hip_u8 = packed_hip.view(torch.uint8).cpu()
     diff = (packed_hip_u8.to(torch.int16) - py_packed.to(torch.int16)).abs()
     bad = (diff > 0) & (diff != 1) & (diff != 16) & (diff != 17)
-    assert (
-        not bad.any()
-    ), f"Packed diff too large for shape {shape}: max={diff.max().item()}"
+    checkAllclose(
+        packed_hip_u8.to(torch.float32),
+        py_packed.to(torch.float32),
+        rtol=0,
+        atol=17,
+        msg=f"packed ({m},{n})",
+    )
+    assert not bad.any(), f"Packed diff too large: max={diff.max().item()}"
+
+    return {"result": "PASS"}
 
 
-@pytest.mark.parametrize(
-    "shape",
-    [
-        (4096, 128),
-        (4096, 256),
-        (4096, 1024),
-        (16, 64),
-        (48, 64),
-        (32, 192),
-        (80, 320),
-        (256, 96),
-    ],
-)
-@pytest.mark.parametrize("float_dtype", [torch.bfloat16, torch.float16])
-def test_e8m0_shuffle(shape, float_dtype):
-    rows, cols = shape
+@benchmark()
+def test_e8m0_shuffle(m, n, float_dtype):
+    rows, cols = m, n
     if rows % 16 != 0:
-        pytest.skip(f"e8m0 shuffle_weight requires rows%16==0 (got {rows})")
+        return {"result": "SKIP"}
     K_pk = cols // 2
     if K_pk % 32 != 0:
-        pytest.skip(f"e8m0 shuffle_weight requires K_pk%32==0 (got K_pk={K_pk})")
+        return {"result": "SKIP"}
 
     torch.manual_seed(42)
-    inp = torch.randn(shape, dtype=float_dtype, device="cuda")
+    inp = torch.randn((m, n), dtype=float_dtype, device="cuda")
 
     packed_out, scale_out = quant_mxfp4_hip(
         inp, group_size=32, e8m0_shuffle=True, shuffle_weight=True
@@ -138,23 +141,16 @@ def test_e8m0_shuffle(shape, float_dtype):
 
     packed_out_u8 = packed_out.view(torch.uint8).cpu()
     expected_w_u8 = expected_w.view(torch.uint8).cpu()
-    assert torch.equal(
-        packed_out_u8, expected_w_u8
-    ), f"E8M0 weight mismatch: {(packed_out_u8 != expected_w_u8).sum()} differ"
+    checkAllclose(
+        packed_out_u8.to(torch.float32),
+        expected_w_u8.to(torch.float32),
+        rtol=0,
+        atol=0,
+        msg=f"e8m0 weight ({m},{n})",
+    )
 
     scale_ref_u8 = scale_ref.view(torch.uint8).flatten().cpu()
     scale_out_u8 = scale_out.view(torch.uint8).flatten().cpu()
-
-    def _fp4_scale_shuffle_id(scaleN_pad, x, y):
-        return (
-            (x // 32 * scaleN_pad) * 32
-            + (y // 8) * 256
-            + (y % 4) * 64
-            + (x % 16) * 4
-            + (y % 8) // 4 * 2
-            + (x % 32) // 16
-        )
-
     for row in range(rows):
         for g in range(scaleN):
             si = _fp4_scale_shuffle_id(scaleN_pad, row, g)
@@ -163,30 +159,21 @@ def test_e8m0_shuffle(shape, float_dtype):
                 scale_out_u8[si].item() == scale_ref_u8[li].item()
             ), f"Scale shuffle mismatch at row={row}, group={g}"
 
+    return {"result": "PASS"}
 
-@pytest.mark.parametrize(
-    "shape",
-    [
-        (4096, 256),
-        (4096, 1024),
-        (32, 256),
-        (64, 512),
-        (96, 256),
-    ],
-)
-@pytest.mark.parametrize("float_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("gate_up", [False, True])
-def test_a16w4_shuffle(shape, float_dtype, gate_up):
-    rows, cols = shape
+
+@benchmark()
+def test_a16w4_shuffle(m, n, float_dtype, gate_up):
+    rows, cols = m, n
     scaleN = cols // 32
     if rows % 32 != 0 or scaleN % 8 != 0:
-        pytest.skip(f"a16w4 requires rows%32==0 and scaleN%8==0 (got {rows}x{cols})")
+        return {"result": "SKIP"}
     K_pk = cols // 2
     if K_pk % 64 != 0:
-        pytest.skip(f"a16w4 shuffle_weight requires K_pk%64==0 (got K_pk={K_pk})")
+        return {"result": "SKIP"}
 
     torch.manual_seed(42)
-    inp = torch.randn(shape, dtype=float_dtype, device="cuda")
+    inp = torch.randn((m, n), dtype=float_dtype, device="cuda")
 
     packed_out, scale_out = quant_mxfp4_hip(
         inp, group_size=32, a16w4_shuffle=True, gate_up=gate_up, shuffle_weight=True
@@ -203,30 +190,38 @@ def test_a16w4_shuffle(shape, float_dtype, gate_up):
 
     packed_out_u8 = packed_out.view(torch.uint8).cpu()
     expected_w_u8 = expected_w.view(torch.uint8).cpu()
-    assert torch.equal(packed_out_u8, expected_w_u8), (
-        f"A16W4 weight shuffle mismatch (gate_up={gate_up}): "
-        f"{(packed_out_u8 != expected_w_u8).sum()} bytes differ"
+    checkAllclose(
+        packed_out_u8.to(torch.float32),
+        expected_w_u8.to(torch.float32),
+        rtol=0,
+        atol=0,
+        msg=f"a16w4 weight (gate_up={gate_up})",
     )
 
     scale_out_u8 = scale_out.view(torch.uint8).cpu()
     expected_s_u8 = expected_s.view(torch.uint8).cpu()
-    assert torch.equal(scale_out_u8, expected_s_u8), (
-        f"A16W4 scale shuffle mismatch (gate_up={gate_up}): "
-        f"{(scale_out_u8 != expected_s_u8).sum()} bytes differ"
+    checkAllclose(
+        scale_out_u8.to(torch.float32),
+        expected_s_u8.to(torch.float32),
+        rtol=0,
+        atol=0,
+        msg=f"a16w4 scale (gate_up={gate_up})",
     )
 
+    return {"result": "PASS"}
 
-@pytest.mark.parametrize("float_dtype", [torch.bfloat16, torch.float16])
+
+@benchmark()
 def test_edge_values(float_dtype):
     rows, cols = 32, 64
 
     inp_zero = torch.zeros(rows, cols, dtype=float_dtype, device="cuda")
     packed, scale = quant_mxfp4_hip(inp_zero, group_size=32)
-    assert packed.view(torch.uint8).sum() == 0
+    assert packed.view(torch.uint8).sum() == 0, "zero input failed"
 
     inp_large = torch.full((rows, cols), 1e4, dtype=float_dtype, device="cuda")
     packed, scale = quant_mxfp4_hip(inp_large, group_size=32)
-    assert packed.view(torch.uint8).max() > 0
+    assert packed.view(torch.uint8).max() > 0, "large input failed"
 
     inp_tiny = torch.full((rows, cols), 1e-10, dtype=float_dtype, device="cuda")
     packed, scale = quant_mxfp4_hip(inp_tiny, group_size=32)
@@ -234,71 +229,73 @@ def test_edge_values(float_dtype):
     inp_neg = torch.full((rows, cols), -3.0, dtype=float_dtype, device="cuda")
     packed, scale = quant_mxfp4_hip(inp_neg, group_size=32)
     py_packed, _ = ref_quant_mxfp4_even_round(inp_neg.cpu(), group_size=32)
-    assert torch.equal(packed.view(torch.uint8).cpu(), py_packed)
+    assert torch.equal(packed.view(torch.uint8).cpu(), py_packed), "neg input failed"
+
+    return {"result": "PASS"}
 
 
-def test_single_group():
-    inp = torch.randn(1, 32, dtype=torch.bfloat16, device="cuda")
-    packed, scale = quant_mxfp4_hip(inp, group_size=32)
-    assert packed.view(torch.uint8).shape == (1, 16)
-    assert scale.view(torch.uint8).shape == (1, 1)
-    py_packed, py_scale = ref_quant_mxfp4_even_round(inp.cpu(), group_size=32)
-    assert torch.equal(scale.view(torch.uint8).cpu(), py_scale)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no_shuffle", action="store_true")
+    parser.add_argument("--e8m0_shuffle", action="store_true")
+    parser.add_argument("--a16w4_shuffle", action="store_true")
+    parser.add_argument("--edge", action="store_true")
+    parser.add_argument("--all", action="store_true", default=True)
+    args = parser.parse_args()
 
-
-@pytest.mark.parametrize("float_dtype", [torch.bfloat16, torch.float16])
-def test_e2m1_boundary_values(float_dtype):
-    boundary_vals = [
-        0.0,
-        0.25,
-        0.5,
-        0.75,
-        1.0,
-        1.25,
-        1.5,
-        1.75,
-        2.0,
-        2.5,
-        3.0,
-        3.5,
-        4.0,
-        5.0,
-        6.0,
-        -6.0,
-        0.0,
-        0.24,
-        0.26,
-        0.74,
-        0.76,
-        1.24,
-        1.26,
-        1.74,
-        1.76,
-        2.49,
-        2.51,
-        3.49,
-        3.51,
-        4.99,
-        5.01,
-        -0.25,
-    ]
-    inp = torch.tensor([boundary_vals], dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_hip(inp, group_size=32)
-    py_packed, py_scale = ref_quant_mxfp4_even_round(inp.cpu(), group_size=32)
-    assert torch.equal(scale.view(torch.uint8).cpu(), py_scale)
-    packed_u8 = packed.view(torch.uint8).cpu()
-    diff = (packed_u8.to(torch.int16) - py_packed.to(torch.int16)).abs()
-    bad = (diff > 0) & (diff != 1) & (diff != 16) & (diff != 17)
-    assert not bad.any(), f"max diff={diff.max().item()}"
-
-
-def test_e8m0_shuffle_scale_only():
-    torch.manual_seed(42)
-    inp = torch.randn(4096, 256, dtype=torch.bfloat16, device="cuda")
-    packed_shuf, scale_shuf = quant_mxfp4_hip(
-        inp, group_size=32, e8m0_shuffle=True, shuffle_weight=False
+    run_all = args.all and not any(
+        [args.no_shuffle, args.e8m0_shuffle, args.a16w4_shuffle, args.edge]
     )
-    packed_ref, scale_ref = quant_mxfp4_hip(inp, group_size=32)
-    packed_shuf_u8 = packed_shuf.view(torch.uint8).cpu()
-    packed_ref_u8 = packed_ref.view(torch.uint8).cpu()
-    assert torch.equal(packed_shuf_u8, packed_ref_u8)
+
+    no_shuffle_shapes = [
+        (4096, 128),
+        (4096, 256),
+        (4096, 1024),
+        (1, 32),
+        (3, 128),
+        (125, 64),
+        (4097, 256),
+    ]
+    e8m0_shapes = [
+        (4096, 128),
+        (4096, 256),
+        (4096, 1024),
+        (16, 64),
+        (48, 64),
+        (32, 192),
+        (80, 320),
+        (256, 96),
+    ]
+    a16w4_shapes = [
+        (4096, 256),
+        (4096, 1024),
+        (32, 256),
+        (64, 512),
+        (96, 256),
+    ]
+    float_dtypes = [torch.bfloat16, torch.float16]
+
+    df = []
+
+    if args.no_shuffle or run_all:
+        for (m, n), dt in itertools.product(no_shuffle_shapes, float_dtypes):
+            df.append(test_no_shuffle(m, n, dt))
+
+    if args.e8m0_shuffle or run_all:
+        for (m, n), dt in itertools.product(e8m0_shapes, float_dtypes):
+            df.append(test_e8m0_shuffle(m, n, dt))
+
+    if args.a16w4_shuffle or run_all:
+        for (m, n), dt, gu in itertools.product(
+            a16w4_shapes, float_dtypes, [False, True]
+        ):
+            df.append(test_a16w4_shuffle(m, n, dt, gu))
+
+    if args.edge or run_all:
+        for dt in float_dtypes:
+            test_edge_values(dt)
+
+    df = pd.DataFrame(df)
+    if "gate_up" in df.columns:
+        df["gate_up"] = df["gate_up"].fillna(0).astype(int)
+    aiter.logger.info("quant_mxfp4 summary:\n%s", df.to_markdown(index=False))

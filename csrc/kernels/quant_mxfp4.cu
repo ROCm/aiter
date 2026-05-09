@@ -9,6 +9,8 @@
 
 namespace aiter {
 
+// Even: e8m0 scale via even-rounding group max to nearest power-of-2.
+//   gfx950: HW builtin (exact RNE); gfx942: SW fallback (round-half-away).
 enum class MxFp4RoundMode : int { Even = 0 };
 
 #define EVEN_ROUND_FP32_SIGN_EXP_MASK 0x7F800000u

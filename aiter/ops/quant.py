@@ -707,6 +707,13 @@ def quant_mxfp4_hip(
     gate_up: bool = False,
     shuffle_weight: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP4 quantization with optional weight/scale shuffle.
+
+    Args:
+        round_mode: 0 = Even — e8m0 scale via even-rounding group max
+            to nearest power-of-2. gfx950 uses HW builtin (exact RNE);
+            gfx942 uses SW fallback (round-half-away).
+    """
     assert x.is_contiguous() and x.dim() == 2
     assert x.dtype in (torch.float16, torch.bfloat16)
     rows, cols = x.shape
