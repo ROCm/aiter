@@ -103,8 +103,16 @@ def build_sage_attn_cdna_module(
 
     # For Int8 MFMA: mfma_i32_32x32x32_i8 accumulates K=32 per call
     MFMA_K_INT8 = 32
-    # For BF16 MFMA: mfma_f32_32x32x16_bf16 accumulates K=16 per call
+    # For BF16 MFMA: mfma_f32_32x32x16_bf16 accumulates K=16 per call (legacy/unused)
     MFMA_K_BF16 = 16
+    # For FP8 K=64 MFMA: mfma_scale_f32_32x32x64_f8f6f4 accumulates K=64 per call.
+    MFMA_K_FP8 = 64
+
+    # FP8 (gfx950 e4m3fn) max representable magnitude. Used to scale P into [0, 1]
+    # → [0, FP8_MAX] before fp8 cast. Since P = exp2(s - m_new) ∈ [0, 1] by
+    # construction (per-row max of P is exactly 1.0), p_amax = 1.0.
+    FP8_MAX = 448.0
+    INV_FP8_MAX = 1.0 / FP8_MAX
 
     ROWS_PER_WAVE = MFMA_M  # 32 output rows per wave
 
@@ -123,13 +131,12 @@ def build_sage_attn_cdna_module(
     D_CHUNK = MFMA_N  # 16 columns per MFMA output fragment
     D_CHUNKS = head_dim // D_CHUNK
 
-    # K steps for GEMM2 per BLOCK_N tile: BLOCK_N // MFMA_K_BF16
-    PV_K_STEPS = BLOCK_N // MFMA_K_BF16
+    # K steps for GEMM2 per BLOCK_N tile: BLOCK_N // MFMA_K_FP8
+    PV_K_STEPS = BLOCK_N // MFMA_K_FP8
 
     assert head_dim % MFMA_K_INT8 == 0, f"head_dim {head_dim} must be divisible by {MFMA_K_INT8}"
-    assert head_dim % MFMA_K_BF16 == 0, f"head_dim {head_dim} must be divisible by {MFMA_K_BF16}"
     assert BLOCK_M % ROWS_PER_WAVE == 0
-    assert BLOCK_N % MFMA_K_BF16 == 0
+    assert BLOCK_N % MFMA_K_FP8 == 0
 
     if sm_scale is None:
         sm_scale = 1.0 / host_math.sqrt(head_dim)
@@ -143,14 +150,25 @@ def build_sage_attn_cdna_module(
     STRIDE_TOKEN = NUM_Q_HEADS * HEAD_DIM
     KV_STRIDE_TOKEN = NUM_KV_HEADS * HEAD_DIM
 
-    # LDS layout for K (Int8) and V (BF16 after cast)
-    # Add padding to reduce bank conflicts
-    K_STRIDE = HEAD_DIM + 8    # extra 8 bytes padding for Int8 rows
-    V_STRIDE = HEAD_DIM + 4    # extra 4 BF16 elements padding for BF16 rows
+    # LDS layout
+    # K: row-major BLOCK_N × HEAD_DIM (Int8, 1 byte/elem). +8 byte pad per row.
+    # V: COLUMN-MAJOR HEAD_DIM × BLOCK_N (FP8 raw bytes, 1 byte/elem). +8 byte
+    #    pad per V "row" (= V "column" in the original BLOCK_N×HEAD_DIM view).
+    #    Storing V transposed in LDS makes per-lane PV reads contiguous in K
+    #    (32 contiguous bytes at fixed d), enabling 2× ds_read_b128 instead of
+    #    32× ds_read_u8.
+    K_STRIDE = HEAD_DIM + 8    # extra 8 bytes padding for Int8 K rows
+    # Pad V "row" stride to a 16-byte multiple so loads can issue as ds_read_b128.
+    # BLOCK_N=128 + 16 = 144 bytes per row.
+    V_STRIDE = BLOCK_N + 16
 
     # Cooperative load parameters
     VEC_WIDTH_K = 16   # 16 Int8 elements = 16 bytes per thread
-    VEC_WIDTH_V = 8    # 8 BF16 elements = 16 bytes per thread
+    # V coop load: each thread reads 16 contiguous FP8 bytes from one global
+    # V row (16 d-positions) and SCATTERS them as 16 separate bytes into the
+    # column-major LDS at 16 different LDS rows (the d-positions), same LDS
+    # column (the kv_row).
+    VEC_WIDTH_V = 16   # 16 FP8 bytes per thread (one global vec load)
     THREADS_PER_ROW_K = HEAD_DIM // VEC_WIDTH_K
     THREADS_PER_ROW_V = HEAD_DIM // VEC_WIDTH_V
     ROWS_PER_BATCH_K = BLOCK_SIZE // THREADS_PER_ROW_K
@@ -170,14 +188,9 @@ def build_sage_attn_cdna_module(
         NUM_BATCHES_V = BLOCK_N // ROWS_PER_BATCH_V
         V_NEEDS_GUARD = False
 
-    LDS_K_TILE = BLOCK_N * K_STRIDE
-    LDS_V_TILE = BLOCK_N * V_STRIDE
-    LDS_V_BASE = LDS_K_TILE
-
-    # Int8 occupies 1 byte; BF16 occupies 2 bytes.
-    # Allocate LDS for K in Int8 and V in BF16 (2 bytes each).
+    # V LDS section: HEAD_DIM rows × V_STRIDE bytes per row.
     LDS_K_BYTES = BLOCK_N * K_STRIDE * 1   # 1 byte per Int8
-    LDS_V_BYTES = BLOCK_N * V_STRIDE * 2   # 2 bytes per BF16
+    LDS_V_BYTES = HEAD_DIM * V_STRIDE * 1  # 1 byte per FP8 (column-major view)
     LDS_TOTAL_BYTES = LDS_K_BYTES + LDS_V_BYTES
 
     # We store K as i8 and V as bf16. Because the SmemAllocator works in elements
@@ -193,7 +206,7 @@ def build_sage_attn_cdna_module(
         global_sym_name=f"sage_attn_cdna_smem_M{BLOCK_M}N{BLOCK_N}_{path_tag}",
     )
     lds_base_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_base_offset + LDS_TOTAL_I8_ELEMS * 2  # *2 for safety
+    allocator.ptr = lds_base_offset + LDS_TOTAL_I8_ELEMS
 
     # Architecture-specific FP8 type (gfx942: fnuz, gfx950: fn)
     # Deferred: MLIR types must be constructed inside an active MLIR Context,
@@ -205,7 +218,7 @@ def build_sage_attn_cdna_module(
     # call the raw ODS class directly with positional arguments.
     from flydsl._mlir.dialects._rocdl_ops_gen import (
         mfma_i32_32x32x32_i8 as _ods_mfma_i32_32x32x32_i8,
-        mfma_f32_32x32x16_bf16 as _ods_mfma_f32_32x32x16_bf16,
+        mfma_scale_f32_32x32x64_f8f6f4 as _ods_mfma_scale_f32_32x32x64_f8f6f4,
     )
 
     def mfma_i32_k32(result_type, operands):
@@ -220,16 +233,23 @@ def build_sage_attn_cdna_module(
             res=result_type, a=a_v, b=b_v, c=c_v, cbsz=cbsz, abid=abid, blgp=blgp,
         ).result
 
-    def mfma_bf16_k16(result_type, operands):
-        a, b, c = operands[0], operands[1], operands[2]
-        cbsz = operands[3] if len(operands) > 3 else 0
-        abid = operands[4] if len(operands) > 4 else 0
-        blgp = operands[5] if len(operands) > 5 else 0
+    def mfma_fp8_k64(result_type, a, b, c, scale_a, scale_b):
+        """rocdl.mfma.scale.f32.32x32x64.f8f6f4 (fp8 * fp8) wrapper.
+
+        a, b: vector<8xi32> per lane (= 32 fp8 bytes per lane).
+        c: vector<16xf32> per lane (accumulator; same layout as 32x32x16_bf16).
+        scale_a, scale_b: i32 (e8m0). Pass 127 for "no scaling" (1.0 multiplier).
+        opselA=opselB=0 selects the FP8 path.
+        """
         a_v = a.ir_value() if hasattr(a, "ir_value") and not isinstance(a, ir.Value) else a
         b_v = b.ir_value() if hasattr(b, "ir_value") and not isinstance(b, ir.Value) else b
         c_v = c.ir_value() if hasattr(c, "ir_value") and not isinstance(c, ir.Value) else c
-        return _ods_mfma_f32_32x32x16_bf16(
-            res=result_type, a=a_v, b=b_v, c=c_v, cbsz=cbsz, abid=abid, blgp=blgp,
+        return _ods_mfma_scale_f32_32x32x64_f8f6f4(
+            res=result_type,
+            a=a_v, b=b_v, c=c_v,
+            cbsz=0, blgp=0,
+            opselA=0, scaleA=scale_a,
+            opselB=0, scaleB=scale_b,
         ).result
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
@@ -277,7 +297,9 @@ def build_sage_attn_cdna_module(
         v16f32_type = Vec.make_type(16, fx.Float32)
         # MFMA 32x32x32_i8: A/B = v4i32 (=16xi8 per lane), C/D = v16i32 per lane (wave64)
         v8i8_type = Vec.make_type(8, fx.Int8)
-        # MFMA 32x32x16_bf16: A/B = v8bf16, C/D = v16f32 per lane (wave64)
+        # MFMA 32x32x64_f8f6f4: A/B = v8i32 (=32xi8 per lane), C/D = v16f32 per lane (wave64)
+        v8i32_type = Vec.make_type(8, fx.Int32)
+        v32i8_type = Vec.make_type(32, fx.Int8)
         v4bf16_type = Vec.make_type(4, fx.BFloat16)
         v16i8_type = Vec.make_type(16, fx.Int8)
         v8bf16_type = Vec.make_type(8, fx.BFloat16)
@@ -288,12 +310,23 @@ def build_sage_attn_cdna_module(
         seq_len_k_v = fx.Index(seq_len_k)
 
         base_ptr = allocator.get_base()
-        # Shared LDS as Int8 view (K stored as i8, V as bf16 in upper half)
+        # Shared LDS as Int8 view (K stored as i8 row-major; V as i8 column-major
+        # in the upper half).
         lds = SmemPtr(
             base_ptr,
             lds_base_offset,
             T.i8,
             shape=(LDS_TOTAL_I8_ELEMS,),
+        ).get()
+        # Separate, smaller, statically-shaped view for V — gives the LLVM
+        # backend a tight bound that helps prove 16-byte alignment for
+        # vector loads, so they can lower to ds_read_b128 instead of
+        # 32× ds_read_u8.
+        lds_v = SmemPtr(
+            base_ptr,
+            lds_base_offset + LDS_K_BYTES,
+            T.i8,
+            shape=(LDS_V_BYTES,),
         ).get()
 
         block_id = fx.Index(gpu.block_idx.x)
@@ -452,38 +485,25 @@ def build_sage_attn_cdna_module(
                     vec = _load_ptr_i8_vec16(k_ptr, g_idx)
                     Vec(vec).store(lds, [lds_idx])
 
-        # V is stored in the upper half of LDS as BF16.
-        # LDS is i8 view; V BF16 elements start at byte LDS_K_BYTES.
-        # We use a bf16 view offset: each BF16 is 2 bytes → byte_offset // 2 for bf16 index.
-        # But we work entirely in byte offsets for i8 LDS array.
+        # V is stored in the upper half of LDS, COLUMN-MAJOR (transposed):
+        # the LDS V section is HEAD_DIM rows × V_STRIDE bytes per row, where
+        # row index = d (0..HEAD_DIM-1) and the first BLOCK_N bytes of each row
+        # hold consecutive kv positions (column = kv_row).
+        # Storing V transposed makes per-lane PV reads be 32 contiguous bytes
+        # (one ds_read_b256 = 2 ds_read_b128) at fixed d, kv_row=k_start..+31.
         LDS_V_BYTE_BASE = LDS_K_BYTES  # byte offset of V section
 
-        _fp8_mlir_type = _fp8_mlir_type_cls.get()
-
-        # Packed FP8→F32 conversion: rocdl.cvt.pk.f32.fp8 unpacks 2 of the 4
-        # FP8 bytes in an i32 src into vector<2xf32> per call (wordSel False/True).
-        # 8 FP8 bytes → 2 i32 words → 4 packed cvt ops → 8 f32. This is ~50 %
-        # fewer cvt instructions than the per-byte variant.
-        _cvt_pk_f32_fp8 = rocdl.CvtPkF32Fp8Op
-        v2f32_type = Vec.make_type(2, fx.Float32)
-        v2i32_type = Vec.make_type(2, fx.Int32)
-
         def coop_load_v(tile_start):
-            """Load V from global (FP8) → convert to BF16 → single vec16 LDS store.
+            """Load V from global (FP8 raw bytes) → write transposed to LDS.
 
-            Per cooperative-load batch:
-              1. v8i8 global load (8 FP8 bytes per thread)
-              2. Reinterpret as v2i32, run 4 packed CvtPkF32Fp8 ops → 8 f32
-              3. Truncate to v8bf16, bitcast to v16i8
-              4. One 16-byte LDS store (vs 16 single-byte stores previously)
+            Each thread reads VEC_WIDTH_V=16 contiguous FP8 bytes from one
+            global V row (16 d-positions for one kv_row) and SCATTERS them as
+            16 individual byte writes to LDS at 16 different LDS rows
+            (the d-positions), same LDS column (= kv_row within the BLOCK_N tile).
 
-            For rows beyond seq_len_k we clamp the load address to row 0 and
-            zero the resulting v8bf16 to prevent 0 * NaN = NaN in the PV MFMA.
+            For rows beyond seq_len_k, we clamp the load address to row 0 and
+            zero the resulting bytes to prevent 0 * NaN = NaN in the PV MFMA.
             """
-            zero_v8bf16 = Vec.from_elements(
-                [arith.constant(0.0, type=T.bf16) for _ in range_constexpr(8)],
-                fx.BFloat16,
-            ).ir_value()
             for batch in range_constexpr(NUM_BATCHES_V):
                 row_offset = batch * ROWS_PER_BATCH_V
                 row_idx_raw = tile_start + load_row_v_batch + row_offset
@@ -496,37 +516,22 @@ def build_sage_attn_cdna_module(
                     do_load = True
                 if do_load:
                     g_idx = kv_global_idx(row_idx, load_col_v_base)
-                    raw_v = _load_ptr_f8_vec8(v_ptr, g_idx)  # v8i8
+                    raw_v = _load_ptr_i8_vec16(v_ptr, g_idx)  # v16i8
 
-                    # Reinterpret 8 FP8 bytes as 2 packed i32 words.
-                    pair_i32 = vector.bitcast(v2i32_type, raw_v)
-                    bf16_elems = []
-                    for word in range_constexpr(2):
-                        w_i32 = vector.extract(
-                            pair_i32, static_position=[word], dynamic_position=[]
+                    # Lane's kv_row within the BLOCK_N tile (= LDS column index).
+                    lds_col = load_row_v_batch + row_offset
+                    # Zero out the 16 bytes for OOB rows.
+                    zero_v16i8 = Vec.filled(16, 0, fx.Int8).ir_value()
+                    raw_v = ArithValue(kv_in_bounds).select(raw_v, zero_v16i8)
+
+                    # Scatter: 16 individual ds_write_u8 to 16 different LDS rows.
+                    for di in range_constexpr(VEC_WIDTH_V):
+                        d_idx = load_col_v_base + di
+                        v_off = d_idx * V_STRIDE + lds_col
+                        b_i8 = vector.extract(
+                            raw_v, static_position=[di], dynamic_position=[]
                         )
-                        # Lo pair (FP8 bytes 0,1) and hi pair (bytes 2,3).
-                        pk_lo = _cvt_pk_f32_fp8(v2f32_type, w_i32, False).res
-                        pk_hi = _cvt_pk_f32_fp8(v2f32_type, w_i32, True).res
-                        for half, pk in ((0, pk_lo), (1, pk_hi)):
-                            for elem in range_constexpr(2):
-                                f32_e = vector.extract(
-                                    pk, static_position=[elem], dynamic_position=[]
-                                )
-                                bf16_elems.append(arith.TruncFOp(T.bf16, f32_e).result)
-
-                    v8bf16 = Vec.from_elements(bf16_elems, fx.BFloat16).ir_value()
-                    # Force the whole vector to zero for OOB rows.
-                    v8bf16 = ArithValue(kv_in_bounds).select(v8bf16, zero_v8bf16)
-                    # Bitcast to v16i8 so we can store into the i8-typed LDS view.
-                    v16i8_val = vector.bitcast(v16i8_type, v8bf16)
-
-                    lds_row = load_row_v_batch + row_offset
-                    base_off = (
-                        LDS_V_BYTE_BASE
-                        + (lds_row * V_STRIDE + load_col_v_base) * 2
-                    )
-                    Vec(v16i8_val).store(lds, [base_off])
+                        Vec.from_elements([b_i8], fx.Int8).store(lds_v, [v_off])
 
         def load_k_frag(kv_block_row, ks):
             """Load v4i32 (=16xi8) K fragment from LDS for mfma_i32_32x32x32_i8.
@@ -539,27 +544,30 @@ def build_sage_attn_cdna_module(
             v16i8 = Vec.load(v16i8_type, lds, [lds_idx])
             return vector.bitcast(v4i32_type, v16i8)
 
-        v2i8_type = Vec.make_type(2, fx.Int8)
+        def load_v_frag_fp8(pks, dc):
+            """Load v8i32 (=32xi8 fp8) V fragment from LDS for mfma_scale_f32_32x32x64.
 
-        def load_v_frag_bf16(pks, dc):
-            """Load v8bf16 V fragment from LDS for mfma_f32_32x32x16_bf16.
+            For lane (klane, lane32) at PV step `pks` and D chunk `dc`, the A
+            operand needs V[d=dc*32+lane32, k=pks*64+klane*32 .. +31]. With V
+            stored column-major (LDS row = d, LDS col = kv_row), this is 32
+            contiguous bytes at LDS[d_col_idx, k_start .. k_start+31].
 
-            For lane (klane, lane32) at PV step `pks` and D chunk `dc`, A operand
-            needs V[kv_row, d] for d=dc*32+lane32 (fixed) and 8 contiguous
-            kv_row = pks*16 + klane*8 + 0..7 (strided V_STRIDE in LDS).
-
-            Returns a v8bf16 register (bitcast to v8i16 by caller for the MFMA).
+            Issue as two 16-byte vector loads to give the compiler the same
+            shape it lowers to ds_read[2]_b64/b128 for K.
             """
             d_col = dc * MFMA_M + lane32
-            kv_row_base = fx.Index(pks * MFMA_K_BF16) + klane * 8
+            kv_k_start = fx.Index(pks * MFMA_K_FP8) + klane * 32
+            v_off = d_col * V_STRIDE + kv_k_start
+            lo_v16i8 = Vec.load(v16i8_type, lds_v, [v_off])
+            hi_v16i8 = Vec.load(v16i8_type, lds_v, [v_off + 16])
+            lo_v4i32 = vector.bitcast(v4i32_type, lo_v16i8)
+            hi_v4i32 = vector.bitcast(v4i32_type, hi_v16i8)
             elems = []
-            for kk in range_constexpr(8):
-                row = kv_row_base + kk
-                byte_off = LDS_V_BYTE_BASE + (row * V_STRIDE + d_col) * 2
-                v2i8_val = Vec.load(v2i8_type, lds, [byte_off])
-                v1bf16 = vector.bitcast(Vec.make_type(1, fx.BFloat16), v2i8_val)
-                elems.append(vector.extract(v1bf16, static_position=[0], dynamic_position=[]))
-            return Vec.from_elements(elems, fx.BFloat16).ir_value()
+            for w in range_constexpr(4):
+                elems.append(vector.extract(lo_v4i32, static_position=[w], dynamic_position=[]))
+            for w in range_constexpr(4):
+                elems.append(vector.extract(hi_v4i32, static_position=[w], dynamic_position=[]))
+            return Vec.from_elements(elems, fx.Int32).ir_value()
 
         def f32_to_bf16_trunc(f32_raw):
             """Bitwise f32 → bf16 truncation (upper 16 bits)."""
@@ -686,71 +694,101 @@ def build_sage_attn_cdna_module(
             for dc in range_constexpr(D_CHUNKS):
                 o_accs[dc] = _fmul(o_accs[dc], corr_vec16)
 
-            # Load V tile (FP8 → BF16) to LDS
+            # Load V tile (raw FP8 bytes, transposed → column-major in LDS)
             coop_load_v(kv_block_start)
             gpu.barrier()
 
-            # ==== GEMM2: O += V @ P  (mfma_f32_32x32x16_bf16) ====
-            # A=V (v8bf16/lane: row m=lane32 of V_descaled[d, kv]; K=k_block*8+0..7
-            #     in kv dim). Loaded by load_v_frag_bf16(pks, dc).
-            # B=P (v8bf16/lane: column n=lane32 of P[kv, q]; K=k_block*8+0..7).
-            # Output: v16f32/lane covering 32 d positions × 32 q rows; same layout
-            # as QK output (m=(i//4)*8 + klane*4 + (i%4) for d index, n=lane32 for
-            # q index).
+            # ==== P quant: f32 → fp8 (e4m3fn on gfx950) ====
+            # P = exp2(s - m_new) ∈ [0, 1] by construction (row-max(P) = 1.0),
+            # so the per-row max-abs is exactly 1.0 and we use a constant
+            # scale FP8_MAX. Apply 1/FP8_MAX in the epilogue (alongside v_descale).
             #
-            # P-handoff bridge: QK output gives lane (klane, lane32) the P values
-            # at q_row=lane32 and kv_rows m=(i//4)*8 + klane*4 + (i%4) within
-            # subtile st. The PV B operand needs kv_rows = pks*16 + klane*8 + 0..7
-            # contiguous in K. For each pks, half of the 8 needed values live in
-            # this lane's QK accumulator (i indices base..base+3 for own klane)
-            # and the other half live in the partner lane (same lane32, other
-            # klane) at the SAME i indices. shuffle_xor(width=64) by 32 swaps
-            # them.
+            # Pack each subtile's 16 fp8 bytes into 4 i32 words. Layout within
+            # a subtile (own's view, klane=0): word w holds bytes for the 4
+            # contiguous QK output indices i=w*4..w*4+3, which correspond to
+            # m={w*8+0, w*8+1, w*8+2, w*8+3} (klane=0) within the subtile.
+            c_fp8_max = arith.constant(FP8_MAX, type=T.f32)
+            c0_i32 = arith.constant(0, type=T.i32)
+            # p_words[subtile][word] : i32, packed 4xfp8 own bytes for this lane
+            p_words = []
+            for st in range_constexpr(N_SUBTILES):
+                sub_words = []
+                for w in range_constexpr(4):
+                    base = st * ELEMS_PER_TILE + w * 4
+                    s0 = arith.mulf(_raw(p_vals[base + 0]), c_fp8_max, fastmath=fm_fast)
+                    s1 = arith.mulf(_raw(p_vals[base + 1]), c_fp8_max, fastmath=fm_fast)
+                    s2 = arith.mulf(_raw(p_vals[base + 2]), c_fp8_max, fastmath=fm_fast)
+                    s3 = arith.mulf(_raw(p_vals[base + 3]), c_fp8_max, fastmath=fm_fast)
+                    packed = c0_i32
+                    packed = rocdl.cvt_pk_fp8_f32(T.i32, s0, s1, packed, 0)
+                    packed = rocdl.cvt_pk_fp8_f32(T.i32, s2, s3, packed, 1)
+                    sub_words.append(packed)
+                p_words.append(sub_words)
+
+            # ==== GEMM2: O += V @ P  (mfma_scale_f32_32x32x64_f8f6f4) ====
+            # A=V (v8i32/lane = 32 fp8 bytes: row m=lane32 of V[d, kv]; K=klane*32+0..31).
+            # B=P (v8i32/lane = 32 fp8 bytes: col n=lane32 of P[kv, q];  K=klane*32+0..31).
+            # Output: v16f32/lane, same layout as the QK output.
             #
-            # base index: pks_in_sub = pks % 2, base = klane*4 + pks_in_sub*8
-            #   (klane=0 own holds m={0..3 lo, 8..11 lo, 16..19 lo, 24..27 lo} at
-            #    i=0..3 / 4..7 / 8..11 / 12..15 of the v16 in subtile st;
-            #    so base is the i-offset where the 4 needed own elements start.)
-            # K layout in B operand:
-            #   klane=0 needs K=0..7  → [own[base..+3], partner[base..+3]]
-            #   klane=1 needs K=8..15 → [partner[base..+3], own[base..+3]]
+            # P-handoff bridge: lane (klane, lane32)'s QK p_vals[subtile] holds
+            # P at q_row=lane32 and kv_rows m=(i//4)*8 + klane*4 + (i%4) for that
+            # subtile. With BLOCK_N=128 and PV_K_STEPS=2, each pks consumes a
+            # different QK subtile per klane:
+            #   pks=p, klane=0 → uses subtile (p*2)
+            #   pks=p, klane=1 → uses subtile (p*2 + 1)
+            # Within a chosen subtile, lane's "own" 16 bytes correspond to K
+            # positions {0..3, 8..11, 16..19, 24..27} (klane=0) or
+            # {4..7, 12..15, 20..23, 28..31} (klane=1). The other 16 bytes
+            # come from the partner lane (same lane32, other klane) — they hold
+            # the OTHER set of K positions WITHIN THE SAME subtile.
+            #
+            # Each klane's "send" payload is the partner's chosen subtile data
+            # this lane already holds. shuffle_xor(width=64, off=32) swaps them.
+            shuf32_i32_const = fx.Int32(32)
+            width_i32_const = fx.Int32(WARP_SIZE)
             klane_is_zero = ArithValue(klane == fx.Index(0))
             for pks in range_constexpr(PV_K_STEPS):
-                subtile_idx = pks // 2  # Python int (range_constexpr yields ints)
-                pks_in_sub = pks % 2
-                # For each j in 0..3, our_keep[j] and to_partner[j] are
-                # selected from p_vals (extracted at constexpr indices) by
-                # klane. Then to_partner is sent to the partner via
-                # shuffle_xor(32); we receive from_partner.
-                our_keep = []
-                from_partner = []
-                for j in range_constexpr(4):
-                    flat_lo = subtile_idx * ELEMS_PER_TILE + pks_in_sub * 8 + j
-                    flat_hi = subtile_idx * ELEMS_PER_TILE + pks_in_sub * 8 + 4 + j
-                    p_lo = p_vals[flat_lo]
-                    p_hi = p_vals[flat_hi]
-                    our = klane_is_zero.select(p_lo, p_hi)
-                    to_par = klane_is_zero.select(p_hi, p_lo)
-                    par = _raw(reduction_peer32(to_par))
-                    our_keep.append(_raw(our))
-                    from_partner.append(par)
-                # Build v8bf16: klane=0 uses [our, partner] for K=0..7;
-                # klane=1 uses [partner, our] for K=8..15.
-                p_bf16_elems = []
-                for j in range_constexpr(4):
-                    own_e = f32_to_bf16_trunc(our_keep[j])
-                    par_e = f32_to_bf16_trunc(from_partner[j])
-                    p_bf16_elems.append(klane_is_zero.select(own_e, par_e))
-                for j in range_constexpr(4):
-                    own_e = f32_to_bf16_trunc(our_keep[j])
-                    par_e = f32_to_bf16_trunc(from_partner[j])
-                    p_bf16_elems.append(klane_is_zero.select(par_e, own_e))
-                p_pack_v8bf16 = Vec.from_elements(p_bf16_elems, fx.BFloat16).ir_value()
+                # klane=0's chosen subtile = pks*2; klane=1's = pks*2 + 1.
+                # Each lane SENDS the data the partner wants:
+                #   klane=0 sends p_words[pks*2+1]; klane=1 sends p_words[pks*2].
+                # "Own" data is from the lane's own chosen subtile.
+                own_words = []
+                send_words = []
+                for w in range_constexpr(4):
+                    own = klane_is_zero.select(
+                        p_words[pks * 2][w], p_words[pks * 2 + 1][w]
+                    )
+                    snd = klane_is_zero.select(
+                        p_words[pks * 2 + 1][w], p_words[pks * 2][w]
+                    )
+                    own_words.append(_raw(own))
+                    send_words.append(_raw(snd))
+                # Receive partner's payload (4 i32) via shuffle_xor on 32-lane peer.
+                recv_words = []
+                for w in range_constexpr(4):
+                    recv_words.append(
+                        _raw(fx.Int32(send_words[w]).shuffle_xor(
+                            shuf32_i32_const, width_i32_const
+                        ))
+                    )
+                # Assemble v8i32: K=0..3 first, then 4..7, then 8..11, etc.
+                # klane=0: [own, partner, own, partner, ...]  (own holds K=0..3,8..11,...)
+                # klane=1: [partner, own, partner, own, ...]  (own holds K=4..7,12..15,...)
+                v8_elems = []
+                for w in range_constexpr(4):
+                    lo = klane_is_zero.select(own_words[w], recv_words[w])
+                    hi = klane_is_zero.select(recv_words[w], own_words[w])
+                    v8_elems.append(_raw(lo))
+                    v8_elems.append(_raw(hi))
+                p_pack_v8i32 = Vec.from_elements(v8_elems, fx.Int32).ir_value()
 
+                # Constant e8m0 scale = 127 → multiplier 1.0 (no scaling).
+                scale_127 = arith.constant(127, type=T.i32)
                 for dc in range_constexpr(D_CHUNKS):
-                    v_frag = load_v_frag_bf16(pks, dc)
-                    o_accs[dc] = mfma_bf16_k16(
-                        v16f32_type, [v_frag, p_pack_v8bf16, o_accs[dc], 0, 0, 0]
+                    v_frag = load_v_frag_fp8(pks, dc)
+                    o_accs[dc] = mfma_fp8_k64(
+                        v16f32_type, v_frag, p_pack_v8i32, o_accs[dc],
+                        scale_127, scale_127,
                     )
 
             m_running = m_new
@@ -764,6 +802,9 @@ def build_sage_attn_cdna_module(
         o_finals = [loop_results[2 + dc] for dc in range_constexpr(D_CHUNKS)]
 
         inv_l = arith.divf(_raw(c_one_f), _raw(l_final), fastmath=fm_fast)
+        # Compensate for the FP8 P-quant scale: multiply output by 1/FP8_MAX.
+        c_inv_fp8_max = arith.constant(INV_FP8_MAX, type=T.f32)
+        inv_l_fp8 = arith.mulf(_raw(inv_l), c_inv_fp8_max, fastmath=fm_fast)
 
         if q_in_bounds:
             # MFMA 32x32 C/D layout (wave64): lane (klane, lane32) holds 16 f32
@@ -791,7 +832,7 @@ def build_sage_attn_cdna_module(
                         o_elem = vector.extract(
                             o_finals[dc], static_position=[i_pos], dynamic_position=[]
                         )
-                        scale = arith.mulf(_raw(inv_l), _raw(v_ds), fastmath=fm_fast)
+                        scale = arith.mulf(_raw(inv_l_fp8), _raw(v_ds), fastmath=fm_fast)
                         o_norm = arith.mulf(o_elem, scale, fastmath=fm_fast)
                         bf16_elems.append(f32_to_bf16_trunc(o_norm))
                     o_vec = Vec.from_elements(bf16_elems, fx.BFloat16).ir_value()
