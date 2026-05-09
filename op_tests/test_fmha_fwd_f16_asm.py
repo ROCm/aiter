@@ -44,6 +44,7 @@ import torch
 import aiter
 
 from aiter.test_common import checkAllclose
+from aiter.jit.utils.chip_info import get_gfx
 
 # from aiter.test_mha_common import (
 #    attention_ref,
@@ -314,6 +315,8 @@ def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
     ],
 )
 def test_fmha_fwd_f16_correctness(batch, hq, hk, sq, sk, head_dim, is_causal):
+    if get_gfx() not in ["gfx1250"]:
+        return
     device = "cuda"
     torch.manual_seed(0)
 
@@ -371,6 +374,8 @@ def test_fmha_fwd_f16_correctness(batch, hq, hk, sq, sk, head_dim, is_causal):
 
 def test_fmha_fwd_f16_ops_layer():
     """Direct ops-layer call: bshd qkv (sbhd memory layout), D64 + non-zero sink."""
+    if get_gfx() not in ["gfx1250"]:
+        return
     device = "cuda"
     torch.manual_seed(0)
 
@@ -411,6 +416,8 @@ def test_fmha_fwd_f16_d64_requires_sink():
     a zero sink for D64, so this error path is unreachable from the public
     API — we exercise it via the lower-level ops stub.
     """
+    if get_gfx() not in ["gfx1250"]:
+        return
     device = "cuda"
     q, k, v = make_qkv_bshd(
         layout=0,
@@ -438,6 +445,8 @@ def test_fmha_fwd_f16_d64_requires_sink():
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("layout", [0, 1, 2])
 def test_fmha_fwd_f16_layout(layout, head_dim):
+    if get_gfx() not in ["gfx1250"]:
+        return
     device = "cuda"
     torch.manual_seed(0)
     batch, hq, hk, sq, sk = 1, 8, 1, 128, 2048
@@ -490,22 +499,11 @@ def test_fmha_fwd_f16_layout(layout, head_dim):
 # ---------------------------------------------------------------------------
 
 
-def _is_gfx1250() -> bool:
-    try:
-        from aiter.jit.utils.chip_info import get_gfx
-
-        return get_gfx() == "gfx1250"
-    except Exception:
-        return False
-
-
-@pytest.mark.skipif(
-    not _is_gfx1250(),
-    reason="flash_attn_func dispatch to fmha_fwd_f16_asm only on gfx1250",
-)
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_fmha_fwd_f16_via_flash_attn_func(head_dim, is_causal):
+    if get_gfx() not in ["gfx1250"]:
+        return
     device = "cuda"
     torch.manual_seed(0)
     batch, hq, hk, sq, sk = 1, 8, 1, 128, 2048
@@ -566,6 +564,8 @@ def test_fmha_fwd_f16_via_flash_attn_func(head_dim, is_causal):
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_fmha_fwd_f16_perf(head_dim, is_causal):
+    if get_gfx() not in ["gfx1250"]:
+        return
     device = "cuda"
     torch.manual_seed(0)
 
