@@ -90,6 +90,7 @@ else:
         from .ops.rope import *  # noqa: F403,E402
         from .ops.topk import *  # noqa: F403,E402
         from .ops.topk_plain import topk_plain  # noqa: F403,F401,E402
+        from .ops.vsa_dual import *  # noqa: F403,E402
         from .ops.mha import *  # noqa: F403,E402
         from .ops.gradlib import *  # noqa: F403,E402
         from .ops.trans_ragged_layout import *  # noqa: F403,E402

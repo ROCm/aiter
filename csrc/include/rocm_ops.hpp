@@ -1658,6 +1658,29 @@ namespace py = pybind11;
           py::arg("stride0"),      \
           py::arg("stride1"));
 
+#define VSA_DUAL_PYBIND                 \
+    m.def("vsa_dual_dropB",             \
+          &vsa_dual_dropB,              \
+          py::arg("q"),                 \
+          py::arg("k"),                 \
+          py::arg("v"),                 \
+          py::arg("qscale"),            \
+          py::arg("kscale"),            \
+          py::arg("vmean"),             \
+          py::arg("vscale"),            \
+          py::arg("q2k_idx"),           \
+          py::arg("q2k_num"),           \
+          py::arg("vbs"),               \
+          py::arg("lim"),               \
+          py::arg("out"),               \
+          py::arg("lse"),               \
+          py::arg("counters"),          \
+          py::arg("B"),                 \
+          py::arg("T"),                 \
+          py::arg("num_q_blks"),        \
+          py::arg("max_kv"),            \
+          py::arg("n_dense"));
+
 #define MLA_METADATA_PYBIND                              \
     m.def("get_mla_metadata_v1",                         \
           &get_mla_metadata_v1,                          \
