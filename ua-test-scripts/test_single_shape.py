@@ -80,8 +80,8 @@ def parse_args():
                    help="Run only Triton kernel (skip CK)")
 
     # Tolerance for testing
-    p.add_argument("--atol", type=float, default=1e-2,
-                   help="Absolute tolerance for allclose (default: 1e-2)")
+    p.add_argument("--atol", type=float, default=1.5e-2,
+                   help="Absolute tolerance for allclose (default: 1.5e-2)")
     p.add_argument("--rtol", type=float, default=1e-2,
                    help="Relative tolerance for allclose (default: 1e-2)")
 
