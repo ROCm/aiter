@@ -164,7 +164,10 @@ def build_sage_attn_cdna_module(
     #    only; performs a 16-lane in-instruction transpose) to deliver the
     #    32 K-contiguous bytes per lane that the f8f6f4 MFMA expects.
     _is_gfx950_kv = "gfx950" in gpu_arch
-    K_STRIDE = HEAD_DIM + 8    # extra 8 bytes padding for Int8 K rows
+    K_STRIDE = HEAD_DIM + 16    # 16 B pad: HEAD_DIM=128 = 32 banks × 4 B,
+                                #   so naive +0/+8 hits bank conflicts on
+                                #   ds_read paths. +16 shifts each row by 4
+                                #   banks → conflict-free (matches V_STRIDE).
     if _is_gfx950_kv:
         # Pad row stride by 16 bytes to break LDS bank conflicts on the
         # ds_read_tr8_b64 path. HEAD_DIM=128 = exact multiple of 32 banks ×
