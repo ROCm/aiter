@@ -42,6 +42,7 @@ def build_silu_and_mul_fq_module(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
+    swiglu_limit: float = 0.0,
 ):
     """Return a JIT launcher for fused gate activation + optional quant + scale sort.
 
@@ -272,8 +273,13 @@ def build_silu_and_mul_fq_module(
                     swiglu_neg_alpha_log2e = arith.constant(
                         -1.4426950408889634 * 1.702, type=f32
                     )
-                    swiglu_limit = arith.constant(7.0, type=f32)
-                    swiglu_neg_limit = arith.constant(-7.0, type=f32)
+                    if const_expr(swiglu_limit != 0):
+                        _limit = arith.constant(float(swiglu_limit), type=f32)
+                        _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
+                    else:
+                        _limit = arith.constant(7.0, type=f32)
+                        _neg_limit = arith.constant(-7.0, type=f32)
+
                     act_vals = []
                     for vi in range_constexpr(VEC):
                         g = vector.extract(
@@ -282,6 +288,7 @@ def build_silu_and_mul_fq_module(
                         u = vector.extract(
                             up_f32, static_position=[vi], dynamic_position=[]
                         )
+
                         if enable_bias:
                             bias_col = col0 + arith.constant(vi, type=i32)
                             g = g + _load_bias_scalar(bias_row + bias_col)
@@ -290,13 +297,15 @@ def build_silu_and_mul_fq_module(
                             )
                         gate = g
                         linear = u
+
                         t = g * neg_log2e
-                        if act == "swiglu":
-                            gate = arith.minimumf(g, swiglu_limit)
-                            linear = arith.maximumf(
-                                arith.minimumf(u, swiglu_limit), swiglu_neg_limit
-                            )
+
+                        if const_expr(swiglu_limit != 0 and act != "swiglu"):
+                            gate = arith.minimumf(gate, _limit)
+                            linear = arith.minimumf(linear, _limit)
+                            linear = arith.maximumf(linear, _neg_limit)
                             t = gate * swiglu_neg_alpha_log2e
+
                         emu = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.exp2.f32", [t], [], []
                         )
@@ -304,7 +313,7 @@ def build_silu_and_mul_fq_module(
                         sig = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.rcp.f32", [den], [], []
                         )
-                        if act == "swiglu":
+                        if const_expr(act == "swiglu"):
                             act_vals.append(gate * sig * (linear + c1_f32))
                         else:
                             act_vals.append(gate * sig * linear)
