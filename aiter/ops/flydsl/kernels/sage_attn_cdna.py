@@ -971,42 +971,31 @@ def build_sage_attn_cdna_module(
             #
             # Each klane's "send" payload is the partner's chosen subtile data
             # this lane already holds. shuffle_xor(width=64, off=32) swaps them.
-            shuf32_i32_const = fx.Int32(32)
-            width_i32_const = fx.Int32(WARP_SIZE)
-            klane_is_zero = ArithValue(klane == fx.Index(0))
+            # Direct cross-half-wave assembly via v_permlane32_swap_b32:
+            # the instruction swaps vdst[high] with vsrc[low]. With vdst=A,
+            # vsrc=B (A=p_words[2pks][w], B=p_words[2pks+1][w]):
+            #   new A[lane n<32]  = old A[n]      = lo[n<32]
+            #   new A[lane n>=32] = old B[n-32]   = lo[n>=32]
+            #   new B[lane n<32]  = old A[n+32]   = hi[n<32]
+            #   new B[lane n>=32] = old B[n]      = hi[n>=32]
+            # which is exactly the (lo, hi) v8 pair the QK→PV bridge needs.
+            # Replaces the 4×(cmp+cndmask)+4×7-instr shuffle_xor pattern (~45 instr/pks)
+            # with 4×(1-instr swap + 2 extracts).
+            from flydsl._mlir.dialects._rocdl_ops_gen import permlane32_swap as _permlane32_swap_op
+            _struct_ty_2xi32 = ir.Type.parse("!llvm.struct<(i32, i32)>")
             for pks in range_constexpr(PV_K_STEPS):
-                # klane=0's chosen subtile = pks*2; klane=1's = pks*2 + 1.
-                # Each lane SENDS the data the partner wants:
-                #   klane=0 sends p_words[pks*2+1]; klane=1 sends p_words[pks*2].
-                # "Own" data is from the lane's own chosen subtile.
-                own_words = []
-                send_words = []
-                for w in range_constexpr(4):
-                    own = klane_is_zero.select(
-                        p_words[pks * 2][w], p_words[pks * 2 + 1][w]
-                    )
-                    snd = klane_is_zero.select(
-                        p_words[pks * 2 + 1][w], p_words[pks * 2][w]
-                    )
-                    own_words.append(_raw(own))
-                    send_words.append(_raw(snd))
-                # Receive partner's payload (4 i32) via shuffle_xor on 32-lane peer.
-                recv_words = []
-                for w in range_constexpr(4):
-                    recv_words.append(
-                        _raw(fx.Int32(send_words[w]).shuffle_xor(
-                            shuf32_i32_const, width_i32_const
-                        ))
-                    )
-                # Assemble v8i32: K=0..3 first, then 4..7, then 8..11, etc.
-                # klane=0: [own, partner, own, partner, ...]  (own holds K=0..3,8..11,...)
-                # klane=1: [partner, own, partner, own, ...]  (own holds K=4..7,12..15,...)
                 v8_elems = []
                 for w in range_constexpr(4):
-                    lo = klane_is_zero.select(own_words[w], recv_words[w])
-                    hi = klane_is_zero.select(recv_words[w], own_words[w])
-                    v8_elems.append(_raw(lo))
-                    v8_elems.append(_raw(hi))
+                    a_w = _raw(p_words[pks * 2][w])
+                    b_w = _raw(p_words[pks * 2 + 1][w])
+                    swapped = _permlane32_swap_op(
+                        _struct_ty_2xi32, old=a_w, src=b_w,
+                        fi=False, bound_control=True,
+                    )
+                    lo_word = _llvm.extractvalue(T.i32, swapped, [0])
+                    hi_word = _llvm.extractvalue(T.i32, swapped, [1])
+                    v8_elems.append(lo_word)
+                    v8_elems.append(hi_word)
                 p_pack_v8i32 = Vec.from_elements(v8_elems, fx.Int32).ir_value()
 
                 # Constant e8m0 scale = 127 → multiplier 1.0 (no scaling).
