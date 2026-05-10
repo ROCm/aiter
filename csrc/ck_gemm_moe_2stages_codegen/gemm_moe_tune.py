@@ -2948,6 +2948,8 @@ class FmoeTuner(TunerCommon):
                         else None
                     )
                 else:
+                    w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, (16, 16))
+                    w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, (16, 16))
                     w1_scale_fmoe = (
                         fp4_utils.e8m0_shuffle(w1_scale)
                         if w1_scale is not None
