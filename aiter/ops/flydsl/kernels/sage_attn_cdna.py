@@ -587,7 +587,7 @@ def build_sage_attn_cdna_module(
             v16i8 = Vec.load(v16i8_type, lds, [lds_idx])
             return vector.bitcast(v4i32_type, v16i8)
 
-        def load_v_frag_fp8(pks, dc, buf_off):
+        def load_v_frag_fp8(pks, dc, buf_off, iter_lane_addr_i32):
             """Load v8i32 (=32xi8 fp8) V fragment from LDS for mfma_scale_f32_32x32x64.
 
             For lane (klane, lane32) at PV step `pks` and D chunk `dc`, the A
@@ -612,39 +612,26 @@ def build_sage_attn_cdna_module(
                 base_d  = dc*32  + (g%2)*16
                 addr    = (base_kv + i//2) * V_STRIDE + (base_d + (i%2)*8)
               4 calls (k_idx 0..3) per lane gather 32 contiguous K-bytes.
+
+              `iter_lane_addr_i32` (gfx950): precomputed per-iter, per-lane
+              i32 LDS address holding (lds_v_base + cur_v_off + lane-invariant
+              part). The (pks, dc, k_idx)-dependent part is added per call as
+              a compile-time literal so the AMDGPU backend folds it into
+              `ds_read offset:LIT`, eliminating per-call `v_or_b32`.
             """
             if const_expr(_is_gfx950):
-                from flydsl.expr.utils.arith import ArithValue as _AV
                 lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
                 v2i32_type = Vec.make_type(2, fx.Int32)
-                v8i8_type = Vec.make_type(8, fx.Int8)
-                lds_base = _memref.extract_aligned_pointer_as_index(
-                    _llvm_value(lds_v)
-                )
-
-                # Per-lane sub-group decomposition.
-                g = lane // fx.Index(16)
-                i = lane % fx.Index(16)
-                klane_g = g // fx.Index(2)
-                d_group = g % fx.Index(2)
-
-                # Hoist invariants of the per-k_idx loop.
-                base_kv_inv = (
-                    fx.Index(pks * MFMA_K_FP8)
-                    + klane_g * fx.Index(32)
-                )
-                base_d = fx.Index(dc * MFMA_M) + d_group * fx.Index(16)
-                row_off_within = i // fx.Index(2)
-                col_extra_within = (i % fx.Index(2)) * fx.Index(8)
 
                 words = []
                 for k_idx in range_constexpr(4):
-                    base_kv = base_kv_inv + fx.Index(k_idx * 8)
-                    addr_bytes = (base_kv + row_off_within) * fx.Index(V_STRIDE) \
-                                 + (base_d + col_extra_within)
-                    byte_off_val = _AV(arith.unwrap(buf_off + addr_bytes, index=True))
-                    total = _AV(lds_base) + byte_off_val
-                    addr_i32 = arith.unwrap(arith.index_cast(T.i32, total))
+                    # Compile-time-constant byte offset for this (pks, dc, k_idx).
+                    lit_bytes = (pks * MFMA_K_FP8 + k_idx * 8) * V_STRIDE \
+                                + dc * MFMA_M
+                    addr_i32 = arith.AddIOp(
+                        iter_lane_addr_i32,
+                        arith.constant(lit_bytes, type=T.i32),
+                    ).result
                     ptr_val = _llvm.inttoptr(lds_ptr_ty, addr_i32)
                     v2i32 = _ods_ds_read_tr8_b64(
                         res=v2i32_type, ptr=ptr_val
@@ -701,6 +688,30 @@ def build_sage_attn_cdna_module(
             is_one = ArithValue(fx.Int32(buf_idx_i32) == fx.Int32(1))
             return fx.Index(is_one.select(stride_index, ZERO_INDEX))
 
+        # Per-lane V LDS base address (gfx950 fast path): hoist the lane-
+        # invariant component once so per-iter ds_reads only need to ADD
+        # cur_v_off and a compile-time literal for (pks, dc, k_idx). This
+        # eliminates the per-ds_read `v_or_b32 vXX, s4, vYY` pattern that
+        # accounted for ~33 instr/iter vs Triton.
+        if const_expr(_is_gfx950):
+            from flydsl.expr.utils.arith import ArithValue as _AV
+            _g = lane // fx.Index(16)
+            _i = lane % fx.Index(16)
+            _klane_g = _g // fx.Index(2)
+            _d_group = _g % fx.Index(2)
+            _row_off_within = _i // fx.Index(2)
+            _col_extra_within = (_i % fx.Index(2)) * fx.Index(8)
+            _per_lane_v_inv = (_klane_g * fx.Index(32) + _row_off_within) \
+                              * fx.Index(V_STRIDE) \
+                              + _d_group * fx.Index(16) + _col_extra_within
+            _lds_v_base = _memref.extract_aligned_pointer_as_index(
+                _llvm_value(lds_v)
+            )
+            _v_lane_base_index = _AV(_lds_v_base) + _per_lane_v_inv
+            v_lane_base_i32 = arith.unwrap(
+                arith.index_cast(T.i32, _v_lane_base_index)
+            )
+
         # Prologue: prefetch first KV block into buffer 0.
         coop_load_k(ZERO_INDEX, ZERO_INDEX)
         coop_load_v(ZERO_INDEX, ZERO_INDEX)
@@ -722,6 +733,17 @@ def build_sage_attn_cdna_module(
             # Compute buffer byte offsets for current and next iterations.
             cur_k_off = _buf_off(cur_buf_i32, K_BUF1_OFF)
             cur_v_off = _buf_off(cur_buf_i32, V_BUF1_OFF)
+            # Per-iter, per-lane V LDS address (gfx950 fast path): single ADD
+            # of cur_v_off + lane-invariant base. Used by load_v_frag_fp8 which
+            # then only adds a compile-time literal per ds_read, freeing the
+            # AMDGPU backend to fold it into `ds_read offset:LIT`.
+            if const_expr(_is_gfx950):
+                cur_v_off_i32 = arith.unwrap(arith.index_cast(T.i32, cur_v_off))
+                v_iter_lane_addr_i32 = arith.AddIOp(
+                    v_lane_base_i32, cur_v_off_i32
+                ).result
+            else:
+                v_iter_lane_addr_i32 = None
             # next_buf = 1 - cur_buf  (XOR 1)
             next_buf_i32 = arith.XOrIOp(
                 _raw(cur_buf_i32), arith.constant(1, type=T.i32)
@@ -990,7 +1012,7 @@ def build_sage_attn_cdna_module(
                 # Constant e8m0 scale = 127 → multiplier 1.0 (no scaling).
                 scale_127 = arith.constant(127, type=T.i32)
                 for dc in range_constexpr(D_CHUNKS):
-                    v_frag = load_v_frag_fp8(pks, dc, cur_v_off)
+                    v_frag = load_v_frag_fp8(pks, dc, cur_v_off, v_iter_lane_addr_i32)
                     o_accs[dc] = mfma_fp8_k64(
                         v16f32_type, v_frag, p_pack_v8i32, o_accs[dc],
                         scale_127, scale_127,
