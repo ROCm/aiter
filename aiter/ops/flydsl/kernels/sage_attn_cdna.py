@@ -924,36 +924,27 @@ def build_sage_attn_cdna_module(
             # synchronized.
 
             # ==== P quant: f32 → fp8 (e4m3fn on gfx950) ====
-            # P = exp2(s - m_new) ∈ [0, 1] by construction (row-max(P) = 1.0),
-            # so the per-row max-abs is exactly 1.0 and we use a constant
-            # scale FP8_MAX. Apply 1/FP8_MAX in the epilogue (alongside v_descale).
+            # P = exp2(s - m_new) ∈ [0, 1] by construction (row-max(P) = 1.0).
+            # Cast directly to fp8e4m3fn without FP8_MAX scaling — matches
+            # Triton's approach. Saves 16 v_pk_mul (= 32 scalar muls) on the
+            # critical-path bridge between QK and PV gemms. Precision loss is
+            # acceptable: e4m3fn has 3 mantissa bits, and [0,1] still uses
+            # the lower exponent range cleanly.
             #
             # Pack each subtile's 16 fp8 bytes into 4 i32 words. Layout within
             # a subtile (own's view, klane=0): word w holds bytes for the 4
             # contiguous QK output indices i=w*4..w*4+3, which correspond to
             # m={w*8+0, w*8+1, w*8+2, w*8+3} (klane=0) within the subtile.
             c0_i32 = arith.constant(0, type=T.i32)
-            # Vectorize p_vals * FP8_MAX as v16f32 multiplies per subtile so
-            # the compiler emits v_pk_mul_f32 (8 packed) instead of 16 scalar
-            # v_mul_f32 per subtile. Then extract scalars for cvt_pk_fp8_f32.
-            fp8_max_v16 = Vec.filled(16, FP8_MAX, fx.Float32)
             # p_words[subtile][word] : i32, packed 4xfp8 own bytes for this lane
             p_words = []
             for st in range_constexpr(N_SUBTILES):
-                p_sub_elems = [
-                    _raw(p_vals[st * ELEMS_PER_TILE + i])
-                    for i in range_constexpr(ELEMS_PER_TILE)
-                ]
-                p_sub_vec = Vec.from_elements(p_sub_elems, fx.Float32)
-                p_scaled_vec = Vec(
-                    arith.mulf(p_sub_vec, fp8_max_v16, fastmath=fm_fast)
-                )
                 sub_words = []
                 for w in range_constexpr(4):
-                    s0 = _raw(p_scaled_vec[w * 4 + 0])
-                    s1 = _raw(p_scaled_vec[w * 4 + 1])
-                    s2 = _raw(p_scaled_vec[w * 4 + 2])
-                    s3 = _raw(p_scaled_vec[w * 4 + 3])
+                    s0 = _raw(p_vals[st * ELEMS_PER_TILE + w * 4 + 0])
+                    s1 = _raw(p_vals[st * ELEMS_PER_TILE + w * 4 + 1])
+                    s2 = _raw(p_vals[st * ELEMS_PER_TILE + w * 4 + 2])
+                    s3 = _raw(p_vals[st * ELEMS_PER_TILE + w * 4 + 3])
                     packed = c0_i32
                     packed = rocdl.cvt_pk_fp8_f32(T.i32, s0, s1, packed, 0)
                     packed = rocdl.cvt_pk_fp8_f32(T.i32, s2, s3, packed, 1)
@@ -1027,9 +1018,9 @@ def build_sage_attn_cdna_module(
         o_finals = [loop_results[3 + dc] for dc in range_constexpr(D_CHUNKS)]
 
         inv_l = arith.divf(_raw(c_one_f), _raw(l_final), fastmath=fm_fast)
-        # Compensate for the FP8 P-quant scale: multiply output by 1/FP8_MAX.
-        c_inv_fp8_max = arith.constant(INV_FP8_MAX, type=T.f32)
-        inv_l_fp8 = arith.mulf(_raw(inv_l), c_inv_fp8_max, fastmath=fm_fast)
+        # No FP8_MAX compensation needed: P-quant casts P∈[0,1] directly without
+        # the FP8_MAX pre-scale (matches Triton).
+        inv_l_fp8 = _raw(inv_l)
 
         if q_in_bounds:
             # MFMA 32x32 C/D layout (wave64): lane (klane, lane32) holds 16 f32
