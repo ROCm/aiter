@@ -856,8 +856,16 @@ def build_sage_attn_cdna_module(
                 if_op = _scf.IfOp(
                     cond_i1, result_types, has_else=True, loc=ir.Location.unknown()
                 )
-                # then-branch: tail tile, apply per-element OOB mask
+                # then-branch: tail tile, apply per-element OOB mask.
+                # Insert an empty sideeffect inline asm at the top so LLVM
+                # SimplifyCFG cannot speculate the mask block past the branch
+                # and flatten the if-then-else back into a chain of selects.
+                # Without this barrier, LLVM if-converts and the steady-state
+                # path executes ~256 wasted v_cmp/v_cndmask/s_nop instr per iter.
                 with ir.InsertionPoint(if_op.then_block):
+                    _llvm.inline_asm(
+                        None, [], "", "", has_side_effects=True,
+                    )
                     masked = []
                     for st in range_constexpr(N_SUBTILES):
                         for elem in range_constexpr(ELEMS_PER_TILE):
