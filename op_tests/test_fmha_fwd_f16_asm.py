@@ -779,6 +779,8 @@ parser.add_argument(
 )
 
 if __name__ == "__main__":
+    if get_gfx() not in ["gfx1250"]:
+        sys.exit(0)
     args = parser.parse_args()
     rc = run_cli(
         batch=args.batch,
