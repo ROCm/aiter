@@ -322,6 +322,8 @@ def build_silu_and_mul_fq_module(
                             act_v = gate * sig * (linear + c1_f32)
                         else:
                             act_v = gate * sig * linear
+                        if const_expr(_need_quant):
+                            act_v = arith.extf(f32, arith.trunc_f(T.bf16, act_v))
                         act_vals.append(act_v)
 
                     if const_expr(_need_quant):

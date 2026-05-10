@@ -40,6 +40,7 @@ import functools
 from aiter.ops.flydsl.moe_common import (
     GateMode,
 )
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1
 
 
 def barrier(vmcnt=63, lgkmcnt=63):
@@ -2238,9 +2239,7 @@ def compile_mixed_moe_gemm1(
                 c4_i32 = arith.constant(4, type=T.i32)
                 c5_i32 = arith.constant(5, type=T.i32)
                 c15_i32 = arith.constant(15, type=T.i32)
-                c22_i32 = arith.constant(22, type=T.i32)
                 c23_i32 = arith.constant(23, type=T.i32)
-                c28_i32 = arith.constant(28, type=T.i32)
                 c31_i32 = arith.constant(31, type=T.i32)
                 c32_i32 = arith.constant(32, type=T.i32)
                 c64_i32 = arith.constant(64, type=T.i32)
@@ -2248,41 +2247,12 @@ def compile_mixed_moe_gemm1(
                 c256_i32 = arith.constant(256, type=T.i32)
                 c0xFF800000_i32 = arith.constant(0xFF800000, type=T.i32)
                 c0x400000_i32 = arith.constant(0x400000, type=T.i32)
-                c0x7FFFFFFF_i32 = arith.constant(0x7FFFFFFF, type=T.i32)
-                c0x80000000_i32 = arith.constant(0x80000000, type=T.i32)
-                c0x3F800000_i32 = arith.constant(0x3F800000, type=T.i32)
-                c0x40C00000_i32 = arith.constant(0x40C00000, type=T.i32)
-                c0x4A800000_i32 = arith.constant(0x4A800000, type=T.i32)
-                c0xC11FFFFF_i32 = arith.constant(0xC11FFFFF, type=T.i32)
-                c0x7_i32 = arith.constant(0x7, type=T.i32)
                 c0_f32 = arith.constant(0.0, type=T.f32)
 
                 fp_headroom = 2 if need_fp4 else (8 if need_fp8 else 0)
                 c_headroom_i32 = arith.constant(fp_headroom, type=T.i32)
 
-                def f32_to_e2m1(qx_f32):
-                    """Convert a scaled f32 value to fp4 (e2m1) 4-bit integer."""
-                    qx = qx_f32.bitcast(T.i32)
-                    s = qx & c0x80000000_i32
-                    qx_abs = qx & c0x7FFFFFFF_i32
-                    denormal_mask = arith.cmpi(
-                        CmpIPredicate.ult, qx_abs, c0x3F800000_i32
-                    )
-                    normal_mask = arith.andi(
-                        arith.cmpi(CmpIPredicate.ult, qx_abs, c0x40C00000_i32),
-                        arith.cmpi(CmpIPredicate.uge, qx_abs, c0x3F800000_i32),
-                    )
-
-                    denorm_f32 = qx_abs.bitcast(T.f32) + c0x4A800000_i32.bitcast(T.f32)
-                    denormal_x = denorm_f32.bitcast(T.i32) - c0x4A800000_i32
-
-                    mant_odd = (qx_abs >> c22_i32) & c1_i32
-                    normal_x = qx_abs + c0xC11FFFFF_i32 + mant_odd
-                    normal_x = normal_x >> c22_i32
-
-                    e2m1 = arith.select(normal_mask, normal_x, c0x7_i32)
-                    e2m1 = arith.select(denormal_mask, denormal_x, e2m1)
-                    return (s >> c28_i32) | e2m1
+                f32_to_e2m1 = emit_f32_to_e2m1
 
                 if const_expr(need_sort):
                     n32_sort = sorted_scale_cols_i32 * c32_i32
@@ -2294,11 +2264,11 @@ def compile_mixed_moe_gemm1(
                     if const_expr(need_quant and not is_splitk):
                         frag_vals = []
                         for i in range_constexpr(e_vec):
-                            frag_vals.append(
-                                vector.extract(
-                                    frag, static_position=[i], dynamic_position=[]
-                                )
+                            v_frag = vector.extract(
+                                frag, static_position=[i], dynamic_position=[]
                             )
+                            v_frag = arith.extf(T.f32, arith.trunc_f(T.bf16, v_frag))
+                            frag_vals.append(v_frag)
 
                         local_max = c0_f32
                         for i in range_constexpr(e_vec):
