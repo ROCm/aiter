@@ -202,7 +202,10 @@ namespace aiter {
 
         if (n_idx == 0) {
             float sqrsum_ = cross_row_sum_4(sqrsum_part, lane_id);
-            if (lane_id < mfma_m && (warp_id * mfma_m + lane_id < m_oob)) {
+            // Four lanes cooperate on one MFMA row. Only one lane group should
+            // publish the reduced sqrsum; otherwise rows 16..63 in each tile
+            // race with sqrsums from earlier rows.
+            if ((lane_id < mfma_m) && (warp_id * mfma_m + lane_id < m_oob)) {
                 sqrsum[k_split_idx * m + idx + warp_id * mfma_m + lane_id] = sqrsum_;
             }
         }

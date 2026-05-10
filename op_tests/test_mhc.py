@@ -478,6 +478,56 @@ def test_mhc_pre(m, hidden_size, hc_mult, test_hc_head=False):
     return ret
 
 
+def test_mhc_pre_repeated_rows_invariant():
+    """DSv4 eval regression: identical rows must stay identical through mhc_pre."""
+    seqlen = 88
+    batch = 4
+    hidden_size = 7168
+    hc_mult = 4
+    hc_mult2 = hc_mult * hc_mult
+    hc_mult3 = hc_mult * 2 + hc_mult2
+    hc_hidden_size = hc_mult * hidden_size
+    pattern = torch.randn(seqlen, hc_mult, hidden_size, dtype=dtypes.bf16)
+    residual = pattern.repeat(batch, 1, 1)
+    fn = torch.randn(hc_mult3, hc_hidden_size, dtype=dtypes.fp32)
+    hc_scale = torch.randn((3,), dtype=dtypes.fp32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=dtypes.fp32) * 0.1
+    extra_args = {
+        "rms_eps": 1e-6,
+        "hc_pre_eps": 1e-6,
+        "hc_sinkhorn_eps": 1e-6,
+        "hc_post_mult_value": 2.0,
+        "sinkhorn_repeat": 20,
+    }
+
+    post_mix_ref, comb_mix_ref, layer_input_ref = mhc_pre_ref(
+        residual, fn, hc_scale, hc_base, **extra_args
+    )
+    post_mix_hip, comb_mix_hip, layer_input_hip = mhc_pre_hip(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        **extra_args,
+    )
+
+    checkAllclose(post_mix_ref, post_mix_hip, msg="repeated_rows post_mix")
+    checkAllclose(comb_mix_ref, comb_mix_hip, msg="repeated_rows comb_mix")
+    checkAllclose(layer_input_ref, layer_input_hip, msg="repeated_rows layer_input")
+
+    for name, tensor in (
+        ("post_mix", post_mix_hip),
+        ("comb_mix", comb_mix_hip),
+        ("layer_input", layer_input_hip),
+    ):
+        view = tensor.view(batch, seqlen, *tensor.shape[1:]).float()
+        max_abs = (view - view[:1]).abs().max().item()
+        if max_abs > 1e-3:
+            raise AssertionError(
+                f"mhc_pre repeated-row invariant failed for {name}: {max_abs=}"
+            )
+
+
 # copy from tilelang/examples/deepseek_mhc/example_mhc_post.py
 def mhc_post_tilelang(
     x: torch.Tensor,
@@ -677,6 +727,7 @@ for dtype in args.dtype:
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
+test_mhc_pre_repeated_rows_invariant()
 
 if not args.hc_head:
     df = []

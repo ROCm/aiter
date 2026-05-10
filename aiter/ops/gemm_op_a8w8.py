@@ -384,6 +384,8 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
         key = (gfx, cu_num, padded_M, N, K) if has_gfx else (cu_num, padded_M, N, K)
         config = _CKGEMM_CONFIG_CACHE[tuned_file].get(key, None)
         if config is not None:
+            config = dict(config)
+            config["_matched_m"] = padded_M
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
                     f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {tuned_file} , kernel name is {config['kernelName']}!"
@@ -749,12 +751,32 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
+    # DSv4-Pro wo_b under TP8 uses local shape [M, 2048] x [7168, 2048].
+    # The tuned table only has the full M=20480 row. Batched eval/prefill emits
+    # partial-M fragments (for example M=5544) that route through padded tuned
+    # dispatch and have shown row-dependent BF16 drift for identical rows.
+    # Use generic CK for partial-M fragments; keep the tuned full-shape row
+    # intact for the throughput benchmark.
+    if dtype == dtypes.bf16 and n == 7168 and k == 2048 and m != 20480:
+        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
     if config is not None:
         libtype = config["libtype"]
+        # The ASM blockscale kernels are tuned for exact or padded M buckets.
+        # For small DSv4 partial-M projections (for example M=176/352 mapping
+        # to the 256/512 buckets), the padded ASM path can produce
+        # row-dependent BF16 ULP drift for identical rows. CK handles MNK
+        # padding internally and preserves row equivalence, so use it for
+        # these small partial-M cases.
+        matched_m = int(config.get("_matched_m", m))
+        if libtype == "asm" and matched_m != m and matched_m <= 512:
+            return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
         if libtype == "cktile":
             return gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
         elif libtype == "ck":

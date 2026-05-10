@@ -108,5 +108,7 @@ default_kernels_dict = {
     ################|      |      |      |      |      |      |      |    |    |    |     |     |     |                |                |            |            |                                 |                |                |                   |
     # Compute friendly
     (-1):kernelInstance(256,     1,   128,   128,    64,    64,   128,  16,  16,  16,   16,    4,    1,     [ 8, 32, 1],     [ 8, 32, 1],           2,           1,                   [1, 32, 1,  8],             [8],     "Intrawave",                  1,),
+    # DSv4 wo_b fallback used by blockscale_bpreshuffle_dispatch for N=7168,K=2048.
+    (-2):kernelInstance(256,     1,   128,   128,    64,   256,   128,  16,  16,  16,   16,    4,    4,     [ 8, 32, 1],     [ 8, 32, 1],           2,           1,                   [1, 32, 1,  8],             [8],     "Intrawave",                  1,),
 }
 # fmt: on

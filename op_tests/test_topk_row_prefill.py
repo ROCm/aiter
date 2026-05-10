@@ -286,6 +286,7 @@ def run_top_k_per_row_prefill(
         num_rows,
         stride_row,
         stride_col,
+        k=indices.size(1),
     )
 
 

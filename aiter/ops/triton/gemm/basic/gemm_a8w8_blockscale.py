@@ -198,6 +198,23 @@ def gemm_a8w8_blockscale_preshuffle(
 
     # Transpose w and w_scale
     # w = w.T  # (K, N)
+    if (
+        dtype == torch.bfloat16
+        and N == 7168
+        and K == 2048
+        and M != 20480
+        and not skip_reduce
+    ):
+        # Match the high-level AITER wrapper's DSv4-Pro wo_b dispatch. ATOM
+        # may import this Triton wrapper directly when ATOM_USE_TRITON_GEMM=1.
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle_ck
+
+        if y is None:
+            y = torch.empty((M, N), dtype=dtype, device=x.device)
+        return gemm_a8w8_blockscale_bpreshuffle_ck(
+            x, w.reshape(N, K), x_scale, w_scale, y
+        )
+
     w_scale = w_scale.T  # (scale_k, scale_n)
 
     if config is None:
