@@ -166,9 +166,11 @@ def build_sage_attn_cdna_module(
     _is_gfx950_kv = "gfx950" in gpu_arch
     K_STRIDE = HEAD_DIM + 8    # extra 8 bytes padding for Int8 K rows
     if _is_gfx950_kv:
-        # No padding needed: HEAD_DIM is already a multiple of 16 and the
-        # transposed-read path doesn't benefit from extra row padding.
-        V_STRIDE = HEAD_DIM
+        # Pad row stride by 16 bytes to break LDS bank conflicts on the
+        # ds_read_tr8_b64 path. HEAD_DIM=128 = exact multiple of 32 banks ×
+        # 4 B/bank, so consecutive rows hit the same bank set; adding 16 B
+        # shifts each row by 4 banks.
+        V_STRIDE = HEAD_DIM + 16
     else:
         # Pad V "row" stride to a 16-byte multiple so loads can issue as
         # ds_read_b128. BLOCK_N=128 + 16 = 144 bytes per row.
