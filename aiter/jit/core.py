@@ -743,7 +743,10 @@ def build_module(
         elif AITER_REBUILD >= 2:
             rm_module(md_name)
         op_dir = f"{bd_dir}/{md_name}"
-        logger.info(f"start build [{md_name}] under {op_dir}")
+        logger.info(
+            f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
+            f"start build [{md_name}] under {op_dir}"
+        )
 
         opbd_dir = f"{op_dir}/build"
         src_dir = f"{op_dir}/build/srcs"
@@ -928,6 +931,7 @@ def build_module(
 
     def FinalFunc():
         logger.info(
+            f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
             f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
         )
 
