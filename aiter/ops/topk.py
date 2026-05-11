@@ -12,6 +12,17 @@ from ..jit.utils.chip_info import get_cu_num
 from ..utility import dtypes
 
 
+@compile_ops("module_moe_topk")
+def topk_softplus(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    need_renorm: bool,
+    routed_scaling_factor: float = 1.0,
+) -> None: ...
+
+
 @compile_ops("module_moe_asm", fc_name="biased_grouped_topk")
 def biased_grouped_topk_hip(
     gating_output: torch.Tensor,
@@ -207,6 +218,7 @@ def top_k_per_row_prefill(
     numRows: int,
     stride0: int,
     stride1: int,
+    k: int = 2048,
 ) -> None: ...
 
 
@@ -232,6 +244,7 @@ def top_k_per_row_decode(
     numRows: int,
     stride0: int,
     stride1: int,
+    k: int = 2048,
 ) -> None: ...
 
 

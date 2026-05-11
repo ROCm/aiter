@@ -2,6 +2,28 @@
 
 set -ex
 
+retry_cmd() {
+    local max_attempts="$1"
+    shift
+    local attempt=1
+    local rc=0
+
+    while true; do
+        if "$@"; then
+            return 0
+        fi
+        rc=$?
+        if [[ "$attempt" -ge "$max_attempts" ]]; then
+            echo "Command failed after ${attempt} attempts: $*"
+            return "$rc"
+        fi
+        local sleep_seconds=$((attempt * 20))
+        echo "Attempt ${attempt}/${max_attempts} failed; retrying in ${sleep_seconds}s..."
+        sleep "${sleep_seconds}"
+        attempt=$((attempt + 1))
+    done
+}
+
 echo
 echo "==== ROCm Packages Installed ===="
 dpkg -l | grep rocm || echo "No ROCm packages found."
@@ -9,12 +31,29 @@ dpkg -l | grep rocm || echo "No ROCm packages found."
 echo
 echo "==== Install dependencies and aiter ===="
 git config --global --add safe.directory /workspace
-pip install --upgrade pandas zmq einops numpy==1.26.2
+pip config set global.retries 15
+pip config set global.timeout 120
+pip install --upgrade pandas pyzmq einops numpy==1.26.2 || {
+    echo "WARNING: batch pip install failed, retrying packages individually..."
+    pip install --upgrade pandas || true
+    pip install --upgrade pyzmq || echo "WARNING: pyzmq unavailable (only needed by aiter.dist.shm_broadcast)"
+    pip install --upgrade einops
+    pip install --upgrade "numpy==1.26.2"
+}
 pip uninstall -y aiter || true
-pip install --upgrade "pybind11>=3.0.1"
-pip install --upgrade "ninja>=1.11.1"
+retry_cmd 3 pip install --upgrade \
+    "pybind11>=3.0.1" \
+    "setuptools>=45" \
+    "setuptools_scm[toml]>=6.2" \
+    wheel \
+    packaging \
+    psutil \
+    "ninja>=1.11.1" \
+    pandas \
+    "flydsl==0.1.6"
 pip install tabulate
-pip install -e .
+retry_cmd 3 pip install --no-build-isolation -e .
+./.github/scripts/install_triton.sh
 
 # Read BUILD_TRITON env var, default to 1. If 1, install Triton; if 0, skip installation.
 BUILD_TRITON=${BUILD_TRITON:-1}
