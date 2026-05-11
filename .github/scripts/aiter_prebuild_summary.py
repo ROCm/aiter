@@ -9,7 +9,6 @@ import os
 import re
 from pathlib import Path
 
-
 FINISH_RE = re.compile(r"finish build \[([^\]]+)\], cost ([0-9.]+)s")
 
 
@@ -28,10 +27,18 @@ def parse_module_costs(log_path: Path) -> list[tuple[str, float]]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--log", required=True, type=Path, help="Path to the tee'd prebuild log")
-    parser.add_argument("--build-status", required=True, type=int, help="setup.py exit code")
-    parser.add_argument("--start", required=True, type=int, help="Prebuild start timestamp in seconds")
-    parser.add_argument("--end", required=True, type=int, help="Prebuild end timestamp in seconds")
+    parser.add_argument(
+        "--log", required=True, type=Path, help="Path to the tee'd prebuild log"
+    )
+    parser.add_argument(
+        "--build-status", required=True, type=int, help="setup.py exit code"
+    )
+    parser.add_argument(
+        "--start", required=True, type=int, help="Prebuild start timestamp in seconds"
+    )
+    parser.add_argument(
+        "--end", required=True, type=int, help="Prebuild end timestamp in seconds"
+    )
     parser.add_argument(
         "--kernel-glob",
         default="aiter/jit/*.so",
@@ -56,11 +63,15 @@ def main() -> int:
     print(f"Prebuild wall time: {wall_seconds}s ({wall_seconds / 60:.1f} min)")
     print(f"Kernel count: {len(kernels)}")
     print(f"Module builds observed: {len(module_costs)}")
-    print(f"Total module compile cost: {total_module_seconds:.1f}s ({total_module_seconds / 60:.1f} min)")
+    print(
+        f"Total module compile cost: {total_module_seconds:.1f}s ({total_module_seconds / 60:.1f} min)"
+    )
 
     if module_costs:
         print("Top slowest module builds:")
-        for name, cost in sorted(module_costs, key=lambda item: item[1], reverse=True)[:20]:
+        for name, cost in sorted(module_costs, key=lambda item: item[1], reverse=True)[
+            :20
+        ]:
             print(f"  {name}: {cost:.1f}s")
 
         print("All module build costs (seconds):")
