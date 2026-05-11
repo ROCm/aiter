@@ -5,7 +5,7 @@
 
 namespace aiter {
 
-void silu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input);
+void silu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input, float limit = 0.0f);
 void swiglu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input);
 void silu_and_mul_bias(const aiter_tensor_t& out,
                        const aiter_tensor_t& input,

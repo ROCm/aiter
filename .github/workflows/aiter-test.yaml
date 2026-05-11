@@ -380,7 +380,7 @@ jobs:
             pip show amd-aiter
           "
 
-      - name: Install amd-triton
+      - name: Install triton
         run: |
           # Ensure install_triton.sh is available even when the PR branch
           # was created before the script was added to main (#2959).
@@ -395,7 +395,7 @@ jobs:
             chmod +x .github/scripts/install_triton.sh
           fi
           docker exec -w /workspace aiter_test \
-            bash -c "./.github/scripts/install_triton.sh && pip show amd-triton"
+            bash -c "./.github/scripts/install_triton.sh && pip show triton"
 
       - name: Show Aiter version
         run: |
@@ -581,7 +581,7 @@ jobs:
             pip show amd-aiter
           "
 
-      - name: Install amd-triton
+      - name: Install triton
         run: |
           # Ensure install_triton.sh is available even when the PR branch
           # was created before the script was added to main (#2959).
@@ -596,7 +596,7 @@ jobs:
             chmod +x .github/scripts/install_triton.sh
           fi
           docker exec -w /workspace aiter_test \
-            bash -c "./.github/scripts/install_triton.sh && pip show amd-triton"
+            bash -c "./.github/scripts/install_triton.sh && pip show triton"
 
       - name: Show Aiter version
         run: |
