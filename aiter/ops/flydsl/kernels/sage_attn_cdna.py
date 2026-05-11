@@ -1124,7 +1124,7 @@ def build_sage_attn_cdna_module(
     _compile_hints = {
         "fast_fp_math": fast_fp_math,
         "unsafe_fp_math": unsafe_fp_math,
-        "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
+        "llvm_options": {"enable-post-misched": True, "lsr-drop-solution": True},
     }
 
     def _launch(*args, **kwargs):
