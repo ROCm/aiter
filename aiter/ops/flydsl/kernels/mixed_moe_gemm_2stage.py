@@ -2139,11 +2139,6 @@ def compile_mixed_moe_gemm1(
                         if const_expr(_apply_weight):
                             v = v * tw
                         if const_expr(_need_quant):
-                            if const_expr(_need_fp4 and act == "swiglu"):
-                                # Match the non-fused Swiglu path: stage1
-                                # materializes bf16 before MXFP4 quantization.
-                                v_bf16 = arith.trunc_f(T.bf16, v)
-                                v = v_bf16.extf(T.f32)
                             lds_idx = row_base_lds + col_local
                             vec1_f32 = T.vec(1, f32)
                             v1 = vector.from_elements(vec1_f32, [v])
