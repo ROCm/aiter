@@ -186,7 +186,10 @@ def get_flydsl_stage2_kernels(
                                 **base_params,
                                 "persist": True,
                             }
-                            if base_name == "flydsl_moe2_afp4_wfp4_bf16_t64x128x256_atomic":
+                            if (
+                                base_name
+                                == "flydsl_moe2_afp4_wfp4_bf16_t64x128x256_atomic"
+                            ):
                                 # Production fp4xfp4 stage2 variant for the EP4
                                 # DeepSeek prefill shape on MI355X.  Adds:
                                 #   - use_async_copy=True (async X DMA in prologue
