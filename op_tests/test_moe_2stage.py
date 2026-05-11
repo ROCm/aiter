@@ -1,6 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+import sys
+
+_LOCAL_DEPS = (
+    "/root/data/aiter",
+    "/root/data/triton/python",
+    "/root/data/FlyDSL/python",
+    "/root/data/FlyDSL",
+)
+for _dep in reversed(_LOCAL_DEPS):
+    if os.path.exists(_dep) and _dep not in sys.path:
+        sys.path.insert(0, _dep)
+
 import torch
 import itertools
 import aiter
@@ -13,6 +26,7 @@ from aiter.int4_utils import (
 from aiter.utility import fp4_utils
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_gfx, get_cu_num
+from aiter.ops.quant import get_torch_quant
 import argparse
 import os
 import pandas as pd
@@ -53,15 +67,22 @@ def _gfx1250_fp8_round_trip_bf16(x: torch.Tensor) -> torch.Tensor:
     `_dequant_blockscale_fp8` (round trip).
     """
     try:
-        from FlyDSL.tests.kernels.utils import fp4_utils as _fly_fp4u_rt
+        from tests.kernels.utils import fp4_utils as _fly_fp4u_rt
     except ImportError:
-        import importlib, sys
-        for _root in ("/app/FlyDSL",):
-            if _root not in sys.path:
-                sys.path.insert(0, _root)
-        _fly_fp4u_rt = importlib.import_module(
-            "tests.kernels.utils.fp4_utils"
-        )
+        try:
+            from FlyDSL.tests.kernels.utils import fp4_utils as _fly_fp4u_rt
+        except ImportError:
+            import importlib, sys
+            for _root in (
+                "/root/data/FlyDSL",
+                "/app/FlyDSL",
+                os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "FlyDSL")),
+            ):
+                if _root not in sys.path:
+                    sys.path.insert(0, _root)
+            _fly_fp4u_rt = importlib.import_module(
+                "tests.kernels.utils.fp4_utils"
+            )
     BLOCK = 32
     DTYPE_MAX = 240.0
     orig_shape = x.shape
@@ -154,12 +175,19 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=True,
     strict_accuracy=True,
+    use_bias=True,
+    require_grouped_gemm=False,
 ):
-    if get_gfx() not in ["gfx950","gfx1250"] and qType == aiter.QuantType.per_1x32:
+    _target_env = ";".join(
+        str(os.environ.get(k, "")).lower()
+        for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS", "AITER_FORCE_GFX1250")
+    )
+    _is_gfx1250_target = get_gfx() == "gfx1250" or "gfx1250" in _target_env or "1" in _target_env
+    if get_gfx() not in ["gfx950", "gfx1250"] and not _is_gfx1250_target and qType == aiter.QuantType.per_1x32:
         return
-    torch_quant = aiter.get_torch_quant(qType)
+    torch_quant = get_torch_quant(qType)
     # gfx1250 a8w4/fp8 + per_1x32 has very limited dynamic range
-    # (fp8 activation × fp4 weight, K=model_dim summation): with the
+    # (fp8 activation x fp4 weight, K=model_dim summation): with the
     # default unit-stddev randn() inputs the per-channel K-sum saturates
     # bf16 (~3e4) and the test's bf16 reference disagrees with the
     # quantised kernel by 100x.  FlyDSL UT
@@ -168,7 +196,7 @@ def test_fmoe(
     # the accuracy window meaningful.
     _input_scale = 1.0
     if (
-        get_gfx() == "gfx1250"
+        _is_gfx1250_target
         and qType == aiter.QuantType.per_1x32
         and (
             (AQDType == dtypes.fp4x2 and WQDType == dtypes.fp4x2)
@@ -279,7 +307,7 @@ def test_fmoe(
         # despite the kernel being numerically correct (mirrors what
         # FlyDSL UT _torch_moe_gemm2_a8w4 does internally).
         if (
-            get_gfx() == "gfx1250"
+            _is_gfx1250_target
             and AQDType == dtypes.fp8
             and WQDType == dtypes.fp4x2
         ):
@@ -302,7 +330,7 @@ def test_fmoe(
         # ``activation == Swiglu``. For the SiLU sweep variants, leave
         # bias disabled to match the activation kind.
         if (
-            get_gfx() == "gfx1250"
+            _is_gfx1250_target
             and qType == aiter.QuantType.per_1x32
             and (
                 (AQDType == dtypes.fp4x2 and WQDType == dtypes.fp4x2)
@@ -317,6 +345,9 @@ def test_fmoe(
             exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
             exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
     else:
+        exp_bias1_aiter = exp_bias1 = None
+        exp_bias2_aiter = exp_bias2 = None
+    if not use_bias:
         exp_bias1_aiter = exp_bias1 = None
         exp_bias2_aiter = exp_bias2 = None
 
@@ -336,7 +367,7 @@ def test_fmoe(
     # (wrong weight layout -> kernel decodes garbage and atomic_add
     # contributes ~0) or wildly-scaled output (wrong scale layout).
     _gfx1250_flydsl_eligible = (
-        get_gfx() == "gfx1250"
+        _is_gfx1250_target
         and qType == aiter.QuantType.per_1x32
         and (
             (AQDType == dtypes.fp4x2 and WQDType == dtypes.fp4x2)            # fp4
@@ -376,14 +407,21 @@ def test_fmoe(
                     "tests.kernels.utils.fp4_utils"
                 )
             E_, N1_, K1_packed_ = w1_qt_aiter.shape
+            E2_, N2_, K2_packed_ = w2_qt_aiter.shape
+            if WQDType == dtypes.fp4x2:
+                # Packed fp4 tensors cannot do copy_/contiguous(); preshuffle bytes.
+                w1_preshuffle = w1_qt_aiter.view(torch.uint8)
+                w2_preshuffle = w2_qt_aiter.view(torch.uint8)
+            else:
+                w1_preshuffle = w1_qt_aiter
+                w2_preshuffle = w2_qt_aiter
             w1_qt_aiter = _fly_fp4u.preshuffle_b_16x16(
-                w1_qt_aiter.contiguous().view(E_ * N1_, K1_packed_),
+                w1_preshuffle.contiguous().view(E_ * N1_, K1_packed_),
                 E_ * N1_,
                 K1_packed_,
             ).view(E_, N1_, K1_packed_)
-            E2_, N2_, K2_packed_ = w2_qt_aiter.shape
             w2_qt_aiter = _fly_fp4u.preshuffle_b_16x16(
-                w2_qt_aiter.contiguous().view(E2_ * N2_, K2_packed_),
+                w2_preshuffle.contiguous().view(E2_ * N2_, K2_packed_),
                 E2_ * N2_,
                 K2_packed_,
             ).view(E2_, N2_, K2_packed_)
@@ -461,7 +499,7 @@ def test_fmoe(
         # GEMM; ref otherwise leaves it in bf16 -> 100% checkAllclose
         # mismatch despite kernel correctness).
         if (
-            get_gfx() == "gfx1250"
+            _is_gfx1250_target
             and AQDType == dtypes.fp8
             and WQDType == dtypes.fp4x2
         ):
@@ -485,6 +523,9 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
+    if require_grouped_gemm:
+        os.environ.pop("AITER_LAST_FUSED_MOE_IMPL", None)
+        os.environ.pop("AITER_DISABLE_GROUPED_A8W4", None)
     _test_graph = int(os.environ.get("AITER_TEST_GRAPH", "1")) != 0
     out2_ck, us2 = run_perftest(
         fused_moe,
@@ -506,6 +547,13 @@ def test_fmoe(
         num_warmup=1,
         testGraph=_test_graph,
     )
+    moe_impl = os.environ.get("AITER_LAST_FUSED_MOE_IMPL", "unknown")
+    if require_grouped_gemm and moe_impl != "grouped_a8w4":
+        raise AssertionError(
+            f"grouped_gemm test expected grouped_a8w4 path, got {moe_impl!r}"
+        )
+    if require_grouped_gemm:
+        print(f"[grouped-gemm-ut] moe_impl={moe_impl}", flush=True)
     # gfx1250 FlyDSL paths inherently have block-quant noise (mxfp8/mxfp4)
     # that compounds over K-sums.  FlyDSL UT
     # (test_moe_gemm_mxscale_gfx1250.py:542 + test_common.verify_output)
@@ -515,7 +563,7 @@ def test_fmoe(
     # trips on intrinsic quantisation noise the kernel cannot avoid.
     _ck_atol, _ck_rtol = 1e-2, 1e-2
     _flydsl_path = (
-        get_gfx() == "gfx1250"
+        _is_gfx1250_target
         and qType == aiter.QuantType.per_1x32
         and (
             (AQDType == dtypes.fp4x2 and WQDType == dtypes.fp4x2)        # fp4
@@ -525,7 +573,7 @@ def test_fmoe(
     )
     if _flydsl_path:
         if AQDType == dtypes.fp8 and WQDType == dtypes.fp4x2:    # a8w4
-            _ck_atol, _ck_rtol = 0.5, 0.5
+            _ck_atol, _ck_rtol = 0.1, 0.1
         elif AQDType == dtypes.fp4x2 and WQDType == dtypes.fp4x2:  # fp4
             _ck_atol, _ck_rtol = 0.25, 0.5
         elif AQDType == dtypes.fp8 and WQDType == dtypes.fp8:    # fp8
@@ -545,6 +593,15 @@ def test_fmoe(
         return 1 - sim
 
     logits_diff = calc_diff(out2_ref, out2_ck)
+    _diff = (out2_ref.float() - out2_ck.float()).abs()
+    print(
+        "[diff] "
+        f"exact_equal={torch.equal(out2_ref, out2_ck)} "
+        f"max_abs={_diff.max().item():.8e} "
+        f"mean_abs={_diff.mean().item():.8e} "
+        f"logits_diff={float(logits_diff):.8e}",
+        flush=True,
+    )
 
     # ---- accuracy verdict --------------------------------------------------
     # FlyDSL paths use UT-style "mismatch_ratio < 5% OR logits_diff <
@@ -597,7 +654,16 @@ def test_fmoe(
                 f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
             )
 
-    return {"us": us2, "err": err}
+    return {
+        "us": us2,
+        "err": err,
+        "exact_equal": bool(torch.equal(out2_ref, out2_ck)),
+        "max_abs_diff": float(_diff.max().item()),
+        "mean_abs_diff": float(_diff.mean().item()),
+        "logits_diff_raw": float(logits_diff),
+        "moe_impl": moe_impl,
+        "require_grouped_gemm": bool(require_grouped_gemm),
+    }
 
 
 l_quant = [
@@ -738,8 +804,8 @@ parser.add_argument(
     Default (None) auto-scales with K via ``_gfx1250_a8w4_default_kpad``
     -- (192, 128) for K<2048 (matches the historical default), and
     ~(K/4 rounded to 128, inter/4 rounded to 64) for K>=2048 (GPT-OSS
-    needs this; the static (192, 128) covers only ~6% of K=2880 and
-    fails the verdict by ~25% mismatch / 0.61 logits_diff).
+    needs this; the static (192, 128) covers only ~6%% of K=2880 and
+    fails the verdict by ~25%% mismatch / 0.61 logits_diff).
     e.g.: -hip 0,0""",
 )
 parser.add_argument(
@@ -751,6 +817,11 @@ parser.add_argument(
     "--no-legacy",
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
+)
+parser.add_argument(
+    "--grouped-gemm",
+    action="store_true",
+    help="Add an explicit gfx1250 a8w4 grouped_gemm case and assert it hits the grouped path.",
 )
 
 args = parser.parse_args()
@@ -925,6 +996,22 @@ def _iter_legacy_cases():
                         hidden_pad=hidden_pad,
                         intermediate_pad=intermediate_pad,
                     ), extras
+                    if args.grouped_gemm and triple == _PER1X32_FP8_FP4:
+                        yield _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            aiter.ActivationType.Swiglu,
+                            hidden_pad=0,
+                            intermediate_pad=0,
+                            use_bias=False,
+                            require_grouped_gemm=True,
+                        ), {"model": "grouped_gemm"}
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
                 for act_type in args.act:
@@ -967,6 +1054,10 @@ if not args.no_flydsl_csv:
     _case_iters.append(_iter_csv_cases())
 if not args.no_legacy:
     _case_iters.append(_iter_legacy_cases())
+elif args.grouped_gemm:
+    _case_iters.append(
+        case for case in _iter_legacy_cases() if case[1].get("model") == "grouped_gemm"
+    )
 case_iter = itertools.chain(*_case_iters)
 
 df = []
