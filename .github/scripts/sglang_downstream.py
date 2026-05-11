@@ -87,9 +87,8 @@ TESTS = [
         "timeout_minutes": 70,
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 3600",
-        "run_on_pr": False,
-        "run_on_schedule": False,
-        "comment": "fix PR https://github.com/ROCm/aiter/pull/2877 not merged yet",
+        "run_on_pr": True,
+        "run_on_schedule": True,
     },
     {
         "runner": "linux-aiter-mi35x-8",
@@ -102,8 +101,8 @@ TESTS = [
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-deepseek-v32-basic --nightly --timeout-per-file 5400",
         "run_on_pr": False,
-        "run_on_schedule": False,
-        "comment": "fix PR https://github.com/ROCm/aiter/pull/2877 not merged yet",
+        "comment": "Standalone performance job is too long for PR validation.",
+        "run_on_schedule": True,
     },
 ]
 
