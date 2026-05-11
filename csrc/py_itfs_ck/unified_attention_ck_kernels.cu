@@ -95,7 +95,9 @@ void unified_attention_fwd(
     // which handles any seqlen_q correctly via 1D grid with Q tile iteration).
     args.max_seqlen_q = (num_tokens == num_seqs) ? 1 : num_tokens;
 
-    args.cache_ptr_int32_overflow_possible = cache_ptr_int32_overflow_possible;
+    (void)cache_ptr_int32_overflow_possible; // accepted at the API for forward compat;
+                                             // CK pipeline currently gates pointer rebasing
+                                             // on row strides + head_dim, not on this flag.
 
     auto [launched, elapsed] = ck_tile::unified_attention(args, {stream});
     TORCH_CHECK(launched,
