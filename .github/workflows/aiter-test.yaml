@@ -117,23 +117,39 @@ jobs:
               export GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" &&
               prebuild_start=$(date +%s) &&
               set +e &&
-              python setup.py bdist_wheel 2>&1 | tee /tmp/aiter-prebuild.log
+              python setup.py bdist_wheel 2>&1 | tee .aiter-prebuild.log
               build_status=${PIPESTATUS[0]}
               set -e
               prebuild_end=$(date +%s)
-              if ! python3 .github/scripts/aiter_prebuild_summary.py \
-                --log /tmp/aiter-prebuild.log \
-                --build-status "${build_status}" \
-                --start "${prebuild_start}" \
-                --end "${prebuild_end}"
-              then
-                echo "::warning::Failed to produce Aiter prebuild summary"
-              fi
+              {
+                echo "BUILD_STATUS=${build_status}"
+                echo "PREBUILD_START=${prebuild_start}"
+                echo "PREBUILD_END=${prebuild_end}"
+              } > .aiter-prebuild.env
               if [ "${build_status}" -ne 0 ]; then
                 exit "${build_status}"
               fi
               ls -lh dist/*.whl
             '
+
+      - name: Summarize Aiter prebuild
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [ ! -f .aiter-prebuild.env ]; then
+            echo "::warning::Aiter prebuild metadata was not generated"
+            exit 0
+          fi
+          . ./.aiter-prebuild.env
+          AITER_RUNNER_NAME="${RUNNER_NAME:-unknown}" \
+          GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" \
+          PREBUILD_KERNELS=1 \
+          MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
+          python3 .github/scripts/aiter_prebuild_summary.py \
+            --log .aiter-prebuild.log \
+            --build-status "${BUILD_STATUS}" \
+            --start "${PREBUILD_START}" \
+            --end "${PREBUILD_END}"
 
       - name: Verify prebuilt kernels in wheel
         run: |
