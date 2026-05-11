@@ -485,26 +485,110 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    _test_graph = int(os.environ.get("AITER_TEST_GRAPH", "1")) != 0
-    out2_ck, us2 = run_perftest(
-        fused_moe,
-        input,
-        w1_qt_aiter,
-        w2_qt_aiter,
-        topk_weights,
-        topk_ids,
-        w1_scale=w1_scale_aiter,
-        w2_scale=w2_scale_aiter,
-        quant_type=qType,
-        activation=actType,
-        doweight_stage1=doweight_stage1,
-        intermediate_pad=intermediate_pad,
-        hidden_pad=hidden_pad,
-        bias1=exp_bias1_aiter,
-        bias2=exp_bias2_aiter,
-        num_iters=3,
-        num_warmup=1,
-        testGraph=_test_graph,
+    # Direct torch.cuda.Event(enable_timing=True) timing path -- bypasses
+    # run_perftest's torch.profiler trace so the reported `us2` is the
+    # raw kernel-side wall-clock from CUDA events.  Tunables via env:
+    #   AITER_MOE_WARMUP    : warmup iters       (default 5)
+    #   AITER_MOE_ITERS     : timed iters        (default 20)
+    #   AITER_MOE_L2_FLUSH  : zero a ~256MB scratch buffer between iters
+    #                         so each iter starts with a cold L2 (default 1)
+    #   AITER_MOE_USE_GRAPH : capture fused_moe() into a CUDAGraph and
+    #                         replay it for each timed iter, amortising
+    #                         host launch overhead (default 0).  Use to
+    #                         confirm whether the gap between fused and
+    #                         (stage1+stage2) is dominated by per-call
+    #                         launch / Python overhead.
+    _num_warmup = int(os.environ.get("AITER_MOE_WARMUP", "5"))
+    _num_iters = int(os.environ.get("AITER_MOE_ITERS", "20"))
+    _l2_flush = int(os.environ.get("AITER_MOE_L2_FLUSH", "1")) != 0
+    _use_graph = int(os.environ.get("AITER_MOE_USE_GRAPH", "0")) != 0
+    _l2_buf = (
+        torch.empty(64 * 1024 * 1024, dtype=dtypes.fp32, device="cuda")
+        if _l2_flush
+        else None
+    )
+
+    def _run_fused_moe():
+        return fused_moe(
+            input,
+            w1_qt_aiter,
+            w2_qt_aiter,
+            topk_weights,
+            topk_ids,
+            w1_scale=w1_scale_aiter,
+            w2_scale=w2_scale_aiter,
+            quant_type=qType,
+            activation=actType,
+            doweight_stage1=doweight_stage1,
+            intermediate_pad=intermediate_pad,
+            hidden_pad=hidden_pad,
+            bias1=exp_bias1_aiter,
+            bias2=exp_bias2_aiter,
+        )
+
+    out2_ck = None
+    if _use_graph:
+        # CUDAGraph capture protocol (see PyTorch docs / test_common.perftest):
+        #   1. Warm up on a side stream so any one-shot kernel JIT
+        #      (FlyDSL compile_moe_gemm1/2, triton per_1x32_*_quant) is
+        #      done before the capture stream starts recording.
+        #   2. Capture exactly one fused_moe() invocation.
+        #   3. Replay the graph each timed iter; this skips Python /
+        #      host launch overhead so the cuda.Event window is
+        #      essentially raw GPU kernel time.
+        _warm_stream = torch.cuda.Stream()
+        _warm_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(_warm_stream):
+            for _ in range(_num_warmup):
+                out2_ck = _run_fused_moe()
+        torch.cuda.current_stream().wait_stream(_warm_stream)
+        torch.cuda.synchronize()
+
+        _graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(_graph):
+            out2_ck = _run_fused_moe()
+        torch.cuda.synchronize()
+
+        _starts = [torch.cuda.Event(enable_timing=True) for _ in range(_num_iters)]
+        _ends = [torch.cuda.Event(enable_timing=True) for _ in range(_num_iters)]
+        for _i in range(_num_iters):
+            if _l2_buf is not None:
+                _l2_buf.zero_()
+            _starts[_i].record()
+            _graph.replay()
+            _ends[_i].record()
+        torch.cuda.synchronize()
+    else:
+        for _ in range(_num_warmup):
+            out2_ck = _run_fused_moe()
+        torch.cuda.synchronize()
+
+        _starts = [torch.cuda.Event(enable_timing=True) for _ in range(_num_iters)]
+        _ends = [torch.cuda.Event(enable_timing=True) for _ in range(_num_iters)]
+        for _i in range(_num_iters):
+            if _l2_buf is not None:
+                _l2_buf.zero_()
+            _starts[_i].record()
+            out2_ck = _run_fused_moe()
+            _ends[_i].record()
+        torch.cuda.synchronize()
+
+    _lat_us_sorted = sorted(
+        s.elapsed_time(e) * 1000.0 for s, e in zip(_starts, _ends)
+    )
+    us2 = _lat_us_sorted[len(_lat_us_sorted) // 2]  # median, in us
+    _mean_us = sum(_lat_us_sorted) / len(_lat_us_sorted)
+    aiter.logger.info(
+        "[cuda.Event] moe fused us: median=%.2f mean=%.2f min=%.2f max=%.2f "
+        "(warmup=%d iters=%d L2_flush=%s graph=%s)",
+        us2,
+        _mean_us,
+        _lat_us_sorted[0],
+        _lat_us_sorted[-1],
+        _num_warmup,
+        _num_iters,
+        _l2_flush,
+        _use_graph,
     )
     # gfx1250 FlyDSL paths inherently have block-quant noise (mxfp8/mxfp4)
     # that compounds over K-sums.  FlyDSL UT
@@ -530,12 +614,43 @@ def test_fmoe(
             _ck_atol, _ck_rtol = 0.25, 0.5
         elif AQDType == dtypes.fp8 and WQDType == dtypes.fp8:    # fp8
             _ck_atol, _ck_rtol = 0.25, 0.25
+    # Rough HBM-traffic estimate for the fused_moe call (lower bound: only
+    # counts the activation in/out plus E_effective expert weights; ignores
+    # workspace + intermediate buffers).  E_effective = min(E, token*topk)
+    # so decode-style small-token cases don't get charged for unused experts.
+    def _bytes_per_elem(d):
+        if d in (dtypes.bf16, dtypes.fp16):
+            return 2.0
+        if d == dtypes.fp8:
+            return 1.0
+        if d == dtypes.fp4x2:
+            return 0.5
+        return 2.0
+    _act_bytes = _bytes_per_elem(dtype)
+    _w_bytes = _bytes_per_elem(WQDType) if WQDType is not None else _act_bytes
+    _E_eff = min(E, token * topk)
+    _w1_n = inter_dim * 2 if use_g1u1 else inter_dim
+    _input_b = token * model_dim * _act_bytes
+    _w1_b = _E_eff * _w1_n * model_dim * _w_bytes
+    _w2_b = _E_eff * model_dim * inter_dim * _w_bytes
+    _w_scale_b = 0.0
+    if qType == aiter.QuantType.per_1x32:
+        _w_scale_b = _E_eff * (
+            _w1_n * (model_dim // 32) + model_dim * (inter_dim // 32)
+        )
+    _out_b = token * model_dim * _act_bytes
+    _total_b = _input_b + _w1_b + _w2_b + _w_scale_b + _out_b
+    _bw_GBps = _total_b / us2 / 1e3  # bytes/us == MB/s; /1e3 -> GB/s
     err = checkAllclose(
         out2_ref,
         out2_ck,
         atol=_ck_atol,
         rtol=_ck_rtol,
-        msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        msg=f"ck_moe_2stages:{us2:>8.2f} us, "
+        f"{token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops, "
+        f"{_bw_GBps:>8.2f} GB/s "
+        f"(M={token},dim={model_dim}/{inter_dim},E={E},topk={topk},"
+        f"act={_act_bytes}B,w={_w_bytes}B)......(quant:{AQDType})",
     )
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):

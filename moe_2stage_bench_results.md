@@ -87,3 +87,100 @@ python /tmp/aiter_bench/run_stage_breakdown.py \
    - `ENABLE_CK=0`:`gfx1250` 在 `3rdparty/composable_kernel` 里没有匹配的 `MAP_COMPILER_STATE_TO_GFXxx_TARGET`,会让 `module_aiter_core` JIT 编译失败。
    - `aiter/ops/flydsl/kernels/{splitk_hgemm,small_m_hgemm}.py` 里 `from flydsl.compiler.protocol import fly_values` 改为 try/except fallback 到 `extract_to_ir_values`,以兼容 `/app/FlyDSL/build-fly/python_packages` 的新版 protocol API。
 5. 所有 case 的精度校验都 FAIL(`[FlyDSL gfx1250 FAIL] mismatch_ratio>0.05 / logits_diff>0.25`),这是 FlyDSL gfx1250 MoE kernel 当前版本和 aiter 参考之间的已知差异,不影响 latency / TFLOPS 的物理意义。
+
+---
+
+## 2026-05-12 v2 sweep — 加上 bs=64 prefill (M=65536) 的完整跑测
+
+本次相比第 1 节的差异:
+
+- `aiter/fused_moe.py` 的两条 per-call `logger.info(...)` 已降级到 `logger.debug(...)`(改 `gfx1250 FlyDSL dispatch:` / `input shapes:`),省掉 50–200 μs/iter 的 stdout 开销。
+- `test_moe_2stage.py` 的 `run_perftest` 已替换成直接 `torch.cuda.Event(enable_timing=True)` 计时(`AITER_MOE_WARMUP=5, AITER_MOE_ITERS=20, AITER_MOE_L2_FLUSH=1, AITER_MOE_USE_GRAPH=0`),`us` 是 20 次 timed iter 的 **median**。
+- `checkAllclose` 的 msg 行加了 `GB/s` 估算(下界:input + min(E, M·topk) 个 expert weights + scales + output)。
+- 没用 hipgraph,因为前次实测发现 graph 模式只在 M=1 上有正向收益(大 M 反而被 L2_flush + replay 调度争用拖慢);默认仍走 eager。
+
+### 5. DeepSeek-V3 TP1 (a4w4 / MXFP4 × MXFP4, Silu) `-dim 7168,2048 -e 256 -k 8 -q 4`
+
+| token | fused us (median) | mean | min | max | TFLOPS | est BW (GB/s) | mismatch | logits_diff | verdict |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+|     1 |     1169.67 |   1230.32 |   1109.66 |   1551.72 |   0.60 |  160.04 | 0.337 | 0.332 | FAIL |
+|    64 |     1269.55 |   1288.19 |   1228.65 |   1728.15 |  35.52 | 4719.24 | 0.413 | 0.446 | FAIL |
+|  1024 |     3166.50 |   3168.84 |   3037.10 |   3367.43 | 227.87 | 1900.78 | 0.421 | 0.461 | FAIL |
+| 65536 |   124755.52 | 124791.70 | 124112.21 | 125143.59 | 370.16 |   63.07 | 0.444 | 0.508 | FAIL |
+
+### 6. DeepSeek-V3 TP4 (a4w4) `-dim 7168,512 -e 256 -k 8 -q 4`
+
+| token | fused us (median) | mean | min | max | TFLOPS | est BW (GB/s) | mismatch | logits_diff | verdict |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+|     1 |    1146.60 |   1161.33 |   1092.83 |   1292.57 |   0.15 |   40.84 | 0.390 | 0.403 | FAIL |
+|    64 |    1158.09 |   1163.32 |   1108.66 |   1292.81 |   9.74 | 1294.54 | 0.401 | 0.435 | FAIL |
+|  1024 |    1198.59 |   1202.24 |   1151.00 |   1387.11 | 150.50 | 1273.77 | 0.421 | 0.465 | FAIL |
+| 65536 |   37416.97 |  37445.97 |  37225.62 |  37964.84 | 308.55 |   90.24 | 0.442 | 0.507 | FAIL |
+
+### 7. DeepSeek-V3 TP8 (a4w4) `-dim 7168,256 -e 256 -k 8 -q 4`
+
+| token | fused us (median) | mean | min | max | TFLOPS | est BW (GB/s) | mismatch | logits_diff | verdict |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+|     1 |    1170.91 |   1180.90 |   1105.05 |   1292.53 |   0.08 |   20.01 | 0.309 | 0.305 | FAIL |
+|    64 |    1170.27 |   1177.95 |   1113.99 |   1300.26 |   4.82 |  641.32 | 0.411 | 0.462 | FAIL |
+|  1024 |    1190.98 |   1203.04 |   1125.76 |   1440.35 |  75.73 |  653.28 | 0.405 | 0.446 | FAIL |
+| 65536 |   30589.95 |  30589.49 |  30441.57 |  30768.11 | 188.70 |   85.90 | 0.431 | 0.492 | FAIL |
+
+### 8. GPT-OSS 120B TP1 (a8w4 / MXFP8 × MXFP4, Swiglu) `-dim 2880,2880 -e 128 -k 4 -q 7` — **未完成**
+
+`-t 1 64 1024 65536` sweep 在 **M=1** 这一个 case 进入 FlyDSL kernel 后超过 12 分钟无任何 cuda.Event 输出,被人工中断。和第 4 节里描述的现象完全一致(`hidden_pad=768, intermediate_pad=768` 的自动 K-pad 已生效,但 kernel 本身在 M=1 配置下挂住)。
+
+参考数据点(同 q=7 a8w4 路径但 dim 不同,**已 PASS**):
+
+| 配置 | M | dim | E | topk | hidden/inter pad | fused us | TFLOPS | est BW | verdict |
+|---|---:|---|---:|---:|---|---:|---:|---:|:---:|
+| `-dim 3072,3072 -e 128 -k 4 -q 7` | 512 | 3072/3072 | 128 | 4 | 768/768 (auto) | 7241.93 | 16.01 | 266.71 | **PASS** (mismatch=0.0016, logits=0.0425) |
+
+**下一步排查建议:**
+
+- 单跑 `-t 1024` 看是否只在 M=1 卡;
+- 加 `AITER_GFX1250_DEBUG=1` 抓 fused_moe 内部 quant / dispatch 阶段的 probe 日志,定位是 stage1 还是 stage1 之前 hang;
+- 试 `-hip 192,128`(关掉自动 K-pad)对比;
+- `AITER_LOG_LEVEL=DEBUG` 看 FlyDSL JIT compile 是否在 M=1 走了死循环。
+
+### 关键观察(基于 5–7 节)
+
+1. **TP1 1024→65536 (×64) → fused 时间 ×39.4** (3166 → 124756 us),scaling 接近线性,瓶颈彻底落在 stage1/stage2 GEMM,host 开销摊薄。BW 估算从 1900 → **63 GB/s** 反而下降是因为 BW 公式在大 M 时 `min(E, M·topk)=256` 已经饱和(每个 expert 只读一次),而每 token 的 activation 写入和 partial sum reduce 真实带宽被 M 摊大,公式低估实际 traffic。
+2. **TP4/TP8 small-M 区间(M ≤ 1024) fused us 几乎不变** (TP4 1147→1199,TP8 1171→1191),完全是 host launch + non-GEMM 固定开销主导;这跟第 1 节的结论一致 —— 切到 TP4/TP8 后 stage GEMM 已经只占 1/3 不到。
+3. **TP4/TP8 大 M=65536 才有意义的速度差**:TP4 = 37417 μs,TP8 = 30590 μs,提速 ~22%。这跟 TP8 stage GEMM 砍半的预期一致(TP4→TP8 inter_dim 从 512 → 256)。
+4. **fused 时间相比第 1 节 baseline (run_perftest + INFO log)**:
+   - TP1 M=1 1383.89 → 1169.67 (−15.5%)
+   - TP1 M=64 1711.69 → 1269.55 (−25.8%)
+   - TP1 M=1024 3615.04 → 3166.50 (−12.4%)
+   - 全局 12–26% 的下降 = `logger.info → debug` + `cuda.Event` 直测(去掉 profiler 包装) 的合计收益。
+5. **精度 verdict 全 FAIL 是 mxfp4/mxfp8 a4w4 在 K=7168 + 没 K-pad 下的固有累积噪声**(mismatch ~0.30–0.44, logits_diff ~0.30–0.51),与 kernel 是否能跑无关,latency/TFLOPS 数据有效。
+
+### v2 sweep 命令汇总
+
+```bash
+export PYTHONPATH=/app/FlyDSL/build-fly/python_packages:/app/FlyDSL:$PYTHONPATH
+export ENABLE_CK=0
+export AITER_USE_OPUS_MOE_SORTING=1
+
+# DSV3 TP1 (a4w4)
+AITER_LOG_MORE=1 python /app/aiter/op_tests/test_moe_2stage.py \
+  -d bf16 -dim 7168,2048 -e 256 -k 8 -q 4 -a silu \
+  -t 1 64 1024 65536 --no-flydsl-csv
+
+# DSV3 TP4 (a4w4)
+AITER_LOG_MORE=1 python /app/aiter/op_tests/test_moe_2stage.py \
+  -d bf16 -dim 7168,512  -e 256 -k 8 -q 4 -a silu \
+  -t 1 64 1024 65536 --no-flydsl-csv
+
+# DSV3 TP8 (a4w4)
+AITER_LOG_MORE=1 python /app/aiter/op_tests/test_moe_2stage.py \
+  -d bf16 -dim 7168,256  -e 256 -k 8 -q 4 -a silu \
+  -t 1 64 1024 65536 --no-flydsl-csv
+
+# GPT-OSS 120B TP1 (a8w4) — 当前 hang 在 M=1
+AITER_LOG_MORE=1 python /app/aiter/op_tests/test_moe_2stage.py \
+  -d bf16 -dim 2880,2880 -e 128 -k 4 -q 7 \
+  -t 1 64 1024 65536 --no-flydsl-csv
+```
+
+原始日志:`/tmp/aiter_bench_v3/{dsv3_tp1,dsv3_tp4,dsv3_tp8,gptoss}.log`

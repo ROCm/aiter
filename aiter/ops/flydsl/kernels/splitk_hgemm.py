@@ -11,7 +11,13 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm, memref, scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.compiler.protocol import fly_values
+try:
+    from flydsl.compiler.protocol import fly_values
+except ImportError:
+    # Newer FlyDSL builds (e.g. /app/FlyDSL/build-fly/python_packages,
+    # protocol.py post-rename) replaced fly_values with extract_to_ir_values
+    # but kept the (obj) -> List[ir.Value] signature unchanged.
+    from flydsl.compiler.protocol import extract_to_ir_values as fly_values
 from flydsl.expr import arith, gpu, range_constexpr, const_expr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
