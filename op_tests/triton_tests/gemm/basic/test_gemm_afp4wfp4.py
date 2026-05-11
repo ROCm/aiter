@@ -1,17 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import pytest
+import triton
 import torch
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffle,
 )
-from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4
+from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
+    gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4,
+)
 
 from aiter.ops.triton.gluon.triton_version import TRITON_VERSION_EQ_3_5
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.shuffle import shuffle_weight,shuffle_weight_gfx1250
+from aiter.ops.shuffle import shuffle_weight, shuffle_weight_gfx1250
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -40,33 +43,40 @@ def un_shuffle_scales(scales_shuffled: torch.Tensor):
     return scales
 
 
-def shuffle_scales_gfx1250(scales: torch.Tensor, preshuffle_factor: int = 32):
-    """Shuffle scales for gfx1250 unshuffle pattern in the kernel."""
-    sm, sn = scales.shape
-    scale_kwidth = 4 if sn >= 4 else sn
-    num_chunk_n = sm // preshuffle_factor
-    num_chunk_k = sn // scale_kwidth
-
-    data = scales.view(num_chunk_n, 4, preshuffle_factor // 4, num_chunk_k, scale_kwidth)
-    data = data.permute(0, 3, 2, 1, 4).contiguous()
-    data = data.view(sm // preshuffle_factor, sn * preshuffle_factor)
-    return data
-
-
-def unshuffle_scales_gfx1250(scales_shuffled: torch.Tensor, preshuffle_factor: int = 32):
-    """Inverse of shuffle_scales_gfx1250."""
-    sm_packed, sn_packed = scales_shuffled.shape
-    sm = sm_packed * preshuffle_factor
-    sn = sn_packed // preshuffle_factor
-    scale_kwidth = 4 if sn >= 4 else sn
-
-    data = scales_shuffled.view(
-        sm // preshuffle_factor, sn // scale_kwidth,
-        preshuffle_factor // 4, 4, scale_kwidth,
+def shuffle_scales_gfx1250(scales: torch.Tensor, BLOCK_K=256) -> torch.Tensor:
+    # Per-tile preshuffle. Each tile T occupies a contiguous K-byte stripe
+    # [T*K_GROUPS*4, (T+1)*K_GROUPS*4) in the output, with the 4 lanes packed
+    # adjacently inside each stripe so the kernel's TDM read sees:
+    #   [tile_T_lane_0_K_groups | tile_T_lane_1 | tile_T_lane_2 | tile_T_lane_3]
+    M, total_K_groups = scales.shape
+    LANES_PER_B128 = 4
+    K_GROUPS = BLOCK_K // SCALE_GROUP_SIZE
+    assert M % LANES_PER_B128 == 0
+    assert total_K_groups % K_GROUPS == 0
+    k_tiles = total_K_groups // K_GROUPS
+    return (
+        scales.reshape(M // LANES_PER_B128, LANES_PER_B128, k_tiles, K_GROUPS)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(M // LANES_PER_B128, k_tiles * LANES_PER_B128 * K_GROUPS)
     )
-    data = data.permute(0, 3, 2, 1, 4).contiguous()
-    data = data.view(sm, sn)
-    return data
+
+
+def unshuffle_scales_gfx1250(
+    scales_shuffled: torch.Tensor, BLOCK_K=256, M: int = None
+) -> torch.Tensor:
+    LANES_PER_B128 = 4
+    K_GROUPS = BLOCK_K // SCALE_GROUP_SIZE
+    rows, cols = scales_shuffled.shape
+    if M is None:
+        M = rows * LANES_PER_B128
+    k_tiles = cols // (LANES_PER_B128 * K_GROUPS)
+    return (
+        scales_shuffled.reshape(rows, k_tiles, LANES_PER_B128, K_GROUPS)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(M, k_tiles * K_GROUPS)
+    )
 
 
 # Note this is specified by the HW and cannot be changed.
@@ -126,10 +136,10 @@ def generate_gemm_afp4wfp4_inputs(
     if shuffle_scales_fg:
         if DEVICE_ARCH == "gfx1250":
             if M >= 32:
-                x_scales_shuffled = shuffle_scales_gfx1250(x_scales, preshuffle_factor=32)
+                x_scales_shuffled = shuffle_scales_gfx1250(x_scales)
             else:
                 x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scales_gfx1250(w_scales, preshuffle_factor=32)
+            w_scales_shuffled = shuffle_scales_gfx1250(w_scales)
         else:
             if M >= 32:
                 x_scales_shuffled = shuffle_scales(x_scales)
@@ -183,7 +193,7 @@ def get_x_vals():
     x_vals += [(v, 7168, 4608) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 2112, 7168) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
-    x_vals += [(2048,8192,4096)]
+    x_vals += [(2048, 8192, 4096)]
     return x_vals
 
 
@@ -236,7 +246,7 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("output", [True, False])
-@pytest.mark.parametrize("shuffle_weight_scales",[True, False])
+@pytest.mark.parametrize("shuffle_weight_scales", [True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
 @pytest.mark.parametrize("impl", ["triton", "gluon"])
 def test_gemm_afp4_wfp4(
@@ -249,9 +259,7 @@ def test_gemm_afp4_wfp4(
     impl,
 ):
     if impl == "gluon" and not arch_info.is_gluon_avail():
-        pytest.skip(
-            "Gluon implementation is not supported on this GPU."
-        )
+        pytest.skip("Gluon implementation is not supported on this GPU.")
     dtype = torch.bfloat16
     # TODO(brunomazzotti): Fix gluon instr shape then enable gluon tests conditionally on 950
     if impl == "gluon":
@@ -296,8 +304,14 @@ def test_gemm_afp4_wfp4(
     if shuffle_weight_scales:
         use_aot: bool = TRITON_VERSION_EQ_3_5 and dtype == torch.bfloat16
         triton_out = gemm_afp4wfp4_preshuffle(
-            x, w_triton, x_scales_triton, w_scales_triton, dtype, y,
-            use_aot=use_aot, skip_reduce=skip_reduce,
+            x,
+            w_triton,
+            x_scales_triton,
+            w_scales_triton,
+            dtype,
+            y,
+            use_aot=use_aot,
+            skip_reduce=skip_reduce,
         )
     else:
         if impl == "triton":
@@ -306,18 +320,25 @@ def test_gemm_afp4_wfp4(
             fn = gluon_gemm_afp4wfp4_CDNA4
         else:
             raise ValueError(f"Unknown implementation: {impl}")
-        triton_out = fn(x, w_triton, x_scales_triton, w_scales_triton, dtype, y,
-                        skip_reduce=skip_reduce)
+        triton_out = fn(
+            x,
+            w_triton,
+            x_scales_triton,
+            w_scales_triton,
+            dtype,
+            y,
+            skip_reduce=skip_reduce,
+        )
 
     if triton_out.dim() == 3:
         triton_out = triton_out.sum(dim=0).to(dtype)
 
-    torch.testing.assert_close(torch_out, triton_out)
+    triton.testing.assert_close(torch_out, triton_out)
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["TN", "TT"]) # "NN", "NT"
+@pytest.mark.parametrize("layout", ["TN", "TT"])  # "NN", "NT"
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_mxfp4_preshuffled_gfx1250(
     M: int,
@@ -363,8 +384,12 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     triton_out = gemm_afp4wfp4_preshuffle(
-        x, w_preshuf, x_scales_shuffled, w_scales_shuffled, dtype,
+        x,
+        w_preshuf,
+        x_scales_shuffled,
+        w_scales_shuffled,
+        dtype,
         y if y is not None else torch.empty_like(torch_out),
     )
 
-    torch.testing.assert_close(torch_out, triton_out)
+    triton.testing.assert_close(torch_out, triton_out)
