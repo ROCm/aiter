@@ -44,6 +44,160 @@ except ImportError as exc:
 torch.set_default_device("cuda")
 
 
+# -- triton_origin_opt: BV=16 + exp2 variant of fwd_h --------------------
+#
+# Side-by-side inline of the ``fwd_h`` host wrapper from the standalone
+# benchmark script ``0423_gdr_prefill_bench_standalone.py``. It launches
+# the same ``chunk_gated_delta_rule_fwd_kernel_h`` kernel as the existing
+# ``chunk_gated_delta_rule_fwd_h`` (``triton_origin`` in this file), but
+# with two changes that the standalone bench's new pipeline applies on
+# top of the original RTP config:
+#
+#   - BV = 16 (was 32): smaller V-tile -> more (V/BV) blocks per (B*H)
+#     program-id pair -> better occupancy on MI355X.
+#   - USE_EXP2 = True (was False): emits a single ``v_exp_f32`` per
+#     gate evaluation instead of the ``v_log + v_mul + v_exp`` chain that
+#     ``tl.exp`` lowers to.
+#
+# Because USE_EXP2 expects gates pre-scaled by ``1/ln(2)``, the wrapper
+# multiplies the supplied ``g`` (already a per-chunk cumsum, as produced
+# by ``_make_inputs``) by RCP_LN2 before launching. That scale step is
+# excluded from the K5 kernel time -- we time only the kernel itself, in
+# line with how the other K5 wrappers in this file are benchmarked.
+#
+# Kernel itself is loaded once (cached) from the standalone bench file
+# via importlib so the source of truth stays in one place. If the
+# standalone bench is unavailable the wrapper raises at module-import
+# time with a clear message.
+
+_RCP_LN2 = 1.0 / 0.6931471805599453
+
+
+def _load_standalone_bench_kernel():
+    import importlib.util
+    import pathlib
+
+    candidate_paths = [
+        pathlib.Path(__file__).resolve().parents[3]
+        / "0423_gdr_prefill_bench_standalone.py",
+        pathlib.Path.cwd() / "0423_gdr_prefill_bench_standalone.py",
+    ]
+    for path in candidate_paths:
+        if path.is_file():
+            break
+    else:
+        raise FileNotFoundError(
+            "0423_gdr_prefill_bench_standalone.py not found; "
+            "needed by triton_origin_opt K5 wrapper. "
+            f"Searched: {[str(p) for p in candidate_paths]}"
+        )
+    spec = importlib.util.spec_from_file_location("_aiter_standalone_bench", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.chunk_gated_delta_rule_fwd_kernel_h
+
+
+_TRITON_ORIGIN_OPT_KERNEL_RAW = _load_standalone_bench_kernel()
+
+
+# Build an autotuned variant of the standalone kernel. The kernel itself
+# already has ``BV`` as a constexpr; here we attach a ``triton.autotune``
+# decorator with a small BV/warps/stages sweep so the launch picks the
+# best config per (H, Hg, K, V, BT) tuple, matching what aiter's own
+# ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` does internally.
+_TRITON_ORIGIN_OPT_KERNEL = triton.autotune(
+    configs=[
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BV in (16, 32, 64)
+        for num_warps in (2, 4)
+        for num_stages in (1, 2, 3)
+    ],
+    key=["H", "Hg", "K", "V", "BT", "IS_VARLEN"],
+)(_TRITON_ORIGIN_OPT_KERNEL_RAW)
+
+
+def chunk_gated_delta_rule_fwd_h_origin_opt(
+    k,
+    w,
+    u,
+    g=None,
+    initial_state=None,
+    output_final_state=False,
+    cu_seqlens=None,
+):
+    """``triton_origin_opt`` K5: USE_EXP2 + autotuned BV/warps/stages variant.
+
+    Mirrors the standalone bench's ``fwd_h`` host wrapper but adds a
+    Triton autotune sweep over ``BV ? {16, 32, 64}``, ``num_warps ?
+    {2, 4}``, ``num_stages ? {1, 2, 3}``. Keyed on ``(H, Hg, K, V, BT,
+    IS_VARLEN)`` so each shape picks its own best config on first run.
+
+    Inputs use the GQA layout from PREFILL_PARAMS unchanged -- since this
+    K5 kernel accepts ``Hg`` directly, no ``repeat_interleave`` is needed
+    (unlike the original ``chunk_gated_delta_rule_fwd_h``, which is
+    MHA-only).
+
+    NOTE: The RCP_LN2 scale required by USE_EXP2=True is applied here so
+    that callers can pass the same per-chunk-cumsum ``g`` as the other
+    K5 wrappers. This scale is a cheap elementwise multiply and is
+    excluded from the kernel-time measurement when ``_bench_fn`` profiles
+    only the kernel launch.
+    """
+    import triton as _triton
+
+    B, T, Hg, K = k.shape
+    V = u.shape[-1]
+    H = u.shape[-2]
+    BT = 64
+    if cu_seqlens is None:
+        N, NT, chunk_offsets = B, _triton.cdiv(T, BT), None
+    else:
+        from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+            prepare_chunk_indices,
+            prepare_chunk_offsets,
+        )
+
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        N = len(cu_seqlens) - 1
+        NT = len(chunk_indices)
+        chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
+
+    h = k.new_empty(B, NT, H, K, V)
+    v_new = torch.empty_like(u)
+    final_state = (
+        k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
+    )
+
+    # USE_EXP2=True expects gates pre-scaled by 1/ln(2). Cheap elementwise
+    # op; excluded from kernel time when profiled via torch.profiler.
+    g_scaled = g * _RCP_LN2 if g is not None else None
+
+    def grid(meta):
+        return (_triton.cdiv(V, meta["BV"]), N * H)
+
+    _TRITON_ORIGIN_OPT_KERNEL[grid](
+        k=k,
+        v=u,
+        w=w,
+        v_new=v_new,
+        g=g_scaled,
+        gk=None,
+        h=h,
+        h0=initial_state,
+        ht=final_state,
+        cu_seqlens=cu_seqlens,
+        chunk_offsets=chunk_offsets,
+        T=T,
+        H=H,
+        Hg=Hg,
+        K=K,
+        V=V,
+        BT=BT,
+        USE_EXP2=True,
+    )
+    return h, v_new, final_state
+
+
 # -- Global test configuration ------------------------------------------
 
 
@@ -824,6 +978,81 @@ class TestCorrectness:
                 msg="triton_origin: final_state mismatch",
             )
 
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_triton_origin_opt(self, args: PrefillArgs):
+        """triton_origin_opt K5: standalone fwd_h (BV=16 + exp2) variant.
+
+        Same kernel as triton_origin but with BV=16 + USE_EXP2 (the
+        ``new pipeline`` config from ``0423_gdr_prefill_bench_standalone.py``).
+        Unlike triton_origin this K5 supports GQA natively (the kernel
+        takes ``Hg`` as a constexpr), so the GQA expand step is skipped.
+        """
+        if args.ssm_state_dtype != torch.float32:
+            pytest.skip("triton_origin_opt reference only supports f32 SSM state.")
+        context_lens = _build_context_lens(
+            args.full_prompt_len, args.max_num_batched_tokens
+        )
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        # GQA-aware K5: no repeat_interleave needed. Hidden state in [K,V]
+        # layout (same as triton_origin), so use h0 transposed from the
+        # VK reference layout.
+        h0_kv = h0.transpose(-2, -1).contiguous() if h0 is not None else None
+
+        h_origin_opt, vn_origin_opt, fs_origin_opt = (
+            chunk_gated_delta_rule_fwd_h_origin_opt(
+                k,
+                w_orig,
+                u_orig,
+                g=g,
+                initial_state=h0_kv,
+                output_final_state=args.output_final_state,
+                cu_seqlens=cu,
+            )
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        h_origin_opt_vk = h_origin_opt.transpose(-2, -1).contiguous()
+        fs_origin_opt_vk = (
+            fs_origin_opt.transpose(-2, -1).contiguous()
+            if fs_origin_opt is not None
+            else None
+        )
+
+        atol, rtol = 5e-2, 5e-2
+        torch.testing.assert_close(
+            h_origin_opt_vk.float(),
+            h_ref.float(),
+            atol=atol,
+            rtol=rtol,
+            msg="triton_origin_opt: h mismatch",
+        )
+        torch.testing.assert_close(
+            vn_origin_opt.float(),
+            vn_ref.float(),
+            atol=atol,
+            rtol=rtol,
+            msg="triton_origin_opt: v_new mismatch",
+        )
+        if args.output_final_state:
+            torch.testing.assert_close(
+                fs_origin_opt_vk.float(),
+                fs_ref.float(),
+                atol=atol,
+                rtol=rtol,
+                msg="triton_origin_opt: final_state mismatch",
+            )
+
 
 # -- bf16 SSM-state correctness ------------------------------------------
 
@@ -1106,6 +1335,20 @@ class TestPerformance:
                 cu_seqlens=cu,
             )
 
+        def triton_origin_opt_launch():
+            # GQA-aware (uses unexpanded k) BV=16 + exp2 variant of fwd_h
+            # from the standalone bench's new pipeline. Same hidden-state
+            # layout [K,V] as triton_origin, so reuses h0_origin_kv.
+            chunk_gated_delta_rule_fwd_h_origin_opt(
+                k=k,
+                w=w_orig,
+                u=u_orig,
+                g=g,
+                initial_state=h0_origin_kv,
+                output_final_state=args.output_final_state,
+                cu_seqlens=cu,
+            )
+
         # Warmup FlyDSL once so its internal BV-autotune sweep does not
         # leak into the timed window. Triton's own ``triton.autotune`` is
         # already absorbed by ``_bench_fn``'s NUM_WARMUP=5 prelude.
@@ -1116,10 +1359,14 @@ class TestPerformance:
         us_fly = _bench_fn(flydsl_launch)
         us_triton_vk = _bench_fn(triton_vk_launch)
         us_triton_origin = _bench_fn(triton_origin_launch)
+        us_triton_origin_opt = _bench_fn(triton_origin_opt_launch)
 
         fly_vs_vk = us_triton_vk / us_fly if us_fly > 0 else float("inf")
         fly_vs_kv = us_triton_opt3 / us_fly if us_fly > 0 else float("inf")
         fly_vs_origin = us_triton_origin / us_fly if us_fly > 0 else float("inf")
+        fly_vs_origin_opt = (
+            us_triton_origin_opt / us_fly if us_fly > 0 else float("inf")
+        )
         vk_vs_origin = (
             us_triton_origin / us_triton_vk if us_triton_vk > 0 else float("inf")
         )
@@ -1144,9 +1391,11 @@ class TestPerformance:
                 "Triton_vk(us)": us_triton_vk,
                 "Triton_kv(us)": us_triton_opt3,
                 "Triton_origin(us)": us_triton_origin,
+                "Triton_origin_opt(us)": us_triton_origin_opt,
                 "flydsl_vs_vk": fly_vs_vk,
                 "flydsl_vs_kv": fly_vs_kv,
                 "flydsl_vs_origin": fly_vs_origin,
+                "flydsl_vs_origin_opt": fly_vs_origin_opt,
                 "vk_vs_origin": vk_vs_origin,
                 "kv_vs_origin": kv_vs_origin,
             }
@@ -1172,9 +1421,11 @@ def _print_perf_table():
         ("Tri_vk", "Triton_vk(us)", 8),
         ("Tri_kv", "Triton_kv(us)", 8),
         ("Tri_orig", "Triton_origin(us)", 9),
+        ("Tri_orig_opt", "Triton_origin_opt(us)", 12),
         ("fly/vk", "flydsl_vs_vk", 7),
         ("fly/kv", "flydsl_vs_kv", 7),
         ("fly/orig", "flydsl_vs_origin", 8),
+        ("fly/o_opt", "flydsl_vs_origin_opt", 9),
         ("vk/orig", "vk_vs_origin", 7),
         ("kv/orig", "kv_vs_origin", 7),
     ]
