@@ -323,6 +323,14 @@ def build_sage_attn_cdna_module(
         kds_ptr = _extract_aligned_pointer(K_descale)
         vds_ptr = _extract_aligned_pointer(V_descale)
 
+        # Buffer descriptors for K/V global loads (Attack #2).
+        # Holding the base in SGPRs (V#) instead of a VGPR base pointer can
+        # free a few VGPRs and unblock LLVM scheduling. Row OOB is still
+        # clamped at the address-compute level (see coop_load_k/v), so
+        # max_size=True is safe — every load address is within the tensor.
+        k_rsrc = buffer_ops.create_buffer_resource(K, max_size=True)
+        v_rsrc = buffer_ops.create_buffer_resource(V, max_size=True)
+
         v4i32_type = Vec.make_type(4, fx.Int32)
         v4f32_type = Vec.make_type(4, fx.Float32)
         v8f32_type = Vec.make_type(8, fx.Float32)
@@ -518,7 +526,15 @@ def build_sage_attn_cdna_module(
                     g_idx = kv_global_idx(row_idx, load_col_k_base)
                     lds_row = load_row_k_batch + row_offset
                     lds_idx = buf_off + lds_row * K_STRIDE + load_col_k_base
-                    vec = _load_ptr_i8_vec16(k_ptr, g_idx)
+                    # buffer_load_dwordx4: g_idx is in i8 elements (=bytes); divide
+                    # by 4 to get the dword index buffer_load expects when dtype=i32.
+                    g_dword_i32 = arith.unwrap(
+                        arith.index_cast(T.i32, _raw(g_idx >> fx.Index(2)))
+                    )
+                    v4i32 = buffer_ops.buffer_load(
+                        k_rsrc, g_dword_i32, vec_width=4, dtype=T.i32
+                    )
+                    vec = vector.bitcast(v16i8_type, v4i32)
                     Vec(vec).store(lds, [lds_idx])
 
         # V is stored in the upper half of LDS, COLUMN-MAJOR (transposed):
@@ -557,7 +573,13 @@ def build_sage_attn_cdna_module(
                     do_load = True
                 if do_load:
                     g_idx = kv_global_idx(row_idx, load_col_v_base)
-                    raw_v = _load_ptr_i8_vec16(v_ptr, g_idx)  # v16i8
+                    g_dword_i32 = arith.unwrap(
+                        arith.index_cast(T.i32, _raw(g_idx >> fx.Index(2)))
+                    )
+                    v4i32 = buffer_ops.buffer_load(
+                        v_rsrc, g_dword_i32, vec_width=4, dtype=T.i32
+                    )
+                    raw_v = vector.bitcast(v16i8_type, v4i32)
                     zero_v16i8 = Vec.filled(16, 0, fx.Int8).ir_value()
                     raw_v = ArithValue(kv_in_bounds).select(raw_v, zero_v16i8)
 
