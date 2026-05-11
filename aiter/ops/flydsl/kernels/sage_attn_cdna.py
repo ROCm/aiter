@@ -717,20 +717,14 @@ def build_sage_attn_cdna_module(
                 arith.index_cast(T.i32, _v_lane_base_index)
             )
 
-        # ===== Attack #4: cross-iter softmax pipeline =====
-        # Strategy: PV[k] for iter k uses p_words computed in PRIOR iter (or
-        # prologue for k=0). Within iter k's loop body we then compute
-        # softmax[k+1] for the NEXT iter — those VALU ops are independent of
-        # PV[k]'s MFMA chain (no source dep), so the JIT scheduler can hide
-        # them in PV[k]'s MFMA shadow. p_words and corr are loop-carried
-        # across the scf.for yield boundary.
-        #
-        # Last-iter handling: the loop unconditionally also computes softmax
-        # for kv_block_start+BLOCK_N. On the last iter that block is fully OOB
-        # (kv_col >= seq_len_k), so the non-causal mask sets all elements to
-        # -inf → m_new = m_running, corr = 1.0, p = 0, l_new = l_running. The
-        # math is preserved. We must clamp the K-descale index to avoid an OOB
-        # load (handled in _emit_qk_softmax_pquant).
+        # ===== Straight QK→softmax→PV per iter (Attack #3 2026-05-11) =====
+        # Cross-iter softmax pipelining was tried and added scf.for yield
+        # pressure for p_words+corr (16 i32 + 1 f32 across the boundary)
+        # without a measured win at long-S vs Triton. Triton uses straight
+        # QK→softmax→PV per iter and wins. Restoring that simpler structure
+        # to (a) shrink loop-carried state by ~17 vregs and (b) let the JIT
+        # scheduler interleave softmax VALU into PV MFMA shadow naturally
+        # within a single iter rather than across the yield boundary.
         N_SUBTILES = BLOCK_N // MFMA_N
         ELEMS_PER_TILE = 16
         NUM_S_VALS = N_SUBTILES * ELEMS_PER_TILE
@@ -880,50 +874,37 @@ def build_sage_attn_cdna_module(
 
         # ---- Prologue ----
         # Prefetch buf 0 (K[0]/V[0]) AND buf 1 (K[1]/V[1] — harmless if num_iters<2;
-        # coop loaders clamp OOB rows to row 0). Then barrier and compute QK[0]
-        # + softmax[0] using buf 0 K. Carry m, l, corr, p_words[0] into the loop.
+        # coop loaders clamp OOB rows to row 0). Then barrier; iter 0 computes
+        # softmax[0] from buf 0 in-line.
         coop_load_k(ZERO_INDEX, ZERO_INDEX)
         coop_load_v(ZERO_INDEX, ZERO_INDEX)
         coop_load_k(fx.Index(BLOCK_N), K_BUF1_OFF)
         coop_load_v(fx.Index(BLOCK_N), V_BUF1_OFF)
         gpu.barrier()
 
-        m_p0, l_p0, corr_p0, p_words_p0 = _emit_qk_softmax_pquant(
-            fx.Index(0), ZERO_INDEX, c_neg_inf, c_zero_f
-        )
-
-        # i32 0 — current PV buffer index for iter 0 (buf 0 holds V[0]).
+        # i32 0 — current buffer index for iter 0 (buf 0 holds K[0]/V[0]).
         c0_i32_init = arith.constant(0, type=T.i32)
 
-        # Iter args layout: [cur_buf, m, l, corr, *o_accs (D_CHUNKS),
-        #                    *p_words (N_SUBTILES * 4 i32)]
-        init_args = [c0_i32_init, _raw(m_p0), _raw(l_p0), _raw(corr_p0)]
+        # Iter args layout (Attack #3 — no cross-iter softmax):
+        #   [cur_buf (i32), m (f32), l (f32), *o_accs (D_CHUNKS × v16f32)]
+        # Drops `corr` and `p_words` (N_SUBTILES * 4 i32) from the prior
+        # cross-iter scheme — those values are now consumed within the same
+        # iter that produces them and need not cross the scf.for yield.
+        init_args = [c0_i32_init, _raw(c_neg_inf), _raw(c_zero_f)]
         for _ in range_constexpr(D_CHUNKS):
             init_args.append(_raw(c_zero_v16f32))
-        for st in range_constexpr(N_SUBTILES):
-            for w in range_constexpr(4):
-                init_args.append(_raw(p_words_p0[st][w]))
 
         _OFF_CUR_BUF = 0
         _OFF_M = 1
         _OFF_L = 2
-        _OFF_CORR = 3
-        _OFF_O_ACCS = 4
-        _OFF_P_WORDS = 4 + D_CHUNKS
+        _OFF_O_ACCS = 3
 
         loop_results = init_args
         for kv_block_start, inner_iter_args in range(0, kv_upper, BLOCK_N, init=init_args):
             cur_buf_i32 = inner_iter_args[_OFF_CUR_BUF]
             m_running = inner_iter_args[_OFF_M]
             l_running = inner_iter_args[_OFF_L]
-            corr_carried = inner_iter_args[_OFF_CORR]
             o_accs = [inner_iter_args[_OFF_O_ACCS + i] for i in range_constexpr(D_CHUNKS)]
-            p_words_carried = []
-            for st in range_constexpr(N_SUBTILES):
-                sub = []
-                for w in range_constexpr(4):
-                    sub.append(inner_iter_args[_OFF_P_WORDS + st * 4 + w])
-                p_words_carried.append(sub)
 
             # Buffer offsets
             cur_k_off = _buf_off(cur_buf_i32, K_BUF1_OFF)
@@ -938,24 +919,27 @@ def build_sage_attn_cdna_module(
             next_buf_i32 = arith.XOrIOp(
                 _raw(cur_buf_i32), arith.constant(1, type=T.i32)
             ).result
-            next_k_off = _buf_off(next_buf_i32, K_BUF1_OFF)
-            next_v_off = _buf_off(next_buf_i32, V_BUF1_OFF)
 
-            # ==== Apply correction factor to o_accs (carried from prologue/prev iter) ====
+            # ==== Compute softmax[k] using cur_buf K ====
+            m_new, l_new, corr, p_words = _emit_qk_softmax_pquant(
+                kv_block_start, cur_k_off, m_running, l_running
+            )
+
+            # ==== Apply correction factor to o_accs (in-iter) ====
             corr_vec16 = (
-                Vec.from_elements([corr_carried], fx.Float32).broadcast_to(16).ir_value()
+                Vec.from_elements([corr], fx.Float32).broadcast_to(16).ir_value()
             )
             for dc in range_constexpr(D_CHUNKS):
                 o_accs[dc] = _fmul(o_accs[dc], corr_vec16)
 
-            # ==== GEMM2: PV[k] using carried p_words[k] and cur_buf V ====
+            # ==== GEMM2: PV[k] using p_words[k] (just computed) and cur_buf V ====
             from flydsl._mlir.dialects._rocdl_ops_gen import permlane32_swap as _permlane32_swap_op
             _struct_ty_2xi32 = ir.Type.parse("!llvm.struct<(i32, i32)>")
             for pks in range_constexpr(PV_K_STEPS):
                 v8_elems = []
                 for w in range_constexpr(4):
-                    a_w = _raw(p_words_carried[pks * 2][w])
-                    b_w = _raw(p_words_carried[pks * 2 + 1][w])
+                    a_w = _raw(p_words[pks * 2][w])
+                    b_w = _raw(p_words[pks * 2 + 1][w])
                     swapped = _permlane32_swap_op(
                         _struct_ty_2xi32, old=a_w, src=b_w,
                         fi=False, bound_control=True,
@@ -973,47 +957,25 @@ def build_sage_attn_cdna_module(
                         scale_127, scale_127,
                     )
 
-            # ==== Compute softmax for NEXT iter (k+1) using K in next_buf ====
-            # Prev iter's prefetch into next_buf was synced by the barrier at
-            # END of that iter (or by the prologue barrier for iter 0).
-            # Source-order: this block runs AFTER the PV MFMA loop, but its
-            # only data dep is on next_buf K reads + m_running/l_running — no
-            # dep on PV's MFMA chain. The JIT scheduler can interleave these
-            # VALU ops into PV's MFMA shadow.
-            kv_block_next = kv_block_start + fx.Index(BLOCK_N)
-            m_new, l_new, corr_new, p_words_new = _emit_qk_softmax_pquant(
-                kv_block_next, next_k_off, m_running, l_running
-            )
-
-            # Barrier #1: sync cross-wave PV V reads of cur_buf done, AND
-            # softmax K reads of next_buf done — required because the prefetch
-            # below overwrites cur_buf (V[k] is being replaced with V[k+2]).
-            # Without this, wave A's prefetch ds_writes can corrupt wave B's
-            # in-flight PV V ds_reads on the same buf.
+            # Barrier: PV V reads of cur_buf done, then prefetch K[k+2]/V[k+2]
+            # into cur_buf (overwriting K[k]/V[k]). Next iter reads next_buf
+            # (untouched here) so a single barrier suffices — vs the prior
+            # scheme's two barriers per iter (the second was needed because
+            # next iter's softmax read this-iter's prefetch target).
             gpu.barrier()
 
-            # ==== Prefetch K[k+2], V[k+2] into cur_buf (overwrites K[k]/V[k]) ====
-            kv_block_after_next = kv_block_next + fx.Index(BLOCK_N)
+            kv_block_after_next = kv_block_start + fx.Index(2 * BLOCK_N)
             coop_load_k(kv_block_after_next, cur_k_off)
             coop_load_v(kv_block_after_next, cur_v_off)
 
-            # Barrier #2: sync prefetch ds_writes complete before next iter's
-            # softmax reads new next_buf K (= this iter's cur_buf). Without
-            # this, next iter could read stale/partial K[k+2].
-            gpu.barrier()
-
             # ==== Yield ====
-            _yield_args = [next_buf_i32, _raw(m_new), _raw(l_new), _raw(corr_new)]
+            _yield_args = [next_buf_i32, _raw(m_new), _raw(l_new)]
             for dc in range_constexpr(D_CHUNKS):
                 _yield_args.append(o_accs[dc])
-            for st in range_constexpr(N_SUBTILES):
-                for w in range_constexpr(4):
-                    _yield_args.append(_raw(p_words_new[st][w]))
             loop_results = yield _yield_args
 
         # ---- Normalize and store O ----
-        # loop_results layout (Attack #4): [cur_buf, m, l, corr, o_acc_0..3,
-        #                                   p_words_0_0..p_words_3_3]
+        # loop_results layout: [cur_buf, m, l, *o_accs (D_CHUNKS)]
         l_final = loop_results[_OFF_L]
         o_finals = [loop_results[_OFF_O_ACCS + dc] for dc in range_constexpr(D_CHUNKS)]
 
