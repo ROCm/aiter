@@ -257,7 +257,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     std::string arch_id = get_gpu_arch();
     if((!a.use_asm_v3) || (a.hdim_q % 8 != 0) || (a.hdim_v % 8 != 0) || (a.has_dbias) ||
        (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic) ||
-       ((arch_id != "gfx942") && (arch_id != "gfx950")))
+       ((arch_id != "gfx942") && (arch_id != "gfx950") && (arch_id != "gfx1250")))
     {
         return -1;
     }
@@ -311,7 +311,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                 return &cfg_fmha_bwd_dq_shuffle;
             }
         }
-        else
+        else if (arch_id == "gfx942")
         {
             if(a.v3_atomic_fp32)
             {
@@ -321,11 +321,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             {
                 return static_cast<CFG*>(nullptr);
             }
+        } else {
+            return &cfg_fmha_bwd_dq_convert; // gfx1250 only support atomic32=1
         }
     }();
 
     bool need_post_processing =
-        ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1);
+        ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1) || (arch_id == "gfx1250");
 
     int mt = asm_mask_type();
 
@@ -449,7 +451,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     auto pre_kernel_launch = [&]() {
         arg_size = sizeof(odo_args);
-        int bdx = 256;
+        int bdx = (arch_id == "gfx1250") ? 128 : 256;
         int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
         int gdy = a.nhead_q;
         int gdz = a.batch;
@@ -546,13 +548,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     auto dqdkdv_kernel_launch = [&]() {
         arg_size                  = sizeof(dqdkdv_args);
-        int bdx = 256;
+        int bdx = (arch_id == "gfx1250") ? 128 : 256;
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
         if((mt == 1) || (mt == 2))
-        { // causal
+        { // mask kb
             gdx = (gdx + 1) / 2;
         }
 
@@ -587,7 +589,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     auto post_kernel_launch = [&]() {
         arg_size                  = sizeof(post_args);
-        int bdx = 256;
+        int bdx = (arch_id == "gfx1250") ? 128 : 256;
         int gdx = (a.max_seqlen_q + ts_dq - 1) / ts_dq;
         int gdy = a.nhead_q;
         int gdz = a.batch;
