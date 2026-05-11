@@ -1,0 +1,112 @@
+---
+title: "aiter Architecture Overview"
+last_verified: 2026-04-06
+source_files:
+  - README.md
+  - aiter/__init__.py
+  - setup.py
+  - docs/attention_pipelines.md
+tags: [architecture, overview]
+---
+
+# aiter Architecture Overview
+
+## What is aiter?
+
+AITER (AMD Inference & Training Engine for ROCm) is AMD's centralized repository of high-performance
+AI operators for ROCm GPUs. It provides both C++ and Python APIs for operators used in inference and
+training workloads. Kernels are implemented via three backends: **Triton**, **Composable Kernel (CK/HIP C++)**, and **hand-written assembly**.
+
+Package name: `amd-aiter`. Install: `git clone --recursive ... && python3 setup.py develop`.
+
+## Layer Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Python API  (aiter/)                                │
+│  - aiter.ops.*          operator entry points        │
+│  - aiter.mla            multi-head latent attention  │
+│  - aiter.ops.triton.*   Triton kernel wrappers       │
+│  - aiter.configs/       tuned CSV config files       │
+├─────────────────────────────────────────────────────┤
+│  JIT / Build Layer  (aiter/jit/)                     │
+│  - compile_ops()     JIT-compiles HIP C++ extensions │
+│  - chip_info          GPU arch detection (gfx family)│
+│  - torch_guard        torch.compile compatibility    │
+├─────────────────────────────────────────────────────┤
+│  Native Kernels                                      │
+│  - csrc/              HIP C++, pybind11 bindings     │
+│  - Triton kernels     aiter/ops/triton/_triton_kernels/ │
+│  - ASM kernels        hand-tuned assembly            │
+├─────────────────────────────────────────────────────┤
+│  Composable Kernel  (3rdparty/composable_kernel/)    │
+│  - Tile-based HIP C++ kernel library                 │
+│  - GEMM, Attention (FMHA), Norm, etc.               │
+│  - Vendored as git submodule                         │
+└─────────────────────────────────────────────────────┘
+```
+
+## Directory Map
+
+| Directory | Purpose |
+|-----------|---------|
+| `aiter/aiter/ops/` | Python operator wrappers (~40 files). Each file is an op family (gemm, attention, moe, etc.). |
+| `aiter/aiter/ops/triton/` | Triton kernel implementations and their Python wrappers (~290 files). |
+| `aiter/aiter/jit/` | JIT compilation infrastructure for HIP/CK C++ extensions. |
+| `aiter/aiter/configs/` | Tuned operator CSV configs (~19 files), per-precision per-arch. |
+| `aiter/aiter/mla/` | Multi-head Latent Attention submodule. |
+| `aiter/aiter/utility/` | Shared utilities: dtypes, FP4 utils, base tuner. |
+| `aiter/csrc/` | C++ source: HIP kernels, pybind11 interfaces (~455 files). |
+| `aiter/3rdparty/composable_kernel/` | Vendored CK library (~13K source files excl. build). |
+| `aiter/hsa/` | ROCm/HSA runtime assets. |
+| `aiter/op_tests/` | Operator tests (~280 files). |
+| `aiter/docs/` | Sphinx docs + markdown technical docs (~24 files). |
+| `aiter/gradlib/` | Gradient library (small, ~9 files). |
+
+## Operator Families
+
+All operators are imported via `aiter/__init__.py`. On Linux/ROCm, the full operator surface loads.
+On Windows, only Triton ops are available.
+
+| Family | Python Module | Wiki Page |
+|--------|---------------|-----------|
+| Attention (MHA, PA, Unified) | `ops.attention`, `ops.mha`, `ops.unified_attention` | [[operators/attention]] |
+| GEMM (A8W8, A16W16, A4W4, batched, deep) | `ops.gemm_op_a8w8`, `ops.gemm_op_a16w16`, `ops.gemm_op_a4w4`, `ops.batched_gemm_*`, `ops.deepgemm` | [[operators/gemm]] |
+| Mixture of Experts (MoE) | `ops.moe_op`, `ops.moe_sorting`, `ops.moe_sorting_opus` | [[operators/moe]] |
+| Quantization | `ops.quant` | [[operators/quant]] |
+| Normalization (RMSNorm, LayerNorm, GroupNorm) | `ops.norm`, `ops.rmsnorm`, `ops.groupnorm` | [[operators/norm]] |
+| Rotary Position Embedding | `ops.rope`, `ops.pos_encoding` | [[operators/rope]] |
+| KV Cache | `ops.cache` | [[operators/cache]] |
+| Communication (AllReduce, Iris) | `ops.communication`, `ops.custom_all_reduce`, `ops.quick_all_reduce` | [[operators/communication]] |
+| Sampling (Top-k) | `ops.topk`, `ops.topk_plain`, `ops.sample` | [[operators/sampling]] |
+| Multi-head Latent Attention | `aiter.mla` | [[operators/mla]] |
+| Activation | `ops.activation` | -- |
+| Fused Ops | `ops.fused_qk_norm_rope_cache_quant`, `ops.fused_split_gdr_update`, `ops.mhc` | -- |
+| Causal Conv1D | `ops.causal_conv1d` | -- |
+| Layout Transform | `ops.trans_ragged_layout` | -- |
+
+## Backend Selection
+
+Each operator may have implementations in one or more backends. The selection logic varies per operator
+but generally follows priority: **ASM > CK > Triton** when a tuned config exists, with fallback
+to Triton when CK/ASM are unavailable (e.g., Windows, missing ROCm).
+
+See [[concepts/backend-selection]] for the full decision logic.
+
+## Configuration System
+
+Tuned configs live in `aiter/configs/` as CSV files (e.g., `a8w8_tuned_gemm.csv`). These contain
+per-shape, per-CU-count kernel selections generated by the [[concepts/autotuning]] pipeline.
+At runtime, GEMM ops look up the best kernel name and splitK value from these CSVs.
+
+## Optional Dependencies
+
+- **FlyDSL**: Enables FlyDSL-based MoE kernels for mixed-precision (A4W4). Falls back to CK when not installed.
+- **Iris**: Enables Triton-based GPU-initiated communication (reduce-scatter, all-gather). See [[operators/communication]].
+
+## Source Files
+
+- `README.md` -- project description and operator table
+- `aiter/__init__.py` -- public API surface (all operator imports)
+- `setup.py` -- build configuration, CK integration, ROCm requirement
+- `docs/` -- technical documentation (attention pipelines, autotuning, triton comms)
