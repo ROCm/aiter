@@ -1,13 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""High-level FlyDSL paged MQA-logits ops (gfx950).
-
-Wraps :mod:`aiter.ops.flydsl.kernels.pa_mqa_logits_fp4` (Q FP4, KV FP4) into
-a single ``flydsl_pa_mqa_logits_fp4`` op that takes torch tensors, hides the
-kernel build / persistent-grid scheduling / JIT launcher boilerplate, and
-caches compiled artifacts per shape config via :func:`functools.cache`.
-"""
+"""High-level FlyDSL paged MQA-logits wrapper (gfx950)."""
 
 from __future__ import annotations
 
@@ -46,12 +40,7 @@ def _get_compiled_pa_mqa_logits_fp4(
     heads: int,
     head_dim: int,
 ):
-    """Build kernel + JIT launcher for one shape config; cached by signature.
-
-    Cache key includes ``max_chunks_per_cta`` because it controls compile-time
-    pipeline unrolling (kernel re-builds when host-side ``safe_chunks_per_cta``
-    grows beyond the previously compiled bound).
-    """
+    """Build kernel + JIT launcher for one shape config; cached by signature."""
     kfn, alloc = build_pa_mqa_logits_fp4_module(
         block_k=block_k,
         kv_block_size=kv_block_size,
@@ -105,42 +94,7 @@ def flydsl_pa_mqa_logits_fp4(
     parallel_unit_num: int = 512,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
-    """Compute MQA logits ``L[b,n,t] = sum_h(relu(Q[b,n,h,:] · K[b,t,:]) * W[b,n,h])``.
-
-    Both Q and KV are FP4 e2m1 with UE8M0 block scales (block_size=32). The
-    MFMA runs natively on FP4 operands (cbsz=4, blgp=4); no in-kernel dequant.
-    gfx950 only.
-
-    Tensor layouts (kernel ABI — caller must preshuffle):
-
-    * ``q_packed``:    ``[B, NEXT_N, H, D//2]`` uint8
-        Natural per-head FP4 layout (low nibble = element 0).
-    * ``q_scale``:     ``[B, NEXT_N, K_TILES, 4, 16, QS_PAD]`` uint8
-        Preshuffled e8m0 scales. ``K_TILES = D // 128``,
-        ``QS_PAD = ceil(H/16/4) * 4``. See
-        :func:`aiter.ops.flydsl.kernels.pa_mqa_logits_fp4.build_pa_mqa_logits_fp4_module`
-        docstring for the layout.
-    * ``kv_cache``:    ``[num_blocks, K_TILES, 4, kv_block_size, 16]`` uint8
-        Paged + preshuffled FP4 KV.
-    * ``kv_scale``:    ``[num_blocks, K_TILES, 4, kv_block_size]`` uint8
-        Paged + preshuffled e8m0 KV scales.
-    * ``block_tables``: ``[B, max_blocks_per_seq]`` int32
-    * ``weights``:     ``[B*NEXT_N, H]`` fp32
-    * ``context_lens``: ``[B]`` int32 — per-batch context length.
-    * ``out_logits``:  ``[B*NEXT_N, T_max]`` fp32 — written in-place.
-        **Caller must pre-fill with -inf**; the kernel only writes valid
-        logit positions and relies on pre-init for OOB / past-context tokens.
-
-    Args:
-        block_k: tokens per chunk (multiple of MFMA_N=16, divisible by num_warps).
-        num_warps: warps per CTA (BLOCK = num_warps * 64).
-        parallel_unit_num: target persistent CTA count (typically
-            ``cu_count * waves_per_eu``).
-        stream: CUDA stream to launch on; defaults to current.
-
-    Returns:
-        ``out_logits`` (the same tensor, written in-place).
-    """
+    """Compute MQA logits (FP4 Q/KV, gfx950). Writes out_logits in-place and returns it."""
     batch, next_n, heads, head_dim_packed = q_packed.shape
     head_dim = head_dim_packed * 2
     kv_block_size = kv_cache.shape[3]
