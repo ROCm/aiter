@@ -16,15 +16,35 @@ and KV seq_len) is also supported since Q and KV shapes may differ.
 from __future__ import annotations
 
 import math
+import os
 from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
 
 from aiter.utility.dtypes import fp8 as _fp8_dtype
-from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant as _triton_sage_quant
+from .sage_quant import flydsl_sage_quant as _flydsl_sage_quant
 
 from .kernels.sage_attn_cdna import build_sage_attn_cdna_module
+
+
+def _sage_quant(*args, **kwargs):
+    """Dispatch to FlyDSL or Triton sage_quant per FLYDSL_SAGE_QUANT_BACKEND env var.
+
+    Default: ``"flydsl"`` — single fused Q INT8 + K INT8 + V FP8 launch
+    (~1.18-1.20x Triton on small/medium shapes, parity on long-S).
+    Set ``FLYDSL_SAGE_QUANT_BACKEND=triton`` to fall back to the per-op
+    Triton wrappers.
+    """
+    backend = os.environ.get("FLYDSL_SAGE_QUANT_BACKEND", "flydsl").lower()
+    if backend == "flydsl":
+        return _flydsl_sage_quant(*args, **kwargs)
+    return _triton_sage_quant(*args, **kwargs)
+
+
+# keep the legacy name `sage_quant` working below
+sage_quant = _sage_quant
 
 __all__ = [
     "flydsl_sage_attn_func",
