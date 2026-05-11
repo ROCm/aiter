@@ -717,129 +717,88 @@ def build_sage_attn_cdna_module(
                 arith.index_cast(T.i32, _v_lane_base_index)
             )
 
-        # Prologue: prefetch first KV block into buffer 0.
-        coop_load_k(ZERO_INDEX, ZERO_INDEX)
-        coop_load_v(ZERO_INDEX, ZERO_INDEX)
+        # ===== Attack #4: cross-iter softmax pipeline =====
+        # Strategy: PV[k] for iter k uses p_words computed in PRIOR iter (or
+        # prologue for k=0). Within iter k's loop body we then compute
+        # softmax[k+1] for the NEXT iter — those VALU ops are independent of
+        # PV[k]'s MFMA chain (no source dep), so the JIT scheduler can hide
+        # them in PV[k]'s MFMA shadow. p_words and corr are loop-carried
+        # across the scf.for yield boundary.
+        #
+        # Last-iter handling: the loop unconditionally also computes softmax
+        # for kv_block_start+BLOCK_N. On the last iter that block is fully OOB
+        # (kv_col >= seq_len_k), so the non-causal mask sets all elements to
+        # -inf → m_new = m_running, corr = 1.0, p = 0, l_new = l_running. The
+        # math is preserved. We must clamp the K-descale index to avoid an OOB
+        # load (handled in _emit_qk_softmax_pquant).
+        N_SUBTILES = BLOCK_N // MFMA_N
+        ELEMS_PER_TILE = 16
+        NUM_S_VALS = N_SUBTILES * ELEMS_PER_TILE
 
-        # i32 0 — current buffer index for the first iteration.
-        c0_i32_init = arith.constant(0, type=T.i32)
+        # Hoist constants used by the softmax helper from inside-loop scope.
+        klane_i32 = fx.Int32(klane)
+        klane_off_i32 = klane_i32 * fx.Int32(4)
+        seq_len_k_i32 = fx.Int32(seq_len_k_v)
 
-        init_args = [c0_i32_init, _raw(c_neg_inf), _raw(c_zero_f)]
-        for _ in range_constexpr(D_CHUNKS):
-            init_args.append(_raw(c_zero_v16f32))
+        def _emit_qk_softmax_pquant(kv_block_start_arg, k_buf_off_arg,
+                                    m_in, l_in):
+            """Emit QK MFMA + scale + mask + softmax + p-quant for the KV tile
+            at kv_block_start_arg, using K loaded into LDS at k_buf_off_arg.
 
-        loop_results = init_args
-        for kv_block_start, inner_iter_args in range(0, kv_upper, BLOCK_N, init=init_args):
-            cur_buf_i32 = inner_iter_args[0]
-            m_running = inner_iter_args[1]
-            l_running = inner_iter_args[2]
-            o_accs = [inner_iter_args[3 + i] for i in range_constexpr(D_CHUNKS)]
-
-            # Compute buffer byte offsets for current and next iterations.
-            cur_k_off = _buf_off(cur_buf_i32, K_BUF1_OFF)
-            cur_v_off = _buf_off(cur_buf_i32, V_BUF1_OFF)
-            # Per-iter, per-lane V LDS address (gfx950 fast path): single ADD
-            # of cur_v_off + lane-invariant base. Used by load_v_frag_fp8 which
-            # then only adds a compile-time literal per ds_read, freeing the
-            # AMDGPU backend to fold it into `ds_read offset:LIT`.
-            if const_expr(_is_gfx950):
-                cur_v_off_i32 = arith.unwrap(arith.index_cast(T.i32, cur_v_off))
-                v_iter_lane_addr_i32 = arith.AddIOp(
-                    v_lane_base_i32, cur_v_off_i32
-                ).result
-            else:
-                v_iter_lane_addr_i32 = None
-            # next_buf = 1 - cur_buf  (XOR 1)
-            next_buf_i32 = arith.XOrIOp(
-                _raw(cur_buf_i32), arith.constant(1, type=T.i32)
-            ).result
-            next_k_off = _buf_off(next_buf_i32, K_BUF1_OFF)
-            next_v_off = _buf_off(next_buf_i32, V_BUF1_OFF)
-
-            # Wait for the prologue/previous-iter prefetch into cur_buf to land
-            # AND for the previous iter's reads of next_buf to drain.
-            gpu.barrier()
-
-            # Issue prefetch for the next KV block into the OTHER buffer. OOB
-            # rows are clamped to row 0 inside the coop loaders; the resulting
-            # garbage is never consumed because the loop terminates first.
-            next_kv_block_start = kv_block_start + BLOCK_N
-            coop_load_k(next_kv_block_start, next_k_off)
-            coop_load_v(next_kv_block_start, next_v_off)
-
-            # ==== GEMM1: S_i32 = K_i8 @ Q_i8^T ====
-            # s_accs[subtile]: v16i32 per lane (MFMA 32x32 output, wave64).
-            # Each wave owns ROWS_PER_WAVE=32 Q rows. MFMA computes 32 Q rows × 32 KV rows.
-            # With BLOCK_N=128, we need BLOCK_N/MFMA_N = 4 row-subtiles.
-            N_SUBTILES = BLOCK_N // MFMA_N
-
-            s_accs = [_raw(c_zero_v16i32) for _ in range(N_SUBTILES)]
-
+            Returns (m_new, l_new, corr, p_words_2d) — IR values.
+            """
+            # 1) QK MFMA
+            s_accs_loc = [_raw(c_zero_v16i32) for _ in range(N_SUBTILES)]
             for ks in range_constexpr(K_STEPS_QK):
                 for st in range_constexpr(N_SUBTILES):
-                    # K operand A: lane has 16 i8 at row m=lane32+st*32, K=ks*32+klane*16..+15
-                    kv_row = lane32 + st * MFMA_N
-                    k_frag = load_k_frag(kv_row, ks, cur_k_off)
-                    s_accs[st] = mfma_i32_k32(
-                        v16i32_type, [k_frag, q_packs[ks], s_accs[st], 0, 0, 0]
+                    kv_row_loc = lane32 + st * MFMA_N
+                    k_frag = load_k_frag(kv_row_loc, ks, k_buf_off_arg)
+                    s_accs_loc[st] = mfma_i32_k32(
+                        v16i32_type,
+                        [k_frag, q_packs[ks], s_accs_loc[st], 0, 0, 0],
                     )
 
-            # Scale Int32 → Float32: S_f32 = S_i32 * q_descale[q_tile] * k_descale[kv_tile]
-            kv_tile_idx = kv_block_start // BLOCK_N
-            k_descale_base = (
+            # 2) Scale (with descale-index clamp for the last-iter OOB tile)
+            kv_tile_idx_loc = kv_block_start_arg // BLOCK_N
+            max_kv_tile = num_k_blocks_per_head - fx.Index(1)
+            kv_tile_safe = fx.Index(
+                ArithValue(kv_tile_idx_loc < num_k_blocks_per_head).select(
+                    kv_tile_idx_loc, max_kv_tile
+                )
+            )
+            k_descale_base_loc = (
                 batch_idx * NUM_KV_HEADS * num_k_blocks_per_head
                 + head_kv_idx * num_k_blocks_per_head
-                + kv_tile_idx
+                + kv_tile_safe
             )
-            k_ds = fx.Float32(_load_ptr_f32(kds_ptr, k_descale_base))
-            qk_scale = _fmul(q_ds, k_ds)
-
-            # 32x32 MFMA output layout: lane (klane, lane32) holds 16 elements
-            # per subtile. Output indexing for vector index i ∈ 0..15:
-            #   m = (i // 4) * 8 + klane * 4 + (i % 4)   (kv_row within subtile)
-            #   n = lane32                                (q_row within wave; constant per lane)
-            # Note: A=K (M=kv_row), B=Q (N=q_row). So m here is kv_row.
-            ELEMS_PER_TILE = 16
-            # Vectorized SIToFP + scale-mul: do the i32->f32 convert and the
-            # qk_scale multiply on the full v16f32 subtile so the compiler can
-            # emit packed v_pk_mul_f32 (and packed v_cvt_pk*) instead of
-            # per-lane v_mul_f32 / v_cvt_f32_i32. Then extract scalars to keep
-            # the downstream s_f32 list-of-scalars interface unchanged.
-            qk_scale_v16 = (
-                Vec.from_elements([qk_scale], fx.Float32).broadcast_to(16)
+            k_ds_loc = fx.Float32(_load_ptr_f32(kds_ptr, k_descale_base_loc))
+            qk_scale_loc = _fmul(q_ds, k_ds_loc)
+            qk_scale_v16_loc = (
+                Vec.from_elements([qk_scale_loc], fx.Float32).broadcast_to(16)
             )
-            s_f32 = []
+            s_f32_loc = []
             for st in range_constexpr(N_SUBTILES):
-                s_i32_vec = Vec(s_accs[st])
+                s_i32_vec = Vec(s_accs_loc[st])
                 s_f32_vec = s_i32_vec.to(fx.Float32)
                 s_scaled_vec = Vec(
-                    arith.mulf(s_f32_vec, qk_scale_v16, fastmath=fm_fast)
+                    arith.mulf(s_f32_vec, qk_scale_v16_loc, fastmath=fm_fast)
                 )
                 for elem in range_constexpr(ELEMS_PER_TILE):
-                    s_f32.append(s_scaled_vec[elem])
+                    s_f32_loc.append(s_scaled_vec[elem])
 
-            # ==== Causal masking ====
-            NUM_S_VALS = N_SUBTILES * ELEMS_PER_TILE
-
-            # Per-element masking: out-of-range KV columns (kv_col >= seq_len_k)
-            # and (if causal) kv_col > q_row get -inf.
-            # For each (st, elem): kv_col = kv_block_start + st*32 + (elem//4)*8 + klane*4 + (elem%4)
-            kv_start_i32 = fx.Int32(kv_block_start)
-            klane_i32 = fx.Int32(klane)
-            klane_off_i32 = klane_i32 * fx.Int32(4)
-            seq_len_k_i32 = fx.Int32(seq_len_k_v)
-
+            # 3) Mask
+            kv_start_i32_loc = fx.Int32(
+                arith.unwrap(arith.index_cast(T.i32, _raw(kv_block_start_arg)))
+            )
             if const_expr(CAUSAL):
-                # Causal mask is per-row (depends on q_row), so the per-tile fast
-                # path doesn't help — keep the slow per-element mask path.
-                s_named = list(s_f32)
+                s_named = list(s_f32_loc)
                 for st in range_constexpr(N_SUBTILES):
                     for elem in range_constexpr(ELEMS_PER_TILE):
                         idx = st * ELEMS_PER_TILE + elem
                         msub = elem // 4
                         erem = elem % 4
                         kv_col_i32 = (
-                            kv_start_i32
+                            kv_start_i32_loc
                             + fx.Int32(st * MFMA_N)
                             + fx.Int32(msub * 8)
                             + klane_off_i32
@@ -848,25 +807,17 @@ def build_sage_attn_cdna_module(
                         out_of_range = ArithValue(kv_col_i32 >= seq_len_k_i32)
                         out_of_range = out_of_range | ArithValue(kv_col_i32 > q_row_i32)
                         s_named[idx] = out_of_range.select(c_neg_inf, s_named[idx])
-                s_f32 = s_named
+                s_f32_loc = s_named
             else:
-                # Non-causal: at most one tail tile is OOB (when seq_len_k is not
-                # a multiple of BLOCK_N). On the in-bounds fast path we skip the
-                # entire ~63 v_cmp + 94 v_cndmask per-element mask block.
-                tile_end = kv_block_start + fx.Index(BLOCK_N)
+                tile_end = kv_block_start_arg + fx.Index(BLOCK_N)
                 tile_oob_av = ArithValue(tile_end > seq_len_k_v)
                 cond_i1 = _raw(tile_oob_av)
                 f32_ty = ir.F32Type.get()
                 result_types = [f32_ty] * NUM_S_VALS
                 if_op = _scf.IfOp(
-                    cond_i1, result_types, has_else=True, loc=ir.Location.unknown()
+                    cond_i1, result_types, has_else=True,
+                    loc=ir.Location.unknown(),
                 )
-                # then-branch: tail tile, apply per-element OOB mask.
-                # Insert an empty sideeffect inline asm at the top so LLVM
-                # SimplifyCFG cannot speculate the mask block past the branch
-                # and flatten the if-then-else back into a chain of selects.
-                # Without this barrier, LLVM if-converts and the steady-state
-                # path executes ~256 wasted v_cmp/v_cndmask/s_nop instr per iter.
                 with ir.InsertionPoint(if_op.then_block):
                     _llvm.inline_asm(
                         None, [], "", "", has_side_effects=True,
@@ -878,120 +829,133 @@ def build_sage_attn_cdna_module(
                             msub = elem // 4
                             erem = elem % 4
                             kv_col_i32 = (
-                                kv_start_i32
+                                kv_start_i32_loc
                                 + fx.Int32(st * MFMA_N)
                                 + fx.Int32(msub * 8)
                                 + klane_off_i32
                                 + fx.Int32(erem)
                             )
                             out_of_range = ArithValue(kv_col_i32 >= seq_len_k_i32)
-                            masked.append(_raw(out_of_range.select(c_neg_inf, s_f32[idx])))
+                            masked.append(_raw(out_of_range.select(c_neg_inf, s_f32_loc[idx])))
                     _scf.YieldOp(masked)
-                # else-branch: in-bounds fast path, pass through unchanged
                 with ir.InsertionPoint(if_op.else_block):
-                    _scf.YieldOp([_raw(v) for v in s_f32])
-                s_f32 = list(if_op.results)
+                    _scf.YieldOp([_raw(v) for v in s_f32_loc])
+                s_f32_loc = list(if_op.results)
 
-            # ==== Online softmax ====
-            local_max = s_f32[0]
+            # 4) Softmax
+            local_max_l = s_f32_loc[0]
             for r in range_constexpr(NUM_S_VALS - 1):
-                local_max = _fmax(local_max, s_f32[r + 1])
-            row_max = row_max_reduce(local_max)
-            m_new = _fmax(m_running, row_max)
-
-            # Correction factor for previous accumulator.
-            # NOTE: s_f32 already contains (Q @ K.T) * sm_scale * log2(e) because
-            # sage_quant absorbs sm_scale_log2e into q_scale. Do NOT multiply by
-            # sm_scale_log2e again here.
-            diff_m = _fsub(m_running, m_new)
-            corr = rocdl.exp2(ir.F32Type.get(), _raw(diff_m))
-
-            # Compute P values directly: p = exp2(s_f32 - m_new)
-            neg_max = _fsub(c_zero_f, m_new)
-            p_vals = []
-            local_sum = _raw(c_zero_f)
+                local_max_l = _fmax(local_max_l, s_f32_loc[r + 1])
+            row_max_l = row_max_reduce(local_max_l)
+            m_new_l = _fmax(m_in, row_max_l)
+            diff_m_l = _fsub(m_in, m_new_l)
+            corr_l = rocdl.exp2(ir.F32Type.get(), _raw(diff_m_l))
+            neg_max_l = _fsub(c_zero_f, m_new_l)
+            p_vals_l = []
+            local_sum_l = _raw(c_zero_f)
             for r in range_constexpr(NUM_S_VALS):
-                diff = _fadd(s_f32[r], neg_max)
+                diff = _fadd(s_f32_loc[r], neg_max_l)
                 p = rocdl.exp2(ir.F32Type.get(), _raw(diff))
-                p_vals.append(p)
-                local_sum = _fadd(local_sum, p)
+                p_vals_l.append(p)
+                local_sum_l = _fadd(local_sum_l, p)
+            tile_sum_l = row_sum_reduce(local_sum_l)
+            l_new_l = _fadd(_fmul(corr_l, l_in), tile_sum_l)
 
-            tile_sum = row_sum_reduce(local_sum)
-            l_new = _fadd(_fmul(corr, l_running), tile_sum)
+            # 5) P-quant → p_words[st][w] : i32
+            c0_i32_l = arith.constant(0, type=T.i32)
+            p_words_l = []
+            for st in range_constexpr(N_SUBTILES):
+                sub = []
+                for w in range_constexpr(4):
+                    s0 = _raw(p_vals_l[st * ELEMS_PER_TILE + w * 4 + 0])
+                    s1 = _raw(p_vals_l[st * ELEMS_PER_TILE + w * 4 + 1])
+                    s2 = _raw(p_vals_l[st * ELEMS_PER_TILE + w * 4 + 2])
+                    s3 = _raw(p_vals_l[st * ELEMS_PER_TILE + w * 4 + 3])
+                    packed = c0_i32_l
+                    packed = rocdl.cvt_pk_fp8_f32(T.i32, s0, s1, packed, 0)
+                    packed = rocdl.cvt_pk_fp8_f32(T.i32, s2, s3, packed, 1)
+                    sub.append(packed)
+                p_words_l.append(sub)
+            return m_new_l, l_new_l, corr_l, p_words_l
 
-            # Rescale O accumulators (each is v16f32 per lane).
-            corr_vec16 = Vec.from_elements([corr], fx.Float32).broadcast_to(16).ir_value()
+        # ---- Prologue ----
+        # Prefetch buf 0 (K[0]/V[0]) AND buf 1 (K[1]/V[1] — harmless if num_iters<2;
+        # coop loaders clamp OOB rows to row 0). Then barrier and compute QK[0]
+        # + softmax[0] using buf 0 K. Carry m, l, corr, p_words[0] into the loop.
+        coop_load_k(ZERO_INDEX, ZERO_INDEX)
+        coop_load_v(ZERO_INDEX, ZERO_INDEX)
+        coop_load_k(fx.Index(BLOCK_N), K_BUF1_OFF)
+        coop_load_v(fx.Index(BLOCK_N), V_BUF1_OFF)
+        gpu.barrier()
+
+        m_p0, l_p0, corr_p0, p_words_p0 = _emit_qk_softmax_pquant(
+            fx.Index(0), ZERO_INDEX, c_neg_inf, c_zero_f
+        )
+
+        # i32 0 — current PV buffer index for iter 0 (buf 0 holds V[0]).
+        c0_i32_init = arith.constant(0, type=T.i32)
+
+        # Iter args layout: [cur_buf, m, l, corr, *o_accs (D_CHUNKS),
+        #                    *p_words (N_SUBTILES * 4 i32)]
+        init_args = [c0_i32_init, _raw(m_p0), _raw(l_p0), _raw(corr_p0)]
+        for _ in range_constexpr(D_CHUNKS):
+            init_args.append(_raw(c_zero_v16f32))
+        for st in range_constexpr(N_SUBTILES):
+            for w in range_constexpr(4):
+                init_args.append(_raw(p_words_p0[st][w]))
+
+        _OFF_CUR_BUF = 0
+        _OFF_M = 1
+        _OFF_L = 2
+        _OFF_CORR = 3
+        _OFF_O_ACCS = 4
+        _OFF_P_WORDS = 4 + D_CHUNKS
+
+        loop_results = init_args
+        for kv_block_start, inner_iter_args in range(0, kv_upper, BLOCK_N, init=init_args):
+            cur_buf_i32 = inner_iter_args[_OFF_CUR_BUF]
+            m_running = inner_iter_args[_OFF_M]
+            l_running = inner_iter_args[_OFF_L]
+            corr_carried = inner_iter_args[_OFF_CORR]
+            o_accs = [inner_iter_args[_OFF_O_ACCS + i] for i in range_constexpr(D_CHUNKS)]
+            p_words_carried = []
+            for st in range_constexpr(N_SUBTILES):
+                sub = []
+                for w in range_constexpr(4):
+                    sub.append(inner_iter_args[_OFF_P_WORDS + st * 4 + w])
+                p_words_carried.append(sub)
+
+            # Buffer offsets
+            cur_k_off = _buf_off(cur_buf_i32, K_BUF1_OFF)
+            cur_v_off = _buf_off(cur_buf_i32, V_BUF1_OFF)
+            if const_expr(_is_gfx950):
+                cur_v_off_i32 = arith.unwrap(arith.index_cast(T.i32, cur_v_off))
+                v_iter_lane_addr_i32 = arith.AddIOp(
+                    v_lane_base_i32, cur_v_off_i32
+                ).result
+            else:
+                v_iter_lane_addr_i32 = None
+            next_buf_i32 = arith.XOrIOp(
+                _raw(cur_buf_i32), arith.constant(1, type=T.i32)
+            ).result
+            next_k_off = _buf_off(next_buf_i32, K_BUF1_OFF)
+            next_v_off = _buf_off(next_buf_i32, V_BUF1_OFF)
+
+            # ==== Apply correction factor to o_accs (carried from prologue/prev iter) ====
+            corr_vec16 = (
+                Vec.from_elements([corr_carried], fx.Float32).broadcast_to(16).ir_value()
+            )
             for dc in range_constexpr(D_CHUNKS):
                 o_accs[dc] = _fmul(o_accs[dc], corr_vec16)
 
-            # V was already loaded (either by the prologue or by the previous
-            # iteration's prefetch). The pre-MFMA barrier above already
-            # synchronized.
-
-            # ==== P quant: f32 → fp8 (e4m3fn on gfx950) ====
-            # P = exp2(s - m_new) ∈ [0, 1] by construction (row-max(P) = 1.0).
-            # Cast directly to fp8e4m3fn without FP8_MAX scaling — matches
-            # Triton's approach. Saves 16 v_pk_mul (= 32 scalar muls) on the
-            # critical-path bridge between QK and PV gemms. Precision loss is
-            # acceptable: e4m3fn has 3 mantissa bits, and [0,1] still uses
-            # the lower exponent range cleanly.
-            #
-            # Pack each subtile's 16 fp8 bytes into 4 i32 words. Layout within
-            # a subtile (own's view, klane=0): word w holds bytes for the 4
-            # contiguous QK output indices i=w*4..w*4+3, which correspond to
-            # m={w*8+0, w*8+1, w*8+2, w*8+3} (klane=0) within the subtile.
-            c0_i32 = arith.constant(0, type=T.i32)
-            # p_words[subtile][word] : i32, packed 4xfp8 own bytes for this lane
-            p_words = []
-            for st in range_constexpr(N_SUBTILES):
-                sub_words = []
-                for w in range_constexpr(4):
-                    s0 = _raw(p_vals[st * ELEMS_PER_TILE + w * 4 + 0])
-                    s1 = _raw(p_vals[st * ELEMS_PER_TILE + w * 4 + 1])
-                    s2 = _raw(p_vals[st * ELEMS_PER_TILE + w * 4 + 2])
-                    s3 = _raw(p_vals[st * ELEMS_PER_TILE + w * 4 + 3])
-                    packed = c0_i32
-                    packed = rocdl.cvt_pk_fp8_f32(T.i32, s0, s1, packed, 0)
-                    packed = rocdl.cvt_pk_fp8_f32(T.i32, s2, s3, packed, 1)
-                    sub_words.append(packed)
-                p_words.append(sub_words)
-
-            # ==== GEMM2: O += V @ P  (mfma_scale_f32_32x32x64_f8f6f4) ====
-            # A=V (v8i32/lane = 32 fp8 bytes: row m=lane32 of V[d, kv]; K=klane*32+0..31).
-            # B=P (v8i32/lane = 32 fp8 bytes: col n=lane32 of P[kv, q];  K=klane*32+0..31).
-            # Output: v16f32/lane, same layout as the QK output.
-            #
-            # P-handoff bridge: lane (klane, lane32)'s QK p_vals[subtile] holds
-            # P at q_row=lane32 and kv_rows m=(i//4)*8 + klane*4 + (i%4) for that
-            # subtile. With BLOCK_N=128 and PV_K_STEPS=2, each pks consumes a
-            # different QK subtile per klane:
-            #   pks=p, klane=0 → uses subtile (p*2)
-            #   pks=p, klane=1 → uses subtile (p*2 + 1)
-            # Within a chosen subtile, lane's "own" 16 bytes correspond to K
-            # positions {0..3, 8..11, 16..19, 24..27} (klane=0) or
-            # {4..7, 12..15, 20..23, 28..31} (klane=1). The other 16 bytes
-            # come from the partner lane (same lane32, other klane) — they hold
-            # the OTHER set of K positions WITHIN THE SAME subtile.
-            #
-            # Each klane's "send" payload is the partner's chosen subtile data
-            # this lane already holds. shuffle_xor(width=64, off=32) swaps them.
-            # Direct cross-half-wave assembly via v_permlane32_swap_b32:
-            # the instruction swaps vdst[high] with vsrc[low]. With vdst=A,
-            # vsrc=B (A=p_words[2pks][w], B=p_words[2pks+1][w]):
-            #   new A[lane n<32]  = old A[n]      = lo[n<32]
-            #   new A[lane n>=32] = old B[n-32]   = lo[n>=32]
-            #   new B[lane n<32]  = old A[n+32]   = hi[n<32]
-            #   new B[lane n>=32] = old B[n]      = hi[n>=32]
-            # which is exactly the (lo, hi) v8 pair the QK→PV bridge needs.
-            # Replaces the 4×(cmp+cndmask)+4×7-instr shuffle_xor pattern (~45 instr/pks)
-            # with 4×(1-instr swap + 2 extracts).
+            # ==== GEMM2: PV[k] using carried p_words[k] and cur_buf V ====
             from flydsl._mlir.dialects._rocdl_ops_gen import permlane32_swap as _permlane32_swap_op
             _struct_ty_2xi32 = ir.Type.parse("!llvm.struct<(i32, i32)>")
             for pks in range_constexpr(PV_K_STEPS):
                 v8_elems = []
                 for w in range_constexpr(4):
-                    a_w = _raw(p_words[pks * 2][w])
-                    b_w = _raw(p_words[pks * 2 + 1][w])
+                    a_w = _raw(p_words_carried[pks * 2][w])
+                    b_w = _raw(p_words_carried[pks * 2 + 1][w])
                     swapped = _permlane32_swap_op(
                         _struct_ty_2xi32, old=a_w, src=b_w,
                         fi=False, bound_control=True,
@@ -1001,8 +965,6 @@ def build_sage_attn_cdna_module(
                     v8_elems.append(lo_word)
                     v8_elems.append(hi_word)
                 p_pack_v8i32 = Vec.from_elements(v8_elems, fx.Int32).ir_value()
-
-                # Constant e8m0 scale = 127 → multiplier 1.0 (no scaling).
                 scale_127 = arith.constant(127, type=T.i32)
                 for dc in range_constexpr(D_CHUNKS):
                     v_frag = load_v_frag_fp8(pks, dc, cur_v_off, v_iter_lane_addr_i32)
@@ -1011,16 +973,49 @@ def build_sage_attn_cdna_module(
                         scale_127, scale_127,
                     )
 
-            m_running = m_new
-            l_running = l_new
+            # ==== Compute softmax for NEXT iter (k+1) using K in next_buf ====
+            # Prev iter's prefetch into next_buf was synced by the barrier at
+            # END of that iter (or by the prologue barrier for iter 0).
+            # Source-order: this block runs AFTER the PV MFMA loop, but its
+            # only data dep is on next_buf K reads + m_running/l_running — no
+            # dep on PV's MFMA chain. The JIT scheduler can interleave these
+            # VALU ops into PV's MFMA shadow.
+            kv_block_next = kv_block_start + fx.Index(BLOCK_N)
+            m_new, l_new, corr_new, p_words_new = _emit_qk_softmax_pquant(
+                kv_block_next, next_k_off, m_running, l_running
+            )
 
-            _yield_args = [next_buf_i32, m_running, l_running] + o_accs
+            # Barrier #1: sync cross-wave PV V reads of cur_buf done, AND
+            # softmax K reads of next_buf done — required because the prefetch
+            # below overwrites cur_buf (V[k] is being replaced with V[k+2]).
+            # Without this, wave A's prefetch ds_writes can corrupt wave B's
+            # in-flight PV V ds_reads on the same buf.
+            gpu.barrier()
+
+            # ==== Prefetch K[k+2], V[k+2] into cur_buf (overwrites K[k]/V[k]) ====
+            kv_block_after_next = kv_block_next + fx.Index(BLOCK_N)
+            coop_load_k(kv_block_after_next, cur_k_off)
+            coop_load_v(kv_block_after_next, cur_v_off)
+
+            # Barrier #2: sync prefetch ds_writes complete before next iter's
+            # softmax reads new next_buf K (= this iter's cur_buf). Without
+            # this, next iter could read stale/partial K[k+2].
+            gpu.barrier()
+
+            # ==== Yield ====
+            _yield_args = [next_buf_i32, _raw(m_new), _raw(l_new), _raw(corr_new)]
+            for dc in range_constexpr(D_CHUNKS):
+                _yield_args.append(o_accs[dc])
+            for st in range_constexpr(N_SUBTILES):
+                for w in range_constexpr(4):
+                    _yield_args.append(_raw(p_words_new[st][w]))
             loop_results = yield _yield_args
 
         # ---- Normalize and store O ----
-        # loop_results layout: [cur_buf_i32, m_running, l_running, o_acc_0, ...]
-        l_final = loop_results[2]
-        o_finals = [loop_results[3 + dc] for dc in range_constexpr(D_CHUNKS)]
+        # loop_results layout (Attack #4): [cur_buf, m, l, corr, o_acc_0..3,
+        #                                   p_words_0_0..p_words_3_3]
+        l_final = loop_results[_OFF_L]
+        o_finals = [loop_results[_OFF_O_ACCS + dc] for dc in range_constexpr(D_CHUNKS)]
 
         inv_l = arith.divf(_raw(c_one_f), _raw(l_final), fastmath=fm_fast)
         # No FP8_MAX compensation needed: P-quant casts P∈[0,1] directly without
