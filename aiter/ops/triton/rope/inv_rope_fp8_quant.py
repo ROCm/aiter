@@ -3,11 +3,18 @@
 
 """Fused inverse RoPE + FP8 block-scaled quantization for DeepSeek-V4 MLA.
 
-Public API wrapping the Triton JIT kernel. Automatically detects the platform
-FP8 type (fn on gfx950/CDNA4, fnuz on gfx942/CDNA3) to ensure hardware-
-accelerated FP8 conversion intrinsics are used.
+Public API wrapping the Triton JIT kernel.  Scale output uses MN-major
+layout (token stride = 1) so downstream fp8_einsum / DeepGEMM can consume
+it directly without ``transform_sf_into_required_layout``, matching the
+vllm ``fused_inv_rope_fp8_quant`` output contract.
 
-Usage:
+Returns::
+
+    o_fp8:   (T, n_groups, D_per_group)  platform fp8, strides (D, T*D, 1)
+    o_scale: (T, n_groups, num_k_blocks) fp32,  strides (1, K*T_a, T_a)
+
+Usage::
+
     from aiter.ops.triton.rope.inv_rope_fp8_quant import inv_rope_fp8_quant
 
     o_fp8, o_scale = inv_rope_fp8_quant(
@@ -25,6 +32,10 @@ from aiter.ops.triton._triton_kernels.rope.inv_rope_fp8_quant import (
 )
 
 
+def _tma_align(n: int, alignment: int = 4) -> int:
+    return (n + alignment - 1) // alignment * alignment
+
+
 def inv_rope_fp8_quant(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -38,9 +49,9 @@ def inv_rope_fp8_quant(
     """Fused inverse RoPE + FP8 block-scaled quantization.
 
     Args:
-        o: Attention output [num_tokens, num_heads, head_dim] bf16.
-        positions: Token positions [num_tokens] int64.
-        cos_sin_cache: Precomputed [max_pos, rope_dim] fp32 with cos||sin.
+        o: Attention output ``[T, num_heads, head_dim]`` bf16.
+        positions: Token positions ``[T]`` int64.
+        cos_sin_cache: ``[max_pos, rope_dim]`` fp32, cos||sin concatenated.
         n_groups: Number of KV groups.
         heads_per_group: Q heads per KV group.
         rope_head_dim: RoPE dimensions per head (default 64).
@@ -48,8 +59,15 @@ def inv_rope_fp8_quant(
         fp8_dtype: Override FP8 dtype (default: auto-detect from platform).
 
     Returns:
-        o_fp8:   (n_groups, T, D_per_group) platform fp8 dtype
-        o_scale: (n_groups, T, num_k_blocks) float32
+        ``(o_fp8, o_scale)`` where
+
+        * **o_fp8** has shape ``(T, G, D_per_group)`` and dtype *fp8_dtype*.
+          Memory layout: transposed view of an internal ``(G, T, D)`` buffer
+          — strides ``(D, T*D, 1)``.
+        * **o_scale** has shape ``(T, G, num_k_blocks)`` with **MN-major**
+          strides ``(1, K*T_aligned, T_aligned)`` where
+          ``T_aligned = ceil(T/4)*4``.  The token dimension has stride 1,
+          matching what ``fp8_einsum`` expects.
     """
     assert o.dtype == torch.bfloat16
     assert o.dim() == 3
@@ -60,9 +78,6 @@ def inv_rope_fp8_quant(
     assert head_dim % quant_group_size == 0
     assert rope_head_dim % 2 == 0
 
-    if positions.dtype != torch.int64:
-        positions = positions.to(torch.int64)
-
     d_per_group = heads_per_group * head_dim
     num_k_blocks = d_per_group // quant_group_size
     chunks_per_head = head_dim // quant_group_size
@@ -72,18 +87,32 @@ def inv_rope_fp8_quant(
 
         fp8_dtype = get_fp8_e4m3_dtype()
 
+    if T == 0:
+        fp8_out = torch.empty(0, n_groups, d_per_group, dtype=fp8_dtype, device=o.device)
+        scale_out = torch.empty(
+            0, n_groups, num_k_blocks, dtype=torch.float32, device=o.device
+        )
+        return fp8_out, scale_out
+
+    if positions.dtype != torch.int64:
+        positions = positions.to(torch.int64)
+
     is_fnuz = fp8_dtype == torch.float8_e4m3fnuz
     fp8_max = torch.finfo(fp8_dtype).max
 
     fp8_out = torch.empty(n_groups, T, d_per_group, dtype=fp8_dtype, device=o.device)
+
+    T_aligned = _tma_align(T)
     scale_out = torch.empty(
-        n_groups, T, num_k_blocks, dtype=torch.float32, device=o.device
+        n_groups * num_k_blocks * T_aligned,
+        dtype=torch.float32,
+        device=o.device,
+    ).as_strided(
+        (n_groups, T, num_k_blocks),
+        (num_k_blocks * T_aligned, 1, T_aligned),
     )
 
-    if T == 0:
-        return fp8_out, scale_out
-
-    grid = (T, n_groups * heads_per_group)
+    grid = (T_aligned, n_groups * heads_per_group)
 
     _inv_rope_fp8_quant_kernel[grid](
         o,
@@ -111,4 +140,4 @@ def inv_rope_fp8_quant(
         num_warps=1,
         num_stages=1,
     )
-    return fp8_out, scale_out
+    return fp8_out.transpose(0, 1), scale_out.transpose(0, 1)
