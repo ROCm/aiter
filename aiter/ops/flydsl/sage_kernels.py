@@ -77,7 +77,7 @@ def flydsl_sage_attn_func(
     causal: bool = False,
     layout: str = "bshd",
     waves_per_eu: int = 2,
-    block_m: int = 256,
+    block_m: Optional[int] = None,
     block_n: int = 128,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
@@ -96,7 +96,9 @@ def flydsl_sage_attn_func(
         causal: apply causal masking when ``True``.
         layout: ``"bshd"`` (default) or ``"bhsd"``.
         waves_per_eu: kernel occupancy hint.
-        block_m: Q tile size (default 256, must match gfx942/950 config).
+        block_m: Q tile size. If ``None`` (default), auto-selected per shape:
+            BLOCK_M=128 when grid_at_BM256 < CU count (small-S/low-occupancy
+            shapes win ~17% from the doubled grid), else BLOCK_M=256.
         block_n: KV tile size (default 128).
         stream: optional CUDA/HIP stream. Defaults to current stream for q.device.
 
@@ -146,6 +148,19 @@ def flydsl_sage_attn_func(
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    # Auto-pick BLOCK_M for occupancy. BM=256 only saturates the GPU once
+    # batch * num_q_heads * ceil(seq_q/256) >= CU count. For small-S/H1
+    # shapes the BM=256 grid is well below CU count and BM=128 (which doubles
+    # the grid) wins +17%; for shapes that already saturate, BM=256 wins
+    # (larger MFMA chains, single coop-load batch).
+    if block_m is None:
+        try:
+            cu_count = torch.cuda.get_device_properties(q.device.index).multi_processor_count
+        except Exception:
+            cu_count = 256
+        grid_at_bm256 = batch * num_q_heads * ((seq_q + 255) // 256)
+        block_m = 128 if grid_at_bm256 < cu_count else 256
 
     fp8_dtype = _fp8_dtype
     fp8_max = torch.finfo(fp8_dtype).max
