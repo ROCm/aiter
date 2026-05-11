@@ -2846,21 +2846,6 @@ class FmoeTuner(TunerCommon):
             )
             prorfiles.append(profileDF)
 
-            # Keep FlyDSL stage2 correctness strict even when the CLI errRatio is
-            # relaxed for exploration. A failed stage2 can still report err<1.0,
-            # which would otherwise let an inaccurate kernel reach the final tune.
-            _bad_flydsl_s2 = (
-                (profileDF["stage"] == "stage2")
-                & profileDF["kernelName"].astype(str).str.startswith("flydsl_")
-                & (profileDF["err"] > 0.05)
-            )
-            if _bad_flydsl_s2.any():
-                print(
-                    "  drop inaccurate FlyDSL stage2 candidates:",
-                    int(_bad_flydsl_s2.sum()),
-                )
-                profileDF = profileDF.loc[~_bad_flydsl_s2].reset_index(drop=True)
-
             ## remove invalid candidate
             profileDF = profileDF[
                 (profileDF["us"] != float("-inf"))

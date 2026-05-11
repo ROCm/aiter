@@ -269,11 +269,6 @@ def get_flydsl_stage2_kernels(
                     if a_dtype != "fp4" or tm not in (32, 64) or tn != 128:
                         continue
                 for mode in modes:
-                    if mfma_variant_tag and mode == "atomic":
-                        # The MFMA32 path is validated with the reduce epilogue.
-                        # Keep atomic out of tuning until its padded-row handling
-                        # is fixed for this variant.
-                        continue
                     for async_copy in async_copies:
                         if is_fp4 and tk == 128 and async_copy:
                             continue

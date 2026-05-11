@@ -2785,7 +2785,7 @@ def compile_mixed_moe_gemm2(
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"{_mfma_variant_tag}_vscale_fix7_scalepad_packedx_rowmap1_rowguard1{_async_tag}{_packed_lds_tag}_tidlds_cshfix"
+        f"{_mfma_variant_tag}_vscale_fix7_scalepad_packedx_rowmap1_rowguard2{_async_tag}{_packed_lds_tag}_tidlds_cshfix"
     ).replace("-", "_")
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Reuse a single allocation for both:
@@ -4387,7 +4387,7 @@ def compile_mixed_moe_gemm2(
                     store_pair=store_pair,
                     skip_initial_barrier=True,
                     interleave_n_reps=True,
-                    use_vskip=bool(accumulate),
+                    use_vskip=bool(accumulate) and not use_mfma32_k64,
                     llvm=llvm,
                     batch_cshuffle_reads=True,
                 )
