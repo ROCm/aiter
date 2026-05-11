@@ -1416,7 +1416,8 @@ def get_2stage_cfgs(
             is_mxscale = gfx1250_fmt in ("fp4", "fp8", "a8w4")
             default_tile_n = 128 if is_mxscale else 64
             default_tile_k = 128 if is_mxscale else 64
-            default_block_m = 32
+            # default_block_m = 32
+            default_block_m = 16
             # FlyDSL UT (test_moe_gemm_mxscale_gfx1250.py) quantises the
             # stage-1 output for a8w4 with ``_per_1x32_fp8_quant`` (fp8
             # activation × fp4 weight, i.e. another ``a8w4`` GEMM), not
