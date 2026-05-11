@@ -158,7 +158,6 @@ def fused_moe(
         and w2.shape[2] == 128
     ):
         from aiter.fused_moe_ptpc_fp8 import fused_moe_ptpc_fp8
-        #print(f"------------------------------------------- fused_moe_ptpc_fp8 hitting -------------------------------------------")
         moe_buf = fused_moe_ptpc_fp8(
             hidden_states,
             w1,
@@ -174,7 +173,8 @@ def fused_moe(
             moe_sorting_dispatch_policy,
         )
 
-        return moe_buf
+        if moe_buf is not None:
+            return moe_buf
 
     if not block_size_M:
         block_size_M = -1

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """Qwen3.5 397B MoE PTPC FP8 TP8 run with prebuilt hasco artifacts on gfx942:
 ``fused_moe()`` calls ``fused_moe_ptpc_fp8`` only when the following conditions are met:
 - B=1~32, E=512, N1=256, K1=4096, N2=4096, K2=128, TOPK=10
@@ -24,7 +25,7 @@ from typing import Any, Optional
 import torch
 
 import aiter
-from aiter import ActivationType, QuantType, dtypes
+from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.fused_moe import moe_sorting
 from csrc.cpp_itfs.hsaco_tools import get_kernel
@@ -77,53 +78,55 @@ def fused_moe_ptpc_fp8(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    #print(f"********************************* Batch size:{B} *********************************")
     if B == 1:
         assert N1 == 2 * K2
-        #print("Get moe_gemm_batch1_gate kernel start")
-        moe_gemm_batch1_gate = get_kernel(f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/moe_gemm_batch1-1-weight_dtype=torch.float8_e4m3fnuz-with_silu=True:moe_gemm_batch1")
-        # print("Get moe_gemm_batch1_gate kernel end")
-        # print("Get moe_gemm_batch1_down kernel start")
-        moe_gemm_batch1_down = get_kernel(f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/moe_gemm_batch1-1-weight_dtype=torch.float8_e4m3fnuz-with_silu=False:moe_gemm_batch1")
-        #print("Get moe_gemm_batch1_down kernel end")
-
-        if moe_gemm_batch1_gate is None or moe_gemm_batch1_down is None:
+        try:
+            moe_gemm_batch1_gate = get_kernel(
+                f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/"
+                f"moe_gemm_batch1-1-weight_dtype=torch.float8_e4m3fnuz-with_silu=True:moe_gemm_batch1"
+            )
+            moe_gemm_batch1_down = get_kernel(
+                f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/"
+                f"moe_gemm_batch1-1-weight_dtype=torch.float8_e4m3fnuz-with_silu=False:moe_gemm_batch1"
+            )
+            cur_out = torch.zeros(
+                [1, N2], dtype=hidden_states.dtype, device=hidden_states.device
+            )
+            moe_gemm_batch1_gate(
+                [N1 // 32, TOPK],
+                [256],
+                hidden_states,
+                w1,
+                gemm1_out,
+                topk_ids,
+                topk_w_f32,
+                w1_scale,
+                1,
+                N1,
+                K1,
+            )
+            moe_gemm_batch1_down(
+                [N2 // 32, TOPK],
+                [64],
+                gemm1_out,
+                w2,
+                cur_out,
+                topk_ids,
+                topk_w_f32,
+                w2_scale,
+                1,
+                N2,
+                K2,
+            )
+        except Exception as e:
+            msg = (
+                f"fused_moe_ptpc_fp8 (B=1): HSACO kernel load or launch failed: {e}. "
+                f"Check artifacts under {AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/"
+            )
+            logger.warning(
+                msg + "; fallback to default fused_moe_() instead."
+            )
             return None
-        cur_out = torch.zeros(
-            [1, N2], dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        #print("Call moe_gemm_batch1_gate kernel start")
-
-        moe_gemm_batch1_gate(
-            [N1 // 32, TOPK],
-            [256],
-            hidden_states,
-            w1,
-            gemm1_out,
-            topk_ids,
-            topk_w_f32,
-            w1_scale,
-            1,
-            N1,
-            K1,
-        )
-
-        #print("Call moe_gemm_batch1_gate kernel end")
-        #print("Call moe_gemm_batch1_down kernel start")
-        moe_gemm_batch1_down(
-            [N2 // 32, TOPK],
-            [64],
-            gemm1_out,
-            w2,
-            cur_out,
-            topk_ids,
-            topk_w_f32,
-            w2_scale,
-            1,
-            N2,
-            K2,
-        )
-        #print("Call moe_gemm_batch1_down kernel end")
     elif 2 <= B <= 32:
         # Stage 1: Shared ``moe_sorting`` + ``moe_gemm_batch``;
         # stage 2: Choose between ``moe_2stage_down_loopn`` and ``moe_2stage_splitk`` based on ``use_down_loopn`` condition.
@@ -142,37 +145,37 @@ def fused_moe_ptpc_fp8(
         grid = int(sorted_expert_ids.shape[0])
         if B * TOPK <= E:
             grid = B * TOPK
-        cur_out = torch.zeros(
-            (B, N2),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        #print("Get moe_gemm_batch kernel start")
-        moe_gemm_batch = get_kernel(
-            f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/moe_gemm_batch-1-weight_dtype=torch.float8_e4m3fnuz-with_silu=True:moe_gemm_batch"
-        )
-        #print("Get moe_gemm_batch kernel end")
-        if moe_gemm_batch is None:
-            return None
 
-        #print("Call moe_gemm_batch kernel start")
-        moe_gemm_batch(
-            [N1 // 32, grid],
-            [256],
-            hidden_states,
-            w1,
-            gemm1_out,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            w1_scale,
-            B,
-            N1,
-            K1,
-            TOPK,
-        )
-        #print("Call moe_gemm_batch kernel end")
+        try:
+            moe_gemm_batch = get_kernel(
+                f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/"
+                f"moe_gemm_batch-1-weight_dtype=torch.float8_e4m3fnuz-with_silu=True:moe_gemm_batch"
+            )
+            moe_gemm_batch(
+                [N1 // 32, grid],
+                [256],
+                hidden_states,
+                w1,
+                gemm1_out,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                w1_scale,
+                B,
+                N1,
+                K1,
+                TOPK,
+            )
+        except Exception as e:
+            msg = (
+                f"fused_moe_ptpc_fp8 (B={B}): moe_gemm_batch HSACO kernel load or launch failed: {e}. "
+                f"Check artifacts under {AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/"
+            )
+            logger.warning(
+                msg + "; fallback to default fused_moe_() instead."
+            )
+            return None
 
 
         BLOCK_N = 1024
@@ -184,62 +187,70 @@ def fused_moe_ptpc_fp8(
         )
 
         if use_down_loopn:
-            #print("Get moe_2stage_down_loopn kernel start")
-            moe_2stage_down_loopn = get_kernel(
-                f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/"
-                f"moe_2stage_down_loopn-1-weight_dtype=torch.float8_e4m3fnuz-TOPK=10-K=128-N=4096-"
-                f"BLOCK_TILE_SIZE_M=16-BLOCK_TILE_SIZE_N=16-fp8_ptpc=True-BLOCK_N=1024-"
-                f"atomic_write=False-STAGES=3:moe_2stage_down_loopn"
-            )
-            #print("Get moe_2stage_down_loopn kernel end")
-            if moe_2stage_down_loopn is None:
+            try:
+                moe_2stage_down_loopn = get_kernel(
+                    f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/"
+                    f"moe_2stage_down_loopn-1-weight_dtype=torch.float8_e4m3fnuz-TOPK=10-K=128-N=4096-"
+                    f"BLOCK_TILE_SIZE_M=16-BLOCK_TILE_SIZE_N=16-fp8_ptpc=True-BLOCK_N=1024-"
+                    f"atomic_write=False-STAGES=3:moe_2stage_down_loopn"
+                )
+                gemm2_out = torch.empty(
+                    [B, TOPK, N2],
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                moe_2stage_down_loopn(
+                    [N2 // BLOCK_N, grid],
+                    [256],
+                    gemm1_out,
+                    w2,
+                    gemm2_out,
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    w2_scale,
+                    B,
+                )
+                cur_out = torch.sum(gemm2_out, dim=1)
+            except Exception as e:
+                msg = (
+                    f"fused_moe_ptpc_fp8 (B={B}): moe_2stage_down_loopn HSACO kernel load or launch failed: {e}. "
+                    f"Check artifacts under {AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/"
+                )
+                logger.warning(
+                    msg + "; fallback to default fused_moe_() instead."
+                )
                 return None
-            gemm2_out = torch.empty(
-                [B, TOPK, N2],
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            #print("Call moe_2stage_down_loopn kernel start")
-            moe_2stage_down_loopn(
-                [N2 // BLOCK_N, grid],
-                [256],
-                gemm1_out,
-                w2,
-                gemm2_out,
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                w2_scale,
-                B,
-            )
-            #print("Call moe_2stage_down_loopn kernel end")
-            cur_out = torch.sum(gemm2_out, dim=1)
         else:
-            #print("Get moe_2stage_splitk kernel start")
-            moe_2stage_splitk = get_kernel(
-                f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/"
-                f"moe_2stage_splitk-1-weight_dtype=torch.float8_e4m3fnuz-TOPK=10-K=128-N=4096-"
-                f"with_silu=False-BLOCK_TILE_SIZE_M=16-BLOCK_TILE_SIZE_N=64-fp8_ptpc=True:moe_2stage_splitk"
-            )
-            #print("Get moe_2stage_splitk kernel end")
-            if moe_2stage_splitk is None:
+            try:
+                moe_2stage_splitk = get_kernel(
+                    f"{AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/"
+                    f"moe_2stage_splitk-1-weight_dtype=torch.float8_e4m3fnuz-TOPK=10-K=128-N=4096-"
+                    f"with_silu=False-BLOCK_TILE_SIZE_M=16-BLOCK_TILE_SIZE_N=64-fp8_ptpc=True:moe_2stage_splitk"
+                )
+                BLOCK_TILE_SIZE_N = 64
+                moe_2stage_splitk(
+                    [N2 // BLOCK_TILE_SIZE_N, grid],
+                    [64],
+                    gemm1_out,
+                    w2,
+                    cur_out,
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    w2_scale,
+                    B,
+                )
+            except Exception as e:
+                msg = (
+                    f"fused_moe_ptpc_fp8 (B={B}): moe_2stage_splitk HSACO kernel load or launch failed: {e}. "
+                    f"Check artifacts under {AITER_CORE_DIR}/hsa/gfx942/fmoe_ptpc_fp8/"
+                )
+                logger.warning(
+                    msg + "; fallback to default fused_moe_() instead."
+                )
                 return None
-            BLOCK_TILE_SIZE_N = 64
-            #print("Call moe_2stage_splitk kernel start")
-            moe_2stage_splitk(
-                [N2 // BLOCK_TILE_SIZE_N, grid],
-                [64],
-                gemm1_out,
-                w2,
-                cur_out,
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                w2_scale,
-                B,
-            )
-            #print("Call moe_2stage_splitk kernel end")
 
     return cur_out
