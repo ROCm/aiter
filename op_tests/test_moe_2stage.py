@@ -594,6 +594,7 @@ def _iter_csv_cases():
         expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
             kwargs["token"],
             kwargs["actType"],
+            kwargs["gateMode"],
             kwargs["qType"],
             kwargs["AQDType"],
             kwargs["WQDType"],
@@ -634,7 +635,9 @@ def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     return 0.0
 
 
-def _runtime_swiglu_mxfp4_q_dtype_a(token, act_type, q_type, aq_dtype, wq_dtype):
+def _runtime_swiglu_mxfp4_q_dtype_a(
+    token, act_type, gate_mode, q_type, aq_dtype, wq_dtype
+):
     """Return the q_dtype_a that fused_moe will select for Swiglu MXFP4."""
     if act_type != aiter.ActivationType.Swiglu:
         return None
@@ -643,11 +646,12 @@ def _runtime_swiglu_mxfp4_q_dtype_a(token, act_type, q_type, aq_dtype, wq_dtype)
     if aq_dtype not in [dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.fp4x2]:
         return None
 
-    if os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "0") == "1":
+    gate_mode = GateMode(gate_mode)
+    if gate_mode == GateMode.SEPARATED:
         bound = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
         return dtypes.bf16 if token < bound else dtypes.fp4x2
 
-    bound = int(os.environ.get("AITER_BF16_FP8_BOUND", "512"))
+    bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
     return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
 
 

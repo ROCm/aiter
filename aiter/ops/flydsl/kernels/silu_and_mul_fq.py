@@ -298,13 +298,18 @@ def build_silu_and_mul_fq_module(
                         gate = g
                         linear = u
 
-                        t = g * neg_log2e
+                        t = gate * neg_log2e
 
-                        if const_expr(swiglu_limit != 0 and act != "swiglu"):
+                        if const_expr(act == "swiglu"):
                             gate = arith.minimumf(gate, _limit)
                             linear = arith.minimumf(linear, _limit)
                             linear = arith.maximumf(linear, _neg_limit)
                             t = gate * swiglu_neg_alpha_log2e
+                        elif const_expr(swiglu_limit != 0):
+                            gate = arith.minimumf(gate, _limit)
+                            linear = arith.minimumf(linear, _limit)
+                            linear = arith.maximumf(linear, _neg_limit)
+                            t = gate * neg_log2e
 
                         emu = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -314,9 +319,14 @@ def build_silu_and_mul_fq_module(
                             f32, "llvm.amdgcn.rcp.f32", [den], [], []
                         )
                         if const_expr(act == "swiglu"):
-                            act_vals.append(gate * sig * (linear + c1_f32))
+                            act_v = gate * sig * (linear + c1_f32)
                         else:
-                            act_vals.append(gate * sig * linear)
+                            act_v = gate * sig * linear
+                        if const_expr(_need_fp4 and act == "swiglu"):
+                            # Keep fused quant numerically aligned with the
+                            # non-fused path, which stores stage1 as bf16 first.
+                            act_v = arith.trunc_f(T.bf16, act_v).extf(T.f32)
+                        act_vals.append(act_v)
 
                     if const_expr(_need_quant):
                         local_max = c0_f32
