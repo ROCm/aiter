@@ -67,9 +67,12 @@ namespace py = pybind11;
 #define ACTIVATION_PYBIND                               \
     m.def("silu_and_mul",                               \
           &aiter::silu_and_mul,                         \
-          "Activation function used in SwiGLU.",        \
+          "Activation function used in SwiGLU. "         \
+          "When limit > 0, clamps x to max=limit "      \
+          "and y to [-limit, limit] before computing.",  \
           py::arg("out"),                               \
-          py::arg("input"));                            \
+          py::arg("input"),                             \
+          py::arg("limit") = 0.0f);                    \
     m.def("swiglu_and_mul",                             \
           &aiter::swiglu_and_mul,                       \
           "Activation function used in GPT-OSS SwiGLU.",\

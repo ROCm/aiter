@@ -125,7 +125,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_fused_qk_rmsnorm_group_quant.py]=5
     FILE_TIMES[op_tests/test_aiter_sigmoid.py]=4
     FILE_TIMES[op_tests/test_indexer_k_quant_and_cache.py]=4
-    FILE_TIMES[op_tests/test_moe_topk_sigmoid.py]=4
+    FILE_TIMES[op_tests/test_moe_topk_gating.py]=4
     FILE_TIMES[op_tests/test_topk_row_prefill.py]=4
     FILE_TIMES[op_tests/test_layernorm2d.py]=3
     FILE_TIMES[op_tests/test_pretune.py]=1
