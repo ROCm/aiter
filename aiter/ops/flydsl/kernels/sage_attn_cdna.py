@@ -294,6 +294,7 @@ def build_sage_attn_cdna_module(
         Q_descale: fx.Tensor,  # f32, shape [batch, num_q_heads, num_q_blocks]
         K_descale: fx.Tensor,  # f32, shape [batch, num_kv_heads, num_k_blocks]
         V_descale: fx.Tensor,  # f32, shape [batch, num_kv_heads, head_dim] (per-element)
+        batch_size: fx.Int32,
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
         num_q_blocks: fx.Int32,
@@ -323,13 +324,22 @@ def build_sage_attn_cdna_module(
         kds_ptr = _extract_aligned_pointer(K_descale)
         vds_ptr = _extract_aligned_pointer(V_descale)
 
-        # Buffer descriptors for K/V global loads (Attack #2).
-        # Holding the base in SGPRs (V#) instead of a VGPR base pointer can
-        # free a few VGPRs and unblock LLVM scheduling. Row OOB is still
-        # clamped at the address-compute level (see coop_load_k/v), so
-        # max_size=True is safe — every load address is within the tensor.
-        k_rsrc = buffer_ops.create_buffer_resource(K, max_size=True)
-        v_rsrc = buffer_ops.create_buffer_resource(V, max_size=True)
+        # Buffer descriptors for K/V global loads.
+        # Tight num_records_bytes = B*S*Hk*HEAD_DIM lets the hardware return
+        # 0 for OOB lanes past tensor end, so we can drop the row-clamp +
+        # V zero-fill selects in coop_load_k/v. Score masking already pins
+        # P=0 for KV columns past seq_len_k, so even inner-batch overflow
+        # rows that fall into a neighboring batch's bytes contribute 0 to
+        # the PV MFMA (0 * any-fp8 = 0; sage_quant outputs are NaN-free).
+        bs_v_for_rsrc = fx.Index(batch_size)
+        slk_v_for_rsrc = fx.Index(seq_len_k)
+        kv_total_bytes = bs_v_for_rsrc * slk_v_for_rsrc * fx.Index(NUM_KV_HEADS * HEAD_DIM)
+        k_rsrc = buffer_ops.create_buffer_resource(
+            K, max_size=False, num_records_bytes=kv_total_bytes,
+        )
+        v_rsrc = buffer_ops.create_buffer_resource(
+            V, max_size=False, num_records_bytes=kv_total_bytes,
+        )
 
         v4i32_type = Vec.make_type(4, fx.Int32)
         v4f32_type = Vec.make_type(4, fx.Float32)
@@ -513,17 +523,19 @@ def build_sage_attn_cdna_module(
             for batch in range_constexpr(NUM_BATCHES_K):
                 row_offset = batch * ROWS_PER_BATCH_K
                 row_idx_raw = tile_start + load_row_k_batch + row_offset
-                # Clamp OOB rows to safe row 0 (we mask the resulting scores
-                # to -inf before softmax, so the K values are discarded).
-                kv_in_bounds = ArithValue(row_idx_raw < seq_len_k_v)
-                row_idx = fx.Index(kv_in_bounds.select(row_idx_raw, fx.Index(0)))
+                # Tight buffer descriptor (num_records_bytes=B*S*Hk*HEAD_DIM)
+                # makes hardware return 0 for OOB lanes past tensor end. For
+                # inner-batch tail rows that overflow into a neighbouring
+                # batch the score mask still pins P=0 for those columns, so
+                # the PV contribution is 0 regardless. No row-clamp select
+                # needed.
                 if const_expr(K_NEEDS_GUARD):
                     row_valid = load_row_k_batch < fx.Index(BLOCK_N)
                     do_load = row_valid
                 else:
                     do_load = True
                 if do_load:
-                    g_idx = kv_global_idx(row_idx, load_col_k_base)
+                    g_idx = kv_global_idx(row_idx_raw, load_col_k_base)
                     lds_row = load_row_k_batch + row_offset
                     lds_idx = buf_off + lds_row * K_STRIDE + load_col_k_base
                     # buffer_load_dwordx4: g_idx is in i8 elements (=bytes); divide
@@ -556,23 +568,24 @@ def build_sage_attn_cdna_module(
               same shape as global, no transpose. Reduces ~2048 ds_write_b8
               transactions per KV iter down to ~128 ds_write_b128 transactions.
 
-            For rows beyond seq_len_k, we clamp the load address to row 0 and
-            zero the resulting bytes to prevent 0 * NaN = NaN in the PV MFMA.
+            Tight buffer descriptor (num_records_bytes=B*S*Hk*HEAD_DIM) makes
+            hardware return 0 for OOB lanes past tensor end. For inner-batch
+            tail rows that overflow into a neighbouring batch the score mask
+            pins P=0 for those columns, so 0 * (whatever V byte) = 0 in the
+            PV MFMA. sage_quant outputs are NaN-free, so no NaN propagation.
 
             buf_off: byte offset into lds_v selecting the ping-pong V buffer.
             """
             for batch in range_constexpr(NUM_BATCHES_V):
                 row_offset = batch * ROWS_PER_BATCH_V
                 row_idx_raw = tile_start + load_row_v_batch + row_offset
-                kv_in_bounds = ArithValue(row_idx_raw < seq_len_k_v)
-                row_idx = fx.Index(kv_in_bounds.select(row_idx_raw, fx.Index(0)))
                 if const_expr(V_NEEDS_GUARD):
                     row_valid = load_row_v_batch < fx.Index(BLOCK_N)
                     do_load = row_valid
                 else:
                     do_load = True
                 if do_load:
-                    g_idx = kv_global_idx(row_idx, load_col_v_base)
+                    g_idx = kv_global_idx(row_idx_raw, load_col_v_base)
                     g_dword_i32 = arith.unwrap(
                         arith.index_cast(T.i32, _raw(g_idx >> fx.Index(2)))
                     )
@@ -580,8 +593,6 @@ def build_sage_attn_cdna_module(
                         v_rsrc, g_dword_i32, vec_width=4, dtype=T.i32
                     )
                     raw_v = vector.bitcast(v16i8_type, v4i32)
-                    zero_v16i8 = Vec.filled(16, 0, fx.Int8).ir_value()
-                    raw_v = ArithValue(kv_in_bounds).select(raw_v, zero_v16i8)
 
                     if const_expr(_is_gfx950):
                         # Row-major: LDS[k_v * V_STRIDE + d]. Each thread writes
@@ -1066,7 +1077,7 @@ def build_sage_attn_cdna_module(
 
         launcher = sage_attn_kernel(
             Q, K, V, O, Q_descale, K_descale, V_descale,
-            seq_len_q, seq_len_k, num_q_blocks,
+            batch_size, seq_len_q, seq_len_k, num_q_blocks,
         )
 
         if const_expr(waves_per_eu is not None):
