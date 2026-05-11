@@ -734,7 +734,7 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                 #endif
                 const auto& gfx = get_device_gfx();
                 if(gfx == "gfx942") return 128;
-                if(gfx == "gfx950") return 64;
+                if(gfx == "gfx950") return 128;
                 return 64;
             }();
             const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
@@ -853,7 +853,7 @@ void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
         const int32_t dynGroupQuantBlockSize = []() -> int32_t {
             const auto& gfx = get_device_gfx();
             if(gfx == "gfx942") return 128;
-            if(gfx == "gfx950") return 64;
+            if(gfx == "gfx950") return 128;
             return 64;
         }();
         const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
