@@ -186,6 +186,24 @@ def get_flydsl_stage2_kernels(
                                 **base_params,
                                 "persist": True,
                             }
+                            if base_name == "flydsl_moe2_afp4_wfp4_bf16_t64x128x256_atomic":
+                                # Production fp4xfp4 stage2 variant for the EP4
+                                # DeepSeek prefill shape on MI355X.  Adds:
+                                #   - use_async_copy=True (async X DMA in prologue
+                                #     overlaps with B/scale VMEM)
+                                #   - cu_num_mul=3 (persistent grid 3x CU count
+                                #     to fill in-flight slack from small per-WG
+                                #     M tile counts; cu_num_mul=4 regresses ~2.4%
+                                #     on the same shape)
+                                #   - waves_per_eu=4 (best on EP4 prefill at
+                                #     cu_num_mul=3; wpe=5/6 underperform here)
+                                kernels[f"{base_name}_persist_async_w4_cumul3"] = {
+                                    **base_params,
+                                    "persist": True,
+                                    "use_async_copy": True,
+                                    "waves_per_eu": 4,
+                                    "cu_num_mul": 3,
+                                }
     return kernels
 
 
@@ -378,6 +396,9 @@ def compile_flydsl_moe_stage2(
     accumulate: bool = True,
     persist_m: int = 1,
     sort_block_m: int = 0,
+    waves_per_eu: Optional[int] = None,
+    use_async_copy: bool = False,
+    cu_num_mul: int = 1,
     b_nt: int = 0,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
@@ -403,10 +424,11 @@ def compile_flydsl_moe_stage2(
             accumulate=accumulate,
             persist_m=persist_m,
             sort_block_m=sort_block_m,
-            b_nt=b_nt,
+            waves_per_eu=waves_per_eu,
+            use_async_copy=use_async_copy,
+            cu_num_mul=cu_num_mul,
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
-            xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
@@ -1035,6 +1057,9 @@ def flydsl_moe_stage2(
     sorted_weights: Optional[torch.Tensor] = None,
     sort_block_m: int = 0,
     persist: Optional[bool] = None,
+    waves_per_eu: Optional[int] = None,
+    use_async_copy: bool = False,
+    cu_num_mul: int = 1,
     b_nt: int = 0,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
@@ -1070,8 +1095,12 @@ def flydsl_moe_stage2(
         out = alloc_fn(
             (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
         )
-    elif accumulate:
-        out.fill_(0)
+    # NOTE: when ``accumulate=True`` (atomic mode), the caller is responsible
+    # for ensuring ``out`` is zero-initialized. In the standard ``fused_moe``
+    # dispatch path this is handled by ``moe_sorting_*_fwd`` which already
+    # zeros ``moe_buf`` via ``moe_buf_set_zero_kernel_2d``, so an extra
+    # ``out.fill_(0)`` here would be a redundant ~``token_num * model_dim``
+    # HBM write (~130us per call at MI355X HBM bw on EP4 prefill shape).
 
     dev = inter_states.device
     flat_a_scale = (
@@ -1166,6 +1195,9 @@ def flydsl_moe_stage2(
         accumulate=accumulate,
         persist_m=_persist_m,
         sort_block_m=sort_block_m,
+        waves_per_eu=waves_per_eu,
+        use_async_copy=use_async_copy,
+        cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
