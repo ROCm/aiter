@@ -1724,8 +1724,12 @@ def _compile_stage1_mxscale_kernel_impl(
                     issue_as_load(make_desc_as(k_base), lds_as_bufs[buf_idx])
 
             def _issue_all_loads(k_base, buf_idx):
-                _issue_b_tdm_only(k_base, buf_idx)
-                _issue_scalar_loads(k_base, buf_idx)
+                if const_expr(is_fp4):
+                    _issue_scalar_loads(k_base, buf_idx)
+                    _issue_b_tdm_only(k_base, buf_idx)
+                else:
+                    _issue_b_tdm_only(k_base, buf_idx)
+                    _issue_scalar_loads(k_base, buf_idx)
 
             def _compute_with_mid_loads(acg, acu, buf_idx, mid_load_callback=None):
                 if const_expr(_use_scheduled_compute):
@@ -3584,8 +3588,12 @@ def _compile_stage2_mxscale_kernel_impl(
                     issue_as_load(make_desc_as(k_base), lds_as_bufs[buf_idx])
 
             def _issue_all_loads(k_base, buf_idx):
-                _issue_b_tdm_only(k_base, buf_idx)
-                _issue_scalar_loads(k_base, buf_idx)
+                if const_expr(is_fp4):
+                    _issue_scalar_loads(k_base, buf_idx)
+                    _issue_b_tdm_only(k_base, buf_idx)
+                else:
+                    _issue_b_tdm_only(k_base, buf_idx)
+                    _issue_scalar_loads(k_base, buf_idx)
 
             def _compute_with_mid_loads(accs_in, buf_idx, mid_load_callback=None):
                 if const_expr(_use_scheduled_compute):
