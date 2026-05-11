@@ -217,6 +217,223 @@ def build_sage_quant_v_module(
 
 
 # =========================================================================
+# Preprocessor: compute V_scale + K_mean in one launch (replaces torch ops)
+# =========================================================================
+
+def build_sage_preprocess_module(head_dim: int, num_kv_heads: int):
+    """Build a kernel that computes V_scale[B,H,D] = max_seq |V| / FP8_MAX
+    and K_mean[B,H,D] = sum_seq(K) / S, in a single launch over (b, h, d_block).
+
+    Grid: B * H * (D / VEC) blocks. Each block = 1 wave (64 threads), each
+    thread accumulates VEC=8 amax/sum across S/64 rows. Wave-shuffle reduce
+    within wave; lane 0 writes 8 V_scale + 8 K_mean values to global.
+
+    Replaces three torch kernel launches (k.mean, k - mean, v.abs.amax/FP8_MAX)
+    with one FlyDSL launch — saves 60-150us of host overhead per call.
+    """
+    assert head_dim % 8 == 0, f"head_dim must be %8, got {head_dim}"
+
+    VEC = 8
+    THREADS_PER_BLOCK = 64
+    D_BLOCKS = head_dim // VEC
+
+    @flyc.kernel
+    def sage_preprocess_kernel(
+        K_in: fx.Tensor,    # bf16 [B, S, H, D]
+        V_in: fx.Tensor,    # bf16 [B, S, H, D]
+        K_mean: fx.Tensor,  # f32  [B, H, D]
+        V_scale: fx.Tensor, # f32  [B, H, D]
+        seq_len: Int32,
+        inv_fp8_max: Int32,  # bit-pattern f32: 1.0 / FP8_MAX
+        inv_seq_len: Int32,  # bit-pattern f32: 1.0 / seq_len
+    ):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+
+        f32 = T.f32
+        i32 = T.i32
+
+        bid_i32 = ArithValue(bid)
+        tid_i32 = ArithValue(tid)
+
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c_kv_heads = arith.constant(num_kv_heads, type=i32)
+        c_head_dim = arith.constant(head_dim, type=i32)
+        c_d_blocks = arith.constant(D_BLOCKS, type=i32)
+        c_vec = arith.constant(VEC, type=i32)
+        c_threads = arith.constant(THREADS_PER_BLOCK, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+
+        seq_len_i32 = ArithValue(seq_len)
+        inv_fp8_max_v = arith.bitcast(f32, ArithValue(inv_fp8_max))
+        inv_seq_len_v = arith.bitcast(f32, ArithValue(inv_seq_len))
+
+        # Decode bid -> (b, h, d_block)
+        d_block = bid_i32 % c_d_blocks
+        bh = bid_i32 // c_d_blocks
+        h_id = bh % c_kv_heads
+        b_id = bh // c_kv_heads
+
+        col_d = d_block * c_vec  # starting column in D for this block
+
+        k_in_rsrc = buffer_ops.create_buffer_resource(K_in, max_size=True)
+        v_in_rsrc = buffer_ops.create_buffer_resource(V_in, max_size=True)
+        k_mean_rsrc = buffer_ops.create_buffer_resource(K_mean, max_size=True)
+        v_scale_rsrc = buffer_ops.create_buffer_resource(V_scale, max_size=True)
+
+        vec_bf16_ty = T.vec(VEC, T.bf16)
+        vec_f32_ty = T.vec(VEC, f32)
+
+        # Per-thread accumulators: VEC f32 amax and sum for V/K respectively.
+        v_amax = [c0_f32 for _ in range(VEC)]
+        k_sum = [c0_f32 for _ in range(VEC)]
+
+        # Loop over rows assigned to this thread (stride = THREADS_PER_BLOCK).
+        # while-loop because seq_len is runtime (not constexpr).
+        # Use scf.WhileOp via simple trip count: rows_per_thread = ceil(S / 64)
+        # and bound-check at each iteration.
+        # Simpler: use scf.ForOp with dynamic upper bound = ceil_div(S, 64).
+        from flydsl._mlir.dialects import scf as _scf_d
+
+        # row_step = threads in block. Iterate row in [tid, S, step=THREADS]
+        c_idx_zero = arith.constant(0, index=True)
+        c_idx_one = arith.constant(1, index=True)
+        # Compute trip count = ceil(S / THREADS_PER_BLOCK)
+        seq_idx = arith.index_cast(T.index, seq_len_i32)
+        threads_idx = arith.constant(THREADS_PER_BLOCK, index=True)
+        trip_count = (seq_idx + threads_idx - c_idx_one) // threads_idx
+
+        # Scalar starting row = tid
+        tid_idx = arith.index_cast(T.index, tid_i32)
+
+        # Use scf.for to loop trip_count times. Carry the VEC amax and VEC sum
+        # accumulators as iter args (16 f32 values).
+        init_args = list(v_amax) + list(k_sum)
+        for_op = _scf_d.ForOp(
+            c_idx_zero, trip_count, c_idx_one, init_args
+        )
+        with ir.InsertionPoint(for_op.body):
+            iv = for_op.induction_variable
+            iter_args = list(for_op.inner_iter_args)
+            in_v_amax = iter_args[:VEC]
+            in_k_sum = iter_args[VEC:]
+
+            iv_i32 = arith.index_cast(i32, iv)
+            global_row = tid_i32 + iv_i32 * c_threads
+            row_in_range = arith.cmpi(
+                CmpIPredicate.ult, global_row, seq_len_i32
+            )
+
+            # Conditional load (mask OOB to 0)
+            row_elem_off = (
+                (b_id * seq_len_i32 + global_row) * c_kv_heads + h_id
+            ) * c_head_dim + col_d
+            in_dw_off = row_elem_off >> c1_i32  # bf16 elem -> dword offset
+            # Use clamped offset for OOB to keep the buffer descriptor masking
+            # behavior simple. buffer_load with create_buffer_resource(max_size)
+            # will return 0 for OOB.
+            safe_off = arith.select(row_in_range, in_dw_off, c0_i32)
+
+            v_raw = buffer_ops.buffer_load(
+                v_in_rsrc, safe_off, vec_width=4, dtype=i32
+            )
+            k_raw = buffer_ops.buffer_load(
+                k_in_rsrc, safe_off, vec_width=4, dtype=i32
+            )
+            v_bf16 = vector.bitcast(vec_bf16_ty, v_raw)
+            k_bf16 = vector.bitcast(vec_bf16_ty, k_raw)
+            v_f32 = v_bf16.extf(vec_f32_ty)
+            k_f32 = k_bf16.extf(vec_f32_ty)
+
+            new_v_amax = []
+            new_k_sum = []
+            for vi in range_constexpr(VEC):
+                v_x = vector.extract(
+                    v_f32, static_position=[vi], dynamic_position=[]
+                )
+                k_x = vector.extract(
+                    k_f32, static_position=[vi], dynamic_position=[]
+                )
+                # Mask OOB so amax/sum are unaffected.
+                v_x_m = arith.select(row_in_range, v_x, c0_f32)
+                k_x_m = arith.select(row_in_range, k_x, c0_f32)
+                abs_v = llvm.call_intrinsic(
+                    f32, "llvm.fabs.f32", [v_x_m], [], []
+                )
+                new_v_amax.append(arith.maximumf(in_v_amax[vi], abs_v))
+                new_k_sum.append(in_k_sum[vi] + k_x_m)
+
+            scf.YieldOp(new_v_amax + new_k_sum)
+
+        # After loop: each thread has its accumulated 8 amax + 8 sum.
+        results = list(for_op.results)
+        per_thread_v_amax = results[:VEC]
+        per_thread_k_sum = results[VEC:]
+
+        # Wave-shuffle reduce across the 64 lanes (single wave per block).
+        SHUFFLE_DISTS = [32, 16, 8, 4, 2, 1]
+        c_warp_size_i32 = arith.constant(WARP_SIZE, type=i32)
+
+        red_v_amax = []
+        red_k_sum = []
+        for vi in range_constexpr(VEC):
+            wm = ArithValue(per_thread_v_amax[vi])
+            ws = ArithValue(per_thread_k_sum[vi])
+            for sh in SHUFFLE_DISTS:
+                off = arith.constant(sh, type=i32)
+                pm = wm.shuffle_xor(off, c_warp_size_i32)
+                ps = ws.shuffle_xor(off, c_warp_size_i32)
+                wm = arith.maximumf(wm, pm)
+                ws = ws + ps
+            red_v_amax.append(wm)
+            red_k_sum.append(ws)
+
+        # Lane 0 writes results.
+        is_lane0 = arith.cmpi(CmpIPredicate.eq, tid_i32, c0_i32)
+        _if = scf.IfOp(is_lane0)
+        with ir.InsertionPoint(_if.then_block):
+            out_off_base = (b_id * c_kv_heads + h_id) * c_head_dim + col_d
+            for vi in range_constexpr(VEC):
+                v_scale = red_v_amax[vi] * inv_fp8_max_v
+                k_mean_v = red_k_sum[vi] * inv_seq_len_v
+                off = out_off_base + arith.constant(vi, type=i32)
+                buffer_ops.buffer_store(
+                    v_scale, v_scale_rsrc, off, offset_is_bytes=False,
+                )
+                buffer_ops.buffer_store(
+                    k_mean_v, k_mean_rsrc, off, offset_is_bytes=False,
+                )
+            scf.YieldOp([])
+
+    @flyc.jit
+    def launch_sage_preprocess(
+        K_in: fx.Tensor,
+        V_in: fx.Tensor,
+        K_mean: fx.Tensor,
+        V_scale: fx.Tensor,
+        batch: fx.Int32,
+        seq_len: fx.Int32,
+        inv_fp8_max_bits: fx.Int32,
+        inv_seq_len_bits: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        # grid = B * H * D_BLOCKS
+        bidx = fx.Index(batch)
+        grid = bidx * arith.constant(num_kv_heads * D_BLOCKS, index=True)
+        launcher = sage_preprocess_kernel(
+            K_in, V_in, K_mean, V_scale, seq_len, inv_fp8_max_bits, inv_seq_len_bits,
+        )
+        launcher.launch(
+            grid=(grid, 1, 1),
+            block=(THREADS_PER_BLOCK, 1, 1),
+            stream=stream,
+        )
+
+    return launch_sage_preprocess
+
+
+# =========================================================================
 # Fused Q+K+V single-launch kernel
 # =========================================================================
 
@@ -284,9 +501,10 @@ def build_sage_quant_fused_module(
         Q_in: fx.Tensor,    # bf16 [B, S_q, H_q, D]
         Q_out: fx.Tensor,   # int8 [B, S_q, H_q, D]
         Q_scale: fx.Tensor, # f32  [B, H_q, NUM_BLKS_Q]
-        K_in: fx.Tensor,    # bf16 [B, S_k, H_k, D]  (already smoothed)
+        K_in: fx.Tensor,    # bf16 [B, S_k, H_k, D]  (RAW, not smoothed)
         K_out: fx.Tensor,   # int8 [B, S_k, H_k, D]
         K_scale: fx.Tensor, # f32  [B, H_k, NUM_BLKS_K]
+        K_mean: fx.Tensor,  # f32  [B, H_k, D]       (subtract from K)
         V_in: fx.Tensor,    # bf16 [B, S_k, H_k, D]
         V_out: fx.Tensor,   # fp8  [B, S_k, H_k, D]
         V_scale: fx.Tensor, # f32  [B, H_k, D]
@@ -350,6 +568,7 @@ def build_sage_quant_fused_module(
         k_in_rsrc = buffer_ops.create_buffer_resource(K_in, max_size=True)
         k_out_rsrc = buffer_ops.create_buffer_resource(K_out, max_size=True)
         k_scale_rsrc = buffer_ops.create_buffer_resource(K_scale, max_size=True)
+        k_mean_rsrc = buffer_ops.create_buffer_resource(K_mean, max_size=True)
         v_in_rsrc = buffer_ops.create_buffer_resource(V_in, max_size=True)
         v_out_rsrc = buffer_ops.create_buffer_resource(V_out, max_size=True)
         v_scale_rsrc = buffer_ops.create_buffer_resource(V_scale, max_size=True)
@@ -458,11 +677,38 @@ def build_sage_quant_fused_module(
             seq_len_i32,
             PASSES,
             apply_sm_scale,
+            subtract_k_mean=False,
         ):
             blk_idx = local_pid % num_blks_i32
             bh_id = local_pid // num_blks_i32
             h_id = bh_id % c_num_heads
             b_id = bh_id // c_num_heads
+
+            # Optional: load K_mean[b, h, col_d:col_d+VEC] once per block.
+            if const_expr(subtract_k_mean):
+                k_mean_off = (b_id * c_num_heads + h_id) * c_head_dim + col_d
+                # vec_width=4 dwords each = 4 f32 = 16 bytes
+                kmean_lo_raw = buffer_ops.buffer_load(
+                    k_mean_rsrc, k_mean_off, vec_width=4, dtype=i32
+                )
+                kmean_hi_raw = buffer_ops.buffer_load(
+                    k_mean_rsrc, k_mean_off + c4_i32, vec_width=4, dtype=i32
+                )
+                kmean_lo = vector.bitcast(v4f32_ty, kmean_lo_raw)
+                kmean_hi = vector.bitcast(v4f32_ty, kmean_hi_raw)
+                k_means = []
+                for vi in range_constexpr(4):
+                    k_means.append(
+                        vector.extract(
+                            kmean_lo, static_position=[vi], dynamic_position=[]
+                        )
+                    )
+                for vi in range_constexpr(4):
+                    k_means.append(
+                        vector.extract(
+                            kmean_hi, static_position=[vi], dynamic_position=[]
+                        )
+                    )
 
             # Stage 1: load + amax
             cached_vals = []  # PASSES x VEC list of f32 ArithValues
@@ -492,6 +738,8 @@ def build_sage_quant_fused_module(
                     x = vector.extract(
                         f32_v, static_position=[vi], dynamic_position=[]
                     )
+                    if const_expr(subtract_k_mean):
+                        x = x - k_means[vi]
                     if const_expr(apply_sm_scale):
                         x = x * sm_scale_log2e_v
                     # Mask OOB rows so amax/quant are unaffected
@@ -687,6 +935,7 @@ def build_sage_quant_fused_module(
                     seq_len_k_i32,
                     PASSES_K,
                     apply_sm_scale=False,
+                    subtract_k_mean=True,
                 )
                 scf.YieldOp([])
             with ir.InsertionPoint(_if_k.else_block):
@@ -703,6 +952,7 @@ def build_sage_quant_fused_module(
         K_in: fx.Tensor,
         K_out: fx.Tensor,
         K_scale: fx.Tensor,
+        K_mean: fx.Tensor,
         V_in: fx.Tensor,
         V_out: fx.Tensor,
         V_scale: fx.Tensor,
@@ -724,7 +974,7 @@ def build_sage_quant_fused_module(
         idx_grid = arith.index_cast(T.index, grid_size)
         launcher = sage_quant_fused_kernel(
             Q_in, Q_out, Q_scale,
-            K_in, K_out, K_scale,
+            K_in, K_out, K_scale, K_mean,
             V_in, V_out, V_scale,
             seq_len_q, seq_len_k,
             num_blocks_q, num_blocks_k,

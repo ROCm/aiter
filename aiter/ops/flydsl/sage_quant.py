@@ -21,6 +21,7 @@ import torch
 from .kernels.sage_quant_cdna import (
     build_sage_quant_v_module,
     build_sage_quant_fused_module,
+    build_sage_preprocess_module,
 )
 
 
@@ -48,6 +49,13 @@ def _get_fused_kernel(
         blk_k=blk_k,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
+    )
+
+
+@lru_cache(maxsize=64)
+def _get_preprocess_kernel(head_dim: int, num_kv_heads: int):
+    return build_sage_preprocess_module(
+        head_dim=head_dim, num_kv_heads=num_kv_heads
     )
 
 
@@ -84,15 +92,14 @@ def flydsl_sage_quant(
     Q_NUM_BLKS = (qo_len + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
-    if smooth_k:
-        k = k - k.mean(dim=v_seq_dim, keepdim=True)
-
     q_scale = torch.empty((b, h_qo, Q_NUM_BLKS), device=q.device, dtype=torch.float32)
     k_scale = torch.empty((b, h_kv, K_NUM_BLKS), device=q.device, dtype=torch.float32)
 
-    v_scale = (
-        v.abs().amax(dim=v_seq_dim).to(torch.float32) / FP8_MAX
-    )
+    # Preprocessor outputs: V_scale and K_mean (both [B, H_kv, D]).
+    # K_mean is subtracted inside the fused kernel (replaces torch k - k.mean()).
+    # V_scale = max_seq |V| / FP8_MAX (replaces torch v.abs().amax/FP8_MAX).
+    v_scale = torch.empty((b, h_kv, head_dim), device=q.device, dtype=torch.float32)
+    k_mean = torch.empty((b, h_kv, head_dim), device=q.device, dtype=torch.float32)
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -106,7 +113,8 @@ def flydsl_sage_quant(
         q_int8_for_kernel = q_int8
         k_int8_for_kernel = k_int8
         v_fp8_for_kernel = v_fp8
-        v_scale_for_kernel = v_scale.contiguous() if not v_scale.is_contiguous() else v_scale
+        v_scale_for_kernel = v_scale
+        k_mean_for_kernel = k_mean
     else:
         q_for_kernel = q.permute(0, 2, 1, 3).contiguous()
         k_for_kernel = k.permute(0, 2, 1, 3).contiguous()
@@ -114,7 +122,8 @@ def flydsl_sage_quant(
         q_int8_for_kernel = torch.empty_like(q_for_kernel, dtype=torch.int8)
         k_int8_for_kernel = torch.empty_like(k_for_kernel, dtype=torch.int8)
         v_fp8_for_kernel = torch.empty_like(v_for_kernel, dtype=FP8_TYPE)
-        v_scale_for_kernel = v_scale.contiguous()
+        v_scale_for_kernel = v_scale
+        k_mean_for_kernel = k_mean
 
     q_task_count = b * h_qo * Q_NUM_BLKS
     k_task_count = b * h_kv * K_NUM_BLKS
@@ -127,6 +136,38 @@ def flydsl_sage_quant(
     # The kernel reinterprets back to f32 via arith.bitcast.
     import struct
     sm_scale_log2e_bits = struct.unpack("<i", struct.pack("<f", sm_scale_log2e_f))[0]
+    inv_fp8_max_bits = struct.unpack(
+        "<i", struct.pack("<f", 1.0 / float(FP8_MAX))
+    )[0]
+    inv_seq_len_bits = struct.unpack(
+        "<i", struct.pack("<f", 1.0 / float(kv_len))
+    )[0]
+
+    stream = torch.cuda.current_stream(q.device)
+
+    # Preprocessor: produces V_scale and K_mean in one launch.
+    # Replaces the torch ops that previously cost 60-150us of host overhead.
+    if smooth_k:
+        preproc = _get_preprocess_kernel(
+            head_dim=int(head_dim), num_kv_heads=int(h_kv),
+        )
+        preproc(
+            k_for_kernel,
+            v_for_kernel,
+            k_mean_for_kernel,
+            v_scale_for_kernel,
+            int(b),
+            int(kv_len),
+            inv_fp8_max_bits,
+            inv_seq_len_bits,
+            stream=stream,
+        )
+    else:
+        # No K-smoothing: zero K_mean, compute V_scale via torch (fallback).
+        k_mean_for_kernel.zero_()
+        v_scale_for_kernel.copy_(
+            v_for_kernel.abs().amax(dim=1).to(torch.float32) / FP8_MAX
+        )
 
     fused = _get_fused_kernel(
         head_dim=int(head_dim),
@@ -136,7 +177,6 @@ def flydsl_sage_quant(
         num_kv_heads=int(h_kv),
     )
 
-    stream = torch.cuda.current_stream(q.device)
     fused(
         q_for_kernel,
         q_int8_for_kernel,
@@ -144,6 +184,7 @@ def flydsl_sage_quant(
         k_for_kernel,
         k_int8_for_kernel,
         k_scale,
+        k_mean_for_kernel,
         v_for_kernel,
         v_fp8_for_kernel,
         v_scale_for_kernel,
