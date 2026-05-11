@@ -27,6 +27,13 @@ from aiter.test_common import (
 )
 from aiter.utility.dtypes import str2Dtype, str2tuple
 
+# NOTE on correctness metrics by score function:
+# - sigmoid uses element-wise comparison (score_errors/index_errors) because
+#   both torch/topk and fused paths return sorted top-K.
+# - softplus/softmax use set-based ID matching (id_errors/max_weight_err)
+#   because torch references intentionally use `topk(..., sorted=False)` to
+#   mirror routing behavior where top-K order is not semantically required.
+
 
 @perftest(num_iters=10, num_warmup=1)
 def run_torch(gating_output: torch.Tensor, topk: int):
@@ -522,9 +529,10 @@ if __name__ == "__main__":
         df = pd.DataFrame(collected)
         print(df.to_string(index=False))
         print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
-        errors = df[df["id_errors"] > 0.01]
+        # benchmark_topk_sigmoid uses {score,index}_errors columns
+        errors = df[(df["index_errors"] > 0.01) | (df["score_errors"] > 0.01)]
         if len(errors) > 0:
-            print(f"\nERROR: {len(errors)} sigmoid config(s) had id errors > 1%!")
+            print(f"\nERROR: {len(errors)} sigmoid config(s) had errors > 1%!")
             print(errors.to_string(index=False))
             failed_sections.append("sigmoid")
 
