@@ -1,0 +1,699 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""
+Reference test for the DeepSeek-V4 (MODEL1_FP8Sparse) MLA decode path,
+mirroring op_tests/test_mla_persistent.py but without an aiter v4 kernel
+comparison (the aiter v4 kernel only ships the qh64/qseqlen4/gqa16 ASM
+variant today; this file establishes the torch reference + metadata call so
+the kernel comparison can be wired in once available).
+
+V4 layout per token (logical):
+  - nope:  448 elements, FP8 (e4m3fnuz on gfx94x, e4m3fn on gfx95x)
+  - scale:   7 active E8M0 scales (1 per 64 nope elements) padded to 8
+             uint8 bytes (bpad8). The kernel reads these bytes directly via
+             v_mfma_scale_f32_{16x16x128,32x32x64}_f8f6f4 (byte B -> 2^(B-127)).
+  - rope:   64 elements, BF16
+  - d_qk = 448 + 64 = 512
+  - d_v  = 512   (V is the *whole* d_qk slice -- both nope and rope --
+                  unlike v3.2 where d_v = 512 sliced off the rope)
+  - QK softmax scale = 1 / sqrt(d_qk) = 1 / sqrt(512)
+"""
+
+import argparse
+import itertools
+import math
+import os
+import random
+from pathlib import Path
+from typing import Tuple, Union
+
+import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+
+torch.set_default_device("cuda")
+torch.set_printoptions(sci_mode=False)
+
+
+# ---------------------------------------------------------------------------
+# V4 layout constants. From sglang flashmla_tests/quant.py
+# (FP8KVCacheLayout.MODEL1_FP8Sparse): (d, d_nope, d_rope, tile_size, num_tiles)
+# = (512, 448, 64, 64, 7).
+# ---------------------------------------------------------------------------
+V4_DIM_NOPE = 448  # FP8 nope elements per token
+V4_DIM_ROPE = 64  # BF16 rope elements per token
+V4_DIM_QK = V4_DIM_NOPE + V4_DIM_ROPE  # 512
+V4_DIM_V = V4_DIM_QK  # PV uses the full nope+rope slice
+V4_TILE = 64  # nope elements covered by one ue8m0 scale
+V4_NUM_TILES = V4_DIM_NOPE // V4_TILE  # 7   (active scales)
+# ASM kernel stores scales bpad8: kDimScale = kDimNope/64 + 1 = 8 slots per
+# token, with the last slot zero-padded. See /jruan/doc/hw_ss_team_test/kl/mla/
+# mla_v4.h:17 (`kDimScale = 8`) and :146 (`(kDimNope/64 + 1)` indexing).
+V4_DIM_SCALE = V4_NUM_TILES + 1  # 8   (storage slots, "bpad8")
+# FP8 |max| differs between archs: e4m3fn (gfx95x) = 448, e4m3fnuz (gfx94x) = 240.
+# The sglang reference uses 448 (assumes e4m3fn); we look it up from torch.finfo
+# so the per-tile scale lands inside the representable range on either arch.
+
+
+# ---------------------------------------------------------------------------
+# Metadata dumper (kept identical to test_mla_persistent.dump_mla_metadata_v1_txt
+# so the same DUMP_MLA_METADATA env switch works here too).
+# ---------------------------------------------------------------------------
+def dump_mla_metadata_v1_txt(
+    filepath: Union[str, Path],
+    *,
+    batch: int,
+    q_seq_len: int,
+    max_num_blocks: int,
+    work_q: int,
+    work_kv: int,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    col_width: int = 5,
+) -> None:
+    path = Path(filepath)
+    wi = work_indptr.detach().cpu().to(torch.int64).tolist()
+    wis = work_info_set.detach().cpu().to(torch.int32)
+    total_tgs = len(wi) - 1
+    w = col_width
+
+    def tg_first_work_row(tg: int):
+        if tg < 0 or tg >= total_tgs:
+            return None
+        w0 = int(wi[tg])
+        w1 = int(wi[tg + 1])
+        if w0 >= w1 or w0 >= wis.shape[0]:
+            return None
+        return wis[w0]
+
+    def line_for(name, pick) -> str:
+        parts = []
+        for tg in range(total_tgs):
+            row = tg_first_work_row(tg)
+            parts.append(pick(row) if row is not None else 0)
+        nums = " ".join(f"{v:>{w}}" for v in parts)
+        return f"{name}:\n    {nums}\n"
+
+    work_ind_line = " ".join(f"{int(v):>{w}}" for v in wi)
+    lines = [
+        f"batch:{batch}, q_seq_len:{q_seq_len}, max_num_blocks:{max_num_blocks}, "
+        f"work_q:{work_q}, work_kv:{work_kv}, total_tgs:{total_tgs}\n",
+        line_for("bs_indptr", lambda r: int(r[0].item())),
+        line_for("partial_indptr", lambda r: int(r[1].item())),
+        line_for("w_q_start", lambda r: int(r[2].item())),
+        line_for("w_q_end", lambda r: int(r[3].item())),
+        line_for("w_kv_start", lambda r: int(r[4].item())),
+        line_for("w_kv_end", lambda r: int(r[5].item())),
+        f"work_indptr:\n    {work_ind_line}\n",
+    ]
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# V4 quantization. Per-tile (64-element) ue8m0 scale: amax / FP8_AMAX rounded
+# UP to the nearest power of 2. Mirrors sglang flashmla_tests/quant.py
+# `quantize_k_cache(MODEL1_FP8Sparse)`.
+# ---------------------------------------------------------------------------
+def fp32_pow2_to_e8m0(pow2_fp32: torch.Tensor) -> torch.Tensor:
+    """
+    Pack a power-of-2 fp32 scale into a 1-byte E8M0 exponent
+    (byte B encodes 2^(B-127); B=0 -> 0.0, B=255 -> INF). The kernel
+    reads these bytes directly via v_mfma_scale_f32_*_f8f6f4.
+    """
+    safe = torch.where(pow2_fp32 > 0, pow2_fp32, torch.ones_like(pow2_fp32))
+    biased = torch.log2(safe).round().to(torch.int32) + 127
+    biased = torch.clamp(biased, 0, 254)
+    biased = torch.where(pow2_fp32 > 0, biased, torch.zeros_like(biased))
+    return biased.to(torch.uint8)
+
+
+def e8m0_to_fp32(byte: torch.Tensor) -> torch.Tensor:
+    """uint8 E8M0 -> fp32 scale; mirrors mla_v4.h:54 `fp8e8m0_to_fp32`."""
+    b = byte.to(torch.int32)
+    out = torch.where(
+        b == 0,
+        torch.zeros_like(b, dtype=torch.float32),
+        torch.where(
+            b == 255,
+            torch.full_like(b, float("inf"), dtype=torch.float32),
+            torch.exp2((b - 127).to(torch.float32)),
+        ),
+    )
+    return out
+
+
+def cast_scale_inv_to_ue8m0_pow2(scales_inv: torch.Tensor) -> torch.Tensor:
+    """amax/FP8_AMAX -> ceil-log2 -> power-of-2 fp32 (intermediate, pre-pack)."""
+    return torch.pow(2.0, torch.clamp_min(scales_inv, 1e-4).log2().ceil()).to(
+        torch.float32
+    )
+
+
+def quantize_v4_nope_bpad8(
+    nope_fp32: torch.Tensor,  # [..., V4_DIM_NOPE]
+    fp8_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Per-tile (64 elt) E8M0 quantization with bpad8 storage. Returns
+    (nope_fp8, scale_e8m0_bpad8, nope_dq_bf16):
+      - nope_fp8: [..., 448]  FP8
+      - scale_e8m0_bpad8: [..., 8]  uint8 E8M0 bytes (7 active + 1 zero pad);
+        the kernel feeds these directly to v_mfma_scale_f32_*_f8f6f4.
+      - nope_dq_bf16: [..., 448]  bf16 round-trip the BF16 MFMA actually sees.
+    Mirrors `fp8e4m3_mul_fp8e8m0_bpad8_to_bf16` in mla_v4.h:124.
+    """
+    fp8_amax = float(torch.finfo(fp8_dtype).max)
+    leading = nope_fp32.shape[:-1]
+    tiled = nope_fp32.reshape(*leading, V4_NUM_TILES, V4_TILE)
+    active_scale_pow2 = cast_scale_inv_to_ue8m0_pow2(
+        tiled.abs().amax(dim=-1) / fp8_amax
+    )  # [..., 7]  fp32 pow2
+    nope_fp8 = (
+        (tiled / active_scale_pow2.unsqueeze(-1))
+        .to(fp8_dtype)
+        .reshape(*leading, V4_DIM_NOPE)
+    )
+
+    # Pack to uint8 E8M0 with bpad8 (8 bytes/token, last slot = 0).
+    active_scale_e8m0 = fp32_pow2_to_e8m0(active_scale_pow2)  # [..., 7] uint8
+    scale_e8m0 = torch.zeros(
+        (*leading, V4_DIM_SCALE), dtype=torch.uint8, device=nope_fp32.device
+    )
+    scale_e8m0[..., :V4_NUM_TILES] = active_scale_e8m0
+
+    nope_dq_bf16 = (
+        (
+            nope_fp8.to(torch.float32).reshape(*leading, V4_NUM_TILES, V4_TILE)
+            * active_scale_pow2.unsqueeze(-1)
+        )
+        .reshape(*leading, V4_DIM_NOPE)
+        .to(torch.bfloat16)
+    )
+    return nope_fp8, scale_e8m0, nope_dq_bf16
+
+
+def quantize_v4_q(
+    q: torch.Tensor,  # [total_q, nhead, V4_DIM_QK]  bf16
+    fp8_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Quantize Q the same way the ASM kernel sees it: nope FP8 + bpad8 E8M0
+    scales, rope kept BF16. Returns (q_nope_fp8, q_nope_scale_e8m0,
+    q_rope_bf16, q_silver_bf16) where q_silver_bf16 is the round-tripped Q
+    the BF16 MFMA consumes.
+    """
+    q_nope_fp32 = q[..., :V4_DIM_NOPE].float()
+    q_rope_bf16 = q[..., V4_DIM_NOPE:].to(torch.bfloat16)
+    q_nope_fp8, q_nope_scale_e8m0, q_nope_dq_bf16 = quantize_v4_nope_bpad8(
+        q_nope_fp32, fp8_dtype
+    )
+    q_silver_bf16 = torch.cat([q_nope_dq_bf16, q_rope_bf16], dim=-1)
+    return q_nope_fp8, q_nope_scale_e8m0, q_rope_bf16, q_silver_bf16
+
+
+def init_v4_kv_cache(
+    num_page: int,
+    page_size: int,
+    fp8_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Build a paged KV cache from a single fp32 source. Returns both the
+    "golden" pure-bf16 buffer (no fp8 anywhere) and the kernel-shaped
+    (FP8 nope + bpad8 scale + BF16 rope) buffers.
+
+    Returns:
+      - kv_buffer_bf16      [num_page, page_size, 1, d_qk=512]  golden ref
+                                                                (bf16 cast of fp32)
+      - kv_nope_fp8         [num_page, page_size, 1, 448]       FP8 nope
+      - kv_nope_scale_e8m0  [num_page, page_size, 1, 8]         uint8 E8M0 bytes
+                                                                (bpad8: 7 active,
+                                                                 last slot = 0)
+      - kv_rope_bf16        [num_page, page_size, 1, 64]        BF16 rope
+    """
+    nope_fp32 = torch.randn((num_page, page_size, 1, V4_DIM_NOPE), dtype=torch.float32)
+    rope_bf16 = torch.randn((num_page, page_size, 1, V4_DIM_ROPE), dtype=torch.bfloat16)
+
+    # Golden: raw bf16 cast of the fp32 source -- no fp8 round-trip.
+    kv_buffer_bf16 = torch.cat([nope_fp32.to(torch.bfloat16), rope_bf16], dim=-1)
+
+    # Silver-side buffers: per-tile bpad8 E8M0 quantization of the same source.
+    nope_fp8, scale_e8m0, _ = quantize_v4_nope_bpad8(nope_fp32, fp8_dtype)
+    return kv_buffer_bf16, nope_fp8, scale_e8m0, rope_bf16
+
+
+def dequant_v4_kv(
+    nope_fp8: torch.Tensor,  # [num_page, page_size, 1, 448]
+    scale_e8m0: torch.Tensor,  # [num_page, page_size, 1, 8]  uint8 (bpad8)
+    rope_bf16: torch.Tensor,  # [num_page, page_size, 1, 64]
+) -> torch.Tensor:
+    """Reassemble [num_page, page_size, 1, d_qk=512] in fp32 from the 3 buffers."""
+    num_page, page_size, _, _ = nope_fp8.shape
+    active_scale = e8m0_to_fp32(scale_e8m0[..., :V4_NUM_TILES])
+    nope_dq = (
+        nope_fp8.to(torch.float32).reshape(
+            num_page, page_size, 1, V4_NUM_TILES, V4_TILE
+        )
+        * active_scale.unsqueeze(-1)
+    ).reshape(num_page, page_size, 1, V4_DIM_NOPE)
+    return torch.cat([nope_dq, rope_bf16.to(torch.float32)], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# V4 reference attention. Two key differences vs the v3.2 reference in
+# test_mla_persistent.ref_masked_attention:
+#   1. K is the full d_qk=512 (nope_dq + rope).
+#   2. V is *also* the full d_qk=512 (NOT k[..., :d_nope]) -- d_v == d_qk in v4.
+# ---------------------------------------------------------------------------
+def ref_masked_attention_v4(
+    query: torch.Tensor,  # [s_q, h_q, d_qk=512]
+    key: torch.Tensor,  # [s_k, h_kv=1, d_qk=512]
+    value: torch.Tensor,  # [s_k, h_kv=1, d_v=512]   -- same buffer as key in v4
+    scale: float,
+    out_dtype: torch.dtype,
+    is_causal: bool = True,
+    causal_diagonal: int = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    attn = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
+    if is_causal:
+        s_q, s_k = query.shape[0], key.shape[0]
+        diag = causal_diagonal if causal_diagonal is not None else s_k - s_q
+        bias = torch.zeros(s_q, s_k, dtype=torch.float32)
+        bias.masked_fill_(
+            torch.ones(s_q, s_k, dtype=torch.bool).tril(diagonal=diag).logical_not(),
+            float("-inf"),
+        )
+        attn = attn + bias
+
+    lse = attn.logsumexp(dim=-1)
+    m = attn.max(dim=-1).values
+    attn_exp = torch.exp(attn - m.unsqueeze(-1))
+    l = attn_exp.sum(-1)  # noqa: E741
+    out = torch.einsum("hqk,khd->qhd", attn_exp, value.float())
+    out = out / l.transpose(0, 1).unsqueeze(-1)
+    return out.to(out_dtype), lse
+
+
+def _v4_dequant_nope_bpad8(
+    nope_fp8: torch.Tensor,  # [..., 448]   FP8
+    nope_scale_e8m0: torch.Tensor,  # [..., 8]     uint8 E8M0 bpad8
+) -> torch.Tensor:
+    """fp8 * per-tile E8M0 scale -> bf16. Mirrors mla_v4.h:124
+    (`fp8e4m3_mul_fp8e8m0_bpad8_to_bf16`). The kernel does the equivalent
+    multiply via v_mfma_scale_f32_*_f8f6f4 reading the same E8M0 bytes."""
+    leading = nope_fp8.shape[:-1]
+    active_scale = e8m0_to_fp32(nope_scale_e8m0[..., :V4_NUM_TILES])
+    return (
+        (
+            nope_fp8.to(torch.float32).reshape(*leading, V4_NUM_TILES, V4_TILE)
+            * active_scale.unsqueeze(-1)
+        )
+        .reshape(*leading, V4_DIM_NOPE)
+        .to(torch.bfloat16)
+    )
+
+
+def torch_mla_extend_v4_silver(
+    # Q (per-token, kernel layout)
+    q_nope_fp8,  # [total_q, nhead, 448]   FP8
+    q_nope_scale_e8m0,  # [total_q, nhead, 8]     uint8 E8M0
+    q_rope_bf16,  # [total_q, nhead, 64]    BF16
+    # KV (paged, kernel layout)
+    kv_nope_fp8,  # [num_page, page_size, 1, 448]   FP8
+    kv_nope_scale_e8m0,  # [num_page, page_size, 1, 8]     uint8 E8M0
+    kv_rope_bf16,  # [num_page, page_size, 1, 64]    BF16
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    sm_scale,
+    out_dtype,
+    is_causal: bool = True,
+):
+    """
+    Reference whose inputs match the ASM kernel's: 2 Q tensors (FP8 nope +
+    E8M0 bpad8 scale, BF16 rope) and 2 KV tensors (same shapes, paged).
+    Internally dequants nope per-tile to BF16 (E8M0 byte B -> 2^(B-127))
+    and concats with rope, then runs the same BF16 attention as the golden
+    ref. This captures the FP8 quantization noise the kernel actually pays
+    via `v_mfma_scale_f32_{16x16x128,32x32x64}_f8f6f4`.
+    """
+    q_nope_bf16 = _v4_dequant_nope_bpad8(q_nope_fp8, q_nope_scale_e8m0)
+    q_silver_bf16 = torch.cat([q_nope_bf16, q_rope_bf16], dim=-1)
+
+    kv_nope_bf16 = _v4_dequant_nope_bpad8(kv_nope_fp8, kv_nope_scale_e8m0)
+    kv_silver_bf16 = torch.cat([kv_nope_bf16, kv_rope_bf16], dim=-1)
+
+    return torch_mla_extend_v4(
+        q_silver_bf16,
+        kv_silver_bf16,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        sm_scale,
+        out_dtype,
+        is_causal=is_causal,
+    )
+
+
+def torch_mla_extend_v4(
+    q,  # [total_q, nhead, d_qk=512]
+    kv_buffer_bf16,  # [num_page, page_size, 1, d_qk=512]   (dequant golden)
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    sm_scale,
+    out_dtype,
+    is_causal: bool = True,
+):
+    """V4 paged-attention reference. K and V are the same tensor (full d_qk slice)."""
+    qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
+    kvc = torch.index_select(kv_buffer_bf16, 0, kv_indices)
+    kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
+    page_size = kv_buffer_bf16.shape[1]
+    bs = qo_indptr.shape[0] - 1
+
+    outs, lses = [], []
+    for i in range(bs):
+        cur_num_page = kvs[i].shape[0]
+        real_kv_len = (cur_num_page - 1) * page_size + int(kv_last_page_lens[i].item())
+        kvi = kvs[i].flatten(0, 1)[:real_kv_len]  # [s_k, 1, d_qk]
+        # In v4: K and V both use the full d_qk slice (nope+rope).
+        o, lse = ref_masked_attention_v4(
+            qs[i], kvi, kvi, sm_scale, out_dtype, is_causal=is_causal
+        )
+        outs.append(o)
+        lses.append(lse)
+
+    out = torch.concat(outs)
+    lse = torch.concat(lses, dim=1).transpose(0, 1)
+    return out, lse
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+def test_mla_v4(
+    ctx_lens,
+    batch_size,
+    nhead,
+    page_size,
+    varlen,
+    decode_qlen,
+    max_split_per_batch,
+    fp8_dtype,
+):
+    ret = {}
+    out_dtype = torch.bfloat16
+
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    seq_lens_qo = torch.empty(batch_size, dtype=torch.int)
+    seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
+    kv_block_nums = torch.empty(batch_size, dtype=torch.int)
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+
+    if varlen:
+        for i in range(batch_size):
+            seq_lens_kv[i] = random.uniform(5, ctx_lens)
+            seq_lens_qo[i] = max(
+                min(int(random.normalvariate(ctx_lens, ctx_lens / 2)), ctx_lens), 1
+            )
+            kv_block_nums[i] = (seq_lens_kv[i] + page_size - 1) // page_size
+            kv_last_page_lens[i] = (
+                page_size
+                if seq_lens_kv[i] % page_size == 0
+                else seq_lens_kv[i] % page_size
+            )
+    else:
+        seq_lens_kv.fill_(ctx_lens)
+        seq_lens_qo.fill_(ctx_lens)
+        kv_block_nums.fill_((ctx_lens + page_size - 1) // page_size)
+        kv_last_page_lens.fill_(
+            page_size if ctx_lens % page_size == 0 else ctx_lens % page_size
+        )
+
+    kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
+    num_page = int(kv_indptr[-1].item())
+    kv_indices = torch.randperm(num_page, dtype=torch.int)
+    qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    max_seqlen_qo = int(seq_lens_qo.max().item())
+
+    # ---- decode-only path (matches test_mla_persistent.test_mla) ----
+    seq_lens_qo.fill_(decode_qlen)
+    max_seqlen_qo = int(seq_lens_qo.max().item())
+    qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    total_q = int(qo_indptr[-1].item())
+
+    # V4 buffers
+    (
+        kv_buffer_bf16,  # golden ref (pure bf16, no fp8)
+        kv_nope_fp8,  # FP8 nope                       (silver)
+        kv_nope_scale_e8m0,  # uint8 E8M0 bpad8 scales        (silver)
+        kv_rope_bf16,  # BF16 rope                      (silver)
+    ) = init_v4_kv_cache(num_page, page_size, fp8_dtype)
+
+    q = torch.randn((total_q, nhead, V4_DIM_QK), dtype=torch.bfloat16)
+    sm_scale = 1.0 / math.sqrt(V4_DIM_QK)  # = 1/sqrt(512)
+    nhead_kv = 1
+
+    # Silver Q: FP8 nope + E8M0 bpad8 scale + BF16 rope (the kernel's input layout).
+    q_nope_fp8, q_nope_scale_e8m0, q_rope_bf16, _ = quantize_v4_q(q, fp8_dtype)
+
+    # ---- golden reference (Q & KV both pure BF16, no FP8 anywhere) ----
+    out_ref, lse_ref = torch_mla_extend_v4(
+        q,
+        kv_buffer_bf16,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        sm_scale,
+        out_dtype=out_dtype,
+        is_causal=True,
+    )
+
+    # ---- silver reference (kernel-shaped inputs: FP8 nope + E8M0 scale + BF16 rope) ----
+    out_silver, lse_silver = torch_mla_extend_v4_silver(
+        q_nope_fp8,
+        q_nope_scale_e8m0,
+        q_rope_bf16,
+        kv_nope_fp8,
+        kv_nope_scale_e8m0,
+        kv_rope_bf16,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        sm_scale,
+        out_dtype=out_dtype,
+        is_causal=True,
+    )
+
+    # Quantization-induced drift between golden and silver -- this is the
+    # noise floor a real fp8 kernel will sit on top of.
+    out_drift_max = (out_ref.float() - out_silver.float()).abs().max().item()
+    out_drift_mean = (out_ref.float() - out_silver.float()).abs().mean().item()
+    aiter.logger.info(
+        "v4 golden vs silver drift: max_abs=%.4f mean_abs=%.5f",
+        out_drift_max,
+        out_drift_mean,
+    )
+
+    # ---- metadata (same v1 API as test_mla_persistent) ----
+    if nhead >= 128:
+        gpu = torch.cuda.current_device()
+        cu_num = torch.cuda.get_device_properties(gpu).multi_processor_count
+        max_split_per_batch = min(
+            (cu_num + batch_size - 1) // batch_size, max_split_per_batch
+        )
+
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_mla_metadata_info_v1(
+        batch_size,
+        max_seqlen_qo,
+        nhead,
+        fp8_dtype,
+        fp8_dtype,
+        is_sparse=False,
+        fast_mode=True,
+        num_kv_splits=max_split_per_batch,
+        intra_batch_mode=False,
+    )
+
+    work_meta_data = torch.empty(
+        work_meta_data_size, dtype=work_meta_data_type, device="cuda"
+    )
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device="cuda")
+    work_info_set = torch.empty(
+        work_info_set_size, dtype=work_info_set_type, device="cuda"
+    )
+    reduce_indptr = torch.empty(
+        reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
+    )
+    reduce_final_map = torch.empty(
+        reduce_final_map_size, dtype=reduce_final_map_type, device="cuda"
+    )
+    reduce_partial_map = torch.empty(
+        reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
+    )
+
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        kv_last_page_lens,
+        nhead // nhead_kv,
+        nhead_kv,
+        False,
+        work_meta_data,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        page_size=page_size,
+        kv_granularity=max(page_size, 16),
+        max_seqlen_qo=int(max_seqlen_qo),
+        uni_seqlen_qo=decode_qlen,
+        fast_mode=True,
+        max_split_per_batch=max_split_per_batch,
+        intra_batch_mode=False,
+        dtype_q=fp8_dtype,
+        dtype_kv=fp8_dtype,
+    )
+
+    if os.environ.get("DUMP_MLA_METADATA", ""):
+        kv_gran = max(page_size, 16)
+        max_num_blocks = max(
+            (int(seq_lens_kv[i].item()) + kv_gran - 1) // kv_gran
+            for i in range(batch_size)
+        )
+        num_works = int(work_indptr[-1].item())
+        if num_works > 0:
+            r0 = work_info_set[0, :6].detach().cpu()
+            hdr_work_q = int(r0[3].item() - r0[2].item())
+        else:
+            hdr_work_q = int(max_seqlen_qo)
+        dump_mla_metadata_v1_txt(
+            os.environ.get("MLA_METADATA_DUMP_PATH", "mla_v4_metadata_dump.txt"),
+            batch=batch_size,
+            q_seq_len=int(max_seqlen_qo),
+            max_num_blocks=max_num_blocks,
+            work_q=hdr_work_q,
+            work_kv=kv_gran,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+        )
+
+    num_works = int(work_indptr[-1].item())
+    aiter.logger.info(
+        "v4 ref ok: batch=%d ctx=%d nhead=%d decode_qlen=%d "
+        "out=%s lse=%s num_works=%d max_split=%d",
+        batch_size,
+        ctx_lens,
+        nhead,
+        decode_qlen,
+        tuple(out_ref.shape),
+        tuple(lse_ref.shape),
+        num_works,
+        max_split_per_batch,
+    )
+
+    ret["batch"] = batch_size
+    ret["ctx_lens"] = ctx_lens
+    ret["nhead"] = nhead
+    ret["decode_qlen"] = decode_qlen
+    ret["max_split_per_batch"] = max_split_per_batch
+    ret["num_works"] = num_works
+    ret["out_shape"] = tuple(out_ref.shape)
+    ret["lse_shape"] = tuple(lse_ref.shape)
+    return ret
+
+
+# ---------------------------------------------------------------------------
+# argparse driver (matches test_mla_persistent.py flag names)
+# ---------------------------------------------------------------------------
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="DSv4 MLA reference test (torch ref + metadata only).",
+)
+parser.add_argument(
+    "-blk",
+    "--block_size",
+    type=int,
+    default=1,
+    help="Page size. e.g.: -blk 1",
+)
+parser.add_argument(
+    "-c",
+    "--ctxLen",
+    type=int,
+    nargs="*",
+    default=[64, 256, 1200, 8192],
+    help="Context length(s). e.g.: -c 64 256",
+)
+parser.add_argument(
+    "-b",
+    "--batchSize",
+    type=int,
+    nargs="*",
+    default=[1, 16, 64],
+    help="Batch size(s). e.g.: -b 1 16",
+)
+parser.add_argument(
+    "-n",
+    "--nhead",
+    type=dtypes.str2tuple,
+    nargs="*",
+    const=None,
+    default=[(16, 4), (128, 1)],  # v4 nm shipped variant: (16, 4) -> 16*4=64
+    help="(num_heads, decode_qlen) tuples. e.g.: -n 16,4",
+)
+parser.add_argument(
+    "-ms",
+    "--max_split_per_batch",
+    type=int,
+    nargs="*",
+    default=[32],
+    help="Max KV splits per batch. e.g.: -ms 32",
+)
+parser.add_argument(
+    "--varlen",
+    action="store_true",
+    help="Variable kv seqlens. Default: False",
+)
+
+args = parser.parse_args()
+
+# v4 is FP8-only on the inputs; pick the arch's flavor of e4m3.
+fp8_dtype = dtypes.fp8
+
+for nhead, decode_qlen in args.nhead:
+    df = []
+    for ctx_len, batch_size, max_split_per_batch in itertools.product(
+        args.ctxLen, args.batchSize, args.max_split_per_batch
+    ):
+        ret = test_mla_v4(
+            ctx_len,
+            batch_size,
+            nhead,
+            args.block_size,
+            varlen=args.varlen,
+            decode_qlen=decode_qlen,
+            max_split_per_batch=max_split_per_batch,
+            fp8_dtype=fp8_dtype,
+        )
+        df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mla_v4_persistent summary (markdown):\n%s", df_md)
