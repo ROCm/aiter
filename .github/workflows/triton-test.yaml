@@ -29,7 +29,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download and check signal artifact
+      - name: Wait for Checks workflow
         run: ./.github/scripts/check_signal.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -183,7 +183,7 @@ jobs:
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          docker exec -e TRITON_HIP_USE_ASYNC_COPY=0 -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
+          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
@@ -360,7 +360,6 @@ jobs:
         with:
           pattern: triton-test-shard-*
           path: .
-      
       - name: Check Triton Test Results
         run: |
           set -ex
