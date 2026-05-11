@@ -4,6 +4,7 @@
 import torch
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.core import is_experimental_enabled
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter import dtypes
 import random
@@ -457,6 +458,21 @@ def torch_mla_extend_split_kv(
             and nheads == 128
             and is_fp8_q
             and is_fp8_kvc
+        )
+        or (
+            get_gfx() == "gfx950"
+            and nheads == 128
+            and is_fp8_q
+            and is_fp8_kvc
+            and is_experimental_enabled()
+        )
+        or (
+            get_gfx() == "gfx942"
+            and nheads in (16, 32, 64)
+            and nheads * max_seqlen_q == 128
+            and is_fp8_q
+            and is_fp8_kvc
+            and is_experimental_enabled()
         )
         or (
             get_gfx() == "gfx950"
@@ -1128,6 +1144,7 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+        page_size=page_size,
         kv_granularity=max(page_size, 16),  # for qh32 kv split is disabled
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
@@ -1375,7 +1392,9 @@ def test_mla(
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
-        kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+        # Use the kv_last_page_lens computed in the outer scope (varlen / ctx_lens
+        # aware). The previous unconditional ones() overwrite was correct only
+        # for page_size == 1.
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
         q_fp8 = q.to(dtypes.fp8)
