@@ -148,11 +148,35 @@ def compile_mixed_moe_gemm1(
     is_f4_a = a_dtype == "fp4"
     is_f4_b = b_dtype == "fp4"
 
+    mock_gate_only = gate_mode is GateMode.MOCK_GATE_ONLY
+    gate_up_interleave = gate_mode is GateMode.INTERLEAVE
+
+    # ------------------------------------------------------------------
+    # tile_n semantics (caller-facing) -- ALWAYS per-side N
+    # ------------------------------------------------------------------
+    # ``tile_n`` always denotes the per-side tile width in the output
+    # ``[0, inter_dim)`` dimension (i.e. either gate-only or up-only).
+    # Internally, the MFMA tile width on W (which spans the
+    # ``[0, 2*inter_dim)`` axis) depends on whether gate and up share a
+    # single accumulator set:
+    #   * ``gate_up_interleave`` / ``mock_gate_only``: one combined acc set
+    #     that spans gate+up interleaved -> internal acc-set width is
+    #     ``2 * tile_n``
+    #   * non-fused (separated): two parallel acc sets (gate, up), each of
+    #     width ``tile_n`` -> internal acc-set width is ``tile_n`` per side
+    # ``_acc_set_n`` captures the size of one acc set's N dimension and is
+    # used everywhere a "single-accumulator-set N" was previously meant by
+    # ``tile_n``. Each CTA always covers ``2 * tile_n`` columns of W
+    # regardless of gate_mode (grid step on W axis).
+    _acc_set_n = (
+        2 * tile_n if (gate_up_interleave or mock_gate_only) else tile_n
+    )
+
     sort_block_m = max(32, tile_m)
-    num_waves = min(4, tile_n // 32)
+    num_waves = min(4, _acc_set_n // 32)
     total_threads = num_waves * 64
     pack_M = 1 if tile_m < 32 else 2
-    n_per_wave = tile_n // num_waves
+    n_per_wave = _acc_set_n // num_waves
     pack_N = min(2, n_per_wave // 16)
     pack_K = 2
     scale_mn_pack = 2
@@ -188,9 +212,6 @@ def compile_mixed_moe_gemm1(
 
     def _load_bias_scalar(bias_rsrc, offset):
         return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=T.f32)
-
-    mock_gate_only = gate_mode is GateMode.MOCK_GATE_ONLY
-    gate_up_interleave = gate_mode is GateMode.INTERLEAVE
 
     # Padding semantics: model_dim and inter_dim INCLUDE padding.
     #   model_dim = model_dim_true + model_dim_pad   (K direction)
@@ -271,7 +292,9 @@ def compile_mixed_moe_gemm1(
     _cshuffle_elem_bytes = 4 if _need_quant else (4 if out_is_f32 else 2)
     _single_x_bytes = int(tile_m) * int(lds_stride) * int(a_elem_bytes)
     lds_out_bytes = (
-        _cshuffle_elem_bytes * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+        _cshuffle_elem_bytes * int(tile_m) * int(_acc_set_n)
+        if _use_cshuffle_epilog
+        else 0
     )
     lds_tid_bytes = int(tile_m) * 4
     _input_elems = _single_x_bytes if a_elem_bytes == 1 else (_single_x_bytes // 2)
@@ -296,7 +319,7 @@ def compile_mixed_moe_gemm1(
     )
 
     if _split_lds_out:
-        _half_out_bytes = _cshuffle_elem_bytes * int(tile_m) * (int(tile_n) // 2)
+        _half_out_bytes = _cshuffle_elem_bytes * int(tile_m) * (int(_acc_set_n) // 2)
         _pong_buffer_bytes = max(_single_x_bytes, _half_out_bytes)
         _ping_buffer_bytes = max(_single_x_bytes, _half_out_bytes)
     else:
@@ -326,7 +349,7 @@ def compile_mixed_moe_gemm1(
     kpack_bytes = 8 if is_int4 else 16
     out_elem_bytes = 4 if out_is_f32 else 2
 
-    _e_vec_s1 = min(tile_n // 32, 8)
+    _e_vec_s1 = min(_acc_set_n // 32, 8)
     if _need_quant:
         _e_vec_s1 = max(2, _e_vec_s1)
     _num_threads_per_quant_blk_s1 = 32 // _e_vec_s1
@@ -424,8 +447,12 @@ def compile_mixed_moe_gemm1(
     _pp_has_scale = [p["has_scale"] for p in _pipe_phases]
 
     fp4_ratio = 2 if a_dtype == "fp4" else 1
-    gui_ratio = 1 if gate_up_interleave else 2
-    _vmcnt_before_barrier = tile_m // 32 // fp4_ratio + tile_n // 32 * gui_ratio
+    # Wait-counter for B vmem loads issued by this CTA: each gate (and up,
+    # when not folded into a single acc set) load contributes one vmem op
+    # per 32 N-elems per wave. Since each CTA always covers 2*tile_n W
+    # columns (= total MFMA N), the count is uniformly tile_n // 16
+    # regardless of gate_mode.
+    _vmcnt_before_barrier = tile_m // 32 // fp4_ratio + tile_n // 16
 
     if True:
 
@@ -514,15 +541,14 @@ def compile_mixed_moe_gemm1(
                 _c1_sw = arith.constant(1, index=True)
                 _c_tn_sw = arith.constant(tile_n, index=True)
                 _c_idp_sw = arith.constant(2 * inter_dim_pad, index=True)
-                if const_expr(mock_gate_only or gate_up_interleave):
-                    _gx = (n_in - _c_idp_sw + _c_tn_sw - _c1_sw) / _c_tn_sw
-                else:
-                    _c2_sw = arith.constant(2, index=True)
-                    _gx = (
-                        (n_in - _c_idp_sw + _c2_sw * _c_tn_sw - _c1_sw)
-                        / _c_tn_sw
-                        / _c2_sw
-                    )
+                _c2_sw = arith.constant(2, index=True)
+                # Each CTA covers 2*tile_n columns of W ([0, 2*inter_dim))
+                # in all gate_mode paths. ceil((n_in - 2*pad) / (2*tile_n)).
+                _gx = (
+                    (n_in - _c_idp_sw + _c2_sw * _c_tn_sw - _c1_sw)
+                    / _c_tn_sw
+                    / _c2_sw
+                )
                 _c_pm_sw = arith.constant(persist_m, index=True)
                 _gy = (size_expert_ids_in + _c_pm_sw - _c1_sw) / _c_pm_sw
 
@@ -546,7 +572,10 @@ def compile_mixed_moe_gemm1(
                 bx_persist = _first_pid_m + (_wgid_in_group % _group_size_m)
                 by = _wgid_in_group / _group_size_m
 
-            by_n = by * arith.constant(tile_n, index=True)
+            # by_n is this CTA's base offset in the acc set's N dimension:
+            #   - GUI/mock: W's [0, 2*inter_dim) axis (= _acc_set_n step)
+            #   - separated: per-side [0, inter_dim) axis (= tile_n = _acc_set_n)
+            by_n = by * arith.constant(_acc_set_n, index=True)
 
             k_base_idx = arith.index(0)
             if const_expr(_is_splitk):
@@ -569,7 +598,7 @@ def compile_mixed_moe_gemm1(
                 T.f32 if _need_quant else (T.bf16 if out_is_bf16 else T.f16)
             )
             if const_expr(_split_lds_out and _use_cshuffle_epilog):
-                _half_out_elems = int(tile_m) * (int(tile_n) // 2)
+                _half_out_elems = int(tile_m) * (int(_acc_set_n) // 2)
                 lds_out = SmemPtr(
                     base_ptr_pong,
                     lds_pong_offset,
@@ -588,7 +617,7 @@ def compile_mixed_moe_gemm1(
                         base_ptr_pong,
                         lds_pong_offset,
                         _lds_out_elem_type,
-                        shape=(tile_m * tile_n,),
+                        shape=(tile_m * _acc_set_n,),
                     ).get()
                     if _use_cshuffle_epilog
                     else None
@@ -2186,8 +2215,13 @@ def compile_mixed_moe_gemm1(
 
                 _e_vec = _e_vec_s1
                 _e_vec_sk = 2
-                _cshuffle_nlane = min(32, tile_n // _e_vec)
-                _cshuffle_nlane_sk = min(32, tile_n // _e_vec_sk)
+                # cshuffle_nlane sizes the LDS->reg shuffle on the
+                # acc-set N dimension. For all paths that hit these two
+                # constants below the acc-set N equals _acc_set_n
+                # (separated normal/splitk uses tile_n which is identical
+                # to _acc_set_n in non-fused mode).
+                _cshuffle_nlane = min(32, _acc_set_n // _e_vec)
+                _cshuffle_nlane_sk = min(32, _acc_set_n // _e_vec_sk)
                 _num_threads_per_quant_blk = _num_threads_per_quant_blk_s1
 
                 _c0_i32 = arith.constant(0, type=T.i32)
@@ -2470,9 +2504,15 @@ def compile_mixed_moe_gemm1(
                 )
 
                 if const_expr(gate_up_interleave and not _is_splitk):
-                    # gui without splitk: acc has activation applied, halved N
+                    # GUI without splitk: SwiGLU folds gate*act and up
+                    # into a single output column, so the epilog write
+                    # width on the per-side [0, inter_dim) axis is
+                    # exactly tile_n (= _acc_set_n // 2). by_n /
+                    # n_tile_base were computed against W's
+                    # [0, 2*inter_dim) axis -- divide by 2 to land on
+                    # the per-side axis.
                     _gui_eff_n = _gui_out_n
-                    _gui_tile_n = tile_n // 2
+                    _gui_tile_n = tile_n
                     _gui_cshuffle_nlane = min(32, _gui_tile_n // _e_vec)
                     _gui_by_n = by_n / arith.constant(2, index=True)
                     _gui_n_tile_base = n_tile_base / arith.constant(2, index=True)
@@ -2502,7 +2542,11 @@ def compile_mixed_moe_gemm1(
                         store_pair=store_pair,
                     )
                 elif const_expr(mock_gate_only or (gate_up_interleave and _is_splitk)):
-                    # mock_gate_only: single pass, by_n covers full [0, 2*inter_dim)
+                    # mock_gate_only / GUI w/ splitk: single pass, no
+                    # activation, writes the full _acc_set_n columns of
+                    # interleaved gate+up into the output stride
+                    # [0, 2*inter_dim) (mock direct store; splitk
+                    # atomic-add).
                     _eff_e_vec = _e_vec_sk
                     acc = acc_gate
                     c_shuffle_epilog(
@@ -2512,7 +2556,7 @@ def compile_mixed_moe_gemm1(
                         scf=scf,
                         range_constexpr=range_constexpr,
                         tile_m=tile_m,
-                        tile_n=tile_n,
+                        tile_n=_acc_set_n,
                         e_vec=_eff_e_vec,
                         cshuffle_nlane=_cshuffle_nlane_sk,
                         block_size=total_threads,
@@ -2690,14 +2734,13 @@ def compile_mixed_moe_gemm1(
         inter_in = arith.index_cast(ir.IndexType.get(), i32_inter_in.ir_value())
         tile_n_index = arith.constant(tile_n, index=True)
         inter_dim_pad_total = arith.constant(2 * inter_dim_pad, index=True)
-        if const_expr(mock_gate_only or gate_up_interleave):
-            gx = (inter_in - inter_dim_pad_total + tile_n_index - 1) / tile_n_index
-        else:
-            gx = (
-                (inter_in - inter_dim_pad_total + 2 * tile_n_index - 1)
-                / tile_n_index
-                / arith.constant(2, index=True)
-            )
+        # Each CTA covers 2*tile_n columns of the [0, 2*inter_dim) W axis
+        # in all gate_mode paths. ceil((inter_in - 2*pad) / (2*tile_n)).
+        gx = (
+            (inter_in - inter_dim_pad_total + 2 * tile_n_index - 1)
+            / tile_n_index
+            / arith.constant(2, index=True)
+        )
         _c_pm_l = arith.constant(persist_m, index=True)
         gy = (
             arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())

@@ -17,6 +17,12 @@ Usage:
     # Custom CSV file(s)
     python -m aiter.aot.flydsl.moe --csv /path/to/config1.csv /path/to/config2.csv
 
+    # GUI-only deployment (replaces every SEP fp4 stage1 row with its GUI twin).
+    python -m aiter.aot.flydsl.moe --gui-policy gugu
+
+    # Compat deployment (covers both SEP and GUI for every fp4 stage1 row).
+    python -m aiter.aot.flydsl.moe --gui-policy gguu
+
 Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
     ARCH                      Target GPU architecture (e.g. gfx942, gfx950).
@@ -27,6 +33,7 @@ import csv
 import os
 import sys
 import time
+from typing import Optional
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -39,7 +46,10 @@ from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
+    csv_caller_gate_modes,
     get_flydsl_kernel_params,
+    is_csv_fallback_row,
+    swap_flydsl_stage1_kernel_for_gate_mode,
     _get_compiled_silu_fused,
     _run_compiled,
     _s1_args_fp4,
@@ -55,85 +65,188 @@ DEFAULT_CSVS = [
 MOE_AOT_ARCH_DEFAULT = "gfx950"
 
 
-def parse_csv(csv_path: str):
+def _row_to_common_meta(row):
+    """Extract the per-row, gate_mode-independent compile metadata used by
+    every job synthesized from this CSV row."""
+    token = int(row["token"])
+    model_dim = int(row["model_dim"])
+    inter_dim = int(row["inter_dim"])
+    experts = int(row["expert"])
+    topk = int(row["topk"])
+    doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
+    cu_num = int(row.get("cu_num", "0"))
+    block_m = int(row.get("block_m", "0") or "0")
+    act_type = row.get("act_type", "")
+    act = (
+        "swiglu"
+        if act_type.strip().split(".")[-1].lower() == "swiglu"
+        else "silu"
+    )
+    q_type = row.get("q_type", "")
+    dtype = row.get("dtype", "")
+    q_dtype_w = row.get("q_dtype_w", "")
+    q_dtype_a = row.get("q_dtype_a", "")
+    # Match the RT condition in fused_moe.py / test_moe_2stage.py:
+    #   _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == fp4x2
+    #   AND the caller actually passes a bias tensor (bias1 is not None).
+    # Bias is passed only when q_dtype_a is fp8 or bf16 (NOT fp4x2).
+    # For pure a4w4 models (q_dtype_a == fp4x2), bias1=None regardless of
+    # activation type (Silu or Swiglu), so enable_bias=False.
+    enable_bias = (
+        q_type.strip().split(".")[-1] == "per_1x32"
+        and dtype in ("torch.bfloat16", "torch.float16")
+        and "float4_e2m1fn_x2" in q_dtype_w
+        and "float4_e2m1fn_x2" not in q_dtype_a  # fp8/bf16 activation only
+    )
+    return {
+        "token": token,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": experts,
+        "topk": topk,
+        "doweight_stage1": doweight_stage1,
+        "cu_num": cu_num,
+        "block_m": block_m,
+        "act": act,
+        "enable_bias": enable_bias,
+    }
+
+
+def _stage1_kernel_for_gate_mode(literal_name: str, gate_mode: str) -> Optional[str]:
+    """Resolve the stage1 kernel name that ``fused_moe`` will ACTUALLY
+    dispatch when the caller requests ``gate_mode``, given the literal
+    name pulled from the CSV row.
+
+    - flydsl rows: route through ``swap_flydsl_stage1_kernel_for_gate_mode``
+      so SEP<->GUI siblings are picked transparently.  Returns None if the
+      requested gate_mode has no registered sibling for this row (e.g.
+      ``_kb`` / ``_go`` SEP kernels have no GUI twin -- such rows are
+      simply skipped under that gate_mode, matching the runtime which would
+      keep using the SEP literal).
+    - non-flydsl (ck / cktile / ...): not subject to flydsl SEP/GUI swap;
+      AOT does not compile these (they live in a different backend), so
+      return None to signal "skip".
+    """
+    if not literal_name.startswith("flydsl_"):
+        return None
+    if not literal_name.startswith("flydsl_moe1_"):
+        # stage2 or other -- caller handles separately, not via swap
+        return literal_name
+    swapped = swap_flydsl_stage1_kernel_for_gate_mode(literal_name, gate_mode)
+    sib = get_flydsl_kernel_params(swapped)
+    if sib is None:
+        return None
+    # Kernels without an explicit ``gate_mode`` in their registry params
+    # (e.g. wint4 stage1 from ``get_flydsl_stage1_kernels_int4_bf16`` --
+    # not subject to SEP/GUI dispatch) are SEP-only by convention; honor
+    # them when caller asks for ``separated`` and skip otherwise.
+    sib_gm = sib.get("gate_mode", "separated")
+    if sib_gm != gate_mode:
+        return None  # no sibling for this gate_mode (e.g. SEP-only _kb under gugu)
+    return swapped
+
+
+def parse_csv(csv_path: str, *, caller_gate_modes_override: Optional[list] = None):
     """Parse the CSV and return a list of unique compile jobs.
 
-    Each job is a dict with keys:
-        kernel_name, stage, model_dim, inter_dim, experts, topk,
-        doweight_stage1 (for stage1), and all params from get_flydsl_kernel_params.
+    The job set produced for a CSV is the SAME as what
+    ``op_tests/test_moe_2stage.py`` would iterate, by construction:
 
-    Deduplicates by
-    (kernel_name, model_dim, inter_dim, experts, topk, doweight_stage1).
+      1. Compute per-CSV ``caller_gate_modes`` via the shared
+         ``csv_caller_gate_modes`` (ck / cktile / a4w4 pinning rules).
+      2. For every row × every caller_gate_mode in the sweep:
+           - stage1 (``kernelName1``): swap to the SEP/GUI sibling that
+             would actually be dispatched at runtime for that gate_mode.
+             Skip the (row, gate_mode) pair when no sibling exists.
+           - stage2 (``kernelName2``): emitted as-is (stage2 is not
+             SEP/GUI sensitive -- it shares the same kernel for both).
+      3. Dedup by ``job_identity`` so siblings shared across rows compile
+         once.
+
+    ``caller_gate_modes_override`` lets ``--gui-policy gugu/gguu`` short-
+    circuit the per-CSV decision (gugu -> [INTERLEAVE], gguu -> [SEP, INTL]).
     """
     jobs = []
     seen = set()
 
     with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            token = int(row["token"])
-            model_dim = int(row["model_dim"])
-            inter_dim = int(row["inter_dim"])
-            experts = int(row["expert"])
-            topk = int(row["topk"])
-            doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
-            cu_num = int(row.get("cu_num", "0"))
-            block_m = int(row.get("block_m", "0") or "0")
-            act_type = row.get("act_type", "")
-            act = (
-                "swiglu"
-                if act_type.strip().split(".")[-1].lower() == "swiglu"
-                else "silu"
-            )
-            q_type = row.get("q_type", "")
-            dtype = row.get("dtype", "")
-            q_dtype_w = row.get("q_dtype_w", "")
-            q_dtype_a = row.get("q_dtype_a", "")
-            # Match the RT condition in fused_moe.py / test_moe_2stage.py:
-            #   _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == fp4x2
-            #   AND the caller actually passes a bias tensor (bias1 is not None).
-            # Bias is passed only when q_dtype_a is fp8 or bf16 (NOT fp4x2).
-            # For pure a4w4 models (q_dtype_a == fp4x2), bias1=None regardless of
-            # activation type (Silu or Swiglu), so enable_bias=False.
-            enable_bias = (
-                q_type.strip().split(".")[-1] == "per_1x32"
-                and dtype in ("torch.bfloat16", "torch.float16")
-                and "float4_e2m1fn_x2" in q_dtype_w
-                and "float4_e2m1fn_x2" not in q_dtype_a  # fp8/bf16 activation only
-            )
+        rows = list(csv.DictReader(f))
 
-            for col in ("kernelName1", "kernelName2"):
-                name = row.get(col, "").strip()
-                if not name or not name.startswith("flydsl_"):
+    if caller_gate_modes_override is not None:
+        gate_modes = list(caller_gate_modes_override)
+    else:
+        gate_modes = csv_caller_gate_modes(rows)
+
+    for row in rows:
+        try:
+            meta = _row_to_common_meta(row)
+        except (KeyError, ValueError):
+            continue
+
+        kn1 = (row.get("kernelName1") or "").strip()
+        kn2 = (row.get("kernelName2") or "").strip()
+        is_fallback = is_csv_fallback_row(row)
+
+        # ---- stage1: per-gate_mode sibling resolution ----------------
+        if kn1.startswith("flydsl_moe1_"):
+            for gm in gate_modes:
+                effective = _stage1_kernel_for_gate_mode(kn1, gm)
+                if effective is None:
+                    if is_fallback:
+                        # Fallback rows tolerate missing siblings silently
+                        # (they're backups, not the deployment kernel).
+                        continue
+                    print(
+                        f"  [skip] {kn1}: no '{gm}' sibling registered "
+                        f"(row dropped under this gate_mode)"
+                    )
                     continue
-
-                job = {
-                    "kernel_name": name,
-                    "model_dim": model_dim,
-                    "inter_dim": inter_dim,
-                    "experts": experts,
-                    "topk": topk,
-                    "doweight_stage1": doweight_stage1,
-                    "cu_num": cu_num,
-                    "act": act,
-                    "enable_bias": enable_bias,
-                }
-                params = get_flydsl_kernel_params(name)
+                params = get_flydsl_kernel_params(effective)
                 if params is None:
-                    print(f"  [WARN] Unknown kernel name: {name}, skipping")
+                    print(f"  [WARN] Unknown kernel name: {effective}, skipping")
                     continue
-
-                if params["stage"] == 2:
-                    job["token_num"] = token
-                    job["block_m"] = block_m
-
-                full_job = {**job, **params}
-                key = job_identity(full_job)
+                job = {
+                    "kernel_name": effective,
+                    "model_dim": meta["model_dim"],
+                    "inter_dim": meta["inter_dim"],
+                    "experts": meta["experts"],
+                    "topk": meta["topk"],
+                    "doweight_stage1": meta["doweight_stage1"],
+                    "cu_num": meta["cu_num"],
+                    "act": meta["act"],
+                    "enable_bias": meta["enable_bias"],
+                    **params,
+                }
+                key = job_identity(job)
                 if key in seen:
                     continue
                 seen.add(key)
+                jobs.append(job)
 
-                jobs.append(full_job)
+        # ---- stage2: literal name, gate_mode-independent -------------
+        if kn2.startswith("flydsl_moe2_"):
+            params = get_flydsl_kernel_params(kn2)
+            if params is None:
+                print(f"  [WARN] Unknown kernel name: {kn2}, skipping")
+            else:
+                job = {
+                    "kernel_name": kn2,
+                    "model_dim": meta["model_dim"],
+                    "inter_dim": meta["inter_dim"],
+                    "experts": meta["experts"],
+                    "topk": meta["topk"],
+                    "doweight_stage1": meta["doweight_stage1"],
+                    "cu_num": meta["cu_num"],
+                    "act": meta["act"],
+                    "enable_bias": meta["enable_bias"],
+                    "token_num": meta["token"],
+                    "block_m": meta["block_m"],
+                    **params,
+                }
+                key = job_identity(job)
+                if key not in seen:
+                    seen.add(key)
+                    jobs.append(job)
 
     return jobs
 
@@ -561,6 +674,25 @@ def compile_one_config(
     return result
 
 
+def _gui_policy_to_override(policy: str):
+    """Translate the CLI gui-policy into a ``caller_gate_modes_override``
+    consumed by ``parse_csv``.
+
+      - ``auto``: None -> ``parse_csv`` uses the per-CSV decision shared
+        with ``op_tests/test_moe_2stage.py`` (ck/cktile/a4w4 pinning).
+      - ``gugu``: force every fp4 stage1 row to compile its INTL sibling
+        only (mimics ``AITER_MOE_GUI=gugu`` runtime).
+      - ``gguu``: force every fp4 stage1 row to compile BOTH SEP and INTL
+        (mimics ``AITER_MOE_GUI=gguu`` runtime; cache serves either
+        caller_gate_mode).
+    """
+    if policy == "gugu":
+        return ["interleave"]
+    if policy == "gguu":
+        return ["separated", "interleave"]
+    return None  # auto
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AOT pre-compile MoE / Mixed-MoE FlyDSL kernels from aiter CSV config",
@@ -572,6 +704,27 @@ def main():
         nargs="+",
         default=DEFAULT_CSVS,
         help="Path(s) to tuned CSV config file(s); defaults come from AITER_CONFIGS",
+    )
+    parser.add_argument(
+        "--gui-policy",
+        choices=("auto", "gugu", "gguu"),
+        default="auto",
+        help=(
+            "Stage1 GUI/SEP coverage policy for fp4-weight kernels:\n"
+            "  auto (default) - per-CSV decision IDENTICAL to\n"
+            "                   op_tests/test_moe_2stage.py:\n"
+            "                     ck_*    -> SEP only,\n"
+            "                     cktile_* -> INTL only,\n"
+            "                     pure flydsl + a4w4 -> [SEP, INTL] sweep,\n"
+            "                     pure flydsl, non-a4w4 -> majority _gui vote.\n"
+            "                   AOT cache covers EXACTLY the kernel set the\n"
+            "                   UT exercises.\n"
+            "  gugu           - Override: GUI-only.  Compile every fp4\n"
+            "                   stage1 row's INTL sibling.  Skip rows\n"
+            "                   without a GUI sibling (e.g. _kb/_go).\n"
+            "  gguu           - Override: compile BOTH SEP and INTL\n"
+            "                   siblings of every fp4 stage1 row."
+        ),
     )
     args = parser.parse_args()
 
@@ -586,7 +739,13 @@ def main():
     )
     arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(auto-detect)"
 
-    all_jobs = collect_aot_jobs(csv_paths, parse_csv)
+    override = _gui_policy_to_override(args.gui_policy)
+    if override is not None:
+        from functools import partial
+        parser_fn = partial(parse_csv, caller_gate_modes_override=override)
+    else:
+        parser_fn = parse_csv
+    all_jobs = collect_aot_jobs(csv_paths, parser_fn)
 
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
@@ -595,6 +754,7 @@ def main():
     print("=" * 72)
     for csv_path in csv_paths:
         print(f"  CSV:          {csv_path}")
+    print(f"  GUI policy:   {args.gui_policy}")
     print(f"  Stage1 jobs:  {len(stage1_jobs)}")
     print(f"  Stage2 jobs:  {len(stage2_jobs)}")
     print(f"  Total jobs:   {len(all_jobs)}")

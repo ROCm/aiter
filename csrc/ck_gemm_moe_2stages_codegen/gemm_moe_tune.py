@@ -2446,6 +2446,26 @@ class FmoeTuner(TunerCommon):
             a_dtype_str, b_dtype_str, out_dtype_str
         )
 
+        # AITER_MOE_GUI=gugu expands the tune scope to include the new
+        # cross-variant candidates introduced by registering both SEP and GUI
+        # for every fp4-weight (a, b) triple.  In auto/gguu we restrict the
+        # iteration to the historical set (a8w4 GUI-only, a4w4 SEP/mock-only)
+        # so the tuning database stays semantically identical to legacy.
+        _gui_mode = os.environ.get("AITER_MOE_GUI", "auto").lower()
+        if _gui_mode != "gugu":
+            if a_dtype_str == "fp8":
+                flydsl_s1_kernels = {
+                    n: p
+                    for n, p in flydsl_s1_kernels.items()
+                    if p.get("gate_mode") != "separated"
+                }
+            else:
+                flydsl_s1_kernels = {
+                    n: p
+                    for n, p in flydsl_s1_kernels.items()
+                    if p.get("gate_mode") != "interleave"
+                }
+
         for blockM in blockMs:
             if blockM not in [32, 64, 128] or not use_g1u1:
                 continue
@@ -2460,11 +2480,16 @@ class FmoeTuner(TunerCommon):
                 if s1_tile_m != blockM:
                     continue
                 if a_dtype_str == "fp8":
+                    # gate_mode is taken from registered kparams (interleave for
+                    # _gui kernels, separated otherwise).  Historically only
+                    # _gui kernels were registered for a8w4, so this matched the
+                    # old hardcoded "interleave"; with AITER_MOE_GUI=gugu we
+                    # also enumerate SEP a8w4 candidates and need to honor
+                    # their actual gate_mode.
                     fp8_params = {
                         **kparams,
                         "out_dtype": "fp8",
                         "a_scale_one": True,
-                        "gate_mode": "interleave",
                     }
                     nonfused_params = {**kparams, "a_scale_one": True}
                     if is_splitk:

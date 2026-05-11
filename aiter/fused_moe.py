@@ -28,7 +28,6 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _USE_GENERIC_SWIGLU_MXFP4_LAYOUT = (
     os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "0") == "1"
 )
-_SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 
 
 def _moe_sorting_impl(
@@ -173,7 +172,7 @@ def fused_moe(
     bias2=None,
     splitk=0,
     swiglu_limit=0.0,
-    gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    gate_mode: Optional[str] = None,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -229,7 +228,7 @@ def fused_moe_fake(
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
-    gate_mode: str = GateMode.SEPARATED.value,
+    gate_mode: Optional[str] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -265,11 +264,18 @@ def fused_moe_(
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
-    gate_mode: str = GateMode.SEPARATED.value,
+    gate_mode: Optional[str] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
+    # ``gate_mode`` is a pure caller-driven parameter.  The ``AITER_MOE_GUI``
+    # env policy is intentionally NOT consulted here -- integration layers
+    # (UT, tune, AOT) translate env/CLI args into a concrete value and pass
+    # it explicitly.  When None, fall back to the historical SEPARATED
+    # default to preserve backward compatibility.
+    if gate_mode is None:
+        gate_mode = GateMode.SEPARATED.value
     gate_mode = GateMode(gate_mode)
     if block_size_M == -1:
         block_size_M = None
@@ -308,16 +314,19 @@ def fused_moe_(
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
     elif quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Swiglu and _USE_GENERIC_SWIGLU_MXFP4_LAYOUT:
-            q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
-        elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
+        if activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
+            elif _USE_GENERIC_SWIGLU_MXFP4_LAYOUT:
+                q_dtype_a = dtypes.fp4x2
             else:
                 q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
 
+    _gate_mode_str = (
+        gate_mode.value if isinstance(gate_mode, GateMode) else gate_mode
+    )
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
@@ -334,6 +343,7 @@ def fused_moe_(
         hidden_pad,
         intermediate_pad,
         isShuffled,
+        gate_mode=_gate_mode_str,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -410,6 +420,7 @@ def fused_moe_(
             topk_weights=topk_weight,
             # only for flydsl dsv4
             swiglu_limit=swiglu_limit,
+            gate_mode=gate_mode,
         )
 
 
@@ -819,6 +830,7 @@ def get_2stage_cfgs(
     hidden_pad,
     intermediate_pad,
     is_shuffled=True,
+    gate_mode=None,
 ):
     _INDEX_COLS = [
         "cu_num",
@@ -1079,6 +1091,30 @@ def get_2stage_cfgs(
             run_1stage_xbf16 = run_1stage and bool(int(cfg["xbf16"]))
         else:
             run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
+
+        # Caller-driven SEP <-> GUI swap.  A single CSV row exposes both
+        # variants of a flydsl stage1 kernel (`name` and `name_gui` siblings
+        # share tile shape but differ in gate_mode + weight layout).  When the
+        # caller passes ``gate_mode`` to fused_moe, swap to the matching
+        # sibling so a single tune entry covers both layouts.  No-op when the
+        # registry lacks a matching sibling.
+        if (
+            not run_1stage
+            and gate_mode is not None
+            and isinstance(kernelName1, str)
+            and kernelName1.startswith("flydsl_moe1_")
+        ):
+            from aiter.ops.flydsl.moe_kernels import (
+                swap_flydsl_stage1_kernel_for_gate_mode,
+            )
+
+            _swapped = swap_flydsl_stage1_kernel_for_gate_mode(kernelName1, gate_mode)
+            if _swapped != kernelName1:
+                logger.info(
+                    f"[fused_moe] gate_mode={gate_mode}: swapped stage1 kernel "
+                    f"{kernelName1} -> {_swapped}"
+                )
+                kernelName1 = _swapped
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
@@ -1449,6 +1485,7 @@ def fused_moe_2stages(
     topk_ids=None,
     topk_weights=None,
     swiglu_limit=0.0,
+    gate_mode=None,
 ):
     quant_func = get_quant(quant_type)
     token_num, _ = hidden_states.shape
@@ -1456,6 +1493,9 @@ def fused_moe_2stages(
     dtype = moe_out.dtype
     device = hidden_states.device
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    _gate_mode_str = (
+        gate_mode.value if isinstance(gate_mode, GateMode) else gate_mode
+    )
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
@@ -1472,6 +1512,7 @@ def fused_moe_2stages(
         hidden_pad,
         intermediate_pad,
         is_shuffled,
+        gate_mode=_gate_mode_str,
     )
     if (
         quant_type == QuantType.per_1x32

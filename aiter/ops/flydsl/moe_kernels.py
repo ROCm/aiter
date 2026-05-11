@@ -67,76 +67,286 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
     return None
 
 
+def stage1_kernel_native_gate_mode(kernel_name1: str) -> str:
+    """Infer the *native* caller_gate_mode implied by a stage1 kernel name.
+
+    Backend-aware rules (used by both UT and AOT to pin every CSV row to
+    its CSV-author-intended gate_mode before deciding whether to swap):
+
+      - ``flydsl_*_gui*`` -> ``"interleave"``
+      - ``flydsl_*``      -> ``"separated"``
+      - ``cktile_*``      -> ``"interleave"``  (cktile uses GUI W layout)
+      - ``ck_*``          -> ``"separated"``   (plain ck uses SEP layout)
+      - anything else     -> ``"separated"``   (default fallback)
+    """
+    n = kernel_name1 or ""
+    if n.startswith("flydsl_"):
+        return "interleave" if "_gui" in n else "separated"
+    if n.startswith("cktile_"):
+        return "interleave"
+    if n.startswith("ck_"):
+        return "separated"
+    return "separated"
+
+
+def is_csv_fallback_row(row) -> bool:
+    """A CSV row is a fallback backup (not the real deployment kernel) when
+    its ``_tag`` column contains ``fallback``.  Such rows are still
+    iterated (so we exercise / compile them) but do NOT participate in the
+    CSV's deployment-mode decision."""
+    if hasattr(row, "get"):
+        tag = str(row.get("_tag", "") or "").lower()
+    else:
+        # pandas Series-like: support both .get and dict-style access
+        try:
+            tag = str(row["_tag"]).lower() if "_tag" in row else ""
+        except Exception:
+            tag = ""
+    return "fallback" in tag
+
+
+def csv_caller_gate_modes(rows) -> list:
+    """Decide which caller_gate_mode(s) to sweep for a whole CSV.
+
+    Same per-CSV pinning rules used by both the unit test
+    (``op_tests/test_moe_2stage.py``) and the AOT pre-compiler
+    (``aiter.aot.flydsl.moe``) so they always cover the SAME kernel set.
+
+    Only **non-fallback** rows participate in the decision (rows tagged
+    ``flydsl_fallback`` etc are backup kernels for the same shape and
+    must not poison the deployment intent).
+
+    Pinning rules (one decision per CSV, applied to every row):
+      1. Any non-fallback row uses plain ``ck_*`` stage1 (not cktile)  -> SEP only.
+      2. Any non-fallback row uses ``cktile_*`` stage1                 -> INTL only.
+      3. Both ck_ AND cktile_ present                                  -> SEP (ck wins).
+      4. Pure flydsl AND CSV is a4w4 (``afp4_wfp4`` in stage1 names)   -> [SEP, INTL].
+      5. Otherwise (pure flydsl, non-a4w4)                             -> majority by
+         ``_gui`` suffix among non-fallback flydsl rows.
+
+    ``rows`` may be any iterable of dict-like / pandas Series rows
+    (csv.DictReader, list of dicts, pandas DataFrame, etc).  Returns a
+    list of caller_gate_mode strings (length 1 for cases 1/2/3/5,
+    length 2 for case 4).
+    """
+    has_ck = False
+    has_cktile = False
+    has_a4w4 = False
+    sep = intl = 0
+
+    if hasattr(rows, "iterrows"):
+        iterator = (row for _, row in rows.iterrows())
+    else:
+        iterator = iter(rows)
+
+    for row in iterator:
+        if is_csv_fallback_row(row):
+            continue
+        kn1 = str(row.get("kernelName1", "") or "") if hasattr(row, "get") else (
+            str(row["kernelName1"]) if "kernelName1" in row else ""
+        )
+        if not kn1:
+            continue
+        if kn1.startswith("cktile_"):
+            has_cktile = True
+        elif kn1.startswith("ck_"):
+            has_ck = True
+        if "afp4_wfp4" in kn1:
+            has_a4w4 = True
+        if kn1.startswith("flydsl_"):
+            if "_gui" in kn1:
+                intl += 1
+            else:
+                sep += 1
+
+    if has_ck and not has_cktile:
+        return ["separated"]
+    if has_cktile and not has_ck:
+        return ["interleave"]
+    if has_ck and has_cktile:
+        # Mixed (rare, both real-deployment) -- prefer SEP for ck side;
+        # cktile side dispatches its own kernel anyway.
+        return ["separated"]
+    if has_a4w4:
+        return ["separated", "interleave"]
+    return ["interleave" if intl > sep else "separated"]
+
+
+def swap_flydsl_stage1_kernel_for_gate_mode(name: str, target_gate_mode) -> str:
+    """Return the SEP/GUI sibling of a stage1 kernel name for a given gate_mode.
+
+    Caller-facing ``tile_n`` is per-side N for both SEP and GUI (the kernel
+    internally sets ``_acc_set_n = 2*tile_n`` for GUI so each CTA always
+    covers ``2*tile_n`` columns of W regardless of layout).  The stage1
+    registry is built so that **for every fp4-weight (tm, tile_n, tk) cfg
+    BOTH a SEP and a GUI sibling exist at the IDENTICAL tile_n** (see
+    ``get_flydsl_stage1_kernels``), so swapping the gate_mode never has to
+    rescale ``tile_n`` -- we only toggle the ``_gui`` suffix and the
+    swapped kernel does the same work-per-tile as the original
+    (performance-neutral).
+
+    Both ``str`` (``"separated"`` / ``"interleave"``) and ``GateMode`` enum
+    values are accepted for ``target_gate_mode``.
+    """
+    if target_gate_mode is None:
+        return name
+    target = (
+        target_gate_mode.value
+        if hasattr(target_gate_mode, "value")
+        else target_gate_mode
+    )
+    if target not in ("separated", "interleave"):
+        return name
+    params = get_flydsl_kernel_params(name)
+    if params is None or params.get("stage") != 1:
+        return name
+    cur = params.get("gate_mode", "separated")
+    if cur == target:
+        return name
+    if cur not in ("separated", "interleave"):
+        return name
+
+    # Strip any ``_fp4`` / ``_fp8`` / ``_sbm`` tail before pattern surgery,
+    # remember it, and re-apply it to the swapped name so the suffix-aware
+    # lookup keeps working.
+    suffix_match = _SUFFIX_RE.search(name)
+    if suffix_match and suffix_match.group(0):
+        base = name[: suffix_match.start()]
+        tail = suffix_match.group(0)
+    else:
+        base = name
+        tail = ""
+
+    if target == "interleave":
+        # SEP -> GUI: insert ``_gui`` before the ``_xcd*`` suffix (if any),
+        # otherwise append.  tile_n stays identical.
+        if "_gui" in base:  # already GUI -- defensive
+            new_base = base
+        elif "_xcd" in base:
+            new_base = base.replace("_xcd", "_gui_xcd")
+        else:
+            new_base = base + "_gui"
+    else:
+        # GUI -> SEP: drop ``_gui``, tile_n stays identical.
+        if "_gui" not in base:
+            return name
+        new_base = base.replace("_gui", "")
+
+    new_name = new_base + tail
+    sibling = get_flydsl_kernel_params(new_name)
+    if sibling is not None and sibling.get("gate_mode") == target:
+        return new_name
+    return name
+
+
 def get_flydsl_stage1_kernels(
     a_dtype: str, b_dtype: str, out_dtype: str
 ) -> Dict[str, Dict]:
-    """Return {kernelName: params} for all supported stage1 configs."""
+    """Return {kernelName: params} for all supported stage1 configs.
+
+    Registry invariants (relied on by ``swap_flydsl_stage1_kernel_for_gate_mode``):
+
+      - ``tile_n`` in kernel names and registry params is ALWAYS the
+        caller-facing per-side N.  The kernel internally derives
+        ``_acc_set_n = 2*tile_n`` for GUI / mock_gate_only paths so each
+        CTA always covers ``2*tile_n`` columns of W (see
+        ``compile_mixed_moe_gemm1``).  No legacy halving / doubling
+        happens here.
+      - For every fp4-weight (tm, tile_n, tk, wpe, kb, bnt, xcd) cfg,
+        BOTH the SEP and the GUI sibling are registered at the IDENTICAL
+        ``tile_n``.  Swap is therefore a pure ``_gui`` suffix toggle and
+        is performance neutral (work-per-tile preserved).
+      - ``_go`` (mock_gate_only) and ``_kb`` (split-K) candidates are
+        gated to the (tm=32, fp4_a, !gui, wpe=3) corner that historically
+        used them; ``_gui`` cannot combine with ``_go`` since both fold
+        gate+up.
+    """
     kernels = {}
     is_fp4_a = a_dtype == "fp4"
     is_fp4_b = b_dtype == "fp4"
 
-    tile_ns = [32, 64, 128] if is_fp4_b else [128]
     tile_ks = [256]
     tile_ms = [32, 64, 128]
-
     waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
     b_nts = [0, 2]
     xcd_swizzles = [0, 4]
 
-    for tm in tile_ms:
+    # GUI/INTERLEAVE only meaningful for fp4-weight kernels (the W layout
+    # interleaves gate/up at 4-bit packing granularity).  For non-fp4 W
+    # only the SEP layout is registered.
+    is_gui_choices = (False, True) if is_fp4_b else (False,)
+
+    def _tile_ns(tm):
+        """Caller-facing per-side ``tile_n`` candidates for this tm.
+
+        SAME set is used for SEP and GUI siblings.  Values were chosen as
+        the union of historical SEP and GUI tile_n's actually referenced
+        by tuned CSVs (so no kernel name disappears) plus the same-tile_n
+        siblings needed by ``swap_flydsl_stage1_kernel_for_gate_mode``."""
+        if not is_fp4_b:
+            return [128]
         if tm == 32:
-            tile_ns = [32, 64, 128]
-        else:
-            tile_ns = [64, 128] if is_fp4_a else [128, 256]
-        for tn in tile_ns:
-            for tk in tile_ks:
-                for wpe in waves_per_eus:
-                    for kb in k_batches if wpe == 3 and tm == 32 and is_fp4_a else [1]:
-                        for bnt in b_nts:
-                            gate_onlys = (
-                                [False, True] if kb > 1 and is_fp4_a else [False]
-                            )
-                            for go in gate_onlys:
-                                for xcd in xcd_swizzles:
-                                    name = flydsl_kernel_name(
-                                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
-                                    )
-                                    if wpe != 1:
-                                        name += f"_w{wpe}"
-                                    if kb != 1:
-                                        name += f"_kb{kb}"
-                                    if bnt != 2:
-                                        name += f"_bnt{bnt}"
-                                    if go:
-                                        name += "_go"
-                                    if a_dtype == "fp8":
-                                        name += "_gui"
-                                    if xcd > 0:
-                                        name += f"_xcd{xcd}"
-                                    kernels[name] = {
-                                        "stage": 1,
-                                        "a_dtype": a_dtype,
-                                        "b_dtype": b_dtype,
-                                        "out_dtype": out_dtype,
-                                        "tile_m": tm,
-                                        "tile_n": tn,
-                                        "tile_k": tk,
-                                        "MPerBlock": tm,
-                                        "waves_per_eu": wpe,
-                                        "k_batch": kb,
-                                        "b_nt": bnt,
-                                        "gate_mode": (
-                                            "mock_gate_only"
-                                            if go
-                                            else (
-                                                "interleave"
-                                                if a_dtype == "fp8"
-                                                else "separated"
-                                            )
-                                        ),
-                                        "xcd_swizzle": xcd,
-                                    }
+            return [32, 64, 128]
+        return [64, 128]  # tm in {64, 128}
+
+    for is_gui in is_gui_choices:
+        for tm in tile_ms:
+            for tn in _tile_ns(tm):
+                for tk in tile_ks:
+                    for wpe in waves_per_eus:
+                        kbs = (
+                            k_batches
+                            if (wpe == 3 and tm == 32 and is_fp4_a and not is_gui)
+                            else [1]
+                        )
+                        for kb in kbs:
+                            for bnt in b_nts:
+                                gate_onlys = (
+                                    [False, True]
+                                    if (kb > 1 and is_fp4_a and not is_gui)
+                                    else [False]
+                                )
+                                for go in gate_onlys:
+                                    for xcd in xcd_swizzles:
+                                        name = flydsl_kernel_name(
+                                            1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                                        )
+                                        if wpe != 1:
+                                            name += f"_w{wpe}"
+                                        if kb != 1:
+                                            name += f"_kb{kb}"
+                                        if bnt != 2:
+                                            name += f"_bnt{bnt}"
+                                        if go:
+                                            name += "_go"
+                                        if is_gui:
+                                            name += "_gui"
+                                        if xcd > 0:
+                                            name += f"_xcd{xcd}"
+                                        kernels[name] = {
+                                            "stage": 1,
+                                            "a_dtype": a_dtype,
+                                            "b_dtype": b_dtype,
+                                            "out_dtype": out_dtype,
+                                            "tile_m": tm,
+                                            "tile_n": tn,
+                                            "tile_k": tk,
+                                            "MPerBlock": tm,
+                                            "waves_per_eu": wpe,
+                                            "k_batch": kb,
+                                            "b_nt": bnt,
+                                            "gate_mode": (
+                                                "mock_gate_only"
+                                                if go
+                                                else (
+                                                    "interleave"
+                                                    if is_gui
+                                                    else "separated"
+                                                )
+                                            ),
+                                            "xcd_swizzle": xcd,
+                                        }
     return kernels
 
 

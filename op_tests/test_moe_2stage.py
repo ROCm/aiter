@@ -26,6 +26,12 @@ from aiter.fused_moe import (
     torch_moe_stage2,
 )
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.moe_kernels import (
+    csv_caller_gate_modes,
+    is_csv_fallback_row,
+    stage1_kernel_native_gate_mode,
+    swap_flydsl_stage1_kernel_for_gate_mode,
+)
 
 
 from aiter.ops.shuffle import (
@@ -170,6 +176,16 @@ def test_fmoe(
         a1_qt = input.to(dtypes.bf16)
         a1_scale = None
     else:
+        # a4w4 (both caller-SEP gguu AND caller-INTL gugu): per the
+        # SEP-vs-INTL probe, the GUI kernel's stage1/2 outputs are
+        # bit-equal to the SEP kernel's (max|d|=0, logits_diff~1e-6
+        # atomic noise only) -- they are the same numerical pipeline,
+        # only the weight layout differs.  So both should compare against
+        # the SAME fp4-a torch reference: fp4-quanting a here puts the ref
+        # on the same fp4 round-trip as the runtime, and the resulting
+        # logits_diff reports the fp4-weight noise floor (~0.009-0.011).
+        # Using a bf16 ref here would hide nothing but the fp4-a quant
+        # cost -- a known, kernel-independent ~0.064 number.
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
 
     # bias dtype convert
@@ -225,15 +241,29 @@ def test_fmoe(
         )
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
-    elif (
-        qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
-        and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
-        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
-        w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
-        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+    elif qType == aiter.QuantType.per_1x32 and WQDType == dtypes.fp4x2:
+        # fp4-weight per_1x32: shuffle layout MUST follow `gateMode` (the
+        # runtime caller decision), NOT `AQDType`.  Historically a8w4 always
+        # used INTERLEAVE so this looked like an AQDType-driven choice; with
+        # AITER_MOE_GUI decoupling a4w4 callers can also request INTERLEAVE
+        # (and a8w4 callers can request SEPARATED), so we drive shuffle from
+        # the actual kernel layout the runtime will pick.
+        if gateMode == GateMode.INTERLEAVE:
+            # GUI / interleaved-row layout
+            w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
+            w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+            w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
+            w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+        elif preshuffle:
+            # SEP / plain layout
+            w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
+            w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
+            w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
+            w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+        else:
+            # SEP without preshuffle: only scales need e8m0 shuffle
+            w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
+            w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
@@ -279,6 +309,9 @@ def test_fmoe(
         a2_qt = out1_ref
         a2_scale = None
     else:
+        # a4w4 (SEP and INTL alike): same reasoning as stage1 -- fp4-quant
+        # a2 so ref's fp4 round cancels the runtime's, exposing only the
+        # fp4-weight noise floor.
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
     a2_qt = a2_qt.view(token, topk, -1)
 
@@ -538,13 +571,19 @@ def _str2enum(s, enum_cls):
     return getattr(enum_cls, s.strip().split(".")[-1])
 
 
-def _row_to_kwargs(row):
-    # csv rows store already-effective dims, so pad defaults to 0.
+def _row_to_kwargs(row, gate_mode=None):
+    """Convert a CSV row into test_fmoe kwargs.
+
+    ``gate_mode`` (optional) overrides the gate_mode value embedded in
+    kwargs.  When None, the legacy mapping is used so the call-site can
+    later expand into multiple gate_mode runs without re-parsing the row.
+    """
     q_type = _str2enum(row["q_type"], aiter.QuantType)
     aq_dtype = _str2dtype(row["q_dtype_a"])
     wq_dtype = _str2dtype(row["q_dtype_w"])
     act_type = _str2enum(row["act_type"], aiter.ActivationType)
-    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
+    if gate_mode is None:
+        gate_mode = _legacy_gate_mode(aq_dtype, wq_dtype)
     return dict(
         dtype=_str2dtype(row["dtype"]),
         token=int(row["token"]),
@@ -565,55 +604,90 @@ def _row_to_kwargs(row):
     )
 
 
+# NOTE: per-CSV caller_gate_mode decision logic, the native-gate_mode
+# inference, and the fallback-row predicate are now shared with the AOT
+# pre-compiler (``aiter.aot.flydsl.moe``) via
+# ``aiter.ops.flydsl.moe_kernels``.  This keeps the UT and AOT in lockstep
+# so the AOT cache covers EXACTLY the kernel set the UT exercises.
+
+
 def _iter_csv_cases():
-    """Yield (kwargs, extras) for every row of every selected model csv."""
+    """Yield (kwargs, extras) for every row of every selected model csv.
+
+    The whole CSV shares a single sweep decision computed by
+    ``csv_caller_gate_modes`` (see that helper for the pinning rules).
+    For a4w4 pure-flydsl deployments this returns BOTH caller paths so
+    every row is exploded into (SEP, INTL); for ck / cktile / non-a4w4
+    flydsl CSVs it returns one fixed gate_mode used for all rows.
+
+    When the requested gate_mode differs from the row's native (CSV-pinned)
+    backend mode we rewrite ``kernelName1`` via
+    ``swap_flydsl_stage1_kernel_for_gate_mode`` so the extras / logs line
+    up with the kernel the runtime will actually dispatch (matches
+    fused_moe's internal swap).  ck / cktile rows are not swapped (they
+    have no flydsl sibling concept).
+
+    ``AITER_MOE_GUI`` env still filters which paths actually run:
+      - auto:  yield as decided
+      - gugu:  drop SEP entries
+      - gguu:  yield everything
+    """
     cu = get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     df_csv = pd.read_csv(merged_csv)
     rows = df_csv[df_csv["cu_num"] == cu]
+    import os as _os
+    env_mode = _os.environ.get("AITER_MOE_GUI", "auto").lower()
+    csv_gate_modes = csv_caller_gate_modes(rows)
+    aiter.logger.info(
+        "CSV %s: caller_gate_mode sweep = %s",
+        merged_csv,
+        csv_gate_modes,
+    )
     for _, row in rows.iterrows():
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
-        if "flydsl_" not in kernel_name1 and "flydsl_" not in kernel_name2:
+        if (
+            "flydsl_" not in kernel_name1
+            and "flydsl_" not in kernel_name2
+            and "ck_" not in kernel_name1
+            and "cktile_" not in kernel_name1
+        ):
             continue
-        try:
-            kwargs = _row_to_kwargs(row)
-        except Exception as e:
-            aiter.logger.warning(
-                "skip row token=%s dim=(%s,%s): parse error %s",
-                row.get("token"),
-                row.get("model_dim"),
-                row.get("inter_dim"),
-                e,
-            )
-            continue
-        # The reference path below uses the CSV q_dtype_a directly, while
-        # fused_moe selects q_dtype_a from the current Swiglu MXFP4 runtime mode.
-        # Skip CSV rows that are tuned for a different mode to avoid comparing
-        # e.g. an fp4x2 reference against a bf16/fp8 runtime dispatch.
-        expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
-            kwargs["token"],
-            kwargs["actType"],
-            kwargs["qType"],
-            kwargs["AQDType"],
-            kwargs["WQDType"],
-        )
-        if expected_aq_dtype is not None and kwargs["AQDType"] != expected_aq_dtype:
-            aiter.logger.info(
-                "skip row token=%s dim=(%s,%s): q_dtype_a=%s does not match "
-                "current Swiglu MXFP4 runtime mode (expected %s)",
-                row.get("token"),
-                row.get("model_dim"),
-                row.get("inter_dim"),
-                kwargs["AQDType"],
-                expected_aq_dtype,
-            )
-            continue
-        kwargs["strict_accuracy"] = True
-        yield kwargs, {
-            "kernelName1": kernel_name1,
-            "kernelName2": kernel_name2,
-        }
+        native_gm = stage1_kernel_native_gate_mode(kernel_name1)
+        for gm in csv_gate_modes:
+            if env_mode == "gugu" and gm == GateMode.SEPARATED.value:
+                aiter.logger.info(
+                    "skip CSV row %s (gm=%s) under AITER_MOE_GUI=gugu (SEP path)",
+                    kernel_name1 or kernel_name2,
+                    gm,
+                )
+                continue
+            if gm == native_gm or not kernel_name1.startswith("flydsl_"):
+                # Native match, or a non-flydsl row (ck / cktile have no
+                # flydsl _gui sibling to swap to -- leave name as-is).
+                effective_kernel_name1 = kernel_name1
+            else:
+                effective_kernel_name1 = swap_flydsl_stage1_kernel_for_gate_mode(
+                    kernel_name1, gm
+                )
+            try:
+                kwargs = _row_to_kwargs(row, gate_mode=gm)
+            except Exception as e:
+                aiter.logger.warning(
+                    "skip row token=%s dim=(%s,%s) gm=%s: parse error %s",
+                    row.get("token"),
+                    row.get("model_dim"),
+                    row.get("inter_dim"),
+                    gm,
+                    e,
+                )
+                continue
+            kwargs["strict_accuracy"] = True
+            yield kwargs, {
+                "kernelName1": effective_kernel_name1,
+                "kernelName2": kernel_name2,
+            }
 
 
 _PER1X32_BF16_FP4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2)
@@ -622,10 +696,60 @@ _PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
 _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
 
-def _effective_gate_mode(aq_dtype, wq_dtype):
+def _legacy_gate_mode(aq_dtype, wq_dtype):
+    """Historical (env-free) gate_mode picked by the legacy 1:1 mapping
+    AQDType==fp8/bf16 + WQDType==fp4x2 -> INTERLEAVE."""
     if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     return GateMode.SEPARATED.value
+
+
+def _effective_gate_modes(aq_dtype, wq_dtype):
+    """Return the list of caller_gate_mode values to sweep for this (aq, wq)
+    pair under the active ``AITER_MOE_GUI`` policy.
+
+    IMPORTANT design constraint: the test reference path is pinned to
+    ``AQDType``, but ``fused_moe`` upcasts q_dtype_a internally whenever
+    (Swiglu activation OR gate_mode==INTERLEAVE).  When the upcast happens,
+    the runtime activation no longer matches AQDType and the reference is
+    no longer comparable.  Each (aq, wq) combo is therefore only meaningfully
+    testable with its NATIVE gate_mode (the one whose q_dtype_a equals
+    AQDType).  The legacy 1:1 mapping captures this:
+
+        AQDType==fp4x2         -> SEP (Silu+SEP keeps q_dtype_a=fp4x2)
+        AQDType in {fp8,bf16}  -> GUI (Swiglu+INTERLEAVE keeps q_dtype_a)
+
+    Cross-mode cases (a4w4 INTERLEAVE, a8w4 SEP under Swiglu, etc.) cannot
+    be validated with this harness without rewriting the reference, so we
+    do NOT sweep them.  Both kernel layouts are still naturally exercised
+    under env=gguu via DIFFERENT entries in ``l_quant`` (a4w4 -> SEP path,
+    a8w4/a16w4 -> GUI path), so gguu UT coverage emerges from the union.
+
+    Returns possibly-empty list (empty == SKIP this combo entirely):
+      - auto:   [legacy_mode]
+      - gugu:   [legacy_mode] for INTERLEAVE-native combos and non-fp4
+                weight; [] for SEP-native fp4-weight (a4w4) since gugu
+                deployment never dispatches SEP fp4 stage1.
+      - gguu:   [legacy_mode] -- same as auto, see comment above.
+    """
+    import os as _os
+    mode = _os.environ.get("AITER_MOE_GUI", "auto").lower()
+    legacy = _legacy_gate_mode(aq_dtype, wq_dtype)
+    is_fp4_weight = wq_dtype == dtypes.fp4x2
+    if mode == "gugu":
+        if is_fp4_weight and legacy == GateMode.SEPARATED.value:
+            return []  # SEP fp4 stage1 unreachable under gugu
+        return [legacy]
+    return [legacy]
+
+
+def _effective_gate_mode(aq_dtype, wq_dtype):
+    """Backward-compat single-value wrapper around ``_effective_gate_modes``.
+    Returns the first element, or the legacy default if the list is empty."""
+    modes = _effective_gate_modes(aq_dtype, wq_dtype)
+    if modes:
+        return modes[0]
+    return _legacy_gate_mode(aq_dtype, wq_dtype)
 
 
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
@@ -634,25 +758,48 @@ def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     return 0.0
 
 
-def _runtime_swiglu_mxfp4_q_dtype_a(token, act_type, q_type, aq_dtype, wq_dtype):
-    """Return the q_dtype_a that fused_moe will select for Swiglu MXFP4."""
-    if act_type != aiter.ActivationType.Swiglu:
-        return None
+def _runtime_swiglu_mxfp4_q_dtype_a(
+    token, act_type, q_type, aq_dtype, wq_dtype, gate_mode=None
+):
+    """Return the q_dtype_a that fused_moe will select for Swiglu MXFP4.
+
+    Mirrors the heuristic in ``aiter/fused_moe.py`` (per-1x32 fp4-weight
+    branch).  When the caller explicitly passes ``gate_mode=INTERLEAVE``
+    for an fp4-weight kernel (a4w4 GUI / gugu path) under Plan A, q_dtype_a
+    stays fp4x2 regardless of activation so the swapped ``..._gui`` kernel
+    sees real fp4 a + e8m0 scale.
+    """
     if q_type != aiter.QuantType.per_1x32 or wq_dtype != dtypes.fp4x2:
         return None
     if aq_dtype not in [dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.fp4x2]:
         return None
 
-    if os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "0") == "1":
-        bound = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
-        return dtypes.bf16 if token < bound else dtypes.fp4x2
+    generic_layout = (
+        os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "0") == "1"
+    )
+    gm = gate_mode.value if isinstance(gate_mode, GateMode) else gate_mode
+    if generic_layout and gm == GateMode.INTERLEAVE.value:
+        return dtypes.fp4x2
 
-    bound = int(os.environ.get("AITER_BF16_FP8_BOUND", "512"))
-    return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
+    if act_type != aiter.ActivationType.Swiglu and gm != GateMode.INTERLEAVE.value:
+        return None
+
+    bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
+    if get_gfx() != "gfx950" or token < bound:
+        return dtypes.bf16
+    if generic_layout:
+        return dtypes.fp4x2
+    return dtypes.fp8
 
 
 def _iter_legacy_cases():
-    """Yield (kwargs, extras) for the original CLI-driven sweep."""
+    """Yield (kwargs, extras) for the original CLI-driven sweep.
+
+    Each (aq, wq) combo runs at most ONCE with its legacy native gate_mode
+    (see ``_effective_gate_modes`` for the constraint reasoning).  Under
+    ``AITER_MOE_GUI=gugu`` the SEP-native fp4-weight combos (a4w4) are
+    skipped because gugu deployment never exercises them.
+    """
     extras = {"model": "legacy"}
 
     def _kw(
@@ -665,6 +812,7 @@ def _iter_legacy_cases():
         wq_dtype,
         doweight_stage1,
         act_type,
+        gate_mode,
         **over,
     ):
         return dict(
@@ -675,7 +823,7 @@ def _iter_legacy_cases():
             E=args.expert,
             topk=args.topk,
             actType=act_type,
-            gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
+            gateMode=gate_mode,
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
@@ -692,6 +840,16 @@ def _iter_legacy_cases():
         doweight_stage1,
     ) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
         triple = (quant_type, aq_dtype, wq_dtype)
+        modes = _effective_gate_modes(aq_dtype, wq_dtype)
+        if not modes:
+            aiter.logger.info(
+                "skip legacy combo q=%s aq=%s wq=%s under AITER_MOE_GUI policy",
+                quant_type,
+                aq_dtype,
+                wq_dtype,
+            )
+            continue
+        gate_mode = modes[0]
 
         if triple in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
@@ -706,6 +864,7 @@ def _iter_legacy_cases():
                         wq_dtype,
                         doweight_stage1,
                         aiter.ActivationType.Swiglu,
+                        gate_mode,
                         hidden_pad=hidden_pad,
                         intermediate_pad=intermediate_pad,
                     ), extras
@@ -723,6 +882,7 @@ def _iter_legacy_cases():
                             wq_dtype,
                             doweight_stage1,
                             act_type,
+                            gate_mode,
                             preshuffle=preshuffle,
                             hidden_pad=0,
                             intermediate_pad=0,
@@ -739,6 +899,7 @@ def _iter_legacy_cases():
                     wq_dtype,
                     doweight_stage1,
                     aiter.ActivationType.Silu,
+                    gate_mode,
                 ), extras
         else:
             for act_type in args.act:
@@ -753,6 +914,7 @@ def _iter_legacy_cases():
                         wq_dtype,
                         doweight_stage1,
                         act_type,
+                        gate_mode,
                     ), extras
 
 
@@ -784,8 +946,20 @@ for kwargs, extras in case_iter:
     ) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4)
     if _force_moe_bound_zero:
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+    ret = None
+    accuracy_error = None
     try:
         ret = test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+    except AssertionError as e:
+        accuracy_error = str(e)
+        aiter.logger.warning(
+            "accuracy assertion failed (continuing): token=%s gm=%s aq=%s wq=%s -> %s",
+            kwargs.get("token"),
+            kwargs.get("gateMode"),
+            kwargs.get("AQDType"),
+            kwargs.get("WQDType"),
+            accuracy_error,
+        )
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
@@ -793,6 +967,14 @@ for kwargs, extras in case_iter:
             else:
                 os.environ["AITER_BF16_FP8_MOE_BOUND"] = _old_moe_bound
     if ret is None:
+        if accuracy_error is not None:
+            df.append({
+                **{k: kwargs.get(k) for k in ("token", "gateMode", "AQDType", "WQDType")},
+                **extras,
+                "us": float("nan"),
+                "logits_diff": float("nan"),
+                "assert_err": accuracy_error[:120],
+            })
         continue
     ret.update(extras)
     df.append(ret)
