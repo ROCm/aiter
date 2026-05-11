@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fused SwiGLU clamp + SiLU * up + optional token weights + per-row FP8 group quant (128).
+"""Fused SwiGLU clamp + SiLU * up + optional token weights + optional per-row FP8 group quant (128).
 
 Each program handles one row (token). ``inp`` is ``[M, 2 * N]`` with gate in the first
 ``N`` columns and up in the second ``N`` (same layout as ``torch.chunk(2, dim=-1)``).
 Gate clamp matches DeepSeek-V4 reference: ``clamp(gate, max=limit)`` only; up uses
-``clamp(up, min=-limit, max=limit)``.
+``clamp(up, min=-limit, max=limit)``. When ``HAS_QUANT`` is False the result is written
+directly to ``out`` in its native dtype and no scales are produced.
 """
 
 import triton
@@ -17,30 +18,31 @@ from aiter.ops.triton._triton_kernels.activation import _apply_activation_from_s
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-_fused_clamp_silu_mul_fp8_group_quant_repr = make_kernel_repr(
-    "_fused_clamp_silu_mul_fp8_group_quant_kernel",
+_fused_clamp_silu_mul_repr = make_kernel_repr(
+    "_fused_clamp_silu_mul_kernel",
     [
         "BLOCK_SIZE_N",
         "QUANT_BLOCK_SIZE",
         "HAVE_WEIGHTS",
         "WEIGHT_BROADCAST",
         "HAVE_SWIGLU_CLAMP",
+        "HAS_QUANT",
     ],
 )
 
 
-@triton.jit(repr=_fused_clamp_silu_mul_fp8_group_quant_repr)
-def _fused_clamp_silu_mul_fp8_group_quant_kernel(
+@triton.jit(repr=_fused_clamp_silu_mul_repr)
+def _fused_clamp_silu_mul_kernel(
     inp_ptr,
-    out_fp8_ptr,
+    out_ptr,
     scale_ptr,
     weights_ptr,
     M,
     n_half,
     inp_stride_m,
     inp_stride_n,
-    out_fp8_stride_m,
-    out_fp8_stride_n,
+    out_stride_m,
+    out_stride_n,
     scale_stride_m,
     scale_stride_n,
     weights_stride_m,
@@ -53,6 +55,7 @@ def _fused_clamp_silu_mul_fp8_group_quant_kernel(
     HAVE_WEIGHTS: tl.constexpr,
     WEIGHT_BROADCAST: tl.constexpr,
     HAVE_SWIGLU_CLAMP: tl.constexpr,
+    HAS_QUANT: tl.constexpr,
     ACTIVATION: tl.constexpr,
 ):
     m_pid = tl.program_id(0)
@@ -91,23 +94,30 @@ def _fused_clamp_silu_mul_fp8_group_quant_kernel(
             ).to(tl.float32)
             out = out * w
 
-    out_fp8, block_scales = _fp8_quant_op(
-        out, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
-    )
-    out_fp8 = tl.ravel(out_fp8)
-    block_scales = tl.ravel(block_scales)
+    if HAS_QUANT:
+        out_q, block_scales = _fp8_quant_op(
+            out, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
+        )
+        out_q = tl.ravel(out_q)
+        block_scales = tl.ravel(block_scales)
 
-    tl.store(
-        out_fp8_ptr + m_pid * out_fp8_stride_m + n_offs * out_fp8_stride_n,
-        out_fp8.to(out_fp8_ptr.dtype.element_ty),
-        mask=mask,
-    )
+        tl.store(
+            out_ptr + m_pid * out_stride_m + n_offs * out_stride_n,
+            out_q.to(out_ptr.dtype.element_ty),
+            mask=mask,
+        )
 
-    num_bs = tl.cdiv(n_half, QUANT_BLOCK_SIZE)
-    NUM_QB: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
-    g_offs = tl.arange(0, NUM_QB)
-    tl.store(
-        scale_ptr + m_pid * scale_stride_m + g_offs * scale_stride_n,
-        block_scales.to(scale_ptr.dtype.element_ty),
-        mask=g_offs < num_bs,
-    )
+        num_bs = tl.cdiv(n_half, QUANT_BLOCK_SIZE)
+        NUM_QB: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
+        g_offs = tl.arange(0, NUM_QB)
+        tl.store(
+            scale_ptr + m_pid * scale_stride_m + g_offs * scale_stride_n,
+            block_scales.to(scale_ptr.dtype.element_ty),
+            mask=g_offs < num_bs,
+        )
+    else:
+        tl.store(
+            out_ptr + m_pid * out_stride_m + n_offs * out_stride_n,
+            out.to(out_ptr.dtype.element_ty),
+            mask=mask,
+        )
