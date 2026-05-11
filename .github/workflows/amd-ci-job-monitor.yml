@@ -227,4 +227,5 @@ jobs:
         with:
           name: runner-fleet-report
           path: runner-fleet-report.md
+          if-no-files-found: error
           retention-days: 7
