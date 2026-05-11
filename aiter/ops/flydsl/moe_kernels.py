@@ -301,10 +301,12 @@ def compile_flydsl_moe_stage1(
     enable_bias: bool = False,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    swiglu_limit: float = 0.0,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
-        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1, GateMode
+        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
+        from .moe_common import GateMode
 
         return compile_mixed_moe_gemm1(
             model_dim=model_dim,
@@ -330,6 +332,7 @@ def compile_flydsl_moe_stage1(
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
+            swiglu_limit=swiglu_limit,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -634,6 +637,7 @@ def _get_compiled_silu_fused(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
+    swiglu_limit: float = 0.0,
 ):
     """Compile and cache the fused gate activation + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
@@ -645,6 +649,7 @@ def _get_compiled_silu_fused(
         gui_layout,
         act=act,
         enable_bias=enable_bias,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -690,6 +695,7 @@ def flydsl_moe_stage1(
     topk_ids: Optional[torch.Tensor] = None,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    swiglu_limit: float = 0.0,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -875,6 +881,7 @@ def flydsl_moe_stage1(
         enable_bias=(kernel_bias is not None),
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
+        swiglu_limit=swiglu_limit,
     )
     _run_compiled(exe, args)
 
@@ -907,6 +914,7 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
+            swiglu_limit=swiglu_limit,
         )
         _run_compiled(
             _silu_fused_k,
@@ -931,6 +939,7 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
+            swiglu_limit=swiglu_limit,
         )
         _run_compiled(
             _silu_fused_k,
@@ -953,6 +962,7 @@ def flydsl_moe_stage1(
             topk,
             act=act,
             enable_bias=use_splitk_bias,
+            swiglu_limit=swiglu_limit,
         )
         _run_compiled(
             _silu_fused_k,

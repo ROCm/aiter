@@ -144,7 +144,6 @@ jobs:
             git submodule update --init --recursive
             pip install -e .
             # ./.github/scripts/install_triton.sh
-            pip show amd-triton || true
             pip show triton || true
             pip show amd-aiter || pip show aiter
           "

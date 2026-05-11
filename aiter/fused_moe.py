@@ -17,12 +17,14 @@ from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.flydsl.moe_common import GateMode
 from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 
 BLOCK_SIZE_M = 32
 
 # Default to Opus unless CK sorting is explicitly requested.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
+_ACT_TYPE_DISABLED_KEY = "__ignore__"
 _USE_GENERIC_SWIGLU_MXFP4_LAYOUT = (
     os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "0") == "1"
 )
@@ -170,6 +172,8 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
+    swiglu_limit=0.0,
+    gate_mode: Optional[str] = GateMode.SEPARATED.value,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -195,6 +199,8 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        swiglu_limit=swiglu_limit,
+        gate_mode=gate_mode,
     )
 
 
@@ -222,6 +228,8 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    swiglu_limit: float = 0.0,
+    gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -256,10 +264,13 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    swiglu_limit: float = 0.0,
+    gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
+    gate_mode = GateMode(gate_mode)
     if block_size_M == -1:
         block_size_M = None
     """user API"""
@@ -292,14 +303,14 @@ def fused_moe_(
         and a1_scale is not None
     ):
         q_dtype_a = dtypes.fp8
-    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_BOUND", "512"))
+    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
     if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
     elif quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu and _USE_GENERIC_SWIGLU_MXFP4_LAYOUT:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
-        elif activation == ActivationType.Swiglu:
+        elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
             else:
@@ -397,6 +408,8 @@ def fused_moe_(
             bias2=bias2,
             topk_ids=topk_ids,
             topk_weights=topk_weight,
+            # only for flydsl dsv4
+            swiglu_limit=swiglu_limit,
         )
 
 
@@ -647,13 +660,16 @@ def nextPow2(n):
     return 1 << (n - 1).bit_length()
 
 
+_PADDED_M_TIERS = [32768, 131072]
+
+
 def get_padded_M(M):
-    padded_m = M
-    if M < 32768:
-        padded_m = nextPow2(padded_m)
-    else:
-        padded_m = 32768
-    return padded_m
+    if M < _PADDED_M_TIERS[0]:
+        return nextPow2(M)
+    for tier in reversed(_PADDED_M_TIERS):
+        if M >= tier:
+            return tier
+    return _PADDED_M_TIERS[0]
 
 
 @dataclass
@@ -669,12 +685,8 @@ class MOEMetadata:
     stage2_has_bias: bool = False
 
 
-def _needs_swiglu_bias_support(dtype, quant_type, activation):
-    return (
-        dtype in [dtypes.bf16, dtypes.fp16]
-        and quant_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
-    )
+def _needs_swiglu_bias_support(dtype, quant_type):
+    return dtype in [dtypes.bf16, dtypes.fp16] and quant_type == QuantType.per_1x32
 
 
 def _normalize_bias_for_kernel(
@@ -705,6 +717,7 @@ def _flydsl_stage1_wrapper(
     out_scale_sorted=None,
     bias1=None,
     topk_ids=None,
+    swiglu_limit: float = 0.0,
     **_kwargs,
 ):
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
@@ -739,6 +752,7 @@ def _flydsl_stage1_wrapper(
         topk_ids=topk_ids,
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -828,8 +842,32 @@ def get_2stage_cfgs(
         df = pd.read_csv(tune_file)
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
-        df = df.set_index(_INDEX_COLS).to_dict("index")
-        return df
+
+        # Primary dict: keep original act_type for exact-match lookup.
+        df_primary = df.copy()
+        dup_mask = df_primary.duplicated(subset=_INDEX_COLS, keep="first")
+        if dup_mask.any():
+            logger.warning(
+                f"[fused_moe] duplicate tuned rows (primary) in {tune_file}; "
+                f"keeping first match for {int(dup_mask.sum())} rows"
+            )
+            df_primary = df_primary.loc[~dup_mask]
+        primary = df_primary.set_index(_INDEX_COLS).to_dict("index")
+
+        # Fallback dict: disable act_type so any activation can match.
+        df_fallback = df.copy()
+        if "act_type" in df_fallback.columns:
+            df_fallback["act_type"] = _ACT_TYPE_DISABLED_KEY
+        dup_mask = df_fallback.duplicated(subset=_INDEX_COLS, keep="first")
+        if dup_mask.any():
+            logger.warning(
+                f"[fused_moe] duplicate tuned rows after disabling act_type in {tune_file}; "
+                f"keeping first match for {int(dup_mask.sum())} rows"
+            )
+            df_fallback = df_fallback.loc[~dup_mask]
+        fallback = df_fallback.set_index(_INDEX_COLS).to_dict("index")
+
+        return primary, fallback
 
     _flydsl_fallback_cache = {}
 
@@ -846,10 +884,19 @@ def get_2stage_cfgs(
         if "_tag" not in df.columns:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
+        if "act_type" in df.columns:
+            df["act_type"] = _ACT_TYPE_DISABLED_KEY
         fb_df = df[df["_tag"] == "flydsl_fallback"]
         if fb_df.empty:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
+        dup_mask = fb_df.duplicated(subset=_INDEX_COLS, keep="first")
+        if dup_mask.any():
+            logger.warning(
+                f"[fused_moe] duplicate fallback rows after disabling act_type in {tune_file}; "
+                f"keeping first match for {int(dup_mask.sum())} rows"
+            )
+            fb_df = fb_df.loc[~dup_mask]
         result = fb_df.set_index(_INDEX_COLS).to_dict("index")
         _flydsl_fallback_cache[tune_file] = result
         return result
@@ -869,7 +916,22 @@ def get_2stage_cfgs(
         inter_dim,
         expert,
         topk,
-        str(activation),
+        activation,
+        str(dtype),
+        str(q_dtype_a),
+        str(q_dtype_w),
+        str(q_type),
+        use_g1u1,
+        doweight_stage1,
+    )
+    keys_disabled = (
+        cu_num,
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        _ACT_TYPE_DISABLED_KEY,
         str(dtype),
         str(q_dtype_a),
         str(q_dtype_w),
@@ -899,12 +961,32 @@ def get_2stage_cfgs(
         )
         logger.info("\033[0m")
 
-    cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
+    def _lookup_cfg(c2s):
+        if not c2s:
+            return None
+        primary, fallback = c2s
+        result = primary.get(keys, None)
+        if result is None:
+            result = fallback.get(keys_disabled, None)
+        # Tier fallback: if current tier not found, try smaller tiers in descending order
+        if result is None and token > _PADDED_M_TIERS[0]:
+            tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
+            for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
+                keys_fb = (keys[0], fallback_tier) + keys[2:]
+                keys_fb_disabled = (keys_disabled[0], fallback_tier) + keys_disabled[2:]
+                result = primary.get(keys_fb, None)
+                if result is None:
+                    result = fallback.get(keys_fb_disabled, None)
+                if result is not None:
+                    break
+        return result
+
+    cfg = _lookup_cfg(cfg_2stages)
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
-        cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
+        cfg = _lookup_cfg(cfg_2stages)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
     if cfg is not None and not is_flydsl_available():
@@ -912,7 +994,9 @@ def get_2stage_cfgs(
         kn2 = str(cfg.get("kernelName2", ""))
         if kn1.startswith("flydsl_") or kn2.startswith("flydsl_"):
             fallback_cfgs = get_flydsl_fallback_cfgs(tune_file)
-            fallback = fallback_cfgs.get(keys)
+            fallback = fallback_cfgs.get(keys, None) or fallback_cfgs.get(
+                keys_disabled, None
+            )
             if fallback is not None:
                 cfg = fallback
                 logger.info(
@@ -1030,8 +1114,7 @@ def get_2stage_cfgs(
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
         enable_bias = (
-            _needs_swiglu_bias_support(dtype, q_type, activation)
-            and q_dtype_w == dtypes.fp4x2
+            _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
         )
         _s1_fp4q = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
         if is_flydsl1:
@@ -1208,7 +1291,7 @@ def get_2stage_cfgs(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
             f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
         )
-        enable_bias = _needs_swiglu_bias_support(dtype, q_type, activation)
+        enable_bias = _needs_swiglu_bias_support(dtype, q_type)
         return MOEMetadata(
             functools.partial(
                 _flydsl_stage1_wrapper,
@@ -1365,6 +1448,7 @@ def fused_moe_2stages(
     bias2=None,
     topk_ids=None,
     topk_weights=None,
+    swiglu_limit=0.0,
 ):
     quant_func = get_quant(quant_type)
     token_num, _ = hidden_states.shape
@@ -1406,13 +1490,13 @@ def fused_moe_2stages(
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        and activation == aiter.ActivationType.Swiglu
+        # and activation == aiter.ActivationType.Swiglu
     ):
         a1 = hidden_states.to(dtypes.fp8)
         M = sorted_ids.shape[0]
         N = a1.shape[-1]
         if metadata.fuse_quant == "fp8":
-            a1_scale = torch.empty([1], dtype=dtypes.fp8_e8m0, device=a1.device)
+            a1_scale = torch.empty(0, dtype=torch.uint8, device=a1.device)
         else:
             a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
 
@@ -1472,7 +1556,7 @@ def fused_moe_2stages(
         )
     extra_stage1_args = {}
     extra_stage2_args = {}
-    need_bias_support = _needs_swiglu_bias_support(dtype, quant_type, activation)
+    need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:
@@ -1481,6 +1565,8 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
+    if metadata.stage1.func is _flydsl_stage1_wrapper:
+        extra_stage1_args["swiglu_limit"] = swiglu_limit
     a2 = metadata.stage1(
         a1,
         w1,
@@ -1526,10 +1612,23 @@ def fused_moe_2stages(
         and dtype in [dtypes.bf16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        and activation == aiter.ActivationType.Swiglu
     ):
-        a2 = a2.to(dtypes.fp8)
-        a2_scale = a1_scale
+        if activation == ActivationType.Silu and swiglu_limit == 0.0:
+            from aiter.ops.triton.quant.fused_mxfp4_quant import fused_quant_fp8_sort
+
+            a2 = a2.view(-1, inter_dim)
+            a2, a2_scale = fused_quant_fp8_sort(
+                a2,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                block_size=32,
+                quant_dtype=dtypes.fp8,
+            )
+            a2 = a2.view(token_num, topk, -1)
+        else:
+            a2 = a2.to(dtypes.fp8)
+            a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
         a2_scale = None
@@ -1725,6 +1824,8 @@ def torch_moe(
 
 # temp workaround for swiglu
 def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0):
+    if limit == 0.0:
+        limit = 7.0
     # Clamp the input values
     x_glu = x_glu.clamp(min=None, max=limit)
     x_linear = x_linear.clamp(min=-limit, max=limit)
@@ -1747,6 +1848,7 @@ def torch_moe_stage1(
     w1_scale=None,  # [expert, inter_dim, 1]
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
+    swiglu_limit=0.0,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
@@ -1848,16 +1950,11 @@ def torch_moe_stage1(
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)
         if use_swiglu:
-            if (
-                quant_type == QuantType.per_1x32
-                and w1_scale is not None
-                and w1_scale.dtype == dtypes.bf16
-            ):
-                # a16wi4: FlyDSL int4_bf16 kernel uses standard silu(gate)*up
-                out = torch.nn.functional.silu(gate) * up
-            else:
-                out = swiglu(gate, up)
+            out = swiglu(gate, up, limit=swiglu_limit)
         else:
+            if swiglu_limit != 0:
+                gate = gate.clamp(min=None, max=swiglu_limit)
+                up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
             out = torch_act(gate) * up
     else:
         out = torch_act(out)

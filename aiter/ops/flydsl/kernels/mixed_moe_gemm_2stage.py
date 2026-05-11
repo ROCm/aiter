@@ -44,25 +44,10 @@ from .mfma_epilogues import c_shuffle_epilog
 from .layout_utils import crd2idx, idx2crd, get as layout_get
 
 import functools
-from enum import Enum
 
-
-class GateMode(str, Enum):
-    """Gate/Up computation strategy for stage1 GEMM.
-
-    SEPARATED:      Two separate B-tile streams (gate + up), default mode.
-    MOCK_GATE_ONLY: Single B-tile stream over full [0, 2*inter_dim), simulates
-                    gate-only by doubling grid X on top of SEPARATED layout.
-                    Requires split-K (k_batch>1).  NOT true gate-only.
-    GATE_ONLY:      Reserved for future true gate-only implementation.
-    INTERLEAVE:     Weight rows interleave gate/up (gate[0], up[0], gate[1], ...).
-                    pack_N=2 routes even/odd N subtiles.  NOT tied to split-K.
-    """
-
-    SEPARATED = "separated"
-    MOCK_GATE_ONLY = "mock_gate_only"
-    GATE_ONLY = "gate_only"
-    INTERLEAVE = "interleave"
+from aiter.ops.flydsl.moe_common import (
+    GateMode,
+)  # noqa: F401  re-exported for back-compat
 
 
 @contextmanager
@@ -130,6 +115,7 @@ def compile_mixed_moe_gemm1(
     gate_mode: GateMode = GateMode.SEPARATED,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    swiglu_limit: float = 0.0,
 ):
     """Compile stage1 kernel (gate+up with silu/swiglu).
 
@@ -1946,8 +1932,14 @@ def compile_mixed_moe_gemm1(
                     return g * sig
 
                 def _silu_mul_vec4(gate_v4, up_v4):
-                    """Element-wise silu(gate) * up on vec4_f32."""
+                    """Element-wise silu(gate) * up on vec4_f32.
+                    When swiglu_limit != 0, clamp gate <= limit and
+                    -limit <= up <= limit before applying silu(gate) * up.
+                    """
                     result_elems = []
+                    if const_expr(swiglu_limit != 0):
+                        _limit = arith.constant(float(swiglu_limit), type=f32)
+                        _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
                     for ei in range_constexpr(4):
                         g = vector.extract(
                             gate_v4, static_position=[ei], dynamic_position=[]
@@ -1955,20 +1947,30 @@ def compile_mixed_moe_gemm1(
                         u = vector.extract(
                             up_v4, static_position=[ei], dynamic_position=[]
                         )
+                        if const_expr(swiglu_limit != 0):
+                            g = arith.minimumf(g, _limit)
+                            u = arith.minimumf(u, _limit)
+                            u = arith.maximumf(u, _neg_limit)
                         result_elems.append(_silu_elem(g) * u)
                     return vector.from_elements(vec4_f32, result_elems)
 
                 def _swiglu_mul_vec4(gate_v4, up_v4):
                     """Element-wise swiglu(gate, up) on vec4_f32.
                     swiglu(g, u) = g * sigmoid(alpha * g) * (u + 1)
-                    with clamping: gate <= limit, -limit <= up <= limit.
+                    When swiglu_limit != 0, clamp gate <= limit and
+                    -limit <= up <= limit before the activation.
                     """
                     result_elems = []
                     _alpha = arith.constant(1.702, type=f32)
-                    _limit = arith.constant(7.0, type=f32)
-                    _neg_limit = arith.constant(-7.0, type=f32)
                     _one = arith.constant(1.0, type=f32)
                     _neg_log2e = arith.constant(-1.4426950408889634, type=f32)
+                    if const_expr(swiglu_limit != 0):
+                        _limit = arith.constant(float(swiglu_limit), type=f32)
+                        _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
+                    else:
+                        _limit = arith.constant(float(7.0), type=f32)
+                        _neg_limit = arith.constant(-float(7.0), type=f32)
+
                     for ei in range_constexpr(4):
                         g = vector.extract(
                             gate_v4, static_position=[ei], dynamic_position=[]
