@@ -950,7 +950,6 @@ def flydsl_preshuffle_gemm_a8(
     use_cshuffle_epilog: int = 0,
     use_async_copy: int = 0,
     waves_per_eu: int = 0,
-    xcd_swizzle: int = 0,
 ) -> Tensor:
     """Compile (cached via lru_cache) and run a FlyDSL preshuffle GEMM kernel."""
     compile_fn = _get_compile_fn()
@@ -1002,17 +1001,12 @@ def flydsl_preshuffle_gemm_a8(
         use_cshuffle_epilog=bool(use_cshuffle_epilog),
         use_async_copy=bool(use_async_copy),
         waves_per_eu=wpe,
-        xcd_swizzle=int(xcd_swizzle),
     )
 
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
     out_contig = Out.contiguous()
-    # FlyDSL's preshuffle kernel requires an arg_bias slot (used only when
-    # epilogue != "none"). Pass an empty tensor as a placeholder for the
-    # default epilogue="none" path.
-    _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
     _run_compiled(
         exe,
         out_contig.view(-1),
@@ -1020,7 +1014,6 @@ def flydsl_preshuffle_gemm_a8(
         _as_i8(WQ.contiguous()).view(-1),
         x_scale.contiguous().view(-1),
         w_scale.contiguous().view(-1),
-        _dummy_bias,
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),
