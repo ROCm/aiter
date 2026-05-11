@@ -103,20 +103,20 @@ def gemm_a8w8_bpreshuffle_cktile(
 
 
 def _parse_flydsl_kernel_name(kernel_name: str):
-    """Parse tile config from flydsl kernelName.
-    Returns ``(tile_m, tile_n, tile_k, lds_stage, cshuffle, async_copy,
-    waves_per_eu, xcd_swizzle)`` or None on parse failure.
+    """Parse tile config from flydsl kernelName, e.g.
+    'flydsl_bpreshuflle_128x64x256_F8_F8_B16_2x0x1x1_default'
+    -> (tile_m=128, tile_n=64, tile_k=256, lds_stage=2, cshuffle=0, async_copy=1, wpe=1)
+    Returns None on parse failure.
     """
     import re
 
     m = re.match(
-        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_"
-        r"(\d+)x(\d+)x(\d+)x(\d+)x(\d+)",
+        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)x(\d+)x(\d+)",
         kernel_name,
     )
     if m is None:
         return None
-    return tuple(int(m.group(i)) for i in range(1, 9))
+    return tuple(int(m.group(i)) for i in range(1, 8))
 
 
 def gemm_a8w8_bpreshuffle_flydsl(
@@ -133,7 +133,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
     parsed = _parse_flydsl_kernel_name(str(kernel_name))
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
-    tm, tn, tk, lds, csh, acp, wpe, xcd = parsed
+    tm, tn, tk, lds, csh, acp, wpe = parsed
 
     flydsl_preshuffle_gemm_a8(
         XQ.contiguous(),
@@ -148,7 +148,6 @@ def gemm_a8w8_bpreshuffle_flydsl(
         csh,
         acp,
         wpe,
-        xcd,
     )
     return Out
 
