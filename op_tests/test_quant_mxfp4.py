@@ -8,9 +8,10 @@ import pandas as pd
 import torch
 
 import aiter
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.quant import quant_mxfp4_hip
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight, shuffle_weight_a16w4
-from aiter.test_common import benchmark, checkAllclose
+from aiter.test_common import benchmark
 
 torch.set_default_device("cuda")
 
@@ -35,7 +36,36 @@ def even_round_scale(max_abs: torch.Tensor) -> torch.Tensor:
     return max_abs_f32
 
 
-def fp32_to_e2m1(val: torch.Tensor) -> torch.Tensor:
+def fp32_to_e2m1_rne(val: torch.Tensor) -> torch.Tensor:
+    """E2M1 quantization with RNE (matches gfx950 HW builtin)."""
+    qx = val.float().contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    s = qx & 0x80000000
+    qx = qx ^ s
+
+    abs_f = qx.to(torch.int32).view(torch.float32)
+    sat = abs_f >= 6.0
+    denorm = (~sat) & (abs_f < 1.0)
+    normal = ~(sat | denorm)
+
+    DENORM_CONST = 149 << 23
+    d = abs_f + torch.tensor(DENORM_CONST, dtype=torch.int32, device=val.device).view(
+        torch.float32
+    )
+    d = (d.view(torch.int32).to(torch.int64) & 0xFFFFFFFF) - DENORM_CONST
+
+    mant_odd = (qx >> 22) & 1
+    VAL_TO_ADD = ((1 - 127) << 23) + (1 << 21) - 1
+    n = (qx + (VAL_TO_ADD & 0xFFFFFFFF) + mant_odd) >> 22
+
+    e2m1 = torch.full_like(qx, 7)
+    e2m1 = torch.where(normal, n, e2m1)
+    e2m1 = torch.where(denorm, d, e2m1)
+    e2m1 = e2m1 | (s >> 28)
+    return e2m1.to(torch.uint8)
+
+
+def fp32_to_e2m1_rha(val: torch.Tensor) -> torch.Tensor:
+    """E2M1 quantization with round-half-away (matches non-gfx950 SW fallback)."""
     a = val.abs()
     dev = val.device
     mag = torch.zeros_like(val, dtype=torch.uint8)
@@ -52,6 +82,9 @@ def fp32_to_e2m1(val: torch.Tensor) -> torch.Tensor:
         torch.tensor(0, dtype=torch.uint8, device=dev),
     )
     return sign | mag
+
+
+fp32_to_e2m1 = fp32_to_e2m1_rne if get_gfx() == "gfx950" else fp32_to_e2m1_rha
 
 
 def ref_quant_mxfp4_even_round(inp: torch.Tensor, group_size: int = 32):
@@ -95,25 +128,10 @@ def test_no_shuffle(m, n, float_dtype):
     py_packed, py_scale = ref_quant_mxfp4_even_round(inp.cpu(), group_size=32)
 
     scale_hip_u8 = scale_hip.view(torch.uint8).cpu()
-    checkAllclose(
-        scale_hip_u8.to(torch.float32),
-        py_scale.to(torch.float32),
-        rtol=0,
-        atol=0,
-        msg=f"scale ({m},{n})",
-    )
+    assert torch.equal(scale_hip_u8, py_scale), f"scale mismatch ({m},{n})"
 
     packed_hip_u8 = packed_hip.view(torch.uint8).cpu()
-    diff = (packed_hip_u8.to(torch.int16) - py_packed.to(torch.int16)).abs()
-    bad = (diff > 0) & (diff != 1) & (diff != 16) & (diff != 17)
-    checkAllclose(
-        packed_hip_u8.to(torch.float32),
-        py_packed.to(torch.float32),
-        rtol=0,
-        atol=17,
-        msg=f"packed ({m},{n})",
-    )
-    assert not bad.any(), f"Packed diff too large: max={diff.max().item()}"
+    assert torch.equal(packed_hip_u8, py_packed), f"packed mismatch ({m},{n})"
 
     return {"result": "PASS"}
 
@@ -141,13 +159,7 @@ def test_e8m0_shuffle(m, n, float_dtype):
 
     packed_out_u8 = packed_out.view(torch.uint8).cpu()
     expected_w_u8 = expected_w.view(torch.uint8).cpu()
-    checkAllclose(
-        packed_out_u8.to(torch.float32),
-        expected_w_u8.to(torch.float32),
-        rtol=0,
-        atol=0,
-        msg=f"e8m0 weight ({m},{n})",
-    )
+    assert torch.equal(packed_out_u8, expected_w_u8), f"e8m0 weight mismatch ({m},{n})"
 
     scale_ref_u8 = scale_ref.view(torch.uint8).flatten().cpu()
     scale_out_u8 = scale_out.view(torch.uint8).flatten().cpu()
@@ -190,23 +202,15 @@ def test_a16w4_shuffle(m, n, float_dtype, gate_up):
 
     packed_out_u8 = packed_out.view(torch.uint8).cpu()
     expected_w_u8 = expected_w.view(torch.uint8).cpu()
-    checkAllclose(
-        packed_out_u8.to(torch.float32),
-        expected_w_u8.to(torch.float32),
-        rtol=0,
-        atol=0,
-        msg=f"a16w4 weight (gate_up={gate_up})",
-    )
+    assert torch.equal(
+        packed_out_u8, expected_w_u8
+    ), f"a16w4 weight mismatch (gate_up={gate_up})"
 
     scale_out_u8 = scale_out.view(torch.uint8).cpu()
     expected_s_u8 = expected_s.view(torch.uint8).cpu()
-    checkAllclose(
-        scale_out_u8.to(torch.float32),
-        expected_s_u8.to(torch.float32),
-        rtol=0,
-        atol=0,
-        msg=f"a16w4 scale (gate_up={gate_up})",
-    )
+    assert torch.equal(
+        scale_out_u8, expected_s_u8
+    ), f"a16w4 scale mismatch (gate_up={gate_up})"
 
     return {"result": "PASS"}
 
@@ -294,6 +298,7 @@ if __name__ == "__main__":
     if args.edge or run_all:
         for dt in float_dtypes:
             test_edge_values(dt)
+        aiter.logger.info("test_edge_values: PASS")
 
     df = pd.DataFrame(df)
     if "gate_up" in df.columns:
