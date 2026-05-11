@@ -145,9 +145,13 @@ def flydsl_sage_quant(
 
     stream = torch.cuda.current_stream(q.device)
 
-    # Preprocessor: produces V_scale and K_mean in one launch.
-    # Replaces the torch ops that previously cost 60-150us of host overhead.
-    if smooth_k:
+    # Preprocessor gating: torch ops dominate small/medium shapes (60-150us)
+    # but are amortized at long S, where the FlyDSL preprocessor's extra
+    # launch + extra K read costs ~3-7%. Threshold picked from bench: at
+    # b * h_kv * kv_len >= 128k (e.g. B1 H8 S16384, B1 H24 S>=5400) the
+    # torch ops are <2% of total and the FlyDSL preprocessor regresses.
+    use_flydsl_preproc = (b * h_kv * kv_len) < 128 * 1024
+    if smooth_k and use_flydsl_preproc:
         preproc = _get_preprocess_kernel(
             head_dim=int(head_dim), num_kv_heads=int(h_kv),
         )
@@ -161,6 +165,12 @@ def flydsl_sage_quant(
             inv_fp8_max_bits,
             inv_seq_len_bits,
             stream=stream,
+        )
+    elif smooth_k:
+        # Long-S path: torch ops are cheap relative to the kernel runtime.
+        k_mean_for_kernel.copy_(k_for_kernel.mean(dim=1))
+        v_scale_for_kernel.copy_(
+            v_for_kernel.abs().amax(dim=1).to(torch.float32) / FP8_MAX
         )
     else:
         # No K-smoothing: zero K_mean, compute V_scale via torch (fallback).
