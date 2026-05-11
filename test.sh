@@ -7,4 +7,4 @@ export AITER_LOG_MORE=1
 #   imports tests.kernels.utils.fp4_utils from the FlyDSL repo.
 export PYTHONPATH=/workspace/ffm/triton/python:/workspace/ffm/FlyDSL:${PYTHONPATH}
 # Note: topk (-k) must be <= number of experts (-e), otherwise topk_softmax errors.
-ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py -t 1 -dim 256,256 -e 16 -k 4 -q 7 --no-flydsl-csv -hip 0,0
+ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py -t 8192 -dim 256,256 -e 4 -k 4 -q 4 --no-flydsl-csv -hip 0,0

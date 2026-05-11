@@ -121,12 +121,6 @@ def _compile_stage1_wmma_kernel_impl(
         i32_size_expert_ids_in: fx.Int32,
     ):
         _ = (arg_scale_x, arg_scale_w, arg_max_token_ids, i32_k_in)
-        llvm_dialect.inline_asm(
-            None, [],  # void result, no operands
-            "s_setreg_imm32_b32 hwreg(26, 4, 1), 1",
-            "",
-            has_side_effects=True,
-        )
 
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")  # inter tile
@@ -509,12 +503,14 @@ def _compile_stage2_wmma_kernel_impl(
         i32_size_expert_ids_in: fx.Int32,
     ):
         _ = (arg_scale_x, arg_scale_w, i32_k_in)
-        llvm_dialect.inline_asm(
-            None, [],  # void result, no operands
-            "s_setreg_imm32_b32 hwreg(26, 4, 1), 1",
-            "",
-            has_side_effects=True,
-        )
+        # ASTRewriter strips ``const_expr(...)`` from ``if`` tests, which would
+        # otherwise eliminate every reference to ``const_expr`` from the
+        # rewritten function body and shrink ``co_freevars`` by one — causing
+        # CPython to reject ``f.__code__ = new_f_code_o`` because the original
+        # ``__closure__`` length no longer matches. Keep one explicit reference
+        # so the rewritten code object's free-vars list still includes
+        # ``const_expr``.
+        _keep_const_expr_ref = const_expr  # noqa: F841
 
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")  # n tile
