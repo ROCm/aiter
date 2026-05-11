@@ -43,9 +43,29 @@ def ensure_spawn_method():
         pass
 
 
+def _testGraph_default():
+    """Default value for the ``testGraph`` knob.
+
+    On gfx1250 the eager-launch overhead from FlyDSL kernel wrappers
+    (Python -> ctypes -> hipModuleLaunchKernel per call) dominates the
+    per-iter time for the MoE GEMMs, so the HIP-graph path gives a
+    materially more useful number for tuning.  On every other arch the
+    historical default (False) avoids the cost of building the graph
+    when the caller didn't ask for it.
+    """
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+        return get_gfx() == "gfx1250"
+    except Exception:
+        return False
+
+
 def perftest(
-    num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
+    num_iters=101, num_warmup=2, testGraph=None, num_rotate_args=0, needTrace=False
 ):
+    if testGraph is None:
+        testGraph = _testGraph_default()
+
     def decorator(func):
         def wrapper(*args, **kwargs):
             num = num_rotate_args
@@ -199,11 +219,15 @@ def run_perftest(
     *args,
     num_iters=101,
     num_warmup=2,
-    testGraph=False,
+    testGraph=None,
     num_rotate_args=0,
     needTrace=False,
     **kwargs,
 ):
+    # Sentinel ``None`` -> arch-aware default (True on gfx1250, False elsewhere).
+    if testGraph is None:
+        testGraph = _testGraph_default()
+
     @perftest(
         num_iters=num_iters,
         num_warmup=num_warmup,
