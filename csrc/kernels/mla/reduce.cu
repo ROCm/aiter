@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <optional>
 #include <sstream>
-#include <torch/python.h>
-#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
 #include "custom_all_reduce.cuh"
 #include "mla.h"
 #include "opus/opus.hpp"
@@ -843,7 +842,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
     {                                                                                        \
         std::stringstream ss;                                                                \
         ss << "NUM_WG_PER_BH=" << (NUM_WG_PER_BH);                                           \
-        TORCH_CHECK(                                                                         \
+        AITER_CHECK(                                                                         \
             false, NAME " doesn't support the specified settings: ", ss.str().c_str(), "."); \
     }
 
@@ -863,7 +862,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
     {                                                                                        \
         std::stringstream ss;                                                                \
         ss << "#heads: " << (NUM_HEAD) << ", head dimension: " << (HEAD_DIM);                \
-        TORCH_CHECK(                                                                         \
+        AITER_CHECK(                                                                         \
             false, NAME " doesn't support the specified settings: ", ss.str().c_str(), "."); \
     }
 
@@ -893,27 +892,27 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
     LSE_TYPE, OUT_TYPE, NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, ...)                            \
     switch((LSE_TYPE))                                                                           \
     {                                                                                            \
-    case at::ScalarType::Float: {                                                                \
+    case AITER_DTYPE_fp32: {                                                                     \
         using lse_t = float;                                                                     \
         switch((OUT_TYPE))                                                                       \
         {                                                                                        \
-        case at::ScalarType::BFloat16: {                                                         \
+        case AITER_DTYPE_bf16: {                                                                 \
             using out_t = opus::bf16_t;                                                          \
             MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, __VA_ARGS__)              \
         }                                                                                        \
         break;                                                                                   \
-        case at::ScalarType::Half: {                                                             \
+        case AITER_DTYPE_fp16: {                                                                 \
             using out_t = opus::fp16_t;                                                          \
             MLA_REDUCE_ROUTER(NUM_HEAD, HEAD_DIM, NUM_WG_PER_BH, NAME, __VA_ARGS__)              \
         }                                                                                        \
         break;                                                                                   \
         default:                                                                                 \
-            TORCH_CHECK(false, NAME " doesn't support output type ", toString((OUT_TYPE)), "."); \
+            AITER_CHECK(false, NAME " doesn't support output type ", AiterDtype_to_str((OUT_TYPE)), "."); \
         }                                                                                        \
     }                                                                                            \
     break;                                                                                       \
     default:                                                                                     \
-        TORCH_CHECK(false, NAME " doesn't support output LSE type ", toString((LSE_TYPE)), "."); \
+        AITER_CHECK(false, NAME " doesn't support output LSE type ", AiterDtype_to_str((LSE_TYPE)), "."); \
     }
 
 template <typename Traits, typename lse_t, typename out_t>
@@ -936,8 +935,9 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
     {
         if(lds_size > (dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy))
         {
-            TORCH_WARN("kn_mla_reduce_v1: The number of splits is too high, adversely affecting "
-                       "occupancy.");
+            fprintf(stderr,
+                    "kn_mla_reduce_v1: The number of splits is too high, adversely affecting "
+                    "occupancy.\n");
         }
 
         const int32_t ps_grid_size = num_cu * Traits::kOccupancy * 2;
@@ -958,7 +958,7 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
     }
     else
     {
-        TORCH_CHECK(false,
+        AITER_CHECK(false,
                     "kn_mla_reduce_v1: The number of splits exceeds what kernel can handle.");
     }
 }
@@ -1022,23 +1022,22 @@ int32_t get_num_work_group_per_bh(const int32_t num_reduce_tile,
 }
 
 void mla_reduce_v1(
-    const torch::Tensor& partial_output, // contiguous [max(reduce_partial_map)+s, h, dv]
-    const torch::Tensor& partial_lse,    // contiguous [max(reduce_partial_map)+s, h]
-    const torch::Tensor& reduce_indptr,  // contiguous [#work + 1]
-    const std::optional<torch::Tensor>& reduce_final_map, // contiguous [#work, 2]
-    const torch::Tensor& reduce_partial_map,              // contiguous [reduce_indptr[-1]]
+    const aiter_tensor_t& partial_output, // contiguous [max(reduce_partial_map)+s, h, dv]
+    const aiter_tensor_t& partial_lse,    // contiguous [max(reduce_partial_map)+s, h]
+    const aiter_tensor_t& reduce_indptr,  // contiguous [#work + 1]
+    std::optional<aiter_tensor_t> reduce_final_map, // contiguous [#work, 2]
+    const aiter_tensor_t& reduce_partial_map,       // contiguous [reduce_indptr[-1]]
     const int32_t max_seqlen_q,
-    const int32_t num_kv_splits,
-    torch::Tensor& final_output,             //            [bs, h, dv]
-    std::optional<torch::Tensor>& final_lse) // contiguous [bs, h]
+    aiter_tensor_t& final_output,             //            [bs, h, dv]
+    std::optional<aiter_tensor_t> final_lse) // contiguous [bs, h]
 {
-    TORCH_CHECK((partial_output.scalar_type() == at::ScalarType::Float) &&
-                    (partial_lse.scalar_type() == at::ScalarType::Float),
+    AITER_CHECK((partial_output.dtype() == AITER_DTYPE_fp32) &&
+                    (partial_lse.dtype() == AITER_DTYPE_fp32),
                 __func__,
                 ": partial_out and partial_lse must be float32!");
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(final_output));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(final_output.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -1056,12 +1055,12 @@ void mla_reduce_v1(
     if(num_reduce_tile > 0)
     {
         MlaReduceKernelV1Params params = {};
-        params.p_reduce_indptr         = reduce_indptr.data_ptr<int32_t>();
+        params.p_reduce_indptr         = reinterpret_cast<int32_t*>(reduce_indptr.data_ptr());
         params.p_reduce_final_map =
             no_reduce_final_map
                 ? nullptr
                 : reinterpret_cast<const MlaPartialTileInfo*>(reduce_final_map->data_ptr());
-        params.p_reduce_partial_map = reduce_partial_map.data_ptr<int32_t>();
+        params.p_reduce_partial_map = reinterpret_cast<int32_t*>(reduce_partial_map.data_ptr());
         params.p_final_lse          = output_lse ? final_lse.value().data_ptr() : nullptr;
         params.p_final_output       = final_output.data_ptr();
         params.p_partial_lse        = partial_lse.data_ptr();
@@ -1073,9 +1072,9 @@ void mla_reduce_v1(
         params.output_lse           = output_lse;
         params.use_reduce_final_map = !no_reduce_final_map;
 
-        DISPATCH_MLA_REDUCE_KERNEL(output_lse ? final_lse.value().scalar_type()
-                                              : at::ScalarType::Float,
-                                   final_output.scalar_type(),
+        DISPATCH_MLA_REDUCE_KERNEL(output_lse ? final_lse.value().dtype()
+                                              : AITER_DTYPE_fp32,
+                                   final_output.dtype(),
                                    num_heads,
                                    head_dim,
                                    num_work_group_per_bh,

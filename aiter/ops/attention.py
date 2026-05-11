@@ -1290,7 +1290,7 @@ def get_mla_metadata_v1_no_redundant(
     ...
 
 
-@compile_ops("module_mla_reduce")
+@compile_ops("module_mla_reduce", develop=True)
 def mla_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -1479,7 +1479,7 @@ def decode_update_mla_metadata_v1(
     )
 
 
-@compile_ops("module_hk_mla")
+@compile_ops("module_hk_mla", develop=True)
 def hk_mla_decode_fwd(
     # [num_seqs, num_heads, head_size]
     query: torch.Tensor,

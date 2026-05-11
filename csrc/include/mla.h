@@ -3,7 +3,13 @@
 
 #pragma once
 
-#include <torch/extension.h>
+// Torch-free header. Only the shared per-work / per-tile descriptors live here.
+// MLA function declarations (metadata / hk / reduce) are forward-declared
+// directly in their respective pybind TUs, so this header doesn't need to
+// preprocess <torch/all.h>.
+
+#include <cstddef>
+#include <cstdint>
 
 union MlaWorkInfo
 {
@@ -34,6 +40,7 @@ union MlaPartialTileInfo
 };
 constexpr size_t kSizeMlaPartialTileInfoInDw = sizeof(MlaPartialTileInfo) / sizeof(uint32_t);
 static_assert(kSizeMlaPartialTileInfoInDw == 2);
+<<<<<<< HEAD
 
 void get_mla_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
                          const torch::Tensor& seqlens_kv_indptr, // [batch size + 1]
@@ -108,3 +115,5 @@ void hk_mla_decode_fwd(
     torch::Tensor& split_output,  // Output: [batch_size, num_kv_splits, num_heads, v_head_dim]
     torch::Tensor& split_lse,     // Output: [batch_size, num_kv_splits, num_heads,  1]
     torch::Tensor& final_output); // Output: [batch_size, num_heads, v_head_dim]
+=======
+>>>>>>> dd86c4140 (detorch for mla_hk and mla_reduce)
