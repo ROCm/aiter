@@ -40,7 +40,10 @@ if is_flydsl_available():
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .fmha_kernels import flydsl_flash_attn_func
-    from .pa_mqa_logits_kernels import flydsl_pa_mqa_logits_fp4
+    from .pa_mqa_logits_kernels import (
+        flydsl_pa_mqa_logits_fp4_schedule,
+        flydsl_pa_mqa_logits_fp4,
+    )
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
@@ -51,5 +54,6 @@ if is_flydsl_available():
         "flydsl_hgemm",
         "flydsl_flash_attn_func",
         "flydsl_pa_mqa_logits_fp4",
+        "flydsl_pa_mqa_logits_fp4_schedule",
         # "flydsl_gdr_decode",
     ]

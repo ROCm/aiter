@@ -35,6 +35,7 @@ from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import (  # noqa: E402
     DEFAULT_HEADS,
 )
 from aiter.ops.flydsl.pa_mqa_logits_kernels import (  # noqa: E402
+    flydsl_pa_mqa_logits_fp4_schedule,
     flydsl_pa_mqa_logits_fp4,
 )
 from aiter.test_common import checkAllclose, run_perftest  # noqa: E402
@@ -295,6 +296,10 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     )
     qe = torch.nn.functional.pad(qe_real, (0, qs_pad - m_tiles)).contiguous()
 
+    schedule = flydsl_pa_mqa_logits_fp4_schedule(
+        context_lens, block_k, parallel_unit_num, next_n=next_n
+    )
+
     def launch_flydsl():
         flydsl_pa_mqa_logits_fp4(
             q_packed,
@@ -308,6 +313,7 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
             block_k=block_k,
             num_warps=num_warps,
             parallel_unit_num=parallel_unit_num,
+            schedule=schedule,
         )
 
     out_logits.fill_(float("-inf"))

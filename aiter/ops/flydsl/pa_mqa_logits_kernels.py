@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import functools
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -20,12 +20,12 @@ from flydsl.expr.typing import T
 from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import (
     DEFAULT_BLOCK_THREADS,
     build_pa_mqa_logits_fp4_module,
-    compute_varctx_schedule,
+    flydsl_pa_mqa_logits_fp4_schedule,
 )
 
 __all__ = [
     "flydsl_pa_mqa_logits_fp4",
-    "compute_varctx_schedule",
+    "flydsl_pa_mqa_logits_fp4_schedule",
 ]
 
 
@@ -92,17 +92,25 @@ def flydsl_pa_mqa_logits_fp4(
     block_k: int = 256,
     num_warps: int = 4,
     parallel_unit_num: int = 512,
+    schedule: Optional[Tuple[int, torch.Tensor, int]] = None,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
-    """Compute MQA logits (FP4 Q/KV, gfx950). Writes out_logits in-place and returns it."""
+    """Compute MQA logits (FP4 Q/KV, gfx950). Writes out_logits in-place and returns it.
+
+    Pass `schedule` (tuple from `flydsl_pa_mqa_logits_fp4_schedule`) to skip the per-call
+    schedule recompute — useful in benchmark loops or when reusing across calls
+    with the same context_lens.
+    """
     batch, next_n, heads, head_dim_packed = q_packed.shape
     head_dim = head_dim_packed * 2
     kv_block_size = kv_cache.shape[3]
     max_blocks_per_seq = block_tables.shape[1]
 
-    safe, cta_info, total_ctas = compute_varctx_schedule(
-        context_lens, block_k, parallel_unit_num, next_n=next_n
-    )
+    if schedule is None:
+        schedule = flydsl_pa_mqa_logits_fp4_schedule(
+            context_lens, block_k, parallel_unit_num, next_n=next_n
+        )
+    safe, cta_info, total_ctas = schedule
 
     launch = _get_compiled_pa_mqa_logits_fp4(
         block_k=block_k,

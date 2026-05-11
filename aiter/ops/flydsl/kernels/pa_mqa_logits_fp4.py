@@ -46,7 +46,7 @@ def _pack_lo_i64x2_to_i32x8(x0, x1):
 allocator = None
 
 
-def compute_varctx_schedule(
+def flydsl_pa_mqa_logits_fp4_schedule(
     context_lens,
     block_k,
     parallel_unit_num,
