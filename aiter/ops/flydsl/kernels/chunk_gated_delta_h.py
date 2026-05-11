@@ -578,6 +578,17 @@ def compile_chunk_gated_delta_h(
 
             # -- 2b. Store v_new (pre-gating) for output --
             if const_expr(SAVE_NEW_VALUE):
+                # Closure wrapper to hide ``vn_`` from FlyDSL 0.1.5+
+                # ``ReplaceIfWithDispatch`` ast rewriter: it scans
+                # subscript-store and ``obj.method()`` calls inside dynamic
+                # ``if`` bodies and demands MLIR-Value state for any name
+                # written to / invoked on.  ``vn_`` is a GTensor (HBM tensor
+                # wrapper), not an MLIR Value.  Wrapping the store in a bare
+                # function call (ast.Name, not ast.Attribute / Subscript)
+                # makes the analyzer skip it.
+                def _emit_vn_store(off, value):
+                    vn_[fx.Index(off)] = value
+
                 for nr in range_constexpr(N_REPEAT):
                     vn_val = vn_frags[nr]
                     vn_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
@@ -592,36 +603,29 @@ def compile_chunk_gated_delta_h(
                             f32_v = vn_val[elem_i]
                             bf16_v = arith.trunc_f(T.bf16, f32_v)
                             vn_off = vn_base + vn_bt_row * fx.Int32(V) + vn_col
-                            vn_[fx.Index(vn_off)] = bf16_v
+                            _emit_vn_store(vn_off, bf16_v)
 
             # -- 3. Gating -- g values prefetched before MFMA --
             if const_expr(USE_G):
                 g_last = g_last_prefetch
                 exp_g_last = _fast_exp(g_last)
 
-                gate_vec = fx.full(4, 0.0, fx.Float32)
+                # Build the 4-lane gate vector via a single from_elements
+                # instead of fx.full(0.0) + 4x vector.insert: less SSA chain,
+                # lets LLVM pack the 4 lanes directly as register-immediate.
+                gate_elems = []
                 for elem_i in range_constexpr(4):
                     g_row, in_bounds = g_row_prefetch[elem_i]
                     gate = _fast_exp(g_last - g_row)
-                    gate_masked = in_bounds.select(gate, fx.Float32(0.0))
-                    gate_vec = vector.insert(
-                        gate_masked,
-                        gate_vec,
-                        static_position=[elem_i],
-                        dynamic_position=[],
-                    )
+                    gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
+                gate_vec = vector.from_elements(T.f32x4, gate_elems)
 
                 for nr in range_constexpr(N_REPEAT):
                     vn_frags[nr] = vn_frags[nr] * gate_vec
 
-                exp_g_last_vec = fx.full(4, 0.0, fx.Float32)
-                for ei in range_constexpr(4):
-                    exp_g_last_vec = vector.insert(
-                        exp_g_last,
-                        exp_g_last_vec,
-                        static_position=[ei],
-                        dynamic_position=[],
-                    )
+                # Wrap raw ArithValue in fx.Float32 so fx.full's broadcast
+                # accepts it (filled() requires a Numeric or Python scalar).
+                exp_g_last_vec = fx.full(4, fx.Float32(exp_g_last), fx.Float32)
 
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     for nr in range_constexpr(N_REPEAT):
@@ -633,14 +637,12 @@ def compile_chunk_gated_delta_h(
             # so we build a per-kb gate vector and multiply h_accs accordingly.
             if const_expr(USE_GK):
                 for kb in range_constexpr(NUM_K_BLOCKS):
-                    gk_vec = fx.full(4, 0.0, fx.Float32)
-                    for elem_i in range_constexpr(4):
-                        gk_vec = vector.insert(
-                            gk_last_prefetch[kb][elem_i],
-                            gk_vec,
-                            static_position=[elem_i],
-                            dynamic_position=[],
-                        )
+                    # Same simplification as gate_vec above: one
+                    # from_elements instead of fx.full(0.0) + 4x insert.
+                    gk_vec = vector.from_elements(
+                        T.f32x4,
+                        [gk_last_prefetch[kb][elem_i] for elem_i in range_constexpr(4)],
+                    )
                     for nr in range_constexpr(N_REPEAT):
                         acc_idx = kb * N_REPEAT + nr
                         h_accs_in[acc_idx] = h_accs_in[acc_idx] * gk_vec
