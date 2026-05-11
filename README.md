@@ -115,9 +115,9 @@ pip install -r requirements.txt
 
 ### Triton
 
-AITER includes Triton-based operators that require amd-triton ([ROCm 7.0](https://pypi.amd.com/triton/rocm-7.0.0/simple/), [ROCm 7.1](https://pypi.amd.com/triton/rocm-7.1.0/simple/), [ROCm 7.2](https://pypi.amd.com/triton/rocm-7.2.0/simple/)), with the correct version selected based on your ROCm installation.
+AITER includes Triton-based operators that require triton from AMD PyPI ([ROCm 7.0](https://pypi.amd.com/triton/release/rocm-7.0.0/simple/), [ROCm 7.1](https://pypi.amd.com/triton/release/rocm-7.1.0/simple/), [ROCm 7.2](https://pypi.amd.com/triton/release/rocm-7.2.0/simple/)), with the correct version selected based on your ROCm installation.
 
-If you install with `python3 setup.py develop`, amd-triton is installed automatically. If you use `pip install -e .`, run the install script manually:
+If you install with `python3 setup.py develop`, triton is installed automatically. If you use `pip install -e .`, run the install script manually:
 
 ```bash
 ./.github/scripts/install_triton.sh
