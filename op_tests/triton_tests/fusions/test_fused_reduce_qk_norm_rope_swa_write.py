@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-import aiter
+from aiter import rope_cached_positions_fwd_inplace
 from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
     fused_reduce_qk_norm_rope_swa_write,
 )
@@ -61,7 +61,7 @@ def run_torch(
 
     def _rope_inplace_slice(x_tail: torch.Tensor):
         rotate_style = 0 if is_neox else 1
-        aiter.rope_cached_positions_fwd_inplace(
+        rope_cached_positions_fwd_inplace(
             x_tail,
             cos,
             sin,
