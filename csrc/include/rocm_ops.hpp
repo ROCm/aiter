@@ -2190,20 +2190,39 @@ namespace py = pybind11;
           py::arg("scale")                   = -1.0f,                 \
           py::arg("use_qk_l2norm_in_kernel") = true,                  \
           py::arg("output")                  = c10::nullopt);
-#define MLA_HK_PYBIND                   \
-    m.def("hk_mla_decode_fwd",          \
-          &hk_mla_decode_fwd,           \
-          "hk_mla_decode_fwd",          \
-          py::arg("query"),             \
-          py::arg("kv_buffer"),         \
-          py::arg("qo_indptr"),         \
-          py::arg("kv_indptr"),         \
-          py::arg("kv_page_indices"),   \
-          py::arg("kv_last_page_lens"), \
-          py::arg("work_indptr"),       \
-          py::arg("work_info_set"),     \
-          py::arg("max_seqlen_q"),      \
-          py::arg("softmax_scale"),     \
-          py::arg("split_output"),      \
-          py::arg("split_lse"),         \
+#define MLA_HK_V32_PYBIND                   \
+    m.def("hk_mla_v32_decode_fwd",          \
+          &hk_mla_v32_decode_fwd,           \
+          "hk_mla_v32_decode_fwd",          \
+          py::arg("query"),                 \
+          py::arg("kv_buffer"),             \
+          py::arg("qo_indptr"),             \
+          py::arg("kv_indptr"),             \
+          py::arg("kv_page_indices"),       \
+          py::arg("kv_last_page_lens"),     \
+          py::arg("work_indptr"),           \
+          py::arg("work_info_set"),         \
+          py::arg("max_seqlen_q"),          \
+          py::arg("softmax_scale"),         \
+          py::arg("split_output"),          \
+          py::arg("split_lse"),             \
+          py::arg("final_output"));
+#define MLA_HK_V40_PYBIND                   \
+    m.def("hk_mla_v40_decode_fwd",          \
+          &hk_mla_v40_decode_fwd,           \
+          "hk_mla_v40_decode_fwd",          \
+          py::arg("query"),                 \
+          py::arg("query_rope"),            \
+          py::arg("kv_buffer"),             \
+          py::arg("kv_buffer_rope"),        \
+          py::arg("qo_indptr"),             \
+          py::arg("kv_indptr"),             \
+          py::arg("kv_page_indices"),       \
+          py::arg("kv_last_page_lens"),     \
+          py::arg("work_indptr"),           \
+          py::arg("work_info_set"),         \
+          py::arg("max_seqlen_q"),          \
+          py::arg("softmax_scale"),         \
+          py::arg("split_output"),          \
+          py::arg("split_lse"),             \
           py::arg("final_output"));

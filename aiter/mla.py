@@ -4,6 +4,7 @@
 # user interface
 
 import functools
+import warnings
 from typing import Optional
 import torch
 import triton
@@ -453,7 +454,7 @@ def mla_decode_fwd(
         )
 
         if use_hk:
-            aiter.hk_mla_decode_fwd(
+            aiter.hk_mla_v32_decode_fwd(
                 q,
                 kv_buffer,
                 qo_indptr,
@@ -541,6 +542,136 @@ def mla_decode_fwd(
                     .reshape(ori_total_s, ori_nhead)
                     .contiguous()
                 )
+
+    return logits, final_lse
+
+
+# V4.0 layout constants (mirrored from op_tests/test_mla_v4_persistent.py).
+_V40_DIM_NOPE = 448
+_V40_DIM_ROPE = 64
+_V40_DIM_QK_PACKED = 576  # NOPE 448 + dup-E8M0 16 + zero pad 112
+
+
+def mla_v40_decode_fwd(
+    q,  # [total_q, nhead, 576]                         FP8 (NOPE+scale+pad)
+    q_rope,  # [total_q, nhead, 64]                          BF16
+    kv_buffer,  # [num_page, page_size, 1, 576]                 FP8
+    kv_buffer_rope,  # [num_page, page_size, 1, 64]                  BF16
+    o,  # [total_q, nhead, 512]                         BF16
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    max_seqlen_q,
+    work_indptr,
+    work_info_set,
+    reduce_indptr,
+    reduce_final_map,
+    reduce_partial_map,
+    sm_scale=None,  # default 1.0/sqrt(512)
+    return_lse=False,
+):
+    """
+    V4.0 MLA decode entry. Persistent (HK) path only -- supports the single
+    shape `(max_seqlen_q * nhead) == 128` with FP8 packed NOPE+scale+pad and
+    BF16 ROPE. If the inputs don't satisfy these constraints, emit a warning
+    and return early (the kernel is NOT called).
+    """
+    device = q.device
+    total_s, nhead, _ = o.shape
+    v_head_dim = o.shape[-1]
+
+    if max_seqlen_q * nhead != 128:
+        warnings.warn(
+            f"mla_v40_decode_fwd: only (max_seqlen_q * nhead) == 128 is supported, "
+            f"got max_seqlen_q={max_seqlen_q} nhead={nhead}; skipping kernel call.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None, None
+    if q.dtype != dtypes.fp8 or kv_buffer.dtype != dtypes.fp8:
+        warnings.warn(
+            f"mla_v40_decode_fwd: NOPE buffers must be FP8, "
+            f"got q.dtype={q.dtype} kv_buffer.dtype={kv_buffer.dtype}; skipping kernel call.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None, None
+    if q_rope.dtype != dtypes.bf16 or kv_buffer_rope.dtype != dtypes.bf16:
+        warnings.warn(
+            f"mla_v40_decode_fwd: ROPE buffers must be BF16, "
+            f"got q_rope.dtype={q_rope.dtype} kv_buffer_rope.dtype={kv_buffer_rope.dtype}; "
+            "skipping kernel call.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None, None
+    if q.shape[-1] != _V40_DIM_QK_PACKED or kv_buffer.shape[-1] != _V40_DIM_QK_PACKED:
+        warnings.warn(
+            f"mla_v40_decode_fwd: packed Q/KV last dim must be {_V40_DIM_QK_PACKED}, "
+            f"got q.shape={tuple(q.shape)} kv_buffer.shape={tuple(kv_buffer.shape)}; "
+            "skipping kernel call.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None, None
+    if q_rope.shape[-1] != _V40_DIM_ROPE or kv_buffer_rope.shape[-1] != _V40_DIM_ROPE:
+        warnings.warn(
+            f"mla_v40_decode_fwd: rope last dim must be {_V40_DIM_ROPE}, "
+            f"got q_rope.shape={tuple(q_rope.shape)} "
+            f"kv_buffer_rope.shape={tuple(kv_buffer_rope.shape)}; skipping kernel call.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None, None
+
+    if sm_scale is None:
+        sm_scale = 1.0 / ((_V40_DIM_NOPE + _V40_DIM_ROPE) ** 0.5)  # 1/sqrt(512)
+
+    logits = torch.empty(
+        (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    attn_lse = torch.empty(
+        (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    final_lse = (
+        torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+        if return_lse
+        else None
+    )
+
+    aiter.hk_mla_v40_decode_fwd(
+        q,
+        q_rope,
+        kv_buffer,
+        kv_buffer_rope,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        work_indptr,
+        work_info_set,
+        max_seqlen_q,
+        sm_scale,
+        logits,
+        attn_lse,
+        o,
+    )
+
+    aiter.mla_reduce_v1(
+        logits,
+        attn_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        max_seqlen_q,
+        o,
+        final_lse,
+    )
 
     return logits, final_lse
 

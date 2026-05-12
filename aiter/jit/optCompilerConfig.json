@@ -1415,16 +1415,30 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_hk_mla": {
+    "module_hk_mla_v32_fwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/mla_hk_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/hk_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mla_hk_v32_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk_v32_decode_fwd.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_utils.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_buffer_managers.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_softmax.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi3xx_v32_fwd_decode_m16x8_fp8_fp8.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi35x_v32_fwd_decode_m16x8_fp8_fp8.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi35x_v32_fwd_decode_m16x4_fp8_fp8.cuh'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''",
+        "third_party": ["'HipKittens'", "'ComposableKernel'"],
+        "is_experimental": "True"
+    },
+    "module_hk_mla_v40_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_hk_v40_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk_v40_decode_fwd.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

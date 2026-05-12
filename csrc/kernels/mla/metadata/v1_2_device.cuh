@@ -496,7 +496,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     const int32_t cluster_multiplier = is_hk_m16x4 ? 2 : 1;
     const int32_t num_clusters = (dev_prop.multiProcessorCount * cluster_multiplier) / num_heads_k;
 
-    // Gate on arch_id consistent with hk_mla_decode_fwd dispatch (gfx942/gfx950).
+    // Gate on arch_id consistent with hk_mla_v32_decode_fwd dispatch (gfx942/gfx950).
     // Otherwise this would mark shapes as natively supported on archs where the
     // HK kernels are unavailable, producing metadata that downstream kernels
     // cannot consume.
