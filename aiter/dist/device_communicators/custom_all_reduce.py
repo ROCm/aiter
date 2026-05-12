@@ -113,6 +113,26 @@ def _validate_per_group_size(group_size: int, element_size: int, n: int) -> None
         )
 
 
+def _validate_mxfp4_hidden_dim(n: int, element_size: int) -> None:
+    """Validate hidden-dim constraints for the fused AR+RMSNorm+MXFP4 epilogue."""
+    if element_size <= 0 or 16 % element_size != 0:
+        raise ValueError(
+            "MXFP4 fused quant requires an element_size that divides 16 "
+            f"(bf16/fp16: 2), got element_size={element_size}"
+        )
+    if n <= 0:
+        raise ValueError(
+            f"MXFP4 fused quant requires hidden_dim n > 0, got n={n}"
+        )
+    pack_size = 16 // element_size
+    if n % 32 != 0:
+        raise ValueError(f"MXFP4 fused quant requires n divisible by 32, got n={n}")
+    if n % pack_size != 0:
+        raise ValueError(
+            f"MXFP4 fused quant requires n divisible by PACK_SIZE={pack_size}, got n={n}"
+        )
+
+
 class IPCBuffer:
     """A single IPC-accessible device buffer.
 
@@ -928,6 +948,51 @@ class CustomAllreduce:
                 registered=False,
             )
 
+    def fused_ar_rms_mxfp4_quant(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        *,
+        w: torch.Tensor,
+        eps: float,
+        registered: bool = False,
+        use_1stage: bool = False,
+        emit_bf16: bool = False,
+    ):
+        K = inp.shape[-1]
+        _validate_mxfp4_hidden_dim(K, inp.element_size())
+        res_out = torch.empty_like(inp)
+        out = torch.empty(
+            inp.shape[:-1] + (K // 2,), dtype=torch.uint8, device=inp.device
+        )
+        scale_out = torch.empty(
+            inp.shape[:-1] + (K // 32,), dtype=torch.uint8, device=inp.device
+        )
+        bf16_out = None
+        bf16_ptr = 0
+        if emit_bf16:
+            bf16_out = torch.empty_like(inp)
+            bf16_ptr = int(bf16_out.data_ptr())
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        ops.fused_allreduce_rmsnorm_mxfp4_quant(
+            self._ptr,
+            inp,
+            res_inp,
+            res_out,
+            out,
+            scale_out,
+            w,
+            eps,
+            reg,
+            reg_bytes,
+            use_1stage,
+            bf16_ptr,
+        )
+        if emit_bf16:
+            return out, res_out, scale_out, bf16_out
+        return out, res_out, scale_out
+
     def custom_fused_ar_rms_per_group_quant(
         self,
         input: torch.Tensor,
@@ -980,6 +1045,54 @@ class CustomAllreduce:
                 use_1stage=use_1stage,
                 emit_bf16=emit_bf16,
             )
+
+    def custom_fused_ar_rms_mxfp4_quant(
+        self,
+        input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        use_1stage: bool = False,
+        emit_bf16: bool = False,
+    ):
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_ar_rms_mxfp4_quant(
+                    input,
+                    residual_inp,
+                    w=weight,
+                    eps=eps,
+                    registered=True,
+                    use_1stage=use_1stage,
+                    emit_bf16=emit_bf16,
+                )
+            else:
+                K = input.shape[-1]
+                dummy_out = torch.zeros(
+                    input.shape[:-1] + (K // 2,), dtype=torch.uint8, device=input.device
+                )
+                dummy_scale = torch.zeros(
+                    input.shape[:-1] + (K // 32,), dtype=torch.uint8, device=input.device
+                )
+                if emit_bf16:
+                    return (
+                        dummy_out,
+                        torch.zeros_like(input),
+                        dummy_scale,
+                        torch.zeros_like(input),
+                    )
+                return dummy_out, torch.zeros_like(input), dummy_scale
+        return self.fused_ar_rms_mxfp4_quant(
+            input,
+            residual_inp,
+            w=weight,
+            eps=eps,
+            registered=False,
+            use_1stage=use_1stage,
+            emit_bf16=emit_bf16,
+        )
 
     def close(self):
         if not self.disabled and getattr(self, "_ptr", 0):

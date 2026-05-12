@@ -1477,6 +1477,117 @@ __device__ __forceinline__ float ar_fusion_epilogue_reduce_abs_max(A& data, int 
     return acc;
 }
 
+__device__ __forceinline__ uint8_t ar_mxfp4_encode(float x)
+{
+    uint8_t sign = x < 0.0f ? 0x8 : 0x0;
+    float ax = fabsf(x);
+    uint8_t mag;
+    if(ax < 0.25f)
+        mag = 0x0; // 0
+    else if(ax < 0.75f)
+        mag = 0x1; // 0.5
+    else if(ax < 1.25f)
+        mag = 0x2; // 1
+    else if(ax < 1.75f)
+        mag = 0x3; // 1.5
+    else if(ax < 2.5f)
+        mag = 0x4; // 2
+    else if(ax < 3.5f)
+        mag = 0x5; // 3
+    else if(ax < 5.0f)
+        mag = 0x6; // 4
+    else
+        mag = 0x7; // 6
+    return sign | mag;
+}
+
+__device__ __forceinline__ float ar_mxfp4_rounded_amax(float amax)
+{
+    union
+    {
+        float f;
+        uint32_t u;
+    } v;
+    v.f = amax;
+    v.u = (v.u + 0x200000u) & 0xFF800000u;
+    return v.f;
+}
+
+template <typename P, typename A, typename T, int PACK_SIZE>
+__device__ __forceinline__ void ar_fusion_epilogue_mxfp4(
+    A& in,
+    P& weight,
+    int hidden_dim,
+    float eps,
+    int idx,
+    int tidx,
+    int block_size,
+    uint8_t* __restrict__ output,
+    uint8_t* __restrict__ scale_out,
+    bool active = true,
+    T* __restrict__ bf16_output = nullptr)
+{
+    static_assert(PACK_SIZE % 2 == 0, "MXFP4 output packs two values per byte");
+    constexpr int MXFP4_GROUP_SIZE = 32;
+    A out;
+
+    ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE>(
+        out, in, weight, eps, hidden_dim, block_size);
+
+    if(bf16_output != nullptr && active)
+    {
+        P bf16_pack;
+#pragma unroll
+        for(int i = 0; i < PACK_SIZE; ++i)
+            bf16_pack[i] = downcast_s<T>(out[i]);
+        *reinterpret_cast<P*>(bf16_output + idx) = bf16_pack;
+    }
+
+    constexpr int threads_per_group = MXFP4_GROUP_SIZE / PACK_SIZE;
+    int group_id                    = threadIdx.x / threads_per_group;
+    int lane_in_group               = threadIdx.x % threads_per_group;
+    int num_groups                  = hidden_dim / MXFP4_GROUP_SIZE;
+
+    auto fn = [](float a, float b) { return a > b ? a : b; };
+    float local_max = 0.0f;
+#pragma unroll
+    for(int i = 0; i < PACK_SIZE; ++i)
+    {
+        float v   = upcast_s(out[i]);
+        local_max = fn(local_max, fabsf(v));
+    }
+    for(int stride = threads_per_group / 2; stride > 0; stride >>= 1)
+    {
+        float other = __shfl_xor(local_max, stride, threads_per_group);
+        local_max   = fn(local_max, other);
+    }
+
+    float rounded_max = ar_mxfp4_rounded_amax(local_max);
+    int scale_unbiased = -127;
+    if(rounded_max > 0.0f)
+    {
+        scale_unbiased = static_cast<int>(floorf(log2f(rounded_max))) - 2;
+        scale_unbiased = max(-127, min(127, scale_unbiased));
+    }
+    float quant_scale = exp2f(-static_cast<float>(scale_unbiased));
+
+    if(active)
+    {
+        int byte_idx = tidx * (hidden_dim / 2) + (threadIdx.x * PACK_SIZE) / 2;
+#pragma unroll
+        for(int i = 0; i < PACK_SIZE; i += 2)
+        {
+            uint8_t lo = ar_mxfp4_encode(upcast_s(out[i]) * quant_scale);
+            uint8_t hi = ar_mxfp4_encode(upcast_s(out[i + 1]) * quant_scale);
+            output[byte_idx + i / 2] = lo | (hi << 4);
+        }
+    }
+
+    if(lane_in_group == 0 && active)
+        scale_out[tidx * num_groups + group_id] =
+            static_cast<uint8_t>(scale_unbiased + 127);
+}
+
 template <typename P, typename A, typename T, typename OutT, int PACK_SIZE>
 __device__ __forceinline__ void ar_fusion_epilogue(A& in,
                                                    P& weight,
@@ -1777,6 +1888,102 @@ void allreduce_fusion_kernel_1stage_per_group_launcher(
                                      output, weight, scale_out,
                                      size, hidden_dim, group_size, eps,
                                      bf16_output);
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(1024, 1)
+    allreduce_fusion_kernel_1stage_mxfp4(RankData* _dp,
+                                         RankSignals sg,
+                                         Signal* self_sg,
+                                         int rank,
+                                         T* __restrict__ residual_inp,
+                                         T* __restrict__ residual_out,
+                                         uint8_t* __restrict__ output,
+                                         T* __restrict__ weight,
+                                         uint8_t* __restrict__ scale_out,
+                                         int size,
+                                         int hidden_dim,
+                                         float eps,
+                                         T* __restrict__ bf16_output = nullptr)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    int block_size          = hidden_dim / pack_size;
+    bool active             = (int)threadIdx.x < block_size;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int tidx                = blockIdx.x;
+    int access_id_in_token  = threadIdx.x * pack_size;
+    int idx                 = tidx * hidden_dim + access_id_in_token;
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+        tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    A acc{};
+    P vec{};
+    P weight_p{};
+    if(active)
+    {
+        vec = ptrs[0][idx / pack_size];
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+            acc[v] = upcast_s(vec[v]);
+#pragma unroll
+        for(int r = 1; r < ngpus; ++r)
+        {
+            vec = ptrs[r][idx / pack_size];
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+                acc[v] += upcast_s(vec[v]);
+        }
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+            acc[v] = upcast_s(downcast_s<T>(acc[v]));
+        P res = *reinterpret_cast<P*>(residual_inp + idx);
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+            acc[v] += upcast_s(res[v]);
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+            vec[v] = downcast_s<T>(acc[v]);
+        *reinterpret_cast<P*>(residual_out + idx) = vec;
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+            acc[v] = upcast_s(vec[v]);
+        weight_p = *reinterpret_cast<P*>(weight + access_id_in_token);
+    }
+    int padded_block_size = (int)blockDim.x;
+    ar_fusion_epilogue_mxfp4<P, A, T, pack_size>(
+        acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
+        output, scale_out, active, bf16_output);
+}
+
+template <typename T, int NGPUS>
+void allreduce_fusion_kernel_1stage_mxfp4_launcher(
+    RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
+    T* residual_inp, T* residual_out, uint8_t* output, T* weight,
+    uint8_t* scale_out, int size, int hidden_dim, float eps,
+    hipStream_t stream, T* bf16_output = nullptr)
+{
+    auto pack_size  = 16 / sizeof(T);
+    int block_size  = hidden_dim / pack_size;
+    int padded_size = (block_size + 31) / 32 * 32;
+    int m           = size / hidden_dim;
+    if(m > kMaxBlocks)
+        throw std::runtime_error(
+            "Token number is too large for allreduce_fusion_kernel_1stage_mxfp4 kernel");
+    dim3 grid(m);
+    dim3 block(padded_size);
+    allreduce_fusion_kernel_1stage_mxfp4<T, NGPUS>
+        <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank,
+                                     residual_inp, residual_out,
+                                     output, weight, scale_out,
+                                     size, hidden_dim, eps, bf16_output);
 }
 
 template <typename T, typename OutT, int NGPUS>
@@ -3518,6 +3725,63 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
 }
 
 template <typename T>
+void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
+                                             T* input,
+                                             T* residual_inp,
+                                             T* residual_out,
+                                             uint8_t* output,
+                                             uint8_t* scale_out,
+                                             T* weight,
+                                             float eps,
+                                             int m,
+                                             int n,
+                                             bool use_1stage,
+                                             T* bf16_output = nullptr)
+{
+    auto d   = 16 / sizeof(T);
+    int size = m * n;
+    if(size % d != 0)
+    {
+        throw std::runtime_error("custom allreduce currently requires input length to be multiple "
+                                 "of " +
+                                 std::to_string(d));
+    }
+    if(n % 32 != 0)
+    {
+        throw std::runtime_error("MXFP4 fused kernel requires hidden_dim divisible by 32");
+    }
+    RankData* ptrs   = get_buffer_RD(stream, input);
+    auto pack_size   = 16 / sizeof(T);
+    bool n_constrain = (n % pack_size == 0) && (n / pack_size <= 1024);
+    use_1stage       = use_1stage && n_constrain && (m <= kMaxBlocks);
+    if(!use_1stage)
+    {
+        throw std::runtime_error(
+            "MXFP4 fused kernel currently supports only 1-stage decode shapes "
+            "with token_num <= " +
+            std::to_string(kMaxBlocks));
+    }
+
+#define DISPATCH_AR_FUSION_MXFP4_KERNEL(NGPUS)                                             \
+    allreduce_fusion_kernel_1stage_mxfp4_launcher<T, NGPUS>(                                \
+        ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight, scale_out,   \
+        size, n, eps, stream, bf16_output);                                                  \
+    return;
+
+    switch(world_size_)
+    {
+    case 8: DISPATCH_AR_FUSION_MXFP4_KERNEL(8); break;
+    case 4: DISPATCH_AR_FUSION_MXFP4_KERNEL(4); break;
+    case 2: DISPATCH_AR_FUSION_MXFP4_KERNEL(2); break;
+    default:
+        throw std::runtime_error(
+            "fused allreduce rmsnorm MXFP4 quant: unsupported world_size=" +
+            std::to_string(world_size_));
+    }
+#undef DISPATCH_AR_FUSION_MXFP4_KERNEL
+}
+
+template <typename T>
 void dispatchFusedQKNormAllReduce(hipStream_t stream,
                                   T* qkv_in,
                                   T* q_w,
@@ -3539,7 +3803,7 @@ void dispatchFusedQKNormAllReduce(hipStream_t stream,
                                  std::to_string(d));
     }
     RankData* ptrs = get_buffer_RD(stream, qkv_in);
-    
+
 #define DISPATCH_QKNORM_AR_FUSION_KERNEL(NGPUS)                                \
     {                                                                          \
         qknorm_allreduce_fusion_kernel_2stage_launcher<T, NGPUS>(ptrs,         \
@@ -3570,6 +3834,7 @@ void dispatchFusedQKNormAllReduce(hipStream_t stream,
         throw std::runtime_error("fused qknorm allreduce rmsnorm: unsupported world_size=" +
                                  std::to_string(world_size_));
     }
+#undef DISPATCH_QKNORM_AR_FUSION_KERNEL
 }
 
 ~CustomAllreduce()

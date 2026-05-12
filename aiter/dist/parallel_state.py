@@ -513,6 +513,22 @@ class GroupCoordinator:
             qkv_in, q_w, k_w, eps
         )
 
+    def fused_allreduce_rmsnorm_mxfp4_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+        emit_bf16: bool = False,
+    ):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_mxfp4_quant(
+            input_, residual_inp_, weight_, eps, prefill_support,
+            emit_bf16=emit_bf16,
+        )
+
     def _fused_allreduce_rmsnorm_out_place(
         self,
         input_: torch.Tensor,

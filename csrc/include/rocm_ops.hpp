@@ -471,6 +471,20 @@ namespace py = pybind11;
           py::arg("reg_bytes"),                                                                 \
           py::arg("use_1stage"),                                                                \
           py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                                   \
+    m.def("fused_allreduce_rmsnorm_mxfp4_quant",                                                \
+          &aiter::fused_allreduce_rmsnorm_mxfp4_quant,                                          \
+          py::arg("_fa"),                                                                       \
+          py::arg("inp"),                                                                       \
+          py::arg("res_inp"),                                                                   \
+          py::arg("res_out"),                                                                   \
+          py::arg("out"),                                                                       \
+          py::arg("scale_out"),                                                                 \
+          py::arg("w"),                                                                         \
+          py::arg("eps"),                                                                       \
+          py::arg("reg_ptr"),                                                                   \
+          py::arg("reg_bytes"),                                                                 \
+          py::arg("use_1stage"),                                                                \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                                   \
     m.def("fused_qknorm_allreduce",                                                             \
           &aiter::fused_qknorm_allreduce,                                                       \
           py::arg("_fa"),                                                                       \

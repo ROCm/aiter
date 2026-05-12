@@ -595,6 +595,76 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
     }
 }
 
+void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
+                                         const aiter_tensor_t& inp,
+                                         const aiter_tensor_t& res_inp,
+                                         const aiter_tensor_t& res_out,
+                                         const aiter_tensor_t& out,
+                                         const aiter_tensor_t& scale_out,
+                                         const aiter_tensor_t& w,
+                                         double eps,
+                                         int64_t reg_ptr, int64_t reg_bytes,
+                                         bool use_1stage,
+                                         int64_t bf16_out_ptr)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto dtype         = inp.dtype();
+    int64_t numel      = inp.numel();
+    int64_t data_bytes = numel * inp.element_size();
+    int n              = (int)w.numel();
+    int m              = (int)(numel / w.numel());
+
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+
+    void* inp_ptr = inp.data_ptr();
+    if(reg_ptr != 0)
+    {
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, inp.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        inp_ptr = (void*)reg_ptr;
+    }
+
+    void* bf16_out = reinterpret_cast<void*>(bf16_out_ptr);
+
+    switch(dtype)
+    {
+#if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16: {
+        fa->dispatchFusedAllReduceRMSNormQuantMXFP4<opus::bf16_t>(
+            stream,
+            reinterpret_cast<opus::bf16_t*>(inp_ptr),
+            reinterpret_cast<opus::bf16_t*>(res_inp.data_ptr()),
+            reinterpret_cast<opus::bf16_t*>(res_out.data_ptr()),
+            reinterpret_cast<uint8_t*>(out.data_ptr()),
+            reinterpret_cast<uint8_t*>(scale_out.data_ptr()),
+            reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
+            (float)eps, m, n, use_1stage,
+            reinterpret_cast<opus::bf16_t*>(bf16_out));
+        break;
+    }
+#endif
+    case AITER_DTYPE_fp16: {
+        fa->dispatchFusedAllReduceRMSNormQuantMXFP4<opus::fp16_t>(
+            stream,
+            reinterpret_cast<opus::fp16_t*>(inp_ptr),
+            reinterpret_cast<opus::fp16_t*>(res_inp.data_ptr()),
+            reinterpret_cast<opus::fp16_t*>(res_out.data_ptr()),
+            reinterpret_cast<uint8_t*>(out.data_ptr()),
+            reinterpret_cast<uint8_t*>(scale_out.data_ptr()),
+            reinterpret_cast<opus::fp16_t*>(w.data_ptr()),
+            (float)eps, m, n, use_1stage,
+            reinterpret_cast<opus::fp16_t*>(bf16_out));
+        break;
+    }
+    default:
+        throw std::runtime_error(
+            "fused_allreduce_rmsnorm_mxfp4_quant only supports float16 and bfloat16");
+    }
+}
+
 void fused_qknorm_allreduce(fptr_t _fa,
                             const aiter_tensor_t& qkv_in,
                             const aiter_tensor_t& q_w,
@@ -661,6 +731,7 @@ void fused_qknorm_allreduce(fptr_t _fa,
     default:
         throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
     }
+#undef DISPATCH_AR_FUSION
 }
 
 } // namespace aiter

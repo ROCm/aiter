@@ -351,6 +351,74 @@ class CudaCommunicator(DeviceCommunicatorBase):
         assert v_out is not None
         return q_out, k_out, v_out
 
+    def fused_allreduce_rmsnorm_mxfp4_quant(
+        self,
+        input_,
+        res_inp_,
+        weight_,
+        eps,
+        prefill_support: bool = False,
+        emit_bf16: bool = False,
+    ):
+        """Fused AR+RMSNorm with an MXFP4 quantization epilogue when supported."""
+        total_bytes = input_.numel() * input_.element_size()
+        K = input_.shape[-1]
+        token_num = input_.numel() // K
+        use_direct_mxfp4 = (
+            token_num <= 4
+            or (K <= 4096 and token_num <= 32)
+            or (K <= 6144 and token_num <= 16)
+            or (K == 8192 and token_num <= 8)
+        )
+        out_fp4 = res_out = scale_out = bf16_out = None
+        ca_comm = self.ca_comm
+        use_1stage_mxfp4 = (
+            self._ar_1stage_override
+            if self._ar_1stage_override is not None
+            else True
+        )
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_, prefill_support)
+            and K % 32 == 0
+            and K <= 16384
+            and token_num <= 80
+            and use_direct_mxfp4
+            and use_1stage_mxfp4
+            and self.world_size != 6
+            and (prefill_support or total_bytes <= 64 * 1024 * 1024)
+        ):
+            result = ca_comm.custom_fused_ar_rms_mxfp4_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                use_1stage=True,
+                emit_bf16=emit_bf16,
+            )
+            assert result is not None
+            if emit_bf16:
+                out_fp4, res_out, scale_out, bf16_out = result
+            else:
+                out_fp4, res_out, scale_out = result
+        else:
+            normed, res_out = self.fused_allreduce_rmsnorm(
+                input_, res_inp_, weight_, eps, prefill_support
+            )
+            from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+            out_fp4, scale_out = dynamic_mxfp4_quant(normed)
+            if emit_bf16:
+                bf16_out = normed
+        assert out_fp4 is not None
+        assert res_out is not None
+        assert scale_out is not None
+        if emit_bf16:
+            assert bf16_out is not None
+            return out_fp4, res_out, scale_out, bf16_out
+        return out_fp4, res_out, scale_out
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:
             dim += input_.dim()

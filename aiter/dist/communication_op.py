@@ -110,6 +110,24 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     )
 
 
+def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    prefill_support: bool = False,
+    emit_bf16: bool = False,
+):
+    return get_tp_group().fused_allreduce_rmsnorm_mxfp4_quant(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        prefill_support,
+        emit_bf16=emit_bf16,
+    )
+
+
 def tensor_model_parallel_fused_qknorm_allreduce(
     qkv_in: torch.Tensor,
     q_w: torch.Tensor,
