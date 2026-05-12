@@ -142,8 +142,10 @@ def csv_caller_gate_modes(rows) -> list:
     for row in iterator:
         if is_csv_fallback_row(row):
             continue
-        kn1 = str(row.get("kernelName1", "") or "") if hasattr(row, "get") else (
-            str(row["kernelName1"]) if "kernelName1" in row else ""
+        kn1 = (
+            str(row.get("kernelName1", "") or "")
+            if hasattr(row, "get")
+            else (str(row["kernelName1"]) if "kernelName1" in row else "")
         )
         if not kn1:
             continue

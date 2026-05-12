@@ -173,9 +173,7 @@ def compile_mixed_moe_gemm1(
     # used everywhere a "single-accumulator-set N" was previously meant by
     # ``tile_n``. Each CTA always covers ``2 * tile_n`` columns of W
     # regardless of gate_mode (grid step on W axis).
-    _acc_set_n = (
-        2 * tile_n if (gate_up_interleave or mock_gate_only) else tile_n
-    )
+    _acc_set_n = 2 * tile_n if (gate_up_interleave or mock_gate_only) else tile_n
 
     sort_block_m = max(32, tile_m)
     num_waves = min(4, _acc_set_n // 32)
@@ -550,9 +548,7 @@ def compile_mixed_moe_gemm1(
                 # Each CTA covers 2*tile_n columns of W ([0, 2*inter_dim))
                 # in all gate_mode paths. ceil((n_in - 2*pad) / (2*tile_n)).
                 _gx = (
-                    (n_in - _c_idp_sw + _c2_sw * _c_tn_sw - _c1_sw)
-                    / _c_tn_sw
-                    / _c2_sw
+                    (n_in - _c_idp_sw + _c2_sw * _c_tn_sw - _c1_sw) / _c_tn_sw / _c2_sw
                 )
                 _c_pm_sw = arith.constant(persist_m, index=True)
                 _gy = (size_expert_ids_in + _c_pm_sw - _c1_sw) / _c_pm_sw

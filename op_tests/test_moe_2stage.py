@@ -675,6 +675,7 @@ def _iter_csv_cases():
     df_csv = pd.read_csv(merged_csv)
     rows = df_csv[df_csv["cu_num"] == cu]
     import os as _os
+
     env_mode = _os.environ.get("AITER_MOE_GUI", "auto").lower()
     csv_gate_modes = csv_caller_gate_modes(rows)
     aiter.logger.info(
@@ -734,10 +735,7 @@ def _iter_csv_cases():
                 kwargs["AQDType"],
                 kwargs["WQDType"],
             )
-            if (
-                expected_aq_dtype is not None
-                and kwargs["AQDType"] != expected_aq_dtype
-            ):
+            if expected_aq_dtype is not None and kwargs["AQDType"] != expected_aq_dtype:
                 aiter.logger.info(
                     "skip row token=%s dim=(%s,%s) gm=%s: q_dtype_a=%s does not "
                     "match current Swiglu MXFP4 runtime mode (expected %s)",
@@ -799,6 +797,7 @@ def _effective_gate_modes(aq_dtype, wq_dtype):
       - gguu:   [legacy_mode] -- same as auto, see comment above.
     """
     import os as _os
+
     mode = _os.environ.get("AITER_MOE_GUI", "auto").lower()
     legacy = _legacy_gate_mode(aq_dtype, wq_dtype)
     is_fp4_weight = wq_dtype == dtypes.fp4x2
@@ -1044,13 +1043,18 @@ for kwargs, extras in case_iter:
                 os.environ["AITER_BF16_FP8_MOE_BOUND"] = _old_moe_bound
     if ret is None:
         if accuracy_error is not None:
-            df.append({
-                **{k: kwargs.get(k) for k in ("token", "gateMode", "AQDType", "WQDType")},
-                **extras,
-                "us": float("nan"),
-                "logits_diff": float("nan"),
-                "assert_err": accuracy_error[:120],
-            })
+            df.append(
+                {
+                    **{
+                        k: kwargs.get(k)
+                        for k in ("token", "gateMode", "AQDType", "WQDType")
+                    },
+                    **extras,
+                    "us": float("nan"),
+                    "logits_diff": float("nan"),
+                    "assert_err": accuracy_error[:120],
+                }
+            )
         continue
     ret.update(extras)
     df.append(ret)

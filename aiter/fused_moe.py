@@ -327,9 +327,7 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    _gate_mode_str = (
-        gate_mode.value if isinstance(gate_mode, GateMode) else gate_mode
-    )
+    _gate_mode_str = gate_mode.value if isinstance(gate_mode, GateMode) else gate_mode
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
@@ -1498,9 +1496,7 @@ def fused_moe_2stages(
     dtype = moe_out.dtype
     device = hidden_states.device
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
-    _gate_mode_str = (
-        gate_mode.value if isinstance(gate_mode, GateMode) else gate_mode
-    )
+    _gate_mode_str = gate_mode.value if isinstance(gate_mode, GateMode) else gate_mode
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
@@ -1869,9 +1865,7 @@ def torch_moe(
 
 
 # temp workaround for swiglu
-def swiglu(
-    x_glu, x_linear, alpha: float = 1.702, limit: Optional[float] = None
-):
+def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: Optional[float] = None):
     # ``None`` -> use the historical default of 7.0; any concrete float
     # (including 0.0) is treated as a real clamp bound.
     if limit is None:
