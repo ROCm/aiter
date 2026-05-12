@@ -11,13 +11,13 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
 
     # Warp/register layout bases depend on warp count
     if num_warps == 2:
-        warp_bases = [[0, 1]]
+        warp_bases = [[1, 0]]
         reg_bases = []
     elif num_warps == 4:
-        warp_bases = [[0, 2], [2, 0]]
-        reg_bases = [[1, 0], [0, 1]]
+        warp_bases = [[0, 1], [2, 0]]
+        reg_bases = [[1, 0]]
     else:
-        warp_bases = [[0, 1], [0, 2], [1, 0]]
+        warp_bases = [[1, 0], [0, 1], [2, 0]]
         reg_bases = []
 
     # e2m1 uses instr_shape [16,16,64] for operands
@@ -26,7 +26,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=reg_bases,
-        instr_shape=[16, 16, 64],
+        instr_shape=[32, 16, 64],
     )
 
     wmma_acc_layout = gl.amd.AMDWMMALayout(
@@ -34,7 +34,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=reg_bases,
-        instr_shape=[16, 16, 128],
+        instr_shape=[32, 16, 128],
     )
 
     # Shared memory layouts
