@@ -23,6 +23,9 @@ def gen_unified_attention_fwd_fake(
     scale_v: float,
     scale_out: float,
     cache_ptr_int32_overflow_possible: bool = False,
+    num_splits: int = 1,
+    o_acc_workspace: Optional[torch.Tensor] = None,
+    lse_acc_workspace: Optional[torch.Tensor] = None,
 ) -> None:
     return None
 
@@ -43,4 +46,15 @@ def unified_attention_fwd(
     scale_v: float,
     scale_out: float,
     cache_ptr_int32_overflow_possible: bool = False,  # true = large cache with overflow checks
+    # KV-segment parallelism (FlashDecoding-style split-KV). When num_splits
+    # > 1 the kernel launches a 3D grid with z-dim == num_splits and writes
+    # each CTA's partial (o_acc, lse) into the workspaces; the caller then
+    # reduces across the split axis to produce the final output. With
+    # num_splits == 1 the workspaces are ignored and `output` is written in
+    # the usual way.
+    num_splits: int = 1,
+    # o_acc_workspace  : float32 [num_q_heads, num_splits, num_tokens, head_size]
+    # lse_acc_workspace: float32 [num_q_heads, num_splits, num_tokens]
+    o_acc_workspace: Optional[torch.Tensor] = None,
+    lse_acc_workspace: Optional[torch.Tensor] = None,
 ) -> None: ...

@@ -1,6 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#include <optional>
 #include <torch/extension.h>
 
 void unified_attention_fwd(
@@ -17,4 +18,7 @@ void unified_attention_fwd(
     float scale_k,
     float scale_v,
     float scale_out,
-    bool cache_ptr_int32_overflow_possible = false);
+    bool cache_ptr_int32_overflow_possible = false,
+    int num_splits                          = 1,
+    std::optional<torch::Tensor> o_acc_workspace   = std::nullopt,
+    std::optional<torch::Tensor> lse_acc_workspace = std::nullopt);

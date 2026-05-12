@@ -21,7 +21,17 @@ void unified_attention_fwd(
     float scale_k,
     float scale_v,
     float scale_out,
-    bool cache_ptr_int32_overflow_possible)
+    bool cache_ptr_int32_overflow_possible,
+    // KV-segment parallelism (FlashDecoding-style split-KV). The kernel
+    // launches a 3D grid with z-dim = num_splits and writes each CTA's
+    // partial (o_acc, lse) into the FP32 workspaces below; the host then
+    // reduces across the split axis to produce the final output. When
+    // num_splits == 1 the workspaces are ignored (pass None/empty).
+    //   o_acc_workspace   : float32 [num_q_heads, num_splits, num_tokens, hdim]
+    //   lse_acc_workspace : float32 [num_q_heads, num_splits, num_tokens]
+    int num_splits,
+    std::optional<torch::Tensor> o_acc_workspace,
+    std::optional<torch::Tensor> lse_acc_workspace)
 {
     auto dtype = query.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
@@ -98,6 +108,30 @@ void unified_attention_fwd(
     (void)cache_ptr_int32_overflow_possible; // accepted at the API for forward compat;
                                              // CK pipeline currently gates pointer rebasing
                                              // on row strides + head_dim, not on this flag.
+
+    // Wire up the split-KV workspace pointers/strides. For num_splits == 1 the
+    // workspace tensors are ignored by the kernel (and the *_acc fields stay
+    // at their no-split defaults). The split index is now derived from
+    // blockIdx.z inside the kernel — the host does not pass `i_split`.
+    args.num_splits = num_splits;
+    if (num_splits > 1) {
+        TORCH_CHECK(o_acc_workspace.has_value() && lse_acc_workspace.has_value(),
+                    "unified_attention: num_splits>1 requires o_acc_workspace and "
+                    "lse_acc_workspace tensors");
+        auto& oacc = *o_acc_workspace;
+        auto& lacc = *lse_acc_workspace;
+        TORCH_CHECK(oacc.dtype() == torch::kFloat32 && lacc.dtype() == torch::kFloat32,
+                    "unified_attention: split workspaces must be float32");
+        TORCH_CHECK(oacc.dim() == 4 && lacc.dim() == 3,
+                    "unified_attention: o_acc must be 4-D [nhead, splits, tokens, hdim], "
+                    "lse_acc must be 3-D [nhead, splits, tokens]");
+        args.o_acc_ptr             = oacc.data_ptr();
+        args.lse_acc_ptr           = lacc.data_ptr();
+        args.nhead_stride_o_acc    = oacc.stride(0);
+        args.split_stride_o_acc    = oacc.stride(1);
+        args.nhead_stride_lse_acc  = lacc.stride(0);
+        args.split_stride_lse_acc  = lacc.stride(1);
+    }
 
     auto [launched, elapsed] = ck_tile::unified_attention(args, {stream});
     TORCH_CHECK(launched,
