@@ -6,8 +6,8 @@ from typing import Optional
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.fusions.fused_reduce_q_norm_qk_rope_swa_write import (
-    _fused_reduce_q_norm_qk_rope_swa_write_kernel,
+from aiter.ops.triton._triton_kernels.fusions.fused_reduce_qk_norm_rope_swa_write import (
+    _fused_reduce_qk_norm_rope_swa_write_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -51,11 +51,13 @@ def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
     return bm, num_warps, waves_per_eu
 
 
-def fused_reduce_q_norm_qk_rope_swa_write(
+def fused_reduce_qk_norm_rope_swa_write(
     q: torch.Tensor,
     kv: torch.Tensor,
     q_norm_weight: Optional[torch.Tensor],
+    kv_norm_weight: Optional[torch.Tensor],
     q_rms_eps: float,
+    kv_rms_eps: float,
     rope_head_dim: int,
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
@@ -69,16 +71,19 @@ def fused_reduce_q_norm_qk_rope_swa_write(
     win: int = 128,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Fused split-K reduce + per-head weighted RMSNorm + RoPE tail + KV norm/RoPE (+ SWA).
+    """Fused split-K reduce + per-head weighted RMSNorm + RoPE tail on Q,
+    weighted RMSNorm + RoPE tail on KV (+ optional SWA).
 
-    Replaces the (split-K reduce → q-norm → q-rope → kv-rope → swa-write) post-GEMM chain.
+    Replaces the (split-K reduce → q-norm → q-rope → kv-norm → kv-rope → swa-write)
+    post-GEMM chain.
 
     Shapes:
         ``q``: ``[M, N]`` or ``[num_splitk, M, N]`` where ``N = num_local_heads * head_dim``.
             The 3D form lets the caller pass an unreduced split-K GEMM output; the kernel
             sums across ``num_splitk`` while loading.
-        ``kv``: ``[M, head_dim]`` updated in-place (RoPE on tail).
+        ``kv``: ``[M, head_dim]`` updated in-place (RMSNorm over head_dim + RoPE on tail).
         ``q_norm_weight``: ``[head_dim]`` (or None for weight-free RMSNorm).
+        ``kv_norm_weight``: ``[head_dim]`` (or None for weight-free RMSNorm).
         ``cos_cache`` / ``sin_cache``: ``[max_position, 1, 1, rope_head_dim // 2]``.
         ``positions``: ``[M]`` int32/int64 indices into cos/sin rows.
 
@@ -134,7 +139,7 @@ def fused_reduce_q_norm_qk_rope_swa_write(
         assert state_slot_mapping.dim() == 1
 
     _LOGGER.info(
-        "FUSED_REDUCE_Q_NORM_QK_ROPE_SWA_WRITE "
+        "FUSED_REDUCE_QK_NORM_ROPE_SWA_WRITE "
         f"M={M} num_splitk={num_splitk} heads={num_local_heads} "
         f"D={head_dim} rd={rope_head_dim} HAS_SWA={HAS_SWA}"
     )
@@ -143,11 +148,12 @@ def fused_reduce_q_norm_qk_rope_swa_write(
         M, num_local_heads, num_splitk
     )
     grid = (triton.cdiv(M, BLOCK_SIZE_M), num_local_heads + 1)
-    _fused_reduce_q_norm_qk_rope_swa_write_kernel[grid](
+    _fused_reduce_qk_norm_rope_swa_write_kernel[grid](
         q,
         q_out,
         kv,
         q_norm_weight,
+        kv_norm_weight,
         positions,
         cos_cache,
         sin_cache,
@@ -170,6 +176,7 @@ def fused_reduce_q_norm_qk_rope_swa_write(
         swa_kv.stride(1) if HAS_SWA else 0,
         win,
         q_rms_eps,
+        kv_rms_eps,
         HEAD_DIM=head_dim,
         ROPE_DIM=rope_head_dim,
         NUM_LOCAL_HEADS=num_local_heads,

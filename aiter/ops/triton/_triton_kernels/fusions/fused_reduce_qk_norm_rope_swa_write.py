@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fused split-K reduce + per-head weighted RMSNorm + RoPE (tail) + KV norm/RoPE
-(+ optional SWA KV write).
+"""Fused split-K reduce + per-head weighted RMSNorm + RoPE (tail) on Q,
+per-row weighted RMSNorm + RoPE (tail) on KV (+ optional SWA KV write).
 
 Grid: ``(cdiv(M, BLOCK_SIZE_M), num_local_heads + 1)``. Each program tile
 handles ``BLOCK_SIZE_M`` tokens. Programs with ``pid_h < num_local_heads``
@@ -10,8 +10,11 @@ load a query head tile ``[NUM_SPLITK, BLOCK_SIZE_M, HEAD_DIM]`` from
 ``q_in``, reduce over the split-K axis, apply per-head weighted batched
 RMSNorm, store the (pre-RoPE) head into ``q_out``, then call the batched
 RoPE on the last ``rope_head_dim`` elements. Programs with
-``pid_h == num_local_heads`` apply RoPE on the ``kv`` tail and optionally
-scatter into ``swa_kv``.
+``pid_h == num_local_heads`` load the full ``[BLOCK_SIZE_M, HEAD_DIM]``
+kv tile, apply weighted batched RMSNorm over ``head_dim``, store the
+normed nope part back into ``kv``, then extract the tail with the same
+reshape+sum trick used for q, apply RoPE, write the result to the kv
+tail, and optionally scatter both parts into ``swa_kv``.
 
 ``q_in`` layout (driven by API helper):
 - 2D: ``[M, N]`` — ``q_in_splitk_stride`` = 0, ``NUM_SPLITK`` = 1.
@@ -65,8 +68,8 @@ def _batched_unit_rope(
     return x_pe * cos + x_pe_rotated * sin
 
 
-_fused_reduce_q_norm_qk_rope_swa_write_repr = make_kernel_repr(
-    "_fused_reduce_q_norm_qk_rope_swa_write_kernel",
+_fused_reduce_qk_norm_rope_swa_write_repr = make_kernel_repr(
+    "_fused_reduce_qk_norm_rope_swa_write_kernel",
     [
         "BLOCK_SIZE_M",
         "HEAD_DIM",
@@ -80,12 +83,13 @@ _fused_reduce_q_norm_qk_rope_swa_write_repr = make_kernel_repr(
 )
 
 
-@triton.jit(repr=_fused_reduce_q_norm_qk_rope_swa_write_repr)
-def _fused_reduce_q_norm_qk_rope_swa_write_kernel(
+@triton.jit(repr=_fused_reduce_qk_norm_rope_swa_write_repr)
+def _fused_reduce_qk_norm_rope_swa_write_kernel(
     q_in_ptr,
     q_out_ptr,
     kv_ptr,
     q_norm_weight_ptr,
+    kv_norm_weight_ptr,
     positions_ptr,
     cos_ptr,
     sin_ptr,
@@ -108,6 +112,7 @@ def _fused_reduce_q_norm_qk_rope_swa_write_kernel(
     swa_kv_pos_stride,
     win,
     q_eps,
+    kv_eps,
     BLOCK_SIZE_M: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
@@ -219,11 +224,34 @@ def _fused_reduce_q_norm_qk_rope_swa_write_kernel(
     sin = tl.load(sin_ptr + cos_offs, mask=src_mask[:, None], other=0)
 
     kv_base_ptrs = kv_ptr + src_id[:, None].to(tl.int64) * stride_kv_m
-    kv_nope_ptrs = kv_base_ptrs + offs_d_full[None, :] * stride_kv_d
+    kv_full_ptrs = kv_base_ptrs + offs_d_full[None, :] * stride_kv_d
     kv_pe_ptrs = kv_base_ptrs + (NOPE_DIM + d_pe_offs[None, :]) * stride_kv_d
-    nope_load_mask = src_mask[:, None] & nope_d_mask[None, :]
-    kv_nope = tl.load(kv_nope_ptrs, mask=nope_load_mask, other=0.0)
-    kv_pe = tl.load(kv_pe_ptrs, mask=src_mask[:, None], other=0.0)
+
+    # Load the entire kv row (nope + pe) so we can RMSNorm over head_dim.
+    kv_full = tl.load(kv_full_ptrs, mask=src_mask[:, None], other=0.0).to(tl.float32)
+
+    if kv_norm_weight_ptr is not None:
+        w_kv = tl.load(kv_norm_weight_ptr + offs_d_full).to(tl.float32)
+    else:
+        w_kv = None
+    kv_normed = _batched_rmsnorm_op(
+        kv_full, w_kv, HEAD_DIM, kv_eps
+    )  # [BLOCK_SIZE_M, HEAD_DIM]
+
+    # Store the normed nope portion back into kv.
+    tl.store(
+        kv_full_ptrs,
+        kv_normed.to(kv_ptr.dtype.element_ty),
+        mask=src_mask[:, None] & nope_d_mask[None, :],
+    )
+
+    # Extract pe via the same reshape+sum trick used for q.
+    kv_pe = tl.where(
+        (offs_d_full >= NOPE_DIM)[None, :], kv_normed, 0.0
+    )  # [BLOCK_SIZE_M, HEAD_DIM]
+    kv_pe = kv_pe.reshape(BLOCK_SIZE_M, NUM_PE_CHUNKS, ROPE_DIM)
+    kv_pe = tl.sum(kv_pe, axis=1)  # [BLOCK_SIZE_M, ROPE_DIM]
+
     kv_pe = _batched_unit_rope(
         kv_pe,
         cos,
@@ -251,11 +279,11 @@ def _fused_reduce_q_norm_qk_rope_swa_write_kernel(
         )
         tl.store(
             swa_kv_ptrs + offs_d_full[None, :],
-            kv_nope,
-            mask=nope_load_mask,
+            kv_normed.to(swa_kv_ptr.dtype.element_ty),
+            mask=src_mask[:, None] & nope_d_mask[None, :],
         )
         tl.store(
             swa_kv_ptrs + NOPE_DIM + d_pe_offs[None, :],
-            kv_pe,
+            kv_pe.to(swa_kv_ptr.dtype.element_ty),
             mask=src_mask[:, None],
         )

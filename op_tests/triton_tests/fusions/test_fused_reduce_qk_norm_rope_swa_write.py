@@ -5,19 +5,13 @@ import pytest
 import torch
 
 import aiter
-from aiter.ops.triton.fusions.fused_reduce_q_norm_qk_rope_swa_write import (
-    fused_reduce_q_norm_qk_rope_swa_write,
+from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
+    fused_reduce_qk_norm_rope_swa_write,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
     run_torch as run_torch_gemm_a8w8_blockscale,
 )
-
-
-def _rmsnorm_per_head_ref(q: torch.Tensor, w, eps: float) -> torch.Tensor:
-    """``q``: ``[M, H, D]`` → per-row RMSNorm matching the kernel's ``_rmsmorm_op``."""
-    v = q.float().pow(2).mean(dim=-1, keepdim=True)
-    return (q.float() * torch.rsqrt(v + eps) * (w if w is not None else 1)).to(q.dtype)
 
 
 def _build_cos_sin(
@@ -34,46 +28,81 @@ def _build_cos_sin(
     return cos, sin
 
 
-def _rope_inplace_slice(
-    x_tail: torch.Tensor,
+def run_torch(
+    q_in_for_ref: torch.Tensor,
+    kv_pre: torch.Tensor,
+    q_norm_weight,
+    kv_norm_weight,
+    q_rms_eps: float,
+    kv_rms_eps: float,
+    rope_head_dim: int,
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
-    *,
     is_neox: bool,
-):
-    rotate_style = 0 if is_neox else 1
-    aiter.rope_cached_positions_fwd_inplace(
-        x_tail,
-        cos,
-        sin,
-        positions.view(1, -1),
-        rotate_style=rotate_style,
-        reuse_freqs_front_part=True,
-        nope_first=False,
-    )
-
-
-def _swa_ref(
-    kv: torch.Tensor,
-    write_indices: torch.Tensor,
-    positions: torch.Tensor,
-    batch_id_per_token: torch.Tensor,
-    state_slot_per_seq: torch.Tensor,
-    swa_kv: torch.Tensor,
+    M: int,
+    num_local_heads: int,
+    head_dim: int,
+    write_indices,
+    batch_id_per_token,
+    state_slot_per_seq,
+    swa_kv_ref: torch.Tensor,
     win: int,
 ):
-    keep = write_indices >= 0
-    src_ids = write_indices[keep].long()
-    if src_ids.numel() == 0:
-        return None, None
-    src_kv = kv[src_ids]
-    src_pos = positions[src_ids]
-    bids = batch_id_per_token[src_ids].long()
-    slots = state_slot_per_seq[bids].long()
-    ring_idx = src_pos % win
-    swa_kv[slots, ring_idx] = src_kv
-    return slots, ring_idx
+    """Reference: split-K reduce -> per-head Q RMSNorm + RoPE tail; per-row
+    KV RMSNorm over head_dim + RoPE tail; optional SWA scatter."""
+    dtype = kv_pre.dtype
+
+    def _rms_per_row(x: torch.Tensor, w, eps: float) -> torch.Tensor:
+        v = x.float().pow(2).mean(dim=-1, keepdim=True)
+        return (x.float() * torch.rsqrt(v + eps) * (w if w is not None else 1)).to(
+            x.dtype
+        )
+
+    def _rope_inplace_slice(x_tail: torch.Tensor):
+        rotate_style = 0 if is_neox else 1
+        aiter.rope_cached_positions_fwd_inplace(
+            x_tail,
+            cos,
+            sin,
+            positions.view(1, -1),
+            rotate_style=rotate_style,
+            reuse_freqs_front_part=True,
+            nope_first=False,
+        )
+
+    # Q: RMSNorm per head + RoPE on tail.
+    q_ref = q_in_for_ref.to(dtype).view(M, num_local_heads, head_dim)
+    q_ref = _rms_per_row(q_ref, q_norm_weight, q_rms_eps)
+    q_tail = (
+        q_ref[..., -rope_head_dim:]
+        .contiguous()
+        .view(1, M, num_local_heads, rope_head_dim)
+    )
+    _rope_inplace_slice(q_tail)
+    q_ref[..., -rope_head_dim:] = q_tail.view(M, num_local_heads, rope_head_dim)
+
+    # KV: RMSNorm over head_dim + RoPE on tail.
+    kv_ref = kv_pre.clone()
+    kv_ref = _rms_per_row(kv_ref, kv_norm_weight, kv_rms_eps)
+    kv_tail = kv_ref[..., -rope_head_dim:].contiguous().view(1, M, 1, rope_head_dim)
+    _rope_inplace_slice(kv_tail)
+    kv_ref[..., -rope_head_dim:] = kv_tail.view(M, rope_head_dim).clone()
+
+    # Optional SWA scatter using the *normed* kv values.
+    slots = ring_idx = None
+    if write_indices is not None:
+        keep = write_indices >= 0
+        src_ids = write_indices[keep].long()
+        if src_ids.numel() > 0:
+            src_kv = kv_ref[src_ids]
+            src_pos = positions[src_ids]
+            bids = batch_id_per_token[src_ids].long()
+            slots = state_slot_per_seq[bids].long()
+            ring_idx = src_pos % win
+            swa_kv_ref[slots, ring_idx] = src_kv
+
+    return q_ref, kv_ref, slots, ring_idx
 
 
 @pytest.mark.parametrize("M", [1, 2, 4, 8, 32])
@@ -81,16 +110,18 @@ def _swa_ref(
 @pytest.mark.parametrize("rope_head_dim", [64])
 @pytest.mark.parametrize("head_dim", [512])
 @pytest.mark.parametrize("q_norm_eps", [1e-6])
+@pytest.mark.parametrize("kv_norm_eps", [1e-6])
 @pytest.mark.parametrize("is_neox", [True, False])
 @pytest.mark.parametrize("with_swa", [True])
 @pytest.mark.parametrize("num_splitk", [1, 2])
-def test_fused_reduce_q_norm_qk_rope_swa_write(
+def test_fused_reduce_qk_norm_rope_swa_write(
     M: int,
     num_local_heads: int,
     q_lora_rank: int,
     rope_head_dim: int,
     head_dim: int,
     q_norm_eps: float,
+    kv_norm_eps: float,
     is_neox: bool,
     with_swa: bool,
     num_splitk: int,
@@ -119,8 +150,8 @@ def test_fused_reduce_q_norm_qk_rope_swa_write(
     )
 
     kv_pre = torch.randn(M, head_dim, dtype=dtype, device=device)
-    kv_ref = kv_pre.clone()
-    q_weight = None  # match earlier convention; weight-free RMSNorm
+    q_weight = None  # weight-free RMSNorm for Q
+    kv_weight = None  # weight-free RMSNorm for KV
 
     # Compute the reference full GEMM output (post a8w8 blockscale dequant).
     y_gemm = run_torch_gemm_a8w8_blockscale(x, w, x_scale, w_scale, torch.float32).to(
@@ -146,27 +177,9 @@ def test_fused_reduce_q_norm_qk_rope_swa_write(
             dim=0
         )  # what the kernel reads (bf16) summed in fp32
 
-    q_ref = q_in_for_ref.to(dtype).view(M, num_local_heads, head_dim)
-    q_ref = _rmsnorm_per_head_ref(q_ref, q_weight, q_norm_eps)
-
     max_seq = 8192
     cos, sin = _build_cos_sin(rope_head_dim, max_seq, dtype, device)
     positions = torch.randperm(max_seq, dtype=torch.int64, device=device)[:M]
-
-    q_tail_ref = (
-        q_ref[..., -rope_head_dim:]
-        .contiguous()
-        .view(1, M, num_local_heads, rope_head_dim)
-    )
-    _rope_inplace_slice(q_tail_ref, cos, sin, positions, is_neox=is_neox)
-    q_ref[..., -rope_head_dim:] = q_tail_ref.view(M, num_local_heads, rope_head_dim)
-
-    kv_tail_ref = kv_ref[..., -rope_head_dim:].contiguous().view(1, M, 1, rope_head_dim)
-    _rope_inplace_slice(kv_tail_ref, cos, sin, positions, is_neox=is_neox)
-    kv_ref[..., -rope_head_dim:] = kv_tail_ref.view(M, rope_head_dim).clone()
-
-    kv_test = kv_pre.clone()
-    q_out = torch.empty(M, num_local_heads, head_dim, dtype=dtype, device=device)
 
     num_slots = M
     win = 128
@@ -174,20 +187,43 @@ def test_fused_reduce_q_norm_qk_rope_swa_write(
     swa_kv_ref = torch.zeros_like(swa_kv_test)
 
     write_indices = batch_id = slot_map = None
-    slots = ring_idx = None
     if with_swa:
         write_indices = torch.randperm(M, dtype=torch.int32, device=device)
         slot_map = torch.randperm(num_slots, dtype=torch.int32, device=device)[:M]
         batch_id = torch.randperm(M, dtype=torch.int32, device=device)
-        slots, ring_idx = _swa_ref(
-            kv_ref, write_indices, positions, batch_id, slot_map, swa_kv_ref, win
-        )
 
-    fused_reduce_q_norm_qk_rope_swa_write(
+    q_ref, kv_ref, slots, ring_idx = run_torch(
+        q_in_for_ref,
+        kv_pre,
+        q_weight,
+        kv_weight,
+        q_norm_eps,
+        kv_norm_eps,
+        rope_head_dim,
+        cos,
+        sin,
+        positions,
+        is_neox,
+        M,
+        num_local_heads,
+        head_dim,
+        write_indices,
+        batch_id,
+        slot_map,
+        swa_kv_ref,
+        win,
+    )
+
+    kv_test = kv_pre.clone()
+    q_out = torch.empty(M, num_local_heads, head_dim, dtype=dtype, device=device)
+
+    fused_reduce_qk_norm_rope_swa_write(
         q_in,
         kv_test,
         q_weight,
+        kv_weight,
         q_norm_eps,
+        kv_norm_eps,
         rope_head_dim,
         cos,
         sin,
