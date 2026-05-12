@@ -1353,6 +1353,7 @@ __global__ void fused_rope_rms_2way_kernel(const T* q0_,
 {
     using mrope_utils::WARP_SIZE;
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
+    constexpr int PAIR_VEC_SIZE   = VEC_SIZE / 2;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
     const int warp_id             = threadIdx.x / WARP_SIZE;
     const int num_warps_per_block = blockDim.x / WARP_SIZE;
@@ -1388,7 +1389,8 @@ __global__ void fused_rope_rms_2way_kernel(const T* q0_,
     int head_id_in_token;
     int data_offset;
 
-    vec_t<T, VEC_SIZE> w_vec, x_vec, cos_sin_vec, cos_vec, sin_vec;
+    vec_t<T, VEC_SIZE> w_vec, x_vec, cos_sin_vec;
+    vec_t<T, PAIR_VEC_SIZE> cos_vec, sin_vec;
 
     if(is_q0)
     {
@@ -1494,7 +1496,7 @@ __global__ void fused_rope_rms_2way_kernel(const T* q0_,
     else
     {
 #pragma unroll
-        for(int i = 0; i < VEC_SIZE / 2; ++i)
+        for(int i = 0; i < PAIR_VEC_SIZE; ++i)
         {
             out_vec[2 * i + 0] = (float)x_vec[2 * i + 0] * (float)cos_vec[i] -
                                  (float)x_vec[2 * i + 1] * (float)sin_vec[i];
