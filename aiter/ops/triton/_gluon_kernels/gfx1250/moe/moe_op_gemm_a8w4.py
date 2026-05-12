@@ -73,14 +73,10 @@ def unswizzle_mx_scale_gfx1250(
     scale_buffer_slice = (
         scale_buffer_slice.reshape(
             (
-                BLOCK_N // PRESHUFFLE_FACTOR,
-                MX_SCALE_BLOCK_K // SCALE_KWIDTH,
-                PRESHUFFLE_FACTOR // 4,
-                4,
-                SCALE_KWIDTH,
+                BLOCK_N // PRESHUFFLE_FACTOR, MX_SCALE_BLOCK_K // SCALE_KWIDTH, PRESHUFFLE_FACTOR, SCALE_KWIDTH 
             )
         )
-        .permute((0, 3, 2, 1, 4))
+        .permute((0, 2, 1, 3))
         .reshape((BLOCK_N, MX_SCALE_BLOCK_K))
     )
 
@@ -219,10 +215,10 @@ def _moe_gemm_a8w4(
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         gl.static_assert(stride_w_mx_k is not None)
         gl.static_assert(stride_w_mx_n is not None)
-        PRESHUFFLE_FACTOR: gl.constexpr = 128
+        PRESHUFFLE_FACTOR: gl.constexpr = 32
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR
-        SCALE_KWIDTH: gl.constexpr = 4 if MX_SCALE_BLOCK_K >= 4 else MX_SCALE_BLOCK_K
+        SCALE_KWIDTH: gl.constexpr = 8 
     else:
         PRESHUFFLE_FACTOR: gl.constexpr = 1
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
@@ -312,15 +308,15 @@ def _moe_gemm_a8w4(
         WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
             3,
             transposed=True,
-            warp_bases=[[0, 2], [1, 0]],
-            reg_bases=[[0, 1]],
+            warp_bases=[[0, 1], [1, 0]],
+            reg_bases=[],
             instr_shape=[16, 16, 128],
         )
         WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(
             3,
             transposed=True,
-            warp_bases=[[0, 2], [1, 0]],
-            reg_bases=[[0, 1]],
+            warp_bases=[[0, 1], [1, 0]],
+            reg_bases=[],
             instr_shape=[16, 16, 64],
         )
     else:

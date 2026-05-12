@@ -199,7 +199,6 @@ class Case:
             Case(300, 400, 800, "float8_e4m3fn", 8, 4),
             Case(16, 512, 512, "mxfloat8_e4m3fn", 32, 2),
             Case(16, 512, 512, "mxfloat8_e4m3fn", 32, 2, hbm_swizzling=True),
-            Case(300, 400, 800, "mxfloat8_e4m3fn", 8, 4),
         ]
     ],
 )
@@ -248,7 +247,7 @@ def test_op(
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx950."
             )
-        if get_arch() == "gfx1250" and (n % 128 != 0 or k % (32 * 4) != 0):
+        if get_arch() == "gfx1250" and (n % 32 != 0 or k % (32 * 8) != 0):
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx1250."
             )

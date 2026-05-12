@@ -8,7 +8,7 @@ from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
 )
-from aiter.ops.triton._gluon_kernels.moe.moe_op_gemm_a8w4 import (
+from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_gluon,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
@@ -169,16 +169,16 @@ def swizzle_scales_gfx950(data):
 
 def swizzle_scales_gfx1250(data):
     E, K_SCALE, N = data.shape
-    preshuffle_factor = 128
+    preshuffle_factor = 32
     num_chunk_n = N // preshuffle_factor
-    SCALE_KWIDTH = 4 if K_SCALE >= 4 else K_SCALE
+    SCALE_KWIDTH = 8 
     num_chunk_k = K_SCALE // SCALE_KWIDTH
 
     data = data.transpose(-1, -2)
     data = data.view(
-        E, num_chunk_n, 4, preshuffle_factor // 4, num_chunk_k, SCALE_KWIDTH
+        E, num_chunk_n, 32, num_chunk_k, SCALE_KWIDTH 
     )
-    data = data.permute(0, 1, 4, 3, 2, 5).contiguous()
+    data = data.permute(0, 1, 3, 2, 4).contiguous()
     data = data.view(E, N // preshuffle_factor, K_SCALE * preshuffle_factor)
     data = data.transpose(-1, -2)
 
