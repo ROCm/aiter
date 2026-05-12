@@ -80,67 +80,126 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
-def run_aot_worker(kind):
-    """Worker for ProcessPoolExecutor — runs in a child process."""
+def _collect_aot_jobs_for(kind):
+    """Helper: load DEFAULT_CSVS + parse_csv for the named kind and
+    return its job list. Imports are local so this runs cheaply on the
+    parent (no FlyDSL JIT pulled in until a worker runs)."""
     if kind == "moe":
-        from .moe import (
-            DEFAULT_CSVS,
-            compile_one_config,
-            parse_csv,
-        )
+        from .moe import DEFAULT_CSVS, parse_csv
     else:
-        from .gemm import (
-            DEFAULT_CSVS,
-            compile_one_config,
-            parse_csv,
-        )
+        from .gemm import DEFAULT_CSVS, parse_csv
+    return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
 
-    label = f"FlyDSL {kind.upper()} AOT"
-    jobs = collect_aot_jobs(DEFAULT_CSVS, parse_csv)
-    if not jobs:
-        return label, 0, 0
-    cache_dir = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
-    print(f"[aiter] {label}: {len(jobs)} kernels to compile (cache: {cache_dir})")
-    results = [compile_one_config(**job) for job in jobs]
-    ok = sum(1 for r in results if r["compile_time"] is not None)
-    fail = len(results) - ok
-    print(f"[aiter] {label}: compiled {ok} ok, {fail} failed")
-    return label, ok, fail
+
+def _compile_one(kind, job):
+    """Per-kernel worker — runs in a ProcessPoolExecutor child process.
+    Top-level so it's picklable. Imports compile_one_config lazily so
+    the pickle wire payload is just (kind, job-dict)."""
+    if kind == "moe":
+        from .moe import compile_one_config
+    else:
+        from .gemm import compile_one_config
+    return kind, compile_one_config(**job)
 
 
 def start_aot(cache_dir: str):
     """Start FlyDSL AOT compilation in background processes.
 
+    Submits one task per kernel (across MoE + GEMM) to a single shared
+    ProcessPoolExecutor. Pool size is configurable via env:
+
+      AITER_FLYDSL_AOT_WORKERS — explicit cap (positive int)
+                                 default: min(os.cpu_count() or 4, 64)
+                                 — 64-worker ceiling so we don't blow past
+                                 typical FlyDSL/torch import RAM budget on
+                                 very wide hosts (192+ cores)
+
+    Previously hardcoded to max_workers=2 (one process per kind, each
+    serializing all of its kernels). On a 64+ core build host that left
+    almost the entire machine idle for the FlyDSL stage. With one task
+    per kernel + a shared pool, the per-kernel compiles fan out across
+    all workers.
+
     Returns (pool, futures_dict) — caller must call ``wait_aot``
-    to collect results and raise on failure.
+    to collect results and raise on failure. If there are no jobs to
+    compile, returns (None, {}) and ``wait_aot`` becomes a no-op.
     """
     from concurrent.futures import ProcessPoolExecutor
 
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
-    pool = ProcessPoolExecutor(max_workers=2)
-    futures = {
-        pool.submit(run_aot_worker, "moe"): "MoE",
-        pool.submit(run_aot_worker, "gemm"): "GEMM",
-    }
+    workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
+    if (
+        workers_env is not None
+        and workers_env.isdigit()
+        and int(workers_env) > 0
+    ):
+        max_workers = int(workers_env)
+    else:
+        max_workers = min(os.cpu_count() or 4, 64)
+
+    # Flatten all kernels from both kinds into a single submission list.
+    all_jobs = []  # list of (kind, job-dict)
+    for kind in ("moe", "gemm"):
+        for job in _collect_aot_jobs_for(kind):
+            all_jobs.append((kind, job))
+
+    if not all_jobs:
+        print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
+        return None, {}
+
+    # Cap pool at the actual job count so we don't spin up idle workers.
+    max_workers = min(max_workers, len(all_jobs))
+    print(
+        f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels (MoE+GEMM), "
+        f"{max_workers} worker processes (cache: {cache_dir})"
+    )
+
+    pool = ProcessPoolExecutor(max_workers=max_workers)
+    futures = {}
+    for kind, job in all_jobs:
+        f = pool.submit(_compile_one, kind, job)
+        # Store a small label string for crash diagnostics in wait_aot.
+        futures[f] = f"{kind.upper()} {job.get('kernel_name', '?')}"
     return pool, futures
 
 
 def wait_aot(pool, futures):
-    """Wait for FlyDSL AOT workers and raise on any failure."""
+    """Wait for FlyDSL AOT workers and raise on any failure.
+
+    Aggregates per-kernel results back to per-kind tallies for log
+    parity with the previous run_aot_worker output."""
+    if pool is None or not futures:
+        return
     try:
+        ok_by_kind = {"moe": 0, "gemm": 0}
+        fail_by_kind = {"moe": 0, "gemm": 0}
         errors = []
         for future in futures:
             try:
-                label, ok, fail = future.result()
-                if fail > 0:
-                    errors.append(f"{label}: {fail} compile failure(s)")
+                kind, result = future.result()
+                if result.get("compile_time") is not None:
+                    ok_by_kind[kind] += 1
+                else:
+                    fail_by_kind[kind] += 1
             except Exception as worker_err:
+                # Crashes don't tell us which kind — best-effort attribute
+                # to whatever the label string starts with.
+                label = futures[future]
+                kind = "moe" if label.startswith("MOE") else "gemm"
+                fail_by_kind[kind] += 1
                 errors.append(
-                    f"FlyDSL {futures[future]} AOT worker crashed: {worker_err}"
+                    f"FlyDSL {label} AOT worker crashed: {worker_err}"
                 )
+        for kind in ("moe", "gemm"):
+            print(
+                f"[aiter] FlyDSL {kind.upper()} AOT: "
+                f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
+            )
         if errors:
-            raise AssertionError("[aiter] FlyDSL AOT failures: " + "; ".join(errors))
+            raise AssertionError(
+                "[aiter] FlyDSL AOT failures: " + "; ".join(errors)
+            )
     finally:
         pool.shutdown(wait=False)
