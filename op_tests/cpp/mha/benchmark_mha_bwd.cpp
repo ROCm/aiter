@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "ck_tile/host.hpp"
+#include "ck_tile/host/pinned_host_releaser.hpp"
 #include "mha_bwd.h"
 #include "utils.hpp"
 
@@ -8,6 +9,7 @@
 #include <array>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <numeric>
 #include <ostream>
 #include <string>
@@ -352,8 +354,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
         (mode == mode_enum::batch ? seqlen_q : seqstart_q_host.back());
     const ck_tile::index_t shape_seqlen_k =
         (mode == mode_enum::batch ? seqlen_k : seqstart_k_host.back());
-    // For group mode, the new launcher needs seqstart on host during construction.
-    // seqstart_q_host / seqstart_k_host are already host std::vector<int> from earlier.
     const fmha_bwd_traits traits{
         shape_seqlen_q,
         shape_seqlen_k,
@@ -372,12 +372,11 @@ bool run(const ck_tile::ArgParser& arg_parser)
         p_drop > 0.0f,
         s_randval,
         deterministic,
-        (mode == mode_enum::group) ? seqstart_q_host.data() : nullptr,
-        (mode == mode_enum::group) ? seqstart_k_host.data() : nullptr,
     };
-    fmha_bwd_launcher launcher(traits);
-    // nsplits is still needed for the ASM atomic16 dq_accum tensor shape below.
-    // Recompute it independently since the new launcher no longer exposes dq_acc_splits.
+    // Note: we no longer construct fmha_bwd_launcher here. The benchmark goes
+    // through aiter::mha_bwd, which internally constructs the launcher and
+    // queries workspace_size. We expose a lazy-grow workspace_alloc callback
+    // below so the dispatcher can resize on demand.
     const ck_tile::index_t kN0 = (hdim_q <= 128) ? 128 : 64;
     const ck_tile::index_t nsplits =
         deterministic ? ck_tile::integer_divide_ceil(max_seqlen_k, kN0) : 1;
@@ -493,20 +492,38 @@ bool run(const ck_tile::ArgParser& arg_parser)
     const std::size_t asm_dq_acc_bytes =
         v3_atomic_fp32 ? dq_acc_host.get_element_space_size_in_bytes()
                        : dq_acc_host_a16.get_element_space_size_in_bytes();
-    const std::size_t ck_workspace_bytes = launcher.workspace_size;
-    ck_tile::DeviceMem dq_acc_buf(std::max(asm_dq_acc_bytes, ck_workspace_bytes));
+    // Pre-size for the ASM v3 path (which sets the buffer pointer directly,
+    // bypassing workspace_alloc). The CK path will lazy-grow via workspace_alloc
+    // below if it needs more bytes than asm_dq_acc_bytes.
+    ck_tile::DeviceMem dq_acc_buf(asm_dq_acc_bytes);
 
-    // Pre-allocated dq_acc_buf serves the workspace_alloc callback (sized to max of
-    // ASM dq_accum and CK launcher workspace requirements).
+    // Lazy-grow workspace allocator: dispatcher calls this with the size CK's
+    // launcher needs. We resize on demand and zero-init when asked. This avoids
+    // requiring the benchmark to pre-compute the launcher's workspace upper bound.
     auto workspace_alloc = [&dq_acc_buf](size_t bytes, bool zero_init) -> void* {
-        AITER_CHECK(bytes <= dq_acc_buf.GetBufferSize(),
-                    "benchmark workspace_alloc: requested ", bytes,
-                    " bytes but dq_acc_buf is ", dq_acc_buf.GetBufferSize());
+        if(bytes > dq_acc_buf.GetBufferSize())
+        {
+            dq_acc_buf.Realloc(bytes);
+        }
         if(zero_init)
         {
             HIP_CHECK_ERROR(hipMemset(dq_acc_buf.GetDeviceBuffer(), 0, bytes));
         }
         return dq_acc_buf.GetDeviceBuffer();
+    };
+
+    // Pinned host allocator for the dispatcher's async pipeline. The shared_ptr
+    // deleter MUST NOT call any HIP API: it runs from the launcher's
+    // hipLaunchHostFunc release callback on the driver helper thread, which
+    // holds HIP runtime locks. Calling hipHostFree there deadlocks against the
+    // main thread's hipFree (DeviceMem dtor). Instead, the deleter enqueues the
+    // pointer to a worker thread that hipHostFrees off the callback path.
+    auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
+        void* p = nullptr;
+        HIP_CHECK_ERROR(hipHostMalloc(&p, bytes, hipHostMallocDefault));
+        return std::shared_ptr<void>(p, [](void* q) {
+            ck_tile::pinned_host_releaser::instance().enqueue(q);
+        });
     };
 
     q_buf.ToDevice(q_host.data());
@@ -687,7 +704,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    p_drop,
                                    p_undrop,
                                    drop_seed_offset,
-                                   workspace_alloc};
+                                   workspace_alloc,
+                                   pinned_host_alloc};
     }();
 
     float ave_time = aiter::mha_bwd(mha_args, stream_config);

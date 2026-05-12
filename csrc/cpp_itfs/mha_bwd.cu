@@ -1,9 +1,7 @@
 #include "mha_bwd.h"
 #include "aiter_hip_common.h"
 #include "asm_fmha_v3_bwd_configs.hpp"
-#include <memory>
 #include <string>
-#include <vector>
 
 namespace aiter {
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
@@ -137,31 +135,10 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     if(asm_ret != -1)
         return asm_ret;
 
-    // For group mode, the new launcher needs seqstart arrays on host during construction.
-    // Locally D2H-copy them; the host buffers stay alive only for traits/launcher
-    // construction below, then are released — they are not retained by the launcher.
-    std::vector<int> seqstart_q_host, seqstart_k_host;
-    const int* seqstart_qs_ptr = nullptr;
-    const int* seqstart_ks_ptr = nullptr;
-    if(a.is_group_mode)
+    if(a.is_group_mode && (a.seqstart_q_ptr == nullptr || a.seqstart_k_ptr == nullptr))
     {
-        if(a.seqstart_q_ptr == nullptr || a.seqstart_k_ptr == nullptr)
-        {
-            AITER_LOG_ERROR("mha_bwd: group mode requires seqstart_q_ptr and seqstart_k_ptr");
-            return -1;
-        }
-        seqstart_q_host.resize(a.batch + 1);
-        seqstart_k_host.resize(a.batch + 1);
-        HIP_CALL(hipMemcpy(seqstart_q_host.data(),
-                           a.seqstart_q_ptr,
-                           sizeof(int) * (a.batch + 1),
-                           hipMemcpyDeviceToHost));
-        HIP_CALL(hipMemcpy(seqstart_k_host.data(),
-                           a.seqstart_k_ptr,
-                           sizeof(int) * (a.batch + 1),
-                           hipMemcpyDeviceToHost));
-        seqstart_qs_ptr = seqstart_q_host.data();
-        seqstart_ks_ptr = seqstart_k_host.data();
+        AITER_LOG_ERROR("mha_bwd: group mode requires seqstart_q_ptr and seqstart_k_ptr");
+        return -1;
     }
 
     const fmha_bwd_traits traits{
@@ -182,13 +159,20 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         a.has_dropout,
         a.is_store_randval,
         a.is_deterministic,
-        seqstart_qs_ptr,
-        seqstart_ks_ptr,
     };
 
-    const fmha_bwd_launcher launcher(traits);
+    fmha_bwd_launcher launcher(traits);
     void* workspace_ptr = a.workspace_alloc(launcher.workspace_size, /*zero_init=*/false);
-    launcher.prepare_workspace(workspace_ptr);
+
+    // Single call enqueues the full async workspace pipeline on the caller's
+    // stream: dq_acc zero (if needed), D2H seqstart (group mode), pack on host,
+    // H2D ws metadata. The pinned staging buffer is owned by `launcher` and
+    // released by its destructor via a tail hipLaunchHostFunc on the stream.
+    launcher.prepare_workspace_async(workspace_ptr,
+                                     static_cast<const int*>(a.seqstart_q_ptr),
+                                     static_cast<const int*>(a.seqstart_k_ptr),
+                                     s,
+                                     a.pinned_host_alloc);
 
     fmha_bwd_args ck_args{
         /* q_ptr              */ a.q_ptr,
