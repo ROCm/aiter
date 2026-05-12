@@ -218,7 +218,9 @@ def get_model_configs(
 
     Args:
         config_path (str): User-provided path to the configuration JSON file.
-        models: List of model names to retrieve, with pattern <modelfamily_modelsize>. If modelfamily specified only, retrieves all the modelsizes.
+        models: List of model names to retrieve. Use ``family-size`` (split on first ``-``) or
+        ``family_size`` (split on first ``_`` if there is no ``-``). Size keys in JSON use ``_``
+        instead of ``-``. If only the family is given, all sizes are returned.
 
     Returns:
         dict: A dictionary of available models and their configurations for the specified families.
@@ -238,12 +240,16 @@ def get_model_configs(
         models = models.replace(" ", "").split(",")
 
     for model in models:
-        delimiter = "_" if "_" in model else "-"
-        model_specs = model.split(delimiter)
-        model_family = model_specs[0]
+        if "-" in model:
+            parts = model.split("-", 1)
+            model_family, model_size = parts[0], parts[1] if len(parts) > 1 else None
+        elif "_" in model:
+            parts = model.split("_", 1)
+            model_family, model_size = parts[0], parts[1] if len(parts) > 1 else None
+        else:
+            model_family, model_size = model, None
 
         if model_family in configs:
-            model_size = model_specs[1] if len(model_specs) > 1 else None
             # Check if model filtering is required
             if model_size is None:  # Include all models in the family
                 # Include all models in the family
