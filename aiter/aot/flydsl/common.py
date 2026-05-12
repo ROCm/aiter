@@ -140,11 +140,16 @@ def start_aot(cache_dir: str):
     Submits one task per kernel (across MoE + GEMM) to a single shared
     ProcessPoolExecutor. Pool size is configurable via env:
 
-      AITER_FLYDSL_AOT_WORKERS — explicit cap (positive int)
-                                 default: min(os.cpu_count() or 4, 64)
-                                 — 64-worker ceiling so we don't blow past
-                                 typical FlyDSL/torch import RAM budget on
-                                 very wide hosts (192+ cores)
+      AITER_FLYDSL_AOT_WORKERS — explicit cap (positive int).
+                                 Invalid values (non-int, "0", negatives,
+                                 surrounding whitespace) raise ValueError
+                                 rather than silently falling back.
+                                 default: min(_affinity_aware_cpu_count(), 64)
+                                 — affinity/cpuset-aware count (handles
+                                 cgroup-constrained CI containers) capped
+                                 at 64 so we don't blow past typical
+                                 FlyDSL/torch import RAM budget on very
+                                 wide hosts (192+ cores).
 
     Previously hardcoded to max_workers=2 (one process per kind, each
     serializing all of its kernels). On a 64+ core build host that left
@@ -162,8 +167,20 @@ def start_aot(cache_dir: str):
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
     workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
-    if workers_env is not None and workers_env.isdigit() and int(workers_env) > 0:
-        max_workers = int(workers_env)
+    if workers_env is not None:
+        # Strict validation: silent fallback on a misspelled override is
+        # exactly the kind of CI surprise we want to avoid.
+        try:
+            requested = int(workers_env)
+        except ValueError as e:
+            raise ValueError(
+                f"AITER_FLYDSL_AOT_WORKERS must be a positive integer, got {workers_env!r}"
+            ) from e
+        if requested <= 0:
+            raise ValueError(
+                f"AITER_FLYDSL_AOT_WORKERS must be > 0, got {workers_env!r}"
+            )
+        max_workers = requested
     else:
         max_workers = min(_affinity_aware_cpu_count(), 64)
 
