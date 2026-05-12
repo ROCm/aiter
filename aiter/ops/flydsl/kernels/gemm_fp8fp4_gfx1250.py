@@ -58,6 +58,8 @@ def compile_mxscale_gemm(
     use_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     atomic_barrier_enable: bool = False,
+    batch_count: int = 1,
+    grouped_masked_m: bool = False,
 ):
     """Compile an MXFP4 or MXFP8 GEMM kernel with TDM async copy.
 
@@ -87,6 +89,12 @@ def compile_mxscale_gemm(
         raise ValueError(f"num_buffers must be 2, 3, or 4, got {num_buffers}")
     if split_k < 1:
         raise ValueError(f"split_k must be >= 1, got {split_k}")
+    if batch_count < 1:
+        raise ValueError(f"batch_count must be >= 1, got {batch_count}")
+    if batch_count > 1 and split_k != 1:
+        raise ValueError("batch_count > 1 currently requires split_k == 1")
+    if grouped_masked_m and batch_count <= 1:
+        raise ValueError("grouped_masked_m requires batch_count > 1")
 
     use_cluster = cluster_m > 1 or cluster_n > 1
     if use_cluster:
@@ -356,6 +364,7 @@ def compile_mxscale_gemm(
         arg_b: fx.Tensor,
         arg_a_scale: fx.Tensor,
         arg_b_scale: fx.Tensor,
+        arg_masked_m: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
     ):
@@ -379,11 +388,37 @@ def compile_mxscale_gemm(
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
         by = gpu.block_id("y")
-        bz = fx.Index(gpu.block_idx.z) if split_k > 1 else arith.index(0)
+        m_tiles_per_batch = (arith.index(M) + arith.index(tile_m - 1)) / arith.index(tile_m)
+        if const_expr(batch_count > 1):
+            flat_bx = fx.Index(gpu.block_idx.x)
+            batch_idx = flat_bx / m_tiles_per_batch
+            bx_local = flat_bx - batch_idx * m_tiles_per_batch
+            bz = arith.index(0)
+        else:
+            batch_idx = arith.index(0)
+            bx_local = bx
+            bz = fx.Index(gpu.block_idx.z) if split_k > 1 else arith.index(0)
 
-        blk_m = bx * arith.index(tile_m)
+        blk_m = bx_local * arith.index(tile_m)
         blk_n = by * arith.index(tile_n)
         split_k_base = bz * arith.index(split_k_chunk)
+        batch_m_base = batch_idx * arith.index(M)
+        batch_b_base = batch_idx * arith.index(N // 16)
+        batch_as_base = batch_idx * arith.index(M // wmma_m_rep)
+        batch_bs_base = batch_idx * arith.index(N // b_scale_load_rep)
+        if const_expr(grouped_masked_m):
+            masked_m_rsrc = buffer_ops.create_buffer_resource(arg_masked_m, max_size=True)
+            valid_m_i32 = buffer_ops.buffer_load(
+                masked_m_rsrc,
+                arith.index_cast(T.i32, batch_idx),
+                vec_width=1,
+                dtype=T.i32,
+            )
+            tile_valid = arith.cmpi(
+                arith.CmpIPredicate.slt,
+                arith.index_cast(T.i32, blk_m),
+                valid_m_i32,
+            )
 
         if const_expr(use_cluster):
             local_x, local_y = gpu.compute_cluster_position()
@@ -406,7 +441,11 @@ def compile_mxscale_gemm(
 
         m_idx = arith.index_cast(T.index, i32_m.ir_value())
         n_stride = arith.index(N)
-        c_nrec = m_idx * n_stride * arith.index(elem_bytes_d)
+        if const_expr(batch_count > 1):
+            c_rows = arith.index(batch_count * M)
+        else:
+            c_rows = m_idx
+        c_nrec = c_rows * n_stride * arith.index(elem_bytes_d)
         c_rsrc = buffer_ops.create_buffer_resource(arg_c, num_records_bytes=c_nrec)
         zero_i32 = arith.constant(0, type=T.i32)
 
@@ -414,8 +453,8 @@ def compile_mxscale_gemm(
             k_packed_off = k_base / arith.index(PACK_FACTOR_A)
             return tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_a, lds_memref=memref,
-                global_offset=(blk_m, k_packed_off),
-                tensor_shape=(tile_m, packed_tile_k_a),
+                global_offset=(batch_m_base + blk_m, k_packed_off),
+                tensor_shape=(batch_count * M, K_packed_a),
                 strides=(K_packed_a, 1),
                 tile_shape=(tile_m, packed_tile_k_a),
                 elem_bytes=1,
@@ -428,9 +467,9 @@ def compile_mxscale_gemm(
             k_packed_off = k_base / arith.index(PACK_FACTOR_B)
             return tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_b, lds_memref=memref,
-                global_offset=(blk_n / arith.index(16),
+                global_offset=(batch_b_base + blk_n / arith.index(16),
                                k_packed_off * arith.index(16)),
-                tensor_shape=(N // 16, K_packed_b * 16),
+                tensor_shape=(batch_count * (N // 16), K_packed_b * 16),
                 strides=(K_packed_b * 16, 1),
                 tile_shape=(tile_n // 16, packed_tile_k_b * 16),
                 elem_bytes=1,
@@ -445,7 +484,7 @@ def compile_mxscale_gemm(
             inner_off = k_scale_off * arith.index(wmma_m_rep)
             return tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_a_scale, lds_memref=memref,
-                global_offset=(outer_off, inner_off),
+                global_offset=(batch_as_base + outer_off, inner_off),
                 tensor_shape=(WMMA_M * m_warp, interleaved_scale_cols_a),
                 strides=(wmma_m_rep * K_scale, 1),
                 tile_shape=(WMMA_M * m_warp, interleaved_scale_cols_a),
@@ -461,7 +500,7 @@ def compile_mxscale_gemm(
             inner_off = k_scale_off * arith.index(b_scale_load_rep)
             return tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_b_scale, lds_memref=memref,
-                global_offset=(outer_off, inner_off),
+                global_offset=(batch_bs_base + outer_off, inner_off),
                 tensor_shape=(WMMA_M * n_warp, interleaved_scale_cols_b),
                 strides=(b_scale_load_rep * K_scale, 1),
                 tile_shape=(WMMA_M * n_warp, interleaved_scale_cols_b),
@@ -1035,7 +1074,7 @@ def compile_mxscale_gemm(
             addrs = []
             _bf16_out = out_dtype in ("bf16", "f16")
             for acc_idx, vec_base, m_off, wn in _sub_tiles:
-                row = blk_m + warp_m_base + arith.index(m_off) + lane16
+                row = batch_m_base + blk_m + warp_m_base + arith.index(m_off) + lane16
                 col_base = (blk_n + warp_n_base + arith.index(wn * WMMA_N)
                             + lane_kgrp * arith.index(8))
                 if const_expr(_bf16_out):
@@ -1134,12 +1173,12 @@ def compile_mxscale_gemm(
             pf_k_packed_a = pf_k / arith.index(PACK_FACTOR_A)
             pf_k_packed_b = pf_k / arith.index(PACK_FACTOR_B)
             tdm_ops.l2_prefetch_tile(
-                arg_a, (blk_m, pf_k_packed_a),
+                arg_a, (batch_m_base + blk_m, pf_k_packed_a),
                 (tile_m, packed_tile_k_a), (K_packed_a, 1),
                 elem_bytes=1, thread_id=tx, block_threads=block_threads)
             tdm_ops.l2_prefetch_tile(
                 arg_b,
-                (blk_n / arith.index(16), pf_k_packed_b * arith.index(16)),
+                (batch_b_base + blk_n / arith.index(16), pf_k_packed_b * arith.index(16)),
                 (tile_n // 16, packed_tile_k_b * 16),
                 (K_packed_b * 16, 1),
                 elem_bytes=1, thread_id=tx, block_threads=block_threads)
@@ -1211,7 +1250,7 @@ def compile_mxscale_gemm(
             d_desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_c,
                 lds_memref=d_lds_base_ptr,
-                global_offset=(blk_m + warp_m_off_sgpr,
+                global_offset=(batch_m_base + blk_m + warp_m_off_sgpr,
                                blk_n + warp_n_off_sgpr),
                 tensor_shape=(warp_tile_m, warp_tile_n),
                 strides=(N, 1),
@@ -1253,7 +1292,14 @@ def compile_mxscale_gemm(
         adv_as_i32 = arith.constant(tile_k // SCALE_BLOCK * wmma_m_rep, type=T.i32)
         adv_bs_i32 = arith.constant(tile_k // SCALE_BLOCK * b_scale_load_rep, type=T.i32)
 
-        pred_const = arith.constant(1, type=T.i32)
+        if const_expr(grouped_masked_m):
+            pred_const = arith.select(
+                tile_valid,
+                arith.constant(1, type=T.i32),
+                arith.constant(0, type=T.i32),
+            )
+        else:
+            pred_const = arith.constant(1, type=T.i32)
 
         if const_expr(wave_specialized_tdm):
             active_stage_lds_addr = [
@@ -1580,7 +1626,7 @@ def compile_mxscale_gemm(
                  cluster_m, cluster_n, use_tdm_store,
                  out_dtype, inst_prefetch, wave_specialized_tdm, split_k,
                  use_scale_opsel, expert_sched_mode,
-                 atomic_barrier_enable)
+                 atomic_barrier_enable, batch_count, grouped_masked_m)
 
     @flyc.jit
     def launch_mxscale_gemm(
@@ -1602,11 +1648,60 @@ def compile_mxscale_gemm(
         idx_m = arith.index_cast(T.index, i32_m.ir_value())
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
         gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
+        if const_expr(batch_count > 1):
+            gx = gx * batch_count
         gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
-            arg_c, arg_a, arg_b, arg_a_scale, arg_b_scale, i32_m, i32_n)
+            arg_c, arg_a, arg_b, arg_a_scale, arg_b_scale, arg_c, i32_m, i32_n)
+        for op in ctx.gpu_module_body.operations:
+            if const_expr(hasattr(op, 'attributes') and op.OPERATION_NAME == "gpu.func"):
+                if const_expr(effective_waves_per_eu is not None):
+                    _wpe = int(effective_waves_per_eu)
+                    if const_expr(_wpe >= 1):
+                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                            ir.IntegerType.get_signless(32), _wpe)
+                if const_expr(use_cluster):
+                    op.attributes["rocdl.cluster_dims"] = ir.StringAttr.get(
+                        f"{cluster_m},{cluster_n},1")
+        cluster_arg = (cluster_m, cluster_n, 1) if use_cluster else None
+        launcher.launch(
+            grid=(gx, gy, gz),
+            block=(block_threads, 1, 1),
+            stream=stream,
+            cluster=cluster_arg,
+        )
+
+    @flyc.jit
+    def launch_mxscale_gemm_masked(
+        arg_c: fx.Tensor,
+        arg_a: fx.Tensor,
+        arg_b: fx.Tensor,
+        arg_a_scale: fx.Tensor,
+        arg_b_scale: fx.Tensor,
+        arg_masked_m: fx.Tensor,
+        i32_m: fx.Int32,
+        i32_n: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _ = cache_tag
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            arena_alloc.finalized = False
+            arena_alloc.finalize()
+
+        idx_m = arith.index_cast(T.index, i32_m.ir_value())
+        idx_n = arith.index_cast(T.index, i32_n.ir_value())
+        gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
+        if const_expr(batch_count > 1):
+            gx = gx * batch_count
+        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gz = split_k
+
+        launcher = kernel_mxscale_gemm(
+            arg_c, arg_a, arg_b, arg_a_scale, arg_b_scale,
+            arg_masked_m, i32_m, i32_n)
         for op in ctx.gpu_module_body.operations:
             if const_expr(hasattr(op, 'attributes') and op.OPERATION_NAME == "gpu.func"):
                 if const_expr(effective_waves_per_eu is not None):
@@ -1629,8 +1724,11 @@ def compile_mxscale_gemm(
         launch_mxscale_gemm.compile_hints["llvm_options"] = {
             "amdgpu-expert-scheduling-mode": True,
         }
+        launch_mxscale_gemm_masked.compile_hints["llvm_options"] = {
+            "amdgpu-expert-scheduling-mode": True,
+        }
 
-    return launch_mxscale_gemm
+    return launch_mxscale_gemm_masked if grouped_masked_m else launch_mxscale_gemm
 
 
 compile_mxfp4_gemm = lambda **kw: compile_mxscale_gemm(data_format="fp4", **kw)
