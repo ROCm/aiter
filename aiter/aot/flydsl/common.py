@@ -217,9 +217,7 @@ def wait_aot(pool, futures):
                 f"GEMM: {fail_by_kind['gemm']} failed"
             )
             raise AssertionError(
-                f"[aiter] FlyDSL AOT failures ({tally}): "
-                + "; ".join(head)
-                + suffix
+                f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
             )
     finally:
         pool.shutdown(wait=False)
