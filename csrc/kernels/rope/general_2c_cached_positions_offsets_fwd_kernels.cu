@@ -24,14 +24,14 @@ using namespace aiter;
  * @param nope_first   If true, back part in last dimension of input is rotated. Otherwise, the front part is rotated.
  */
 void rope_cached_positions_offsets_2c_fwd_impl(
-    torch::Tensor&       output_x,
-    torch::Tensor&       output_y,
-    const torch::Tensor& input_x,
-    const torch::Tensor& input_y,
-    const torch::Tensor& cos,
-    const torch::Tensor& sin,
-    const torch::Tensor& positions,
-    const torch::Tensor& offsets,
+    aiter_tensor_t&       output_x,
+    aiter_tensor_t&       output_y,
+    const aiter_tensor_t& input_x,
+    const aiter_tensor_t& input_y,
+    const aiter_tensor_t& cos,
+    const aiter_tensor_t& sin,
+    const aiter_tensor_t& positions,
+    const aiter_tensor_t& offsets,
     const int32_t        rotate_style,
     const bool           reuse_freqs_front_part,
     const bool           nope_first)
@@ -64,7 +64,7 @@ void rope_cached_positions_offsets_2c_fwd_impl(
     const int32_t stride_oy_h = output_y.stride(2);
     const int32_t stride_oy_d = output_y.stride(3);
 
-    TORCH_CHECK(stride_ix_d == 1 && stride_iy_d == 1 && stride_ox_d == 1 && stride_oy_d == 1,
+    AITER_CHECK(stride_ix_d == 1 && stride_iy_d == 1 && stride_ox_d == 1 && stride_oy_d == 1,
                 "rope_cached_positions_offsets_2c_fwd_impl requires all stride_d to be 1");
 
     // Get strides of positions and offsets
@@ -72,24 +72,24 @@ void rope_cached_positions_offsets_2c_fwd_impl(
     assert(1 == offsets.stride(1)   && 2 == offsets.dim());
     const int32_t max_position = cos.size(0);
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input_x));
+    HipDeviceGuard device_guard(input_x.device_id);
     DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(
-        input_x.scalar_type(),
-        cos.scalar_type(),
-        positions.scalar_type(),
+        input_x.dtype(),
+        cos.dtype(),
+        positions.dtype(),
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
         "dispatch_2c_sbhd_cached_indirect2<OpCachedFwd, ...>",
         dispatch_2c_sbhd_cached_indirect2<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
-            output_x.data_ptr<scalar_t_0>(),
-            output_y.data_ptr<scalar_t_0>(),
-            input_x.data_ptr<scalar_t_0>(),
-            input_y.data_ptr<scalar_t_0>(),
-            cos.data_ptr<scalar_t_1>(),
-            sin.data_ptr<scalar_t_1>(),
-            positions.data_ptr<pos_t>(),
-            offsets.data_ptr<int64_t>(),
+            reinterpret_cast<scalar_t_0*>(output_x.data_ptr()),
+            reinterpret_cast<scalar_t_0*>(output_y.data_ptr()),
+            reinterpret_cast<scalar_t_0*>(input_x.data_ptr()),
+            reinterpret_cast<scalar_t_0*>(input_y.data_ptr()),
+            reinterpret_cast<scalar_t_1*>(cos.data_ptr()),
+            reinterpret_cast<scalar_t_1*>(sin.data_ptr()),
+            reinterpret_cast<int64_t*>(positions.data_ptr()),
+            reinterpret_cast<int64_t*>(offsets.data_ptr()),
             max_position,
             size_s, size_b, size_h_x, size_h_y, size_d,
             size_f, // size of last dimension of freqs.
