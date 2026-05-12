@@ -22,6 +22,7 @@ from aiter.ops.mha import flash_attn_func, flash_attn_fp8_pertensor_func
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.fav3_sage import (
+    fav3_sage_func,
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
@@ -33,6 +34,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
+    sage_quant,
     sage_quant_mxfp4,
 )
 from aiter.test_mha_common import attention_ref, attention_ref_block_sparse
@@ -348,12 +350,61 @@ def make_fav3_fp8_runner(
     v: torch.Tensor,
     softmax_scale: Optional[float],
     causal: bool,
+    e2e: bool = False,
 ) -> Any:
     batch, _, num_q_heads, head_dim = q.shape
     _, _, num_kv_heads, _ = k.shape
 
     fp8_dtype = aiter.dtypes.fp8
     group_size = num_q_heads // num_kv_heads if num_q_heads != num_kv_heads else None
+
+    if softmax_scale is None:
+        softmax_scale = head_dim**-0.5
+
+    if e2e:
+
+        def _run_fav3_fp8_e2e():
+            q_fp8, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
+            k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
+            v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
+            return flash_attn_3.fwd(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                q_descale,
+                k_descale,
+                v_descale,
+                softmax_scale,
+                causal,
+                -1,
+                -1,
+                0,
+                0.0,
+                False,
+                None,
+                1,
+                None,
+                0,
+            )
+
+        return _run_fav3_fp8_e2e
 
     q_fp8, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
     k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
@@ -362,9 +413,6 @@ def make_fav3_fp8_runner(
     assert q_descale.shape == (batch, num_kv_heads)
     assert k_descale.shape == (batch, num_kv_heads)
     assert v_descale.shape == (batch, num_kv_heads)
-
-    if softmax_scale is None:
-        softmax_scale = head_dim**-0.5
 
     return lambda: flash_attn_3.fwd(
         q_fp8,
@@ -429,15 +477,57 @@ def make_kernel_runner(
     softmax_scale = head_dim**-0.5
 
     if args.kernel == "sage_fp8":
-        return lambda: fav3_sage_wrapper_func(
+        if args.e2e:
+            return lambda: fav3_sage_wrapper_func(
+                q,
+                k,
+                v,
+                softmax_scale,
+                causal=args.causal,
+                return_lse=False,
+                layout=args.layout,
+                block_lut=block_lut,
+            )
+
+        cfg = get_sage_fwd_configs()
+        fp8_type = aiter.dtypes.fp8
+        fp8_max = torch.finfo(fp8_type).max
+
+        q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale = sage_quant(
             q,
             k,
             v,
-            softmax_scale,
+            fp8_type,
+            fp8_max,
+            BLKQ=cfg["BLOCK_M"],
+            BLKK=cfg["BLOCK_N"],
+            sm_scale=softmax_scale,
+            layout=args.layout,
+        )
+
+        if block_lut is not None:
+            kv_block_indices, lut_start, lut_count = block_lut
+            use_block_sparse = True
+        else:
+            kv_block_indices = lut_start = lut_count = None
+            use_block_sparse = False
+
+        return lambda: fav3_sage_func(
+            q_int8,
+            k_int8,
+            v_fp8,
+            q_scale,
+            k_scale,
+            v_scale,
+            softmax_scale=softmax_scale,
             causal=args.causal,
             return_lse=False,
             layout=args.layout,
-            block_lut=block_lut,
+            config=cfg,
+            kv_block_indices=kv_block_indices,
+            lut_start=lut_start,
+            lut_count=lut_count,
+            use_block_sparse=use_block_sparse,
         )
 
     if args.kernel == "sage_mxfp4":
@@ -523,6 +613,22 @@ def make_kernel_runner(
         )
 
     if args.kernel == "aiter_fp8":
+        if args.e2e:
+            def _run_aiter_fp8_e2e():
+                q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = fp8_quantize(
+                    q_bshd, k_bshd, v_bshd
+                )
+                return flash_attn_fp8_pertensor_func(
+                    q_fp8,
+                    k_fp8,
+                    v_fp8,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+
+            return _run_aiter_fp8_e2e
+
         q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = fp8_quantize(
             q_bshd, k_bshd, v_bshd
         )
@@ -543,6 +649,7 @@ def make_kernel_runner(
             v_bshd,
             softmax_scale=softmax_scale,
             causal=args.causal,
+            e2e=args.e2e,
         )
 
     raise ValueError(f"Unsupported kernel: {args.kernel}")
@@ -861,8 +968,13 @@ def validate_args(args: argparse.Namespace) -> None:
         if args.load_captured:
             raise ValueError("--kernel=all does not support --load-captured")
 
+    _quantized_kernels = ("sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8")
+
+    if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
+        logger.warning("--e2e has no effect for kernel %s", args.kernel)
+
     if args.kernel not in ("sage_mxfp4", "all") and (
-        args.e2e or args.qsmooth or args.hadamard_rotate is False
+        args.qsmooth or args.hadamard_rotate is False
     ):
         logger.warning("MXFP4-specific flags are ignored unless --kernel=sage_mxfp4")
 
@@ -1241,7 +1353,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--e2e",
         action="store_true",
-        help="(MXFP4 only) Include end-to-end quantization overhead in benchmark",
+        help="Include quantization overhead in benchmark timing",
     )
     parser.add_argument(
         "--hadamard-rotate",
