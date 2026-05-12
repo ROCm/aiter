@@ -126,7 +126,7 @@ def torch_gmm(
 ) -> Tensor:
     check_input_device_dtype(lhs, rhs, group_sizes)
 
-    M, _, N, G = get_gmm_shape(lhs, rhs, group_sizes)
+    M, K, N, G = get_gmm_shape(lhs, rhs, group_sizes)
 
     out = get_gmm_output(
         M,
@@ -135,6 +135,17 @@ def torch_gmm(
         preferred_element_type=preferred_element_type,
         existing_out=existing_out,
     )
+
+    # rhs has three supported storage layouts (see gmm() docstring):
+    #   * Non-transposed:        shape (G, K, N), stride (K*N, N, 1).
+    #   * Transposed (layout 1): shape (G, K, N), stride (K*N, 1, K).
+    #   * Transposed (layout 2): shape (G, N, K), stride (K*N, K, 1).
+    # For PyTorch matmul, only the tensor metadata matters: when rhs has shape
+    # (G, N, K) (layout 2), we need to transpose rhs[g] from (N, K) to (K, N)
+    # before the matmul. For the other two layouts, rhs[g] already has the
+    # logical (K, N) shape; PyTorch handles the column-major stride of layout
+    # 1 transparently via strides.
+    is_rhs_layout_2 = rhs.shape[1] == N and rhs.shape[2] == K
 
     last_row = 0
 
@@ -148,7 +159,9 @@ def torch_gmm(
         start_idx = last_row
         end_idx = last_row + m
 
-        result = (lhs[start_idx:end_idx, :] @ rhs[g]).to(torch.float32)
+        # rhs_g is the (K, N) matrix for group g, regardless of storage layout.
+        rhs_g = rhs[g].T if is_rhs_layout_2 else rhs[g]
+        result = (lhs[start_idx:end_idx, :] @ rhs_g).to(torch.float32)
         if bias is not None:
             result += bias[g].to(torch.float32)
         out[start_idx:end_idx, :] = result.to(preferred_element_type)
@@ -267,6 +280,17 @@ def torch_tgmm(
         existing_bias_grad=bias_grad,
     )
 
+    # lhs has three supported storage layouts (see ptgmm() / nptgmm() docstring):
+    #   * Non-transposed:        shape (K, M), stride (M, 1).
+    #   * Transposed (layout 1): shape (K, M), stride (1, K).
+    #   * Transposed (layout 2): shape (M, K), stride (K, 1).
+    # For PyTorch slicing along the m-dimension we need lhs to logically have
+    # shape (K, M). Layout 2 has shape (M, K), so we transpose it. The other
+    # two layouts already have shape (K, M); PyTorch handles the column-major
+    # stride of layout 1 transparently via strides.
+    is_lhs_layout_2 = lhs.shape[0] == M
+    lhs_km = lhs.T if is_lhs_layout_2 else lhs
+
     last_col = 0
 
     for g in range(G):
@@ -278,12 +302,12 @@ def torch_tgmm(
 
         start_idx = last_col
         end_idx = last_col + m
-        mm = lhs[:, start_idx:end_idx] @ rhs[start_idx:end_idx, :]
+        mm = lhs_km[:, start_idx:end_idx] @ rhs[start_idx:end_idx, :]
         out[g] = mm.to(preferred_element_type)
 
         # Bias gradient: sum lhs across m-dimension (columns) for each group.
         if compute_bias_grad:
-            grad = lhs[:, start_idx:end_idx].sum(dim=1, dtype=torch.float32)
+            grad = lhs_km[:, start_idx:end_idx].sum(dim=1, dtype=torch.float32)
             bias_grad[g] += grad
 
         last_col += m

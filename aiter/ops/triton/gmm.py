@@ -96,7 +96,10 @@ def gmm(
         lhs data type must be torch.float16 or torch.bfloat16, and must match rhs data type.
         lhs must be on the same device of rhs and group_sizes.
     rhs : torch.Tensor
-        Right-hand side 3D input tensor. Shape: (G, K, N).
+        Right-hand side 3D input tensor. Shape is (G, K, N) when rhs is non-transposed. When rhs is
+        transposed, two physically equivalent metadata layouts are supported: shape (G, K, N) with a
+        column-major-like stride, and shape (G, N, K) with a row-major stride. See Implementation
+        Notes below for the supported (shape, stride) combinations.
         rhs data type must be torch.float16 or torch.bfloat16, and must match lhs data type.
         rhs must be on the same device of lhs and group_sizes.
     group_sizes : torch.Tensor
@@ -131,11 +134,20 @@ def gmm(
     --------------------
     - GMM is implemented with a persistent Triton kernel.
     - lhs must be row-major (lhs.stride() == (K, 1)).
-    - rhs can be row-major (rhs.stride() == (K * N, N, 1)) or column-major (rhs.stride() ==
-      (K * N, 1, K)). If rhs is row-major then kernel parameter TRANS_RHS == False, this is useful
-      for implementing forward pass. If rhs is column-major then kernel parameter TRANS_RHS == True,
-      this is useful for computing the lhs derivative in the backward pass, while fusing the
-      transposition.
+    - rhs supports three storage layouts. The two transposed layouts are physically
+      equivalent (same memory ordering, K varies fastest, then N, then G); only the
+      tensor metadata (shape and stride) differs. Both transposed layouts select
+      kernel parameter TRANS_RHS == True and produce identical byte offsets in the
+      kernel's pointer arithmetic, so they execute the same code:
+        * Non-transposed: shape (G, K, N), stride (K*N, N, 1). Kernel parameter
+          TRANS_RHS == False. Useful for the forward pass.
+        * Transposed (layout 1): shape (G, K, N), stride (K*N, 1, K). Kernel parameter
+          TRANS_RHS == True. The (K, N) sub-matrix per group is column-major.
+        * Transposed (layout 2): shape (G, N, K), stride (K*N, K, 1). Kernel parameter
+          TRANS_RHS == True. The (N, K) sub-matrix per group is row-major.
+      Both transposed layouts are useful for computing the lhs derivative in the
+      backward pass while fusing the transposition. The choice between layout 1 and
+      layout 2 is purely a metadata preference of the calling code.
     - out must be row-major (out.stride() == (N, 1)).
     - bias must be row-major (bias.stride() == (N, 1)) if provided.
     """
@@ -265,7 +277,10 @@ def ptgmm(
     Parameters
     ----------
     lhs : torch.Tensor
-        Left-hand side 2D input tensor. Shape: (K, M).
+        Left-hand side 2D input tensor. Shape is (K, M) when lhs is non-transposed. When lhs is
+        transposed, two physically equivalent metadata layouts are supported: shape (K, M) with a
+        column-major stride, and shape (M, K) with a row-major stride. See Implementation Notes
+        below for the supported (shape, stride) combinations.
         lhs data type must be torch.float16 or torch.bfloat16, and must match rhs data type.
         lhs must be on the same device of rhs and group_sizes.
     rhs : torch.Tensor
@@ -307,10 +322,20 @@ def ptgmm(
     Implementation Notes
     --------------------
     - PTGMM is implemented with a persistent Triton kernel.
-    - lhs can be row-major (lhs.stride() == (M, 1)) or column-major (lhs.stride() == (1, K)). If lhs
-      is row-major then kernel parameter TRANS_LHS == False. If lhs is column-major then kernel
-      parameter TRANS_LHS == True, this is useful for computing the rhs derivative in the backward
-      pass, while fusing the transposition.
+    - lhs supports three storage layouts. The two transposed layouts are physically
+      equivalent (same memory ordering, K varies fastest, then M); only the tensor
+      metadata (shape and stride) differs. Both transposed layouts select kernel
+      parameter TRANS_LHS == True and produce identical byte offsets in the kernel's
+      pointer arithmetic, so they execute the same code:
+        * Non-transposed: shape (K, M), stride (M, 1). Kernel parameter
+          TRANS_LHS == False.
+        * Transposed (layout 1): shape (K, M), stride (1, K). Kernel parameter
+          TRANS_LHS == True. lhs is column-major.
+        * Transposed (layout 2): shape (M, K), stride (K, 1). Kernel parameter
+          TRANS_LHS == True. lhs is row-major over the swapped shape.
+      Both transposed layouts are useful for computing the rhs derivative in the
+      backward pass while fusing the transposition. The choice between layout 1 and
+      layout 2 is purely a metadata preference of the calling code.
     - rhs must be row-major (rhs.stride() == (N, 1)).
     - out must be row-major (out.stride() == (K * N, N, 1)).
     """
@@ -448,7 +473,10 @@ def nptgmm(
     Parameters
     ----------
     lhs : torch.Tensor
-        Left-hand side 2D input tensor. Shape: (K, M).
+        Left-hand side 2D input tensor. Shape is (K, M) when lhs is non-transposed. When lhs is
+        transposed, two physically equivalent metadata layouts are supported: shape (K, M) with a
+        column-major stride, and shape (M, K) with a row-major stride. See Implementation Notes
+        below for the supported (shape, stride) combinations.
         lhs data type must be torch.float16 or torch.bfloat16, and must match rhs data type.
         lhs must be on the same device of rhs and group_sizes.
     rhs : torch.Tensor
@@ -490,10 +518,20 @@ def nptgmm(
     Implementation Notes
     --------------------
     - NPTGMM is implemented with a non-persistent regular Triton kernel.
-    - lhs can be row-major (lhs.stride() == (M, 1)) or column-major (lhs.stride() == (1, K)). If lhs
-      is row-major then kernel parameter TRANS_LHS == False. If lhs is column-major then kernel
-      parameter TRANS_LHS == True, this is useful for computing the rhs derivative in the backward
-      pass, while fusing the transposition.
+    - lhs supports three storage layouts. The two transposed layouts are physically
+      equivalent (same memory ordering, K varies fastest, then M); only the tensor
+      metadata (shape and stride) differs. Both transposed layouts select kernel
+      parameter TRANS_LHS == True and produce identical byte offsets in the kernel's
+      pointer arithmetic, so they execute the same code:
+        * Non-transposed: shape (K, M), stride (M, 1). Kernel parameter
+          TRANS_LHS == False.
+        * Transposed (layout 1): shape (K, M), stride (1, K). Kernel parameter
+          TRANS_LHS == True. lhs is column-major.
+        * Transposed (layout 2): shape (M, K), stride (K, 1). Kernel parameter
+          TRANS_LHS == True. lhs is row-major over the swapped shape.
+      Both transposed layouts are useful for computing the rhs derivative in the
+      backward pass while fusing the transposition. The choice between layout 1 and
+      layout 2 is purely a metadata preference of the calling code.
     - rhs must be row-major (rhs.stride() == (N, 1)).
     - out must be row-major (out.stride() == (K * N, N, 1)).
     """
