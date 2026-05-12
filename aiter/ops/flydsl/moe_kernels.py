@@ -305,7 +305,7 @@ def compile_flydsl_moe_stage1(
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype in ("fp4", "mxfp4"):
-        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
+        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1, GateMode
 
         return compile_mixed_moe_gemm1(
             model_dim=model_dim,

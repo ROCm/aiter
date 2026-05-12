@@ -21,7 +21,7 @@ A8W4 path is selected by `a_dtype='fp8', b_dtype='fp4'` plus
 
 import os
 import functools
-from contextlib import contextmanager
+from enum import Enum
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -61,24 +61,25 @@ from .mfma_preshuffle_pipeline import (
 )
 from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
 from .layout_utils import crd2idx, idx2crd, get as layout_get
-from .kernels_common import validate_moe_dtypes
-from ..moe_common import GateMode
+from .kernels_common import _if_then, validate_moe_dtypes
 
 
-@contextmanager
-def _if_then(if_op, _scf_compat=None):
-    """Context manager for SCF IfOp then-region.
+class GateMode(str, Enum):
+    """Gate/Up computation strategy for stage1 GEMM.
 
-    The optional second argument is accepted for backward compatibility but
-    ignored — the module-level ``scf`` import is used for YieldOp.
+    SEPARATED:      Two separate B-tile streams (gate + up), default mode.
+    MOCK_GATE_ONLY: Single B-tile stream over full [0, 2*inter_dim), simulates
+                    gate-only by doubling grid X on top of SEPARATED layout.
+                    Requires split-K (k_batch>1).  NOT true gate-only.
+    GATE_ONLY:      Reserved for future true gate-only implementation.
+    INTERLEAVE:     Weight rows interleave gate/up (gate[0], up[0], gate[1], ...).
+                    pack_N=2 routes even/odd N subtiles.  NOT tied to split-K.
     """
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
+
+    SEPARATED = "separated"
+    MOCK_GATE_ONLY = "mock_gate_only"
+    GATE_ONLY = "gate_only"
+    INTERLEAVE = "interleave"
 
 
 def _barrier(vmcnt=63, lgkmcnt=63):
@@ -323,19 +324,19 @@ def compile_mixed_moe_gemm1(
     if is_a16w4_stage1:
         if out_dtype not in ("f16", "bf16") and _use_cshuffle_epilog:
             raise ValueError("stage1 cshuffle epilog supports only f16/bf16 output")
-        _split_k_intra = split_k_intra
-        if const_expr(_split_k_intra > 1):
+        _k_batch = split_k_intra
+        if const_expr(_k_batch > 1):
             _use_cshuffle_epilog = False
-            _waves_per_group = 4 // _split_k_intra
+            _waves_per_group = 4 // _k_batch
             _n_per_wave_check = tile_n // _waves_per_group
             if _n_per_wave_check < 16:
                 raise ValueError(
-                    f"split_k_intra={_split_k_intra} with tile_n={tile_n}: "
+                    f"split_k_intra={_k_batch} with tile_n={tile_n}: "
                     f"n_per_wave={_n_per_wave_check} < 16 (MFMA minimum)"
                 )
         # GUI cross-wave fusion: needed when num_acc_n < 2 per wave
         # (standard pair fusion requires gate+up in same wave, i.e. num_acc_n >= 2)
-        _n_per_wave_eff = tile_n // ((4 // _split_k_intra) if _split_k_intra > 1 else 4)
+        _n_per_wave_eff = tile_n // ((4 // _k_batch) if _k_batch > 1 else 4)
         _gui_xwave_fuse = (
             gate_up_interleave and not _is_splitk
             and (_n_per_wave_eff // 16) < 2
@@ -351,7 +352,7 @@ def compile_mixed_moe_gemm1(
                 if tile_m % _cs_mlane_chk != 0:
                     _use_cshuffle_epilog = False
     else:
-        _split_k_intra = 1  # not used by generic
+        _k_batch = 1  # not used by generic
         _need_fp4 = out_dtype == "fp4"
         _need_fp8 = out_dtype == "fp8"
         _need_quant = _need_fp4 or _need_fp8
@@ -364,7 +365,7 @@ def compile_mixed_moe_gemm1(
         _mode_tag = "gui" if gate_up_interleave else ("go" if gate_only else "sep")
         epilog_tag = "cshuffle" if _use_cshuffle_epilog else "direct"
         _wpe_tag = f"_wpe{waves_per_eu}" if waves_per_eu >= 1 else ""
-        _ski_tag = f"_ski{_split_k_intra}" if _split_k_intra > 1 else ""
+        _ski_tag = f"_ski{_k_batch}" if _k_batch > 1 else ""
         _bias_tag = "_bias" if enable_bias else ""
         _act_tag = f"_{act}" if act != "silu" else ""
         _pad_tag = f"_mp{model_dim_pad}_ip{inter_dim_pad}" if (model_dim_pad or inter_dim_pad) else ""
@@ -924,19 +925,19 @@ def compile_mixed_moe_gemm1(
                 col_offset_base_bytes = lane_div_16 * arith.index(_a_sublane_stride)
 
                 by_n = by * arith.index(tile_n)
-                _waves_per_group = 4 // _split_k_intra
+                _waves_per_group = 4 // _k_batch
                 # NOTE: shadows enclosing-scope `n_per_wave`; rename to avoid
                 # making it look like a local of moe_gemm1 (which would break
                 # the generic body's enclosing-scope reference under FlyDSL).
                 _a16_n_per_wave = tile_n // _waves_per_group
                 num_acc_n = _a16_n_per_wave // 16
                 c_n_per_wave = arith.index(_a16_n_per_wave)
-                if const_expr(_split_k_intra > 1):
+                if const_expr(_k_batch > 1):
                     _wave_group = wave_id // arith.index(_waves_per_group)
                     _wave_in_group = wave_id % arith.index(_waves_per_group)
                     n_tile_base = _wave_in_group * c_n_per_wave
                     # A LDS: each wave group reads different K half
-                    _k_half_bytes = (tile_k // _split_k_intra) * elem_bytes
+                    _k_half_bytes = (tile_k // _k_batch) * elem_bytes
                     col_offset_base_bytes = (
                         col_offset_base_bytes
                         + _wave_group * arith.index(_k_half_bytes)
@@ -987,7 +988,7 @@ def compile_mixed_moe_gemm1(
 
                     if const_expr(gate_up_interleave and not _is_splitk):
                         if const_expr(_gui_xwave_fuse):
-                            if const_expr(_split_k_intra > 1):
+                            if const_expr(_k_batch > 1):
                                 # Split_k xwave: all waves share same output cols
                                 _gui_col_g = (
                                     by_n // arith.index(2) + lane_mod_16
@@ -1027,16 +1028,16 @@ def compile_mixed_moe_gemm1(
                             col_g_list.append(col_g)
 
                 m_repeat = tile_m // 16
-                k_unroll = (tile_k_bytes // 64) // _split_k_intra
+                k_unroll = (tile_k_bytes // 64) // _k_batch
 
-                _pad_k_elems = (model_dim_pad % tile_k) if (not _is_splitk and _split_k_intra == 1 and model_dim_pad > 0) else 0
+                _pad_k_elems = (model_dim_pad % tile_k) if (not _is_splitk and _k_batch == 1 and model_dim_pad > 0) else 0
                 _pad_ku_skip = _pad_k_elems // 32
                 _tail_ku = k_unroll - _pad_ku_skip
                 _tail_k0_count = (_tail_ku + 3) // 4 if _pad_ku_skip > 0 else None
 
                 # Each dwordx4 covers 128 K elements; per-group count
                 _k_per_dwordx4 = 128
-                _k0_count = (tile_k // _k_per_dwordx4) // _split_k_intra
+                _k0_count = (tile_k // _k_per_dwordx4) // _k_batch
 
                 # Scale mni for gate (and up if separated)
                 scale_mni_gate = []
@@ -1485,8 +1486,8 @@ def compile_mixed_moe_gemm1(
                     k_base = arith.index(0)
 
                 # Intra-WG split-K: B offset per wave group
-                if const_expr(_split_k_intra > 1):
-                    _k_half = tile_k // _split_k_intra
+                if const_expr(_k_batch > 1):
+                    _k_half = tile_k // _k_batch
                     _wg_k_off = _wave_group * arith.index(_k_half)
                 else:
                     _wg_k_off = arith.index(0)
@@ -1601,7 +1602,7 @@ def compile_mixed_moe_gemm1(
                 )
 
                 # ---- Intra-WG split-K reduce via LDS ----
-                if const_expr(_split_k_intra > 1):
+                if const_expr(_k_batch > 1):
                     _num_accs = num_acc_n * m_repeat
                     _has_up = not _single_b
                     _streams = 2 if _has_up else 1
@@ -1703,7 +1704,7 @@ def compile_mixed_moe_gemm1(
                             )
 
                 # ---- Cross-wave gate-up fusion (4-wave, no split_k) ----
-                if const_expr(_gui_xwave_fuse and _split_k_intra <= 1):
+                if const_expr(_gui_xwave_fuse and _k_batch <= 1):
                     _xw_num_accs = num_acc_n * m_repeat
                     _xw_f32_per_thr = 4 * _xw_num_accs
                     _xw_stride = arith.index(_xw_f32_per_thr)
@@ -4237,7 +4238,7 @@ def compile_mixed_moe_gemm1(
     # -- Host launcher --
     # Unified cache key: gate_mode encodes gate_only / gate_up_interleave,
     # so a single tuple covers both A16W4 and generic stage1 paths.  The
-    # tag includes A16W4-only fields (`_split_k_intra`, `_use_cshuffle_epilog`)
+    # tag includes A16W4-only fields (`_k_batch` = split_k_intra, `_use_cshuffle_epilog`)
     # which are no-ops for the generic path (constant 1 / unchanged).
     _cache_tag = (
         module_name, a_dtype, b_dtype, out_dtype,
@@ -4246,7 +4247,7 @@ def compile_mixed_moe_gemm1(
         model_dim_pad, inter_dim_pad,
         _use_cshuffle_epilog, persist_m, use_async_copy,
         waves_per_eu, k_batch, gate_mode,
-        a_scale_one, xcd_swizzle, _split_k_intra,
+        a_scale_one, xcd_swizzle, _k_batch,
     )
 
 
@@ -4365,7 +4366,7 @@ def compile_mixed_moe_gemm2(
     b_nt: int = 2,
     xcd_swizzle: int = 0,
     waves_per_eu: int = 0,
-    split_k_intra: int = 1,
+    k_batch: int = 1,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -4398,9 +4399,9 @@ def compile_mixed_moe_gemm2(
     assumed equal to `tile_m`. When set, stage2 can use a different tile_m from
     sorting/stage1. Requires sort_block_m % tile_m == 0.
 
-    `split_k_intra` is the A16W4 stage2 intra-block K partition factor
-    (same name as stage1's `split_k_intra`).  It is distinct from stage1's
-    inter-block split-K `k_batch`.
+    `k_batch` is the A16W4 stage2 inter-block split-K factor (grid Z dimension).
+    Splits `inter_dim` across `k_batch` CTAs; each CTA atomically accumulates
+    its partial result.  Equivalent to `k_batch` in aiter's stage2 kernel.
     """
     is_a16w4 = b_dtype == "fp4" and a_dtype in ("bf16", "fp16")
     # ---- Unified setup (A16W4 + Generic) ----
@@ -4577,8 +4578,8 @@ def compile_mixed_moe_gemm2(
 
     # Unified module name (cache key). Optional tags are appended only when
     # they deviate from defaults so A8W4/A4W4 keys remain backward-compatible
-    # with previously cached binaries (ski/wpe/bias/pad default off).
-    _ski_tag = f"_ski{int(split_k_intra)}" if int(split_k_intra) > 1 else ""
+    # with previously cached binaries (kb/wpe/bias/pad default off).
+    _kb_tag = f"_kb{int(k_batch)}" if int(k_batch) > 1 else ""
     _wpe_tag = f"_wpe{waves_per_eu}" if waves_per_eu >= 1 else ""
     _bias_tag = "_bias" if enable_bias else ""
     _pad_tag = (
@@ -4593,22 +4594,22 @@ def compile_mixed_moe_gemm2(
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_cshuffle"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_vscale_fix3"
-        f"{_pm_tag}{_sbm_tag}{_xcd_tag}{_ski_tag}{_wpe_tag}{_bias_tag}{_pad_tag}"
+        f"{_pm_tag}{_sbm_tag}{_xcd_tag}{_kb_tag}{_wpe_tag}{_bias_tag}{_pad_tag}"
     ).replace("-", "_")
 
-    # ---- A16W4 split_k_intra validation ----
-    _split_k_intra = int(split_k_intra)
-    if is_a16w4 and _split_k_intra > 1:
-        if inter_dim % (_split_k_intra * tile_k) != 0:
+    # ---- A16W4 k_batch validation ----
+    _k_batch = int(k_batch)
+    if is_a16w4 and _k_batch > 1:
+        if inter_dim % (_k_batch * tile_k) != 0:
             raise ValueError(
                 f"inter_dim={inter_dim} must be divisible by "
-                f"split_k_intra*tile_k={_split_k_intra * tile_k}"
+                f"k_batch*tile_k={_k_batch * tile_k}"
             )
-        _k_dim = inter_dim // _split_k_intra
+        _k_dim = inter_dim // _k_batch
         _total_tiles_check = _k_dim // tile_k
         if _total_tiles_check < 2 or _total_tiles_check % 2 != 0:
             raise ValueError(
-                f"split_k_intra={_split_k_intra}: "
+                f"k_batch={_k_batch}: "
                 f"_k_dim/tile_k={_total_tiles_check} must be even and >= 2 "
                 f"for the ping-pong pipeline"
             )
@@ -5225,7 +5226,7 @@ def compile_mixed_moe_gemm2(
 
                     _pad_k_elems = (
                         (inter_dim_pad % tile_k)
-                        if (_split_k_intra == 1 and inter_dim_pad > 0)
+                        if (_k_batch == 1 and inter_dim_pad > 0)
                         else 0
                     )
                     _pad_ku_skip = _pad_k_elems // 32
@@ -5533,7 +5534,7 @@ def compile_mixed_moe_gemm2(
                         rocdl.sched_barrier(0)
 
                     # ---- intra-block split-K offset ----
-                    if const_expr(_split_k_intra > 1):
+                    if const_expr(_k_batch > 1):
                         bz = gpu.block_id("z")
                         k_base = bz * arith.index(_k_dim)
                     else:
@@ -7007,7 +7008,7 @@ def compile_mixed_moe_gemm2(
         b_nt,
         xcd_swizzle,
         waves_per_eu,
-        split_k_intra,
+        k_batch,
     )
 
     @flyc.jit
@@ -7053,7 +7054,7 @@ def compile_mixed_moe_gemm2(
                 - arith.constant(1, index=True)
             ) / _c_pm_l
 
-        gz = _split_k_intra if is_a16w4 else 1
+        gz = _k_batch if is_a16w4 else 1
 
         moe_gemm2(
             arg_out,
@@ -7106,7 +7107,7 @@ def compile_a16w4_moe_gemm2(
     inter_dim_pad: int = 0,
     accumulate: bool = True,
     waves_per_eu: int = 0,
-    split_k_intra: int = 1,
+    k_batch: int = 1,
 ):
     """Compatibility wrapper for callers that import the legacy A16W4 entry."""
     return compile_mixed_moe_gemm2(
@@ -7127,5 +7128,5 @@ def compile_a16w4_moe_gemm2(
         inter_dim_pad=inter_dim_pad,
         accumulate=accumulate,
         waves_per_eu=waves_per_eu,
-        split_k_intra=split_k_intra,
+        k_batch=k_batch,
     )
