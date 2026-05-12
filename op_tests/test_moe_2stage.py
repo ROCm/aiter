@@ -31,7 +31,6 @@ from aiter.fused_moe import (
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.flydsl.moe_kernels import (
     csv_caller_gate_modes,
-    is_csv_fallback_row,
     stage1_kernel_native_gate_mode,
     swap_flydsl_stage1_kernel_for_gate_mode,
 )

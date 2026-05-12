@@ -133,7 +133,6 @@ def build_silu_and_mul_fq_module(
         c254_i32 = arith.constant(254, type=i32)
         c256_i32 = arith.constant(256, type=i32)
         c0xFF_i32 = arith.constant(0xFF, type=i32)
-        c0x200000_i32 = arith.constant(0x200000, type=i32)
         c0xFF800000_i32 = arith.constant(0xFF800000, type=i32)
         c0x400000_i32 = arith.constant(0x400000, type=i32)
         c0x7FFFFF_i32 = arith.constant(0x7FFFFF, type=i32)
