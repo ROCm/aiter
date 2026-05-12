@@ -42,10 +42,119 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, tdm_ops, vector
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
+
+
+def _build_v4i32_buffer_rsrc(tensor, num_records_bytes=0xFFFFFFFF, arch=None):
+    """Build a ``<4 x i32>`` V# (buffer resource descriptor) for ``s_buffer_load``.
+
+    ``s_buffer_load`` intrinsics take the legacy ``<4 x i32>`` descriptor;
+    ``rocdl.make.buffer.rsrc`` (the modern op used by
+    ``buffer_ops.create_buffer_resource``) only produces ``!llvm.ptr<8>``, so
+    we assemble the V# manually here.
+
+    AMDGPU V# layout (low to high):
+      word0: base[31:0]
+      word1: base[47:32] (low 16) | stride<<16 (high 16)
+      word2: num_records (bytes)
+      word3: flags (DATA_FORMAT, NUM_FORMAT, OOB_SELECT, etc.)
+    """
+    i32_t = ir.IntegerType.get_signless(32)
+
+    base_idx = buffer_ops.extract_base_index(tensor, address_space=1)
+    base_i64 = _raw(arith.index_cast(T.i64, base_idx))
+
+    # word 0: base[31:0]
+    w0 = arith.trunci(i32_t, base_i64)
+
+    # word 1: base[63:32] truncated to i32 — only base[47:32] is meaningful
+    # for addresses, and stride=0 leaves the high 16 bits zero.
+    shift_amt = _raw(arith.constant(32, type=T.i64))
+    base_hi_i64 = arith.shrui(base_i64, shift_amt)
+    w1 = arith.trunci(i32_t, base_hi_i64)
+
+    # word 2: num_records (bytes)
+    w2 = _raw(arith.constant(num_records_bytes, type=T.i32))
+
+    # word 3: flags (data format, OOB select, etc.)
+    w3 = _raw(arith.constant(buffer_ops._get_buffer_flags(arch), type=T.i32))
+
+    rsrc_type = ir.Type.parse('vector<4xi32>')
+    return vector.from_elements(rsrc_type, [w0, w1, w2, w3])
+
+
+def _s_buffer_load_b32(rsrc_v4i32, byte_offset_i32):
+    """Emit ``s_buffer_load_b32`` — scalar K$ load, result lands in an SGPR.
+
+    Bypasses the VGPR → ``v_readfirstlane`` round-trip that the vmem
+    ``buffer_load`` path requires, and uses the ``s_wait_kmcnt`` counter
+    (separate from vmem ``s_wait_loadcnt``).
+
+    Args:
+        rsrc_v4i32: buffer descriptor as ``vector<4xi32>``
+                    (from ``_build_v4i32_buffer_rsrc``).
+        byte_offset_i32: byte offset (i32 SGPR value).
+
+    Returns: i32 (scalar — uniform across the wave).
+    """
+    cachepol = _raw(arith.constant(0, type=T.i32))
+    return _llvm.call_intrinsic(
+        T.i32,
+        "llvm.amdgcn.s.buffer.load.i32",
+        [_raw(rsrc_v4i32), _raw(byte_offset_i32), cachepol],
+        [], [],
+    )
+
+
+def _s_buffer_load_v2i32(rsrc_v4i32, byte_offset_i32):
+    """Emit ``s_buffer_load_b64`` — 2-dword scalar K$ load returning vector<2xi32>.
+
+    All lanes see the same vector; per-element extracts stay uniform.
+    """
+    cachepol = _raw(arith.constant(0, type=T.i32))
+    return _llvm.call_intrinsic(
+        ir.Type.parse('vector<2xi32>'),
+        "llvm.amdgcn.s.buffer.load.v2i32",
+        [_raw(rsrc_v4i32), _raw(byte_offset_i32), cachepol],
+        [], [],
+    )
+
+
+def _s_buffer_load_v4i32(rsrc_v4i32, byte_offset_i32):
+    """Emit ``s_buffer_load_b128`` — 4-dword scalar K$ load returning vector<4xi32>.
+    """
+    cachepol = _raw(arith.constant(0, type=T.i32))
+    return _llvm.call_intrinsic(
+        ir.Type.parse('vector<4xi32>'),
+        "llvm.amdgcn.s.buffer.load.v4i32",
+        [_raw(rsrc_v4i32), _raw(byte_offset_i32), cachepol],
+        [], [],
+    )
+
+
+def _s_buffer_load_vec(rsrc_v4i32, byte_offset_i32, width):
+    """Width-dispatched ``s_buffer_load`` returning a vector<widthxi32>.
+
+    Module-level so the dispatch runs at Python trace time and the kernel's
+    AST rewriter never sees the ``if/elif`` (which it would otherwise lift
+    into ``scf.if`` branches and scope away the assigned value).
+
+    Supports width ∈ {2, 4}. Width=1 should use ``_s_buffer_load_b32`` directly.
+    """
+    if width == 2:
+        return _s_buffer_load_v2i32(rsrc_v4i32, byte_offset_i32)
+    if width == 4:
+        return _s_buffer_load_v4i32(rsrc_v4i32, byte_offset_i32)
+    raise ValueError(
+        f"_s_buffer_load_vec width must be 2 or 4 (got {width}); "
+        "use _s_buffer_load_b32 for width=1."
+    )
+
+
 from flydsl.expr.numeric import Float32 as fxFloat32, Int32 as fxInt32
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
@@ -241,6 +350,10 @@ def compile_pa_decode_main(
 
             # --- Buffer resources (sl_rsrc already created above) ---
             bt_rsrc = buffer_ops.create_buffer_resource(arg_block_tables, max_size=True)
+            # Parallel <4 x i32> descriptor for s_buffer_load.i32. The vmem
+            # buffer_load path keeps using `bt_rsrc` (ptr<8>); the BPC=1 path
+            # uses this one to drive the scalar K$ load.
+            bt_rsrc_v4i32 = _build_v4i32_buffer_rsrc(arg_block_tables, arch=gpu_arch)
             out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
             ml_rsrc = buffer_ops.create_buffer_resource(arg_max_logits, max_size=True)
             es_rsrc = buffer_ops.create_buffer_resource(arg_exp_sums, max_size=True)
@@ -415,10 +528,12 @@ def compile_pa_decode_main(
                     # Last load uses BT_TAIL_WIDTH (may be < BT_VEC_WIDTH); all others use BT_VEC_WIDTH.
                     this_width = BT_TAIL_WIDTH if ldi == BT_NUM_LOADS - 1 else BT_VEC_WIDTH
                     bt_off = bt_base + arith.index(ldi * BT_VEC_WIDTH)
+                    # s_buffer_load offset is in BYTES — i32 elements ⇒ ×4.
+                    bt_off_bytes_i32 = arith.index_cast(
+                        T.i32, bt_off * arith.index(4)
+                    )
                     if this_width == 1:
-                        phys_i32 = buffer_ops.buffer_load(
-                            bt_rsrc, bt_off, vec_width=1, dtype=T.i32
-                        )
+                        phys_i32 = _s_buffer_load_b32(bt_rsrc_v4i32, bt_off_bytes_i32)
                         logical_idx = base_logical + arith.index(ldi * BT_VEC_WIDTH)
                         in_range = arith.cmpi(
                             arith.CmpIPredicate.slt, _raw(logical_idx), _raw(live_blocks)
@@ -426,8 +541,11 @@ def compile_pa_decode_main(
                         phys_i32 = arith.select(in_range, _raw(phys_i32), _raw(zero_i32))
                         out.append(arith.index_cast(T.index, phys_i32))
                     else:
-                        phys_vec = buffer_ops.buffer_load(
-                            bt_rsrc, bt_off, vec_width=this_width, dtype=T.i32
+                        # Vectorized scalar K$ load. b64 (width 2) and b128
+                        # (width 4) are the hardware-native sizes. Module-level
+                        # dispatch keeps the if/elif out of the rewriter's path.
+                        phys_vec = _s_buffer_load_vec(
+                            bt_rsrc_v4i32, bt_off_bytes_i32, this_width
                         )
                         for b in range_constexpr(this_width):
                             elem = vector.extract(
