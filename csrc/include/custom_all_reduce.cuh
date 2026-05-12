@@ -1820,23 +1820,22 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                                     eps);
 }
 
-template <typename T, int ngpus>
+template <typename T, int ngpus, int WARP_SIZE>
 __global__ void __launch_bounds__(1024, 1)
     qknorm_allreduce_fusion_kernel_2stage(RankData* _dp,
-                                   RankSignals sg,
-                                   Signal* self_sg,
-                                   int rank,
-                                   T* __restrict__ qk_in,
-                                   T* __restrict__ q_w,
-                                   T* __restrict__ k_w,
-                                   T* __restrict__ q_out,
-                                   T* __restrict__ k_out,
-                                   int token_num,
-                                   int hidden_dim_q,
-                                   int hidden_dim_k,
-                                   float eps)
+                                          RankSignals sg,
+                                          Signal* self_sg,
+                                          int rank,
+                                          T* __restrict__ qk_in,
+                                          T* __restrict__ q_w,
+                                          T* __restrict__ k_w,
+                                          T* __restrict__ q_out,
+                                          T* __restrict__ k_out,
+                                          int token_num,
+                                          int hidden_dim_q,
+                                          int hidden_dim_k,
+                                          float eps)
 {
-    constexpr int WARP_SIZE = 32;
     constexpr int pack_size = 16 / sizeof(T);
     int hidden_dim          = hidden_dim_q + hidden_dim_k;
     int block_size          = hidden_dim / pack_size;
@@ -1877,26 +1876,29 @@ __global__ void __launch_bounds__(1024, 1)
             acc[v] = upcast_s(vec[v]);
             sum2 += acc[v] * acc[v];
         }
+        
         sum2 = warpReduce<AddFunctor, float, WARP_SIZE>(sum2);
         if (threadIdx.x % WARP_SIZE == 0)
             smem[wid] = sum2;
         __syncthreads();
+
         sum2 = 0.0f;
         if (is_q_t0) {
-            for (int i = 0; i < hidden_dim_q / pack_size / WARP_SIZE; ++i) {
+            for (int i = 0; i < hidden_dim_q / WARP_SIZE / pack_size; ++i) {
                 sum2 += smem[i];
             }
             sum2 /= (float)hidden_dim_q;
             *reinterpret_cast<float*>(&var_vec) = sum2;
-            tmps[rank][0] = var_vec;
+            tmps[rank][tidx * 2 + 0] = var_vec;
         } else if (is_k_t0) {
-            for (int i = hidden_dim_q / pack_size / WARP_SIZE; i < hidden_dim / pack_size / WARP_SIZE; ++i) {
+            for (int i = hidden_dim_q / WARP_SIZE / pack_size; i < hidden_dim / WARP_SIZE / pack_size; ++i) {
                 sum2 += smem[i];
             }
             sum2 /= (float)hidden_dim_k;
             *reinterpret_cast<float*>(&var_vec) = sum2;
-            tmps[rank][1] = var_vec;
+            tmps[rank][tidx * 2 + 1] = var_vec;
         }
+
         end_sync<ngpus>(sg, self_sg, rank);
 
         if (is_q_t0) {
@@ -1904,7 +1906,7 @@ __global__ void __launch_bounds__(1024, 1)
             for(int r = 1; r < ngpus; ++r)
             {
                 int target = (rank + r) % ngpus;
-                auto peer_vec = tmps[target][0];
+                auto peer_vec = tmps[target][tidx * 2 + 0];
                 sum2 += *reinterpret_cast<float*>(&peer_vec);
             }
             smem[0] = sum2;
@@ -1913,27 +1915,30 @@ __global__ void __launch_bounds__(1024, 1)
             for(int r = 1; r < ngpus; ++r)
             {
                 int target = (rank + r) % ngpus;
-                auto peer_vec = tmps[target][1];
+                auto peer_vec = tmps[target][tidx * 2 + 1];
                 sum2 += *reinterpret_cast<float*>(&peer_vec);
             }
             smem[1] = sum2;
         }
+
         __syncthreads();
 
         if (is_q) {
+            weight_p = *reinterpret_cast<P*>(&q_w[access_id_in_token]);
             float denom = rsqrtf(smem[0] / ngpus + eps);
 #pragma unroll
             for(int v = 0; v < pack_size; ++v)
             {
-                vec[v] = downcast_s<T>(acc[v] * denom);
+                vec[v] = downcast_s<T>(acc[v] * denom * weight_p[v]);
             }
             *reinterpret_cast<P*>(&q_out[tidx * hidden_dim_q + access_id_in_token]) = vec;
         } else {
+            weight_p = *reinterpret_cast<P*>(&k_w[access_id_in_token - hidden_dim_q]);
             float denom = rsqrtf(smem[1] / ngpus + eps);
 #pragma unroll
             for(int v = 0; v < pack_size; ++v)
             {
-                vec[v] = downcast_s<T>(acc[v] * denom);
+                vec[v] = downcast_s<T>(acc[v] * denom * weight_p[v]);
             }
             *reinterpret_cast<P*>(&k_out[tidx * hidden_dim_k + access_id_in_token - hidden_dim_q]) = vec;
         }
@@ -1946,6 +1951,8 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                              Signal* self_sg,
                                              int rank,
                                              T* qk_in,
+                                             T* q_w,
+                                             T* k_w,
                                              T* q_out,
                                              T* k_out,
                                              int token_num,
@@ -1970,12 +1977,14 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
             "Invalid qk hidden dim layout for qknorm_allreduce_fusion_kernel_2stage kernel");
     dim3 threadsPerBlock(LAUNCH_THREADS);
     dim3 numBlocks(token_num);
-    qknorm_allreduce_fusion_kernel_2stage<T, NGPUS>
+    qknorm_allreduce_fusion_kernel_2stage<T, NGPUS, WARP_SIZE>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
                                                     sg,
                                                     self_sg,
                                                     rank,
                                                     qk_in,
+                                                    q_w,
+                                                    k_w,
                                                     q_out,
                                                     k_out,
                                                     token_num,
