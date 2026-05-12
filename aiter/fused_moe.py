@@ -21,11 +21,6 @@ from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
 
-# Cache GFX name and CU count at import time to avoid repeated HIP runtime queries
-# in the decode hot path.
-_cached_gfx: str = get_gfx()
-_cached_cu_num: int = get_cu_num()
-
 # Cache for moe_sorting output buffers keyed on
 # (device_idx, M, topk, num_experts, block_size, model_dim, dtype).
 _moe_sorting_buf_cache: dict = {}
