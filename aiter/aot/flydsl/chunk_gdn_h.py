@@ -12,6 +12,10 @@ extracts every unique compile-time configuration, and pre-compiles it
 into the FlyDSL disk cache so that the first inference call does not pay
 the JIT cost.
 
+By default, both the f32-state (legacy) and bf16-state runtime paths are
+covered: each jsonl entry is compiled twice with ``STATE_DTYPE_BF16``
+toggled. Pass ``--no-state-bf16`` to keep only the f32-state variant.
+
 Usage:
     # Compile all unique FlyDSL chunk-gdn-h kernels from the default jsonl
     python -m aiter.aot.flydsl.chunk_gdn_h
@@ -19,10 +23,21 @@ Usage:
     # Custom jsonl file(s)
     python -m aiter.aot.flydsl.chunk_gdn_h --jsonl /path/to/tuned.jsonl
 
+    # Cross-compile every entry for a different GPU arch (host need not
+    # be that GPU; FlyDSL emits ISA for the requested target).
+    python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
+
+    # Skip the bf16-state variant (legacy f32-state only)
+    python -m aiter.aot.flydsl.chunk_gdn_h --no-state-bf16
+
 Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
-    ARCH / FLYDSL_GPU_ARCH    Target GPU architecture, overridden per-job
-                              based on the ``arch`` field in the jsonl.
+    ARCH / GPU_ARCHS          Target GPU architecture (logging hint); the
+                              actual per-job compile arch comes from the
+                              ``arch`` field of each jsonl entry.
+    FLYDSL_GPU_ARCH           Per-job arch override applied during compile;
+                              ``--target-arch`` takes precedence over both
+                              this env var and the ``arch`` field in jsonl.
 """
 
 from __future__ import annotations
@@ -40,6 +55,7 @@ import flydsl.expr as fx
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     compile_only_env,
+    dedupe_jobs,
     job_identity,
     override_env,
 )
@@ -50,7 +66,15 @@ _DEFAULT_JSONL = (
     Path(__file__).resolve().parents[2] / "ops" / "flydsl" / "chunk_gdn_h_tuned.jsonl"
 )
 DEFAULT_JSONLS = [str(_DEFAULT_JSONL)]
+# Alias to match the (DEFAULT_CSVS, parse_csv, compile_one_config) contract
+# expected by ``aiter.aot.flydsl.common.run_aot_worker``. K5 reads jsonl
+# rather than csv, but the worker only cares about the names.
+DEFAULT_CSVS = DEFAULT_JSONLS
 CHUNK_GDN_H_AOT_ARCH_DEFAULT = "gfx950"
+# K5 ships a single kernel today; mirrors the ``@flyc.kernel(name=...)``
+# decorator in ``kernels/chunk_gated_delta_h.py`` so the AOT ``result`` dict
+# and any failure-mode print share one source of truth.
+_KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_vk"
 
 # Map jsonl ``dtype`` string -> torch dtype name used for dummy tensors.
 # Only bf16 is exercised by the kernel today (state_t is selected
@@ -135,6 +159,11 @@ def parse_jsonl(jsonl_path: str) -> list[dict[str, Any]]:
     return jobs
 
 
+# Alias to match the contract expected by
+# ``aiter.aot.flydsl.common.run_aot_worker``.
+parse_csv = parse_jsonl
+
+
 def _torch_dtype_for_kernel(dtype_str: str):
     import torch
 
@@ -182,11 +211,13 @@ def _compile_chunk_gdn_h_to_cache(
 
     # Pick a representative T_flat / N for the dummy tensors. These only
     # influence the host launch shape, not the compiled artifact, so any
-    # value consistent with BT divisibility works.
+    # value consistent with BT divisibility works. ``is_varlen`` flips
+    # the kernel's cu_seqlens read path at runtime, but the AOT dummy
+    # tensor shape is identical in both modes, so we use a single T.
     T_flat = BT
     N = 1
     B = N
-    T = T_flat if not is_varlen else T_flat
+    T = T_flat
 
     k = torch.empty((B, T, Hg, K), device=dev, dtype=torch_dtype)
     v = torch.empty((B, H, T_flat, V), device=dev, dtype=torch_dtype)
@@ -247,6 +278,22 @@ def _compile_chunk_gdn_h_to_cache(
     )
 
 
+def _format_shape_str(job: dict) -> str:
+    """Render a job dict into the one-line summary used by ``[OK]`` /
+    ``[FAIL]`` prints. Kept as a free function so the parallel-mode crash
+    handler can produce the same line as the serial path."""
+    return (
+        f"chunk_gdn_h  "
+        f"K={job.get('K')} V={job.get('V')} BT={job.get('BT')} "
+        f"BV={job.get('BV')} H={job.get('H')} Hg={job.get('Hg')} "
+        f"dtype={job.get('dtype')} "
+        f"use_g={job.get('use_g')} use_gk={job.get('use_gk')} "
+        f"use_h0={job.get('use_h0')} store_fs={job.get('store_fs')} "
+        f"save_vn={job.get('save_vn')} is_varlen={job.get('is_varlen')} "
+        f"wu_contig={job.get('wu_contig')} state_bf16={job.get('state_bf16')}"
+    )
+
+
 def compile_one_config(
     *,
     dtype: str,
@@ -261,17 +308,20 @@ def compile_one_config(
 ) -> dict:
     """Compile one chunk-gdn-h configuration and save it to cache."""
     aot_arch = arch or CHUNK_GDN_H_AOT_ARCH_DEFAULT
-    shape_str = (
-        f"chunk_gdn_h  "
-        f"K={K} V={V} BT={BT} BV={BV} H={H} Hg={Hg} "
-        f"dtype={dtype} "
-        f"use_g={kwargs.get('use_g')} use_gk={kwargs.get('use_gk')} "
-        f"use_h0={kwargs.get('use_h0')} store_fs={kwargs.get('store_fs')} "
-        f"save_vn={kwargs.get('save_vn')} is_varlen={kwargs.get('is_varlen')} "
-        f"wu_contig={kwargs.get('wu_contig')} state_bf16={kwargs.get('state_bf16')}"
+    shape_str = _format_shape_str(
+        {
+            "K": K,
+            "V": V,
+            "BT": BT,
+            "BV": BV,
+            "H": H,
+            "Hg": Hg,
+            "dtype": dtype,
+            **kwargs,
+        }
     )
     result = {
-        "kernel_name": "chunk_gdn_fwd_h_flydsl_vk",
+        "kernel_name": _KERNEL_NAME,
         "shape": shape_str,
         "compile_time": None,
         "compile_arch": aot_arch,
@@ -316,9 +366,20 @@ def main():
         "aiter/ops/flydsl/chunk_gdn_h_tuned.jsonl",
     )
     parser.add_argument(
-        "--state-bf16",
+        "--no-state-bf16",
         action="store_true",
-        help="Also compile the bf16-state variant in addition to the f32-state default.",
+        help="Skip the bf16-state variant. Default behaviour compiles both "
+        "f32-state (legacy) and bf16-state (used when the caller passes "
+        "``state_dtype=torch.bfloat16``) so neither runtime path pays a "
+        "JIT cost on first call.",
+    )
+    parser.add_argument(
+        "--target-arch",
+        type=str,
+        default=None,
+        help="Override the ``arch`` field of every jsonl entry; useful for "
+        "cross-compiling on a host whose GPU differs from the tuned arch "
+        "(e.g. ``--target-arch gfx942`` on a gfx950 box).",
     )
     args = parser.parse_args()
 
@@ -335,33 +396,34 @@ def main():
 
     all_jobs = collect_aot_jobs(jsonl_paths, parse_jsonl)
 
-    # Optionally fan out the (state_bf16=False) jobs into a bf16-state twin.
-    if args.state_bf16 and all_jobs:
-        bf16_jobs = []
-        seen = {job_identity(j) for j in all_jobs}
-        for j in all_jobs:
-            twin = dict(j)
-            twin["state_bf16"] = True
-            key = job_identity(twin)
-            if key in seen:
-                continue
-            seen.add(key)
-            bf16_jobs.append(twin)
-        all_jobs.extend(bf16_jobs)
+    # ``--target-arch`` rewrites the ``arch`` field of every job, then we
+    # dedupe again because two jsonl entries that differed only in arch
+    # collapse to the same compile after the override.
+    if args.target_arch and all_jobs:
+        all_jobs = dedupe_jobs([dict(j, arch=args.target_arch) for j in all_jobs])
+
+    # By default fan out into both f32-state and bf16-state variants so
+    # neither runtime path pays a JIT cost on first call. ``dedupe_jobs``
+    # drops any pre-existing dup. ``--no-state-bf16`` opts out.
+    if not args.no_state_bf16 and all_jobs:
+        all_jobs = dedupe_jobs(all_jobs + [dict(j, state_bf16=True) for j in all_jobs])
 
     print("=" * 72)
     print("FlyDSL chunk-gated-delta-h AOT Pre-compilation")
     print("=" * 72)
     for jsonl_path in jsonl_paths:
-        print(f"  jsonl:        {jsonl_path}")
-    print(f"  Total jobs:   {len(all_jobs)}")
-    print("  Compile arch: (from jsonl 'arch' field)")
-    print(f"  Cache dir:    {cache_dir}")
-    print(f"  Target arch:  {arch}")
+        print(f"  jsonl:            {jsonl_path}")
+    print(f"  Total jobs:       {len(all_jobs)}")
+    if args.target_arch:
+        print(f"  Compile arch:     {args.target_arch} (overridden by --target-arch)")
+    else:
+        print("  Compile arch:     (from jsonl 'arch' field)")
+    print(f"  Cache dir:        {cache_dir}")
+    print(f"  Target arch:      {arch}")
     print("=" * 72)
 
     total_t0 = time.time()
-    results = []
+    results: list[dict] = []
 
     for i, job in enumerate(all_jobs, 1):
         print(f"\n[{i}/{len(all_jobs)}] ", end="")
@@ -375,9 +437,9 @@ def main():
     print("\n" + "=" * 72)
     print("Summary")
     print("=" * 72)
-    print(f"  Total time:   {total_elapsed:.1f}s")
-    print(f"  Compiled:     {ok} ok, {fail} failed")
-    print(f"  Cache dir:    {cache_dir}")
+    print(f"  Total time:       {total_elapsed:.1f}s")
+    print(f"  Compiled:         {ok} ok, {fail} failed")
+    print(f"  Cache dir:        {cache_dir}")
     print()
 
     exit_code = 0

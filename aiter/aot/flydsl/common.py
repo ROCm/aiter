@@ -80,22 +80,32 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
-def run_aot_worker(kind):
-    """Worker for ProcessPoolExecutor — runs in a child process."""
-    if kind == "moe":
-        from .moe import (
-            DEFAULT_CSVS,
-            compile_one_config,
-            parse_csv,
-        )
-    else:
-        from .gemm import (
-            DEFAULT_CSVS,
-            compile_one_config,
-            parse_csv,
-        )
+# Registry of AOT kinds. Each entry maps a short kind name to
+#   (module_path, human_label).
+# Each module must export ``DEFAULT_CSVS`` (or alias), ``parse_csv`` (or
+# alias), and ``compile_one_config`` -- the contract consumed by
+# ``run_aot_worker`` below.
+_AOT_KINDS: dict[str, tuple[str, str]] = {
+    "moe": (".moe", "MoE"),
+    "gemm": (".gemm", "GEMM"),
+    "chunk_gdn_h": (".chunk_gdn_h", "chunk-gdn-h"),
+}
 
-    label = f"FlyDSL {kind.upper()} AOT"
+
+def run_aot_worker(kind: str):
+    """Worker for ProcessPoolExecutor -- runs in a child process."""
+    if kind not in _AOT_KINDS:
+        raise ValueError(f"Unknown AOT kind {kind!r}; supported: {sorted(_AOT_KINDS)}")
+    module_path, human_label = _AOT_KINDS[kind]
+
+    from importlib import import_module
+
+    mod = import_module(module_path, package=__package__)
+    DEFAULT_CSVS = mod.DEFAULT_CSVS
+    parse_csv = mod.parse_csv
+    compile_one_config = mod.compile_one_config
+
+    label = f"FlyDSL {human_label} AOT"
     jobs = collect_aot_jobs(DEFAULT_CSVS, parse_csv)
     if not jobs:
         return label, 0, 0
@@ -108,22 +118,40 @@ def run_aot_worker(kind):
     return label, ok, fail
 
 
-def start_aot(cache_dir: str):
+def start_aot(cache_dir: str, kinds: list[str] | None = None):
     """Start FlyDSL AOT compilation in background processes.
 
-    Returns (pool, futures_dict) — caller must call ``wait_aot``
+    Args:
+        cache_dir: FlyDSL JIT cache directory. Exported to children via
+            ``FLYDSL_RUNTIME_CACHE_DIR``.
+        kinds: Optional subset of AOT kinds to launch (default: all
+            registered kinds).
+
+    Returns (pool, futures_dict) -- caller must call ``wait_aot``
     to collect results and raise on failure.
     """
+    import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
 
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
-    pool = ProcessPoolExecutor(max_workers=2)
-    futures = {
-        pool.submit(run_aot_worker, "moe"): "MoE",
-        pool.submit(run_aot_worker, "gemm"): "GEMM",
-    }
+    if kinds is None:
+        kinds = list(_AOT_KINDS)
+    else:
+        unknown = [k for k in kinds if k not in _AOT_KINDS]
+        if unknown:
+            raise ValueError(
+                f"Unknown AOT kind(s) {unknown}; " f"supported: {sorted(_AOT_KINDS)}"
+            )
+
+    # Use ``spawn`` to avoid inheriting a half-initialised CUDA context from
+    # the parent process; ``fork`` would crash with
+    # "Cannot re-initialize CUDA in forked subprocess" the moment any child
+    # touches ``torch.cuda``.
+    mp_ctx = multiprocessing.get_context("spawn")
+    pool = ProcessPoolExecutor(max_workers=max(1, len(kinds)), mp_context=mp_ctx)
+    futures = {pool.submit(run_aot_worker, kind): _AOT_KINDS[kind][1] for kind in kinds}
     return pool, futures
 
 
