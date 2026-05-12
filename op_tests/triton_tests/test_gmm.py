@@ -7,6 +7,7 @@
 
 # Python standard library
 from functools import partial
+import warnings
 
 # PyTorch
 import torch
@@ -64,6 +65,9 @@ REAL_SHAPES: list[tuple[int, int, int, int]] = [
 # Test shapes are test only + real ones.
 TEST_SHAPES: list[tuple[int, int, int, int]] = TEST_ONLY_SHAPES + REAL_SHAPES
 
+# Other production workload: unknown model
+#                                                   M,    K,    N,  G
+OTHER_REAL_SHAPE: tuple[int, int, int, int] = (267424, 1280, 2560, 32)
 
 # Transpositions.
 
@@ -241,6 +245,61 @@ def test_gmm(
             "Triton GMM doesn't match PyTorch reference GMM.",
             atol=atol,
             rtol=rtol,
+        )
+
+
+@pytest.mark.parametrize(
+    "M, K, N, G", [OTHER_REAL_SHAPE, OTHER_REAL_SHAPE[:-1] + (17,)]
+)
+@pytest.mark.parametrize(
+    "trans_rhs, alt_trans", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("grid_dim", [None, 240])
+@pytest.mark.parametrize("work_stealing", [False, True])
+def test_gmm_alt_trans_rhs_int64_group_sizes_grid_dim_override_work_stealing(
+    M: int,
+    K: int,
+    N: int,
+    G: int,
+    trans_rhs: bool,
+    alt_trans: bool,
+    grid_dim: int | None,
+    work_stealing: bool,
+):
+    lhs, rhs, multiple_group_sizes, out_torch, _ = gen_gmm_tensors(
+        M,
+        K,
+        N,
+        G,
+        NUM_GROUP_SIZES,
+        group_sizes_dtype=torch.int64,  # feature under test
+        trans_rhs=trans_rhs,
+        alt_trans=alt_trans,  # feature under test
+        rng_seed=RNG_SEED,
+        unif_group_sizes=True,
+    )
+    out_triton = torch.empty_like(out_torch)
+
+    for group_sizes in multiple_group_sizes:
+        torch_gmm(lhs, rhs, group_sizes, existing_out=out_torch)
+
+        # Ignore expected warnings about grid dimension override.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore" if grid_dim is not None else "default")
+            triton_gmm(
+                lhs,
+                rhs,
+                group_sizes,
+                existing_out=out_triton,
+                grid_dim=grid_dim,  # feature under test
+                work_stealing=work_stealing,  # feature under test
+            )
+
+        m = int(torch.sum(group_sizes).item())
+        check_tensors(
+            out_triton[:m],
+            out_torch[:m],
+            "Triton GMM doesn't match PyTorch reference GMM.",
         )
 
 
@@ -497,4 +556,68 @@ def test_tgmm_accumulate(persistent_str: str, with_bias_grad: bool):
             bias_grad_triton[non_empty_groups],
             bias_grad_torch[non_empty_groups],
             "Triton persistent TGMM bias_grad with ACCUMULATE=True does not match reference.",
+        )
+
+
+@pytest.mark.parametrize("persistent_str", {"p", "np"})
+@pytest.mark.parametrize(
+    "M, K, N, G", [OTHER_REAL_SHAPE, OTHER_REAL_SHAPE[:-1] + (13,)]
+)
+@pytest.mark.parametrize(
+    "trans_lhs, alt_trans", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("grid_dim", [None, 228])
+def test_tgmm_alt_trans_lhs_int64_group_sizes_grid_dim_override(
+    persistent_str: str,
+    M: int,
+    K: int,
+    N: int,
+    G: int,
+    trans_lhs: bool,
+    alt_trans: bool,
+    grid_dim: int | None,
+):
+    assert persistent_str in {"p", "np"}
+    persistent: bool = persistent_str == "p"
+    has_grid_dim: bool = grid_dim is not None
+
+    if not persistent and has_grid_dim:
+        pytest.skip("Grid dimension override is only applicable to persistent TGMM.")
+
+    lhs, rhs, multiple_group_sizes, out_torch, _ = gen_tgmm_tensors(
+        M,
+        K,
+        N,
+        G,
+        NUM_GROUP_SIZES,
+        group_sizes_dtype=torch.int64,  # feature under test
+        trans_lhs=trans_lhs,
+        alt_trans=alt_trans,  # feature under test
+        rng_seed=RNG_SEED,
+        unif_group_sizes=True,
+    )
+    out_triton = torch.empty_like(out_torch)
+
+    for group_sizes in multiple_group_sizes:
+        torch_tgmm(lhs, rhs, group_sizes, existing_out=out_torch)
+
+        if persistent:
+            # Ignore expected warnings about grid dimension override.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore" if has_grid_dim else "default")
+                triton_ptgmm(
+                    lhs,
+                    rhs,
+                    group_sizes,
+                    existing_out=out_triton,
+                    grid_dim=grid_dim,  # feature under test
+                )
+        else:
+            triton_nptgmm(lhs, rhs, group_sizes, existing_out=out_triton)
+
+        non_empty_groups = group_sizes > 0
+        check_tensors(
+            out_triton[non_empty_groups],
+            out_torch[non_empty_groups],
+            f"Triton {'persistent' if persistent else 'non-persistent'} TGMM doesn't match PyTorch reference TGMM.",
         )
