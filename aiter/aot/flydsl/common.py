@@ -201,6 +201,25 @@ def wait_aot(pool, futures):
                 f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
             )
         if errors:
-            raise AssertionError("[aiter] FlyDSL AOT failures: " + "; ".join(errors))
+            # Cap the message body — with per-kernel tasks the failure
+            # list can grow to hundreds of entries (vs. ~2 in the
+            # pre-refactor design), bloating CI logs and the exception
+            # text. The full per-kernel diagnostics live in stdout from
+            # the FAIL: lines compile_one_config already prints; the
+            # exception text just needs enough to point at the problem.
+            _MAX_ERRORS_IN_MSG = 10
+            head = errors[:_MAX_ERRORS_IN_MSG]
+            suffix = ""
+            if len(errors) > _MAX_ERRORS_IN_MSG:
+                suffix = f"; ... ({len(errors) - _MAX_ERRORS_IN_MSG} more)"
+            tally = (
+                f"MoE: {fail_by_kind['moe']} failed, "
+                f"GEMM: {fail_by_kind['gemm']} failed"
+            )
+            raise AssertionError(
+                f"[aiter] FlyDSL AOT failures ({tally}): "
+                + "; ".join(head)
+                + suffix
+            )
     finally:
         pool.shutdown(wait=False)
