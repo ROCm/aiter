@@ -403,9 +403,7 @@ def fused_moe_1stage(
             a1 = hidden_states
             if quant_type == QuantType.per_1x128:
                 scale_t = torch.empty_like(a1_scale)
-                aiter.partial_transpose(
-                    scale_t, a1_scale, num_rows=num_local_tokens
-                )
+                aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
                 a1_scale = scale_t
 
         token_num = hidden_states.shape[0]
@@ -1430,7 +1428,9 @@ def cktile_moe_stage1(
     dtype = hidden_states.dtype
 
     out = torch.empty(
-        (token_num, topk, hidden_states.shape[-1]), dtype=dtype, device=hidden_states.device
+        (token_num, topk, hidden_states.shape[-1]),
+        dtype=dtype,
+        device=hidden_states.device,
     )
 
     aiter.moe_cktile2stages_gemm1(
