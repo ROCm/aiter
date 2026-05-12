@@ -37,15 +37,23 @@ _scale_t_cache: dict = {}
 _quant_func_t_cache: dict = {}
 
 
-def _get_moe_sorting_bufs(M, topk, num_experts, block_size, model_dim, moebuf_dtype, device):
-    device_idx = device.index if device.index is not None else torch.cuda.current_device()
+def _get_moe_sorting_bufs(
+    M, topk, num_experts, block_size, model_dim, moebuf_dtype, device
+):
+    device_idx = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
     key = (device_idx, M, topk, num_experts, block_size, model_dim, moebuf_dtype)
     if key not in _moe_sorting_buf_cache:
         max_num_tokens_padded = int(M * topk + num_experts * block_size - topk)
         max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
         sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-        sorted_weights = torch.empty(max_num_tokens_padded, dtype=dtypes.fp32, device=device)
-        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+        sorted_weights = torch.empty(
+            max_num_tokens_padded, dtype=dtypes.fp32, device=device
+        )
+        sorted_expert_ids = torch.empty(
+            max_num_m_blocks, dtype=dtypes.i32, device=device
+        )
         num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
         moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
         _moe_sorting_buf_cache[key] = (
@@ -60,11 +68,15 @@ def _get_moe_sorting_bufs(M, topk, num_experts, block_size, model_dim, moebuf_dt
 
 def _get_scale_t_buf(scale):
     device = scale.device
-    device_idx = device.index if device.index is not None else torch.cuda.current_device()
+    device_idx = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
     rows, cols = scale.shape[-2], scale.shape[-1]
     key = (device_idx, cols, rows, scale.dtype)
     if key not in _scale_t_cache:
-        _scale_t_cache[key] = torch.empty((cols, rows), dtype=scale.dtype, device=device)
+        _scale_t_cache[key] = torch.empty(
+            (cols, rows), dtype=scale.dtype, device=device
+        )
     return _scale_t_cache[key]
 
 
@@ -97,7 +109,9 @@ def moe_sorting(
         sorted_weights = torch.empty(
             max_num_tokens_padded, dtype=dtypes.fp32, device=device
         )
-        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+        sorted_expert_ids = torch.empty(
+            max_num_m_blocks, dtype=dtypes.i32, device=device
+        )
         num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
         moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
     else:
@@ -107,7 +121,9 @@ def moe_sorting(
             sorted_expert_ids,
             num_valid_ids,
             moe_buf,
-        ) = _get_moe_sorting_bufs(M, topk, num_experts, block_size, model_dim, moebuf_dtype, device)
+        ) = _get_moe_sorting_bufs(
+            M, topk, num_experts, block_size, model_dim, moebuf_dtype, device
+        )
     aiter.moe_sorting_fwd(
         topk_ids,
         topk_weights,
