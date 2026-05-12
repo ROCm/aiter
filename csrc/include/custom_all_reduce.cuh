@@ -1820,6 +1820,170 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                                     eps);
 }
 
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(1024, 1)
+    qknorm_allreduce_fusion_kernel_2stage(RankData* _dp,
+                                   RankSignals sg,
+                                   Signal* self_sg,
+                                   int rank,
+                                   T* __restrict__ qk_in,
+                                   T* __restrict__ q_w,
+                                   T* __restrict__ k_w,
+                                   T* __restrict__ q_out,
+                                   T* __restrict__ k_out,
+                                   int token_num,
+                                   int hidden_dim_q,
+                                   int hidden_dim_k,
+                                   float eps)
+{
+    constexpr int WARP_SIZE = 32;
+    constexpr int pack_size = 16 / sizeof(T);
+    int hidden_dim          = hidden_dim_q + hidden_dim_k;
+    int block_size          = hidden_dim / pack_size;
+    bool active             = (int)threadIdx.x < block_size;
+    bool is_q               = (int)threadIdx.x * pack_size < hidden_dim_q;
+    bool is_q_t0            = threadIdx.x == 0;
+    bool is_k_t0            = threadIdx.x == (hidden_dim_q / pack_size);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int tidx                = blockIdx.x;
+    int access_id_in_token  = threadIdx.x * pack_size;
+    int idx                 = tidx * hidden_dim + access_id_in_token;
+    int wid                 = threadIdx.x / WARP_SIZE;
+
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+        tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    __shared__ float smem[32];
+
+    A acc{};
+    P vec{};
+    P var_vec{};
+    P weight_p{};
+    float sum2 = 0.0f;
+    if(active)
+    {
+        vec = ptrs[0][idx / pack_size];
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            acc[v] = upcast_s(vec[v]);
+            sum2 += acc[v] * acc[v];
+        }
+        sum2 = warpReduce<AddFunctor, float, WARP_SIZE>(sum2);
+        if (threadIdx.x % WARP_SIZE == 0)
+            smem[wid] = sum2;
+        __syncthreads();
+        sum2 = 0.0f;
+        if (is_q_t0) {
+            for (int i = 0; i < hidden_dim_q / pack_size / WARP_SIZE; ++i) {
+                sum2 += smem[i];
+            }
+            sum2 /= (float)hidden_dim_q;
+            *reinterpret_cast<float*>(&var_vec) = sum2;
+            tmps[rank][0] = var_vec;
+        } else if (is_k_t0) {
+            for (int i = hidden_dim_q / pack_size / WARP_SIZE; i < hidden_dim / pack_size / WARP_SIZE; ++i) {
+                sum2 += smem[i];
+            }
+            sum2 /= (float)hidden_dim_k;
+            *reinterpret_cast<float*>(&var_vec) = sum2;
+            tmps[rank][1] = var_vec;
+        }
+        end_sync<ngpus>(sg, self_sg, rank);
+
+        if (is_q_t0) {
+#pragma unroll
+            for(int r = 1; r < ngpus; ++r)
+            {
+                int target = (rank + r) % ngpus;
+                auto peer_vec = tmps[target][0];
+                sum2 += *reinterpret_cast<float*>(&peer_vec);
+            }
+            smem[0] = sum2;
+        } else if (is_k_t0) {
+#pragma unroll
+            for(int r = 1; r < ngpus; ++r)
+            {
+                int target = (rank + r) % ngpus;
+                auto peer_vec = tmps[target][1];
+                sum2 += *reinterpret_cast<float*>(&peer_vec);
+            }
+            smem[1] = sum2;
+        }
+        __syncthreads();
+
+        if (is_q) {
+            float denom = rsqrtf(smem[0] / ngpus + eps);
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+            {
+                vec[v] = downcast_s<T>(acc[v] * denom);
+            }
+            *reinterpret_cast<P*>(&q_out[tidx * hidden_dim_q + access_id_in_token]) = vec;
+        } else {
+            float denom = rsqrtf(smem[1] / ngpus + eps);
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+            {
+                vec[v] = downcast_s<T>(acc[v] * denom);
+            }
+            *reinterpret_cast<P*>(&k_out[tidx * hidden_dim_k + access_id_in_token - hidden_dim_q]) = vec;
+        }
+    }
+}
+
+template <typename T , int NGPUS>
+void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
+                                             RankSignals sg,
+                                             Signal* self_sg,
+                                             int rank,
+                                             T* qk_in,
+                                             T* q_out,
+                                             T* k_out,
+                                             int token_num,
+                                             int hidden_dim_q,
+                                             int hidden_dim_k,
+                                             float eps,
+                                             hipStream_t stream)
+{
+    constexpr int PACK_SIZE  = 16 / sizeof(T);
+    constexpr int WARP_SIZE  = 32;
+    constexpr int WARP_WORK_SIZE = WARP_SIZE * PACK_SIZE;
+    int hidden_dim           = hidden_dim_q + hidden_dim_k;
+    int BLOCK_SIZE           = hidden_dim / PACK_SIZE;
+    // pad to next multiple of WARP_SIZE for correct block reduction
+    int LAUNCH_THREADS       = ((BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+    if(token_num > kMaxBlocks)
+        throw std::runtime_error(
+            "Token number is too large for qknorm_allreduce_fusion_kernel_2stage kernel");
+    bool valid = (hidden_dim_q % WARP_WORK_SIZE == 0) && (hidden_dim_k % WARP_WORK_SIZE == 0);
+    if (!valid)
+        throw std::runtime_error(
+            "Invalid qk hidden dim layout for qknorm_allreduce_fusion_kernel_2stage kernel");
+    dim3 threadsPerBlock(LAUNCH_THREADS);
+    dim3 numBlocks(token_num);
+    qknorm_allreduce_fusion_kernel_2stage<T, NGPUS>
+        <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
+                                                    sg,
+                                                    self_sg,
+                                                    rank,
+                                                    qk_in,
+                                                    q_out,
+                                                    k_out,
+                                                    token_num,
+                                                    hidden_dim_q,
+                                                    hidden_dim_k,
+                                                    eps);
+}
+
 template <typename T, typename OutT, int ngpus>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_2stage(RankData* _dp,
