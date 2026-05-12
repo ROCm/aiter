@@ -21,6 +21,60 @@ from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
 
+# Cache GFX name and CU count at import time to avoid repeated HIP runtime queries
+# in the decode hot path.
+_cached_gfx: str = get_gfx()
+_cached_cu_num: int = get_cu_num()
+
+# Cache for moe_sorting output buffers keyed on
+# (device_idx, M, topk, num_experts, block_size, model_dim, dtype).
+_moe_sorting_buf_cache: dict = {}
+
+# Cache for scale-transpose buffers keyed on (device_idx, cols, rows, dtype).
+_scale_t_cache: dict = {}
+
+# Cache for quant-function partials with transpose_scale=True, keyed on quant_type.
+_quant_func_t_cache: dict = {}
+
+
+def _get_moe_sorting_bufs(M, topk, num_experts, block_size, model_dim, moebuf_dtype, device):
+    device_idx = device.index if device.index is not None else torch.cuda.current_device()
+    key = (device_idx, M, topk, num_experts, block_size, model_dim, moebuf_dtype)
+    if key not in _moe_sorting_buf_cache:
+        max_num_tokens_padded = int(M * topk + num_experts * block_size - topk)
+        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+        sorted_weights = torch.empty(max_num_tokens_padded, dtype=dtypes.fp32, device=device)
+        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        _moe_sorting_buf_cache[key] = (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+        )
+    return _moe_sorting_buf_cache[key]
+
+
+def _get_scale_t_buf(scale):
+    device = scale.device
+    device_idx = device.index if device.index is not None else torch.cuda.current_device()
+    rows, cols = scale.shape[-2], scale.shape[-1]
+    key = (device_idx, cols, rows, scale.dtype)
+    if key not in _scale_t_cache:
+        _scale_t_cache[key] = torch.empty((cols, rows), dtype=scale.dtype, device=device)
+    return _scale_t_cache[key]
+
+
+def _get_quant_func_transpose(quant_type):
+    if quant_type not in _quant_func_t_cache:
+        _quant_func_t_cache[quant_type] = functools.partial(
+            get_quant(quant_type), transpose_scale=True
+        )
+    return _quant_func_t_cache[quant_type]
+
 
 def moe_sorting(
     topk_ids,
@@ -38,16 +92,22 @@ def moe_sorting(
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
 
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
-        max_num_tokens_padded, dtype=dtypes.fp32, device=device
-    )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     if expert_mask is not None:
+        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+        sorted_weights = torch.empty(
+            max_num_tokens_padded, dtype=dtypes.fp32, device=device
+        )
+        sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
         moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
     else:
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+        ) = _get_moe_sorting_bufs(M, topk, num_experts, block_size, model_dim, moebuf_dtype, device)
     aiter.moe_sorting_fwd(
         topk_ids,
         topk_weights,
