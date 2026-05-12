@@ -52,13 +52,12 @@ _GFX950_BLOCKSCALE_NOVS_KERNELS: dict = {
 }
 
 # Module-level pre-resolved kernel name constants for the gfx950 fast path,
-# resolved once at import time using _cached_gfx to avoid repeated dict lookups
-# in the decode hot path.
+# resolved once at import time. get_gfx() is lru_cache'd so this is a single HIP call.
 _FAST_PATH_KERNELNAME_BF16: str = _GFX950_BLOCKSCALE_NOVS_KERNELS.get(
-    (_cached_gfx, dtypes.bf16), ("", "")
+    (get_gfx(), dtypes.bf16), ("", "")
 )[0]
 _FAST_PATH_KERNELNAME_FP16: str = _GFX950_BLOCKSCALE_NOVS_KERNELS.get(
-    (_cached_gfx, dtypes.fp16), ("", "")
+    (get_gfx(), dtypes.fp16), ("", "")
 )[0]
 
 
@@ -859,7 +858,7 @@ def get_2stage_cfgs(
             logger.warning(f"Fmoe tuning not support for {keys}")
 
     force_1stage = _should_force_1stage_asm(
-        _cached_gfx,
+        get_gfx(),
         q_type,
         dtype,
         q_dtype_a,
