@@ -4,6 +4,9 @@ Keep helper naming consistent with other kernel helpers (e.g. `mfma_preshuffle_p
 but this module is intentionally small and MLIR-dialect facing.
 """
 
+_VALID_A_DTYPES = frozenset(("fp8", "fp16", "bf16", "int8", "fp4"))
+_VALID_B_DTYPES = frozenset(("fp8", "fp16", "int8", "int4", "fp4", "mxfp4"))
+
 from flydsl._mlir import ir
 from flydsl.expr.typing import T
 from flydsl._mlir.dialects import (
@@ -14,6 +17,18 @@ from flydsl._mlir.dialects import (
 )
 from flydsl.expr import buffer_ops
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+
+
+def validate_moe_dtypes(a_dtype: str, b_dtype: str) -> None:
+    """Validate a_dtype/b_dtype strings for mixed MoE kernels."""
+    if a_dtype not in _VALID_A_DTYPES:
+        raise ValueError(
+            f"a_dtype must be one of {tuple(sorted(_VALID_A_DTYPES))}, got {a_dtype!r}"
+        )
+    if b_dtype not in _VALID_B_DTYPES:
+        raise ValueError(
+            f"b_dtype must be one of {tuple(sorted(_VALID_B_DTYPES))}, got {b_dtype!r}"
+        )
 
 
 def get_warp_size(arch=None):

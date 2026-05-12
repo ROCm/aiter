@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from typing import Callable
 
 from flydsl._mlir import ir
+from flydsl._mlir.dialects.arith import CmpIPredicate
 import flydsl.expr as fx
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
@@ -127,6 +128,10 @@ def c_shuffle_epilog(
       - `store_pair(...)` is called for each (row_local, col_pair0) half2 after shuffle.
 
     `store_pair` can implement either global stores or atomics.
+
+    When ``lds_out_split`` is provided, the epilogue runs in split-LDS mode:
+    waves are divided into two groups (A: lower half, uses ``lds_out``; B: upper half,
+    uses ``lds_out_split``), each handling half of the N dimension.
     """
     if int(block_size) <= 0 or (int(block_size) % int(cshuffle_nlane)) != 0:
         raise ValueError(

@@ -263,7 +263,7 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
 
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
-    for a in ("fp8", "fp4", "fp16"):
+    for a in ("fp8", "fp4", "fp16", "bf16"):
         for b in ("fp4",):
             for out in ("bf16", "f16"):
                 _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
@@ -304,9 +304,8 @@ def compile_flydsl_moe_stage1(
     swiglu_limit: float = 0.0,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
-    if b_dtype == "fp4":
+    if b_dtype in ("fp4", "mxfp4"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
-        from .moe_common import GateMode
 
         return compile_mixed_moe_gemm1(
             model_dim=model_dim,
@@ -326,7 +325,7 @@ def compile_flydsl_moe_stage1(
             k_batch=k_batch,
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
-            gate_mode=GateMode(gate_mode),
+            gate_mode=gate_mode,
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
