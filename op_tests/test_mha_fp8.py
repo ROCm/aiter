@@ -6,6 +6,7 @@ import aiter
 from aiter import dtypes
 from aiter.test_common import run_perftest
 from aiter import per_tensor_quant
+from aiter.ops.mha import flash_attn_func, flash_attn_fp8_pertensor_func
 import pytest
 import pandas as pd
 import argparse
@@ -26,7 +27,7 @@ def run_ck(
 ):
     if q.dtype == dtypes.fp8 and k.dtype == dtypes.fp8 and v.dtype == dtypes.fp8:
         return run_perftest(
-            aiter.flash_attn_fp8_pertensor_func,
+            flash_attn_fp8_pertensor_func,
             q,
             k,
             v,
@@ -38,7 +39,7 @@ def run_ck(
         )
     else:
         return run_perftest(
-            aiter.flash_attn_func,
+            flash_attn_func,
             q,
             k,
             v,

@@ -17,6 +17,8 @@ import torch
 import triton
 
 import aiter
+from aiter.ops.mha import flash_attn_func, flash_attn_fp8_pertensor_func
+
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.fav3_sage import (
@@ -502,7 +504,7 @@ def make_kernel_runner(
         )
 
     if args.kernel == "aiter_bf16":
-        return lambda: aiter.ops.mha.flash_attn_func(
+        return lambda: flash_attn_func(
             q_bshd,
             k_bshd,
             v_bshd,
@@ -514,7 +516,7 @@ def make_kernel_runner(
     if args.kernel == "aiter_fp8":
         q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = fp8_quantize(q_bshd, k_bshd, v_bshd)
 
-        return lambda: aiter.flash_attn_fp8_pertensor_func(
+        return lambda: flash_attn_fp8_pertensor_func(
             q_fp8,
             k_fp8,
             v_fp8,
@@ -575,7 +577,7 @@ def make_reference_output(
 
     if ref == "aiter_bf16":
         return primary_output(
-            aiter.ops.mha.flash_attn_func(
+            flash_attn_func(
                 q_bshd,
                 k_bshd,
                 v_bshd,
