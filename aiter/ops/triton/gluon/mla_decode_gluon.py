@@ -36,6 +36,10 @@ from triton.experimental.gluon import language as gl
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.device_info import get_num_xcds
+import aiter.ops.triton.gluon.triton_version as tv
+
+# Pre-compute version check as constexpr for use in JIT kernels
+TRITON_VERSION_GE_3_6_0 = tl.constexpr(tv.TRITON_VERSION_GE_3_6_0)
 
 # fmt: off
 @gluon.jit
@@ -155,9 +159,13 @@ def _mla_decode_gluon(
     )
 
     # layout for mfma
+    # Triton >= 3.6.0 requires 3D instr_shape (M, N, K); older versions use 2D (M, N).
+    MFMA_INSTR_SHAPE: gl.constexpr = (
+        [16, 16, 32] if TRITON_VERSION_GE_3_6_0 else [16, 16]
+    )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, 32],
+        instr_shape=MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[4, 1],
     )

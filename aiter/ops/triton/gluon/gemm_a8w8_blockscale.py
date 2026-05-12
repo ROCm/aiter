@@ -16,6 +16,10 @@ from triton import language as tl
 _LOGGER = AiterTritonLogger()
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+import aiter.ops.triton.gluon.triton_version as tv
+
+# Pre-compute version check as constexpr for use in JIT kernels
+TRITON_VERSION_GE_3_6_0 = tl.constexpr(tv.TRITON_VERSION_GE_3_6_0)
 
 
 @triton.heuristics(
@@ -118,9 +122,14 @@ def _gemm_a8w8_blockscale_kernel(
         warps_per_cta=[1, NUM_WARPS],
         order=[0, 1],
     )
+    # V_MFMA_F32_16X16X32_FP8_FP8 instruction
+    # Triton >= 3.6.0 requires 3D instr_shape (M, N, K); older versions use 2D (M, N).
+    MFMA_INSTR_SHAPE: gl.constexpr = (
+        [16, 16, 32] if TRITON_VERSION_GE_3_6_0 else [16, 16]
+    )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, 32],  # V_MFMA_F32_16X16X32_FP8_FP8 instruction
+        instr_shape=MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[NUM_WARPS // 2, 2],
     )
