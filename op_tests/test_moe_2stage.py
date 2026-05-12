@@ -3,6 +3,7 @@
 
 import torch
 import itertools
+from typing import Optional
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, benchmark, run_perftest
@@ -70,7 +71,7 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=True,
     strict_accuracy=True,
-    swiglu_limit=0.0,
+    swiglu_limit: Optional[float] = None,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -567,8 +568,9 @@ parser.add_argument(
     "--swiglu-limit",
     "-sl",
     type=float,
-    default=0.0,
-    help="Limit the number of experts for swiglu activation type. Default is 0.0.",
+    default=None,
+    help="Clamp value for swiglu/silu pre-activation. Default (unset) "
+    "disables clamping (equivalent to passing 0.0).",
 )
 
 args = parser.parse_args()
@@ -816,10 +818,14 @@ def _effective_gate_mode(aq_dtype, wq_dtype):
     return _legacy_gate_mode(aq_dtype, wq_dtype)
 
 
-def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
+def _effective_swiglu_limit(
+    quant_type, aq_dtype, wq_dtype, swiglu_limit: Optional[float]
+) -> Optional[float]:
+    """Pass through ``swiglu_limit`` for fp4-weight Swiglu-friendly combos,
+    otherwise disable clamping (return ``None``)."""
     if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
         return swiglu_limit
-    return 0.0
+    return None
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(

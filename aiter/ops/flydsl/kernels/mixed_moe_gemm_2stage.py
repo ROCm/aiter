@@ -11,6 +11,7 @@ It is extracted from `tests/kernels/test_moe_gemm.py` so that:
 
 import os
 from contextlib import contextmanager
+from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -115,7 +116,7 @@ def compile_mixed_moe_gemm1(
     gate_mode: GateMode = GateMode.SEPARATED,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
 ):
     """Compile stage1 kernel (gate+up with silu/swiglu).
 
@@ -127,6 +128,10 @@ def compile_mixed_moe_gemm1(
     that the GPU can process in parallel.
 
     gate_mode controls the gate/up computation strategy — see GateMode enum.
+
+    swiglu_limit (Optional[float]): clamp value for swiglu/silu pre-activation.
+    ``None`` (default) disables clamping; any concrete float (including
+    ``0.0``) is treated as a real clamp bound.
     """
     gpu_arch = get_hip_arch()
     allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem0")
@@ -1962,11 +1967,11 @@ def compile_mixed_moe_gemm1(
 
                 def _silu_mul_vec4(gate_v4, up_v4):
                     """Element-wise silu(gate) * up on vec4_f32.
-                    When swiglu_limit != 0, clamp gate <= limit and
-                    -limit <= up <= limit before applying silu(gate) * up.
+                    When ``swiglu_limit is not None``, clamp gate <= limit
+                    and -limit <= up <= limit before applying silu(gate) * up.
                     """
                     result_elems = []
-                    if const_expr(swiglu_limit != 0):
+                    if const_expr(swiglu_limit is not None):
                         _limit = arith.constant(float(swiglu_limit), type=f32)
                         _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
                     for ei in range_constexpr(4):
@@ -1976,7 +1981,7 @@ def compile_mixed_moe_gemm1(
                         u = vector.extract(
                             up_v4, static_position=[ei], dynamic_position=[]
                         )
-                        if const_expr(swiglu_limit != 0):
+                        if const_expr(swiglu_limit is not None):
                             g = arith.minimumf(g, _limit)
                             u = arith.minimumf(u, _limit)
                             u = arith.maximumf(u, _neg_limit)
@@ -1986,14 +1991,14 @@ def compile_mixed_moe_gemm1(
                 def _swiglu_mul_vec4(gate_v4, up_v4):
                     """Element-wise swiglu(gate, up) on vec4_f32.
                     swiglu(g, u) = g * sigmoid(alpha * g) * (u + 1)
-                    When swiglu_limit != 0, clamp gate <= limit and
-                    -limit <= up <= limit before the activation.
+                    When ``swiglu_limit is not None``, clamp gate <= limit
+                    and -limit <= up <= limit before the activation.
                     """
                     result_elems = []
                     _alpha = arith.constant(1.702, type=f32)
                     _one = arith.constant(1.0, type=f32)
                     _neg_log2e = arith.constant(-1.4426950408889634, type=f32)
-                    if const_expr(swiglu_limit != 0):
+                    if const_expr(swiglu_limit is not None):
                         _limit = arith.constant(float(swiglu_limit), type=f32)
                         _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
                     else:

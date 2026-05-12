@@ -20,6 +20,8 @@ Compile options:
   act        : "silu" | "swiglu"
 """
 
+from typing import Optional
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, vector, range_constexpr, const_expr
@@ -42,7 +44,7 @@ def build_silu_and_mul_fq_module(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
 ):
     """Return a JIT launcher for fused gate activation + optional quant + scale sort.
 
@@ -60,6 +62,10 @@ def build_silu_and_mul_fq_module(
     gui_layout : bool
         False -> input is gate-up separated  [gate_0:N | up_0:N]
         True  -> input is block-interleaved  [gate_0:16, up_0:16, gate_16:32, ...]
+    swiglu_limit : Optional[float]
+        Clamp value for swiglu/silu pre-activation.  ``None`` (default)
+        disables clamping; any concrete float (including ``0.0``) is treated
+        as a real clamp bound.
     """
     assert inter_dim % 32 == 0, f"inter_dim={inter_dim} must be divisible by 32"
     _need_fp4 = quant_mode == "fp4"
@@ -273,7 +279,7 @@ def build_silu_and_mul_fq_module(
                     swiglu_neg_alpha_log2e = arith.constant(
                         -1.4426950408889634 * 1.702, type=f32
                     )
-                    if const_expr(swiglu_limit != 0):
+                    if const_expr(swiglu_limit is not None):
                         _limit = arith.constant(float(swiglu_limit), type=f32)
                         _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
                     else:
@@ -303,7 +309,7 @@ def build_silu_and_mul_fq_module(
                             linear = arith.minimumf(linear, _limit)
                             linear = arith.maximumf(linear, _neg_limit)
                             t = gate * swiglu_neg_alpha_log2e
-                        elif const_expr(swiglu_limit != 0 and act != "swiglu"):
+                        elif const_expr(swiglu_limit is not None):
                             gate = arith.minimumf(gate, _limit)
                             linear = arith.minimumf(linear, _limit)
                             linear = arith.maximumf(linear, _neg_limit)

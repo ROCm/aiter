@@ -172,7 +172,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
-    swiglu_limit=0.0,
+    swiglu_limit: Optional[float] = None,
     gate_mode: Optional[str] = None,
 ):
     if not block_size_M:
@@ -228,7 +228,7 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
     gate_mode: Optional[str] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
@@ -264,7 +264,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
     gate_mode: Optional[str] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
@@ -731,7 +731,7 @@ def _flydsl_stage1_wrapper(
     out_scale_sorted=None,
     bias1=None,
     topk_ids=None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
     **_kwargs,
 ):
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
@@ -1488,7 +1488,7 @@ def fused_moe_2stages(
     bias2=None,
     topk_ids=None,
     topk_weights=None,
-    swiglu_limit=0.0,
+    swiglu_limit: Optional[float] = None,
     gate_mode=GateMode.SEPARATED.value,
 ):
     quant_func = get_quant(quant_type)
@@ -1659,7 +1659,7 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
     ):
-        if activation == ActivationType.Silu and swiglu_limit == 0.0:
+        if activation == ActivationType.Silu and swiglu_limit is None:
             from aiter.ops.triton.quant.fused_mxfp4_quant import fused_quant_fp8_sort
 
             a2 = a2.view(-1, inter_dim)
@@ -1869,8 +1869,12 @@ def torch_moe(
 
 
 # temp workaround for swiglu
-def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0):
-    if limit == 0.0:
+def swiglu(
+    x_glu, x_linear, alpha: float = 1.702, limit: Optional[float] = None
+):
+    # ``None`` -> use the historical default of 7.0; any concrete float
+    # (including 0.0) is treated as a real clamp bound.
+    if limit is None:
         limit = 7.0
     # Clamp the input values
     x_glu = x_glu.clamp(min=None, max=limit)
@@ -1894,7 +1898,7 @@ def torch_moe_stage1(
     w1_scale=None,  # [expert, inter_dim, 1]
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
-    swiglu_limit=0.0,
+    swiglu_limit: Optional[float] = None,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
@@ -1998,7 +2002,7 @@ def torch_moe_stage1(
         if use_swiglu:
             out = swiglu(gate, up, limit=swiglu_limit)
         else:
-            if swiglu_limit != 0:
+            if swiglu_limit is not None:
                 gate = gate.clamp(min=None, max=swiglu_limit)
                 up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
             out = torch_act(gate) * up

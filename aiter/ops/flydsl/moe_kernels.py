@@ -511,7 +511,7 @@ def compile_flydsl_moe_stage1(
     enable_bias: bool = False,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -847,9 +847,14 @@ def _get_compiled_silu_fused(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
 ):
-    """Compile and cache the fused gate activation + quant + scale-sort kernel."""
+    """Compile and cache the fused gate activation + quant + scale-sort kernel.
+
+    ``swiglu_limit=None`` is the only "no clamp" sentinel; any concrete
+    float (including ``0.0``) is treated as a real clamp bound and gets
+    its own cache entry.
+    """
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
     return build_silu_and_mul_fq_module(
@@ -905,7 +910,7 @@ def flydsl_moe_stage1(
     topk_ids: Optional[torch.Tensor] = None,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
