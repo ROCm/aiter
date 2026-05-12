@@ -40,6 +40,8 @@ class _GroupedA8W4Config:
     cluster_n: int
     use_scale_opsel: bool
     expert_sched_mode: bool
+    grouped_persistent_m: bool = True
+    persistent_workers: Optional[int] = None
     data_format: str = "a8w4"
     act: str = "silu"
 
@@ -59,12 +61,28 @@ def _validate_common(cfg: _GroupedA8W4Config) -> None:
         raise ValueError(f"tile_k must be a multiple of 128 for MXScale WMMA_SCALE, got {cfg.tile_k}")
     if cfg.act not in ("silu", "swiglu"):
         raise ValueError(f"act must be 'silu' or 'swiglu', got {cfg.act!r}")
+    if cfg.grouped_persistent_m and (cfg.cluster_m != 1 or cfg.cluster_n != 1):
+        raise ValueError("grouped_persistent_m currently requires cluster_m=cluster_n=1")
 
 
 def _to_int(value) -> int:
     if isinstance(value, torch.Tensor):
         return int(value.item())
     return int(value)
+
+
+def _make_m_tile_prefix(masked_m: torch.Tensor, cfg: _GroupedA8W4Config) -> torch.Tensor:
+    valid_m = masked_m[:cfg.experts].to(dtype=torch.int32)
+    valid_m = valid_m.clamp(min=0, max=cfg.max_m)
+    valid_tiles = torch.div(
+        valid_m + (cfg.tile_m - 1),
+        cfg.tile_m,
+        rounding_mode="floor",
+    )
+    prefix = torch.empty((cfg.experts + 1,), device=masked_m.device, dtype=torch.int32)
+    prefix[0].zero_()
+    torch.cumsum(valid_tiles, dim=0, out=prefix[1:])
+    return prefix
 
 
 def _check_rank(name: str, tensor: torch.Tensor, rank: int) -> None:
@@ -172,6 +190,8 @@ def _compile_base_a8w4_gemm(*, K: int, N: int, cfg: _GroupedA8W4Config):
         expert_sched_mode=cfg.expert_sched_mode,
         batch_count=cfg.experts,
         grouped_masked_m=True,
+        grouped_persistent_m=cfg.grouped_persistent_m,
+        persistent_workers=cfg.persistent_workers,
     )
 
 
@@ -197,6 +217,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     cluster_n: int = 1,
     use_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
+    grouped_persistent_m: bool = True,
+    persistent_workers: int | None = None,
     act: str = "silu",
     data_format: str = "a8w4",
 ):
@@ -207,7 +229,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         waves_per_eu=waves_per_eu, out_dtype=str(out_dtype), use_tdm_store=bool(use_tdm_store),
         inst_prefetch=bool(inst_prefetch), wave_specialized_tdm=bool(wave_specialized_tdm),
         cluster_m=int(cluster_m), cluster_n=int(cluster_n), use_scale_opsel=bool(use_scale_opsel),
-        expert_sched_mode=bool(expert_sched_mode), data_format=str(data_format), act=str(act),
+        expert_sched_mode=bool(expert_sched_mode), grouped_persistent_m=bool(grouped_persistent_m),
+        persistent_workers=persistent_workers, data_format=str(data_format), act=str(act),
     )
     _validate_common(cfg)
     base = _compile_base_a8w4_gemm(K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg)
@@ -220,7 +243,14 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         if stream is None:
             stream = torch.cuda.current_stream()
         tmp = torch.empty((cfg.experts, cfg.max_m, 2 * cfg.inter_dim), device=y.device, dtype=y.dtype)
-        base(tmp, x, w, scale_x, scale_w, masked_m, cfg.max_m, 2 * cfg.inter_dim, stream=stream)
+        if cfg.grouped_persistent_m:
+            with torch.cuda.stream(stream):
+                m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
+                base(tmp, x, w, scale_x, scale_w, masked_m, m_tile_prefix,
+                     cfg.max_m, 2 * cfg.inter_dim, stream=stream)
+        else:
+            base(tmp, x, w, scale_x, scale_w, masked_m,
+                 cfg.max_m, 2 * cfg.inter_dim, stream=stream)
         for e in range(cfg.experts):
             valid = _to_int(masked_m[e])
             if valid <= 0:
@@ -257,6 +287,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     cluster_n: int = 1,
     use_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
+    grouped_persistent_m: bool = True,
+    persistent_workers: int | None = None,
     data_format: str = "a8w4",
 ):
     cfg = _GroupedA8W4Config(
@@ -266,7 +298,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         waves_per_eu=waves_per_eu, out_dtype=str(out_dtype), use_tdm_store=bool(use_tdm_store),
         inst_prefetch=bool(inst_prefetch), wave_specialized_tdm=bool(wave_specialized_tdm),
         cluster_m=int(cluster_m), cluster_n=int(cluster_n), use_scale_opsel=bool(use_scale_opsel),
-        expert_sched_mode=bool(expert_sched_mode), data_format=str(data_format),
+        expert_sched_mode=bool(expert_sched_mode), grouped_persistent_m=bool(grouped_persistent_m),
+        persistent_workers=persistent_workers, data_format=str(data_format),
     )
     _validate_common(cfg)
     base = _compile_base_a8w4_gemm(K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg)
@@ -278,7 +311,14 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         _check_stage2_args(y, x, w, scale_x, scale_w, masked_m, cfg)
         if stream is None:
             stream = torch.cuda.current_stream()
-        base(y, x, w, scale_x, scale_w, masked_m, cfg.max_m, cfg.model_dim, stream=stream)
+        if cfg.grouped_persistent_m:
+            with torch.cuda.stream(stream):
+                m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
+                base(y, x, w, scale_x, scale_w, masked_m, m_tile_prefix,
+                     cfg.max_m, cfg.model_dim, stream=stream)
+        else:
+            base(y, x, w, scale_x, scale_w, masked_m,
+                 cfg.max_m, cfg.model_dim, stream=stream)
         for e in range(cfg.experts):
             valid = _to_int(masked_m[e])
             if valid <= 0:
