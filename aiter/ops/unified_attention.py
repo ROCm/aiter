@@ -124,8 +124,15 @@ def _pick_num_splits(
     # select_config tile-tier ladder closely enough for the heuristic.
     avg_q = total_q // num_seqs
     if num_qpkv == 1:
-        # d=128 MHA: kBlockQ ∈ {128, 256}
-        kBlockQ = 128 if avg_q <= 128 else 256
+        # d=128 MHA: kBlockQ ∈ {16, 32, 128, 256}
+        if avg_q <= 16:
+            kBlockQ = 16
+        elif avg_q <= 32:
+            kBlockQ = 32
+        elif avg_q <= 128:
+            kBlockQ = 128
+        else:
+            kBlockQ = 256
     else:
         # d=64 GQA-8: kBlockQ ∈ {2, 8, 16}
         kBlockQ_tiny  = 16 // num_qpkv   # 2
