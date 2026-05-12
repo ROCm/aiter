@@ -153,11 +153,14 @@ def _affinity_aware_cpu_count() -> int:
     use. ``os.cpu_count()`` reports host CPUs and ignores cgroup /
     cpuset constraints common in CI containers; ``sched_getaffinity``
     is the right answer where available (Linux). Fallback to
-    ``cpu_count`` otherwise."""
+    ``cpu_count`` otherwise. Clamped to ≥1 — empty-affinity-set or
+    None-from-cpu_count would otherwise yield 0 and break the
+    ``ProcessPoolExecutor(max_workers=0)`` call site."""
     try:
-        return len(os.sched_getaffinity(0))
+        n = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
-        return os.cpu_count() or 4
+        n = os.cpu_count() or 0
+    return max(n, 1)
 
 
 def start_aot(
