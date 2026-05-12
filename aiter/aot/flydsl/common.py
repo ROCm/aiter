@@ -130,11 +130,7 @@ def start_aot(cache_dir: str):
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
     workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
-    if (
-        workers_env is not None
-        and workers_env.isdigit()
-        and int(workers_env) > 0
-    ):
+    if workers_env is not None and workers_env.isdigit() and int(workers_env) > 0:
         max_workers = int(workers_env)
     else:
         max_workers = min(os.cpu_count() or 4, 64)
@@ -189,17 +185,13 @@ def wait_aot(pool, futures):
                 label = futures[future]
                 kind = "moe" if label.startswith("MOE") else "gemm"
                 fail_by_kind[kind] += 1
-                errors.append(
-                    f"FlyDSL {label} AOT worker crashed: {worker_err}"
-                )
+                errors.append(f"FlyDSL {label} AOT worker crashed: {worker_err}")
         for kind in ("moe", "gemm"):
             print(
                 f"[aiter] FlyDSL {kind.upper()} AOT: "
                 f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
             )
         if errors:
-            raise AssertionError(
-                "[aiter] FlyDSL AOT failures: " + "; ".join(errors)
-            )
+            raise AssertionError("[aiter] FlyDSL AOT failures: " + "; ".join(errors))
     finally:
         pool.shutdown(wait=False)
