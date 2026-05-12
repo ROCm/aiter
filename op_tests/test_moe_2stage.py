@@ -615,43 +615,47 @@ def test_fmoe(
             _ck_atol, _ck_rtol = 0.25, 0.5
         elif AQDType == dtypes.fp8 and WQDType == dtypes.fp8:    # fp8
             _ck_atol, _ck_rtol = 0.25, 0.25
-    # Rough HBM-traffic estimate for the fused_moe call (lower bound: only
-    # counts the activation in/out plus E_effective expert weights; ignores
-    # workspace + intermediate buffers).  E_effective = min(E, token*topk)
-    # so decode-style small-token cases don't get charged for unused experts.
-    def _bytes_per_elem(d):
-        if d in (dtypes.bf16, dtypes.fp16):
+    _use_ffm = os.environ.get("USE_FFM", "0") not in ("0", "")
+    if _use_ffm:
+        _bw_GBps = 0.0
+        _bw_msg = ""
+    else:
+        def _bytes_per_elem(d):
+            if d in (dtypes.bf16, dtypes.fp16):
+                return 2.0
+            if d == dtypes.fp8:
+                return 1.0
+            if d == dtypes.fp4x2:
+                return 0.5
             return 2.0
-        if d == dtypes.fp8:
-            return 1.0
-        if d == dtypes.fp4x2:
-            return 0.5
-        return 2.0
-    _act_bytes = _bytes_per_elem(dtype)
-    _w_bytes = _bytes_per_elem(WQDType) if WQDType is not None else _act_bytes
-    _E_eff = min(E, token * topk)
-    _w1_n = inter_dim * 2 if use_g1u1 else inter_dim
-    _input_b = token * model_dim * _act_bytes
-    _w1_b = _E_eff * _w1_n * model_dim * _w_bytes
-    _w2_b = _E_eff * model_dim * inter_dim * _w_bytes
-    _w_scale_b = 0.0
-    if qType == aiter.QuantType.per_1x32:
-        _w_scale_b = _E_eff * (
-            _w1_n * (model_dim // 32) + model_dim * (inter_dim // 32)
+        _act_bytes = _bytes_per_elem(dtype)
+        _w_bytes = _bytes_per_elem(WQDType) if WQDType is not None else _act_bytes
+        _E_eff = min(E, token * topk)
+        _w1_n = inter_dim * 2 if use_g1u1 else inter_dim
+        _input_b = token * model_dim * _act_bytes
+        _w1_b = _E_eff * _w1_n * model_dim * _w_bytes
+        _w2_b = _E_eff * model_dim * inter_dim * _w_bytes
+        _w_scale_b = 0.0
+        if qType == aiter.QuantType.per_1x32:
+            _w_scale_b = _E_eff * (
+                _w1_n * (model_dim // 32) + model_dim * (inter_dim // 32)
+            )
+        _out_b = token * model_dim * _act_bytes
+        _total_b = _input_b + _w1_b + _w2_b + _w_scale_b + _out_b
+        _bw_GBps = _total_b / us2 / 1e3
+        _bw_msg = (
+            f"{token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops, "
+            f"{_bw_GBps:>8.2f} GB/s "
+            f"(M={token},dim={model_dim}/{inter_dim},E={E},topk={topk},"
+            f"act={_act_bytes}B,w={_w_bytes}B)"
         )
-    _out_b = token * model_dim * _act_bytes
-    _total_b = _input_b + _w1_b + _w2_b + _w_scale_b + _out_b
-    _bw_GBps = _total_b / us2 / 1e3  # bytes/us == MB/s; /1e3 -> GB/s
     err = checkAllclose(
         out2_ref,
         out2_ck,
         atol=_ck_atol,
         rtol=_ck_rtol,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, "
-        f"{token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops, "
-        f"{_bw_GBps:>8.2f} GB/s "
-        f"(M={token},dim={model_dim}/{inter_dim},E={E},topk={topk},"
-        f"act={_act_bytes}B,w={_w_bytes}B)......(quant:{AQDType})",
+        f"{_bw_msg}......(quant:{AQDType})",
     )
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
