@@ -6,8 +6,20 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import enum
 import os
 from typing import Any, Callable, Iterator
+
+
+class OpKind(enum.Enum):
+    """FlyDSL AOT kernel categories. Members are picklable across
+    ProcessPoolExecutor process boundaries; using an enum (rather than
+    raw strings) means typos at call sites become construction errors
+    instead of silently routing to the wrong code path."""
+
+    MOE = "moe"
+    GEMM = "gemm"
+
 
 _CU_NUM_TO_ARCH = {
     80: "gfx942",
@@ -80,7 +92,7 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
-def _collect_aot_jobs_for(kind):
+def _collect_aot_jobs_for(kind: OpKind):
     """Helper: load DEFAULT_CSVS + parse_csv for the named kind and
     return its job list. Note that importing .gemm / .moe here also
     executes their module-level imports, which include FlyDSL itself
@@ -88,22 +100,38 @@ def _collect_aot_jobs_for(kind):
     truly free in the parent process — but it's identical to what the
     pre-refactor ``run_aot_worker`` paid in each child, just shifted
     once into the parent."""
-    if kind == "moe":
+    if kind is OpKind.MOE:
         from .moe import DEFAULT_CSVS, parse_csv
-    else:
+    elif kind is OpKind.GEMM:
         from .gemm import DEFAULT_CSVS, parse_csv
+    else:
+        raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
 
 
-def _compile_one(kind, job):
+def _compile_one(kind: OpKind, job):
     """Per-kernel worker — runs in a ProcessPoolExecutor child process.
     Top-level so it's picklable. Imports compile_one_config lazily so
     the pickle wire payload is just (kind, job-dict)."""
-    if kind == "moe":
+    if kind is OpKind.MOE:
         from .moe import compile_one_config
-    else:
+    elif kind is OpKind.GEMM:
         from .gemm import compile_one_config
+    else:
+        raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return kind, compile_one_config(**job)
+
+
+def _affinity_aware_cpu_count() -> int:
+    """Return the number of CPUs this process is actually allowed to
+    use. ``os.cpu_count()`` reports host CPUs and ignores cgroup /
+    cpuset constraints common in CI containers; ``sched_getaffinity``
+    is the right answer where available (Linux). Fallback to
+    ``cpu_count`` otherwise."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 4
 
 
 def start_aot(cache_dir: str):
@@ -137,11 +165,11 @@ def start_aot(cache_dir: str):
     if workers_env is not None and workers_env.isdigit() and int(workers_env) > 0:
         max_workers = int(workers_env)
     else:
-        max_workers = min(os.cpu_count() or 4, 64)
+        max_workers = min(_affinity_aware_cpu_count(), 64)
 
     # Flatten all kernels from both kinds into a single submission list.
-    all_jobs = []  # list of (kind, job-dict)
-    for kind in ("moe", "gemm"):
+    all_jobs: list[tuple[OpKind, dict]] = []
+    for kind in OpKind:
         for job in _collect_aot_jobs_for(kind):
             all_jobs.append((kind, job))
 
@@ -161,7 +189,7 @@ def start_aot(cache_dir: str):
     for kind, job in all_jobs:
         f = pool.submit(_compile_one, kind, job)
         # Store a small label string for crash diagnostics in wait_aot.
-        futures[f] = f"{kind.upper()} {job.get('kernel_name', '?')}"
+        futures[f] = f"{kind.name} {job.get('kernel_name', '?')}"
     return pool, futures
 
 
@@ -173,9 +201,9 @@ def wait_aot(pool, futures):
     if pool is None or not futures:
         return
     try:
-        ok_by_kind = {"moe": 0, "gemm": 0}
-        fail_by_kind = {"moe": 0, "gemm": 0}
-        errors = []
+        ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
+        fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
+        errors: list[str] = []
         for future in futures:
             try:
                 kind, result = future.result()
@@ -192,12 +220,12 @@ def wait_aot(pool, futures):
                 # Crashes don't tell us which kind — best-effort attribute
                 # to whatever the label string starts with.
                 label = futures[future]
-                kind = "moe" if label.startswith("MOE") else "gemm"
+                kind = OpKind.MOE if label.startswith(OpKind.MOE.name) else OpKind.GEMM
                 fail_by_kind[kind] += 1
                 errors.append(f"FlyDSL {label} AOT worker crashed: {worker_err}")
-        for kind in ("moe", "gemm"):
+        for kind in OpKind:
             print(
-                f"[aiter] FlyDSL {kind.upper()} AOT: "
+                f"[aiter] FlyDSL {kind.name} AOT: "
                 f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
             )
         if errors:
@@ -212,10 +240,7 @@ def wait_aot(pool, futures):
             suffix = ""
             if len(errors) > _MAX_ERRORS_IN_MSG:
                 suffix = f"; ... ({len(errors) - _MAX_ERRORS_IN_MSG} more)"
-            tally = (
-                f"MoE: {fail_by_kind['moe']} failed, "
-                f"GEMM: {fail_by_kind['gemm']} failed"
-            )
+            tally = ", ".join(f"{k.name}: {fail_by_kind[k]} failed" for k in OpKind)
             raise AssertionError(
                 f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
             )
