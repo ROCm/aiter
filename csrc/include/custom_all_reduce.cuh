@@ -3497,6 +3497,60 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
 #undef DISPATCH_AR_FUSION_PG_KERNEL
 }
 
+template <typename T>
+void dispatchFusedQKNormAllReduce(hipStream_t stream,
+                                  T* qk_in,
+                                  T* q_w,
+                                  T* k_w,
+                                  T* q_out,
+                                  T* k_out,
+                                  int token_num,
+                                  int hidden_dim_q,
+                                  int hidden_dim_k,
+                                  float eps)
+{
+    auto d = 16 / sizeof(T);
+    if(hidden_dim_q % d != 0 || hidden_dim_k % d != 0)
+    {
+        throw std::runtime_error("custom allreduce currently requires input length to be multiple "
+                                 "of " +
+                                 std::to_string(d));
+    }
+    RankData* ptrs = get_buffer_RD(stream, qk_in);
+
+    auto pack_size   = 16 / sizeof(T);
+    bool n_constrain = (n % pack_size == 0) && (n / pack_size <= 1024);
+    use_1stage       = use_1stage && n_constrain;
+#define DISPATCH_QKNORM_AR_FUSION_KERNEL(NGPUS)                                \
+    {                                                                          \
+        qknorm_allreduce_fusion_kernel_2stage_launcher<T, NGPUS>(ptrs,         \
+                                                                 sg_,          \
+                                                                 self_sg_,     \
+                                                                 rank_,        \
+                                                                 qk_in,        \
+                                                                 q_w,          \
+                                                                 k_w,          \
+                                                                 q_out,        \
+                                                                 k_out,        \
+                                                                 token_num,    \
+                                                                 hidden_dim_q, \
+                                                                 hidden_dim_k, \
+                                                                 eps,          \
+                                                                 stream);      \
+        return;                                                                \
+    }
+
+    switch(world_size_)
+    {
+    case 8: DISPATCH_AR_FUSION_KERNEL(8); break;
+    case 4: DISPATCH_AR_FUSION_KERNEL(4); break;
+    case 2: DISPATCH_AR_FUSION_KERNEL(2); break;
+    default:
+        throw std::runtime_error("fused qknorm allreduce rmsnorm: unsupported world_size=" +
+                                 std::to_string(world_size_));
+    }
+}
+
 ~CustomAllreduce()
 {
     for(auto [_, ptr] : ipc_handles_)
