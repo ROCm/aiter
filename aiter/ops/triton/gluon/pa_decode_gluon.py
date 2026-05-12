@@ -5145,6 +5145,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 query_group_size=query_group_size,
                 head_size=head_size,
                 context_partition_num=context_partition_num,
+                stream=torch.cuda.current_stream(output_ptr.device),
             )
         except Exception:
             pass
