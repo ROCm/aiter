@@ -92,22 +92,21 @@ def _pick_num_splits(
 ) -> int:
     """Pick KV-splits to oversubscribe CTAs ~2x the device's CU count.
 
-    Cost model:
+    Cost model (pure-CPU, no device sync — safe under CUDA graph capture):
         base_ctas   = num_kv_heads * q_tiles
         target_ctas = num_cus * 2
-        num_splits  = clamp(target_ctas / base_ctas, 1, min(16, kv_tile_cap))
+        num_splits  = clamp(target_ctas / base_ctas, 1, 16)
 
-    where kv_tile_cap = ceil(min_kv_len / page_size) prevents creating splits
-    that would get zero work, and 16 is a hard ceiling to keep the combine
-    cheap.
+    The 16 cap keeps the per-split workspace and the combine cheap. `q_tiles`
+    is approximated from `avg_q` to follow the C++ select_config tile-tier
+    ladder; mixed prefill+decode batches may be slightly over- or under-
+    estimated but the `clamp` absorbs the error.
 
-    `q_tiles` is approximated from `avg_q` only (no device sync on
-    `query_start_len`) — for mixed prefill+decode batches this may slightly
-    over- or under-estimate the true tile count, but the formula is robust
-    to that since `clamp` absorbs the error.
-
-    Returns 1 when splitting wouldn't help (already plenty of CTAs, or the
-    min KV len is shorter than one page).
+    A split that ends up with zero KV pages (because num_splits > the seq's
+    KV-page count) is harmless: the kernel writes -inf to that split's
+    lse_acc, and _combine_splits drops -inf rows from the merge. We
+    intentionally do not read seq_lens off the device here to keep the
+    wrapper compatible with CUDA-graph capture and avoid per-call syncs.
     """
     env = os.environ.get("AITER_UA_FORCE_SPLITS")
     if env is not None:
@@ -115,7 +114,6 @@ def _pick_num_splits(
 
     total_q       = query.shape[0]
     num_q_heads   = query.shape[1]
-    page_size     = key_cache.shape[1]
     num_kv_heads  = key_cache.shape[2]
     num_seqs      = seq_lens.shape[0]
     if num_seqs <= 0:
@@ -139,17 +137,11 @@ def _pick_num_splits(
         else:
             kBlockQ = 128 // num_qpkv    # 16 (decode_*_m128 / prefill share kBlockQ=16)
 
-    q_tiles   = max(1, (total_q + kBlockQ - 1) // kBlockQ)
-    base_ctas = num_kv_heads * q_tiles
-
-    # One small sync: pull min KV len off the device so we never create a
-    # split that gets zero pages.
-    min_kv_len  = int(seq_lens.min().item())
-    kv_tile_cap = max(1, (min_kv_len + page_size - 1) // page_size)
-
+    q_tiles     = max(1, (total_q + kBlockQ - 1) // kBlockQ)
+    base_ctas   = num_kv_heads * q_tiles
     target_ctas = _num_cus(query.device) * 2
     raw_splits  = target_ctas // max(1, base_ctas)
-    return max(1, min(16, kv_tile_cap, raw_splits))
+    return max(1, min(16, raw_splits))
 
 
 def _combine_splits(
