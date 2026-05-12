@@ -344,6 +344,67 @@ def fp8_quantize(
     return q_quant, k_quant, v_quant, q_descale, k_descale, v_descale
 
 
+def _unpack_block_lut(
+    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> Tuple[
+    Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], bool
+]:
+    """Unpack block LUT into (kv_block_indices, lut_start, lut_count, use_block_sparse)."""
+    if block_lut is not None:
+        kv_block_indices, lut_start, lut_count = block_lut
+        return kv_block_indices, lut_start, lut_count, True
+    return None, None, None, False
+
+
+def _call_flash_attn_3(
+    q_fp8: torch.Tensor,
+    k_fp8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> Any:
+    """Thin wrapper around flash_attn_3.fwd with default args for unused features."""
+    return flash_attn_3.fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,  # out, alibi_slopes, etc.
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,  # unused optional tensors
+        None,
+        None,
+        None,  # rng states, padding
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale,
+        causal,
+        -1,
+        -1,  # window_size
+        0,
+        0.0,
+        False,  # attention_chunk, softcap, deterministic
+        None,
+        1,
+        None,  # descale_out, sm_margin, seqused_k
+        0,  # num_splits
+    )
+
+
 def make_fav3_fp8_runner(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -361,94 +422,30 @@ def make_fav3_fp8_runner(
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
 
+    def _quantize():
+        q_fp8, q_ds = _quantize_bshd(q, fp8_dtype, group_size=group_size)
+        k_fp8, k_ds = _quantize_bshd(k, fp8_dtype)
+        v_fp8, v_ds = _quantize_bshd(v, fp8_dtype)
+        return q_fp8, k_fp8, v_fp8, q_ds, k_ds, v_ds
+
     if e2e:
+        return lambda: _call_flash_attn_3(*_quantize(), softmax_scale, causal)
 
-        def _run_fav3_fp8_e2e():
-            q_fp8, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
-            k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
-            v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
-            return flash_attn_3.fwd(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                q_descale,
-                k_descale,
-                v_descale,
-                softmax_scale,
-                causal,
-                -1,
-                -1,
-                0,
-                0.0,
-                False,
-                None,
-                1,
-                None,
-                0,
-            )
-
-        return _run_fav3_fp8_e2e
-
-    q_fp8, q_descale = _quantize_bshd(q, fp8_dtype, group_size=group_size)
-    k_fp8, k_descale = _quantize_bshd(k, fp8_dtype)
-    v_fp8, v_descale = _quantize_bshd(v, fp8_dtype)
+    q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = _quantize()
 
     assert q_descale.shape == (batch, num_kv_heads)
     assert k_descale.shape == (batch, num_kv_heads)
     assert v_descale.shape == (batch, num_kv_heads)
 
-    return lambda: flash_attn_3.fwd(
+    return lambda: _call_flash_attn_3(
         q_fp8,
         k_fp8,
         v_fp8,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
         q_descale,
         k_descale,
         v_descale,
         softmax_scale,
         causal,
-        -1,
-        -1,
-        0,
-        0.0,
-        False,
-        None,
-        1,
-        None,
-        0,
     )
 
 
@@ -505,13 +502,7 @@ def make_kernel_runner(
             layout=args.layout,
         )
 
-        if block_lut is not None:
-            kv_block_indices, lut_start, lut_count = block_lut
-            use_block_sparse = True
-        else:
-            kv_block_indices = lut_start = lut_count = None
-            use_block_sparse = False
-
+        kv_idx, lut_s, lut_c, sparse = _unpack_block_lut(block_lut)
         return lambda: fav3_sage_func(
             q_int8,
             k_int8,
@@ -524,10 +515,10 @@ def make_kernel_runner(
             return_lse=False,
             layout=args.layout,
             config=cfg,
-            kv_block_indices=kv_block_indices,
-            lut_start=lut_start,
-            lut_count=lut_count,
-            use_block_sparse=use_block_sparse,
+            kv_block_indices=kv_idx,
+            lut_start=lut_s,
+            lut_count=lut_c,
+            use_block_sparse=sparse,
         )
 
     if args.kernel == "sage_mxfp4":
@@ -578,13 +569,7 @@ def make_kernel_runner(
             q_smoothing=args.qsmooth,
         )
 
-        if block_lut is not None:
-            kv_block_indices, lut_start, lut_count = block_lut
-            use_block_sparse = True
-        else:
-            kv_block_indices = lut_start = lut_count = None
-            use_block_sparse = False
-
+        kv_idx, lut_s, lut_c, sparse = _unpack_block_lut(block_lut)
         return lambda: fav3_sage_mxfp4_func(
             q=q_quant,
             k=k_quant,
@@ -596,10 +581,10 @@ def make_kernel_runner(
             causal=args.causal,
             layout=args.layout,
             config=cfg,
-            kv_block_indices=kv_block_indices,
-            lut_start=lut_start,
-            lut_count=lut_count,
-            use_block_sparse=use_block_sparse,
+            kv_block_indices=kv_idx,
+            lut_start=lut_s,
+            lut_count=lut_c,
+            use_block_sparse=sparse,
         )
 
     if args.kernel == "aiter_bf16":
@@ -613,26 +598,24 @@ def make_kernel_runner(
         )
 
     if args.kernel == "aiter_fp8":
-        if args.e2e:
-            def _run_aiter_fp8_e2e():
-                q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = fp8_quantize(
-                    q_bshd, k_bshd, v_bshd
-                )
-                return flash_attn_fp8_pertensor_func(
-                    q_fp8,
-                    k_fp8,
-                    v_fp8,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                )
 
-            return _run_aiter_fp8_e2e
+        def _run_aiter_fp8():
+            q_fp8, k_fp8, v_fp8, q_ds, k_ds, v_ds = fp8_quantize(q_bshd, k_bshd, v_bshd)
+            return flash_attn_fp8_pertensor_func(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                q_descale=q_ds,
+                k_descale=k_ds,
+                v_descale=v_ds,
+            )
+
+        if args.e2e:
+            return _run_aiter_fp8
 
         q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = fp8_quantize(
             q_bshd, k_bshd, v_bshd
         )
-
         return lambda: flash_attn_fp8_pertensor_func(
             q_fp8,
             k_fp8,
