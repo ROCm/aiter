@@ -10,12 +10,16 @@
 #include "rocprim/rocprim.hpp"
 #include <hipcub/hipcub.hpp>
 
+#ifndef KERNEL_BENCH_ITERS
+#define KERNEL_BENCH_ITERS 1
+#endif
+
 const int32_t BlockSize           = 256;
 const int32_t groupQuantBlockSize = 64;
 
 namespace aiter {
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true>
-__global__ void
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64>
+__global__ void __launch_bounds__(block_size)
 dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       float* __restrict__ scale,
                                       DTYPE_I const* __restrict__ input,
@@ -36,7 +40,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         ori_rows = *num_rows * num_cols_factor;
     }
     static constexpr int num_thread_per_group = group_size / thread_data_size;
-    int32_t row_offset       = blockIdx.x * blockDim.x;
+    int32_t row_offset       = blockIdx.x * block_size;
     int32_t groupId          = (row_offset + threadIdx.x) / num_thread_per_group;
     int32_t scaleN           = ori_cols / group_size;
     int32_t scaleN_pad       = (std::is_same_v<DTYPE_O, opus::fp4_t> && shuffle_scale)
@@ -69,7 +73,6 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     auto const* input_vecs = reinterpret_cast<vec_i const*>(input + row_offset);
     vec_i thread_data = input_vecs[threadIdx.x % num_thread_per_group];
     float absMax      = 1e-10f;
-#pragma unroll
     for(size_t j = 0; j < thread_data_size; j++)
     {
         absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
@@ -727,16 +730,7 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
         DISPATCH_GROUP_SIZE(cols,
             static constexpr int thread_data_size     = 32;
             static constexpr int num_thread_per_group = _GS / thread_data_size;
-            const int32_t dynGroupQuantBlockSize = [&out]() -> int32_t {
-                #if defined(__Float4_e2m1fn_x2)
-                    if(out.dtype() == AITER_DTYPE_fp4x2)
-                        return 64;
-                #endif
-                const auto& gfx = get_device_gfx();
-                if(gfx == "gfx942") return 128;
-                if(gfx == "gfx950") return 128;
-                return 64;
-            }();
+            static constexpr int32_t dynGroupQuantBlockSize = 64;
             const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
             auto launch_group_quant = [&](auto out_type_tag, int ori_cols, int ori_rows, int num_group, auto shuffle_tag) {
                 using out_t = decltype(out_type_tag);
@@ -746,20 +740,26 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                 dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
                 dim3 const block(dynGroupQuantBlockSize);
                 AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
-                    input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
+                    input.dtype(), "dynamic_p/app/aiter-test/csrc/kernels/quant_kernels.cuer_group_scaled_quant_kernel", [&] {
                         using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-                        aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss>
-                            <<<grid, block, 0, stream>>>(
-                            reinterpret_cast<out_t*>(out.data_ptr()),
-                            reinterpret_cast<float*>(scales.data_ptr()),
-                            reinterpret_cast<input_dtype*>(input.data_ptr()),
-                            scale_ub.has_value() ? reinterpret_cast<float*>(scale_ub->data_ptr()) : nullptr,
-                            ori_rows,
-                            ori_cols,
-                            ori_cols,
-                            oob_size,
-                            num_rows_ptr,
-                            num_rows_factor);
+                        for (int i = 0; i < KERNEL_BENCH_ITERS; i++)
+                        {
+                            aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, dynGroupQuantBlockSize>
+                                <<<grid, block, 0, stream>>>(
+                                reinterpret_cast<out_t*>(out.data_ptr()),
+                                reinterpret_cast<float*>(scales.data_ptr()),
+                                reinterpret_cast<input_dtype*>(input.data_ptr()),
+                                scale_ub.has_value() ? reinterpret_cast<float*>(scale_ub->data_ptr()) : nullptr,
+                                ori_rows,
+                                ori_cols,
+                                ori_cols,
+                                oob_size,
+                                num_rows_ptr,
+                                num_rows_factor);
+                            #if KERNEL_BENCH_ITERS != 1
+                                hipStreamSynchronize(stream);
+                            #endif
+                        }
                     });
             };
             auto do_launch = [&](auto shuffle_tag) {
@@ -850,12 +850,7 @@ void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
     DISPATCH_GROUP_SIZE(group_size,
         static constexpr int thread_data_size     = 32;
         static constexpr int num_thread_per_group = _GS / thread_data_size;
-        const int32_t dynGroupQuantBlockSize = []() -> int32_t {
-            const auto& gfx = get_device_gfx();
-            if(gfx == "gfx942") return 128;
-            if(gfx == "gfx950") return 128;
-            return 64;
-        }();
+        static constexpr int32_t dynGroupQuantBlockSize = 64;
         const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
 
         int scaleN    = cols / _GS;
@@ -870,35 +865,47 @@ void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                     using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-                    aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, opus::fp4_t, thread_data_size, _GS, true>
-                        <<<grid, block, 0, stream>>>(
-                        reinterpret_cast<opus::fp4_t*>(out.data_ptr()),
-                        reinterpret_cast<float*>(scales.data_ptr()),
-                        reinterpret_cast<input_dtype*>(input.data_ptr()),
-                        nullptr,
-                        rows,
-                        cols,
-                        row_stride,
-                        oob_size,
-                        num_rows_ptr,
-                        num_rows_factor);
+                    for (int i = 0; i < KERNEL_BENCH_ITERS; i++)
+                    {
+                        aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, opus::fp4_t, thread_data_size, _GS, true, dynGroupQuantBlockSize>
+                            <<<grid, block, 0, stream>>>(
+                            reinterpret_cast<opus::fp4_t*>(out.data_ptr()),
+                            reinterpret_cast<float*>(scales.data_ptr()),
+                            reinterpret_cast<input_dtype*>(input.data_ptr()),
+                            nullptr,
+                            rows,
+                            cols,
+                            row_stride,
+                            oob_size,
+                            num_rows_ptr,
+                            num_rows_factor);
+                        #if KERNEL_BENCH_ITERS != 1
+                            hipStreamSynchronize(stream);
+                        #endif
+                    }
                 });
         } else {
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                     using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-                    aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, opus::fp4_t, thread_data_size, _GS, false>
-                        <<<grid, block, 0, stream>>>(
-                        reinterpret_cast<opus::fp4_t*>(out.data_ptr()),
-                        reinterpret_cast<float*>(scales.data_ptr()),
-                        reinterpret_cast<input_dtype*>(input.data_ptr()),
-                        nullptr,
-                        rows,
-                        cols,
-                        row_stride,
-                        oob_size,
-                        num_rows_ptr,
-                        num_rows_factor);
+                    for (int i = 0; i < KERNEL_BENCH_ITERS; i++)
+                    {
+                        aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, opus::fp4_t, thread_data_size, _GS, false, dynGroupQuantBlockSize>
+                            <<<grid, block, 0, stream>>>(
+                            reinterpret_cast<opus::fp4_t*>(out.data_ptr()),
+                            reinterpret_cast<float*>(scales.data_ptr()),
+                            reinterpret_cast<input_dtype*>(input.data_ptr()),
+                            nullptr,
+                            rows,
+                            cols,
+                            row_stride,
+                            oob_size,
+                            num_rows_ptr,
+                            num_rows_factor);
+                        #if KERNEL_BENCH_ITERS != 1
+                            hipStreamSynchronize(stream);
+                        #endif
+                    }
                 });
         }
 #else
