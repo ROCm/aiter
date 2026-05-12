@@ -248,6 +248,15 @@ def _moe_sorting_impl(
         num_local_tokens,
         dispatch_policy,
     )
+    if int(os.environ.get("AITER_GFX1250_SORT_PROBE", "0")):
+        torch.cuda.synchronize()
+        logger.info(
+            f"[sort_probe use_opus={use_opus}] "
+            f"num_valid_ids={num_valid_ids.tolist()} "
+            f"sorted_expert_ids={sorted_expert_ids.tolist()} "
+            f"sorted_ids[:64]={sorted_ids[:64].tolist()} "
+            f"sorted_weights[:32]={sorted_weights[:32].tolist()}"
+        )
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
@@ -982,13 +991,14 @@ def _gfx1250_moe_stage1(
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
 
-    _sort_block_m = max(32, block_m)
-    _all_blks = sorted_expert_ids.shape[0]
-    _dense_blks = (
-        min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])
-        // _sort_block_m
-    )
-    _grid_y = min(_dense_blks, _all_blks)
+    # _sort_block_m = max(32, block_m)
+    # _all_blks = sorted_expert_ids.shape[0]
+    # _dense_blks = (
+    #     min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])
+    #     // _sort_block_m
+    # )
+    # _grid_y = min(_dense_blks, _all_blks)
+    _grid_y = sorted_expert_ids.shape[0]
 
     if in_dtype in ("fp4", "fp8", "a8w4"):
         from aiter.ops.flydsl.kernels.moe_gemm_2stage_mxscale_gfx1250 import (
