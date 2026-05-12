@@ -46,7 +46,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - name: Download and check signal artifact
+      - name: Wait for Checks workflow
         run: ./.github/scripts/check_signal.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -276,7 +276,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip setuptools wheel
+          python -m pip install --upgrade pip setuptools wheel
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install triton-windows
         shell: bash

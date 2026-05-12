@@ -348,6 +348,7 @@ def mhc_pre_ref(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    test_hc_head: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
 
@@ -356,34 +357,41 @@ def mhc_pre_ref(
     out = residual_flat @ fn.T
     mixes = out * (sqrsum.unsqueeze(-1) / fn.shape[-1] + rms_eps).rsqrt()
 
-    hc_scale = torch.cat(
-        [
-            hc_scale[0].expand(hc_mult),
-            hc_scale[1].expand(hc_mult),
-            hc_scale[2].expand(hc_mult * hc_mult),
-        ],
-    )
-    mixes = mixes * hc_scale + hc_base
+    if not test_hc_head:
+        hc_scale = torch.cat(
+            [
+                hc_scale[0].expand(hc_mult),
+                hc_scale[1].expand(hc_mult),
+                hc_scale[2].expand(hc_mult * hc_mult),
+            ],
+        )
+        mixes = mixes * hc_scale + hc_base
 
-    pre_mix = mixes[:, :hc_mult].sigmoid().unsqueeze(-1) + hc_pre_eps
-    post_mix = (
-        mixes[:, hc_mult : 2 * hc_mult].sigmoid() * hc_post_mult_value
-    ).unsqueeze(-1)
-    res_mix = mixes[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult)
+        pre_mix = mixes[:, :hc_mult].sigmoid().unsqueeze(-1) + hc_pre_eps
+        post_mix = (
+            mixes[:, hc_mult : 2 * hc_mult].sigmoid() * hc_post_mult_value
+        ).unsqueeze(-1)
+        res_mix = mixes[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult)
 
-    def sinkhorn_normalize_ref(
-        x: torch.Tensor, repeat: int, eps: float
-    ) -> torch.Tensor:
-        x = x.softmax(-1) + eps
-        x = x / (x.sum(-2, keepdim=True) + eps)
-        for _ in range(repeat - 1):
-            x = x / (x.sum(-1, keepdim=True) + eps)
+        def sinkhorn_normalize_ref(
+            x: torch.Tensor, repeat: int, eps: float
+        ) -> torch.Tensor:
+            x = x.softmax(-1) + eps
             x = x / (x.sum(-2, keepdim=True) + eps)
-        return x
+            for _ in range(repeat - 1):
+                x = x / (x.sum(-1, keepdim=True) + eps)
+                x = x / (x.sum(-2, keepdim=True) + eps)
+            return x
 
-    res_mix = sinkhorn_normalize_ref(
-        res_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps
-    )
+        res_mix = sinkhorn_normalize_ref(
+            res_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps
+        )
+    else:
+        hc_scale = hc_scale[0].expand(hc_mult)
+        mixes = mixes * hc_scale + hc_base
+        pre_mix = mixes[:, :hc_mult].sigmoid().unsqueeze(-1) + hc_pre_eps
+        post_mix = None
+        res_mix = None
 
     layer_input = (residual * pre_mix).sum(-2).bfloat16()
 
@@ -415,9 +423,9 @@ def mhc_pre_hip(
 
 
 @benchmark()
-def test_mhc_pre(m, hidden_size, hc_mult):
+def test_mhc_pre(m, hidden_size, hc_mult, test_hc_head=False):
     hc_mult2 = hc_mult * hc_mult
-    hc_mult3 = hc_mult * 2 + hc_mult2
+    hc_mult3 = hc_mult * 2 + hc_mult2 if not test_hc_head else hc_mult
     hc_hidden_size = hc_mult * hidden_size
     residual = torch.randn(m, hc_mult, hidden_size, dtype=dtypes.bf16)
     fn = torch.randn(hc_mult3, hc_hidden_size, dtype=dtypes.fp32)
@@ -428,11 +436,16 @@ def test_mhc_pre(m, hidden_size, hc_mult):
         "hc_pre_eps": 1e-6,
         "hc_sinkhorn_eps": 1e-6,
         "hc_post_mult_value": 1.0,
-        "sinkhorn_repeat": 20,
+        "sinkhorn_repeat": 20 if not test_hc_head else 0,
     }
 
     post_mix_ref, comb_mix_ref, layer_input_ref = mhc_pre_ref(
-        residual, fn, hc_scale, hc_base, **extra_args
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        **extra_args,
+        test_hc_head=test_hc_head,
     )
     (post_mix_hip, comb_mix_hip, layer_input_hip), hip_us = run_perftest(
         mhc_pre_hip,
@@ -442,9 +455,9 @@ def test_mhc_pre(m, hidden_size, hc_mult):
         hc_base,
         **extra_args,
     )
-
-    checkAllclose(post_mix_ref, post_mix_hip, msg="post_mix")
-    checkAllclose(comb_mix_ref, comb_mix_hip, msg="comb_mix")
+    if not test_hc_head:
+        checkAllclose(post_mix_ref, post_mix_hip, msg="post_mix")
+        checkAllclose(comb_mix_ref, comb_mix_hip, msg="comb_mix")
     hip_err = checkAllclose(layer_input_ref, layer_input_hip, msg="layer_input")
     ret = {}
     ret["hip_err"] = hip_err
@@ -641,6 +654,11 @@ parser.add_argument(
     help="""hidden_size.
     e.g.: -hidden_size 1024""",
 )
+parser.add_argument(
+    "--hc_head",
+    action="store_true",
+    help="""Test mhc_pre for hc_head only.""",
+)
 
 args = parser.parse_args()
 
@@ -649,19 +667,25 @@ for dtype in args.dtype:
     for m in args.m:
         for hidden_size in args.hidden_size:
             for hc_mult in [4]:
-                ret = test_mhc_pre(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
+                ret = test_mhc_pre(
+                    m=m,
+                    hidden_size=hidden_size,
+                    hc_mult=hc_mult,
+                    test_hc_head=args.hc_head,
+                )
                 df.append(ret)
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
 
-df = []
-for dtype in args.dtype:
-    for hidden_size in args.hidden_size:
-        for m in args.m:
-            for hc_mult in [4]:
-                ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
-                df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
+if not args.hc_head:
+    df = []
+    for dtype in args.dtype:
+        for hidden_size in args.hidden_size:
+            for m in args.m:
+                for hc_mult in [4]:
+                    ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
+                    df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
