@@ -8,7 +8,7 @@ from itertools import product
 from abc import ABC, abstractmethod
 
 from flydsl._mlir.dialects import fly, llvm
-from flydsl.compiler.protocol import fly_values
+from flydsl.compiler.protocol import extract_to_ir_values as fly_values
 from flydsl._mlir import ir
 from flydsl.expr.typing import T
 
