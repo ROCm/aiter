@@ -177,9 +177,7 @@ def build_silu_and_mul_fq_module(
                 qx = qx_f32.bitcast(i32)
                 s = qx & c0x80000000_i32
                 qx_abs = qx & c0x7FFFFFFF_i32
-                denormal_mask = arith.cmpi(
-                    CmpIPredicate.ult, qx_abs, c0x3F800000_i32
-                )
+                denormal_mask = arith.cmpi(CmpIPredicate.ult, qx_abs, c0x3F800000_i32)
                 normal_mask = arith.andi(
                     arith.cmpi(CmpIPredicate.ult, qx_abs, c0x40C00000_i32),
                     arith.cmpi(CmpIPredicate.uge, qx_abs, c0x3F800000_i32),

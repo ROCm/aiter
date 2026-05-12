@@ -42,11 +42,15 @@ def test_flydsl_swiglu_fused_fp4_quant_matches_reference(
     sorted_ids = ((slot_ids[order] << 24) | token_ids[order]).to(torch.int32)
     num_valid_ids = torch.tensor([rows], dtype=torch.int32, device=device)
 
-    out = torch.empty((token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=device)
+    out = torch.empty(
+        (token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=device
+    )
     scale_cols = inter_dim // 32
     padded_rows = (sorted_ids.numel() + 255) // 256 * 256
     padded_cols = (scale_cols + 7) // 8 * 8
-    out_scale_sorted = torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=device)
+    out_scale_sorted = torch.empty(
+        padded_rows * padded_cols, dtype=torch.uint8, device=device
+    )
 
     kernel = _get_compiled_silu_fused(
         inter_dim,
