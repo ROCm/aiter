@@ -16,7 +16,7 @@ using namespace hk_mla;
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     __attribute__((amdgpu_num_vgpr(72))) void kn_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(
-        HkMlaDecodeFwdParams<T> params)
+        HkMlaV32DecodeFwdParams<T> params)
 {
     using q_t     = T::q_t;
     using kv_t    = T::kv_t;
@@ -824,7 +824,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 template <typename T>
 __global__ __launch_bounds__(
     T::kNumThreads,
-    T::kOccupancy) void kn_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(HkMlaDecodeFwdParams<T> params)
+    T::kOccupancy) void kn_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(HkMlaV32DecodeFwdParams<T> params)
 { assert(false); }
 #endif
 
@@ -865,7 +865,7 @@ void mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(aiter_tensor_t& query,
 
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    HkMlaDecodeFwdParams<Traits> params = {
+    HkMlaV32DecodeFwdParams<Traits> params = {
         hk::make_gl<typename Traits::gl_q>(
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(query.data_ptr())),
             query.size(0),
@@ -937,16 +937,16 @@ void hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(aiter_tensor_t& query,
     {
         const int32_t page_size = kv_buffer.size(1);
 
-#define DISPATCH_PAGE_SIZE(PS)                                            \
-    case PS: {                                                            \
-        using Traits = HkMlaDecodeFwdTraits<hk::fp8e4m3,                  \
+#define DISPATCH_PAGE_SIZE(PageSize)                                      \
+    case PageSize: {                                                      \
+        using Traits = HkMlaV32DecodeFwdTraits<hk::fp8e4m3,               \
                                             hk::fp8e4m3,                  \
                                             hk::bf16,                     \
                                             /*kBlockN_=*/32,              \
                                             /*kNumWarps_=*/8,             \
                                             /*kOccupancy_=*/1,            \
                                             /*kBlockM_=*/128,             \
-                                            /*kPageSize_=*/PS>;           \
+                                            /*kPageSize_=*/PageSize>;     \
         mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8<Traits>(query,             \
                                                        kv_buffer,         \
                                                        qo_indptr,         \

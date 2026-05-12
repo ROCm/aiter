@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "mla.h"
 #include "mla_hk.h"
 
-// TODO(v4.0): wire to per-arch mi35x v40 decode kernel once it lands. For now
-// this is a stub so the Python-side mla_v40_decode_fwd can be developed and
-// tested against the silver reference.
 void hk_mla_v40_decode_fwd(aiter_tensor_t& query,
                            aiter_tensor_t& query_rope,
                            aiter_tensor_t& kv_buffer,
