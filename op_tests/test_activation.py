@@ -10,9 +10,12 @@ import pandas as pd
 import argparse
 
 
-def torch_silu_and_mul(input: torch.Tensor) -> torch.Tensor:
+def torch_silu_and_mul(input: torch.Tensor, limit: float = 0.0) -> torch.Tensor:
     d = input.shape[-1] // 2
     x, y = input.split([d, d], dim=-1)
+    if limit > 0:
+        x = torch.clamp(x, max=limit)
+        y = torch.clamp(y, min=-limit, max=limit)
     out = F.silu(x) * y
     return out
 
@@ -64,7 +67,7 @@ def test_scaled_silu_and_mul(m, n, dtype, output_dtype=None):
 
 
 @benchmark()
-def test_silu_and_mul(m, n, dtype, output_dtype=None):
+def test_silu_and_mul(m, n, dtype, output_dtype=None, limit=0.0):
     """
     Test silu_and_mul with flexible input/output types.
     If output_dtype is None, output matches input dtype.
@@ -74,7 +77,7 @@ def test_silu_and_mul(m, n, dtype, output_dtype=None):
     out = torch.empty((m, n // 2), dtype=out_dtype, device="cuda")
 
     # Reference: compute in input dtype, convert to output dtype if needed
-    ref = torch_silu_and_mul(input)
+    ref = torch_silu_and_mul(input, limit=limit)
     if output_dtype is not None:
         ref = ref.to(output_dtype)
 
@@ -82,6 +85,7 @@ def test_silu_and_mul(m, n, dtype, output_dtype=None):
         aiter.silu_and_mul,
         out,
         input,
+        limit,
     )
 
     # Check if the results are close
@@ -92,6 +96,7 @@ def test_silu_and_mul(m, n, dtype, output_dtype=None):
     ret = {}
     ret["input_dtype"] = dtype_map.get(dtype, str(dtype))
     ret["output_dtype"] = dtype_map.get(out_dtype, str(out_dtype))
+    ret["limit"] = limit
     ret["M"] = m
     ret["N"] = n
     ret["us"] = us_aiter
@@ -286,6 +291,30 @@ df = df[
 
 df_md = df.to_markdown(index=False)
 aiter.logger.info("silu_and_mul summary (markdown):\n%s", df_md)
+
+df = []
+for dtype in args.dtype:
+    for m in args.m:
+        for n in args.n:
+            ret = test_silu_and_mul(m, n, dtype, limit=10.0)
+            df.append(ret)
+df = pd.DataFrame(df)
+df = df[
+    [
+        "M",
+        "N",
+        "input_dtype",
+        "output_dtype",
+        "limit",
+        "us",
+        "TB/s",
+        "RD TB/s",
+        "WR TB/s",
+        "err",
+    ]
+]
+df_md = df.to_markdown(index=False)
+aiter.logger.info("silu_and_mul with limit=10.0 summary (markdown):\n%s", df_md)
 
 df = []
 for dtype in args.dtype:

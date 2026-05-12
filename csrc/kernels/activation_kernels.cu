@@ -20,10 +20,11 @@ namespace aiter {
 // Activation and gating kernel template with flexible input/output types.
 // DTYPE_I: input type (fp32/bf16/fp16), DTYPE_O: output type (fp32/bf16/fp16)
 // Computes in float, converts to DTYPE_O on output.
-template <typename DTYPE_I, typename DTYPE_O, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I>
+template <typename DTYPE_I, typename DTYPE_O, float (*ACT_FN)(const DTYPE_I&), int32_t VEC_SIZE_I, bool HAS_LIMIT = false>
 __global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d]
                                    const DTYPE_I* __restrict__ input, // [..., 2, d]
-                                   const int d)
+                                   const int d,
+                                   const float limit = 0.0f)
 {
     const int64_t token_idx         = blockIdx.x;
     auto const* ptr_x               = (input + token_idx * 2 * d);
@@ -64,15 +65,28 @@ __global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d
 #pragma unroll
         for(size_t j = 0; j < VEC_SIZE_I; j += 2)
         {
-            // Call ACT_FN with appropriate type conversion
             DTYPE_I x_val0 = x[j];
-            float ax0      = ACT_FN(x_val0);
             float y0       = opus::cast<float>(y[j]);
+            if constexpr (HAS_LIMIT)
+            {
+                float fx0 = opus::cast<float>(x_val0);
+                fx0       = fminf(fx0, limit);
+                x_val0    = opus::cast<DTYPE_I>(fx0);
+                y0        = __builtin_amdgcn_fmed3f(-limit, y0, limit);
+            }
+            float ax0      = ACT_FN(x_val0);
             if(j + 1 < VEC_SIZE_I)
             {
                 DTYPE_I x_val1      = x[j + 1];
-                float ax1           = ACT_FN(x_val1);
                 float y1            = opus::cast<float>(y[j + 1]);
+                if constexpr (HAS_LIMIT)
+                {
+                    float fx1 = opus::cast<float>(x_val1);
+                    fx1       = fminf(fx1, limit);
+                    x_val1    = opus::cast<DTYPE_I>(fx1);
+                    y1        = __builtin_amdgcn_fmed3f(-limit, y1, limit);
+                }
+                float ax1           = ACT_FN(x_val1);
                 opus::fp32x2_t a    = {ax0, ax1};
                 opus::fp32x2_t b    = {y0, y1};
                 opus::fp32x2_t c;
@@ -450,7 +464,7 @@ static constexpr int nextPow2(unsigned int num)
     HipDeviceGuard device_guard(input.device_id);                                     \
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-// Helper macro for fp32 vec_size dispatch (VEC_SIZE <= 16 for fp32 path)
+// Helper macros for fp32 vec_size dispatch
 #define DISPATCH_FP32_VEC_SIZE_CASE(VS, KERNEL_NAME, KERNEL, ...)              \
     case VS:                                                                   \
         aiter::KERNEL_NAME<input_dtype, output_dtype, KERNEL<input_dtype>, VS> \
@@ -467,8 +481,25 @@ static constexpr int nextPow2(unsigned int num)
         DISPATCH_FP32_VEC_SIZE_CASE(1, KERNEL_NAME, KERNEL, __VA_ARGS__)  \
     }
 
-#define DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr) \
-    DISPATCH_FP32_KERNEL(act_and_mul_kernel, KERNEL, out_ptr, in_ptr, d)
+// Variant with extra template args (e.g., HAS_LIMIT)
+#define DISPATCH_FP32_VEC_SIZE_CASE_EX(VS, KERNEL_NAME, KERNEL, EXTRA_TARGS, ...)  \
+    case VS:                                                                        \
+        aiter::KERNEL_NAME<input_dtype, output_dtype, KERNEL<input_dtype>, VS, EXTRA_TARGS> \
+            <<<grid, block, 0, stream>>>(__VA_ARGS__);                              \
+        break;
+
+#define DISPATCH_FP32_KERNEL_EX(KERNEL_NAME, KERNEL, EXTRA_TARGS, ...)                    \
+    switch(vec_size)                                                                       \
+    {                                                                                      \
+        DISPATCH_FP32_VEC_SIZE_CASE_EX(16, KERNEL_NAME, KERNEL, EXTRA_TARGS, __VA_ARGS__) \
+        DISPATCH_FP32_VEC_SIZE_CASE_EX(8, KERNEL_NAME, KERNEL, EXTRA_TARGS, __VA_ARGS__)  \
+        DISPATCH_FP32_VEC_SIZE_CASE_EX(4, KERNEL_NAME, KERNEL, EXTRA_TARGS, __VA_ARGS__)  \
+        DISPATCH_FP32_VEC_SIZE_CASE_EX(2, KERNEL_NAME, KERNEL, EXTRA_TARGS, __VA_ARGS__)  \
+        DISPATCH_FP32_VEC_SIZE_CASE_EX(1, KERNEL_NAME, KERNEL, EXTRA_TARGS, __VA_ARGS__)  \
+    }
+
+#define DISPATCH_FP32_ACT_KERNEL(KERNEL, HAS_LIMIT_VAL, out_ptr, in_ptr, limit_val) \
+    DISPATCH_FP32_KERNEL_EX(act_and_mul_kernel, KERNEL, HAS_LIMIT_VAL, out_ptr, in_ptr, d, limit_val)
 
 #define DISPATCH_FP32_SWIGLU_VEC_SIZE_CASE(VS, KERNEL_NAME, ...) \
     case VS:                                                     \
@@ -544,54 +575,55 @@ static constexpr int nextPow2(unsigned int num)
     }
 
 // Launch activation and gating kernel with flexible input/output types
-// Input and output types are determined by the tensor dtypes passed from Python
-#define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL)                                                    \
-    COMPUTE_ACTIVATION_KERNEL_PARAMS                                                             \
-    if(input.dtype() == AITER_DTYPE_fp32)                                                        \
-    {                                                                                            \
-        /* fp32 input: dispatch based on output type */                                          \
-        using input_dtype = opus::fp32_t;                                                        \
-        auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                    \
-        if(out.dtype() == AITER_DTYPE_bf16)                                                      \
-        {                                                                                        \
-            using output_dtype = opus::bf16_t;                                                   \
-            auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                \
-            DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                    \
-        }                                                                                        \
-        else if(out.dtype() == AITER_DTYPE_fp16)                                                 \
-        {                                                                                        \
-            using output_dtype = opus::fp16_t;                                                   \
-            auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                \
-            DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                    \
-        }                                                                                        \
-        else if(out.dtype() == AITER_DTYPE_fp32)                                                 \
-        {                                                                                        \
-            using output_dtype = opus::fp32_t;                                                   \
-            auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                \
-            DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                    \
-        }                                                                                        \
-        else                                                                                     \
-        {                                                                                        \
-            AITER_CHECK(false, "Unsupported output type for fp32 input");                        \
-        }                                                                                        \
-    }                                                                                            \
-    else                                                                                         \
-    {                                                                                            \
-        /* bf16/fp16 input: output must match input type */                                      \
-        AITER_CHECK(input.dtype() == out.dtype(),                                                \
-                    "For bf16/fp16 input, output type must match input type");                   \
-        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "act_and_mul_kernel", [&] {               \
-            using input_dtype  = typename aiter::hip2opus<scalar_t>::type;                       \
-            using output_dtype = input_dtype;                                                    \
-            AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(                                                        \
-                vec_size,                                                                        \
-                aiter::                                                                          \
-                    act_and_mul_kernel<input_dtype, output_dtype, KERNEL<input_dtype>, VEC_SIZE> \
-                <<<grid, block, 0, stream>>>(reinterpret_cast<output_dtype*>(out.data_ptr()),    \
-                                             reinterpret_cast<input_dtype*>(input.data_ptr()),   \
-                                             d);)                                                \
-        });                                                                                      \
+// HAS_LIMIT_VAL: compile-time bool for limit path specialization
+#define LAUNCH_ACTIVATION_GATE_KERNEL_IMPL(KERNEL, HAS_LIMIT_VAL, limit_val)                      \
+    COMPUTE_ACTIVATION_KERNEL_PARAMS                                                              \
+    if(input.dtype() == AITER_DTYPE_fp32)                                                         \
+    {                                                                                             \
+        using input_dtype = opus::fp32_t;                                                         \
+        auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                     \
+        if(out.dtype() == AITER_DTYPE_bf16)                                                       \
+        {                                                                                         \
+            using output_dtype = opus::bf16_t;                                                    \
+            auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                 \
+            DISPATCH_FP32_ACT_KERNEL(KERNEL, HAS_LIMIT_VAL, out_ptr, in_ptr, limit_val)           \
+        }                                                                                         \
+        else if(out.dtype() == AITER_DTYPE_fp16)                                                  \
+        {                                                                                         \
+            using output_dtype = opus::fp16_t;                                                    \
+            auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                 \
+            DISPATCH_FP32_ACT_KERNEL(KERNEL, HAS_LIMIT_VAL, out_ptr, in_ptr, limit_val)           \
+        }                                                                                         \
+        else if(out.dtype() == AITER_DTYPE_fp32)                                                  \
+        {                                                                                         \
+            using output_dtype = opus::fp32_t;                                                    \
+            auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                 \
+            DISPATCH_FP32_ACT_KERNEL(KERNEL, HAS_LIMIT_VAL, out_ptr, in_ptr, limit_val)           \
+        }                                                                                         \
+        else                                                                                      \
+        {                                                                                         \
+            AITER_CHECK(false, "Unsupported output type for fp32 input");                         \
+        }                                                                                         \
+    }                                                                                             \
+    else                                                                                          \
+    {                                                                                             \
+        AITER_CHECK(input.dtype() == out.dtype(),                                                 \
+                    "For bf16/fp16 input, output type must match input type");                    \
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "act_and_mul_kernel", [&] {                \
+            using input_dtype  = typename aiter::hip2opus<scalar_t>::type;                        \
+            using output_dtype = input_dtype;                                                     \
+            AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(                                                         \
+                vec_size,                                                                         \
+                aiter::                                                                           \
+                    act_and_mul_kernel<input_dtype, output_dtype, KERNEL<input_dtype>, VEC_SIZE, HAS_LIMIT_VAL> \
+                <<<grid, block, 0, stream>>>(reinterpret_cast<output_dtype*>(out.data_ptr()),     \
+                                             reinterpret_cast<input_dtype*>(input.data_ptr()),    \
+                                             d, limit_val);)                                      \
+        });                                                                                       \
     }
+
+#define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL) \
+    LAUNCH_ACTIVATION_GATE_KERNEL_IMPL(KERNEL, false, 0.0f)
 
 // Launch scaled activation and gating kernel with flexible input/output types
 #define LAUNCH_SCALED_ACTIVATION_GATE_KERNEL(KERNEL)                                            \
@@ -667,9 +699,18 @@ namespace aiter {
 // - bf16 input must output as bf16
 // - fp16 input must output as fp16
 void silu_and_mul(const aiter_tensor_t& out,   // [..., d]
-                  const aiter_tensor_t& input) // [..., 2 * d]
+                  const aiter_tensor_t& input, // [..., 2 * d]
+                  float limit)
 {
-    LAUNCH_ACTIVATION_GATE_KERNEL(aiter::silu_kernel);
+    AITER_CHECK(limit >= 0.0f, "silu_and_mul: limit must be >= 0");
+    if(limit > 0.0f)
+    {
+        LAUNCH_ACTIVATION_GATE_KERNEL_IMPL(aiter::silu_kernel, true, limit);
+    }
+    else
+    {
+        LAUNCH_ACTIVATION_GATE_KERNEL(aiter::silu_kernel);
+    }
 }
 
 void swiglu_and_mul(const aiter_tensor_t& out,   // [..., d]
