@@ -671,6 +671,225 @@ __global__ void __launch_bounds__(512, 1)
     }
 }
 
+// INT8 block-scaled 1-stage all-reduce.
+// Adds a pre-quantization phase (before the barrier) where each GPU quantizes
+// its own input into its tmp buffer. The double-buffer gather then reads INT8
+// from peer tmp buffers instead of BF16 from input buffers.
+// Tmp buffer layout per GPU: [INT8 data: size Q-packs][scales: size T values]
+// Bandwidth: 10 bits/element vs 16 for BF16 (0.625x), error <= 0.39%.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_1stage_int8(RankData* _input_dp,
+                                    RankData* _output_dp,
+                                    RankSignals sg,
+#ifndef USE_ROCM
+                                    volatile
+#endif
+                                    Signal* self_sg,
+                                    T* __restrict__ result,
+                                    int rank,
+                                    int size)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using Q                 = typename opus::vector_t<int8_t, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
+    auto dp                 = *_input_dp;
+    int warp_id             = threadIdx.x / tnum_gpu;
+    int lane_id             = threadIdx.x % tnum_gpu;
+
+    __shared__ Q q_smem[2][tnum_gpu * ngpus];
+    __shared__ T s_smem[2][tnum_gpu * ngpus];
+
+    // Phase 0 (before barrier): warp 0 quantizes own input into own tmp buffer.
+    // Uses the same index pattern as the gather phase so that block b's signal
+    // covers exactly the positions block b on peer GPUs will read.
+    Q* own_tmp   = get_tmp_buf<Q>(self_sg);
+    T* own_scale = reinterpret_cast<T*>(own_tmp + size);
+    const int step  = gridDim.x * tnum_gpu;
+    const int start = blockIdx.x * tnum_gpu + lane_id;
+    if(warp_id == 0)
+    {
+        for(int idx = start; idx < size; idx += step)
+        {
+            P val       = ((const P*)dp.ptrs[rank])[idx];
+            T scale_fac = packReduce<AbsMaxFunctor, T, pack_size>(val);
+            scale_fac   = downcast_s<T>(upcast_s(scale_fac) / 127.f);
+            own_tmp[idx]   = packQuantInt8<T, pack_size>(val, scale_fac);
+            own_scale[idx] = scale_fac;
+        }
+    }
+    __syncthreads();  // all threads in block done writing before barrier
+
+    // Build peer pointers into INT8 tmp buffers (no rotation: bitwise-identical results)
+    Q* i8ptrs[ngpus];
+    T* i8scales[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        i8ptrs[i]   = get_tmp_buf<Q>(sg.signals[i]);
+        i8scales[i] = reinterpret_cast<T*>(i8ptrs[i] + size);
+    }
+
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    // compute iteration count (same formula as cross_device_reduce_1stage)
+    const int first = blockIdx.x * tnum_gpu;
+    int iters       = 0;
+    {
+        int rem = size - first;
+        iters   = rem > 0 ? (rem + step - 1) / step : 0;
+    }
+
+    // fill buffer 0
+    int buf  = 0;
+    int idx0 = start;
+    if(idx0 < size)
+    {
+        q_smem[buf][warp_id * tnum_gpu + lane_id] = i8ptrs[warp_id][idx0];
+        s_smem[buf][warp_id * tnum_gpu + lane_id] = i8scales[warp_id][idx0];
+    }
+    __syncthreads();
+
+    for(int it = 0; it < iters; ++it)
+    {
+        const int cur_idx  = idx0 + it * step;
+        const int next_idx = cur_idx + step;
+        const int next_buf = buf ^ 1;
+
+        // 1. Warp 0 reduces current buffer: dequantize INT8 + accumulate in FP32
+        if(warp_id == 0 && cur_idx < size)
+        {
+            Q q0 = q_smem[buf][0 * tnum_gpu + lane_id];
+            T s0 = s_smem[buf][0 * tnum_gpu + lane_id];
+            A acc;
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] = static_cast<float>(q0[j]) * upcast_s(s0);
+#pragma unroll
+            for(int g = 1; g < ngpus; ++g)
+            {
+                Q q_g = q_smem[buf][g * tnum_gpu + lane_id];
+                T s_g = s_smem[buf][g * tnum_gpu + lane_id];
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                    acc[j] += static_cast<float>(q_g[j]) * upcast_s(s_g);
+            }
+            P out;
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                out[j] = downcast_s<T>(acc[j]);
+            ((P*)result)[cur_idx] = out;
+        }
+
+        // 2. All warps prefetch next INT8 packs + scales
+        if(next_idx < size)
+        {
+            q_smem[next_buf][warp_id * tnum_gpu + lane_id] = i8ptrs[warp_id][next_idx];
+            s_smem[next_buf][warp_id * tnum_gpu + lane_id] = i8scales[warp_id][next_idx];
+        }
+        __syncthreads();
+        buf = next_buf;
+    }
+
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// INT8 block-scaled 2-stage all-reduce.
+// Identical to cross_device_reduce_2stage except the tmp buffer holds
+// INT8-quantized packs + per-pack BF16/FP16 scales instead of raw BF16/FP16.
+// Tmp buffer layout per GPU:  [INT8 data: part Q-packs][scales: part T values]
+// Bandwidth: 10 bits/element vs 16 for BF16 (0.625x), error <= 0.39%.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_2stage_int8(RankData* _input_dp,
+                                    RankData* _output_dp,
+                                    RankSignals sg,
+#ifndef USE_ROCM
+                                    volatile
+#endif
+                                    Signal* self_sg,
+                                    T* __restrict__ result,
+                                    int rank,
+                                    int size)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using Q                 = typename opus::vector_t<int8_t, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int warp_id             = threadIdx.x / tnum_gpu;
+    int lane_id             = threadIdx.x % tnum_gpu;
+    int tid                 = blockIdx.x * tnum_gpu + lane_id;
+    int stride              = gridDim.x * tnum_gpu;
+    int part                = size / ngpus;
+    int start               = rank * part;
+    int end                 = rank == ngpus - 1 ? size : start + part;
+    int largest_part        = part + size % ngpus;
+    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
+    const P* ptrs[ngpus];
+    Q*       tmps[ngpus];
+    T*       scales[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        tmps[i]    = get_tmp_buf<Q>(sg.signals[target]);
+        // scales follow immediately after the INT8 data region
+        scales[i]  = reinterpret_cast<T*>(tmps[i] + part);
+    }
+    auto tmp_out   = tmps[0];
+    auto scale_out = scales[0];
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    // stage 1: reduce-scatter (identical gather + FP32 reduce as non-INT8 version)
+    // Only write differs: INT8+scale to tmp instead of BF16.
+    for(int idx = start + tid; idx < end; idx += stride)
+    {
+        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
+        __syncthreads();
+        if(warp_id == 0)
+        {
+            A add_reg;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+                add_reg[i] = upcast_s(tmp_smem[pack_size * threadIdx.x + i]);
+            constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
+#pragma unroll
+            for(int i = 1; i < ngpus; ++i)
+            {
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                    add_reg[j] += upcast_s(
+                        tmp_smem[i * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
+            }
+            P write_reg;
+#pragma unroll
+            for(int i = 0; i < pack_size; ++i)
+                write_reg[i] = downcast_s<T>(add_reg[i]);
+
+            // per-pack scale: max_abs of this pack / 127
+            T scale_fac    = packReduce<AbsMaxFunctor, T, pack_size>(write_reg);
+            scale_fac      = downcast_s<T>(upcast_s(scale_fac) / 127.f);
+            // write INT8 quantized data and scale (one scale per pack, no shfl needed)
+            tmp_out[idx - start]   = packQuantInt8<T, pack_size>(write_reg, scale_fac);
+            scale_out[idx - start] = scale_fac;
+        }
+        __syncthreads();
+    }
+    end_sync<ngpus>(sg, self_sg, rank);
+
+    // stage 2: all-gather — dequantize INT8 from each peer's tmp buffer
+    for(int idx = tid; idx < largest_part; idx += stride)
+    {
+        int dst_idx = (warp_id + rank) % ngpus * part + idx;
+        ((P*)result)[dst_idx] =
+            packDequantInt8<T, pack_size>(tmps[warp_id][idx], scales[warp_id][idx]);
+    }
+}
+
 /*
  * naive allgather
  * for case: input(1345,)
@@ -996,6 +1215,34 @@ DINLINE opus::vector_t<T, pack_size> packDequant(opus::vector_t<opus::fp8_t, pac
         }
     }
     return ret_val;
+}
+
+// Symmetric INT8 block quantization helpers.
+// scale = max_abs / 127  =>  int8 = clamp(round(fp / scale), -127, 127)
+// Clamped to [-127, 127] (not -128) so the mapping is symmetric and dequant exact.
+template <typename T, int pack_size>
+DINLINE opus::vector_t<int8_t, pack_size>
+packQuantInt8(opus::vector_t<T, pack_size> inp, T scale_factor)
+{
+    opus::vector_t<int8_t, pack_size> out;
+    float inv = 1.f / (upcast_s(scale_factor) + 1e-8f);
+#pragma unroll
+    for(int i = 0; i < pack_size; i++)
+        out[i] = static_cast<int8_t>(
+            __float2int_rn(fminf(fmaxf(upcast_s(inp[i]) * inv, -127.f), 127.f)));
+    return out;
+}
+
+template <typename T, int pack_size>
+DINLINE opus::vector_t<T, pack_size>
+packDequantInt8(opus::vector_t<int8_t, pack_size> inp, T scale_factor)
+{
+    opus::vector_t<T, pack_size> out;
+    float s = upcast_s(scale_factor);
+#pragma unroll
+    for(int i = 0; i < pack_size; i++)
+        out[i] = downcast_s<T>(static_cast<float>(inp[i]) * s);
+    return out;
 }
 
 template <typename T, int pack_size, int ngpus>
@@ -2610,6 +2857,73 @@ class CustomAllreduce
         {
             DISPATCH_CALL(8, 256, 8);
         }
+    }
+
+    // Dispatch to cross_device_reduce_1stage_int8 or cross_device_reduce_2stage_int8
+    // based on the same size thresholds as allreduce(). No quant_scale template
+    // parameter — granularity is pack_size (one scale per thread load), already
+    // compile-time. Instantiations: ngpus in {2,4,6,8} x T in {bf16,fp16} = 8 total.
+    template <typename T>
+    void runInt8QuantKernel(hipStream_t stream, T* input, T* output, int size)
+    {
+        auto d          = 16 / sizeof(T);
+        auto bytes      = size * sizeof(T);
+        int  size_packs = size / d;  // size in units of P-packs (matches allreduce convention)
+        int  threads    = THREAD_NUM;
+        int  tnum_gpu   = threads / world_size_;
+
+        RankData* input_ptrs = get_buffer_RD(stream, input);
+
+        bool call_1stage = false;
+        int  blocks      = 16;
+
+        if(world_size_ == 2)
+        {
+            call_1stage = true;
+        }
+        else if(full_nvlink_)
+        {
+            if((world_size_ <= 4 && bytes < 160 * 1024) || (world_size_ <= 8 && bytes < 80 * 1024))
+                call_1stage = true;
+        }
+
+        if(call_1stage)
+            blocks = std::min(kMaxBlocks, (size_packs + tnum_gpu - 1) / tnum_gpu);
+        else
+            blocks = std::min(kMaxBlocks,
+                              (size_packs / world_size_ + tnum_gpu - 1) / tnum_gpu);
+
+#define KL_INT8(ngpus, name)                                                    \
+    name<T, ngpus><<<blocks, threads, 0, stream>>>(                             \
+        input_ptrs, nullptr, sg_, self_sg_, output, rank_, size_packs)
+
+#define INT8_CASE(ngpus)                                            \
+    case ngpus: {                                                   \
+        if(call_1stage)                                             \
+        {                                                           \
+            KL_INT8(ngpus, cross_device_reduce_1stage_int8);        \
+        }                                                           \
+        else                                                        \
+        {                                                           \
+            KL_INT8(ngpus, cross_device_reduce_2stage_int8);        \
+        }                                                           \
+        break;                                                      \
+    }
+
+        switch(world_size_)
+        {
+            INT8_CASE(2)
+            INT8_CASE(4)
+            INT8_CASE(6)
+            INT8_CASE(8)
+        default:
+            throw std::runtime_error(
+                "runInt8QuantKernel only supports num gpus in (2,4,6,8). Got " +
+                std::to_string(world_size_));
+        }
+
+#undef INT8_CASE
+#undef KL_INT8
     }
 
     /**

@@ -29,6 +29,7 @@ def all_reduce(
     out: torch.Tensor,
     use_new: bool,
     open_fp8_quant: bool,
+    use_int8_quant: bool,
     reg_inp_ptr: int,
     reg_inp_bytes: int,
 ) -> None: ...

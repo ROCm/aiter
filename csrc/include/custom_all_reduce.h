@@ -36,6 +36,7 @@ void all_reduce(fptr_t _fa,
                 const aiter_tensor_t& out,
                 bool use_new,
                 bool open_fp8_quant,
+                bool use_int8_quant,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes);
 void reduce_scatter(fptr_t _fa,

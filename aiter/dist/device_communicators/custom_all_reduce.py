@@ -529,6 +529,7 @@ class CustomAllreduce:
         out: Optional[torch.Tensor] = None,
         use_new: bool = True,
         open_fp8_quant: bool = False,
+        use_int8_quant: bool = False,
         registered_input: bool = False,
     ):
         """Performs an out-of-place all reduce.
@@ -548,13 +549,18 @@ class CustomAllreduce:
             out,
             use_new,
             open_fp8_quant,
+            use_int8_quant,
             reg_inp,
             reg_inp_bytes,
         )
         return out
 
     def custom_all_reduce(
-        self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
+        self,
+        input: torch.Tensor,
+        use_new: bool = True,
+        open_fp8_quant: bool = False,
+        use_int8_quant: bool = False,
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -565,6 +571,7 @@ class CustomAllreduce:
                     input,
                     use_new=use_new,
                     open_fp8_quant=open_fp8_quant,
+                    use_int8_quant=use_int8_quant,
                     registered_input=self.enable_register_for_capturing,
                 )
             else:
@@ -580,6 +587,7 @@ class CustomAllreduce:
                 input,
                 use_new=use_new,
                 open_fp8_quant=open_fp8_quant,
+                use_int8_quant=use_int8_quant,
                 registered_input=False,
             )
 

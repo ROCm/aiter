@@ -73,7 +73,8 @@ int64_t meta_size() { return sizeof(aiter::Signal); }
 
 static void _all_reduce(fptr_t _fa, void* inp, void* out,
                         int64_t numel, AiterDtype dtype,
-                        bool use_new, bool open_fp8_quant, bool is_broadcast_reg_outptr)
+                        bool use_new, bool open_fp8_quant,
+                        bool use_int8_quant, bool is_broadcast_reg_outptr)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -87,7 +88,14 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
         break;
     }
     case AITER_DTYPE_fp16: {
-        if(open_fp8_quant && numel >= 128 * 2048)
+        if(use_int8_quant && numel >= 128 * 2048)
+        {
+            fa->runInt8QuantKernel<opus::fp16_t>(stream,
+                                        reinterpret_cast<opus::fp16_t*>(inp),
+                                        reinterpret_cast<opus::fp16_t*>(out),
+                                        numel);
+        }
+        else if(open_fp8_quant && numel >= 128 * 2048)
         {
             fa->runFp8QuantKernel<opus::fp16_t>(stream,
                                         reinterpret_cast<opus::fp16_t*>(inp),
@@ -105,10 +113,20 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case AITER_DTYPE_bf16: {
-        fa->allreduce<opus::bf16_t>(stream,
-                                      reinterpret_cast<opus::bf16_t*>(inp),
-                                      reinterpret_cast<opus::bf16_t*>(out),
-                                      numel, use_new);
+        if(use_int8_quant && numel >= 128 * 2048)
+        {
+            fa->runInt8QuantKernel<opus::bf16_t>(stream,
+                                        reinterpret_cast<opus::bf16_t*>(inp),
+                                        reinterpret_cast<opus::bf16_t*>(out),
+                                        numel);
+        }
+        else
+        {
+            fa->allreduce<opus::bf16_t>(stream,
+                                          reinterpret_cast<opus::bf16_t*>(inp),
+                                          reinterpret_cast<opus::bf16_t*>(out),
+                                          numel, use_new);
+        }
         break;
     }
 #endif
@@ -356,7 +374,7 @@ void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr)
 void all_reduce(fptr_t _fa,
                 const aiter_tensor_t& inp,
                 const aiter_tensor_t& out,
-                bool use_new, bool open_fp8_quant,
+                bool use_new, bool open_fp8_quant, bool use_int8_quant,
                 int64_t reg_inp_ptr, int64_t reg_inp_bytes)
 {
     HipDeviceGuard device_guard(inp.device_id);
@@ -384,7 +402,7 @@ void all_reduce(fptr_t _fa,
     }
 
     _all_reduce(_fa, actual_inp, actual_out, numel, dtype,
-                use_new, open_fp8_quant, is_broadcast_reg_outptr);
+                use_new, open_fp8_quant, use_int8_quant, is_broadcast_reg_outptr);
 }
 
 void reduce_scatter(fptr_t _fa,
