@@ -5,6 +5,7 @@
 #include "py_itfs_common.h"
 #include "aiter_opus_plus.h"
 #include "dispatch_utils.h"
+#include "fp4_quant_utils.h"
 #include "rocprim/rocprim.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
@@ -294,21 +295,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                 float max = multithread_reduce_max_dpp<ReduceThreadSize>(thread_max);
                 if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
                 {
-                    auto fp4_scale = [](float tmp) {
-                        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-                        uint32_t exponent = (u32 >> 23) & 0b11111111;
-                        if(exponent == 0b11111111)
-                        {
-                            return __builtin_bit_cast(float, exponent << 23);
-                        }
-                        if(((u32 & 0x400000)) &&
-                           (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-                        {
-                            exponent += 1;
-                        }
-                        return __builtin_bit_cast(float, exponent << 23);
-                    };
-                    max = fp4_scale(max);
+                    max = aiter::fp4_round_pow2(max);
                 }
                 quant_scale = max * inverted_dtype_max;
                 if((tid % reduce_thread_size == 0) && ((tid * thread_data_size) < n1))

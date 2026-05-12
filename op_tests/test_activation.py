@@ -184,6 +184,157 @@ def test_gelu_fast(m, n, dtype, output_dtype=None):
     return ret
 
 
+def _dequant_fp8_group(q, s, group_size):
+    m, n = q.shape
+    return (
+        q.float().view(m, n // group_size, group_size) * s.float().view(m, -1, 1)
+    ).view(m, n)
+
+
+def _dequant_fp4_group(q, s, group_size):
+    from aiter.utility import fp4_utils
+
+    m = q.shape[0]
+    n = s.shape[1] * group_size
+    packed_cols = n // 2
+    q_u8 = q.view(torch.uint8) if q.dtype == dtypes.fp4x2 else q
+    if q_u8.shape[1] > packed_cols:
+        q_u8 = q_u8[:, :packed_cols]
+    q_f32 = fp4_utils.mxfp4_to_f32(q_u8).view(m, n // group_size, group_size)
+    s_f32 = fp4_utils.e8m0_to_f32(s).float().view(m, -1, 1)
+    return (q_f32 * s_f32).view(m, n)
+
+
+def _fp4_round_pow2_half_up(x: torch.Tensor) -> torch.Tensor:
+    """Round positive fp32 tensor to power-of-two with 1.5 threshold."""
+    x_f32 = x.float()
+    u32 = x_f32.view(torch.int32)
+    exponent = (u32 >> 23) & 0xFF
+    round_up = ((u32 & 0x400000) != 0) & (
+        ((u32 & 0x200000) != 0) | ((u32 & 0x1FFFFF) != 0) | (exponent != 0)
+    )
+    exponent = exponent + round_up.to(torch.int32)
+    rounded_u32 = exponent << 23
+    return rounded_u32.view(torch.float32)
+
+
+def _ref_group_scales_fp8(x: torch.Tensor, group_size: int, out_dtype) -> torch.Tensor:
+    m, n = x.shape
+    xg = x.view(m, n // group_size, group_size).float()
+    dmax = torch.finfo(out_dtype).max
+    x_max = torch.amax(torch.abs(xg), dim=-1)
+    x_max = torch.maximum(x_max, torch.full_like(x_max, 1e-10))
+    return x_max / dmax
+
+
+def _ref_group_scales_fp4(x: torch.Tensor, group_size: int) -> torch.Tensor:
+    m, n = x.shape
+    xg = x.view(m, n // group_size, group_size).float()
+    x_max = torch.amax(torch.abs(xg), dim=-1)
+    x_max = torch.maximum(x_max, torch.full_like(x_max, 1e-10))
+    x_max_rounded = _fp4_round_pow2_half_up(x_max)
+    quant_scale = x_max_rounded * 0.25
+    return ((quant_scale.view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
+
+
+@benchmark()
+def test_silu_and_mul_quant(m, n, dtype, group_size, output_dtype=None, limit=0.0):
+    """
+    Test silu_and_mul_quant with per-group quantization to fp8 or fp4.
+    Benchmarks HIP kernel and validates against PyTorch reference.
+    """
+    ret = {}
+    input = torch.randn(m, n, dtype=dtype, device="cuda")
+    d = n // 2
+    out_dtype = output_dtype if output_dtype is not None else dtypes.fp8
+    num_groups = d // group_size
+
+    is_fp4 = out_dtype == dtypes.fp4x2
+    if is_fp4:
+        out = torch.empty((m, d // 2), dtype=out_dtype, device="cuda")
+        scale = torch.empty((m, num_groups), dtype=torch.uint8, device="cuda")
+    else:
+        out = torch.empty((m, d), dtype=out_dtype, device="cuda")
+        scale = torch.empty((m, num_groups), dtype=torch.float32, device="cuda")
+
+    _, us_aiter = run_perftest(
+        aiter.silu_and_mul_quant,
+        out,
+        input,
+        scale,
+        group_size,
+        limit,
+    )
+
+    # Accuracy validation
+    ref = torch_silu_and_mul(input, limit=limit).float()
+
+    if is_fp4:
+        q_atol, q_rtol = 0.5, 0.5
+        hip_deq = _dequant_fp4_group(out, scale, group_size)
+        ref_scale = _ref_group_scales_fp4(ref, group_size)
+        scale_diff = (scale.to(torch.int16) - ref_scale.to(torch.int16)).abs()
+        scale_max_abs_diff = scale_diff.max().item()
+        scale_mismatch_ratio = (scale != ref_scale).float().mean().item()
+        err_scale = checkAllclose(
+            scale.float(),
+            ref_scale.float(),
+            rtol=0.0,
+            atol=0.0,
+            msg=f"HIP scale vs ref (M={m}, N={n}, gs={group_size}): ",
+        )
+    else:
+        q_atol, q_rtol = 0.05, 0.05
+        hip_deq = _dequant_fp8_group(out, scale, group_size)
+        ref_scale = _ref_group_scales_fp8(ref, group_size, out_dtype)
+        scale_diff = (scale.float() - ref_scale.float()).abs()
+        scale_max_abs_diff = scale_diff.max().item()
+        scale_mismatch_ratio = (
+            (~torch.isclose(scale.float(), ref_scale.float(), rtol=1e-3, atol=1e-3))
+            .float()
+            .mean()
+            .item()
+        )
+        err_scale = checkAllclose(
+            scale.float(),
+            ref_scale.float(),
+            rtol=1e-3,
+            atol=1e-3,
+            msg=f"HIP scale vs ref (M={m}, N={n}, gs={group_size}): ",
+        )
+
+    err_hip = checkAllclose(
+        ref,
+        hip_deq,
+        rtol=q_rtol,
+        atol=q_atol,
+        msg=f"HIP vs ref (M={m}, N={n}, gs={group_size}): ",
+    )
+
+    dtype_map = {
+        torch.float32: "fp32",
+        torch.float16: "fp16",
+        torch.bfloat16: "bf16",
+        dtypes.fp8: "fp8",
+        dtypes.fp4x2: "fp4",
+    }
+    ret["input_dtype"] = dtype_map.get(dtype, str(dtype))
+    ret["output_dtype"] = dtype_map.get(out_dtype, str(out_dtype))
+    ret["limit"] = limit
+    ret["group_size"] = group_size
+    ret["M"] = m
+    ret["N"] = n
+    ret["us"] = us_aiter
+    ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
+    ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
+    ret["WR TB/s"] = (out.nbytes + scale.nbytes) / us_aiter / 1e6
+    ret["err_hip"] = err_hip
+    ret["err_scale"] = err_scale
+    ret["scale_max_abs_diff"] = scale_max_abs_diff
+    ret["scale_mismatch_ratio"] = scale_mismatch_ratio
+    return ret
+
+
 @benchmark()
 def test_scaled_silu_and_mul_mixed_dtype(m, n, input_dtype, output_dtype):
     """Test fp32 input with fp16/bf16 output for scaled activation"""
@@ -315,6 +466,74 @@ df = df[
 ]
 df_md = df.to_markdown(index=False)
 aiter.logger.info("silu_and_mul with limit=10.0 summary (markdown):\n%s", df_md)
+
+quant_cols = [
+    "M",
+    "N",
+    "input_dtype",
+    "output_dtype",
+    "group_size",
+    "us",
+    "TB/s",
+    "RD TB/s",
+    "WR TB/s",
+    "err_hip",
+    "err_scale",
+    "scale_max_abs_diff",
+    "scale_mismatch_ratio",
+]
+
+# silu_and_mul_quant with fp8 (group_size=64, 128)
+df = []
+for dtype in args.dtype:
+    for m in args.m:
+        for n in args.n:
+            for gs in [64, 128]:
+                d = n // 2
+                if d >= gs and d % gs == 0:
+                    ret = test_silu_and_mul_quant(m, n, dtype, group_size=gs)
+                    df.append(ret)
+if df:
+    df = pd.DataFrame(df)
+    df = df[quant_cols]
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("silu_and_mul_quant (fp8) summary (markdown):\n%s", df_md)
+
+# silu_and_mul_quant with fp4 (group_size=32)
+df = []
+for dtype in args.dtype:
+    for m in args.m:
+        for n in args.n:
+            d = n // 2
+            gs = 32
+            if d >= gs and d % gs == 0:
+                ret = test_silu_and_mul_quant(
+                    m, n, dtype, group_size=gs, output_dtype=dtypes.fp4x2
+                )
+                df.append(ret)
+if df:
+    df = pd.DataFrame(df)
+    df = df[quant_cols]
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("silu_and_mul_quant (fp4) summary (markdown):\n%s", df_md)
+
+# silu_and_mul_quant with fp8 + limit=10
+df = []
+for dtype in args.dtype:
+    for m in args.m:
+        for n in args.n:
+            d = n // 2
+            gs = 128
+            if d >= gs and d % gs == 0:
+                ret = test_silu_and_mul_quant(m, n, dtype, group_size=gs, limit=10.0)
+                df.append(ret)
+if df:
+    df = pd.DataFrame(df)
+    df = df[quant_cols + ["limit"]]
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info(
+        "silu_and_mul_quant (fp8, limit=10) summary (markdown):\n%s", df_md
+    )
 
 df = []
 for dtype in args.dtype:

@@ -6,6 +6,7 @@
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
 #include "quant.h"
+#include "fp4_quant_utils.h"
 #include "rocprim/rocprim.hpp"
 #include <hipcub/hipcub.hpp>
 
@@ -27,10 +28,6 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       int32_t const* __restrict__ num_rows = nullptr,
                                       const int32_t num_cols_factor        = 1)
 {
-    auto fp4_scale_shuffle_id = [](int32_t scaleN_pad, int32_t x, int32_t y) {
-        return (x / 32 * scaleN_pad) * 32 + (y / 8) * 256 + (y % 4) * 64 + (x % 16) * 4 +
-               (y % 8) / 4 * 2 + (x % 32) / 16;
-    };
     if(num_rows != nullptr)
     {
         ori_rows = *num_rows * num_cols_factor;
@@ -51,7 +48,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             // if (shuffle_scale && threadIdx.x % num_thread_per_group == 0)
             // {
             //   auto *tmp = reinterpret_cast<uint8_t *>(scale);
-            //   groupId = fp4_scale_shuffle_id(scaleN_pad, x, y);
+            //   groupId = aiter::fp4_scale_shuffle_idx(scaleN_pad, x, y);
             //   tmp[groupId] = 0x7f;
             // }
             return;
@@ -84,19 +81,8 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
     absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
 
-    auto fp4_scale = [](float tmp) {
-        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-        uint32_t exponent = (u32 >> 23) & 0b11111111;
-        if(exponent == 0b11111111)
-        {
-            return __builtin_bit_cast(float, exponent << 23);
-        }
-        if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
-    };
     float inverted_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                               ? fp4_scale(absMax) * inverted_DTYPE_MAX
+                               ? aiter::fp4_round_pow2(absMax) * inverted_DTYPE_MAX
                                : absMax * inverted_DTYPE_MAX;
     row_offset           = std::is_same_v<DTYPE_O, opus::fp4_t>
                                ? groupId * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
@@ -109,7 +95,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             uint8_t exponent = (__builtin_bit_cast(uint32_t, inverted_scale) >> 23) & 0b11111111;
             if(shuffle_scale)
             {
-                groupId = fp4_scale_shuffle_id(scaleN_pad, x, y);
+                groupId = aiter::fp4_scale_shuffle_idx(scaleN_pad, x, y);
             }
             tmp[groupId] = exponent;
         }
@@ -205,19 +191,8 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     // absMax = BlockReduce(temp_storage).Reduce(absMax, hipcub::Max());
     absMax = block_reduce<float, hipcub::Max, BlockSize, true>(absMax, hipcub::Max());
 
-    auto fp4_scale = [](float tmp) {
-        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-        uint32_t exponent = (u32 >> 23) & 0b11111111;
-        if(exponent == 0b11111111)
-        {
-            return __builtin_bit_cast(float, exponent << 23);
-        }
-        if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
-    };
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                          ? fp4_scale(absMax) * inverted_DTYPE_MAX
+                          ? aiter::fp4_round_pow2(absMax) * inverted_DTYPE_MAX
                           : absMax * inverted_DTYPE_MAX;
     return std::make_tuple(row_scale, reinterpret_cast<DTYPE_I*>(&vec_cur));
 }
@@ -430,19 +405,8 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
 
     absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
 
-    auto fp4_scale = [](float tmp) {
-        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-        uint32_t exponent = (u32 >> 23) & 0b11111111;
-        if(exponent == 0b11111111)
-        {
-            return __builtin_bit_cast(float, exponent << 23);
-        }
-        if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
-    };
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                          ? fp4_scale(absMax) * inverted_DTYPE_MAX
+                          ? aiter::fp4_round_pow2(absMax) * inverted_DTYPE_MAX
                           : absMax * inverted_DTYPE_MAX;
     return std::make_tuple(row_scale, reinterpret_cast<float*>(&smscale_cur));
 }
@@ -1462,19 +1426,8 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
             }
             absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
 
-            auto fp4_scale = [](float tmp) {
-                uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-                uint32_t exponent = (u32 >> 23) & 0b11111111;
-                if(exponent == 0b11111111)
-                {
-                    return __builtin_bit_cast(float, exponent << 23);
-                }
-                if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-                    exponent += 1;
-                return __builtin_bit_cast(float, exponent << 23);
-            };
             float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                                ? fp4_scale(absMax) * inverted_DTYPE_MAX
+                                ? aiter::fp4_round_pow2(absMax) * inverted_DTYPE_MAX
                                 : absMax * inverted_DTYPE_MAX;
             
             int out_token_idx;
@@ -1650,22 +1603,6 @@ __global__ void mxfp4_quant_moe_sort_kernel(
     const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
     const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
 
-    auto fp4_scale = [](float tmp) {
-        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-        uint32_t exponent = (u32 >> 23) & 0b11111111;
-        if(exponent == 0b11111111)
-        {
-            return __builtin_bit_cast(float, exponent << 23);
-        }
-        if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
-    };
-    auto fp4_scale_shuffle_id = [](int32_t scaleN_pad_, int32_t x, int32_t y) {
-        return (x / 32 * scaleN_pad_) * 32 + (y / 8) * 256 + (y % 4) * 64 +
-               (x % 16) * 4 + (y % 8) / 4 * 2 + (x % 32) / 16;
-    };
-
     for(; block_idx < num_blocks; block_idx += num_tg)
     {
         int sub_idx         = block_idx % tgs_per_block_m;
@@ -1711,14 +1648,14 @@ __global__ void mxfp4_quant_moe_sort_kernel(
             absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
 
             float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                                  ? fp4_scale(absMax) * inverted_DTYPE_MAX
+                                  ? aiter::fp4_round_pow2(absMax) * inverted_DTYPE_MAX
                                   : absMax * inverted_DTYPE_MAX;
 
             const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
             if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
             {
                 uint8_t bs_e8m0 = (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
-                int addr        = fp4_scale_shuffle_id(scaleN_pad, sorted_row, scale_k);
+                int addr        = aiter::fp4_scale_shuffle_idx(scaleN_pad, sorted_row, scale_k);
                 scale[addr]     = bs_e8m0;
             }
 
@@ -1850,10 +1787,6 @@ __global__ void mxfp4_moe_sort_kernel(
     using vec_i = opus::vector_t<uint8_t, vec_size_i>;
     const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
     const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
-    auto fp4_scale_shuffle_id = [](int32_t scaleN_pad_, int32_t x, int32_t y) {
-        return (x / 32 * scaleN_pad_) * 32 + (y / 8) * 256 + (y % 4) * 64 +
-               (x % 16) * 4 + (y % 8) / 4 * 2 + (x % 32) / 16;
-    };
     auto buffer_scale =
                 opus::make_gmem<uint8_t>(scale, scale_per_row * num_tokens * topk * sizeof(uint8_t));
     for(; block_idx < num_blocks; block_idx += num_tg)
@@ -1884,7 +1817,7 @@ __global__ void mxfp4_moe_sort_kernel(
             {
                 if((scale_k + j) < scaleN_valid)
                 {
-                    int addr = fp4_scale_shuffle_id(scaleN_pad, sorted_row, scale_k + j);
+                    int addr = aiter::fp4_scale_shuffle_idx(scaleN_pad, sorted_row, scale_k + j);
                     out_scale[addr] = vec_scale[j];
                 }
             }
