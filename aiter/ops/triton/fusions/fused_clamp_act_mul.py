@@ -87,11 +87,9 @@ def fused_clamp_act_mul(
             assert out.shape == (M, n_half)
 
     assert n_half >= 128
-    assert (n_half & (n_half - 1)) == 0, "N=D//2 must be a power of 2 for this kernel"
     assert n_half % 128 == 0
 
     BLOCK_SIZE_N = triton.next_power_of_2(n_half)
-    assert BLOCK_SIZE_N == n_half
 
     HAVE_WEIGHTS = weights is not None
     if HAVE_WEIGHTS:

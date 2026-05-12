@@ -26,8 +26,8 @@ def _torch_reference(inp, swiglu_limit, weights, dtype_quant):
 
 
 @pytest.mark.parametrize("M", [1, 2, 4, 8, 32])
-@pytest.mark.parametrize("D", [512])
-@pytest.mark.parametrize("swiglu_limit", [0.0, 10.0])
+@pytest.mark.parametrize("D", [2048, 3072])
+@pytest.mark.parametrize("swiglu_limit", [0.0, 7.0])
 @pytest.mark.parametrize("transpose_scale", [True, False])
 @pytest.mark.parametrize(
     "with_weights,weight_broadcast",
