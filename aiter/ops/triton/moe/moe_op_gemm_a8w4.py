@@ -171,13 +171,11 @@ def swizzle_scales_gfx1250(data):
     E, K_SCALE, N = data.shape
     preshuffle_factor = 32
     num_chunk_n = N // preshuffle_factor
-    SCALE_KWIDTH = 8 
+    SCALE_KWIDTH = 8
     num_chunk_k = K_SCALE // SCALE_KWIDTH
 
     data = data.transpose(-1, -2)
-    data = data.view(
-        E, num_chunk_n, 32, num_chunk_k, SCALE_KWIDTH 
-    )
+    data = data.view(E, num_chunk_n, 32, num_chunk_k, SCALE_KWIDTH)
     data = data.permute(0, 1, 3, 2, 4).contiguous()
     data = data.view(E, N // preshuffle_factor, K_SCALE * preshuffle_factor)
     data = data.transpose(-1, -2)
