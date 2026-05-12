@@ -178,6 +178,8 @@ def test_fmoe(
     use_bias=True,
     require_grouped_gemm=False,
 ):
+    if require_grouped_gemm and os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
+        print("[grouped-gemm-debug] enter test_fmoe", flush=True)
     _target_env = ";".join(
         str(os.environ.get(k, "")).lower()
         for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS", "AITER_FORCE_GFX1250")
@@ -186,6 +188,8 @@ def test_fmoe(
     if get_gfx() not in ["gfx950", "gfx1250"] and not _is_gfx1250_target and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = get_torch_quant(qType)
+    if require_grouped_gemm and os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
+        print("[grouped-gemm-debug] target/quant helper done", flush=True)
     # gfx1250 a8w4/fp8 + per_1x32 has very limited dynamic range
     # (fp8 activation x fp4 weight, K=model_dim summation): with the
     # default unit-stddev randn() inputs the per-channel K-sum saturates
@@ -205,26 +209,57 @@ def test_fmoe(
         )
     ):
         _input_scale = 0.2
-    input = torch.randn((token, model_dim), dtype=dtype) * _input_scale
+    _fast_init = (
+        require_grouped_gemm
+        and os.environ.get("AITER_GROUPED_FAST_INIT", "0").lower()
+        in ("1", "true", "t", "yes", "on")
+    )
+    if _fast_init:
+        input = torch.full((token, model_dim), _input_scale, dtype=dtype)
+    else:
+        input = torch.randn((token, model_dim), dtype=dtype) * _input_scale
+    if require_grouped_gemm and os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
+        print("[grouped-gemm-debug] input init done", flush=True)
     if use_g1u1:
-        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) * _input_scale
+        if _fast_init:
+            w1 = torch.full((E, inter_dim * 2, model_dim), _input_scale, dtype=dtype)
+        else:
+            w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) * _input_scale
         if hidden_pad != 0 and intermediate_pad != 0:
             w1[:, :, -hidden_pad:] = 0
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
-        exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
+        if _fast_init:
+            exp_bias1 = torch.zeros((E, inter_dim * 2), dtype=dtype)
+        else:
+            exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
     else:
-        w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype) * _input_scale
-        exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
+        if _fast_init:
+            w1 = torch.full((E, inter_dim, model_dim), _input_scale, dtype=dtype)
+            exp_bias1 = torch.zeros((E * inter_dim), dtype=dtype)
+        else:
+            w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype) * _input_scale
+            exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
+    if require_grouped_gemm and os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
+        print("[grouped-gemm-debug] w1/bias1 init done", flush=True)
+
     # UT scales w2 by an additional 1/sqrt(inter_dim) to keep stage2
     # output in range; replicate that on gfx1250 a8w4/fp8.
     import math as _math
     _w2_scale = (_input_scale / _math.sqrt(inter_dim)) if _input_scale != 1.0 else 1.0
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) * _w2_scale
+    if _fast_init:
+        w2 = torch.full((E, model_dim, inter_dim), _w2_scale, dtype=dtype)
+    else:
+        w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) * _w2_scale
     if hidden_pad != 0 and intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
-    exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
+    if _fast_init:
+        exp_bias2 = torch.zeros((E, model_dim), dtype=dtype)
+    else:
+        exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
+    if require_grouped_gemm and os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
+        print("[grouped-gemm-debug] w2/bias2 init done", flush=True)
     if AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0
@@ -236,9 +271,38 @@ def test_fmoe(
     else:
         score = torch.randn((token, E), dtype=dtype)
 
-    topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    if require_grouped_gemm and os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
+        print("[grouped-gemm-debug] score init done; start topk", flush=True)
+    _fast_topk = (
+        require_grouped_gemm
+        and os.environ.get("AITER_GROUPED_FAST_TOPK", "0").lower()
+        in ("1", "true", "t", "yes", "on")
+        and topk <= E
+    )
+    if _fast_topk:
+        topk_ids = torch.arange(topk, dtype=dtypes.i32).view(1, topk).repeat(token, 1)
+        topk_weights = torch.full((token, topk), 1.0 / topk, dtype=dtypes.fp32)
+    else:
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    _skip_ref = (
+        require_grouped_gemm
+        and os.environ.get("AITER_GROUPED_SKIP_REF", "0").lower()
+        in ("1", "true", "t", "yes", "on")
+    )
 
-    if qType == aiter.QuantType.per_Tensor:
+    def _grouped_debug(msg):
+        if require_grouped_gemm and os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
+            print(f"[grouped-gemm-debug] {msg}", flush=True)
+
+    _grouped_debug("topk done; start weight quant")
+
+    if _skip_ref and qType == aiter.QuantType.per_1x32 and WQDType == dtypes.fp4x2:
+        # grouped large-shape benchmark mode: avoid expensive reference-only fp4 weight quant.
+        w1_qt = torch.full((E, w1.shape[1], w1.shape[2] // 2), 0x33, dtype=torch.uint8).view(dtypes.fp4x2)
+        w2_qt = torch.full((E, w2.shape[1], w2.shape[2] // 2), 0x33, dtype=torch.uint8).view(dtypes.fp4x2)
+        w1_scale = torch.full((E, w1.shape[1], w1.shape[2] // 32), 127, dtype=torch.uint8)
+        w2_scale = torch.full((E, w2.shape[1], w2.shape[2] // 32), 127, dtype=torch.uint8)
+    elif qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
         w2_qt, w2_scale = aiter.pertoken_quant(w2.view(E, -1), quant_dtype=WQDType)
         w1_qt = w1_qt.view(w1.shape)
@@ -280,6 +344,8 @@ def test_fmoe(
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
+    _grouped_debug("weight quant done")
+
     if qType != aiter.QuantType.per_1x32:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
@@ -312,8 +378,13 @@ def test_fmoe(
             and WQDType == dtypes.fp4x2
         ):
             a1_qt = _gfx1250_fp8_round_trip_bf16(input)
+    elif _skip_ref and qType == aiter.QuantType.per_1x32 and AQDType == dtypes.fp4x2:
+        a1_qt = input
+        a1_scale = None
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
+
+    _grouped_debug("activation quant/ref input done")
 
     # bias dtype convert
     if (
@@ -465,67 +536,74 @@ def test_fmoe(
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
+    if not _skip_ref:
+        _grouped_debug("layout prep done; start reference or skip")
+
     # # ######################## stage 1 start ###########
-    out1_ref = torch_moe_stage1(
-        a1_qt,
-        w1_qt,
-        w2_qt,
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        activation=actType,
-        quant_type=qType,
-        a1_scale=a1_scale,
-        w1_scale=w1_scale,
-        w1_bias=exp_bias1,
-        doweight=doweight_stage1,
-    )
-
-    # ######################## stage 2 start ###########
-    if qType == aiter.QuantType.per_128x128:
-        a2_qt, a2_scale = aiter.pertoken_quant(
-            out1_ref.view(token, -1, 128), quant_dtype=AQDType
+        out1_ref = torch_moe_stage1(
+            a1_qt,
+            w1_qt,
+            w2_qt,
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            activation=actType,
+            quant_type=qType,
+            a1_scale=a1_scale,
+            w1_scale=w1_scale,
+            w1_bias=exp_bias1,
+            doweight=doweight_stage1,
         )
-        a2_scale = a2_scale.view(token, topk, -1)
-    elif (
-        qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
-        and (WQDType == dtypes.fp4x2)
-    ):  # a16w4 & a8w4
-        a2_qt = out1_ref
-        a2_scale = None
-        # gfx1250 + a8w4 stage2 ref: round-trip a2 the same way stage1
-        # does (kernel quantises stage1 output to fp8 before the second
-        # GEMM; ref otherwise leaves it in bf16 -> 100% checkAllclose
-        # mismatch despite kernel correctness).
-        if (
-            _is_gfx1250_target
-            and AQDType == dtypes.fp8
-            and WQDType == dtypes.fp4x2
-        ):
-            a2_qt = _gfx1250_fp8_round_trip_bf16(out1_ref)
+
+        # ######################## stage 2 start ###########
+        if qType == aiter.QuantType.per_128x128:
+            a2_qt, a2_scale = aiter.pertoken_quant(
+                out1_ref.view(token, -1, 128), quant_dtype=AQDType
+            )
+            a2_scale = a2_scale.view(token, topk, -1)
+        elif (
+            qType == aiter.QuantType.per_1x32
+            and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+            and (WQDType == dtypes.fp4x2)
+        ):  # a16w4 & a8w4
+            a2_qt = out1_ref
+            a2_scale = None
+            # gfx1250 + a8w4 stage2 ref: round-trip a2 the same way stage1
+            # does (kernel quantises stage1 output to fp8 before the second
+            # GEMM; ref otherwise leaves it in bf16 -> 100% checkAllclose
+            # mismatch despite kernel correctness).
+            if (
+                _is_gfx1250_target
+                and AQDType == dtypes.fp8
+                and WQDType == dtypes.fp4x2
+            ):
+                a2_qt = _gfx1250_fp8_round_trip_bf16(out1_ref)
+        else:
+            a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
+        a2_qt = a2_qt.view(token, topk, -1)
+
+        out2_ref = torch_moe_stage2(
+            a2_qt,
+            w1_qt,  # E, inter_dim*2, model_dim
+            w2_qt,  # E, model_dim, inter_dim
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            quant_type=qType,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            w2_bias=exp_bias2,
+            doweight=not doweight_stage1,
+        )
+
     else:
-        a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
-    a2_qt = a2_qt.view(token, topk, -1)
-
-    out2_ref = torch_moe_stage2(
-        a2_qt,
-        w1_qt,  # E, inter_dim*2, model_dim
-        w2_qt,  # E, model_dim, inter_dim
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        quant_type=qType,
-        w2_scale=w2_scale,
-        a2_scale=a2_scale,
-        w2_bias=exp_bias2,
-        doweight=not doweight_stage1,
-    )
-
+        out2_ref = None
     # ######################## stage 2 end ###########
     if require_grouped_gemm:
         os.environ.pop("AITER_LAST_FUSED_MOE_IMPL", None)
         os.environ.pop("AITER_DISABLE_GROUPED_A8W4", None)
+    _grouped_debug("reference block done; start fused_moe perf")
+
     _test_graph = int(os.environ.get("AITER_TEST_GRAPH", "1")) != 0
     out2_ck, us2 = run_perftest(
         fused_moe,
@@ -548,12 +626,37 @@ def test_fmoe(
         testGraph=_test_graph,
     )
     moe_impl = os.environ.get("AITER_LAST_FUSED_MOE_IMPL", "unknown")
-    if require_grouped_gemm and moe_impl != "grouped_a8w4":
+    if require_grouped_gemm and moe_impl not in ("grouped_a8w4", "grouped_a4w4"):
         raise AssertionError(
-            f"grouped_gemm test expected grouped_a8w4 path, got {moe_impl!r}"
+            f"grouped_gemm test expected grouped path, got {moe_impl!r}"
         )
     if require_grouped_gemm:
         print(f"[grouped-gemm-ut] moe_impl={moe_impl}", flush=True)
+    if _skip_ref:
+        return {
+            "dtype": dtype,
+            "token": token,
+            "model_dim": model_dim,
+            "inter_dim": inter_dim,
+            "E": E,
+            "topk": topk,
+            "actType": actType,
+            "qType": qType,
+            "AQDType": AQDType,
+            "WQDType": WQDType,
+            "use_g1u1": use_g1u1,
+            "doweight_stage1": doweight_stage1,
+            "strict_accuracy": strict_accuracy,
+            "preshuffle": preshuffle,
+            "hidden_pad": hidden_pad,
+            "intermediate_pad": intermediate_pad,
+            "use_bias": use_bias,
+            "require_grouped_gemm": bool(require_grouped_gemm),
+            "us": us2,
+            "err": -1,
+            "moe_impl": moe_impl,
+            "skip_ref": True,
+        }
     # gfx1250 FlyDSL paths inherently have block-quant noise (mxfp8/mxfp4)
     # that compounds over K-sums.  FlyDSL UT
     # (test_moe_gemm_mxscale_gfx1250.py:542 + test_common.verify_output)
@@ -1030,6 +1133,23 @@ def _iter_legacy_cases():
                             hidden_pad=0,
                             intermediate_pad=0,
                         ), extras
+                        if args.grouped_gemm:
+                            yield _kw(
+                                dtype,
+                                m,
+                                model_dim,
+                                inter_dim,
+                                quant_type,
+                                aq_dtype,
+                                wq_dtype,
+                                doweight_stage1,
+                                aiter.ActivationType.Swiglu,
+                                preshuffle=preshuffle,
+                                hidden_pad=0,
+                                intermediate_pad=0,
+                                use_bias=False,
+                                require_grouped_gemm=True,
+                            ), {"model": "grouped_gemm"}
         else:
             for act_type in args.act:
                 for m in args.tokenNum:

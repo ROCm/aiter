@@ -10,12 +10,13 @@ calling convention while the underlying A8W4 GEMM owns TDM/WMMA_SCALE codegen.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
-from aiter.ops.flydsl.kernels.gemm_fp8fp4_gfx1250 import compile_a8w4_gemm
+from aiter.ops.flydsl.kernels.gemm_fp8fp4_gfx1250 import compile_a8w4_gemm, compile_mxfp4_gemm
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class _GroupedA8W4Config:
     cluster_n: int
     use_scale_opsel: bool
     expert_sched_mode: bool
+    data_format: str = "a8w4"
     act: str = "silu"
 
 
@@ -47,12 +49,14 @@ def _validate_common(cfg: _GroupedA8W4Config) -> None:
         raise ValueError(f"out_dtype must be 'f16' or 'bf16', got {cfg.out_dtype!r}")
     if cfg.num_buffers not in (2, 3, 4):
         raise ValueError(f"num_buffers must be 2, 3 or 4, got {cfg.num_buffers}")
+    if cfg.data_format not in ("a8w4", "fp4"):
+        raise ValueError(f"data_format must be 'a8w4' or 'fp4', got {cfg.data_format!r}")
     if cfg.model_dim % 32 != 0:
-        raise ValueError(f"model_dim must be divisible by 32 for A8W4 scales, got {cfg.model_dim}")
+        raise ValueError(f"model_dim must be divisible by 32 for MXScale scales, got {cfg.model_dim}")
     if cfg.inter_dim % 32 != 0:
-        raise ValueError(f"inter_dim must be divisible by 32 for A8W4 scales, got {cfg.inter_dim}")
+        raise ValueError(f"inter_dim must be divisible by 32 for MXScale scales, got {cfg.inter_dim}")
     if cfg.tile_k % 128 != 0:
-        raise ValueError(f"tile_k must be a multiple of 128 for A8W4 WMMA_SCALE, got {cfg.tile_k}")
+        raise ValueError(f"tile_k must be a multiple of 128 for MXScale WMMA_SCALE, got {cfg.tile_k}")
     if cfg.act not in ("silu", "swiglu"):
         raise ValueError(f"act must be 'silu' or 'swiglu', got {cfg.act!r}")
 
@@ -66,6 +70,12 @@ def _to_int(value) -> int:
 def _check_rank(name: str, tensor: torch.Tensor, rank: int) -> None:
     if tensor.dim() != rank:
         raise ValueError(f"{name} must be rank-{rank}, got shape={tuple(tensor.shape)}")
+
+
+def _pack_factors(cfg: _GroupedA8W4Config) -> tuple[int, int]:
+    if cfg.data_format == "fp4":
+        return 2, 2
+    return 1, 2
 
 
 def _preshuffled_scale_shape(rows: int, k_dim: int, warp_tile: int, tile_k: int) -> tuple[int, int]:
@@ -90,10 +100,11 @@ def _check_stage1_args(y, x, w, scale_x, scale_w, masked_m, cfg: _GroupedA8W4Con
     _check_rank("scale_w", scale_w, 3)
     if tuple(y.shape) != (cfg.experts, cfg.max_m, cfg.inter_dim):
         raise ValueError(f"y shape must be {(cfg.experts, cfg.max_m, cfg.inter_dim)}, got {tuple(y.shape)}")
-    if tuple(x.shape) != (cfg.experts, cfg.max_m, cfg.model_dim):
-        raise ValueError(f"x shape must be {(cfg.experts, cfg.max_m, cfg.model_dim)}, got {tuple(x.shape)}")
-    if tuple(w.shape) != (cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // 2):
-        raise ValueError(f"w shape must be {(cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // 2)}, got {tuple(w.shape)}")
+    pack_a, pack_b = _pack_factors(cfg)
+    if tuple(x.shape) != (cfg.experts, cfg.max_m, cfg.model_dim // pack_a):
+        raise ValueError(f"x shape must be {(cfg.experts, cfg.max_m, cfg.model_dim // pack_a)}, got {tuple(x.shape)}")
+    if tuple(w.shape) != (cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // pack_b):
+        raise ValueError(f"w shape must be {(cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // pack_b)}, got {tuple(w.shape)}")
     warp_tile_m = cfg.tile_m // cfg.m_warp
     warp_tile_n = cfg.tile_n // cfg.n_warp
     scale_x_shape = _preshuffled_scale_shape(cfg.max_m, cfg.model_dim, warp_tile_m, cfg.tile_k)
@@ -122,10 +133,11 @@ def _check_stage2_args(y, x, w, scale_x, scale_w, masked_m, cfg: _GroupedA8W4Con
     _check_rank("scale_w", scale_w, 3)
     if tuple(y.shape) != (cfg.experts, cfg.max_m, cfg.model_dim):
         raise ValueError(f"y shape must be {(cfg.experts, cfg.max_m, cfg.model_dim)}, got {tuple(y.shape)}")
-    if tuple(x.shape) != (cfg.experts, cfg.max_m, cfg.inter_dim):
-        raise ValueError(f"x shape must be {(cfg.experts, cfg.max_m, cfg.inter_dim)}, got {tuple(x.shape)}")
-    if tuple(w.shape) != (cfg.experts, cfg.model_dim, cfg.inter_dim // 2):
-        raise ValueError(f"w shape must be {(cfg.experts, cfg.model_dim, cfg.inter_dim // 2)}, got {tuple(w.shape)}")
+    pack_a, pack_b = _pack_factors(cfg)
+    if tuple(x.shape) != (cfg.experts, cfg.max_m, cfg.inter_dim // pack_a):
+        raise ValueError(f"x shape must be {(cfg.experts, cfg.max_m, cfg.inter_dim // pack_a)}, got {tuple(x.shape)}")
+    if tuple(w.shape) != (cfg.experts, cfg.model_dim, cfg.inter_dim // pack_b):
+        raise ValueError(f"w shape must be {(cfg.experts, cfg.model_dim, cfg.inter_dim // pack_b)}, got {tuple(w.shape)}")
     warp_tile_m = cfg.tile_m // cfg.m_warp
     warp_tile_n = cfg.tile_n // cfg.n_warp
     scale_x_shape = _preshuffled_scale_shape(cfg.max_m, cfg.inter_dim, warp_tile_m, cfg.tile_k)
@@ -138,7 +150,8 @@ def _check_stage2_args(y, x, w, scale_x, scale_w, masked_m, cfg: _GroupedA8W4Con
         raise ValueError(f"masked_m must contain at least {cfg.experts} entries, got {masked_m.numel()}")
 
 def _compile_base_a8w4_gemm(*, K: int, N: int, cfg: _GroupedA8W4Config):
-    return compile_a8w4_gemm(
+    compiler = compile_mxfp4_gemm if cfg.data_format == "fp4" else compile_a8w4_gemm
+    return compiler(
         M=cfg.max_m,
         N=N,
         K=K,
@@ -157,9 +170,12 @@ def _compile_base_a8w4_gemm(*, K: int, N: int, cfg: _GroupedA8W4Config):
         cluster_n=cfg.cluster_n,
         use_scale_opsel=cfg.use_scale_opsel,
         expert_sched_mode=cfg.expert_sched_mode,
+        batch_count=cfg.experts,
+        grouped_masked_m=True,
     )
 
 
+@functools.lru_cache(maxsize=128)
 def compile_moe_grouped_gemm1_a8w4_masked(
     *,
     model_dim: int,
@@ -182,6 +198,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     use_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     act: str = "silu",
+    data_format: str = "a8w4",
 ):
     cfg = _GroupedA8W4Config(
         model_dim=int(model_dim), inter_dim=int(inter_dim), experts=int(experts),
@@ -190,7 +207,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         waves_per_eu=waves_per_eu, out_dtype=str(out_dtype), use_tdm_store=bool(use_tdm_store),
         inst_prefetch=bool(inst_prefetch), wave_specialized_tdm=bool(wave_specialized_tdm),
         cluster_m=int(cluster_m), cluster_n=int(cluster_n), use_scale_opsel=bool(use_scale_opsel),
-        expert_sched_mode=bool(expert_sched_mode), act=str(act),
+        expert_sched_mode=bool(expert_sched_mode), data_format=str(data_format), act=str(act),
     )
     _validate_common(cfg)
     base = _compile_base_a8w4_gemm(K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg)
@@ -202,22 +219,23 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         _check_stage1_args(y, x, w, scale_x, scale_w, masked_m, cfg)
         if stream is None:
             stream = torch.cuda.current_stream()
-        tmp = torch.empty((cfg.max_m, 2 * cfg.inter_dim), device=y.device, dtype=y.dtype)
+        tmp = torch.empty((cfg.experts, cfg.max_m, 2 * cfg.inter_dim), device=y.device, dtype=y.dtype)
+        base(tmp, x, w, scale_x, scale_w, masked_m, cfg.max_m, 2 * cfg.inter_dim, stream=stream)
         for e in range(cfg.experts):
             valid = _to_int(masked_m[e])
             if valid <= 0:
                 continue
             if valid > cfg.max_m:
                 raise ValueError(f"masked_m[{e}]={valid} exceeds max_m={cfg.max_m}")
-            base(tmp, x[e], w[e], scale_x[e], scale_w[e], valid, 2 * cfg.inter_dim, stream=stream)
-            gate = tmp[:valid, :cfg.inter_dim].float()
-            up = tmp[:valid, cfg.inter_dim:2 * cfg.inter_dim].float()
+            gate = tmp[e, :valid, :cfg.inter_dim].float()
+            up = tmp[e, :valid, cfg.inter_dim:2 * cfg.inter_dim].float()
             y[e, :valid].copy_(_apply_gate_up(gate, up, cfg.act).to(y.dtype))
         return y
 
     return launch
 
 
+@functools.lru_cache(maxsize=128)
 def compile_moe_grouped_gemm2_a8w4_masked(
     *,
     model_dim: int,
@@ -239,6 +257,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     cluster_n: int = 1,
     use_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
+    data_format: str = "a8w4",
 ):
     cfg = _GroupedA8W4Config(
         model_dim=int(model_dim), inter_dim=int(inter_dim), experts=int(experts),
@@ -247,7 +266,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         waves_per_eu=waves_per_eu, out_dtype=str(out_dtype), use_tdm_store=bool(use_tdm_store),
         inst_prefetch=bool(inst_prefetch), wave_specialized_tdm=bool(wave_specialized_tdm),
         cluster_m=int(cluster_m), cluster_n=int(cluster_n), use_scale_opsel=bool(use_scale_opsel),
-        expert_sched_mode=bool(expert_sched_mode),
+        expert_sched_mode=bool(expert_sched_mode), data_format=str(data_format),
     )
     _validate_common(cfg)
     base = _compile_base_a8w4_gemm(K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg)
@@ -259,19 +278,29 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         _check_stage2_args(y, x, w, scale_x, scale_w, masked_m, cfg)
         if stream is None:
             stream = torch.cuda.current_stream()
+        base(y, x, w, scale_x, scale_w, masked_m, cfg.max_m, cfg.model_dim, stream=stream)
         for e in range(cfg.experts):
             valid = _to_int(masked_m[e])
             if valid <= 0:
                 continue
             if valid > cfg.max_m:
                 raise ValueError(f"masked_m[{e}]={valid} exceeds max_m={cfg.max_m}")
-            base(y[e], x[e], w[e], scale_x[e], scale_w[e], valid, cfg.model_dim, stream=stream)
         return y
 
     return launch
 
 
+def compile_moe_grouped_gemm1_mxfp4_masked(**kwargs):
+    return compile_moe_grouped_gemm1_a8w4_masked(data_format="fp4", **kwargs)
+
+
+def compile_moe_grouped_gemm2_mxfp4_masked(**kwargs):
+    return compile_moe_grouped_gemm2_a8w4_masked(data_format="fp4", **kwargs)
+
+
 __all__ = [
     "compile_moe_grouped_gemm1_a8w4_masked",
     "compile_moe_grouped_gemm2_a8w4_masked",
+    "compile_moe_grouped_gemm1_mxfp4_masked",
+    "compile_moe_grouped_gemm2_mxfp4_masked",
 ]
