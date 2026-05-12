@@ -185,8 +185,13 @@ void mla_decode_stage1_asm_fwd(
     }
     else
     {
-        args.out_16_nosplit = 0;
-        args.ptr_RP = nullptr;
+        // The legacy QH16 m32x1_n16x1 kernel (gqa_ratio=32, decode qseqlen=1)
+        // writes directly to output via ptr_RP when kv_split==1.  Passing
+        // nullptr causes GPU memory faults on gfx950.  Other non-persistent
+        // kernels (v3, stage1) use split-reduce and expect ptr_RP = nullptr.
+        bool legacy_qh16 = (gqa_ratio == 32 && max_seqlen_q == 1);
+        args.out_16_nosplit = legacy_qh16 ? kv_split : 0;
+        args.ptr_RP = legacy_qh16 ? output->data_ptr() : nullptr;
         args.ptr_STP = num_kv_splits_indptr->data_ptr();
     }
 
@@ -344,12 +349,28 @@ void mla_decode_stage1_asm_fwd(
                     ": fp8/fp8 with gqa_ratio=64 only supports decode_qlen=1 in persistent mode");
             }
         }
+    } else if (gqa_ratio == 8){
+        if (q_type == "bf16" && kv_type == "bf16"){
+            if(!persistent){
+                config_max_seqlen_q = 1;
+                sub_Q = 8;
+            }
+        } else if (q_type == "fp8" && kv_type == "fp8"){
+            if(!persistent && max_seqlen_q == 1){
+                config_max_seqlen_q = 1;
+                sub_Q = 8;
+            }
+        }
     }
 
-    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio* max_seqlen_q % 128 == 0)){
+    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
-        args.s_Q_Bs = gqa_ratio;
+        args.s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio > 16)){
+        config_max_seqlen_q = 1;
+        config_gqa_ratio = 64;
+        args.s_MQA = gqa_ratio;
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag);

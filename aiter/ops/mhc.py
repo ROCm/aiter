@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import math
-from torch import Tensor
+
+import torch
 from aiter import dtypes
+from torch import Tensor
+
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.torch_guard import torch_compile_guard
 
 
 @compile_ops("module_mhc")
@@ -37,22 +40,46 @@ def mhc_pre_big_fuse(
 ) -> None: ...
 
 
+def mhc_pre_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m = residual.size(0)
+    hc_mult = residual.size(1)
+    hidden_size = residual.size(2)
+    device = residual.device
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
+    layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
+    return post_mix, comb_mix, layer_input
+
+
+@torch_compile_guard(gen_fake=mhc_pre_fake)
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
     hidden_size = residual.size(2)
     hc_mult3 = fn.size(0)
-    assert hc_mult3 == hc_mult * 2 + hc_mult * hc_mult
+    assert hc_mult3 == hc_mult * 2 + hc_mult * hc_mult or (
+        hc_mult3 == hc_mult and sinkhorn_repeat == 0
+    )
     hc_hidden_size = hc_mult * hidden_size
 
     prefetch_stages = 2
@@ -87,18 +114,19 @@ def mhc_pre(
             if num_tg > meanwhile_tg * 4:
                 break
 
+    device = residual.device
     out_pad = torch.empty(
-        selected_splitk, m, (hc_mult3 + 31) // 32 * 32, dtype=dtypes.fp32
+        selected_splitk, m, (hc_mult3 + 31) // 32 * 32, dtype=dtypes.fp32, device=device
     )
     out = out_pad[:, :, :hc_mult3]
-    sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32)
+    sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
     mhc_pre_gemm_sqrsum(out, sqrsum, residual, fn, selected_tile_k)
     # out = out.sum(0)
     # sqrsum = sqrsum.sum(0)
 
-    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32)
-    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32)
-    layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16)
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
+    layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
     mhc_pre_big_fuse(
         post_mix,
         comb_mix,
