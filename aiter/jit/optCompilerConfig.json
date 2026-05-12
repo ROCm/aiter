@@ -1089,8 +1089,7 @@
     },
     "module_fmha_fwd_f16_asm": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_fwd_f16.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/fmha_fwd_f16_asm_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_fwd_f16.cu'"
         ],
         "flags_extra_cc": [
             "'-DENABLE_CK=0'"

@@ -277,40 +277,32 @@ def fmha_v3_fwd(
 # read directly from the tensor so non-contiguous bshd-shaped views (e.g. of
 # sbhd / bhsd allocations) are accepted.  Only `tensor.stride(-1) == 1` is
 # required.  softmax_scale is forwarded to the kernel as-is (the kernel
-# applies it internally to Q·K^T before softmax).  sink (when provided) is
-# in AITER post-scale convention; the .cu host driver multiplies it by
-# sqrt(qk_head_dim) to convert to the kernel's pre-scale raw-logit domain.
+# applies it internally to Q·K^T before softmax).
+#
+# Memory-allocation policy: all GPU tensors (out, lse, sink) are allocated on
+# the Python side; the C++ entry point performs only pointer + stride
+# bookkeeping and kernel launch (no torch dependency).  The public wrapper
+# `fmha_fwd_f16_asm` below handles allocation and the AITER-post-scale →
+# kernel-pre-scale conversion for sink (multiply by sqrt(qk_head_dim)).
 # ---------------------------------------------------------------------------
-def gen_fmha_fwd_f16_asm_fake_tensors(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    softmax_scale: float,
-    is_causal: bool,
-    return_lse: bool,
-    sink: Optional[Tensor] = None,
-    out: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor]:
-    batch, q_seq_len, q_head_num, _ = q.shape
-    d_v = v.size(3)
-    fake_out = (
-        out
-        if out is not None
-        else torch.empty(
-            (batch, q_seq_len, q_head_num, d_v), dtype=q.dtype, device=q.device
-        )
-    )
-    fake_lse = torch.empty(
-        (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
-    )
-    return (fake_out, fake_lse)
-
-
 @compile_ops(
     "module_fmha_fwd_f16_asm",
     fc_name="fmha_fwd_f16_asm",
-    gen_fake=gen_fmha_fwd_f16_asm_fake_tensors,
+    ffi_type="ctypes",
 )
+def _fmha_fwd_f16_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    lse: Tensor,
+    sink: Tensor,
+    softmax_scale: float,
+    is_causal: bool,
+    return_lse: bool,
+) -> None: ...
+
+
 def fmha_fwd_f16_asm(
     q: Tensor,
     k: Tensor,
@@ -320,7 +312,65 @@ def fmha_fwd_f16_asm(
     return_lse: bool,
     sink: Optional[Tensor] = None,
     out: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor]: ...
+) -> Tuple[Tensor, Tensor]:
+    """Public wrapper: allocates `out`/`lse`/`sink` buffers as needed and
+    forwards to the ctypes-backed kernel entry point.
+
+    Contract details:
+      * `sink` (caller) is in AITER post-scale convention.  This wrapper
+        converts it to the kernel's pre-scale raw-logit domain by multiplying
+        by sqrt(qk_head_dim) before launch.
+      * The kernel always accesses `ptr_LSE`, so an LSE buffer is always
+        allocated even when `return_lse=False`; in that case the contents are
+        undefined and callers should ignore the returned `lse`.
+      * D64 kernels (`_rxy_sink`) compile ENABLE_SINK=1 and read `sink`;
+        callers MUST pass an explicit sink for D64.
+      * D128 kernels (`_rxy`) compile ENABLE_SINK=0 and ignore `sink`; the
+        kernarg slot must still be a valid non-null pointer, so we always
+        allocate a zero buffer when none is supplied.
+    """
+    batch, q_seq_len, q_head_num, qk_head_dim = q.shape
+    v_head_dim = v.size(3)
+
+    if out is None:
+        out = torch.empty(
+            (batch, q_seq_len, q_head_num, v_head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+
+    lse = torch.empty(
+        (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
+    )
+
+    if sink is not None:
+        # AITER post-scale → kernel pre-scale.
+        sink_for_kernel = (sink * (qk_head_dim**0.5)).to(torch.float32).contiguous()
+    elif qk_head_dim == 64:
+        raise RuntimeError(
+            "fmha_fwd_f16_asm: D64 kernels require an explicit `sink` tensor "
+            f"of shape [q_head_num]={q_head_num} fp32 (AITER post-scale "
+            "convention). Pass `sink=torch.zeros(q_head_num, dtype=torch.float32)` "
+            "if you want a zero-logit sink."
+        )
+    else:
+        # D128: kernel never reads sink contents but slot must be non-null.
+        sink_for_kernel = torch.zeros(
+            q_head_num, dtype=torch.float32, device=q.device
+        )
+
+    _fmha_fwd_f16_asm(
+        q,
+        k,
+        v,
+        out,
+        lse,
+        sink_for_kernel,
+        float(softmax_scale),
+        bool(is_causal),
+        bool(return_lse),
+    )
+    return out, lse
 
 
 def cmdGenFunc_mha_varlen_fwd(
@@ -1415,14 +1465,15 @@ def _flash_attn_forward(
         # gfx1250 ASM bf16 path: q/k/v are bshd; kernel reads strides directly,
         # no API-side permute.  softmax_scale is forwarded as-is (kernel applies
         # it internally to Q·K^T).  sink_ptr is in AITER post-scale convention;
-        # the .cu host driver multiplies it by sqrt(qk_head_dim) to convert to
-        # the kernel's pre-scale raw-logit domain before launch.
+        # the public `fmha_fwd_f16_asm` wrapper multiplies it by
+        # sqrt(qk_head_dim) and auto-fills the D64 zero-sink case internally,
+        # so we just forward the user's sink_ptr here.
         sink_for_kernel = sink_ptr
         if hdim_q == 64 and sink_for_kernel is None:
-            # D64 kernels always read SINK; auto-fill zero-logit so callers
-            # who don't care about sink still hit this fast path.
+            # D64 kernels always read SINK; pass an explicit zero-logit so the
+            # wrapper does not raise on us.
             sink_for_kernel = torch.zeros(nhead_q, dtype=torch.float32, device=q.device)
-        _r = fmha_fwd_f16_asm(
+        out_, softmax_lse = fmha_fwd_f16_asm(
             q,
             k,
             v,
@@ -1432,8 +1483,6 @@ def _flash_attn_forward(
             sink_for_kernel,
             out,
         )
-        out_ = _r[0]
-        softmax_lse = _r[1]
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases

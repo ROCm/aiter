@@ -9,22 +9,25 @@
 // kernel will follow the strides correctly.  Only `tensor.stride(-1) == 1`
 // (last-dim contiguous) is required, matching flash_attn_func semantics.
 //
-// sink convention (AITER / CK-Tile post-scale):
-//   The user passes sink in the same domain as Q*K^T * softmax_scale (post-scale).
-//   The kernel expects pre-scale raw logits.  This file converts:
-//       sink_raw = sink_user * sqrt(qk_head_dim)
-#include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
+// Memory-allocation policy:
+//   All tensors (q, k, v, out, lse, sink) are allocated by the Python caller.
+//   This C++ entry point performs **only pointer + stride bookkeeping and
+//   kernel launch** — no GPU memory allocation, no temporary tensors, no torch
+//   dependency.  In particular, the AITER post-scale → pre-scale conversion
+//   for `sink` (multiply by sqrt(qk_head_dim)) is the caller's responsibility:
+//   pass `sink` already in the kernel's pre-scale raw-logit domain.
+//
+// sink slot semantics (still enforced here):
+//   D64 `_rxy_sink` kernels compile ENABLE_SINK=1 → `sink` MUST be non-null.
+//   D128 `_rxy`     kernels compile ENABLE_SINK=0 → `sink` slot must still be
+//                   a valid non-null pointer (kernarg layout requires it), but
+//                   the kernel never reads its contents.  Pass a zero buffer.
+#include "aiter_tensor.h"
+#include "aiter_ctypes_error.h"
+#include "asm_fmha_fwd_f16_configs.hpp"
 #include <hip/hip_runtime.h>
 #include <cmath>
 #include <memory>
-#include <unordered_map>
-
-#include "aiter_hip_common.h"
-#include "asm_fmha_fwd_f16_configs.hpp"
-
-namespace aiter {
-namespace torch_itfs {
 
 // Kernel argument block (ABI = FmhaFwdKernelArgsBase in fmha_fwd_f16.cpp).
 // kernarg_size = 528 B (33 slots × 16 B, including ptr_SINK at the end).
@@ -91,7 +94,7 @@ static std::string get_heuristic_kernel_fmha_fwd_f16(const std::string& dtype,
         if (cfg.mask    != mask_flag)   continue;
         return el.first;
     }
-    TORCH_CHECK(false,
+    AITER_CHECK(false,
                 "fmha_fwd_f16_asm: no kernel for dtype=", dtype,
                 " hdim_q=", hdim_q, " hdim_v=", hdim_v,
                 " mask=", mask_flag,
@@ -101,152 +104,132 @@ static std::string get_heuristic_kernel_fmha_fwd_f16(const std::string& dtype,
 
 // ---- main entry ------------------------------------------------------------
 
-// API contract: q/k/v have **bshd shape**, i.e. q.shape = [batch, seq_q, hq, d],
-// k/v.shape = [batch, seq_k, hk, d].  The kernel reads strides directly from
-// `tensor.stride(...)`, so the underlying memory layout is whatever the user
-// arranged — they may pass a non-contiguous bshd-shaped view of an sbhd / bhsd
-// allocation, and the kernel will follow strides correctly.  Only `stride(-1)
-// == 1` (last dim contiguous) is required, matching flash_attn_func.
+AITER_CTYPES_ERROR_DEF
+
+// C ABI: every tensor is caller-allocated.  No GPU memory is allocated here;
+// no torch dependency.
 //
-// sink: optional [q_head_num] fp32 tensor in AITER post-scale convention.
-//       Internally converted to pre-scale: sink_raw = sink_user * sqrt(qk_head_dim).
-std::vector<at::Tensor> fmha_fwd_f16(at::Tensor&                      q,
-                                     const at::Tensor&                k,
-                                     const at::Tensor&                v,
-                                     float                            softmax_scale,
-                                     bool                             is_causal,
-                                     bool                             return_lse,
-                                     std::optional<at::Tensor>        sink_,
-                                     std::optional<at::Tensor>        out_)
+// q/k/v have **bshd shape**, i.e. q.shape = [batch, seq_q, hq, d], k/v.shape =
+// [batch, seq_k, hk, d].  Kernel reads strides directly from the tensor, so
+// non-contiguous bshd-shaped views backed by sbhd / bhsd memory work — only
+// `stride(-1) == 1` is required.
+//
+// out  : [batch, q_seq_len, q_head_num, v_head_dim] bf16, last dim contiguous.
+// lse  : [batch, q_head_num, q_seq_len] fp32.  Always required by kernel ABI
+//        (kernel may touch ptr_LSE even when return_lse=0); pass a buffer of
+//        the right size regardless of whether you read it.
+// sink : [q_head_num] fp32 in the kernel's pre-scale raw-logit domain.
+//        Required for D64 (ENABLE_SINK=1).  For D128 (ENABLE_SINK=0) the
+//        slot must still be a valid non-null pointer of the right size, but
+//        contents are ignored — pass a zero buffer.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    fmha_fwd_f16_asm,
+    (aiter_tensor_t* q,
+     aiter_tensor_t* k,
+     aiter_tensor_t* v,
+     aiter_tensor_t* out,
+     aiter_tensor_t* lse,
+     aiter_tensor_t* sink,
+     float           softmax_scale,
+     int             is_causal,
+     int             return_lse,
+     hipStream_t     stream),
+    (q, k, v, out, lse, sink, softmax_scale, is_causal, return_lse, stream))
 {
-    // ---- basic validation --------------------------------------------------
-    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+    // ---- arch + dtype validation ------------------------------------------
+    const std::string arch_id = get_gpu_arch();
+    AITER_CHECK(arch_id == "gfx1250",
+                "fmha_fwd_f16_asm: only supported on gfx1250, got ", arch_id);
+
+    AITER_CHECK(q && k && v && out && lse && sink,
+                "fmha_fwd_f16_asm: q/k/v/out/lse/sink must all be non-null");
+    AITER_CHECK(q->dtype() == AITER_DTYPE_bf16 &&
+                k->dtype() == AITER_DTYPE_bf16 &&
+                v->dtype() == AITER_DTYPE_bf16,
+                "fmha_fwd_f16_asm: q/k/v must be bf16");
+    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16,
+                "fmha_fwd_f16_asm: out must be bf16");
+    AITER_CHECK(lse->dtype() == AITER_DTYPE_fp32,
+                "fmha_fwd_f16_asm: lse must be fp32");
+    AITER_CHECK(sink->dtype() == AITER_DTYPE_fp32,
+                "fmha_fwd_f16_asm: sink must be fp32");
+
+    AITER_CHECK(q->dim() == 4 && k->dim() == 4 && v->dim() == 4,
                 "fmha_fwd_f16_asm: q/k/v must be 4-D tensors (bshd shape)");
-    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1,
+    AITER_CHECK(q->stride(-1) == 1 && k->stride(-1) == 1 && v->stride(-1) == 1,
                 "fmha_fwd_f16_asm: q/k/v must have contiguous last dim");
-    TORCH_CHECK(q.scalar_type() == at::kBFloat16,
-                "fmha_fwd_f16_asm: only bf16 is supported");
-    TORCH_CHECK(k.scalar_type() == at::kBFloat16 && v.scalar_type() == at::kBFloat16,
-                "fmha_fwd_f16_asm: k/v must also be bf16");
 
     // ---- dimension extraction (bshd) ---------------------------------------
-    const int batch        = (int)q.size(0);
-    const int q_seq_len    = (int)q.size(1);
-    const int q_head_num   = (int)q.size(2);
-    const int qk_head_dim  = (int)q.size(3);
+    const int batch        = (int)q->size(0);
+    const int q_seq_len    = (int)q->size(1);
+    const int q_head_num   = (int)q->size(2);
+    const int qk_head_dim  = (int)q->size(3);
 
-    const int kv_seq_len   = (int)k.size(1);
-    const int kv_head_num  = (int)k.size(2);
-    const int v_head_dim   = (int)v.size(3);
+    const int kv_seq_len   = (int)k->size(1);
+    const int kv_head_num  = (int)k->size(2);
+    const int v_head_dim   = (int)v->size(3);
 
-    TORCH_CHECK((int)k.size(0) == batch,        "k batch mismatch");
-    TORCH_CHECK((int)v.size(0) == batch,        "v batch mismatch");
-    TORCH_CHECK((int)k.size(3) == qk_head_dim,  "k head_dim mismatch");
-    TORCH_CHECK((int)v.size(1) == kv_seq_len,   "v seq_len mismatch with k");
-    TORCH_CHECK((int)v.size(2) == kv_head_num,  "v head_num mismatch with k");
-    TORCH_CHECK(q_head_num % kv_head_num == 0,  "q_head_num must be a multiple of kv_head_num");
-    TORCH_CHECK(qk_head_dim == 64 || qk_head_dim == 128,
+    AITER_CHECK((int)k->size(0) == batch,        "fmha_fwd_f16_asm: k batch mismatch");
+    AITER_CHECK((int)v->size(0) == batch,        "fmha_fwd_f16_asm: v batch mismatch");
+    AITER_CHECK((int)k->size(3) == qk_head_dim,  "fmha_fwd_f16_asm: k head_dim mismatch");
+    AITER_CHECK((int)v->size(1) == kv_seq_len,   "fmha_fwd_f16_asm: v seq_len mismatch with k");
+    AITER_CHECK((int)v->size(2) == kv_head_num,  "fmha_fwd_f16_asm: v head_num mismatch with k");
+    AITER_CHECK(q_head_num % kv_head_num == 0,   "fmha_fwd_f16_asm: q_head_num must be a multiple of kv_head_num");
+    AITER_CHECK(qk_head_dim == 64 || qk_head_dim == 128,
                 "fmha_fwd_f16_asm: only head_dim 64 or 128 supported, got ", qk_head_dim);
-    TORCH_CHECK(v_head_dim == qk_head_dim,
+    AITER_CHECK(v_head_dim == qk_head_dim,
                 "fmha_fwd_f16_asm: v_head_dim must equal qk_head_dim");
+
+    AITER_CHECK(out->dim() == 4 &&
+                (int)out->size(0) == batch    && (int)out->size(1) == q_seq_len &&
+                (int)out->size(2) == q_head_num && (int)out->size(3) == v_head_dim,
+                "fmha_fwd_f16_asm: out shape must be [batch, q_seq_len, q_head_num, v_head_dim]");
+    AITER_CHECK(out->stride(-1) == 1,
+                "fmha_fwd_f16_asm: out must have contiguous last dim");
+
+    AITER_CHECK(lse->dim() == 3 &&
+                (int)lse->size(0) == batch &&
+                (int)lse->size(1) == q_head_num &&
+                (int)lse->size(2) == q_seq_len,
+                "fmha_fwd_f16_asm: lse shape must be [batch, q_head_num, q_seq_len]");
+
+    AITER_CHECK(sink->dim() == 1 && (int)sink->size(0) == q_head_num,
+                "fmha_fwd_f16_asm: sink must be 1-D with size q_head_num (", q_head_num, ")");
 
     const int gqa       = q_head_num / kv_head_num;
     const int mask_flag = is_causal ? 1 : 0;
 
     // ---- stride extraction (in bytes), bshd dim layout --------------------
     // bshd: dim0=b, dim1=s, dim2=h, dim3=d
-    const int elem_size = q.element_size();  // 2 for bf16
+    const int elem_size = (int)q->element_size();  // 2 for bf16
 
-    const int stride_q_batch = (int)q.stride(0) * elem_size;
-    const int stride_q_seq   = (int)q.stride(1) * elem_size;
-    const int stride_q_head  = (int)q.stride(2) * elem_size;
+    const int stride_q_batch = (int)q->stride(0) * elem_size;
+    const int stride_q_seq   = (int)q->stride(1) * elem_size;
+    const int stride_q_head  = (int)q->stride(2) * elem_size;
 
-    const int stride_k_batch = (int)k.stride(0) * elem_size;
-    const int stride_k_seq   = (int)k.stride(1) * elem_size;
-    const int stride_k_head  = (int)k.stride(2) * elem_size;
+    const int stride_k_batch = (int)k->stride(0) * elem_size;
+    const int stride_k_seq   = (int)k->stride(1) * elem_size;
+    const int stride_k_head  = (int)k->stride(2) * elem_size;
 
-    const int stride_v_batch = (int)v.stride(0) * elem_size;
-    const int stride_v_seq   = (int)v.stride(1) * elem_size;
-    const int stride_v_head  = (int)v.stride(2) * elem_size;
+    const int stride_v_batch = (int)v->stride(0) * elem_size;
+    const int stride_v_seq   = (int)v->stride(1) * elem_size;
+    const int stride_v_head  = (int)v->stride(2) * elem_size;
 
-    const int sub_Q        = 128;  // ts_qo: Q-tile size used by all kernels
-    const int stride_q_tg  = sub_Q * stride_q_seq;
+    const int stride_o_batch = (int)out->stride(0) * elem_size;
+    const int stride_o_seq   = (int)out->stride(1) * elem_size;
+    const int stride_o_head  = (int)out->stride(2) * elem_size;
+
+    const int sub_Q           = 128;  // ts_qo: Q-tile size used by all kernels
+    const int stride_q_tg     = sub_Q * stride_q_seq;
     const int stride_lse_head = q_seq_len * (int)sizeof(float);  // fixed layout
-
-    // ---- output allocation (bshd) -----------------------------------------
-    at::Tensor out;
-    if (out_.has_value())
-    {
-        out = out_.value();
-        TORCH_CHECK(out.dim() == 4 &&
-                    (int)out.size(0) == batch    && (int)out.size(1) == q_seq_len &&
-                    (int)out.size(2) == q_head_num && (int)out.size(3) == v_head_dim,
-                    "fmha_fwd_f16_asm: pre-allocated out shape must be "
-                    "[batch, q_seq_len, q_head_num, v_head_dim]");
-        TORCH_CHECK(out.stride(-1) == 1 && out.scalar_type() == q.scalar_type(),
-                    "fmha_fwd_f16_asm: out must have contiguous last dim and same dtype as q");
-    }
-    else
-    {
-        out = at::empty({batch, q_seq_len, q_head_num, v_head_dim}, q.options());
-    }
-
-    const int stride_o_batch = (int)out.stride(0) * elem_size;
-    const int stride_o_seq   = (int)out.stride(1) * elem_size;
-    const int stride_o_head  = (int)out.stride(2) * elem_size;
-
-    // ---- LSE allocation (fixed layout [batch, q_head_num, q_seq_len] fp32) -
-    // Always allocate even when not returned: the kernel may access ptr_LSE.
-    at::Tensor lse = at::empty({batch, q_head_num, q_seq_len},
-                               q.options().dtype(at::kFloat));
-
-    // ---- sink buffer -------------------------------------------------------
-    // D64 `_rxy_sink` kernels (ENABLE_SINK=1): ptr_SINK is actively read.
-    //   Sink must be provided for D64; passing a zero buffer silently passes
-    //   logit=0 through the sink path (which still exercises the code path but
-    //   is numerically equivalent to a very negative logit after max-subtraction).
-    //   We therefore REQUIRE an explicit sink for D64 so callers are aware.
-    //
-    // D128 `_rxy` kernels (ENABLE_SINK=0): ptr_SINK is compiled out; the slot
-    //   must still be a valid non-null pointer, but values are irrelevant.
-    //   Zeros are used when no sink is supplied for D128.
-    //
-    // sink_ is in AITER post-scale convention (same domain as Q·K^T * scale).
-    // Convert to pre-scale for kernel: sink_raw = sink_user * sqrt(qk_head_dim).
-    at::Tensor sink;
-    if (sink_.has_value())
-    {
-        TORCH_CHECK(sink_.value().dim() == 1 && sink_.value().size(0) == q_head_num,
-                    "fmha_fwd_f16_asm: sink must be 1-D with size q_head_num (", q_head_num, ")");
-        TORCH_CHECK(sink_.value().scalar_type() == at::kFloat,
-                    "fmha_fwd_f16_asm: sink must be fp32");
-        // AITER post-scale → pre-scale: multiply by sqrt(qk_head_dim)
-        float pre_scale = std::sqrt(static_cast<float>(qk_head_dim));
-        sink = (sink_.value() * pre_scale).contiguous();
-    }
-    else if (qk_head_dim == 64)
-    {
-        // D64 _rxy_sink kernels always compute the sink path (ENABLE_SINK=1).
-        // Require an explicit sink so callers know it is active.
-        TORCH_CHECK(false,
-                    "fmha_fwd_f16_asm: D64 (_rxy_sink) kernels require an explicit `sink` "
-                    "tensor of shape [q_head_num]=", q_head_num, " fp32 (AITER post-scale "
-                    "convention).  Pass `sink=torch.zeros(q_head_num, dtype=torch.float32)` "
-                    "if you want a zero-logit sink.");
-    }
-    else
-    {
-        // D128 _rxy kernels: ENABLE_SINK=0, ptr_SINK is ignored by the kernel.
-        sink = at::zeros({q_head_num}, q.options().dtype(at::kFloat));
-    }
 
     // ---- kernel args -------------------------------------------------------
     KernelArgs args = {};
-    args.ptr_O           = out.data_ptr();
-    args.ptr_Q           = q.data_ptr();
-    args.ptr_K           = k.data_ptr();
-    args.ptr_V           = v.data_ptr();
-    args.ptr_LSE         = lse.data_ptr();
+    args.ptr_O           = out->data_ptr();
+    args.ptr_Q           = q->data_ptr();
+    args.ptr_K           = k->data_ptr();
+    args.ptr_V           = v->data_ptr();
+    args.ptr_LSE         = lse->data_ptr();
     args.scalar_f        = softmax_scale;
     args.q_seq_len       = q_seq_len;
     args.stride_q_seq    = stride_q_seq;
@@ -283,7 +266,7 @@ std::vector<at::Tensor> fmha_fwd_f16(at::Tensor&                      q,
     args.stride_lse_head = stride_lse_head;
     args.ptr_QSeqPad     = nullptr;
     args.ptr_KSeqPad     = nullptr;
-    args.ptr_SINK        = sink.data_ptr();
+    args.ptr_SINK        = sink->data_ptr();
 
     size_t arg_size = sizeof(args);
 
@@ -291,18 +274,14 @@ std::vector<at::Tensor> fmha_fwd_f16(at::Tensor&                      q,
     // Always use the _brd (border) kernel variant: it handles both aligned
     // and unaligned q_seq_len/kv_seq_len uniformly (border path is a no-op
     // when sequences are aligned), so there's no runtime branch on alignment.
-    const std::string dtype   = "bf16";
-    const std::string arch_id = get_gpu_arch();
-    if(arch_id != "gfx1250"){
-        AITER_CHECK(false, __func__, ": fmha_fwd_f16 is only supported on gfx1250");
-    }
-    CFG* cfg_map              = &cfg_fmha_fwd_f16;
+    const std::string dtype = "bf16";
+    CFG* cfg_map            = &cfg_fmha_fwd_f16;
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     const std::string kernel_key = get_heuristic_kernel_fmha_fwd_f16(
         dtype, qk_head_dim, v_head_dim, mask_flag, arch_id, cfg_map);
     auto it = cfg_map->find(kernel_key);
-    TORCH_CHECK(it != cfg_map->end(),
+    AITER_CHECK(it != cfg_map->end(),
                 "fmha_fwd_f16_asm: kernel not found in CFG: ", kernel_key);
 
     const char* name    = it->second.knl_name.c_str();
@@ -319,40 +298,6 @@ std::vector<at::Tensor> fmha_fwd_f16(at::Tensor&                      q,
 
     // All _rxy kernels use remap_xy=1: swap gdx↔gdy at launch so that
     // bid.x indexes heads and bid.y indexes Q-tiles.
-    auto stream = at::hip::getCurrentHIPStream().stream();
-
-    // ---- DEBUG DUMP -------------------------------------------------------
-    fprintf(stderr,
-        "\n[fmha_fwd_f16 DEBUG] kernel_key=%s  co=%s  arg_size=%zu\n"
-        "  KernelArgs:\n"
-        "    ptr_O=%p  ptr_Q=%p  ptr_K=%p  ptr_V=%p  ptr_LSE=%p\n"
-        "    scalar_f=%g\n"
-        "    q_seq_len=%d  kv_seq_len=%d  q_head_num=%d  gqa=%d\n"
-        "    qk_head_dim=%d  v_head_dim=%d  opt=%d  lse=%d\n"
-        "    stride_q_seq=%d  stride_q_tg=%d  stride_q_head=%d  stride_q_batch=%d\n"
-        "    stride_k_seq=%d  stride_k_head=%d  stride_k_batch=%d\n"
-        "    stride_v_seq=%d  stride_v_head=%d  stride_v_batch=%d\n"
-        "    stride_o_seq=%d  stride_o_head=%d  stride_o_batch=%d\n"
-        "    ptr_QSeq=%p  ptr_KSeq=%p  stride_lse_head=%d\n"
-        "    ptr_QSeqPad=%p  ptr_KSeqPad=%p  ptr_SINK=%p\n"
-        "  Launch dims (after rxy swap):  gdx(head)=%d  gdy(Qtile)=%d  gdz(batch)=%d\n"
-        "                                 bdx=%d  bdy=1  bdz=1\n"
-        "  Pre-swap:                      gdx(Qtile)=%d  gdy(head)=%d  gdz(batch)=%d\n",
-        kernel_key.c_str(), co_name, arg_size,
-        args.ptr_O, args.ptr_Q, args.ptr_K, args.ptr_V, args.ptr_LSE,
-        args.scalar_f,
-        args.q_seq_len, args.kv_seq_len, args.q_head_num, args.gqa,
-        args.qk_head_dim, args.v_head_dim, args.opt, args.lse,
-        args.stride_q_seq, args.stride_q_tg, args.stride_q_head, args.stride_q_batch,
-        args.stride_k_seq, args.stride_k_head, args.stride_k_batch,
-        args.stride_v_seq, args.stride_v_head, args.stride_v_batch,
-        args.stride_o_seq, args.stride_o_head, args.stride_o_batch,
-        args.ptr_QSeq, args.ptr_KSeq, args.stride_lse_head,
-        args.ptr_QSeqPad, args.ptr_KSeqPad, args.ptr_SINK,
-        gdy, gdx, gdz, bdx,
-        gdx, gdy, gdz);
-    fflush(stderr);
-
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              gdy,   // launch_gdx = head count  (swapped)
@@ -362,17 +307,4 @@ std::vector<at::Tensor> fmha_fwd_f16(at::Tensor&                      q,
                              1,
                              1,
                              stream});
-
-    std::vector<at::Tensor> ret;
-    ret.push_back(out);
-    // Always return LSE in slot [1].  When return_lse==false the kernel skips
-    // writing it (args.lse=0) so the data is undefined; callers that don't
-    // need LSE should simply ignore the second tensor.  Keeping a fixed
-    // 2-tuple return matches torch.library schema requirements (compile_ops
-    // / infer_schema only accepts fixed-arity Tuple).
-    ret.push_back(lse);
-    return ret;
 }
-
-} // namespace torch_itfs
-} // namespace aiter
