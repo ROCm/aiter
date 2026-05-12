@@ -1364,7 +1364,18 @@ namespace py = pybind11;
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \
           py::arg("input"),                                              \
-          py::arg("num_rows"));
+          py::arg("num_rows"));                                          \
+    m.def("quant_mxfp4",                                                 \
+          &aiter::quant_mxfp4,                                           \
+          py::arg("inp"),                                                \
+          py::arg("out_packed"),                                         \
+          py::arg("out_scale"),                                          \
+          py::arg("group_size")      = 32,                               \
+          py::arg("round_mode")      = 0,                                \
+          py::arg("e8m0_shuffle")    = false,                            \
+          py::arg("a16w4_shuffle")   = false,                            \
+          py::arg("gate_up")         = false,                            \
+          py::arg("shuffle_weight")  = false);
 
 #define DSV4_ROTATE_QUANT_PYBIND                                         \
     m.def("rotate_activation_fp4quant_inplace",                          \

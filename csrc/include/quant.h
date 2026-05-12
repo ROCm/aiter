@@ -83,4 +83,13 @@ void mxfp4_moe_sort_hip(aiter_tensor_t& out_scale,
                          const aiter_tensor_t& num_valid_ids,
                          int token_num,
                          int cols);
+void quant_mxfp4(const aiter_tensor_t& inp,
+                 aiter_tensor_t& out_packed,
+                 aiter_tensor_t& out_scale,
+                 int group_size          = 32,
+                 int round_mode          = 0,
+                 bool e8m0_shuffle       = false,
+                 bool a16w4_shuffle      = false,
+                 bool gate_up            = false,
+                 bool shuffle_weight     = false);
 } // namespace aiter
