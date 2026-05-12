@@ -5,8 +5,12 @@ import os
 from typing import Optional
 
 import torch
+import triton
 
 from ..jit.core import compile_ops
+from .triton._triton_kernels.attention.unified_attention import (
+    reduce_segments_ck_layout,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -97,10 +101,15 @@ def _pick_num_splits(
         target_ctas = num_cus * 2
         num_splits  = clamp(target_ctas / base_ctas, 1, 16)
 
-    The 16 cap keeps the per-split workspace and the combine cheap. `q_tiles`
-    is approximated from `avg_q` to follow the C++ select_config tile-tier
-    ladder; mixed prefill+decode batches may be slightly over- or under-
-    estimated but the `clamp` absorbs the error.
+    The 16 cap keeps the per-split workspace and the combine cheap. The
+    Triton combine kernel handles non-power-of-2 split counts internally
+    via `NUM_SPLITS_PADDED = next_pow2(num_splits)` with a runtime mask,
+    so we don't pad the heuristic — picking exactly the right number of
+    splits avoids wasted CTAs and workspace.
+
+    `q_tiles` is approximated from `avg_q` to follow the C++ select_config
+    tile-tier ladder; mixed prefill+decode batches may be slightly over- or
+    under-estimated but the `clamp` absorbs the error.
 
     A split that ends up with zero KV pages (because num_splits > the seq's
     KV-page count) is harmless: the kernel writes -inf to that split's
@@ -110,6 +119,7 @@ def _pick_num_splits(
     """
     env = os.environ.get("AITER_UA_FORCE_SPLITS")
     if env is not None:
+        # Caller is responsible for passing a power-of-2 value (or 1).
         return max(1, int(env))
 
     total_q       = query.shape[0]
@@ -156,33 +166,47 @@ def _combine_splits(
     o_acc: torch.Tensor,
     lse_acc: torch.Tensor,
 ) -> None:
-    """FlashDecoding-style LSE merge, written in pure torch ops.
+    """FlashDecoding-style LSE merge via a Triton kernel.
 
-    o_acc   : [nhead, num_splits, total_q, hdim]  fp32  (already normalized
-                                                          per-split: divided by
-                                                          its own l)
-    lse_acc : [nhead, num_splits, total_q]        fp32  (natural-log domain)
+    This is a thin wrapper around `reduce_segments_ck_layout`, which is the
+    CK-layout sibling of `reduce_segments` (the kernel that Triton-UA's 3D
+    path uses). Algorithmically identical — both fuse the LSE rescale +
+    weighted sum into a single Triton launch — so combine-step overhead is
+    the same on both backends, eliminating it as a confounder when
+    comparing CK vs Triton attention-kernel performance.
 
-    Writes the merged result into `output` (layout [total_q, nhead, hdim]).
+    o_acc   : [nhead, num_splits, total_q, hdim]  fp32, contiguous,
+                                                  per-split-normalized
+    lse_acc : [nhead, num_splits, total_q]        fp32, contiguous,
+                                                  natural-log (m + log(l))
+    output  : [total_q, nhead, hdim]              bf16/fp16 (CK output dtype)
 
-    Combine math (per-split lse[s] = m[s] + log(l[s])):
-        lse_max = max_s lse[s]
-        w[s]    = exp(lse[s] - lse_max)
-        out     = sum_s (o_acc[s] * w[s]) / sum_s w[s]
-
-    Splits with lse == -inf (masked-out / empty) get zero weight so they
-    don't contribute, and (-inf) - (-inf) is replaced with 0 to avoid NaN.
+    Per (t, h):
+        lse_max  = max_s lse[h, s, t]
+        w[s]     = exp(lse[h, s, t] - lse_max)   ( -inf rows -> 0 )
+        out[t,h] = sum_s o_acc[h, s, t, :] * w[s] / sum_s w[s]
     """
-    is_empty   = torch.isinf(lse_acc) & (lse_acc < 0)
-    safe_lse   = torch.where(is_empty, torch.zeros_like(lse_acc), lse_acc)
-    lse_max    = safe_lse.amax(dim=1, keepdim=True)
-    weight     = torch.exp(safe_lse - lse_max)
-    weight     = torch.where(is_empty, torch.zeros_like(weight), weight)
-    weight_sum = weight.sum(dim=1, keepdim=True)
-    weight_sum = torch.where(weight_sum == 0, torch.ones_like(weight_sum), weight_sum)
-    w_full     = (weight / weight_sum).unsqueeze(-1)
-    o_merged   = (o_acc * w_full).sum(dim=1)  # [nhead, total_q, hdim]
-    output.copy_(o_merged.transpose(0, 1).to(output.dtype))
+    num_q_heads, num_splits, num_tokens, head_size = o_acc.shape
+    head_size_padded   = triton.next_power_of_2(head_size)
+    # NUM_SPLITS_PADDED is the `tl.arange` upper bound — only it needs to
+    # be a power of 2. `num_splits` itself is the actual stride multiplier
+    # and the kernel masks the [num_splits, NUM_SPLITS_PADDED) tail.
+    num_splits_padded  = triton.next_power_of_2(num_splits)
+    grid = (num_tokens, num_q_heads)
+    reduce_segments_ck_layout[grid](
+        output_ptr=output,
+        o_acc_ptr=o_acc,
+        lse_acc_ptr=lse_acc,
+        num_tokens=num_tokens,
+        num_splits=num_splits,
+        output_stride_0=output.stride(0),
+        output_stride_1=output.stride(1),
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=head_size_padded,
+        NUM_SPLITS_PADDED=num_splits_padded,
+        num_warps=2 if num_splits >= 4 else 1,
+        num_stages=1,
+    )
 
 
 # -----------------------------------------------------------------------------

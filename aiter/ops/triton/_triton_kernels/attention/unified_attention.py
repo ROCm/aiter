@@ -775,3 +775,99 @@ def reduce_segments(
         + tl.arange(0, HEAD_SIZE_PADDED)
     )
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
+
+
+@triton.jit
+def reduce_segments_ck_layout(
+    output_ptr,       # [num_tokens, num_query_heads, head_size]  (bf16/fp16)
+    o_acc_ptr,        # [num_query_heads, num_splits, num_tokens, head_size]  fp32
+    lse_acc_ptr,      # [num_query_heads, num_splits, num_tokens]             fp32
+    num_tokens,       # int (runtime, stride multiplier)
+    num_splits,       # int (runtime, stride multiplier + active-split mask)
+    output_stride_0: tl.int64,
+    output_stride_1: tl.int64,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    NUM_SPLITS_PADDED: tl.constexpr,  # next_pow2(num_splits) — only used for tl.arange
+):
+    # FlashDecoding-style LSE merge of CK-layout split-KV partials.
+    #
+    # Algorithmically identical to `reduce_segments` above, just adapted to the
+    # CK kernel's workspace layout:
+    #   * o_acc / lse_acc are head-major ([H, S, T, D] / [H, S, T]) instead
+    #     of token-major.
+    #   * `lse_acc` is natural-log (m + log(l)) — a single fused tensor
+    #     instead of separate `segm_max`/`segm_expsum`.
+    #   * `o_acc` is already normalized by its per-split `l`, so the
+    #     equivalent of `segm_expsum` is implicitly 1.
+    #   * Empty splits are encoded by lse == -inf (host pre-fills lse_acc
+    #     with -inf; the CK kernel only overwrites real splits). No
+    #     seq_lens-derived mask is needed.
+    #
+    # `num_splits` is a runtime parameter and may be any integer — only the
+    # `tl.arange` upper bound has to be a power of 2, hence the separate
+    # `NUM_SPLITS_PADDED` constexpr. Splits at index >= num_splits are
+    # masked out of both the lse and o_acc loads.
+    #
+    # Final per (t, h):
+    #   lse_max  = max_s lse[h, s, t]                            (ignoring -inf)
+    #   w[s]     = exp(lse[h, s, t] - lse_max)                   (-inf -> 0)
+    #   out[t,h] = sum_s o_acc[h, s, t, :] * w[s] / sum_s w[s]
+    query_token_idx = tl.program_id(0)
+    query_head_idx  = tl.program_id(1)
+
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    if HEAD_SIZE_PADDED != HEAD_SIZE:
+        dim_mask = offs_d < HEAD_SIZE
+    else:
+        dim_mask = tl.full((1,), 1, dtype=tl.int1)
+
+    # Active-split mask: padded tail beyond `num_splits` loads as -inf for
+    # lse and 0 for o_acc, exactly like a real empty split would.
+    s_idx      = tl.arange(0, NUM_SPLITS_PADDED)
+    split_mask = s_idx < num_splits
+
+    # lse_acc[h, :, t] — strides (contiguous [H, num_splits, T]):
+    #   H -> num_splits * num_tokens ; S -> num_tokens ; T -> 1
+    lse_offset = (
+        query_head_idx.to(tl.int64) * (num_splits * num_tokens)
+        + s_idx.to(tl.int64) * num_tokens
+        + query_token_idx
+    )
+    lse = tl.load(lse_acc_ptr + lse_offset, mask=split_mask, other=float("-inf"))
+
+    # Replace -inf with a large finite sentinel so `tl.max` stays finite even
+    # in the (unlikely) all-empty case. Empty splits still produce weight 0
+    # because exp(-inf - finite) == 0 and we mask them explicitly below.
+    is_empty = lse == float("-inf")
+    lse_safe = tl.where(is_empty, -1.0e38, lse)
+    lse_max  = tl.max(lse_safe)
+
+    weight = fast_exp(lse - lse_max)
+    weight = tl.where(is_empty, 0.0, weight)
+    weight_sum = tl.sum(weight)
+    weight_sum_safe = tl.where(weight_sum == 0.0, 1.0, weight_sum)
+
+    # o_acc[h, :, t, :] — strides (contiguous [H, num_splits, T, D]):
+    #   H -> num_splits*num_tokens*HEAD_SIZE ; S -> num_tokens*HEAD_SIZE ;
+    #   T -> HEAD_SIZE ; D -> 1
+    o_offset = (
+        query_head_idx.to(tl.int64) * (num_splits * num_tokens * HEAD_SIZE)
+        + s_idx[:, None].to(tl.int64) * (num_tokens * HEAD_SIZE)
+        + query_token_idx * HEAD_SIZE
+        + offs_d[None, :]
+    )
+    o = tl.load(
+        o_acc_ptr + o_offset,
+        mask=split_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    )
+    o = o * weight[:, None]
+    acc = tl.sum(o, axis=0) / weight_sum_safe
+
+    output_offset = (
+        query_token_idx * output_stride_0
+        + query_head_idx * output_stride_1
+        + offs_d
+    )
+    tl.store(output_ptr + output_offset, acc, mask=dim_mask)
