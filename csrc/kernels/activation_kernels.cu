@@ -480,6 +480,23 @@ static constexpr int nextPow2(unsigned int num)
     HipDeviceGuard device_guard(input.device_id);                                     \
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
+// Scaled kernel uses more waves for mid-range d to match Triton's parallelism
+#define COMPUTE_SCALED_ACTIVATION_KERNEL_PARAMS                                       \
+    int warp_size       = static_cast<int>(WARP_SIZE);                                \
+    int d              = input.size(-1) / 2;                                          \
+    int64_t num_tokens = input.numel() / input.size(-1);                              \
+    int vec_size       = nextPow2(d / warp_size);                                     \
+    vec_size           = vec_size < 2 ? 2 : vec_size;                                 \
+    vec_size           = vec_size > max_vec_size ? max_vec_size : vec_size;           \
+    int num_wave       = nextPow2(d / warp_size / vec_size);                          \
+    num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;           \
+    if(d > 512 && d <= 2048 && num_tokens <= 4096)                                    \
+        num_wave = 4;                                                                 \
+    dim3 grid(num_tokens);                                                            \
+    dim3 block(num_wave * warp_size);                                                 \
+    HipDeviceGuard device_guard(input.device_id);                                     \
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
 // Helper macros for fp32 vec_size dispatch
 #define DISPATCH_FP32_VEC_SIZE_CASE(VS, KERNEL_NAME, KERNEL, ...)              \
     case VS:                                                                   \
@@ -644,7 +661,7 @@ static constexpr int nextPow2(unsigned int num)
 
 // Launch scaled activation and gating kernel with flexible input/output types
 #define LAUNCH_SCALED_ACTIVATION_GATE_KERNEL(KERNEL)                                            \
-    COMPUTE_ACTIVATION_KERNEL_PARAMS                                                            \
+    COMPUTE_SCALED_ACTIVATION_KERNEL_PARAMS                                                     \
     if(input.dtype() == AITER_DTYPE_fp32)                                                       \
     {                                                                                           \
         /* fp32 input: dispatch based on output type (fp8/bf16/fp16/fp32) */                    \
