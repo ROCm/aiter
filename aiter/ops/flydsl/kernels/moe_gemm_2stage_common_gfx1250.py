@@ -904,7 +904,7 @@ def _mxscale_precompute_a_data_bases(
     range_constexpr,
 ):
     row_base = (warp_m_base + lane16) * arith.index(lds_a_stride_bytes)
-    k_half_off = lane_kgrp * arith.index(32 if is_fp4 else 16)
+    k_half_off = lane_kgrp * arith.index(16)
     return [
         row_base + arith.index(wm * WMMA_M * lds_a_stride_bytes) + k_half_off
         for wm in range_constexpr(wmma_m_rep)
@@ -924,7 +924,7 @@ def _mxscale_precompute_rowmajor_b_data_bases(
 ):
     return [
         (warp_n_base + lane16) * arith.index(lds_b_stride_bytes)
-        + lane_kgrp * arith.index(32)
+        + lane_kgrp * arith.index(16)
         + arith.index(wnh * WMMA_N * lds_b_stride_bytes)
         for wnh in range_constexpr(wmma_n_rep * 2)
     ]
@@ -983,7 +983,7 @@ def _mxscale_load_data_frag(
     byte_off = lane_base + arith.index(ks * WMMA_K // PACK_FACTOR_A)
     v0 = _lds_load_b128(lds_buffer, byte_off)
     if is_fp4:
-        v1 = _lds_load_b128(lds_buffer, byte_off + arith.index(16))
+        v1 = _lds_load_b128(lds_buffer, byte_off + arith.index(32))
         return vector.shuffle(v0, v1, list(range(8)))
     v1 = _lds_load_b128(lds_buffer, byte_off + arith.index(32))
     v2 = _lds_load_b128(lds_buffer, byte_off + arith.index(64))
@@ -1009,9 +1009,9 @@ def _mxscale_load_rowmajor_b_frag(
     base0 = b_lane_bases[wn * 2] + k_byte_off
     base1 = b_lane_bases[wn * 2 + 1] + k_byte_off
     v0 = _lds_load_b128(lds_buffer, base0)
-    v1 = _lds_load_b128(lds_buffer, base0 + arith.index(16))
+    v1 = _lds_load_b128(lds_buffer, base0 + arith.index(32))
     v2 = _lds_load_b128(lds_buffer, base1)
-    v3 = _lds_load_b128(lds_buffer, base1 + arith.index(16))
+    v3 = _lds_load_b128(lds_buffer, base1 + arith.index(32))
     v01 = vector.shuffle(v0, v1, list(range(8)))
     v23 = vector.shuffle(v2, v3, list(range(8)))
     return vector.shuffle(v01, v23, list(range(16)))

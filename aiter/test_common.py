@@ -448,6 +448,20 @@ def checkAllclose(
 ):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
 
+    if printLog:
+        a_head = a.reshape(-1)[:printNum]
+        b_head = b.reshape(-1)[:printNum]
+        delta_head = (a_head.float() - b_head.float()).abs()
+        logger.info(
+            f"{msg}[checkAllclose head] first {printNum} elements\n"
+            f"    a    : {tuple(a.shape)} {a.dtype}\n"
+            f"           {a_head}\n"
+            f"    b    : {tuple(b.shape)} {b.dtype}\n"
+            f"           {b_head}\n"
+            f"    delta:\n"
+            f"           {delta_head}"
+        )
+
     if _bool_all_safe(isClose):
         if printLog:
             logger.info(f"{msg}[checkAllclose {atol=} {rtol=} \033[32mpassed~\033[0m]")

@@ -34,6 +34,7 @@ from aiter.ops.shuffle import (
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
+torch.manual_seed(0)
 AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
@@ -545,6 +546,9 @@ def test_fmoe(
         return 1 - sim
 
     logits_diff = calc_diff(out2_ref, out2_ck)
+    aiter.logger.info(
+        f"[moe_2stage] logits_diff={logits_diff:.6f} mismatch_ratio={err:.4f}"
+    )
 
     # ---- accuracy verdict --------------------------------------------------
     # FlyDSL paths use UT-style "mismatch_ratio < 5% OR logits_diff <
