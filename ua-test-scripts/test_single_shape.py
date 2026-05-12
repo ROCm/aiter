@@ -179,7 +179,7 @@ def run_triton(out, tensors, args):
     """Run Triton unified attention."""
     from aiter.ops.triton.attention import unified_attention as ua_mod
     # modify the ua_mods use_2d_kernel to return True no matter what the input is
-    ua_mod.use_2d_kernel = lambda *args, **kwargs: True
+    # ua_mod.use_2d_kernel = lambda *args, **kwargs: True
     window = (args.window_left, args.window_right)
 
     ua_mod.unified_attention(
