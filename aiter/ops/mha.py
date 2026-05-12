@@ -355,9 +355,7 @@ def fmha_fwd_f16_asm(
         )
     else:
         # D128: kernel never reads sink contents but slot must be non-null.
-        sink_for_kernel = torch.zeros(
-            q_head_num, dtype=torch.float32, device=q.device
-        )
+        sink_for_kernel = torch.zeros(q_head_num, dtype=torch.float32, device=q.device)
 
     _fmha_fwd_f16_asm(
         q,
