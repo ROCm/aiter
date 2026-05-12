@@ -31,6 +31,71 @@ _scale_t_cache: dict = {}
 # Cache for quant-function partials with transpose_scale=True, keyed on quant_type.
 _quant_func_t_cache: dict = {}
 
+# Maximum token count for which the 1-stage ASM fast path is preferred over the
+# 2-stage CK path for gfx950 FP8-blockscale decode workloads.  Above this
+# threshold the problem is large enough that the CK 2-stage pipeline's overlap
+# of compute and memory traffic outweighs the HBM round-trip savings.
+_1STAGE_TOKEN_THRESHOLD = 512
+
+# Pre-resolved kernel name tuples for the gfx950 FP8-blockscale 1-stage ASM
+# fast path.  Keys are (gfx, output_dtype); values are
+# (plain_novs_name, presorted_novs_ps_name).
+_GFX950_BLOCKSCALE_NOVS_KERNELS: dict = {
+    ("gfx950", dtypes.bf16): (
+        "fmoe_fp8_blockscale_g1u1_bf16",
+        "fmoe_fp8_blockscale_g1u1_bf16_presorted",
+    ),
+    ("gfx950", dtypes.fp16): (
+        "fmoe_fp8_blockscale_g1u1_fp16",
+        "fmoe_fp8_blockscale_g1u1_fp16_presorted",
+    ),
+}
+
+# Module-level pre-resolved kernel name constants for the gfx950 fast path,
+# resolved once at import time using _cached_gfx to avoid repeated dict lookups
+# in the decode hot path.
+_FAST_PATH_KERNELNAME_BF16: str = _GFX950_BLOCKSCALE_NOVS_KERNELS.get(
+    (_cached_gfx, dtypes.bf16), ("", "")
+)[0]
+_FAST_PATH_KERNELNAME_FP16: str = _GFX950_BLOCKSCALE_NOVS_KERNELS.get(
+    (_cached_gfx, dtypes.fp16), ("", "")
+)[0]
+
+
+def _should_force_1stage_asm(
+    gfx,
+    q_type,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    use_g1u1,
+    doweight_stage1,
+    inter_dim,
+    token,
+):
+    """Return True when the gfx950 FP8-blockscale 1-stage ASM fast path should
+    be used instead of the 2-stage CK path.
+
+    Conditions (all must hold):
+    - gfx950 GPU
+    - per_1x128 block-scale quantization
+    - FP8 activations and FP8 weights
+    - G1U1 (gate+up fused) weight layout
+    - inter_dim divisible by 256 (kernel alignment requirement)
+    - token count within the decode threshold
+    - doweight_stage1 is False (weight-stage1 path uses a different kernel)
+    """
+    return (
+        gfx == "gfx950"
+        and q_type == QuantType.per_1x128
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp8
+        and use_g1u1
+        and inter_dim % 256 == 0
+        and token <= _1STAGE_TOKEN_THRESHOLD
+        and not doweight_stage1
+    )
+
 
 def _get_moe_sorting_bufs(
     M, topk, num_experts, block_size, model_dim, moebuf_dtype, device
@@ -316,6 +381,8 @@ def fused_moe_(
         doweight_stage1,
         hidden_pad,
         intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -418,6 +485,59 @@ def fused_moe_1stage(
     device=None,
     doweight_stage1: bool = None,
 ):
+    if (
+        quant_type == QuantType.per_1x128
+        and isG1U1
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp8
+        and not doweight_stage1
+    ):
+        dtype = moe_buf.dtype
+        if dtype == dtypes.bf16:
+            effective_kernelName = _FAST_PATH_KERNELNAME_BF16
+        else:
+            effective_kernelName = _FAST_PATH_KERNELNAME_FP16
+
+        if hidden_states.dtype != dtypes.fp8:
+            quant_func = _get_quant_func_transpose(quant_type)
+            a1, a1_scale = quant_func(
+                hidden_states,
+                scale=a1_scale,
+                quant_dtype=dtypes.fp8,
+                num_rows=num_local_tokens,
+            )
+        else:
+            assert (
+                a1_scale is not None
+            ), "a1_scale must be provided for quantized input for fused_moe"
+            a1 = hidden_states
+            if a1_scale is not None:
+                scale_t = _get_scale_t_buf(a1_scale)
+                aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
+                a1_scale = scale_t
+
+        aiter.fmoe_fp8_blockscale_g1u1(
+            moe_buf,
+            a1,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            topk,
+            a1_scale,
+            w1_scale,
+            w2_scale,
+            effective_kernelName,
+            fc_scale_blkn=128,
+            fc_scale_blkk=128,
+            block_size_M=block_size_M,
+            fc2_smooth_scale=None,
+            activation=activation,
+        )
+        return moe_buf
+
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
         aiter.fmoe(
@@ -640,6 +760,8 @@ def get_2stage_cfgs(
     hidden_pad,
     intermediate_pad,
     is_shuffled=True,
+    bias1=None,
+    bias2=None,
 ):
     _INDEX_COLS = [
         "cu_num",
@@ -736,6 +858,18 @@ def get_2stage_cfgs(
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
 
+    force_1stage = _should_force_1stage_asm(
+        _cached_gfx,
+        q_type,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        use_g1u1,
+        doweight_stage1,
+        inter_dim,
+        token,
+    )
+
     ksplit = 0
     kernelName1 = ""
     kernelName2 = ""
@@ -753,8 +887,7 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict.get(get_gfx(), {}):
             if q_type == QuantType.per_1x128:
-                # for fp8 blockscale, ck has better performance so disable assembly kernel
-                run_1stage = token > 32 and (inter_dim % 128 == 0)
+                run_1stage = inter_dim % 256 == 0
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
@@ -765,8 +898,16 @@ def get_2stage_cfgs(
             if run_1stage and q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
                 run_1stage_xbf16 = int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
 
+        if force_1stage and not run_1stage:
+            run_1stage = True
+            if dtype == dtypes.bf16:
+                kernelName1 = _FAST_PATH_KERNELNAME_BF16
+            else:
+                kernelName1 = _FAST_PATH_KERNELNAME_FP16
+
+        _default_run1stage_block_m = 16 if force_1stage else BLOCK_SIZE_M
         block_m = (
-            BLOCK_SIZE_M
+            _default_run1stage_block_m
             if run_1stage
             else (
                 (64 if token > 32 else 16)
@@ -786,6 +927,14 @@ def get_2stage_cfgs(
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
+
+        if force_1stage and not run_1stage:
+            run_1stage = True
+            if dtype == dtypes.bf16:
+                kernelName1 = _FAST_PATH_KERNELNAME_BF16
+            else:
+                kernelName1 = _FAST_PATH_KERNELNAME_FP16
+
         if not is_shuffled and not run_1stage:
             logger.warning(
                 f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
@@ -956,6 +1105,8 @@ def fused_moe_2stages(
         hidden_pad,
         intermediate_pad,
         is_shuffled,
+        bias1=bias1,
+        bias2=bias2,
     )
     if (
         quant_type == QuantType.per_1x32
