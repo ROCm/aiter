@@ -567,8 +567,6 @@ def make_reference_output(
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
     )
-    softmax_scale = q_bshd.shape[-1] ** -0.5
-
     ref = args.ref or "torch"
 
     if block_attn_mask is not None:
@@ -1443,9 +1441,15 @@ def main() -> int:
         )
 
     if args.load_captured:
-        default_runner = lambda: run_benchmark_captured(args, loaded_single_mask)
+
+        def default_runner():
+            run_benchmark_captured(args, loaded_single_mask)
+
     else:
-        default_runner = lambda: run_benchmark_generated(args, loaded_single_mask)
+
+        def default_runner():
+            run_benchmark_generated(args, loaded_single_mask)
+
     return run_with_optional_vgpr(args, default_runner)
 
 
