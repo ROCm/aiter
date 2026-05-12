@@ -336,3 +336,195 @@ def test_ck_unified_attn_splitkv(
     torch.testing.assert_close(
         output, ref_output, atol=atol, rtol=rtol
     ), f"max abs diff = {max_diff:.3e}, mean = {mean_diff:.3e}"
+
+
+# ---------------------------------------------------------------------------
+# Transparent split-KV (allow_splitkv=True, default-on) sanity check.
+#
+# This exercises the Python wrapper's auto-split path: heuristic picks
+# num_splits, wrapper allocates the FP32 workspaces, kernel writes per-split
+# partials, wrapper combines into `output`. We pick a shape where the
+# heuristic is *guaranteed* to choose num_splits > 1 (long KV, few CTAs)
+# and assert both:
+#   (a) the heuristic actually returned > 1 — so we know the test exercised
+#       the auto-split branch and not the trivial num_splits=1 fallback;
+#   (b) the combined output matches the torch reference.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize(
+    "head_config",
+    [
+        (32, 4, 64),    # GQA-8, d=64
+        (16, 16, 128),  # MHA,   d=128
+    ],
+)
+@torch.inference_mode()
+def test_ck_unified_attn_transparent_splitkv(
+    head_config: tuple[int, int, int],
+    dtype: torch.dtype,
+) -> None:
+    """End-to-end check that the transparent split-KV path is correct.
+
+    Shape is intentionally decode-heavy (batch=4 seqs, all Q=1, long KV) so
+    `_pick_num_splits` is forced above 1 by the CTA-occupancy heuristic.
+    """
+    from aiter.ops.unified_attention import _pick_num_splits
+
+    torch.manual_seed(0)
+
+    num_blocks  = 2048           # well below the int32-overflow threshold
+    block_size  = 32             # kv_tile_cap = min_kv_len / 32 ≥ 256 here
+    num_q_heads, num_kv_heads, head_size = head_config
+
+    # batch of 4 pure decode requests, each with a 4096-token KV cache —
+    # ratio kv_tile_cap : base_ctas is well above 1 so the heuristic always
+    # chooses num_splits > 1 here regardless of device CU count.
+    num_seqs   = 4
+    query_lens = [1] * num_seqs
+    kv_lens    = [4096, 8192, 6144, 8192]
+
+    scale = head_size**-0.5
+
+    query = torch.randn(
+        sum(query_lens), num_q_heads, head_size, dtype=dtype, device="cuda"
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+    )
+    value_cache = torch.randn_like(key_cache)
+
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device="cuda"
+    ).cumsum(dim=0, dtype=torch.int32)
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+
+    max_num_blocks_per_seq = (max(kv_lens) + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (num_seqs, max_num_blocks_per_seq),
+        dtype=torch.int32, device="cuda",
+    )
+
+    # (a) Heuristic must pick > 1; otherwise the test isn't really
+    # exercising the auto-split branch.
+    chosen = _pick_num_splits(query, key_cache, seq_lens)
+    assert chosen > 1, (
+        f"transparent path test ineffective: heuristic chose num_splits={chosen} "
+        f"for head_config={head_config}, batch={num_seqs}, KV={kv_lens}. "
+        f"Increase KV lengths or reduce num_kv_heads."
+    )
+
+    # (b) Run the transparent path (no explicit num_splits / workspaces) and
+    # compare against the torch reference.
+    output = torch.empty_like(query)
+    unified_attention_fwd(
+        output, query, key_cache, value_cache,
+        block_tables, seq_lens, cu_query_lens,
+        mask_type=2,
+        scale_s=scale, scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0,
+        cache_ptr_int32_overflow_possible=False,
+        # allow_splitkv defaults to True; no num_splits / workspaces passed.
+    )
+
+    ref_output = ref_paged_attn(
+        query=query.clone(),
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=None, soft_cap=None, sinks=None,
+    )
+
+    # Same tolerance as the explicit-split test: per-split divide-then-
+    # reaccumulate in the LSE combine drifts a single bf16 element by up to
+    # ~5e-2 even when the mean is at noise level. (atol, mean) catches real
+    # bugs without flagging precision noise.
+    atol, rtol = 6e-2, 1e-2
+    diff = (output.float() - ref_output.float()).abs()
+    mean_diff = diff.mean().item()
+    max_diff = diff.max().item()
+    assert mean_diff < 5e-3, (
+        f"mean |diff|={mean_diff:.3e} (max={max_diff:.3e}) — likely a real bug "
+        f"in the transparent split-KV path, not just bf16 noise "
+        f"(num_splits chosen = {chosen})"
+    )
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), (
+        f"max abs diff = {max_diff:.3e}, mean = {mean_diff:.3e}, "
+        f"num_splits chosen = {chosen}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Opt-out check: allow_splitkv=False must produce the same output as the
+# single-launch path no matter what shape we throw at it.
+# ---------------------------------------------------------------------------
+@torch.inference_mode()
+def test_ck_unified_attn_opt_out_splitkv() -> None:
+    """allow_splitkv=False forces num_splits=1 regardless of shape."""
+    torch.manual_seed(0)
+
+    num_blocks  = 2048
+    block_size  = 32
+    num_q_heads, num_kv_heads, head_size = 32, 4, 64
+
+    num_seqs   = 4
+    query_lens = [1] * num_seqs
+    kv_lens    = [4096, 8192, 6144, 8192]
+    dtype      = torch.bfloat16
+
+    scale = head_size**-0.5
+
+    query = torch.randn(
+        sum(query_lens), num_q_heads, head_size, dtype=dtype, device="cuda"
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+    )
+    value_cache = torch.randn_like(key_cache)
+
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device="cuda"
+    ).cumsum(dim=0, dtype=torch.int32)
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
+
+    max_num_blocks_per_seq = (max(kv_lens) + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (num_seqs, max_num_blocks_per_seq),
+        dtype=torch.int32, device="cuda",
+    )
+
+    out_split = torch.empty_like(query)
+    unified_attention_fwd(
+        out_split, query, key_cache, value_cache,
+        block_tables, seq_lens, cu_query_lens,
+        mask_type=2,
+        scale_s=scale, scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0,
+        cache_ptr_int32_overflow_possible=False,
+        allow_splitkv=True,
+    )
+
+    out_no_split = torch.empty_like(query)
+    unified_attention_fwd(
+        out_no_split, query, key_cache, value_cache,
+        block_tables, seq_lens, cu_query_lens,
+        mask_type=2,
+        scale_s=scale, scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0,
+        cache_ptr_int32_overflow_possible=False,
+        allow_splitkv=False,
+    )
+
+    # Both paths should match the torch reference within tolerance — and
+    # therefore also match each other (modulo per-split fp32 drift).
+    ref_output = ref_paged_attn(
+        query=query.clone(),
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=None, soft_cap=None, sinks=None,
+    )
+    torch.testing.assert_close(out_no_split, ref_output, atol=1.5e-2, rtol=1e-2)
+    torch.testing.assert_close(out_split,    ref_output, atol=6e-2, rtol=1e-2)
