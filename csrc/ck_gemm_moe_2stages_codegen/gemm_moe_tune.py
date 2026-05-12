@@ -971,8 +971,20 @@ class FmoeTuner(TunerCommon):
                 )
             )
         elif q_dtype_w == dtypes.fp4x2 and q_dtype_a == dtypes.fp4x2:
-            w1_qt_shffle_ck = shuffle_weight(w1_qt, (16, 16))
-            w2_qt_shffle_ck = shuffle_weight(w2_qt, (16, 16))
+            # a4w4: weight/scale layout MUST match the kernel's gate_mode.
+            # ``gen_flydsl_2stages_task`` uses ``AITER_MOE_GUI`` to pick the
+            # candidate set (gugu -> INTL only, auto/gguu -> SEP only), so
+            # shuffle along the same axis here.  Picking the wrong layout
+            # silently corrupts accuracy (every gugu candidate failed errRatio
+            # before this fix).
+            if os.environ.get("AITER_MOE_GUI", "auto").lower() == "gugu":
+                w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, True)
+                w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
+                w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
+                w2_scale_aiter = shuffle_scale_a16w4(w2_scale, expert, False)
+            else:
+                w1_qt_shffle_ck = shuffle_weight(w1_qt, (16, 16))
+                w2_qt_shffle_ck = shuffle_weight(w2_qt, (16, 16))
         elif q_dtype_w == dtypes.fp4x2 and q_dtype_a == dtypes.fp8:
             # a8w4 per_1x32 stage1 just support tune a1_cast now.
             w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, True)
@@ -2446,13 +2458,21 @@ class FmoeTuner(TunerCommon):
             a_dtype_str, b_dtype_str, out_dtype_str
         )
 
-        # AITER_MOE_GUI=gugu expands the tune scope to include the new
-        # cross-variant candidates introduced by registering both SEP and GUI
-        # for every fp4-weight (a, b) triple.  In auto/gguu we restrict the
-        # iteration to the historical set (a8w4 GUI-only, a4w4 SEP/mock-only)
-        # so the tuning database stays semantically identical to legacy.
+        # Tune never sweeps both SEP and GUI for the same (a, b) triple --
+        # we always pick exactly one gate_mode based on AITER_MOE_GUI:
+        #   * gugu       -> force INTL (interleave) for both a4w4 and a8w4
+        #   * auto/gguu  -> historical default (a8w4 INTL, a4w4 SEP/mock-only)
+        # Sweeping both would double the tune budget and produce a tuned
+        # database whose row → kernel_name mapping diverges from the runtime
+        # dispatch (which only ever picks one variant per call).
         _gui_mode = os.environ.get("AITER_MOE_GUI", "auto").lower()
-        if _gui_mode != "gugu":
+        if _gui_mode == "gugu":
+            flydsl_s1_kernels = {
+                n: p
+                for n, p in flydsl_s1_kernels.items()
+                if p.get("gate_mode") == "interleave"
+            }
+        else:
             if a_dtype_str == "fp8":
                 flydsl_s1_kernels = {
                     n: p
