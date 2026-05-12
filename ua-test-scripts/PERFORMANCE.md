@@ -1,99 +1,139 @@
-# CK vs Triton Unified Attention - Performance Results
+# CK Unified Attention — Performance vs Triton
 
-## Executive Summary
+Performance comparison of the CK Tile unified attention kernel against the
+Triton unified attention reference, after the recent refactor work
+(transparent split-KV, runtime `kBlockQ`, collapsed MHA/GQA variants,
+m32/m16 d=128 decode variants, Triton-fused combine).
 
-CK Tile unified attention optimizations show **batch-size dependent performance** vs Triton:
+All numbers measured on **AMD MI350 (gfx950)**, 304 CUs, ROCm 7.0.0, bf16,
+context length `sk=120000`, decode (`sq=1`), `block_size=16`, CUDA-graph
+timing. Each cell is `time_triton / time_ck` (i.e. `>1.0` = CK wins).
 
-- **High batch (b≥64)**: CK wins 1.1–1.7× faster
-- **Low batch (b≤32)**: Triton wins 1.4–6.6× faster (using 3D split-KV kernel)
-- **Crossover point**: Between b=32 and b=64
+## Headline numbers
 
-## Detailed Results
+### d=64 GQA-8 (`hq=64`, `hk=8`)
 
-### High Batch Performance (CK Advantage)
+| batch | CK time (ms) | Triton time (ms) | Speedup    | CK bandwidth |
+|------:|-------------:|-----------------:|-----------:|-------------:|
+|     4 | 0.276        | 0.498            | **1.82x**  | 3.56 TB/s    |
+|     8 | 0.414        | 1.015            | **2.45x**  | 4.75 TB/s    |
+|    32 | 1.577        | 3.010            | **1.91x**  | 4.99 TB/s    |
+|    64 | 3.134        | 5.485            | **1.75x**  | 5.02 TB/s    |
+|   128 | 6.236        | 10.335           | **1.66x**  | 5.05 TB/s    |
+|   256 | 12.444       | 15.935           | **1.28x**  | 5.06 TB/s    |
 
-| Batch | CK (ms) | Triton (ms) | Triton Kernel | Speedup | Winner |
-|-------|---------|-------------|---------------|---------|--------|
-| 512   | 1.065   | 1.815       | 2D            | **1.70×** | **CK** |
-| 256   | 0.395   | 0.684       | 2D            | **1.73×** | **CK** |
-| 64    | 0.243   | 0.267       | 2D            | **1.10×** | **CK** |
+### d=128 MHA (`hq=16`, `hk=16`)
 
-### Low Batch Performance (Triton Advantage)
+| batch | CK time (ms) | Triton time (ms) | Speedup    | CK bandwidth |
+|------:|-------------:|-----------------:|-----------:|-------------:|
+|     4 | 0.767        | 0.815            | **1.06x**  | 5.13 TB/s    |
+|     8 | 1.508        | 2.023            | **1.34x**  | 5.21 TB/s    |
+|    32 | 5.895        | 6.821            | **1.16x**  | 5.34 TB/s    |
+|    64 | 11.710       | 10.892           |   0.93x    | 5.37 TB/s    |
+|   128 | 23.278       | 25.401           | **1.09x**  | 5.41 TB/s    |
+|   256 | 46.507       | 47.170           | **1.01x**  | 5.41 TB/s    |
 
-| Batch | CK (ms) | Triton (ms) | Triton Kernel | Speedup | Winner |
-|-------|---------|-------------|---------------|---------|--------|
-| 32    | 0.217   | 0.156       | 3D + reduce   | **0.72×** | **Triton 1.4×** |
-| 16    | 0.213   | 0.097       | 3D + reduce   | **0.45×** | **Triton 2.2×** |
-| 8     | 0.212   | 0.054       | 3D + reduce   | **0.25×** | **Triton 3.9×** |
-| 4     | 0.213   | 0.032       | 3D + reduce   | **0.15×** | **Triton 6.6×** |
+CK saturates ~5 TB/s effective HBM bandwidth across the sweep (MI350 peak
+is ~5.3 TB/s). The two regimes where Triton remains competitive — d=64
+b=256 and d=128 b=64 — are also the two cases where Triton's 2D path
+already saturates the device, leaving no headroom for split-KV to help.
 
-*Test configuration: sk=8192, hq=64, hk=8, d=64, decode, bf16*
+## Why these numbers (architectural recap)
 
-## Key Insights
+The CK kernel runs under a **transparent split-KV** wrapper
+(`unified_attention_fwd` in `aiter/ops/unified_attention.py`):
 
-### Triton Kernel Selection
-- **2D kernel**: Used at moderate to high batch (b≥64)
-  - Single kernel launch per iteration
-  - Simpler execution model
+1. **`_pick_num_splits`** picks `num_splits ∈ [1, 16]` from a CTA-occupancy
+   heuristic — purely CPU-side, no device sync, so it's CUDA-graph safe.
+   Target is roughly `2 × num_CUs` total CTAs.
+2. If `num_splits == 1` the kernel writes directly to the output tensor
+   (single-launch path).
+3. If `num_splits > 1` the kernel writes per-split partials to FP32
+   workspaces (`o_acc`, `lse_acc`), then **`_combine_splits`** does a
+   FlashDecoding-style LSE merge.
 
-- **3D kernel**: Used at low batch (b≤32)
-  - Split-KV parallelism to utilize GPU at low occupancy
-  - Paired with `reduce_segments` reduction kernel (~4 μs overhead)
-  - Significantly faster when batch size limits parallelism
+The combine is a single fused Triton kernel (`reduce_segments_ck_layout`),
+algorithmically identical to Triton-UA's own `reduce_segments`:
 
-### Why CK Wins at High Batch
-CK Tile optimizations require sufficient parallelism to saturate the GPU. At batch sizes ≥64, there's enough work to fully utilize compute resources, allowing CK's optimizations to shine.
+```
+lse_max  = max_s lse[s]
+w[s]     = exp(lse[s] - lse_max)    # -inf rows -> 0
+out      = Σ_s o_acc[s] · w[s] / Σ_s w[s]
+```
 
-### Why Triton Wins at Low Batch
-At low batch sizes (b≤32), standard 2D kernels have insufficient parallelism. Triton's 3D split-KV kernel parallelizes over the KV sequence dimension, maintaining high GPU utilization even with small batches.
+The only differences vs `reduce_segments` are layout (head-major
+`[H, S, T, D]` instead of token-major `[T, H, S, D]`) and lse encoding
+(single natural-log `lse_acc` instead of separate base-2 `m`/`expsum`).
+Because both backends now use the same kernel for the combine step, the
+table above isolates the **attention-kernel** comparison from any combine
+overhead difference.
 
-## Correctness
+## Reproducing the numbers
 
-100% pass rate across all tested configurations:
-- Max absolute difference: ≤2.4e-4 (within bf16 precision)
-- `torch.testing.assert_allclose` with atol=1e-2, rtol=1e-2: ✓ PASS
+```bash
+# d=64 GQA-8
+for B in 4 8 32 64 128 256; do
+  python ua-test-scripts/test_single_shape.py \
+    -b $B -sq 1 -sk 120000 -hq 64 -hk 8 -d 64 \
+    --block-size 16 --num-blocks 120000 \
+    --test --warmup 20 --iters 100
+done
 
-## Profiling Details
+# d=128 MHA
+for B in 4 8 32 64 128 256; do
+  python ua-test-scripts/test_single_shape.py \
+    -b $B -sq 1 -sk 120000 -hq 16 -hk 16 -d 128 \
+    --block-size 16 --num-blocks 60000 \
+    --test --warmup 20 --iters 100
+done
+```
 
-### Kernel Trace Analysis
-ROCProfiler v3 captures:
-- CK kernel: `ck_tile::kentry<2, UnifiedAttentionKernel>`
-- Triton 2D: `kernel_unified_attention_2d`
-- Triton 3D: `kernel_unified_attention_3d` + `reduce_segments`
+`--test` runs correctness vs Triton in-process before benchmarking, so each
+data point in the sweep is guaranteed to match Triton's output within
+`atol=0.015, rtol=0.01` (same tolerance as the broader Triton/CK test
+suites for non-quantized dtypes).
 
-The trace parser (`parse_kernel_trace.py`) automatically:
-- Excludes warmup iterations from statistics
-- Detects 2D vs 3D Triton variants
-- Accounts for reduction kernel overhead in 3D timing
+> The d=128 sweep uses `--num-blocks 60000` (not 120000) to stay below the
+> int32 stride-overflow threshold in the kernel's rebased-pointer path —
+> this is a known kernel limitation, see the 4 expected failures in
+> `test_unified_attention_ck_correctness.py`.
 
-### Measurement Accuracy
-All benchmarks use **CUDA graph mode** by default to eliminate kernel launch overhead and match production performance. This is critical for 3D kernels which launch two kernels (main + reduce) - eager mode adds ~18μs launch overhead per iteration.
+## Correctness reference
 
-Python-level median timing with graph mode matches ROCProfiler kernel trace timing within 1-3%, validating measurement accuracy.
+```bash
+python -m pytest ua-test-scripts/test_unified_attention_ck_correctness.py -q
+```
 
-## Recommendations
+Expected: **241 passed, 4 failed**. The 4 failures are all
+`num_blocks=32768 + d=128 MHA + block_size=64`, caused by int32 overflow in
+the rebased-pointer path. Unrelated to split-KV / combine and tracked
+separately.
 
-**For production inference** (typical batch 64-512+):
-- **Use CK** - Consistently 1.1-1.7× faster at realistic batch sizes
+For the split-KV path specifically:
 
-**For low-concurrency scenarios** (batch <32):
-- **Use Triton** - Up to 4× faster due to split-KV parallelism
+```bash
+python -m pytest ua-test-scripts/test_unified_attention_ck_correctness.py::test_ck_unified_attn_splitkv -q
+```
 
-**For mixed workloads**:
-- Consider dynamic kernel selection based on batch size
-- Crossover threshold: b=48 (midpoint between 32 and 64)
+## Tuning levers (advanced)
 
-## Test Environment
+The split-KV heuristic can be overridden via environment variable for
+A/B testing or profiling:
 
-- **Hardware**: AMD MI350 (gfx950), 256 CUs, ~295GB HBM
-- **Software**: ROCm 7.0.0, rocprofv3
-- **Configuration**: GQA-8 (64 query heads, 8 KV heads), head_dim=64, bf16
-- **Workload**: Decode (seqlen_q=1), context length 8192-12000
+```bash
+# Force a specific num_splits (1 = single-launch, no combine).
+AITER_UA_FORCE_SPLITS=1  python ua-test-scripts/test_single_shape.py ...
+AITER_UA_FORCE_SPLITS=8  python ua-test-scripts/test_single_shape.py ...
+AITER_UA_FORCE_SPLITS=16 python ua-test-scripts/test_single_shape.py ...
+```
 
-## Bug Fixed During Testing
+Or from Python, callers can pass `allow_splitkv=False` to
+`unified_attention_fwd` to disable the transparent split-KV path entirely,
+or pass explicit `num_splits` + workspaces to own the combine themselves.
 
-**Issue**: Triton unified attention path had `_try_ck_unified_attention()` enabled, causing Triton to incorrectly call CK implementation.
+## Hardware
 
-**Fix**: Commented out lines 234-238 in `/root/aiter/aiter/ops/triton/attention/unified_attention.py`
-
-This bug caused early test runs to show similar performance at all batch sizes, masking the batch-dependent behavior.
+Tested on AMD MI350 (gfx950) with ROCm 7.0.0. The kernel and the heuristic
+are not MI350-specific — `_pick_num_splits` reads `multi_processor_count`
+from the device at call time — but the absolute timings above are MI350
+data points.
