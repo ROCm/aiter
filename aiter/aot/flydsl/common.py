@@ -82,8 +82,12 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
 
 def _collect_aot_jobs_for(kind):
     """Helper: load DEFAULT_CSVS + parse_csv for the named kind and
-    return its job list. Imports are local so this runs cheaply on the
-    parent (no FlyDSL JIT pulled in until a worker runs)."""
+    return its job list. Note that importing .gemm / .moe here also
+    executes their module-level imports, which include FlyDSL itself
+    (e.g. ``flydsl.expr`` in gemm.py). Job collection is therefore not
+    truly free in the parent process — but it's identical to what the
+    pre-refactor ``run_aot_worker`` paid in each child, just shifted
+    once into the parent."""
     if kind == "moe":
         from .moe import DEFAULT_CSVS, parse_csv
     else:
@@ -179,6 +183,11 @@ def wait_aot(pool, futures):
                     ok_by_kind[kind] += 1
                 else:
                     fail_by_kind[kind] += 1
+                    # A None compile_time means compile_one_config returned
+                    # cleanly but didn't produce a kernel — still a
+                    # failure that the original wait_aot raised on.
+                    label = futures[future]
+                    errors.append(f"FlyDSL {label} compile failed (compile_time=None)")
             except Exception as worker_err:
                 # Crashes don't tell us which kind — best-effort attribute
                 # to whatever the label string starts with.
