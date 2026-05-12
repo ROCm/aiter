@@ -70,13 +70,15 @@ def hip_fused_sigmoid_gating_delta_rule_update(
     HV = v.shape[2]
 
     if scale is None:
-        scale = K ** -0.5
+        scale = K**-0.5
 
     N = B * T if cu_seqlens is None else len(cu_seqlens) - 1
 
     o = torch.empty_like(v)
 
-    dt_bias_bf16 = dt_bias.to(torch.bfloat16) if dt_bias.dtype != torch.bfloat16 else dt_bias
+    dt_bias_bf16 = (
+        dt_bias.to(torch.bfloat16) if dt_bias.dtype != torch.bfloat16 else dt_bias
+    )
 
     indices_int32 = (
         initial_state_indices.to(torch.int32)

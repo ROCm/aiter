@@ -49,7 +49,9 @@ def create_inputs(args: GDNDecodeArgs, pool_size: int | None = None):
     dt_bias.uniform_(1, 2)
     a_log = torch.randn((args.num_v_heads,), dtype=torch.float32, device="cuda")
     a_log.uniform_(0, 16)
-    indices = torch.randperm(pool_size, device="cuda")[: args.batch_size].to(torch.int32)
+    indices = torch.randperm(pool_size, device="cuda")[: args.batch_size].to(
+        torch.int32
+    )
     state = torch.randn(
         (pool_size, args.num_v_heads, args.head_k_dim, args.head_v_dim),
         dtype=torch.float32,
@@ -78,9 +80,7 @@ def torch_gdn_decode_reference(
     out: torch.Tensor,
 ) -> None:
     beta = b.sigmoid()
-    g = -a_log.float().exp() * F.softplus(
-        a.float() + dt_bias, beta=1.0, threshold=20.0
-    )
+    g = -a_log.float().exp() * F.softplus(a.float() + dt_bias, beta=1.0, threshold=20.0)
 
     if args.num_v_heads // args.num_k_heads > 1:
         repeat = args.num_v_heads // args.num_k_heads
@@ -97,7 +97,7 @@ def torch_gdn_decode_reference(
     beta = beta.transpose(1, 2).contiguous().to(torch.float32)
     g = g.transpose(1, 2).contiguous().to(torch.float32)
 
-    query = query * (args.head_k_dim ** -0.5)
+    query = query * (args.head_k_dim**-0.5)
     recurrent_state = state[indices.to(torch.long)]
 
     for token_idx in range(args.seq_len):
@@ -142,7 +142,7 @@ def hip_gdn_decode(
         b,
         state_vk,
         indices,
-        scale=float(args.head_k_dim ** -0.5),
+        scale=float(args.head_k_dim**-0.5),
         use_qk_l2norm_in_kernel=args.use_qk_l2norm,
     )
     out.copy_(result)
@@ -182,8 +182,7 @@ def validate_case(args: GDNDecodeArgs, mode: str) -> tuple[float, float]:
 
 def make_online_companion(args: GDNDecodeArgs):
     inproj_out = (
-        args.num_k_heads * args.head_k_dim * 2
-        + args.num_v_heads * args.head_v_dim
+        args.num_k_heads * args.head_k_dim * 2 + args.num_v_heads * args.head_v_dim
     )
     hidden = torch.randn(
         (args.batch_size, ONLINE_HIDDEN_DIM), dtype=args.dtype, device="cuda"
@@ -277,7 +276,9 @@ def parse_args():
 
 def main() -> None:
     cli_args = parse_args()
-    gpu = os.environ.get("HIP_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
+    gpu = os.environ.get(
+        "HIP_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    )
     print(f"=== HIP inline-ASM GDN decode | GPU {gpu} | mode={cli_args.mode} ===")
 
     all_passed = True
