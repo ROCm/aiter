@@ -45,7 +45,6 @@ from op_tests.triton_tests.attention.test_fav3_sage import (
     compare_accuracy,
 )
 
-
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -65,7 +64,13 @@ KernelName = Literal[
     "aiter_bf16",
 ]
 
-ALL_KERNELS: List[str] = ["sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8", "aiter_bf16"]
+ALL_KERNELS: List[str] = [
+    "sage_fp8",
+    "sage_mxfp4",
+    "fav3_fp8",
+    "aiter_fp8",
+    "aiter_bf16",
+]
 
 
 @dataclass
@@ -188,10 +193,7 @@ def load_block_mask_from_json(
                 raise ValueError(
                     f"num_q_blocks mismatch: inferred {m.num_q_blocks}, got {item['num_q_blocks']}"
                 )
-            if (
-                "num_kv_blocks" in item
-                and item["num_kv_blocks"] != m.num_kv_blocks
-            ):
+            if "num_kv_blocks" in item and item["num_kv_blocks"] != m.num_kv_blocks:
                 raise ValueError(
                     f"num_kv_blocks mismatch: inferred {m.num_kv_blocks}, got {item['num_kv_blocks']}"
                 )
@@ -315,7 +317,9 @@ def fp8_quantize(
     k: torch.Tensor,
     v: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     quant_dtype = aiter.dtypes.fp8
     q_quant, q_descale = aiter.per_tensor_quant(
         q,
@@ -400,14 +404,15 @@ def make_fav3_fp8_runner(
     )
 
 
-
 def make_torch_ref_runner(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool,
 ) -> Any:
-    return lambda: attention_ref(q, k, v, dropout_p=0.0, dropout_mask=None, causal=causal)
+    return lambda: attention_ref(
+        q, k, v, dropout_p=0.0, dropout_mask=None, causal=causal
+    )
 
 
 def make_kernel_runner(
@@ -417,7 +422,9 @@ def make_kernel_runner(
     v: torch.Tensor,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
 ) -> Any:
-    q_bshd, k_bshd, v_bshd = layout_preprocess(q, k, v, layout=args.layout, target_layout="bshd")
+    q_bshd, k_bshd, v_bshd = layout_preprocess(
+        q, k, v, layout=args.layout, target_layout="bshd"
+    )
     head_dim = q_bshd.shape[-1]
     softmax_scale = head_dim**-0.5
 
@@ -438,7 +445,9 @@ def make_kernel_runner(
         if block_r > q.shape[-1]:
             raise ValueError(f"block_r ({block_r}) must be <= head dim ({q.shape[-1]})")
 
-        r = create_hadamard_matrix(block_r, device=q.device, dtype=q.dtype) / (block_r**0.5)
+        r = create_hadamard_matrix(block_r, device=q.device, dtype=q.dtype) / (
+            block_r**0.5
+        )
 
         if args.e2e:
             return lambda: fav3_sage_mxfp4_wrapper(
@@ -514,7 +523,9 @@ def make_kernel_runner(
         )
 
     if args.kernel == "aiter_fp8":
-        q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = fp8_quantize(q_bshd, k_bshd, v_bshd)
+        q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = fp8_quantize(
+            q_bshd, k_bshd, v_bshd
+        )
 
         return lambda: flash_attn_fp8_pertensor_func(
             q_fp8,
@@ -553,14 +564,18 @@ def make_reference_output(
     v: torch.Tensor,
     block_attn_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    q_bshd, k_bshd, v_bshd = layout_preprocess(q, k, v, layout=args.layout, target_layout="bshd")
+    q_bshd, k_bshd, v_bshd = layout_preprocess(
+        q, k, v, layout=args.layout, target_layout="bshd"
+    )
     softmax_scale = q_bshd.shape[-1] ** -0.5
 
     ref = args.ref or "torch"
 
     if block_attn_mask is not None:
         if ref != "torch":
-            raise ValueError("Block sparse comparison currently supports --ref=torch only")
+            raise ValueError(
+                "Block sparse comparison currently supports --ref=torch only"
+            )
         block_m, block_n = kernel_block_sizes(args.kernel)
         ref_out = attention_ref_block_sparse(
             q_bshd,
@@ -637,7 +652,9 @@ def benchmark_single_case(
         compare_accuracy(current_primary, ref_primary)
         if args.kernel == "sage_mxfp4":
             # MXFP4 is numerically noisier than BF16/FP32 and needs looser checks.
-            check_attention_outputs(current_primary, ref_primary, fp8=True, atol=3.0e-1, rtol=2.0e-1)
+            check_attention_outputs(
+                current_primary, ref_primary, fp8=True, atol=3.0e-1, rtol=2.0e-1
+            )
         else:
             check_attention_outputs(current_primary, ref_primary, fp8=False)
 
@@ -698,7 +715,9 @@ def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> List[
         return result
 
     if args.metric == "sparseput" and not include_sparse_metric:
-        raise ValueError("sparse_throughput requires --block-sparsity or --block-mask-file")
+        raise ValueError(
+            "sparse_throughput requires --block-sparsity or --block-mask-file"
+        )
 
     if args.metric not in metric_map:
         raise ValueError(f"Unknown metric: {args.metric}")
@@ -826,7 +845,9 @@ def validate_args(args: argparse.Namespace) -> None:
         args.sk = args.sq
 
     if args.block_sparsity is not None and not (0.0 <= args.block_sparsity <= 1.0):
-        raise ValueError(f"--block-sparsity must be in [0,1], got {args.block_sparsity}")
+        raise ValueError(
+            f"--block-sparsity must be in [0,1], got {args.block_sparsity}"
+        )
 
     if args.block_sparsity is not None and args.block_mask_file:
         logger.info("Using --block-mask-file; ignoring --block-sparsity")
@@ -845,9 +866,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.kernel not in ("sage_mxfp4", "all") and (
         args.e2e or args.qsmooth or args.hadamard_rotate is False
     ):
-        logger.warning(
-            "MXFP4-specific flags are ignored unless --kernel=sage_mxfp4"
-        )
+        logger.warning("MXFP4-specific flags are ignored unless --kernel=sage_mxfp4")
 
 
 def run_benchmark_generated(
@@ -942,7 +961,9 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: List[LoadedMask]) -
 
         q = torch.randn((loaded.batch, HQ, n_ctx_q, D_HEAD), device=device, dtype=dtype)
         k = torch.randn((loaded.batch, HK, n_ctx_k, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((loaded.batch, HK, n_ctx_k, D_HEAD_V), device=device, dtype=dtype)
+        v = torch.randn(
+            (loaded.batch, HK, n_ctx_k, D_HEAD_V), device=device, dtype=dtype
+        )
         q.requires_grad = False
         k.requires_grad = False
         v.requires_grad = False
@@ -966,10 +987,14 @@ def run_block_sparse_repetitions(
     loaded_single_mask: Optional[LoadedMask],
 ) -> None:
     if loaded_single_mask is not None:
-        raise ValueError("--n-repetitions is only supported with random --block-sparsity")
+        raise ValueError(
+            "--n-repetitions is only supported with random --block-sparsity"
+        )
 
     if args.load_captured:
-        raise ValueError("--n-repetitions is supported only with generated random inputs")
+        raise ValueError(
+            "--n-repetitions is supported only with generated random inputs"
+        )
 
     dtype = arg_to_torch_dtype[args.dtype]
     device = "cuda"
@@ -1010,7 +1035,9 @@ def run_block_sparse_repetitions(
 
     for _ in range(args.n_repetitions):
         mask = (
-            torch.rand(shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device)
+            torch.rand(
+                shape.batch, shape.hq, num_q_blocks, num_kv_blocks, device=device
+            )
             > args.block_sparsity
         ).to(torch.bool)
         lut = block_attn_mask_to_ragged_lut(mask, return_none_if_dense=True)
@@ -1126,7 +1153,14 @@ def parse_args() -> argparse.Namespace:
         "--kernel",
         type=str,
         default="sage_fp8",
-        choices=["sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8", "aiter_bf16", "all"],
+        choices=[
+            "sage_fp8",
+            "sage_mxfp4",
+            "fav3_fp8",
+            "aiter_fp8",
+            "aiter_bf16",
+            "all",
+        ],
         help="Kernel implementation to benchmark. Use 'all' to compare all backends.",
     )
 
@@ -1138,7 +1172,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d", type=int, default=0, help="Q/K head dimension")
     parser.add_argument("--dv", type=int, default=0, help="V head dimension")
 
-    parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16", "fp32"])
+    parser.add_argument(
+        "--dtype", type=str, default="bf16", choices=["fp16", "bf16", "fp32"]
+    )
     parser.add_argument("--layout", type=str, default="bshd", choices=["bshd", "bhsd"])
     parser.add_argument("--causal", action="store_true", help="Enable causal attention")
 
@@ -1158,9 +1194,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("-o", action="store_true", help="Write Triton output CSV")
-    parser.add_argument("--print-vgpr", action="store_true", help="Print kernel VGPR usage")
+    parser.add_argument(
+        "--print-vgpr", action="store_true", help="Print kernel VGPR usage"
+    )
 
-    parser.add_argument("--compare-to-ref", action="store_true", help="Compare against reference")
+    parser.add_argument(
+        "--compare-to-ref", action="store_true", help="Compare against reference"
+    )
     parser.add_argument(
         "--ref",
         type=str,
@@ -1249,7 +1289,11 @@ def print_vgpr_from_bench(runner: Any) -> None:
         output_file = temp_file.name
 
     old_stdout, old_stderr = sys.stdout, sys.stderr
-    env_keys = ["AMDGCN_ENABLE_DUMP", "TRITON_ALWAYS_COMPILE", "TRITON_PRINT_AUTOTUNING"]
+    env_keys = [
+        "AMDGCN_ENABLE_DUMP",
+        "TRITON_ALWAYS_COMPILE",
+        "TRITON_PRINT_AUTOTUNING",
+    ]
     old_env = {k: os.environ.get(k) for k in env_keys}
 
     try:
@@ -1341,7 +1385,9 @@ def run_all_kernels(args: argparse.Namespace) -> None:
 
     args.kernel = saved_kernel
 
-    print(f"\nbench_sage --kernel=all  (b={args.b} hq={args.hq} sq={args.sq} sk={sk} d={d_head}):")
+    print(
+        f"\nbench_sage --kernel=all  (b={args.b} hq={args.hq} sq={args.sq} sk={sk} d={d_head}):"
+    )
     print(f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10}")
     print("-" * 38)
     for name, ms, tflops in rows:
