@@ -1,0 +1,183 @@
+[aiter INFO] 2026-05-12 12:38:01.119 - MainProcess:68511 - /app/aiter/aiter/jit/core.py:568 - get_module_custom_op
+import [module_aiter_core] under /app/aiter/aiter/jit/module_aiter_core.so
+[NB_OVERRIDE] compile_moe_gemm1 / compile_moe_gemm2 wrapped to inject num_buffers=2
+[aiter INFO] 2026-05-12 12:38:01.847 - MainProcess:68511 - /app/aiter/op_tests/test_moe_2stage.py:1105 - <module>
+moe_2stage: scanned 0 cases, recorded 0 results (skipped 0)
+[aiter INFO] 2026-05-12 12:38:01.851 - MainProcess:68511 - /app/aiter/op_tests/test_moe_2stage.py:1113 - <module>
+moe_2stage summary (markdown):
+
+
+========== DSV3_TP1_a4w4  M=1 dim=7168/2048 E=256 topk=8 AQ=torch.float4_e2m1fn_x2 WQ=torch.float4_e2m1fn_x2 act=ActivationType.Silu ==========
+[aiter INFO] 2026-05-12 12:38:01.852 - MainProcess:68511 - /app/aiter/aiter/test_common.py:280 - log_args
+
+calling test_fmoe(dtype                        = torch.bfloat16,
+                  token                        = 1,
+                  model_dim                    = 7168,
+                  inter_dim                    = 2048,
+                  E                            = 256,
+                  topk                         = 8,
+                  actType                      = ActivationType.Silu,
+                  qType                        = QuantType.per_1x32,
+                  AQDType                      = torch.float4_e2m1fn_x2,
+                  WQDType                      = torch.float4_e2m1fn_x2,
+                  use_g1u1                     = True,
+                  doweight_stage1              = False,
+                  strict_accuracy              = False,
+                  hidden_pad                   = 0,
+                  intermediate_pad             = 0,
+                  preshuffle                   = True)
+[aiter INFO] 2026-05-12 12:38:02.455 - MainProcess:68511 - /app/aiter/aiter/jit/core.py:568 - get_module_custom_op
+import [module_moe_sorting_opus] under /app/aiter/aiter/jit/module_moe_sorting_opus.so
+[aiter INFO] 2026-05-12 12:38:03.802 - MainProcess:68511 - /app/aiter/op_tests/test_moe_2stage.py:582 - test_fmoe
+[cuda.Event] moe fused us: median=1193.50 mean=1245.94 min=1167.62 max=1609.80 (warmup=5 iters=20 L2_flush=True graph=False)
+[aiter INFO] 2026-05-12 12:38:03.821 - MainProcess:68511 - /app/aiter/aiter/test_common.py:455 - checkAllclose
+ck_moe_2stages: 1193.50 us,     0.59 tflops,   156.85 GB/s (M=1,dim=7168/2048,E=256,topk=8,act=2.0B,w=0.5B)......(quant:torch.float4_e2m1fn_x2)[checkAllclose head] first 8 elements
+    a    : (1, 7168) torch.bfloat16
+           tensor([-0.2441, -0.1138, -0.8750, -0.1216, -0.6836, -0.4219, -0.5938,  0.1084],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : (1, 7168) torch.bfloat16
+           tensor([-0.5430, -0.5000, -0.9531, -1.1250, -0.2832, -1.1094, -0.3652, -1.1562],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.2988, 0.3862, 0.0781, 1.0034, 0.4004, 0.6875, 0.2285, 1.2646],
+       device='cuda:0')
+[aiter INFO] 2026-05-12 12:38:03.842 - MainProcess:68511 - /app/aiter/aiter/test_common.py:491 - checkAllclose
+ck_moe_2stages: 1193.50 us,     0.59 tflops,   156.85 GB/s (M=1,dim=7168/2048,E=256,topk=8,act=2.0B,w=0.5B)......(quant:torch.float4_e2m1fn_x2)[checkAllclose atol=0.25 rtol=0.5 [31mfailed![0m]
+    a    : torch.Size([1, 7168])
+           tensor([-0.1216, -0.6836,  0.1084, -0.0354, -0.5977, -0.3633, -0.2275,  1.1094],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([1, 7168])
+           tensor([-1.1250, -0.2832, -1.1562, -0.8711,  0.0439,  0.1387,  0.1211, -0.5938],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([1.0000, 0.4004, 1.2656, 0.8359, 0.6406, 0.5000, 0.3477, 1.7031],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter INFO] 2026-05-12 12:38:03.842 - MainProcess:68511 - /app/aiter/aiter/test_common.py:502 - checkAllclose
+-->max abs delta:2.78125, delta details: 36.3% (2603 of 7168) elements
+[aiter INFO] 2026-05-12 12:38:03.842 - MainProcess:68511 - /app/aiter/op_tests/test_moe_2stage.py:668 - test_fmoe
+[moe_2stage] logits_diff=0.377957 mismatch_ratio=0.3631
+[aiter WARNING] 2026-05-12 12:38:03.842 - MainProcess:68511 - /app/aiter/op_tests/test_moe_2stage.py:702 - test_fmoe
+[31m[FlyDSL gfx1250 FAIL][0m FlyDSL gfx1250 verdict: mismatch_ratio=0.3631 (thr=0.05), logits_diff=0.3780 (thr=0.25)
+[CASE] test_fmoe wall=2.0s ret={'dtype': torch.bfloat16, 'token': 1, 'model_dim': 7168, 'inter_dim': 2048, 'E': 256, 'topk': 8, 'actType': <ActivationType.Silu: 0>, 'qType': <QuantType.per_1x32: 3>, 'AQDType': torch.float4_e2m1fn_x2, 'WQDType': torch.float4_e2m1fn_x2, 'use_g1u1': True, 'doweight_stage1': False, 'strict_accuracy': False, 'hidden_pad': 0, 'intermediate_pad': 0, 'preshuffle': True, 'us': 1193.4969425201416, 'err': 0.3631417453289032}
+[TILE] stage1 meta={'in_dtype': 'fp4', 'out_dtype_str': 'bf16', 'tile_n': 128, 'tile_k': 128, 'block_m': 16, 'activation': 'Silu', 'num_buffers': 2}
+[TILE] stage2 meta={'in_dtype': 'fp4', 'out_dtype_str': 'bf16', 'tile_n': 128, 'tile_k': 128, 'block_m': 16, 'num_buffers': 2}
+[TILE] stage1 a=(1, 3584)/torch.float4_e2m1fn_x2 w1=(256, 4096, 3584)/torch.float4_e2m1fn_x2 w2=(256, 7168, 1024)/torch.float4_e2m1fn_x2 out=(1, 8, 2048)/torch.bfloat16
+[TILE] stage2 a=(1, 8, 1024)/torch.float4_e2m1fn_x2 w1=(256, 4096, 3584)/torch.float4_e2m1fn_x2 w2=(256, 7168, 1024)/torch.float4_e2m1fn_x2 out=(1, 7168)/torch.bfloat16
+[aiter INFO] 2026-05-12 12:38:04.197 - MainProcess:68511 - /app/aiter/aiter/test_common.py:105 - wrapper
+avg: 194.28109973669052 us/iter from cuda.Event
+/opt/venv/lib/python3.12/site-packages/torch/profiler/profiler.py:217: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W512 12:38:04.382377108 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[aiter INFO] 2026-05-12 12:38:04.216 - MainProcess:68511 - /app/aiter/aiter/test_common.py:348 - post_process_data
+abnormal data indices: {16, 3}
+[aiter INFO] 2026-05-12 12:38:04.216 - MainProcess:68511 - /app/aiter/aiter/test_common.py:350 - post_process_data
+abnormal data: 48.250999999999976
+[aiter INFO] 2026-05-12 12:38:04.216 - MainProcess:68511 - /app/aiter/aiter/test_common.py:350 - post_process_data
+abnormal data: 2.2220000000000084
+[aiter INFO] 2026-05-12 12:38:04.238 - MainProcess:68511 - /app/aiter/aiter/test_common.py:433 - get_trace_perf
+                                                                                                    name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
+0              void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat1... 19.0            0.0            725.1             38.2        CUDA            1
+1                                                                            moe_mxscale_stage1_single_0 19.0            0.0            909.2             47.9        CUDA            1
+2                                                                                  hipModuleLaunchKernel 19.0           55.0              0.0              0.0         CPU        68511
+3                                                                                            aten::fill_ 19.0          725.1              0.0              0.0         CPU        68511
+[avg us/iter]                                                                                        NaN  NaN           41.1             86.0              NaN         NaN          NaN
+[aiter INFO] 2026-05-12 12:38:04.243 - MainProcess:68511 - /app/aiter/aiter/test_common.py:105 - wrapper
+avg: 168.3223992586136 us/iter from cuda.Event
+[aiter INFO] 2026-05-12 12:38:04.256 - MainProcess:68511 - /app/aiter/aiter/test_common.py:348 - post_process_data
+abnormal data indices: {4, 15}
+[aiter INFO] 2026-05-12 12:38:04.256 - MainProcess:68511 - /app/aiter/aiter/test_common.py:350 - post_process_data
+abnormal data: 2.102000000000004
+[aiter INFO] 2026-05-12 12:38:04.256 - MainProcess:68511 - /app/aiter/aiter/test_common.py:350 - post_process_data
+abnormal data: 48.09100000000001
+[aiter INFO] 2026-05-12 12:38:04.276 - MainProcess:68511 - /app/aiter/aiter/test_common.py:433 - get_trace_perf
+                                                                                                    name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
+0                                                                            moe_mxscale_stage2_single_0 19.0            0.0            512.0             26.9        CUDA            1
+1              void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat1... 19.0            0.0            848.2             44.6        CUDA            1
+2                                                                                            aten::fill_ 19.0          848.2              0.0              0.0         CPU        68511
+[avg us/iter]                                                                                        NaN  NaN           44.6             71.6              NaN         NaN          NaN
+[PERFTEST] DSV3_TP1_a4w4 M=1: fused=1193.50us | stage1(run_perftest)=86.02us  stage2(run_perftest)=71.59us | stage1(cuda.Event median)=143.85us  stage2(cuda.Event median)=138.21us | sum_cuda=282.06us  non-GEMM=911.44us
+
+========== DSV3_TP1_a4w4  M=64 dim=7168/2048 E=256 topk=8 AQ=torch.float4_e2m1fn_x2 WQ=torch.float4_e2m1fn_x2 act=ActivationType.Silu ==========
+[aiter INFO] 2026-05-12 12:38:04.284 - MainProcess:68511 - /app/aiter/aiter/test_common.py:280 - log_args
+
+calling test_fmoe(dtype                        = torch.bfloat16,
+                  token                        = 64,
+                  model_dim                    = 7168,
+                  inter_dim                    = 2048,
+                  E                            = 256,
+                  topk                         = 8,
+                  actType                      = ActivationType.Silu,
+                  qType                        = QuantType.per_1x32,
+                  AQDType                      = torch.float4_e2m1fn_x2,
+                  WQDType                      = torch.float4_e2m1fn_x2,
+                  use_g1u1                     = True,
+                  doweight_stage1              = False,
+                  strict_accuracy              = False,
+                  hidden_pad                   = 0,
+                  intermediate_pad             = 0,
+                  preshuffle                   = True)
+[aiter INFO] 2026-05-12 12:39:01.388 - MainProcess:68511 - /app/aiter/op_tests/test_moe_2stage.py:582 - test_fmoe
+[cuda.Event] moe fused us: median=1321.69 mean=1344.91 min=1308.39 max=1778.09 (warmup=5 iters=20 L2_flush=True graph=False)
+[aiter INFO] 2026-05-12 12:39:01.393 - MainProcess:68511 - /app/aiter/aiter/test_common.py:455 - checkAllclose
+ck_moe_2stages: 1321.69 us,    34.12 tflops,  4533.07 GB/s (M=64,dim=7168/2048,E=256,topk=8,act=2.0B,w=0.5B)......(quant:torch.float4_e2m1fn_x2)[checkAllclose head] first 8 elements
+    a    : (64, 7168) torch.bfloat16
+           tensor([ 0.2295,  0.9805, -0.2578,  0.3203, -0.2207, -0.1719, -0.3594, -0.2832],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : (64, 7168) torch.bfloat16
+           tensor([ 0.7852,  1.2109, -2.0469, -0.7031, -1.4844,  0.2139, -0.1011, -0.3555],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.5557, 0.2305, 1.7891, 1.0234, 1.2637, 0.3857, 0.2583, 0.0723],
+       device='cuda:0')
+[aiter INFO] 2026-05-12 12:39:01.398 - MainProcess:68511 - /app/aiter/aiter/test_common.py:491 - checkAllclose
+ck_moe_2stages: 1321.69 us,    34.12 tflops,  4533.07 GB/s (M=64,dim=7168/2048,E=256,topk=8,act=2.0B,w=0.5B)......(quant:torch.float4_e2m1fn_x2)[checkAllclose atol=0.25 rtol=0.5 [31mfailed![0m]
+    a    : torch.Size([64, 7168])
+           tensor([-0.2578,  0.3203, -0.2207, -0.1719, -1.3281, -0.2324, -0.5352,  0.8008],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([64, 7168])
+           tensor([-2.0469, -0.7031, -1.4844,  0.2139, -0.7109,  0.1123,  0.4570,  2.5938],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([1.7891, 1.0234, 1.2656, 0.3867, 0.6172, 0.3438, 0.9922, 1.7969],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter INFO] 2026-05-12 12:39:01.398 - MainProcess:68511 - /app/aiter/aiter/test_common.py:502 - checkAllclose
+-->max abs delta:5.40625, delta details: 36.7% (168497 of 458752) elements
+[aiter INFO] 2026-05-12 12:39:01.398 - MainProcess:68511 - /app/aiter/op_tests/test_moe_2stage.py:668 - test_fmoe
+[moe_2stage] logits_diff=0.375413 mismatch_ratio=0.3673
+[aiter WARNING] 2026-05-12 12:39:01.398 - MainProcess:68511 - /app/aiter/op_tests/test_moe_2stage.py:702 - test_fmoe
+[31m[FlyDSL gfx1250 FAIL][0m FlyDSL gfx1250 verdict: mismatch_ratio=0.3673 (thr=0.05), logits_diff=0.3754 (thr=0.25)
+[CASE] test_fmoe wall=57.1s ret={'dtype': torch.bfloat16, 'token': 64, 'model_dim': 7168, 'inter_dim': 2048, 'E': 256, 'topk': 8, 'actType': <ActivationType.Silu: 0>, 'qType': <QuantType.per_1x32: 3>, 'AQDType': torch.float4_e2m1fn_x2, 'WQDType': torch.float4_e2m1fn_x2, 'use_g1u1': True, 'doweight_stage1': False, 'strict_accuracy': False, 'hidden_pad': 0, 'intermediate_pad': 0, 'preshuffle': True, 'us': 1321.6869831085205, 'err': 0.3672943413257599}
+[TILE] stage1 meta={'in_dtype': 'fp4', 'out_dtype_str': 'bf16', 'tile_n': 128, 'tile_k': 128, 'block_m': 16, 'activation': 'Silu', 'num_buffers': 2}
+[TILE] stage2 meta={'in_dtype': 'fp4', 'out_dtype_str': 'bf16', 'tile_n': 128, 'tile_k': 128, 'block_m': 16, 'num_buffers': 2}
+[TILE] stage1 a=(64, 3584)/torch.float4_e2m1fn_x2 w1=(256, 4096, 3584)/torch.float4_e2m1fn_x2 w2=(256, 7168, 1024)/torch.float4_e2m1fn_x2 out=(64, 8, 2048)/torch.bfloat16
+[TILE] stage2 a=(64, 8, 1024)/torch.float4_e2m1fn_x2 w1=(256, 4096, 3584)/torch.float4_e2m1fn_x2 w2=(256, 7168, 1024)/torch.float4_e2m1fn_x2 out=(64, 7168)/torch.bfloat16
+[aiter INFO] 2026-05-12 12:39:01.421 - MainProcess:68511 - /app/aiter/aiter/test_common.py:105 - wrapper
+avg: 741.8303936719894 us/iter from cuda.Event
+[aiter INFO] 2026-05-12 12:39:01.447 - MainProcess:68511 - /app/aiter/aiter/test_common.py:348 - post_process_data
+abnormal data indices: {16, 4}
+[aiter INFO] 2026-05-12 12:39:01.447 - MainProcess:68511 - /app/aiter/aiter/test_common.py:350 - post_process_data
+abnormal data: 638.92
+[aiter INFO] 2026-05-12 12:39:01.447 - MainProcess:68511 - /app/aiter/aiter/test_common.py:350 - post_process_data
+abnormal data: 34.821000000000026
+[aiter INFO] 2026-05-12 12:39:01.467 - MainProcess:68511 - /app/aiter/aiter/test_common.py:433 - get_trace_perf
+                                                                                                    name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
+0              void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat1... 19.0            0.0         12,697.5            668.3        CUDA            1
+1                                                                            moe_mxscale_stage1_single_0 19.0            0.0         24,989.8          1,315.3        CUDA            1
+2                                                                                            aten::fill_ 19.0       12,697.5              0.0              0.0         CPU        68511
+[avg us/iter]                                                                                        NaN  NaN          668.3          1,983.5              NaN         NaN          NaN
+[aiter INFO] 2026-05-12 12:39:01.477 - MainProcess:68511 - /app/aiter/aiter/test_common.py:105 - wrapper
+avg: 349.6525511145592 us/iter from cuda.Event
+[aiter INFO] 2026-05-12 12:39:01.493 - MainProcess:68511 - /app/aiter/aiter/test_common.py:348 - post_process_data
+abnormal data indices: {4, 15}
+[aiter INFO] 2026-05-12 12:39:01.493 - MainProcess:68511 - /app/aiter/aiter/test_common.py:350 - post_process_data
+abnormal data: 35.783000000000015
+[aiter INFO] 2026-05-12 12:39:01.493 - MainProcess:68511 - /app/aiter/aiter/test_common.py:350 - post_process_data
+abnormal data: 243.06099999999998
+[aiter INFO] 2026-05-12 12:39:01.513 - MainProcess:68511 - /app/aiter/aiter/test_common.py:433 - get_trace_perf
+                                                                                                    name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
+0              void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat1... 19.0            0.0          4,854.9            255.5        CUDA            1
+1                                                                            moe_mxscale_stage2_single_0 19.0            0.0          9,408.3            495.2        CUDA            1
+2                                                                                            aten::fill_ 19.0        4,854.9              0.0              0.0         CPU        68511
+[avg us/iter]                                                                                        NaN  NaN          255.5            750.7              NaN         NaN          NaN
+[PERFTEST] DSV3_TP1_a4w4 M=64: fused=1321.69us | stage1(run_perftest)=1983.54us  stage2(run_perftest)=750.70us | stage1(cuda.Event median)=674.56us  stage2(cuda.Event median)=255.54us | sum_cuda=930.10us  non-GEMM=391.58us
+[DONE] wrote /tmp/aiter_bench_v5/dsv3_tp1.json (2 rows)

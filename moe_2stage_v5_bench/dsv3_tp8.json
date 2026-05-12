@@ -1,0 +1,82 @@
+[
+  {
+    "tag": "DSV3_TP8_a4w4",
+    "token": 1,
+    "model_dim": 7168,
+    "inter_dim": 256,
+    "expert": 256,
+    "topk": 8,
+    "fused_us": 1147.3489999771118,
+    "stage1_us_perftest": 83.07394736842109,
+    "stage2_us_perftest": 66.46157894736835,
+    "stage1_cuda": {
+      "median": 142.81299710273743,
+      "mean": 144.9998989701271,
+      "min": 138.8469934463501,
+      "max": 186.1169934272766
+    },
+    "stage2_cuda": {
+      "median": 134.63999330997467,
+      "mean": 134.22984927892685,
+      "min": 118.3760017156601,
+      "max": 143.41400563716888
+    },
+    "stage1_meta": {
+      "in_dtype": "fp4",
+      "out_dtype_str": "bf16",
+      "tile_n": 128,
+      "tile_k": 128,
+      "block_m": 16,
+      "activation": "Silu",
+      "num_buffers": 2
+    },
+    "stage2_meta": {
+      "in_dtype": "fp4",
+      "out_dtype_str": "bf16",
+      "tile_n": 128,
+      "tile_k": 128,
+      "block_m": 16,
+      "num_buffers": 2
+    }
+  },
+  {
+    "tag": "DSV3_TP8_a4w4",
+    "token": 64,
+    "model_dim": 7168,
+    "inter_dim": 256,
+    "expert": 256,
+    "topk": 8,
+    "fused_us": 1161.4090204238892,
+    "stage1_us_perftest": 155.22694736842104,
+    "stage2_us_perftest": 80.80900000000008,
+    "stage1_cuda": {
+      "median": 155.3110033273697,
+      "mean": 145.94335034489632,
+      "min": 109.48299616575241,
+      "max": 201.22000575065613
+    },
+    "stage2_cuda": {
+      "median": 139.6079957485199,
+      "mean": 140.93580022454262,
+      "min": 135.00100374221802,
+      "max": 179.50700223445892
+    },
+    "stage1_meta": {
+      "in_dtype": "fp4",
+      "out_dtype_str": "bf16",
+      "tile_n": 128,
+      "tile_k": 128,
+      "block_m": 16,
+      "activation": "Silu",
+      "num_buffers": 2
+    },
+    "stage2_meta": {
+      "in_dtype": "fp4",
+      "out_dtype_str": "bf16",
+      "tile_n": 128,
+      "tile_k": 128,
+      "block_m": 16,
+      "num_buffers": 2
+    }
+  }
+]

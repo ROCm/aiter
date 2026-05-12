@@ -10,6 +10,6 @@ export PYTHONPATH=/workspace/ffm/triton/python:/workspace/ffm/FlyDSL:${PYTHONPAT
 # Note: topk (-k) must be <= number of experts (-e), otherwise topk_softmax errors.
 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=0 python op_tests/test_moe_2stage.py -t 1 -dim 256,256 -e 1 -k 1 -q 4 --no-flydsl-csv -hip 0,0
 
-ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=0 python op_tests/test_moe_2stage.py -t 1 -dim 256,256 -e 2 -k 2 -q 4 --no-flydsl-csv -hip 0,0
+AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py -t 64 -dim 7168,2048 -e 256 -k 8 -q 4 --no-flydsl-csv -hip 0,0
 
 # ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=0 python op_tests/test_moe_2stage.py -t 1 -dim 256,1024 -e 8 -k 2 -q 4 --no-flydsl-csv -hip 0,0

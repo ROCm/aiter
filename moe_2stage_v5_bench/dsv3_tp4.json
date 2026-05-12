@@ -1,0 +1,82 @@
+[
+  {
+    "tag": "DSV3_TP4_a4w4",
+    "token": 1,
+    "model_dim": 7168,
+    "inter_dim": 512,
+    "expert": 256,
+    "topk": 8,
+    "fused_us": 1137.3330354690552,
+    "stage1_us_perftest": 100.69115789473682,
+    "stage2_us_perftest": 78.9614210526315,
+    "stage1_cuda": {
+      "median": 144.6949988603592,
+      "mean": 145.8509996533394,
+      "min": 140.1289999485016,
+      "max": 162.6019924879074
+    },
+    "stage2_cuda": {
+      "median": 135.36199927330017,
+      "mean": 133.56690108776093,
+      "min": 79.75900173187256,
+      "max": 155.67199885845184
+    },
+    "stage1_meta": {
+      "in_dtype": "fp4",
+      "out_dtype_str": "bf16",
+      "tile_n": 128,
+      "tile_k": 128,
+      "block_m": 16,
+      "activation": "Silu",
+      "num_buffers": 2
+    },
+    "stage2_meta": {
+      "in_dtype": "fp4",
+      "out_dtype_str": "bf16",
+      "tile_n": 128,
+      "tile_k": 128,
+      "block_m": 16,
+      "num_buffers": 2
+    }
+  },
+  {
+    "tag": "DSV3_TP4_a4w4",
+    "token": 64,
+    "model_dim": 7168,
+    "inter_dim": 512,
+    "expert": 256,
+    "topk": 8,
+    "fused_us": 1183.4419965744019,
+    "stage1_us_perftest": 515.3131052631579,
+    "stage2_us_perftest": 109.66973684210525,
+    "stage1_cuda": {
+      "median": 172.7370023727417,
+      "mean": 185.09155064821243,
+      "min": 170.2529937028885,
+      "max": 303.9329946041107
+    },
+    "stage2_cuda": {
+      "median": 141.1300003528595,
+      "mean": 136.39859780669212,
+      "min": 124.9459981918335,
+      "max": 145.9379941225052
+    },
+    "stage1_meta": {
+      "in_dtype": "fp4",
+      "out_dtype_str": "bf16",
+      "tile_n": 128,
+      "tile_k": 128,
+      "block_m": 16,
+      "activation": "Silu",
+      "num_buffers": 2
+    },
+    "stage2_meta": {
+      "in_dtype": "fp4",
+      "out_dtype_str": "bf16",
+      "tile_n": 128,
+      "tile_k": 128,
+      "block_m": 16,
+      "num_buffers": 2
+    }
+  }
+]
