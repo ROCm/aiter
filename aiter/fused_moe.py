@@ -1438,13 +1438,24 @@ def get_2stage_cfgs(
             stage2_tile_n = 128 if stage2_is_mxscale else 64
             stage2_tile_k = 128 if stage2_is_mxscale else 64
 
-            logger.info(
-                f"[fused_moe] gfx1250 FlyDSL dispatch: format={gfx1250_fmt}, "
-                f"{'mxscale' if is_mxscale else 'wmma'} kernel"
+            # Demoted to DEBUG (was INFO) -- per-call host log was adding
+            # 50-200us of stdout overhead per fused_moe(), which dominated
+            # measured fused time for small-M / TP4-TP8 cases where the
+            # GEMM itself is only a few hundred us.  %-style formatting so
+            # the args are not evaluated when DEBUG is disabled.
+            logger.debug(
+                "[fused_moe] gfx1250 FlyDSL dispatch: format=%s, %s kernel",
+                gfx1250_fmt,
+                "mxscale" if is_mxscale else "wmma",
             )
-            logger.info(
-                f"[fused_moe] input shapes: token={token}, model_dim={model_dim}, "
-                f"inter_dim={inter_dim}, expert={expert}, topk={topk}"
+            logger.debug(
+                "[fused_moe] input shapes: token=%s, model_dim=%s, "
+                "inter_dim=%s, expert=%s, topk=%s",
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
             )
             
             # ``has_bias=True`` lets ``fused_moe_2stages`` forward
