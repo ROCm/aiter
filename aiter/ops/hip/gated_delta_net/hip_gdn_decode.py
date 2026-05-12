@@ -16,6 +16,7 @@ pool_idx sorting for L2-cache-friendly state access is handled inside
 the C++ extension (configurable via HIP_GDN_SORT_IDX_BS env var).
 """
 
+import os
 from typing import Optional
 
 import torch
@@ -23,16 +24,39 @@ import torch
 _ext = None
 
 
+def _normalize_rocm_arch(arch: Optional[str]) -> Optional[str]:
+    if not arch:
+        return None
+    arch = arch.split(";")[0].strip()
+    if not arch:
+        return None
+    return arch.split(":")[0].strip()
+
+
+def _detect_rocm_arch() -> str:
+    env_arch = _normalize_rocm_arch(
+        os.environ.get("GPU_ARCHS") or os.environ.get("AITER_HIP_GDN_ARCH")
+    )
+    if env_arch:
+        return env_arch
+
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        device_arch = _normalize_rocm_arch(getattr(props, "gcnArchName", None))
+        if device_arch:
+            return device_arch
+
+    return "gfx942"
+
+
 def _load_extension():
     global _ext
     if _ext is not None:
         return _ext
     from torch.utils.cpp_extension import load
-    import os
 
     src_dir = os.path.dirname(os.path.abspath(__file__))
-    gpu_archs = os.environ.get("GPU_ARCHS") or os.environ.get("AITER_HIP_GDN_ARCH")
-    arch = (gpu_archs.split(";")[0] if gpu_archs else "gfx942").strip()
+    arch = _detect_rocm_arch()
     _ext = load(
         name="hip_gdn_decode_ext",
         sources=[
