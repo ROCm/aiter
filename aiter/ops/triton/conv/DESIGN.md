@@ -108,7 +108,7 @@ intermediate `M[36, T, K_out]` tensor.
 **The fused path is opt-in, not router-selected.** `_select_3x3_method` only
 ever returns `winograd_f4x3` or `winograd_f4x3_cblocked` — both the standard
 3-kernel pipeline. The fused variant is reachable explicitly via
-`--method winograd_f4x3_fused` in the bench harness (`op_tests/triton_tests/conv/_registry.py`)
+`--method winograd_f4x3_fused` in the bench tool (`op_tests/op_benchmarks/triton/bench_conv2d.py`)
 or by importing `conv2d_winograd_f4x3_fused` directly. It wins on a narrow
 band of small/medium VAE shapes but hits register pressure at the larger
 ResNet 3×3 tile shapes, so it isn't worth a special-case branch in the
@@ -616,15 +616,15 @@ rare. 6× catches the long tail without flagging healthy fp16 ordering
 noise.
 
 If a new kernel needs the Winograd bump, mark it `is_winograd=True` in
-`op_tests/triton_tests/conv/_registry.py`; `suite.py` will pick the right
-tolerance automatically.
+`op_tests/triton_tests/conv/_helpers.py` (`METHOD_REGISTRY`); the
+`_get_tolerances` dispatch picks the right tolerance automatically.
 
 ---
 
 ## 9. Method registry
 
-`op_tests/triton_tests/conv/_registry.py` is the **single source of truth**
-for kernel dispatch. Adding a new method takes one entry:
+`op_tests/triton_tests/conv/_helpers.py` (`METHOD_REGISTRY`) is the **single source of truth**
+for kernel dispatch in the test harness. Adding a new method takes one entry:
 
 ```python
 METHOD_REGISTRY = {
@@ -640,13 +640,12 @@ METHOD_REGISTRY = {
 |---|---|
 | `kernel_fn` | The public `conv2d_*` wrapper (not the raw kernel) — handles repack and grid setup, or routes to a specialized variant (`conv2d_nchw` does smart routing). |
 | `guard_fn(R, S, stride, dilation, C)` | Returns `True` if the method is applicable. `None` means "always". |
-| `is_winograd` | Selects the 6× tolerance bump in `op_tests/triton_tests/conv/suite.py`. |
-| `bench_tag` | Suffix added to the per-layer bench row, e.g. `"[cblocked]"`. |
-| `short_name` | Column header in the comparison table when `--method all`. |
+| `is_winograd` | Selects the 6× tolerance bump in `_helpers._get_tolerances`. |
+| `bench_tag` | Suffix added to the per-test result name, e.g. `"[cblocked]"`. |
+| `short_name` | Reserved for future bench output; not used by `bench_conv2d.py` today. |
 
-Wiring downstream of the registry — `op_tests/triton_tests/conv/cli.py --method all`, the per-layer
-table, the comparison summary, the tolerance dispatch — is automatic. You
-do not edit any of those.
+Wiring downstream of the registry — the parametrized pytest tests, the
+tolerance dispatch — is automatic. You do not edit any of those.
 
 ---
 
@@ -670,22 +669,26 @@ Concretely, to add (say) a `winograd_f6x3` variant:
    ref to the source tensor in the cached value. For input-side prepacks
    (rare — only `_PACK_CACHE_CBLOCKED` does this today), use a
    single-entry plain dict cleared per-call instead — see §7.
-5. **Register** in `op_tests/triton_tests/conv/_registry.py`. Set
+5. **Register** in `op_tests/triton_tests/conv/_helpers.py` (`METHOD_REGISTRY`). Set
    `is_winograd=True` if the kernel uses Winograd-style transforms
    (you'll need the 6× tolerance bump). If the kernel uses a different
    Winograd tile (e.g. F(6,3)), also add a new `variant=` branch in
    `_utils._winograd_tolerances` and route to it from
-   `op_tests/triton_tests/conv/suite._get_tolerances` — F(4,3)'s 6× bump
-   is calibrated specifically for that tile size.
+   `_helpers._get_tolerances` — F(4,3)'s 6× bump
+   is calibrated specifically for that tile size. Also add the kernel to
+   `op_tests/op_benchmarks/triton/bench_conv2d.py`'s `METHODS` dict so
+   `--method <new_name>` works.
 6. **Optionally route** from `_select_3x3_method` if the new kernel
    should be auto-selected. Update the heuristic comment block with the
    shape range where it wins. If you do route from `_select_3x3_method`,
    also add a `_last_triton_kernel = "..."` line in the matching branch
    of `conv2d_nchw` / `conv2d_nhwc` so the bench labels the row
    correctly.
-7. **Run the suite** — the new method will appear automatically in
-   `python -m op_tests.triton_tests.conv.cli --method all --benchmark
-   --test-mode models --model-name resnet50` and in the comparison table.
+7. **Run the suite** — `pytest op_tests/triton_tests/conv/` parametrizes
+   `test_no_bias` and `test_activations` over every entry in
+   `METHOD_REGISTRY`, so the new method gets correctness coverage
+   automatically. Bench it via
+   `python -m op_tests.op_benchmarks.triton.bench_conv2d --method <new_name> ...`.
 
 ---
 
