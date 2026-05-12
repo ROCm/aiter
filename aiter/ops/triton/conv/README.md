@@ -52,13 +52,16 @@ To measure on your stack:
 
 ```bash
 python -m op_tests.op_benchmarks.triton.bench_conv2d \
-    --model-name <resnet50|sd35_vae|flux2_vae> \
-    --layout both --dtype <fp16|bf16> \
-    [--model-path <path>]   # required for sd35_vae / flux2_vae
+    --model <resnet50|"stable-diffusion-3.5-medium"|"FLUX.2"> \
+    --dtype <fp16|bf16> \
+    [--miopen-solvers]   # opt-in; ~60-120s upfront subprocess
 ```
 
-The bench harness produces per-layer tables with kernel timings, shapes,
-the routing decision per layer, and aggregate TFLOPS for both backends.
+The bench harness produces three box-drawn tables: LAYER-BY-LAYER (per-layer
+Triton vs MIOpen TFLOPS, Triton kernel name, optionally MIOpen solver,
+kernel+repack column for shapes that prepack), MIOpen SOLVER SUMMARY (only
+with `--miopen-solvers`), and OVERALL PERFORMANCE (mean/median/aggregate
+TFLOPS, total time, layer wins, correctness).
 
 > **Note on TFLOPS**: numbers are *direct-convolution-equivalent* throughput
 > (the standard convention used by cuDNN, MIOpen, and the Winograd
@@ -125,65 +128,66 @@ to reproduce and inspect the generated images.
 
 ---
 
-## Reproducing the benchmarks
+## Reproducing the tests and benchmarks
 
-The harness lives at `op_tests/triton_tests/conv/`. Run from the AITER
-repo root.
+Run from the AITER repo root (`/app/aiter` in this tree, or `PYTHONPATH=/app/aiter`).
 
-### Correctness
-
-By test mode:
+### Correctness (CDNA CI runs this)
 
 ```bash
-python -m op_tests.triton_tests.conv.cli --test-mode edge          # edge cases (default)
-python -m op_tests.triton_tests.conv.cli --test-mode random --num-random 200
-python -m op_tests.triton_tests.conv.cli --test-mode stability     # stability check
-python -m op_tests.triton_tests.conv.cli --test-mode activations   # relu/relu6/gelu fusion
-python -m op_tests.triton_tests.conv.cli --test-mode models --model-name resnet50
-python -m op_tests.triton_tests.conv.cli --test-mode all           # everything above
+pytest op_tests/triton_tests/conv/                                # full matrix, 74 tests
+pytest op_tests/triton_tests/conv/ -k "no_bias and fp16_nchw"     # subset
+pytest op_tests/triton_tests/conv/ -k "test_edge"                 # one test family
 ```
 
-Cross-axis flags (combine with any mode):
-
-```
---dtype {fp16,bf16}                           # default fp16
---layout {nchw,nhwc,both}                     # default nchw
---method {default,cblocked,winograd_f4x3,winograd_f4x3_fused,winograd_f4x3_cblocked,all}
-```
-
-Pytest entry (parametrized over fp16/bf16 × nchw/nhwc):
-
-```bash
-pytest op_tests/triton_tests/conv/test_pytest.py                              # full matrix
-pytest op_tests/triton_tests/conv/test_pytest.py -k "edge and fp16_nchw" -s   # single case
-```
+Tests are parametrized over `(dtype, layout, method)`. Every kernel in
+`_helpers.ORDERED_METHODS` is exercised against fp16 and bf16 on NCHW.
+NHWC is single-dispatch (only `conv2d_nhwc`), so each NHWC test runs once
+per dtype.
 
 ### Benchmark
 
-Per-layer TFLOPS table vs PyTorch / MIOpen:
+Three modes, all in `bench_conv2d.py`.
+
+**Single shape** (one parseable result line — for ad-hoc measurements):
 
 ```bash
-python -m op_tests.op_benchmarks.triton.bench_conv2d --model-name resnet50 --num-layers 53
-python -m op_tests.op_benchmarks.triton.bench_conv2d --model-name sd35_vae \
-    --model-path <path to model>/stable-diffusion-3.5-medium
-python -m op_tests.op_benchmarks.triton.bench_conv2d --model-name flux2_vae \
-    --model-path <path to model>/FLUX.2-klein-9B
+python -m op_tests.op_benchmarks.triton.bench_conv2d \
+    --N 1 --C 64 --H 56 --W 56 --K 64 --R 3 --S 3 --pad-h 1 --pad-w 1
 ```
 
-3×3 method comparison table (all methods side-by-side):
+**Built-in 12-shape sweep** (no model required, three box-drawn tables):
 
 ```bash
-python -m op_tests.op_benchmarks.triton.bench_conv2d --method all --model-name resnet50
+python -m op_tests.op_benchmarks.triton.bench_conv2d --dtype fp16
 ```
 
-Bench-specific flags:
+**Real-model sweep** (reads shapes from `model_shapes.json`):
+
+```bash
+python -m op_tests.op_benchmarks.triton.bench_conv2d --model resnet50
+python -m op_tests.op_benchmarks.triton.bench_conv2d --model "FLUX.2" --miopen-solvers
+```
+
+Cross-axis flags:
 
 ```
---num-layers N                                # cap layers (default 53 for bench)
---batch-size N                                # default 1 (all models)
---height H --width W                          # override input shape; omit = real per-layer shapes
---model-path PATH                             # required for sd_unet / sd35_vae / flux2_vae
---pretrained                                  # use real pretrained weights (all models). Default: random init
+--dtype {fp16,bf16}                           # default fp16
+--layout {nchw,nhwc}                          # default nchw
+--method {auto,default,cblocked,nhwc,winograd_f4x3,winograd_f4x3_fused,winograd_f4x3_cblocked}
+--metric {time,throughput}                    # default throughput
+--no-bias                                     # bench the bias=None code path
+--miopen-solvers                              # detect MIOpen solver names (sweep mode; ~60-120s subprocess)
+--show-kernel-name                            # include routed kernel name in single-shape output
+```
+
+Real-model shapes are pre-extracted (no torchvision/diffusers needed at
+bench time). To add a new model, run `extract_conv_shapes.py` once and
+merge its JSON output into `model_shapes.json`:
+
+```bash
+python -m op_tests.op_benchmarks.triton.model_benchmarking_tool.extract_conv_shapes \
+    --model resnet50    # or sd35_vae / flux2_vae with --model-path
 ```
 
 Tested on ROCm 7.2 / PyTorch `2.9.1+gitff65f5b` / Triton 3.7 (commit `23f4e522d`).
@@ -213,6 +217,13 @@ aiter/ops/triton/conv/                Kernel library
 aiter/ops/triton/_triton_kernels/conv/   @triton.jit kernels
   (1x1, 3x3 cblocked, 3x3 NHWC, general, 5 Winograd kernels)
 
-op_tests/triton_tests/conv/           Correctness suite + benchmark driver
-op_tests/op_benchmarks/triton/bench_conv2d.py   Bench shim
+op_tests/triton_tests/conv/           Pytest unit tests (CDNA CI runs this)
+  test_conv2d.py                      The only collected test file
+  _helpers.py                         TestSuite, registry, shape generators
+
+op_tests/op_benchmarks/triton/
+  bench_conv2d.py                     Self-contained bench tool (single + sweep)
+  model_benchmarking_tool/
+    extract_conv_shapes.py            One-time offline shape extraction
+    model_shapes.json                 Pre-extracted conv shapes (resnet50, SD3.5, FLUX2)
 ```
