@@ -330,7 +330,7 @@ def compile_moe_gemm1(
     module_name = (
         f"mfma_moe1_{g1u_tag}_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}"
-        f"_abi4"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
+        f"_abi5_csh16"  # keep MFMA16 CShuffle isolated from MFMA32 epilogue scheduling
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────

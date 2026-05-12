@@ -164,11 +164,15 @@ def c_shuffle_epilog(
 
     tile_n_idx = arith.constant(int(tile_n), index=True)
     n_tile_base_v = n_tile_base
-    write_lane_mod = lane_mod_32 if int(mfma_m) == 32 else lane_mod_16
-    write_lane_div = lane_div_32 if int(mfma_m) == 32 else lane_div_16
-    if write_lane_mod is None or write_lane_div is None:
-        raise ValueError("mfma_m=32 requires lane_div_32 and lane_mod_32")
-    col_base_local = n_tile_base_v + write_lane_mod  # index within [0,tile_n)
+    is_mfma32 = int(mfma_m) == 32
+    if is_mfma32:
+        if lane_mod_32 is None or lane_div_32 is None:
+            raise ValueError("mfma_m=32 requires lane_div_32 and lane_mod_32")
+        col_base_local = n_tile_base_v + lane_mod_32  # index within [0,tile_n)
+    else:
+        # Keep the legacy MFMA16 path simple: int8 stage1 is very sensitive to
+        # extra epilogue address/row-mapping code in the generated schedule.
+        col_base_local = n_tile_base_v + lane_mod_16  # index within [0,tile_n)
 
     _col_remap = None
     if _do_interleave:
@@ -204,10 +208,10 @@ def c_shuffle_epilog(
 
     if not skip_initial_barrier:
         gpu.barrier()
-    if int(mfma_m) == 32:
+    if is_mfma32:
         # CK row-major 32x32 MFMA mapping:
         # row = mi*32 + lane_div32*4 + (ii//4)*8 + (ii%4), ii in [0,16).
-        lane_div_32_mul4 = write_lane_div * arith.index(4)
+        lane_div_32_mul4 = lane_div_32 * arith.index(4)
         for mi in range_constexpr(m_repeat):
             mi_base = arith.constant(mi * 32, index=True)
             for ii in range_constexpr(16):
