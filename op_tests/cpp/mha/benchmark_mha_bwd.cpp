@@ -354,29 +354,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
         (mode == mode_enum::batch ? seqlen_q : seqstart_q_host.back());
     const ck_tile::index_t shape_seqlen_k =
         (mode == mode_enum::batch ? seqlen_k : seqstart_k_host.back());
-    const fmha_bwd_traits traits{
-        shape_seqlen_q,
-        shape_seqlen_k,
-        batch,
-        max_seqlen_q,
-        max_seqlen_k,
-        hdim_q,
-        hdim_v,
-        nhead,
-        nhead_k,
-        data_type,
-        mode == mode_enum::group,
-        mask.type,
-        bias.type,
-        use_dbias,
-        p_drop > 0.0f,
-        s_randval,
-        deterministic,
-    };
-    // Note: we no longer construct fmha_bwd_launcher here. The benchmark goes
-    // through aiter::mha_bwd, which internally constructs the launcher and
-    // queries workspace_size. We expose a lazy-grow workspace_alloc callback
-    // below so the dispatcher can resize on demand.
+    // The benchmark goes through aiter::mha_bwd, which internally constructs
+    // the launcher and queries workspace_size. We expose a lazy-grow
+    // workspace_alloc callback below so the dispatcher can resize on demand.
     const ck_tile::index_t kN0 = (hdim_q <= 128) ? 128 : 64;
     const ck_tile::index_t nsplits =
         deterministic ? ck_tile::integer_divide_ceil(max_seqlen_k, kN0) : 1;

@@ -141,6 +141,12 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         return -1;
     }
 
+    if(a.is_group_mode && !a.pinned_host_alloc)
+    {
+        AITER_LOG_ERROR("mha_bwd: group mode requires pinned_host_alloc callback");
+        return -1;
+    }
+
     const fmha_bwd_traits traits{
         a.seqlen_q,
         a.seqlen_k,

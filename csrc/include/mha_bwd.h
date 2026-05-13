@@ -156,8 +156,8 @@ struct mha_bwd_args
     // .get() must remain valid (not reused by the allocator) for as long as any
     // pending stream operation references it; aiter ensures this by extending
     // shared_ptr lifetime via a stream-tail hipLaunchHostFunc keepalive.
-    // Required for the group-mode async pipeline; if left empty in group mode,
-    // the dispatcher falls back to a synchronous D2H path.
+    // Required for the group-mode async pipeline; mha_bwd returns an error if
+    // left empty in group mode. Unused in batch mode (may be left empty).
     std::function<std::shared_ptr<void>(size_t bytes)> pinned_host_alloc{};
 };
 
