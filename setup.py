@@ -220,24 +220,16 @@ _TEST_PREBUILD_EXCLUDE_MODULES = {
     # Multi-GPU-only communication modules are covered by main/nightly full builds.
     "module_custom_all_reduce",
     "module_quick_all_reduce",
-    # Standard Aiter PR tests do not need prebuilt backward MHA kernels.
+    # Gradlib solver wrappers are not part of the standard top-level Aiter shards.
+    "module_rocsolgemm",
+}
+
+_TEST_PREBUILD_KEEP_MHA_MODULES = {
     "module_fmha_v3_bwd",
     "module_fmha_v3_varlen_bwd",
     "module_mha_bwd",
     "module_mha_varlen_bwd",
     "libmha_bwd",
-    # OPUS-specific sorting is not part of the standard top-level Aiter shards.
-    "module_moe_sorting_opus",
-    # Narrow standard-test coverage. Let PR tests JIT these if exercised.
-    "module_deepgemm",
-    "module_gemm_a8w8_blockscale_cktile",
-    "module_gemm_a8w8_blockscale_bpreshuffle_cktile",
-    "module_mla_reduce",
-    "module_moe_cktile2stages",
-    "module_norm",
-    "module_pa_ragged",
-    "module_rmsnorm",
-    "module_rocsolgemm",
 }
 
 
@@ -272,10 +264,18 @@ def get_exclude_ops():
             # Exclude tune modules; for MHA keep only fmha_v3 fwd variants
             if "_tune" in module:
                 exclude_ops.append(module)
-            if "mha" in module and module not in [
-                "module_fmha_v3_fwd",
-                "module_fmha_v3_varlen_fwd",
-            ]:
+            if (
+                "mha" in module
+                and module
+                not in [
+                    "module_fmha_v3_fwd",
+                    "module_fmha_v3_varlen_fwd",
+                ]
+                and not (
+                    AITER_PREBUILD_PROFILE in {"test", "ci-test", "ci_test"}
+                    and module in _TEST_PREBUILD_KEEP_MHA_MODULES
+                )
+            ):
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 2:
             # Exclude _bwd and _tune
