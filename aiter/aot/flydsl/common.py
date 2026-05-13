@@ -51,6 +51,35 @@ def collect_aot_jobs(
     return dedupe_jobs(jobs)
 
 
+def raise_if_aot_cache_miss(
+    case_kwargs: dict[str, Any],
+    cache_misses: list[tuple[str, int, Any, Any, int]],
+    last_cache_key: dict[int, Any],
+) -> None:
+    if not cache_misses:
+        return
+
+    details = []
+    for name, jf_id, manager_key, cache_dir, miss_count in cache_misses:
+        exists = cache_dir.exists() if cache_dir is not None else False
+        pkl_count = sum(1 for _ in cache_dir.glob("*.pkl")) if exists else 0
+        cache_key = last_cache_key.get(jf_id)
+        cache_key_str = (
+            "\n".join(f"      {item!r}" for item in cache_key)
+            if cache_key
+            else "<unknown>"
+        )
+        details.append(
+            f"  {name}: +{miss_count} miss, manager_key={manager_key}\n"
+            f"    cache_dir={cache_dir} (exists={exists}, pkl_count={pkl_count})\n"
+            f"    looked-up cache_key:\n{cache_key_str}"
+        )
+
+    raise RuntimeError(
+        "AOT cache miss for case " + repr(case_kwargs) + ":\n" + "\n".join(details)
+    )
+
+
 @contextmanager
 def compile_only_env() -> Iterator[None]:
     prev = os.environ.get("COMPILE_ONLY")

@@ -27,6 +27,7 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.aot.flydsl.common import raise_if_aot_cache_miss
 from aiter.ops.flydsl.moe_common import GateMode
 
 
@@ -39,9 +40,8 @@ from aiter.ops.shuffle import (
 )
 # --- AOT-cache miss detection ------------------------------------------------
 # Wrap aiter's MoE dispatcher so we register every FlyDSL JitFunction we touch.
-# Each case then diffs JitCacheManager.cache_info().misses across all touched
-# JitFunctions; any positive delta means a kernel was JIT-compiled instead of
-# loaded from the AOT cache, and we raise immediately.
+# Any positive JitCacheManager.cache_info().misses means a kernel was
+# JIT-compiled instead of loaded from the AOT cache.
 import aiter.ops.flydsl.moe_kernels as _aiter_mk
 
 _jit_fns_seen = []  # insertion order; values are JitFunction instances
@@ -65,23 +65,15 @@ def _run_compiled_tracked(exe, args):
 _aiter_mk._run_compiled = _run_compiled_tracked
 
 
-def _miss_snapshot():
-    snap = []
+def _aot_cache_misses():
+    misses = []
     for jf in _jit_fns_seen:
         info = jf.cache_info()
-        if info is not None:
-            cdir = getattr(jf.cache_manager, "cache_dir", None)
-            snap.append((jf.func.__name__, id(jf), jf.manager_key, cdir, info.misses))
-    return snap
-
-
-def _miss_delta(before, after):
-    bm = {(n, i): m for n, i, _mk, _cd, m in before}
-    return [
-        (n, i, mk, cd, m_after - bm.get((n, i), 0))
-        for n, i, mk, cd, m_after in after
-        if m_after > bm.get((n, i), 0)
-    ]
+        if info is None or info.misses == 0:
+            continue
+        cdir = getattr(jf.cache_manager, "cache_dir", None)
+        misses.append((jf.func.__name__, id(jf), jf.manager_key, cdir, info.misses))
+    return misses
 
 
 # -----------------------------------------------------------------------------
@@ -875,28 +867,8 @@ for kwargs, extras in case_iter:
     if _force_moe_bound_zero:
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     try:
-        miss_before = _miss_snapshot()
         ret = test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
-        new_misses = _miss_delta(miss_before, _miss_snapshot())
-        if new_misses:
-            details = []
-            for name, jf_id, mk, cdir, dn in new_misses:
-                exists = cdir.exists() if cdir is not None else False
-                npkl = sum(1 for _ in cdir.glob("*.pkl")) if exists else 0
-                ck = _last_cache_key.get(jf_id)
-                ck_str = (
-                    "\n".join(f"      {item!r}" for item in ck)
-                    if ck
-                    else "<unknown>"
-                )
-                details.append(
-                    f"  {name}: +{dn} miss, manager_key={mk}\n"
-                    f"    cache_dir={cdir} (exists={exists}, pkl_count={npkl})\n"
-                    f"    looked-up cache_key:\n{ck_str}"
-                )
-            raise RuntimeError(
-                "AOT cache miss for case " + repr(kwargs) + ":\n" + "\n".join(details)
-            )
+        raise_if_aot_cache_miss(kwargs, _aot_cache_misses(), _last_cache_key)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
