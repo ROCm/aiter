@@ -220,18 +220,18 @@ _TEST_PREBUILD_EXCLUDE_MODULES = {
     # Multi-GPU-only communication modules are covered by main/nightly full builds.
     "module_custom_all_reduce",
     "module_quick_all_reduce",
-    # Gradlib solver wrappers are not part of the standard top-level Aiter shards.
-    "module_rocsolgemm",
-}
-
-_TEST_PREBUILD_KEEP_MHA_MODULES = {
+    # MHA backward kernels are allowed to JIT in standard PR shards.
     "module_fmha_v3_bwd",
     "module_fmha_v3_varlen_bwd",
     "module_mha_bwd",
     "module_mha_varlen_bwd",
     "libmha_bwd",
+    # Not exercised by the standard PR shards that reported runtime JIT.
+    "module_gemm_a8w8_blockscale_bpreshuffle_cktile",
+    "module_moe_cktile2stages",
+    # Gradlib solver wrappers are not part of the standard top-level Aiter shards.
+    "module_rocsolgemm",
 }
-
 
 def _get_profile_exclude_modules(all_modules):
     if AITER_PREBUILD_PROFILE not in {"test", "ci-test", "ci_test"}:
@@ -271,10 +271,6 @@ def get_exclude_ops():
                     "module_fmha_v3_fwd",
                     "module_fmha_v3_varlen_fwd",
                 ]
-                and not (
-                    AITER_PREBUILD_PROFILE in {"test", "ci-test", "ci_test"}
-                    and module in _TEST_PREBUILD_KEEP_MHA_MODULES
-                )
             ):
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 2:

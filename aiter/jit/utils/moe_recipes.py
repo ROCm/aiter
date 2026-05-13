@@ -13,7 +13,6 @@ _DTYPE_MAP = {
     "torch.bfloat16": "b16",
     "torch.float16": "f16",
     "torch.int8": "i8",
-    "torch.int4": "i4",
     "torch.float4_e2m1fn_x2": "fp4x2",
 }
 
@@ -184,26 +183,4 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> List[Dict]:
                     is_splitk=splitk,
                 )
                 results.append({"md_name": md_name, "blob_gen_cmd": blob_gen_cmd})
-
-    # Legacy MoE tests exercise the a8w4 per-token path even though it is not
-    # represented in tuned CSVs. Prebuild the matching CK variant to avoid
-    # runtime JIT in PR standard shards.
-    for key in [
-        ("f8", "i4", "b16", "per_token", "silu", 2, False, False),
-    ]:
-        if key in seen:
-            continue
-        seen.add(key)
-        md_name, blob_gen_cmd = _build_moe_variant(
-            aiter_csrc_dir=aiter_csrc_dir,
-            a_dtype=key[0],
-            b_dtype=key[1],
-            c_dtype=key[2],
-            quant_type=key[3],
-            activation=key[4],
-            mul_routed_weight_stage=key[5],
-            preshuffle_mode=key[6],
-            is_splitk=key[7],
-        )
-        results.append({"md_name": md_name, "blob_gen_cmd": blob_gen_cmd})
     return results
