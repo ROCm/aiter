@@ -21,7 +21,7 @@ except Exception:
     CXX_PS_REDUCE_AVAILABLE = False
     launch_pa_decode_ps_reduce_cxx = None
 
-FLYDSL_PS_REDUCE_AVAILABLE = False
+FLYDSL_PS_REDUCE_AVAILABLE = True
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
