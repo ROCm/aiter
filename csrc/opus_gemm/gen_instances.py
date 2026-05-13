@@ -833,9 +833,9 @@ void
         # that the if constexpr guard cannot screen.
         has_oob_str = "true" if k.has_oob else "false"
         if is_a16w16_split_barrier:
-            cpol_launch_extra = ""
-            if hasattr(k, "cpol_a") and k.cpol_a >= 0:
-                cpol_launch_extra = f",\n        {k.cpol_a}, {k.cpol_b}"
+            cachectl_launch_extra = ""
+            if hasattr(k, "cachectl_a") and k.cachectl_a >= 0:
+                cachectl_launch_extra = f",\n        {k.cachectl_a}, {k.cachectl_b}"
             launch_block = f"""
     using TraitsNoBias = {traits_name}<{k.BLOCK_SIZE},
         opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
@@ -843,14 +843,14 @@ void
         opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
         false,                                 // HAS_BIAS
         D_C,                                   // D_BIAS = D_C
-        {has_oob_str}{cpol_launch_extra}>;
+        {has_oob_str}{cachectl_launch_extra}>;
     using TraitsBias = {traits_name}<{k.BLOCK_SIZE},
         opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
         opus::tuple<{da}, {db}, D_C, fp32_t>,
         opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
         true,                                  // HAS_BIAS
         D_C,                                   // D_BIAS = D_C
-        {has_oob_str}{cpol_launch_extra}>;
+        {has_oob_str}{cachectl_launch_extra}>;
 
     auto stream = aiter::getCurrentHIPStream();
     if (bias.has_value()) {{{{
@@ -921,9 +921,9 @@ void
         # a16w16 split-barrier emits two Traits (HAS_BIAS true / false);
         # everything else has a single Traits.
         # CPOL template params (only for a16w16 split-barrier)
-        cpol_extra = ""
-        if is_a16w16_split_barrier and (hasattr(k, "cpol_a") and k.cpol_a >= 0):
-            cpol_extra = f",\n    {k.cpol_a}, {k.cpol_b}"
+        cachectl_extra = ""
+        if is_a16w16_split_barrier and (hasattr(k, "cachectl_a") and k.cachectl_a >= 0):
+            cachectl_extra = f",\n    {k.cachectl_a}, {k.cachectl_b}"
         if is_a16w16_split_barrier:
             traits_aliases = f"""
 template <typename D_C>
@@ -933,7 +933,7 @@ using {k.name}_TraitsNoBias = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
     false,
     D_C,
-    {has_oob_str}{cpol_extra}>;
+    {has_oob_str}{cachectl_extra}>;
 template <typename D_C>
 using {k.name}_TraitsBias = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
@@ -941,7 +941,7 @@ using {k.name}_TraitsBias = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
     true,
     D_C,
-    {has_oob_str}{cpol_extra}>;
+    {has_oob_str}{cachectl_extra}>;
 """
         else:
             traits_aliases = f"""

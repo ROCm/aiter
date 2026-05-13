@@ -32,8 +32,8 @@ class OpusGemmInstance:
     has_oob: bool = True
     # Cache policy for A/B loads (CDNA4 ISA Table 49). -1 = use traits default.
     # 0=LRU, 1=SC0(LLC Evict), 17=SC0+SC1(L2 Bypass).
-    cpol_a: int = -1
-    cpol_b: int = -1
+    cachectl_a: int = -1
+    cachectl_b: int = -1
 
     @property
     def name(self) -> str:
@@ -52,8 +52,8 @@ class OpusGemmInstance:
             parts.append(f"wgpcu{self.WG_PER_CU}")
         if not self.has_oob:
             parts.append("nooob")
-        if self.cpol_a >= 0 or self.cpol_b >= 0:
-            parts.append(f"cA{self.cpol_a}cB{self.cpol_b}")
+        if self.cachectl_a >= 0 or self.cachectl_b >= 0:
+            parts.append(f"cA{self.cachectl_a}cB{self.cachectl_b}")
         return "_".join(parts)
 
 
@@ -235,31 +235,31 @@ a16w16_kernels_list_nooob = {
 #   M-heavy: A=SC0(1, LLC Evict), B=BYPASS_L2(17) — large A streams, small B cached
 #   N-heavy: A=BYPASS_L2(17), B=SC0(1, LLC Evict) — swapped
 #   Balanced: A=LRU(0), B=LRU(0) — both cached normally
-_CPOL_CONFIGS = [
-    (2000, 1, 17, "Mheavy"),   # kid_offset, cpol_a, cpol_b
+_CACHECTL_CONFIGS = [
+    (2000, 1, 17, "Mheavy"),   # kid_offset, cachectl_a, cachectl_b
     (3000, 17, 1, "Nheavy"),
     (4000, 0,  0, "balanced"),
 ]
 a16w16_kernels_list_cpol = {}
-for offset, ca, cb, _tag in _CPOL_CONFIGS:
+for offset, ca, cb, _tag in _CACHECTL_CONFIGS:
     for kid, inst in a16w16_kernels_list.items():
         new_inst = _a16w16(
             inst.BLOCK_SIZE, inst.B_M, inst.B_N, inst.B_K,
             inst.T_N, inst.W_M, inst.W_N, inst.W_K,
         )
-        new_inst.cpol_a = ca
-        new_inst.cpol_b = cb
+        new_inst.cachectl_a = ca
+        new_inst.cachectl_b = cb
         a16w16_kernels_list_cpol[kid + offset] = new_inst
 
 a16w16_kernels_list_cpol_nooob = {}
-for offset, ca, cb, _tag in _CPOL_CONFIGS:
+for offset, ca, cb, _tag in _CACHECTL_CONFIGS:
     for kid, inst in a16w16_kernels_list.items():
         new_inst = _a16w16(
             inst.BLOCK_SIZE, inst.B_M, inst.B_N, inst.B_K,
             inst.T_N, inst.W_M, inst.W_N, inst.W_K, has_oob=False,
         )
-        new_inst.cpol_a = ca
-        new_inst.cpol_b = cb
+        new_inst.cachectl_a = ca
+        new_inst.cachectl_b = cb
         a16w16_kernels_list_cpol_nooob[kid + offset + 1000] = new_inst
 
 a16w16_flatmm_splitk_kernels_list_nooob = {
