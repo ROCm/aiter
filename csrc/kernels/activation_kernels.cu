@@ -547,7 +547,7 @@ __global__ void act_and_mul_quant_kernel(
     float max_val = multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
 
     if constexpr(is_fp4)
-        max_val = aiter::fp4_round_pow2(max_val);
+        max_val = aiter::fp4_f32_to_e8m0_scale(max_val);
 
     float quant_scale = max_val * inverted_DTYPE_MAX;
 
@@ -654,20 +654,12 @@ static constexpr int nextPow2(unsigned int num)
 
 // Scaled kernel uses more waves for mid-range d to match Triton's parallelism
 #define COMPUTE_SCALED_ACTIVATION_KERNEL_PARAMS                                       \
-    int warp_size       = static_cast<int>(WARP_SIZE);                                \
-    int d              = input.size(-1) / 2;                                          \
-    int64_t num_tokens = input.numel() / input.size(-1);                              \
-    int vec_size       = nextPow2(d / warp_size);                                     \
-    vec_size           = vec_size < 2 ? 2 : vec_size;                                 \
-    vec_size           = vec_size > max_vec_size ? max_vec_size : vec_size;           \
-    int num_wave       = nextPow2(d / warp_size / vec_size);                          \
-    num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;           \
+    COMPUTE_ACTIVATION_KERNEL_PARAMS                                                  \
     if(d > 512 && d <= 2048 && num_tokens <= 4096)                                    \
+    {                                                                                 \
         num_wave = 4;                                                                 \
-    dim3 grid(num_tokens);                                                            \
-    dim3 block(num_wave * warp_size);                                                 \
-    HipDeviceGuard device_guard(input.device_id);                                     \
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+        block    = dim3(num_wave * warp_size);                                        \
+    }
 
 // Helper macros for fp32 vec_size dispatch
 #define DISPATCH_FP32_VEC_SIZE_CASE(VS, KERNEL_NAME, KERNEL, ...)              \
@@ -687,24 +679,26 @@ static constexpr int nextPow2(unsigned int num)
     }
 
 // Variant with extra template args (e.g., HAS_LIMIT)
-#define DISPATCH_FP32_VEC_SIZE_CASE_EX(VS, KERNEL_NAME, KERNEL, EXTRA_TARGS, ...)  \
-    case VS:                                                                        \
-        aiter::KERNEL_NAME<input_dtype, output_dtype, KERNEL<input_dtype>, VS, EXTRA_TARGS> \
-            <<<grid, block, 0, stream>>>(__VA_ARGS__);                              \
+#define DISPATCH_FP32_VEC_SIZE_CASE_EX(VS, KERNEL_NAME, KERNEL, EXTRA_T1, EXTRA_T2, ...) \
+    case VS:                                                                             \
+        aiter::KERNEL_NAME<input_dtype, output_dtype, KERNEL<input_dtype>, VS,           \
+                           EXTRA_T1, EXTRA_T2>                                           \
+            <<<grid, block, 0, stream>>>(__VA_ARGS__);                                   \
         break;
 
-#define DISPATCH_FP32_KERNEL_EX(KERNEL_NAME, KERNEL, EXTRA_TARGS, ...)                    \
-    switch(vec_size)                                                                       \
-    {                                                                                      \
-        DISPATCH_FP32_VEC_SIZE_CASE_EX(16, KERNEL_NAME, KERNEL, EXTRA_TARGS, __VA_ARGS__) \
-        DISPATCH_FP32_VEC_SIZE_CASE_EX(8, KERNEL_NAME, KERNEL, EXTRA_TARGS, __VA_ARGS__)  \
-        DISPATCH_FP32_VEC_SIZE_CASE_EX(4, KERNEL_NAME, KERNEL, EXTRA_TARGS, __VA_ARGS__)  \
-        DISPATCH_FP32_VEC_SIZE_CASE_EX(2, KERNEL_NAME, KERNEL, EXTRA_TARGS, __VA_ARGS__)  \
-        DISPATCH_FP32_VEC_SIZE_CASE_EX(1, KERNEL_NAME, KERNEL, EXTRA_TARGS, __VA_ARGS__)  \
+#define DISPATCH_FP32_KERNEL_EX(KERNEL_NAME, KERNEL, EXTRA_T1, EXTRA_T2, ...)                     \
+    switch(vec_size)                                                                               \
+    {                                                                                              \
+        DISPATCH_FP32_VEC_SIZE_CASE_EX(16, KERNEL_NAME, KERNEL, EXTRA_T1, EXTRA_T2, __VA_ARGS__)  \
+        DISPATCH_FP32_VEC_SIZE_CASE_EX(8, KERNEL_NAME, KERNEL, EXTRA_T1, EXTRA_T2, __VA_ARGS__)   \
+        DISPATCH_FP32_VEC_SIZE_CASE_EX(4, KERNEL_NAME, KERNEL, EXTRA_T1, EXTRA_T2, __VA_ARGS__)   \
+        DISPATCH_FP32_VEC_SIZE_CASE_EX(2, KERNEL_NAME, KERNEL, EXTRA_T1, EXTRA_T2, __VA_ARGS__)   \
+        DISPATCH_FP32_VEC_SIZE_CASE_EX(1, KERNEL_NAME, KERNEL, EXTRA_T1, EXTRA_T2, __VA_ARGS__)   \
     }
 
+// fp32 uses AUX=0 (regular load): NT load hurts fp32 due to higher cache line utilization (4B/elem)
 #define DISPATCH_FP32_ACT_KERNEL(KERNEL, HAS_LIMIT_VAL, out_ptr, in_ptr, limit_val) \
-    DISPATCH_FP32_KERNEL_EX(act_and_mul_kernel, KERNEL, HAS_LIMIT_VAL, out_ptr, in_ptr, d, limit_val)
+    DISPATCH_FP32_KERNEL_EX(act_and_mul_kernel, KERNEL, HAS_LIMIT_VAL, RT, out_ptr, in_ptr, d, limit_val)
 
 
 #define DISPATCH_FP32_SWIGLU_VEC_SIZE_CASE(VS, KERNEL_NAME, ...) \

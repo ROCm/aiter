@@ -295,7 +295,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                 float max = multithread_reduce_max_dpp<ReduceThreadSize>(thread_max);
                 if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
                 {
-                    max = aiter::fp4_round_pow2(max);
+                    max = aiter::fp4_f32_to_e8m0_scale(max);
                 }
                 quant_scale = max * inverted_dtype_max;
                 if((tid % reduce_thread_size == 0) && ((tid * thread_data_size) < n1))

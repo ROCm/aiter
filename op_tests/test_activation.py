@@ -8,6 +8,7 @@ from aiter import dtypes
 import functools
 import pandas as pd
 import argparse
+from aiter.utility import fp4_utils
 
 
 def torch_silu_and_mul(input: torch.Tensor, limit: float = 0.0) -> torch.Tensor:
@@ -205,19 +206,6 @@ def _dequant_fp4_group(q, s, group_size):
     return (q_f32 * s_f32).view(m, n)
 
 
-def _fp4_round_pow2_half_up(x: torch.Tensor) -> torch.Tensor:
-    """Round positive fp32 tensor to power-of-two with 1.5 threshold."""
-    x_f32 = x.float()
-    u32 = x_f32.view(torch.int32)
-    exponent = (u32 >> 23) & 0xFF
-    round_up = ((u32 & 0x400000) != 0) & (
-        ((u32 & 0x200000) != 0) | ((u32 & 0x1FFFFF) != 0) | (exponent != 0)
-    )
-    exponent = exponent + round_up.to(torch.int32)
-    rounded_u32 = exponent << 23
-    return rounded_u32.view(torch.float32)
-
-
 def _ref_group_scales_fp8(x: torch.Tensor, group_size: int, out_dtype) -> torch.Tensor:
     m, n = x.shape
     xg = x.view(m, n // group_size, group_size).float()
@@ -232,9 +220,8 @@ def _ref_group_scales_fp4(x: torch.Tensor, group_size: int) -> torch.Tensor:
     xg = x.view(m, n // group_size, group_size).float()
     x_max = torch.amax(torch.abs(xg), dim=-1)
     x_max = torch.maximum(x_max, torch.full_like(x_max, 1e-10))
-    x_max_rounded = _fp4_round_pow2_half_up(x_max)
-    quant_scale = x_max_rounded * 0.25
-    return ((quant_scale.view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
+    scale_e8m0 = fp4_utils.f32_to_e8m0(x_max * 0.25)
+    return scale_e8m0.view(torch.uint8)
 
 
 @benchmark()

@@ -15,7 +15,7 @@ namespace aiter {
 //
 // Special: Inf/NaN (exponent == 0xFF) passes through unchanged.
 //          Denormal with mantissa == exactly 0.5 is not bumped (guarded by exponent > 0).
-__device__ __forceinline__ float fp4_round_pow2(float x)
+__device__ __forceinline__ float fp4_f32_to_e8m0_scale(float x)
 {
     uint32_t u32      = __builtin_bit_cast(uint32_t, x);
     uint32_t exponent = (u32 >> 23) & 0xFFu;

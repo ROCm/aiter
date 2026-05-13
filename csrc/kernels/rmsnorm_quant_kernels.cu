@@ -211,7 +211,7 @@ __global__ void add_rmsnorm_quant_kernel(
                     float max= multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
                     if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
                     {
-                        max = aiter::fp4_round_pow2(max);
+                        max = aiter::fp4_f32_to_e8m0_scale(max);
                     }
                     quant_scale = max * inverted_DTYPE_MAX;
                     if(threadIdx.x % reduce_thread_size == 0 && (threadIdx.x * thread_data_size) < n)
