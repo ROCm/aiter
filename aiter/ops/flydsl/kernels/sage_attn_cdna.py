@@ -22,8 +22,6 @@ Supports:
 """
 
 import math as host_math
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
