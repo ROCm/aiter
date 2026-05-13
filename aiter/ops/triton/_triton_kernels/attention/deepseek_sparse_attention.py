@@ -1067,6 +1067,77 @@ def _bwd_dkv_xcd_local(
         tl.atomic_add(dkv_rope_ptrs, dKV_rope, mask=valid[None, :], sem="relaxed")
 
 
+# Experiment: non-atomic scatter — same traffic pattern as _bwd_dkv_hg_fused
+# but uses tl.store instead of tl.atomic_add.  Results are INCORRECT (races),
+# but WRITE_SIZE from rocprof tells us how much of the atomic write traffic is
+# due to the atomic mechanism itself vs. the data volume.
+@triton.jit
+def _bwd_dkv_nonatomic_scatter(
+    Q_T_ptr, dO_T_ptr, dS_ptr, P_ptr, TopK_ptr, dKV_ptr,
+    stride_qt_t: tl.int64, stride_dot_t: tl.int64,
+    stride_ds_t: tl.int64, stride_ds_h: tl.int64,
+    stride_topk_t: tl.int64, stride_dkv_t: tl.int64,
+    num_heads: tl.int32,
+    TOPK: tl.constexpr, TILE_K: tl.constexpr, BLOCK_H: tl.constexpr,
+    NUM_HG: tl.constexpr, D_V: tl.constexpr, D_ROPE: tl.constexpr,
+):
+    """
+    Diagnostic-only: identical compute to _bwd_dkv_hg_fused but writes with
+    tl.store instead of tl.atomic_add.  Results are wrong due to races.
+    Use only for rocprof WRITE_SIZE measurement to isolate atomic overhead.
+    """
+    token_idx = tl.program_id(0)
+    NUM_TILES: tl.constexpr = (TOPK + TILE_K - 1) // TILE_K
+    topk_base = token_idx * stride_topk_t
+    offs_tile = tl.arange(0, TILE_K)
+    offs_v    = tl.arange(0, D_V)
+    offs_r    = tl.arange(0, D_ROPE)
+
+    for t in range(NUM_TILES):
+        tile_start = t * TILE_K
+        tile_offs  = tile_start + offs_tile
+        topk_pos   = tl.load(TopK_ptr + topk_base + tile_offs,
+                             mask=tile_offs < TOPK, other=-1)
+        valid   = (tile_offs < TOPK) & (topk_pos != -1)
+        safe_pos = tl.where(valid, topk_pos, 0)
+
+        dKV_lora = tl.zeros([D_V,    TILE_K], dtype=tl.float32)
+        dKV_rope = tl.zeros([D_ROPE, TILE_K], dtype=tl.float32)
+
+        for hg in range(NUM_HG):
+            offs_h = hg * BLOCK_H + tl.arange(0, BLOCK_H)
+            mask_h = offs_h < num_heads
+            qt_base  = token_idx * stride_qt_t
+            dot_base = token_idx * stride_dot_t
+            ds_base  = token_idx * stride_ds_t
+
+            Q_lora_T = tl.load(
+                Q_T_ptr + qt_base + offs_v[:, None] * num_heads + offs_h[None, :],
+                mask=mask_h[None, :], other=0.0)
+            Q_rope_T = tl.load(
+                Q_T_ptr + qt_base + (D_V + offs_r[:, None]) * num_heads + offs_h[None, :],
+                mask=mask_h[None, :], other=0.0)
+            dO_T = tl.load(
+                dO_T_ptr + dot_base + offs_v[:, None] * num_heads + offs_h[None, :],
+                mask=mask_h[None, :], other=0.0)
+            dS_val = tl.load(
+                dS_ptr + ds_base + offs_h[:, None] * stride_ds_h + tile_offs[None, :],
+                mask=mask_h[:, None] & (tile_offs[None, :] < TOPK), other=0.0)
+            P_val = tl.load(
+                P_ptr + ds_base + offs_h[:, None] * stride_ds_h + tile_offs[None, :],
+                mask=mask_h[:, None] & (tile_offs[None, :] < TOPK), other=0.0)
+
+            dKV_lora += tl.dot(Q_lora_T, dS_val.to(Q_lora_T.dtype)).to(tl.float32)
+            dKV_lora += tl.dot(dO_T,     P_val.to(dO_T.dtype)).to(tl.float32)
+            dKV_rope += tl.dot(Q_rope_T, dS_val.to(Q_rope_T.dtype)).to(tl.float32)
+
+        # Non-atomic store — WRONG results, measures write traffic only
+        tl.store(dKV_ptr + safe_pos[None, :] * stride_dkv_t + offs_v[:, None],
+                 dKV_lora, mask=valid[None, :])
+        tl.store(dKV_ptr + safe_pos[None, :] * stride_dkv_t + (D_V + offs_r[:, None]),
+                 dKV_rope, mask=valid[None, :])
+
+
 @triton.jit
 def _bwd_dkv_reduce_copies(
     dKV_copies_ptr,     # [NUM_COPIES * T * D_QK] fp32, flattened

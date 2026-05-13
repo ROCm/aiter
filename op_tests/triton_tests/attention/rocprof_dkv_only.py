@@ -1,9 +1,16 @@
 """
 Minimal script that runs dKV kernels for rocprof hardware counter collection.
 
-Profiles two kernels back-to-back:
-  1. _bwd_dkv_hg_fused     — baseline (cross-XCD atomic adds)
-  2. _bwd_dkv_xcd_local    — XCD-local routing ((i%304)//38 assignment)
+Profiles three kernels:
+  1. _bwd_dkv_hg_fused        — baseline (cross-XCD atomic adds to shared buf)
+  2. _bwd_dkv_xcd_local       — XCD-local routing ((i%304)//38), 8 private bufs
+  3. _bwd_dkv_nonatomic_scatter — same scatter as hg_fused but tl.store (wrong
+                                  results); measures WRITE_SIZE without atomics
+
+Hypothesis being tested:
+  If WRITE_SIZE(1) ≈ WRITE_SIZE(2) >> WRITE_SIZE(3), atomics themselves
+  (not cross-XCD coherence) cause the write amplification.
+  If WRITE_SIZE(1) >> WRITE_SIZE(2) ≈ WRITE_SIZE(3), XCD-local routing fixed it.
 
 Usage:
   rocprof -i op_tests/triton_tests/attention/rocprof_counters.txt \
@@ -22,6 +29,7 @@ from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import
     _bwd_dq_store_intermediates,
     _bwd_dkv_hg_fused,
     _bwd_dkv_xcd_local,
+    _bwd_dkv_nonatomic_scatter,
     _bwd_dkv_reduce_copies,
     _sparse_mla_bwd_preprocess,
 )
@@ -133,4 +141,32 @@ _bwd_dkv_reduce_copies[(triton.cdiv(total_elems, reduce_block),)](
     NUM_COPIES=num_xcd, BLOCK=reduce_block,
 )
 torch.cuda.synchronize()
-print("Run 2 (xcd_local) done. Check /tmp/dkv_profile.csv for hardware counters.")
+print("Run 2 (xcd_local) done.")
+
+# warmup _bwd_dkv_nonatomic_scatter
+for _ in range(3):
+    dkv.zero_()
+    _bwd_dkv_nonatomic_scatter[(T,)](
+        q_t, do_t, dS, P, topk_idx, dkv,
+        q_t.stride(0), do_t.stride(0),
+        dS.stride(0), dS.stride(1),
+        topk_idx.stride(0), dkv.stride(0),
+        H, TOPK=TOPK, TILE_K=64, BLOCK_H=bh,
+        NUM_HG=num_hg, D_V=DV, D_ROPE=DR,
+        num_warps=4, num_stages=1,
+    )
+torch.cuda.synchronize()
+
+# profiled run 3 — non-atomic store (wrong results, measures write traffic only)
+dkv.zero_()
+_bwd_dkv_nonatomic_scatter[(T,)](
+    q_t, do_t, dS, P, topk_idx, dkv,
+    q_t.stride(0), do_t.stride(0),
+    dS.stride(0), dS.stride(1),
+    topk_idx.stride(0), dkv.stride(0),
+    H, TOPK=TOPK, TILE_K=64, BLOCK_H=bh,
+    NUM_HG=num_hg, D_V=DV, D_ROPE=DR,
+    num_warps=4, num_stages=1,
+)
+torch.cuda.synchronize()
+print("Run 3 (nonatomic_scatter) done. Check /tmp/dkv_profile.csv for hardware counters.")
