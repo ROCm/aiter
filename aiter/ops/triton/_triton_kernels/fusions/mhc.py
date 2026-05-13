@@ -639,3 +639,116 @@ def _mhc_reduce_apply_kernel(
                 BLOCK_M,
                 NUM_SINKHORN_ITERS,
             )
+
+
+@triton.jit
+def _mhc_post_kernel(
+    out_ptr,  # (M, n, C)  bf16 / fp16
+    x_ptr,  # (M, C)     bf16 / fp16  (layer_input from mhc())
+    residual_ptr,  # (M, n, C)  bf16 / fp16
+    post_mix_ptr,  # (M, n)     fp32  (mhc()'s h_post)
+    comb_mix_ptr,  # (M, n, n)  fp32  [src, dst]  (mhc()'s h_res)
+    M,
+    C,
+    stride_x_m,
+    stride_x_c,
+    stride_res_m,
+    stride_res_n,
+    stride_res_c,
+    stride_out_m,
+    stride_out_n,
+    stride_out_c,
+    stride_post_m,
+    stride_post_n,
+    stride_comb_m,
+    stride_comb_src,
+    stride_comb_dst,
+    n: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """Fused mhc_post kernel: compute one M-tile across all `n` output
+    streams and the full hidden dim.
+
+        out[m, j, c] = post_mix[m, j] * x[m, c]
+                     + sum_h comb_mix[m, h, j] * residual[m, h, c]
+
+    Grid: ``(cdiv(M, BLOCK_M),)``. Each program loads ``post_mix``
+    (BLOCK_M, n) and ``comb_mix`` (BLOCK_M, n, n) once and reuses them
+    across the persistent loop over ``BLOCK_C``-sized C-tiles. The
+    ``n``-source-head contraction inside each C-tile is unrolled via
+    ``tl.static_range``: each iteration loads a 2-D ``residual`` slice and
+    a 1-D ``comb_mix`` row and accumulates ``comb_h * res_h`` into
+    ``out_tile``. This avoids materializing a (BLOCK_M, n, n, BLOCK_C)
+    outer-product intermediate. Requires ``n`` to be a power of 2 so
+    ``tl.arange(0, n)`` compiles.
+    """
+    pid_m = tl.program_id(0)
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    i_n = tl.arange(0, n)
+
+    m_mask = rm < M
+
+    post_mix_tile = tl.load(
+        post_mix_ptr + rm[:, None] * stride_post_m + i_n[None, :] * stride_post_n,
+        mask=m_mask[:, None],
+        other=0.0,
+    )
+
+    # Pre-load each row of the per-token (n_src, n_dst) comb_mix matrix into
+    # a tuple of 2-D tiles. Each ``comb_rows[h]`` has shape (BLOCK_M, n_dst)
+    # and lives in registers across the C-loop, eliminating per-C-tile
+    # reloads of the small per-token coefficients.
+    comb_rows = ()
+    for h in tl.static_range(n):
+        comb_rows = comb_rows + (
+            tl.load(
+                comb_mix_ptr
+                + rm[:, None] * stride_comb_m
+                + h * stride_comb_src
+                + i_n[None, :] * stride_comb_dst,
+                mask=m_mask[:, None],
+                other=0.0,
+            ),
+        )
+
+    for c_start in range(0, C, BLOCK_C):
+        rc = c_start + tl.arange(0, BLOCK_C)
+        c_mask = rc < C
+
+        # ``x`` and ``residual`` are bf16 / fp16 in production. Keeping them
+        # in their native dtype halves on-chip footprint vs an upfront fp32
+        # promotion; mixed-dtype multiply with fp32 ``post_mix`` / ``comb``
+        # is auto-promoted by Triton with an fp32 accumulator.
+        x_tile = tl.load(
+            x_ptr + rm[:, None] * stride_x_m + rc[None, :] * stride_x_c,
+            mask=m_mask[:, None] & c_mask[None, :],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+
+        out_tile = post_mix_tile[:, :, None] * x_tile[:, None, :].to(tl.float32)
+
+        for h in tl.static_range(n):
+            res_h = tl.load(
+                residual_ptr
+                + rm[:, None] * stride_res_m
+                + h * stride_res_n
+                + rc[None, :] * stride_res_c,
+                mask=m_mask[:, None] & c_mask[None, :],
+                other=0.0,
+                cache_modifier=".cg",
+            )
+            comb_h = comb_rows[h]  # (BLOCK_M, n_dst), pre-loaded 2-D tile
+            out_tile += comb_h[:, :, None] * res_h[:, None, :].to(tl.float32)
+
+        tl.store(
+            out_ptr
+            + rm[:, None, None] * stride_out_m
+            + i_n[None, :, None] * stride_out_n
+            + rc[None, None, :] * stride_out_c,
+            out_tile.to(out_ptr.dtype.element_ty),
+            mask=m_mask[:, None, None] & c_mask[None, None, :],
+            cache_modifier=".cs",
+        )
