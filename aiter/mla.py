@@ -488,21 +488,25 @@ def mla_decode_fwd(
             and is_experimental_enabled()
         )
 
-        use_hk = use_hk_h32_q4 or (
-            get_gfx() in ("gfx942", "gfx950")
-            and nhead * max_seqlen_q == 128
-            and not hk_h32_q4
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and page_size in (1, 64)
-            and is_experimental_enabled()
-        ) or (
-            get_gfx() == "gfx950"
-            and nhead * max_seqlen_q == 64
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and page_size in (1, 64)
-            and is_experimental_enabled()
+        use_hk = (
+            use_hk_h32_q4
+            or (
+                get_gfx() in ("gfx942", "gfx950")
+                and nhead * max_seqlen_q == 128
+                and not hk_h32_q4
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and page_size in (1, 64)
+                and is_experimental_enabled()
+            )
+            or (
+                get_gfx() == "gfx950"
+                and nhead * max_seqlen_q == 64
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and page_size in (1, 64)
+                and is_experimental_enabled()
+            )
         )
 
         if use_hk:

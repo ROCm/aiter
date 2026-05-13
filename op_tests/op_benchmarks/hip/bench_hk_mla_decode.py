@@ -16,7 +16,6 @@ import torch
 import aiter
 from aiter import dtypes
 
-
 NHEAD = 128
 NHEAD_KV = 1
 KV_LORA = 512
@@ -53,6 +52,16 @@ def parse_int_list(value: str) -> list[int]:
     return [int(x) for x in value.split(",") if x.strip()]
 
 
+def parse_shape_list(value: str) -> list[MlaShape]:
+    shapes = []
+    for item in value.split(","):
+        if not item:
+            continue
+        batch, ctx = item.split("x")
+        shapes.append(MlaShape(int(batch), int(ctx), 4, 1))
+    return shapes
+
+
 def make_indptr(shape: MlaShape) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     qo_indptr = torch.arange(
         0,
@@ -82,14 +91,18 @@ def make_metadata(
     max_split_per_batch: int,
     force_hk_native_metadata: bool = False,
     cap_split_to_cu_per_batch: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     old_force_native = os.environ.get("AITER_HK_MLA_FORCE_NATIVE_METADATA")
     if force_hk_native_metadata:
         os.environ["AITER_HK_MLA_FORCE_NATIVE_METADATA"] = "1"
     else:
         os.environ.pop("AITER_HK_MLA_FORCE_NATIVE_METADATA", None)
 
-    cu_num = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    cu_num = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
     if cap_split_to_cu_per_batch:
         max_split_per_batch = min(
             (cu_num + shape.batch_size - 1) // shape.batch_size,
@@ -255,7 +268,9 @@ def unfold_o_from_gfx950_asm(o: torch.Tensor, shape: MlaShape) -> torch.Tensor:
     )
 
 
-def time_cuda_us(fn: Callable[[], None], warmup: int, iters: int) -> tuple[float, float]:
+def time_cuda_us(
+    fn: Callable[[], None], warmup: int, iters: int
+) -> tuple[float, float]:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -277,6 +292,52 @@ def cosine_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     y_f = y.float().flatten()
     denom = torch.clamp((x_f * x_f + y_f * y_f).sum(), min=1e-12)
     return float(1 - 2 * (x_f * y_f).sum() / denom)
+
+
+def error_metrics(ref: torch.Tensor, out: torch.Tensor) -> dict[str, float]:
+    diff = (ref.float() - out.float()).abs()
+    return {
+        "cos": cosine_diff(ref, out),
+        "rmse": float((diff * diff).mean().sqrt()),
+        "max_abs": float(diff.max()),
+        "mean_abs": float(diff.mean()),
+    }
+
+
+def reference_mla(
+    q_fp8: torch.Tensor, kv_fp8: torch.Tensor, shape: MlaShape
+) -> torch.Tensor:
+    q = q_fp8.float().view(shape.batch_size, shape.decode_qlen, NHEAD, QK_HEAD_DIM)
+    kv = kv_fp8.float().view(
+        shape.batch_size, shape.ctx_len, shape.page_size, NHEAD_KV, QK_HEAD_DIM
+    )
+    kv = kv[:, :, 0, 0, :]
+    v = kv[:, :, :V_HEAD_DIM]
+    scores = torch.einsum("bqhd,bcd->bqhc", q, kv) / math.sqrt(QK_HEAD_DIM)
+    probs = torch.softmax(scores, dim=-1)
+    out = torch.einsum("bqhc,bcd->bqhd", probs, v)
+    return out.reshape(shape.total_q, NHEAD, V_HEAD_DIM).to(torch.bfloat16)
+
+
+def causal_reference_mla(
+    q_fp8: torch.Tensor, kv_fp8: torch.Tensor, shape: MlaShape
+) -> torch.Tensor:
+    q = q_fp8.float().view(shape.batch_size, shape.decode_qlen, NHEAD, QK_HEAD_DIM)
+    kv = kv_fp8.float().view(
+        shape.batch_size, shape.ctx_len, shape.page_size, NHEAD_KV, QK_HEAD_DIM
+    )
+    kv = kv[:, :, 0, 0, :]
+    v = kv[:, :, :V_HEAD_DIM]
+    outs = []
+    for q_idx in range(shape.decode_qlen):
+        kv_end = max(1, shape.ctx_len - (shape.decode_qlen - 1 - q_idx))
+        scores = torch.einsum("bhd,bcd->bhc", q[:, q_idx], kv[:, :kv_end]) / math.sqrt(
+            QK_HEAD_DIM
+        )
+        probs = torch.softmax(scores, dim=-1)
+        outs.append(torch.einsum("bhc,bcd->bhd", probs, v[:, :kv_end]))
+    out = torch.stack(outs, dim=1)
+    return out.reshape(shape.total_q, NHEAD, V_HEAD_DIM).to(torch.bfloat16)
 
 
 def metadata_stats(
@@ -309,11 +370,218 @@ def metadata_stats(
         "avg_kv_span": float(kv_spans.float().mean().item()),
         "max_qo_span": int(qo_spans.max().item()),
         "partial_tile_count": int(partial_tiles.numel()),
-        "max_partials_per_tile": int(partial_tiles.max().item()) if partial_tiles.numel() else 0,
+        "max_partials_per_tile": (
+            int(partial_tiles.max().item()) if partial_tiles.numel() else 0
+        ),
         "avg_partials_per_tile": (
             float(partial_tiles.float().mean().item()) if partial_tiles.numel() else 0.0
         ),
     }
+
+
+def run_asm_once(
+    q: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    shape: MlaShape,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_meta_data: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+) -> torch.Tensor:
+    sm_scale = 1.0 / math.sqrt(QK_HEAD_DIM)
+    q_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
+    kv_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
+    q_asm = fold_q_for_gfx950_asm(q, shape)
+    asm_nhead = 16 if NHEAD == 128 else NHEAD
+    split, lse, out = alloc_outputs(
+        shape, reduce_partial_map, asm_nhead, output_tokens=q_asm.size(0)
+    )
+    aiter.mla_decode_stage1_asm_fwd(
+        q_asm,
+        kv_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        None,
+        work_meta_data,
+        work_indptr,
+        work_info_set,
+        shape.decode_qlen,
+        shape.page_size,
+        NHEAD_KV,
+        sm_scale,
+        split,
+        lse,
+        out,
+        None,
+        q_scale,
+        kv_scale,
+    )
+    aiter.mla_reduce_v1(
+        split,
+        lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        shape.decode_qlen,
+        out,
+        None,
+    )
+    return unfold_o_from_gfx950_asm(out, shape)
+
+
+def run_hk_once(
+    q: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    shape: MlaShape,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    use_long_kernel: bool,
+) -> torch.Tensor:
+    sm_scale = 1.0 / math.sqrt(QK_HEAD_DIM)
+    split, lse, out = alloc_outputs(shape, reduce_partial_map, NHEAD)
+    hk_decode = (
+        aiter.hk_mla_decode_fwd_long if use_long_kernel else aiter.hk_mla_decode_fwd
+    )
+    hk_decode(
+        q,
+        kv_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        work_indptr,
+        work_info_set,
+        shape.decode_qlen,
+        sm_scale,
+        split,
+        lse,
+        out,
+    )
+    aiter.mla_reduce_v1(
+        split,
+        lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        shape.decode_qlen,
+        out,
+        None,
+    )
+    return out
+
+
+def make_metadata_from_lens(
+    lens: torch.Tensor,
+    decode_qlen: int,
+    max_split_per_batch: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+]:
+    batch_size = int(lens.numel())
+    max_ctx = int(lens.max().item())
+    shape = MlaShape(batch_size, max_ctx, decode_qlen, 1)
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_mla_metadata_info_v1(
+        batch_size,
+        decode_qlen,
+        NHEAD,
+        dtypes.fp8,
+        dtypes.fp8,
+        is_sparse=False,
+        fast_mode=True,
+        num_kv_splits=max_split_per_batch,
+        intra_batch_mode=False,
+    )
+    work_meta_data = torch.empty(
+        work_meta_data_size, dtype=work_meta_data_type, device="cuda"
+    )
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device="cuda")
+    work_info_set = torch.empty(
+        work_info_set_size, dtype=work_info_set_type, device="cuda"
+    )
+    reduce_indptr = torch.empty(
+        reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
+    )
+    reduce_final_map = torch.empty(
+        reduce_final_map_size, dtype=reduce_final_map_type, device="cuda"
+    )
+    reduce_partial_map = torch.empty(
+        reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
+    )
+    qo_indptr = torch.arange(
+        0, batch_size * decode_qlen + 1, decode_qlen, dtype=torch.int32, device="cuda"
+    )
+    kv_indptr = torch.empty((batch_size + 1,), dtype=torch.int32, device="cuda")
+    kv_indptr[0] = 0
+    kv_indptr[1:] = torch.cumsum(lens.to(torch.int32), dim=0)
+    kv_last_page_lens = torch.ones((batch_size,), dtype=torch.int32, device="cuda")
+    kv_indices = torch.arange(int(lens.sum().item()), dtype=torch.int32, device="cuda")
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        kv_last_page_lens,
+        NHEAD // NHEAD_KV,
+        NHEAD_KV,
+        False,
+        work_meta_data,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        page_size=shape.page_size,
+        kv_granularity=max(shape.page_size, 16),
+        max_seqlen_qo=shape.decode_qlen,
+        uni_seqlen_qo=shape.decode_qlen,
+        fast_mode=True,
+        max_split_per_batch=max_split_per_batch,
+        dtype_q=dtypes.fp8,
+        dtype_kv=dtypes.fp8,
+    )
+    return (
+        qo_indptr,
+        kv_indptr,
+        kv_last_page_lens,
+        kv_indices,
+        work_meta_data,
+        work_indptr,
+        work_info_set,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        max_ctx,
+    )
 
 
 def benchmark_shape(args: argparse.Namespace, shape: MlaShape) -> dict[str, object]:
@@ -536,12 +804,281 @@ def print_row(row: dict[str, object]) -> None:
         )
 
 
+def run_correctness_mode(args: argparse.Namespace) -> None:
+    if NHEAD != 32 or args.decode_qlen != 4:
+        raise ValueError("correctness mode is intended for nhead=32 and decode_qlen=4")
+
+    rows = []
+    for shape in args.shapes:
+        torch.manual_seed(1234 + shape.batch_size * 100000 + shape.ctx_len)
+        q, kv_buffer, qo_indptr, kv_indptr, kv_indices, kv_last_page_lens = make_inputs(
+            shape, shuffle_pages=False
+        )
+        (
+            work_meta_data,
+            work_indptr,
+            work_info_set,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+        ) = make_metadata(
+            shape,
+            args.max_split_per_batch,
+            cap_split_to_cu_per_batch=not args.no_split_cap,
+        )
+
+        asm_out = run_asm_once(
+            q,
+            kv_buffer,
+            shape,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            work_meta_data,
+            work_indptr,
+            work_info_set,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+        )
+        hk_out = run_hk_once(
+            q,
+            kv_buffer,
+            shape,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            work_indptr,
+            work_info_set,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            args.hk_long_kernel,
+        )
+
+        ref = reference_mla(q, kv_buffer, shape)
+        causal_ref = causal_reference_mla(q, kv_buffer, shape)
+        torch.cuda.synchronize()
+
+        metrics = {
+            "asm_ref": error_metrics(ref, asm_out),
+            "hk_ref": error_metrics(ref, hk_out),
+            "asm_causal_ref": error_metrics(causal_ref, asm_out),
+            "hk_causal_ref": error_metrics(causal_ref, hk_out),
+            "hk_asm": error_metrics(asm_out, hk_out),
+        }
+        row: dict[str, object] = {
+            "batch": shape.batch_size,
+            "ctx": shape.ctx_len,
+            "total_kv": shape.total_kv_tokens,
+        }
+        for prefix, vals in metrics.items():
+            for key, value in vals.items():
+                row[f"{prefix}_{key}"] = value
+        rows.append(row)
+        print(
+            f"B={shape.batch_size} ctx={shape.ctx_len} total={shape.total_kv_tokens} | "
+            f"ASM/ref cos={metrics['asm_ref']['cos']:.6f} "
+            f"HK/ref cos={metrics['hk_ref']['cos']:.6f} "
+            f"ASM/causal cos={metrics['asm_causal_ref']['cos']:.6f} "
+            f"HK/causal cos={metrics['hk_causal_ref']['cos']:.6f} "
+            f"HK/ASM cos={metrics['hk_asm']['cos']:.6f}",
+            flush=True,
+        )
+
+    if args.csv:
+        with open(args.csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+def run_graph_replay_mode(args: argparse.Namespace) -> None:
+    if NHEAD != 32 or args.decode_qlen != 4:
+        raise ValueError("graph-replay mode is intended for nhead=32 and decode_qlen=4")
+
+    capture = MlaShape(args.graph_batch, args.graph_capture_ctx, args.decode_qlen, 1)
+    replay = MlaShape(args.graph_batch, args.graph_replay_ctx, args.decode_qlen, 1)
+    replay_meta = make_metadata(
+        replay,
+        args.max_split_per_batch,
+        cap_split_to_cu_per_batch=not args.no_split_cap,
+    )
+    tensors = {
+        "qo_indptr": make_indptr(replay)[0].clone(),
+        "kv_indptr": make_indptr(replay)[1].clone(),
+        "kv_last_page_lens": make_indptr(replay)[2].clone(),
+        "kv_indices": torch.arange(replay.num_pages, dtype=torch.int32, device="cuda"),
+        "work_meta": replay_meta[0].clone(),
+        "work_indptr": replay_meta[1].clone(),
+        "work_info": replay_meta[2].clone(),
+        "reduce_indptr": replay_meta[3].clone(),
+        "reduce_final_map": replay_meta[4].clone(),
+        "reduce_partial_map": replay_meta[5].clone(),
+    }
+
+    q = torch.randn(
+        (replay.total_q, NHEAD, QK_HEAD_DIM), dtype=torch.bfloat16, device="cuda"
+    ).to(dtypes.fp8)
+    kv_buffer = torch.randn(
+        (replay.num_pages, replay.page_size, NHEAD_KV, QK_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).to(dtypes.fp8)
+    graph_split, graph_lse, graph_out = alloc_outputs(
+        replay, tensors["reduce_partial_map"], NHEAD
+    )
+
+    def copy_static_metadata(meta: tuple[torch.Tensor, ...]) -> None:
+        tensors["qo_indptr"].copy_(meta[0])
+        tensors["kv_indptr"].copy_(meta[1])
+        tensors["kv_last_page_lens"].copy_(meta[2])
+        tensors["kv_indices"][: meta[3].numel()].copy_(meta[3])
+        tensors["work_meta"].copy_(meta[4])
+        tensors["work_indptr"].copy_(meta[5])
+        tensors["work_info"].copy_(meta[6])
+        tensors["reduce_indptr"].copy_(meta[7])
+        tensors["reduce_final_map"].copy_(meta[8])
+        tensors["reduce_partial_map"].copy_(meta[9])
+
+    capture_meta = make_metadata(
+        capture,
+        args.max_split_per_batch,
+        cap_split_to_cu_per_batch=not args.no_split_cap,
+    )
+    capture_indptr = make_indptr(capture)
+    copy_static_metadata(
+        (
+            *capture_indptr,
+            torch.arange(capture.num_pages, dtype=torch.int32, device="cuda"),
+            *capture_meta,
+        )
+    )
+
+    def graph_hk_total() -> None:
+        hk_decode = (
+            aiter.hk_mla_decode_fwd_long
+            if args.hk_long_kernel
+            else aiter.hk_mla_decode_fwd
+        )
+        hk_decode(
+            q,
+            kv_buffer,
+            tensors["qo_indptr"],
+            tensors["kv_indptr"],
+            tensors["kv_indices"],
+            tensors["kv_last_page_lens"],
+            tensors["work_indptr"],
+            tensors["work_info"],
+            replay.decode_qlen,
+            1.0 / math.sqrt(QK_HEAD_DIM),
+            graph_split,
+            graph_lse,
+            graph_out,
+        )
+        aiter.mla_reduce_v1(
+            graph_split,
+            graph_lse,
+            tensors["reduce_indptr"],
+            tensors["reduce_final_map"],
+            tensors["reduce_partial_map"],
+            replay.decode_qlen,
+            graph_out,
+            None,
+        )
+
+    for _ in range(3):
+        graph_hk_total()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_hk_total()
+
+    if 0 < args.graph_raw_batch < args.graph_batch:
+        replay_lens = torch.full(
+            (args.graph_batch,), args.graph_pad_ctx, dtype=torch.int32, device="cuda"
+        )
+        replay_lens[: args.graph_raw_batch] = args.graph_replay_ctx
+        meta = make_metadata_from_lens(
+            replay_lens, replay.decode_qlen, args.max_split_per_batch
+        )
+        copy_static_metadata(meta[:-1])
+        compare_tokens = args.graph_raw_batch * replay.decode_qlen
+    else:
+        replay_indptr = make_indptr(replay)
+        copy_static_metadata(
+            (
+                *replay_indptr,
+                torch.arange(replay.num_pages, dtype=torch.int32, device="cuda"),
+                *replay_meta,
+            )
+        )
+        compare_tokens = replay.total_q
+
+    graph.replay()
+    torch.cuda.synchronize()
+    eager_hk = run_hk_once(
+        q,
+        kv_buffer,
+        replay,
+        tensors["qo_indptr"],
+        tensors["kv_indptr"],
+        tensors["kv_indices"],
+        tensors["kv_last_page_lens"],
+        tensors["work_indptr"],
+        tensors["work_info"],
+        tensors["reduce_indptr"],
+        tensors["reduce_final_map"],
+        tensors["reduce_partial_map"],
+        args.hk_long_kernel,
+    )
+    eager_asm = run_asm_once(
+        q,
+        kv_buffer,
+        replay,
+        tensors["qo_indptr"],
+        tensors["kv_indptr"],
+        tensors["kv_indices"],
+        tensors["kv_last_page_lens"],
+        tensors["work_meta"],
+        tensors["work_indptr"],
+        tensors["work_info"],
+        tensors["reduce_indptr"],
+        tensors["reduce_final_map"],
+        tensors["reduce_partial_map"],
+    )
+    ref = reference_mla(q, kv_buffer, replay)
+    comparisons = (
+        ("graph_hk/ref", ref[:compare_tokens], graph_out[:compare_tokens]),
+        ("eager_hk/ref", ref[:compare_tokens], eager_hk[:compare_tokens]),
+        ("asm/ref", ref[:compare_tokens], eager_asm[:compare_tokens]),
+        ("graph_hk/eager_hk", eager_hk[:compare_tokens], graph_out[:compare_tokens]),
+        ("graph_hk/asm", eager_asm[:compare_tokens], graph_out[:compare_tokens]),
+    )
+    for name, expected, actual in comparisons:
+        metrics = error_metrics(expected, actual)
+        print(
+            f"{name}: cos={metrics['cos']:.6f} rmse={metrics['rmse']:.6f} "
+            f"max_abs={metrics['max_abs']:.6f} mean_abs={metrics['mean_abs']:.6f}",
+            flush=True,
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare HipKitten and AITER ASM persistent MLA decode for "
             "DeepSeek-R1 FP8 shapes on gfx950."
         )
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("benchmark", "correctness", "graph-replay"),
+        default="benchmark",
+        help="Run a timing sweep, an HK-vs-ASM/reference correctness check, or a CUDA graph replay check.",
     )
     parser.add_argument("--batch-sizes", default="2,4", type=parse_int_list)
     parser.add_argument(
@@ -573,6 +1110,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", default=100, type=int)
     parser.add_argument("--shuffle-pages", action="store_true")
     parser.add_argument(
+        "--shapes",
+        default=parse_shape_list("1x512,2x2048,4x8192"),
+        type=parse_shape_list,
+        help="Correctness-mode comma-separated BxCTX list.",
+    )
+    parser.add_argument("--graph-batch", default=32, type=int)
+    parser.add_argument("--graph-raw-batch", default=0, type=int)
+    parser.add_argument("--graph-capture-ctx", default=8, type=int)
+    parser.add_argument("--graph-replay-ctx", default=2048, type=int)
+    parser.add_argument("--graph-pad-ctx", default=4, type=int)
+    parser.add_argument(
         "--metadata-stats",
         action="store_true",
         help="Include work split and reduce metadata statistics in CSV/log output.",
@@ -587,6 +1135,13 @@ def main() -> None:
     NHEAD = args.nhead
     torch.manual_seed(0)
     torch.set_default_device("cuda")
+
+    if args.mode == "correctness":
+        run_correctness_mode(args)
+        return
+    if args.mode == "graph-replay":
+        run_graph_replay_mode(args)
+        return
 
     fields = [
         "batch",
