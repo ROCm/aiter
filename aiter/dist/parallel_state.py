@@ -499,6 +499,19 @@ class GroupCoordinator:
             input_, residual_inp_, weight_, eps, group_size, prefill_support,
             emit_bf16=emit_bf16,
         )
+    
+    def fused_qknorm_allreduce(
+        self,
+        qkv_in: torch.Tensor,
+        q_w: torch.Tensor,
+        k_w: torch.Tensor,
+        eps: float,
+    ):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_qknorm_allreduce(
+            qkv_in, q_w, k_w, eps
+        )
 
     def _fused_allreduce_rmsnorm_out_place(
         self,

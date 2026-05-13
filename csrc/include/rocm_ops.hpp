@@ -443,7 +443,9 @@ namespace py = pybind11;
           py::arg("q_out"),                                                                     \
           py::arg("k_out"),                                                                     \
           py::arg("v_out"),                                                                     \
-          py::arg("eps"));                                                                      \
+          py::arg("eps"),                                                                       \
+          py::arg("reg_ptr"),                                                                   \
+          py::arg("reg_bytes"));                                                                \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
     m.def("register_input_buffer",                                                             \

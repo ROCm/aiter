@@ -116,7 +116,7 @@ def tensor_model_parallel_fused_qknorm_allreduce(
     k_w: torch.Tensor,
     eps: float,
 ):
-    return get_tp_group()._fused_qknorm_allreduce_out_place(
+    return get_tp_group().fused_qknorm_allreduce(
         qkv_in,
         q_w,
         k_w,

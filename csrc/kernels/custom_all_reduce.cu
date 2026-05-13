@@ -602,7 +602,9 @@ void fused_qknorm_allreduce(fptr_t _fa,
                             const aiter_tensor_t& q_out,
                             const aiter_tensor_t& k_out,
                             const aiter_tensor_t& v_out,
-                            double eps)
+                            double eps,
+                            int64_t reg_ptr,
+                            int64_t reg_bytes)
 {
     HipDeviceGuard device_guard(qkv_in.device_id);
     hipStream_t stream   = aiter::getCurrentHIPStream();
@@ -612,21 +614,32 @@ void fused_qknorm_allreduce(fptr_t _fa,
     int64_t token_num    = qkv_in.size(0);
     int64_t hidden_dim_v = qkv_in.size(1) - (hidden_dim_q + hidden_dim_k);
     auto fa              = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int64_t data_bytes   = qkv_in.numel() * qkv_in.element_size();
+    void* inp_ptr        = qkv_in.data_ptr();
 
-#define DISPATCH_AR_FUSION(DTYPE)                                                            \
-    {                                                                                        \
-        fa->dispatchFusedQKNormAllReduce<DTYPE>(stream,                                      \
-                                                reinterpret_cast<DTYPE*>(qkv_in.data_ptr()), \
-                                                reinterpret_cast<DTYPE*>(q_w.data_ptr()),    \
-                                                reinterpret_cast<DTYPE*>(k_w.data_ptr()),    \
-                                                reinterpret_cast<DTYPE*>(q_out.data_ptr()),  \
-                                                reinterpret_cast<DTYPE*>(k_out.data_ptr()),  \
-                                                reinterpret_cast<DTYPE*>(v_out.data_ptr()),  \
-                                                token_num,                                   \
-                                                hidden_dim_q,                                \
-                                                hidden_dim_k,                                \
-                                                hidden_dim_v,                                \
-                                                eps);                                        \
+    if(reg_ptr != 0)
+    {
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, qkv_in.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        inp_ptr = (void*)reg_ptr;
+    }
+
+#define DISPATCH_AR_FUSION(DTYPE)                                                           \
+    {                                                                                       \
+        fa->dispatchFusedQKNormAllReduce<DTYPE>(stream,                                     \
+                                                reinterpret_cast<DTYPE*>(inp_ptr),          \
+                                                reinterpret_cast<DTYPE*>(q_w.data_ptr()),   \
+                                                reinterpret_cast<DTYPE*>(k_w.data_ptr()),   \
+                                                reinterpret_cast<DTYPE*>(q_out.data_ptr()), \
+                                                reinterpret_cast<DTYPE*>(k_out.data_ptr()), \
+                                                reinterpret_cast<DTYPE*>(v_out.data_ptr()), \
+                                                token_num,                                  \
+                                                hidden_dim_q,                               \
+                                                hidden_dim_k,                               \
+                                                hidden_dim_v,                               \
+                                                eps);                                       \
     }
 
     switch(dtype)

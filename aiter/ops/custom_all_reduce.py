@@ -123,6 +123,8 @@ def fused_qknorm_allreduce(
     k_out: torch.Tensor,
     v_out: torch.Tensor,
     eps: float,
+    reg_ptr: int,
+    reg_bytes: int,
 ) -> None: ...
 
 

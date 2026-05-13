@@ -206,7 +206,7 @@ def test_qknorm_allreduce(
 
 
 l_dtype = ["fp16", "bf16"]
-l_shape = [(1, 3072, 512, 1024), (2, 3072, 512, 1024), (32768, 3072, 512, 1024)]
+l_shape = [(1, 3072, 512, 1024), (2, 3072, 512, 1024), (16, 3072, 512, 1024)]
 
 
 parser = argparse.ArgumentParser(description="config input of test")

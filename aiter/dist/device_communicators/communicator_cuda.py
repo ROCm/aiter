@@ -343,7 +343,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         k_w,
         eps,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_out, k_out, v_out = self.ca_comm.fused_qknorm_ar(
+        q_out, k_out, v_out = self.ca_comm.custom_fused_qknorm_ar(
             qkv_in, q_w, k_w, eps
         )
         assert q_out is not None
