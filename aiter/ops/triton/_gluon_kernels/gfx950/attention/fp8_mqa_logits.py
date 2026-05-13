@@ -35,10 +35,6 @@ def _load_kv_scales_block(
     end_ind=0,
     masked: gl.constexpr = False,
 ):
-    # When `end_off` is provided, positions j with `offset_into_segment + j >= end_off`
-    # are masked out (predicated load). Mirrors `load_to_shared`'s `end_row` for
-    # safely loading scales that straddle the segment boundary; pass `end_off=None`
-    # for unmasked loads.
     offsets = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, mfma_layout))
     if masked:
         mask = offsets < (end_ind - offset_into_segment)
@@ -62,8 +58,7 @@ def _store_logits_block(
     USE_BUFFER_STORE: gl.constexpr,
     mask=None,
 ):
-    # buffer_store caps at 2 GB; fall back to global store
-    # scores = scores.to(logits_ptr.type.element_ty)
+    # buffer_store caps at 2 GB
     if mask is None:
         if USE_BUFFER_STORE:
             gl.amd.cdna4.buffer_store(scores, ptr=logits_ptr, offsets=store_offsets)
@@ -80,9 +75,12 @@ def _store_logits_block(
 
 @gluon.constexpr_function
 def _offset_bases_to_blocked(offset_bases, contiguity, num_warps, warp_size, shape):
-    # Mirrors Triton's CoalesceAsyncCopy partition: lg2(C) bases to reg,
-    # lg2(WS) to lane, lg2(NW) to warp, leftovers back to reg. Keeps the
-    # blocked layout in sync with the shared layout so async-copy folds.
+    # Mirrors Triton's CoalesceAsyncCopy partition: 
+    # lg2(C) bases to reg,
+    # lg2(WS) to lane, 
+    # lg2(NW) to warp, 
+    # leftovers back to reg. 
+    # Keeps the blocked layout in sync with the shared layout so async-copy folds.
     rank = len(shape)
     lg2_c = contiguity.bit_length() - 1
     lg2_nw = num_warps.bit_length() - 1
@@ -109,10 +107,10 @@ def _offset_bases_to_blocked(offset_bases, contiguity, num_warps, warp_size, sha
 
 @gluon.constexpr_function
 def _make_kv_load_layouts_cdna4(HEAD_SIZE, BLOCK_KV, NUM_WARPS, WARP_SIZE):
-    # K [HEAD_SIZE, BLOCK_KV] fp8 layouts. Triton >= 3.7: XOR-swizzle dim1
+    # K [HEAD_SIZE, BLOCK_KV] fp8 layouts. XOR-swizzle dim1
     # to break LDS bank-conflict periodicity + interval padding every 1 KiB;
     # the matching blocked layout lets CoalesceAsyncCopy fold async-copy +
-    # shared store. Older Triton: simpler swizzled fallback.
+    # shared store. Older Triton: simple fallback.
     CONTIGUITY = 16  # 128-bit vector / 8-bit fp8
     if TRITON_BEYOND_37:
         LG2_HS = HEAD_SIZE.bit_length() - 1
@@ -443,7 +441,7 @@ def mqa_logits_loop_double_buf(
 
     # Body: full tiles only. With loop bound `num_full_tiles - 2`, the prefetch
     # at i+2 is guaranteed to address a full tile (i+2 in [2, num_full_tiles-1]),
-    # so no clamping or mask is needed here.
+    # so no mask is needed
     buf_cur: gl.int32 = 0
     for i in tl.range(0, num_full_tiles - 2):
         kv_scales = _load_kv_scales_block(
@@ -475,10 +473,7 @@ def mqa_logits_loop_double_buf(
         kv_pos += BLOCK_KV
         buf_cur = 1 - buf_cur
 
-    # Peel: second-to-last full tile. Its prefetch (tile num_full_tiles) straddles
-    # the segment boundary -- pass `end_row=end_ind` so the async loader masks
-    # OOB rows. (TDM loader ignores end_row.) Only run when there are at least
-    # 2 full tiles; otherwise the existing peels below already cover all cases.
+    # Peel to not have OOB when prefetching
     if num_full_tiles > 1:
         kv_scales = _load_kv_scales_block(
             kv_scales_ptr,
@@ -532,7 +527,6 @@ def mqa_logits_loop_double_buf(
     )
     scores = scores * kv_scales
     # Masked: handles num_full_tiles == 0 (segment shorter than BLOCK_KV).
-    # For num_full_tiles >= 1 the mask is all-true on this tile, no-op cost.
     mask = store_arange < (end_ind - kv_pos)
     _store_logits_block(logits_ptr, store_offsets, scores, USE_BUFFER_STORE, mask=mask)
 
@@ -541,7 +535,7 @@ def mqa_logits_loop_double_buf(
     kv_pos += BLOCK_KV
     buf_cur = 1 - buf_cur
 
-    # Peel: partial tail (mask is a no-op when the tail is empty)
+    # Peel: partial tail
     kv_scales = _load_kv_scales_block(
         kv_scales_ptr,
         kv_scales_off,
