@@ -17,6 +17,7 @@ from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import
     _bwd_dkv_hg_fused,
     _bwd_dkv_privatized,
     _bwd_dkv_xcd_local,
+    _bwd_dkv_nonatomic_scatter,
     _bwd_dkv_reduce_copies,
     _sparse_mla_bwd_preprocess,
 )
@@ -139,24 +140,51 @@ def run_config(seq_len=4096, num_heads=128, kv_lora_rank=512, rope_rank=64, topk
             NUM_COPIES=num_xcd, BLOCK=reduce_block,
         )
 
+    def run_dkv_nonatomic():
+        _bwd_dkv_nonatomic_scatter[(T,)](
+            q_t, do_t, dS, P, topk_idx, dkv,
+            q_t.stride(0), do_t.stride(0),
+            dS.stride(0), dS.stride(1),
+            topk_idx.stride(0), dkv.stride(0),
+            H,
+            TOPK=topk, TILE_K=64, BLOCK_H=bh,
+            NUM_HG=num_hg, D_V=DV, D_ROPE=DR,
+            num_warps=4, num_stages=1,
+        )
+
     ms_dq           = bench(run_dq, reps)
     ms_dkv_fused    = bench(run_dkv_hg_fused, reps)
     ms_dkv_private  = bench(run_dkv_privatized, reps)
     ms_dkv_xcd      = bench(run_dkv_xcd_local, reps)
+    ms_dkv_nonatomic = bench(run_dkv_nonatomic, reps)
+
+    bw_peak = 5.3e6  # MB/s (5.3 TB/s)
+    fetch_gb = 19.0  # measured ~19 GB for all variants
+    write_atomic_gb = 36.0
+    write_nonatomic_gb = 8.1
+    t_bw_atomic   = (fetch_gb + write_atomic_gb)   * 1e3 / bw_peak  # ms
+    t_bw_nonatomic = (fetch_gb + write_nonatomic_gb) * 1e3 / bw_peak  # ms
 
     label = f"S{seq_len}_H{num_heads}_topk{topk}"
     print(f"\n  {label}")
-    print(f"  {'Kernel':<32s}  {'Time (ms)':>10s}  {'% of split_int total':>20s}")
-    print(f"  {'-'*68}")
-    total_split = ms_dq + ms_dkv_fused
-    print(f"  {'dQ (store_intermediates)':<32s}  {ms_dq:10.2f}  {ms_dq/total_split*100:19.1f}%")
-    print(f"  {'dKV (hg_fused)':<32s}  {ms_dkv_fused:10.2f}  {ms_dkv_fused/total_split*100:19.1f}%")
-    print(f"  {'dKV (privatized x8, i%8)':<32s}  {ms_dkv_private:10.2f}  {ms_dkv_private/total_split*100:19.1f}%")
-    print(f"  {'dKV (xcd_local x8, (i%304)//38)':<32s}  {ms_dkv_xcd:10.2f}  {ms_dkv_xcd/total_split*100:19.1f}%")
-    print(f"  {'-'*68}")
-    print(f"  {'dQ + dKV_fused (expected total)':<32s}  {total_split:10.2f}")
-    print(f"  {'dQ + dKV_privatized':<32s}  {ms_dq + ms_dkv_private:10.2f}")
-    print(f"  {'dQ + dKV_xcd_local':<32s}  {ms_dq + ms_dkv_xcd:10.2f}")
+    print(f"  {'Kernel':<36s}  {'Time (ms)':>10s}  {'vs hg_fused':>12s}")
+    print(f"  {'-'*64}")
+    print(f"  {'dKV (hg_fused, atomic)':<36s}  {ms_dkv_fused:10.2f}  {'baseline':>12s}")
+    print(f"  {'dKV (privatized x8, i%8)':<36s}  {ms_dkv_private:10.2f}  {ms_dkv_private/ms_dkv_fused:11.2f}x")
+    print(f"  {'dKV (xcd_local x8, (i%304)//38)':<36s}  {ms_dkv_xcd:10.2f}  {ms_dkv_xcd/ms_dkv_fused:11.2f}x")
+    print(f"  {'dKV (nonatomic, wrong results)':<36s}  {ms_dkv_nonatomic:10.2f}  {ms_dkv_nonatomic/ms_dkv_fused:11.2f}x")
+    print(f"  {'-'*64}")
+    print(f"  {'Theoretical min (BW only, atomic)':<36s}  {t_bw_atomic:10.2f}  {'(55GB/5.3TBs)':>12s}")
+    print(f"  {'Theoretical min (BW only, nonatomic)':<36s}  {t_bw_nonatomic:10.2f}  {'(27GB/5.3TBs)':>12s}")
+    print(f"  {'-'*64}")
+    print(f"  Atomic overhead above nonatomic:  {ms_dkv_fused - ms_dkv_nonatomic:.2f} ms")
+    print(f"  Nonatomic overhead above BW floor: {ms_dkv_nonatomic - t_bw_nonatomic:.2f} ms  "
+          f"(random scatter latency)")
+    print(f"  Atomic serialization stalls:       "
+          f"{ms_dkv_fused - ms_dkv_nonatomic - (t_bw_atomic - t_bw_nonatomic):.2f} ms  (estimated)")
+    print(f"\n  dQ benchmark:")
+    print(f"  {'dQ (store_intermediates)':<36s}  {ms_dq:10.2f}")
+    print(f"  {'dQ + dKV_fused (split_int total)':<36s}  {ms_dq + ms_dkv_fused:10.2f}")
 
 
 def main():
