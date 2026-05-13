@@ -40,6 +40,79 @@ AITER_MOE_EXPERT_BALANCE = (
 )
 
 
+_STAGE_EVENT_BUCKETS = {"stage1": [], "stage2": []}
+_STAGE_EVENT_PATCHED = False
+
+
+def _install_stage_event_patches():
+    """Wrap ``aiter.fused_moe._gfx1250_moe_stage{1,2}`` with cuda.Event
+    bracketing so the existing fused timing path can also report
+    per-stage median/mean/min/max alongside ``[cuda.Event] moe fused us``.
+
+    Each wrapped call records exactly one (start, end) ``cuda.Event``
+    pair and appends it to ``_STAGE_EVENT_BUCKETS[stage_name]``.  The
+    timing path clears the buckets right before the timed loop and
+    reads them after ``torch.cuda.synchronize()``.
+
+    Notes:
+    - ``get_2stage_cfgs`` caches a ``functools.partial`` over the
+      *original* function reference (captured at partial-creation
+      time), so we must (a) install the wrappers *before* the first
+      ``fused_moe`` call, and (b) ``cache_clear()`` so subsequent
+      ``MOEMetadata`` instances rebuild partials around the wrapped
+      symbols.  Doing both at module import time satisfies (a)
+      naturally because ``test_fmoe`` is the first caller.
+    - Gated by ``AITER_MOE_STAGE_SPLIT_EVENT`` (default on; set ``0``
+      to opt out, e.g. when running with ``AITER_MOE_USE_GRAPH=1``
+      since CUDAGraph replay does not cooperate with the per-call
+      event-list append pattern used here).
+    """
+    global _STAGE_EVENT_PATCHED
+    if _STAGE_EVENT_PATCHED:
+        return
+    if int(os.environ.get("AITER_MOE_STAGE_SPLIT_EVENT", "1")) == 0:
+        return
+    try:
+        import aiter.fused_moe as _fm
+    except Exception:
+        return
+    if not hasattr(_fm, "_gfx1250_moe_stage1") or not hasattr(
+        _fm, "_gfx1250_moe_stage2"
+    ):
+        return
+
+    def _wrap(stage_name, orig_fn):
+        def _stage_event_wrapper(*args, **kwargs):
+            ev_start = torch.cuda.Event(enable_timing=True)
+            ev_end = torch.cuda.Event(enable_timing=True)
+            ev_start.record()
+            ret = orig_fn(*args, **kwargs)
+            ev_end.record()
+            _STAGE_EVENT_BUCKETS[stage_name].append((ev_start, ev_end))
+            return ret
+
+        _stage_event_wrapper.__wrapped__ = orig_fn
+        _stage_event_wrapper.__name__ = getattr(
+            orig_fn, "__name__", "_stage_event_wrapper"
+        )
+        return _stage_event_wrapper
+
+    _fm._gfx1250_moe_stage1 = _wrap("stage1", _fm._gfx1250_moe_stage1)
+    _fm._gfx1250_moe_stage2 = _wrap("stage2", _fm._gfx1250_moe_stage2)
+    if hasattr(_fm, "get_2stage_cfgs") and hasattr(
+        _fm.get_2stage_cfgs, "cache_clear"
+    ):
+        _fm.get_2stage_cfgs.cache_clear()
+    _STAGE_EVENT_PATCHED = True
+    aiter.logger.info(
+        "[test_moe_2stage] installed stage1/stage2 cuda.Event patch "
+        "(disable via AITER_MOE_STAGE_SPLIT_EVENT=0)"
+    )
+
+
+_install_stage_event_patches()
+
+
 def _gfx1250_fp8_round_trip_bf16(x: torch.Tensor) -> torch.Tensor:
     """Quantise ``x`` (any float dtype) to per-1x32 mxfp8 (e4m3fn bytes,
     e8m0 scale, dtype_max=240) and immediately dequantise back to bf16.
@@ -566,6 +639,18 @@ def test_fmoe(
 
         _starts = [torch.cuda.Event(enable_timing=True) for _ in range(_num_iters)]
         _ends = [torch.cuda.Event(enable_timing=True) for _ in range(_num_iters)]
+        # ``_STAGE_EVENT_BUCKETS`` has been collecting per-stage event
+        # pairs during warmup; reset them here so the post-loop summary
+        # reflects only the ``_num_iters`` timed iterations.  CUDAGraph
+        # capture is skipped above because graph replay doesn't
+        # re-execute the Python-side ``append(...)`` -- so per-stage
+        # split is reported only on this non-graph branch.
+        _stage_event_split_enabled = (
+            _STAGE_EVENT_PATCHED and not _use_graph
+        )
+        if _stage_event_split_enabled:
+            _STAGE_EVENT_BUCKETS["stage1"].clear()
+            _STAGE_EVENT_BUCKETS["stage2"].clear()
         for _i in range(_num_iters):
             if _l2_buf is not None:
                 _l2_buf.zero_()
@@ -591,6 +676,58 @@ def test_fmoe(
         _l2_flush,
         _use_graph,
     )
+
+    def _summarize_event_us(pair_list, max_pairs):
+        """Reduce a list of ``(start, end) cuda.Event`` pairs into
+        ``(median, mean, min, max, n)`` in microseconds.  Returns
+        ``None`` if no pairs were captured.  Caller is responsible for
+        having issued ``torch.cuda.synchronize()`` first so
+        ``elapsed_time`` is valid for every pair."""
+        if not pair_list:
+            return None
+        pairs = pair_list[-max_pairs:] if max_pairs else pair_list
+        vals_us = sorted(s.elapsed_time(e) * 1000.0 for s, e in pairs)
+        return (
+            vals_us[len(vals_us) // 2],
+            sum(vals_us) / len(vals_us),
+            vals_us[0],
+            vals_us[-1],
+            len(vals_us),
+        )
+
+    _stage_summary_active = (
+        _STAGE_EVENT_PATCHED
+        and not _use_graph
+        and (
+            _STAGE_EVENT_BUCKETS["stage1"] or _STAGE_EVENT_BUCKETS["stage2"]
+        )
+    )
+    if _stage_summary_active:
+        _s1 = _summarize_event_us(
+            _STAGE_EVENT_BUCKETS["stage1"], _num_iters
+        )
+        _s2 = _summarize_event_us(
+            _STAGE_EVENT_BUCKETS["stage2"], _num_iters
+        )
+        if _s1 is not None:
+            aiter.logger.info(
+                "[cuda.Event] moe stage1 us: median=%.2f mean=%.2f "
+                "min=%.2f max=%.2f (iters=%d)",
+                _s1[0], _s1[1], _s1[2], _s1[3], _s1[4],
+            )
+        if _s2 is not None:
+            aiter.logger.info(
+                "[cuda.Event] moe stage2 us: median=%.2f mean=%.2f "
+                "min=%.2f max=%.2f (iters=%d)",
+                _s2[0], _s2[1], _s2[2], _s2[3], _s2[4],
+            )
+        if _s1 is not None and _s2 is not None:
+            _med_sum = _s1[0] + _s2[0]
+            aiter.logger.info(
+                "[cuda.Event] moe stage1+stage2 median sum: %.2f us "
+                "(fused median=%.2f, gap=%+.2f us = launch/overhead)",
+                _med_sum, us2, us2 - _med_sum,
+            )
     # gfx1250 FlyDSL paths inherently have block-quant noise (mxfp8/mxfp4)
     # that compounds over K-sums.  FlyDSL UT
     # (test_moe_gemm_mxscale_gfx1250.py:542 + test_common.verify_output)

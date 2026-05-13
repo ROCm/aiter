@@ -16,6 +16,6 @@ ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=0 python op_tests/test_moe_2stage.py -t 1
 # the silent default in aiter/fused_moe.py::get_2stage_cfgs.
 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
   -t 64 -dim 7168,2048 -e 256 -k 8 -q 4 --no-flydsl-csv -hip 0,0 \
-  -tn 128 -tk 128 -bm 16 --stage2-tile-n 128 --stage2-tile-k 128
+  -tn 128 -tk 512 -bm 16 --stage2-tile-n 128 --stage2-tile-k 128
 
 # ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=0 python op_tests/test_moe_2stage.py -t 1 -dim 256,1024 -e 8 -k 2 -q 4 --no-flydsl-csv -hip 0,0
