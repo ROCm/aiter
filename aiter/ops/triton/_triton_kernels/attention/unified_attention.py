@@ -88,10 +88,15 @@ def kernel_unified_attention_2d(
     stride_k_cache_1: tl.int64,  # int
     stride_k_cache_2: tl.int64,  # int
     stride_k_cache_3: tl.constexpr,  # int
+    stride_k_cache_4: tl.int64,  # int (5th dimension for SHUFFLE)
     stride_v_cache_0: tl.int64,  # int
     stride_v_cache_1: tl.int64,  # int
     stride_v_cache_2: tl.int64,  # int
     stride_v_cache_3: tl.constexpr,  # int
+    stride_v_cache_4: tl.int64,  # int (5th dimension for SHUFFLE)
+    USE_SHUFFLE: tl.constexpr,  # bool
+    X_K: tl.constexpr,  # int (X-packing factor for K)
+    X_V: tl.constexpr,  # int (X-packing factor for V)
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
@@ -419,10 +424,15 @@ def kernel_unified_attention_3d(
     stride_k_cache_1: tl.int64,  # int
     stride_k_cache_2: tl.int64,  # int
     stride_k_cache_3: tl.constexpr,  # int
+    stride_k_cache_4: tl.int64,  # int (5th dimension for SHUFFLE)
     stride_v_cache_0: tl.int64,  # int
     stride_v_cache_1: tl.int64,  # int
     stride_v_cache_2: tl.int64,  # int
     stride_v_cache_3: tl.constexpr,  # int
+    stride_v_cache_4: tl.int64,  # int (5th dimension for SHUFFLE)
+    USE_SHUFFLE: tl.constexpr,  # bool
+    X_K: tl.constexpr,  # int (X-packing factor for K)
+    X_V: tl.constexpr,  # int (X-packing factor for V)
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,

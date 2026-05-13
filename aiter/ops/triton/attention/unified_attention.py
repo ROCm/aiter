@@ -143,12 +143,54 @@ def unified_attention(
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
-    block_size = v.shape[1]
+    # Detect layout from K/V cache tensor dimensions
+    if len(k.shape) == 5:
+        # SHUFFLE layout:
+        # K: [num_blocks, num_kv_heads, head_size//X, block_size, X]
+        # V: [num_blocks, num_kv_heads, block_size//X, head_size, X]
+        USE_SHUFFLE = True
+        num_blocks_k, num_kv_heads_k, dim_groups_k, block_size_k, X_k = k.shape
+        num_blocks_v, num_kv_heads_v, block_tokens_v, head_size_v, X_v = v.shape
+
+        assert len(v.shape) == 5, "V must also be 5D if K is 5D (SHUFFLE)"
+        assert num_kv_heads_k == num_kv_heads_v, "K and V must have same num_kv_heads"
+        assert num_blocks_k == num_blocks_v, "K and V must have same num_blocks"
+
+        num_kv_heads = num_kv_heads_k
+        head_size = dim_groups_k * X_k
+        block_size = block_size_k
+
+        # Verify V dimensions
+        assert head_size == head_size_v, (
+            f"K head_size {head_size} != V head_size {head_size_v}"
+        )
+        assert block_tokens_v * X_v == block_size, (
+            f"V block_size mismatch: {block_tokens_v} * {X_v} != {block_size}"
+        )
+
+    elif len(k.shape) == 4:
+        # NHD layout: [num_blocks, block_size, num_kv_heads, head_size]
+        USE_SHUFFLE = False
+        num_blocks, block_size, num_kv_heads, head_size_k = k.shape
+        assert len(v.shape) == 4, "V must also be 4D if K is 4D (NHD)"
+        assert v.shape == k.shape, "K and V must have same shape in NHD layout"
+        X_k = X_v = 1  # No X-packing in NHD
+        head_size = head_size_k
+
+    else:
+        raise ValueError(
+            f"Invalid K cache shape: {k.shape}. Expected 4D (NHD) or 5D (SHUFFLE)"
+        )
+
+    # Continue with common parameters
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
-    num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
-    head_size = q.shape[2]
+    head_size_from_q = q.shape[2]
+
+    assert head_size == head_size_from_q, (
+        f"K/V head_size {head_size} != Q head_size {head_size_from_q}"
+    )
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -233,10 +275,15 @@ def unified_attention(
             stride_k_cache_1=k.stride(1),
             stride_k_cache_2=k.stride(2),
             stride_k_cache_3=k.stride(3),
+            stride_k_cache_4=k.stride(4) if USE_SHUFFLE else 0,
             stride_v_cache_0=v.stride(0),
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            stride_v_cache_4=v.stride(4) if USE_SHUFFLE else 0,
+            USE_SHUFFLE=USE_SHUFFLE,
+            X_K=X_k,
+            X_V=X_v,
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
             ALL_DECODE=ALL_DECODE,
@@ -311,10 +358,15 @@ def unified_attention(
             stride_k_cache_1=k.stride(1),
             stride_k_cache_2=k.stride(2),
             stride_k_cache_3=k.stride(3),
+            stride_k_cache_4=k.stride(4) if USE_SHUFFLE else 0,
             stride_v_cache_0=v.stride(0),
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            stride_v_cache_4=v.stride(4) if USE_SHUFFLE else 0,
+            USE_SHUFFLE=USE_SHUFFLE,
+            X_K=X_k,
+            X_V=X_v,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
