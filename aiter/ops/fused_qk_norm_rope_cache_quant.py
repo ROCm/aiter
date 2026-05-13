@@ -157,6 +157,30 @@ def _fused_qk_rmsnorm_kernel(
 _FUSED_QK_FALLBACK_M = 16384
 
 
+# Bypass torch.compile / Dynamo on this Python-side dispatcher.
+# The dispatcher mixes Optional[Tensor] (often None) with Tensor and float
+# args. Under Inductor compilation, the mixed schema confuses arg routing:
+# Optional[Tensor]=None args get folded as compile-time constants and the
+# remaining float args end up at positions where Tensor args are expected,
+# producing `AttributeError: 'float' object has no attribute 'size'` at the
+# `q.size(0)` dispatch check below. See issue #3172.
+#
+# Why this rather than @torch.library.custom_op:
+#   Registering as a custom op surfaces the bug as an explicit Tensor/float
+#   type-check failure but does NOT fix the underlying Inductor mishandling
+#   of Optional[Tensor]+float mixed schemas — the FX-compiled call still
+#   passes args in the wrong positions. @torch.compiler.disable is the
+#   smallest change that actually unblocks Kimi-K2.5-MXFP4 serving.
+#
+# Perf cost: ~0.3% per token at most. The barrier adds ~1-3 μs per call;
+# Kimi calls this op once per of ~64 layers per token, so ~200 μs added on
+# top of 50-200 ms total per-token inference time. Within the noise floor
+# of normal serving variance, well below typical perf-test threshold of 1%.
+#
+# The actual kernel call (`_fused_qk_rmsnorm_kernel`, decorated with
+# `@compile_ops`) and the fallback `rmsnorm` op below remain torch.compile-
+# friendly when called from outside this dispatcher.
+@torch.compiler.disable
 def _fused_qk_rmsnorm(
     q_out: Optional[Tensor],
     q: Tensor,
