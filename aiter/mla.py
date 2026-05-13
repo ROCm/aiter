@@ -15,6 +15,19 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.core import is_experimental_enabled
 
 
+def _hk_mla_gfx950_h32_max_ctx_per_seq(batch_size: int) -> int:
+    # H32 qlen=4, page_size=1 on the PR3072 MI35x m16x8 path.
+    if batch_size <= 8:
+        return 70000
+    if batch_size <= 16:
+        return 49152
+    if batch_size <= 32:
+        return 16384
+    if batch_size <= 64:
+        return 8192
+    return 0
+
+
 @triton.jit
 def _fwd_kernel_stage2_asm(
     Mid_O,
@@ -460,9 +473,27 @@ def mla_decode_fwd(
             else None
         )
 
-        use_hk = (
+        hk_h32_q4 = (
+            get_gfx() == "gfx950"
+            and nhead == 32
+            and max_seqlen_q == 4
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+        )
+        hk_h32_q4_max_ctx = _hk_mla_gfx950_h32_max_ctx_per_seq(bs)
+        hk_h32_q4_avg_ctx = (total_kv + bs - 1) // bs
+        use_hk_h32_q4 = (
+            hk_h32_q4
+            and page_size == 1
+            and hk_h32_q4_max_ctx > 0
+            and hk_h32_q4_avg_ctx <= hk_h32_q4_max_ctx
+            and is_experimental_enabled()
+        )
+
+        use_hk = use_hk_h32_q4 or (
             get_gfx() in ("gfx942", "gfx950")
             and nhead * max_seqlen_q == 128
+            and not hk_h32_q4
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
             and page_size in (1, 64)

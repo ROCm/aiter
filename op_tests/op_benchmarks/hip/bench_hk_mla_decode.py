@@ -424,9 +424,6 @@ def benchmark_shape(args: argparse.Namespace, shape: MlaShape) -> dict[str, obje
             }
         )
 
-    if shape.page_size != 1:
-        return row
-
     (
         _hk_work_meta_data,
         hk_work_indptr,
