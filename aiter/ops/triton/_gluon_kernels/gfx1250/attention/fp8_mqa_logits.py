@@ -902,7 +902,7 @@ def mqa_logits_loop_pipelined_pingpong(
 
 
 @gluon.jit
-def fp8_mqa_logits_kernel(
+def _gluon_fp8_mqa_logits_kernel(
     Q_ptr,  # fp8e4m3 [seq_len, NUM_HEADS, HEAD_SIZE]
     KV_ptr,  # fp8e4m3 [seq_len_kv, HEAD_SIZE]
     kv_scales_ptr,  # fp32   [seq_len_kv]
