@@ -473,6 +473,7 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
+    _s1_tn, _s1_tk, _s1_bm, _s2_tn, _s2_tk = _gfx1250_tile_env_overrides()
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
@@ -489,6 +490,11 @@ def fused_moe_(
         hidden_pad,
         intermediate_pad,
         isShuffled,
+        stage1_tile_n=_s1_tn,
+        stage1_tile_k=_s1_tk,
+        stage1_block_m=_s1_bm,
+        stage2_tile_n=_s2_tn,
+        stage2_tile_k=_s2_tk,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -1383,6 +1389,50 @@ def _flydsl_stage2_wrapper(
     )
 
 
+def _gfx1250_tile_env_overrides():
+    """Read ``AITER_GFX1250_*`` tile-config env vars.
+
+    Returns a 5-tuple ``(stage1_tile_n, stage1_tile_k, stage1_block_m,
+    stage2_tile_n, stage2_tile_k)`` where each entry is ``int`` if the
+    env var is set to a positive integer, else ``None`` (fall back to
+    the hardcoded default in ``get_2stage_cfgs``).
+
+    Designed to be called at each ``get_2stage_cfgs`` call site so the
+    resolved values become part of the ``lru_cache`` key; that way two
+    runs with different env settings get distinct cache entries instead
+    of silently sharing the first one's metadata.
+
+    Env vars recognised:
+
+    * ``AITER_GFX1250_STAGE1_TILE_N``
+    * ``AITER_GFX1250_STAGE1_TILE_K``
+    * ``AITER_GFX1250_BLOCK_M`` (== stage1/stage2 ``tile_m`` /
+      ``route_tile_m`` -- shared by both stages in the current
+      ``MOEMetadata.block_m`` plumbing)
+    * ``AITER_GFX1250_STAGE2_TILE_N``
+    * ``AITER_GFX1250_STAGE2_TILE_K``
+
+    Unset / empty / non-positive values fall back to ``None``.
+    """
+    def _g(name):
+        v = os.environ.get(name, "")
+        if not v:
+            return None
+        try:
+            iv = int(v)
+        except ValueError:
+            return None
+        return iv if iv > 0 else None
+
+    return (
+        _g("AITER_GFX1250_STAGE1_TILE_N"),
+        _g("AITER_GFX1250_STAGE1_TILE_K"),
+        _g("AITER_GFX1250_BLOCK_M"),
+        _g("AITER_GFX1250_STAGE2_TILE_N"),
+        _g("AITER_GFX1250_STAGE2_TILE_K"),
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -1400,6 +1450,16 @@ def get_2stage_cfgs(
     hidden_pad,
     intermediate_pad,
     is_shuffled=True,
+    # gfx1250 FlyDSL tile overrides. ``None`` -> fall back to the
+    # hardcoded default below. These are part of the lru_cache key so
+    # callers can switch tile shape per-run without poisoning the
+    # cache. Plumbed from env vars by the call sites; see
+    # ``_gfx1250_tile_env_overrides``.
+    stage1_tile_n=None,
+    stage1_tile_k=None,
+    stage1_block_m=None,
+    stage2_tile_n=None,
+    stage2_tile_k=None,
 ):
     _INDEX_COLS = [
         "cu_num",
@@ -1423,10 +1483,24 @@ def get_2stage_cfgs(
         if gfx1250_fmt is not None:
             out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
             is_mxscale = gfx1250_fmt in ("fp4", "fp8", "a8w4")
-            default_tile_n = 128 if is_mxscale else 64
-            default_tile_k = 128 if is_mxscale else 64
+            # Hardcoded defaults; callers (e.g. op_tests/test_moe_2stage.py)
+            # can override via ``stage1_tile_n`` / ``stage1_tile_k`` /
+            # ``stage1_block_m`` / ``stage2_tile_n`` / ``stage2_tile_k``
+            # kwargs (each plumbed in from ``AITER_GFX1250_*`` env vars at
+            # the call site). ``None`` here keeps the historical defaults.
+            _default_tile_n = 128 if is_mxscale else 64
+            _default_tile_k = 128 if is_mxscale else 64
             # default_block_m = 32
-            default_block_m = 16
+            _default_block_m = 16
+            default_tile_n = (
+                stage1_tile_n if stage1_tile_n is not None else _default_tile_n
+            )
+            default_tile_k = (
+                stage1_tile_k if stage1_tile_k is not None else _default_tile_k
+            )
+            default_block_m = (
+                stage1_block_m if stage1_block_m is not None else _default_block_m
+            )
             # FlyDSL UT (test_moe_gemm_mxscale_gfx1250.py) quantises the
             # stage-1 output for a8w4 with ``_per_1x32_fp8_quant`` (fp8
             # activation × fp4 weight, i.e. another ``a8w4`` GEMM), not
@@ -1434,8 +1508,23 @@ def get_2stage_cfgs(
             # caller's gfx1250_fmt for fp4/fp8/a8w4 alike.
             stage2_fmt = gfx1250_fmt
             stage2_is_mxscale = stage2_fmt in ("fp4", "fp8", "a8w4")
-            stage2_tile_n = 128 if stage2_is_mxscale else 64
-            stage2_tile_k = 128 if stage2_is_mxscale else 64
+            _stage2_default_tile_n = 128 if stage2_is_mxscale else 64
+            _stage2_default_tile_k = 128 if stage2_is_mxscale else 64
+            # Local var names ``stage2_tile_n``/``stage2_tile_k`` are
+            # already function kwargs holding the caller override (or
+            # ``None``); resolve into the names downstream code expects.
+            _s2_tile_n_override = stage2_tile_n
+            _s2_tile_k_override = stage2_tile_k
+            stage2_tile_n = (
+                _s2_tile_n_override
+                if _s2_tile_n_override is not None
+                else _stage2_default_tile_n
+            )
+            stage2_tile_k = (
+                _s2_tile_k_override
+                if _s2_tile_k_override is not None
+                else _stage2_default_tile_k
+            )
 
             # Demoted to DEBUG (was INFO) -- per-call host log was adding
             # 50-200us of stdout overhead per fused_moe(), which dominated
@@ -1914,6 +2003,7 @@ def fused_moe_2stages(
     dtype = moe_out.dtype
     device = hidden_states.device
     is_shuffled = getattr(w1, "is_shuffled", False)
+    _s1_tn, _s1_tk, _s1_bm, _s2_tn, _s2_tk = _gfx1250_tile_env_overrides()
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
@@ -1930,6 +2020,11 @@ def fused_moe_2stages(
         hidden_pad,
         intermediate_pad,
         is_shuffled,
+        stage1_tile_n=_s1_tn,
+        stage1_tile_k=_s1_tk,
+        stage1_block_m=_s1_bm,
+        stage2_tile_n=_s2_tn,
+        stage2_tile_k=_s2_tk,
     )
     if (
         quant_type == QuantType.per_1x32

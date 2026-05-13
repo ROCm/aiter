@@ -875,8 +875,70 @@ parser.add_argument(
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
 )
+# ---- gfx1250 FlyDSL tile overrides --------------------------------------
+# These plumb directly into ``aiter.fused_moe.get_2stage_cfgs`` (which
+# reads them back through the matching ``AITER_GFX1250_*`` env vars at
+# its call sites and forwards them as kwargs to keep ``lru_cache`` keys
+# tile-shape sensitive). Leaving any of them unset preserves the current
+# hardcoded default (tile_n=tile_k=128 for mxscale fp4/fp8/a8w4, block_m
+# / route_tile_m=16 for both stages).
+parser.add_argument(
+    "-tn", "--stage1-tile-n",
+    type=int,
+    default=None,
+    help="""gfx1250 stage1 FlyDSL ``tile_n``. None -> use hardcoded
+    default (128 for mxscale fp4/fp8/a8w4). Exported as
+    AITER_GFX1250_STAGE1_TILE_N for ``get_2stage_cfgs`` to pick up.""",
+)
+parser.add_argument(
+    "-tk", "--stage1-tile-k",
+    type=int,
+    default=None,
+    help="gfx1250 stage1 FlyDSL ``tile_k``. None -> 128 (mxscale).",
+)
+parser.add_argument(
+    "-bm", "--block-m",
+    type=int,
+    default=None,
+    help="""gfx1250 stage1/stage2 shared ``block_m`` /
+    ``route_tile_m``. None -> hardcoded default of 16. Threaded through
+    ``MOEMetadata.block_m`` so both stages get the same value.""",
+)
+parser.add_argument(
+    "--stage2-tile-n",
+    type=int,
+    default=None,
+    help="gfx1250 stage2 FlyDSL ``tile_n``. None -> 128 (mxscale).",
+)
+parser.add_argument(
+    "--stage2-tile-k",
+    type=int,
+    default=None,
+    help="gfx1250 stage2 FlyDSL ``tile_k``. None -> 128 (mxscale).",
+)
 
 args = parser.parse_args()
+
+
+# Export the gfx1250 tile overrides into the environment **before** any
+# call to ``fused_moe`` / ``get_2stage_cfgs``. The aiter side reads them
+# via ``_gfx1250_tile_env_overrides`` at each call site and forwards
+# them as kwargs to ``get_2stage_cfgs`` so the lru_cache key stays
+# tile-shape sensitive.
+def _maybe_set_env(name, value):
+    if value is None:
+        return
+    os.environ[name] = str(int(value))
+    aiter.logger.info(
+        "[test_moe_2stage] gfx1250 tile override: %s=%s", name, value
+    )
+
+
+_maybe_set_env("AITER_GFX1250_STAGE1_TILE_N", args.stage1_tile_n)
+_maybe_set_env("AITER_GFX1250_STAGE1_TILE_K", args.stage1_tile_k)
+_maybe_set_env("AITER_GFX1250_BLOCK_M",       args.block_m)
+_maybe_set_env("AITER_GFX1250_STAGE2_TILE_N", args.stage2_tile_n)
+_maybe_set_env("AITER_GFX1250_STAGE2_TILE_K", args.stage2_tile_k)
 
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
