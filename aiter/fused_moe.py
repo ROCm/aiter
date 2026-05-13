@@ -25,9 +25,6 @@ BLOCK_SIZE_M = 32
 # Default to Opus unless CK sorting is explicitly requested.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
-_USE_GENERIC_SWIGLU_MXFP4_LAYOUT = (
-    os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "0") == "1"
-)
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 
 
@@ -308,7 +305,7 @@ def fused_moe_(
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
     elif quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Swiglu and _USE_GENERIC_SWIGLU_MXFP4_LAYOUT:
+        if activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
@@ -334,6 +331,7 @@ def fused_moe_(
         hidden_pad,
         intermediate_pad,
         isShuffled,
+        gate_mode,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -410,6 +408,7 @@ def fused_moe_(
             topk_weights=topk_weight,
             # only for flydsl dsv4
             swiglu_limit=swiglu_limit,
+            gate_mode=gate_mode,
         )
 
 
@@ -819,7 +818,9 @@ def get_2stage_cfgs(
     hidden_pad,
     intermediate_pad,
     is_shuffled=True,
+    gate_mode=GateMode.SEPARATED.value,
 ):
+    gate_mode = GateMode(gate_mode)
     _INDEX_COLS = [
         "cu_num",
         "token",
@@ -1160,7 +1161,7 @@ def get_2stage_cfgs(
             stage2_has_bias=enable_bias and is_flydsl2,
         )
     if (
-        not _USE_GENERIC_SWIGLU_MXFP4_LAYOUT
+        gate_mode != GateMode.SEPARATED
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
@@ -1449,8 +1450,10 @@ def fused_moe_2stages(
     topk_ids=None,
     topk_weights=None,
     swiglu_limit=0.0,
+    gate_mode=GateMode.SEPARATED.value,
 ):
     quant_func = get_quant(quant_type)
+    gate_mode = GateMode(gate_mode)
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = moe_out.dtype
@@ -1472,6 +1475,7 @@ def fused_moe_2stages(
         hidden_pad,
         intermediate_pad,
         is_shuffled,
+        gate_mode,
     )
     if (
         quant_type == QuantType.per_1x32

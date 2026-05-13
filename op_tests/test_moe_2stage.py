@@ -22,6 +22,8 @@ import logging
 from aiter.fused_moe import (
     fused_topk,
     fused_moe,
+    get_2stage_cfgs,
+    get_padded_M,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -244,13 +246,47 @@ def test_fmoe(
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
     # # ######################## stage 1 start ###########
+    stage1_ref_dtype = dtype
+    if (
+        actType == aiter.ActivationType.Swiglu
+        and qType == aiter.QuantType.per_1x32
+        and WQDType == dtypes.fp4x2
+    ):
+        runtime_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
+            token, actType, gateMode, qType, AQDType, WQDType
+        )
+        if runtime_aq_dtype == dtypes.fp4x2:
+            metadata = get_2stage_cfgs(
+                get_padded_M(token),
+                model_dim,
+                inter_dim,
+                E,
+                topk,
+                dtype,
+                runtime_aq_dtype,
+                WQDType,
+                qType,
+                w1.shape[1] == (inter_dim * 2),
+                actType,
+                doweight_stage1,
+                hidden_pad,
+                intermediate_pad,
+                getattr(w1_qt_aiter, "is_shuffled", False)
+                or getattr(w2_qt_aiter, "is_shuffled", False),
+                gateMode,
+            )
+            if metadata.fuse_quant == "fp4":
+                # Fused Swiglu MXFP4 quantizes the f32 activation directly.
+                # Keep the torch reference at f32 until the quantization step.
+                stage1_ref_dtype = dtypes.fp32
+
     out1_ref = torch_moe_stage1(
         a1_qt,
         w1_qt,
         w2_qt,
         topk_weights,
         topk_ids,
-        dtype=dtype,
+        dtype=stage1_ref_dtype,
         activation=actType,
         quant_type=qType,
         a1_scale=a1_scale,
@@ -544,6 +580,8 @@ def _row_to_kwargs(row):
     aq_dtype = _str2dtype(row["q_dtype_a"])
     wq_dtype = _str2dtype(row["q_dtype_w"])
     act_type = _str2enum(row["act_type"], aiter.ActivationType)
+    # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
+    # from the selected activation/weight dtype layout used by fused_moe.
     gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
     return dict(
         dtype=_str2dtype(row["dtype"]),
@@ -594,6 +632,7 @@ def _iter_csv_cases():
         expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
             kwargs["token"],
             kwargs["actType"],
+            kwargs["gateMode"],
             kwargs["qType"],
             kwargs["AQDType"],
             kwargs["WQDType"],
@@ -634,7 +673,9 @@ def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     return 0.0
 
 
-def _runtime_swiglu_mxfp4_q_dtype_a(token, act_type, q_type, aq_dtype, wq_dtype):
+def _runtime_swiglu_mxfp4_q_dtype_a(
+    token, act_type, gate_mode, q_type, aq_dtype, wq_dtype
+):
     """Return the q_dtype_a that fused_moe will select for Swiglu MXFP4."""
     if act_type != aiter.ActivationType.Swiglu:
         return None
@@ -643,11 +684,12 @@ def _runtime_swiglu_mxfp4_q_dtype_a(token, act_type, q_type, aq_dtype, wq_dtype)
     if aq_dtype not in [dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.fp4x2]:
         return None
 
-    if os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "0") == "1":
+    gate_mode = GateMode(gate_mode)
+    if gate_mode == GateMode.SEPARATED:
         bound = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
         return dtypes.bf16 if token < bound else dtypes.fp4x2
 
-    bound = int(os.environ.get("AITER_BF16_FP8_BOUND", "512"))
+    bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
     return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
 
 
