@@ -59,7 +59,7 @@ def fp8_mqa_logits(
         device=Q.device,
     )
 
-    use_gluon = arch in SUPPORTED_ARCHS
+    use_gluon = _gluon_fp8_mqa_logits_kernel is not None
     stride_q_s, stride_q_h, stride_q_d = Q.stride()
     stride_kv_s, stride_kv_d = KV.stride()
     stride_w_s, stride_w_h = weights.stride()
@@ -146,7 +146,6 @@ def fp8_mqa_logits(
             NUM_WARPS=num_warps,
             NUM_BUFFERS=num_buffers,
             NUM_CHAINS=num_chains,
-            ARCH_NAME=arch,
             USE_BUFFER_LOAD=use_buffer_load,
             USE_BUFFER_STORE=use_buffer_store,
             num_warps=num_warps,
