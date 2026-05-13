@@ -2196,24 +2196,24 @@ def compile_mixed_moe_gemm1(
                 _c3_i32 = arith.constant(3, type=T.i32)
                 _c4_i32 = arith.constant(4, type=T.i32)
                 _c5_i32 = arith.constant(5, type=T.i32)
-                _c7_i32 = arith.constant(7, type=T.i32)
                 _c15_i32 = arith.constant(15, type=T.i32)
-                _c21_i32 = arith.constant(21, type=T.i32)
+                _c22_i32 = arith.constant(22, type=T.i32)
                 _c23_i32 = arith.constant(23, type=T.i32)
                 _c28_i32 = arith.constant(28, type=T.i32)
                 _c31_i32 = arith.constant(31, type=T.i32)
                 _c32_i32 = arith.constant(32, type=T.i32)
                 _c64_i32 = arith.constant(64, type=T.i32)
-                _c126_i32 = arith.constant(126, type=T.i32)
-                _c127_i32 = arith.constant(127, type=T.i32)
                 _c254_i32 = arith.constant(254, type=T.i32)
                 _c256_i32 = arith.constant(256, type=T.i32)
-                _c0xFF_i32 = arith.constant(0xFF, type=T.i32)
-                _c0x200000_i32 = arith.constant(0x200000, type=T.i32)
                 _c0xFF800000_i32 = arith.constant(0xFF800000, type=T.i32)
                 _c0x400000_i32 = arith.constant(0x400000, type=T.i32)
-                _c0x7FFFFF_i32 = arith.constant(0x7FFFFF, type=T.i32)
+                _c0x7FFFFFFF_i32 = arith.constant(0x7FFFFFFF, type=T.i32)
                 _c0x80000000_i32 = arith.constant(0x80000000, type=T.i32)
+                _c0x3F800000_i32 = arith.constant(0x3F800000, type=T.i32)  # 1.0f
+                _c0x40C00000_i32 = arith.constant(0x40C00000, type=T.i32)  # 6.0f
+                _c0x4A800000_i32 = arith.constant(0x4A800000, type=T.i32)
+                _c0xC11FFFFF_i32 = arith.constant(0xC11FFFFF, type=T.i32)
+                _c0x7_i32 = arith.constant(0x7, type=T.i32)
                 _c0_f32 = arith.constant(0.0, type=T.f32)
 
                 _c8_i32 = arith.constant(8, type=T.i32)
@@ -2222,18 +2222,28 @@ def compile_mixed_moe_gemm1(
 
                 def _f32_to_e2m1(qx_f32):
                     """Convert a scaled f32 value to fp4 (e2m1) 4-bit integer."""
+                    # Match fp4_utils.f32_to_mxfp4 / HIP quant: saturate, denorm,
+                    # and normal round-to-nearest-even paths.
                     qx = qx_f32.bitcast(T.i32)
                     s = qx & _c0x80000000_i32
-                    e = (qx >> _c23_i32) & _c0xFF_i32
-                    m = qx & _c0x7FFFFF_i32
-                    adj_exp = arith.maxsi(_c126_i32 - e, _c0_i32)
-                    m_denorm = (_c0x400000_i32 | (m >> _c1_i32)) >> adj_exp
-                    is_denorm = arith.cmpi(CmpIPredicate.ult, e, _c127_i32)
-                    m = arith.select(is_denorm, m_denorm, m)
-                    e = arith.maxsi(e - _c126_i32, _c0_i32)
-                    combined = (e << _c2_i32) | (m >> _c21_i32)
-                    rounded = (combined + _c1_i32) >> _c1_i32
-                    e2m1 = arith.minui(rounded, _c7_i32)
+                    qx_abs = qx & _c0x7FFFFFFF_i32
+                    denormal_mask = arith.cmpi(
+                        CmpIPredicate.ult, qx_abs, _c0x3F800000_i32
+                    )
+                    normal_mask = arith.andi(
+                        arith.cmpi(CmpIPredicate.ult, qx_abs, _c0x40C00000_i32),
+                        arith.cmpi(CmpIPredicate.uge, qx_abs, _c0x3F800000_i32),
+                    )
+
+                    denorm_f32 = qx_abs.bitcast(T.f32) + _c0x4A800000_i32.bitcast(T.f32)
+                    denormal_x = denorm_f32.bitcast(T.i32) - _c0x4A800000_i32
+
+                    mant_odd = (qx_abs >> _c22_i32) & _c1_i32
+                    normal_x = qx_abs + _c0xC11FFFFF_i32 + mant_odd
+                    normal_x = normal_x >> _c22_i32
+
+                    e2m1 = arith.select(normal_mask, normal_x, _c0x7_i32)
+                    e2m1 = arith.select(denormal_mask, denormal_x, e2m1)
                     return (s >> _c28_i32) | e2m1
 
                 if const_expr(_need_sort):

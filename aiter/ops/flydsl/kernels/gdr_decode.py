@@ -37,6 +37,8 @@ def create_vk_gdr_decode_kernel(
     head_k_dim: int,
     head_v_dim: int,
     state_strides: tuple,
+    a_strides: tuple,
+    b_strides: tuple,
     use_qk_l2norm: bool,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
@@ -140,12 +142,31 @@ def create_vk_gdr_decode_kernel(
         v_tensor = GTensor(
             value, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
         )
-        a_tensor = GTensor(a, dtype=dtype_, shape=(-1, seq_length, num_v_heads))
-        b_tensor = GTensor(b, dtype=dtype_, shape=(-1, seq_length, num_v_heads))
+        a_tensor = GTensor(
+            a,
+            dtype=dtype_,
+            stride=(a_strides[0], a_strides[1], a_strides[2]),
+            shape=(-1, seq_length, num_v_heads),
+        )
+        b_tensor = GTensor(
+            b,
+            dtype=dtype_,
+            stride=(b_strides[0], b_strides[1], b_strides[2]),
+            shape=(-1, seq_length, num_v_heads),
+        )
         dt_bias_tensor = GTensor(dt_bias, dtype=dtype_, shape=(num_v_heads,))
         A_log_tensor = GTensor(A_log, dtype=A_log_dtype_, shape=(num_v_heads,))
         out_tensor = GTensor(
             out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
+        )
+        state_tensor = GTensor(
+            state,
+            dtype=state_dtype_,
+            shape=(num_v_heads, head_v_dim, head_k_dim),
+            stride=(state_strides[1], state_strides[2], state_strides[3]),
+            static_bytes_offset_i64=fx.Index(pool_idx)
+            * fx.Index(state_strides[0])
+            * get_dtype_bytes(state_dtype),
         )
 
         def fast_exp(x, use_exp2=True):
@@ -161,16 +182,6 @@ def create_vk_gdr_decode_kernel(
         cond_valid = arith.cmpi(arith.CmpIPredicate.sge, pool_idx, fx.Int32(0))
         cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
         with ir.InsertionPoint(cond_valid_if.then_block):
-
-            state_tensor = GTensor(
-                state,
-                dtype=state_dtype_,
-                shape=(num_v_heads, head_v_dim, head_k_dim),
-                stride=(state_strides[1], state_strides[2], state_strides[3]),
-                static_bytes_offset_i64=fx.Index(pool_idx)
-                * fx.Index(state_strides[0])
-                * get_dtype_bytes(state_dtype),
-            )
 
             if const_expr("f32" in A_log_dtype):
                 r_A_log = A_log_tensor[hv_i]
