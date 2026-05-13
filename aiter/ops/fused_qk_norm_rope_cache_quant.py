@@ -163,9 +163,7 @@ def _fused_qk_rmsnorm(
         rmsnorm(q_out, q, q_weight, q_eps)
         rmsnorm(k_out, k, k_weight, k_eps)
     else:
-        _fused_qk_rmsnorm_kernel(
-            q, q_weight, q_eps, k, k_weight, k_eps, q_out, k_out
-        )
+        _fused_qk_rmsnorm_kernel(q, q_weight, q_eps, k, k_weight, k_eps, q_out, k_out)
     return q_out, k_out
 
 
