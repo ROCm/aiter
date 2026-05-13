@@ -32,7 +32,12 @@ template<int BLOCK_SIZE_,
         typename TILE_,
         typename WAVE_,
         bool HAS_BIAS_ = false,
-        typename D_BIAS_ = void>
+        typename D_BIAS_ = void,
+        bool HAS_OOB_ = true,
+        int CPOL_A_ = 0,
+        int CPOL_B_ = 17,
+        int SWIZZLE_W_ = 8,
+        int SWIZZLE_C_ = 32>
 struct opus_gemm_a16w16_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
@@ -53,6 +58,7 @@ struct opus_gemm_a16w16_traits_gfx950 {
     static_assert(std::is_same<D_A, D_B>::value);
 
     static constexpr bool HAS_BIAS = HAS_BIAS_;
+    static constexpr bool HAS_OOB = HAS_OOB_;
     using D_BIAS = std::conditional_t<std::is_same_v<D_BIAS_, void>, D_C, D_BIAS_>;
 
     static constexpr int T_M = opus::get<0>(TILE{});
@@ -92,6 +98,17 @@ struct opus_gemm_a16w16_traits_gfx950 {
     static constexpr int b_buffer_load_insts = HALF_B_N * B_K / (BLOCK_SIZE * VEC_B);
     static constexpr int a_ds_read_insts = (E_M * E_K * W_M * W_K) / (opus::get_warp_size() * VEC_A);
     static constexpr int b_ds_read_insts = (E_N * E_K * W_N * W_K) / (opus::get_warp_size() * VEC_B);
+
+    // Cache policy for A/B loads (CDNA4 ISA Table 49).
+    // Values: 0=LRU, 1=SC0(Group,LLC Evict), 2=NT(Stream), 17=SC0+SC1(BYPASS_L2).
+    // Tuner selects optimal CPOL per shape from multiple kid variants.
+    static constexpr int CPOL_A = CPOL_A_;
+    static constexpr int CPOL_B = CPOL_B_;
+
+    // HipKittens XCD swizzle parameters (Algorithm 1, MI350 = 8 XCDs)
+    static constexpr int NUM_XCD = 8;
+    static constexpr int SWIZZLE_W = SWIZZLE_W_;
+    static constexpr int SWIZZLE_C = SWIZZLE_C_;
 };
 
 #ifndef OPUS_GEMM_NOSCALE_KARGS_GFX950_DEFINED
@@ -319,7 +336,8 @@ template<int BLOCK_SIZE_,   // workgroup size (locked to 256)
         typename VEC_,      // opus::seq<VEC_A, VEC_B, VEC_C>
         typename MFMA_,     // opus::seq<W_M, W_N, W_K>
         int WG_PER_CU_,
-        bool HAS_BIAS_>
+        bool HAS_BIAS_,
+        bool HAS_OOB_ = true>
 struct opus_flatmm_splitk_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
@@ -381,6 +399,7 @@ struct opus_flatmm_splitk_traits_gfx950 {
     static constexpr int VEC_C = opus::get<2>(VEC{});
 
     static constexpr bool HAS_BIAS = HAS_BIAS_;
+    static constexpr bool HAS_OOB = HAS_OOB_;
 
     static_assert(VEC_A == 16 / sizeof(D_A));
     static constexpr int smem_linear_wave_per_async_load = opus::get_warp_size() * 16 / sizeof(D_A);

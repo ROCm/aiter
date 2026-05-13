@@ -517,7 +517,7 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
             v_c = mma(v_a1, v_b1, v_c);
             __builtin_amdgcn_s_setprio(0);
             s_waitcnt_lgkmcnt(0_I);
-            mask_va_tail<T>(v_a0, k_valid_final, lane_id);
+            if constexpr (T::HAS_OOB) { mask_va_tail<T>(v_a0, k_valid_final, lane_id); }
             __builtin_amdgcn_s_setprio(1);
             v_c = mma(v_a0, v_b0, v_c);
             __builtin_amdgcn_s_setprio(0);
@@ -529,7 +529,7 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
             v_c = mma(v_a0, v_b0, v_c);
             __builtin_amdgcn_s_setprio(0);
             s_waitcnt_lgkmcnt(0_I);
-            mask_va_tail<T>(v_a1, k_valid_final, lane_id);
+            if constexpr (T::HAS_OOB) { mask_va_tail<T>(v_a1, k_valid_final, lane_id); }
             __builtin_amdgcn_s_setprio(1);
             v_c = mma(v_a1, v_b1, v_c);
             __builtin_amdgcn_s_setprio(0);

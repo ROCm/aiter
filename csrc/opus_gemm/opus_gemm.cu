@@ -205,20 +205,32 @@ void opus_gemm(
 // so the dispatcher forces the <fp32_t> branch for kids >= 200 regardless of
 // Y dtype. Both bf16 and fp32 Y are valid.
 
-// splitk kids live in [200, 300). Kept as a range so future splitk tiles don't
-// require a dispatcher change.
+// splitk kids live in [200, 300) with non-OOB variants at [1200, 1300).
 static constexpr int OPUS_SPLITK_KID_MIN = 200;
 static constexpr int OPUS_SPLITK_KID_MAX = 300;
-// Split-barrier a16w16 kids live in [4, 10). Used to gate which kids accept
-// a non-empty bias (a16w16_flatmm 100..115 keeps HAS_BIAS=false until its
-// warp-spec epilogue gets bias support).
+// Split-barrier a16w16 kids live in [4, 10) with non-OOB variants at [1004, 1010).
 static constexpr int OPUS_A16W16_SB_KID_MIN = 4;
 static constexpr int OPUS_A16W16_SB_KID_MAX = 10;
+// non-OOB kid offset
+static constexpr int OPUS_NOOOB_KID_OFFSET = 1000;
+
+static inline bool opus_kid_is_splitk(int kid)
+{
+  return (kid >= OPUS_SPLITK_KID_MIN && kid < OPUS_SPLITK_KID_MAX) ||
+         (kid >= OPUS_SPLITK_KID_MIN + OPUS_NOOOB_KID_OFFSET &&
+          kid < OPUS_SPLITK_KID_MAX + OPUS_NOOOB_KID_OFFSET);
+}
+
+static inline bool opus_kid_is_a16w16_sb(int kid)
+{
+  return (kid >= OPUS_A16W16_SB_KID_MIN && kid < OPUS_A16W16_SB_KID_MAX) ||
+         (kid >= OPUS_A16W16_SB_KID_MIN + OPUS_NOOOB_KID_OFFSET &&
+          kid < OPUS_A16W16_SB_KID_MAX + OPUS_NOOOB_KID_OFFSET);
+}
 
 static inline bool opus_kid_supports_bias(int kid)
 {
-  return (kid >= OPUS_A16W16_SB_KID_MIN && kid < OPUS_A16W16_SB_KID_MAX) ||
-         (kid >= OPUS_SPLITK_KID_MIN && kid < OPUS_SPLITK_KID_MAX);
+  return opus_kid_is_a16w16_sb(kid) || opus_kid_is_splitk(kid);
 }
 
 void opus_gemm_a16w16_tune(
@@ -249,7 +261,7 @@ void opus_gemm_a16w16_tune(
     // splitk kids force <fp32_t> because traits static_assert D_C=float.
     // Y can be bf16 or fp32 -- the launcher dispatches the reduce kernel
     // on Y.dtype() at runtime.
-    if (kernelId >= OPUS_SPLITK_KID_MIN && kernelId < OPUS_SPLITK_KID_MAX)
+    if (opus_kid_is_splitk(kernelId))
     {
       AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
                   || Y.dtype() == AITER_DTYPE_fp32,

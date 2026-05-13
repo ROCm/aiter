@@ -831,20 +831,26 @@ void
         # bias pointer because the in-kernel prefetch issues unconditional
         # buffer_loads -- a null rsrc would generate out-of-bounds garbage
         # that the if constexpr guard cannot screen.
+        has_oob_str = "true" if k.has_oob else "false"
         if is_a16w16_split_barrier:
+            cpol_launch_extra = ""
+            if hasattr(k, "cpol_a") and k.cpol_a >= 0:
+                cpol_launch_extra = f",\n        {k.cpol_a}, {k.cpol_b}"
             launch_block = f"""
     using TraitsNoBias = {traits_name}<{k.BLOCK_SIZE},
         opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
         opus::tuple<{da}, {db}, D_C, fp32_t>,
         opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
         false,                                 // HAS_BIAS
-        D_C>;                                  // D_BIAS = D_C (matches Y dtype)
+        D_C,                                   // D_BIAS = D_C
+        {has_oob_str}{cpol_launch_extra}>;
     using TraitsBias = {traits_name}<{k.BLOCK_SIZE},
         opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
         opus::tuple<{da}, {db}, D_C, fp32_t>,
         opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
         true,                                  // HAS_BIAS
-        D_C>;                                  // D_BIAS = D_C
+        D_C,                                   // D_BIAS = D_C
+        {has_oob_str}{cpol_launch_extra}>;
 
     auto stream = aiter::getCurrentHIPStream();
     if (bias.has_value()) {{{{
@@ -914,6 +920,10 @@ void
         # without repeating the long template argument list.
         # a16w16 split-barrier emits two Traits (HAS_BIAS true / false);
         # everything else has a single Traits.
+        # CPOL template params (only for a16w16 split-barrier)
+        cpol_extra = ""
+        if is_a16w16_split_barrier and (hasattr(k, "cpol_a") and k.cpol_a >= 0):
+            cpol_extra = f",\n    {k.cpol_a}, {k.cpol_b}"
         if is_a16w16_split_barrier:
             traits_aliases = f"""
 template <typename D_C>
@@ -922,14 +932,16 @@ using {k.name}_TraitsNoBias = {traits_name}<{k.BLOCK_SIZE},
     opus::tuple<{da}, {db}, D_C, fp32_t>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
     false,
-    D_C>;
+    D_C,
+    {has_oob_str}{cpol_extra}>;
 template <typename D_C>
 using {k.name}_TraitsBias = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
     opus::tuple<{da}, {db}, D_C, fp32_t>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
     true,
-    D_C>;
+    D_C,
+    {has_oob_str}{cpol_extra}>;
 """
         else:
             traits_aliases = f"""
@@ -1291,6 +1303,7 @@ void
         # Pre-declared Traits alias at file scope (visible to both passes).
         # See _gen_noscale_instance for the rationale of the host/device
         # pass split.
+        has_oob_str = "true" if k.has_oob else "false"
         traits_aliases = f"""
 template <typename D_C>
 using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
@@ -1299,7 +1312,8 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
     {k.WG_PER_CU},
-    false>;
+    false,
+    {has_oob_str}>;
 """
 
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
@@ -1469,11 +1483,11 @@ void
     dim3 block_reduce(REDUCE_BS);
 
     {kernel_func}<{k.name}_Traits<D_C>><<<grid_main, block_main, 0, stream>>>(kargs);
-    // Reduce kernel: 4 specializations (D_OUT bf16/fp32 x HAS_BIAS true/false).
+    // Reduce kernel: specializations (D_OUT bf16/fp32 x HAS_BIAS true/false x HAS_OOB).
     // bias dtype is locked to Y.dtype() by BIAS_HOST_VALIDATE.
     if (Y.dtype() == AITER_DTYPE_bf16) {{{{
         if (bias.has_value()) {{{{
-            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16>
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
                     reinterpret_cast<const float*>(ptr_workspace_),
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
@@ -1481,7 +1495,7 @@ void
                     reinterpret_cast<const __bf16*>(ptr_bias_),
                     stride_bias_batch_);
         }}}} else {{{{
-            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16>
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
                     reinterpret_cast<const float*>(ptr_workspace_),
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
@@ -1491,7 +1505,7 @@ void
     }}}} else {{{{
         // Y.dtype() == Float per the AITER_CHECK above.
         if (bias.has_value()) {{{{
-            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, true, float>
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
                     reinterpret_cast<const float*>(ptr_workspace_),
                     reinterpret_cast<float*>(Y.data_ptr()),
@@ -1499,7 +1513,7 @@ void
                     reinterpret_cast<const float*>(ptr_bias_),
                     stride_bias_batch_);
         }}}} else {{{{
-            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float>
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
                     reinterpret_cast<const float*>(ptr_workspace_),
                     reinterpret_cast<float*>(Y.data_ptr()),
@@ -1849,12 +1863,12 @@ void
         # has 4 specialisations (D_OUT bf16/fp32 x HAS_BIAS true/false),
         # all instantiated in each splitk device.cu.
         forward_decls = (
-            "// Forward declaration only. The 4 specialisations are\n"
-            "// instantiated by every splitk device.cu so the linker\n"
-            "// always finds at least one definition (weak symbols\n"
-            "// dedupe across TUs).\n"
+            "// Forward declaration only. Specialisations are instantiated\n"
+            "// by every splitk device.cu so the linker always finds at\n"
+            "// least one definition (weak symbols dedupe across TUs).\n"
             "template<int VEC_, int BLOCK_, typename D_OUT,\n"
-            "         bool HAS_BIAS_, typename D_BIAS_>\n"
+            "         bool HAS_BIAS_, typename D_BIAS_,\n"
+            "         bool HAS_OOB_>\n"
             "__global__ void splitk_reduce_kernel(\n"
             "    const float* workspace, D_OUT* c_out,\n"
             "    int split_k, int M, int N, int batch,\n"
@@ -1969,23 +1983,36 @@ void
             "//\n"
             "// Auto-generated. Do not edit. See gen_instances.py:_emit_splitk_reduce_tu.\n"
             "//\n"
-            "// Dedicated device TU for the 4 splitk_reduce_kernel\n"
-            "// specialisations (D_OUT bf16/fp32 x HAS_BIAS true/false).\n"
+            "// Dedicated device TU for splitk_reduce_kernel specialisations\n"
+            "// (D_OUT bf16/fp32 x HAS_BIAS true/false x HAS_OOB true/false).\n"
             "// Carved out of every splitk kid's device.cu so the reduce\n"
-            "// kernels only get RA'd / ISA-emitted once instead of 23\n"
-            "// times. Compiled with -D__HIPCC_RTC__ (per-source flag in\n"
-            "// optCompilerConfig.json) so the host pass is minimal.\n"
+            "// kernels only get RA'd / ISA-emitted once. Compiled with\n"
+            "// -D__HIPCC_RTC__ so the host pass is minimal.\n"
             '#include "gfx950/splitk_reduce_gfx950.cuh"\n'
-            "template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16>(\n"
+            "// HAS_OOB=true variants\n"
+            "template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16, true>(\n"
             "    const float*, __bf16*, int, int, int, int, int, int,\n"
             "    const __bf16*, int);\n"
-            "template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16>(\n"
+            "template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16, true>(\n"
             "    const float*, __bf16*, int, int, int, int, int, int,\n"
             "    const __bf16*, int);\n"
-            "template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float>(\n"
+            "template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float,  true>(\n"
             "    const float*, float*,  int, int, int, int, int, int,\n"
             "    const float*,  int);\n"
-            "template __global__ void splitk_reduce_kernel<16, 64, float,  false, float>(\n"
+            "template __global__ void splitk_reduce_kernel<16, 64, float,  false, float,  true>(\n"
+            "    const float*, float*,  int, int, int, int, int, int,\n"
+            "    const float*,  int);\n"
+            "// HAS_OOB=false variants\n"
+            "template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16, false>(\n"
+            "    const float*, __bf16*, int, int, int, int, int, int,\n"
+            "    const __bf16*, int);\n"
+            "template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16, false>(\n"
+            "    const float*, __bf16*, int, int, int, int, int, int,\n"
+            "    const __bf16*, int);\n"
+            "template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float,  false>(\n"
+            "    const float*, float*,  int, int, int, int, int, int,\n"
+            "    const float*,  int);\n"
+            "template __global__ void splitk_reduce_kernel<16, 64, float,  false, float,  false>(\n"
             "    const float*, float*,  int, int, int, int, int, int,\n"
             "    const float*,  int);\n"
         )
