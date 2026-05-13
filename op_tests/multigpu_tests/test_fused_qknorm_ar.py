@@ -119,6 +119,8 @@ def qknorm_allreduce_host(qk_ins, q_ws, k_ws, eps=1e-6):
     for i in range(tp_size):
         q_var_all += q_vars[i]
         k_var_all += k_vars[i]
+    q_var_all = q_var_all / tp_size
+    k_var_all = k_var_all / tp_size
     q_outs = []
     k_outs = []
     for i in range(tp_size):

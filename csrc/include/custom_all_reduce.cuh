@@ -1869,7 +1869,7 @@ __global__ void __launch_bounds__(1024, 1)
     float sum2 = 0.0f;
     if(active)
     {
-        vec = ptrs[0][idx / pack_size];
+        vec = ptrs[rank][idx / pack_size];
 #pragma unroll
         for(int v = 0; v < pack_size; ++v)
         {
