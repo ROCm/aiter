@@ -121,6 +121,7 @@ def benchmark_gmm(
     metric: str = DEFAULT_METRIC,
     use_bias: bool = False,
     accumulate: bool = False,
+    output: bool = False,
 ) -> None:
     assert gmm_type in GMM_TYPES, "Invalid GMM type."
     assert metric in METRICS, "Invalid benchmark metric."
@@ -288,7 +289,7 @@ def benchmark_gmm(
         metric,
         unit,
     )
-    benchmark.run(show_plots=False, print_data=True)
+    benchmark.run(show_plots=False, print_data=True, save_path="." if output else "")
 
 
 # Command line interface parsing.
@@ -428,6 +429,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="accumulate bias gradient",
     )
+    parser.add_argument(
+        "-o",
+        action="store_true",
+        help="write performance results to CSV file in the current directory",
+    )
     try:
         return validate_args(parser.parse_args())
     except argparse.ArgumentError as arg_error:
@@ -468,6 +474,7 @@ def main() -> None:
         metric=args.metric,
         use_bias=args.use_bias,
         accumulate=args.accumulate,
+        output=args.o,
     )
 
 
