@@ -18,7 +18,9 @@ FLYDSL_VERSION = "flydsl==0.1.7"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
-AITER_PREBUILD_PROFILE = os.environ.get("AITER_PREBUILD_PROFILE", "full").strip().lower()
+AITER_PREBUILD_PROFILE = (
+    os.environ.get("AITER_PREBUILD_PROFILE", "full").strip().lower()
+)
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
 if IS_WINDOWS:
@@ -233,7 +235,9 @@ def _get_profile_exclude_modules(all_modules):
     if AITER_PREBUILD_PROFILE not in {"test", "ci-test", "ci_test"}:
         return []
 
-    exclude_modules = sorted(m for m in _TEST_PREBUILD_EXCLUDE_MODULES if m in all_modules)
+    exclude_modules = sorted(
+        m for m in _TEST_PREBUILD_EXCLUDE_MODULES if m in all_modules
+    )
     print(
         "[aiter] AITER_PREBUILD_PROFILE="
         f"{AITER_PREBUILD_PROFILE}: excluding {len(exclude_modules)} "
