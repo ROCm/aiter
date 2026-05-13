@@ -4,8 +4,6 @@ from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 from triton.language.core import PropagateNan
 
-SUPPORTED_ARCHS = ("gfx950",)
-
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
 

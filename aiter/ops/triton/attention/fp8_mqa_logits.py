@@ -100,7 +100,7 @@ def fp8_mqa_logits(
             (seq_len, seq_len_kv_aligned),
             dtype=torch.float32,
             device=Q.device,
-        )[:, :seq_len_kv]      
+        )[:, :seq_len_kv]
 
     use_gluon = _gluon_fp8_mqa_logits_kernel is not None
     stride_q_s, stride_q_h, stride_q_d = Q.stride()

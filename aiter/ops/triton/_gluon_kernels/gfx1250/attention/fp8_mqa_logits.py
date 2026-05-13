@@ -1,6 +1,3 @@
-from packaging.version import Version
-
-import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -11,11 +8,6 @@ from triton.language.core import PropagateNan
 from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
     _weighted_sum_fma_fold,
 )
-
-TRITON_VERSION = Version(triton.__version__)
-TRITON_BEYOND_37 = TRITON_VERSION >= Version("3.7.0")
-
-SUPPORTED_ARCHS = ("gfx950", "gfx1250")
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
