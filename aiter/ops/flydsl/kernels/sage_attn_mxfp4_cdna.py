@@ -609,6 +609,29 @@ def build_sage_attn_mxfp4_cdna_module(
         else:
             kv_upper = seq_len_k_v
 
+        # ---- Tile-split: count fully-unmasked tiles vs masked-tail tiles. ----
+        # Body loop processes tiles where every (Q-row, K-col) pair is valid:
+        #   - K-col never exceeds seq_len_k (no seq-len tail)
+        #   - K-col never exceeds q_row (no causal diagonal)
+        # Tail loop covers remaining tiles up to kv_upper and runs the existing
+        # masked path. Mirrors Triton's _sage_fwd_no_mask / _sage_fwd_mask split.
+        #
+        # n_full = min(in_range_full_blocks, fully_below_diag_blocks if causal)
+        #   in_range_full_blocks = seq_len_k // BLOCK_N
+        #   fully_below_diag_blocks = q_start // BLOCK_N (BLOCK_M >= BLOCK_N)
+        BLOCK_N_IDX = fx.Index(BLOCK_N)
+        in_range_full_blocks = seq_len_k_v // BLOCK_N_IDX
+        if const_expr(CAUSAL):
+            fully_below_diag_blocks = q_start // BLOCK_N_IDX
+            n_full_blocks_idx = fx.Index(
+                ArithValue(fully_below_diag_blocks < in_range_full_blocks).select(
+                    fully_below_diag_blocks, in_range_full_blocks
+                )
+            )
+        else:
+            n_full_blocks_idx = in_range_full_blocks
+        kv_body_end = n_full_blocks_idx * BLOCK_N_IDX
+
         # ---- Cooperative load helpers for K (Int8) ----
         # buf_off: byte offset into the K-side LDS that selects the ping-pong
         # buffer. 0 = buffer 0, LDS_K_BYTES = buffer 1.
@@ -861,9 +884,18 @@ def build_sage_attn_mxfp4_cdna_module(
         klane_off_i32 = klane_i32 * fx.Int32(4)
         seq_len_k_i32 = fx.Int32(seq_len_k_v)
 
-        def _emit_qk_softmax_pquant(kv_block_start_arg, k_buf_off_arg, m_in, l_in):
+        def _emit_qk_softmax_pquant(
+            kv_block_start_arg, k_buf_off_arg, m_in, l_in, mask_mode="full"
+        ):
             """Emit QK FP4 MFMA + (mask) + softmax + p-quant for the KV tile
             at kv_block_start_arg.
+
+            mask_mode (Python-level constant — controls IR generation):
+              - "none" : no causal mask, no seq-len-tile-end mask, no bias-OOB
+                         bounds-check. Used by the body loop where the caller
+                         guarantees every (Q-row, K-col) is in range.
+              - "full" : all masking active (current behavior). Used by the
+                         tail loop, which covers the diagonal/seq-len boundary.
 
             FP4 MFMA semantics (probe-validated 2026-05-13):
               - mfma_scale_f32_32x32x64_f8f6f4 with cbsz=4, blgp=4 processes
@@ -970,8 +1002,14 @@ def build_sage_attn_mxfp4_cdna_module(
             # broadcast across Q rows). Bias shape: [B, Hq, Q_NUM_BLKS, S_k].
             # Per lane (klane, lane32), each vector elem (msub, erem) of st-th
             # subtile maps to K-col = kv_block_start + st*32 + msub*8 +
-            # klane*4 + erem. Bias is independent of Q-row (= lane32 here),
-            # but depends on klane via the kv_col formula.
+            # klane*4 + erem.
+            #
+            # No per-element OOB bounds-check: when mask_mode='none' the body
+            # loop guarantees kv_col < seq_len_k. When mask_mode='full' the
+            # downstream score mask sets P=-inf for OOB cols, so any garbage
+            # bias added for those positions is dropped. The buffer descriptor
+            # (sized to the full bias tensor) returns 0 past total bounds,
+            # and the dropped bounds-check shaves ~16 select+cmpi ops per tile.
             if const_expr(USE_BIAS):
                 # Bias base byte offset for (B, Hq, Q_NUM_BLKS, *):
                 #   ((batch * NUM_Q_HEADS + head_q) * num_q_tiles + q_tile) * S_k * 4
@@ -995,77 +1033,28 @@ def build_sage_attn_mxfp4_cdna_module(
                             + klane * 4
                             + fx.Index(erem)
                         )
-                        # Bounds-check: if kv_col is past seq_len_k, force
-                        # idx to 0 (load returns valid 0.0 instead of any
-                        # buffer-OOB behavior) and select 0.0 bias.
-                        kv_in_bias_bounds = ArithValue(
-                            arith.cmpi(
-                                arith.CmpIPredicate.slt,
-                                _raw(kv_col_idx),
-                                _raw(seq_len_k_v),
-                            )
-                        )
-                        kv_col_safe = fx.Index(
-                            kv_in_bias_bounds.select(kv_col_idx, fx.Index(0))
-                        )
                         bias_dword_idx = arith.unwrap(
                             arith.index_cast(
-                                T.i32, _raw(bias_base_dword + kv_col_safe)
+                                T.i32, _raw(bias_base_dword + kv_col_idx)
                             )
                         )
                         bias_val = buffer_ops.buffer_load(
                             bias_rsrc, bias_dword_idx,
                             vec_width=1, dtype=T.f32,
                         )
-                        bias_val_safe = kv_in_bias_bounds.select(
-                            bias_val, fx.Float32(0.0)
-                        )
-                        s_bias.append(_fadd(s_f32_loc[idx], bias_val_safe))
+                        s_bias.append(_fadd(s_f32_loc[idx], bias_val))
                 s_f32_loc = s_bias
 
-            # 3) Mask
-            kv_start_i32_loc = fx.Int32(
-                arith.unwrap(arith.index_cast(T.i32, _raw(kv_block_start_arg)))
-            )
-            if const_expr(CAUSAL):
-                s_named = list(s_f32_loc)
-                for st in range_constexpr(N_SUBTILES):
-                    for elem in range_constexpr(ELEMS_PER_TILE):
-                        idx = st * ELEMS_PER_TILE + elem
-                        msub = elem // 4
-                        erem = elem % 4
-                        kv_col_i32 = (
-                            kv_start_i32_loc
-                            + fx.Int32(st * MFMA_N)
-                            + fx.Int32(msub * 8)
-                            + klane_off_i32
-                            + fx.Int32(erem)
-                        )
-                        out_of_range = ArithValue(kv_col_i32 >= seq_len_k_i32)
-                        out_of_range = out_of_range | ArithValue(kv_col_i32 > q_row_i32)
-                        s_named[idx] = out_of_range.select(c_neg_inf, s_named[idx])
-                s_f32_loc = s_named
-            else:
-                tile_end = kv_block_start_arg + fx.Index(BLOCK_N)
-                tile_oob_av = ArithValue(tile_end > seq_len_k_v)
-                cond_i1 = _raw(tile_oob_av)
-                f32_ty = ir.F32Type.get()
-                result_types = [f32_ty] * NUM_S_VALS
-                if_op = _scf.IfOp(
-                    cond_i1,
-                    result_types,
-                    has_else=True,
-                    loc=ir.Location.unknown(),
+            # 3) Mask — only emitted in mask_mode='full'.
+            # In mask_mode='none' the body loop guarantees every (Q-row, K-col)
+            # is in range (no causal diagonal, no seq-len overflow), so the
+            # entire mask code path is statically removed.
+            if const_expr(mask_mode == "full"):
+                kv_start_i32_loc = fx.Int32(
+                    arith.unwrap(arith.index_cast(T.i32, _raw(kv_block_start_arg)))
                 )
-                with ir.InsertionPoint(if_op.then_block):
-                    _llvm.inline_asm(
-                        None,
-                        [],
-                        "",
-                        "",
-                        has_side_effects=True,
-                    )
-                    masked = []
+                if const_expr(CAUSAL):
+                    s_named = list(s_f32_loc)
                     for st in range_constexpr(N_SUBTILES):
                         for elem in range_constexpr(ELEMS_PER_TILE):
                             idx = st * ELEMS_PER_TILE + elem
@@ -1079,13 +1068,50 @@ def build_sage_attn_mxfp4_cdna_module(
                                 + fx.Int32(erem)
                             )
                             out_of_range = ArithValue(kv_col_i32 >= seq_len_k_i32)
-                            masked.append(
-                                _raw(out_of_range.select(c_neg_inf, s_f32_loc[idx]))
-                            )
-                    _scf.YieldOp(masked)
-                with ir.InsertionPoint(if_op.else_block):
-                    _scf.YieldOp([_raw(v) for v in s_f32_loc])
-                s_f32_loc = list(if_op.results)
+                            out_of_range = out_of_range | ArithValue(kv_col_i32 > q_row_i32)
+                            s_named[idx] = out_of_range.select(c_neg_inf, s_named[idx])
+                    s_f32_loc = s_named
+                else:
+                    tile_end = kv_block_start_arg + fx.Index(BLOCK_N)
+                    tile_oob_av = ArithValue(tile_end > seq_len_k_v)
+                    cond_i1 = _raw(tile_oob_av)
+                    f32_ty = ir.F32Type.get()
+                    result_types = [f32_ty] * NUM_S_VALS
+                    if_op = _scf.IfOp(
+                        cond_i1,
+                        result_types,
+                        has_else=True,
+                        loc=ir.Location.unknown(),
+                    )
+                    with ir.InsertionPoint(if_op.then_block):
+                        _llvm.inline_asm(
+                            None,
+                            [],
+                            "",
+                            "",
+                            has_side_effects=True,
+                        )
+                        masked = []
+                        for st in range_constexpr(N_SUBTILES):
+                            for elem in range_constexpr(ELEMS_PER_TILE):
+                                idx = st * ELEMS_PER_TILE + elem
+                                msub = elem // 4
+                                erem = elem % 4
+                                kv_col_i32 = (
+                                    kv_start_i32_loc
+                                    + fx.Int32(st * MFMA_N)
+                                    + fx.Int32(msub * 8)
+                                    + klane_off_i32
+                                    + fx.Int32(erem)
+                                )
+                                out_of_range = ArithValue(kv_col_i32 >= seq_len_k_i32)
+                                masked.append(
+                                    _raw(out_of_range.select(c_neg_inf, s_f32_loc[idx]))
+                                )
+                        _scf.YieldOp(masked)
+                    with ir.InsertionPoint(if_op.else_block):
+                        _scf.YieldOp([_raw(v) for v in s_f32_loc])
+                    s_f32_loc = list(if_op.results)
 
             # 4) Softmax
             local_max_l = s_f32_loc[0]
@@ -1150,10 +1176,19 @@ def build_sage_attn_mxfp4_cdna_module(
         _OFF_L = 2
         _OFF_O_ACCS = 3
 
-        loop_results = init_args
-        for kv_block_start, inner_iter_args in range(
-            0, kv_upper, BLOCK_N, init=init_args
-        ):
+        # Hoist module imports outside the loop body for reuse.
+        from flydsl._mlir.dialects._rocdl_ops_gen import (
+            permlane32_swap as _permlane32_swap_op,
+        )
+
+        _struct_ty_2xi32 = ir.Type.parse("!llvm.struct<(i32, i32)>")
+
+        def _emit_iter(kv_block_start, inner_iter_args, mask_mode):
+            """Emit one KV-tile iteration: QK MFMA + softmax + PV MFMA + prefetch.
+
+            mask_mode is a Python-level constant ('none' or 'full') passed
+            through to _emit_qk_softmax_pquant. Returns the yield_args list.
+            """
             cur_buf_i32 = inner_iter_args[_OFF_CUR_BUF]
             m_running = inner_iter_args[_OFF_M]
             l_running = inner_iter_args[_OFF_L]
@@ -1177,7 +1212,7 @@ def build_sage_attn_mxfp4_cdna_module(
 
             # ==== Compute softmax[k] using cur_buf K ====
             m_new, l_new, corr, p_words = _emit_qk_softmax_pquant(
-                kv_block_start, cur_k_off, m_running, l_running
+                kv_block_start, cur_k_off, m_running, l_running, mask_mode=mask_mode
             )
 
             # ==== Apply correction factor to o_accs (in-iter) ====
@@ -1188,11 +1223,6 @@ def build_sage_attn_mxfp4_cdna_module(
                 o_accs[dc] = _fmul(o_accs[dc], corr_vec16)
 
             # ==== GEMM2: PV[k] using p_words[k] (just computed) and cur_buf V ====
-            from flydsl._mlir.dialects._rocdl_ops_gen import (
-                permlane32_swap as _permlane32_swap_op,
-            )
-
-            _struct_ty_2xi32 = ir.Type.parse("!llvm.struct<(i32, i32)>")
             for pks in range_constexpr(PV_K_STEPS):
                 v8_elems = []
                 for w in range_constexpr(4):
@@ -1222,11 +1252,7 @@ def build_sage_attn_mxfp4_cdna_module(
                         scale_127,
                     )
 
-            # Barrier: PV V reads of cur_buf done, then prefetch K[k+2]/V[k+2]
-            # into cur_buf (overwriting K[k]/V[k]). Next iter reads next_buf
-            # (untouched here) so a single barrier suffices — vs the prior
-            # scheme's two barriers per iter (the second was needed because
-            # next iter's softmax read this-iter's prefetch target).
+            # Barrier + prefetch K[k+2]/V[k+2] into cur_buf (overwriting K[k]/V[k]).
             gpu.barrier()
 
             kv_block_after_next = kv_block_start + fx.Index(2 * BLOCK_N)
@@ -1237,7 +1263,31 @@ def build_sage_attn_mxfp4_cdna_module(
             _yield_args = [next_buf_i32, _raw(m_new), _raw(l_new)]
             for dc in range_constexpr(D_CHUNKS):
                 _yield_args.append(o_accs[dc])
-            loop_results = yield _yield_args
+            return _yield_args
+
+        # Body loop: tiles fully below the diagonal AND fully within seq_len_k.
+        # mask_mode='none' strips the causal/seq-len mask code path entirely,
+        # producing a tighter inner loop. For non-causal shapes whose seq_len_k
+        # is a multiple of BLOCK_N, this loop covers ALL K-tiles (the tail
+        # loop below has zero iterations).
+        body_results = init_args
+        for kv_block_start, inner_iter_args in range(
+            0, kv_body_end, BLOCK_N, init=init_args
+        ):
+            body_results = yield _emit_iter(
+                kv_block_start, inner_iter_args, mask_mode="none"
+            )
+
+        # Tail loop: covers the diagonal stripe (causal) and/or the seq-len
+        # boundary tile. Runs the full mask code path. State (m, l, o_accs,
+        # cur_buf) is threaded from the body loop's last yield via init=...
+        loop_results = body_results
+        for kv_block_start, inner_iter_args in range(
+            kv_body_end, kv_upper, BLOCK_N, init=body_results
+        ):
+            loop_results = yield _emit_iter(
+                kv_block_start, inner_iter_args, mask_mode="full"
+            )
 
         # ---- Normalize and store O ----
         # loop_results layout: [cur_buf, m, l, *o_accs (D_CHUNKS)]
