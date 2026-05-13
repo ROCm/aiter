@@ -24,7 +24,6 @@ from .kernels.sage_quant_cdna import (
     build_sage_preprocess_module,
 )
 
-
 __all__ = ["flydsl_sage_quant"]
 
 
@@ -54,9 +53,7 @@ def _get_fused_kernel(
 
 @lru_cache(maxsize=64)
 def _get_preprocess_kernel(head_dim: int, num_kv_heads: int):
-    return build_sage_preprocess_module(
-        head_dim=head_dim, num_kv_heads=num_kv_heads
-    )
+    return build_sage_preprocess_module(head_dim=head_dim, num_kv_heads=num_kv_heads)
 
 
 def flydsl_sage_quant(
@@ -81,11 +78,9 @@ def flydsl_sage_quant(
     if layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = k.shape
-        v_seq_dim = 2
     elif layout == "bshd":
         b, qo_len, h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = k.shape
-        v_seq_dim = 1
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
 
@@ -135,13 +130,10 @@ def flydsl_sage_quant(
     # slot spec, which forced the slow DLPack dispatch (~150us per call).
     # The kernel reinterprets back to f32 via arith.bitcast.
     import struct
+
     sm_scale_log2e_bits = struct.unpack("<i", struct.pack("<f", sm_scale_log2e_f))[0]
-    inv_fp8_max_bits = struct.unpack(
-        "<i", struct.pack("<f", 1.0 / float(FP8_MAX))
-    )[0]
-    inv_seq_len_bits = struct.unpack(
-        "<i", struct.pack("<f", 1.0 / float(kv_len))
-    )[0]
+    inv_fp8_max_bits = struct.unpack("<i", struct.pack("<f", 1.0 / float(FP8_MAX)))[0]
+    inv_seq_len_bits = struct.unpack("<i", struct.pack("<f", 1.0 / float(kv_len)))[0]
 
     stream = torch.cuda.current_stream(q.device)
 
@@ -153,7 +145,8 @@ def flydsl_sage_quant(
     use_flydsl_preproc = (b * h_kv * kv_len) < 128 * 1024
     if smooth_k and use_flydsl_preproc:
         preproc = _get_preprocess_kernel(
-            head_dim=int(head_dim), num_kv_heads=int(h_kv),
+            head_dim=int(head_dim),
+            num_kv_heads=int(h_kv),
         )
         preproc(
             k_for_kernel,

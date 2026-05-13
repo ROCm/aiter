@@ -21,17 +21,15 @@ This module exposes two builders:
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, vector, range_constexpr, const_expr, gpu
-from flydsl.expr.typing import T, Int32, Float32, Vector as Vec
+from flydsl.expr.typing import T, Int32, Vector as Vec
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
 
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf, rocdl
-from flydsl._mlir.dialects import scf as _scf
 from flydsl.expr import buffer_ops
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-
 
 BLOCK_THREADS = 256
 WARP_SIZE = 64
@@ -41,6 +39,7 @@ NUM_WAVES = BLOCK_THREADS // WARP_SIZE  # 4
 # =========================================================================
 # Standalone V FP8 kernel (Stage 0 — kept as reference / fallback)
 # =========================================================================
+
 
 def build_sage_quant_v_module(
     head_dim: int,
@@ -61,16 +60,14 @@ def build_sage_quant_v_module(
     assert head_dim % 8 == 0, f"head_dim={head_dim} must be divisible by 8"
     VEC_V = 8
     THREADS_PER_ROW = head_dim // VEC_V
-    assert BLOCK_THREADS % THREADS_PER_ROW == 0, (
-        f"BLOCK_THREADS={BLOCK_THREADS} not divisible by THREADS_PER_ROW={THREADS_PER_ROW}"
-    )
+    assert (
+        BLOCK_THREADS % THREADS_PER_ROW == 0
+    ), f"BLOCK_THREADS={BLOCK_THREADS} not divisible by THREADS_PER_ROW={THREADS_PER_ROW}"
     ROWS_PER_PASS = BLOCK_THREADS // THREADS_PER_ROW
-    assert blk_k % ROWS_PER_PASS == 0, (
-        f"blk_k={blk_k} must be divisible by ROWS_PER_PASS={ROWS_PER_PASS}"
-    )
+    assert (
+        blk_k % ROWS_PER_PASS == 0
+    ), f"blk_k={blk_k} must be divisible by ROWS_PER_PASS={ROWS_PER_PASS}"
     PASSES = blk_k // ROWS_PER_PASS
-
-    elem_bytes_in = 2  # bf16
 
     @flyc.kernel
     def sage_quant_v_kernel(
@@ -87,14 +84,12 @@ def build_sage_quant_v_module(
         i32 = T.i32
 
         c0_i32 = arith.constant(0, type=i32)
-        c2_i32 = arith.constant(2, type=i32)
         c4_i32 = arith.constant(4, type=i32)
         c_threads_per_row = arith.constant(THREADS_PER_ROW, type=i32)
         c_blk_k = arith.constant(blk_k, type=i32)
         c_head_dim = arith.constant(head_dim, type=i32)
         c_kv_heads = arith.constant(num_kv_heads, type=i32)
         c_vec = arith.constant(VEC_V, type=i32)
-        c_elem_in = arith.constant(elem_bytes_in, type=i32)
 
         bid_i32 = ArithValue(bid)
         tid_i32 = ArithValue(tid)
@@ -150,17 +145,13 @@ def build_sage_quant_v_module(
                     (b_id * seq_len_i32 + global_row) * c_kv_heads + h_id
                 ) * c_head_dim + col_d
                 in_dw_off = row_elem_off >> arith.constant(1, type=i32)
-                raw = buffer_ops.buffer_load(
-                    in_rsrc, in_dw_off, vec_width=4, dtype=i32
-                )
+                raw = buffer_ops.buffer_load(in_rsrc, in_dw_off, vec_width=4, dtype=i32)
                 bf16_v = vector.bitcast(vec_bf16_ty, raw)
                 f32_v = bf16_v.extf(vec_f32_ty)
 
                 scaled_vals = []
                 for vi in range_constexpr(VEC_V):
-                    x = vector.extract(
-                        f32_v, static_position=[vi], dynamic_position=[]
-                    )
+                    x = vector.extract(f32_v, static_position=[vi], dynamic_position=[])
                     scaled_vals.append(x * v_inv_scales[vi])
 
                 out_byte_off = row_elem_off
@@ -220,6 +211,7 @@ def build_sage_quant_v_module(
 # Preprocessor: compute V_scale + K_mean in one launch (replaces torch ops)
 # =========================================================================
 
+
 def build_sage_preprocess_module(head_dim: int, num_kv_heads: int):
     """Build a kernel that computes V_scale[B,H,D] = max_seq |V| / FP8_MAX
     and K_mean[B,H,D] = sum_seq(K) / S, in a single launch over (b, h, d_block).
@@ -239,10 +231,10 @@ def build_sage_preprocess_module(head_dim: int, num_kv_heads: int):
 
     @flyc.kernel
     def sage_preprocess_kernel(
-        K_in: fx.Tensor,    # bf16 [B, S, H, D]
-        V_in: fx.Tensor,    # bf16 [B, S, H, D]
+        K_in: fx.Tensor,  # bf16 [B, S, H, D]
+        V_in: fx.Tensor,  # bf16 [B, S, H, D]
         K_mean: fx.Tensor,  # f32  [B, H, D]
-        V_scale: fx.Tensor, # f32  [B, H, D]
+        V_scale: fx.Tensor,  # f32  [B, H, D]
         seq_len: Int32,
         inv_fp8_max: Int32,  # bit-pattern f32: 1.0 / FP8_MAX
         inv_seq_len: Int32,  # bit-pattern f32: 1.0 / seq_len
@@ -304,15 +296,10 @@ def build_sage_preprocess_module(head_dim: int, num_kv_heads: int):
         threads_idx = arith.constant(THREADS_PER_BLOCK, index=True)
         trip_count = (seq_idx + threads_idx - c_idx_one) // threads_idx
 
-        # Scalar starting row = tid
-        tid_idx = arith.index_cast(T.index, tid_i32)
-
         # Use scf.for to loop trip_count times. Carry the VEC amax and VEC sum
         # accumulators as iter args (16 f32 values).
         init_args = list(v_amax) + list(k_sum)
-        for_op = _scf_d.ForOp(
-            c_idx_zero, trip_count, c_idx_one, init_args
-        )
+        for_op = _scf_d.ForOp(c_idx_zero, trip_count, c_idx_one, init_args)
         with ir.InsertionPoint(for_op.body):
             iv = for_op.induction_variable
             iter_args = list(for_op.inner_iter_args)
@@ -321,9 +308,7 @@ def build_sage_preprocess_module(head_dim: int, num_kv_heads: int):
 
             iv_i32 = arith.index_cast(i32, iv)
             global_row = tid_i32 + iv_i32 * c_threads
-            row_in_range = arith.cmpi(
-                CmpIPredicate.ult, global_row, seq_len_i32
-            )
+            row_in_range = arith.cmpi(CmpIPredicate.ult, global_row, seq_len_i32)
 
             # Conditional load (mask OOB to 0)
             row_elem_off = (
@@ -335,12 +320,8 @@ def build_sage_preprocess_module(head_dim: int, num_kv_heads: int):
             # will return 0 for OOB.
             safe_off = arith.select(row_in_range, in_dw_off, c0_i32)
 
-            v_raw = buffer_ops.buffer_load(
-                v_in_rsrc, safe_off, vec_width=4, dtype=i32
-            )
-            k_raw = buffer_ops.buffer_load(
-                k_in_rsrc, safe_off, vec_width=4, dtype=i32
-            )
+            v_raw = buffer_ops.buffer_load(v_in_rsrc, safe_off, vec_width=4, dtype=i32)
+            k_raw = buffer_ops.buffer_load(k_in_rsrc, safe_off, vec_width=4, dtype=i32)
             v_bf16 = vector.bitcast(vec_bf16_ty, v_raw)
             k_bf16 = vector.bitcast(vec_bf16_ty, k_raw)
             v_f32 = v_bf16.extf(vec_f32_ty)
@@ -349,18 +330,12 @@ def build_sage_preprocess_module(head_dim: int, num_kv_heads: int):
             new_v_amax = []
             new_k_sum = []
             for vi in range_constexpr(VEC):
-                v_x = vector.extract(
-                    v_f32, static_position=[vi], dynamic_position=[]
-                )
-                k_x = vector.extract(
-                    k_f32, static_position=[vi], dynamic_position=[]
-                )
+                v_x = vector.extract(v_f32, static_position=[vi], dynamic_position=[])
+                k_x = vector.extract(k_f32, static_position=[vi], dynamic_position=[])
                 # Mask OOB so amax/sum are unaffected.
                 v_x_m = arith.select(row_in_range, v_x, c0_f32)
                 k_x_m = arith.select(row_in_range, k_x, c0_f32)
-                abs_v = llvm.call_intrinsic(
-                    f32, "llvm.fabs.f32", [v_x_m], [], []
-                )
+                abs_v = llvm.call_intrinsic(f32, "llvm.fabs.f32", [v_x_m], [], [])
                 new_v_amax.append(arith.maximumf(in_v_amax[vi], abs_v))
                 new_k_sum.append(in_k_sum[vi] + k_x_m)
 
@@ -399,10 +374,16 @@ def build_sage_preprocess_module(head_dim: int, num_kv_heads: int):
                 k_mean_v = red_k_sum[vi] * inv_seq_len_v
                 off = out_off_base + arith.constant(vi, type=i32)
                 buffer_ops.buffer_store(
-                    v_scale, v_scale_rsrc, off, offset_is_bytes=False,
+                    v_scale,
+                    v_scale_rsrc,
+                    off,
+                    offset_is_bytes=False,
                 )
                 buffer_ops.buffer_store(
-                    k_mean_v, k_mean_rsrc, off, offset_is_bytes=False,
+                    k_mean_v,
+                    k_mean_rsrc,
+                    off,
+                    offset_is_bytes=False,
                 )
             scf.YieldOp([])
 
@@ -422,7 +403,13 @@ def build_sage_preprocess_module(head_dim: int, num_kv_heads: int):
         bidx = fx.Index(batch)
         grid = bidx * arith.constant(num_kv_heads * D_BLOCKS, index=True)
         launcher = sage_preprocess_kernel(
-            K_in, V_in, K_mean, V_scale, seq_len, inv_fp8_max_bits, inv_seq_len_bits,
+            K_in,
+            V_in,
+            K_mean,
+            V_scale,
+            seq_len,
+            inv_fp8_max_bits,
+            inv_seq_len_bits,
         )
         launcher.launch(
             grid=(grid, 1, 1),
@@ -436,6 +423,7 @@ def build_sage_preprocess_module(head_dim: int, num_kv_heads: int):
 # =========================================================================
 # Fused Q+K+V single-launch kernel
 # =========================================================================
+
 
 def build_sage_quant_fused_module(
     head_dim: int,
@@ -466,7 +454,7 @@ def build_sage_quant_fused_module(
     assert blk_k in (64, 128, 256), f"unexpected BLK_K={blk_k}"
 
     VEC = 8
-    THREADS_PER_ROW = head_dim // VEC               # 16 for head_dim=128
+    THREADS_PER_ROW = head_dim // VEC  # 16 for head_dim=128
     assert BLOCK_THREADS % THREADS_PER_ROW == 0
     ROWS_PER_PASS = BLOCK_THREADS // THREADS_PER_ROW  # 16
     assert blk_q % ROWS_PER_PASS == 0
@@ -498,16 +486,16 @@ def build_sage_quant_fused_module(
 
     @flyc.kernel
     def sage_quant_fused_kernel(
-        Q_in: fx.Tensor,    # bf16 [B, S_q, H_q, D]
-        Q_out: fx.Tensor,   # int8 [B, S_q, H_q, D]
-        Q_scale: fx.Tensor, # f32  [B, H_q, NUM_BLKS_Q]
-        K_in: fx.Tensor,    # bf16 [B, S_k, H_k, D]  (RAW, not smoothed)
-        K_out: fx.Tensor,   # int8 [B, S_k, H_k, D]
-        K_scale: fx.Tensor, # f32  [B, H_k, NUM_BLKS_K]
+        Q_in: fx.Tensor,  # bf16 [B, S_q, H_q, D]
+        Q_out: fx.Tensor,  # int8 [B, S_q, H_q, D]
+        Q_scale: fx.Tensor,  # f32  [B, H_q, NUM_BLKS_Q]
+        K_in: fx.Tensor,  # bf16 [B, S_k, H_k, D]  (RAW, not smoothed)
+        K_out: fx.Tensor,  # int8 [B, S_k, H_k, D]
+        K_scale: fx.Tensor,  # f32  [B, H_k, NUM_BLKS_K]
         K_mean: fx.Tensor,  # f32  [B, H_k, D]       (subtract from K)
-        V_in: fx.Tensor,    # bf16 [B, S_k, H_k, D]
-        V_out: fx.Tensor,   # fp8  [B, S_k, H_k, D]
-        V_scale: fx.Tensor, # f32  [B, H_k, D]
+        V_in: fx.Tensor,  # bf16 [B, S_k, H_k, D]
+        V_out: fx.Tensor,  # fp8  [B, S_k, H_k, D]
+        V_scale: fx.Tensor,  # f32  [B, H_k, D]
         seq_len_q: Int32,
         seq_len_k: Int32,
         num_blocks_q: Int32,
@@ -521,7 +509,6 @@ def build_sage_quant_fused_module(
 
         f32 = T.f32
         i32 = T.i32
-        i8 = T.i8
 
         bid_i32 = ArithValue(bid)
         tid_i32 = ArithValue(tid)
@@ -532,10 +519,8 @@ def build_sage_quant_fused_module(
         c8_i32 = arith.constant(8, type=i32)
         c16_i32 = arith.constant(16, type=i32)
         c24_i32 = arith.constant(24, type=i32)
-        c32_i32 = arith.constant(32, type=i32)
         c0xFF_i32 = arith.constant(0xFF, type=i32)
         c_warp_size_i32 = arith.constant(WARP_SIZE, type=i32)
-        c_num_waves_i32 = arith.constant(NUM_WAVES, type=i32)
         c_threads_per_row = arith.constant(THREADS_PER_ROW, type=i32)
         c_head_dim = arith.constant(head_dim, type=i32)
         c_q_heads = arith.constant(num_q_heads, type=i32)
@@ -582,8 +567,6 @@ def build_sage_quant_fused_module(
         # sm_scale_log2e arrives as int32 (bit pattern of f32) for the fast
         # CallState slot path; reinterpret it back to f32 here.
         sm_scale_log2e_v = arith.bitcast(f32, ArithValue(sm_scale_log2e_bits))
-
-        qk_task_count_i32 = q_task_count_i32 + k_task_count_i32
 
         vec_bf16_ty = T.vec(VEC, T.bf16)
         vec_f32_ty = T.vec(VEC, f32)
@@ -632,7 +615,8 @@ def build_sage_quant_fused_module(
                 block_max = c0_f32
                 for w in range_constexpr(NUM_WAVES):
                     wval_vec = Vec.load(
-                        T.vec(1, f32), lds,
+                        T.vec(1, f32),
+                        lds,
                         [arith.constant(w, index=True)],
                     )
                     wval = vector.extract(
@@ -662,18 +646,20 @@ def build_sage_quant_fused_module(
 
             gpu.barrier()
 
-            inv_vec = Vec.load(
-                T.vec(1, f32), lds, [arith.constant(0, index=True)]
-            )
-            return vector.extract(
-                inv_vec, static_position=[0], dynamic_position=[]
-            )
+            inv_vec = Vec.load(T.vec(1, f32), lds, [arith.constant(0, index=True)])
+            return vector.extract(inv_vec, static_position=[0], dynamic_position=[])
 
         # ---------- generic Q/K INT8 body ----------
         def do_qk_quant(
             local_pid,
-            in_rsrc, out_rsrc, scale_rsrc,
-            BLK, c_blk, num_heads, c_num_heads, num_blks_i32,
+            in_rsrc,
+            out_rsrc,
+            scale_rsrc,
+            BLK,
+            c_blk,
+            num_heads,
+            c_num_heads,
+            num_blks_i32,
             seq_len_i32,
             PASSES,
             apply_sm_scale,
@@ -717,27 +703,23 @@ def build_sage_quant_fused_module(
             for p in range_constexpr(PASSES):
                 row_in_blk = row_base + arith.constant(p * ROWS_PER_PASS, type=i32)
                 global_row = blk_idx * c_blk + row_in_blk
-                row_in_range = arith.cmpi(
-                    CmpIPredicate.ult, global_row, seq_len_i32
-                )
+                row_in_range = arith.cmpi(CmpIPredicate.ult, global_row, seq_len_i32)
 
                 # bf16 element offset
                 row_elem_off = (
                     (b_id * seq_len_i32 + global_row) * c_num_heads + h_id
                 ) * c_head_dim + col_d
-                in_dw_off = row_elem_off >> c1_i32  # bf16: 2 bytes/elem -> dword off = elem/2
+                in_dw_off = (
+                    row_elem_off >> c1_i32
+                )  # bf16: 2 bytes/elem -> dword off = elem/2
 
-                raw = buffer_ops.buffer_load(
-                    in_rsrc, in_dw_off, vec_width=4, dtype=i32
-                )
+                raw = buffer_ops.buffer_load(in_rsrc, in_dw_off, vec_width=4, dtype=i32)
                 bf16_v = vector.bitcast(vec_bf16_ty, raw)
                 f32_v = bf16_v.extf(vec_f32_ty)
 
                 pass_vals = []
                 for vi in range_constexpr(VEC):
-                    x = vector.extract(
-                        f32_v, static_position=[vi], dynamic_position=[]
-                    )
+                    x = vector.extract(f32_v, static_position=[vi], dynamic_position=[])
                     if const_expr(subtract_k_mean):
                         x = x - k_means[vi]
                     if const_expr(apply_sm_scale):
@@ -766,17 +748,13 @@ def build_sage_quant_fused_module(
                     offset_is_bytes=False,
                 )
 
-            inv_scale = cross_wave_amax_to_inv_scale(
-                local_max, store_scale, scale_off
-            )
+            inv_scale = cross_wave_amax_to_inv_scale(local_max, store_scale, scale_off)
 
             # Stage 3: quantize and store (int8)
             for p in range_constexpr(PASSES):
                 row_in_blk = row_base + arith.constant(p * ROWS_PER_PASS, type=i32)
                 global_row = blk_idx * c_blk + row_in_blk
-                row_in_range = arith.cmpi(
-                    CmpIPredicate.ult, global_row, seq_len_i32
-                )
+                row_in_range = arith.cmpi(CmpIPredicate.ult, global_row, seq_len_i32)
                 _if_store = scf.IfOp(row_in_range)
                 with ir.InsertionPoint(_if_store.then_block):
                     row_elem_off = (
@@ -788,9 +766,7 @@ def build_sage_quant_fused_module(
                     for vi in range_constexpr(VEC):
                         xs = cached_vals[p][vi] * inv_scale
                         # Round-half-away-from-zero: trunc(x + 0.5*sign(x))
-                        is_pos = arith.cmpf(
-                            arith.CmpFPredicate.OGE, xs, c0_f32
-                        )
+                        is_pos = arith.cmpf(arith.CmpFPredicate.OGE, xs, c0_f32)
                         signed_half = arith.select(is_pos, c_p_half, c_n_half)
                         rounded = xs + signed_half
                         as_i32 = arith.fptosi(i32, rounded)
@@ -809,9 +785,7 @@ def build_sage_quant_fused_module(
                         b2 = (int8_vals_i32[_b + 2] & c0xFF_i32) << c16_i32
                         b3 = (int8_vals_i32[_b + 3] & c0xFF_i32) << c24_i32
                         packed = b0 | b1 | b2 | b3
-                        word_off = row_elem_off + arith.constant(
-                            _wg * 4, type=i32
-                        )
+                        word_off = row_elem_off + arith.constant(_wg * 4, type=i32)
                         buffer_ops.buffer_store(
                             packed,
                             out_rsrc,
@@ -840,28 +814,18 @@ def build_sage_quant_fused_module(
 
             v_inv_scales = []
             for vi in range_constexpr(4):
-                s = vector.extract(
-                    scale_lo, static_position=[vi], dynamic_position=[]
-                )
-                inv_s = llvm.call_intrinsic(
-                    f32, "llvm.amdgcn.rcp.f32", [s], [], []
-                )
+                s = vector.extract(scale_lo, static_position=[vi], dynamic_position=[])
+                inv_s = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [s], [], [])
                 v_inv_scales.append(inv_s)
             for vi in range_constexpr(4):
-                s = vector.extract(
-                    scale_hi, static_position=[vi], dynamic_position=[]
-                )
-                inv_s = llvm.call_intrinsic(
-                    f32, "llvm.amdgcn.rcp.f32", [s], [], []
-                )
+                s = vector.extract(scale_hi, static_position=[vi], dynamic_position=[])
+                inv_s = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [s], [], [])
                 v_inv_scales.append(inv_s)
 
             for p in range_constexpr(PASSES_V):
                 row_in_blk = row_base + arith.constant(p * ROWS_PER_PASS, type=i32)
                 global_row = blk_n_id * c_blk_k + row_in_blk
-                row_in_range = arith.cmpi(
-                    CmpIPredicate.ult, global_row, seq_len_k_i32
-                )
+                row_in_range = arith.cmpi(CmpIPredicate.ult, global_row, seq_len_k_i32)
                 _if_row = scf.IfOp(row_in_range)
                 with ir.InsertionPoint(_if_row.then_block):
                     row_elem_off = (
@@ -899,9 +863,7 @@ def build_sage_quant_fused_module(
                             packed_w,
                             1,
                         )
-                        word_off = out_byte_off + arith.constant(
-                            _wg * 4, type=i32
-                        )
+                        word_off = out_byte_off + arith.constant(_wg * 4, type=i32)
                         buffer_ops.buffer_store(
                             packed_w,
                             v_out_rsrc,
@@ -916,8 +878,14 @@ def build_sage_quant_fused_module(
         with ir.InsertionPoint(_if_q.then_block):
             do_qk_quant(
                 bid_i32,
-                q_in_rsrc, q_out_rsrc, q_scale_rsrc,
-                blk_q, c_blk_q, num_q_heads, c_q_heads, num_blocks_q_i32,
+                q_in_rsrc,
+                q_out_rsrc,
+                q_scale_rsrc,
+                blk_q,
+                c_blk_q,
+                num_q_heads,
+                c_q_heads,
+                num_blocks_q_i32,
                 seq_len_q_i32,
                 PASSES_Q,
                 apply_sm_scale=True,
@@ -930,8 +898,14 @@ def build_sage_quant_fused_module(
             with ir.InsertionPoint(_if_k.then_block):
                 do_qk_quant(
                     local_pid_kv,
-                    k_in_rsrc, k_out_rsrc, k_scale_rsrc,
-                    blk_k, c_blk_k, num_kv_heads, c_kv_heads, num_blocks_k_i32,
+                    k_in_rsrc,
+                    k_out_rsrc,
+                    k_scale_rsrc,
+                    blk_k,
+                    c_blk_k,
+                    num_kv_heads,
+                    c_kv_heads,
+                    num_blocks_k_i32,
                     seq_len_k_i32,
                     PASSES_K,
                     apply_sm_scale=False,
@@ -973,12 +947,22 @@ def build_sage_quant_fused_module(
 
         idx_grid = arith.index_cast(T.index, grid_size)
         launcher = sage_quant_fused_kernel(
-            Q_in, Q_out, Q_scale,
-            K_in, K_out, K_scale, K_mean,
-            V_in, V_out, V_scale,
-            seq_len_q, seq_len_k,
-            num_blocks_q, num_blocks_k,
-            q_task_count, k_task_count,
+            Q_in,
+            Q_out,
+            Q_scale,
+            K_in,
+            K_out,
+            K_scale,
+            K_mean,
+            V_in,
+            V_out,
+            V_scale,
+            seq_len_q,
+            seq_len_k,
+            num_blocks_q,
+            num_blocks_k,
+            q_task_count,
+            k_task_count,
             sm_scale_log2e_bits,
         )
         launcher.launch(

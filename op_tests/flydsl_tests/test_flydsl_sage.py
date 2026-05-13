@@ -19,6 +19,7 @@ if not is_flydsl_available():
 
 try:
     from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
+
     HAS_TRITON_SAGE = True
 except Exception:
     HAS_TRITON_SAGE = False
@@ -75,9 +76,21 @@ def _make_qkv(
     device: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     g = torch.Generator(device=device).manual_seed(seed)
-    q = torch.randn((batch, seq_len, num_q_heads, head_dim), generator=g, dtype=dtype, device=device)
-    k = torch.randn((batch, seq_len, num_kv_heads, head_dim), generator=g, dtype=dtype, device=device)
-    v = torch.randn((batch, seq_len, num_kv_heads, head_dim), generator=g, dtype=dtype, device=device)
+    q = torch.randn(
+        (batch, seq_len, num_q_heads, head_dim), generator=g, dtype=dtype, device=device
+    )
+    k = torch.randn(
+        (batch, seq_len, num_kv_heads, head_dim),
+        generator=g,
+        dtype=dtype,
+        device=device,
+    )
+    v = torch.randn(
+        (batch, seq_len, num_kv_heads, head_dim),
+        generator=g,
+        dtype=dtype,
+        device=device,
+    )
     return q, k, v
 
 
@@ -89,18 +102,27 @@ _COS_MEAN_MIN = 0.99
 @pytest.mark.parametrize(
     "batch,seq_len,num_q_heads,num_kv_heads,head_dim",
     [
-        (1, 4096, 8, 8, 128),    # standard MHA, seq aligned to 256
+        (1, 4096, 8, 8, 128),  # standard MHA, seq aligned to 256
         (2, 2048, 16, 16, 128),  # larger heads
-        (1, 4096, 16, 4, 128),   # GQA: 4 KV groups for 16 Q heads
-        (1, 4096, 8, 1, 128),    # MQA: 1 KV head
+        (1, 4096, 16, 4, 128),  # GQA: 4 KV groups for 16 Q heads
+        (1, 4096, 8, 1, 128),  # MQA: 1 KV head
     ],
 )
-def test_flydsl_sage_correctness_bf16(batch, seq_len, num_q_heads, num_kv_heads, head_dim):
-    q, k, v = _make_qkv(batch, seq_len, num_q_heads, num_kv_heads, head_dim, torch.bfloat16)
+def test_flydsl_sage_correctness_bf16(
+    batch, seq_len, num_q_heads, num_kv_heads, head_dim
+):
+    q, k, v = _make_qkv(
+        batch, seq_len, num_q_heads, num_kv_heads, head_dim, torch.bfloat16
+    )
     out = flydsl_sage_attn_func(q, k, v, causal=False)
     ref = _ref_sdpa_bshd(q, k, v, causal=False)
 
-    assert out.shape == (batch, seq_len, num_q_heads, head_dim), f"shape mismatch: {out.shape}"
+    assert out.shape == (
+        batch,
+        seq_len,
+        num_q_heads,
+        head_dim,
+    ), f"shape mismatch: {out.shape}"
     assert out.dtype == torch.bfloat16, f"expected bf16 output, got {out.dtype}"
 
     cos = F.cosine_similarity(
@@ -112,15 +134,17 @@ def test_flydsl_sage_correctness_bf16(batch, seq_len, num_q_heads, num_kv_heads,
         f"min_cos={cos.min().item():.4f} < {_COS_MIN} "
         f"(batch={batch}, seq={seq_len}, Hq={num_q_heads}, Hkv={num_kv_heads})"
     )
-    assert cos.mean().item() > _COS_MEAN_MIN, (
-        f"mean_cos={cos.mean().item():.4f} < {_COS_MEAN_MIN}"
-    )
+    assert (
+        cos.mean().item() > _COS_MEAN_MIN
+    ), f"mean_cos={cos.mean().item():.4f} < {_COS_MEAN_MIN}"
 
 
 def test_flydsl_sage_correctness_causal():
     """Causal masking: lower-triangular attention."""
     batch, seq_len, num_q_heads, num_kv_heads, head_dim = 1, 4096, 8, 8, 128
-    q, k, v = _make_qkv(batch, seq_len, num_q_heads, num_kv_heads, head_dim, torch.bfloat16)
+    q, k, v = _make_qkv(
+        batch, seq_len, num_q_heads, num_kv_heads, head_dim, torch.bfloat16
+    )
     out = flydsl_sage_attn_func(q, k, v, causal=True)
     ref = _ref_sdpa_bshd(q, k, v, causal=True)
 
@@ -136,7 +160,9 @@ def test_flydsl_sage_correctness_causal():
 def test_flydsl_sage_bhsd_layout():
     """BHSD layout produces the same result as BSHD (transposed)."""
     batch, seq_len, num_q_heads, head_dim = 1, 4096, 8, 128
-    q_bshd, k_bshd, v_bshd = _make_qkv(batch, seq_len, num_q_heads, num_q_heads, head_dim, torch.bfloat16)
+    q_bshd, k_bshd, v_bshd = _make_qkv(
+        batch, seq_len, num_q_heads, num_q_heads, head_dim, torch.bfloat16
+    )
 
     out_bshd = flydsl_sage_attn_func(q_bshd, k_bshd, v_bshd, layout="bshd")
 
@@ -197,7 +223,9 @@ def test_flydsl_sage_rejects_dtype_mismatch():
 def test_flydsl_sage_padded_seq_len():
     """seq_len not aligned to block_m (256) is padded transparently."""
     batch, seq_len, num_q_heads, head_dim = 1, 3000, 8, 128  # 3000 % 256 != 0
-    q, k, v = _make_qkv(batch, seq_len, num_q_heads, num_q_heads, head_dim, torch.bfloat16)
+    q, k, v = _make_qkv(
+        batch, seq_len, num_q_heads, num_q_heads, head_dim, torch.bfloat16
+    )
     out = flydsl_sage_attn_func(q, k, v, causal=False)
     ref = _ref_sdpa_bshd(q, k, v, causal=False)
 
@@ -214,18 +242,24 @@ def test_flydsl_sage_padded_seq_len():
 @pytest.mark.parametrize(
     "batch,seq_q,seq_k,num_q_heads,num_kv_heads,head_dim,causal",
     [
-        (1,  4096,  4096,  8,  8, 128, False),
-        (1,  4096,  4096,  8,  8, 128, True),
+        (1, 4096, 4096, 8, 8, 128, False),
+        (1, 4096, 4096, 8, 8, 128, True),
         (1, 16384, 16384, 24, 24, 128, False),
-        (2,  4096,  4096, 16,  4, 128, False),
-        (1,  3000,  3000,  8,  8, 128, False),
+        (2, 4096, 4096, 16, 4, 128, False),
+        (1, 3000, 3000, 8, 8, 128, False),
     ],
 )
-def test_flydsl_sage_vs_triton(batch, seq_q, seq_k, num_q_heads, num_kv_heads, head_dim, causal):
+def test_flydsl_sage_vs_triton(
+    batch, seq_q, seq_k, num_q_heads, num_kv_heads, head_dim, causal
+):
     """FlyDSL output matches Triton fav3_sage on the same quantized inputs."""
-    q, k, v = _make_qkv(batch, seq_q, num_q_heads, num_kv_heads, head_dim, torch.bfloat16)
+    q, k, v = _make_qkv(
+        batch, seq_q, num_q_heads, num_kv_heads, head_dim, torch.bfloat16
+    )
     if seq_k != seq_q:
-        _, k, v = _make_qkv(batch, seq_k, num_q_heads, num_kv_heads, head_dim, torch.bfloat16, seed=99)
+        _, k, v = _make_qkv(
+            batch, seq_k, num_q_heads, num_kv_heads, head_dim, torch.bfloat16, seed=99
+        )
 
     flydsl_out = flydsl_sage_attn_func(q, k, v, causal=causal)
     try:
@@ -246,6 +280,6 @@ def test_flydsl_sage_vs_triton(batch, seq_q, seq_k, num_q_heads, num_kv_heads, h
         f"FlyDSL vs Triton min_cos={cos.min().item():.4f} < {_COS_MIN} "
         f"(B={batch} Sq={seq_q} Sk={seq_k} Hq={num_q_heads} Hkv={num_kv_heads} causal={causal})"
     )
-    assert cos.mean().item() > _COS_MEAN_MIN, (
-        f"FlyDSL vs Triton mean_cos={cos.mean().item():.4f} < {_COS_MEAN_MIN}"
-    )
+    assert (
+        cos.mean().item() > _COS_MEAN_MIN
+    ), f"FlyDSL vs Triton mean_cos={cos.mean().item():.4f} < {_COS_MEAN_MIN}"

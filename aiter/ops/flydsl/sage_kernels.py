@@ -18,12 +18,14 @@ from __future__ import annotations
 import math
 import os
 from functools import lru_cache
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
 from aiter.utility.dtypes import fp8 as _fp8_dtype
-from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant as _triton_sage_quant
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+    sage_quant as _triton_sage_quant,
+)
 from .sage_quant import flydsl_sage_quant as _flydsl_sage_quant
 
 from .kernels.sage_attn_cdna import build_sage_attn_cdna_module
@@ -176,7 +178,9 @@ def flydsl_sage_attn_func(
     # (larger MFMA chains, single coop-load batch).
     if block_m is None:
         try:
-            cu_count = torch.cuda.get_device_properties(q.device.index).multi_processor_count
+            cu_count = torch.cuda.get_device_properties(
+                q.device.index
+            ).multi_processor_count
         except Exception:
             cu_count = 256
         grid_at_bm256 = batch * num_q_heads * ((seq_q + 255) // 256)
@@ -230,7 +234,9 @@ def flydsl_sage_attn_func(
             torch.cuda.current_stream(q.device) if stream is None else stream
         )
         if launch_stream.device != q.device:
-            raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
+            raise ValueError(
+                f"`stream` must be on {q.device}, got {launch_stream.device}"
+            )
 
         exe = _get_kernel(
             num_q_heads=num_q_heads,

@@ -22,7 +22,6 @@ Supports:
 """
 
 import math as host_math
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -36,7 +35,6 @@ from flydsl.expr import (
     rocdl,
     vector,
 )
-from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
 from .kernels_common import get_warp_size
@@ -48,7 +46,6 @@ from flydsl._mlir.dialects import (
     llvm as _llvm,
     memref as _memref,
     scf as _scf,
-    vector as _vector,
 )
 
 _LOG2E = host_math.log2(host_math.e)
@@ -104,16 +101,8 @@ def build_sage_attn_cdna_module(
 
     # For Int8 MFMA: mfma_i32_32x32x32_i8 accumulates K=32 per call
     MFMA_K_INT8 = 32
-    # For BF16 MFMA: mfma_f32_32x32x16_bf16 accumulates K=16 per call (legacy/unused)
-    MFMA_K_BF16 = 16
     # For FP8 K=64 MFMA: mfma_scale_f32_32x32x64_f8f6f4 accumulates K=64 per call.
     MFMA_K_FP8 = 64
-
-    # FP8 (gfx950 e4m3fn) max representable magnitude. Used to scale P into [0, 1]
-    # → [0, FP8_MAX] before fp8 cast. Since P = exp2(s - m_new) ∈ [0, 1] by
-    # construction (per-row max of P is exactly 1.0), p_amax = 1.0.
-    FP8_MAX = 448.0
-    INV_FP8_MAX = 1.0 / FP8_MAX
 
     ROWS_PER_WAVE = MFMA_M  # 32 output rows per wave
 
@@ -135,7 +124,9 @@ def build_sage_attn_cdna_module(
     # K steps for GEMM2 per BLOCK_N tile: BLOCK_N // MFMA_K_FP8
     PV_K_STEPS = BLOCK_N // MFMA_K_FP8
 
-    assert head_dim % MFMA_K_INT8 == 0, f"head_dim {head_dim} must be divisible by {MFMA_K_INT8}"
+    assert (
+        head_dim % MFMA_K_INT8 == 0
+    ), f"head_dim {head_dim} must be divisible by {MFMA_K_INT8}"
     assert BLOCK_M % ROWS_PER_WAVE == 0
     assert BLOCK_N % MFMA_K_FP8 == 0
 
@@ -164,10 +155,10 @@ def build_sage_attn_cdna_module(
     #    only; performs a 16-lane in-instruction transpose) to deliver the
     #    32 K-contiguous bytes per lane that the f8f6f4 MFMA expects.
     _is_gfx950_kv = "gfx950" in gpu_arch
-    K_STRIDE = HEAD_DIM + 16    # 16 B pad: HEAD_DIM=128 = 32 banks × 4 B,
-                                #   so naive +0/+8 hits bank conflicts on
-                                #   ds_read paths. +16 shifts each row by 4
-                                #   banks → conflict-free (matches V_STRIDE).
+    K_STRIDE = HEAD_DIM + 16  # 16 B pad: HEAD_DIM=128 = 32 banks × 4 B,
+    #   so naive +0/+8 hits bank conflicts on
+    #   ds_read paths. +16 shifts each row by 4
+    #   banks → conflict-free (matches V_STRIDE).
     if _is_gfx950_kv:
         # Pad row stride by 16 bytes to break LDS bank conflicts on the
         # ds_read_tr8_b64 path. HEAD_DIM=128 = exact multiple of 32 banks ×
@@ -180,14 +171,14 @@ def build_sage_attn_cdna_module(
         V_STRIDE = BLOCK_N + 16
 
     # Cooperative load parameters
-    VEC_WIDTH_K = 16   # 16 Int8 elements = 16 bytes per thread
+    VEC_WIDTH_K = 16  # 16 Int8 elements = 16 bytes per thread
     # V coop load (gfx942): each thread reads 16 contiguous FP8 bytes from one
     # global V row (16 d-positions) and SCATTERS them as 16 separate bytes
     # into column-major LDS at 16 different LDS rows (the d-positions), same
     # LDS column (the kv_row).
     # V coop load (gfx950): each thread reads 16 contiguous FP8 bytes and
     # WRITES them contiguously into row-major LDS as one ds_write_b128.
-    VEC_WIDTH_V = 16   # 16 FP8 bytes per thread (one global vec load)
+    VEC_WIDTH_V = 16  # 16 FP8 bytes per thread (one global vec load)
     THREADS_PER_ROW_K = HEAD_DIM // VEC_WIDTH_K
     THREADS_PER_ROW_V = HEAD_DIM // VEC_WIDTH_V
     ROWS_PER_BATCH_K = BLOCK_SIZE // THREADS_PER_ROW_K
@@ -210,9 +201,9 @@ def build_sage_attn_cdna_module(
     # V LDS section.
     # gfx942 (column-major): HEAD_DIM rows × V_STRIDE bytes per row.
     # gfx950 (row-major):    BLOCK_N rows × V_STRIDE (=HEAD_DIM) bytes per row.
-    LDS_K_BYTES = BLOCK_N * K_STRIDE * 1   # 1 byte per Int8
+    LDS_K_BYTES = BLOCK_N * K_STRIDE * 1  # 1 byte per Int8
     if _is_gfx950_kv:
-        LDS_V_BYTES = BLOCK_N * V_STRIDE * 1   # row-major: BLOCK_N × HEAD_DIM
+        LDS_V_BYTES = BLOCK_N * V_STRIDE * 1  # row-major: BLOCK_N × HEAD_DIM
     else:
         LDS_V_BYTES = HEAD_DIM * V_STRIDE * 1  # column-major: HEAD_DIM × V_STRIDE
     # Stage III: 2-stage software pipeline. Allocate two ping-pong buffers for
@@ -259,11 +250,29 @@ def build_sage_attn_cdna_module(
         cbsz = operands[3] if len(operands) > 3 else 0
         abid = operands[4] if len(operands) > 4 else 0
         blgp = operands[5] if len(operands) > 5 else 0
-        a_v = a.ir_value() if hasattr(a, "ir_value") and not isinstance(a, ir.Value) else a
-        b_v = b.ir_value() if hasattr(b, "ir_value") and not isinstance(b, ir.Value) else b
-        c_v = c.ir_value() if hasattr(c, "ir_value") and not isinstance(c, ir.Value) else c
+        a_v = (
+            a.ir_value()
+            if hasattr(a, "ir_value") and not isinstance(a, ir.Value)
+            else a
+        )
+        b_v = (
+            b.ir_value()
+            if hasattr(b, "ir_value") and not isinstance(b, ir.Value)
+            else b
+        )
+        c_v = (
+            c.ir_value()
+            if hasattr(c, "ir_value") and not isinstance(c, ir.Value)
+            else c
+        )
         return _ods_mfma_i32_32x32x32_i8(
-            res=result_type, a=a_v, b=b_v, c=c_v, cbsz=cbsz, abid=abid, blgp=blgp,
+            res=result_type,
+            a=a_v,
+            b=b_v,
+            c=c_v,
+            cbsz=cbsz,
+            abid=abid,
+            blgp=blgp,
         ).result
 
     def mfma_fp8_k64(result_type, a, b, c, scale_a, scale_b):
@@ -274,23 +283,40 @@ def build_sage_attn_cdna_module(
         scale_a, scale_b: i32 (e8m0). Pass 127 for "no scaling" (1.0 multiplier).
         opselA=opselB=0 selects the FP8 path.
         """
-        a_v = a.ir_value() if hasattr(a, "ir_value") and not isinstance(a, ir.Value) else a
-        b_v = b.ir_value() if hasattr(b, "ir_value") and not isinstance(b, ir.Value) else b
-        c_v = c.ir_value() if hasattr(c, "ir_value") and not isinstance(c, ir.Value) else c
+        a_v = (
+            a.ir_value()
+            if hasattr(a, "ir_value") and not isinstance(a, ir.Value)
+            else a
+        )
+        b_v = (
+            b.ir_value()
+            if hasattr(b, "ir_value") and not isinstance(b, ir.Value)
+            else b
+        )
+        c_v = (
+            c.ir_value()
+            if hasattr(c, "ir_value") and not isinstance(c, ir.Value)
+            else c
+        )
         return _ods_mfma_scale_f32_32x32x64_f8f6f4(
             res=result_type,
-            a=a_v, b=b_v, c=c_v,
-            cbsz=0, blgp=0,
-            opselA=0, scaleA=scale_a,
-            opselB=0, scaleB=scale_b,
+            a=a_v,
+            b=b_v,
+            c=c_v,
+            cbsz=0,
+            blgp=0,
+            opselA=0,
+            scaleA=scale_a,
+            opselB=0,
+            scaleB=scale_b,
         ).result
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def sage_attn_kernel(
-        Q: fx.Tensor,          # Int8, 1D flattened BSHD
-        K: fx.Tensor,          # Int8, 1D flattened BSHD (num_kv_heads)
-        V: fx.Tensor,          # FP8, 1D flattened BSHD (num_kv_heads)
-        O: fx.Tensor,          # BF16 output, 1D flattened BSHD
+        Q: fx.Tensor,  # Int8, 1D flattened BSHD
+        K: fx.Tensor,  # Int8, 1D flattened BSHD (num_kv_heads)
+        V: fx.Tensor,  # FP8, 1D flattened BSHD (num_kv_heads)
+        O: fx.Tensor,  # BF16 output, 1D flattened BSHD  # noqa: E741
         Q_descale: fx.Tensor,  # f32, shape [batch, num_q_heads, num_q_blocks]
         K_descale: fx.Tensor,  # f32, shape [batch, num_kv_heads, num_k_blocks]
         V_descale: fx.Tensor,  # f32, shape [batch, num_kv_heads, head_dim] (per-element)
@@ -317,8 +343,6 @@ def build_sage_attn_cdna_module(
             return arith.SIToFPOp(T.f32, _raw(v)).result
 
         q_ptr = _extract_aligned_pointer(Q)
-        k_ptr = _extract_aligned_pointer(K)
-        v_ptr = _extract_aligned_pointer(V)
         o_ptr = _extract_aligned_pointer(O)
         qds_ptr = _extract_aligned_pointer(Q_descale)
         kds_ptr = _extract_aligned_pointer(K_descale)
@@ -333,29 +357,26 @@ def build_sage_attn_cdna_module(
         # the PV MFMA (0 * any-fp8 = 0; sage_quant outputs are NaN-free).
         bs_v_for_rsrc = fx.Index(batch_size)
         slk_v_for_rsrc = fx.Index(seq_len_k)
-        kv_total_bytes = bs_v_for_rsrc * slk_v_for_rsrc * fx.Index(NUM_KV_HEADS * HEAD_DIM)
+        kv_total_bytes = (
+            bs_v_for_rsrc * slk_v_for_rsrc * fx.Index(NUM_KV_HEADS * HEAD_DIM)
+        )
         k_rsrc = buffer_ops.create_buffer_resource(
-            K, max_size=False, num_records_bytes=kv_total_bytes,
+            K,
+            max_size=False,
+            num_records_bytes=kv_total_bytes,
         )
         v_rsrc = buffer_ops.create_buffer_resource(
-            V, max_size=False, num_records_bytes=kv_total_bytes,
+            V,
+            max_size=False,
+            num_records_bytes=kv_total_bytes,
         )
 
         v4i32_type = Vec.make_type(4, fx.Int32)
-        v4f32_type = Vec.make_type(4, fx.Float32)
-        v8f32_type = Vec.make_type(8, fx.Float32)
         v16i32_type = Vec.make_type(16, fx.Int32)
         v16f32_type = Vec.make_type(16, fx.Float32)
         # MFMA 32x32x32_i8: A/B = v4i32 (=16xi8 per lane), C/D = v16i32 per lane (wave64)
         v8i8_type = Vec.make_type(8, fx.Int8)
-        # MFMA 32x32x64_f8f6f4: A/B = v8i32 (=32xi8 per lane), C/D = v16f32 per lane (wave64)
-        v8i32_type = Vec.make_type(8, fx.Int32)
-        v32i8_type = Vec.make_type(32, fx.Int8)
-        v4bf16_type = Vec.make_type(4, fx.BFloat16)
         v16i8_type = Vec.make_type(16, fx.Int8)
-        v8bf16_type = Vec.make_type(8, fx.BFloat16)
-        v4i16_type = Vec.make_type(4, fx.Int16)
-        v8i16_type = Vec.make_type(8, fx.Int16)
 
         seq_len_q_v = fx.Index(seq_len_q)
         seq_len_k_v = fx.Index(seq_len_k)
@@ -457,7 +478,9 @@ def build_sage_attn_cdna_module(
         # We preload K_STEPS_QK packs per lane (each = 16 i8 = v4i32).
         q_row = q_start + wave_q_offset + lane32
         q_row_i32 = fx.Int32(q_row)
-        q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_q_v))
+        q_in_bounds = arith.cmpi(
+            arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_q_v)
+        )
         q_row_safe = fx.Index(ArithValue(q_in_bounds).select(q_row, fx.Index(0)))
 
         _zero_v4i32_ir = Vec.filled(4, 0, fx.Int32).ir_value()
@@ -489,7 +512,6 @@ def build_sage_attn_cdna_module(
         c_neg_inf = fx.Float32(float("-inf"))
         c_zero_f = fx.Float32(0.0)
         c_one_f = fx.Float32(1.0)
-        c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
         c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
         c_zero_v16i32 = Vec.filled(16, 0, fx.Int32)
 
@@ -512,7 +534,9 @@ def build_sage_attn_cdna_module(
 
         _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
-            kv_upper = fx.Index(ArithValue(_q_end < seq_len_k_v).select(_q_end, seq_len_k_v))
+            kv_upper = fx.Index(
+                ArithValue(_q_end < seq_len_k_v).select(_q_end, seq_len_k_v)
+            )
         else:
             kv_upper = seq_len_k_v
 
@@ -555,7 +579,6 @@ def build_sage_attn_cdna_module(
         # hold consecutive kv positions (column = kv_row).
         # Storing V transposed makes per-lane PV reads be 32 contiguous bytes
         # (one ds_read_b256 = 2 ds_read_b128) at fixed d, kv_row=k_start..+31.
-        LDS_V_BYTE_BASE = LDS_K_BYTES  # byte offset of V section
 
         def coop_load_v(tile_start, buf_off):
             """Load V from global (FP8 raw bytes) into LDS.
@@ -664,25 +687,24 @@ def build_sage_attn_cdna_module(
                 words = []
                 for k_idx in range_constexpr(4):
                     # Compile-time-constant byte offset for this (pks, dc, k_idx).
-                    lit_bytes = (pks * MFMA_K_FP8 + k_idx * 8) * V_STRIDE \
-                                + dc * MFMA_M
+                    lit_bytes = (pks * MFMA_K_FP8 + k_idx * 8) * V_STRIDE + dc * MFMA_M
                     addr_i32 = arith.AddIOp(
                         iter_lane_addr_i32,
                         arith.constant(lit_bytes, type=T.i32),
                     ).result
                     ptr_val = _llvm.inttoptr(lds_ptr_ty, addr_i32)
-                    v2i32 = _ods_ds_read_tr8_b64(
-                        res=v2i32_type, ptr=ptr_val
-                    ).result
+                    v2i32 = _ods_ds_read_tr8_b64(res=v2i32_type, ptr=ptr_val).result
                     words.append(v2i32)
 
                 # Pack 4× v2i32 → v8i32 (= 32 fp8 bytes per lane).
                 elems = []
                 for w_idx in range_constexpr(4):
                     for sub in range_constexpr(2):
-                        elems.append(vector.extract(
-                            words[w_idx], static_position=[sub], dynamic_position=[]
-                        ))
+                        elems.append(
+                            vector.extract(
+                                words[w_idx], static_position=[sub], dynamic_position=[]
+                            )
+                        )
                 return Vec.from_elements(elems, fx.Int32).ir_value()
 
             # gfx942 column-major path (unchanged).
@@ -695,9 +717,13 @@ def build_sage_attn_cdna_module(
             hi_v4i32 = vector.bitcast(v4i32_type, hi_v16i8)
             elems = []
             for w in range_constexpr(4):
-                elems.append(vector.extract(lo_v4i32, static_position=[w], dynamic_position=[]))
+                elems.append(
+                    vector.extract(lo_v4i32, static_position=[w], dynamic_position=[])
+                )
             for w in range_constexpr(4):
-                elems.append(vector.extract(hi_v4i32, static_position=[w], dynamic_position=[]))
+                elems.append(
+                    vector.extract(hi_v4i32, static_position=[w], dynamic_position=[])
+                )
             return Vec.from_elements(elems, fx.Int32).ir_value()
 
         def f32_to_bf16_trunc(f32_raw):
@@ -733,22 +759,21 @@ def build_sage_attn_cdna_module(
         # accounted for ~33 instr/iter vs Triton.
         if const_expr(_is_gfx950):
             from flydsl.expr.utils.arith import ArithValue as _AV
+
             _g = lane // fx.Index(16)
             _i = lane % fx.Index(16)
             _klane_g = _g // fx.Index(2)
             _d_group = _g % fx.Index(2)
             _row_off_within = _i // fx.Index(2)
             _col_extra_within = (_i % fx.Index(2)) * fx.Index(8)
-            _per_lane_v_inv = (_klane_g * fx.Index(32) + _row_off_within) \
-                              * fx.Index(V_STRIDE) \
-                              + _d_group * fx.Index(16) + _col_extra_within
-            _lds_v_base = _memref.extract_aligned_pointer_as_index(
-                _llvm_value(lds_v)
+            _per_lane_v_inv = (
+                (_klane_g * fx.Index(32) + _row_off_within) * fx.Index(V_STRIDE)
+                + _d_group * fx.Index(16)
+                + _col_extra_within
             )
+            _lds_v_base = _memref.extract_aligned_pointer_as_index(_llvm_value(lds_v))
             _v_lane_base_index = _AV(_lds_v_base) + _per_lane_v_inv
-            v_lane_base_i32 = arith.unwrap(
-                arith.index_cast(T.i32, _v_lane_base_index)
-            )
+            v_lane_base_i32 = arith.unwrap(arith.index_cast(T.i32, _v_lane_base_index))
 
         # ===== Straight QK→softmax→PV per iter (Attack #3 2026-05-11) =====
         # Cross-iter softmax pipelining was tried and added scf.for yield
@@ -767,8 +792,7 @@ def build_sage_attn_cdna_module(
         klane_off_i32 = klane_i32 * fx.Int32(4)
         seq_len_k_i32 = fx.Int32(seq_len_k_v)
 
-        def _emit_qk_softmax_pquant(kv_block_start_arg, k_buf_off_arg,
-                                    m_in, l_in):
+        def _emit_qk_softmax_pquant(kv_block_start_arg, k_buf_off_arg, m_in, l_in):
             """Emit QK MFMA + scale + mask + softmax + p-quant for the KV tile
             at kv_block_start_arg, using K loaded into LDS at k_buf_off_arg.
 
@@ -800,9 +824,9 @@ def build_sage_attn_cdna_module(
             )
             k_ds_loc = fx.Float32(_load_ptr_f32(kds_ptr, k_descale_base_loc))
             qk_scale_loc = _fmul(q_ds, k_ds_loc)
-            qk_scale_v16_loc = (
-                Vec.from_elements([qk_scale_loc], fx.Float32).broadcast_to(16)
-            )
+            qk_scale_v16_loc = Vec.from_elements(
+                [qk_scale_loc], fx.Float32
+            ).broadcast_to(16)
             s_f32_loc = []
             for st in range_constexpr(N_SUBTILES):
                 s_i32_vec = Vec(s_accs_loc[st])
@@ -842,12 +866,18 @@ def build_sage_attn_cdna_module(
                 f32_ty = ir.F32Type.get()
                 result_types = [f32_ty] * NUM_S_VALS
                 if_op = _scf.IfOp(
-                    cond_i1, result_types, has_else=True,
+                    cond_i1,
+                    result_types,
+                    has_else=True,
                     loc=ir.Location.unknown(),
                 )
                 with ir.InsertionPoint(if_op.then_block):
                     _llvm.inline_asm(
-                        None, [], "", "", has_side_effects=True,
+                        None,
+                        [],
+                        "",
+                        "",
+                        has_side_effects=True,
                     )
                     masked = []
                     for st in range_constexpr(N_SUBTILES):
@@ -863,7 +893,9 @@ def build_sage_attn_cdna_module(
                                 + fx.Int32(erem)
                             )
                             out_of_range = ArithValue(kv_col_i32 >= seq_len_k_i32)
-                            masked.append(_raw(out_of_range.select(c_neg_inf, s_f32_loc[idx])))
+                            masked.append(
+                                _raw(out_of_range.select(c_neg_inf, s_f32_loc[idx]))
+                            )
                     _scf.YieldOp(masked)
                 with ir.InsertionPoint(if_op.else_block):
                     _scf.YieldOp([_raw(v) for v in s_f32_loc])
@@ -933,11 +965,15 @@ def build_sage_attn_cdna_module(
         _OFF_O_ACCS = 3
 
         loop_results = init_args
-        for kv_block_start, inner_iter_args in range(0, kv_upper, BLOCK_N, init=init_args):
+        for kv_block_start, inner_iter_args in range(
+            0, kv_upper, BLOCK_N, init=init_args
+        ):
             cur_buf_i32 = inner_iter_args[_OFF_CUR_BUF]
             m_running = inner_iter_args[_OFF_M]
             l_running = inner_iter_args[_OFF_L]
-            o_accs = [inner_iter_args[_OFF_O_ACCS + i] for i in range_constexpr(D_CHUNKS)]
+            o_accs = [
+                inner_iter_args[_OFF_O_ACCS + i] for i in range_constexpr(D_CHUNKS)
+            ]
 
             # Buffer offsets
             cur_k_off = _buf_off(cur_buf_i32, K_BUF1_OFF)
@@ -966,7 +1002,10 @@ def build_sage_attn_cdna_module(
                 o_accs[dc] = _fmul(o_accs[dc], corr_vec16)
 
             # ==== GEMM2: PV[k] using p_words[k] (just computed) and cur_buf V ====
-            from flydsl._mlir.dialects._rocdl_ops_gen import permlane32_swap as _permlane32_swap_op
+            from flydsl._mlir.dialects._rocdl_ops_gen import (
+                permlane32_swap as _permlane32_swap_op,
+            )
+
             _struct_ty_2xi32 = ir.Type.parse("!llvm.struct<(i32, i32)>")
             for pks in range_constexpr(PV_K_STEPS):
                 v8_elems = []
@@ -974,8 +1013,11 @@ def build_sage_attn_cdna_module(
                     a_w = _raw(p_words[pks * 2][w])
                     b_w = _raw(p_words[pks * 2 + 1][w])
                     swapped = _permlane32_swap_op(
-                        _struct_ty_2xi32, old=a_w, src=b_w,
-                        fi=False, bound_control=True,
+                        _struct_ty_2xi32,
+                        old=a_w,
+                        src=b_w,
+                        fi=False,
+                        bound_control=True,
                     )
                     lo_word = _llvm.extractvalue(T.i32, swapped, [0])
                     hi_word = _llvm.extractvalue(T.i32, swapped, [1])
@@ -986,8 +1028,12 @@ def build_sage_attn_cdna_module(
                 for dc in range_constexpr(D_CHUNKS):
                     v_frag = load_v_frag_fp8(pks, dc, cur_v_off, v_iter_lane_addr_i32)
                     o_accs[dc] = mfma_fp8_k64(
-                        v16f32_type, v_frag, p_pack_v8i32, o_accs[dc],
-                        scale_127, scale_127,
+                        v16f32_type,
+                        v_frag,
+                        p_pack_v8i32,
+                        o_accs[dc],
+                        scale_127,
+                        scale_127,
                     )
 
             # Barrier: PV V reads of cur_buf done, then prefetch K[k+2]/V[k+2]
@@ -1032,18 +1078,22 @@ def build_sage_attn_cdna_module(
                     bf16_elems = []
                     for erem in range_constexpr(4):
                         i_pos = msub * 4 + erem
-                        v_ds = fx.Float32(_load_ptr_f32(
-                            vds_ptr,
-                            v_descale_base
-                            + fx.Index(dc * MFMA_M)
-                            + fx.Index(msub * 8)
-                            + klane * 4
-                            + erem,
-                        ))
+                        v_ds = fx.Float32(
+                            _load_ptr_f32(
+                                vds_ptr,
+                                v_descale_base
+                                + fx.Index(dc * MFMA_M)
+                                + fx.Index(msub * 8)
+                                + klane * 4
+                                + erem,
+                            )
+                        )
                         o_elem = vector.extract(
                             o_finals[dc], static_position=[i_pos], dynamic_position=[]
                         )
-                        scale = arith.mulf(_raw(inv_l_fp8), _raw(v_ds), fastmath=fm_fast)
+                        scale = arith.mulf(
+                            _raw(inv_l_fp8), _raw(v_ds), fastmath=fm_fast
+                        )
                         o_norm = arith.mulf(o_elem, scale, fastmath=fm_fast)
                         bf16_elems.append(f32_to_bf16_trunc(o_norm))
                     o_vec = Vec.from_elements(bf16_elems, fx.BFloat16).ir_value()
@@ -1055,7 +1105,7 @@ def build_sage_attn_cdna_module(
         Q: fx.Tensor,
         K: fx.Tensor,
         V: fx.Tensor,
-        O: fx.Tensor,
+        O: fx.Tensor,  # noqa: E741
         Q_descale: fx.Tensor,
         K_descale: fx.Tensor,
         V_descale: fx.Tensor,
@@ -1076,8 +1126,17 @@ def build_sage_attn_cdna_module(
         grid_x = bs_idx * num_q_tiles * NUM_Q_HEADS
 
         launcher = sage_attn_kernel(
-            Q, K, V, O, Q_descale, K_descale, V_descale,
-            batch_size, seq_len_q, seq_len_k, num_q_blocks,
+            Q,
+            K,
+            V,
+            O,
+            Q_descale,
+            K_descale,
+            V_descale,
+            batch_size,
+            seq_len_q,
+            seq_len_k,
+            num_q_blocks,
         )
 
         if const_expr(waves_per_eu is not None):
@@ -1085,7 +1144,9 @@ def build_sage_attn_cdna_module(
             if const_expr(_wpe >= 1):
                 for op in ctx.gpu_module_body.operations:
                     if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, _wpe)
+                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                            T.i32, _wpe
+                        )
 
         if const_expr(flat_work_group_size is not None):
             _fwgs = int(flat_work_group_size)
@@ -1098,22 +1159,28 @@ def build_sage_attn_cdna_module(
         passthrough_entries = []
         if const_expr(daz):
             passthrough_entries.append(
-                ir.ArrayAttr.get([
-                    ir.StringAttr.get("denormal-fp-math-f32"),
-                    ir.StringAttr.get("preserve-sign,preserve-sign"),
-                ])
+                ir.ArrayAttr.get(
+                    [
+                        ir.StringAttr.get("denormal-fp-math-f32"),
+                        ir.StringAttr.get("preserve-sign,preserve-sign"),
+                    ]
+                )
             )
             passthrough_entries.append(
-                ir.ArrayAttr.get([
-                    ir.StringAttr.get("no-nans-fp-math"),
-                    ir.StringAttr.get("true"),
-                ])
+                ir.ArrayAttr.get(
+                    [
+                        ir.StringAttr.get("no-nans-fp-math"),
+                        ir.StringAttr.get("true"),
+                    ]
+                )
             )
             passthrough_entries.append(
-                ir.ArrayAttr.get([
-                    ir.StringAttr.get("unsafe-fp-math"),
-                    ir.StringAttr.get("true"),
-                ])
+                ir.ArrayAttr.get(
+                    [
+                        ir.StringAttr.get("unsafe-fp-math"),
+                        ir.StringAttr.get("true"),
+                    ]
+                )
             )
         for op in ctx.gpu_module_body.operations:
             if const_expr(getattr(op, "OPERATION_NAME", None) == "gpu.func"):
@@ -1131,13 +1198,34 @@ def build_sage_attn_cdna_module(
         with CompilationContext.compile_hints(_compile_hints):
             return launch_sage_attn(*args, **kwargs)
 
-    def _compile(Q, K, V, O, Q_descale, K_descale, V_descale,
-                 batch_size, seq_len_q, seq_len_k, num_q_blocks, stream=None):
+    def _compile(
+        Q,
+        K,
+        V,
+        O,  # noqa: E741
+        Q_descale,
+        K_descale,
+        V_descale,
+        batch_size,
+        seq_len_q,
+        seq_len_k,
+        num_q_blocks,
+        stream=None,
+    ):
         with CompilationContext.compile_hints(_compile_hints):
             return flyc.compile(
                 launch_sage_attn,
-                Q, K, V, O, Q_descale, K_descale, V_descale,
-                batch_size, seq_len_q, seq_len_k, num_q_blocks,
+                Q,
+                K,
+                V,
+                O,
+                Q_descale,
+                K_descale,
+                V_descale,
+                batch_size,
+                seq_len_q,
+                seq_len_k,
+                num_q_blocks,
                 fx.Stream(stream),
             )
 
