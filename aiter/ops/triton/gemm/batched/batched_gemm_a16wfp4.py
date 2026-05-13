@@ -65,9 +65,7 @@ def batched_gemm_a16wfp4_fake_tensor(
 # memory. Do not remove this argument without re-auditing the kernel's
 # tl.store sites and re-checking the post-grad FX graph of any compiled
 # downstream consumer.
-@torch_compile_guard(
-    mutates_args=["y"], gen_fake=batched_gemm_a16wfp4_fake_tensor
-)
+@torch_compile_guard(mutates_args=["y"], gen_fake=batched_gemm_a16wfp4_fake_tensor)
 def batched_gemm_a16wfp4_(
     x: torch.Tensor,
     w: torch.Tensor,
