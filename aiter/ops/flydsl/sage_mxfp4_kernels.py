@@ -221,6 +221,7 @@ def flydsl_sage_attn_mxfp4_func(
             q_d.reshape(-1),
             k_d.reshape(-1),
             v_descale,
+            bias_t,
             batch,
             seq_q_pad,
             seq_k,

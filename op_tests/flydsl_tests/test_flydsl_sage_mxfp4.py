@@ -161,12 +161,18 @@ def test_flydsl_mxfp4_causal_vs_sdpa():
 # ============================================================================
 
 def _shared_quant_run(q, k, v, causal, q_smoothing, layout="bshd"):
-    """Quantize once via Triton; run BOTH kernels with the same inputs."""
+    """Quantize once via Triton; run BOTH kernels with the same inputs.
+
+    BLKQ in quant must match block_m in the FlyDSL kernel, since the bias
+    (delta_s) tensor is laid out as [B, Hq, ceil(S_q/BLKQ), S_k] and the
+    kernel's bias indexing treats q_tile_idx as the kernel's BLOCK_M tile.
+    """
     fp8_type = _fp8_dtype
     fp8_max = torch.finfo(fp8_type).max
+    BLKQ = 256
     (q_q, q_d, k_q, k_d, v_q, v_d, delta_s) = _triton_sage_quant_mxfp4(
         q, k, v, fp8_type, fp8_max,
-        BLKQ=256, BLKK=64, layout=layout, q_smoothing=q_smoothing,
+        BLKQ=BLKQ, BLKK=64, layout=layout, q_smoothing=q_smoothing,
     )
     triton_out = _triton_mxfp4_func(
         q=q_q, k=k_q, v=v_q,
@@ -177,6 +183,7 @@ def _shared_quant_run(q, k, v, causal, q_smoothing, layout="bshd"):
         q=q_q, k=k_q, v=v_q,
         q_descale=q_d, k_descale=k_d, v_descale=v_d,
         bias=delta_s, causal=causal, layout=layout,
+        block_m=BLKQ,
     )
     return flydsl_out, triton_out
 

@@ -324,6 +324,7 @@ def build_sage_attn_mxfp4_cdna_module(
         Q_descale: fx.Tensor,  # uint8 e8m0, shape [batch, S, num_q_heads, D//32]
         K_descale: fx.Tensor,  # uint8 e8m0, shape [batch, S, num_kv_heads, D//32]
         V_descale: fx.Tensor,  # f32, shape [batch, num_kv_heads, head_dim] (per-element)
+        Bias: fx.Tensor,  # f32, shape [B, Hq, Q_NUM_BLKS, S_k] when USE_BIAS, else dummy 1B
         batch_size: fx.Int32,
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
@@ -391,6 +392,25 @@ def build_sage_attn_mxfp4_cdna_module(
 
         seq_len_q_v = fx.Index(seq_len_q)
         seq_len_k_v = fx.Index(seq_len_k)
+
+        # Bias buffer (f32), shape [B, Hq, Q_NUM_BLKS, S_k]. Q_NUM_BLKS uses
+        # BLOCK_M (the kernel's q-tile dim, matching Triton's BLKQ=BLOCK_M).
+        # Only created when USE_BIAS — otherwise the wrapper passes a dummy
+        # 1-byte tensor and the buffer-load code below is never emitted.
+        if const_expr(USE_BIAS):
+            num_q_tiles_idx_b = (
+                (seq_len_q_v + fx.Index(BLOCK_M - 1)) // fx.Index(BLOCK_M)
+            )
+            bias_total_bytes = (
+                bs_v_for_rsrc
+                * fx.Index(NUM_Q_HEADS)
+                * num_q_tiles_idx_b
+                * seq_len_k_v
+                * fx.Index(4)
+            )
+            bias_rsrc = buffer_ops.create_buffer_resource(
+                Bias, max_size=False, num_records_bytes=bias_total_bytes,
+            )
 
         base_ptr = allocator.get_base()
         # Shared LDS as Int8 view: covers BOTH K ping-pong buffers (K0 | K1).
@@ -945,6 +965,64 @@ def build_sage_attn_mxfp4_cdna_module(
                 for elem in range_constexpr(ELEMS_PER_TILE):
                     s_f32_loc.append(s_vec[elem])
 
+            # 2b) Bias add (q_smoothing path: delta_s = q_mean × K_rot).
+            # Triton applies bias[None, :] to qk before softmax (per K-col,
+            # broadcast across Q rows). Bias shape: [B, Hq, Q_NUM_BLKS, S_k].
+            # Per lane (klane, lane32), each vector elem (msub, erem) of st-th
+            # subtile maps to K-col = kv_block_start + st*32 + msub*8 +
+            # klane*4 + erem. Bias is independent of Q-row (= lane32 here),
+            # but depends on klane via the kv_col formula.
+            if const_expr(USE_BIAS):
+                # Bias base byte offset for (B, Hq, Q_NUM_BLKS, *):
+                #   ((batch * NUM_Q_HEADS + head_q) * num_q_tiles + q_tile) * S_k * 4
+                num_q_tiles_loc = (
+                    (seq_len_q_v + fx.Index(BLOCK_M - 1)) // fx.Index(BLOCK_M)
+                )
+                bias_base_dword = (
+                    (batch_idx * fx.Index(NUM_Q_HEADS) + head_q_idx)
+                    * num_q_tiles_loc + q_tile_idx
+                ) * seq_len_k_v
+                s_bias = []
+                for st in range_constexpr(N_SUBTILES):
+                    for elem in range_constexpr(ELEMS_PER_TILE):
+                        idx = st * ELEMS_PER_TILE + elem
+                        msub = elem // 4
+                        erem = elem % 4
+                        kv_col_idx = (
+                            kv_block_start_arg
+                            + fx.Index(st * MFMA_N)
+                            + fx.Index(msub * 8)
+                            + klane * 4
+                            + fx.Index(erem)
+                        )
+                        # Bounds-check: if kv_col is past seq_len_k, force
+                        # idx to 0 (load returns valid 0.0 instead of any
+                        # buffer-OOB behavior) and select 0.0 bias.
+                        kv_in_bias_bounds = ArithValue(
+                            arith.cmpi(
+                                arith.CmpIPredicate.slt,
+                                _raw(kv_col_idx),
+                                _raw(seq_len_k_v),
+                            )
+                        )
+                        kv_col_safe = fx.Index(
+                            kv_in_bias_bounds.select(kv_col_idx, fx.Index(0))
+                        )
+                        bias_dword_idx = arith.unwrap(
+                            arith.index_cast(
+                                T.i32, _raw(bias_base_dword + kv_col_safe)
+                            )
+                        )
+                        bias_val = buffer_ops.buffer_load(
+                            bias_rsrc, bias_dword_idx,
+                            vec_width=1, dtype=T.f32,
+                        )
+                        bias_val_safe = kv_in_bias_bounds.select(
+                            bias_val, fx.Float32(0.0)
+                        )
+                        s_bias.append(_fadd(s_f32_loc[idx], bias_val_safe))
+                s_f32_loc = s_bias
+
             # 3) Mask
             kv_start_i32_loc = fx.Int32(
                 arith.unwrap(arith.index_cast(T.i32, _raw(kv_block_start_arg)))
@@ -1217,6 +1295,7 @@ def build_sage_attn_mxfp4_cdna_module(
         Q_descale: fx.Tensor,
         K_descale: fx.Tensor,
         V_descale: fx.Tensor,
+        Bias: fx.Tensor,
         batch_size: fx.Int32,
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
@@ -1240,6 +1319,7 @@ def build_sage_attn_mxfp4_cdna_module(
             Q_descale,
             K_descale,
             V_descale,
+            Bias,
             batch_size,
             seq_len_q,
             seq_len_k,
