@@ -158,12 +158,29 @@ def run_config(seq_len=4096, num_heads=128, kv_lora_rank=512, rope_rank=64, topk
     ms_dkv_xcd      = bench(run_dkv_xcd_local, reps)
     ms_dkv_nonatomic = bench(run_dkv_nonatomic, reps)
 
-    bw_peak = 5.3e6  # MB/s (5.3 TB/s)
-    fetch_gb = 19.0  # measured ~19 GB for all variants
-    write_atomic_gb = 36.0
-    write_nonatomic_gb = 8.1
-    t_bw_atomic   = (fetch_gb + write_atomic_gb)   * 1e3 / bw_peak  # ms
-    t_bw_nonatomic = (fetch_gb + write_nonatomic_gb) * 1e3 / bw_peak  # ms
+    # Theoretical HBM traffic from kernel parameters (no L2 reuse assumed for Q/dO).
+    # fetch: Q_lora_T + Q_rope_T + dO_T loaded num_tiles*num_hg times each per CTA;
+    #        dS + P loaded num_tiles*num_hg times each (all unique); topk_idx num_tiles times.
+    num_tiles = triton.cdiv(topk, 64)  # TILE_K=64
+    fetch_bytes = T * (
+        num_tiles * num_hg * (DV * bh * 2)       # Q_lora_T  [D_V x BLOCK_H] bf16
+        + num_tiles * num_hg * (DR * bh * 2)     # Q_rope_T  [D_ROPE x BLOCK_H] bf16
+        + num_tiles * num_hg * (DV * bh * 2)     # dO_T      [D_V x BLOCK_H] bf16
+        + num_tiles * num_hg * (bh * 64 * 2)     # dS        [BLOCK_H x TILE_K] bf16
+        + num_tiles * num_hg * (bh * 64 * 2)     # P         [BLOCK_H x TILE_K] bf16
+        + num_tiles * (64 * 4)                    # topk_idx  [TILE_K] int32
+    )
+    # write: nonatomic = T*TOPK*D*4; atomic = 4x empirical (from rocprof: WRITE_SIZE = 4*nonatomic)
+    write_nonatomic_bytes = T * topk * D * 4
+    write_atomic_bytes    = 4 * write_nonatomic_bytes
+
+    fetch_gb         = fetch_bytes         / 1e9
+    write_nonatomic_gb = write_nonatomic_bytes / 1e9
+    write_atomic_gb    = write_atomic_bytes    / 1e9
+
+    bw_peak_GBs = 5300  # 5.3 TB/s
+    t_bw_atomic    = (fetch_gb + write_atomic_gb)    / bw_peak_GBs * 1e3  # ms
+    t_bw_nonatomic = (fetch_gb + write_nonatomic_gb) / bw_peak_GBs * 1e3  # ms
 
     label = f"S{seq_len}_H{num_heads}_topk{topk}"
     print(f"\n  {label}")
@@ -174,8 +191,10 @@ def run_config(seq_len=4096, num_heads=128, kv_lora_rank=512, rope_rank=64, topk
     print(f"  {'dKV (xcd_local x8, (i%304)//38)':<36s}  {ms_dkv_xcd:10.2f}  {ms_dkv_xcd/ms_dkv_fused:11.2f}x")
     print(f"  {'dKV (nonatomic, wrong results)':<36s}  {ms_dkv_nonatomic:10.2f}  {ms_dkv_nonatomic/ms_dkv_fused:11.2f}x")
     print(f"  {'-'*64}")
-    print(f"  {'Theoretical min (BW only, atomic)':<36s}  {t_bw_atomic:10.2f}  {'(55GB/5.3TBs)':>12s}")
-    print(f"  {'Theoretical min (BW only, nonatomic)':<36s}  {t_bw_nonatomic:10.2f}  {'(27GB/5.3TBs)':>12s}")
+    print(f"  {'BW floor (atomic)':<36s}  {t_bw_atomic:10.2f}  "
+          f"  ({fetch_gb:.0f}+{write_atomic_gb:.0f}={fetch_gb+write_atomic_gb:.0f} GB / 5300 GB/s)")
+    print(f"  {'BW floor (nonatomic)':<36s}  {t_bw_nonatomic:10.2f}  "
+          f"  ({fetch_gb:.0f}+{write_nonatomic_gb:.0f}={fetch_gb+write_nonatomic_gb:.0f} GB / 5300 GB/s)")
     print(f"  {'-'*64}")
     print(f"  Atomic overhead above nonatomic:  {ms_dkv_fused - ms_dkv_nonatomic:.2f} ms")
     print(f"  Nonatomic overhead above BW floor: {ms_dkv_nonatomic - t_bw_nonatomic:.2f} ms  "
