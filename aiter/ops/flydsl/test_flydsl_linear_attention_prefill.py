@@ -77,15 +77,18 @@ _exp = tl.exp
 _exp2 = tl.math.exp2
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BV in (16, 32, 64)
-        for num_warps in (2, 4)
-        for num_stages in (1, 2, 3)
-    ],
-    key=["H", "Hg", "K", "V", "BT", "IS_VARLEN"],
-)
+# Decorator stack mirrors FLA's K5 kernels (Heuristics outer, Autotune
+# inner) so that Triton 3.x writes the sweep result to its persistent
+# autotune cache (`~/.triton/autotune`) via ``cache_results=True``. After
+# the first run each (H, K, V, BT, IS_VARLEN) key is served from disk and
+# subsequent runs no longer launch the full BV/warps/stages sweep -- the
+# rocprof kernel-stats CSV then reports the same ~56 calls as the other
+# K5 kernels, instead of the 9000+ that an un-cached sweep produces.
+#
+# ``Hg`` is intentionally excluded from ``key``: it only affects host-side
+# address arithmetic (``H // Hg`` divisor for the K block-ptr), not the
+# compiled binary or tile shape, so adding it would just multiply the
+# number of unique keys and force redundant sweeps.
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -95,6 +98,16 @@ _exp2 = tl.math.exp2
         "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
+)
+@triton.autotune(
+    configs=[
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BV in (16, 32, 64)
+        for num_warps in (2, 4)
+        for num_stages in (2, 3)
+    ],
+    key=["H", "K", "V", "BT", "IS_VARLEN"],
+    cache_results=True,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_origin_opt(
@@ -1554,6 +1567,11 @@ class TestPerformance:
         kv_vs_origin = (
             us_triton_origin / us_triton_opt3 if us_triton_opt3 > 0 else float("inf")
         )
+        opt_vs_origin = (
+            us_triton_origin / us_triton_origin_opt
+            if us_triton_origin_opt > 0
+            else float("inf")
+        )
 
         _perf_results.append(
             {
@@ -1579,6 +1597,7 @@ class TestPerformance:
                 "flydsl_vs_origin_opt": fly_vs_origin_opt,
                 "vk_vs_origin": vk_vs_origin,
                 "kv_vs_origin": kv_vs_origin,
+                "opt_vs_origin": opt_vs_origin,
             }
         )
 
@@ -1609,6 +1628,7 @@ def _print_perf_table():
         ("fly/o_opt", "flydsl_vs_origin_opt", 9),
         ("vk/orig", "vk_vs_origin", 7),
         ("kv/orig", "kv_vs_origin", 7),
+        ("o_opt/orig", "opt_vs_origin", 10),
     ]
     header = " | ".join(display.rjust(width) for display, _, width in cols)
     sep = "-+-".join("-" * width for _, _, width in cols)
