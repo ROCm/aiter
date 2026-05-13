@@ -60,7 +60,8 @@ template <ck_tile::index_t M_Tile,
           bool TransposeC                          = false,
           bool UsePersistentKernel                 = false,
           ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave,
-          int BlockPerCu                           = 1>
+          int BlockPerCu                           = 1,
+          bool AQRowMajor                          = false>
 struct CreateTileGemmConfig
 {
     static constexpr ck_tile::index_t M_Tile_v                  = M_Tile;
@@ -77,6 +78,7 @@ struct CreateTileGemmConfig
     static constexpr bool UsePersistentKernel_v                 = UsePersistentKernel;
     static constexpr ck_tile::GemmPipelineScheduler Scheduler_v = Scheduler;
     static constexpr int BlockPerCu_v                           = BlockPerCu;
+    static constexpr bool AQRowMajor_v                          = AQRowMajor;
 };
 
 template <ck_tile::index_t M_Tile,
@@ -92,7 +94,8 @@ template <ck_tile::index_t M_Tile,
           bool TransposeC                          = false,
           bool UsePersistentKernel                 = false,
           ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave,
-          int BlockPerCu                           = 1>
+          int BlockPerCu                           = 1,
+          bool AQRowMajor                          = false>
 using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             N_Tile,
                                             K_Tile,
@@ -106,7 +109,8 @@ using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             TransposeC,
                                             UsePersistentKernel,
                                             Scheduler,
-                                            BlockPerCu>;
+                                            BlockPerCu,
+                                            AQRowMajor>;
 
 template <typename QDataType,
           typename OutDataType,
@@ -124,6 +128,9 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
         BQuantGroupSize::kN == 128 &&
         (GemmConfig::M_Warp_v * GemmConfig::N_Warp_v * GemmConfig::K_Warp_v == 8) &&
         GemmConfig::K_Warp_Tile_v == 128;
+    // When AQRowMajor is true for an 8-warp config, the kernel reads x_scale
+    // in row-major layout natively, avoiding the host-side transpose.
+    static constexpr bool aq_col_major = eight_waves && !GemmConfig::AQRowMajor_v;
 
     using GemmShape = ck_tile::TileGemmShape<
         ck_tile::sequence<GemmConfig::M_Tile_v, GemmConfig::N_Tile_v, GemmConfig::K_Tile_v>,
@@ -145,7 +152,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
         BLayout,
         CLayout,
         QuantMode,
-        std::conditional_t<eight_waves, AQLayout_8Warps, AQLayout>,
+        std::conditional_t<aq_col_major, AQLayout_8Warps, AQLayout>,
         BQLayout,
         transpose_c,
         UseDoubleSmemBuffer>;
@@ -196,6 +203,8 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
             std::conditional_t<UseDoubleSmemBuffer && PreshuffleB,
                                ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
                                ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>>;
+        static_assert(!GemmConfig::TiledMMAPermuteN_v,
+                      "TiledMMAPermuteN=true requires PermuteNEpilogue, not CShuffleEpilogue");
         using GemmEpilogue = ck_tile::CShuffleEpilogue<
             ck_tile::CShuffleEpilogueProblem<ADataType,
                                              BDataType,
@@ -215,8 +224,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                              transpose_c,
                                              1,
                                              false,
-                                             1,
-                                             GemmConfig::TiledMMAPermuteN_v>>;
+                                             1>>;
 
         using Kernel =
             ck_tile::QuantGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue, QuantMode>;
@@ -225,11 +233,6 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 
         const dim3 grids  = Kernel::GridSize(args.M, args.N, args.k_batch);
         const dim3 blocks = Kernel::BlockSize();
-
-        if(args.k_batch != 1)
-        {
-            throw std::runtime_error("split-k is not supported yet!");
-        }
 
         if(!Kernel::IsSupportedArgument(kargs))
         {
@@ -275,7 +278,8 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
                                                                torch::Tensor& x_scale,
                                                                torch::Tensor& w_scale,
                                                                torch::Tensor& Y,
-                                                               bool PreshuffleB)
+                                                               bool PreshuffleB,
+                                                               int k_batch = 1)
 {
     // check
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
@@ -308,7 +312,15 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     const int N = WQ.size(0);
     const int K = XQ.size(1);
 
-    const bool eight_waves =
+    // Whether this kernel configuration uses column-major AQ layout,
+    // requiring a host-side transpose of x_scale.
+    constexpr bool aq_col_major =
+        BQuantGroupSize::kN == 128 &&
+        (GemmInstance::M_Warp_v * GemmInstance::N_Warp_v * GemmInstance::K_Warp_v == 8) &&
+        GemmInstance::K_Warp_Tile_v == 128 &&
+        !GemmInstance::AQRowMajor_v;
+
+    constexpr bool eight_waves =
         BQuantGroupSize::kN == 128 &&
         (GemmInstance::M_Warp_v * GemmInstance::N_Warp_v * GemmInstance::K_Warp_v == 8) &&
         GemmInstance::K_Warp_Tile_v == 128;
@@ -321,18 +333,34 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     // through the async kernel launch.
     torch::Tensor x_scale_t;
 
-    if(eight_waves && !PreshuffleB)
+    if constexpr(aq_col_major)
     {
-        x_scale_t   = x_scale.transpose(0, 1).contiguous().view(x_scale.sizes());
-        args.aq_ptr = x_scale_t.data_ptr();
+        // 8-warp ColumnMajor AQ: transpose x_scale to col-major
+        if(!PreshuffleB)
+        {
+            x_scale_t   = x_scale.transpose(0, 1).contiguous().view(x_scale.sizes());
+            args.aq_ptr = x_scale_t.data_ptr();
+        }
+        else
+        {
+            args.aq_ptr = x_scale.data_ptr();
+        }
     }
-    else if(!eight_waves && PreshuffleB)
+    else if constexpr(!eight_waves)
     {
-        x_scale_t   = x_scale.view({x_scale.size(1), x_scale.size(0)}).transpose(0, 1).contiguous();
-        args.aq_ptr = x_scale_t.data_ptr();
+        if(PreshuffleB)
+        {
+            x_scale_t   = x_scale.view({x_scale.size(1), x_scale.size(0)}).transpose(0, 1).contiguous();
+            args.aq_ptr = x_scale_t.data_ptr();
+        }
+        else
+        {
+            args.aq_ptr = x_scale.data_ptr();
+        }
     }
     else
     {
+        // 8-warp RowMajor AQ: use x_scale directly, no transpose needed
         args.aq_ptr = x_scale.data_ptr();
     }
 
@@ -340,8 +368,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     args.bq_ptr = w_scale.data_ptr();
     args.c_ptr  = Y.data_ptr();
 
-    // split-k is not supported yet for tile quant gemm, set k_batch to 1
-    args.k_batch = 1;
+    args.k_batch = k_batch;
     args.M       = M;
     args.N       = N;
     args.K       = K;
@@ -357,7 +384,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     const int stride_A  = XQ.stride(0);
     const int stride_B  = WQ.stride(0);
     const int stride_C  = Y.stride(0);
-    const int stride_AQ = eight_waves ? M : static_cast<int>(x_scale.stride(0));
+    const int stride_AQ = aq_col_major ? M : static_cast<int>(x_scale.stride(0));
     const int stride_BQ = w_scale.stride(0);
 
     args.QK_A      = AQK;
@@ -367,6 +394,14 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     args.stride_C  = stride_C;
     args.stride_AQ = stride_AQ;
     args.stride_BQ = stride_BQ;
+
+    // Split-K uses atomic_add into C; zero the output buffer first.
+    // Use zero_() so all rows are cleared regardless of the leading-dimension
+    // stride (e.g. padded tensors produced by vLLM's _maybe_pad_fp8_weight).
+    if(k_batch > 1)
+    {
+        Y.zero_();
+    }
 
     // do tile GEMM
     if(PreshuffleB)

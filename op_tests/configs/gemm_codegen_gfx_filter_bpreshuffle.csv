@@ -1,0 +1,7 @@
+gfx,cu_num,M,N,K,q_dtype_w,kernelId,splitK,us,kernelName,tflops,bw,errRatio,libtype
+gfx942,304,64,5120,1280,torch.int8,0,1,7.7424,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_16x128E,108.35,941.68,0.0,asm
+gfx950,256,64,5120,1280,torch.float8_e4m3fn,29,0,7.6564,a8w8_bpreshuffle_256x16x64x256_16x16_16x16_16x16x1_16x16x1_1x16x1x16_4x4x1_1x1_intrawave_v2,109.56,952.26,0.0,ck
+gfx942,304,128,5120,1280,torch.int8,1,1,8.5797,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_32x128E,195.55,935.72,0.0,asm
+gfx950,256,128,5120,1280,torch.float8_e4m3fn,29,0,7.7817,a8w8_bpreshuffle_256x16x64x256_16x16_16x16_16x16x1_16x16x1_1x16x1x16_4x4x1_1x1_intrawave_v2,215.60,1031.67,0.0,ck
+gfx942,304,256,5120,1280,torch.int8,2,1,9.2104,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_48x128E,364.31,1031.74,0.0,asm
+gfx950,256,256,5120,1280,torch.float8_e4m3fn,119,0,10.1726,a8w8_bpreshuffle_256x32x128x256_16x16_16x16_16x16x1_16x16x1_1x16x1x16_8x8x1_1x2_intrawave_v1,329.85,934.15,0.0,ck

@@ -38,6 +38,10 @@ def _bwd_preprocess(
     stride_o_h,
     stride_o_m,
     stride_o_k,
+    stride_do_b,
+    stride_do_h,
+    stride_do_m,
+    stride_do_k,
     stride_delta_b,
     stride_delta_h,
     stride_delta_m,
@@ -70,13 +74,21 @@ def _bwd_preprocess(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BLOCK_D_MODEL_POW2)
 
-    # Offset O/DO by batch, head and q_start
-    offs = (
+    # O and DO may have different strides (e.g. BSHD vs SBHD memory layout),
+    # so address each with its own strides.
+    offs_o = (
         bid * stride_o_b
         + hid * stride_o_h
         + q_start * stride_o_m
         + offs_m[:, None] * stride_o_m
         + offs_k[None, :] * stride_o_k
+    )
+    offs_do = (
+        bid * stride_do_b
+        + hid * stride_do_h
+        + q_start * stride_do_m
+        + offs_m[:, None] * stride_do_m
+        + offs_k[None, :] * stride_do_k
     )
 
     # create masks
@@ -87,8 +99,8 @@ def _bwd_preprocess(
         mask &= offs_k[None, :] < BLOCK_D_MODEL
 
     # load [BLOCK_M, BLOCK_D_MODEL_POW2]
-    o = tl.load(o_ptr + offs, mask=mask, other=0.0)
-    do = tl.load(do_ptr + offs, mask=mask, other=0.0)
+    o = tl.load(o_ptr + offs_o, mask=mask, other=0.0)
+    do = tl.load(do_ptr + offs_do, mask=mask, other=0.0)
 
     # compute and write-back to delta
     if IS_FP8:
