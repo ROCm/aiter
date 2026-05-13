@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import hashlib
 import importlib
 import json
 import logging
@@ -76,6 +77,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
+AITER_TUNED_CONFIG_MODE = os.getenv("AITER_TUNED_CONFIG_MODE", "full").strip().lower()
 
 
 # config_env start here
@@ -126,6 +128,62 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
 
 
 class AITER_CONFIG(object):
+    def _use_base_tuned_configs(self) -> bool:
+        return AITER_TUNED_CONFIG_MODE in {"base", "light", "lite", "minimal"}
+
+    def _file_config_summary(self, path: str) -> tuple[Optional[int], Optional[int], Optional[str]]:
+        try:
+            import pandas as pd
+
+            df = pd.read_csv(path)
+            rows = len(df)
+            cols = len(df.columns)
+        except Exception:
+            rows = None
+            cols = None
+
+        try:
+            digest = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            sha256 = digest.hexdigest()
+        except OSError:
+            sha256 = None
+
+        return rows, cols, sha256
+
+    def _dataframe_sha256(self, df) -> str:
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        return hashlib.sha256(csv_bytes).hexdigest()
+
+    def _log_config_summary(
+        self,
+        *,
+        merge_name: str,
+        mode: str,
+        path: str,
+        rows: Optional[int],
+        cols: Optional[int],
+        sha256: Optional[str],
+        source_count: int,
+        rows_before_dedup: Optional[int] = None,
+    ):
+        row_text = "unknown" if rows is None else str(rows)
+        col_text = "unknown" if cols is None else str(cols)
+        hash_text = "unknown" if sha256 is None else sha256[:16]
+        before_text = (
+            ""
+            if rows_before_dedup is None
+            else f" rows_before_dedup={rows_before_dedup}"
+        )
+        print(
+            "[aiter] tuned config "
+            f"name={merge_name} mode={mode} sources={source_count} "
+            f"rows={row_text} cols={col_text}{before_text} "
+            f"sha256={hash_text} path={path}"
+        )
+
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
         return self.get_config_file(
@@ -195,6 +253,17 @@ class AITER_CONFIG(object):
     def update_config_files(self, file_path: str, merge_name: str):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
+            if file_path:
+                rows, cols, sha256 = self._file_config_summary(file_path)
+                self._log_config_summary(
+                    merge_name=merge_name,
+                    mode="single",
+                    path=file_path,
+                    rows=rows,
+                    cols=cols,
+                    sha256=sha256,
+                    source_count=1,
+                )
             return file_path
         source_pairs = []
         ## merge config files
@@ -234,6 +303,7 @@ class AITER_CONFIG(object):
             if non_empty
             else source_pairs[0][1].iloc[0:0].copy()
         )
+        rows_before_dedup = len(merge_df)
         has_tag = "_tag" in merge_df.columns
         if has_tag:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
@@ -314,6 +384,16 @@ class AITER_CONFIG(object):
             os.replace(tmp_file_path, new_file_path)
 
         mp_lock(lock_path, write_config)
+        self._log_config_summary(
+            merge_name=merge_name,
+            mode="merged",
+            path=new_file_path,
+            rows=len(merge_df),
+            cols=len(merge_df.columns),
+            sha256=self._dataframe_sha256(merge_df),
+            source_count=len(source_pairs),
+            rows_before_dedup=rows_before_dedup,
+        )
         return new_file_path
 
     @functools.lru_cache(maxsize=20)
@@ -323,6 +403,19 @@ class AITER_CONFIG(object):
         from pathlib import Path
 
         if not config_env_file:
+            if self._use_base_tuned_configs():
+                rows, cols, sha256 = self._file_config_summary(default_file)
+                self._log_config_summary(
+                    merge_name=tuned_file_name,
+                    mode=AITER_TUNED_CONFIG_MODE,
+                    path=default_file,
+                    rows=rows,
+                    cols=cols,
+                    sha256=sha256,
+                    source_count=1,
+                )
+                return default_file
+
             model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
             op_tuned_file_list = [
                 p
