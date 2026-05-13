@@ -18,6 +18,7 @@ FLYDSL_VERSION = "flydsl==0.1.7"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
+AITER_PREBUILD_PROFILE = os.environ.get("AITER_PREBUILD_PROFILE", "full").strip().lower()
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
 if IS_WINDOWS:
@@ -213,6 +214,34 @@ def _load_modules_from_config():
     return []
 
 
+_TEST_PREBUILD_EXCLUDE_MODULES = {
+    # Multi-GPU-only communication modules are covered by main/nightly full builds.
+    "module_custom_all_reduce",
+    "module_quick_all_reduce",
+    # Standard Aiter PR tests do not need prebuilt backward MHA kernels.
+    "module_fmha_v3_bwd",
+    "module_fmha_v3_varlen_bwd",
+    "module_mha_bwd",
+    "module_mha_varlen_bwd",
+    "libmha_bwd",
+    # OPUS-specific sorting is not part of the standard top-level Aiter shards.
+    "module_moe_sorting_opus",
+}
+
+
+def _get_profile_exclude_modules(all_modules):
+    if AITER_PREBUILD_PROFILE not in {"test", "ci-test", "ci_test"}:
+        return []
+
+    exclude_modules = sorted(m for m in _TEST_PREBUILD_EXCLUDE_MODULES if m in all_modules)
+    print(
+        "[aiter] AITER_PREBUILD_PROFILE="
+        f"{AITER_PREBUILD_PROFILE}: excluding {len(exclude_modules)} "
+        f"test-unneeded modules: {', '.join(exclude_modules)}"
+    )
+    return exclude_modules
+
+
 def get_exclude_ops():
     all_modules = _load_modules_from_config()
     exclude_ops = []
@@ -221,6 +250,8 @@ def get_exclude_ops():
     if not ENABLE_CK:
         exclude_ops.extend(sorted(core._get_ck_exclude_modules()))
         return exclude_ops
+
+    exclude_ops.extend(_get_profile_exclude_modules(all_modules))
 
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
@@ -245,7 +276,7 @@ def get_exclude_ops():
             if "_tune" in module:
                 exclude_ops.append(module)
 
-    return exclude_ops
+    return sorted(set(exclude_ops))
 
 
 if PREBUILD_KERNELS != 0:

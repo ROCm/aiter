@@ -48,6 +48,7 @@ jobs:
     needs: check-signal
     env:
       AITER_TUNED_CONFIG_MODE: ${{ github.event_name == 'pull_request' && 'smoke' || 'full' }}
+      AITER_PREBUILD_PROFILE: ${{ github.event_name == 'pull_request' && 'test' || 'full' }}
     permissions:
       id-token: write
       contents: read
@@ -98,6 +99,7 @@ jobs:
             --network=host \
             -e AITER_PREBUILD_MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
             -e AITER_TUNED_CONFIG_MODE="${AITER_TUNED_CONFIG_MODE}" \
+            -e AITER_PREBUILD_PROFILE="${AITER_PREBUILD_PROFILE}" \
             -e AITER_RUNNER_NAME="${RUNNER_NAME:-unknown}" \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
@@ -114,7 +116,7 @@ jobs:
               pip install --upgrade "ninja>=1.11.1" &&
               pip install --upgrade setuptools_scm &&
               pip install tabulate &&
-              echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, MAX_JOBS: ${AITER_PREBUILD_MAX_JOBS}, and AITER_TUNED_CONFIG_MODE: ${AITER_TUNED_CONFIG_MODE}" &&
+              echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, MAX_JOBS: ${AITER_PREBUILD_MAX_JOBS}, AITER_TUNED_CONFIG_MODE: ${AITER_TUNED_CONFIG_MODE}, and AITER_PREBUILD_PROFILE: ${AITER_PREBUILD_PROFILE}" &&
               export PREBUILD_KERNELS=1 &&
               export MAX_JOBS="${AITER_PREBUILD_MAX_JOBS}" &&
               export GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" &&
