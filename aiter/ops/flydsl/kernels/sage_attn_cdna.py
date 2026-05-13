@@ -14,7 +14,7 @@ Architecture: gfx942 (MI300X) and gfx950 (MI350)
 
 Layout: Q/K/V/O are 1D-flattened from BSHD.
 Grid:   (batch * num_q_tiles * num_q_heads,)
-Block:  (NUM_WAVES * 64,) -- default 4 waves → 256 threads
+Block:  (NUM_WAVES * 64,) -- default 8 waves → 512 threads
 
 Supports:
   - Causal masking
@@ -22,7 +22,6 @@ Supports:
 """
 
 import math as host_math
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
