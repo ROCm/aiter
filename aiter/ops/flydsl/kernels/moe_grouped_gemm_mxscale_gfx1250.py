@@ -244,10 +244,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             stream = torch.cuda.current_stream()
         tmp = torch.empty((cfg.experts, cfg.max_m, 2 * cfg.inter_dim), device=y.device, dtype=y.dtype)
         if cfg.grouped_persistent_m:
-            with torch.cuda.stream(stream):
-                m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
-                base(tmp, x, w, scale_x, scale_w, masked_m, m_tile_prefix,
-                     cfg.max_m, 2 * cfg.inter_dim, stream=stream)
+            base(tmp, x, w, scale_x, scale_w, masked_m, masked_m,
+                 cfg.max_m, 2 * cfg.inter_dim, stream=stream)
         else:
             base(tmp, x, w, scale_x, scale_w, masked_m,
                  cfg.max_m, 2 * cfg.inter_dim, stream=stream)
@@ -312,10 +310,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         if stream is None:
             stream = torch.cuda.current_stream()
         if cfg.grouped_persistent_m:
-            with torch.cuda.stream(stream):
-                m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
-                base(y, x, w, scale_x, scale_w, masked_m, m_tile_prefix,
-                     cfg.max_m, cfg.model_dim, stream=stream)
+            base(y, x, w, scale_x, scale_w, masked_m, masked_m,
+                 cfg.max_m, cfg.model_dim, stream=stream)
         else:
             base(y, x, w, scale_x, scale_w, masked_m,
                  cfg.max_m, cfg.model_dim, stream=stream)
