@@ -1265,29 +1265,37 @@ def build_sage_attn_mxfp4_cdna_module(
                 _yield_args.append(o_accs[dc])
             return _yield_args
 
-        # Body loop: tiles fully below the diagonal AND fully within seq_len_k.
-        # mask_mode='none' strips the causal/seq-len mask code path entirely,
-        # producing a tighter inner loop. For non-causal shapes whose seq_len_k
-        # is a multiple of BLOCK_N, this loop covers ALL K-tiles (the tail
-        # loop below has zero iterations).
-        body_results = init_args
-        for kv_block_start, inner_iter_args in range(
-            0, kv_body_end, BLOCK_N, init=init_args
-        ):
-            body_results = yield _emit_iter(
-                kv_block_start, inner_iter_args, mask_mode="none"
-            )
-
-        # Tail loop: covers the diagonal stripe (causal) and/or the seq-len
-        # boundary tile. Runs the full mask code path. State (m, l, o_accs,
-        # cur_buf) is threaded from the body loop's last yield via init=...
-        loop_results = body_results
-        for kv_block_start, inner_iter_args in range(
-            kv_body_end, kv_upper, BLOCK_N, init=body_results
-        ):
-            loop_results = yield _emit_iter(
-                kv_block_start, inner_iter_args, mask_mode="full"
-            )
+        # Causal: emit body+tail split. Body covers tiles fully below the
+        # diagonal (no mask, no scf.if), tail covers the diagonal stripe with
+        # the full mask path. Big causal win.
+        # Non-causal: keep a single loop with mask_mode='full' (the seq-len
+        # tile-end mask is a runtime scf.if predicate that's false on every
+        # interior tile, so it costs ~one branch per iter — emitting a body+
+        # tail split here introduced a small fwd regression on H24 large-S
+        # shapes via duplicated loop bodies and iter_args plumbing).
+        if const_expr(CAUSAL):
+            body_results = init_args
+            for kv_block_start, inner_iter_args in range(
+                0, kv_body_end, BLOCK_N, init=init_args
+            ):
+                body_results = yield _emit_iter(
+                    kv_block_start, inner_iter_args, mask_mode="none"
+                )
+            loop_results = body_results
+            for kv_block_start, inner_iter_args in range(
+                kv_body_end, kv_upper, BLOCK_N, init=body_results
+            ):
+                loop_results = yield _emit_iter(
+                    kv_block_start, inner_iter_args, mask_mode="full"
+                )
+        else:
+            loop_results = init_args
+            for kv_block_start, inner_iter_args in range(
+                0, kv_upper, BLOCK_N, init=init_args
+            ):
+                loop_results = yield _emit_iter(
+                    kv_block_start, inner_iter_args, mask_mode="full"
+                )
 
         # ---- Normalize and store O ----
         # loop_results layout: [cur_buf, m, l, *o_accs (D_CHUNKS)]
