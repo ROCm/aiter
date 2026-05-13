@@ -325,13 +325,12 @@ def compile_flydsl_moe_stage1(
             k_batch=k_batch,
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
-            gate_mode=gate_mode,
+            gate_mode=GateMode(gate_mode),
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
-            swiglu_limit=swiglu_limit,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
