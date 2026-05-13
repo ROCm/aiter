@@ -27,8 +27,9 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.aot.flydsl.common import raise_if_aot_cache_miss
+from aiter.aot.flydsl.common import fail_on_aot_cache_miss
 from aiter.ops.flydsl.moe_common import GateMode
+import aiter.ops.flydsl.moe_kernels as _aiter_mk
 
 
 from aiter.ops.shuffle import (
@@ -38,46 +39,6 @@ from aiter.ops.shuffle import (
     pack_int8_to_packed_int4,
     shuffle_scale_for_int4,
 )
-# --- AOT-cache miss detection ------------------------------------------------
-# Wrap aiter's MoE dispatcher so we register every FlyDSL JitFunction we touch.
-# Any positive JitCacheManager.cache_info().misses means a kernel was
-# JIT-compiled instead of loaded from the AOT cache.
-import aiter.ops.flydsl.moe_kernels as _aiter_mk
-
-_jit_fns_seen = []  # insertion order; values are JitFunction instances
-_last_cache_key = {}  # id(jf) -> last cache_key tuple looked up
-_orig_run_compiled = _aiter_mk._run_compiled
-
-
-def _run_compiled_tracked(exe, args):
-    if exe not in _jit_fns_seen:
-        _jit_fns_seen.append(exe)
-    try:
-        exe._ensure_sig()
-        bound = exe._sig.bind(*args)
-        bound.apply_defaults()
-        _last_cache_key[id(exe)] = exe._make_cache_key(bound.arguments)
-    except Exception:
-        pass
-    return _orig_run_compiled(exe, args)
-
-
-_aiter_mk._run_compiled = _run_compiled_tracked
-
-
-def _aot_cache_misses():
-    misses = []
-    for jf in _jit_fns_seen:
-        info = jf.cache_info()
-        if info is None or info.misses == 0:
-            continue
-        cdir = getattr(jf.cache_manager, "cache_dir", None)
-        misses.append((jf.func.__name__, id(jf), jf.manager_key, cdir, info.misses))
-    return misses
-
-
-# -----------------------------------------------------------------------------
-
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
 AITER_MOE_EXPERT_BALANCE = (
@@ -85,6 +46,7 @@ AITER_MOE_EXPERT_BALANCE = (
 )
 
 
+@fail_on_aot_cache_miss(_aiter_mk)
 @benchmark()
 def test_fmoe(
     dtype,
@@ -868,7 +830,6 @@ for kwargs, extras in case_iter:
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     try:
         ret = test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
-        raise_if_aot_cache_miss(kwargs, _aot_cache_misses(), _last_cache_key)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:

@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import functools
+import inspect
 import os
 from typing import Any, Callable, Iterator
 
@@ -78,6 +80,70 @@ def raise_if_aot_cache_miss(
     raise RuntimeError(
         "AOT cache miss for case " + repr(case_kwargs) + ":\n" + "\n".join(details)
     )
+
+
+def fail_on_aot_cache_miss(
+    run_compiled_module: Any,
+    run_compiled_name: str = "_run_compiled",
+) -> Callable:
+    """Fail a wrapped test when a patched FlyDSL run helper reports cache misses."""
+
+    def decorator(func: Callable) -> Callable:
+        jit_fns_seen = []
+        last_cache_key = {}
+
+        def case_arguments(args, kwargs):
+            try:
+                bound = inspect.signature(func).bind_partial(*args, **kwargs)
+                bound.apply_defaults()
+                return dict(bound.arguments)
+            except Exception:
+                case_kwargs = dict(kwargs)
+                if args:
+                    case_kwargs["args"] = args
+                return case_kwargs
+
+        def aot_cache_misses():
+            misses = []
+            for jf in jit_fns_seen:
+                info = jf.cache_info()
+                if info is None or info.misses == 0:
+                    continue
+                cache_dir = getattr(jf.cache_manager, "cache_dir", None)
+                misses.append(
+                    (jf.func.__name__, id(jf), jf.manager_key, cache_dir, info.misses)
+                )
+            return misses
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            orig_run_compiled = getattr(run_compiled_module, run_compiled_name)
+
+            def run_compiled_tracked(exe, compile_args):
+                if exe not in jit_fns_seen:
+                    jit_fns_seen.append(exe)
+                try:
+                    exe._ensure_sig()
+                    bound = exe._sig.bind(*compile_args)
+                    bound.apply_defaults()
+                    last_cache_key[id(exe)] = exe._make_cache_key(bound.arguments)
+                except Exception:
+                    pass
+                return orig_run_compiled(exe, compile_args)
+
+            setattr(run_compiled_module, run_compiled_name, run_compiled_tracked)
+            try:
+                ret = func(*args, **kwargs)
+                raise_if_aot_cache_miss(
+                    case_arguments(args, kwargs), aot_cache_misses(), last_cache_key
+                )
+                return ret
+            finally:
+                setattr(run_compiled_module, run_compiled_name, orig_run_compiled)
+
+        return wrapper
+
+    return decorator
 
 
 @contextmanager
