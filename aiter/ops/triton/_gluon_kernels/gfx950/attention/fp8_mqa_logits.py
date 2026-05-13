@@ -1,5 +1,3 @@
-import os
-import torch
 from packaging.version import Version
 
 import triton
@@ -8,8 +6,6 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 from triton.language.core import PropagateNan
-
-from aiter.ops.triton.utils._triton import arch_info
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_BEYOND_37 = TRITON_VERSION >= Version("3.7.0")
@@ -23,6 +19,7 @@ _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 def elementwise_max_prop_nan(a, b):
     return gl.maximum(a, b, propagate_nan=_MAX_PROPAGATE_NAN_ALL)
 
+
 @gluon.jit
 def relu_f32(x):
     return elementwise_max_prop_nan(x, 0)
@@ -35,7 +32,7 @@ def _load_kv_scales_block(
     BLOCK_KV: gl.constexpr,
     mfma_layout: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
-    end_ind = 0,
+    end_ind=0,
     masked: gl.constexpr = False,
 ):
     # When `end_off` is provided, positions j with `offset_into_segment + j >= end_off`
@@ -66,7 +63,7 @@ def _store_logits_block(
     mask=None,
 ):
     # buffer_store caps at 2 GB; fall back to global store
-    #scores = scores.to(logits_ptr.type.element_ty)
+    # scores = scores.to(logits_ptr.type.element_ty)
     if mask is None:
         if USE_BUFFER_STORE:
             gl.amd.cdna4.buffer_store(scores, ptr=logits_ptr, offsets=store_offsets)
@@ -175,6 +172,7 @@ class MQAAsyncKVLoaderConfig:
         self.blocked = gl.constexpr(blocked)
         self.shared = gl.constexpr(shared)
 
+
 @aggregate
 class MQAAsyncKVLoader:
     """CDNA4 async-copy loader. Shared holds K as [HEAD_SIZE, BLOCK_KV]."""
@@ -222,11 +220,17 @@ class MQAAsyncKVLoader:
             0, kv_cfg.BLOCK_KV, layout=gl.SliceLayout(0, kv_cfg.blocked)
         )[None, :]
         base_offset = offs_d * stride_kv_d + offs_n * stride_kv_s
-        return MQAAsyncKVLoader(kv_cfg, KV_ptr, kv_shared, base_offset, stride_kv_s, seq_len_kv)
+        return MQAAsyncKVLoader(
+            kv_cfg, KV_ptr, kv_shared, base_offset, stride_kv_s, seq_len_kv
+        )
 
     @gluon.jit
     def load_to_shared(
-        self, row_offset, buffer_id, USE_BUFFER_LOAD: gl.constexpr, masked: gl.constexpr=False
+        self,
+        row_offset,
+        buffer_id,
+        USE_BUFFER_LOAD: gl.constexpr,
+        masked: gl.constexpr = False,
     ):
         # When `end_row` is provided, rows at column j with `row_offset + j >= end_row`
         # are masked out (predicated load). Used to safely prefetch tiles that may
@@ -237,9 +241,7 @@ class MQAAsyncKVLoader:
                 self.kv_cfg.BLOCK_KV,
                 layout=gl.SliceLayout(0, self.kv_cfg.blocked),
             )[None, :]
-            mask = (
-                (offs_n < (self.seq_len_kv - row_offset))
-            )
+            mask = offs_n < (self.seq_len_kv - row_offset)
         else:
             mask = None
         if USE_BUFFER_LOAD:
@@ -292,6 +294,7 @@ def _mqa_dot(
         b_format="e4m3",
         acc=acc,
     )
+
 
 @gluon.constexpr_function
 def _make_head_reduction_plan(linear_layout, num_heads, block_kv, num_chains):
@@ -517,7 +520,6 @@ def mqa_logits_loop_double_buf(
         USE_BUFFER_LOAD,
         end_ind,
         masked=True,
-
     )
     mfma_k = kv_loader.load_from_shared(
         wait_count=1, target_layout=dot_b_layout, buffer_id=buf_cur
