@@ -115,6 +115,10 @@ else:
             "CK and HIP ops are disabled. Triton ops remain available.",
             e,
         )
+        try:
+            from .ops.communication import destroy_dist_env, init_dist_env  # noqa: F401,E402
+        except Exception:
+            pass
 
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
 try:
@@ -126,6 +130,6 @@ try:
         reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
         IRIS_COMM_AVAILABLE,  # noqa: F401
     )
-except (ImportError, AttributeError):
+except (ImportError, AttributeError, RuntimeError, OSError, KeyError):
     # Iris or triton not available, skip import
     IRIS_COMM_AVAILABLE = False

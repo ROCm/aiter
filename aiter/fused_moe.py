@@ -698,6 +698,81 @@ def _normalize_bias_for_kernel(
     return bias
 
 
+@functools.lru_cache(maxsize=None)
+def _fmoe_stage1_fq_adaptive_enabled() -> bool:
+    return os.environ.get("AITER_FMOE_STAGE1_FQ_ADAPTIVE", "0") == "1"
+
+
+@functools.lru_cache(maxsize=None)
+def _fmoe_stage1_fq_adaptive_min_token() -> int:
+    raw = os.environ.get("AITER_FMOE_STAGE1_FQ_ADAPTIVE_MIN_TOKEN", "16")
+    try:
+        return int(raw)
+    except ValueError:
+        return 16
+
+
+@functools.lru_cache(maxsize=None)
+def _fmoe_stage1_fq_adaptive_max_token() -> int:
+    raw = os.environ.get("AITER_FMOE_STAGE1_FQ_ADAPTIVE_MAX_TOKEN", "32")
+    try:
+        return int(raw)
+    except ValueError:
+        return 32
+
+
+def _normalize_stage1_fq_kernel_name(value: str) -> Optional[str]:
+    value = value.strip()
+    if value.lower() in {"", "0", "1", "false", "true", "no", "yes", "off", "on"}:
+        return None
+    # May 8 C4 scripts used the old "_fq" suffix; current FlyDSL uses "_fp4".
+    value = value.replace("_go_fq", "_go_fp4")
+    if value.endswith("_fq"):
+        value = f"{value[:-3]}_fp4"
+    return value
+
+
+@functools.lru_cache(maxsize=None)
+def _fmoe_stage1_fq_adaptive_token16_kernel() -> Optional[str]:
+    return _normalize_stage1_fq_kernel_name(
+        os.environ.get("AITER_FMOE_STAGE1_FQ_ADAPTIVE_TOKEN16_KERNEL", "")
+    )
+
+
+def _fmoe_stage1_fq_adaptive_kernel(
+    *,
+    token: int,
+    inter_dim: int,
+    dtype: torch.dtype,
+    q_dtype_a: torch.dtype,
+    q_dtype_w: torch.dtype,
+    q_type: QuantType,
+    activation: ActivationType,
+    use_g1u1: bool,
+    doweight_stage1: bool,
+) -> Optional[str]:
+    if not _fmoe_stage1_fq_adaptive_enabled():
+        return None
+    if token < _fmoe_stage1_fq_adaptive_min_token():
+        return None
+    if token > _fmoe_stage1_fq_adaptive_max_token():
+        return None
+    if not (
+        inter_dim == 512
+        and dtype == dtypes.bf16
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Silu
+        and use_g1u1
+        and not doweight_stage1
+    ):
+        return None
+    if token == 16:
+        return _fmoe_stage1_fq_adaptive_token16_kernel()
+    return None
+
+
 def _flydsl_stage1_wrapper(
     hidden_states,
     w1,
@@ -1148,6 +1223,28 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 use_non_temporal_load=use_non_temporal_load,
             )
+        stage1_fq_override = _fmoe_stage1_fq_adaptive_kernel(
+            token=token,
+            inter_dim=inter_dim,
+            dtype=dtype,
+            q_dtype_a=q_dtype_a,
+            q_dtype_w=q_dtype_w,
+            q_type=q_type,
+            activation=activation,
+            use_g1u1=use_g1u1,
+            doweight_stage1=doweight_stage1,
+        )
+        if stage1_fq_override is not None:
+            logger.info(
+                f"[fused_moe] stage1 FQ adaptive override token={token} "
+                f"kernelName1={kernelName1!r} override={stage1_fq_override}"
+            )
+            stage1_func = functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=stage1_fq_override,
+                activation=activation,
+            )
+            _s1_fp4q = True
         _s1_fp8q = is_flydsl1 and "_fp8" in kernelName1.split("_t")[-1]
         _fuse_quant = "fp8" if _s1_fp8q else ("fp4" if _s1_fp4q else "")
         return MOEMetadata(
