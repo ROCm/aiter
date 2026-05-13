@@ -145,45 +145,25 @@ def _flatmm_splitk_pfk(k) -> int:
 
 
 def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
-    """Pick literal KBatch values in {0, 2..32} worth probing for this (shape, kid).
-
-    Heuristic = "calculated saturation split + powers of 2" (user-confirmed).
-    See section 9 of splitk_flatmm_aiter plan.
+    """Pick literal KBatch values in {0, 1..16} worth probing for this (shape, kid).
 
     Output:
       - Always contains 0 (no-split fallback).
-      - At most 6 values total (0 plus up to 5 of {kb_calc, 2, 4, 8, 16, 32}).
+      - Probes every integer in [1, min(16, max_split_k)] so the tuner can
+        find the optimal split factor without gaps.
       - Storage is literal KBatch, matching gptoss_bf16_tuned_gemm.csv convention.
     """
-    B_M, B_N, B_K = k_inst.B_M, k_inst.B_N, k_inst.B_K
-    wg_per_cu = getattr(k_inst, "WG_PER_CU", 2)
-    tiles_mn = _ceil_div(M, B_M) * _ceil_div(N, B_N)
-    base_grid = tiles_mn * max(batch, 1)
+    B_K = k_inst.B_K
     total_iters = _ceil_div(K, B_K)
     pfk = _flatmm_splitk_pfk(k_inst)
 
     candidates = {0}
 
-    # pfk cap: launcher auto-clamps anything above this; no point probing it.
-    max_split_k = min(32, max(1, total_iters // max(pfk, 1)))
-    if max_split_k < 2:
+    max_split_k = min(16, max(1, total_iters // max(pfk, 1)))
+    if max_split_k < 1:
         return [0]
 
-    # Saturation target: 2 * wg_per_cu * cu_num gives a 2x headroom above "all
-    # CUs busy" to absorb tail imbalance.
-    target_grid = 2 * wg_per_cu * cu_num
-    if base_grid >= target_grid:
-        return [0]  # already saturated; splitK costs reduce kernel for no gain
-
-    # (a) calculated: smallest KBatch hitting the saturation target
-    kb_calc = max(2, _ceil_div(target_grid, max(base_grid, 1)))
-    if kb_calc <= max_split_k:
-        candidates.add(kb_calc)
-
-    # (b) powers of 2 in [2, max_split_k]
-    for kb in (2, 4, 8, 16, 32):
-        if kb > max_split_k:
-            break
+    for kb in range(1, max_split_k + 1):
         candidates.add(kb)
 
     return sorted(candidates)
@@ -557,6 +537,10 @@ def _kid_rejects_shape(k_inst, M, N, K):
         # (b) N-alignment bug in split-barrier store_if.
         if N % 16 != 0:
             return True
+        # (c) non-OOB kids require tile-aligned shapes.
+        if not k_inst.has_oob:
+            if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
+                return True
         return False
 
     if k_inst.kernel_tag == "a16w16_flatmm":
@@ -578,6 +562,10 @@ def _kid_rejects_shape(k_inst, M, N, K):
             return True
         # (b) No known correctness bugs for splitk. mask_va_tail handles the
         # K tail; the tail-store path in the reduce kernel handles any N.
+        # (c) non-OOB kids require tile-aligned shapes.
+        if not k_inst.has_oob:
+            if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
+                return True
         return False
 
     return False

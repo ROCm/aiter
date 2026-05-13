@@ -93,24 +93,32 @@ inline OpusA16W16NoscaleKernel opus_a16w16_heuristic_dispatch_gfx950(
   if (M <= 4)
   {
     // Extremely skinny M: cc recommends (64,64,128) WG=1 for deep K.
+    if ((M % 64 == 0) && (N % 64 == 0) && (K % 128 == 0))
+      return opus_gemm_flatmm_splitk_256x64x64x128_2x1_16x16x32_0x0x0_wgpcu1_nooob<fp32_t>;
     return opus_gemm_flatmm_splitk_256x64x64x128_2x1_16x16x32_0x0x0_wgpcu1<fp32_t>;
   }
   if (M <= 64)
   {
     // Mid-skinny: cc-recommended medium-M kernel (64,32,128) WG=2.
+    if ((M % 64 == 0) && (N % 32 == 0) && (K % 128 == 0))
+      return opus_gemm_flatmm_splitk_256x64x32x128_2x1_16x16x32_0x0x0_wgpcu2_nooob<fp32_t>;
     return opus_gemm_flatmm_splitk_256x64x32x128_2x1_16x16x32_0x0x0_wgpcu2<fp32_t>;
   }
   if (M <= 128)
   {
     // Sweet spot: (64,64,64) WG=2.
+    if ((M % 64 == 0) && (N % 64 == 0) && (K % 64 == 0))
+      return opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2_nooob<fp32_t>;
     return opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2<fp32_t>;
   }
   // M > 128
   if (split_barrier_ok)
   {
+    if ((M % 256 == 0) && (N % 256 == 0) && (K % 64 == 0))
+      return opus_gemm_512x256x256x64_2x4_16x16x32_0x0x0_nooob<CDataType>;
     return opus_gemm_512x256x256x64_2x4_16x16x32_0x0x0<CDataType>;
   }
-  // Non-aligned large shape: splitk kid 200 handles any (M, N, K) because
-  // mask_va_tail + reduce-tail cover arbitrary N/K.
+  if ((M % 64 == 0) && (N % 64 == 0) && (K % 64 == 0))
+    return opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2_nooob<fp32_t>;
   return opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2<fp32_t>;
 }
