@@ -23,8 +23,6 @@ def _hk_mla_gfx950_h32_max_ctx_per_seq(batch_size: int) -> int:
         return 49152
     if batch_size <= 32:
         return 16384
-    if batch_size <= 64:
-        return 8192
     return 0
 
 
