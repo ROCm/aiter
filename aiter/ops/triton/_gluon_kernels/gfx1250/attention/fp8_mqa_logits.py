@@ -10,6 +10,8 @@ from triton.language.core import _aggregate as aggregate
 from triton.language.core import PropagateNan
 
 from aiter.ops.triton.utils._triton import arch_info
+# same reduction technique, arch agnostic
+from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import _weighted_sum_fma_fold
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_BEYOND_37 = TRITON_VERSION >= Version("3.7.0")
@@ -193,110 +195,6 @@ def _mqa_dot(
         layout=layout,
     )
     return gl.amd.gfx1250.wmma(mfma_q, mfma_k, acc)
-
-
-@gluon.constexpr_function
-def _make_head_reduction_plan(linear_layout, num_heads, block_kv, num_chains):
-    # Reg bits split into `folded` (FMA) and `summed` (gl.sum). log2(NUM_CHAINS)
-    # folded bits stay as a parallel-chain axis for shorter dependency depth
-    # to help with RAW issues
-    assert (
-        num_chains >= 1 and (num_chains & (num_chains - 1)) == 0
-    ), f"num_chains must be a power of 2, got {num_chains}"
-    head_bits = num_heads.bit_length() - 1
-    chain_bits = num_chains.bit_length() - 1
-    reg_bases = [tuple(b) for b in linear_layout.reg_bases]
-    summed_head_bits = []
-    folded_head_bits = []
-    for bit in range(head_bits):
-        stride = 1 << (head_bits - 1 - bit)
-        if (stride, 0) in reg_bases:
-            folded_head_bits.append(bit)
-        else:
-            summed_head_bits.append(bit)
-    assert chain_bits <= len(folded_head_bits), (
-        f"num_chains={num_chains} needs >={chain_bits} folded head bits, "
-        f"only {len(folded_head_bits)} available for shape "
-        f"[{num_heads}, {block_kv}]"
-    )
-    chain_axis_bits = folded_head_bits[:chain_bits]
-    chain_fold_bits = folded_head_bits[chain_bits:]
-    fold_depth = len(chain_fold_bits)
-    head_bit_shape = tuple([2] * head_bits + [block_kv])
-    head_bit_order = tuple(
-        summed_head_bits + [head_bits] + chain_axis_bits + chain_fold_bits
-    )
-    folded_shape = tuple(
-        [1 << len(summed_head_bits), block_kv, num_chains] + [2] * fold_depth
-    )
-    return (head_bit_shape, head_bit_order, folded_shape, fold_depth, 1 << fold_depth)
-
-
-@gluon.jit
-def _split_leaf(x, IDX: gl.constexpr, DEPTH: gl.constexpr):
-    for bit in gl.static_range(0, DEPTH):
-        lo, hi = x.split()
-        if (IDX // (2**bit)) % 2 == 0:
-            x = lo
-        else:
-            x = hi
-    return x
-
-
-@gluon.jit
-def _weighted_fma_fold_serial(
-    s,
-    w,
-    NUM_LEAVES: gl.constexpr,
-    DEPTH: gl.constexpr,
-):
-    # Fold trailing DEPTH size-2 axes into one serial FMA chain.
-    # Leading axes (NUM_CHAINS) run as parallel chains
-    s_leaf = _split_leaf(s, 0, DEPTH)
-    acc = s_leaf * _split_leaf(w, 0, DEPTH)
-    for i in gl.static_range(1, NUM_LEAVES):
-        s_leaf = _split_leaf(s, i, DEPTH)
-        acc = gl.fma(s_leaf, _split_leaf(w, i, DEPTH), acc)
-    return acc
-
-
-@gluon.jit
-def _weighted_sum_fma_fold(
-    s,
-    w_col,
-    NUM_HEADS: gl.constexpr,
-    BLOCK_KV: gl.constexpr,
-    mfma_layout: gl.constexpr,
-    NUM_CHAINS: gl.constexpr = 1,
-):
-    # sum_h(s[h, k] * w[h]) via reg-axis FMA folding. NUM_CHAINS parallel
-    # chains trade NUM_CHAINS-1 extra adds for shorter dep chain.
-    # Returns [BLOCK_KV] in SliceLayout(0, mfma_layout).
-    if NUM_CHAINS < 1:
-        s = s * w_col
-        s = gl.sum(s, 0)
-        return s
-    else:
-        linear_layout: gl.constexpr = gl.to_linear_layout(
-            mfma_layout, [NUM_HEADS, BLOCK_KV]
-        )
-        plan: gl.constexpr = _make_head_reduction_plan(
-            linear_layout, NUM_HEADS, BLOCK_KV, NUM_CHAINS
-        )
-        head_bit_shape: gl.constexpr = plan[0]
-        head_bit_order: gl.constexpr = plan[1]
-        folded_shape: gl.constexpr = plan[2]
-        fold_depth: gl.constexpr = plan[3]
-        folded_count: gl.constexpr = plan[4]
-
-        w = w_col.broadcast_to([NUM_HEADS, BLOCK_KV])
-        s = s.reshape((head_bit_shape)).permute(head_bit_order).reshape(folded_shape)
-        w = w.reshape(head_bit_shape).permute(head_bit_order).reshape(folded_shape)
-        s = _weighted_fma_fold_serial(s, w, folded_count, fold_depth)
-        s = gl.sum(s, axis=2)  # combine parallel chains
-        s = gl.sum(s, axis=0)  # cross-lane sum
-        s = gl.convert_layout(s, gl.SliceLayout(0, mfma_layout))
-        return s
 
 
 @gluon.jit
