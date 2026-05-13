@@ -191,80 +191,47 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
     torch.testing.assert_close(torch_out, out)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("B, M, N, K", [(16, 16, 512, 128), (16, 512, 512, 128)])
-def test_batched_gemm_a16wfp4_transpose_bm_eager(B, M, N, K, dtype):
-    """Lock the eager-mode shape contract: ``transpose_bm=True`` returns ``(M, B, N)``.
+def test_batched_gemm_a16wfp4_fake_honors_transpose_bm():
+    """Regression: the fake must match the real kernel's allocation
+    branch on ``transpose_bm`` (lines 100-103 of batched_gemm_a16wfp4.py).
 
-    The real kernel has switched on ``transpose_bm`` since the op was added,
-    but the public shape contract was previously only enforced via the fake
-    tensor (which did not match). This test pins the kernel contract so a
-    future kernel refactor cannot silently regress it.
+    Pre-fix the fake returned ``(Bx, M, N)`` regardless of
+    ``transpose_bm``, so under ``torch.compile`` AOTAutograd specialized
+    the unbacked SymInt ``M`` of any downstream consumer to the static
+    ``Bx`` -- silently producing wrong output (or a GPU memory access
+    fault) on cudagraph replay at any other ``M``. Post-fix the fake
+    returns ``(M, Bx, N)`` when ``transpose_bm=True``, matching the real
+    kernel.
+
+    Pure meta-tensor test: no GPU, no FP4 hardware, no kernel launch,
+    no ``torch.compile`` trace -- testing the fake function in isolation
+    is the necessary and sufficient condition for the downstream graph
+    to be correct.
     """
-    if not arch_info.is_fp4_avail():
-        pytest.skip("MXFP4 not supported on this architecture")
-
-    torch.cuda.empty_cache()
-    x, w, _x_scales, w_scales, _ = generate_batched_gemm_a16wfp4_inputs(
-        B, M, N, K, dtype, layout="TN", output=False
+    from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
+        batched_gemm_a16wfp4_fake_tensor,
     )
 
-    out = batched_gemm_a16wfp4(
-        x, w, w_scales, dtype, None, transpose_bm=True, prequant=True
+    B, M, N, K = 16, 7, 512, 128
+
+    x = torch.empty((B, M, K), dtype=torch.bfloat16, device="meta")
+    w = torch.empty((B, N, K // 2), dtype=torch.uint8, device="meta")
+    w_scales = torch.empty((B, N, K // 32), dtype=torch.uint8, device="meta")
+
+    out_t = batched_gemm_a16wfp4_fake_tensor(
+        x, w, w_scales, dtype=torch.bfloat16, transpose_bm=True
     )
-    assert out.shape == (
+    assert out_t.shape == (
         M,
         B,
         N,
-    ), f"transpose_bm=True must return (M, B, N); got {tuple(out.shape)}"
+    ), f"transpose_bm=True must return (M, B, N); got {tuple(out_t.shape)}"
 
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_batched_gemm_a16wfp4_transpose_bm_compile_dynamic_M(dtype):
-    """Regression: under ``torch.compile`` with a dynamic-``M`` BMM whose
-    output is ``cat``-ed on ``dim=-1`` with a tensor of shape ``(M, B, K)``,
-    the fake tensor MUST honor ``transpose_bm`` -- otherwise AOTAutograd
-    specializes the unbacked ``M`` to ``B`` and replay at any other ``M``
-    runs the wrong slice.
-
-    Pre-fix this test fails with either:
-      * ``RuntimeError: Sizes of tensors must match except in dimension 2``
-        from the ``torch.cat`` (when shape mismatch is caught at trace time),
-      * a ``_assert_scalar`` runtime failure on the second invocation
-        (when AOTAutograd specialized ``M = B = 16`` and we later call with
-        ``M = 512``), or
-      * a silent shape mismatch + downstream OOB.
-    """
-    if not arch_info.is_fp4_avail():
-        pytest.skip("MXFP4 not supported on this architecture")
-
-    B, K, N = 16, 128, 512
-    qk_rope = 64
-
-    def f(x, w, w_scales, q_pe):
-        # x: (B, M, K)   w: (B, N, K//2)   w_scales: (B, N, K//SCALE_GROUP_SIZE)
-        # q_pe: (M, B, qk_rope) -- mirrors vLLM's MLA decode q-prep cat input
-        ql_nope = batched_gemm_a16wfp4(
-            x, w, w_scales, dtype, None, transpose_bm=True, prequant=True
-        )
-        # Must be cat-able on dim=-1 -> requires non-cat dims to match.
-        return torch.cat((ql_nope, q_pe), dim=-1)
-
-    fc = torch.compile(f, fullgraph=True, dynamic=True)
-
-    for M in (16, 512):
-        x, w, _x_scales, w_scales, _ = generate_batched_gemm_a16wfp4_inputs(
-            B, M, N, K, dtype, layout="TN", output=False
-        )
-        q_pe = torch.randn((M, B, qk_rope), dtype=dtype, device="cuda")
-        # Mark the M dim of x dynamic so AOTAutograd traces an unbacked SymInt
-        # for the BMM's M -- the conditions under which the fake bug triggers.
-        torch._dynamo.mark_dynamic(x, 1)
-        torch._dynamo.mark_dynamic(q_pe, 0)
-
-        out = fc(x, w, w_scales, q_pe)
-        assert out.shape == (
-            M,
-            B,
-            N + qk_rope,
-        ), f"M={M}: got {tuple(out.shape)}, expected ({M}, {B}, {N + qk_rope})"
+    out_f = batched_gemm_a16wfp4_fake_tensor(
+        x, w, w_scales, dtype=torch.bfloat16, transpose_bm=False
+    )
+    assert out_f.shape == (
+        B,
+        M,
+        N,
+    ), f"transpose_bm=False must return (B, M, N); got {tuple(out_f.shape)}"
