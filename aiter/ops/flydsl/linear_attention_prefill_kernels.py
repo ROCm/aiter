@@ -8,7 +8,7 @@ This module hosts:
 * ``chunk_gated_delta_rule_fwd_h_flydsl`` -- host wrapper around the K5
   hidden-state recurrence FlyDSL kernel (``compile_chunk_gated_delta_h``).
   Performs PyTorch tensor preparation, looks up ``BV`` from the
-  offline-tuned table ``chunk_gdn_h_tuned.jsonl``, manages the compiled
+  offline-tuned table ``chunk_gdn_h_tuned.csv``, manages the compiled
   kernel cache, and handles the launch stream. The kernel-compile module
   ``kernels.chunk_gated_delta_h`` is kept ``torch``-free, mirroring the
   layering used by ``kernels.gdr_decode``.
@@ -22,7 +22,7 @@ This module hosts:
 
 from __future__ import annotations
 
-import json
+import csv
 import os
 from pathlib import Path
 
@@ -57,7 +57,7 @@ __all__ = [
 _compiled_kernels = {}
 _BV_CANDIDATES = [16, 32, 64]
 _DEFAULT_BV = 16
-_TUNED_FILE = "chunk_gdn_h_tuned.jsonl"
+_TUNED_FILE = "chunk_gdn_h_tuned.csv"
 
 # (dtype_str, arch, K, V, BT, H, Hg, T_flat, N,
 #  use_g, use_gk, use_h0, store_fs, save_vn, is_varlen, wu_contig) -> {"BV": int}
@@ -138,48 +138,64 @@ def _lookup_tuned_bv(
         fname = os.path.join(Path(__file__).resolve().parent, _TUNED_FILE)
         if os.path.exists(fname):
             with open(fname, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if len(line) <= 10:
-                        continue
-                    obj = json.loads(line)
+                for row in csv.DictReader(f):
+                    # Coerce CSV string fields to native Python types so the
+                    # lookup key tuple is byte-for-byte identical to what
+                    # the runtime caller passes.
+                    obj_arch = row["arch"]
+                    obj_dtype = row["dtype"]
+                    obj_K = int(row["K"])
+                    obj_V = int(row["V"])
+                    obj_BT = int(row["BT"])
+                    obj_H = int(row["H"])
+                    obj_Hg = int(row["Hg"])
+                    obj_T_flat = int(row["T_flat"])
+                    obj_N = int(row["N"])
+                    obj_use_g = row["use_g"] == "True"
+                    obj_use_gk = row["use_gk"] == "True"
+                    obj_use_h0 = row["use_h0"] == "True"
+                    obj_store_fs = row["store_fs"] == "True"
+                    obj_save_vn = row["save_vn"] == "True"
+                    obj_is_varlen = row["is_varlen"] == "True"
+                    obj_wu_contig = row["wu_contig"] == "True"
+                    cfg = {"BV": int(row["BV"])}
                     key = (
-                        obj["dtype"],
-                        obj["arch"],
-                        obj["K"],
-                        obj["V"],
-                        obj["BT"],
-                        obj["H"],
-                        obj["Hg"],
-                        obj["T_flat"],
-                        obj["N"],
-                        obj["use_g"],
-                        obj["use_gk"],
-                        obj["use_h0"],
-                        obj["store_fs"],
-                        obj["save_vn"],
-                        obj["is_varlen"],
-                        obj["wu_contig"],
+                        obj_dtype,
+                        obj_arch,
+                        obj_K,
+                        obj_V,
+                        obj_BT,
+                        obj_H,
+                        obj_Hg,
+                        obj_T_flat,
+                        obj_N,
+                        obj_use_g,
+                        obj_use_gk,
+                        obj_use_h0,
+                        obj_store_fs,
+                        obj_save_vn,
+                        obj_is_varlen,
+                        obj_wu_contig,
                     )
-                    _dict[key] = obj["config"]
+                    _dict[key] = cfg
                     sk = _gdn_h_shape_key_no_T(
-                        obj["dtype"],
-                        obj["arch"],
-                        obj["K"],
-                        obj["V"],
-                        obj["BT"],
-                        obj["H"],
-                        obj["Hg"],
-                        obj["N"],
-                        obj["use_g"],
-                        obj["use_gk"],
-                        obj["use_h0"],
-                        obj["store_fs"],
-                        obj["save_vn"],
-                        obj["is_varlen"],
-                        obj["wu_contig"],
+                        obj_dtype,
+                        obj_arch,
+                        obj_K,
+                        obj_V,
+                        obj_BT,
+                        obj_H,
+                        obj_Hg,
+                        obj_N,
+                        obj_use_g,
+                        obj_use_gk,
+                        obj_use_h0,
+                        obj_store_fs,
+                        obj_save_vn,
+                        obj_is_varlen,
+                        obj_wu_contig,
                     )
-                    _t_index.setdefault(sk, []).append((obj["T_flat"], obj["config"]))
+                    _t_index.setdefault(sk, []).append((obj_T_flat, cfg))
         for _v in _t_index.values():
             _v.sort(key=lambda x: x[0])
         GDN_H_GLOBAL_CONFIG_MAP = _dict
@@ -401,7 +417,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         last two dims).
 
     BV-tile selection uses an offline-tuned lookup table
-    (``chunk_gdn_h_tuned.jsonl``) -- mirrors the pattern used by
+    (``chunk_gdn_h_tuned.csv``) -- mirrors the pattern used by
     ``flydsl_gdr_decode``. Shapes not present in the table fall back to
     ``_DEFAULT_BV`` with a one-time warning.
     """

@@ -6,23 +6,23 @@
 """AOT pre-compilation for the FlyDSL chunk-gated-delta-h (K5) kernel.
 
 Reads the offline-tuned BV lookup table
-``aiter/ops/flydsl/chunk_gdn_h_tuned.jsonl`` (the same file consumed at
+``aiter/ops/flydsl/chunk_gdn_h_tuned.csv`` (the same file consumed at
 runtime by ``_lookup_tuned_bv`` in ``linear_attention_prefill_kernels``),
 extracts every unique compile-time configuration, and pre-compiles it
 into the FlyDSL disk cache so that the first inference call does not pay
 the JIT cost.
 
-Each jsonl entry is compiled twice -- once with ``STATE_DTYPE_BF16=False``
+Each csv row is compiled twice -- once with ``STATE_DTYPE_BF16=False``
 (legacy f32-state runtime path) and once with ``STATE_DTYPE_BF16=True``
 (used when the caller passes ``state_dtype=torch.bfloat16``) -- so neither
 runtime path pays a JIT cost on first call.
 
 Usage:
-    # Compile all unique FlyDSL chunk-gdn-h kernels from the default jsonl
+    # Compile all unique FlyDSL chunk-gdn-h kernels from the default csv
     python -m aiter.aot.flydsl.chunk_gdn_h
 
-    # Custom jsonl file(s)
-    python -m aiter.aot.flydsl.chunk_gdn_h --jsonl /path/to/tuned.jsonl
+    # Custom csv file(s)
+    python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 
     # Cross-compile every entry for a different GPU arch (host need not
     # be that GPU; FlyDSL emits ISA for the requested target).
@@ -32,16 +32,16 @@ Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
     ARCH / GPU_ARCHS          Target GPU architecture (logging hint); the
                               actual per-job compile arch comes from the
-                              ``arch`` field of each jsonl entry.
+                              ``arch`` column of each csv row.
     FLYDSL_GPU_ARCH           Per-job arch override applied during compile;
                               ``--target-arch`` takes precedence over both
-                              this env var and the ``arch`` field in jsonl.
+                              this env var and the ``arch`` column in csv.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import csv
 import os
 import sys
 import time
@@ -60,14 +60,10 @@ from aiter.aot.flydsl.common import (
 from aiter.ops.flydsl.kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 
 # Default tuned table lives next to the kernel host wrapper.
-_DEFAULT_JSONL = (
-    Path(__file__).resolve().parents[2] / "ops" / "flydsl" / "chunk_gdn_h_tuned.jsonl"
+_DEFAULT_CSV = (
+    Path(__file__).resolve().parents[2] / "ops" / "flydsl" / "chunk_gdn_h_tuned.csv"
 )
-DEFAULT_JSONLS = [str(_DEFAULT_JSONL)]
-# Alias to match the (DEFAULT_CSVS, parse_csv, compile_one_config) contract
-# expected by ``aiter.aot.flydsl.common.run_aot_worker``. K5 reads jsonl
-# rather than csv, but the worker only cares about the names.
-DEFAULT_CSVS = DEFAULT_JSONLS
+DEFAULT_CSVS = [str(_DEFAULT_CSV)]
 CHUNK_GDN_H_AOT_ARCH_DEFAULT = "gfx950"
 # K5 ships a single kernel today; mirrors the ``@flyc.kernel(name=...)``
 # decorator in ``kernels/chunk_gated_delta_h.py`` so the AOT ``result`` dict
@@ -83,71 +79,79 @@ _TORCH_DTYPE = {
 }
 
 
-def parse_jsonl(jsonl_path: str) -> list[dict[str, Any]]:
-    """Parse the chunk_gdn_h tuned jsonl and return unique compile jobs.
+def _parse_bool(s: str) -> bool:
+    """CSV-friendly bool parser. Tolerates ``"True"``/``"False"`` (Python
+    ``str(bool)`` style, used by gdr_decode_tuned.csv) plus the more
+    permissive ``"1"/"0"``, ``"yes"/"no"`` for handwritten csvs."""
+    s = s.strip()
+    if s in ("True", "true", "1", "yes"):
+        return True
+    if s in ("False", "false", "0", "no"):
+        return False
+    raise ValueError(f"unrecognised bool literal {s!r}")
 
-    Each row in the jsonl already carries every compile-time switch the
-    kernel cares about (K/V/BT/H/Hg/use_g/use_gk/use_h0/store_fs/save_vn/
-    is_varlen/wu_contig) plus the offline-tuned ``BV``. We only keep the
-    fields that actually influence MLIR compilation; ``T_flat``/``N`` and
+
+def parse_csv(csv_path: str) -> list[dict[str, Any]]:
+    """Parse the chunk_gdn_h tuned csv and return unique compile jobs.
+
+    Each row already carries every compile-time switch the kernel cares
+    about (K/V/BT/H/Hg/use_g/use_gk/use_h0/store_fs/save_vn/is_varlen/
+    wu_contig) plus the offline-tuned ``BV``. We only keep the fields
+    that actually influence MLIR compilation; ``T_flat``/``N`` and
     ``duration`` are dropped (they affect the host launch grid, not the
     compiled artifact).
     """
     jobs: list[dict[str, Any]] = []
     seen: set[tuple] = set()
 
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError as e:
-                print(f"  [WARN] bad jsonl line in {jsonl_path}: {e}")
-                continue
-
-            dtype = obj.get("dtype", "torch.bfloat16")
+    with open(csv_path, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            dtype = row.get("dtype", "torch.bfloat16")
             if dtype not in _TORCH_DTYPE:
                 print(f"  [WARN] Unsupported dtype {dtype!r}, skipping")
                 continue
 
             try:
-                bv = int(obj["config"]["BV"])
-                k = int(obj["K"])
-                v = int(obj["V"])
+                bv = int(row["BV"])
+                k = int(row["K"])
+                v = int(row["V"])
             except (KeyError, TypeError, ValueError) as e:
-                print(f"  [WARN] malformed entry in {jsonl_path}: {e}")
+                print(f"  [WARN] malformed row in {csv_path}: {e}")
                 continue
 
             if v % bv != 0 or bv > v:
                 print(
-                    f"  [WARN] BV={bv} does not divide V={v}, skipping entry "
-                    f"in {jsonl_path}"
+                    f"  [WARN] BV={bv} does not divide V={v}, skipping row "
+                    f"in {csv_path}"
                 )
                 continue
 
-            job = {
-                "dtype": dtype,
-                "arch": obj.get("arch", CHUNK_GDN_H_AOT_ARCH_DEFAULT),
-                "K": k,
-                "V": v,
-                "BT": int(obj.get("BT", 64)),
-                "BV": bv,
-                "H": int(obj["H"]),
-                "Hg": int(obj["Hg"]),
-                "use_g": bool(obj.get("use_g", True)),
-                "use_gk": bool(obj.get("use_gk", False)),
-                "use_h0": bool(obj.get("use_h0", True)),
-                "store_fs": bool(obj.get("store_fs", False)),
-                "save_vn": bool(obj.get("save_vn", True)),
-                "is_varlen": bool(obj.get("is_varlen", False)),
-                "wu_contig": bool(obj.get("wu_contig", True)),
-                # state dtype is not tracked in the tuned jsonl yet; default
-                # f32 here, then main() unconditionally fans out into a bf16
-                # twin so both runtime paths are pre-compiled.
-                "state_bf16": False,
-            }
+            try:
+                job = {
+                    "dtype": dtype,
+                    "arch": row.get("arch") or CHUNK_GDN_H_AOT_ARCH_DEFAULT,
+                    "K": k,
+                    "V": v,
+                    "BT": int(row.get("BT") or 64),
+                    "BV": bv,
+                    "H": int(row["H"]),
+                    "Hg": int(row["Hg"]),
+                    "use_g": _parse_bool(row.get("use_g") or "True"),
+                    "use_gk": _parse_bool(row.get("use_gk") or "False"),
+                    "use_h0": _parse_bool(row.get("use_h0") or "True"),
+                    "store_fs": _parse_bool(row.get("store_fs") or "False"),
+                    "save_vn": _parse_bool(row.get("save_vn") or "True"),
+                    "is_varlen": _parse_bool(row.get("is_varlen") or "False"),
+                    "wu_contig": _parse_bool(row.get("wu_contig") or "True"),
+                    # state dtype is not tracked in the tuned csv yet; default
+                    # f32 here, then main() unconditionally fans out into a
+                    # bf16 twin so both runtime paths are pre-compiled.
+                    "state_bf16": False,
+                }
+            except (KeyError, ValueError) as e:
+                print(f"  [WARN] malformed row in {csv_path}: {e}")
+                continue
+
             key = job_identity(job)
             if key in seen:
                 continue
@@ -155,11 +159,6 @@ def parse_jsonl(jsonl_path: str) -> list[dict[str, Any]]:
             jobs.append(job)
 
     return jobs
-
-
-# Alias to match the contract expected by
-# ``aiter.aot.flydsl.common.run_aot_worker``.
-parse_csv = parse_jsonl
 
 
 def _torch_dtype_for_kernel(dtype_str: str):
@@ -351,42 +350,42 @@ def compile_one_config(
 def main():
     parser = argparse.ArgumentParser(
         description="AOT pre-compile FlyDSL chunk-gated-delta-h kernels "
-        "from the offline-tuned jsonl table",
+        "from the offline-tuned csv table",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
-        "--jsonl",
+        "--csv",
         type=str,
         nargs="+",
-        default=DEFAULT_JSONLS,
-        help="Path(s) to tuned jsonl file(s); defaults to "
-        "aiter/ops/flydsl/chunk_gdn_h_tuned.jsonl",
+        default=DEFAULT_CSVS,
+        help="Path(s) to tuned csv file(s); defaults to "
+        "aiter/ops/flydsl/chunk_gdn_h_tuned.csv",
     )
     parser.add_argument(
         "--target-arch",
         type=str,
         default=None,
-        help="Override the ``arch`` field of every jsonl entry; useful for "
+        help="Override the ``arch`` column of every csv row; useful for "
         "cross-compiling on a host whose GPU differs from the tuned arch "
         "(e.g. ``--target-arch gfx942`` on a gfx950 box).",
     )
     args = parser.parse_args()
 
-    jsonl_paths = [os.path.abspath(p) for p in args.jsonl]
-    for jsonl_path in jsonl_paths:
-        if not os.path.isfile(jsonl_path):
-            print(f"Error: jsonl file not found: {jsonl_path}")
+    csv_paths = [os.path.abspath(p) for p in args.csv]
+    for csv_path in csv_paths:
+        if not os.path.isfile(csv_path):
+            print(f"Error: csv file not found: {csv_path}")
             sys.exit(1)
 
     cache_dir = os.path.expanduser(
         os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
     )
-    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(from jsonl)"
+    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(from csv)"
 
-    all_jobs = collect_aot_jobs(jsonl_paths, parse_jsonl)
+    all_jobs = collect_aot_jobs(csv_paths, parse_csv)
 
     # ``--target-arch`` rewrites the ``arch`` field of every job, then we
-    # dedupe again because two jsonl entries that differed only in arch
+    # dedupe again because two csv rows that differed only in arch
     # collapse to the same compile after the override.
     if args.target_arch and all_jobs:
         all_jobs = dedupe_jobs([dict(j, arch=args.target_arch) for j in all_jobs])
@@ -400,13 +399,13 @@ def main():
     print("=" * 72)
     print("FlyDSL chunk-gated-delta-h AOT Pre-compilation")
     print("=" * 72)
-    for jsonl_path in jsonl_paths:
-        print(f"  jsonl:            {jsonl_path}")
+    for csv_path in csv_paths:
+        print(f"  csv:              {csv_path}")
     print(f"  Total jobs:       {len(all_jobs)}")
     if args.target_arch:
         print(f"  Compile arch:     {args.target_arch} (overridden by --target-arch)")
     else:
-        print("  Compile arch:     (from jsonl 'arch' field)")
+        print("  Compile arch:     (from csv 'arch' column)")
     print(f"  Cache dir:        {cache_dir}")
     print(f"  Target arch:      {arch}")
     print("=" * 72)

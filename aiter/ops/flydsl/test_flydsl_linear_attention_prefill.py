@@ -97,7 +97,7 @@ _exp2 = tl.math.exp2
     }
 )
 @triton.jit(do_not_specialize=["T"])
-def _chunk_gated_delta_rule_fwd_kernel_h_origin_opt(
+def chunk_gated_delta_rule_fwd_kernel_h_origin_opt(
     k,
     v,
     w,
@@ -294,7 +294,7 @@ def _chunk_gated_delta_rule_fwd_kernel_h_origin_opt(
             tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
 
-_TRITON_ORIGIN_OPT_KERNEL = _chunk_gated_delta_rule_fwd_kernel_h_origin_opt
+_TRITON_ORIGIN_OPT_KERNEL = chunk_gated_delta_rule_fwd_kernel_h_origin_opt
 
 
 def chunk_gated_delta_rule_fwd_h_origin_opt(
