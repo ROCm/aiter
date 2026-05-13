@@ -129,19 +129,19 @@ def fp8_mqa_logits(
         )
     else:
         num_buffers = 2
-
+        USE_FOLDED_REDUCTION = FOLDED_REDUCTED_SUPPORT and num_heads > 16
         if arch == "gfx950":
             num_buffers = 2
             loop_variant = 0
             waves_per_eu = 3
-            num_chains = 4 if FOLDED_REDUCTED_SUPPORT else 0
+            num_chains = 4 if USE_FOLDED_REDUCTION else 0
             num_warps = 1
             block_kv = 32
             other = {"USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED}
         else:
             loop_variant = 1
             waves_per_eu = 1
-            num_chains = 8 if FOLDED_REDUCTED_SUPPORT else 0
+            num_chains = 8 if USE_FOLDED_REDUCTION else 0
             num_warps = 4
             block_kv = 128
             other = {"LOOP_VARIANT": loop_variant}
