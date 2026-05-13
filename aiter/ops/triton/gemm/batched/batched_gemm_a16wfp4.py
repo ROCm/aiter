@@ -42,6 +42,14 @@ def batched_gemm_a16wfp4_fake_tensor(
     if y is None:
         Bx, M, _ = x.shape
         _, N, _ = w.shape
+        # Match the real kernel's allocation (lines 100-103 of this file).
+        # Returning ``(Bx, M, N)`` regardless of ``transpose_bm`` causes
+        # ``torch.compile`` to specialize the leading SymInt of the BMM
+        # output to ``Bx`` whenever a downstream op constrains it (e.g. a
+        # ``torch.cat`` on ``dim=-1`` with a tensor of shape ``(M, Bx, K)``),
+        # silently baking the wrong static slice into the captured graph.
+        if transpose_bm:
+            return torch.empty((M, Bx, N), dtype=dtype, device=x.device)
         return torch.empty((Bx, M, N), dtype=dtype, device=x.device)
     return y
 
