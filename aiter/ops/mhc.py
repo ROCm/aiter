@@ -98,7 +98,7 @@ def mhc_pre(
         if (hc_hidden_size % tile_k) != 0:
             continue
         meanwhile_tg = num_cu * tg_per_cu
-        for splitk in range(1, 33):
+        for splitk in range(1, num_cu + 1):
             if hc_hidden_size % (splitk * tile_k) != 0 or (hc_hidden_size // splitk) < (
                 tile_k * prefetch_stages
             ):
@@ -111,7 +111,7 @@ def mhc_pre(
                 selected_tile_k = tile_k
                 selected_score = score
             # print(f"{selected_score=} {selected_splitk=} {selected_tile_k=} {score=} {splitk=} {tile_k=}")
-            if num_tg > meanwhile_tg * 4:
+            if num_tg > meanwhile_tg * 2:
                 break
 
     device = residual.device
