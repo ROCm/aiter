@@ -46,7 +46,7 @@ def batched_gemm_a16wfp4_fake_tensor(
     return y
 
 
-@torch_compile_guard(gen_fake=batched_gemm_a16wfp4_fake_tensor)
+@torch_compile_guard(mutates_args=["y"], gen_fake=batched_gemm_a16wfp4_fake_tensor)
 def batched_gemm_a16wfp4_(
     x: torch.Tensor,
     w: torch.Tensor,

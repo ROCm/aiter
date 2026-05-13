@@ -189,3 +189,43 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
     batched_gemm_a16wfp4(x, w, w_scales, dtype, out, transpose_bm=False, prequant=True)
 
     torch.testing.assert_close(torch_out, out)
+
+
+def test_batched_gemm_a16wfp4_schema_mutates_only_y():
+    """Lock the mutation contract: only ``y`` is mutated by the kernel.
+
+    AITER's ``torch_compile_guard`` decorator defaults ``mutates_args`` to
+    ``"unknown"``, which marks every Tensor argument of the wrapped op as
+    in-place mutated (``Tensor(aN!)`` in the schema). For
+    ``batched_gemm_a16wfp4_`` the kernel only writes to ``y``, so the op
+    must declare ``mutates_args=["y"]`` explicitly. Otherwise AOTAutograd
+    inserts spurious ``auto_functionalized()`` writeback chains on the
+    read-only inputs, which break downstream FX pattern matchers and inflate
+    cudagraph capture peak memory.
+    """
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    op = torch.ops.aiter.batched_gemm_a16wfp4_
+    schemas = list(op._schemas.values())
+    assert len(schemas) == 1, f"unexpected overload set: {schemas}"
+    schema_str = str(schemas[0])
+
+    # The post-fix schema must NOT have alias annotations on x / w / w_scales /
+    # y_scale -- those are read-only inputs.
+    for read_only_arg in ("Tensor x", "Tensor w", "Tensor w_scales"):
+        assert (
+            read_only_arg in schema_str
+        ), f"expected unannotated `{read_only_arg}` in schema, got: {schema_str}"
+        bad = read_only_arg.replace("Tensor", "Tensor(a")
+        assert (
+            bad not in schema_str
+        ), f"read-only arg appears as mutating in schema: {schema_str}"
+    assert (
+        "Tensor? y_scale" in schema_str
+    ), f"expected unannotated `Tensor? y_scale` in schema, got: {schema_str}"
+
+    # The post-fix schema MUST still mark `y` as mutating (`Tensor(aN!)?`).
+    assert (
+        "Tensor(a" in schema_str and "!)? y=None" in schema_str
+    ), f"expected `y` to remain a mutating optional tensor, got: {schema_str}"
