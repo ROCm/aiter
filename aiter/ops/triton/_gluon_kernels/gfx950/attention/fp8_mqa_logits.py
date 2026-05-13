@@ -1,14 +1,8 @@
-from packaging.version import Version
-
-import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 from triton.language.core import PropagateNan
-
-TRITON_VERSION = Version(triton.__version__)
-TRITON_BEYOND_37 = TRITON_VERSION >= Version("3.7.0")
 
 SUPPORTED_ARCHS = ("gfx950",)
 
@@ -75,11 +69,11 @@ def _store_logits_block(
 
 @gluon.constexpr_function
 def _offset_bases_to_blocked(offset_bases, contiguity, num_warps, warp_size, shape):
-    # Mirrors Triton's CoalesceAsyncCopy partition: 
+    # Mirrors Triton's CoalesceAsyncCopy partition:
     # lg2(C) bases to reg,
-    # lg2(WS) to lane, 
-    # lg2(NW) to warp, 
-    # leftovers back to reg. 
+    # lg2(WS) to lane,
+    # lg2(NW) to warp,
+    # leftovers back to reg.
     # Keeps the blocked layout in sync with the shared layout so async-copy folds.
     rank = len(shape)
     lg2_c = contiguity.bit_length() - 1
@@ -106,13 +100,15 @@ def _offset_bases_to_blocked(offset_bases, contiguity, num_warps, warp_size, sha
 
 
 @gluon.constexpr_function
-def _make_kv_load_layouts_cdna4(HEAD_SIZE, BLOCK_KV, NUM_WARPS, WARP_SIZE):
+def _make_kv_load_layouts_cdna4(
+    HEAD_SIZE, BLOCK_KV, NUM_WARPS, WARP_SIZE, USE_PADDED_SHARED_LAYOUT
+):
     # K [HEAD_SIZE, BLOCK_KV] fp8 layouts. XOR-swizzle dim1
     # to break LDS bank-conflict periodicity + interval padding every 1 KiB;
     # the matching blocked layout lets CoalesceAsyncCopy fold async-copy +
     # shared store. Older Triton: simple fallback.
     CONTIGUITY = 16  # 128-bit vector / 8-bit fp8
-    if TRITON_BEYOND_37:
+    if USE_PADDED_SHARED_LAYOUT:
         LG2_HS = HEAD_SIZE.bit_length() - 1
         LG2_TS = BLOCK_KV.bit_length() - 1
         LG2_C = CONTIGUITY.bit_length() - 1
@@ -155,12 +151,21 @@ class MQAAsyncKVLoaderConfig:
     shared: gl.constexpr
 
     @gluon.constexpr_function
-    def __init__(self, BLOCK_KV, HEAD_SIZE, NUM_WARPS, WARP_SIZE, NUM_BUFFERS):
+    def __init__(
+        self,
+        BLOCK_KV,
+        HEAD_SIZE,
+        NUM_WARPS,
+        WARP_SIZE,
+        NUM_BUFFERS,
+        USE_PADDED_SHARED_LAYOUT,
+    ):
         blocked, shared = _make_kv_load_layouts_cdna4(
             HEAD_SIZE,
             BLOCK_KV,
             NUM_WARPS,
             WARP_SIZE,
+            USE_PADDED_SHARED_LAYOUT,
         )
         self.BLOCK_KV = gl.constexpr(BLOCK_KV)
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
@@ -202,9 +207,15 @@ class MQAAsyncKVLoader:
         NUM_WARPS: gl.constexpr,
         WARP_SIZE: gl.constexpr,
         NUM_BUFFERS: gl.constexpr,
+        USE_PADDED_SHARED_LAYOUT: gl.constexpr,
     ):
         kv_cfg = MQAAsyncKVLoaderConfig(
-            BLOCK_KV, HEAD_SIZE, NUM_WARPS, WARP_SIZE, NUM_BUFFERS
+            BLOCK_KV,
+            HEAD_SIZE,
+            NUM_WARPS,
+            WARP_SIZE,
+            NUM_BUFFERS,
+            USE_PADDED_SHARED_LAYOUT,
         )
         kv_shared = gl.allocate_shared_memory(
             KV_ptr.type.element_ty,
@@ -389,7 +400,7 @@ def _weighted_sum_fma_fold(
         folded_count: gl.constexpr = plan[4]
 
         w = w_col.broadcast_to([NUM_HEADS, BLOCK_KV])
-        s = s.reshape((head_bit_shape)).permute(head_bit_order).reshape(folded_shape)
+        s = s.reshape(head_bit_shape).permute(head_bit_order).reshape(folded_shape)
         w = w.reshape(head_bit_shape).permute(head_bit_order).reshape(folded_shape)
         s = _weighted_fma_fold_serial(s, w, folded_count, fold_depth)
         s = gl.sum(s, axis=2)  # combine parallel chains
@@ -420,8 +431,6 @@ def mqa_logits_loop_double_buf(
 ):
     store_arange = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, mfma_layout))
     store_offsets = store_arange * stride_logits_k
-
-    # Clamp OOB prefetches back to the last in-bounds tile
 
     kv_pos = start_ind
     kv_scales_off: gl.int32 = 0
@@ -587,6 +596,7 @@ def _gluon_fp8_mqa_logits_kernel(
     NUM_CHAINS: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
+    USE_PADDED_SHARED_LAYOUT: gl.constexpr,
 ):
 
     gl.static_assert(
@@ -643,6 +653,7 @@ def _gluon_fp8_mqa_logits_kernel(
         NUM_WARPS,
         WARP_SIZE,
         NUM_BUFFERS,
+        USE_PADDED_SHARED_LAYOUT,
     )
 
     q = gl.amd.cdna4.buffer_load(

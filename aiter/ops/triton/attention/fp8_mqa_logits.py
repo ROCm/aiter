@@ -3,9 +3,9 @@ import torch
 from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
-import triton
 from aiter.ops.triton.utils._triton import arch_info
-from packaging.version import Version
+from triton.experimental.gluon.language.amd.cdna4 import async_copy
+import inspect
 
 arch = arch_info.get_arch()
 if arch == "gfx950":
@@ -19,8 +19,38 @@ elif arch == "gfx1250":
 else:
     _gluon_fp8_mqa_logits_kernel = None
 
-TRITON_VERSION = Version(triton.__version__)
-TRITON_BEYOND_37 = TRITON_VERSION > Version("3.7.0")
+
+# Hacks to see if we can use some newer features
+# TODO: remove when the next Triton release happens so we can rely on version
+# Latest official release do not have these features
+def _async_copy_accepts_distributed_layout() -> bool:
+    try:
+        src = inspect.getsource(async_copy.global_load_to_shared)
+    except (OSError, TypeError):
+        return False
+    return "DistributedLayout" in src
+
+
+def _permute_accepts_constexpr_tuple() -> bool:
+    """
+    True iff Triton's _unwrap_iterable unwraps an inner constexpr.
+
+    On versions before PR #9751 (commit 0688e7736a), passing a constexpr-wrapped
+    tuple as the sole arg to permute/trans/reshape leaves the constexpr wrapped,
+    causing `len(constexpr)` to fail in semantic.permute. After #9751, it gets
+    unwrapped to a raw tuple of ints.
+    """
+    try:
+        from triton.language.core import _unwrap_iterable, constexpr
+    except ImportError:
+        return False
+    probe = constexpr((0, 1, 2))
+    result = _unwrap_iterable((probe,))
+    return not isinstance(result, constexpr)
+
+
+ASYNC_COPY_SUPPORTS_DISTRIBUTED = _async_copy_accepts_distributed_layout()
+FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 
 
 def fp8_mqa_logits(
@@ -104,17 +134,17 @@ def fp8_mqa_logits(
             num_buffers = 2
             loop_variant = 0
             waves_per_eu = 3
-            num_chains = 4 if TRITON_BEYOND_37 else 0
+            num_chains = 4 if FOLDED_REDUCTED_SUPPORT else 0
             num_warps = 1
             block_kv = 32
-            other = {}
+            other = {"USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED}
         else:
             loop_variant = 1
             waves_per_eu = 1
-            num_chains = 8
+            num_chains = 8 if FOLDED_REDUCTED_SUPPORT else 0
             num_warps = 4
             block_kv = 128
-            other = {"LOOP_VARIANT":loop_variant}
+            other = {"LOOP_VARIANT": loop_variant}
 
         # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
         # Fall back to plain global load/store when a tensor exceeds that.
