@@ -868,6 +868,126 @@ def _bwd_dkv_hg_fused(
 
 
 # =====================================================================
+# Backward method="privatized" — dKV kernel with copy-based privatization
+# =====================================================================
+@triton.jit
+def _bwd_dkv_privatized(
+    Q_T_ptr,            # [T, D_QK, H] bf16
+    dO_T_ptr,           # [T, D_V,  H] bf16
+    dS_ptr,             # [T, H, TOPK] bf16
+    P_ptr,              # [T, H, TOPK] bf16
+    TopK_ptr,           # [T, TOPK] int32
+    dKV_copies_ptr,     # [NUM_COPIES, T, D_QK] fp32
+    stride_qt_t: tl.int64,
+    stride_dot_t: tl.int64,
+    stride_ds_t: tl.int64,
+    stride_ds_h: tl.int64,
+    stride_topk_t: tl.int64,
+    stride_copies: tl.int64,   # T * D_QK — gap between consecutive copies
+    stride_dkv_t: tl.int64,   # D_QK
+    num_heads: tl.int32,
+    TOPK: tl.constexpr,
+    TILE_K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NUM_HG: tl.constexpr,
+    NUM_COPIES: tl.constexpr,
+    D_V: tl.constexpr,
+    D_ROPE: tl.constexpr,
+):
+    """
+    Privatized dKV scatter kernel.
+
+    Grid: (total_tokens,) -- one program per query token.
+    Routes atomic_add to copy (token_idx % NUM_COPIES), so each copy
+    receives only TOPK/NUM_COPIES writers per address instead of TOPK.
+    A separate reduction kernel sums the copies afterward.
+    """
+    token_idx = tl.program_id(0)
+    copy_idx = token_idx % NUM_COPIES
+
+    NUM_TILES: tl.constexpr = (TOPK + TILE_K - 1) // TILE_K
+    topk_base = token_idx * stride_topk_t
+    offs_tile = tl.arange(0, TILE_K)
+    offs_v = tl.arange(0, D_V)
+    offs_r = tl.arange(0, D_ROPE)
+
+    copy_base = copy_idx * stride_copies
+
+    for t in range(NUM_TILES):
+        tile_start = t * TILE_K
+        tile_offs = tile_start + offs_tile
+        topk_pos = tl.load(TopK_ptr + topk_base + tile_offs,
+                           mask=tile_offs < TOPK, other=-1)
+        valid = (tile_offs < TOPK) & (topk_pos != -1)
+        safe_pos = tl.where(valid, topk_pos, 0)
+
+        dKV_lora = tl.zeros([D_V,    TILE_K], dtype=tl.float32)
+        dKV_rope = tl.zeros([D_ROPE, TILE_K], dtype=tl.float32)
+
+        for hg in range(NUM_HG):
+            offs_h = hg * BLOCK_H + tl.arange(0, BLOCK_H)
+            mask_h = offs_h < num_heads
+
+            qt_base = token_idx * stride_qt_t
+            Q_lora_T = tl.load(
+                Q_T_ptr + qt_base + offs_v[:, None] * num_heads + offs_h[None, :],
+                mask=mask_h[None, :], other=0.0,
+            )
+            Q_rope_T = tl.load(
+                Q_T_ptr + qt_base + (D_V + offs_r[:, None]) * num_heads + offs_h[None, :],
+                mask=mask_h[None, :], other=0.0,
+            )
+            dot_base = token_idx * stride_dot_t
+            dO_T = tl.load(
+                dO_T_ptr + dot_base + offs_v[:, None] * num_heads + offs_h[None, :],
+                mask=mask_h[None, :], other=0.0,
+            )
+            ds_base = token_idx * stride_ds_t
+            dS_val = tl.load(
+                dS_ptr + ds_base + offs_h[:, None] * stride_ds_h + tile_offs[None, :],
+                mask=mask_h[:, None] & (tile_offs[None, :] < TOPK), other=0.0,
+            )
+            P_val = tl.load(
+                P_ptr + ds_base + offs_h[:, None] * stride_ds_h + tile_offs[None, :],
+                mask=mask_h[:, None] & (tile_offs[None, :] < TOPK), other=0.0,
+            )
+
+            dKV_lora += tl.dot(Q_lora_T, dS_val.to(Q_lora_T.dtype)).to(tl.float32)
+            dKV_lora += tl.dot(dO_T,     P_val.to(dO_T.dtype)).to(tl.float32)
+            dKV_rope += tl.dot(Q_rope_T, dS_val.to(Q_rope_T.dtype)).to(tl.float32)
+
+        # Scatter into this token's private copy — NUM_COPIES times fewer writers
+        dkv_lora_ptrs = (dKV_copies_ptr + copy_base
+                         + safe_pos[None, :] * stride_dkv_t + offs_v[:, None])
+        tl.atomic_add(dkv_lora_ptrs, dKV_lora, mask=valid[None, :], sem="relaxed")
+
+        dkv_rope_ptrs = (dKV_copies_ptr + copy_base
+                         + safe_pos[None, :] * stride_dkv_t + (D_V + offs_r[:, None]))
+        tl.atomic_add(dkv_rope_ptrs, dKV_rope, mask=valid[None, :], sem="relaxed")
+
+
+@triton.jit
+def _bwd_dkv_reduce_copies(
+    dKV_copies_ptr,     # [NUM_COPIES * T * D_QK] fp32, flattened
+    dKV_ptr,            # [T * D_QK] fp32, flattened
+    stride_copies: tl.int64,   # T * D_QK
+    total_elems: tl.int32,
+    NUM_COPIES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Sum NUM_COPIES privatized dKV buffers element-wise into dKV."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_elems
+
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for k in tl.static_range(NUM_COPIES):
+        acc += tl.load(dKV_copies_ptr + k * stride_copies + offs,
+                       mask=mask, other=0.0)
+    tl.store(dKV_ptr + offs, acc, mask=mask)
+
+
+# =====================================================================
 # Python wrappers
 # =====================================================================
 def sparse_mla_fwd(q, kv, topk_indices, kv_lora_rank=512, scale=None):
@@ -937,6 +1057,8 @@ def sparse_mla_bwd(q, kv, o, do, topk_indices, lse, kv_lora_rank=512, scale=None
             "fused"              -- single fused kernel (58ms, no extra memory)
             "recompute"          -- split dQ+dKV, full recomputation (49ms, 0 extra)
             "split_intermediate" -- split dQ+dKV, stores dS/P (35ms, 2 GiB extra)
+            "privatized"         -- split dQ+dKV, privatized dKV scatter (experimental)
+                                    num_copies=8 reduces atomic serialization depth by 8x
 
     Returns:
         dq:  [total_tokens, num_heads, d_qk] same dtype as q
@@ -1061,9 +1183,59 @@ def sparse_mla_bwd(q, kv, o, do, topk_indices, lse, kv_lora_rank=512, scale=None
             num_warps=nw_dkv, num_stages=1,
         )
 
+    elif method == "privatized":
+        num_copies = 8
+        bh, tk_dq, nw_dq, ns_dq = 64, 16, 4, 2
+        tk_dkv, nw_dkv = 64, 4
+        num_hg = triton.cdiv(num_heads, bh)
+
+        dS_buf = torch.zeros(total_tokens, num_heads, topk, dtype=torch.bfloat16, device=q.device)
+        P_buf = torch.zeros(total_tokens, num_heads, topk, dtype=torch.bfloat16, device=q.device)
+
+        grid_dq = (total_tokens, num_hg)
+        _bwd_dq_store_intermediates[grid_dq](
+            q, kv, do, topk_indices, lse, delta,
+            dq, dS_buf, P_buf,
+            q.stride(0), q.stride(1), kv.stride(0),
+            do.stride(0), do.stride(1),
+            dq.stride(0), dq.stride(1),
+            topk_indices.stride(0),
+            dS_buf.stride(0), dS_buf.stride(1),
+            scale, num_heads,
+            TOPK=topk, BLOCK_H=bh, TILE_K=tk_dq,
+            D_V=kv_lora_rank, D_ROPE=rope_rank,
+            num_warps=nw_dq, num_stages=ns_dq,
+        )
+
+        stride_copies = total_tokens * d_qk
+        dkv_copies = torch.zeros(num_copies * stride_copies, dtype=torch.float32, device=q.device)
+
+        grid_dkv = (total_tokens,)
+        _bwd_dkv_privatized[grid_dkv](
+            q_t, do_t, dS_buf, P_buf, topk_indices, dkv_copies,
+            q_t.stride(0), do_t.stride(0),
+            dS_buf.stride(0), dS_buf.stride(1),
+            topk_indices.stride(0),
+            stride_copies, d_qk,
+            num_heads,
+            TOPK=topk, TILE_K=tk_dkv, BLOCK_H=bh,
+            NUM_HG=num_hg, NUM_COPIES=num_copies,
+            D_V=kv_lora_rank, D_ROPE=rope_rank,
+            num_warps=nw_dkv, num_stages=1,
+        )
+
+        total_elems = total_tokens * d_qk
+        reduce_block = 1024
+        grid_reduce = (triton.cdiv(total_elems, reduce_block),)
+        _bwd_dkv_reduce_copies[grid_reduce](
+            dkv_copies, dkv,
+            stride_copies, total_elems,
+            NUM_COPIES=num_copies, BLOCK=reduce_block,
+        )
+
     else:
         raise ValueError(f"Unknown backward method: {method!r}. "
-                         f"Choose from 'fused', 'recompute', 'split_intermediate'.")
+                         f"Choose from 'fused', 'recompute', 'split_intermediate', 'privatized'.")
 
     dkv_out = dkv.unsqueeze(1).to(kv.dtype)
     return dq, dkv_out

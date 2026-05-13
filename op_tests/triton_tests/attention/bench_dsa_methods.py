@@ -1,15 +1,16 @@
 """
-Benchmark and correctness test for all 3 backward methods in deepseek_sparse_attention.py.
+Benchmark and correctness test for all 4 backward methods in deepseek_sparse_attention.py.
 
 Usage:
-  python bench_dsa_methods.py                   # correctness + benchmark (all 3 methods)
+  python bench_dsa_methods.py                   # correctness + benchmark (all 4 methods)
   python bench_dsa_methods.py --bench-only      # benchmark only
   python bench_dsa_methods.py --test-only       # correctness only
 
-Three backward strategies:
+Four backward strategies:
   1. "fused"              — single fused kernel (baseline)
   2. "recompute"          — split dQ+dKV, full S/P/dS recomputation (1.18x, 0 extra memory)
   3. "split_intermediate" — split dQ+dKV, stores dS/P intermediates (1.68x, 2 GiB extra)
+  4. "privatized"         — split dQ+dKV, 8 private dKV copies (experimental)
 """
 import sys
 import os
@@ -24,7 +25,7 @@ from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import
     sparse_mla_train,
 )
 
-METHODS = ["fused", "recompute", "split_intermediate"]
+METHODS = ["fused", "recompute", "split_intermediate", "privatized"]
 
 
 # =====================================================================
@@ -35,7 +36,7 @@ def test_methods_agree(
     kv_lora_rank=512, rope_rank=64, topk=128,
     device="cuda",
 ):
-    """Verify all 3 backward methods produce the same dQ and dKV."""
+    """Verify all 4 backward methods produce the same dQ and dKV."""
     d_qk = kv_lora_rank + rope_rank
     total_tokens = batch * seq_len
     scale = 1.0 / (d_qk ** 0.5)
@@ -86,7 +87,7 @@ def test_autograd_methods(
     kv_lora_rank=256, rope_rank=64, topk=64,
     device="cuda",
 ):
-    """Verify autograd works with all 3 backward methods."""
+    """Verify autograd works with all 4 backward methods."""
     d_qk = kv_lora_rank + rope_rank
     total_tokens = batch * seq_len
     scale = 1.0 / (d_qk ** 0.5)
@@ -143,7 +144,7 @@ def benchmark_methods(
     kv_lora_rank=512, rope_rank=64, topk=1024,
     device="cuda", reps=50,
 ):
-    """Benchmark all 3 backward methods side-by-side."""
+    """Benchmark all 4 backward methods side-by-side."""
     d_qk = kv_lora_rank + rope_rank
     total_tokens = batch * seq_len
     scale = 1.0 / (d_qk ** 0.5)
@@ -185,7 +186,13 @@ def benchmark_methods(
             speedup = baseline_ms / ms
 
             if method == "split_intermediate":
+                # dS + P buffers: [T, H, TOPK] bf16 each
                 extra = f"{total_tokens * num_heads * topk * 2 * 2 / 1024**3:.1f} GiB"
+            elif method == "privatized":
+                # dS + P buffers (same as split_intermediate) + 8 dKV copies (fp32)
+                ds_p = total_tokens * num_heads * topk * 2 * 2
+                dkv_copies = 8 * total_tokens * d_qk * 4
+                extra = f"{(ds_p + dkv_copies) / 1024**3:.1f} GiB"
             else:
                 extra = "0"
 
@@ -242,7 +249,7 @@ def main():
 
     if not args.bench_only:
         print("\n" + "=" * 64)
-        print("  CORRECTNESS: All 3 backward methods agree")
+        print("  CORRECTNESS: All 4 backward methods agree")
         print("=" * 64)
 
         all_ok = True
@@ -251,7 +258,7 @@ def main():
         all_ok &= test_methods_agree(1, 256, 128, 512, 64, 128, device)
 
         print("\n" + "=" * 64)
-        print("  CORRECTNESS: Autograd with all 3 methods")
+        print("  CORRECTNESS: Autograd with all 4 methods")
         print("=" * 64)
         all_ok &= test_autograd_methods(device=device)
 
@@ -279,7 +286,7 @@ def main():
                 print(f"  SKIPPED {cfg}: {e}")
 
         print("\n" + "=" * 64)
-        print("  BENCHMARK: Backward (3 methods)")
+        print("  BENCHMARK: Backward (4 methods)")
         print("=" * 64)
         bwd_configs = [
             (1, 4096, 128, 512, 64, 1024),
