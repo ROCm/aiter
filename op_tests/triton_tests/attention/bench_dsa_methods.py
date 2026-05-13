@@ -1,16 +1,17 @@
 """
-Benchmark and correctness test for all 4 backward methods in deepseek_sparse_attention.py.
+Benchmark and correctness test for all 5 backward methods in deepseek_sparse_attention.py.
 
 Usage:
-  python bench_dsa_methods.py                   # correctness + benchmark (all 4 methods)
+  python bench_dsa_methods.py                   # correctness + benchmark (all 5 methods)
   python bench_dsa_methods.py --bench-only      # benchmark only
   python bench_dsa_methods.py --test-only       # correctness only
 
-Four backward strategies:
+Five backward strategies:
   1. "fused"              — single fused kernel (baseline)
   2. "recompute"          — split dQ+dKV, full S/P/dS recomputation (1.18x, 0 extra memory)
   3. "split_intermediate" — split dQ+dKV, stores dS/P intermediates (1.68x, 2 GiB extra)
-  4. "privatized"         — split dQ+dKV, 8 private dKV copies (experimental)
+  4. "privatized"         — split dQ+dKV, 8 private dKV copies (token_idx%8 routing)
+  5. "xcd_privatized"     — split dQ+dKV, 8 XCD-local copies (MI300X: (i%304)//38 routing)
 """
 import sys
 import os
@@ -25,7 +26,7 @@ from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import
     sparse_mla_train,
 )
 
-METHODS = ["fused", "recompute", "split_intermediate", "privatized"]
+METHODS = ["fused", "recompute", "split_intermediate", "privatized", "xcd_privatized"]
 
 
 # =====================================================================
@@ -188,7 +189,7 @@ def benchmark_methods(
             if method == "split_intermediate":
                 # dS + P buffers: [T, H, TOPK] bf16 each
                 extra = f"{total_tokens * num_heads * topk * 2 * 2 / 1024**3:.1f} GiB"
-            elif method == "privatized":
+            elif method in ("privatized", "xcd_privatized"):
                 # dS + P buffers (same as split_intermediate) + 8 dKV copies (fp32)
                 ds_p = total_tokens * num_heads * topk * 2 * 2
                 dkv_copies = 8 * total_tokens * d_qk * 4
