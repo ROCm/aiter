@@ -60,6 +60,7 @@ def fp8_mqa_logits(
     weights,
     cu_starts,
     cu_ends,
+    clean_logits=True,
 ):
     """
     This function computes the logits to be used by a topk function for sparse attention.
@@ -70,24 +71,36 @@ def fp8_mqa_logits(
     weights:     [seq_len, NUM_HEADS], dtype float32
     cu_starts:   [seq_len], dtype int32, start indices
     cu_ends:     [seq_len], dtype int32, end indices
+    clean_logits: bool. If True, positions outside [cu_starts[i], cu_ends[i]) in row i
+                  are explicitly written as -inf. If False, the kernel skips writing
+                  those positions and leaves whatever was in the output buffer there
+                  (the caller is responsible for pre-filling with -inf or ignoring them).
 
     Returns:
     logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
     """
 
-    BLOCK_KV = 128
     seq_len, num_heads, head_size = Q.shape
     seq_len_kv = KV.shape[0]
     # TODO: Currently assuming num_heads and head_size is power of 2.
     assert num_heads & (num_heads - 1) == 0, "num q. heads should be power of 2."
     assert head_size & (head_size - 1) == 0, "head size should be power of 2."
     # Initialize with -inf because of causal masking
-    logits = torch.full(
-        (seq_len, seq_len_kv),
-        fill_value=-float("inf"),
-        dtype=torch.float32,
-        device=Q.device,
-    )
+    aligned_size = 256
+    seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
+    if clean_logits:
+        logits = torch.full(
+            (seq_len, seq_len_kv_aligned),
+            fill_value=-float("inf"),
+            dtype=torch.float32,
+            device=Q.device,
+        )[:, :seq_len_kv]
+    else:
+        logits = torch.empty(
+            (seq_len, seq_len_kv_aligned),
+            dtype=torch.float32,
+            device=Q.device,
+        )[:, :seq_len_kv]      
 
     use_gluon = _gluon_fp8_mqa_logits_kernel is not None
     stride_q_s, stride_q_h, stride_q_d = Q.stride()
@@ -95,6 +108,8 @@ def fp8_mqa_logits(
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
     if not use_gluon:
+        block_kv = 128
+
         # heuristic for MFMA instruction shape
         matrix_instr_nonkdim = 32
         if seq_len <= 1024:
@@ -121,7 +136,7 @@ def fp8_mqa_logits(
             stride_w_h=stride_w_h,
             stride_logits_s=stride_logits_s,
             stride_logits_k=stride_logits_k,
-            BLOCK_KV=BLOCK_KV,
+            BLOCK_KV=block_kv,
             num_warps=4,
             num_stages=2,
             waves_per_eu=2,
