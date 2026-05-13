@@ -261,19 +261,49 @@ def kernel_unified_attention_2d(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
+        # Calculate offsets based on layout (4D NHD vs 5D SHUFFLE)
+        if USE_SHUFFLE:
+            # 5D SHUFFLE layout:
+            # K: [num_blocks, num_kv_heads, head_size//X, block_size, X]
+            # V: [num_blocks, num_kv_heads, block_size//X, head_size, X]
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
+            # For K: decompose offs_d into (dim_group, x)
+            k_dim_group = offs_d // X_K
+            k_x = offs_d % X_K
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0 +
+                kv_head_idx * stride_k_cache_1 +
+                k_dim_group[:, None] * stride_k_cache_2 +
+                (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_3 +
+                k_x[:, None] * stride_k_cache_4
+            )
+
+            # For V: decompose seq_offset into (token_group, x)
+            v_token_in_block = seq_offset % BLOCK_SIZE
+            v_token_group = v_token_in_block // X_V
+            v_x = v_token_in_block % X_V
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0 +
+                kv_head_idx * stride_v_cache_1 +
+                v_token_group[:, None] * stride_v_cache_2 +
+                offs_d[None, :] * stride_v_cache_3 +
+                v_x[:, None] * stride_v_cache_4
+            )
+        else:
+            # 4D NHD layout: [num_blocks, block_size, num_kv_heads, head_size]
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
 
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(
@@ -584,19 +614,49 @@ def kernel_unified_attention_3d(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
+        # Calculate offsets based on layout (4D NHD vs 5D SHUFFLE)
+        if USE_SHUFFLE:
+            # 5D SHUFFLE layout:
+            # K: [num_blocks, num_kv_heads, head_size//X, block_size, X]
+            # V: [num_blocks, num_kv_heads, block_size//X, head_size, X]
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
+            # For K: decompose offs_d into (dim_group, x)
+            k_dim_group = offs_d // X_K
+            k_x = offs_d % X_K
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0 +
+                kv_head_idx * stride_k_cache_1 +
+                k_dim_group[:, None] * stride_k_cache_2 +
+                (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_3 +
+                k_x[:, None] * stride_k_cache_4
+            )
+
+            # For V: decompose seq_offset into (token_group, x)
+            v_token_in_block = seq_offset % BLOCK_SIZE
+            v_token_group = v_token_in_block // X_V
+            v_x = v_token_in_block % X_V
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0 +
+                kv_head_idx * stride_v_cache_1 +
+                v_token_group[:, None] * stride_v_cache_2 +
+                offs_d[None, :] * stride_v_cache_3 +
+                v_x[:, None] * stride_v_cache_4
+            )
+        else:
+            # 4D NHD layout: [num_blocks, block_size, num_kv_heads, head_size]
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
 
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(
