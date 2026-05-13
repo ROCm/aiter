@@ -157,6 +157,24 @@ inline __device__ auto make_layout_rb_noscale(int lane_id, int wave_id_n) {
 #endif // __HIP_DEVICE_COMPILE__ (layout functions)
 
 // ============================================================================
+// Cache policy (cpol/aux) bits — matches LLVM AMDGPU::CPol in SIDefines.h
+// Hardware mapping: GLC→SC0, SLC→NT, SCC→SC1 (see CDNA4 ISA Table 49/50)
+// ============================================================================
+#define CPOL_DEFAULT      0                       // all zero → L1 Hit LRU, L2 Hit LRU
+#define CPOL_GLC          1                       // bit0: GLC → SC0 (scope: group)
+#define CPOL_SLC          2                       // bit1: SLC → NT  (non-temporal)
+#define CPOL_DLC          4                       // bit2: DLC
+#define CPOL_SCC          16                      // bit4: SCC → SC1 (scope: device/system)
+#define CPOL_SC0          CPOL_GLC                // alias
+#define CPOL_SC1          CPOL_SCC                // alias
+#define CPOL_NT           CPOL_SLC                // alias: NT → L1 Miss Evict, L2 Hit Stream
+#define CPOL_SC0_SC1      (CPOL_SC0 | CPOL_SC1)  // SC0+SC1 → L2 Coherent Bypass
+#define CPOL_SC0_NT       (CPOL_SC0 | CPOL_NT)   // SC0+NT  → L2 Hit Stream (group scope)
+#define CPOL_STREAM       CPOL_NT                 // alias: L2 Hit Stream for loads
+#define CPOL_BYPASS_L2    CPOL_SC0_SC1            // alias: L2 Coherent Bypass for loads
+#define CPOL_STORE_NT     CPOL_SC0_NT             // alias: non-temporal store
+
+// ============================================================================
 // BF16 noscale GEMM kernel (a16w16)
 // Kernel definition visible on both passes (host pass needs it for stub generation).
 // ============================================================================
@@ -182,9 +200,47 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
 
     const int grid_dim_x = opus::grid_size_x() / opus::block_size_x();
     int wgid = (opus::block_id_y() * grid_dim_x) + opus::block_id_x();
+    const int num_tiles_m = ceil_div(kargs.m, T::B_M);
     const int num_tiles_n = ceil_div_constexpr(kargs.n, T::B_N);
-    int row = (wgid / num_tiles_n) * T::B_M;
-    int col = (wgid % num_tiles_n) * T::B_N;
+    const int total_wgs = num_tiles_m * num_tiles_n;
+
+    // HipKittens XCD swizzle (Algorithm 1) for joint L2+LLC cache reuse
+    int tile_m_id, tile_n_id;
+    if constexpr (T::NUM_XCD > 1) {
+        constexpr int nXCD = T::NUM_XCD;
+        constexpr int W = T::SWIZZLE_W;
+        constexpr int C = T::SWIZZLE_C;
+        int xy = wgid;
+        int blocks_per_cycle = nXCD * C;
+        int limit = (total_wgs / blocks_per_cycle) * blocks_per_cycle;
+        if (xy >= limit) {
+            tile_m_id = xy / num_tiles_n;
+            tile_n_id = xy % num_tiles_n;
+        } else {
+            int xcd = xy % nXCD;
+            int local = xy / nXCD;
+            int chunk_idx = local / C;
+            int pos = local % C;
+            int new_xy = xcd * C + chunk_idx * blocks_per_cycle + pos;
+            int tid_per_group = W * num_tiles_n;
+            int group_id = new_xy / tid_per_group;
+            int first_row = group_id * W;
+            int win_h = num_tiles_m - first_row;
+            if (win_h > W) win_h = W;
+            int l = new_xy % tid_per_group;
+            tile_m_id = first_row + (l % win_h);
+            tile_n_id = l / win_h;
+            if (tile_n_id >= num_tiles_n) {
+                tile_m_id = xy / num_tiles_n;
+                tile_n_id = xy % num_tiles_n;
+            }
+        }
+    } else {
+        tile_m_id = wgid / num_tiles_n;
+        tile_n_id = wgid % num_tiles_n;
+    }
+    int row = tile_m_id * T::B_M;
+    int col = tile_n_id * T::B_N;
 
     int batch_id = opus::block_id_z();
     int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
@@ -246,19 +302,19 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
     int tic = 0, toc = 1;
 
     // Prologue
-    async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, 0));
-    async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, 0));
-    async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0));
-    async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, 0));
+    async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, 0), opus::number<T::CPOL_B>{});
+    async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, 0), opus::number<T::CPOL_A>{});
+    async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0), opus::number<T::CPOL_B>{});
+    async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, 0), opus::number<T::CPOL_A>{});
 
     if (wave_id_m == 1) __builtin_amdgcn_s_barrier();
 
     s_waitcnt_vmcnt(number<T::a_buffer_load_insts + T::b_buffer_load_insts>{});
     __builtin_amdgcn_s_barrier();
 
-    async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, 1));
-    async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, 1));
-    async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, 1));
+    async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, 1), opus::number<T::CPOL_B>{});
+    async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, 1), opus::number<T::CPOL_A>{});
+    async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, 1), opus::number<T::CPOL_B>{});
 
     s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
     __builtin_amdgcn_s_barrier();
@@ -270,7 +326,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
     for(int tile = 0; tile < loops - 2; tile += 2) {
         // First tile
         v_a = load<T::VEC_A>(s_a[tic][0], u_ra);
-        async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 1));
+        async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 1), opus::number<T::CPOL_A>{});
         s_waitcnt_lgkmcnt(number<T::a_ds_read_insts>{});
         __builtin_amdgcn_s_barrier();
 
@@ -282,7 +338,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_sched_barrier(0);
 
         v_b[1] = load<T::VEC_B>(s_b[tic][1], u_rb);
-        async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, tile + 2));
+        async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, tile + 2), opus::number<T::CPOL_B>{});
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
@@ -293,7 +349,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_sched_barrier(0);
 
         v_a = load<T::VEC_A>(s_a[tic][1], u_ra);
-        async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, tile + 2));
+        async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, tile + 2), opus::number<T::CPOL_A>{});
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
@@ -303,7 +359,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, tile + 2));
+        async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, tile + 2), opus::number<T::CPOL_B>{});
         s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
         __builtin_amdgcn_s_barrier();
         v_b[0] = load<T::VEC_B>(s_b[toc][0], u_rb);
@@ -316,7 +372,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
 
         // Second tile
         v_a = load<T::VEC_A>(s_a[toc][0], u_ra);
-        async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, tile + 2));
+        async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, tile + 2), opus::number<T::CPOL_A>{});
         s_waitcnt_lgkmcnt(number<T::a_ds_read_insts>{});
         __builtin_amdgcn_s_barrier();
 
@@ -328,7 +384,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_sched_barrier(0);
 
         v_b[1] = load<T::VEC_B>(s_b[toc][1], u_rb);
-        async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, tile + 3));
+        async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, tile + 3), opus::number<T::CPOL_B>{});
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
@@ -339,7 +395,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_sched_barrier(0);
 
         v_a = load<T::VEC_A>(s_a[toc][1], u_ra);
-        async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, tile + 3));
+        async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, tile + 3), opus::number<T::CPOL_A>{});
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
@@ -349,7 +405,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 3));
+        async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 3), opus::number<T::CPOL_B>{});
         s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
         __builtin_amdgcn_s_barrier();
         v_b[0] = load<T::VEC_B>(s_b[tic][0], u_rb);
@@ -366,7 +422,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         int tile = loops - 2;
 
         v_a = load<T::VEC_A>(s_a[tic][0], u_ra);
-        async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 1));
+        async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 1), opus::number<T::CPOL_A>{});
         __builtin_amdgcn_s_barrier();
         s_waitcnt_lgkmcnt(0_I);
 
@@ -491,15 +547,23 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
             }
         }
 
-        auto pred = [&](auto... ids) {
-            return (m_base + u_gc_m(ids...)) < kargs.m && (n_base + u_gc_n(ids...)) < kargs.n;
-        };
-
-        if constexpr (std::is_same_v<D_C, D_ACC>) {
-            store_if<T::VEC_C>(g_c, pred, vc, u_gc, g_c_offset);
+        if constexpr (T::HAS_OOB) {
+            auto pred = [&](auto... ids) {
+                return (m_base + u_gc_m(ids...)) < kargs.m && (n_base + u_gc_n(ids...)) < kargs.n;
+            };
+            if constexpr (std::is_same_v<D_C, D_ACC>) {
+                store_if<T::VEC_C>(g_c, pred, vc, u_gc, g_c_offset, opus::number<CPOL_NT>{});
+            } else {
+                auto vc_out = cast<D_C>(vc);
+                store_if<T::VEC_C>(g_c, pred, vc_out, u_gc, g_c_offset, opus::number<CPOL_NT>{});
+            }
         } else {
-            auto vc_out = cast<D_C>(vc);
-            store_if<T::VEC_C>(g_c, pred, vc_out, u_gc, g_c_offset);
+            if constexpr (std::is_same_v<D_C, D_ACC>) {
+                store<T::VEC_C>(g_c, vc, u_gc, g_c_offset, opus::number<CPOL_NT>{});
+            } else {
+                auto vc_out = cast<D_C>(vc);
+                store<T::VEC_C>(g_c, vc_out, u_gc, g_c_offset, opus::number<CPOL_NT>{});
+            }
         }
     };
 

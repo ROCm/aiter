@@ -26,6 +26,14 @@ class OpusGemmInstance:
     # Flatmm-only. Defaults to 2 (match existing behavior for non-flatmm kernels).
     # Only emitted in the generated instance name when kernel_tag == "a16w16_flatmm".
     WG_PER_CU: int = 2
+    # Compile-time OOB (out-of-bounds) tail handling. True = full boundary
+    # checks (mask_va_tail, store_if pred, reduce N-tail). False = no tail
+    # checks, only valid when shape is tile-aligned (M%B_M==N%B_N==K%B_K==0).
+    has_oob: bool = True
+    # Cache policy for A/B loads (CDNA4 ISA Table 49). -1 = use traits default.
+    # 0=LRU, 1=SC0(LLC Evict), 17=SC0+SC1(L2 Bypass).
+    cpol_a: int = -1
+    cpol_b: int = -1
 
     @property
     def name(self) -> str:
@@ -37,18 +45,19 @@ class OpusGemmInstance:
             "x".join(map(str, [self.GROUP_M, self.GROUP_N, self.GROUP_K])),
         ]
         if self.kernel_tag == "a16w16_flatmm":
-            # Disambiguate by pipeline (flatmm vs split-barrier) and occupancy.
             parts.insert(1, "flatmm")
             parts.append(f"wgpcu{self.WG_PER_CU}")
         elif self.kernel_tag == "a16w16_flatmm_splitk":
-            # Distinguish from non-splitk flatmm by inserting both tags and
-            # appending the WG_PER_CU suffix (same scheme as flatmm).
             parts.insert(1, "flatmm_splitk")
             parts.append(f"wgpcu{self.WG_PER_CU}")
+        if not self.has_oob:
+            parts.append("nooob")
+        if self.cpol_a >= 0 or self.cpol_b >= 0:
+            parts.append(f"cA{self.cpol_a}cB{self.cpol_b}")
         return "_".join(parts)
 
 
-def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk):
+def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True):
     vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
     return OpusGemmInstance(
         bs,
@@ -68,16 +77,11 @@ def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk):
         0,
         "a16w16",
         ["fp32_t", "bf16_t"],
+        has_oob=has_oob,
     )
 
 
-def _a16w16_flatmm_splitk(bm, bn, bk, wg_per_cu):
-    # Flatmm split-K locked config (per cc -t 0..10 dispatch):
-    # BLOCK_SIZE=256, T_M=2, T_N=1, MFMA=(16,16,32), VEC=(8,8,4), HAS_BIAS=false.
-    # output_dtypes=["fp32_t"]: main kernel writes fp32 workspace; Y is bf16
-    # (reduce kernel does the fp32->bf16 cast). Only the fp32_t template
-    # instantiation is generated; opus_gemm.cu forces the <fp32_t> dispatch
-    # branch for splitk kids regardless of Y.dtype (which must be bf16).
+def _a16w16_flatmm_splitk(bm, bn, bk, wg_per_cu, has_oob=True):
     vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
     return OpusGemmInstance(
         256,
@@ -98,6 +102,7 @@ def _a16w16_flatmm_splitk(bm, bn, bk, wg_per_cu):
         "a16w16_flatmm_splitk",
         ["fp32_t"],
         wg_per_cu,
+        has_oob=has_oob,
     )
 
 
@@ -216,13 +221,65 @@ a16w16_flatmm_splitk_kernels_list = {
     223: _a16w16_flatmm_splitk( 96,  96,  64, 2),   # pfk=3, VGPR=208/256, AGPR=72  (81% VGPR -- watch)
 }
 
+# non-OOB variants: kid + 1000, same tile but HAS_OOB=false.
+# Only valid when shape is tile-aligned (M%B_M==N%B_N==K%B_K==0).
+a16w16_kernels_list_nooob = {
+    kid + 1000: _a16w16(
+        inst.BLOCK_SIZE, inst.B_M, inst.B_N, inst.B_K,
+        inst.T_N, inst.W_M, inst.W_N, inst.W_K, has_oob=False,
+    )
+    for kid, inst in a16w16_kernels_list.items()
+}
+
+# CPOL variants for a16w16: 3 policies per kid, tuner picks best per shape.
+#   M-heavy: A=SC0(1, LLC Evict), B=BYPASS_L2(17) — large A streams, small B cached
+#   N-heavy: A=BYPASS_L2(17), B=SC0(1, LLC Evict) — swapped
+#   Balanced: A=LRU(0), B=LRU(0) — both cached normally
+_CPOL_CONFIGS = [
+    (2000, 1, 17, "Mheavy"),   # kid_offset, cpol_a, cpol_b
+    (3000, 17, 1, "Nheavy"),
+    (4000, 0,  0, "balanced"),
+]
+a16w16_kernels_list_cpol = {}
+for offset, ca, cb, _tag in _CPOL_CONFIGS:
+    for kid, inst in a16w16_kernels_list.items():
+        new_inst = _a16w16(
+            inst.BLOCK_SIZE, inst.B_M, inst.B_N, inst.B_K,
+            inst.T_N, inst.W_M, inst.W_N, inst.W_K,
+        )
+        new_inst.cpol_a = ca
+        new_inst.cpol_b = cb
+        a16w16_kernels_list_cpol[kid + offset] = new_inst
+
+a16w16_kernels_list_cpol_nooob = {}
+for offset, ca, cb, _tag in _CPOL_CONFIGS:
+    for kid, inst in a16w16_kernels_list.items():
+        new_inst = _a16w16(
+            inst.BLOCK_SIZE, inst.B_M, inst.B_N, inst.B_K,
+            inst.T_N, inst.W_M, inst.W_N, inst.W_K, has_oob=False,
+        )
+        new_inst.cpol_a = ca
+        new_inst.cpol_b = cb
+        a16w16_kernels_list_cpol_nooob[kid + offset + 1000] = new_inst
+
+a16w16_flatmm_splitk_kernels_list_nooob = {
+    kid + 1000: _a16w16_flatmm_splitk(
+        inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU, has_oob=False,
+    )
+    for kid, inst in a16w16_flatmm_splitk_kernels_list.items()
+}
+
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
     **a8w8_scale_kernels_list,
     **a8w8_kernels_list,
     **a16w16_kernels_list,
+    **a16w16_kernels_list_nooob,
+    **a16w16_kernels_list_cpol,
+    **a16w16_kernels_list_cpol_nooob,
     **a16w16_flatmm_kernels_list,
     **a16w16_flatmm_splitk_kernels_list,
+    **a16w16_flatmm_splitk_kernels_list_nooob,
 }
 
 default_kernels_dict = {

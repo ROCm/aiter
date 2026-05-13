@@ -65,7 +65,8 @@
 #include <cstdint>   // uint16_t / uint32_t used by the bias-fold and bf16 store paths
 
 template<int VEC_ = 16, int BLOCK_ = 64, typename D_OUT = __bf16,
-         bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT>
+         bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT,
+         bool HAS_OOB_ = true>
 __global__ void splitk_reduce_kernel(
     const float* __restrict__ workspace,
     D_OUT*       __restrict__ c_out,
@@ -81,6 +82,7 @@ __global__ void splitk_reduce_kernel(
     constexpr int VEC   = VEC_;
     constexpr int BLOCK = BLOCK_;
     constexpr bool HAS_BIAS = HAS_BIAS_;
+    constexpr bool HAS_OOB = HAS_OOB_;
     using D_BIAS = D_BIAS_;
 
     // STEP = elements per buffer_store_dwordx4. STEP * sizeof(D_OUT) == 16.
@@ -163,31 +165,88 @@ __global__ void splitk_reduce_kernel(
                                (unsigned int)((size_t)batch * M * N * sizeof(D_OUT)));
     const int c_idx = b * M * N + m * N + n_base;  // in D_OUT elements
 
-    if (n_base + VEC <= N) {
-        // Fast path: entire VEC chunk is in-row -> VEC/STEP x buffer_store_dwordx4.
-        // static_for promotes the loop index to constexpr so opus::slice's
-        // compile-time bounds (opus::number<>) can be formed.
-        opus::static_for<VEC / STEP>([&](auto g_c_idx) {
-            constexpr int g = decltype(g_c_idx)::value;
-            g_c.template store<STEP>(
-                opus::slice(out,
-                            opus::number<g * STEP>{},
-                            opus::number<(g + 1) * STEP>{}),
-                c_idx + g * STEP);
-        });
-    } else if (n_base < N) {
-        // Tail path: only the first `valid` elements of the VEC chunk are in
-        // row m. Scalar-store them one by one; the remaining (VEC - valid)
-        // elements would otherwise spill into row m+1 via a 128-bit vector
-        // store (buffer rsrc cannot catch this because the target byte offset
-        // is still < rsrc.size in a row-major tensor).
-        const int valid = N - n_base;
-        #pragma unroll
-        for (int j = 0; j < VEC; ++j) {
-            if (j < valid) g_c.template store<1>(out[j], c_idx + j);
+    // Store-path macro helpers (compile-time offsets -> buffer_store_dwordx4/x2/dword/short).
+    using opus::slice;
+    using opus::number;
+#define OPUS_REDUCE_ST8(OFF) g_c.template store<8>(slice(out, number<OFF>{}, number<OFF+8>{}), c_idx + (OFF))
+#define OPUS_REDUCE_ST4(OFF) g_c.template store<4>(slice(out, number<OFF>{}, number<OFF+4>{}), c_idx + (OFF))
+#define OPUS_REDUCE_ST2(OFF) g_c.template store<2>(slice(out, number<OFF>{}, number<OFF+2>{}), c_idx + (OFF))
+#define OPUS_REDUCE_ST1(OFF) g_c.template store<1>(out[OFF], c_idx + (OFF))
+
+    if constexpr (!HAS_OOB) {
+        // Non-OOB: N is tile-aligned so no partial-VEC tail, but still
+        // need to skip threads whose n_base is past N (reduce grid is
+        // over-provisioned: grid.x = ceil(N, VEC*BLOCK)).
+        if (n_base + VEC <= N) {
+            opus::static_for<VEC / STEP>([&](auto g_c_idx) {
+                constexpr int g = decltype(g_c_idx)::value;
+                g_c.template store<STEP>(
+                    slice(out, number<g * STEP>{}, number<(g + 1) * STEP>{}),
+                    c_idx + g * STEP);
+            });
         }
+    } else {
+        if (n_base + VEC <= N) {
+            // Fast path: entire VEC chunk is in-row.
+            opus::static_for<VEC / STEP>([&](auto g_c_idx) {
+                constexpr int g = decltype(g_c_idx)::value;
+                g_c.template store<STEP>(
+                    slice(out, number<g * STEP>{}, number<(g + 1) * STEP>{}),
+                    c_idx + g * STEP);
+            });
+        } else if (n_base < N) {
+            // Tail path: decompose valid ∈ [1, VEC-1] into descending
+            // power-of-2 chunks so we emit dwordx4/dwordx2/dword/short
+            // instead of VEC scalar stores.
+            // Ref: demon_gcn/opus_gemm/mxfp8_e8m0/gemm_mxfp_a8w8_1d1d.hpp
+            static_assert(VEC == 16, "reduce tail switch assumes VEC=16");
+            const int valid = N - n_base;
+            if constexpr (sizeof(D_OUT) == 2) {
+                // bf16: STEP=8, store<8>=dwordx4, store<4>=dwordx2, store<2>=dword, store<1>=short
+                switch (valid) {
+                    case  1: OPUS_REDUCE_ST1( 0); break;
+                    case  2: OPUS_REDUCE_ST2( 0); break;
+                    case  3: OPUS_REDUCE_ST2( 0); OPUS_REDUCE_ST1( 2); break;
+                    case  4: OPUS_REDUCE_ST4( 0); break;
+                    case  5: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST1( 4); break;
+                    case  6: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST2( 4); break;
+                    case  7: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST2( 4); OPUS_REDUCE_ST1( 6); break;
+                    case  8: OPUS_REDUCE_ST8( 0); break;
+                    case  9: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST1( 8); break;
+                    case 10: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST2( 8); break;
+                    case 11: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST2( 8); OPUS_REDUCE_ST1(10); break;
+                    case 12: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST4( 8); break;
+                    case 13: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST4( 8); OPUS_REDUCE_ST1(12); break;
+                    case 14: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST4( 8); OPUS_REDUCE_ST2(12); break;
+                    case 15: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST4( 8); OPUS_REDUCE_ST2(12); OPUS_REDUCE_ST1(14); break;
+                }
+            } else {
+                // fp32: STEP=4, store<4>=dwordx4, store<2>=dwordx2, store<1>=dword
+                switch (valid) {
+                    case  1: OPUS_REDUCE_ST1( 0); break;
+                    case  2: OPUS_REDUCE_ST2( 0); break;
+                    case  3: OPUS_REDUCE_ST2( 0); OPUS_REDUCE_ST1( 2); break;
+                    case  4: OPUS_REDUCE_ST4( 0); break;
+                    case  5: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST1( 4); break;
+                    case  6: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST2( 4); break;
+                    case  7: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST2( 4); OPUS_REDUCE_ST1( 6); break;
+                    case  8: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); break;
+                    case  9: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST1( 8); break;
+                    case 10: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST2( 8); break;
+                    case 11: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST2( 8); OPUS_REDUCE_ST1(10); break;
+                    case 12: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST4( 8); break;
+                    case 13: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST4( 8); OPUS_REDUCE_ST1(12); break;
+                    case 14: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST4( 8); OPUS_REDUCE_ST2(12); break;
+                    case 15: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST4( 8); OPUS_REDUCE_ST2(12); OPUS_REDUCE_ST1(14); break;
+                }
+            }
+        }
+        // else: whole VEC chunk is past N -> write nothing.
     }
-    // else: whole VEC chunk is past N -> write nothing.
+#undef OPUS_REDUCE_ST8
+#undef OPUS_REDUCE_ST4
+#undef OPUS_REDUCE_ST2
+#undef OPUS_REDUCE_ST1
 #else
     // Non-gfx950 device pass: empty stub. See gfx950 branch above.
 #endif  // __gfx950__
