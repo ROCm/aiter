@@ -57,6 +57,7 @@ def perftest(
                 data = func(*args, **kwargs)
                 end_evt.record()
                 end_evt.synchronize()
+                torch.cuda.empty_cache()
                 avg = start_evt.elapsed_time(end_evt) * 1000
                 torch.cuda.empty_cache()
                 return data, avg
