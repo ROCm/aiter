@@ -1004,12 +1004,19 @@ def build_sage_attn_mxfp4_cdna_module(
             # subtile maps to K-col = kv_block_start + st*32 + msub*8 +
             # klane*4 + erem.
             #
-            # No per-element OOB bounds-check: when mask_mode='none' the body
-            # loop guarantees kv_col < seq_len_k. When mask_mode='full' the
-            # downstream score mask sets P=-inf for OOB cols, so any garbage
-            # bias added for those positions is dropped. The buffer descriptor
-            # (sized to the full bias tensor) returns 0 past total bounds,
-            # and the dropped bounds-check shaves ~16 select+cmpi ops per tile.
+            # Per-element OOB bounds-check (kv_col<seq_len_k) gated on CAUSAL.
+            # Empirically (measured 2026-05-13) the cmpi+select pair shifts
+            # LLVM's instruction schedule in opposite directions for causal
+            # vs non-causal kernels:
+            #   - non-causal q_smooth=True (single loop, mask_mode='full' on
+            #     last tile): the predicate helps LLVM schedule the bias
+            #     buffer_load latency. Dropping it: S=32768 fwd 2.48x → 1.64x
+            #     Triton (-34%). KEEP the check.
+            #   - causal q_smooth=True (body+tail split, body mask_mode='none'
+            #     covers most iters): the predicate is provably redundant
+            #     in the body and apparently blocks better scheduling.
+            #     Dropping it: S=16384 caus 1.67x → 2.58x Triton (+54%).
+            #     DROP the check.
             if const_expr(USE_BIAS):
                 # Bias base byte offset for (B, Hq, Q_NUM_BLKS, *):
                 #   ((batch * NUM_Q_HEADS + head_q) * num_q_tiles + q_tile) * S_k * 4
@@ -1033,16 +1040,47 @@ def build_sage_attn_mxfp4_cdna_module(
                             + klane * 4
                             + fx.Index(erem)
                         )
-                        bias_dword_idx = arith.unwrap(
-                            arith.index_cast(
-                                T.i32, _raw(bias_base_dword + kv_col_idx)
+                        if const_expr(not CAUSAL):
+                            # Non-causal: keep the bounds-check (helps LLVM scheduling)
+                            kv_in_bias_bounds = ArithValue(
+                                arith.cmpi(
+                                    arith.CmpIPredicate.slt,
+                                    _raw(kv_col_idx),
+                                    _raw(seq_len_k_v),
+                                )
                             )
-                        )
-                        bias_val = buffer_ops.buffer_load(
-                            bias_rsrc, bias_dword_idx,
-                            vec_width=1, dtype=T.f32,
-                        )
-                        s_bias.append(_fadd(s_f32_loc[idx], bias_val))
+                            kv_col_safe = fx.Index(
+                                kv_in_bias_bounds.select(kv_col_idx, fx.Index(0))
+                            )
+                            bias_dword_idx = arith.unwrap(
+                                arith.index_cast(
+                                    T.i32, _raw(bias_base_dword + kv_col_safe)
+                                )
+                            )
+                            bias_val = buffer_ops.buffer_load(
+                                bias_rsrc, bias_dword_idx,
+                                vec_width=1, dtype=T.f32,
+                            )
+                            bias_val_safe = kv_in_bias_bounds.select(
+                                bias_val, fx.Float32(0.0)
+                            )
+                            s_bias.append(_fadd(s_f32_loc[idx], bias_val_safe))
+                        else:
+                            # Causal: drop the bounds-check. In body the bound
+                            # is provably true; in tail the score mask kills
+                            # OOB cols via -inf, so any garbage bias added is
+                            # harmless. Skipping the check unblocks better
+                            # LLVM scheduling for the causal kernel.
+                            bias_dword_idx = arith.unwrap(
+                                arith.index_cast(
+                                    T.i32, _raw(bias_base_dword + kv_col_idx)
+                                )
+                            )
+                            bias_val = buffer_ops.buffer_load(
+                                bias_rsrc, bias_dword_idx,
+                                vec_width=1, dtype=T.f32,
+                            )
+                            s_bias.append(_fadd(s_f32_loc[idx], bias_val))
                 s_f32_loc = s_bias
 
             # 3) Mask — only emitted in mask_mode='full'.
@@ -1210,6 +1248,28 @@ def build_sage_attn_mxfp4_cdna_module(
                 _raw(cur_buf_i32), arith.constant(1, type=T.i32)
             ).result
 
+            # ==== PRE_LOAD_V (q_smooth=False only): hoist all V fragments
+            # before the QK MFMA chain so 32 ds_read_tr8_b64 issue up-front
+            # and their LDS latency is hidden behind the long QK MFMA chain.
+            # Mirrors Triton's PRE_LOAD_V=True path
+            # (fav3_sage_attention_mxfp4.py:171, 196-202). Trades ~64 vgpr/lane
+            # of register pressure for better ILP.
+            #
+            # Disabled when USE_BIAS=True (q_smooth=True): the bias path
+            # already adds significant register pressure (per-element bias
+            # loads and adds across 64 vector elements), so pre-loading V
+            # spills VGPRs and regresses q_smooth=True forward shapes by
+            # 10-16% (measured 2026-05-13). The post-load V fetch path is
+            # kept for q_smooth=True since LLVM's scheduler already pipelines
+            # ds_reads with PV MFMA effectively when registers are tight.
+            if const_expr(not USE_BIAS):
+                v_frags_pre = [[None] * D_CHUNKS for _ in range(PV_K_STEPS)]
+                for pks in range_constexpr(PV_K_STEPS):
+                    for dc in range_constexpr(D_CHUNKS):
+                        v_frags_pre[pks][dc] = load_v_frag_fp8(
+                            pks, dc, cur_v_off, v_iter_lane_addr_i32
+                        )
+
             # ==== Compute softmax[k] using cur_buf K ====
             m_new, l_new, corr, p_words = _emit_qk_softmax_pquant(
                 kv_block_start, cur_k_off, m_running, l_running, mask_mode=mask_mode
@@ -1222,7 +1282,7 @@ def build_sage_attn_mxfp4_cdna_module(
             for dc in range_constexpr(D_CHUNKS):
                 o_accs[dc] = _fmul(o_accs[dc], corr_vec16)
 
-            # ==== GEMM2: PV[k] using p_words[k] (just computed) and cur_buf V ====
+            # ==== GEMM2: PV[k] using p_words[k] and V (pre-loaded if available) ====
             for pks in range_constexpr(PV_K_STEPS):
                 v8_elems = []
                 for w in range_constexpr(4):
@@ -1242,7 +1302,12 @@ def build_sage_attn_mxfp4_cdna_module(
                 p_pack_v8i32 = Vec.from_elements(v8_elems, fx.Int32).ir_value()
                 scale_127 = arith.constant(127, type=T.i32)
                 for dc in range_constexpr(D_CHUNKS):
-                    v_frag = load_v_frag_fp8(pks, dc, cur_v_off, v_iter_lane_addr_i32)
+                    if const_expr(not USE_BIAS):
+                        v_frag = v_frags_pre[pks][dc]
+                    else:
+                        v_frag = load_v_frag_fp8(
+                            pks, dc, cur_v_off, v_iter_lane_addr_i32
+                        )
                     o_accs[dc] = mfma_fp8_k64(
                         v16f32_type,
                         v_frag,
