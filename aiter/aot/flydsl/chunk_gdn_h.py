@@ -12,9 +12,10 @@ extracts every unique compile-time configuration, and pre-compiles it
 into the FlyDSL disk cache so that the first inference call does not pay
 the JIT cost.
 
-By default, both the f32-state (legacy) and bf16-state runtime paths are
-covered: each jsonl entry is compiled twice with ``STATE_DTYPE_BF16``
-toggled. Pass ``--no-state-bf16`` to keep only the f32-state variant.
+Each jsonl entry is compiled twice -- once with ``STATE_DTYPE_BF16=False``
+(legacy f32-state runtime path) and once with ``STATE_DTYPE_BF16=True``
+(used when the caller passes ``state_dtype=torch.bfloat16``) -- so neither
+runtime path pays a JIT cost on first call.
 
 Usage:
     # Compile all unique FlyDSL chunk-gdn-h kernels from the default jsonl
@@ -26,9 +27,6 @@ Usage:
     # Cross-compile every entry for a different GPU arch (host need not
     # be that GPU; FlyDSL emits ISA for the requested target).
     python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
-
-    # Skip the bf16-state variant (legacy f32-state only)
-    python -m aiter.aot.flydsl.chunk_gdn_h --no-state-bf16
 
 Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
@@ -146,8 +144,8 @@ def parse_jsonl(jsonl_path: str) -> list[dict[str, Any]]:
                 "is_varlen": bool(obj.get("is_varlen", False)),
                 "wu_contig": bool(obj.get("wu_contig", True)),
                 # state dtype is not tracked in the tuned jsonl yet; default
-                # f32 to match the legacy runtime path. Bumping to bf16 is
-                # cheap to add via --state-bf16 below.
+                # f32 here, then main() unconditionally fans out into a bf16
+                # twin so both runtime paths are pre-compiled.
                 "state_bf16": False,
             }
             key = job_identity(job)
@@ -280,8 +278,7 @@ def _compile_chunk_gdn_h_to_cache(
 
 def _format_shape_str(job: dict) -> str:
     """Render a job dict into the one-line summary used by ``[OK]`` /
-    ``[FAIL]`` prints. Kept as a free function so the parallel-mode crash
-    handler can produce the same line as the serial path."""
+    ``[FAIL]`` prints."""
     return (
         f"chunk_gdn_h  "
         f"K={job.get('K')} V={job.get('V')} BT={job.get('BT')} "
@@ -366,14 +363,6 @@ def main():
         "aiter/ops/flydsl/chunk_gdn_h_tuned.jsonl",
     )
     parser.add_argument(
-        "--no-state-bf16",
-        action="store_true",
-        help="Skip the bf16-state variant. Default behaviour compiles both "
-        "f32-state (legacy) and bf16-state (used when the caller passes "
-        "``state_dtype=torch.bfloat16``) so neither runtime path pays a "
-        "JIT cost on first call.",
-    )
-    parser.add_argument(
         "--target-arch",
         type=str,
         default=None,
@@ -402,10 +391,10 @@ def main():
     if args.target_arch and all_jobs:
         all_jobs = dedupe_jobs([dict(j, arch=args.target_arch) for j in all_jobs])
 
-    # By default fan out into both f32-state and bf16-state variants so
-    # neither runtime path pays a JIT cost on first call. ``dedupe_jobs``
-    # drops any pre-existing dup. ``--no-state-bf16`` opts out.
-    if not args.no_state_bf16 and all_jobs:
+    # Fan out into both f32-state and bf16-state variants so neither
+    # runtime path pays a JIT cost on first call. ``dedupe_jobs`` drops
+    # any pre-existing dup.
+    if all_jobs:
         all_jobs = dedupe_jobs(all_jobs + [dict(j, state_bf16=True) for j in all_jobs])
 
     print("=" * 72)
@@ -437,9 +426,9 @@ def main():
     print("\n" + "=" * 72)
     print("Summary")
     print("=" * 72)
-    print(f"  Total time:       {total_elapsed:.1f}s")
-    print(f"  Compiled:         {ok} ok, {fail} failed")
-    print(f"  Cache dir:        {cache_dir}")
+    print(f"  Total time:   {total_elapsed:.1f}s")
+    print(f"  Compiled:     {ok} ok, {fail} failed")
+    print(f"  Cache dir:    {cache_dir}")
     print()
 
     exit_code = 0

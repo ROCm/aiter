@@ -12,7 +12,7 @@ import enum
 import os
 from typing import Any, Callable, Iterator
 
-# Cap on the entries embedded in the AssertionError message — beyond
+# Cap on the entries embedded in the AssertionError message -- beyond
 # this we append a "(... N more)" suffix. Per-kernel diagnostics still
 # go to stdout from compile_one_config's [FAIL] prints; the exception
 # text just needs enough to point at the problem.
@@ -20,25 +20,26 @@ _MAX_ERRORS_IN_MSG = 10
 
 # Default ceiling for the FlyDSL AOT process pool, applied on top of
 # affinity-aware CPU count. Each worker re-imports torch + FlyDSL
-# (~1.5–2.5 GB RSS), so 64 × 2 GB ≈ 128 GB — fits comfortably on a
-# typical 64+ core build host with ≥256 GB RAM, but containers with
+# (~1.5-2.5 GB RSS), so 64 x 2 GB ~= 128 GB -- fits comfortably on a
+# typical 64+ core build host with >=256 GB RAM, but containers with
 # tighter cgroup memory caps may want to lower via AITER_FLYDSL_AOT_WORKERS.
 _DEFAULT_MAX_WORKERS = 64
 
 
 class OpKind(enum.Enum):
-    """FlyDSL AOT kernel categories — enum so typos at call sites become
+    """FlyDSL AOT kernel categories -- enum so typos at call sites become
     construction errors instead of silently routing to the wrong code path."""
 
     MOE = "moe"
     GEMM = "gemm"
+    CHUNK_GDN_H = "chunk_gdn_h"
 
 
 @dataclass(frozen=True)
 class JobLabel:
     """Diagnostic label attached to a submitted future. Replaces the
     earlier string-formatted label that wait_aot had to parse back into
-    a kind via ``label.startswith(OpKind.MOE.name)`` — a heuristic that
+    a kind via ``label.startswith(OpKind.MOE.name)`` -- a heuristic that
     silently misattributed crashes if a future OpKind member was added."""
 
     kind: OpKind
@@ -119,102 +120,33 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
-# Registry of AOT kinds. Each entry maps a short kind name to
-#   (module_path, human_label).
-# Each module must export ``DEFAULT_CSVS`` (or alias), ``parse_csv`` (or
-# alias), and ``compile_one_config`` -- the contract consumed by
-# ``run_aot_worker`` below.
-_AOT_KINDS: dict[str, tuple[str, str]] = {
-    "moe": (".moe", "MoE"),
-    "gemm": (".gemm", "GEMM"),
-    "chunk_gdn_h": (".chunk_gdn_h", "chunk-gdn-h"),
-}
-
-
-def run_aot_worker(kind: str):
-    """Worker for ProcessPoolExecutor -- runs in a child process."""
-    if kind not in _AOT_KINDS:
-        raise ValueError(f"Unknown AOT kind {kind!r}; supported: {sorted(_AOT_KINDS)}")
-    module_path, human_label = _AOT_KINDS[kind]
-
-    from importlib import import_module
-
-    mod = import_module(module_path, package=__package__)
-    DEFAULT_CSVS = mod.DEFAULT_CSVS
-    parse_csv = mod.parse_csv
-    compile_one_config = mod.compile_one_config
-
-    label = f"FlyDSL {human_label} AOT"
-    jobs = collect_aot_jobs(DEFAULT_CSVS, parse_csv)
-    if not jobs:
-        return label, 0, 0
-    cache_dir = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
-    print(f"[aiter] {label}: {len(jobs)} kernels to compile (cache: {cache_dir})")
-    results = [compile_one_config(**job) for job in jobs]
-    ok = sum(1 for r in results if r["compile_time"] is not None)
-    fail = len(results) - ok
-    print(f"[aiter] {label}: compiled {ok} ok, {fail} failed")
-    return label, ok, fail
-
-
-def start_aot(cache_dir: str, kinds: list[str] | None = None):
-    """Start FlyDSL AOT compilation in background processes.
-
-    Args:
-        cache_dir: FlyDSL JIT cache directory. Exported to children via
-            ``FLYDSL_RUNTIME_CACHE_DIR``.
-        kinds: Optional subset of AOT kinds to launch (default: all
-            registered kinds).
-
-    Returns (pool, futures_dict) -- caller must call ``wait_aot``
-    to collect results and raise on failure.
-    """
-    import multiprocessing
-    from concurrent.futures import ProcessPoolExecutor
-
-    os.makedirs(cache_dir, exist_ok=True)
-    os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
-
-    if kinds is None:
-        kinds = list(_AOT_KINDS)
-    else:
-        unknown = [k for k in kinds if k not in _AOT_KINDS]
-        if unknown:
-            raise ValueError(
-                f"Unknown AOT kind(s) {unknown}; " f"supported: {sorted(_AOT_KINDS)}"
-            )
-
-    # Use ``spawn`` to avoid inheriting a half-initialised CUDA context from
-    # the parent process; ``fork`` would crash with
-    # "Cannot re-initialize CUDA in forked subprocess" the moment any child
-    # touches ``torch.cuda``.
-    mp_ctx = multiprocessing.get_context("spawn")
-    pool = ProcessPoolExecutor(max_workers=max(1, len(kinds)), mp_context=mp_ctx)
-    futures = {pool.submit(run_aot_worker, kind): _AOT_KINDS[kind][1] for kind in kinds}
 def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     """Load DEFAULT_CSVS + parse_csv for the named kind and return its
-    job list. Note: importing .gemm / .moe here also runs their
-    module-level imports, which pull in FlyDSL (e.g. ``flydsl.expr``).
-    Job collection is therefore not free in the parent process — but
-    it's identical to what the pre-refactor ``run_aot_worker`` paid in
-    each child, just shifted once into the parent."""
+    job list. Note: importing .gemm / .moe / .chunk_gdn_h here also
+    runs their module-level imports, which pull in FlyDSL (e.g.
+    ``flydsl.expr``). Job collection is therefore not free in the
+    parent process, just shifted once out of every child."""
     if kind is OpKind.MOE:
         from .moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.GEMM:
         from .gemm import DEFAULT_CSVS, parse_csv
+    elif kind is OpKind.CHUNK_GDN_H:
+        from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
 
 
 def _compile_one(kind: OpKind, job: dict[str, Any]) -> tuple[OpKind, dict[str, Any]]:
-    """Per-kernel worker — runs in a ProcessPoolExecutor child process.
+    """Per-kernel worker -- runs in a ProcessPoolExecutor child process.
     Top-level so it's picklable. Imports compile_one_config lazily so
     the pickle wire payload is just (kind, job-dict)."""
     if kind is OpKind.MOE:
         from .moe import compile_one_config
     elif kind is OpKind.GEMM:
         from .gemm import compile_one_config
+    elif kind is OpKind.CHUNK_GDN_H:
+        from .chunk_gdn_h import compile_one_config
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return kind, compile_one_config(**job)
@@ -225,7 +157,7 @@ def _affinity_aware_cpu_count() -> int:
     use. ``os.cpu_count()`` reports host CPUs and ignores cgroup /
     cpuset constraints common in CI containers; ``sched_getaffinity``
     is the right answer where available (Linux). Fallback to
-    ``cpu_count`` otherwise. Clamped to ≥1 — empty-affinity-set or
+    ``cpu_count`` otherwise. Clamped to >=1 -- empty-affinity-set or
     None-from-cpu_count would otherwise yield 0 and break the
     ``ProcessPoolExecutor(max_workers=0)`` call site."""
     try:
@@ -240,18 +172,18 @@ def start_aot(
 ) -> tuple[ProcessPoolExecutor | None, dict[Future, JobLabel]]:
     """Start FlyDSL AOT compilation in background processes.
 
-    Submits one task per kernel (across MoE + GEMM) to a single shared
-    ProcessPoolExecutor. Pool size is configurable via env:
+    Submits one task per kernel (across all OpKind members) to a single
+    shared ProcessPoolExecutor. Pool size is configurable via env:
 
-      AITER_FLYDSL_AOT_WORKERS — explicit worker count. Non-integer
+      AITER_FLYDSL_AOT_WORKERS -- explicit worker count. Non-integer
                                  values raise ValueError; "0" / negatives
                                  are clamped to 1.
                                  default: min(_affinity_aware_cpu_count(),
-                                 _DEFAULT_MAX_WORKERS) — affinity/cpuset-
+                                 _DEFAULT_MAX_WORKERS) -- affinity/cpuset-
                                  aware count capped at the module
                                  constant.
 
-    Returns (pool, futures_dict) — caller must call ``wait_aot``
+    Returns (pool, futures_dict) -- caller must call ``wait_aot``
     to collect results and raise on failure. If there are no jobs to
     compile, returns (None, {}) and ``wait_aot`` becomes a no-op.
     """
@@ -260,7 +192,6 @@ def start_aot(
 
     workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
     if workers_env is not None:
-        # Raise on non-int (typo); clamp 0 / negatives to 1.
         try:
             max_workers = max(int(workers_env), 1)
         except ValueError as e:
@@ -270,7 +201,6 @@ def start_aot(
     else:
         max_workers = min(_affinity_aware_cpu_count(), _DEFAULT_MAX_WORKERS)
 
-    # Flatten all kernels from both kinds into a single submission list.
     all_jobs: list[tuple[OpKind, dict[str, Any]]] = []
     for kind in OpKind:
         for job in _collect_aot_jobs_for(kind):
@@ -280,10 +210,10 @@ def start_aot(
         print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
         return None, {}
 
-    # Cap pool at the actual job count so we don't spin up idle workers.
     max_workers = min(max_workers, len(all_jobs))
     print(
-        f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels (MoE+GEMM), "
+        f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
+        f"({'+'.join(k.name for k in OpKind)}), "
         f"{max_workers} worker processes (cache: {cache_dir})"
     )
 
@@ -292,8 +222,8 @@ def start_aot(
     # compiler subprocess. The child never re-enters torch / FlyDSL /
     # sccache-client Python in a way that would acquire an inherited
     # mutex, so the classic fork-after-import deadlock pattern (parent
-    # thread holds lock at fork time → child tries to acquire same lock
-    # → deadlock) doesn't apply. Validated empirically at 64 workers
+    # thread holds lock at fork time -> child tries to acquire same lock
+    # -> deadlock) doesn't apply. Validated empirically at 64 workers
     # (test job 299597), no hangs.
     pool = ProcessPoolExecutor(max_workers=max_workers)
     futures: dict[Future, JobLabel] = {}
@@ -323,11 +253,11 @@ def wait_aot(pool: ProcessPoolExecutor | None, futures: dict[Future, JobLabel]) 
                 else:
                     fail_by_kind[kind] += 1
                     # A None compile_time means compile_one_config returned
-                    # cleanly but didn't produce a kernel — still a
+                    # cleanly but didn't produce a kernel -- still a
                     # failure that the original wait_aot raised on.
                     errors.append(f"FlyDSL {label} produced no kernel")
             except Exception as worker_err:
-                # Use the JobLabel's kind directly — no string parsing,
+                # Use the JobLabel's kind directly -- no string parsing,
                 # so a future OpKind addition won't silently misattribute.
                 fail_by_kind[label.kind] += 1
                 errors.append(f"FlyDSL {label} AOT worker crashed: {worker_err}")
