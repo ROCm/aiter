@@ -22,4 +22,21 @@ AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORT
   -t 64 -dim 7168,2048 -e 256 -k 8 -q 4 --no-flydsl-csv -hip 0,0 \
   -tn 128 -tk 512 -bm 16 --stage2-tile-n 128 --stage2-tile-k 128
 
+# GPT-OSS 120B TP1 (a8w4 / MXFP8 x MXFP4, SwiGLU)
+#   input : [M, 2880] bf16
+#   w1    : [128, 2*2880, 2880]   (gate||up packed, MXFP8 act x MXFP4 wt)
+#   w2    : [128, 2880,   2880]
+#   topk=4 -- ``-q 7`` (per_1x32 fp8/fp4x2) is force-routed to
+#   ActivationType.Swiglu by ``_effective_act_type``; passing
+#   ``-a swiglu`` makes the intent explicit.
+# Accuracy note: with ``-hip 0,0`` (no K-padding on w1/w2) the FlyDSL
+# a8w4 verdict will fail at K=2880 (per-1x32 quant noise ~sqrt(K) blows
+# past mismatch_ratio=0.05 / logits_diff=0.5). Perf numbers are still
+# valid; drop the ``-hip 0,0`` flag to let the script auto-pick
+# ``-hip 768,768`` via ``_gfx1250_a8w4_default_kpad`` if a PASS verdict
+# is required.
+AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
+  -t 64 -dim 2880,2880 -e 128 -k 4 -q 7 -a swiglu --no-flydsl-csv -hip 0,0 \
+  -tn 128 -tk 512 -bm 16 --stage2-tile-n 128 --stage2-tile-k 128
+
 # ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=0 python op_tests/test_moe_2stage.py -t 1 -dim 256,1024 -e 8 -k 2 -q 4 --no-flydsl-csv -hip 0,0
