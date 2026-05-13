@@ -13,6 +13,33 @@ from flydsl._mlir.dialects import (
     llvm as _llvm,
 )
 from flydsl.expr import buffer_ops
+from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+
+
+def get_warp_size(arch=None):
+    """Return the wavefront/warp size for the given GPU architecture.
+
+    CDNA (gfx9xx) uses wave64, RDNA (gfx10xx/gfx11xx/gfx12xx) uses wave32.
+    """
+    if arch is None:
+        arch = get_rocm_arch()
+    return 32 if is_rdna_arch(arch) else 64
+
+
+def dtype_to_elem_type(dtype_str: str):
+    """Map a dtype string to its MLIR scalar type.
+
+    Supported: ``'f32'``, ``'f16'``, ``'bf16'``.
+    """
+    if dtype_str == "f32":
+        return T.f32
+    if dtype_str == "f16":
+        return T.f16
+    if dtype_str == "bf16":
+        return T.bf16
+    raise ValueError(
+        f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', or 'bf16')"
+    )
 
 
 def _create_llvm_ptr(value, address_space: int = 1):

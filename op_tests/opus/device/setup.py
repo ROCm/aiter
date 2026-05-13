@@ -30,6 +30,7 @@ _CU_SOURCES = [
     "test_wmma_f32.cu",
     "test_wmma_f8.cu",
     "test_wmma_scale.cu",
+    "test_mma_step_k.cu",
     "test_load_store_if.cu",
     "test_vector_add.cu",
     "test_async_load.cu",

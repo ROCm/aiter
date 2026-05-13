@@ -111,8 +111,9 @@ def mp_lock(
 
 
 def get_hip_version():
+    hipconfig_home = shutil.which("hipconfig")
     version = subprocess.run(
-        "/opt/rocm/bin/hipconfig --version", shell=True, capture_output=True, text=True
+        f"{hipconfig_home} --version", shell=True, capture_output=True, text=True
     )
     return parse(version.stdout.split()[-1].rstrip("-").replace("-", "+"))
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
 
 import pandas as pd
@@ -132,10 +132,69 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A4W4}",
         "untune_file": "aiter/configs/a4w4_blockscale_untuned_gemm.csv",
+        "config_env_name": "AITER_CONFIG_GEMM_A4W4",
     }
+
+    def _clear_op_caches(self):
+        from aiter.ops.gemm_op_a4w4 import get_GEMM_config
+
+        get_GEMM_config.cache_clear()
+        if hasattr(get_GEMM_config, "gemm_dict"):
+            del get_GEMM_config.gemm_dict
 
     def _setup_specific_arguments(self):
         pass
+
+    def run_config(self, args):
+        from aiter.ops.gemm_op_a4w4 import gemm_a4w4
+        from aiter.test_common import run_perftest, checkAllclose
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            row = untunedf.iloc[i]
+            M = int(row["M"])
+            N = int(row["N"])
+            K = int(row["K"])
+            shape_str = f"({M}, {N}, {K})"
+            try:
+                (
+                    x,
+                    w,
+                    x_scales,
+                    w_scales,
+                    w_shuffle,
+                    x_scales_shuffle,
+                    w_scales_shuffle,
+                    out_ck,
+                    bias_f32,
+                ) = generate_data(M, N, K, 0)
+                out, us = run_perftest(
+                    gemm_a4w4,
+                    x,
+                    w_shuffle,
+                    x_scales_shuffle,
+                    w_scales_shuffle,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = run_torch(x, w, x_scales, w_scales, dtypes.bf16)
+                err_ratio = checkAllclose(
+                    out[:M].to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
+                )
+                status = (
+                    "ok"
+                    if err_ratio <= args.errRatio
+                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                )
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as e:
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
+                )
+            finally:
+                torch.cuda.empty_cache()
+        return results
 
     def calculate(self, results, bpes=(1 / 2, 1 / 2, 2)):
         return super().calculate(results, bpes=bpes)
@@ -158,7 +217,8 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         return kernel_dict
 
     def getKernelName(self, kernelId):
-        if kernelId < 0 or kernelId > len(kernels_list):
+        # kernels_list is a dict keyed by kernel index; do not use len() bounds only.
+        if kernelId is None or kernelId < 0 or kernelId not in kernels_list:
             return None
         return kernels_list[kernelId].name
 
@@ -168,19 +228,17 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         tunedf,
         args,
     ):
-        issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
-        shape_grouped = False
+        shape_grouped = args.shape_grouped
         errRatio = args.errRatio
-        from aiter.jit.utils.chip_info import get_gfx
+        from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
         if get_gfx() not in ["gfx950"]:
             print(f"tuning is not supported in this chip {get_gfx()}")
             return []
-        gpu = torch.cuda.current_device()
-        device_properties = torch.cuda.get_device_properties(gpu)
-        cu_num = device_properties.multi_processor_count
+        gfx = self.get_gfx()
+        cu_num = self.get_cu_num()
         task = []
         tasks_in_data = []
 
@@ -189,16 +247,16 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         gemm_asm_data_idx = [0, 4, 5, 6, 7, 8]
         torch_data_idx = [0, 1, 2, 3]
         seed = 1000
-        for i in range(len(untunedf)):
-            M = untunedf.loc[i, "M"]
-            N = untunedf.loc[i, "N"]
-            K = untunedf.loc[i, "K"]
+        for shape_idx in range(len(untunedf)):
+            row = untunedf.iloc[shape_idx]
+            # Native int keys so post_process grouping matches single-shape runs (no np.int64 vs int split).
+            M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
 
             total_kernel_nums = 0
             seed = seed + 1
 
-            for i in range(ck_kernels_num):
-                kernel = kernels_list[i]
+            for kernel_idx in range(ck_kernels_num):
+                kernel = kernels_list[kernel_idx]
                 maxsplitK = (
                     aiter.compute_gemm_SplitK(
                         M,
@@ -212,7 +270,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     else 0
                 )
                 for splitK in range(maxsplitK + 1):
-                    info = ((cu_num, M, N, K), i, splitK, "")
+                    info = ((gfx, cu_num, M, N, K), kernel_idx, splitK, "")
                     task.append(
                         (
                             info,
@@ -221,7 +279,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             run_gemm_a4w4_blockscale,
                             (
                                 gemm_a4w4_data_idx,
-                                i,
+                                kernel_idx,
                                 splitK,
                             ),
                             {
@@ -260,7 +318,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     maxsplitK = 0
                 for splitK in range(maxsplitK + 1):
                     kernel_name = kernelName[0]
-                    info = ((cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
+                    info = ((gfx, cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
                     task.append(
                         (
                             info,

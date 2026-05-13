@@ -7,22 +7,22 @@
 
 ### Aiter
 - runs used: `10`
-- discovered files: `61`
-- with samples: `61`
-- added: `1`
-- updated: `49`
-- unchanged: `11`
+- discovered files: `67`
+- with samples: `67`
+- added: `4`
+- updated: `59`
+- unchanged: `4`
 - defaulted (no history): `0`
-- removed stale entries: `0`
+- removed stale entries: `1`
 - defaulted files list: `none`
 
 ### Triton
 - runs used: `10`
-- discovered files: `70`
-- with samples: `58`
-- added: `1`
-- updated: `42`
-- unchanged: `27`
-- defaulted (no history): `12`
+- discovered files: `89`
+- with samples: `89`
+- added: `8`
+- updated: `76`
+- unchanged: `5`
+- defaulted (no history): `0`
 - removed stale entries: `0`
-- defaulted files list: `op_tests/triton_tests/attention/test_fp8_mqa_logits.py, op_tests/triton_tests/attention/test_la.py, op_tests/triton_tests/attention/test_la_paged.py, op_tests/triton_tests/attention/test_mha_with_sink.py, op_tests/triton_tests/attention/test_unified_attention.py, op_tests/triton_tests/fusions/test_fused_mul_add.py, op_tests/triton_tests/gemm/batched/test_batched_gemm_a16wfp4.py, op_tests/triton_tests/gemm/feed_forward/test_ff_a16w16_fused.py, op_tests/triton_tests/moe/test_moe_gemm_a4w4.py, op_tests/triton_tests/rope/test_rope.py, op_tests/triton_tests/test_gated_delta_rule.py, op_tests/triton_tests/test_gmm.py`
+- defaulted files list: `none`

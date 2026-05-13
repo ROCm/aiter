@@ -325,6 +325,9 @@ void register_graph_buffers(fptr_t _fa,
 
 int64_t allocate_meta_buffer(int64_t size)
 {
+    int device_index;
+    HIP_CALL(hipGetDevice(&device_index));
+    HipDeviceGuard device_guard(device_index);
     hipStream_t stream = aiter::getCurrentHIPStream();
     void* buffer;
     hipStreamCaptureMode mode = hipStreamCaptureModeRelaxed;
@@ -356,6 +359,7 @@ void all_reduce(fptr_t _fa,
                 bool use_new, bool open_fp8_quant,
                 int64_t reg_inp_ptr, int64_t reg_inp_bytes)
 {
+    HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();
@@ -388,6 +392,7 @@ void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& out,
                     int64_t reg_ptr, int64_t reg_bytes)
 {
+    HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t inp_numel  = inp.numel();
@@ -412,6 +417,7 @@ void all_gather_reg(fptr_t _fa,
                     const aiter_tensor_t& out,
                     int64_t dim)
 {
+    HipDeviceGuard device_guard(inp.device_id);
     int64_t last_dim_size = inp.size(-1);
     _all_gather(_fa, inp.data_ptr(), out.data_ptr(), inp.numel(), inp.dtype(),
                 last_dim_size, dim);
@@ -424,6 +430,7 @@ void all_gather_unreg(fptr_t _fa,
                       int64_t reg_bytes,
                       int64_t dim)
 {
+    HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     int64_t data_bytes = inp.numel() * inp.element_size();
     int64_t last_dim_size = inp.size(-1);
@@ -446,6 +453,7 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              int64_t reg_ptr, int64_t reg_bytes,
                              bool use_1stage)
 {
+    HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();
@@ -484,6 +492,7 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    int64_t reg_ptr, int64_t reg_bytes,
                                    bool use_1stage)
 {
+    HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();
@@ -508,6 +517,81 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
                                  dtype, (float)eps, m, n, use_1stage);
+    }
+}
+
+void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
+                                             const aiter_tensor_t& inp,
+                                             const aiter_tensor_t& res_inp,
+                                             const aiter_tensor_t& res_out,
+                                             const aiter_tensor_t& out,
+                                             const aiter_tensor_t& scale_out,
+                                             const aiter_tensor_t& w,
+                                             double eps,
+                                             int64_t group_size,
+                                             int64_t reg_ptr, int64_t reg_bytes,
+                                             bool use_1stage,
+                                             int64_t bf16_out_ptr)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto dtype     = inp.dtype();
+    int64_t numel  = inp.numel();
+    int64_t data_bytes = numel * inp.element_size();
+    int n = (int)w.numel();
+    int m = (int)(numel / w.numel());
+
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+
+    void* inp_ptr = inp.data_ptr();
+    if(reg_ptr != 0)
+    {
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, inp.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        inp_ptr = (void*)reg_ptr;
+    }
+
+    // bf16_out_ptr is an opaque data pointer (0 = not requested). When non-zero
+    // the fused kernel writes the pre-quantization bf16/fp16 normed output so
+    // GDN-style callers can keep an unquantized view without launching a
+    // separate per-group quant kernel.
+    void* bf16_out = reinterpret_cast<void*>(bf16_out_ptr);
+
+    switch(dtype)
+    {
+#if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16: {
+        fa->dispatchFusedAllReduceRMSNormQuantPerGroup<opus::bf16_t, fp8_type>(
+            stream,
+            reinterpret_cast<opus::bf16_t*>(inp_ptr),
+            reinterpret_cast<opus::bf16_t*>(res_inp.data_ptr()),
+            reinterpret_cast<opus::bf16_t*>(res_out.data_ptr()),
+            reinterpret_cast<fp8_type*>(out.data_ptr()),
+            reinterpret_cast<float*>(scale_out.data_ptr()),
+            reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
+            (float)eps, m, n, (int)group_size, use_1stage,
+            reinterpret_cast<opus::bf16_t*>(bf16_out));
+        break;
+    }
+#endif
+    case AITER_DTYPE_fp16: {
+        fa->dispatchFusedAllReduceRMSNormQuantPerGroup<opus::fp16_t, fp8_type>(
+            stream,
+            reinterpret_cast<opus::fp16_t*>(inp_ptr),
+            reinterpret_cast<opus::fp16_t*>(res_inp.data_ptr()),
+            reinterpret_cast<opus::fp16_t*>(res_out.data_ptr()),
+            reinterpret_cast<fp8_type*>(out.data_ptr()),
+            reinterpret_cast<float*>(scale_out.data_ptr()),
+            reinterpret_cast<opus::fp16_t*>(w.data_ptr()),
+            (float)eps, m, n, (int)group_size, use_1stage,
+            reinterpret_cast<opus::fp16_t*>(bf16_out));
+        break;
+    }
+    default:
+        throw std::runtime_error(
+            "fused_allreduce_rmsnorm_quant_per_group only supports float16 and bfloat16");
     }
 }
 

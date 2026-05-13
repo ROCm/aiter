@@ -7,6 +7,7 @@ from .common import apply_rotary
 from .utils import (
     DEBUG,
     AUTOTUNE,
+    AutotuneMode,
     get_arch,
     get_padded_headsize,
     get_shape_from_layout,
@@ -28,7 +29,7 @@ FWD_DECODE_AUTOTUNE_KEYS = [
 MAX_BLOCK_M = 64
 
 
-def get_fwd_decode_configs(autotune: bool):
+def get_fwd_decode_configs(mode: AutotuneMode):
     """
     Returns configs for both the splitK kernel and reduce kernel.
 
@@ -36,9 +37,8 @@ def get_fwd_decode_configs(autotune: bool):
         (splitk_configs, reduce_config): Tuple of config lists for each kernel
     """
 
-    if not autotune:
+    if mode == "off":
         arch = get_arch()
-
         if arch.is_rdna:
             return (
                 [
@@ -62,7 +62,6 @@ def get_fwd_decode_configs(autotune: bool):
                 [triton.Config({}, num_stages=1, num_warps=4)],
             )
         else:
-            # Default / fallback
             return (
                 [
                     triton.Config(
@@ -74,45 +73,82 @@ def get_fwd_decode_configs(autotune: bool):
                 [triton.Config({}, num_stages=1, num_warps=4)],
             )
 
-    # ===================== Autotune Sweep =====================
-    arch = get_arch()
-    splitk_configs = []
+    elif mode == "on":
+        arch = get_arch()
+        if arch.is_rdna:
+            return (
+                [
+                    triton.Config(
+                        {"BLOCK_M": 32, "BLOCK_N": 32},
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ],
+                [triton.Config({}, num_stages=1, num_warps=4)],
+            )
+        elif arch.is_cdna:
+            return (
+                [
+                    triton.Config(
+                        {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ],
+                [triton.Config({}, num_stages=1, num_warps=4)],
+            )
+        else:
+            return (
+                [
+                    triton.Config(
+                        {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ],
+                [triton.Config({}, num_stages=1, num_warps=4)],
+            )
 
-    BLOCK_M_OPTIONS = [64, 32, 16]
-    BLOCK_N_OPTIONS = [128, 64, 32, 16]
-    NUM_WARPS_OPTIONS = [2, 4]
-    NUM_STAGES_OPTIONS = [1]
-    WAVES_PER_EU_OPTIONS = [4, 2, 1]
+    else:  # sweep
+        arch = get_arch()
+        splitk_configs = []
 
-    # Ensure BLOCK_M options don't exceed MAX_BLOCK_M
-    assert all(
-        bm <= MAX_BLOCK_M for bm in BLOCK_M_OPTIONS
-    ), f"BLOCK_M_OPTIONS {BLOCK_M_OPTIONS} exceeds MAX_BLOCK_M {MAX_BLOCK_M}"
+        BLOCK_M_OPTIONS = [64, 32, 16]
+        BLOCK_N_OPTIONS = [128, 64, 32, 16]
+        NUM_WARPS_OPTIONS = [2, 4]
+        NUM_STAGES_OPTIONS = [1]
+        WAVES_PER_EU_OPTIONS = [4, 2, 1]
 
-    for bm in BLOCK_M_OPTIONS:
-        for bn in BLOCK_N_OPTIONS:
-            for waves in WAVES_PER_EU_OPTIONS:
-                for nw in NUM_WARPS_OPTIONS:
-                    for ns in NUM_STAGES_OPTIONS:
-                        splitk_configs.append(
-                            triton.Config(
-                                {
-                                    "BLOCK_M": bm,
-                                    "BLOCK_N": bn,
-                                    "waves_per_eu": waves,
-                                },
-                                num_stages=ns,
-                                num_warps=nw,
+        # Ensure BLOCK_M options don't exceed MAX_BLOCK_M
+        assert all(
+            bm <= MAX_BLOCK_M for bm in BLOCK_M_OPTIONS
+        ), f"BLOCK_M_OPTIONS {BLOCK_M_OPTIONS} exceeds MAX_BLOCK_M {MAX_BLOCK_M}"
+
+        for bm in BLOCK_M_OPTIONS:
+            for bn in BLOCK_N_OPTIONS:
+                for waves in WAVES_PER_EU_OPTIONS:
+                    for nw in NUM_WARPS_OPTIONS:
+                        for ns in NUM_STAGES_OPTIONS:
+                            splitk_configs.append(
+                                triton.Config(
+                                    {
+                                        "BLOCK_M": bm,
+                                        "BLOCK_N": bn,
+                                        "waves_per_eu": waves,
+                                    },
+                                    num_stages=ns,
+                                    num_warps=nw,
+                                )
                             )
-                        )
 
-    # Reduce kernel configs - sweep num_warps
-    NUM_WARPS_REDUCE_OPTIONS = [2, 4]
-    reduce_configs = [
-        triton.Config({}, num_stages=1, num_warps=nw) for nw in NUM_WARPS_REDUCE_OPTIONS
-    ]
+        # Reduce kernel configs - sweep num_warps
+        NUM_WARPS_REDUCE_OPTIONS = [2, 4]
+        reduce_configs = [
+            triton.Config({}, num_stages=1, num_warps=nw)
+            for nw in NUM_WARPS_REDUCE_OPTIONS
+        ]
 
-    return splitk_configs, reduce_configs
+        return splitk_configs, reduce_configs
 
 
 fwd_decode_splitk_configs, fwd_decode_reduce_configs = get_fwd_decode_configs(AUTOTUNE)
@@ -331,6 +367,32 @@ def _fwd_kernel_splitK(
     USE_BLOCK_TABLE: tl.constexpr,
     IS_FP8: tl.constexpr,  # FP8 flag
 ):
+    # Cast strides to int64 to prevent overflow in pointer arithmetic.
+    # stride * index can exceed int32 range for large tensors (e.g. batch=64, sk=8192, d=56).
+    # See mha.py USE_INT64_STRIDES for the same pattern used in the prefill kernel.
+    stride_qz_i64 = tl.cast(stride_qz, tl.int64)
+    stride_qm_i64 = tl.cast(stride_qm, tl.int64)
+    stride_qg_i64 = tl.cast(stride_qg, tl.int64)
+    stride_qh_i64 = tl.cast(stride_qh, tl.int64)
+    stride_qd_i64 = tl.cast(stride_qd, tl.int64)
+    stride_kz_i64 = tl.cast(stride_kz, tl.int64)
+    stride_kn_i64 = tl.cast(stride_kn, tl.int64)
+    stride_kg_i64 = tl.cast(stride_kg, tl.int64)
+    stride_kh_i64 = tl.cast(stride_kh, tl.int64)
+    stride_kd_i64 = tl.cast(stride_kd, tl.int64)
+    stride_vz_i64 = tl.cast(stride_vz, tl.int64)
+    stride_vn_i64 = tl.cast(stride_vn, tl.int64)
+    stride_vg_i64 = tl.cast(stride_vg, tl.int64)
+    stride_vh_i64 = tl.cast(stride_vh, tl.int64)
+    stride_vd_i64 = tl.cast(stride_vd, tl.int64)
+    stride_osk_zhg_i64 = tl.cast(stride_osk_zhg, tl.int64)
+    stride_osk_s_i64 = tl.cast(stride_osk_s, tl.int64)
+    stride_osk_m_i64 = tl.cast(stride_osk_m, tl.int64)
+    stride_osk_d_i64 = tl.cast(stride_osk_d, tl.int64)
+    stride_mzhg_i64 = tl.cast(stride_mzhg, tl.int64)
+    stride_ms_i64 = tl.cast(stride_ms, tl.int64)
+    stride_m2_i64 = tl.cast(stride_m2, tl.int64)
+
     # get program ids
     pid_m = tl.program_id(0)
     pid_zhg = tl.program_id(1)
@@ -391,8 +453,10 @@ def _fwd_kernel_splitK(
     offs_d = tl.arange(0, BLOCK_DMODEL)
 
     # compute ptrs
-    q_offset = Q + hq_id * stride_qh + z_id * stride_qz + g_id * stride_qg
-    q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    q_offset = Q + hq_id * stride_qh_i64 + z_id * stride_qz_i64 + g_id * stride_qg_i64
+    q_ptrs = (
+        q_offset + offs_m[:, None] * stride_qm_i64 + offs_d[None, :] * stride_qd_i64
+    )
 
     # Handle block table for paged attention
     if USE_BLOCK_TABLE:
@@ -401,10 +465,16 @@ def _fwd_kernel_splitK(
         block_table_ptr = Block_table + z_id * stride_bt_b
     else:
         k_offset = (
-            K + hk_id * stride_kh + cache_batch_idx * stride_kz + g_id * stride_kg
+            K
+            + hk_id * stride_kh_i64
+            + cache_batch_idx * stride_kz_i64
+            + g_id * stride_kg_i64
         )
         v_offset = (
-            V + hv_id * stride_vh + cache_batch_idx * stride_vz + g_id * stride_vg
+            V
+            + hv_id * stride_vh_i64
+            + cache_batch_idx * stride_vz_i64
+            + g_id * stride_vg_i64
         )
 
     # compute masks
@@ -486,15 +556,15 @@ def _fwd_kernel_splitK(
                     # Calculate base addresses for K and V in this physical block
                     k_base = (
                         K
-                        + physical_block * BLOCK_SIZE_K * stride_kn
-                        + hk_id * stride_kh
-                        + g_id * stride_kg
+                        + physical_block * BLOCK_SIZE_K * stride_kn_i64
+                        + hk_id * stride_kh_i64
+                        + g_id * stride_kg_i64
                     )
                     v_base = (
                         V
-                        + physical_block * BLOCK_SIZE_K * stride_vn
-                        + hv_id * stride_vh
-                        + g_id * stride_vg
+                        + physical_block * BLOCK_SIZE_K * stride_vn_i64
+                        + hv_id * stride_vh_i64
+                        + g_id * stride_vg_i64
                     )
 
                     # Offsets within the current block
@@ -517,13 +587,13 @@ def _fwd_kernel_splitK(
                     # Load K and V
                     kT_ptrs = (
                         k_base
-                        + offs_d[:, None] * stride_kd
-                        + block_offs[None, :] * stride_kn
+                        + offs_d[:, None] * stride_kd_i64
+                        + block_offs[None, :] * stride_kn_i64
                     )
                     v_ptrs = (
                         v_base
-                        + block_offs[:, None] * stride_vn
-                        + offs_d[None, :] * stride_vd
+                        + block_offs[:, None] * stride_vn_i64
+                        + offs_d[None, :] * stride_vd_i64
                     )
 
                     kT = tl.load(kT_ptrs, mask=kT_mask_final, other=0.0)
@@ -565,13 +635,13 @@ def _fwd_kernel_splitK(
         for start_n in range(lo, hi, BLOCK_N):
             kT_ptrs = (
                 k_offset
-                + offs_d[:, None] * stride_kd
-                + (start_n + offs_n)[None, :] * stride_kn
+                + offs_d[:, None] * stride_kd_i64
+                + (start_n + offs_n)[None, :] * stride_kn_i64
             )
             V_ptrs = (
                 v_offset
-                + (start_n + offs_n)[:, None] * stride_vn
-                + offs_d[None, :] * stride_vd
+                + (start_n + offs_n)[:, None] * stride_vn_i64
+                + offs_d[None, :] * stride_vd_i64
             )
 
             # load k
@@ -611,9 +681,13 @@ def _fwd_kernel_splitK(
             )
 
     # write back O
-    osk_offset = Out_splitK + pid_zhg * stride_osk_zhg + pid_splitk * stride_osk_s
+    osk_offset = (
+        Out_splitK + pid_zhg * stride_osk_zhg_i64 + pid_splitk * stride_osk_s_i64
+    )
     osk_ptrs = (
-        osk_offset + offs_m[:, None] * stride_osk_m + offs_d[None, :] * stride_osk_d
+        osk_offset
+        + offs_m[:, None] * stride_osk_m_i64
+        + offs_d[None, :] * stride_osk_d_i64
     )
     tl.store(
         osk_ptrs,
@@ -622,10 +696,10 @@ def _fwd_kernel_splitK(
     )
 
     # write metadata for split-K reduction
-    metadata_offset = Metadata + pid_zhg * stride_mzhg + pid_splitk * stride_ms
+    metadata_offset = Metadata + pid_zhg * stride_mzhg_i64 + pid_splitk * stride_ms_i64
     metadata_ptr = metadata_offset + offs_m
     tl.store(metadata_ptr, m_i)
-    tl.store(metadata_ptr + stride_m2, l_i)
+    tl.store(metadata_ptr + stride_m2_i64, l_i)
 
 
 FWD_DECODE_REDUCE_AUTOTUNE_KEYS = [
@@ -670,6 +744,21 @@ def _splitK_reduce(
     MASK_SPLITK: tl.constexpr,
     PADDED_HEAD: tl.constexpr,
 ):
+    # Cast strides to int64 to prevent overflow in pointer arithmetic.
+    stride_osk_zhg_i64 = tl.cast(stride_osk_zhg, tl.int64)
+    stride_osk_s_i64 = tl.cast(stride_osk_s, tl.int64)
+    stride_osk_m_i64 = tl.cast(stride_osk_m, tl.int64)
+    stride_osk_k_i64 = tl.cast(stride_osk_k, tl.int64)
+    stride_mzhg_i64 = tl.cast(stride_mzhg, tl.int64)
+    stride_m2_i64 = tl.cast(stride_m2, tl.int64)
+    stride_ms_i64 = tl.cast(stride_ms, tl.int64)
+    stride_mm_i64 = tl.cast(stride_mm, tl.int64)
+    stride_oz_i64 = tl.cast(stride_oz, tl.int64)
+    stride_oh_i64 = tl.cast(stride_oh, tl.int64)
+    stride_og_i64 = tl.cast(stride_og, tl.int64)
+    stride_om_i64 = tl.cast(stride_om, tl.int64)
+    stride_lse_zhg_i64 = tl.cast(stride_lse_zhg, tl.int64)
+
     # get pids
     pid_zhg = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -686,25 +775,25 @@ def _splitK_reduce(
         o_mask = None
 
     # compute ptrs
-    metadata_offset = Metadata + pid_zhg * stride_mzhg
-    metadata_ptr = metadata_offset + offs_splitK * stride_ms + pid_m * stride_mm
+    metadata_offset = Metadata + pid_zhg * stride_mzhg_i64
+    metadata_ptr = metadata_offset + offs_splitK * stride_ms_i64 + pid_m * stride_mm_i64
 
-    osk_offset = Out_splitK + pid_zhg * stride_osk_zhg + pid_m * stride_osk_m
+    osk_offset = Out_splitK + pid_zhg * stride_osk_zhg_i64 + pid_m * stride_osk_m_i64
     osk_ptr = (
         osk_offset
-        + offs_splitK[:, None] * stride_osk_s
-        + offs_k[None, :] * stride_osk_k
+        + offs_splitK[:, None] * stride_osk_s_i64
+        + offs_k[None, :] * stride_osk_k_i64
     )
 
     # read max values of each splitK
     if MASK_SPLITK:
         splitK_mask = offs_splitK < split_k
         l_m = tl.load(metadata_ptr, mask=splitK_mask, other=float("-inf"))
-        l_sum = tl.load(metadata_ptr + stride_m2, mask=splitK_mask, other=0.0)
+        l_sum = tl.load(metadata_ptr + stride_m2_i64, mask=splitK_mask, other=0.0)
         acc = tl.load(osk_ptr, mask=splitK_mask[:, None], other=0.0)
     else:
         l_m = tl.load(metadata_ptr)
-        l_sum = tl.load(metadata_ptr + stride_m2)
+        l_sum = tl.load(metadata_ptr + stride_m2_i64)
         acc = tl.load(osk_ptr)
 
     g_m = tl.max(l_m, axis=0)
@@ -723,12 +812,14 @@ def _splitK_reduce(
     z_id = pid_zhg // (H * G)
     h_id = (pid_zhg // G) % H
     g_id = pid_zhg % G
-    out_offset = Out + z_id * stride_oz + h_id * stride_oh + g_id * stride_og
-    out_ptr = out_offset + pid_m * stride_om + offs_k
+    out_offset = (
+        Out + z_id * stride_oz_i64 + h_id * stride_oh_i64 + g_id * stride_og_i64
+    )
+    out_ptr = out_offset + pid_m * stride_om_i64 + offs_k
     tl.store(out_ptr, acc_out, mask=o_mask)
 
     # Store lse
-    l_ptrs = LSE + pid_zhg * stride_lse_zhg + pid_m
+    l_ptrs = LSE + pid_zhg * stride_lse_zhg_i64 + pid_m
     lse_val = tl.where(g_sum > 0, (g_m + tl.math.log2(g_sum)) / 1.44269504, g_m)
     tl.store(l_ptrs, lse_val)
 
@@ -1074,7 +1165,12 @@ def attention_forward_decode_triton_impl(
 
     # create intermediate tensors
     out_splitk = torch.empty(
-        [batch_size * n_group_q * heads_per_group_q, split_k, seqlen_q_ceil, dim_kc],
+        [
+            batch_size * n_group_q * heads_per_group_q,
+            split_k,
+            seqlen_q_ceil,
+            dim_padded,
+        ],
         dtype=torch.float32,
         device=q.device,
     )

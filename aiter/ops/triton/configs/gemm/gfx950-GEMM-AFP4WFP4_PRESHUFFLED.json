@@ -50,7 +50,7 @@
   "M_LEQ_128": {
     "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 64,
-    "BLOCK_SIZE_K": 512,
+    "BLOCK_SIZE_K": 256,
     "GROUP_SIZE_M": 1,
     "num_warps": 4,
     "num_stages": 3,
@@ -62,7 +62,7 @@
   "M_LEQ_256": {
     "BLOCK_SIZE_M": 128,
     "BLOCK_SIZE_N": 64,
-    "BLOCK_SIZE_K": 512,
+    "BLOCK_SIZE_K": 256,
     "GROUP_SIZE_M": 1,
     "num_warps": 4,
     "num_stages": 3,
@@ -74,7 +74,7 @@
   "M_LEQ_512": {
     "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 128,
-    "BLOCK_SIZE_K": 512,
+    "BLOCK_SIZE_K": 256,
     "GROUP_SIZE_M": 4,
     "num_warps": 4,
     "num_stages": 2,

@@ -5,10 +5,8 @@ import logging
 from typing import Optional
 
 # from ..dist.utils import get_open_port, get_distributed_init_method, get_ip
-import aiter
 import torch
 import torch.distributed as dist
-from torch import Tensor
 
 from ..dist.parallel_state import (
     destroy_distributed_environment,
@@ -61,7 +59,6 @@ def init_dist_env(
         )
         ca_comm.signal = signal
         ca_comm.register_input_buffer(signal)
-        # buffer: expose the pool's input buffer tensor for ASM-path functions
         ca_comm.buffer = ca_comm._pool["input"].tensor
     logger.debug(f"RANK: {rankID}/{tensor_model_parallel_size} init_dist_env...")
 
@@ -71,69 +68,3 @@ def destroy_dist_env():
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
-
-
-def all_reduce_asm(inp: torch.Tensor):
-    tp_grp = get_tp_group()
-    ca = tp_grp.device_communicator.ca_comm
-    if ca._IS_CAPTURING:
-        if torch.cuda.is_current_stream_capturing():
-            return aiter.all_reduce_asm_(
-                inp, ca._ptr, ca.signal, ca.buffer, ca._IS_CAPTURING
-            )
-        else:
-            # if warm up, mimic the allocation pattern
-            # since custom allreduce is out-of-place
-            return torch.empty_like(inp)
-    else:
-        # note: outside of cuda graph context,
-        # custom allreduce incurs a cost of hipMemcpy, which should
-        # be small(<=1% of overall latency) compared to the performance
-        # gains of using custom kernels
-        return aiter.all_reduce_asm_(
-            inp, ca._ptr, ca.signal, ca.buffer, ca._IS_CAPTURING
-        )
-
-
-def all_reduce_rmsnorm(
-    input: Tensor, residual_in: Tensor, weight: Tensor, bias: Tensor, epsilon: float
-):
-    tp_grp = get_tp_group()
-    ca = tp_grp.device_communicator.ca_comm
-
-    return aiter.all_reduce_rmsnorm_(
-        input,
-        residual_in,
-        weight,
-        bias,
-        epsilon,
-        ca._ptr,
-        ca.signal,
-        ca.buffer,
-        ca._IS_CAPTURING,
-    )
-
-
-def all_reduce_rmsnorm_quant(
-    input: Tensor,
-    residual_in: Tensor,
-    xscale: Tensor,
-    weight: Tensor,
-    bias: Tensor,
-    epsilon: float,
-):
-    tp_grp = get_tp_group()
-    ca = tp_grp.device_communicator.ca_comm
-
-    return aiter.all_reduce_rmsnorm_quant_(
-        input,
-        residual_in,
-        xscale,
-        weight,
-        bias,
-        epsilon,
-        ca._ptr,
-        ca.signal,
-        ca.buffer,
-        ca._IS_CAPTURING,
-    )

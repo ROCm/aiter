@@ -23,6 +23,8 @@ struct aiter_tensor_t
     int dim() const { return ndim; }
     AiterDtype dtype() const { return dtype_; }
     size_t element_size() const { return AiterDtype_element_size(dtype_); }
+    bool is_gpu() const { return device_id >= 0; }
+    bool is_cpu() const { return device_id == -1; }
 
     bool is_contiguous() const
     {
@@ -51,46 +53,61 @@ public:
                              int device_id,
                              hipStream_t stream = nullptr)
     {
-        (void)stream; // reserved for future async alloc
         AiterTensor t;
         t.init_shape(dims, dtype, device_id);
+        t.stream_ = stream;
 
         size_t nbytes = t.numel_ * AiterDtype_element_size(dtype);
         if(nbytes > 0)
         {
-            int prev_dev;
-            HIP_CALL(hipGetDevice(&prev_dev));
-            HIP_CALL(hipSetDevice(device_id));
-            HIP_CALL(hipMalloc(&t.ptr, nbytes));
-            HIP_CALL(hipSetDevice(prev_dev));
+            HipDeviceGuard guard(device_id);
+            if(stream)
+                HIP_CALL(hipMallocAsync(&t.ptr, nbytes, stream));
+            else
+                HIP_CALL(hipMalloc(&t.ptr, nbytes));
         }
         t.owns_memory_ = true;
         return t;
     }
 
-    /// Allocate uninitialized GPU memory with same shape/dtype/device as `other`.
+    /// Allocate uninitialized GPU memory with same shape/strides/dtype/device as `other`.
+    /// Preserves the original strides of `other`.
+    /// Allocates enough storage span to cover the full positive-stride layout.
     static AiterTensor empty_like(const aiter_tensor_t* other,
                                   hipStream_t stream = nullptr)
     {
+        AITER_CHECK(other != nullptr, __func__, ": other must not be null");
+        AITER_CHECK(other->ndim <= 8, __func__, ": ndim ", other->ndim, " exceeds max 8");
         AiterTensor t;
         t.ndim = other->ndim;
-        for(int i = 0; i < other->ndim; ++i)
-        {
-            t.shape[i] = other->shape[i];
-            t.strides[i] = other->strides[i];
-        }
         t.numel_ = other->numel_;
         t.dtype_ = other->dtype_;
         t.device_id = other->device_id;
 
-        size_t nbytes = t.numel_ * AiterDtype_element_size(t.dtype_);
+        size_t storage_nelem = (t.numel_ == 0) ? 0 : 1;
+        for(int i = 0; i < other->ndim; ++i)
+        {
+            t.shape[i] = other->shape[i];
+            t.strides[i] = other->strides[i];
+
+            AITER_CHECK(other->strides[i] >= 0,
+                        __func__,
+                        ": negative strides are not supported");
+            if(storage_nelem > 0 && other->shape[i] > 1)
+                storage_nelem += static_cast<size_t>(other->shape[i] - 1) *
+                                 static_cast<size_t>(other->strides[i]);
+        }
+
+        t.stream_ = stream;
+
+        size_t nbytes = storage_nelem * AiterDtype_element_size(t.dtype_);
         if(nbytes > 0)
         {
-            int prev_dev;
-            HIP_CALL(hipGetDevice(&prev_dev));
-            HIP_CALL(hipSetDevice(t.device_id));
-            HIP_CALL(hipMalloc(&t.ptr, nbytes));
-            HIP_CALL(hipSetDevice(prev_dev));
+            HipDeviceGuard guard(t.device_id);
+            if(stream)
+                HIP_CALL(hipMallocAsync(&t.ptr, nbytes, stream));
+            else
+                HIP_CALL(hipMalloc(&t.ptr, nbytes));
         }
         t.owns_memory_ = true;
         return t;
@@ -106,6 +123,7 @@ public:
         size_t nbytes = t.numel_ * AiterDtype_element_size(dtype);
         if(nbytes > 0)
         {
+            HipDeviceGuard guard(device_id);
             if(stream)
                 HIP_CALL(hipMemsetAsync(t.ptr, 0, nbytes, stream));
             else
@@ -118,7 +136,11 @@ public:
     {
         if(owns_memory_ && ptr)
         {
-            hipFree(ptr);
+            HipDeviceGuard guard(device_id);
+            if(stream_)
+                hipFreeAsync(ptr, stream_);
+            else
+                hipFree(ptr);
             ptr = nullptr;
         }
     }
@@ -126,7 +148,8 @@ public:
     // Move constructor
     AiterTensor(AiterTensor&& other) noexcept
         : aiter_tensor_t(static_cast<aiter_tensor_t&>(other)),
-          owns_memory_(other.owns_memory_)
+          owns_memory_(other.owns_memory_),
+          stream_(other.stream_)
     {
         other.owns_memory_ = false;
         other.ptr = nullptr;
@@ -138,9 +161,16 @@ public:
         if(this != &other)
         {
             if(owns_memory_ && ptr)
-                hipFree(ptr);
+            {
+                HipDeviceGuard guard(device_id);
+                if(stream_)
+                    hipFreeAsync(ptr, stream_);
+                else
+                    hipFree(ptr);
+            }
             static_cast<aiter_tensor_t&>(*this) = static_cast<aiter_tensor_t&>(other);
             owns_memory_ = other.owns_memory_;
+            stream_ = other.stream_;
             other.owns_memory_ = false;
             other.ptr = nullptr;
         }
@@ -153,6 +183,7 @@ public:
 
 private:
     bool owns_memory_ = false;
+    hipStream_t stream_ = nullptr;
 
     AiterTensor()
     {
@@ -162,6 +193,7 @@ private:
 
     void init_shape(std::initializer_list<int64_t> dims, AiterDtype dt, int dev)
     {
+        AITER_CHECK(dims.size() <= 8, "AiterTensor supports at most 8 dims, got ", dims.size());
         ndim = static_cast<int>(dims.size());
         int i = 0;
         for(auto d : dims)

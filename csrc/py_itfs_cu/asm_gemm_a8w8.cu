@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_tensor.h"
+#include "aiter_ctypes_error.h"
 #include "asm_i8gemm_configs.hpp"
 #include <cmath>
 #include <memory>
@@ -121,7 +122,11 @@ static std::tuple<std::string, int> get_heuristic_kernel(
     return std::make_tuple(selectedKernelName, selectedsplitK);
 }
 
-AITER_C_ITFS void gemm_a8w8_asm(
+AITER_CTYPES_ERROR_DEF
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    gemm_a8w8_asm,
+    (
     aiter_tensor_t* A,       // A:[M, K] i8
     aiter_tensor_t* B,       // B:[N, K] i8 -> shuffle layout(32,16)
     aiter_tensor_t* A_scale, // A_scale:[M, 1] f32
@@ -131,7 +136,8 @@ AITER_C_ITFS void gemm_a8w8_asm(
     aiter_tensor_t* bias,    // bias:[1, N] f32
     int          bpreshuffle,
     int          splitK,
-    hipStream_t  stream)
+    hipStream_t  stream),
+    (A, B, A_scale, B_scale, out, kernelName, bias, bpreshuffle, splitK, stream))
 {
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16,
                 "GEMM A8W8 asm only support BFloat16 output now!");
@@ -178,14 +184,14 @@ AITER_C_ITFS void gemm_a8w8_asm(
                    std::hash<int>()(splitk_key) ^ std::hash<bool>()(shuffle_key);
         }
     };
-    static std::unordered_map<DictKey, std::tuple<std::string, int>, SimpleHash>
+    static SynchronizedCache<DictKey, std::tuple<std::string, int>, SimpleHash>
         heuristic_kernel_dict;
 
     if(config_map->empty())
     {
         AITER_CHECK(false, __func__, " no kernel support a8w8 for this gpu arch");
     }
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     std::string arch_id = get_gpu_arch();
     std::string selectedName = (kernelName && kernelName[0] != '\0')
                                    ? arch_id + kernelName
@@ -193,22 +199,11 @@ AITER_C_ITFS void gemm_a8w8_asm(
     int selectedksplit = opt_splitK.value_or(0) ?: 1;
     if(selectedName.empty())
     {
-        auto it = heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, opt_splitK, opt_bpreshuffle));
-        if(it != heuristic_kernel_dict.end())
-        {
-            auto res       = it->second;
-            selectedName   = std::get<0>(res);
-            selectedksplit = std::get<1>(res);
-        }
-        else
-        {
-            auto it = get_heuristic_kernel(Mdim, Ndim, Kdim, arch_id, opt_splitK, opt_bpreshuffle, config_map);
-
-            selectedName   = std::get<0>(it);
-            selectedksplit = std::get<1>(it);
-            heuristic_kernel_dict[{Mdim, Ndim, Kdim, opt_splitK, opt_bpreshuffle}] =
-                std::make_tuple(selectedName, selectedksplit);
-        }
+        std::tie(selectedName, selectedksplit) = heuristic_kernel_dict.get_or_create(
+            DictKey(Mdim, Ndim, Kdim, splitK, bpreshuffle), [&]() {
+                return get_heuristic_kernel(
+                    Mdim, Ndim, Kdim, arch_id, splitK, bpreshuffle, config_map);
+            });
     }
 
     AiterAsmKernel* impl_ptr = nullptr;
@@ -232,21 +227,40 @@ AITER_C_ITFS void gemm_a8w8_asm(
 
         if(cfg.splitK == 1 && selectedksplit > 0)
         {
-            int k_per_split         = (Kdim + ks - 1) / selectedksplit;
+            // Step 1: Validate or auto-correct splitK for TileK(128) alignment.
+            //   - Heuristic path: auto-correct to the nearest valid splitK.
+            //   - Explicit path (tuned config): reject misaligned splitK.
+            int k_per_split         = (Kdim + selectedksplit - 1) / selectedksplit;
             int k_per_split_aligned = ((k_per_split + 127) / 128) * 128;
-
-            int actual_splitK = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
-            if(actual_splitK != selectedksplit)
+            int actual_splitK       = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
+            if(!opt_splitK.has_value())
             {
-                printf("warning: change splitK form %d to %d to make sure every block deals with "
-                       "128x k\n",
-                       selectedksplit,
-                       actual_splitK);
-                selectedksplit = actual_splitK;
+                if(actual_splitK != selectedksplit)
+                {
+                    AITER_LOG_WARNING("change splitK from " << selectedksplit << " to "
+                           << actual_splitK << " to make sure every block deals with 128x k");
+                    selectedksplit = actual_splitK;
+                }
+            }
+            else
+            {
+                AITER_CHECK(
+                    selectedksplit == actual_splitK,
+                    __func__,
+                    " Kdim alignment check failed for splitK! Kdim=", Kdim,
+                    ", selectedksplit=", selectedksplit,
+                    ", k_per_split_aligned=", k_per_split_aligned,
+                    ", actual_splitK=", actual_splitK);
             }
 
+            // Step 2: Sanity check — verify the final partition is valid.
             k_per_split         = (Kdim + selectedksplit - 1) / selectedksplit;
             k_per_split_aligned = ((k_per_split + 127) / 128) * 128;
+            AITER_CHECK(Kdim % k_per_split_aligned == 0 ||
+                       (Kdim / k_per_split_aligned) == (selectedksplit - 1),
+                       __func__, " Kdim alignment check failed for splitK!");
+
+            // Step 3: Zero output buffer for atomic accumulation across splits.
             args.ks = selectedksplit;
             if(selectedksplit > 1)
             {
@@ -254,12 +268,9 @@ AITER_C_ITFS void gemm_a8w8_asm(
             }
         }
         gdx         = gdx * selectedksplit;
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel ", selectedName);

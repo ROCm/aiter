@@ -390,6 +390,60 @@ def get_concurrency_label(row: dict[str, Any]):
     return select_primary_runner_label(get_custom_runner_labels(row))
 
 
+def load_runner_inventory(config_path: Path):
+    if not config_path.exists():
+        return {}
+
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            "PyYAML is required to load runner-config.yml for runner reports."
+        ) from exc
+
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    runners = payload.get("runners", {})
+    if not isinstance(runners, dict):
+        return {}
+
+    inventory = {}
+    for label, metadata in runners.items():
+        if not isinstance(metadata, dict):
+            continue
+
+        gpu_arch = metadata.get("gpu_arch") or "-"
+        gpu_count = metadata.get("gpu_count")
+        inventory[str(label)] = {
+            "gpu_arch": str(gpu_arch),
+            "gpu_count": str(gpu_count) if gpu_count not in (None, "") else "-",
+        }
+
+    return inventory
+
+
+def runner_label_sort_key_with_inventory(
+    label: str, runner_inventory: dict[str, dict[str, str]]
+):
+    metadata = runner_inventory.get(label, {})
+    lowered = label.lower()
+    family_source = str(metadata.get("gpu_arch") or label).lower()
+    family_match = re.search(r"(mi\d+[a-z0-9x]*)", family_source)
+    family = family_match.group(1) if family_match else "zzz"
+
+    gpu_count = metadata.get("gpu_count")
+    if isinstance(gpu_count, str) and gpu_count.isdigit():
+        count = int(gpu_count)
+    else:
+        count = 0
+        for pattern in (r"(\d+)\s*gpu", r"gpu[-_]?(\d+)", r"-(\d+)$"):
+            match = re.search(pattern, lowered)
+            if match:
+                count = int(match.group(1))
+                break
+
+    return (family, count, lowered)
+
+
 def analyze_concurrency(job_rows: list[dict[str, Any]], report_time: datetime):
     stats_by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in job_rows:
@@ -690,6 +744,9 @@ def main():
 
     if args.runner_report:
         concurrency = analyze_concurrency(job_rows, report_time)
+        runner_inventory = load_runner_inventory(
+            Path(__file__).resolve().parents[1] / "runner-config.yml"
+        )
         print("## Concurrency by Runner Label")
         if concurrency:
             print(
@@ -697,6 +754,8 @@ def main():
                     [
                         [
                             label,
+                            runner_inventory.get(label, {}).get("gpu_arch", "-"),
+                            runner_inventory.get(label, {}).get("gpu_count", "-"),
                             values["peak"],
                             values["avg_concurrent"],
                             values["total_jobs"],
@@ -707,11 +766,15 @@ def main():
                         ]
                         for label, values in sorted(
                             concurrency.items(),
-                            key=lambda item: runner_label_sort_key(item[0]),
+                            key=lambda item: runner_label_sort_key_with_inventory(
+                                item[0], runner_inventory
+                            ),
                         )
                     ],
                     headers=[
                         "runner_label",
+                        "gpu_arch",
+                        "gpu_count",
                         "peak_concurrent",
                         "avg_concurrent",
                         "total_jobs",
