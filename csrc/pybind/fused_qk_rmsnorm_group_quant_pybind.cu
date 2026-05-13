@@ -3,9 +3,11 @@
 
 #include "rocm_ops.hpp"
 #include "fused_qk_rmsnorm_group_quant.h"
+#include "aiter_stream.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    AITER_SET_STREAM_PYBIND
     m.def("fused_qk_rmsnorm_group_quant",
           &aiter::fused_qk_rmsnorm_group_quant,
           py::arg("q_out_quantized")          = std::nullopt,

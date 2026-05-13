@@ -1537,6 +1537,16 @@ def compile_ops(
                         func.__signature__ = sig
                         ann = {k: v.annotation for k, v in sig.parameters.items()}
                         ann["return"] = sig.return_annotation
+                        _tensor_types = (torch.Tensor,)
+                        if aiter_tensor_t is not object:
+                            _tensor_types = (torch.Tensor, aiter_tensor_t)
+
+                        def _is_tensor_like(obj):
+                            return isinstance(obj, _tensor_types)
+
+                        def _is_tensor_type(tp):
+                            return tp is torch.Tensor or (aiter_tensor_t is not object and tp is aiter_tensor_t)
+
                         callargs = inspect.getcallargs(func, *args, **kwargs)
                         for el, arg in callargs.items():
                             expected_type = ann[el]
@@ -1545,7 +1555,9 @@ def compile_ops(
                             sub_t = typing.get_args(expected_type)
 
                             if origin is None:
-                                if not isinstance(arg, expected_type) and not (
+                                if _is_tensor_type(expected_type) and _is_tensor_like(arg):
+                                    pass
+                                elif not isinstance(arg, expected_type) and not (
                                     any(el in str(expected_type) for el in enum_types)
                                     and isinstance(arg, int)
                                 ):
@@ -1558,7 +1570,7 @@ def compile_ops(
                                         f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                     )
                             elif origin is typing.Union or origin is types.UnionType:
-                                if arg is not None and not isinstance(arg, sub_t):
+                                if arg is not None and not _is_tensor_like(arg) and not isinstance(arg, sub_t):
                                     raise TypeError(
                                         f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
                                     )
@@ -1623,6 +1635,9 @@ def compile_ops(
                             )
                     return True
 
+                if not func.arg_checked:
+                    func.arg_checked = check_args()
+
                 # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
                 if develop:
                     import torch
@@ -1641,9 +1656,6 @@ def compile_ops(
                         )
                         for k, v in kwargs.items()
                     }
-
-                if not func.arg_checked:
-                    func.arg_checked = check_args()
 
                 if AITER_LOG_MORE == 2:
                     from ..test_common import log_args

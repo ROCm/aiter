@@ -317,6 +317,14 @@ static const std::string get_gpu_arch()
     }
 }
 
+static inline bool is_fp8_ocp_arch()
+{
+    std::string arch = get_gpu_arch();
+    for(auto a : fp8_ocp_archs)
+        if(arch == a) return true;
+    return false;
+}
+
 static uint32_t get_num_cu_func()
 {
     auto get_num_cu_local = []() {
