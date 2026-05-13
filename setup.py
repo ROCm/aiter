@@ -228,6 +228,16 @@ _TEST_PREBUILD_EXCLUDE_MODULES = {
     "libmha_bwd",
     # OPUS-specific sorting is not part of the standard top-level Aiter shards.
     "module_moe_sorting_opus",
+    # Narrow standard-test coverage. Let PR tests JIT these if exercised.
+    "module_deepgemm",
+    "module_gemm_a8w8_blockscale_cktile",
+    "module_gemm_a8w8_blockscale_bpreshuffle_cktile",
+    "module_mla_reduce",
+    "module_moe_cktile2stages",
+    "module_norm",
+    "module_pa_ragged",
+    "module_rmsnorm",
+    "module_rocsolgemm",
 }
 
 
