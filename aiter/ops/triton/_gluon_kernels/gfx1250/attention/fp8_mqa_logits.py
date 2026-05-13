@@ -51,15 +51,12 @@ def _load_kv_scales_block(
     BLOCK_KV: gl.constexpr,
     mfma_layout: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
-    end_off=None,
+    end_ind=0,
+    masked: gl.constexpr = False,
 ):
-    # When `end_off` is provided, positions j with `offset_into_segment + j >= end_off`
-    # are masked out (predicated load). Mirrors `load_to_shared`'s `end_row` for
-    # safely loading scales that straddle the segment boundary; pass `end_off=None`
-    # for unmasked loads.
     offsets = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, mfma_layout))
-    if end_off is not None:
-        mask = (offset_into_segment + offsets) < end_off
+    if masked:
+        mask = offsets < (end_ind - offset_into_segment)
     else:
         mask = None
     if USE_BUFFER_LOAD:
@@ -128,6 +125,7 @@ class MQATDMKVLoader:
     @gluon.jit
     def initialize(
         KV_ptr,
+        start_ind,
         seq_len_kv,
         stride_kv_s,
         stride_kv_d: gl.constexpr,
@@ -139,8 +137,8 @@ class MQATDMKVLoader:
     ):
         kv_cfg = MQATDMKVLoaderConfig(BLOCK_KV, HEAD_SIZE, NUM_BUFFERS)
         kv_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=KV_ptr,
-            shape=(seq_len_kv, kv_cfg.HEAD_SIZE),
+            base=KV_ptr + start_ind * stride_kv_s,
+            shape=(seq_len_kv - start_ind, kv_cfg.HEAD_SIZE),
             strides=(stride_kv_s, 1),
             block_shape=(kv_cfg.BLOCK_KV, kv_cfg.HEAD_SIZE),
             layout=kv_cfg.shared,
@@ -154,15 +152,11 @@ class MQATDMKVLoader:
 
     @gluon.jit
     def load_to_shared(
-        self, row_offset, buffer_id, USE_BUFFER_LOAD: gl.constexpr, end_row=None
+        self, row_offset, buffer_id, USE_BUFFER_LOAD: gl.constexpr
     ):
-        # USE_BUFFER_LOAD ignored, TDM descriptors have no 2 gb cap.
-        # end_row is accepted for API parity with the async loader but ignored:
-        # the TDM descriptor (configured with seq_len_kv as the extent) handles
-        # OOB rows automatically.
         gl.amd.gfx1250.tdm.async_load(
             self.kv_desc,
-            [row_offset.to(gl.int32), 0],
+            [row_offset, 0],
             self.kv_shared.index(buffer_id),
         )
 
@@ -220,31 +214,21 @@ def mqa_logits_loop_double_buf(
     store_arange = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, mfma_layout))
     store_offsets = store_arange * stride_logits_k
 
-    # Clamp OOB prefetches back to the last in-bounds tile
-    last_useful_row = start_ind + ((end_ind - start_ind - 1) // BLOCK_KV) * BLOCK_KV
-
     kv_pos = start_ind
     kv_scales_off: gl.int32 = 0
 
     kv_loader.load_to_shared(
-        gl.minimum(start_ind, last_useful_row),
+        0,
         buffer_id=0,
         USE_BUFFER_LOAD=USE_BUFFER_LOAD,
     )
     kv_loader.load_to_shared(
-        gl.minimum(start_ind + BLOCK_KV, last_useful_row),
+        BLOCK_KV,
         buffer_id=1,
         USE_BUFFER_LOAD=USE_BUFFER_LOAD,
     )
 
-    # `end_scales_off` mirrors `end_ind` for the per-segment scales array.
-    # Passing it into `_load_kv_scales_block` predicates OOB lanes (no-op when
-    # the tile is fully in-bounds), so the explicit clamping below is gone.
     end_scales_off = end_ind - start_ind
-
-    # Body: full tiles only. With loop bound `num_full_tiles - 2`, the prefetch
-    # at i+2 is guaranteed to address a full tile (i+2 in [2, num_full_tiles-1]),
-    # so no clamping or mask is needed here.
     buf_cur: gl.int32 = 0
     for i in tl.range(0, num_full_tiles - 1):
         kv_scales = _load_kv_scales_block(
@@ -253,16 +237,14 @@ def mqa_logits_loop_double_buf(
             BLOCK_KV,
             mfma_layout,
             USE_BUFFER_LOAD,
-            end_off=end_scales_off,
         )
         mfma_k = kv_loader.load_from_shared(
             wait_count=1, target_layout=dot_b_layout, buffer_id=buf_cur
         )
         kv_loader.load_to_shared(
-            start_ind + (i + 2) * BLOCK_KV,
+            (i + 2) * BLOCK_KV,
             buffer_id=buf_cur,
             USE_BUFFER_LOAD=USE_BUFFER_LOAD,
-            end_row=end_ind,
         )
         scores = _mqa_dot(mfma_q, mfma_k, NUM_HEADS, BLOCK_KV, mfma_layout)
         scores = relu_f32(scores)
@@ -278,14 +260,14 @@ def mqa_logits_loop_double_buf(
         buf_cur = 1 - buf_cur
 
 
-    # Peel: last full tile (still unmasked)
     kv_scales = _load_kv_scales_block(
         kv_scales_ptr,
         kv_scales_off,
         BLOCK_KV,
         mfma_layout,
         USE_BUFFER_LOAD,
-        end_off=end_scales_off,
+        end_ind=end_scales_off,
+        masked=True,
     )
     mfma_k = kv_loader.load_from_shared(
         wait_count=1, target_layout=dot_b_layout, buffer_id=buf_cur
@@ -298,7 +280,6 @@ def mqa_logits_loop_double_buf(
     )
     scores = scores * kv_scales
     # Masked: handles num_full_tiles == 0 (segment shorter than BLOCK_KV).
-    # For num_full_tiles >= 1 the mask is all-true on this tile, no-op cost.
     mask_last_full = (kv_pos + store_arange) < end_ind
     _store_logits_block(logits_ptr, store_offsets, scores, USE_BUFFER_STORE, mask=mask_last_full)
 
@@ -314,7 +295,8 @@ def mqa_logits_loop_double_buf(
         BLOCK_KV,
         mfma_layout,
         USE_BUFFER_LOAD,
-        end_off=end_scales_off,
+        end_ind=end_scales_off,
+        masked=True,
     )
     mfma_k = kv_loader.load_from_shared(
         wait_count=0, target_layout=dot_b_layout, buffer_id=buf_cur
@@ -360,31 +342,30 @@ def mqa_logits_loop_pipelined(
     USE_BUFFER_STORE: gl.constexpr,
 ):
     gl.static_assert(NUM_BUFFERS == 2, "pipelined variant requires NUM_BUFFERS == 2")
+    end_scales_off = end_ind - start_ind
 
     store_arange = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, mfma_layout))
     store_offsets = store_arange * stride_logits_k
-
-    last_useful_row = start_ind + ((end_ind - start_ind - 1) // BLOCK_KV) * BLOCK_KV
-    last_useful_scales_off = last_useful_row - start_ind
-
     # Prologue: prefetch K[0:4], pre_dot(0), pre_dot(1), dot(0).
     kv_loader.load_to_shared(
-        gl.minimum(start_ind + 0 * BLOCK_KV, last_useful_row),
+        0,
         buffer_id=0,
         USE_BUFFER_LOAD=USE_BUFFER_LOAD,
     )
     kv_loader.load_to_shared(
-        gl.minimum(start_ind + 1 * BLOCK_KV, last_useful_row),
+        BLOCK_KV,
         buffer_id=1,
         USE_BUFFER_LOAD=USE_BUFFER_LOAD,
     )
     # pre_dot(0)
     scales_i = _load_kv_scales_block(
         kv_scales_ptr,
-        gl.minimum(0 * BLOCK_KV, last_useful_scales_off),
+        0,
         BLOCK_KV,
         mfma_layout,
         USE_BUFFER_LOAD,
+        end_ind=end_scales_off,
+        masked=True,
     )
     mfma_k_0 = kv_loader.load_from_shared(
         wait_count=1,
@@ -392,7 +373,7 @@ def mqa_logits_loop_pipelined(
         buffer_id=0,
     )
     kv_loader.load_to_shared(
-        gl.minimum(start_ind + 2 * BLOCK_KV, last_useful_row),
+        2 * BLOCK_KV,
         buffer_id=0,
         USE_BUFFER_LOAD=USE_BUFFER_LOAD,
     )
@@ -404,13 +385,15 @@ def mqa_logits_loop_pipelined(
     )
     scales_next = _load_kv_scales_block(
         kv_scales_ptr,
-        gl.minimum(1 * BLOCK_KV, last_useful_scales_off),
+        BLOCK_KV,
         BLOCK_KV,
         mfma_layout,
         USE_BUFFER_LOAD,
+        end_ind=end_scales_off,
+        masked=True,
     )
     kv_loader.load_to_shared(
-        gl.minimum(start_ind + 3 * BLOCK_KV, last_useful_row),
+        3 * BLOCK_KV,
         buffer_id=1,
         USE_BUFFER_LOAD=USE_BUFFER_LOAD,
     )
@@ -422,7 +405,6 @@ def mqa_logits_loop_pipelined(
         BLOCK_KV,
         mfma_layout,
     )
-
     # Body: 2-unrolled (sub-iter A → buf 0, sub-iter B → buf 1). Odd leftover
     # runs in the post-loop block.
     end = max(0, num_full_tiles - 1)
@@ -438,10 +420,12 @@ def mqa_logits_loop_pipelined(
         )
         scales_next2 = _load_kv_scales_block(
             kv_scales_ptr,
-            gl.minimum((i + 2) * BLOCK_KV, last_useful_scales_off),
+            (i + 2) * BLOCK_KV,
             BLOCK_KV,
             mfma_layout,
             USE_BUFFER_LOAD,
+            end_ind=end_scales_off,
+            masked=True,
         )
         # dot(i+1)
         scores_next = _mqa_dot(
@@ -453,7 +437,7 @@ def mqa_logits_loop_pipelined(
         )
         # async-prefetch K[i+4] into buf 0.
         kv_loader.load_to_shared(
-            gl.minimum(start_ind + (i + 4) * BLOCK_KV, last_useful_row),
+            (i + 4) * BLOCK_KV,
             buffer_id=0,
             USE_BUFFER_LOAD=USE_BUFFER_LOAD,
         )
@@ -482,10 +466,12 @@ def mqa_logits_loop_pipelined(
         )
         scales_next2 = _load_kv_scales_block(
             kv_scales_ptr,
-            gl.minimum((i + 2) * BLOCK_KV, last_useful_scales_off),
+            (i + 2) * BLOCK_KV,
             BLOCK_KV,
             mfma_layout,
             USE_BUFFER_LOAD,
+            end_ind=end_scales_off,
+            masked=True,
         )
         scores_next = _mqa_dot(
             mfma_q,
@@ -495,7 +481,7 @@ def mqa_logits_loop_pipelined(
             mfma_layout,
         )
         kv_loader.load_to_shared(
-            gl.minimum(start_ind + (i + 4) * BLOCK_KV, last_useful_row),
+            (i + 4) * BLOCK_KV,
             buffer_id=1,
             USE_BUFFER_LOAD=USE_BUFFER_LOAD,
         )
@@ -524,10 +510,12 @@ def mqa_logits_loop_pipelined(
         )
         scales_next2 = _load_kv_scales_block(
             kv_scales_ptr,
-            gl.minimum((i + 2) * BLOCK_KV, last_useful_scales_off),
+            (i + 2) * BLOCK_KV,
             BLOCK_KV,
             mfma_layout,
             USE_BUFFER_LOAD,
+            end_ind=end_scales_off,
+            masked=True,
         )
         scores_next = _mqa_dot(
             mfma_q,
@@ -581,223 +569,6 @@ def mqa_logits_loop_pipelined(
     _store_logits_block(
         logits_ptr, store_offsets, scores_next, USE_BUFFER_STORE, mask=mask
     )
-
-
-# Ping-pong variant of the pipelined loop. Body stages are wrapped in
-# `gl.amd.warp_pipeline_stage` so the scheduler emits s_setprio between
-# clusters: memory at prio 3 (head start), MFMA at prio 0 (yield during its
-# long pipe), VALU+store at prio 1/2.
-#
-# With pingpong, the sibling warp's MFMA hides this warp's VALU latency, so
-# the post stage finalizes the scores from the MFMA produced in the SAME
-# sub-iter (no 1-iter VALU/WMMA lag).
-@gluon.jit
-def mqa_logits_loop_pipelined_pingpong(
-    kv_loader,
-    mfma_q,
-    w_block,
-    kv_scales_ptr,
-    logits_ptr,
-    start_ind,
-    end_ind,
-    num_full_tiles,
-    NUM_HEADS: gl.constexpr,
-    BLOCK_KV: gl.constexpr,
-    stride_logits_k,
-    mfma_layout: gl.constexpr,
-    dot_b_layout: gl.constexpr,
-    NUM_BUFFERS: gl.constexpr,
-    NUM_CHAINS: gl.constexpr,
-    USE_BUFFER_LOAD: gl.constexpr,
-    USE_BUFFER_STORE: gl.constexpr,
-):
-    gl.static_assert(
-        NUM_BUFFERS == 2, "pipelined_pingpong variant requires NUM_BUFFERS == 2"
-    )
-
-    store_arange = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, mfma_layout))
-    store_offsets = store_arange * stride_logits_k
-
-    last_useful_row = start_ind + ((end_ind - start_ind - 1) // BLOCK_KV) * BLOCK_KV
-    last_useful_scales_off = last_useful_row - start_ind
-
-    # Prologue: prefetch tiles 0,1; load K_0 into regs and scales[0]; queue
-    # tile-2 prefetch so buf 0 carries the next-even tile by the time the
-    # loop wants it. Even tiles live in buf 0, odd tiles in buf 1.
-    kv_loader.load_to_shared(
-        gl.minimum(start_ind + 0 * BLOCK_KV, last_useful_row),
-        buffer_id=0,
-        USE_BUFFER_LOAD=USE_BUFFER_LOAD,
-    )
-    kv_loader.load_to_shared(
-        gl.minimum(start_ind + 1 * BLOCK_KV, last_useful_row),
-        buffer_id=1,
-        USE_BUFFER_LOAD=USE_BUFFER_LOAD,
-    )
-    scales_i = _load_kv_scales_block(
-        kv_scales_ptr,
-        gl.minimum(0 * BLOCK_KV, last_useful_scales_off),
-        BLOCK_KV,
-        mfma_layout,
-        USE_BUFFER_LOAD,
-    )
-    mfma_k = kv_loader.load_from_shared(
-        wait_count=1,
-        target_layout=dot_b_layout,
-        buffer_id=0,
-    )
-    kv_loader.load_to_shared(
-        gl.minimum(start_ind + 2 * BLOCK_KV, last_useful_row),
-        buffer_id=0,
-        USE_BUFFER_LOAD=USE_BUFFER_LOAD,
-    )
-
-    end = num_full_tiles - 1
-    odd_peel = end % 2
-    end_pairs = end - odd_peel
-    for i in range(0, end_pairs, 2):
-        # ---- sub-iter A: MFMA on K_i (in regs); fetch K_{i+1} from buf 1;
-        #      prefetch tile i+3 into buf 1; post stage finalizes K_i's scores. ----
-        with gl.amd.warp_pipeline_stage("load", priority=3):
-            mfma_k_next = kv_loader.load_from_shared(
-                wait_count=1,
-                target_layout=dot_b_layout,
-                buffer_id=1,
-                skip_wait=False,
-            )
-            scales_next = _load_kv_scales_block(
-                kv_scales_ptr,
-                gl.minimum((i + 1) * BLOCK_KV, last_useful_scales_off),
-                BLOCK_KV,
-                mfma_layout,
-                USE_BUFFER_LOAD,
-            )
-        with gl.amd.warp_pipeline_stage("compute", priority=0):
-            scores_i = _mqa_dot(
-                mfma_q,
-                mfma_k,
-                NUM_HEADS,
-                BLOCK_KV,
-                mfma_layout,
-            )
-            kv_loader.load_to_shared(
-                gl.minimum(start_ind + (i + 3) * BLOCK_KV, last_useful_row),
-                buffer_id=1,
-                USE_BUFFER_LOAD=USE_BUFFER_LOAD,
-            )
-        with gl.amd.warp_pipeline_stage("post", priority=1):
-            scores_i = relu_f32(scores_i)
-            scores_i = _weighted_sum_fma_fold(
-                scores_i, w_block, NUM_HEADS, BLOCK_KV, mfma_layout, NUM_CHAINS
-            )
-            scores_i = scores_i * scales_i
-            _store_logits_block(logits_ptr, store_offsets, scores_i, USE_BUFFER_STORE)
-
-        mfma_k = mfma_k_next
-        scales_i = scales_next
-        logits_ptr += BLOCK_KV * stride_logits_k
-        ############################################
-        # ---- sub-iter B: MFMA on K_{i+1}; fetch K_{i+2} from buf 0;
-        #      prefetch tile i+4 into buf 0; post stage finalizes K_{i+1}. ----
-        i = i + 1
-        with gl.amd.warp_pipeline_stage("load", priority=3):
-            mfma_k_next = kv_loader.load_from_shared(
-                wait_count=1,
-                target_layout=dot_b_layout,
-                buffer_id=0,
-                skip_wait=False,
-            )
-            scales_next = _load_kv_scales_block(
-                kv_scales_ptr,
-                gl.minimum((i + 1) * BLOCK_KV, last_useful_scales_off),
-                BLOCK_KV,
-                mfma_layout,
-                USE_BUFFER_LOAD,
-            )
-        with gl.amd.warp_pipeline_stage("compute", priority=0):
-            scores_i = _mqa_dot(
-                mfma_q,
-                mfma_k,
-                NUM_HEADS,
-                BLOCK_KV,
-                mfma_layout,
-            )
-            kv_loader.load_to_shared(
-                gl.minimum(start_ind + (i + 3) * BLOCK_KV, last_useful_row),
-                buffer_id=0,
-                USE_BUFFER_LOAD=USE_BUFFER_LOAD,
-            )
-        with gl.amd.warp_pipeline_stage("post", priority=1):
-            scores_i = relu_f32(scores_i)
-            scores_i = _weighted_sum_fma_fold(
-                scores_i, w_block, NUM_HEADS, BLOCK_KV, mfma_layout, NUM_CHAINS
-            )
-            scores_i = scores_i * scales_i
-            _store_logits_block(logits_ptr, store_offsets, scores_i, USE_BUFFER_STORE)
-
-        mfma_k = mfma_k_next
-        scales_i = scales_next
-        logits_ptr += BLOCK_KV * stride_logits_k
-
-    kv_pos_post = (start_ind + end_pairs) * BLOCK_KV
-    # Odd leftover: process K_{end_pairs} (in regs); fetch K_{end_pairs+1}
-    # from buf 1 for the epilogue.
-    if odd_peel:
-        i = end_pairs
-        with gl.amd.warp_pipeline_stage("load", priority=2):
-            mfma_k_next = kv_loader.load_from_shared(
-                wait_count=1,
-                target_layout=dot_b_layout,
-                buffer_id=1,
-            )
-            scales_next = _load_kv_scales_block(
-                kv_scales_ptr,
-                gl.minimum((i + 1) * BLOCK_KV, last_useful_scales_off),
-                BLOCK_KV,
-                mfma_layout,
-                USE_BUFFER_LOAD,
-            )
-        with gl.amd.warp_pipeline_stage("compute", priority=0):
-            scores_i = _mqa_dot(
-                mfma_q,
-                mfma_k,
-                NUM_HEADS,
-                BLOCK_KV,
-                mfma_layout,
-            )
-        with gl.amd.warp_pipeline_stage("post", priority=1):
-            scores_i = relu_f32(scores_i)
-            scores_i = _weighted_sum_fma_fold(
-                scores_i, w_block, NUM_HEADS, BLOCK_KV, mfma_layout, 0
-            )
-            scores_i = scores_i * scales_i
-            _store_logits_block(logits_ptr, store_offsets, scores_i, USE_BUFFER_STORE)
-
-        mfma_k = mfma_k_next
-        scales_i = scales_next
-        logits_ptr += BLOCK_KV * stride_logits_k
-        kv_pos_post += BLOCK_KV
-    # Epilogue: single masked store of the last tile.
-    # Masked: handles num_full_tiles == 0 (segment shorter than BLOCK_KV).
-    with gl.amd.warp_pipeline_stage("compute", priority=0):
-        scores_i = _mqa_dot(
-            mfma_q,
-            mfma_k,
-            NUM_HEADS,
-            BLOCK_KV,
-            mfma_layout,
-        )
-    with gl.amd.warp_pipeline_stage("compute", priority=2):
-        scores_i = relu_f32(scores_i)
-        scores_i = _weighted_sum_fma_fold(
-            scores_i, w_block, NUM_HEADS, BLOCK_KV, mfma_layout, 0
-        )
-        scores_i = scores_i * scales_i
-        mask = (kv_pos_post + store_arange) < end_ind
-        _store_logits_block(
-            logits_ptr, store_offsets, scores_i, USE_BUFFER_STORE, mask=mask
-        )
-
 
 @gluon.jit
 def _gluon_fp8_mqa_logits_kernel(
@@ -883,6 +654,7 @@ def _gluon_fp8_mqa_logits_kernel(
 
     kv_loader = KVLoader.initialize(
         KV_ptr,
+        start_ind,
         seq_len_kv,
         stride_kv_s,
         stride_kv_d,
@@ -940,28 +712,8 @@ def _gluon_fp8_mqa_logits_kernel(
             USE_BUFFER_LOAD,
             USE_BUFFER_STORE,
         )
-    elif LOOP_VARIANT == 1:
+    else:
         mqa_logits_loop_pipelined(
-            kv_loader,
-            mfma_q,
-            w_block,
-            kv_scales_ptr_seg,
-            logits_ptr_row,
-            start_ind,
-            end_ind,
-            num_full_tiles,
-            NUM_HEADS,
-            BLOCK_KV,
-            stride_logits_k,
-            mfma_layout,
-            dot_b_layout,
-            NUM_BUFFERS,
-            NUM_CHAINS,
-            USE_BUFFER_LOAD,
-            USE_BUFFER_STORE,
-        )
-    elif LOOP_VARIANT == 2:
-        mqa_logits_loop_pipelined_pingpong(
             kv_loader,
             mfma_q,
             w_block,
