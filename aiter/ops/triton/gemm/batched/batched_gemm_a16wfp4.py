@@ -54,7 +54,20 @@ def batched_gemm_a16wfp4_fake_tensor(
     return y
 
 
-@torch_compile_guard(gen_fake=batched_gemm_a16wfp4_fake_tensor)
+# Explicit ``mutates_args=["y"]`` rather than the ``torch_compile_guard``
+# default ("unknown"). Without this, ``torch.library.infer_schema`` marks
+# every Tensor argument as in-place mutated (``Tensor(aN!)`` for
+# ``x`` / ``w`` / ``w_scales`` / ``y_scale``), which is wrong: the kernel
+# only writes to ``y``. The spurious markers cause downstream
+# ``torch.compile`` consumers to emit ``auto_functionalized()`` writeback
+# chains on the read-only inputs, which break FX pattern matchers (e.g.
+# vLLM's MLA decode q-prep fusion) and inflate cudagraph capture peak
+# memory. Do not remove this argument without re-auditing the kernel's
+# tl.store sites and re-checking the post-grad FX graph of any compiled
+# downstream consumer.
+@torch_compile_guard(
+    mutates_args=["y"], gen_fake=batched_gemm_a16wfp4_fake_tensor
+)
 def batched_gemm_a16wfp4_(
     x: torch.Tensor,
     w: torch.Tensor,
