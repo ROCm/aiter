@@ -86,10 +86,14 @@ def generate_cp_test_data(seq_len, seq_len_kv):
 @pytest.mark.parametrize(
     "s_q, s_k",
     [
-        (1, 16), (1, 113),
-        (17, 76), (61, 113), (61, 1024),
+        (1, 16),
+        (1, 113),
+        (17, 76),
+        (61, 113),
+        (61, 1024),
         (128, 1024),
-        (1024, 1024), (1024, 1560),
+        (1024, 1024),
+        (1024, 1560),
     ],
 )
 @pytest.mark.parametrize("num_heads", [64])
@@ -130,10 +134,10 @@ def test_fp8_mqa_logits(
     # If clean_logits is not set, clean the rest for testing
     if not clean_logits:
         assert logits.size() == (s_q, s_k)
-        tmp = torch.full((s_q, s_k), float('-inf'), device='cuda')
+        tmp = torch.full((s_q, s_k), float("-inf"), device="cuda")
         for i in range(s_q):
             tmp[i, ks[i] : ke[i]] = logits[i, : ke[i] - ks[i]]
-        logits = tmp 
+        logits = tmp
 
     ref_neginf_mask = ref_logits == float("-inf")
     neginf_mask = logits == float("-inf")

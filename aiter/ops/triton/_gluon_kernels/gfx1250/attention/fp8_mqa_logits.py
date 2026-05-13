@@ -1,5 +1,3 @@
-import os
-import torch
 from packaging.version import Version
 
 import triton
@@ -9,9 +7,10 @@ from triton.experimental.gluon import language as gl
 from triton.language.core import _aggregate as aggregate
 from triton.language.core import PropagateNan
 
-from aiter.ops.triton.utils._triton import arch_info
 # same reduction technique, arch agnostic
-from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import _weighted_sum_fma_fold
+from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
+    _weighted_sum_fma_fold,
+)
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_BEYOND_37 = TRITON_VERSION >= Version("3.7.0")
@@ -78,7 +77,7 @@ def _store_logits_block(
     mask=None,
 ):
     # buffer_store caps at 2 GB; fall back to global store
-    #scores = scores.to(logits_ptr.type.element_ty)
+    # scores = scores.to(logits_ptr.type.element_ty)
     if mask is None:
         if USE_BUFFER_STORE:
             gl.amd.cdna4.buffer_store(scores, ptr=logits_ptr, offsets=store_offsets)
@@ -91,6 +90,7 @@ def _store_logits_block(
             )
         else:
             gl.store(logits_ptr + store_offsets, scores, mask=mask)
+
 
 @aggregate
 class MQATDMKVLoaderConfig:
@@ -151,9 +151,7 @@ class MQATDMKVLoader:
         return MQATDMKVLoader(kv_cfg, kv_desc, kv_shared)
 
     @gluon.jit
-    def load_to_shared(
-        self, row_offset, buffer_id, USE_BUFFER_LOAD: gl.constexpr
-    ):
+    def load_to_shared(self, row_offset, buffer_id, USE_BUFFER_LOAD: gl.constexpr):
         gl.amd.gfx1250.tdm.async_load(
             self.kv_desc,
             [row_offset, 0],
@@ -259,7 +257,6 @@ def mqa_logits_loop_double_buf(
         kv_pos += BLOCK_KV
         buf_cur = 1 - buf_cur
 
-
     kv_scales = _load_kv_scales_block(
         kv_scales_ptr,
         kv_scales_off,
@@ -281,7 +278,9 @@ def mqa_logits_loop_double_buf(
     scores = scores * kv_scales
     # Masked: handles num_full_tiles == 0 (segment shorter than BLOCK_KV).
     mask_last_full = (kv_pos + store_arange) < end_ind
-    _store_logits_block(logits_ptr, store_offsets, scores, USE_BUFFER_STORE, mask=mask_last_full)
+    _store_logits_block(
+        logits_ptr, store_offsets, scores, USE_BUFFER_STORE, mask=mask_last_full
+    )
 
     kv_scales_off += BLOCK_KV
     logits_ptr += BLOCK_KV * stride_logits_k
@@ -555,7 +554,9 @@ def mqa_logits_loop_pipelined(
     scores_i = scores_i * scales_i
     # Masked: handles num_full_tiles == 0 (segment shorter than BLOCK_KV).
     mask_last_full = (kv_pos_post + store_arange) < end_ind
-    _store_logits_block(logits_ptr, store_offsets, scores_i, USE_BUFFER_STORE, mask=mask_last_full)
+    _store_logits_block(
+        logits_ptr, store_offsets, scores_i, USE_BUFFER_STORE, mask=mask_last_full
+    )
 
     logits_ptr += BLOCK_KV * stride_logits_k
     kv_pos_post += BLOCK_KV
@@ -569,6 +570,7 @@ def mqa_logits_loop_pipelined(
     _store_logits_block(
         logits_ptr, store_offsets, scores_next, USE_BUFFER_STORE, mask=mask
     )
+
 
 @gluon.jit
 def _gluon_fp8_mqa_logits_kernel(
