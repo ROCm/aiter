@@ -4,7 +4,6 @@
 import torch
 
 
-
 def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
     """
     Preshuffle weights for gfx1250 WMMA.
@@ -41,7 +40,7 @@ def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
 
     w = w.view(x_type)
     return w
-    
+
 
 def shuffle_weight(
     x: torch.Tensor,
