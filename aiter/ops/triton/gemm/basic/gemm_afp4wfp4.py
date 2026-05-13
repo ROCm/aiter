@@ -406,7 +406,8 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     return y
 
-
+# TODO: Split-K support
+# TODO: gluon kernel for M < 32 without preshuffling scales for M < 32
 def gemm_afp4wfp4_preshuffle(
     x_fp4: torch.Tensor,
     w_preshuf: torch.Tensor,

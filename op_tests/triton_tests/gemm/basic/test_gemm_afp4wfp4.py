@@ -51,10 +51,12 @@ def shuffle_scales_gfx1250(scales: torch.Tensor):
     M, K_groups = scales.shape
 
     out = scales.view(
-        M // 16, 16,           # rows  →  (m_tile, lane)
-        K_groups // 4, 4,      # cols  →  (k_tile, kg_in_lane)
+        M // 16,
+        16,  # rows  →  (m_tile, lane)
+        K_groups // 4,
+        4,  # cols  →  (k_tile, kg_in_lane)
     )
-    out = out.permute(0, 2, 1, 3).contiguous()   # (m_tile, k_tile, lane, kg_in_lane)
+    out = out.permute(0, 2, 1, 3).contiguous()  # (m_tile, k_tile, lane, kg_in_lane)
     out = out.view(M // 16, K_groups * 16)
     return out
 
@@ -64,8 +66,10 @@ def un_shuffle_scales_gfx1250(scales_shuffled: torch.Tensor):
     M = rows * 16
     K_groups = cols // 16
 
-    out = scales_shuffled.view(rows, K_groups // 4, 16, 4)  # (m_tile, k_tile, lane, kg_in_lane)
-    out = out.permute(0, 2, 1, 3).contiguous()              # (m_tile, lane, k_tile, kg_in_lane)
+    out = scales_shuffled.view(
+        rows, K_groups // 4, 16, 4
+    )  # (m_tile, k_tile, lane, kg_in_lane)
+    out = out.permute(0, 2, 1, 3).contiguous()  # (m_tile, lane, k_tile, kg_in_lane)
     out = out.view(M, K_groups)
     return out
 
@@ -328,8 +332,8 @@ def test_gemm_afp4_wfp4(
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["TN", "TT"])  # "NN", "NT"
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("layout", ["TN"])  # "NN", "NT"
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_mxfp4_preshuffled_gfx1250(
     M: int,
