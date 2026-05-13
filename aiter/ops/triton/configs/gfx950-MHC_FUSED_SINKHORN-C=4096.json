@@ -1,4 +1,13 @@
 {
+    "M_LEQ_1": {
+        "BLOCK_M": 16,
+        "BLOCK_K": 512,
+        "BLOCK_C": 128,
+        "NUM_KSPLIT": 32,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 0
+    },
     "M_LEQ_1024": {
         "BLOCK_M": 32,
         "BLOCK_K": 256,
