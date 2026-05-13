@@ -1980,7 +1980,7 @@ def compile_moe_gemm2(
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}"
-        f"_abi3"  # mask sentinel token ids on loads/stores to avoid illegal address faults
+        f"_abi4"  # keep CShuffle block-size mapping aligned with dynamic thread count
     ).replace("-", "_")
 
     # ── CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel
@@ -3310,6 +3310,7 @@ def compile_moe_gemm2(
                         range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
+                        block_size=total_threads,
                         e_vec=e_vec,
                         m_repeat=m_repeat,
                         num_acc_n=num_acc_n,
