@@ -23,9 +23,7 @@ concurrency:
 
 env:
   DOCKER_IMAGE: "rocm/pytorch:latest"
-  GPU_ARCH_LIST: "gfx942;gfx950"
   AITER_TEST: "op_tests"
-  AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
   AITER_PREBUILD_MAX_JOBS: "96"
 
 jobs:
@@ -44,8 +42,17 @@ jobs:
 
   build_aiter_wheels:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    name: Build Aiter wheel (${{ matrix.label }})
     runs-on: build-only-aiter
     needs: check-signal
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: gfx942
+            label: MI300X
+          - arch: gfx950
+            label: MI35X
     permissions:
       id-token: write
       contents: read
@@ -111,10 +118,10 @@ jobs:
               pip install --upgrade "ninja>=1.11.1" &&
               pip install --upgrade setuptools_scm &&
               pip install tabulate &&
-              echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, and MAX_JOBS: ${AITER_PREBUILD_MAX_JOBS}" &&
+              echo "Prebuilding kernels with GPU_ARCHS: ${{ matrix.arch }}, PREBUILD_KERNELS: 1, and MAX_JOBS: ${AITER_PREBUILD_MAX_JOBS}" &&
               export PREBUILD_KERNELS=1 &&
               export MAX_JOBS="${AITER_PREBUILD_MAX_JOBS}" &&
-              export GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" &&
+              export GPU_ARCHS="${{ matrix.arch }}" &&
               prebuild_start=$(date +%s) &&
               set +e &&
               python setup.py bdist_wheel 2>&1 | tee .aiter-prebuild.log
@@ -142,7 +149,7 @@ jobs:
           fi
           . ./.aiter-prebuild.env
           AITER_RUNNER_NAME="${RUNNER_NAME:-unknown}" \
-          GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" \
+          GPU_ARCHS="${{ matrix.arch }}" \
           PREBUILD_KERNELS=1 \
           MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
           python3 .github/scripts/aiter_prebuild_summary.py \
@@ -187,7 +194,7 @@ jobs:
       - name: Upload wheel as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
+          name: aiter-whl-${{ github.run_id }}-${{ matrix.arch }}
           path: dist/*.whl
           retention-days: 14
 
@@ -214,7 +221,7 @@ jobs:
           for WHL in dist/*.whl; do
             WHL_NAME=$(basename ${WHL})
             echo "Uploading ${WHL_NAME} to S3..."
-            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/${WHL_NAME}
+            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-staging/${{ matrix.arch }}/${WHL_NAME}
           done
           echo "Wheels uploaded to S3 staging"
 
@@ -225,14 +232,14 @@ jobs:
           fi
 
           MANIFEST_WHL_NAME=$(basename "$MANIFEST_WHL")
-          MANIFEST_WHL_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/${MANIFEST_WHL_NAME}"
+          MANIFEST_WHL_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/${{ matrix.arch }}/${MANIFEST_WHL_NAME}"
           MANIFEST_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           python3 -c "import json, pathlib, sys; pathlib.Path('latest-main-wheel.json').write_text(json.dumps({'branch': sys.argv[1], 'timestamp': sys.argv[2], 'commit': sys.argv[3], 'wheel_name': sys.argv[4], 'wheel_url': sys.argv[5]}, indent=2) + '\n', encoding='utf-8')" \
             "$GITHUB_REF_NAME" "$MANIFEST_TIMESTAMP" "$GITHUB_SHA" "$MANIFEST_WHL_NAME" "$MANIFEST_WHL_URL"
 
           aws s3 cp latest-main-wheel.json \
-            s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/main/latest.json \
+            s3://framework-whls-nightlies/whl-staging/${{ matrix.arch }}/main/latest.json \
             --content-type application/json
 
           echo "Uploaded latest main wheel manifest for ${MANIFEST_WHL_NAME}"
@@ -269,42 +276,52 @@ jobs:
         include:
           - runner: linux-aiter-mi35x-1
             label: MI35X
+            arch: gfx950
             shard_total: 5
             shard_idx: 0
           - runner: linux-aiter-mi35x-1
             label: MI35X
+            arch: gfx950
             shard_total: 5
             shard_idx: 1
           - runner: linux-aiter-mi35x-1
             label: MI35X
+            arch: gfx950
             shard_total: 5
             shard_idx: 2
           - runner: linux-aiter-mi35x-1
             label: MI35X
+            arch: gfx950
             shard_total: 5
             shard_idx: 3
           - runner: linux-aiter-mi35x-1
             label: MI35X
+            arch: gfx950
             shard_total: 5
             shard_idx: 4
           - runner: linux-aiter-mi300x-1
             label: MI300X
+            arch: gfx942
             shard_total: 5
             shard_idx: 0
           - runner: linux-aiter-mi300x-1
             label: MI300X
+            arch: gfx942
             shard_total: 5
             shard_idx: 1
           - runner: linux-aiter-mi300x-1
             label: MI300X
+            arch: gfx942
             shard_total: 5
             shard_idx: 2
           - runner: linux-aiter-mi300x-1
             label: MI300X
+            arch: gfx942
             shard_total: 5
             shard_idx: 3
           - runner: linux-aiter-mi300x-1
             label: MI300X
+            arch: gfx942
             shard_total: 5
             shard_idx: 4
     runs-on: ${{ matrix.runner }}
@@ -333,7 +350,7 @@ jobs:
       - name: Download Aiter wheel artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
+          name: aiter-whl-${{ github.run_id }}-${{ matrix.arch }}
           path: aiter_wheels
 
       - name: Docker login
@@ -551,8 +568,10 @@ jobs:
         include:
           - runner: linux-aiter-mi35x-8
             label: MI35X
+            arch: gfx950
           - runner: linux-aiter-mi300x-8
             label: MI300X
+            arch: gfx942
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -564,7 +583,7 @@ jobs:
       - name: Download Aiter wheel artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
+          name: aiter-whl-${{ github.run_id }}-${{ matrix.arch }}
           path: aiter_wheels
 
       - name: Docker login
