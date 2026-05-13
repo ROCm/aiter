@@ -88,11 +88,13 @@ def _build_inputs(batch=2, kv_seq_lens=64, q_seq_logical=4, num_heads=GQA_RATIO,
     num_page = batch * (kv_seq_lens // PAGE_SIZE)
     num_kv_splits = 1                          # passes=1 for this variant
 
-    # FP8 dtype on ROCm = float8_e4m3fnuz. The kernel reads raw bytes (NOPE
+    # FP8 dtype: use aiter's canonical alias which auto-resolves per arch
+    # (gfx942 = e4m3fnuz, gfx950 = e4m3fn). The kernel reads raw bytes (NOPE
     # bytes + e8m0 dup-scale bytes packed by host), so we just need a
     # 1-byte-per-elem tensor of the right shape — any random byte pattern
-    # will do for smoke testing (correctness test is in compare_against_poc_kl_dump).
-    fp8_dt = torch.float8_e4m3fnuz
+    # will do for smoke testing (numerical correctness lives in
+    # test_mla_v4_nm_golden.py).
+    fp8_dt = aiter.dtypes.fp8
 
     def _rand_fp8(shape):
         # numpy seeded RNG (NOT torch.randint — that is non-reproducible
