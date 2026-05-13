@@ -3517,10 +3517,7 @@ void dispatchFusedQKNormAllReduce(hipStream_t stream,
                                  std::to_string(d));
     }
     RankData* ptrs = get_buffer_RD(stream, qk_in);
-
-    auto pack_size   = 16 / sizeof(T);
-    bool n_constrain = (n % pack_size == 0) && (n / pack_size <= 1024);
-    use_1stage       = use_1stage && n_constrain;
+    
 #define DISPATCH_QKNORM_AR_FUSION_KERNEL(NGPUS)                                \
     {                                                                          \
         qknorm_allreduce_fusion_kernel_2stage_launcher<T, NGPUS>(ptrs,         \
@@ -3542,9 +3539,9 @@ void dispatchFusedQKNormAllReduce(hipStream_t stream,
 
     switch(world_size_)
     {
-    case 8: DISPATCH_AR_FUSION_KERNEL(8); break;
-    case 4: DISPATCH_AR_FUSION_KERNEL(4); break;
-    case 2: DISPATCH_AR_FUSION_KERNEL(2); break;
+    case 8: DISPATCH_QKNORM_AR_FUSION_KERNEL(8); break;
+    case 4: DISPATCH_QKNORM_AR_FUSION_KERNEL(4); break;
+    case 2: DISPATCH_QKNORM_AR_FUSION_KERNEL(2); break;
     default:
         throw std::runtime_error("fused qknorm allreduce rmsnorm: unsupported world_size=" +
                                  std::to_string(world_size_));

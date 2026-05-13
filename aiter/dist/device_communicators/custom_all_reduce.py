@@ -862,16 +862,15 @@ class CustomAllreduce:
         qk_in: torch.Tensor,
         q_w: torch.Tensor,
         k_w: torch.Tensor,
-        *,
         eps: float,
     ):
         dtype = qk_in.dtype
         device = qk_in.device
         hidden_dim_q = q_w.shape[-1]
         hidden_dim_k = k_w.shape[-1]
-        token_num = qk_in.numel() / (hidden_dim_q + hidden_dim_k)
-        q_out = torch.empty(token_num, hidden_dim_q, dtype=dtype, device=device)
-        k_out = torch.empty(token_num, hidden_dim_k, dtype=dtype, device=device)
+        token_num = qk_in.numel() // (hidden_dim_q + hidden_dim_k)
+        q_out = torch.empty((token_num, hidden_dim_q), dtype=dtype, device=device)
+        k_out = torch.empty((token_num, hidden_dim_k), dtype=dtype, device=device)
         ops.fused_qknorm_allreduce(
             self._ptr,
             qk_in,
