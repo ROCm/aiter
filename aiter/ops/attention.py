@@ -966,7 +966,6 @@ def get_mla_metadata_info_v1(
             and kv_dtype == dtypes.fp8
             and q_dtype == dtypes.fp8
             and is_experimental_enabled()
-
         )
         or (
             get_gfx() == "gfx950"
