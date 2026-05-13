@@ -27,8 +27,24 @@ def calculate_tflops(start_inds, end_inds, num_heads_q, head_dim, time_ms):
 
 
 def run_benchmark(args):
-    x_names = ["batch_size", "seq_q_l", "seq_kv_l", "num_heads_q", "head_dim", "clean_logits"]
-    x_vals_list = [[args.batch_size, args.seq_q_l, args.seq_kv_l, args.num_heads_q, args.head_dim, args.clean_logits]]
+    x_names = [
+        "batch_size",
+        "seq_q_l",
+        "seq_kv_l",
+        "num_heads_q",
+        "head_dim",
+        "clean_logits",
+    ]
+    x_vals_list = [
+        [
+            args.batch_size,
+            args.seq_q_l,
+            args.seq_kv_l,
+            args.num_heads_q,
+            args.head_dim,
+            args.clean_logits,
+        ]
+    ]
     if args.metric == "time":
         ylabel = "Time (ms)"
     elif args.metric == "throughput":
@@ -52,7 +68,14 @@ def run_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_fp8_mqa_logits(
-        batch_size, seq_q_l, seq_kv_l, num_heads_q, head_dim, clean_logits, metric, **kwargs
+        batch_size,
+        seq_q_l,
+        seq_kv_l,
+        num_heads_q,
+        head_dim,
+        clean_logits,
+        metric,
+        **kwargs,
     ):
         s_q = batch_size * seq_q_l
         s_k = batch_size * seq_kv_l
@@ -69,10 +92,11 @@ def run_benchmark(args):
         for b in range(batch_size):
             qs = b * seq_q_l
             kvs = b * seq_kv_l
-            ks[qs:qs + seq_q_l] = kvs
-            ke[qs:qs + seq_q_l] = kvs + (seq_kv_l - seq_q_l) + arange_q + 1
+            ks[qs : qs + seq_q_l] = kvs
+            ke[qs : qs + seq_q_l] = kvs + (seq_kv_l - seq_q_l) + arange_q + 1
 
         q_fp8 = q.to(e4m3_dtype)
+
         def func():
             return fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits)
 
