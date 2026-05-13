@@ -121,7 +121,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     QManager8bitsV3<T> q_manager;
     KvManager8bitsV3<T> kv_manager;
     OManager16bitsV2<T, out_t> o_manager;
-    OManager32bitsV2<T, split_t> split_o_manager;
+    OManager32bitsV1<T, split_t> split_o_manager;
 
     // kv_0/kv_1 hold 32 N-cols of K-matrix per load (= 4 vgprs = 2 mfma B-tiles).
     // On kBlockN=64 this is the LOWER N-half; the upper half is re-loaded into
@@ -1145,7 +1145,9 @@ template <typename T>
 __global__ __launch_bounds__(
     T::kNumThreads,
     T::kOccupancy) void kn_mi35x_mla_v32_fwd_decode_m16x8_fp8_fp8(HkMlaDecodeFwdParams<T> params)
-{ assert(false); }
+{
+    assert(false);
+}
 #endif
 
 template <typename Traits>
@@ -1227,7 +1229,7 @@ void mi35x_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
         softmax_scale,
         log2_num_qheads};
 
-    const dim3 grid        = dim3(dev_prop.multiProcessorCount);
+    const dim3 grid        = dim3(work_indptr.size(0) - 1);
     const int32_t lds_size = dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy;
 
     kn_mi35x_mla_v32_fwd_decode_m16x8_fp8_fp8<Traits>
@@ -1250,8 +1252,8 @@ void hk_mi35x_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(final_output));
 
-    const bool q_is_fp8  = (query.scalar_type() == at::ScalarType::Float8_e4m3fn) ||
-                           (query.scalar_type() == at::ScalarType::Float8_e4m3fnuz);
+    const bool q_is_fp8 = (query.scalar_type() == at::ScalarType::Float8_e4m3fn) ||
+                          (query.scalar_type() == at::ScalarType::Float8_e4m3fnuz);
     const bool kv_is_fp8 = (kv_buffer.scalar_type() == at::ScalarType::Float8_e4m3fn) ||
                            (kv_buffer.scalar_type() == at::ScalarType::Float8_e4m3fnuz);
 
