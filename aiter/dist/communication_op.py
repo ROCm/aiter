@@ -111,13 +111,13 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
 
 
 def tensor_model_parallel_fused_qknorm_allreduce(
-    qk_in: torch.Tensor,
+    qkv_in: torch.Tensor,
     q_w: torch.Tensor,
     k_w: torch.Tensor,
     eps: float,
 ):
     return get_tp_group()._fused_qknorm_allreduce_out_place(
-        qk_in,
+        qkv_in,
         q_w,
         k_w,
         eps,

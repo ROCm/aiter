@@ -185,31 +185,33 @@ def fused_allreduce_rmsnorm_quant_(
 
 
 def fused_qknorm_allreduce_fake(
-    qk_in: torch.Tensor,
+    qkv_in: torch.Tensor,
     q_w: torch.Tensor,
     k_w: torch.Tensor,
     eps: float,
     group_name: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dtype = qkv_in.dtype
     return (
-        torch.empty((qk_in.shape[0], q_w.shape[-1]), dtype=qk_in.float32, device=qk_in.device()),
-        torch.empty((qk_in.shape[0], k_w.shape[-1]), dtype=qk_in.float32, device=qk_in.device()),
+        torch.empty((qkv_in.shape[0], q_w.shape[-1]), dtype=dtype, device=qkv_in.device),
+        torch.empty((qkv_in.shape[0], k_w.shape[-1]), dtype=dtype, device=qkv_in.device),
+        torch.empty((qkv_in.shape[0], qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1]), dtype=dtype, device=qkv_in.device),
     )
 
 
 @torch_compile_guard(gen_fake=fused_qknorm_allreduce_fake)
 def fused_qknorm_allreduce_(
-    qk_in: torch.Tensor,
+    qkv_in: torch.Tensor,
     q_w: torch.Tensor,
     k_w: torch.Tensor,
     eps: float,
     group_name: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    return group._fused_qknorm_allreduce_out_place(qk_in, q_w, k_w, eps)
+    return group._fused_qknorm_allreduce_out_place(qkv_in, q_w, k_w, eps)
 
 
 if supports_custom_op():
@@ -536,15 +538,15 @@ class GroupCoordinator:
     
     def _fused_qknorm_allreduce_out_place(
         self,
-        qk_in: torch.Tensor,
+        qkv_in: torch.Tensor,
         q_w: torch.Tensor,
         k_w: torch.Tensor,
         eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_qknorm_allreduce(
-            qk_in,
+            qkv_in,
             q_w,
             k_w,
             eps,

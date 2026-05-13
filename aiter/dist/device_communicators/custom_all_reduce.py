@@ -859,28 +859,31 @@ class CustomAllreduce:
     
     def fused_qknorm_ar(
         self,
-        qk_in: torch.Tensor,
+        qkv_in: torch.Tensor,
         q_w: torch.Tensor,
         k_w: torch.Tensor,
         eps: float,
     ):
-        dtype = qk_in.dtype
-        device = qk_in.device
+        dtype = qkv_in.dtype
+        device = qkv_in.device
         hidden_dim_q = q_w.shape[-1]
         hidden_dim_k = k_w.shape[-1]
-        token_num = qk_in.numel() // (hidden_dim_q + hidden_dim_k)
+        token_num = qkv_in.shape[0]
+        hidden_dim_v = qkv_in.shape[1] - (hidden_dim_q + hidden_dim_k)
         q_out = torch.empty((token_num, hidden_dim_q), dtype=dtype, device=device)
         k_out = torch.empty((token_num, hidden_dim_k), dtype=dtype, device=device)
+        v_out = torch.empty((token_num, hidden_dim_v), dtype=dtype, device=device)
         ops.fused_qknorm_allreduce(
             self._ptr,
-            qk_in,
+            qkv_in,
             q_w,
             k_w,
             q_out,
             k_out,
+            v_out,
             eps,
         )
-        return q_out, k_out
+        return q_out, k_out, v_out
 
     def custom_fused_ar_rms_per_group_quant(
         self,

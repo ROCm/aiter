@@ -338,17 +338,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
     
     def fused_qknorm_allreduce(
         self,
-        qk_in,
+        qkv_in,
         q_w,
         k_w,
         eps,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        q_out, k_out = self.ca_comm.fused_qknorm_ar(
-            qk_in, q_w, k_w, eps
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_out, k_out, v_out = self.ca_comm.fused_qknorm_ar(
+            qkv_in, q_w, k_w, eps
         )
         assert q_out is not None
         assert k_out is not None
-        return q_out, k_out
+        assert v_out is not None
+        return q_out, k_out, v_out
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:

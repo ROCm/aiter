@@ -437,11 +437,12 @@ namespace py = pybind11;
     m.def("fused_qknorm_allreduce",                                                             \
           &aiter::fused_qknorm_allreduce,                                                       \
           py::arg("_fa"),                                                                       \
-          py::arg("qk_in"),                                                                     \
+          py::arg("qkv_in"),                                                                    \
           py::arg("q_w"),                                                                       \
           py::arg("k_w"),                                                                       \
           py::arg("q_out"),                                                                     \
           py::arg("k_out"),                                                                     \
+          py::arg("v_out"),                                                                     \
           py::arg("eps"));                                                                      \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \

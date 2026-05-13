@@ -34,7 +34,7 @@ def qknorm_allreduce(
     tp_size,
     pp_size,
     rankID,
-    qk_in,
+    qkv_in,
     q_w,
     k_w,
     withGraph=False,
@@ -51,7 +51,7 @@ def qknorm_allreduce(
         distributed_init_method=distributed_init_method,
     )
     ensure_model_parallel_initialized(tp_size, pp_size)
-    qk_in = qk_in.to(device)
+    qkv_in = qkv_in.to(device)
     q_w = q_w.to(device)
     k_w = k_w.to(device)
     # dist.barrier(device_ids=[i for i in range(tp_size)])
@@ -65,25 +65,26 @@ def qknorm_allreduce(
         graph = torch.cuda.CUDAGraph()
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
-                q_out, k_out = tensor_model_parallel_fused_qknorm_allreduce(
-                    qk_in, q_w, k_w, 1e-6
+                q_out, k_out, v_out = tensor_model_parallel_fused_qknorm_allreduce(
+                    qkv_in, q_w, k_w, 1e-6
                 )
         q_out.fill_(0)
         k_out.fill_(0)
+        v_out.fill_(0)
 
         @perftest()
         def run_ca():
             graph.replay()
 
         _, us = run_ca()
-        out = ((q_out, k_out), us)
+        out = ((q_out, k_out, v_out), us)
     else:
 
         @perftest()
-        def run_ca(qk_in, q_w, k_w):
-            return tensor_model_parallel_fused_qknorm_allreduce(qk_in, q_w, k_w, 1e-6)
+        def run_ca(qkv_in, q_w, k_w):
+            return tensor_model_parallel_fused_qknorm_allreduce(qkv_in, q_w, k_w, 1e-6)
 
-        out = run_ca(qk_in, q_w, k_w)
+        out = run_ca(qkv_in, q_w, k_w)
 
     # destroy
     if dist.is_initialized():
@@ -93,18 +94,21 @@ def qknorm_allreduce(
     return out
 
 
-def qknorm_allreduce_host(qk_ins, q_ws, k_ws, eps=1e-6):
-    tp_size = len(qk_ins)
-    token_num = qk_ins[0].shape[0]
+def qknorm_allreduce_host(qkv_ins, q_ws, k_ws, eps=1e-6):
+    tp_size = len(qkv_ins)
+    token_num = qkv_ins[0].shape[0]
     hidden_dim_q = q_ws[0].shape[0]
     hidden_dim_k = k_ws[0].shape[0]
+    hidden_dim_v = qkv_ins[0].shape[1] - hidden_dim_q - hidden_dim_k
     qs = []
     ks = []
+    vs = []
     q_vars = []
     k_vars = []
     for i in range(tp_size):
-        qk_in = qk_ins[i]
-        q, k = qk_in.split([hidden_dim_q, hidden_dim_k], dim=1)
+        qkv_in = qkv_ins[i]
+        q, k, v = qkv_in.split([hidden_dim_q, hidden_dim_k, hidden_dim_v], dim=1)
+        vs.append(v)
         orig_dtype = q.dtype
         q = q.to(torch.float32)
         k = k.to(torch.float32)
@@ -132,7 +136,7 @@ def qknorm_allreduce_host(qk_ins, q_ws, k_ws, eps=1e-6):
         k = (k * torch.rsqrt(k_var_all + eps) * kw).to(orig_dtype)
         q_outs.append(q)
         k_outs.append(k)
-    return q_outs, k_outs
+    return q_outs, k_outs, vs
 
 
 @benchmark()
@@ -147,7 +151,7 @@ def test_qknorm_allreduce(
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     pool = Pool(processes=tp_size)
-    qk_ins = []
+    qkv_ins = []
     q_ws = []
     k_ws = []
     rets = []
@@ -155,11 +159,12 @@ def test_qknorm_allreduce(
         token_num = shape[0]
         hidden_dim_q = shape[1]
         hidden_dim_k = shape[2]
-        hidden_dim = hidden_dim_q + hidden_dim_k
-        qk_in = torch.randn((token_num, hidden_dim), dtype=dtype)
+        hidden_dim_v = shape[3]
+        hidden_dim = hidden_dim_q + hidden_dim_k + hidden_dim_v
+        qkv_in = torch.randn((token_num, hidden_dim), dtype=dtype)
         q_w = torch.randn((hidden_dim_q,), dtype=dtype)
         k_w = torch.randn((hidden_dim_k,), dtype=dtype)
-        qk_ins.append(qk_in)
+        qkv_ins.append(qkv_in)
         q_ws.append(q_w)
         k_ws.append(k_w)
         rets.append(
@@ -169,7 +174,7 @@ def test_qknorm_allreduce(
                     tp_size,
                     pp_size,
                     i,
-                    qk_in,
+                    qkv_in,
                     q_w,
                     k_w,
                     withGraph,
@@ -181,15 +186,17 @@ def test_qknorm_allreduce(
     pool.join()
     rets = [el.get() for el in rets]
     all_us = [us for _, us in rets]
-    q_outs, k_outs = qknorm_allreduce_host(qk_ins, q_ws, k_ws)
+    q_outs, k_outs, v_outs = qknorm_allreduce_host(qkv_ins, q_ws, k_ws)
     max_err = 0.0
     ii = 0
     for outs, us in rets:
         msg = f"test_qknorm_allreduce: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         err_q = checkAllclose(q_outs[ii], outs[0].to(q_outs[ii]), msg=msg)
         err_k = checkAllclose(k_outs[ii], outs[1].to(k_outs[ii]), msg=msg)
+        err_v = checkAllclose(v_outs[ii], outs[2].to(v_outs[ii]), msg=msg)
         max_err = max(max_err, err_q)
         max_err = max(max_err, err_k)
+        max_err = max(max_err, err_v)
         ii += 1
     return {
         "min_us": min(all_us),
@@ -199,7 +206,7 @@ def test_qknorm_allreduce(
 
 
 l_dtype = ["fp16", "bf16"]
-l_shape = [(1, 3072, 512), (2, 3072, 512), (32768, 3072, 512)]
+l_shape = [(1, 3072, 512, 1024), (2, 3072, 512, 1024), (32768, 3072, 512, 1024)]
 
 
 parser = argparse.ArgumentParser(description="config input of test")
@@ -220,7 +227,7 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="shape. e.g. -s 128,8192",
+    help="shape. e.g. -s 1,3072,512,1024",
 )
 parser.add_argument(
     "-g",
