@@ -11,7 +11,10 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm, memref, scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.compiler.protocol import fly_values
+try:
+    from flydsl.compiler.protocol import fly_values
+except ImportError:
+    from flydsl.compiler.protocol import extract_to_ir_values as fly_values
 from flydsl.expr import arith, gpu, range_constexpr, const_expr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch

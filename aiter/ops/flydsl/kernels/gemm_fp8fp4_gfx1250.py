@@ -406,13 +406,13 @@ def compile_mxscale_gemm(
                 )
 
         tx = gpu.thread_id("x")
-        bx = gpu.block_id("x")
-        by = gpu.block_id("y")
+        bx = arith.index_cast(T.index, _raw(gpu.block_id("x")))
+        by = arith.index_cast(T.index, _raw(gpu.block_id("y")))
         m_tiles_per_batch = (arith.index(M) + arith.index(tile_m - 1)) / arith.index(tile_m)
 
-        def _emit_tile(batch_idx, bx_local, bz):
+        def _emit_tile(batch_idx, bx_local, by_local, bz):
             blk_m = bx_local * arith.index(tile_m)
-            blk_n = by * arith.index(tile_n)
+            blk_n = by_local * arith.index(tile_n)
             split_k_base = bz * arith.index(split_k_chunk)
             batch_m_base = batch_idx * arith.index(M)
             batch_b_base = batch_idx * arith.index(N // 16)
@@ -1637,40 +1637,45 @@ def compile_mxscale_gemm(
 
 
         if const_expr(grouped_persistent_m):
-            prefix_rsrc = buffer_ops.create_buffer_resource(arg_m_tile_prefix, max_size=True)
-            total_tiles_i32 = buffer_ops.buffer_load(
-                prefix_rsrc, arith.index(batch_count), vec_width=1, dtype=T.i32)
-            total_tiles = arith.index_cast(T.index, total_tiles_i32)
-            worker_idx = fx.Index(gpu.block_idx.x)
-            worker_count = arith.index(_persistent_workers)
+            masked_m_rsrc = buffer_ops.create_buffer_resource(arg_masked_m, max_size=True)
+            worker_idx = arith.index_cast(T.index, _raw(gpu.block_idx.x))
+            grid_size = arith.index(_persistent_workers)
+            idx_n = arith.index_cast(T.index, i32_n.ir_value())
+            n_tiles_per_batch = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
+            block_start = arith.index(0)
 
-            for compact_tile in range(worker_idx, total_tiles, worker_count):
-                compact_tile_i32 = arith.index_cast(T.i32, compact_tile)
-                lo = arith.index(0)
-                hi = arith.index(batch_count - 1)
-                for _ in range_constexpr((batch_count - 1).bit_length()):
-                    mid = (lo + hi) / arith.index(2)
-                    end_i32 = buffer_ops.buffer_load(
-                        prefix_rsrc, mid + arith.index(1), vec_width=1, dtype=T.i32)
-                    move_right = arith.cmpi(
-                        arith.CmpIPredicate.sle, end_i32, compact_tile_i32)
-                    lo = arith.select(move_right, mid + arith.index(1), lo)
-                    hi = arith.select(move_right, hi, mid)
-                start_i32 = buffer_ops.buffer_load(
-                    prefix_rsrc, lo, vec_width=1, dtype=T.i32)
-                start_idx = arith.index_cast(T.index, start_i32)
-                _emit_tile(lo, compact_tile - start_idx, arith.index(0))
+            for batch_static in range_constexpr(batch_count):
+                batch_idx = arith.index(batch_static)
+                valid_m_i32 = buffer_ops.buffer_load(
+                    masked_m_rsrc, batch_idx, vec_width=1, dtype=T.i32)
+                valid_m_idx = arith.index_cast(T.index, valid_m_i32)
+                m_tile_count = (valid_m_idx + arith.index(tile_m - 1)) / arith.index(tile_m)
+                tile_count = m_tile_count * n_tiles_per_batch
+                block_end = block_start + tile_count
+                block_start_mod = arith.remui(block_start, grid_size)
+                first_offset = arith.remui(
+                    worker_idx + grid_size - block_start_mod, grid_size)
+                first_tile = block_start + first_offset
+
+                for global_tile in range(first_tile, block_end, grid_size):
+                    global_tile_idx = arith.index_cast(T.index, global_tile)
+                    local_tile = global_tile_idx - block_start
+                    by_local = local_tile / m_tile_count
+                    bx_local = local_tile - by_local * m_tile_count
+                    _emit_tile(batch_idx, bx_local, by_local, arith.index(0))
+
+                block_start = block_end
         else:
             if const_expr(batch_count > 1):
-                flat_bx = fx.Index(gpu.block_idx.x)
+                flat_bx = arith.index_cast(T.index, _raw(gpu.block_idx.x))
                 batch_idx = flat_bx / m_tiles_per_batch
                 bx_local = flat_bx - batch_idx * m_tiles_per_batch
                 bz = arith.index(0)
             else:
                 batch_idx = arith.index(0)
                 bx_local = bx
-                bz = fx.Index(gpu.block_idx.z) if split_k > 1 else arith.index(0)
-            _emit_tile(batch_idx, bx_local, bz)
+                bz = arith.index_cast(T.index, _raw(gpu.block_idx.z)) if split_k > 1 else arith.index(0)
+            _emit_tile(batch_idx, bx_local, by, bz)
 
     cache_tag = (data_format, K, tile_m, tile_n, tile_k, m_warp, n_warp,
                  num_buffers, compute_schedule_kind,
@@ -1792,9 +1797,8 @@ def compile_mxscale_gemm(
             arena_alloc.finalized = False
             arena_alloc.finalize()
 
-        idx_n = arith.index_cast(T.index, i32_n.ir_value())
         gx = arith.index(_persistent_workers)
-        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gy = 1
         gz = 1
 
         launcher = kernel_mxscale_gemm(
