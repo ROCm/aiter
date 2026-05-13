@@ -511,6 +511,18 @@ namespace py = pybind11;
           py::arg("Out"),           \
           py::arg("splitK") = 0);
 
+#define GEMM_W4A16_PYBIND                                                              \
+    m.def("gemm_w4a16",                                                                \
+          &gemm_w4a16,                                                                 \
+          "CK WMMA W4A16 b_scale GEMM (gfx1151). scaled_zp=None for symmetric, "      \
+          "(zp - 8) * scale for asymmetric AWQ.",                                      \
+          py::arg("in_a"),                                                             \
+          py::arg("in_b"),                                                             \
+          py::arg("in_s"),                                                             \
+          py::arg("Y"),                                                                \
+          py::arg("group_size"),                                                       \
+          py::arg("scaled_zp") = std::nullopt);
+
 #define GEMM_A8W8_BLOCKSCALE_PYBIND \
     m.def("gemm_a8w8_blockscale",   \
           &gemm_a8w8_blockscale,    \

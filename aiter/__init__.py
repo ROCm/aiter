@@ -78,6 +78,7 @@ else:
         from .ops.gemm_op_a8w8 import *  # noqa: F403,E402
         from .ops.gemm_op_a16w16 import *  # noqa: F403,E402
         from .ops.gemm_op_a4w4 import *  # noqa: F403,E402
+        from .ops.gemm_w4a16 import *  # noqa: F403,E402
         from .ops.batched_gemm_op_a8w8 import *  # noqa: F403,E402
         from .ops.batched_gemm_op_bf16 import *  # noqa: F403,E402
         from .ops.deepgemm import *  # noqa: F403,E402

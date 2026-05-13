@@ -307,6 +307,25 @@
         "hip_clang_path": "os.environ.get('GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH')",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE}'"
     },
+    "module_gemm_w4a16": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_w4a16_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/ck_w4a16/gemm_w4a16.cu'"
+        ],
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/ck_w4a16/include'",
+            "f'{CK_DIR}/include'"
+        ],
+        "flags_extra_cc": [
+            "'-DCK_USE_WMMA=1'"
+        ],
+        "flags_extra_hip": [
+            "'-DCK_USE_WMMA=1'",
+            "'-mllvm -greedy-reverse-local-assignment=1'",
+            "'-mllvm -enable-noalias-to-md-conversion=1'"
+        ],
+        "blob_gen_cmd": "''"
+    },
     "module_gemm_a8w8_bpreshuffle": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_bpreshuffle_pybind.cu'",
