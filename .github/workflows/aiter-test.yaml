@@ -47,7 +47,7 @@ jobs:
     runs-on: build-only-aiter
     needs: check-signal
     env:
-      AITER_TUNED_CONFIG_MODE: ${{ github.event_name == 'pull_request' && 'base' || 'full' }}
+      AITER_TUNED_CONFIG_MODE: ${{ github.event_name == 'pull_request' && 'smoke' || 'full' }}
     permissions:
       id-token: write
       contents: read

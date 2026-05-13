@@ -1,0 +1,13 @@
+gfx,cu_num,M,N,K,q_dtype_w,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+gfx942,80,128,128,5120,torch.int8,asm,0,8,7.3189,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_16x128E,22.92,183.56,0.182
+gfx942,80,192,1536,1024,torch.int8,asm,1,1,6.9538,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_32x128E,86.86,339.28,0.0
+gfx942,80,192,1536,5120,torch.float8_e4m3fnuz,cktile,9,0,18.9229,a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_32x64x512_1x4x1_16x16x64_default,159.59,498.72,0.0
+gfx942,80,192,128,5120,torch.int8,asm,1,8,7.5835,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_32x128E,33.18,222.53,0.1825
+gfx950,256,64,192,1024,torch.float8_e4m3fn,flydsl,989,0,3.199,flydsl_bpreshuflle_16x64x512_F8_F8_B16_1x0x0x3_default,7.87,89.63,0.0
+gfx950,256,256,8192,8192,torch.float8_e4m3fn,ck,144,0,31.9715,a8w8_bpreshuffle_256x128x64x256_16x16_16x16_16x16x1_16x16x1_1x32x1x8_8x8x1_2x1_intrawave_v3,1074.7,2295.8,0.0
+gfx950,256,32768,57344,8192,torch.float8_e4m3fn,ck,33,0,12218.2137,a8w8_bpreshuffle_256x256x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8x8x1_2x1_intrawave_v3,2519.71,368.0,0.0
+gfx950,256,32,384,7168,torch.float8_e4m3fn,ck,10,0,10.6799,a8w8_bpreshuffle_128x16x32x512_16x16_16x16_32x4x1_32x4x1_1x16x1x8_4x4x1_1x1_intrawave_v1,16.49,281.51,0.0
+gfx942,304,64,1536,5120,torch.int8,asm,0,1,16.7759,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_16x128E,60.0,500.04,0.0
+gfx942,304,10240,1536,5120,torch.int8,asm,6,1,142.1441,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_112x256E,1133.08,645.47,0.0
+gfx942,304,40960,5120,1280,torch.int8,asm,6,1,475.7676,_ZN5aiter42I8gemm_bf16_perTokenI8_BpreShuffle_112x256E,1128.43,1005.56,0.0
+gfx942,304,128,5120,1280,torch.int8,asm,1,1,8.5797,_ZN5aiter41I8gemm_bf16_perTokenI8_BpreShuffle_32x128E,195.55,935.72,0.0
