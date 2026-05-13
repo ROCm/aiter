@@ -443,6 +443,7 @@ class FmoeTuner(TunerCommon):
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
             use_async_copy=kparams.get("use_async_copy", False),
+            use_cshuffle_epilog=kparams.get("use_cshuffle_epilog", None),
             k_batch=kparams.get("k_batch", 1),
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
@@ -2243,10 +2244,18 @@ class FmoeTuner(TunerCommon):
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
         flydsl_s1_kernels = get_flydsl_stage1_kernels(
-            a_dtype_s1, b_dtype_s1, out_dtype_str, model_dim=model_dim
+            a_dtype_s1,
+            b_dtype_s1,
+            out_dtype_str,
+            model_dim=model_dim,
+            n_dim=inter_dim,
         )
         flydsl_s2_kernels = get_flydsl_stage2_kernels(
-            a_dtype_s2, b_dtype_s2, out_dtype_str
+            a_dtype_s2,
+            b_dtype_s2,
+            out_dtype_str,
+            k_dim=inter_dim,
+            n_dim=model_dim,
         )
 
         for blockM in blockMs:

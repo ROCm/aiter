@@ -267,6 +267,14 @@ def quantize_weight(
     q_dtype_w: torch.dtype,
     chunk_experts: int = 0,
 ):
+    if q_type == QuantType.per_Tensor and q_dtype_w != torch.int4 and weight.dim() == 3:
+        # FMOE kernels use one scale per expert for per_tensor weights.
+        expert = weight.shape[0]
+        weight_qt, weight_scale = aiter.pertoken_quant(
+            weight.view(expert, -1), quant_dtype=q_dtype_w
+        )
+        return weight_qt.view(weight.shape), weight_scale
+
     torch_quant = get_torch_quant(q_type)
     if (
         q_type == QuantType.per_1x32
@@ -487,6 +495,11 @@ def torch_moe_reference(
         and not quant.is_hybrid
         and quant.q_type in {QuantType.per_Token, QuantType.per_Tensor}
         and quant.q_dtype_w != dtypes.fp4x2
+        and not (
+            quant.q_type == QuantType.per_Tensor
+            and w1_scale is not None
+            and w1_scale.numel() == case.expert
+        )
     ):
         return torch_moe(
             hidden,
