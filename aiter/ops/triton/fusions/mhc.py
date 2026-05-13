@@ -8,10 +8,14 @@ import triton
 from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_fused_kernel,
     _mhc_fused_split_kernel,
+    _mhc_post_kernel,
     _mhc_reduce_apply_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.mhc_config_utils import get_mhc_config
+from aiter.ops.triton.utils.mhc_config_utils import (
+    get_mhc_config,
+    get_mhc_post_config,
+)
 
 _LOGGER = AiterTritonLogger()
 
@@ -290,3 +294,134 @@ def mhc(
     h_post = out[:, :n].unsqueeze(-1)  # (M, n, 1)
     h_res = out[:, n:].view(M, n, n)  # (M, n, n)
     return h_post, h_res, layer_input
+
+
+def mhc_post(
+    out: Optional[torch.Tensor],
+    layer_input: torch.Tensor,  # (M, C)  bf16 / fp16
+    residual: torch.Tensor,  # (M, n, C)  bf16 / fp16
+    post_mix: torch.Tensor,  # (M, n) or (M, n, 1)  fp32
+    comb_mix: torch.Tensor,  # (M, n, n)  fp32 [src, dst]
+    config: Optional[dict] = None,
+) -> torch.Tensor:
+    """Fused mHC post step in one Triton launch.
+
+    Computes the updated multi-stream residual by mixing the transformer
+    output ``layer_input`` with the previous-layer residual streams:
+
+        out[m, j, c] = post_mix[m, j] * layer_input[m, c]
+                     + sum_h comb_mix[m, h, j] * residual[m, h, c]
+
+    Pipeline (per (M-tile, C-tile), with ``n`` iterated inside):
+
+                  layer_input            residual              post_mix       comb_mix
+                    (M, C)              (M, n, C)              (M, n)        (M, n, n)
+                       \\                  |                   /              /
+                        \\                 |                  /              /
+                         v                 v                 v              v
+                              elementwise mix per dst stream j in [0, n)
+                                  acc_j = post_mix[:, j] * layer_input
+                                        + sum_h comb_mix[:, h, j] * residual[:, h, :]
+                                                   |
+                                                   v
+                                              out[:, j, :]
+                                                (M, n, C)
+
+    All tensors live on the same CUDA device. ``layer_input`` and ``residual``
+    are bf16 / fp16; ``post_mix`` and ``comb_mix`` are fp32. ``post_mix`` may be
+    passed as ``(M, n, 1)`` (the layout produced by ``mhc()``) and is squeezed
+    internally.
+
+    Args:
+        out:         optional pre-allocated output of shape ``(M, n, C)`` and
+                     dtype ``layer_input.dtype``. Allocated if ``None``.
+        layer_input: (M, C) bf16 / fp16 - mhc()'s ``layer_input`` output, i.e.
+                     the transformer block input fed back into the residual.
+        residual:    (M, n, C) bf16 / fp16 - the previous-layer multi-stream
+                     residual ``x_l``.
+        post_mix:    (M, n) or (M, n, 1) fp32 - mhc()'s ``h_post``.
+        comb_mix:    (M, n, n) fp32 - mhc()'s ``h_res``; ``[m, h, j]`` is the
+                     coefficient on residual stream ``h`` for output stream ``j``.
+        config:      optional config dict ``{BLOCK_M, BLOCK_C, num_warps,
+                     num_stages, waves_per_eu}``. Loaded from per-arch tuned
+                     configs when ``None``.
+
+    Returns the updated ``(M, n, C)`` multi-stream residual ``x_{l+1}``.
+
+    Reference: arXiv:2512.24880.
+    """
+    M, n, C = residual.shape
+    assert layer_input.shape == (
+        M,
+        C,
+    ), f"layer_input shape mismatch: expected ({M}, {C}), got {layer_input.shape}"
+
+    if post_mix.ndim == 3:
+        post_mix = post_mix.squeeze(-1)
+    assert post_mix.shape == (
+        M,
+        n,
+    ), f"post_mix shape mismatch: expected ({M}, {n}), got {post_mix.shape}"
+    assert comb_mix.shape == (
+        M,
+        n,
+        n,
+    ), f"comb_mix shape mismatch: expected ({M}, {n}, {n}), got {comb_mix.shape}"
+    assert (
+        layer_input.device == residual.device == post_mix.device == comb_mix.device
+    ), "All tensors must be on the same device"
+    assert layer_input.device.type == "cuda", "mHC post kernel requires CUDA device"
+
+    if config is None:
+        config = get_mhc_post_config(M, C)
+    config = dict(config)  # Always copy to avoid mutating LRU cache
+
+    BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
+    BLOCK_C = config.pop("BLOCK_C", min(256, triton.next_power_of_2(C)))
+    BLOCK_C = min(BLOCK_C, triton.next_power_of_2(C))
+
+    _LOGGER.info(
+        f"MHC_POST: layer_input={tuple(layer_input.shape)} "
+        f"residual={tuple(residual.shape)} post_mix={tuple(post_mix.shape)} "
+        f"comb_mix={tuple(comb_mix.shape)} "
+        f"BLOCK_M={BLOCK_M} BLOCK_C={BLOCK_C}"
+    )
+
+    if out is None:
+        out = torch.empty(M, n, C, dtype=layer_input.dtype, device=layer_input.device)
+    else:
+        assert out.shape == (
+            M,
+            n,
+            C,
+        ), f"out shape mismatch: expected ({M}, {n}, {C}), got {out.shape}"
+
+    grid = (triton.cdiv(M, BLOCK_M),)
+    _mhc_post_kernel[grid](
+        out,
+        layer_input,
+        residual,
+        post_mix,
+        comb_mix,
+        M=M,
+        C=C,
+        stride_x_m=layer_input.stride(0),
+        stride_x_c=layer_input.stride(1),
+        stride_res_m=residual.stride(0),
+        stride_res_n=residual.stride(1),
+        stride_res_c=residual.stride(2),
+        stride_out_m=out.stride(0),
+        stride_out_n=out.stride(1),
+        stride_out_c=out.stride(2),
+        stride_post_m=post_mix.stride(0),
+        stride_post_n=post_mix.stride(1),
+        stride_comb_m=comb_mix.stride(0),
+        stride_comb_src=comb_mix.stride(1),
+        stride_comb_dst=comb_mix.stride(2),
+        n=n,
+        BLOCK_M=BLOCK_M,
+        BLOCK_C=BLOCK_C,
+        **config,
+    )
+
+    return out
