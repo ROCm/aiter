@@ -31,6 +31,8 @@ __all__ = [
     "is_doubly_stochastic",
     "generate_mhc_inputs",
     "get_test_shapes",
+    "mhc_post_torch",
+    "generate_mhc_post_inputs",
 ]
 
 # =============================================================================
@@ -191,6 +193,7 @@ def sinkhorn_knopp_log_domain_torch(
     Returns:
         Doubly stochastic matrices with shape (M, N, N)
     """
+    num_iters = int(num_iters)  # Ensure int for range()
     M, N, _ = logits.shape
 
     log_A = logits.to(torch.float32)
@@ -323,3 +326,126 @@ def get_test_shapes():
     ]
 
     return shapes
+
+
+def mhc_post_torch(
+    layer_input: torch.Tensor,  # (M, C)
+    residual: torch.Tensor,  # (M, n, C)
+    post_mix: torch.Tensor,  # (M, n) or (M, n, 1)
+    comb_mix: torch.Tensor,  # (M, n, n)  [src, dst]
+) -> torch.Tensor:
+    """PyTorch reference for the mhc_post step.
+
+    Computes the updated multi-stream residual by mixing the transformer
+    output ``layer_input`` with the previous-layer residual streams:
+
+        out[m, j, c] = post_mix[m, j] * layer_input[m, c]
+                     + sum_h comb_mix[m, h, j] * residual[m, h, c]
+
+    ``post_mix`` may be passed as ``(M, n, 1)`` (the layout produced by
+    ``mhc()``) and is squeezed internally.
+
+    Reference: arXiv:2512.24880.
+    """
+    post_mix = post_mix.squeeze(-1) if post_mix.ndim == 3 else post_mix
+    x_f32 = layer_input.float()
+    res_f32 = residual.float()
+
+    # Term 1: post_mix * layer_input broadcast across dst stream j -> (M, n, C)
+    out = post_mix[:, :, None] * x_f32[:, None, :]
+
+    # Term 2: contract over src dim h: einsum "mhc,mhj -> mjc"
+    out = out + torch.einsum("mhc,mhj->mjc", res_f32, comb_mix.float())
+
+    return out.to(layer_input.dtype)
+
+
+def generate_mhc_post_inputs(
+    M: int,
+    n: int,
+    C: int,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """
+    Generate test inputs for mhc_post.
+
+    Returns:
+        Tuple of (layer_input, residual, post_mix, comb_mix) where:
+        - layer_input: (M, C) in dtype
+        - residual:    (M, n, C) in dtype
+        - post_mix:    (M, n) fp32
+        - comb_mix:    (M, n, n) fp32
+    """
+    layer_input = torch.randn(M, C, dtype=dtype, device=device)
+    residual = torch.randn(M, n, C, dtype=dtype, device=device)
+    post_mix = torch.randn(M, n, dtype=torch.float32, device=device) * 0.1
+    comb_mix = torch.randn(M, n, n, dtype=torch.float32, device=device) * 0.1
+
+    return layer_input, residual, post_mix, comb_mix
+
+
+def mhc_e2e_ref(
+    x_l,
+    phi,
+    alpha_pre,
+    alpha_post,
+    alpha_res,
+    bias,
+    n,
+    eps=1e-6,
+    hc_pre_eps=0.0,
+    hc_post_mult_value=2.0,
+    sinkhorn_iters=20,
+):
+    """
+    Reference implementation using PyTorch
+
+    # =============================================================================
+    # End-to-End Pipeline Tests (mhc → mhc_post)
+    # =============================================================================
+    #
+    # Pipeline Overview:
+    #
+    # x_l (M, n, C)  ──┐
+    #                  │
+    #                  ├──> mhc() ──> (h_post, h_res, layer_input)
+    #                  │                                 │
+    #                  │                                 ├──> layer_input (M, C)
+    #                  │                                 │
+    #                  │                                 v
+    #                  └──────────────────────────> mhc_post() ──> x_l+1 (M, n, C)
+    #                                                   │
+    #                                                   └──> Uses (layer_input, x_l, h_post, h_res)
+
+    Pipeline:
+    x_l (M, n, C) → flatten → mhc → (h_post, h_res, layer_input) → mhc_post → x_l+1 (M, n, C)
+    """
+    sinkhorn_iters = int(sinkhorn_iters)
+    M, n_check, C = x_l.shape
+    assert n_check == n, f"Stream count mismatch: {n_check} != {n}"
+    assert hc_post_mult_value == 2.0, (
+        "mhc_torch hardcodes 2.0 * sigmoid(H_post); "
+        "non-default hc_post_mult_value is not supported in the reference"
+    )
+
+    x_l_flat = x_l.view(M, n * C)
+
+    # Step 1: mhc - compute coefficients and layer_input
+    h_post, h_res, _h_pre, layer_input = mhc_torch(
+        x_l_flat,
+        phi,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        n,
+        eps=eps,
+        hc_pre_eps=hc_pre_eps,
+        sinkhorn_iters=sinkhorn_iters,
+    )
+
+    # Step 2: mhc_post - merge layer_input back to multi-stream
+    x_l_plus_1 = mhc_post_torch(layer_input, x_l, h_post, h_res)
+
+    return layer_input, x_l_plus_1, h_post, h_res

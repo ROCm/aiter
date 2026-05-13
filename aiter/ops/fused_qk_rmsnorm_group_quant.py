@@ -12,7 +12,9 @@ from ..utility import dtypes
 
 
 @compile_ops(
-    "module_fused_qk_rmsnorm_group_quant", fc_name="fused_qk_rmsnorm_group_quant"
+    "module_fused_qk_rmsnorm_group_quant",
+    fc_name="fused_qk_rmsnorm_group_quant",
+    develop=True,
 )
 def _fused_qk_rmsnorm_group_quant_kernel(
     q_out_quantized: Optional[Tensor] = None,
@@ -34,7 +36,9 @@ def _fused_qk_rmsnorm_group_quant_kernel(
 
 
 @compile_ops(
-    "module_fused_qk_rmsnorm_group_quant", fc_name="fused_qk_rmsnorm_per_token_quant"
+    "module_fused_qk_rmsnorm_group_quant",
+    fc_name="fused_qk_rmsnorm_per_token_quant",
+    develop=True,
 )
 def _fused_qk_rmsnorm_per_token_quant_kernel(
     q_out_quantized: Tensor,
