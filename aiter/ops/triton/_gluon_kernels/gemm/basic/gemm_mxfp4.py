@@ -76,6 +76,22 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
 # so load_shared_relaxed reads bytes in the order WMMA expects.
 # ---------------------------------------------------------------------------
 
+@gluon.jit
+def depreshuffle_scales(
+    smem_scales,
+    BLOCK_M: gl.constexpr,
+    K_GROUPS: gl.constexpr,
+):
+    LANES_PER_STRIPE: gl.constexpr = 16
+    KG_PER_STRIPE: gl.constexpr = 4
+    NUM_STRIPES: gl.constexpr = K_GROUPS // KG_PER_STRIPE
+    return (
+        smem_scales
+        .reshape((BLOCK_M // LANES_PER_STRIPE, NUM_STRIPES, LANES_PER_STRIPE, KG_PER_STRIPE))
+        .permute((0, 2, 1, 3))
+        .reshape((BLOCK_M, K_GROUPS))
+    )
+
 
 @gluon.jit
 def depreshuffle_b_raw_to_kn(
@@ -146,10 +162,15 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
     BLOCK_K_BYTES: gl.constexpr = BLOCK_SIZE_K // FP4_ELEMS_PER_BYTE
     K_GROUPS: gl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_ELEMS
-    LANES_PER_B128: gl.constexpr = 4
+    LANES_PER_TDM: gl.constexpr =16
+
+    gl.static_assert(K_GROUPS * 32 == BLOCK_SIZE_K)
+
 
     gl.static_assert(BLOCK_SIZE_K % 32 == 0)
-    gl.static_assert(K_GROUPS * 32 == BLOCK_SIZE_K)
+    gl.static_assert(BLOCK_SIZE_K % 128 == 0)        # K_GROUPS divisible by KG_PER_STRIPE
+    gl.static_assert(BLOCK_SIZE_M % LANES_PER_TDM == 0)
+    gl.static_assert(BLOCK_SIZE_N % LANES_PER_TDM == 0)
 
     pid = gl.program_id(axis=0)
     tiles_n = gl.cdiv(N, BLOCK_SIZE_N)
@@ -183,24 +204,24 @@ def gemm_mxfp4_preshuffle_gfx1250(
     k_scale_cols = K_elems // SCALE_GROUP_ELEMS
 
     as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_scale_ptr + tile_m * (BLOCK_SIZE_M // LANES_PER_B128) * stride_as_m,
+        base=a_scale_ptr + tile_m * (BLOCK_SIZE_M // LANES_PER_TDM) * stride_as_m,
         shape=(
-            gl.cdiv(M, LANES_PER_B128) - tile_m * (BLOCK_SIZE_M // LANES_PER_B128),
-            k_scale_cols * LANES_PER_B128,
+            gl.cdiv(M, LANES_PER_TDM) - tile_m * (BLOCK_SIZE_M // LANES_PER_TDM),
+            k_scale_cols * LANES_PER_TDM,
         ),
         strides=(stride_as_m, stride_as_k),
-        block_shape=(BLOCK_SIZE_M // LANES_PER_B128, K_GROUPS * LANES_PER_B128),
+        block_shape=(BLOCK_SIZE_M // LANES_PER_TDM, K_GROUPS * LANES_PER_TDM),
         layout=shared_S,
     )
 
     bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=b_scale_ptr + tile_n * (BLOCK_SIZE_N // LANES_PER_B128) * stride_bs_n,
+        base=b_scale_ptr + tile_n * (BLOCK_SIZE_N // LANES_PER_TDM) * stride_bs_n,
         shape=(
-            gl.cdiv(N, LANES_PER_B128) - tile_n * (BLOCK_SIZE_N // LANES_PER_B128),
-            k_scale_cols * LANES_PER_B128,
+            gl.cdiv(N, LANES_PER_TDM) - tile_n * (BLOCK_SIZE_N // LANES_PER_TDM),
+            k_scale_cols * LANES_PER_TDM,
         ),
         strides=(stride_bs_n, stride_bs_k),
-        block_shape=(BLOCK_SIZE_N // LANES_PER_B128, K_GROUPS * LANES_PER_B128),
+        block_shape=(BLOCK_SIZE_N // LANES_PER_TDM, K_GROUPS * LANES_PER_TDM),
         layout=shared_S,
     )
 
@@ -221,13 +242,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
     smem_AS = gl.allocate_shared_memory(
         a_scale_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_SIZE_M // LANES_PER_B128, K_GROUPS * LANES_PER_B128],
+        [NUM_BUFFERS, BLOCK_SIZE_M // LANES_PER_TDM, K_GROUPS * LANES_PER_TDM],
         layout=shared_S,
     )
 
     smem_BS = gl.allocate_shared_memory(
         b_scale_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_SIZE_N // LANES_PER_B128, K_GROUPS * LANES_PER_B128],
+        [NUM_BUFFERS, BLOCK_SIZE_N // LANES_PER_TDM, K_GROUPS * LANES_PER_TDM],
         layout=shared_S,
     )
 
@@ -254,10 +275,10 @@ def gemm_mxfp4_preshuffle_gfx1250(
             b_desc, [0, BLOCK_K_BYTES * 16]
         )
         as_desc = gl.amd.gfx1250.tdm.advance(
-            as_desc, [0, K_GROUPS * LANES_PER_B128]
+            as_desc, [0, K_GROUPS * LANES_PER_TDM]
         )
         bs_desc = gl.amd.gfx1250.tdm.advance(
-            bs_desc, [0, K_GROUPS * LANES_PER_B128]
+            bs_desc, [0, K_GROUPS * LANES_PER_TDM]
         )
         load_idx += 1
 
@@ -275,10 +296,12 @@ def gemm_mxfp4_preshuffle_gfx1250(
         layout=dot_b_layout,
     )
     cur_AS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        smem_AS.index(slot_c).reshape((BLOCK_SIZE_M, K_GROUPS)), layout=a_scale_layout
+        depreshuffle_scales(smem_AS.index(slot_c), BLOCK_SIZE_M, K_GROUPS),
+         layout=a_scale_layout
     )
     cur_BS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        smem_BS.index(slot_c).reshape((BLOCK_SIZE_N, K_GROUPS)), layout=b_scale_layout
+        depreshuffle_scales(smem_BS.index(slot_c), BLOCK_SIZE_N, K_GROUPS),
+         layout=b_scale_layout
     )
 
     # --- 3. Main loop: WMMA(cur) → TDM(future) → wait → pre-load(next) ---
@@ -303,10 +326,10 @@ def gemm_mxfp4_preshuffle_gfx1250(
             b_desc, [0, BLOCK_K_BYTES * 16]
         )
         as_desc = gl.amd.gfx1250.tdm.advance(
-            as_desc, [0, K_GROUPS * LANES_PER_B128]
+            as_desc, [0, K_GROUPS * LANES_PER_TDM]
         )
         bs_desc = gl.amd.gfx1250.tdm.advance(
-            bs_desc, [0, K_GROUPS * LANES_PER_B128]
+            bs_desc, [0, K_GROUPS * LANES_PER_TDM]
         )
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 4)
@@ -326,11 +349,11 @@ def gemm_mxfp4_preshuffle_gfx1250(
             layout=dot_b_layout,
         )
         cur_AS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_AS.index(next_slot).reshape((BLOCK_SIZE_M, K_GROUPS)),
+            depreshuffle_scales(smem_AS.index(next_slot), BLOCK_SIZE_M, K_GROUPS),
             layout=a_scale_layout,
         )
         cur_BS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_BS.index(next_slot).reshape((BLOCK_SIZE_N, K_GROUPS)),
+            depreshuffle_scales(smem_BS.index(next_slot), BLOCK_SIZE_N, K_GROUPS),
             layout=b_scale_layout,
         )
         compute_idx += 1
@@ -352,11 +375,11 @@ def gemm_mxfp4_preshuffle_gfx1250(
             layout=dot_b_layout,
         )
         next_AS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_AS.index(next_slot).reshape((BLOCK_SIZE_M, K_GROUPS)),
+            depreshuffle_scales(smem_AS.index(next_slot), BLOCK_SIZE_M, K_GROUPS),
             layout=a_scale_layout,
         )
         next_BS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_BS.index(next_slot).reshape((BLOCK_SIZE_N, K_GROUPS)),
+            depreshuffle_scales(smem_BS.index(next_slot), BLOCK_SIZE_N, K_GROUPS),
             layout=b_scale_layout,
         )
 

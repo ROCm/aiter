@@ -43,40 +43,31 @@ def un_shuffle_scales(scales_shuffled: torch.Tensor):
     return scales
 
 
-def shuffle_scales_gfx1250(scales: torch.Tensor, BLOCK_K=256) -> torch.Tensor:
-    # Per-tile preshuffle. Each tile T occupies a contiguous K-byte stripe
-    # [T*K_GROUPS*4, (T+1)*K_GROUPS*4) in the output, with the 4 lanes packed
-    # adjacently inside each stripe so the kernel's TDM read sees:
-    #   [tile_T_lane_0_K_groups | tile_T_lane_1 | tile_T_lane_2 | tile_T_lane_3]
-    M, total_K_groups = scales.shape
-    LANES_PER_B128 = 4
-    K_GROUPS = BLOCK_K // SCALE_GROUP_SIZE
-    assert M % LANES_PER_B128 == 0
-    assert total_K_groups % K_GROUPS == 0
-    k_tiles = total_K_groups // K_GROUPS
-    return (
-        scales.reshape(M // LANES_PER_B128, LANES_PER_B128, k_tiles, K_GROUPS)
-        .permute(0, 2, 1, 3)
-        .contiguous()
-        .reshape(M // LANES_PER_B128, k_tiles * LANES_PER_B128 * K_GROUPS)
+def shuffle_scales_gfx1250(scales: torch.Tensor):
+    # LANES_PER_STRIPE = 16         128 B / 8 B-per-lane
+    # K_GROUPS_PER_LANE = 8         256 K elements / 32 K-per-group
+    # One 128-byte TDM stripe = 16 lanes × 8 scale-groups per lane
+    # (8 scale-groups × 32 K-per-group = 256 K elems contiguous per lane)
+    M, K_groups = scales.shape
+
+    out = scales.view(
+        M // 16, 16,           # rows  →  (m_tile, lane)
+        K_groups // 4, 4,      # cols  →  (k_tile, kg_in_lane)
     )
+    out = out.permute(0, 2, 1, 3).contiguous()   # (m_tile, k_tile, lane, kg_in_lane)
+    out = out.view(M // 16, K_groups * 16)
+    return out
 
 
-def unshuffle_scales_gfx1250(
-    scales_shuffled: torch.Tensor, BLOCK_K=256, M: int = None
-) -> torch.Tensor:
-    LANES_PER_B128 = 4
-    K_GROUPS = BLOCK_K // SCALE_GROUP_SIZE
+def un_shuffle_scales_gfx1250(scales_shuffled: torch.Tensor):
     rows, cols = scales_shuffled.shape
-    if M is None:
-        M = rows * LANES_PER_B128
-    k_tiles = cols // (LANES_PER_B128 * K_GROUPS)
-    return (
-        scales_shuffled.reshape(rows, k_tiles, LANES_PER_B128, K_GROUPS)
-        .permute(0, 2, 1, 3)
-        .contiguous()
-        .reshape(M, k_tiles * K_GROUPS)
-    )
+    M = rows * 16
+    K_groups = cols // 16
+
+    out = scales_shuffled.view(rows, K_groups // 4, 16, 4)  # (m_tile, k_tile, lane, kg_in_lane)
+    out = out.permute(0, 2, 1, 3).contiguous()              # (m_tile, lane, k_tile, kg_in_lane)
+    out = out.view(M, K_groups)
+    return out
 
 
 # Note this is specified by the HW and cannot be changed.
