@@ -86,8 +86,8 @@ def pid_grid(pid: int, num_pid_m: int, num_pid_n: int, GROUP_SIZE_M: gl.constexp
     return pid_m, pid_n
 
 
-# @gluon.jit(launch_metadata=matmul_launch_metadata, loop_carried_load_percent=0)
-@gluon.jit(launch_metadata=matmul_launch_metadata)
+# @gluon.jit(launch_metadata=matmul_launch_metadata)
+@gluon.jit(launch_metadata=matmul_launch_metadata, loop_carried_load_percent=0)
 def _moe_gemm_a4w4_gfx1250(
     Y,
     stride_y_k,
@@ -144,6 +144,7 @@ def _moe_gemm_a4w4_gfx1250(
     # layouts
     WMMA_LAYOUT: gl.constexpr,
     WMMA_LAYOUT_PACKED: gl.constexpr,
+    L2_PREFETCH_DISTANCE: gl.constexpr,
     # triton configs
     NUM_WARPS: gl.constexpr,
 ):
@@ -170,7 +171,7 @@ def _moe_gemm_a4w4_gfx1250(
         BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR"
     )
 
-    NUM_LOADS_IN_BATCH: gl.constexpr = 2
+    NUM_LOADS_IN_BATCH: gl.constexpr = 4
     gl.static_assert(NUM_BUFFERS >= 3, "NUM_BUFFERS must be at least 3")
 
     w_type: gl.constexpr = W.dtype.element_ty
@@ -378,6 +379,39 @@ def _moe_gemm_a4w4_gfx1250(
     load_idx = 0
     wmma_idx = 0
 
+    num_k_iter = gl.cdiv(K, BLOCK_K)
+
+    # L2 prefetch prologue: warm L2 for the iterations that the first few main-loop
+    # iterations will load but that aren't already covered by the LDS prologue.
+    for i in gl.static_range(L2_PREFETCH_DISTANCE):
+        pref_idx = (NUM_BUFFERS - 1) + i
+        pref_pred = pref_idx < num_k_iter
+        if GatherIndx is None:
+            gl.amd.gfx1250.tdm.prefetch(
+                x_desc,
+                [offs_x_m.to(index_type), pref_idx * PACKED_BLOCK_K_X],
+                pred=pref_pred,
+                speculative=True,
+            )
+            gl.amd.gfx1250.tdm.prefetch(
+                x_scales_desc,
+                [offs_x_m.to(index_type), pref_idx * MX_SCALE_BLOCK_K],
+                pred=pref_pred,
+                speculative=True,
+            )
+        gl.amd.gfx1250.tdm.prefetch(
+            w_desc,
+            [offs_w_n.to(index_type), pref_idx * PACKED_BLOCK_K_W],
+            pred=pref_pred,
+            speculative=True,
+        )
+        gl.amd.gfx1250.tdm.prefetch(
+            w_scales_desc,
+            [offs_w_n_scale.to(index_type), pref_idx * PACKED_MX_BLOCK],
+            pred=pref_pred,
+            speculative=True,
+        )
+
     # prologue: fill NUM_BUFFERS-1 LDS slots via TDM
     for _ in gl.static_range(NUM_BUFFERS - 1):
         if GatherIndx is None:
@@ -444,7 +478,6 @@ def _moe_gemm_a4w4_gfx1250(
     wmma_idx += 1
 
     # main loop: perform wmma and fill LDS with next tile
-    num_k_iter = gl.cdiv(K, BLOCK_K)
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     for _ in range(num_k_iter - (NUM_BUFFERS - 1)):
         # issue wmma
@@ -490,6 +523,36 @@ def _moe_gemm_a4w4_gfx1250(
             w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
         load_idx += 1
+
+        # prefetch L2_PREFETCH_DISTANCE iters ahead of the load we just issued.
+        if L2_PREFETCH_DISTANCE > 0:
+            pref_idx = load_idx + L2_PREFETCH_DISTANCE - 1
+            pref_pred = pref_idx < num_k_iter
+            if GatherIndx is None:
+                gl.amd.gfx1250.tdm.prefetch(
+                    x_desc,
+                    [offs_x_m.to(index_type), pref_idx * PACKED_BLOCK_K_X],
+                    pred=pref_pred,
+                    speculative=True,
+                )
+                gl.amd.gfx1250.tdm.prefetch(
+                    x_scales_desc,
+                    [offs_x_m.to(index_type), pref_idx * MX_SCALE_BLOCK_K],
+                    pred=pref_pred,
+                    speculative=True,
+                )
+            gl.amd.gfx1250.tdm.prefetch(
+                w_desc,
+                [offs_w_n.to(index_type), pref_idx * PACKED_BLOCK_K_W],
+                pred=pref_pred,
+                speculative=True,
+            )
+            gl.amd.gfx1250.tdm.prefetch(
+                w_scales_desc,
+                [offs_w_n_scale.to(index_type), pref_idx * PACKED_MX_BLOCK],
+                pred=pref_pred,
+                speculative=True,
+            )
 
         # wait for next tile to be filled
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH)
