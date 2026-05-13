@@ -28,6 +28,18 @@ from torch_guard import torch_compile_guard  # noqa: E402
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
 
+
+def is_experimental_enabled() -> bool:
+    # Mirror the C++ side (atoi(...) != 0): treat unset and "0" as disabled,
+    # any other integer value as enabled. Non-numeric strings are treated as
+    # disabled to avoid accidentally turning on experimental code paths.
+    val = os.environ.get("AITER_ENABLE_EXPERIMENTAL", "0")
+    try:
+        return int(val) != 0
+    except ValueError:
+        return False
+
+
 aiter_lib = None
 
 
@@ -694,7 +706,7 @@ def clone_3rdparty(third_party: str) -> None:
         dir_path = HIP_KITTENS_DIR
         third_party_info = {
             "url": "https://github.com/HazyResearch/HipKittens.git",
-            "commit": "b027c06ba935b80a53a7c7f7f82c0f9cbd0bf3cb",
+            "commit": "a5e308a7ec633b1e94a952de629f41653a0874f3",
         }
     elif third_party == "ComposableKernel":
         # TODO: ComposableKernel will be supported in the future
@@ -1076,7 +1088,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
                         continue
                     single_ops = convert(d_ops)
                     # exclude experimental ops if AITER_ENABLE_EXPERIMENTAL is not set
-                    if not os.getenv("AITER_ENABLE_EXPERIMENTAL", False):
+                    if not is_experimental_enabled():
                         if single_ops.get("is_experimental", False):
                             continue
                     d_single_ops = {
