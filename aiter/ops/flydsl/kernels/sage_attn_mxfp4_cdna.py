@@ -908,6 +908,11 @@ def build_sage_attn_mxfp4_cdna_module(
                 k_scale_i32_per_st.append(k_scale_i32_lane)
 
             # ---- 1) QK FP4 MFMA: K_STEPS_QK calls per (st), each one scale group ----
+            # MFMA operand order: A=K, B=Q (mirrors sage v1 INT8 convention).
+            # Output S[m=K-row, n=Q-row]: lane32=Q-row, vector elems span K-rows.
+            # This matches the downstream mask/softmax/P-quant code that
+            # encodes the K-col index via (msub, klane, erem) of the vector
+            # elements and reduces per-Q-row max across klane (XOR 32).
             s_accs_loc = [_raw(c_zero_v16f32) for _ in range(N_SUBTILES)]
             for ks in range_constexpr(K_STEPS_QK):
                 # Pack q_packs[ks] (v2i32 = 8 active bytes per lane) into v8i32
@@ -917,33 +922,28 @@ def build_sage_attn_mxfp4_cdna_module(
                     kv_row_loc = lane32 + st * MFMA_N
                     k_v2 = load_k_frag_fp4(kv_row_loc, ks, k_buf_off_arg)
                     k_v8 = _v2_to_v8(k_v2)
+                    # A=K (M=K-row=lane32), B=Q (N=Q-row=lane32). Scale per
+                    # operand: scaleA = K-row scale, scaleB = Q-row scale.
                     s_accs_loc[st] = mfma_fp4_scaled(
                         v16f32_type,
-                        q_v8, k_v8, s_accs_loc[st],
-                        q_scale_i32, k_scale_i32_per_st[st],
+                        k_v8, q_v8, s_accs_loc[st],
+                        k_scale_i32_per_st[st], q_scale_i32,
                         ks, ks,
                     )
 
             # 2) Score post-processing.
             # The MFMA already applies the per-32-group dequantization scales
             # via scaleA/scaleB. sm_scale * log2(e) is baked into Q by the
-            # Triton rotation_smooth_qk quantizer. In principle no extra
-            # multiply is needed. EMPIRICAL FINDING (2026-05-13): the no-mult
-            # path achieves cos~0.39, while keeping the explicit sm_scale*log2e
-            # multiply gets cos~0.61 (still well below the 0.95 bar — there's
-            # another correctness bug to chase). Keeping the multiply for now;
-            # remove once the underlying scale-byte / nibble-order bug is
-            # resolved (see plan: Stage 2 iteration).
-            sm_log2e = float(sm_scale) * 1.4426950408889634
-            sm_scale_v = Vec.from_elements(
-                [fx.Float32(sm_log2e)], fx.Float32
-            ).broadcast_to(16)
+            # Triton rotation_smooth_qk quantizer (see sage_quant_mxfp4 →
+            # rotation_smooth_qk(sm_scale=sm_scale*1.4426950408889634)).
+            # No post-MFMA multiply is needed — Triton's reference also
+            # skips it (see _attn_fwd_inner_full at ~_triton_kernels/.../
+            # fav3_sage_attention_mxfp4.py:225 — straight exp2(qk - max)).
             s_f32_loc = []
             for st in range_constexpr(N_SUBTILES):
                 s_vec = Vec(s_accs_loc[st])
-                s_scaled = Vec(arith.mulf(s_vec, sm_scale_v, fastmath=fm_fast))
                 for elem in range_constexpr(ELEMS_PER_TILE):
-                    s_f32_loc.append(s_scaled[elem])
+                    s_f32_loc.append(s_vec[elem])
 
             # 3) Mask
             kv_start_i32_loc = fx.Int32(

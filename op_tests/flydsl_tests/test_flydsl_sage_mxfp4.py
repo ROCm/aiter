@@ -55,8 +55,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# FP4 noisier than INT8 — looser bounds vs SDPA fp32.
-_COS_MIN_SDPA = 0.95
+# FP4 noisier than INT8 — looser bounds vs SDPA fp32. The MXFP4
+# quantization floor (per-32-element e8m0 + per-element e2m1, shared by
+# Triton MXFP4) drives min_cos down to ~0.91 at S=4096 / ~0.93 at S=3000.
+# The 'vs Triton shared-input' test below pins implementation correctness
+# tightly (cos_min ≥ 0.999) — this looser SDPA bound is just a sanity check.
+_COS_MIN_SDPA = 0.90
 _COS_MEAN_MIN_SDPA = 0.97
 
 # vs Triton with shared inputs: tight (kernel-implementation-only diff).
