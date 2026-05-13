@@ -466,8 +466,9 @@ parser.add_argument(
     "--act",
     type=dtypes.str2ActivationType,
     nargs="*",
-    default=[aiter.ActivationType.Silu],
-    help="""Select activation type. Default: [Silu].
+    default=None,
+    help="""Select activation type. When omitted, each quant path picks its
+    own default (Swiglu for mxfp4 a8w4/a16w4, Silu otherwise).
     e.g.: -a gelu        # [Gelu]
           -a silu gelu    # [Silu, Gelu]""",
 )
@@ -735,25 +736,31 @@ def _iter_legacy_cases():
     ) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
         triple = (quant_type, aq_dtype, wq_dtype)
 
+        # Per-path default activation when user does not specify -a.
+        # Keeps prior behavior (mxfp4 a8w4/a16w4 default to Swiglu; other
+        # paths default to Silu) but now also honors an explicit -a override.
         if triple in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
-            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
-                for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        aiter.ActivationType.Swiglu,
-                        hidden_pad=hidden_pad,
-                        intermediate_pad=intermediate_pad,
-                    ), extras
+            acts = args.act if args.act is not None else [aiter.ActivationType.Swiglu]
+            for act_type in acts:
+                for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+                    for m in args.tokenNum:
+                        yield _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            hidden_pad=hidden_pad,
+                            intermediate_pad=intermediate_pad,
+                        ), extras
         elif triple == _PER1X32_FP4_FP4:
+            acts = args.act if args.act is not None else [aiter.ActivationType.Silu]
             for preshuffle in args.preshuffle:
-                for act_type in args.act:
+                for act_type in acts:
                     for m in args.tokenNum:
                         yield _kw(
                             dtype,
@@ -770,20 +777,23 @@ def _iter_legacy_cases():
                             intermediate_pad=0,
                         ), extras
         elif triple == _PER1X32_BF16_I4:
-            for m in args.tokenNum:
-                yield _kw(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    doweight_stage1,
-                    aiter.ActivationType.Silu,
-                ), extras
+            acts = args.act if args.act is not None else [aiter.ActivationType.Silu]
+            for act_type in acts:
+                for m in args.tokenNum:
+                    yield _kw(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        doweight_stage1,
+                        act_type,
+                    ), extras
         else:
-            for act_type in args.act:
+            acts = args.act if args.act is not None else [aiter.ActivationType.Silu]
+            for act_type in acts:
                 for m in args.tokenNum:
                     yield _kw(
                         dtype,
@@ -819,17 +829,22 @@ for kwargs, extras in case_iter:
         args.swiglu_limit,
     )
     _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
-    _force_moe_bound_zero = (
-        kwargs["qType"],
-        kwargs["AQDType"],
-        kwargs["WQDType"],
-    ) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4)
-    if _force_moe_bound_zero:
-        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+    # Pin the runtime bf16/fp8 dispatch bound so the kernel matches the
+    # quant configuration declared by the test row:
+    #   * a8w4 (fp8 act + fp4x2 weights): bound=0 -> always fp8 path
+    #   * a16w4 (bf16 act + fp4x2 weights): bound=large -> always bf16 path
+    _triple = (kwargs["qType"], kwargs["AQDType"], kwargs["WQDType"])
+    _force_moe_bound = None
+    if _triple == _PER1X32_FP8_FP4:
+        _force_moe_bound = "0"
+    elif _triple == _PER1X32_BF16_FP4:
+        _force_moe_bound = "1000000000"
+    if _force_moe_bound is not None:
+        os.environ["AITER_BF16_FP8_MOE_BOUND"] = _force_moe_bound
     try:
         ret = test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
     finally:
-        if _force_moe_bound_zero:
+        if _force_moe_bound is not None:
             if _old_moe_bound is None:
                 os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
             else:
