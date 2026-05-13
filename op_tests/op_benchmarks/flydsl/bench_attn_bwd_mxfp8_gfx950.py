@@ -18,7 +18,7 @@ DEFAULT_BENCH_ITERS = 20
 DEFAULT_BENCH_WARMUP = 3
 
 def bench_attn_bwd_flyc(
-    batch, seqlen, head_dim,
+    batch, num_heads_q, num_heads_kv, seqlen, head_dim,
     tile_m, tile_n,
     causal,
     test_graph,
@@ -38,7 +38,7 @@ def bench_attn_bwd_flyc(
     sm_scale = 0.5
     _wpe = int(waves_per_eu) if waves_per_eu else 0
     launch_fn = compile_attn_bwd_mxfp8_gfx950(
-        seqlen=seqlen, head_dim=head_dim,
+        num_heads_q=num_heads_q, num_heads_kv=num_heads_kv, seqlen=seqlen, head_dim=head_dim,
         tile_m=tile_m, tile_n=tile_n, tile_head=tile_head,
         sm_scale=sm_scale,
         causal=causal,
@@ -47,11 +47,12 @@ def bench_attn_bwd_flyc(
     print(f"✓ Kernel prepared")
 
     device = torch.device("cuda")
-    q_fp32 = torch.randn(batch, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
-    k_fp32 = torch.randn(batch, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
-    v_fp32 = torch.randn(batch, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
-    o_fp32 = torch.randn(batch, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
-    do_fp32 = torch.randn(batch, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
+    gqa_size = num_heads_q // num_heads_kv
+    q_fp32 = torch.randn(batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
+    k_fp32 = torch.randn(batch, num_heads_kv, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
+    v_fp32 = torch.randn(batch, num_heads_kv, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
+    o_fp32 = torch.randn(batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
+    do_fp32 = torch.randn(batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
 
     q_fp32_head, q_quant_head, q_scale_head = mx_quant(q_fp32, -1)
     q_fp32_m, q_quant_m, q_scale_m = mx_quant(q_fp32, -2)
@@ -61,19 +62,24 @@ def bench_attn_bwd_flyc(
     do_fp32_head, do_quant_head, do_scale_head = mx_quant(do_fp32, -1)
     do_fp32_m, do_quant_m, do_scale_m = mx_quant(do_fp32, -2)
 
-    qk = q_fp32 @ k_fp32.transpose(-2, -1)
+    k_fp32 = k_fp32.repeat_interleave(gqa_size, dim=1)
+    k_fp32_head = k_fp32_head.repeat_interleave(gqa_size, dim=1)
+    k_fp32_n = k_fp32_n.repeat_interleave(gqa_size, dim=1)
+    v_fp32 = v_fp32.repeat_interleave(gqa_size, dim=1)
+
+    qk = torch.matmul(q_fp32, k_fp32.transpose(-2, -1))
     qk = qk * sm_scale
     m = qk.max(dim=-1)[0]
-    p = (qk - m[:, :, None]).exp()
+    p = (qk - m[:, :, :, None]).exp()
     l = p.sum(dim=-1)
     m = m + torch.log(l)
     D = (o_fp32 * do_fp32).sum(dim=-1)
 
     if check_correctness:
-        dq_ref, dk_ref, dv_ref = run_torch(q_fp32_head, q_fp32_m, k_fp32_head, k_fp32_n, v_fp32, do_fp32_head, do_fp32_m, m, D, sm_scale, causal)
-    dq_fly = torch.zeros((batch, seqlen, head_dim), dtype=torch.float32, device=device)
-    dk_fly = torch.zeros((batch, seqlen, head_dim), dtype=torch.bfloat16, device=device)
-    dv_fly = torch.zeros((batch, seqlen, head_dim), dtype=torch.bfloat16, device=device)
+        dq_ref, dk_ref, dv_ref = run_torch(q_fp32_head, q_fp32_m, k_fp32_head, k_fp32_n, v_fp32, do_fp32_head, do_fp32_m, m, D, sm_scale, causal, gqa_size)
+    dq_fly = torch.zeros((batch, num_heads_q, seqlen, head_dim), dtype=torch.float32, device=device)
+    dk_fly = torch.zeros((batch, num_heads_kv, seqlen, head_dim), dtype=torch.float32, device=device)
+    dv_fly = torch.zeros((batch, num_heads_kv, seqlen, head_dim), dtype=torch.float32, device=device)
 
     def launch_kernel(dq, dk, dv, q_quant_head, q_scale_head, q_quant_m, q_scale_m, k_quant_head, k_scale_head, k_quant_n, k_scale_n, v, v_scale, do_quant_head, do_scale_head, do_quant_m, do_scale_m, m, D, batch):
         launch_fn(
@@ -97,6 +103,14 @@ def bench_attn_bwd_flyc(
             m.contiguous().view(-1),
             D.contiguous().view(-1),
             batch,
+            q_quant_head.stride(0),
+            q_scale_head.stride(0),
+            k_quant_head.stride(0),
+            k_scale_head.stride(0),
+            m.stride(0),
+            q_quant_head.stride(1),
+            q_scale_head.stride(1),
+            m.stride(1),
             torch.cuda.current_stream(),
         )
 
@@ -131,6 +145,8 @@ def bench_attn_bwd_flyc(
     torch.cuda.synchronize()
 
     dq_fly.zero_()
+    dk_fly.zero_()
+    dv_fly.zero_()
     launch_kernel(
         dq_fly,
         dk_fly,
@@ -163,8 +179,8 @@ def bench_attn_bwd_flyc(
         assert check_result(dk_fly_fp32, dk_ref, rtol=0.01, atol=0.01)
         assert check_result(dv_fly_fp32, dv_ref, rtol=0.01, atol=0.01)
 
-    bytes_moved = (7 + 4 + 2 * 2) * seqlen * head_dim + 2 * 4 * seqlen
-    flops = batch * (5 * 2 * seqlen * seqlen * head_dim + 5 * seqlen * seqlen + 2 * 3 * seqlen * seqlen)
+    bytes_moved = (4 + 4) * batch * num_heads_q * seqlen * head_dim + (3 + 2 * 4) * batch * num_heads_kv * seqlen * head_dim + 2 * 4 * batch * num_heads_q * seqlen
+    flops = batch * num_heads_q * (5 * 2 * seqlen * seqlen * head_dim + 5 * seqlen * seqlen + 2 * 3 * seqlen * seqlen)
     if causal:
         flops /= 2
     tflops = flops / (us / 1e6) / 1e12
@@ -177,6 +193,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Preshuffle GEMM benchmark")
     parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--num_heads_q", type=int, default=128)
+    parser.add_argument("--num_heads_kv", type=int, default=128)
     parser.add_argument("--seqlen", type=int, default=1024)
     parser.add_argument("--head", type=int, default=128)
     parser.add_argument("--tile_m", type=int, default=128)
@@ -191,7 +209,7 @@ if __name__ == "__main__":
     torch.set_default_device("cuda")
 
     bench_attn_bwd_flyc(
-        batch=args.batch, seqlen=args.seqlen, head_dim=args.head,
+        batch=args.batch, num_heads_q=args.num_heads_q, num_heads_kv=args.num_heads_kv, seqlen=args.seqlen, head_dim=args.head,
         tile_m=args.tile_m, tile_n=args.tile_n,
         causal=args.causal,
         test_graph=bool(args.test_graph),
