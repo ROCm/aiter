@@ -233,6 +233,7 @@ _TEST_PREBUILD_EXCLUDE_MODULES = {
     "module_rocsolgemm",
 }
 
+
 def _get_profile_exclude_modules(all_modules):
     if AITER_PREBUILD_PROFILE not in {"test", "ci-test", "ci_test"}:
         return []
@@ -264,14 +265,10 @@ def get_exclude_ops():
             # Exclude tune modules; for MHA keep only fmha_v3 fwd variants
             if "_tune" in module:
                 exclude_ops.append(module)
-            if (
-                "mha" in module
-                and module
-                not in [
-                    "module_fmha_v3_fwd",
-                    "module_fmha_v3_varlen_fwd",
-                ]
-            ):
+            if "mha" in module and module not in [
+                "module_fmha_v3_fwd",
+                "module_fmha_v3_varlen_fwd",
+            ]:
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 2:
             # Exclude _bwd and _tune
