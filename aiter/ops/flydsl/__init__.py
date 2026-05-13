@@ -41,6 +41,10 @@ if is_flydsl_available():
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .fmha_kernels import flydsl_flash_attn_func
     from .sage_kernels import flydsl_sage_attn_func
+    from .sage_mxfp4_kernels import (
+        flydsl_sage_attn_mxfp4_func,
+        fav3_sage_mxfp4_flydsl_wrapper,
+    )
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
@@ -51,5 +55,7 @@ if is_flydsl_available():
         "flydsl_hgemm",
         "flydsl_flash_attn_func",
         "flydsl_sage_attn_func",
+        "flydsl_sage_attn_mxfp4_func",
+        "fav3_sage_mxfp4_flydsl_wrapper",
         # "flydsl_gdr_decode",
     ]
