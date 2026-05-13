@@ -34,8 +34,8 @@ template<int BLOCK_SIZE_,
         bool HAS_BIAS_ = false,
         typename D_BIAS_ = void,
         bool HAS_OOB_ = true,
-        int CPOL_A_ = 0,
-        int CPOL_B_ = 17,
+        int CACHECTL_A_ = 0,
+        int CACHECTL_B_ = 17,
         int SWIZZLE_W_ = 8,
         int SWIZZLE_C_ = 32>
 struct opus_gemm_a16w16_traits_gfx950 {
@@ -102,8 +102,8 @@ struct opus_gemm_a16w16_traits_gfx950 {
     // Cache policy for A/B loads (CDNA4 ISA Table 49).
     // Values: 0=LRU, 1=SC0(Group,LLC Evict), 2=NT(Stream), 17=SC0+SC1(BYPASS_L2).
     // Tuner selects optimal CPOL per shape from multiple kid variants.
-    static constexpr int CPOL_A = CPOL_A_;
-    static constexpr int CPOL_B = CPOL_B_;
+    static constexpr int CACHECTL_A = CACHECTL_A_;
+    static constexpr int CACHECTL_B = CACHECTL_B_;
 
     // HipKittens XCD swizzle parameters (Algorithm 1, MI350 = 8 XCDs)
     static constexpr int NUM_XCD = 8;
