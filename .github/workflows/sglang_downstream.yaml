@@ -68,7 +68,8 @@ jobs:
       matrix: ${{ fromJSON(needs.select-sglang-tests.outputs.matrix) }}
 
     env:
-      SGL_BRANCH: main
+      # Track SGLang AMD CI branch for https://github.com/ROCm/aiter/issues/2751.
+      SGL_BRANCH: amd/aiter-ci
       GPU_ARCH: gfx950
       SGLANG_CI_HOSTNAME_OVERRIDE: linux-mi35x-gpu-8
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
