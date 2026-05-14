@@ -1,17 +1,19 @@
 """
-Benchmark and correctness test for all 5 backward methods in deepseek_sparse_attention.py.
+Benchmark and correctness test for all 6 backward methods in deepseek_sparse_attention.py.
 
 Usage:
-  python bench_dsa_methods.py                   # correctness + benchmark (all 5 methods)
+  python bench_dsa_methods.py                   # correctness + benchmark (all 6 methods)
   python bench_dsa_methods.py --bench-only      # benchmark only
   python bench_dsa_methods.py --test-only       # correctness only
 
-Five backward strategies:
+Six backward strategies:
   1. "fused"              — single fused kernel (baseline)
   2. "recompute"          — split dQ+dKV, full S/P/dS recomputation (1.18x, 0 extra memory)
   3. "split_intermediate" — split dQ+dKV, stores dS/P intermediates (1.68x, 2 GiB extra)
   4. "privatized"         — split dQ+dKV, 8 private dKV copies (token_idx%8 routing)
   5. "xcd_privatized"     — split dQ+dKV, 8 XCD-local copies (MI300X: (i%304)//38 routing)
+  6. "gather"             — split dQ+dKV, no atomics: [T,TOPK,D] bf16 intermediate +
+                            CSR inverted topk gather (~7 GiB extra)
 """
 import sys
 import os
@@ -26,7 +28,7 @@ from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import
     sparse_mla_train,
 )
 
-METHODS = ["fused", "recompute", "split_intermediate", "privatized", "xcd_privatized"]
+METHODS = ["fused", "recompute", "split_intermediate", "privatized", "xcd_privatized", "gather"]
 
 
 # =====================================================================
@@ -37,7 +39,7 @@ def test_methods_agree(
     kv_lora_rank=512, rope_rank=64, topk=128,
     device="cuda",
 ):
-    """Verify all 4 backward methods produce the same dQ and dKV."""
+    """Verify all backward methods produce the same dQ and dKV."""
     d_qk = kv_lora_rank + rope_rank
     total_tokens = batch * seq_len
     scale = 1.0 / (d_qk ** 0.5)
@@ -88,7 +90,7 @@ def test_autograd_methods(
     kv_lora_rank=256, rope_rank=64, topk=64,
     device="cuda",
 ):
-    """Verify autograd works with all 4 backward methods."""
+    """Verify autograd works with all backward methods."""
     d_qk = kv_lora_rank + rope_rank
     total_tokens = batch * seq_len
     scale = 1.0 / (d_qk ** 0.5)
@@ -194,6 +196,11 @@ def benchmark_methods(
                 ds_p = total_tokens * num_heads * topk * 2 * 2
                 dkv_copies = 8 * total_tokens * d_qk * 4
                 extra = f"{(ds_p + dkv_copies) / 1024**3:.1f} GiB"
+            elif method == "gather":
+                # dS + P buffers + [T, TOPK, D] bf16 intermediate
+                ds_p = total_tokens * num_heads * topk * 2 * 2
+                interm = total_tokens * topk * d_qk * 2
+                extra = f"{(ds_p + interm) / 1024**3:.1f} GiB"
             else:
                 extra = "0"
 

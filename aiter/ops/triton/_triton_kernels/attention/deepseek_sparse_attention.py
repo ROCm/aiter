@@ -1160,6 +1160,172 @@ def _bwd_dkv_reduce_copies(
 
 
 # =====================================================================
+# Backward method="gather" — intermediate storage + inverted topk gather
+# =====================================================================
+@triton.jit
+def _bwd_compute_dkv_intermediate(
+    Q_T_ptr,        # [T, D_QK, H] bf16  (q transposed: stride_qt_t = D_QK * H)
+    dO_T_ptr,       # [T, D_V,  H] bf16
+    dS_ptr,         # [T, H, TOPK] bf16
+    P_ptr,          # [T, H, TOPK] bf16
+    TopK_ptr,       # [T, TOPK] int32
+    Interm_ptr,     # [T, TOPK, D_QK] bf16 — output, one writer per (q, topk_rank)
+    stride_qt_t: tl.int64,
+    stride_dot_t: tl.int64,
+    stride_ds_t: tl.int64,
+    stride_ds_h: tl.int64,
+    stride_topk_t: tl.int64,
+    stride_interm_t: tl.int64,   # TOPK * D_QK
+    stride_interm_k: tl.int64,   # D_QK
+    num_heads: tl.int32,
+    TOPK: tl.constexpr,
+    TILE_K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NUM_HG: tl.constexpr,
+    D_V: tl.constexpr,
+    D_ROPE: tl.constexpr,
+):
+    """
+    Same compute as _bwd_dkv_hg_fused but writes to a private intermediate
+    [T, TOPK, D] bf16 instead of atomic_add to shared dKV — no atomics needed.
+
+    Grid: (total_tokens,) -- one program per query token q.
+    For each tile of TOPK, stores dKV_lora/rope for that (q, tile) block.
+    """
+    token_idx = tl.program_id(0)
+
+    NUM_TILES: tl.constexpr = (TOPK + TILE_K - 1) // TILE_K
+    topk_base = token_idx * stride_topk_t
+    offs_tile = tl.arange(0, TILE_K)
+    offs_v = tl.arange(0, D_V)
+    offs_r = tl.arange(0, D_ROPE)
+
+    interm_base_t = token_idx * stride_interm_t  # base for this query token
+
+    for t in range(NUM_TILES):
+        tile_start = t * TILE_K
+        tile_offs = tile_start + offs_tile
+        valid = tile_offs < TOPK
+
+        dKV_lora = tl.zeros([D_V, TILE_K], dtype=tl.float32)
+        dKV_rope = tl.zeros([D_ROPE, TILE_K], dtype=tl.float32)
+
+        for hg in range(NUM_HG):
+            offs_h = hg * BLOCK_H + tl.arange(0, BLOCK_H)
+            mask_h = offs_h < num_heads
+
+            qt_base = token_idx * stride_qt_t
+            Q_lora_T = tl.load(
+                Q_T_ptr + qt_base + offs_v[:, None] * num_heads + offs_h[None, :],
+                mask=mask_h[None, :], other=0.0,
+            )
+            Q_rope_T = tl.load(
+                Q_T_ptr + qt_base + (D_V + offs_r[:, None]) * num_heads + offs_h[None, :],
+                mask=mask_h[None, :], other=0.0,
+            )
+
+            dot_base = token_idx * stride_dot_t
+            dO_T = tl.load(
+                dO_T_ptr + dot_base + offs_v[:, None] * num_heads + offs_h[None, :],
+                mask=mask_h[None, :], other=0.0,
+            )
+
+            ds_base = token_idx * stride_ds_t
+            dS_val = tl.load(
+                dS_ptr + ds_base + offs_h[:, None] * stride_ds_h + tile_offs[None, :],
+                mask=mask_h[:, None] & valid[None, :], other=0.0,
+            )
+            P_val = tl.load(
+                P_ptr + ds_base + offs_h[:, None] * stride_ds_h + tile_offs[None, :],
+                mask=mask_h[:, None] & valid[None, :], other=0.0,
+            )
+
+            dKV_lora += tl.dot(Q_lora_T, dS_val.to(Q_lora_T.dtype)).to(tl.float32)
+            dKV_lora += tl.dot(dO_T, P_val.to(dO_T.dtype)).to(tl.float32)
+            dKV_rope += tl.dot(Q_rope_T, dS_val.to(Q_rope_T.dtype)).to(tl.float32)
+
+        # Store to intermediate: Interm[token_idx, tile_start:tile_start+TILE_K, 0:D_V]
+        # Layout: [T, TOPK, D] so pointer = interm_base_t + tile_offs[None,:]*D + offs_v[:,None]
+        interm_lora_ptrs = (Interm_ptr + interm_base_t
+                            + tile_offs[None, :] * stride_interm_k
+                            + offs_v[:, None])
+        tl.store(interm_lora_ptrs, dKV_lora.to(tl.bfloat16), mask=valid[None, :])
+
+        interm_rope_ptrs = (Interm_ptr + interm_base_t
+                            + tile_offs[None, :] * stride_interm_k
+                            + D_V + offs_r[:, None])
+        tl.store(interm_rope_ptrs, dKV_rope.to(tl.bfloat16), mask=valid[None, :])
+
+
+@triton.jit
+def _bwd_dkv_gather(
+    Interm_ptr,     # [T, TOPK, D] bf16, flattened as [T*TOPK, D]
+    InvPtr_ptr,     # [T+1] int32 — CSR row pointers (kv_token -> range in inv_data)
+    InvData_ptr,    # [T*TOPK] int32 — encoded as q*TOPK+r, sorted by KV token
+    dKV_ptr,        # [T, D] bf16 — output
+    stride_interm_k: tl.int64,   # D_V + D_ROPE
+    stride_dkv_t: tl.int64,
+    TOPK: tl.constexpr,
+    D_V: tl.constexpr,
+    D_ROPE: tl.constexpr,
+):
+    """
+    Gather dKV from intermediate buffer using CSR-style inverted topk index.
+
+    Grid: (total_tokens,) -- one CTA per KV token k.
+    Accumulates in fp32, stores bf16. No atomics.
+    """
+    k = tl.program_id(0)
+    offs_v = tl.arange(0, D_V)
+    offs_r = tl.arange(0, D_ROPE)
+
+    start = tl.load(InvPtr_ptr + k)
+    end = tl.load(InvPtr_ptr + k + 1)
+
+    dkv_acc_lora = tl.zeros([D_V], dtype=tl.float32)
+    dkv_acc_rope = tl.zeros([D_ROPE], dtype=tl.float32)
+
+    n_entries = end - start
+    for i in range(n_entries):
+        # entry = q*TOPK + r, used directly as flat index into [T*TOPK, D] intermediate
+        entry = tl.load(InvData_ptr + start + i).to(tl.int64)
+        base = entry * stride_interm_k
+        lora_val = tl.load(Interm_ptr + base + offs_v)
+        rope_val = tl.load(Interm_ptr + base + D_V + offs_r)
+        dkv_acc_lora += lora_val.to(tl.float32)
+        dkv_acc_rope += rope_val.to(tl.float32)
+
+    dkv_base = k.to(tl.int64) * stride_dkv_t
+    tl.store(dKV_ptr + dkv_base + offs_v, dkv_acc_lora.to(tl.bfloat16))
+    tl.store(dKV_ptr + dkv_base + D_V + offs_r, dkv_acc_rope.to(tl.bfloat16))
+
+
+def _build_inverted_topk(topk_indices):
+    """
+    Build CSR-style inverted index from topk_indices [T, TOPK] int32.
+
+    Returns:
+        inv_ptr:  [T+1] int32 — row pointers (kv_token -> range in inv_data)
+        inv_data: [T*TOPK] int32 — encoded (q*TOPK+r) values, sorted by KV token
+    """
+    T, TOPK = topk_indices.shape
+    device = topk_indices.device
+
+    flat_kv = topk_indices.reshape(-1).long()   # [T*TOPK] KV token indices
+    # argsort by KV token to get the flat indices (q*TOPK+r) in sorted order
+    order = torch.argsort(flat_kv, stable=True)
+    inv_data = order.to(torch.int32)  # [T*TOPK]
+
+    counts = torch.zeros(T, dtype=torch.int32, device=device)
+    counts.scatter_add_(0, flat_kv, torch.ones(T * TOPK, dtype=torch.int32, device=device))
+
+    inv_ptr = torch.zeros(T + 1, dtype=torch.int32, device=device)
+    torch.cumsum(counts, dim=0, out=inv_ptr[1:])
+
+    return inv_ptr, inv_data
+
+
+# =====================================================================
 # Python wrappers
 # =====================================================================
 def sparse_mla_fwd(q, kv, topk_indices, kv_lora_rank=512, scale=None):
@@ -1234,6 +1400,10 @@ def sparse_mla_bwd(q, kv, o, do, topk_indices, lse, kv_lora_rank=512, scale=None
             "xcd_privatized"     -- split dQ+dKV, true XCD-local scatter (MI300X)
                                     routes CTA i to copy (i%304)//38, keeping all atomic
                                     adds L2-local within each XCD (8 copies, 38 CUs/XCD)
+            "gather"             -- split dQ+dKV, eliminates all atomics:
+                                    stores head-reduced dKV to [T,TOPK,D] bf16 intermediate,
+                                    builds CSR inverted topk, gathers with plain bf16 stores
+                                    (~6.97 GiB extra: 2.14 GiB dS/P + 4.83 GiB intermediate)
 
     Returns:
         dq:  [total_tokens, num_heads, d_qk] same dtype as q
@@ -1458,10 +1628,65 @@ def sparse_mla_bwd(q, kv, o, do, topk_indices, lse, kv_lora_rank=512, scale=None
             NUM_COPIES=num_xcd, BLOCK=reduce_block,
         )
 
+    elif method == "gather":
+        bh, tk_dq, nw_dq, ns_dq = 64, 16, 4, 2
+        tk_dkv, nw_dkv = 64, 4
+        num_hg = triton.cdiv(num_heads, bh)
+
+        # Phase 1: dQ + store dS/P intermediates (same as split_intermediate)
+        dS_buf = torch.zeros(total_tokens, num_heads, topk, dtype=torch.bfloat16, device=q.device)
+        P_buf  = torch.zeros(total_tokens, num_heads, topk, dtype=torch.bfloat16, device=q.device)
+
+        grid_dq = (total_tokens, num_hg)
+        _bwd_dq_store_intermediates[grid_dq](
+            q, kv, do, topk_indices, lse, delta,
+            dq, dS_buf, P_buf,
+            q.stride(0), q.stride(1), kv.stride(0),
+            do.stride(0), do.stride(1),
+            dq.stride(0), dq.stride(1),
+            topk_indices.stride(0),
+            dS_buf.stride(0), dS_buf.stride(1),
+            scale, num_heads,
+            TOPK=topk, BLOCK_H=bh, TILE_K=tk_dq,
+            D_V=kv_lora_rank, D_ROPE=rope_rank,
+            num_warps=nw_dq, num_stages=ns_dq,
+        )
+
+        # Phase 2: compute head-reduced dKV intermediate [T, TOPK, D] bf16 (no atomics)
+        interm = torch.empty(total_tokens, topk, d_qk, dtype=torch.bfloat16, device=q.device)
+        grid_interm = (total_tokens,)
+        _bwd_compute_dkv_intermediate[grid_interm](
+            q_t, do_t, dS_buf, P_buf, topk_indices, interm,
+            q_t.stride(0), do_t.stride(0),
+            dS_buf.stride(0), dS_buf.stride(1),
+            topk_indices.stride(0),
+            interm.stride(0), interm.stride(1),
+            num_heads,
+            TOPK=topk, TILE_K=tk_dkv, BLOCK_H=bh,
+            NUM_HG=num_hg, D_V=kv_lora_rank, D_ROPE=rope_rank,
+            num_warps=nw_dkv, num_stages=1,
+        )
+
+        # Phase 3: build CSR inverted topk (Python, ~1ms)
+        inv_ptr, inv_data = _build_inverted_topk(topk_indices)
+
+        # Phase 4: gather dKV with plain stores (no atomics)
+        dkv_gather = torch.empty(total_tokens, d_qk, dtype=torch.bfloat16, device=q.device)
+        grid_gather = (total_tokens,)
+        _bwd_dkv_gather[grid_gather](
+            interm, inv_ptr, inv_data, dkv_gather,
+            interm.stride(1), dkv_gather.stride(0),
+            TOPK=topk, D_V=kv_lora_rank, D_ROPE=rope_rank,
+            num_warps=nw_dkv,
+        )
+
+        dkv_out = dkv_gather.unsqueeze(1)
+        return dq, dkv_out
+
     else:
         raise ValueError(f"Unknown backward method: {method!r}. "
                          f"Choose from 'fused', 'recompute', 'split_intermediate', "
-                         f"'privatized', 'xcd_privatized'.")
+                         f"'privatized', 'xcd_privatized', 'gather'.")
 
     dkv_out = dkv.unsqueeze(1).to(kv.dtype)
     return dq, dkv_out
