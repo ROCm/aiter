@@ -327,21 +327,6 @@ namespace py = pybind11;
           py::arg("quant_block_size"),                                              \
           py::arg("scale_fmt"),                                                     \
           py::arg("preshuffle") = false);                                           \
-    m.def("indexer_k_norm_rope_quant_and_cache",                                    \
-          &aiter::indexer_k_norm_rope_quant_and_cache,                              \
-          py::arg("k"),                                                             \
-          py::arg("kv_cache"),                                                      \
-          py::arg("slot_mapping"),                                                  \
-          py::arg("norm_weight"),                                                   \
-          py::arg("norm_bias"),                                                     \
-          py::arg("positions"),                                                     \
-          py::arg("cos_cache"),                                                     \
-          py::arg("sin_cache"),                                                     \
-          py::arg("epsilon"),                                                       \
-          py::arg("quant_block_size"),                                              \
-          py::arg("scale_fmt"),                                                     \
-          py::arg("preshuffle") = false,                                            \
-          py::arg("is_neox") = true);                                               \
     m.def("indexer_qk_rope_quant_and_cache",                                        \
           &aiter::indexer_qk_rope_quant_and_cache,                                  \
           py::arg("q"),                                                             \

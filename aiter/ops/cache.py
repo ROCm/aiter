@@ -109,24 +109,6 @@ def indexer_k_quant_and_cache(
 
 
 @compile_ops("module_cache", develop=True)
-def indexer_k_norm_rope_quant_and_cache(
-    k: Tensor,
-    kv_cache: Tensor,
-    slot_mapping: Tensor,
-    norm_weight: Tensor,
-    norm_bias: Tensor,
-    positions: Tensor,
-    cos_cache: Tensor,
-    sin_cache: Tensor,
-    epsilon: float,
-    quant_block_size: int,
-    scale_fmt: str,
-    preshuffle: bool = False,
-    is_neox: bool = True,
-) -> None: ...
-
-
-@compile_ops("module_cache", develop=True)
 def indexer_qk_rope_quant_and_cache(
     q: Tensor,
     q_out: Tensor,
