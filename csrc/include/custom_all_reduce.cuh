@@ -1820,6 +1820,191 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                                     eps);
 }
 
+template <typename T, int ngpus, int WARP_SIZE>
+__global__ void __launch_bounds__(1024, 1)
+    qknorm_allreduce_fusion_kernel_2stage(RankData* _dp,
+                                          RankSignals sg,
+                                          Signal* self_sg,
+                                          int rank,
+                                          T* __restrict__ qkv_in,
+                                          T* __restrict__ q_w,
+                                          T* __restrict__ k_w,
+                                          T* __restrict__ q_out,
+                                          T* __restrict__ k_out,
+                                          T* __restrict__ v_out,
+                                          int token_num,
+                                          int hidden_dim_q,
+                                          int hidden_dim_k,
+                                          int hidden_dim_v,
+                                          float eps)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    int hidden_dim_qk       = hidden_dim_q + hidden_dim_k;
+    int hidden_dim          = hidden_dim_q + hidden_dim_k + hidden_dim_v;
+    bool is_q               = (int)threadIdx.x * pack_size < hidden_dim_q;
+    bool is_qk              = (int)threadIdx.x * pack_size < hidden_dim_qk;
+    bool is_k               = (!is_q) && (is_qk);
+    bool is_q_t0            = threadIdx.x == 0;
+    bool is_k_t0            = threadIdx.x == (hidden_dim_q / pack_size);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int tidx                = blockIdx.x;
+    int access_id_in_token  = threadIdx.x * pack_size;
+    int idx                 = tidx * hidden_dim + access_id_in_token;
+    int wid                 = threadIdx.x / WARP_SIZE;
+
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+        tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    __shared__ float smem[32];
+
+    A acc{};
+    P vec{};
+    P var_vec{};
+    P weight_p{};
+    float sum2 = 0.0f;
+
+    vec = ptrs[rank][idx / pack_size];
+
+    if (is_qk) {
+
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            acc[v] = upcast_s(vec[v]);
+            sum2 += acc[v] * acc[v];
+        }
+        
+        sum2 = warpReduce<AddFunctor, float, WARP_SIZE>(sum2);
+
+        if (threadIdx.x % WARP_SIZE == 0)
+            smem[wid] = sum2;
+        __syncthreads();
+
+        sum2 = 0.0f;
+
+        if (is_q_t0) {
+            for (int i = 0; i < hidden_dim_q / WARP_SIZE / pack_size; ++i) {
+                sum2 += smem[i];
+            }
+            sum2 /= (float)hidden_dim_q;
+            *reinterpret_cast<float*>(&var_vec) = sum2;
+            tmps[rank][tidx * 2 + 0] = var_vec;
+        } else if (is_k_t0) {
+            for (int i = hidden_dim_q / WARP_SIZE / pack_size; i < hidden_dim_qk / WARP_SIZE / pack_size; ++i) {
+                sum2 += smem[i];
+            }
+            sum2 /= (float)hidden_dim_k;
+            *reinterpret_cast<float*>(&var_vec) = sum2;
+            tmps[rank][tidx * 2 + 1] = var_vec;
+        }
+
+        end_sync<ngpus>(sg, self_sg, rank);
+
+        if (is_q_t0) {
+#pragma unroll
+            for(int r = 1; r < ngpus; ++r)
+            {
+                int target = (rank + r) % ngpus;
+                auto peer_vec = tmps[target][tidx * 2 + 0];
+                sum2 += *reinterpret_cast<float*>(&peer_vec);
+            }
+            smem[0] = sum2;
+        } else if (is_k_t0) {
+#pragma unroll
+            for(int r = 1; r < ngpus; ++r)
+            {
+                int target = (rank + r) % ngpus;
+                auto peer_vec = tmps[target][tidx * 2 + 1];
+                sum2 += *reinterpret_cast<float*>(&peer_vec);
+            }
+            smem[1] = sum2;
+        }
+
+        __syncthreads();
+
+        if (is_q) {
+            weight_p = *reinterpret_cast<P*>(&q_w[access_id_in_token]);
+            float denom = rsqrtf(smem[0] / ngpus + eps);
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+            {
+                vec[v] = downcast_s<T>(acc[v] * denom * weight_p[v]);
+            }
+            *reinterpret_cast<P*>(&q_out[tidx * hidden_dim_q + access_id_in_token]) = vec;
+        } else {
+            weight_p = *reinterpret_cast<P*>(&k_w[access_id_in_token - hidden_dim_q]);
+            float denom = rsqrtf(smem[1] / ngpus + eps);
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+            {
+                vec[v] = downcast_s<T>(acc[v] * denom * weight_p[v]);
+            }
+            *reinterpret_cast<P*>(&k_out[tidx * hidden_dim_k + access_id_in_token - hidden_dim_q]) = vec;
+        }
+    
+    } else {
+        *reinterpret_cast<P*>(&v_out[tidx * hidden_dim_v + access_id_in_token - hidden_dim_qk]) = vec;
+    }
+}
+
+template <typename T , int NGPUS>
+void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
+                                             RankSignals sg,
+                                             Signal* self_sg,
+                                             int rank,
+                                             T* qkv_in,
+                                             T* q_w,
+                                             T* k_w,
+                                             T* q_out,
+                                             T* k_out,
+                                             T* v_out,
+                                             int token_num,
+                                             int hidden_dim_q,
+                                             int hidden_dim_k,
+                                             int hidden_dim_v,
+                                             float eps,
+                                             hipStream_t stream)
+{
+    constexpr int PACK_SIZE      = 16 / sizeof(T);
+    constexpr int WARP_SIZE      = 32;
+    constexpr int WARP_WORK_SIZE = WARP_SIZE * PACK_SIZE;
+    int hidden_dim               = hidden_dim_q + hidden_dim_k + hidden_dim_v;
+    int BLOCK_SIZE               = hidden_dim / PACK_SIZE;
+    if(token_num > kMaxBlocks)
+        throw std::runtime_error(
+            "Token number is too large for qknorm_allreduce_fusion_kernel_2stage kernel");
+    bool valid = (hidden_dim_q % WARP_WORK_SIZE == 0) && (hidden_dim_k % WARP_WORK_SIZE == 0) && (hidden_dim_v % WARP_WORK_SIZE == 0);
+    if (!valid)
+        throw std::runtime_error(
+            "Invalid qk hidden dim layout for qknorm_allreduce_fusion_kernel_2stage kernel");
+    dim3 threadsPerBlock(BLOCK_SIZE);
+    dim3 numBlocks(token_num);
+    qknorm_allreduce_fusion_kernel_2stage<T, NGPUS, WARP_SIZE>
+        <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
+                                                    sg,
+                                                    self_sg,
+                                                    rank,
+                                                    qkv_in,
+                                                    q_w,
+                                                    k_w,
+                                                    q_out,
+                                                    k_out,
+                                                    v_out,
+                                                    token_num,
+                                                    hidden_dim_q,
+                                                    hidden_dim_k,
+                                                    hidden_dim_v,
+                                                    eps);
+}
+
 template <typename T, typename OutT, int ngpus>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_2stage(RankData* _dp,
@@ -3322,6 +3507,61 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
             std::to_string(world_size_));
     }
 #undef DISPATCH_AR_FUSION_PG_KERNEL
+}
+
+template <typename T>
+void dispatchFusedQKNormAllReduce(hipStream_t stream,
+                                  T* qkv_in,
+                                  T* q_w,
+                                  T* k_w,
+                                  T* q_out,
+                                  T* k_out,
+                                  T* v_out,
+                                  int token_num,
+                                  int hidden_dim_q,
+                                  int hidden_dim_k,
+                                  int hidden_dim_v,
+                                  float eps)
+{
+    auto d = 16 / sizeof(T);
+    if(hidden_dim_q % d != 0 || hidden_dim_k % d != 0 || hidden_dim_v % d != 0)
+    {
+        throw std::runtime_error("custom allreduce currently requires input length to be multiple "
+                                 "of " +
+                                 std::to_string(d));
+    }
+    RankData* ptrs = get_buffer_RD(stream, qkv_in);
+    
+#define DISPATCH_QKNORM_AR_FUSION_KERNEL(NGPUS)                                \
+    {                                                                          \
+        qknorm_allreduce_fusion_kernel_2stage_launcher<T, NGPUS>(ptrs,         \
+                                                                 sg_,          \
+                                                                 self_sg_,     \
+                                                                 rank_,        \
+                                                                 qkv_in,       \
+                                                                 q_w,          \
+                                                                 k_w,          \
+                                                                 q_out,        \
+                                                                 k_out,        \
+                                                                 v_out,        \
+                                                                 token_num,    \
+                                                                 hidden_dim_q, \
+                                                                 hidden_dim_k, \
+                                                                 hidden_dim_v, \
+                                                                 eps,          \
+                                                                 stream);      \
+        return;                                                                \
+    }
+
+    switch(world_size_)
+    {
+    case 8: DISPATCH_QKNORM_AR_FUSION_KERNEL(8); break;
+    case 4: DISPATCH_QKNORM_AR_FUSION_KERNEL(4); break;
+    case 2: DISPATCH_QKNORM_AR_FUSION_KERNEL(2); break;
+    default:
+        throw std::runtime_error("fused qknorm allreduce rmsnorm: unsupported world_size=" +
+                                 std::to_string(world_size_));
+    }
 }
 
 ~CustomAllreduce()

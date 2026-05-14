@@ -6,7 +6,7 @@
 #include "hk_mla_utils.cuh"
 
 template <typename T>
-class QManagerV1
+class QManager8bitsV1
 {
     private:
     using q_t = typename T::q_t;
@@ -40,10 +40,10 @@ class QManagerV1
     }
 };
 
-// Lanes loads Q from VRAM by row so as to fullfill cache line. Then, lanes exchange data via
+// Lanes load Q from VRAM by row so as to fulfill cache line. Then, lanes exchange data via
 // ds_bpermute_b32.
 template <typename T>
-class QManagerV2
+class QManager8bitsV2
 {
     private:
     using q_t = typename T::q_t;
@@ -116,9 +116,9 @@ class QManagerV2
     }
 
     public:
-    __device__ QManagerV2()
+    __device__ QManager8bitsV2()
     {
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
         m_src_lane_0            = (lane_idx % 16) * 4 + (lane_idx / 32);
         m_src_lane_1            = m_src_lane_0 + 2;
         m_src_lane_0 *= 4; // the address passed in ds_bpermute_b32 is tid * 4
@@ -143,11 +143,11 @@ class QManagerV2
         // Since dtype should be fp8, a buffer_load_dwordx4 is used to load all 1x16 elements.
         constexpr uint32_t kNumRowsPerWarp = 16;
         constexpr uint32_t kNumColsPerWarp = 64;
-        constexpr uint32_t kNumElemPerWarp = kNumRowsPerWarp * kNumColsPerWarp;      // 16*64=1024
-        constexpr uint32_t kNumElemPerLane = kNumElemPerWarp / ckt::get_warp_size(); // 1024/64=16
-        constexpr uint32_t kNumLanesPerRow = kNumColsPerWarp / kNumElemPerLane;      // 64/16=4
+        constexpr uint32_t kNumElemPerWarp = kNumRowsPerWarp * kNumColsPerWarp;       // 16*64=1024
+        constexpr uint32_t kNumElemPerLane = kNumElemPerWarp / opus::get_warp_size(); // 1024/64=16
+        constexpr uint32_t kNumLanesPerRow = kNumColsPerWarp / kNumElemPerLane;       // 64/16=4
 
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         uint64_t as_u64 =
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&q_buffer[{q_start, 0, 0, 0}]));
@@ -162,43 +162,39 @@ class QManagerV2
         v4ui data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 1 * kNumColsPerWarp);
         asm volatile("s_waitcnt vmcnt(1)");
         v4ui data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 2 * kNumColsPerWarp);
-        __builtin_amdgcn_s_setprio(7);
+        __builtin_amdgcn_s_setprio(3);
         shuffle_data<GPR_NOPE_START + 0>(data_0);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(6);
         data_0 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 3 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 4>(data_1);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(5);
+        __builtin_amdgcn_s_setprio(2);
         data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 4 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 8>(data_2);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(4);
         data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 5 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 12>(data_0);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(3);
+        __builtin_amdgcn_s_setprio(1);
         data_0 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 6 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 16>(data_1);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(2);
         data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 7 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 20>(data_2);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(1);
+        __builtin_amdgcn_s_setprio(0);
         data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 8 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 24>(data_0);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(0);
         shuffle_data<GPR_NOPE_START + 28>(data_1);
         asm volatile("s_waitcnt vmcnt(0)");
         shuffle_data<GPR_ROPE_START>(data_2);
     }
 };
 
-// Lanes loads Q from VRAM by row so as to fullfill cache line. Then, lanes exchange data via LDS.
+// Lanes load Q from VRAM by row so as to fulfill cache line. Then, lanes exchange data via LDS.
 template <typename T>
-class QManagerV3
+class QManager8bitsV3
 {
     private:
     using q_t = typename T::q_t;
@@ -215,14 +211,14 @@ class QManagerV3
     static constexpr uint32_t kMfmaRows = 16;
     static constexpr uint32_t kMfmaCols = 32;
     static constexpr uint32_t kMfmaElemPerLane =
-        kMfmaRows * kMfmaCols / ckt::get_warp_size(); // 16*32/64=8
+        kMfmaRows * kMfmaCols / opus::get_warp_size(); // 16*32/64=8
 
     template <uint32_t GPR_START>
     __device__ __forceinline__ void shuffle_data(const v4ui& data, const uintptr_t p_lds)
     {
-        constexpr uint32_t kNumLanePerRow = ckt::get_warp_size() / kNumElemPerCol; // 64/16=4
+        constexpr uint32_t kNumLanePerRow = opus::get_warp_size() / kNumElemPerCol; // 64/16=4
 
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         auto get_v_offset = [&](const uint32_t row, const uint32_t col) -> uint32_t {
             return (row / 2) * kNumBytesPer2Rows + ((row % 2) * kNumElemPerRow + col) * sizeof(q_t);
@@ -253,7 +249,7 @@ class QManagerV3
     }
 
     public:
-    __device__ QManagerV3() {}
+    __device__ QManager8bitsV3() {}
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     {
@@ -270,11 +266,11 @@ class QManagerV3
         // Since dtype should be fp8, a buffer_load_dwordx4 is used to load all 1x16 elements.
         constexpr uint32_t kNumRowsPerWarp = 16;
         constexpr uint32_t kNumColsPerWarp = 64;
-        constexpr uint32_t kNumElemPerWarp = kNumRowsPerWarp * kNumColsPerWarp;      // 16*64=1024
-        constexpr uint32_t kNumElemPerLane = kNumElemPerWarp / ckt::get_warp_size(); // 1024/64=16
-        constexpr uint32_t kNumLanesPerRow = kNumColsPerWarp / kNumElemPerLane;      // 64/16=4
+        constexpr uint32_t kNumElemPerWarp = kNumRowsPerWarp * kNumColsPerWarp;       // 16*64=1024
+        constexpr uint32_t kNumElemPerLane = kNumElemPerWarp / opus::get_warp_size(); // 1024/64=16
+        constexpr uint32_t kNumLanesPerRow = kNumColsPerWarp / kNumElemPerLane;       // 64/16=4
 
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         const uintptr_t p_lds_warp = p_lds + warp_idx * get_lds_size_per_warp_in_byte();
 
@@ -291,34 +287,30 @@ class QManagerV3
         v4ui data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 1 * kNumColsPerWarp);
         asm volatile("s_waitcnt vmcnt(1)");
         v4ui data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 2 * kNumColsPerWarp);
-        __builtin_amdgcn_s_setprio(7);
+        __builtin_amdgcn_s_setprio(3);
         shuffle_data<GPR_NOPE_START + 0>(data_0, p_lds_warp);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(6);
         data_0 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 3 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 4>(data_1, p_lds_warp);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(5);
+        __builtin_amdgcn_s_setprio(2);
         data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 4 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 8>(data_2, p_lds_warp);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(4);
         data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 5 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 12>(data_0, p_lds_warp);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(3);
+        __builtin_amdgcn_s_setprio(1);
         data_0 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 6 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 16>(data_1, p_lds_warp);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(2);
         data_1 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 7 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 20>(data_2, p_lds_warp);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(1);
+        __builtin_amdgcn_s_setprio(0);
         data_2 = hkm::buffer_load_dwordx4(br, v_offset, s_offset, 8 * kNumColsPerWarp);
         shuffle_data<GPR_NOPE_START + 24>(data_0, p_lds_warp);
         asm volatile("s_waitcnt vmcnt(1)");
-        __builtin_amdgcn_s_setprio(0);
         shuffle_data<GPR_NOPE_START + 28>(data_1, p_lds_warp);
         asm volatile("s_waitcnt vmcnt(0)");
         shuffle_data<GPR_ROPE_START>(data_2, p_lds_warp);
@@ -327,13 +319,13 @@ class QManagerV3
 
 // Compared with V3, V4 uses LDS async load.
 template <typename T>
-class QManagerV4
+class QManager8bitsV4
 {
     protected:
     using q_t = typename T::q_t;
 
     // Stores 16x64 elements per warp in LDS.
-    // Pad 2DW per 2 rows.
+    // Pad 4DW per 4 rows.
     static constexpr uint32_t kNumElemPerRow           = 64;
     static constexpr uint32_t kNumElemPerCol           = 16;
     static constexpr uint32_t kNumPaddingBytesPer4Rows = 4 * sizeof(uint32_t); // 4*4=16
@@ -344,7 +336,7 @@ class QManagerV4
     static constexpr uint32_t kMfmaRows = 16;
     static constexpr uint32_t kMfmaCols = 32;
     static constexpr uint32_t kMfmaElemPerLane =
-        kMfmaRows * kMfmaCols / ckt::get_warp_size(); // 16*32/64=8
+        kMfmaRows * kMfmaCols / opus::get_warp_size(); // 16*32/64=8
 
     // The input ptrs are expected to be the start address of the warp.
     // After loading, the data layout in LDS is:
@@ -372,7 +364,7 @@ class QManagerV4
     {
         constexpr uint32_t kOffsetInBytes = kColOffset * sizeof(q_t);
 
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         const uint32_t row_tmp = lane_idx / 16;
         const uint32_t row     = (row_tmp / 2) * (kNumElemPerCol / 2) + (row_tmp % 2) * 1;
@@ -385,7 +377,7 @@ class QManagerV4
 
         uint32_t voffset = (row * T::kQkHeadDim + col) * sizeof(q_t);
         hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                            (as3_uint32_ptr)(p_lds - kOffsetInBytes),
+                                            (hk::as3_uint32_ptr)(p_lds - kOffsetInBytes),
                                             4,
                                             voffset,
                                             0,
@@ -393,7 +385,7 @@ class QManagerV4
                                             0);
         voffset += voffset_inc;
         hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                            (as3_uint32_ptr)(p_lds - kOffsetInBytes),
+                                            (hk::as3_uint32_ptr)(p_lds - kOffsetInBytes),
                                             4,
                                             voffset,
                                             0,
@@ -401,7 +393,7 @@ class QManagerV4
                                             0);
         voffset += voffset_inc;
         hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                            (as3_uint32_ptr)(p_lds - kOffsetInBytes),
+                                            (hk::as3_uint32_ptr)(p_lds - kOffsetInBytes),
                                             4,
                                             voffset,
                                             0,
@@ -409,7 +401,7 @@ class QManagerV4
                                             0);
         voffset += voffset_inc;
         hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                            (as3_uint32_ptr)(p_lds - kOffsetInBytes),
+                                            (hk::as3_uint32_ptr)(p_lds - kOffsetInBytes),
                                             4,
                                             voffset,
                                             0,
@@ -420,7 +412,7 @@ class QManagerV4
     template <uint32_t GPR_START>
     __device__ __forceinline__ void lds_2_gpr(const uintptr_t p_lds)
     {
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         const uint32_t row      = lane_idx % 16;
         const uint32_t row_phy  = (row / 8) * 2 + (row % 8) / 2 * 4 + (row % 2) * 1;
@@ -440,7 +432,7 @@ class QManagerV4
     }
 
     public:
-    __device__ QManagerV4() {}
+    __device__ QManager8bitsV4() {}
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     {
@@ -453,7 +445,7 @@ class QManagerV4
                                                   const int32_t q_start,
                                                   const uintptr_t p_lds)
     {
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         const uintptr_t p_lds_warp = p_lds + warp_idx * get_lds_size_per_block_in_byte();
         const q_t* p_q_buffer_warp =
@@ -499,18 +491,18 @@ class QManagerV4
 
 // Compared with V4, V5 uses 3 LDS buffers to load Q to reduce barrier & waitcnt time.
 template <typename T>
-class QManagerV5 : public QManagerV4<T>
+class QManager8bitsV5 : public QManager8bitsV4<T>
 {
     private:
     using q_t = typename T::q_t;
 
     public:
-    __device__ QManagerV5() : QManagerV4<T>() {}
+    __device__ QManager8bitsV5() : QManager8bitsV4<T>() {}
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     {
         // using 3 buffers
-        return 3 * T::kNumWarps * QManagerV4<T>::get_lds_size_per_block_in_byte();
+        return 3 * T::kNumWarps * QManager8bitsV4<T>::get_lds_size_per_block_in_byte();
     }
 
     template <uint32_t GPR_NOPE_START, uint32_t GPR_ROPE_START>
@@ -520,13 +512,13 @@ class QManagerV5 : public QManagerV4<T>
                                                   const uintptr_t p_lds)
     {
         const uintptr_t p_lds_warp_0 =
-            p_lds + 3 * warp_idx * QManagerV4<T>::get_lds_size_per_block_in_byte();
+            p_lds + 3 * warp_idx * QManager8bitsV4<T>::get_lds_size_per_block_in_byte();
         const uintptr_t p_lds_warp_1 =
-            p_lds_warp_0 + QManagerV4<T>::get_lds_size_per_block_in_byte();
+            p_lds_warp_0 + QManager8bitsV4<T>::get_lds_size_per_block_in_byte();
         const uintptr_t p_lds_warp_2 =
-            p_lds_warp_1 + QManagerV4<T>::get_lds_size_per_block_in_byte();
+            p_lds_warp_1 + QManager8bitsV4<T>::get_lds_size_per_block_in_byte();
         const q_t* p_q_buffer_warp = &q_buffer[{q_start, 0, 0, 0}] +
-                                     warp_idx * QManagerV4<T>::kNumElemPerCol * T::kQkHeadDim;
+                                     warp_idx * QManager8bitsV4<T>::kNumElemPerCol * T::kQkHeadDim;
 
         this->template vram_2_lds<0>(p_q_buffer_warp, p_lds_warp_0);
         this->template vram_2_lds<64>(p_q_buffer_warp, p_lds_warp_1);
@@ -558,7 +550,11 @@ class QManagerV5 : public QManagerV4<T>
     }
 };
 
-template <bool kCheckBoundary>
+// kv_tile_start / kv_tile_end are in TOKEN units. For kPageSize > 1 the
+// per-lane row index is split into (page_idx, intra_page_off), then the
+// physical page number from p_kv_indices is converted back to a flat row
+// in the [num_page * kPageSize, ...] view.
+template <bool kCheckBoundary, int32_t kPageSize>
 __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
                                                  const int32_t row_base,
                                                  const int32_t kv_tile_start,
@@ -576,15 +572,26 @@ __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
     {
         const __amdgpu_buffer_rsrc_t rsrc = __builtin_amdgcn_make_buffer_rsrc(
             const_cast<void*>(static_cast<const void*>(p_kv_indices)), 0, 0xffffffff, 0x00020000);
-        row_kv_ld =
-            __builtin_amdgcn_raw_buffer_load_b32(rsrc, row_kv_ld_idx * sizeof(int32_t), 0, 0);
+        if constexpr(kPageSize == 1)
+        {
+            row_kv_ld =
+                __builtin_amdgcn_raw_buffer_load_b32(rsrc, row_kv_ld_idx * sizeof(int32_t), 0, 0);
+        }
+        else
+        {
+            const uint32_t page_idx   = row_kv_ld_idx / kPageSize;
+            const uint32_t intra_page = row_kv_ld_idx % kPageSize;
+            const int32_t page_phys =
+                __builtin_amdgcn_raw_buffer_load_b32(rsrc, page_idx * sizeof(int32_t), 0, 0);
+            row_kv_ld = page_phys * kPageSize + intra_page;
+        }
     }
 
     return row_kv_ld;
 }
 
 template <typename T>
-class KvManagerV1
+class KvManager8bitsV1
 {
     private:
     using kv_t = typename T::kv_t;
@@ -601,12 +608,14 @@ class KvManagerV1
         kNumElemPerWarp * sizeof(kv_t) + kNumPaddingDw * sizeof(uint32_t); // 256*1+4*4=272
     static constexpr uint32_t kNumRowThreads = 32; // #threads handle the same column.
     static constexpr uint32_t kNumColThreads =
-        ckt::get_warp_size() / kNumRowThreads; // #threads handle the same row. 64/32=2
+        opus::get_warp_size() / kNumRowThreads; // #threads handle the same row. 64/32=2
     static constexpr uint32_t kNumBytesPerThrPerRnd =
         4; // use buffer_load_dword which loads 4B each time.
 
     public:
-    // Calculate the size of LDS in bytes for a 32x64 block.
+    // LDS size in bytes for the whole 32 x kQkHeadDim KV block (one tile).
+    // Layout is sliced into kQkHeadDim/kNumColsPerWarp = 72 (576/8) per-warp 32x8 strips,
+    // each strip occupying kWarpOffset(=272) bytes including 2 DW padding.
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     {
         return kWarpOffset * (T::kQkHeadDim / kNumColsPerWarp);
@@ -614,13 +623,13 @@ class KvManagerV1
 
     __device__ __forceinline__ static uint32_t get_kv_ld_row_base_idx(const int32_t warp_idx)
     {
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
         return lane_idx / 2;
     }
 
     __device__ __forceinline__ static uint32_t get_kv_ld_col_base(const int32_t warp_idx)
     {
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
         return warp_idx * 8 + (lane_idx % 2) * 4;
     }
 
@@ -648,7 +657,10 @@ class KvManagerV1
     // @param col_base: the base column index which should be:
     //        warp_idx * kNumColsPerWarp(8) + lane_idx % kNumColThreads(2) *
     //        kNumBytesPerThrPerRnd(4)
-    template <uint32_t kColOffset, bool kIsLastIter, bool kCheckBoundary = true>
+    template <uint32_t kRowOffset,
+              uint32_t kColOffset,
+              bool kIsLastIter,
+              bool kCheckBoundary = true>
     __device__ __forceinline__ static void async_load_k_tile(const uintptr_t p_lds_kv_warp_base,
                                                              const uint32_t warp_idx,
                                                              const typename T::gl_kv& kv_buffer,
@@ -659,8 +671,10 @@ class KvManagerV1
         {
             static_assert(((kColOffset % 64) == 0) && (kColOffset < 576),
                           "async_load_k(): Unsupported column offset!");
+            static_assert(kRowOffset == 0,
+                          "KvManager8bitsV1::async_load_k_tile(): kRowOffset must be 0");
 
-            const uint32_t lane_idx = ckt::get_lane_id();
+            const uint32_t lane_idx = opus::lane_id();
 
             const uintptr_t p_lds_kv_warp =
                 p_lds_kv_warp_base + kColOffset / kNumColsPerWarp * kWarpOffset - kColOffset;
@@ -679,7 +693,7 @@ class KvManagerV1
                 const uint32_t voffset = row * T::kQkHeadDim * sizeof(kv_t) + col_base;
 
                 hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                                    (as3_uint32_ptr)(p_lds_kv_warp),
+                                                    (hk::as3_uint32_ptr)(p_lds_kv_warp),
                                                     kNumBytesPerThrPerRnd,
                                                     voffset,
                                                     0,
@@ -689,7 +703,7 @@ class KvManagerV1
         }
     }
 
-    template <bool kIsLastIter, bool kCheckBoundary>
+    template <uint32_t kRowOffset, bool kIsLastIter, bool kCheckBoundary>
     __device__ __forceinline__ static void async_load_k(const uintptr_t p_lds_kv,
                                                         const uint32_t warp_idx,
                                                         const typename T::gl_kv& kv_buffer,
@@ -700,23 +714,23 @@ class KvManagerV1
         {
             const uintptr_t p_lds_kv_warp = get_p_lds_kv_warp_base(warp_idx, p_lds_kv);
 
-            async_load_k_tile<0, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 0, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<64, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 64, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<128, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 128, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<192, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 192, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<256, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 256, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<320, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 320, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<384, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 384, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<448, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 448, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<512, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 512, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
         }
     }
@@ -728,14 +742,14 @@ class KvManagerV1
         constexpr uint32_t kMfmaRows = 16; // 16 refers to mfma_f32_16x16x32_fp8_fp8.
         constexpr uint32_t kMfmaCols = 32; // 32 refers to mfma_f32_16x16x32_fp8_fp8.
         constexpr uint32_t kMfmaElemPerThr =
-            kMfmaRows * kMfmaCols / ckt::get_warp_size(); // 16*32/64=8
+            kMfmaRows * kMfmaCols / opus::get_warp_size(); // 16*32/64=8
 
         static_assert(((kRowOffset % 16) == 0) && (kRowOffset < 32),
                       "load_k_to_gpr(): Unsupported row offset!");
         static_assert(((kColOffset % 32) == 0) && (kColOffset < 576),
                       "load_k_to_gpr(): Unsupported column offset!");
 
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         // // equivalent with kFixedOffset=0
         // const uint32_t row = kRowOffset + lane_idx % kMfmaRows;
@@ -752,7 +766,9 @@ class KvManagerV1
         constexpr uint32_t kFixedOffset = kRowOffset * kMfmaElemPerThr * sizeof(kv_t) +
                                           kColOffset / kNumColsPerWarp * kWarpOffset;
 
-        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, kRowOffset / 16>;
+        // RT must hold exactly one 2-vgpr range (one mfma A-tile). Caller passes the
+        // appropriate sub-view per kRowOffset; the function always writes to range 0.
+        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, 0>;
         static_assert(range_type::lo + 1 == range_type::hi,
                       "ds_read_b64 requires 2 consecutive registers");
         hkm::ds_read_b64<range_type::lo>(p_lds_kv_lane, kFixedOffset);
@@ -762,7 +778,7 @@ class KvManagerV1
     __device__ __forceinline__ static void
     load_v_to_gpr(v8ui* p_result, const uint32_t warp_idx, const uintptr_t p_lds_v)
     {
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         // Each warp takes 16x128 elements. Each thread takes 4x8 elements block-wise column-major
         // layout.
@@ -782,7 +798,7 @@ class KvManagerV1
 };
 
 template <typename T>
-class KvManagerV2
+class KvManager8bitsV2
 {
     private:
     using kv_t = typename T::kv_t;
@@ -826,9 +842,9 @@ class KvManagerV2
         constexpr uint32_t kNumRowsPerRowGroup = kNumRowsPerWarp / kNumRowGroupPerWarp; // 4 / 2 = 2
         constexpr uint32_t kRowGroupStride     = kNumRows / kNumRowGroupPerWarp; // 32 / 2 = 16
         constexpr uint32_t kNumThreadsPerRowGroup =
-            ckt::get_warp_size() / kNumRowGroupPerWarp; // 64 / 2 = 32
+            opus::get_warp_size() / kNumRowGroupPerWarp; // 64 / 2 = 32
 
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
         // (lane_idx / 32) * 16 + (lane_idx / 16) % 2 + warp_idx * 2
         return (lane_idx / kNumThreadsPerRowGroup) * kRowGroupStride +
                (lane_idx / kRowGroupStride) % kNumRowsPerRowGroup + warp_idx * kNumRowsPerRowGroup;
@@ -836,7 +852,7 @@ class KvManagerV2
 
     __device__ __forceinline__ static uint32_t get_kv_ld_col_base(const int32_t warp_idx)
     {
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
         return (lane_idx % 16) * 4;
     }
 
@@ -865,7 +881,10 @@ class KvManagerV2
     // (30, 000 - 063) [W7L32 - W7L47] BANK 14-29
     // (31, 000 - 063) [W7L48 - W7L63] BANK 30-13
     // 2DW padding
-    template <uint32_t kColOffset, bool kIsLastIter, bool kCheckBoundary = true>
+    template <uint32_t kRowOffset,
+              uint32_t kColOffset,
+              bool kIsLastIter,
+              bool kCheckBoundary = true>
     __device__ __forceinline__ static void async_load_k_tile(const uintptr_t p_lds_kv_warp_base,
                                                              const uint32_t warp_idx,
                                                              const typename T::gl_kv& kv_buffer,
@@ -876,10 +895,12 @@ class KvManagerV2
         {
             static_assert(((kColOffset % 64) == 0) && (kColOffset < 576),
                           "async_load_k(): Unsupported column offset!");
+            static_assert(kRowOffset == 0,
+                          "KvManager8bitsV2::async_load_k_tile(): kRowOffset must be 0");
 
             constexpr uint32_t kBlockIdx = kColOffset / 64;
 
-            const uint32_t lane_idx = ckt::get_lane_id();
+            const uint32_t lane_idx = opus::lane_id();
 
             const uintptr_t p_lds_kv_warp =
                 p_lds_kv_warp_base + kBlockIdx * kNumBytesPerBlock - kColOffset;
@@ -898,7 +919,7 @@ class KvManagerV2
                 const uint32_t voffset = row * T::kQkHeadDim * sizeof(kv_t) + col_base;
 
                 hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                                    (as3_uint32_ptr)(p_lds_kv_warp),
+                                                    (hk::as3_uint32_ptr)(p_lds_kv_warp),
                                                     kNumBytesPerThrPerRnd,
                                                     voffset,
                                                     0,
@@ -908,7 +929,7 @@ class KvManagerV2
         }
     }
 
-    template <bool kIsLastIter, bool kCheckBoundary>
+    template <uint32_t kRowOffset, bool kIsLastIter, bool kCheckBoundary>
     __device__ __forceinline__ static void async_load_k(const uintptr_t p_lds_kv,
                                                         const uint32_t warp_idx,
                                                         const typename T::gl_kv& kv_buffer,
@@ -919,23 +940,23 @@ class KvManagerV2
         {
             const uintptr_t p_lds_kv_warp = get_p_lds_kv_warp_base(warp_idx, p_lds_kv);
 
-            async_load_k_tile<0, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 0, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<64, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 64, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<128, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 128, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<192, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 192, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<256, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 256, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<320, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 320, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<384, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 384, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<448, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 448, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
-            async_load_k_tile<512, false, kCheckBoundary>(
+            async_load_k_tile<kRowOffset, 512, false, kCheckBoundary>(
                 p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
         }
     }
@@ -947,37 +968,41 @@ class KvManagerV2
         constexpr uint32_t kMfmaRows = 16; // 16 refers to mfma_f32_16x16x32_fp8_fp8.
         constexpr uint32_t kMfmaCols = 32; // 32 refers to mfma_f32_16x16x32_fp8_fp8.
         constexpr uint32_t kMfmaElemPerThr =
-            kMfmaRows * kMfmaCols / ckt::get_warp_size(); // 16*32/64=8
+            kMfmaRows * kMfmaCols / opus::get_warp_size(); // 16*32/64=8
 
         static_assert(((kRowOffset % 16) == 0) && (kRowOffset < 32),
                       "load_k_to_gpr(): Unsupported row offset!");
         static_assert(((kColOffset % 32) == 0) && (kColOffset < 576),
                       "load_k_to_gpr(): Unsupported column offset!");
 
-        // const uint32_t lane_idx = ckt::get_lane_id();
-        // const uint32_t row = kRowOffset + lane_idx % kMfmaRows;
-        // const uint32_t row_phy = ((row % 16) / 2) * 4 + 2 * (row / 16) + (row % 2);
-        // const uint32_t col = kColOffset + lane_idx / kMfmaRows * kMfmaElemPerThr;
-        // const uintptr_t p_lds_kv_lane =
-        //     p_lds_kv +
-        //     (row_phy / 4) * kNumBytesPerSubBlock +
-        //     row_phy * kNumBytesPerRow +
-        //     col / kNumCols * kNumBytesPerBlock +
-        //     (col % kNumCols) * sizeof(kv_t);
-        // constexpr uint32_t kFixedOffset = 0;
-
-        const uint32_t lane_idx       = ckt::get_lane_id();
-        const uint32_t row            = lane_idx % kMfmaRows;      // row < 16
-        const uint32_t row_phy        = (row / 2) * 4 + (row % 2); // row_phy < 32
-        const uint32_t col            = lane_idx / kMfmaRows * kMfmaElemPerThr;
-        const uintptr_t p_lds_kv_lane = p_lds_kv + (row_phy / 4) * kNumBytesPerSubBlock +
-                                        (row_phy % 4) * kNumBytesPerRow +
-                                        (col % kNumCols) * sizeof(kv_t);
+        // Canonical address (matches load_v_to_gpr() / store layout):
+        //   row     = kRowOffset + lane_idx % kMfmaRows;             // ? [kRowOffset,
+        //   kRowOffset+16) row_phy = ((row % 16) / 2) * 4 + 2 * (row / 16) + (row % 2); col     =
+        //   kColOffset + (lane_idx / kMfmaRows) * kMfmaElemPerThr; p_lds_kv_lane = p_lds_kv +
+        //       (row_phy / 4)         * kNumBytesPerSubBlock +
+        //       (row_phy % 4)         * kNumBytesPerRow +
+        //        col / kNumCols       * kNumBytesPerBlock +
+        //       (col % kNumCols)      * sizeof(kv_t);
+        //
+        // Per-lane simplifications (lane row ? [0,16), lane col ? {0,8,16,24}):
+        //   row/16 == 0          => row_phy = (row/2)*4 + (row%2)
+        //                        => row_phy/4 == row/2, row_phy%4 == row%2
+        //   col < 32 < kNumCols  => col/kNumCols == 0, col%kNumCols == col
+        // kRowOffset/kColOffset terms are constexpr-folded into kFixedOffset.
+        // kRowOffset==16 shifts row_phy by +2 (always lands in row_phy%4),
+        // contributing +(kRowOffset/16) * 2 * kNumBytesPerRow.
+        const uint32_t lane_idx       = opus::lane_id();
+        const uint32_t row            = lane_idx % kMfmaRows;
+        const uint32_t col            = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
+        const uintptr_t p_lds_kv_lane = p_lds_kv + (row / 2) * kNumBytesPerSubBlock +
+                                        (row % 2) * kNumBytesPerRow + col * sizeof(kv_t);
         constexpr uint32_t kFixedOffset = (kRowOffset / 16) * 2 * kNumBytesPerRow +
-                                          (kColOffset % kNumCols) * sizeof(kv_t) +
-                                          (kColOffset / kNumCols) * kNumBytesPerBlock;
+                                          (kColOffset / kNumCols) * kNumBytesPerBlock +
+                                          (kColOffset % kNumCols) * sizeof(kv_t);
 
-        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, kRowOffset / 16>;
+        // RT must hold exactly one 2-vgpr range (one mfma A-tile). Caller passes the
+        // appropriate sub-view per kRowOffset; the function always writes to range 0.
+        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, 0>;
         static_assert(range_type::lo + 1 == range_type::hi,
                       "ds_read_b64 requires 2 consecutive registers");
         hkm::ds_read_b64<range_type::lo>(p_lds_kv_lane, kFixedOffset);
@@ -987,7 +1012,7 @@ class KvManagerV2
     __device__ __forceinline__ static void
     load_v_to_gpr(v8ui* p_result, const uint32_t warp_idx, const uintptr_t p_lds_v)
     {
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         // Each warp takes 16x128 elements. Each thread takes 4x8 elements block-wise column-major
         // layout.
@@ -1010,7 +1035,416 @@ class KvManagerV2
 };
 
 template <typename T>
-class VtManagerV1
+class KvManager8bitsV3
+{
+    private:
+    using kv_t = typename T::kv_t;
+
+    /// TODO: These parameters should reside in Traits.
+    // In the view of thread block on loading
+    static constexpr uint32_t kNumRows         = T::kBlockN;
+    static constexpr uint32_t kNumCols         = 64;
+    static constexpr uint32_t kNumSubBlockRows = 4;
+    static constexpr uint32_t kNumSubBlockCols = 32;
+    static constexpr uint32_t kNumBlocks       = T::kQkHeadDim / kNumCols; // 576/64=9
+    static constexpr uint32_t kNumPaddingDw    = 2;
+    static constexpr uint32_t kNumBytesPerSubBlock =
+        kNumSubBlockRows * kNumSubBlockCols * sizeof(kv_t); // 4*32*1=128
+    static constexpr uint32_t kNumBytesPer2SubBlocksWithPadding =
+        kNumBytesPerSubBlock * 2 + kNumPaddingDw * sizeof(uint32_t); // 128*2+2*4=264
+    // LDS layout: kBlockN x 64 block split into kBlockN/4 sub-block slots; INDEPENDENT of
+    // kNumWarps.
+    static constexpr uint32_t kNum2SubBlocks = kNumRows / 4; // kBlockN=32 -> 8; kBlockN=64 -> 16
+    static_assert(kNum2SubBlocks % T::kNumWarps == 0,
+                  "kNum2SubBlocks must be a multiple of kNumWarps");
+    static constexpr uint32_t kNumPassesPerWarp = kNum2SubBlocks / T::kNumWarps; // 1 or 2
+    static constexpr uint32_t kNumBytesPerBlock =
+        kNumBytesPer2SubBlocksWithPadding * kNum2SubBlocks;           // 264 * kNum2SubBlocks
+    static constexpr uint32_t kNumRowsPerWarp = kNumSubBlockRows * 2; // 8
+    static constexpr uint32_t kNumWarpsPerCol = 32 / kNumRowsPerWarp; // 4 (rows per pass / 8)
+    // Slot stride between consecutive row-passes within a col-block. Equals
+    // kNumWarpsPerCol * kNumColStripsPerBlock = 4 * 2 = 8 slots, i.e. one full row-pass
+    // covers all warp-rows x all col-strips before the next row-pass begins. Constant
+    // across kNumWarps so row-strip and col-strip slot offsets stay independent (col-strip
+    // stride is 4 slots; row-strip stride must differ to avoid collision when both are used,
+    // as in m16x4 kBlockN=64).
+    static constexpr uint32_t kRowPassSlotStride = kNumWarpsPerCol * 2; // 8
+    static constexpr uint32_t kNumBytesPerThrPerRnd =
+        4; // use buffer_load_dword which loads 4B each time.
+    static constexpr uint32_t kNumThrPerSubBlockRow =
+        kNumSubBlockCols / kNumBytesPerThrPerRnd; // 32 / 4 = 8
+
+    static_assert(T::kQkHeadDim % kNumCols == 0, "kQkHeadDim must be divisible by kNumCols!");
+
+    // Per-lane LDS byte offset within a 32-row x 32-col sub-tile of one warp's V/K block.
+    // Shared by load_k_to_gpr() and load_transposed_v_to_gpr(): both walk a 16x32 tile,
+    // and per-lane (row, col) lands in the same place -- only the rule that maps lane_idx
+    // to (row, col) differs (mfma A-tile layout vs ds_read_b64_tr_b8 input footprint).
+    //
+    // Preconditions (caller must guarantee):
+    //   row ? [0, 16)         -- local row inside the 16-row tile.
+    //   col ? {0, 8, 16, 24}  -- local col inside the 32-col sub-block.
+    // With those, the canonical formula
+    //   (row_phy/8)*264 + (row_phy%8)*32 + col/64*2112 + (col%64)/32*1056 + (col%64)%32
+    // collapses to the two terms below (see load_*_to_gpr() comments for the derivation).
+    __device__ __forceinline__ static uint32_t get_block_lane_offset(const uint32_t row,
+                                                                     const uint32_t col)
+    {
+        return (row / 4) * kNumBytesPer2SubBlocksWithPadding +
+               ((row % 4) * kNumSubBlockCols + col) * sizeof(kv_t);
+    }
+
+    // Constexpr ds_read immediate-offset that selects the (kRowOffset, kColOffset)
+    // sub-tile within the warp's V/K block.
+    //   kRowOffset ? {0, 16, 32, 48}                  -- top/bot 16-row sub-tile of each pass.
+    //                                                    (For kBlockN=32 only 0/16 valid.)
+    //   kColOffset is a multiple of 32, < kQkHeadDim -- picks the 32-col strip.
+    // Layout B (per 64-col block): pass 1 of all warps comes after pass 0 of all warps.
+    //   pass = kRowOffset / 32                            -> +pass * kRowPassSlotStride * 264
+    //   sub-block within pass = (kRowOffset % 32) / 16    -> +sub * 128
+    //   64-col block index = kColOffset / 64              -> +block * kNumBytesPerBlock
+    //   32-col strip within block = (kColOffset % 64) / 32 -> +strip * 4 * 264
+    // Row-strip stride uses constant 8 (not T::kNumWarps) so that row and col strips occupy
+    // independent slot bits: row -> slots {0,8}, col -> slots {0,4}. With kNumWarps=8 (m16x8)
+    // this matches the original kNumWarps stride; with kNumWarps=4 (m16x4) it avoids the
+    // collision where (row=32,col=0) and (row=0,col=32) would both land on slot+4.
+    // The block stride must use kNumBytesPerBlock (which depends on kBlockN via
+    // kNum2SubBlocks); collapsing it into (kColOffset/32)*4*264 only works when
+    // kNum2SubBlocks == 8 (i.e., kBlockN == 32).
+    template <uint32_t kRowOffset, uint32_t kColOffset>
+    static constexpr uint32_t get_block_fixed_offset()
+    {
+        return (kRowOffset / 32) * kRowPassSlotStride * kNumBytesPer2SubBlocksWithPadding +
+               ((kRowOffset % 32) / 16) * kNumBytesPerSubBlock +
+               (kColOffset / 64) * kNumBytesPerBlock +
+               ((kColOffset % 64) / 32) * 4 * kNumBytesPer2SubBlocksWithPadding;
+    }
+
+    public:
+    // There are 576 / 64 = 9 blocks. Each block contains 32x64 elements.
+    // The number of sub-blocks is 8. Each sub-block contains 2 blocks of 4x32 elements.
+    __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
+    {
+        return kNumBytesPerBlock * kNumBlocks; // 2112*9=19008
+    }
+
+    // Each warp takes two 4x32 blocks (rows r..r+3 and r+16..r+19); each row is handled by 8
+    // contiguous threads. warps {0,4}/{1,5}/{2,6}/{3,7} differ only in column block; the row sets:
+    // warp[0, 4]: row[ 0- 3], row[16-19]
+    // warp[1, 5]: row[ 4- 7], row[20-23]
+    // warp[2, 6]: row[ 8-11], row[24-27]
+    // warp[3, 7]: row[12-15], row[28-31]
+    __device__ __forceinline__ static uint32_t get_kv_ld_row_base_idx(const int32_t warp_idx)
+    {
+        constexpr uint32_t kNumThrPerSubBlock =
+            kNumSubBlockRows * kNumSubBlockCols / kNumBytesPerThrPerRnd; // 4 * 32 / 4 = 32
+
+        const uint32_t lane_idx = opus::lane_id();
+        // (warp_idx % 4) * 4 + (lane_idx / 32) * 16 + (lane_idx % 32) / 8
+        return (warp_idx % kNumWarpsPerCol) * kNumSubBlockRows +
+               (lane_idx / kNumThrPerSubBlock) * kNumWarpsPerCol * kNumSubBlockRows +
+               (lane_idx % kNumThrPerSubBlock) / kNumThrPerSubBlockRow;
+    }
+
+    __device__ __forceinline__ static uint32_t get_kv_ld_col_base(const int32_t warp_idx)
+    {
+        const uint32_t lane_idx = opus::lane_id();
+        return (warp_idx / kNumWarpsPerCol) * kNumSubBlockCols +
+               (lane_idx % kNumThrPerSubBlockRow) * kNumBytesPerThrPerRnd;
+    }
+
+    // Layout B: pass 1 of all warps lives after pass 0 of all warps. Callers requesting a
+    // col-strip pass use `warp_idx + kNumWarps` (col offset = +4*264 in slot space); callers
+    // requesting a row-strip pass use the kRowOffset=32 template arg in get_block_fixed_offset
+    // and async_load_k_tile (row offset = +8*264 in slot space). m16x4 kBlockN=32 uses only
+    // col-strip; m16x8 kBlockN=64 uses only row-strip; m16x4 kBlockN=64 uses both, packed
+    // into the 16 available slots/col-block. Stride per warp slot = 264 bytes (one
+    // 2-sub-block-with-padding).
+    __device__ __forceinline__ static uintptr_t get_p_lds_kv_warp_base(const int32_t warp_idx,
+                                                                       const uintptr_t p_lds_kv)
+    {
+        return p_lds_kv + warp_idx * kNumBytesPer2SubBlocksWithPadding;
+    }
+
+    // Load 32x64 elements from VRAM to LDS
+    // Each warp loads two 4x32 elements. Padding 2DW between warps.
+    // After loading, the elements are in the following layout:
+    // (00, 000 - 031) [W0L00 - W0L07] BANK 00-07
+    // (01, 000 - 031) [W0L08 - W0L15] BANK 08-15
+    // (02, 000 - 031) [W0L16 - W0L23] BANK 16-23
+    // (03, 000 - 031) [W0L24 - W0L31] BANK 24-31
+    // (16, 000 - 031) [W0L32 - W0L39] BANK 00-07
+    // (17, 000 - 031) [W0L40 - W0L47] BANK 08-15
+    // (18, 000 - 031) [W0L48 - W0L55] BANK 16-23
+    // (19, 000 - 031) [W0L56 - W0L63] BANK 24-31
+    // 2DW padding
+    // (04, 000 - 031) [W1L00 - W1L07] BANK 02-09
+    // ...
+    // (23, 000 - 031) [W1L56 - W1L63] BANK 26-01
+    // 2DW padding
+    // (08, 000 - 031) [W2L00 - W2L07] BANK 04-11
+    // ...
+    // (27, 000 - 031) [W2L56 - W2L63] BANK 28-03
+    // 2DW padding
+    // (12, 000 - 031) [W3L00 - W3L07] BANK 06-13
+    // ...
+    // (31, 000 - 031) [W3L56 - W3L63] BANK 30-05
+    // 2DW padding
+    // (00, 032 - 063) [W4L00 - W4L07] BANK 08-15
+    // ...
+    // (31, 032 - 063) [W7L56 - W7L63] BANK 06-13
+    //
+    // Single-pass loader: each call issues exactly one buffer_load_dword and writes
+    // one 32x64 sub-tile into LDS. For kBlockN=64 (kNumPassesPerWarp=2) the caller
+    // invokes this twice with kRowOffset=0,32; the kRowOffset=p*32 sub-tile covers
+    // KV rows [kv_tile_start + p*32, kv_tile_start + (p+1)*32) and writes to LDS
+    // slot warp_idx + p*kNumWarps within the column-block (Layout B).
+    // `row` is the physical KV row already resolved by get_kv_ld_row (-1 means OOB).
+    template <uint32_t kRowOffset,
+              uint32_t kColOffset,
+              bool kIsLastIter,
+              bool kCheckBoundary = true>
+    __device__ __forceinline__ static void async_load_k_tile(const uintptr_t p_lds_kv_warp_base,
+                                                             const uint32_t warp_idx,
+                                                             const typename T::gl_kv& kv_buffer,
+                                                             const int32_t row,
+                                                             const int32_t col_base)
+    {
+        if constexpr(kIsLastIter == false)
+        {
+            static_assert(((kColOffset % 64) == 0) && (kColOffset < 576),
+                          "async_load_k(): Unsupported column offset!");
+            static_assert((kRowOffset == 0) || (kRowOffset == 32),
+                          "async_load_k_tile(): kRowOffset must be 0 or 32");
+            static_assert((kRowOffset / 32) < kNumPassesPerWarp,
+                          "async_load_k_tile(): kRowOffset out of range for kBlockN");
+
+            constexpr uint32_t kPass     = kRowOffset / 32;
+            constexpr uint32_t kBlockIdx = kColOffset / 64;
+
+            const uint32_t lane_idx = opus::lane_id();
+
+            const kv_t* p_kv_buffer = &kv_buffer[{0, 0, 0, 0}];
+            const hk::i32x4 srsrc   = hk::make_srsrc(p_kv_buffer, 0xffffffff);
+
+            const uintptr_t p_lds_kv_warp =
+                p_lds_kv_warp_base +
+                kPass * kRowPassSlotStride * kNumBytesPer2SubBlocksWithPadding +
+                kBlockIdx * kNumBytesPerBlock - kColOffset;
+
+            if(kCheckBoundary && (row == -1))
+            {
+                const uintptr_t p_lds_kv_lane =
+                    p_lds_kv_warp + kColOffset + lane_idx * kNumBytesPerThrPerRnd;
+                hkm::ds_write_b32(0u, p_lds_kv_lane, 0);
+            }
+            else
+            {
+                const uint32_t voffset = row * T::kQkHeadDim * sizeof(kv_t) + col_base;
+
+                hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                                    (hk::as3_uint32_ptr)(p_lds_kv_warp),
+                                                    kNumBytesPerThrPerRnd,
+                                                    voffset,
+                                                    0,
+                                                    kColOffset,
+                                                    0);
+            }
+        }
+    }
+
+    // Single-pass bulk loader: loads one 32x576 row-stripe (9 column blocks) into LDS.
+    // For kBlockN=32 the caller invokes this once with kRowOffset=0; for kBlockN=64
+    // the caller invokes it twice with kRowOffset=0 and kRowOffset=32, supplying the
+    // physical KV row for each pass.
+    template <uint32_t kRowOffset, bool kIsLastIter, bool kCheckBoundary>
+    __device__ __forceinline__ static void async_load_k(const uintptr_t p_lds_kv,
+                                                        const uint32_t warp_idx,
+                                                        const typename T::gl_kv& kv_buffer,
+                                                        const int32_t row_kv_ld,
+                                                        const int32_t kv_ld_col_base)
+    {
+        if constexpr(kIsLastIter == false)
+        {
+            const uintptr_t p_lds_kv_warp = get_p_lds_kv_warp_base(warp_idx, p_lds_kv);
+
+            async_load_k_tile<kRowOffset, 0, false, kCheckBoundary>(
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k_tile<kRowOffset, 64, false, kCheckBoundary>(
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k_tile<kRowOffset, 128, false, kCheckBoundary>(
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k_tile<kRowOffset, 192, false, kCheckBoundary>(
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k_tile<kRowOffset, 256, false, kCheckBoundary>(
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k_tile<kRowOffset, 320, false, kCheckBoundary>(
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k_tile<kRowOffset, 384, false, kCheckBoundary>(
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k_tile<kRowOffset, 448, false, kCheckBoundary>(
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+            async_load_k_tile<kRowOffset, 512, false, kCheckBoundary>(
+                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+        }
+    }
+
+    // Load 16x32 blocks from LDS to GPR. Each thread takes contiguous 8 elements.
+    template <uint32_t kRowOffset, uint32_t kColOffset, hkdart::all RT>
+    __device__ __forceinline__ static void load_k_to_gpr(RT& dst, const uintptr_t p_lds_kv)
+    {
+        constexpr uint32_t kMfmaRows = 16; // 16 refers to mfma_f32_16x16x32_fp8_fp8.
+        constexpr uint32_t kMfmaCols = 32; // 32 refers to mfma_f32_16x16x32_fp8_fp8.
+        constexpr uint32_t kMfmaElemPerThr =
+            kMfmaRows * kMfmaCols / opus::get_warp_size(); // 16*32/64=8
+
+        static_assert(((kRowOffset % 16) == 0) && (kRowOffset < T::kBlockN),
+                      "load_k_to_gpr(): Unsupported row offset!");
+        static_assert(((kColOffset % 32) == 0) && (kColOffset < 576),
+                      "load_k_to_gpr(): Unsupported column offset!");
+
+        // Per-lane (row, col): mfma_f32_16x16x32 A-tile layout.
+        //   row = lane_idx % 16    ? [0, 16)
+        //   col = (lane_idx / 16) * 8 ? {0, 8, 16, 24}
+        // See get_block_lane_offset() / get_block_fixed_offset() for the address math.
+        const uint32_t lane_idx         = opus::lane_id();
+        const uint32_t row              = lane_idx % kMfmaRows;
+        const uint32_t col              = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
+        const uintptr_t p_lds_kv_lane   = p_lds_kv + get_block_lane_offset(row, col);
+        constexpr uint32_t kFixedOffset = get_block_fixed_offset<kRowOffset, kColOffset>();
+
+        // RT must hold exactly one 2-vgpr range (one mfma A-tile = 16x32 = 2 vgprs).
+        // Caller passes the appropriate sub-view per kRowOffset; the function always
+        // writes to range 0. This decouples the destination VGPR from the LDS source
+        // address (selected by kFixedOffset via kRowOffset, including pass bits for
+        // the upper N-half on kBlockN=64).
+        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, 0>;
+        static_assert(range_type::lo + 1 == range_type::hi,
+                      "ds_read_b64 requires 2 consecutive registers");
+        hkm::ds_read_b64<range_type::lo>(p_lds_kv_lane, kFixedOffset);
+    }
+
+    // Load un-transposed vector from LDS to GPR.
+    // Each warp takes (kNumRows/2) x 128 elements: per-thread 4x8 block-wise column-major layout.
+    // For kBlockN=64 (kNumSubTiles=2), writes 2 consecutive v8ui (sub-tile 0: rows R..R+3,
+    // sub-tile 1: rows R+32..R+35). Caller must allocate p_result[kNumSubTiles].
+    __device__ __forceinline__ static void
+    load_v_to_gpr(v8ui* p_result, const uint32_t warp_idx, const uintptr_t p_lds_v)
+    {
+        const uint32_t lane_idx         = opus::lane_id();
+        constexpr uint32_t kNumSubTiles = kNumRows / 32;
+        const uint32_t col              = (lane_idx % 16) * 8 + warp_idx / 2 * 128;
+
+#pragma unroll
+        for(uint32_t sub = 0; sub < kNumSubTiles; ++sub)
+        {
+            const uint32_t row = (warp_idx % 2) * 16 + lane_idx / 16 * 4 + sub * 32;
+            // Layout-B row_phy: linear LDS slot ID = pass * kNumWarps + warp_for_row,
+            // then 8 row_phy units per slot (sub_block * 4 + sub_row).
+            //   warp_for_row = (row % 16) / 4
+            //   pass         = row / 32
+            //   sub_block    = (row % 32) / 16
+            //   sub_row      = row % 4
+            const uint32_t row_phy = ((row / 32) * kRowPassSlotStride + (row % 16) / 4) * 8 +
+                                     ((row % 32) / 16) * 4 + (row % 4);
+            const uintptr_t p_lds_v_lane =
+                p_lds_v + (row_phy / 8) * kNumBytesPer2SubBlocksWithPadding +
+                (row_phy % 8) * kNumSubBlockCols * sizeof(kv_t) +
+                col / kNumCols * kNumBytesPerBlock +
+                (col % kNumCols) / 32 * (4 * kNumBytesPer2SubBlocksWithPadding) +
+                ((col % kNumCols) % 32) * sizeof(kv_t);
+
+            const v2ui pass_0 = hkm::ds_read_b64(p_lds_v_lane, 0);
+            const v2ui pass_1 = hkm::ds_read_b64(p_lds_v_lane, 32);
+            const v2ui pass_2 = hkm::ds_read_b64(p_lds_v_lane, 64);
+            const v2ui pass_3 = hkm::ds_read_b64(p_lds_v_lane, 96);
+
+            p_result[sub] = {
+                pass_0.x, pass_0.y, pass_1.x, pass_1.y, pass_2.x, pass_2.y, pass_3.x, pass_3.y};
+        }
+    }
+
+    // Load a 16x32 (rows x cols) tile of V from LDS into 2 consecutive GPRs per lane,
+    // transposed for use as the B operand of mfma_f32_16x16x32_fp8_fp8.
+    //
+    // The 64-lane wave is split into 4 lane groups of 16 lanes. Each group handles a
+    // 4x32 sub-tile (rows r..r+3, cols 0..31 in tile-local coords). Within a group,
+    // `ds_read_b64_tr_b8` requires this input footprint (each lane reads 8 fp8 bytes):
+    //   * L00: [0, 00~07], L01: [0, 08~15], L08: [0, 16~23], L09: [0, 24~31]
+    //   * L02: [1, 00~07], L03: [1, 08~15], L10: [1, 16~23], L11: [1, 24~31]
+    //   * L04: [2, 00~07], L05: [2, 08~15], L12: [2, 16~23], L13: [2, 24~31]
+    //   * L06: [3, 00~07], L07: [3, 08~15], L14: [3, 16~23], L15: [3, 24~31]
+    // After the hardware transpose, each lane holds 4 rows x 2 cols of V across the
+    // 2 destination GPRs (GPR -> cols c, c+16; GPR+1 -> see finalize_load_transposed_v_to_gpr):
+    //   L00: rows[0~3] of cols {00, 16}, L01: rows[0~3] of cols {01, 17}, ...,
+    //   L15: rows[0~3] of cols {15, 31}.
+    // The 4 lane groups together cover the full 16x32 tile (4 rows each).
+    //
+    // Template params:
+    //   kRowOffset : row offset of the tile within the 32-row LDS V block (0 or 16).
+    //   kColOffset : col offset of the tile within the 512-col head_dim (multiple of 32, < 512).
+    //   GPR        : index of the first of the 2 destination VGPRs.
+    // Runtime param:
+    //   p_lds_v    : LDS base address of the current V block (KvManager8bitsV3 layout).
+    template <uint32_t kRowOffset, uint32_t kColOffset, uint32_t GPR>
+    __device__ __forceinline__ void static load_transposed_v_to_gpr(const uintptr_t p_lds_v)
+    {
+#if defined(__gfx950__)
+        static_assert(((kRowOffset % 16) == 0) && (kRowOffset < T::kBlockN),
+                      "load_transpose_v_to_gpr(): Unsupported row offset!");
+        static_assert(((kColOffset % 32) == 0) && (kColOffset < 512),
+                      "load_transpose_v_to_gpr(): Unsupported column offset!");
+
+        // Per-lane (row, col): ds_read_b64_tr_b8 input footprint (see header above).
+        //   row = (lane_idx / 16) * 4 + ((lane_idx % 16) / 2) % 4    ? [0, 16)
+        //   col = ((lane_idx % 2) + ((lane_idx % 16) / 8) * 2) * 8   ? {0, 8, 16, 24}
+        // See get_block_lane_offset() / get_block_fixed_offset() for the address math.
+        const uint32_t lane_idx         = opus::lane_id();
+        const uint32_t lane_idx_in_grp  = lane_idx % 16;
+        const uint32_t row              = (lane_idx / 16) * 4 + (lane_idx_in_grp / 2) % 4;
+        const uint32_t col              = ((lane_idx % 2) + (lane_idx_in_grp / 8) * 2) * 8;
+        const uintptr_t p_lds_v_lane    = p_lds_v + get_block_lane_offset(row, col);
+        constexpr uint32_t kFixedOffset = get_block_fixed_offset<kRowOffset, kColOffset>();
+
+        hkm::ds_read_b64_tr_b8<GPR>(p_lds_v_lane, kFixedOffset);
+#else
+        static_assert(false,
+                      "KVManager8bitsV3::load_transposed_v_to_gpr() is not expected to be called.");
+#endif
+    }
+
+    // Repack the output of two adjacent load_transposed_v_to_gpr() calls into the layout
+    // that mfma_f32_16x16x32_fp8_fp8 expects for its B operand.
+    //
+    // After load_transposed_v_to_gpr(), each lane's 2 GPRs are laid out row-major across
+    // the local 2-row x 2-col mini-tile (in dword units):
+    //   GPR_0   = block[r,   c | r,   c+1]   // row r,   2 cols
+    //   GPR_0+1 = block[r+1, c | r+1, c+1]   // row r+1, 2 cols  (this is "GPR_1" of the same call)
+    // Calling finalize on the (GPR_0, GPR_1) pair from two adjacent loads rearranges them
+    // to column-major (each GPR pair holds one N column with its K rows contiguous):
+    //   GPR_0 = block[r, c   | r+1, c  ]   // col c,   2 rows
+    //   GPR_1 = block[r, c+1 | r+1, c+1]   // col c+1, 2 rows
+    // This is achieved by a single intra-lane `v_swap_b32` between GPR_0+1 and GPR_1
+    // (no cross-lane traffic).
+    //
+    // Template params:
+    //   GPR_0, GPR_1 : indices of the first VGPR of two 2-register pairs returned by
+    //                  load_transposed_v_to_gpr(). The pairs must not overlap.
+    template <uint32_t GPR_0, uint32_t GPR_1>
+    __device__ __forceinline__ void static finalize_load_transposed_v_to_gpr()
+    {
+#if defined(__gfx950__)
+        asm volatile("v_swap_b32 v[%0], v[%1]" : : "i"(GPR_0 + 1), "i"(GPR_1));
+#else
+        static_assert(
+            false,
+            "KVManager8bitsV3::finalize_load_transposed_v_to_gpr() is not expected to be called.");
+#endif
+    }
+};
+
+template <typename T>
+class VtManager8bitsV1
 {
     private:
     using kv_t = T::kv_t;
@@ -1070,7 +1504,7 @@ class VtManagerV1
                                                                      const uint32_t warp_idx,
                                                                      const v8ui& v_transposed)
     {
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         // 4x8 block-wise row major layout. No padding between rows or columns.
         const uint32_t row_blk = (warp_idx % 2) * 4 + lane_idx / 16;
@@ -1083,8 +1517,8 @@ class VtManagerV1
         hkm::ds_write_b128(v_transposed.hi, p_lds_vt_lane, sizeof(v4ui));
     }
 
-    // load 32x32 block for each warp. Each threads takes 4x4 elements.
-    template <uint32_t kColOffset, uint32_t GPR>
+    // load 32x16 block for each warp. Each thread takes 2x4 elements.
+    template <uint32_t kRowOffset, uint32_t kColOffset, uint32_t GPR>
     __device__ __forceinline__ void static load_transposed_v_to_gpr(const uintptr_t p_lds_vt)
     {
         constexpr uint32_t kNumDwPerBlock =
@@ -1095,10 +1529,11 @@ class VtManagerV1
         constexpr uint32_t kFixedColBlk      = kColOffset / kNumColsPerThr;
         constexpr uint32_t kFixedBlockOffset = kFixedColBlk * kNumElemsPerBlock * sizeof(kv_t);
 
+        static_assert(kRowOffset == 0, "load_transpose_v_to_gpr(): Unsupported row offset!");
         static_assert(((kColOffset % 16) == 0) && (kColOffset < 512),
                       "load_transpose_v_to_gpr(): Unsupported column offset!");
 
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         // calculate logical coordinate of top-left dw
         const uint32_t row_blk = lane_idx / 16; // 16: 16x16 mfma tile.
@@ -1161,11 +1596,11 @@ __device__ __forceinline__ uint32_t float_2_bf16_pair(uint32_t src_0, uint32_t s
 
 #if defined(__gfx950__)
     asm volatile("v_cvt_pk_bf16_f32 %0, v[%1], v[%2]" : "=v"(result) : "i"(src_0), "i"(src_1));
-#elif defined(__gfx94__)
-    static constexpr uint32_t FP32_NAN            = 0x7fff0000;
+#elif defined(__gfx942__)
+    static constexpr uint32_t FP32_NAN = 0x7fff0000;
     static constexpr uint32_t ROUND_BIAS_FOR_BF16 = 0x7fff;
-    static constexpr uint32_t MERGE_MASK          = 0xffff0000;
-    static constexpr uint32_t PERM                = 0x07060302;
+    static constexpr uint32_t MERGE_MASK = 0xffff0000;
+    static constexpr uint32_t PERM = 0x07060302;
 
     using uint32x2_t = uint32_t __attribute__((ext_vector_type(2)));
     uint32x2_t check_nan;
@@ -1213,14 +1648,14 @@ __device__ __forceinline__ uint32_t float_2_bf16_pair(uint32_t src_0, uint32_t s
     return result;
 }
 
-// Convert float32 data in pinned GPR to a 16 bits data and store in VRAM.
+// Convert float32 data in pinned GPR to 16-bit data and store to VRAM.
 template <typename T, typename out_t>
 class OManager16bitsV1
 {
     private:
     static_assert(sizeof(out_t) == 2, "Output type must be 16 bits");
 
-    // All comes from result of mfma_f32_16x16x32_fp8_fp8
+    // All come from the result of mfma_f32_16x16x32_fp8_fp8.
     static constexpr uint32_t kMfmaCols = 16;
 
     public:
@@ -1229,22 +1664,23 @@ class OManager16bitsV1
         return 0; // Not used
     }
 
-    // Convert 16x32 blocks of 8 float32 data and store them in VRAM.
-    // GPR_START: Starting GPR index for current 16x32 block
-    // kColOffset: Element-wise column offset in output buffer.
+    // Convert one 16x32 MFMA-result tile (8 float32 elements per lane) and store to VRAM.
+    // GPR_START: starting GPR index of the 16x32 tile.
+    // kColOffset: element-wise column offset in the output buffer.
     template <uint32_t GPR_START, uint32_t kColOffset>
     __device__ __forceinline__ void output_to_vram(const out_t* p_output,
                                                    const uint32_t warp_idx,
                                                    const uint32_t qo_start,
-                                                   const uintptr_t p_lds)
+                                                   const uintptr_t p_lds,
+                                                   const uint32_t num_qheads)
     {
         static_assert((kColOffset % 32) == 0, "kColOffset must be divisible by 32");
 
         constexpr uint32_t kOffsetInBytes0 = kColOffset * sizeof(out_t);
         constexpr uint32_t kOffsetInBytes1 = kOffsetInBytes0 + kMfmaCols * sizeof(out_t);
 
-        const uint32_t lane_idx     = ckt::get_lane_id();
-        const uint32_t row_idx      = lane_idx % 16 + warp_idx * 16 + qo_start * T::kQoNumHead;
+        const uint32_t lane_idx     = opus::lane_id();
+        const uint32_t row_idx      = lane_idx % 16 + warp_idx * 16 + qo_start * num_qheads;
         const uint32_t col_idx_base = (lane_idx / 16) * 4;
         const uint32_t offset       = (row_idx * T::kVoHeadDim + col_idx_base) * sizeof(out_t);
 
@@ -1281,8 +1717,8 @@ class OManager16bitsV1
     }
 };
 
-// Compare with OManager32bitsV1, this version changes the layout of data in GPR via LDS on storing
-// buffer to make sure that the data in adjacent lanes are stored in the same cache line.
+// Compared with OManager16bitsV1, this version changes the layout of data in GPR via LDS before
+// storing to VRAM so that adjacent lanes write into the same cache line.
 template <typename T, typename out_t>
 class OManager16bitsV2
 {
@@ -1297,11 +1733,11 @@ class OManager16bitsV2
         4 * sizeof(uint32_t) / sizeof(out_t); // use buffer_store_dwordx4
     static constexpr uint32_t kVramStLanePerRow = kNumCols / kVramStElemPerLane; // 32/8=4
 
-    // All comes from result of mfma_f32_16x16x32_fp8_fp8
+    // All come from the result of mfma_f32_16x16x32_fp8_fp8.
     static constexpr uint32_t kMfmaRows = 16;
     static constexpr uint32_t kMfmaCols = 16;
     static constexpr uint32_t kMfmaElemPerLane =
-        kMfmaRows * kMfmaCols / ckt::get_warp_size(); // 16*16/64=4
+        kMfmaRows * kMfmaCols / opus::get_warp_size(); // 16*16/64=4
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_per_warp_in_byte()
     {
@@ -1315,20 +1751,21 @@ class OManager16bitsV2
         return T::kNumWarps * get_lds_size_per_warp_in_byte(); // 8*1056=8448
     }
 
-    // Convert 16x32 blocks of 8 float32 data and store them in VRAM.
-    // GPR_START: Starting GPR index for current 16x32 block
-    // kColOffset: Element-wise column offset in output buffer.
+    // Convert one 16x32 MFMA-result tile (8 float32 elements per lane) and store to VRAM.
+    // GPR_START: starting GPR index of the 16x32 tile.
+    // kColOffset: element-wise column offset in the output buffer.
     template <uint32_t GPR_START, uint32_t kColOffset>
     __device__ __forceinline__ void output_to_vram(const out_t* p_output,
                                                    const uint32_t warp_idx,
                                                    const uint32_t qo_start,
-                                                   const uintptr_t p_lds)
+                                                   const uintptr_t p_lds,
+                                                   const uint32_t num_qheads)
     {
         static_assert((kColOffset % 32) == 0, "kColOffset must be divisible by 32");
 
         constexpr uint32_t kOffsetInBytes = kColOffset * sizeof(out_t);
 
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         const uintptr_t p_lds_warp = p_lds + warp_idx * get_lds_size_per_warp_in_byte();
 
@@ -1345,7 +1782,7 @@ class OManager16bitsV2
         const uint32_t col_lds_ld      = (lane_idx % kVramStLanePerRow) * kVramStElemPerLane;
         const uint32_t v_offset_lds_ld = get_v_offset_lds(row_lds_ld, col_lds_ld);
 
-        const uint32_t row_vram_st = row_lds_ld + qo_start * T::kQoNumHead + warp_idx * kNumRows;
+        const uint32_t row_vram_st = row_lds_ld + qo_start * num_qheads + warp_idx * kNumRows;
         const uint32_t col_vram_st = col_lds_ld;
         const uint32_t v_offset_vram_st =
             (row_vram_st * T::kVoHeadDim + col_vram_st) * sizeof(out_t);
@@ -1379,14 +1816,14 @@ class OManager16bitsV2
     }
 };
 
-// Convert float32 data in pinned GPR to a 32 bits data and store in VRAM.
+// Store float32 data from pinned GPR to VRAM (no conversion; out_t must be float).
 template <typename T, typename out_t>
 class OManager32bitsV1
 {
     private:
     static_assert(sizeof(out_t) == 4, "Output type must be 32 bits");
 
-    // All comes from result of mfma_f32_16x16x32_fp8_fp8
+    // All come from the result of mfma_f32_16x16x32_fp8_fp8.
     static constexpr uint32_t kMfmaCols = 16;
 
     public:
@@ -1395,22 +1832,23 @@ class OManager32bitsV1
         return 0; // Not used
     }
 
-    // Convert 16x32 blocks of 8 float32 data and store them in VRAM.
-    // GPR_START: Starting GPR index for current 16x32 block
-    // kColOffset: Element-wise column offset in output buffer.
+    // Convert one 16x32 MFMA-result tile (8 float32 elements per lane) and store to VRAM.
+    // GPR_START: starting GPR index of the 16x32 tile.
+    // kColOffset: element-wise column offset in the output buffer.
     template <uint32_t GPR_START, uint32_t kColOffset>
     __device__ __forceinline__ void output_to_vram(const out_t* p_output,
                                                    const uint32_t warp_idx,
                                                    const uint32_t qo_start,
-                                                   const uintptr_t p_lds)
+                                                   const uintptr_t p_lds,
+                                                   const uint32_t num_qheads)
     {
         static_assert((kColOffset % 32) == 0, "kColOffset must be divisible by 32");
 
         constexpr uint32_t kOffsetInBytes0 = kColOffset * sizeof(out_t);
         constexpr uint32_t kOffsetInBytes1 = kOffsetInBytes0 + kMfmaCols * sizeof(out_t);
 
-        const uint32_t lane_idx     = ckt::get_lane_id();
-        const uint32_t row_idx      = lane_idx % 16 + warp_idx * 16 + qo_start * T::kQoNumHead;
+        const uint32_t lane_idx     = opus::lane_id();
+        const uint32_t row_idx      = lane_idx % 16 + warp_idx * 16 + qo_start * num_qheads;
         const uint32_t col_idx_base = (lane_idx / 16) * 4;
         const uint32_t offset       = (row_idx * T::kVoHeadDim + col_idx_base) * sizeof(out_t);
 
@@ -1444,8 +1882,8 @@ class OManager32bitsV1
     }
 };
 
-// Compare with OManager32bitsV1, this version changes the layout of data in GPR via LDS on storing
-// buffer to make sure that the data in adjacent lanes are stored in the same cache line.
+// Compared with OManager32bitsV1, this version changes the layout of data in GPR via LDS before
+// storing to VRAM so that adjacent lanes write into the same cache line.
 template <typename T, typename out_t>
 class OManager32bitsV2
 {
@@ -1460,17 +1898,17 @@ class OManager32bitsV2
         4 * sizeof(uint32_t) / sizeof(out_t); // use buffer_store_dwordx4
     static constexpr uint32_t kVramStLanePerRow = kNumCols / kVramStElemPerLane; // 32/4=8
     static constexpr uint32_t kVramStRowsPerRnd =
-        ckt::get_warp_size() / kVramStLanePerRow; // 64/8=8
+        opus::get_warp_size() / kVramStLanePerRow; // 64/8=8
     static constexpr uint32_t kLdsLdOffsetDeltaInBytes =
         kVramStRowsPerRnd * kNumElemPerPaddedRow * sizeof(out_t); // 8*36*4=1152
     static constexpr uint32_t kVramStOffsetDeltaInBytes =
         kVramStRowsPerRnd * T::kVoHeadDim * sizeof(out_t); // 8*512*4=16384
 
-    // All comes from result of mfma_f32_16x16x32_fp8_fp8
+    // All come from the result of mfma_f32_16x16x32_fp8_fp8.
     static constexpr uint32_t kMfmaRows = 16;
     static constexpr uint32_t kMfmaCols = 16;
     static constexpr uint32_t kMfmaElemPerLane =
-        kMfmaRows * kMfmaCols / ckt::get_warp_size(); // 16*16/64=4
+        kMfmaRows * kMfmaCols / opus::get_warp_size(); // 16*16/64=4
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_per_warp_in_byte()
     {
@@ -1483,19 +1921,20 @@ class OManager32bitsV2
         return T::kNumWarps * get_lds_size_per_warp_in_byte(); // 8*2304=18432
     }
 
-    // Convert 16x32 blocks of 8 float32 data and store them in VRAM.
-    // GPR_START: Starting GPR index for current 16x32 block
-    // kColOffset: Element-wise column offset in output buffer.
+    // Convert one 16x32 MFMA-result tile (8 float32 elements per lane) and store to VRAM.
+    // GPR_START: starting GPR index of the 16x32 tile.
+    // kColOffset: element-wise column offset in the output buffer.
     template <uint32_t GPR_START, uint32_t kColOffset>
     __device__ __forceinline__ void output_to_vram(const out_t* p_output,
                                                    const uint32_t warp_idx,
                                                    const uint32_t qo_start,
-                                                   const uintptr_t p_lds)
+                                                   const uintptr_t p_lds,
+                                                   const uint32_t num_qheads)
     {
         static_assert((kColOffset % 32) == 0, "kColOffset must be divisible by 32");
         constexpr uint32_t kOffsetInBytes = kColOffset * sizeof(out_t);
 
-        const uint32_t lane_idx = ckt::get_lane_id();
+        const uint32_t lane_idx = opus::lane_id();
 
         const uintptr_t p_lds_warp = p_lds + warp_idx * get_lds_size_per_warp_in_byte();
 
@@ -1511,7 +1950,7 @@ class OManager32bitsV2
         const uint32_t col_lds_ld      = (lane_idx % kVramStLanePerRow) * kVramStElemPerLane;
         const uint32_t v_offset_lds_ld = get_v_offset_lds(row_lds_ld, col_lds_ld);
 
-        const uint32_t row_vram_st = row_lds_ld + qo_start * T::kQoNumHead + warp_idx * kNumRows;
+        const uint32_t row_vram_st = row_lds_ld + qo_start * num_qheads + warp_idx * kNumRows;
         const uint32_t col_vram_st = col_lds_ld;
         const uint32_t v_offset_vram_st =
             (row_vram_st * T::kVoHeadDim + col_vram_st) * sizeof(out_t);

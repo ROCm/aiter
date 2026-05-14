@@ -277,6 +277,9 @@ void mla_decode_stage1_asm_fwd(
         if (q_type == "bf16" && kv_type == "bf16" && arch_id == "gfx942"){
             ps = 0; // not use ps
         }
+        if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && max_seqlen_q > 1){
+            causal = 1;
+        }
     }
     else if(gqa_ratio == 16){
         sub_Q = 128;
@@ -363,10 +366,14 @@ void mla_decode_stage1_asm_fwd(
         }
     }
 
-    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio* max_seqlen_q % 128 == 0)){
+    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
-        args.s_Q_Bs = gqa_ratio;
+        args.s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio > 16)){
+        config_max_seqlen_q = 1;
+        config_gqa_ratio = 64;
+        args.s_MQA = gqa_ratio;
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag);
