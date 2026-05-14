@@ -1,0 +1,37 @@
+{
+    "default": {
+        "BLOCK_M": 16,
+        "BLOCK_C": 256,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 1
+    },
+    "C_512": {
+        "BLOCK_M": 8,
+        "BLOCK_C": 512,
+        "num_warps": 8,
+        "num_stages": 1,
+        "waves_per_eu": 0
+    },
+    "C_4096": {
+        "BLOCK_M": 16,
+        "BLOCK_C": 256,
+        "num_warps": 8,
+        "num_stages": 3,
+        "waves_per_eu": 1
+    },
+    "C_7168": {
+        "BLOCK_M": 8,
+        "BLOCK_C": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 1
+    },
+    "C_32768": {
+        "BLOCK_M": 8,
+        "BLOCK_C": 1024,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 1
+    }
+}
