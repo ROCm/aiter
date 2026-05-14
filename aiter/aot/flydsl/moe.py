@@ -165,6 +165,11 @@ def _precompile_to_cache(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    # Stage2-only kernel tuning knobs (registered by the production-variant
+    # entries in `get_flydsl_stage2_kernels`). Forwarded into
+    # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
+    use_async_copy: bool = False,
+    cu_num_mul: int = 1,
     **kwargs,
 ):
     """Trigger MLIR compilation with dummy tensors and COMPILE_ONLY=1.
@@ -505,6 +510,9 @@ def _precompile_to_cache(
                 accumulate=accumulate,
                 persist_m=_persist_m,
                 sort_block_m=sort_block_m,
+                waves_per_eu=waves_per_eu,
+                use_async_copy=use_async_copy,
+                cu_num_mul=cu_num_mul,
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,

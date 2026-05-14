@@ -2764,6 +2764,14 @@ def compile_mixed_moe_gemm2(
     waves_per_eu: Optional[int] = None,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
+    # API parity (reviewer #3): the fp4xfp4 stage2 fold doesn't consume
+    # `b_nt` or `xcd_swizzle` directly -- they're only meaningful for the
+    # stage1 kernel and the legacy stage2 implementations. Accept them as
+    # ignored kwargs so callers parsing `_bnt{N}` / `_xcd{N}` registry
+    # suffixes (unifying their stage1/stage2 dispatch) keep working without
+    # having to special-case the fp4xfp4 path.
+    b_nt: int = 0,
+    xcd_swizzle: int = 0,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -2802,6 +2810,7 @@ def compile_mixed_moe_gemm2(
     assumed equal to `tile_m`. When set, stage2 can use a different tile_m from
     sorting/stage1. Requires sort_block_m % tile_m == 0.
     """
+    del b_nt, xcd_swizzle  # no-op on the fp4xfp4 stage2 path; see signature note
     _sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
     if const_expr(_sort_block_m != tile_m and _sort_block_m % tile_m != 0):
         raise ValueError(
