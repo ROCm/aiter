@@ -975,7 +975,7 @@ def get_mla_metadata_info_v1(
             and effective_seqlen_qo != 4
         )
         or (
-            get_gfx() == "gfx950"
+            get_gfx() in ("gfx942", "gfx950")
             and num_head_qo == 64
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8

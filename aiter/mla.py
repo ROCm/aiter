@@ -391,7 +391,7 @@ def mla_decode_fwd(
                 and max_seqlen_q == 2
             )
             or (
-                get_gfx() == "gfx950"
+                get_gfx() in ("gfx942", "gfx950")
                 and nhead == 64
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
