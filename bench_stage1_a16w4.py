@@ -143,8 +143,8 @@ def setup_data(token, model_dim, inter_dim, E, topk, block_m,
 
 def call_flydsl_a16w4(d, topk, block_m, tile_n=128, tile_k=256,
                       gate_up_interleave=False, waves_per_eu=0,
-                      split_k_intra=1, act="silu",
-                      model_dim_pad=0, inter_dim_pad=0, k_batch=1):
+                      act="silu", model_dim_pad=0, inter_dim_pad=0,
+                      k_batch=1):
     if gate_up_interleave:
         w1_shuf = d["w1_qt_shuf_gui"]
         ws_shuf = d["w1_scale_shuf_gui"]
@@ -160,9 +160,8 @@ def call_flydsl_a16w4(d, topk, block_m, tile_n=128, tile_k=256,
         a_dtype="bf16", b_dtype="mxfp4", out_dtype="bf16",
         act=act,
         w1_scale=ws_shuf,
-        gate_up_interleave=gate_up_interleave,
+        gate_mode="interleave" if gate_up_interleave else "separated",
         waves_per_eu=waves_per_eu,
-        split_k_intra=split_k_intra,
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         k_batch=k_batch,
@@ -173,8 +172,8 @@ def fn_flydsl_a16w4(inp, w1_qt_shuf, sorted_ids, sorted_expert_ids,
                      num_valid_ids, w1_scale_shuf,
                      topk, block_m, tile_n=128, tile_k=256,
                      gate_up_interleave=False, waves_per_eu=0,
-                     split_k_intra=1, act="silu",
-                     model_dim_pad=0, inter_dim_pad=0, k_batch=1):
+                     act="silu", model_dim_pad=0, inter_dim_pad=0,
+                     k_batch=1):
     return flydsl_moe_stage1(
         a=inp, w1=w1_qt_shuf,
         sorted_token_ids=sorted_ids, sorted_expert_ids=sorted_expert_ids,
@@ -183,9 +182,8 @@ def fn_flydsl_a16w4(inp, w1_qt_shuf, sorted_ids, sorted_expert_ids,
         a_dtype="bf16", b_dtype="mxfp4", out_dtype="bf16",
         act=act,
         w1_scale=w1_scale_shuf,
-        gate_up_interleave=gate_up_interleave,
+        gate_mode="interleave" if gate_up_interleave else "separated",
         waves_per_eu=waves_per_eu,
-        split_k_intra=split_k_intra,
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         k_batch=k_batch,
@@ -421,7 +419,6 @@ def main():
                     d, topk, fly_block_m, tile_n=args.tile_n,
                     tile_k=args.tile_k, gate_up_interleave=False,
                     waves_per_eu=args.waves_per_eu,
-                    split_k_intra=args.split_k_intra,
                     act=act, model_dim_pad=model_dim_pad,
                     inter_dim_pad=inter_dim_pad, k_batch=kb,
                 )
@@ -451,7 +448,7 @@ def main():
                 print("      perf ...", end="", flush=True)
                 _, us_fly_sep = run_perftest(
                     fn_flydsl_a16w4, *fly_common, args.tile_n, args.tile_k, False,
-                    args.waves_per_eu, args.split_k_intra, act,
+                    args.waves_per_eu, act,
                     model_dim_pad, inter_dim_pad, kb,
                     num_iters=ni, num_warmup=nw,
                 )
@@ -466,7 +463,6 @@ def main():
                     d, topk, fly_block_m, tile_n=args.tile_n,
                     tile_k=args.tile_k, gate_up_interleave=True,
                     waves_per_eu=args.waves_per_eu,
-                    split_k_intra=args.split_k_intra,
                     act=act, model_dim_pad=model_dim_pad,
                     inter_dim_pad=inter_dim_pad, k_batch=kb,
                 )
@@ -496,7 +492,7 @@ def main():
                 print("      perf ...", end="", flush=True)
                 _, us_fly_gui = run_perftest(
                     fn_flydsl_a16w4, *gui_common, args.tile_n, args.tile_k, True,
-                    args.waves_per_eu, args.split_k_intra, act,
+                    args.waves_per_eu, act,
                     model_dim_pad, inter_dim_pad, kb,
                     num_iters=ni, num_warmup=nw,
                 )
