@@ -4,6 +4,7 @@
 """FlyDSL MOE kernel management: naming, compilation, and high-level API."""
 
 import functools
+import os
 import re
 
 from typing import Dict, Optional
@@ -440,6 +441,13 @@ def compile_flydsl_moe_stage2(
 _DLPACK_SAFE = (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
 
 
+def _current_stream():
+    """Return a launch stream, or a dummy stream for CPU compile-only AOT."""
+    if os.environ.get("COMPILE_ONLY") == "1" and not torch.cuda.is_available():
+        return 0
+    return torch.cuda.current_stream()
+
+
 def _view_safe(t: torch.Tensor) -> torch.Tensor:
     """View as uint8 if dtype is not dlpack-safe, otherwise return as-is."""
     return (
@@ -471,7 +479,7 @@ def _s1_args_fp4(
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = _current_stream()
     return (
         _view_safe(out),
         _view_safe(a),
@@ -509,7 +517,7 @@ def _s1_args_std(
     stream=None,
 ):
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = _current_stream()
     return (
         out,
         a,
@@ -552,7 +560,7 @@ def _s2_args_fp4(
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = _current_stream()
     return (
         _view_safe(target),
         _view_safe(a),
@@ -589,7 +597,7 @@ def _s2_args_std(
     stream=None,
 ):
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = _current_stream()
     return (
         target,
         a,
@@ -928,7 +936,7 @@ def flydsl_moe_stage1(
                 bias_arg,
                 token_num,
                 num_sorted_rows,
-                torch.cuda.current_stream(),
+                _current_stream(),
             ),
         )
     elif _gui_sk:
@@ -953,7 +961,7 @@ def flydsl_moe_stage1(
                 bias_arg,
                 token_num,
                 num_sorted_rows,
-                torch.cuda.current_stream(),
+                _current_stream(),
             ),
         )
     elif _splitk_fp4:
@@ -976,7 +984,7 @@ def flydsl_moe_stage1(
                 bias_arg,
                 token_num,
                 num_sorted_rows,
-                torch.cuda.current_stream(),
+                _current_stream(),
             ),
         )
     elif _is_splitk:
