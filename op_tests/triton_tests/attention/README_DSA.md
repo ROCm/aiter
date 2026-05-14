@@ -54,25 +54,30 @@ loss = compute_loss(o)
 loss.backward()  # dQ and dKV computed automatically
 ```
 
-## Three Backward Strategies
+## Backward Strategies
 
-The backward pass computes `dQ` and `dKV` from the upstream gradient `dO`. Three strategies trade off speed vs. memory:
+The backward pass computes `dQ` and `dKV` from the upstream gradient `dO`. Five strategies trade off speed vs. memory:
 
 | Method | Time (ms) | Speedup | Extra Memory | Description |
 |--------|-----------|---------|--------------|-------------|
-| `"fused"` | 58.3 | 1.00x | 0 | Single fused kernel. Baseline. |
-| `"recompute"` | 49.3 | 1.18x | 0 | Split dQ + dKV. Recomputes S, P, dS in dKV kernel. |
-| `"split_intermediate"` | 34.8 | 1.68x | ~2 GiB | Split dQ + dKV. Stores dS and P as intermediates. |
+| `"fused"` | 61.1 | 1.00x | 0 | Single fused kernel. Baseline. |
+| `"recompute"` | 52.5 | 1.16x | 0 | Split dQ + dKV. Recomputes S, P, dS in dKV kernel. |
+| `"split_intermediate"` | 38.0 | 1.61x | ~2 GiB | Split dQ + dKV. Stores dS and P as intermediates. |
+| `"privatized"` | 38.0 | 1.61x | ~2.1 GiB | Like split_intermediate with 8 private dKV copies. No improvement over split_intermediate — atomic serialization within XCD is equally limiting. |
+| `"xcd_privatized"` | 38.0 | 1.61x | ~2.1 GiB | Like privatized but routes CTA i to XCD (i%304)//38. No improvement — routing assumption may not hold or intra-XCD contention is the remaining bottleneck. |
+| `"gather"` | 18.2 | **3.36x** | ~6.5 GiB | **Recommended.** Eliminates all atomics: stores per-(q,topk_rank) head-reduced dKV to [T,TOPK,D] bf16 intermediate, builds CSR inverted topk, gathers with plain stores. |
 
 *Measured on MI300X, T=4096, H=128, D=576, TOPK=1024.*
 
 ### When to use which
 
-- **`"fused"`** (default): Good for small sequences or memory-constrained settings. Single kernel, no intermediate allocations, but has 105 VGPR spills due to register pressure from 8 simultaneous dot products.
+- **`"fused"`** (default): Good for small sequences or memory-constrained settings. Single kernel, no intermediate allocations.
 
-- **`"recompute"`**: Same memory as fused, 18% faster. Splits into separate dQ and dKV kernels, eliminating register conflicts. The dKV kernel recomputes attention scores (S, P, dS) instead of reading intermediates -- the extra FLOPs are hidden behind the atomic-add bottleneck.
+- **`"recompute"`**: Same memory as fused, 16% faster. Splits into separate dQ and dKV kernels. The dKV kernel recomputes attention scores instead of reading intermediates — extra FLOPs hidden behind the atomic bottleneck.
 
-- **`"split_intermediate"`**: Fastest (68% speedup), but allocates `2 * T * H * TOPK * 2 bytes` of intermediate storage (~2 GiB at T=4096, H=128, TOPK=1024). The dKV kernel fuses both head groups (NUM_HG=2), halving atomicAdd operations from 4.83B to 2.42B.
+- **`"split_intermediate"`**: 1.61x speedup over fused, ~2 GiB extra. Stores dS/P intermediates to halve recomputation, then scatters dKV with atomic_add.
+
+- **`"gather"`**: **Best performance (3.36x speedup)** by eliminating atomic_add entirely. Uses ~6.5 GiB extra (scales as `T * TOPK * D * 2 bytes`). The dKV scatter writes to a private [T, TOPK, D] bf16 buffer (one unique writer per slot — no contention), then a gather phase accumulates dKV per KV token with plain stores. The 3.36x gain over fused (vs 1.61x for split_intermediate) comes from removing the ~4.5x write amplification caused by cross-XCD atomic ownership transfers measured via rocprof TCC_EA0 counters.
 
 ## Integration into a Model
 
@@ -185,29 +190,46 @@ python op_tests/triton_tests/attention/bench_dsa_methods.py --bench-only
 
 Expected output:
 ```
-GPU: AMD Instinct MI300X
+================================================================
+  BENCHMARK: Forward
+================================================================
+  B1_S4096_H128_topk1024             5.57 ms     209.7 TFLOPS
+  B1_S4096_H128_topk2048            10.52 ms     222.1 TFLOPS
+  B1_S8192_H128_topk1024            11.42 ms     204.5 TFLOPS
 
 ================================================================
-  CORRECTNESS: All 3 backward methods agree
-================================================================
-
-  Config: B=1 S=128 H=16 D=320 TOPK=64
-  Method                  dQ max_rel  dKV max_rel  Status
-  ----------------------------------------------------------
-  fused                     0.00e+00    0.00e+00     REF
-  recompute                 1.23e-04    2.34e-06    PASS
-  split_intermediate        5.67e-05    1.89e-06    PASS
-
-================================================================
-  BENCHMARK: Backward (3 methods)
+  BENCHMARK: Backward (6 methods)
 ================================================================
 
   B1_S4096_H128_topk1024
   Method                  Time (ms)   TFLOPS  Speedup   Extra mem
   ----------------------------------------------------------------
-  fused                      58.30     41.2     1.00x          0
-  recompute                  49.30     48.7     1.18x          0
-  split_intermediate         34.80     69.0     1.68x    2.0 GiB
+  fused                       61.10     39.4     1.00x          0
+  recompute                   52.47     45.8     1.16x          0
+  split_intermediate          37.99     63.3     1.61x    2.0 GiB
+  privatized                  38.03     63.2     1.61x    2.1 GiB
+  xcd_privatized              38.02     63.3     1.61x    2.1 GiB
+  gather                      18.17    132.3     3.36x    6.5 GiB
+
+  B1_S4096_H128_topk2048
+  Method                  Time (ms)   TFLOPS  Speedup   Extra mem
+  ----------------------------------------------------------------
+  fused                      119.41     40.3     1.00x          0
+  recompute                  101.48     47.4     1.18x          0
+  split_intermediate          73.50     65.5     1.62x    4.0 GiB
+  privatized                  73.50     65.4     1.62x    4.1 GiB
+  xcd_privatized              73.47     65.5     1.63x    4.1 GiB
+  gather                      33.66    142.9     3.55x   13.0 GiB
+
+  B1_S8192_H128_topk1024
+  Method                  Time (ms)   TFLOPS  Speedup   Extra mem
+  ----------------------------------------------------------------
+  fused                      122.05     39.4     1.00x          0
+  recompute                  104.50     46.0     1.17x          0
+  split_intermediate          76.34     63.0     1.60x    4.0 GiB
+  privatized                  76.43     62.9     1.60x    4.1 GiB
+  xcd_privatized              76.44     62.9     1.60x    4.1 GiB
+  gather                      36.42    132.1     3.35x   13.0 GiB
 ```
 
 ### Run existing tests
@@ -255,14 +277,18 @@ op_tests/triton_tests/attention/
 
 The forward kernel uses online softmax with autotuned tiling (BLOCK_H, TILE_K). K and V share the same data (first `kv_lora_rank` dims), loaded once and reused via `tl.trans()`.
 
-### Backward bottleneck: atomicAdd
+### Backward bottleneck: atomicAdd and how gather eliminates it
 
-The backward pass has 8 dot products per loop iteration. The key bottleneck is **dKV scatter**: multiple query programs contribute gradients to the same KV token via `tl.atomic_add`. On MI300X:
-- Baseline: 4.83 billion atomicAdd operations, ~91.7% of kernel runtime
-- HG-fused: 2.42 billion atomicAdd operations (2x reduction via head-group fusion)
-- Hardware limit: ~409 GOPS atomic throughput (estimated), our kernel achieves ~83 GOPS (~20%)
+The key bottleneck is **dKV scatter**: multiple query CTAs contribute gradients to the same KV token via `tl.atomic_add`. On MI300X, rocprof `TCC_EA0` hardware counters reveal a **4.5× write amplification** over non-atomic stores:
 
-This atomic bottleneck is fundamental to sparse attention's backward pass and cannot be eliminated without changing the algorithm (unlike dense FlashAttention which uses a KV-outer loop).
+- Each cross-XCD atomic ownership transfer forces a 64B writeback to HBM (Infinity Fabric)
+- With TOPK=1024 writers per KV token across 8 XCDs, ownership bounces constantly
+- Result: ~603M dirty cache-line writebacks (atomic) vs ~67M (non-atomic) — 8.9× more evictions
+- Net bytes ratio: 4.5× (atomic writebacks are 64B, store evictions are 128B)
+
+Privatized schemes (8 copies, XCD-local routing) don't help — intra-XCD atomic serialization is equally limiting, and privatized/xcd_privatized bench identically to split_intermediate.
+
+The `"gather"` method eliminates atomics entirely: each `[T, TOPK, D]` intermediate slot has exactly one writer, so `tl.store` is correct with zero contention. The gather phase then accumulates per KV token with a sequential loop. Result: **3.36x speedup over fused** (vs 1.61x for the previous best).
 
 ## Cross-Platform Forward Comparison: AITER (MI300X) vs TileLang (H100)
 
@@ -288,14 +314,13 @@ Notes:
 
 TileLang's backward kernel exceeds the H100's dynamic shared memory limit (requests 368KB) on all full DeepSeek-V3 configs (H=128, D=576), so only smaller configs could run.
 
-| Config | AITER `split_intermediate` | AITER `recompute` | AITER `fused` | TileLang (H100) |
-|--------|---------------------------:|-------------------:|--------------:|----------------:|
-| S4096_H128_topk1024 | 63.5 TFLOPS (1.61x) | 46.2 TFLOPS (1.17x) | 39.4 TFLOPS | FAILED (shmem) |
-| S4096_H128_topk2048 | 65.5 TFLOPS (1.63x) | 47.6 TFLOPS (1.18x) | 40.3 TFLOPS | FAILED (shmem) |
-| S8192_H128_topk1024 | 63.1 TFLOPS (1.60x) | 45.9 TFLOPS (1.16x) | 39.4 TFLOPS | FAILED (shmem) |
-| S8192_H128_topk2048 | 65.6 TFLOPS (1.62x) | 47.5 TFLOPS (1.18x) | 40.4 TFLOPS | FAILED (shmem) |
-| S4096_H32_topk1024 | 18.2 TFLOPS (0.81x) | 18.2 TFLOPS (0.81x) | 22.6 TFLOPS | 60.4 TFLOPS |
-| S4096_H16_topk1024 | 9.8 TFLOPS (0.90x) | 7.9 TFLOPS (0.73x) | 10.9 TFLOPS | 33.1 TFLOPS |
+| Config | AITER `gather` | AITER `split_intermediate` | AITER `fused` | TileLang (H100) |
+|--------|---------------:|---------------------------:|--------------:|----------------:|
+| S4096_H128_topk1024 | **132.3 TFLOPS (3.36x)** | 63.3 TFLOPS (1.61x) | 39.4 TFLOPS | FAILED (shmem) |
+| S4096_H128_topk2048 | **142.9 TFLOPS (3.55x)** | 65.5 TFLOPS (1.62x) | 40.3 TFLOPS | FAILED (shmem) |
+| S8192_H128_topk1024 | **132.1 TFLOPS (3.35x)** | 63.0 TFLOPS (1.60x) | 39.4 TFLOPS | FAILED (shmem) |
+| S4096_H32_topk1024 | — | 18.2 TFLOPS (0.81x) | 22.6 TFLOPS | 60.4 TFLOPS |
+| S4096_H16_topk1024 | — | 9.8 TFLOPS (0.90x) | 10.9 TFLOPS | 33.1 TFLOPS |
 
 *AITER numbers on MI300X. Speedups relative to fused baseline.*
 
