@@ -1,0 +1,130 @@
+--- a/aiter/fused_moe.py
++++ b/aiter/fused_moe.py
+@@ -153,6 +153,38 @@
+     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+ 
+ 
++_moe_sorting_buf_cache: dict = {}
++
++
++def _get_moe_sorting_bufs(
++    M, topk, num_experts, block_size, model_dim, moebuf_dtype, device
++):
++    key = (device.index, M, topk, num_experts, block_size, model_dim, moebuf_dtype)
++    if key not in _moe_sorting_buf_cache:
++        max_num_tokens_padded = int(M * topk + num_experts * block_size - topk)
++        sorted_ids = torch.empty(
++            max_num_tokens_padded, dtype=torch.int32, device=device
++        )
++        sorted_weights = torch.empty(
++            max_num_tokens_padded, dtype=torch.float32, device=device
++        )
++        sorted_expert_ids = torch.empty(
++            max_num_tokens_padded // block_size, dtype=torch.int32, device=device
++        )
++        num_valid_ids = torch.empty(1, dtype=torch.int32, device=device)
++        moe_buf = torch.empty(
++            (max_num_tokens_padded, model_dim), dtype=moebuf_dtype, device=device
++        )
++        _moe_sorting_buf_cache[key] = (
++            sorted_ids,
++            sorted_weights,
++            sorted_expert_ids,
++            num_valid_ids,
++            moe_buf,
++        )
++    return _moe_sorting_buf_cache[key]
++
++
+ def moe_sorting(
+     topk_ids,
+     topk_weights,
+@@ -164,6 +196,60 @@
+     num_local_tokens=None,
+     dispatch_policy=0,
+ ):
++    if expert_mask is None:
++        try:
++            M, topk = topk_ids.shape
++            device = topk_ids.device
++            (
++                sorted_ids,
++                sorted_weights,
++                sorted_expert_ids,
++                num_valid_ids,
++                moe_buf,
++            ) = _get_moe_sorting_bufs(
++                M, topk, num_experts, block_size, model_dim, moebuf_dtype, device
++            )
++            if not _USE_CK_MOE_SORTING:
++                aiter.moe_sorting_fwd(
++                    topk_ids,
++                    topk_weights,
++                    sorted_ids,
++                    sorted_weights,
++                    sorted_expert_ids,
++                    num_valid_ids,
++                    moe_buf,
++                    num_experts,
++                    int(block_size),
++                    expert_mask,
++                    num_local_tokens,
++                    dispatch_policy,
++                )
++            else:
++                aiter.moe_sorting_fwd(
++                    topk_ids,
++                    topk_weights,
++                    sorted_ids,
++                    sorted_weights,
++                    sorted_expert_ids,
++                    num_valid_ids,
++                    moe_buf,
++                    num_experts,
++                    int(block_size),
++                    expert_mask,
++                    num_local_tokens,
++                    dispatch_policy,
++                )
++            return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
++        except Exception as e:
++            logger.error(f"Error in moe_sorting: {e}")
++            max_num_tokens_padded = int(
++                topk_ids.numel() + num_experts * block_size - topk_ids.shape[1]
++            )
++            topk = topk_ids.shape[1]
++            logger.error(
++                f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
++            )
++            raise e
+     try:
+         return _moe_sorting_impl(
+             topk_ids,
+@@ -187,6 +273,17 @@
+             f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
+         )
+         raise e
++
++
++_quant_func_t_cache: dict = {}
++
++
++def _get_quant_func_transpose(quant_type):
++    if quant_type not in _quant_func_t_cache:
++        _quant_func_t_cache[quant_type] = functools.partial(
++            get_quant(quant_type), transpose_scale=True
++        )
++    return _quant_func_t_cache[quant_type]
+ 
+ 
+ # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
+@@ -523,8 +620,7 @@
+                 )
+                 effective_a1_scale = scale_t_buf
+             else:
+-                quant_func = get_quant(quant_type)
+-                quant_func = functools.partial(quant_func, transpose_scale=True)
++                quant_func = _get_quant_func_transpose(quant_type)
+                 a1, effective_a1_scale = quant_func(
+                     hidden_states,
+                     scale=a1_scale,
