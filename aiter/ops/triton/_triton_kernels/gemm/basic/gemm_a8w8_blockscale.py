@@ -191,7 +191,7 @@ def _gemm_a8w8_blockscale_kernel(
 
             # Perform dot operation and apply scale
             accumulator += (
-                tl.dot(a, b, input_precision="ieee")
+                tl.dot(a, b)
                 * a_scale[:, None]
                 * b_scale[None, :]
             )
@@ -408,7 +408,7 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
 
             # Perform dot operation and apply scale
             accumulator += (
-                tl.dot(a, b, input_precision="ieee")
+                tl.dot(a, b)
                 * a_scale[:, None]
                 * b_scale[None, :]
             )

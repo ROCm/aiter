@@ -174,7 +174,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                 b_scale = tl.load(b_scale_ptrs)
 
                 accumulator_fp8 += (
-                    tl.dot(a, b, input_precision="ieee")
+                    tl.dot(a, b)
                     * a_scale[:, None]
                     * b_scale[None, :]
                 )
@@ -236,7 +236,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                         cache_modifier=cache_modifier,
                     )
 
-                accumulator_bf16 += tl.dot(a, b, input_precision="ieee")
+                accumulator_bf16 += tl.dot(a, b)
 
                 a_ptrs += BLOCK_SIZE_K * stride_a_bf16_k
                 b_ptrs += BLOCK_SIZE_K * stride_b_bf16_k

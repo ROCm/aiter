@@ -180,13 +180,13 @@ def _gemm_a16w8_blockscale_kernel(
                 a = a.to(b_ptr.type.element_ty).reshape(BLOCK_SIZE_M, BLOCK_SIZE_K)
                 a_scale = a_scale.reshape(BLOCK_SIZE_M)
                 accumulator += (
-                    tl.dot(a, b, input_precision="ieee")
+                    tl.dot(a, b)
                     * a_scale[:, None]
                     * b_scale[None, :]
                 )
             else:
                 b = b.to(a_ptr.type.element_ty)
-                accumulator += tl.dot(a, b, input_precision="ieee") * b_scale[None, :]
+                accumulator += tl.dot(a, b) * b_scale[None, :]
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -396,13 +396,13 @@ def _gemm_a16w8_blockscale_preshuffle_kernel(
                 a = a.to(b_ptr.type.element_ty).reshape(BLOCK_SIZE_M, BLOCK_SIZE_K)
                 a_scale = a_scale.reshape(BLOCK_SIZE_M)
                 accumulator += (
-                    tl.dot(a, b, input_precision="ieee")
+                    tl.dot(a, b)
                     * a_scale[:, None]
                     * b_scale[None, :]
                 )
             else:
                 b = b.to(a_ptr.type.element_ty)
-                accumulator += tl.dot(a, b, input_precision="ieee") * b_scale[None, :]
+                accumulator += tl.dot(a, b) * b_scale[None, :]
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak

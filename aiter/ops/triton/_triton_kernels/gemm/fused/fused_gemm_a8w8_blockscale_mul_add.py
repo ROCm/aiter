@@ -180,7 +180,7 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
 
             # Perform dot operation and apply scale
             accumulator += (
-                tl.dot(a, b, input_precision="ieee")
+                tl.dot(a, b)
                 * a_scale[:, None]
                 * b_scale[None, :]
             )
