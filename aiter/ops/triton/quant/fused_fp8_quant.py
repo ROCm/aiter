@@ -522,21 +522,20 @@ def fused_flatten_fp8_group_quant(
     out = torch.empty((M, N), dtype=dtype_quant, device=x.device)
 
     if transpose_scale:
-        # Allocate as (num_bs_cols, M) so the row-major storage of this tensor
-        # is equivalent to a column-major (M, num_bs_cols) layout. We then
-        # tell the inner kernel to write with swapped strides, and view back
-        # to (M, num_bs_cols) at the end.
+        # Allocate (num_bs_cols, M) row-major; pass swapped (1, M) strides so
+        # the kernel writes column-major into the (M, num_bs_cols) logical
+        # buffer. View back to (M, num_bs_cols) at the end so the public
+        # tensor is row-major contiguous and byte-equivalent to
+        # default.transpose(0, 1).contiguous().view(M, num_bs_cols).
         out_block_scales = torch.empty(
             (num_bs_cols, M), dtype=torch.float32, device=x.device
         )
-        out_bs_row_stride = out_block_scales.stride(1)  # = 1
-        out_bs_col_stride = out_block_scales.stride(0)  # = M
+        out_bs_row_stride, out_bs_col_stride = 1, M
     else:
         out_block_scales = torch.empty(
             (M, num_bs_cols), dtype=torch.float32, device=x.device
         )
-        out_bs_row_stride = out_block_scales.stride(0)  # = num_bs_cols
-        out_bs_col_stride = out_block_scales.stride(1)  # = 1
+        out_bs_row_stride, out_bs_col_stride = num_bs_cols, 1
 
     DTYPE_MAX = (
         torch.finfo(out.dtype).max

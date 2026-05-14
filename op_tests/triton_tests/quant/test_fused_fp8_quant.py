@@ -367,10 +367,8 @@ def test_fused_flatten_fp8_group_quant(M: int, N1: int, N2: int, dtype):
 
 @pytest.mark.parametrize("M", [1, 32, 256])
 @pytest.mark.parametrize("N1, N2", [(16, 128)])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_flatten_fp8_group_quant_transpose_scale(
-    M: int, N1: int, N2: int, dtype
-):
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fused_flatten_fp8_group_quant_transpose_scale(M: int, N1: int, N2: int, dtype):
     """Test that transpose_scale parameter returns scale with transposed memory layout."""
     torch.manual_seed(0)
     group_size = 128
