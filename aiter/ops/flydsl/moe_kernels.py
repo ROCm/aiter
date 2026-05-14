@@ -381,6 +381,7 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    k_batch: int = 1,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -406,6 +407,7 @@ def compile_flydsl_moe_stage2(
             inter_dim_pad=inter_dim_pad,
             xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
+            k_batch=k_batch,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -1038,6 +1040,7 @@ def flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     bias: Optional[torch.Tensor] = None,
+    k_batch: int = 1,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1169,6 +1172,7 @@ def flydsl_moe_stage2(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        k_batch=k_batch,
     )
     _run_compiled(exe, args)
 
