@@ -3796,10 +3796,19 @@ void indexer_k_norm_rope_quant_and_cache(
     AITER_CHECK(k.device_id == positions.device_id, "k and positions must be on the same device");
     AITER_CHECK(k.device_id == cos_cache.device_id, "k and cos_cache must be on the same device");
     AITER_CHECK(k.device_id == sin_cache.device_id, "k and sin_cache must be on the same device");
+    AITER_CHECK(k.dim() == 2, "k must be [num_tokens, head_dim]");
+    AITER_CHECK(slot_mapping.size(0) >= num_tokens, "slot_mapping must cover all k tokens");
+    AITER_CHECK(positions.size(0) >= num_tokens, "positions must cover all k tokens");
     AITER_CHECK(head_dim == 128, "indexer fused k cache only supports head_dim=128");
     AITER_CHECK(rope_dim == 64, "indexer fused k cache only supports rope_dim=64");
     AITER_CHECK(quant_block_size == head_dim,
                 "indexer fused k cache only supports quant_block_size == head_dim");
+    AITER_CHECK(k.stride(1) == 1 && k.stride(0) == head_dim,
+                "indexer fused k cache requires contiguous [num_tokens, head_dim] k");
+    AITER_CHECK(norm_weight.dtype() == k.dtype(), "norm_weight dtype must match k dtype");
+    AITER_CHECK(norm_bias.dtype() == k.dtype(), "norm_bias dtype must match k dtype");
+    AITER_CHECK(cos_cache.dtype() == k.dtype(), "cos_cache dtype must match k dtype");
+    AITER_CHECK(sin_cache.dtype() == k.dtype(), "sin_cache dtype must match k dtype");
     AITER_CHECK(norm_weight.size(0) == head_dim, "norm_weight size must match head_dim");
     AITER_CHECK(norm_bias.size(0) == head_dim, "norm_bias size must match head_dim");
     if(preshuffle)
@@ -3868,10 +3877,13 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(q.device_id == sin_cache.device_id, "q and sin_cache must be on the same device");
     AITER_CHECK(q.dim() == 3, "q must be [num_tokens, n_heads, head_dim]");
     AITER_CHECK(q_out.dim() == 3, "q_out must be [num_tokens, n_heads, head_dim]");
+    AITER_CHECK(k.dim() == 2, "k must be [num_tokens, head_dim]");
     AITER_CHECK(weights.dim() == 2, "weights must be [num_tokens, n_heads]");
     AITER_CHECK(weights_out.dim() == 2, "weights_out must be [num_tokens, n_heads]");
     AITER_CHECK(q.size(0) == num_tokens, "q token dimension must match k");
     AITER_CHECK(q.size(2) == head_dim, "q head_dim must match k head_dim");
+    AITER_CHECK(slot_mapping.size(0) >= num_tokens, "slot_mapping must cover all k tokens");
+    AITER_CHECK(positions.size(0) >= num_tokens, "positions must cover all k tokens");
     AITER_CHECK(q_out.size(0) == num_tokens && q_out.size(1) == n_heads &&
                     q_out.size(2) == head_dim,
                 "q_out shape must match q");
@@ -3883,6 +3895,14 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(rope_dim == 64, "indexer fused qk cache only supports rope_dim=64");
     AITER_CHECK(quant_block_size == head_dim,
                 "indexer fused qk cache only supports quant_block_size == head_dim");
+    AITER_CHECK(k.stride(1) == 1 && k.stride(0) == head_dim,
+                "indexer fused qk cache requires contiguous [num_tokens, head_dim] k");
+    AITER_CHECK(k.dtype() == q.dtype(), "k dtype must match q dtype");
+    AITER_CHECK(weights.dtype() == q.dtype(), "weights dtype must match q dtype");
+    AITER_CHECK(norm_weight.dtype() == q.dtype(), "norm_weight dtype must match q dtype");
+    AITER_CHECK(norm_bias.dtype() == q.dtype(), "norm_bias dtype must match q dtype");
+    AITER_CHECK(cos_cache.dtype() == q.dtype(), "cos_cache dtype must match q dtype");
+    AITER_CHECK(sin_cache.dtype() == q.dtype(), "sin_cache dtype must match q dtype");
     AITER_CHECK(norm_weight.size(0) == head_dim, "norm_weight size must match head_dim");
     AITER_CHECK(norm_bias.size(0) == head_dim, "norm_bias size must match head_dim");
     if(preshuffle)
