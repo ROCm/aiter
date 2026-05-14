@@ -1708,6 +1708,10 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
     // the compiler default ~26 instr — see f32x2_to_bf16x2_rne in
     // rope_common.h). Bit-exact RNE equivalent to warp_rms_norm_ — only
     // difference is NaN payload normalisation (canonical 0x7fff bf16 NaN).
+    // To match diffusers RMSNorm semantics, reuse the same scratch for a
+    // 2-stage writeback:
+    //   n = x * rsqrt(...)
+    //   n = round_T(n * gamma_T) after x_vec has been packed back to T
     {
         float v[VEC_SIZE];
         float acc = 0.f;
@@ -1724,7 +1728,14 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
 #pragma unroll
         for(int i = 0; i < VEC_SIZE; ++i)
         {
-            n[i] = v[i] * s_val * (float)w_vec[i];
+            n[i] = v[i] * s_val;
+        }
+        mrope_utils::pack_f32_to_vec_t(x_vec, n);
+
+#pragma unroll
+        for(int i = 0; i < VEC_SIZE; ++i)
+        {
+            n[i] = (float)x_vec[i] * (float)w_vec[i];
         }
         mrope_utils::pack_f32_to_vec_t(x_vec, n);
     }
@@ -2065,6 +2076,9 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
         // x_pair_0/1 (would be redundant lshl b32 conversions). Same RNE on
         // writeback via pack_f32_to_vec_t (10 instr per bf16x2 pair vs the
         // compiler default 26 instr — see f32x2_to_bf16x2_rne in rope_common.h).
+        // To match diffusers RMSNorm semantics, reuse the same scratch for a
+        // 2-stage writeback: first pack x * rsqrt(...), then multiply the
+        // packed low-precision values by gamma and pack once more.
         float v0[VEC_PAIR], v1[VEC_PAIR];
         float acc0 = 0.f, acc1 = 0.f;
 #pragma unroll
@@ -2084,8 +2098,17 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
 #pragma unroll
         for(int i = 0; i < VEC_PAIR; ++i)
         {
-            n0[i] = v0[i] * s_val0 * (float)w_vec[i];
-            n1[i] = v1[i] * s_val1 * (float)w_vec[i];
+            n0[i] = v0[i] * s_val0;
+            n1[i] = v1[i] * s_val1;
+        }
+        mrope_utils::pack_f32_to_vec_t(x_pair_0, n0);
+        mrope_utils::pack_f32_to_vec_t(x_pair_1, n1);
+
+#pragma unroll
+        for(int i = 0; i < VEC_PAIR; ++i)
+        {
+            n0[i] = (float)x_pair_0[i] * (float)w_vec[i];
+            n1[i] = (float)x_pair_1[i] * (float)w_vec[i];
         }
         mrope_utils::pack_f32_to_vec_t(x_pair_0, n0);
         mrope_utils::pack_f32_to_vec_t(x_pair_1, n1);

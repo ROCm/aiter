@@ -19,6 +19,21 @@ def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
     return weight * x
 
 
+def rms_norm_diffusers_forward(x: Tensor, weight: Tensor, eps: float):
+    input_dtype = x.dtype
+    variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    hidden_states = x * torch.rsqrt(variance + eps)
+
+    if weight is not None:
+        if weight.dtype in [torch.float16, torch.bfloat16]:
+            hidden_states = hidden_states.to(weight.dtype)
+        hidden_states = hidden_states * weight
+    else:
+        hidden_states = hidden_states.to(input_dtype)
+
+    return hidden_states
+
+
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
     """Apply interleaved MRoPE to 3D rotary embeddings.
     Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
@@ -1351,10 +1366,10 @@ def run_torch_qk_norm_rope_1way(
     is_neox_style = not is_interleaved
     q_shape = q.shape
     k_shape = k.shape
-    q_by_head = rms_norm_forward(
+    q_by_head = rms_norm_diffusers_forward(
         q.view(batch_size, num_tokens, num_heads_q, head_size), w_q, eps
     )
-    k_by_head = rms_norm_forward(
+    k_by_head = rms_norm_diffusers_forward(
         k.view(batch_size, num_tokens, num_heads_k, head_size), w_k, eps
     )
     cos_sin = cos_sin.view(num_tokens, head_size)
