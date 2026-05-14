@@ -24,7 +24,7 @@ env:
   DOCKER_PULL_MAX_ATTEMPTS: "3"
   DOCKER_PULL_RETRY_DELAY_SECONDS: "10"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/Aiter.git' }}
-  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
 
 jobs:
   check-signal:
@@ -32,6 +32,7 @@ jobs:
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:atom') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:atom_full') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
     runs-on: ubuntu-latest
     steps:
@@ -44,45 +45,119 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
+  load-atom-models:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:atom') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:atom_full') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    runs-on: ubuntu-latest
+    outputs:
+      models_json: ${{ steps.models.outputs.models_json }}
+    steps:
+      - name: Checkout ATOM model configs
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ATOM_REPOSITORY_URL }}
+          ref: ${{ env.ATOM_BRANCH }}
+
+      - name: Load ATOM accuracy model matrix
+        id: models
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+
+          default_models = [
+              {
+                  "model_name": "DeepSeek-R1-0528",
+                  "label": "MI300X",
+                  "model_path": "deepseek-ai/DeepSeek-R1-0528",
+                  "extraArgs": "--kv_cache_dtype fp8 -tp 8",
+                  "env_vars": "",
+                  "accuracy_test_threshold": "0.94",
+                  "runner": "linux-aiter-mi300x-8",
+                  "run_on_pr": True,
+                  "job_name": "ATOM Benchmark (DeepSeek-R1-0528, MI300X)",
+              },
+              {
+                  "model_name": "DeepSeek-R1-0528",
+                  "label": "MI35X",
+                  "model_path": "deepseek-ai/DeepSeek-R1-0528",
+                  "extraArgs": "--kv_cache_dtype fp8 -tp 8",
+                  "env_vars": "",
+                  "accuracy_test_threshold": "0.94",
+                  "runner": "linux-aiter-mi35x-8",
+                  "run_on_pr": True,
+                  "job_name": "ATOM Benchmark (DeepSeek-R1-0528, MI35X)",
+              },
+              {
+                  "model_name": "gpt-oss-120b",
+                  "label": "MI35X",
+                  "model_path": "openai/gpt-oss-120b",
+                  "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3",
+                  "env_vars": "ATOM_GPT_OSS_MODEL=1\nHSA_NO_SCRATCH_RECLAIM=1",
+                  "accuracy_test_threshold": "0.38",
+                  "runner": "linux-aiter-mi35x-1",
+                  "run_on_pr": True,
+                  "job_name": "ATOM Benchmark (gpt-oss-120b, MI35X)",
+              },
+          ]
+
+          labels_raw = os.environ.get("LABELS_JSON") or "[]"
+          labels = json.loads(labels_raw)
+          if labels is None:
+              labels = []
+
+          full_atom = os.environ["EVENT_NAME"] == "pull_request" and "ci:atom_full" in labels
+          if not full_atom:
+              selected = default_models
+          else:
+              with open(".github/benchmark/models_accuracy.json", encoding="utf-8") as f:
+                  selected = [
+                      model
+                      for model in json.load(f)
+                      if str(model.get("test_level", "")).lower() in {"pr", "main"}
+                  ]
+              runner_overrides = {
+                  "atom-mi355-8gpu.predownload": "linux-aiter-mi35x-8",
+                  "linux-atom-mi35x-4": "linux-aiter-mi35x-4",
+                  "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
+              }
+              for model in selected:
+                  model["runner"] = runner_overrides.get(model["runner"], model["runner"])
+                  model["label"] = model.get("runner", "")
+                  model["accuracy_test_threshold"] = str(model.get("accuracy_threshold", 0))
+                  model["run_on_pr"] = True
+                  model["job_name"] = (
+                      f"Accuracy ({model['model_name']}, {model['model_path']}, "
+                      f"{model.get('extraArgs', '')}, {model['runner']})"
+                  )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"models_json={json.dumps(selected)}\n")
+
+          mode = "full" if full_atom else "default"
+          print(f"Selected {len(selected)} ATOM accuracy model(s) for {mode} mode")
+          PY
+
   atom_benchmark:
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:atom') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:atom_full') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    needs: [check-signal]
-    name: ATOM Benchmark 
+    needs: [check-signal, load-atom-models]
+    name: ${{ matrix.job_name }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # run_on_pr: true = run on all events; false = skip on PR (still runs on push/schedule/workflow_dispatch)
-          - model_name: "DeepSeek-R1-0528"
-            label: MI300X
-            model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8"
-            env_vars: ""
-            accuracy_test_threshold: "0.94"
-            runner: linux-aiter-mi300x-8
-            run_on_pr: true
-          - model_name: "DeepSeek-R1-0528"
-            label: MI35X
-            model_path: "deepseek-ai/DeepSeek-R1-0528"
-            extraArgs: "--kv_cache_dtype fp8 -tp 8"
-            env_vars: ""
-            accuracy_test_threshold: "0.94"
-            runner: linux-aiter-mi35x-8
-            run_on_pr: true
-          - model_name: "gpt-oss-120b"
-            label: MI35X
-            model_path: "openai/gpt-oss-120b"
-            extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
-            env_vars: |
-              ATOM_GPT_OSS_MODEL=1
-              HSA_NO_SCRATCH_RECLAIM=1
-            accuracy_test_threshold: "0.38"
-            runner: linux-aiter-mi35x-1
-            run_on_pr: true
+        include: ${{ fromJson(needs.load-atom-models.outputs.models_json) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
@@ -90,7 +165,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.ATOM_REPOSITORY_URL }}
-          branch: ${{ env.ATOM_BRANCH }}
+          ref: ${{ env.ATOM_BRANCH }}
 
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
@@ -128,7 +203,7 @@ jobs:
               git submodule sync && git submodule update --init --recursive && \\
               MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e . && \\
               ./.github/scripts/install_triton.sh
-          RUN echo "=== amd-triton version ===" && pip show amd-triton || true
+          RUN echo "=== triton version ===" && pip show triton || true
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           EOF
 
@@ -153,13 +228,11 @@ jobs:
           fi
 
           MODEL_MOUNT=""
-          if [ "${{ matrix.runner }}" = "linux-aiter-mi35x-8" ]; then
-            if [ -d "/models" ]; then
-              MODEL_MOUNT="-v /models:/models"
-              echo "Using host model cache mount: /models"
-            else
-              echo "Warning: /models directory not found on runner; MI35X model cache will stay container-local."
-            fi
+          if [ -d "/models" ]; then
+            MODEL_MOUNT="-v /models:/models"
+            echo "Using host model cache mount: /models"
+          else
+            echo "Warning: /models directory not found on runner; model cache will stay container-local."
           fi
 
           cat > /tmp/env_file.txt << 'EOF'
@@ -202,32 +275,46 @@ jobs:
           docker exec atom_aiter_test bash -lc "pip show amd-aiter atom && pip list"
 
       - name: Download Models
-        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.model_name == 'DeepSeek-R1-0528'
+        if: matrix.run_on_pr == true || github.event_name != 'pull_request'
+        timeout-minutes: 150
         run: |
-          if [ "${{ matrix.runner }}" = "linux-aiter-mi35x-8" ]; then
+          set -euo pipefail
+          if docker exec atom_aiter_test bash -lc "[ -d /models ]"; then
             model_cache_dir="/models"
           else
             model_cache_dir="/run"
           fi
 
-          if docker exec atom_aiter_test bash -lc "[ -d '${model_cache_dir}' ]"; then
-            echo "${model_cache_dir} directory found, downloading model to ${model_cache_dir}/${{ matrix.model_path }}"
-            if ! docker exec atom_aiter_test bash -lc "hf download ${{ matrix.model_path }} --local-dir '${model_cache_dir}/${{ matrix.model_path }}'"; then
-              echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
-              exit 1
-            fi
-          else
-            echo "${model_cache_dir} directory not found in container, skipping model download"
+          target_dir="${model_cache_dir}/${{ matrix.model_path }}"
+          echo "Downloading model to ${target_dir}"
+          if ! docker exec \
+            -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
+            -e MODEL_ID="${{ matrix.model_path }}" \
+            -e TARGET_DIR="${target_dir}" \
+            -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+            -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+            -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+            -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+            atom_aiter_test bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
+            echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
+            exit 1
           fi
+        env:
+          MODEL_DOWNLOAD_TIMEOUT: "3h"
+          MODEL_LOCK_WAIT_SECONDS: "7200"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
 
       - name: Run ATOM accuracy test
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         timeout-minutes: 90
+        env:
+          MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
         run: |
           set -euo pipefail
           echo ""
           echo "========== Launching ATOM server =========="
-          if [ "${{ matrix.runner }}" = "linux-aiter-mi35x-8" ]; then
+          if docker exec atom_aiter_test bash -lc "[ -d /models ]"; then
             model_cache_dir="/models"
           else
             model_cache_dir="/run"
@@ -238,9 +325,8 @@ jobs:
           else
             model_path="${{ matrix.model_path }}"
           fi
-          docker exec atom_aiter_test bash -lc "
-            .github/scripts/atom_test.sh launch $model_path ${{ matrix.extraArgs }}
-          "
+          printf '.github/scripts/atom_test.sh launch %q %s\n' "$model_path" "$MODEL_EXTRA_ARGS" | \
+            docker exec -i atom_aiter_test bash -l
           echo ""
           echo "========== Running accuracy test =========="
           docker exec atom_aiter_test bash -lc "
