@@ -419,6 +419,35 @@ jobs:
             pip show amd-aiter
           "
 
+      - name: Sync prebuilt kernels into source tree
+        run: |
+          set -euo pipefail
+          docker exec -i \
+          -w /workspace \
+          aiter_test \
+          python3 - <<'PY'
+          from importlib.metadata import distribution
+          from pathlib import Path
+          from shutil import copy2
+
+          dist = distribution("amd-aiter")
+          installed_jit = Path(dist.locate_file("aiter/jit")).resolve()
+          workspace_jit = Path("/workspace/aiter/jit").resolve()
+
+          kernels = sorted(installed_jit.glob("*.so"))
+          if not kernels:
+              raise SystemExit(f"No prebuilt kernels found in {installed_jit}")
+
+          workspace_jit.mkdir(parents=True, exist_ok=True)
+          for kernel in kernels:
+              copy2(kernel, workspace_jit / kernel.name)
+
+          print(
+              f"Synced {len(kernels)} prebuilt kernels from {installed_jit} "
+              f"to {workspace_jit}"
+          )
+          PY
+
       - name: Install triton
         run: |
           # Ensure install_triton.sh is available even when the PR branch
@@ -619,6 +648,35 @@ jobs:
             pip install '${AITER_WHEEL_PATH}'
             pip show amd-aiter
           "
+
+      - name: Sync prebuilt kernels into source tree
+        run: |
+          set -euo pipefail
+          docker exec -i \
+          -w /workspace \
+          aiter_test \
+          python3 - <<'PY'
+          from importlib.metadata import distribution
+          from pathlib import Path
+          from shutil import copy2
+
+          dist = distribution("amd-aiter")
+          installed_jit = Path(dist.locate_file("aiter/jit")).resolve()
+          workspace_jit = Path("/workspace/aiter/jit").resolve()
+
+          kernels = sorted(installed_jit.glob("*.so"))
+          if not kernels:
+              raise SystemExit(f"No prebuilt kernels found in {installed_jit}")
+
+          workspace_jit.mkdir(parents=True, exist_ok=True)
+          for kernel in kernels:
+              copy2(kernel, workspace_jit / kernel.name)
+
+          print(
+              f"Synced {len(kernels)} prebuilt kernels from {installed_jit} "
+              f"to {workspace_jit}"
+          )
+          PY
 
       - name: Install triton
         run: |

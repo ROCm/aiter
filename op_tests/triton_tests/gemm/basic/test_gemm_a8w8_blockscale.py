@@ -113,7 +113,6 @@ def generate_gemm_a8w8_blockscale_inputs(
         y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
 
     return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
-    return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
 
 
 @pytest.mark.parametrize(
