@@ -442,8 +442,8 @@ _DLPACK_SAFE = (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
 
 
 def _current_stream():
-    """Return a launch stream, or a dummy stream for CPU compile-only AOT."""
-    if os.environ.get("COMPILE_ONLY") == "1" and not torch.cuda.is_available():
+    """Return a launch stream, or a dummy stream for compile-only AOT."""
+    if os.environ.get("COMPILE_ONLY") == "1":
         return 0
     return torch.cuda.current_stream()
 
