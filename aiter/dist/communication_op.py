@@ -43,9 +43,11 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     weight_: torch.Tensor,
     eps: float,
     prefill_support: bool = False,
+    use_old_ca: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return get_tp_group().fused_allreduce_rmsnorm(
-        input_, residual_inp_, weight_, eps, prefill_support
+        input_, residual_inp_, weight_, eps, prefill_support,
+        use_old_ca=use_old_ca,
     )
 
 
@@ -55,13 +57,37 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     weight_: torch.Tensor,
     eps: float,
     prefill_support: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    emit_bf16: bool = False,
+    use_old_ca: bool = False,
+):
     return get_tp_group().fused_allreduce_rmsnorm_quant(
         input_,
         residual_inp_,
         weight_,
         eps,
         prefill_support,
+        emit_bf16=emit_bf16,
+        use_old_ca=use_old_ca,
+    )
+
+
+def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    emit_bf16: bool = False,
+):
+    return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        group_size,
+        prefill_support,
+        emit_bf16=emit_bf16,
     )
 
 

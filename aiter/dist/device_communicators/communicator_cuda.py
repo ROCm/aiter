@@ -211,6 +211,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         weight_,
         eps,
         prefill_support: bool = False,
+        use_old_ca: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n = input_.shape[-1]
         total_bytes = input_.numel() * input_.element_size()
@@ -233,7 +234,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     else (total_bytes <= 128 * 1024)
                 )
                 out, res_out = ca_comm.custom_fused_ar_rms(
-                    input_, res_inp_, weight_, eps, use_1stage
+                    input_, res_inp_, weight_, eps, use_1stage,
+                    use_old_ca=use_old_ca,
                 )
                 assert out is not None
                 assert res_out is not None
@@ -262,8 +264,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
         weight_,
         eps,
         prefill_support: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        emit_bf16: bool = False,
+        use_old_ca: bool = False,
+    ):
+        """Fused AR+RMSNorm+per-token FP8 quant, optionally also emitting the
+        pre-quantization bf16/fp16 normed output.
+
+        When ``emit_bf16=False`` returns ``(fp8, residual_out, scale)``.
+        When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` —
+        used by Qwen3.5 sparse MoE so the gate / shared-expert can keep an
+        unquantized view of the same normed activation that the dense
+        gate_up_proj consumes in fp8.
+
+        When ``use_old_ca=True`` the all-reduce half of the fused kernel is
+        swapped for the legacy ("old") custom_all_reduce primitive (start_sync
+        + cross-rank load + end_sync), so the kernel can interleave safely
+        with other old-CA all_reduce calls when SGLang sets
+        SGLANG_USE_AITER_NEW_CA=false. The ``+ add + rmsnorm + quant``
+        epilogue (and the bf16 side-output) is unchanged in either case.
+        """
         total_bytes = input_.numel() * input_.element_size()
+        out = res_out = scale_out = bf16_out = None
+        fused_ok = False
         if (
             int(input_.shape[-1]) in [512, 1024, 2048, 4096]
             and total_bytes <= 4096 * 1024
@@ -274,18 +296,98 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 if self._ar_1stage_override is not None
                 else (total_bytes <= 128 * 1024)
             )
-            out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
-                input_, res_inp_, weight_, eps, use_1stage
+            result = self.ca_comm.custom_fused_ar_rms_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                use_1stage,
+                emit_bf16=emit_bf16,
+                use_old_ca=use_old_ca,
             )
-        else:
+            if result is not None:
+                if emit_bf16:
+                    out, res_out, scale_out, bf16_out = result
+                else:
+                    out, res_out, scale_out = result
+                fused_ok = True
+        if not fused_ok:
             out_, res_out = self.fused_allreduce_rmsnorm(
                 input_, res_inp_, weight_, eps, prefill_support
             )
             hip_quant = get_hip_quant(QuantType.per_Token)
             out, scale_out = hip_quant(out_, quant_dtype=fp8)
+            if emit_bf16:
+                bf16_out = out_
         assert out is not None
         assert res_out is not None
         assert scale_out is not None
+        if emit_bf16:
+            assert bf16_out is not None
+            return out, res_out, scale_out, bf16_out
+        return out, res_out, scale_out
+
+    def fused_allreduce_rmsnorm_quant_per_group(
+        self,
+        input_,
+        res_inp_,
+        weight_,
+        eps,
+        group_size: int = 128,
+        prefill_support: bool = False,
+        emit_bf16: bool = False,
+    ):
+        """Fused AR+RMSNorm+per-group FP8 quant, optionally also emitting the
+        pre-quantization bf16/fp16 normed output.
+
+        When ``emit_bf16=False`` returns ``(fp8, residual_out, scale)``.
+        When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` —
+        used by GDN-style layers that have both an FP8 projection and a bf16
+        gating projection consuming the same normed activation, so they can
+        skip the separate per-group quant kernel entirely (see Qwen3.5).
+        """
+        total_bytes = input_.numel() * input_.element_size()
+        K = int(input_.shape[-1])
+        fused_ok = False
+        out = res_out = scale_out = bf16_out = None
+        if (
+            K % group_size == 0
+            and K <= 16384
+            and total_bytes < 8 * 1024 * 8192
+            and self.world_size != 6
+            and (prefill_support or total_bytes <= 64 * 1024 * 1024)
+        ):
+            use_1stage = (
+                self._ar_1stage_override
+                if self._ar_1stage_override is not None
+                else (total_bytes <= 128 * 1024)
+            )
+            try:
+                result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
+                    input_, res_inp_, weight_, eps, group_size, use_1stage,
+                    emit_bf16=emit_bf16,
+                )
+                if emit_bf16:
+                    out, res_out, scale_out, bf16_out = result
+                else:
+                    out, res_out, scale_out = result
+                fused_ok = True
+            except Exception:
+                pass
+        if not fused_ok:
+            out_, res_out = self.fused_allreduce_rmsnorm(
+                input_, res_inp_, weight_, eps, prefill_support
+            )
+            hip_quant = get_hip_quant(QuantType.per_1x128)
+            out, scale_out = hip_quant(out_, quant_dtype=fp8)
+            if emit_bf16:
+                bf16_out = out_
+        assert out is not None
+        assert res_out is not None
+        assert scale_out is not None
+        if emit_bf16:
+            assert bf16_out is not None
+            return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
