@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
-Emit mha_performance_comparison.md: MFMA vs JAX vs TE/CK reference tables plus ck_pr_6764 timings.
+Emit markdown for MHA performance comparisons.
 
-Reads timings CSV: seq,fwd_ms,bwd_ms (from run_mha_performance_comparison.sh).
+--kind self_attn: MFMA / JAX / TE·CK reference + ck_pr_6764 (CSV: seq,fwd_ms,bwd_ms).
+
+--kind cross_attn: cross-attention ck_pr_6764 (CSV: batch,s_kv,fwd_ms,bwd_ms[,group_fwd]; legacy: s_kv,... defaults batch=2048).
+  Optional --jax-timings: batch,s_kv,jax_fwd_ms,jax_bwd_ms. Section order follows first occurrence of each batch in the timings CSV (matches shell sweep order).
 """
 from __future__ import annotations
 
@@ -141,7 +144,7 @@ def geom_mean_ratios(ratios: list[float]) -> float:
     return math.exp(sum(logs) / len(logs))
 
 
-def load_timings(path: Path) -> dict[int, tuple[float | None, float | None]]:
+def load_self_timings(path: Path) -> dict[int, tuple[float | None, float | None]]:
     out: dict[int, tuple[float | None, float | None]] = {}
     with path.open(newline="") as f:
         for row in csv.DictReader(f):
@@ -158,32 +161,101 @@ def load_timings(path: Path) -> dict[int, tuple[float | None, float | None]]:
     return out
 
 
+def load_jax_cross_timings(path: Path) -> tuple[dict[tuple[int, int], tuple[float, float]], dict[int, tuple[float, float]]]:
+    """Return (jax_by_batch_skv, jax_by_skv_legacy_no_batch_column)."""
+    by_bs: dict[tuple[int, int], tuple[float, float]] = {}
+    by_p: dict[int, tuple[float, float]] = {}
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or ()
+        has_batch = "batch" in fields
+        for row in reader:
+            p = int(row["s_kv"])
+            try:
+                jf = float(row["jax_fwd_ms"]) if row.get("jax_fwd_ms", "").strip() else 0.0
+                jb = float(row["jax_bwd_ms"]) if row.get("jax_bwd_ms", "").strip() else 0.0
+            except ValueError:
+                continue
+            if has_batch and row.get("batch", "").strip().isdigit():
+                b = int(row["batch"])
+                by_bs[(b, p)] = (jf, jb)
+            else:
+                by_p[p] = (jf, jb)
+    return by_bs, by_p
+
+
+def load_cross_timings(ck_path: Path, jax_path: Path | None = None) -> tuple[list[dict[str, str | int | float | None]], list[int]]:
+    rows: list[dict[str, str | int | float | None]] = []
+    batch_order: list[int] = []
+    seen_batch: set[int] = set()
+    with ck_path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or ()
+        has_batch = "batch" in fields
+        for row in reader:
+            p = int(row["s_kv"])
+            b_raw = row.get("batch", "").strip() if has_batch else ""
+            batch = int(b_raw) if b_raw.isdigit() else 2048
+            if batch not in seen_batch:
+                seen_batch.add(batch)
+                batch_order.append(batch)
+            try:
+                fwd = float(row["fwd_ms"]) if row.get("fwd_ms", "").strip() else None
+            except ValueError:
+                fwd = None
+            try:
+                bwd = float(row["bwd_ms"]) if row.get("bwd_ms", "").strip() else None
+            except ValueError:
+                bwd = None
+            gf = int(row["group_fwd"]) if row.get("group_fwd", "").strip().isdigit() else 0
+            rows.append({"batch": batch, "s_kv": p, "fwd_ms": fwd, "bwd_ms": bwd, "group_fwd": gf})
+    rows.sort(key=lambda r: (int(r["batch"]), int(r["s_kv"])))
+
+    if jax_path is not None and jax_path.exists():
+        jm_bs, jm_p = load_jax_cross_timings(jax_path)
+        for r in rows:
+            b, p = int(r["batch"]), int(r["s_kv"])
+            if (b, p) in jm_bs:
+                r["jax_fwd_ms"], r["jax_bwd_ms"] = jm_bs[(b, p)]
+            elif p in jm_p:
+                r["jax_fwd_ms"], r["jax_bwd_ms"] = jm_p[p]
+    return rows, batch_order
+
+
 def fmt_ms(v: float | None) -> str:
     if v is None:
         return "—"
     return f"{v:.3f}"
 
 
-def write_md(timings: dict[int, tuple[float | None, float | None]], out: Path) -> None:
+def fmt_ck_vs_mfma(ck: float | None, mfma: float) -> str:
+    """Time ratio ck_pr_6764 / MFMA (>1 means ck slower than MFMA reference)."""
+    if ck is None or ck <= 0 or mfma <= 0:
+        return "—"
+    return f"{ck / mfma:.2f}x"
+
+
+def write_self_attn_md(timings: dict[int, tuple[float | None, float | None]], out: Path) -> None:
     lines: list[str] = [
-        "# Performance Comparison: MFMA Kernel vs JAX vs TransformerEngine (CK) vs ck_pr_6764",
+        "# Performance Comparison: MFMA Kernel vs JAX vs TransformerEngine (CK) vs ck_pr_6764 (self-attention)",
         "",
         "**Config:** bs=2048, nheads=32, hdim=128, bfloat16, causal=False, seqlen_q == seqlen_kv",
         "",
         "**MFMA kernel selection:** mfma_4x4 for seq 1–4, mfma_16x16 for seq 5–17",
         "",
-        "**ck_pr_6764:** measured with `run_mha_performance_comparison.sh` (asm v2 `fwd_v3=0`, `bwd_v3=0`, CK path).",
+        "**ck_pr_6764:** `run_mha_performance_comparison_self_attn.sh` (asm v2 `fwd_v3=0`, `bwd_v3=0`).",
         "",
         "## Forward Pass (mean time in ms)",
         "",
-        "| seq | JAX (ms) | TE/CK (ms) | MFMA (ms) | kernel | vs JAX | vs TE/CK | ck_pr_6764 (ms) |",
-        "|----:|---------:|-----------:|----------:|:-------|-------:|---------:|----------------:|",
+        "| seq | JAX (ms) | TE/CK (ms) | MFMA (ms) | kernel | vs JAX | vs TE/CK | ck_pr_6764 (ms) | ck vs MFMA |",
+        "|----:|---------:|-----------:|----------:|:-------|-------:|---------:|----------------:|-----------:|",
     ]
 
     mfma_fwd_rat_jax: list[float] = []
     mfma_fwd_rat_te: list[float] = []
     ck_fwd_rat_jax: list[float] = []
     ck_fwd_rat_te: list[float] = []
+    ck_fwd_vs_mfma: list[float] = []
 
     for s in range(1, 18):
         jax, te, mfma = JAX_FWD_MS[s], TE_CK_FWD_MS[s], MFMA_FWD_MS[s]
@@ -192,26 +264,29 @@ def write_md(timings: dict[int, tuple[float | None, float | None]], out: Path) -
         mfma_fwd_rat_te.append(rt)
         ck_f, _ = timings.get(s, (None, None))
         ck_col = fmt_ms(ck_f)
+        vm = fmt_ck_vs_mfma(ck_f, mfma)
         if ck_f is not None and ck_f > 0:
             ck_fwd_rat_jax.append(jax / ck_f)
             ck_fwd_rat_te.append(te / ck_f)
+            ck_fwd_vs_mfma.append(ck_f / mfma)
         lines.append(
             f"| {s} | {jax:.3f} | {te:.3f} | {mfma:.3f} | {mfma_fwd_kernel(s)} | "
-            f"{rj:.2f}x | {rt:.2f}x | {ck_col} |"
+            f"{rj:.2f}x | {rt:.2f}x | {ck_col} | {vm} |"
         )
 
     lines += [
         "",
         "## Backward Pass (mean time in ms)",
         "",
-        "| seq | JAX (ms) | TE/CK (ms) | MFMA (ms) | vs JAX | vs TE/CK | ck_pr_6764 (ms) |",
-        "|----:|---------:|-----------:|----------:|-------:|---------:|----------------:|",
+        "| seq | JAX (ms) | TE/CK (ms) | MFMA (ms) | vs JAX | vs TE/CK | ck_pr_6764 (ms) | ck vs MFMA |",
+        "|----:|---------:|-----------:|----------:|-------:|---------:|----------------:|-----------:|",
     ]
 
     mfma_bwd_rat_jax: list[float] = []
     mfma_bwd_rat_te: list[float] = []
     ck_bwd_rat_jax: list[float] = []
     ck_bwd_rat_te: list[float] = []
+    ck_bwd_vs_mfma: list[float] = []
 
     for s in range(1, 18):
         jax, te, mfma = JAX_BWD_MS[s], TE_CK_BWD_MS[s], MFMA_BWD_MS[s]
@@ -220,11 +295,13 @@ def write_md(timings: dict[int, tuple[float | None, float | None]], out: Path) -
         mfma_bwd_rat_te.append(rt)
         _, ck_b = timings.get(s, (None, None))
         ck_col = fmt_ms(ck_b)
+        vm = fmt_ck_vs_mfma(ck_b, mfma)
         if ck_b is not None and ck_b > 0:
             ck_bwd_rat_jax.append(jax / ck_b)
             ck_bwd_rat_te.append(te / ck_b)
+            ck_bwd_vs_mfma.append(ck_b / mfma)
         lines.append(
-            f"| {s} | {jax:.3f} | {te:.3f} | {mfma:.3f} | {rj:.2f}x | {rt:.2f}x | {ck_col} |"
+            f"| {s} | {jax:.3f} | {te:.3f} | {mfma:.3f} | {rj:.2f}x | {rt:.2f}x | {ck_col} | {vm} |"
         )
 
     gj_mfma_f = geom_mean_ratios(mfma_fwd_rat_jax)
@@ -249,19 +326,23 @@ def write_md(timings: dict[int, tuple[float | None, float | None]], out: Path) -
     if len(ck_fwd_rat_jax) == 17:
         gj = geom_mean_ratios(ck_fwd_rat_jax)
         gt = geom_mean_ratios(ck_fwd_rat_te)
+        gm = geom_mean_ratios(ck_fwd_vs_mfma)
         lines += [
             "### Forward (ck_pr_6764, geometric mean vs references)",
             f"- **vs JAX:** ~{gj:.1f}x",
             f"- **vs TE/CK:** ~{gt:.1f}x",
+            f"- **ck vs MFMA** (time ratio): ~{gm:.1f}x",
             "",
         ]
     if len(ck_bwd_rat_jax) == 17:
         gj = geom_mean_ratios(ck_bwd_rat_jax)
         gt = geom_mean_ratios(ck_bwd_rat_te)
+        gm = geom_mean_ratios(ck_bwd_vs_mfma)
         lines += [
             "### Backward (ck_pr_6764, geometric mean vs references)",
             f"- **vs JAX:** ~{gj:.1f}x",
             f"- **vs TE/CK:** ~{gt:.1f}x",
+            f"- **ck vs MFMA** (time ratio): ~{gm:.1f}x",
             "",
         ]
 
@@ -273,10 +354,128 @@ def write_md(timings: dict[int, tuple[float | None, float | None]], out: Path) -
         "- MFMA backward uses mfma_16x16x16 for all sequence lengths",
         "- Forward speedup columns (vs JAX / vs TE/CK) are reference_mean / MFMA time (higher = MFMA faster)",
         "- Backward vs columns use the same ratio convention as the MFMA reference table",
-        "- Backward seq=1 is slower than JAX in the MFMA reference because JAX uses a highly optimized scalar path for single-token attention",
-        "- **ck_pr_6764** timings are produced by this repo’s MHA v2 benchmark (`mask=0`, batch layout BHSD)",
+        "- **ck vs MFMA** is ck_pr_6764 wall time / MFMA reference time (<1 means ck is faster than MFMA column)",
+        "- **ck_pr_6764** timings: `mask=0`, BHSD (`iperm=1`, `operm=1`)",
         "",
     ]
+
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def fmt_speedup_jax_over_ck(jax_ms: float | None, ck_ms: float | None) -> str:
+    """jax_ms / ck_ms (>1 means ck_pr_6764 is faster than JAX unfused)."""
+    if jax_ms is None or ck_ms is None or jax_ms <= 0 or ck_ms <= 0:
+        return "—"
+    return f"{jax_ms / ck_ms:.2f}x"
+
+
+def write_cross_attn_md(
+    rows: list[dict[str, str | int | float | None]],
+    out: Path,
+    batch_order: list[int],
+) -> None:
+    if not batch_order:
+        batch_order = sorted({int(r["batch"]) for r in rows})
+    any_group = any(int(r.get("group_fwd") or 0) == 1 for r in rows)
+
+    lines: list[str] = [
+        "# Cross-attention: CK vs JAX unfused",
+        "",
+        "**Layout:** CK **BHSD** (`benchmark_mha_fwd.cpp`, `benchmark_mha_bwd.cpp`: `-iperm=1 -operm=1`). JAX unfused **BSHD** (`jax_unfused_attention.py`).",
+        "",
+        "**Files & run:**",
+        "- `run_mha_performance_comparison_cross_attn.sh` — CK + optional JAX, then `write_mha_performance_comparison_md.py --kind cross_attn`. From repo root: `cd op_tests/cpp/mha && ./run_mha_performance_comparison_cross_attn.sh`.",
+        "- `run_jax_unfused_cross_attn_benchmark.py` — JAX timings only (env `JAX_UNFUSED_*` set by the shell).",
+        "",
+        "`jax/ck` = jax_time / ck_time (>1 ⇒ CK faster).",
+        "",
+        "Each **Configuration *n*** is one batch size **B**; numbering follows the order of batch blocks in the timing CSV (same as `CROSS_ATTN_BATCHES` in `run_mha_performance_comparison_cross_attn.sh` when that script produced the CSV).",
+        "",
+    ]
+    if any_group:
+        lines += [
+            "> Some rows used `CROSS_ATTN_GROUP_FWD=1` (forward group mode); backward stays uniform `s_kv=P`.",
+            "",
+        ]
+
+    for idx, b in enumerate(batch_order, start=1):
+        batch_rows = sorted((r for r in rows if int(r["batch"]) == b), key=lambda r: int(r["s_kv"]))
+        has_jax_b = any(r.get("jax_fwd_ms") is not None for r in batch_rows)
+
+        lines += [f"## Configuration {idx} — B={b}", ""]
+
+        lines += [
+            "### Forward",
+            "",
+            "**CK:** `benchmark_mha_fwd`, bf16, BHSD, **B** as in section title, `s_q=1`, `s_kv=P`, `h=32`, `d=128`, `mask=0`, `fwd_v3=0`; warmup/repeat from `run_mha_performance_comparison_cross_attn.sh`.",
+            "",
+            "**JAX:** `run_jax_unfused_cross_attn_benchmark.py` + `jax_unfused_attention.py`, BSHD, same **B** / `s_q` / `s_kv` / `h` / `d`; non-causal; softmax `1/sqrt(d)` when `JAX_UNFUSED_SM_SCALE=ck`.",
+            "",
+        ]
+        if has_jax_b:
+            lines += [
+                "| s_kv (P) | ck fwd (ms) | jax unfused fwd (ms) | jax/ck fwd | group fwd |",
+                "|---------:|--------------:|---------------------:|-----------:|:---------:|",
+            ]
+            for r in batch_rows:
+                p = int(r["s_kv"])
+                gf = "yes" if int(r.get("group_fwd") or 0) == 1 else "no"
+                fv = r.get("fwd_ms")
+                jf = r.get("jax_fwd_ms")
+                ck_f = float(fv) if isinstance(fv, (int, float)) else None
+                jax_f = float(jf) if isinstance(jf, (int, float)) else None
+                lines.append(
+                    f"| {p} | {fmt_ms(ck_f)} | {fmt_ms(jax_f)} | {fmt_speedup_jax_over_ck(jax_f, ck_f)} | {gf} |"
+                )
+        else:
+            lines += [
+                "| s_kv (P) | ck fwd (ms) | group fwd |",
+                "|---------:|--------------:|:---------:|",
+            ]
+            for r in batch_rows:
+                p = int(r["s_kv"])
+                gf = "yes" if int(r.get("group_fwd") or 0) == 1 else "no"
+                fv = r.get("fwd_ms")
+                fwd_s = fmt_ms(float(fv)) if isinstance(fv, (int, float)) else "—"
+                lines.append(f"| {p} | {fwd_s} | {gf} |")
+
+        lines += [
+            "",
+            "### Backward",
+            "",
+            "**CK:** `benchmark_mha_bwd`, bf16, BHSD, **B** as in section title, `s_q=1`, `s_kv=P`, `h=32`, `d=128`, `mask=0`, `bwd_v3=0`, `mode=0`; warmup/repeat from same shell.",
+            "",
+            "**JAX:** same script as forward; `vjp` on unfused forward, then `jit(pullback)` timed for `do`.",
+            "",
+        ]
+        if has_jax_b:
+            lines += [
+                "| s_kv (P) | ck bwd (ms) | jax unfused bwd (ms) | jax/ck bwd | group fwd |",
+                "|---------:|--------------:|---------------------:|-----------:|:---------:|",
+            ]
+            for r in batch_rows:
+                p = int(r["s_kv"])
+                gf = "yes" if int(r.get("group_fwd") or 0) == 1 else "no"
+                bv = r.get("bwd_ms")
+                jb = r.get("jax_bwd_ms")
+                ck_b = float(bv) if isinstance(bv, (int, float)) else None
+                jax_b = float(jb) if isinstance(jb, (int, float)) else None
+                lines.append(
+                    f"| {p} | {fmt_ms(ck_b)} | {fmt_ms(jax_b)} | {fmt_speedup_jax_over_ck(jax_b, ck_b)} | {gf} |"
+                )
+        else:
+            lines += [
+                "| s_kv (P) | ck bwd (ms) | group fwd |",
+                "|---------:|--------------:|:---------:|",
+            ]
+            for r in batch_rows:
+                p = int(r["s_kv"])
+                gf = "yes" if int(r.get("group_fwd") or 0) == 1 else "no"
+                bv = r.get("bwd_ms")
+                bwd_s = fmt_ms(float(bv)) if isinstance(bv, (int, float)) else "—"
+                lines.append(f"| {p} | {bwd_s} | {gf} |")
+
+        lines.append("")
 
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -285,20 +484,34 @@ def main() -> None:
     here = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
-        "--timings",
-        type=Path,
+        "--kind",
+        choices=("self_attn", "cross_attn"),
         required=True,
-        help="CSV with columns seq,fwd_ms,bwd_ms",
     )
+    ap.add_argument("--timings", type=Path, required=True, help="Input timings CSV")
     ap.add_argument(
-        "--out",
+        "--jax-timings",
         type=Path,
-        default=here / "mha_performance_comparison.md",
-        help="Output markdown path",
+        default=None,
+        help="Optional JAX unfused CSV (cross_attn): batch,s_kv,jax_fwd_ms,jax_bwd_ms (legacy: s_kv,jax_fwd_ms,jax_bwd_ms)",
     )
+    ap.add_argument("--out", type=Path, default=None, help="Output markdown path")
     args = ap.parse_args()
-    timings = load_timings(args.timings)
-    write_md(timings, args.out)
+
+    if args.out is None:
+        args.out = (
+            here / "mha_performance_comparison_self_attn.md"
+            if args.kind == "self_attn"
+            else here / "mha_performance_comparison_cross_attn.md"
+        )
+
+    if args.kind == "self_attn":
+        write_self_attn_md(load_self_timings(args.timings), args.out)
+    else:
+        jax_p = args.jax_timings if args.jax_timings is not None else None
+        rows, batch_order = load_cross_timings(args.timings, jax_p)
+        write_cross_attn_md(rows, args.out, batch_order)
+
     print(f"wrote {args.out}")
 
 

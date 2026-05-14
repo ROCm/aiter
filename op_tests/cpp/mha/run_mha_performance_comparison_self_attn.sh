@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# Single entry: same problem shape as the published MFMA vs JAX vs TE/CK table —
+# Self-attention benchmark (published MFMA / JAX / TE·CK table shape):
 #   bs=2048, nheads=32, hdim=128, bf16, causal=False (mask=0), seqlen_q == seqlen_kv.
-# Runs asm v2 (-fwd_v3=0 -bwd_v3=0), seq SEQ_MIN..SEQ_MAX (default 1–17).
+# Asm v2 (-fwd_v3=0 -bwd_v3=0), seq SEQ_MIN..SEQ_MAX (default 1–17).
 #
-# Output: mha_performance_comparison.md (only persistent artifact from this script).
+# Output: mha_performance_comparison_self_attn.md
 #
-#   cd op_tests/cpp/mha && ./run_mha_performance_comparison.sh
+#   cd op_tests/cpp/mha && ./run_mha_performance_comparison_self_attn.sh
 #
 set -euo pipefail
 
@@ -22,7 +22,7 @@ PYTHON="${PYTHON:-python3}"
 EXT="$SCRIPT_DIR/extract_mha_timing.py"
 SEQ_MIN="${SEQ_MIN:-1}"
 SEQ_MAX="${SEQ_MAX:-17}"
-OUT_MD="${OUT_MD:-$SCRIPT_DIR/mha_performance_comparison.md}"
+OUT_MD="${OUT_MD:-$SCRIPT_DIR/mha_performance_comparison_self_attn.md}"
 
 TIMINGS_CSV=$(mktemp)
 trap 'rm -f "$TIMINGS_CSV"' EXIT
@@ -54,7 +54,7 @@ echo "seq,fwd_ms,bwd_ms" > "$TIMINGS_CSV"
 echo "AITER_ASM_DIR=$AITER_ASM_DIR"
 
 for ((s = SEQ_MIN; s <= SEQ_MAX; s++)); do
-    echo "======== ck_pr_6764 bench: b=2048 h=32 d=128 bf16 s=${s} (v2) ========"
+    echo "======== self-attn ck_pr_6764: b=2048 h=32 d=128 bf16 s=${s} (v2) ========"
 
     fwd_out=$(
         "$FWD_EXE" \
@@ -80,6 +80,7 @@ for ((s = SEQ_MIN; s <= SEQ_MAX; s++)); do
 done
 
 "$PYTHON" "$SCRIPT_DIR/write_mha_performance_comparison_md.py" \
+    --kind self_attn \
     --timings "$TIMINGS_CSV" \
     --out "$OUT_MD"
 
