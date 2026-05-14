@@ -760,7 +760,12 @@ def flydsl_moe_stage1(
             )
 
     if _is_splitk:
-        torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
+        _is_a16w4 = a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")
+        if _is_a16w4:
+            # A16W4 split-K kernel uses f32 atomics for partial sums.
+            torch_tmp_out_dtype = torch.float32
+        else:
+            torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
         tmp_out = torch.zeros(
             (token_num, topk, inter_dim * 2), dtype=torch_tmp_out_dtype, device=dev
         )
@@ -988,6 +993,8 @@ def flydsl_moe_stage1(
         )
 
         post_input = tmp_out.view(-1, inter_dim * 2)
+        if post_input.dtype == torch.float32:
+            post_input = post_input.to(dtypes.bf16)
         post_out = out.view(-1, inter_dim)
         post_bias = bias.contiguous() if bias is not None else None
         if bias is not None and act == "swiglu":
