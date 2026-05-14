@@ -9,7 +9,11 @@ import logging
 import torch
 from aiter.ops.flydsl.kernels.attn_bwd_mxfp8_gfx950 import compile_attn_bwd_mxfp8_gfx950
 from utils import run_perftest
-from op_tests.flydsl_tests.test_attn_bwd_mxfp8_gfx950 import run_torch, mx_quant, check_result
+from op_tests.flydsl_tests.test_attn_bwd_mxfp8_gfx950 import (
+    run_torch,
+    mx_quant,
+    check_result,
+)
 from flydsl.runtime.device import get_rocm_arch
 
 logging.basicConfig(level=logging.INFO)
@@ -17,29 +21,38 @@ ARCH = str(get_rocm_arch())
 DEFAULT_BENCH_ITERS = 20
 DEFAULT_BENCH_WARMUP = 3
 
+
 def bench_attn_bwd_flyc(
-    batch, num_heads_q, num_heads_kv, seqlen, head_dim,
-    tile_m, tile_n,
+    batch,
+    num_heads_q,
+    num_heads_kv,
+    seqlen,
+    head_dim,
+    tile_m,
+    tile_n,
     causal,
     test_graph,
     bench_iters: int = DEFAULT_BENCH_ITERS,
     bench_warmup: int = DEFAULT_BENCH_WARMUP,
     waves_per_eu: int = 0,
-    check_correctness: bool = False
+    check_correctness: bool = False,
 ):
     """Attention bwd using the @flyc.kernel / @flyc.jit API."""
     tile_head = head_dim
     print("=" * 80)
-    print(
-        f"[flyc]  Attention Backward Test (Tile: {tile_m}x{tile_n}x{tile_head})"
-    )
+    print(f"[flyc]  Attention Backward Test (Tile: {tile_m}x{tile_n}x{tile_head})")
     print("=" * 80)
-    
+
     sm_scale = 0.5
     _wpe = int(waves_per_eu) if waves_per_eu else 0
     launch_fn = compile_attn_bwd_mxfp8_gfx950(
-        num_heads_q=num_heads_q, num_heads_kv=num_heads_kv, seqlen=seqlen, head_dim=head_dim,
-        tile_m=tile_m, tile_n=tile_n, tile_head=tile_head,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        seqlen=seqlen,
+        head_dim=head_dim,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_head=tile_head,
         sm_scale=sm_scale,
         causal=causal,
         waves_per_eu=_wpe,
@@ -48,11 +61,36 @@ def bench_attn_bwd_flyc(
 
     device = torch.device("cuda")
     gqa_size = num_heads_q // num_heads_kv
-    q_fp32 = torch.randn(batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
-    k_fp32 = torch.randn(batch, num_heads_kv, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
-    v_fp32 = torch.randn(batch, num_heads_kv, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
-    o_fp32 = torch.randn(batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
-    do_fp32 = torch.randn(batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
+    q_fp32 = (
+        torch.randn(
+            batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
+    k_fp32 = (
+        torch.randn(
+            batch, num_heads_kv, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
+    v_fp32 = (
+        torch.randn(
+            batch, num_heads_kv, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
+    o_fp32 = (
+        torch.randn(
+            batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
+    do_fp32 = (
+        torch.randn(
+            batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
 
     q_fp32_head, q_quant_head, q_scale_head = mx_quant(q_fp32, -1)
     q_fp32_m, q_quant_m, q_scale_m = mx_quant(q_fp32, -2)
@@ -76,12 +114,52 @@ def bench_attn_bwd_flyc(
     D = (o_fp32 * do_fp32).sum(dim=-1)
 
     if check_correctness:
-        dq_ref, dk_ref, dv_ref = run_torch(q_fp32_head, q_fp32_m, k_fp32_head, k_fp32_n, v_fp32, do_fp32_head, do_fp32_m, m, D, sm_scale, causal, gqa_size)
-    dq_fly = torch.zeros((batch, num_heads_q, seqlen, head_dim), dtype=torch.float32, device=device)
-    dk_fly = torch.zeros((batch, num_heads_kv, seqlen, head_dim), dtype=torch.float32, device=device)
-    dv_fly = torch.zeros((batch, num_heads_kv, seqlen, head_dim), dtype=torch.float32, device=device)
+        dq_ref, dk_ref, dv_ref = run_torch(
+            q_fp32_head,
+            q_fp32_m,
+            k_fp32_head,
+            k_fp32_n,
+            v_fp32,
+            do_fp32_head,
+            do_fp32_m,
+            m,
+            D,
+            sm_scale,
+            causal,
+            gqa_size,
+        )
+    dq_fly = torch.zeros(
+        (batch, num_heads_q, seqlen, head_dim), dtype=torch.float32, device=device
+    )
+    dk_fly = torch.zeros(
+        (batch, num_heads_kv, seqlen, head_dim), dtype=torch.float32, device=device
+    )
+    dv_fly = torch.zeros(
+        (batch, num_heads_kv, seqlen, head_dim), dtype=torch.float32, device=device
+    )
 
-    def launch_kernel(dq, dk, dv, q_quant_head, q_scale_head, q_quant_m, q_scale_m, k_quant_head, k_scale_head, k_quant_n, k_scale_n, v, v_scale, do_quant_head, do_scale_head, do_quant_m, do_scale_m, m, D, batch):
+    def launch_kernel(
+        dq,
+        dk,
+        dv,
+        q_quant_head,
+        q_scale_head,
+        q_quant_m,
+        q_scale_m,
+        k_quant_head,
+        k_scale_head,
+        k_quant_n,
+        k_scale_n,
+        v,
+        v_scale,
+        do_quant_head,
+        do_scale_head,
+        do_quant_m,
+        do_scale_m,
+        m,
+        D,
+        batch,
+    ):
         launch_fn(
             dq.contiguous().view(-1),
             dk.contiguous().view(-1),
@@ -167,7 +245,7 @@ def bench_attn_bwd_flyc(
         do_scale_m,
         m,
         D,
-        batch
+        batch,
     )
 
     dq_fly_fp32 = dq_fly.to(torch.float32)
@@ -179,8 +257,20 @@ def bench_attn_bwd_flyc(
         assert check_result(dk_fly_fp32, dk_ref, rtol=0.01, atol=0.01)
         assert check_result(dv_fly_fp32, dv_ref, rtol=0.01, atol=0.01)
 
-    bytes_moved = (4 + 4) * batch * num_heads_q * seqlen * head_dim + (3 + 2 * 4) * batch * num_heads_kv * seqlen * head_dim + 2 * 4 * batch * num_heads_q * seqlen
-    flops = batch * num_heads_q * (5 * 2 * seqlen * seqlen * head_dim + 5 * seqlen * seqlen + 2 * 3 * seqlen * seqlen)
+    bytes_moved = (
+        (4 + 4) * batch * num_heads_q * seqlen * head_dim
+        + (3 + 2 * 4) * batch * num_heads_kv * seqlen * head_dim
+        + 2 * 4 * batch * num_heads_q * seqlen
+    )
+    flops = (
+        batch
+        * num_heads_q
+        * (
+            5 * 2 * seqlen * seqlen * head_dim
+            + 5 * seqlen * seqlen
+            + 2 * 3 * seqlen * seqlen
+        )
+    )
     if causal:
         flops /= 2
     tflops = flops / (us / 1e6) / 1e12
@@ -209,12 +299,17 @@ if __name__ == "__main__":
     torch.set_default_device("cuda")
 
     bench_attn_bwd_flyc(
-        batch=args.batch, num_heads_q=args.num_heads_q, num_heads_kv=args.num_heads_kv, seqlen=args.seqlen, head_dim=args.head,
-        tile_m=args.tile_m, tile_n=args.tile_n,
+        batch=args.batch,
+        num_heads_q=args.num_heads_q,
+        num_heads_kv=args.num_heads_kv,
+        seqlen=args.seqlen,
+        head_dim=args.head,
+        tile_m=args.tile_m,
+        tile_n=args.tile_n,
         causal=args.causal,
         test_graph=bool(args.test_graph),
         bench_iters=args.num_iters,
         bench_warmup=args.num_warmup,
         waves_per_eu=int(args.waves_per_eu),
-        check_correctness=args.check_correctness
+        check_correctness=args.check_correctness,
     )

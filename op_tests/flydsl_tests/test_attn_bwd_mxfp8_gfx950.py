@@ -19,6 +19,7 @@ if not torch.cuda.is_available():
 
 ARCH = str(get_rocm_arch())
 
+
 def check_result(test_out, ref_out, atol=0.01, rtol=0.01, pass_pct=95.0):
     """Compare outputs and print result. Returns (passed, max_delta, pct_close)."""
     close_mask = torch.isclose(test_out.float(), ref_out.float(), atol=atol, rtol=rtol)
@@ -26,7 +27,7 @@ def check_result(test_out, ref_out, atol=0.01, rtol=0.01, pass_pct=95.0):
     passed = pct_close > pass_pct
     if passed:
         return True
-    
+
     max_delta = (ref_out.float() - test_out.float()).abs().max().item()
     print(
         f"  max_delta={max_delta:.4f}, {pct_close:.1f}% close (atol={atol}, rtol={rtol})"
@@ -42,7 +43,20 @@ def mx_quant(x, dim=-1):
     return x_fp32.contiguous(), x_fp8.contiguous(), x_scale.contiguous()
 
 
-def run_torch(q_fp32_head, q_fp32_m, k_fp32_head, k_fp32_n, v, do_fp32_head, do_fp32_m, m, D, sm_scale, causal, gqa_size):
+def run_torch(
+    q_fp32_head,
+    q_fp32_m,
+    k_fp32_head,
+    k_fp32_n,
+    v,
+    do_fp32_head,
+    do_fp32_m,
+    m,
+    D,
+    sm_scale,
+    causal,
+    gqa_size,
+):
     batch = q_fp32_head.shape[0]
     num_heads_q = q_fp32_head.shape[1]
     num_heads_kv = num_heads_q // gqa_size
@@ -55,10 +69,10 @@ def run_torch(q_fp32_head, q_fp32_m, k_fp32_head, k_fp32_n, v, do_fp32_head, do_
     if causal:
         mask = torch.tril(torch.ones((seqlen, seqlen), device=device))
         p[:, :, mask == 0] = 0.0
-    
+
     ppT, _, _ = mx_quant(p, -2)
     ppT = ppT.transpose(-2, -1)
-    dv =  torch.matmul(ppT, do_fp32_m)
+    dv = torch.matmul(ppT, do_fp32_m)
     dp = torch.matmul(do_fp32_head, v_f32.transpose(-2, -1))
     ds = p * (dp - D[:, :, :, None])
     dsT, _, _ = mx_quant(ds, -1)
@@ -76,11 +90,7 @@ def run_torch(q_fp32_head, q_fp32_m, k_fp32_head, k_fp32_n, v, do_fp32_head, do_
 @pytest.mark.parametrize("batch", [1, 4])
 @pytest.mark.parametrize(
     "num_heads_q, num_heads_kv",
-    [
-        (48, 48),
-        (64, 8),
-        (80, 20)
-    ],
+    [(48, 48), (64, 8), (80, 20)],
 )
 @pytest.mark.parametrize("seqlen", [128, 1024, 1056, 1152, 4096])
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -88,8 +98,13 @@ def run_torch(q_fp32_head, q_fp32_m, k_fp32_head, k_fp32_n, v, do_fp32_head, do_
 @pytest.mark.parametrize("tile_n", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_attn_bwd_flyc(
-    batch, num_heads_q, num_heads_kv, seqlen, head_dim,
-    tile_m, tile_n,
+    batch,
+    num_heads_q,
+    num_heads_kv,
+    seqlen,
+    head_dim,
+    tile_m,
+    tile_n,
     causal,
     waves_per_eu: int = 0,
 ):
@@ -102,9 +117,13 @@ def test_attn_bwd_flyc(
     sm_scale = 0.5
     _wpe = int(waves_per_eu)
     launch_fn = compile_attn_bwd_mxfp8_gfx950(
-        num_heads_q=num_heads_q, num_heads_kv=num_heads_kv,
-        seqlen=seqlen, head_dim=head_dim,
-        tile_m=tile_m, tile_n=tile_n, tile_head=tile_head,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        seqlen=seqlen,
+        head_dim=head_dim,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_head=tile_head,
         sm_scale=sm_scale,
         causal=causal,
         waves_per_eu=_wpe,
@@ -112,10 +131,30 @@ def test_attn_bwd_flyc(
 
     device = torch.device("cuda")
     gqa_size = num_heads_q // num_heads_kv
-    q_fp32 = torch.randn(batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
-    k_fp32 = torch.randn(batch, num_heads_kv, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
-    v_fp32 = torch.randn(batch, num_heads_kv, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
-    do_fp32 = torch.randn(batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32) * 0.5
+    q_fp32 = (
+        torch.randn(
+            batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
+    k_fp32 = (
+        torch.randn(
+            batch, num_heads_kv, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
+    v_fp32 = (
+        torch.randn(
+            batch, num_heads_kv, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
+    do_fp32 = (
+        torch.randn(
+            batch, num_heads_q, seqlen, head_dim, device=device, dtype=torch.float32
+        )
+        * 0.5
+    )
 
     q_fp32_head, q_quant_head, q_scale_head = mx_quant(q_fp32, -1)
     q_fp32_m, q_quant_m, q_scale_m = mx_quant(q_fp32, -2)
@@ -140,13 +179,53 @@ def test_attn_bwd_flyc(
     m = m + torch.log(l)
     D = (o_fp32 * do_fp32).sum(dim=-1)
 
-    dq_ref, dk_ref, dv_ref = run_torch(q_fp32_head, q_fp32_m, k_fp32_head, k_fp32_n, v_fp32, do_fp32_head, do_fp32_m, m, D, sm_scale, causal, gqa_size)
+    dq_ref, dk_ref, dv_ref = run_torch(
+        q_fp32_head,
+        q_fp32_m,
+        k_fp32_head,
+        k_fp32_n,
+        v_fp32,
+        do_fp32_head,
+        do_fp32_m,
+        m,
+        D,
+        sm_scale,
+        causal,
+        gqa_size,
+    )
 
-    dq_fly = torch.zeros((batch, num_heads_q, seqlen, head_dim), dtype=torch.float32, device=device)
-    dk_fly = torch.zeros((batch, num_heads_kv, seqlen, head_dim), dtype=torch.float32, device=device)
-    dv_fly = torch.zeros((batch, num_heads_kv, seqlen, head_dim), dtype=torch.float32, device=device)
+    dq_fly = torch.zeros(
+        (batch, num_heads_q, seqlen, head_dim), dtype=torch.float32, device=device
+    )
+    dk_fly = torch.zeros(
+        (batch, num_heads_kv, seqlen, head_dim), dtype=torch.float32, device=device
+    )
+    dv_fly = torch.zeros(
+        (batch, num_heads_kv, seqlen, head_dim), dtype=torch.float32, device=device
+    )
 
-    def launch_kernel(dq, dk, dv, q_quant_head, q_scale_head, q_quant_m, q_scale_m, k_quant_head, k_scale_head, k_quant_n, k_scale_n, v, v_scale, do_quant_head, do_scale_head, do_quant_m, do_scale_m, m, D, batch):
+    def launch_kernel(
+        dq,
+        dk,
+        dv,
+        q_quant_head,
+        q_scale_head,
+        q_quant_m,
+        q_scale_m,
+        k_quant_head,
+        k_scale_head,
+        k_quant_n,
+        k_scale_n,
+        v,
+        v_scale,
+        do_quant_head,
+        do_scale_head,
+        do_quant_m,
+        do_scale_m,
+        m,
+        D,
+        batch,
+    ):
         launch_fn(
             dq.contiguous().view(-1),
             dk.contiguous().view(-1),
@@ -199,7 +278,7 @@ def test_attn_bwd_flyc(
         do_scale_m,
         m,
         D,
-        batch
+        batch,
     )
 
     dq_fly_fp32 = dq_fly.to(torch.float32)
