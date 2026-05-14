@@ -1086,6 +1086,25 @@ def test_mla(
             (cu_num + batch_size - 1) // batch_size, max_split_per_batch
         )
 
+    metadata_max_split_per_batch = max_split_per_batch
+    metadata_kv_granularity = max(page_size, 16)
+    if (
+        get_gfx() == "gfx950"
+        and dtype == dtypes.fp8
+        and kvtype == dtypes.fp8
+        and nhead == 32
+        and max_seqlen_qo == 4
+        and page_size == 1
+        and is_experimental_enabled()
+    ):
+        hk_h32_min_split_per_batch = int(
+            os.environ.get("AITER_HK_H32_MIN_SPLIT_PER_BATCH", "96")
+        )
+        metadata_max_split_per_batch = max(
+            max_split_per_batch, hk_h32_min_split_per_batch
+        )
+        metadata_kv_granularity = max(metadata_kv_granularity, 64)
+
     (
         (work_meta_data_size, work_meta_data_type),
         (work_indptr_size, work_indptr_type),
@@ -1101,7 +1120,7 @@ def test_mla(
         kvtype,
         is_sparse=False,
         fast_mode=True if not non_persistent_mode else False,
-        num_kv_splits=max_split_per_batch,
+        num_kv_splits=metadata_max_split_per_batch,
         intra_batch_mode=non_persistent_mode,
     )
 
@@ -1140,18 +1159,18 @@ def test_mla(
         reduce_final_map,
         reduce_partial_map,
         page_size=page_size,
-        kv_granularity=max(page_size, 16),  # for qh32 kv split is disabled
+        kv_granularity=metadata_kv_granularity,
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=True if not non_persistent_mode else False,
-        max_split_per_batch=max_split_per_batch,
+        max_split_per_batch=metadata_max_split_per_batch,
         intra_batch_mode=non_persistent_mode,
         dtype_q=dtype,
         dtype_kv=kvtype,
     )
 
     if os.environ.get("DUMP_MLA_METADATA", ""):
-        kv_gran = max(page_size, 16)
+        kv_gran = metadata_kv_granularity
         max_num_blocks = max(
             (int(seq_lens_kv[i].item()) + kv_gran - 1) // kv_gran
             for i in range(batch_size)

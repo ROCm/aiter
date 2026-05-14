@@ -1229,7 +1229,7 @@ void mi35x_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
         softmax_scale,
         log2_num_qheads};
 
-    const dim3 grid        = dim3(work_indptr.size(0) - 1);
+    const dim3 grid        = dim3(dev_prop.multiProcessorCount);
     const int32_t lds_size = dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy;
 
     kn_mi35x_mla_v32_fwd_decode_m16x8_fp8_fp8<Traits>

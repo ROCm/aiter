@@ -937,16 +937,6 @@ def get_mla_metadata_info_v1(
     if is_hk_m16x4:
         cu_num *= 2
 
-    is_hk_h32_q4 = (
-        get_gfx() == "gfx950"
-        and q_dtype == dtypes.fp8
-        and kv_dtype == dtypes.fp8
-        and num_head_qo == 32
-        and max_seqlen_qo == 4
-        and is_experimental_enabled()
-    )
-    effective_num_kv_splits = max(num_kv_splits, 96) if is_hk_h32_q4 else num_kv_splits
-
     use_qseqlen_fold = (
         get_gfx() == "gfx950"
         and q_dtype == dtypes.fp8
@@ -1026,10 +1016,10 @@ def get_mla_metadata_info_v1(
         return (
             ((2), torch.uint64),  # work_metadata_ptrs
             (cu_num + 1, torch.int32),  # work_indptr
-            ((tile_cnt * effective_num_kv_splits, 8), torch.int32),  # work_info_set
+            ((tile_cnt * num_kv_splits, 8), torch.int32),  # work_info_set
             ((tile_cnt + 1), torch.int32),  # reduce_indptr
             ((tile_cnt, 2), torch.int32),  # reduce_final_map
-            (tile_cnt * effective_num_kv_splits, torch.int32),  # reduce_partial_map
+            (tile_cnt * num_kv_splits, torch.int32),  # reduce_partial_map
         )
 
 
