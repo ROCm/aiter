@@ -521,6 +521,52 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
 }
 
 
+static void _fused_allreduce_rmsnorm_per_tensor_quant(fptr_t _fa,
+                                                       void* inp, void* residual_inp,
+                                                       void* residual_out, void* out,
+                                                       float scale_factor, void* w,
+                                                       AiterDtype dtype, float eps,
+                                                       int m, int n,
+                                                       bool use_1stage)
+{
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+
+#define DISPATCH_AR_FUSION_PT(DTYPE)                                             \
+    fa->dispatchFusedAllReduceRMSNormPerTensorQuant<DTYPE, fp8_type>(            \
+        stream,                                                                   \
+        reinterpret_cast<DTYPE*>(inp),                                            \
+        reinterpret_cast<DTYPE*>(residual_inp),                                   \
+        reinterpret_cast<DTYPE*>(residual_out),                                   \
+        reinterpret_cast<fp8_type*>(out),                                         \
+        scale_factor,                                                             \
+        reinterpret_cast<DTYPE*>(w),                                              \
+        eps,                                                                      \
+        m,                                                                        \
+        n,                                                                        \
+        use_1stage);
+
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp32: {
+        DISPATCH_AR_FUSION_PT(opus::fp32_t)
+        break;
+    }
+    case AITER_DTYPE_fp16: {
+        DISPATCH_AR_FUSION_PT(opus::fp16_t)
+        break;
+    }
+    case AITER_DTYPE_bf16: {
+        DISPATCH_AR_FUSION_PT(opus::bf16_t)
+        break;
+    }
+    default:
+        throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
+    }
+
+#undef DISPATCH_AR_FUSION_PT
+}
+
 void fused_allreduce_rmsnorm_per_tensor_quant(fptr_t _fa,
                                               const aiter_tensor_t& inp,
                                               const aiter_tensor_t& res_inp,
