@@ -76,7 +76,6 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
-AITER_TUNED_CONFIG_MODE = os.getenv("AITER_TUNED_CONFIG_MODE", "full").strip().lower()
 
 
 # config_env start here
@@ -127,12 +126,6 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
 
 
 class AITER_CONFIG(object):
-    def _use_base_tuned_configs(self) -> bool:
-        return AITER_TUNED_CONFIG_MODE in {"base", "light", "lite", "minimal"}
-
-    def _use_smoke_tuned_configs(self) -> bool:
-        return AITER_TUNED_CONFIG_MODE in {"smoke", "ci-smoke", "ci_smoke"}
-
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
         return self.get_config_file(
@@ -330,30 +323,6 @@ class AITER_CONFIG(object):
         from pathlib import Path
 
         if not config_env_file:
-            if self._use_smoke_tuned_configs():
-                smoke_file = (
-                    f"{AITER_ROOT_DIR}/aiter/configs/ci/{tuned_file_name}_smoke.csv"
-                )
-                if os.path.exists(smoke_file):
-                    print(
-                        f"[aiter] tuned config name={tuned_file_name} "
-                        f"mode={AITER_TUNED_CONFIG_MODE} path={smoke_file}"
-                    )
-                    return smoke_file
-                print(
-                    f"[aiter] tuned config name={tuned_file_name} "
-                    f"mode={AITER_TUNED_CONFIG_MODE} smoke_path_missing={smoke_file} "
-                    f"fallback={default_file}"
-                )
-                return default_file
-
-            if self._use_base_tuned_configs():
-                print(
-                    f"[aiter] tuned config name={tuned_file_name} "
-                    f"mode={AITER_TUNED_CONFIG_MODE} path={default_file}"
-                )
-                return default_file
-
             model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
             op_tuned_file_list = [
                 p
