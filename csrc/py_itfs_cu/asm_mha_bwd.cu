@@ -130,18 +130,14 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-    at::Tensor dq_accum;
 
-    if (!deterministic) {
-        if (is_v3_atomic_fp32) {
-            dq_accum = torch::zeros({1, batch_size, num_heads, seqlen_q, head_size_q}, opts.dtype(at::kFloat));
-        } else {
-            // When atomic16, padding dq_accum seqlen to 16x, head dim to 128/192
-            // In this case, dq_accum could have any layout, we set it to be `bhsd`
-            int padded_head_size_q = head_size_q == 192? 192: 128;
-            dq_accum = torch::zeros({1, batch_size, num_heads, (seqlen_q + 15) / 16 * 16, padded_head_size_q}, opts.dtype(q_dtype));
-        }
-    }
+    at::Tensor workspace;
+    auto workspace_alloc = [&workspace, opts](size_t bytes, bool zero_init) -> void* {
+        workspace = zero_init
+                        ? torch::zeros({static_cast<int64_t>(bytes)}, opts.dtype(at::kByte))
+                        : torch::empty({static_cast<int64_t>(bytes)}, opts.dtype(at::kByte));
+        return workspace.data_ptr();
+    };
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -225,13 +221,6 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
             ck_tile::index_t stride_dv = dv_expanded.stride(1);
             ck_tile::index_t nhead_stride_dv = dv_expanded.stride(2);
 
-            // TODO: if dq_acc layout do no harm to performance consider reuse this api
-            // dq_acc: (split, batch_size, nheads, seqlen_q, hdim_q)
-            ck_tile::index_t split_stride_dq_acc = dq_accum.stride(0);
-            ck_tile::long_index_t batch_stride_dq_acc = dq_accum.stride(1);
-            ck_tile::long_index_t nhead_stride_dq_acc = dq_accum.stride(2);
-            ck_tile::index_t stride_dq_acc = dq_accum.stride(3);
-
             float p_undrop = 1.0 - p_dropout;
 
             void *alibi_slopes_ptr = nullptr;
@@ -276,7 +265,6 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                                 dk_expanded.data_ptr(),
                                 dv_expanded.data_ptr(),
                                 nullptr, // dbias
-                                dq_accum.data_ptr(),
                                 nullptr, // sink_ptr (not used in v3 asm path)
                                 nullptr, // d_sink_ptr (not used in v3 asm path)
                                 nullptr, // seqstart_q_ptr (batch mode)
@@ -300,7 +288,6 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                                 stride_o,
                                 0, // stride_randval
                                 stride_do,
-                                stride_dq_acc,
                                 stride_dq,
                                 stride_dk,
                                 stride_dv,
@@ -313,7 +300,6 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                                 0, // nhead_stride_randval
                                 nhead_stride_do,
                                 nhead_stride_lse,
-                                nhead_stride_dq_acc,
                                 nhead_stride_dq,
                                 nhead_stride_dk,
                                 nhead_stride_dv,
@@ -326,17 +312,16 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                                 0, // batch_stride_randval
                                 batch_stride_do,
                                 batch_stride_lse,
-                                batch_stride_dq_acc,
                                 batch_stride_dq,
                                 batch_stride_dk,
                                 batch_stride_dv,
                                 0  , // batch_stride_dbias, FA without dbias
-                                split_stride_dq_acc,
                                 mask.left,
                                 mask.right,
                                 p_dropout,
                                 p_undrop,
-                                drop_seed_offset};
+                                drop_seed_offset,
+                                workspace_alloc};
         }();
 
         float t = aiter::mha_bwd(args, stream_config);
