@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_post_kernel,
     _mhc_post_pre_split_kernel,
     _mhc_reduce_apply_kernel,
+    _mhc_post_pre_reduce_apply_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.mhc_config_utils import (
@@ -24,7 +25,9 @@ _LOGGER = AiterTritonLogger()
 def mhc(
     x: torch.Tensor,
     phi: torch.Tensor,  # Unified phi: (K, n + n + n_squared)
-    alphas: torch.Tensor,
+    alpha_pre: float,
+    alpha_post: float,
+    alpha_res: float,
     bias: torch.Tensor,
     n: int,
     eps: float = 1e-6,
@@ -69,9 +72,7 @@ def mhc(
     Args:
         x:                  (M, n*C) bf16 / fp16 input.
         phi:                (K, N=n+n+n*n) bf16 / fp16; cols ``[pre|post|res]``.
-        alphas:             (3,) fp32 — ``[alpha_pre, alpha_post, alpha_res]``.
-                            Loaded by the kernel via tl.load; no host-side
-                            unpack required.
+        alpha_pre/post/res: per-stream scaling factors.
         bias:               (N,) fp32.
         n:                  stream / manifold dimension.
         eps:                RMS-norm epsilon (default 1e-6).
@@ -115,24 +116,20 @@ def mhc(
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
     BLOCK_C = config.pop("BLOCK_C", min(64, triton.next_power_of_2(C)))
 
-    # `_mhc_reduce_apply_kernel` uses a (num_M_tiles, num_C_tiles + 2) grid:
-    # the apply-pre tiles get pid_c in [0, NUM_C_BLOCKS), and two dedicated
-    # CTAs handle post (pid_c == NUM_C_BLOCKS) and res+Sinkhorn (pid_c ==
-    # NUM_C_BLOCKS + 1). Computed inside the kernel via tl.cdiv(C, BLOCK_C);
-    # no need to pass it explicitly.
+    # Pin h_post to pid_c == 0 and h_res (with the sinkhorn loop) to pid_c == 1
+    # in `_mhc_reduce_apply_kernel`. When only one C-tile per M-tile exists,
+    # fall back to pid_c == 0 doing both. Resolved at compile time via constexpr.
     NUM_C_BLOCKS = triton.cdiv(C, BLOCK_C)
+    RES_PID_C = 0 if NUM_C_BLOCKS == 1 else 1
 
     _LOGGER.info(
         f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} "
-        f"alphas={tuple(alphas.shape)}@{alphas.dtype} "
+        f"alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} "
         f"hc_pre_eps={hc_pre_eps} hc_post_mult_value={hc_post_mult_value} "
         f"sinkhorn_iters={sinkhorn_iters} num_ksplit={num_ksplit} "
         f"BLOCK_M={BLOCK_M} BLOCK_N={BLOCK_N} BLOCK_K={BLOCK_K} BLOCK_C={BLOCK_C} "
-        f"N_TOTAL_POW2={N_TOTAL_POW2} NUM_C_BLOCKS={NUM_C_BLOCKS}"
+        f"N_TOTAL_POW2={N_TOTAL_POW2} RES_PID_C={RES_PID_C}"
     )
-    assert alphas.shape == (
-        3,
-    ), f"alphas shape mismatch: expected (3,), got {tuple(alphas.shape)}"
 
     assert K == K_phi, f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
     assert (
@@ -184,7 +181,6 @@ def mhc(
         # kernel that fuses RMS reduce, all 3 stream activations, and the apply step.
         splitk_block_size = triton.cdiv(K, num_ksplit)
         actual_ksplit = triton.cdiv(K, splitk_block_size)
-        KSPLIT_POW2 = triton.next_power_of_2(actual_ksplit)
 
         acc_partial = torch.empty(
             (num_ksplit, M, N_total), dtype=torch.float32, device=x.device
@@ -220,30 +216,16 @@ def mhc(
             **config,
         )
 
-        # Grid: NUM_M_BLOCKS * NUM_C_BLOCKS apply-pre CTAs +
-        #       NUM_M_BLOCKS_POST_RES * 2 dedicated CTAs (post + res).
-        # The kernel reads NUM_M_BLOCKS_POST_RES as cdiv(M, BLOCK_M_POST_RES),
-        # so the launch grid MUST match — otherwise the trailing post/res
-        # rows never run and their output stays uninitialized.
-        BLOCK_M_POST_RES = 1
-        grid_reduce_apply = (
-            triton.cdiv(M, BLOCK_M) * NUM_C_BLOCKS
-            + triton.cdiv(M, BLOCK_M_POST_RES) * 2,
-        )
-        # `out` is the unified (M, n + n_squared) buffer; the kernel now takes
-        # separate h_post_ptr / h_res_ptr. Pass slice views into `out` so the
-        # kernel writes the same memory it always did — strides come from the
-        # underlying contiguous buffer (stride_M = n + n_squared, stride_N = 1).
-        _h_post_view = out[:, :n]
-        _h_res_view = out[:, n:]
+        grid_reduce_apply = (triton.cdiv(M, BLOCK_M), triton.cdiv(C, BLOCK_C))
         _mhc_reduce_apply_kernel[grid_reduce_apply](
             acc_partial,
             acc_sq_partial,
-            alphas,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
             bias,
             x,
-            _h_post_view,
-            _h_res_view,
+            out,
             layer_input,
             M=M,
             K=K,
@@ -260,10 +242,8 @@ def mhc(
             stride_acc_sq_m=acc_sq_partial.stride(1),
             stride_xm=x.stride(0),
             stride_xk=x.stride(1),
-            stride_hp_m=_h_post_view.stride(0),
-            stride_hp_n=_h_post_view.stride(1),
-            stride_hr_m=_h_res_view.stride(0),
-            stride_hr_n=_h_res_view.stride(1),
+            stride_out_m=out.stride(0),
+            stride_out_n=out.stride(1),
             stride_li_m=layer_input.stride(0),
             stride_li_c=layer_input.stride(1),
             BLOCK_M=BLOCK_M,
@@ -271,9 +251,8 @@ def mhc(
             N_POW2=N_POW2,
             N_POW2_RES=N_POW2_RES,
             ACTUAL_KSPLIT=actual_ksplit,
-            KSPLIT_POW2=KSPLIT_POW2,
-            BLOCK_M_POST_RES=BLOCK_M_POST_RES,
             NUM_SINKHORN_ITERS=sinkhorn_iters,
+            RES_PID_C=RES_PID_C,
             **config,
         )
     else:
@@ -281,7 +260,9 @@ def mhc(
         _mhc_fused_kernel[grid](
             x,
             phi,
-            alphas,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
             bias,
             out,
             layer_input,
@@ -764,7 +745,7 @@ def mhc_post_pre(
     grid_reduce_apply = (
         triton.cdiv(M, BLOCK_M) * NUM_C_BLOCKS + triton.cdiv(M, BLOCK_M_POST_RES) * 2,
     )
-    _mhc_reduce_apply_kernel[grid_reduce_apply](
+    _mhc_post_pre_reduce_apply_kernel[grid_reduce_apply](
         acc_partial,
         acc_sq_partial,
         alphas,

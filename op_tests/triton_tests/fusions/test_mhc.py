@@ -151,7 +151,9 @@ def test_mhc_correctness(M, n, C, dtype):
     triton_tuple = mhc(
         x,
         phi,
-        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
+        alpha_pre,
+        alpha_post,
+        alpha_res,
         bias,
         n_streams,
         config=_config_for_large_n(n),
@@ -184,7 +186,9 @@ def test_mhc_different_epsilon(eps, M, n, C):
     triton_tuple = mhc(
         x,
         phi,
-        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
+        alpha_pre,
+        alpha_post,
+        alpha_res,
         bias,
         n_streams,
         eps=eps,
@@ -207,7 +211,9 @@ def test_mhc_different_alpha(alpha_scale):
     triton_tuple = mhc(
         x,
         phi,
-        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
+        alpha_pre,
+        alpha_post,
+        alpha_res,
         bias,
         n_streams,
     )
@@ -237,9 +243,7 @@ def test_mhc_zero_input():
     bias = torch.randn(N_total, dtype=torch.float32, device="cuda") * 0.1
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
-    triton_tuple = mhc(
-        x, phi, _alphas(alpha_pre, alpha_post, alpha_res, device=x.device), bias, n
-    )
+    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
 
     _assert_mhc_close(triton_tuple, out_torch)
 
@@ -259,9 +263,7 @@ def test_mhc_large_values():
     bias = torch.randn(N_total, dtype=torch.float32, device="cuda")
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
-    triton_tuple = mhc(
-        x, phi, _alphas(alpha_pre, alpha_post, alpha_res, device=x.device), bias, n
-    )
+    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
 
     # Layer_input scales linearly with x, so loosen its absolute tolerance for
     # x ~ N(0, 100²).
@@ -283,7 +285,9 @@ def test_mhc_small_shapes(M, n, C, dtype):
     triton_tuple = mhc(
         x,
         phi,
-        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
+        alpha_pre,
+        alpha_post,
+        alpha_res,
         bias,
         n_streams,
         config=_config_for_large_n(n),
@@ -311,7 +315,9 @@ def test_mhc_output_range():
     post_mix, comb_mix, _ = mhc(
         x,
         phi,
-        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
+        alpha_pre,
+        alpha_post,
+        alpha_res,
         bias,
         n_streams,
         sinkhorn_iters=50,
@@ -398,7 +404,9 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
     triton_tuple = mhc(
         x,
         phi,
-        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
+        alpha_pre,
+        alpha_post,
+        alpha_res,
         bias,
         n_streams,
         sinkhorn_iters=0,
@@ -441,7 +449,9 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
     triton_tuple = mhc(
         x,
         phi,
-        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
+        alpha_pre,
+        alpha_post,
+        alpha_res,
         bias,
         n_streams,
         config=_make_split_k_config(num_ksplit, n=n),
@@ -481,7 +491,9 @@ def test_split_k_various_splits(num_ksplit):
     triton_tuple = mhc(
         x,
         phi,
-        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
+        alpha_pre,
+        alpha_post,
+        alpha_res,
         bias,
         n_streams,
         sinkhorn_iters=0,
@@ -533,7 +545,9 @@ def test_split_k_large_k():
     triton_tuple = mhc(
         x,
         phi,
-        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
+        alpha_pre,
+        alpha_post,
+        alpha_res,
         bias,
         n_streams,
         sinkhorn_iters=0,
@@ -622,7 +636,9 @@ def test_triton_mhc_matches_hip(M, n, C):
     post_t, comb_t, li_t = mhc(
         x,
         phi,
-        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
+        alpha_pre,
+        alpha_post,
+        alpha_res,
         bias,
         n_streams,
         eps=rms_eps,
@@ -953,7 +969,9 @@ def mhc_e2e_triton(
     h_post, h_res, layer_input = mhc(
         x_l_flat,
         phi,
-        _alphas(alpha_pre, alpha_post, alpha_res, device=x_l_flat.device),
+        alpha_pre,
+        alpha_post,
+        alpha_res,
         bias,
         n,
         eps,

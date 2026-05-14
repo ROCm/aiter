@@ -7,6 +7,7 @@ from aiter.ops.triton._triton_kernels.fusions.mhc import (
     _mhc_reduce_apply_kernel,
     _mhc_post_kernel,
     _mhc_post_pre_split_kernel,
+    _mhc_post_pre_reduce_apply_kernel,
 )
 
 __all__ = [
@@ -15,4 +16,5 @@ __all__ = [
     "_mhc_reduce_apply_kernel",
     "_mhc_post_kernel",
     "_mhc_post_pre_split_kernel",
+    "_mhc_post_pre_reduce_apply_kernel",
 ]
