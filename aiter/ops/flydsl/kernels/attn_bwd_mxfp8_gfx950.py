@@ -78,6 +78,7 @@ def compile_attn_bwd_mxfp8_gfx950(
     tile_m_mx = tile_m // 32
     tile_n_mx = tile_n // 32
     gqa_size = num_heads_q // num_heads_kv
+    seqlen_rounded = ((seqlen + tile_m - 1) // tile_m) * tile_m
 
     gpu_arch = get_hip_arch()
 
@@ -214,7 +215,7 @@ def compile_attn_bwd_mxfp8_gfx950(
         arg_do_scale_head: fx.Tensor,
         arg_do_quant_m: fx.Tensor,
         arg_do_scale_m: fx.Tensor,
-        arg_m: fx.Tensor,
+        arg_M: fx.Tensor,
         arg_D: fx.Tensor,
         batch: fx.Int32,
         stride_qo_batch: fx.Int32,
@@ -343,52 +344,48 @@ def compile_attn_bwd_mxfp8_gfx950(
             base_ptr_ds_scale_shuffle, lds_ds_scale_shuffle_offset, T.i8, shape=(tile_m * tile_n_mx,)
         ).get()
 
+        offset_qo_nheads = batch_id * fx.Index(stride_qo_batch) + head_q * fx.Index(stride_qkvo_nheads)
+        offset_dq_nheads = offset_qo_nheads * 4
+        offset_kv_nheads = batch_id * fx.Index(stride_kv_batch) + head_kv * fx.Index(stride_qkvo_nheads)
+        offset_dkdv_nheads = offset_kv_nheads * 4
+        offset_qo_scale_nheads = batch_id * fx.Index(stride_qo_scale_batch) + head_q * fx.Index(stride_qkvo_scale_nheads)
+        offset_kv_scale_nheads = batch_id * fx.Index(stride_kv_scale_batch) + head_kv * fx.Index(stride_qkvo_scale_nheads)
+        offset_MD_nheads = (batch_id * fx.Index(stride_MD_batch) + head_q * fx.Index(stride_MD_nheads)) * 4
 
         # ---- Buffer resources (runtime byte sizes for OOB protection) ----
         head_dim_mx = head_dim // 32
-        global_buffer_size_qo = fx.Index(batch * num_heads_q * seqlen * head_dim) 
-        global_buffer_size_kv = fx.Index(batch * num_heads_kv * seqlen * head_dim) 
-        global_buffer_size_qo_scale = fx.Index(batch * num_heads_q * seqlen * head_dim_mx) 
-        global_buffer_size_kv_scale = fx.Index(batch * num_heads_kv * seqlen * head_dim_mx) 
-        q_nrec = arith.index_cast(T.i64, global_buffer_size_qo)
-        q_scale_head_nrec = arith.index_cast(T.i64, global_buffer_size_qo_scale)
-        q_scale_m_nrec = arith.index_cast(T.i64, global_buffer_size_qo_scale)
-        k_nrec = arith.index_cast(T.i64, global_buffer_size_kv)
-        k_scale_head_nrec = arith.index_cast(T.i64, global_buffer_size_kv_scale)
-        k_scale_n_nrec = arith.index_cast(T.i64, global_buffer_size_kv_scale)
-        v_nrec = arith.index_cast(T.i64, global_buffer_size_kv)
-        v_scale_nrec = arith.index_cast(T.i64, global_buffer_size_kv_scale)
-        do_nrec = arith.index_cast(T.i64, global_buffer_size_qo)
-        do_scale_head_nrec = arith.index_cast(T.i64, global_buffer_size_qo_scale)
-        do_scale_m_nrec = arith.index_cast(T.i64, global_buffer_size_qo_scale)
-        dq_nrec = arith.index_cast(T.i64, global_buffer_size_qo * 4)
-        dk_nrec = arith.index_cast(T.i64, global_buffer_size_kv * 4)
-        dv_nrec = arith.index_cast(T.i64, global_buffer_size_kv * 4)
-        m_nrec = arith.index_cast(T.i64, fx.Index(batch * num_heads_q * seqlen * 4))
-        D_nrec = arith.index_cast(T.i64, fx.Index(batch * num_heads_q * seqlen * 4))
+        global_buffer_size_tensor = fx.Index(seqlen * head_dim)
+        global_buffer_size_scale = fx.Index(seqlen * head_dim_mx)
+        q_nrec = arith.index_cast(T.i64, global_buffer_size_tensor)
+        q_scale_nrec = arith.index_cast(T.i64, global_buffer_size_scale)
+        k_nrec = arith.index_cast(T.i64, global_buffer_size_tensor)
+        k_scale_nrec = arith.index_cast(T.i64, global_buffer_size_scale)
+        v_nrec = arith.index_cast(T.i64, global_buffer_size_tensor)
+        v_scale_nrec = arith.index_cast(T.i64, global_buffer_size_scale)
+        do_nrec = arith.index_cast(T.i64, global_buffer_size_tensor)
+        do_scale_nrec = arith.index_cast(T.i64, global_buffer_size_scale)
+        output_nrec = arith.index_cast(T.i64, global_buffer_size_tensor * 4)
+        MD_nrec = arith.index_cast(T.i64, fx.Index(seqlen * 4))
 
-        q_quant_head_rsrc = buffer_ops.create_buffer_resource(arg_q_quant_head, max_size=False, num_records_bytes=q_nrec)
-        q_scale_head_rsrc = buffer_ops.create_buffer_resource(arg_q_scale_head, max_size=False, num_records_bytes=q_scale_head_nrec)
-        q_quant_m_rsrc = buffer_ops.create_buffer_resource(arg_q_quant_m, max_size=False, num_records_bytes=q_nrec)
-        q_scale_m_rsrc = buffer_ops.create_buffer_resource(arg_q_scale_m, max_size=False, num_records_bytes=q_scale_m_nrec)
-        k_quant_head_rsrc = buffer_ops.create_buffer_resource(arg_k_quant_head, max_size=False, num_records_bytes=k_nrec)
-        k_scale_head_rsrc = buffer_ops.create_buffer_resource(arg_k_scale_head, max_size=False, num_records_bytes=k_scale_head_nrec)
-        k_quant_n_rsrc = buffer_ops.create_buffer_resource(arg_k_quant_n, max_size=False, num_records_bytes=k_nrec)
-        k_scale_n_rsrc = buffer_ops.create_buffer_resource(arg_k_scale_n, max_size=False, num_records_bytes=k_scale_n_nrec)
-        v_rsrc = buffer_ops.create_buffer_resource(arg_v, max_size=False, num_records_bytes=v_nrec)
-        v_scale_rsrc = buffer_ops.create_buffer_resource(arg_v_scale, max_size=False, num_records_bytes=v_scale_nrec)
-        do_quant_head_rsrc = buffer_ops.create_buffer_resource(arg_do_quant_head, max_size=False, num_records_bytes=do_nrec)
-        do_scale_head_rsrc = buffer_ops.create_buffer_resource(arg_do_scale_head, max_size=False, num_records_bytes=do_scale_head_nrec)
-        do_quant_m_rsrc = buffer_ops.create_buffer_resource(arg_do_quant_m, max_size=False, num_records_bytes=do_nrec)
-        do_scale_m_rsrc = buffer_ops.create_buffer_resource(arg_do_scale_m, max_size=False, num_records_bytes=do_scale_m_nrec)
-        dq_rsrc = buffer_ops.create_buffer_resource(arg_dq, max_size=False, num_records_bytes=dq_nrec)
-        dk_rsrc = buffer_ops.create_buffer_resource(arg_dk, max_size=False,
-                                                   num_records_bytes=dk_nrec)
-        dv_rsrc = buffer_ops.create_buffer_resource(arg_dv, max_size=False,
-                                                   num_records_bytes=dv_nrec)
-        m_rsrc = buffer_ops.create_buffer_resource(arg_m, max_size=False,
-                                                   num_records_bytes=m_nrec)
-        D_rsrc = buffer_ops.create_buffer_resource(arg_D, max_size=False, num_records_bytes=D_nrec)
+        q_quant_head_rsrc = buffer_ops.create_buffer_resource(arg_q_quant_head, max_size=False, num_records_bytes=q_nrec, base_byte_offset=offset_qo_nheads)
+        q_scale_head_rsrc = buffer_ops.create_buffer_resource(arg_q_scale_head, max_size=False, num_records_bytes=q_scale_nrec, base_byte_offset=offset_qo_scale_nheads)
+        q_quant_m_rsrc = buffer_ops.create_buffer_resource(arg_q_quant_m, max_size=False, num_records_bytes=q_nrec, base_byte_offset=offset_qo_nheads)
+        q_scale_m_rsrc = buffer_ops.create_buffer_resource(arg_q_scale_m, max_size=False, num_records_bytes=q_scale_nrec, base_byte_offset=offset_qo_scale_nheads)
+        k_quant_head_rsrc = buffer_ops.create_buffer_resource(arg_k_quant_head, max_size=False, num_records_bytes=k_nrec, base_byte_offset=offset_kv_nheads)
+        k_scale_head_rsrc = buffer_ops.create_buffer_resource(arg_k_scale_head, max_size=False, num_records_bytes=k_scale_nrec, base_byte_offset=offset_kv_scale_nheads)
+        k_quant_n_rsrc = buffer_ops.create_buffer_resource(arg_k_quant_n, max_size=False, num_records_bytes=k_nrec, base_byte_offset=offset_kv_nheads)
+        k_scale_n_rsrc = buffer_ops.create_buffer_resource(arg_k_scale_n, max_size=False, num_records_bytes=k_scale_nrec, base_byte_offset=offset_kv_scale_nheads)
+        v_rsrc = buffer_ops.create_buffer_resource(arg_v, max_size=False, num_records_bytes=v_nrec, base_byte_offset=offset_kv_nheads)
+        v_scale_rsrc = buffer_ops.create_buffer_resource(arg_v_scale, max_size=False, num_records_bytes=v_scale_nrec, base_byte_offset=offset_kv_scale_nheads)
+        do_quant_head_rsrc = buffer_ops.create_buffer_resource(arg_do_quant_head, max_size=False, num_records_bytes=do_nrec, base_byte_offset=offset_qo_nheads)
+        do_scale_head_rsrc = buffer_ops.create_buffer_resource(arg_do_scale_head, max_size=False, num_records_bytes=do_scale_nrec, base_byte_offset=offset_qo_scale_nheads)
+        do_quant_m_rsrc = buffer_ops.create_buffer_resource(arg_do_quant_m, max_size=False, num_records_bytes=do_nrec, base_byte_offset=offset_qo_nheads)
+        do_scale_m_rsrc = buffer_ops.create_buffer_resource(arg_do_scale_m, max_size=False, num_records_bytes=do_scale_nrec, base_byte_offset=offset_qo_scale_nheads)
+        dq_rsrc = buffer_ops.create_buffer_resource(arg_dq, max_size=False, num_records_bytes=output_nrec, base_byte_offset=offset_dq_nheads)
+        dk_rsrc = buffer_ops.create_buffer_resource(arg_dk, max_size=False, num_records_bytes=output_nrec, base_byte_offset=offset_dkdv_nheads)
+        dv_rsrc = buffer_ops.create_buffer_resource(arg_dv, max_size=False, num_records_bytes=output_nrec, base_byte_offset=offset_dkdv_nheads)
+        M_rsrc = buffer_ops.create_buffer_resource(arg_M, max_size=False, num_records_bytes=MD_nrec, base_byte_offset=offset_MD_nheads)
+        D_rsrc = buffer_ops.create_buffer_resource(arg_D, max_size=False, num_records_bytes=MD_nrec, base_byte_offset=offset_MD_nheads)
 
         global_offset_n = by * tile_n
         global_offset_n_mx = global_offset_n // 32
@@ -511,14 +508,6 @@ def compile_attn_bwd_mxfp8_gfx950(
         c4 = fx.Index(4)
         tx_i32_base = tx * c4
 
-        offset_qo_nheads = batch_id * fx.Index(stride_qo_batch) + head_q * fx.Index(stride_qkvo_nheads)
-        offset_qo_nheads_div4 = offset_qo_nheads // 4
-        offset_kv_nheads = batch_id * fx.Index(stride_kv_batch) + head_kv * fx.Index(stride_qkvo_nheads)
-        offset_kv_nheads_div4 = offset_kv_nheads // 4
-        offset_qo_scale_nheads = batch_id * fx.Index(stride_qo_scale_batch) + head_q * fx.Index(stride_qkvo_scale_nheads)
-        offset_kv_scale_nheads = batch_id * fx.Index(stride_kv_scale_batch) + head_kv * fx.Index(stride_qkvo_scale_nheads)
-        offset_MD_nheads = batch_id * fx.Index(stride_MD_batch) + head_q * fx.Index(stride_MD_nheads)
-
         def load_q_quant_head_16(idx_elem):
             return buffer_copy_gmem16_dwordx4(
                 buffer_ops, vector,
@@ -599,7 +588,7 @@ def compile_attn_bwd_mxfp8_gfx950(
             for i in range_constexpr(num_qo_loads):
                 row_q_local, col_q_local_i32 = qo_tile_chunk_coord_i32(i)
                 row_q_global = offset_m + row_q_local
-                idx_elem = offset_qo_nheads_div4 + row_q_global * head_dim_div4 + col_q_local_i32
+                idx_elem = row_q_global * head_dim_div4 + col_q_local_i32
                 q_16B = load_q_quant_head_16(idx_elem)
                 parts.append(vector.bitcast(T.i32x4, q_16B))
             return parts
@@ -609,7 +598,7 @@ def compile_attn_bwd_mxfp8_gfx950(
             for i in range_constexpr(num_qo_loads):
                 row_q_local, col_q_local_i32 = qo_tile_chunk_coord_i32(i)
                 row_q_global = offset_m + row_q_local
-                idx_elem = offset_qo_nheads_div4 + row_q_global * head_dim_div4 + col_q_local_i32
+                idx_elem = row_q_global * head_dim_div4 + col_q_local_i32
                 q_16B = load_q_quant_m_16(idx_elem)
                 parts.append(vector.bitcast(T.i32x4, q_16B))
             return parts
@@ -619,7 +608,7 @@ def compile_attn_bwd_mxfp8_gfx950(
             for i in range_constexpr(num_kv_loads):
                 row_k_local, col_k_local_i32 = kv_tile_chunk_coord_i32(i)
                 row_k_global = global_offset_n + row_k_local
-                idx_elem = offset_kv_nheads_div4 + row_k_global * head_dim_div4 + col_k_local_i32
+                idx_elem = row_k_global * head_dim_div4 + col_k_local_i32
                 k_16B = load_k_quant_head_16(idx_elem)
                 parts.append(vector.bitcast(T.i32x4, k_16B))
             return parts
@@ -629,7 +618,7 @@ def compile_attn_bwd_mxfp8_gfx950(
             for i in range_constexpr(num_kv_loads):
                 row_k_local, col_k_local_i32 = kv_tile_chunk_coord_i32(i)
                 row_k_global = global_offset_n + row_k_local
-                idx_elem = offset_kv_nheads_div4 + row_k_global * head_dim_div4 + col_k_local_i32
+                idx_elem = row_k_global * head_dim_div4 + col_k_local_i32
                 k_16B = load_k_quant_n_16(idx_elem)
                 parts.append(vector.bitcast(T.i32x4, k_16B))
             return parts
@@ -639,7 +628,7 @@ def compile_attn_bwd_mxfp8_gfx950(
             for i in range_constexpr(num_kv_loads):
                 row_v_local, col_v_local_i32 = kv_tile_chunk_coord_i32(i)
                 row_v_global = global_offset_n + row_v_local
-                idx_elem = offset_kv_nheads_div4 + row_v_global * head_dim_div4 + col_v_local_i32
+                idx_elem = row_v_global * head_dim_div4 + col_v_local_i32
                 v_16B = load_v_16(idx_elem)
                 parts.append(vector.bitcast(T.i32x4, v_16B))
             return parts
@@ -649,7 +638,7 @@ def compile_attn_bwd_mxfp8_gfx950(
             for i in range_constexpr(num_qo_loads):
                 row_do_local, col_do_local_i32 = qo_tile_chunk_coord_i32(i)
                 row_do_global = offset_m + row_do_local
-                idx_elem = offset_qo_nheads_div4 + row_do_global * head_dim_div4 + col_do_local_i32
+                idx_elem = row_do_global * head_dim_div4 + col_do_local_i32
                 do_16B = load_do_quant_head_16(idx_elem)
                 parts.append(vector.bitcast(T.i32x4, do_16B))
             return parts
@@ -659,7 +648,7 @@ def compile_attn_bwd_mxfp8_gfx950(
             for i in range_constexpr(num_qo_loads):
                 row_do_local, col_do_local_i32 = qo_tile_chunk_coord_i32(i)
                 row_do_global = offset_m + row_do_local
-                idx_elem = offset_qo_nheads_div4 + row_do_global * head_dim_div4 + col_do_local_i32
+                idx_elem = row_do_global * head_dim_div4 + col_do_local_i32
                 do_16B = load_do_quant_m_16(idx_elem)
                 parts.append(vector.bitcast(T.i32x4, do_16B))
             return parts
@@ -668,13 +657,13 @@ def compile_attn_bwd_mxfp8_gfx950(
             vec_width = bytes_per_thread_qo_scale
             if const_expr(vec_width == 1):
                 if const_expr(bytes_per_tile_qo_scale < total_threads):
-                    idx_elem = offset_qo_scale_nheads + offset_m * head_dim_mx + tx % bytes_per_tile_qo_scale
+                    idx_elem = offset_m * head_dim_mx + tx % bytes_per_tile_qo_scale
                 else:
-                    idx_elem = offset_qo_scale_nheads + offset_m * head_dim_mx + tx 
+                    idx_elem =  offset_m * head_dim_mx + tx 
                 vec = buffer_ops.buffer_load(q_scale_head_rsrc, idx_elem, vec_width=1, dtype=T.i8)
                 vec = vector.from_elements(T.vec(1, T.i8), [vec])
             else:  # vec_width=2
-                idx_elem = (offset_qo_scale_nheads + offset_m * head_dim_mx + tx * vec_width) // 2
+                idx_elem = (offset_m * head_dim_mx + tx * vec_width) // 2
                 vec = buffer_ops.buffer_load(q_scale_head_rsrc, idx_elem, vec_width=1, dtype=T.i16)
                 vec = vector.from_elements(T.vec(1, T.i16), [vec])
                 vec = vector.bitcast(T.i8x2, vec)
@@ -684,13 +673,13 @@ def compile_attn_bwd_mxfp8_gfx950(
             vec_width = bytes_per_thread_qo_scale
             if const_expr(vec_width == 1):
                 if const_expr(bytes_per_tile_qo_scale < total_threads):
-                    idx_elem = offset_qo_scale_nheads + offset_m * head_dim + tx % bytes_per_tile_qo_scale
+                    idx_elem = offset_m * head_dim + tx % bytes_per_tile_qo_scale
                 else:
-                    idx_elem = offset_qo_scale_nheads + offset_m * head_dim + tx
+                    idx_elem = offset_m * head_dim + tx
                 vec = buffer_ops.buffer_load(q_scale_m_rsrc, idx_elem, vec_width=1, dtype=T.i8)
                 vec = vector.from_elements(T.vec(1, T.i8), [vec])
             else:  # vec_width=2
-                idx_elem = (offset_qo_scale_nheads + offset_m * head_dim + tx * vec_width) // 2
+                idx_elem = (offset_m * head_dim + tx * vec_width) // 2
                 vec = buffer_ops.buffer_load(q_scale_m_rsrc, idx_elem, vec_width=1, dtype=T.i16)
                 vec = vector.from_elements(T.vec(1, T.i16), [vec])
                 vec = vector.bitcast(T.i8x2, vec)
@@ -700,13 +689,13 @@ def compile_attn_bwd_mxfp8_gfx950(
             vec_width = bytes_per_thread_kv_scale
             if const_expr(vec_width == 1):
                 if const_expr(bytes_per_tile_kv_scale < total_threads):
-                    idx_elem = offset_kv_scale_nheads + global_offset_n * head_dim_mx + tx % bytes_per_tile_kv_scale
+                    idx_elem = global_offset_n * head_dim_mx + tx % bytes_per_tile_kv_scale
                 else:
-                    idx_elem = offset_kv_scale_nheads + global_offset_n * head_dim_mx + tx
+                    idx_elem = global_offset_n * head_dim_mx + tx
                 vec = buffer_ops.buffer_load(k_scale_head_rsrc, idx_elem, vec_width=1, dtype=T.i8)
                 vec = vector.from_elements(T.vec(1, T.i8), [vec])
             else:  # vec_width=2
-                idx_elem = (offset_kv_scale_nheads + global_offset_n * head_dim_mx + tx * vec_width) // 2
+                idx_elem = (global_offset_n * head_dim_mx + tx * vec_width) // 2
                 vec = buffer_ops.buffer_load(k_scale_head_rsrc, idx_elem, vec_width=1, dtype=T.i16)
                 vec = vector.from_elements(T.vec(1, T.i16), [vec])
                 vec = vector.bitcast(T.i8x2, vec)
@@ -716,13 +705,13 @@ def compile_attn_bwd_mxfp8_gfx950(
             vec_width = bytes_per_thread_kv_scale
             if const_expr(vec_width == 1):
                 if const_expr(bytes_per_tile_kv_scale < total_threads):
-                    idx_elem = offset_kv_scale_nheads + global_offset_n_mx * head_dim + tx % bytes_per_tile_kv_scale
+                    idx_elem = global_offset_n_mx * head_dim + tx % bytes_per_tile_kv_scale
                 else:
-                    idx_elem = offset_kv_scale_nheads + global_offset_n_mx * head_dim + tx 
+                    idx_elem = global_offset_n_mx * head_dim + tx 
                 vec = buffer_ops.buffer_load(k_scale_n_rsrc, idx_elem, vec_width=1, dtype=T.i8)
                 vec = vector.from_elements(T.vec(1, T.i8), [vec])
             else:  # vec_width=2
-                idx_elem = (offset_kv_scale_nheads + global_offset_n_mx * head_dim + tx * vec_width) // 2
+                idx_elem = (global_offset_n_mx * head_dim + tx * vec_width) // 2
                 vec = buffer_ops.buffer_load(k_scale_n_rsrc, idx_elem, vec_width=1, dtype=T.i16)
                 vec = vector.from_elements(T.vec(1, T.i16), [vec])
                 vec = vector.bitcast(T.i8x2, vec)
@@ -732,13 +721,13 @@ def compile_attn_bwd_mxfp8_gfx950(
             vec_width = bytes_per_thread_kv_scale
             if const_expr(vec_width == 1):
                 if const_expr(bytes_per_tile_kv_scale < total_threads):
-                    idx_elem = offset_kv_scale_nheads + global_offset_n * head_dim_mx + tx % bytes_per_tile_kv_scale
+                    idx_elem = global_offset_n * head_dim_mx + tx % bytes_per_tile_kv_scale
                 else:
-                    idx_elem = offset_kv_scale_nheads + global_offset_n * head_dim_mx + tx
+                    idx_elem = global_offset_n * head_dim_mx + tx
                 vec = buffer_ops.buffer_load(v_scale_rsrc, idx_elem, vec_width=1, dtype=T.i8)
                 vec = vector.from_elements(T.vec(1, T.i8), [vec])
             else:  # vec_width=2
-                idx_elem = (offset_kv_scale_nheads + global_offset_n * head_dim_mx + tx * vec_width) // 2
+                idx_elem = (global_offset_n * head_dim_mx + tx * vec_width) // 2
                 vec = buffer_ops.buffer_load(v_scale_rsrc, idx_elem, vec_width=1, dtype=T.i16)
                 vec = vector.from_elements(T.vec(1, T.i16), [vec])
                 vec = vector.bitcast(T.i8x2, vec)
@@ -748,13 +737,13 @@ def compile_attn_bwd_mxfp8_gfx950(
             vec_width = bytes_per_thread_qo_scale
             if const_expr(vec_width == 1):
                 if const_expr(bytes_per_tile_qo_scale < total_threads):
-                    idx_elem = offset_qo_scale_nheads + offset_m * head_dim_mx + tx % bytes_per_tile_qo_scale
+                    idx_elem = offset_m * head_dim_mx + tx % bytes_per_tile_qo_scale
                 else:
-                    idx_elem = offset_qo_scale_nheads + offset_m * head_dim_mx + tx
+                    idx_elem = offset_m * head_dim_mx + tx
                 vec = buffer_ops.buffer_load(do_scale_head_rsrc, idx_elem, vec_width=1, dtype=T.i8)
                 vec = vector.from_elements(T.vec(1, T.i8), [vec])
             else:  # vec_width=2
-                idx_elem = (offset_qo_scale_nheads + offset_m * head_dim_mx + tx * vec_width) // 2
+                idx_elem = (offset_m * head_dim_mx + tx * vec_width) // 2
                 vec = buffer_ops.buffer_load(do_scale_head_rsrc, idx_elem, vec_width=1, dtype=T.i16)
                 vec = vector.from_elements(T.vec(1, T.i16), [vec])
                 vec = vector.bitcast(T.i8x2, vec)
@@ -764,13 +753,13 @@ def compile_attn_bwd_mxfp8_gfx950(
             vec_width = bytes_per_thread_qo_scale
             if const_expr(vec_width == 1):
                 if const_expr(bytes_per_tile_qo_scale < total_threads):
-                    idx_elem = offset_qo_scale_nheads + offset_m * head_dim + tx % bytes_per_tile_qo_scale
+                    idx_elem = offset_m * head_dim + tx % bytes_per_tile_qo_scale
                 else:
-                    idx_elem = offset_qo_scale_nheads + offset_m * head_dim + tx
+                    idx_elem = offset_m * head_dim + tx
                 vec = buffer_ops.buffer_load(do_scale_m_rsrc, idx_elem, vec_width=1, dtype=T.i8)
                 vec = vector.from_elements(T.vec(1, T.i8), [vec])
             else:  # vec_width=2
-                idx_elem = (offset_qo_scale_nheads + offset_m * head_dim + tx * vec_width) // 2
+                idx_elem = (offset_m * head_dim + tx * vec_width) // 2
                 vec = buffer_ops.buffer_load(do_scale_m_rsrc, idx_elem, vec_width=1, dtype=T.i16)
                 vec = vector.from_elements(T.vec(1, T.i16), [vec])
                 vec = vector.bitcast(T.i8x2, vec)
@@ -907,8 +896,8 @@ def compile_attn_bwd_mxfp8_gfx950(
             accs_out = [acc_init] * ps_n_accs
 
             for mi in range_constexpr(ps_m_num_subtiles):
-                global_m_norm_idx = offset_MD_nheads + offset_m + ps_m_wave_id * ps_m_per_wave + mi * 16 + lane_div_16 * 4 #+ ii
-                m_norm_vector = buffer_ops.buffer_load(m_rsrc, global_m_norm_idx, vec_width=4)
+                global_m_norm_idx = offset_m + ps_m_wave_id * ps_m_per_wave + mi * 16 + lane_div_16 * 4
+                m_norm_vector = buffer_ops.buffer_load(M_rsrc, global_m_norm_idx, vec_width=4)
 
                 for ni in range_constexpr(ps_n_num_subtiles):
                     
@@ -1043,7 +1032,7 @@ def compile_attn_bwd_mxfp8_gfx950(
 
             for mi in range_constexpr(ps_m_num_subtiles):
 
-                global_D_idx = offset_MD_nheads + offset_m + ps_m_wave_id * ps_m_per_wave + mi * 16 + lane_div_16 * 4 
+                global_D_idx = offset_m + ps_m_wave_id * ps_m_per_wave + mi * 16 + lane_div_16 * 4 
                 D_vector = buffer_ops.buffer_load(D_rsrc, global_D_idx, vec_width=4)
 
                 for ni in range_constexpr(ps_n_num_subtiles):
@@ -1349,7 +1338,7 @@ def compile_attn_bwd_mxfp8_gfx950(
                     for ii in range_constexpr(4):
                         global_row = offset_m + dq_m_wave_id * dq_m_per_wave + mi * 16 + lane_div_16 * 4 + ii
                         global_col = dq_head_wave_id * dq_head_per_wave + hi * 16 + lane_mod_16
-                        global_idx = offset_qo_nheads + global_row * head_dim + global_col
+                        global_idx = global_row * head_dim + global_col
                         global_idx_bytes = global_idx * 4
                         
                         acc_idx = mi * dq_num_subtiles_head + hi
@@ -1369,7 +1358,7 @@ def compile_attn_bwd_mxfp8_gfx950(
 
                         global_row = global_offset_n + dk_n_wave_id * dk_n_per_wave + ni * 16 + lane_div_16 * 4 + ii
                         global_col = dk_head_wave_id * dk_head_per_wave + hi * 16 + lane_mod_16
-                        global_idx = offset_kv_nheads + global_row * head_dim + global_col
+                        global_idx = global_row * head_dim + global_col
                         
                         acc_idx = ni * dk_num_subtiles_head + hi
                         acc = final_accs[acc_idx]
@@ -1391,7 +1380,7 @@ def compile_attn_bwd_mxfp8_gfx950(
 
                         global_row = global_offset_n + dv_n_wave_id * dv_n_per_wave + ni * 16 + lane_div_16 * 4 + ii
                         global_col = dv_head_wave_id * dv_head_per_wave + hi * 16 + lane_mod_16
-                        global_idx = offset_kv_nheads + global_row * head_dim + global_col
+                        global_idx = global_row * head_dim + global_col
                         
                         acc_idx = ni * dv_head_num_subtiles + hi
                         acc = final_accs[acc_idx]
@@ -1503,15 +1492,15 @@ def compile_attn_bwd_mxfp8_gfx950(
         dk = [acc_init] * dk_n_accs
         dv = [acc_init] * dv_n_accs
 
-        num_tiles_loop = seqlen // tile_m
+        num_tiles_loop = seqlen_rounded // tile_m
         if const_expr((num_tiles_loop % 2) == 1):
-            upper_bound = seqlen - tile_m
+            upper_bound = seqlen_rounded - tile_m
             init_state = _pack_state(dk, dv) 
             for iv, inner in range(start_m, upper_bound, tile_m * 2, init=init_state):
                 results = yield pingpong(iv, inner)
             dk, dv = _unpack_state(results)
 
-            curr_m = arith.index(seqlen - tile_m)
+            curr_m = arith.index(seqlen_rounded - tile_m)
             qk = compute_qk(lds_q_quant_head_pong, lds_q_scale_head_pong, lds_k_quant_head, lds_k_scale_head) 
             p = softmax(qk, curr_m)
             mxquant_m_and_store_to_lds(p, lds_ppt_shuffle, lds_ppt_scale_shuffle)
@@ -1526,14 +1515,14 @@ def compile_attn_bwd_mxfp8_gfx950(
             dq = compute_dq(lds_ds_shuffle, lds_ds_scale_shuffle, lds_k_quant_n, lds_k_scale_n)
             store_dq_atomic(dq, curr_m)
         else:
-            upper_bound = seqlen - (tile_m * 2)
+            upper_bound = seqlen_rounded - (tile_m * 2)
             init_state = _pack_state(dk, dv)
             for iv, inner in range(start_m, upper_bound, tile_m * 2, init=init_state):
                 results = yield pingpong(iv, inner)
             dk, dv = _unpack_state(results)
 
-            curr_m = arith.index(seqlen - tile_m * 2)
-            last_m = arith.index(seqlen - tile_m)
+            curr_m = arith.index(seqlen_rounded - tile_m * 2)
+            last_m = arith.index(seqlen_rounded - tile_m)
             last_m_mx = last_m // 32
             store_q_tile_to_lds(prefetch_q_quant_head_tile(last_m), lds_q_quant_head_ping)
             store_q_scale_tile_to_lds(prefetch_q_scale_head_tile(last_m), lds_q_scale_head_ping)
@@ -1602,7 +1591,7 @@ def compile_attn_bwd_mxfp8_gfx950(
         arg_do_scale_head: fx.Tensor,
         arg_do_quant_m: fx.Tensor,
         arg_do_scale_m: fx.Tensor,
-        arg_m: fx.Tensor,
+        arg_M: fx.Tensor,
         arg_D: fx.Tensor,
         batch: fx.Int32,
         stride_qo_batch: fx.Int32,
@@ -1648,10 +1637,10 @@ def compile_attn_bwd_mxfp8_gfx950(
             allocator_ds_scale_shuffle.finalize()
 
         gx = num_heads_q 
-        gy = seqlen // tile_n
+        gy = (seqlen + tile_n - 1) // tile_n
         gz = batch
 
-        launcher = kernel_attn_bwd(arg_dq, arg_dk, arg_dv, arg_q_quant_head, arg_q_scale_head, arg_q_quant_m, arg_q_scale_m, arg_k_quant_head, arg_k_scale_head, arg_k_quant_n, arg_k_scale_n, arg_v, arg_v_scale, arg_do_quant_head, arg_do_scale_head, arg_do_quant_m, arg_do_scale_m, arg_m, arg_D, 
+        launcher = kernel_attn_bwd(arg_dq, arg_dk, arg_dv, arg_q_quant_head, arg_q_scale_head, arg_q_quant_m, arg_q_scale_m, arg_k_quant_head, arg_k_scale_head, arg_k_quant_n, arg_k_scale_n, arg_v, arg_v_scale, arg_do_quant_head, arg_do_scale_head, arg_do_quant_m, arg_do_scale_m, arg_M, arg_D, 
                                    batch,
                                    stride_qo_batch,
                                    stride_qo_scale_batch,

@@ -82,7 +82,7 @@ def run_torch(q_fp32_head, q_fp32_m, k_fp32_head, k_fp32_n, v, do_fp32_head, do_
         (80, 20)
     ],
 )
-@pytest.mark.parametrize("seqlen", [128, 1024, 1152, 4096])
+@pytest.mark.parametrize("seqlen", [128, 1024, 1056, 1152, 4096])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("tile_m", [64, 128])
 @pytest.mark.parametrize("tile_n", [64, 128])
