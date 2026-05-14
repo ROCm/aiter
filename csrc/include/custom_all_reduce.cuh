@@ -1861,6 +1861,11 @@ static_assert(sizeof(IPC_KEY) == sizeof(hipIpcMemHandle_t));
 static_assert(alignof(IPC_KEY) == alignof(hipIpcMemHandle_t));
 
 
+
+// ── per-tensor static FP8 quant device epilogue ──
+// Caller provides pre-calibrated inv_scale = 1/scale_factor.
+// No block-level abs-max reduction; just multiply by inv_scale and saturate-cast to FP8.
+template <typename P, typename A, typename T, typename OutT, int PACK_SIZE>
 __device__ __forceinline__ void ar_fusion_epilogue_per_tensor_quant(A& in,
                                                                      P& weight,
                                                                      int hidden_dim,
@@ -2203,6 +2208,7 @@ void allreduce_fusion_kernel_split_per_tensor_quant_launcher(RankData* _dp,
         <<<numBlocks, threadsPerBlock, 0, stream>>>(
             sg, rank, residual_inp, residual_out, output, weight, inv_scale, size, hidden_dim, eps);
 }
+
 
 class CustomAllreduce
 {
