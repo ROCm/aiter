@@ -121,7 +121,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     QManager8bitsV3<T> q_manager;
     KvManager8bitsV3<T> kv_manager;
     OManager16bitsV2<T, out_t> o_manager;
-    OManager32bitsV1<T, split_t> split_o_manager;
+    OManager32bitsV2<T, split_t> split_o_manager;
 
     // kv_0/kv_1 hold 32 N-cols of K-matrix per load (= 4 vgprs = 2 mfma B-tiles).
     // On kBlockN=64 this is the LOWER N-half; the upper half is re-loaded into

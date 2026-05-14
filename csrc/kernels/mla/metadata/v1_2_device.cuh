@@ -550,9 +550,20 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         "N is in [2, 8), or (#head, max_seqlen_qo) = (8, 4) where q and kv are fp8, "
         "or q and kv are bf16 on gfx950")
 
-    int32_t num_splits = max_split_per_batch < 0
+    const bool is_hk_h32_q4 =
+        (arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 32) &&
+        (max_seqlen_qo == 4) && (page_size == 1) && enable_experimental;
+    const int32_t effective_max_split_per_batch =
+        is_hk_h32_q4 ? max(max_split_per_batch, 96) : max_split_per_batch;
+    int32_t num_splits = effective_max_split_per_batch < 0
                              ? num_clusters
-                             : min(num_clusters, max_split_per_batch * num_batches);
+                             : min(num_clusters, effective_max_split_per_batch * num_batches);
+
+    int32_t effective_kv_granularity = kv_granularity;
+    if(is_hk_h32_q4)
+    {
+        effective_kv_granularity = max(effective_kv_granularity, 64);
+    }
 
     MlaMetadataV1KernelParameter params = {};
     params.p_work_metadata_ptrs         = work_metadata_ptrs.data_ptr<uint64_t>();
@@ -570,8 +581,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.num_splits                   = num_splits;
     params.reduce_indptr_size           = reduce_indptr.size(0);
     params.page_size                    = page_size;
-    params.kv_granularity               = kv_granularity;
-    params.kv_granularity_log2          = __builtin_ctz(kv_granularity);
+    params.kv_granularity               = effective_kv_granularity;
+    params.kv_granularity_log2          = __builtin_ctz(effective_kv_granularity);
     params.uni_seqlen_qo                = uni_seqlen_qo;
     params.ori_seqlen_qo                = ori_uni_seqlen_qo;
     params.is_causal                    = is_causal;
