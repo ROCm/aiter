@@ -27,6 +27,125 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 
+# Hardware constants: gfx name and CU count cannot change within a process
+# lifetime, so we query them once at module import time and cache the results.
+# This eliminates repeated HIP runtime queries in the decode hot path.
+_cached_gfx: str = get_gfx()
+_cached_cu_num: int = get_cu_num()
+
+# Cache for scale transpose buffers, keyed on (device.index, cols, rows, dtype).
+# Reusing these buffers across steps eliminates per-step HIP malloc.
+_scale_t_cache: dict = {}
+
+# Cache for moe_sorting output tensors, keyed on
+# (device.index, M, topk, num_experts, block_size, model_dim, moebuf_dtype).
+_moe_sorting_buf_cache: dict = {}
+
+# Cache for quantization functions with transpose_scale=True, keyed on quant_type.
+_quant_func_t_cache: dict = {}
+
+# Token threshold below which the 1-stage ASM fast path is used for gfx950
+# FP8 blockscale decode.
+_1STAGE_TOKEN_THRESHOLD: int = 512
+
+# Mapping from (gfx_str, output_dtype) to (plain_novs_name, presorted_novs_ps_name)
+# for the gfx950 1-stage ASM FP8 blockscale kernels.
+_GFX950_BLOCKSCALE_NOVS_KERNELS: dict = {
+    ("gfx950", dtypes.bf16): (
+        "fmoe_fp8_blockscale_g1u1_bf16",
+        "fmoe_fp8_blockscale_g1u1_bf16_presorted",
+    ),
+    ("gfx950", dtypes.fp16): (
+        "fmoe_fp8_blockscale_g1u1_fp16",
+        "fmoe_fp8_blockscale_g1u1_fp16_presorted",
+    ),
+}
+
+# Pre-resolved kernel name constants for the gfx950 1-stage ASM fast path,
+# resolved once at import time from _GFX950_BLOCKSCALE_NOVS_KERNELS.
+_FAST_PATH_KERNELNAME_BF16: str = _GFX950_BLOCKSCALE_NOVS_KERNELS.get(
+    (_cached_gfx, dtypes.bf16), ("", "")
+)[0]
+_FAST_PATH_KERNELNAME_FP16: str = _GFX950_BLOCKSCALE_NOVS_KERNELS.get(
+    (_cached_gfx, dtypes.fp16), ("", "")
+)[0]
+
+
+def _get_scale_t_buf(scale: torch.Tensor) -> torch.Tensor:
+    """Return a cached buffer with transposed shape of the given scale tensor.
+
+    The buffer is keyed on (device.index, cols, rows, dtype) so that it is
+    reused across decode steps without triggering a new HIP malloc each time.
+    """
+    rows, cols = scale.shape[0], scale.shape[1]
+    key = (scale.device.index, cols, rows, scale.dtype)
+    buf = _scale_t_cache.get(key)
+    if buf is None:
+        buf = torch.empty((cols, rows), dtype=scale.dtype, device=scale.device)
+        _scale_t_cache[key] = buf
+    return buf
+
+
+def _get_moe_sorting_bufs(
+    M, topk, num_experts, block_size, model_dim, moebuf_dtype, device
+):
+    """Return cached moe_sorting output tensors for the given configuration.
+
+    Tensors are keyed on (device.index, M, topk, num_experts, block_size,
+    model_dim, moebuf_dtype) and reused across decode steps to avoid per-step
+    HIP malloc.
+    """
+    key = (device.index, M, topk, num_experts, block_size, model_dim, moebuf_dtype)
+    bufs = _moe_sorting_buf_cache.get(key)
+    if bufs is None:
+        max_num_tokens_padded = int(M * topk + num_experts * block_size - topk)
+        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+        sorted_weights = torch.empty(
+            max_num_tokens_padded, dtype=dtypes.fp32, device=device
+        )
+        sorted_expert_ids = torch.empty(
+            max_num_m_blocks, dtype=dtypes.i32, device=device
+        )
+        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        bufs = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+        _moe_sorting_buf_cache[key] = bufs
+    return bufs
+
+
+def _get_quant_func_transpose(quant_type):
+    """Return a cached functools.partial of get_quant(quant_type) with transpose_scale=True."""
+    fn = _quant_func_t_cache.get(quant_type)
+    if fn is None:
+        fn = functools.partial(get_quant(quant_type), transpose_scale=True)
+        _quant_func_t_cache[quant_type] = fn
+    return fn
+
+
+def _should_force_1stage_asm(
+    gfx,
+    q_type,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    use_g1u1,
+    doweight_stage1,
+    inter_dim,
+    token,
+):
+    """Return True only for the gfx950 per_1x128 FP8/FP8 decode fast path."""
+    return (
+        gfx == "gfx950"
+        and q_type == QuantType.per_1x128
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp8
+        and use_g1u1
+        and not doweight_stage1
+        and inter_dim % 256 == 0
+        and token <= _1STAGE_TOKEN_THRESHOLD
+    )
+
 
 def _moe_sorting_impl(
     topk_ids,
@@ -106,6 +225,65 @@ def moe_sorting(
     num_local_tokens=None,
     dispatch_policy=0,
 ):
+    if expert_mask is None:
+        device = topk_ids.device
+        M, topk = topk_ids.shape
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+            _get_moe_sorting_bufs(
+                M, topk, num_experts, block_size, model_dim, moebuf_dtype, device
+            )
+        )
+        try:
+            if not _USE_CK_MOE_SORTING:
+                ws_size = aiter.moe_sorting_opus_get_workspace_size(
+                    M, num_experts, topk, dispatch_policy
+                )
+                workspace = (
+                    torch.empty(ws_size, dtype=torch.uint8, device=device)
+                    if ws_size > 0
+                    else None
+                )
+                aiter.moe_sorting_opus_fwd(
+                    topk_ids,
+                    topk_weights,
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    moe_buf,
+                    num_experts,
+                    int(block_size),
+                    expert_mask,
+                    num_local_tokens,
+                    workspace,
+                    dispatch_policy,
+                )
+            else:
+                aiter.moe_sorting_fwd(
+                    topk_ids,
+                    topk_weights,
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    moe_buf,
+                    num_experts,
+                    int(block_size),
+                    expert_mask,
+                    num_local_tokens,
+                    dispatch_policy,
+                )
+            return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+        except Exception as e:
+            logger.error(f"Error in moe_sorting: {e}")
+            max_num_tokens_padded = int(
+                topk_ids.numel() + num_experts * block_size - topk_ids.shape[1]
+            )
+            topk = topk_ids.shape[1]
+            logger.error(
+                f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
+            )
+            raise e
     try:
         return _moe_sorting_impl(
             topk_ids,
@@ -478,6 +656,65 @@ def fused_moe_1stage(
             a2_scale,
             activation,
         )
+    elif (
+        quant_type == QuantType.per_1x128
+        and isG1U1
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp8
+        and not doweight_stage1
+    ):
+        # gfx950 1-stage ASM FP8 blockscale fast path
+        dtype = moe_buf.dtype
+        if dtype == dtypes.bf16:
+            effective_kernelName = (
+                _FAST_PATH_KERNELNAME_BF16 if _FAST_PATH_KERNELNAME_BF16 else kernelName
+            )
+        elif dtype == dtypes.fp16:
+            effective_kernelName = (
+                _FAST_PATH_KERNELNAME_FP16 if _FAST_PATH_KERNELNAME_FP16 else kernelName
+            )
+        else:
+            kv = _GFX950_BLOCKSCALE_NOVS_KERNELS.get((_cached_gfx, dtype), ("", ""))
+            effective_kernelName = kv[0] if kv[0] else kernelName
+
+        if hidden_states.dtype != q_dtype_a:
+            quant_func_t = _get_quant_func_transpose(quant_type)
+            a1, a1_scale = quant_func_t(
+                hidden_states,
+                scale=a1_scale,
+                quant_dtype=q_dtype_a,
+                num_rows=num_local_tokens,
+            )
+        else:
+            assert (
+                a1_scale is not None
+            ), "a1_scale must be provided for quantized input for fused_moe"
+            a1 = hidden_states
+            scale_t = _get_scale_t_buf(a1_scale)
+            aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
+            a1_scale = scale_t
+
+        aiter.fmoe_fp8_blockscale_g1u1(
+            moe_buf,
+            a1,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            topk,
+            a1_scale,
+            w1_scale,
+            w2_scale,
+            effective_kernelName,
+            fc2_smooth_scale=None,
+            activation=activation,
+            fc_scale_blkn=128,
+            fc_scale_blkk=128,
+            block_size_M=block_size_M,
+        )
+        return moe_buf
     else:
         if xbf16:
             # xquant happens inside the asm kernel for per_1x128
@@ -500,7 +737,7 @@ def fused_moe_1stage(
                 ), "a1_scale must be provided for quantized input for fused_moe"
                 a1 = hidden_states
                 if quant_type == QuantType.per_1x128:
-                    scale_t = torch.empty_like(a1_scale)
+                    scale_t = _get_scale_t_buf(a1_scale)
                     aiter.partial_transpose(
                         scale_t, a1_scale, num_rows=num_local_tokens
                     )
@@ -569,7 +806,7 @@ def fused_moe_1stage(
 
 @functools.lru_cache(maxsize=2048)
 def get_block_size_M(token, topk, expert, inter_dim):
-    cu_num = get_cu_num()
+    cu_num = _cached_cu_num
     tileN = 128
     tgN = (inter_dim + tileN - 1) // tileN
     support_list = [32, 64, 128]
@@ -909,7 +1146,7 @@ def get_2stage_cfgs(
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
-    cu_num = get_cu_num()
+    cu_num = _cached_cu_num
     keys = (
         cu_num,
         token,
@@ -923,7 +1160,7 @@ def get_2stage_cfgs(
         str(q_dtype_w),
         str(q_type),
         use_g1u1,
-        doweight_stage1,
+        bool(doweight_stage1),
     )
     keys_disabled = (
         cu_num,
@@ -938,7 +1175,7 @@ def get_2stage_cfgs(
         str(q_dtype_w),
         str(q_type),
         use_g1u1,
-        doweight_stage1,
+        bool(doweight_stage1),
     )
 
     def MainFunc():
@@ -1010,6 +1247,19 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    # Compute force_1stage for the gfx950 ASM fast path
+    force_1stage = _should_force_1stage_asm(
+        _cached_gfx,
+        q_type,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        use_g1u1,
+        doweight_stage1,
+        inter_dim,
+        token,
+    )
+
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
@@ -1039,15 +1289,19 @@ def get_2stage_cfgs(
             if run_1stage and q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
                 run_1stage_xbf16 = int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
 
-        block_m = (
-            BLOCK_SIZE_M
-            if run_1stage
-            else (
-                (64 if token > 32 else 16)
-                if q_type == QuantType.per_1x128
-                else get_block_size_M(token, topk, expert, inter_dim)
+        # For the gfx950 1-stage ASM fast path, use block_m=16 for per_1x128
+        if force_1stage and q_type == QuantType.per_1x128:
+            block_m = 16
+        else:
+            block_m = (
+                BLOCK_SIZE_M
+                if run_1stage
+                else (
+                    (64 if token > 32 else 16)
+                    if q_type == QuantType.per_1x128
+                    else get_block_size_M(token, topk, expert, inter_dim)
+                )
             )
-        )
         ksplit = (
             ksplit
             if (run_1stage)
@@ -1080,6 +1334,19 @@ def get_2stage_cfgs(
             run_1stage_xbf16 = run_1stage and bool(int(cfg["xbf16"]))
         else:
             run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
+
+    # Additive override: if force_1stage is True and the CSV/heuristic would
+    # produce run_1stage=False, force it to True and populate kernelName1.
+    if force_1stage and not run_1stage:
+        run_1stage = True
+        if dtype == dtypes.bf16:
+            kernelName1 = _FAST_PATH_KERNELNAME_BF16
+        elif dtype == dtypes.fp16:
+            kernelName1 = _FAST_PATH_KERNELNAME_FP16
+        else:
+            kv = _GFX950_BLOCKSCALE_NOVS_KERNELS.get((_cached_gfx, dtype), ("", ""))
+            kernelName1 = kv[0]
+        run_1stage_xbf16 = False
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
