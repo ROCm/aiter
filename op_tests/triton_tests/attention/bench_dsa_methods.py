@@ -1,19 +1,21 @@
 """
-Benchmark and correctness test for all 6 backward methods in deepseek_sparse_attention.py.
+Benchmark and correctness test for all 7 backward methods in deepseek_sparse_attention.py.
 
 Usage:
-  python bench_dsa_methods.py                   # correctness + benchmark (all 6 methods)
+  python bench_dsa_methods.py                   # correctness + benchmark (all methods)
   python bench_dsa_methods.py --bench-only      # benchmark only
   python bench_dsa_methods.py --test-only       # correctness only
 
-Six backward strategies:
+Backward strategies:
   1. "fused"              — single fused kernel (baseline)
   2. "recompute"          — split dQ+dKV, full S/P/dS recomputation (1.18x, 0 extra memory)
   3. "split_intermediate" — split dQ+dKV, stores dS/P intermediates (1.68x, 2 GiB extra)
   4. "privatized"         — split dQ+dKV, 8 private dKV copies (token_idx%8 routing)
-  5. "xcd_privatized"     — split dQ+dKV, 8 XCD-local copies (MI300X: (i%304)//38 routing)
+  5. "xcd_privatized"     — split dQ+dKV, 8 XCD-local copies (hw_id routing)
   6. "gather"             — split dQ+dKV, no atomics: [T,TOPK,D] bf16 intermediate +
                             CSR inverted topk gather (~7 GiB extra)
+  7. "chunked_gather"     — gather in R_CHUNK=64 rank passes; no dS/P storage;
+                            ~310 MB extra memory; expected ~19-22 ms
 """
 import sys
 import os
@@ -28,7 +30,7 @@ from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import
     sparse_mla_train,
 )
 
-METHODS = ["fused", "recompute", "split_intermediate", "privatized", "xcd_privatized", "gather"]
+METHODS = ["fused", "recompute", "split_intermediate", "privatized", "xcd_privatized", "gather", "chunked_gather"]
 
 
 # =====================================================================
@@ -201,6 +203,13 @@ def benchmark_methods(
                 ds_p = total_tokens * num_heads * topk * 2 * 2
                 interm = total_tokens * topk * d_qk * 2
                 extra = f"{(ds_p + interm) / 1024**3:.1f} GiB"
+            elif method == "chunked_gather":
+                # chunk dS+P [T,H,R_CHUNK] bf16×2 + [T,R_CHUNK,D] bf16 interm + [T,D] fp32 acc
+                R_CHUNK = min(256, topk)
+                chunk_ds_p = total_tokens * num_heads * R_CHUNK * 2 * 2
+                interm_buf = total_tokens * R_CHUNK * d_qk * 2
+                acc = total_tokens * d_qk * 4
+                extra = f"{(chunk_ds_p + interm_buf + acc) / 1024**3:.2f} GiB"
             else:
                 extra = "0"
 
