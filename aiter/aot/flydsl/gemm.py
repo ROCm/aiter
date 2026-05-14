@@ -331,6 +331,8 @@ def compile_one_config(
     kernel_name: str, kind: str, m: int, n: int, k: int, cu_num: int = 0, **kwargs
 ) -> dict:
     """Compile one GEMM kernel configuration and save it to cache."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
     aot_arch = cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
@@ -343,7 +345,9 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        with override_env("ARCH", aot_arch), override_env("FLYDSL_GPU_ARCH", aot_arch):
+        with override_env("ARCH", aot_arch), override_env(
+            "FLYDSL_GPU_ARCH", aot_arch
+        ), FakeTensorMode():
             if kind == "hgemm":
                 hgemm_kwargs = dict(kwargs)
                 hgemm_kwargs["target_gfx"] = aot_arch
