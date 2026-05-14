@@ -4,6 +4,7 @@
 #include "mha_bwd.h"
 #include "utils.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <functional>
@@ -351,6 +352,32 @@ bool run(const ck_tile::ArgParser& arg_parser)
         (mode == mode_enum::batch ? seqlen_q : seqstart_q_host.back());
     const ck_tile::index_t shape_seqlen_k =
         (mode == mode_enum::batch ? seqlen_k : seqstart_k_host.back());
+    // For group mode, the new launcher needs seqstart on host during construction.
+    // seqstart_q_host / seqstart_k_host are already host std::vector<int> from earlier.
+    const fmha_bwd_traits traits{
+        shape_seqlen_q,
+        shape_seqlen_k,
+        batch,
+        max_seqlen_q,
+        max_seqlen_k,
+        hdim_q,
+        hdim_v,
+        nhead,
+        nhead_k,
+        data_type,
+        mode == mode_enum::group,
+        mask.type,
+        bias.type,
+        use_dbias,
+        p_drop > 0.0f,
+        s_randval,
+        deterministic,
+        (mode == mode_enum::group) ? seqstart_q_host.data() : nullptr,
+        (mode == mode_enum::group) ? seqstart_k_host.data() : nullptr,
+    };
+    fmha_bwd_launcher launcher(traits);
+    // nsplits is still needed for the ASM atomic16 dq_accum tensor shape below.
+    // Recompute it independently since the new launcher no longer exposes dq_acc_splits.
     const ck_tile::index_t kN0 = (hdim_q <= 128) ? 128 : 64;
     const ck_tile::index_t nsplits =
         deterministic ? ck_tile::integer_divide_ceil(max_seqlen_k, kN0) : 1;
@@ -463,9 +490,24 @@ bool run(const ck_tile::ArgParser& arg_parser)
     ck_tile::DeviceMem drop_seed_buf(drop_prefs ? sizeof(uint64_t) : 0);
     ck_tile::DeviceMem drop_offset_buf(drop_prefs ? sizeof(uint64_t) : 0);
     ck_tile::DeviceMem alibi_slope_buf(alibi_slope_host.get_element_space_size_in_bytes());
-    ck_tile::DeviceMem dq_acc_buf(v3_atomic_fp32
-                                      ? dq_acc_host.get_element_space_size_in_bytes()
-                                      : dq_acc_host_a16.get_element_space_size_in_bytes());
+    const std::size_t asm_dq_acc_bytes =
+        v3_atomic_fp32 ? dq_acc_host.get_element_space_size_in_bytes()
+                       : dq_acc_host_a16.get_element_space_size_in_bytes();
+    const std::size_t ck_workspace_bytes = launcher.workspace_size;
+    ck_tile::DeviceMem dq_acc_buf(std::max(asm_dq_acc_bytes, ck_workspace_bytes));
+
+    // Pre-allocated dq_acc_buf serves the workspace_alloc callback (sized to max of
+    // ASM dq_accum and CK launcher workspace requirements).
+    auto workspace_alloc = [&dq_acc_buf](size_t bytes, bool zero_init) -> void* {
+        AITER_CHECK(bytes <= dq_acc_buf.GetBufferSize(),
+                    "benchmark workspace_alloc: requested ", bytes,
+                    " bytes but dq_acc_buf is ", dq_acc_buf.GetBufferSize());
+        if(zero_init)
+        {
+            HIP_CHECK_ERROR(hipMemset(dq_acc_buf.GetDeviceBuffer(), 0, bytes));
+        }
+        return dq_acc_buf.GetDeviceBuffer();
+    };
 
     q_buf.ToDevice(q_host.data());
     k_buf.ToDevice(k_host.data());
@@ -519,7 +561,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t stride_o       = (o_perm ? hdim_v : nhead * hdim_v);
         const ck_tile::index_t stride_randval = (max_seqlen_k);
         const ck_tile::index_t stride_do      = (o_perm ? hdim_v : nhead * hdim_v);
-        const ck_tile::index_t stride_dq_acc  = a16_dq_acc_hdim;
         const ck_tile::index_t stride_dk      = (i_perm ? hdim_q : nhead * hdim_q);
         const ck_tile::index_t stride_dv      = (i_perm ? hdim_v : nhead * hdim_v);
         const ck_tile::index_t stride_dbias   = (i_perm ? max_seqlen_k : nhead * max_seqlen_k);
@@ -532,7 +573,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t nhead_stride_randval = (shape_seqlen_q * max_seqlen_k);
         const ck_tile::index_t nhead_stride_do      = (o_perm ? shape_seqlen_q * hdim_v : hdim_v);
         const ck_tile::index_t nhead_stride_lsed    = shape_seqlen_q;
-        const ck_tile::long_index_t nhead_stride_dq_acc = a16_dq_acc_seq * a16_dq_acc_hdim;
         const ck_tile::index_t nhead_stride_dbias =
             (i_perm ? shape_seqlen_q * max_seqlen_k : max_seqlen_k);
         // setup batch_stride_* arguments
@@ -547,10 +587,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t batch_stride_dk      = (nhead * shape_seqlen_k * hdim_q);
         const ck_tile::index_t batch_stride_dv      = (nhead * shape_seqlen_k * hdim_v);
         const ck_tile::index_t batch_stride_dbias   = (nhead * shape_seqlen_q * max_seqlen_k);
-        const ck_tile::long_index_t batch_stride_dq_acc =
-            (nhead * a16_dq_acc_seq * a16_dq_acc_hdim);
-        const ck_tile::index_t split_stride_dq_acc =
-            (shape_batch * nhead * shape_seqlen_q * hdim_q);
 
         const auto drop_seed_offset = [&]() -> decltype(fmha_bwd_args::drop_seed_offset) {
             if(drop_prefs)
@@ -594,7 +630,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    dk_buf.GetDeviceBuffer(),
                                    dv_buf.GetDeviceBuffer(),
                                    dbias_buf.GetDeviceBuffer(),
-                                   dq_acc_buf.GetDeviceBuffer(),
                                    nullptr, // sink_ptr
                                    nullptr, // d_sink_ptr
                                    seqstart_q.GetDeviceBuffer(),
@@ -619,7 +654,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    stride_o,
                                    stride_randval,
                                    stride_do,
-                                   stride_dq_acc,
                                    stride_q, // stride_dq
                                    stride_dk,
                                    stride_dv,
@@ -632,7 +666,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    nhead_stride_randval,
                                    nhead_stride_do,
                                    nhead_stride_lsed,
-                                   nhead_stride_dq_acc,
                                    nhead_stride_q, // nhead_stride_dq
                                    nhead_stride_k, // nhead_stride_dk
                                    nhead_stride_v, // nhead_stride_dv
@@ -645,17 +678,16 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    batch_stride_randval,
                                    batch_stride_do,
                                    batch_stride_lsed,
-                                   batch_stride_dq_acc, // batch_stride_dq_acc
                                    batch_stride_q,      // batch_stride_dq
                                    batch_stride_dk,
                                    batch_stride_dv,
                                    batch_stride_dbias,
-                                   split_stride_dq_acc,
                                    mask.left,
                                    mask.right,
                                    p_drop,
                                    p_undrop,
-                                   drop_seed_offset};
+                                   drop_seed_offset,
+                                   workspace_alloc};
     }();
 
     float ave_time = aiter::mha_bwd(mha_args, stream_config);
@@ -891,7 +923,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
     lse_buf.ToDevice(lse_host.data());
     dq_buf.SetZero();
     dbias_buf.SetZero();
-    dq_acc_buf.SetZero();
 
     ck_tile::stream_config stream_config_v{
         nullptr, true, 0, 0, 1, arg_parser.get_str("timer") == std::string("gpu")};
