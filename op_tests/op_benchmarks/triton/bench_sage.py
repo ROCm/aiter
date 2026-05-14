@@ -17,7 +17,7 @@ import torch
 import triton
 
 import aiter
-from aiter.ops.mha import flash_attn_func, flash_attn_fp8_pertensor_func
+from aiter.ops.mha import flash_attn_func, flash_attn_fp8_pertensor_func, flash_attn_i8fp8_pertensor_func
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
@@ -63,6 +63,7 @@ KernelName = Literal[
     "sage_mxfp4",
     "fav3_fp8",
     "aiter_fp8",
+    "aiter_i8fp8",
     "aiter_bf16",
 ]
 
@@ -71,6 +72,7 @@ ALL_KERNELS: List[str] = [
     "sage_mxfp4",
     "fav3_fp8",
     "aiter_fp8",
+    "aiter_i8fp8",
     "aiter_bf16",
 ]
 
@@ -342,6 +344,35 @@ def fp8_quantize(
         dtypeMax=torch.finfo(quant_dtype).max,
     )
     return q_quant, k_quant, v_quant, q_descale, k_descale, v_descale
+
+
+def i8fp8_quantize(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Quantize Q/K to int8, V to fp8 (Sage-style)."""
+    # Q -> int8
+    q_amax = torch.abs(q).max()
+    q_scale = q_amax / 127.0
+    q_int8 = torch.clamp(torch.round(q / q_scale), -128, 127).to(torch.int8)
+    q_descale = q_scale.reshape(1).to(torch.float32)
+    # K -> int8
+    k_amax = torch.abs(k).max()
+    k_scale = k_amax / 127.0
+    k_int8 = torch.clamp(torch.round(k / k_scale), -128, 127).to(torch.int8)
+    k_descale = k_scale.reshape(1).to(torch.float32)
+    # V -> fp8
+    quant_dtype = aiter.dtypes.fp8
+    v_quant, v_descale = aiter.per_tensor_quant(
+        v,
+        scale=torch.abs(v).max(),
+        quant_dtype=quant_dtype,
+        dtypeMax=torch.finfo(quant_dtype).max,
+    )
+    return q_int8, k_int8, v_quant, q_descale, k_descale, v_descale
 
 
 def _unpack_block_lut(
@@ -625,6 +656,34 @@ def make_kernel_runner(
             v_descale=v_descale,
         )
 
+    if args.kernel == "aiter_i8fp8":
+
+        def _run_aiter_i8fp8():
+            q_i8, k_i8, v_fp8, q_ds, k_ds, v_ds = i8fp8_quantize(q_bshd, k_bshd, v_bshd)
+            return flash_attn_i8fp8_pertensor_func(
+                q_i8,
+                k_i8,
+                v_fp8,
+                q_descale=q_ds,
+                k_descale=k_ds,
+                v_descale=v_ds,
+            )
+
+        if args.e2e:
+            return _run_aiter_i8fp8
+
+        q_i8, k_i8, v_fp8, q_descale, k_descale, v_descale = i8fp8_quantize(
+            q_bshd, k_bshd, v_bshd
+        )
+        return lambda: flash_attn_i8fp8_pertensor_func(
+            q_i8,
+            k_i8,
+            v_fp8,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+
     if args.kernel == "fav3_fp8":
         return make_fav3_fp8_runner(
             q_bshd,
@@ -755,14 +814,14 @@ def benchmark_single_case(
         * (shape.d_head + shape.d_head_v)
     )
 
-    if args.kernel in ("fav3_fp8", "aiter_fp8", "sage_fp8", "sage_mxfp4"):
+    if args.kernel in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8", "sage_fp8", "sage_mxfp4"):
         q_elem_size = 1
         k_elem_size = 1
     else:
         q_elem_size = q.element_size()
         k_elem_size = k.element_size()
 
-    v_elem_size = 1 if args.kernel in ("fav3_fp8", "aiter_fp8") else v.element_size()
+    v_elem_size = 1 if args.kernel in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8") else v.element_size()
     mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
 
     sparse_flops = None
@@ -951,7 +1010,7 @@ def validate_args(args: argparse.Namespace) -> None:
         if args.load_captured:
             raise ValueError("--kernel=all does not support --load-captured")
 
-    _quantized_kernels = ("sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8")
+    _quantized_kernels = ("sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8", "aiter_i8fp8")
 
     if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
@@ -1251,6 +1310,7 @@ def parse_args() -> argparse.Namespace:
             "sage_mxfp4",
             "fav3_fp8",
             "aiter_fp8",
+            "aiter_i8fp8",
             "aiter_bf16",
             "all",
         ],
