@@ -1638,6 +1638,7 @@ def compile_mxscale_gemm(
 
         if const_expr(grouped_persistent_m):
             masked_m_rsrc = buffer_ops.create_buffer_resource(arg_masked_m, max_size=True)
+            prefix_rsrc = buffer_ops.create_buffer_resource(arg_m_tile_prefix, max_size=True)
             block_id0 = arith.index_cast(T.index, _raw(gpu.block_idx.x))
             grid_size = arith.index(_persistent_workers)
             idx_n = arith.index_cast(T.index, i32_n.ir_value())
@@ -1646,34 +1647,46 @@ def compile_mxscale_gemm(
             max_n_tiles_per_batch = (N + tile_n - 1) // tile_n
             max_tiles_per_batch = max_m_tiles_per_batch * max_n_tiles_per_batch
 
-            # CK Tile persistent grouped GEMM walks groups at runtime. Each
-            # worker keeps a global block id, accumulates the preceding groups'
-            # grid sizes, and advances block_id by the persistent grid size.
-            for batch_idx, group_state in range(0, batch_count, 1, init=[block_id0, arith.index(0)]):
-                block_id = group_state[0]
-                block_start = group_state[1]
-                valid_m_i32 = buffer_ops.buffer_load(
-                    masked_m_rsrc, batch_idx, vec_width=1, dtype=T.i32)
-                valid_m_idx = arith.index_cast(T.index, valid_m_i32)
-                m_tile_count = (valid_m_idx + arith.index(tile_m - 1)) / arith.index(tile_m)
-                block_end = block_start + m_tile_count * n_tiles_per_batch
+            # Early-quit: total tile count = prefix[batch_count] * n_tiles_per_batch.
+            # Workers whose initial block_id is already beyond total_tiles have
+            # nothing to do; gate the whole batch loop on a single check so
+            # idle workers skip the 256-step empty walk.
+            total_m_tiles_i32 = buffer_ops.buffer_load(
+                prefix_rsrc, batch_count, vec_width=1, dtype=T.i32)
+            total_m_tiles_idx = arith.index_cast(T.index, total_m_tiles_i32)
+            total_tiles = total_m_tiles_idx * n_tiles_per_batch
+            has_work = arith.cmpi(
+                arith.CmpIPredicate.slt, block_id0, total_tiles)
 
-                for _, tile_state in range(0, max_tiles_per_batch, 1, init=[block_id]):
-                    cur_block_id = tile_state[0]
-                    tile_active = arith.cmpi(
-                        arith.CmpIPredicate.slt, cur_block_id, block_end)
-                    if tile_active:
-                        local_tile = cur_block_id - block_start
-                        by_local = local_tile / m_tile_count
-                        bx_local = local_tile - by_local * m_tile_count
-                        _emit_tile(batch_idx, bx_local, by_local, arith.index(0))
-                        gpu.barrier()
+            if has_work:
+                # CK Tile persistent grouped GEMM walks groups at runtime. Each
+                # worker keeps a global block id, accumulates the preceding groups'
+                # grid sizes, and advances block_id by the persistent grid size.
+                for batch_idx, group_state in range(0, batch_count, 1, init=[block_id0, arith.index(0)]):
+                    block_id = group_state[0]
+                    block_start = group_state[1]
+                    valid_m_i32 = buffer_ops.buffer_load(
+                        masked_m_rsrc, batch_idx, vec_width=1, dtype=T.i32)
+                    valid_m_idx = arith.index_cast(T.index, valid_m_i32)
+                    m_tile_count = (valid_m_idx + arith.index(tile_m - 1)) / arith.index(tile_m)
+                    block_end = block_start + m_tile_count * n_tiles_per_batch
 
-                    next_block_id = arith.select(
-                        tile_active, cur_block_id + grid_size, cur_block_id)
-                    tile_results = yield [next_block_id]
+                    for _, tile_state in range(0, max_tiles_per_batch, 1, init=[block_id]):
+                        cur_block_id = tile_state[0]
+                        tile_active = arith.cmpi(
+                            arith.CmpIPredicate.slt, cur_block_id, block_end)
+                        if tile_active:
+                            local_tile = cur_block_id - block_start
+                            by_local = local_tile / m_tile_count
+                            bx_local = local_tile - by_local * m_tile_count
+                            _emit_tile(batch_idx, bx_local, by_local, arith.index(0))
+                            gpu.barrier()
 
-                group_results = yield [tile_results, block_end]
+                        next_block_id = arith.select(
+                            tile_active, cur_block_id + grid_size, cur_block_id)
+                        tile_results = yield [next_block_id]
+
+                    group_results = yield [tile_results, block_end]
         else:
             if const_expr(batch_count > 1):
                 flat_bx = arith.index_cast(T.index, _raw(gpu.block_idx.x))

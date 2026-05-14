@@ -245,22 +245,20 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             stream = torch.cuda.current_stream()
         tmp = torch.empty((cfg.experts, cfg.max_m, 2 * cfg.inter_dim), device=y.device, dtype=y.dtype)
         if cfg.grouped_persistent_m:
+            m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
             _run_compiled(
-                base, tmp, x, w, scale_x, scale_w, masked_m, masked_m,
+                base, tmp, x, w, scale_x, scale_w, masked_m, m_tile_prefix,
                 cfg.max_m, 2 * cfg.inter_dim, stream)
         else:
             _run_compiled(
                 base, tmp, x, w, scale_x, scale_w, masked_m,
                 cfg.max_m, 2 * cfg.inter_dim, stream)
-        for e in range(cfg.experts):
-            valid = _to_int(masked_m[e])
-            if valid <= 0:
-                continue
-            if valid > cfg.max_m:
-                raise ValueError(f"masked_m[{e}]={valid} exceeds max_m={cfg.max_m}")
-            gate = tmp[e, :valid, :cfg.inter_dim].float()
-            up = tmp[e, :valid, cfg.inter_dim:2 * cfg.inter_dim].float()
-            y[e, :valid].copy_(_apply_gate_up(gate, up, cfg.act).to(y.dtype))
+        # Apply gate*act(up) on GPU in a single fused op (no per-expert loop).
+        # Pad rows beyond masked_m may carry junk; downstream consumers honor
+        # masked_m so untouched rows are ignored.
+        gate_all = tmp[:, :, :cfg.inter_dim]
+        up_all = tmp[:, :, cfg.inter_dim:2 * cfg.inter_dim]
+        y.copy_(_apply_gate_up(gate_all, up_all, cfg.act).to(y.dtype))
         return y
 
     return launch
@@ -313,19 +311,14 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         if stream is None:
             stream = torch.cuda.current_stream()
         if cfg.grouped_persistent_m:
+            m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
             _run_compiled(
-                base, y, x, w, scale_x, scale_w, masked_m, masked_m,
+                base, y, x, w, scale_x, scale_w, masked_m, m_tile_prefix,
                 cfg.max_m, cfg.model_dim, stream)
         else:
             _run_compiled(
                 base, y, x, w, scale_x, scale_w, masked_m,
                 cfg.max_m, cfg.model_dim, stream)
-        for e in range(cfg.experts):
-            valid = _to_int(masked_m[e])
-            if valid <= 0:
-                continue
-            if valid > cfg.max_m:
-                raise ValueError(f"masked_m[{e}]={valid} exceeds max_m={cfg.max_m}")
         return y
 
     return launch

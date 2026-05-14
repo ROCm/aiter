@@ -31,6 +31,7 @@ from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (  # noqa:
     compile_moe_grouped_gemm1_mxfp4_masked,
     compile_moe_grouped_gemm2_mxfp4_masked,
 )
+from aiter.test_common import run_perftest  # noqa: E402
 from aiter.utility import dtypes  # noqa: E402
 from flydsl.runtime.device import get_rocm_arch  # noqa: E402
 
@@ -63,7 +64,17 @@ def _shape(
     tile_k: int = 128,
     m_warp: int = 1,
     n_warp: int = 2,
-) -> dict[str, int]:
+    num_buffers: int = 2,
+    waves_per_eu: int | None = None,
+    inst_prefetch: bool = False,
+    use_tdm_store: bool = True,
+    use_scale_opsel: bool = False,
+    wave_specialized_tdm: bool = False,
+    expert_sched_mode: bool = False,
+    persistent_workers: int | None = None,
+    cluster_m: int = 1,
+    cluster_n: int = 1,
+) -> dict:
     return dict(
         experts=experts,
         max_m=max_m,
@@ -74,11 +85,38 @@ def _shape(
         tile_k=tile_k,
         m_warp=m_warp,
         n_warp=n_warp,
+        num_buffers=num_buffers,
+        waves_per_eu=waves_per_eu,
+        inst_prefetch=inst_prefetch,
+        use_tdm_store=use_tdm_store,
+        use_scale_opsel=use_scale_opsel,
+        wave_specialized_tdm=wave_specialized_tdm,
+        expert_sched_mode=expert_sched_mode,
+        persistent_workers=persistent_workers,
+        cluster_m=cluster_m,
+        cluster_n=cluster_n,
     )
 
 
-def _masked_m(experts: int, max_m: int, *, mode: str = "mixed") -> torch.Tensor:
-    if mode == "full":
+_KERNEL_OPTION_KEYS = (
+    "tile_m", "tile_n", "tile_k", "m_warp", "n_warp",
+    "num_buffers", "waves_per_eu", "inst_prefetch", "use_tdm_store",
+    "use_scale_opsel", "wave_specialized_tdm", "expert_sched_mode",
+    "persistent_workers", "cluster_m", "cluster_n",
+)
+
+
+def _kernel_kwargs(s: dict) -> dict:
+    """Extract kernel-tuning kwargs to forward to compile_moe_grouped_gemm*."""
+    return {k: s[k] for k in _KERNEL_OPTION_KEYS if k in s}
+
+
+def _masked_m(experts: int, max_m: int, *, mode: str = "mixed", override: int | None = None) -> torch.Tensor:
+    if override is not None:
+        if override < 0 or override > max_m:
+            raise ValueError(f"masked_m override={override} must be in [0, max_m={max_m}]")
+        vals = [int(override)] * experts
+    elif mode == "full":
         vals = [max_m] * experts
     elif mode == "descending":
         vals = [max(0, max_m - (idx % 4) * max(1, max_m // 4)) for idx in range(experts)]
@@ -108,7 +146,22 @@ def _constant_mxfp4(rows: int, cols: int, byte: int = 0x11) -> torch.Tensor:
 
 def _mxfp4_batch(experts: int, rows: int, cols: int, *, mode: str, seed: int) -> torch.Tensor:
     if mode == "pattern":
-        return torch.stack([_pattern_mxfp4(rows, cols, seed=seed + e) for e in range(experts)])
+        # Vectorized: build the (rows*cols) index pattern once on GPU, broadcast
+        # to (experts, rows*cols) with per-expert seed offset, then pack. This
+        # replaces a 256-step CPU loop (which dominated build-inputs latency).
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        vals = torch.tensor([0, 1, 8, 9], dtype=torch.uint8, device=device)
+        base = torch.arange(rows * cols, dtype=torch.long, device=device)  # (R*C,)
+        seeds = torch.arange(experts, dtype=torch.long, device=device) + seed
+        idx = (base.view(1, -1) + seeds.view(-1, 1)) % vals.numel()       # (E, R*C)
+        u4 = vals[idx].view(experts, rows, cols)                           # (E, R, C)  uint8 with values in {0,1,8,9}
+        # Pack two nibbles per byte along the last dim.
+        if cols % 2 != 0:
+            raise ValueError(f"cols must be even, got {cols}")
+        low = u4[..., 0::2] & 0x0F
+        high = (u4[..., 1::2] & 0x0F) << 4
+        packed = (low | high).contiguous()
+        return packed.cpu()
     assert cols % 2 == 0
     return torch.full((experts, rows, cols // 2), 0x11, dtype=torch.uint8)
 
@@ -164,16 +217,32 @@ def _mock_grouped_mxfp4(
     experts, max_m = slot_token_ids.shape
     if mode == "constant":
         return torch.full((experts, max_m, cols // 2), 0x11, dtype=torch.uint8)
+    if cols % 2 != 0:
+        raise ValueError(f"cols must be even, got {cols}")
 
-    grouped = torch.zeros((experts, max_m, cols // 2), dtype=torch.uint8)
-    for expert in range(experts):
-        for row in range(max_m):
-            token = int(slot_token_ids[expert, row].item())
-            if token < 0:
-                continue
-            rank = int(slot_rank_ids[expert, row].item())
-            grouped[expert, row] = _pattern_mxfp4(1, cols, seed=seed + token * 17 + rank * 3 + expert)[0]
-    return grouped
+    # Vectorized version: build per-(expert,row) seed and pattern indices on GPU
+    # in one shot rather than 256x32=8192 host-side .item()/_pattern_mxfp4 calls.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    vals = torch.tensor([0, 1, 8, 9], dtype=torch.uint8, device=device)
+    slot_tok = slot_token_ids.to(device, dtype=torch.long)               # (E, max_m)
+    slot_rnk = slot_rank_ids.to(device, dtype=torch.long)
+    expert_idx = torch.arange(experts, dtype=torch.long, device=device).view(experts, 1)
+    valid = slot_tok >= 0                                                # (E, max_m) bool
+    base_seed = (
+        seed
+        + slot_tok.clamp(min=0) * 17
+        + slot_rnk.clamp(min=0) * 3
+        + expert_idx
+    )                                                                     # (E, max_m)
+    base_idx = torch.arange(cols, dtype=torch.long, device=device).view(1, 1, cols)  # (1, 1, cols)
+    idx = (base_idx + base_seed.unsqueeze(-1)) % vals.numel()             # (E, max_m, cols)
+    u4 = vals[idx]                                                        # (E, max_m, cols) uint8 in {0,1,8,9}
+    low = u4[..., 0::2] & 0x0F
+    high = (u4[..., 1::2] & 0x0F) << 4
+    packed = (low | high)                                                  # (E, max_m, cols//2)
+    # Zero out rows where slot_token_id < 0 (no token assigned).
+    packed = packed * valid.unsqueeze(-1)
+    return packed.contiguous().cpu()
 
 
 def _mxfp4_to_f32(x: torch.Tensor) -> torch.Tensor:
@@ -223,11 +292,42 @@ def _prep_scale_batch(scales: torch.Tensor, *, warp_tile: int, tile_k: int) -> t
 
 
 def _reference_mxfp4(a_fp4: torch.Tensor, b_fp4: torch.Tensor, a_scale: torch.Tensor, b_scale: torch.Tensor, m: int, n: int, k: int) -> torch.Tensor:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    a_fp4 = a_fp4.to(device, non_blocking=True)
+    b_fp4 = b_fp4.to(device, non_blocking=True)
+    a_scale = a_scale.to(device, non_blocking=True)
+    b_scale = b_scale.to(device, non_blocking=True)
     a_f32 = _mxfp4_to_f32(a_fp4.view(torch.uint8))[:m, :k]
     b_f32 = _mxfp4_to_f32(b_fp4.view(torch.uint8))[:n, :k]
     a_sc = _e8m0_to_f32(a_scale.view(torch.uint8)).repeat_interleave(SCALE_BLOCK, dim=-1)[:m, :k]
     b_sc = _e8m0_to_f32(b_scale.view(torch.uint8)).repeat_interleave(SCALE_BLOCK, dim=-1)[:n, :k]
     return torch.matmul(a_f32 * a_sc, (b_f32 * b_sc).T)
+
+
+def _reference_mxfp4_batched(
+    a_fp4: torch.Tensor,        # (B, M_pad, K_pack)  uint8
+    b_fp4: torch.Tensor,        # (B, N,     K_pack)  uint8
+    a_scale: torch.Tensor,      # (B, M_pad, K/32)    uint8
+    b_scale: torch.Tensor,      # (B, N,     K/32)    uint8
+    *,
+    k: int,
+) -> torch.Tensor:
+    """Batched FP4 GEMM reference -- single GPU call per intermediate, no host loop.
+
+    Returns (B, M_pad, N) float32. Caller must select rows [:valid] per expert.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    a_fp4 = a_fp4.to(device, non_blocking=True).contiguous()
+    b_fp4 = b_fp4.to(device, non_blocking=True).contiguous()
+    a_scale = a_scale.to(device, non_blocking=True).contiguous()
+    b_scale = b_scale.to(device, non_blocking=True).contiguous()
+    a_f32 = _mxfp4_to_f32(a_fp4.view(torch.uint8))[..., :k]
+    b_f32 = _mxfp4_to_f32(b_fp4.view(torch.uint8))[..., :k]
+    a_sc = _e8m0_to_f32(a_scale.view(torch.uint8)).repeat_interleave(SCALE_BLOCK, dim=-1)[..., :k]
+    b_sc = _e8m0_to_f32(b_scale.view(torch.uint8)).repeat_interleave(SCALE_BLOCK, dim=-1)[..., :k]
+    a_scaled = a_f32 * a_sc                                    # (B, M, K)
+    b_scaled = (b_f32 * b_sc).transpose(-1, -2).contiguous()    # (B, K, N)
+    return torch.matmul(a_scaled, b_scaled)                     # (B, M, N)
 
 
 def _assert_valid_rows_close(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -238,25 +338,43 @@ def _assert_valid_rows_close(name: str, actual: torch.Tensor, expected: torch.Te
     torch.testing.assert_close(actual, expected, rtol=0.25, atol=0.25)
 
 
-def _time_kernel(fn, *, warmup: int, iters: int) -> float:
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) * 1000.0 / max(1, iters)
+def _assert_batched_close(
+    name: str,
+    actual: torch.Tensor,        # (B, M_pad, N)
+    expected: torch.Tensor,      # (B, M_pad, N)
+    masked_m_cpu: torch.Tensor,  # (B,) int
+) -> None:
+    """Compare only the [:valid_m[e]] rows per expert in a single GPU op.
+
+    Builds a row mask of shape (B, M_pad, 1) on device, broadcasts, and asserts
+    once. Pad rows are forced to match (0 == 0) so they don't trigger failures.
+    """
+    actual = actual.float()
+    expected = expected.to(actual.device).float()
+    B, M_pad, _ = actual.shape
+    row_idx = torch.arange(M_pad, device=actual.device).view(1, M_pad)
+    masked_m_dev = masked_m_cpu.to(actual.device, dtype=torch.int32).view(B, 1)
+    row_mask = (row_idx < masked_m_dev).unsqueeze(-1).float()  # (B, M_pad, 1)
+    actual_masked = actual * row_mask
+    expected_masked = expected * row_mask
+    diff = (actual_masked - expected_masked).abs()
+    n_valid = float(row_mask.sum()) * actual.shape[-1]
+    max_abs = float(diff.max())
+    mean_abs = float(diff.sum() / max(n_valid, 1.0))
+    print(
+        f"[masked-grouped-moe-gemm] {name} batched: shape={tuple(actual.shape)} "
+        f"active_experts={int((masked_m_cpu > 0).sum().item())} "
+        f"max_abs={max_abs:.8e} mean_abs={mean_abs:.8e}",
+        flush=True,
+    )
+    torch.testing.assert_close(actual_masked, expected_masked, rtol=0.25, atol=0.25)
 
 
-def _run_stage1(s: dict[str, int], *, persistent: bool, verify: bool, data: str, masked_mode: str, warmup: int, iters: int) -> float:
+def _run_stage1(s: dict[str, int], *, persistent: bool, verify: bool, data: str, masked_mode: str, warmup: int, iters: int, masked_m_override: int | None = None) -> float:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
     _log(f"stage1 persistent={persistent}: build inputs")
-    masked_m = _masked_m(E, max_m, mode=masked_mode)
+    masked_m = _masked_m(E, max_m, mode=masked_mode, override=masked_m_override)
     x_raw = _mxfp4_batch(E, max_m, model_dim, mode=data, seed=0)
     w_raw = _mxfp4_batch(E, 2 * inter_dim, model_dim, mode=data, seed=17)
     x_scale_raw = torch.full((E, max_m, model_dim // SCALE_BLOCK), DEFAULT_SCALE_U8, dtype=torch.uint8)
@@ -269,8 +387,8 @@ def _run_stage1(s: dict[str, int], *, persistent: bool, verify: bool, data: str,
     compile_start = time.perf_counter()
     kernel = compile_moe_grouped_gemm1_mxfp4_masked(
         model_dim=model_dim, inter_dim=inter_dim, experts=E, max_m=max_m,
-        tile_m=s["tile_m"], tile_n=s["tile_n"], tile_k=s["tile_k"], m_warp=s["m_warp"], n_warp=s["n_warp"],
-        out_dtype="f16", num_buffers=2, expert_sched_mode=False, grouped_persistent_m=persistent,
+        out_dtype="f16", grouped_persistent_m=persistent,
+        **_kernel_kwargs(s),
     )
     _log(f"stage1 persistent={persistent}: compile done in {time.perf_counter() - compile_start:.2f}s")
     x = x_raw.cuda()
@@ -280,24 +398,35 @@ def _run_stage1(s: dict[str, int], *, persistent: bool, verify: bool, data: str,
         kernel(y, x, w, x_scale, w_scale, masked_m, max_m, inter_dim, model_dim, E, stream=torch.cuda.current_stream())
 
     _log(f"stage1 persistent={persistent}: launch warmup={warmup} iters={iters}")
-    us = _time_kernel(launch, warmup=warmup, iters=iters)
-    _log(f"stage1 persistent={persistent}: launch done")
+    _, us = run_perftest(launch, num_warmup=warmup, num_iters=iters, testGraph=False)
+    _log(f"stage1 persistent={persistent}: launch done us={us:.2f}")
     if verify:
-        for e in range(E):
-            valid = int(masked_m[e].item())
-            if valid == 0:
-                continue
-            gate_up = _reference_mxfp4(x_raw[e], w_raw[e], x_scale_raw[e], w_scale_raw[e], valid, 2 * inter_dim, model_dim)
-            expected = (torch.nn.functional.silu(gate_up[:, :inter_dim]) * gate_up[:, inter_dim:]).to(torch.float16).float()
-            _assert_valid_rows_close(f"stage1 persistent={persistent} expert={e}", y[e, :valid], expected)
+        masked_m_cpu_full = masked_m.cpu()
+        active_idx = torch.nonzero(masked_m_cpu_full > 0, as_tuple=False).flatten().tolist()
+        if active_idx:
+            active_t = torch.tensor(active_idx, dtype=torch.long)
+            gate_up_all = _reference_mxfp4_batched(
+                x_raw[active_t], w_raw[active_t],
+                x_scale_raw[active_t], w_scale_raw[active_t],
+                k=model_dim,
+            )  # (A, max_m, 2*inter_dim)
+            gate = gate_up_all[..., :inter_dim]
+            up = gate_up_all[..., inter_dim:]
+            expected_active = (torch.nn.functional.silu(gate) * up).to(torch.float16).float()
+            actual_active = y[active_t].float()
+            _assert_batched_close(
+                f"stage1 persistent={persistent}",
+                actual_active, expected_active,
+                masked_m_cpu_full[active_t],
+            )
     return us
 
 
-def _run_stage2(s: dict[str, int], *, persistent: bool, verify: bool, data: str, masked_mode: str, warmup: int, iters: int) -> float:
+def _run_stage2(s: dict[str, int], *, persistent: bool, verify: bool, data: str, masked_mode: str, warmup: int, iters: int, masked_m_override: int | None = None) -> float:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
     _log(f"stage2 persistent={persistent}: build inputs")
-    masked_m = _masked_m(E, max_m, mode=masked_mode)
+    masked_m = _masked_m(E, max_m, mode=masked_mode, override=masked_m_override)
     x_raw = _mxfp4_batch(E, max_m, inter_dim, mode=data, seed=31)
     w_raw = _mxfp4_batch(E, model_dim, inter_dim, mode=data, seed=47)
     x_scale_raw = torch.full((E, max_m, inter_dim // SCALE_BLOCK), DEFAULT_SCALE_U8, dtype=torch.uint8)
@@ -310,8 +439,8 @@ def _run_stage2(s: dict[str, int], *, persistent: bool, verify: bool, data: str,
     compile_start = time.perf_counter()
     kernel = compile_moe_grouped_gemm2_mxfp4_masked(
         model_dim=model_dim, inter_dim=inter_dim, experts=E, max_m=max_m,
-        tile_m=s["tile_m"], tile_n=s["tile_n"], tile_k=s["tile_k"], m_warp=s["m_warp"], n_warp=s["n_warp"],
-        out_dtype="f16", num_buffers=2, expert_sched_mode=False, grouped_persistent_m=persistent,
+        out_dtype="f16", grouped_persistent_m=persistent,
+        **_kernel_kwargs(s),
     )
     _log(f"stage2 persistent={persistent}: compile done in {time.perf_counter() - compile_start:.2f}s")
     x = x_raw.cuda()
@@ -321,15 +450,24 @@ def _run_stage2(s: dict[str, int], *, persistent: bool, verify: bool, data: str,
         kernel(y, x, w, x_scale, w_scale, masked_m, max_m, model_dim, inter_dim, E, stream=torch.cuda.current_stream())
 
     _log(f"stage2 persistent={persistent}: launch warmup={warmup} iters={iters}")
-    us = _time_kernel(launch, warmup=warmup, iters=iters)
-    _log(f"stage2 persistent={persistent}: launch done")
+    _, us = run_perftest(launch, num_warmup=warmup, num_iters=iters, testGraph=False)
+    _log(f"stage2 persistent={persistent}: launch done us={us:.2f}")
     if verify:
-        for e in range(E):
-            valid = int(masked_m[e].item())
-            if valid == 0:
-                continue
-            expected = _reference_mxfp4(x_raw[e], w_raw[e], x_scale_raw[e], w_scale_raw[e], valid, model_dim, inter_dim).to(torch.float16).float()
-            _assert_valid_rows_close(f"stage2 persistent={persistent} expert={e}", y[e, :valid], expected)
+        masked_m_cpu_full = masked_m.cpu()
+        active_idx = torch.nonzero(masked_m_cpu_full > 0, as_tuple=False).flatten().tolist()
+        if active_idx:
+            active_t = torch.tensor(active_idx, dtype=torch.long)
+            expected_active = _reference_mxfp4_batched(
+                x_raw[active_t], w_raw[active_t],
+                x_scale_raw[active_t], w_scale_raw[active_t],
+                k=inter_dim,
+            ).to(torch.float16).float()
+            actual_active = y[active_t].float()
+            _assert_batched_close(
+                f"stage2 persistent={persistent}",
+                actual_active, expected_active,
+                masked_m_cpu_full[active_t],
+            )
     return us
 
 
@@ -368,8 +506,8 @@ def _run_mock_moe(
     compile_start = time.perf_counter()
     k1 = compile_moe_grouped_gemm1_mxfp4_masked(
         model_dim=model_dim, inter_dim=inter_dim, experts=E, max_m=max_m,
-        tile_m=s["tile_m"], tile_n=s["tile_n"], tile_k=s["tile_k"], m_warp=s["m_warp"], n_warp=s["n_warp"],
-        out_dtype="f16", num_buffers=2, expert_sched_mode=False, grouped_persistent_m=persistent,
+        out_dtype="f16", grouped_persistent_m=persistent,
+        **_kernel_kwargs(s),
     )
     _log(f"mock moe stage1 persistent={persistent}: compile done in {time.perf_counter() - compile_start:.2f}s")
     x1 = x1_raw.cuda()
@@ -379,16 +517,26 @@ def _run_mock_moe(
         k1(y1, x1, w1, x1_scale, w1_scale, masked_m, max_m, inter_dim, model_dim, E, stream=torch.cuda.current_stream())
 
     _log(f"mock moe stage1 persistent={persistent}: launch warmup={warmup} iters={iters}")
-    us1 = _time_kernel(launch_stage1, warmup=warmup, iters=iters)
-    _log(f"mock moe stage1 persistent={persistent}: launch done")
+    _, us1 = run_perftest(launch_stage1, num_warmup=warmup, num_iters=iters, testGraph=False)
+    _log(f"mock moe stage1 persistent={persistent}: launch done us={us1:.2f}")
     if verify:
-        for e in range(E):
-            valid = int(masked_m_cpu[e].item())
-            if valid == 0:
-                continue
-            gate_up = _reference_mxfp4(x1_raw[e], w1_raw[e], x1_scale_raw[e], w1_scale_raw[e], valid, 2 * inter_dim, model_dim)
-            expected = (torch.nn.functional.silu(gate_up[:, :inter_dim]) * gate_up[:, inter_dim:]).to(torch.float16).float()
-            _assert_valid_rows_close(f"mock stage1 persistent={persistent} expert={e}", y1[e, :valid], expected)
+        active_idx = torch.nonzero(masked_m_cpu > 0, as_tuple=False).flatten().tolist()
+        if active_idx:
+            active_t = torch.tensor(active_idx, dtype=torch.long)
+            gate_up_all = _reference_mxfp4_batched(
+                x1_raw[active_t], w1_raw[active_t],
+                x1_scale_raw[active_t], w1_scale_raw[active_t],
+                k=model_dim,
+            )
+            gate = gate_up_all[..., :inter_dim]
+            up = gate_up_all[..., inter_dim:]
+            expected_active = (torch.nn.functional.silu(gate) * up).to(torch.float16).float()
+            actual_active = y1[active_t].float()
+            _assert_batched_close(
+                f"mock stage1 persistent={persistent}",
+                actual_active, expected_active,
+                masked_m_cpu[active_t],
+            )
 
     # Future integration point: replace this mocked quantized intermediate with
     # quantization of y1 once the end-to-end grouped MoE path is wired in.
@@ -404,8 +552,8 @@ def _run_mock_moe(
     compile_start = time.perf_counter()
     k2 = compile_moe_grouped_gemm2_mxfp4_masked(
         model_dim=model_dim, inter_dim=inter_dim, experts=E, max_m=max_m,
-        tile_m=s["tile_m"], tile_n=s["tile_n"], tile_k=s["tile_k"], m_warp=s["m_warp"], n_warp=s["n_warp"],
-        out_dtype="f16", num_buffers=2, expert_sched_mode=False, grouped_persistent_m=persistent,
+        out_dtype="f16", grouped_persistent_m=persistent,
+        **_kernel_kwargs(s),
     )
     _log(f"mock moe stage2 persistent={persistent}: compile done in {time.perf_counter() - compile_start:.2f}s")
     x2 = x2_raw.cuda()
@@ -415,28 +563,46 @@ def _run_mock_moe(
         k2(y2, x2, w2, x2_scale, w2_scale, masked_m, max_m, model_dim, inter_dim, E, stream=torch.cuda.current_stream())
 
     _log(f"mock moe stage2 persistent={persistent}: launch warmup={warmup} iters={iters}")
-    us2 = _time_kernel(launch_stage2, warmup=warmup, iters=iters)
-    _log(f"mock moe stage2 persistent={persistent}: launch done")
+    _, us2 = run_perftest(launch_stage2, num_warmup=warmup, num_iters=iters, testGraph=False)
+    _log(f"mock moe stage2 persistent={persistent}: launch done us={us2:.2f}")
     if verify:
         expected_topk_out = torch.zeros((tokens, topk, model_dim), device="cuda", dtype=torch.float32)
-        for e in range(E):
-            valid = int(masked_m_cpu[e].item())
-            if valid == 0:
-                continue
-            expected = _reference_mxfp4(x2_raw[e], w2_raw[e], x2_scale_raw[e], w2_scale_raw[e], valid, model_dim, inter_dim).to(torch.float16).float()
-            _assert_valid_rows_close(f"mock stage2 persistent={persistent} expert={e}", y2[e, :valid], expected)
-            for row in range(valid):
-                token = int(slot_token_ids[e, row].item())
-                rank = int(slot_rank_ids[e, row].item())
-                expected_topk_out[token, rank].copy_(expected[row])
+        active_idx = torch.nonzero(masked_m_cpu > 0, as_tuple=False).flatten().tolist()
+        if active_idx:
+            active_t = torch.tensor(active_idx, dtype=torch.long)
+            expected_all = _reference_mxfp4_batched(
+                x2_raw[active_t], w2_raw[active_t],
+                x2_scale_raw[active_t], w2_scale_raw[active_t],
+                k=inter_dim,
+            ).to(torch.float16).float()  # (A, max_m, model_dim)
+            actual_active = y2[active_t].float()
+            _assert_batched_close(
+                f"mock stage2 persistent={persistent}",
+                actual_active, expected_all,
+                masked_m_cpu[active_t],
+            )
+            # Scatter expected rows into (tokens, topk, model_dim). Active loop
+            # bound is small (= number of routed experts), so a per-row Python
+            # loop here is cheap compared to the 256-expert version.
+            for ai, e in enumerate(active_idx):
+                valid = int(masked_m_cpu[e].item())
+                for row in range(valid):
+                    token = int(slot_token_ids[e, row].item())
+                    rank = int(slot_rank_ids[e, row].item())
+                    expected_topk_out[token, rank].copy_(expected_all[ai, row])
 
+    # Vectorized scatter: gather rows that have a valid token/rank assignment
+    # into (tokens, topk, model_dim) without iterating experts on the host.
     topk_out = torch.zeros((tokens, topk, model_dim), device="cuda", dtype=torch.float16)
-    for expert in range(E):
-        valid = int(masked_m_cpu[expert].item())
-        for row in range(valid):
-            token = int(slot_token_ids[expert, row].item())
-            rank = int(slot_rank_ids[expert, row].item())
-            topk_out[token, rank].copy_(y2[expert, row])
+    row_idx = torch.arange(max_m, device="cuda").view(1, max_m)
+    valid_mask = (row_idx < masked_m.view(E, 1))                      # (E, max_m)  bool, GPU
+    flat_mask = valid_mask.view(-1)                                    # (E*max_m,)
+    if flat_mask.any():
+        flat_tokens = slot_token_ids.to("cuda").view(-1)               # (E*max_m,)
+        flat_ranks = slot_rank_ids.to("cuda").view(-1)
+        flat_y = y2.view(E * max_m, model_dim)                         # (E*max_m, model_dim)
+        sel = torch.nonzero(flat_mask, as_tuple=False).flatten()       # (R,) indices
+        topk_out[flat_tokens[sel], flat_ranks[sel]] = flat_y[sel]
     out = (topk_out.float() * topk_weights.cuda().unsqueeze(-1)).sum(dim=1).to(torch.float16)
     if verify:
         expected_out = (
@@ -505,13 +671,36 @@ def main() -> None:
     parser.add_argument("--tile-k", type=int, default=128)
     parser.add_argument("--m-warp", type=int, default=1)
     parser.add_argument("--n-warp", type=int, default=2)
+    parser.add_argument("--num-buffers", type=int, default=2,
+                        help="K-tile pipeline depth. Must satisfy K/tile_k >= num_buffers.")
+    parser.add_argument("--waves-per-eu", type=int, default=None,
+                        help="Override waves-per-EU (default: kernel decides).")
+    parser.add_argument("--persistent-workers", type=int, default=None,
+                        help="Override persistent grid size (default: get_cu_num()).")
+    parser.add_argument("--cluster-m", type=int, default=1,
+                        help="Workgroup cluster M (mutually exclusive with --persistent).")
+    parser.add_argument("--cluster-n", type=int, default=1,
+                        help="Workgroup cluster N (mutually exclusive with --persistent).")
+    parser.add_argument("--inst-prefetch", action=argparse.BooleanOptionalAction, default=False,
+                        help="Inject s_prefetch_inst_pc_rel hints (--inst-prefetch / --no-inst-prefetch).")
+    parser.add_argument("--use-tdm-store", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use LDS+TDM tensor_store_2d for C writeback.")
+    parser.add_argument("--use-scale-opsel", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use WMMA scale op_sel to reduce scale loads.")
+    parser.add_argument("--wave-specialized-tdm", action=argparse.BooleanOptionalAction, default=False,
+                        help="Dedicate one warp to TDM issue (requires 4-warp configs).")
+    parser.add_argument("--expert-sched-mode", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable LLVM amdgpu-expert-scheduling-mode.")
     parser.add_argument("--persistent", action="store_true", help="Use persistent grouped scheduling.")
     parser.add_argument("--non-persistent", action="store_true", help="Also run the non-persistent variant.")
     parser.add_argument("--verify", action="store_true", help="Run torch reference checks. Expensive for DeepSeek shapes.")
     parser.add_argument("--data", choices=("constant", "pattern"), default="constant")
     parser.add_argument("--masked-mode", choices=("mixed", "full", "descending"), default="mixed")
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--iters", type=int, default=3)
+    parser.add_argument("--masked-m-override", type=int, default=None,
+                        help="Force every expert's valid_m to this value (0..max_m). "
+                             "Useful for decode (M=1) cases where buffer max_m must be >= tile_m.")
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--iters", type=int, default=101)
     args = parser.parse_args()
 
     try:
@@ -528,6 +717,16 @@ def main() -> None:
         tile_k=args.tile_k,
         m_warp=args.m_warp,
         n_warp=args.n_warp,
+        num_buffers=args.num_buffers,
+        waves_per_eu=args.waves_per_eu,
+        inst_prefetch=args.inst_prefetch,
+        use_tdm_store=args.use_tdm_store,
+        use_scale_opsel=args.use_scale_opsel,
+        wave_specialized_tdm=args.wave_specialized_tdm,
+        expert_sched_mode=args.expert_sched_mode,
+        persistent_workers=args.persistent_workers,
+        cluster_m=args.cluster_m,
+        cluster_n=args.cluster_n,
     )
     persist_modes = [args.persistent]
     if args.non_persistent:
@@ -554,10 +753,10 @@ def main() -> None:
             print(f"[masked-grouped-moe-gemm] mock_moe persistent={persistent} stage1_us={us1:.2f} stage2_us={us2:.2f}", flush=True)
             continue
         if args.stage in ("1", "both"):
-            us = _run_stage1(s, persistent=persistent, verify=args.verify, data=args.data, masked_mode=args.masked_mode, warmup=args.warmup, iters=args.iters)
+            us = _run_stage1(s, persistent=persistent, verify=args.verify, data=args.data, masked_mode=args.masked_mode, warmup=args.warmup, iters=args.iters, masked_m_override=args.masked_m_override)
             print(f"[masked-grouped-moe-gemm] stage1 persistent={persistent} us={us:.2f}", flush=True)
         if args.stage in ("2", "both"):
-            us = _run_stage2(s, persistent=persistent, verify=args.verify, data=args.data, masked_mode=args.masked_mode, warmup=args.warmup, iters=args.iters)
+            us = _run_stage2(s, persistent=persistent, verify=args.verify, data=args.data, masked_mode=args.masked_mode, warmup=args.warmup, iters=args.iters, masked_m_override=args.masked_m_override)
             print(f"[masked-grouped-moe-gemm] stage2 persistent={persistent} us={us:.2f}", flush=True)
 
 
