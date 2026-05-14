@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 
 from aiter.ops.flydsl.kernels.gemm_fp8fp4_gfx1250 import compile_a8w4_gemm, compile_mxfp4_gemm
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 
 @dataclass(frozen=True)
@@ -244,11 +245,13 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             stream = torch.cuda.current_stream()
         tmp = torch.empty((cfg.experts, cfg.max_m, 2 * cfg.inter_dim), device=y.device, dtype=y.dtype)
         if cfg.grouped_persistent_m:
-            base(tmp, x, w, scale_x, scale_w, masked_m, masked_m,
-                 cfg.max_m, 2 * cfg.inter_dim, stream=stream)
+            _run_compiled(
+                base, tmp, x, w, scale_x, scale_w, masked_m, masked_m,
+                cfg.max_m, 2 * cfg.inter_dim, stream)
         else:
-            base(tmp, x, w, scale_x, scale_w, masked_m,
-                 cfg.max_m, 2 * cfg.inter_dim, stream=stream)
+            _run_compiled(
+                base, tmp, x, w, scale_x, scale_w, masked_m,
+                cfg.max_m, 2 * cfg.inter_dim, stream)
         for e in range(cfg.experts):
             valid = _to_int(masked_m[e])
             if valid <= 0:
@@ -310,11 +313,13 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         if stream is None:
             stream = torch.cuda.current_stream()
         if cfg.grouped_persistent_m:
-            base(y, x, w, scale_x, scale_w, masked_m, masked_m,
-                 cfg.max_m, cfg.model_dim, stream=stream)
+            _run_compiled(
+                base, y, x, w, scale_x, scale_w, masked_m, masked_m,
+                cfg.max_m, cfg.model_dim, stream)
         else:
-            base(y, x, w, scale_x, scale_w, masked_m,
-                 cfg.max_m, cfg.model_dim, stream=stream)
+            _run_compiled(
+                base, y, x, w, scale_x, scale_w, masked_m,
+                cfg.max_m, cfg.model_dim, stream)
         for e in range(cfg.experts):
             valid = _to_int(masked_m[e])
             if valid <= 0:
