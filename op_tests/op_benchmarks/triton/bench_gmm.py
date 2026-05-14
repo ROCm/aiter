@@ -220,9 +220,9 @@ def benchmark_gmm(
             gb_sum += 1e-9 * (read_bytes + write_bytes)
 
         # Compute milliseconds: milliseconds of all group sizes / number of group sizes.
-        p50_ms = round(p50_ms_sum / G, 4)
-        p20_ms = round(p20_ms_sum / G, 4)
-        p80_ms = round(p80_ms_sum / G, 4)
+        p50_ms = round(p50_ms_sum / num_group_sizes, 4)
+        p20_ms = round(p20_ms_sum / num_group_sizes, 4)
+        p80_ms = round(p80_ms_sum / num_group_sizes, 4)
 
         # Compute total seconds.
         p50_s_sum = 1e-3 * p50_ms_sum
