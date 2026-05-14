@@ -3,8 +3,12 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/aiter_core_pybind.cu'"
         ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
+        "flags_extra_hip": [
+            "'-DENABLE_CK=0'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
