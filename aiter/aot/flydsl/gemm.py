@@ -227,8 +227,7 @@ def _compile_hgemm_to_cache(
 
     import torch
 
-    has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
-    dev = torch.device("cuda") if has_cuda else torch.device("cpu")
+    dev = torch.device("cpu")
     torch_dtype = _torch_dtype_for_kernel(dtype)
 
     out = torch.empty((m, n), device=dev, dtype=torch_dtype)
@@ -245,7 +244,7 @@ def _compile_hgemm_to_cache(
         device=dev,
         dtype=torch.int32,
     )
-    stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
+    stream = fx.Stream(0)
 
     exe = compile_flydsl_hgemm_kernel(
         dtype,
@@ -297,8 +296,7 @@ def _compile_preshuffle_to_cache(
 
     import torch
 
-    has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
-    dev = torch.device("cuda") if has_cuda else torch.device("cpu")
+    dev = torch.device("cpu")
     out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
 
     # FlyDSL preshuffle kernels consume raw quantized bytes for fp8/int8 paths.
@@ -308,7 +306,7 @@ def _compile_preshuffle_to_cache(
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
     bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
-    stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
+    stream = fx.Stream(0)
 
     exe = compile_preshuffle_gemm_a8(
         N=n,
