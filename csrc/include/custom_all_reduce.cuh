@@ -2816,6 +2816,229 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
     }
 }
 
+template <typename T, typename QT>
+void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
+                                                T* input,
+                                                T* residual_inp,
+                                                T* residual_out,
+                                                QT* output,
+                                                float* scale_out,
+                                                T* weight,
+                                                float eps,
+                                                int m,
+                                                int n,
+                                                int group_size,
+                                                bool use_1stage,
+                                                T* bf16_output = nullptr)
+{
+    auto d   = 16 / sizeof(T);
+    int size = m * n;
+    if(size % d != 0)
+    {
+        throw std::runtime_error("custom allreduce currently requires input length to be multiple "
+                                 "of " +
+                                 std::to_string(d));
+    }
+    // Per-group FP8 quant kernel constraints. The fused epilogue
+    // ``ar_fusion_epilogue_per_group`` uses a butterfly ``__shfl_xor``
+    // intra-group abs-max reduction with packed 16B loads, which imposes
+    // the following requirements on ``group_size``:
+    //
+    //   (a) group_size > 0
+    //   (b) group_size % PACK_SIZE == 0            (PACK_SIZE = 16/sizeof(T))
+    //   (c) (group_size / PACK_SIZE) is a power of two
+    //   (d) (group_size / PACK_SIZE) <= wavefront size (64 on CDNA)
+    //   (e) n % group_size == 0
+    //
+    // Without (a)-(d) the kernel would silently produce wrong scales
+    // (ill-formed butterfly stride, cross-warp shuffles, or a fractional
+    // pack per group); without (e) ``num_groups = n / group_size`` would
+    // not be an integer. Reject up front with an actionable message.
+    constexpr int kPackSize      = 16 / sizeof(T);
+    constexpr int kWavefrontSize = 64; // AMD CDNA wavefront width (gfx94x / gfx950)
+    if(group_size <= 0)
+    {
+        throw std::runtime_error(
+            "per-group quant requires group_size > 0, got group_size=" +
+            std::to_string(group_size));
+    }
+    if(group_size % kPackSize != 0)
+    {
+        throw std::runtime_error(
+            "per-group quant requires group_size divisible by PACK_SIZE=" +
+            std::to_string(kPackSize) + " (16/sizeof(T)), got group_size=" +
+            std::to_string(group_size));
+    }
+    int const threads_per_group_check = group_size / kPackSize;
+    if((threads_per_group_check & (threads_per_group_check - 1)) != 0)
+    {
+        throw std::runtime_error(
+            "per-group quant requires group_size/PACK_SIZE to be a power of two "
+            "(butterfly __shfl_xor reduction), got group_size=" +
+            std::to_string(group_size) +
+            " PACK_SIZE=" + std::to_string(kPackSize) +
+            " threads_per_group=" + std::to_string(threads_per_group_check));
+    }
+    if(threads_per_group_check > kWavefrontSize)
+    {
+        throw std::runtime_error(
+            "per-group quant requires group_size/PACK_SIZE <= wavefront size (" +
+            std::to_string(kWavefrontSize) +
+            "), got group_size=" + std::to_string(group_size) +
+            " PACK_SIZE=" + std::to_string(kPackSize) +
+            " threads_per_group=" + std::to_string(threads_per_group_check));
+    }
+    if(n % group_size != 0)
+    {
+        throw std::runtime_error(
+            "per-group quant requires n divisible by group_size, n=" +
+            std::to_string(n) + " group_size=" + std::to_string(group_size));
+    }
+    RankData* ptrs   = get_buffer_RD(stream, input);
+    auto pack_size   = 16 / sizeof(T);
+    bool n_constrain = (n % pack_size == 0) && (n / pack_size <= 1024);
+
+    use_1stage = use_1stage && n_constrain;
+
+#define DISPATCH_AR_FUSION_PG_KERNEL(NGPUS)                                               \
+    if(use_1stage)                                                                         \
+    {                                                                                      \
+        allreduce_fusion_kernel_1stage_per_group_launcher<T, QT, NGPUS>(                   \
+            ptrs, sg_, self_sg_, rank_,                                                     \
+            residual_inp, residual_out, output, weight, scale_out,                          \
+            size, n, group_size, eps, stream, bf16_output);                                 \
+        return;                                                                             \
+    }                                                                                      \
+    else if(n_constrain && (size * sizeof(T) <= 512 * 1024))                               \
+    {                                                                                      \
+        allreduce_fusion_kernel_2stage_per_group_launcher<T, QT, NGPUS>(                   \
+            ptrs, sg_, self_sg_, rank_,                                                     \
+            residual_inp, residual_out, output, weight, scale_out,                          \
+            size, n, group_size, eps, stream, bf16_output);                                 \
+        return;                                                                             \
+    }                                                                                      \
+    else if(n_constrain)                                                                   \
+    {                                                                                      \
+        allreduce_fusion_kernel_split_per_group_launcher<T, QT, NGPUS>(                    \
+            ptrs, sg_, self_sg_, rank_,                                                     \
+            residual_inp, residual_out, output, weight, scale_out,                          \
+            size, n, group_size, eps, stream, bf16_output);                                 \
+        return;                                                                             \
+    }                                                                                      \
+    else                                                                                   \
+    {                                                                                      \
+        throw std::runtime_error(                                                           \
+            "per-group quant fused kernel: unsupported n");                                  \
+    }
+
+    switch(world_size_)
+    {
+    case 8: DISPATCH_AR_FUSION_PG_KERNEL(8); break;
+    case 4: DISPATCH_AR_FUSION_PG_KERNEL(4); break;
+    case 2: DISPATCH_AR_FUSION_PG_KERNEL(2); break;
+    default:
+        throw std::runtime_error(
+            "fused allreduce rmsnorm per-group quant: unsupported world_size=" +
+            std::to_string(world_size_));
+    }
+#undef DISPATCH_AR_FUSION_PG_KERNEL
+}
+
+
+template <typename T, typename QT>
+void dispatchFusedAllReduceRMSNormPerTensorQuant(hipStream_t stream,
+                                                  T* input,
+                                                  T* residual_inp,
+                                                  T* residual_out,
+                                                  QT* output,
+                                                  float scale_factor,
+                                                  T* weight,
+                                                  float eps,
+                                                  int m,
+                                                  int n,
+                                                  bool use_1stage)
+{
+    auto d   = 16 / sizeof(T);
+    int size = m * n;
+    if(size % d != 0)
+        throw std::runtime_error(
+            "custom allreduce requires input length to be multiple of " + std::to_string(d));
+
+    float inv_scale = (scale_factor == 0.f) ? 1.f : 1.f / scale_factor;
+    RankData* ptrs  = get_buffer_RD(stream, input);
+    auto pack_size  = 16 / sizeof(T);
+    bool n_constrain = (n % pack_size == 0) && (n / pack_size <= 1024);
+    use_1stage       = use_1stage && n_constrain;
+
+#define DISPATCH_AR_FUSION_PT_KERNEL(NGPUS)                                                    \
+    if(use_1stage)                                                                             \
+    {                                                                                          \
+        allreduce_fusion_kernel_1stage_per_tensor_quant_launcher<T, QT, NGPUS>(ptrs,           \
+                                                              sg_,                             \
+                                                              self_sg_,                        \
+                                                              rank_,                           \
+                                                              residual_inp,                    \
+                                                              residual_out,                    \
+                                                              output,                          \
+                                                              weight,                          \
+                                                              inv_scale,                       \
+                                                              size,                            \
+                                                              n,                               \
+                                                              eps,                             \
+                                                              stream);                         \
+        return;                                                                                \
+    }                                                                                          \
+    else if(n_constrain && (size * sizeof(T) <= 512 * 1024))                                   \
+    {                                                                                          \
+        allreduce_fusion_kernel_2stage_per_tensor_quant_launcher<T, QT, NGPUS>(ptrs,           \
+                                                              sg_,                             \
+                                                              self_sg_,                        \
+                                                              rank_,                           \
+                                                              residual_inp,                    \
+                                                              residual_out,                    \
+                                                              output,                          \
+                                                              weight,                          \
+                                                              inv_scale,                       \
+                                                              size,                            \
+                                                              n,                               \
+                                                              eps,                             \
+                                                              stream);                         \
+        return;                                                                                \
+    }                                                                                          \
+    else if(n_constrain)                                                                       \
+    {                                                                                          \
+        allreduce_fusion_kernel_split_per_tensor_quant_launcher<T, QT, NGPUS>(ptrs,            \
+                                                             sg_,                              \
+                                                             self_sg_,                         \
+                                                             rank_,                            \
+                                                             residual_inp,                     \
+                                                             residual_out,                     \
+                                                             output,                           \
+                                                             weight,                           \
+                                                             inv_scale,                        \
+                                                             size,                             \
+                                                             n,                                \
+                                                             eps,                              \
+                                                             stream);                          \
+        return;                                                                                \
+    }                                                                                          \
+    else                                                                                       \
+    {                                                                                          \
+        printf("fused allreduce rmsnorm per_tensor_quant: n=%d not supported\n", n);           \
+    }
+
+    switch(world_size_)
+    {
+    case 8: DISPATCH_AR_FUSION_PT_KERNEL(8); break;
+    case 4: DISPATCH_AR_FUSION_PT_KERNEL(4); break;
+    case 2: DISPATCH_AR_FUSION_PT_KERNEL(2); break;
+    default:
+        throw std::runtime_error(
+            "fused allreduce rmsnorm per_tensor_quant: unsupported world_size=" +
+            std::to_string(world_size_));
+    }
+#undef DISPATCH_AR_FUSION_PT_KERNEL
+}
 ~CustomAllreduce()
 {
     for(auto [_, ptr] : ipc_handles_)

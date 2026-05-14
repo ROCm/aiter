@@ -730,6 +730,198 @@ class CustomAllreduce:
                 post_per_token_quant=True,
             )
 
+
+    def fused_ar_rms_per_tensor_quant(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        *,
+        res_out: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
+        w: torch.Tensor,
+        eps: float,
+        scale_factor: float,
+        registered: bool = False,
+        use_1stage: bool = False,
+    ):
+        """AR + RMSNorm + per-tensor static FP8 quantization.
+
+        Args:
+            scale_factor: pre-calibrated static scale (positive float).
+                          output_fp8 = clamp(rms_out / scale_factor, FP8_MIN, FP8_MAX)
+        Returns:
+            (out: fp8 tensor, res_out: bf16/fp16 tensor)
+        """
+        if res_out is None:
+            res_out = torch.empty_like(inp)
+        if out is None:
+            out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        ops.fused_allreduce_rmsnorm_per_tensor_quant(
+            self._ptr,
+            inp,
+            res_inp,
+            res_out,
+            out,
+            float(scale_factor),
+            w,
+            eps,
+            reg,
+            reg_bytes,
+            use_1stage,
+        )
+        return out, res_out
+
+    def custom_fused_ar_rms_per_tensor_quant(
+        self,
+        input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        scale_factor: float,
+        use_1stage: bool,
+    ):
+        """Fused AR+RMSNorm+per-tensor-static-FP8-quant with graph-capture support.
+
+        Returns (out_fp8, res_out_bf16) or None if custom allreduce is not applicable.
+        """
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_ar_rms_per_tensor_quant(
+                    input,
+                    residual_inp,
+                    w=weight,
+                    eps=eps,
+                    scale_factor=scale_factor,
+                    registered=True,
+                    use_1stage=use_1stage,
+                )
+            else:
+                dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
+                return dummy_out, torch.zeros_like(input)
+        else:
+            return self.fused_ar_rms_per_tensor_quant(
+                input,
+                residual_inp,
+                w=weight,
+                eps=eps,
+                scale_factor=scale_factor,
+                registered=False,
+                use_1stage=use_1stage,
+            )
+
+    def fused_ar_rms_per_group_quant(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        *,
+        w: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        registered: bool = False,
+        use_1stage: bool = False,
+        emit_bf16: bool = False,
+    ):
+        K = inp.shape[-1]
+        # Fail fast on bad ``group_size`` at the Python boundary. Mirrors
+        # the C++ host dispatcher checks; catching it here surfaces a
+        # synchronous ``ValueError`` instead of a post-launch
+        # ``RuntimeError`` that would only fire at CUDA-graph replay and
+        # would be much harder to attribute to the offending call site.
+        _validate_per_group_size(group_size, inp.element_size(), K)
+        res_out = torch.empty_like(inp)
+        num_groups = K // group_size
+        out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
+        scale_out = torch.empty(
+            inp.shape[:-1] + (num_groups,), dtype=torch.float32, device=inp.device
+        )
+        # Optional bf16/fp16 mirror of the pre-quantization normed output.
+        # Requested by GDN-style layers that also need an unquantized view
+        # (e.g. Qwen3.5 in_proj_ba). Zero-overhead when not requested
+        # because the kernel branches on the pointer being non-null.
+        bf16_out = None
+        bf16_ptr = 0
+        if emit_bf16:
+            bf16_out = torch.empty_like(inp)
+            bf16_ptr = int(bf16_out.data_ptr())
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        ops.fused_allreduce_rmsnorm_quant_per_group(
+            self._ptr,
+            inp,
+            res_inp,
+            res_out,
+            out,
+            scale_out,
+            w,
+            eps,
+            group_size,
+            reg,
+            reg_bytes,
+            use_1stage,
+            bf16_ptr,
+        )
+        if emit_bf16:
+            return out, res_out, scale_out, bf16_out
+        return out, res_out, scale_out
+
+    def custom_fused_ar_rms_per_group_quant(
+        self,
+        input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        use_1stage: bool = False,
+        emit_bf16: bool = False,
+    ):
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_ar_rms_per_group_quant(
+                    input,
+                    residual_inp,
+                    w=weight,
+                    eps=eps,
+                    group_size=group_size,
+                    registered=True,
+                    use_1stage=use_1stage,
+                    emit_bf16=emit_bf16,
+                )
+            else:
+                K = input.shape[-1]
+                num_groups = K // group_size
+                dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
+                dummy_scale = torch.zeros(
+                    input.shape[:-1] + (num_groups,),
+                    dtype=torch.float32,
+                    device=input.device,
+                )
+                if emit_bf16:
+                    return (
+                        dummy_out,
+                        torch.zeros_like(input),
+                        dummy_scale,
+                        torch.zeros_like(input),
+                    )
+                return dummy_out, torch.zeros_like(input), dummy_scale
+        else:
+            return self.fused_ar_rms_per_group_quant(
+                input,
+                residual_inp,
+                w=weight,
+                eps=eps,
+                group_size=group_size,
+                registered=False,
+                use_1stage=use_1stage,
+                emit_bf16=emit_bf16,
+            )
+
     def close(self):
         if not self.disabled and self._ptr:
             ops.dispose(self._ptr)

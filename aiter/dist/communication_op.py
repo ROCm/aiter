@@ -65,6 +65,51 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     )
 
 
+def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    emit_bf16: bool = False,
+):
+    return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        group_size,
+        prefill_support,
+        emit_bf16=emit_bf16,
+    )
+
+
+
+def tensor_model_parallel_fused_allreduce_rmsnorm_per_tensor_quant(
+    input_: "torch.Tensor",
+    residual_inp_: "torch.Tensor",
+    weight_: "torch.Tensor",
+    eps: float,
+    scale_factor: float,
+    prefill_support: bool = False,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Fused AllReduce + RMSNorm + per-tensor static FP8 quantization across TP group.
+
+    Args:
+        scale_factor: pre-calibrated static scale scalar (float).
+    Returns:
+        (fp8_out, res_out) — the fp8 quantized output and the bf16/fp16 residual.
+    """
+    return get_tp_group().fused_allreduce_rmsnorm_per_tensor_quant(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        scale_factor,
+        prefill_support,
+    )
+
 def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().custom_all_gather(input_)
 

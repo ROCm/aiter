@@ -184,6 +184,41 @@ def fused_allreduce_rmsnorm_quant_(
     )
 
 
+def fused_allreduce_rmsnorm_per_tensor_quant_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    scale_factor: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fp8_dtype = torch.float8_e4m3fnuz
+    return (
+        torch.empty_like(inp, dtype=fp8_dtype),
+        torch.empty_like(res_inp),
+    )
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_per_tensor_quant_fake)
+def fused_allreduce_rmsnorm_per_tensor_quant_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    scale_factor: float,
+    group_name: str,
+    prefill_support: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_per_tensor_quant_out_place(
+        inp, res_inp, w, eps, scale_factor, prefill_support
+    )
+
+
+
 if supports_custom_op():
 
     # @torch.library.custom_op("aiter::outplace_all_gather", mutates_args=[])
@@ -486,6 +521,45 @@ class GroupCoordinator:
             residual_inp_,
             weight_,
             eps,
+            prefill_support,
+        )
+
+    def fused_allreduce_rmsnorm_per_tensor_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        scale_factor: float,
+        prefill_support: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return fused_allreduce_rmsnorm_per_tensor_quant_(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            scale_factor,
+            group_name=self.unique_name,
+            prefill_support=prefill_support,
+        )
+
+    def _fused_allreduce_rmsnorm_per_tensor_quant_out_place(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        scale_factor: float,
+        prefill_support: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_per_tensor_quant(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            scale_factor,
             prefill_support,
         )
 

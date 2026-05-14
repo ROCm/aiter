@@ -288,6 +288,127 @@ class CudaCommunicator(DeviceCommunicatorBase):
         assert scale_out is not None
         return out, res_out, scale_out
 
+
+    def fused_allreduce_rmsnorm_per_tensor_quant(
+        self,
+        input_,
+        res_inp_,
+        weight_,
+        eps,
+        scale_factor: float,
+        prefill_support: bool = False,
+    ) -> tuple:
+        """Fused AllReduce + RMSNorm + per-tensor static FP8 quantization.
+
+        Args:
+            scale_factor: static quantization scale (positive float, pre-calibrated).
+                          Kernel computes: fp8_out = clamp(rms_out / scale_factor)
+        Returns:
+            (fp8_out, res_out)  — no scale tensor is returned (caller already has it)
+        """
+        n = input_.shape[-1]
+        total_bytes = input_.numel() * input_.element_size()
+        can_use_fuse = (
+            n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
+        )
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_)
+            and can_use_fuse
+            and int(input_.shape[-1]) % (16 // input_.element_size()) == 0
+        ):
+            if not prefill_support and total_bytes > 64 * 1024 * 1024:
+                pass  # fall through to split path for large prefill
+            else:
+                use_1stage = (
+                    self._ar_1stage_override
+                    if self._ar_1stage_override is not None
+                    else (total_bytes <= 128 * 1024)
+                )
+                result = ca_comm.custom_fused_ar_rms_per_tensor_quant(
+                    input_, res_inp_, weight_, eps, scale_factor, use_1stage
+                )
+                if result is not None:
+                    out, res_out = result
+                    assert out is not None
+                    assert res_out is not None
+                    return out, res_out
+
+        # Fallback: fused AR+RMSNorm then separate per-tensor quant
+        ar_rms_out, res_out = self.fused_allreduce_rmsnorm(
+            input_, res_inp_, weight_, eps, prefill_support
+        )
+        from aiter.utility.dtypes import fp8
+        inv_scale = 1.0 / scale_factor if scale_factor != 0.0 else 1.0
+        fp8_max = 448.0  # max representable e4m3fnuz value
+        out_fp8 = ar_rms_out.float().mul_(inv_scale).clamp_(-fp8_max, fp8_max).to(fp8)
+        return out_fp8, res_out
+
+    def fused_allreduce_rmsnorm_quant_per_group(
+        self,
+        input_,
+        res_inp_,
+        weight_,
+        eps,
+        group_size=128,
+        prefill_support: bool = False,
+        emit_bf16: bool = False,
+    ):
+        """Fused AR+RMSNorm+per-group FP8 quant, optionally also emitting the
+        pre-quantization bf16/fp16 normed output.
+
+        When ``emit_bf16=False`` returns ``(fp8, residual_out, scale)``.
+        When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` —
+        used by GDN-style layers that have both an FP8 projection and a bf16
+        gating projection consuming the same normed activation, so they can
+        skip the separate per-group quant kernel entirely (see Qwen3.5).
+        """
+        total_bytes = input_.numel() * input_.element_size()
+        K = input_.shape[-1]
+        fused_ok = False
+        out = res_out = scale_out = bf16_out = None
+        if (
+            K % group_size == 0
+            and K <= 16384
+            and total_bytes < 8 * 1024 * 8192
+            and self.world_size != 6
+            and (prefill_support or total_bytes <= 64 * 1024 * 1024)
+        ):
+            use_1stage = (
+                self._ar_1stage_override
+                if self._ar_1stage_override is not None
+                else (total_bytes <= 128 * 1024)
+            )
+            try:
+                result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
+                    input_, res_inp_, weight_, eps, group_size, use_1stage,
+                    emit_bf16=emit_bf16,
+                )
+                if emit_bf16:
+                    out, res_out, scale_out, bf16_out = result
+                else:
+                    out, res_out, scale_out = result
+                fused_ok = True
+            except Exception:
+                pass
+        if not fused_ok:
+            out_, res_out = self.fused_allreduce_rmsnorm(
+                input_, res_inp_, weight_, eps, prefill_support
+            )
+            hip_quant = get_hip_quant(QuantType.per_1x128)
+            out, scale_out = hip_quant(out_, quant_dtype=fp8)
+            if emit_bf16:
+                bf16_out = out_
+        assert out is not None
+        assert res_out is not None
+        assert scale_out is not None
+        if emit_bf16:
+            assert bf16_out is not None
+            return out, res_out, scale_out, bf16_out
+        return out, res_out, scale_out
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:
             dim += input_.dim()

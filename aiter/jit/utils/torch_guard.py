@@ -82,6 +82,7 @@ NONE_WRAPPED_OP = [
     "all_gather_unreg",
     "fused_allreduce_rmsnorm",
     "fused_allreduce_rmsnorm_quant",
+    "fused_allreduce_rmsnorm_per_tensor_quant",
 ]
 
 
