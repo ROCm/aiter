@@ -22,26 +22,26 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       float* __restrict__ scale,
                                       DTYPE_I const* __restrict__ input,
                                       float const* __restrict__ scale_ub,
-                                      int32_t ori_rows,
+                                      int64_t ori_rows,
                                       int32_t ori_cols,
                                       int32_t ori_row_stride,
-                                      int32_t oob_size,
+                                      int64_t oob_size,
                                       int32_t const* __restrict__ num_rows = nullptr,
                                       const int32_t num_cols_factor        = 1)
 {
     if(num_rows != nullptr)
     {
-        ori_rows = *num_rows * num_cols_factor;
+        ori_rows = static_cast<int64_t>(*num_rows) * num_cols_factor;
     }
     static constexpr int num_thread_per_group = group_size / thread_data_size;
-    int32_t row_offset       = blockIdx.x * block_size;
-    int32_t groupId          = (row_offset + threadIdx.x) / num_thread_per_group;
+    int64_t row_offset       = static_cast<int64_t>(blockIdx.x) * block_size;
+    int64_t groupId          = (row_offset + threadIdx.x) / num_thread_per_group;
     int32_t scaleN           = ori_cols / group_size;
     int32_t scaleN_pad       = (std::is_same_v<DTYPE_O, opus::fp4_t> && shuffle_scale)
                                    ? (((scaleN + 7) / 8) * 8)
                                    : scaleN;
-    int32_t x                = groupId / scaleN_pad;
-    int32_t y                = groupId % scaleN_pad;
+    int64_t x                = groupId / scaleN_pad;
+    int32_t y                = static_cast<int32_t>(groupId % scaleN_pad);
     if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
     {
         if(x >= ori_rows || y >= scaleN)
@@ -93,7 +93,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             uint8_t exponent = (__builtin_bit_cast(uint32_t, inverted_scale) >> 23) & 0b11111111;
             if constexpr(shuffle_scale)
             {
-                groupId = aiter::fp4_scale_shuffle_idx(scaleN_pad, x, y);
+                groupId = aiter::fp4_scale_shuffle_idx(scaleN_pad, static_cast<int>(x), y);
             }
             tmp[groupId] = exponent;
         }
@@ -703,11 +703,13 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                 using out_t = decltype(out_type_tag);
                 constexpr bool ss = decltype(shuffle_tag)::value;
                 static constexpr int32_t ooba = 4 / sizeof(out_t);
-                int32_t oob_size = ((ori_rows * ori_cols + ooba - 1) / ooba * ooba) * sizeof(out_t);
+                const int64_t oob_elems =
+                    (static_cast<int64_t>(ori_rows) * ori_cols + ooba - 1) / ooba * ooba;
+                const int64_t oob_size = oob_elems * static_cast<int64_t>(sizeof(out_t));
                 dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
                 dim3 const block(dynGroupQuantBlockSize);
                 AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
-                    input.dtype(), "dynamic_p/app/aiter-test/csrc/kernels/quant_kernels.cuer_group_scaled_quant_kernel", [&] {
+                    input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                         using input_dtype = typename aiter::hip2opus<scalar_t>::type;
                         aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, dynGroupQuantBlockSize>
                             <<<grid, block, 0, stream>>>(
@@ -817,7 +819,9 @@ void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
         int scaleN    = cols / _GS;
         int num_group = shuffle_scale ? rows * ((scaleN + 7) / 8 * 8) : rows * scaleN;
         static constexpr int32_t ooba = 4 / sizeof(opus::fp4_t);
-        int32_t oob_size = ((rows * cols + ooba - 1) / ooba * ooba) * sizeof(opus::fp4_t);
+        const int64_t oob_elems =
+            (static_cast<int64_t>(rows) * cols + ooba - 1) / ooba * ooba;
+        const int64_t oob_size = oob_elems * static_cast<int64_t>(sizeof(opus::fp4_t));
         dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
         dim3 const block(dynGroupQuantBlockSize);
 
