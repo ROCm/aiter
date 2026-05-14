@@ -91,13 +91,13 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_per_tensor_quant(
     residual_inp_: "torch.Tensor",
     weight_: "torch.Tensor",
     eps: float,
-    scale_factor: float,
+    scale: torch.Tensor,
     prefill_support: bool = False,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
     """Fused AllReduce + RMSNorm + per-tensor static FP8 quantization across TP group.
 
     Args:
-        scale_factor: pre-calibrated static scale scalar (float).
+        scale: pre-calibrated static scale tensor with one float32 element.
     Returns:
         (fp8_out, res_out) — the fp8 quantized output and the bf16/fp16 residual.
     """
@@ -106,7 +106,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_per_tensor_quant(
         residual_inp_,
         weight_,
         eps,
-        scale_factor,
+        scale,
         prefill_support,
     )
 

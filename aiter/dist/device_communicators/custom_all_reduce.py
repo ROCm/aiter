@@ -740,15 +740,15 @@ class CustomAllreduce:
         out: Optional[torch.Tensor] = None,
         w: torch.Tensor,
         eps: float,
-        scale_factor: float,
+        scale: torch.Tensor,
         registered: bool = False,
         use_1stage: bool = False,
     ):
         """AR + RMSNorm + per-tensor static FP8 quantization.
 
         Args:
-            scale_factor: pre-calibrated static scale (positive float).
-                          output_fp8 = clamp(rms_out / scale_factor, FP8_MIN, FP8_MAX)
+            scale: pre-calibrated static scale tensor with one float32 element.
+                   output_fp8 = clamp(rms_out / scale[0], FP8_MIN, FP8_MAX)
         Returns:
             (out: fp8 tensor, res_out: bf16/fp16 tensor)
         """
@@ -765,7 +765,7 @@ class CustomAllreduce:
             res_inp,
             res_out,
             out,
-            float(scale_factor),
+            scale,
             w,
             eps,
             reg,
@@ -780,7 +780,7 @@ class CustomAllreduce:
         residual_inp: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
-        scale_factor: float,
+        scale: torch.Tensor,
         use_1stage: bool,
     ):
         """Fused AR+RMSNorm+per-tensor-static-FP8-quant with graph-capture support.
@@ -796,7 +796,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    scale_factor=scale_factor,
+                    scale=scale,
                     registered=True,
                     use_1stage=use_1stage,
                 )
@@ -809,7 +809,7 @@ class CustomAllreduce:
                 residual_inp,
                 w=weight,
                 eps=eps,
-                scale_factor=scale_factor,
+                scale=scale,
                 registered=False,
                 use_1stage=use_1stage,
             )

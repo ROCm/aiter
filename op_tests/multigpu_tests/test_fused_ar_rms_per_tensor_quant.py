@@ -69,6 +69,7 @@ def fused_ar_rmsnorm_per_tensor_quant(
     ensure_model_parallel_initialized(tp_size, pp_size)
     x = x.to(device)
     weight = weight.to(device)
+    scale = torch.tensor([scale_factor], dtype=torch.float32, device=device)
 
     # Warm-up barrier
     group = get_tp_group().device_group
@@ -81,7 +82,7 @@ def fused_ar_rmsnorm_per_tensor_quant(
             with torch.cuda.graph(graph, stream=gc.stream):
                 out_fp8, res_out = (
                     tensor_model_parallel_fused_allreduce_rmsnorm_per_tensor_quant(
-                        x, x, weight, eps, scale_factor
+                        x, x, weight, eps, scale
                     )
                 )
         out_fp8.fill_(0)
@@ -100,7 +101,7 @@ def fused_ar_rmsnorm_per_tensor_quant(
         def run_ca(x):
             out_fp8, res_out = (
                 tensor_model_parallel_fused_allreduce_rmsnorm_per_tensor_quant(
-                    x, x, weight, eps, scale_factor
+                    x, x, weight, eps, scale
                 )
             )
             return out_fp8, res_out

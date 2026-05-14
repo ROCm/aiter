@@ -100,7 +100,7 @@ def fused_allreduce_rmsnorm_per_tensor_quant(
     res_inp,
     res_out,
     out,
-    scale_factor: float,
+    scale,
     w,
     eps: float,
     reg_ptr: int,

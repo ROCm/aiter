@@ -189,7 +189,7 @@ def fused_allreduce_rmsnorm_per_tensor_quant_fake(
     res_inp: torch.Tensor,
     w: torch.Tensor,
     eps: float,
-    scale_factor: float,
+    scale: torch.Tensor,
     group_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     fp8_dtype = torch.float8_e4m3fnuz
@@ -205,7 +205,7 @@ def fused_allreduce_rmsnorm_per_tensor_quant_(
     res_inp: torch.Tensor,
     w: torch.Tensor,
     eps: float,
-    scale_factor: float,
+    scale: torch.Tensor,
     group_name: str,
     prefill_support: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -214,7 +214,7 @@ def fused_allreduce_rmsnorm_per_tensor_quant_(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._fused_allreduce_rmsnorm_per_tensor_quant_out_place(
-        inp, res_inp, w, eps, scale_factor, prefill_support
+        inp, res_inp, w, eps, scale, prefill_support
     )
 
 
@@ -530,7 +530,7 @@ class GroupCoordinator:
         residual_inp_: torch.Tensor,
         weight_: torch.Tensor,
         eps: float,
-        scale_factor: float,
+        scale: torch.Tensor,
         prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return fused_allreduce_rmsnorm_per_tensor_quant_(
@@ -538,7 +538,7 @@ class GroupCoordinator:
             residual_inp_,
             weight_,
             eps,
-            scale_factor,
+            scale,
             group_name=self.unique_name,
             prefill_support=prefill_support,
         )
@@ -549,7 +549,7 @@ class GroupCoordinator:
         residual_inp_: torch.Tensor,
         weight_: torch.Tensor,
         eps: float,
-        scale_factor: float,
+        scale: torch.Tensor,
         prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
@@ -559,7 +559,7 @@ class GroupCoordinator:
             residual_inp_,
             weight_,
             eps,
-            scale_factor,
+            scale,
             prefill_support,
         )
 

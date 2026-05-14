@@ -295,14 +295,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         res_inp_,
         weight_,
         eps,
-        scale_factor: float,
+        scale: torch.Tensor,
         prefill_support: bool = False,
     ) -> tuple:
         """Fused AllReduce + RMSNorm + per-tensor static FP8 quantization.
 
         Args:
-            scale_factor: static quantization scale (positive float, pre-calibrated).
-                          Kernel computes: fp8_out = clamp(rms_out / scale_factor)
+            scale: static quantization scale tensor with one float32 element.
+                   Kernel computes: fp8_out = clamp(rms_out / scale[0])
         Returns:
             (fp8_out, res_out)  — no scale tensor is returned (caller already has it)
         """
@@ -328,7 +328,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     else (total_bytes <= 128 * 1024)
                 )
                 result = ca_comm.custom_fused_ar_rms_per_tensor_quant(
-                    input_, res_inp_, weight_, eps, scale_factor, use_1stage
+                    input_, res_inp_, weight_, eps, scale, use_1stage
                 )
                 if result is not None:
                     out, res_out = result
@@ -336,14 +336,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     assert res_out is not None
                     return out, res_out
 
-        # Fallback: fused AR+RMSNorm then separate per-tensor quant
+        # Fallback: fused AR+RMSNorm then separate static per-tensor quant.
         ar_rms_out, res_out = self.fused_allreduce_rmsnorm(
             input_, res_inp_, weight_, eps, prefill_support
         )
-        from aiter.utility.dtypes import fp8
-        inv_scale = 1.0 / scale_factor if scale_factor != 0.0 else 1.0
-        fp8_max = 448.0  # max representable e4m3fnuz value
-        out_fp8 = ar_rms_out.float().mul_(inv_scale).clamp_(-fp8_max, fp8_max).to(fp8)
+        hip_quant = get_hip_quant(QuantType.per_Tensor)
+        out_fp8, _ = hip_quant(ar_rms_out, scale, quant_dtype=fp8)
         return out_fp8, res_out
 
     def fused_allreduce_rmsnorm_quant_per_group(

@@ -1863,8 +1863,8 @@ static_assert(alignof(IPC_KEY) == alignof(hipIpcMemHandle_t));
 
 
 // ── per-tensor static FP8 quant device epilogue ──
-// Caller provides pre-calibrated inv_scale = 1/scale_factor.
-// No block-level abs-max reduction; just multiply by inv_scale and saturate-cast to FP8.
+// Caller provides a device pointer to a pre-calibrated per-tensor scale.
+// No block-level abs-max reduction; just load scale[0], multiply by reciprocal and saturate-cast to FP8.
 template <typename P, typename A, typename T, typename OutT, int PACK_SIZE>
 __device__ __forceinline__ void ar_fusion_epilogue_per_tensor_quant(A& in,
                                                                      P& weight,
@@ -1873,11 +1873,13 @@ __device__ __forceinline__ void ar_fusion_epilogue_per_tensor_quant(A& in,
                                                                      int idx,
                                                                      int block_size,
                                                                      OutT* __restrict__ output,
-                                                                     float inv_scale,
+                                                                     const float* __restrict__ scale,
                                                                      bool active = true)
 {
-    float FP8_MAX = opus::cast<opus::fp32_t>(opus::numeric_limits<opus::fp8_t>::max());
-    using OP      = opus::vector_t<OutT, PACK_SIZE>;
+    float FP8_MAX      = opus::cast<opus::fp32_t>(opus::numeric_limits<opus::fp8_t>::max());
+    float scale_factor = *scale;
+    float inv_scale    = scale_factor == 0.f ? 1.f : 1.f / scale_factor;
+    using OP           = opus::vector_t<OutT, PACK_SIZE>;
     OP out_quant;
     A out;
     ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE>(
@@ -1904,7 +1906,7 @@ __global__ void __launch_bounds__(1024, 1)
                                                     T* __restrict__ residual_out,
                                                     OutT* __restrict__ output,
                                                     T* __restrict__ weight,
-                                                    float inv_scale,
+                                                    const float* __restrict__ scale,
                                                     int size,
                                                     int hidden_dim,
                                                     float eps)
@@ -1960,7 +1962,7 @@ __global__ void __launch_bounds__(1024, 1)
     }
     int padded_block_size = (int)blockDim.x;
     ar_fusion_epilogue_per_tensor_quant<P, A, T, OutT, pack_size>(
-        acc, weight_p, hidden_dim, eps, idx, padded_block_size, output, inv_scale, active);
+        acc, weight_p, hidden_dim, eps, idx, padded_block_size, output, scale, active);
 }
 
 template <typename T, typename OutT, int NGPUS>
@@ -1972,7 +1974,7 @@ void allreduce_fusion_kernel_1stage_per_tensor_quant_launcher(RankData* _dp,
                                                                T* residual_out,
                                                                OutT* output,
                                                                T* weight,
-                                                               float inv_scale,
+                                                               const float* scale,
                                                                int size,
                                                                int hidden_dim,
                                                                float eps,
@@ -1997,7 +1999,7 @@ void allreduce_fusion_kernel_1stage_per_tensor_quant_launcher(RankData* _dp,
                                                     residual_out,
                                                     output,
                                                     weight,
-                                                    inv_scale,
+                                                    scale,
                                                     size,
                                                     hidden_dim,
                                                     eps);
@@ -2014,7 +2016,7 @@ __global__ void __launch_bounds__(1024, 1)
                                                     T* __restrict__ residual_out,
                                                     OutT* __restrict__ output,
                                                     T* __restrict__ weight,
-                                                    float inv_scale,
+                                                    const float* __restrict__ scale,
                                                     int size,
                                                     int hidden_dim,
                                                     float eps)
@@ -2084,7 +2086,7 @@ __global__ void __launch_bounds__(1024, 1)
         for(int v = 0; v < pack_size; ++v)
             acc[v] = upcast_s(vec[v]);
         ar_fusion_epilogue_per_tensor_quant<P, A, T, OutT, pack_size>(
-            acc, weight_p, hidden_dim, eps, idx, block_size, output, inv_scale);
+            acc, weight_p, hidden_dim, eps, idx, block_size, output, scale);
     }
 }
 
@@ -2097,7 +2099,7 @@ void allreduce_fusion_kernel_2stage_per_tensor_quant_launcher(RankData* _dp,
                                                                T* residual_out,
                                                                OutT* output,
                                                                T* weight,
-                                                               float inv_scale,
+                                                               const float* scale,
                                                                int size,
                                                                int hidden_dim,
                                                                float eps,
@@ -2119,7 +2121,7 @@ void allreduce_fusion_kernel_2stage_per_tensor_quant_launcher(RankData* _dp,
                                                             residual_out,
                                                             output,
                                                             weight,
-                                                            inv_scale,
+                                                            scale,
                                                             size,
                                                             hidden_dim,
                                                             eps);
@@ -2134,7 +2136,7 @@ __global__ void __launch_bounds__(1024, 1)
                                                       T* __restrict__ residual_out,
                                                       OutT* __restrict__ output,
                                                       T* __restrict__ weight,
-                                                      float inv_scale,
+                                                      const float* __restrict__ scale,
                                                       int size,
                                                       int hidden_dim,
                                                       float eps)
@@ -2159,7 +2161,7 @@ __global__ void __launch_bounds__(1024, 1)
         for(int v = 0; v < pack_size; ++v)
             acc[v] = upcast_s(vec[v]);
         ar_fusion_epilogue_per_tensor_quant<P, A, T, OutT, pack_size>(
-            acc, weight_p, hidden_dim, eps, idx, block_size, output, inv_scale);
+            acc, weight_p, hidden_dim, eps, idx, block_size, output, scale);
     }
 }
 
@@ -2172,7 +2174,7 @@ void allreduce_fusion_kernel_split_per_tensor_quant_launcher(RankData* _dp,
                                                               T* residual_out,
                                                               OutT* output,
                                                               T* weight,
-                                                              float inv_scale,
+                                                              const float* scale,
                                                               int size,
                                                               int hidden_dim,
                                                               float eps,
@@ -2206,7 +2208,7 @@ void allreduce_fusion_kernel_split_per_tensor_quant_launcher(RankData* _dp,
     dim3 numBlocks(nblocks);
     local_device_load_rmsnorm_per_tensor_quant_naive<T, OutT>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(
-            sg, rank, residual_inp, residual_out, output, weight, inv_scale, size, hidden_dim, eps);
+            sg, rank, residual_inp, residual_out, output, weight, scale, size, hidden_dim, eps);
 }
 
 
@@ -3301,7 +3303,7 @@ void dispatchFusedAllReduceRMSNormPerTensorQuant(hipStream_t stream,
                                                   T* residual_inp,
                                                   T* residual_out,
                                                   QT* output,
-                                                  float scale_factor,
+                                                  float* scale,
                                                   T* weight,
                                                   float eps,
                                                   int m,
@@ -3314,7 +3316,6 @@ void dispatchFusedAllReduceRMSNormPerTensorQuant(hipStream_t stream,
         throw std::runtime_error(
             "custom allreduce requires input length to be multiple of " + std::to_string(d));
 
-    float inv_scale = (scale_factor == 0.f) ? 1.f : 1.f / scale_factor;
     RankData* ptrs  = get_buffer_RD(stream, input);
     auto pack_size  = 16 / sizeof(T);
     bool n_constrain = (n % pack_size == 0) && (n / pack_size <= 1024);
@@ -3331,7 +3332,7 @@ void dispatchFusedAllReduceRMSNormPerTensorQuant(hipStream_t stream,
                                                               residual_out,                    \
                                                               output,                          \
                                                               weight,                          \
-                                                              inv_scale,                       \
+                                                              scale,                            \
                                                               size,                            \
                                                               n,                               \
                                                               eps,                             \
@@ -3348,7 +3349,7 @@ void dispatchFusedAllReduceRMSNormPerTensorQuant(hipStream_t stream,
                                                               residual_out,                    \
                                                               output,                          \
                                                               weight,                          \
-                                                              inv_scale,                       \
+                                                              scale,                            \
                                                               size,                            \
                                                               n,                               \
                                                               eps,                             \
@@ -3365,7 +3366,7 @@ void dispatchFusedAllReduceRMSNormPerTensorQuant(hipStream_t stream,
                                                              residual_out,                     \
                                                              output,                           \
                                                              weight,                           \
-                                                             inv_scale,                        \
+                                                             scale,                             \
                                                              size,                             \
                                                              n,                                \
                                                              eps,                              \
