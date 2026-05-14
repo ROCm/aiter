@@ -72,8 +72,9 @@ def test_fmoe(
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
-        if hidden_pad != 0 and intermediate_pad != 0:
+        if hidden_pad != 0:
             w1[:, :, -hidden_pad:] = 0
+        if intermediate_pad != 0:
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
         exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
@@ -81,8 +82,9 @@ def test_fmoe(
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
-    if hidden_pad != 0 and intermediate_pad != 0:
+    if intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
+    if hidden_pad != 0:
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if AITER_MOE_EXPERT_BALANCE:
