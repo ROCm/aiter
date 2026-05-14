@@ -188,6 +188,7 @@ def test_flydsl_stage1_a16w4(
     E: int = 64,
     topk: int = 4,
     block_m: int = 32,
+    k_batch: int = 1,
     atol: float = 1.0,
     rtol: float = 0.05,
 ):
@@ -196,7 +197,7 @@ def test_flydsl_stage1_a16w4(
     print(f"\n{'='*70}")
     print(
         f"[TEST] FlyDSL stage1 A16W4: token={token}, dim=({model_dim},{inter_dim}), "
-        f"E={E}, topk={topk}, block_m={block_m}"
+        f"E={E}, topk={topk}, block_m={block_m}, k_batch={k_batch}"
     )
     print(f"{'='*70}")
 
@@ -227,6 +228,7 @@ def test_flydsl_stage1_a16w4(
         w1_scale=data["w1_scale_shuf"],
         a1_scale=None,
         sorted_weights=data["sorted_weights_s1"],
+        k_batch=k_batch,
     )
     torch.cuda.synchronize()
 
@@ -405,6 +407,13 @@ def main():
     parser.add_argument("-k", "--topk", type=int, default=4)
     parser.add_argument("--block-m", type=int, nargs="+", default=[32])
     parser.add_argument(
+        "--k-batch",
+        type=int,
+        nargs="+",
+        default=[1],
+        help="k_batch (split-K) values for stage1 sweep (default: 1)",
+    )
+    parser.add_argument(
         "--mode", type=str, nargs="+", default=["atomic"], choices=["atomic", "reduce"]
     )
     parser.add_argument(
@@ -430,30 +439,32 @@ def main():
     for token in args.tokens:
         for bm in args.block_m:
             if "stage1" in args.stage:
-                try:
-                    passed, max_delta, pct = test_flydsl_stage1_a16w4(
-                        token=token,
-                        model_dim=args.model_dim,
-                        inter_dim=args.inter_dim,
-                        E=args.experts,
-                        topk=args.topk,
-                        block_m=bm,
-                        atol=args.atol,
-                        rtol=args.rtol,
-                    )
-                    results.append(
-                        (
-                            f"stage1_a16w4_t{token}_bm{bm}",
-                            "PASS" if passed else "FAIL",
-                            max_delta,
-                            pct,
+                for kb in args.k_batch:
+                    try:
+                        passed, max_delta, pct = test_flydsl_stage1_a16w4(
+                            token=token,
+                            model_dim=args.model_dim,
+                            inter_dim=args.inter_dim,
+                            E=args.experts,
+                            topk=args.topk,
+                            block_m=bm,
+                            k_batch=kb,
+                            atol=args.atol,
+                            rtol=args.rtol,
                         )
-                    )
-                except Exception:
-                    import traceback
+                        results.append(
+                            (
+                                f"stage1_a16w4_t{token}_bm{bm}_kb{kb}",
+                                "PASS" if passed else "FAIL",
+                                max_delta,
+                                pct,
+                            )
+                        )
+                    except Exception:
+                        import traceback
 
-                    traceback.print_exc()
-                    results.append((f"stage1_a16w4_t{token}_bm{bm}", "ERROR", 0, 0))
+                        traceback.print_exc()
+                        results.append((f"stage1_a16w4_t{token}_bm{bm}_kb{kb}", "ERROR", 0, 0))
 
             if "stage2" in args.stage:
                 for mode in args.mode:
