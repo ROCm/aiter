@@ -14,7 +14,7 @@ import pandas as pd
 try:
     pd.set_option("future.no_silent_downcasting", True)
 except pd.errors.OptionError:
-    # Option only exists in pandas >= 2.0.3 and is deprecated in pandas 3.0+.
+    # Option was added in pandas 2.2 and is deprecated in pandas 3.0+.
     # Safe to ignore on versions where it's unavailable.
     pass
 
