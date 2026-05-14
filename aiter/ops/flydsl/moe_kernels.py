@@ -813,7 +813,7 @@ def flydsl_moe_stage1(
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
-    is_fp4 = b_dtype == "fp4"
+    is_fp4 = b_dtype in ("fp4", "mxfp4")
     _n_in = inter_dim * 2 if is_fp4 else inter_dim
     _k_in = model_dim
 
