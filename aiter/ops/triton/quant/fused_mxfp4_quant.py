@@ -29,8 +29,10 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_reduce_rms_mxfp4_quant_kernel,
     _fused_rms_mxfp4_quant_kernel,
 )
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import _gluon_fused_rms_mxfp4_quant_kernel
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
+
 
 _LOGGER = AiterTritonLogger()
 
@@ -121,8 +123,7 @@ def fused_rms_mxfp4_quant(
         x2_stride_m = x2.stride(0)
         out2_stride_m = out2.stride(0)
 
-    # checks args for gluon or triton. Auto will default to best kernel based on hardware arch
-
+    #checks args for either gluon, triton, or auto. auto will check for gfx1250 hardware and set to gluon if it exists, otherwise defaults to triton
     if inargs == "auto":
         if get_arch() == "gfx1250":
             kernel = _gluon_fused_rms_mxfp4_quant_kernel
@@ -130,14 +131,13 @@ def fused_rms_mxfp4_quant(
             kernel = _fused_rms_mxfp4_quant_kernel
     elif inargs == "gluon":
         if get_arch() != "gfx1250":
-            raise ValueError("Gluon kernel only supported on gfx1250")
+            raise RuntimeError("Gluon kernel only supported on gfx1250 hardware")
         kernel = _gluon_fused_rms_mxfp4_quant_kernel
     elif inargs == "triton":
         kernel = _fused_rms_mxfp4_quant_kernel
     else:
-        raise ValueError(
-            f"Invalid argument: {inargs}. Chose from auto, gluon, or triton"
-        )
+        raise ValueError(f"Invalid argument: {inargs}. Choose from auto, gluon, or triton")
+
 
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * (2 if (x2 is not None) else 1),)
     kernel[grid](
