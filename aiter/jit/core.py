@@ -1545,7 +1545,9 @@ def compile_ops(
                             return isinstance(obj, _tensor_types)
 
                         def _is_tensor_type(tp):
-                            return tp is torch.Tensor or (aiter_tensor_t is not object and tp is aiter_tensor_t)
+                            return tp is torch.Tensor or (
+                                aiter_tensor_t is not object and tp is aiter_tensor_t
+                            )
 
                         callargs = inspect.getcallargs(func, *args, **kwargs)
                         for el, arg in callargs.items():
@@ -1555,7 +1557,9 @@ def compile_ops(
                             sub_t = typing.get_args(expected_type)
 
                             if origin is None:
-                                if _is_tensor_type(expected_type) and _is_tensor_like(arg):
+                                if _is_tensor_type(expected_type) and _is_tensor_like(
+                                    arg
+                                ):
                                     pass
                                 elif not isinstance(arg, expected_type) and not (
                                     any(el in str(expected_type) for el in enum_types)
@@ -1570,7 +1574,11 @@ def compile_ops(
                                         f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                     )
                             elif origin is typing.Union or origin is types.UnionType:
-                                if arg is not None and not _is_tensor_like(arg) and not isinstance(arg, sub_t):
+                                if (
+                                    arg is not None
+                                    and not _is_tensor_like(arg)
+                                    and not isinstance(arg, sub_t)
+                                ):
                                     raise TypeError(
                                         f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
                                     )
