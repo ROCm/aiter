@@ -25,7 +25,7 @@ Notation (from mHC paper arXiv:2512.24880v2):
 import pytest
 import torch
 
-from aiter.ops.triton.fusions.mhc import mhc, mhc_post
+from aiter.ops.triton.fusions.mhc import mhc, mhc_post, mhc_post_pre
 from aiter.ops.triton.utils.mhc_config_utils import (
     hip_post_dispatch_block as _hip_post_dispatch_block,
 )
@@ -54,6 +54,16 @@ except ImportError:
 # =============================================================================
 # Tests
 # =============================================================================
+
+
+def _alphas(alpha_pre, alpha_post, alpha_res, device="cuda"):
+    """Pack the three per-stream scale floats into the (3,) fp32 tensor that
+    ``mhc()`` / ``mhc_post_pre()`` now consume — the kernels ``tl.load`` the
+    individual alphas at offsets 0/1/2.
+    """
+    return torch.tensor(
+        [alpha_pre, alpha_post, alpha_res], dtype=torch.float32, device=device
+    )
 
 
 def _assert_mhc_close(
@@ -141,9 +151,7 @@ def test_mhc_correctness(M, n, C, dtype):
     triton_tuple = mhc(
         x,
         phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
+        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
         bias,
         n_streams,
         config=_config_for_large_n(n),
@@ -174,7 +182,12 @@ def test_mhc_different_epsilon(eps, M, n, C):
         x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams, eps=eps
     )
     triton_tuple = mhc(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams, eps=eps
+        x,
+        phi,
+        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
+        bias,
+        n_streams,
+        eps=eps,
     )
 
     _assert_mhc_close(triton_tuple, out_torch)
@@ -191,7 +204,13 @@ def test_mhc_different_alpha(alpha_scale):
     alpha_pre = alpha_post = alpha_res = alpha_scale
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
+    triton_tuple = mhc(
+        x,
+        phi,
+        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
+        bias,
+        n_streams,
+    )
 
     _assert_mhc_close(
         triton_tuple,
@@ -218,7 +237,9 @@ def test_mhc_zero_input():
     bias = torch.randn(N_total, dtype=torch.float32, device="cuda") * 0.1
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
-    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
+    triton_tuple = mhc(
+        x, phi, _alphas(alpha_pre, alpha_post, alpha_res, device=x.device), bias, n
+    )
 
     _assert_mhc_close(triton_tuple, out_torch)
 
@@ -238,7 +259,9 @@ def test_mhc_large_values():
     bias = torch.randn(N_total, dtype=torch.float32, device="cuda")
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
-    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
+    triton_tuple = mhc(
+        x, phi, _alphas(alpha_pre, alpha_post, alpha_res, device=x.device), bias, n
+    )
 
     # Layer_input scales linearly with x, so loosen its absolute tolerance for
     # x ~ N(0, 100²).
@@ -260,9 +283,7 @@ def test_mhc_small_shapes(M, n, C, dtype):
     triton_tuple = mhc(
         x,
         phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
+        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
         bias,
         n_streams,
         config=_config_for_large_n(n),
@@ -290,9 +311,7 @@ def test_mhc_output_range():
     post_mix, comb_mix, _ = mhc(
         x,
         phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
+        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
         bias,
         n_streams,
         sinkhorn_iters=50,
@@ -379,9 +398,7 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
     triton_tuple = mhc(
         x,
         phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
+        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
         bias,
         n_streams,
         sinkhorn_iters=0,
@@ -424,9 +441,7 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
     triton_tuple = mhc(
         x,
         phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
+        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
         bias,
         n_streams,
         config=_make_split_k_config(num_ksplit, n=n),
@@ -466,9 +481,7 @@ def test_split_k_various_splits(num_ksplit):
     triton_tuple = mhc(
         x,
         phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
+        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
         bias,
         n_streams,
         sinkhorn_iters=0,
@@ -520,9 +533,7 @@ def test_split_k_large_k():
     triton_tuple = mhc(
         x,
         phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
+        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
         bias,
         n_streams,
         sinkhorn_iters=0,
@@ -611,9 +622,7 @@ def test_triton_mhc_matches_hip(M, n, C):
     post_t, comb_t, li_t = mhc(
         x,
         phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
+        _alphas(alpha_pre, alpha_post, alpha_res, device=x.device),
         bias,
         n_streams,
         eps=rms_eps,
@@ -765,6 +774,7 @@ def test_mhc_post_squeeze_post_mix():
         # see bench_mhc.py --op post --with-hip for that repro.
         (1024, 4, 4096),
         (2048, 4, 4096),
+        (2048, 4, 7168),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -822,6 +832,97 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
     assert pct <= 0.05, f"{msg} (atol=2e-2, rtol=1e-2, bad_element_ratio={pct:.2%})"
 
 
+# =============================================================================
+# Fused mhc_post_pre Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize("M", [1, 4, 64, 128])
+@pytest.mark.parametrize("n", [4])
+@pytest.mark.parametrize("C", [1024, 4096, 7168])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_triton_mhc_pre_post(M, n, C, dtype):
+    """Fused ``mhc_post_pre()`` matches the unfused torch chain.
+
+    ``mhc_post_pre`` fuses one mHC sub-layer transition: it consumes the
+    previous sub-layer's ``(post_mix, comb_mix)`` to update the residual
+    stream via the mhc_post mix, then runs the next sub-layer's mhc_pre
+    GEMM + RMS-norm + Sinkhorn on the just-updated residual.
+
+    Reference is the unfused chain on torch:
+        residual_out = mhc_post_torch(layer_input, residual_in, post_mix, comb_mix)
+        (h_post, h_res, _h_pre, layer_input_out) = mhc_torch(residual_out.view(M, n*C), phi, ...)
+
+    Compared outputs: ``(residual_out, h_post, h_res, layer_input_out)``.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required for mHC kernels")
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    sinkhorn_iters = 20
+
+    # Reuse the existing mHC input generators: `generate_mhc_post_inputs`
+    # for the post-step operands and `generate_mhc_inputs` for phi/bias/alphas.
+    # The two generators produce independent random data — same convention
+    # as test_mhc_e2e_correctness.
+    layer_input, residual_in, post_mix, comb_mix = generate_mhc_post_inputs(
+        M, n, C, dtype
+    )
+    _x_unused, phi, alpha_pre, alpha_post, alpha_res, bias, _n = generate_mhc_inputs(
+        M, n, C, dtype
+    )
+
+    # Reference: torch mhc_post -> torch mhc. mhc_torch is the PyTorch ref;
+    # it still takes the three floats directly (no alphas tensor).
+    residual_out_ref = mhc_post_torch(layer_input, residual_in, post_mix, comb_mix)
+    h_post_ref, h_res_ref, _h_pre_ref, layer_input_out_ref = mhc_torch(
+        residual_out_ref.view(M, n * C),
+        phi,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        n,
+        sinkhorn_iters=sinkhorn_iters,
+    )
+
+    # Triton fused — mhc_post_pre consumes the alphas tensor.
+    h_post_t, h_res_t, layer_input_out_t, residual_out_t = mhc_post_pre(
+        layer_input,
+        residual_in,
+        post_mix,
+        comb_mix,
+        phi,
+        _alphas(alpha_pre, alpha_post, alpha_res, device=layer_input.device),
+        bias,
+        n,
+        sinkhorn_iters=sinkhorn_iters,
+    )
+
+    cfg = f"(M={M}, n={n}, C={C}, dtype={dtype})"
+    for name, t, ref, atol, rtol in (
+        ("residual_out", residual_out_t, residual_out_ref, 2e-2, 2e-2),
+        ("h_post", h_post_t, h_post_ref, 2e-2, 2e-2),
+        ("h_res", h_res_t, h_res_ref, 2e-2, 2e-2),
+        ("layer_input_out", layer_input_out_t, layer_input_out_ref, 5e-2, 2e-2),
+    ):
+        msg = f"mhc_post_pre {name} mismatch at {cfg}"
+        pct = checkAllclose(
+            t.float(),
+            ref.float(),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=0.05,
+            msg=msg,
+        )
+        assert (
+            pct <= 0.05
+        ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+
+
 def mhc_e2e_triton(
     x_l_flat,
     phi,
@@ -849,9 +950,7 @@ def mhc_e2e_triton(
     h_post, h_res, layer_input = mhc(
         x_l_flat,
         phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
+        _alphas(alpha_pre, alpha_post, alpha_res, device=x_l_flat.device),
         bias,
         n,
         eps,
@@ -907,7 +1006,8 @@ def test_mhc_e2e_correctness(M, n, C, dtype):
     )
     x_l = x_l_flat.view(M, n, C)
 
-    # Reference implementation
+    # Reference implementation — mhc_e2e_ref is the torch ref and takes
+    # three floats directly.
     layer_input_ref, x_l_plus_1_ref, h_post_ref, h_res_ref = mhc_e2e_ref(
         x_l,
         phi,
@@ -919,7 +1019,8 @@ def test_mhc_e2e_correctness(M, n, C, dtype):
         sinkhorn_iters=int(sinkhorn_iters),
     )
 
-    # Triton implementation
+    # Triton implementation — wrapper takes three floats and converts to
+    # an alphas tensor internally before invoking mhc().
     layer_input_triton, x_l_plus_1_triton, h_post_triton, h_res_triton = mhc_e2e_triton(
         x_l_flat,
         phi,
