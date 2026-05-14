@@ -383,7 +383,6 @@ if not os.path.exists(os.path.join(AITER_META_DIR, "csrc")):
 sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
-gfxs = get_gfx_list()
 AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 
@@ -500,7 +499,9 @@ def check_and_set_ninja_worker():
     import psutil
 
     # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
+    free_memory_gb = psutil.virtual_memory().available / (
+        1024**3
+    )  # free memory in GB
     max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
@@ -839,6 +840,7 @@ def build_module(
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
             if blob_gen_cmd:
+                get_gfx_list()
                 blob_dir = f"{op_dir}/blob/"
                 os.makedirs(blob_dir, exist_ok=True)
                 if AITER_LOG_MORE:
