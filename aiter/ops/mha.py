@@ -1308,6 +1308,23 @@ def _flash_attn_forward(
         )
         return ret
 
+    def is_fmha_v3_i8fp8():
+        ret = get_gfx() == "gfx950"
+        ret = ret and (hdim_q == 128)
+        ret = ret and (q.dtype == torch.int8)
+        ret = ret and (k.dtype == torch.int8)
+        ret = ret and (v.dtype == dtypes.fp8)
+        ret = ret and (
+            q_descale is not None and k_descale is not None and v_descale is not None
+        )
+        ret = ret and (
+            q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
+        )
+        ret = ret and (
+            q_descale.shape == k_descale.shape and q_descale.shape == v_descale.shape
+        )
+        return ret
+
     def can_impl_fmha_v3_fwd():
         # basic
         ret = alibi_slopes is None
@@ -1317,11 +1334,11 @@ def _flash_attn_forward(
         ret = ret and (hdim_q == 128 or hdim_q == 192)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
-        ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
+        ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8() or is_fmha_v3_i8fp8())
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
         # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table
         # (1,2,4,8,16); arbitrary divisor ratios route to CK.
-        if is_fmha_v3_fp8():
+        if is_fmha_v3_fp8() or is_fmha_v3_i8fp8():
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         return ret
@@ -3096,6 +3113,56 @@ def flash_attn_fp8_pertensor_func(
         return_lse=False,
         return_softmax=False,
         sink_ptr=sink_ptr,
+    )
+    out = out_padded[..., :head_size_v_og]
+    return out
+
+
+def flash_attn_i8fp8_pertensor_func(
+    q,
+    k,
+    v,
+    q_descale,
+    k_descale,
+    v_descale,
+    causal=False,
+    window_size=(-1, -1, 0),  # -1 means infinite context window, 0 means no sink
+    softmax_scale=None,
+):
+    """Flash attention with int8 Q/K and fp8 V (Sage-style).
+
+    Args:
+        q: int8 tensor [b, sq, hq, d]
+        k: int8 tensor [b, sk, hk, d]
+        v: fp8 tensor  [b, sk, hk, d_v]
+        q_descale, k_descale, v_descale: float32 descale tensors, shape (1,) or (b, hk)
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    head_size_q_og = q.size(3)
+    head_size_v_og = v.size(3)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+    out_padded, _, _, _ = _flash_attn_forward(
+        q,
+        k,
+        v,
+        0.0,
+        softmax_scale,
+        causal=causal,
+        window_size_left=int(window_size[0]),
+        window_size_right=int(window_size[1]),
+        sink_size=int(window_size[2]) if len(window_size) == 3 else 0,
+        bias=None,
+        alibi_slopes=None,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        return_lse=False,
+        return_softmax=False,
     )
     out = out_padded[..., :head_size_v_og]
     return out

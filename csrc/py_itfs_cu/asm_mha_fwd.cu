@@ -228,18 +228,32 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                     std::optional<at::Generator> gen_)
 {
     auto q_dtype = q.dtype();
+    auto v_dtype = v.dtype();
     bool is_qkv_fp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || is_qkv_fp8,
-                "FlashAttention only support fp16, bf16 and fp8_e4m3 data type");
+    bool is_qk_int8 = q_dtype == at::ScalarType::Char;
+    bool is_v_fp8 = v_dtype == at::ScalarType::Float8_e4m3fn || v_dtype == at::ScalarType::Float8_e4m3fnuz;
+    bool is_i8fp8 = is_qk_int8 && is_v_fp8;
 
-    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
-    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || is_qkv_fp8 || is_i8fp8,
+                "FlashAttention only support fp16, bf16, fp8_e4m3 and int8(q/k)+fp8(v) data type");
+
+    if (is_i8fp8) {
+        TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype (int8)");
+    } else {
+        TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+        TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    }
 
     std::string dtype_str;
     if (q_dtype == torch::kFloat16) {
         dtype_str = "fp16";
     } else if (q_dtype == torch::kBFloat16) {
         dtype_str = "bf16";
+    } else if (is_i8fp8) {
+        if (!out_.has_value() || out_.value().dtype() == torch::kBFloat16)
+            dtype_str = "i8fp8bf16"; // int8 Q/K, fp8 V, bf16 output
+        else
+            TORCH_CHECK(false, "For i8fp8 input, output must have dtype BF16 for now");
     } else if (is_qkv_fp8) {
         if (!out_.has_value() || out_.value().dtype() == torch::kBFloat16)
             dtype_str = "fp8bf16"; // only support bf16 out for fp8
@@ -252,7 +266,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     TORCH_CHECK(q_descale_.has_value() == k_descale_.has_value() &&
                 k_descale_.has_value() == v_descale_.has_value(),
                 "q_descale, k_descale, v_descale must be all provided or all not provided");
-    if(is_qkv_fp8)
+    if(is_qkv_fp8 || is_i8fp8)
     {
         TORCH_CHECK(q_descale_.has_value(),
                     "q_descale, k_descale, v_descale must be provided for asm fp8");
@@ -325,7 +339,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
 
     auto opts = q.options();
-    auto out_type = dtype_str == "fp8bf16" ? torch::kBFloat16 : q.scalar_type();
+    auto out_type = (dtype_str == "fp8bf16" || dtype_str == "i8fp8bf16") ? torch::kBFloat16 : q.scalar_type();
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
