@@ -2765,12 +2765,14 @@ def compile_mixed_moe_gemm2(
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     # API parity (reviewer #3): the fp4xfp4 stage2 fold doesn't consume
-    # `b_nt` or `xcd_swizzle` directly -- they're only meaningful for the
-    # stage1 kernel and the legacy stage2 implementations. Accept them as
-    # ignored kwargs so callers parsing `_bnt{N}` / `_xcd{N}` registry
-    # suffixes (unifying their stage1/stage2 dispatch) keep working without
-    # having to special-case the fp4xfp4 path.
+    # `b_nt` directly -- it's only meaningful for the stage1 kernel's B-side
+    # cache modifier. Accept it as an ignored kwarg so callers parsing
+    # `_bnt{N}` registry suffixes (unifying their stage1/stage2 dispatch)
+    # keep working without having to special-case the fp4xfp4 path.
     b_nt: int = 0,
+    # XCD WG-ID swizzle (lalala-sh): remap (bx_persist, by_outer) so that
+    # consecutive WGs land on the same XCD and share L2, which lifts the
+    # stage2 hit-rate on MI355X. `0` disables the remap.
     xcd_swizzle: int = 0,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
@@ -2810,7 +2812,7 @@ def compile_mixed_moe_gemm2(
     assumed equal to `tile_m`. When set, stage2 can use a different tile_m from
     sorting/stage1. Requires sort_block_m % tile_m == 0.
     """
-    del b_nt, xcd_swizzle  # no-op on the fp4xfp4 stage2 path; see signature note
+    del b_nt  # no-op on the fp4xfp4 stage2 path; see signature note above
     _sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
     if const_expr(_sort_block_m != tile_m and _sort_block_m % tile_m != 0):
         raise ValueError(
@@ -3008,10 +3010,11 @@ def compile_mixed_moe_gemm2(
     _num_k_tiles_per_batch = int(inter_dim) // int(tile_k)
     _async_tag = "_async" if use_async_copy else ""
     _cumul_tag = f"_cumul{int(cu_num_mul)}" if int(cu_num_mul) != 1 else ""
+    _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_vscale_fix3_fp4opt_v1{_pm_tag}{_sbm_tag}{_wpe_tag}{_async_tag}{_cumul_tag}"
+        f"_vscale_fix3_fp4opt_v1{_pm_tag}{_sbm_tag}{_wpe_tag}{_async_tag}{_cumul_tag}{_xcd_tag}"
     ).replace("-", "_")
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Reuse a single allocation for both:
@@ -3123,6 +3126,41 @@ def compile_mixed_moe_gemm2(
             tx = gpu.thread_id("x")
             by_outer = gpu.block_id("x")
             bx_persist = gpu.block_id("y")  # persistent WG index (M-dim)
+
+            if const_expr(xcd_swizzle > 0):
+                # Remap (bx_persist, by_outer) so consecutive WGs hit the
+                # same XCD and share L2 -- mirrors the stage1 XCD remap.
+                _NUM_XCDS_S = 8
+                _c1_sw = arith.constant(1, index=True)
+                _c_tn_sw = arith.constant(tile_n, index=True)
+                _c_mdp_sw = arith.constant(model_dim_pad, index=True)
+                _gx = (n_in - _c_mdp_sw + _c_tn_sw - _c1_sw) / _c_tn_sw
+                if const_expr(_persistent):
+                    _gy = arith.constant(_cu_num, index=True)
+                else:
+                    _c_pm_sw = arith.constant(persist_m, index=True)
+                    _gy = (size_expert_ids_in + _c_pm_sw - _c1_sw) / _c_pm_sw
+
+                _linear_id = bx_persist * _gx + by_outer
+                _num_wgs = _gx * _gy
+
+                _c_xcds = arith.constant(_NUM_XCDS_S, index=True)
+                _wgs_per_xcd = _num_wgs / _c_xcds
+                _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id / _c_xcds)
+
+                _WGM_S = xcd_swizzle
+                _c_wgm = arith.constant(_WGM_S, index=True)
+                _num_wgid_in_group = _c_wgm * _gx
+                _group_id = _wgid / _num_wgid_in_group
+                _first_pid_m = _group_id * _c_wgm
+                _remaining_m = _gy - _first_pid_m
+                _cmp_m = arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
+                _group_size_m = arith.select(_cmp_m, _remaining_m, _c_wgm)
+
+                _wgid_in_group = _wgid % _num_wgid_in_group
+                bx_persist = _first_pid_m + (_wgid_in_group % _group_size_m)
+                by_outer = _wgid_in_group / _group_size_m
+
             by = by_outer
 
             # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
@@ -4858,6 +4896,7 @@ def compile_mixed_moe_gemm2(
         _cu_num if _persistent else 0,
         waves_per_eu,
         use_async_copy,
+        xcd_swizzle,
     )
 
     @flyc.jit

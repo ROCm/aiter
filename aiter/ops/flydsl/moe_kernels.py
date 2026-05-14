@@ -210,7 +210,13 @@ def _register_production_variants_stage2(
         #   waves_per_eu=4       -- best on EP4 prefill at cu_num_mul=3;
         #                           wpe=5/6 underperform here
         (
-            "fp4", "fp4", "bf16", 64, 128, 256, "atomic",
+            "fp4",
+            "fp4",
+            "bf16",
+            64,
+            128,
+            256,
+            "atomic",
             "_persist_async_w4_cumul3",
             {
                 "persist": True,
