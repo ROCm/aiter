@@ -458,13 +458,15 @@ def mhc_post_pre(
     bias: torch.Tensor,  # (N,) fp32
     n: int,
     eps: float = 1e-6,
-    hc_pre_eps: float = 0.0,
+    hc_pre_eps: float = 1e-6,
     hc_post_mult_value: float = 2.0,
     sinkhorn_iters: int = 20,
     residual_out: Optional[torch.Tensor] = None,
     h_post: Optional[torch.Tensor] = None,
     h_res: Optional[torch.Tensor] = None,
     layer_input_out: Optional[torch.Tensor] = None,
+    acc_partial: Optional[torch.Tensor] = None,
+    acc_sq_partial: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mhc_post + (next) mhc_pre across two Triton launches.
@@ -643,10 +645,35 @@ def mhc_post_pre(
             residual_out.dtype == dtype
         ), f"residual_out dtype mismatch: expected {dtype}, got {residual_out.dtype}"
 
-    acc_partial = torch.empty(
-        (NUM_KSPLIT, M, N_total), dtype=torch.float32, device=device
-    )
-    acc_sq_partial = torch.empty((NUM_KSPLIT, M), dtype=torch.float32, device=device)
+    # Split-K reduce-apply scratch. Write-before-read within this call (the
+    # split kernel writes every entry the reduce kernel reads, masked the same
+    # way), so callers may pass persistent buffers — keeping `.data_ptr()`
+    # stable lets CUDAGraph capture/replay work without surprise re-allocation.
+    if acc_partial is None:
+        acc_partial = torch.empty(
+            (NUM_KSPLIT, M, N_total), dtype=torch.float32, device=device
+        )
+    else:
+        assert acc_partial.shape == (NUM_KSPLIT, M, N_total), (
+            f"acc_partial shape mismatch: expected ({NUM_KSPLIT}, {M}, {N_total}), "
+            f"got {tuple(acc_partial.shape)}"
+        )
+        assert (
+            acc_partial.dtype == torch.float32
+        ), f"acc_partial dtype mismatch: expected float32, got {acc_partial.dtype}"
+    if acc_sq_partial is None:
+        acc_sq_partial = torch.empty(
+            (NUM_KSPLIT, M), dtype=torch.float32, device=device
+        )
+    else:
+        assert acc_sq_partial.shape == (NUM_KSPLIT, M), (
+            f"acc_sq_partial shape mismatch: expected ({NUM_KSPLIT}, {M}), "
+            f"got {tuple(acc_sq_partial.shape)}"
+        )
+        assert acc_sq_partial.dtype == torch.float32, (
+            f"acc_sq_partial dtype mismatch: expected float32, "
+            f"got {acc_sq_partial.dtype}"
+        )
 
     # --- Launch 1: fused post + partial pre GEMM/sqrsum, one CTA per (M-tile, C-tile).
     grid_split = (triton.cdiv(M, BLOCK_M), NUM_KSPLIT)
