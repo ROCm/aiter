@@ -39,6 +39,7 @@ from aiter.ops.shuffle import (
     pack_int8_to_packed_int4,
     shuffle_scale_for_int4,
 )
+
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
 AITER_MOE_EXPERT_BALANCE = (

@@ -49,6 +49,22 @@ DEFAULT_CSVS = [
 MOE_AOT_ARCH_DEFAULT = "gfx950"
 
 
+def _parse_optional_float(value, source: str) -> float | None:
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value == "":
+        return None
+    try:
+        return float(value)
+    except ValueError as e:
+        raise ValueError(f"{source} must be a float, got {value!r}") from e
+
+
+def _row_swiglu_limit(row: dict[str, str]) -> float:
+    return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit") or 0.0
+
+
 def parse_csv(csv_path: str):
     """Parse the CSV and return a list of unique compile jobs.
 
@@ -83,6 +99,7 @@ def parse_csv(csv_path: str):
             dtype = row.get("dtype", "")
             q_dtype_w = row.get("q_dtype_w", "")
             q_dtype_a = row.get("q_dtype_a", "")
+            swiglu_limit = _row_swiglu_limit(row)
             # Match the RT condition in fused_moe.py / test_moe_2stage.py:
             #   _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == fp4x2
             #   AND the caller actually passes a bias tensor (bias1 is not None).
@@ -104,9 +121,7 @@ def parse_csv(csv_path: str):
                 if stage1_name.startswith("flydsl_")
                 else None
             )
-            stage1_out_dtype = (
-                stage1_params.get("out_dtype") if stage1_params else None
-            )
+            stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
 
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
@@ -131,14 +146,13 @@ def parse_csv(csv_path: str):
 
                 job["token_num"] = token
                 job["block_m"] = block_m
+                job["swiglu_limit"] = swiglu_limit
                 # Stage2 needs to know whether stage1 fuses fp4/fp8 quant —
                 # this changes the shape of a2_scale (sorted scale buffer
                 # vs separate quant call output).
                 if params["stage"] == 2:
                     job["stage1_fuse_quant"] = (
-                        stage1_out_dtype
-                        if stage1_out_dtype in ("fp4", "fp8")
-                        else None
+                        stage1_out_dtype if stage1_out_dtype in ("fp4", "fp8") else None
                     )
 
                 full_job = {**job, **params}
@@ -180,6 +194,7 @@ def _precompile_to_cache(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     stage1_fuse_quant=None,
+    swiglu_limit: float = 0.0,
     **kwargs,
 ):
     """Trigger MLIR compilation by calling the runtime stage1/stage2 entry points
@@ -196,7 +211,7 @@ def _precompile_to_cache(
     """
     import torch
 
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device("cpu")
     is_fp4_weight = b_dtype == "fp4"
     is_int4_weight = b_dtype == "int4"
     tokens = token_num if token_num > 0 else tile_m
@@ -254,17 +269,13 @@ def _precompile_to_cache(
         sorted_token_ids = torch.zeros(
             max_num_tokens_padded, device=dev, dtype=torch.int32
         )
-        sorted_expert_ids = torch.zeros(
-            max_num_m_blocks, device=dev, dtype=torch.int32
-        )
+        sorted_expert_ids = torch.zeros(max_num_m_blocks, device=dev, dtype=torch.int32)
         num_valid_ids = torch.zeros(2, device=dev, dtype=torch.int32)
         return sorted_token_ids, sorted_expert_ids, num_valid_ids
 
     def _make_sorted_weights(doweight: bool):
         if doweight:
-            return torch.zeros(
-                max_num_tokens_padded, device=dev, dtype=torch.float32
-            )
+            return torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.float32)
         return None
 
     def _make_a1_scale():
@@ -323,9 +334,22 @@ def _precompile_to_cache(
             return torch.zeros(
                 _padded_rows * _padded_cols, dtype=torch.uint8, device=dev
             )
-        if a_dtype in ("fp8", "fp4"):
-            # Stand-alone quant call (fused_dynamic_mxfp4_quant_moe_sort or
-            # mxfp4_moe_sort_fwd): 32-row alignment.
+        if a_dtype == "fp8":
+            if act == "silu" and swiglu_limit == 0.0:
+                # fused_moe_2stages uses fused_quant_fp8_sort for this path.
+                rows = (max_num_tokens_padded + 31) // 32 * 32
+                cols = (inter_dim + 31) // 32
+                return torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
+
+            # Otherwise fused_moe_2stages reuses a1_scale for stage2.
+            return torch.ones(
+                [max_num_tokens_padded, model_dim // 32],
+                dtype=torch.uint8,
+                device=dev,
+            )
+        if a_dtype == "fp4":
+            # fused_dynamic_mxfp4_quant_moe_sort / mxfp4_moe_sort_fwd path:
+            # 32-row alignment.
             rows = (max_num_tokens_padded + 31) // 32 * 32
             cols = (inter_dim + 31) // 32
             return torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
@@ -404,6 +428,7 @@ def _precompile_to_cache(
                 topk_ids=topk_ids if enable_bias else None,
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
+                swiglu_limit=swiglu_limit,
             )
 
         elif stage == 2:
@@ -458,6 +483,8 @@ def _precompile_to_cache(
                 xcd_swizzle=xcd_swizzle,
                 bias=bias,
             )
+
+
 def compile_one_config(
     kernel_name: str,
     model_dim: int,
