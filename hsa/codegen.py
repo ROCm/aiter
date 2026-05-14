@@ -11,7 +11,12 @@ from io import StringIO
 import numpy as np
 import pandas as pd
 
-pd.set_option("future.no_silent_downcasting", True)
+try:
+    pd.set_option("future.no_silent_downcasting", True)
+except pd.errors.OptionError:
+    # Option only exists in pandas >= 2.0.3 and is deprecated in pandas 3.0+.
+    # Safe to ignore on versions where it's unavailable.
+    pass
 
 
 def _strip_line_end_comments(line: str) -> str:
