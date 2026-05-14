@@ -1,9 +1,8 @@
-import torch
 import triton
 from triton.experimental import gluon
-from typing import Optional
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from triton.experimental.gluon import language as gl
+
 
 @gluon.jit
 def _rmsnorm_op(
@@ -13,12 +12,13 @@ def _rmsnorm_op(
     epsilon,
 ):
 
-    row_norm = row*row
+    row_norm = row * row
     row_norm = gl.sum(row_norm, axis=-1, keep_dims=True)
     norm_factor = gl.rsqrt((row_norm / n_cols) + epsilon)
 
     rms_norm = row * norm_factor * weights
     return rms_norm
+
 
 @triton.heuristics(
     {
@@ -70,13 +70,13 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
     EVEN_M_N2: gl.constexpr,
 ):
     start_pid = gl.program_id(0)
-    #get number of programs to determine is 1 or 2 passes
+    # get number of programs to determine is 1 or 2 passes
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
 
-    #create block layouts
+    # create block layouts
     gLayout2D: gl.constexpr = gl.BlockedLayout(
         [1, 2],  # sizePerThread
-        [1, 32], # threadsPerWarp
+        [1, 32],  # threadsPerWarp
         [1, 4],  # warpsPerCTA
         [1, 0],  # order
     )
@@ -153,7 +153,9 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
             start_pid -= num_pid_m
 
             # Load x2 and w2 in parallel then wait for both
-            gl.amd.gfx1250.tdm.async_load(x2_desec, [start_pid * BLOCK_SIZE_M, 0], smemX2)
+            gl.amd.gfx1250.tdm.async_load(
+                x2_desec, [start_pid * BLOCK_SIZE_M, 0], smemX2
+            )
             gl.amd.gfx1250.tdm.async_load(w2_desec, [0], smemW2)
             gl.amd.gfx1250.tdm.async_wait(0)
 
@@ -175,7 +177,9 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
                 out2_ptr.dtype.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_N2], sharedLayout2D
             )
             smemOut2.store(norm2.to(out2_ptr.dtype.element_ty))
-            gl.amd.gfx1250.tdm.async_store(out2_desec, [start_pid * BLOCK_SIZE_M, 0], smemOut2)
+            gl.amd.gfx1250.tdm.async_store(
+                out2_desec, [start_pid * BLOCK_SIZE_M, 0], smemOut2
+            )
             gl.amd.gfx1250.tdm.async_wait(0)
         return
 
@@ -186,7 +190,9 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
     # Load x1 and optionally res1 in parallel, then wait
     gl.amd.gfx1250.tdm.async_load(x1_desec, [start_pid * BLOCK_SIZE_M, 0], smemX1)
     if FIRST_INPUT_RES:
-        gl.amd.gfx1250.tdm.async_load(res1_desec, [start_pid * BLOCK_SIZE_M, 0], smemRes1)
+        gl.amd.gfx1250.tdm.async_load(
+            res1_desec, [start_pid * BLOCK_SIZE_M, 0], smemRes1
+        )
     gl.amd.gfx1250.tdm.async_wait(0)
 
     x1 = smemX1.load(gLayout2D).to(gl.float32)
@@ -217,10 +223,14 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
             out1_ptr.dtype.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_N], sharedLayout2D
         )
         smemOut1.store(norm1.to(out1_ptr.dtype.element_ty))
-        gl.amd.gfx1250.tdm.async_store(out1_desec, [start_pid * BLOCK_SIZE_M, 0], smemOut1)
+        gl.amd.gfx1250.tdm.async_store(
+            out1_desec, [start_pid * BLOCK_SIZE_M, 0], smemOut1
+        )
         gl.amd.gfx1250.tdm.async_wait(0)
 
-    out1_fp4, bs_e8m0 = _mxfp4_quant_op(norm1, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE)
+    out1_fp4, bs_e8m0 = _mxfp4_quant_op(
+        norm1, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+    )
     out1_fp4 = gl.convert_layout(out1_fp4, gLayout2D)
 
     # out1_fp4 uses half-width (packed) offsets — keep as regular store
@@ -228,7 +238,11 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
     out_mask1 = (half_x_offs_n < (N1 // 2))[None, :]
     if not EVEN_M_N:
         out_mask1 = out_mask1 & (x_offs_m < M)[:, None]
-    gl.store(out1_fp4_ptr + x_offs_m[:, None] * out1_fp4_stride_m + half_x_offs_n[None, :], out1_fp4, mask=out_mask1)
+    gl.store(
+        out1_fp4_ptr + x_offs_m[:, None] * out1_fp4_stride_m + half_x_offs_n[None, :],
+        out1_fp4,
+        mask=out_mask1,
+    )
 
     # out1_bs uses non-linear shuffle offsets — keep as regular store
     bs_offs_m = start_pid * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
@@ -264,9 +278,13 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
         if not SHUFFLE_PAD:
             bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < SCALE_N)[None, :]
         else:
-            bs_mask = (bs_offs_m < SCALE_M_PAD)[:, None] & (bs_offs_n < SCALE_N_PAD)[None, :]
+            bs_mask = (bs_offs_m < SCALE_M_PAD)[:, None] & (bs_offs_n < SCALE_N_PAD)[
+                None, :
+            ]
 
-    gl.store(out1_bs_ptr + bs_offs, bs_e8m0.to(out1_bs_ptr.type.element_ty), mask=bs_mask)
+    gl.store(
+        out1_bs_ptr + bs_offs, bs_e8m0.to(out1_bs_ptr.type.element_ty), mask=bs_mask
+    )
 
     # Store residual output via TDM
     if FIRST_INPUT_RES:
@@ -281,5 +299,7 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
             out_res1_ptr.dtype.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_N], sharedLayout2D
         )
         smemOutRes1.store(x1.to(out_res1_ptr.dtype.element_ty))
-        gl.amd.gfx1250.tdm.async_store(out_res1_desec, [start_pid * BLOCK_SIZE_M, 0], smemOutRes1)
+        gl.amd.gfx1250.tdm.async_store(
+            out_res1_desec, [start_pid * BLOCK_SIZE_M, 0], smemOutRes1
+        )
         gl.amd.gfx1250.tdm.async_wait(0)
