@@ -35,14 +35,17 @@ _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", 
 def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
     device = topk_ids.device
     M = topk_ids.shape[0]
-    # torch.empty (not torch.zeros): the asm fmoe kernels write back via
-    # global_atomic_pk_add_bf16 (accumulator pattern), so moe_buf MUST start
-    # zeroed -- but we issue the zero as a hipMemsetAsync on the kernel's
-    # stream from asm_fmoe.cu right before launch_kernel. That keeps both
-    # ops in a single CUDA-graph node pair (host pays ~one launch instead
-    # of two) and avoids aten::fill_'s ~2 us PyTorch dispatch overhead at
-    # small M.
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    # FLAT kernels zero their own output rows on-device and need an
+    # extra M*8-byte per-token coordination region appended to moe_buf.
+    # We over-allocate as a flat byte buffer and expose only the row part.
+    #
+    # The trailing region does not need initialisation; the kernel
+    # tolerates arbitrary contents on the first reference per dispatch.
+    elem_size = torch.empty(0, dtype=moebuf_dtype).element_size()
+    row_bytes = M * model_dim * elem_size
+    flag_bytes = M * 8
+    flat_buf = torch.empty(row_bytes + flag_bytes, dtype=torch.uint8, device=device)
+    moe_buf = flat_buf[:row_bytes].view(moebuf_dtype).view(M, model_dim)
     topk_ids_i32 = (
         topk_ids
         if topk_ids.dtype == dtypes.i32 and topk_ids.is_contiguous()

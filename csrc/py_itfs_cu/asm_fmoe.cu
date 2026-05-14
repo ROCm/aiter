@@ -214,15 +214,6 @@ class FMoeKernel
             gdz = 1;
         }
 
-        // FLAT writeback is global_atomic_pk_add_bf16 -> moe_buf must start at 0.
-        // Same-stream so CUDA-graph capture folds memset + kernel into one dispatch.
-        // Non-FLAT path is zeroed inside moe_sorting_fwd, so we gate on FLAT here.
-        if(this->is_flat_dispatch)
-        {
-            size_t out_bytes = static_cast<size_t>(token_cnt) * dim * O_elemSize;
-            (void)hipMemsetAsync(out->ptr, 0, out_bytes, stream);
-        }
-
         if constexpr(switchGxy)
         {
             kernel.launch_kernel({&args,
