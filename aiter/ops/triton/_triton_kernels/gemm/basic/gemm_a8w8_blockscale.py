@@ -190,11 +190,7 @@ def _gemm_a8w8_blockscale_kernel(
             b_scale = tl.load(b_scale_ptrs)
 
             # Perform dot operation and apply scale
-            accumulator += (
-                tl.dot(a, b)
-                * a_scale[:, None]
-                * b_scale[None, :]
-            )
+            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -407,11 +403,7 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
             b_scale = tl.load(b_scale_ptrs)
 
             # Perform dot operation and apply scale
-            accumulator += (
-                tl.dot(a, b)
-                * a_scale[:, None]
-                * b_scale[None, :]
-            )
+            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
