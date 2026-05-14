@@ -24,6 +24,13 @@ static struct {
     torch::Tensor perm_i32;
 } sort_cache;
 
+static void reset_sort_cache() {
+    sort_cache.last_ptr = nullptr;
+    sort_cache.last_bs = 0;
+    sort_cache.sorted_indices = torch::Tensor();
+    sort_cache.perm_i32 = torch::Tensor();
+}
+
 extern "C" {
 void launch_gdn_decode_iasm(
     const void* query, const void* key, const void* value,
@@ -223,6 +230,8 @@ void hip_state_transpose_multi_layer(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("hip_gdn_decode_reset_sort_cache", &reset_sort_cache,
+          "Invalidate cached sorted GDN decode indices");
     m.def("hip_gdn_decode_tuned_inplace", &hip_gdn_decode_tuned_inplace,
           "GDN decode TUNED kernel (state layout: [pool, HV, V, K])");
     m.def("hip_gdn_decode_tuned_kv_inplace", &hip_gdn_decode_tuned_kv_inplace,

@@ -45,6 +45,12 @@ def _load_extension():
     return _ext
 
 
+def hip_gdn_decode_reset_sort_cache():
+    """Invalidate C++ sorted-index cache before a new decode/graph step."""
+    ext = _load_extension()
+    ext.hip_gdn_decode_reset_sort_cache()
+
+
 def hip_fused_sigmoid_gating_delta_rule_update(
     A_log: torch.Tensor,
     a: torch.Tensor,
