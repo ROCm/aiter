@@ -1335,6 +1335,8 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     q_amax = block_reduce<float, decltype(max_func), HEAD_DIM, true>(q_amax, max_func);
 
     const float q_fp8_max = static_cast<float>(opus::finfo<cache_t>::max());
+    // Q scale is consumed by weights_out and must match the unfused quant path;
+    // only the K cache scale is encoded as UE8M0 for cache layout compatibility.
     const float q_scale = fmaxf(q_amax, 1e-10f) / q_fp8_max;
     const float q_inv_scale = 1.0f / q_scale;
     q_out[token_idx * q_out_stride_t + head_idx * q_out_stride_h + dim * q_out_stride_d] =
@@ -3658,6 +3660,8 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(k.dim() == 2, "k must be [num_tokens, head_dim]");
     AITER_CHECK(weights.dim() == 2, "weights must be [num_tokens, n_heads]");
     AITER_CHECK(weights_out.dim() == 2, "weights_out must be [num_tokens, n_heads]");
+    AITER_CHECK(cos_cache.dim() == 2, "cos_cache must be [max_position, rope_dim / 2]");
+    AITER_CHECK(sin_cache.dim() == 2, "sin_cache must be [max_position, rope_dim / 2]");
     AITER_CHECK(q.size(0) == num_tokens, "q token dimension must match k");
     AITER_CHECK(q.size(2) == head_dim, "q head_dim must match k head_dim");
     AITER_CHECK(slot_mapping.size(0) >= num_tokens, "slot_mapping must cover all k tokens");
@@ -3669,6 +3673,11 @@ void indexer_qk_rope_quant_and_cache(
                 "weights shape must match q [num_tokens, n_heads]");
     AITER_CHECK(weights_out.size(0) == num_tokens && weights_out.size(1) == n_heads,
                 "weights_out shape must match weights");
+    AITER_CHECK(cos_cache.size(0) == sin_cache.size(0) &&
+                    cos_cache.size(1) == sin_cache.size(1),
+                "cos_cache and sin_cache shapes must match");
+    AITER_CHECK(cos_cache.stride(1) == 1 && sin_cache.stride(1) == 1,
+                "cos_cache and sin_cache last dimension must be contiguous");
     AITER_CHECK(head_dim == 128, "indexer fused qk cache only supports head_dim=128");
     AITER_CHECK(rope_dim == 64, "indexer fused qk cache only supports rope_dim=64");
     AITER_CHECK(quant_block_size == head_dim,
@@ -3676,7 +3685,9 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(k.stride(1) == 1 && k.stride(0) == head_dim,
                 "indexer fused qk cache requires contiguous [num_tokens, head_dim] k");
     AITER_CHECK(k.dtype() == q.dtype(), "k dtype must match q dtype");
+    AITER_CHECK(q_out.dtype() == AITER_DTYPE_fp8, "q_out dtype must be fp8");
     AITER_CHECK(weights.dtype() == q.dtype(), "weights dtype must match q dtype");
+    AITER_CHECK(weights_out.dtype() == AITER_DTYPE_fp32, "weights_out dtype must be fp32");
     AITER_CHECK(norm_weight.dtype() == q.dtype(), "norm_weight dtype must match q dtype");
     AITER_CHECK(norm_bias.dtype() == q.dtype(), "norm_bias dtype must match q dtype");
     AITER_CHECK(cos_cache.dtype() == q.dtype(), "cos_cache dtype must match q dtype");
