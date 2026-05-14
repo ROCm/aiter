@@ -37,8 +37,14 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
-    flydsl_moe_stage1,
-    flydsl_moe_stage2,
+    _get_compiled_silu_fused,
+    _run_compiled,
+    _s1_args_fp4,
+    _s1_args_std,
+    _s2_args_fp4,
+    _s2_args_std,
+    compile_flydsl_moe_stage1,
+    compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
 )
 
@@ -377,6 +383,62 @@ def _precompile_to_cache(
             w1_shape = _user_w1_shape()
             w1 = _alloc(w1_shape, _storage_dtype(b_dtype))
 
+            _need_fp4 = out_dtype == "fp4"
+            _need_fp8 = out_dtype == "fp8"
+            _fuse_any_quant = _need_fp4 or _need_fp8
+            _base_out_dtype = "bf16" if _fuse_any_quant else out_dtype
+            _is_splitk = k_batch > 1
+            _splitk_fp4 = _is_splitk and _need_fp4
+            _gui_sk = gate_mode == "interleave" and _is_splitk
+            _gui_sk_fused = _gui_sk and _fuse_any_quant
+            _gemm_out_dtype = _base_out_dtype if _is_splitk else out_dtype
+            _gemm_out_torch_dtype = (
+                torch.bfloat16 if _gemm_out_dtype == "bf16" else torch.float16
+            )
+
+            if _is_splitk:
+                tmp_out = torch.zeros(
+                    (tokens, topk, inter_dim * 2),
+                    dtype=_gemm_out_torch_dtype,
+                    device=dev,
+                )
+                out = (
+                    torch.zeros(
+                        (tokens, topk, inter_dim // 2), device=dev, dtype=torch.uint8
+                    )
+                    if _need_fp4
+                    else (
+                        torch.zeros(
+                            (tokens, topk, inter_dim), device=dev, dtype=torch.uint8
+                        )
+                        if _need_fp8
+                        else torch.empty(
+                            (tokens, topk, inter_dim),
+                            device=dev,
+                            dtype=_gemm_out_torch_dtype,
+                        )
+                    )
+                )
+            else:
+                tmp_out = None
+                out = (
+                    torch.empty(
+                        (tokens, topk, inter_dim // 2), device=dev, dtype=torch.uint8
+                    )
+                    if _need_fp4
+                    else (
+                        torch.empty(
+                            (tokens, topk, inter_dim), device=dev, dtype=torch.uint8
+                        )
+                        if _need_fp8
+                        else torch.empty(
+                            (tokens, topk, inter_dim),
+                            device=dev,
+                            dtype=_gemm_out_torch_dtype,
+                        )
+                    )
+                )
+
             a1_scale = _make_a1_scale()
             # w1_scale: per-32 group along K dimension. Storage size in bytes.
             if is_fp4_weight:
@@ -398,38 +460,138 @@ def _precompile_to_cache(
                 else None
             )
 
-            # Topk_ids is only used by silu_fused for the bias-broadcast path; an
-            # int32 (token_num*topk,) tensor is enough for cache-key purposes.
-            topk_ids = torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
+            flat_a_scale = (
+                a1_scale.view(-1)
+                if a1_scale is not None
+                else torch.empty(0, device=dev)
+            )
+            flat_w_scale = (
+                w1_scale.view(-1)
+                if w1_scale is not None
+                else torch.empty(0, device=dev)
+            )
+            sw_arg = (
+                sw
+                if sw is not None
+                else torch.empty(0, device=dev, dtype=torch.float32)
+            )
+            _grid_y = min(max_num_m_blocks, tokens * topk)
+            _kernel_out = tmp_out if _is_splitk else out
+            kernel_bias = None if _is_splitk else bias
+            _n_in = inter_dim * 2 if is_fp4_weight else inter_dim
+            _k_in = model_dim
 
-            flydsl_moe_stage1(
-                a=a,
-                w1=w1,
-                sorted_token_ids=sorted_token_ids,
-                sorted_expert_ids=sorted_expert_ids,
-                num_valid_ids=num_valid_ids,
+            scale_cols = inter_dim // 32
+            sorted_size = max(max_num_tokens_padded, max_num_m_blocks * tile_m)
+            padded_rows = (sorted_size + 255) // 256 * 256
+            padded_cols = (scale_cols + 7) // 8 * 8
+            out_scale_sorted_flat = (
+                torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
+                if (_fuse_any_quant or _splitk_fp4 or _gui_sk_fused)
+                else torch.empty(0, dtype=torch.uint8, device=dev)
+            )
+
+            if is_fp4_weight:
+                args = _s1_args_fp4(
+                    _kernel_out.view(-1),
+                    a.view(-1),
+                    w1.view(-1),
+                    flat_a_scale,
+                    flat_w_scale,
+                    sorted_token_ids,
+                    sorted_expert_ids,
+                    sw_arg,
+                    num_valid_ids,
+                    out_scale_sorted_flat.view(-1),
+                    tokens,
+                    _n_in,
+                    _k_in,
+                    _grid_y,
+                    dev,
+                    bias=(
+                        kernel_bias.view(-1)
+                        if kernel_bias is not None
+                        else torch.empty(0, device=dev)
+                    ),
+                    stream=0,
+                )
+            else:
+                args = _s1_args_std(
+                    _kernel_out.view(-1),
+                    a.view(-1),
+                    w1.view(-1),
+                    flat_a_scale,
+                    flat_w_scale,
+                    sorted_token_ids,
+                    sorted_expert_ids,
+                    sw_arg,
+                    num_valid_ids,
+                    tokens,
+                    _n_in,
+                    _k_in,
+                    _grid_y,
+                    stream=0,
+                )
+
+            exe = compile_flydsl_moe_stage1(
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=E,
                 topk=topk,
                 tile_m=tile_m,
                 tile_n=tile_n,
                 tile_k=tile_k,
+                doweight_stage1=(sw is not None),
                 a_dtype=a_dtype,
                 b_dtype=b_dtype,
-                out_dtype=out_dtype,
+                out_dtype=_gemm_out_dtype,
                 act=act,
-                w1_scale=w1_scale,
-                a1_scale=a1_scale,
-                sorted_weights=sw,
                 use_async_copy=True,
                 k_batch=k_batch,
                 waves_per_eu=waves_per_eu,
                 b_nt=b_nt,
                 gate_mode=gate_mode,
-                bias=bias,
-                topk_ids=topk_ids if enable_bias else None,
+                enable_bias=(kernel_bias is not None),
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
                 swiglu_limit=swiglu_limit,
             )
+            _run_compiled(exe, args)
+
+            if _gui_sk_fused or _gui_sk or _splitk_fp4:
+                if _gui_sk_fused:
+                    quant_mode = "fp4" if _need_fp4 else "fp8"
+                    gui_layout = True
+                elif _gui_sk:
+                    quant_mode = "none"
+                    gui_layout = True
+                else:
+                    quant_mode = "fp4"
+                    gui_layout = False
+                silu_fused = _get_compiled_silu_fused(
+                    inter_dim,
+                    topk,
+                    quant_mode,
+                    gui_layout=gui_layout,
+                    act=act,
+                    enable_bias=False,
+                    swiglu_limit=swiglu_limit,
+                )
+                _run_compiled(
+                    silu_fused,
+                    (
+                        tmp_out.view(-1, inter_dim * 2),
+                        out.view(-1).view(torch.uint8),
+                        out_scale_sorted_flat,
+                        sorted_token_ids,
+                        num_valid_ids,
+                        sorted_token_ids.view(-1),
+                        torch.empty(0, device=dev, dtype=torch.float32),
+                        tokens,
+                        sorted_token_ids.shape[0],
+                        0,
+                    ),
+                )
 
         elif stage == 2:
             # Stage2 input is (token_num, topk, inter_dim) in a_dtype storage.
@@ -460,29 +622,112 @@ def _precompile_to_cache(
                 else None
             )
 
-            flydsl_moe_stage2(
-                inter_states=a,
-                w2=w2,
-                sorted_token_ids=sorted_token_ids,
-                sorted_expert_ids=sorted_expert_ids,
-                num_valid_ids=num_valid_ids,
+            torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
+            accumulate = mode != "reduce"
+            out = torch.zeros((tokens, model_dim), dtype=torch_out_dtype, device=dev)
+            target = out
+            if not accumulate:
+                target = torch.empty(
+                    (tokens * topk * model_dim,),
+                    device=dev,
+                    dtype=torch_out_dtype,
+                )
+
+            flat_a_scale = (
+                a2_scale.view(-1)
+                if a2_scale is not None
+                else torch.empty(0, device=dev)
+            )
+            flat_w_scale = (
+                w2_scale.view(-1)
+                if w2_scale is not None
+                else torch.empty(0, device=dev)
+            )
+            sw_arg = (
+                sw
+                if sw is not None
+                else torch.empty(
+                    sorted_token_ids.shape, dtype=torch.float32, device=dev
+                )
+            )
+
+            _sbm = sort_block_m if sort_block_m > 0 else tile_m
+            if _sbm == tile_m:
+                m_blocks = min(sorted_expert_ids.shape[0], tokens * topk)
+            else:
+                total_sorted = sorted_expert_ids.shape[0] * _sbm
+                m_blocks = (total_sorted + tile_m - 1) // tile_m
+            if persist is True:
+                _persist_m = -1
+            elif persist is False:
+                _persist_m = 4 if m_blocks > 256 else 1
+            else:
+                _persist_m = -1 if m_blocks > 256 else 1
+            if a_dtype == "fp8":
+                _persist_m = 1
+
+            _n_in = model_dim
+            _k_in = inter_dim
+            if a_dtype == "fp4":
+                _k_in *= 2
+
+            if is_fp4_weight:
+                args = _s2_args_fp4(
+                    target,
+                    a,
+                    w2,
+                    flat_a_scale,
+                    flat_w_scale,
+                    sorted_token_ids,
+                    sorted_expert_ids,
+                    sw_arg,
+                    num_valid_ids,
+                    tokens,
+                    _n_in,
+                    _k_in,
+                    m_blocks,
+                    dev,
+                    bias=bias,
+                    stream=0,
+                )
+            else:
+                args = _s2_args_std(
+                    target,
+                    a,
+                    w2,
+                    flat_a_scale,
+                    flat_w_scale,
+                    sorted_token_ids,
+                    sorted_expert_ids,
+                    sw_arg,
+                    num_valid_ids,
+                    tokens,
+                    _n_in,
+                    _k_in,
+                    m_blocks,
+                    stream=0,
+                )
+
+            exe = compile_flydsl_moe_stage2(
+                model_dim=model_dim,
+                inter_dim=_k_in,
+                experts=E,
                 topk=topk,
                 tile_m=tile_m,
                 tile_n=tile_n,
                 tile_k=tile_k,
+                doweight_stage2=(sw is not None),
                 a_dtype=a_dtype,
                 b_dtype=b_dtype,
                 out_dtype=out_dtype,
-                mode=mode,
-                w2_scale=w2_scale,
-                a2_scale=a2_scale,
-                sorted_weights=sw,
+                accumulate=accumulate,
+                persist_m=_persist_m,
                 sort_block_m=sort_block_m,
-                persist=persist,
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
-                bias=bias,
+                enable_bias=enable_bias,
             )
+            _run_compiled(exe, args)
 
 
 def compile_one_config(
