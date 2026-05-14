@@ -23,7 +23,8 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> local_expert_mask = std::nullopt,
                           std::optional<aiter_tensor_t> num_local_tokens  = std::nullopt,
                           std::optional<aiter_tensor_t> workspace        = std::nullopt,
-                          int dispatch_policy                             = 0);
+                          int dispatch_policy                             = 0,
+                          std::optional<aiter_tensor_t> local_topk_ids   = std::nullopt);
 
 #ifdef MOE_SORTING_OPUS_IMPL
 // ============================================================================
@@ -428,6 +429,7 @@ struct MoeSortingHostArgs
     void* p_ws;             // size is moe_sorting_get_workspace_size()
                             // if return zero, then could be nullptr
                             // must be cleard before use
+    void* p_local_topk_ids; // optional [token, topk], global topk ids mapped to local ids
     opus::index_t tokens;         // if p_local_tokens is not nullptr, this indicate the max possible tokens used for ws/LDS calculation
     opus::index_t unit_size;      // this is the M_a of fused-moe kernel
     opus::index_t num_experts;
@@ -468,6 +470,7 @@ struct MoeSortingKernel
         void* p_sorted_expert_ids;
         void* p_total_tokens_post_pad;
         void* p_moe_buf;
+        void* p_local_topk_ids;
         opus::index_t tokens;
         opus::index_t num_experts;
         opus::index_t moe_buf_interm_dim; // p_moe_buf interm_dim
@@ -522,6 +525,7 @@ struct MoeSortingKernel
         k.p_sorted_weights        = h.p_sorted_weights;
         k.p_sorted_expert_ids     = h.p_sorted_expert_ids;
         k.p_moe_buf               = h.p_moe_buf;
+        k.p_local_topk_ids        = h.p_local_topk_ids;
         k.p_total_tokens_post_pad = h.p_total_tokens_post_pad;
         k.tokens                  = h.tokens;
         k.num_experts             = h.num_experts;
@@ -732,6 +736,7 @@ struct MoeSortingKernel
                                                WeightType* p_sorted_weights,
                                                opus::index_t* p_sorted_expert_ids,
                                                opus::index_t* p_total_tokens_post_pad,
+                                               IndexType* p_local_topk_ids,
                                                const opus::index_t num_experts,
                                                const opus::index_t tokens,
                                                const opus::mdiv unit_size_mdiv,
@@ -926,6 +931,21 @@ struct MoeSortingKernel
             __syncthreads();
         }
 
+        if(p_local_topk_ids != nullptr)
+        {
+            for(int i = tid; i < tokens * topk; i += block_size)
+            {
+                int eid      = topk_id[i];
+                int local_id = eid;
+                if constexpr(Problem::LocalExpertMasking)
+                {
+                    local_id = local_expert_mask[eid] != 0 ? smem_cumdup(eid) : -1;
+                }
+                p_local_topk_ids[i] = local_id;
+            }
+            __syncthreads();
+        }
+
         for(int i_e = tid; i_e < num_experts; i_e += block_size)
         {
             int e_start = smem_cumsum(i_e);
@@ -1095,6 +1115,7 @@ struct MoeSortingKernel
             static_cast<WeightType*>(kargs.p_sorted_weights),
             static_cast<IndexType*>(kargs.p_sorted_expert_ids),
             static_cast<IndexType*>(kargs.p_total_tokens_post_pad),
+            static_cast<IndexType*>(kargs.p_local_topk_ids),
             kargs.num_experts,
             tokens_,
             kargs.unit_size_mdiv,

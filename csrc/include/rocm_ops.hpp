@@ -1262,7 +1262,8 @@ namespace py = pybind11;
           py::arg("local_expert_mask") = std::nullopt, \
           py::arg("num_local_tokens")  = std::nullopt, \
           py::arg("workspace")         = std::nullopt, \
-          py::arg("dispatch_policy")   = 0);
+          py::arg("dispatch_policy")   = 0,            \
+          py::arg("local_topk_ids")    = std::nullopt);
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \

@@ -39,6 +39,7 @@ def _moe_sorting_impl(
     num_local_tokens,
     dispatch_policy,
     use_opus,
+    return_local_topk_ids=False,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -52,10 +53,16 @@ def _moe_sorting_impl(
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    local_topk_ids = (
+        torch.empty_like(topk_ids)
+        if return_local_topk_ids and expert_mask is not None and use_opus
+        else None
+    )
 
     if use_opus:
+        opus_dispatch_policy = 1 if return_local_topk_ids else dispatch_policy
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
-            M, num_experts, topk, dispatch_policy
+            M, num_experts, topk, opus_dispatch_policy
         )
         workspace = (
             torch.empty(ws_size, dtype=torch.uint8, device=device)
@@ -75,7 +82,8 @@ def _moe_sorting_impl(
             expert_mask,
             num_local_tokens,
             workspace,
-            dispatch_policy,
+            opus_dispatch_policy,
+            local_topk_ids,
         )
     else:
         aiter.moe_sorting_fwd(
@@ -92,7 +100,10 @@ def _moe_sorting_impl(
             num_local_tokens,
             dispatch_policy,
         )
-    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+    ret = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+    if return_local_topk_ids:
+        return (*ret, local_topk_ids)
+    return ret
 
 
 def moe_sorting(
@@ -105,6 +116,7 @@ def moe_sorting(
     expert_mask=None,
     num_local_tokens=None,
     dispatch_policy=0,
+    return_local_topk_ids=False,
 ):
     try:
         return _moe_sorting_impl(
@@ -117,7 +129,8 @@ def moe_sorting(
             expert_mask,
             num_local_tokens,
             dispatch_policy,
-            use_opus=not _USE_CK_MOE_SORTING,
+            use_opus=return_local_topk_ids or not _USE_CK_MOE_SORTING,
+            return_local_topk_ids=return_local_topk_ids,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -338,7 +351,16 @@ def fused_moe_(
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
         block_size_M = int(block_size_M)
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+    stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+    need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
+    need_local_topk_ids = (
+        not metadata.run_1stage
+        and need_bias_support
+        and metadata.has_bias
+        and stage1_func is cktile_moe_stage1
+        and expert_mask is not None
+    )
+    sorting_ret = moe_sorting(
         topk_ids,
         topk_weight,
         global_E,
@@ -348,7 +370,20 @@ def fused_moe_(
         expert_mask,
         num_local_tokens,
         moe_sorting_dispatch_policy,
+        return_local_topk_ids=need_local_topk_ids,
     )
+    if need_local_topk_ids:
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            local_topk_ids,
+        ) = sorting_ret
+    else:
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = sorting_ret
+        local_topk_ids = None
 
     if metadata.run_1stage:
         return metadata.stage1(
@@ -404,7 +439,7 @@ def fused_moe_(
             intermediate_pad=intermediate_pad,
             bias1=bias1,
             bias2=bias2,
-            topk_ids=topk_ids,
+            topk_ids=local_topk_ids if local_topk_ids is not None else topk_ids,
             topk_weights=topk_weight,
             # only for flydsl dsv4
             swiglu_limit=swiglu_limit,
