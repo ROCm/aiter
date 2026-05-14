@@ -27,6 +27,75 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 
+# Hardware constants: gfx name and CU count cannot change within a process
+# lifetime, so we query them once at module import time and cache the results.
+# This eliminates repeated HIP runtime queries in the decode hot path.
+_cached_gfx: str = get_gfx()
+_cached_cu_num: int = get_cu_num()
+
+# Cache for scale transpose buffers, keyed on (device.index, cols, rows, dtype).
+# Reusing these buffers across steps eliminates per-step HIP malloc.
+_scale_t_cache: dict = {}
+
+# Cache for moe_sorting output tensors, keyed on
+# (device.index, M, topk, num_experts, block_size, model_dim, moebuf_dtype).
+_moe_sorting_buf_cache: dict = {}
+
+# Cache for quantization functions with transpose_scale=True, keyed on quant_type.
+_quant_func_t_cache: dict = {}
+
+
+def _get_scale_t_buf(scale: torch.Tensor) -> torch.Tensor:
+    """Return a cached buffer with transposed shape of the given scale tensor.
+
+    The buffer is keyed on (device.index, cols, rows, dtype) so that it is
+    reused across decode steps without triggering a new HIP malloc each time.
+    """
+    rows, cols = scale.shape[0], scale.shape[1]
+    key = (scale.device.index, cols, rows, scale.dtype)
+    buf = _scale_t_cache.get(key)
+    if buf is None:
+        buf = torch.empty((cols, rows), dtype=scale.dtype, device=scale.device)
+        _scale_t_cache[key] = buf
+    return buf
+
+
+def _get_moe_sorting_bufs(
+    M, topk, num_experts, block_size, model_dim, moebuf_dtype, device
+):
+    """Return cached moe_sorting output tensors for the given configuration.
+
+    Tensors are keyed on (device.index, M, topk, num_experts, block_size,
+    model_dim, moebuf_dtype) and reused across decode steps to avoid per-step
+    HIP malloc.
+    """
+    key = (device.index, M, topk, num_experts, block_size, model_dim, moebuf_dtype)
+    bufs = _moe_sorting_buf_cache.get(key)
+    if bufs is None:
+        max_num_tokens_padded = int(M * topk + num_experts * block_size - topk)
+        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+        sorted_weights = torch.empty(
+            max_num_tokens_padded, dtype=dtypes.fp32, device=device
+        )
+        sorted_expert_ids = torch.empty(
+            max_num_m_blocks, dtype=dtypes.i32, device=device
+        )
+        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        bufs = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+        _moe_sorting_buf_cache[key] = bufs
+    return bufs
+
+
+def _get_quant_func_transpose(quant_type):
+    """Return a cached functools.partial of get_quant(quant_type) with transpose_scale=True."""
+    fn = _quant_func_t_cache.get(quant_type)
+    if fn is None:
+        fn = functools.partial(get_quant(quant_type), transpose_scale=True)
+        _quant_func_t_cache[quant_type] = fn
+    return fn
+
 
 def _moe_sorting_impl(
     topk_ids,
@@ -106,6 +175,65 @@ def moe_sorting(
     num_local_tokens=None,
     dispatch_policy=0,
 ):
+    if expert_mask is None:
+        device = topk_ids.device
+        M, topk = topk_ids.shape
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+            _get_moe_sorting_bufs(
+                M, topk, num_experts, block_size, model_dim, moebuf_dtype, device
+            )
+        )
+        try:
+            if not _USE_CK_MOE_SORTING:
+                ws_size = aiter.moe_sorting_opus_get_workspace_size(
+                    M, num_experts, topk, dispatch_policy
+                )
+                workspace = (
+                    torch.empty(ws_size, dtype=torch.uint8, device=device)
+                    if ws_size > 0
+                    else None
+                )
+                aiter.moe_sorting_opus_fwd(
+                    topk_ids,
+                    topk_weights,
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    moe_buf,
+                    num_experts,
+                    int(block_size),
+                    expert_mask,
+                    num_local_tokens,
+                    workspace,
+                    dispatch_policy,
+                )
+            else:
+                aiter.moe_sorting_fwd(
+                    topk_ids,
+                    topk_weights,
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    moe_buf,
+                    num_experts,
+                    int(block_size),
+                    expert_mask,
+                    num_local_tokens,
+                    dispatch_policy,
+                )
+            return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+        except Exception as e:
+            logger.error(f"Error in moe_sorting: {e}")
+            max_num_tokens_padded = int(
+                topk_ids.numel() + num_experts * block_size - topk_ids.shape[1]
+            )
+            topk = topk_ids.shape[1]
+            logger.error(
+                f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
+            )
+            raise e
     try:
         return _moe_sorting_impl(
             topk_ids,
@@ -500,7 +628,7 @@ def fused_moe_1stage(
                 ), "a1_scale must be provided for quantized input for fused_moe"
                 a1 = hidden_states
                 if quant_type == QuantType.per_1x128:
-                    scale_t = torch.empty_like(a1_scale)
+                    scale_t = _get_scale_t_buf(a1_scale)
                     aiter.partial_transpose(
                         scale_t, a1_scale, num_rows=num_local_tokens
                     )
@@ -569,7 +697,7 @@ def fused_moe_1stage(
 
 @functools.lru_cache(maxsize=2048)
 def get_block_size_M(token, topk, expert, inter_dim):
-    cu_num = get_cu_num()
+    cu_num = _cached_cu_num
     tileN = 128
     tgN = (inter_dim + tileN - 1) // tileN
     support_list = [32, 64, 128]
@@ -909,7 +1037,7 @@ def get_2stage_cfgs(
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
-    cu_num = get_cu_num()
+    cu_num = _cached_cu_num
     keys = (
         cu_num,
         token,
