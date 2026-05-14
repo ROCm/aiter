@@ -889,6 +889,9 @@ def test_triton_mhc_pre_post(M, n, C, dtype):
         sinkhorn_iters=sinkhorn_iters,
     )
 
+    # Convert to K-contiguous tensor
+    phi = phi.T.contiguous().T.to(torch.float32)
+
     # Triton fused — mhc_post_pre consumes the alphas tensor.
     h_post_t, h_res_t, layer_input_out_t, residual_out_t = mhc_post_pre(
         layer_input,
