@@ -5143,6 +5143,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 head_size=head_size,
                 context_partition_num=context_partition_num,
             )
+            return
         except Exception:
             pass
         try:
