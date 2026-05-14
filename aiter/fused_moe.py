@@ -512,7 +512,9 @@ def fused_moe_1stage(
     ):
         dtype = moe_buf.dtype
         effective_kernelName = (
-            _FAST_PATH_KERNELNAME_BF16 if dtype == dtypes.bf16 else _FAST_PATH_KERNELNAME_FP16
+            _FAST_PATH_KERNELNAME_BF16
+            if dtype == dtypes.bf16
+            else _FAST_PATH_KERNELNAME_FP16
         )
         if hidden_states.dtype != dtypes.fp8:
             quant_func = get_quant(quant_type, transpose_scale=True)
@@ -526,11 +528,21 @@ def fused_moe_1stage(
             assert a1_scale is not None, "a1_scale required for pre-quantized input"
             a1 = hidden_states
         aiter.fmoe_fp8_blockscale_g1u1(
-            moe_buf, a1, w1, w2,
-            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
-            topk, a1_scale, w1_scale, w2_scale,
+            moe_buf,
+            a1,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            topk,
+            a1_scale,
+            w1_scale,
+            w2_scale,
             effective_kernelName,
-            fc_scale_blkn=128, fc_scale_blkk=128,
+            fc_scale_blkn=128,
+            fc_scale_blkk=128,
             block_size_M=block_size_M,
             fc2_smooth_scale=None,
             activation=activation,
@@ -1108,8 +1120,15 @@ def get_2stage_cfgs(
                 )
 
     force_1stage = _should_force_1stage_asm(
-        get_gfx(), q_type, dtype, q_dtype_a, q_dtype_w,
-        use_g1u1, doweight_stage1, inter_dim, token,
+        get_gfx(),
+        q_type,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        use_g1u1,
+        doweight_stage1,
+        inter_dim,
+        token,
     )
 
     use_non_temporal_load = False
@@ -1143,7 +1162,11 @@ def get_2stage_cfgs(
 
         if force_1stage and not run_1stage:
             run_1stage = True
-            kernelName1 = _FAST_PATH_KERNELNAME_BF16 if dtype == dtypes.bf16 else _FAST_PATH_KERNELNAME_FP16
+            kernelName1 = (
+                _FAST_PATH_KERNELNAME_BF16
+                if dtype == dtypes.bf16
+                else _FAST_PATH_KERNELNAME_FP16
+            )
 
         block_m = (
             BLOCK_SIZE_M
@@ -1178,7 +1201,11 @@ def get_2stage_cfgs(
         run_1stage = cfg.get("run_1stage", False)
         if force_1stage and not run_1stage:
             run_1stage = True
-            kernelName1 = _FAST_PATH_KERNELNAME_BF16 if dtype == dtypes.bf16 else _FAST_PATH_KERNELNAME_FP16
+            kernelName1 = (
+                _FAST_PATH_KERNELNAME_BF16
+                if dtype == dtypes.bf16
+                else _FAST_PATH_KERNELNAME_FP16
+            )
         if not is_shuffled and not run_1stage:
             logger.warning(
                 f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
