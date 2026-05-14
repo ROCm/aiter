@@ -24,6 +24,9 @@ import aiter as ops
 from aiter import dtypes
 
 
+_GLUON_DECODE_MIN_BATCH_SIZE = 8
+
+
 # from vllm.utils import is_hip
 def is_hip():
     return True
@@ -40,6 +43,20 @@ _ON_NAVI = (
     hasattr(_DEVICE_PROPERTIES, "gcnArchName")
     and "gfx1" in torch.cuda.get_device_properties("cuda").gcnArchName
 )
+
+
+def _is_gluon_decode_available() -> bool:
+    try:
+        from aiter.ops.triton.gluon.pa_decode_gluon import (
+            GLUON_JIT_KERNEL_ENABLED,
+            get_cdna_version,
+        )
+    except Exception:
+        return False
+    return GLUON_JIT_KERNEL_ENABLED and get_cdna_version() in (3, 4)
+
+
+_GLUON_DECODE_AVAILABLE = _is_gluon_decode_available()
 
 
 # page attention ops
@@ -246,30 +263,98 @@ class PagedAttention:
         output_dtype: torch.dtype = None,
     ) -> torch.Tensor:
         # Whether to use rocm custom paged attention or not
-        num_seqs, num_heads, head_size = query.shape
+        num_query_tokens, num_heads, head_size = query.shape
+        batch_size = block_tables.shape[0]
+        query_length = mtp
         block_size = key_cache.size(3)
         output = torch.empty_like(query, dtype=output_dtype)
-
-        max_num_partitions = (
-            max_seq_len + _PARTITION_SIZE_ROCM - 1
-        ) // _PARTITION_SIZE_ROCM
-        tmp_output = torch.empty(
-            size=(num_seqs, num_heads, max_num_partitions, head_size),
-            dtype=output.dtype,
-            device=output.device,
-        )
-        exp_sums = torch.empty(
-            size=(num_seqs, num_heads, max_num_partitions),
-            dtype=dtypes.fp32,
-            device=output.device,
-        )
-        max_logits = torch.empty_like(exp_sums)
         cpa_fp8_out = False
         if fp8_out_scale is not None:
             output = torch.empty_like(output, dtype=dtypes.fp8)
             cpa_fp8_out = True
+
+        max_num_partitions = (
+            max_seq_len + _PARTITION_SIZE_ROCM - 1
+        ) // _PARTITION_SIZE_ROCM
         if scale is None:
             scale = float(1.0 / (head_size**0.5))
+
+        use_gluon_decode = (
+            batch_size >= _GLUON_DECODE_MIN_BATCH_SIZE
+            and not cpa_fp8_out
+            and _GLUON_DECODE_AVAILABLE
+            and query_length > 0
+            and query_length <= 4
+            and num_query_tokens == batch_size * query_length
+            and num_heads % num_kv_heads == 0
+            and block_size in (16, 64, 1024)
+            and query.dtype == dtypes.bf16
+            and key_cache.dtype == dtypes.bf16
+            and value_cache.dtype == dtypes.bf16
+            and output.dtype == dtypes.bf16
+            and (query_length * (num_heads // num_kv_heads)) <= 64
+        )
+
+        if use_gluon_decode:
+            equivalent_query_group_size = query_length * (num_heads // num_kv_heads)
+            exp_sums = torch.empty(
+                (
+                    batch_size,
+                    num_kv_heads,
+                    max_num_partitions,
+                    equivalent_query_group_size,
+                ),
+                dtype=dtypes.fp32,
+                device=output.device,
+            )
+            max_logits = torch.empty_like(exp_sums)
+            tmp_output = torch.empty(
+                (
+                    batch_size,
+                    num_kv_heads,
+                    max_num_partitions,
+                    equivalent_query_group_size,
+                    head_size,
+                ),
+                dtype=output.dtype,
+                device=output.device,
+            )
+            torch.ops.aiter.pa_decode_gluon(
+                output,
+                query,
+                key_cache,
+                value_cache,
+                seq_lens,
+                block_tables,
+                scale,
+                query_length,
+                max_num_partitions,
+                _PARTITION_SIZE_ROCM,
+                dtypes.bf16,
+                None,
+                None,
+                None,
+                exp_sums=exp_sums,
+                max_logits=max_logits,
+                temporary_output=tmp_output,
+                alibi_slopes=alibi_slopes,
+                sinks=None,
+                sliding_window=0,
+                ps=False,
+            )
+            return output
+
+        tmp_output = torch.empty(
+            size=(num_query_tokens, num_heads, max_num_partitions, head_size),
+            dtype=output.dtype,
+            device=output.device,
+        )
+        exp_sums = torch.empty(
+            size=(num_query_tokens, num_heads, max_num_partitions),
+            dtype=dtypes.fp32,
+            device=output.device,
+        )
+        max_logits = torch.empty_like(exp_sums)
         torch.ops.aiter.paged_attention_rocm(
             output,
             exp_sums,
@@ -294,7 +379,7 @@ class PagedAttention:
             mtp=mtp,
         )
         if cpa_fp8_out:
-            return output.view(num_seqs, num_heads * head_size)
+            return output.view(num_query_tokens, num_heads * head_size)
         return output
 
     # @staticmethod
