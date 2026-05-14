@@ -382,7 +382,9 @@ def fused_moe_(
             local_topk_ids,
         ) = sorting_ret
     else:
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = sorting_ret
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+            sorting_ret
+        )
         local_topk_ids = None
 
     if metadata.run_1stage:
