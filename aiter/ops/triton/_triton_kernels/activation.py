@@ -222,8 +222,6 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
     stride_x_n = tl.cast(stride_x_n_in, tl.int64)
     stride_x_fp8_m = tl.cast(stride_x_fp8_m_in, tl.int64)
     stride_x_fp8_n = tl.cast(stride_x_fp8_n_in, tl.int64)
-    stride_bs_m = tl.cast(stride_bs_m_in, tl.int64)
-    stride_bs_n = tl.cast(stride_bs_n_in, tl.int64)
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
 
     x_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -248,6 +246,8 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
     out_offs = pid_m * stride_x_fp8_m + out_offs_n * stride_x_fp8_n
 
     if DO_QUANT:
+        stride_bs_m = tl.cast(stride_bs_m_in, tl.int64)
+        stride_bs_n = tl.cast(stride_bs_n_in, tl.int64)
         x_fp8, x_bs = _fp8_quant_op(
             x, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
         )

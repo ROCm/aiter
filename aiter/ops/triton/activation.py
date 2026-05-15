@@ -165,11 +165,6 @@ def act_mul(
         group_size = max(32, group_size)
 
     scaleN = triton.cdiv(N_half, group_size)
-    dummy_bs = torch.empty(
-        (1, 1),
-        dtype=torch.float32,
-        device=x.device,
-    )
     DTYPE_MAX = 1.0
     BLOCK_SIZE_N = group_size
 
@@ -180,10 +175,11 @@ def act_mul(
     _act_mul_and_dynamic_fp8_group_quant_kernel[grid](
         x_2d,
         out_2d,
-        dummy_bs,
+        None,
         *x_2d.stride(),
         *out_2d.stride(),
-        *dummy_bs.stride(),
+        0,  # stride_bs_m_in
+        0,  # stride_bs_n_in
         N=N_half,
         ACTIVATION=activation,
         scaleN=scaleN,
