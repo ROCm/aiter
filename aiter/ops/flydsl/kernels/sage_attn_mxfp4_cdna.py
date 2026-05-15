@@ -526,17 +526,28 @@ def build_sage_attn_mxfp4_cdna_module(
 
         # ---- Preload Q to registers (FP4 packed) ----
         # Each wave owns ROWS_PER_WAVE=32 Q rows.
-        # For FP4 32x32x64: each MFMA call processes K=32 elements (one scale
-        # group). Per lane = 8 bytes = 16 nibbles for K=group*32 + klane*16..+15.
-        # We load K_STEPS_QK packs per lane, each = 8 bytes (v2i32 wrapped as
-        # v8i32 with upper bytes zeroed at MFMA-call time).
+        # For FP4 32x32x64 with op-sel scale-group packing (per-lane scale
+        # validated 2026-05-14): each MFMA call processes K=64 elements
+        # covering TWO MXFP4 scale groups. Per lane = 16 bytes = 32 nibbles
+        # holding ONE full scale group; klane=0 lane carries group 2*ks_pair,
+        # klane=1 lane carries group 2*ks_pair+1. Per-lane scale i32 carries
+        # the matching e8m0 byte at opselA=ks_pair, so ONE MFMA call applies
+        # the correct per-32-group scale to both halves.
+        # K_STEPS_QK_PACKED = K_STEPS_QK // 2 (=2 for head_dim=128).
         v2i32_type = Vec.make_type(2, fx.Int32)
         v8i32_type = Vec.make_type(8, fx.Int32)
         v8i8_type_l = Vec.make_type(8, fx.Int8)
+        v16i8_type_l = Vec.make_type(16, fx.Int8)
 
         def _load_ptr_i8_vec8_local(ptr, base_idx):
             gep = buffer_ops.get_element_ptr(ptr, fx.Int64(base_idx), elem_type=T.i8)
             return _pointer_load(v8i8_type_l, gep)
+
+        def _load_ptr_i8_vec16_local(ptr, base_idx):
+            gep = buffer_ops.get_element_ptr(ptr, fx.Int64(base_idx), elem_type=T.i8)
+            return _pointer_load(v16i8_type_l, gep)
+
+        K_STEPS_QK_PACKED = K_STEPS_QK // 2
 
         q_row = q_start + wave_q_offset + lane32
         q_row_i32 = fx.Int32(q_row)
@@ -545,16 +556,18 @@ def build_sage_attn_mxfp4_cdna_module(
         )
         q_row_safe = fx.Index(ArithValue(q_in_bounds).select(q_row, fx.Index(0)))
 
-        _zero_v2i32_ir = Vec.filled(2, 0, fx.Int32).ir_value()
-        q_packs = []  # one v2i32 per scale group (= 8 bytes = 16 K-nibbles per lane)
-        for ks in range_constexpr(K_STEPS_QK):
-            # ks = scale group index (0..3 for head_dim=128).
-            # K-byte range: ks*16 + klane*8 .. + 7 (8 bytes per lane).
-            q_col_byte = fx.Index(ks * 16) + klane * 8
+        _zero_v4i32_ir = Vec.filled(4, 0, fx.Int32).ir_value()
+        q_packs = []  # one v4i32 per ks_pair (= 16 bytes = 32 K-nibbles per lane)
+        for ks_pair in range_constexpr(K_STEPS_QK_PACKED):
+            # ks_pair covers scale groups (2*ks_pair, 2*ks_pair+1).
+            # Per-lane K-byte range: ks_pair*32 + klane*16 .. +15 (16 bytes).
+            # klane=0 → K-nibbles [ks_pair*64 : ks_pair*64+32] (group 2*ks_pair)
+            # klane=1 → K-nibbles [ks_pair*64+32 : ks_pair*64+64] (group 2*ks_pair+1)
+            q_col_byte = fx.Index(ks_pair * 32) + klane * 16
             g_idx = q_global_idx(q_row_safe, q_col_byte)
-            v8i8 = _load_ptr_i8_vec8_local(q_ptr, g_idx)
-            v2i32 = vector.bitcast(v2i32_type, v8i8)
-            q_packs.append(ArithValue(q_in_bounds).select(v2i32, _zero_v2i32_ir))
+            v16i8 = _load_ptr_i8_vec16_local(q_ptr, g_idx)
+            v4i32 = vector.bitcast(v4i32_type, v16i8)
+            q_packs.append(ArithValue(q_in_bounds).select(v4i32, _zero_v4i32_ir))
 
         # ---- Q-scale (e8m0) preload: 4 bytes per lane = 1 i32 per (q_row) ----
         # q_descale shape: [B, S, Hq, D//32 = 4]. One i32 per q_row covers all
@@ -573,6 +586,25 @@ def build_sage_attn_mxfp4_cdna_module(
         q_scale_i32 = ArithValue(q_in_bounds).select(
             q_scale_i32, _scale_one_i32
         )
+
+        # ---- Per-klane Q-scale packing for op-sel scale-group packing ----
+        # Original q_scale_i32 = [g0, g1, g2, g3] (4 e8m0 bytes, little-endian).
+        # For per-lane scale (validated by probe_mfma_32x32x64_fp4_perlane_scale.py):
+        # shuffle so klane=0 lane has bytes [g0, g2, _, _] and klane=1 lane has
+        # bytes [g1, g3, _, _]. Then opselA=ks_pair (∈{0,1}) selects the right
+        # scale per (klane, ks_pair):
+        #   klane=0 + ks_pair=0 → byte 0 = g0  (group 0)
+        #   klane=1 + ks_pair=0 → byte 0 = g1  (group 1)
+        #   klane=0 + ks_pair=1 → byte 1 = g2  (group 2)
+        #   klane=1 + ks_pair=1 → byte 1 = g3  (group 3)
+        _klane_i32_local = fx.Int32(klane)
+        _shift_lo = arith.MulIOp(_raw(_klane_i32_local), arith.constant(8, type=T.i32)).result
+        _shift_hi = arith.AddIOp(_shift_lo, arith.constant(16, type=T.i32)).result
+        _mask_byte = arith.constant(0xFF, type=T.i32)
+        _g_lo = arith.AndIOp(arith.ShRUIOp(q_scale_i32, _shift_lo).result, _mask_byte).result
+        _g_hi = arith.AndIOp(arith.ShRUIOp(q_scale_i32, _shift_hi).result, _mask_byte).result
+        _g_hi_shifted = arith.ShLIOp(_g_hi, arith.constant(8, type=T.i32)).result
+        q_scale_packed_i32 = arith.OrIOp(_g_lo, _g_hi_shifted).result
 
         # v_descale per-channel f32, indexed [B, Hkv, D]
         v_descale_base = (batch_idx * NUM_KV_HEADS + head_kv_idx) * HEAD_DIM
@@ -739,6 +771,20 @@ def build_sage_attn_mxfp4_cdna_module(
             lds_idx = buf_off + fx.Index(kv_block_row * K_STRIDE) + k_col_byte
             v8i8 = Vec.load(v8i8_type_l, lds, [lds_idx])
             return vector.bitcast(v2i32_type, v8i8)
+
+        def load_k_frag_fp4_packed(kv_block_row, ks_pair, buf_off):
+            """Load v4i32 (=16xi8 = 32 nibbles) K fragment covering 2 scale groups.
+
+            kv_block_row: row within BLOCK_N tile (0..BLOCK_N-1)
+            ks_pair: scale-group pair index (0..K_STEPS_QK_PACKED-1).
+                     Covers groups (2*ks_pair, 2*ks_pair+1).
+            klane=0 lane → K-nibbles [ks_pair*64 : ks_pair*64+32] (group 2*ks_pair)
+            klane=1 lane → K-nibbles [ks_pair*64+32 : ks_pair*64+64] (group 2*ks_pair+1)
+            """
+            k_col_byte = fx.Index(ks_pair * 32) + klane * 16
+            lds_idx = buf_off + fx.Index(kv_block_row * K_STRIDE) + k_col_byte
+            v16i8 = Vec.load(v16i8_type_l, lds, [lds_idx])
+            return vector.bitcast(v4i32_type, v16i8)
 
         def load_v_frag_fp8(pks, dc, buf_off, iter_lane_addr_i32):
             """Load v8i32 (=32xi8 fp8) V fragment from LDS for mfma_scale_f32_32x32x64.
@@ -917,20 +963,30 @@ def build_sage_attn_mxfp4_cdna_module(
             v8i32_t = Vec.make_type(8, fx.Int32)
             _zero_i32 = arith.constant(0, type=T.i32)
 
-            def _v2_to_v8(v2):
-                """Pad v2i32 → v8i32 by zero-extending upper 6 i32 elements."""
-                e0 = vector.extract(v2, static_position=[0], dynamic_position=[])
-                e1 = vector.extract(v2, static_position=[1], dynamic_position=[])
+            def _v4_to_v8(v4):
+                """Pad v4i32 → v8i32 by zero-extending upper 4 i32 elements."""
+                e0 = vector.extract(v4, static_position=[0], dynamic_position=[])
+                e1 = vector.extract(v4, static_position=[1], dynamic_position=[])
+                e2 = vector.extract(v4, static_position=[2], dynamic_position=[])
+                e3 = vector.extract(v4, static_position=[3], dynamic_position=[])
                 return Vec.from_elements(
-                    [e0, e1, _zero_i32, _zero_i32, _zero_i32, _zero_i32, _zero_i32, _zero_i32],
+                    [e0, e1, e2, e3, _zero_i32, _zero_i32, _zero_i32, _zero_i32],
                     fx.Int32,
                 ).ir_value()
 
             # ---- Load per-(kv_row) k_scale i32 packs, one per N-subtile ----
             # k_descale shape [B, S, Hkv, D//32 = 4]. Per lane: kv_row =
-            # kv_block_start + lane32 + st*32. Load 4 e8m0 bytes into i32.
+            # kv_block_start + lane32 + st*32. Load 4 e8m0 bytes into i32 then
+            # apply per-klane shuffle so klane=0 lane has bytes [g0, g2, _, _]
+            # and klane=1 lane has bytes [g1, g3, _, _]. opselA=ks_pair selects
+            # the right scale per (klane, ks_pair). See per-klane scale probe
+            # (op_tests/.../probe_mfma_32x32x64_fp4_perlane_scale.py).
             _scale_one_i32_l = arith.constant(0x7F7F7F7F, type=T.i32)
-            k_scale_i32_per_st = []
+            _shift_lo_l = arith.MulIOp(_raw(klane_i32), arith.constant(8, type=T.i32)).result
+            _shift_hi_l = arith.AddIOp(_shift_lo_l, arith.constant(16, type=T.i32)).result
+            _mask_byte_l = arith.constant(0xFF, type=T.i32)
+            _shift_8_l = arith.constant(8, type=T.i32)
+            k_scale_packed_per_st = []
             for st in range_constexpr(N_SUBTILES):
                 kv_row_for_lane = kv_block_start_arg + lane32 + fx.Index(st * MFMA_N)
                 kv_in_bounds_l = arith.cmpi(
@@ -957,30 +1013,40 @@ def build_sage_attn_mxfp4_cdna_module(
                 k_scale_i32_lane = ArithValue(kv_in_bounds_l).select(
                     k_scale_i32_lane, _scale_one_i32_l
                 )
-                k_scale_i32_per_st.append(k_scale_i32_lane)
+                # Per-klane pack: byte 0 = group 2*ks_pair (klane-dependent),
+                # byte 1 = group 2*ks_pair+1.
+                _g_lo_k = arith.AndIOp(arith.ShRUIOp(k_scale_i32_lane, _shift_lo_l).result, _mask_byte_l).result
+                _g_hi_k = arith.AndIOp(arith.ShRUIOp(k_scale_i32_lane, _shift_hi_l).result, _mask_byte_l).result
+                _g_hi_k_shifted = arith.ShLIOp(_g_hi_k, _shift_8_l).result
+                k_scale_packed_lane = arith.OrIOp(_g_lo_k, _g_hi_k_shifted).result
+                k_scale_packed_per_st.append(k_scale_packed_lane)
 
-            # ---- 1) QK FP4 MFMA: K_STEPS_QK calls per (st), each one scale group ----
+            # ---- 1) QK FP4 MFMA: K_STEPS_QK_PACKED calls per (st) ----
+            # Each call covers TWO MXFP4 scale groups via per-lane scale packing
+            # (klane=0 carries one group, klane=1 the other). Total: half the
+            # MFMA count of the per-32-group split (4 → 2 calls per st).
             # MFMA operand order: A=K, B=Q (mirrors sage v1 INT8 convention).
             # Output S[m=K-row, n=Q-row]: lane32=Q-row, vector elems span K-rows.
             # This matches the downstream mask/softmax/P-quant code that
             # encodes the K-col index via (msub, klane, erem) of the vector
             # elements and reduces per-Q-row max across klane (XOR 32).
             s_accs_loc = [_raw(c_zero_v16f32) for _ in range(N_SUBTILES)]
-            for ks in range_constexpr(K_STEPS_QK):
-                # Pack q_packs[ks] (v2i32 = 8 active bytes per lane) into v8i32
-                # with upper 24 bytes zero.
-                q_v8 = _v2_to_v8(q_packs[ks])
+            for ks_pair in range_constexpr(K_STEPS_QK_PACKED):
+                # Pack q_packs[ks_pair] (v4i32 = 16 active bytes per lane) into
+                # v8i32 with upper 16 bytes zero.
+                q_v8 = _v4_to_v8(q_packs[ks_pair])
                 for st in range_constexpr(N_SUBTILES):
                     kv_row_loc = lane32 + st * MFMA_N
-                    k_v2 = load_k_frag_fp4(kv_row_loc, ks, k_buf_off_arg)
-                    k_v8 = _v2_to_v8(k_v2)
-                    # A=K (M=K-row=lane32), B=Q (N=Q-row=lane32). Scale per
-                    # operand: scaleA = K-row scale, scaleB = Q-row scale.
+                    k_v4 = load_k_frag_fp4_packed(kv_row_loc, ks_pair, k_buf_off_arg)
+                    k_v8 = _v4_to_v8(k_v4)
+                    # A=K (M=K-row=lane32), B=Q (N=Q-row=lane32). Per-lane
+                    # packed scales: opselA=opselB=ks_pair selects byte ks_pair
+                    # in each lane's packed scale i32.
                     s_accs_loc[st] = mfma_fp4_scaled(
                         v16f32_type,
                         k_v8, q_v8, s_accs_loc[st],
-                        k_scale_i32_per_st[st], q_scale_i32,
-                        ks, ks,
+                        k_scale_packed_per_st[st], q_scale_packed_i32,
+                        ks_pair, ks_pair,
                     )
 
             # 2) Score post-processing.
