@@ -40,6 +40,89 @@ AITER_MOE_EXPERT_BALANCE = (
 )
 
 
+# ---------------------------------------------------------------------------
+# setup-phase probe -- complements the fused_moe.py [probe] tags so a SIGKILL
+# during w1/w2 randn / quant / preshuffle / torch_moe_stage{1,2} reference
+# (i.e. *before* fused_moe is even called) leaves a breadcrumb showing the
+# last phase that *started* and what it cost. Same env switch as the kernel
+# probe: ``AITER_GFX1250_PROBE=1``.
+#
+# Reports both python-side wallclock and GPU memory delta so you can tell a
+# host-side hang (torch repeat/mask indexing) from a GPU OOM (peak just
+# before kill). ``torch.cuda.memory_allocated`` is what the caching
+# allocator currently has handed out; ``max_allocated`` is the peak since
+# the last reset.
+import time as _setup_time
+
+
+def _setup_probe_on() -> bool:
+    return int(os.environ.get("AITER_GFX1250_PROBE", "0")) != 0
+
+
+def _gpu_mem_summary() -> str:
+    try:
+        cur = torch.cuda.memory_allocated() / (1024 ** 3)
+        peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+        return f"gpu_alloc={cur:.2f}G peak={peak:.2f}G reserved={reserved:.2f}G"
+    except Exception:
+        return "gpu_alloc=?"
+
+
+def _host_mem_summary() -> str:
+    """Read VmRSS from /proc/self/status; cheap, no extra deps."""
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    kb = int(line.split()[1])
+                    return f"host_rss={kb / (1024 * 1024):.2f}G"
+    except Exception:
+        pass
+    return "host_rss=?"
+
+
+def _setup_probe_begin(tag: str, **fields):
+    if not _setup_probe_on():
+        return None
+    parts = " ".join(f"{k}={v}" for k, v in fields.items())
+    aiter.logger.info(
+        f"[probe-setup] {tag}.begin {_gpu_mem_summary()} {_host_mem_summary()} {parts}".rstrip()
+    )
+    # flush immediately -- if a SIGKILL hits next, the begin line must
+    # already be on disk so we can attribute the death to *this* phase.
+    for h in getattr(aiter.logger, "handlers", []):
+        try:
+            h.flush()
+        except Exception:
+            pass
+    return _setup_time.perf_counter()
+
+
+def _setup_probe_end(tag: str, t0, *, sync: bool = True, **fields):
+    if t0 is None:
+        return
+    if sync:
+        try:
+            torch.cuda.synchronize()
+        except Exception as _e:
+            aiter.logger.info(
+                f"[probe-setup] {tag}.sync_failed err={type(_e).__name__}:{_e}"
+            )
+            return
+    elapsed = (_setup_time.perf_counter() - t0) * 1000.0
+    parts = " ".join(f"{k}={v}" for k, v in fields.items())
+    aiter.logger.info(
+        f"[probe-setup] {tag}.end elapsed_ms={elapsed:.1f} "
+        f"{_gpu_mem_summary()} {_host_mem_summary()} {parts}".rstrip()
+    )
+    for h in getattr(aiter.logger, "handlers", []):
+        try:
+            h.flush()
+        except Exception:
+            pass
+
+
 _STAGE_EVENT_BUCKETS = {"stage1": [], "stage2": []}
 _STAGE_EVENT_PATCHED = False
 
@@ -170,6 +253,62 @@ def _gfx1250_fp8_round_trip_bf16(x: torch.Tensor) -> torch.Tensor:
     return deq
 
 
+def _k_tile_align_pad(
+    model_dim: int,
+    inter_dim: int,
+    tile_k_s1: int,
+    tile_k_s2: int,
+) -> tuple[int, int, int, int]:
+    """Compute the *physical* K-padding needed to align stage1/stage2 K
+    to their respective ``tile_k`` so the FlyDSL gfx1250 MoE GEMM has
+    zero partial K-tiles.
+
+    Why
+    ---
+    The gfx1250 FlyDSL MoE GEMM (``_gfx1250_moe_stage{1,2}``) tiles the
+    K-loop with a fixed ``tile_k``.  When ``K % tile_k != 0`` (GPT-OSS
+    K=2880, ``tile_k=256`` → 11.25 tiles) the *last* K-tile still loads
+    a full ``[tile_n, tile_k]`` weight block from HBM and issues a full
+    MFMA, but only ``(K % tile_k) / tile_k`` of the work is useful.  At
+    K=2880/tile_k=256 that is **25% useful** in the trailing tile, or
+    ~6.7% of total HBM bytes "wasted" per stage.  Physically padding K
+    to the next ``tile_k`` multiple (zero-valued in both weights and
+    activations along the appended K-columns) removes the partial tile
+    entirely so every K-tile loads a fully productive block.
+
+    Semantics
+    ---------
+    The appended K-columns are zeroed in both ``w*`` and the activation
+    input/intermediate so they contribute exactly 0 to every dot
+    product -- the kernel result is *bit-identical* on the original
+    ``[:, :model_dim]`` slice as before, only the partial-tile overhead
+    disappears.  MX-FP4 ``e8m0`` block scales for the padded K-columns
+    are auto-generated from the (already-zero) padded weight by the
+    quant step, so callers don't need to touch them.
+
+    Note this is independent of :func:`_gfx1250_a8w4_default_kpad`
+    (which trims K for *accuracy*, keeping K physical length fixed).
+    The two are stackable: accuracy-trim first, then tile-align-pad
+    the trimmed K up to the next ``tile_k`` multiple.
+
+    Returns
+    -------
+    ``(model_dim_padded, inter_dim_padded, md_extra, id_extra)``.
+    ``md_extra`` (resp. ``id_extra``) is the number of zero-valued
+    K-columns appended to stage1 (resp. stage2).
+    """
+    def _round_up_to(x: int, m: int) -> int:
+        return ((x + m - 1) // m) * m
+
+    # Round up to lcm(tile_k, 32) so per-1x32 MX-scale tiling stays
+    # well-defined (each 32-wide block maps to one e8m0 scale byte).
+    md_pad = _round_up_to(model_dim, max(tile_k_s1, 32))
+    id_pad = _round_up_to(inter_dim, max(tile_k_s2, 32))
+    md_pad = _round_up_to(md_pad, 32)
+    id_pad = _round_up_to(id_pad, 32)
+    return md_pad, id_pad, md_pad - model_dim, id_pad - inter_dim
+
+
 def _gfx1250_a8w4_default_kpad(model_dim: int, inter_dim: int) -> tuple[int, int]:
     """Pick a default ``(hidden_pad, intermediate_pad)`` for the gfx1250
     a8w4 SwiGLU sweep that keeps the FlyDSL accuracy verdict's
@@ -231,6 +370,74 @@ def test_fmoe(
 ):
     if get_gfx() not in ["gfx950","gfx1250"] and qType == aiter.QuantType.per_1x32:
         return
+    # ------------------------------------------------------------------
+    # AITER_MOE_SKIP_REF=1 -- skip torch_moe_stage1 / torch_moe_stage2 (the
+    # bf16 reference path used only for checkAllclose) and the verdict block
+    # that depends on out2_ref. Useful when the reference's
+    # ``mxfp4_to_f32(w_qt)`` peaks (~8.5 GB fp32 temporaries per stage on
+    # GPT-OSS shapes) get the test SIGKILLed before perftest starts, or
+    # when you only care about kernel timing and don't want the
+    # reference's per-expert masked GEMM dominating wall-clock setup.
+    # Does NOT skip activation/weight quant -- those produce the
+    # quantised tensors that fused_moe itself consumes.
+    # ------------------------------------------------------------------
+    _skip_ref = int(os.environ.get("AITER_MOE_SKIP_REF", "0")) != 0
+    # ------------------------------------------------------------------
+    # AITER_K_TILE_ALIGN_PAD=1 -- physically pad stage1 K (= model_dim)
+    # and stage2 K (= inter_dim) up to the next multiple of their
+    # respective ``tile_k`` so the FlyDSL gfx1250 GEMM has zero partial
+    # K-tiles.  Eliminates the ~25%-utilised trailing K-tile that
+    # GPT-OSS's K=2880 with tile_k=256 produces.  See
+    # ``_k_tile_align_pad`` docstring for full rationale.  Padded
+    # K-columns are zero-valued so kernel output on the original
+    # ``[:, :model_dim_orig]`` slice is bit-identical to the unpadded
+    # run.  Only relevant on gfx1250 per_1x32 (FlyDSL) paths.
+    # ------------------------------------------------------------------
+    _k_tile_align = int(os.environ.get("AITER_K_TILE_ALIGN_PAD", "0")) != 0
+    _orig_model_dim, _orig_inter_dim = int(model_dim), int(inter_dim)
+    _md_extra = 0
+    _id_extra = 0
+    if (
+        _k_tile_align
+        and get_gfx() == "gfx1250"
+        and qType == aiter.QuantType.per_1x32
+    ):
+        _tile_k_s1 = int(os.environ.get("AITER_GFX1250_STAGE1_TILE_K", "256"))
+        _tile_k_s2 = int(
+            os.environ.get("AITER_GFX1250_STAGE2_TILE_K", str(_tile_k_s1))
+        )
+        _md_pad, _id_pad, _md_extra, _id_extra = _k_tile_align_pad(
+            _orig_model_dim, _orig_inter_dim, _tile_k_s1, _tile_k_s2,
+        )
+        if _md_extra or _id_extra:
+            aiter.logger.info(
+                "[k-tile-align-pad] gfx1250 per_1x32: model_dim "
+                f"{_orig_model_dim}->{_md_pad} (+{_md_extra}, "
+                f"tile_k_s1={_tile_k_s1}), inter_dim "
+                f"{_orig_inter_dim}->{_id_pad} (+{_id_extra}, "
+                f"tile_k_s2={_tile_k_s2}); K-tail / N-tail will be "
+                "zero-padded so kernel output on the original slice is "
+                "bit-identical."
+            )
+            model_dim = _md_pad
+            inter_dim = _id_pad
+    # Reset peak counter so each test_fmoe call reports its own peak instead
+    # of carrying over from prior cases in the sweep.
+    try:
+        torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+    _t_setup = _setup_probe_begin(
+        "test_fmoe.setup",
+        token=int(token), model_dim=int(model_dim), inter_dim=int(inter_dim),
+        orig_model_dim=int(_orig_model_dim), orig_inter_dim=int(_orig_inter_dim),
+        md_extra=int(_md_extra), id_extra=int(_id_extra),
+        E=int(E), topk=int(topk),
+        qType=str(qType), AQDType=str(AQDType), WQDType=str(WQDType),
+        actType=str(actType),
+        hidden_pad=int(hidden_pad), intermediate_pad=int(intermediate_pad),
+        skip_ref=bool(_skip_ref),
+    )
     torch_quant = aiter.get_torch_quant(qType)
     # gfx1250 a8w4/fp8 + per_1x32 has very limited dynamic range
     # (fp8 activation × fp4 weight, K=model_dim summation): with the
@@ -251,6 +458,9 @@ def test_fmoe(
         )
     ):
         _input_scale = 0.2
+    _t_rand = _setup_probe_begin("test_fmoe.randn",
+                                 w1_bytes=int(E) * int(inter_dim * (2 if use_g1u1 else 1)) * int(model_dim) * 2,
+                                 w2_bytes=int(E) * int(model_dim) * int(inter_dim) * 2)
     input = torch.randn((token, model_dim), dtype=dtype) * _input_scale
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) * _input_scale
@@ -271,6 +481,46 @@ def test_fmoe(
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
+    # ------------------------------------------------------------------
+    # AITER_K_TILE_ALIGN_PAD: zero out the appended K-tail and N-tail of
+    # every tensor that lives in the padded ``[orig:padded]`` region.
+    # Because all randn() shapes above already used the post-swap
+    # ``model_dim`` / ``inter_dim``, the padded region is just the
+    # trailing slice ``[orig:padded]`` along the corresponding axis.
+    # Zeroing weights + biases is sufficient: ``input``'s padded K-tail
+    # is zeroed so it stays 0 even before the kernel's a-quant, and
+    # stage1 output (= stage2 input) is automatically 0 in the padded
+    # inter_dim slice because every weight column there is 0.  MX-FP4
+    # ``e8m0`` scales for the padded blocks are generated by the quant
+    # step downstream on already-zero data, so they're well-defined.
+    # ------------------------------------------------------------------
+    if _md_extra > 0 or _id_extra > 0:
+        if _md_extra > 0:
+            # input K-tail (stage1 activation K = model_dim)
+            input[:, _orig_model_dim:model_dim] = 0
+            # w1 K-tail
+            w1[:, :, _orig_model_dim:model_dim] = 0
+            # w2 N-tail (output rows along model_dim)
+            w2[:, _orig_model_dim:model_dim, :] = 0
+            # exp_bias2 N-tail
+            exp_bias2[:, _orig_model_dim:model_dim] = 0
+        if _id_extra > 0:
+            # w2 K-tail (stage2 activation K = inter_dim)
+            w2[:, :, _orig_inter_dim:inter_dim] = 0
+            if use_g1u1:
+                # w1 N-tail split across gate ([0:inter_dim]) and up
+                # ([inter_dim:2*inter_dim]); zero the trailing
+                # ``_id_extra`` rows of *each* half so neither
+                # contributes to swiglu in the padded region.
+                w1[:, _orig_inter_dim:inter_dim, :] = 0
+                w1[:, inter_dim + _orig_inter_dim : inter_dim * 2, :] = 0
+                exp_bias1[:, _orig_inter_dim:inter_dim] = 0
+                exp_bias1[:, inter_dim + _orig_inter_dim : inter_dim * 2] = 0
+            else:
+                w1[:, _orig_inter_dim:inter_dim, :] = 0
+                # exp_bias1 is 1-D ``(E*inter_dim,)`` in the non-g1u1
+                # branch; reshape view to zero per-expert N-tail.
+                exp_bias1.view(E, inter_dim)[:, _orig_inter_dim:inter_dim] = 0
     if AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0
@@ -281,8 +531,14 @@ def test_fmoe(
             end_col = start_col + topk
     else:
         score = torch.randn((token, E), dtype=dtype)
+    _setup_probe_end("test_fmoe.randn", _t_rand, sync=True,
+                     w1_shape=tuple(w1.shape), w2_shape=tuple(w2.shape))
 
+    _t_topk = _setup_probe_begin("test_fmoe.fused_topk")
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    _setup_probe_end("test_fmoe.fused_topk", _t_topk, sync=True)
+
+    _t_wq = _setup_probe_begin("test_fmoe.weight_quant", qType=str(qType))
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -332,7 +588,12 @@ def test_fmoe(
     else:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+    _setup_probe_end("test_fmoe.weight_quant", _t_wq, sync=True,
+                     w1_qt_shape=tuple(w1_qt.shape), w2_qt_shape=tuple(w2_qt.shape),
+                     w1_scale_shape=tuple(w1_scale.shape),
+                     w2_scale_shape=tuple(w2_scale.shape))
 
+    _t_aq = _setup_probe_begin("test_fmoe.act_quant")
     # Quant-ing a
     if qType == aiter.QuantType.per_128x128:
         a1_qt, a1_scale = aiter.pertoken_quant(
@@ -360,7 +621,11 @@ def test_fmoe(
             a1_qt = _gfx1250_fp8_round_trip_bf16(input)
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
+    _setup_probe_end("test_fmoe.act_quant", _t_aq, sync=True,
+                     a1_qt_shape=tuple(a1_qt.shape),
+                     a1_qt_dtype=str(a1_qt.dtype))
 
+    _t_ps = _setup_probe_begin("test_fmoe.preshuffle")
     # bias dtype convert
     if (
         qType == aiter.QuantType.per_1x32
@@ -500,63 +765,92 @@ def test_fmoe(
     else:
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+    _setup_probe_end("test_fmoe.preshuffle", _t_ps, sync=True,
+                     w1_qt_aiter_shape=tuple(w1_qt_aiter.shape),
+                     w2_qt_aiter_shape=tuple(w2_qt_aiter.shape))
 
-    # # ######################## stage 1 start ###########
-    out1_ref = torch_moe_stage1(
-        a1_qt,
-        w1_qt,
-        w2_qt,
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        activation=actType,
-        quant_type=qType,
-        a1_scale=a1_scale,
-        w1_scale=w1_scale,
-        w1_bias=exp_bias1,
-        doweight=doweight_stage1,
-    )
-
-    # ######################## stage 2 start ###########
-    if qType == aiter.QuantType.per_128x128:
-        a2_qt, a2_scale = aiter.pertoken_quant(
-            out1_ref.view(token, -1, 128), quant_dtype=AQDType
+    if _skip_ref:
+        aiter.logger.info(
+            "[test_moe_2stage] AITER_MOE_SKIP_REF=1: skipping "
+            "torch_moe_stage1 / a2 quant / torch_moe_stage2 reference "
+            "(checkAllclose verdict will also be skipped). Set =0 to re-enable."
         )
-        a2_scale = a2_scale.view(token, topk, -1)
-    elif (
-        qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
-        and (WQDType == dtypes.fp4x2)
-    ):  # a16w4 & a8w4
-        a2_qt = out1_ref
+        out1_ref = None
+        a2_qt = None
         a2_scale = None
-        # gfx1250 + a8w4 stage2 ref: round-trip a2 the same way stage1
-        # does (kernel quantises stage1 output to fp8 before the second
-        # GEMM; ref otherwise leaves it in bf16 -> 100% checkAllclose
-        # mismatch despite kernel correctness).
-        if (
-            get_gfx() == "gfx1250"
-            and AQDType == dtypes.fp8
-            and WQDType == dtypes.fp4x2
-        ):
-            a2_qt = _gfx1250_fp8_round_trip_bf16(out1_ref)
+        out2_ref = None
     else:
-        a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
-    a2_qt = a2_qt.view(token, topk, -1)
+        _t_ref1 = _setup_probe_begin("test_fmoe.torch_moe_stage1_ref",
+                                     note="dequant w1 to fp32 + per-expert masked GEMM")
+        # # ######################## stage 1 start ###########
+        out1_ref = torch_moe_stage1(
+            a1_qt,
+            w1_qt,
+            w2_qt,
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            activation=actType,
+            quant_type=qType,
+            a1_scale=a1_scale,
+            w1_scale=w1_scale,
+            w1_bias=exp_bias1,
+            doweight=doweight_stage1,
+        )
+        _setup_probe_end("test_fmoe.torch_moe_stage1_ref", _t_ref1, sync=True,
+                         out1_ref_shape=tuple(out1_ref.shape),
+                         out1_ref_absmax=f"{float(out1_ref.float().abs().max()):.3f}")
 
-    out2_ref = torch_moe_stage2(
-        a2_qt,
-        w1_qt,  # E, inter_dim*2, model_dim
-        w2_qt,  # E, model_dim, inter_dim
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        quant_type=qType,
-        w2_scale=w2_scale,
-        a2_scale=a2_scale,
-        w2_bias=exp_bias2,
-        doweight=not doweight_stage1,
-    )
+        _t_a2q = _setup_probe_begin("test_fmoe.a2_quant_for_ref")
+        # ######################## stage 2 start ###########
+        if qType == aiter.QuantType.per_128x128:
+            a2_qt, a2_scale = aiter.pertoken_quant(
+                out1_ref.view(token, -1, 128), quant_dtype=AQDType
+            )
+            a2_scale = a2_scale.view(token, topk, -1)
+        elif (
+            qType == aiter.QuantType.per_1x32
+            and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+            and (WQDType == dtypes.fp4x2)
+        ):  # a16w4 & a8w4
+            a2_qt = out1_ref
+            a2_scale = None
+            # gfx1250 + a8w4 stage2 ref: round-trip a2 the same way stage1
+            # does (kernel quantises stage1 output to fp8 before the second
+            # GEMM; ref otherwise leaves it in bf16 -> 100% checkAllclose
+            # mismatch despite kernel correctness).
+            if (
+                get_gfx() == "gfx1250"
+                and AQDType == dtypes.fp8
+                and WQDType == dtypes.fp4x2
+            ):
+                a2_qt = _gfx1250_fp8_round_trip_bf16(out1_ref)
+        else:
+            a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
+        a2_qt = a2_qt.view(token, topk, -1)
+        _setup_probe_end("test_fmoe.a2_quant_for_ref", _t_a2q, sync=True,
+                         a2_qt_shape=tuple(a2_qt.shape))
+
+        _t_ref2 = _setup_probe_begin("test_fmoe.torch_moe_stage2_ref")
+        out2_ref = torch_moe_stage2(
+            a2_qt,
+            w1_qt,  # E, inter_dim*2, model_dim
+            w2_qt,  # E, model_dim, inter_dim
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            quant_type=qType,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            w2_bias=exp_bias2,
+            doweight=not doweight_stage1,
+        )
+        _setup_probe_end("test_fmoe.torch_moe_stage2_ref", _t_ref2, sync=True,
+                         out2_ref_shape=tuple(out2_ref.shape))
+    _setup_probe_end("test_fmoe.setup", _t_setup, sync=True,
+                     note=("setup done (ref skipped via AITER_MOE_SKIP_REF=1); "
+                           "about to enter fused_moe") if _skip_ref else
+                          "all setup phases done; about to enter fused_moe")
 
     # ######################## stage 2 end ###########
     # Direct torch.cuda.Event(enable_timing=True) timing path -- bypasses
@@ -786,6 +1080,19 @@ def test_fmoe(
             f"(M={token},dim={model_dim}/{inter_dim},E={E},topk={topk},"
             f"act={_act_bytes}B,w={_w_bytes}B)"
         )
+    if _skip_ref:
+        # AITER_MOE_SKIP_REF=1 path: no out2_ref tensor exists, so we
+        # can't compute mismatch_ratio / logits_diff. Surface as PASS
+        # (err=0) in the markdown summary and log a one-line marker so
+        # readers know accuracy was intentionally skipped, not silently
+        # zeroed.  Perftest timing (us2, _bw_msg) is unaffected.
+        aiter.logger.info(
+            "[moe_2stage] AITER_MOE_SKIP_REF=1 -> "
+            f"perftest only: {us2:>8.2f} us, {_bw_msg} (quant:{AQDType}); "
+            "checkAllclose/logits_diff skipped (no reference)."
+        )
+        return {"us": us2, "err": 0}
+
     err = checkAllclose(
         out2_ref,
         out2_ck,

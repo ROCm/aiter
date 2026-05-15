@@ -19,8 +19,12 @@ export PYTHONPATH=/workspace/ffm/triton/python:/workspace/ffm/FlyDSL:${PYTHONPAT
 # be able to fit it (num_buffers <= K_padded // tile_k); the kernel
 # raises otherwise.
 AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
+  -t 1 -dim 7168,2048 -e 256 -k 8 -q 4 --no-flydsl-csv -hip 0,0 \
+  -tn 128 -tk 512 -bm 16 --stage2-tile-n 256 --stage2-tile-k 256
+
+AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
   -t 64 -dim 7168,2048 -e 256 -k 8 -q 4 --no-flydsl-csv -hip 0,0 \
-  -tn 128 -tk 512 -bm 16 --stage2-tile-n 128 --stage2-tile-k 128
+  -tn 128 -tk 512 -bm 16 --stage2-tile-n 256 --stage2-tile-k 256
 
 # GPT-OSS 120B TP1 (a8w4 / MXFP8 x MXFP4, SwiGLU)
 #   input : [M, 2880] bf16
@@ -35,8 +39,36 @@ AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORT
 # valid; drop the ``-hip 0,0`` flag to let the script auto-pick
 # ``-hip 768,768`` via ``_gfx1250_a8w4_default_kpad`` if a PASS verdict
 # is required.
-AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
+
+AITER_MOE_SKIP_REF=0 AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
+  -t 1 -dim 2880,2880 -e 128 -k 4 -q 7 -a swiglu --no-flydsl-csv -hip 0,0 \
+  -tn 128 -tk 256 -bm 16 --stage2-tile-n 128 --stage2-tile-k 256
+
+AITER_MOE_SKIP_REF=0 AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
   -t 64 -dim 2880,2880 -e 128 -k 4 -q 7 -a swiglu --no-flydsl-csv -hip 0,0 \
+  -tn 128 -tk 512 -bm 16 --stage2-tile-n 256 --stage2-tile-k 256
+
+# GPT-OSS BS=1 / BS=64 with physical K-tile alignment padding
+# (AITER_K_TILE_ALIGN_PAD=1): rounds model_dim / inter_dim up to the
+# next multiple of stage1 / stage2 ``tile_k`` so there is no partial
+# K-tile.  At ``-dim 2880,2880 -tk 256 --stage2-tile-k 256``,
+# 2880 -> 3072 (+192) per stage, eliminating the trailing 25%-utilised
+# K-tile.  Padded K-columns are zero-valued so kernel output on the
+# original ``[:, :2880]`` slice is bit-identical to the unpadded run.
+AITER_K_TILE_ALIGN_PAD=1 AITER_MOE_SKIP_REF=0 AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
+  -t 1 -dim 2880,2880 -e 128 -k 4 -q 7 -a swiglu --no-flydsl-csv -hip 0,0 \
+  -tn 128 -tk 512 -bm 16 --stage2-tile-n 256 --stage2-tile-k 256
+
+AITER_K_TILE_ALIGN_PAD=1 AITER_MOE_SKIP_REF=0 AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
+  -t 64 -dim 2880,2880 -e 128 -k 4 -q 7 -a swiglu --no-flydsl-csv -hip 0,0 \
+  -tn 128 -tk 512 -bm 16 --stage2-tile-n 256 --stage2-tile-k 256
+
+AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
+ -t 64 -dim 3072,3072 -e 128 -k 4 -q 7 --no-flydsl-csv -hip 0,0 \
+  -tn 128 -tk 512 -bm 16 --stage2-tile-n 256 --stage2-tile-k 256
+
+AITER_GFX1250_PROBE=1 AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
+  -t 64 -dim 2880,2880 -e 64 -k 4 -q 7 -a swiglu --no-flydsl-csv -hip 0,0 \
   -tn 128 -tk 512 -bm 16 --stage2-tile-n 128 --stage2-tile-k 128
 
 # ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=0 python op_tests/test_moe_2stage.py -t 1 -dim 256,1024 -e 8 -k 2 -q 4 --no-flydsl-csv -hip 0,0
