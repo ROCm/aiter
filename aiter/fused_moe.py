@@ -27,12 +27,6 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 
-# Hardware constants: gfx name and CU count cannot change within a process
-# lifetime, so we query them once at module import time and cache the results.
-# This eliminates repeated HIP runtime queries in the decode hot path.
-_cached_gfx: str = get_gfx()
-_cached_cu_num: int = get_cu_num()
-
 # Cache for scale transpose buffers, keyed on (device.index, cols, rows, dtype).
 # Reusing these buffers across steps eliminates per-step HIP malloc.
 _scale_t_cache: dict = {}
@@ -64,10 +58,10 @@ _GFX950_BLOCKSCALE_NOVS_KERNELS: dict = {
 # Pre-resolved kernel name constants for the gfx950 1-stage ASM fast path,
 # resolved once at import time from _GFX950_BLOCKSCALE_NOVS_KERNELS.
 _FAST_PATH_KERNELNAME_BF16: str = _GFX950_BLOCKSCALE_NOVS_KERNELS.get(
-    (_cached_gfx, dtypes.bf16), ("", "")
+    (get_gfx(), dtypes.bf16), ("", "")
 )[0]
 _FAST_PATH_KERNELNAME_FP16: str = _GFX950_BLOCKSCALE_NOVS_KERNELS.get(
-    (_cached_gfx, dtypes.fp16), ("", "")
+    (get_gfx(), dtypes.fp16), ("", "")
 )[0]
 
 
@@ -674,7 +668,7 @@ def fused_moe_1stage(
                 _FAST_PATH_KERNELNAME_FP16 if _FAST_PATH_KERNELNAME_FP16 else kernelName
             )
         else:
-            kv = _GFX950_BLOCKSCALE_NOVS_KERNELS.get((_cached_gfx, dtype), ("", ""))
+            kv = _GFX950_BLOCKSCALE_NOVS_KERNELS.get((get_gfx(), dtype), ("", ""))
             effective_kernelName = kv[0] if kv[0] else kernelName
 
         if hidden_states.dtype != q_dtype_a:
@@ -806,7 +800,7 @@ def fused_moe_1stage(
 
 @functools.lru_cache(maxsize=2048)
 def get_block_size_M(token, topk, expert, inter_dim):
-    cu_num = _cached_cu_num
+    cu_num = get_cu_num()
     tileN = 128
     tgN = (inter_dim + tileN - 1) // tileN
     support_list = [32, 64, 128]
@@ -1146,7 +1140,7 @@ def get_2stage_cfgs(
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
-    cu_num = _cached_cu_num
+    cu_num = get_cu_num()
     keys = (
         cu_num,
         token,
@@ -1249,7 +1243,7 @@ def get_2stage_cfgs(
 
     # Compute force_1stage for the gfx950 ASM fast path
     force_1stage = _should_force_1stage_asm(
-        _cached_gfx,
+        get_gfx(),
         q_type,
         dtype,
         q_dtype_a,
@@ -1344,7 +1338,7 @@ def get_2stage_cfgs(
         elif dtype == dtypes.fp16:
             kernelName1 = _FAST_PATH_KERNELNAME_FP16
         else:
-            kv = _GFX950_BLOCKSCALE_NOVS_KERNELS.get((_cached_gfx, dtype), ("", ""))
+            kv = _GFX950_BLOCKSCALE_NOVS_KERNELS.get((get_gfx(), dtype), ("", ""))
             kernelName1 = kv[0]
         run_1stage_xbf16 = False
 
