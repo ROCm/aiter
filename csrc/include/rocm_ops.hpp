@@ -1264,6 +1264,20 @@ namespace py = pybind11;
           py::arg("workspace")         = std::nullopt, \
           py::arg("dispatch_policy")   = 0);
 
+#define PA_SPARSE_PREFILL_OPUS_PYBIND                  \
+    m.def("pa_sparse_prefill_opus_fwd",        \
+          &pa_sparse_prefill_opus_fwd,         \
+          py::arg("q"),                                \
+          py::arg("unified_kv"),                       \
+          py::arg("kv_indices_prefix"),                \
+          py::arg("kv_indptr_prefix"),                 \
+          py::arg("kv"),                               \
+          py::arg("kv_indices_extend"),                \
+          py::arg("kv_indptr_extend"),                 \
+          py::arg("attn_sink"),                        \
+          py::arg("out"),                              \
+          py::arg("softmax_scale"));
+
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
           &layernorm2d,                            \
