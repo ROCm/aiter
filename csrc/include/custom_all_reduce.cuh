@@ -1501,7 +1501,7 @@ __device__ __forceinline__ uint8_t ar_mxfp4_encode(float x)
     return sign | mag;
 }
 
-__device__ __forceinline__ float ar_mxfp4_rounded_amax(float amax)
+__device__ __forceinline__ uint8_t ar_mxfp4_scale_e8m0(float amax)
 {
     union
     {
@@ -1510,6 +1510,20 @@ __device__ __forceinline__ float ar_mxfp4_rounded_amax(float amax)
     } v;
     v.f = amax;
     v.u = (v.u + 0x200000u) & 0xFF800000u;
+    uint32_t exponent = (v.u >> 23) & 0xFFu;
+    if(exponent <= 2)
+        return 0;
+    return static_cast<uint8_t>(exponent - 2);
+}
+
+__device__ __forceinline__ float ar_mxfp4_quant_scale(uint8_t scale_e8m0)
+{
+    union
+    {
+        float f;
+        uint32_t u;
+    } v;
+    v.u = (254u - static_cast<uint32_t>(scale_e8m0)) << 23;
     return v.f;
 }
 
@@ -1562,14 +1576,8 @@ __device__ __forceinline__ void ar_fusion_epilogue_mxfp4(
         local_max   = fn(local_max, other);
     }
 
-    float rounded_max = ar_mxfp4_rounded_amax(local_max);
-    int scale_unbiased = -127;
-    if(rounded_max > 0.0f)
-    {
-        scale_unbiased = static_cast<int>(floorf(log2f(rounded_max))) - 2;
-        scale_unbiased = max(-127, min(127, scale_unbiased));
-    }
-    float quant_scale = exp2f(-static_cast<float>(scale_unbiased));
+    uint8_t scale_e8m0 = ar_mxfp4_scale_e8m0(local_max);
+    float quant_scale  = ar_mxfp4_quant_scale(scale_e8m0);
 
     if(active)
     {
@@ -1584,8 +1592,7 @@ __device__ __forceinline__ void ar_fusion_epilogue_mxfp4(
     }
 
     if(lane_in_group == 0 && active)
-        scale_out[tidx * num_groups + group_id] =
-            static_cast<uint8_t>(scale_unbiased + 127);
+        scale_out[tidx * num_groups + group_id] = scale_e8m0;
 }
 
 template <typename P, typename A, typename T, typename OutT, int PACK_SIZE>
@@ -1984,6 +1991,147 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
                                      residual_inp, residual_out,
                                      output, weight, scale_out,
                                      size, hidden_dim, eps, bf16_output);
+}
+
+// 2-stage variant of the MXFP4 fused AR+RMSNorm+quant kernel.
+// Stage 1: reduce-scatter via shared memory (warp_id picks peer, warp 0 sums)
+//          and writes the rounded bf16/fp16 reduction back to every peer's tmp.
+// Stage 2: each block reads tmps[rank] (now holding the full all-reduced
+//          tensor), adds the residual, RMSNorms, and runs the MXFP4 epilogue.
+//
+// Compared to the 1-stage variant this:
+//   * supports m > kMaxBlocks via grid-stride looping in stage 2,
+//   * keeps the stage-1 numerics identical to the per-group 2-stage kernel
+//     (sum in fp32, downcast to T before storing in tmp), which matches the
+//     unfused (allreduce -> RMSNorm -> dynamic_mxfp4_quant) reference.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(1024, 1)
+    allreduce_fusion_kernel_2stage_mxfp4(RankData* _dp,
+                                         RankSignals sg,
+                                         Signal* self_sg,
+                                         int rank,
+                                         T* __restrict__ residual_inp,
+                                         T* __restrict__ residual_out,
+                                         uint8_t* __restrict__ output,
+                                         T* __restrict__ weight,
+                                         uint8_t* __restrict__ scale_out,
+                                         int size,
+                                         int hidden_dim,
+                                         float eps,
+                                         T* __restrict__ bf16_output = nullptr)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    int block_size          = hidden_dim / pack_size;
+    int tnum_gpu            = block_size / ngpus;
+    int padded_block_size   = (int)blockDim.x;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    extern __shared__ char smem_buf[];
+    P* tmp_smem = reinterpret_cast<P*>(smem_buf);
+    bool stage_active = (int)threadIdx.x < block_size;
+    int warp_id       = threadIdx.x / tnum_gpu;
+    int lane_id       = threadIdx.x % tnum_gpu;
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+        tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+    }
+    A acc;
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    int size_pack = size / pack_size;
+    for(int idx_pack = (blockIdx.x * ngpus + rank) * tnum_gpu + lane_id;
+        idx_pack < size_pack;
+        idx_pack += gridDim.x * ngpus * tnum_gpu)
+    {
+        P vec{};
+        if(stage_active)
+            vec = ptrs[warp_id][idx_pack];
+        tmp_smem[threadIdx.x] = vec;
+        __syncthreads();
+        if(warp_id == 0 && (int)threadIdx.x < tnum_gpu)
+        {
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+                acc[v] = upcast_s(vec[v]);
+#pragma unroll
+            for(int r = 1; r < ngpus; ++r)
+            {
+                vec = tmp_smem[r * tnum_gpu + lane_id];
+#pragma unroll
+                for(int v = 0; v < pack_size; ++v)
+                    acc[v] += upcast_s(vec[v]);
+            }
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+                vec[v] = downcast_s<T>(acc[v]);
+            tmp_smem[lane_id] = vec;
+        }
+        __syncthreads();
+        if(stage_active)
+        {
+            vec                    = tmp_smem[lane_id];
+            tmps[warp_id][idx_pack] = vec;
+        }
+    }
+
+    int access_id_in_token = threadIdx.x * pack_size;
+    bool active            = (int)threadIdx.x < block_size;
+    P weight_p{};
+    if(active)
+        weight_p = *reinterpret_cast<P*>(weight + access_id_in_token);
+    end_sync<ngpus>(sg, self_sg, rank);
+    int token_num = size / hidden_dim;
+    for(int tidx = blockIdx.x; tidx < token_num; tidx += gridDim.x)
+    {
+        int idx = tidx * hidden_dim + access_id_in_token;
+        A acc{};
+        if(active)
+        {
+            P vec = tmps[rank][idx / pack_size];
+            P res = *reinterpret_cast<P*>(residual_inp + idx);
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+                vec[v] += res[v];
+            *reinterpret_cast<P*>(residual_out + idx) = vec;
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+                acc[v] = upcast_s(vec[v]);
+        }
+        ar_fusion_epilogue_mxfp4<P, A, T, pack_size>(
+            acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
+            output, scale_out, active, bf16_output);
+    }
+}
+
+template <typename T, int NGPUS>
+void allreduce_fusion_kernel_2stage_mxfp4_launcher(
+    RankData* _dp, RankSignals sg, Signal* self_sg, int rank,
+    T* residual_inp, T* residual_out, uint8_t* output, T* weight,
+    uint8_t* scale_out, int size, int hidden_dim, float eps,
+    hipStream_t stream, T* bf16_output = nullptr)
+{
+    constexpr int PACK_SIZE = 16 / sizeof(T);
+    int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
+    int token_num           = size / hidden_dim;
+    if(BLOCK_SIZE % NGPUS != 0)
+        throw std::runtime_error(
+            "2-stage MXFP4 fused kernel requires hidden_dim/PACK_SIZE divisible by "
+            "world_size (warp-per-peer reduce-scatter). Got block_size=" +
+            std::to_string(BLOCK_SIZE) + " ngpus=" + std::to_string(NGPUS));
+    int padded_block_size = (BLOCK_SIZE + 31) / 32 * 32;
+    dim3 threadsPerBlock(padded_block_size);
+    token_num = std::min(token_num, kMaxBlocks);
+    dim3 numBlocks(token_num);
+    size_t smem_size = padded_block_size * sizeof(typename opus::vector_t<T, PACK_SIZE>);
+    allreduce_fusion_kernel_2stage_mxfp4<T, NGPUS>
+        <<<numBlocks, threadsPerBlock, smem_size, stream>>>(
+            _dp, sg, self_sg, rank,
+            residual_inp, residual_out, output, weight, scale_out,
+            size, hidden_dim, eps, bf16_output);
 }
 
 template <typename T, typename OutT, int NGPUS>
@@ -3752,21 +3900,42 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
     }
     RankData* ptrs   = get_buffer_RD(stream, input);
     auto pack_size   = 16 / sizeof(T);
+    int  block_size  = n / (int)pack_size;
     bool n_constrain = (n % pack_size == 0) && (n / pack_size <= 1024);
-    use_1stage       = use_1stage && n_constrain && (m <= kMaxBlocks);
-    if(!use_1stage)
+    bool can_1stage  = use_1stage && n_constrain && (m <= kMaxBlocks);
+    // 2-stage budget mirrors the per-group FP8 dispatcher: 512 KiB of input
+    // bytes is the largest size where keeping the full reduction in shared
+    // memory still beats the split (reduce-scatter + local) variant.
+    bool stage2_n_ok = (block_size % world_size_) == 0 &&
+                       (bf16_output == nullptr || (block_size % 32) == 0);
+    bool can_2stage  = !can_1stage && n_constrain && stage2_n_ok &&
+                      ((int64_t)size * (int64_t)sizeof(T) <= 512 * 1024);
+    if(!can_1stage && !can_2stage)
     {
         throw std::runtime_error(
-            "MXFP4 fused kernel currently supports only 1-stage decode shapes "
-            "with token_num <= " +
-            std::to_string(kMaxBlocks));
+            "MXFP4 fused kernel: unsupported shape m=" + std::to_string(m) +
+            " n=" + std::to_string(n) + " (1-stage requires use_1stage && m<=" +
+            std::to_string(kMaxBlocks) +
+            ", 2-stage requires hidden_dim/PACK_SIZE divisible by world_size, "
+            "bf16 side-output requires hidden_dim/PACK_SIZE divisible by 32, and "
+            "size*sizeof(T) <= 512 KiB)");
     }
 
-#define DISPATCH_AR_FUSION_MXFP4_KERNEL(NGPUS)                                             \
-    allreduce_fusion_kernel_1stage_mxfp4_launcher<T, NGPUS>(                                \
-        ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight, scale_out,   \
-        size, n, eps, stream, bf16_output);                                                  \
-    return;
+#define DISPATCH_AR_FUSION_MXFP4_KERNEL(NGPUS)                                              \
+    if(can_1stage)                                                                           \
+    {                                                                                        \
+        allreduce_fusion_kernel_1stage_mxfp4_launcher<T, NGPUS>(                             \
+            ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,           \
+            scale_out, size, n, eps, stream, bf16_output);                                    \
+        return;                                                                              \
+    }                                                                                        \
+    else                                                                                     \
+    {                                                                                        \
+        allreduce_fusion_kernel_2stage_mxfp4_launcher<T, NGPUS>(                             \
+            ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,           \
+            scale_out, size, n, eps, stream, bf16_output);                                    \
+        return;                                                                              \
+    }
 
     switch(world_size_)
     {

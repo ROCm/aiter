@@ -360,41 +360,80 @@ class CudaCommunicator(DeviceCommunicatorBase):
         prefill_support: bool = False,
         emit_bf16: bool = False,
     ):
-        """Fused AR+RMSNorm with an MXFP4 quantization epilogue when supported."""
+        """Fused AR+RMSNorm with an MXFP4 quantization epilogue when supported.
+
+        Selects the 1-stage decode-shape kernel when the shape qualifies,
+        otherwise the 2-stage kernel for larger shapes that still fit in the
+        512 KiB shared-memory reduce-scatter budget. Falls back to fused
+        AR+RMSNorm + ``dynamic_mxfp4_quant`` for any shape neither kernel
+        supports.
+
+        ``AITER_AR_1STAGE``:
+            * ``"1"``  -> only attempt the 1-stage kernel
+            * ``"0"``  -> only attempt the 2-stage kernel
+            * unset    -> auto: prefer 1-stage when eligible, else 2-stage
+        """
         total_bytes = input_.numel() * input_.element_size()
         K = input_.shape[-1]
         token_num = input_.numel() // K
+        element_size = input_.element_size()
+        pack_size = 16 // element_size if element_size > 0 else 0
+        block_size = K // pack_size if pack_size > 0 else 0
+
+        # 1-stage gate: direct decode shapes only (matches kernel constraints).
         use_direct_mxfp4 = (
             token_num <= 4
             or (K <= 4096 and token_num <= 32)
             or (K <= 6144 and token_num <= 16)
             or (K == 8192 and token_num <= 8)
         )
-        out_fp4 = res_out = scale_out = bf16_out = None
-        ca_comm = self.ca_comm
-        use_1stage_mxfp4 = (
-            self._ar_1stage_override
-            if self._ar_1stage_override is not None
-            else True
-        )
-        if (
-            ca_comm is not None
-            and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_, prefill_support)
+        override = self._ar_1stage_override
+        can_1stage = (
+            override is not False
             and K % 32 == 0
             and K <= 16384
             and token_num <= 80
             and use_direct_mxfp4
-            and use_1stage_mxfp4
+        )
+
+        # 2-stage gate: larger prefill shapes that still fit the 512 KiB
+        # shared-memory reduce-scatter budget and split evenly across ranks.
+        can_2stage = (
+            override is not True
+            and K % 32 == 0
+            and pack_size > 0
+            and K <= 8192
+            and block_size % self.world_size == 0
+            and (not emit_bf16 or block_size % 32 == 0)
+            and total_bytes <= 512 * 1024
+        )
+        if override is None:
+            prefer_2stage = (
+                can_2stage
+                and self.world_size == 8
+                and token_num >= 16
+                and K <= 6144
+            )
+            if prefer_2stage:
+                can_1stage = False
+
+        out_fp4 = res_out = scale_out = bf16_out = None
+        ca_comm = self.ca_comm
+        use_kernel = (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_, prefill_support)
             and self.world_size != 6
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
-        ):
+            and (can_1stage or can_2stage)
+        )
+        if use_kernel:
             result = ca_comm.custom_fused_ar_rms_mxfp4_quant(
                 input_,
                 res_inp_,
                 weight_,
                 eps,
-                use_1stage=True,
+                use_1stage=can_1stage,
                 emit_bf16=emit_bf16,
             )
             assert result is not None
