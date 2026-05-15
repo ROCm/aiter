@@ -970,7 +970,7 @@ def build_compute_delta_s_module(
     """
     assert head_dim == 128, f"only head_dim=128 supported, got {head_dim}"
     assert num_q_heads % num_kv_heads == 0, "Hq must be multiple of Hk for GQA"
-    assert block_n in (32, 64, 128, 256), f"block_n must be 32/64/128/256, got {block_n}"
+    assert block_n in (32, 64, 128, 256, 512), f"block_n must be 32/64/128/256/512, got {block_n}"
 
     VEC = 8
     THREADS_PER_ROW = head_dim // VEC  # 16

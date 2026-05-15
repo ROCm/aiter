@@ -1094,17 +1094,17 @@ def build_sage_attn_mxfp4_cdna_module(
                     (batch_idx * fx.Index(NUM_Q_HEADS) + head_q_idx)
                     * num_q_tiles_loc + q_tile_idx
                 ) * seq_len_k_v
+                # Non-causal bias coalescing decision (compile-time):
+                # Empirically (2026-05-15) vec=4 i32 loads beat per-elem
+                # vec=1 for non-causal Hq>=16 by +14-19% (GQA/Hq=24) but
+                # regress non-causal Hq=8 by -22-29% (collapses LLVM's
+                # latency-hiding window when there's not enough independent
+                # work). Threshold at Hq>=16 to capture the GQA/large-head
+                # win without the small-Hq regression.
+                NONCAUSAL_BIAS_VEC4 = NUM_Q_HEADS >= 16
                 s_bias = []
                 for st in range_constexpr(N_SUBTILES):
-                    if const_expr(not CAUSAL):
-                        # Non-causal: per-element vec_width=1 + per-elem
-                        # bounds-predicate. Empirically (measured 2026-05-15
-                        # at SHA ef4e11e19+) coalescing into vec_width=4 i32
-                        # loads regressed S=32768 fwd 2.57x → 1.82x Triton
-                        # (-29%). The per-elem cmpi+select pair before each
-                        # buffer_load helps LLVM schedule the load latency
-                        # behind useful work; vec=4 loads collapse the
-                        # latency window. KEEP the per-elem path here.
+                    if const_expr(not CAUSAL and not NONCAUSAL_BIAS_VEC4):
                         for elem in range_constexpr(ELEMS_PER_TILE):
                             idx = st * ELEMS_PER_TILE + elem
                             msub = elem // 4
@@ -1144,9 +1144,7 @@ def build_sage_attn_mxfp4_cdna_module(
                         # in-range; tail's score mask kills OOB cols via
                         # -inf so any garbage bias is harmless). Coalesce
                         # to vec_width=4 i32 loads — 4x fewer bias loads
-                        # and better scheduling. Empirical lift on
-                        # 2026-05-15: S=4096 caus +9%, S=8192 caus +8%,
-                        # S=16384 caus +5%.
+                        # and better scheduling.
                         for msub in range_constexpr(4):
                             kv_col_base = (
                                 kv_block_start_arg
