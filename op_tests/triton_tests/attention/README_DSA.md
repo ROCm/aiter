@@ -56,18 +56,26 @@ loss.backward()  # dQ and dKV computed automatically
 
 ## Backward Strategies
 
-The backward pass computes `dQ` and `dKV` from the upstream gradient `dO`. Five strategies trade off speed vs. memory:
+The backward pass computes `dQ` and `dKV` from the upstream gradient `dO`. Eight strategies trade off speed vs. memory:
 
 | Method | Time (ms) | Speedup | Extra Memory | Description |
 |--------|-----------|---------|--------------|-------------|
 | `"fused"` | 61.1 | 1.00x | 0 | Single fused kernel. Baseline. |
 | `"recompute"` | 52.5 | 1.16x | 0 | Split dQ + dKV. Recomputes S, P, dS in dKV kernel. |
 | `"split_intermediate"` | 38.0 | 1.61x | ~2 GiB | Split dQ + dKV. Stores dS and P as intermediates. |
-| `"privatized"` | 38.0 | 1.61x | ~2.1 GiB | Like split_intermediate with 8 private dKV copies. No improvement over split_intermediate — atomic serialization within XCD is equally limiting. |
-| `"xcd_privatized"` | 38.0 | 1.61x | ~2.1 GiB | Like privatized but routes CTA i to XCD (i%304)//38. No improvement — routing assumption may not hold or intra-XCD contention is the remaining bottleneck. |
-| `"gather"` | 18.2 | **3.36x** | ~6.5 GiB | **Recommended.** Eliminates all atomics: stores per-(q,topk_rank) head-reduced dKV to [T,TOPK,D] bf16 intermediate, builds CSR inverted topk, gathers with plain stores. |
+| `"privatized"` | 38.0 | 1.61x | ~2.1 GiB | Like split_intermediate with 8 private dKV copies. No improvement — L2-miss atomics serialize at Infinity Cache regardless. |
+| `"xcd_privatized"` | 38.0 | 1.61x | ~2.1 GiB | Like privatized with hw_id-based XCD routing. No improvement — dKV copy (9.44 MB) exceeds 4 MB L2, so atomics always miss to Infinity Cache. |
+| `"gather"` | 18.2 | **3.36x** | ~6.5 GiB | Eliminates all atomics via [T,TOPK,D] bf16 intermediate + CSR gather. |
+| `"chunked_gather"` | 23.4 | **2.62x** | ~1.65 GiB | **Best memory/speed tradeoff.** Processes TOPK in R_CHUNK=256 rank passes, reusing a [T,R_CHUNK,D] intermediate. No atomics. |
+| `"persistent"` | N/A | — | ~25 MB | 304-CTA persistent kernel with XCD-local L2 atomics. **Blocked: Triton/LLVM compilation hangs at D_V=512 due to register pressure.** See `persistent_kernel_postmortem.md`. |
 
 *Measured on MI300X, T=4096, H=128, D=576, TOPK=1024.*
+
+### Recommended method
+
+- **Best performance, memory not a concern:** `"gather"` (18.2 ms, 6.5 GiB extra)
+- **Best performance/memory tradeoff:** `"chunked_gather"` (23.4 ms, 1.65 GiB extra)
+- **Zero extra memory:** `"recompute"` (52.5 ms, 0 extra)
 
 ### When to use which
 
@@ -77,7 +85,9 @@ The backward pass computes `dQ` and `dKV` from the upstream gradient `dO`. Five 
 
 - **`"split_intermediate"`**: 1.61x speedup over fused, ~2 GiB extra. Stores dS/P intermediates to halve recomputation, then scatters dKV with atomic_add.
 
-- **`"gather"`**: **Best performance (3.36x speedup)** by eliminating atomic_add entirely. Uses ~6.5 GiB extra (scales as `T * TOPK * D * 2 bytes`). The dKV scatter writes to a private [T, TOPK, D] bf16 buffer (one unique writer per slot — no contention), then a gather phase accumulates dKV per KV token with plain stores. The 3.36x gain over fused (vs 1.61x for split_intermediate) comes from removing the ~4.5x write amplification caused by cross-XCD atomic ownership transfers measured via rocprof TCC_EA0 counters.
+- **`"gather"`**: Best raw performance (3.36x speedup), uses ~6.5 GiB extra (scales as `T * TOPK * D * 2 bytes`). No atomics: each [T, TOPK, D] slot has exactly one writer, then a gather phase accumulates dKV with plain stores. Choose when HBM is plentiful.
+
+- **`"chunked_gather"`**: **Best memory/performance tradeoff (2.62x, ~1.65 GiB extra).** Processes TOPK ranks in passes of R_CHUNK=256. Reuses a fixed [T, R_CHUNK, D] intermediate buffer each pass — no atomics, no 2 GiB dS/P storage. Choose when the 6.5 GiB gather buffer is too large.
 
 ## Integration into a Model
 
@@ -198,7 +208,7 @@ Expected output:
   B1_S8192_H128_topk1024            11.42 ms     204.5 TFLOPS
 
 ================================================================
-  BENCHMARK: Backward (6 methods)
+  BENCHMARK: Backward (7 methods; "persistent" skipped — compilation hang)
 ================================================================
 
   B1_S4096_H128_topk1024
@@ -210,27 +220,12 @@ Expected output:
   privatized                  38.03     63.2     1.61x    2.1 GiB
   xcd_privatized              38.02     63.3     1.61x    2.1 GiB
   gather                      18.17    132.3     3.36x    6.5 GiB
-
-  B1_S4096_H128_topk2048
-  Method                  Time (ms)   TFLOPS  Speedup   Extra mem
-  ----------------------------------------------------------------
-  fused                      119.41     40.3     1.00x          0
-  recompute                  101.48     47.4     1.18x          0
-  split_intermediate          73.50     65.5     1.62x    4.0 GiB
-  privatized                  73.50     65.4     1.62x    4.1 GiB
-  xcd_privatized              73.47     65.5     1.63x    4.1 GiB
-  gather                      33.66    142.9     3.55x   13.0 GiB
-
-  B1_S8192_H128_topk1024
-  Method                  Time (ms)   TFLOPS  Speedup   Extra mem
-  ----------------------------------------------------------------
-  fused                      122.05     39.4     1.00x          0
-  recompute                  104.50     46.0     1.17x          0
-  split_intermediate          76.34     63.0     1.60x    4.0 GiB
-  privatized                  76.43     62.9     1.60x    4.1 GiB
-  xcd_privatized              76.44     62.9     1.60x    4.1 GiB
-  gather                      36.42    132.1     3.35x   13.0 GiB
+  chunked_gather              23.35    103.0     2.62x   1.65 GiB
 ```
+
+Note: the `"persistent"` method exists in code but hangs at Triton/LLVM compilation
+for production configs (D_V=512). Run `bench_dsa_methods.py` without `"persistent"`
+in METHODS to get results for the other 7 methods. See `persistent_kernel_postmortem.md`.
 
 ### Run existing tests
 
@@ -262,13 +257,16 @@ aiter/ops/triton/_triton_kernels/attention/
   deepseek_sparse_attention.py     # Main file: fwd + bwd kernels + Python wrappers
 
 op_tests/triton_tests/attention/
-  bench_dsa_methods.py             # Benchmark all 3 backward methods side-by-side
-  test_sparse_mla_fwd_train.py     # Forward correctness test
-  test_sparse_mla_bwd_train.py     # Backward correctness test (vs PyTorch reference)
-  bench_bwd_dkv_hg_fused.py        # Detailed split+intermediate benchmark
-  bench_bwd_dkv_recompute.py       # Detailed split+recompute benchmark
-  bench_bwd_configs.py             # Backward autotune config sweep
-  bench_fwd_stages.py              # Forward multi-stage benchmark
+  bench_dsa_methods.py                   # Benchmark all 8 backward methods side-by-side
+  test_sparse_mla_fwd_train.py           # Forward correctness test
+  test_sparse_mla_bwd_train.py           # Backward correctness test (vs PyTorch reference)
+  bench_bwd_dkv_hg_fused.py             # Detailed split+intermediate benchmark
+  bench_bwd_dkv_recompute.py            # Detailed split+recompute benchmark
+  bench_bwd_configs.py                  # Backward autotune config sweep
+  bench_fwd_stages.py                   # Forward multi-stage benchmark
+  atomic_bottleneck_analysis.md         # Root cause: why atomics are slow on MI300X
+  chunked_dkv_plan.md                   # Design plan for Approach A (persistent) and B (chunked_gather)
+  persistent_kernel_postmortem.md       # Why persistent kernel can't compile in Triton
 ```
 
 ## Performance Characteristics
@@ -289,6 +287,8 @@ The key bottleneck is **dKV scatter**: multiple query CTAs contribute gradients 
 Privatized schemes (8 copies, XCD-local routing) don't help — intra-XCD atomic serialization is equally limiting, and privatized/xcd_privatized bench identically to split_intermediate.
 
 The `"gather"` method eliminates atomics entirely: each `[T, TOPK, D]` intermediate slot has exactly one writer, so `tl.store` is correct with zero contention. The gather phase then accumulates per KV token with a sequential loop. Result: **3.36x speedup over fused** (vs 1.61x for the previous best).
+
+The `"chunked_gather"` method achieves the same no-atomic property at lower memory cost by processing TOPK ranks in passes of R_CHUNK=256. Each pass: (1) compute dQ contribution and store chunk dS/P to `[T,H,R_CHUNK]` bf16 buffers; (2) run the original gather dKV-intermediate kernel with M=D_V=512 GEMMs for high MFMA utilization; (3) accumulate into a fp32 dkv_acc buffer. Total extra memory: `~1.65 GiB` (vs `6.5 GiB` for full gather). Result: **2.62x speedup** at 103 TFLOPS.
 
 ## Cross-Platform Forward Comparison: AITER (MI300X) vs TileLang (H100)
 

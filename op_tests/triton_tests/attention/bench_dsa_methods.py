@@ -1,5 +1,5 @@
 """
-Benchmark and correctness test for all 7 backward methods in deepseek_sparse_attention.py.
+Benchmark and correctness test for all 8 backward methods in deepseek_sparse_attention.py.
 
 Usage:
   python bench_dsa_methods.py                   # correctness + benchmark (all methods)
@@ -14,8 +14,10 @@ Backward strategies:
   5. "xcd_privatized"     — split dQ+dKV, 8 XCD-local copies (hw_id routing)
   6. "gather"             — split dQ+dKV, no atomics: [T,TOPK,D] bf16 intermediate +
                             CSR inverted topk gather (~7 GiB extra)
-  7. "chunked_gather"     — gather in R_CHUNK=64 rank passes; no dS/P storage;
-                            ~310 MB extra memory; expected ~19-22 ms
+  7. "chunked_gather"     — gather in R_CHUNK=256 rank passes; stores chunk dS/P;
+                            ~1.65 GiB extra; 23ms / 103 TFLOPS / 2.62x
+  8. "persistent"         — 304-CTA persistent kernel; L2-local atomics per XCD;
+                            K_CHUNK fits dkv_chunk/XCD in 4 MB L2; ~25 MB extra
 """
 import sys
 import os
@@ -30,7 +32,7 @@ from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import
     sparse_mla_train,
 )
 
-METHODS = ["fused", "recompute", "split_intermediate", "privatized", "xcd_privatized", "gather", "chunked_gather"]
+METHODS = ["fused", "recompute", "split_intermediate", "privatized", "xcd_privatized", "gather", "chunked_gather", "persistent"]
 
 
 # =====================================================================
@@ -210,6 +212,10 @@ def benchmark_methods(
                 interm_buf = total_tokens * R_CHUNK * d_qk * 2
                 acc = total_tokens * d_qk * 4
                 extra = f"{(chunk_ds_p + interm_buf + acc) / 1024**3:.2f} GiB"
+            elif method == "persistent":
+                # dkv_chunk [8, K_CHUNK, D] fp32 — K_CHUNK = min(T, 4MB//(D*4))
+                K_CHUNK = min(total_tokens, (4 * 1024 * 1024) // (d_qk * 4))
+                extra = f"{8 * K_CHUNK * d_qk * 4 / 1024**2:.0f} MB"
             else:
                 extra = "0"
 
