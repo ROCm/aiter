@@ -197,7 +197,9 @@ def _gemm_a8wfp4_kernel(
                     b_mask = offs_bk[:, None] < K - k * (BLOCK_SIZE_K // 2)
                     b = tl.load(b_ptrs, mask=b_mask, other=0)
                 b_scales = tl.load(b_scale_ptrs)
-            accumulator += tl.dot_scaled(a, a_ones_scale, "e4m3", b, b_scales, "e2m1")
+            accumulator = tl.dot_scaled(
+                a, a_ones_scale, "e4m3", b, b_scales, "e2m1", acc=accumulator
+            )
 
         # Scale by a_scales at the end
         c = (accumulator * a_scales[:, None]).to(c_ptr.type.element_ty)

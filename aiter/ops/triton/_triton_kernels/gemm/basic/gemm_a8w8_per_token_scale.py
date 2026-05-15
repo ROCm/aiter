@@ -168,7 +168,7 @@ def _gemm_a8w8_per_token_scale_kernel(
                 )
 
             # Perform dot operation and apply scale
-            accumulator += tl.dot(a, b)
+            accumulator = tl.dot(a, b, acc=accumulator)
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
