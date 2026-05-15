@@ -2177,10 +2177,11 @@ template<typename T, index_t N> using mfma_vtype_t = typename impl::mfma_vtype<T
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
     return inst_(__builtin_bit_cast(long, a), __builtin_bit_cast(long, b), c, cbsz, abid, blgp); }
 
-// scaled MFMA (f8f6f4): input always bitcast to i32x8_t (256 bits); uses format codes and runtime scale
+// scaled MFMA (f8f6f4): input always bitcast to i32x8_t (256 bits); uses format codes and runtime scale.
+// scale_op_sel_a / scale_op_sel_b are 2-bit byte-selectors inside the packed-int32 scale word.
 #define DISPATCH_MFMA_SCALE_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
-    return inst_(__builtin_bit_cast(i32x8_t, a), __builtin_bit_cast(i32x8_t, b), c, fmt_a, fmt_b, 0, scale_a, 0, scale_b); }
+    return inst_(__builtin_bit_cast(i32x8_t, a), __builtin_bit_cast(i32x8_t, b), c, fmt_a, fmt_b, scale_op_sel_a, scale_a, scale_op_sel_b, scale_b); }
 
 // prefer use make_mfma() to create instance, which will return impl::mfma_adaptor_xxx. In this way we can access layout info from the "mma"
 //
@@ -2249,10 +2250,13 @@ struct mfma {
 
     // Scaled MFMA dispatch (gfx950: f8f6f4 with E8M0 block exponent scaling)
     // scale_a, scale_b are runtime E8M0 exponent values; 127 = no scaling (2^0 = 1.0).
-    template<typename VA, typename VB, typename VC>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) -> vtype_c {
-        (void)a; (void)b; (void)c; (void)scale_a; (void)scale_b;
-        if constexpr (false) {}
+    // scale_op_sel_a, scale_op_sel_b are compile-time 2-bit byte-selectors picking
+    // which byte of the packed-int32 scale word feeds this MFMA. Default 0 matches
+    // the legacy behavior of treating scale_a/scale_b as scalar values (low byte).
+    template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) -> vtype_c {
+        (void)a; (void)b; (void)c; (void)scale_a; (void)scale_b;  // used by DISPATCH_MFMA_SCALE_; suppress -Wunused-parameter on host
+        if      constexpr (false) {}
 #if defined(__gfx950__)
         else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp8_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp8_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
@@ -2262,9 +2266,9 @@ struct mfma {
         __builtin_unreachable();
     }
 
-    template<typename VA, typename VB>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
-        vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
+    template<typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
     }
 };
 #undef DISPATCH_MFMA_
@@ -2692,14 +2696,14 @@ struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
         typename MFMA::vtype_c c{0}; return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
 
-    template<typename VA, typename VB, typename VC>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
-        return base::operator()(b, a, c, scale_b, scale_a);
+    template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        return base::operator()(b, a, c, scale_b, scale_a, number<scale_op_sel_b>{}, number<scale_op_sel_a>{});
     }
 
-    template<typename VA, typename VB>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
-        typename MFMA::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
+    template<typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        typename MFMA::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
     }
 };
 }
@@ -2903,23 +2907,25 @@ struct tiled_mma_adaptor : public MMA_ {
         return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
 
-    // Scaled MFMA (f8f6f4): forward scale_a, scale_b to underlying MMA.
-    template<typename VA, typename VB, typename VC,
+    // Scaled MFMA (f8f6f4): forward scale_a, scale_b and per-call scale_op_sel to underlying MMA.
+    // All sub-MFMAs in this call share the same scale_op_sel (they reside at the same
+    // K position in the packed-int32 scale word).
+    template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         VC c_ {c};
         #pragma unroll
         for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
             index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
             auto s_a = a[i_m * EXPAND_K + i_k]; auto s_b = b[i_n * EXPAND_K + i_k]; auto s_c = c_[i_m * EXPAND_N + i_n];
-            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b); c_[i_m * EXPAND_N + i_n] = s_c;
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{}); c_[i_m * EXPAND_N + i_n] = s_c;
         }
         return c_;
     }
 
-    template<typename VA, typename VB, typename VC,
+    template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         static_assert(size<VA>() == tile_a_len);
         static_assert(size<VB>() == tile_b_len);
         static_assert(size<VC>() == tile_c_len);
@@ -2934,15 +2940,16 @@ struct tiled_mma_adaptor : public MMA_ {
             auto s_a = slice(a, number<i_tile_a * a_len>{}, number<i_tile_a * a_len + a_len>{});
             auto s_b = slice(b, number<i_tile_b * b_len>{}, number<i_tile_b * b_len + b_len>{});
             auto s_c = slice(c_, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
-            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
             set_slice(c_, s_c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
         });
         return c_;
     }
-    template<typename VA, typename VB>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
+
+    template<typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         vtype_c c{0};
-        return operator()(a, b, c, scale_a, scale_b);
+        return operator()(a, b, c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
     }
 
     template<index_t STEP_K, typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
@@ -2995,23 +3002,23 @@ struct tiled_mma_adaptor : public MMA_ {
         return step_k(step, a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
 
-    template<index_t STEP_K, typename VA, typename VB, typename VC,
+    template<index_t STEP_K, typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
-    OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+    OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         static_assert(STEP_K < EXPAND_K);
         VC c_ {c};
         #pragma unroll
         for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
             index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
             auto s_a = a[i_m * EXPAND_K + STEP_K]; auto s_b = b[i_n * EXPAND_K + STEP_K]; auto s_c = c_[i_m * EXPAND_N + i_n];
-            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b); c_[i_m * EXPAND_N + i_n] = s_c;
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{}); c_[i_m * EXPAND_N + i_n] = s_c;
         }
         return c_;
     }
 
-    template<index_t STEP_K, typename VA, typename VB, typename VC,
+    template<index_t STEP_K, typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
-    OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+    OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         static_assert(STEP_K < EXPAND_K);
         static_assert(size<VA>() == tile_a_len);
         static_assert(size<VB>() == tile_b_len);
@@ -3033,17 +3040,17 @@ struct tiled_mma_adaptor : public MMA_ {
             typename MMA::vtype_c s_c;
             #pragma unroll
             for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
-            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
             #pragma unroll
             for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
         }
         return c_;
     }
 
-    template<index_t STEP_K, typename VA, typename VB>
-    OPUS_D constexpr auto step_k(number<STEP_K> step, const VA& a, const VB& b, int scale_a, int scale_b) {
+    template<index_t STEP_K, typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto step_k(number<STEP_K> step, const VA& a, const VB& b, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         vtype_c c{0};
-        return step_k(step, a, b, c, scale_a, scale_b);
+        return step_k(step, a, b, c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
     }
 
     OPUS_ADAPTOR_LAYOUT_API_DEFINE
