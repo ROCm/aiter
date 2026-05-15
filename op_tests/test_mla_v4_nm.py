@@ -33,6 +33,7 @@ import pytest
 import torch
 
 import aiter
+import aiter.mla  # main no longer auto-imports submodules; need explicit
 from aiter.jit.utils.chip_info import get_gfx
 
 
@@ -332,8 +333,8 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     import re
     lines = captured.err.splitlines()
     try:
-        start = next(i for i, l in enumerate(lines)
-                     if l.startswith("[aiter kernarg 288B]"))
+        start = next(i for i, line in enumerate(lines)
+                     if line.startswith("[aiter kernarg 288B]"))
     except StopIteration:
         pytest.fail(
             "kernarg hexdump not found in stderr — "
@@ -356,11 +357,11 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     # Each slot is 16 bytes; first 4 bytes carry the payload, rest is padding.
     def slot(i): return kargs[i * 16: i * 16 + 16]
     def slot_u32(i): return int.from_bytes(slot(i)[:4], "little")
+    import struct
+
     def slot_f32(i):
-        import struct
         return struct.unpack("<f", slot(i)[:4])[0]
 
-    import math, struct
     # scalar_f is computed in jinja with C `float`s (1.0f/sqrtf(512.f)). Mirror
     # that precision here so the byte-exact compare doesn't false-fail on the
     # FP64→FP32 round-off difference.

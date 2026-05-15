@@ -19,7 +19,7 @@ from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from aiter import dtypes
 
 from ..jit.utils.chip_info import get_gfx
-from ..jit.core import compile_ops
+from ..jit.core import compile_ops, is_experimental_enabled
 
 MD_NAME = "module_attention"
 
@@ -963,6 +963,22 @@ def get_mla_metadata_info_v1(
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
 
+    # HK MLA m16x4 (gfx950 + fp8/fp8 + 64 q-tokens per tile) runs at occupancy=2,
+    # so the kernel launches 2*num_cu workgroups. Buffer sizes (work_indptr,
+    # work_info_set) must scale to match -- the C++ metadata layer applies the
+    # same multiplier when it builds the cluster work map. The dispatch (in
+    # aiter/mla.py:use_hk) only routes to hk_mla_decode_fwd when
+    # AITER_ENABLE_EXPERIMENTAL is set, so the multiplier is gated identically.
+    is_hk_m16x4 = (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.fp8
+        and kv_dtype == dtypes.fp8
+        and (num_head_qo * max_seqlen_qo == 64)
+        and is_experimental_enabled()
+    )
+    if is_hk_m16x4:
+        cu_num *= 2
+
     use_qseqlen_fold = (
         get_gfx() == "gfx950"
         and q_dtype == dtypes.fp8
@@ -975,22 +991,30 @@ def get_mla_metadata_info_v1(
         )
     )
 
-    # In sparse mode, each expanded batch has 1 Q token
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
-    max_qo_tiles_per_batch = (
-        int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
-        if num_head_qo == 16
+    max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 16))
+    if (
+        num_head_qo == 16
         or (
-            get_gfx() in ("gfx942", "gfx950")
+            get_gfx() == "gfx942"
             and num_head_qo == 128
             and kv_dtype == dtypes.fp8
             and q_dtype == dtypes.fp8
         )
         or (
+            get_gfx() == "gfx942"
+            and num_head_qo in (16, 32, 64)
+            and num_head_qo * effective_seqlen_qo == 128
+            and kv_dtype == dtypes.fp8
+            and q_dtype == dtypes.fp8
+            and is_experimental_enabled()
+        )
+        or (
             get_gfx() == "gfx950"
-            and (num_head_qo * effective_seqlen_qo) % 128 == 0
-            and kv_dtype == dtypes.bf16
-            and q_dtype == dtypes.bf16
+            and num_head_qo == 128
+            and kv_dtype == dtypes.fp8
+            and q_dtype == dtypes.fp8
+            and effective_seqlen_qo != 4
         )
         or (
             get_gfx() == "gfx950"
@@ -1000,8 +1024,22 @@ def get_mla_metadata_info_v1(
             and effective_seqlen_qo == 1
         )
         or use_qseqlen_fold
-        else int(math.ceil(effective_seqlen_qo * num_head_qo / 16))
-    )
+    ):
+        max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
+    elif (
+        get_gfx() == "gfx950"
+        and ((num_head_qo * effective_seqlen_qo) >= 128 or num_head_qo > 64)
+        and kv_dtype == dtypes.bf16
+        and q_dtype == dtypes.bf16
+        and num_head_qo != 48
+    ):
+        if num_head_qo * 2 > 128:
+            max_qo_tiles_per_batch = effective_seqlen_qo
+        else:
+            max_qo_tiles_per_batch = int(
+                math.ceil(effective_seqlen_qo * num_head_qo / 128)
+            )
+
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
 
