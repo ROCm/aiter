@@ -1,17 +1,25 @@
 from typing import Optional
 import functools
 import json
-import triton
+
 import torch
+
+import triton
+import triton.language as tl
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
-from triton.experimental import gluon
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
-from triton.experimental.gluon import language as gl
+import aiter.ops.triton.gluon.triton_version as tv
 
 _LOGGER = AiterTritonLogger()
+
+# Pre-compute version check as constexpr for use in JIT kernels
+TRITON_VERSION_GE_3_6_0 = tl.constexpr(tv.TRITON_VERSION_GE_3_6_0)
 
 
 @triton.heuristics(
@@ -95,25 +103,35 @@ def _gemm_a8w8_kernel(
         order=[0, 1],
     )
 
+    if TRITON_VERSION_GE_3_6_0:
+        # FP8 uses dot_scaled: mfma_scale_f32_16x16x128_f8f6f4 (K=128, K_WIDTH=32)
+        # INT8 uses dot: mfma_i32_16x16x64_i8 (K=64, K_WIDTH=16)
+        MFMA_K: gl.constexpr = 128 if FP8_FORMAT is not None else 64
+        MFMA_K_WIDTH: gl.constexpr = 32 if FP8_FORMAT is not None else 16
+        MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_K]
+    else:
+        MFMA_INSTR_SHAPE: gl.constexpr = [16, 16]
+        MFMA_K_WIDTH: gl.constexpr = 16
+
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16],
+        instr_shape=MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[2, NUM_WARPS // 2],
     )
 
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=1, max_phase=16, order=[1, 0]
+        vec=MFMA_K_WIDTH, per_phase=1, max_phase=16, order=[1, 0]
     )
     shared_b: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=1, max_phase=16, order=[0, 1]
+        vec=MFMA_K_WIDTH, per_phase=1, max_phase=16, order=[0, 1]
     )
 
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfma_layout, k_width=16
+        operand_index=0, parent=mfma_layout, k_width=MFMA_K_WIDTH
     )
     dot_b_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfma_layout, k_width=16
+        operand_index=1, parent=mfma_layout, k_width=MFMA_K_WIDTH
     )
 
     # Load first blocks of A and B input matrices
@@ -373,9 +391,16 @@ def _gemm_a8w8_preshuffled_kernel(
         shape=[BLOCK_SIZE_N // 16, BLOCK_SIZE_K * 16],
     )
 
+    # Both FP8 and INT8 use regular (unscaled) MFMA here. linear_nk and the
+    # reshape/permute unshuffle sequence were designed for K=32, K_WIDTH=16.
+    # FP8: mfma_f32_16x16x32_fp8_fp8
+    # INT8: mfma_i32_16x16x32_i8
+    MFMA_INSTR_SHAPE: gl.constexpr = (
+        [16, 16, 32] if TRITON_VERSION_GE_3_6_0 else [16, 16]
+    )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16],
+        instr_shape=MFMA_INSTR_SHAPE,
         transposed=True,
         warps_per_cta=[1, NUM_WARPS],
     )
@@ -488,18 +513,7 @@ def _gemm_a8w8_preshuffled_kernel(
         )
         cur_b = gl.convert_layout(value=cur_b, layout=dot_b_layout, assert_trivial=True)
 
-        if FP8_FORMAT is None:  # in_dtype is int8
-            acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)
-        else:
-            acc = gl.amd.cdna4.mfma_scaled(
-                a=cur_a,
-                a_scale=None,
-                a_format=FP8_FORMAT,
-                b=cur_b,
-                b_scale=None,
-                b_format=FP8_FORMAT,
-                acc=acc,
-            )
+        acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)
 
         # write next block of A to LDS
         smem_a.store(a)
@@ -523,18 +537,7 @@ def _gemm_a8w8_preshuffled_kernel(
     )
     cur_b = gl.convert_layout(value=cur_b, layout=dot_b_layout, assert_trivial=True)
 
-    if FP8_FORMAT is None:  # in_dtype is int8
-        acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)
-    else:
-        acc = gl.amd.cdna4.mfma_scaled(
-            a=cur_a,
-            a_scale=None,
-            a_format=FP8_FORMAT,
-            b=cur_b,
-            b_scale=None,
-            b_format=FP8_FORMAT,
-            acc=acc,
-        )
+    acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)
 
     # apply scales to accumulator
     acc *= a_scale[:, None] * b_scale[None, :]

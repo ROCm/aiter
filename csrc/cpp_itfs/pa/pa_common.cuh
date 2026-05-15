@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
+#include "aiter_hip_common.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp8.h>
-#include "hip_compat.h"
 
 #include "dtype_fp8.cuh"
-#include "quant_utils.cuh"
 #include "float.h"
+#include "quant_utils.cuh"
 
 #include <ck_tile/ops/fmha/block/block_masking.hpp>
 #include <ck_tile/ops/fmha/block/variants.hpp>
@@ -24,8 +24,7 @@
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define DIVIDE_ROUND_UP(a, b) (((a) + (b)-1) / (b))
-
+#define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
 
 using floatx4   = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 using float16x4 = __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
@@ -59,11 +58,11 @@ typedef struct _B8x16
     _B8x8 xy[2];
 } _B8x16;
 
-union vec_converter {
+union vec_converter
+{
     bit16x4 vec4;
     bit16x2 vec2[2];
 };
-
 
 ////// Non temporal loads ///////
 template <typename T>
@@ -121,16 +120,20 @@ __device__ __forceinline__ floatx4 gcn_mfma16x16x32_instr(const _B16x8& inpA,
 template <typename T, int absz, int cbid, int blgp>
 __device__ __forceinline__ floatx4 gcn_mfma16x16x32_instr(const long& inpA,
                                                           const long& inpB,
-                                                          const floatx4& inpC) {
-  if constexpr (std::is_same<T, __hip_fp8_e4m3>::value) {
-    return __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(inpA, inpB, inpC, absz, cbid,
-                                                 blgp);
-  } else if constexpr (std::is_same<T, __hip_fp8_e5m2>::value) {
-    return __builtin_amdgcn_mfma_f32_16x16x32_bf8_bf8(inpA, inpB, inpC, absz,
-                                                     cbid, blgp);
-  } else {
-    static_assert(false, "unsupported 8b dtype");
-  }
+                                                          const floatx4& inpC)
+{
+    if constexpr(std::is_same<T, __hip_fp8_e4m3>::value)
+    {
+        return __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(inpA, inpB, inpC, absz, cbid, blgp);
+    }
+    else if constexpr(std::is_same<T, __hip_fp8_e5m2>::value)
+    {
+        return __builtin_amdgcn_mfma_f32_16x16x32_bf8_bf8(inpA, inpB, inpC, absz, cbid, blgp);
+    }
+    else
+    {
+        static_assert(false, "unsupported 8b dtype");
+    }
 }
 
 #else
@@ -156,16 +159,20 @@ __device__ __forceinline__ floatx4 gcn_mfma16x16x16_instr(const _B16x4& inpA,
 template <typename T, int absz, int cbid, int blgp>
 __device__ __forceinline__ floatx4 gcn_mfma16x16x32_instr(const long& inpA,
                                                           const long& inpB,
-                                                          const floatx4& inpC) {
-  if constexpr (std::is_same<T, __hip_fp8_e4m3>::value) {
-    return __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(inpA, inpB, inpC, absz, cbid,
-                                                 blgp);
-  } else if constexpr (std::is_same<T, __hip_fp8_e5m2>::value) {
-    return __builtin_amdgcn_mfma_f32_16x16x32_bf8_bf8(inpA, inpB, inpC, absz,
-                                                     cbid, blgp);
-  } else {
-    static_assert(false, "unsupported 8b dtype");
-  }
+                                                          const floatx4& inpC)
+{
+    if constexpr(std::is_same<T, __hip_fp8_e4m3>::value)
+    {
+        return __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(inpA, inpB, inpC, absz, cbid, blgp);
+    }
+    else if constexpr(std::is_same<T, __hip_fp8_e5m2>::value)
+    {
+        return __builtin_amdgcn_mfma_f32_16x16x32_bf8_bf8(inpA, inpB, inpC, absz, cbid, blgp);
+    }
+    else
+    {
+        static_assert(false, "unsupported 8b dtype");
+    }
 }
 #endif
 
@@ -185,7 +192,6 @@ __device__ __forceinline__ float to_float(const T& inp)
         static_assert(false, "unsupported 16b dtype");
     }
 }
-
 
 template <typename T>
 __device__ __forceinline__ T from_float(const float& inp)
@@ -279,7 +285,6 @@ __device__ __forceinline__ _B16x4 addx4(const _B16x4& inp1, const _B16x4& inp2)
     }
 }
 
-
 __device__ __forceinline__ floatx4 to_float_fp8x4(const _B8x4& inp)
 {
     const auto f0 = __builtin_amdgcn_cvt_pk_f32_fp8(inp, false);
@@ -344,17 +349,19 @@ __device__ __forceinline__ _B16x8 convert_b8x8_custom(const _B8x8 input)
     return ret;
 }
 
-typedef union u64_cvt {
-  half f16x4[4];
-  int16_t b16x4[4];
-  _B8x8 b8x8;
-  _B16x4 b64;
-  int64_t i64;
+typedef union u64_cvt
+{
+    half f16x4[4];
+    int16_t b16x4[4];
+    _B8x8 b8x8;
+    _B16x4 b64;
+    int64_t i64;
 } _T8x8;
 
-
-__device__ __forceinline__ float warpReduceMax(float val) {
-    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+__device__ __forceinline__ float warpReduceMax(float val)
+{
+    for(int offset = warpSize / 2; offset > 0; offset /= 2)
+    {
         val = max(val, __shfl_down(val, offset, warpSize)); // Using max() for reduction
     }
     return val;

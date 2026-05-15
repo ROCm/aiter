@@ -17,7 +17,7 @@
 #include <cmath>
 #include <type_traits>
 
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include "hip_reduce.h"
 #include "quant_utils.cuh"
 #include "rope/rope_common.h"
@@ -32,9 +32,43 @@
  #define CHECK_INPUT(x) \
      CHECK_TH_CUDA(x);  \
      CHECK_CONTIGUOUS(x)
+
+namespace aiter {
+/** Map q/k/v tensor strides to logical [token, head, dim] element strides (PyTorch strides are in elements). */
+struct ActivationStrides3D
+{
+    int64_t st;
+    int64_t sh;
+    int64_t sd;
+};
+
+inline ActivationStrides3D activation_strides_logical_3d(
+    at::Tensor const& t, int64_t num_heads, int64_t head_dim)
+{
+    if(t.dim() == 2)
+    {
+        TORCH_CHECK(
+            t.size(1) == num_heads * head_dim,
+            "activation dim 1 must be num_heads * head_dim (got ",
+            t.size(1),
+            " vs ",
+            num_heads * head_dim,
+            ")");
+        return {t.stride(0), num_heads * t.stride(1), t.stride(1)};
+    }
+    TORCH_CHECK(t.dim() == 3, "q/k/v must be 2D [T, H*D] or 3D [T, H, D], got dim ", t.dim());
+    TORCH_CHECK(t.size(1) == num_heads && t.size(2) == head_dim,
+                "q/k/v 3D shape must be [T, num_heads, head_dim]");
+    return {t.stride(0), t.stride(1), t.stride(2)};
+}
+} // namespace aiter
  
  namespace {
  using mrope_utils::vec_t;
+
+ // Minimum absmax used when computing FP8 KV scales to avoid division by zero when
+ // activations are all zero (e.g. CUDA graph warmup, invalid slots, or padding).
+ static constexpr float kFp8KvQuantAbsmaxFloorF32 = 1e-8f;
  
  template <typename Func, typename T>
  __inline__ __device__ T warpReduceSum(Func func, T val)
@@ -80,7 +114,20 @@
            int num_kv_heads,
            vllm::Fp8KVCacheDataType kv_dt>
  __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
-     scalar_t* qkv_void,            // Combined QKV tensor
+     scalar_t* qkv_void,            // Combined QKV tensor (unused if separate_qkv)
+     bool const separate_qkv,       // If true, use q_act/k_act/v_act with [token, heads, dim] layout
+     scalar_t* q_act,               // [num_tokens, num_heads_q * head_dim] or nullptr
+     scalar_t* k_act,               // [num_tokens, num_heads_k * head_dim] or nullptr
+     scalar_t* v_act,               // [num_tokens, num_heads_v * head_dim] or nullptr
+     int64_t const q_st,
+     int64_t const q_sh,
+     int64_t const q_sd,
+     int64_t const k_st,
+     int64_t const k_sh,
+     int64_t const k_sd,
+     int64_t const v_st,
+     int64_t const v_sh,
+     int64_t const v_sd,
      int const num_heads_q,         // Number of query heads
      int const num_heads_k,         // Number of key heads
      int const num_heads_v,         // Number of value heads
@@ -128,15 +175,45 @@
      const float inverted_kscale = k_scale == nullptr ? 1.0f : 1 / (*k_scale);
      const float inverted_vscale = v_scale == nullptr ? 1.0f : 1 / (*v_scale);
  
- #pragma unroll
+     int64_t const act_st = isQ ? q_st : (isK ? k_st : v_st);
+     int64_t const act_sh = isQ ? q_sh : (isK ? k_sh : v_sh);
+     int64_t const act_sd = isQ ? q_sd : (isK ? k_sd : v_sd);
+     scalar_t* const act_base = isQ ? q_act : (isK ? k_act : v_act);
+ 
      // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before
      // kernel launch
-     for(int i = 0; i < load_loop_cnt; i += 1)
+     if(!separate_qkv)
      {
-         int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim +
-                               laneId * numElemsPerThread) /
-                              vec_size;
-         reinterpret_cast<ltype*>(elements)[i] = reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
+ #pragma unroll
+         for(int i = 0; i < load_loop_cnt; i += 1)
+         {
+             int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim +
+                                   laneId * numElemsPerThread) /
+                                  vec_size;
+             reinterpret_cast<ltype*>(elements)[i] =
+                 reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i];
+         }
+     }
+     else if(act_sd == 1)
+     {
+         int64_t const base_elems = (int64_t)tokenIdx * act_st + (int64_t)headIdx * act_sh +
+                                    (int64_t)(laneId * numElemsPerThread);
+ #pragma unroll
+         for(int i = 0; i < load_loop_cnt; i += 1)
+         {
+             reinterpret_cast<ltype*>(elements)[i] =
+                 *reinterpret_cast<ltype const*>(act_base + base_elems + i * vec_size);
+         }
+     }
+     else
+     {
+ #pragma unroll
+         for(int j = 0; j < numElemsPerThread; j++)
+         {
+             int64_t const off = (int64_t)tokenIdx * act_st + (int64_t)headIdx * act_sh +
+                                 (int64_t)(laneId * numElemsPerThread + j) * act_sd;
+             elements[j] = act_base[off];
+         }
      }
  
      // If qk, we adopt RMSNorm + RoPE, so we need to compute sum of squares.
@@ -222,14 +299,42 @@
              }
              __syncwarp();
          }
- #pragma unroll
-         for(int i = 0; i < load_loop_cnt; i += 1)
+         int64_t const qk_st = isQ ? q_st : k_st;
+         int64_t const qk_sh = isQ ? q_sh : k_sh;
+         int64_t const qk_sd = isQ ? q_sd : k_sd;
+         scalar_t* const qk_dst = isQ ? q_act : k_act;
+         if(!separate_qkv)
          {
-             int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim +
-                                   laneId * numElemsPerThread) /
-                                  vec_size;
-             reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] =
-                 reinterpret_cast<ltype*>(elements)[i];
+ #pragma unroll
+             for(int i = 0; i < load_loop_cnt; i += 1)
+             {
+                 int64_t offsetWarp = (tokenIdx * num_heads * head_dim + localHeadIdx * head_dim +
+                                       laneId * numElemsPerThread) /
+                                      vec_size;
+                 reinterpret_cast<ltype*>(qkv_void)[offsetWarp + i] =
+                     reinterpret_cast<ltype*>(elements)[i];
+             }
+         }
+         else if(qk_sd == 1)
+         {
+             int64_t const base_elems = (int64_t)tokenIdx * qk_st + (int64_t)headIdx * qk_sh +
+                                          (int64_t)(laneId * numElemsPerThread);
+ #pragma unroll
+             for(int i = 0; i < load_loop_cnt; i += 1)
+             {
+                 *reinterpret_cast<ltype*>(qk_dst + base_elems + i * vec_size) =
+                     reinterpret_cast<ltype*>(elements)[i];
+             }
+         }
+         else
+         {
+ #pragma unroll
+             for(int j = 0; j < numElemsPerThread; j++)
+             {
+                 int64_t const off = (int64_t)tokenIdx * qk_st + (int64_t)headIdx * qk_sh +
+                                     (int64_t)(laneId * numElemsPerThread + j) * qk_sd;
+                 qk_dst[off] = elements[j];
+             }
          }
      }
  
@@ -270,7 +375,8 @@
          float k_scale_val = 1.0f;
          if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
          {
-             k_scale_val = warp_max / dtype_max;
+             float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
+             k_scale_val                 = warp_max_safe / dtype_max;
              int64_t scale_offset =
                  block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
              k_scale[scale_offset] = k_scale_val;
@@ -298,7 +404,8 @@
          float v_scale_val = 1.0f;
          if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
          {
-             v_scale_val = warp_max / dtype_max;
+             float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
+             v_scale_val                 = warp_max_safe / dtype_max;
              int64_t scale_offset =
                  block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
              v_scale[scale_offset] = v_scale_val;
@@ -637,8 +744,9 @@
         float inv_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            k_scale_val = block_max / dtype_max;
-            inv_scale_val = dtype_max / block_max;
+            float const block_max_safe = fmaxf(block_max, kFp8KvQuantAbsmaxFloorF32);
+            k_scale_val                  = block_max_safe / dtype_max;
+            inv_scale_val                = dtype_max / block_max_safe;
             int64_t scale_offset = block_idx * num_heads_k + headIdx;
             if(block_offset > 0)
             {
@@ -675,7 +783,7 @@
                 else
                 {
                     k_scale_val   = k_scale_global;
-                    inv_scale_val = 1.0f / k_scale_global;
+                    inv_scale_val = 1.0f / fmaxf(k_scale_global, kFp8KvQuantAbsmaxFloorF32);
                 }
             }
             else
@@ -715,8 +823,9 @@
         float inv_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            v_scale_val = block_max / dtype_max;
-            inv_scale_val = dtype_max / block_max;
+            float const block_max_safe = fmaxf(block_max, kFp8KvQuantAbsmaxFloorF32);
+            v_scale_val                  = block_max_safe / dtype_max;
+            inv_scale_val                = dtype_max / block_max_safe;
             int64_t scale_offset = block_idx * num_heads_k + headIdx;
             if(block_offset > 0)
             {
@@ -776,7 +885,7 @@
                 else
                 {
                     v_scale_val   = v_scale_global;
-                    inv_scale_val = 1.0f / v_scale_global;
+                    inv_scale_val = 1.0f / fmaxf(v_scale_global, kFp8KvQuantAbsmaxFloorF32);
                 }
             }
             else
@@ -862,6 +971,19 @@
  
  template <typename scalar_t, typename kv_cache_scalar_t, vllm::Fp8KVCacheDataType kv_dt>
  void launchFusedQKNormRopeQuantCacheShuffle(scalar_t* qkv,
+                                             bool const separate_qkv,
+                                             scalar_t* q_act,
+                                             scalar_t* k_act,
+                                             scalar_t* v_act,
+                                             int64_t const q_st,
+                                             int64_t const q_sh,
+                                             int64_t const q_sd,
+                                             int64_t const k_st,
+                                             int64_t const k_sh,
+                                             int64_t const k_sd,
+                                             int64_t const v_st,
+                                             int64_t const v_sh,
+                                             int64_t const v_sd,
                                              int const num_tokens,
                                              int const num_heads_q,
                                              int const num_heads_k,
@@ -902,6 +1024,19 @@
                                                     NUM_KV_HEADS,
                                                     kv_dt>
                  <<<gridDim, blockDim, 0, stream>>>(qkv,
+                                                    separate_qkv,
+                                                    q_act,
+                                                    k_act,
+                                                    v_act,
+                                                    q_st,
+                                                    q_sh,
+                                                    q_sd,
+                                                    k_st,
+                                                    k_sh,
+                                                    k_sd,
+                                                    v_st,
+                                                    v_sh,
+                                                    v_sd,
                                                     num_heads_q,
                                                     num_heads_k,
                                                     num_heads_v,
@@ -929,6 +1064,19 @@
                                                     NUM_KV_HEADS,
                                                     kv_dt>
                  <<<gridDim, blockDim, 0, stream>>>(qkv,
+                                                    separate_qkv,
+                                                    q_act,
+                                                    k_act,
+                                                    v_act,
+                                                    q_st,
+                                                    q_sh,
+                                                    q_sd,
+                                                    k_st,
+                                                    k_sh,
+                                                    k_sd,
+                                                    v_st,
+                                                    v_sh,
+                                                    v_sd,
                                                     num_heads_q,
                                                     num_heads_k,
                                                     num_heads_v,
@@ -956,6 +1104,19 @@
                                                     NUM_KV_HEADS,
                                                     kv_dt>
                  <<<gridDim, blockDim, 0, stream>>>(qkv,
+                                                    separate_qkv,
+                                                    q_act,
+                                                    k_act,
+                                                    v_act,
+                                                    q_st,
+                                                    q_sh,
+                                                    q_sd,
+                                                    k_st,
+                                                    k_sh,
+                                                    k_sd,
+                                                    v_st,
+                                                    v_sh,
+                                                    v_sd,
                                                     num_heads_q,
                                                     num_heads_k,
                                                     num_heads_v,
@@ -1108,28 +1269,6 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
     }
 }
  } // namespace
- #define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)       \
-     launchFusedQKNormRopeQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE>( \
-         reinterpret_cast<SRC_T*>(qkv.data_ptr()),                     \
-         num_tokens,                                                   \
-         num_heads_q,                                                  \
-         num_heads_k,                                                  \
-         num_heads_v,                                                  \
-         head_dim,                                                     \
-         eps,                                                          \
-         reinterpret_cast<SRC_T*>(q_weight.data_ptr()),                \
-         reinterpret_cast<SRC_T*>(k_weight.data_ptr()),                \
-         reinterpret_cast<SRC_T*>(cos_sin_cache.data_ptr()),           \
-         !is_neox,                                                     \
-         position_ids.data_ptr<int64_t>(),                             \
-         reinterpret_cast<CACHE_T*>(k_cache.data_ptr()),               \
-         reinterpret_cast<CACHE_T*>(v_cache.data_ptr()),               \
-         slot_mapping.data_ptr<int64_t>(),                             \
-         k_scale.has_value() ? k_scale->data_ptr<float>() : nullptr,   \
-         v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr,   \
-         page_size,                                                    \
-         x,                                                            \
-         stream);
  #define CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT(SRC_T, CACHE_T, KV_DTYPE)       \
          launchFusedQKNormRopeBlockQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE>( \
              reinterpret_cast<SRC_T*>(qkv.data_ptr()),                     \
@@ -1156,27 +1295,40 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
              max_tokens_per_batch,                                         \
              stream);
 
-#define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)       \
-    launchFusedQKNormRopeQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE>( \
-        reinterpret_cast<SRC_T*>(qkv.data_ptr()),                     \
-        num_tokens,                                                   \
-        num_heads_q,                                                  \
-        num_heads_k,                                                  \
-        num_heads_v,                                                  \
-        head_dim,                                                     \
-        eps,                                                          \
-        reinterpret_cast<SRC_T*>(q_weight.data_ptr()),                \
-        reinterpret_cast<SRC_T*>(k_weight.data_ptr()),                \
-        reinterpret_cast<SRC_T*>(cos_sin_cache.data_ptr()),           \
-        !is_neox,                                                     \
-        position_ids.data_ptr<int64_t>(),                             \
-        reinterpret_cast<CACHE_T*>(k_cache.data_ptr()),               \
-        reinterpret_cast<CACHE_T*>(v_cache.data_ptr()),               \
-        slot_mapping.data_ptr<int64_t>(),                             \
-        k_scale.has_value() ? k_scale->data_ptr<float>() : nullptr,   \
-        v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr,   \
-        page_size,                                                    \
-        x,                                                            \
+#define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)                                    \
+    launchFusedQKNormRopeQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE>(                               \
+        use_separate ? nullptr : reinterpret_cast<SRC_T*>(qkv.data_ptr()),                      \
+        use_separate,                                                                             \
+        use_separate ? reinterpret_cast<SRC_T*>(opt_q.value().data_ptr()) : nullptr,             \
+        use_separate ? reinterpret_cast<SRC_T*>(opt_k.value().data_ptr()) : nullptr,             \
+        use_separate ? reinterpret_cast<SRC_T*>(opt_v.value().data_ptr()) : nullptr,             \
+        q_stride_token,                                                                           \
+        q_stride_head,                                                                            \
+        q_stride_dim,                                                                             \
+        k_stride_token,                                                                           \
+        k_stride_head,                                                                            \
+        k_stride_dim,                                                                             \
+        v_stride_token,                                                                           \
+        v_stride_head,                                                                            \
+        v_stride_dim,                                                                             \
+        num_tokens,                                                                               \
+        num_heads_q,                                                                              \
+        num_heads_k,                                                                              \
+        num_heads_v,                                                                              \
+        head_dim,                                                                                 \
+        eps,                                                                                      \
+        reinterpret_cast<SRC_T*>(q_weight.data_ptr()),                                            \
+        reinterpret_cast<SRC_T*>(k_weight.data_ptr()),                                            \
+        reinterpret_cast<SRC_T*>(cos_sin_cache.data_ptr()),                                       \
+        !is_neox,                                                                                 \
+        position_ids.data_ptr<int64_t>(),                                                         \
+        reinterpret_cast<CACHE_T*>(k_cache.data_ptr()),                                         \
+        reinterpret_cast<CACHE_T*>(v_cache.data_ptr()),                                         \
+        slot_mapping.data_ptr<int64_t>(),                                                         \
+        k_scale.has_value() ? k_scale->data_ptr<float>() : nullptr,                             \
+        v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr,                             \
+        page_size,                                                                                \
+        x,                                                                                        \
         stream);
 
 template <typename T, int HEAD_SIZE, bool IS_NEOX>
@@ -1201,6 +1353,7 @@ __global__ void fused_rope_rms_2way_kernel(const T* q0_,
 {
     using mrope_utils::WARP_SIZE;
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
+    constexpr int PAIR_VEC_SIZE   = VEC_SIZE / 2;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
     const int warp_id             = threadIdx.x / WARP_SIZE;
     const int num_warps_per_block = blockDim.x / WARP_SIZE;
@@ -1236,7 +1389,8 @@ __global__ void fused_rope_rms_2way_kernel(const T* q0_,
     int head_id_in_token;
     int data_offset;
 
-    vec_t<T, VEC_SIZE> w_vec, x_vec, cos_sin_vec, cos_vec, sin_vec;
+    vec_t<T, VEC_SIZE> w_vec, x_vec, cos_sin_vec;
+    vec_t<T, PAIR_VEC_SIZE> cos_vec, sin_vec;
 
     if(is_q0)
     {
@@ -1342,7 +1496,7 @@ __global__ void fused_rope_rms_2way_kernel(const T* q0_,
     else
     {
 #pragma unroll
-        for(int i = 0; i < VEC_SIZE / 2; ++i)
+        for(int i = 0; i < PAIR_VEC_SIZE; ++i)
         {
             out_vec[2 * i + 0] = (float)x_vec[2 * i + 0] * (float)cos_vec[i] -
                                  (float)x_vec[2 * i + 1] * (float)sin_vec[i];
@@ -1463,8 +1617,7 @@ void fused_rope_rms_2way(const T* q0,
 namespace aiter {
 
 void fused_qk_norm_rope_cache_quant_shuffle(
-    at::Tensor& qkv,                   // Combined QKV tensor [num_tokens,
-                                       // (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+    at::Tensor& qkv, // Deprecated concat QKV; empty if only q/k/v. If both given, q/k/v used; qkv ignored.
     int64_t num_heads_q,               // Number of query heads
     int64_t num_heads_k,               // Number of key heads
     int64_t num_heads_v,               // Number of value heads
@@ -1475,25 +1628,38 @@ void fused_qk_norm_rope_cache_quant_shuffle(
     at::Tensor& cos_sin_cache,         // Cos/sin cache [max_position, head_dim]
     bool is_neox,                      // Whether RoPE is applied in Neox style
     at::Tensor& position_ids,          // Position IDs for RoPE [num_tokens]
-    at::Tensor& k_cache,               // k cache
-    at::Tensor& v_cache,               // v cache
+    at::Tensor& k_cache,               // [num_blocks, num_kv_heads, head_dim//x, page_size, x]
+    at::Tensor& v_cache,               // 4D [num_blocks, num_heads_v, head_dim, page_size] or 5D shuffle
+                                       // [num_blocks, num_heads_v, page_size//x, head_dim, x]
     at::Tensor& slot_mapping,          // slot mapping
     const std::string& kv_cache_dtype, // kv cache data type
     std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
-    std::optional<at::Tensor> v_scale  // v scale tensor for quantized v cache
+    std::optional<at::Tensor> v_scale,  // v scale tensor for quantized v cache
+    std::optional<at::Tensor> opt_q,    // [num_tokens, num_heads_q * head_dim] (preferred)
+    std::optional<at::Tensor> opt_k,    // [num_tokens, num_heads_k * head_dim]
+    std::optional<at::Tensor> opt_v     // [num_tokens, num_heads_v * head_dim]
 )
 {
-    // Input validation
-    CHECK_INPUT(qkv);
+    const bool have_q = opt_q.has_value();
+    const bool have_k = opt_k.has_value();
+    const bool have_v = opt_v.has_value();
+    const bool any_sep = have_q || have_k || have_v;
+    TORCH_CHECK(
+        !any_sep || (have_q && have_k && have_v),
+        "fused_qk_norm_rope_cache_quant_shuffle: pass all of q, k, v together, or omit all three.");
+    const bool use_separate = have_q && have_k && have_v;
+    const bool have_qkv   = qkv.numel() > 0;
+
     CHECK_INPUT(position_ids);
     CHECK_INPUT(q_weight);
     CHECK_INPUT(k_weight);
     CHECK_INPUT(cos_sin_cache);
+    CHECK_INPUT(k_cache);
+    CHECK_INPUT(v_cache);
+    CHECK_INPUT(slot_mapping);
     CHECK_TYPE(position_ids, torch::kInt64);
+    CHECK_TYPE(slot_mapping, torch::kInt64);
 
-    TORCH_CHECK(qkv.dim() == 2,
-                "QKV tensor must be 2D: [num_tokens, "
-                "(num_heads_q+num_heads_k+num_heads_v)*head_dim]");
     TORCH_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
     TORCH_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
     TORCH_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
@@ -1501,28 +1667,206 @@ void fused_qk_norm_rope_cache_quant_shuffle(
     TORCH_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
     TORCH_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
     TORCH_CHECK(cos_sin_cache.size(1) == head_dim, "Cos/sin cache dimension must match head_dim");
-    TORCH_CHECK(qkv.scalar_type() == q_weight.scalar_type() &&
-                    qkv.scalar_type() == k_weight.scalar_type(),
-                "qkv, q_weight and k_weight must have the same dtype");
     TORCH_CHECK(head_dim % 32 == 0,
                 "Head dimension must be multiple of 32 for fused QK Norm RoPE kernel");
     TORCH_CHECK(
         num_heads_k <= 32,
         "Number of key heads must be less than or equal to 32 for fused QK Norm RoPE kernel");
 
-    int64_t num_tokens = qkv.size(0);
-    int64_t page_size  = v_cache.size(-1);
-    int64_t x          = k_cache.size(-1);
+    int64_t num_tokens = 0;
+    at::ScalarType act_dtype = at::ScalarType::Undefined;
+
+    int64_t q_stride_token = 0, q_stride_head = 0, q_stride_dim = 0;
+    int64_t k_stride_token = 0, k_stride_head = 0, k_stride_dim = 0;
+    int64_t v_stride_token = 0, v_stride_head = 0, v_stride_dim = 0;
+
+    if(use_separate)
+    {
+        at::Tensor const& q_t = opt_q.value();
+        at::Tensor const& k_t = opt_k.value();
+        at::Tensor const& v_t = opt_v.value();
+        CHECK_TH_CUDA(q_t);
+        CHECK_TH_CUDA(k_t);
+        CHECK_TH_CUDA(v_t);
+        TORCH_CHECK(
+            (q_t.dim() == 2 || q_t.dim() == 3) && (k_t.dim() == 2 || k_t.dim() == 3) &&
+                (v_t.dim() == 2 || v_t.dim() == 3),
+            "q, k, v must be 2D [num_tokens, num_heads * head_dim] or 3D [num_tokens, num_heads, head_dim]");
+        num_tokens = q_t.size(0);
+        TORCH_CHECK(k_t.size(0) == num_tokens && v_t.size(0) == num_tokens,
+                    "q, k, v must share the same num_tokens");
+        if(q_t.dim() == 2)
+        {
+            TORCH_CHECK(q_t.size(1) == num_heads_q * head_dim,
+                        "q dim 1 must be num_heads_q * head_dim");
+        }
+        else
+        {
+            TORCH_CHECK(q_t.size(1) == num_heads_q && q_t.size(2) == head_dim,
+                        "q 3D shape must be [num_tokens, num_heads_q, head_dim]");
+        }
+        if(k_t.dim() == 2)
+        {
+            TORCH_CHECK(k_t.size(1) == num_heads_k * head_dim,
+                        "k dim 1 must be num_heads_k * head_dim");
+        }
+        else
+        {
+            TORCH_CHECK(k_t.size(1) == num_heads_k && k_t.size(2) == head_dim,
+                        "k 3D shape must be [num_tokens, num_heads_k, head_dim]");
+        }
+        if(v_t.dim() == 2)
+        {
+            TORCH_CHECK(v_t.size(1) == num_heads_v * head_dim,
+                        "v dim 1 must be num_heads_v * head_dim");
+        }
+        else
+        {
+            TORCH_CHECK(v_t.size(1) == num_heads_v && v_t.size(2) == head_dim,
+                        "v 3D shape must be [num_tokens, num_heads_v, head_dim]");
+        }
+        TORCH_CHECK(q_t.scalar_type() == k_t.scalar_type() && q_t.scalar_type() == v_t.scalar_type(),
+                    "q, k, v must share the same dtype");
+        TORCH_CHECK(q_t.scalar_type() == q_weight.scalar_type() &&
+                        q_t.scalar_type() == k_weight.scalar_type(),
+                    "q/k/v must match q_weight/k_weight dtype");
+        act_dtype = q_t.scalar_type();
+        ActivationStrides3D const sq = activation_strides_logical_3d(q_t, num_heads_q, head_dim);
+        ActivationStrides3D const sk = activation_strides_logical_3d(k_t, num_heads_k, head_dim);
+        ActivationStrides3D const sv = activation_strides_logical_3d(v_t, num_heads_v, head_dim);
+        q_stride_token = sq.st;
+        q_stride_head    = sq.sh;
+        q_stride_dim     = sq.sd;
+        k_stride_token   = sk.st;
+        k_stride_head    = sk.sh;
+        k_stride_dim     = sk.sd;
+        v_stride_token   = sv.st;
+        v_stride_head    = sv.sh;
+        v_stride_dim     = sv.sd;
+        if(have_qkv)
+        {
+            TORCH_WARN_ONCE(
+                "fused_qk_norm_rope_cache_quant_shuffle: `qkv` is deprecated and will be removed. "
+                "Separate `q`, `k`, `v` were also passed; the kernel uses `q/k/v` in-place and ignores `qkv`.");
+            int64_t const total_heads = num_heads_q + num_heads_k + num_heads_v;
+            TORCH_CHECK(qkv.dim() == 2,
+                        "When passing both qkv and q/k/v, qkv must be 2D [num_tokens, total_heads*head_dim]");
+            TORCH_CHECK(qkv.size(0) == num_tokens && qkv.size(1) == total_heads * head_dim,
+                        "When passing both qkv and q/k/v, qkv shape must be [num_tokens, (nh_q+nh_k+nh_v)*head_dim] "
+                        "(qkv is unused but must be consistent).");
+            TORCH_CHECK(qkv.scalar_type() == q_t.scalar_type(),
+                        "When passing both qkv and q/k/v, qkv dtype must match q/k/v.");
+            CHECK_INPUT(qkv);
+        }
+    }
+    else
+    {
+        TORCH_CHECK(
+            have_qkv,
+            "fused_qk_norm_rope_cache_quant_shuffle: pass non-empty `qkv`, or pass all of `q`, `k`, `v`.");
+        TORCH_WARN_ONCE(
+            "fused_qk_norm_rope_cache_quant_shuffle: the concatenated `qkv` input alone is deprecated and "
+            "will be removed; prefer separate `q`, `k`, `v` tensors.");
+        CHECK_INPUT(qkv);
+        TORCH_CHECK(qkv.dim() == 2,
+                    "QKV tensor must be 2D: [num_tokens, "
+                    "(num_heads_q+num_heads_k+num_heads_v)*head_dim]");
+        TORCH_CHECK(qkv.scalar_type() == q_weight.scalar_type() &&
+                        qkv.scalar_type() == k_weight.scalar_type(),
+                    "qkv, q_weight and k_weight must have the same dtype");
+        num_tokens = qkv.size(0);
+        act_dtype  = qkv.scalar_type();
+    }
+
     TORCH_CHECK(position_ids.size(0) == num_tokens,
-                "Number of tokens in position_ids must match QKV");
+                "Number of tokens in position_ids must match activations");
 
-    int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
-    TORCH_CHECK(qkv.size(1) == total_heads * head_dim,
-                "QKV tensor size must match total number of heads and head dimension");
+    TORCH_CHECK(k_cache.dim() == 5,
+                "k_cache must be 5D [num_blocks, num_kv_heads, head_dim//x, page_size, x], got dim ",
+                k_cache.dim());
+    int64_t x            = k_cache.size(-1);
+    int64_t page_size_k  = k_cache.size(-2);
+    TORCH_CHECK(x > 0 && head_dim % x == 0,
+                "head_dim (",
+                head_dim,
+                ") must be divisible by k_cache x (",
+                x,
+                ")");
+    TORCH_CHECK(k_cache.size(2) == head_dim / x,
+                "k_cache dim 2 must equal head_dim//x, got ",
+                k_cache.size(2),
+                " expected ",
+                head_dim / x);
+    TORCH_CHECK(k_cache.size(1) == num_heads_k,
+                "k_cache dim 1 must equal num_heads_k, got ",
+                k_cache.size(1));
 
-    auto stream = at::hip::getCurrentHIPStream(qkv.get_device());
+    int64_t page_size;
+    if(v_cache.dim() == 5)
+    {
+        // Shuffle layout: [num_blocks, num_heads_v, page_size//x, head_dim, x]
+        TORCH_CHECK(v_cache.size(0) == k_cache.size(0),
+                    "v_cache and k_cache num_blocks must match");
+        TORCH_CHECK(v_cache.size(1) == num_heads_v,
+                    "v_cache dim 1 must equal num_heads_v, got ",
+                    v_cache.size(1));
+        TORCH_CHECK(v_cache.size(-1) == x && v_cache.size(-2) == head_dim,
+                    "v_cache trailing dims must be [head_dim, x], got [",
+                    v_cache.size(-2),
+                    ", ",
+                    v_cache.size(-1),
+                    "]");
+        TORCH_CHECK(v_cache.size(-3) * x == page_size_k,
+                    "v_cache shuffle: size(-3)*x must equal k_cache page_size; got ",
+                    v_cache.size(-3),
+                    "*",
+                    x,
+                    " vs ",
+                    page_size_k);
+        page_size = page_size_k;
+    }
+    else if(v_cache.dim() == 4)
+    {
+        // [num_blocks, num_heads_v, head_dim, page_size]
+        TORCH_CHECK(v_cache.size(0) == k_cache.size(0),
+                    "v_cache and k_cache num_blocks must match");
+        TORCH_CHECK(v_cache.size(1) == num_heads_v,
+                    "v_cache dim 1 must equal num_heads_v, got ",
+                    v_cache.size(1));
+        TORCH_CHECK(v_cache.size(2) == head_dim,
+                    "v_cache dim 2 must equal head_dim, got ",
+                    v_cache.size(2));
+        page_size = v_cache.size(-1);
+        TORCH_CHECK(page_size == page_size_k,
+                    "v_cache page_size (last dim) must match k_cache page_size; got ",
+                    page_size,
+                    " vs ",
+                    page_size_k);
+        TORCH_CHECK(page_size % x == 0,
+                    "page_size must be divisible by x for V cache layout; got page_size=",
+                    page_size,
+                    " x=",
+                    x);
+    }
+    else
+    {
+        TORCH_CHECK(false,
+                    "v_cache must be 4D [num_blocks, num_heads_v, head_dim, page_size] or 5D shuffle "
+                    "[num_blocks, num_heads_v, page_size//x, head_dim, x], got dim ",
+                    v_cache.dim());
+    }
 
-    DISPATCH_BY_KV_CACHE_DTYPE(qkv.scalar_type(), kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_QUANT);
+    if(!use_separate)
+    {
+        int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
+        TORCH_CHECK(qkv.size(1) == total_heads * head_dim,
+                    "QKV tensor size must match total number of heads and head dimension");
+    }
+
+    const int64_t stream_device = use_separate ? opt_q.value().get_device() : qkv.get_device();
+    auto stream                 = at::hip::getCurrentHIPStream(stream_device);
+
+    DISPATCH_BY_KV_CACHE_DTYPE(act_dtype, kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_QUANT);
 }
 
 template <typename T>

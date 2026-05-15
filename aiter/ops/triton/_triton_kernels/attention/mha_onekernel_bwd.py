@@ -43,6 +43,10 @@ def _bwd_preprocess(
     stride_o_h,
     stride_o_m,
     stride_o_k,
+    stride_do_b,
+    stride_do_h,
+    stride_do_m,
+    stride_do_k,
     stride_delta_b,
     stride_delta_h,
     stride_delta_m,
@@ -75,13 +79,21 @@ def _bwd_preprocess(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BLOCK_D_MODEL_POW2)
 
-    # Offset O/DO by batch, head and q_start
-    offs = (
+    # O and DO may have different strides (e.g. BSHD vs SBHD memory layout),
+    # so address each with its own strides.
+    offs_o = (
         bid * stride_o_b
         + hid * stride_o_h
         + q_start * stride_o_m
         + offs_m[:, None] * stride_o_m
         + offs_k[None, :] * stride_o_k
+    )
+    offs_do = (
+        bid * stride_do_b
+        + hid * stride_do_h
+        + q_start * stride_do_m
+        + offs_m[:, None] * stride_do_m
+        + offs_k[None, :] * stride_do_k
     )
 
     # create masks
@@ -92,8 +104,8 @@ def _bwd_preprocess(
         mask &= offs_k[None, :] < BLOCK_D_MODEL
 
     # load [BLOCK_M, BLOCK_D_MODEL_POW2]
-    o = tl.load(o_ptr + offs, mask=mask, other=0.0)
-    do = tl.load(do_ptr + offs, mask=mask, other=0.0)
+    o = tl.load(o_ptr + offs_o, mask=mask, other=0.0)
+    do = tl.load(do_ptr + offs_do, mask=mask, other=0.0)
 
     # compute and write-back to delta
     if IS_FP8:
@@ -162,6 +174,7 @@ def _bwd_dkdv_inner(
     FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
@@ -262,6 +275,11 @@ def _bwd_dkdv_inner(
                         tl.where(causal_mask, qkT * sm_scale, 0.0),
                     )
             pT = tl.where(mask, pT, 0.0)
+        if SLIDING_WINDOW > 0:
+            window_mask = offs_n[:, None] >= (
+                offs_m[None, :] - delta_qk - SLIDING_WINDOW
+            )
+            pT = tl.where(window_mask, pT, 0.0)
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
         # Compute dV.
         if ENABLE_DROPOUT:
@@ -373,6 +391,8 @@ def _bwd_dq_inner(
     FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    ENABLE_SINK: tl.constexpr,
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
@@ -398,6 +418,7 @@ def _bwd_dq_inner(
     curr_philox_offset = batch_philox_offset
     curr_dropout_offset = dropout_offset
     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
+    delta_recomp = tl.zeros([BLOCK_M2], dtype=tl.float32)
     for blk_idx in range(num_steps):
         if DEBUG_TRITON:
             print(f"iter {blk_idx}: curr_n = {curr_n}")  # noqa: E701
@@ -464,6 +485,11 @@ def _bwd_dq_inner(
             causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
             mask = causal_mask & mask_mn
             p = tl.where(mask, p, 0.0)
+        if SLIDING_WINDOW > 0:
+            window_mask = offs_n[None, :] >= (
+                offs_m[:, None] - delta_qk - SLIDING_WINDOW
+            )
+            p = tl.where(window_mask, p, 0.0)
         # Compute dP and dS.
         if IS_FP8:
             dp = tl.dot(do, vT) * descale_do * descale_v
@@ -471,6 +497,9 @@ def _bwd_dq_inner(
             dp = tl.dot(do, vT)
         if ENABLE_DROPOUT:
             dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
+        if ENABLE_SINK:
+            # Equal to do_i . o_i but skips the bf16 round-trip through forward `o`.
+            delta_recomp += tl.sum(p * dp, axis=1)
         delta_i = Di[:, None]
         ds = p * (dp - delta_i)
         # Compute dQ.
@@ -492,7 +521,7 @@ def _bwd_dq_inner(
         if HAS_PE:
             kT_pe_ptrs += step_n * stride_kn
         vT_ptrs += step_n * stride_vn
-    return dq, dq_pe
+    return dq, dq_pe, delta_recomp
 
 
 _bwd_kernel_causal_repr = make_kernel_repr(
@@ -511,6 +540,7 @@ _bwd_kernel_causal_repr = make_kernel_repr(
         "IS_FP8",
         "USE_INT64_STRIDES",
         "ENABLE_SINK",
+        "SLIDING_WINDOW",
     ],
 )
 
@@ -603,6 +633,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
     ENABLE_SINK: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
         stride_qb = tl.cast(stride_qb_in, tl.int64)
@@ -907,9 +938,13 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
             )
             start_m += num_steps * MASK_BLOCK_M1
-            num_steps = tl.cdiv(seqlen_q - start_m, BLOCK_M1)
+            end_m = seqlen_q
+            if SLIDING_WINDOW > 0:
+                end_m = min(start_n + BLOCK_N1 + delta_qk + SLIDING_WINDOW, seqlen_q)
+            num_steps = tl.cdiv(max(end_m - start_m, 0), BLOCK_M1)
             end_m = start_m + num_steps * BLOCK_M1
 
             if DEBUG_TRITON:
@@ -968,6 +1003,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
             )
         # end of GQA/MQA of dkdv
         # Write back dV
@@ -1058,16 +1094,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             m = m[:, None]
             delta = tl.load(Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0)
 
-            if ENABLE_SINK:
-                sink = tl.load(Sink + hqid).to(tl.float32)
-                if USE_EXP2:
-                    RCP_LN2: tl.constexpr = 1.4426950408889634
-                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
-                else:
-                    psink = tl.math.exp(sink - m)
-                dsink = tl.sum(-psink * delta[:, None])
-                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
-
             MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
             # start can only be 0 at minimum
             start_n = max(end_n - BLOCK_M2, 0)
@@ -1086,7 +1112,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
             else:
                 dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
-            dq, dq_pe = _bwd_dq_inner(
+            dq, dq_pe, delta_recomp_masked = _bwd_dq_inner(
                 dq,  # output tensor
                 dq_pe,  # optional output tensor
                 q,
@@ -1133,15 +1159,20 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                ENABLE_SINK=ENABLE_SINK,
             )
             end_n -= num_steps * MASK_BLOCK_N2
-            num_steps = tl.cdiv(end_n, BLOCK_N2)
-            start_n = max(end_n - num_steps * BLOCK_N2, 0)
+            window_start_n = 0
+            if SLIDING_WINDOW > 0:
+                window_start_n = max(start_m - delta_qk - SLIDING_WINDOW, 0)
+            start_n = window_start_n // BLOCK_N2 * BLOCK_N2
+            num_steps = tl.cdiv(max(end_n - start_n, 0), BLOCK_N2)
             if DEBUG_TRITON:
                 print(
                     f"unMasked: start_m: {start_m}, start_n: {start_n}, end_n: {end_n}, num_steps: {num_steps}"
                 )  # noqa: E701
-            dq, dq_pe = _bwd_dq_inner(
+            dq, dq_pe, delta_recomp_unmasked = _bwd_dq_inner(
                 dq,  # output tensor
                 dq_pe,  # optional output tensor
                 q,
@@ -1188,7 +1219,19 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                ENABLE_SINK=ENABLE_SINK,
             )
+            if ENABLE_SINK:
+                sink = tl.load(Sink + hqid).to(tl.float32)
+                if USE_EXP2:
+                    RCP_LN2: tl.constexpr = 1.4426950408889634
+                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
+                else:
+                    psink = tl.math.exp(sink - m)
+                delta_recomp = delta_recomp_masked + delta_recomp_unmasked
+                dsink = tl.sum(-psink * delta_recomp[:, None])
+                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
@@ -1219,6 +1262,7 @@ _bwd_kernel_noncausal_repr = make_kernel_repr(
         "IS_FP8",
         "USE_INT64_STRIDES",
         "ENABLE_SINK",
+        "SLIDING_WINDOW",
     ],
 )
 
@@ -1311,6 +1355,7 @@ def bwd_kernel_noncausal(
     DEBUG_TRITON_DETAIL: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
     ENABLE_SINK: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     if USE_INT64_STRIDES:
         stride_qb = tl.cast(stride_qb_in, tl.int64)
@@ -1562,6 +1607,7 @@ def bwd_kernel_noncausal(
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
             )
 
         # Write back dV
@@ -1632,16 +1678,6 @@ def bwd_kernel_noncausal(
             m = m[:, None]
             delta = tl.load(Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0)
 
-            if ENABLE_SINK:
-                sink = tl.load(Sink + hqid).to(tl.float32)
-                if USE_EXP2:
-                    RCP_LN2: tl.constexpr = 1.4426950408889634
-                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
-                else:
-                    psink = tl.math.exp(sink - m)
-                dsink = tl.sum(-psink * delta[:, None])
-                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
-
             if IS_FP8:
                 descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
@@ -1660,7 +1696,7 @@ def bwd_kernel_noncausal(
                 dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
             else:
                 dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
-            dq, dq_pe = _bwd_dq_inner(
+            dq, dq_pe, delta_recomp = _bwd_dq_inner(
                 dq,  # output tensor
                 dq_pe,  # optional output tensor
                 q,
@@ -1707,7 +1743,18 @@ def bwd_kernel_noncausal(
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                ENABLE_SINK=ENABLE_SINK,
             )
+            if ENABLE_SINK:
+                sink = tl.load(Sink + hqid).to(tl.float32)
+                if USE_EXP2:
+                    RCP_LN2: tl.constexpr = 1.4426950408889634
+                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
+                else:
+                    psink = tl.math.exp(sink - m)
+                dsink = tl.sum(-psink * delta_recomp[:, None])
+                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd

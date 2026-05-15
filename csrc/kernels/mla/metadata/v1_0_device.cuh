@@ -15,15 +15,15 @@ __device__ int32_t get_local_splits(int32_t seqlen_kv,
     int32_t ex_splits =
         seqlen_kv /
         196; // magic num 196. Experiments shows 196 per splits can get better performance.
-    return ck_tile::min(ck_tile::min(ex_splits, num_splits_per_cu), num_splits);
+    return opus::min(opus::min(ex_splits, num_splits_per_cu), num_splits);
 #endif
 }
 
 template <bool DP_MODE = false>
-__launch_bounds__(ck_tile::get_warp_size(), 1) __global__
+__launch_bounds__(opus::get_warp_size(), 1) __global__
     void kn_get_mla_metadata_v1_0(MlaMetadataV1KernelParameter params)
 {
-    const int32_t lane_idx = ck_tile::get_lane_id();
+    const int32_t lane_idx = opus::lane_id();
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
@@ -44,7 +44,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
 
     int32_t num_splits_per_cu = (params.num_cu + params.num_batches - 1) / params.num_batches;
 
-    for(int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
+    for(int32_t bid = lane_idx; bid < params.num_batches; bid += opus::get_warp_size())
     {
         const int32_t bid_ori = bid / params.qk_batch_ratio;
 
@@ -67,8 +67,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
         const int32_t num_splits =
             get_local_splits(seqlen_kv, params.num_splits, num_splits_per_cu);
-        const int32_t payload = ck_tile::integer_divide_ceil(num_blocks, num_splits);
-        int32_t split_local   = ck_tile::integer_divide_ceil(num_blocks, payload);
+        const int32_t payload = integer_divide_ceil(num_blocks, num_splits);
+        int32_t split_local   = integer_divide_ceil(num_blocks, payload);
         int32_t tail          = seqlen_kv % (payload * params.kv_granularity);
         if(tail <= 4 && tail != 0 && split_local > 1)
         {
@@ -95,7 +95,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     int32_t work_per_cu = work_end / params.num_cu;
     int32_t work_res    = work_end % params.num_cu;
 
-    for(int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
+    for(int32_t bid = lane_idx; bid < params.num_batches; bid += opus::get_warp_size())
     {
         const int32_t bid_ori = bid / params.qk_batch_ratio;
 
@@ -126,7 +126,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             work_info.qo_end         = work_info.qo_start + params.uni_seqlen_qo;
             work_info.kv_start       = kv_begin + (sid * payload * params.kv_granularity);
             work_info.kv_end =
-                ck_tile::min(work_info.kv_start + payload * params.kv_granularity, kv_end);
+                opus::min(work_info.kv_start + payload * params.kv_granularity, kv_end);
             work_info.kv_offset = kv_end - work_info.kv_end;
             if(work_info.kv_offset <= 4 && split_local > 1)
             {
@@ -143,7 +143,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     int32_t reduce_end = params.p_reduce_indptr[params.num_batches];
-    for(int32_t work_id = lane_idx + 1; work_id < work_res; work_id += ck_tile::get_warp_size())
+    for(int32_t work_id = lane_idx + 1; work_id < work_res; work_id += opus::get_warp_size())
     {
         params.p_work_indptr[work_id] = min(work_id * (work_per_cu + 1), work_end);
     }
@@ -151,13 +151,13 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     int32_t stage = work_res * (work_per_cu + 1);
 
     for(int32_t work_id = work_res + lane_idx; work_id < params.num_cu + 1;
-        work_id += ck_tile::get_warp_size())
+        work_id += opus::get_warp_size())
     {
         params.p_work_indptr[work_id] = stage + (work_id - work_res) * work_per_cu;
     }
 
     for(int32_t reduce_id = params.num_batches + lane_idx; reduce_id <= params.fixed_num_batches;
-        reduce_id += ck_tile::get_warp_size())
+        reduce_id += opus::get_warp_size())
     {
         params.p_reduce_indptr[reduce_id] = reduce_end;
     }

@@ -76,12 +76,27 @@ def main():
         with workflow_path.open("r", encoding="utf-8") as file_obj:
             content = yaml.safe_load(file_obj) or {}
 
-        jobs = list((content.get("jobs") or {}).keys())
-        jobs = [job for job in jobs if job not in excluded_jobs]
+        jobs_dict = content.get("jobs") or {}
+        job_ids = [job_id for job_id in jobs_dict.keys() if job_id not in excluded_jobs]
 
-        workflow_map[workflow_file] = jobs
-        for job in jobs:
-            matrix.append({"workflow": workflow_file, "job_name": job})
+        display_names = []
+        for job_id in job_ids:
+            job_def = jobs_dict.get(job_id) or {}
+            raw_name = job_def.get("name") if isinstance(job_def, dict) else None
+            if isinstance(raw_name, str) and "${{" not in raw_name:
+                display_name = raw_name
+            else:
+                display_name = job_id
+            display_names.append(display_name)
+            matrix.append(
+                {
+                    "workflow": workflow_file,
+                    "job_id": job_id,
+                    "job_name": display_name,
+                }
+            )
+
+        workflow_map[workflow_file] = display_names
 
     Path(args.out_matrix).write_text(
         json.dumps(matrix, ensure_ascii=False), encoding="utf-8"

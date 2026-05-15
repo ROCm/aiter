@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # user interface
 
@@ -10,6 +10,68 @@ import torch
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num
 from ..utility import dtypes
+
+
+# DEPRECATED: low-level binding kept for backward compatibility only.
+# Will be removed once all callers have migrated to topk_gating() below.
+# New code should use topk_gating(), which:
+#   - accepts an Optional[Tensor] correction_bias (None => no bias)
+#   - validates score_func string
+#   - exposes the same C++ kernel under a more accurate name
+@compile_ops("module_moe_topk")
+def topk_softplus(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    need_renorm: bool,
+    routed_scaling_factor: float = 1.0,
+    score_func: str = "sqrtsoftplus",
+) -> None: ...
+
+
+_VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
+
+
+def topk_gating(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: Optional[torch.Tensor] = None,
+    need_renorm: bool = True,
+    routed_scaling_factor: float = 1.0,
+    score_func: str = "sqrtsoftplus",
+) -> None:
+    """Unified fused topk gating for MoE routing.
+
+    Args:
+        score_func: one of {"sqrtsoftplus" (DeepSeek V4-Pro default),
+                            "sigmoid" (Llama4),
+                            "softmax" (DeepSeek V3 / classic MoE)}.
+        correction_bias: optional bias tensor, pass None for no bias.
+
+    Note: softmax is already normalized, so renorm is forced off.
+    """
+    assert (
+        score_func in _VALID_SCORE_FUNCS
+    ), f"Unknown score_func '{score_func}', expected one of {_VALID_SCORE_FUNCS}"
+    if correction_bias is None:
+        # Match gating dtype/device so dispatch picks DTYPE_B == DTYPE_I,
+        # avoiding extra kernel template instantiations.
+        correction_bias = torch.empty(
+            0, dtype=gating_output.dtype, device=gating_output.device
+        )
+    if score_func == "softmax":
+        need_renorm = False
+    topk_softplus(
+        topk_weights,
+        topk_indices,
+        gating_output,
+        correction_bias,
+        need_renorm,
+        routed_scaling_factor,
+        score_func,
+    )
 
 
 @compile_ops("module_moe_asm", fc_name="biased_grouped_topk")
@@ -85,13 +147,7 @@ def biased_grouped_topk(
     token_num = gating_output.shape[0]
     num_experts = gating_output.shape[1]
     cu_num = get_cu_num()
-    # moe_fused_gate requires num_experts to be a power of 2.
-    # For models with non-power-of-2 expert counts (e.g. Kimi-K2.5 with 384
-    # experts), always use biased_grouped_topk_hip which has no such constraint.
-    num_experts_is_power_of_2 = (
-        num_experts > 0 and (num_experts & (num_experts - 1)) == 0
-    )
-    if token_num <= cu_num * 212 or not num_experts_is_power_of_2:
+    if token_num <= cu_num * 212 or num_experts // num_expert_group > 32:
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
@@ -213,6 +269,7 @@ def top_k_per_row_prefill(
     numRows: int,
     stride0: int,
     stride1: int,
+    k: int = 2048,
 ) -> None: ...
 
 
@@ -238,6 +295,7 @@ def top_k_per_row_decode(
     numRows: int,
     stride0: int,
     stride1: int,
+    k: int = 2048,
 ) -> None: ...
 
 

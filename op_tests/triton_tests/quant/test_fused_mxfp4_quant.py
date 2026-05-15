@@ -22,8 +22,6 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
 from aiter.ops.quant import per_1x32_f4_quant_hip
 from aiter.utility.fp4_utils import moe_mxfp4_sort, dynamic_mxfp4_quant
 
-torch.manual_seed(0)
-
 
 def rmsnorm(input, weight, eps=1e-6):
     row_norm = input * input
@@ -130,6 +128,8 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
+    torch.manual_seed(0)
+
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     x = torch.randn((B, M, N), dtype=dtype, device="cuda").transpose(0, 1)
@@ -169,9 +169,10 @@ def test_fused_rms_quant(
     shuffle: bool,
     scale_shuffle_padding: bool,
 ):
-
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.manual_seed(0)
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     x1, x2, rms1_w, rms2_w, resid1 = generate_fused_rms_quant_data(
@@ -317,6 +318,8 @@ def test_fused_reduce_act_mul_mxfp4_group_quant(
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
+    torch.manual_seed(0)
+
     if shuffle and (N1 * 2) % 512 != 0:
         pytest.skip()
 
@@ -401,6 +404,8 @@ def test_fuse_reduce_rms_quant(
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.manual_seed(0)
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     x1, w1, x2, w2, res1, x3 = generate_fused_reduce_rms_quant_data(
@@ -548,6 +553,9 @@ def test_fused_dynamic_mxfp4_quant_moe_sort(
 ):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.manual_seed(0)
+
     q_dtype_a = torch.float4_e2m1fn_x2
     num_local_tokens = None
     num_valid_ids = torch.zeros(2, dtype=torch.int64, device="cuda")

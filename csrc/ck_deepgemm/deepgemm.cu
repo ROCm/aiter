@@ -4,6 +4,7 @@
 #include "deepgemm_common.cuh"
 #include "deepgemm_lookup.h"
 #include "deepgemm_manifest.h"
+#include "gemm_dispatch_utils.h"
 #include <cmath>
 #include "py_itfs_common.h"
 
@@ -12,24 +13,9 @@ using RowwiseKernel = std::function<
                   torch::Tensor &, torch::Tensor &,
                   std::optional<torch::Tensor>, std::optional<torch::Tensor>)>;
 
-// Define a custom hash function for std::tuple<int, int, int>
-struct IntTupleHash
-{
-  size_t operator()(const std::tuple<int, int, int> &t) const
-  {
-    auto hash1 = std::hash<int>{}(std::get<0>(t));
-    auto hash2 = std::hash<int>{}(std::get<1>(t));
-    auto hash3 = std::hash<int>{}(std::get<2>(t));
-    return hash1 ^ hash2 ^ hash3;
-  }
-};
-
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
-using RowwiseKernelMap = std::unordered_map<
-    std::tuple<int, int, int>,
-    RowwiseKernel,
-    IntTupleHash>;
+using RowwiseKernelMap = GemmDispatchMap<RowwiseKernel>;
 
 template <typename ABDataType, typename AccDataType, typename CDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)

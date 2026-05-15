@@ -111,7 +111,7 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
             const int32_t effective_kv_length =
                 is_causal ? std::min(kv_length - qo_length + local_qo_end, kv_length) : kv_length;
             const int32_t num_units =
-                ck_tile::integer_divide_ceil(effective_kv_length, kvlen_granularity);
+                integer_divide_ceil(effective_kv_length, kvlen_granularity);
             // const int32_t num_units =
             //     offset_div(effective_kv_length, kvlen_granularity, SPLIT_KV_OVERHEAD);
             query_tiles.push_back({batch_idx,

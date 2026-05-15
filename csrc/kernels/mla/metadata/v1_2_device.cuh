@@ -22,7 +22,7 @@ struct MlaMetadataV12Traits
 };
 
 template <typename Traits>
-__launch_bounds__(ck_tile::get_warp_size(), 1) __global__
+__launch_bounds__(opus::get_warp_size(), 1) __global__
     void kn_get_mla_metadata_v1_2(MlaMetadataV1KernelParameter params)
 {
     using QoState = QoState<Traits>;
@@ -59,7 +59,16 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     auto get_num_qo_tiles = [&](const int32_t batch_idx) {
         if constexpr(Traits::kQoSplits)
         {
-            const int32_t packed_qo_len = qo_state.get_seqlen(batch_idx) * params.num_heads;
+            const int32_t seqlen_qo = qo_state.get_seqlen(batch_idx);
+            // When num_heads * 2 > kPackedQoLenPerWg, each tile can hold at most
+            // 1 qo position (floor(kPackedQoLenPerWg / num_heads) == 1), so we
+            // need seqlen_qo tiles. The simple ceil(packed/kPackedQoLenPerWg)
+            // underestimates this for non-power-of-2 num_heads (e.g., 96, 112).
+            if(params.num_heads * 2 > Traits::kPackedQoLenPerWg)
+            {
+                return seqlen_qo;
+            }
+            const int32_t packed_qo_len = seqlen_qo * params.num_heads;
             return integer_divide_ceil_power2(
                 packed_qo_len, Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2);
         }
@@ -69,12 +78,12 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         }
     };
 
-    const int32_t lane_idx = ck_tile::get_lane_id();
+    const int32_t lane_idx = opus::lane_id();
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
     int32_t sum_blocks = 0;
-    for(int32_t bid = lane_idx; bid < num_batches; bid += ck_tile::get_warp_size())
+    for(int32_t bid = lane_idx; bid < num_batches; bid += opus::get_warp_size())
     {
         const int32_t bid_ori = Traits::kIsSparse ? (bid / ori_seqlen_qo / params.qk_batch_ratio)
                                                   : (bid / params.qk_batch_ratio);
@@ -100,9 +109,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         }
     }
 
-    sum_blocks =
-        aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), ck_tile::get_warp_size()>(
-            sum_blocks);
+    sum_blocks = aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), opus::get_warp_size()>(
+        sum_blocks);
 
     if(lane_idx == 0)
     {
@@ -115,8 +123,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     // expected payload handled by each cu part.
-    const int32_t payload = ck_tile::integer_divide_ceil(sum_blocks, params.num_splits) +
-                            params.fixed_over_head_num_blocks;
+    const int32_t payload =
+        integer_divide_ceil(sum_blocks, params.num_splits) + params.fixed_over_head_num_blocks;
     const int32_t page_size   = params.page_size;
     int32_t curr_batch        = 0; // batch ID of the batch which is under review
     int32_t curr_kv_block     = 0; // #blocks handled by previous cu part(s)
@@ -144,7 +152,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         {
             const int32_t num_qo_tiles = get_num_qo_tiles(curr_batch);
             const int32_t qo_tile_size =
-                ck_tile::integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
+                integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
             const int32_t num_kv_blocks = integer_divide_ceil_power2(
                 curr_kv_seqlen, params.kv_granularity, params.kv_granularity_log2);
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
@@ -162,8 +170,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     work_info.batch_idx = curr_batch;
                     work_info.qo_start =
                         qo_state.get_begin(curr_batch) + curr_qo_tile_idx * qo_tile_size;
-                    work_info.qo_end   = ck_tile::min(work_info.qo_start + qo_tile_size,
-                                                    qo_state.get_end(curr_batch));
+                    work_info.qo_end =
+                        opus::min(work_info.qo_start + qo_tile_size, qo_state.get_end(curr_batch));
                     work_info.kv_start = curr_kv_begin + (curr_kv_block * params.kv_granularity);
                     if(page_size == 1)
                     {
@@ -178,23 +186,28 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                     1;
                             }
                         }
-                        batch_tail       = ck_tile::max(batch_tail, 0);
-                        work_info.kv_end = ck_tile::min(
-                            work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
-                            curr_kv_end - batch_tail);
+                        batch_tail       = opus::max(batch_tail, 0);
+                        work_info.kv_end = opus::min(work_info.kv_start +
+                                                         (remain_kv_blocks * params.kv_granularity),
+                                                     curr_kv_end - batch_tail);
                         if((curr_kv_end - work_info.kv_end < params.tail_done_threshold &&
                             curr_kv_end - work_info.kv_end > 0) ||
                            cur_tail_done)
                         {
-                            work_info.kv_end = ck_tile::min(curr_kv_end - batch_tail, curr_kv_end);
+                            work_info.kv_end = opus::min(curr_kv_end - batch_tail, curr_kv_end);
                         }
                         work_info.kv_offset = curr_kv_end - work_info.kv_end;
+                        if(Traits::kIsSparse && params.qk_batch_ratio == 1)
+                        {
+                            work_info.batch_idx = curr_batch / ori_seqlen_qo;
+                            work_info.kv_offset += ori_seqlen_qo - 1 - (curr_batch % ori_seqlen_qo);
+                        }
                     }
                     else
                     {
-                        work_info.kv_end = ck_tile::min(
-                            work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
-                            curr_kv_end);
+                        work_info.kv_end = opus::min(work_info.kv_start +
+                                                         (remain_kv_blocks * params.kv_granularity),
+                                                     curr_kv_end);
                         work_info.kv_offset =
                             (curr_kv_end - work_info.kv_end == 0)
                                 ? 0
@@ -227,7 +240,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                 // record a work in work_info_set
                 if(curr_n_split_idx > 0)
                 {
-                    for(int32_t idx = lane_idx; idx < num_splits; idx += ck_tile::get_warp_size())
+                    for(int32_t idx = lane_idx; idx < num_splits; idx += opus::get_warp_size())
                     {
                         fill_work_info(idx);
                     }
@@ -303,8 +316,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         work_info.batch_idx = curr_batch;
                         work_info.qo_start =
                             qo_state.get_begin(curr_batch) + curr_qo_tile_idx * qo_tile_size;
-                        work_info.qo_end = ck_tile::min(work_info.qo_start + qo_tile_size,
-                                                        qo_state.get_end(curr_batch));
+                        work_info.qo_end = opus::min(work_info.qo_start + qo_tile_size,
+                                                     qo_state.get_end(curr_batch));
                         work_info.kv_start =
                             curr_kv_begin + (curr_kv_block * params.kv_granularity);
                         if(page_size == 1)
@@ -320,21 +333,26 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                                  1;
                                 }
                             }
-                            batch_tail       = ck_tile::max(batch_tail, 0);
-                            work_info.kv_end = ck_tile::min(
+                            batch_tail       = opus::max(batch_tail, 0);
+                            work_info.kv_end = opus::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
                             if(curr_kv_end - work_info.kv_end < params.tail_done_threshold)
                             {
-                                cur_tail_done = true;
-                                work_info.kv_end =
-                                    ck_tile::min(curr_kv_end, curr_kv_end - batch_tail);
+                                cur_tail_done    = true;
+                                work_info.kv_end = opus::min(curr_kv_end, curr_kv_end - batch_tail);
                             }
                             work_info.kv_offset = curr_kv_end - work_info.kv_end;
+                            if(Traits::kIsSparse && params.qk_batch_ratio == 1)
+                            {
+                                work_info.batch_idx = curr_batch / ori_seqlen_qo;
+                                work_info.kv_offset +=
+                                    ori_seqlen_qo - 1 - (curr_batch % ori_seqlen_qo);
+                            }
                         }
                         else
                         {
-                            work_info.kv_end = ck_tile::min(
+                            work_info.kv_end = opus::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end);
                             work_info.kv_offset =
@@ -373,7 +391,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     for(int32_t i = tot_qo_tiles + lane_idx; i < params.reduce_indptr_size;
-        i += ck_tile::get_warp_size())
+        i += opus::get_warp_size())
     {
         params.p_reduce_indptr[i] = last_reduce_indptr;
     }
@@ -393,7 +411,7 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
     const int32_t lds_bytes_per_batch =
         sizeof(int32_t) * (QoState<DummyTraits>::is_unique() ? 1 : 2);
     const int32_t max_qo_tiles =
-        kQoSplits ? (ck_tile::integer_divide_ceil(max_seqlen_qo, kPackedQoLenPerWg)) : 1;
+        kQoSplits ? (integer_divide_ceil(max_seqlen_qo, kPackedQoLenPerWg)) : 1;
     const int32_t max_lds_batch_size = lds_size / lds_bytes_per_batch;
 
     if(params.num_batches <= max_lds_batch_size)
@@ -431,21 +449,21 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_final_map,
                                   torch::Tensor& reduce_partial_map)
 {
-    constexpr int32_t kPackedQoLenPerWg = 128;
-    const hipStream_t stream            = at::hip::getCurrentHIPStream();
+
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
     hipGetDevice(&dev);
     hipGetDeviceProperties(&dev_prop, dev);
 
-    const int32_t num_clusters = dev_prop.multiProcessorCount / num_heads_k;
-    const bool is_sparse       = (topk >= 0);
+    const bool is_sparse = (topk >= 0);
 
-    int32_t num_batches    = seqlens_kv_indptr.size(0) - 1;
-    int32_t num_heads      = num_heads_k * num_heads_per_head_k;
-    int32_t qk_batch_ratio = 1;
-    int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
+    int32_t num_batches     = seqlens_kv_indptr.size(0) - 1;
+    int32_t num_heads       = num_heads_k * num_heads_per_head_k;
+    int32_t qk_batch_ratio  = 1;
+    int32_t qk_seqlen_ratio = 1;
+    int32_t uni_seqlen_qo   = ori_uni_seqlen_qo;
 
     auto arch_id = get_gpu_arch();
 
@@ -456,36 +474,81 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     const bool kv_is_fp8 =
         (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
 
+    const bool enable_experimental = std::getenv("AITER_ENABLE_EXPERIMENTAL") != nullptr &&
+                                     std::atoi(std::getenv("AITER_ENABLE_EXPERIMENTAL")) != 0;
+
+    // HK MLA m16x4 kernel runs at occupancy=2 (gfx950 + fp8/fp8 + 64 q-tokens per
+    // tile, gated on AITER_ENABLE_EXPERIMENTAL same as the dispatch in
+    // aiter/mla.py:use_hk). The m16x4 launch site spawns 2*num_cu workgroups; the
+    // work distribution here must produce work_indptr sized to match so the second
+    // occupancy slot actually receives work. Detection mirrors hk_decode_fwd
+    // dispatch (num_heads * max_seqlen_qo == 64) and uses ORIGINAL
+    // num_heads/max_seqlen_qo (pre-fold).
+    const bool is_hk_m16x4 = (arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
+                             (num_heads * max_seqlen_qo == 64) && enable_experimental;
+    const int32_t cluster_multiplier = is_hk_m16x4 ? 2 : 1;
+    const int32_t num_clusters = (dev_prop.multiProcessorCount * cluster_multiplier) / num_heads_k;
+
+    // Gate on arch_id consistent with hk_mla_decode_fwd dispatch (gfx942/gfx950).
+    // Otherwise this would mark shapes as natively supported on archs where the
+    // HK kernels are unavailable, producing metadata that downstream kernels
+    // cannot consume.
+    const bool hk_mtp_experimental =
+        (arch_id == "gfx942" || arch_id == "gfx950") && (q_is_fp8 && kv_is_fp8) &&
+        (num_heads * max_seqlen_qo == 128) &&
+        ((num_heads == 16) || (num_heads == 32) || (num_heads == 64) || (num_heads == 128)) &&
+        enable_experimental;
+
     const bool natively_supported =
         (num_heads == 16) ||
         ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
+         (max_seqlen_qo == 2)) ||
+        ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
          (max_seqlen_qo == 4)) ||
-        ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8);
+        ((arch_id == "gfx950") && (num_heads == 64) && q_is_fp8 && kv_is_fp8 &&
+         (max_seqlen_qo == 1)) ||
+        ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8)  ||
+        ((arch_id == "gfx950") && (num_heads == 128) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo != 4)) ||
+        ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
+        hk_mtp_experimental;
 
-    const bool use_qseqlen_fold = !natively_supported && (arch_id == "gfx950") && q_is_fp8 &&
-                                  kv_is_fp8 && (num_heads > 16) &&
-                                  (uni_seqlen_qo * (num_heads / 16) == 4);
 
-    if((natively_supported == false) && (num_heads % 16 == 0))
+    const bool use_qseqlen_fold =
+        !natively_supported && (arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads > 16) &&
+        ((uni_seqlen_qo * (num_heads / 16) == 4) || ((num_heads == 64) && (uni_seqlen_qo == 2)));
+
+    if(use_qseqlen_fold && (num_heads == 64) && (uni_seqlen_qo == 2))
+    {
+        qk_seqlen_ratio = num_heads / 32;
+        num_heads       = 32;
+        uni_seqlen_qo *= qk_seqlen_ratio;
+    }
+    else if(use_qseqlen_fold && (uni_seqlen_qo * (num_heads / 16) == 4))
+    {
+        qk_seqlen_ratio = num_heads / 16;
+        num_heads       = 16;
+        uni_seqlen_qo *= qk_seqlen_ratio;
+    }
+    else if(!natively_supported && (num_heads % 16 == 0))
     {
         qk_batch_ratio = num_heads / 16;
         num_heads      = 16;
-        if(use_qseqlen_fold)
-        {
-            uni_seqlen_qo *= qk_batch_ratio;
-            qk_batch_ratio = 1;
-        }
-        else
-        {
-            num_batches *= qk_batch_ratio;
-        }
+        num_batches *= qk_batch_ratio;
     }
 
-    TORCH_CHECK((num_heads == 16) || (num_heads == 128) ||
-                    ((num_heads == 32) && q_is_fp8 && kv_is_fp8),
-                __func__,
-                ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
-                "N is in [2, 8).")
+    TORCH_CHECK(
+        (num_heads == 16) || (num_heads == 128) || ((num_heads == 32) && q_is_fp8 && kv_is_fp8) ||
+            ((num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
+            ((arch_id == "gfx950") && (num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 &&
+             kv_is_fp8) ||
+            ((arch_id == "gfx942") && (num_heads == 8) && (max_seqlen_qo == 2) && !q_is_fp8 &&
+             !kv_is_fp8) ||
+            ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
+            hk_mtp_experimental,
+        __func__,
+        ": only supports #heads in [16, 64, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
+        "N is in [2, 8), or (#head, max_seqlen_qo) = (8, 4) where q and kv are fp8, "
+        "or q and kv are bf16 on gfx950")
 
     int32_t num_splits = max_split_per_batch < 0
                              ? num_clusters
@@ -516,6 +579,14 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.qk_batch_ratio               = qk_batch_ratio;
     params.fixed_over_head_num_blocks   = max(1, (16 + page_size - 1) / page_size);
     params.tail_done_threshold          = max_seqlen_qo;
+
+    int32_t kPackedQoLenPerWg = 128;
+    if ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8 &&
+        (num_heads * max_seqlen_qo >= 64) && (num_heads <= 64) &&
+        (((num_heads * max_seqlen_qo) < 128) ||
+         (num_heads == 48))) {
+        kPackedQoLenPerWg = 64;
+    }
 
     // launch kernel
     MLA_METADATA_DISPATCHER(

@@ -143,7 +143,9 @@ def _ff_a16w16_fused_ungated(
         partial_sum_y = tl.dot(acc, w2)
         # tl.device_print("w2:", w2)
         # tl.device_print("partial y:", partial_sum_y)
-        y_mask = (offs_ym[:, None] < M) & ((offs_k[None, :] + BLOCK_SIZE_K * k) < K)
+        y_mask = (offs_ym[:, None] < M) & (
+            (offs_k[None, :] + BLOCK_SIZE_K * k_cyclic_offset) < K
+        )
         tl.atomic_add(y_ptrs, partial_sum_y, mask=y_mask, sem="relaxed", scope="gpu")
         # tl.store(y_ptrs, partial_sum_y, mask=y_mask)
         k_cyclic_offset += 1

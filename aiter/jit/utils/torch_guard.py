@@ -82,7 +82,7 @@ NONE_WRAPPED_OP = [
     "all_gather_unreg",
     "fused_allreduce_rmsnorm",
     "fused_allreduce_rmsnorm_quant",
-    "_make_aiter_tensor",
+    "fused_qknorm_allreduce",
 ]
 
 

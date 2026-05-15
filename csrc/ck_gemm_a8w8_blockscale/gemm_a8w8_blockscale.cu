@@ -1,35 +1,22 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <cmath>
 #include <functional>
 #include <unordered_map>
 
 #include <torch/extension.h>
 
 #include "gemm_common.h"
+#include "gemm_dispatch_utils.h"
 
 #include "gemm_a8w8_blockscale_common.cuh"
 #include "gemm_a8w8_blockscale_lookup.h"
 #include "gemm_a8w8_blockscale_manifest.h"
 
 using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
 
-// Define a custom hash function for std::tuple<int, int, int>
-struct IntTupleHash
-{
-    size_t operator()(const std::tuple<int, int, int>& t) const
-    {
-        auto hash1 = std::hash<int>{}(std::get<0>(t));
-        auto hash2 = std::hash<int>{}(std::get<1>(t));
-        auto hash3 = std::hash<int>{}(std::get<2>(t));
-        return hash1 ^ hash2 ^ hash3;
-    }
-};
-
-using BlockwiseKernelMap =
-    std::unordered_map<std::tuple<int, int, int>, BlockwiseKernel, IntTupleHash>;
+using BlockwiseKernelMap = GemmDispatchMap<BlockwiseKernel>;
 
 template <typename DDataType, typename EDataType = DDataType>
 static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
@@ -53,8 +40,11 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
         }
     }();
 
+    const int cu_num         = get_device_cu_num();
+    const std::string& gfx   = get_device_gfx();
+
     // First check if this shape(M,N,K) is available in the direct lookup.
-    auto it = lookup.find({M, N, K});
+    auto it = lookup.find({gfx, cu_num, M, N, K});
     // If we found an optimal kernel, use it.
     if(it != lookup.end())
     {
@@ -67,7 +57,7 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     padded_m = getPaddedM(M, N, K, 0);
 
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({padded_m, N, K});
+    it = lookup.find({gfx, cu_num, padded_m, N, K});
     // If we found an optimal kernel, use it.
     if(it != lookup.end())
     {
@@ -76,7 +66,7 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
 
     // Coarse-grained search
     padded_m = getPaddedM(M, N, K, 1);
-    it       = lookup.find({padded_m, N, K});
+    it       = lookup.find({gfx, cu_num, padded_m, N, K});
     if(it != lookup.end())
     {
         return it->second;
@@ -92,22 +82,28 @@ torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
                                    torch::Tensor& WQ,
                                    torch::Tensor& x_scale,
                                    torch::Tensor& w_scale,
-                                   torch::Tensor& Y)
+                                   torch::Tensor& Y,
+                                   int splitK)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
 
-    int M = XQ.size(0);
-    int N = WQ.size(0);
-    int K = XQ.size(1);
+    TORCH_CHECK(splitK >= 0 && splitK <= 30,
+                "splitK must be in the range [0, 30], got ",
+                splitK);
+
+    int M      = XQ.size(0);
+    int N      = WQ.size(0);
+    int K      = XQ.size(1);
+    int KBatch = 1 << splitK;
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        blockscale_dispatch<FP32, FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        blockscale_dispatch<FP32, FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockscale_dispatch<FP32, BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        blockscale_dispatch<FP32, BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else
     {

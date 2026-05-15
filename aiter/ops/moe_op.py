@@ -24,7 +24,9 @@ def topk_softmax(
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm", fc_name="topk_softmax_asm", ffi_type="ctypes")
+@compile_ops(
+    "module_moe_topksoftmax_asm", fc_name="topk_softmax_asm", ffi_type="ctypes"
+)
 def topk_softmax_asm(
     topk_weights: Tensor,
     topk_indices: Tensor,
@@ -234,7 +236,8 @@ def cmdGenFunc_ck_moe_stage(
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
-    is_splitk = splitk > 1
+    is_splitk = splitk > 1 and not kernelName
+    is_splitk = is_splitk or (bool(kernelName) and "Splitk" in kernelName)
     outtype = str2dtype_dict[dst_type] if is_splitk else out.dtype
     md_name, blob_gen_cmd = get_moe_stage_module(
         hidden_states.dtype,
@@ -509,19 +512,19 @@ def get_moe_stage_module(
     act = str(activation).split(".")[-1].lower()
     quant_type = str(quant_type).split(".")[-1].lower()
 
-    md_name = ("_").join(
-        [
-            "module_moe_ck2stages",
-            Adtype,
-            Bdtype,
-            "preshuffle_on" if preshuffle_mode else "preshuffle_off",
-            Cdtype,
-            act,
-            quant_type,
-            f"mulWeightStage{mul_routed_weight_stage}",
-            "splitk" if is_splitk else "",
-        ]
-    )
+    parts = [
+        "module_moe_ck2stages",
+        Adtype,
+        Bdtype,
+        "preshuffle_on" if preshuffle_mode else "preshuffle_off",
+        Cdtype,
+        act,
+        quant_type,
+        f"mulWeightStage{mul_routed_weight_stage}",
+    ]
+    if is_splitk:
+        parts.append("splitk")
+    md_name = "_".join(parts)
     blob_gen_cmd = [
         f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} {splitk_str} -w {{}}"
     ]

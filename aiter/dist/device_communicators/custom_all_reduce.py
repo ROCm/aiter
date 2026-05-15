@@ -17,7 +17,7 @@
 
 import pickle
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -28,7 +28,7 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
-from aiter.utility.dtypes import fp8, _torch_to_aiter_dtype, torch_to_aiter_pybind
+from aiter.utility.dtypes import fp8
 
 try:
     ops.meta_size()
@@ -46,11 +46,71 @@ def is_weak_contiguous(inp: torch.Tensor):
     )
 
 
-_torch_to_aiter = torch_to_aiter_pybind
+# Wavefront width on AMD CDNA / gfx94x / gfx950. ``__shfl_xor`` in the
+# fused per-group FP8 quant epilogue is scoped to a single wavefront, so
+# ``threads_per_group = group_size / PACK_SIZE`` must fit inside it.
+_AITER_AR_WAVEFRONT_SIZE = 64
 
 
-def _current_stream_ptr() -> int:
-    return torch.cuda.current_stream().cuda_stream
+def _validate_per_group_size(group_size: int, element_size: int, n: int) -> None:
+    """Validate ``group_size`` for the fused AR + RMSNorm + per-group FP8
+    quant kernel. Mirrors the C++ host dispatcher checks in
+    ``dispatchFusedAllReduceRMSNormQuantPerGroup`` so callers fail fast
+    with a clear Python-level ``ValueError`` (rather than a generic
+    ``RuntimeError`` from the extension, which aborts CUDA-graph capture
+    asynchronously).
+
+    The fused epilogue imposes five constraints on ``group_size``:
+
+    (a) ``group_size > 0``
+    (b) ``group_size % PACK_SIZE == 0`` with ``PACK_SIZE = 16 // element_size``
+        (each thread owns a full 16-byte pack, so a group must be made of
+        whole packs).
+    (c) ``threads_per_group = group_size / PACK_SIZE`` must be a power of two
+        (butterfly ``__shfl_xor`` reduction strides ``{tpg/2, tpg/4, ..., 1}``).
+    (d) ``threads_per_group`` must fit inside a wavefront
+        (``<= 64`` on AMD CDNA); cross-warp shuffles do not exist on HIP.
+    (e) ``n % group_size == 0`` so ``num_groups = n / group_size`` is an
+        integer.
+    """
+    if not isinstance(group_size, int):
+        raise TypeError(
+            f"per-group quant group_size must be int, got {type(group_size).__name__}"
+        )
+    if group_size <= 0:
+        raise ValueError(
+            f"per-group quant requires group_size > 0, got group_size={group_size}"
+        )
+    if element_size <= 0 or 16 % element_size != 0:
+        raise ValueError(
+            "per-group quant requires an element_size that divides 16 "
+            f"(bf16/fp16: 2), got element_size={element_size}"
+        )
+    pack_size = 16 // element_size
+    if group_size % pack_size != 0:
+        raise ValueError(
+            f"per-group quant requires group_size divisible by PACK_SIZE="
+            f"{pack_size} (16 // element_size), got group_size={group_size}"
+        )
+    threads_per_group = group_size // pack_size
+    if threads_per_group & (threads_per_group - 1) != 0:
+        raise ValueError(
+            "per-group quant requires group_size/PACK_SIZE to be a power of "
+            "two (butterfly __shfl_xor reduction), got "
+            f"group_size={group_size} PACK_SIZE={pack_size} "
+            f"threads_per_group={threads_per_group}"
+        )
+    if threads_per_group > _AITER_AR_WAVEFRONT_SIZE:
+        raise ValueError(
+            "per-group quant requires group_size/PACK_SIZE <= wavefront size "
+            f"({_AITER_AR_WAVEFRONT_SIZE}), got group_size={group_size} "
+            f"PACK_SIZE={pack_size} threads_per_group={threads_per_group}"
+        )
+    if n % group_size != 0:
+        raise ValueError(
+            f"per-group quant requires n divisible by group_size, "
+            f"got n={n} group_size={group_size}"
+        )
 
 
 class IPCBuffer:
@@ -77,7 +137,7 @@ class IPCBuffer:
         self._uncached = uncached
         if uncached:
             self._buffer = None
-            self._raw_ptr = ops.allocate_meta_buffer(size, _current_stream_ptr())
+            self._raw_ptr = ops.allocate_meta_buffer(size)
         else:
             self._buffer = torch.empty(size, dtype=torch.uint8, device=device)
             self._raw_ptr = self._buffer.data_ptr()
@@ -366,12 +426,10 @@ class CustomAllreduce:
         # Create IPC buffer pool and allocate all named buffers.
         # "meta" uses hipAlloc (uncached) for synchronization metadata +
         # intermediate allreduce temp storage.
-        # "input" / "output" use torchAlloc (cached) for D2D relay in
-        # eager mode.
+        # "input" uses torchAlloc (cached) for D2D relay in eager mode.
         self._pool = IPCBufferPool(self.device, self.group)
         self._pool.create("meta", ops.meta_size() + max_size * 2, uncached=True)
         self._pool.create("input", max_size)
-        self._pool.create("output", max_size)
 
         # Exchange meta buffer IPC handles to initialize C++ backend
         handles, offsets = self._pool.get_ipc_meta("meta")
@@ -387,19 +445,11 @@ class CustomAllreduce:
             self.fully_connected,
         )
 
-        # Register input/output IPC buffers with the C++ backend
+        # Register input IPC buffer with the C++ backend
         handles, offsets = self._pool.get_ipc_meta("input")
         ops.register_input_buffer(
             self._ptr,
             self._pool["input"].data_ptr,
-            [h.data_ptr() for h in handles],
-            offsets,
-        )
-
-        handles, offsets = self._pool.get_ipc_meta("output")
-        ops.register_output_buffer(
-            self._ptr,
-            self._pool["output"].data_ptr,
             [h.data_ptr() for h in handles],
             offsets,
         )
@@ -437,7 +487,7 @@ class CustomAllreduce:
         """Batch-register graph-captured buffer addresses."""
         self._pool.flush_graph_buffers(self._ptr)
 
-    def should_custom_ar(self, inp: torch.Tensor):
+    def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
         if self.disabled:
             return False
         inp_size = inp.numel() * inp.element_size()
@@ -450,7 +500,12 @@ class CustomAllreduce:
         # little performance improvement over NCCL.
         # In allreduce 2stage writemode, use 2x tmp buffer
         if self.world_size == 2 or self.fully_connected:
-            return inp_size <= (self.max_size / 2)
+            # decode
+            if not prefill_support:
+                return inp_size <= 8192 * 8192
+            # prefill
+            else:
+                return inp_size <= (self.max_size / 2)
         return False
 
     def should_custom_ag(self, inp: torch.Tensor):
@@ -475,7 +530,6 @@ class CustomAllreduce:
         use_new: bool = True,
         open_fp8_quant: bool = False,
         registered_input: bool = False,
-        registered_output: bool = False,
     ):
         """Performs an out-of-place all reduce.
 
@@ -486,22 +540,16 @@ class CustomAllreduce:
         if out is None:
             out = torch.empty_like(inp)
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        stream = _current_stream_ptr()
         reg_inp = 0 if registered_input else self._pool["input"].data_ptr
         reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
-        reg_out = 0 if registered_output else self._pool["output"].data_ptr
-        reg_out_bytes = 0 if registered_output else self._pool["output"].max_size
         ops.all_reduce(
             self._ptr,
-            _torch_to_aiter(inp),
-            _torch_to_aiter(out),
+            inp,
+            out,
             use_new,
             open_fp8_quant,
             reg_inp,
             reg_inp_bytes,
-            reg_out,
-            reg_out_bytes,
-            stream,
         )
         return out
 
@@ -518,7 +566,6 @@ class CustomAllreduce:
                     use_new=use_new,
                     open_fp8_quant=open_fp8_quant,
                     registered_input=self.enable_register_for_capturing,
-                    registered_output=self.enable_register_for_capturing,
                 )
             else:
                 # if warm up, mimic the allocation pattern
@@ -534,7 +581,6 @@ class CustomAllreduce:
                 use_new=use_new,
                 open_fp8_quant=open_fp8_quant,
                 registered_input=False,
-                registered_output=False,
             )
 
     def reduce_scatter(
@@ -545,16 +591,14 @@ class CustomAllreduce:
         registered: bool = False,
     ):
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        stream = _current_stream_ptr()
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
         ops.reduce_scatter(
             self._ptr,
-            _torch_to_aiter(inp),
-            _torch_to_aiter(out),
+            inp,
+            out,
             reg,
             reg_bytes,
-            stream,
         )
 
     def custom_reduce_scatter(
@@ -588,13 +632,11 @@ class CustomAllreduce:
                 device=inp.device,
             )
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        stream = _current_stream_ptr()
         ops.all_gather_reg(
             self._ptr,
-            _torch_to_aiter(inp),
-            _torch_to_aiter(out),
+            inp,
+            out,
             dim,
-            stream,
         )
         return out
 
@@ -608,15 +650,13 @@ class CustomAllreduce:
                 device=inp.device,
             )
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        stream = _current_stream_ptr()
         ops.all_gather_unreg(
             self._ptr,
-            _torch_to_aiter(inp),
+            inp,
             self._pool["input"].data_ptr,
-            _torch_to_aiter(out),
+            out,
             self._pool["input"].max_size,
             dim,
-            stream,
         )
         return out
 
@@ -648,7 +688,6 @@ class CustomAllreduce:
     ):
         if res_out is None:
             res_out = torch.empty_like(inp)
-        stream = _current_stream_ptr()
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
         if not post_per_token_quant:
@@ -657,16 +696,15 @@ class CustomAllreduce:
             assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
             ops.fused_allreduce_rmsnorm(
                 self._ptr,
-                _torch_to_aiter(inp),
-                _torch_to_aiter(res_inp),
-                _torch_to_aiter(res_out),
-                _torch_to_aiter(out),
-                _torch_to_aiter(w),
+                inp,
+                res_inp,
+                res_out,
+                out,
+                w,
                 eps,
                 reg,
                 reg_bytes,
                 use_1stage,
-                stream,
             )
             return out, res_out
         else:
@@ -679,17 +717,16 @@ class CustomAllreduce:
                 )
             ops.fused_allreduce_rmsnorm_quant(
                 self._ptr,
-                _torch_to_aiter(inp),
-                _torch_to_aiter(res_inp),
-                _torch_to_aiter(res_out),
-                _torch_to_aiter(out),
-                _torch_to_aiter(scale_out),
-                _torch_to_aiter(w),
+                inp,
+                res_inp,
+                res_out,
+                out,
+                scale_out,
+                w,
                 eps,
                 reg,
                 reg_bytes,
                 use_1stage,
-                stream,
             )
             return out, res_out, scale_out
 
@@ -765,8 +802,187 @@ class CustomAllreduce:
                 post_per_token_quant=True,
             )
 
+    def fused_ar_rms_per_group_quant(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        *,
+        w: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        registered: bool = False,
+        use_1stage: bool = False,
+        emit_bf16: bool = False,
+    ):
+        K = inp.shape[-1]
+        # Fail fast on bad ``group_size`` at the Python boundary. Mirrors
+        # the C++ host dispatcher checks; catching it here surfaces a
+        # synchronous ``ValueError`` instead of a post-launch
+        # ``RuntimeError`` that would only fire at CUDA-graph replay and
+        # would be much harder to attribute to the offending call site.
+        _validate_per_group_size(group_size, inp.element_size(), K)
+        res_out = torch.empty_like(inp)
+        num_groups = K // group_size
+        out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
+        scale_out = torch.empty(
+            inp.shape[:-1] + (num_groups,), dtype=torch.float32, device=inp.device
+        )
+        # Optional bf16/fp16 mirror of the pre-quantization normed output.
+        # Requested by GDN-style layers that also need an unquantized view
+        # (e.g. Qwen3.5 in_proj_ba). Zero-overhead when not requested
+        # because the kernel branches on the pointer being non-null.
+        bf16_out = None
+        bf16_ptr = 0
+        if emit_bf16:
+            bf16_out = torch.empty_like(inp)
+            bf16_ptr = int(bf16_out.data_ptr())
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        ops.fused_allreduce_rmsnorm_quant_per_group(
+            self._ptr,
+            inp,
+            res_inp,
+            res_out,
+            out,
+            scale_out,
+            w,
+            eps,
+            group_size,
+            reg,
+            reg_bytes,
+            use_1stage,
+            bf16_ptr,
+        )
+        if emit_bf16:
+            return out, res_out, scale_out, bf16_out
+        return out, res_out, scale_out
+    
+    def fused_qknorm_ar(
+        self,
+        qkv_in: torch.Tensor,
+        q_w: torch.Tensor,
+        k_w: torch.Tensor,
+        eps: float,
+        registered: bool = False,
+    ):
+        dtype = qkv_in.dtype
+        device = qkv_in.device
+        hidden_dim_q = q_w.shape[-1]
+        hidden_dim_k = k_w.shape[-1]
+        token_num = qkv_in.shape[0]
+        hidden_dim_v = qkv_in.shape[1] - (hidden_dim_q + hidden_dim_k)
+        q_out = torch.empty((token_num, hidden_dim_q), dtype=dtype, device=device)
+        k_out = torch.empty((token_num, hidden_dim_k), dtype=dtype, device=device)
+        v_out = torch.empty((token_num, hidden_dim_v), dtype=dtype, device=device)
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        ops.fused_qknorm_allreduce(
+            self._ptr,
+            qkv_in,
+            q_w,
+            k_w,
+            q_out,
+            k_out,
+            v_out,
+            eps,
+            reg,
+            reg_bytes,
+        )
+        return q_out, k_out, v_out
+    
+    def custom_fused_qknorm_ar(
+        self,
+        qkv_in: torch.Tensor,
+        q_w: torch.Tensor,
+        k_w: torch.Tensor,
+        eps: float,
+    ) -> [torch.Tensor, torch.Tensor, torch.Tensor]:
+        dtype = qkv_in.dtype
+        if self.disabled:
+            return (
+                torch.empty((qkv_in.shape[0], q_w.shape[-1]), dtype=dtype, device=qkv_in.device),
+                torch.empty((qkv_in.shape[0], k_w.shape[-1]), dtype=dtype, device=qkv_in.device),
+                torch.empty((qkv_in.shape[0], qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1]), dtype=dtype, device=qkv_in.device)
+            )
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_qknorm_ar(
+                    qkv_in,
+                    q_w,
+                    k_w,
+                    eps,
+                    registered=True,
+                )
+            else:
+                return (
+                    torch.empty((qkv_in.shape[0], q_w.shape[-1]), dtype=dtype, device=qkv_in.device),
+                    torch.empty((qkv_in.shape[0], k_w.shape[-1]), dtype=dtype, device=qkv_in.device),
+                    torch.empty((qkv_in.shape[0], qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1]), dtype=dtype, device=qkv_in.device)
+                )
+        else:
+            return self.fused_qknorm_ar(
+                qkv_in,
+                q_w,
+                k_w,
+                eps,
+                registered=False,
+            )
+
+    def custom_fused_ar_rms_per_group_quant(
+        self,
+        input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        use_1stage: bool = False,
+        emit_bf16: bool = False,
+    ):
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_ar_rms_per_group_quant(
+                    input,
+                    residual_inp,
+                    w=weight,
+                    eps=eps,
+                    group_size=group_size,
+                    registered=True,
+                    use_1stage=use_1stage,
+                    emit_bf16=emit_bf16,
+                )
+            else:
+                K = input.shape[-1]
+                num_groups = K // group_size
+                dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
+                dummy_scale = torch.zeros(
+                    input.shape[:-1] + (num_groups,),
+                    dtype=torch.float32,
+                    device=input.device,
+                )
+                if emit_bf16:
+                    return (
+                        dummy_out,
+                        torch.zeros_like(input),
+                        dummy_scale,
+                        torch.zeros_like(input),
+                    )
+                return dummy_out, torch.zeros_like(input), dummy_scale
+        else:
+            return self.fused_ar_rms_per_group_quant(
+                input,
+                residual_inp,
+                w=weight,
+                eps=eps,
+                group_size=group_size,
+                registered=False,
+                use_1stage=use_1stage,
+                emit_bf16=emit_bf16,
+            )
+
     def close(self):
-        if not self.disabled and self._ptr:
+        if not self.disabled and getattr(self, "_ptr", 0):
             ops.dispose(self._ptr)
             self._ptr = 0
 

@@ -1,6 +1,6 @@
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (C) 2024-2025, The vLLM team.
+ * Copyright (C) 2024-2026, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include "dispatch_utils.h"
 
 namespace vllm
@@ -36,16 +36,16 @@ namespace vllm
       // GPT-NeoX style rotary embedding.
       x_index = rot_offset;
       y_index = embed_dim + rot_offset;
-      cos = VLLM_LDG(cos_ptr + x_index);
-      sin = VLLM_LDG(sin_ptr + x_index);
+      cos = *(cos_ptr + x_index);
+      sin = *(sin_ptr + x_index);
     }
     else
     {
       // GPT-J style rotary embedding.
       x_index = 2 * rot_offset;
       y_index = 2 * rot_offset + 1;
-      cos = VLLM_LDG(cos_ptr + x_index / 2);
-      sin = VLLM_LDG(sin_ptr + x_index / 2);
+      cos = *(cos_ptr + x_index / 2);
+      sin = *(sin_ptr + x_index / 2);
     }
 
     const scalar_t x = arr[x_index];
