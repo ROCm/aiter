@@ -423,16 +423,19 @@ suite_gqa() {
 }
 
 SUITE_kernel_flags_ARCHS=''
-SUITE_kernel_flags_DESC='v3_atomic_fp32 x v3_bf16_cvt x v3_api_check x v3_check_d, single shape.'
+SUITE_kernel_flags_DESC='v3_atomic_fp32 x v3_bf16_cvt x v3_check_d, single shape (validation-pass only).'
 suite_kernel_flags() {
-    local prec mask atom cvt apick chkd
+    local prec mask atom cvt chkd
     # One fixed shape: tile-aligned canonical.
     local b=2 h=4 h_k=2 sq=128 sk=128 hdim=64
+    # Note: v3_api_check is a probe knob (returns 1.0f without launching the
+    # kernel); validating its zeroed output is meaningless by design, so the
+    # apick axis is intentionally pinned to 0 here. Probe semantics belong in
+    # a dedicated smoke test, not in the validation-pass coverage suite.
     for prec in fp16 bf16; do
     for mask in 0 t b; do
     for atom in 0 1; do
     for cvt in 0 1 2; do
-    for apick in 0 1; do
     for chkd in 0 1; do
         if skip_v3_constraint "$prec" "$hdim" "$sq" "$sk" "$mask" "$atom" "$cvt"; then
             continue
@@ -440,9 +443,9 @@ suite_kernel_flags() {
         run_case kernel_flags -prec=$prec -b=$b -h=$h -h_k=$h_k -d=$hdim \
             -s=$sq -s_k=$sk -mask=$mask \
             -bwd_v3=1 -v3_atomic_fp32=$atom -v3_bf16_cvt=$cvt \
-            -v3_api_check=$apick -v3_check_d=$chkd -mode=0 \
+            -v3_api_check=0 -v3_check_d=$chkd -mode=0 \
             -init=1 -seed=11939
-    done; done; done; done; done; done
+    done; done; done; done; done
 }
 
 SUITE_shape_edges_ARCHS=''
