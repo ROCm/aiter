@@ -162,6 +162,15 @@ def _moe_gemm_a8w4(
     SPLIT_K: tl.constexpr,
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
+    # Idea 1: fold per-1×32 MXFP8 (ue8m0 scale) group quant into write-back.
+    # When HAS_MX_OUT=True, Y is fp8 e4m3 and YMxScale receives uint8 ue8m0
+    # exponents at [m, n // 32]. Eliminates the standalone `downcast_to_mxfp`
+    # launch between GEMM1 and GEMM2. Requires SPLIT_K==1 and OUT_BLOCK_N % 32 == 0.
+    YMxScale=None,
+    stride_y_mx_m=0,
+    stride_y_mx_n=0,
+    HAS_MX_OUT: tl.constexpr = False,
+    MX_OUT_DTYPE_MAX: tl.constexpr = 448.0,
 ):
     tl.assume(stride_y_k >= 0)
     tl.assume(stride_y_m >= 0)
@@ -421,4 +430,45 @@ def _moe_gemm_a8w4(
         + offs_y_n.to(index_type)[None, :] * stride_y_n
     )
     mask = mask_m[:, None] & mask_n[None, :]
-    tl.store(YPtrs, out, mask=mask)
+    if HAS_MX_OUT and SPLIT_K == 1:
+        # Per-1×32 MXFP8 group quant emit. Mirrors the ue8m0 path in
+        # `_fused_clamp_silu_mul_kernel`. OUT_BLOCK_N is the post-swiglu output
+        # block size (BLOCK_N if no swiglu, BLOCK_N//2 with apply_swiglu).
+        tl.static_assert(
+            OUT_BLOCK_N % 32 == 0,
+            "HAS_MX_OUT requires OUT_BLOCK_N % 32 == 0",
+        )
+        NUM_QB: tl.constexpr = OUT_BLOCK_N // 32
+        out_safe = tl.where(mask, out, 0.0)
+        out_3d = tl.reshape(out_safe, [BLOCK_M, NUM_QB, 32])
+        abs_3d = tl.abs(out_3d)
+        max_val = tl.max(abs_3d, axis=2, keep_dims=True)
+        dequant_scale = max_val / MX_OUT_DTYPE_MAX
+        # ROUND_UP via exponent: 2 ** ceil(log2(dequant_scale)).
+        dequant_scale_exponent = (
+            dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF
+        ) & 0x7F800000
+        dequant_scale_rounded = dequant_scale_exponent.to(tl.float32, bitcast=True)
+        quant_scale = tl.where(
+            dequant_scale_rounded == 0, 0.0, 1.0 / dequant_scale_rounded
+        )
+        quant_tensor = out_3d * quant_scale
+        quant_2d = tl.reshape(quant_tensor, [BLOCK_M, OUT_BLOCK_N])
+        tl.store(YPtrs, quant_2d.to(Y.dtype.element_ty), mask=mask)
+        # Extract biased exponent (top 8 bits >> 23) as uint8 ue8m0 scale.
+        scale_exp_3d = (dequant_scale_exponent >> 23).to(tl.uint8)
+        scale_exp_2d = tl.reshape(scale_exp_3d, [BLOCK_M, NUM_QB])
+        offs_s_n = NUM_QB * pid_n + tl.arange(0, NUM_QB)
+        mask_s_n = offs_s_n < tl.cdiv(yN, 32)
+        YMxScalePtrs = (
+            YMxScale
+            + (start_m + offs_y_m).to(index_type)[:, None] * stride_y_mx_m
+            + offs_s_n.to(index_type)[None, :] * stride_y_mx_n
+        )
+        tl.store(
+            YMxScalePtrs,
+            scale_exp_2d,
+            mask=mask_m[:, None] & mask_s_n[None, :],
+        )
+    else:
+        tl.store(YPtrs, out, mask=mask)

@@ -294,6 +294,202 @@ def routing(logits, n_expts_act, sm_first=False):
     )
 
 
+def routing_a8w4(
+    logits: torch.Tensor,
+    n_expts_act: int,
+    block_m: int,
+    *,
+    score_mode: str = "sqrtsoftplus",
+    bias: torch.Tensor | None = None,
+    renorm: bool = True,
+    routed_scaling_factor: float = 1.0,
+):
+    """All-Triton routing for the a8w4 path: fused V4 routing math + sort.
+
+    One-shot pipeline:
+      1. aiter `_topk` (extended): pre-transform (sqrtsoftplus) + bias + topk
+         + bitmatrix + renorm + scale — single Triton kernel.
+      2. aiter `sort_tokens` (or `sort_tokens_fused` for tiny M): sort tokens by
+         expert and produce ExptData specialized for the given ``block_m``.
+
+    Returns (RoutingData, gather_indx, scatter_indx) where gather_indx and
+    scatter_indx are raw int32 tensors (no GatherIndx/ScatterIndx wrappers) —
+    consumed directly by ``moe_gemm_a8w4``.
+
+    No multi-block_m dict, no triton_kernels wrapper, no Python bridge step.
+    """
+    from .topk import topk
+
+    n_tokens, n_expts_tot = logits.shape
+
+    # Step 1: extended topk does sqrtsoftplus + bias + topk + bitmatrix + renorm + scale.
+    expt_scal, expt_indx, bitmatrix = topk(
+        logits,
+        n_expts_act,
+        apply_softmax=False,
+        score_mode=score_mode,
+        bias=bias,
+        renorm=renorm,
+        routed_scaling_factor=routed_scaling_factor,
+        HIST_BLOCK_M=32,
+    )
+
+    # Step 2: sort tokens by expert and build ExptData for the chosen block_m.
+    if n_tokens <= 16:
+        HIST_BLOCK_M = triton.next_power_of_2(max(n_tokens, 1))
+        sort_fn = sort_tokens_fused
+    else:
+        HIST_BLOCK_M = 32
+        sort_fn = sort_tokens
+    (
+        hist,
+        topk_indx,
+        gate_indx,
+        gate_scal,
+        token_offs_raw,
+        token_offs_pad,
+        block_pid_map,
+    ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
+    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
+    routing_data = RoutingData(
+        block_m=block_m,
+        gate_scal=gate_scal,
+        expt_hist=hist,
+        n_expts_tot=n_expts_tot,
+        n_expts_act=n_expts_act,
+        expt_data=expt_data,
+    )
+    return routing_data, topk_indx, gate_indx
+
+
+
+def routing_a8w4_from_hash(
+    router_logits: torch.Tensor,
+    tid2eid: torch.Tensor,
+    input_ids: torch.Tensor,
+    n_expts_act: int,
+    block_m: int,
+    *,
+    score_mode: str = "sqrtsoftplus",
+    renorm: bool = True,
+    routed_scaling_factor: float = 1.0,
+):
+    """All-Triton routing for the a8w4 path on DeepSeek-V4 hash layers.
+
+    Single fused kernel ``hash_routing`` does tid2eid lookup + score transform
+    + gather + renorm + scale + bitmatrix in one launch, then
+    ``sort_tokens_fused`` (same as :func:`routing_a8w4`) produces ExptData.
+
+    Replaces the Python ``_hash_topk`` + multi-kernel ``fused_routing_from_topk``
+    counting-sort + ``compute_expt_data`` (with memset) chain entirely.
+    """
+    from .topk import hash_routing
+
+    n_tokens, n_expts_tot = router_logits.shape
+
+    expt_scal, expt_indx, bitmatrix = hash_routing(
+        router_logits,
+        tid2eid,
+        input_ids,
+        n_expts_act=n_expts_act,
+        HIST_BLOCK_M=32,
+        score_mode=score_mode,
+        renorm=renorm,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+    if n_tokens <= 16:
+        HIST_BLOCK_M = triton.next_power_of_2(max(n_tokens, 1))
+        sort_fn = sort_tokens_fused
+    else:
+        HIST_BLOCK_M = 32
+        sort_fn = sort_tokens
+    (
+        hist,
+        topk_indx,
+        gate_indx,
+        gate_scal,
+        token_offs_raw,
+        token_offs_pad,
+        block_pid_map,
+    ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
+    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
+    routing_data = RoutingData(
+        block_m=block_m,
+        gate_scal=gate_scal,
+        expt_hist=hist,
+        n_expts_tot=n_expts_tot,
+        n_expts_act=n_expts_act,
+        expt_data=expt_data,
+    )
+    return routing_data, topk_indx, gate_indx
+
+
+def routing_a8w4_from_topk(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    n_expts_tot: int,
+    block_m: int,
+):
+    """Routing for the a8w4 path when topk has been pre-computed externally
+    (e.g. DeepSeek-V4 hash layers with tid2eid lookup).
+
+    Mirrors ``routing_a8w4`` but skips the score+topk math step. Pipeline:
+      1. aiter ``fused_routing_from_topk``: 3-kernel counting-sort over the
+         supplied ``(topk_weights, topk_ids)``. Allocates only via
+         ``torch.empty`` — no histogram memset.
+      2. aiter ``_expt_data_only_kernel``: standalone stage1+stage2 launch
+         that materialises ExptData (token_offs_raw, token_offs_pad,
+         block_pid_map) from the histogram for the chosen ``block_m``.
+
+    Returns ``(RoutingData, gather_indx, scatter_indx)`` where ``gather_indx``
+    and ``scatter_indx`` are raw int32 tensors — same contract as
+    ``routing_a8w4`` — so ``_a8w4_fused_experts`` consumes them unchanged.
+    """
+    from aiter.ops.triton.fusions.fused_routing_from_topk import (
+        fused_routing_from_topk,
+    )
+    from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
+        _expt_data_only_kernel,
+    )
+
+    n_tokens, n_expts_act = topk_weights.shape
+    n_gates = n_tokens * n_expts_act
+
+    hist, topk_indx, gate_indx, gate_scal = fused_routing_from_topk(
+        topk_weights, topk_ids, n_expts_tot
+    )
+
+    token_offs_raw, token_offs_pad, block_pid_map, blocks1a, BLOCK_A, block_m_log2 = (
+        _compute_expt_data_internal(n_expts_tot, n_gates, block_m, topk_weights.device)
+    )
+
+    _expt_data_only_kernel[(blocks1a,)](
+        hist,
+        n_expts_tot,
+        token_offs_raw,
+        token_offs_pad,
+        block_pid_map,
+        block_pid_map.shape[0],
+        n_gates,
+        block_m_log2,
+        BLOCK_A,
+        (hist.shape[0] == BLOCK_A),
+        num_warps=1,
+    )
+
+    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
+    routing_data = RoutingData(
+        block_m=block_m,
+        gate_scal=gate_scal,
+        expt_hist=hist,
+        n_expts_tot=n_expts_tot,
+        n_expts_act=n_expts_act,
+        expt_data=expt_data,
+    )
+    return routing_data, topk_indx, gate_indx
+
+
 # --------------------------
 # torch reference
 # --------------------------
