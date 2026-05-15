@@ -27,12 +27,6 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 
-# Hardware constants: gfx name and CU count cannot change within a process
-# lifetime, so we query them once at module import time and cache the results.
-# This eliminates repeated HIP runtime queries in the decode hot path.
-_cached_gfx: str = get_gfx()
-_cached_cu_num: int = get_cu_num()
-
 # Cache for scale transpose buffers, keyed on (device.index, cols, rows, dtype).
 # Reusing these buffers across steps eliminates per-step HIP malloc.
 _scale_t_cache: dict = {}
@@ -697,7 +691,7 @@ def fused_moe_1stage(
 
 @functools.lru_cache(maxsize=2048)
 def get_block_size_M(token, topk, expert, inter_dim):
-    cu_num = _cached_cu_num
+    cu_num = get_cu_num()
     tileN = 128
     tgN = (inter_dim + tileN - 1) // tileN
     support_list = [32, 64, 128]
@@ -1037,7 +1031,7 @@ def get_2stage_cfgs(
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
-    cu_num = _cached_cu_num
+    cu_num = get_cu_num()
     keys = (
         cu_num,
         token,
