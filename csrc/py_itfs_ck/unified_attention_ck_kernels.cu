@@ -31,11 +31,24 @@ void unified_attention_fwd(
     //   lse_acc_workspace : float32 [num_q_heads, num_splits, num_tokens]
     int num_splits,
     std::optional<torch::Tensor> o_acc_workspace,
-    std::optional<torch::Tensor> lse_acc_workspace)
+    std::optional<torch::Tensor> lse_acc_workspace,
+    float q_descale,
+    float k_descale,
+    float v_descale)
 {
     auto dtype = query.dtype();
-    TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
-                "unified_attention only supports fp16 and bf16 data types");
+    // FP8 path: Q is FP8E4M3 (e4m3fn on gfx950 / e4m3fnuz on gfx942). The
+    // output dtype is allowed to be bf16 or fp16 — we mirror the Triton
+    // reference which writes bf16 output for FP8 inputs (and the CK fp8
+    // problem traits also use bf16 for `o_dtype`). When q/k/v are not FP8
+    // the descale floats default to 1.0f at the Python layer so this code
+    // path is identical to the pre-FP8 behaviour.
+    TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16 ||
+                    dtype == torch::kFloat8_e4m3fn ||
+                    dtype == torch::kFloat8_e4m3fnuz,
+                "unified_attention supports fp16, bf16, fp8_e4m3fn, fp8_e4m3fnuz inputs");
+    TORCH_CHECK(key_cache.dtype() == dtype && value_cache.dtype() == dtype,
+                "unified_attention requires q/k/v to share dtype");
     TORCH_CHECK(block_tables.dtype() == torch::kInt32, "block_tables must be int32");
     TORCH_CHECK(seq_lens.dtype() == torch::kInt32, "seq_lens must be int32");
     TORCH_CHECK(query_start_len.dtype() == torch::kInt32, "query_start_len must be int32");
@@ -43,8 +56,10 @@ void unified_attention_fwd(
     ck_tile::unified_attention_args::data_type_enum dt;
     if (dtype == torch::kFloat16)
         dt = ck_tile::unified_attention_args::data_type_enum::fp16;
-    else
+    else if (dtype == torch::kBFloat16)
         dt = ck_tile::unified_attention_args::data_type_enum::bf16;
+    else
+        dt = ck_tile::unified_attention_args::data_type_enum::fp8;
 
     ck_tile::index_t num_tokens   = query.size(0);
     ck_tile::index_t num_head_q   = query.size(1);
@@ -72,6 +87,9 @@ void unified_attention_fwd(
     args.scale_k            = scale_k;
     args.scale_v            = scale_v;
     args.scale_out          = scale_out;
+    args.q_descale          = q_descale;
+    args.k_descale          = k_descale;
+    args.v_descale          = v_descale;
 
     args.q_ptr          = query.data_ptr();
     args.query_stride_0 = query.stride(0);

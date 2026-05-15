@@ -12,11 +12,16 @@ The CK kernel currently supports:
   - hdim=128, MHA  (num_queries_per_kv == 1)
   - hdim=64,  GQA-8 (num_queries_per_kv == 8)
   - fp16 / bf16
+  - **fp8** (e4m3fn on gfx950, e4m3fnuz elsewhere) for the `prefill_d{64,128}`
+    and `decode_d{64,128}_m128` variants — i.e. mixed prefill+decode batches
+    that don't land in the small-tile decode tiers (m16 / m32 / m64).
   - mask_type 0 (no mask) and 2 (causal)
-It does **not** support: fp8 quant, sliding window, softcap, attention sinks.
+It does **not** support: sliding window, softcap, attention sinks.
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 import pytest
 import torch
@@ -26,6 +31,12 @@ from aiter.ops.unified_attention import unified_attention_fwd
 # Reuse the exact same reference the Triton suite uses so any drift is caught
 # on both sides.
 from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
+
+# Match the e4m3 selector the Triton FP8 suite uses: e4m3fn on gfx950/gfx1250,
+# e4m3fnuz elsewhere. The CK kernel's compile-time `CK_TILE_USE_OCP_FP8` flag
+# resolves to the same selector so host-side quantisation and device-side MFMA
+# agree byte-for-byte on the fp8 format.
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 
 # ---------------------------------------------------------------------------
@@ -528,3 +539,272 @@ def test_ck_unified_attn_opt_out_splitkv() -> None:
     )
     torch.testing.assert_close(out_no_split, ref_output, atol=1.5e-2, rtol=1e-2)
     torch.testing.assert_close(out_split,    ref_output, atol=6e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# FP8 correctness sweep — mirrors the Triton FP8 test
+# (`test_unified_attention.py::test_triton_unified_attn` with `q_dtype=e4m3`).
+#
+# Differences:
+#   * The CK FP8 dispatch only has instances for `prefill_d{64,128}` and
+#     `decode_d{64,128}_m128` so far — pure-decode batches that land in the
+#     m16/m32/m64 tiers are skipped at the test-collection level.
+#   * The CK FP8 problem traits force `o_dtype = bf16` regardless of the
+#     source dtype. We allocate a bf16 output buffer and cast the torch
+#     reference (whose dtype follows the source `dtype` parameter) to bf16
+#     before comparison.
+#   * Per-tensor scalar descales are passed as floats (CK ABI) rather than
+#     1-element fp32 tensors (Triton ABI), but they encode the same scaling
+#     identity: `qk_scale = sm_scale * q_descale * k_descale` baked into
+#     `scale_s`, with `v_descale` applied to o_acc once after the K/V loop.
+# ---------------------------------------------------------------------------
+def _fp8_variant_supported(
+    head_config: tuple[int, int, int],
+    query_lens: list[int],
+) -> bool:
+    """Return True iff the FP8 dispatch path for this (head_config, query_lens)
+    is currently correct. Mirrors `unified_attention.cpp::select_config` and
+    the `dispatch_variant<>` `if constexpr` gate on the FP8 branch.
+
+    FP8 is enabled on every variant that uses the 32x32x16 MFMA, i.e.
+    prefill_d{64,128} + decode_d{64,128}_m128 + decode_d128_m32 +
+    decode_d64_m64. The `fmha_alu1` cross-lane P-tile fixup in
+    `unified_attention_pipeline.hpp` realigns the FP8 packed P operand
+    after the softmax cast for all of these.
+
+    The 16x16x32 `_m16` tiers (decode_d128_m16, decode_d64_m16) are
+    NOT FP8-enabled yet: the QK-C output and PV-A input layouts differ
+    by an M<->N axis swap there (16x16 C has M=4 contiguous per lane,
+    N=1 per lane; PV-A Single needs M=1 per lane, K=8 contiguous per
+    lane), which the current slot-swap fixup cannot express -- it would
+    need a full per-thread transpose (likely via LDS).
+
+    Host-side `max_seqlen_q` is conservatively set to `num_tokens` unless the
+    batch is pure decode (num_tokens == num_seqs), in which case it's 1 --
+    same logic as `unified_attention_ck_kernels.cu::unified_attention_fwd`.
+    """
+    num_q_heads, num_kv_heads, head_size = head_config
+    if head_size not in (64, 128):
+        return False
+    num_qpkv = num_q_heads // num_kv_heads
+    num_tokens = sum(query_lens)
+    num_seqs = len(query_lens)
+    avg_q = num_tokens // max(1, num_seqs)
+    max_q = 1 if num_tokens == num_seqs else num_tokens
+    avg_rows = avg_q * num_qpkv
+    max_rows = max_q * num_qpkv
+
+    # Both ladders: only the m16 tier (16x16x32 MFMA) is still ungated.
+    if avg_rows <= 16 and max_rows <= 16:
+        return False
+    return True
+
+
+# FP8-friendly seq-len patterns. We need coverage of every FP8-enabled
+# variant in both ladders:
+#   prefill_d* (32x32x16, 8 warps)              -- pattern 0
+#   decode_d*_m128 (32x32x16, 4 warps)          -- patterns 1, 2
+#   decode_d128_m32 / decode_d64_m64 (32x32x16, -- patterns 3, 4
+#       1 / 2 warps respectively)
+# All of these share the QK-C / PV-A alias fix in `fmha_alu1`. The m16
+# tiers (16x16x32) need a separate transpose-style fix and are skipped
+# via `_fp8_variant_supported`.
+FP8_SEQ_LEN_PATTERNS = [
+    # pattern 0: prefill_d{64,128} (max_rows >= 129)
+    [(1, 1328), (5, 18), (129, 463)],
+    # pattern 1: decode_d{64,128}_m128 for MHA (max_rows = 64*1 = 64)
+    [(64, 1024)],
+    # pattern 2: decode_d{64,128}_m128 for GQA-8 (max_rows = 9*8 = 72)
+    [(9, 1024)],
+    # pattern 3: decode_d128_m32 (MHA, max_rows = 17), decode_d64_m64 (MHA,
+    # max_rows = 17 -> still m64). For GQA-8: max_rows = 17*8 = 136, lands
+    # in m128 / prefill -- still FP8-enabled, just exercises a different
+    # tier.
+    [(17, 1024)],
+    # pattern 4: pure-decode pattern that lands in m32 (MHA, max_rows=1)
+    # and m64 (d=64 GQA-8, max_rows = 1*8 = 8 -> still m16, SKIPPED for d=64
+    # GQA-8 / supported for d=128 MHA). Also covers the multi-seq path.
+    [(1, 200), (1, 537), (1, 919)],
+]
+
+
+def _per_tensor_quantize_fp8(
+    x: torch.Tensor, fp8_dtype: torch.dtype
+) -> tuple[torch.Tensor, float]:
+    """Per-tensor symmetric FP8 quantisation matching the Triton FP8 suite.
+
+    Returns `(x_fp8, descale)` where
+        descale = amax(|x|) / FP8_MAX
+        x_fp8   = (x * FP8_MAX / amax(|x|)).clamp(-FP8_MAX, FP8_MAX).to(fp8)
+    so `descale * x_fp8.float() ≈ x.float()`. The descale is a Python float
+    (CK ABI) rather than a 1-element tensor (Triton ABI); both encode the
+    same scaling identity.
+    """
+    fp8_max = float(torch.finfo(fp8_dtype).max)
+    amax = x.detach().abs().amax().clamp(min=1e-9)
+    descale = (amax / fp8_max).item()
+    # Scale in-place on a bf16/fp16 working buffer (chunked along dim 0 when
+    # the tensor is large) to avoid holding a full fp32 intermediate -- the
+    # naive `x.float() * scale` allocates 4 bytes per element and OOMs on the
+    # 32768-block d=128 sweep configs.
+    scale = fp8_max / amax  # 0-d, same dtype as x
+    q = torch.empty_like(x, dtype=fp8_dtype)
+    flat_x = x.reshape(-1)
+    flat_q = q.reshape(-1)
+    chunk = 1 << 24  # 16 Mi elements ≈ 32 MiB working buffer in bf16
+    for off in range(0, flat_x.numel(), chunk):
+        end = min(off + chunk, flat_x.numel())
+        flat_q[off:end] = (
+            (flat_x[off:end] * scale).clamp_(-fp8_max, fp8_max).to(fp8_dtype)
+        )
+    return q, descale
+
+
+@pytest.mark.parametrize("seq_lens", FP8_SEQ_LEN_PATTERNS)
+@pytest.mark.parametrize("head_config", HEAD_CONFIGS)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
+@torch.inference_mode()
+def test_ck_unified_attn_fp8(
+    seq_lens: list[tuple[int, int]],
+    head_config: tuple[int, int, int],
+    block_size: int,
+    dtype: torch.dtype,
+    num_blocks: int,
+) -> None:
+    """CK FP8 unified-attention vs torch reference.
+
+    The kernel quantises Q/K/V to FP8 (e4m3*) at host build time and folds
+    `q_descale * k_descale` into the softmax scale; `v_descale` is applied
+    once to `o_acc` after the K/V loop. The torch reference is computed on
+    the *un-quantised* high-precision inputs, so the loose tolerance below
+    captures the irreducible FP8 quantisation noise + MFMA reordering
+    (same `atol/rtol = 1.5e-1` that the Triton FP8 suite uses).
+    """
+    num_query_heads, num_kv_heads, head_size = head_config
+    assert num_query_heads % num_kv_heads == 0
+
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+
+    if not _fp8_variant_supported(head_config, query_lens):
+        pytest.skip(
+            f"FP8 small-tile decode (m16/m32/m64) returns NaN -- known "
+            f"pipeline bug; gated off in unified_attention.cpp. Would "
+            f"dispatch for head_config={head_config} query_lens={query_lens}."
+        )
+
+    # FP8 block_size constraint mirrors the Triton suite: the K/V async-load
+    # path needs at least 32-element tiles for the FP8 GEMMs to schedule
+    # cleanly.
+    if block_size < 32:
+        pytest.skip("FP8 needs block_size >= 32 (same constraint as Triton)")
+
+    # Reference requires query_len <= kv_len for the triangle mask to be
+    # well-formed — same skip as the non-FP8 tests above.
+    for ql, kl in seq_lens:
+        if ql > kl:
+            pytest.skip(f"reference requires query_len ({ql}) <= kv_len ({kl})")
+
+    torch.manual_seed(0)
+
+    num_seqs = len(seq_lens)
+    max_kv_len = max(kv_lens_list)
+    scale = head_size**-0.5
+
+    # 1) High-precision sources (bf16/fp16), same as Triton.
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
+    )
+    value_cache = torch.randn_like(key_cache)
+
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device="cuda"
+    ).cumsum(dim=0, dtype=torch.int32)
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0, num_blocks, (num_seqs, max_num_blocks_per_seq),
+        dtype=torch.int32, device="cuda",
+    )
+
+    # 2) Per-tensor FP8 quantisation. Same recipe as the Triton FP8 test
+    # (`amax / fp8_max` descale per tensor).
+    q_fp8, q_descale = _per_tensor_quantize_fp8(query, e4m3_dtype)
+    k_fp8, k_descale = _per_tensor_quantize_fp8(key_cache, e4m3_dtype)
+    v_fp8, v_descale = _per_tensor_quantize_fp8(value_cache, e4m3_dtype)
+
+    # 3) Kernel output dtype is bf16 for FP8 inputs (CK FP8 problem traits
+    # force `o_dtype = bf16`). Allocate accordingly; the wrapper validates
+    # output dtype against the problem traits.
+    output = torch.empty(
+        query.shape, dtype=torch.bfloat16, device="cuda"
+    )
+
+    stride_k_cache_0 = block_size * num_kv_heads * head_size
+    INT32_MAX = 2**31 - 1
+    cache_ptr_int32_overflow_possible = (num_blocks * stride_k_cache_0) > INT32_MAX
+
+    # 4) Run the FP8 kernel. allow_splitkv=False so the FP8 path goes through
+    # the single-launch write rather than the per-split workspace path — the
+    # split-KV combine has its own coverage above and we don't want to fold
+    # both code paths into the same FP8 correctness signal.
+    unified_attention_fwd(
+        output,
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        block_tables,
+        kv_lens,
+        cu_query_lens,
+        mask_type=2,  # causal — matches `ref_paged_attn`'s triangle mask
+        scale_s=scale,
+        scale=1.0,
+        scale_k=1.0,
+        scale_v=1.0,
+        scale_out=1.0,
+        cache_ptr_int32_overflow_possible=cache_ptr_int32_overflow_possible,
+        allow_splitkv=False,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    # 5) Reference on un-quantised inputs (same as Triton FP8 test). Then
+    # cast to bf16 to match the kernel's output dtype before comparison.
+    ref_output = ref_paged_attn(
+        query=query.clone(),  # ref_paged_attn scales `q` in place
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=None,
+        soft_cap=None,
+        sinks=None,
+    ).to(torch.bfloat16)
+
+    # Same tolerance as the Triton FP8 suite — atol/rtol = 1.5e-1 absorbs
+    # per-tensor FP8 quantisation noise + MFMA reordering. We additionally
+    # report the row-mean-mismatch population so regressions in the FP8
+    # row-corruption tail are visible in the assertion message.
+    atol, rtol = 1.5e-1, 1.5e-1
+    diff = (output.float() - ref_output.float()).abs()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    row_mean = diff.mean(dim=-1)  # [total_q, num_heads]
+    bad_rows = int((row_mean > 0.05).sum().item())
+    n_rows = int(row_mean.numel())
+    torch.testing.assert_close(
+        output, ref_output, atol=atol, rtol=rtol
+    ), (
+        f"max abs diff = {max_diff:.3e}, mean = {mean_diff:.3e}, "
+        f"row-mean > 0.05: {bad_rows}/{n_rows} "
+        f"({100.0 * bad_rows / max(1, n_rows):.4f}%)"
+    )

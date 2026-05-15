@@ -36,6 +36,9 @@ def _gen_unified_attention_fwd_kernel_fake(
     num_splits: int = 1,
     o_acc_workspace: Optional[torch.Tensor] = None,
     lse_acc_workspace: Optional[torch.Tensor] = None,
+    q_descale: float = 1.0,
+    k_descale: float = 1.0,
+    v_descale: float = 1.0,
 ) -> None:
     return None
 
@@ -63,6 +66,9 @@ def _unified_attention_fwd_kernel(
     num_splits: int = 1,
     o_acc_workspace: Optional[torch.Tensor] = None,
     lse_acc_workspace: Optional[torch.Tensor] = None,
+    q_descale: float = 1.0,
+    k_descale: float = 1.0,
+    v_descale: float = 1.0,
 ) -> None: ...
 
 
@@ -248,6 +254,15 @@ def unified_attention_fwd(
     # lse_acc_workspace: float32 [num_q_heads, num_splits, num_tokens]
     o_acc_workspace: Optional[torch.Tensor] = None,
     lse_acc_workspace: Optional[torch.Tensor] = None,
+    # Per-tensor FP8 descales — mirror Triton unified_attention's q_scale,
+    # k_scale, v_scale device-tensor arguments but passed as float32 scalars
+    # here. The kernel folds q_descale*k_descale into the softmax scale and
+    # applies v_descale once to o_acc outside the K/V loop. For non-FP8
+    # dtypes leave these at 1.0f (the default) and the kernel is a no-op
+    # w.r.t. these arguments.
+    q_descale: float = 1.0,
+    k_descale: float = 1.0,
+    v_descale: float = 1.0,
 ) -> None:
     explicit_override = (
         num_splits > 1
@@ -275,6 +290,9 @@ def unified_attention_fwd(
             num_splits,
             o_acc_workspace,
             lse_acc_workspace,
+            q_descale,
+            k_descale,
+            v_descale,
         )
         return
 
@@ -300,6 +318,9 @@ def unified_attention_fwd(
             1,
             None,
             None,
+            q_descale,
+            k_descale,
+            v_descale,
         )
         return
 
@@ -334,5 +355,8 @@ def unified_attention_fwd(
         chosen,
         o_acc,
         lse_acc,
+        q_descale,
+        k_descale,
+        v_descale,
     )
     _combine_splits(output, o_acc, lse_acc)

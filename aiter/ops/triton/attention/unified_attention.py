@@ -230,7 +230,14 @@ def unified_attention(
     sinks=None,
 ):
     assert causal, "Only causal attention is supported"
-    assert q_descale is None, "Q scales not supported"
+    # NOTE(fp8): the Triton unified_attention kernel already plumbs q_scale
+    # through (kernel_unified_attention_{2d,3d} both `tl.load(q_scale)` —
+    # see `_q_ds = tl.load(q_scale) if q_scale is not None else 1.0` in
+    # `_triton_kernels/attention/unified_attention.py`). The previous
+    # `assert q_descale is None` was a stale guard from when the kernel
+    # ignored Q scales; dropping it lets us pass real FP8 Q descales
+    # through to the kernel and matches the K/V descale path. Non-FP8
+    # callers pass `q_descale=None` and the kernel falls back to 1.0.
 
     # if _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
     #                               seqused_k, max_seqlen_k, softmax_scale,

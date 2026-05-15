@@ -128,7 +128,10 @@ namespace py = pybind11;
           py::arg("cache_ptr_int32_overflow_possible") = false,                 \
           py::arg("num_splits")                        = 1,                     \
           py::arg("o_acc_workspace")                   = std::nullopt,          \
-          py::arg("lse_acc_workspace")                 = std::nullopt);
+          py::arg("lse_acc_workspace")                 = std::nullopt,          \
+          py::arg("q_descale")                         = 1.0f,                  \
+          py::arg("k_descale")                         = 1.0f,                  \
+          py::arg("v_descale")                         = 1.0f);
 
 #define ATTENTION_PYBIND                                          \
     m.def("paged_attention_rocm",                                 \

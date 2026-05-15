@@ -21,4 +21,12 @@ void unified_attention_fwd(
     bool cache_ptr_int32_overflow_possible = false,
     int num_splits                          = 1,
     std::optional<torch::Tensor> o_acc_workspace   = std::nullopt,
-    std::optional<torch::Tensor> lse_acc_workspace = std::nullopt);
+    std::optional<torch::Tensor> lse_acc_workspace = std::nullopt,
+    // Per-tensor FP8 descales (a.k.a. "scales" in the Triton kernel). The
+    // CK kernel folds Q*K descales into the softmax scale and applies V
+    // descale once to o_acc after the 1/l normalisation — matches Triton
+    // unified_attention's q_scale/k_scale/v_scale handling. For non-FP8
+    // tensors these default to 1.0f (no-op).
+    float q_descale = 1.0f,
+    float k_descale = 1.0f,
+    float v_descale = 1.0f);
