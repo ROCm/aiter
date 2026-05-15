@@ -4,17 +4,12 @@ from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
-<<<<<<< HEAD
 import inspect
 from packaging.version import Version
 import triton
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
-=======
-from triton.experimental.gluon.language.amd.cdna4 import async_copy
-import inspect
->>>>>>> 09e21f3ee ([TRITON][GLUON] Add fp8_mqa_logits gluon kernel for gfx950 and gfx1250 (#3174))
 
 arch = arch_info.get_arch()
 if arch == "gfx950":
@@ -34,15 +29,10 @@ else:
 # Latest official release do not have these features
 def _async_copy_accepts_distributed_layout() -> bool:
     try:
-<<<<<<< HEAD
         from triton.experimental.gluon.language.amd.cdna4 import async_copy
 
         src = inspect.getsource(async_copy.global_load_to_shared)
     except (OSError, TypeError, ImportError):
-=======
-        src = inspect.getsource(async_copy.global_load_to_shared)
-    except (OSError, TypeError):
->>>>>>> 09e21f3ee ([TRITON][GLUON] Add fp8_mqa_logits gluon kernel for gfx950 and gfx1250 (#3174))
         return False
     return "DistributedLayout" in src
 
@@ -118,11 +108,7 @@ def fp8_mqa_logits(
             device=Q.device,
         )[:, :seq_len_kv]
 
-<<<<<<< HEAD
     use_gluon = TRITON_GE_36 and _gluon_fp8_mqa_logits_kernel is not None
-=======
-    use_gluon = _gluon_fp8_mqa_logits_kernel is not None
->>>>>>> 09e21f3ee ([TRITON][GLUON] Add fp8_mqa_logits gluon kernel for gfx950 and gfx1250 (#3174))
     stride_q_s, stride_q_h, stride_q_d = Q.stride()
     stride_kv_s, stride_kv_d = KV.stride()
     stride_w_s, stride_w_h = weights.stride()
