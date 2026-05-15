@@ -12,16 +12,16 @@ TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
 
 arch = arch_info.get_arch()
-if arch == "gfx950":
-    from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
-        _gluon_fp8_mqa_logits_kernel,
-    )
-elif arch == "gfx1250":
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
-        _gluon_fp8_mqa_logits_kernel,
-    )
-else:
-    _gluon_fp8_mqa_logits_kernel = None
+_gluon_fp8_mqa_logits_kernel = None
+if TRITON_GE_36:
+    if arch == "gfx950":
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
+            _gluon_fp8_mqa_logits_kernel,
+        )
+    elif arch == "gfx1250":
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
+            _gluon_fp8_mqa_logits_kernel,
+        )
 
 
 # Hacks to see if we can use some newer features
