@@ -32,8 +32,18 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
 
 
 def run_triton(
-    x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=None, impl=None
+    x,
+    weight,
+    x_scale,
+    w_scale,
+    bias=None,
+    dtype=torch.bfloat16,
+    y=None,
+    impl=None,
+    use_gluon=False,
 ):
+    if use_gluon:
+        return impl(x, weight, x_scale, w_scale, bias, dtype, y, use_gluon=use_gluon)
     return impl(x, weight, x_scale, w_scale, bias, dtype, y)
 
 
@@ -159,6 +169,7 @@ def get_fewer_x_vals():
         "triton",
         "gluon",
         "gluon_shuffle",
+        "gfx1250_gluon",
     ],
 )
 def test_gemm_fp8(in_dtype, m, n, k, impl: str):
@@ -175,6 +186,16 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
             "For preshuffle, N must be multiple of 16 and K must be multiple of 32."
         )
 
+    if impl == "gfx1250_gluon" and DEVICE_ARCH != "gfx1250":
+        pytest.skip(
+            "gfx1250 Gluon implementation is not supported on this device (requires gfx1250)."
+        )
+
+    if impl == "gfx1250_gluon" and (in_dtype == "int8"):
+        pytest.skip(
+            "gfx1250 Gluon implementation does not support int8 input or int32 output."
+        )
+
     in_dtype = str_to_torch_dtype[in_dtype]
     out_dtype = str_to_torch_dtype["bf16"]
     x, weight, weight_triton, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
@@ -189,7 +210,9 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
     )
 
     a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
-    if impl == "triton":
+    use_gluon = False
+    if impl == "triton" or impl == "gfx1250_gluon":
+        use_gluon = impl == "gfx1250_gluon"
         impl = triton_gemm_a8w8
     elif impl == "gluon":
         impl = gluon_gemm_a8w8
@@ -197,7 +220,17 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
         impl = gluon_gemm_a8w8_preshuffle
     else:
         raise ValueError(f"Unknown implementation: {impl}")
-    b = run_triton(x, weight_triton, x_scale, w_scale, bias, out_dtype, y, impl)
+    b = run_triton(
+        x,
+        weight_triton,
+        x_scale,
+        w_scale,
+        bias,
+        out_dtype,
+        y,
+        impl,
+        use_gluon=use_gluon,
+    )
 
     torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
 

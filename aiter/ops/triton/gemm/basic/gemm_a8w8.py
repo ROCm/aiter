@@ -9,6 +9,9 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
     _gemm_a8w8_reduce_kernel,
     _get_config,
 )
+from aiter.ops.triton.gluon.gfx1250_gemm_a8w8 import (
+    gfx1250_gemm_a8w8 as _gluon_gemm_a8w8,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -24,6 +27,7 @@ def gemm_a8w8(
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
     skip_reduce: Optional[bool] = False,
+    use_gluon: bool = False,
 ):
     """
     Computes 8 bit matrix multiplication Y = (X @ W^T) * (x_scale * w_scale) with optional bias.
@@ -42,14 +46,28 @@ def gemm_a8w8(
         skip_reduce (Optional[bool]): Skip reduction of split-K partial results.
             Enables kernel fusion with downstream operations (FP8/FP4 quantization,
             RMSNorm). Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
+        use_gluon (bool): If True, use the Gluon kernel (gfx1250) instead of the
+            default Triton kernel. Defaults to False.
 
     Returns:
         torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
     """
 
     _LOGGER.info(
-        f"GEMM_A8W8: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        f"GEMM_A8W8: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)} use_gluon={use_gluon}"
     )
+
+    if use_gluon:
+        return _gluon_gemm_a8w8(
+            x,
+            w,
+            x_scale,
+            w_scale,
+            bias=bias,
+            dtype=dtype,
+            y=y,
+            config=config,
+        )
 
     assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
 
