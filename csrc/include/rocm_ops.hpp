@@ -98,6 +98,16 @@ namespace py = pybind11;
           py::arg("out"),                               \
           py::arg("input"),                             \
           py::arg("scale"));                            \
+    m.def("silu_and_mul_quant",                         \
+          &aiter::silu_and_mul_quant,                   \
+          "Fused silu_and_mul with per-group "          \
+          "quantization to fp4 or fp8.",                \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("scale"),                             \
+          py::arg("group_size"),                        \
+          py::arg("limit") = 0.0f,                     \
+          py::arg("shuffle_scale") = false);            \
     m.def("gelu_and_mul",                               \
           &aiter::gelu_and_mul,                         \
           "Activation function used in GELU.",          \
