@@ -208,6 +208,15 @@ def test_qknorm_allreduce(
 l_dtype = ["fp16", "bf16"]
 l_shape = [(1, 3072, 512, 1024), (2, 3072, 512, 1024), (16, 3072, 512, 1024)]
 
+# MiniMax-M2 per-rank QKV geometry at TP in {2, 4, 8}, swept across
+# token_num to exercise the grid-strided outer loop above kMaxBlocks (=80).
+l_T_widen = [1, 16, 32, 64, 80, 128, 256, 512, 1024, 2048]
+SHAPE_BY_TP = {
+    2: [(T, 3072, 512, 512) for T in l_T_widen],
+    4: [(T, 1536, 256, 256) for T in l_T_widen],
+    8: [(T, 768, 128, 128) for T in l_T_widen],
+}
+
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(
@@ -236,6 +245,46 @@ parser.add_argument(
     default=True,
     help="use CUDA graph (default: True). e.g. -g true or -g false",
 )
+parser.add_argument(
+    "--tp-sizes",
+    type=lambda s: [int(x) for x in s.split(",") if x.strip()],
+    default=[8],
+    help="comma-separated TP sizes from {2, 4, 8} (default 8). "
+    "Non-default switches to the multi-T SHAPE_BY_TP matrix.",
+)
+
+
+try:
+    import pytest
+
+    @pytest.mark.parametrize(
+        "tp,shape,dtype_str",
+        [
+            (tp, shape, d)
+            for tp in (2, 4, 8)
+            for shape in SHAPE_BY_TP[tp]
+            for d in ("bf16", "fp16")
+        ],
+    )
+    def test_widen_multi_t(tp, shape, dtype_str):
+        if torch.cuda.device_count() < tp:
+            pytest.skip(f"requires >= {tp} GPUs (have {torch.cuda.device_count()})")
+        ret = test_qknorm_allreduce(
+            tp,
+            1,
+            shape,
+            dtypes.d_dtypes[dtype_str],
+            withGraph=True,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
+        assert (
+            ret["err"] < 1e-2
+        ), f"qknorm err={ret['err']} at tp={tp} shape={shape} dtype={dtype_str}"
+
+except ImportError:
+    pass
 
 
 if __name__ == "__main__":
@@ -245,22 +294,27 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
     else:
         l_dtype = [dtypes.d_dtypes[args.dtype]]
-    if args.shape is not None:
-        l_shape = [args.shape]
     df = []
-    for dtype in l_dtype:
-        for shape in l_shape:
-            ret = test_qknorm_allreduce(
-                8,
-                1,
-                shape,
-                dtype,
-                withGraph=args.with_graph,
-                distributed_init_method=get_distributed_init_method(
-                    get_ip(), get_open_port()
-                ),
-            )
-            df.append(ret)
+    for tp in args.tp_sizes:
+        if args.shape is not None:
+            shapes = [args.shape]
+        elif args.tp_sizes == [8]:
+            shapes = l_shape
+        else:
+            shapes = SHAPE_BY_TP.get(tp, l_shape)
+        for dtype in l_dtype:
+            for shape in shapes:
+                ret = test_qknorm_allreduce(
+                    tp,
+                    1,
+                    shape,
+                    dtype,
+                    withGraph=args.with_graph,
+                    distributed_init_method=get_distributed_init_method(
+                        get_ip(), get_open_port()
+                    ),
+                )
+                df.append(ret)
     df = pd.DataFrame(df)
     show_cols = [
         "tp_size",
