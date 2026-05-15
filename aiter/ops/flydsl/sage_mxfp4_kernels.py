@@ -280,22 +280,28 @@ def fav3_sage_mxfp4_flydsl_wrapper(
     fp8_type = _fp8_dtype
     fp8_max = torch.finfo(fp8_type).max
 
-    if q_smooth:
-        # q_smoothing path keeps the Triton quant — the delta_s computation
-        # and q_mean reduction are still Triton-only. q_smooth=True is
-        # already 1.4-2.7x vs Triton, no pressure to port.
+    # FlyDSL fused quant handles both q_smooth modes (1 launch + optional
+    # delta_s GEMM launch when q_smooth=True). The kill-switch env var
+    # AITER_FLYDSL_FORCE_TRITON_QSMOOTH_QUANT=1 routes q_smooth=True back
+    # to the Triton quant for one release-cycle as a safety valve.
+    import os as _os
+    _force_triton_qsmooth = (
+        q_smooth
+        and _os.environ.get("AITER_FLYDSL_FORCE_TRITON_QSMOOTH_QUANT", "0") == "1"
+    )
+    if _force_triton_qsmooth:
         (q_q, q_d, k_q, k_d, v_q, v_d, delta_s) = _triton_sage_quant_mxfp4(
             q, k, v, fp8_type, fp8_max,
             BLKQ=config["BLOCK_M"], BLKK=64,
             layout=layout, R=R, BLOCK_R=BLOCK_R, q_smoothing=q_smooth,
         )
     else:
-        # FlyDSL fused quant: 1 launch instead of Triton's ~9 launches.
         (q_q, q_d, k_q, k_d, v_q, v_d, delta_s) = _flydsl_sage_quant_mxfp4(
             q, k, v, fp8_type, fp8_max,
             BLKQ=config["BLOCK_M"], BLKK=64,
             layout=layout, R=R, BLOCK_R=BLOCK_R,
             skip_k_mean=config.get("skip_k_mean", False),
+            q_smoothing=q_smooth,
         )
 
     return flydsl_sage_attn_mxfp4_func(

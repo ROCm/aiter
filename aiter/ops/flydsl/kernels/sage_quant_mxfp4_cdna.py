@@ -35,8 +35,16 @@ Layout notes (head_dim=128, BLOCK_THREADS=256, VEC=8):
 
 K-mean subtraction: handled out-of-kernel by torch (matches Triton).
 
-q_smoothing: NOT supported in this kernel (caller must fall back to
-Triton quant for q_smooth=True).
+q_smoothing (Q smoothing path):
+  When ``q_smoothing=True``, the Q branch performs an extra in-kernel
+  reduction over BLOCK_M to compute ``M_Q[d] = mean over rows in block``
+  (PRE-rotation). The Q tile is then re-loaded, ``Q -= M_Q`` is applied,
+  Hadamard rotation runs, and the result is FP4-quantized. Lane 0 of
+  each wave-0-row writes ``M_Q * sm_scale * log2(e)`` to the Q_mean
+  output. The companion ``compute_delta_s_module`` consumes Q_mean to
+  produce the per-block bias ``delta_s = Q_mean @ (K - K_mean).T`` that
+  the attention kernel adds to logits — algebraically equivalent to
+  Triton's _rot_q_kernel + _compute_delta_s_kernel pipeline.
 """
 
 import flydsl.compiler as flyc
@@ -49,6 +57,7 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf, rocdl
 from flydsl.expr import buffer_ops
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch  # noqa: F401
 
 BLOCK_THREADS = 256
@@ -63,6 +72,7 @@ def build_sage_quant_mxfp4_module(
     num_q_heads: int,
     num_kv_heads: int,
     subtract_k_mean: bool = True,
+    q_smoothing: bool = False,
 ):
     """Build a fused single-launch kernel for MXFP4 sage quantization.
 
@@ -92,16 +102,41 @@ def build_sage_quant_mxfp4_module(
 
     NUM_SCALE_GROUPS = head_dim // 32   # 4
     GROUP_LANES = 32 // VEC              # 4 lanes per scale group
+    INV_BLK_Q = 1.0 / blk_q              # for Q-mean = sum/BLOCK_M
 
     # Hadamard normalization 1/sqrt(128)
     import math
     HADAMARD_NORM = 1.0 / math.sqrt(head_dim)
+
+    # LDS scratch for q_smoothing M_Q reduction (across the 4 warps).
+    # Each warp writes its post-intra-warp-reduce partial sums into
+    # ``[wave_id, lane_in_row, vi]`` (NUM_WAVES * THREADS_PER_ROW * VEC f32 =
+    # 4 * 16 * 8 = 512 f32 = 2 KB). All 256 threads then read NUM_WAVES
+    # slots for their (lane_in_row, vi) and combine.
+    if q_smoothing:
+        LDS_F32_SLOTS = NUM_WAVES * THREADS_PER_ROW * VEC
+        LDS_BYTES = LDS_F32_SLOTS * 4
+        gpu_arch = get_hip_arch()
+        allocator = SmemAllocator(
+            None,
+            arch=gpu_arch,
+            global_sym_name=(
+                f"sage_quant_mxfp4_qsmooth_smem_h{head_dim}"
+                f"_q{blk_q}_k{blk_k}_hq{num_q_heads}_hk{num_kv_heads}"
+            ),
+        )
+        lds_offset = allocator._align(allocator.ptr, 16)
+        allocator.ptr = lds_offset + LDS_BYTES
+    else:
+        LDS_F32_SLOTS = 0
+        lds_offset = 0
 
     @flyc.kernel
     def sage_quant_mxfp4_kernel(
         Q_in: fx.Tensor,        # bf16 [B, S_q, Hq, D]
         Q_fp4: fx.Tensor,       # u8   [B, S_q, Hq, D//2]    packed FP4
         Q_descale: fx.Tensor,   # u8   [B, S_q, Hq, D//32]   e8m0
+        Q_mean: fx.Tensor,      # f32  [B, Hq, NUM_BLKS_Q, D]  (q_smoothing only)
         K_in: fx.Tensor,        # bf16 [B, S_k, Hk, D]       (RAW)
         K_fp4: fx.Tensor,       # u8   [B, S_k, Hk, D//2]
         K_descale: fx.Tensor,   # u8   [B, S_k, Hk, D//32]
@@ -160,10 +195,16 @@ def build_sage_quant_mxfp4_module(
         c0_f32           = arith.constant(0.0,             type=f32)
 
         # Hadamard butterfly stage offsets (cross-lane partner offsets)
-        c_lane_off_1 = arith.constant(1, type=i32)
-        c_lane_off_2 = arith.constant(2, type=i32)
-        c_lane_off_4 = arith.constant(4, type=i32)
-        c_lane_off_8 = arith.constant(8, type=i32)
+        c_lane_off_1  = arith.constant(1,  type=i32)
+        c_lane_off_2  = arith.constant(2,  type=i32)
+        c_lane_off_4  = arith.constant(4,  type=i32)
+        c_lane_off_8  = arith.constant(8,  type=i32)
+        # Within-warp cross-row_base offsets (warp = 4 row_bases × 16 lanes)
+        c_lane_off_16 = arith.constant(16, type=i32)
+        c_lane_off_32 = arith.constant(32, type=i32)
+
+        # 1/BLOCK_M used for Q-mean = sum/BLOCK_M
+        c_inv_blk_q = arith.constant(INV_BLK_Q, type=f32)
 
         # ------------------------------------------------------------------
         # Per-thread coordinates within the (BLK, D) tile
@@ -176,6 +217,9 @@ def build_sage_quant_mxfp4_module(
         col_d       = (tid_i32 % c_threads_per_row) * c_vec
         lane_in_row = tid_i32 % c_threads_per_row
         group_idx   = lane_in_row >> c2_i32  # //4
+        # Wave/lane decomposition (used by q_smoothing reduction).
+        wave_id     = tid_i32 // c_warp_size_i32   # 0..NUM_WAVES-1
+        lane_in_warp = tid_i32 % c_warp_size_i32   # 0..WARP_SIZE-1
 
         seq_len_q_i32     = ArithValue(seq_len_q)
         seq_len_k_i32     = ArithValue(seq_len_k)
@@ -196,6 +240,7 @@ def build_sage_quant_mxfp4_module(
         q_in_rsrc      = buffer_ops.create_buffer_resource(Q_in,      max_size=True)
         q_fp4_rsrc     = buffer_ops.create_buffer_resource(Q_fp4,     max_size=True)
         q_descale_rsrc = buffer_ops.create_buffer_resource(Q_descale, max_size=True)
+        q_mean_rsrc    = buffer_ops.create_buffer_resource(Q_mean,    max_size=True)
         k_in_rsrc      = buffer_ops.create_buffer_resource(K_in,      max_size=True)
         k_fp4_rsrc     = buffer_ops.create_buffer_resource(K_fp4,     max_size=True)
         k_descale_rsrc = buffer_ops.create_buffer_resource(K_descale, max_size=True)
@@ -203,6 +248,13 @@ def build_sage_quant_mxfp4_module(
         v_in_rsrc      = buffer_ops.create_buffer_resource(V_in,      max_size=True)
         v_fp8_rsrc     = buffer_ops.create_buffer_resource(V_fp8,     max_size=True)
         v_scale_rsrc   = buffer_ops.create_buffer_resource(V_scale,   max_size=True)
+
+        # LDS pointer for q_smoothing M_Q reduction. Unused when False.
+        if const_expr(q_smoothing):
+            base_ptr = allocator.get_base()
+            lds = SmemPtr(
+                base_ptr, lds_offset, T.f32, shape=(LDS_F32_SLOTS,)
+            ).get()
 
         # ==================================================================
         # Helper: per-row inline FWHT (Walsh-Hadamard) for BLOCK_R=128
@@ -518,6 +570,209 @@ def build_sage_quant_mxfp4_module(
                     scf.YieldOp([])
 
         # ==================================================================
+        # Q rotate-quant body WITH q_smoothing (two-pass: M_Q reduce, then
+        # subtract+rotate+quant). Only built when ``q_smoothing=True``.
+        # ==================================================================
+        def do_q_rotate_smoothed_quant(local_pid):
+            blk_idx = local_pid % num_blocks_q_i32
+            bh_id   = local_pid // num_blocks_q_i32
+            h_id    = bh_id % c_q_heads
+            b_id    = bh_id // c_q_heads
+
+            # ----- Phase 1: load Q rows, accumulate per-thread sum across
+            # PASSES_Q passes (no rotation, no quant).
+            sums = [c0_f32] * VEC
+            for p in range_constexpr(PASSES_Q):
+                row_in_blk = row_base + arith.constant(p * ROWS_PER_PASS, type=i32)
+                global_row = blk_idx * c_blk_q + row_in_blk
+                row_in_range = arith.cmpi(CmpIPredicate.ult, global_row, seq_len_q_i32)
+                row_elem_off = (
+                    (b_id * seq_len_q_i32 + global_row) * c_q_heads + h_id
+                ) * c_head_dim + col_d
+                in_dw_off = arith.ShRUIOp(row_elem_off, c1_i32).result
+                safe_off = arith.select(row_in_range, in_dw_off, c0_i32)
+                raw = buffer_ops.buffer_load(q_in_rsrc, safe_off,
+                                              vec_width=4, dtype=i32)
+                bf16_v = vector.bitcast(vec_bf16_ty, raw)
+                f32_v  = bf16_v.extf(vec_f32_ty)
+                for vi in range_constexpr(VEC):
+                    x = vector.extract(f32_v, static_position=[vi],
+                                        dynamic_position=[])
+                    x_masked = arith.select(row_in_range, x, c0_f32)
+                    sums[vi] = ArithValue(sums[vi]) + ArithValue(x_masked)
+
+            # ----- Phase 2: within-warp reduction across the 4 row_bases.
+            # In a 64-lane warp, threads with the same lane_in_row are at
+            # offsets {0, 16, 32, 48} → shuffle_xor 16 + 32 sums them all.
+            for off_const in (c_lane_off_16, c_lane_off_32):
+                for vi in range_constexpr(VEC):
+                    self_v = ArithValue(sums[vi])
+                    peer = self_v.shuffle_xor(off_const, c_warp_size_i32)
+                    sums[vi] = self_v + peer
+
+            # ----- Phase 3: write per-warp partial sums to LDS, barrier.
+            # Slot index: wave_id * (THREADS_PER_ROW * VEC) + lane_in_row * VEC + vi
+            # Only first row_base in each warp writes (lane_in_warp < 16).
+            lds_base_w = arith.MulIOp(
+                wave_id, arith.constant(THREADS_PER_ROW * VEC, type=i32)
+            ).result
+            lds_base_l = arith.MulIOp(lane_in_row, c_vec).result
+            lds_thread_base = arith.AddIOp(lds_base_w, lds_base_l).result
+
+            is_first_rowbase = arith.cmpi(
+                CmpIPredicate.ult, lane_in_warp, c_threads_per_row
+            )
+            _if_w = scf.IfOp(is_first_rowbase)
+            with ir.InsertionPoint(_if_w.then_block):
+                for vi in range_constexpr(VEC):
+                    slot_i = arith.AddIOp(
+                        lds_thread_base, arith.constant(vi, type=i32)
+                    ).result
+                    Vec.from_elements([sums[vi]], fx.Float32).store(
+                        lds, [arith.index_cast(T.index, slot_i)]
+                    )
+                scf.YieldOp([])
+
+            gpu.barrier()
+
+            # ----- Phase 4: each thread reads NUM_WAVES partial sums for
+            # its (lane_in_row, vi) and combines → M_Q[col].
+            means = []
+            for vi in range_constexpr(VEC):
+                acc = c0_f32
+                for w in range_constexpr(NUM_WAVES):
+                    slot_i = arith.constant(
+                        w * THREADS_PER_ROW * VEC + vi, type=i32
+                    )
+                    slot_i = arith.AddIOp(slot_i, lds_base_l).result
+                    v = Vec.load(
+                        T.vec(1, f32),
+                        lds,
+                        [arith.index_cast(T.index, slot_i)],
+                    )
+                    v_s = vector.extract(v, static_position=[0],
+                                          dynamic_position=[])
+                    acc = arith.AddFOp(acc, v_s).result
+                means.append(arith.MulFOp(acc, c_inv_blk_q).result)
+
+            # ----- Phase 5: warp 0 + first row_base writes Q_mean*sm to global.
+            # Q_mean shape [B, Hq, NUM_BLKS_Q, D]. Per block writes D f32 values.
+            qmean_block_off = (
+                (b_id * c_q_heads + h_id) * num_blocks_q_i32 + blk_idx
+            ) * c_head_dim
+            qmean_thread_off = arith.AddIOp(qmean_block_off, col_d).result
+
+            is_w0 = arith.cmpi(CmpIPredicate.eq, wave_id, c0_i32)
+            is_w0_first_rowbase = arith.andi(is_w0, is_first_rowbase)
+            _if_store_mean = scf.IfOp(is_w0_first_rowbase)
+            with ir.InsertionPoint(_if_store_mean.then_block):
+                for vi in range_constexpr(VEC):
+                    scaled = arith.MulFOp(means[vi], sm_scale_log2e_v).result
+                    off_vi = arith.AddIOp(
+                        qmean_thread_off, arith.constant(vi, type=i32)
+                    ).result
+                    buffer_ops.buffer_store(
+                        scaled, q_mean_rsrc, off_vi, offset_is_bytes=False,
+                    )
+                scf.YieldOp([])
+
+            # ----- Phase 6: re-load Q rows, subtract M_Q, rotate, scale,
+            # quantize, store FP4 + descale (mirrors the existing one-pass body).
+            for p in range_constexpr(PASSES_Q):
+                row_in_blk = row_base + arith.constant(p * ROWS_PER_PASS, type=i32)
+                global_row = blk_idx * c_blk_q + row_in_blk
+                row_in_range = arith.cmpi(CmpIPredicate.ult, global_row, seq_len_q_i32)
+                row_elem_off = (
+                    (b_id * seq_len_q_i32 + global_row) * c_q_heads + h_id
+                ) * c_head_dim + col_d
+                in_dw_off = arith.ShRUIOp(row_elem_off, c1_i32).result
+                safe_off = arith.select(row_in_range, in_dw_off, c0_i32)
+                raw = buffer_ops.buffer_load(q_in_rsrc, safe_off,
+                                              vec_width=4, dtype=i32)
+                bf16_v = vector.bitcast(vec_bf16_ty, raw)
+                f32_v  = bf16_v.extf(vec_f32_ty)
+
+                v_list = []
+                for vi in range_constexpr(VEC):
+                    x = vector.extract(f32_v, static_position=[vi],
+                                        dynamic_position=[])
+                    x_centered = ArithValue(x) - ArithValue(means[vi])
+                    v_list.append(x_centered)
+
+                # Hadamard rotation (linear: rotation of (Q - M_Q) gives same
+                # FP4 nibbles as Triton's center-after-rotate path, since
+                # mean(Q@R) = mean(Q)@R).
+                rotated = hadamard_rotate_row(v_list)
+                # Apply sm_scale*log2e (Q only)
+                rotated = [ArithValue(x) * sm_scale_log2e_v for x in rotated]
+                # Mask OOB rows
+                rotated_masked = [arith.select(row_in_range, x, c0_f32)
+                                  for x in rotated]
+
+                amax = per_group_amax(rotated_masked)
+                scale_exp, quant_scale = amax_to_e8m0_and_quant_scale(amax)
+
+                nibbles = []
+                for vi in range_constexpr(VEC):
+                    qv = ArithValue(rotated_masked[vi]) * ArithValue(quant_scale)
+                    nibbles.append(f32_to_e2m1_nibble(qv))
+
+                bytes4 = []
+                for i in (0, 1, 2, 3):
+                    lo = nibbles[2 * i]
+                    hi = arith.ShLIOp(nibbles[2 * i + 1], c4_i32).result
+                    bytes4.append(arith.OrIOp(lo, hi).result)
+                w0 = bytes4[0]
+                w1 = arith.ShLIOp(bytes4[1], c8_i32).result
+                w2 = arith.ShLIOp(bytes4[2], c16_i32).result
+                w3 = arith.ShLIOp(bytes4[3], c24_i32).result
+                packed = arith.OrIOp(
+                    arith.OrIOp(w0, w1).result,
+                    arith.OrIOp(w2, w3).result,
+                ).result
+
+                out_byte_row = (
+                    (b_id * seq_len_q_i32 + global_row) * c_q_heads + h_id
+                ) * arith.constant(head_dim // 2, type=i32)
+                out_byte_off = out_byte_row + arith.ShRUIOp(col_d, c1_i32).result
+
+                grp_first_lane = arith.cmpi(CmpIPredicate.eq,
+                                              arith.AndIOp(lane_in_row,
+                                                            arith.constant(3, type=i32)
+                                                            ).result,
+                                              c0_i32)
+                shift_amt = arith.ShLIOp(group_idx,
+                                          arith.constant(3, type=i32)).result
+                shifted   = arith.ShLIOp(scale_exp, shift_amt).result
+                masked_shifted = arith.select(grp_first_lane, shifted, c0_i32)
+
+                or_acc = ArithValue(masked_shifted)
+                for off_const in (c_lane_off_1, c_lane_off_2,
+                                    c_lane_off_4, c_lane_off_8):
+                    peer = or_acc.shuffle_xor(off_const, c_warp_size_i32)
+                    or_acc = arith.OrIOp(or_acc, peer).result
+                    or_acc = ArithValue(or_acc)
+
+                _if_store = scf.IfOp(row_in_range)
+                with ir.InsertionPoint(_if_store.then_block):
+                    buffer_ops.buffer_store(
+                        packed, q_fp4_rsrc, out_byte_off, offset_is_bytes=True,
+                    )
+                    is_row_lane0 = arith.cmpi(CmpIPredicate.eq,
+                                                lane_in_row, c0_i32)
+                    _if_dscl = scf.IfOp(is_row_lane0)
+                    with ir.InsertionPoint(_if_dscl.then_block):
+                        descale_byte_off = (
+                            (b_id * seq_len_q_i32 + global_row) * c_q_heads + h_id
+                        ) * c_d_div_32
+                        buffer_ops.buffer_store(
+                            or_acc, q_descale_rsrc, descale_byte_off,
+                            offset_is_bytes=True,
+                        )
+                        scf.YieldOp([])
+                    scf.YieldOp([])
+
+        # ==================================================================
         # V FP8 quant body (per-channel scale loaded once per block)
         # ==================================================================
         def do_v_quant(local_pid):
@@ -590,11 +845,14 @@ def build_sage_quant_mxfp4_module(
         is_q = arith.cmpi(CmpIPredicate.ult, bid_i32, q_task_count_i32)
         _if_q = scf.IfOp(is_q, has_else=True)
         with ir.InsertionPoint(_if_q.then_block):
-            do_qk_rotate_quant(
-                bid_i32, q_in_rsrc, q_fp4_rsrc, q_descale_rsrc,
-                blk_q, c_blk_q, c_q_heads, num_blocks_q_i32,
-                seq_len_q_i32, PASSES_Q, apply_sm_scale=True,
-            )
+            if const_expr(q_smoothing):
+                do_q_rotate_smoothed_quant(bid_i32)
+            else:
+                do_qk_rotate_quant(
+                    bid_i32, q_in_rsrc, q_fp4_rsrc, q_descale_rsrc,
+                    blk_q, c_blk_q, c_q_heads, num_blocks_q_i32,
+                    seq_len_q_i32, PASSES_Q, apply_sm_scale=True,
+                )
             scf.YieldOp([])
         with ir.InsertionPoint(_if_q.else_block):
             local_pid_kv = bid_i32 - q_task_count_i32
@@ -619,6 +877,7 @@ def build_sage_quant_mxfp4_module(
         Q_in: fx.Tensor,
         Q_fp4: fx.Tensor,
         Q_descale: fx.Tensor,
+        Q_mean: fx.Tensor,
         K_in: fx.Tensor,
         K_fp4: fx.Tensor,
         K_descale: fx.Tensor,
@@ -637,13 +896,16 @@ def build_sage_quant_mxfp4_module(
         grid_size: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
+        if q_smoothing:
+            allocator.finalized = False
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
-            pass
+            if q_smoothing:
+                allocator.finalize()
 
         idx_grid = arith.index_cast(T.index, grid_size)
         launcher = sage_quant_mxfp4_kernel(
-            Q_in, Q_fp4, Q_descale,
+            Q_in, Q_fp4, Q_descale, Q_mean,
             K_in, K_fp4, K_descale, K_mean,
             V_in, V_fp8, V_scale,
             seq_len_q, seq_len_k,
@@ -662,5 +924,257 @@ def build_sage_quant_mxfp4_module(
         head_dim=head_dim, blk_q=blk_q, blk_k=blk_k,
         num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
         hadamard_norm=HADAMARD_NORM,
+        q_smoothing=q_smoothing,
     )
     return launch_sage_quant_mxfp4
+
+
+# ============================================================================
+# Stage 2: compute_delta_s kernel (q_smoothing-only)
+#
+# Algebra:
+#   delta_s[b, hq, q_blk, k] = sum_d Q_mean[b, hq, q_blk, d] *
+#                              (K[b, k, hk, d] - K_mean[b, hk, d])
+# where Q_mean is already pre-multiplied by sm_scale*log2e by Stage 1's
+# Q-smoothed kernel. The attention kernel adds delta_s to QK logits;
+# combined with the centered Q (from Stage 1) and K-mean-subtracted K
+# (from the regular K branch), this recovers softmax(sm * Q @ K.T)
+# modulo a per-Q-row constant — softmax-invariant.
+#
+# Layout (BSHD only):
+#   Q_mean : f32 [B, Hq, Q_NUM_BLKS, D]
+#   K_in   : bf16 [B, S_k, Hk, D]   (RAW, post k-mean only if not in-kernel)
+#   K_mean : f32 [B, Hk, D]
+#   delta_s: f32 [B, Hq, Q_NUM_BLKS, S_k]
+#
+# Tile: 64 K-rows per workgroup × full D=128. 256 threads = 16 lanes_per_row
+# × 16 row_base. PASSES_DS = 4 covers BLOCK_DS=64 rows. Per thread loads
+# Q_mean[col_d..+8] and K_mean[col_d..+8] once, then per-pass loads
+# K[row, col_d..+8], computes (K - K_mean) * Q_mean, intra-thread + cross-
+# lane sums to produce one delta_s f32 per K-row written by lane_in_row==0.
+# ============================================================================
+
+
+def build_compute_delta_s_module(
+    head_dim: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    block_n: int = 64,
+    subtract_k_mean_in_kernel: bool = True,
+):
+    """Build the delta_s GEMM kernel.
+
+    Grid: B * Hq * Q_NUM_BLKS * K_NUM_BLKS_DS where
+        K_NUM_BLKS_DS = ceil(S_k / block_n).
+    Per-workgroup: process block_n K rows, one Q-block, full D.
+    """
+    assert head_dim == 128, f"only head_dim=128 supported, got {head_dim}"
+    assert num_q_heads % num_kv_heads == 0, "Hq must be multiple of Hk for GQA"
+    assert block_n in (32, 64, 128), f"block_n must be 32/64/128, got {block_n}"
+
+    VEC = 8
+    THREADS_PER_ROW = head_dim // VEC  # 16
+    assert BLOCK_THREADS % THREADS_PER_ROW == 0
+    ROWS_PER_PASS = BLOCK_THREADS // THREADS_PER_ROW  # 16
+    assert block_n % ROWS_PER_PASS == 0
+    PASSES_DS = block_n // ROWS_PER_PASS
+
+    GQA_GROUP = num_q_heads // num_kv_heads
+
+    @flyc.kernel
+    def compute_delta_s_kernel(
+        Q_mean: fx.Tensor,    # f32  [B, Hq, Q_NUM_BLKS, D]
+        K_in: fx.Tensor,      # bf16 [B, S_k, Hk, D]
+        K_mean: fx.Tensor,    # f32  [B, Hk, D]
+        Delta_S: fx.Tensor,   # f32  [B, Hq, Q_NUM_BLKS, S_k]
+        seq_len_k: Int32,
+        num_blocks_q: Int32,
+        num_blocks_n_ds: Int32,
+    ):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+
+        f32 = T.f32
+        i32 = T.i32
+
+        bid_i32 = ArithValue(bid)
+        tid_i32 = ArithValue(tid)
+
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c2_i32 = arith.constant(2, type=i32)
+        c4_i32 = arith.constant(4, type=i32)
+        c8_i32 = arith.constant(8, type=i32)
+        c_warp_size_i32 = arith.constant(WARP_SIZE, type=i32)
+        c_threads_per_row = arith.constant(THREADS_PER_ROW, type=i32)
+        c_head_dim = arith.constant(head_dim, type=i32)
+        c_q_heads = arith.constant(num_q_heads, type=i32)
+        c_kv_heads = arith.constant(num_kv_heads, type=i32)
+        c_block_n = arith.constant(block_n, type=i32)
+        c_vec = arith.constant(VEC, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+        c_gqa_group = arith.constant(GQA_GROUP, type=i32)
+
+        c_lane_off_1 = arith.constant(1, type=i32)
+        c_lane_off_2 = arith.constant(2, type=i32)
+        c_lane_off_4 = arith.constant(4, type=i32)
+        c_lane_off_8 = arith.constant(8, type=i32)
+
+        seq_len_k_i32 = ArithValue(seq_len_k)
+        num_blocks_q_i32 = ArithValue(num_blocks_q)
+        num_blocks_n_ds_i32 = ArithValue(num_blocks_n_ds)
+
+        row_base = tid_i32 // c_threads_per_row
+        col_d = (tid_i32 % c_threads_per_row) * c_vec
+        lane_in_row = tid_i32 % c_threads_per_row
+
+        vec_bf16_ty = T.vec(VEC, T.bf16)
+        vec_f32_ty  = T.vec(VEC, f32)
+        v4f32_ty    = T.vec(4, f32)
+
+        q_mean_rsrc = buffer_ops.create_buffer_resource(Q_mean,  max_size=True)
+        k_in_rsrc   = buffer_ops.create_buffer_resource(K_in,    max_size=True)
+        k_mean_rsrc = buffer_ops.create_buffer_resource(K_mean,  max_size=True)
+        delta_s_rsrc = buffer_ops.create_buffer_resource(Delta_S, max_size=True)
+
+        # Decompose bid → (b, hq, q_blk, n_blk).
+        # bid layout: bid = ((b * Hq + hq) * Q_NUM_BLKS + q_blk) * NUM_N_BLKS + n_blk
+        n_blk = bid_i32 % num_blocks_n_ds_i32
+        rest1 = bid_i32 // num_blocks_n_ds_i32
+        q_blk = rest1 % num_blocks_q_i32
+        rest2 = rest1 // num_blocks_q_i32
+        h_q_id = rest2 % c_q_heads
+        b_id = rest2 // c_q_heads
+        # GQA mapping: hk = hq // (Hq / Hk)
+        h_k_id = h_q_id // c_gqa_group
+
+        # ---- Load Q_mean[b, hq, q_blk, col_d..+VEC] (8 f32) once per WG ----
+        qmean_off_dw = (
+            (b_id * c_q_heads + h_q_id) * num_blocks_q_i32 + q_blk
+        ) * c_head_dim + col_d
+        qmean_lo_raw = buffer_ops.buffer_load(
+            q_mean_rsrc, qmean_off_dw, vec_width=4, dtype=i32
+        )
+        qmean_hi_raw = buffer_ops.buffer_load(
+            q_mean_rsrc, qmean_off_dw + c4_i32, vec_width=4, dtype=i32
+        )
+        qmean_lo_v = vector.bitcast(v4f32_ty, qmean_lo_raw)
+        qmean_hi_v = vector.bitcast(v4f32_ty, qmean_hi_raw)
+        q_means = []
+        for vi in range_constexpr(4):
+            q_means.append(vector.extract(qmean_lo_v,
+                                            static_position=[vi],
+                                            dynamic_position=[]))
+        for vi in range_constexpr(4):
+            q_means.append(vector.extract(qmean_hi_v,
+                                            static_position=[vi],
+                                            dynamic_position=[]))
+
+        # ---- Load K_mean[b, hk, col_d..+VEC] once per WG ----
+        if const_expr(subtract_k_mean_in_kernel):
+            kmean_off_dw = (b_id * c_kv_heads + h_k_id) * c_head_dim + col_d
+            kmean_lo_raw = buffer_ops.buffer_load(
+                k_mean_rsrc, kmean_off_dw, vec_width=4, dtype=i32
+            )
+            kmean_hi_raw = buffer_ops.buffer_load(
+                k_mean_rsrc, kmean_off_dw + c4_i32, vec_width=4, dtype=i32
+            )
+            kmean_lo_v = vector.bitcast(v4f32_ty, kmean_lo_raw)
+            kmean_hi_v = vector.bitcast(v4f32_ty, kmean_hi_raw)
+            k_means = []
+            for vi in range_constexpr(4):
+                k_means.append(vector.extract(kmean_lo_v,
+                                                static_position=[vi],
+                                                dynamic_position=[]))
+            for vi in range_constexpr(4):
+                k_means.append(vector.extract(kmean_hi_v,
+                                                static_position=[vi],
+                                                dynamic_position=[]))
+
+        # ---- For each pass: load K row, compute partial dot product ----
+        for p in range_constexpr(PASSES_DS):
+            row_in_blk = row_base + arith.constant(p * ROWS_PER_PASS, type=i32)
+            global_row = n_blk * c_block_n + row_in_blk
+            row_in_range = arith.cmpi(CmpIPredicate.ult, global_row,
+                                        seq_len_k_i32)
+
+            row_elem_off = (
+                (b_id * seq_len_k_i32 + global_row) * c_kv_heads + h_k_id
+            ) * c_head_dim + col_d
+            in_dw_off = arith.ShRUIOp(row_elem_off, c1_i32).result
+            safe_off = arith.select(row_in_range, in_dw_off, c0_i32)
+            raw = buffer_ops.buffer_load(k_in_rsrc, safe_off,
+                                          vec_width=4, dtype=i32)
+            bf16_v = vector.bitcast(vec_bf16_ty, raw)
+            f32_v  = bf16_v.extf(vec_f32_ty)
+
+            # intra-thread accumulator for this K row
+            partial = c0_f32
+            for vi in range_constexpr(VEC):
+                k_x = vector.extract(f32_v, static_position=[vi],
+                                      dynamic_position=[])
+                if const_expr(subtract_k_mean_in_kernel):
+                    k_centered = ArithValue(k_x) - ArithValue(k_means[vi])
+                else:
+                    k_centered = ArithValue(k_x)
+                prod = k_centered * ArithValue(q_means[vi])
+                partial = arith.AddFOp(partial, prod).result
+
+            # Cross-lane reduce within the row's 16 lanes (sum, 4 stages)
+            partial_av = ArithValue(partial)
+            for off_const in (c_lane_off_1, c_lane_off_2,
+                              c_lane_off_4, c_lane_off_8):
+                peer = partial_av.shuffle_xor(off_const, c_warp_size_i32)
+                partial_av = arith.AddFOp(partial_av, peer).result
+                partial_av = ArithValue(partial_av)
+
+            # Mask OOB rows to 0 (won't be stored anyway)
+            partial_masked = arith.select(row_in_range, partial_av, c0_f32)
+
+            # Lane 0 of each row writes one f32 to delta_s
+            is_row_lane0 = arith.cmpi(CmpIPredicate.eq, lane_in_row, c0_i32)
+            cond = arith.andi(is_row_lane0, row_in_range)
+            _if_st = scf.IfOp(cond)
+            with ir.InsertionPoint(_if_st.then_block):
+                ds_off_dw = (
+                    (b_id * c_q_heads + h_q_id) * num_blocks_q_i32 + q_blk
+                ) * seq_len_k_i32 + global_row
+                buffer_ops.buffer_store(
+                    partial_masked, delta_s_rsrc, ds_off_dw,
+                    offset_is_bytes=False,
+                )
+                scf.YieldOp([])
+
+    @flyc.jit
+    def launch_compute_delta_s(
+        Q_mean: fx.Tensor,
+        K_in: fx.Tensor,
+        K_mean: fx.Tensor,
+        Delta_S: fx.Tensor,
+        seq_len_k: fx.Int32,
+        num_blocks_q: fx.Int32,
+        num_blocks_n_ds: fx.Int32,
+        grid_size: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            pass
+
+        idx_grid = arith.index_cast(T.index, grid_size)
+        launcher = compute_delta_s_kernel(
+            Q_mean, K_in, K_mean, Delta_S,
+            seq_len_k, num_blocks_q, num_blocks_n_ds,
+        )
+        launcher.launch(
+            grid=(idx_grid, 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_compute_delta_s._meta = dict(
+        head_dim=head_dim, block_n=block_n,
+        num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
+        subtract_k_mean_in_kernel=subtract_k_mean_in_kernel,
+    )
+    return launch_compute_delta_s

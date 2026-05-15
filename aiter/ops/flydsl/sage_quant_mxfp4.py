@@ -31,7 +31,10 @@ from typing import Optional, Tuple
 
 import torch
 
-from .kernels.sage_quant_mxfp4_cdna import build_sage_quant_mxfp4_module
+from .kernels.sage_quant_mxfp4_cdna import (
+    build_sage_quant_mxfp4_module,
+    build_compute_delta_s_module,
+)
 from .kernels.sage_quant_cdna import build_sage_preprocess_module
 
 
@@ -41,7 +44,7 @@ __all__ = ["flydsl_sage_quant_mxfp4"]
 @lru_cache(maxsize=64)
 def _get_kernel(head_dim: int, blk_q: int, blk_k: int,
                 num_q_heads: int, num_kv_heads: int,
-                subtract_k_mean: bool):
+                subtract_k_mean: bool, q_smoothing: bool):
     return build_sage_quant_mxfp4_module(
         head_dim=head_dim,
         blk_q=blk_q,
@@ -49,6 +52,19 @@ def _get_kernel(head_dim: int, blk_q: int, blk_k: int,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
         subtract_k_mean=subtract_k_mean,
+        q_smoothing=q_smoothing,
+    )
+
+
+@lru_cache(maxsize=64)
+def _get_delta_s_kernel(head_dim: int, num_q_heads: int, num_kv_heads: int,
+                         block_n: int, subtract_k_mean_in_kernel: bool):
+    return build_compute_delta_s_module(
+        head_dim=head_dim,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        block_n=block_n,
+        subtract_k_mean_in_kernel=subtract_k_mean_in_kernel,
     )
 
 
@@ -83,14 +99,17 @@ def flydsl_sage_quant_mxfp4(
     R: Optional[torch.Tensor] = None,
     BLOCK_R: int = 128,
     skip_k_mean: bool = False,
+    q_smoothing: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-           torch.Tensor, torch.Tensor, None]:
-    """Returns (q_fp4, q_d, k_fp4, k_d, v_fp8, v_scale, None).
+           torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Returns (q_fp4, q_d, k_fp4, k_d, v_fp8, v_scale, delta_s).
 
-    BSHD layout only. q_smoothing must be False.
-    R is ignored when present — the kernel uses a fixed normalized
-    Walsh-Hadamard of size BLOCK_R=128 (matches Triton's default for
-    the bench path).
+    ``delta_s`` is None when ``q_smoothing=False``; otherwise an f32 tensor
+    of shape ``[B, Hq, Q_NUM_BLKS, S_k]`` to be passed as ``bias`` to the
+    attention kernel.
+
+    BSHD layout (BHSD permuted in/out). R is ignored — the kernel uses a
+    fixed normalized Walsh-Hadamard of size BLOCK_R=128.
     """
     assert layout in ("bshd", "bhsd"), f"layout must be bshd|bhsd, got {layout}"
     # bhsd: permute to bshd, run, permute outputs back. The kernel only
@@ -135,6 +154,14 @@ def flydsl_sage_quant_mxfp4(
     v_fp8   = torch.empty((B, S_k, Hk, D),        dtype=fp8_type,    device=v.device)
     k_mean  = torch.empty((B, Hk, D),             dtype=torch.float32, device=k.device)
     v_scale = torch.empty((B, Hk, D),             dtype=torch.float32, device=v.device)
+
+    # Q_mean is per-Q-block; only allocated/written when q_smoothing=True.
+    if q_smoothing:
+        q_mean = torch.empty(
+            (B, Hq, NUM_BLKS_Q, D), dtype=torch.float32, device=q.device,
+        )
+    else:
+        q_mean = torch.empty(1, dtype=torch.float32, device=q.device)  # dummy
 
     # Materialize input contiguity (kernel assumes BSHD-contiguous layout).
     q_c = q.contiguous()
@@ -187,6 +214,7 @@ def flydsl_sage_quant_mxfp4(
         head_dim=D, blk_q=BLKQ, blk_k=BLKK,
         num_q_heads=Hq, num_kv_heads=Hk,
         subtract_k_mean=use_in_kernel_k_mean,
+        q_smoothing=q_smoothing,
     )
     sm_bits   = _f32_bits(sm_scale_log2e)
     norm_bits = _f32_bits(1.0 / math.sqrt(D))
@@ -194,6 +222,7 @@ def flydsl_sage_quant_mxfp4(
         q_c.reshape(-1),
         q_fp4.reshape(-1),
         q_d.reshape(-1),
+        q_mean.reshape(-1),
         k_c.reshape(-1),
         k_fp4.reshape(-1),
         k_d.reshape(-1),
@@ -209,12 +238,42 @@ def flydsl_sage_quant_mxfp4(
         stream=stream,
     )
 
+    # ---- Stage 3 (q_smoothing only): compute delta_s = Q_mean @ (K - K_mean).T
+    delta_s = None
+    if q_smoothing:
+        DS_BLOCK_N = 64
+        ds_num_blocks_n = (S_k + DS_BLOCK_N - 1) // DS_BLOCK_N
+        delta_s = torch.empty(
+            (B, Hq, NUM_BLKS_Q, S_k), dtype=torch.float32, device=q.device,
+        )
+        ds_grid = B * Hq * NUM_BLKS_Q * ds_num_blocks_n
+        # When K-mean was pre-subtracted by torch (long-S branch), K_mean
+        # is unused and we pass K_mean tensor (zeros not required since
+        # the kernel branch on subtract_k_mean_in_kernel guards the load).
+        ds_launcher = _get_delta_s_kernel(
+            head_dim=D, num_q_heads=Hq, num_kv_heads=Hk,
+            block_n=DS_BLOCK_N,
+            subtract_k_mean_in_kernel=use_in_kernel_k_mean,
+        )
+        # K_in must be the same K seen by the main kernel:
+        #  - in-kernel K-mean: k_c is raw, K_mean is real → kernel computes (K - K_mean)
+        #  - torch K-mean   : k_c is already K - K_mean, K_mean tensor is unused
+        ds_launcher(
+            q_mean.reshape(-1),
+            k_c.reshape(-1),
+            k_mean.reshape(-1),
+            delta_s.reshape(-1),
+            S_k, NUM_BLKS_Q, ds_num_blocks_n,
+            ds_grid,
+            stream=stream,
+        )
+
     if bhsd_in:
         q_fp4 = q_fp4.permute(0, 2, 1, 3).contiguous()
         q_d   = q_d.permute(0, 2, 1, 3).contiguous()
         k_fp4 = k_fp4.permute(0, 2, 1, 3).contiguous()
         k_d   = k_d.permute(0, 2, 1, 3).contiguous()
         v_fp8 = v_fp8.permute(0, 2, 1, 3).contiguous()
-        # v_scale is [B, Hk, D] regardless of layout (per-channel)
+        # delta_s is [B, Hq, Q_NUM_BLKS, S_k] — already layout-agnostic
 
-    return q_fp4, q_d, k_fp4, k_d, v_fp8, v_scale, None
+    return q_fp4, q_d, k_fp4, k_d, v_fp8, v_scale, delta_s
