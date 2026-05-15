@@ -384,6 +384,7 @@ def build_sage_attn_mxfp4_cdna_module(
         )
 
         v4i32_type = Vec.make_type(4, fx.Int32)
+        v4f32_type = Vec.make_type(4, fx.Float32)
         v16i32_type = Vec.make_type(16, fx.Int32)
         v16f32_type = Vec.make_type(16, fx.Float32)
         # MFMA 32x32x32_i8: A/B = v4i32 (=16xi8 per lane), C/D = v16i32 per lane (wave64)
@@ -1095,19 +1096,26 @@ def build_sage_attn_mxfp4_cdna_module(
                 ) * seq_len_k_v
                 s_bias = []
                 for st in range_constexpr(N_SUBTILES):
-                    for elem in range_constexpr(ELEMS_PER_TILE):
-                        idx = st * ELEMS_PER_TILE + elem
-                        msub = elem // 4
-                        erem = elem % 4
-                        kv_col_idx = (
-                            kv_block_start_arg
-                            + fx.Index(st * MFMA_N)
-                            + fx.Index(msub * 8)
-                            + klane * 4
-                            + fx.Index(erem)
-                        )
-                        if const_expr(not CAUSAL):
-                            # Non-causal: keep the bounds-check (helps LLVM scheduling)
+                    if const_expr(not CAUSAL):
+                        # Non-causal: per-element vec_width=1 + per-elem
+                        # bounds-predicate. Empirically (measured 2026-05-15
+                        # at SHA ef4e11e19+) coalescing into vec_width=4 i32
+                        # loads regressed S=32768 fwd 2.57x → 1.82x Triton
+                        # (-29%). The per-elem cmpi+select pair before each
+                        # buffer_load helps LLVM schedule the load latency
+                        # behind useful work; vec=4 loads collapse the
+                        # latency window. KEEP the per-elem path here.
+                        for elem in range_constexpr(ELEMS_PER_TILE):
+                            idx = st * ELEMS_PER_TILE + elem
+                            msub = elem // 4
+                            erem = elem % 4
+                            kv_col_idx = (
+                                kv_block_start_arg
+                                + fx.Index(st * MFMA_N)
+                                + fx.Index(msub * 8)
+                                + klane * 4
+                                + fx.Index(erem)
+                            )
                             kv_in_bias_bounds = ArithValue(
                                 arith.cmpi(
                                     arith.CmpIPredicate.slt,
@@ -1131,22 +1139,39 @@ def build_sage_attn_mxfp4_cdna_module(
                                 bias_val, fx.Float32(0.0)
                             )
                             s_bias.append(_fadd(s_f32_loc[idx], bias_val_safe))
-                        else:
-                            # Causal: drop the bounds-check. In body the bound
-                            # is provably true; in tail the score mask kills
-                            # OOB cols via -inf, so any garbage bias added is
-                            # harmless. Skipping the check unblocks better
-                            # LLVM scheduling for the causal kernel.
-                            bias_dword_idx = arith.unwrap(
+                    else:
+                        # Causal: no bounds-check needed (body is provably
+                        # in-range; tail's score mask kills OOB cols via
+                        # -inf so any garbage bias is harmless). Coalesce
+                        # to vec_width=4 i32 loads — 4x fewer bias loads
+                        # and better scheduling. Empirical lift on
+                        # 2026-05-15: S=4096 caus +9%, S=8192 caus +8%,
+                        # S=16384 caus +5%.
+                        for msub in range_constexpr(4):
+                            kv_col_base = (
+                                kv_block_start_arg
+                                + fx.Index(st * MFMA_N)
+                                + fx.Index(msub * 8)
+                                + klane * 4
+                            )
+                            base_dword = arith.unwrap(
                                 arith.index_cast(
-                                    T.i32, _raw(bias_base_dword + kv_col_idx)
+                                    T.i32, _raw(bias_base_dword + kv_col_base)
                                 )
                             )
-                            bias_val = buffer_ops.buffer_load(
-                                bias_rsrc, bias_dword_idx,
-                                vec_width=1, dtype=T.f32,
+                            b4_raw = buffer_ops.buffer_load(
+                                bias_rsrc, base_dword,
+                                vec_width=4, dtype=T.i32,
                             )
-                            s_bias.append(_fadd(s_f32_loc[idx], bias_val))
+                            b4 = vector.bitcast(v4f32_type, b4_raw)
+                            for erem in range_constexpr(4):
+                                idx = st * ELEMS_PER_TILE + msub * 4 + erem
+                                bias_val = vector.extract(
+                                    b4, static_position=[erem], dynamic_position=[]
+                                )
+                                s_bias.append(
+                                    _fadd(s_f32_loc[idx], fx.Float32(bias_val))
+                                )
                 s_f32_loc = s_bias
 
             # 3) Mask — only emitted in mask_mode='full'.

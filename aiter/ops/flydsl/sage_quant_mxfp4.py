@@ -241,10 +241,10 @@ def flydsl_sage_quant_mxfp4(
     # ---- Stage 3 (q_smoothing only): compute delta_s = Q_mean @ (K - K_mean).T
     delta_s = None
     if q_smoothing:
-        # Empirically tuned: 128 beats 64 on S>=8192 (21% faster) and is a
-        # tie or near-tie on shorter S. 256 is slightly better on a few
-        # shapes but bigger register/LDS footprint risks long-S regressions
-        # in pathological cases. 128 is the safe global default.
+        # Empirically tuned: 128 beats 64 by 11-21% on S>=8192. 256 wins
+        # marginally on long-S but regresses S=1024 and GQA B=2 — sweep
+        # decided 128 is the safe global default. Per-shape selection
+        # was tried and the win didn't beat the complexity.
         DS_BLOCK_N = 128
         ds_num_blocks_n = (S_k + DS_BLOCK_N - 1) // DS_BLOCK_N
         delta_s = torch.empty(
