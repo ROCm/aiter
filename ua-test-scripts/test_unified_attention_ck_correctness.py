@@ -546,9 +546,6 @@ def test_ck_unified_attn_opt_out_splitkv() -> None:
 # (`test_unified_attention.py::test_triton_unified_attn` with `q_dtype=e4m3`).
 #
 # Differences:
-#   * The CK FP8 dispatch only has instances for `prefill_d{64,128}` and
-#     `decode_d{64,128}_m128` so far — pure-decode batches that land in the
-#     m16/m32/m64 tiers are skipped at the test-collection level.
 #   * The CK FP8 problem traits force `o_dtype = bf16` regardless of the
 #     source dtype. We allocate a bf16 output buffer and cast the torch
 #     reference (whose dtype follows the source `dtype` parameter) to bf16
@@ -563,39 +560,20 @@ def _fp8_variant_supported(
     query_lens: list[int],
 ) -> bool:
     """Return True iff the FP8 dispatch path for this (head_config, query_lens)
-    is currently correct. Mirrors `unified_attention.cpp::select_config` and
-    the `dispatch_variant<>` `if constexpr` gate on the FP8 branch.
+    is currently expected to give a correct result. Mirrors
+    `unified_attention.cpp::select_config` + the `dispatch_variant<>`
+    `if constexpr` gate on the FP8 branch.
 
-    FP8 is enabled on every variant that uses the 32x32x16 MFMA, i.e.
-    prefill_d{64,128} + decode_d{64,128}_m128 + decode_d128_m32 +
-    decode_d64_m64. The `fmha_alu1` cross-lane P-tile fixup in
-    `unified_attention_pipeline.hpp` realigns the FP8 packed P operand
-    after the softmax cast for all of these.
-
-    The 16x16x32 `_m16` tiers (decode_d128_m16, decode_d64_m16) are
-    NOT FP8-enabled yet: the QK-C output and PV-A input layouts differ
-    by an M<->N axis swap there (16x16 C has M=4 contiguous per lane,
-    N=1 per lane; PV-A Single needs M=1 per lane, K=8 contiguous per
-    lane), which the current slot-swap fixup cannot express -- it would
-    need a full per-thread transpose (likely via LDS).
-
-    Host-side `max_seqlen_q` is conservatively set to `num_tokens` unless the
-    batch is pure decode (num_tokens == num_seqs), in which case it's 1 --
-    same logic as `unified_attention_ck_kernels.cu::unified_attention_fwd`.
+    Status as of the LDS-roundtrip fix in `fmha_alu1`: FP8 is enabled on
+    EVERY UA variant -- prefill_d{64,128} and decode_d{64,128}_m{16,32,64,128}.
+    The roundtrip is layout-agnostic (store with QK-C distribution ->
+    block-sync -> load with PV-A distribution) and works uniformly for
+    the 32x32x16 (prefill, decode_m{32,64,128}) and 16x16x32
+    (decode_m16) MFMA shapes. Only the d != 64/128 case is still
+    unsupported (no instance compiled).
     """
-    num_q_heads, num_kv_heads, head_size = head_config
+    _, _, head_size = head_config
     if head_size not in (64, 128):
-        return False
-    num_qpkv = num_q_heads // num_kv_heads
-    num_tokens = sum(query_lens)
-    num_seqs = len(query_lens)
-    avg_q = num_tokens // max(1, num_seqs)
-    max_q = 1 if num_tokens == num_seqs else num_tokens
-    avg_rows = avg_q * num_qpkv
-    max_rows = max_q * num_qpkv
-
-    # Both ladders: only the m16 tier (16x16x32 MFMA) is still ungated.
-    if avg_rows <= 16 and max_rows <= 16:
         return False
     return True
 
@@ -606,9 +584,10 @@ def _fp8_variant_supported(
 #   decode_d*_m128 (32x32x16, 4 warps)          -- patterns 1, 2
 #   decode_d128_m32 / decode_d64_m64 (32x32x16, -- patterns 3, 4
 #       1 / 2 warps respectively)
-# All of these share the QK-C / PV-A alias fix in `fmha_alu1`. The m16
-# tiers (16x16x32) need a separate transpose-style fix and are skipped
-# via `_fp8_variant_supported`.
+#   decode_d*_m16 (16x16x32, 1 warp)            -- pattern 4 (pure decode)
+# All variants share the QK-C / PV-A LDS-roundtrip re-layout in
+# `fmha_alu1` -- pattern 4 (single-token-per-seq pure decode) hits
+# m16 for d=128 MHA / d=64 GQA-8 too.
 FP8_SEQ_LEN_PATTERNS = [
     # pattern 0: prefill_d{64,128} (max_rows >= 129)
     [(1, 1328), (5, 18), (129, 463)],
@@ -690,9 +669,8 @@ def test_ck_unified_attn_fp8(
 
     if not _fp8_variant_supported(head_config, query_lens):
         pytest.skip(
-            f"FP8 small-tile decode (m16/m32/m64) returns NaN -- known "
-            f"pipeline bug; gated off in unified_attention.cpp. Would "
-            f"dispatch for head_config={head_config} query_lens={query_lens}."
+            f"FP8 dispatch unsupported (no instance compiled) for "
+            f"head_config={head_config} query_lens={query_lens}."
         )
 
     # FP8 block_size constraint mirrors the Triton suite: the K/V async-load
