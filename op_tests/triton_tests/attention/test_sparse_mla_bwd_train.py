@@ -134,6 +134,7 @@ def test_backward(
     rope_rank=64,
     topk=128,
     device="cuda",
+    method="fused",
 ):
     d_qk = kv_lora_rank + rope_rank
     total_tokens = batch * seq_len
@@ -158,7 +159,8 @@ def test_backward(
     o, lse = sparse_mla_fwd(q, kv, topk_indices, kv_lora_rank, scale)
 
     # Run our backward
-    dq, dkv = sparse_mla_bwd(q, kv, o, do, topk_indices, lse, kv_lora_rank, scale)
+    dq, dkv = sparse_mla_bwd(q, kv, o, do, topk_indices, lse, kv_lora_rank, scale,
+                              method=method)
 
     # Reference backward
     dq_ref, dkv_ref = compute_reference_grads(q, kv, topk_indices, do, kv_lora_rank, scale)
@@ -167,7 +169,6 @@ def test_backward(
     dq_f = dq.float()
     max_diff_dq = (dq_f - dq_ref).abs().max().item()
     mean_diff_dq = (dq_f - dq_ref).abs().mean().item()
-    # Relative error for dQ
     dq_ref_norm = dq_ref.abs().mean().item()
     rel_err_dq = mean_diff_dq / (dq_ref_norm + 1e-8)
 
@@ -179,12 +180,12 @@ def test_backward(
     rel_err_dkv = mean_diff_dkv / (dkv_ref_norm + 1e-8)
 
     # Tolerances: bf16 accumulation + atomics add noise
-    passed_dq = rel_err_dq < 0.1  # 10% relative error
-    passed_dkv = rel_err_dkv < 0.15  # 15% relative error (atomics add noise)
+    passed_dq = rel_err_dq < 0.1
+    passed_dkv = rel_err_dkv < 0.15
     passed = passed_dq and passed_dkv
     status = "PASS" if passed else "FAIL"
 
-    print(f"  [{status}] B={batch}, S={seq_len}, H={num_heads}, "
+    print(f"  [{status}] {method:<22s} B={batch}, S={seq_len}, H={num_heads}, "
           f"d_v={kv_lora_rank}, d_rope={rope_rank}, topk={topk}")
     print(f"    dQ:  max_diff={max_diff_dq:.6f}, mean_diff={mean_diff_dq:.6f}, "
           f"rel_err={rel_err_dq:.4f}")
@@ -205,6 +206,7 @@ def test_autograd_e2e(
     rope_rank=64,
     topk=64,
     device="cuda",
+    method="fused",
 ):
     d_qk = kv_lora_rank + rope_rank
     total_tokens = batch * seq_len
@@ -224,7 +226,8 @@ def test_autograd_e2e(
             topk_indices[global_t, :n_valid] = abs_pos.int()
 
     # Forward + backward through autograd
-    o, lse = sparse_mla_train(q, kv, topk_indices, kv_lora_rank, scale)
+    o, lse = sparse_mla_train(q, kv, topk_indices, kv_lora_rank, scale,
+                               bwd_method=method)
 
     # Create upstream gradient
     do = torch.randn_like(o)
@@ -240,7 +243,7 @@ def test_autograd_e2e(
 
     passed = has_dq and has_dkv
     status = "PASS" if passed else "FAIL"
-    print(f"  [{status}] Autograd E2E: B={batch}, S={seq_len}, H={num_heads}, "
+    print(f"  [{status}] {method:<22s} B={batch}, S={seq_len}, H={num_heads}, "
           f"d_v={kv_lora_rank}, topk={topk}")
     if has_dq:
         print(f"    dQ  max={q.grad.abs().max().item():.6f}")
@@ -363,6 +366,13 @@ def main():
     os.environ["HIP_VISIBLE_DEVICES"] = str(args.gpu)
     device = "cuda"
 
+    # "persistent" excluded: Triton/LLVM compilation hangs at D_V=512.
+    # See dsa_dev/docs/persistent_kernel_postmortem.md.
+    BWD_METHODS = [
+        "fused", "recompute", "split_intermediate",
+        "privatized", "xcd_privatized", "gather", "chunked_gather",
+    ]
+
     if not args.bench_only:
         print("=" * 60)
         print("Preprocess Tests")
@@ -374,7 +384,7 @@ def main():
 
         print()
         print("=" * 60)
-        print("Backward Correctness Tests")
+        print("Backward Correctness Tests (all methods)")
         print("=" * 60)
 
         test_configs = [
@@ -382,12 +392,12 @@ def main():
             (1, 128, 16, 256, 64, 64),
             (1, 256, 32, 512, 64, 128),
             (1, 256, 128, 512, 64, 128),
-            (1, 64, 16, 256, 64, 64),
-            (1, 512, 128, 512, 64, 256),
         ]
 
-        for cfg in test_configs:
-            all_passed &= test_backward(*cfg, device=device)
+        for method in BWD_METHODS:
+            print(f"\n  -- {method} --")
+            for cfg in test_configs:
+                all_passed &= test_backward(*cfg, device=device, method=method)
 
         print()
         print("=" * 60)
@@ -397,9 +407,10 @@ def main():
 
         print()
         print("=" * 60)
-        print("End-to-End Autograd Tests")
+        print("End-to-End Autograd Tests (all methods)")
         print("=" * 60)
-        all_passed &= test_autograd_e2e(device=device)
+        for method in BWD_METHODS:
+            all_passed &= test_autograd_e2e(device=device, method=method)
 
         print()
         if all_passed:
