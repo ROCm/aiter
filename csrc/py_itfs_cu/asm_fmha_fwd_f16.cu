@@ -29,47 +29,59 @@
 #include <cmath>
 #include <memory>
 
-// Kernel argument block (ABI = FmhaFwdKernelArgsBase in fmha_fwd_f16.cpp).
-// kernarg_size = 528 B (33 slots × 16 B, including ptr_SINK at the end).
-struct __attribute__((packed)) KernelArgs
+// Kernel argument block — packed ABI (132 B = 0x84), matches
+// FmhaFwdKernelArgsBase in poc_kl/mi400/fmha_fwd_f16/fmha_fwd_f16.cpp
+// and the .args YAML emitted into the v8 .s patched HSA metadata.
+//
+// Field names mirror poc_kl: short names (d_addr / q_seqs / k_hs / ...)
+// rather than the older 528-B slot-padded layout we used pre-v8.
+//
+//   d   = output O
+//   q/k/v_seqs = stride along seq dim (bytes)
+//   q/k/v_hs   = stride along head dim (bytes)
+//   q/k/v_bas  = stride along batch dim (bytes)
+//   q_ts       = stride between Q-tiles (sub_Q * q_seqs)
+//   lse_hs     = stride per Q head for LSE (q_seq_len * 4)
+//   opt        = packed switches: bit0 reverse_kv, bit1 double_q,
+//                bit2 remap_xy.  We swap gdx/gdy at launch, so bit2=1.
+//   sink_addr  = per-Q-head f32 sink logits (pre-scale).  Read only by
+//                D64 `_rxy_sink_*` kernels (ENABLE_SINK=1).  For D128
+//                the slot must still be valid (kernarg layout) but is
+//                ignored; we pass a zero buffer.
+#pragma pack(push, 1)
+struct KernelArgs
 {
-    void*        ptr_O;          p2 _padO;
-    void*        ptr_Q;          p2 _padQ;
-    void*        ptr_K;          p2 _padK;
-    void*        ptr_V;          p2 _padV;
-    void*        ptr_LSE;        p2 _padLSE;
-    float        scalar_f;       p3 _padSc;
-    int          q_seq_len;      p3 _p0;
-    int          stride_q_seq;   p3 _p1;
-    int          stride_q_tg;    p3 _p2;
-    int          stride_q_head;  p3 _p3;
-    int          stride_q_batch; p3 _p4;
-    int          gqa;            p3 _p5;
-    int          stride_k_seq;   p3 _p6;
-    int          stride_k_head;  p3 _p7;
-    int          stride_k_batch; p3 _p8;
-    int          opt;            p3 _p9;
-    int          lse;            p3 _p10;
-    int          kv_seq_len;     p3 _p11;
-    int          qk_head_dim;    p3 _p12;
-    int          v_head_dim;     p3 _p13;
-    int          q_head_num;     p3 _p14;
-    int          stride_v_seq;   p3 _p15;
-    int          stride_v_head;  p3 _p16;
-    int          stride_v_batch; p3 _p17;
-    int          stride_o_seq;   p3 _p18;
-    int          stride_o_head;  p3 _p19;
-    int          stride_o_batch; p3 _p20;
-    void*        ptr_QSeq;       p2 _padQSeq;
-    void*        ptr_KSeq;       p2 _padKSeq;
-    int          stride_lse_head;p3 _p21;
-    void*        ptr_QSeqPad;    p2 _padQSeqPad;
-    void*        ptr_KSeqPad;    p2 _padKSeqPad;
-    // per-Q-head f32 sink logits (pre-scale raw domain).
-    // D64 `_rxy_sink` kernels: ENABLE_SINK reads this at UCONST offset 0x200.
-    // D128 `_rxy` kernels: slot must exist for kernarg_size=528 but is unused.
-    void*        ptr_SINK;       p2 _padSINK;
+    void*        d_addr;           // off 0x00  s_D_addr
+    const void*  q_addr;           // off 0x08  s_Q_addr
+    const void*  k_addr;           // off 0x10  s_K_addr
+    const void*  v_addr;           // off 0x18  s_V_addr
+    void*        lse_addr;         // off 0x20  s_LSE_addr
+    float        scalar;           // off 0x28  s_scalar
+    int          q_seq_len;        // off 0x2C  s_Q_seq_len
+    int          q_seqs;           // off 0x30  s_Q_Seqs
+    int          q_ts;             // off 0x34  s_Q_Ts
+    int          q_hs;             // off 0x38  s_Q_Hs
+    int          q_bas;            // off 0x3C  s_Q_BAs
+    int          gqa;              // off 0x40  s_gqa
+    int          k_seqs;           // off 0x44  s_K_Seqs
+    int          k_hs;             // off 0x48  s_K_Hs
+    int          k_bas;            // off 0x4C  s_K_BAs
+    int          opt;              // off 0x50  s_opt  (bits 0..2)
+    int          lse;              // off 0x54  s_LSE  (1 = write LSE)
+    int          kv_seq_len;       // off 0x58  s_KV_seq_len
+    int          q_head_num;       // off 0x5C  s_Q_head_num
+    int          v_seqs;           // off 0x60  s_V_Seqs
+    int          v_hs;             // off 0x64  s_V_Hs
+    int          v_bas;            // off 0x68  s_V_BAs
+    int          d_seqs;           // off 0x6C  s_D_Seqs (== O stride along seq)
+    int          d_hs;             // off 0x70  s_D_Hs
+    int          d_bas;            // off 0x74  s_D_BAs
+    int          lse_hs;           // off 0x78  s_LSE_Hs
+    void*        sink_addr;        // off 0x7C  s_SINK_buf_addr
 };
+#pragma pack(pop)
+static_assert(sizeof(KernelArgs) == 0x84,
+              "fmha_fwd_f16_asm: KernelArgs must be 132B packed (matches v8 .args)");
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -224,49 +236,45 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int stride_lse_head = q_seq_len * (int)sizeof(float);  // fixed layout
 
     // ---- kernel args -------------------------------------------------------
-    KernelArgs args = {};
-    args.ptr_O           = out->data_ptr();
-    args.ptr_Q           = q->data_ptr();
-    args.ptr_K           = k->data_ptr();
-    args.ptr_V           = v->data_ptr();
-    args.ptr_LSE         = lse->data_ptr();
-    args.scalar_f        = softmax_scale;
-    args.q_seq_len       = q_seq_len;
-    args.stride_q_seq    = stride_q_seq;
-    args.stride_q_tg     = stride_q_tg;
-    args.stride_q_head   = stride_q_head;
-    args.stride_q_batch  = stride_q_batch;
-    args.gqa             = gqa;
-    args.stride_k_seq    = stride_k_seq;
-    args.stride_k_head   = stride_k_head;
-    args.stride_k_batch  = stride_k_batch;
-    // s_opt SGPR (kernarg dword @ offset 0xF0): packs three host-side switches.
-    // Bit layout must stay in lockstep with poc_kl/.../fmha_fwd_f16.cpp::opt_packed
-    // and the S_OPT_BIT_* defines in BF16_FMHA_FWD_*.sp3:
+    // ABI = FmhaFwdKernelArgsBase from poc_kl/mi400/fmha_fwd_f16/fmha_fwd_f16.cpp
+    // (132 B packed).  Field naming follows the poc_kl source-of-truth.
+    KernelArgs args;
+    memset(&args, 0, sizeof(args));
+    args.d_addr     = out->data_ptr();
+    args.q_addr     = q->data_ptr();
+    args.k_addr     = k->data_ptr();
+    args.v_addr     = v->data_ptr();
+    args.lse_addr   = lse->data_ptr();
+    args.scalar     = softmax_scale;
+    args.q_seq_len  = q_seq_len;
+    args.q_seqs     = stride_q_seq;
+    args.q_ts       = stride_q_tg;
+    args.q_hs       = stride_q_head;
+    args.q_bas      = stride_q_batch;
+    args.gqa        = gqa;
+    args.k_seqs     = stride_k_seq;
+    args.k_hs       = stride_k_head;
+    args.k_bas      = stride_k_batch;
+    // s_opt SGPR: packs three host-side switches.  Bit layout matches
+    // poc_kl/.../fmha_fwd_f16.cpp::opt_packed and the S_OPT_BIT_* defines:
     //   bit0: reverse_kv   (compile-time gated by CAS_MASK build; ignored by mask=0 kernels)
     //   bit1: double_q     (compile-time gated by DOUBLE_Q   build; ignored by non-_dq kernels)
     //   bit2: remap_xy     (must be 1 — we swap gdx/gdy at launch below)
-    // 7 = 0b111 enables all three.  Safe for the four shipped _brd_rxy /
-    // _cas_brd_rxy [_sink] .co binaries because bits 0/1 are compile-time
+    // 7 = 0b111 enables all three.  Safe for the four shipped _rxy_brd /
+    // _rxy_cas_brd [_sink] .co binaries because bits 0/1 are compile-time
     // gated off in those builds; bit2 matches the gdx/gdy swap on launch.
-    args.opt             = 7;
-    args.lse             = return_lse ? 1 : 0;
-    args.kv_seq_len      = kv_seq_len;
-    args.qk_head_dim     = qk_head_dim;
-    args.v_head_dim      = v_head_dim;
-    args.q_head_num      = q_head_num;
-    args.stride_v_seq    = stride_v_seq;
-    args.stride_v_head   = stride_v_head;
-    args.stride_v_batch  = stride_v_batch;
-    args.stride_o_seq    = stride_o_seq;
-    args.stride_o_head   = stride_o_head;
-    args.stride_o_batch  = stride_o_batch;
-    args.ptr_QSeq        = nullptr;
-    args.ptr_KSeq        = nullptr;
-    args.stride_lse_head = stride_lse_head;
-    args.ptr_QSeqPad     = nullptr;
-    args.ptr_KSeqPad     = nullptr;
-    args.ptr_SINK        = sink->data_ptr();
+    args.opt        = 7;
+    args.lse        = return_lse ? 1 : 0;
+    args.kv_seq_len = kv_seq_len;
+    args.q_head_num = q_head_num;
+    args.v_seqs     = stride_v_seq;
+    args.v_hs       = stride_v_head;
+    args.v_bas      = stride_v_batch;
+    args.d_seqs     = stride_o_seq;
+    args.d_hs       = stride_o_head;
+    args.d_bas      = stride_o_batch;
+    args.lse_hs     = stride_lse_head;
+    args.sink_addr  = sink->data_ptr();
 
     size_t arg_size = sizeof(args);
 

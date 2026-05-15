@@ -127,17 +127,27 @@ def _ref_attn(q, k, v, *, is_causal: bool, sink: "Optional[torch.Tensor]" = None
 
 
 def _cmp(a: torch.Tensor, b: torch.Tensor, *, rtol=1e-2, atol=1e-2, msg: str = ""):
-    """bf16-safe wrapper around checkAllclose.
+    """bf16-safe wrapper around checkAllclose, but **failing** on mismatch.
+
+    `aiter.test_common.checkAllclose` only logs a warning when the two
+    tensors disagree -- it never raises -- so the surrounding test would
+    PASS silently even with NaN-filled outputs.  This wrapper forwards the
+    diff metadata to checkAllclose (for the nicely-formatted diff log),
+    then explicitly fails the test using `torch.testing.assert_close` so
+    that pytest reports a real failure on any mismatch or NaN.
 
     On gfx1250 + ROCm 7.13 some bf16 element-wise GPU ops (isnan / isclose /
     contiguous) deadlock when invoked right after a custom ASM kernel.  The
     deadlock is unrelated to fmha_fwd_f16 itself (it has been reproduced with
     pure-PyTorch programs).  As a workaround we cast both tensors to fp32 on
-    CPU before comparing — this avoids triggering the buggy GPU bf16 path.
+    CPU before comparing -- this avoids triggering the buggy GPU bf16 path.
     """
     a32 = a.detach().float().cpu()
     b32 = b.detach().float().cpu()
+    # First: produce the nice diff log if not all-close (warning! / failed!).
     checkAllclose(a32, b32, rtol=rtol, atol=atol, msg=msg)
+    # Then: enforce a hard failure.  equal_nan=False so any NaN is a mismatch.
+    torch.testing.assert_close(a32, b32, rtol=rtol, atol=atol, msg=msg)
 
 
 def _nrms(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -301,20 +311,31 @@ def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("batch", [1, 2])
-@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize(
-    "hq,hk,sq,sk",
+    "head_dim,hq,hk,sq,sk,batch",
     [
-        # Shapes from run.sh aligned tests: kv_head_num=4, gqa=16
-        # → q_head_num = 4 * 16 = 64
-        (8, 1, 128, 2048),  # aligned (test_d64 / test_d128)
-        (8, 1, 130, 2048),  # q unaligned: sq not mult of 128
-        (8, 1, 128, 2300),  # kv unaligned: sk not mult of 256
+        # ----- Small shapes (cheap, GQA-light) ---------------------------
+        # Catch unaligned-sq / unaligned-sk corner cases without paying
+        # the cost of materializing the full [b, h, sq, sk] fp32 attn
+        # matrix in _ref_attn.
+        (64,  8, 1, 128, 2048, 1),  # D64  aligned
+        (64,  8, 1, 128, 2048, 2),
+        (64,  8, 1, 130, 2048, 1),  # D64  q-unaligned (sq not mult of 128)
+        (64,  8, 1, 128, 2300, 1),  # D64  kv-unaligned (sk not mult of 256)
+        (128, 8, 1, 128, 2048, 1),  # D128 aligned
+        (128, 8, 1, 128, 2048, 2),
+        (128, 8, 1, 130, 2048, 1),  # D128 q-unaligned
+        (128, 8, 1, 128, 2300, 1),  # D128 kv-unaligned
+        # ----- Large shapes aligned to run.sh perf_v4_d64 / perf_v4_d128 -
+        # Same memory pressure as test_fmha_fwd_f16_perf, batch=1 only
+        # because the reference path's fp32 attn matrix would otherwise
+        # exceed device memory (D64 batch=2 sq=sk=8192 → 32 GB).
+        (64,  64, 8, 8192, 8192, 1),  # D64  perf-sized, aligned
+        (128, 64, 4, 4096, 4096, 1),  # D128 perf-sized, aligned
     ],
 )
-def test_fmha_fwd_f16_correctness(batch, hq, hk, sq, sk, head_dim, is_causal):
+def test_fmha_fwd_f16_correctness(head_dim, hq, hk, sq, sk, batch, is_causal):
     if get_gfx() not in ["gfx1250"]:
         return
     device = "cuda"
@@ -348,12 +369,52 @@ def test_fmha_fwd_f16_correctness(batch, hq, hk, sq, sk, head_dim, is_causal):
         sink=sink,
         via="public",
     )
+
+    # Pinpoint NaN/Inf source: check kernel outputs BEFORE running the
+    # reference, so that a kernel-produced NaN is flagged independently
+    # of any reference-path issue.  Move to fp32 CPU first to avoid the
+    # gfx1250 bf16 element-wise deadlock noted near the top of this file.
+    _ok = out_kernel.detach().float().cpu()
+    _ls = lse_asm.detach().float().cpu()
+    _shape_msg = (
+        f"d={head_dim} causal={is_causal} b={batch} sq={sq} sk={sk}"
+    )
+    assert not _ok.isnan().any().item(), (
+        f"KERNEL out contains NaN [{_shape_msg}] -- kernel-side bug"
+    )
+    assert not _ok.isinf().any().item(), (
+        f"KERNEL out contains Inf [{_shape_msg}] -- kernel-side bug"
+    )
+    assert not _ls.isnan().any().item(), (
+        f"KERNEL lse contains NaN [{_shape_msg}] -- kernel-side bug"
+    )
+    assert not _ls.isinf().any().item(), (
+        f"KERNEL lse contains Inf [{_shape_msg}] -- kernel-side bug"
+    )
+
     out_ref, lse_ref = run_ref(q, k, v, is_causal=is_causal, sink=sink)
+
+    # Likewise sanity-check the reference before comparing.  A NaN here
+    # indicates a reference-path issue (e.g. softmax underflow at a corner
+    # case the kernel handles correctly).
+    _or = out_ref.detach().float().cpu()
+    _lr = lse_ref.detach().float().cpu()
+    assert not _or.isnan().any().item(), (
+        f"REFERENCE out contains NaN [{_shape_msg}] -- ref-path issue"
+    )
+    assert not _or.isinf().any().item(), (
+        f"REFERENCE out contains Inf [{_shape_msg}] -- ref-path issue"
+    )
+    assert not _lr.isnan().any().item(), (
+        f"REFERENCE lse contains NaN [{_shape_msg}] -- ref-path issue"
+    )
+    assert not _lr.isinf().any().item(), (
+        f"REFERENCE lse contains Inf [{_shape_msg}] -- ref-path issue"
+    )
 
     nrms_o = _nrms(out_kernel, out_ref)
     print(
-        f"[corr d={head_dim} causal={is_causal} b={batch} sq={sq} sk={sk}] "
-        f"nrms(out)={nrms_o:.3e}"
+        f"[corr {_shape_msg}] nrms(out)={nrms_o:.3e}"
     )
 
     _cmp(
@@ -569,8 +630,14 @@ def test_fmha_fwd_f16_perf(head_dim, is_causal):
     device = "cuda"
     torch.manual_seed(0)
 
-    # perf_d64 / perf_d128 in run.sh: batch=2 kv_head_num=8 gqa=8 -> hq=64
-    sq, batch, hq, hk, sk = 8192, 2, 64, 8, 8192
+    # Shapes aligned with run.sh perf_v?_d64 / perf_v?_d128:
+    #   D64  : batch=2 kv_head_num=8  gqa=8  -> hq=64, hk=8,  sq=sk=8192
+    #   D128 : batch=2 kv_head_num=4  gqa=16 -> hq=64, hk=4,  sq=sk=4096
+    # (D128 sq/sk is halved because per-head buffer doubles vs D64.)
+    if head_dim == 64:
+        sq, batch, hq, hk, sk = 8192, 2, 64, 8, 8192
+    else:  # head_dim == 128
+        sq, batch, hq, hk, sk = 4096, 2, 64, 4, 4096
     q, k, v = make_qkv_bshd(
         layout=2,
         sq=sq,
