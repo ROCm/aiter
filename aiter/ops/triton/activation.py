@@ -122,7 +122,6 @@ def act_mul_and_mxfp4_quant(
         num_warps=NUM_WARPS,
         waves_per_eu=0,
         num_stages=1,
-        DO_QUANT=True,
     )
 
     return x_fp4, blockscale_e8m0

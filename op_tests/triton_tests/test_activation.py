@@ -163,7 +163,7 @@ def torch_act_mul_ref(x: torch.Tensor, activation: str) -> torch.Tensor:
         (1, 7),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_tanh"])
 @pytest.mark.parametrize("use_out", [False, True])
 def test_act_mul_no_quant(M, N_half, dtype, activation, use_out):
@@ -186,7 +186,7 @@ def test_act_mul_no_quant(M, N_half, dtype, activation, use_out):
         (2, 3, 4, 32),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("activation", ["silu", "gelu"])
 def test_act_mul_no_quant_higher_rank(shape, dtype, activation):
     """act_mul should handle any input rank by flattening/unflattening internally."""

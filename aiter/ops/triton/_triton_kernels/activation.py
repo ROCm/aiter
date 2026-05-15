@@ -100,7 +100,6 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
     scaleM_pad: tl.constexpr,
     scaleN_pad: tl.constexpr,
     SHUFFLE: tl.constexpr,
-    DO_QUANT: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     start_n = tl.program_id(1) * NUM_ITER
@@ -135,74 +134,60 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
             ).to(tl.float32)
 
         x = _apply_activation_from_str(a, ACTIVATION) * b
-        if DO_QUANT:
-            out_tensor, bs_e8m0 = _mxfp4_quant_op(
-                x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
-            )
+        out_tensor, bs_e8m0 = _mxfp4_quant_op(
+            x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+        )
 
-            out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-            out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
-            out_offs = (
-                out_offs_m[:, None] * stride_x_fp4_m
-                + out_offs_n[None, :] * stride_x_fp4_n
-            )
+        out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
+        out_offs = (
+            out_offs_m[:, None] * stride_x_fp4_m
+            + out_offs_n[None, :] * stride_x_fp4_n
+        )
 
-            if EVEN_M_N:
-                tl.store(x_out_ptr + out_offs, out_tensor)
-            else:
-                out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
-                tl.store(x_out_ptr + out_offs, out_tensor, mask=out_mask)
-
-            bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-            bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
-            if SHUFFLE:
-                bs_offs_0 = bs_offs_m[:, None] // 32
-                bs_offs_1 = bs_offs_m[:, None] % 32
-                bs_offs_2 = bs_offs_1 % 16
-                bs_offs_1 = bs_offs_1 // 16
-                bs_offs_3 = bs_offs_n[None, :] // 8
-                bs_offs_4 = bs_offs_n[None, :] % 8
-                bs_offs_5 = bs_offs_4 % 4
-                bs_offs_4 = bs_offs_4 // 4
-                bs_offs = (
-                    bs_offs_1
-                    + bs_offs_4 * 2
-                    + bs_offs_2 * 2 * 2
-                    + bs_offs_5 * 2 * 2 * 16
-                    + bs_offs_3 * 2 * 2 * 16 * 4
-                    + bs_offs_0 * 2 * 16 * scaleN
-                )
-                bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
-                bs_mask = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[
-                    None, :
-                ]
-                bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
-            else:
-                bs_offs = (
-                    bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-                )
-                bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
-            if EVEN_M_N:
-                tl.store(bs_ptr + bs_offs, bs_e8m0)
-            else:
-                tl.store(
-                    bs_ptr + bs_offs,
-                    bs_e8m0,
-                    mask=bs_mask,
-                )
+        if EVEN_M_N:
+            tl.store(x_out_ptr + out_offs, out_tensor)
         else:
-            out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-            out_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-            out_offs = (
-                out_offs_m[:, None] * stride_x_fp4_m
-                + out_offs_n[None, :] * stride_x_fp4_n
+            out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
+            tl.store(x_out_ptr + out_offs, out_tensor, mask=out_mask)
+
+        bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
+        if SHUFFLE:
+            bs_offs_0 = bs_offs_m[:, None] // 32
+            bs_offs_1 = bs_offs_m[:, None] % 32
+            bs_offs_2 = bs_offs_1 % 16
+            bs_offs_1 = bs_offs_1 // 16
+            bs_offs_3 = bs_offs_n[None, :] // 8
+            bs_offs_4 = bs_offs_n[None, :] % 8
+            bs_offs_5 = bs_offs_4 % 4
+            bs_offs_4 = bs_offs_4 // 4
+            bs_offs = (
+                bs_offs_1
+                + bs_offs_4 * 2
+                + bs_offs_2 * 2 * 2
+                + bs_offs_5 * 2 * 2 * 16
+                + bs_offs_3 * 2 * 2 * 16 * 4
+                + bs_offs_0 * 2 * 16 * scaleN
             )
-            x_out = x.to(x_out_ptr.dtype.element_ty)
-            if EVEN_M_N:
-                tl.store(x_out_ptr + out_offs, x_out)
-            else:
-                out_mask = (out_offs_m < M)[:, None] & (out_offs_n < N)[None, :]
-                tl.store(x_out_ptr + out_offs, x_out, mask=out_mask)
+            bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
+            bs_mask = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[
+                None, :
+            ]
+            bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
+        else:
+            bs_offs = (
+                bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+            )
+            bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
+        if EVEN_M_N:
+            tl.store(bs_ptr + bs_offs, bs_e8m0)
+        else:
+            tl.store(
+                bs_ptr + bs_offs,
+                bs_e8m0,
+                mask=bs_mask,
+            )
 
 
 @triton.heuristics(
