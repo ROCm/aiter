@@ -470,8 +470,7 @@ __global__ void act_and_mul_quant_kernel(
     auto buffer_out = opus::make_gmem<DTYPE_O_STORE>(out_base, oob_o * sizeof(DTYPE_O_STORE));
 
     constexpr float inverted_DTYPE_MAX =
-        is_fp4 ? 0.25f
-               : (1.f / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        (1.f / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
     const int reduce_thread_size = group_size / VEC_SIZE_I;
     const int tid                = threadIdx.x;
@@ -546,10 +545,9 @@ __global__ void act_and_mul_quant_kernel(
 
     float max_val = multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
 
-    if constexpr(is_fp4)
-        max_val = aiter::fp4_f32_to_e8m0_scale(max_val);
-
-    float quant_scale = max_val * inverted_DTYPE_MAX;
+    float quant_scale = is_fp4
+        ? aiter::fp4_f32_to_e8m0_scale(max_val)
+        : max_val * inverted_DTYPE_MAX;
 
     if(tid % reduce_thread_size == 0 && row_offset < d)
     {

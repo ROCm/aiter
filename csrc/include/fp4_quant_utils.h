@@ -6,22 +6,24 @@
 
 namespace aiter {
 
-// Round-to-power-of-2 with 1.5x threshold for E8M0 scale derivation.
-// Matches fp4_utils.f32_to_e8m0 in Python.
-//
-// If the float mantissa >= 0.5 (i.e. value >= 1.5 x 2^k for some k),
-// the exponent is bumped by 1, rounding up to the next power of 2.
-// Otherwise, the value is truncated down (floor) to a power of 2.
-//
-// Special: Inf/NaN (exponent == 0xFF) passes through unchanged.
-//          Denormal with mantissa == exactly 0.5 is not bumped (guarded by exponent > 0).
-__device__ __forceinline__ float fp4_f32_to_e8m0_scale(float x)
+// OCP standard: E8M0 scale = floor_pow2(amax / 4) = floor_pow2(amax) / 4.
+// ~37% of random inputs will have amax > scale * 6 (max clipping).
+__device__ __forceinline__ float fp4_f32_to_e8m0_scale(float amax)
 {
-    uint32_t u32      = __builtin_bit_cast(uint32_t, x);
+    constexpr float inv_fp4_pow2_max = 0.25f; // 1 / max_pow2(FP4 E2M1) = 1/4
+    uint32_t u32      = __builtin_bit_cast(uint32_t, amax * inv_fp4_pow2_max);
     uint32_t exponent = (u32 >> 23) & 0xFFu;
-    if(exponent == 0xFFu)
-        return __builtin_bit_cast(float, exponent << 23);
-    if((u32 & 0x400000u) && ((u32 & 0x200000u) || (u32 & 0x1FFFFFu) || exponent))
+    return __builtin_bit_cast(float, exponent << 23);
+}
+
+// NV ROUND_UP / DSv4 Pro / FlashInfer: E8M0 scale = ceil_pow2(amax / 6).
+// Guarantees 0% max-value clipping: scale * 6 >= amax always holds.
+__device__ __forceinline__ float fp4_f32_to_e8m0_scale_roundup(float amax)
+{
+    constexpr float inv_fp4_max = 1.0f / 6.0f;
+    uint32_t u32      = __builtin_bit_cast(uint32_t, amax * inv_fp4_max);
+    uint32_t exponent = (u32 >> 23) & 0xFFu;
+    if(exponent < 0xFFu && (u32 & 0x7FFFFFu))
         exponent += 1;
     return __builtin_bit_cast(float, exponent << 23);
 }

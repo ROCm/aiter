@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from . import dtypes
 from torch import Tensor
@@ -50,10 +50,6 @@ def f32_to_e8m0(x):
     u32 = x.view(torch.int32)
     exponent = ((u32 >> 23) & 0xFF).view(torch.uint32).to(torch.uint8)
     nan_case = exponent == 0xFF
-    round_case = ((u32 & 0x400000) > 0) & (
-        ((u32 & 0x200000) > 0) | ((u32 & 0x1FFFFF) > 0) | (exponent > 0)
-    )
-    exponent[round_case] += 1
     exponent[nan_case] = 0xFF
     return exponent.view(dtypes.fp8_e8m0)
 

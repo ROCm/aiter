@@ -51,9 +51,7 @@ __global__ void add_rmsnorm_quant_kernel(
         static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
         static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
         constexpr float inverted_DTYPE_MAX =
-            std::is_same_v<DTYPE_O, opus::fp4_t>
-                ? 0.25
-                : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+            (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
         DTYPE_I* input_ptr = input + idx * static_cast<int64_t>(input_stride);
         DTYPE_O_STORE* out_ptr;
         const int oob_i = (n + ooba_i - 1) / ooba_i * ooba_i;
@@ -209,11 +207,9 @@ __global__ void add_rmsnorm_quant_kernel(
                 {
                     int reduce_thread_size = group_size / thread_data_size;
                     float max= multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
-                    if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
-                    {
-                        max = aiter::fp4_f32_to_e8m0_scale(max);
-                    }
-                    quant_scale = max * inverted_DTYPE_MAX;
+                    quant_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
+                        ? aiter::fp4_f32_to_e8m0_scale(max)
+                        : max * inverted_DTYPE_MAX;
                     if(threadIdx.x % reduce_thread_size == 0 && (threadIdx.x * thread_data_size) < n)
                     {
                         int64_t x = idx;

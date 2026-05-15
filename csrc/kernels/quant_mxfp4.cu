@@ -5,13 +5,19 @@
 #include "aiter_dispatch.h"
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
+#include "fp4_quant_utils.h"
 #include "quant.h"
 
 namespace aiter {
 
-// Even: e8m0 scale via even-rounding group max to nearest power-of-2.
-//   gfx950: HW builtin (exact RNE); gfx942: SW fallback (round-half-away).
-enum class MxFp4RoundMode : int { Even = 0 };
+// Scale rounding modes for MXFP4 quantization.
+// Ref: Quark/quark/torch/quantization/utils.py (RoundMode enum)
+//      Quark/quark/torch/kernel/mx/triton.py  (_compute_quant_and_scale)
+enum class MxFp4RoundMode : int {
+    RoundDown = 0, // OCP standard: floor_pow2(amax) / 4. ~37% max clipping.
+    RoundUp   = 1, // DSv4 Pro : ceil_pow2(amax / 6). 0% clipping.
+    Even      = 2, // Quark EVEN: round_pow2_1.75(amax) / 4. ~21% max clipping.
+};
 
 #define EVEN_ROUND_FP32_SIGN_EXP_MASK 0x7F800000u
 #define EVEN_ROUND_VAL_TO_ADD         0x00200000u
@@ -122,7 +128,13 @@ void quant_mxfp4_kernel(
     float dequant_scale;
     uint8_t biased_exp;
 
-    if constexpr (rmode == MxFp4RoundMode::Even) {
+    if constexpr (rmode == MxFp4RoundMode::RoundDown) {
+        dequant_scale = aiter::fp4_f32_to_e8m0_scale(group_max);
+        biased_exp    = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
+    } else if constexpr (rmode == MxFp4RoundMode::RoundUp) {
+        dequant_scale = aiter::fp4_f32_to_e8m0_scale_roundup(group_max);
+        biased_exp    = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
+    } else if constexpr (rmode == MxFp4RoundMode::Even) {
         max_bits          = (max_bits + EVEN_ROUND_VAL_TO_ADD) & EVEN_ROUND_FP32_SIGN_EXP_MASK;
         float max_rounded = __uint_as_float(max_bits);
 
@@ -229,7 +241,8 @@ void quant_mxfp4(
     AITER_CHECK(out_packed.is_contiguous(), __func__, " expected out_packed to be contiguous");
     AITER_CHECK(out_scale.is_contiguous(), __func__, " expected out_scale to be contiguous");
     AITER_CHECK(group_size == 32, __func__, " expected group_size=32");
-    AITER_CHECK(round_mode == 0, __func__, " only Even round mode (0) is supported");
+    AITER_CHECK(round_mode >= 0 && round_mode <= 2, __func__,
+                " round_mode must be 0 (RoundDown/OCP), 1 (RoundUp/DSv4 Pro), or 2 (Even/Quark)");
     AITER_CHECK(!(e8m0_shuffle && a16w4_shuffle),
                 __func__, " e8m0_shuffle and a16w4_shuffle are mutually exclusive");
     AITER_CHECK(!shuffle_weight || e8m0_shuffle || a16w4_shuffle,
@@ -265,7 +278,14 @@ void quant_mxfp4(
 
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
         inp.dtype(), "quant_mxfp4_kernel", [&] {
-            MXFP4_DISPATCH(scalar_t, MxFp4RoundMode::Even);
+            switch (static_cast<MxFp4RoundMode>(round_mode)) {
+            case MxFp4RoundMode::RoundDown:
+                MXFP4_DISPATCH(scalar_t, MxFp4RoundMode::RoundDown); break;
+            case MxFp4RoundMode::RoundUp:
+                MXFP4_DISPATCH(scalar_t, MxFp4RoundMode::RoundUp); break;
+            case MxFp4RoundMode::Even:
+                MXFP4_DISPATCH(scalar_t, MxFp4RoundMode::Even); break;
+            }
         });
 }
 

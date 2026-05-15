@@ -87,16 +87,8 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
     using DTYPE_O_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
     constexpr int interleave_size = WARP_SIZE;
-    constexpr float inverted_dtype_max = []() constexpr {
-        if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
-        {
-            return 0.25f;
-        }
-        else
-        {
-            return 1.0f / static_cast<float>(opus::finfo<DTYPE_O>::max());
-        }
-    }();
+    constexpr float inverted_dtype_max =
+        (1.0f / static_cast<float>(opus::finfo<DTYPE_O>::max()));
     static_assert(!PER_TOKEN_QUANT || !std::is_same_v<DTYPE_O, opus::fp4_t>,
                   "per-token quant only supports fp8 output");
 
@@ -293,11 +285,9 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             {
                 constexpr int reduce_thread_size = ReduceThreadSize;
                 float max = multithread_reduce_max_dpp<ReduceThreadSize>(thread_max);
-                if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
-                {
-                    max = aiter::fp4_f32_to_e8m0_scale(max);
-                }
-                quant_scale = max * inverted_dtype_max;
+                quant_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
+                    ? aiter::fp4_f32_to_e8m0_scale(max)
+                    : max * inverted_dtype_max;
                 if((tid % reduce_thread_size == 0) && ((tid * thread_data_size) < n1))
                 {
                     int g = tid / reduce_thread_size;

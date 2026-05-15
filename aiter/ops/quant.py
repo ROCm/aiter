@@ -710,14 +710,25 @@ def quant_mxfp4_hip(
     """MXFP4 quantization with optional weight/scale shuffle.
 
     Args:
-        round_mode: 0 = Even — e8m0 scale via even-rounding group max
-            to nearest power-of-2. gfx950 uses HW builtin (exact RNE);
-            gfx942 uses SW fallback (round-half-away).
+        round_mode: Scale rounding strategy (aligned with Quark RoundMode):
+            0 = RoundDown -- OCP standard: floor_pow2(amax) / 4. ~37% max clipping.
+            1 = RoundUp   --  DSv4 Pro: ceil_pow2(amax / 6).
+                             0% max clipping.
+            2 = Even      -- triton: round_pow2_1.75(amax) / 4. ~21% max clipping.
+                             gfx950 uses HW builtin (exact RNE);
+                             gfx942 uses SW fallback (round-half-away).
+        Ref: Quark/quark/torch/quantization/utils.py  (RoundMode enum)
+             Quark/quark/torch/kernel/mx/triton.py   (_compute_quant_and_scale)
     """
     assert x.is_contiguous() and x.dim() == 2
     assert x.dtype in (torch.float16, torch.bfloat16)
     rows, cols = x.shape
     assert cols % group_size == 0
+
+    # RoundDown (OCP) without a16w4/gate_up/shuffle_weight ->
+    # route to dynamic_per_group_scaled_quant_fp4 (the default FP4 quant path).
+    if round_mode == 0 and not a16w4_shuffle and not gate_up and not shuffle_weight:
+        return per_1x32_f4_quant_hip(x, shuffle=e8m0_shuffle)
 
     fp4x2 = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
     fp8_e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)

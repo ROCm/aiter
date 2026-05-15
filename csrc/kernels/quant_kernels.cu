@@ -65,9 +65,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     static constexpr int32_t vec_size_o =
         std::is_same_v<DTYPE_O, opus::fp4_t> ? thread_data_size / 2 : thread_data_size;
     const float inverted_DTYPE_MAX =
-        std::is_same_v<DTYPE_O, opus::fp4_t>
-            ? 0.25
-            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
     static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
     const int64_t oob_o = (ori_rows * ori_cols + ooba_o - 1) / ooba_o * ooba_o;
@@ -82,7 +80,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
 
     float inverted_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                               ? aiter::fp4_f32_to_e8m0_scale(absMax) * inverted_DTYPE_MAX
+                               ? aiter::fp4_f32_to_e8m0_scale(absMax)
                                : absMax * inverted_DTYPE_MAX;
     row_offset           = std::is_same_v<DTYPE_O, opus::fp4_t>
                                ? groupId * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
@@ -138,9 +136,7 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     static constexpr int32_t load_chunk_bytes = sizeof(DTYPE_I) * vec_size_i % 16 == 0 ? 16 : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4);
     using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
     const float inverted_DTYPE_MAX =
-        std::is_same_v<DTYPE_O, opus::fp4_t>
-            ? 0.25
-            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
     const int64_t row_offset        = blockIdx.x * cols;
     auto const* ptr_i               = reinterpret_cast<DTYPE_I const*>(input + row_offset);
@@ -192,7 +188,7 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     absMax = block_reduce<float, hipcub::Max, BlockSize, true>(absMax, hipcub::Max());
 
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                          ? aiter::fp4_f32_to_e8m0_scale(absMax) * inverted_DTYPE_MAX
+                          ? aiter::fp4_f32_to_e8m0_scale(absMax)
                           : absMax * inverted_DTYPE_MAX;
     return std::make_tuple(row_scale, reinterpret_cast<DTYPE_I*>(&vec_cur));
 }
@@ -384,9 +380,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
         std::is_same_v<DTYPE_O, opus::fp4_t> ? vec_size_i / 2 : vec_size_i;
     using vec_s = opus::vector_t<float, vec_size_i>;
     const float inverted_DTYPE_MAX =
-        std::is_same_v<DTYPE_O, opus::fp4_t>
-            ? 0.25
-            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
     auto const* ptr_smscale = reinterpret_cast<float const*>(smooth_scale + smscale_map_idx * cols);
     auto const* smscale_vecs = reinterpret_cast<vec_s const*>(ptr_smscale);
@@ -406,7 +400,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
     absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
 
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                          ? aiter::fp4_f32_to_e8m0_scale(absMax) * inverted_DTYPE_MAX
+                          ? aiter::fp4_f32_to_e8m0_scale(absMax)
                           : absMax * inverted_DTYPE_MAX;
     return std::make_tuple(row_scale, reinterpret_cast<float*>(&smscale_cur));
 }
@@ -1393,9 +1387,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
         using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
         using vec_f = opus::vector_t<float, vec_size_i>;
         const float inverted_DTYPE_MAX =
-            std::is_same_v<DTYPE_O, opus::fp4_t>
-                ? 0.25
-                : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+            (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
         auto buffer_smscale = opus::make_gmem<float>(smooth_scale + expert_id * cols, cols * sizeof(float));
         vec_f smscale = load_vector_nbytes<float, thread_data_size, 16>(buffer_smscale, threadIdx.x * vec_size_i);
         int token_id_list = token_id_info_list & 0xFFFFFF;
@@ -1427,7 +1419,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
             absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
 
             float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                                ? aiter::fp4_f32_to_e8m0_scale(absMax) * inverted_DTYPE_MAX
+                                ? aiter::fp4_f32_to_e8m0_scale(absMax)
                                 : absMax * inverted_DTYPE_MAX;
             
             int out_token_idx;
@@ -1597,9 +1589,7 @@ __global__ void mxfp4_quant_moe_sort_kernel(
     using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
     using vec_f = opus::vector_t<float, vec_size_i>;
     const float inverted_DTYPE_MAX =
-        std::is_same_v<DTYPE_O, opus::fp4_t>
-            ? 0.25
-            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
     const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
     const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
 
@@ -1648,7 +1638,7 @@ __global__ void mxfp4_quant_moe_sort_kernel(
             absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
 
             float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                                  ? aiter::fp4_f32_to_e8m0_scale(absMax) * inverted_DTYPE_MAX
+                                  ? aiter::fp4_f32_to_e8m0_scale(absMax)
                                   : absMax * inverted_DTYPE_MAX;
 
             const int sorted_row = sorted_ids_base + i * tgs_per_block_m;

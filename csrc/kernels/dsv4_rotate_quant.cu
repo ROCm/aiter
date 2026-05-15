@@ -5,6 +5,7 @@
 #include "aiter_dispatch.h"
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
+#include "fp4_quant_utils.h"
 #include "dsv4_rotate_quant.h"
 #include "rocprim/rocprim.hpp"
 #include <hipcub/hipcub.hpp>
@@ -163,19 +164,7 @@ __global__ void hadamard_rotate_activation_fp4quant_inplace_kernel(DTYPE_I* __re
         int num_thread_per_group = group_size / vec_size;
         absMax                  = multithread_reduce(absMax, max_op, num_thread_per_group);
 
-        constexpr float inverted_DTYPE_MAX = 1.0f / fp4_max;
-        auto ceil_pow2 = [](float tmp) {
-            uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-            uint32_t exponent = (u32 >> 23) & 0b11111111;
-            if(exponent == 0b11111111)
-            {
-                return __builtin_bit_cast(float, exponent << 23);
-            }
-            if(u32 & 0x7FFFFF)
-                exponent += 1;
-            return __builtin_bit_cast(float, exponent << 23);
-        };
-        float scale = ceil_pow2(absMax * inverted_DTYPE_MAX);
+        float scale = aiter::fp4_f32_to_e8m0_scale_roundup(absMax);
 
         auto a_fp4       = scaled_cast<opus::fp4_t>(af, scale);
         halfxvec_t a_out = scaled_cast<DTYPE_I>(a_fp4, scale);
@@ -398,19 +387,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_inplace_kernel(DTYPE_I*
         int num_thread_per_group = group_size / vec_size;
         absMax                  = multithread_reduce(absMax, max_op, num_thread_per_group);
 
-        constexpr float inverted_DTYPE_MAX = 1.0f / fp4_max;
-        auto ceil_pow2 = [](float tmp) {
-            uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-            uint32_t exponent = (u32 >> 23) & 0b11111111;
-            if(exponent == 0b11111111)
-            {
-                return __builtin_bit_cast(float, exponent << 23);
-            }
-            if(u32 & 0x7FFFFF)
-                exponent += 1;
-            return __builtin_bit_cast(float, exponent << 23);
-        };
-        float scale = ceil_pow2(absMax * inverted_DTYPE_MAX);
+        float scale = aiter::fp4_f32_to_e8m0_scale_roundup(absMax);
 
         auto a_fp4       = scaled_cast<opus::fp4_t>(af, scale);
         halfxvec_t a_out = scaled_cast<DTYPE_I>(a_fp4, scale);
