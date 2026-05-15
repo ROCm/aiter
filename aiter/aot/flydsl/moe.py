@@ -668,8 +668,6 @@ def _precompile_to_cache(
 
             _n_in = model_dim
             _k_in = inter_dim
-            if a_dtype == "fp4":
-                _k_in *= 2
 
             if is_fp4_weight:
                 args = _s2_args_fp4(
@@ -710,7 +708,7 @@ def _precompile_to_cache(
 
             exe = compile_flydsl_moe_stage2(
                 model_dim=model_dim,
-                inter_dim=_k_in,
+                inter_dim=inter_dim,
                 experts=E,
                 topk=topk,
                 tile_m=tile_m,
