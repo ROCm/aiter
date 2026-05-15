@@ -104,6 +104,7 @@ def indexer_k_quant_and_cache(
     slot_mapping: Tensor,
     quant_block_size: int,
     scale_fmt: str,
+    preshuffle: bool = False,
 ) -> None: ...
 
 
@@ -114,6 +115,7 @@ def cp_gather_indexer_k_quant_cache(
     dst_scale: Tensor,
     block_table: Tensor,
     cu_seq_lens: Tensor,
+    preshuffle: bool = False,
 ) -> None: ...
 
 

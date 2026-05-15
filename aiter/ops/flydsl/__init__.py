@@ -12,7 +12,7 @@ from packaging.version import Version
 
 from .utils import is_flydsl_available
 
-_MIN_FLYDSL_VERSION = Version("0.1.3")
+_MIN_FLYDSL_VERSION = Version("0.1.5.dev515")
 
 __all__ = [
     "is_flydsl_available",

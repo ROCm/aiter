@@ -29,6 +29,7 @@ from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.utility.base_tuner import GemmCommonTuner
@@ -506,6 +507,13 @@ class Gemm:
                 )
                 if self.k / splitK < subK:
                     break
+                # splitK kernels use a semaphore array of size gdx*gdy; skip
+                # candidates where the grid exceeds the semaphore workspace limit.
+                if splitK > 1:
+                    gdx = (self.n + tile_n - 1) // tile_n
+                    gdy = (self.m + tile_m - 1) // tile_m
+                    if gdx * gdy > ASM_SPLITK_MAX_GRID:
+                        continue
                 task_asm.append(
                     (
                         info,
