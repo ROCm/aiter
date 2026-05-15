@@ -92,6 +92,13 @@ namespace py = pybind11;
           py::arg("input"),                             \
           py::arg("expert_ids"),                        \
           py::arg("bias"));                             \
+    m.def("gelu_and_mul_bias",                          \
+          &aiter::gelu_and_mul_bias,                    \
+          "GELU gating with per-expert bias.",          \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("expert_ids"),                        \
+          py::arg("bias"));                             \
     m.def("scaled_silu_and_mul",                        \
           &aiter::scaled_silu_and_mul,                  \
           "Activation function used in scaled SwiGLU.", \

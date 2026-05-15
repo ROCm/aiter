@@ -1112,6 +1112,83 @@ void swiglu_and_mul_bias(const aiter_tensor_t& out,        // [..., d]
     });
 }
 
+void gelu_and_mul_bias(const aiter_tensor_t& out,        // [..., d]
+                       const aiter_tensor_t& input,      // [..., 2 * d]
+                       const aiter_tensor_t& expert_ids, // [...]
+                       const aiter_tensor_t& bias)       // [expert, 2 * d]
+{
+    COMPUTE_ACTIVATION_KERNEL_PARAMS
+    AITER_CHECK(input.size(-1) % 2 == 0, "gelu_and_mul_bias expects an even last dimension");
+    AITER_CHECK(out.numel() == num_tokens * d, "gelu_and_mul_bias output shape mismatch");
+    AITER_CHECK(expert_ids.numel() == num_tokens,
+                "gelu_and_mul_bias expert_ids must provide one id per row");
+    AITER_CHECK(bias.size(-1) == input.size(-1),
+                "gelu_and_mul_bias bias width must match the fused gate/up width");
+    AITER_CHECK(bias.dtype() == AITER_DTYPE_fp32, "gelu_and_mul_bias expects fp32 bias");
+    AITER_CHECK(out.device_id == input.device_id && bias.device_id == input.device_id &&
+                    expert_ids.device_id == input.device_id,
+                "gelu_and_mul_bias expects all tensors on the same device");
+    const int64_t num_experts = bias.size(0);
+
+    VLLM_DISPATCH_INTEGRAL_TYPES_rmTorch(expert_ids.dtype(), "gelu_and_mul_bias", [&] {
+        using expert_index_t = scalar_t;
+        auto* expert_ptr = reinterpret_cast<const expert_index_t*>(expert_ids.data_ptr());
+        if(input.dtype() == AITER_DTYPE_fp32)
+        {
+            using input_dtype = opus::fp32_t;
+            auto* in_ptr      = reinterpret_cast<const input_dtype*>(input.data_ptr());
+            auto* bias_ptr    = reinterpret_cast<const input_dtype*>(bias.data_ptr());
+            if(out.dtype() == AITER_DTYPE_bf16)
+            {
+                using output_dtype = opus::bf16_t;
+                auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());
+                DISPATCH_FP32_ACT_BIAS_KERNEL(
+                    aiter::gelu_kernel, expert_index_t, out_ptr, in_ptr, expert_ptr, bias_ptr)
+            }
+            else if(out.dtype() == AITER_DTYPE_fp16)
+            {
+                using output_dtype = opus::fp16_t;
+                auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());
+                DISPATCH_FP32_ACT_BIAS_KERNEL(
+                    aiter::gelu_kernel, expert_index_t, out_ptr, in_ptr, expert_ptr, bias_ptr)
+            }
+            else if(out.dtype() == AITER_DTYPE_fp32)
+            {
+                using output_dtype = opus::fp32_t;
+                auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());
+                DISPATCH_FP32_ACT_BIAS_KERNEL(
+                    aiter::gelu_kernel, expert_index_t, out_ptr, in_ptr, expert_ptr, bias_ptr)
+            }
+            else
+            {
+                AITER_CHECK(false, "Unsupported output type for fp32 input");
+            }
+        }
+        else
+        {
+            AITER_CHECK(input.dtype() == out.dtype(),
+                        "For bf16/fp16 input, output type must match input type");
+            AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "act_and_mul_bias_kernel", [&] {
+                using input_dtype  = typename aiter::hip2opus<scalar_t>::type;
+                using output_dtype = input_dtype;
+                using bias_dtype   = opus::fp32_t;
+                auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());
+                auto* in_ptr       = reinterpret_cast<const input_dtype*>(input.data_ptr());
+                auto* bias_ptr     = reinterpret_cast<const bias_dtype*>(bias.data_ptr());
+                AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(
+                    vec_size,
+                    aiter::act_and_mul_bias_kernel<input_dtype,
+                                                   output_dtype,
+                                                   expert_index_t,
+                                                   bias_dtype,
+                                                   aiter::gelu_kernel<bias_dtype>,
+                                                   VEC_SIZE><<<grid, block, 0, stream>>>(
+                        out_ptr, in_ptr, expert_ptr, bias_ptr, d, num_experts);)
+            });
+        }
+    });
+}
+
 void scaled_silu_and_mul(const aiter_tensor_t& out,   // [..., d]
                          const aiter_tensor_t& input, // [..., 2 * d]
                          const aiter_tensor_t& scale)

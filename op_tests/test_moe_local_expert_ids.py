@@ -2,12 +2,11 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
+import torch.nn.functional as F
 
+import aiter
 from aiter import dtypes
-from aiter.fused_moe import (
-    _add_valid_expert_bias,
-    moe_sorting,
-)
+from aiter.fused_moe import moe_sorting
 from aiter.test_common import checkAllclose
 
 
@@ -61,12 +60,16 @@ def test_moe_sorting_return_local_topk_ids():
     )
 
 
-def test_invalid_expert_bias_is_masked():
-    valid_out = torch.zeros((3, 4), dtype=dtypes.bf16, device="cuda")
+def test_gelu_and_mul_bias_masks_invalid_experts():
+    valid_out = torch.randn((3, 8), dtype=dtypes.bf16, device="cuda")
+    out = torch.empty((3, 4), dtype=dtypes.bf16, device="cuda")
     expert_ids = torch.tensor([-1, 0, 2], dtype=dtypes.i32, device="cuda")
-    bias = torch.arange(8, dtype=dtypes.fp32, device="cuda").view(2, 4)
+    bias = torch.randn((3, 8), dtype=dtypes.fp32, device="cuda")
 
-    actual = _add_valid_expert_bias(valid_out, expert_ids, bias)
-    expected = torch.zeros_like(actual)
-    expected[1] = bias[0].to(actual.dtype)
-    checkAllclose(expected, actual, atol=0, msg="invalid expert bias mask")
+    aiter.gelu_and_mul_bias(out, valid_out, expert_ids, bias)
+
+    expected = torch.zeros_like(out)
+    for row, expert_id in [(1, 0), (2, 2)]:
+        gate, up = (valid_out[row].float() + bias[expert_id]).chunk(2)
+        expected[row] = (F.gelu(gate) * up).to(out.dtype)
+    checkAllclose(expected, out, msg="gelu bias invalid expert mask")

@@ -2624,11 +2624,14 @@ struct MoeSortingMultiPhaseKernel_P3
 
 namespace impl {
 // we use dynamic LDS size here
-OPUS_H constexpr auto moe_sorting_get_smem_size_p23(int num_experts_)
+OPUS_H constexpr auto moe_sorting_get_smem_size_p23(int num_experts_, bool emit_local_topk_ids)
 {
     constexpr opus::index_t kBlockSize     = 256; // hardcoded 256
-    const opus::index_t expert_cumsum_elem = num_experts_ + 1;
-    return (4 + 2 * kBlockSize / opus::get_warp_size() + expert_cumsum_elem) * sizeof(int);
+    const opus::index_t expert_cumsum_elem    = num_experts_ + 1;
+    const opus::index_t local_expert_id_elem = emit_local_topk_ids ? num_experts_ : 0;
+    return (4 + 2 * kBlockSize / opus::get_warp_size() + expert_cumsum_elem +
+            local_expert_id_elem) *
+           sizeof(int);
 }
 } // namespace impl
 
@@ -2650,6 +2653,7 @@ struct MoeSortingMultiPhaseKernel_P23
     using Hargs = MoeSortingHostArgs;
     struct Kargs
     {
+        const void* p_topk_ids;
         const void* p_weights;
         const void* p_local_expert_mask; // [expert]
         const void* p_local_tokens;      // [1]
@@ -2661,6 +2665,7 @@ struct MoeSortingMultiPhaseKernel_P23
         void* p_sorted_token_ids;
         void* p_sorted_weights;
         void* p_moe_buf;
+        void* p_local_topk_ids;
 
         opus::index_t tokens;
         opus::index_t num_experts;
@@ -2679,6 +2684,7 @@ struct MoeSortingMultiPhaseKernel_P23
     OPUS_H static constexpr auto MakeKargs(const Hargs& h)
     {
         Kargs k;
+        k.p_topk_ids          = h.p_topk_ids;
         k.p_weights           = h.p_weights;
         k.p_local_expert_mask = h.p_local_expert_mask;
         k.p_local_tokens      = h.p_local_tokens;
@@ -2692,7 +2698,8 @@ struct MoeSortingMultiPhaseKernel_P23
         k.p_sorted_token_ids = h.p_sorted_token_ids;
         k.p_sorted_weights   = h.p_sorted_weights;
 
-        k.p_moe_buf = h.p_moe_buf;
+        k.p_moe_buf        = h.p_moe_buf;
+        k.p_local_topk_ids = h.p_local_topk_ids;
 
         k.tokens         = h.tokens;
         k.num_experts    = h.num_experts;
@@ -2728,7 +2735,8 @@ struct MoeSortingMultiPhaseKernel_P23
     // only use this at host !
     OPUS_H static constexpr auto GetSmemSize(const Hargs& h)
     {
-        const auto smem_23 = impl::moe_sorting_get_smem_size_p23(h.num_experts);
+        const auto smem_23 =
+            impl::moe_sorting_get_smem_size_p23(h.num_experts, h.p_local_topk_ids != nullptr);
         const auto smem_sf = kBlockSize * 4 * sizeof(IndexType);
         return max(smem_23, smem_sf);
     }
@@ -2764,8 +2772,11 @@ struct MoeSortingMultiPhaseKernel_P23
 
             const IndexType* p_local_expert_mask =
                 static_cast<const IndexType*>(kargs.p_local_expert_mask);
-            IndexType* p_expert_cumsum      = reinterpret_cast<IndexType*>(kargs.p_expert_cumsum);
-            IndexType* p_expert_cumsum_smem = s + 4 + 2 * kBlockSize / opus::get_warp_size();
+            IndexType* p_expert_cumsum = reinterpret_cast<IndexType*>(kargs.p_expert_cumsum);
+            IndexType* p_expert_cumsum_smem =
+                s + 4 + 2 * kBlockSize / opus::get_warp_size();
+            IndexType* p_expert_local_ids_smem =
+                p_expert_cumsum_smem + kargs.num_experts + 1;
             IndexType* p_total_tokens_post_pad =
                 reinterpret_cast<IndexType*>(kargs.p_total_tokens_post_pad);
             IndexType* p_sorted_expert_ids =
@@ -2860,6 +2871,17 @@ struct MoeSortingMultiPhaseKernel_P23
                 if(position < kargs.num_experts)
                 {
                     p_expert_cumsum_smem[position] = out_0 * kargs.unit_size_mdiv.divisor;
+                    if(kargs.p_local_topk_ids != nullptr)
+                    {
+                        if constexpr(Problem::LocalExpertMasking)
+                        {
+                            p_expert_local_ids_smem[position] = b_ ? out_1 : -1;
+                        }
+                        else
+                        {
+                            p_expert_local_ids_smem[position] = position;
+                        }
+                    }
                 }
 
                 {
@@ -2898,6 +2920,36 @@ struct MoeSortingMultiPhaseKernel_P23
             }
         }
 
+        __syncthreads();
+        if(kargs.p_local_topk_ids != nullptr && blockIdx.x == 0)
+        {
+            const IndexType* p_topk_ids = static_cast<const IndexType*>(kargs.p_topk_ids);
+            IndexType* p_local_topk_ids = static_cast<IndexType*>(kargs.p_local_topk_ids);
+            IndexType* s                = reinterpret_cast<IndexType*>(smem);
+            IndexType* p_expert_cumsum_smem =
+                s + 4 + 2 * kBlockSize / opus::get_warp_size();
+            IndexType* p_expert_local_ids_smem =
+                p_expert_cumsum_smem + kargs.num_experts + 1;
+            const opus::index_t total_topk_ids = tokens * kargs.topk_mdiv.divisor;
+
+            for(opus::index_t i = threadIdx.x; i < total_topk_ids; i += kBlockSize)
+            {
+                IndexType eid      = p_topk_ids[i];
+                IndexType local_id = -1;
+                if(eid >= 0 && eid < kargs.num_experts)
+                {
+                    if constexpr(Problem::LocalExpertMasking)
+                    {
+                        local_id = p_expert_local_ids_smem[eid];
+                    }
+                    else
+                    {
+                        local_id = eid;
+                    }
+                }
+                p_local_topk_ids[i] = local_id;
+            }
+        }
         __syncthreads();
         {
             const IndexType* p_local_expert_mask =
@@ -3492,7 +3544,9 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
 
         if(a.tokens < 2048)
         {
-            if(aiter::impl::moe_sorting_get_smem_size_p23(a.num_experts) > opus::get_smem_size())
+            if(aiter::impl::moe_sorting_get_smem_size_p23(a.num_experts,
+                                                          a.p_local_topk_ids != nullptr) >
+               opus::get_smem_size())
             {
                 printf("opus moe_sorting: do not support large expert %d\n", a.num_experts);
                 return -1;
@@ -3525,7 +3579,9 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
         }
         else
         {
-            if(aiter::impl::moe_sorting_get_smem_size_p23(a.num_experts) > opus::get_smem_size())
+            if(aiter::impl::moe_sorting_get_smem_size_p23(a.num_experts,
+                                                          a.p_local_topk_ids != nullptr) >
+               opus::get_smem_size())
             {
                 printf("opus moe_sorting: do not support large expert %d\n", a.num_experts);
                 return -1;

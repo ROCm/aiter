@@ -33,6 +33,19 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
     int num_tokens = topk_ids.size(0);
     int topk       = topk_ids.size(1);
 
+    if(local_topk_ids.has_value())
+    {
+        auto& ids_out = local_topk_ids.value();
+        AITER_CHECK(ids_out.dim() == 2 && ids_out.size(0) == topk_ids.size(0) &&
+                        ids_out.size(1) == topk_ids.size(1),
+                    "local_topk_ids must have the same [tokens, topk] shape as topk_ids");
+        AITER_CHECK(ids_out.dtype() == topk_ids.dtype(),
+                    "local_topk_ids dtype must match topk_ids");
+        AITER_CHECK(ids_out.device_id == topk_ids.device_id,
+                    "local_topk_ids must be on the same device as topk_ids");
+        AITER_CHECK(ids_out.is_contiguous(), "local_topk_ids must be contiguous");
+    }
+
     HipDeviceGuard device_guard(topk_ids.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
