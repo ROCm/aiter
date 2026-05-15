@@ -43,7 +43,7 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
     # tolerates arbitrary contents on the first reference per dispatch.
     elem_size = torch.empty(0, dtype=moebuf_dtype).element_size()
     row_bytes = M * model_dim * elem_size
-    flag_bytes = M * 8
+    flag_bytes = 8
     flat_buf = torch.empty(row_bytes + flag_bytes, dtype=torch.uint8, device=device)
     moe_buf = flat_buf[:row_bytes].view(moebuf_dtype).view(M, model_dim)
     topk_ids_i32 = (
