@@ -3,6 +3,7 @@
 
 import functools
 import os
+import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -984,7 +985,8 @@ def get_2stage_cfgs(
 
     cfg = _lookup_cfg(cfg_2stages)
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
-        lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
+        lock_name = re.sub(r"[^\w.\-]", "_", str(keys))
+        lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{lock_name}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
         cfg = _lookup_cfg(cfg_2stages)

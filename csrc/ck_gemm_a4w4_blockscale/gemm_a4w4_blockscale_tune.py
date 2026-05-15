@@ -114,17 +114,17 @@ def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
     bias_f32 = None
-    return (
-        x,
-        w,
-        x_scales,
-        w_scales,
-        w_shuffle,
-        x_scales_shuffle,
-        w_scales_shuffle,
-        out_ck,
-        bias_f32,
-    )
+    return {
+        "x": x,
+        "w": w,
+        "x_scales": x_scales,
+        "w_scales": w_scales,
+        "w_shuffle": w_shuffle,
+        "x_scales_shuffle": x_scales_shuffle,
+        "w_scales_shuffle": w_scales_shuffle,
+        "out_ck": out_ck,
+        "bias_f32": bias_f32,
+    }
 
 
 class GemmA4W4BlockScaleTuner(GemmCommonTuner):
@@ -157,18 +157,18 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             N = int(row["N"])
             K = int(row["K"])
             shape_str = f"({M}, {N}, {K})"
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
             try:
-                (
-                    x,
-                    w,
-                    x_scales,
-                    w_scales,
-                    w_shuffle,
-                    x_scales_shuffle,
-                    w_scales_shuffle,
-                    out_ck,
-                    bias_f32,
-                ) = generate_data(M, N, K, 0)
+                gd = generate_data(M, N, K, 0)
+                x, w = gd["x"], gd["w"]
+                x_scales, w_scales = gd["x_scales"], gd["w_scales"]
+                w_shuffle = gd["w_shuffle"]
+                x_scales_shuffle = gd["x_scales_shuffle"]
+                w_scales_shuffle = gd["w_scales_shuffle"]
+                out_ck = gd["out_ck"]
+                bias_f32 = gd["bias_f32"]
                 out, us = run_perftest(
                     gemm_a4w4,
                     x,
@@ -184,8 +184,8 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 )
                 status = (
                     "ok"
-                    if err_ratio <= args.errRatio
-                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                    if err_ratio <= allowed_err_ratio
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
@@ -243,17 +243,29 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         tasks_in_data = []
 
         ck_kernels_num = len(kernels_list)
-        gemm_a4w4_data_idx = [0, 4, 5, 6, 7]  # index in generated data
-        gemm_asm_data_idx = [0, 4, 5, 6, 7, 8]
-        torch_data_idx = [0, 1, 2, 3]
-        seed = 1000
+        gemm_ck_keys = [
+            "x",
+            "w_shuffle",
+            "x_scales_shuffle",
+            "w_scales_shuffle",
+            "out_ck",
+        ]
+        gemm_asm_keys = [
+            "x",
+            "w_shuffle",
+            "x_scales_shuffle",
+            "w_scales_shuffle",
+            "out_ck",
+            "bias_f32",
+        ]
+        ref_keys = ["x", "w", "x_scales", "w_scales"]
+        seed = 0
         for shape_idx in range(len(untunedf)):
             row = untunedf.iloc[shape_idx]
             # Native int keys so post_process grouping matches single-shape runs (no np.int64 vs int split).
             M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
 
             total_kernel_nums = 0
-            seed = seed + 1
 
             for kernel_idx in range(ck_kernels_num):
                 kernel = kernels_list[kernel_idx]
@@ -278,7 +290,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             (M, N, K, seed),
                             run_gemm_a4w4_blockscale,
                             (
-                                gemm_a4w4_data_idx,
+                                gemm_ck_keys,
                                 kernel_idx,
                                 splitK,
                             ),
@@ -288,13 +300,16 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             },
                             run_torch,
                             (
-                                torch_data_idx,
+                                ref_keys,
                                 dtypes.bf16,
                             ),
                             {},
                             None,
                             1e-2,
                             0.01,
+                            None,
+                            None,
+                            ("out_ck",),
                         )
                     )
                     total_kernel_nums = total_kernel_nums + 1
@@ -326,7 +341,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             (M, N, K, seed),
                             run_gemm_a4w4_blockscale_asm,
                             (
-                                gemm_asm_data_idx,
+                                gemm_asm_keys,
                                 kernel_name,
                                 dtypes.bf16,
                                 True,
@@ -338,13 +353,16 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             },
                             run_torch,
                             (
-                                torch_data_idx,
+                                ref_keys,
                                 dtypes.bf16,
                             ),
                             {},
                             None,
                             1e-2,
                             0.01,
+                            None,
+                            None,
+                            ("out_ck",),
                         )
                     )
                     asm_kernels_id = asm_kernels_id + 1

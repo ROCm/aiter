@@ -29,6 +29,9 @@ def worker(
     printLog=False,
     tol_err_ratio=0.05,
     compare_fn=None,
+    max_abs_delta=None,
+    output_keys=None,
+    _arg_key_list=None,
 ):
     from aiter.test_common import run_perftest
 
@@ -38,6 +41,17 @@ def worker(
     try:
         torch.cuda.set_device(device)
         args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
+        if output_keys is not None and _arg_key_list is not None:
+            for key in output_keys:
+                if key in _arg_key_list:
+                    idx = _arg_key_list.index(key)
+                    if idx < len(args) and isinstance(args[idx], torch.Tensor):
+                        # Fill output with NaN before run_perftest so that
+                        # warmup runs with this initial state.  If the kernel
+                        # does not fully write the output, NaN values survive
+                        # through warmup/iters and will be caught by
+                        # checkAllclose.
+                        args[idx].fill_(float("nan"))
         torch.cuda.synchronize()
         res = None
         us = float("inf")
@@ -89,6 +103,16 @@ def worker(
                         if ref[i].dtype.itemsize == 1:
                             ref[i] = ref[i].view(torch.uint8).to(dtypes.fp32)
                             res[i] = res[i].view(torch.uint8).to(dtypes.fp32)
+                        print(f"compare ref and res: info:{info}\t", flush=True)
+                        print(
+                            ref[i].shape,
+                            res[i].shape,
+                            f"atol={atol}, rtol={rtol}",
+                            flush=True,
+                        )
+                        print(ref[i], flush=True)
+                        print(res[i], flush=True)
+                        print("compare ref and res done", flush=True)
                         err_ratio = checkAllclose(
                             ref[i],
                             res[i],
@@ -97,6 +121,7 @@ def worker(
                             tol_err_ratio=tol_err_ratio,
                             printLog=printLog,
                             msg=f"info:{info} res[{i}] ",
+                            max_abs_delta=max_abs_delta,
                         )
                     max_err_ratio = max(max_err_ratio, err_ratio)
     except RuntimeError as e:
@@ -167,8 +192,8 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
     # (ref!=None | ref_func!=None) & fast_mode=1: compare results and return all results, but do not postprocess
     # (ref!=None | ref_func!=None) & fast_mode=0: return best result, postprocess
     if ref is None and not fast_mode or (ref_func is not None and fast_mode):
-        ref_data_idx, *rest = ([], *ref_args) if not data else ref_args
-        updated_ref_args = tuple(data[i] for i in ref_data_idx) + tuple(rest)
+        ref_data_keys, *rest = ([], *ref_args) if not data else ref_args
+        updated_ref_args = tuple(data[k] for k in ref_data_keys) + tuple(rest)
         ref = ref_func(*updated_ref_args, **ref_kwargs)
         torch.cuda.synchronize()
 
@@ -211,7 +236,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             # either gen_data func or inpur data
 
             new_args = (
-                (tuple(data[i] for i in args[0]) + tuple(args[1:]))
+                (tuple(data[k] for k in args[0]) + tuple(args[1:]))
                 if gen_data is not None
                 else args
             )
@@ -221,17 +246,26 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             else:
                 _cur_key = (id(ref_func), ref_args)
                 if _cur_key != _prev_ref_key:
-                    ref_data_idx_i, *rest_i = ref_args
-                    updated = tuple(data[j] for j in ref_data_idx_i) + tuple(rest_i)
+                    ref_data_keys_i, *rest_i = ref_args
+                    updated = tuple(data[k] for k in ref_data_keys_i) + tuple(rest_i)
                     ref = ref_func(*updated, **ref_kwargs)
                     torch.cuda.synchronize()
                     _prev_ref_key = _cur_key
 
             # Extract rtol, atol from rest if available, otherwise use defaults.
             # Optional rest[2]: custom compare callable (e.g. cosine diff for a8w4).
+            # Optional rest[3]: explicit max_abs_delta for catastrophic error detection.
+            # Optional rest[4]: output_keys -- names of output tensors to NaN-init.
             rtol = rest[0] if len(rest) > 0 else 1e-2
             atol = rest[1] if len(rest) > 1 else 1e-2
             compare_fn = rest[2] if len(rest) > 2 and callable(rest[2]) else None
+            max_abs_delta = rest[3] if len(rest) > 3 else None
+            output_keys = (
+                rest[4]
+                if len(rest) > 4 and isinstance(rest[4], (list, tuple))
+                else None
+            )
+            arg_key_list = list(args[0]) if gen_data is not None else None
 
             work_args = (
                 gpu_id,
@@ -242,9 +276,12 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 ref,
                 rtol,
                 atol,
-                verbose,  # Use the verbose from work_group parameter
-                err_ratio,  # Use the err_ratio from work_group parameter
+                verbose,
+                err_ratio,
                 compare_fn,
+                max_abs_delta,
+                output_keys,
+                arg_key_list,
             )
 
             # Run worker with explicit GPU ID

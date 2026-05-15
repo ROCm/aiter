@@ -396,8 +396,35 @@ def get_trace_perf(prof, num_iters):
     return df.at[avg_name, "device_time_sum"]
 
 
+def _check_catastrophic(actual_max_delta, a, b, max_abs_delta):
+    if max_abs_delta is not None:
+        return actual_max_delta > max_abs_delta
+    ref_abs_max = max(b.abs().max().item(), 1.0)
+    return actual_max_delta > ref_abs_max * 0.5
+
+
+def _catastrophic_check_silent(a, b, max_abs_delta):
+    """Compute catastrophic check without creating masked tensors (for not-printLog path)."""
+    if torch.isnan(a).any() or torch.isnan(b).any():
+        return True
+    if max_abs_delta is not None:
+        actual_max_delta = (a - b).abs().max().item()
+        return actual_max_delta > max_abs_delta
+    diff_abs = (a - b).abs()
+    vals = torch.stack([diff_abs.max(), b.abs().max()]).tolist()
+    return vals[0] > max(vals[1], 1.0) * 0.5
+
+
 def checkAllclose(
-    a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="", printNum=8, printLog=True
+    a,
+    b,
+    rtol=1e-2,
+    atol=1e-2,
+    tol_err_ratio=0.05,
+    msg="",
+    printNum=8,
+    printLog=True,
+    max_abs_delta=None,
 ):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
 
@@ -412,7 +439,10 @@ def checkAllclose(
             printNum = min(printNum, num)
             percent = (num / a.numel()).item()
             if not printLog:
-                return percent
+                if percent >= tol_err_ratio:
+                    return percent
+                is_cat = _catastrophic_check_silent(a, b, max_abs_delta)
+                return 1.0 if is_cat else percent
             a_msked = a[mask]
             b_msked = b[mask]
             delta = (a_msked - b_msked).abs()
@@ -422,11 +452,28 @@ def checkAllclose(
             printNum = min(printNum, num)
             percent = (num / a.numel()).item()
             if not printLog:
-                return percent
+                if percent >= tol_err_ratio:
+                    return percent
+                is_cat = _catastrophic_check_silent(a, b, max_abs_delta)
+                return 1.0 if is_cat else percent
             a_msked = a[mask]
             b_msked = b[mask]
             delta = (a_msked - b_msked).abs()
-        if percent > tol_err_ratio:
+
+        actual_max_delta = delta.max().item()
+        is_catastrophic = _check_catastrophic(actual_max_delta, a, b, max_abs_delta)
+
+        if is_catastrophic:
+            logger.info(
+                f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mcatastrophic!\033[0m] max abs delta {actual_max_delta:.4f}
+    a    : {a.shape}
+           {a_msked[:printNum]}
+    b    : {b.shape}
+           {b_msked[:printNum]}
+    delta:
+           {delta[:printNum]}"""
+            )
+        elif percent > tol_err_ratio:
             logger.info(f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
     a    : {a.shape}
            {a_msked[:printNum]}
@@ -441,6 +488,11 @@ def checkAllclose(
         logger.info(
             f"-->max abs delta:{delta.max()}, delta details: {percent:.1%} ({num} of {a.numel()}) elements"
         )
+        if is_catastrophic:
+            raise AssertionError(
+                f"{msg}catastrophic error: max abs delta {actual_max_delta:.4f}, "
+                f"{percent:.1%} ({num} of {a.numel()}) elements mismatch"
+            )
         return percent
 
 
