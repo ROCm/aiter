@@ -1008,18 +1008,18 @@ def mla_prefill_reduce(
 #   gqa_ratio=16, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
 # ---------------------------------------------------------------------------
 def mla_decode_fwd_v4_nm(
-    q,                    # [total_query_len, num_heads, head_size]   FP8 packed Q+e8m0
-    qrope,                # [total_query_len, num_heads, kv_rotary]   BF16
-    kv_buffer,            # [num_page, page_size, num_kv_heads, dim_qk_packed]
-    kvrope,               # [num_page, page_size, num_kv_heads, kv_rotary]
-    output,               # [total_query_len, num_heads, v_head_dim]  BF16 (used for out_16_nosplit=1)
-    qo_indptr,            # [num_seqs+1]
-    kv_indptr,            # [num_seqs+1]
-    kv_page_indices,      # [num_page_used]
-    kv_last_page_lens,    # [num_seqs]
-    split_indptr,         # [num_seqs+1]
+    q,  # [total_query_len, num_heads, head_size]   FP8 packed Q+e8m0
+    qrope,  # [total_query_len, num_heads, kv_rotary]   BF16
+    kv_buffer,  # [num_page, page_size, num_kv_heads, dim_qk_packed]
+    kvrope,  # [num_page, page_size, num_kv_heads, kv_rotary]
+    output,  # [total_query_len, num_heads, v_head_dim]  BF16 (used for out_16_nosplit=1)
+    qo_indptr,  # [num_seqs+1]
+    kv_indptr,  # [num_seqs+1]
+    kv_page_indices,  # [num_page_used]
+    kv_last_page_lens,  # [num_seqs]
+    split_indptr,  # [num_seqs+1]
     max_seqlen_q,
-    sm_scale=None,        # ignored on v4 nm; kernel hardcodes 1/sqrt(512)
+    sm_scale=None,  # ignored on v4 nm; kernel hardcodes 1/sqrt(512)
     out_16_nosplit=0,
     num_kv_splits=1,
     sub_Q=64,
@@ -1048,12 +1048,14 @@ def mla_decode_fwd_v4_nm(
     if logits is None:
         logits = torch.empty(
             (num_seqs, num_kv_splits, num_kv_heads, q_seq_lens_internal, v_head_dim),
-            dtype=dtypes.fp32, device=q.device,
+            dtype=dtypes.fp32,
+            device=q.device,
         )
     if attn_lse is None:
         attn_lse = torch.empty(
             (num_seqs, num_kv_splits, num_kv_heads, q_seq_lens_internal, 1),
-            dtype=dtypes.fp32, device=q.device,
+            dtype=dtypes.fp32,
+            device=q.device,
         )
 
     # softmax_scale is ignored by the v4 nm kernel (hardcodes 1/sqrt(512));
@@ -1061,14 +1063,22 @@ def mla_decode_fwd_v4_nm(
     sm_scale_arg = 0.0 if sm_scale is None else float(sm_scale)
 
     aiter.mla_decode_v4_asm(
-        q, qrope, kv_buffer, kvrope,
-        qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens,
+        q,
+        qrope,
+        kv_buffer,
+        kvrope,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
         split_indptr,
         max_seqlen_q,
         sm_scale_arg,
         int(out_16_nosplit),
         int(sub_Q),
         int(num_kv_splits),
-        logits, attn_lse, output,
+        logits,
+        attn_lse,
+        output,
     )
     return logits, attn_lse

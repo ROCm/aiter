@@ -36,19 +36,18 @@ import aiter
 import aiter.mla  # main no longer auto-imports submodules; need explicit
 from aiter.jit.utils.chip_info import get_gfx
 
-
 # ---------------------------------------------------------------------------
 # Variant under test (matches the cfg_mla_v4_asm entry in
 # hsa/gfx950/mla_v4/mla_v4_asm.csv served by csrc/py_itfs_cu/asm_mla_v4.cu).
 # ---------------------------------------------------------------------------
-GQA_RATIO     = 16          # num_heads / num_kv_heads
-SUB_Q         = 64          # block of q_seq_lens (after gqa boost) handled per workgroup
-PAGE_SIZE     = 1
-NUM_KV_HEADS  = 1
-DIM_NOPE      = 448         # FP8 NOPE bytes per token
-DIM_ROPE      = 64          # BF16 ROPE elements per token (= 128 bytes; lives in qrope/kvrope)
-DIM_QK_PACKED = 576         # = args.dim(512) + args.k_rotary(64); matches poc_kl stride_Page
-V_HEAD_DIM    = 512         # logical V head dim = args.dim = kv_lora_rank
+GQA_RATIO = 16  # num_heads / num_kv_heads
+SUB_Q = 64  # block of q_seq_lens (after gqa boost) handled per workgroup
+PAGE_SIZE = 1
+NUM_KV_HEADS = 1
+DIM_NOPE = 448  # FP8 NOPE bytes per token
+DIM_ROPE = 64  # BF16 ROPE elements per token (= 128 bytes; lives in qrope/kvrope)
+DIM_QK_PACKED = 576  # = args.dim(512) + args.k_rotary(64); matches poc_kl stride_Page
+V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 
 
 def _on_gfx950():
@@ -70,8 +69,9 @@ needs_gfx950 = pytest.mark.skipif(
 # smoke testing the dispatcher we just need byte-level buffers of the right
 # shape and dtype; numerical correctness is deferred (see file docstring).
 # ---------------------------------------------------------------------------
-def _build_inputs(batch=2, kv_seq_lens=64, q_seq_logical=4, num_heads=GQA_RATIO,
-                  device="cuda", seed=0):
+def _build_inputs(
+    batch=2, kv_seq_lens=64, q_seq_logical=4, num_heads=GQA_RATIO, device="cuda", seed=0
+):
     """Return a dict of every tensor mla_decode_fwd_v4_nm needs.
 
     Sizes mirror what poc_kl/mi350/mla_asm/mla.cpp computes for the same cmd
@@ -87,7 +87,7 @@ def _build_inputs(batch=2, kv_seq_lens=64, q_seq_logical=4, num_heads=GQA_RATIO,
 
     total_q = batch * q_seq_logical
     num_page = batch * (kv_seq_lens // PAGE_SIZE)
-    num_kv_splits = 1                          # passes=1 for this variant
+    num_kv_splits = 1  # passes=1 for this variant
 
     # FP8 dtype: use aiter's canonical alias which auto-resolves per arch
     # (gfx942 = e4m3fnuz, gfx950 = e4m3fn). The kernel reads raw bytes (NOPE
@@ -108,25 +108,27 @@ def _build_inputs(batch=2, kv_seq_lens=64, q_seq_logical=4, num_heads=GQA_RATIO,
     q = _rand_fp8((total_q, num_heads, DIM_QK_PACKED))
     qrope = torch.randn(
         (total_q, num_heads, DIM_ROPE),
-        dtype=torch.bfloat16, device=device,
+        dtype=torch.bfloat16,
+        device=device,
     )
 
     kv_buffer = _rand_fp8((num_page, PAGE_SIZE, NUM_KV_HEADS, DIM_QK_PACKED))
     kvrope = torch.randn(
         (num_page, PAGE_SIZE, NUM_KV_HEADS, DIM_ROPE),
-        dtype=torch.bfloat16, device=device,
+        dtype=torch.bfloat16,
+        device=device,
     )
 
     # Index tables.
     #   q_indptr[b] = b * (q_seq_lens / gqa_ratio) = b * q_seq_logical
-    qo_indptr = torch.arange(
-        0, batch + 1, dtype=torch.int32, device=device
-    ) * q_seq_logical
+    qo_indptr = (
+        torch.arange(0, batch + 1, dtype=torch.int32, device=device) * q_seq_logical
+    )
 
     pages_per_seq = kv_seq_lens // PAGE_SIZE
-    kv_indptr = torch.arange(
-        0, batch + 1, dtype=torch.int32, device=device
-    ) * pages_per_seq
+    kv_indptr = (
+        torch.arange(0, batch + 1, dtype=torch.int32, device=device) * pages_per_seq
+    )
 
     # Random page mapping (each batch's pages picked from [0, num_page)).
     kv_page_indices = torch.arange(
@@ -134,13 +136,15 @@ def _build_inputs(batch=2, kv_seq_lens=64, q_seq_logical=4, num_heads=GQA_RATIO,
     )
 
     kv_last_page_lens = torch.full(
-        (batch,), kv_seq_lens % PAGE_SIZE,
-        dtype=torch.int32, device=device,
+        (batch,),
+        kv_seq_lens % PAGE_SIZE,
+        dtype=torch.int32,
+        device=device,
     )
 
-    split_indptr = torch.arange(
-        0, batch + 1, dtype=torch.int32, device=device
-    ) * num_kv_splits
+    split_indptr = (
+        torch.arange(0, batch + 1, dtype=torch.int32, device=device) * num_kv_splits
+    )
 
     # `output` here is the *final reduce* buffer (3D), used only when
     # out_16_nosplit=1. The split-out fp32 logits are allocated *inside*
@@ -152,7 +156,8 @@ def _build_inputs(batch=2, kv_seq_lens=64, q_seq_logical=4, num_heads=GQA_RATIO,
     # so this MUST be 3D [total_q, num_heads, v_head_dim].
     output = torch.empty(
         (total_q, num_heads, V_HEAD_DIM),
-        dtype=torch.bfloat16, device=device,
+        dtype=torch.bfloat16,
+        device=device,
     ).fill_(-1)
 
     return dict(
@@ -190,7 +195,7 @@ def test_v4_nm_smoke_default_shape():
     bytes are also random — dequantization legitimately produces inf/NaN.
     True numerical correctness lives in compare_against_poc_kl_dump() (TODO).
 
-    Uses batch=2 to also exercise the multi-batch (gdy>1) code path. 
+    Uses batch=2 to also exercise the multi-batch (gdy>1) code path.
     """
     args = _build_inputs(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0)
 
@@ -203,11 +208,15 @@ def test_v4_nm_smoke_default_shape():
     q_seq_lens_internal = gqa_ratio * args["max_seqlen_q"]
     args["logits"] = torch.full(
         (num_seqs, num_kv_splits, num_kv_heads, q_seq_lens_internal, V_HEAD_DIM),
-        SENTINEL, dtype=torch.float32, device="cuda",
+        SENTINEL,
+        dtype=torch.float32,
+        device="cuda",
     )
     args["attn_lse"] = torch.full(
         (num_seqs, num_kv_splits, num_kv_heads, q_seq_lens_internal, 1),
-        SENTINEL, dtype=torch.float32, device="cuda",
+        SENTINEL,
+        dtype=torch.float32,
+        device="cuda",
     )
 
     logits, attn_lse = aiter.mla.mla_decode_fwd_v4_nm(**args)
@@ -239,14 +248,16 @@ def test_v4_nm_no_half_zero_pattern():
     # logits is 5D [num_seqs, kMaxSplit, num_kv_heads, q_seq_lens_internal, dim_v];
     # only split=0 is written when num_kv_splits=1. Look at THAT slice only;
     # other split slots are uninitialized memory and would noise this test.
-    written = logits[:, 0]                     # [num_seqs, num_kv_heads, q_seq_lens_internal, dim_v]
-    flat = written.reshape(-1, V_HEAD_DIM)     # rows of dim_v=512
+    written = logits[:, 0]  # [num_seqs, num_kv_heads, q_seq_lens_internal, dim_v]
+    flat = written.reshape(-1, V_HEAD_DIM)  # rows of dim_v=512
     # If half the row is NaN and the other half is exactly zero, that's the
     # historic wave32-on-wave64 landmine (256 NaN + 256 zero per row).
     half = V_HEAD_DIM // 2
     first_half_nan_count = torch.isnan(flat[:, :half]).sum(dim=1).max().item()
     second_half_zero_count = (flat[:, half:] == 0.0).sum(dim=1).max().item()
-    assert not (first_half_nan_count > half * 0.9 and second_half_zero_count > half * 0.9), (
+    assert not (
+        first_half_nan_count > half * 0.9 and second_half_zero_count > half * 0.9
+    ), (
         f"Detected the wave32-on-wave64 launch landmine: "
         f"first {first_half_nan_count}/{half} NaN, "
         f"second {second_half_zero_count}/{half} zero. "
@@ -279,10 +290,12 @@ def test_v4_nm_determinism():
     # uninitialized memory and may legitimately differ between calls.
     written1 = logits1_bits[:, 0]
     written2 = logits2.view(torch.int32)[:, 0]
-    assert torch.equal(written1, written2), \
-        "v4 nm logits are non-deterministic (likely uninit accumulator/LDS)"
-    assert torch.equal(lse1_bits[:, 0], lse2.view(torch.int32)[:, 0]), \
-        "v4 nm attn_lse is non-deterministic"
+    assert torch.equal(
+        written1, written2
+    ), "v4 nm logits are non-deterministic (likely uninit accumulator/LDS)"
+    assert torch.equal(
+        lse1_bits[:, 0], lse2.view(torch.int32)[:, 0]
+    ), "v4 nm attn_lse is non-deterministic"
 
 
 @needs_gfx950
@@ -331,10 +344,12 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     # The dispatcher fprintf's "[aiter kernarg 288B]" then 18 rows of 16
     # hex bytes. Parse the 18 rows out of stderr.
     import re
+
     lines = captured.err.splitlines()
     try:
-        start = next(i for i, line in enumerate(lines)
-                     if line.startswith("[aiter kernarg 288B]"))
+        start = next(
+            i for i, line in enumerate(lines) if line.startswith("[aiter kernarg 288B]")
+        )
     except StopIteration:
         pytest.fail(
             "kernarg hexdump not found in stderr — "
@@ -343,20 +358,22 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
             f"stderr was: {captured.err[:500]}"
         )
     hex_rows = []
-    for line in lines[start + 1: start + 1 + 18]:
+    for line in lines[start + 1 : start + 1 + 18]:
         m = re.match(r"^((?:[0-9a-fA-F]{2}\s*){16})$", line.strip())
         if not m:
             break
         hex_rows.append(bytes.fromhex(line.strip().replace(" ", "")))
-    assert len(hex_rows) == 18, (
-        f"expected 18 hex rows of kernarg, got {len(hex_rows)}"
-    )
+    assert len(hex_rows) == 18, f"expected 18 hex rows of kernarg, got {len(hex_rows)}"
     kargs = b"".join(hex_rows)
     assert len(kargs) == 288, f"kernarg byte total = {len(kargs)}, want 288"
 
     # Each slot is 16 bytes; first 4 bytes carry the payload, rest is padding.
-    def slot(i): return kargs[i * 16: i * 16 + 16]
-    def slot_u32(i): return int.from_bytes(slot(i)[:4], "little")
+    def slot(i):
+        return kargs[i * 16 : i * 16 + 16]
+
+    def slot_u32(i):
+        return int.from_bytes(slot(i)[:4], "little")
+
     import struct
 
     def slot_f32(i):
@@ -368,12 +385,12 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     expected_scalar_f_bytes = struct.pack(
         "<f", float(np.float32(1.0) / np.float32(np.sqrt(np.float32(448 + 64))))
     )
-    expected_gqa_ratio  = GQA_RATIO                   # 16
-    expected_kv_split   = 1                            # num_kv_splits=1
-    expected_total_kv   = 64 * 2                       # kv_seq_lens * batch
-    expected_stride_pg  = 1 * DIM_QK_PACKED            # page_size * 576
-    expected_log2_page  = 0                            # log2(page_size=1)
-    expected_out16ns    = 0                            # out_16_nosplit=0
+    expected_gqa_ratio = GQA_RATIO  # 16
+    expected_kv_split = 1  # num_kv_splits=1
+    expected_total_kv = 64 * 2  # kv_seq_lens * batch
+    expected_stride_pg = 1 * DIM_QK_PACKED  # page_size * 576
+    expected_log2_page = 0  # log2(page_size=1)
+    expected_out16ns = 0  # out_16_nosplit=0
 
     # slot 7 scalar_f: byte-exact compare (FP32)
     actual_scalar_f_bytes = slot(7)[:4]
@@ -382,12 +399,12 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
         f"want {expected_scalar_f_bytes.hex()} (= 1/sqrt(512) in FP32)"
     )
     for slot_idx, want, name in [
-        (8,  expected_gqa_ratio,  "s_gqa_ratio"),
-        (9,  expected_kv_split,   "s_kv_split"),
-        (10, expected_total_kv,   "s_total_kv"),
-        (11, expected_stride_pg,  "s_stride_page"),
-        (12, expected_log2_page,  "s_log2_page"),
-        (15, expected_out16ns,    "out_16_nosplit"),
+        (8, expected_gqa_ratio, "s_gqa_ratio"),
+        (9, expected_kv_split, "s_kv_split"),
+        (10, expected_total_kv, "s_total_kv"),
+        (11, expected_stride_pg, "s_stride_page"),
+        (12, expected_log2_page, "s_log2_page"),
+        (15, expected_out16ns, "out_16_nosplit"),
     ]:
         got = slot_u32(slot_idx)
         assert got == want, (
