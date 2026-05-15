@@ -95,7 +95,11 @@ def unshuffle_weight_gfx1250(w_buffer_slice, BLOCK_N, NATIVE_BLOCK_K_W):
     )
 
 
-@gluon.jit(launch_metadata=matmul_launch_metadata, do_not_specialize=["num_tokens"])
+@gluon.jit(
+    launch_metadata=matmul_launch_metadata,
+    loop_carried_load_percent=0,
+    do_not_specialize=["num_tokens"],
+)
 def _moe_gemm_a8w4_decode(
     Y,
     stride_y_m,
@@ -640,7 +644,7 @@ def _moe_gemm_a8w4_decode(
     gl.amd.gfx1250.tdm.async_wait(0)
 
 
-@gluon.jit(launch_metadata=matmul_launch_metadata)
+@gluon.jit(launch_metadata=matmul_launch_metadata, loop_carried_load_percent=0)
 def _moe_gemm_a8w4_prefill(
     Y,
     stride_y_m,
@@ -928,10 +932,8 @@ def _moe_gemm_a8w4_prefill(
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
+                write_idx * BLOCK_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
-            )
-            x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                x_desc, add_offsets=[0, BLOCK_K]
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
@@ -954,10 +956,8 @@ def _moe_gemm_a8w4_prefill(
                 gl.amd.gfx1250.tdm.async_gather(
                     x_scales_desc,
                     offs_x_m,
+                    write_idx * MX_SCALE_BLOCK_K,
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                )
-                x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                    x_scales_desc, add_offsets=[0, MX_SCALE_BLOCK_K]
                 )
         write_idx += 1
 
@@ -1012,10 +1012,8 @@ def _moe_gemm_a8w4_prefill(
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
+                write_idx * BLOCK_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
-            )
-            x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                x_desc, add_offsets=[0, BLOCK_K]
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
@@ -1038,10 +1036,8 @@ def _moe_gemm_a8w4_prefill(
                 gl.amd.gfx1250.tdm.async_gather(
                     x_scales_desc,
                     offs_x_m,
+                    write_idx * MX_SCALE_BLOCK_K,
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                )
-                x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                    x_scales_desc, add_offsets=[0, MX_SCALE_BLOCK_K]
                 )
         write_idx += 1
 
