@@ -105,9 +105,11 @@ void unified_attention_fwd(
     // which handles any seqlen_q correctly via 1D grid with Q tile iteration).
     args.max_seqlen_q = (num_tokens == num_seqs) ? 1 : num_tokens;
 
-    (void)cache_ptr_int32_overflow_possible; // accepted at the API for forward compat;
-                                             // CK pipeline currently gates pointer rebasing
-                                             // on row strides + head_dim, not on this flag.
+    // Routes the K/V async-load path inside the CK pipeline. False (default)
+    // → fast `buffer_load_dword_lds` with shared SRD (valid as long as the
+    // cache fits in 4 GB). True → `global_load_lds` with per-lane 64-bit base
+    // pointer (slower but lifts the 4 GB limit).
+    args.cache_ptr_int32_overflow_possible = cache_ptr_int32_overflow_possible;
 
     // Wire up the split-KV workspace pointers/strides. For num_splits == 1 the
     // workspace tensors are ignored by the kernel (and the *_acc fields stay
