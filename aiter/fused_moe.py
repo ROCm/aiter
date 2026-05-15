@@ -28,6 +28,38 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 
 
+def _map_global_to_local_topk_ids(topk_ids, expert_mask):
+    if expert_mask is None:
+        return topk_ids.clone()
+
+    local_expert_ids = (
+        expert_mask.to(dtype=topk_ids.dtype).cumsum(0, dtype=topk_ids.dtype) - 1
+    )
+    local_expert_ids = torch.where(
+        expert_mask != 0,
+        local_expert_ids,
+        torch.full_like(local_expert_ids, -1),
+    )
+    return local_expert_ids[topk_ids.to(torch.long)]
+
+
+def _add_valid_expert_bias(valid_out, expert_ids, bias):
+    expert_ids = expert_ids.to(torch.long)
+    valid_expert = (expert_ids >= 0) & (expert_ids < bias.shape[0])
+    safe_expert_ids = torch.where(
+        valid_expert,
+        expert_ids,
+        torch.zeros_like(expert_ids),
+    )
+    expert_bias = bias[safe_expert_ids].to(valid_out.dtype)
+    valid_shape = (valid_expert.shape[0],) + (1,) * (expert_bias.dim() - 1)
+    return valid_out + torch.where(
+        valid_expert.view(valid_shape),
+        expert_bias,
+        torch.zeros_like(expert_bias),
+    )
+
+
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -54,15 +86,14 @@ def _moe_sorting_impl(
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
     local_topk_ids = (
-        torch.empty_like(topk_ids)
-        if return_local_topk_ids and expert_mask is not None and use_opus
+        _map_global_to_local_topk_ids(topk_ids, expert_mask)
+        if return_local_topk_ids
         else None
     )
 
     if use_opus:
-        opus_dispatch_policy = 1 if return_local_topk_ids else dispatch_policy
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
-            M, num_experts, topk, opus_dispatch_policy
+            M, num_experts, topk, dispatch_policy
         )
         workspace = (
             torch.empty(ws_size, dtype=torch.uint8, device=device)
@@ -82,8 +113,7 @@ def _moe_sorting_impl(
             expert_mask,
             num_local_tokens,
             workspace,
-            opus_dispatch_policy,
-            local_topk_ids,
+            dispatch_policy,
         )
     else:
         aiter.moe_sorting_fwd(
@@ -129,7 +159,7 @@ def moe_sorting(
             expert_mask,
             num_local_tokens,
             dispatch_policy,
-            use_opus=return_local_topk_ids or not _USE_CK_MOE_SORTING,
+            use_opus=not _USE_CK_MOE_SORTING,
             return_local_topk_ids=return_local_topk_ids,
         )
     except Exception as e:
@@ -2297,9 +2327,7 @@ def cktile_moe_stage1(
                 aiter.swiglu_and_mul(out, valid_out)
             else:
                 if bias1 is not None:
-                    valid_out = valid_out + bias1[expert_ids.to(torch.long)].to(
-                        valid_out.dtype
-                    )
+                    valid_out = _add_valid_expert_bias(valid_out, expert_ids, bias1)
                 aiter.gelu_and_mul(out, valid_out)
     return out
 
