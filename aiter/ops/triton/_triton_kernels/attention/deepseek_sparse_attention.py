@@ -10,10 +10,15 @@ Forward:
   O[t,h] = softmax(Q[t,h] @ KV[topk[t]]^T) @ V[topk[t]]
   Single autotuned kernel with online softmax.
 
-Backward — three strategies:
-  1. "fused"              — single fused kernel, 58ms, no extra memory (baseline)
-  2. "recompute"          — split dQ + dKV, recomputes S/P/dS, 49ms, 0 extra memory
-  3. "split_intermediate" — split dQ + dKV, stores dS/P intermediates, 35ms, 2 GiB extra
+Backward — 8 strategies (see README_DSA.md for full comparison):
+  "fused"              — single fused kernel, 61ms, 0 extra memory (baseline)
+  "recompute"          — split dQ+dKV, recomputes S/P/dS, 52ms, 0 extra memory
+  "split_intermediate" — split dQ+dKV, stores dS/P intermediates, 38ms, 2 GiB extra
+  "privatized"         — split dQ+dKV, 8 private dKV copies, 38ms, 2.1 GiB extra
+  "xcd_privatized"     — split dQ+dKV, hw_id XCD routing, 38ms, 2.1 GiB extra
+  "gather"             — no atomics, [T,TOPK,D] intermediate + CSR gather, 18ms, 6.5 GiB
+  "chunked_gather"     — no atomics, chunked gather (R_CHUNK=256), 23ms, 1.65 GiB
+  "persistent"         — 304-CTA L2-local atomics; blocked by Triton/LLVM compile hang
 
 Performance measured on MI300X with T=4096 H=128 D=576 TOPK=1024.
 """
