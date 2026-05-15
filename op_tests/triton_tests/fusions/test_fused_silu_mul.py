@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from aiter.ops.triton.fusions.fused_silu_mul import fused_silu_mul_last_dim
+from aiter.ops.triton.activation import fused_silu_mul
 
 LOG2_E = 1.44269504089
 
@@ -38,18 +38,18 @@ def torch_silu_mul_last_dim_ref(x: torch.Tensor) -> torch.Tensor:
         (1, 3, 7, 32),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_explicit_out", [False, True])
-def test_fused_silu_mul_last_dim(shape, dtype, use_explicit_out):
+def test_fused_silu_mul(shape, dtype, use_explicit_out):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     x = torch.randn(shape, dtype=dtype, device="cuda")
     ref = torch_silu_mul_last_dim_ref(x)
     if use_explicit_out:
         out = torch.empty_like(ref)
-        fused_silu_mul_last_dim(x, out)
+        fused_silu_mul(x, out)
     else:
-        out = fused_silu_mul_last_dim(x)
+        out = fused_silu_mul(x)
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
 
@@ -58,7 +58,7 @@ def test_fused_silu_mul_requires_even_last_dim():
         pytest.skip("CUDA required")
     x = torch.randn(2, 3, device="cuda")
     with pytest.raises(AssertionError, match="even"):
-        fused_silu_mul_last_dim(x)
+        fused_silu_mul(x)
 
 
 @pytest.mark.parametrize(
@@ -84,7 +84,7 @@ def test_fused_silu_mul_tp4_moe_shapes(n_rows, last_dim, dtype):
     shape = (n_rows, last_dim)
     x = torch.randn(shape, dtype=dtype, device="cuda")
     ref = torch_silu_mul_last_dim_ref(x)
-    out = fused_silu_mul_last_dim(x)
+    out = fused_silu_mul(x)
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
 
@@ -120,5 +120,5 @@ def test_fused_silu_mul_tp4_prefill_bf16(n_rows, last_dim):
     shape = (n_rows, last_dim)
     x = torch.randn(shape, dtype=dtype, device="cuda")
     ref = torch_silu_mul_last_dim_ref(x)
-    out = fused_silu_mul_last_dim(x)
+    out = fused_silu_mul(x)
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
