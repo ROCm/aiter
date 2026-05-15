@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 import pytest
 from aiter.ops.triton.quant.fused_mxfp4_quant import (
     fused_flatten_mxfp4_quant,
@@ -235,7 +234,6 @@ def test_fused_rms_quant(
     y1_fp32_triton = convert_mxfp4_to_fp32(y1_fp4_triton, y1_scales_triton)
 
     torch.testing.assert_close(y1_fp32_torch, y1_fp32_triton)
-
 
 
 @pytest.mark.parametrize(
