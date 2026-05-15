@@ -1843,14 +1843,11 @@ __global__ void __launch_bounds__(1024, 1)
     int hidden_dim          = hidden_dim_q + hidden_dim_k + hidden_dim_v;
     bool is_q               = (int)threadIdx.x * pack_size < hidden_dim_q;
     bool is_qk              = (int)threadIdx.x * pack_size < hidden_dim_qk;
-    bool is_k               = (!is_q) && (is_qk);
     bool is_q_t0            = threadIdx.x == 0;
     bool is_k_t0            = threadIdx.x == (hidden_dim_q / pack_size);
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
-    int tidx                = blockIdx.x;
     int access_id_in_token  = threadIdx.x * pack_size;
-    int idx                 = tidx * hidden_dim + access_id_in_token;
     int wid                 = threadIdx.x / WARP_SIZE;
 
     const P* ptrs[ngpus];
@@ -1865,97 +1862,110 @@ __global__ void __launch_bounds__(1024, 1)
 
     __shared__ float smem[32];
 
-    A acc{};
-    P vec{};
-    P var_vec{};
-    P weight_p{};
-    float sum2 = 0.0f;
+    for(int tidx = blockIdx.x; tidx < token_num; tidx += gridDim.x)
+    {
+        int idx = tidx * hidden_dim + access_id_in_token;
+        P vec = ptrs[rank][idx / pack_size];
+        A acc;
 
-    vec = ptrs[rank][idx / pack_size];
-
-    if (is_qk) {
-
+        if (is_qk) {
+            float sum2 = 0.0f;
 #pragma unroll
-        for(int v = 0; v < pack_size; ++v)
-        {
-            acc[v] = upcast_s(vec[v]);
-            sum2 += acc[v] * acc[v];
+            for(int v = 0; v < pack_size; ++v)
+            {
+                acc[v] = upcast_s(vec[v]);
+                sum2 += acc[v] * acc[v];
+            }
+            sum2 = warpReduce<AddFunctor, float, WARP_SIZE>(sum2);
+            if (threadIdx.x % WARP_SIZE == 0)
+                smem[wid] = sum2;
         }
-        
-        sum2 = warpReduce<AddFunctor, float, WARP_SIZE>(sum2);
-
-        if (threadIdx.x % WARP_SIZE == 0)
-            smem[wid] = sum2;
         __syncthreads();
 
-        sum2 = 0.0f;
-
-        if (is_q_t0) {
-            for (int i = 0; i < hidden_dim_q / WARP_SIZE / pack_size; ++i) {
-                sum2 += smem[i];
+        if (is_qk) {
+            P var_vec{};
+            float sum2 = 0.0f;
+            if (is_q_t0) {
+                for (int i = 0; i < hidden_dim_q / WARP_SIZE / pack_size; ++i)
+                    sum2 += smem[i];
+                sum2 /= (float)hidden_dim_q;
+                *reinterpret_cast<float*>(&var_vec) = sum2;
+                tmps[rank][tidx * 2 + 0] = var_vec;
+            } else if (is_k_t0) {
+                for (int i = hidden_dim_q / WARP_SIZE / pack_size;
+                     i < hidden_dim_qk / WARP_SIZE / pack_size; ++i)
+                    sum2 += smem[i];
+                sum2 /= (float)hidden_dim_k;
+                *reinterpret_cast<float*>(&var_vec) = sum2;
+                tmps[rank][tidx * 2 + 1] = var_vec;
             }
-            sum2 /= (float)hidden_dim_q;
-            *reinterpret_cast<float*>(&var_vec) = sum2;
-            tmps[rank][tidx * 2 + 0] = var_vec;
-        } else if (is_k_t0) {
-            for (int i = hidden_dim_q / WARP_SIZE / pack_size; i < hidden_dim_qk / WARP_SIZE / pack_size; ++i) {
-                sum2 += smem[i];
-            }
-            sum2 /= (float)hidden_dim_k;
-            *reinterpret_cast<float*>(&var_vec) = sum2;
-            tmps[rank][tidx * 2 + 1] = var_vec;
+        } else {
+            *reinterpret_cast<P*>(&v_out[tidx * hidden_dim_v +
+                                        access_id_in_token - hidden_dim_qk]) = vec;
         }
+        __syncthreads();
+    }
 
-        end_sync<ngpus>(sg, self_sg, rank);
+    end_sync<ngpus>(sg, self_sg, rank);
 
-        if (is_q_t0) {
+    for(int tidx = blockIdx.x; tidx < token_num; tidx += gridDim.x)
+    {
+        int idx = tidx * hidden_dim + access_id_in_token;
+        P vec;
+        A acc;
+
+        if (is_qk) {
+            vec = ptrs[rank][idx / pack_size];
 #pragma unroll
-            for(int r = 1; r < ngpus; ++r)
-            {
-                int target = (rank + r) % ngpus;
-                auto peer_vec = tmps[target][tidx * 2 + 0];
-                sum2 += *reinterpret_cast<float*>(&peer_vec);
-            }
-            smem[0] = sum2;
-        } else if (is_k_t0) {
+            for(int v = 0; v < pack_size; ++v)
+                acc[v] = upcast_s(vec[v]);
+
+            float sum2 = 0.0f;
+            if (is_q_t0) {
+                sum2 = *reinterpret_cast<float*>(&tmps[rank][tidx * 2 + 0]);
 #pragma unroll
-            for(int r = 1; r < ngpus; ++r)
-            {
-                int target = (rank + r) % ngpus;
-                auto peer_vec = tmps[target][tidx * 2 + 1];
-                sum2 += *reinterpret_cast<float*>(&peer_vec);
+                for(int r = 1; r < ngpus; ++r)
+                {
+                    int target = (rank + r) % ngpus;
+                    auto peer_vec = tmps[target][tidx * 2 + 0];
+                    sum2 += *reinterpret_cast<float*>(&peer_vec);
+                }
+                smem[0] = sum2;
+            } else if (is_k_t0) {
+                sum2 = *reinterpret_cast<float*>(&tmps[rank][tidx * 2 + 1]);
+#pragma unroll
+                for(int r = 1; r < ngpus; ++r)
+                {
+                    int target = (rank + r) % ngpus;
+                    auto peer_vec = tmps[target][tidx * 2 + 1];
+                    sum2 += *reinterpret_cast<float*>(&peer_vec);
+                }
+                smem[1] = sum2;
             }
-            smem[1] = sum2;
         }
-
         __syncthreads();
 
         if (is_q) {
-            weight_p = *reinterpret_cast<P*>(&q_w[access_id_in_token]);
+            P weight_p = *reinterpret_cast<P*>(&q_w[access_id_in_token]);
             float denom = rsqrtf(smem[0] / ngpus + eps);
 #pragma unroll
             for(int v = 0; v < pack_size; ++v)
-            {
                 vec[v] = downcast_s<T>(acc[v] * denom * weight_p[v]);
-            }
             *reinterpret_cast<P*>(&q_out[tidx * hidden_dim_q + access_id_in_token]) = vec;
-        } else {
-            weight_p = *reinterpret_cast<P*>(&k_w[access_id_in_token - hidden_dim_q]);
+        } else if (is_qk) {
+            P weight_p = *reinterpret_cast<P*>(&k_w[access_id_in_token - hidden_dim_q]);
             float denom = rsqrtf(smem[1] / ngpus + eps);
 #pragma unroll
             for(int v = 0; v < pack_size; ++v)
-            {
                 vec[v] = downcast_s<T>(acc[v] * denom * weight_p[v]);
-            }
-            *reinterpret_cast<P*>(&k_out[tidx * hidden_dim_k + access_id_in_token - hidden_dim_q]) = vec;
+            *reinterpret_cast<P*>(&k_out[tidx * hidden_dim_k +
+                                         access_id_in_token - hidden_dim_q]) = vec;
         }
-    
-    } else {
-        *reinterpret_cast<P*>(&v_out[tidx * hidden_dim_v + access_id_in_token - hidden_dim_qk]) = vec;
+        __syncthreads();
     }
 }
 
-template <typename T , int NGPUS>
+template <typename T, int NGPUS>
 void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                              RankSignals sg,
                                              Signal* self_sg,
@@ -1978,15 +1988,13 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
     constexpr int WARP_WORK_SIZE = WARP_SIZE * PACK_SIZE;
     int hidden_dim               = hidden_dim_q + hidden_dim_k + hidden_dim_v;
     int BLOCK_SIZE               = hidden_dim / PACK_SIZE;
-    if(token_num > kMaxBlocks)
-        throw std::runtime_error(
-            "Token number is too large for qknorm_allreduce_fusion_kernel_2stage kernel");
     bool valid = (hidden_dim_q % WARP_WORK_SIZE == 0) && (hidden_dim_k % WARP_WORK_SIZE == 0) && (hidden_dim_v % WARP_WORK_SIZE == 0);
     if (!valid)
         throw std::runtime_error(
             "Invalid qk hidden dim layout for qknorm_allreduce_fusion_kernel_2stage kernel");
     dim3 threadsPerBlock(BLOCK_SIZE);
-    dim3 numBlocks(token_num);
+    int grid_blocks = std::min(token_num, kMaxBlocks);
+    dim3 numBlocks(grid_blocks);
     qknorm_allreduce_fusion_kernel_2stage<T, NGPUS, WARP_SIZE>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
                                                     sg,
