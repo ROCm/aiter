@@ -127,7 +127,8 @@ std::tuple<std::string, std::string, std::string> get_heuristic_kernel(std::stri
     return std::make_tuple(preProcessingKernelName, dQdKdVKernelName, postProcessingKernelName);
 }
 
-float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
+__attribute__((visibility("default"))) float mha_bwd(mha_bwd_args a,
+                                                     const ck_tile::stream_config& s)
 {
     float asm_ret = fmha_v3_bwd(a, s);
 #if ONLY_FAV3
