@@ -3268,7 +3268,7 @@ def compile_mixed_moe_gemm2(
             if const_expr(is_f16_a):
                 sx_rsrc = None
             else:
-                if const_expr(is_f4_a):
+                if const_expr(is_f4_a or is_f8_a):
                     # A2 microscale: e8m0 in sorted layout [sorted_size, K/32].
                     # Caller must pre-scatter a2_scale via moe_mxfp4_sort.
                     kblk = _div_pow2(k_in, 32)
