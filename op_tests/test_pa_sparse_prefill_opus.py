@@ -56,7 +56,6 @@ import aiter  # noqa: F401  (registers the top-level export)
 from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
 from aiter.test_common import benchmark, checkAllclose, perftest
 
-
 # ---------------------------------------------------------------------------
 # Skip helpers
 # ---------------------------------------------------------------------------
@@ -99,14 +98,14 @@ def _skip_if_unsupported(d: int) -> bool:
 
 
 def _ref_pa_sparse_prefill_opus(
-    q: torch.Tensor,                  # [N, H, D]
-    unified_kv: torch.Tensor,         # [total_pages, D]
+    q: torch.Tensor,  # [N, H, D]
+    unified_kv: torch.Tensor,  # [total_pages, D]
     kv_indices_prefix: torch.Tensor,  # [nnz_prefix] int32
-    kv_indptr_prefix: torch.Tensor,   # [N+1] int32
-    kv: torch.Tensor,                 # [total_tokens, D]
+    kv_indptr_prefix: torch.Tensor,  # [N+1] int32
+    kv: torch.Tensor,  # [total_tokens, D]
     kv_indices_extend: torch.Tensor,  # [nnz_extend] int32
-    kv_indptr_extend: torch.Tensor,   # [N+1] int32
-    attn_sink: torch.Tensor,          # [H] fp32
+    kv_indptr_extend: torch.Tensor,  # [N+1] int32
+    attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
 ) -> torch.Tensor:
     """Per-token reference. Matches the GPU kernel: online-softmax over
@@ -194,16 +193,12 @@ def _random_csr(
 def _dense_csr(
     n: int, total_rows: int, *, device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    indptr = torch.arange(
-        0, (n + 1) * total_rows, total_rows, dtype=torch.int32
-    )
+    indptr = torch.arange(0, (n + 1) * total_rows, total_rows, dtype=torch.int32)
     indices = torch.arange(total_rows, dtype=torch.int32).repeat(n)
     return indptr.to(device), indices.to(device)
 
 
-def _empty_csr(
-    n: int, *, device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def _empty_csr(n: int, *, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.zeros(n + 1, dtype=torch.int32, device=device),
         torch.zeros(0, dtype=torch.int32, device=device),
@@ -239,17 +234,19 @@ def _make_inputs(
     unified_kv = (
         torch.randn(total_pages, d, device=device, dtype=torch.float32) * 0.5
     ).to(dtype)
-    kv = (
-        torch.randn(total_tokens, d, device=device, dtype=torch.float32) * 0.5
-    ).to(dtype)
-    attn_sink = (torch.randn(h, device=device, dtype=torch.float32) * 0.25)
+    kv = (torch.randn(total_tokens, d, device=device, dtype=torch.float32) * 0.5).to(
+        dtype
+    )
+    attn_sink = torch.randn(h, device=device, dtype=torch.float32) * 0.25
 
     def _csr(total_rows: int, seed_offset: int):
         if mode == "sparse":
             return _random_csr(
-                n, total_rows,
+                n,
+                total_rows,
                 max_nnz_per_row=min(total_rows, 96),
-                device=device, seed=seed * 2 + seed_offset,
+                device=device,
+                seed=seed * 2 + seed_offset,
             )
         if mode == "dense":
             return _dense_csr(n, total_rows, device=device)
@@ -316,8 +313,14 @@ def run_pa_sparse_prefill_opus(
         return None
 
     inputs = _make_inputs(
-        n, h, d, total_pages, total_tokens, dtype,
-        mode=mode, seed=seed,
+        n,
+        h,
+        d,
+        total_pages,
+        total_tokens,
+        dtype,
+        mode=mode,
+        seed=seed,
     )
     softmax_scale = 1.0 / math.sqrt(d)
 
@@ -331,7 +334,10 @@ def run_pa_sparse_prefill_opus(
         got = pa_sparse_prefill_opus(**inputs, softmax_scale=softmax_scale)
         rtol, atol = _get_tolerances(dtype)
         checkAllclose(
-            got, ref, rtol=rtol, atol=atol,
+            got,
+            ref,
+            rtol=rtol,
+            atol=atol,
             msg=(
                 f"[N={n} H={h} D={d} tp={total_pages} tt={total_tokens} "
                 f"dtype={dtype} mode={mode}]"
@@ -372,9 +378,7 @@ _PYTEST_DTYPES = [torch.bfloat16, torch.float16]
 _PYTEST_MODES = ["sparse", "dense", "empty"]
 
 
-@pytest.mark.parametrize(
-    "dtype", _PYTEST_DTYPES, ids=lambda d: str(d).split(".")[-1]
-)
+@pytest.mark.parametrize("dtype", _PYTEST_DTYPES, ids=lambda d: str(d).split(".")[-1])
 @pytest.mark.parametrize(
     "n,h,total_pages,total_tokens",
     _PYTEST_SHAPES,
@@ -384,12 +388,16 @@ _PYTEST_MODES = ["sparse", "dense", "empty"]
 def test_pa_sparse_prefill_opus(dtype, n, h, total_pages, total_tokens, mode):
     # bench=False keeps pytest fast; CLI path does the timing.
     run_pa_sparse_prefill_opus(
-        n=n, h=h, d=512,
-        total_pages=total_pages, total_tokens=total_tokens,
+        n=n,
+        h=h,
+        d=512,
+        total_pages=total_pages,
+        total_tokens=total_tokens,
         dtype=dtype,
         mode=mode,
         seed=(hash((n, h, total_pages, total_tokens, str(dtype), mode)) & 0xFFFF),
-        verify=True, bench=False,
+        verify=True,
+        bench=False,
     )
 
 
@@ -406,33 +414,45 @@ parser = argparse.ArgumentParser(
     ),
 )
 parser.add_argument(
-    "-n", "--n_tokens",
-    type=int, nargs="*", default=[1024],
+    "-n",
+    "--n_tokens",
+    type=int,
+    nargs="*",
+    default=[1024],
     help="number of query tokens N (default: 1024)",
 )
 parser.add_argument(
     "--h_q",
-    type=int, nargs="*", default=[128],
+    type=int,
+    nargs="*",
+    default=[128],
     help="number of query heads H_Q (default: 128)",
 )
 parser.add_argument(
-    "-d", "--head_dim",
-    type=int, default=512,
+    "-d",
+    "--head_dim",
+    type=int,
+    default=512,
     help="head dim D, kernel currently only compiled for 512 (default: 512)",
 )
 parser.add_argument(
     "--total_pages",
-    type=int, default=None,
+    type=int,
+    default=None,
     help="rows in unified_kv (default: matches -n)",
 )
 parser.add_argument(
     "--total_tokens",
-    type=int, default=None,
+    type=int,
+    default=None,
     help="rows in extend kv (default: matches -n)",
 )
 parser.add_argument(
     "--dtype",
-    type=str, nargs="*", default=["bf16"], choices=["bf16", "fp16"],
+    type=str,
+    nargs="*",
+    default=["bf16"],
+    choices=["bf16", "fp16"],
     help="attention dtype(s) to sweep (default: bf16)",
 )
 parser.add_argument(
@@ -455,7 +475,8 @@ parser.add_argument(
 )
 parser.add_argument(
     "--seed",
-    type=int, default=0,
+    type=int,
+    default=0,
     help="RNG seed for input + CSR generation",
 )
 
@@ -491,7 +512,9 @@ if __name__ == "__main__":
         # Stringify dtype for prettier print.
         if "dtype" in df.columns:
             df["dtype"] = df["dtype"].map(
-                lambda t: str(t).split(".")[-1] if hasattr(t, "is_floating_point") else str(t)
+                lambda t: (
+                    str(t).split(".")[-1] if hasattr(t, "is_floating_point") else str(t)
+                )
             )
         # Drop columns that don't carry signal in the default sweep.
         drop_cols = [c for c in ("verify", "bench", "seed") if c in df.columns]

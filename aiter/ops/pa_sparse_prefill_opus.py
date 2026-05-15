@@ -85,12 +85,10 @@ def pa_sparse_prefill_opus(
       ``out`` (``[T, H, D]`` same dtype as ``q``).
     """
     if q.dtype not in (torch.bfloat16, torch.float16):
-        raise RuntimeError(
-            f"pa_sparse_prefill_opus expects fp16/bf16 q, got {q.dtype}"
-        )
+        raise RuntimeError(f"pa_sparse_prefill_opus expects fp16/bf16 q, got {q.dtype}")
     if unified_kv.dtype != q.dtype:
         raise RuntimeError(
-            f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
+            f"unified_kv dtype mismatch: unified_kv={unified_kv.dtype}, q={q.dtype}"
         )
     if kv.dtype != q.dtype:
         raise RuntimeError(f"kv dtype mismatch: kv={kv.dtype}, q={q.dtype}")
