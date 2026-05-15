@@ -3,7 +3,7 @@
         "BLOCK_M": 16,
         "BLOCK_K": 256,
         "BLOCK_C": 128,
-        "NUM_KSPLIT": 32,
+        "NUM_KSPLIT": 28,
         "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 0
@@ -12,7 +12,7 @@
         "BLOCK_M": 32,
         "BLOCK_K": 256,
         "BLOCK_C": 256,
-        "NUM_KSPLIT": 8,
+        "NUM_KSPLIT": 7,
         "num_warps": 8,
         "num_stages": 2,
         "waves_per_eu": 2
@@ -21,7 +21,7 @@
         "BLOCK_M": 64,
         "BLOCK_K": 128,
         "BLOCK_C": 64,
-        "NUM_KSPLIT": 8,
+        "NUM_KSPLIT": 7,
         "num_warps": 8,
         "num_stages": 2,
         "waves_per_eu": 1
@@ -30,7 +30,7 @@
         "BLOCK_M": 64,
         "BLOCK_K": 256,
         "BLOCK_C": 64,
-        "NUM_KSPLIT": 4,
+        "NUM_KSPLIT": 7,
         "num_warps": 8,
         "num_stages": 2,
         "waves_per_eu": 1
@@ -39,7 +39,7 @@
         "BLOCK_M": 64,
         "BLOCK_K": 256,
         "BLOCK_C": 256,
-        "NUM_KSPLIT": 2,
+        "NUM_KSPLIT": 7,
         "num_warps": 8,
         "num_stages": 2,
         "waves_per_eu": 0
@@ -48,7 +48,7 @@
         "BLOCK_M": 64,
         "BLOCK_K": 256,
         "BLOCK_C": 256,
-        "NUM_KSPLIT": 2,
+        "NUM_KSPLIT": 7,
         "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 0
@@ -57,7 +57,7 @@
         "BLOCK_M": 64,
         "BLOCK_K": 256,
         "BLOCK_C": 256,
-        "NUM_KSPLIT": 2,
+        "NUM_KSPLIT": 7,
         "num_warps": 4,
         "num_stages": 1,
         "waves_per_eu": 0
