@@ -78,7 +78,7 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
 @triton.jit
 def _act_mul_and_dynamic_mxfp4_quant_kernel(
     x_ptr,
-    x_out_ptr,
+    x_fp4_ptr,
     bs_ptr,
     stride_x_m_in,
     stride_x_n_in,
@@ -141,15 +141,14 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
         out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
         out_offs = (
-            out_offs_m[:, None] * stride_x_fp4_m
-            + out_offs_n[None, :] * stride_x_fp4_n
+            out_offs_m[:, None] * stride_x_fp4_m + out_offs_n[None, :] * stride_x_fp4_n
         )
 
         if EVEN_M_N:
-            tl.store(x_out_ptr + out_offs, out_tensor)
+            tl.store(x_fp4_ptr + out_offs, out_tensor)
         else:
             out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
-            tl.store(x_out_ptr + out_offs, out_tensor, mask=out_mask)
+            tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
 
         bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
