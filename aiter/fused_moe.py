@@ -1113,6 +1113,7 @@ def get_2stage_cfgs(
         )
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
+    is_cktile2 = bool(kernelName2) and kernelName2.startswith("cktile_")
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
@@ -1139,6 +1140,26 @@ def get_2stage_cfgs(
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
+            )
+        elif is_cktile2:
+            # cktile_* kernels live in module_moe_cktile2stages, not in
+            # module_moe_ck2stages. Dispatching them via ck_moe_stage2_fwd
+            # misses the lookup table and falls back to heuristic, which
+            # breaks cudagraph capture.
+            #
+            # Do NOT forward kernelName2: the CSV value `cktile_a8w4_bm{N}`
+            # is just a tuner label (gemm_moe_tune.py:2344,2377), not a real
+            # key in get_cktile_name_lookup() (real names are e.g.
+            # `moe_cktile2stages_gemm2_256x32x256x256_...`). The tuner itself
+            # (gemm_moe_tune.py:394-409) calls cktile_moe_stage2 with empty
+            # kernel_name + block_m, hitting the heuristic dispatch in
+            # moe_cktile2stages.cu:456-487. Match that here so we land on the
+            # same kernel as the tuner measured.
+            stage2_func = functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
             )
         else:
             stage2_func = functools.partial(
@@ -1369,6 +1390,21 @@ def get_2stage_cfgs(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
             )
+        elif kernelName2 and kernelName2.startswith("cktile_"):
+            # cktile_* kernels must be dispatched via cktile_moe_stage2 (in
+            # module_moe_cktile2stages); ck_moe_stage2_fwd only knows about
+            # module_moe_ck2stages kernels.
+            #
+            # Do NOT forward kernelName2: `cktile_a8w4_bm{N}` is a tuner label,
+            # not a key in get_cktile_name_lookup(). The tuner itself uses
+            # empty kernel_name + block_m and relies on the heuristic dispatch
+            # in moe_cktile2stages.cu — match that here.
+            stage2_func = functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            )
         else:
             stage2_func = functools.partial(
                 aiter.ck_moe_stage2_fwd,
@@ -1399,6 +1435,29 @@ def get_2stage_cfgs(
         tag = ""
         block_m = ([el for el in tmpList if block_m < el] + [128])[0]
 
+    if kernelName2 and kernelName2.startswith("cktile_"):
+        # cktile_* kernels must be dispatched via cktile_moe_stage2 (in
+        # module_moe_cktile2stages); ck_moe_stage2_fwd only knows about
+        # module_moe_ck2stages kernels.
+        #
+        # Do NOT forward kernelName2: `cktile_a8w4_bm{N}` is a tuner label,
+        # not a key in get_cktile_name_lookup(). The tuner itself uses empty
+        # kernel_name + block_m and relies on the heuristic dispatch in
+        # moe_cktile2stages.cu — match that here.
+        stage2_func = functools.partial(
+            cktile_moe_stage2,
+            n_pad_zeros=hidden_pad // 64 * 64,
+            k_pad_zeros=intermediate_pad // 128 * 128,
+            activation=activation,
+        )
+    else:
+        stage2_func = functools.partial(
+            aiter.ck_moe_stage2_fwd,
+            kernelName=kernelName2,
+            activation=activation,
+            quant_type=q_type,
+            use_non_temporal_load=use_non_temporal_load,
+        )
     return MOEMetadata(
         functools.partial(
             asm_stage1,
@@ -1406,13 +1465,7 @@ def get_2stage_cfgs(
             activation=activation,
             quant_type=q_type,
         ),
-        functools.partial(
-            aiter.ck_moe_stage2_fwd,
-            kernelName=kernelName2,
-            activation=activation,
-            quant_type=q_type,
-            use_non_temporal_load=use_non_temporal_load,
-        ),
+        stage2_func,
         block_m,
         ksplit,
         run_1stage,
