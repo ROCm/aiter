@@ -890,6 +890,11 @@ def flydsl_moe_stage1(
     )
     _run_compiled(exe, args)
 
+    # a16w4 split-K accumulates partials into f32 via atomics.
+    # All post-GEMM kernels (silu_and_mul_fq, silu_and_mul) expect bf16 input.
+    if _is_splitk and tmp_out is not None and tmp_out.dtype == torch.float32:
+        tmp_out = tmp_out.to(dtypes.bf16)
+
     num_sorted_rows = sorted_token_ids.shape[0]
     use_splitk_bias = _is_splitk and bias is not None
     if use_splitk_bias and topk_ids is None:
