@@ -85,7 +85,7 @@ def generate_cp_test_data(seq_len, seq_len_kv):
 
 @pytest.mark.parametrize(
     "s_q, s_k",
-    [   
+    [
         (1, 1),
         (1, 16),
         (1, 113),
@@ -147,5 +147,5 @@ def test_fp8_mqa_logits(
     logits = logits.masked_fill(neginf_mask, 0)
     diff = calc_diff(logits, ref_logits)
     if ref_neginf_mask.all():
-        return   # nothing left to compare
+        return  # nothing left to compare
     assert diff < 1e-3, f"{diff=}"
