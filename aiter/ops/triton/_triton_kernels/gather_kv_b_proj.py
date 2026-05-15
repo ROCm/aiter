@@ -266,13 +266,17 @@ def _triton_gather_kv_b_proj(
         ).to(tl.float32)
 
     for chunk_id in range(total_kv_chunk):
+        block_lane_valid = (
+            chunk_id * KBlocksPerChunkK + tl.arange(0, ChunkK) // KBlockSize
+            < total_kv_block
+        )
         kv_block_idx = tl.load(
             kv_indices
             + kv_block_start
             + chunk_id * KBlocksPerChunkK
             + tl.arange(0, ChunkK) // KBlockSize,
-            mask=chunk_id * KBlocksPerChunkK + tl.arange(0, ChunkK) // KBlockSize
-            < total_kv_block,
+            mask=block_lane_valid,
+            other=0,
         )
         kv_c_data_base_offset = (
             kv_block_idx[:, None] * stride_k_buffer
@@ -283,16 +287,35 @@ def _triton_gather_kv_b_proj(
         accum_k = tl.zeros((ChunkK, PaddedK), dtype=tl.float32)
         accum_v = tl.zeros((ChunkK, PaddedV), dtype=tl.float32)
 
-        kv_c_data_0 = tl.load(k_buffer + kv_c_data_base_offset + 0 * ScaleKGranularity)
-        kv_c_data_1 = tl.load(k_buffer + kv_c_data_base_offset + 1 * ScaleKGranularity)
-        kv_c_data_2 = tl.load(k_buffer + kv_c_data_base_offset + 2 * ScaleKGranularity)
-        kv_c_data_3 = tl.load(k_buffer + kv_c_data_base_offset + 3 * ScaleKGranularity)
+        row_mask = block_lane_valid[:, None]
+        kv_c_data_0 = tl.load(
+            k_buffer + kv_c_data_base_offset + 0 * ScaleKGranularity,
+            mask=row_mask,
+            other=0.0,
+        )
+        kv_c_data_1 = tl.load(
+            k_buffer + kv_c_data_base_offset + 1 * ScaleKGranularity,
+            mask=row_mask,
+            other=0.0,
+        )
+        kv_c_data_2 = tl.load(
+            k_buffer + kv_c_data_base_offset + 2 * ScaleKGranularity,
+            mask=row_mask,
+            other=0.0,
+        )
+        kv_c_data_3 = tl.load(
+            k_buffer + kv_c_data_base_offset + 3 * ScaleKGranularity,
+            mask=row_mask,
+            other=0.0,
+        )
         kv_pe_data = tl.load(
             k_buffer
             + kv_block_idx[:, None] * stride_k_buffer
             + tl.arange(0, ChunkK)[:, None] % KBlockSize * (KV_CDim + KV_PeDim)
             + KV_CDim
             + tl.arange(0, KV_PeDim)[None, :],
+            mask=row_mask,
+            other=0.0,
         )
 
         if NO_SCALE:
