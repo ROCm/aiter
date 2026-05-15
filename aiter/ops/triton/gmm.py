@@ -5,6 +5,9 @@
 # Imports.
 # ------------------------------------------------------------------------------
 
+# Python standard library
+import warnings
+
 # PyTorch
 import torch
 from torch import Tensor
@@ -70,10 +73,11 @@ def gmm(
     lhs: Tensor,
     rhs: Tensor,
     group_sizes: Tensor,
+    bias: Tensor | None = None,
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
     config: dict[str, int] | None = None,
-    bias: Tensor | None = None,
+    grid_dim: int | None = None,
 ) -> Tensor:
     """
     Perform Group Matrix Multiplication (GMM): out = lhs @ rhs + bias
@@ -107,6 +111,10 @@ def gmm(
         group_sizes data type must be torch.int32 or torch.int64, and all its elements must be
         non-negative.
         group_sizes must be on the same device of lhs and rhs.
+    bias : torch.Tensor or None, optional
+        Optional bias tensor. Shape: (G, N).
+        If provided, bias data type must match lhs and rhs data type, and bias must be on the same
+        device as other input tensors. Each group g adds bias[g] to the output.
     preferred_element_type : torch.dtype, optional
         Desired data type for output tensor. Default is torch.bfloat16.
         Supported output types are torch.float16 and torch.bfloat16.
@@ -119,10 +127,10 @@ def gmm(
     config : dict[str, int] or None, optional
         Optional dictionary with kernel metaparameters. If absent, config will be queried from
         internal tuning database.
-    bias : torch.Tensor or None, optional
-        Optional bias tensor. Shape: (G, N).
-        If provided, bias data type must match lhs and rhs data type, and bias must be on the same
-        device as other input tensors. Each group g adds bias[g] to the output.
+    grid_dim : positive int or None, optional
+        Optional override for GRID_DIM config. It's useful to override it while doing performance
+        experiments or launching the GMM kernel in parallel with a comms kernel (reserve some CUs
+        for comms).
 
     Returns
     -------
@@ -190,6 +198,16 @@ def gmm(
         }
     ), "Invalid GMM kernel config."
 
+    # Override grid dimension, if optional argument is provided.
+    assert (grid_dim is None) or (
+        grid_dim > 0
+    ), f"Invalid grid dimension {grid_dim}. It must be None or a positive integer."
+    if grid_dim is not None and grid_dim != config["GRID_DIM"]:
+        warnings.warn(
+            f"Overriding GMM grid dim with {grid_dim} (it was {config['GRID_DIM']})."
+        )
+        config["GRID_DIM"] = grid_dim
+
     grid = _gmm_grid(
         N,
         config["BLOCK_SIZE_M"],
@@ -251,11 +269,12 @@ def ptgmm(
     lhs: Tensor,
     rhs: Tensor,
     group_sizes: Tensor,
+    bias_grad: Tensor | None = None,
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
-    config: dict[str, int] | None = None,
-    bias_grad: Tensor | None = None,
     accumulate: bool = False,
+    config: dict[str, int] | None = None,
+    grid_dim: int | None = None,
 ) -> Tensor:
     """
     Perform a Group Matrix Multiplication (GMM) variant: out = lhs @ rhs
@@ -293,6 +312,10 @@ def ptgmm(
         group_sizes data type must be torch.int32 or torch.int64, and all its elements must be
         non-negative.
         group_sizes must be on the same device of lhs and rhs.
+    bias_grad : torch.Tensor or None, optional
+        Optional bias gradient output tensor. Shape: (G, K).
+        If provided, the kernel will compute the bias gradient and write it to this tensor.
+        bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
     preferred_element_type : torch.dtype, optional
         Desired data type for output tensor. Default is torch.bfloat16.
         Supported output types are torch.float16 and torch.bfloat16.
@@ -302,17 +325,17 @@ def ptgmm(
         allocated.
         If provided then it must have shape (G, K, N), its data type must match
         preferred_element_type and it must be on the same device of other input tensors.
-    config : dict[str, int] or None, optional
-        Optional dictionary with kernel metaparameters. If absent, config will be queried from
-        internal tuning database.
-    bias_grad : torch.Tensor or None, optional
-        Optional bias gradient output tensor. Shape: (G, K).
-        If provided, the kernel will compute the bias gradient and write it to this tensor.
-        bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
     accumulate : bool, optional
         Whether to accumulate into existing output tensor values. Default is False.
         If False, output will be overwritten with fresh computation.
         If True, results will be added to existing output tensor values.
+    config : dict[str, int] or None, optional
+        Optional dictionary with kernel metaparameters. If absent, config will be queried from
+        internal tuning database.
+    grid_dim : positive int or None, optional
+        Optional override for GRID_DIM config. It's useful to override it while doing performance
+        experiments or launching the persistent TGMM kernel in parallel with a comms kernel (reserve
+        some CUs for comms).
 
     Returns
     -------
@@ -375,6 +398,16 @@ def ptgmm(
             "GRID_DIM",
         }
     ), "Invalid PTGMM kernel config."
+
+    # Override grid dimension, if optional argument is provided.
+    assert (grid_dim is None) or (
+        grid_dim > 0
+    ), f"Invalid grid dimension {grid_dim}. It must be None or a positive integer."
+    if grid_dim is not None and grid_dim != config["GRID_DIM"]:
+        warnings.warn(
+            f"Overriding PTGMM grid dim with {grid_dim} (it was {config['GRID_DIM']})."
+        )
+        config["GRID_DIM"] = grid_dim
 
     # Bias gradient handling.
     # -----------------------
@@ -448,11 +481,11 @@ def nptgmm(
     lhs: Tensor,
     rhs: Tensor,
     group_sizes: Tensor,
+    bias_grad: Tensor | None = None,
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
-    config: dict[str, int] | None = None,
-    bias_grad: Tensor | None = None,
     accumulate: bool = False,
+    config: dict[str, int] | None = None,
 ) -> Tensor:
     """
     Perform a Group Matrix Multiplication (GMM) variant: out = lhs @ rhs
@@ -490,6 +523,10 @@ def nptgmm(
         group_sizes data type must be torch.int32 or torch.int64, and all its elements must be
         non-negative.
         group_sizes must be on the same device of lhs and rhs.
+    bias_grad : torch.Tensor or None, optional
+        Optional bias gradient output tensor. Shape: (G, K).
+        If provided, the kernel will compute the bias gradient and write it to this tensor.
+        bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
     preferred_element_type : torch.dtype, optional
         Desired data type for output tensor. Default is torch.bfloat16.
         Supported output types are torch.float16 and torch.bfloat16.
@@ -499,17 +536,13 @@ def nptgmm(
         allocated.
         If provided then it must have shape (G, K, N), its data type must match
         preferred_element_type and it must be on the same device of other input tensors.
-    config : dict[str, int] or None, optional
-        Optional dictionary with kernel metaparameters. If absent, config will be queried from
-        internal tuning database.
-    bias_grad : torch.Tensor or None, optional
-        Optional bias gradient output tensor. Shape: (G, K).
-        If provided, the kernel will compute the bias gradient and write it to this tensor.
-        bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
     accumulate : bool, optional
         Whether to accumulate into existing output tensor values. Default is False.
         If False, output will be overwritten with fresh computation.
         If True, results will be added to existing output tensor values.
+    config : dict[str, int] or None, optional
+        Optional dictionary with kernel metaparameters. If absent, config will be queried from
+        internal tuning database.
 
     Returns
     -------

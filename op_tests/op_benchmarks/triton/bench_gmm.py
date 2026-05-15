@@ -127,6 +127,7 @@ def benchmark_gmm(
     metric: str = DEFAULT_METRIC,
     use_bias: bool = False,
     accumulate: bool = False,
+    grid_dim: int | None = None,
     output: bool = False,
 ) -> None:
     assert gmm_type in GMM_TYPES, "Invalid GMM type."
@@ -134,15 +135,27 @@ def benchmark_gmm(
 
     desc, gen_tensors, kernel_wrapper = select_triton_kernel(gmm_type)
 
-    in_dtype_str = str_from_dtype(in_dtype)
-    out_dtype_str = str_from_dtype(out_dtype)
-    group_sizes_dtype_str = str_from_group_sizes_dtype(group_sizes_dtype)
-    dtypes_desc = f"i{in_dtype_str}_o{out_dtype_str}_g{group_sizes_dtype_str}"
-    layout_desc = (
-        "".join("t" if trans else "n" for trans in (trans_lhs, trans_rhs)) + "n"
-    )
-    unit = METRIC_UNITS[metric]
-    triton_provider = f"triton_{gmm_type}_{dtypes_desc}_{layout_desc}_{unit}"
+    in_dtype_str: str = str_from_dtype(in_dtype)
+    out_dtype_str: str = str_from_dtype(out_dtype)
+    group_sizes_dtype_str: str = str_from_group_sizes_dtype(group_sizes_dtype)
+    unit: str = METRIC_UNITS[metric]
+    has_grid_dim: bool = gmm_type != "nptgmm" and grid_dim is not None
+    triton_provider_desc: list[str] = [
+        "triton",
+        gmm_type,
+        # data types
+        f"i{in_dtype_str}",
+        f"o{out_dtype_str}",
+        f"g{group_sizes_dtype_str}",
+        # layout description
+        "".join("t" if trans else "n" for trans in (trans_lhs, trans_rhs)) + "n",
+    ]
+    # grid dim
+    if has_grid_dim:
+        triton_provider_desc.append(f"gd{grid_dim}")
+    # unit of benchmark metric
+    triton_provider_desc.append(unit)
+    triton_provider: str = "_".join(triton_provider_desc)
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -200,6 +213,9 @@ def benchmark_gmm(
             elif gmm_type == "ptgmm" or gmm_type == "nptgmm":
                 kwargs["bias_grad"] = bias
                 kwargs["accumulate"] = accumulate
+
+            if has_grid_dim:
+                kwargs["grid_dim"] = grid_dim
 
             p50_ms, p20_ms, p80_ms = triton.testing.do_bench(
                 lambda: kernel_wrapper(**kwargs),
@@ -293,6 +309,8 @@ def benchmark_gmm(
         num_group_sizes,
         unif_group_sizes,
     )
+    if has_grid_dim:
+        logging.info("  overridden persistent grid_dim = %d", grid_dim)
     logging.info(
         "  metric = %s (in %s)",
         metric,
@@ -434,7 +452,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Other arguments
-    parser.add_argument("--verbose", action="store_true", help="enable verbose output")
     parser.add_argument(
         "--use-bias",
         action="store_true",
@@ -446,10 +463,17 @@ def parse_args() -> argparse.Namespace:
         help="accumulate bias gradient",
     )
     parser.add_argument(
+        "--grid-dim",
+        type=positive_int,
+        default=None,
+        help="override grid dimension config of persistent kernels",
+    )
+    parser.add_argument(
         "-o",
         action="store_true",
         help="write performance results to CSV file in the current directory",
     )
+    parser.add_argument("--verbose", action="store_true", help="enable verbose output")
 
     try:
         return validate_args(parser.parse_args())
@@ -493,6 +517,7 @@ def main() -> None:
         metric=args.metric,
         use_bias=args.use_bias,
         accumulate=args.accumulate,
+        grid_dim=args.grid_dim,
         output=args.o,
     )
 

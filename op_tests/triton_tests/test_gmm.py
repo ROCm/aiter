@@ -214,9 +214,9 @@ def test_gmm(
             lhs,
             rhs,
             group_sizes,
+            bias=bias,
             preferred_element_type=out_dtype,
             existing_out=out_triton,
-            bias=bias,
         )
 
         m = int(torch.sum(group_sizes).item())
@@ -365,9 +365,9 @@ def test_tgmm(
             lhs,
             rhs,
             group_sizes,
+            bias_grad=bias_grad_torch,
             preferred_element_type=out_dtype,
             existing_out=out_torch,
-            bias_grad=bias_grad_torch,
             accumulate=False,
         )
 
@@ -469,9 +469,9 @@ def test_tgmm_accumulate(persistent_str: str, with_bias_grad: bool):
             lhs,
             rhs,
             group_sizes,
+            bias_grad=bias_grad_triton,
             preferred_element_type=out_dtype,
             existing_out=out_triton,
-            bias_grad=bias_grad_triton,
             accumulate=True,
         )
     else:
@@ -479,9 +479,9 @@ def test_tgmm_accumulate(persistent_str: str, with_bias_grad: bool):
             lhs,
             rhs,
             group_sizes,
+            bias_grad=bias_grad_triton,
             preferred_element_type=out_dtype,
             existing_out=out_triton,
-            bias_grad=bias_grad_triton,
             accumulate=True,
         )
 
