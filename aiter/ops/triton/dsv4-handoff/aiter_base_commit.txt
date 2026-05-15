@@ -1,0 +1,8 @@
+aiter_parent=b4cf226d6535044d7f59b86c7b5c636e77f73b80  aiter_head=6b3f776104eef3da37551865fbc688820238759b
+commit 6b3f776104eef3da37551865fbc688820238759b
+Author:     Aliasger Zaidy <aliasger.zaidy@amd.com>
+AuthorDate: Fri May 15 22:03:18 2026 +0000
+Commit:     Aliasger Zaidy <aliasger.zaidy@amd.com>
+CommitDate: Fri May 15 22:03:18 2026 +0000
+
+    Add a8w4 moe modifications and mxfp8 GEMM for DSv4

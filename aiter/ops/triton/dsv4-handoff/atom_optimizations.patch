@@ -1,0 +1,1005 @@
+diff --git a/atom/model_ops/fused_moe_triton.py b/atom/model_ops/fused_moe_triton.py
+index 8bb1be4c..bdbab278 100644
+--- a/atom/model_ops/fused_moe_triton.py
++++ b/atom/model_ops/fused_moe_triton.py
+@@ -218,6 +218,193 @@ def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
+     return routing_data, gather_indx, scatter_indx
+ 
+ 
++def bridge_tk_to_aiter_routing(tk_rd, block_m: int):
++    """Bridge triton_kernels RoutingData -> aiter RoutingData (for moe_gemm_a8w4).
++
++    triton_kernels carries per-block-m specializations of token_offs_pad /
++    block_pid_map as dicts keyed by block_m; the aiter variant is specialized
++    for a single block_m and stores those fields as plain tensors.
++    """
++    from aiter.ops.triton.moe.moe_routing.routing import RoutingData, ExptData
++
++    tk_ed = tk_rd.expt_data
++    if block_m not in tk_ed.token_offs_pad:
++        raise ValueError(
++            f"bridge_tk_to_aiter_routing: block_m={block_m} not present in "
++            f"tk_rd.expt_data.token_offs_pad. Keys: {sorted(tk_ed.token_offs_pad.keys())}"
++        )
++    aiter_expt_data = ExptData(
++        hist=tk_ed.hist,
++        token_offs_raw=tk_ed.token_offs_raw,
++        token_offs_pad=tk_ed.token_offs_pad[block_m],
++        block_pid_map=tk_ed.block_pid_map[block_m],
++    )
++    return RoutingData(
++        block_m=block_m,
++        gate_scal=tk_rd.gate_scal,
++        expt_hist=tk_rd.expt_hist,
++        n_expts_tot=tk_rd.n_expts_tot,
++        n_expts_act=tk_rd.n_expts_act,
++        expt_data=aiter_expt_data,
++    )
++
++
++def _a8w4_fused_experts(
++    output_tensor: torch.Tensor,
++    hidden_states: torch.Tensor,
++    w1: torch.Tensor,            # a8w4 layout: uint8 [E, K/2, 2N], stride(-2)==1
++    w2: torch.Tensor,            # a8w4 layout: uint8 [E, N/2, K], stride(-2)==1
++    w1_scale: torch.Tensor,      # swizzled ue8m0 uint8
++    w2_scale: torch.Tensor,      # swizzled ue8m0 uint8
++    routing_data,
++    gather_indx,
++    scatter_indx,
++    topk: int,
++    swiglu_limit: float,
++    w1_bias: torch.Tensor | None,
++    w2_bias: torch.Tensor | None,
++    apply_router_weight_on_input: bool,
++    pre_built_aiter_routing=None,  # if set, skip bridge and use this aiter routing directly
++    # Step 9: shared-expert output to fold into GEMM2 reduce_grouped writeback.
++    residual: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Step 1 minimum a8w4 fused experts.
++
++    Pipeline: downcast_to_mxfp -> moe_gemm_a8w4 (G1, no swiglu) ->
++              fused_clamp_act_mul (silu_mul, no quant) -> downcast_to_mxfp ->
++              moe_gemm_a8w4 (G2). No apply_swiglu fold, no out_mx_quant fold,
++              no residual fold — those are later steps.
++    """
++    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4, recommend_block_m
++    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
++
++    M, K = hidden_states.shape[-2:]
++    BLOCK_M = recommend_block_m(M)
++    # Step 3: apply_swiglu fold into GEMM1. Requires interleaved W13 (done at weight load).
++    _swiglu_fold = os.environ.get("ATOM_A8W4_SWIGLU_FOLD", "0") == "1"
++
++    # Pre-MoE quant: bf16 -> fp8 e4m3 + ue8m0 per-1x32.
++    x_fp8, x_scale = downcast_to_mxfp(
++        hidden_states, torch.float8_e4m3fn, axis=-1
++    )
++
++    # Step 4: skip bridge when pre_built_aiter_routing is provided.
++    if pre_built_aiter_routing is not None:
++        aiter_routing = pre_built_aiter_routing
++        gammas = aiter_routing.gate_scal
++        gather_src_indx = gather_indx  # already raw int32 tensor
++        scatter_src_indx = scatter_indx
++    else:
++        aiter_routing = bridge_tk_to_aiter_routing(routing_data, BLOCK_M)
++        gammas = routing_data.gate_scal if routing_data else None
++        gather_src_indx = gather_indx.src_indx
++        scatter_src_indx = scatter_indx.src_indx
++
++    if w1_scale.dtype != torch.uint8:
++        w1_scale = w1_scale.view(torch.uint8)
++    if w2_scale.dtype != torch.uint8:
++        w2_scale = w2_scale.view(torch.uint8)
++
++    if _swiglu_fold:
++        # Step 5: optional fold of MXFP8 (fp8 e4m3 + ue8m0 per-1×32) emit into
++        # GEMM1's apply_swiglu writeback. Saves one `downcast_to_mxfp` launch.
++        _mx_emit = os.environ.get("ATOM_A8W4_GEMM1_MX_EMIT", "0") == "1"
++        if _mx_emit:
++            inter_fp8, inter_scale = moe_gemm_a8w4(
++                x=x_fp8,
++                w=w1,
++                x_scales=x_scale,
++                w_scales=w1_scale,
++                bias=w1_bias,
++                routing_data=aiter_routing,
++                gather_indx=gather_src_indx,
++                gammas=gammas if apply_router_weight_on_input else None,
++                swizzle_mx_scale="CDNA4_SCALE",
++                apply_swiglu=True,
++                alpha=1.0,
++                limit=swiglu_limit,
++                add_residual=False,
++                out_dtype=torch.bfloat16,  # ignored when out_mx_quant=True
++                out_mx_quant=True,
++            )
++        else:
++            # Step 3: GEMM1 with apply_swiglu=True. Reads interleaved W13. Returns bf16 [M*topk, N].
++            # add_residual=False = V4-Flash semantics (silu(gate) * up). True would compute s*(up+1).
++            inter_bf16 = moe_gemm_a8w4(
++                x=x_fp8,
++                w=w1,
++                x_scales=x_scale,
++                w_scales=w1_scale,
++                bias=w1_bias,
++                routing_data=aiter_routing,
++                gather_indx=gather_src_indx,
++                gammas=gammas if apply_router_weight_on_input else None,
++                swizzle_mx_scale="CDNA4_SCALE",
++                apply_swiglu=True,
++                alpha=1.0,
++                limit=swiglu_limit,
++                add_residual=False,
++                out_dtype=torch.bfloat16,
++            )
++            inter_bf16 = inter_bf16.view(inter_bf16.shape[-2], inter_bf16.shape[-1])
++            inter_fp8, inter_scale = downcast_to_mxfp(
++                inter_bf16, torch.float8_e4m3fn, axis=-1
++            )
++    else:
++        # GEMM1: fp8 act x fp4 weight, bf16 output [M*topk, 2N].
++        raw_intermediate = moe_gemm_a8w4(
++            x=x_fp8,
++            w=w1,
++            x_scales=x_scale,
++            w_scales=w1_scale,
++            bias=w1_bias,
++            routing_data=aiter_routing,
++            gather_indx=gather_src_indx,
++            gammas=gammas if apply_router_weight_on_input else None,
++            swizzle_mx_scale="CDNA4_SCALE",
++            apply_swiglu=False,
++            out_dtype=torch.bfloat16,
++        )
++        raw_2d = raw_intermediate.view(
++            raw_intermediate.shape[-2], raw_intermediate.shape[-1]
++        )
++        two_N = raw_2d.shape[-1]
++        inter_bf16 = torch.empty(
++            (raw_2d.shape[0], two_N // 2),
++            device=raw_2d.device,
++            dtype=torch.bfloat16,
++        )
++        fused_clamp_act_mul(
++            raw_2d,
++            out=inter_bf16,
++            swiglu_limit=swiglu_limit,
++            activation="silu",
++            dtype_quant=None,
++        )
++        inter_fp8, inter_scale = downcast_to_mxfp(
++            inter_bf16, torch.float8_e4m3fn, axis=-1
++        )
++
++    # GEMM2: fp8 act x fp4 weight, scatter+combine.
++    # Step 9: pass `residual` so reduce_grouped folds the routed+shared add
++    # into the writeback (saves the standalone elementwise add launch).
++    y = moe_gemm_a8w4(
++        x=inter_fp8,
++        w=w2,
++        x_scales=inter_scale,
++        w_scales=w2_scale,
++        bias=w2_bias,
++        routing_data=aiter_routing,
++        scatter_indx=scatter_src_indx,
++        gammas=None if apply_router_weight_on_input else gammas,
++        swizzle_mx_scale="CDNA4_SCALE",
++        apply_swiglu=False,
++        out_dtype=torch.bfloat16,
++        residual=residual,
++    )
++    return y
++
++
+ def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
+     """
+     Shrink the given tensor and apply the given view to it.  This is
+@@ -293,13 +480,41 @@ def triton_kernel_fused_experts(
+     expert_map: torch.Tensor | None = None,
+     intermediate_cache: torch.Tensor | None = None,
+     a1q_scale: torch.Tensor | None = None,
++    w13_weight_scale_a8w4: torch.Tensor | None = None,
++    w2_weight_scale_a8w4: torch.Tensor | None = None,
++    swiglu_limit_a8w4: float = 7.0,
+ ) -> torch.Tensor:
+-    # type check, uint8 means mxfp4
++    # type check
+     assert hidden_states.dtype == torch.bfloat16
+     assert w1_bias is None or w1_bias.dtype == torch.float32
+     assert w2_bias is None or w2_bias.dtype == torch.float32
+ 
+-    # Shape check, only check non-mxfp4
++    # a8w4 path: dispatched when env is set AND a8w4 scale tensors were plumbed
++    # through. matmul_ogs path below stays untouched.
++    _use_a8w4 = (
++        os.environ.get("ATOM_MOE_BACKEND", "matmul_ogs") == "a8w4"
++        and w13_weight_scale_a8w4 is not None
++        and w2_weight_scale_a8w4 is not None
++    )
++    if _use_a8w4:
++        return _a8w4_fused_experts(
++            output_tensor,
++            hidden_states,
++            w1,
++            w2,
++            w13_weight_scale_a8w4,
++            w2_weight_scale_a8w4,
++            routing_data,
++            gather_indx,
++            scatter_indx,
++            topk,
++            swiglu_limit=swiglu_limit_a8w4,
++            w1_bias=w1_bias,
++            w2_bias=w2_bias,
++            apply_router_weight_on_input=apply_router_weight_on_input,
++        )
++
++    # Shape check for matmul_ogs path (a8w4 has different layout)
+     assert hidden_states.ndim == 2
+     assert hidden_states.shape[-1] == w1.shape[-2]
+     assert w2.shape[-1] == w1.shape[1]
+diff --git a/atom/model_ops/layernorm.py b/atom/model_ops/layernorm.py
+index 14898b20..b56c2f6a 100644
+--- a/atom/model_ops/layernorm.py
++++ b/atom/model_ops/layernorm.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: MIT
+ # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+ 
++import os
+ from typing import Optional, Tuple
+ 
+ import aiter
+@@ -318,6 +319,27 @@ class RMSNorm(nn.Module):
+                 and x_scale is None
+                 and self.quant_type.value in _AITER_RMS_QUANT_TYPE_VALUES
+             ):
++                # MXFP8 path: when downstream Linear consumes MXFP8 1x32 e8m0
++                # scales (ATOM_FP8_BLOCKSCALE_USE_MXFP8=1), emit those directly
++                # to skip the dequant+requant cascade. Limited to per_1x128 and
++                # the no-residual case (most q_norm callers).
++                if (
++                    self.quant_type.value == _QV_PER_1X128
++                    and residual is None
++                    and os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
++                ):
++                    from aiter.ops.triton.quant.quant_mxfp8 import (
++                        rmsnorm_mxfp8_quant,
++                    )
++                    if x.dim() != 2:
++                        x2 = x.reshape(-1, x.shape[-1])
++                    else:
++                        x2 = x
++                    y, s = rmsnorm_mxfp8_quant(x2, self.weight, self.eps)
++                    if x.dim() != 2:
++                        y = y.view(*x.shape[:-1], x.shape[-1])
++                        s = s.view(*x.shape[:-1], s.shape[-1])
++                    return y, s
+                 # Dynamic-scale fused RMSNorm + quant via aiter HIP kernels.
+                 # Static FP8 (x_scale provided) stays on the branch above.
+                 x, x_scale, residual_out = _aiter_rms_quant(
+diff --git a/atom/model_ops/linear.py b/atom/model_ops/linear.py
+index e016de70..de1c174f 100644
+--- a/atom/model_ops/linear.py
++++ b/atom/model_ops/linear.py
+@@ -2,6 +2,7 @@
+ # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+ 
+ import logging
++import os
+ from functools import partial as functools_partial
+ from typing import Callable, Optional
+ 
+@@ -284,11 +285,20 @@ class LinearBase(nn.Module):
+                     torch.empty(self.output_size, 1, dtype=dtypes.fp32)
+                 )
+             elif quant_type == QuantType.per_1x128:
++                # When MXFP8 a8w8 is active, allocate weight_scale directly as
++                # float8_e8m0fnu (1 byte) to match the on-disk dtype - avoids
++                # the lossy fp32 upcast/round-trip at load.
++                _mxfp8_env = (
++                    os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
++                )
++                _scale_dtype = (
++                    torch.float8_e8m0fnu if _mxfp8_env else dtypes.fp32
++                )
+                 self.weight_scale = atom_parameter(
+                     torch.empty(
+                         (self.output_size + 127) // 128,
+                         (self.input_size + 127) // 128,
+-                        dtype=dtypes.fp32,
++                        dtype=_scale_dtype,
+                     )
+                 )
+             elif quant_type == QuantType.per_1x32:
+@@ -392,9 +402,22 @@ class LinearBase(nn.Module):
+                 self.quant_type == QuantType.per_Token
+                 and self.params_dtype == dtypes.fp8
+             ) or self.quant_type == QuantType.per_1x32
+-            # per_1x128 only needs shuffle when using the preshuffle GEMM path
++            # per_1x128 only needs shuffle when using a preshuffle GEMM path.
++            # MXFP8 path: only shuffle if gemm_mxfp8_preshuffle will consume the
++            # shuffled weight (gated by ATOM_MXFP8_USE_PRESHUFFLE, default on).
++            # The non-preshuffle gemm_mxfp8 reads scrambled rows otherwise.
++            _mxfp8_active = (
++                self.quant_type == QuantType.per_1x128
++                and os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
++            )
++            _mxfp8_preshuffle = _mxfp8_active and (
++                os.environ.get("ATOM_MXFP8_USE_PRESHUFFLE", "1") == "1"
++            )
+             if not need_shuffle and self.quant_type == QuantType.per_1x128:
+-                need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
++                if _mxfp8_active:
++                    need_shuffle = _mxfp8_preshuffle
++                else:
++                    need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+             if need_shuffle:
+                 if self.weight.dim() == 2:
+                     shuffle_weights(self.weight)
+@@ -403,19 +426,80 @@ class LinearBase(nn.Module):
+         if self.quant_type == QuantType.per_1x32:
+             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+ 
++        # ---- Optional: MXFP8 a8w8 path (dormant, only active when env set) ----
++        # On disk V4-Flash stores per_1x128 weight scales as float8_e8m0fnu
++        # (uint8 powers-of-2) and weights as float8_e4m3fn. With MXFP8 active,
++        # __init__ allocated weight_scale as float8_e8m0fnu so the loader copied
++        # bits without any upcast/round-trip. Just expose as uint8 view here
++        # (gemm_mxfp8 expects uint8) and convert fp8 weight to fn-bits if the
++        # loader landed it as fnuz.
++        self._mxfp8_active = (
++            self.quant_type == QuantType.per_1x128
++            and os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
++        )
++        if self._mxfp8_active:
++            if self.weight_scale.data.dtype != torch.uint8:
++                self.weight_scale = atom_parameter(
++                    self.weight_scale.data.view(torch.uint8).contiguous()
++                )
++            if self.weight.data.dtype == torch.float8_e4m3fnuz:
++                # On-disk format is float8_e4m3fn but the param was allocated
++                # as fnuz (AMD default). The bit patterns differ - convert via
++                # value to preserve semantics.
++                w_val = self.weight.data.float()
++                w_fn = w_val.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
++                self.weight = atom_parameter(w_fn)
++
+     @mark_trace
+     def forward(
+         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
+     ) -> torch.Tensor:
+         if self.quant_type.value == QuantType.No.value:
+-            y = tgemm.mm(
+-                x,
+-                self.weight,
+-                self.bias,
+-                otype=otype,
+-            )
++            # Step 7: optional aiter Triton bf16 GEMM dispatch for QuantType.No
++            # Linears (e.g. the MoE gate, ReplicatedLinear). Triggered by
++            # ATOM_TRITON_BF16_GEMM=1. Falls back to tgemm.mm otherwise.
++            if (
++                os.environ.get("ATOM_TRITON_BF16_GEMM", "0") == "1"
++                and x.dtype == torch.bfloat16
++                and self.weight.dtype == torch.bfloat16
++            ):
++                from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
++                # gemm_a16w16 expects x[M,K], w[N,K]; weight is already [N,K]
++                y = gemm_a16w16(x, self.weight, self.bias, dtype=otype)
++            else:
++                y = tgemm.mm(
++                    x,
++                    self.weight,
++                    self.bias,
++                    otype=otype,
++                )
+         else:
+-            if x_scale is None:
++            # MXFP8 path: route per_1x128 weights through MXFP8 GEMM.
++            _use_mxfp8 = (
++                self.quant_type.value == QuantType.per_1x128.value
++                and getattr(self, "_mxfp8_active", False)
++            )
++            if _use_mxfp8:
++                from aiter.ops.triton.quant.quant_mxfp8 import (
++                    per_1x32_mxfp8_quant_triton,
++                )
++
++                if x_scale is None:
++                    x, x_scale = per_1x32_mxfp8_quant_triton(x)
++                elif x_scale.dtype == torch.uint8:
++                    pass  # caller already emitted MXFP8 1x32
++                else:
++                    # legacy caller emitted FP8 + fp32 1x128 scale. Dequant to
++                    # bf16, then re-quantize to MXFP8 1x32.
++                    Mx, Kx = x.shape
++                    sM, sCols = x_scale.shape
++                    group = Kx // sCols
++                    x_dq = x.to(torch.float32).view(Mx, sCols, group) * x_scale.to(
++                        torch.float32
++                    ).view(sM, sCols, 1)
++                    x_bf16 = x_dq.view(Mx, Kx).to(torch.bfloat16)
++                    x, x_scale = per_1x32_mxfp8_quant_triton(x_bf16)
++            elif x_scale is None:
+                 quant_func = self.quant_func
+                 if self.quant_type.value == QuantType.per_1x128.value:
+                     # preshuffle GEMM expects column-major x_scale;
+@@ -460,21 +544,115 @@ class LinearBase(nn.Module):
+                     if self.bias is not None:
+                         y += self.bias
+             elif self.quant_type.value == QuantType.per_1x128.value:
+-                if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
++                if _use_mxfp8:
++                    from aiter.ops.triton.gemm.basic.gemm_mxfp8 import gemm_mxfp8
++
++                    # One-shot dump: overwrite each call so the final saved file
++                    # is the most recent call (curl-driven, post-warmup).
++                    _dump_env = os.environ.get("ATOM_MXFP8_DUMP", "")
++                    if _dump_env:
++                        if _dump_env in getattr(self, "prefix", ""):
++                            try:
++                                import torch as _t
++                                _t.save(
++                                    {
++                                        "prefix": self.prefix,
++                                        "x": x.detach().cpu(),
++                                        "weight": self.weight.data.detach().cpu(),
++                                        "x_scale": x_scale.detach().cpu()
++                                        if x_scale is not None
++                                        else None,
++                                        "weight_scale": self.weight_scale.data.detach().cpu(),
++                                        "otype": str(otype),
++                                    },
++                                    f"/tmp/mxfp8_dump_{self.prefix.replace('.', '_')}.pt",
++                                )
++                                print(
++                                    f"[MXFP8_DUMP] saved /tmp/mxfp8_dump_{self.prefix.replace('.', '_')}.pt "
++                                    f"x={tuple(x.shape)}/{x.dtype} "
++                                    f"w={tuple(self.weight.shape)}/{self.weight.dtype} "
++                                    f"xs={tuple(x_scale.shape) if x_scale is not None else None}/{x_scale.dtype if x_scale is not None else None} "
++                                    f"ws={tuple(self.weight_scale.shape)}/{self.weight_scale.dtype}",
++                                    flush=True,
++                                )
++                                self._mxfp8_dumped = True
++                            except Exception as e:
++                                print(f"[MXFP8_DUMP_FAIL] {e}", flush=True)
++                    try:
++                        if os.environ.get("ATOM_MXFP8_USE_PRESHUFFLE", "1") == "1":
++                            from aiter.ops.triton.gemm.basic.gemm_mxfp8 import (
++                                gemm_mxfp8_preshuffle,
++                            )
++                            y = gemm_mxfp8_preshuffle(
++                                x,
++                                self.weight,
++                                x_scale,
++                                self.weight_scale,
++                                dtype=otype,
++                            )
++                        else:
++                            y = gemm_mxfp8(
++                                x,
++                                self.weight,
++                                x_scale,
++                                self.weight_scale,
++                                dtype=otype,
++                            )
++                    except Exception as e:
++                        print(
++                            f"[MXFP8_FAIL] x={tuple(x.shape)}/{x.dtype} "
++                            f"w={tuple(self.weight.shape)}/{self.weight.dtype} "
++                            f"xs={tuple(x_scale.shape)}/{x_scale.dtype} "
++                            f"ws={tuple(self.weight_scale.shape)}/{self.weight_scale.dtype} "
++                            f"err={type(e).__name__}: {str(e)[:200]}",
++                            flush=True,
++                        )
++                        raise
++                elif envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
++                    # If MXFP8 loader was active but kernel was skipped, the
++                    # weight_scale is uint8 (e8m0). Legacy preshuffle GEMM wants
++                    # fp32 - decode on the fly.
++                    _ws = self.weight_scale
++                    if _ws.dtype == torch.uint8:
++                        _ws = fp4_utils.e8m0_to_f32(_ws.view(torch.float8_e8m0fnu))
++                    # Legacy dump hook for A/B comparison vs MXFP8 path.
++                    _dump_env = os.environ.get("ATOM_MXFP8_DUMP", "")
++                    if _dump_env and _dump_env in getattr(self, "prefix", ""):
++                        try:
++                            import torch as _t
++                            _t.save(
++                                {
++                                    "prefix": self.prefix,
++                                    "x": x.detach().cpu(),
++                                    "weight": self.weight.data.detach().cpu(),
++                                    "x_scale": x_scale.detach().cpu()
++                                    if x_scale is not None
++                                    else None,
++                                    "weight_scale": self.weight_scale.data.detach().cpu(),
++                                    "otype": str(otype),
++                                    "path": "legacy",
++                                },
++                                f"/tmp/legacy_dump_{self.prefix.replace('.', '_')}.pt",
++                            )
++                        except Exception as e:
++                            print(f"[LEGACY_DUMP_FAIL] {e}", flush=True)
+                     y = gemm_a8w8_blockscale_preshuffle_impl(
+                         x,
+                         self.weight,
+                         x_scale,
+-                        self.weight_scale,
++                        _ws,
+                         dtype=otype,
+                         prefix=self.prefix,
+                     )
+                 else:
++                    _ws2 = self.weight_scale
++                    if _ws2.dtype == torch.uint8:
++                        _ws2 = fp4_utils.e8m0_to_f32(_ws2.view(torch.float8_e8m0fnu))
+                     y = gemm_a8w8_blockscale(
+                         x,
+                         self.weight,
+                         x_scale,
+-                        self.weight_scale,
++                        _ws2,
+                         dtype=otype,
+                     )
+                 if self.bias is not None:
+diff --git a/atom/model_ops/moe.py b/atom/model_ops/moe.py
+index e38388de..5fc59cdc 100644
+--- a/atom/model_ops/moe.py
++++ b/atom/model_ops/moe.py
+@@ -829,6 +829,82 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+         if os.environ.get("ATOM_V4_TORCH_MOE"):
+             return
+ 
++        # Step 1: a8w4 MoE backend weight-layout branch. Reorders W13/W2 into
++        # the layout moe_gemm_a8w4 expects and swizzles scales.
++        _use_a8w4_moe = (
++            os.environ.get("ATOM_MOE_BACKEND", "matmul_ogs") == "a8w4"
++        )
++        if _use_a8w4_moe and self.use_triton:
++            from aiter.ops.triton.moe.moe_op_gemm_a8w4 import swizzle_scales
++
++            # Step 3: gate/up interleave for apply_swiglu fold. Off by default.
++            _interleave_w13 = os.environ.get("ATOM_A8W4_SWIGLU_FOLD", "0") == "1"
++
++            def _interleave_gateup(t):
++                """t: [E, 2N, *] → reorder dim=1 from [g..u..] to [g,u,g,u,...]"""
++                E, two_N = t.shape[0], t.shape[1]
++                N = two_N // 2
++                tail = t.shape[2:]
++                return (
++                    t.view(E, 2, N, *tail)
++                    .permute(0, 2, 1, *range(3, 3 + len(tail)))
++                    .contiguous()
++                    .view(E, two_N, *tail)
++                )
++
++            # W1 weight: view-transpose to [E, K/2, 2N] (no .contiguous())
++            w1_w = layer.w13_weight.data.view(torch.uint8)  # [E, 2N, K/2]
++            if _interleave_w13:
++                w1_w = _interleave_gateup(w1_w)
++            w1_w_kernel = w1_w.transpose(-1, -2)  # [E, K/2, 2N], view
++            assert w1_w_kernel.stride(-2) == 1, (
++                "W1: K must be contiguous (do NOT call .contiguous())"
++            )
++
++            # W1 scale: transpose + contiguous + swizzle
++            w1_s = layer.w13_weight_scale.data  # [E, 2N, K/32]
++            if _interleave_w13:
++                w1_s = _interleave_gateup(w1_s)
++            w1_s_swz_in = w1_s.transpose(-1, -2).contiguous()  # [E, K/32, 2N]
++            w1_s_E, w1_s_SCALE_K, w1_s_N = w1_s_swz_in.shape
++            w1_s_K = w1_s_SCALE_K * 32
++            if w1_s_N % 32 == 0 and w1_s_K % 256 == 0:
++                w1_s_kernel = swizzle_scales(w1_s_swz_in)
++            else:
++                w1_s_kernel = w1_s_swz_in
++
++            # W2 weight: view-transpose to [E, N_per/2, hidden]
++            w2_w = layer.w2_weight.data.view(torch.uint8)
++            w2_w_kernel = w2_w.transpose(-1, -2)
++            assert w2_w_kernel.stride(-2) == 1, (
++                "W2: K (=N_per/2 packed) must be contiguous"
++            )
++
++            # W2 scale: transpose + contiguous + swizzle
++            w2_s = layer.w2_weight_scale.data
++            w2_s_swz_in = w2_s.transpose(-1, -2).contiguous()
++            w2_s_E, w2_s_SCALE_K, w2_s_N = w2_s_swz_in.shape
++            w2_s_K = w2_s_SCALE_K * 32
++            if w2_s_N % 32 == 0 and w2_s_K % 256 == 0:
++                w2_s_kernel = swizzle_scales(w2_s_swz_in)
++            else:
++                w2_s_kernel = w2_s_swz_in
++
++            del layer.w13_weight
++            del layer.w2_weight
++            del layer.w13_weight_scale
++            del layer.w2_weight_scale
++            layer.w13_weight = w1_w_kernel
++            layer.w2_weight = w2_w_kernel
++            layer.w13_weight_scale = w1_s_kernel
++            layer.w2_weight_scale = w2_s_kernel
++
++            self.w13_precision_config = None
++            self.w2_precision_config = None
++            self.moe_backend = "a8w4"
++            self.a8w4_swiglu_fold = _interleave_w13
++            return
++
+         if self.use_triton:
+             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
+             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+@@ -856,6 +932,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+             layer.w2_weight = w2_weight
+             layer.w13_weight_scale = None
+             layer.w2_weight_scale = None
++            self.moe_backend = "matmul_ogs"
+             return
+ 
+         # shuffle weight
+@@ -934,6 +1011,143 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+             )
+ 
+             if needs_custom_routing:
++                _a8w4 = getattr(self, "moe_backend", "matmul_ogs") == "a8w4"
++
++                # DeepSeek-V4 hash-layer fully-fused fast path: replaces the
++                # Python `_hash_topk` + multi-kernel `fused_routing_from_topk`
++                # counting-sort + `compute_expt_data` (with memset) chain with
++                # ONE Triton kernel (hash_routing) + sort_tokens_fused. Same
++                # 2-kernel shape as the non-hash routing_a8w4 path.
++                #
++                # Detection: custom_routing_function is the bound method of a
++                # MoeLayer whose gate has the tid2eid lookup table.
++                _hash_layer = (
++                    _a8w4
++                    and custom_routing_function is not None
++                    and hasattr(custom_routing_function, "__self__")
++                    and hasattr(
++                        getattr(custom_routing_function.__self__, "gate", None),
++                        "tid2eid",
++                    )
++                )
++                _a8w4_hash_fused = (
++                    _hash_layer
++                    and os.environ.get("ATOM_A8W4_TRITON_ROUTING", "0") == "1"
++                    and os.environ.get("ATOM_A8W4_HASH_FAST_ROUTING", "0") == "1"
++                    and layer.num_fused_shared_experts == 0
++                )
++                if _a8w4_hash_fused:
++                    from aiter.ops.triton.moe.moe_routing.routing import (
++                        routing_a8w4_from_hash,
++                    )
++                    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import recommend_block_m
++                    from atom.model_ops.fused_moe_triton import _a8w4_fused_experts
++
++                    moe_layer = custom_routing_function.__self__
++                    tid2eid = moe_layer.gate.tid2eid
++
++                    # Get input_ids (with DP gather, mirror _hash_topk semantics).
++                    fwd_ctx = get_forward_context()
++                    ids = fwd_ctx.context.input_ids.flatten()
++                    num_tokens = router_logits.shape[0]
++                    if ids.shape[0] < num_tokens:
++                        ids_2d = ids.unsqueeze(-1)
++                        ids_2d, _ = pad_for_all_gather(ids_2d)
++                        from aiter.dist.parallel_state import get_dp_group
++
++                        ids_2d = get_dp_group().all_gather(ids_2d, dim=0)
++                        ids = ids_2d[:num_tokens].flatten()
++                    ids = ids.clamp(0, tid2eid.shape[0] - 1)
++
++                    n_expts_tot = router_logits.shape[-1]
++                    if global_num_experts > 0:
++                        n_expts_tot = global_num_experts
++                    n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
++
++                    block_m = recommend_block_m(x.shape[-2])
++                    aiter_routing, gather_src, scatter_src = routing_a8w4_from_hash(
++                        router_logits,
++                        tid2eid,
++                        ids,
++                        n_expts_act=top_k,
++                        block_m=block_m,
++                        score_mode="sqrtsoftplus",
++                        renorm=renormalize,
++                        routed_scaling_factor=moe_layer.routed_scaling_factor,
++                    )
++                    moe_residual = getattr(layer, "_moe_residual_to_fold", None)
++                    if moe_residual is not None:
++                        layer._moe_residual_was_folded = True
++                    output = torch.empty_like(x)
++                    return _a8w4_fused_experts(
++                        output, x,
++                        layer.w13_weight, layer.w2_weight,
++                        layer.w13_weight_scale, layer.w2_weight_scale,
++                        routing_data=None,
++                        gather_indx=gather_src,
++                        scatter_indx=scatter_src,
++                        topk=top_k,
++                        swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
++                        w1_bias=layer.w13_bias,
++                        w2_bias=layer.w2_bias,
++                        apply_router_weight_on_input=layer.apply_router_weight_on_input,
++                        pre_built_aiter_routing=aiter_routing,
++                        residual=moe_residual,
++                    )
++
++                _a8w4_triton_routing = (
++                    _a8w4
++                    and os.environ.get("ATOM_A8W4_TRITON_ROUTING", "0") == "1"
++                    and scoring_func == "sqrtsoftplus"
++                    and not use_grouped_topk
++                    and custom_routing_function is None
++                    and layer.num_fused_shared_experts == 0
++                )
++                if _a8w4_triton_routing:
++                    # Step 4: aiter `routing_a8w4` does V4 math + topk + sort + ExptData
++                    # in one Triton pipeline. Skip FusedMoE.select_experts + bridge.
++                    from aiter.ops.triton.moe.moe_routing.routing import routing_a8w4
++                    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import recommend_block_m
++                    from atom.model_ops.fused_moe_triton import _a8w4_fused_experts
++
++                    n_expts_tot = router_logits.shape[-1]
++                    if global_num_experts > 0:
++                        n_expts_tot = global_num_experts
++                    n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
++                    M = x.shape[-2]
++                    block_m = recommend_block_m(M)
++                    aiter_routing, gather_src, scatter_src = routing_a8w4(
++                        router_logits,
++                        n_expts_act=top_k,
++                        block_m=block_m,
++                        score_mode="sqrtsoftplus",
++                        bias=e_score_correction_bias,
++                        renorm=renormalize,
++                        routed_scaling_factor=layer.routed_scaling_factor,
++                    )
++                    # Step 9: V4 single-stream stashes shared-experts output on
++                    # the layer; fold it into reduce_grouped's writeback. None
++                    # for callers that didn't pre-compute shared.
++                    moe_residual = getattr(layer, "_moe_residual_to_fold", None)
++                    if moe_residual is not None:
++                        layer._moe_residual_was_folded = True
++                    output = torch.empty_like(x)
++                    return _a8w4_fused_experts(
++                        output, x,
++                        layer.w13_weight, layer.w2_weight,
++                        layer.w13_weight_scale, layer.w2_weight_scale,
++                        routing_data=None,
++                        gather_indx=gather_src,
++                        scatter_indx=scatter_src,
++                        topk=top_k,
++                        swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
++                        w1_bias=layer.w13_bias,
++                        w2_bias=layer.w2_bias,
++                        apply_router_weight_on_input=layer.apply_router_weight_on_input,
++                        pre_built_aiter_routing=aiter_routing,
++                        residual=moe_residual,
++                    )
++
+                 # Use ATOM's full-featured select_experts for routing,
+                 # then triton matmul_ogs for the actual MoE computation.
+                 topk_weights, topk_ids = FusedMoE.select_experts(
+@@ -958,10 +1172,57 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+                     n_expts_tot = global_num_experts
+                 n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
+ 
++                n_gates_pad = topk_weights.shape[0] * topk_weights.shape[1]
++                _a8w4_topk_fast = (
++                    _a8w4
++                    and os.environ.get("ATOM_A8W4_TRITON_ROUTING", "0") == "1"
++                    and os.environ.get("ATOM_A8W4_HASH_FAST_ROUTING", "0") == "1"
++                    and layer.num_fused_shared_experts == 0
++                    and n_gates_pad <= 4096
++                )
++                if _a8w4_topk_fast:
++                    # Custom-routing a8w4 fast path (DeepSeek-V4 hash layers):
++                    # build aiter RoutingData directly from (topk_weights, topk_ids)
++                    # via `routing_a8w4_from_topk`. Skips matmul_ogs `compute_expt_data`,
++                    # eliminating its histogram memset (`_expt_data_memset`).
++                    # Bounded by `fused_routing_from_topk`'s 4096-NK single-CTA budget;
++                    # prefill exceeds this and falls through to the matmul_ogs path
++                    # where routing overhead is amortised over much larger GEMM work.
++                    from aiter.ops.triton.moe.moe_routing.routing import (
++                        routing_a8w4_from_topk,
++                    )
++                    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import recommend_block_m
++                    from atom.model_ops.fused_moe_triton import _a8w4_fused_experts
++
++                    block_m = recommend_block_m(x.shape[-2])
++                    aiter_routing, gather_src, scatter_src = routing_a8w4_from_topk(
++                        topk_weights, topk_ids, n_expts_tot, block_m
++                    )
++                    moe_residual = getattr(layer, "_moe_residual_to_fold", None)
++                    if moe_residual is not None:
++                        layer._moe_residual_was_folded = True
++                    output = torch.empty_like(x)
++                    return _a8w4_fused_experts(
++                        output, x,
++                        layer.w13_weight, layer.w2_weight,
++                        layer.w13_weight_scale, layer.w2_weight_scale,
++                        routing_data=None,
++                        gather_indx=gather_src,
++                        scatter_indx=scatter_src,
++                        topk=n_expts_act,
++                        swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
++                        w1_bias=layer.w13_bias,
++                        w2_bias=layer.w2_bias,
++                        apply_router_weight_on_input=layer.apply_router_weight_on_input,
++                        pre_built_aiter_routing=aiter_routing,
++                        residual=moe_residual,
++                    )
++
+                 routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
+                     topk_weights, topk_ids, n_expts_tot
+                 )
+ 
++                _a8w4 = getattr(self, "moe_backend", "matmul_ogs") == "a8w4"
+                 output = torch.empty_like(x)
+                 _moe_result = triton_kernel_fused_experts(
+                     output,
+@@ -981,6 +1242,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                     global_num_experts=n_expts_tot,
+                     expert_map=expert_map,
++                    w13_weight_scale_a8w4=(
++                        layer.w13_weight_scale if _a8w4 else None
++                    ),
++                    w2_weight_scale_a8w4=(
++                        layer.w2_weight_scale if _a8w4 else None
++                    ),
++                    swiglu_limit_a8w4=getattr(layer, "swiglu_limit", 0.0),
+                 )
+                 return _moe_result
+ 
+diff --git a/atom/models/deepseek_v4.py b/atom/models/deepseek_v4.py
+index c82a1f1d..b8a6909b 100644
+--- a/atom/models/deepseek_v4.py
++++ b/atom/models/deepseek_v4.py
+@@ -126,6 +126,12 @@ _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
+ # Fused-kernel switches. Default off; flip via env to A/B against the eager path.
+ _V4_USE_TRITON_FUSION = os.environ.get("ATOM_V4_USE_TRITON_FUSION", "0") == "1"
+ ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
++# MXFP8 a8w8 GEMM path (Task #77). When on, q_norm RMSNorm emits FP8 e4m3fn +
++# uint8 e8m0 1x32 scales directly (via the Triton rmsnorm_mxfp8_quant path in
++# atom/model_ops/layernorm.py) so wq_b's MXFP8 GEMM consumes them with no
++# transcode. The helper below is reserved for call sites that need to fuse
++# the Q-side MXFP8 quant with the K-side bf16 RMSNorm in a single launch.
++_V4_USE_MXFP8 = os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
+ 
+ 
+ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
+@@ -135,6 +141,40 @@ def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
+     return rmsnorm2d_fwd_(x, ones, eps, dim)
+ 
+ 
++def _fuse_rmsnorm_mxfp8_quant(
++    q_lora: torch.Tensor,
++    q_norm_weight: torch.Tensor,
++    q_norm_eps: float,
++    kv_pre: torch.Tensor,
++    kv_norm_weight: torch.Tensor,
++    kv_norm_eps: float,
++) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Dual RMSNorm with MXFP8 emit on Q side, bf16 on K side, single launch.
++
++    Q: RMSNorm + per-1x32 MXFP8 quant -- emits FP8 e4m3fn + uint8 e8m0 scale
++       directly so the downstream wq_b MXFP8 GEMM consumes them with no
++       dequant+requant cascade.
++    K: RMSNorm only, bf16 output, consumed by the downstream RoPE / SWA-write
++       fused kernel which expects bf16 K.
++
++    Both halves run in a single Triton launch (dual_rmsnorm_mxfp8_quant) to
++    avoid the +6us/layer per-launch overhead of two separate kernels.
++
++    Returns (qr_fp8, qr_scale_e8m0, kv_bf16).
++    """
++    from aiter.ops.triton.quant.quant_mxfp8 import dual_rmsnorm_mxfp8_quant
++
++    qr, qr_scale, kv = dual_rmsnorm_mxfp8_quant(
++        q_lora,
++        kv_pre,
++        q_norm_weight,
++        kv_norm_weight,
++        q_norm_eps,
++        kv_norm_eps,
++    )
++    return qr, qr_scale, kv
++
++
+ def _fused_qk_norm_rope_swa_write_fake(
+     q: torch.Tensor,
+     kv: torch.Tensor,
+@@ -1946,7 +1986,11 @@ class Expert(nn.Module):
+         # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
+         # quant through a single aiter triton kernel. The fused kernel emits
+         # FP8 + scale; w2 accepts `x_scale` and skips its own quant step.
+-        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION
++        # ATOM_V4_DISABLE_FCAM=1 forces the unfused eager path for A/B vs the
++        # Triton fused-clamp-act-mul kernel.
++        self.use_fused_clamp_act_mul = _V4_USE_TRITON_FUSION and (
++            os.environ.get("ATOM_V4_DISABLE_FCAM", "0") != "1"
++        )
+ 
+     def forward(
+         self,
+@@ -1961,14 +2005,31 @@ class Expert(nn.Module):
+         # feed the bf16 GEMM output directly.
+         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
+         if self.use_fused_clamp_act_mul:
+-            x_fp8, x_scale = fused_clamp_act_mul(
+-                combined,
+-                swiglu_limit=self.swiglu_limit,
+-                activation="silu",
+-                weights=weights,
+-                dtype_quant=dtypes.fp8,
+-                transpose_scale=True,
+-            )
++            # When MXFP8 is enabled, ATOM_MXFP8_BYPASS_FCAM=1 forces the
++            # legacy fp32 1x128 emit + linear.py's dequant+requant fallback,
++            # isolating whether fused_clamp_act_mul's MXFP8 emit has a bug.
++            _mxfp8 = os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
++            _bypass_fcam = os.environ.get("ATOM_MXFP8_BYPASS_FCAM", "0") == "1"
++            if _mxfp8 and not _bypass_fcam:
++                x_fp8, x_scale = fused_clamp_act_mul(
++                    combined,
++                    swiglu_limit=self.swiglu_limit,
++                    activation="silu",
++                    weights=weights,
++                    dtype_quant=torch.float8_e4m3fn,
++                    quant_block_size=32,
++                    scale_dtype_fmt="ue8m0",
++                    transpose_scale=False,
++                )
++            else:
++                x_fp8, x_scale = fused_clamp_act_mul(
++                    combined,
++                    swiglu_limit=self.swiglu_limit,
++                    activation="silu",
++                    weights=weights,
++                    dtype_quant=dtypes.fp8,
++                    transpose_scale=True,
++                )
+             return self.w2(x_fp8, x_scale=x_scale)
+         out = torch.empty(
+             (combined.shape[0], combined.shape[-1] // 2),
+@@ -2197,9 +2258,32 @@ class MoE(nn.Module):
+     def single_stream_moe_forward(
+         self, x: torch.Tensor  # [num_tokens, dim]
+     ) -> torch.Tensor:  # [num_tokens, dim]
+-        """Sequential: shared_experts → routed_experts → combine."""
++        """Sequential: shared_experts → routed_experts → combine.
++
++        Step 9: when the MoE method supports it (a8w4 triton-routing path),
++        the `routed + shared` add is folded into reduce_grouped's writeback by
++        stashing `shared` on `self.experts` before `routed_expert_forward`.
++        Saves the standalone elementwise add kernel. Gated by
++        ATOM_A8W4_FUSE_RESIDUAL (default 1) for easy A/B.
++        """
+         shared = self.shared_experts(x) if self.shared_experts is not None else None
+-        routed = self.routed_expert_forward(x)
++        fuse_residual = (
++            shared is not None
++            and os.environ.get("ATOM_A8W4_FUSE_RESIDUAL", "1") == "1"
++        )
++        if fuse_residual:
++            self.experts._moe_residual_to_fold = shared
++        try:
++            routed = self.routed_expert_forward(x)
++        finally:
++            if fuse_residual:
++                self.experts._moe_residual_to_fold = None
++        folded = getattr(self.experts, "_moe_residual_was_folded", False)
++        self.experts._moe_residual_was_folded = False  # one-shot
++        if folded:
++            if self.tp_size > 1:
++                routed = tensor_model_parallel_all_reduce(routed)
++            return routed
+         return self.combine_outputs(routed, shared)
+ 
+     def dual_stream_moe_forward(

@@ -1,0 +1,3527 @@
+diff --git a/aiter/ops/triton/_triton_kernels/fusions/fused_clamp_act_mul.py b/aiter/ops/triton/_triton_kernels/fusions/fused_clamp_act_mul.py
+index f5887fdcb..589cc372f 100644
+--- a/aiter/ops/triton/_triton_kernels/fusions/fused_clamp_act_mul.py
++++ b/aiter/ops/triton/_triton_kernels/fusions/fused_clamp_act_mul.py
+@@ -23,6 +23,7 @@ _fused_clamp_silu_mul_repr = make_kernel_repr(
+     [
+         "BLOCK_SIZE_N",
+         "QUANT_BLOCK_SIZE",
++        "SCALE_FMT",
+         "HAVE_WEIGHTS",
+         "WEIGHT_BROADCAST",
+         "HAVE_SWIGLU_CLAMP",
+@@ -50,6 +51,7 @@ def _fused_clamp_silu_mul_kernel(
+     swiglu_limit,
+     BLOCK_SIZE_N: tl.constexpr,
+     QUANT_BLOCK_SIZE: tl.constexpr,
++    SCALE_FMT: tl.constexpr,
+     DTYPE_MAX: tl.constexpr,
+     DTYPE_MIN: tl.constexpr,
+     HAVE_WEIGHTS: tl.constexpr,
+@@ -95,11 +97,34 @@ def _fused_clamp_silu_mul_kernel(
+             out = out * w
+ 
+     if HAS_QUANT:
+-        out_q, block_scales = _fp8_quant_op(
+-            out, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
+-        )
+-        out_q = tl.ravel(out_q)
+-        block_scales = tl.ravel(block_scales)
++        if SCALE_FMT == "ue8m0":
++            # Per-1×QUANT_BLOCK_SIZE MXFP8 emit: fp8 e4m3 values + uint8 ue8m0
++            # biased-exponent scales. Mirrors the ue8m0 path used by moe_gemm_a8w4.
++            NUM_QB: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
++            out_3d = tl.reshape(out, [1, NUM_QB, QUANT_BLOCK_SIZE])
++            abs_3d = tl.abs(out_3d)
++            max_val = tl.max(abs_3d, axis=2, keep_dims=True)
++            dequant_scale = max_val / DTYPE_MAX
++            # ROUND_UP via exponent: 2 ** ceil(log2(dequant_scale))
++            dequant_scale_exp = (
++                dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF
++            ) & 0x7F800000
++            dequant_scale_rounded = dequant_scale_exp.to(tl.float32, bitcast=True)
++            quant_scale = tl.where(
++                dequant_scale_rounded == 0, 0.0, 1.0 / dequant_scale_rounded
++            )
++            quant_tensor = out_3d * quant_scale
++            quant_2d = tl.reshape(quant_tensor, [1, BLOCK_SIZE_N])
++            out_q = tl.ravel(quant_2d)
++            scale_exp = (dequant_scale_exp >> 23).to(tl.uint8)
++            scale_exp_2d = tl.reshape(scale_exp, [1, NUM_QB])
++            block_scales = tl.ravel(scale_exp_2d)
++        else:
++            out_q, block_scales = _fp8_quant_op(
++                out, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
++            )
++            out_q = tl.ravel(out_q)
++            block_scales = tl.ravel(block_scales)
+ 
+         tl.store(
+             out_ptr + m_pid * out_stride_m + n_offs * out_stride_n,
+@@ -108,8 +133,8 @@ def _fused_clamp_silu_mul_kernel(
+         )
+ 
+         num_bs = tl.cdiv(n_half, QUANT_BLOCK_SIZE)
+-        NUM_QB: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
+-        g_offs = tl.arange(0, NUM_QB)
++        NUM_QB_S: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
++        g_offs = tl.arange(0, NUM_QB_S)
+         tl.store(
+             scale_ptr + m_pid * scale_stride_m + g_offs * scale_stride_n,
+             block_scales.to(scale_ptr.dtype.element_ty),
+diff --git a/aiter/ops/triton/_triton_kernels/gemm/basic/gemm_mxfp8.py b/aiter/ops/triton/_triton_kernels/gemm/basic/gemm_mxfp8.py
+new file mode 100644
+index 000000000..beaf16cb2
+--- /dev/null
++++ b/aiter/ops/triton/_triton_kernels/gemm/basic/gemm_mxfp8.py
+@@ -0,0 +1,417 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++
++import triton
++import triton.language as tl
++from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
++from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
++
++
++_gemm_mxfp8_repr = make_kernel_repr(
++    "_gemm_mxfp8_kernel",
++    [
++        "BLOCK_SIZE_M",
++        "BLOCK_SIZE_N",
++        "BLOCK_SIZE_K",
++        "GROUP_SIZE_M",
++        "num_warps",
++        "num_stages",
++        "waves_per_eu",
++        "matrix_instr_nonkdim",
++        "cache_modifier",
++        "NUM_KSPLIT",
++    ],
++)
++
++
++@triton.heuristics(
++    {
++        "EVEN_K": lambda args: (args["K"] % args["BLOCK_SIZE_K"] == 0),
++    }
++)
++@triton.jit(repr=_gemm_mxfp8_repr)
++def _gemm_mxfp8_kernel(
++    a_ptr,
++    b_ptr,
++    c_ptr,
++    a_scales_ptr,
++    b_scales_ptr,
++    M,
++    N,
++    K,
++    stride_am,
++    stride_ak,
++    stride_bk,
++    stride_bn,
++    stride_cm,
++    stride_cn,
++    stride_asm,
++    stride_ask,
++    stride_bsn,
++    stride_bsk,
++    # Meta-parameters
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
++    GROUP_SIZE_M: tl.constexpr,
++    NUM_KSPLIT: tl.constexpr,
++    EVEN_K: tl.constexpr,
++    num_warps: tl.constexpr,
++    num_stages: tl.constexpr,
++    waves_per_eu: tl.constexpr,
++    matrix_instr_nonkdim: tl.constexpr,
++    cache_modifier: tl.constexpr,
++):
++    """
++    Kernel for computing the matmul C = A x B.
++    A and B inputs are FP8 e4m3 (1 byte per element).
++    A_scales are e8m0 (uint8) with shape (M, K // 32).
++    B_scales are stored compact e8m0 (uint8) with shape (N // 128, K // 128),
++    representing 128x128 weight blocks. Broadcast inside kernel to (N, K // 32).
++    A has shape (M, K), B has shape (K, N) and C has shape (M, N).
++    Output dtype is determined by c_ptr (bf16 or fp16).
++    NUM_KSPLIT == 1 only (no split-K in this first version).
++    """
++
++    tl.assume(stride_am > 0)
++    tl.assume(stride_ak > 0)
++    tl.assume(stride_bk > 0)
++    tl.assume(stride_bn > 0)
++    tl.assume(stride_cm > 0)
++    tl.assume(stride_cn > 0)
++    tl.assume(stride_asm > 0)
++    tl.assume(stride_ask > 0)
++    tl.assume(stride_bsk > 0)
++    tl.assume(stride_bsn > 0)
++
++    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
++
++    pid_unified = tl.program_id(axis=0)
++    pid_unified = remap_xcd(pid_unified, GRID_MN, NUM_XCDS=8)
++
++    pid = pid_unified
++    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
++    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
++
++    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
++
++    tl.assume(pid_m >= 0)
++    tl.assume(pid_n >= 0)
++
++    # Scale group sizes
++    SCALE_GROUP_SIZE: tl.constexpr = 32  # A: per 32 elements along K
++    B_SCALE_K_GROUP: tl.constexpr = 128  # B: per 128 along K
++    B_SCALE_N_GROUP: tl.constexpr = 128  # B: per 128 along N
++
++    # Number of K iterations
++    num_k_iter = tl.cdiv(K, BLOCK_SIZE_K)
++
++    # Create pointers for first block of A and B input matrices
++    offs_k = tl.arange(0, BLOCK_SIZE_K)
++    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
++    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
++    a_ptrs = a_ptr + (
++        offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
++    )
++    b_ptrs = b_ptr + (
++        offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
++    )
++
++    # A-scale pointers: per-row (M) and per scale group (K // 32)
++    offs_ks_a = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
++    a_scale_ptrs = (
++        a_scales_ptr + offs_am[:, None] * stride_asm + offs_ks_a[None, :] * stride_ask
++    )
++
++    # B-scale pointers: compact (N // 128, K // 128) — broadcast inside the kernel
++    # Each scale covers a 128(N) x 128(K) block.
++    # We want a tile of shape (BLOCK_SIZE_N, BLOCK_SIZE_K // 32) per K-iter.
++    # Broadcast by floor-division: row index n -> n // 128; k-scale index ks -> ks // 4
++    # (since ks counts 32-element groups, and 128 / 32 = 4).
++    offs_bsn = offs_bn // B_SCALE_N_GROUP  # (BLOCK_SIZE_N,)
++
++    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++    offs_scale_k_a = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
++
++    for k in range(0, num_k_iter):
++        # K base for this iteration (in elements)
++        k_base = k * BLOCK_SIZE_K
++
++        # ---- Load A scales (M, BLOCK_SIZE_K // 32) ----
++        if EVEN_K:
++            a_scales = tl.load(a_scale_ptrs)
++        else:
++            a_scale_mask = offs_scale_k_a[None, :] < (
++                K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
++            )
++            a_scales = tl.load(a_scale_ptrs, mask=a_scale_mask, other=127)
++
++        # ---- Load and broadcast B scales (BLOCK_SIZE_N, BLOCK_SIZE_K // 32) ----
++        # B-scale K index in compact layout (K // 128 stride)
++        k_scale_idx_b = (k_base + tl.arange(0, BLOCK_SIZE_K) // SCALE_GROUP_SIZE) // (
++            B_SCALE_K_GROUP // SCALE_GROUP_SIZE
++        )
++        # k_scale_idx_b: shape (BLOCK_SIZE_K,), but we want one per 32-group.
++        # Recompute correctly:
++        offs_bsk = (
++            k_base + offs_scale_k_a * SCALE_GROUP_SIZE
++        ) // B_SCALE_K_GROUP  # (BLOCK_SIZE_K // 32,)
++        b_scale_ptrs = (
++            b_scales_ptr
++            + offs_bsn[:, None] * stride_bsn
++            + offs_bsk[None, :] * stride_bsk
++        )
++        if EVEN_K:
++            b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
++        else:
++            # OOB along K: load with the same mask as a-scales
++            b_scale_mask = offs_scale_k_a[None, :] < (
++                K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
++            )
++            b_scales = tl.load(
++                b_scale_ptrs,
++                mask=b_scale_mask,
++                other=127,
++                cache_modifier=cache_modifier,
++            )
++
++        # ---- Load A, B data ----
++        if EVEN_K:
++            a = tl.load(a_ptrs)
++            b = tl.load(b_ptrs, cache_modifier=cache_modifier)
++        else:
++            a = tl.load(
++                a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0
++            )
++            b = tl.load(
++                b_ptrs,
++                mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
++                other=0,
++                cache_modifier=cache_modifier,
++            )
++
++        accumulator = tl.dot_scaled(
++            a, a_scales, "e4m3", b, b_scales, "e4m3", accumulator
++        )
++
++        # Advance the ptrs to the next K block.
++        a_ptrs += BLOCK_SIZE_K * stride_ak
++        b_ptrs += BLOCK_SIZE_K * stride_bk
++        a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
++
++    c = accumulator.to(c_ptr.type.element_ty)
++
++    # Write back the block of the output matrix C with masks.
++    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
++    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
++    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
++    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
++    tl.store(c_ptrs, c, mask=c_mask)
++
++
++_gemm_mxfp8_preshuffle_repr = make_kernel_repr(
++    "_gemm_mxfp8_preshuffle_kernel",
++    [
++        "BLOCK_SIZE_M",
++        "BLOCK_SIZE_N",
++        "BLOCK_SIZE_K",
++        "GROUP_SIZE_M",
++        "num_warps",
++        "num_stages",
++        "waves_per_eu",
++        "matrix_instr_nonkdim",
++        "cache_modifier",
++        "NUM_KSPLIT",
++    ],
++)
++
++
++@triton.heuristics(
++    {
++        "EVEN_K": lambda args: (args["K"] % args["BLOCK_SIZE_K"] == 0),
++    }
++)
++@triton.jit(repr=_gemm_mxfp8_preshuffle_repr)
++def _gemm_mxfp8_preshuffle_kernel(
++    a_ptr,
++    b_ptr,
++    c_ptr,
++    a_scales_ptr,
++    b_scales_ptr,
++    M,
++    N,
++    K,
++    stride_am,
++    stride_ak,
++    stride_bn,
++    stride_bk,
++    stride_cm,
++    stride_cn,
++    stride_asm,
++    stride_ask,
++    stride_bsn,
++    stride_bsk,
++    # Meta-parameters
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
++    GROUP_SIZE_M: tl.constexpr,
++    NUM_KSPLIT: tl.constexpr,
++    EVEN_K: tl.constexpr,
++    num_warps: tl.constexpr,
++    num_stages: tl.constexpr,
++    waves_per_eu: tl.constexpr,
++    matrix_instr_nonkdim: tl.constexpr,
++    cache_modifier: tl.constexpr,
++):
++    """
++    Preshuffle variant of _gemm_mxfp8_kernel. Weight tensor has been shuffled
++    via aiter.ops.shuffle.shuffle_weight(layout=(16, 16)) so that 16-row N tiles
++    are interleaved with their 32-col K chunks in storage. The kernel loads the
++    shuffled tile in storage order (BLOCK_SIZE_N // 16, BLOCK_SIZE_K * 16) then
++    reshape+permute+trans inside the kernel to restore logical (K, N) layout
++    before tl.dot_scaled. Scales remain in the unshuffled compact 128x128 layout.
++    """
++
++    tl.assume(stride_am > 0)
++    tl.assume(stride_ak > 0)
++    tl.assume(stride_bk > 0)
++    tl.assume(stride_bn > 0)
++    tl.assume(stride_cm > 0)
++    tl.assume(stride_cn > 0)
++    tl.assume(stride_asm > 0)
++    tl.assume(stride_ask > 0)
++    tl.assume(stride_bsk > 0)
++    tl.assume(stride_bsn > 0)
++
++    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
++
++    pid_unified = tl.program_id(axis=0)
++    pid_unified = remap_xcd(pid_unified, GRID_MN, NUM_XCDS=8)
++
++    pid = pid_unified
++    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
++    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
++
++    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
++
++    tl.assume(pid_m >= 0)
++    tl.assume(pid_n >= 0)
++
++    SCALE_GROUP_SIZE: tl.constexpr = 32  # A: per-32 along K
++    B_SCALE_K_GROUP: tl.constexpr = 128  # B compact: per-128 along K
++    B_SCALE_N_GROUP: tl.constexpr = 128  # B compact: per-128 along N
++
++    num_k_iter = tl.cdiv(K, BLOCK_SIZE_K)
++
++    # A pointers (unchanged from non-preshuffle kernel).
++    offs_k = tl.arange(0, BLOCK_SIZE_K)
++    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
++    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
++
++    # B pointers for preshuffled layout. The shuffled storage is viewed as
++    # (N // 16, K * 16) elements. pid_n indexes BLOCK_SIZE_N // 16 N-tiles per
++    # step; the K dimension is expanded by 16x in byte addresses.
++    offs_bn_shuffle = pid_n * (BLOCK_SIZE_N // 16) + tl.arange(0, BLOCK_SIZE_N // 16)
++    offs_k_shuffle = tl.arange(0, BLOCK_SIZE_K * 16)
++    b_ptrs = b_ptr + (
++        offs_bn_shuffle[:, None] * stride_bn + offs_k_shuffle[None, :] * stride_bk
++    )
++
++    # A-scale pointers: per-row M, per 32-K group.
++    offs_ks_a = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
++    a_scale_ptrs = (
++        a_scales_ptr + offs_am[:, None] * stride_asm + offs_ks_a[None, :] * stride_ask
++    )
++
++    # B-scale pointers: compact (N // 128, K // 128). The N index needs the
++    # ORIGINAL (logical) row, not the shuffled row index, so use offs_bn_logical.
++    offs_bn_logical = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
++    offs_bsn = offs_bn_logical // B_SCALE_N_GROUP
++
++    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++    offs_scale_k_a = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
++
++    for k in range(0, num_k_iter):
++        k_base = k * BLOCK_SIZE_K
++
++        # Load A scales.
++        if EVEN_K:
++            a_scales = tl.load(a_scale_ptrs)
++        else:
++            a_scale_mask = offs_scale_k_a[None, :] < (
++                K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
++            )
++            a_scales = tl.load(a_scale_ptrs, mask=a_scale_mask, other=127)
++
++        # Load and broadcast B scales (same as non-preshuffle path).
++        offs_bsk = (
++            k_base + offs_scale_k_a * SCALE_GROUP_SIZE
++        ) // B_SCALE_K_GROUP
++        b_scale_ptrs = (
++            b_scales_ptr
++            + offs_bsn[:, None] * stride_bsn
++            + offs_bsk[None, :] * stride_bsk
++        )
++        if EVEN_K:
++            b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
++        else:
++            b_scale_mask = offs_scale_k_a[None, :] < (
++                K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
++            )
++            b_scales = tl.load(
++                b_scale_ptrs,
++                mask=b_scale_mask,
++                other=127,
++                cache_modifier=cache_modifier,
++            )
++
++        # Load A and B (preshuffled).
++        if EVEN_K:
++            a = tl.load(a_ptrs)
++            b_shuf = tl.load(b_ptrs, cache_modifier=cache_modifier)
++        else:
++            a = tl.load(
++                a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0
++            )
++            b_shuf = tl.load(
++                b_ptrs,
++                mask=offs_k_shuffle[None, :] < (K - k * BLOCK_SIZE_K) * 16,
++                other=0,
++                cache_modifier=cache_modifier,
++            )
++
++        # Unshuffle B in-kernel. Inverse of the shuffle_weight permute:
++        # shuffle:   (N // 16, 16, K // 32, 2, 16) --[perm 0,1,3,4,2,5]-> (N // 16, K // 32, 2, 16, 16)
++        # unshuffle: (N // 16, K // 32, 2, 16, 16) --[perm 0,1,4,2,3,5]-> (N // 16, 16, K // 32, 2, 16)
++        # then flatten to (N, K) and trans to (K, N).
++        b = (
++            b_shuf.reshape(
++                1,
++                BLOCK_SIZE_N // 16,
++                BLOCK_SIZE_K // 32,
++                2,
++                16,
++                16,
++            )
++            .permute(0, 1, 4, 2, 3, 5)
++            .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
++            .trans(1, 0)
++        )
++
++        accumulator = tl.dot_scaled(
++            a, a_scales, "e4m3", b, b_scales, "e4m3", accumulator
++        )
++
++        # Advance pointers.
++        a_ptrs += BLOCK_SIZE_K * stride_ak
++        b_ptrs += BLOCK_SIZE_K * 16 * stride_bk
++        a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
++
++    c = accumulator.to(c_ptr.type.element_ty)
++
++    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
++    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
++    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
++    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
++    tl.store(c_ptrs, c, mask=c_mask)
+diff --git a/aiter/ops/triton/_triton_kernels/moe/moe_op_gemm_a8w4.py b/aiter/ops/triton/_triton_kernels/moe/moe_op_gemm_a8w4.py
+index b71090c14..a368dba2c 100644
+--- a/aiter/ops/triton/_triton_kernels/moe/moe_op_gemm_a8w4.py
++++ b/aiter/ops/triton/_triton_kernels/moe/moe_op_gemm_a8w4.py
+@@ -162,6 +162,15 @@ def _moe_gemm_a8w4(
+     SPLIT_K: tl.constexpr,
+     W_CACHE_MODIFIER: tl.constexpr,
+     UPCAST_INDICES: tl.constexpr = False,
++    # Idea 1: fold per-1×32 MXFP8 (ue8m0 scale) group quant into write-back.
++    # When HAS_MX_OUT=True, Y is fp8 e4m3 and YMxScale receives uint8 ue8m0
++    # exponents at [m, n // 32]. Eliminates the standalone `downcast_to_mxfp`
++    # launch between GEMM1 and GEMM2. Requires SPLIT_K==1 and OUT_BLOCK_N % 32 == 0.
++    YMxScale=None,
++    stride_y_mx_m=0,
++    stride_y_mx_n=0,
++    HAS_MX_OUT: tl.constexpr = False,
++    MX_OUT_DTYPE_MAX: tl.constexpr = 448.0,
+ ):
+     tl.assume(stride_y_k >= 0)
+     tl.assume(stride_y_m >= 0)
+@@ -421,4 +430,45 @@ def _moe_gemm_a8w4(
+         + offs_y_n.to(index_type)[None, :] * stride_y_n
+     )
+     mask = mask_m[:, None] & mask_n[None, :]
+-    tl.store(YPtrs, out, mask=mask)
++    if HAS_MX_OUT and SPLIT_K == 1:
++        # Per-1×32 MXFP8 group quant emit. Mirrors the ue8m0 path in
++        # `_fused_clamp_silu_mul_kernel`. OUT_BLOCK_N is the post-swiglu output
++        # block size (BLOCK_N if no swiglu, BLOCK_N//2 with apply_swiglu).
++        tl.static_assert(
++            OUT_BLOCK_N % 32 == 0,
++            "HAS_MX_OUT requires OUT_BLOCK_N % 32 == 0",
++        )
++        NUM_QB: tl.constexpr = OUT_BLOCK_N // 32
++        out_safe = tl.where(mask, out, 0.0)
++        out_3d = tl.reshape(out_safe, [BLOCK_M, NUM_QB, 32])
++        abs_3d = tl.abs(out_3d)
++        max_val = tl.max(abs_3d, axis=2, keep_dims=True)
++        dequant_scale = max_val / MX_OUT_DTYPE_MAX
++        # ROUND_UP via exponent: 2 ** ceil(log2(dequant_scale)).
++        dequant_scale_exponent = (
++            dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF
++        ) & 0x7F800000
++        dequant_scale_rounded = dequant_scale_exponent.to(tl.float32, bitcast=True)
++        quant_scale = tl.where(
++            dequant_scale_rounded == 0, 0.0, 1.0 / dequant_scale_rounded
++        )
++        quant_tensor = out_3d * quant_scale
++        quant_2d = tl.reshape(quant_tensor, [BLOCK_M, OUT_BLOCK_N])
++        tl.store(YPtrs, quant_2d.to(Y.dtype.element_ty), mask=mask)
++        # Extract biased exponent (top 8 bits >> 23) as uint8 ue8m0 scale.
++        scale_exp_3d = (dequant_scale_exponent >> 23).to(tl.uint8)
++        scale_exp_2d = tl.reshape(scale_exp_3d, [BLOCK_M, NUM_QB])
++        offs_s_n = NUM_QB * pid_n + tl.arange(0, NUM_QB)
++        mask_s_n = offs_s_n < tl.cdiv(yN, 32)
++        YMxScalePtrs = (
++            YMxScale
++            + (start_m + offs_y_m).to(index_type)[:, None] * stride_y_mx_m
++            + offs_s_n.to(index_type)[None, :] * stride_y_mx_n
++        )
++        tl.store(
++            YMxScalePtrs,
++            scale_exp_2d,
++            mask=mask_m[:, None] & mask_s_n[None, :],
++        )
++    else:
++        tl.store(YPtrs, out, mask=mask)
+diff --git a/aiter/ops/triton/_triton_kernels/moe/moe_routing/expt_data.py b/aiter/ops/triton/_triton_kernels/moe/moe_routing/expt_data.py
+index ff0b32ac7..70fa3b6f8 100644
+--- a/aiter/ops/triton/_triton_kernels/moe/moe_routing/expt_data.py
++++ b/aiter/ops/triton/_triton_kernels/moe/moe_routing/expt_data.py
+@@ -90,3 +90,37 @@ def _expt_data_compute_stage2_fused(expt_id, Hist, TileStart, TileInfo):
+         return
+     TileInfo += tl.load(TileStart + expt_id)
+     tl.store(TileInfo, expt_id)
++
++
++@triton.jit
++def _expt_data_only_kernel(
++    Hist,
++    n_expts_tot,
++    TokenStart,
++    TileStart,
++    MDTileInfo,
++    max_num_tiles,
++    n_gates,
++    tile_dim_log2: tl.constexpr,
++    BLOCK: tl.constexpr,
++    EQUAL_BLOCK: tl.constexpr,
++):
++    """Standalone stage1+stage2 launch — builds ExptData from a precomputed
++    histogram with no memset. Grid: (n_expts_tot,)."""
++    pid = tl.program_id(0)
++
++    _expt_data_compute_stage1(
++        pid,
++        Hist,
++        n_expts_tot,
++        TokenStart,
++        TileStart,
++        MDTileInfo,
++        max_num_tiles,
++        n_gates,
++        tile_dim_log2,
++        BLOCK,
++        EQUAL_BLOCK,
++    )
++
++    _expt_data_compute_stage2(pid, Hist, TileStart, MDTileInfo, tile_dim_log2)
+diff --git a/aiter/ops/triton/_triton_kernels/moe/moe_routing/topk.py b/aiter/ops/triton/_triton_kernels/moe/moe_routing/topk.py
+index b75562b09..4b5384c9a 100644
+--- a/aiter/ops/triton/_triton_kernels/moe/moe_routing/topk.py
++++ b/aiter/ops/triton/_triton_kernels/moe/moe_routing/topk.py
+@@ -26,6 +26,25 @@ def key_to_fpval(x):
+     return x ^ tl.where((x & tm) == 0, fm, tm)
+ 
+ 
++@triton.jit
++def _apply_score_mode(x, SCORE_MODE: tl.constexpr):
++    """Pre-transform raw logits before topk selection.
++
++    SCORE_MODE values:
++      - "softmax": no pre-transform (caller may apply softmax to selected
++        values via APPLY_SOFTMAX flag).
++      - "sqrtsoftplus": x → sqrt(softplus(x)) using numerically stable
++        softplus(x) = max(x, 0) + log(1 + exp(-|x|)). Matches
++        torch.nn.functional.softplus for the DeepSeek-V4 sqrtsoftplus router.
++    """
++    if SCORE_MODE == "sqrtsoftplus":
++        x_f = x.to(tl.float32)
++        softplus_x = tl.maximum(x_f, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x_f)))
++        return tl.sqrt(softplus_x).to(x.dtype)
++    # "softmax" (and default): identity
++    return x
++
++
+ @triton.jit
+ def streaming_topk(
+     X,
+@@ -37,45 +56,78 @@ def streaming_topk(
+     N_EXPTS_ACT: tl.constexpr,
+     N_EXPTS_ACT_PAD: tl.constexpr,
+     BLOCK_N: tl.constexpr,
++    Bias=None,
++    SCORE_MODE: tl.constexpr = "softmax",
++    HAS_BIAS: tl.constexpr = False,
+ ):
+     x_nbits: tl.constexpr = X.dtype.element_ty.primitive_bitwidth
+     x_utype: tl.constexpr = tl.dtype(f"uint{x_nbits}")
+     if x_nbits < 16:
+-        # this ensures that we leave at least 16 bits for expert index
+-        # even if the input dtype is smaller than 16 bits:
+         y_nbits: tl.constexpr = 32
+     else:
+         y_nbits: tl.constexpr = x_nbits * 2
+     x_ultype: tl.constexpr = tl.dtype(f"uint{y_nbits}")
+     x_dtype: tl.constexpr = X.dtype.element_ty
+ 
+-    # subtract 1 from loop iterations because we peel the first (masked) iteration:
+     loop_iterations: tl.constexpr = N_EXPTS_PAD // BLOCK_N - 1
+     offs_x_n = loop_iterations * BLOCK_N + tl.arange(0, BLOCK_N)
+     mask_n = offs_x_n[None, :] < n_expts_tot
+ 
+-    # first iteration:
++    # First iteration (peeled, may have masked lanes). For SCORE_MODE="softmax"
++    # (legacy), keep the exact original sequence (load with -inf placeholder,
++    # no transform). For SCORE_MODE="sqrtsoftplus", load with 0 placeholder,
++    # apply transform + optional bias, then explicitly mask invalid lanes to
++    # -inf — because the transform of -inf is NOT -inf (sqrt(softplus(-inf))
++    # = 0) and would incorrectly win topk against small valid scores.
+     X_ptrs = X + offs_m[:, None] * stride_xm + offs_x_n[None, :]
+-    x = tl.load(X_ptrs, mask=(mask_m & mask_n), other=float("-inf"))
++    if SCORE_MODE == "softmax":
++        x = tl.load(X_ptrs, mask=(mask_m & mask_n), other=float("-inf"))
++    else:
++        x = tl.load(X_ptrs, mask=(mask_m & mask_n), other=0.0)
++        x = _apply_score_mode(x, SCORE_MODE)
++        if HAS_BIAS:
++            bias_col_mask = offs_x_n < n_expts_tot
++            b = tl.load(Bias + offs_x_n, mask=bias_col_mask, other=0.0)
++            x = x + b[None, :].to(x_dtype)
++        x = tl.where(mask_m & mask_n, x, float("-inf"))
+     x = fpval_to_key(x.to(x_utype, bitcast=True))
+     x = (x.to(x_ultype) << 16) | offs_x_n[None, :]
+     acc = tl.topk(x, N_EXPTS_ACT_PAD, dim=1)
+ 
+-    # subsequent iterations:
++    # subsequent iterations: full blocks within n_expts_tot, no col mask
+     for _i in (tl.static_range if loop_iterations <= 4 else range)(loop_iterations):
+         acc = tl.bitonic_merge(acc)  # ensure sorted ascending for the merge
+         X_ptrs -= BLOCK_N
+         offs_x_n -= BLOCK_N
+-        x = tl.load(X_ptrs, mask=mask_m, other=float("-inf"))
++        if SCORE_MODE == "softmax":
++            x = tl.load(X_ptrs, mask=mask_m, other=float("-inf"))
++        else:
++            x = tl.load(X_ptrs, mask=mask_m, other=0.0)
++            x = _apply_score_mode(x, SCORE_MODE)
++            if HAS_BIAS:
++                b = tl.load(Bias + offs_x_n)
++                x = x + b[None, :].to(x_dtype)
++            x = tl.where(mask_m, x, float("-inf"))
+         x = fpval_to_key(x.to(x_utype, bitcast=True))
+         x = (x.to(x_ultype) << 16) | offs_x_n[None, :]
+         acc = tl.maximum(acc, tl.topk(x, N_EXPTS_ACT_PAD, dim=1))
+ 
++    # Pre-existing bug fix: after the streaming merge loop, acc is not
++    # guaranteed to be sorted by value (tl.maximum of an ASC and the new
++    # tl.topk output is bitonic, not sorted). The mask `arange < K` only
++    # works if acc is already sorted descending by value with the top-K at
++    # positions 0..K-1. For K_PAD > K (e.g. K=6 with K_PAD=8), this drops
++    # arbitrary entries, including real top-K entries. Fix: sort by value
++    # ascending first, then mask the smallest (K_PAD - K) positions.
++    if N_EXPTS_ACT != N_EXPTS_ACT_PAD:
++        acc = tl.sort(acc, dim=1)
+     # rotate expert index into upper 16 bits:
+     # 0000vvvvvvvviiii --> iiii0000vvvvvvvv
+     acc = (acc << (y_nbits - 16)) | (acc >> 16)
+     if N_EXPTS_ACT != N_EXPTS_ACT_PAD:
+-        mask_expts_act = tl.arange(0, N_EXPTS_ACT_PAD)[None, :] < N_EXPTS_ACT
++        mask_expts_act = tl.arange(0, N_EXPTS_ACT_PAD)[None, :] >= (
++            N_EXPTS_ACT_PAD - N_EXPTS_ACT
++        )
+         acc = tl.where(mask_expts_act, acc, N_EXPTS_PAD << (y_nbits - 16))
+     # sort in ascending order of expert (descending order of key)
+     acc = tl.sort(acc, dim=1)
+@@ -115,7 +167,20 @@ def _topk(
+     N_EXPTS_ACT: tl.constexpr,
+     N_EXPTS_ACT_PAD: tl.constexpr,
+     BLOCK_N: tl.constexpr,
++    Bias=None,
++    SCORE_MODE: tl.constexpr = "softmax",
++    HAS_BIAS: tl.constexpr = False,
++    APPLY_RENORM: tl.constexpr = False,
++    ROUTED_SCALING: tl.constexpr = 1.0,
+ ):
++    # Backward-compat sanity. APPLY_SOFTMAX = post-selection softmax over the
++    # K selected logits (legacy behavior). It only makes sense when no
++    # pre-transform is applied; for SCORE_MODE="sqrtsoftplus" the caller is
++    # expected to use APPLY_RENORM + ROUTED_SCALING instead.
++    tl.static_assert(
++        (not APPLY_SOFTMAX) or (SCORE_MODE == "softmax"),
++        "APPLY_SOFTMAX is only valid when SCORE_MODE='softmax'",
++    )
+ 
+     pid = tl.program_id(0)
+     if isinstance(n_rows, tl.tensor) and n_rows.dtype.is_ptr():
+@@ -130,14 +195,12 @@ def _topk(
+         tl.store(SP + offs, tl.zeros([BLOCK_SP], tl.int32), mask=offs < sp_size)
+ 
+     if pid * BLOCK_M >= n_rows:
+-        # early exit:
+         return
+ 
+     tl.static_assert(BLOCK_N % 32 == 0)
+     tl.static_assert(N_EXPTS_PAD % BLOCK_N == 0)
+     x_dtype: tl.constexpr = X.dtype.element_ty
+ 
+-    # load logits
+     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_y_n = tl.arange(0, N_EXPTS_ACT_PAD)
+     mask_m = offs_m[:, None] < n_rows
+@@ -151,13 +214,39 @@ def _topk(
+         N_EXPTS_ACT,
+         N_EXPTS_ACT_PAD,
+         BLOCK_N,
++        Bias=Bias,
++        SCORE_MODE=SCORE_MODE,
++        HAS_BIAS=HAS_BIAS,
+     )
+ 
++    # Real-entry mask: padded (sentinel) entries are flagged by
++    # y_indices == N_EXPTS_PAD inside streaming_topk and have y_values = -inf.
++    # Post-selection ops (bias-subtract, renorm, scaling) must operate on
++    # real entries only — otherwise -inf poisons the renorm sum, and the
++    # sentinel y_indices (== N_EXPTS_PAD) would OOB the Bias array.
++    real_mask = y_indices != N_EXPTS_PAD if N_EXPTS_ACT != N_EXPTS_ACT_PAD else (y_indices >= 0)
++
++    # For SCORE_MODE="sqrtsoftplus" with HAS_BIAS, the y_values returned by
++    # streaming_topk are biased scores (sqrt(softplus(x)) + bias) — used for
++    # selection. We want the unbiased sqrt(softplus(x)) values as the gathered
++    # weights (the "noaux_tc" pattern from V4). Subtract bias[y_indices].
++    if SCORE_MODE == "sqrtsoftplus" and HAS_BIAS:
++        safe_idx = tl.where(real_mask, y_indices, 0).to(tl.int32)
++        b_at_idx = tl.load(Bias + safe_idx)
++        y_unbiased = y_values.to(tl.float32) - b_at_idx
++        y_values = tl.where(real_mask, y_unbiased, 0.0).to(x_dtype)
++
+     # normalize selected values
+     if APPLY_SOFTMAX:
+         y_values = tl.softmax(y_values.to(tl.float32), dim=1, keep_dims=True).to(
+             x_dtype
+         )
++    elif APPLY_RENORM:
++        y_f = tl.where(real_mask, y_values.to(tl.float32), 0.0)
++        s = tl.sum(y_f, axis=1, keep_dims=True)
++        y_values = (y_f / (s + 1e-20) * ROUTED_SCALING).to(x_dtype)
++    elif ROUTED_SCALING != 1.0:
++        y_values = (y_values.to(tl.float32) * ROUTED_SCALING).to(x_dtype)
+ 
+     # write back
+     Yv_ptrs = Yv + offs_m[:, None] * stride_ym + offs_y_n[None, :]
+@@ -182,3 +271,150 @@ def _topk(
+         r = tl.reduce_or(y2, axis=1)
+         BitsPtrs = Bits + offs_m[:, None] * stride_rm + offs_r_n[None, :] * stride_rn
+         tl.store(BitsPtrs, r, mask=mask_m)
++
++
++@triton.jit
++def _hash_routing(
++    InputIds,           # int32 [n_rows] — token-id per row
++    Tid2Eid,            # int32 [vocab_size, K] — per-token-id top-K expert table
++    stride_t2e_v,       # row stride of Tid2Eid (= K)
++    X,                  # [n_rows, n_expts_tot] router logits (bf16/fp32)
++    stride_xm,
++    Yv,                 # output expt_scal [n_rows, N_EXPTS_ACT_PAD]
++    Yi,                 # output expt_indx [n_rows, N_EXPTS_ACT_PAD] (int16)
++    stride_ym,
++    Bits,               # bitmatrix data
++    stride_rm,
++    stride_rn,
++    n_rows,
++    n_expts_tot,
++    S,                  # bitmatrix scratchpad (must memset to 0)
++    BLOCK_S: tl.constexpr,
++    s_blocks,
++    SP,                 # bitmatrix partials (must memset to 0)
++    BLOCK_SP: tl.constexpr,
++    sp_blocks,
++    sp_size,
++    BLOCK_M: tl.constexpr,
++    N_EXPTS_PAD: tl.constexpr,     # padded n_expts_tot (power of 2 ≥ n_expts_tot)
++    N_EXPTS_ACT: tl.constexpr,
++    N_EXPTS_ACT_PAD: tl.constexpr, # next pow2 of K
++    BLOCK_N: tl.constexpr,
++    SCORE_MODE: tl.constexpr = "sqrtsoftplus",
++    APPLY_RENORM: tl.constexpr = True,
++    ROUTED_SCALING: tl.constexpr = 1.0,
++):
++    """Fused hash routing for DeepSeek-V4 hash layers.
++
++    Replaces _hash_topk (Python: tid2eid lookup + softplus + sqrt + gather +
++    renorm + scale) AND fused_routing_from_topk (3-kernel counting sort) AND
++    bitmatrix construction with ONE Triton kernel. Output contract matches
++    `_topk` so downstream `sort_tokens_fused` consumes it unchanged.
++
++    Pipeline per row:
++      1. expt_indx = Tid2Eid[input_id, :K]  # tid2eid lookup
++      2. raw_scores = sqrt(softplus(X[row, :]))  # apply score transform
++      3. expt_scal = raw_scores[expt_indx]  # gather K weights
++      4. (optional) renorm: expt_scal /= expt_scal.sum() ; clamp_min(1e-20)
++      5. expt_scal *= routed_scaling_factor
++      6. Pack expt_indx into bitmatrix.
++
++    No topk selection — expt_indx is fully determined by Tid2Eid lookup.
++    """
++    pid = tl.program_id(0)
++
++    # Memset bitmatrix scratchpads (mirror _topk pattern)
++    if pid < s_blocks:
++        tl.store(
++            S + BLOCK_S * pid + tl.arange(0, BLOCK_S), tl.zeros([BLOCK_S], tl.int32)
++        )
++    elif pid < s_blocks + sp_blocks:
++        offs = BLOCK_SP * (pid - s_blocks) + tl.arange(0, BLOCK_SP)
++        tl.store(SP + offs, tl.zeros([BLOCK_SP], tl.int32), mask=offs < sp_size)
++
++    if pid * BLOCK_M >= n_rows:
++        return
++
++    tl.static_assert(BLOCK_N % 32 == 0)
++    tl.static_assert(N_EXPTS_PAD % BLOCK_N == 0)
++    x_dtype: tl.constexpr = X.dtype.element_ty
++
++    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
++    mask_m = offs_m < n_rows
++
++    # 1. Load input_ids for this BLOCK_M, then tid2eid[input_ids[i], :K]
++    input_ids = tl.load(InputIds + offs_m, mask=mask_m, other=0).to(tl.int32)
++    offs_k = tl.arange(0, N_EXPTS_ACT_PAD)
++    mask_k = offs_k < N_EXPTS_ACT if N_EXPTS_ACT != N_EXPTS_ACT_PAD else tl.full([N_EXPTS_ACT_PAD], 1, tl.int1)
++    # Gather Tid2Eid[input_ids[m], k] for m in BLOCK_M, k in K
++    t2e_offs = input_ids[:, None] * stride_t2e_v + offs_k[None, :]
++    expt_indx = tl.load(
++        Tid2Eid + t2e_offs,
++        mask=mask_m[:, None] & mask_k[None, :],
++        other=0,
++    ).to(tl.int32)
++
++    # 2-3. Apply score transform to full row + gather at expt_indx.
++    # Streaming load of X row in BLOCK_N chunks; accumulate scores per expert
++    # at expt_indx (each row has K << n_expts_tot, so we test which chunk
++    # holds each expert index).
++    y_scores = tl.zeros([BLOCK_M, N_EXPTS_ACT_PAD], dtype=tl.float32)
++    loop_iterations: tl.constexpr = N_EXPTS_PAD // BLOCK_N
++    for i in range(loop_iterations):
++        offs_x_n = i * BLOCK_N + tl.arange(0, BLOCK_N)
++        mask_n = offs_x_n < n_expts_tot
++        X_ptrs = X + offs_m[:, None] * stride_xm + offs_x_n[None, :]
++        x = tl.load(X_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(tl.float32)
++        # sqrt(softplus(x)) — numerically stable
++        if SCORE_MODE == "sqrtsoftplus":
++            softplus_x = tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x)))
++            scores = tl.sqrt(softplus_x)
++        else:
++            scores = x
++        # For each (m, k): if expt_indx[m, k] is in [i*BLOCK_N, (i+1)*BLOCK_N), pick scores[m, expt_indx[m, k] - i*BLOCK_N]
++        # Implement via expand: scores[m, n] vs expt_indx[m, k] mapping.
++        # gate_mask[m, k, n] = (expt_indx[m, k] == offs_x_n[n])
++        match = expt_indx[:, :, None] == offs_x_n[None, None, :]
++        # picked[m, k] = sum_n match[m, k, n] * scores[m, n]
++        scores_3d = scores[:, None, :].broadcast_to(BLOCK_M, N_EXPTS_ACT_PAD, BLOCK_N)
++        picked = tl.where(match, scores_3d, 0.0)
++        y_scores += tl.sum(picked, axis=2)
++
++    # Real-entry mask (handles N_EXPTS_ACT_PAD > N_EXPTS_ACT padding lanes)
++    real_mask = mask_k[None, :]
++    y_f = tl.where(mask_m[:, None] & real_mask, y_scores, 0.0)
++
++    # 4-5. Renorm + scale
++    if APPLY_RENORM:
++        s = tl.sum(y_f, axis=1, keep_dims=True)
++        y_f = y_f / (s + 1e-20) * ROUTED_SCALING
++    elif ROUTED_SCALING != 1.0:
++        y_f = y_f * ROUTED_SCALING
++
++    y_values = y_f.to(x_dtype)
++
++    # Write outputs
++    Yv_ptrs = Yv + offs_m[:, None] * stride_ym + offs_k[None, :]
++    Yi_ptrs = Yi + offs_m[:, None] * stride_ym + offs_k[None, :]
++    write_mask = mask_m[:, None] & real_mask
++    tl.store(Yv_ptrs, y_values, mask=write_mask)
++    tl.store(Yi_ptrs, expt_indx, mask=write_mask)
++
++    # Pack into bitmatrix (mirror _topk pattern; sentinels (indx=0 in padded
++    # lanes) safely OR with a real bit since y_values=0 in those lanes won't
++    # affect downstream — but to be safe, mask out padded lanes from packing).
++    safe_indx = tl.where(real_mask, expt_indx, 0).to(tl.int32)
++    y_div = safe_indx // 32
++    y_rem = safe_indx % 32
++    bm_iters: tl.constexpr = N_EXPTS_PAD // BLOCK_N
++    for i in range(bm_iters):
++        offs_r_n = tl.arange(0, BLOCK_N // 32) + i * (BLOCK_N // 32)
++        # Only contribute bits from real lanes
++        y2 = tl.where(
++            (y_div[:, :, None] == offs_r_n[None, None, :]) & real_mask[:, :, None],
++            (1 << y_rem)[:, :, None],
++            0,
++        )
++        r = tl.reduce_or(y2, axis=1)
++        BitsPtrs = Bits + offs_m[:, None] * stride_rm + offs_r_n[None, :] * stride_rn
++        tl.store(BitsPtrs, r, mask=mask_m[:, None])
+diff --git a/aiter/ops/triton/_triton_kernels/moe/reduce.py b/aiter/ops/triton/_triton_kernels/moe/reduce.py
+index 665ce7548..057c8a066 100644
+--- a/aiter/ops/triton/_triton_kernels/moe/reduce.py
++++ b/aiter/ops/triton/_triton_kernels/moe/reduce.py
+@@ -25,6 +25,12 @@ def _reduce_grouped(
+     BLOCK_N: tl.constexpr,
+     EVEN_N: tl.constexpr,
+     ADD_RESIDUAL: tl.constexpr,
++    # Step 9: external residual fold-in. When HAS_EXT_RESIDUAL=True,
++    # Residual[token, :] is added to `acc` before the writeback.
++    Residual,
++    stride_extres_m: tl.uint64,
++    stride_extres_n,
++    HAS_EXT_RESIDUAL: tl.constexpr,
+ ):
+     pid = tl.program_id(0)
+     pid_t = pid // num_blocks
+@@ -66,6 +72,20 @@ def _reduce_grouped(
+     # Compute per-32-col MXFP scales for this tile if requested
+     Nrem = N // ACTIVATION_REDUCTION_N
+ 
++    # Step 9: optional external residual fold-in: load residual at this
++    # tile and add to acc before writeback. Same per-token-row layout as Out.
++    if HAS_EXT_RESIDUAL:
++        res_offs_n = pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT)
++        res_ptr = (
++            Residual + pid_t * stride_extres_m + res_offs_n * stride_extres_n
++        )
++        if EVEN_N:
++            res = tl.load(res_ptr).to(tl.float32)
++            acc = acc + res
++        else:
++            res_mask = res_offs_n < Nrem
++            res = tl.load(res_ptr, mask=res_mask, other=0.0).to(tl.float32)
++            acc = acc + res
+     # write-back for this tile
+     out_ptr = OutPtrs + pid_t * stride_om
+     if EVEN_N:
+diff --git a/aiter/ops/triton/_triton_kernels/quant/quant_mxfp8.py b/aiter/ops/triton/_triton_kernels/quant/quant_mxfp8.py
+new file mode 100644
+index 000000000..fe8350972
+--- /dev/null
++++ b/aiter/ops/triton/_triton_kernels/quant/quant_mxfp8.py
+@@ -0,0 +1,384 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++
++import triton
++import triton.language as tl
++
++
++# MXFP8 activation quant: per-1x32 e8m0 scale + FP8 e4m3 values.
++# Follows aiter.ops.quant.per_1x32_f8_scale_f8_quant:
++#   MAX_POW2 = int(log2(448)) = 8
++#   dtypeMax = 2 ** 8 = 256.0
++#   scale_f32 = max_abs / dtypeMax
++#   scale_e8m0 = round_up_to_pow2(scale_f32) → e8m0 biased
++#   y = round(x_fp32 / e8m0_to_f32(scale_e8m0)) cast to fp8 e4m3
++#
++# Per-block e8m0 derivation done with the same trick as the existing mxfp4 quant:
++#   - bitcast amax to int32
++#   - add 0x200000 (round up to a power of 2 with respect to fp4-style rounding)
++#   - mask 0xFF800000 (keep only sign+exponent bits)
++#   - bitcast back to fp32
++# This delivers a pure power-of-2 amax. Then log2(amax).floor() - 8 gives the
++# unbiased e8m0 exponent for MXFP8 (since dtypeMax = 2**8).
++
++
++@triton.jit
++def _mxfp8_quant_kernel(
++    x_ptr,
++    y_ptr,
++    s_ptr,
++    M,
++    N,
++    stride_xm,
++    stride_xn,
++    stride_ym,
++    stride_yn,
++    stride_sm,
++    stride_sn,
++    BLOCK_SIZE_N: tl.constexpr,  # power-of-2 covering full N
++    QUANT_BLOCK_SIZE: tl.constexpr,  # =32
++    NUM_PRGMS: tl.constexpr,  # row-loop range (usually =M)
++):
++    """
++    Per-1x32 MXFP8 quant. One program per row, holding the full row in
++    registers so a single launch handles all K-groups. Mirrors
++    _rmsnorm_mxfp8_quant_kernel shape and minimizes grid overhead.
++    """
++    row_start = tl.program_id(0)
++    col_offsets = tl.arange(0, BLOCK_SIZE_N)
++    mask = col_offsets < N
++    n_groups: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
++
++    for row_idx in tl.range(row_start, M, NUM_PRGMS, num_stages=2):
++        x = tl.load(
++            x_ptr + row_idx * stride_xm + col_offsets * stride_xn,
++            mask=mask,
++            other=0.0,
++        ).to(tl.float32)
++
++        # (BLOCK_SIZE_N,) -> (n_groups, QUANT_BLOCK_SIZE)
++        x_2d = tl.reshape(x, (n_groups, QUANT_BLOCK_SIZE))
++        amax = tl.max(tl.abs(x_2d), axis=1, keep_dims=True)
++
++        amax_i32 = amax.to(tl.int32, bitcast=True)
++        amax_i32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
++        amax_p2 = amax_i32.to(tl.float32, bitcast=True)
++        scale_unbiased = tl.log2(amax_p2).floor() - 8
++        scale_unbiased = tl.clamp(scale_unbiased, min=-127, max=127)
++        scale_e8m0 = (scale_unbiased.to(tl.int32) + 127).to(tl.uint8)
++        quant_scale = tl.exp2(-scale_unbiased)
++
++        qx_2d = x_2d * quant_scale
++        qx = tl.reshape(qx_2d, (BLOCK_SIZE_N,))
++        y = qx.to(y_ptr.type.element_ty)
++
++        tl.store(
++            y_ptr + row_idx * stride_ym + col_offsets * stride_yn,
++            y,
++            mask=mask,
++        )
++
++        group_offsets = tl.arange(0, n_groups)
++        group_mask = group_offsets < (N // QUANT_BLOCK_SIZE)
++        scale_flat = tl.reshape(scale_e8m0, (n_groups,))
++        tl.store(
++            s_ptr + row_idx * stride_sm + group_offsets * stride_sn,
++            scale_flat,
++            mask=group_mask,
++        )
++
++
++# Transcoder: (FP8 fnuz, fp32 1x128 scale) -> (FP8 fn, e8m0 1x32 scale).
++# Replaces the Python dequant+requant cascade (fp32 cast + multiply + bf16 cast
++# + per_1x32_mxfp8 quant) used in linear.py's MXFP8 fallback path for MLA wq_b
++# when q_norm emits the legacy fp8 fnuz + fp32 1x128 format.
++#
++# In: x_fp8_fnuz (M, N) — fp8 e4m3fnuz bits (interpreted with bias 8 -> value)
++#     x_scale_fp32 (M, N//128) — fp32 per-token-block scale
++# Out: y_fp8_fn (M, N) — fp8 e4m3fn bits (NV format, bias 7)
++#      y_scale_e8m0 (M, N//32) — uint8 e8m0 (1x32 MX scale)
++
++
++@triton.jit
++def _fp8_legacy_to_mxfp8_kernel(
++    x_fnuz_ptr,
++    x_scale_fp32_ptr,
++    y_fn_ptr,
++    y_scale_e8m0_ptr,
++    M,
++    N,
++    stride_xm,
++    stride_xn,
++    stride_xsm,
++    stride_xsn,
++    stride_ym,
++    stride_yn,
++    stride_ysm,
++    stride_ysn,
++    BLOCK_SIZE_M: tl.constexpr,
++    QUANT_BLOCK_SIZE: tl.constexpr,  # =32 (MXFP8 group)
++    LEGACY_BLOCK_SIZE: tl.constexpr,  # =128 (input scale group)
++):
++    """
++    One program per (BLOCK_SIZE_M rows, QUANT_BLOCK_SIZE-element column window).
++    For each 1x32 block, dequantize fnuz fp8 values using the corresponding
++    1x128 fp32 scale, derive the e8m0 (1x32) scale, then re-quantize to fp8 fn.
++    """
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++
++    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
++    offs_n = pid_n * QUANT_BLOCK_SIZE + tl.arange(0, QUANT_BLOCK_SIZE)
++
++    x_offs = offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn
++    x_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
++
++    # Load fp8 fnuz values; .to(fp32) decodes via fnuz bias 8 semantically.
++    x_fnuz = tl.load(x_fnuz_ptr + x_offs, mask=x_mask, other=0.0).to(tl.float32)
++
++    # Which legacy 1x128 group does this 1x32 block fall into?
++    legacy_n = (pid_n * QUANT_BLOCK_SIZE) // LEGACY_BLOCK_SIZE
++    xs_offs = offs_m * stride_xsm + legacy_n * stride_xsn
++    xs_mask = offs_m < M
++    x_scale = tl.load(x_scale_fp32_ptr + xs_offs, mask=xs_mask, other=1.0)
++
++    # Dequantize: bf16-equivalent reconstruction.
++    x_dq = x_fnuz * x_scale[:, None]
++
++    # Derive new e8m0 (1x32) scale from x_dq amax. Same recipe as
++    # _mxfp8_quant_kernel above.
++    amax = tl.max(tl.abs(x_dq), axis=1, keep_dims=True)
++    amax_i32 = amax.to(tl.int32, bitcast=True)
++    amax_i32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
++    amax_p2 = amax_i32.to(tl.float32, bitcast=True)
++    scale_unbiased = tl.log2(amax_p2).floor() - 8
++    scale_unbiased = tl.clamp(scale_unbiased, min=-127, max=127)
++    scale_e8m0 = (scale_unbiased.to(tl.int32) + 127).to(tl.uint8)
++    quant_scale = tl.exp2(-scale_unbiased)
++
++    # Re-quantize to fp8 fn.
++    qx = x_dq * quant_scale
++    y = qx.to(y_fn_ptr.type.element_ty)
++
++    y_offs = offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
++    tl.store(y_fn_ptr + y_offs, y, mask=x_mask)
++
++    s_offs = offs_m[:, None] * stride_ysm + pid_n * stride_ysn
++    s_mask = offs_m[:, None] < M
++    tl.store(y_scale_e8m0_ptr + s_offs, scale_e8m0, mask=s_mask)
++
++
++# Fused RMSNorm + MXFP8 (1x32 e8m0) quant. Replaces the separate
++# rmsnorm_quant(fp8 fnuz + fp32 1x128) + transcode-to-MXFP8 sequence used
++# upstream of MXFP8-aware GEMMs (e.g. V4 q_norm -> wq_b).
++#
++# One program per row. Holds the full row in registers, so K is constrained
++# by the BLOCK_SIZE_K constexpr (must be a power of two >= K).
++#
++# In:  x (M, K) bf16 or fp16
++#      g (K,)  bf16 or fp16 weight
++# Out: y (M, K) fp8 e4m3fn
++#      scale (M, K // 32) uint8 e8m0
++
++
++@triton.jit
++def _rmsnorm_mxfp8_quant_kernel(
++    x_ptr,
++    g_ptr,
++    y_ptr,
++    s_ptr,
++    M,
++    K,
++    stride_xm,
++    stride_xk,
++    stride_ym,
++    stride_yk,
++    stride_sm,
++    stride_sn,
++    epsilon,
++    BLOCK_SIZE_K: tl.constexpr,  # power-of-2 covering full K
++    QUANT_BLOCK_SIZE: tl.constexpr,  # =32
++    NUM_PRGMS: tl.constexpr,  # for persistent-loop variant; usually =M
++):
++    """One program processes one row: rmsnorm then MXFP8 quant in registers."""
++    row_start = tl.program_id(0)
++    col_offsets = tl.arange(0, BLOCK_SIZE_K)
++    mask = col_offsets < K
++
++    for row_idx in tl.range(row_start, M, NUM_PRGMS, num_stages=2):
++        # Load full row, cast to fp32
++        x = tl.load(
++            x_ptr + row_idx * stride_xm + col_offsets * stride_xk,
++            mask=mask,
++            other=0.0,
++        ).to(tl.float32)
++        g = tl.load(g_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
++
++        # RMS norm
++        ss = tl.sum(x * x, axis=-1)
++        norm_factor = tl.math.rsqrt((ss / K) + epsilon)
++        y_fp32 = x * norm_factor * g  # (BLOCK_SIZE_K,)
++
++        # Reshape into (K // QUANT_BLOCK_SIZE, QUANT_BLOCK_SIZE) groups for amax.
++        # BLOCK_SIZE_K is the power-of-2 padded size; we keep OOB lanes masked to 0
++        # via the load above, so amax over them is 0 (won't affect the in-bounds max).
++        y_2d = tl.reshape(y_fp32, (BLOCK_SIZE_K // QUANT_BLOCK_SIZE, QUANT_BLOCK_SIZE))
++        amax = tl.max(tl.abs(y_2d), axis=1, keep_dims=True)  # (G, 1)
++
++        # e8m0 scale derivation (same recipe as _mxfp8_quant_kernel).
++        amax_i32 = amax.to(tl.int32, bitcast=True)
++        amax_i32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
++        amax_p2 = amax_i32.to(tl.float32, bitcast=True)
++        scale_unbiased = tl.log2(amax_p2).floor() - 8
++        scale_unbiased = tl.clamp(scale_unbiased, min=-127, max=127)
++        scale_e8m0 = (scale_unbiased.to(tl.int32) + 127).to(tl.uint8)  # (G, 1)
++        quant_scale = tl.exp2(-scale_unbiased)  # (G, 1)
++
++        # Quantize: y_quant = y_fp32 * quant_scale (broadcast along inner 32).
++        qx_2d = y_2d * quant_scale
++        qx = tl.reshape(qx_2d, (BLOCK_SIZE_K,))
++        y_fp8 = qx.to(y_ptr.type.element_ty)
++
++        # Store y (mask OOB).
++        tl.store(
++            y_ptr + row_idx * stride_ym + col_offsets * stride_yk,
++            y_fp8,
++            mask=mask,
++        )
++
++        # Store scales: G entries for this row.
++        n_groups: tl.constexpr = BLOCK_SIZE_K // QUANT_BLOCK_SIZE
++        group_offsets = tl.arange(0, n_groups)
++        group_mask = group_offsets < (K // QUANT_BLOCK_SIZE)
++        scale_flat = tl.reshape(scale_e8m0, (n_groups,))
++        tl.store(
++            s_ptr + row_idx * stride_sm + group_offsets * stride_sn,
++            scale_flat,
++            mask=group_mask,
++        )
++
++
++# Dual fused RMSNorm: Q-side (MXFP8 quant + e8m0 scale emit) + K-side (bf16 out).
++# Replaces the CK `fused_qk_rmsnorm_group_quant` semantics in one Triton launch
++# for the MXFP8 GEMM path (Task #77). The two halves are independent (different
++# weight, different K dim) so they're packed into one program per row to amortize
++# launch overhead: same kernel launch loads both rows, normalizes both, stores Q
++# fp8 + scale, stores K bf16. Each row's Q and K are independently RMSNorm'd
++# (separate weights, separate eps, separate K dim) -- this kernel does NOT fuse
++# their normalization arithmetic, only their launch.
++#
++# In:  q     (M, KQ) bf16 or fp16
++#      kv    (M, KK) bf16 or fp16
++#      gq    (KQ,)   bf16 or fp16 Q-RMSNorm weight
++#      gk    (KK,)   bf16 or fp16 K-RMSNorm weight
++# Out: yq    (M, KQ) fp8 e4m3fn
++#      sq    (M, KQ // 32) uint8 e8m0
++#      yk    (M, KK) bf16
++
++
++@triton.jit
++def _dual_rmsnorm_mxfp8_quant_kernel(
++    q_ptr,
++    k_ptr,
++    gq_ptr,
++    gk_ptr,
++    yq_ptr,
++    sq_ptr,
++    yk_ptr,
++    M,
++    KQ,
++    KK,
++    stride_qm,
++    stride_qn,
++    stride_km,
++    stride_kn,
++    stride_yqm,
++    stride_yqn,
++    stride_sqm,
++    stride_sqn,
++    stride_ykm,
++    stride_ykn,
++    eps_q,
++    eps_k,
++    BLOCK_SIZE_KQ: tl.constexpr,  # power-of-2 covering full KQ
++    BLOCK_SIZE_KK: tl.constexpr,  # power-of-2 covering full KK
++    QUANT_BLOCK_SIZE: tl.constexpr,  # =32 (MXFP8 group size)
++    NUM_PRGMS: tl.constexpr,  # row-loop bound (usually =M)
++):
++    """One program per row: do Q-side RMSNorm+MXFP8 quant AND K-side RMSNorm
++    (bf16 out) in one launch. Mirrors the CK `fused_qk_rmsnorm_group_quant`
++    fusion topology but emits MXFP8 1x32 (e8m0) scales for Q directly."""
++    row_start = tl.program_id(0)
++
++    q_col_offsets = tl.arange(0, BLOCK_SIZE_KQ)
++    q_mask = q_col_offsets < KQ
++    k_col_offsets = tl.arange(0, BLOCK_SIZE_KK)
++    k_mask = k_col_offsets < KK
++
++    n_q_groups: tl.constexpr = BLOCK_SIZE_KQ // QUANT_BLOCK_SIZE
++
++    for row_idx in tl.range(row_start, M, NUM_PRGMS, num_stages=2):
++        # ===== Q side: RMSNorm + MXFP8 quant =====
++        x_q = tl.load(
++            q_ptr + row_idx * stride_qm + q_col_offsets * stride_qn,
++            mask=q_mask,
++            other=0.0,
++        ).to(tl.float32)
++        g_q = tl.load(gq_ptr + q_col_offsets, mask=q_mask, other=0.0).to(
++            tl.float32
++        )
++
++        ss_q = tl.sum(x_q * x_q, axis=-1)
++        norm_q = tl.math.rsqrt((ss_q / KQ) + eps_q)
++        y_q_fp32 = x_q * norm_q * g_q
++
++        y_q_2d = tl.reshape(y_q_fp32, (n_q_groups, QUANT_BLOCK_SIZE))
++        amax_q = tl.max(tl.abs(y_q_2d), axis=1, keep_dims=True)
++
++        amax_qi32 = amax_q.to(tl.int32, bitcast=True)
++        amax_qi32 = (amax_qi32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
++        amax_qp2 = amax_qi32.to(tl.float32, bitcast=True)
++        scale_q_unbiased = tl.log2(amax_qp2).floor() - 8
++        scale_q_unbiased = tl.clamp(scale_q_unbiased, min=-127, max=127)
++        scale_q_e8m0 = (scale_q_unbiased.to(tl.int32) + 127).to(tl.uint8)
++        quant_scale_q = tl.exp2(-scale_q_unbiased)
++
++        qx_q_2d = y_q_2d * quant_scale_q
++        qx_q = tl.reshape(qx_q_2d, (BLOCK_SIZE_KQ,))
++        y_q_fp8 = qx_q.to(yq_ptr.type.element_ty)
++
++        tl.store(
++            yq_ptr + row_idx * stride_yqm + q_col_offsets * stride_yqn,
++            y_q_fp8,
++            mask=q_mask,
++        )
++
++        q_group_offsets = tl.arange(0, n_q_groups)
++        q_group_mask = q_group_offsets < (KQ // QUANT_BLOCK_SIZE)
++        scale_q_flat = tl.reshape(scale_q_e8m0, (n_q_groups,))
++        tl.store(
++            sq_ptr + row_idx * stride_sqm + q_group_offsets * stride_sqn,
++            scale_q_flat,
++            mask=q_group_mask,
++        )
++
++        # ===== K side: RMSNorm only, bf16 out =====
++        x_k = tl.load(
++            k_ptr + row_idx * stride_km + k_col_offsets * stride_kn,
++            mask=k_mask,
++            other=0.0,
++        ).to(tl.float32)
++        g_k = tl.load(gk_ptr + k_col_offsets, mask=k_mask, other=0.0).to(
++            tl.float32
++        )
++
++        ss_k = tl.sum(x_k * x_k, axis=-1)
++        norm_k = tl.math.rsqrt((ss_k / KK) + eps_k)
++        y_k_fp32 = x_k * norm_k * g_k
++        y_k_out = y_k_fp32.to(yk_ptr.type.element_ty)
++
++        tl.store(
++            yk_ptr + row_idx * stride_ykm + k_col_offsets * stride_ykn,
++            y_k_out,
++            mask=k_mask,
++        )
+diff --git a/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=1536-K=4096.json b/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=1536-K=4096.json
+new file mode 100644
+index 000000000..6b2567e19
+--- /dev/null
++++ b/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=1536-K=4096.json
+@@ -0,0 +1,170 @@
++{
++  "M_LEQ_4": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_8": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 2,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_16": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 2,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_32": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_64": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_128": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 1,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_256": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 1,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_512": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_2048": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 8,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_4096": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_8192": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_GEQ_8192": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "any": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  }
++}
+\ No newline at end of file
+diff --git a/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=4096-K=1024.json b/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=4096-K=1024.json
+new file mode 100644
+index 000000000..5ba817728
+--- /dev/null
++++ b/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=4096-K=1024.json
+@@ -0,0 +1,170 @@
++{
++  "M_LEQ_4": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_8": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 2,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_16": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 2,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_32": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 2,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_64": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_128": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 1,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_256": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 1,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_512": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_1024": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_2048": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 3,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_4096": {
++    "BLOCK_SIZE_M": 256,
++    "BLOCK_SIZE_N": 256,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 8,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_8192": {
++    "BLOCK_SIZE_M": 256,
++    "BLOCK_SIZE_N": 256,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 8,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_GEQ_8192": {
++    "BLOCK_SIZE_M": 256,
++    "BLOCK_SIZE_N": 256,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 8,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "any": {
++    "BLOCK_SIZE_M": 256,
++    "BLOCK_SIZE_N": 256,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 8,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  }
++}
+\ No newline at end of file
+diff --git a/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=4096-K=256.json b/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=4096-K=256.json
+new file mode 100644
+index 000000000..e4b178dda
+--- /dev/null
++++ b/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=4096-K=256.json
+@@ -0,0 +1,170 @@
++{
++  "M_LEQ_4": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 8,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_8": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_16": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 1,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_32": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_64": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_128": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 1,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_256": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 1,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_512": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_1024": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_2048": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 16,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_4096": {
++    "BLOCK_SIZE_M": 256,
++    "BLOCK_SIZE_N": 256,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 8,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_8192": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 16,
++    "num_warps": 4,
++    "num_stages": 3,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_GEQ_8192": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 256,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "any": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 256,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  }
++}
+\ No newline at end of file
+diff --git a/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=512-K=4096.json b/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=512-K=4096.json
+new file mode 100644
+index 000000000..63ea46478
+--- /dev/null
++++ b/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=512-K=4096.json
+@@ -0,0 +1,170 @@
++{
++  "M_LEQ_4": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_8": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 2,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_16": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 2,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_32": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 2,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_64": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_128": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_256": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 1,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_512": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_1024": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_2048": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_4096": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_8192": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_GEQ_8192": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 8,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "any": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 8,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  }
++}
+\ No newline at end of file
+diff --git a/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=8192-K=1024.json b/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=8192-K=1024.json
+new file mode 100644
+index 000000000..cb2547fbb
+--- /dev/null
++++ b/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE-N=8192-K=1024.json
+@@ -0,0 +1,170 @@
++{
++  "M_LEQ_4": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_8": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 2,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_16": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 2,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_32": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 2,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_64": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_128": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_256": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_512": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_1024": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_2048": {
++    "BLOCK_SIZE_M": 256,
++    "BLOCK_SIZE_N": 256,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 8,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_4096": {
++    "BLOCK_SIZE_M": 256,
++    "BLOCK_SIZE_N": 256,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 8,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_LEQ_8192": {
++    "BLOCK_SIZE_M": 256,
++    "BLOCK_SIZE_N": 256,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 8,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "M_GEQ_8192": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 256,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  },
++  "any": {
++    "BLOCK_SIZE_M": 128,
++    "BLOCK_SIZE_N": 256,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 4,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 2,
++    "matrix_instr_nonkdim": 32,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  }
++}
+\ No newline at end of file
+diff --git a/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE.json b/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE.json
+new file mode 100644
+index 000000000..0008e2ab9
+--- /dev/null
++++ b/aiter/ops/triton/configs/gemm/gfx950-GEMM-MXFP8-PRESHUFFLE.json
+@@ -0,0 +1,14 @@
++{
++  "any": {
++    "BLOCK_SIZE_M": 32,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 256,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": null,
++    "NUM_KSPLIT": 1
++  }
++}
+diff --git a/aiter/ops/triton/fusions/fused_clamp_act_mul.py b/aiter/ops/triton/fusions/fused_clamp_act_mul.py
+index 0b1b8a1a6..32a0b3e6b 100644
+--- a/aiter/ops/triton/fusions/fused_clamp_act_mul.py
++++ b/aiter/ops/triton/fusions/fused_clamp_act_mul.py
+@@ -25,6 +25,9 @@ def fused_clamp_act_mul(
+     weights: Optional[torch.Tensor] = None,
+     dtype_quant: torch.dtype | None = None,
+     transpose_scale: bool = False,
++    quant_block_size: int = 128,
++    scale_dtype_fmt: Literal["fp32", "ue8m0"] = "fp32",
++    shuffle_scale: bool = False,
+ ):
+     """
+     Fused clamp (SwiGLU-style) + act(gate) * up + optional weights, with optional FP8 group quant.
+@@ -54,6 +57,22 @@ def fused_clamp_act_mul(
+ 
+     HAS_QUANT = dtype_quant is not None
+ 
++    # Step 5 ue8m0 mode: per-1×32 group quant, uint8 scale.
++    assert scale_dtype_fmt in ("fp32", "ue8m0")
++    if scale_dtype_fmt == "ue8m0":
++        assert HAS_QUANT, "scale_dtype_fmt='ue8m0' requires dtype_quant"
++        assert quant_block_size == 32, f"ue8m0 requires quant_block_size=32 got {quant_block_size}"
++        assert dtype_quant in (torch.float8_e4m3fn, torch.float8_e4m3fnuz), (
++            f"ue8m0 requires fp8 e4m3, got {dtype_quant}"
++        )
++        if shuffle_scale and transpose_scale:
++            raise ValueError("shuffle_scale incompatible with transpose_scale")
++        _scale_storage_dtype = torch.uint8
++    else:
++        if shuffle_scale:
++            raise ValueError("shuffle_scale only valid with scale_dtype_fmt='ue8m0'")
++        _scale_storage_dtype = torch.float32
++
+     if HAS_QUANT:
+         if out is None:
+             out = torch.empty((M, n_half), dtype=dtype_quant, device=inp.device)
+@@ -65,15 +84,15 @@ def fused_clamp_act_mul(
+                     dtype_quant,
+                     out.dtype,
+                 )
+-        num_blocks = (n_half + 127) // 128
++        num_blocks = (n_half + quant_block_size - 1) // quant_block_size
+         if scale is None:
+             if transpose_scale:
+                 scale = torch.empty(
+-                    (num_blocks, M), dtype=torch.float32, device=inp.device
++                    (num_blocks, M), dtype=_scale_storage_dtype, device=inp.device
+                 )
+             else:
+                 scale = torch.empty(
+-                    (M, num_blocks), dtype=torch.float32, device=inp.device
++                    (M, num_blocks), dtype=_scale_storage_dtype, device=inp.device
+                 )
+         else:
+             if transpose_scale:
+@@ -153,7 +172,8 @@ def fused_clamp_act_mul(
+         weights.stride(1) if HAVE_WEIGHTS else 0,
+         swiglu_limit,
+         BLOCK_SIZE_N=BLOCK_SIZE_N,
+-        QUANT_BLOCK_SIZE=128,
++        QUANT_BLOCK_SIZE=quant_block_size,
++        SCALE_FMT=scale_dtype_fmt,
+         DTYPE_MAX=DTYPE_MAX,
+         DTYPE_MIN=-DTYPE_MAX,
+         HAVE_WEIGHTS=HAVE_WEIGHTS,
+@@ -167,5 +187,8 @@ def fused_clamp_act_mul(
+     if HAS_QUANT:
+         if transpose_scale:
+             scale = scale.view(M, num_bs_cols)
++        if shuffle_scale:
++            from aiter.utility import fp4_utils
++            scale = fp4_utils.e8m0_shuffle(scale)
+         return out, scale
+     return out
+diff --git a/aiter/ops/triton/gemm/basic/gemm_mxfp8.py b/aiter/ops/triton/gemm/basic/gemm_mxfp8.py
+new file mode 100644
+index 000000000..56d4d2f44
+--- /dev/null
++++ b/aiter/ops/triton/gemm/basic/gemm_mxfp8.py
+@@ -0,0 +1,256 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++
++from typing import Optional
++
++import torch
++import triton
++
++from aiter.ops.triton._triton_kernels.gemm.basic.gemm_mxfp8 import (
++    _gemm_mxfp8_kernel,
++    _gemm_mxfp8_preshuffle_kernel,
++)
++from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
++
++
++_DEFAULT_CONFIG = {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 8,
++    "NUM_KSPLIT": 1,
++    "num_warps": 4,
++    "num_stages": 2,
++    "waves_per_eu": 0,
++    "matrix_instr_nonkdim": 16,
++    "cache_modifier": "",
++}
++
++
++def _get_default_config() -> dict:
++    return dict(_DEFAULT_CONFIG)
++
++
++# -----------------------------------------------------------------------------
++# Tuned-config lookup for gemm_mxfp8_preshuffle.
++#
++# Configs live under aiter.ops.triton.configs.gemm using the standard aiter
++# naming: gfx{arch}-GEMM-MXFP8-PRESHUFFLE-N={N}-K={K}.json, keyed by
++# M_LEQ_x / M_GEQ_x / any per STANDARD_M_BOUNDS. A generic fallback
++# gfx{arch}-GEMM-MXFP8-PRESHUFFLE.json covers untuned (N, K) shapes.
++# -----------------------------------------------------------------------------
++
++# Shapes that have OOM'd at runtime with the tuned config. Future calls
++# bypass the tuned lookup for these and use _DEFAULT_CONFIG. The tuned
++# benches don't run under HIP-graph capture, so they can pick configs that
++# look fine in isolation but blow LDS once captured. This cache survives
++# across requests in the same process.
++_OOM_SHAPES: set = set()
++
++
++def _mark_oom(M: int, N: int, K: int):
++    _OOM_SHAPES.add((M, N, K))
++
++
++def _get_config(M: int, N: int, K: int) -> dict:
++    """Load the best tuned config for (M, N, K) via the standard aiter JSON
++    config mechanism. Falls back to the generic fallback file or to
++    _DEFAULT_CONFIG if no JSON is available."""
++    try:
++        config, _ = get_gemm_config("GEMM-MXFP8-PRESHUFFLE", M, N, K)
++    except (AssertionError, KeyError, FileNotFoundError):
++        config = _get_default_config()
++    # Always pin NUM_KSPLIT=1 (this version of the kernel doesn't split K).
++    config["NUM_KSPLIT"] = 1
++    # The JSON uses cache_modifier=null which decodes to Python None; the
++    # kernel accepts None or "", but we keep the empty-string default from
++    # _DEFAULT_CONFIG to match the legacy code path.
++    if config.get("cache_modifier") is None:
++        config["cache_modifier"] = ""
++    return config
++
++
++def gemm_mxfp8(
++    x: torch.Tensor,
++    w: torch.Tensor,
++    x_scales: torch.Tensor,
++    w_scales: torch.Tensor,
++    dtype: Optional[torch.dtype] = torch.bfloat16,
++    y: Optional[torch.Tensor] = None,
++    config: Optional[dict] = None,
++) -> torch.Tensor:
++    """
++    Computes matrix multiplication Y = X @ W^T with MXFP8 activations and FP8
++    weights (1x32 e8m0 act scales, 128x128 e8m0 weight scales).
++
++    Args:
++        x: FP8 e4m3 (or uint8 view) input matrix with shape (M, K).
++        w: FP8 e4m3 (or uint8 view) weight matrix with shape (N, K) — internally
++           transposed to (K, N) before the kernel call.
++        x_scales: e8m0 (uint8) per-group scale for x with shape (M, K // 32).
++        w_scales: e8m0 (uint8) per-block scale for w with shape (N // 128, K // 128).
++        dtype: Output dtype (BF16 or FP16). Default bf16.
++        y: Optional pre-allocated output tensor with shape (M, N).
++        config: Optional kernel-tuning dict. If None uses defaults.
++
++    Returns:
++        torch.Tensor: Output with shape (M, N).
++    """
++    M, K = x.shape
++    N, K_w = w.shape
++    assert K == K_w, f"K mismatch: x has K={K}, w has K={K_w}"
++
++    # Transpose w to (K, N) for the kernel.
++    w_t = w.T
++
++    # tl.dot_scaled with format "e4m3" expects uint8-typed operands; reinterpret
++    # the FP8 buffers as uint8 (bit-identical view).
++    if x.dtype != torch.uint8:
++        x = x.view(torch.uint8)
++    if w_t.dtype != torch.uint8:
++        w_t = w_t.view(torch.uint8)
++
++    if config is None:
++        config = _get_default_config()
++    else:
++        # Merge with defaults so missing keys are filled.
++        merged = _get_default_config()
++        merged.update(config)
++        config = merged
++
++    # First-version: NUM_KSPLIT must be 1
++    config["NUM_KSPLIT"] = 1
++
++    if y is None:
++        y = torch.empty((M, N), dtype=dtype, device=x.device)
++
++    grid = lambda META: (  # noqa: E731
++        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
++    )
++
++    _gemm_mxfp8_kernel[grid](
++        x,
++        w_t,
++        y,
++        x_scales,
++        w_scales,
++        M,
++        N,
++        K,
++        x.stride(0),
++        x.stride(1),
++        w_t.stride(0),
++        w_t.stride(1),
++        y.stride(0),
++        y.stride(1),
++        x_scales.stride(0),
++        x_scales.stride(1),
++        w_scales.stride(0),
++        w_scales.stride(1),
++        **config,
++    )
++
++    return y
++
++
++def gemm_mxfp8_preshuffle(
++    x: torch.Tensor,
++    w_shuffled: torch.Tensor,
++    x_scales: torch.Tensor,
++    w_scales: torch.Tensor,
++    dtype: Optional[torch.dtype] = torch.bfloat16,
++    y: Optional[torch.Tensor] = None,
++    config: Optional[dict] = None,
++) -> torch.Tensor:
++    """
++    Preshuffle variant of gemm_mxfp8. The weight tensor has already been
++    permuted via aiter.ops.shuffle.shuffle_weight(..., layout=(16, 16)). Scales
++    are left unshuffled in the compact 128x128 layout.
++
++    Args:
++        x: FP8 e4m3 activations with shape (M, K).
++        w_shuffled: FP8 e4m3 weights, shuffled in place to (N, K) storage
++            (same total bytes; bytes rearranged for the kernel's read pattern).
++        x_scales: e8m0 (uint8) per-token scale with shape (M, K // 32).
++        w_scales: e8m0 (uint8) per-block weight scale with shape (N // 128, K // 128).
++        dtype: Output dtype.
++        y: Optional pre-allocated output (M, N).
++        config: Optional kernel-tuning dict.
++
++    Returns:
++        torch.Tensor: Output with shape (M, N).
++    """
++    M, K = x.shape
++    N, K_w = w_shuffled.shape
++    assert K == K_w, f"K mismatch: x={K}, w={K_w}"
++    assert N % 16 == 0, f"N must be divisible by 16 for preshuffle, got {N}"
++
++    # The kernel expects to address the shuffled tensor as (N//16, K*16).
++    w_view = w_shuffled.view(N // 16, K * 16)
++
++    if x.dtype != torch.uint8:
++        x = x.view(torch.uint8)
++    if w_view.dtype != torch.uint8:
++        w_view = w_view.view(torch.uint8)
++
++    if config is None:
++        if (M, N, K) in _OOM_SHAPES:
++            # We've previously OOM'd here under HIP-graph capture; skip the
++            # tuned lookup and use the conservative default.
++            config = _get_default_config()
++        else:
++            config = _get_config(M, N, K)
++    else:
++        merged = _get_default_config()
++        merged.update(config)
++        config = merged
++
++    config["NUM_KSPLIT"] = 1
++
++    if y is None:
++        y = torch.empty((M, N), dtype=dtype, device=x.device)
++
++    grid = lambda META: (  # noqa: E731
++        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
++    )
++
++    def _launch(cfg):
++        _gemm_mxfp8_preshuffle_kernel[grid](
++            x,
++            w_view,
++            y,
++            x_scales,
++            w_scales,
++            M,
++            N,
++            K,
++            x.stride(0),
++            x.stride(1),
++            w_view.stride(0),
++            w_view.stride(1),
++            y.stride(0),
++            y.stride(1),
++            x_scales.stride(0),
++            x_scales.stride(1),
++            w_scales.stride(0),
++            w_scales.stride(1),
++            **cfg,
++        )
++
++    try:
++        _launch(config)
++    except Exception as e:
++        # The tuned config may overflow gfx950 LDS (163840 bytes) under HIP
++        # graph capture even when the standalone bench succeeds. Fall back
++        # to default and cache the failure to avoid retrying on every call.
++        if (
++            "OutOfResources" in type(e).__name__
++            or "shared memory" in str(e)
++            or "Required" in str(e)
++        ):
++            _mark_oom(M, N, K)
++            _launch(_get_default_config() | {"NUM_KSPLIT": 1})
++        else:
++            raise
++
++    return y
+diff --git a/aiter/ops/triton/moe/moe_op_gemm_a8w4.py b/aiter/ops/triton/moe/moe_op_gemm_a8w4.py
+index a1269cf24..67ed4b9e7 100644
+--- a/aiter/ops/triton/moe/moe_op_gemm_a8w4.py
++++ b/aiter/ops/triton/moe/moe_op_gemm_a8w4.py
+@@ -2,6 +2,7 @@
+ # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
+ 
+ import itertools
++import os
+ import torch
+ import triton
+ from aiter.ops.triton.moe.moe_routing.routing import RoutingData
+@@ -64,6 +65,17 @@ def allocate_output(
+     return matmul_output, final_output
+ 
+ 
++def recommend_block_m(m: int) -> int:
++    """Recommend block_m for moe_gemm_a8w4 based on M.
++
++    Prefill (M >= 256) → 64. Decode (M < 256) → 32.
++    Both regimes overridable via env: AITER_A8W4_PREFILL_BM / AITER_A8W4_DECODE_BM.
++    """
++    if m >= 256:
++        return int(os.environ.get("AITER_A8W4_PREFILL_BM", "64"))
++    return int(os.environ.get("AITER_A8W4_DECODE_BM", "16"))
++
++
+ def get_kernel_config(m, n, k, routing_data):
+     block_m = routing_data.block_m
+     group_m = 4
+@@ -82,7 +94,10 @@ def get_kernel_config(m, n, k, routing_data):
+         grid_m = routing_data.n_blocks(m, block_m)
+         grid_n = triton.cdiv(n, block_n)
+         grid = grid_m * grid_n * split_k
+-        while block_n >= 64 and grid < 256:
++        # Floor at 64 (was 32): out_mx_quant=True with apply_swiglu requires
++        # OUT_BLOCK_N = BLOCK_N // 2 >= 32. Loop boundary changed to keep
++        # block_n >= 64 for both MX and non-MX paths.
++        while block_n >= 128 and grid < 256:
+             block_n = block_n // 2
+             grid_m = routing_data.n_blocks(m, block_m)
+             grid_n = triton.cdiv(n, block_n)
+@@ -99,6 +114,14 @@ def get_kernel_config(m, n, k, routing_data):
+             block_n = 512
+             num_warps = 8
+ 
++    elif block_m == 64:
++        # V4-Flash prefill-tuned (rocprof brute force v2): for block_m=64,
++        # (bn=128, nw=4, ns=1) gives 2-4x speedup over the previous bn=512/nw=8
++        # default on all four V4-Flash prefill shapes.
++        block_n = 128
++        num_warps = 4
++        num_stages = 1
++
+     else:
+         block_n = 512
+         num_warps = 8
+@@ -117,6 +140,22 @@ def get_kernel_config(m, n, k, routing_data):
+         "matrix_instr_nonkdim": 16,
+         "kpack": 1,
+     }
++    # Env-driven overrides split by regime: block_m>=64 → PREFILL_*, else DECODE_*.
++    # Generic AITER_A8W4_* still works as a fallback when the regime-specific var is unset.
++    _regime = "PREFILL" if block_m >= 64 else "DECODE"
++    _knobs = (
++        "block_n", "block_k", "num_warps", "num_stages",
++        "group_m", "waves_per_eu", "matrix_instr_nonkdim", "split_k",
++    )
++    for key in _knobs:
++        env_specific = f"AITER_A8W4_{_regime}_{key.upper()}"
++        env_generic = f"AITER_A8W4_{key.upper()}"
++        v = os.environ.get(env_specific, os.environ.get(env_generic))
++        if v is not None:
++            try:
++                ret[key] = int(v)
++            except ValueError:
++                pass
+     return ret
+ 
+ 
+@@ -158,6 +197,13 @@ def moe_gemm_a8w4(
+     add_residual=True,
+     unpadded_N=None,
+     unpadded_K=None,
++    # Idea 1: emit (fp8 e4m3, ue8m0 per-1×32 scale) directly from the GEMM
++    # write-back. When out_mx_quant=True, returns (y_fp8, y_scale_ue8m0).
++    # Requires SPLIT_K==1 and no scatter_indx (GEMM1-style).
++    out_mx_quant: bool = False,
++    # External residual to fold into reduce_grouped writeback (saves the
++    # standalone routed+shared elementwise add).
++    residual=None,
+ ):
+     """
+     Y[:, :] = 0.
+@@ -199,11 +245,21 @@ def moe_gemm_a8w4(
+         reduction_n_matmul = 1
+         apply_swiglu_reduction = False
+         reduction_n_reduction = 1
+-    # allocate output memory
++    # allocate output memory. With out_mx_quant=True, the kernel writes fp8 e4m3
++    # into y; otherwise the requested out_dtype (bf16).
++    if out_mx_quant:
++        assert config["split_k"] == 1, "out_mx_quant requires split_k == 1"
++        assert scatter_indx is None, (
++            "out_mx_quant currently only supported for GEMM1-style (no scatter); "
++            "scatter+combine would need fp8-aware reduce_grouped"
++        )
++        out_dtype_actual = torch.float8_e4m3fn
++    else:
++        out_dtype_actual = out_dtype
+     y, y_final = allocate_output(
+         x,
+         w,
+-        out_dtype,
++        out_dtype_actual,
+         reduction_n_matmul,
+         reduction_n_reduction,
+         routing_data,
+@@ -212,6 +268,18 @@ def moe_gemm_a8w4(
+         config["block_m"],
+         config["split_k"],
+     )
++    # Companion ue8m0 scale buffer for the MXFP8 emit path.
++    if out_mx_quant:
++        n_out = w.shape[-1] // reduction_n_matmul  # post-swiglu width
++        assert n_out % 32 == 0, "out_mx_quant requires N_out % 32 == 0"
++        m_out = y.shape[-2]
++        y_scale = torch.empty((m_out, n_out // 32), dtype=torch.uint8, device=x.device)
++        stride_y_mx_m = y_scale.stride(0)
++        stride_y_mx_n = y_scale.stride(1)
++    else:
++        y_scale = None
++        stride_y_mx_m = 0
++        stride_y_mx_n = 0
+     stride_bias = None if bias is None else bias.stride(0)
+     # moe metadata
+     expt_data = routing_data.expt_data
+@@ -279,13 +347,22 @@ def moe_gemm_a8w4(
+         waves_per_eu=config["waves_per_eu"],
+         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+         kpack=config["kpack"],
++        YMxScale=y_scale,
++        stride_y_mx_m=stride_y_mx_m,
++        stride_y_mx_n=stride_y_mx_n,
++        HAS_MX_OUT=out_mx_quant,
+     )
++    # MXFP8 emit path: scatter_indx is None and split_k==1, so we bypass
++    # reduce_grouped and return (fp8 values, ue8m0 scales) directly.
++    if out_mx_quant:
++        return y.squeeze(0), y_scale
+     # Build grouped reduction inputs in a uniform way
+     group_indx = (
+         None
+         if scatter_indx is None
+         else scatter_indx.view(-1, routing_data.n_expts_act)
+     )
++    # Step 9: external residual fold-in is now wired into reduce_grouped.
+     y_final = reduce_grouped(
+         y,
+         group_indx,
+@@ -296,6 +373,7 @@ def moe_gemm_a8w4(
+         reduction_n_reduction,
+         out_dtype=out_dtype,
+         add_residual=add_residual,
++        residual=residual,
+     )
+     return y_final
+ 
+diff --git a/aiter/ops/triton/moe/moe_routing/routing.py b/aiter/ops/triton/moe/moe_routing/routing.py
+index b59221a47..aedf708fd 100644
+--- a/aiter/ops/triton/moe/moe_routing/routing.py
++++ b/aiter/ops/triton/moe/moe_routing/routing.py
+@@ -294,6 +294,202 @@ def routing(logits, n_expts_act, sm_first=False):
+     )
+ 
+ 
++def routing_a8w4(
++    logits: torch.Tensor,
++    n_expts_act: int,
++    block_m: int,
++    *,
++    score_mode: str = "sqrtsoftplus",
++    bias: torch.Tensor | None = None,
++    renorm: bool = True,
++    routed_scaling_factor: float = 1.0,
++):
++    """All-Triton routing for the a8w4 path: fused V4 routing math + sort.
++
++    One-shot pipeline:
++      1. aiter `_topk` (extended): pre-transform (sqrtsoftplus) + bias + topk
++         + bitmatrix + renorm + scale — single Triton kernel.
++      2. aiter `sort_tokens` (or `sort_tokens_fused` for tiny M): sort tokens by
++         expert and produce ExptData specialized for the given ``block_m``.
++
++    Returns (RoutingData, gather_indx, scatter_indx) where gather_indx and
++    scatter_indx are raw int32 tensors (no GatherIndx/ScatterIndx wrappers) —
++    consumed directly by ``moe_gemm_a8w4``.
++
++    No multi-block_m dict, no triton_kernels wrapper, no Python bridge step.
++    """
++    from .topk import topk
++
++    n_tokens, n_expts_tot = logits.shape
++
++    # Step 1: extended topk does sqrtsoftplus + bias + topk + bitmatrix + renorm + scale.
++    expt_scal, expt_indx, bitmatrix = topk(
++        logits,
++        n_expts_act,
++        apply_softmax=False,
++        score_mode=score_mode,
++        bias=bias,
++        renorm=renorm,
++        routed_scaling_factor=routed_scaling_factor,
++        HIST_BLOCK_M=32,
++    )
++
++    # Step 2: sort tokens by expert and build ExptData for the chosen block_m.
++    if n_tokens <= 16:
++        HIST_BLOCK_M = triton.next_power_of_2(max(n_tokens, 1))
++        sort_fn = sort_tokens_fused
++    else:
++        HIST_BLOCK_M = 32
++        sort_fn = sort_tokens
++    (
++        hist,
++        topk_indx,
++        gate_indx,
++        gate_scal,
++        token_offs_raw,
++        token_offs_pad,
++        block_pid_map,
++    ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
++    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
++    routing_data = RoutingData(
++        block_m=block_m,
++        gate_scal=gate_scal,
++        expt_hist=hist,
++        n_expts_tot=n_expts_tot,
++        n_expts_act=n_expts_act,
++        expt_data=expt_data,
++    )
++    return routing_data, topk_indx, gate_indx
++
++
++
++def routing_a8w4_from_hash(
++    router_logits: torch.Tensor,
++    tid2eid: torch.Tensor,
++    input_ids: torch.Tensor,
++    n_expts_act: int,
++    block_m: int,
++    *,
++    score_mode: str = "sqrtsoftplus",
++    renorm: bool = True,
++    routed_scaling_factor: float = 1.0,
++):
++    """All-Triton routing for the a8w4 path on DeepSeek-V4 hash layers.
++
++    Single fused kernel ``hash_routing`` does tid2eid lookup + score transform
++    + gather + renorm + scale + bitmatrix in one launch, then
++    ``sort_tokens_fused`` (same as :func:`routing_a8w4`) produces ExptData.
++
++    Replaces the Python ``_hash_topk`` + multi-kernel ``fused_routing_from_topk``
++    counting-sort + ``compute_expt_data`` (with memset) chain entirely.
++    """
++    from .topk import hash_routing
++
++    n_tokens, n_expts_tot = router_logits.shape
++
++    expt_scal, expt_indx, bitmatrix = hash_routing(
++        router_logits,
++        tid2eid,
++        input_ids,
++        n_expts_act=n_expts_act,
++        HIST_BLOCK_M=32,
++        score_mode=score_mode,
++        renorm=renorm,
++        routed_scaling_factor=routed_scaling_factor,
++    )
++
++    if n_tokens <= 16:
++        HIST_BLOCK_M = triton.next_power_of_2(max(n_tokens, 1))
++        sort_fn = sort_tokens_fused
++    else:
++        HIST_BLOCK_M = 32
++        sort_fn = sort_tokens
++    (
++        hist,
++        topk_indx,
++        gate_indx,
++        gate_scal,
++        token_offs_raw,
++        token_offs_pad,
++        block_pid_map,
++    ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
++    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
++    routing_data = RoutingData(
++        block_m=block_m,
++        gate_scal=gate_scal,
++        expt_hist=hist,
++        n_expts_tot=n_expts_tot,
++        n_expts_act=n_expts_act,
++        expt_data=expt_data,
++    )
++    return routing_data, topk_indx, gate_indx
++
++
++def routing_a8w4_from_topk(
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    n_expts_tot: int,
++    block_m: int,
++):
++    """Routing for the a8w4 path when topk has been pre-computed externally
++    (e.g. DeepSeek-V4 hash layers with tid2eid lookup).
++
++    Mirrors ``routing_a8w4`` but skips the score+topk math step. Pipeline:
++      1. aiter ``fused_routing_from_topk``: 3-kernel counting-sort over the
++         supplied ``(topk_weights, topk_ids)``. Allocates only via
++         ``torch.empty`` — no histogram memset.
++      2. aiter ``_expt_data_only_kernel``: standalone stage1+stage2 launch
++         that materialises ExptData (token_offs_raw, token_offs_pad,
++         block_pid_map) from the histogram for the chosen ``block_m``.
++
++    Returns ``(RoutingData, gather_indx, scatter_indx)`` where ``gather_indx``
++    and ``scatter_indx`` are raw int32 tensors — same contract as
++    ``routing_a8w4`` — so ``_a8w4_fused_experts`` consumes them unchanged.
++    """
++    from aiter.ops.triton.fusions.fused_routing_from_topk import (
++        fused_routing_from_topk,
++    )
++    from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
++        _expt_data_only_kernel,
++    )
++
++    n_tokens, n_expts_act = topk_weights.shape
++    n_gates = n_tokens * n_expts_act
++
++    hist, topk_indx, gate_indx, gate_scal = fused_routing_from_topk(
++        topk_weights, topk_ids, n_expts_tot
++    )
++
++    token_offs_raw, token_offs_pad, block_pid_map, blocks1a, BLOCK_A, block_m_log2 = (
++        _compute_expt_data_internal(n_expts_tot, n_gates, block_m, topk_weights.device)
++    )
++
++    _expt_data_only_kernel[(blocks1a,)](
++        hist,
++        n_expts_tot,
++        token_offs_raw,
++        token_offs_pad,
++        block_pid_map,
++        block_pid_map.shape[0],
++        n_gates,
++        block_m_log2,
++        BLOCK_A,
++        (hist.shape[0] == BLOCK_A),
++        num_warps=1,
++    )
++
++    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
++    routing_data = RoutingData(
++        block_m=block_m,
++        gate_scal=gate_scal,
++        expt_hist=hist,
++        n_expts_tot=n_expts_tot,
++        n_expts_act=n_expts_act,
++        expt_data=expt_data,
++    )
++    return routing_data, topk_indx, gate_indx
++
++
+ # --------------------------
+ # torch reference
+ # --------------------------
+diff --git a/aiter/ops/triton/moe/moe_routing/topk.py b/aiter/ops/triton/moe/moe_routing/topk.py
+index c9c43e1ba..38ca646ab 100644
+--- a/aiter/ops/triton/moe/moe_routing/topk.py
++++ b/aiter/ops/triton/moe/moe_routing/topk.py
+@@ -1,10 +1,35 @@
+ import triton
+ import torch
+-from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import _topk
++from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import _topk, _hash_routing
+ from aiter.ops.triton.moe.moe_routing.bitmatrix import Bitmatrix
+ 
+ 
+-def topk(x, k, apply_softmax=True, dim=1, return_bitmatrix=True, HIST_BLOCK_M=32):
++def topk(
++    x,
++    k,
++    apply_softmax=True,
++    dim=1,
++    return_bitmatrix=True,
++    HIST_BLOCK_M=32,
++    score_mode: str = "softmax",
++    bias=None,
++    renorm: bool = False,
++    routed_scaling_factor: float = 1.0,
++):
++    """Top-k expert selection with bitmatrix.
++
++    score_mode:
++      - "softmax" (default): no pre-transform; APPLY_SOFTMAX may renormalize.
++      - "sqrtsoftplus": pre-transform `scores = sqrt(softplus(logits))` before
++        adding the optional `bias` and running topk. Selected weights are the
++        UNBIASED sqrt(softplus(logits)). DeepSeek-V4 noaux_tc router.
++
++    bias (fp32, [n_expts_tot]): added to scores for selection only, not for
++    returned weights. Only meaningful with score_mode='sqrtsoftplus'.
++
++    renorm: renormalize weights to sum=1 per row before multiplying by
++    routed_scaling_factor.
++    """
+     x_shape = [x.shape[0], x.shape[1]]
+ 
+     def cdiv(a, b):
+@@ -18,6 +43,21 @@ def topk(x, k, apply_softmax=True, dim=1, return_bitmatrix=True, HIST_BLOCK_M=32
+     assert x_shape[-1] < 32768
+     assert dim == 1
+     assert return_bitmatrix
++    assert score_mode in ("softmax", "sqrtsoftplus"), (
++        f"score_mode must be 'softmax' or 'sqrtsoftplus', got {score_mode!r}"
++    )
++    if score_mode != "softmax":
++        assert not apply_softmax, (
++            "apply_softmax only valid with score_mode='softmax'"
++        )
++    has_bias = bias is not None
++    if has_bias:
++        assert bias.dim() == 1
++        assert bias.shape[0] == x.shape[-1]
++        assert bias.dtype == torch.float32
++        assert score_mode == "sqrtsoftplus", (
++            "bias currently only supported with score_mode='sqrtsoftplus'"
++        )
+     n_rows, n_cols = x_shape
+     dev = x.device
+     # scratchpad tensors
+@@ -70,7 +110,121 @@ def topk(x, k, apply_softmax=True, dim=1, return_bitmatrix=True, HIST_BLOCK_M=32
+         N_EXPTS_ACT=k,  # constants
+         N_EXPTS_ACT_PAD=k_pow2,
+         num_warps=8,
++        Bias=bias,
++        SCORE_MODE=score_mode,
++        HAS_BIAS=has_bias,
++        APPLY_RENORM=renorm,
++        ROUTED_SCALING=routed_scaling_factor,
++    )
++    bitmatrix_shape = [n_rows, n_cols_words * 32]
++    bitmatrix = Bitmatrix(
++        bitmatrix,
++        shape=bitmatrix_shape,
++        scratchpad=scratchpad,
++        scratchpad_partials=scratchpad_partials,
++    )
++    return y_vals, y_indx, bitmatrix
++
++
++def hash_routing(
++    router_logits: torch.Tensor,    # [n_rows, n_expts_tot] bf16/fp32
++    tid2eid: torch.Tensor,          # [vocab_size, K] int32 per-token-id expert table
++    input_ids: torch.Tensor,        # [n_rows] int32 token ids (post DP gather, clamped)
++    n_expts_act: int,
++    HIST_BLOCK_M: int = 32,
++    score_mode: str = "sqrtsoftplus",
++    renorm: bool = True,
++    routed_scaling_factor: float = 1.0,
++):
++    """Fused hash routing: tid2eid lookup + score transform + gather + renorm
++    + scale + bitmatrix construction. Output contract matches :func:`topk` so
++    downstream :func:`sort_tokens_fused` consumes it unchanged.
++
++    Replaces the Python ``_hash_topk`` + ``fused_routing_from_topk``
++    counting-sort + bitmatrix-build chain with one Triton kernel launch.
++    """
++
++    def cdiv(a, b):
++        return (a + b - 1) // b
++
++    BLOCK_M = 32
++    BLOCK_N = 128
++    BLOCK_S = 128
++    BLOCK_SP = 128
++    assert router_logits.dim() == 2
++    assert input_ids.dim() == 1
++    assert tid2eid.dim() == 2
++    assert input_ids.shape[0] == router_logits.shape[0]
++    assert tid2eid.shape[1] == n_expts_act, (
++        f"tid2eid second dim {tid2eid.shape[1]} must equal n_expts_act {n_expts_act}"
++    )
++    assert tid2eid.dtype == torch.int32
++    assert input_ids.dtype in (torch.int32, torch.int64)
++    assert score_mode in ("sqrtsoftplus",)
++
++    n_rows, n_cols = router_logits.shape
++    dev = router_logits.device
++    k = n_expts_act
++
++    y_vals = torch.empty((n_rows, k), dtype=router_logits.dtype, device=dev)
++    y_indx = torch.empty((n_rows, k), dtype=torch.int16, device=dev)
++    k_pow2 = triton.next_power_of_2(k)
++
++    n_cols_pad = cdiv(n_cols, BLOCK_N) * BLOCK_N
++    n_cols_words = n_cols_pad // 32
++    bitmatrix = torch.empty(
++        (n_cols_words, cdiv(n_rows, 32) * 32), dtype=torch.uint32, device=dev
++    )
++    bitmatrix = torch.transpose(bitmatrix, 0, 1)[:n_rows]
++    s_blocks = cdiv(n_cols, BLOCK_S)
++    s_cols = s_blocks * BLOCK_S
++    scratchpad = torch.empty((s_cols,), dtype=torch.int32, device=dev)
++    TILE_SIZE = 8
++    BLOCK_MM = HIST_BLOCK_M * TILE_SIZE
++    pids_x = cdiv(n_rows, BLOCK_MM)
++    scratchpad_partials = torch.empty(
++        (n_cols_pad, pids_x * TILE_SIZE), device=dev, dtype=torch.int32
++    )
++    scratchpad_partials = torch.transpose(scratchpad_partials, 0, 1)
++    sp_size = torch.numel(scratchpad_partials)
++    sp_blocks = cdiv(sp_size, BLOCK_SP)
++    pids = max(cdiv(n_rows, BLOCK_M), s_blocks + sp_blocks)
++
++    # int32 cast for input_ids if int64
++    input_ids_i32 = input_ids.to(torch.int32) if input_ids.dtype != torch.int32 else input_ids
++
++    _hash_routing[(pids,)](
++        input_ids_i32,
++        tid2eid,
++        tid2eid.stride(0),
++        router_logits,
++        router_logits.stride(0),
++        y_vals,
++        y_indx,
++        y_vals.stride(0),
++        bitmatrix,
++        bitmatrix.stride(0),
++        bitmatrix.stride(1),
++        n_rows,
++        n_cols,
++        scratchpad,
++        BLOCK_S,
++        s_blocks,
++        scratchpad_partials,
++        BLOCK_SP,
++        sp_blocks,
++        sp_size,
++        BLOCK_M=BLOCK_M,
++        BLOCK_N=BLOCK_N,
++        N_EXPTS_PAD=n_cols_pad,
++        N_EXPTS_ACT=k,
++        N_EXPTS_ACT_PAD=k_pow2,
++        SCORE_MODE=score_mode,
++        APPLY_RENORM=renorm,
++        ROUTED_SCALING=routed_scaling_factor,
++        num_warps=8,
+     )
++
+     bitmatrix_shape = [n_rows, n_cols_words * 32]
+     bitmatrix = Bitmatrix(
+         bitmatrix,
+diff --git a/aiter/ops/triton/moe/reduce.py b/aiter/ops/triton/moe/reduce.py
+index 6a17af681..35a1648b1 100644
+--- a/aiter/ops/triton/moe/reduce.py
++++ b/aiter/ops/triton/moe/reduce.py
+@@ -13,6 +13,8 @@ def reduce_grouped(
+     reduction_n=1,
+     out_dtype=None,
+     add_residual: bool = True,
++    # Step 9: optional external residual folded into the writeback.
++    residual: "torch.Tensor | None" = None,
+ ):
+     """
+     Grouped row reduction used during moe scatter and also compatible with split-k reduce.
+@@ -37,6 +39,10 @@ def reduce_grouped(
+     """
+ 
+     if indx is None and x.shape[0] == 1:
++        assert residual is None, (
++            "reduce_grouped early-return path can't apply external residual; "
++            "either rebuild routing with K>=1 or skip residual fold for this call"
++        )
+         return x.squeeze(0)
+     if indx is not None:
+         num_groups = indx.shape[0]
+@@ -48,6 +54,18 @@ def reduce_grouped(
+     BLOCK_N = 512
+     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
+ 
++    # Step 9: prep external residual buffer + strides for the kernel.
++    if residual is not None:
++        assert residual.shape == out.shape, (
++            f"residual.shape {tuple(residual.shape)} must match out.shape {tuple(out.shape)}"
++        )
++        res_stride_m = residual.stride(0)
++        res_stride_n = residual.stride(1)
++        has_ext_residual = True
++    else:
++        res_stride_m = 0
++        res_stride_n = 0
++        has_ext_residual = False
+     _reduce_grouped[(num_blocks * num_groups,)](
+         x,
+         x.stride(0),
+@@ -68,6 +86,10 @@ def reduce_grouped(
+         EVEN_N=(x.shape[-1] % BLOCK_N == 0),
+         K=K,  #
+         ADD_RESIDUAL=add_residual,
++        Residual=residual,
++        stride_extres_m=res_stride_m,
++        stride_extres_n=res_stride_n,
++        HAS_EXT_RESIDUAL=has_ext_residual,
+         num_warps=2,  #
+     )
+     return out
+diff --git a/aiter/ops/triton/quant/quant_mxfp8.py b/aiter/ops/triton/quant/quant_mxfp8.py
+new file mode 100644
+index 000000000..ae82cafab
+--- /dev/null
++++ b/aiter/ops/triton/quant/quant_mxfp8.py
+@@ -0,0 +1,289 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++
++from typing import Optional, Tuple
++import torch
++import triton
++
++from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
++    _mxfp8_quant_kernel,
++    _fp8_legacy_to_mxfp8_kernel,
++    _rmsnorm_mxfp8_quant_kernel,
++    _dual_rmsnorm_mxfp8_quant_kernel,
++)
++
++
++_QUANT_BLOCK_SIZE = 32
++
++
++def per_1x32_mxfp8_quant_triton(
++    x: torch.Tensor,
++    scale: Optional[torch.Tensor] = None,
++    quant_dtype: torch.dtype = torch.float8_e4m3fn,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Per-1x32 MXFP8 quantization (e8m0 scale + FP8 e4m3 values).
++
++    Args:
++        x: Input tensor (..., K). Typically bf16 or fp16. K % 32 == 0.
++        scale: Pre-allocated scale tensor (M, K // 32) uint8. Optional.
++        quant_dtype: FP8 dtype to cast quantized values to. On MI3xx
++            torch.float8_e4m3fnuz is the canonical FP8 e4m3 type. torch.float8_e4m3fn
++            is acceptable on hardware that supports it.
++
++    Returns:
++        Tuple of:
++            y: FP8 tensor of shape x.shape.
++            s: e8m0 (uint8) scale tensor of shape (..., K // 32).
++    """
++    assert x.dim() >= 2, f"x must be at least 2D, got {x.dim()}"
++    orig_shape = x.shape
++    K = orig_shape[-1]
++    assert (
++        K % _QUANT_BLOCK_SIZE == 0
++    ), f"last dim K={K} must be a multiple of {_QUANT_BLOCK_SIZE}"
++
++    x2d = x.reshape(-1, K).contiguous()
++    M = x2d.shape[0]
++    Ns = K // _QUANT_BLOCK_SIZE  # number of scales per row
++
++    y = torch.empty((M, K), dtype=quant_dtype, device=x.device)
++    if scale is None:
++        scale = torch.empty((M, Ns), dtype=torch.uint8, device=x.device)
++    else:
++        assert scale.shape == (M, Ns), f"scale shape {scale.shape} != ({M},{Ns})"
++        assert scale.dtype == torch.uint8
++
++    BLOCK_SIZE_N = triton.next_power_of_2(K)
++    NUM_PRGMS = M
++    grid = (NUM_PRGMS,)
++
++    _mxfp8_quant_kernel[grid](
++        x2d,
++        y,
++        scale,
++        M,
++        K,
++        x2d.stride(0),
++        x2d.stride(1),
++        y.stride(0),
++        y.stride(1),
++        scale.stride(0),
++        scale.stride(1),
++        BLOCK_SIZE_N=BLOCK_SIZE_N,
++        QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
++        NUM_PRGMS=NUM_PRGMS,
++    )
++
++    y = y.view(*orig_shape[:-1], K)
++    s = scale.view(*orig_shape[:-1], Ns)
++    return y, s
++
++
++_LEGACY_BLOCK_SIZE = 128
++
++
++def fp8_legacy_to_mxfp8(
++    x_fnuz: torch.Tensor,
++    x_scale_fp32: torch.Tensor,
++    y_fn: Optional[torch.Tensor] = None,
++    y_scale: Optional[torch.Tensor] = None,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Transcode (FP8 e4m3fnuz, fp32 1x128 scale) -> (FP8 e4m3fn, e8m0 1x32 scale)
++    in a single Triton launch. Replaces the Python dequant+requant cascade
++    used when MXFP8 path receives legacy-formatted (FP8 + fp32 1x128) inputs.
++
++    Args:
++        x_fnuz: FP8 e4m3fnuz tensor of shape (M, N), N % 32 == 0.
++        x_scale_fp32: fp32 scale of shape (M, N // 128).
++        y_fn: optional preallocated output FP8 e4m3fn tensor.
++        y_scale: optional preallocated uint8 e8m0 scale tensor.
++
++    Returns:
++        y_fn (M, N) fp8 e4m3fn, y_scale (M, N // 32) uint8 e8m0.
++    """
++    assert x_fnuz.dim() == 2, f"x must be 2D, got {x_fnuz.dim()}"
++    M, N = x_fnuz.shape
++    assert N % _QUANT_BLOCK_SIZE == 0
++    assert N % _LEGACY_BLOCK_SIZE == 0
++    assert x_scale_fp32.shape == (M, N // _LEGACY_BLOCK_SIZE), (
++        f"x_scale_fp32 shape {x_scale_fp32.shape} != ({M},{N // _LEGACY_BLOCK_SIZE})"
++    )
++
++    Ns = N // _QUANT_BLOCK_SIZE
++    if y_fn is None:
++        y_fn = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=x_fnuz.device)
++    if y_scale is None:
++        y_scale = torch.empty((M, Ns), dtype=torch.uint8, device=x_fnuz.device)
++
++    BLOCK_SIZE_M = 1
++    grid = (triton.cdiv(M, BLOCK_SIZE_M), Ns)
++
++    _fp8_legacy_to_mxfp8_kernel[grid](
++        x_fnuz,
++        x_scale_fp32,
++        y_fn,
++        y_scale,
++        M,
++        N,
++        x_fnuz.stride(0),
++        x_fnuz.stride(1),
++        x_scale_fp32.stride(0),
++        x_scale_fp32.stride(1),
++        y_fn.stride(0),
++        y_fn.stride(1),
++        y_scale.stride(0),
++        y_scale.stride(1),
++        BLOCK_SIZE_M=BLOCK_SIZE_M,
++        QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
++        LEGACY_BLOCK_SIZE=_LEGACY_BLOCK_SIZE,
++    )
++
++    return y_fn, y_scale
++
++
++def rmsnorm_mxfp8_quant(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    eps: float,
++    y: Optional[torch.Tensor] = None,
++    scale: Optional[torch.Tensor] = None,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Fused RMSNorm + MXFP8 (1x32 e8m0) quant in a single Triton launch.
++
++    Args:
++        x: (M, K) bf16 or fp16.
++        weight: (K,) bf16 or fp16 RMSNorm weight.
++        eps: RMSNorm epsilon.
++        y: optional preallocated FP8 e4m3fn output (M, K).
++        scale: optional preallocated uint8 e8m0 output (M, K // 32).
++
++    Returns:
++        y (M, K) fp8 e4m3fn, scale (M, K // 32) uint8.
++    """
++    assert x.dim() == 2, f"x must be 2D, got {x.dim()}"
++    M, K = x.shape
++    assert weight.shape == (K,), f"weight shape {weight.shape} != ({K},)"
++    assert K % _QUANT_BLOCK_SIZE == 0
++    Ns = K // _QUANT_BLOCK_SIZE
++    BLOCK_SIZE_K = triton.next_power_of_2(K)
++
++    if y is None:
++        y = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
++    if scale is None:
++        scale = torch.empty((M, Ns), dtype=torch.uint8, device=x.device)
++
++    NUM_PRGMS = M
++    grid = (NUM_PRGMS,)
++
++    _rmsnorm_mxfp8_quant_kernel[grid](
++        x,
++        weight,
++        y,
++        scale,
++        M,
++        K,
++        x.stride(0),
++        x.stride(1),
++        y.stride(0),
++        y.stride(1),
++        scale.stride(0),
++        scale.stride(1),
++        eps,
++        BLOCK_SIZE_K=BLOCK_SIZE_K,
++        QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
++        NUM_PRGMS=NUM_PRGMS,
++    )
++    return y, scale
++
++
++def dual_rmsnorm_mxfp8_quant(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++    eps_q: float,
++    eps_k: Optional[float] = None,
++    yq: Optional[torch.Tensor] = None,
++    sq: Optional[torch.Tensor] = None,
++    yk: Optional[torch.Tensor] = None,
++) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Fused dual RMSNorm in a single Triton launch.
++
++    - Q side: RMSNorm(q, q_weight, eps_q) -> MXFP8 (FP8 e4m3fn + uint8 e8m0 1x32).
++    - K side: RMSNorm(k, k_weight, eps_k) -> bf16.
++
++    Replaces the CK `fused_qk_rmsnorm_group_quant` kernel for the MXFP8 GEMM
++    path on V4 (Task #77): one launch instead of two (rmsnorm_mxfp8_quant +
++    rmsnorm2d_fwd_), eliminating the ~6us/layer launch-overhead regression.
++
++    Args:
++        q: (M, KQ) bf16 or fp16 — Q-side input (e.g. q_lora).
++        k: (M, KK) bf16 or fp16 — K-side input (e.g. kv_pre).
++        q_weight: (KQ,) bf16 or fp16 — Q RMSNorm weight.
++        k_weight: (KK,) bf16 or fp16 — K RMSNorm weight.
++        eps_q: Q RMSNorm epsilon.
++        eps_k: K RMSNorm epsilon; defaults to eps_q.
++        yq, sq, yk: optional pre-allocated outputs.
++
++    Returns:
++        yq (M, KQ) fp8 e4m3fn, sq (M, KQ // 32) uint8 e8m0, yk (M, KK) bf16.
++    """
++    assert q.dim() == 2, f"q must be 2D, got {q.dim()}"
++    assert k.dim() == 2, f"k must be 2D, got {k.dim()}"
++    M, KQ = q.shape
++    Mk, KK = k.shape
++    assert M == Mk, f"q rows {M} != k rows {Mk}"
++    assert q_weight.shape == (KQ,), f"q_weight shape {q_weight.shape} != ({KQ},)"
++    assert k_weight.shape == (KK,), f"k_weight shape {k_weight.shape} != ({KK},)"
++    assert KQ % _QUANT_BLOCK_SIZE == 0, (
++        f"KQ={KQ} must be a multiple of {_QUANT_BLOCK_SIZE}"
++    )
++    if eps_k is None:
++        eps_k = eps_q
++
++    Ns = KQ // _QUANT_BLOCK_SIZE
++    BLOCK_SIZE_KQ = triton.next_power_of_2(KQ)
++    BLOCK_SIZE_KK = triton.next_power_of_2(KK)
++
++    if yq is None:
++        yq = torch.empty((M, KQ), dtype=torch.float8_e4m3fn, device=q.device)
++    if sq is None:
++        sq = torch.empty((M, Ns), dtype=torch.uint8, device=q.device)
++    if yk is None:
++        yk = torch.empty((M, KK), dtype=k.dtype, device=k.device)
++
++    NUM_PRGMS = M
++    grid = (NUM_PRGMS,)
++
++    _dual_rmsnorm_mxfp8_quant_kernel[grid](
++        q,
++        k,
++        q_weight,
++        k_weight,
++        yq,
++        sq,
++        yk,
++        M,
++        KQ,
++        KK,
++        q.stride(0),
++        q.stride(1),
++        k.stride(0),
++        k.stride(1),
++        yq.stride(0),
++        yq.stride(1),
++        sq.stride(0),
++        sq.stride(1),
++        yk.stride(0),
++        yk.stride(1),
++        eps_q,
++        eps_k,
++        BLOCK_SIZE_KQ=BLOCK_SIZE_KQ,
++        BLOCK_SIZE_KK=BLOCK_SIZE_KK,
++        QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
++        NUM_PRGMS=NUM_PRGMS,
++    )
++    return yq, sq, yk

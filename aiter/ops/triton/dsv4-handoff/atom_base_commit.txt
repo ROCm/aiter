@@ -1,0 +1,8 @@
+atom_parent=9f1c49e346e37763a20b100c03ecd937c3d5e2e1  atom_head=4459e8c60d3f1648324c84bcfdf0dcf1933a67a1
+commit 4459e8c60d3f1648324c84bcfdf0dcf1933a67a1
+Author:     Aliasger Zaidy <aliasger.zaidy@amd.com>
+AuthorDate: Fri May 15 22:04:42 2026 +0000
+Commit:     Aliasger Zaidy <aliasger.zaidy@amd.com>
+CommitDate: Fri May 15 22:04:42 2026 +0000
+
+    Add a8w4 moe modifications and mxfp8 GEMM for DSv4
