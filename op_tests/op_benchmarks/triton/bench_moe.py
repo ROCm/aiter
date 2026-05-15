@@ -5,6 +5,7 @@ import triton
 from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
 from aiter.ops.triton.moe.moe_op import fused_moe as triton_moe
 from aiter.ops.triton.moe.moe_op_silu_fused import fused_moe_silu as triton_moe_silu
+from aiter.ops.triton.activation import act_mul
 from op_tests.triton_tests.moe.test_moe import input_helper, input_helper_int4_w4a16
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
@@ -262,6 +263,68 @@ def run_benchmark(args):
     bench_moe_gemm.run(save_path="." if args.o else None, print_data=True)
 
 
+def run_act_mul_benchmark(args):
+    """Benchmark ``act_mul`` (SiLU/GELU * gate) on tensors shaped like MoE activations."""
+    print_time = args.print_time
+    dtype = str_to_torch_dtype[args.dtype]
+    activation = args.act_mul_activation
+
+    if print_time:
+        line_names = ["Time_(ms)"]
+        line_vals = ["time"]
+    else:
+        line_names = ["Time_(ms)", "GFLOPS", "Bandwidth_(GB/s)"]
+        line_vals = ["time", "gflops", "bandwidth"]
+
+    x_vals_list = model_benchmark_configs(args)
+    x_names = ["model", "M", "N", "K", "E", "top_k"]
+
+    benchmark = triton.testing.Benchmark(
+        x_names=x_names,
+        x_vals=x_vals_list,
+        line_arg="metric",
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
+        ylabel="ms / GFLOPS / GB/s",
+        plot_name=get_caller_name_no_ext() + "_act_mul",
+        args={},
+    )
+
+    @triton.testing.perf_report([benchmark])
+    def bench_act_mul(M, N, K, E, top_k, metric, model=None):
+        n_even = N if N % 2 == 0 else N - 1
+        if n_even < 2:
+            return 0.0
+        n_rows = M * top_k
+        d = n_even // 2
+        x = torch.randn(n_rows, n_even, device="cuda", dtype=dtype)
+        out = torch.empty(n_rows, d, device="cuda", dtype=dtype)
+
+        elem = torch.tensor([], dtype=dtype).element_size()
+        mem_read = n_rows * n_even * elem
+        mem_write = n_rows * d * elem
+        flops = float(n_rows * d * 8)
+
+        def fn():
+            return act_mul(x, activation, out=out)
+
+        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        bandwidth = (mem_read + mem_write) / (ms * 1e-3) * 1e-9
+        gflops = flops / ms * 1e-6
+
+        if metric == "time":
+            return ms
+        elif metric == "gflops":
+            return gflops
+        elif metric == "bandwidth":
+            return bandwidth
+        else:
+            raise ValueError("Unknown metric: " + metric)
+
+    bench_act_mul.run(save_path="." if args.o else None, print_data=True)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="Benchmark MoE GEMM",
@@ -301,6 +364,19 @@ def parse_args():
     parser.add_argument("-fp8_type", default="e5m2fnuz")
     parser.add_argument("-silu_fused", action="store_true", default=False)
     parser.add_argument(
+        "-bench_act_mul",
+        action="store_true",
+        default=False,
+        help="Benchmark act_mul (no quant) using model M, N, top_k (same layout as silu-fused MoE).",
+    )
+    parser.add_argument(
+        "-act_mul_activation",
+        type=str,
+        default="silu",
+        choices=["silu", "gelu", "gelu_tanh"],
+        help="Activation for -bench_act_mul.",
+    )
+    parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )
     args = parser.parse_args()
@@ -309,6 +385,17 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.bench_act_mul:
+        if args.print_vgpr:
+
+            def fun():
+                return run_act_mul_benchmark(args)
+
+            print_vgpr(fun, get_caller_name_no_ext() + "_act_mul")
+            return 0
+        run_act_mul_benchmark(args)
+        return 0
 
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")

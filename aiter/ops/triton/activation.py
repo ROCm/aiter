@@ -1,15 +1,14 @@
-from typing import Literal
+from typing import Literal, Optional
 import triton
-import triton.language as tl
 import torch
 import aiter
-
-fp8_dtype = aiter.dtypes.fp8
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.activation import (
     _act_mul_and_dynamic_mxfp4_quant_kernel,
     _act_mul_and_dynamic_fp8_group_quant_kernel,
 )
+
+fp8_dtype = aiter.dtypes.fp8
 
 _LOGGER = AiterTritonLogger()
 
@@ -128,6 +127,71 @@ def act_mul_and_mxfp4_quant(
     return x_fp4, blockscale_e8m0
 
 
+def act_mul(
+    x: torch.Tensor,
+    activation: Literal["silu", "gelu", "gelu_tanh"],
+    out: Optional[torch.Tensor] = None,
+    group_size: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Gated activation along the last dimension only (no quantization): ``act(x0) * x1``
+    where ``x`` is ``[..., 2 * d]`` split into two ``[..., d]`` halves.
+
+    Accepts any input rank; leading dimensions are flattened before the kernel and
+    restored in the returned tensor, which has shape ``[..., d]``.
+
+    Uses the same Triton path as ``act_mul_and_fp8_group_quant`` with quantization disabled.
+    """
+    _LOGGER.info(f"ACT_MUL: x={tuple(x.shape)} activation={activation}")
+    assert x.is_cuda and x.is_contiguous()
+    assert x.shape[-1] % 2 == 0
+
+    # Flatten all leading dimensions so the kernel always sees a 2-D tensor.
+    orig_shape = x.shape
+    x_2d = x.view(-1, orig_shape[-1])
+    M, N = x_2d.shape
+    N_half = N // 2
+    out_shape = orig_shape[:-1] + (N_half,)
+
+    if out is None:
+        out_2d = torch.empty((M, N_half), dtype=x.dtype, device=x.device)
+    else:
+        assert out.shape == out_shape
+        assert out.dtype == x.dtype and out.is_contiguous()
+        out_2d = out.view(M, N_half)
+
+    if group_size is None:
+        group_size = min(256, triton.next_power_of_2(N_half))
+        group_size = max(32, group_size)
+
+    scaleN = triton.cdiv(N_half, group_size)
+    DTYPE_MAX = 1.0
+    BLOCK_SIZE_N = group_size
+
+    grid = (
+        M,
+        triton.cdiv(N_half, BLOCK_SIZE_N),
+    )
+    _act_mul_and_dynamic_fp8_group_quant_kernel[grid](
+        x_2d,
+        out_2d,
+        None,
+        *x_2d.stride(),
+        *out_2d.stride(),
+        0,  # stride_bs_m_in
+        0,  # stride_bs_n_in
+        N=N_half,
+        ACTIVATION=activation,
+        scaleN=scaleN,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        QUANT_BLOCK_SIZE=group_size,
+        DTYPE_MAX=DTYPE_MAX,
+        DTYPE_MIN=-DTYPE_MAX,
+        DO_QUANT=False,
+    )
+    return out_2d.view(out_shape)
+
+
 def act_mul_and_fp8_group_quant(
     x: torch.Tensor,
     activation: Literal["silu", "gelu", "gelu_tanh"],
@@ -195,6 +259,7 @@ def act_mul_and_fp8_group_quant(
         # num_warps=NUM_WARPS,
         # waves_per_eu=0,
         # num_stages=1,
+        DO_QUANT=True,
     )
 
     return x_fp8, out_bs

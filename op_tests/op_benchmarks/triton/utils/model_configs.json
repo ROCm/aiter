@@ -61,8 +61,55 @@
       "num_expert": 256,
       "top_k": 4
     }
+  },
+  "glm47fp8": {
+    "TP4": {
+      "hidden_size": 1280,
+      "intermediate_size": 768,
+      "num_attention_heads": 96,
+      "num_key_value_heads": 8,
+      "vocab_size": 151552,
+      "num_expert": 160,
+      "top_k": 8,
+      "parallel": "TP4",
+      "notes": "GLM-4.7 MoE (zai-org/GLM-4.7): per-GPU tensor-parallel shard; K=5120/4, N=2*moe_intermediate/4=3072/4"
+    },
+    "EP4": {
+      "hidden_size": 5120,
+      "intermediate_size": 3072,
+      "num_attention_heads": 96,
+      "num_key_value_heads": 8,
+      "vocab_size": 151552,
+      "num_expert": 40,
+      "top_k": 8,
+      "parallel": "EP4",
+      "notes": "GLM-4.7 MoE: per-GPU expert-parallel shard; E=160/4, N=2*1536"
+    }
+  },
+  "kimik25": {
+    "TP4": {
+      "hidden_size": 1792,
+      "intermediate_size": 1024,
+      "num_attention_heads": 64,
+      "num_key_value_heads": 64,
+      "vocab_size": 163840,
+      "num_expert": 384,
+      "top_k": 8,
+      "parallel": "TP4",
+      "notes": "Kimi-K2.5 text MoE (moonshotai/Kimi-K2.5): TP4 shard; K=7168/4, N=2*moe_intermediate/4=4096/4"
+    },
+    "EP4": {
+      "hidden_size": 7168,
+      "intermediate_size": 4096,
+      "num_attention_heads": 64,
+      "num_key_value_heads": 64,
+      "vocab_size": 163840,
+      "num_expert": 96,
+      "top_k": 8,
+      "parallel": "EP4",
+      "notes": "Kimi-K2.5 text MoE: EP4 shard; E=384/4, N=2*2048"
+    }
   }
 }
-    
-    
+
   

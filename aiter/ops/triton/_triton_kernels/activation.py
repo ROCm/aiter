@@ -134,7 +134,6 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
             ).to(tl.float32)
 
         x = _apply_activation_from_str(a, ACTIVATION) * b
-
         out_tensor, bs_e8m0 = _mxfp4_quant_op(
             x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
         )
@@ -183,7 +182,6 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
         if EVEN_M_N:
             tl.store(bs_ptr + bs_offs, bs_e8m0)
         else:
-
             tl.store(
                 bs_ptr + bs_offs,
                 bs_e8m0,
@@ -199,7 +197,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
 @triton.jit
 def _act_mul_and_dynamic_fp8_group_quant_kernel(
     x_ptr,
-    x_fp8_ptr,
+    x_out_ptr,
     x_bs_ptr,
     stride_x_m_in,
     stride_x_n_in,
@@ -215,6 +213,7 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
     EVEN_N: tl.constexpr,
+    DO_QUANT: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -223,8 +222,6 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
     stride_x_n = tl.cast(stride_x_n_in, tl.int64)
     stride_x_fp8_m = tl.cast(stride_x_fp8_m_in, tl.int64)
     stride_x_fp8_n = tl.cast(stride_x_fp8_n_in, tl.int64)
-    stride_bs_m = tl.cast(stride_bs_m_in, tl.int64)
-    stride_bs_n = tl.cast(stride_bs_n_in, tl.int64)
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
 
     x_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -245,31 +242,43 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
 
     x = _apply_activation_from_str(a, ACTIVATION) * b
 
-    x_fp8, x_bs = _fp8_quant_op(
-        x, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
-    )
-    x_fp8 = tl.ravel(x_fp8)
-    x_bs = tl.ravel(x_bs)
-
     out_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     out_offs = pid_m * stride_x_fp8_m + out_offs_n * stride_x_fp8_n
 
-    if EVEN_N:
-        tl.store(x_fp8_ptr + out_offs, x_fp8.to(x_fp8_ptr.dtype.element_ty))
-    else:
-        out_mask = out_offs_n < N
-        tl.store(
-            x_fp8_ptr + out_offs, x_fp8.to(x_fp8_ptr.dtype.element_ty), mask=out_mask
+    if DO_QUANT:
+        stride_bs_m = tl.cast(stride_bs_m_in, tl.int64)
+        stride_bs_n = tl.cast(stride_bs_n_in, tl.int64)
+        x_fp8, x_bs = _fp8_quant_op(
+            x, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
         )
+        x_fp8 = tl.ravel(x_fp8)
+        x_bs = tl.ravel(x_bs)
 
-    bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
-    bs_offs = pid_m * stride_bs_m + bs_offs_n * stride_bs_n
-    if EVEN_N:
-        tl.store(x_bs_ptr + bs_offs, x_bs.to(x_bs_ptr.dtype.element_ty))
+        if EVEN_N:
+            tl.store(x_out_ptr + out_offs, x_fp8.to(x_out_ptr.dtype.element_ty))
+        else:
+            out_mask = out_offs_n < N
+            tl.store(
+                x_out_ptr + out_offs,
+                x_fp8.to(x_out_ptr.dtype.element_ty),
+                mask=out_mask,
+            )
+
+        bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
+        bs_offs = pid_m * stride_bs_m + bs_offs_n * stride_bs_n
+        if EVEN_N:
+            tl.store(x_bs_ptr + bs_offs, x_bs.to(x_bs_ptr.dtype.element_ty))
+        else:
+            bs_mask = bs_offs_n < scaleN
+            tl.store(
+                x_bs_ptr + bs_offs,
+                x_bs.to(x_bs_ptr.dtype.element_ty),
+                mask=bs_mask,
+            )
     else:
-        bs_mask = bs_offs_n < scaleN
-        tl.store(
-            x_bs_ptr + bs_offs,
-            x_bs.to(x_bs_ptr.dtype.element_ty),
-            mask=bs_mask,
-        )
+        x_out = x.to(x_out_ptr.dtype.element_ty)
+        if EVEN_N:
+            tl.store(x_out_ptr + out_offs, x_out)
+        else:
+            out_mask = out_offs_n < N
+            tl.store(x_out_ptr + out_offs, x_out, mask=out_mask)
