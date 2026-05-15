@@ -1,4 +1,4 @@
-FROM rocm/pytorch:rocm7.2.2_ubuntu24.04_py3.12_pytorch_release_2.10.0
+FROM rocm/pytorch:latest
 
 RUN pip config set global.default-timeout 60 && \
     pip config set global.retries 10
