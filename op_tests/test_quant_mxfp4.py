@@ -124,7 +124,7 @@ def test_no_shuffle(m, n, float_dtype):
     torch.manual_seed(42)
     inp = torch.randn((m, n), dtype=float_dtype, device="cuda")
 
-    packed_hip, scale_hip = quant_mxfp4_hip(inp, group_size=32)
+    packed_hip, scale_hip = quant_mxfp4_hip(inp, group_size=32, round_mode=2)
     py_packed, py_scale = ref_quant_mxfp4_even_round(inp.cpu(), group_size=32)
 
     scale_hip_u8 = scale_hip.view(torch.uint8).cpu()
@@ -231,7 +231,7 @@ def test_edge_values(float_dtype):
     packed, scale = quant_mxfp4_hip(inp_tiny, group_size=32)
 
     inp_neg = torch.full((rows, cols), -3.0, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_hip(inp_neg, group_size=32)
+    packed, scale = quant_mxfp4_hip(inp_neg, group_size=32, round_mode=2)
     py_packed, _ = ref_quant_mxfp4_even_round(inp_neg.cpu(), group_size=32)
     assert torch.equal(packed.view(torch.uint8).cpu(), py_packed), "neg input failed"
 
