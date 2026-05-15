@@ -64,6 +64,12 @@ _flydsl_cache = os.path.join(os.path.dirname(__file__), "jit", "flydsl_cache")
 if os.path.isdir(_flydsl_cache) and "FLYDSL_RUNTIME_CACHE_DIR" not in os.environ:
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = _flydsl_cache
 
+try:
+    from .ops.enum import *  # noqa: F403,E402
+    from .utility import dtypes as dtypes  # noqa: E402
+except (ImportError, RuntimeError, OSError, KeyError) as e:
+    logger.warning("AITER Python utility imports are not available: %s", e)
+
 if sys.platform == "win32":
     logger.info("Windows: CK and HIP ops are not available. Triton ops only.")
 elif AITER_AOT_IMPORT:
@@ -71,8 +77,6 @@ elif AITER_AOT_IMPORT:
 else:
     try:
         from .jit import core as core  # noqa: E402
-        from .utility import dtypes as dtypes  # noqa: E402
-        from .ops.enum import *  # noqa: F403,E402
         from .ops.norm import *  # noqa: F403,E402
         from .ops.quant import *  # noqa: F403,E402
         from .ops.gemm_op_a8w8 import *  # noqa: F403,E402
