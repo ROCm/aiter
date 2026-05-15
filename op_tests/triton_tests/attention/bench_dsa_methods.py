@@ -32,7 +32,9 @@ from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import
     sparse_mla_train,
 )
 
-METHODS = ["fused", "recompute", "split_intermediate", "privatized", "xcd_privatized", "gather", "chunked_gather", "persistent"]
+# "persistent" excluded: Triton/LLVM compilation hangs at D_V=512 (register pressure).
+# See persistent_kernel_postmortem.md. Add manually if testing small D_V configs.
+METHODS = ["fused", "recompute", "split_intermediate", "privatized", "xcd_privatized", "gather", "chunked_gather"]
 
 
 # =====================================================================
