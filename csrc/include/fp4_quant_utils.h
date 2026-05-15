@@ -8,6 +8,7 @@ namespace aiter {
 
 // OCP standard: E8M0 scale = floor_pow2(amax / 4) = floor_pow2(amax) / 4.
 // ~37% of random inputs will have amax > scale * 6 (max clipping).
+// NaN/Inf inputs yield exponent 0xFF (E8M0 NaN); mantissa is always stripped.
 __device__ __forceinline__ float fp4_f32_to_e8m0_scale(float amax)
 {
     constexpr float inv_fp4_pow2_max = 0.25f; // 1 / max_pow2(FP4 E2M1) = 1/4
@@ -18,6 +19,7 @@ __device__ __forceinline__ float fp4_f32_to_e8m0_scale(float amax)
 
 // NV ROUND_UP / DSv4 Pro / FlashInfer: E8M0 scale = ceil_pow2(amax / 6).
 // Guarantees 0% max-value clipping: scale * 6 >= amax always holds.
+// NaN/Inf inputs yield exponent 0xFF (E8M0 NaN); mantissa is always stripped.
 __device__ __forceinline__ float fp4_f32_to_e8m0_scale_roundup(float amax)
 {
     constexpr float inv_fp4_max = 1.0f / 6.0f;
