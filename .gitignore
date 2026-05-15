@@ -81,5 +81,6 @@ scripts/results/*.csv
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
 
+# vim swaps
 *.swo
 *.swp
