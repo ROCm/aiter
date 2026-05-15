@@ -233,12 +233,6 @@ def mla_decode_fwd(
                 and (
                     q.dtype == dtypes.fp8
                     or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
-                    or (
-                        q.dtype == dtypes.bf16
-                        and kv_buffer.dtype == dtypes.bf16
-                        and nhead == 32
-                        and max_seqlen_q == 1
-                    )
                 )
             )
             else torch.empty(
@@ -281,14 +275,7 @@ def mla_decode_fwd(
         )
 
         if num_kv_splits == 1 and (
-            q.dtype == dtypes.fp8
-            or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
-            or (
-                q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
-                and nhead == 32
-                and max_seqlen_q == 1
-            )
+            q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
         ):
             lse = final_lse if return_lse else attn_lse
             return logits.view(total_s, nhead, v_head_dim), lse
