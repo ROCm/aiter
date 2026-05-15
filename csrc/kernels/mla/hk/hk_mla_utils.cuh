@@ -130,11 +130,18 @@ template <typename q_nope_t_,
           int32_t kPageSize_>
 struct HkMlaV40DecodeFwdTraits
 {
+    // V4 dimensions (vs V3.2 which had kKvLoraRank=kQkNopeHeadDim=kVoHeadDim=512):
+    //   - NOPE shrunk to 448 fp8 elements/token (kQkNopeHeadDim).
+    //   - ROPE unchanged at 64 bf16 elements/token (kQkRopeHeadDim).
+    //   - PV consumes the *full* d_qk slice (NOPE bf16 + ROPE bf16), so
+    //     kVoHeadDim = kQkNopeHeadDim + kQkRopeHeadDim = 512 (vs V3.2 where
+    //     V was the 512-wide NOPE-only slice).
     static constexpr int32_t kKvNumHead          = 1;
-    static constexpr int32_t kKvLoraRank         = 512;
+    static constexpr int32_t kKvLoraRank         = 448;
     static constexpr int32_t kQkNopeHeadDim      = kKvLoraRank;
     static constexpr int32_t kQkRopeHeadDim      = 64;
-    static constexpr int32_t kVoHeadDim          = kKvLoraRank;
+    static constexpr int32_t kQkHeadDim          = kQkNopeHeadDim + kQkRopeHeadDim;
+    static constexpr int32_t kVoHeadDim          = kQkHeadDim;
     // V4 NOPE on-disk packing: NOPE 448 FP8 + dup-E8M0 16 + zero pad 112 = 576
     // bytes per token. Stored in a buffer whose element type is q_nope_t_, so
     // the trailing-axis element count = 576 / sizeof(q_nope_t_). For FP8 that
@@ -226,6 +233,43 @@ enum class PvGemmEpilogueType : uint32_t
 };
 
 namespace hk_mla {
+
+// Decode an E8M0 scale byte (8-bit unsigned biased exponent, bias = 127) into
+// its fp32 representation. Encoding: B in [0, 255] decodes to 2^(B - 127),
+// produced by placing (B + 127) into the exponent field of an IEEE fp32:
+//   bits = (B + 127) << 23, then bit_cast to float. (E8M0 has no mantissa,
+// so the mantissa field is all zeros, giving an exact power of two.)
+__device__ __forceinline__ float e8m0_to_f32(uint32_t b)
+{
+    return __builtin_bit_cast(float, (b + 127u) << 23);
+}
+
+// Encode the immediate operand for `__builtin_amdgcn_s_waitcnt(int)` on
+// gfx9/gfx950. Each input is the COUNT of outstanding ops the caller wants
+// to wait for; <= 0 means "no wait needed for this counter" (the helper sets
+// that field to its max -- i.e. "wait until counter <= max", which is always
+// true). Positive input means "wait until counter == 0" (the typical pipeline
+// intent: I issued some ops, drain them all before reading the result).
+//
+// gfx9/gfx950 s_waitcnt encoding:
+//   bits[3:0]   = vmcnt[3:0]
+//   bits[6:4]   = expcnt
+//   bits[11:8]  = lgkmcnt
+//   bits[15:14] = vmcnt[5:4]
+//
+// Example: encode_s_waitcnt(0, 0, 1) -> 0x0F70 == "vmcnt(0)" only.
+constexpr int encode_s_waitcnt(int expcnt, int lgkmcnt, int vmcnt)
+{
+    constexpr int kExpMax  = 0x7;     // 3 bits
+    constexpr int kLgkmMax = 0xF;     // 4 bits
+    constexpr int kVmMax   = 0x3F;    // 6 bits
+
+    const int e = (expcnt  <= 0) ? kExpMax  : 0;
+    const int l = (lgkmcnt <= 0) ? kLgkmMax : 0;
+    const int v = (vmcnt   <= 0) ? kVmMax   : 0;
+
+    return (v & 0xF) | (e << 4) | (l << 8) | (((v >> 4) & 0x3) << 14);
+}
 
 // Single-stride lane swap helpers. Inline asm is used (rather than the LLVM
 // builtin __builtin_amdgcn_permlane{32,16}_swap) because the builtin form,
