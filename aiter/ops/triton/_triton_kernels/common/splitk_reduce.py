@@ -15,6 +15,7 @@ _gemm_splitk_reduce_repr = make_kernel_repr(
         "activation",
         "use_activation",
     ],
+    name_key="KERNEL_NAME",
 )
 
 
@@ -38,6 +39,7 @@ def _gemm_splitk_reduce_kernel(
     ADD_BIAS: tl.constexpr,
     activation: tl.constexpr,
     use_activation: tl.constexpr,
+    KERNEL_NAME: tl.constexpr = "_gemm_splitk_reduce_kernel",
 ):
     tl.assume(stride_c_in_k > 0)
     tl.assume(stride_c_in_m > 0)
@@ -47,6 +49,11 @@ def _gemm_splitk_reduce_kernel(
 
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
+
+    # Tell the AMD backend pid * stride stays non-negative so it can lower
+    # the loads/stores to buffer ops instead of generic global ops.
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
 
     offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N

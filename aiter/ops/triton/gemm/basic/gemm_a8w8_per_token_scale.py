@@ -126,6 +126,7 @@ def gemm_a8w8_per_token_scale(
             ADD_BIAS=False,
             activation="",
             use_activation=False,
+            KERNEL_NAME="_gemm_a8w8_per_token_scale_reduce_kernel",
         )
 
     return y

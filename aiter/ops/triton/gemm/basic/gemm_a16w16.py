@@ -130,6 +130,7 @@ def gemm_a16w16(
             ADD_BIAS=(bias is not None),
             activation=_get_activation_from_str(activation) if activation else "",
             use_activation=activation is not None,
+            KERNEL_NAME="_gemm_a16w16_reduce_kernel",
         )
 
     return y

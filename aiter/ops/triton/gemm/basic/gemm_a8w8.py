@@ -133,6 +133,7 @@ def gemm_a8w8(
             ADD_BIAS=bias is not None,
             activation="",
             use_activation=False,
+            KERNEL_NAME="_gemm_a8w8_reduce_kernel",
         )
 
     return y

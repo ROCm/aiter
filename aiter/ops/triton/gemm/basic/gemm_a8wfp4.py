@@ -171,4 +171,5 @@ def gemm_a8wfp4(
             ADD_BIAS=False,
             activation="",
             use_activation=False,
+            KERNEL_NAME="_gemm_afp4_wfp4_reduce_kernel",
         )

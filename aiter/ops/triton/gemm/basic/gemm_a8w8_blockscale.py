@@ -155,6 +155,7 @@ def gemm_a8w8_blockscale(
             ADD_BIAS=False,
             activation="",
             use_activation=False,
+            KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
         )
 
     return y
@@ -311,6 +312,7 @@ def gemm_a8w8_blockscale_preshuffle(
             ADD_BIAS=False,
             activation="",
             use_activation=False,
+            KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
         )
 
     return y
