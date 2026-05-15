@@ -4,345 +4,127 @@ Triton kernels for DeepSeek-V3 style sparse MLA (Multi-head Latent Attention) tr
 
 ## What is DSA?
 
-In DeepSeek-V3's MLA architecture, each query token attends to only a **TopK subset** of KV tokens (e.g., 1024 out of 128K), rather than the full sequence. This "sparse" attention pattern:
-- Reduces FLOPs proportionally to the sparsity ratio
-- Uses MQA (multi-query attention): 128 query heads share 1 KV head
-- KV is compressed into a latent space: `kv_lora_rank=512` + `rope_rank=64` = `d_qk=576`
+In DeepSeek-V3's MLA architecture, each query token attends to only a **TopK subset** of KV tokens (e.g., 1024 out of 128K), rather than the full sequence:
+- MQA: 128 query heads share 1 KV head
+- KV is compressed: `kv_lora_rank=512` + `rope_rank=64` = `d_qk=576`
 
 ```
 Q:    [total_tokens, num_heads=128, d_qk=576]    bf16
-KV:   [total_tokens, 1,             d_qk=576]    bf16   (shared across heads)
-TopK: [total_tokens, topk=1024]                   int32  (token indices)
+KV:   [total_tokens, 1,             d_qk=576]    bf16
+TopK: [total_tokens, topk=1024]                  int32  (absolute KV token indices)
 ```
 
 ## Quick Start
 
-### Forward pass
-
 ```python
 from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import (
-    sparse_mla_fwd,
+    sparse_mla_fwd, sparse_mla_bwd, sparse_mla_train,
 )
 
-# o: [T, H, kv_lora_rank], lse: [T, H]
+# Forward
 o, lse = sparse_mla_fwd(q, kv, topk_indices, kv_lora_rank=512)
-```
 
-### Backward pass
-
-```python
-from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import (
-    sparse_mla_bwd,
-)
-
-# Choose a backward strategy:
+# Backward (explicit)
 dq, dkv = sparse_mla_bwd(q, kv, o, do, topk_indices, lse,
-                          kv_lora_rank=512, method="fused")
-```
+                          kv_lora_rank=512, method="chunked_gather")
 
-### Differentiable (autograd-integrated)
-
-```python
-from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import (
-    sparse_mla_train,
-)
-
-# Forward + backward through PyTorch autograd
+# Autograd-integrated
 o, lse = sparse_mla_train(q, kv, topk_indices, kv_lora_rank=512,
-                          bwd_method="split_intermediate")
-loss = compute_loss(o)
-loss.backward()  # dQ and dKV computed automatically
+                           bwd_method="chunked_gather")
+loss = o.sum()
+loss.backward()  # populates q.grad and kv.grad
 ```
 
 ## Backward Strategies
 
-The backward pass computes `dQ` and `dKV` from the upstream gradient `dO`. Eight strategies trade off speed vs. memory:
+All numbers measured on MI300X (gfx942), B=1, S=4096, H=128, D=576, TOPK=1024.
 
-| Method | Time (ms) | Speedup | Extra Memory | Description |
-|--------|-----------|---------|--------------|-------------|
-| `"fused"` | 61.1 | 1.00x | 0 | Single fused kernel. Baseline. |
-| `"recompute"` | 52.5 | 1.16x | 0 | Split dQ + dKV. Recomputes S, P, dS in dKV kernel. |
-| `"split_intermediate"` | 38.0 | 1.61x | ~2 GiB | Split dQ + dKV. Stores dS and P as intermediates. |
-| `"privatized"` | 38.0 | 1.61x | ~2.1 GiB | Like split_intermediate with 8 private dKV copies. No improvement — L2-miss atomics serialize at Infinity Cache regardless. |
-| `"xcd_privatized"` | 38.0 | 1.61x | ~2.1 GiB | Like privatized with hw_id-based XCD routing. No improvement — dKV copy (9.44 MB) exceeds 4 MB L2, so atomics always miss to Infinity Cache. |
-| `"gather"` | 18.2 | **3.36x** | ~6.5 GiB | Eliminates all atomics via [T,TOPK,D] bf16 intermediate + CSR gather. |
-| `"chunked_gather"` | 23.4 | **2.62x** | ~1.65 GiB | **Best memory/speed tradeoff.** Processes TOPK in R_CHUNK=256 rank passes, reusing a [T,R_CHUNK,D] intermediate. No atomics. |
-| `"persistent"` | N/A | — | ~25 MB | 304-CTA persistent kernel with XCD-local L2 atomics. **Blocked: Triton/LLVM compilation hangs at D_V=512 due to register pressure.** See `persistent_kernel_postmortem.md`. |
+| Method | Time (ms) | TFLOPS | Speedup | Extra Memory | Bottleneck |
+|--------|----------:|-------:|--------:|-------------:|------------|
+| `"fused"` | 61.1 | 39.4 | 1.00x | 0 | atomicAdd + S/P recompute |
+| `"recompute"` | 52.2 | 46.1 | 1.17x | 0 | atomicAdd (Infinity Cache) |
+| `"split_intermediate"` | 37.9 | 63.5 | 1.61x | ~2 GiB | atomicAdd (Infinity Cache) |
+| `"privatized"` | 37.9 | 63.4 | 1.61x | ~2.1 GiB | atomicAdd — no improvement over split_intermediate |
+| `"xcd_privatized"` | 37.9 | 63.4 | 1.61x | ~2.1 GiB | atomicAdd — no improvement (dKV > 4 MB L2, misses to Infinity Cache) |
+| `"gather"` | 18.0 | 133.7 | **3.40x** | ~6.5 GiB | HBM bandwidth |
+| `"chunked_gather"` | 23.1 | 103.9 | **2.64x** | ~1.65 GiB | HBM bandwidth |
+| `"persistent"` | — | — | — | ~25 MB | blocked: Triton/LLVM hangs at D_V=512 |
 
-*Measured on MI300X, T=4096, H=128, D=576, TOPK=1024.*
+### Recommended
 
-### Recommended method
+| Scenario | Method |
+|---|---|
+| Best speed, memory not a constraint | `"gather"` |
+| Best speed/memory tradeoff | `"chunked_gather"` |
+| Zero extra memory | `"recompute"` |
+| Small head count (H≤32) | `"fused"` |
 
-- **Best performance, memory not a concern:** `"gather"` (18.2 ms, 6.5 GiB extra)
-- **Best performance/memory tradeoff:** `"chunked_gather"` (23.4 ms, 1.65 GiB extra)
-- **Zero extra memory:** `"recompute"` (52.5 ms, 0 extra)
+## Why atomicAdd Is the Bottleneck
 
-### When to use which
+The dKV scatter is a scatter-reduce: each of T×TOPK=4M query-rank pairs writes a D=576-element gradient to a shared KV token via `atomic_add_f32`. On MI300X:
 
-- **`"fused"`** (default): Good for small sequences or memory-constrained settings. Single kernel, no intermediate allocations.
+- The dKV buffer (T×D×4 = 9.44 MB fp32) exceeds the 4 MB L2 per XCD → atomics always miss L2 and serialize at the **shared Infinity Cache** (~0.12 TFLOPS empirical, vs 1,307 TFLOPS bf16 matrix compute)
+- XCD privatization (`"privatized"`, `"xcd_privatized"`) does not help: the private copy still exceeds L2, so atomics still route to the Infinity Cache atomic unit
+- rocprof `TCC_EA0` counters show **4.5× write amplification** vs non-atomic stores (~603M dirty writebacks vs ~67M)
 
-- **`"recompute"`**: Same memory as fused, 16% faster. Splits into separate dQ and dKV kernels. The dKV kernel recomputes attention scores instead of reading intermediates — extra FLOPs hidden behind the atomic bottleneck.
+`"gather"` and `"chunked_gather"` eliminate atomics entirely by writing each contribution to a uniquely-owned slot in an intermediate buffer (one writer per slot → plain store, no serialization). The gather phase accumulates per KV token with plain loads.
 
-- **`"split_intermediate"`**: 1.61x speedup over fused, ~2 GiB extra. Stores dS/P intermediates to halve recomputation, then scatters dKV with atomic_add.
+## The `persistent` Method (Blocked)
 
-- **`"gather"`**: Best raw performance (3.36x speedup), uses ~6.5 GiB extra (scales as `T * TOPK * D * 2 bytes`). No atomics: each [T, TOPK, D] slot has exactly one writer, then a gather phase accumulates dKV with plain stores. Choose when HBM is plentiful.
-
-- **`"chunked_gather"`**: **Best memory/performance tradeoff (2.62x, ~1.65 GiB extra).** Processes TOPK ranks in passes of R_CHUNK=256. Reuses a fixed [T, R_CHUNK, D] intermediate buffer each pass — no atomics, no 2 GiB dS/P storage. Choose when the 6.5 GiB gather buffer is too large.
-
-## Integration into a Model
-
-### Minimal integration
-
-Replace your dense attention forward/backward with DSA:
-
-```python
-from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import (
-    sparse_mla_fwd,
-    sparse_mla_bwd,
-)
-
-class SparseMLA(torch.nn.Module):
-    def __init__(self, kv_lora_rank=512, rope_rank=64, num_heads=128, topk=1024):
-        super().__init__()
-        self.kv_lora_rank = kv_lora_rank
-        self.d_qk = kv_lora_rank + rope_rank
-        self.scale = 1.0 / (self.d_qk ** 0.5)
-
-    def forward(self, q, kv, topk_indices):
-        """
-        Args:
-            q:             [total_tokens, num_heads, d_qk]  bf16
-            kv:            [total_tokens, 1, d_qk]          bf16
-            topk_indices:  [total_tokens, topk]             int32
-                           Absolute token indices. Use -1 for padding.
-        Returns:
-            o: [total_tokens, num_heads, kv_lora_rank]  bf16
-        """
-        o, lse = sparse_mla_fwd(q, kv, topk_indices, self.kv_lora_rank, self.scale)
-        # Save for backward
-        self._saved = (q, kv, topk_indices, o, lse)
-        return o
-
-    def backward(self, do):
-        q, kv, topk_indices, o, lse = self._saved
-        dq, dkv = sparse_mla_bwd(
-            q, kv, o, do, topk_indices, lse,
-            kv_lora_rank=self.kv_lora_rank,
-            scale=self.scale,
-            method="split_intermediate",  # fastest
-        )
-        return dq, dkv
-```
-
-### Using autograd (recommended)
-
-```python
-from aiter.ops.triton._triton_kernels.attention.deepseek_sparse_attention import (
-    sparse_mla_train,
-)
-
-class SparseMLA(torch.nn.Module):
-    def __init__(self, kv_lora_rank=512, rope_rank=64):
-        super().__init__()
-        self.kv_lora_rank = kv_lora_rank
-        self.d_qk = kv_lora_rank + rope_rank
-
-    def forward(self, q, kv, topk_indices):
-        o, _lse = sparse_mla_train(
-            q, kv, topk_indices,
-            kv_lora_rank=self.kv_lora_rank,
-            bwd_method="split_intermediate",
-        )
-        return o
-```
-
-### Input requirements
-
-| Tensor | Shape | Dtype | Notes |
-|--------|-------|-------|-------|
-| `q` | `[T, H, D]` | bf16 | `D = kv_lora_rank + rope_rank`. Must be contiguous. |
-| `kv` | `[T, 1, D]` | bf16 | Single KV head (MQA). Also accepts `[T, D]`. |
-| `topk_indices` | `[T, TOPK]` | int32 | Absolute indices into `kv`'s token dimension. Use `-1` for invalid/padding. |
-| `o` (output) | `[T, H, kv_lora_rank]` | bf16 | Only first `kv_lora_rank` dims (no rope in output). |
-| `lse` (output) | `[T, H]` | fp32 | Log-sum-exp, needed for backward. |
-| `do` (grad input) | `[T, H, kv_lora_rank]` | bf16 | Upstream gradient of `o`. |
-| `dq` (grad output) | `[T, H, D]` | bf16 | Gradient w.r.t. `q`. |
-| `dkv` (grad output) | `[T, 1, D]` | bf16 | Gradient w.r.t. `kv`. |
-
-## Reproducing Benchmarks
-
-### Prerequisites
-
-- AMD MI300X GPU (gfx942)
-- ROCm 6.x with PyTorch and Triton
-- AITER installed: `pip install -e .` from repo root
-
-If running in Docker (recommended):
-```bash
-docker run --device /dev/kfd --device /dev/dri \
-  -v $(pwd):/workspace -w /workspace \
-  rocm/pytorch:latest bash
-pip install -e .
-```
-
-### Run all benchmarks (correctness + performance)
-
-```bash
-# Full test: correctness + benchmark for all 3 methods
-python op_tests/triton_tests/attention/bench_dsa_methods.py
-
-# Correctness only
-python op_tests/triton_tests/attention/bench_dsa_methods.py --test-only
-
-# Benchmark only
-python op_tests/triton_tests/attention/bench_dsa_methods.py --bench-only
-```
-
-Expected output:
-```
-================================================================
-  BENCHMARK: Forward
-================================================================
-  B1_S4096_H128_topk1024             5.57 ms     209.7 TFLOPS
-  B1_S4096_H128_topk2048            10.52 ms     222.1 TFLOPS
-  B1_S8192_H128_topk1024            11.42 ms     204.5 TFLOPS
-
-================================================================
-  BENCHMARK: Backward (7 methods; "persistent" skipped — compilation hang)
-================================================================
-
-  B1_S4096_H128_topk1024
-  Method                  Time (ms)   TFLOPS  Speedup   Extra mem
-  ----------------------------------------------------------------
-  fused                       61.10     39.4     1.00x          0
-  recompute                   52.47     45.8     1.16x          0
-  split_intermediate          37.99     63.3     1.61x    2.0 GiB
-  privatized                  38.03     63.2     1.61x    2.1 GiB
-  xcd_privatized              38.02     63.3     1.61x    2.1 GiB
-  gather                      18.17    132.3     3.36x    6.5 GiB
-  chunked_gather              23.35    103.0     2.62x   1.65 GiB
-```
-
-Note: the `"persistent"` method exists in code but hangs at Triton/LLVM compilation
-for production configs (D_V=512). Run `bench_dsa_methods.py` without `"persistent"`
-in METHODS to get results for the other 7 methods. See `persistent_kernel_postmortem.md`.
-
-### Run existing tests
-
-```bash
-# Forward kernel correctness
-python op_tests/triton_tests/attention/test_sparse_mla_fwd_train.py
-
-# Backward kernel correctness (baseline fused method, against PyTorch reference)
-python op_tests/triton_tests/attention/test_sparse_mla_bwd_train.py
-
-# Backward kernel correctness + benchmark (all configs)
-python op_tests/triton_tests/attention/test_sparse_mla_bwd_train.py --bench-only
-```
-
-### Individual kernel benchmarks (detailed analysis)
-
-```bash
-# Split dQ + dKV with intermediates (detailed config sweep)
-python op_tests/triton_tests/attention/bench_bwd_dkv_hg_fused.py
-
-# Split dQ + dKV with recomputation (detailed config sweep)
-python op_tests/triton_tests/attention/bench_bwd_dkv_recompute.py
-```
+The persistent kernel was designed to fix the L2-miss problem by chunking the KV token range so each XCD's private dkv_chunk (3.14 MB) fits in its 4 MB L2, making atomics L2-local. The kernel logic is correct (passes correctness tests at small D_V), but Triton/LLVM hangs during compilation at production config (D_V=512) due to register pressure (~164 VGPRs/thread with BLOCK_H=64). See `dsa_dev/docs/persistent_kernel_postmortem.md` for the full analysis and recommended paths forward (reduce BLOCK_H, split dQ/dKV passes, or HIP implementation).
 
 ## File Structure
 
 ```
 aiter/ops/triton/_triton_kernels/attention/
-  deepseek_sparse_attention.py     # Main file: fwd + bwd kernels + Python wrappers
+  deepseek_sparse_attention.py       # Forward kernel + backward dispatch + autograd wrapper
+  _dsa_bwd_preprocess.py             # Delta precompute kernel (shared by all methods)
+  _dsa_bwd_fused.py                  # "fused": single fused bwd kernel
+  _dsa_bwd_recompute.py              # "recompute": split dQ+dKV, recompute S/P/dS
+  _dsa_bwd_split_intermediate.py     # "split_intermediate": split dQ+dKV, store dS/P
+  _dsa_bwd_privatized.py             # "privatized", "xcd_privatized": private dKV copies
+  _dsa_bwd_gather.py                 # "gather", "chunked_gather": no-atomic methods
+  _dsa_bwd_persistent.py             # "persistent": 304-CTA L2-local kernel (blocked)
 
 op_tests/triton_tests/attention/
-  bench_dsa_methods.py                   # Benchmark all 8 backward methods side-by-side
-  test_sparse_mla_fwd_train.py           # Forward correctness test
-  test_sparse_mla_bwd_train.py           # Backward correctness test (vs PyTorch reference)
-  bench_bwd_dkv_hg_fused.py             # Detailed split+intermediate benchmark
-  bench_bwd_dkv_recompute.py            # Detailed split+recompute benchmark
-  bench_bwd_configs.py                  # Backward autotune config sweep
-  bench_fwd_stages.py                   # Forward multi-stage benchmark
-  atomic_bottleneck_analysis.md         # Root cause: why atomics are slow on MI300X
-  chunked_dkv_plan.md                   # Design plan for Approach A (persistent) and B (chunked_gather)
-  persistent_kernel_postmortem.md       # Why persistent kernel can't compile in Triton
+  README_DSA.md                      # This file
+  bench_dsa_methods.py               # Correctness + benchmark for all 7 working methods
+  test_sparse_mla_fwd_train.py       # Forward correctness test
+  test_sparse_mla_bwd_train.py       # Backward correctness test (vs PyTorch reference)
 ```
 
-## Performance Characteristics
+## Running Tests and Benchmarks
 
-### Forward
+```bash
+# Correctness (all 7 methods)
+python op_tests/triton_tests/attention/bench_dsa_methods.py --test-only
 
-The forward kernel uses online softmax with autotuned tiling (BLOCK_H, TILE_K). K and V share the same data (first `kv_lora_rank` dims), loaded once and reused via `tl.trans()`.
+# Benchmark (all 7 methods, 3 configs)
+python op_tests/triton_tests/attention/bench_dsa_methods.py --bench-only
 
-### Backward bottleneck: atomicAdd and how gather eliminates it
+# Forward unit test
+python op_tests/triton_tests/attention/test_sparse_mla_fwd_train.py
 
-The key bottleneck is **dKV scatter**: multiple query CTAs contribute gradients to the same KV token via `tl.atomic_add`. On MI300X, rocprof `TCC_EA0` hardware counters reveal a **4.5× write amplification** over non-atomic stores:
+# Backward unit test
+python op_tests/triton_tests/attention/test_sparse_mla_bwd_train.py
+```
 
-- Each cross-XCD atomic ownership transfer forces a 64B writeback to HBM (Infinity Fabric)
-- With TOPK=1024 writers per KV token across 8 XCDs, ownership bounces constantly
-- Result: ~603M dirty cache-line writebacks (atomic) vs ~67M (non-atomic) — 8.9× more evictions
-- Net bytes ratio: 4.5× (atomic writebacks are 64B, store evictions are 128B)
+Expected benchmark output (MI300X, B=1, S=4096, H=128, TOPK=1024):
 
-Privatized schemes (8 copies, XCD-local routing) don't help — intra-XCD atomic serialization is equally limiting, and privatized/xcd_privatized bench identically to split_intermediate.
-
-The `"gather"` method eliminates atomics entirely: each `[T, TOPK, D]` intermediate slot has exactly one writer, so `tl.store` is correct with zero contention. The gather phase then accumulates per KV token with a sequential loop. Result: **3.36x speedup over fused** (vs 1.61x for the previous best).
-
-The `"chunked_gather"` method achieves the same no-atomic property at lower memory cost by processing TOPK ranks in passes of R_CHUNK=256. Each pass: (1) compute dQ contribution and store chunk dS/P to `[T,H,R_CHUNK]` bf16 buffers; (2) run the original gather dKV-intermediate kernel with M=D_V=512 GEMMs for high MFMA utilization; (3) accumulate into a fp32 dkv_acc buffer. Total extra memory: `~1.65 GiB` (vs `6.5 GiB` for full gather). Result: **2.62x speedup** at 103 TFLOPS.
-
-## Cross-Platform Forward Comparison: AITER (MI300X) vs TileLang (H100)
-
-Forward kernel TFLOPS comparison between our AITER Triton kernel on MI300X and [TileLang](https://github.com/tile-ai/tilelang) on H100.
-
-All configs: B=1, D=576 (kv_lora_rank=512, rope_rank=64), bf16.
-
-| Config | AITER Triton (MI300X) | TileLang (H100) |
-|--------|----------------------:|------------------:|
-| S4096_H128_topk1024 | 209 TFLOPS | 308 TFLOPS |
-| S4096_H128_topk2048 | 222 TFLOPS | 342 TFLOPS |
-| S8192_H128_topk1024 | 204 TFLOPS | 312 TFLOPS |
-| S8192_H128_topk2048 | 216 TFLOPS | 346 TFLOPS |
-| S4096_H32_topk1024 | 160 TFLOPS | 165 TFLOPS |
-| S4096_H16_topk1024 | 116 TFLOPS | 125 TFLOPS |
-
-Notes:
-- H100 has higher memory bandwidth (3.35 TB/s vs 5.3 TB/s) and different compute characteristics, so raw TFLOPS are not directly comparable across platforms.
-- At full DeepSeek-V3 config (H=128), TileLang on H100 is ~1.5x higher TFLOPS. At smaller head counts (H=32, H=16), the gap narrows to near parity.
-- TileLang script: `tilelang/examples/dsa_sparse_finetune/benchmark_dsa_fwd.py`
-
-### Backward: AITER (MI300X) vs TileLang (H100)
-
-TileLang's backward kernel exceeds the H100's dynamic shared memory limit (requests 368KB) on all full DeepSeek-V3 configs (H=128, D=576), so only smaller configs could run.
-
-| Config | AITER `gather` | AITER `split_intermediate` | AITER `fused` | TileLang (H100) |
-|--------|---------------:|---------------------------:|--------------:|----------------:|
-| S4096_H128_topk1024 | **132.3 TFLOPS (3.36x)** | 63.3 TFLOPS (1.61x) | 39.4 TFLOPS | FAILED (shmem) |
-| S4096_H128_topk2048 | **142.9 TFLOPS (3.55x)** | 65.5 TFLOPS (1.62x) | 40.3 TFLOPS | FAILED (shmem) |
-| S8192_H128_topk1024 | **132.1 TFLOPS (3.35x)** | 63.0 TFLOPS (1.60x) | 39.4 TFLOPS | FAILED (shmem) |
-| S4096_H32_topk1024 | — | 18.2 TFLOPS (0.81x) | 22.6 TFLOPS | 60.4 TFLOPS |
-| S4096_H16_topk1024 | — | 9.8 TFLOPS (0.90x) | 10.9 TFLOPS | 33.1 TFLOPS |
-
-*AITER numbers on MI300X. Speedups relative to fused baseline.*
-
-Notes:
-- TileLang backward fails on H128/D576 configs with `InternalError: Failed to set the allowed dynamic shared memory size to 368624`. The DSA backward kernel's register and shared memory pressure is a known challenge (see [atomicAdd bottleneck](#backward-bottleneck-atomicadd)).
-- The split methods (`recompute`, `split_intermediate`) provide 1.16-1.63x speedup on H128 configs but are **slower** on H32/H16. The split overhead (two kernel launches, extra memory traffic) is not amortized when head count is small. Use `fused` for small head counts.
-- TileLang script: `tilelang/examples/dsa_sparse_finetune/benchmark_dsa_bwd.py`
-- TileLang version: 0.1.9, PyTorch 2.9.0, NVIDIA H100 80GB HBM3
-
-### AITER Forward Performance Evolution (MI300X)
-
-Our forward kernel went through 4 optimization stages (S4096, H128, topk1024):
-
-| Stage | Description | TFLOPS |
-|-------|-------------|-------:|
-| 1 | tl.trans, BH=16 TK=32, 1 stage | 88.8 |
-| 2 | Separate K/V loads, BH=16 TK=16, 1 stage | 99.2 |
-| 3 | Separate K/V loads, BH=32 TK=16, 2 stages | 138.0 |
-| 4 | tl.trans + autotune, BH=64 TK=16, 2 stages | 209.4 |
+```
+  Method                  Time (ms)   TFLOPS  Speedup   Extra mem
+  ----------------------------------------------------------------
+  fused                       61.11     39.4     1.00x          0
+  recompute                   52.16     46.1     1.17x          0
+  split_intermediate          37.89     63.5     1.61x    2.0 GiB
+  privatized                  37.94     63.4     1.61x    2.1 GiB
+  xcd_privatized              37.93     63.4     1.61x    2.1 GiB
+  gather                      17.99    133.7     3.40x    6.5 GiB
+  chunked_gather              23.14    103.9     2.64x   1.63 GiB
+```
 
 ## References
 
 - [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437)
-- [DeepSeek-V3.2 Training](https://arxiv.org/abs/2512.02556) -- DSA training at 128K seq_len, topk=2048
-- [AITER](https://github.com/ROCm/aiter) -- AMD Inference and Training Efficiency Repository
+- [DeepSeek-V3.2 Training](https://arxiv.org/abs/2512.02556)
+- [AITER](https://github.com/ROCm/aiter)
