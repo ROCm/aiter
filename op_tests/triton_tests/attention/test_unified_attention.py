@@ -9,9 +9,9 @@ import torch
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.triton.utils.types import e4m3_dtype
 
-NUM_HEADS = [(4, 4), (16, 2)]
-HEAD_SIZES = [64, 128]
-BLOCK_SIZES = [16, 64]
+NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
+HEAD_SIZES = [(128, 128), (256, 256), (192, 128)]
+BLOCK_SIZES = [16, 64, 48]
 
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
@@ -42,6 +42,7 @@ def ref_paged_attn(
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
+    head_size_v = value_cache.shape[-1]
     outputs: list[torch.Tensor] = []
     start_idx = 0
     query = query.to(torch.float32)
@@ -64,7 +65,7 @@ def ref_paged_attn(
 
         k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
         k = k[:kv_len]
-        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
+        v = value_cache[block_indices].view(-1, num_kv_heads, head_size_v)
         v = v[:kv_len]
 
         if q.shape[1] != k.shape[1]:
@@ -91,7 +92,7 @@ def ref_paged_attn(
         attn = torch.softmax(attn, dim=-1).to(v.dtype)
         if sinks is not None:
             attn = attn[..., :-1]
-        out = torch.einsum("hqk,khd->qhd", attn, v)
+        out = torch.einsum("hqk,khc->qhc", attn, v)
 
         outputs.append(out)
         start_idx += query_len
@@ -102,11 +103,121 @@ def ref_paged_attn(
     return out.to(out_dtype)
 
 
+def make_unified_attn_inputs(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size_qk: int,
+    head_size_v: int,
+    dtype: torch.dtype,
+    block_size: int = None,
+    num_blocks: int = None,
+):
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    num_query_heads, num_kv_heads = num_heads
+    assert num_query_heads % num_kv_heads == 0
+
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens_list)
+
+    scale = head_size_qk**-0.5
+
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size_qk, dtype=dtype, device="cuda"
+    )
+
+    key_cache = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size_qk,
+        dtype=dtype,
+        device="cuda",
+    )
+    value_cache = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size_v,
+        dtype=dtype,
+        device="cuda",
+    )
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(
+        0,
+        num_blocks,
+        (num_seqs, max_num_blocks_per_seq),
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device="cuda"
+    ).cumsum(dim=0, dtype=torch.int32)
+
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
+    query_lens = torch.tensor(query_lens, dtype=torch.int32, device="cuda")
+
+    output = torch.empty(
+        sum(query_lens),
+        num_query_heads,
+        head_size_v,
+        dtype=dtype,
+        device="cuda",
+    )
+
+    return (
+        query,
+        key_cache,
+        value_cache,
+        cu_query_lens,
+        query_lens,
+        kv_lens,
+        block_tables,
+        output,
+        max_query_len,
+        max_kv_len,
+        scale,
+    )
+
+
+def ref_attn(
+    query,
+    key_cache,
+    value_cache,
+    query_lens,
+    kv_lens,
+    block_tables,
+    scale,
+    sliding_window=None,
+    soft_cap=None,
+    sinks=None,
+    causal=True,
+):
+    return ref_paged_attn(
+        query,
+        key_cache,
+        value_cache,
+        query_lens,
+        kv_lens,
+        block_tables,
+        scale,
+        out_dtype=query.dtype,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        sinks=sinks,
+    )
+
+
 @pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("head_sizes", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("soft_cap", [None, 50.0])
@@ -123,7 +234,7 @@ def ref_paged_attn(
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
-    head_size: int,
+    head_sizes: tuple[int, int],
     sliding_window: Optional[int],
     block_size: int,
     soft_cap: Optional[float],
@@ -135,6 +246,7 @@ def test_triton_unified_attn(
     use_kv_descale: bool,
     use_out_scale: bool,
 ) -> None:
+    head_size_qk, head_size_v = head_sizes
 
     torch.manual_seed(0)
     num_seqs = len(seq_lens)
@@ -146,20 +258,31 @@ def test_triton_unified_attn(
     max_query_len = max(query_lens)
     max_kv_len = max(kv_lens)
     window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
-    scale = head_size**-0.5
+    scale = head_size_qk**-0.5
 
     query = torch.randn(
-        sum(query_lens), num_query_heads, head_size, dtype=torch.float32, device="cuda"
+        sum(query_lens),
+        num_query_heads,
+        head_size_qk,
+        dtype=torch.float32,
+        device="cuda",
     )
     key_cache = torch.randn(
         num_blocks,
         block_size,
         num_kv_heads,
-        head_size,
+        head_size_qk,
         dtype=torch.float32,
         device="cuda",
     )
-    value_cache = torch.randn_like(key_cache)
+    value_cache = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size_v,
+        dtype=torch.float32,
+        device="cuda",
+    )
     query = query.to(q_dtype)
     key_cache = key_cache.to(kv_dtype)
     value_cache = value_cache.to(kv_dtype)
@@ -177,7 +300,13 @@ def test_triton_unified_attn(
         device="cuda",
     )
     sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
-    output = torch.empty_like(query).to(out_dtype)
+    output = torch.empty(
+        sum(query_lens),
+        num_query_heads,
+        head_size_v,
+        dtype=out_dtype,
+        device="cuda",
+    )
 
     maybe_quantized_query = query
     maybe_quantized_key_cache = key_cache
