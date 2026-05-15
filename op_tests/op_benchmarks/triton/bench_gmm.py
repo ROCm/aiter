@@ -22,6 +22,11 @@ from aiter.ops.triton.utils.gmm_common import (
     dtype_from_str,
     DTYPE,
     str_from_dtype,
+    SUPPORTED_GROUP_SIZES_DTYPES_STR,
+    GROUP_SIZES_DTYPE_STR,
+    group_sizes_dtype_from_str,
+    GROUP_SIZES_DTYPE,
+    str_from_group_sizes_dtype,
     TRANS_LHS,
     TRANS_RHS,
     RNG_SEED,
@@ -113,6 +118,7 @@ def benchmark_gmm(
     bench_shape: tuple[int, int, int, int] | None = None,
     in_dtype: torch.dtype = DTYPE,
     out_dtype: torch.dtype = DTYPE,
+    group_sizes_dtype: torch.dtype = GROUP_SIZES_DTYPE,
     trans_lhs: bool = TRANS_LHS,
     trans_rhs: bool = TRANS_RHS,
     rng_seed: int = RNG_SEED,
@@ -130,7 +136,8 @@ def benchmark_gmm(
 
     in_dtype_str = str_from_dtype(in_dtype)
     out_dtype_str = str_from_dtype(out_dtype)
-    dtypes_desc = f"i{in_dtype_str}_o{out_dtype_str}"
+    group_sizes_dtype_str = str_from_group_sizes_dtype(group_sizes_dtype)
+    dtypes_desc = f"i{in_dtype_str}_o{out_dtype_str}_g{group_sizes_dtype_str}"
     layout_desc = (
         "".join("t" if trans else "n" for trans in (trans_lhs, trans_rhs)) + "n"
     )
@@ -160,6 +167,7 @@ def benchmark_gmm(
             num_group_sizes,
             input_type=in_dtype,
             output_type=out_dtype,
+            group_sizes_dtype=group_sizes_dtype,
             trans_lhs=trans_lhs,
             trans_rhs=trans_rhs,
             rng_seed=rng_seed,
@@ -267,9 +275,10 @@ def benchmark_gmm(
 
     logging.info("Benchmarking Triton %s kernel:", desc)
     logging.info(
-        "  input_type = %s, output_type = %s, rng_seed = %d, use_bias = %s, accumulate = %s",
+        "  input_type = %s, output_type = %s, group_sizes_type = %s, rng_seed = %d, use_bias = %s, accumulate = %s",
         in_dtype_str,
         out_dtype_str,
+        group_sizes_dtype_str,
         rng_seed,
         use_bias,
         accumulate,
@@ -384,6 +393,13 @@ def parse_args() -> argparse.Namespace:
         default=DTYPE_STR,
         help=f"output data type (default: {DTYPE_STR})",
     )
+    parser.add_argument(
+        "--group-sizes-type",
+        type=str.lower,
+        choices=SUPPORTED_GROUP_SIZES_DTYPES_STR,
+        default=GROUP_SIZES_DTYPE_STR,
+        help=f"group sizes data type (default: {GROUP_SIZES_DTYPE_STR})",
+    )
 
     # Transposition
     add_trans_arg(parser, "lhs", TRANS_LHS)
@@ -434,6 +450,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="write performance results to CSV file in the current directory",
     )
+
     try:
         return validate_args(parser.parse_args())
     except argparse.ArgumentError as arg_error:
@@ -460,12 +477,14 @@ def main() -> None:
     shape = (args.M, args.K, args.N, args.G)
     in_dtype = dtype_from_str(args.input_type)
     out_dtype = dtype_from_str(args.output_type)
+    group_sizes_dtype = group_sizes_dtype_from_str(args.group_sizes_type)
 
     benchmark_gmm(
         args.gmm_type,
         bench_shape=None if all(arg is None for arg in shape) else shape,
         in_dtype=in_dtype,
         out_dtype=out_dtype,
+        group_sizes_dtype=group_sizes_dtype,
         trans_lhs=args.trans_lhs,
         trans_rhs=args.trans_rhs,
         rng_seed=args.rng_seed,

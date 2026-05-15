@@ -112,19 +112,22 @@ def gmm_kernel(
     tl.assume(N > 0)
     tl.assume(G > 0)
 
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    int_type = group_sizes_ptr.type.element_ty
+    zero = tl.cast(0, int_type)
+
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N).to(int_type)
     tl.device_assert(num_n_tiles > 0, "num_n_tiles <= 0")
 
     # Current tile. Each program computes multiple tiles of each group.
-    tile = tl.program_id(0)
+    tile = tl.program_id(0).to(int_type)
     tl.device_assert(tile >= 0, "tile < 0 (at initialization)")
 
     # Tile limit of last MM problem (inclusive).
-    last_mm_tile = 0
+    last_mm_tile = zero
 
     # Last input row of lhs and output row of out. Each group reads some rows of
     # lhs and writes some rows to out.
-    last_m = 0
+    last_m = zero
 
     # Loop through all (m, K, N) MM problems:
     #   (m, K) x (K, N) = (m, N)
@@ -283,25 +286,28 @@ def tgmm_persistent_kernel(
     tl.assume(N > 0)
     tl.assume(G > 0)
 
-    num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    int_type = group_sizes_ptr.type.element_ty
+    zero = tl.cast(0, int_type)
+
+    num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K).to(int_type)
     tl.device_assert(num_k_tiles > 0, "num_k_tiles <= 0")
 
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N).to(int_type)
     tl.device_assert(num_n_tiles > 0, "num_n_tiles <= 0")
 
     num_tiles = num_k_tiles * num_n_tiles
     tl.device_assert(num_tiles > 0, "num_tiles <= 0")
 
     # Current tile. Each program computes multiple tiles of each group.
-    tile = tl.program_id(0)
+    tile = tl.program_id(0).to(int_type)
     tl.device_assert(tile >= 0, "tile < 0 (at initialization)")
 
     # Tile limit of last MM problem (inclusive).
-    last_mm_tile = 0
+    last_mm_tile = zero
 
     # Last input column of lhs and input row of rhs. Each group reads some
     # columns of lhs and some rows of rhs.
-    last_m = 0
+    last_m = zero
 
     # Loop through all (K, m, N) MM problems:
     #   (K, m) x (m, N) = (K, N)

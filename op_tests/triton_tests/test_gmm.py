@@ -131,8 +131,8 @@ def torch_gmm(
     out = get_gmm_output(
         M,
         N,
-        device=lhs.device,
         preferred_element_type=preferred_element_type,
+        device=lhs.device,
         existing_out=existing_out,
     )
 
@@ -265,8 +265,8 @@ def torch_tgmm(
         K,
         N,
         G,
-        device=lhs.device,
         preferred_element_type=preferred_element_type,
+        device=lhs.device,
         existing_out=existing_out,
     )
 
