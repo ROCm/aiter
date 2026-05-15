@@ -168,7 +168,7 @@ def swizzle_scales_gfx1250(data):
     SCALE_K = block_shape[-2]
     N = block_shape[-1]
     num_chunk_m = N // NON_K_PRESHUFFLE_BLOCK_SIZE
-    SCALE_KWIDTH = 4 if SCALE_K >= 4 else SCALE_K
+    SCALE_KWIDTH = min(16, triton.next_power_of_2(SCALE_K)) if SCALE_K >= 4 else SCALE_K
     num_chunk_k = SCALE_K // SCALE_KWIDTH
     data = data.transpose(-1, -2)
     data = data.view(
