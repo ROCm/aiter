@@ -32,6 +32,7 @@ from typing import Optional, Tuple
 import torch
 
 from .kernels.sage_quant_mxfp4_cdna import build_sage_quant_mxfp4_module
+from .kernels.sage_quant_cdna import build_sage_preprocess_module
 
 
 __all__ = ["flydsl_sage_quant_mxfp4"]
@@ -39,12 +40,22 @@ __all__ = ["flydsl_sage_quant_mxfp4"]
 
 @lru_cache(maxsize=64)
 def _get_kernel(head_dim: int, blk_q: int, blk_k: int,
-                num_q_heads: int, num_kv_heads: int):
+                num_q_heads: int, num_kv_heads: int,
+                subtract_k_mean: bool):
     return build_sage_quant_mxfp4_module(
         head_dim=head_dim,
         blk_q=blk_q,
         blk_k=blk_k,
         num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        subtract_k_mean=subtract_k_mean,
+    )
+
+
+@lru_cache(maxsize=64)
+def _get_preprocess(head_dim: int, num_kv_heads: int):
+    return build_sage_preprocess_module(
+        head_dim=head_dim,
         num_kv_heads=num_kv_heads,
     )
 
@@ -117,37 +128,68 @@ def flydsl_sage_quant_mxfp4(
     grid_size = q_task_count + k_task_count + v_task_count
 
     # Outputs (torch.empty: every element is written by the kernel)
-    q_fp4 = torch.empty((B, S_q, Hq, D // 2), dtype=torch.uint8, device=q.device)
-    q_d   = torch.empty((B, S_q, Hq, D // 32), dtype=torch.uint8, device=q.device)
-    k_fp4 = torch.empty((B, S_k, Hk, D // 2), dtype=torch.uint8, device=k.device)
-    k_d   = torch.empty((B, S_k, Hk, D // 32), dtype=torch.uint8, device=k.device)
-    v_fp8 = torch.empty((B, S_k, Hk, D), dtype=fp8_type, device=v.device)
-
-    # K-mean (matches Triton rotation_smooth_qk:419, applied to RAW K
-    # not rotated K — sageattention smoothing). For q_smooth=False we may
-    # skip this; controlled by skip_k_mean.
-    if skip_k_mean:
-        k_input = k
-    else:
-        k_input = k - k.mean(dim=1, keepdim=True)
-
-    # Per-channel V scale: max along seq dim / FP8_MAX.
-    v_scale = (v.abs().amax(dim=1).to(torch.float32) / fp8_max).contiguous()
+    q_fp4   = torch.empty((B, S_q, Hq, D // 2),  dtype=torch.uint8, device=q.device)
+    q_d     = torch.empty((B, S_q, Hq, D // 32), dtype=torch.uint8, device=q.device)
+    k_fp4   = torch.empty((B, S_k, Hk, D // 2),  dtype=torch.uint8, device=k.device)
+    k_d     = torch.empty((B, S_k, Hk, D // 32), dtype=torch.uint8, device=k.device)
+    v_fp8   = torch.empty((B, S_k, Hk, D),        dtype=fp8_type,    device=v.device)
+    k_mean  = torch.empty((B, Hk, D),             dtype=torch.float32, device=k.device)
+    v_scale = torch.empty((B, Hk, D),             dtype=torch.float32, device=v.device)
 
     # Materialize input contiguity (kernel assumes BSHD-contiguous layout).
     q_c = q.contiguous()
-    k_c = k_input.contiguous()
+    k_c = k.contiguous()
     v_c = v.contiguous()
 
+    stream = torch.cuda.current_stream(q.device)
+
+    # In-kernel K-mean subtract is a big win on short S (saves 2 torch launches)
+    # but a regression on long S (extra register pressure on the K branch hurts
+    # the heavy bandwidth-bound work). Threshold empirically picked from bench.
+    use_in_kernel_k_mean = (not skip_k_mean) and (S_k <= 8192)
+
+    # ---- Stage 1: K_mean + V_scale.
+    # When in-kernel subtract is on, use the FlyDSL preprocessor (1 launch) to
+    # produce K_mean and V_scale together. Otherwise compute via torch (2-3
+    # launches but faster on long S due to torch.mean's optimization).
+    if skip_k_mean:
+        k_mean.zero_()
+        v_scale_torch = (v.abs().amax(dim=1).to(torch.float32) / fp8_max).contiguous()
+        v_scale.copy_(v_scale_torch)
+        k_subtract_torch = None
+    elif use_in_kernel_k_mean:
+        preprocess = _get_preprocess(head_dim=D, num_kv_heads=Hk)
+        preprocess(
+            k_c.reshape(-1),
+            v_c.reshape(-1),
+            k_mean.reshape(-1),
+            v_scale.reshape(-1),
+            B,
+            S_k,
+            _f32_bits(1.0 / fp8_max),
+            _f32_bits(1.0 / S_k),
+            stream=stream,
+        )
+        k_subtract_torch = None
+    else:
+        # Long-S path: torch K-mean (well-optimized) + torch broadcast subtract.
+        # Pre-subtract here so the kernel doesn't pay the inline-subtract
+        # register-pressure cost.
+        k_mean_torch = k.mean(dim=1, keepdim=True)
+        k_subtract_torch = (k - k_mean_torch).contiguous()
+        v_scale_torch = (v.abs().amax(dim=1).to(torch.float32) / fp8_max).contiguous()
+        v_scale.copy_(v_scale_torch)
+        # k_mean tensor is unused by the kernel in this branch (subtract_k_mean=False)
+        k_c = k_subtract_torch  # use pre-subtracted K as kernel input
+
+    # ---- Stage 2: fused MXFP4 quant kernel (Q rotate + K rotate-(maybe-mean)-quant + V FP8)
     launcher = _get_kernel(
         head_dim=D, blk_q=BLKQ, blk_k=BLKK,
         num_q_heads=Hq, num_kv_heads=Hk,
+        subtract_k_mean=use_in_kernel_k_mean,
     )
-
-    sm_bits  = _f32_bits(sm_scale_log2e)
+    sm_bits   = _f32_bits(sm_scale_log2e)
     norm_bits = _f32_bits(1.0 / math.sqrt(D))
-
-    stream = torch.cuda.current_stream(q.device)
     launcher(
         q_c.reshape(-1),
         q_fp4.reshape(-1),
@@ -155,6 +197,7 @@ def flydsl_sage_quant_mxfp4(
         k_c.reshape(-1),
         k_fp4.reshape(-1),
         k_d.reshape(-1),
+        k_mean.reshape(-1),
         v_c.reshape(-1),
         v_fp8.reshape(-1),
         v_scale.reshape(-1),

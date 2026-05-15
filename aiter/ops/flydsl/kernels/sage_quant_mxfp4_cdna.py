@@ -62,6 +62,7 @@ def build_sage_quant_mxfp4_module(
     blk_k: int,
     num_q_heads: int,
     num_kv_heads: int,
+    subtract_k_mean: bool = True,
 ):
     """Build a fused single-launch kernel for MXFP4 sage quantization.
 
@@ -101,9 +102,10 @@ def build_sage_quant_mxfp4_module(
         Q_in: fx.Tensor,        # bf16 [B, S_q, Hq, D]
         Q_fp4: fx.Tensor,       # u8   [B, S_q, Hq, D//2]    packed FP4
         Q_descale: fx.Tensor,   # u8   [B, S_q, Hq, D//32]   e8m0
-        K_in: fx.Tensor,        # bf16 [B, S_k, Hk, D]       (post K-mean subtract)
+        K_in: fx.Tensor,        # bf16 [B, S_k, Hk, D]       (RAW)
         K_fp4: fx.Tensor,       # u8   [B, S_k, Hk, D//2]
         K_descale: fx.Tensor,   # u8   [B, S_k, Hk, D//32]
+        K_mean: fx.Tensor,      # f32  [B, Hk, D]            subtracted from K rows
         V_in: fx.Tensor,        # bf16 [B, S_k, Hk, D]
         V_fp8: fx.Tensor,       # fp8  [B, S_k, Hk, D]
         V_scale: fx.Tensor,     # f32  [B, Hk, D]            per-channel (precomputed)
@@ -197,6 +199,7 @@ def build_sage_quant_mxfp4_module(
         k_in_rsrc      = buffer_ops.create_buffer_resource(K_in,      max_size=True)
         k_fp4_rsrc     = buffer_ops.create_buffer_resource(K_fp4,     max_size=True)
         k_descale_rsrc = buffer_ops.create_buffer_resource(K_descale, max_size=True)
+        k_mean_rsrc    = buffer_ops.create_buffer_resource(K_mean,    max_size=True)
         v_in_rsrc      = buffer_ops.create_buffer_resource(V_in,      max_size=True)
         v_fp8_rsrc     = buffer_ops.create_buffer_resource(V_fp8,     max_size=True)
         v_scale_rsrc   = buffer_ops.create_buffer_resource(V_scale,   max_size=True)
@@ -372,11 +375,35 @@ def build_sage_quant_mxfp4_module(
         # ==================================================================
         def do_qk_rotate_quant(local_pid, in_rsrc, fp4_rsrc, descale_rsrc,
                                 BLK, c_blk, c_num_heads, num_blks_i32,
-                                seq_len_i32, PASSES, apply_sm_scale):
+                                seq_len_i32, PASSES, apply_sm_scale,
+                                subtract_k_mean=False):
             blk_idx = local_pid % num_blks_i32
             bh_id   = local_pid // num_blks_i32
             h_id    = bh_id % c_num_heads
             b_id    = bh_id // c_num_heads
+
+            # Load K_mean[b, h, col_d:col_d+VEC] once per block (8 f32 values).
+            if const_expr(subtract_k_mean):
+                k_mean_off = (b_id * c_num_heads + h_id) * c_head_dim + col_d
+                kmean_lo_raw = buffer_ops.buffer_load(
+                    k_mean_rsrc, k_mean_off, vec_width=4, dtype=i32
+                )
+                kmean_hi_raw = buffer_ops.buffer_load(
+                    k_mean_rsrc, k_mean_off + c4_i32, vec_width=4, dtype=i32
+                )
+                kmean_lo = vector.bitcast(v4f32_ty, kmean_lo_raw)
+                kmean_hi = vector.bitcast(v4f32_ty, kmean_hi_raw)
+                k_means = []
+                for vi in (0, 1, 2, 3):
+                    k_means.append(
+                        vector.extract(kmean_lo, static_position=[vi],
+                                        dynamic_position=[])
+                    )
+                for vi in (0, 1, 2, 3):
+                    k_means.append(
+                        vector.extract(kmean_hi, static_position=[vi],
+                                        dynamic_position=[])
+                    )
 
             for p in range_constexpr(PASSES):
                 row_in_blk = row_base + arith.constant(p * ROWS_PER_PASS, type=i32)
@@ -398,6 +425,8 @@ def build_sage_quant_mxfp4_module(
                 v_list = []
                 for vi in range_constexpr(VEC):
                     x = vector.extract(f32_v, static_position=[vi], dynamic_position=[])
+                    if const_expr(subtract_k_mean):
+                        x = x - k_means[vi]
                     v_list.append(x)
 
                 # ---- Stage 2: Hadamard rotation -----
@@ -576,6 +605,7 @@ def build_sage_quant_mxfp4_module(
                     local_pid_kv, k_in_rsrc, k_fp4_rsrc, k_descale_rsrc,
                     blk_k, c_blk_k, c_kv_heads, num_blocks_k_i32,
                     seq_len_k_i32, PASSES_K, apply_sm_scale=False,
+                    subtract_k_mean=subtract_k_mean,
                 )
                 scf.YieldOp([])
             with ir.InsertionPoint(_if_k.else_block):
@@ -592,6 +622,7 @@ def build_sage_quant_mxfp4_module(
         K_in: fx.Tensor,
         K_fp4: fx.Tensor,
         K_descale: fx.Tensor,
+        K_mean: fx.Tensor,
         V_in: fx.Tensor,
         V_fp8: fx.Tensor,
         V_scale: fx.Tensor,
@@ -613,7 +644,7 @@ def build_sage_quant_mxfp4_module(
         idx_grid = arith.index_cast(T.index, grid_size)
         launcher = sage_quant_mxfp4_kernel(
             Q_in, Q_fp4, Q_descale,
-            K_in, K_fp4, K_descale,
+            K_in, K_fp4, K_descale, K_mean,
             V_in, V_fp8, V_scale,
             seq_len_q, seq_len_k,
             num_blocks_q, num_blocks_k,
