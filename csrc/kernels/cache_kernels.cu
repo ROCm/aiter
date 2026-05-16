@@ -1293,6 +1293,10 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     if(token_idx >= num_tokens || head_idx >= n_heads)
         return;
 
+    const int64_t slot_idx = slot_mapping[token_idx];
+    if(slot_idx < 0)
+        return;
+
     const int64_t pos = positions[token_idx];
     const scalar_t* cos_ptr = cos_cache + pos * cos_stride0;
     const scalar_t* sin_ptr = sin_cache + pos * sin_stride0;
@@ -1350,10 +1354,6 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     }
 
     if(head_idx != 0)
-        return;
-
-    const int64_t slot_idx = slot_mapping[token_idx];
-    if(slot_idx < 0)
         return;
 
     __shared__ float normed[HEAD_DIM];
