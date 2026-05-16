@@ -876,7 +876,6 @@ def compile_attn_bwd_mxfp8_gfx950(
                     a2 = a3 = fx.Int64(0)
                 a128 = pack_i64x4_to_i32x8(a0, a1, a2, a3)
 
-                lds_a_scale_row = lds_a_row
                 # a_scale = lds_scale_load(
                 #    lds_a_scale_row, lds_scale_col, tile_head_mx, lds_a_scale_buffer
                 # )
