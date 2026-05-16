@@ -1635,7 +1635,14 @@ OPUS_D constexpr auto buffer_default_config() {
     return 0x00020000;
 #elif defined(__gfx103__)
     return 0x31014000;
-#elif defined(__gfx11__) || defined(__gfx12__) || defined(__gfx1250__)
+// Navi 44 / Navi 48 (RDNA4, gfx1200 / gfx1201) use the same RDNA buffer rsrc
+// config word as gfx1250. They are listed here explicitly because the
+// __gfx11__ / __gfx12__ tokens on the previous line are typos — clang only
+// predefines the uppercase __GFX11__ / __GFX12__ — so without these explicit
+// per-arch checks gfx1200 / gfx1201 fall into the 0xffffffff fallback,
+// producing an invalid buffer descriptor that silently drops all stores and
+// returns zero for all loads from make_gmem<>.
+#elif defined(__gfx11__) || defined(__gfx12__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)
     return 0x31004000;
 #else
     return 0xffffffff;

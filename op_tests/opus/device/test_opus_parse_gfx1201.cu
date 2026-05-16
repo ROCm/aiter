@@ -3,33 +3,38 @@
 
 /**
  * @file test_opus_parse_gfx1201.cu
- * @brief Verify opus.hpp parses cleanly on gfx1201 (Navi 48 / RX 9070 XT, RDNA4).
+ * @brief Verify opus.hpp parses + opus::make_gmem load/store work on gfx1201
+ *        (Navi 48 / RX 9070 XT, RDNA4).
  *
- * Without the gfx1201 forward-declaration fix in opus.hpp, kernels that
- * include opus.hpp on gfx1201 fail to compile with:
+ * Two issues this test covers, both addressed in this commit:
  *
- *     csrc/include/opus/opus.hpp:3065:24: error: unknown type name 'mfma_adaptor'
+ *  1) Parse-time: without the forward declarations of mfma_adaptor /
+ *     wmma_adaptor at the top of the opus namespace, opus.hpp fails to
+ *     compile for gfx1201 device code because make_tiled_mma()'s default
+ *     template argument names types that are gated behind __GFX9__ /
+ *     __gfx1250__ blocks.
  *
- * because make_tiled_mma()'s default template argument references
- * mfma_adaptor (defined only under __GFX9__) and wmma_adaptor (defined only
- * under __gfx1250__) — neither of which is active in gfx1201 device code.
+ *  2) Runtime: even after the header parses, opus::make_gmem<>.store<N>()
+ *     and .load<N>() silently produced wrong results on gfx1201 because
+ *     buffer_default_config() returned the 0xffffffff fallback (the
+ *     __gfx11__ / __gfx12__ checks on the prior line are typos — clang
+ *     only predefines the uppercase __GFX11__ / __GFX12__). The invalid
+ *     buffer rsrc made all buffer_load_b32 lanes return 0 and all
+ *     buffer_store_b32 lanes drop on the floor. Fix: add explicit
+ *     __gfx1201__ / __gfx1200__ branches with the correct 0x31004000
+ *     config word that gfx1250 already uses.
  *
- * This test exercises the opus utilities sample_kernels.cu actually uses
- * (opus::vector_t for vectorized lane storage, opus::cast for type
- * conversion). They are pure compile-time / C++ template machinery — no HIP
- * intrinsics — so they work on any arch the opus.hpp header parses for.
+ * The kernel below exercises the exact opus API that sample_kernels.cu /
+ * topk_softmax_kernels_group.cu / etc. depend on:
  *
- * What this test does NOT exercise:
- *   - opus::make_gmem .load<N>/.store<N> — these route through buffer-load /
- *     buffer-store intrinsics that are not available on gfx1201 today; the
- *     kernel uses plain pointer arithmetic for memory I/O instead.
- *   - mfma_adaptor / wmma_adaptor instantiation — neither is defined for
- *     gfx1201; that is the subject of opus.hpp Phase 2 (full WMMA support).
+ *     auto g = opus::make_gmem(ptr);
+ *     auto v = g.load<VEC>(i);    // buffer_load via cached rsrc
+ *     ... opus::cast<float>(v[j]) ...
+ *     g.store<VEC>(vr, i);        // buffer_store via cached rsrc
  *
- * If this test builds and produces correct results on gfx1201, the
- * forward declarations in opus.hpp are sufficient to keep gfx1201 device
- * code compiling. Behavior on gfx1250 / gfx9x is unchanged — the kernel
- * body is gated by __gfx1201__ so other archs see an empty no-op pass.
+ * If this test produces correct results on gfx1201, both fixes hold.
+ * Kernel body is gated by __gfx1201__ so other archs see an empty no-op
+ * pass — gfx1250 / gfx9x behavior is unchanged.
  */
 
 #ifdef __HIP_DEVICE_COMPILE__
@@ -37,11 +42,8 @@
 #include "opus/opus.hpp"
 
 #if defined(__gfx1201__)
-// Element-wise add via opus::vector_t lanes + opus::cast<float>; the
-// load/store goes through plain pointer arithmetic because opus's
-// buffer-intrinsic backed make_gmem store path is not available on
-// gfx1201 today. Sample_kernels.cu uses the same vector_t + cast pattern
-// for its per-lane FP8/BF16 → FP32 conversion.
+// Element-wise add via opus make_gmem load / store + per-lane opus::cast.
+// Mirrors the load → cast<float> → store pattern in sample_kernels.cu.
 template<int BLOCK_SIZE, int VECTOR_SIZE>
 __global__ void opus_parse_gfx1201_kernel(
     const float* __restrict__ a,
@@ -49,25 +51,25 @@ __global__ void opus_parse_gfx1201_kernel(
     float*       __restrict__ result,
     int n)
 {
-    int idx    = __builtin_amdgcn_workgroup_id_x() * BLOCK_SIZE
-               + __builtin_amdgcn_workitem_id_x();
+    auto g_a = opus::make_gmem(a);
+    auto g_b = opus::make_gmem(b);
+    auto g_r = opus::make_gmem(result);
+
+    int idx    = __builtin_amdgcn_workgroup_id_x() * BLOCK_SIZE + __builtin_amdgcn_workitem_id_x();
     int stride = __builtin_amdgcn_grid_size_x();
 
-    for (int base = idx * VECTOR_SIZE; base < n; base += stride * VECTOR_SIZE) {
-        opus::vector_t<float, VECTOR_SIZE> va, vb, vr;
-        for (int j = 0; j < VECTOR_SIZE; ++j) {
-            va[j] = a[base + j];
-            vb[j] = b[base + j];
-        }
+    for (int i = idx * VECTOR_SIZE; i < n; i += stride * VECTOR_SIZE) {
+        auto va = g_a.load<VECTOR_SIZE>(i);
+        auto vb = g_b.load<VECTOR_SIZE>(i);
+
+        decltype(va) vr;
         for (int j = 0; j < VECTOR_SIZE; ++j) {
             // opus::cast<float>(float) is a compile-time pass-through.
-            // Including it in the test exercises the same template path
-            // sample_kernels.cu instantiates for its DTYPE_I → float lanes.
+            // Including it exercises the same template path sample_kernels.cu
+            // instantiates for its per-lane DTYPE_I → float conversion.
             vr[j] = opus::cast<float>(va[j]) + opus::cast<float>(vb[j]);
         }
-        for (int j = 0; j < VECTOR_SIZE; ++j) {
-            result[base + j] = vr[j];
-        }
+        g_r.store<VECTOR_SIZE>(vr, i);
     }
 }
 
