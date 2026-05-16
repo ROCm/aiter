@@ -2,37 +2,34 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 /**
- * @file test_opus_parse_gfx1201.cu
- * @brief Verify opus.hpp parses + opus::make_gmem load/store work on gfx1201
- *        (Navi 48 / RX 9070 XT, RDNA4).
+ * @file test_opus_gmem_gfx1201.cu
+ * @brief Exercise opus::make_gmem<>.load<>/.store<> on gfx1201 (Navi 48 /
+ *        RX 9070 XT, RDNA4).
  *
- * Two issues this test covers, both addressed in this commit:
+ * Two opus.hpp changes need to be in place for this test to pass:
  *
- *  1) Parse-time: without the forward declarations of mfma_adaptor /
- *     wmma_adaptor at the top of the opus namespace, opus.hpp fails to
- *     compile for gfx1201 device code because make_tiled_mma()'s default
- *     template argument names types that are gated behind __GFX9__ /
- *     __gfx1250__ blocks.
+ *  1) Forward declarations of mfma_adaptor / wmma_adaptor in the opus
+ *     namespace, so the header parses for gfx1201 device code.
+ *     make_tiled_mma()'s default template argument names these types,
+ *     and without forward decls name lookup fails on archs where the
+ *     full definitions (gated by __GFX9__ / __gfx1250__) are inactive.
  *
- *  2) Runtime: even after the header parses, opus::make_gmem<>.store<N>()
- *     and .load<N>() silently produced wrong results on gfx1201 because
- *     buffer_default_config() returned the 0xffffffff fallback (the
- *     __gfx11__ / __gfx12__ checks on the prior line are typos — clang
- *     only predefines the uppercase __GFX11__ / __GFX12__). The invalid
- *     buffer rsrc made all buffer_load_b32 lanes return 0 and all
- *     buffer_store_b32 lanes drop on the floor. Fix: add explicit
- *     __gfx1201__ / __gfx1200__ branches with the correct 0x31004000
- *     config word that gfx1250 already uses.
+ *  2) buffer_default_config() returning the correct RDNA buffer rsrc
+ *     config (0x31004000) for gfx1201 instead of the 0xffffffff
+ *     fallback. The existing __gfx11__ / __gfx12__ tokens are typos
+ *     (clang only predefines the uppercase __GFX11__ / __GFX12__), so
+ *     without an explicit __gfx1201__ / __gfx1200__ branch the
+ *     make_gmem<> resource descriptor is invalid and all buffer_load_b32
+ *     lanes return 0 / all buffer_store_b32 lanes drop on the floor.
  *
- * The kernel below exercises the exact opus API that sample_kernels.cu /
- * topk_softmax_kernels_group.cu / etc. depend on:
+ * The kernel exercises the exact opus API that sample_kernels.cu /
+ * topk_softmax_kernels_group.cu / mhc_kernels.cu depend on:
  *
  *     auto g = opus::make_gmem(ptr);
  *     auto v = g.load<VEC>(i);    // buffer_load via cached rsrc
  *     ... opus::cast<float>(v[j]) ...
  *     g.store<VEC>(vr, i);        // buffer_store via cached rsrc
  *
- * If this test produces correct results on gfx1201, both fixes hold.
  * Kernel body is gated by __gfx1201__ so other archs see an empty no-op
  * pass — gfx1250 / gfx9x behavior is unchanged.
  */
@@ -45,7 +42,7 @@
 // Element-wise add via opus make_gmem load / store + per-lane opus::cast.
 // Mirrors the load → cast<float> → store pattern in sample_kernels.cu.
 template<int BLOCK_SIZE, int VECTOR_SIZE>
-__global__ void opus_parse_gfx1201_kernel(
+__global__ void opus_gmem_gfx1201_kernel(
     const float* __restrict__ a,
     const float* __restrict__ b,
     float*       __restrict__ result,
@@ -73,7 +70,7 @@ __global__ void opus_parse_gfx1201_kernel(
     }
 }
 
-template __global__ void opus_parse_gfx1201_kernel<256, 4>(const float*, const float*, float*, int);
+template __global__ void opus_gmem_gfx1201_kernel<256, 4>(const float*, const float*, float*, int);
 #endif // __gfx1201__
 
 #else
@@ -90,9 +87,9 @@ template __global__ void opus_parse_gfx1201_kernel<256, 4>(const float*, const f
 } while(0)
 
 template<int BLOCK_SIZE, int VECTOR_SIZE>
-__global__ void opus_parse_gfx1201_kernel(const float*, const float*, float*, int) {}
+__global__ void opus_gmem_gfx1201_kernel(const float*, const float*, float*, int) {}
 
-extern "C" void run_opus_parse_gfx1201(
+extern "C" void run_opus_gmem_gfx1201(
     const void* d_a,
     const void* d_b,
     void*       d_result,
@@ -107,7 +104,7 @@ extern "C" void run_opus_parse_gfx1201(
     int blocks = (n + (BLOCK_SIZE * VECTOR_SIZE) - 1) / (BLOCK_SIZE * VECTOR_SIZE);
 
     hipLaunchKernelGGL(
-        (opus_parse_gfx1201_kernel<BLOCK_SIZE, VECTOR_SIZE>),
+        (opus_gmem_gfx1201_kernel<BLOCK_SIZE, VECTOR_SIZE>),
         dim3(blocks), dim3(BLOCK_SIZE), 0, 0,
         a, b, r, n);
     HIP_CALL(hipGetLastError());

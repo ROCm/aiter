@@ -176,12 +176,29 @@ class OpusDeviceLib:
         fn.argtypes = [_VP, _VP, _VP, _I]
         fn(self._ptr(A), self._ptr(B), self._ptr(Result), int(A.numel()))
 
-    # -- opus_parse_gfx1201 (verifies opus.hpp parses + opus utils work on gfx1201) --
-    def run_opus_parse_gfx1201(self, A, B, Result):
-        fn = self._lib.run_opus_parse_gfx1201
+    # -- opus_gmem_gfx1201 (verifies opus.hpp parses + opus utils work on gfx1201) --
+    def run_opus_gmem_gfx1201(self, A, B, Result):
+        fn = self._lib.run_opus_gmem_gfx1201
         fn.restype = None
         fn.argtypes = [_VP, _VP, _VP, _I]
         fn(self._ptr(A), self._ptr(B), self._ptr(Result), int(A.numel()))
+
+    # -- wmma_gfx1201 (8 wave32 16x16x16 variants via __builtin_amdgcn_wmma_*_w32_gfx12) --
+    def _run_wmma_gfx1201(self, suffix, A, B, C):
+        fn = getattr(self._lib, f"run_wmma_gfx1201_{suffix}")
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I, _I, _I]
+        fn(self._ptr(A), self._ptr(B), self._ptr(C),
+           int(A.stride(0)), int(B.stride(0)), int(C.stride(0)))
+
+    def run_wmma_gfx1201_f32_f16(self, A, B, C):     self._run_wmma_gfx1201("f32_f16",     A, B, C)
+    def run_wmma_gfx1201_f32_bf16(self, A, B, C):    self._run_wmma_gfx1201("f32_bf16",    A, B, C)
+    def run_wmma_gfx1201_f16_f16(self, A, B, C):     self._run_wmma_gfx1201("f16_f16",     A, B, C)
+    def run_wmma_gfx1201_bf16_bf16(self, A, B, C):   self._run_wmma_gfx1201("bf16_bf16",   A, B, C)
+    def run_wmma_gfx1201_f32_fp8_fp8(self, A, B, C): self._run_wmma_gfx1201("f32_fp8_fp8", A, B, C)
+    def run_wmma_gfx1201_f32_fp8_bf8(self, A, B, C): self._run_wmma_gfx1201("f32_fp8_bf8", A, B, C)
+    def run_wmma_gfx1201_f32_bf8_fp8(self, A, B, C): self._run_wmma_gfx1201("f32_bf8_fp8", A, B, C)
+    def run_wmma_gfx1201_f32_bf8_bf8(self, A, B, C): self._run_wmma_gfx1201("f32_bf8_bf8", A, B, C)
 
     # -- async_load --
     def run_async_load(self, Src, Dst):
@@ -1174,19 +1191,19 @@ def test_vector_add(mod):
 
 
 # Archs where the opus.hpp parse-time fix matters. The kernel body in
-# test_opus_parse_gfx1201.cu is gated by __gfx1201__ — on other archs the
+# test_opus_gmem_gfx1201.cu is gated by __gfx1201__ — on other archs the
 # launcher runs an empty kernel, so we skip the correctness check to avoid
 # a misleading failure.
 _OPUS_PARSE_GFX1201_ARCHS = {"gfx1201"}
 
 
-def test_opus_parse_gfx1201(mod):
+def test_opus_gmem_gfx1201(mod):
     """Verify opus.hpp parses + opus utilities (make_gmem / .load/.store /
     cast) work on gfx1201. Mirrors the load → cast<float> → store pattern
     in sample_kernels.cu. Skips on other archs (kernel body is gfx1201-only)."""
     arch = _get_gpu_arch()
     if arch not in _OPUS_PARSE_GFX1201_ARCHS:
-        print(f"  SKIP: opus_parse_gfx1201 (arch={arch}, gfx1201-only test)")
+        print(f"  SKIP: opus_gmem_gfx1201 (arch={arch}, gfx1201-only test)")
         return 0
 
     n = 1310720
@@ -1198,7 +1215,7 @@ def test_opus_parse_gfx1201(mod):
     B = torch.randn(n, device=device, dtype=dtype)
     Result = torch.empty(n, device=device, dtype=dtype)
 
-    mod.run_opus_parse_gfx1201(A, B, Result)
+    mod.run_opus_gmem_gfx1201(A, B, Result)
 
     Ref = A + B
 
@@ -1208,12 +1225,94 @@ def test_opus_parse_gfx1201(mod):
     if not ok:
         diff_count = (Result - Ref).abs().gt(atol + rtol * Ref.abs()).sum().item()
         print(
-            f"  FAIL: opus_parse_gfx1201 max_diff={max_diff:.6e}, "
+            f"  FAIL: opus_gmem_gfx1201 max_diff={max_diff:.6e}, "
             f"{diff_count} elements outside tol"
         )
         return 1
-    print(f"  PASS: opus_parse_gfx1201 (arch={arch}, n={n}), max_diff={max_diff:.6e}")
+    print(f"  PASS: opus_gmem_gfx1201 (arch={arch}, n={n}), max_diff={max_diff:.6e}")
     return 0
+
+
+# WMMA tests for gfx1201 (Navi 48). Kernel bodies in test_wmma_gfx1201.cu are
+# gated by __gfx1201__ — on other archs the launcher runs an empty kernel
+# so we skip the correctness check.
+_WMMA_GFX1201_ARCHS = {"gfx1201"}
+
+
+def _wmma_gfx1201_tolerances(out_dtype):
+    # f32 acc is bit-exact against the FP32 reference matmul; f16/bf16 acc
+    # picks up one ULP of rounding error.
+    if out_dtype == torch.float32:   return 5e-2, 1e-2
+    if out_dtype == torch.float16:   return 1e-1, 1e-2
+    if out_dtype == torch.bfloat16:  return 5e-1, 5e-2
+    return 1e-2, 1e-2
+
+
+def _test_wmma_gfx1201_variant(mod, name, runner, in_dtype_a, in_dtype_b, out_dtype):
+    """Drive one wmma_gfx1201 variant: build random 16x16 A/B, call the
+    WMMA kernel, compare against fp32 torch matmul cast to out_dtype."""
+    arch = _get_gpu_arch()
+    if arch not in _WMMA_GFX1201_ARCHS:
+        print(f"  SKIP: wmma_gfx1201_{name} (arch={arch}, gfx1201-only)")
+        return 0
+
+    M = N = K = 16
+    device = torch.device("cuda")
+
+    torch.manual_seed(42)
+    a_ref = torch.randn(M, K, dtype=torch.float32, device=device) * 2.0
+    b_ref = torch.randn(K, N, dtype=torch.float32, device=device) * 2.0
+    A = a_ref.to(in_dtype_a)
+    B = b_ref.to(in_dtype_b)
+    C = torch.zeros(M, N, dtype=out_dtype, device=device)
+
+    Ref = (A.to(torch.float32) @ B.to(torch.float32)).to(out_dtype)
+
+    runner(A, B, C)
+
+    atol, rtol = _wmma_gfx1201_tolerances(out_dtype)
+    Cf = C.to(torch.float32)
+    Rf = Ref.to(torch.float32)
+    ok = torch.allclose(Cf, Rf, atol=atol, rtol=rtol)
+    max_diff = (Cf - Rf).abs().max().item()
+    if not ok:
+        print(f"  FAIL: wmma_gfx1201_{name} max_diff={max_diff:.4e} (atol={atol})")
+        return 1
+    print(f"  PASS: wmma_gfx1201_{name} (in=({in_dtype_a}, {in_dtype_b}), out={out_dtype}, max_diff={max_diff:.4e})")
+    return 0
+
+
+def test_wmma_gfx1201_f32_f16(mod):
+    return _test_wmma_gfx1201_variant(mod, "f32_f16", mod.run_wmma_gfx1201_f32_f16,
+                                      torch.float16, torch.float16, torch.float32)
+
+def test_wmma_gfx1201_f32_bf16(mod):
+    return _test_wmma_gfx1201_variant(mod, "f32_bf16", mod.run_wmma_gfx1201_f32_bf16,
+                                      torch.bfloat16, torch.bfloat16, torch.float32)
+
+def test_wmma_gfx1201_f16_f16(mod):
+    return _test_wmma_gfx1201_variant(mod, "f16_f16", mod.run_wmma_gfx1201_f16_f16,
+                                      torch.float16, torch.float16, torch.float16)
+
+def test_wmma_gfx1201_bf16_bf16(mod):
+    return _test_wmma_gfx1201_variant(mod, "bf16_bf16", mod.run_wmma_gfx1201_bf16_bf16,
+                                      torch.bfloat16, torch.bfloat16, torch.bfloat16)
+
+def test_wmma_gfx1201_f32_fp8_fp8(mod):
+    return _test_wmma_gfx1201_variant(mod, "f32_fp8_fp8", mod.run_wmma_gfx1201_f32_fp8_fp8,
+                                      torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float32)
+
+def test_wmma_gfx1201_f32_fp8_bf8(mod):
+    return _test_wmma_gfx1201_variant(mod, "f32_fp8_bf8", mod.run_wmma_gfx1201_f32_fp8_bf8,
+                                      torch.float8_e4m3fn, torch.float8_e5m2, torch.float32)
+
+def test_wmma_gfx1201_f32_bf8_fp8(mod):
+    return _test_wmma_gfx1201_variant(mod, "f32_bf8_fp8", mod.run_wmma_gfx1201_f32_bf8_fp8,
+                                      torch.float8_e5m2, torch.float8_e4m3fn, torch.float32)
+
+def test_wmma_gfx1201_f32_bf8_bf8(mod):
+    return _test_wmma_gfx1201_variant(mod, "f32_bf8_bf8", mod.run_wmma_gfx1201_f32_bf8_bf8,
+                                      torch.float8_e5m2, torch.float8_e5m2, torch.float32)
 
 
 def test_async_load(mod):
@@ -2221,7 +2320,15 @@ def main():
     failures += test_wmma_scale_16x16x128_fp8_bx32_scaled(mod)
     failures += test_mma_step_k_bf16(mod)
     failures += test_vector_add(mod)
-    failures += test_opus_parse_gfx1201(mod)
+    failures += test_opus_gmem_gfx1201(mod)
+    failures += test_wmma_gfx1201_f32_f16(mod)
+    failures += test_wmma_gfx1201_f32_bf16(mod)
+    failures += test_wmma_gfx1201_f16_f16(mod)
+    failures += test_wmma_gfx1201_bf16_bf16(mod)
+    failures += test_wmma_gfx1201_f32_fp8_fp8(mod)
+    failures += test_wmma_gfx1201_f32_fp8_bf8(mod)
+    failures += test_wmma_gfx1201_f32_bf8_fp8(mod)
+    failures += test_wmma_gfx1201_f32_bf8_bf8(mod)
     failures += test_async_load(mod)
     failures += test_tr_load_f16(mod)
     failures += test_dtype_convert_fp32_bf16(mod)

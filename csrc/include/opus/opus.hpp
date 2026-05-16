@@ -2331,8 +2331,15 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
 #endif // __GFX9__ (mfma)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// wmma (gfx1250 / RDNA4, wave32)
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+// wmma (RDNA4 / wave32) — supports gfx1250 and gfx1201 (Navi 48).
+// The two archs share the same opus::wmma<> template + dispatch shape, but use
+// different LLVM builtins:
+//   - gfx1250: __builtin_amdgcn_wmma_<dtype>_16x16x{32,64,128,4}_<combo>      (wmma-256b-insts)
+//   - gfx1201: __builtin_amdgcn_wmma_<dtype>_16x16x{16,32}_<combo>_w32_gfx12  (wmma-128b-insts)
+// gfx1201 only supports the 16x16x16 shape (plus 16x16x32 for iu4) and the
+// dispatch macros below have different argument lists than the gfx1250 ones
+// (see DISPATCH_WMMA_GFX12_* further down).
+#if defined(__gfx1250__) || defined(__gfx1201__) || !defined(__HIP_DEVICE_COMPILE__)
 // f16/bf16/f32 builtins: (neg_a, A, neg_b, B, matrix_fmts, C, clamp, neg_c)
 #define DISPATCH_WMMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
@@ -2354,6 +2361,27 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
     return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), \
                  __builtin_bit_cast(vector_t<i32_t, i32_b>, b), \
                  static_cast<short>(0), c, false, false); }
+
+// gfx12 (gfx1200 / gfx1201, Navi 44/48) WMMA dispatch macros.
+//
+// The gfx12 builtins (suffixed _w32_gfx12 in BuiltinsAMDGPU.td) have a leaner
+// signature than the gfx1250 ones — there is no matrix_fmts / neg_c slot —
+// so they need their own macros even though shape/dtype matching is identical.
+//
+// FP / FP8-acc variants (f16/bf16/f16→f16/bf16→bf16 → f32 or same-type acc):   (A, B, C)
+// FP8/BF8 (A/B reinterpreted as packed i32 vector):                            (A, B, C)
+#define DISPATCH_WMMA_GFX12_F32_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
+  wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
+    return inst_(a, b, c); }
+
+#define DISPATCH_WMMA_GFX12_8BIT_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
+  wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
+    constexpr index_t i32_a = elem_a * static_cast<index_t>(sizeof(dtype_a)) / static_cast<index_t>(sizeof(i32_t)); \
+    constexpr index_t i32_b = elem_b * static_cast<index_t>(sizeof(dtype_b)) / static_cast<index_t>(sizeof(i32_t)); \
+    return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), \
+                 __builtin_bit_cast(vector_t<i32_t, i32_b>, b), c); }
 
 template<typename dtype_a_, typename dtype_b_, typename dtype_c_, index_t wave_m_, index_t wave_n_, index_t wave_k_, index_t warp_size_ = get_warp_size()>
 struct wmma {
@@ -2418,6 +2446,22 @@ struct wmma {
         else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, fp8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_bf8_fp8)
         else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, bf8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_bf8_bf8)
 #endif
+#if defined(__gfx1201__)
+        // gfx12 wave32 16x16x16 — f16/bf16 → f32
+        else if constexpr DISPATCH_WMMA_GFX12_F32_(fp16_t, fp16_t, fp32_t, 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_(bf16_t, bf16_t, fp32_t, 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
+        // gfx12 wave32 16x16x16 — same-type accumulator (same 3-arg signature as f32 acc)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_(fp16_t, fp16_t, fp16_t, 16, 16, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_(bf16_t, bf16_t, bf16_t, 16, 16, 16, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w32_gfx12)
+        // gfx12 wave32 16x16x16 — fp8/bf8 × {fp8, bf8} → f32
+        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(fp8_t, fp8_t, fp32_t, 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(fp8_t, bf8_t, fp32_t, 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_fp8_bf8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t, fp8_t, fp32_t, 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf8_fp8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t, bf8_t, fp32_t, 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12)
+        // Note: gfx12 also supports __builtin_amdgcn_wmma_i32_16x16x{16,32}_iu{8,4}_w32_gfx12
+        // (signed/unsigned 8-bit / 4-bit integer dot). Not wired here because opus
+        // doesn't have iu8_t / iu4_t dtype aliases yet — see follow-up.
+#endif // __gfx1201__
         __builtin_unreachable();
     }
 
@@ -2512,6 +2556,19 @@ struct wmma {
 #undef DISPATCH_WMMA_
 #undef DISPATCH_WMMA_BF16F32_
 #undef DISPATCH_WMMA_8BIT_
+#undef DISPATCH_WMMA_GFX12_F32_
+#undef DISPATCH_WMMA_GFX12_8BIT_
+
+// gfx12 (gfx1200 / gfx1201, Navi 44/48) — wave32 WMMA 16x16x16 type aliases.
+// Only the 16x16x{16,32} shapes are valid on gfx12; 16x16x32 is iu4-only.
+using wmma_f32_16x16x16_f16     = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 16>;
+using wmma_f16_16x16x16_f16     = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 16>;
+using wmma_f32_16x16x16_bf16    = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 16>;
+using wmma_bf16_16x16x16_bf16   = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 16>;
+using wmma_f32_16x16x16_fp8_fp8 = wmma<fp8_t , fp8_t , fp32_t, 16, 16, 16>;
+using wmma_f32_16x16x16_fp8_bf8 = wmma<fp8_t , bf8_t , fp32_t, 16, 16, 16>;
+using wmma_f32_16x16x16_bf8_fp8 = wmma<bf8_t , fp8_t , fp32_t, 16, 16, 16>;
+using wmma_f32_16x16x16_bf8_bf8 = wmma<bf8_t , bf8_t , fp32_t, 16, 16, 16>;
 
 // f16/bf16 16x16x32
 using wmma_f32_16x16x32_f16   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32>;
@@ -2543,7 +2600,7 @@ using wmma_scale_f32_16x16x128_fp8_fp8 = wmma<fp8_t, fp8_t, fp32_t, 16, 16, 128>
 using wmma_scale_f32_16x16x128_fp4_fp4 = wmma<fp4_t, fp4_t, fp32_t, 16, 16, 128>;
 // Scaled WMMA (dedicated fp4 32x16x128 instruction)
 using wmma_scale_f32_32x16x128_fp4_fp4 = wmma<fp4_t, fp4_t, fp32_t, 32, 16, 128>;
-#endif // __gfx1250__ (wmma)
+#endif // __gfx1250__ / __gfx1201__ (wmma)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // adaptor
@@ -2743,7 +2800,17 @@ template<typename d_a, typename d_b, typename d_c, typename WaveMNK /*seq<m, n, 
 OPUS_D decltype(auto) make_mfma(WaveMNK&&, A&& = {}, number<warp_size_> = {}) { return A{}(mfma<d_a, d_b, d_c, get<0>(WaveMNK{}), get<1>(WaveMNK{}), get<2>(WaveMNK{}), warp_size_>{}); }
 #endif // __GFX9__
 
-// wmma_adaptor: same layout encoding as mfma_adaptor but for wave32 WMMA (gfx1250)
+// wmma_adaptor: same layout encoding as mfma_adaptor but for wave32 WMMA (gfx1250).
+//
+// NOTE: gfx12 (gfx1200 / gfx1201, RDNA4) WMMA uses a column-distributed
+// fragment layout for A / B / C (lane selects column, lane group selects an
+// 8-row block, vector register index selects row within block — see AMD
+// RDNA4 ISA §7.12.2 and CK's wmma_gemm.hpp). This is incompatible with the
+// row-distributed encoding below, which was designed for gfx1250's WMMA.
+// gfx1201 callers can still use the opus::wmma<> struct directly to invoke
+// the gfx12 builtins, but the make_tiled_mma / partition_layout_* path is
+// gfx1250-only until a dedicated wmma_adaptor_gfx12 is added.
+//
 // A:[(grpm_a<p>), (rept_a<y>, grpk_a<p>, pack_a<y>)], MxK
 // B:[(grpn_b<p>), (rept_b<y>, grpk_b<p>, pack_b<y>)], NxK
 // C:[(grpm_c<p>, rept_c<y>, pack_c<y>), (grpn_c<p>)], MxN
