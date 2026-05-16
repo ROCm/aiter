@@ -319,10 +319,10 @@ def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
         # Catch unaligned-sq / unaligned-sk corner cases without paying
         # the cost of materializing the full [b, h, sq, sk] fp32 attn
         # matrix in _ref_attn.
-        (64,  8, 1, 128, 2048, 1),  # D64  aligned
-        (64,  8, 1, 128, 2048, 2),
-        (64,  8, 1, 130, 2048, 1),  # D64  q-unaligned (sq not mult of 128)
-        (64,  8, 1, 128, 2300, 1),  # D64  kv-unaligned (sk not mult of 256)
+        (64, 8, 1, 128, 2048, 1),  # D64  aligned
+        (64, 8, 1, 128, 2048, 2),
+        (64, 8, 1, 130, 2048, 1),  # D64  q-unaligned (sq not mult of 128)
+        (64, 8, 1, 128, 2300, 1),  # D64  kv-unaligned (sk not mult of 256)
         (128, 8, 1, 128, 2048, 1),  # D128 aligned
         (128, 8, 1, 128, 2048, 2),
         (128, 8, 1, 130, 2048, 1),  # D128 q-unaligned
@@ -331,7 +331,7 @@ def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
         # Same memory pressure as test_fmha_fwd_f16_perf, batch=1 only
         # because the reference path's fp32 attn matrix would otherwise
         # exceed device memory (D64 batch=2 sq=sk=8192 → 32 GB).
-        (64,  64, 8, 8192, 8192, 1),  # D64  perf-sized, aligned
+        (64, 64, 8, 8192, 8192, 1),  # D64  perf-sized, aligned
         (128, 64, 4, 4096, 4096, 1),  # D128 perf-sized, aligned
     ],
 )
@@ -376,21 +376,19 @@ def test_fmha_fwd_f16_correctness(head_dim, hq, hk, sq, sk, batch, is_causal):
     # gfx1250 bf16 element-wise deadlock noted near the top of this file.
     _ok = out_kernel.detach().float().cpu()
     _ls = lse_asm.detach().float().cpu()
-    _shape_msg = (
-        f"d={head_dim} causal={is_causal} b={batch} sq={sq} sk={sk}"
-    )
-    assert not _ok.isnan().any().item(), (
-        f"KERNEL out contains NaN [{_shape_msg}] -- kernel-side bug"
-    )
-    assert not _ok.isinf().any().item(), (
-        f"KERNEL out contains Inf [{_shape_msg}] -- kernel-side bug"
-    )
-    assert not _ls.isnan().any().item(), (
-        f"KERNEL lse contains NaN [{_shape_msg}] -- kernel-side bug"
-    )
-    assert not _ls.isinf().any().item(), (
-        f"KERNEL lse contains Inf [{_shape_msg}] -- kernel-side bug"
-    )
+    _shape_msg = f"d={head_dim} causal={is_causal} b={batch} sq={sq} sk={sk}"
+    assert (
+        not _ok.isnan().any().item()
+    ), f"KERNEL out contains NaN [{_shape_msg}] -- kernel-side bug"
+    assert (
+        not _ok.isinf().any().item()
+    ), f"KERNEL out contains Inf [{_shape_msg}] -- kernel-side bug"
+    assert (
+        not _ls.isnan().any().item()
+    ), f"KERNEL lse contains NaN [{_shape_msg}] -- kernel-side bug"
+    assert (
+        not _ls.isinf().any().item()
+    ), f"KERNEL lse contains Inf [{_shape_msg}] -- kernel-side bug"
 
     out_ref, lse_ref = run_ref(q, k, v, is_causal=is_causal, sink=sink)
 
@@ -399,23 +397,21 @@ def test_fmha_fwd_f16_correctness(head_dim, hq, hk, sq, sk, batch, is_causal):
     # case the kernel handles correctly).
     _or = out_ref.detach().float().cpu()
     _lr = lse_ref.detach().float().cpu()
-    assert not _or.isnan().any().item(), (
-        f"REFERENCE out contains NaN [{_shape_msg}] -- ref-path issue"
-    )
-    assert not _or.isinf().any().item(), (
-        f"REFERENCE out contains Inf [{_shape_msg}] -- ref-path issue"
-    )
-    assert not _lr.isnan().any().item(), (
-        f"REFERENCE lse contains NaN [{_shape_msg}] -- ref-path issue"
-    )
-    assert not _lr.isinf().any().item(), (
-        f"REFERENCE lse contains Inf [{_shape_msg}] -- ref-path issue"
-    )
+    assert (
+        not _or.isnan().any().item()
+    ), f"REFERENCE out contains NaN [{_shape_msg}] -- ref-path issue"
+    assert (
+        not _or.isinf().any().item()
+    ), f"REFERENCE out contains Inf [{_shape_msg}] -- ref-path issue"
+    assert (
+        not _lr.isnan().any().item()
+    ), f"REFERENCE lse contains NaN [{_shape_msg}] -- ref-path issue"
+    assert (
+        not _lr.isinf().any().item()
+    ), f"REFERENCE lse contains Inf [{_shape_msg}] -- ref-path issue"
 
     nrms_o = _nrms(out_kernel, out_ref)
-    print(
-        f"[corr {_shape_msg}] nrms(out)={nrms_o:.3e}"
-    )
+    print(f"[corr {_shape_msg}] nrms(out)={nrms_o:.3e}")
 
     _cmp(
         out_kernel,
