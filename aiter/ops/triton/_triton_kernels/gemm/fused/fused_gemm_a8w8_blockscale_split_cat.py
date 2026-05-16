@@ -156,11 +156,7 @@ def _fused_gemm_a8w8_blockscale_split_cat(
             b_scale = tl.load(b_scale_ptrs)
 
             # Perform dot operation and apply scale
-            accumulator += (
-                tl.dot(a, b, input_precision="ieee")
-                * a_scale[:, None]
-                * b_scale[None, :]
-            )
+            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_a_k
@@ -413,11 +409,7 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
             b_scale = tl.load(b_scale_ptrs)
 
             # Perform dot operation and apply scale
-            accumulator += (
-                tl.dot(a, b, input_precision="ieee")
-                * a_scale[:, None]
-                * b_scale[None, :]
-            )
+            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_a_k
