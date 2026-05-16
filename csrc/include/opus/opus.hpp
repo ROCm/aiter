@@ -500,6 +500,28 @@ template <std::size_t I, typename... Ts> struct tuple_element<I, const opus::tup
 
 namespace opus {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Forward declarations for the mma adaptor dispatcher structs.
+//
+// Their full definitions live inside arch-specific #if blocks farther down:
+//   - mfma_adaptor / mfma_adaptor_swap_ab   under  #if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
+//   - wmma_adaptor / wmma_adaptor_swap_ab   under  #if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+//
+// On archs that match neither — e.g. gfx1200 / gfx1201 (Navi 44 / Navi 48,
+// RDNA4) — both blocks are inactive in device code and the identifiers go
+// undeclared. That alone is fine until a template like make_tiled_mma()
+// (below) names them in its default template argument: name lookup then
+// fails at parse time even if no caller ever instantiates the template.
+//
+// Forward-declaring them here as incomplete types lets such templates parse
+// cleanly on all archs. Instantiation still requires the full definition,
+// so kernels that don't actually call make_tiled_mma() / make_mfma() /
+// make_wmma() are unaffected. Behavior on gfx1250 and gfx9x is unchanged.
+struct mfma_adaptor;
+struct mfma_adaptor_swap_ab;
+struct wmma_adaptor;
+struct wmma_adaptor_swap_ab;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
 // transforms
 template<typename X, typename Y, index_t... Is> constexpr auto embed(const X& x, const Y& y, seq<Is...>) { return ( ... + (get<Is>(x) * get<Is>(y))); }
 template<typename X, typename Y>                constexpr auto embed(const X& x, const Y& y) { return embed(x, y, make_index_seq<X::size()>{}); }

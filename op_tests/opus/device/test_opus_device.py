@@ -176,6 +176,13 @@ class OpusDeviceLib:
         fn.argtypes = [_VP, _VP, _VP, _I]
         fn(self._ptr(A), self._ptr(B), self._ptr(Result), int(A.numel()))
 
+    # -- opus_parse_gfx1201 (verifies opus.hpp parses + opus utils work on gfx1201) --
+    def run_opus_parse_gfx1201(self, A, B, Result):
+        fn = self._lib.run_opus_parse_gfx1201
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I]
+        fn(self._ptr(A), self._ptr(B), self._ptr(Result), int(A.numel()))
+
     # -- async_load --
     def run_async_load(self, Src, Dst):
         fn = self._lib.run_async_load
@@ -1163,6 +1170,49 @@ def test_vector_add(mod):
         )
         return 1
     print(f"  PASS: vector_add (n={n}), max_diff={max_diff:.6e}")
+    return 0
+
+
+# Archs where the opus.hpp parse-time fix matters. The kernel body in
+# test_opus_parse_gfx1201.cu is gated by __gfx1201__ — on other archs the
+# launcher runs an empty kernel, so we skip the correctness check to avoid
+# a misleading failure.
+_OPUS_PARSE_GFX1201_ARCHS = {"gfx1201"}
+
+
+def test_opus_parse_gfx1201(mod):
+    """Verify opus.hpp parses + opus utilities (make_gmem / .load/.store /
+    cast) work on gfx1201. Mirrors the load → cast<float> → store pattern
+    in sample_kernels.cu. Skips on other archs (kernel body is gfx1201-only)."""
+    arch = _get_gpu_arch()
+    if arch not in _OPUS_PARSE_GFX1201_ARCHS:
+        print(f"  SKIP: opus_parse_gfx1201 (arch={arch}, gfx1201-only test)")
+        return 0
+
+    n = 1310720
+    device = torch.device("cuda")
+    dtype = torch.float32
+
+    torch.manual_seed(42)
+    A = torch.randn(n, device=device, dtype=dtype)
+    B = torch.randn(n, device=device, dtype=dtype)
+    Result = torch.empty(n, device=device, dtype=dtype)
+
+    mod.run_opus_parse_gfx1201(A, B, Result)
+
+    Ref = A + B
+
+    atol, rtol = 1e-5, 1e-5
+    ok = torch.allclose(Result, Ref, atol=atol, rtol=rtol)
+    max_diff = (Result - Ref).abs().max().item()
+    if not ok:
+        diff_count = (Result - Ref).abs().gt(atol + rtol * Ref.abs()).sum().item()
+        print(
+            f"  FAIL: opus_parse_gfx1201 max_diff={max_diff:.6e}, "
+            f"{diff_count} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: opus_parse_gfx1201 (arch={arch}, n={n}), max_diff={max_diff:.6e}")
     return 0
 
 
@@ -2171,6 +2221,7 @@ def main():
     failures += test_wmma_scale_16x16x128_fp8_bx32_scaled(mod)
     failures += test_mma_step_k_bf16(mod)
     failures += test_vector_add(mod)
+    failures += test_opus_parse_gfx1201(mod)
     failures += test_async_load(mod)
     failures += test_tr_load_f16(mod)
     failures += test_dtype_convert_fp32_bf16(mod)

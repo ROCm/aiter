@@ -40,6 +40,7 @@ _CU_SOURCES = [
     "test_numeric_limits.cu",
     "test_workgroup_barrier.cu",
     "test_finfo.cu",
+    "test_opus_parse_gfx1201.cu",
 ]
 
 
