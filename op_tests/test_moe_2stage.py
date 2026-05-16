@@ -42,6 +42,10 @@ AITER_MOE_EXPERT_BALANCE = (
 
 _STAGE_EVENT_BUCKETS = {"stage1": [], "stage2": []}
 _STAGE_EVENT_PATCHED = False
+# Per-stage kernel output capture for per-stage logits_diff. Off by
+# default (clones would pollute timed-loop iters); the test toggles
+# ``enabled`` on for one extra post-timing fused_moe call.
+_STAGE_OUTPUT_CAPTURE = {"enabled": False, "stage1": None, "stage2": None}
 
 
 def _install_stage_event_patches():
@@ -89,6 +93,9 @@ def _install_stage_event_patches():
             ret = orig_fn(*args, **kwargs)
             ev_end.record()
             _STAGE_EVENT_BUCKETS[stage_name].append((ev_start, ev_end))
+            if _STAGE_OUTPUT_CAPTURE["enabled"]:
+                _t = ret[0] if isinstance(ret, tuple) else ret
+                _STAGE_OUTPUT_CAPTURE[stage_name] = _t.detach().clone()
             return ret
 
         _stage_event_wrapper.__wrapped__ = orig_fn
@@ -573,7 +580,7 @@ def test_fmoe(
     #                         (stage1+stage2) is dominated by per-call
     #                         launch / Python overhead.
     _num_warmup = int(os.environ.get("AITER_MOE_WARMUP", "5"))
-    _num_iters = int(os.environ.get("AITER_MOE_ITERS", "20"))
+    _num_iters = int(os.environ.get("AITER_MOE_ITERS", "64"))
     _l2_flush = int(os.environ.get("AITER_MOE_L2_FLUSH", "1")) != 0
     _use_graph = int(os.environ.get("AITER_MOE_USE_GRAPH", "0")) != 0
     _l2_buf = (
@@ -728,6 +735,23 @@ def test_fmoe(
                 "(fused median=%.2f, gap=%+.2f us = launch/overhead)",
                 _med_sum, us2, us2 - _med_sum,
             )
+
+    # ── per-stage logits_diff: capture the kernel's stage1 output by
+    # running fused_moe one extra time with the per-stage capture flag
+    # on. Done after timing so the clone() inside the wrapper does not
+    # pollute the timed-loop measurement.
+    out1_ck = None
+    if _STAGE_EVENT_PATCHED:
+        _STAGE_OUTPUT_CAPTURE["stage1"] = None
+        _STAGE_OUTPUT_CAPTURE["stage2"] = None
+        _STAGE_OUTPUT_CAPTURE["enabled"] = True
+        try:
+            out2_ck = _run_fused_moe()
+            torch.cuda.synchronize()
+        finally:
+            _STAGE_OUTPUT_CAPTURE["enabled"] = False
+        out1_ck = _STAGE_OUTPUT_CAPTURE["stage1"]
+
     # gfx1250 FlyDSL paths inherently have block-quant noise (mxfp8/mxfp4)
     # that compounds over K-sums.  FlyDSL UT
     # (test_moe_gemm_mxscale_gfx1250.py:542 + test_common.verify_output)
@@ -802,9 +826,30 @@ def test_fmoe(
         return 1 - sim
 
     logits_diff = calc_diff(out2_ref, out2_ck)
-    aiter.logger.info(
-        f"[moe_2stage] logits_diff={logits_diff:.6f} mismatch_ratio={err:.4f}"
-    )
+    # Per-stage breakdown:
+    #   stage1 = kernel post-activation a2 vs torch_moe_stage1 ref
+    #   stage2 = end-to-end kernel out vs torch_moe_stage2 ref (== logits_diff)
+    if out1_ck is not None:
+        try:
+            logits_diff_s1 = calc_diff(
+                out1_ref.to(out1_ck.dtype).reshape(out1_ck.shape),
+                out1_ck,
+            )
+            aiter.logger.info(
+                f"[moe_2stage] logits_diff stage1={logits_diff_s1:.6f} "
+                f"stage2(e2e)={logits_diff:.6f} mismatch_ratio={err:.4f}"
+            )
+        except Exception as _e:  # shape mismatch etc — fall back to total only
+            aiter.logger.warning(
+                f"[moe_2stage] stage1 logits_diff skipped: {_e}"
+            )
+            aiter.logger.info(
+                f"[moe_2stage] logits_diff={logits_diff:.6f} mismatch_ratio={err:.4f}"
+            )
+    else:
+        aiter.logger.info(
+            f"[moe_2stage] logits_diff={logits_diff:.6f} mismatch_ratio={err:.4f}"
+        )
 
     # ---- accuracy verdict --------------------------------------------------
     # FlyDSL paths use UT-style "mismatch_ratio < 5% OR logits_diff <
@@ -1053,6 +1098,15 @@ parser.add_argument(
     default=None,
     help="gfx1250 stage2 FlyDSL ``tile_k``. None -> 128 (mxscale).",
 )
+parser.add_argument(
+    "--num-buffers",
+    type=int,
+    default=None,
+    help="""gfx1250 FlyDSL pipeline depth (num_buffers). None -> 1
+(single-buffer, no pipelining). 2+ enables K-loop pipelining with
+non-zero s_wait_tensorcnt fences. Exported as
+AITER_GFX1250_NUM_BUFFERS.""",
+)
 
 args = parser.parse_args()
 
@@ -1076,6 +1130,7 @@ _maybe_set_env("AITER_GFX1250_STAGE1_TILE_K", args.stage1_tile_k)
 _maybe_set_env("AITER_GFX1250_BLOCK_M",       args.block_m)
 _maybe_set_env("AITER_GFX1250_STAGE2_TILE_N", args.stage2_tile_n)
 _maybe_set_env("AITER_GFX1250_STAGE2_TILE_K", args.stage2_tile_k)
+_maybe_set_env("AITER_GFX1250_NUM_BUFFERS",   args.num_buffers)
 
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant

@@ -1042,6 +1042,7 @@ def _gfx1250_moe_stage1(
 
     _expert_sched = int(os.environ.get("AITER_GFX1250_EXPERT_SCHED", "1")) != 0
     _tdm_gather = int(os.environ.get("AITER_GFX1250_TDM_GATHER", "1")) != 0
+    _num_buffers = int(os.environ.get("AITER_GFX1250_NUM_BUFFERS", "1"))
     exe = compile_moe_gemm1(
         model_dim=model_dim_padded,
         inter_dim=inter_dim,
@@ -1058,6 +1059,7 @@ def _gfx1250_moe_stage1(
         expert_sched_mode=_expert_sched,
         use_tdm_gather=_tdm_gather,
         use_tdm_gather_as=_tdm_gather,
+        num_buffers=_num_buffers,
     )
 
     args = (
@@ -1215,6 +1217,7 @@ def _gfx1250_moe_stage2(
 
     _expert_sched_s2 = int(os.environ.get("AITER_GFX1250_EXPERT_SCHED", "1")) != 0
     _tdm_gather_s2 = int(os.environ.get("AITER_GFX1250_TDM_GATHER", "1")) != 0
+    _num_buffers_s2 = int(os.environ.get("AITER_GFX1250_NUM_BUFFERS", "1"))
     _stage2_skip = int(os.environ.get("AITER_GFX1250_STAGE2_SKIP", "0")) != 0
     if _stage2_skip:
         # Diagnostic: skip the actual stage2 GEMM and return the zero-initialised
@@ -1238,6 +1241,7 @@ def _gfx1250_moe_stage2(
         expert_sched_mode=_expert_sched_s2,
         use_tdm_gather=_tdm_gather_s2,
         use_tdm_gather_as=_tdm_gather_s2,
+        num_buffers=_num_buffers_s2,
     )
 
     args = (

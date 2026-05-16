@@ -12,6 +12,7 @@ instructions for microscaling block formats with E8M0 scales.
 from __future__ import annotations
 
 import functools
+import os
 
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
@@ -212,6 +213,8 @@ def _compile_stage1_mxscale_kernel_impl(
         and _as_row_bytes_ok
     )
 
+    _const_one_act = os.environ.get("AITER_GFX1250_CONST_ONE", "0") in ("1", "true", "True")
+
     # Pipeline calculations for multi-buffer
     _use_pipeline = int(num_buffers) >= 2
     if _use_pipeline:
@@ -225,7 +228,7 @@ def _compile_stage1_mxscale_kernel_impl(
         _pp = _compute_pipeline_plan(
             num_k_tiles=num_k_tiles_per_bz, num_buffers=int(num_buffers),
             B_TDM_PER_STEP=_B_TDM_PER_STEP, tile_m=int(tile_m),
-            use_tdm_gather=use_tdm_gather,
+            use_tdm_gather=False if _const_one_act else use_tdm_gather,
             use_tdm_gather_as=_use_tdm_gather_as,
             wave_specialized_tdm=wave_specialized_tdm,
             tdm_loader_waves=_tdm_loader_waves,
@@ -478,7 +481,7 @@ def _compile_stage1_mxscale_kernel_impl(
             return k_base / arith.index(PACK_FACTOR_A)
 
         # TDM gather for A data
-        _use_tdm_gather_a = bool(use_tdm_gather)
+        _use_tdm_gather_a = bool(use_tdm_gather) and not _const_one_act
 
         def issue_a_load(k_packed_base, target_lds):
             total = int(tile_m * packed_tile_k_a)
@@ -490,16 +493,16 @@ def _compile_stage1_mxscale_kernel_impl(
                 with ir.InsertionPoint(_if_elem.then_block):
                     row = elem // arith.index(int(packed_tile_k_a))
                     col = elem % arith.index(int(packed_tile_k_a))
-                    # Use preloaded lds_tid instead of per-thread buffer_load(sorted_rsrc, ...).
-                    # Invalid rows were pre-filled with sentinel 0xFFFFFFFF at preload, so
-                    # tok=0xFFFFFF will make tok_ok=false for them.
-                    fused = _load_fused_from_lds(row)
-                    tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
-                    tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
-                    load_ok = tok_ok
-                    x_idx = tok * arith.constant(K_packed_a, type=T.i32) + arith.index_cast(T.i32, k_packed_base + col)
-                    x_idx_safe = arith.select(load_ok, x_idx, arith.constant(0, type=T.i32))
-                    x_val = arith.select(load_ok, buffer_ops.buffer_load(x_rsrc, x_idx_safe, vec_width=1, dtype=T.i8), arith.constant(0, type=T.i8))
+                    if const_expr(_const_one_act):
+                        x_val = arith.constant(1, type=T.i8)
+                    else:
+                        fused = _load_fused_from_lds(row)
+                        tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
+                        tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
+                        load_ok = tok_ok
+                        x_idx = tok * arith.constant(K_packed_a, type=T.i32) + arith.index_cast(T.i32, k_packed_base + col)
+                        x_idx_safe = arith.select(load_ok, x_idx, arith.constant(0, type=T.i32))
+                        x_val = arith.select(load_ok, buffer_ops.buffer_load(x_rsrc, x_idx_safe, vec_width=1, dtype=T.i8), arith.constant(0, type=T.i8))
                     lds_idx = row * arith.index(lds_a_stride_bytes) + col
                     v1 = vector.from_elements(T.vec(1, T.i8), [x_val])
                     vector.store(v1, target_lds, [lds_idx], alignment=1)
@@ -1147,7 +1150,7 @@ def _compile_stage1_mxscale_kernel_impl(
         _if_blk = scf.IfOp(block_ok)
         with ir.InsertionPoint(_if_blk.then_block):
             _preload_sorted_ids_to_lds()
-            if const_expr(_use_tdm_gather_a or bool(use_tdm_store)):
+            if const_expr(_use_tdm_gather_a or _use_tdm_gather_as or bool(use_tdm_store)):
                 _precompute_a_row_indices()
             a_data_bases = _precompute_a_data_bases()
             b_data_bases = _precompute_b_data_bases()
@@ -2389,6 +2392,8 @@ def _compile_stage2_mxscale_kernel_impl(
         and _as_row_bytes_ok
     )
 
+    _const_one_act = os.environ.get("AITER_GFX1250_CONST_ONE", "0") in ("1", "true", "True")
+
     _use_pipeline = int(num_buffers) >= 2
     if _use_pipeline:
         from kernels.gemm_common_gfx1250 import (
@@ -2398,7 +2403,7 @@ def _compile_stage2_mxscale_kernel_impl(
         _pp = _compute_pipeline_plan(
             num_k_tiles=num_k_tiles, num_buffers=int(num_buffers),
             B_TDM_PER_STEP=_B_TDM_PER_STEP, tile_m=int(tile_m),
-            use_tdm_gather=use_tdm_gather,
+            use_tdm_gather=False if _const_one_act else use_tdm_gather,
             use_tdm_gather_as=_use_tdm_gather_as,
             wave_specialized_tdm=wave_specialized_tdm,
             tdm_loader_waves=_tdm_loader_waves,
@@ -2634,7 +2639,7 @@ def _compile_stage2_mxscale_kernel_impl(
                 for_store=True,
             )
 
-        _use_tdm_gather_a = bool(use_tdm_gather)
+        _use_tdm_gather_a = bool(use_tdm_gather) and not _const_one_act
         _a_row_ids = []
         _a_row_valids = []
         _TDM_GATHER_CHUNK = 8
@@ -2728,19 +2733,21 @@ def _compile_stage2_mxscale_kernel_impl(
                 with ir.InsertionPoint(_if_elem.then_block):
                     row = elem // arith.index(int(packed_tile_k_a))
                     col = elem % arith.index(int(packed_tile_k_a))
-                    # Use preloaded lds_tid instead of per-thread buffer_load(sorted_rsrc, ...).
-                    fused = _load_fused_from_lds(row)
-                    tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
-                    slot = fused >> arith.constant(24, type=T.i32)
-                    tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
-                    slot_ok0 = arith.cmpi(arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32))
-                    slot_ok1 = arith.cmpi(arith.CmpIPredicate.slt, slot, c_topk_i32)
-                    ts = tok * c_topk_i32 + slot
-                    ts_ok = arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
-                    load_ok = ts_ok
-                    x_idx = ts * arith.constant(K_packed_a, type=T.i32) + arith.index_cast(T.i32, k_packed_base + col)
-                    x_idx_safe = arith.select(load_ok, x_idx, arith.constant(0, type=T.i32))
-                    x_val = arith.select(load_ok, buffer_ops.buffer_load(x_rsrc, x_idx_safe, vec_width=1, dtype=T.i8), arith.constant(0, type=T.i8))
+                    if const_expr(_const_one_act):
+                        x_val = arith.constant(1, type=T.i8)
+                    else:
+                        fused = _load_fused_from_lds(row)
+                        tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
+                        slot = fused >> arith.constant(24, type=T.i32)
+                        tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
+                        slot_ok0 = arith.cmpi(arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32))
+                        slot_ok1 = arith.cmpi(arith.CmpIPredicate.slt, slot, c_topk_i32)
+                        ts = tok * c_topk_i32 + slot
+                        ts_ok = arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
+                        load_ok = ts_ok
+                        x_idx = ts * arith.constant(K_packed_a, type=T.i32) + arith.index_cast(T.i32, k_packed_base + col)
+                        x_idx_safe = arith.select(load_ok, x_idx, arith.constant(0, type=T.i32))
+                        x_val = arith.select(load_ok, buffer_ops.buffer_load(x_rsrc, x_idx_safe, vec_width=1, dtype=T.i8), arith.constant(0, type=T.i8))
                     lds_idx = row * arith.index(lds_a_stride_bytes) + col
                     v1 = vector.from_elements(T.vec(1, T.i8), [x_val])
                     vector.store(v1, target_lds, [lds_idx], alignment=1)
@@ -3185,7 +3192,7 @@ def _compile_stage2_mxscale_kernel_impl(
         _if_blk = scf.IfOp(block_ok)
         with ir.InsertionPoint(_if_blk.then_block):
             _preload_sorted_ids_to_lds()
-            if const_expr(_use_tdm_gather_a):
+            if const_expr(_use_tdm_gather_a or _use_tdm_gather_as):
                 _precompute_a_row_indices()
             a_data_bases = _precompute_a_data_bases()
             b_data_bases = _precompute_b_data_bases()

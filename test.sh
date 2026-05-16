@@ -1,21 +1,20 @@
-source $GFX1250_MODEL_PATH/ffmlite_env.sh
+#!/bin/bash
+# DeepSeek V3 TP1 stage1+stage2 perftest (gfx1250, real HW — no FFM)
+
 export AITER_LOG_MORE=1
-export USE_FFM=1
-# - /workspace/ffm/triton/python:  triton isn't pip-installed in the venv;
-#   without it, aiter/ops/quant.py's `import triton` fails -> aiter silently
-#   disables HIP ops -> `from aiter import get_hip_quant` ImportError.
-# - /workspace/ffm/FlyDSL:         test_moe_2stage._gfx1250_fp8_round_trip_bf16
-#   imports tests.kernels.utils.fp4_utils from the FlyDSL repo.
-export PYTHONPATH=/workspace/ffm/triton/python:/workspace/ffm/FlyDSL:${PYTHONPATH}
-# Note: topk (-k) must be <= number of experts (-e), otherwise topk_softmax errors.
-ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=0 python op_tests/test_moe_2stage.py -t 1 -dim 256,256 -e 1 -k 1 -q 4 --no-flydsl-csv -hip 0,0
+export AITER_GFX1250_TDM_GATHER=1
+# export AITER_GFX1250_CONST_ONE=1
+# Dump compiled kernel assembly + IR to $FLYDSL_DUMP_DIR (default ~/.flydsl/debug).
+export FLYDSL_DEBUG_DUMP_ASM=1
+export FLYDSL_DUMP_IR=1
+export FLYDSL_DUMP_DIR=/app/aiter/.flydsl_dump
 
-# Explicitly pass the historical hardcoded gfx1250 FlyDSL tile config
-# (-tn / -tk / -bm = stage1; --stage2-tile-n / --stage2-tile-k = stage2)
-# so subsequent sweeps can tweak any of them without falling back to
+# Explicit gfx1250 FlyDSL tile config:
+#   stage1: -tn / -tk / -bm
+#   stage2: --stage2-tile-n / --stage2-tile-k
+# Pass them explicitly so sweeps can tweak any without falling back to
 # the silent default in aiter/fused_moe.py::get_2stage_cfgs.
-AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
+ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
   -t 64 -dim 7168,2048 -e 256 -k 8 -q 4 --no-flydsl-csv -hip 0,0 \
-  -tn 128 -tk 512 -bm 16 --stage2-tile-n 128 --stage2-tile-k 128
-
-# ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=0 python op_tests/test_moe_2stage.py -t 1 -dim 256,1024 -e 8 -k 2 -q 4 --no-flydsl-csv -hip 0,0
+  -tn 128 -tk 512 -bm 16 --stage2-tile-n 128 --stage2-tile-k 128 \
+  --num-buffers ${NUM_BUFFERS:-1}
