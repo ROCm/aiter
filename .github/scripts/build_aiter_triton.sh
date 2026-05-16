@@ -50,7 +50,7 @@ retry_cmd 3 pip install --upgrade \
     psutil \
     "ninja>=1.11.1" \
     pandas \
-    "flydsl==0.1.8.dev574"
+    "flydsl==0.1.8"
 pip install tabulate
 retry_cmd 3 pip install --no-build-isolation -e .
 ./.github/scripts/install_triton.sh
