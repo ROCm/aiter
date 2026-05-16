@@ -111,11 +111,29 @@ def build(verbose=False, jobs=None):
     if verbose:
         print(f"[setup] arch={arch}, jobs={jobs}")
 
+    # Per-arch skip list: kernels that use builtins not available on the
+    # target arch. Skipped at .so build time so the rest of the suite
+    # still links; the Python harness sees the missing extern "C" launcher
+    # and reports SKIP for those tests.
+    #
+    # gfx1201 / gfx1200 (Navi 44/48, RDNA4): opus _async_load uses
+    # __builtin_amdgcn_raw_ptr_buffer_load_lds which needs the
+    # `vmem-to-lds-load-insts` target feature (gfx9x / gfx950 / gfx1250 only).
+    _ARCH_SKIP_SOURCES = {
+        "gfx1200": {"test_async_load.cu", "test_load_store_if.cu"},
+        "gfx1201": {"test_async_load.cu", "test_load_store_if.cu"},
+    }
+    skip = _ARCH_SKIP_SOURCES.get(arch, set())
+    sources = [s for s in _CU_SOURCES if s not in skip]
+    if verbose and skip:
+        for s in sorted(skip):
+            print(f"[setup]   skip {s} (incompatible with arch={arch})")
+
     t0 = time.monotonic()
 
     # Parallel compile: each .cu -> .o
     tasks = []
-    for s in _CU_SOURCES:
+    for s in sources:
         src = os.path.join(_THIS_DIR, s)
         obj = os.path.join(_THIS_DIR, s.replace(".cu", ".o"))
         tasks.append((src, obj, hipcc, arch, verbose))

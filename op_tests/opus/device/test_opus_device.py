@@ -319,6 +319,15 @@ def _get_gpu_arch():
     return getattr(props, "gcnArchName", "").split(":")[0]
 
 
+def _skip_if_missing_symbol(mod, sym, label):
+    """Print SKIP + return True if the .so wasn't built with `sym` (setup.py
+    skips arch-incompatible sources per _ARCH_SKIP_SOURCES)."""
+    if not hasattr(mod._lib, sym):
+        print(f"  SKIP: {label} ({sym} not built for arch={_get_gpu_arch()})")
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Individual test functions
 # ---------------------------------------------------------------------------
@@ -1398,6 +1407,8 @@ def test_wmma_gfx1201_f32_bf8_bf8(mod):
 
 def test_async_load(mod):
     """Test async_load: copy data through LDS and verify integrity."""
+    if _skip_if_missing_symbol(mod, "run_async_load", "async_load"):
+        return 0
     # n should be a multiple of BLOCK_SIZE (256)
     n = 1048576  # 1M elements
     device = torch.device("cuda")
@@ -1900,6 +1911,8 @@ def test_dtype_convert_fp32_fp4_x4(mod):
 
 def test_predicated_copy(mod):
     """Test gmem load_if/store_if via free function wrappers (boundary predicate)."""
+    if _skip_if_missing_symbol(mod, "run_predicated_copy", "predicated_copy"):
+        return 0
     # Use n not aligned to block*4 to create a partial boundary condition
     n = 1001
     BLOCK_SIZE = 256
@@ -1946,6 +1959,8 @@ def test_predicated_copy_2d(mod):
     Uses a 2D layout with row/col boundary checking — the predicate receives (i_row, i_col)
     and uses them to check bounds, which would fail if given a single flat index.
     """
+    if _skip_if_missing_symbol(mod, "run_predicated_copy_2d", "predicated_copy_2d"):
+        return 0
     ROWS = 4  # issue space rows per workgroup
     COLS = 4  # issue space cols per thread
     BLOCK_SIZE = 256  # threads per block
@@ -1986,6 +2001,8 @@ def test_predicated_copy_2d(mod):
 
 def test_free_func_vector_add(mod):
     """Test opus::load / opus::store free function wrappers (vector add)."""
+    if _skip_if_missing_symbol(mod, "run_free_func_add", "free_func_vector_add"):
+        return 0
     n = 1310720  # same as regular vector_add test
     device = torch.device("cuda")
     dtype = torch.float32
@@ -2015,6 +2032,10 @@ def test_free_func_vector_add(mod):
 
 def test_predicated_async_load(mod):
     """Test gmem async_load_if via free function wrapper (boundary predicate)."""
+    if _skip_if_missing_symbol(
+        mod, "run_predicated_async_load", "predicated_async_load"
+    ):
+        return 0
     n = 1001
     BLOCK_SIZE = 256
     n_padded = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE  # 1024
