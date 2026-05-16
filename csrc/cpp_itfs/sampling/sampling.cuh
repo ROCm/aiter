@@ -1341,7 +1341,7 @@ static void topk_renorm_from_probs(
 {
     int max_k = top_k_val;
     if (max_k <= 0) max_k = 50;
-    if (max_k >= vocab_size) max_k = vocab_size - 1;
+    if (max_k > vocab_size) max_k = vocab_size;
 
     size_t radix_buf_size = 0;
     radix_topk::standalone_stable_radix_10bits<float, int, false>(
