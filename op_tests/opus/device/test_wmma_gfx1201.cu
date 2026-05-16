@@ -47,7 +47,7 @@
 #ifdef __HIP_DEVICE_COMPILE__
 // ── Device pass ─────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
-#if defined(__gfx1201__)
+#if defined(__gfx1201__) || defined(__gfx1200__)
 
 // Generic 1-wave, 1-tile WMMA driver. Each lane loads its column-distributed
 // A and B fragment from global memory, calls opus::wmma<>::operator(), and
@@ -103,7 +103,7 @@ template __global__ void wmma_gfx12_kernel<opus::fp8_t , opus::bf8_t , opus::fp3
 template __global__ void wmma_gfx12_kernel<opus::bf8_t , opus::fp8_t , opus::fp32_t>(const opus::bf8_t* , const opus::fp8_t* , opus::fp32_t*, int, int, int);
 template __global__ void wmma_gfx12_kernel<opus::bf8_t , opus::bf8_t , opus::fp32_t>(const opus::bf8_t* , const opus::bf8_t* , opus::fp32_t*, int, int, int);
 
-#endif // __gfx1201__
+#endif // __gfx1201__ / __gfx1200__
 
 #else
 // ── Host pass: empty kernel stubs + extern "C" launchers ────────────────────

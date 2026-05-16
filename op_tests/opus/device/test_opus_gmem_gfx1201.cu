@@ -30,15 +30,16 @@
  *     ... opus::cast<float>(v[j]) ...
  *     g.store<VEC>(vr, i);        // buffer_store via cached rsrc
  *
- * Kernel body is gated by __gfx1201__ so other archs see an empty no-op
- * pass — gfx1250 / gfx9x behavior is unchanged.
+ * Kernel body is gated by __gfx1201__ / __gfx1200__ (same RDNA4 family,
+ * same ISA for buffer_load/store) so other archs see an empty no-op pass
+ * — gfx1250 / gfx9x behavior is unchanged.
  */
 
 #ifdef __HIP_DEVICE_COMPILE__
 // ── Device pass: opus.hpp + kernel body, no hip_runtime.h ──────────────────
 #include "opus/opus.hpp"
 
-#if defined(__gfx1201__)
+#if defined(__gfx1201__) || defined(__gfx1200__)
 // Element-wise add via opus make_gmem load / store + per-lane opus::cast.
 // Mirrors the load → cast<float> → store pattern in sample_kernels.cu.
 template<int BLOCK_SIZE, int VECTOR_SIZE>
@@ -71,7 +72,7 @@ __global__ void opus_gmem_gfx1201_kernel(
 }
 
 template __global__ void opus_gmem_gfx1201_kernel<256, 4>(const float*, const float*, float*, int);
-#endif // __gfx1201__
+#endif // __gfx1201__ / __gfx1200__
 
 #else
 // ── Host pass: launcher + empty kernel stub ────────────────────────────────

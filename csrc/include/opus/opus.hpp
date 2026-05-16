@@ -2308,8 +2308,8 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
 #endif // __GFX9__ (mfma)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// wmma (RDNA4 / wave32) — gfx1250 uses wmma-256b builtins (16x16x{4,32,64,128}); gfx1201 (Navi 48) uses wmma-128b _w32_gfx12 builtins (16x16x16). Dispatch macros for the two arg-list shapes differ — gfx12 set is DISPATCH_WMMA_GFX12_*.
-#if defined(__gfx1250__) || defined(__gfx1201__) || !defined(__HIP_DEVICE_COMPILE__)
+// wmma (RDNA4 / wave32) — gfx1250 uses wmma-256b builtins (16x16x{4,32,64,128}); gfx1200/gfx1201 (Navi 44/48) use wmma-128b _w32_gfx12 builtins (16x16x16). Dispatch macros for the two arg-list shapes differ — gfx12 set is DISPATCH_WMMA_GFX12_*.
+#if defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
 // f16/bf16/f32 builtins: (neg_a, A, neg_b, B, matrix_fmts, C, clamp, neg_c)
 #define DISPATCH_WMMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
@@ -2405,7 +2405,7 @@ struct wmma {
         else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, fp8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_bf8_fp8)
         else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, bf8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_bf8_bf8)
 #endif
-#if defined(__gfx1201__)
+#if defined(__gfx1201__) || defined(__gfx1200__)
         // gfx12 wave32 16x16x16: f16/bf16/fp8/bf8 → f32 + same-type (f16/bf16) acc. iu8/iu4 deferred (no iu*_t aliases yet).
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp32_t , 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, fp32_t , 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
@@ -2415,7 +2415,7 @@ struct wmma {
         else if constexpr DISPATCH_WMMA_GFX12_8BIT_(fp8_t , bf8_t , fp32_t , 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_fp8_bf8_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t , fp8_t , fp32_t , 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf8_fp8_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t , bf8_t , fp32_t , 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12)
-#endif // __gfx1201__
+#endif // __gfx1201__ / __gfx1200__
         __builtin_unreachable();
     }
 
@@ -2553,7 +2553,7 @@ using wmma_scale_f32_16x16x128_fp8_fp8 = wmma<fp8_t, fp8_t, fp32_t, 16, 16, 128>
 using wmma_scale_f32_16x16x128_fp4_fp4 = wmma<fp4_t, fp4_t, fp32_t, 16, 16, 128>;
 // Scaled WMMA (dedicated fp4 32x16x128 instruction)
 using wmma_scale_f32_32x16x128_fp4_fp4 = wmma<fp4_t, fp4_t, fp32_t, 32, 16, 128>;
-#endif // __gfx1250__ / __gfx1201__ (wmma)
+#endif // __gfx1250__ / __gfx1201__ / __gfx1200__ (wmma)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // adaptor

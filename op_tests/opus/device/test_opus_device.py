@@ -1220,11 +1220,11 @@ def test_vector_add(mod):
     return 0
 
 
-# Archs where the opus.hpp parse-time fix matters. The kernel body in
-# test_opus_gmem_gfx1201.cu is gated by __gfx1201__ — on other archs the
-# launcher runs an empty kernel, so we skip the correctness check to avoid
-# a misleading failure.
-_OPUS_PARSE_GFX1201_ARCHS = {"gfx1201"}
+# Archs where the opus.hpp gfx12 (Navi 44/48 RDNA4) path is active. The kernel
+# body in test_opus_gmem_gfx1201.cu is gated by __gfx1201__ / __gfx1200__ —
+# on other archs the launcher runs an empty kernel, so we skip the correctness
+# check to avoid a misleading failure.
+_OPUS_PARSE_GFX1201_ARCHS = {"gfx1201", "gfx1200"}
 
 
 def test_opus_gmem_gfx1201(mod):
@@ -1263,10 +1263,11 @@ def test_opus_gmem_gfx1201(mod):
     return 0
 
 
-# WMMA tests for gfx1201 (Navi 48). Kernel bodies in test_wmma_gfx1201.cu are
-# gated by __gfx1201__ — on other archs the launcher runs an empty kernel
-# so we skip the correctness check.
-_WMMA_GFX1201_ARCHS = {"gfx1201"}
+# WMMA tests for gfx1200/gfx1201 (Navi 44/48, RDNA4). Both archs share the
+# same gfx12 wmma-128b ISA so the kernel bodies in test_wmma_gfx1201.cu are
+# gated by __gfx1201__ / __gfx1200__ — on other archs the launcher runs an
+# empty kernel so we skip the correctness check.
+_WMMA_GFX1201_ARCHS = {"gfx1201", "gfx1200"}
 
 
 def _wmma_gfx1201_tolerances(out_dtype):
