@@ -8,7 +8,12 @@ import logging
 import torch
 import pytest
 
-from aiter.ops.triton.quant.mxfp8_quant import downcast_to_mxfp8, upcast_from_mxfp8
+from aiter.ops.triton.quant.mxfp8_quant import (
+    downcast_to_mxfp8,
+    upcast_from_mxfp8,
+    downcast_to_mxfp8_2d,
+    upcast_from_mxfp8_2d,
+)
 from aiter.ops.flydsl.kernels.attn_bwd_mxfp8_gfx950 import compile_attn_bwd_mxfp8_gfx950
 from flydsl.runtime.device import get_rocm_arch
 
@@ -43,28 +48,31 @@ def mx_quant(x, dim=-1):
     return x_fp32.contiguous(), x_fp8.contiguous(), x_scale.contiguous()
 
 
+def mx_quant_2d(x):
+    x_fp8, x_scale = downcast_to_mxfp8_2d(x, torch.float8_e4m3fn)
+    x_fp32 = upcast_from_mxfp8_2d(x_fp8, x_scale, torch.float32)
+    return x_fp32.contiguous(), x_fp8.contiguous(), x_scale.contiguous()
+
+
 def run_torch(
-    q_fp32_head,
-    q_fp32_m,
-    k_fp32_head,
-    k_fp32_n,
+    q_fp32,
+    k_fp32,
     v,
-    do_fp32_head,
-    do_fp32_m,
+    do_fp32,
     m,
     D,
     sm_scale,
     causal,
     gqa_size,
 ):
-    batch = q_fp32_head.shape[0]
-    num_heads_q = q_fp32_head.shape[1]
+    batch = q_fp32.shape[0]
+    num_heads_q = q_fp32.shape[1]
     num_heads_kv = num_heads_q // gqa_size
-    seqlen = q_fp32_head.shape[2]
-    head_dim = q_fp32_head.shape[3]
-    device = q_fp32_head.device
+    seqlen = q_fp32.shape[2]
+    head_dim = q_fp32.shape[3]
+    device = q_fp32.device
     v_f32 = v.to(torch.float32)
-    qk = torch.matmul(q_fp32_head, k_fp32_head.transpose(-2, -1)) * sm_scale
+    qk = torch.matmul(q_fp32, k_fp32.transpose(-2, -1)) * sm_scale
     p = torch.exp(qk - m[:, :, :, None])
     if causal:
         mask = torch.tril(torch.ones((seqlen, seqlen), device=device))
@@ -72,14 +80,14 @@ def run_torch(
 
     ppT, _, _ = mx_quant(p, -2)
     ppT = ppT.transpose(-2, -1)
-    dv = torch.matmul(ppT, do_fp32_m)
-    dp = torch.matmul(do_fp32_head, v_f32.transpose(-2, -1))
+    dv = torch.matmul(ppT, do_fp32)
+    dp = torch.matmul(do_fp32, v_f32.transpose(-2, -1))
     ds = p * (dp - D[:, :, :, None])
     dsT, _, _ = mx_quant(ds, -1)
     dsT = dsT.transpose(-2, -1)
     ds, _, _ = mx_quant(ds, -2)
-    dk = torch.matmul(dsT, q_fp32_m) * sm_scale
-    dq = torch.matmul(ds, k_fp32_n) * sm_scale
+    dk = torch.matmul(dsT, q_fp32) * sm_scale
+    dq = torch.matmul(ds, k_fp32) * sm_scale
 
     dk = dk.view(batch, num_heads_kv, gqa_size, seqlen, head_dim).sum(dim=2)
     dv = dv.view(batch, num_heads_kv, gqa_size, seqlen, head_dim).sum(dim=2)
@@ -156,37 +164,29 @@ def test_attn_bwd_flyc(
         * 0.5
     )
 
-    q_fp32_head, q_quant_head, q_scale_head = mx_quant(q_fp32, -1)
-    q_fp32_m, q_quant_m, q_scale_m = mx_quant(q_fp32, -2)
-    k_fp32_head, k_quant_head, k_scale_head = mx_quant(k_fp32, -1)
-    k_fp32_n, k_quant_n, k_scale_n = mx_quant(k_fp32, -2)
+    q_fp32, q_quant, q_scale = mx_quant_2d(q_fp32)
+    k_fp32, k_quant, k_scale = mx_quant_2d(k_fp32)
     v_fp32, v_quant, v_scale = mx_quant(v_fp32)
-    do_fp32_head, do_quant_head, do_scale_head = mx_quant(do_fp32, -1)
-    do_fp32_m, do_quant_m, do_scale_m = mx_quant(do_fp32, -2)
+    do_fp32, do_quant, do_scale = mx_quant_2d(do_fp32)
 
     k_fp32 = k_fp32.repeat_interleave(gqa_size, dim=1)
-    k_fp32_head = k_fp32_head.repeat_interleave(gqa_size, dim=1)
-    k_fp32_n = k_fp32_n.repeat_interleave(gqa_size, dim=1)
     v_fp32 = v_fp32.repeat_interleave(gqa_size, dim=1)
 
     qk = q_fp32 @ k_fp32.transpose(-2, -1)
     qk = qk * sm_scale
     m = qk.max(dim=-1)[0]
     p = (qk - m[:, :, :, None]).exp()
-    l = p.sum(dim=-1)
-    p = p / l[:, :, :, None]
+    L = p.sum(dim=-1)
+    p = p / L[:, :, :, None]
     o_fp32 = torch.matmul(p, v_fp32)
-    m = m + torch.log(l)
+    m = m + torch.log(L)
     D = (o_fp32 * do_fp32).sum(dim=-1)
 
     dq_ref, dk_ref, dv_ref = run_torch(
-        q_fp32_head,
-        q_fp32_m,
-        k_fp32_head,
-        k_fp32_n,
+        q_fp32,
+        k_fp32,
         v_fp32,
-        do_fp32_head,
-        do_fp32_m,
+        do_fp32,
         m,
         D,
         sm_scale,
@@ -208,20 +208,14 @@ def test_attn_bwd_flyc(
         dq,
         dk,
         dv,
-        q_quant_head,
-        q_scale_head,
-        q_quant_m,
-        q_scale_m,
-        k_quant_head,
-        k_scale_head,
-        k_quant_n,
-        k_scale_n,
+        q,
+        q_scale,
+        k,
+        k_scale,
         v,
         v_scale,
-        do_quant_head,
-        do_scale_head,
-        do_quant_m,
-        do_scale_m,
+        do,
+        do_scale,
         m,
         D,
         batch,
@@ -230,31 +224,30 @@ def test_attn_bwd_flyc(
             dq.contiguous().view(-1),
             dk.contiguous().view(-1),
             dv.contiguous().view(-1),
-            q_quant_head.contiguous().view(-1),
-            q_scale_head.contiguous().view(-1),
-            q_quant_m.contiguous().view(-1),
-            q_scale_m.contiguous().view(-1),
-            k_quant_head.contiguous().view(-1),
-            k_scale_head.contiguous().view(-1),
-            k_quant_n.contiguous().view(-1),
-            k_scale_n.contiguous().view(-1),
+            q.contiguous().view(-1),
+            q_scale.contiguous().view(-1),
+            k.contiguous().view(-1),
+            k_scale.contiguous().view(-1),
             v.contiguous().view(-1),
             v_scale.contiguous().view(-1),
-            do_quant_head.contiguous().view(-1),
-            do_scale_head.contiguous().view(-1),
-            do_quant_m.contiguous().view(-1),
-            do_scale_m.contiguous().view(-1),
+            do.contiguous().view(-1),
+            do_scale.contiguous().view(-1),
             m.contiguous().view(-1),
             D.contiguous().view(-1),
             batch,
-            q_quant_head.stride(0),
-            q_scale_head.stride(0),
-            k_quant_head.stride(0),
-            k_scale_head.stride(0),
+            q.stride(0),
+            k.stride(0),
             m.stride(0),
-            q_quant_head.stride(1),
-            q_scale_head.stride(1),
+            q.stride(1),
             m.stride(1),
+            q_scale.stride(0),
+            q_scale.stride(1),
+            k_scale.stride(0),
+            k_scale.stride(1),
+            v_scale.stride(0),
+            v_scale.stride(1),
+            do_scale.stride(0),
+            do_scale.stride(1),
             torch.cuda.current_stream(),
         )
 
@@ -262,20 +255,14 @@ def test_attn_bwd_flyc(
         dq_fly,
         dk_fly,
         dv_fly,
-        q_quant_head,
-        q_scale_head,
-        q_quant_m,
-        q_scale_m,
-        k_quant_head,
-        k_scale_head,
-        k_quant_n,
-        k_scale_n,
+        q_quant,
+        q_scale,
+        k_quant,
+        k_scale,
         v_quant,
         v_scale,
-        do_quant_head,
-        do_scale_head,
-        do_quant_m,
-        do_scale_m,
+        do_quant,
+        do_scale,
         m,
         D,
         batch,

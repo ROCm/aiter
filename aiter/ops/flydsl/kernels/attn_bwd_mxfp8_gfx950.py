@@ -87,18 +87,7 @@ def compile_attn_bwd_mxfp8_gfx950(
 
     allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem0")
     allocator_ping = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem1")
-    allocator_k_quant_head = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="smem_k_quant_head"
-    )
-    allocator_k_scale_head = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="smem_k_scale_head"
-    )
-    allocator_k_quant_n = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="smem_k_quant_n"
-    )
-    allocator_k_scale_n = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="smem_k_scale_n"
-    )
+    allocator_k = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem_k")
     allocator_v = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem_v")
     allocator_v_scale = SmemAllocator(
         None, arch=gpu_arch, global_sym_name="smem_v_scale"
@@ -147,10 +136,7 @@ def compile_attn_bwd_mxfp8_gfx950(
 
     # ── LDS sizing (pure Python, no MLIR ops) ────────────────────────────────
     lds_qo_tile_bytes = int(tile_m) * int(tile_head)
-    lds_qo_scale_tile_bytes = (int(tile_m) * int(tile_head)) // 32
     lds_k_tile_bytes = int(tile_n) * int(tile_head)
-    lds_k_scale_head_tile_bytes = int(tile_n) * int(tile_head_mx)
-    lds_k_scale_n_tile_bytes = int(tile_n_mx) * int(tile_head)
     lds_v_tile_bytes = int(tile_n) * int(tile_head)
     lds_v_scale_tile_bytes = int(tile_n) * int(tile_head_mx)
     lds_ppt_tile_bytes = int(tile_n) * int(tile_m)
@@ -160,45 +146,20 @@ def compile_attn_bwd_mxfp8_gfx950(
     lds_ds_tile_bytes = int(tile_m) * int(tile_n)
     lds_ds_scale_tile_bytes = int(tile_m) * int(tile_n_mx)
 
-    buffer_size_bytes = lds_qo_tile_bytes * 4 + lds_qo_scale_tile_bytes * 4
+    buffer_size_bytes = lds_qo_tile_bytes * 2  # + lds_qo_scale_tile_bytes * 4
 
     lds_pong_offset = allocator_pong._align(allocator_pong.ptr, 16)
     allocator_pong.ptr = lds_pong_offset + buffer_size_bytes
-    lds_q_quant_head_pong_offset = lds_pong_offset
-    lds_q_scale_head_pong_offset = lds_q_quant_head_pong_offset + lds_qo_tile_bytes
-    lds_q_quant_m_pong_offset = lds_q_scale_head_pong_offset + lds_qo_scale_tile_bytes
-    lds_q_scale_m_pong_offset = lds_q_quant_m_pong_offset + lds_qo_tile_bytes
-    lds_do_quant_head_pong_offset = lds_q_scale_m_pong_offset + lds_qo_scale_tile_bytes
-    lds_do_scale_head_pong_offset = lds_do_quant_head_pong_offset + lds_qo_tile_bytes
-    lds_do_quant_m_pong_offset = lds_do_scale_head_pong_offset + lds_qo_scale_tile_bytes
-    lds_do_scale_m_pong_offset = lds_do_quant_m_pong_offset + lds_qo_tile_bytes
+    lds_q_pong_offset = lds_pong_offset
+    lds_do_pong_offset = lds_q_pong_offset + lds_qo_tile_bytes
 
     lds_ping_offset = allocator_ping._align(allocator_ping.ptr, 16)
     allocator_ping.ptr = lds_ping_offset + buffer_size_bytes
-    lds_q_quant_head_ping_offset = lds_ping_offset
-    lds_q_scale_head_ping_offset = lds_q_quant_head_ping_offset + lds_qo_tile_bytes
-    lds_q_quant_m_ping_offset = lds_q_scale_head_ping_offset + lds_qo_scale_tile_bytes
-    lds_q_scale_m_ping_offset = lds_q_quant_m_ping_offset + lds_qo_tile_bytes
-    lds_do_quant_head_ping_offset = lds_q_scale_m_ping_offset + lds_qo_scale_tile_bytes
-    lds_do_scale_head_ping_offset = lds_do_quant_head_ping_offset + lds_qo_tile_bytes
-    lds_do_quant_m_ping_offset = lds_do_scale_head_ping_offset + lds_qo_scale_tile_bytes
-    lds_do_scale_m_ping_offset = lds_do_quant_m_ping_offset + lds_qo_tile_bytes
+    lds_q_ping_offset = lds_ping_offset
+    lds_do_ping_offset = lds_q_ping_offset + lds_qo_tile_bytes
 
-    lds_k_quant_head_offset = allocator_k_quant_head._align(
-        allocator_k_quant_head.ptr, 16
-    )
-    allocator_k_quant_head.ptr = lds_k_quant_head_offset + lds_k_tile_bytes
-
-    lds_k_scale_head_offset = allocator_k_scale_head._align(
-        allocator_k_scale_head.ptr, 16
-    )
-    allocator_k_scale_head.ptr = lds_k_scale_head_offset + lds_k_scale_head_tile_bytes
-
-    lds_k_quant_n_offset = allocator_k_quant_n._align(allocator_k_quant_n.ptr, 16)
-    allocator_k_quant_n.ptr = lds_k_quant_n_offset + lds_k_tile_bytes
-
-    lds_k_scale_n_offset = allocator_k_scale_n._align(allocator_k_scale_n.ptr, 16)
-    allocator_k_scale_n.ptr = lds_k_scale_n_offset + lds_k_scale_n_tile_bytes
+    lds_k_offset = allocator_k._align(allocator_k.ptr, 16)
+    allocator_k.ptr = lds_k_offset + lds_k_tile_bytes
 
     lds_v_offset = allocator_v._align(allocator_v.ptr, 16)
     allocator_v.ptr = lds_v_offset + lds_v_tile_bytes
@@ -242,31 +203,30 @@ def compile_attn_bwd_mxfp8_gfx950(
         arg_dq: fx.Tensor,
         arg_dk: fx.Tensor,
         arg_dv: fx.Tensor,
-        arg_q_quant_head: fx.Tensor,
-        arg_q_scale_head: fx.Tensor,
-        arg_q_quant_m: fx.Tensor,
-        arg_q_scale_m: fx.Tensor,
-        arg_k_quant_head: fx.Tensor,
-        arg_k_scale_head: fx.Tensor,
-        arg_k_quant_n: fx.Tensor,
-        arg_k_scale_n: fx.Tensor,
+        arg_q: fx.Tensor,
+        arg_q_scale: fx.Tensor,
+        arg_k: fx.Tensor,
+        arg_k_scale: fx.Tensor,
         arg_v: fx.Tensor,
         arg_v_scale: fx.Tensor,
-        arg_do_quant_head: fx.Tensor,
-        arg_do_scale_head: fx.Tensor,
-        arg_do_quant_m: fx.Tensor,
-        arg_do_scale_m: fx.Tensor,
+        arg_do: fx.Tensor,
+        arg_do_scale: fx.Tensor,
         arg_M: fx.Tensor,
         arg_D: fx.Tensor,
         batch: fx.Int32,
         stride_qo_batch: fx.Int32,
-        stride_qo_scale_batch: fx.Int32,
         stride_kv_batch: fx.Int32,
-        stride_kv_scale_batch: fx.Int32,
         stride_MD_batch: fx.Int32,
         stride_qkvo_nheads: fx.Int32,
-        stride_qkvo_scale_nheads: fx.Int32,
         stride_MD_nheads: fx.Int32,
+        stride_q_scale_batch: fx.Int32,
+        stride_q_scale_nheads: fx.Int32,
+        stride_k_scale_batch: fx.Int32,
+        stride_k_scale_nheads: fx.Int32,
+        stride_v_scale_batch: fx.Int32,
+        stride_v_scale_nheads: fx.Int32,
+        stride_do_scale_batch: fx.Int32,
+        stride_do_scale_nheads: fx.Int32,
     ):
 
         # ---- Types ----
@@ -287,10 +247,7 @@ def compile_attn_bwd_mxfp8_gfx950(
         # ---- LDS (separate ping/pong buffers) ----
         base_ptr_pong = allocator_pong.get_base()
         base_ptr_ping = allocator_ping.get_base()
-        base_ptr_k_quant_head = allocator_k_quant_head.get_base()
-        base_ptr_k_scale_head = allocator_k_scale_head.get_base()
-        base_ptr_k_quant_n = allocator_k_quant_n.get_base()
-        base_ptr_k_scale_n = allocator_k_scale_n.get_base()
+        base_ptr_k = allocator_k.get_base()
         base_ptr_v = allocator_v.get_base()
         base_ptr_v_scale = allocator_v_scale.get_base()
         base_ptr_ppt_shuffle = allocator_ppt_shuffle.get_base()
@@ -300,110 +257,35 @@ def compile_attn_bwd_mxfp8_gfx950(
         base_ptr_ds_shuffle = allocator_ds_shuffle.get_base()
         base_ptr_ds_scale_shuffle = allocator_ds_scale_shuffle.get_base()
 
-        lds_q_quant_head_pong = SmemPtr(
+        lds_q_pong = SmemPtr(
             base_ptr_pong,
-            lds_q_quant_head_pong_offset,
+            lds_q_pong_offset,
             T.f8,
             shape=(tile_m * tile_head,),
         ).get()
-        lds_q_quant_head_ping = SmemPtr(
+        lds_q_ping = SmemPtr(
             base_ptr_ping,
-            lds_q_quant_head_ping_offset,
+            lds_q_ping_offset,
             T.f8,
             shape=(tile_m * tile_head,),
         ).get()
-        lds_q_scale_head_pong = SmemPtr(
+        lds_do_pong = SmemPtr(
             base_ptr_pong,
-            lds_q_scale_head_pong_offset,
-            T.i8,
-            shape=(tile_m * tile_head_mx,),
-        ).get()
-        lds_q_scale_head_ping = SmemPtr(
-            base_ptr_ping,
-            lds_q_scale_head_ping_offset,
-            T.i8,
-            shape=(tile_m * tile_head_mx,),
-        ).get()
-        lds_q_quant_m_pong = SmemPtr(
-            base_ptr_pong, lds_q_quant_m_pong_offset, T.f8, shape=(tile_m * tile_head,)
-        ).get()
-        lds_q_quant_m_ping = SmemPtr(
-            base_ptr_ping, lds_q_quant_m_ping_offset, T.f8, shape=(tile_m * tile_head,)
-        ).get()
-        lds_q_scale_m_pong = SmemPtr(
-            base_ptr_pong,
-            lds_q_scale_m_pong_offset,
-            T.i8,
-            shape=(tile_m_mx * tile_head,),
-        ).get()
-        lds_q_scale_m_ping = SmemPtr(
-            base_ptr_ping,
-            lds_q_scale_m_ping_offset,
-            T.i8,
-            shape=(tile_m_mx * tile_head,),
-        ).get()
-        lds_do_quant_head_pong = SmemPtr(
-            base_ptr_pong,
-            lds_do_quant_head_pong_offset,
+            lds_do_pong_offset,
             T.f8,
             shape=(tile_m * tile_head,),
         ).get()
-        lds_do_quant_head_ping = SmemPtr(
+        lds_do_ping = SmemPtr(
             base_ptr_ping,
-            lds_do_quant_head_ping_offset,
+            lds_do_ping_offset,
             T.f8,
             shape=(tile_m * tile_head,),
         ).get()
-        lds_do_scale_head_pong = SmemPtr(
-            base_ptr_pong,
-            lds_do_scale_head_pong_offset,
-            T.i8,
-            shape=(tile_m * tile_head_mx,),
-        ).get()
-        lds_do_scale_head_ping = SmemPtr(
-            base_ptr_ping,
-            lds_do_scale_head_ping_offset,
-            T.i8,
-            shape=(tile_m * tile_head_mx,),
-        ).get()
-        lds_do_quant_m_pong = SmemPtr(
-            base_ptr_pong, lds_do_quant_m_pong_offset, T.f8, shape=(tile_m * tile_head,)
-        ).get()
-        lds_do_quant_m_ping = SmemPtr(
-            base_ptr_ping, lds_do_quant_m_ping_offset, T.f8, shape=(tile_m * tile_head,)
-        ).get()
-        lds_do_scale_m_pong = SmemPtr(
-            base_ptr_pong,
-            lds_do_scale_m_pong_offset,
-            T.i8,
-            shape=(tile_head * tile_m_mx,),
-        ).get()
-        lds_do_scale_m_ping = SmemPtr(
-            base_ptr_ping,
-            lds_do_scale_m_ping_offset,
-            T.i8,
-            shape=(tile_head * tile_m_mx,),
-        ).get()
-        lds_k_quant_head = SmemPtr(
-            base_ptr_k_quant_head,
-            lds_k_quant_head_offset,
+        lds_k = SmemPtr(
+            base_ptr_k,
+            lds_k_offset,
             T.f8,
             shape=(tile_n * tile_head,),
-        ).get()
-        lds_k_scale_head = SmemPtr(
-            base_ptr_k_scale_head,
-            lds_k_scale_head_offset,
-            T.i8,
-            shape=(tile_n * tile_head_mx,),
-        ).get()
-        lds_k_quant_n = SmemPtr(
-            base_ptr_k_quant_n, lds_k_quant_n_offset, T.f8, shape=(tile_n * tile_head,)
-        ).get()
-        lds_k_scale_n = SmemPtr(
-            base_ptr_k_scale_n,
-            lds_k_scale_n_offset,
-            T.i8,
-            shape=(tile_n_mx * tile_head,),
         ).get()
         lds_v = SmemPtr(
             base_ptr_v, lds_v_offset, T.f8, shape=(tile_n * tile_head,)
@@ -447,78 +329,62 @@ def compile_attn_bwd_mxfp8_gfx950(
             stride_qkvo_nheads
         )
         offset_dkdv_nheads = offset_kv_nheads * 4
-        offset_qo_scale_nheads = batch_id * fx.Index(
-            stride_qo_scale_batch
-        ) + head_q * fx.Index(stride_qkvo_scale_nheads)
-        offset_kv_scale_nheads = batch_id * fx.Index(
-            stride_kv_scale_batch
-        ) + head_kv * fx.Index(stride_qkvo_scale_nheads)
+        offset_q_scale_nheads = batch_id * fx.Index(
+            stride_q_scale_batch
+        ) + head_q * fx.Index(stride_q_scale_nheads)
+        offset_k_scale_nheads = batch_id * fx.Index(
+            stride_k_scale_batch
+        ) + head_kv * fx.Index(stride_k_scale_nheads)
+        offset_v_scale_nheads = batch_id * fx.Index(
+            stride_v_scale_batch
+        ) + head_kv * fx.Index(stride_v_scale_nheads)
+        offset_do_scale_nheads = batch_id * fx.Index(
+            stride_do_scale_batch
+        ) + head_q * fx.Index(stride_do_scale_nheads)
         offset_MD_nheads = (
             batch_id * fx.Index(stride_MD_batch) + head_q * fx.Index(stride_MD_nheads)
         ) * 4
 
         # ---- Buffer resources (runtime byte sizes for OOB protection) ----
         head_dim_mx = head_dim // 32
+        seqlen_mx = seqlen // 32
         global_buffer_size_tensor = fx.Index(seqlen * head_dim)
         global_buffer_size_scale = fx.Index(seqlen * head_dim_mx)
+        global_buffer_size_scale_2d = fx.Index(seqlen_mx * head_dim_mx)
         q_nrec = arith.index_cast(T.i64, global_buffer_size_tensor)
-        q_scale_nrec = arith.index_cast(T.i64, global_buffer_size_scale)
+        q_scale_nrec = arith.index_cast(T.i64, global_buffer_size_scale_2d)
         k_nrec = arith.index_cast(T.i64, global_buffer_size_tensor)
-        k_scale_nrec = arith.index_cast(T.i64, global_buffer_size_scale)
+        k_scale_nrec = arith.index_cast(T.i64, global_buffer_size_scale_2d)
         v_nrec = arith.index_cast(T.i64, global_buffer_size_tensor)
         v_scale_nrec = arith.index_cast(T.i64, global_buffer_size_scale)
         do_nrec = arith.index_cast(T.i64, global_buffer_size_tensor)
-        do_scale_nrec = arith.index_cast(T.i64, global_buffer_size_scale)
+        do_scale_nrec = arith.index_cast(T.i64, global_buffer_size_scale_2d)
         output_nrec = arith.index_cast(T.i64, global_buffer_size_tensor * 4)
         MD_nrec = arith.index_cast(T.i64, fx.Index(seqlen * 4))
 
-        q_quant_head_rsrc = buffer_ops.create_buffer_resource(
-            arg_q_quant_head,
+        q_rsrc = buffer_ops.create_buffer_resource(
+            arg_q,
             max_size=False,
             num_records_bytes=q_nrec,
             base_byte_offset=offset_qo_nheads,
         )
-        q_scale_head_rsrc = buffer_ops.create_buffer_resource(
-            arg_q_scale_head,
+        q_scale_rsrc = buffer_ops.create_buffer_resource(
+            arg_q_scale,
             max_size=False,
             num_records_bytes=q_scale_nrec,
-            base_byte_offset=offset_qo_scale_nheads,
+            base_byte_offset=offset_q_scale_nheads,
         )
-        q_quant_m_rsrc = buffer_ops.create_buffer_resource(
-            arg_q_quant_m,
-            max_size=False,
-            num_records_bytes=q_nrec,
-            base_byte_offset=offset_qo_nheads,
-        )
-        q_scale_m_rsrc = buffer_ops.create_buffer_resource(
-            arg_q_scale_m,
-            max_size=False,
-            num_records_bytes=q_scale_nrec,
-            base_byte_offset=offset_qo_scale_nheads,
-        )
-        k_quant_head_rsrc = buffer_ops.create_buffer_resource(
-            arg_k_quant_head,
+        k_rsrc = buffer_ops.create_buffer_resource(
+            arg_k,
             max_size=False,
             num_records_bytes=k_nrec,
             base_byte_offset=offset_kv_nheads,
         )
-        k_scale_head_rsrc = buffer_ops.create_buffer_resource(
-            arg_k_scale_head,
+        k_scale_rsrc = buffer_ops.create_buffer_resource(
+            arg_k_scale,
             max_size=False,
             num_records_bytes=k_scale_nrec,
-            base_byte_offset=offset_kv_scale_nheads,
-        )
-        k_quant_n_rsrc = buffer_ops.create_buffer_resource(
-            arg_k_quant_n,
-            max_size=False,
-            num_records_bytes=k_nrec,
-            base_byte_offset=offset_kv_nheads,
-        )
-        k_scale_n_rsrc = buffer_ops.create_buffer_resource(
-            arg_k_scale_n,
-            max_size=False,
-            num_records_bytes=k_scale_nrec,
-            base_byte_offset=offset_kv_scale_nheads,
+            base_byte_offset=offset_k_scale_nheads,
         )
         v_rsrc = buffer_ops.create_buffer_resource(
             arg_v,
@@ -530,31 +396,19 @@ def compile_attn_bwd_mxfp8_gfx950(
             arg_v_scale,
             max_size=False,
             num_records_bytes=v_scale_nrec,
-            base_byte_offset=offset_kv_scale_nheads,
+            base_byte_offset=offset_v_scale_nheads,
         )
-        do_quant_head_rsrc = buffer_ops.create_buffer_resource(
-            arg_do_quant_head,
+        do_rsrc = buffer_ops.create_buffer_resource(
+            arg_do,
             max_size=False,
             num_records_bytes=do_nrec,
             base_byte_offset=offset_qo_nheads,
         )
-        do_scale_head_rsrc = buffer_ops.create_buffer_resource(
-            arg_do_scale_head,
+        do_scale_rsrc = buffer_ops.create_buffer_resource(
+            arg_do_scale,
             max_size=False,
             num_records_bytes=do_scale_nrec,
-            base_byte_offset=offset_qo_scale_nheads,
-        )
-        do_quant_m_rsrc = buffer_ops.create_buffer_resource(
-            arg_do_quant_m,
-            max_size=False,
-            num_records_bytes=do_nrec,
-            base_byte_offset=offset_qo_nheads,
-        )
-        do_scale_m_rsrc = buffer_ops.create_buffer_resource(
-            arg_do_scale_m,
-            max_size=False,
-            num_records_bytes=do_scale_nrec,
-            base_byte_offset=offset_qo_scale_nheads,
+            base_byte_offset=offset_do_scale_nheads,
         )
         dq_rsrc = buffer_ops.create_buffer_resource(
             arg_dq,
@@ -635,6 +489,7 @@ def compile_attn_bwd_mxfp8_gfx950(
         dv_n_per_wave = tile_n // dv_n_num_waves
         dv_n_num_subtiles = dv_n_per_wave // 16
         dv_head_per_wave = tile_head // dv_head_num_waves
+        dv_head_mx_per_wave = tile_head_mx // dv_head_num_waves
         dv_head_num_subtiles = dv_head_per_wave // 16
         dv_n_accs = dv_n_num_subtiles * dv_head_num_subtiles
 
@@ -650,6 +505,7 @@ def compile_attn_bwd_mxfp8_gfx950(
         dk_n_per_wave = tile_n // dk_n_num_waves
         dk_num_subtiles_n = dk_n_per_wave // 16
         dk_head_per_wave = tile_head // dk_head_num_waves
+        dk_head_mx_per_wave = tile_head_mx // dk_head_num_waves
         dk_num_subtiles_head = dk_head_per_wave // 16
         dk_n_accs = dk_num_subtiles_n * dk_num_subtiles_head
 
@@ -665,6 +521,7 @@ def compile_attn_bwd_mxfp8_gfx950(
         dq_m_per_wave = tile_m // dq_m_num_waves
         dq_num_subtiles_m = dq_m_per_wave // 16
         dq_head_per_wave = tile_head // dq_head_num_waves
+        dq_head_mx_per_wave = tile_head_mx // dq_head_num_waves
         dq_num_subtiles_head = dq_head_per_wave // 16
         dq_n_accs = dq_num_subtiles_m * dq_num_subtiles_head
 
@@ -727,46 +584,24 @@ def compile_attn_bwd_mxfp8_gfx950(
         c4 = fx.Index(4)
         tx_i32_base = tx * c4
 
-        def load_q_quant_head_16(idx_elem):
+        def load_q_16(idx_elem):
             return buffer_copy_gmem16_dwordx4(
                 buffer_ops,
                 vector,
                 elem_type=_elem_type(),
                 idx_i32=idx_elem,
-                rsrc=q_quant_head_rsrc,
+                rsrc=q_rsrc,
                 vec_elems=16,
                 elem_bytes=elem_bytes,
             )
 
-        def load_q_quant_m_16(idx_elem):
+        def load_k_16(idx_elem):
             return buffer_copy_gmem16_dwordx4(
                 buffer_ops,
                 vector,
                 elem_type=_elem_type(),
                 idx_i32=idx_elem,
-                rsrc=q_quant_m_rsrc,
-                vec_elems=16,
-                elem_bytes=elem_bytes,
-            )
-
-        def load_k_quant_head_16(idx_elem):
-            return buffer_copy_gmem16_dwordx4(
-                buffer_ops,
-                vector,
-                elem_type=_elem_type(),
-                idx_i32=idx_elem,
-                rsrc=k_quant_head_rsrc,
-                vec_elems=16,
-                elem_bytes=elem_bytes,
-            )
-
-        def load_k_quant_n_16(idx_elem):
-            return buffer_copy_gmem16_dwordx4(
-                buffer_ops,
-                vector,
-                elem_type=_elem_type(),
-                idx_i32=idx_elem,
-                rsrc=k_quant_n_rsrc,
+                rsrc=k_rsrc,
                 vec_elems=16,
                 elem_bytes=elem_bytes,
             )
@@ -782,24 +617,13 @@ def compile_attn_bwd_mxfp8_gfx950(
                 elem_bytes=elem_bytes,
             )
 
-        def load_do_quant_head_16(idx_elem):
+        def load_do_16(idx_elem):
             return buffer_copy_gmem16_dwordx4(
                 buffer_ops,
                 vector,
                 elem_type=_elem_type(),
                 idx_i32=idx_elem,
-                rsrc=do_quant_head_rsrc,
-                vec_elems=16,
-                elem_bytes=elem_bytes,
-            )
-
-        def load_do_quant_m_16(idx_elem):
-            return buffer_copy_gmem16_dwordx4(
-                buffer_ops,
-                vector,
-                elem_type=_elem_type(),
-                idx_i32=idx_elem,
-                rsrc=do_quant_m_rsrc,
+                rsrc=do_rsrc,
                 vec_elems=16,
                 elem_bytes=elem_bytes,
             )
@@ -822,43 +646,23 @@ def compile_attn_bwd_mxfp8_gfx950(
                 layout_tile_div4=layout_kv_tile_div4,
             )
 
-        def prefetch_q_quant_head_tile(offset_m):
+        def prefetch_q_tile(offset_m):
             parts = []
             for i in range_constexpr(num_qo_loads):
                 row_q_local, col_q_local_i32 = qo_tile_chunk_coord_i32(i)
                 row_q_global = offset_m + row_q_local
                 idx_elem = row_q_global * head_dim_div4 + col_q_local_i32
-                q_16B = load_q_quant_head_16(idx_elem)
+                q_16B = load_q_16(idx_elem)
                 parts.append(vector.bitcast(T.i32x4, q_16B))
             return parts
 
-        def prefetch_q_quant_m_tile(offset_m):
-            parts = []
-            for i in range_constexpr(num_qo_loads):
-                row_q_local, col_q_local_i32 = qo_tile_chunk_coord_i32(i)
-                row_q_global = offset_m + row_q_local
-                idx_elem = row_q_global * head_dim_div4 + col_q_local_i32
-                q_16B = load_q_quant_m_16(idx_elem)
-                parts.append(vector.bitcast(T.i32x4, q_16B))
-            return parts
-
-        def prefetch_k_quant_head_tile():
+        def prefetch_k_tile():
             parts = []
             for i in range_constexpr(num_kv_loads):
                 row_k_local, col_k_local_i32 = kv_tile_chunk_coord_i32(i)
                 row_k_global = global_offset_n + row_k_local
                 idx_elem = row_k_global * head_dim_div4 + col_k_local_i32
-                k_16B = load_k_quant_head_16(idx_elem)
-                parts.append(vector.bitcast(T.i32x4, k_16B))
-            return parts
-
-        def prefetch_k_quant_n_tile():
-            parts = []
-            for i in range_constexpr(num_kv_loads):
-                row_k_local, col_k_local_i32 = kv_tile_chunk_coord_i32(i)
-                row_k_global = global_offset_n + row_k_local
-                idx_elem = row_k_global * head_dim_div4 + col_k_local_i32
-                k_16B = load_k_quant_n_16(idx_elem)
+                k_16B = load_k_16(idx_elem)
                 parts.append(vector.bitcast(T.i32x4, k_16B))
             return parts
 
@@ -872,109 +676,67 @@ def compile_attn_bwd_mxfp8_gfx950(
                 parts.append(vector.bitcast(T.i32x4, v_16B))
             return parts
 
-        def prefetch_do_quant_head_tile(offset_m):
+        def prefetch_do_tile(offset_m):
             parts = []
             for i in range_constexpr(num_qo_loads):
                 row_do_local, col_do_local_i32 = qo_tile_chunk_coord_i32(i)
                 row_do_global = offset_m + row_do_local
                 idx_elem = row_do_global * head_dim_div4 + col_do_local_i32
-                do_16B = load_do_quant_head_16(idx_elem)
+                do_16B = load_do_16(idx_elem)
                 parts.append(vector.bitcast(T.i32x4, do_16B))
             return parts
 
-        def prefetch_do_quant_m_tile(offset_m):
+        def prefetch_q_scale_head_2d_tile(offset_m):
             parts = []
-            for i in range_constexpr(num_qo_loads):
-                row_do_local, col_do_local_i32 = qo_tile_chunk_coord_i32(i)
-                row_do_global = offset_m + row_do_local
-                idx_elem = row_do_global * head_dim_div4 + col_do_local_i32
-                do_16B = load_do_quant_m_16(idx_elem)
-                parts.append(vector.bitcast(T.i32x4, do_16B))
+            for i in range_constexpr(ps_m_num_subtiles // 2):
+                global_row = offset_m + ps_m_wave_id * ps_m_mx_per_wave + i
+                global_col = lane_div_16 % tile_head_mx
+                global_idx = global_row * head_dim_mx + global_col
+                vec = buffer_ops.buffer_load(
+                    q_scale_rsrc, global_idx, vec_width=1, dtype=T.i8
+                )
+                vec = vec.extui(T.i32)
+                parts.append(vec)
             return parts
 
-        def prefetch_q_scale_head_tile(offset_m):
-            vec_width = bytes_per_thread_qo_scale
-            if const_expr(vec_width == 1):
-                if const_expr(bytes_per_tile_qo_scale < total_threads):
-                    idx_elem = offset_m * head_dim_mx + tx % bytes_per_tile_qo_scale
-                else:
-                    idx_elem = offset_m * head_dim_mx + tx
+        def prefetch_q_scale_m_2d_tile(offset_m):
+            parts = []
+            for i in range_constexpr(dk_num_subtiles_head // 2):
+                global_row = offset_m + lane_div_16 % tile_m_mx
+                global_col = dk_head_wave_id * dk_head_mx_per_wave + i
+                global_idx = global_row * head_dim_mx + global_col
                 vec = buffer_ops.buffer_load(
-                    q_scale_head_rsrc, idx_elem, vec_width=1, dtype=T.i8
+                    q_scale_rsrc, global_idx, vec_width=1, dtype=T.i8
                 )
-                vec = vector.from_elements(T.vec(1, T.i8), [vec])
-            else:  # vec_width=2
-                idx_elem = (offset_m * head_dim_mx + tx * vec_width) // 2
-                vec = buffer_ops.buffer_load(
-                    q_scale_head_rsrc, idx_elem, vec_width=1, dtype=T.i16
-                )
-                vec = vector.from_elements(T.vec(1, T.i16), [vec])
-                vec = vector.bitcast(T.i8x2, vec)
-            return vec
+                vec = vec.extui(T.i32)
+                parts.append(vec)
+            return parts
 
-        def prefetch_q_scale_m_tile(offset_m):
-            vec_width = bytes_per_thread_qo_scale
-            if const_expr(vec_width == 1):
-                if const_expr(bytes_per_tile_qo_scale < total_threads):
-                    idx_elem = offset_m * head_dim + tx % bytes_per_tile_qo_scale
-                else:
-                    idx_elem = offset_m * head_dim + tx
+        def prefetch_k_scale_head_2d_tile():
+            parts = []
+            for i in range_constexpr(ps_n_num_subtiles // 2):
+                global_row = global_offset_n_mx + ps_n_wave_id * ps_n_mx_per_wave + i
+                global_col = lane_div_16 % tile_head_mx
+                global_idx = global_row * head_dim_mx + global_col
                 vec = buffer_ops.buffer_load(
-                    q_scale_m_rsrc, idx_elem, vec_width=1, dtype=T.i8
+                    k_scale_rsrc, global_idx, vec_width=1, dtype=T.i8
                 )
-                vec = vector.from_elements(T.vec(1, T.i8), [vec])
-            else:  # vec_width=2
-                idx_elem = (offset_m * head_dim + tx * vec_width) // 2
-                vec = buffer_ops.buffer_load(
-                    q_scale_m_rsrc, idx_elem, vec_width=1, dtype=T.i16
-                )
-                vec = vector.from_elements(T.vec(1, T.i16), [vec])
-                vec = vector.bitcast(T.i8x2, vec)
-            return vec
+                vec = vec.extui(T.i32)
+                parts.append(vec)
+            return parts
 
-        def prefetch_k_scale_head_tile():
-            vec_width = bytes_per_thread_kv_scale
-            if const_expr(vec_width == 1):
-                if const_expr(bytes_per_tile_kv_scale < total_threads):
-                    idx_elem = (
-                        global_offset_n * head_dim_mx + tx % bytes_per_tile_kv_scale
-                    )
-                else:
-                    idx_elem = global_offset_n * head_dim_mx + tx
+        def prefetch_k_scale_n_2d_tile():
+            parts = []
+            for i in range_constexpr(dq_num_subtiles_head // 2):
+                global_row = global_offset_n_mx + lane_div_16 % tile_n_mx
+                global_col = dq_head_wave_id * dq_head_mx_per_wave + i
+                global_idx = global_row * head_dim_mx + global_col
                 vec = buffer_ops.buffer_load(
-                    k_scale_head_rsrc, idx_elem, vec_width=1, dtype=T.i8
+                    k_scale_rsrc, global_idx, vec_width=1, dtype=T.i8
                 )
-                vec = vector.from_elements(T.vec(1, T.i8), [vec])
-            else:  # vec_width=2
-                idx_elem = (global_offset_n * head_dim_mx + tx * vec_width) // 2
-                vec = buffer_ops.buffer_load(
-                    k_scale_head_rsrc, idx_elem, vec_width=1, dtype=T.i16
-                )
-                vec = vector.from_elements(T.vec(1, T.i16), [vec])
-                vec = vector.bitcast(T.i8x2, vec)
-            return vec
-
-        def prefetch_k_scale_n_tile():
-            vec_width = bytes_per_thread_kv_scale
-            if const_expr(vec_width == 1):
-                if const_expr(bytes_per_tile_kv_scale < total_threads):
-                    idx_elem = (
-                        global_offset_n_mx * head_dim + tx % bytes_per_tile_kv_scale
-                    )
-                else:
-                    idx_elem = global_offset_n_mx * head_dim + tx
-                vec = buffer_ops.buffer_load(
-                    k_scale_n_rsrc, idx_elem, vec_width=1, dtype=T.i8
-                )
-                vec = vector.from_elements(T.vec(1, T.i8), [vec])
-            else:  # vec_width=2
-                idx_elem = (global_offset_n_mx * head_dim + tx * vec_width) // 2
-                vec = buffer_ops.buffer_load(
-                    k_scale_n_rsrc, idx_elem, vec_width=1, dtype=T.i16
-                )
-                vec = vector.from_elements(T.vec(1, T.i16), [vec])
-                vec = vector.bitcast(T.i8x2, vec)
-            return vec
+                vec = vec.extui(T.i32)
+                parts.append(vec)
+            return parts
 
         def prefetch_v_scale_tile():
             vec_width = bytes_per_thread_kv_scale
@@ -998,45 +760,31 @@ def compile_attn_bwd_mxfp8_gfx950(
                 vec = vector.bitcast(T.i8x2, vec)
             return vec
 
-        def prefetch_do_scale_head_tile(offset_m):
-            vec_width = bytes_per_thread_qo_scale
-            if const_expr(vec_width == 1):
-                if const_expr(bytes_per_tile_qo_scale < total_threads):
-                    idx_elem = offset_m * head_dim_mx + tx % bytes_per_tile_qo_scale
-                else:
-                    idx_elem = offset_m * head_dim_mx + tx
+        def prefetch_do_scale_head_2d_tile(offset_m):
+            parts = []
+            for i in range_constexpr(ps_m_num_subtiles // 2):
+                global_row = offset_m + ps_m_wave_id * ps_m_mx_per_wave + i
+                global_col = lane_div_16 % tile_head_mx
+                global_idx = global_row * head_dim_mx + global_col
                 vec = buffer_ops.buffer_load(
-                    do_scale_head_rsrc, idx_elem, vec_width=1, dtype=T.i8
+                    do_scale_rsrc, global_idx, vec_width=1, dtype=T.i8
                 )
-                vec = vector.from_elements(T.vec(1, T.i8), [vec])
-            else:  # vec_width=2
-                idx_elem = (offset_m * head_dim_mx + tx * vec_width) // 2
-                vec = buffer_ops.buffer_load(
-                    do_scale_head_rsrc, idx_elem, vec_width=1, dtype=T.i16
-                )
-                vec = vector.from_elements(T.vec(1, T.i16), [vec])
-                vec = vector.bitcast(T.i8x2, vec)
-            return vec
+                vec = vec.extui(T.i32)
+                parts.append(vec)
+            return parts
 
-        def prefetch_do_scale_m_tile(offset_m):
-            vec_width = bytes_per_thread_qo_scale
-            if const_expr(vec_width == 1):
-                if const_expr(bytes_per_tile_qo_scale < total_threads):
-                    idx_elem = offset_m * head_dim + tx % bytes_per_tile_qo_scale
-                else:
-                    idx_elem = offset_m * head_dim + tx
+        def prefetch_do_scale_m_2d_tile(offset_m):
+            parts = []
+            for i in range_constexpr(dv_head_num_subtiles // 2):
+                global_row = offset_m + lane_div_16 % tile_m_mx
+                global_col = dv_head_wave_id * dv_head_mx_per_wave + i
+                global_idx = global_row * head_dim_mx + global_col
                 vec = buffer_ops.buffer_load(
-                    do_scale_m_rsrc, idx_elem, vec_width=1, dtype=T.i8
+                    do_scale_rsrc, global_idx, vec_width=1, dtype=T.i8
                 )
-                vec = vector.from_elements(T.vec(1, T.i8), [vec])
-            else:  # vec_width=2
-                idx_elem = (offset_m * head_dim + tx * vec_width) // 2
-                vec = buffer_ops.buffer_load(
-                    do_scale_m_rsrc, idx_elem, vec_width=1, dtype=T.i16
-                )
-                vec = vector.from_elements(T.vec(1, T.i16), [vec])
-                vec = vector.bitcast(T.i8x2, vec)
-            return vec
+                vec = vec.extui(T.i32)
+                parts.append(vec)
+            return parts
 
         def store_q_tile_to_lds(vec_q_parts, lds_buffer):
             for i in range_constexpr(num_qo_loads):
@@ -1086,32 +834,11 @@ def compile_attn_bwd_mxfp8_gfx950(
                 v16 = vector.bitcast(_vec16_type(), vec_do_parts[i])
                 vector.store(v16, lds_buffer, [idx0])
 
-        def store_q_scale_tile_to_lds(vec_scale, lds_buffer):
-            vec_width = bytes_per_thread_qo_scale
-            idx = tx * vec_width
-            if total_threads > bytes_per_tile_qo_scale:
-                idx = idx % bytes_per_tile_qo_scale
-            vector.store(vec_scale, lds_buffer, [idx])
-
-        def store_k_scale_tile_to_lds(vec_scale, lds_buffer):
-            vec_width = bytes_per_thread_kv_scale
-            idx = tx * vec_width
-            if total_threads > bytes_per_tile_kv_scale:
-                idx = idx % bytes_per_tile_kv_scale
-            vector.store(vec_scale, lds_buffer, [idx])
-
         def store_v_scale_tile_to_lds(vec_scale, lds_buffer):
             vec_width = bytes_per_thread_kv_scale
             idx = tx * vec_width
             if total_threads > bytes_per_tile_kv_scale:
                 idx = idx % bytes_per_tile_kv_scale
-            vector.store(vec_scale, lds_buffer, [idx])
-
-        def store_do_scale_tile_to_lds(vec_scale, lds_buffer):
-            vec_width = bytes_per_thread_qo_scale
-            idx = tx * vec_width
-            if total_threads > bytes_per_tile_qo_scale:
-                idx = idx % bytes_per_tile_qo_scale
             vector.store(vec_scale, lds_buffer, [idx])
 
         # ── Compute tile (MFMA) ───────────────────────────────────────────
@@ -1122,9 +849,7 @@ def compile_attn_bwd_mxfp8_gfx950(
             v4 = vector.from_elements(vec4_i64, [x0, x1, x2, x3])
             return vector.bitcast(vec8_i32, v4)
 
-        def compute_qk(
-            lds_a_buffer, lds_a_scale_buffer, lds_b_buffer, lds_b_scale_buffer
-        ):
+        def compute_qk(lds_a_buffer, a_scales, lds_b_buffer, b_scales):
             # (m, head) @ (head, n) = (m, n)
 
             current_accs_list = [acc_init] * ps_n_accs
@@ -1132,9 +857,7 @@ def compile_attn_bwd_mxfp8_gfx950(
 
             ku0 = 0
             ku1 = 1
-            lds_col0 = (
-                ku0 * 64 + lane_div_16 * 16
-            )  # 16 elements packed per lane, 64 per wave
+            lds_col0 = ku0 * 64 + lane_div_16 * 16
             lds_col1 = ku1 * 64 + lane_div_16 * 16
             lds_scale_col = lane_div_16
             if const_expr(tile_head == 64):
@@ -1154,9 +877,10 @@ def compile_attn_bwd_mxfp8_gfx950(
                 a128 = pack_i64x4_to_i32x8(a0, a1, a2, a3)
 
                 lds_a_scale_row = lds_a_row
-                a_scale = lds_scale_load(
-                    lds_a_scale_row, lds_scale_col, tile_head_mx, lds_a_scale_buffer
-                )
+                # a_scale = lds_scale_load(
+                #    lds_a_scale_row, lds_scale_col, tile_head_mx, lds_a_scale_buffer
+                # )
+                a_scale = a_scales[mi // 2]
 
                 for ni in range_constexpr(ps_n_num_subtiles):
                     lds_b_row = ps_n_wave_id * ps_n_per_wave + ni * 16 + lane_mod_16
@@ -1170,11 +894,9 @@ def compile_attn_bwd_mxfp8_gfx950(
                     else:
                         b2 = b3 = fx.Int64(0)
                     b128 = pack_i64x4_to_i32x8(b0, b1, b2, b3)
-                    b_scale = lds_scale_load(
-                        lds_b_row, lds_scale_col, tile_head_mx, lds_b_scale_buffer
-                    )
 
-                    # fx.printf("ni={}, mi={}", ni, mi)
+                    b_scale = b_scales[ni // 2]
+
                     acc_idx = mi * ps_n_num_subtiles + ni
                     current_accs_list[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                         mfma_res_ty,
@@ -1252,7 +974,7 @@ def compile_attn_bwd_mxfp8_gfx950(
             return accs_out
 
         def compute_dv(
-            accs_in, lds_a_buffer, lds_a_scale_buffer, lds_b_buffer, lds_b_scale_buffer
+            accs_in, lds_a_buffer, lds_a_scale_buffer, lds_b_buffer, b_scales
         ):
             current_accs_list = list(accs_in)
             mfma_res_ty = T.f32x4
@@ -1313,15 +1035,7 @@ def compile_attn_bwd_mxfp8_gfx950(
                             b3 = fx.Int64(0)
                         b128 = pack_i64x4_to_i32x8(b0, b1, b2, b3)
 
-                        lds_b_scale_col = (
-                            dv_head_wave_id * dv_head_per_wave + hi * 16 + lane_mod_16
-                        )
-                        b_scale = lds_scale_load(
-                            lds_b_scale_row,
-                            lds_b_scale_col,
-                            tile_head,
-                            lds_b_scale_buffer,
-                        )
+                        b_scale = b_scales[hi // 2]
 
                         acc_idx = ni * dv_head_num_subtiles + hi
                         current_accs_list[acc_idx] = (
@@ -1342,16 +1056,12 @@ def compile_attn_bwd_mxfp8_gfx950(
                         )
             return current_accs_list
 
-        def compute_dp(
-            lds_a_buffer, lds_a_scale_buffer, lds_b_buffer, lds_b_scale_buffer
-        ):
+        def compute_dp(lds_a_buffer, a_scales, lds_b_buffer, lds_b_scale_buffer):
             current_accs_list = [acc_init] * ps_n_accs
             mfma_res_ty = T.f32x4
             ku0 = 0
             ku1 = 1
-            lds_col0 = (
-                ku0 * 64 + lane_div_16 * 16
-            )  # 16 elements packed per lane, 64 per wave
+            lds_col0 = ku0 * 64 + lane_div_16 * 16
             lds_col1 = ku1 * 64 + lane_div_16 * 16
             lds_scale_col = lane_div_16
             if const_expr(tile_head == 64):
@@ -1369,9 +1079,8 @@ def compile_attn_bwd_mxfp8_gfx950(
                 else:
                     a2 = a3 = fx.Int64(0)
                 a128 = pack_i64x4_to_i32x8(a0, a1, a2, a3)
-                a_scale = lds_scale_load(
-                    lds_a_row, lds_scale_col, tile_head_mx, lds_a_scale_buffer
-                )
+
+                a_scale = a_scales[mi // 2]
 
                 for ni in range_constexpr(ps_n_num_subtiles):
                     lds_b_row = ps_n_wave_id * ps_n_per_wave + ni * 16 + lane_mod_16
@@ -1663,7 +1372,7 @@ def compile_attn_bwd_mxfp8_gfx950(
                         vector.store(scale_vector, lds_buffer_scale, [lds_scale_idx])
 
         def compute_dk(
-            accs_in, lds_a_buffer, lds_a_scale_buffer, lds_b_buffer, lds_b_scale_buffer
+            accs_in, lds_a_buffer, lds_a_scale_buffer, lds_b_buffer, b_scales
         ):
             current_accs_list = list(accs_in)
             mfma_res_ty = T.f32x4
@@ -1672,9 +1381,7 @@ def compile_attn_bwd_mxfp8_gfx950(
                 ku0 = ku128 * 2
                 ku1 = ku0 + 1
 
-                lds_a_col0 = (
-                    ku0 * 64 + lane_div_16 * 16
-                )  # 16 elements packed per lane, 64 per wave
+                lds_a_col0 = ku0 * 64 + lane_div_16 * 16
                 lds_a_col1 = ku1 * 64 + lane_div_16 * 16
 
                 lds_b_row0 = ku0 * 64 + lane_div_16 * 16 + lane_div_2
@@ -1706,9 +1413,7 @@ def compile_attn_bwd_mxfp8_gfx950(
                     )
 
                     for hi in range_constexpr(dk_num_subtiles_head):
-                        lds_b_col = (
-                            dk_head_wave_id * dk_head_per_wave + hi * 16
-                        )  # + lane_mod_2 * 8
+                        lds_b_col = dk_head_wave_id * dk_head_per_wave + hi * 16
                         b0 = lds_load_packs_k32_transposed(
                             lds_b_row0, lds_b_col, tile_head, lds_b_buffer
                         )
@@ -1727,15 +1432,7 @@ def compile_attn_bwd_mxfp8_gfx950(
                             b3 = fx.Int64(0)
                         b128 = pack_i64x4_to_i32x8(b0, b1, b2, b3)
 
-                        lds_b_scale_col = (
-                            dk_head_wave_id * dk_head_per_wave + hi * 16 + lane_mod_16
-                        )
-                        b_scale = lds_scale_load(
-                            lds_b_scale_row,
-                            lds_b_scale_col,
-                            tile_head,
-                            lds_b_scale_buffer,
-                        )
+                        b_scale = b_scales[hi // 2]
 
                         acc_idx = ni * dk_num_subtiles_head + hi
                         current_accs_list[acc_idx] = (
@@ -1756,9 +1453,7 @@ def compile_attn_bwd_mxfp8_gfx950(
                         )
             return current_accs_list
 
-        def compute_dq(
-            lds_a_buffer, lds_a_scale_buffer, lds_b_buffer, lds_b_scale_buffer
-        ):
+        def compute_dq(lds_a_buffer, lds_a_scale_buffer, lds_b_buffer, b_scales):
             # (m, n) @ (n, head) = (m, head)
 
             current_accs_list = [acc_init] * dq_n_accs
@@ -1780,10 +1475,10 @@ def compile_attn_bwd_mxfp8_gfx950(
                 lds_b_row3 = ku1 * 64 + lane_div_16 * 16 + 8 + lane_div_2
 
                 lds_a_scale_col = lane_div_16
-                lds_b_scale_row = lane_div_16
+                # lds_b_scale_row = lane_div_16
                 if const_expr(tile_n == 64):
                     lds_a_scale_col = lds_a_scale_col % 2
-                    lds_b_scale_row = lds_b_scale_row % 2
+                    # lds_b_scale_row = lds_b_scale_row % 2
 
                 for mi in range_constexpr(dq_num_subtiles_m):
                     lds_a_col = (
@@ -1815,9 +1510,7 @@ def compile_attn_bwd_mxfp8_gfx950(
                     )
 
                     for hi in range_constexpr(dq_num_subtiles_head):
-                        lds_b_col = (
-                            dq_head_wave_id * dq_head_per_wave + hi * 16
-                        )  # + lane_mod_2 * 8
+                        lds_b_col = dq_head_wave_id * dq_head_per_wave + hi * 16
                         b0 = lds_load_packs_k32_transposed(
                             lds_b_row0, lds_b_col, tile_head, lds_b_buffer
                         )
@@ -1836,15 +1529,7 @@ def compile_attn_bwd_mxfp8_gfx950(
                             b3 = fx.Int64(0)
                         b128 = pack_i64x4_to_i32x8(b0, b1, b2, b3)
 
-                        lds_b_scale_col = (
-                            dq_head_wave_id * dq_head_per_wave + hi * 16 + lane_mod_16
-                        )
-                        b_scale = lds_scale_load(
-                            lds_b_scale_row,
-                            lds_b_scale_col,
-                            tile_head,
-                            lds_b_scale_buffer,
-                        )
+                        b_scale = b_scales[hi // 2]
 
                         acc_idx = mi * dq_num_subtiles_head + hi
                         current_accs_list[acc_idx] = (
@@ -1979,49 +1664,84 @@ def compile_attn_bwd_mxfp8_gfx950(
 
         # ── Main pipeline ─────────────────────────────────────────────────
 
-        def _pack_state(dk, dv):
-            return list(dk) + list(dv)
+        def _pack_state(dk, dv, q_scales_head, q_scales_m, do_scales_head, do_scales_m):
+            return (
+                list(dk)
+                + list(dv)
+                + list(q_scales_head)
+                + list(q_scales_m)
+                + list(do_scales_head)
+                + list(do_scales_m)
+            )
 
         def _unpack_state(vals):
             dk = list(vals[:dk_n_accs])
-            dv = list(vals[dk_n_accs:])
-            return dk, dv
+            dv = list(vals[dk_n_accs : dk_n_accs + dv_n_accs])
+            q_scales_head = list(
+                vals[
+                    dk_n_accs
+                    + dv_n_accs : dk_n_accs
+                    + dv_n_accs
+                    + ps_m_num_subtiles // 2
+                ]
+            )
+            q_scales_m = list(
+                vals[
+                    dk_n_accs
+                    + dv_n_accs
+                    + ps_m_num_subtiles // 2 : dk_n_accs
+                    + dv_n_accs
+                    + ps_m_num_subtiles // 2
+                    + dk_num_subtiles_head // 2
+                ]
+            )
+            do_scales_head = list(
+                vals[
+                    dk_n_accs
+                    + dv_n_accs
+                    + ps_m_num_subtiles // 2
+                    + dk_num_subtiles_head // 2 : dk_n_accs
+                    + dv_n_accs
+                    + ps_m_num_subtiles // 2
+                    + dk_num_subtiles_head // 2
+                    + ps_m_num_subtiles // 2
+                ]
+            )
+            do_scales_m = list(
+                vals[
+                    dk_n_accs
+                    + dv_n_accs
+                    + ps_m_num_subtiles // 2
+                    + dk_num_subtiles_head // 2
+                    + ps_m_num_subtiles // 2 :
+                ]
+            )
+            return dk, dv, q_scales_head, q_scales_m, do_scales_head, do_scales_m
 
         def pingpong(offset_m, inner_state):
-            dk, dv = _unpack_state(inner_state)
+            (
+                dk,
+                dv,
+                q_scales_head_pong,
+                q_scales_m_pong,
+                do_scales_head_pong,
+                do_scales_m_pong,
+            ) = _unpack_state(inner_state)
 
             next_offset_m = offset_m + tile_m
             next_offset_m_mx = next_offset_m // 32
-            store_q_tile_to_lds(
-                prefetch_q_quant_head_tile(next_offset_m), lds_q_quant_head_ping
-            )
-            store_q_scale_tile_to_lds(
-                prefetch_q_scale_head_tile(next_offset_m), lds_q_scale_head_ping
-            )
-            store_q_tile_to_lds(
-                prefetch_q_quant_m_tile(next_offset_m), lds_q_quant_m_ping
-            )
-            store_q_scale_tile_to_lds(
-                prefetch_q_scale_m_tile(next_offset_m_mx), lds_q_scale_m_ping
-            )
-            store_do_tile_to_lds(
-                prefetch_do_quant_head_tile(next_offset_m), lds_do_quant_head_ping
-            )
-            store_do_scale_tile_to_lds(
-                prefetch_do_scale_head_tile(next_offset_m), lds_do_scale_head_ping
-            )
-            store_do_tile_to_lds(
-                prefetch_do_quant_m_tile(next_offset_m), lds_do_quant_m_ping
-            )
-            store_do_scale_tile_to_lds(
-                prefetch_do_scale_m_tile(next_offset_m_mx), lds_do_scale_m_ping
-            )
+            store_q_tile_to_lds(prefetch_q_tile(next_offset_m), lds_q_ping)
+            q_scales_head_ping = prefetch_q_scale_head_2d_tile(next_offset_m_mx)
+            q_scales_m_ping = prefetch_q_scale_m_2d_tile(next_offset_m_mx)
+            store_do_tile_to_lds(prefetch_do_tile(next_offset_m), lds_do_ping)
+            do_scales_head_ping = prefetch_do_scale_head_2d_tile(next_offset_m_mx)
+            do_scales_m_ping = prefetch_do_scale_m_2d_tile(next_offset_m_mx)
 
             qk = compute_qk(
-                lds_q_quant_head_pong,
-                lds_q_scale_head_pong,
-                lds_k_quant_head,
-                lds_k_scale_head,
+                lds_q_pong,
+                q_scales_head_pong,
+                lds_k,
+                k_scales_head,
             )
             p = softmax(qk, offset_m)
             mxquant_m_and_store_to_lds(p, lds_ppt_shuffle, lds_ppt_scale_shuffle)
@@ -2030,12 +1750,10 @@ def compile_attn_bwd_mxfp8_gfx950(
                 dv,
                 lds_ppt_shuffle,
                 lds_ppt_scale_shuffle,
-                lds_do_quant_m_pong,
-                lds_do_scale_m_pong,
+                lds_do_pong,
+                do_scales_m_pong,
             )
-            dp = compute_dp(
-                lds_do_quant_head_pong, lds_do_scale_head_pong, lds_v, lds_v_scale
-            )
+            dp = compute_dp(lds_do_pong, do_scales_head_pong, lds_v, lds_v_scale)
             ds = compute_ds(dp, p, offset_m)
             mxquant_m_and_store_to_lds(ds, lds_dst_shuffle, lds_dst_scale_shuffle)
             mxquant_n_and_store_to_lds(ds, lds_ds_shuffle, lds_ds_scale_shuffle)
@@ -2044,48 +1762,28 @@ def compile_attn_bwd_mxfp8_gfx950(
                 dk,
                 lds_dst_shuffle,
                 lds_dst_scale_shuffle,
-                lds_q_quant_m_pong,
-                lds_q_scale_m_pong,
+                lds_q_pong,
+                q_scales_m_pong,
             )
-            dq = compute_dq(
-                lds_ds_shuffle, lds_ds_scale_shuffle, lds_k_quant_n, lds_k_scale_n
-            )
+            dq = compute_dq(lds_ds_shuffle, lds_ds_scale_shuffle, lds_k, k_scales_n)
             store_dq_atomic(dq, offset_m)
             hot_loop_scheduler()
             gpu.barrier()
 
             next_offset_m = offset_m + (tile_m * 2)
             next_offset_m_mx = next_offset_m // 32
-            store_q_tile_to_lds(
-                prefetch_q_quant_head_tile(next_offset_m), lds_q_quant_head_pong
-            )
-            store_q_scale_tile_to_lds(
-                prefetch_q_scale_head_tile(next_offset_m), lds_q_scale_head_pong
-            )
-            store_q_tile_to_lds(
-                prefetch_q_quant_m_tile(next_offset_m), lds_q_quant_m_pong
-            )
-            store_q_scale_tile_to_lds(
-                prefetch_q_scale_m_tile(next_offset_m_mx), lds_q_scale_m_pong
-            )
-            store_do_tile_to_lds(
-                prefetch_do_quant_head_tile(next_offset_m), lds_do_quant_head_pong
-            )
-            store_do_scale_tile_to_lds(
-                prefetch_do_scale_head_tile(next_offset_m), lds_do_scale_head_pong
-            )
-            store_do_tile_to_lds(
-                prefetch_do_quant_m_tile(next_offset_m), lds_do_quant_m_pong
-            )
-            store_do_scale_tile_to_lds(
-                prefetch_do_scale_m_tile(next_offset_m_mx), lds_do_scale_m_pong
-            )
+            store_q_tile_to_lds(prefetch_q_tile(next_offset_m), lds_q_pong)
+            q_scales_head_pong = prefetch_q_scale_head_2d_tile(next_offset_m_mx)
+            q_scales_m_pong = prefetch_q_scale_m_2d_tile(next_offset_m_mx)
+            store_do_tile_to_lds(prefetch_do_tile(next_offset_m), lds_do_pong)
+            do_scales_head_pong = prefetch_do_scale_head_2d_tile(next_offset_m_mx)
+            do_scales_m_pong = prefetch_do_scale_m_2d_tile(next_offset_m_mx)
 
             qk = compute_qk(
-                lds_q_quant_head_ping,
-                lds_q_scale_head_ping,
-                lds_k_quant_head,
-                lds_k_scale_head,
+                lds_q_ping,
+                q_scales_head_ping,
+                lds_k,
+                k_scales_head,
             )
             p = softmax(qk, offset_m + tile_m)
             mxquant_m_and_store_to_lds(p, lds_ppt_shuffle, lds_ppt_scale_shuffle)
@@ -2094,12 +1792,10 @@ def compile_attn_bwd_mxfp8_gfx950(
                 dv,
                 lds_ppt_shuffle,
                 lds_ppt_scale_shuffle,
-                lds_do_quant_m_ping,
-                lds_do_scale_m_ping,
+                lds_do_ping,
+                do_scales_m_ping,
             )
-            dp = compute_dp(
-                lds_do_quant_head_ping, lds_do_scale_head_ping, lds_v, lds_v_scale
-            )
+            dp = compute_dp(lds_do_ping, do_scales_head_ping, lds_v, lds_v_scale)
             ds = compute_ds(dp, p, offset_m + tile_m)
             mxquant_m_and_store_to_lds(ds, lds_dst_shuffle, lds_dst_scale_shuffle)
             mxquant_n_and_store_to_lds(ds, lds_ds_shuffle, lds_ds_scale_shuffle)
@@ -2108,17 +1804,22 @@ def compile_attn_bwd_mxfp8_gfx950(
                 dk,
                 lds_dst_shuffle,
                 lds_dst_scale_shuffle,
-                lds_q_quant_m_ping,
-                lds_q_scale_m_ping,
+                lds_q_ping,
+                q_scales_m_ping,
             )
-            dq = compute_dq(
-                lds_ds_shuffle, lds_ds_scale_shuffle, lds_k_quant_n, lds_k_scale_n
-            )
+            dq = compute_dq(lds_ds_shuffle, lds_ds_scale_shuffle, lds_k, k_scales_n)
             store_dq_atomic(dq, offset_m + tile_m)
             hot_loop_scheduler()
             gpu.barrier()
 
-            return _pack_state(dk, dv)
+            return _pack_state(
+                dk,
+                dv,
+                q_scales_head_pong,
+                q_scales_m_pong,
+                do_scales_head_pong,
+                do_scales_m_pong,
+            )
 
         if const_expr(causal):
             start_m = (global_offset_n // (tile_m * 2)) * (tile_m * 2)
@@ -2126,30 +1827,17 @@ def compile_attn_bwd_mxfp8_gfx950(
             start_m = fx.Index(0)
         start_m_mx = start_m // 32
 
-        store_q_tile_to_lds(prefetch_q_quant_head_tile(start_m), lds_q_quant_head_pong)
-        store_q_scale_tile_to_lds(
-            prefetch_q_scale_head_tile(start_m), lds_q_scale_head_pong
-        )
-        store_q_tile_to_lds(prefetch_q_quant_m_tile(start_m), lds_q_quant_m_pong)
-        store_q_scale_tile_to_lds(
-            prefetch_q_scale_m_tile(start_m_mx), lds_q_scale_m_pong
-        )
-        store_k_tile_to_lds(prefetch_k_quant_head_tile(), lds_k_quant_head)
-        store_k_scale_tile_to_lds(prefetch_k_scale_head_tile(), lds_k_scale_head)
-        store_k_tile_to_lds(prefetch_k_quant_n_tile(), lds_k_quant_n)
-        store_k_scale_tile_to_lds(prefetch_k_scale_n_tile(), lds_k_scale_n)
+        store_q_tile_to_lds(prefetch_q_tile(start_m), lds_q_pong)
+        q_scales_head_pong = prefetch_q_scale_head_2d_tile(start_m_mx)
+        q_scales_m_pong = prefetch_q_scale_m_2d_tile(start_m_mx)
+        store_k_tile_to_lds(prefetch_k_tile(), lds_k)
+        k_scales_head = prefetch_k_scale_head_2d_tile()
+        k_scales_n = prefetch_k_scale_n_2d_tile()
         store_v_tile_to_lds(prefetch_v_tile(), lds_v)
         store_v_scale_tile_to_lds(prefetch_v_scale_tile(), lds_v_scale)
-        store_do_tile_to_lds(
-            prefetch_do_quant_head_tile(start_m), lds_do_quant_head_pong
-        )
-        store_do_scale_tile_to_lds(
-            prefetch_do_scale_head_tile(start_m), lds_do_scale_head_pong
-        )
-        store_do_tile_to_lds(prefetch_do_quant_m_tile(start_m), lds_do_quant_m_pong)
-        store_do_scale_tile_to_lds(
-            prefetch_do_scale_m_tile(start_m_mx), lds_do_scale_m_pong
-        )
+        store_do_tile_to_lds(prefetch_do_tile(start_m), lds_do_pong)
+        do_scales_head_pong = prefetch_do_scale_head_2d_tile(start_m_mx)
+        do_scales_m_pong = prefetch_do_scale_m_2d_tile(start_m_mx)
         gpu.barrier()
         dk = [acc_init] * dk_n_accs
         dv = [acc_init] * dv_n_accs
@@ -2157,17 +1845,31 @@ def compile_attn_bwd_mxfp8_gfx950(
         num_tiles_loop = seqlen_rounded // tile_m
         if const_expr((num_tiles_loop % 2) == 1):
             upper_bound = seqlen_rounded - tile_m
-            init_state = _pack_state(dk, dv)
+            init_state = _pack_state(
+                dk,
+                dv,
+                q_scales_head_pong,
+                q_scales_m_pong,
+                do_scales_head_pong,
+                do_scales_m_pong,
+            )
             for iv, inner in range(start_m, upper_bound, tile_m * 2, init=init_state):
                 results = yield pingpong(iv, inner)
-            dk, dv = _unpack_state(results)
+            (
+                dk,
+                dv,
+                q_scales_head_pong,
+                q_scales_m_pong,
+                do_scales_head_pong,
+                do_scales_m_pong,
+            ) = _unpack_state(results)
 
             curr_m = arith.index(seqlen_rounded - tile_m)
             qk = compute_qk(
-                lds_q_quant_head_pong,
-                lds_q_scale_head_pong,
-                lds_k_quant_head,
-                lds_k_scale_head,
+                lds_q_pong,
+                q_scales_head_pong,
+                lds_k,
+                k_scales_head,
             )
             p = softmax(qk, curr_m)
             mxquant_m_and_store_to_lds(p, lds_ppt_shuffle, lds_ppt_scale_shuffle)
@@ -2176,12 +1878,10 @@ def compile_attn_bwd_mxfp8_gfx950(
                 dv,
                 lds_ppt_shuffle,
                 lds_ppt_scale_shuffle,
-                lds_do_quant_m_pong,
-                lds_do_scale_m_pong,
+                lds_do_pong,
+                do_scales_m_pong,
             )
-            dp = compute_dp(
-                lds_do_quant_head_pong, lds_do_scale_head_pong, lds_v, lds_v_scale
-            )
+            dp = compute_dp(lds_do_pong, do_scales_head_pong, lds_v, lds_v_scale)
             ds = compute_ds(dp, p, curr_m)
             mxquant_m_and_store_to_lds(ds, lds_dst_shuffle, lds_dst_scale_shuffle)
             mxquant_n_and_store_to_lds(ds, lds_ds_shuffle, lds_ds_scale_shuffle)
@@ -2190,49 +1890,47 @@ def compile_attn_bwd_mxfp8_gfx950(
                 dk,
                 lds_dst_shuffle,
                 lds_dst_scale_shuffle,
-                lds_q_quant_m_pong,
-                lds_q_scale_m_pong,
+                lds_q_pong,
+                q_scales_m_pong,
             )
-            dq = compute_dq(
-                lds_ds_shuffle, lds_ds_scale_shuffle, lds_k_quant_n, lds_k_scale_n
-            )
+            dq = compute_dq(lds_ds_shuffle, lds_ds_scale_shuffle, lds_k, k_scales_n)
             store_dq_atomic(dq, curr_m)
         else:
             upper_bound = seqlen_rounded - (tile_m * 2)
-            init_state = _pack_state(dk, dv)
+            init_state = _pack_state(
+                dk,
+                dv,
+                q_scales_head_pong,
+                q_scales_m_pong,
+                do_scales_head_pong,
+                do_scales_m_pong,
+            )
             for iv, inner in range(start_m, upper_bound, tile_m * 2, init=init_state):
                 results = yield pingpong(iv, inner)
-            dk, dv = _unpack_state(results)
+            (
+                dk,
+                dv,
+                q_scales_head_pong,
+                q_scales_m_pong,
+                do_scales_head_pong,
+                do_scales_m_pong,
+            ) = _unpack_state(results)
 
             curr_m = arith.index(seqlen_rounded - tile_m * 2)
             last_m = arith.index(seqlen_rounded - tile_m)
             last_m_mx = last_m // 32
-            store_q_tile_to_lds(
-                prefetch_q_quant_head_tile(last_m), lds_q_quant_head_ping
-            )
-            store_q_scale_tile_to_lds(
-                prefetch_q_scale_head_tile(last_m), lds_q_scale_head_ping
-            )
-            store_q_tile_to_lds(prefetch_q_quant_m_tile(last_m), lds_q_quant_m_ping)
-            store_q_scale_tile_to_lds(
-                prefetch_q_scale_m_tile(last_m_mx), lds_q_scale_m_ping
-            )
-            store_do_tile_to_lds(
-                prefetch_do_quant_head_tile(last_m), lds_do_quant_head_ping
-            )
-            store_do_scale_tile_to_lds(
-                prefetch_do_scale_head_tile(last_m), lds_do_scale_head_ping
-            )
-            store_do_tile_to_lds(prefetch_do_quant_m_tile(last_m), lds_do_quant_m_ping)
-            store_do_scale_tile_to_lds(
-                prefetch_do_scale_m_tile(last_m_mx), lds_do_scale_m_ping
-            )
+            store_q_tile_to_lds(prefetch_q_tile(last_m), lds_q_ping)
+            q_scales_head_ping = prefetch_q_scale_head_2d_tile(last_m_mx)
+            q_scales_m_ping = prefetch_q_scale_m_2d_tile(last_m_mx)
+            store_do_tile_to_lds(prefetch_do_tile(last_m), lds_do_ping)
+            do_scales_head_ping = prefetch_do_scale_head_2d_tile(last_m_mx)
+            do_scales_m_ping = prefetch_do_scale_m_2d_tile(last_m_mx)
 
             qk = compute_qk(
-                lds_q_quant_head_pong,
-                lds_q_scale_head_pong,
-                lds_k_quant_head,
-                lds_k_scale_head,
+                lds_q_pong,
+                q_scales_head_pong,
+                lds_k,
+                k_scales_head,
             )
             p = softmax(qk, curr_m)
             mxquant_m_and_store_to_lds(p, lds_ppt_shuffle, lds_ppt_scale_shuffle)
@@ -2241,12 +1939,10 @@ def compile_attn_bwd_mxfp8_gfx950(
                 dv,
                 lds_ppt_shuffle,
                 lds_ppt_scale_shuffle,
-                lds_do_quant_m_pong,
-                lds_do_scale_m_pong,
+                lds_do_pong,
+                do_scales_m_pong,
             )
-            dp = compute_dp(
-                lds_do_quant_head_pong, lds_do_scale_head_pong, lds_v, lds_v_scale
-            )
+            dp = compute_dp(lds_do_pong, do_scales_head_pong, lds_v, lds_v_scale)
             ds = compute_ds(dp, p, curr_m)
             mxquant_m_and_store_to_lds(ds, lds_dst_shuffle, lds_dst_scale_shuffle)
             mxquant_n_and_store_to_lds(ds, lds_ds_shuffle, lds_ds_scale_shuffle)
@@ -2255,12 +1951,10 @@ def compile_attn_bwd_mxfp8_gfx950(
                 dk,
                 lds_dst_shuffle,
                 lds_dst_scale_shuffle,
-                lds_q_quant_m_pong,
-                lds_q_scale_m_pong,
+                lds_q_pong,
+                q_scales_m_pong,
             )
-            dq = compute_dq(
-                lds_ds_shuffle, lds_ds_scale_shuffle, lds_k_quant_n, lds_k_scale_n
-            )
+            dq = compute_dq(lds_ds_shuffle, lds_ds_scale_shuffle, lds_k, k_scales_n)
             store_dq_atomic(dq, curr_m)
 
             hot_loop_scheduler()
@@ -2268,10 +1962,10 @@ def compile_attn_bwd_mxfp8_gfx950(
 
             curr_m = last_m
             qk = compute_qk(
-                lds_q_quant_head_ping,
-                lds_q_scale_head_ping,
-                lds_k_quant_head,
-                lds_k_scale_head,
+                lds_q_ping,
+                q_scales_head_ping,
+                lds_k,
+                k_scales_head,
             )
             p = softmax(qk, curr_m)
             mxquant_m_and_store_to_lds(p, lds_ppt_shuffle, lds_ppt_scale_shuffle)
@@ -2280,12 +1974,10 @@ def compile_attn_bwd_mxfp8_gfx950(
                 dv,
                 lds_ppt_shuffle,
                 lds_ppt_scale_shuffle,
-                lds_do_quant_m_ping,
-                lds_do_scale_m_ping,
+                lds_do_ping,
+                do_scales_m_ping,
             )
-            dp = compute_dp(
-                lds_do_quant_head_ping, lds_do_scale_head_ping, lds_v, lds_v_scale
-            )
+            dp = compute_dp(lds_do_ping, do_scales_head_ping, lds_v, lds_v_scale)
             ds = compute_ds(dp, p, curr_m)
             mxquant_m_and_store_to_lds(ds, lds_dst_shuffle, lds_dst_scale_shuffle)
             mxquant_n_and_store_to_lds(ds, lds_ds_shuffle, lds_ds_scale_shuffle)
@@ -2294,12 +1986,10 @@ def compile_attn_bwd_mxfp8_gfx950(
                 dk,
                 lds_dst_shuffle,
                 lds_dst_scale_shuffle,
-                lds_q_quant_m_ping,
-                lds_q_scale_m_ping,
+                lds_q_ping,
+                q_scales_m_ping,
             )
-            dq = compute_dq(
-                lds_ds_shuffle, lds_ds_scale_shuffle, lds_k_quant_n, lds_k_scale_n
-            )
+            dq = compute_dq(lds_ds_shuffle, lds_ds_scale_shuffle, lds_k, k_scales_n)
             store_dq_atomic(dq, curr_m)
 
         store_dk_atomic(dk)
@@ -2313,40 +2003,36 @@ def compile_attn_bwd_mxfp8_gfx950(
         arg_dq: fx.Tensor,
         arg_dk: fx.Tensor,
         arg_dv: fx.Tensor,
-        arg_q_quant_head: fx.Tensor,
-        arg_q_scale_head: fx.Tensor,
-        arg_q_quant_m: fx.Tensor,
-        arg_q_scale_m: fx.Tensor,
-        arg_k_quant_head: fx.Tensor,
-        arg_k_scale_head: fx.Tensor,
-        arg_k_quant_n: fx.Tensor,
-        arg_k_scale_n: fx.Tensor,
+        arg_q: fx.Tensor,
+        arg_q_scale: fx.Tensor,
+        arg_k: fx.Tensor,
+        arg_k_scale: fx.Tensor,
         arg_v: fx.Tensor,
         arg_v_scale: fx.Tensor,
         arg_do_quant_head: fx.Tensor,
-        arg_do_scale_head: fx.Tensor,
-        arg_do_quant_m: fx.Tensor,
-        arg_do_scale_m: fx.Tensor,
+        arg_do_scale: fx.Tensor,
         arg_M: fx.Tensor,
         arg_D: fx.Tensor,
         batch: fx.Int32,
         stride_qo_batch: fx.Int32,
-        stride_qo_scale_batch: fx.Int32,
         stride_kv_batch: fx.Int32,
-        stride_kv_scale_batch: fx.Int32,
         stride_MD_batch: fx.Int32,
         stride_qkvo_nheads: fx.Int32,
-        stride_qkvo_scale_nheads: fx.Int32,
         stride_MD_nheads: fx.Int32,
+        stride_q_scale_batch: fx.Int32,
+        stride_q_scale_nheads: fx.Int32,
+        stride_k_scale_batch: fx.Int32,
+        stride_k_scale_nheads: fx.Int32,
+        stride_v_scale_batch: fx.Int32,
+        stride_v_scale_nheads: fx.Int32,
+        stride_do_scale_batch: fx.Int32,
+        stride_do_scale_nheads: fx.Int32,
         stream: fx.Stream,
     ):
         _ = _cache_tag
         allocator_pong.finalized = False
         allocator_ping.finalized = False
-        allocator_k_quant_head.finalized = False
-        allocator_k_scale_head.finalized = False
-        allocator_k_quant_n.finalized = False
-        allocator_k_scale_n.finalized = False
+        allocator_k.finalized = False
         allocator_v.finalized = False
         allocator_v_scale.finalized = False
         allocator_ppt_shuffle.finalized = False
@@ -2359,10 +2045,7 @@ def compile_attn_bwd_mxfp8_gfx950(
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator_pong.finalize()
             allocator_ping.finalize()
-            allocator_k_quant_head.finalize()
-            allocator_k_scale_head.finalize()
-            allocator_k_quant_n.finalize()
-            allocator_k_scale_n.finalize()
+            allocator_k.finalize()
             allocator_v.finalize()
             allocator_v_scale.finalize()
             allocator_ppt_shuffle.finalize()
@@ -2380,31 +2063,30 @@ def compile_attn_bwd_mxfp8_gfx950(
             arg_dq,
             arg_dk,
             arg_dv,
-            arg_q_quant_head,
-            arg_q_scale_head,
-            arg_q_quant_m,
-            arg_q_scale_m,
-            arg_k_quant_head,
-            arg_k_scale_head,
-            arg_k_quant_n,
-            arg_k_scale_n,
+            arg_q,
+            arg_q_scale,
+            arg_k,
+            arg_k_scale,
             arg_v,
             arg_v_scale,
             arg_do_quant_head,
-            arg_do_scale_head,
-            arg_do_quant_m,
-            arg_do_scale_m,
+            arg_do_scale,
             arg_M,
             arg_D,
             batch,
             stride_qo_batch,
-            stride_qo_scale_batch,
             stride_kv_batch,
-            stride_kv_scale_batch,
             stride_MD_batch,
             stride_qkvo_nheads,
-            stride_qkvo_scale_nheads,
             stride_MD_nheads,
+            stride_q_scale_batch,
+            stride_q_scale_nheads,
+            stride_k_scale_batch,
+            stride_k_scale_nheads,
+            stride_v_scale_batch,
+            stride_v_scale_nheads,
+            stride_do_scale_batch,
+            stride_do_scale_nheads,
         )
         if waves_per_eu is not None:
             _wpe = int(waves_per_eu)

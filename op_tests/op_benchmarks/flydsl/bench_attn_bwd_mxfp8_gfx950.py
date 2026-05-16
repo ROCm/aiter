@@ -12,6 +12,7 @@ from utils import run_perftest
 from op_tests.flydsl_tests.test_attn_bwd_mxfp8_gfx950 import (
     run_torch,
     mx_quant,
+    mx_quant_2d,
     check_result,
 )
 from flydsl.runtime.device import get_rocm_arch
@@ -57,7 +58,7 @@ def bench_attn_bwd_flyc(
         causal=causal,
         waves_per_eu=_wpe,
     )
-    print(f"✓ Kernel prepared")
+    print("✓ Kernel prepared")
 
     device = torch.device("cuda")
     gqa_size = num_heads_q // num_heads_kv
@@ -92,36 +93,28 @@ def bench_attn_bwd_flyc(
         * 0.5
     )
 
-    q_fp32_head, q_quant_head, q_scale_head = mx_quant(q_fp32, -1)
-    q_fp32_m, q_quant_m, q_scale_m = mx_quant(q_fp32, -2)
-    k_fp32_head, k_quant_head, k_scale_head = mx_quant(k_fp32, -1)
-    k_fp32_n, k_quant_n, k_scale_n = mx_quant(k_fp32, -2)
+    q_fp32, q_quant, q_scale = mx_quant_2d(q_fp32)
+    k_fp32, k_quant, k_scale = mx_quant_2d(k_fp32)
     v_fp32, v_quant, v_scale = mx_quant(v_fp32)
-    do_fp32_head, do_quant_head, do_scale_head = mx_quant(do_fp32, -1)
-    do_fp32_m, do_quant_m, do_scale_m = mx_quant(do_fp32, -2)
+    do_fp32, do_quant, do_scale = mx_quant_2d(do_fp32)
 
     k_fp32 = k_fp32.repeat_interleave(gqa_size, dim=1)
-    k_fp32_head = k_fp32_head.repeat_interleave(gqa_size, dim=1)
-    k_fp32_n = k_fp32_n.repeat_interleave(gqa_size, dim=1)
     v_fp32 = v_fp32.repeat_interleave(gqa_size, dim=1)
 
     qk = torch.matmul(q_fp32, k_fp32.transpose(-2, -1))
     qk = qk * sm_scale
     m = qk.max(dim=-1)[0]
     p = (qk - m[:, :, :, None]).exp()
-    l = p.sum(dim=-1)
-    m = m + torch.log(l)
+    L = p.sum(dim=-1)
+    m = m + torch.log(L)
     D = (o_fp32 * do_fp32).sum(dim=-1)
 
     if check_correctness:
         dq_ref, dk_ref, dv_ref = run_torch(
-            q_fp32_head,
-            q_fp32_m,
-            k_fp32_head,
-            k_fp32_n,
+            q_fp32,
+            k_fp32,
             v_fp32,
-            do_fp32_head,
-            do_fp32_m,
+            do_fp32,
             m,
             D,
             sm_scale,
@@ -142,20 +135,14 @@ def bench_attn_bwd_flyc(
         dq,
         dk,
         dv,
-        q_quant_head,
-        q_scale_head,
-        q_quant_m,
-        q_scale_m,
-        k_quant_head,
-        k_scale_head,
-        k_quant_n,
-        k_scale_n,
+        q,
+        q_scale,
+        k,
+        k_scale,
         v,
         v_scale,
-        do_quant_head,
-        do_scale_head,
-        do_quant_m,
-        do_scale_m,
+        do,
+        do_scale,
         m,
         D,
         batch,
@@ -164,31 +151,30 @@ def bench_attn_bwd_flyc(
             dq.contiguous().view(-1),
             dk.contiguous().view(-1),
             dv.contiguous().view(-1),
-            q_quant_head.contiguous().view(-1),
-            q_scale_head.contiguous().view(-1),
-            q_quant_m.contiguous().view(-1),
-            q_scale_m.contiguous().view(-1),
-            k_quant_head.contiguous().view(-1),
-            k_scale_head.contiguous().view(-1),
-            k_quant_n.contiguous().view(-1),
-            k_scale_n.contiguous().view(-1),
+            q.contiguous().view(-1),
+            q_scale.contiguous().view(-1),
+            k.contiguous().view(-1),
+            k_scale.contiguous().view(-1),
             v.contiguous().view(-1),
             v_scale.contiguous().view(-1),
-            do_quant_head.contiguous().view(-1),
-            do_scale_head.contiguous().view(-1),
-            do_quant_m.contiguous().view(-1),
-            do_scale_m.contiguous().view(-1),
+            do.contiguous().view(-1),
+            do_scale.contiguous().view(-1),
             m.contiguous().view(-1),
             D.contiguous().view(-1),
             batch,
-            q_quant_head.stride(0),
-            q_scale_head.stride(0),
-            k_quant_head.stride(0),
-            k_scale_head.stride(0),
+            q.stride(0),
+            k.stride(0),
             m.stride(0),
-            q_quant_head.stride(1),
-            q_scale_head.stride(1),
+            q.stride(1),
             m.stride(1),
+            q_scale.stride(0),
+            q_scale.stride(1),
+            k_scale.stride(0),
+            k_scale.stride(1),
+            v_scale.stride(0),
+            v_scale.stride(1),
+            do_scale.stride(0),
+            do_scale.stride(1),
             torch.cuda.current_stream(),
         )
 
@@ -199,20 +185,14 @@ def bench_attn_bwd_flyc(
         dq_fly,
         dk_fly,
         dv_fly,
-        q_quant_head,
-        q_scale_head,
-        q_quant_m,
-        q_scale_m,
-        k_quant_head,
-        k_scale_head,
-        k_quant_n,
-        k_scale_n,
+        q_quant,
+        q_scale,
+        k_quant,
+        k_scale,
         v_quant,
         v_scale,
-        do_quant_head,
-        do_scale_head,
-        do_quant_m,
-        do_scale_m,
+        do_quant,
+        do_scale,
         m,
         D,
         batch,
@@ -220,46 +200,37 @@ def bench_attn_bwd_flyc(
         num_warmup=bench_warmup,
         testGraph=test_graph,
     )
-    torch.cuda.synchronize()
-
-    dq_fly.zero_()
-    dk_fly.zero_()
-    dv_fly.zero_()
-    launch_kernel(
-        dq_fly,
-        dk_fly,
-        dv_fly,
-        q_quant_head,
-        q_scale_head,
-        q_quant_m,
-        q_scale_m,
-        k_quant_head,
-        k_scale_head,
-        k_quant_n,
-        k_scale_n,
-        v_quant,
-        v_scale,
-        do_quant_head,
-        do_scale_head,
-        do_quant_m,
-        do_scale_m,
-        m,
-        D,
-        batch,
-    )
-
-    dq_fly_fp32 = dq_fly.to(torch.float32)
-    dk_fly_fp32 = dk_fly.to(torch.float32)
-    dv_fly_fp32 = dv_fly.to(torch.float32)
 
     if check_correctness:
-        assert check_result(dq_fly_fp32, dq_ref, rtol=0.01, atol=0.01)
-        assert check_result(dk_fly_fp32, dk_ref, rtol=0.01, atol=0.01)
-        assert check_result(dv_fly_fp32, dv_ref, rtol=0.01, atol=0.01)
+        torch.cuda.synchronize()
+
+        dq_fly.zero_()
+        dk_fly.zero_()
+        dv_fly.zero_()
+        launch_kernel(
+            dq_fly,
+            dk_fly,
+            dv_fly,
+            q_quant,
+            q_scale,
+            k_quant,
+            k_scale,
+            v_quant,
+            v_scale,
+            do_quant,
+            do_scale,
+            m,
+            D,
+            batch,
+        )
+
+        assert check_result(dq_fly, dq_ref, rtol=0.01, atol=0.01)
+        assert check_result(dk_fly, dk_ref, rtol=0.01, atol=0.01)
+        assert check_result(dv_fly, dv_ref, rtol=0.01, atol=0.01)
 
     bytes_moved = (
-        (4 + 4) * batch * num_heads_q * seqlen * head_dim
-        + (3 + 2 * 4) * batch * num_heads_kv * seqlen * head_dim
+        (2 + 4) * batch * num_heads_q * seqlen * head_dim
+        + (2 + 2 * 4) * batch * num_heads_kv * seqlen * head_dim
         + 2 * 4 * batch * num_heads_q * seqlen
     )
     flops = (
