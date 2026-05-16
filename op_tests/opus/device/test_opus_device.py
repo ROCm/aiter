@@ -188,17 +188,38 @@ class OpusDeviceLib:
         fn = getattr(self._lib, f"run_wmma_gfx1201_{suffix}")
         fn.restype = None
         fn.argtypes = [_VP, _VP, _VP, _I, _I, _I]
-        fn(self._ptr(A), self._ptr(B), self._ptr(C),
-           int(A.stride(0)), int(B.stride(0)), int(C.stride(0)))
+        fn(
+            self._ptr(A),
+            self._ptr(B),
+            self._ptr(C),
+            int(A.stride(0)),
+            int(B.stride(0)),
+            int(C.stride(0)),
+        )
 
-    def run_wmma_gfx1201_f32_f16(self, A, B, C):     self._run_wmma_gfx1201("f32_f16",     A, B, C)
-    def run_wmma_gfx1201_f32_bf16(self, A, B, C):    self._run_wmma_gfx1201("f32_bf16",    A, B, C)
-    def run_wmma_gfx1201_f16_f16(self, A, B, C):     self._run_wmma_gfx1201("f16_f16",     A, B, C)
-    def run_wmma_gfx1201_bf16_bf16(self, A, B, C):   self._run_wmma_gfx1201("bf16_bf16",   A, B, C)
-    def run_wmma_gfx1201_f32_fp8_fp8(self, A, B, C): self._run_wmma_gfx1201("f32_fp8_fp8", A, B, C)
-    def run_wmma_gfx1201_f32_fp8_bf8(self, A, B, C): self._run_wmma_gfx1201("f32_fp8_bf8", A, B, C)
-    def run_wmma_gfx1201_f32_bf8_fp8(self, A, B, C): self._run_wmma_gfx1201("f32_bf8_fp8", A, B, C)
-    def run_wmma_gfx1201_f32_bf8_bf8(self, A, B, C): self._run_wmma_gfx1201("f32_bf8_bf8", A, B, C)
+    def run_wmma_gfx1201_f32_f16(self, A, B, C):
+        self._run_wmma_gfx1201("f32_f16", A, B, C)
+
+    def run_wmma_gfx1201_f32_bf16(self, A, B, C):
+        self._run_wmma_gfx1201("f32_bf16", A, B, C)
+
+    def run_wmma_gfx1201_f16_f16(self, A, B, C):
+        self._run_wmma_gfx1201("f16_f16", A, B, C)
+
+    def run_wmma_gfx1201_bf16_bf16(self, A, B, C):
+        self._run_wmma_gfx1201("bf16_bf16", A, B, C)
+
+    def run_wmma_gfx1201_f32_fp8_fp8(self, A, B, C):
+        self._run_wmma_gfx1201("f32_fp8_fp8", A, B, C)
+
+    def run_wmma_gfx1201_f32_fp8_bf8(self, A, B, C):
+        self._run_wmma_gfx1201("f32_fp8_bf8", A, B, C)
+
+    def run_wmma_gfx1201_f32_bf8_fp8(self, A, B, C):
+        self._run_wmma_gfx1201("f32_bf8_fp8", A, B, C)
+
+    def run_wmma_gfx1201_f32_bf8_bf8(self, A, B, C):
+        self._run_wmma_gfx1201("f32_bf8_bf8", A, B, C)
 
     # -- async_load --
     def run_async_load(self, Src, Dst):
@@ -1242,9 +1263,12 @@ _WMMA_GFX1201_ARCHS = {"gfx1201"}
 def _wmma_gfx1201_tolerances(out_dtype):
     # f32 acc is bit-exact against the FP32 reference matmul; f16/bf16 acc
     # picks up one ULP of rounding error.
-    if out_dtype == torch.float32:   return 5e-2, 1e-2
-    if out_dtype == torch.float16:   return 1e-1, 1e-2
-    if out_dtype == torch.bfloat16:  return 5e-1, 5e-2
+    if out_dtype == torch.float32:
+        return 5e-2, 1e-2
+    if out_dtype == torch.float16:
+        return 1e-1, 1e-2
+    if out_dtype == torch.bfloat16:
+        return 5e-1, 5e-2
     return 1e-2, 1e-2
 
 
@@ -1278,41 +1302,98 @@ def _test_wmma_gfx1201_variant(mod, name, runner, in_dtype_a, in_dtype_b, out_dt
     if not ok:
         print(f"  FAIL: wmma_gfx1201_{name} max_diff={max_diff:.4e} (atol={atol})")
         return 1
-    print(f"  PASS: wmma_gfx1201_{name} (in=({in_dtype_a}, {in_dtype_b}), out={out_dtype}, max_diff={max_diff:.4e})")
+    print(
+        f"  PASS: wmma_gfx1201_{name} (in=({in_dtype_a}, {in_dtype_b}), out={out_dtype}, max_diff={max_diff:.4e})"
+    )
     return 0
 
 
 def test_wmma_gfx1201_f32_f16(mod):
-    return _test_wmma_gfx1201_variant(mod, "f32_f16", mod.run_wmma_gfx1201_f32_f16,
-                                      torch.float16, torch.float16, torch.float32)
+    return _test_wmma_gfx1201_variant(
+        mod,
+        "f32_f16",
+        mod.run_wmma_gfx1201_f32_f16,
+        torch.float16,
+        torch.float16,
+        torch.float32,
+    )
+
 
 def test_wmma_gfx1201_f32_bf16(mod):
-    return _test_wmma_gfx1201_variant(mod, "f32_bf16", mod.run_wmma_gfx1201_f32_bf16,
-                                      torch.bfloat16, torch.bfloat16, torch.float32)
+    return _test_wmma_gfx1201_variant(
+        mod,
+        "f32_bf16",
+        mod.run_wmma_gfx1201_f32_bf16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+    )
+
 
 def test_wmma_gfx1201_f16_f16(mod):
-    return _test_wmma_gfx1201_variant(mod, "f16_f16", mod.run_wmma_gfx1201_f16_f16,
-                                      torch.float16, torch.float16, torch.float16)
+    return _test_wmma_gfx1201_variant(
+        mod,
+        "f16_f16",
+        mod.run_wmma_gfx1201_f16_f16,
+        torch.float16,
+        torch.float16,
+        torch.float16,
+    )
+
 
 def test_wmma_gfx1201_bf16_bf16(mod):
-    return _test_wmma_gfx1201_variant(mod, "bf16_bf16", mod.run_wmma_gfx1201_bf16_bf16,
-                                      torch.bfloat16, torch.bfloat16, torch.bfloat16)
+    return _test_wmma_gfx1201_variant(
+        mod,
+        "bf16_bf16",
+        mod.run_wmma_gfx1201_bf16_bf16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+    )
+
 
 def test_wmma_gfx1201_f32_fp8_fp8(mod):
-    return _test_wmma_gfx1201_variant(mod, "f32_fp8_fp8", mod.run_wmma_gfx1201_f32_fp8_fp8,
-                                      torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float32)
+    return _test_wmma_gfx1201_variant(
+        mod,
+        "f32_fp8_fp8",
+        mod.run_wmma_gfx1201_f32_fp8_fp8,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fn,
+        torch.float32,
+    )
+
 
 def test_wmma_gfx1201_f32_fp8_bf8(mod):
-    return _test_wmma_gfx1201_variant(mod, "f32_fp8_bf8", mod.run_wmma_gfx1201_f32_fp8_bf8,
-                                      torch.float8_e4m3fn, torch.float8_e5m2, torch.float32)
+    return _test_wmma_gfx1201_variant(
+        mod,
+        "f32_fp8_bf8",
+        mod.run_wmma_gfx1201_f32_fp8_bf8,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float32,
+    )
+
 
 def test_wmma_gfx1201_f32_bf8_fp8(mod):
-    return _test_wmma_gfx1201_variant(mod, "f32_bf8_fp8", mod.run_wmma_gfx1201_f32_bf8_fp8,
-                                      torch.float8_e5m2, torch.float8_e4m3fn, torch.float32)
+    return _test_wmma_gfx1201_variant(
+        mod,
+        "f32_bf8_fp8",
+        mod.run_wmma_gfx1201_f32_bf8_fp8,
+        torch.float8_e5m2,
+        torch.float8_e4m3fn,
+        torch.float32,
+    )
+
 
 def test_wmma_gfx1201_f32_bf8_bf8(mod):
-    return _test_wmma_gfx1201_variant(mod, "f32_bf8_bf8", mod.run_wmma_gfx1201_f32_bf8_bf8,
-                                      torch.float8_e5m2, torch.float8_e5m2, torch.float32)
+    return _test_wmma_gfx1201_variant(
+        mod,
+        "f32_bf8_bf8",
+        mod.run_wmma_gfx1201_f32_bf8_bf8,
+        torch.float8_e5m2,
+        torch.float8_e5m2,
+        torch.float32,
+    )
 
 
 def test_async_load(mod):
