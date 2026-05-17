@@ -1676,6 +1676,25 @@ namespace py = pybind11;
           py::arg("stride0"),      \
           py::arg("stride1"));
 
+#define PA_GQA_V5_PYBIND               \
+    m.def("pa_gqa_v5_decode",          \
+          &pa_gqa_v5_decode,           \
+          py::arg("out"),              \
+          py::arg("exp_sums"),         \
+          py::arg("max_logits"),       \
+          py::arg("tmp_out"),          \
+          py::arg("query"),            \
+          py::arg("key_cache"),        \
+          py::arg("value_cache"),      \
+          py::arg("block_tables"),     \
+          py::arg("context_lens"),     \
+          py::arg("num_kv_heads"),     \
+          py::arg("scale"),            \
+          py::arg("block_size"),       \
+          py::arg("max_context_len"),  \
+          py::arg("partition_size"),   \
+          py::arg("mtp"));
+
 #define MLA_METADATA_PYBIND                              \
     m.def("get_mla_metadata_v1",                         \
           &get_mla_metadata_v1,                          \

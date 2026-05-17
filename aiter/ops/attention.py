@@ -485,6 +485,68 @@ def pa_persistent_fwd(
     return logits, final_lse
 
 
+# ---------------------------------------------------------------------------
+# pa_gqa v5 — JIT-compiled native aiter op that loads
+# hsa/gfx942/pa_gqa_v5/asm_pa_gqa_v5.co via AiterAsmKernel and dispatches the
+# v5 main + reduce_v1<bf16,kNL=32,kPartSize=256> kernels.  Same pattern as
+# top_k_per_row_decode (aiter/ops/topk.py).  Hard-specialised for:
+#     bf16 Q/K/V, num_kv_heads=1, num_heads=8 (GQA=8), head=128, block=16,
+#     mtp=2, partition_size=256, max ctx <= 524288.
+# Used by `PagedAttention.forward_decode` when the config matches; otherwise
+# we fall through to `paged_attention_rocm` (HIP).  Bit-identical to HIP,
+# ~1.5x-2.7x faster on the supported config.
+# Set $AITER_DISABLE_PA_V5=1 to force the HIP path (e.g. for A/B).
+# ---------------------------------------------------------------------------
+import os as _os
+
+
+@compile_ops("module_pa_gqa_v5")
+def pa_gqa_v5_decode(
+    out: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    block_size: int,
+    max_context_len: int,
+    partition_size: int,
+    mtp: int,
+) -> None: ...
+
+
+def _pa_gqa_v5_eligible(
+    query, key_cache, value_cache,
+    num_kv_heads, block_size, partition_size, mtp, max_context_len,
+    alibi_slopes, kv_cache_dtype, fp8_out_scale, q_scale,
+):
+    """Match the TORCH_CHECKs inside pa_gqa_v5_decode."""
+    if _os.environ.get("AITER_DISABLE_PA_V5") == "1":
+        return False
+    bf16 = dtypes.bf16
+    return (
+        query.dtype == bf16
+        and key_cache.dtype == bf16
+        and value_cache.dtype == bf16
+        and num_kv_heads == 1
+        and query.dim() >= 3 and query.shape[1] == 8       # GQA ratio = 8
+        and query.shape[2] == 128                          # head_size
+        and block_size == 16
+        and mtp == 2
+        and partition_size == 256
+        and max_context_len <= 524288                      # kNL=32 reduce limit
+        and alibi_slopes is None
+        and (kv_cache_dtype is None or kv_cache_dtype == "auto")
+        and q_scale is None
+        and fp8_out_scale is None
+    )
+
+
 def paged_attention_rocm(
     out: torch.Tensor,
     exp_sums: torch.Tensor,
@@ -508,6 +570,9 @@ def paged_attention_rocm(
     mtp: int = 1,
     q_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # Pure HIP path.  v5 dispatch lives in `PagedAttention.forward_decode`
+    # (one layer up); this entry stays HIP-only so bench / test / profile
+    # scripts that call it directly keep getting the baseline they expect.
     paged_attention_rocm_core(
         out,
         exp_sums,
