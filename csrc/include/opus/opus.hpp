@@ -1508,6 +1508,12 @@ OPUS_H_D constexpr index_t get_warp_size()
     return 32;
 #elif defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
     return 64;
+#elif (defined(__gfx1201__) || defined(__gfx1200__)) && __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w64_gfx12)
+    // Workaround: __AMDGCN_WAVEFRONT_SIZE__ macro was removed in ROCm 7.2 (clang 22),
+    // and __builtin_amdgcn_wavefrontsize() is not constexpr. The _w64_gfx12 builtins are
+    // gated by the wavefrontsize64 target feature (set by -mwavefrontsize64), so
+    // __has_builtin serves as a constexpr-compatible proxy for wave64 detection on gfx12.
+    return 64;
 #else
     return 32;
 #endif
