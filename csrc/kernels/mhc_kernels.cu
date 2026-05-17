@@ -373,7 +373,7 @@ namespace aiter {
         // return res;
     }
 
-    template <typename DTYPE_I, int block_size, int hc_mult, int num_rows, int residual_block>
+    template <typename DTYPE_I, int block_size, int hc_mult, int num_rows, int residual_block, bool use_nt>
     __global__ __launch_bounds__(block_size,2)
     void mhc_pre_big_fuse_kernel(
         float* post_mix,
@@ -397,6 +397,7 @@ namespace aiter {
         int sub_hidden_size
     )
     {
+        static constexpr int cache_policy = use_nt ? GROUP_NT : RT;
         using opus::operator""_I;
         static constexpr int warp_size = opus::get_warp_size();
         static constexpr int hc_mult2 = hc_mult * hc_mult;
@@ -523,7 +524,7 @@ namespace aiter {
             auto load_res_loop = [&](int i) {
                 halfx8_t v_res = {0};
                 if (i < out_loop && res_row_id < m_oob) {
-                    v_res = buffer_res.template load<8>(
+                    v_res = buffer_res.template load<8, cache_policy>(
                         res_row_id * residual_stride + res_hc_id * residual_hc_stride +
                         i * residual_block + K_swizzled);
                 }
@@ -539,7 +540,7 @@ namespace aiter {
                 if(threadIdx.x % hc_mult != 0) {
                     out_offset = -1;
                 }
-                buffer_layer_input.template store<8>(v_res, out_offset);
+                buffer_layer_input.template store<8, halfx8_t, cache_policy>(v_res, out_offset);
             };
 
             halfx8_t v_res0 = load_res_loop(0);
@@ -604,7 +605,7 @@ namespace aiter {
         }
     }
 
-#define MHC_PRE_BIG_FUSE_KERNEL_IMPL(block_size, hc_mult, num_rows, residual_block) \
+#define MHC_PRE_BIG_FUSE_KERNEL_IMPL_(block_size, hc_mult, num_rows, residual_block, use_nt) \
     TORCH_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
     TORCH_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
     int m_blocks = (m + num_rows - 1) / num_rows; \
@@ -620,7 +621,7 @@ namespace aiter {
     dim3 block(block_size); \
     AITER_DISPATCH_FLOATING16_TYPES(layer_input.scalar_type(), "mhc_pre_big_fuse", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
-        mhc_pre_big_fuse_kernel<DTYPE_I, block_size, hc_mult, num_rows, residual_block><<<grid, block, 0, stream>>>( \
+        mhc_pre_big_fuse_kernel<DTYPE_I, block_size, hc_mult, num_rows, residual_block, use_nt><<<grid, block, 0, stream>>>( \
             reinterpret_cast<float*>(post_mix.data_ptr()), \
             reinterpret_cast<float*>(comb_mix.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(layer_input.data_ptr()), \
@@ -642,6 +643,13 @@ namespace aiter {
             sub_hidden_size \
         ); \
     });
+
+#define MHC_PRE_BIG_FUSE_KERNEL_IMPL(block_size, hc_mult, num_rows, residual_block) \
+    if (m >= 8 * cu_num) { \
+        MHC_PRE_BIG_FUSE_KERNEL_IMPL_(block_size, hc_mult, num_rows, residual_block, true); \
+    } else { \
+        MHC_PRE_BIG_FUSE_KERNEL_IMPL_(block_size, hc_mult, num_rows, residual_block, false); \
+    }
 
 #define MHC_PRE_BIG_FUSE_KERNEL_DISPATCH(m) \
     if (m <= cu_num * 12 || get_gpu_arch() != "gfx942") { \
