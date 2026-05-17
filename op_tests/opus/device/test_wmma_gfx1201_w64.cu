@@ -22,7 +22,7 @@ __global__ void wmma_gfx12_w64_kernel(
     using vtype_b = opus::vector_t<DIN_B, ELEM>;
     using vtype_c = opus::vector_t<DOUT, ELEM>;
 
-    int lane = static_cast<int>(opus::lane_id());
+    int lane = __builtin_amdgcn_mbcnt_hi(-1, __builtin_amdgcn_mbcnt_lo(-1, 0));
     int group = lane / 16;     // 0,1,2,3
     int sublane = lane % 16;   // column for B/C, row for A
 
