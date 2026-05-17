@@ -2333,14 +2333,30 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
                  static_cast<short>(0), c, false, false); }
 
 // gfx12 (_w32_gfx12 suffix) builtins: 3-arg (A, B, C) — no matrix_fmts / neg_c slot. fp/same-type acc:
-#define DISPATCH_WMMA_GFX12_F32_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
- (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { return inst_(a, b, c); }
+// The warp_size param (ws_) selects between _w32_gfx12 and _w64_gfx12 variants and is
+// required because both shapes share the same {wm, wn, wk} triple.
+#define DISPATCH_WMMA_GFX12_F32_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
+  wave_m == wm_ && wave_n == wn_ && wave_k == wk_ && warp_size == ws_) { return inst_(a, b, c); }
 // fp8/bf8 variant: A/B reinterpreted as packed i32 vector then (A, B, C):
-#define DISPATCH_WMMA_GFX12_8BIT_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
- (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
+#define DISPATCH_WMMA_GFX12_8BIT_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
+  wave_m == wm_ && wave_n == wn_ && wave_k == wk_ && warp_size == ws_) { \
     constexpr index_t i32_a = elem_a * static_cast<index_t>(sizeof(dtype_a)) / static_cast<index_t>(sizeof(i32_t)); \
     constexpr index_t i32_b = elem_b * static_cast<index_t>(sizeof(dtype_b)) / static_cast<index_t>(sizeof(i32_t)); \
     return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), __builtin_bit_cast(vector_t<i32_t, i32_b>, b), c); }
+// STEP_K: synthesize a larger K by chaining N copies of an inst with K=inst_k_. Matches
+// the gfx942 mfma_f32_16x16x32_*_1k pattern (2× 16x16x16 inner). Lets a kernel use a
+// wider A/B vector type per K-step so memory loads vectorize to b128 per lane (e.g.
+// wave64 16x16x32 bf16 = 8 elem/lane = 16 bytes = 1 ds_load_b128 per lane).
+#define DISPATCH_WMMA_GFX12_F32_STEP_K_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_k_, inst_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
+  wave_m == wm_ && wave_n == wn_ && wave_k == wk_ && warp_size == ws_) { \
+    constexpr index_t steps = wk_ / inst_k_; \
+    constexpr index_t e_a = elem_a / steps; constexpr index_t e_b = elem_b / steps; \
+    auto tmp = inst_(slice(a, number<0>{}, number<e_a>{}), slice(b, number<0>{}, number<e_b>{}), c); \
+    static_for<steps - 1>([&](auto i){ tmp = inst_(slice(a, number<e_a * (i+1)>{}, number<e_a*(i+2)>{}), slice(b, number<e_b * (i+1)>{}, number<e_b * (i+2)>{}), tmp); }); \
+    return tmp; }
 
 template<typename dtype_a_, typename dtype_b_, typename dtype_c_, index_t wave_m_, index_t wave_n_, index_t wave_k_, index_t warp_size_ = get_warp_size()>
 struct wmma {
@@ -2406,15 +2422,44 @@ struct wmma {
         else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, bf8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_bf8_bf8)
 #endif
 #if defined(__gfx1201__) || defined(__gfx1200__)
-        // gfx12 wave32 16x16x16: f16/bf16/fp8/bf8 → f32 + same-type (f16/bf16) acc. iu8/iu4 deferred (no iu*_t aliases yet).
-        else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp32_t , 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
-        else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, fp32_t , 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
-        else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp16_t , 16, 16, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12)
-        else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, bf16_t , 16, 16, 16, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w32_gfx12)
-        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(fp8_t , fp8_t , fp32_t , 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12)
-        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(fp8_t , bf8_t , fp32_t , 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_fp8_bf8_w32_gfx12)
-        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t , fp8_t , fp32_t , 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf8_fp8_w32_gfx12)
-        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t , bf8_t , fp32_t , 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12)
+        // The _w32/_w64 builtins are gated by wavefrontsize32/wavefrontsize64 target
+        // features. Clang checks target features eagerly (even for unused if-constexpr
+        // branches), so we gate the dispatch lines with __has_builtin to only include
+        // the lines that match the active wave mode.
+#  if __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
+        // gfx12 wave32 16x16x16: f16/bf16/fp8/bf8 → f32 + same-type (f16/bf16) acc. iu8/iu4 deferred.
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp16_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, bf16_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(fp8_t , fp8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(fp8_t , bf8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_fp8_bf8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t , fp8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf8_fp8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t , bf8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12)
+        // gfx12 wave32 16x16x32: synthetic — 2× stacked 16x16x16 along K. Per-lane A/B =
+        // 16 fp16/bf16 elem (= 32 B). Useful for wider per-K-step register footprint and
+        // amortizing inner-loop overhead across 2 wmma issues.
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp32_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, fp32_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp16_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, bf16_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w32_gfx12)
+#  endif // wave32 builtin available
+#  if __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w64_gfx12)
+        // gfx12 wave64 16x16x16: native _w64_gfx12 builtins. Per-lane A/B = 4 elem
+        // (= 8 B = 1 b64 load per lane). Kernel must be compiled with wavefrontsize64.
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp32_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f32_16x16x16_f16_w64_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, fp32_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp16_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f16_16x16x16_f16_w64_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, bf16_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w64_gfx12)
+        // gfx12 wave64 16x16x32: synthetic — 2× stacked _w64 16x16x16. Per-lane A/B = 8
+        // elem (= 16 B = 1 ds_load_b128 / global_load_b128 per lane). The primary
+        // motivation for the wave64 path on gfx12: wider per-lane vector-load slot than
+        // wave64 16x16x16's natural 8 B per lane.
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp32_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w64_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, fp32_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp16_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w64_gfx12)
+        else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, bf16_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w64_gfx12)
+#  endif // wave64 builtin available
 #endif // __gfx1201__ / __gfx1200__
         __builtin_unreachable();
     }
@@ -2512,8 +2557,10 @@ struct wmma {
 #undef DISPATCH_WMMA_8BIT_
 #undef DISPATCH_WMMA_GFX12_F32_
 #undef DISPATCH_WMMA_GFX12_8BIT_
+#undef DISPATCH_WMMA_GFX12_F32_STEP_K_
 
-// gfx12 (gfx1200/gfx1201, Navi 44/48) wave32 16x16x16 aliases
+// gfx12 (gfx1200/gfx1201, Navi 44/48) wave32 16x16x16 aliases (default warp_size).
+// The wave64 and synthetic 16x16x32 aliases follow below.
 using wmma_f32_16x16x16_f16     = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 16>;
 using wmma_f16_16x16x16_f16     = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 16>;
 using wmma_f32_16x16x16_bf16    = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 16>;
@@ -2522,6 +2569,21 @@ using wmma_f32_16x16x16_fp8_fp8 = wmma<fp8_t , fp8_t , fp32_t, 16, 16, 16>;
 using wmma_f32_16x16x16_fp8_bf8 = wmma<fp8_t , bf8_t , fp32_t, 16, 16, 16>;
 using wmma_f32_16x16x16_bf8_fp8 = wmma<bf8_t , fp8_t , fp32_t, 16, 16, 16>;
 using wmma_f32_16x16x16_bf8_bf8 = wmma<bf8_t , bf8_t , fp32_t, 16, 16, 16>;
+// gfx12 wave32 16x16x32 synthetic (2× 16x16x16 stacked along K, see STEP_K dispatch).
+using wmma_f32_16x16x32_f16_w32   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32, 32>;
+using wmma_f32_16x16x32_bf16_w32  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 32, 32>;
+using wmma_f16_16x16x32_f16_w32   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 32, 32>;
+using wmma_bf16_16x16x32_bf16_w32 = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 32, 32>;
+// gfx12 wave64 16x16x16 native — kernel must be compiled with wavefrontsize64.
+using wmma_f32_16x16x16_f16_w64   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 16, 64>;
+using wmma_f32_16x16x16_bf16_w64  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 16, 64>;
+using wmma_f16_16x16x16_f16_w64   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 16, 64>;
+using wmma_bf16_16x16x16_bf16_w64 = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 16, 64>;
+// gfx12 wave64 16x16x32 synthetic (2× 16x16x16_w64) — per-lane A/B = 16 B = 1 b128 load.
+using wmma_f32_16x16x32_f16_w64   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32, 64>;
+using wmma_f32_16x16x32_bf16_w64  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 32, 64>;
+using wmma_f16_16x16x32_f16_w64   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 32, 64>;
+using wmma_bf16_16x16x32_bf16_w64 = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 32, 64>;
 
 // f16/bf16 16x16x32
 using wmma_f32_16x16x32_f16   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32>;

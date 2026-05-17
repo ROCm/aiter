@@ -42,7 +42,11 @@ _CU_SOURCES = [
     "test_finfo.cu",
     "test_opus_gmem_gfx1201.cu",
     "test_wmma_gfx1201.cu",
+    "test_wmma_gfx1201_w64.cu",
 ]
+
+# Sources requiring -mwavefrontsize64 (wave64 builtins).
+_W64_SOURCES = {"test_wmma_gfx1201_w64.cu"}
 
 
 def _detect_arch():
@@ -76,7 +80,8 @@ def _find_hipcc():
 
 def _compile_one(args):
     """Compile a single .cu -> .o.  Used as a worker function for parallel builds."""
-    src, obj, hipcc, arch, verbose = args
+    src, obj, hipcc, arch, verbose, *rest = args
+    extra_flags = rest[0] if rest else []
     cmd = [
         hipcc,
         f"--offload-arch={arch}",
@@ -85,6 +90,7 @@ def _compile_one(args):
         "-D__HIPCC_RTC__",
         f"-I{_REPO_CSRC}",
         f"-I{_THIS_DIR}",
+        *extra_flags,
         "-c",
         src,
         "-o",
@@ -136,7 +142,8 @@ def build(verbose=False, jobs=None):
     for s in sources:
         src = os.path.join(_THIS_DIR, s)
         obj = os.path.join(_THIS_DIR, s.replace(".cu", ".o"))
-        tasks.append((src, obj, hipcc, arch, verbose))
+        extra = ["-mwavefrontsize64"] if s in _W64_SOURCES else []
+        tasks.append((src, obj, hipcc, arch, verbose, extra))
 
     objs = []
     with ProcessPoolExecutor(max_workers=jobs) as pool:
