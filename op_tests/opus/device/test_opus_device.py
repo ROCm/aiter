@@ -1432,16 +1432,20 @@ def test_wmma_gfx1201_f32_bf8_bf8(mod):
     )
 
 
-
 # WMMA wave64 tests for gfx1200/gfx1201 (RDNA4). The _w64_gfx12 builtins
 # use 64 lanes with 4 elem/lane instead of wave32's 8 elem/lane.
 
-def _test_wmma_gfx1201_w64_variant(mod, name, runner, in_dtype_a, in_dtype_b, out_dtype):
+
+def _test_wmma_gfx1201_w64_variant(
+    mod, name, runner, in_dtype_a, in_dtype_b, out_dtype
+):
     arch = _get_gpu_arch()
     if arch not in _WMMA_GFX1201_ARCHS:
         print(f"  SKIP: wmma_gfx1201_w64_{name} (arch={arch}, gfx1201-only)")
         return 0
-    if _skip_if_missing_symbol(mod, f"run_wmma_gfx1201_w64_{name}", f"wmma_gfx1201_w64_{name}"):
+    if _skip_if_missing_symbol(
+        mod, f"run_wmma_gfx1201_w64_{name}", f"wmma_gfx1201_w64_{name}"
+    ):
         return 0
 
     M = N = K = 16
