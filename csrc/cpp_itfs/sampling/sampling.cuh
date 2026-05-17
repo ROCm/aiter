@@ -218,6 +218,15 @@ __device__ void choose_bucket(Counter<T, IdxT>* counter, IdxT const* histogram,
     }
 }
 
+template <typename T, typename IdxT, typename RATIO_T = float>
+__host__ __device__ IdxT calc_buf_len(IdxT len) {
+    constexpr RATIO_T ratio = 2 + sizeof(IdxT) * 2 / sizeof(T);
+    IdxT buf_len = len / (ratio * 8);
+    constexpr IdxT aligned = 256 / std::min(sizeof(T), sizeof(IdxT));
+    buf_len = buf_len & (~(aligned - 1));
+    return buf_len;
+}
+
 template <typename T, typename IdxT, int BitsPerPass, bool WRITE_TOPK_VALUES, int BlockSize>
 __device__ void filter_and_histogram_for_one_block(
     T const* in_buf, IdxT const* in_idx_buf,
@@ -478,7 +487,10 @@ __global__ void radix_topk_one_block_kernel(
         __syncthreads();
 
         choose_bucket<T, IdxT, BitsPerPass>(&counter, histogram, current_k, 0);
-        if (threadIdx.x == 0) counter.previous_len = counter.len;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            counter.previous_len = counter.len;
+        }
         __syncthreads();
 
         if (counter.len == counter.k) {
@@ -535,7 +547,10 @@ __global__ void radix_topk_one_block_kernel(
         __syncthreads();
 
         choose_bucket<T, IdxT, BitsPerPass>(&counter, histogram, current_k, 1);
-        if (threadIdx.x == 0) counter.previous_len = counter.len;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            counter.previous_len = counter.len;
+        }
         __syncthreads();
 
         if (counter.len == counter.k || num_passes <= 2) {
@@ -597,7 +612,10 @@ __global__ void radix_topk_one_block_kernel(
         __syncthreads();
 
         choose_bucket<T, IdxT, BitsPerPass>(&counter, histogram, current_k, pass);
-        if (threadIdx.x == 0) counter.previous_len = counter.len;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            counter.previous_len = counter.len;
+        }
         __syncthreads();
 
         if (pass == num_passes - 1 || counter.len == counter.k) {
@@ -625,15 +643,6 @@ __global__ void radix_topk_one_block_kernel(
             break;
         }
     }
-}
-
-template <typename T, typename IdxT, typename RATIO_T = float>
-__host__ __device__ IdxT calc_buf_len(IdxT len) {
-    constexpr RATIO_T ratio = 2 + sizeof(IdxT) * 2 / sizeof(T);
-    IdxT buf_len = len / (ratio * 8);
-    constexpr IdxT aligned = 256 / std::min(sizeof(T), sizeof(IdxT));
-    buf_len = buf_len & (~(aligned - 1));
-    return buf_len;
 }
 
 inline size_t calc_aligned_size(std::vector<size_t> const& sizes) {
@@ -1302,30 +1311,57 @@ __global__ void TopKRenormWriteOnlyKernel(
     float* __restrict__ renormed_probs,
     int vocab_size)
 {
+    __shared__ typename hipcub::BlockReduce<float, BlockSize>::TempStorage reduce_temp;
+
     const int batch_id = blockIdx.x;
     const int tx = threadIdx.x;
     const float* row_probs = probs + static_cast<size_t>(batch_id) * vocab_size;
     float* row_out = renormed_probs + static_cast<size_t>(batch_id) * vocab_size;
 
     const float pivot = pivots[batch_id];
-    const float normalizer = normalizers[batch_id];
-
     const uint32_t step       = BlockSize * VEC_SIZE;
     const uint32_t num_chunks = (vocab_size + step - 1) / step;
 
+    float local_sum = 0.f;
     vec_t<float, VEC_SIZE> v;
+    const uint32_t uv = (uint32_t)vocab_size;
     for (uint32_t i = 0; i < num_chunks; ++i) {
         v.fill(0.f);
         const uint32_t base = (i * BlockSize + tx) * VEC_SIZE;
-        if (base < (uint32_t)vocab_size)
+        if (base + VEC_SIZE <= uv)
             v.cast_load(row_probs + base);
+        else if (base < uv)
+            for (uint32_t j = 0; j < VEC_SIZE && base + j < uv; ++j) v[j] = row_probs[base + j];
+#pragma unroll
+        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+            float p = v[j];
+            if (base + j < uv && p >= pivot)
+                local_sum += p;
+        }
+    }
+
+    float total_sum = hipcub::BlockReduce<float, BlockSize>(reduce_temp).Sum(local_sum);
+    __shared__ float s_normalizer;
+    if (tx == 0) s_normalizer = __frcp_rn(fmaxf(total_sum, 1e-8f));
+    __syncthreads();
+    const float normalizer = s_normalizer;
+
+    for (uint32_t i = 0; i < num_chunks; ++i) {
+        v.fill(0.f);
+        const uint32_t base = (i * BlockSize + tx) * VEC_SIZE;
+        if (base + VEC_SIZE <= uv)
+            v.cast_load(row_probs + base);
+        else if (base < uv)
+            for (uint32_t j = 0; j < VEC_SIZE && base + j < uv; ++j) v[j] = row_probs[base + j];
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; ++j) {
             float p = v[j];
             v[j] = (p >= pivot) ? p * normalizer : 0.f;
         }
-        if (base < (uint32_t)vocab_size)
+        if (base + VEC_SIZE <= uv)
             v.store(row_out + base);
+        else if (base < uv)
+            for (uint32_t j = 0; j < VEC_SIZE && base + j < uv; ++j) row_out[base + j] = v[j];
     }
 }
 
@@ -1347,6 +1383,7 @@ static void topk_renorm_from_probs(
     radix_topk::standalone_stable_radix_10bits<float, int, false>(
         nullptr, radix_buf_size, probs, batch_size, (int64_t)vocab_size,
         nullptr, nullptr, max_k, nullptr, nullptr, true, stream);
+    radix_buf_size = (radix_buf_size + 255) & ~(size_t)255;
 
     size_t pivot_bytes      = (size_t)batch_size * sizeof(float);
     size_t normalizer_bytes = (size_t)batch_size * sizeof(float);
