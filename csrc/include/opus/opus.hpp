@@ -1500,9 +1500,7 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
 //   Guarded by OPUS_ENABLE_RUNTIME_QUERY (default 0). Define OPUS_ENABLE_RUNTIME_QUERY=1 before
 //   including opus.hpp (or via compiler flag) to enable these functions and the hip_runtime_api.h include.
 //
-// gfx1200/gfx1201 wave32/64 detection: __AMDGCN_WAVEFRONT_SIZE__ was removed in ROCm 7.2 and
-// __builtin_amdgcn_wavefrontsize() is not constexpr. The _w32_gfx12 builtins are gated by the
-// wavefrontsize32 target feature (set by -mwavefrontsize32, the default), so __has_builtin is a constexpr proxy.
+// gfx12 wave32/64 detection: __AMDGCN_WAVEFRONT_SIZE__ removed in ROCm 7.2; _w32 builtins are gated by wavefrontsize32 target feature, so __has_builtin is a constexpr proxy.
 #if (defined(__gfx1201__) || defined(__gfx1200__)) && defined(__HIP_DEVICE_COMPILE__)
 #  if __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
 #    define OPUS_GFX120X_IS_WAVE32 1
@@ -2808,7 +2806,7 @@ template<typename d_a, typename d_b, typename d_c, typename WaveMNK /*seq<m, n, 
 OPUS_D decltype(auto) make_mfma(WaveMNK&&, A&& = {}, number<warp_size_> = {}) { return A{}(mfma<d_a, d_b, d_c, get<0>(WaveMNK{}), get<1>(WaveMNK{}), get<2>(WaveMNK{}), warp_size_>{}); }
 #endif // __GFX9__
 
-// wmma_adaptor: layout encoding for wave32 WMMA (gfx1250). TODO: gfx12 (gfx1200/gfx1201) needs a dedicated adaptor — its fragment layout is asymmetric (A row-distributed, B/C column-distributed) per AMD RDNA4 ISA §7.12.2 / CK wmma_gemm.hpp. Until then gfx1201 callers use opus::wmma<> directly.
+// wmma_adaptor: layout encoding for wave32 WMMA (gfx1250).
 // A:[(grpm_a<p>), (rept_a<y>, grpk_a<p>, pack_a<y>)], MxK
 // B:[(grpn_b<p>), (rept_b<y>, grpk_b<p>, pack_b<y>)], NxK
 // C:[(grpm_c<p>, rept_c<y>, pack_c<y>), (grpn_c<p>)], MxN
