@@ -2806,11 +2806,11 @@ template<typename d_a, typename d_b, typename d_c, typename WaveMNK /*seq<m, n, 
 OPUS_D decltype(auto) make_mfma(WaveMNK&&, A&& = {}, number<warp_size_> = {}) { return A{}(mfma<d_a, d_b, d_c, get<0>(WaveMNK{}), get<1>(WaveMNK{}), get<2>(WaveMNK{}), warp_size_>{}); }
 #endif // __GFX9__
 
-// wmma_adaptor: layout encoding for wave32 WMMA (gfx1250).
+// wmma_adaptor: layout encoding for wave32 WMMA (gfx1250, gfx1200/gfx1201).
 // A:[(grpm_a<p>), (rept_a<y>, grpk_a<p>, pack_a<y>)], MxK
 // B:[(grpn_b<p>), (rept_b<y>, grpk_b<p>, pack_b<y>)], NxK
 // C:[(grpm_c<p>, rept_c<y>, pack_c<y>), (grpn_c<p>)], MxN
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
 namespace impl {
 template<typename WMMA>
 struct wmma_adaptor : public remove_cvref_t<WMMA> {
@@ -2889,7 +2889,7 @@ OPUS_D decltype(auto) make_wmma(number<w_m>, number<w_n>, number<w_k>, A&& = {},
 
 template<typename d_a, typename d_b, typename d_c, typename WaveMNK, typename A = wmma_adaptor, index_t warp_size_ = get_warp_size()>
 OPUS_D decltype(auto) make_wmma(WaveMNK&&, A&& = {}, number<warp_size_> = {}) { return A{}(wmma<d_a, d_b, d_c, get<0>(WaveMNK{}), get<1>(WaveMNK{}), get<2>(WaveMNK{}), warp_size_>{}); }
-#endif // __gfx1250__
+#endif // __gfx1250__ / __gfx1201__ / __gfx1200__ (wmma_adaptor)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 namespace impl {

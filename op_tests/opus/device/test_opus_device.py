@@ -247,6 +247,26 @@ class OpusDeviceLib:
     def run_wmma_gfx1201_w64_bf16_bf16(self, A, B, C):
         self._run_wmma_gfx1201_w64("bf16_bf16", A, B, C)
 
+    # -- wmma_gfx1201_tiled (make_tiled_mma + partition_layout, C = A @ B^T via swap_ab) --
+    def _run_wmma_gfx1201_tiled(self, suffix, A, B, C):
+        fn = getattr(self._lib, f"run_wmma_gfx1201_tiled_{suffix}")
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I, _I, _I]
+        fn(
+            self._ptr(A),
+            self._ptr(B),
+            self._ptr(C),
+            int(A.stride(0)),
+            int(B.stride(0)),
+            int(C.stride(0)),
+        )
+
+    def run_wmma_gfx1201_tiled_f32_f16(self, A, B, C):
+        self._run_wmma_gfx1201_tiled("f32_f16", A, B, C)
+
+    def run_wmma_gfx1201_tiled_f32_bf16(self, A, B, C):
+        self._run_wmma_gfx1201_tiled("f32_bf16", A, B, C)
+
     # -- async_load --
     def run_async_load(self, Src, Dst):
         fn = self._lib.run_async_load
@@ -1520,6 +1540,65 @@ def test_wmma_gfx1201_w64_bf16_bf16(mod):
     )
 
 
+# Tiled WMMA tests for gfx1200/gfx1201: make_tiled_mma + partition_layout + gmem (C = A @ B^T).
+
+
+def _test_wmma_gfx1201_tiled_variant(mod, name, runner, in_dtype, out_dtype):
+    arch = _get_gpu_arch()
+    if arch not in _WMMA_GFX1201_ARCHS:
+        print(f"  SKIP: wmma_gfx1201_tiled_{name} (arch={arch}, gfx1201-only)")
+        return 0
+    if _skip_if_missing_symbol(
+        mod, f"run_wmma_gfx1201_tiled_{name}", f"wmma_gfx1201_tiled_{name}"
+    ):
+        return 0
+
+    M = N = K = 16
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    A = torch.randn(M, K, dtype=torch.float32, device=device) * 2.0
+    B = torch.randn(N, K, dtype=torch.float32, device=device) * 2.0
+    a = A.to(in_dtype)
+    b = B.to(in_dtype)
+    C = torch.zeros(M, N, dtype=out_dtype, device=device)
+    Ref = (a.to(torch.float32) @ b.to(torch.float32).t()).to(out_dtype)
+
+    runner(a, b, C)
+
+    atol, rtol = _wmma_gfx1201_tolerances(out_dtype)
+    ok = torch.allclose(C.float(), Ref.float(), atol=atol, rtol=rtol)
+    max_diff = (C.float() - Ref.float()).abs().max().item()
+    if not ok:
+        print(
+            f"  FAIL: wmma_gfx1201_tiled_{name} max_diff={max_diff:.4e} (atol={atol})"
+        )
+        return 1
+    print(
+        f"  PASS: wmma_gfx1201_tiled_{name} (in={in_dtype}, out={out_dtype}, max_diff={max_diff:.4e})"
+    )
+    return 0
+
+
+def test_wmma_gfx1201_tiled_f32_f16(mod):
+    return _test_wmma_gfx1201_tiled_variant(
+        mod,
+        "f32_f16",
+        mod.run_wmma_gfx1201_tiled_f32_f16,
+        torch.float16,
+        torch.float32,
+    )
+
+
+def test_wmma_gfx1201_tiled_f32_bf16(mod):
+    return _test_wmma_gfx1201_tiled_variant(
+        mod,
+        "f32_bf16",
+        mod.run_wmma_gfx1201_tiled_f32_bf16,
+        torch.bfloat16,
+        torch.float32,
+    )
+
+
 def test_async_load(mod):
     """Test async_load: copy data through LDS and verify integrity."""
     if _skip_if_missing_symbol(mod, "run_async_load", "async_load"):
@@ -2557,6 +2636,8 @@ def main():
     failures += test_wmma_gfx1201_w64_f32_bf16(mod)
     failures += test_wmma_gfx1201_w64_f16_f16(mod)
     failures += test_wmma_gfx1201_w64_bf16_bf16(mod)
+    failures += test_wmma_gfx1201_tiled_f32_f16(mod)
+    failures += test_wmma_gfx1201_tiled_f32_bf16(mod)
     failures += test_async_load(mod)
     failures += test_tr_load_f16(mod)
     failures += test_dtype_convert_fp32_bf16(mod)

@@ -43,6 +43,7 @@ _CU_SOURCES = [
     "test_opus_gmem_gfx1201.cu",
     "test_wmma_gfx1201.cu",
     "test_wmma_gfx1201_w64.cu",
+    "test_wmma_gfx1201_tiled.cu",
 ]
 
 # Sources requiring -mwavefrontsize64 (wave64 builtins).
