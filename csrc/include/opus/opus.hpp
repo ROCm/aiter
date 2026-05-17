@@ -2334,26 +2334,21 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
                  __builtin_bit_cast(vector_t<i32_t, i32_b>, b), \
                  static_cast<short>(0), c, false, false); }
 
-// gfx12 (_w32_gfx12 suffix) builtins: 3-arg (A, B, C) — no matrix_fmts / neg_c slot. fp/same-type acc:
-// ws_ param selects _w32/_w64 variants (both share the same {wm,wn,wk} triple).
+// gfx12 builtins: 3-arg (A, B, C) — no matrix_fmts/neg_c. ws_ selects _w32/_w64 (same {wm,wn,wk} triple).
+#define DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) \
+ (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_ && warp_size == ws_)
 #define DISPATCH_WMMA_GFX12_F32_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_) \
- (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
-  wave_m == wm_ && wave_n == wn_ && wave_k == wk_ && warp_size == ws_) { return inst_(a, b, c); }
-// fp8/bf8 variant: A/B reinterpreted as packed i32 vector then (A, B, C):
-#define DISPATCH_WMMA_GFX12_8BIT_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_) \
- (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
-  wave_m == wm_ && wave_n == wn_ && wave_k == wk_ && warp_size == ws_) { \
+ DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { return inst_(a, b, c); }
+#define DISPATCH_WMMA_GFX12_8BIT_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_) /* fp8/bf8: A/B bitcast to i32 */ \
+ DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { \
     constexpr index_t i32_a = elem_a * static_cast<index_t>(sizeof(dtype_a)) / static_cast<index_t>(sizeof(i32_t)); \
     constexpr index_t i32_b = elem_b * static_cast<index_t>(sizeof(dtype_b)) / static_cast<index_t>(sizeof(i32_t)); \
     return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), __builtin_bit_cast(vector_t<i32_t, i32_b>, b), c); }
-// STEP_K: chain N copies of inst with K=inst_k_ to synthesize wider K (like mfma_*_1k). Wider per-lane A/B for b128 loads.
-#define DISPATCH_WMMA_GFX12_F32_STEP_K_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_k_, inst_) \
- (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
-  wave_m == wm_ && wave_n == wn_ && wave_k == wk_ && warp_size == ws_) { \
-    constexpr index_t steps = wk_ / inst_k_; \
-    constexpr index_t e_a = elem_a / steps; constexpr index_t e_b = elem_b / steps; \
+#define DISPATCH_WMMA_GFX12_F32_STEP_K_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_k_, inst_) /* chain N×inst for wider K */ \
+ DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { \
+    constexpr index_t steps = wk_ / inst_k_, e_a = elem_a / steps, e_b = elem_b / steps; \
     auto tmp = inst_(slice(a, number<0>{}, number<e_a>{}), slice(b, number<0>{}, number<e_b>{}), c); \
-    static_for<steps - 1>([&](auto i){ tmp = inst_(slice(a, number<e_a * (i+1)>{}, number<e_a*(i+2)>{}), slice(b, number<e_b * (i+1)>{}, number<e_b * (i+2)>{}), tmp); }); \
+    static_for<steps - 1>([&](auto i){ tmp = inst_(slice(a, number<e_a*(i+1)>{}, number<e_a*(i+2)>{}), slice(b, number<e_b*(i+1)>{}, number<e_b*(i+2)>{}), tmp); }); \
     return tmp; }
 
 template<typename dtype_a_, typename dtype_b_, typename dtype_c_, index_t wave_m_, index_t wave_n_, index_t wave_k_, index_t warp_size_ = get_warp_size()>
@@ -2547,6 +2542,7 @@ struct wmma {
 #undef DISPATCH_WMMA_
 #undef DISPATCH_WMMA_BF16F32_
 #undef DISPATCH_WMMA_8BIT_
+#undef DISPATCH_WMMA_GFX12_MATCH_
 #undef DISPATCH_WMMA_GFX12_F32_
 #undef DISPATCH_WMMA_GFX12_8BIT_
 #undef DISPATCH_WMMA_GFX12_F32_STEP_K_
