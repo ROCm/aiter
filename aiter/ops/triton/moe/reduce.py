@@ -1,6 +1,7 @@
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.moe.reduce import _reduce_grouped
+from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
 
 def reduce_grouped(
@@ -58,7 +59,8 @@ def reduce_grouped(
         out.stride(1),  #
         indx,  #
         x.shape[0],
-        x.shape[-1],
+        x.shape[1],
+        x.shape[2],
         num_blocks,
         apply_swiglu,
         alpha,
@@ -68,6 +70,7 @@ def reduce_grouped(
         EVEN_N=(x.shape[-1] % BLOCK_N == 0),
         K=K,  #
         ADD_RESIDUAL=add_residual,
+        USE_TDM=is_tdm_avail(),
         num_warps=2,  #
     )
     return out
