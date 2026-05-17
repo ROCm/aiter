@@ -499,10 +499,8 @@ template <std::size_t I, typename... Ts> struct tuple_element<I, const opus::tup
 } // namespace std
 
 namespace opus {
-// fwd-decl mma adaptor dispatchers — full defs are arch-gated (mfma under __GFX9__, wmma under __gfx1250__);
-// archs matching neither (e.g. gfx1200/gfx1201) need the names visible so make_tiled_mma()'s default template arg parses.
-struct mfma_adaptor; struct mfma_adaptor_swap_ab;
-struct wmma_adaptor; struct wmma_adaptor_swap_ab;
+// fwd-decl mma adaptors — needed so make_tiled_mma() parses on archs (gfx12) where full defs are gated out.
+struct mfma_adaptor; struct mfma_adaptor_swap_ab; struct wmma_adaptor; struct wmma_adaptor_swap_ab;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // transforms
@@ -1106,8 +1104,8 @@ OPUS_D constexpr unsigned short fp32_to_bf16_rtn_raw(float f)
     else if(bits & 0xffff) { bits |= 0x10000; /* Preserve signaling NaN */ }
     return static_cast<unsigned short>(bits >> 16);
 }
-#if (defined(__gfx950__) || defined(__gfx1250__)) && __clang_major__ >= 20
-template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx1250 has instruction conversion, leave 'rm' here for compatiblity
+#if (defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)) && __clang_major__ >= 20
+template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx1250/gfx12 has instruction conversion, leave 'rm' here for compatiblity
 OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) { return static_cast<bf16_t>(x); }
 #else
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // 0:standard, 1:truncate_with_nan, 2:truncate, 3:standard asm 4:rta_asm(round to nearest away)
@@ -1502,14 +1500,25 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
 //   Guarded by OPUS_ENABLE_RUNTIME_QUERY (default 0). Define OPUS_ENABLE_RUNTIME_QUERY=1 before
 //   including opus.hpp (or via compiler flag) to enable these functions and the hip_runtime_api.h include.
 //
+// gfx1200/gfx1201 wave32/64 detection: __AMDGCN_WAVEFRONT_SIZE__ was removed in ROCm 7.2 and
+// __builtin_amdgcn_wavefrontsize() is not constexpr. The _w32_gfx12 builtins are gated by the
+// wavefrontsize32 target feature (set by -mwavefrontsize32, the default), so __has_builtin is a constexpr proxy.
+#if (defined(__gfx1201__) || defined(__gfx1200__)) && defined(__HIP_DEVICE_COMPILE__)
+#  if __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
+#    define OPUS_GFX120X_IS_WAVE32 1
+#  else
+#    define OPUS_GFX120X_IS_WAVE32 0
+#  endif
+#endif
+
 OPUS_H_D constexpr index_t get_warp_size()
 {
 #if defined(__gfx1250__)
     return 32;
 #elif defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
     return 64;
-#elif (defined(__gfx1201__) || defined(__gfx1200__)) && __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w64_gfx12)
-    return 64; // workaround: __AMDGCN_WAVEFRONT_SIZE__ removed in ROCm 7.2; _w64 builtins are gated by -mwavefrontsize64 target feature, so __has_builtin is a constexpr proxy
+#elif defined(OPUS_GFX120X_IS_WAVE32) && !OPUS_GFX120X_IS_WAVE32
+    return 64;
 #else
     return 32;
 #endif
@@ -2336,16 +2345,16 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
 
 // gfx12 builtins: 3-arg (A, B, C) — no matrix_fmts/neg_c. ws_ selects _w32/_w64 (same {wm,wn,wk} triple).
 #define DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) \
- (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_ && warp_size == ws_)
+    (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_ && warp_size == ws_)
 #define DISPATCH_WMMA_GFX12_F32_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_) \
- DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { return inst_(a, b, c); }
+    DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { return inst_(a, b, c); }
 #define DISPATCH_WMMA_GFX12_8BIT_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_) /* fp8/bf8: A/B bitcast to i32 */ \
- DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { \
+    DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { \
     constexpr index_t i32_a = elem_a * static_cast<index_t>(sizeof(dtype_a)) / static_cast<index_t>(sizeof(i32_t)); \
     constexpr index_t i32_b = elem_b * static_cast<index_t>(sizeof(dtype_b)) / static_cast<index_t>(sizeof(i32_t)); \
     return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), __builtin_bit_cast(vector_t<i32_t, i32_b>, b), c); }
 #define DISPATCH_WMMA_GFX12_F32_STEP_K_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_k_, inst_) /* chain N×inst for wider K */ \
- DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { \
+    DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { \
     constexpr index_t steps = wk_ / inst_k_, e_a = elem_a / steps, e_b = elem_b / steps; \
     auto tmp = inst_(slice(a, number<0>{}, number<e_a>{}), slice(b, number<0>{}, number<e_b>{}), c); \
     static_for<steps - 1>([&](auto i){ tmp = inst_(slice(a, number<e_a*(i+1)>{}, number<e_a*(i+2)>{}), slice(b, number<e_b*(i+1)>{}, number<e_b*(i+2)>{}), tmp); }); \
@@ -2415,8 +2424,8 @@ struct wmma {
         else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, bf8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_bf8_bf8)
 #endif
 #if defined(__gfx1201__) || defined(__gfx1200__)
-        // _w32/_w64 builtins gated by wavefrontsize target feature; __has_builtin selects the active wave mode.
-#  if __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
+        // _w32/_w64 builtins gated by wavefrontsize target feature; OPUS_GFX120X_IS_WAVE32 selects the active wave mode.
+#  if OPUS_GFX120X_IS_WAVE32
         // gfx12 wave32 16x16x16: f16/bf16/fp8/bf8 → f32 + same-type acc. iu8/iu4 deferred.
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
@@ -2432,16 +2441,13 @@ struct wmma {
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp16_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, bf16_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w32_gfx12)
 #  endif // wave32 builtin available
-#  if __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w64_gfx12)
+#  if !OPUS_GFX120X_IS_WAVE32
         // gfx12 wave64 16x16x16: native _w64_gfx12 builtins (4 elem/lane). Requires -mwavefrontsize64.
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp32_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f32_16x16x16_f16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, fp32_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp16_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f16_16x16x16_f16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, bf16_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w64_gfx12)
-        // gfx12 wave64 16x16x32: synthetic — 2× stacked _w64 16x16x16. Per-lane A/B = 8
-        // elem (= 16 B = 1 ds_load_b128 / global_load_b128 per lane). The primary
-        // motivation for the wave64 path on gfx12: wider per-lane vector-load slot than
-        // wave64 16x16x16's natural 8 B per lane.
+        // gfx12 wave64 16x16x32 synthetic: 2× stacked _w64 16x16x16 (8 elem/lane = 1 b128 load).
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp32_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, fp32_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp16_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w64_gfx12)

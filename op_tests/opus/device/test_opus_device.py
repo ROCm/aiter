@@ -380,7 +380,7 @@ _FP8_LIKE_DTYPES = {
 def _get_fp8_dtype():
     """Return the correct FP8 (e4m3) torch dtype for the current GPU arch."""
     arch = _get_gpu_arch()
-    if arch in ("gfx950", "gfx1250"):
+    if arch in ("gfx950", "gfx1250", "gfx1201", "gfx1200"):
         return torch.float8_e4m3fn
     return torch.float8_e4m3fnuz  # gfx942 default
 
@@ -388,7 +388,7 @@ def _get_fp8_dtype():
 def _get_bf8_dtype():
     """Return the correct BF8 (e5m2) torch dtype for the current GPU arch."""
     arch = _get_gpu_arch()
-    if arch in ("gfx950", "gfx1250"):
+    if arch in ("gfx950", "gfx1250", "gfx1201", "gfx1200"):
         return torch.float8_e5m2
     return torch.float8_e5m2fnuz  # gfx942 default
 
@@ -2300,7 +2300,14 @@ def test_numeric_limits(mod):
         ("fp16", 5, 2, True, torch.float16, True),
         ("bf16", 10, 2, True, torch.bfloat16, True),
         ("fp8", 15, 1, True, fp8_dtype, False),
-        ("bf8", 20, 1, True, bf8_dtype, arch in ("gfx950", "gfx1250")),
+        (
+            "bf8",
+            20,
+            1,
+            True,
+            bf8_dtype,
+            arch in ("gfx950", "gfx1250", "gfx1201", "gfx1200"),
+        ),
         ("i32", 25, 4, False, torch.int32, False),
         ("i16", 35, 2, False, torch.int16, False),
         ("i8", 45, 1, False, torch.int8, False),
