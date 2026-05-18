@@ -17,7 +17,11 @@ import torch
 import triton
 
 import aiter
-from aiter.ops.mha import flash_attn_func, flash_attn_fp8_pertensor_func, flash_attn_i8fp8_pertensor_func
+from aiter.ops.mha import (
+    flash_attn_func,
+    flash_attn_fp8_pertensor_func,
+    flash_attn_i8fp8_pertensor_func,
+)
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
@@ -631,7 +635,11 @@ def make_kernel_runner(
     if args.kernel == "aiter_fp8":
 
         def _run_aiter_fp8():
-            q_fp8, k_fp8, v_fp8, q_ds, k_ds, v_ds = fp8_quantize(q_bshd, k_bshd, v_bshd)
+            q_fp8, k_fp8, v_fp8, q_ds, k_ds, v_ds = fp8_quantize(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+            )
             return flash_attn_fp8_pertensor_func(
                 q_fp8,
                 k_fp8,
@@ -645,7 +653,9 @@ def make_kernel_runner(
             return _run_aiter_fp8
 
         q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = fp8_quantize(
-            q_bshd, k_bshd, v_bshd
+            q_bshd,
+            k_bshd,
+            v_bshd,
         )
         return lambda: flash_attn_fp8_pertensor_func(
             q_fp8,
@@ -798,7 +808,7 @@ def benchmark_single_case(
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
         compare_accuracy(current_primary, ref_primary)
         if args.kernel == "sage_mxfp4":
-            # MXFP4 is numerically noisier than BF16/FP32 and needs looser checks.
+            # MXFP4 Q/K quantization is numerically noisier than BF16/FP32.
             check_attention_outputs(
                 current_primary, ref_primary, fp8=True, atol=3.0e-1, rtol=2.0e-1
             )
@@ -814,14 +824,24 @@ def benchmark_single_case(
         * (shape.d_head + shape.d_head_v)
     )
 
-    if args.kernel in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8", "sage_fp8", "sage_mxfp4"):
+    if args.kernel in (
+        "fav3_fp8",
+        "aiter_fp8",
+        "aiter_i8fp8",
+        "sage_fp8",
+        "sage_mxfp4",
+    ):
         q_elem_size = 1
         k_elem_size = 1
     else:
         q_elem_size = q.element_size()
         k_elem_size = k.element_size()
 
-    v_elem_size = 1 if args.kernel in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8") else v.element_size()
+    v_elem_size = (
+        1
+        if args.kernel in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8")
+        else v.element_size()
+    )
     mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
 
     sparse_flops = None
@@ -1010,7 +1030,13 @@ def validate_args(args: argparse.Namespace) -> None:
         if args.load_captured:
             raise ValueError("--kernel=all does not support --load-captured")
 
-    _quantized_kernels = ("sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8", "aiter_i8fp8")
+    _quantized_kernels = (
+        "sage_fp8",
+        "sage_mxfp4",
+        "fav3_fp8",
+        "aiter_fp8",
+        "aiter_i8fp8",
+    )
 
     if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
