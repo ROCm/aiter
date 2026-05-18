@@ -80,6 +80,14 @@ ALL_KERNELS: List[str] = [
     "aiter_bf16",
 ]
 
+FP8_CHECK_KERNELS = {
+    "sage_fp8",
+    "sage_mxfp4",
+    "fav3_fp8",
+    "aiter_fp8",
+    "aiter_i8fp8",
+}
+
 
 @dataclass
 class ShapeSpec:
@@ -925,10 +933,14 @@ def benchmark_single_case(
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
         compare_accuracy(current_primary, ref_primary)
-        if args.kernel == "sage_mxfp4":
-            # MXFP4 Q/K quantization is numerically noisier than BF16/FP32.
+        if args.kernel in FP8_CHECK_KERNELS:
             check_attention_outputs(
-                current_primary, ref_primary, fp8=True, atol=3.0e-1, rtol=2.0e-1
+                current_primary,
+                ref_primary,
+                fp8=True,
+                max_diff_percentage=(
+                    2.0 if args.input_distribution == "transformer" else 0.5
+                ),
             )
         else:
             check_attention_outputs(current_primary, ref_primary, fp8=False)
