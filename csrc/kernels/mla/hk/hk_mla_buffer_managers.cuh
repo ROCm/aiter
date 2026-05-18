@@ -725,14 +725,24 @@ class QManager8to16bitsV1
         constexpr uint32_t kColInRecord    = kChunkIdx * kP1ChunkCols;          // 0,64,128,192
         constexpr int      kVOffI          = static_cast<int>(kColInRecord);
         constexpr uint32_t kStagingI       = kBufIdx * kP1StagingBytesPerWarp;
+        // Chunk = 64 cols = 2 sub-block tiles (tile_idx = 2*kChunkIdx, 2*kChunkIdx+1).
+        // Each tile's scale is 2 bytes (duplicated) in the [448..463] region, so
+        // tile T's byte offset is 448 + 2*T. s0 -> tile (2*kChunkIdx) at +0,
+        // s1 -> tile (2*kChunkIdx+1) at +2.
         constexpr uint32_t kScaleBaseInRec =
-            kScaleBaseOff + (kChunkIdx * kP1ChunkCols) / kSubBlockCols;         // 448 + 2*kChunkIdx
+            kScaleBaseOff + 4u * kChunkIdx;                                     // 448 + 4*kChunkIdx
 
         const uint32_t lane_idx     = opus::lane_id();
         const uint32_t row_in_warp  = lane_idx >> 2;                            // 0..15
         const uint32_t col_quad     = lane_idx & 3u;                            // 0..3
         const uint32_t v_off        = row_in_warp * kPackedNopeStride + col_quad * 16u;
-        const uint32_t v_off_scale  = row_in_warp * kPackedNopeStride;
+        // Scale must be loaded for the row that the CONSUMER attributes to this
+        // lane (consumer uses lane & 15, NOT lane >> 2 -- see
+        // p1_staging_to_vgpr_chunk). Otherwise each lane scales row R's fp8 data
+        // by row (R/4)'s scale, which is silently wrong on near-uniform data and
+        // catastrophic on outliers.
+        const uint32_t scale_row    = lane_idx & 15u;
+        const uint32_t v_off_scale  = scale_row * kPackedNopeStride;
 
         const hk::i32x4 srsrc = hk::make_srsrc(p_q_warp, 0xffffffff);
         hk::llvm_amdgcn_raw_buffer_load_lds(
@@ -751,7 +761,7 @@ class QManager8to16bitsV1
         s0_dw = hkm::buffer_load_ubyte(
             br, v_off_scale, /*s_off=*/0u, /*i_off=*/kScaleBaseInRec + 0u);
         s1_dw = hkm::buffer_load_ubyte(
-            br, v_off_scale, /*s_off=*/0u, /*i_off=*/kScaleBaseInRec + 1u);
+            br, v_off_scale, /*s_off=*/0u, /*i_off=*/kScaleBaseInRec + 2u);
     }
 
     // ---- Phase 1: 1 fp8 chunk in staging -> 2 mfma A-tiles in VGPR ----
@@ -790,14 +800,15 @@ class QManager8to16bitsV1
         const uintptr_t addr_base =
             p_lds_warp_staging + row_in_warp * (kP1ChunkCols) + col_byte;
 
-        // Drain vmcnt: this chunk's staging buffer_load_lds AND the two scale
-        // buffer_load_ubytes (issued in p1_vmem_to_staging_chunk) must complete
-        // before we ds_read the staging / consume the scales. Drains EVERY
-        // outstanding vmem -- simple non-pipelined approach; Phase 1 is a
-        // one-shot warmup, not on the critical loop, so the lost overlap is
-        // acceptable for Gen.1.
+        // Drain BOTH vmcnt AND lgkmcnt:
+        //  - vmcnt covers the vmem-fetch side of buffer_load_lds + the scale
+        //    buffer_load_ubytes that returned to VGPR.
+        //  - lgkmcnt covers the LDS-write side of buffer_load_lds. On GFX9 a
+        //    buffer_load_lds increments lgkmcnt for its LDS-store half; ds_read
+        //    of that LDS region can see stale data unless lgkmcnt is drained
+        //    first. Phase 1 is a one-shot warmup -- the lost pipelining is fine.
         __builtin_amdgcn_s_waitcnt(
-            hk_mla::encode_s_waitcnt(/*expcnt=*/0, /*lgkmcnt=*/0, /*vmcnt=*/1));
+            hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/0));
         __builtin_amdgcn_sched_barrier(0);
 
         // 8 fp8/lane per iter -> 2 dwords/lane via ds_read_b64. kStagingI is
@@ -811,7 +822,7 @@ class QManager8to16bitsV1
         // intrinsic and is otherwise free to be hoisted past a bare s_waitcnt
         // (verified by ISA inspection on KvManager8to16bitsV1).
         __builtin_amdgcn_s_waitcnt(
-            hk_mla::encode_s_waitcnt(/*expcnt=*/0, /*lgkmcnt=*/1, /*vmcnt=*/0));
+            hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
         __builtin_amdgcn_sched_barrier(0);
 
         const float s0_f = hk_mla::e8m0_to_f32(s0_dw);
@@ -897,7 +908,7 @@ class QManager8to16bitsV1
         // be hoisted past a bare s_waitcnt; intrinsic+sched_barrier is the
         // true scheduling barrier.)
         __builtin_amdgcn_s_waitcnt(
-            hk_mla::encode_s_waitcnt(/*expcnt=*/0, /*lgkmcnt=*/0, /*vmcnt=*/1));
+            hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/0));
         __builtin_amdgcn_sched_barrier(0);
 
         const float scale_f = hk_mla::e8m0_to_f32(scale_dw);
@@ -1066,6 +1077,41 @@ class QManager8to16bitsV1
         p2_vmem_to_vgpr_nope_chunk<2>(p_q_warp, nope_dw_2, scale_dw_2);
         p2_load_rope_chunk(p_q_rope_warp, p_lds_q, warp_idx_u);
         p2_cvt_store_nope_chunk<2>(p_lds_q, warp_idx_u, nope_dw_2, scale_dw_2);
+    }
+
+    // QK A-tile load from the bf16 final Q LDS region. Loads one 16 x 32 bf16
+    // sub-block (= 4 vgprs/lane) into RT in mfma_f32_16x16x32_bf16 A layout.
+    //   kColTile selects the col tile inside Q[:, 256:512] (0..7, where 0..5
+    //   are NoPE Q cols 256..447, 6..7 are RoPE Q cols 448..511).
+    //   warp_idx selects the row tile (each warp owns its own 16 M-rows).
+    // The per-warp sub-block byte stride is dynamic (warp_idx * kSubBlockBytes,
+    // scalar) so it cannot fold into the ds_read offset immediate; the col-tile
+    // bytes fold via the 16-bit ds_read offset:.
+    template <uint32_t kColTile, hkdart::all RT>
+    __device__ __forceinline__ static void
+        load_q_lds_to_gpr(RT& dst, const uintptr_t p_lds_q, const uint32_t warp_idx)
+    {
+        static_assert(kColTile < kFinalLdsColTiles,
+                      "load_q_lds_to_gpr: kColTile out of range.");
+
+        constexpr uint32_t kMfmaRows       = 16;
+        constexpr uint32_t kMfmaElemPerThr = 8;
+
+        const uint32_t lane_idx = opus::lane_id();
+        const uint32_t row      = lane_idx % kMfmaRows;
+        const uint32_t col      = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
+
+        const uint32_t in_sb_byte =
+            row * (kSubBlockCols * sizeof(hk::bf16)) + col * sizeof(hk::bf16);
+
+        constexpr uint32_t kColTileBytes = kColTile * kFinalLdsRowTiles * kSubBlockBytes;
+
+        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, 0>;
+        static_assert(range_type::lo + 3 == range_type::hi,
+                      "ds_read_b128 requires 4 consecutive registers");
+
+        const uintptr_t p_lds_q_lane = p_lds_q + warp_idx * kSubBlockBytes + in_sb_byte;
+        hkm::ds_read_b128<range_type::lo>(static_cast<uint32_t>(p_lds_q_lane), kColTileBytes);
     }
 };
 
@@ -2087,14 +2133,21 @@ class KvManager8to16bitsV1
 
     // ---- Public API: addressing helpers used by the kernel body ------------
     // Per-warp logical row inside the 32-row KV tile (range [0, 31]).
+    // Per-lane row index in the 32-row KV tile. Maps the wave-to-tile partition
+    // (row_tile = (warp_idx>>1)&1; lanes 0..63 cover 16 rows x 4 col_groups) to
+    // an absolute row [0, 32) in the tile. The kernel body then adds
+    // kv_tile_start to get a row index in the *flat* KV-token space.
+    //
+    // Each row of the 32-row tile is covered by 4 lanes (col_group 0..3 reading
+    // 16 fp8 cols each = 64 cols total per wave-col-tile). row_in_warp = lane>>2
+    // gives the within-wave row 0..15; row_tile*16 selects the upper-half or
+    // lower-half of the 32-row tile.
     __device__ __forceinline__ static uint32_t get_kv_ld_row_base_idx(const int32_t warp_idx)
     {
-        // TODO(v4.0 Phase 2): derive from warp_idx + lane_idx so each lane fetches
-        // exactly one fp8 row segment per chunk. The 32 rows of a chunk are split
-        // across 8 waves x 4 lane-rows = 32 rows -> each lane covers 1 row x 32 fp8
-        // bytes per chunk = 1 dwordx4 + 1 dwordx4 across 2 lanes-per-row interleaved.
-        (void)warp_idx;
-        return 0;
+        const uint32_t lane_idx    = opus::lane_id();
+        const uint32_t row_tile    = (static_cast<uint32_t>(warp_idx) >> 1) & 1u; // 0 or 1
+        const uint32_t row_in_warp = lane_idx >> 2;                               // 0..15
+        return row_tile * 16u + row_in_warp;                                      // 0..31
     }
 
     // Per-lane column byte offset into the packed 576 B/token KV-NoPE record.
@@ -2161,38 +2214,46 @@ class KvManager8to16bitsV1
             const hk::buffer_resource br =
                 hk::make_buffer_resource(as_u64, 0xffffffff, 0x00020000);
 
-            // Address split (NoPE):
-            //   v_offset (per-lane)   = col_group * 16
-            //   s_offset (wave-unif)  = row_kv_ld * 576 + col_tile_in_tile * 64
+            // Address split (NoPE): row_kv_ld is *per-lane* (each lane covers a
+            // distinct row of the 32-row KV tile, see get_kv_ld_row_base_idx),
+            // so it MUST live in v_offset -- routing it via s_offset would force
+            // v_readfirstlane and collapse all lanes onto row 0.
+            //   v_offset (per-lane)   = row_kv_ld * 576 + col_group * 16
+            //   s_offset (wave-unif)  = col_tile_in_tile * 64
             //   i_offset (compile-tm) = kTileIdx * 256
-            const uint32_t v_off_nope = col_group * 16u;
-            const uint32_t s_off_nope =
+            const uint32_t v_off_nope =
                 in_bounds
                     ? (static_cast<uint32_t>(row_kv_ld) * kPackedStride +
-                       col_tile_in_tile * kWaveTileCols)
+                       col_group * 16u)
                     : 0u;
-            constexpr int i_off_nope = static_cast<int>(kTileIdx * kTileCols);
+            const uint32_t s_off_nope = col_tile_in_tile * kWaveTileCols;
+            constexpr int  i_off_nope = static_cast<int>(kTileIdx * kTileCols);
 
-            // Address split (scale): wave-uniform load, 1 byte zero-extended.
-            //   v_offset (per-lane)   = 0
-            //   s_offset (wave-unif)  = row_kv_ld * 576 + col_tile_in_tile * 2
+            // Address split (scale): also per-lane (each lane consumes the scale
+            // for its own row in cvt_and_store_kv_tile). 1 byte zero-extended.
+            //   v_offset (per-lane)   = row_kv_ld * 576 + col_tile_in_tile * 2
+            //   s_offset (wave-unif)  = 0
             //   i_offset (compile-tm) = 448 + kTileIdx * 8
+            // Per kTileIdx we cover kColTilesPerTile (=8) sub-block-cols of 32
+            // V-cols each = 256 V-cols = 4 scale tiles. Each scale tile occupies
+            // 2 bytes (duplicated), so skip 4*2 = 8 = kColTilesPerTile bytes per
+            // kTileIdx (since 1 sub-block-col is half a scale tile = 1 dup byte).
             constexpr uint32_t kScaleBaseOff = 448u;
-            const uint32_t     s_off_scale =
+            const uint32_t     v_off_scale =
                 in_bounds
                     ? (static_cast<uint32_t>(row_kv_ld) * kPackedStride +
                        col_tile_in_tile * 2u)
                     : 0u;
             constexpr int i_off_scale =
-                static_cast<int>(kScaleBaseOff + kTileIdx * (kColTilesPerTile * 2u));
+                static_cast<int>(kScaleBaseOff + kTileIdx * kColTilesPerTile);
 
             prefetch_out.nope_dw =
                 in_bounds
-                    ? hkm::buffer_load_dwordx4(br, v_off_nope, s_off_nope, i_off_nope)
+                    ? hkm::buffer_load_dwordx4(br, v_off_nope, /*s_off=*/s_off_nope, i_off_nope)
                     : hk::u32x4{0u, 0u, 0u, 0u};
             prefetch_out.scale_dw =
                 in_bounds
-                    ? hkm::buffer_load_ubyte(br, /*v_offset=*/0u, s_off_scale, i_off_scale)
+                    ? hkm::buffer_load_ubyte(br, v_off_scale, /*s_off=*/0u, i_off_scale)
                     : 0u;
         }
         else
@@ -2268,7 +2329,7 @@ class KvManager8to16bitsV1
         if(skip == false)
         {
             __builtin_amdgcn_s_waitcnt(
-                hk_mla::encode_s_waitcnt(/*expcnt=*/0, /*lgkmcnt=*/0, /*vmcnt=*/1));
+                hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/0));
             __builtin_amdgcn_sched_barrier(0);
         }
     }

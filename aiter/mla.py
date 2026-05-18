@@ -4,7 +4,6 @@
 # user interface
 
 import functools
-import warnings
 from typing import Optional
 import torch
 import triton
@@ -572,61 +571,36 @@ def mla_v40_decode_fwd(
     return_lse=False,
 ):
     """
-    V4.0 MLA decode entry. Persistent (HK) path only -- supports the single
-    shape `(max_seqlen_q * nhead) == 128` with FP8 packed NOPE+scale+pad and
-    BF16 ROPE. If the inputs don't satisfy these constraints, emit a warning
-    and return early (the kernel is NOT called).
+    V4.0 MLA decode router. Picks a suitable backend (HK persistent today;
+    asm / triton / gluon / flydsl as they land) given the layout, dtype, and
+    target chip. Writes attention output into `o` in-place; returns
+    `(logits, final_lse)` for the caller (final_lse is None unless
+    return_lse=True).
     """
     device = q.device
-    total_s, nhead, _ = o.shape
-    v_head_dim = o.shape[-1]
+    total_s, nhead, v_head_dim = o.shape
 
-    if max_seqlen_q * nhead != 128:
-        warnings.warn(
-            f"mla_v40_decode_fwd: only (max_seqlen_q * nhead) == 128 is supported, "
-            f"got max_seqlen_q={max_seqlen_q} nhead={nhead}; skipping kernel call.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return None, None
-    if q.dtype != dtypes.fp8 or kv_buffer.dtype != dtypes.fp8:
-        warnings.warn(
-            f"mla_v40_decode_fwd: NOPE buffers must be FP8, "
-            f"got q.dtype={q.dtype} kv_buffer.dtype={kv_buffer.dtype}; skipping kernel call.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return None, None
-    if q_rope.dtype != dtypes.bf16 or kv_buffer_rope.dtype != dtypes.bf16:
-        warnings.warn(
-            f"mla_v40_decode_fwd: ROPE buffers must be BF16, "
-            f"got q_rope.dtype={q_rope.dtype} kv_buffer_rope.dtype={kv_buffer_rope.dtype}; "
-            "skipping kernel call.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return None, None
-    if q.shape[-1] != _V40_DIM_QK_PACKED or kv_buffer.shape[-1] != _V40_DIM_QK_PACKED:
-        warnings.warn(
-            f"mla_v40_decode_fwd: packed Q/KV last dim must be {_V40_DIM_QK_PACKED}, "
-            f"got q.shape={tuple(q.shape)} kv_buffer.shape={tuple(kv_buffer.shape)}; "
-            "skipping kernel call.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return None, None
-    if q_rope.shape[-1] != _V40_DIM_ROPE or kv_buffer_rope.shape[-1] != _V40_DIM_ROPE:
-        warnings.warn(
-            f"mla_v40_decode_fwd: rope last dim must be {_V40_DIM_ROPE}, "
-            f"got q_rope.shape={tuple(q_rope.shape)} "
-            f"kv_buffer_rope.shape={tuple(kv_buffer_rope.shape)}; skipping kernel call.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return None, None
+    assert q.shape[-1] == _V40_DIM_QK_PACKED, (
+        f"mla_v40_decode_fwd: packed Q last dim must be {_V40_DIM_QK_PACKED}, "
+        f"got q.shape={tuple(q.shape)}"
+    )
+    assert kv_buffer.shape[-1] == _V40_DIM_QK_PACKED, (
+        f"mla_v40_decode_fwd: packed KV last dim must be {_V40_DIM_QK_PACKED}, "
+        f"got kv_buffer.shape={tuple(kv_buffer.shape)}"
+    )
+    assert q_rope.shape[-1] == _V40_DIM_ROPE, (
+        f"mla_v40_decode_fwd: Q rope last dim must be {_V40_DIM_ROPE}, "
+        f"got q_rope.shape={tuple(q_rope.shape)}"
+    )
+    assert kv_buffer_rope.shape[-1] == _V40_DIM_ROPE, (
+        f"mla_v40_decode_fwd: KV rope last dim must be {_V40_DIM_ROPE}, "
+        f"got kv_buffer_rope.shape={tuple(kv_buffer_rope.shape)}"
+    )
 
     if sm_scale is None:
         sm_scale = 1.0 / ((_V40_DIM_NOPE + _V40_DIM_ROPE) ** 0.5)  # 1/sqrt(512)
+
+    page_size = kv_buffer.shape[1]
 
     logits = torch.empty(
         (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
@@ -644,23 +618,60 @@ def mla_v40_decode_fwd(
         else None
     )
 
-    aiter.hk_mla_v40_decode_fwd(
-        q,
-        q_rope,
-        kv_buffer,
-        kv_buffer_rope,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_lens,
-        work_indptr,
-        work_info_set,
-        max_seqlen_q,
-        sm_scale,
-        logits,
-        attn_lse,
-        o,
+    use_hk = (
+        get_gfx() == "gfx950"
+        and nhead * max_seqlen_q == 128
+        and q.dtype == dtypes.fp8
+        and kv_buffer.dtype == dtypes.fp8
+        and q_rope.dtype == dtypes.bf16
+        and kv_buffer_rope.dtype == dtypes.bf16
+        and page_size in (1, 64)
+        and is_experimental_enabled()
     )
+
+    if use_hk:
+        aiter.hk_mla_v40_decode_fwd(
+            q,
+            q_rope,
+            kv_buffer,
+            kv_buffer_rope,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            work_indptr,
+            work_info_set,
+            max_seqlen_q,
+            sm_scale,
+            logits,
+            attn_lse,
+            o,
+        )
+        import os as _os
+        if _os.environ.get("V40_PROBE", ""):
+            _l = logits.float()
+            _a = attn_lse.float()
+            print(f"[V40_PROBE] logits shape={tuple(_l.shape)} dtype={_l.dtype}")
+            print(f"[V40_PROBE] logits nan%={(_l.isnan().float().mean().item()*100):.2f} "
+                  f"inf%={(_l.isinf().float().mean().item()*100):.2f} "
+                  f"min={_l[~_l.isnan()&~_l.isinf()].min().item() if (~_l.isnan()&~_l.isinf()).any() else float('nan'):.4g} "
+                  f"max={_l[~_l.isnan()&~_l.isinf()].max().item() if (~_l.isnan()&~_l.isinf()).any() else float('nan'):.4g}")
+            print(f"[V40_PROBE] lse nan%={(_a.isnan().float().mean().item()*100):.2f} "
+                  f"inf%={(_a.isinf().float().mean().item()*100):.2f} "
+                  f"min={_a[~_a.isnan()&~_a.isinf()].min().item() if (~_a.isnan()&~_a.isinf()).any() else float('nan'):.4g} "
+                  f"max={_a[~_a.isnan()&~_a.isinf()].max().item() if (~_a.isnan()&~_a.isinf()).any() else float('nan'):.4g}")
+            print(f"[V40_PROBE] logits[0,0,0,:8] = {_l[0,0,0,:8].cpu().tolist()}")
+            print(f"[V40_PROBE] lse[0,0,:8,0]    = {_a[0,0,:8,0].cpu().tolist()}")
+    else:
+        # TODO: dispatch to asm / triton / gluon / flydsl V4.0 backends once
+        # they land. Today HK is the only available implementation.
+        raise NotImplementedError(
+            f"mla_v40_decode_fwd: no backend available for "
+            f"gfx={get_gfx()} nhead={nhead} max_seqlen_q={max_seqlen_q} "
+            f"q.dtype={q.dtype} kv_buffer.dtype={kv_buffer.dtype} "
+            f"q_rope.dtype={q_rope.dtype} kv_buffer_rope.dtype={kv_buffer_rope.dtype} "
+            f"page_size={page_size} experimental={is_experimental_enabled()}"
+        )
 
     aiter.mla_reduce_v1(
         logits,
@@ -672,6 +683,8 @@ def mla_v40_decode_fwd(
         o,
         final_lse,
     )
+
+    return logits, final_lse
 
     return logits, final_lse
 

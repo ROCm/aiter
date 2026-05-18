@@ -33,6 +33,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.test_common import checkAllclose
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -679,6 +680,68 @@ def test_mla_v4(
         num_works,
         max_split_per_batch,
     )
+
+    # ---- V4.0 decode kernel (router; HK is the only backend today) ----
+    # Packed FP8 (NOPE+dup-scale+pad) Q/KV + BF16 RoPE Q/KV; output BF16.
+    # mla_v40_decode_fwd raises NotImplementedError for shapes the router
+    # can't dispatch yet, so we only invoke it when the HK constraint
+    # (nhead*decode_qlen)==128 is satisfied.
+    if max_seqlen_qo * nhead == 128:
+        out_v40 = torch.empty((total_q, nhead, V4_DIM_V), dtype=out_dtype)
+        aiter.mla.mla_v40_decode_fwd(
+            q_packed,
+            q_rope_bf16,
+            kv_packed,
+            kv_rope_bf16,
+            out_v40,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_qo,
+            work_indptr,
+            work_info_set,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            sm_scale=sm_scale,
+        )
+        err = checkAllclose(
+            out_silver.to(out_dtype),
+            out_v40,
+            msg=(
+                f"mla_v40_decode    [silver vs aiter_v40]: "
+                f"b={batch_size} c={ctx_lens} n={nhead} ql={decode_qlen}"
+            ),
+        )
+        ret["v40_err"] = err
+
+        if os.environ.get("V40_DUMP", ""):
+            silver_b = out_silver.to(out_dtype)
+            diff = (silver_b.float() - out_v40.float()).abs()
+            match_mask = diff < 0.01
+            # Per-(head, col-tile) match rate (32-col tiles, matches output_to_vram chunking)
+            mr_per_head_coltile = match_mask.reshape(
+                total_q, nhead, V4_DIM_V // 32, 32
+            ).float().mean(dim=-1)
+            # Per col-tile, averaged across heads + tokens
+            mr_per_coltile = mr_per_head_coltile.mean(dim=(0, 1))
+            # Per head, averaged across col-tiles + tokens
+            mr_per_head = mr_per_head_coltile.mean(dim=(0, 2))
+            # Per warp (16 heads per warp)
+            mr_per_warp = mr_per_head.reshape(8, 16).mean(dim=-1)
+            print(f"[V40_DUMP] match_rate per col_tile (16 tiles of 32 cols): "
+                  f"{mr_per_coltile.cpu().tolist()}")
+            print(f"[V40_DUMP] match_rate per warp (8 warps of 16 heads): "
+                  f"{mr_per_warp.cpu().tolist()}")
+            print(f"[V40_DUMP] sample silver[0, 0, :8] = "
+                  f"{silver_b[0, 0, :8].cpu().tolist()}")
+            print(f"[V40_DUMP] sample v40   [0, 0, :8] = "
+                  f"{out_v40[0, 0, :8].cpu().tolist()}")
+            print(f"[V40_DUMP] sample silver[0, 0, 32:40] = "
+                  f"{silver_b[0, 0, 32:40].cpu().tolist()}")
+            print(f"[V40_DUMP] sample v40   [0, 0, 32:40] = "
+                  f"{out_v40[0, 0, 32:40].cpu().tolist()}")
 
     ret["batch"] = batch_size
     ret["ctx_lens"] = ctx_lens
