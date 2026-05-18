@@ -3261,6 +3261,47 @@ class FmoeTuner(TunerCommon):
                         "status": status,
                     }
                 )
+            except AssertionError as e:
+                # checkAllclose raises on catastrophic error (max_delta exceeds threshold).
+                # Demote to mismatch only when err_ratio also exceeds allowed_err_ratio,
+                # i.e. it is genuinely a precision issue. Otherwise keep as error so that
+                # rare outliers (e.g. a few NaN/zeros) are not silently swept under mismatch.
+                msg = str(e)
+                if "catastrophic" in msg:
+                    import re
+
+                    m = re.search(r"(\d+\.\d+)%", msg)
+                    err_ratio = float(m.group(1)) / 100 if m else 1.0
+                    if err_ratio > allowed_err_ratio:
+                        results.append(
+                            {
+                                "shape": shape_str,
+                                "e2e_us": us if "us" in locals() else -1,
+                                "kernel_us": kernel_us,
+                                "status": (
+                                    f"mismatch:catastrophic err_ratio={err_ratio:.6g}"
+                                    f"(>{allowed_err_ratio_desc})"
+                                ),
+                            }
+                        )
+                    else:
+                        results.append(
+                            {
+                                "shape": shape_str,
+                                "e2e_us": -1,
+                                "kernel_us": kernel_us,
+                                "status": f"error:{e}",
+                            }
+                        )
+                else:
+                    results.append(
+                        {
+                            "shape": shape_str,
+                            "e2e_us": -1,
+                            "kernel_us": kernel_us,
+                            "status": f"error:{e}",
+                        }
+                    )
             except Exception as e:
                 results.append(
                     {
