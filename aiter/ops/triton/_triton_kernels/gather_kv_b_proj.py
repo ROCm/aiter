@@ -83,9 +83,14 @@ def _triton_gather_kv_b_proj(
     PER_ROW_SCALE: tl.constexpr = False,
     NO_SCALE: tl.constexpr = False,
 ):
-    stride_k_buffer: tl.constexpr = KBlockSize * (KV_CDim + KV_PeDim)
-    stride_k_prefix: tl.constexpr = TpNumHeads * (QkNopeHeadDim + KV_PeDim)
-    stride_v_prefix: tl.constexpr = TpNumHeads * VHeadDim
+    # All three strides are multiplied by runtime indices that can overflow
+    # i32 at large scales. Promote the scalar (broadcast) side to i64 so the multiply
+    # is i32-zext x i64 -> i64
+    stride_k_buffer = tl.full([], KBlockSize * (KV_CDim + KV_PeDim), dtype=tl.int64)
+    stride_k_prefix = tl.full(
+        [], TpNumHeads * (QkNopeHeadDim + KV_PeDim), dtype=tl.int64
+    )
+    stride_v_prefix = tl.full([], TpNumHeads * VHeadDim, dtype=tl.int64)
 
     ScaleKGranularity: tl.constexpr = 128
     ScaleNGranularity: tl.constexpr = 128
@@ -278,14 +283,6 @@ def _triton_gather_kv_b_proj(
             mask=block_lane_valid,
             other=0,
         )
-        # Force u64 multiply for kv_block_idx * stride_k_buffer. AMDGPU backend
-        # otherwise emits `v_mad_u64_u32` (correct) followed by
-        # `v_ashrrev_i32_e32 v_high, 31, v_low` which sign-extends the low word
-        # and overwrites the real u64 high word. When bit-31 of the product is
-        # set (large kv_block_idx at high concurrency / large KV pool), the
-        # high word becomes 0xffffffff and the global_load_dwordx4 of
-        # kv_c_data_* / kv_pe_data faults in the page just before k_buffer.
-        kv_block_idx = kv_block_idx.to(tl.int64)
         kv_c_data_base_offset = (
             kv_block_idx[:, None] * stride_k_buffer
             + tl.arange(0, ChunkK)[:, None] % KBlockSize * (KV_CDim + KV_PeDim)
