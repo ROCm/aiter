@@ -29,4 +29,10 @@ void unified_attention_fwd(
     // tensors these default to 1.0f (no-op).
     float q_descale = 1.0f,
     float k_descale = 1.0f,
-    float v_descale = 1.0f);
+    float v_descale = 1.0f,
+    // Optional caller-side override for max_seqlen_q used by `select_config`.
+    // 0 (default) keeps the conservative `num_tokens` heuristic. Pass the real
+    // per-seq max here when known (e.g. uniform-sq benchmarks or when the
+    // caller already has a host-side max) to let the dispatcher pick a tighter
+    // tile-tier (e.g. decode_d128_m128 instead of prefill_d128).
+    int64_t max_seqlen_q_override = 0);

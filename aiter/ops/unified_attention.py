@@ -39,6 +39,7 @@ def _gen_unified_attention_fwd_kernel_fake(
     q_descale: float = 1.0,
     k_descale: float = 1.0,
     v_descale: float = 1.0,
+    max_seqlen_q_override: int = 0,
 ) -> None:
     return None
 
@@ -69,6 +70,7 @@ def _unified_attention_fwd_kernel(
     q_descale: float = 1.0,
     k_descale: float = 1.0,
     v_descale: float = 1.0,
+    max_seqlen_q_override: int = 0,
 ) -> None: ...
 
 
@@ -263,6 +265,12 @@ def unified_attention_fwd(
     q_descale: float = 1.0,
     k_descale: float = 1.0,
     v_descale: float = 1.0,
+    # Optional caller-side override of max_seqlen_q used by C++ select_config.
+    # 0 (default) keeps the conservative `num_tokens` heuristic. Pass the real
+    # per-seq max when known (e.g. uniform-sq benchmarks) to enable the
+    # tighter decode_d{64,128}_m{16,32,128} tiers instead of falling through
+    # to prefill_d{64,128}.
+    max_seqlen_q: int = 0,
 ) -> None:
     explicit_override = (
         num_splits > 1
@@ -293,6 +301,7 @@ def unified_attention_fwd(
             q_descale,
             k_descale,
             v_descale,
+            max_seqlen_q,
         )
         return
 
@@ -321,6 +330,7 @@ def unified_attention_fwd(
             q_descale,
             k_descale,
             v_descale,
+            max_seqlen_q,
         )
         return
 
@@ -358,5 +368,6 @@ def unified_attention_fwd(
         q_descale,
         k_descale,
         v_descale,
+        max_seqlen_q,
     )
     _combine_splits(output, o_acc, lse_acc)

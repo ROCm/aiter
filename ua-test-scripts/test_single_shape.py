@@ -326,6 +326,14 @@ def run_ck(out, tensors, args):
         q_descale=float(tensors['q_descale']),
         k_descale=float(tensors['k_descale']),
         v_descale=float(tensors['v_descale']),
+        # NOTE: the wrapper now accepts max_seqlen_q, which forwards to C++
+        # select_config and lets the dispatcher pick a tighter BlockM tier.
+        # We tested forcing the 4-warp decode_d128_m128 variant for sq=8 and
+        # it regressed (0.197 → 0.240 ms): the 4-warp variant cuts barrier
+        # stalls (%any_wait 200%→57%) but doubles K/V cache traffic because
+        # BlockM=128 reads the same K/V tile twice for 256 effective Q rows.
+        # Leave default behaviour (conservative max_seqlen_q heuristic) so
+        # production callers don't regress.
     )
 
 

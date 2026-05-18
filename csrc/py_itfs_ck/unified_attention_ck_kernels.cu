@@ -34,7 +34,12 @@ void unified_attention_fwd(
     std::optional<torch::Tensor> lse_acc_workspace,
     float q_descale,
     float k_descale,
-    float v_descale)
+    float v_descale,
+    // Optional caller-side override for max_seqlen_q. When 0 (default) we fall
+    // back to the conservative heuristic at line below. Pass the real per-seq
+    // max here to let the C++ dispatcher pick a tighter (smaller) BlockM tier
+    // (e.g. decode_d128_m128 with 4 warps vs prefill_d128 with 8 warps).
+    int64_t max_seqlen_q_override)
 {
     auto dtype = query.dtype();
     // FP8 path: Q is FP8E4M3 (e4m3fn on gfx950 / e4m3fnuz on gfx942). The
@@ -118,10 +123,16 @@ void unified_attention_fwd(
     args.num_seqs            = num_seqs;
 
     // Graph-capture-safe max_seqlen_q estimation (no GPU→CPU copy).
-    // Pure decode: num_tokens == num_seqs → every seq has exactly 1 token.
-    // Otherwise: use num_tokens as conservative upper bound (forces medium tier
-    // which handles any seqlen_q correctly via 1D grid with Q tile iteration).
-    args.max_seqlen_q = (num_tokens == num_seqs) ? 1 : num_tokens;
+    //   - Caller-provided override (>0) wins — lets the wrapper pick a tighter
+    //     BlockM tier (e.g. decode_d128_m128 4-warp instead of prefill_d128
+    //     8-warp). Callers that can't supply this stay on the heuristic.
+    //   - Pure decode: num_tokens == num_seqs → every seq has exactly 1 token.
+    //   - Otherwise: use num_tokens as conservative upper bound (forces medium
+    //     tier which handles any seqlen_q correctly via 1D grid w/ Q iter).
+    if (max_seqlen_q_override > 0)
+        args.max_seqlen_q = static_cast<ck_tile::index_t>(max_seqlen_q_override);
+    else
+        args.max_seqlen_q = (num_tokens == num_seqs) ? 1 : num_tokens;
 
     // Routes the K/V async-load path inside the CK pipeline. False (default)
     // → fast `buffer_load_dword_lds` with shared SRD (valid as long as the
