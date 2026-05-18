@@ -116,6 +116,7 @@ void mla_decode_stage1_asm_fwd(
     aiter_tensor_t* lse,                  //   [batch_size, num_heads] (nullable)
     aiter_tensor_t* q_scale,              //   [1] (nullable)
     aiter_tensor_t* kv_scale,             //   [1] (nullable)
+    bool causal_mask, 
     hipStream_t stream)
 {    
     int batch           = qo_indptr->size(0) - 1;
@@ -266,7 +267,7 @@ void mla_decode_stage1_asm_fwd(
     
     int ps = persistent ? 1 : 0;
     int prefill = 0; // decode stage
-    int causal = 0;
+    int causal = causal_mask;
     int config_max_seqlen_q = max_seqlen_q;
     int config_gqa_ratio = gqa_ratio;
     int sub_Q = 128; // default value
@@ -380,6 +381,8 @@ void mla_decode_stage1_asm_fwd(
         args.s_MQA = gqa_ratio;
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;
+    std::cout << "causal mask: " << causal << ", persistent: " << persistent << ", gqa_ratio: " << gqa_ratio 
+              << ", max_seqlen_q: " << max_seqlen_q << ", sub_Q: " << sub_Q << std::endl;
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     

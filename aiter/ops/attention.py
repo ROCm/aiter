@@ -685,6 +685,7 @@ def mla_decode_stage1_asm_fwd(
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
     # [1] pertensor
+    causal_mask: bool = False,
 ) -> None: ...
 
 

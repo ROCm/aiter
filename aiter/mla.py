@@ -179,6 +179,7 @@ def mla_decode_fwd(
     intra_batch_mode=False,
     return_logits=False,
     return_lse=False,
+    causal_mask=False,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -278,6 +279,7 @@ def mla_decode_fwd(
             final_lse,
             q_scale,
             kv_scale,
+            causal_mask,
         )
 
         if num_kv_splits == 1 and (
