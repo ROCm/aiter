@@ -223,6 +223,19 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_align_block_size.py]=1
     FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_topk.py]=1
     FILE_TIMES[op_tests/triton_tests/triton_metadata_redirect/test_metadata_redirect.py]=1
+    FILE_TIMES[op_tests/triton_tests/triton_kernels/test_distributed.py]=507
+    FILE_TIMES[op_tests/triton_tests/triton_kernels/test_matmul.py]=157
+    FILE_TIMES[op_tests/triton_tests/triton_kernels/test_roofline.py]=4
+    FILE_TIMES[op_tests/triton_tests/triton_kernels/test_reduce.py]=2
+    FILE_TIMES[op_tests/triton_tests/triton_kernels/test_compaction.py]=1
+    FILE_TIMES[op_tests/triton_tests/triton_kernels/test_tensor.py]=1
+    FILE_TIMES[op_tests/triton_tests/triton_kernels/test_topk.py]=1
+    FILE_TIMES[op_tests/triton_tests/triton_kernels/test_mxfp.py]=1
+    FILE_TIMES[op_tests/triton_tests/triton_kernels/test_specialize.py]=1
+    FILE_TIMES[op_tests/triton_tests/triton_kernels/test_swiglu.py]=1
+    FILE_TIMES[op_tests/triton_tests/triton_kernels/test_matmul_details/test_opt_flags_split_k.py]=1
+    FILE_TIMES[op_tests/triton_tests/triton_kernels/test_tensor_details/test_layout_cdna4.py]=1
+    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_constexpr_mutation.py]=2
 fi
 
 get_time() {
