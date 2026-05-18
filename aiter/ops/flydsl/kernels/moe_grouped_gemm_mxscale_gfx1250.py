@@ -37,6 +37,7 @@ class _GroupedA8W4Config:
     use_tdm_store: bool
     inst_prefetch: bool
     wave_specialized_tdm: bool
+    split_k: int
     cluster_m: int
     cluster_n: int
     use_scale_opsel: bool
@@ -60,6 +61,8 @@ def _validate_common(cfg: _GroupedA8W4Config) -> None:
         raise ValueError(f"inter_dim must be divisible by 32 for MXScale scales, got {cfg.inter_dim}")
     if cfg.tile_k % 128 != 0:
         raise ValueError(f"tile_k must be a multiple of 128 for MXScale WMMA_SCALE, got {cfg.tile_k}")
+    if cfg.split_k < 1:
+        raise ValueError(f"split_k must be >= 1, got {cfg.split_k}")
     if cfg.act not in ("silu", "swiglu"):
         raise ValueError(f"act must be 'silu' or 'swiglu', got {cfg.act!r}")
     if cfg.grouped_persistent_m and (cfg.cluster_m != 1 or cfg.cluster_n != 1):
@@ -84,6 +87,25 @@ def _make_m_tile_prefix(masked_m: torch.Tensor, cfg: _GroupedA8W4Config) -> torc
     prefix[0].zero_()
     torch.cumsum(valid_tiles, dim=0, out=prefix[1:])
     return prefix
+
+
+def _make_m_tile_map(masked_m: torch.Tensor, cfg: _GroupedA8W4Config) -> torch.Tensor:
+    valid_m = masked_m[:cfg.experts].to(dtype=torch.int32)
+    valid_m = valid_m.clamp(min=0, max=cfg.max_m)
+    valid_tiles = torch.div(
+        valid_m + (cfg.tile_m - 1),
+        cfg.tile_m,
+        rounding_mode="floor",
+    ).cpu().tolist()
+    max_m_tiles = (cfg.max_m + cfg.tile_m - 1) // cfg.tile_m
+    packed = [
+        expert * max_m_tiles + local_tile
+        for expert, count in enumerate(valid_tiles)
+        for local_tile in range(int(count))
+    ]
+    if not packed:
+        packed = [0]
+    return torch.tensor(packed, device=masked_m.device, dtype=torch.int32)
 
 
 def _check_rank(name: str, tensor: torch.Tensor, rank: int) -> None:
@@ -182,9 +204,10 @@ def _compile_base_a8w4_gemm(*, K: int, N: int, cfg: _GroupedA8W4Config):
         num_buffers=cfg.num_buffers,
         waves_per_eu=cfg.waves_per_eu,
         out_dtype=cfg.out_dtype,
-        use_tdm_store=cfg.use_tdm_store,
+        use_tdm_store=cfg.use_tdm_store and cfg.split_k == 1,
         inst_prefetch=cfg.inst_prefetch,
         wave_specialized_tdm=cfg.wave_specialized_tdm,
+        split_k=cfg.split_k,
         cluster_m=cfg.cluster_m,
         cluster_n=cfg.cluster_n,
         use_scale_opsel=cfg.use_scale_opsel,
@@ -214,6 +237,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     use_tdm_store: bool = True,
     inst_prefetch: bool = False,
     wave_specialized_tdm: bool = False,
+    split_k: int = 1,
     cluster_m: int = 1,
     cluster_n: int = 1,
     use_scale_opsel: bool = False,
@@ -229,6 +253,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         m_warp=int(m_warp), n_warp=int(n_warp), num_buffers=int(num_buffers),
         waves_per_eu=waves_per_eu, out_dtype=str(out_dtype), use_tdm_store=bool(use_tdm_store),
         inst_prefetch=bool(inst_prefetch), wave_specialized_tdm=bool(wave_specialized_tdm),
+        split_k=int(split_k),
         cluster_m=int(cluster_m), cluster_n=int(cluster_n), use_scale_opsel=bool(use_scale_opsel),
         expert_sched_mode=bool(expert_sched_mode), grouped_persistent_m=bool(grouped_persistent_m),
         persistent_workers=persistent_workers, data_format=str(data_format), act=str(act),
@@ -237,22 +262,63 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     base = _compile_base_a8w4_gemm(K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg)
 
     def launch(y, x, w, scale_x, scale_w, masked_m, max_m_arg, inter_dim_arg,
-               model_dim_arg, experts_arg, *, stream=None):
+               model_dim_arg, experts_arg, *, stream=None, _gemm_events=None,
+               _m_tile_prefix=None, _m_tile_map=None, _tmp=None, _skip_epilogue=False,
+               _debug_tmp_sentinel=None, _debug_tmp_out=None):
+        """If `_gemm_events=(start, end)` is given, those cuda.Events are
+        recorded immediately before / after the GEMM kernel launch only, so the
+        caller can measure pure GEMM device time excluding prefix-sum and
+        gate*act epilogue.
+
+        Diagnostic hooks (off by default):
+          - `_debug_tmp_sentinel`: if set to a float, the intermediate `tmp`
+            buffer is filled with that value BEFORE the GEMM launch. Cells
+            still equal to the sentinel after the launch indicate GEMM did
+            not write them.
+          - `_debug_tmp_out`: a list-like; if provided, the post-GEMM `tmp`
+            (before the silu(gate)*up epilogue) is appended so the caller can
+            inspect raw GEMM output statistics.
+        """
         if int(max_m_arg) != cfg.max_m or int(inter_dim_arg) != cfg.inter_dim or int(model_dim_arg) != cfg.model_dim or int(experts_arg) != cfg.experts:
             raise ValueError("runtime dimensions must match compile-time grouped A8W4 stage1 config")
         _check_stage1_args(y, x, w, scale_x, scale_w, masked_m, cfg)
         if stream is None:
             stream = torch.cuda.current_stream()
-        tmp = torch.empty((cfg.experts, cfg.max_m, 2 * cfg.inter_dim), device=y.device, dtype=y.dtype)
+        tmp = _tmp
+        if tmp is None:
+            tmp = torch.empty((cfg.experts, cfg.max_m, 2 * cfg.inter_dim), device=y.device, dtype=y.dtype)
+        if _debug_tmp_sentinel is not None:
+            tmp.fill_(float(_debug_tmp_sentinel))
+        if cfg.split_k > 1:
+            tmp.zero_()
         if cfg.grouped_persistent_m:
-            m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
+            m_tile_prefix = _m_tile_prefix
+            if m_tile_prefix is None:
+                m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
+            m_tile_map = _m_tile_map
+            if m_tile_map is None:
+                m_tile_map = _make_m_tile_map(masked_m, cfg)
+            if _gemm_events is not None:
+                _gemm_events[0].record(stream)
             _run_compiled(
-                base, tmp, x, w, scale_x, scale_w, masked_m, m_tile_prefix,
+                base, tmp, x, w, scale_x, scale_w, masked_m, m_tile_prefix, m_tile_map,
                 cfg.max_m, 2 * cfg.inter_dim, stream)
+            if _gemm_events is not None:
+                _gemm_events[1].record(stream)
         else:
+            if _gemm_events is not None:
+                _gemm_events[0].record(stream)
             _run_compiled(
                 base, tmp, x, w, scale_x, scale_w, masked_m,
                 cfg.max_m, 2 * cfg.inter_dim, stream)
+            if _gemm_events is not None:
+                _gemm_events[1].record(stream)
+        if _debug_tmp_out is not None:
+            # Holding a detached reference is enough to keep the per-call tmp
+            # buffer alive for diagnostics; no clone needed.
+            _debug_tmp_out.append(tmp.detach())
+        if _skip_epilogue:
+            return tmp
         # Apply gate*act(up) on GPU in a single fused op (no per-expert loop).
         # Pad rows beyond masked_m may carry junk; downstream consumers honor
         # masked_m so untouched rows are ignored.
@@ -282,6 +348,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     use_tdm_store: bool = True,
     inst_prefetch: bool = False,
     wave_specialized_tdm: bool = False,
+    split_k: int = 1,
     cluster_m: int = 1,
     cluster_n: int = 1,
     use_scale_opsel: bool = False,
@@ -296,6 +363,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         m_warp=int(m_warp), n_warp=int(n_warp), num_buffers=int(num_buffers),
         waves_per_eu=waves_per_eu, out_dtype=str(out_dtype), use_tdm_store=bool(use_tdm_store),
         inst_prefetch=bool(inst_prefetch), wave_specialized_tdm=bool(wave_specialized_tdm),
+        split_k=int(split_k),
         cluster_m=int(cluster_m), cluster_n=int(cluster_n), use_scale_opsel=bool(use_scale_opsel),
         expert_sched_mode=bool(expert_sched_mode), grouped_persistent_m=bool(grouped_persistent_m),
         persistent_workers=persistent_workers, data_format=str(data_format),
@@ -304,21 +372,39 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     base = _compile_base_a8w4_gemm(K=cfg.inter_dim, N=cfg.model_dim, cfg=cfg)
 
     def launch(y, x, w, scale_x, scale_w, masked_m, max_m_arg, model_dim_arg,
-               inter_dim_arg, experts_arg, *, stream=None):
+               inter_dim_arg, experts_arg, *, stream=None, _gemm_events=None,
+               _m_tile_prefix=None, _m_tile_map=None):
+        """If `_gemm_events=(start, end)` is given, record around the GEMM
+        kernel launch only -- excludes prefix-sum prep work."""
         if int(max_m_arg) != cfg.max_m or int(model_dim_arg) != cfg.model_dim or int(inter_dim_arg) != cfg.inter_dim or int(experts_arg) != cfg.experts:
             raise ValueError("runtime dimensions must match compile-time grouped A8W4 stage2 config")
         _check_stage2_args(y, x, w, scale_x, scale_w, masked_m, cfg)
         if stream is None:
             stream = torch.cuda.current_stream()
+        if cfg.split_k > 1:
+            y.zero_()
         if cfg.grouped_persistent_m:
-            m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
+            m_tile_prefix = _m_tile_prefix
+            if m_tile_prefix is None:
+                m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
+            m_tile_map = _m_tile_map
+            if m_tile_map is None:
+                m_tile_map = _make_m_tile_map(masked_m, cfg)
+            if _gemm_events is not None:
+                _gemm_events[0].record(stream)
             _run_compiled(
-                base, y, x, w, scale_x, scale_w, masked_m, m_tile_prefix,
+                base, y, x, w, scale_x, scale_w, masked_m, m_tile_prefix, m_tile_map,
                 cfg.max_m, cfg.model_dim, stream)
+            if _gemm_events is not None:
+                _gemm_events[1].record(stream)
         else:
+            if _gemm_events is not None:
+                _gemm_events[0].record(stream)
             _run_compiled(
                 base, y, x, w, scale_x, scale_w, masked_m,
                 cfg.max_m, cfg.model_dim, stream)
+            if _gemm_events is not None:
+                _gemm_events[1].record(stream)
         return y
 
     return launch
