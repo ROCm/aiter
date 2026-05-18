@@ -15,15 +15,15 @@ The same harness drives:
 
 Example CLI usage (inside the aiter source tree)::
 
-    # bf16, sparse CSR, default 1024 tokens / 128 heads, with bench
+    # default sweep: N x H_Q x total_pages x {sparse, dense} (bf16), with bench
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill_opus.py
 
-    # dense CSR for both prefix and extend
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill_opus.py --dense
+    # only dense CSR for both prefix and extend
+    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill_opus.py --mode dense
 
-    # custom shape, both bf16 and fp16, no correctness check
+    # single shape, bf16 only, no correctness check
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill_opus.py \\
-        -n 256 1024 --h_q 128 --dtype bf16 fp16 --no-verify
+        -n 1024 --h_q 128 --dtype bf16 --mode sparse --no-verify
 
 Reference design notes (Q&A):
 
@@ -157,24 +157,60 @@ def _ref_pa_sparse_prefill_opus(
 # CSR index generators
 # ---------------------------------------------------------------------------
 
+# Must match the KV_TILE_SIZE template default in
+# csrc/include/pa_sparse_prefill_opus.h. The kernel inner loop advances the
+# K/V dimension in chunks of this size, so the trailing-tile branches (full /
+# half / over-tile) are most likely to break when nnz_per_row sits at one of
+# these boundary values.
+_KV_TILE_SIZE = 32
+
+
+def _boundary_nnz(kv_tile_size: int, total_rows: int) -> list:
+    """Tile-boundary nnz values seeded into the leading rows of a sparse CSR,
+    mirroring gcnasm/opus_attn/sparse_paged_attn/pa_host.cc::
+    init_sparse_kv_indices. Clamped into [0, total_rows]."""
+    cands = [
+        0,
+        1,
+        kv_tile_size - 1,
+        kv_tile_size,
+        kv_tile_size + 1,
+        2 * kv_tile_size,
+        2 * kv_tile_size + 1,
+        total_rows,
+    ]
+    return [max(0, min(v, total_rows)) for v in cands]
+
 
 def _random_csr(
     n: int,
     total_rows: int,
     *,
-    max_nnz_per_row: Optional[int] = None,
     allow_empty: bool = True,
+    kv_tile_size: int = _KV_TILE_SIZE,
     device: torch.device,
     seed: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Random CSR with deterministic tile-boundary nnz on the first rows.
+
+    Length distribution: ``randint(0, total_rows)`` -- no artificial cap, so a
+    sparse sweep can produce anything from empty rows up to nearly-dense rows.
+    """
     g = torch.Generator(device="cpu")
     g.manual_seed(seed)
 
-    cap = max_nnz_per_row if max_nnz_per_row is not None else total_rows
-    cap = min(cap, total_rows)
     lo = 0 if allow_empty else 1
 
-    lens = torch.randint(lo, cap + 1, (n,), generator=g, dtype=torch.int32)
+    lens = torch.randint(lo, total_rows + 1, (n,), generator=g, dtype=torch.int32)
+    # Seed the leading rows with tile-boundary lengths -- guarantees every
+    # sparse sweep exercises the kernel's full/half/over-tile branches and
+    # (when allow_empty) the sink-only empty-row path.
+    boundary = _boundary_nnz(kv_tile_size, total_rows)
+    if not allow_empty:
+        boundary = [max(b, 1) for b in boundary]
+    for i, v in enumerate(boundary[:n]):
+        lens[i] = v
+
     indptr = torch.zeros(n + 1, dtype=torch.int32)
     indptr[1:] = torch.cumsum(lens, dim=0)
     nnz = int(indptr[-1].item())
@@ -187,6 +223,15 @@ def _random_csr(
             continue
         perm = torch.randperm(total_rows, generator=g)[:row_len]
         indices[s:e] = perm.to(torch.int32)
+
+    # Cheap sanity asserts (CPU-side, O(n) after generation).
+    assert int(indptr[0].item()) == 0
+    assert int(indptr[-1].item()) == nnz
+    assert bool(torch.all(indptr[1:] >= indptr[:-1]).item())
+    if nnz > 0:
+        assert int(indices.min().item()) >= 0
+        assert int(indices.max().item()) < total_rows
+
     return indptr.to(device), indices.to(device)
 
 
@@ -210,7 +255,6 @@ def _empty_csr(n: int, *, device: torch.device) -> Tuple[torch.Tensor, torch.Ten
 # ---------------------------------------------------------------------------
 
 # Single sparsity knob applied symmetrically to both prefix and extend CSRs.
-# 'empty' is only exercised by the pytest sweep (CLI uses --dense flag).
 _MODES = ("sparse", "dense", "empty")
 
 
@@ -244,7 +288,6 @@ def _make_inputs(
             return _random_csr(
                 n,
                 total_rows,
-                max_nnz_per_row=min(total_rows, 96),
                 device=device,
                 seed=seed * 2 + seed_offset,
             )
@@ -339,7 +382,7 @@ def run_pa_sparse_prefill_opus(
             rtol=rtol,
             atol=atol,
             msg=(
-                f"[N={n} H={h} D={d} tp={total_pages} tt={total_tokens} "
+                f"[N={n} H={h} D={d} total_pages={total_pages} total_tokens={total_tokens} "
                 f"dtype={dtype} mode={mode}]"
             ),
         )
@@ -363,8 +406,6 @@ def run_pa_sparse_prefill_opus(
 
 # ---------------------------------------------------------------------------
 # pytest parametrised correctness sweep (CI).
-# Single sparsity knob; 'empty' is included so empty-CSR edge cases stay
-# covered even though the CLI only exposes --dense.
 # ---------------------------------------------------------------------------
 
 
@@ -418,15 +459,15 @@ parser.add_argument(
     "--n_tokens",
     type=int,
     nargs="*",
-    default=[1024],
-    help="number of query tokens N (default: 1024)",
+    default=[1024, 4096],
+    help="number of query tokens N (default: [1024, 4096])",
 )
 parser.add_argument(
     "--h_q",
     type=int,
     nargs="*",
-    default=[128],
-    help="number of query heads H_Q (default: 128)",
+    default=[64, 128],
+    help="number of query heads H_Q (default: [64, 128])",
 )
 parser.add_argument(
     "-d",
@@ -438,8 +479,12 @@ parser.add_argument(
 parser.add_argument(
     "--total_pages",
     type=int,
-    default=None,
-    help="rows in unified_kv (default: matches -n)",
+    nargs="*",
+    default=[1024, 4096, 16384],
+    help=(
+        "rows in unified_kv (default: [1024, 4096, 16384]). "
+        "Pass 0 to mirror -n for that sweep point."
+    ),
 )
 parser.add_argument(
     "--total_tokens",
@@ -453,14 +498,21 @@ parser.add_argument(
     nargs="*",
     default=["bf16"],
     choices=["bf16", "fp16"],
-    help="attention dtype(s) to sweep (default: bf16)",
+    help="attention dtype(s) to sweep (default: [bf16])",
 )
 parser.add_argument(
-    "--dense",
-    action="store_true",
+    "--mode",
+    type=str,
+    nargs="*",
+    default=["sparse", "dense"],
+    choices=list(_MODES),
     help=(
-        "use dense CSR for both prefix and extend (every token sees every "
-        "page / every kv row). Default is random sparse for both."
+        "CSR mode(s) to sweep for both prefix and extend.\n"
+        "  sparse: random nnz/row in [0, total_rows] with leading rows\n"
+        "          seeded at KV-tile boundaries (0, 1, T-1, T, T+1, ...)\n"
+        "  dense : every token sees every page / every kv row\n"
+        "  empty : all-empty CSR rows (sink-only output)\n"
+        "Default: [sparse, dense]."
     ),
 )
 parser.add_argument(
@@ -486,11 +538,17 @@ _DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    mode = "dense" if args.dense else "sparse"
 
     rows = []
-    for n, h, dtype_str in itertools.product(args.n_tokens, args.h_q, args.dtype):
-        total_pages = args.total_pages if args.total_pages is not None else n
+    for n, h, dtype_str, mode, pages_arg in itertools.product(
+        args.n_tokens,
+        args.h_q,
+        args.dtype,
+        args.mode,
+        args.total_pages,
+    ):
+        # 0 is the sentinel for "mirror -n" on a per-sweep-point basis.
+        total_pages = pages_arg if pages_arg > 0 else n
         total_tokens = args.total_tokens if args.total_tokens is not None else n
         row = run_pa_sparse_prefill_opus(
             n=n,
