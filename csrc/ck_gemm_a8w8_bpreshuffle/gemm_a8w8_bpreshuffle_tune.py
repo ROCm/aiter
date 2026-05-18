@@ -555,6 +555,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         gfx = self.get_gfx()
         task = []
         tasks_data = []  # [(kernel_nums, datas)]
+        seed = 0
         for i in range(len(untunedf)):
             M = untunedf.loc[i, "M"]
             N = untunedf.loc[i, "N"]

@@ -103,16 +103,16 @@ def worker(
                         if ref[i].dtype.itemsize == 1:
                             ref[i] = ref[i].view(torch.uint8).to(dtypes.fp32)
                             res[i] = res[i].view(torch.uint8).to(dtypes.fp32)
-                        print(f"compare ref and res: info:{info}\t", flush=True)
-                        print(
-                            ref[i].shape,
-                            res[i].shape,
-                            f"atol={atol}, rtol={rtol}",
-                            flush=True,
-                        )
-                        print(ref[i], flush=True)
-                        print(res[i], flush=True)
-                        print("compare ref and res done", flush=True)
+                        # print(f"compare ref and res: info:{info}\t", flush=True)
+                        # print(
+                        #    ref[i].shape,
+                        #    res[i].shape,
+                        #    f"atol={atol}, rtol={rtol}",
+                        #    flush=True,
+                        # )
+                        # print(ref[i], flush=True)
+                        # print(res[i], flush=True)
+                        # print("compare ref and res done", flush=True)
                         err_ratio = checkAllclose(
                             ref[i],
                             res[i],
