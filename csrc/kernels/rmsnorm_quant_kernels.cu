@@ -5,6 +5,7 @@
 #include "py_itfs_common.h"
 #include "aiter_opus_plus.h"
 #include "dispatch_utils.h"
+#include "fp4_quant_utils.h"
 #include "rocprim/rocprim.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
@@ -266,14 +267,7 @@ __global__ void add_rmsnorm_quant_kernel(
                     float thread_max = 1e-10f;
                     if constexpr(thread_data_size % 2 == 0)
                     {
-                        for(int i = 0; i < thread_data_size; i += 2)
-                        {
-                            asm volatile("v_max3_f32 %0, %1, %2, %3\n"
-                                        : "=v"(thread_max)
-                                        : "v"(thread_max),
-                                        "v"(fabsf(thread_data_float[i])),
-                                        "v"(fabsf(thread_data_float[i + 1])));
-                        }
+                        max = aiter::fp4_f32_to_e8m0_scale(max);
                     }
                     else
                     {
@@ -313,7 +307,7 @@ __global__ void add_rmsnorm_quant_kernel(
                             if(shuffle_scale)
                             {
                                 scaleN_pad = (scaleN_pad + 7) / 8 * 8;
-                                x = fp4_scale_shuffle_id(scaleN_pad, x, y);
+                                x = aiter::fp4_scale_shuffle_idx(scaleN_pad, x, y);
                             }
                             else
                             {
