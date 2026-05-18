@@ -265,6 +265,7 @@ def _reshape_causal_conv1d_update_single_token_kernel(
     NP2_STATELEN: tl.constexpr,
     USE_PAD_SLOT: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    GQA_INTERLEAVED_LAYOUT: tl.constexpr,
 ):
     # ruff: noqa: E501
     idx_seq = tl.program_id(0)
@@ -275,15 +276,20 @@ def _reshape_causal_conv1d_update_single_token_kernel(
     if tl.program_id(1) == 0:
         ## HV = triton.next_power_of_2(num_v_heads)
         idx_hv = tl.arange(0, HV)
-        ## map idx_hv to source idx
-        idx_h = idx_hv // (num_v_heads // num_k_heads)
-        idx_v = idx_hv % (num_v_heads // num_k_heads)
-        b_source_offset = idx_h * (2 * num_v_heads // num_k_heads) + idx_v
-        a_source_offset = (
-            idx_h * (2 * num_v_heads // num_k_heads)
-            + num_v_heads // num_k_heads
-            + idx_v
-        )
+        if GQA_INTERLEAVED_LAYOUT:
+            ## map idx_hv to source idx (interleaved per K-head: [b0..b_g, a0..a_g, ...])
+            idx_h = idx_hv // (num_v_heads // num_k_heads)
+            idx_v = idx_hv % (num_v_heads // num_k_heads)
+            b_source_offset = idx_h * (2 * num_v_heads // num_k_heads) + idx_v
+            a_source_offset = (
+                idx_h * (2 * num_v_heads // num_k_heads)
+                + num_v_heads // num_k_heads
+                + idx_v
+            )
+        else:
+            ## non-interleaved: ba = [b_all | a_all] concat along last dim
+            b_source_offset = idx_hv
+            a_source_offset = num_v_heads + idx_hv
 
         b_source_ptrs = (
             ba_ptr + idx_seq * stride_ba_seq + b_source_offset * stride_ba_token
@@ -302,13 +308,17 @@ def _reshape_causal_conv1d_update_single_token_kernel(
     ## write z
     elif tl.program_id(1) < 1 + num_program_write_z:
         idx_z = (tl.program_id(1) - 1) * BLOCK_Z + tl.arange(0, BLOCK_Z)
-        ## map idx_z to source idx
-        idx_z_x = (
-            idx_z // (num_v_heads // num_k_heads * head_v_dim) * head_qkvz_dim
-            + 2 * head_k_dim
-            + num_v_heads // num_k_heads * head_v_dim
-            + idx_z % (num_v_heads // num_k_heads * head_v_dim)
-        )
+        if GQA_INTERLEAVED_LAYOUT:
+            ## map idx_z to source idx (interleaved per K-head [q,k,v,z] slot)
+            idx_z_x = (
+                idx_z // (num_v_heads // num_k_heads * head_v_dim) * head_qkvz_dim
+                + 2 * head_k_dim
+                + num_v_heads // num_k_heads * head_v_dim
+                + idx_z % (num_v_heads // num_k_heads * head_v_dim)
+            )
+        else:
+            ## non-interleaved: x = [q_all | k_all | v_all | z_all]
+            idx_z_x = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim + idx_z
         z_source_ptrs = x_ptr + idx_seq * stride_x_seq + idx_z_x * stride_x_dim
         mask_z = idx_z < num_v_heads * head_v_dim
         z = tl.load(z_source_ptrs, mask=mask_z, other=0.0)
@@ -336,29 +346,34 @@ def _reshape_causal_conv1d_update_single_token_kernel(
         idx_feats = (tl.program_id(1) - 1 - num_program_write_z) * BLOCK_N + tl.arange(
             0, BLOCK_N
         )
-        ## map idx_feats to idx_feats_x
-        idx_feats_x = (
-            (idx_feats < num_k_heads * head_k_dim).to(tl.int64)
-            * (idx_feats // head_k_dim * head_qkvz_dim + idx_feats % head_k_dim)
-            + (
-                (idx_feats >= num_k_heads * head_k_dim)
-                & (idx_feats < num_k_heads * head_k_dim * 2)
-            ).to(tl.int64)
-            * (
-                (idx_feats - num_k_heads * head_k_dim) // head_k_dim * head_qkvz_dim
-                + head_k_dim
-                + (idx_feats - num_k_heads * head_k_dim) % head_k_dim
+        if GQA_INTERLEAVED_LAYOUT:
+            ## map idx_feats to idx_feats_x (interleaved per K-head [q,k,v,z] slot)
+            idx_feats_x = (
+                (idx_feats < num_k_heads * head_k_dim).to(tl.int64)
+                * (idx_feats // head_k_dim * head_qkvz_dim + idx_feats % head_k_dim)
+                + (
+                    (idx_feats >= num_k_heads * head_k_dim)
+                    & (idx_feats < num_k_heads * head_k_dim * 2)
+                ).to(tl.int64)
+                * (
+                    (idx_feats - num_k_heads * head_k_dim) // head_k_dim * head_qkvz_dim
+                    + head_k_dim
+                    + (idx_feats - num_k_heads * head_k_dim) % head_k_dim
+                )
+                + (idx_feats >= num_k_heads * head_k_dim * 2).to(tl.int64)
+                * (
+                    (idx_feats - num_k_heads * head_k_dim * 2)
+                    // (num_v_heads // num_k_heads * head_v_dim)
+                    * head_qkvz_dim
+                    + 2 * head_k_dim
+                    + (idx_feats - num_k_heads * head_k_dim * 2)
+                    % (num_v_heads // num_k_heads * head_v_dim)
+                )
             )
-            + (idx_feats >= num_k_heads * head_k_dim * 2).to(tl.int64)
-            * (
-                (idx_feats - num_k_heads * head_k_dim * 2)
-                // (num_v_heads // num_k_heads * head_v_dim)
-                * head_qkvz_dim
-                + 2 * head_k_dim
-                + (idx_feats - num_k_heads * head_k_dim * 2)
-                % (num_v_heads // num_k_heads * head_v_dim)
-            )
-        )
+        else:
+            ## non-interleaved [q_all | k_all | v_all | z_all]: q/k/v packing
+            ## already matches the flat conv output indexing.
+            idx_feats_x = idx_feats.to(tl.int64)
 
         if IS_APC_ENABLED:
             # Get the state from the initial_state_idx

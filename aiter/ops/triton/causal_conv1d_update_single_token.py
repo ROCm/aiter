@@ -172,7 +172,17 @@ def fused_reshape_causal_conv1d_update_single_token(
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
     validate_data: bool = False,
+    gqa_interleaved_layout: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused reshape + causal-conv1d update for a packed GDN qkvz tensor.
+
+    ``gqa_interleaved_layout`` (default True for backward compatibility):
+      - True  — ``x`` packs each K-head as ``[q_chunk | k_chunk | v_chunk | z_chunk]``
+                contiguously, and ``ba`` interleaves ``[b_g, a_g]`` per K-head group.
+                (Used by Qwen3-Next.)
+      - False — ``x`` packs as flat ``[q_all | k_all | v_all | z_all]`` and
+                ``ba`` concatenates ``[b_all | a_all]``. (Used by Qwen3.5.)
+    """
     assert (
         num_accepted_tokens is None
     ), f"num_accepted_tokens must be None, got {num_accepted_tokens}"
@@ -210,7 +220,12 @@ def fused_reshape_causal_conv1d_update_single_token(
     head_dim = head_k_dim + head_k_dim + head_v_dim * num_v_heads // num_k_heads
     head_qkvz_dim = head_dim + head_v_dim * num_v_heads // num_k_heads
     dim = num_k_heads * head_dim
-    expected_qkvz_dim = num_k_heads * head_qkvz_dim
+    if gqa_interleaved_layout:
+        expected_qkvz_dim = num_k_heads * head_qkvz_dim
+    else:
+        expected_qkvz_dim = (
+            2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim
+        )
     assert (
         qkvz_dim == expected_qkvz_dim
     ), f"ERROR: expect qkvz_dim to be {expected_qkvz_dim}, got {qkvz_dim}"
@@ -322,6 +337,7 @@ def fused_reshape_causal_conv1d_update_single_token(
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
+        GQA_INTERLEAVED_LAYOUT=gqa_interleaved_layout,
     )
     if unsqueeze:
         out = out.squeeze(-1)
