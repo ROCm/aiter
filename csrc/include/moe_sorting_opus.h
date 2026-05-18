@@ -2950,7 +2950,6 @@ struct MoeSortingMultiPhaseKernel_P23
                 p_local_topk_ids[i] = local_id;
             }
         }
-        __syncthreads();
         {
             const IndexType* p_local_expert_mask =
                 static_cast<const IndexType*>(kargs.p_local_expert_mask);

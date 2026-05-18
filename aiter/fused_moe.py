@@ -356,7 +356,8 @@ def fused_moe_(
         not metadata.run_1stage
         and need_bias_support
         and metadata.has_bias
-        and stage1_func is cktile_moe_stage1
+        and metadata.ksplit > 1
+        and stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1)
         and expert_mask is not None
     )
     sorting_ret = moe_sorting(
