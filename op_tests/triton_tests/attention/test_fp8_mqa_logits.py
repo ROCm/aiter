@@ -54,10 +54,10 @@ def ref_fp8_mqa_logits(
     k = k.float()
 
     mask_lo = (
-        torch.arange(0, seq_len_kv, device=q.device)[None, :] >= cu_seqlen_ks[:, None]
+        torch.arange(0, seq_len_kv, device="cuda")[None, :] >= cu_seqlen_ks[:, None]
     )
     mask_hi = (
-        torch.arange(0, seq_len_kv, device=q.device)[None, :] < cu_seqlen_ke[:, None]
+        torch.arange(0, seq_len_kv, device="cuda")[None, :] < cu_seqlen_ke[:, None]
     )
     mask = mask_lo & mask_hi
 
@@ -83,23 +83,11 @@ def generate_cp_test_data(seq_len, seq_len_kv):
     return ks, ke
 
 
-@pytest.mark.parametrize(
-    "s_q, s_k",
-    [
-        (1, 16),
-        (1, 113),
-        (17, 76),
-        (61, 113),
-        (61, 1024),
-        (128, 1024),
-        (1024, 1024),
-        (1024, 1560),
-    ],
-)
-@pytest.mark.parametrize("num_heads", [64])
+@pytest.mark.parametrize("s_q", [1, 17, 61, 128, 1024])
+@pytest.mark.parametrize("s_k", [16, 76, 113, 1024, 2048])
+@pytest.mark.parametrize("num_heads", [16, 64])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("disable_cp", [True, False])
-@pytest.mark.parametrize("clean_logits", [True, False])
 @torch.inference_mode()
 def test_fp8_mqa_logits(
     s_q: int,
@@ -107,8 +95,9 @@ def test_fp8_mqa_logits(
     num_heads: int,
     head_dim: int,
     disable_cp: bool,
-    clean_logits: bool,
 ) -> None:
+    if s_q > s_k:
+        pytest.skip()
     torch.manual_seed(0)
     q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
@@ -129,15 +118,7 @@ def test_fp8_mqa_logits(
         q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
     )
 
-    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits)
-
-    # If clean_logits is not set, clean the rest for testing
-    if not clean_logits:
-        assert logits.size() == (s_q, s_k)
-        tmp = torch.full((s_q, s_k), float("-inf"), device="cuda")
-        for i in range(s_q):
-            tmp[i, ks[i] : ke[i]] = logits[i, : ke[i] - ks[i]]
-        logits = tmp
+    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke)
 
     ref_neginf_mask = ref_logits == float("-inf")
     neginf_mask = logits == float("-inf")
