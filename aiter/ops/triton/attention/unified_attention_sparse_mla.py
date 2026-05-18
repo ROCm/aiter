@@ -8,7 +8,6 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention_sparse_mla imp
     _2d_topk_autotuner,
     _3d_csr_autotuner,
     _kernel_unified_attention_sparse_mla_2d,
-    _kernel_unified_attention_sparse_mla_csr_2d,
     _kernel_unified_attention_sparse_mla_csr_3d,
     _kernel_unified_attention_sparse_mla_csr_reduce,
 )
@@ -273,12 +272,14 @@ def unified_attention_sparse_mla(
             )
             return
 
-        # 2D CSR path
+        # 2D CSR path (merged kernel; topk_indices_ptr unused under USE_CSR=True
+        # — pass kv_indices as a placeholder pointer so Triton typechecks).
         kernel_kwargs = dict(
             output_ptr=out,
             query_ptr=q,
             key_cache_ptr=k,
             value_cache_ptr=v,
+            topk_indices_ptr=kv_indices,
             kv_indptr_ptr=kv_indptr,
             kv_indices_ptr=kv_indices,
             seq_lens_ptr=seqused_k,
@@ -301,12 +302,14 @@ def unified_attention_sparse_mla(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            topk_count=0,
             max_sparse_len=max_sparse_len,
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ROPE_RANK=ROPE_RANK,
             KV_LORA_RANK=KV_LORA_RANK,
+            USE_CSR=True,
             ALL_DECODE=ALL_DECODE,
             Q_SCALE=Q_SCALE,
             K_SCALE=K_SCALE,
@@ -315,7 +318,7 @@ def unified_attention_sparse_mla(
         if UA_SPARSE_MLA_AUTOTUNE and _2d_csr_autotuner is not None:
             _2d_csr_autotuner[(total_num_q_blocks,)](**kernel_kwargs)
         else:
-            _kernel_unified_attention_sparse_mla_csr_2d[(total_num_q_blocks,)](
+            _kernel_unified_attention_sparse_mla_2d[(total_num_q_blocks,)](
                 **kernel_kwargs,
                 TILE_SIZE=DEFAULT_2D_CSR_TILE_SIZE,
                 PRELOAD_V=DEFAULT_2D_CSR_PRELOAD_V,
@@ -325,14 +328,16 @@ def unified_attention_sparse_mla(
             )
         return
 
-    # Dense top-k path (2D only).
+    # Dense top-k path (merged kernel; kv_indptr_ptr/kv_indices_ptr unused under
+    # USE_CSR=False — pass topk_indices as a placeholder pointer).
     kernel_kwargs = dict(
         output_ptr=out,
         query_ptr=q,
         key_cache_ptr=k,
         value_cache_ptr=v,
-        block_tables_ptr=block_table,
         topk_indices_ptr=topk_indices,
+        kv_indptr_ptr=topk_indices,
+        kv_indices_ptr=topk_indices,
         seq_lens_ptr=seqused_k,
         scale=softmax_scale,
         q_scale=q_scale_t,
@@ -340,7 +345,6 @@ def unified_attention_sparse_mla(
         v_scale=v_scale_t,
         num_query_heads=num_query_heads,
         num_queries_per_kv=num_queries_per_kv,
-        block_table_stride=block_table.stride(0),
         query_stride_0=q.stride(0),
         query_stride_1=q.stride(1),
         output_stride_0=out.stride(0),
@@ -355,11 +359,13 @@ def unified_attention_sparse_mla(
         stride_v_cache_2=v.stride(2),
         stride_v_cache_3=v.stride(3),
         topk_count=topk_count,
+        max_sparse_len=0,
         query_start_len_ptr=cu_seqlens_q,
         num_seqs=num_seqs,
         BLOCK_M=BLOCK_M,
         ROPE_RANK=ROPE_RANK,
         KV_LORA_RANK=KV_LORA_RANK,
+        USE_CSR=False,
         ALL_DECODE=ALL_DECODE,
         Q_SCALE=Q_SCALE,
         K_SCALE=K_SCALE,
