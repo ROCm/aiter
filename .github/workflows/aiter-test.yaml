@@ -379,6 +379,19 @@ jobs:
           --name aiter_test \
           $IMAGE_TAG
 
+      - name: Check GPU visibility
+        run: |
+          set -euo pipefail
+          if docker exec \
+            -w /workspace \
+            aiter_test \
+            bash -lc './.github/scripts/aiter_gpu_visibility_check.sh'; then
+            echo "GPU visibility check completed"
+          else
+            status=$?
+            echo "::warning::GPU visibility check failed with exit code ${status}; continuing"
+          fi
+
       - name: Sync CK submodule
         run: |
           set -ex
@@ -608,6 +621,19 @@ jobs:
           -w /workspace \
           --name aiter_test \
           $IMAGE_TAG
+
+      - name: Check GPU visibility
+        run: |
+          set -euo pipefail
+          if docker exec \
+            -w /workspace \
+            aiter_test \
+            bash -lc './.github/scripts/aiter_gpu_visibility_check.sh'; then
+            echo "GPU visibility check completed"
+          else
+            status=$?
+            echo "::warning::GPU visibility check failed with exit code ${status}; continuing"
+          fi
 
       - name: Sync CK submodule
         run: |
