@@ -63,5 +63,9 @@ if [[ "$BUILD_TRITON" == "1" ]]; then
 fi
 
 echo
+echo "==== Verify pinned triton ===="
+python .github/scripts/verify_triton_pin.py .github/requirements/triton-test.txt
+
+echo
 echo "==== Show installed packages ===="
 pip list

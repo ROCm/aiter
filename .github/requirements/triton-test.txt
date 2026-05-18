@@ -12,7 +12,7 @@ pybind11==3.0.1
 ninja==1.11.1.4
 psutil
 packaging
-flydsl==0.1.7
+flydsl==0.1.8
 
 # Test deps.
 pandas==2.2.3

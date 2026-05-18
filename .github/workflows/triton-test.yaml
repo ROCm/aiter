@@ -16,7 +16,6 @@ on:
       - ".github/scripts/select_triton_tests.py"
       - ".github/scripts/split_tests.sh"
       - ".github/scripts/verify_triton_pin.py"
-      - ".github/dockerfiles/triton-test.Dockerfile"
       - ".github/requirements/triton-test.txt"
   workflow_dispatch:
 
@@ -70,7 +69,7 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      DOCKER_IMAGE: "aiter_triton_test:ci"
+      DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"
 
     steps:
@@ -114,11 +113,6 @@ jobs:
           echo "$TRITON_TEST"
           echo "TRITON_TEST=$TRITON_TEST" >> $GITHUB_ENV
 
-      - name: Build Docker image
-        run: |
-          set -ex
-          docker build -t ${{ env.DOCKER_IMAGE }} -f .github/dockerfiles/triton-test.Dockerfile .
-
       - name: Run the container
         run: |
           set -ex
@@ -140,23 +134,10 @@ jobs:
           --name triton_test \
           ${{ env.DOCKER_IMAGE }}
 
-      - name: Install aiter (editable)
+      - name: Setup Aiter and Triton
         run: |
           set -ex
-          docker exec -w /workspace triton_test git config --global --add safe.directory /workspace
-          docker exec -w /workspace triton_test pip install --no-build-isolation -e .
-
-      - name: Reinstall pinned triton
-        # aiter's `triton>=3.6.0` requirement can pull stock PyPI triton on top of the
-        # pinned AMD wheel. Reinstall to restore the pin.
-        run: |
-          set -ex
-          docker exec -w /workspace triton_test pip install --force-reinstall --no-deps -r .github/requirements/triton-test.txt
-
-      - name: Verify pinned triton wasn't overwritten
-        run: |
-          set -ex
-          docker exec -w /workspace triton_test python .github/scripts/verify_triton_pin.py .github/requirements/triton-test.txt
+          docker exec -w /workspace triton_test bash .github/scripts/build_aiter_triton.sh
 
       # TODO: Uncomment [docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"]
       #       command to enable test selection.
@@ -211,7 +192,7 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      DOCKER_IMAGE: "aiter_triton_test:ci"
+      DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_TEST: "op_tests/triton_tests/"
 
     steps:
@@ -255,11 +236,6 @@ jobs:
           echo "$TRITON_TEST"
           echo "TRITON_TEST=$TRITON_TEST" >> $GITHUB_ENV
 
-      - name: Build Docker image
-        run: |
-          set -ex
-          docker build -t ${{ env.DOCKER_IMAGE }} -f .github/dockerfiles/triton-test.Dockerfile .
-
       - name: Run the container
         run: |
           set -ex
@@ -281,23 +257,10 @@ jobs:
           --name triton_test \
           ${{ env.DOCKER_IMAGE }}
 
-      - name: Install aiter (editable)
+      - name: Setup Aiter and Triton
         run: |
           set -ex
-          docker exec -w /workspace triton_test git config --global --add safe.directory /workspace
-          docker exec -w /workspace triton_test pip install --no-build-isolation -e .
-
-      - name: Reinstall pinned triton
-        # aiter's `triton>=3.6.0` requirement can pull stock PyPI triton on top of the
-        # pinned AMD wheel. Reinstall to restore the pin.
-        run: |
-          set -ex
-          docker exec -w /workspace triton_test pip install --force-reinstall --no-deps -r .github/requirements/triton-test.txt
-
-      - name: Verify pinned triton wasn't overwritten
-        run: |
-          set -ex
-          docker exec -w /workspace triton_test python .github/scripts/verify_triton_pin.py .github/requirements/triton-test.txt
+          docker exec -w /workspace triton_test bash .github/scripts/build_aiter_triton.sh
 
       - name: Triton Tests
         run: |
