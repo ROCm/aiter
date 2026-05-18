@@ -816,7 +816,7 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                 b_ptr.dtype.element_ty
             )
 
-            accumulator += tl.dot(a, b, input_precision="ieee") * a_scale
+            accumulator += tl.dot(a, b) * a_scale
 
             a_ptrs += BLOCK_SIZE_K * stride_ak_i64
             b_ptrs += BLOCK_SIZE_K * stride_bk_i64
