@@ -86,39 +86,53 @@ def _sage_fwd_no_mask(
             else:
                 v = tl.load(v_ptrs)
 
-        # setup qk accumlator
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
-
         # -- compute qk ----
-        qk += tl.dot(q, k) * (q_descale * k_descale)
-
-        if USE_ALIBI:
-            # compute the global position of each token within the sequence
-            q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            alibi_block = compute_alibi_block(
-                alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
-            )
-            qk += alibi_block
+        # Optimization (vs. eagerly scaled qk): defer the (q_descale * k_descale)
+        # descale until softmax so it can be fused with the m_ij subtract into a
+        # single FMA. Mathematically equivalent because scale > 0:
+        #   max(qk_int * scale) == max(qk_int) * scale
+        #   (qk_int * scale) - m_ij == fma(qk_int, scale, -m_ij)
+        # The fast path (no bias/alibi) skips the per-element scale multiply that
+        # the original code emitted as 64 v_fma_f32 with a zero addend, and instead
+        # folds the scale into the subtract from m_ij as a real fused FMA.
+        qk_int = tl.dot(q, k)
+        scale = q_descale * k_descale
 
         # compute qk mask
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
 
-        # compute bias
-        if USE_BIAS:
-            bias_ptrs = bias_base_ptrs + start_n * stride_bn
-            bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk += bias
+        if USE_ALIBI or USE_BIAS:
+            # Bias / alibi live in the scaled domain, so we materialize the
+            # scaled qk eagerly to add them, exactly as before.
+            qk = qk_int.to(ACCUMULATOR_TYPE) * scale
 
-        # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            if USE_ALIBI:
+                q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                alibi_block = compute_alibi_block(
+                    alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
+                )
+                qk += alibi_block
 
-        # scale and subtract max
-        if USE_BIAS:
-            q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
-            )
+            if USE_BIAS:
+                bias_ptrs = bias_base_ptrs + start_n * stride_bn
+                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
+                qk += bias
+
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            if USE_BIAS:
+                q_shifted = tl.where(
+                    m_ij[:, None] == float("-inf"),
+                    float("-inf"),
+                    qk - m_ij[:, None],
+                )
+            else:
+                q_shifted = qk - m_ij[:, None]
         else:
-            q_shifted = qk - m_ij[:, None]
+            # Fast path: keep qk in unscaled f32 and fuse scale into the FMA.
+            qk = qk_int.to(ACCUMULATOR_TYPE)
+            row_max_unscaled = tl.max(qk, 1)
+            m_ij = tl.maximum(m_i, row_max_unscaled * scale)
+            q_shifted = qk * scale - m_ij[:, None]
 
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
