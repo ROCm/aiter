@@ -122,6 +122,70 @@ def primary_output(result: Any) -> Any:
     return result
 
 
+def generate_test_tensors(
+    batch: int,
+    hq: int,
+    hk: int,
+    sq: int,
+    sk: int,
+    d_head: int,
+    d_head_v: int,
+    dtype: torch.dtype,
+    device: str,
+    distribution: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if distribution == "normal":
+        q = torch.randn((batch, hq, sq, d_head), device=device, dtype=dtype)
+        k = torch.randn((batch, hk, sk, d_head), device=device, dtype=dtype)
+        v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=dtype)
+        return q, k, v
+
+    if distribution != "transformer":
+        raise ValueError(f"Unsupported input distribution: {distribution}")
+
+    q = torch.randn((batch, hq, sq, d_head), device=device, dtype=torch.float32)
+    k = torch.randn((batch, hk, sk, d_head), device=device, dtype=torch.float32)
+    v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=torch.float32)
+
+    q = q / q.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+    k = k / k.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+    v = v / v.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+
+    q_channel_scale = torch.exp(
+        0.35 * torch.randn((1, hq, 1, d_head), device=device)
+    ).clamp(0.35, 2.5)
+    k_channel_scale = torch.exp(
+        0.35 * torch.randn((1, hk, 1, d_head), device=device)
+    ).clamp(0.35, 2.5)
+    v_channel_scale = torch.exp(
+        0.45 * torch.randn((1, hk, 1, d_head_v), device=device)
+    ).clamp(0.25, 3.5)
+    q = q * q_channel_scale
+    k = k * k_channel_scale
+    v = v * v_channel_scale
+
+    shared_heads = min(hq, hk)
+    shared_seq = min(sq, sk)
+    shared_d = min(d_head, d_head_v)
+    if shared_heads > 0 and shared_seq > 0:
+        shared = torch.randn(
+            (batch, shared_heads, shared_seq, shared_d),
+            device=device,
+            dtype=torch.float32,
+        )
+        q[:, :shared_heads, :shared_seq, :shared_d] += 0.35 * shared
+        k[:, :shared_heads, :shared_seq, :shared_d] += 0.35 * shared
+
+    num_v_outlier_dims = max(1, d_head_v // 16)
+    v_outlier_dims = torch.randperm(d_head_v, device=device)[:num_v_outlier_dims]
+    v[..., v_outlier_dims] *= 4.0
+    num_v_outlier_tokens = max(1, sk // 128)
+    v_outlier_tokens = torch.randperm(sk, device=device)[:num_v_outlier_tokens]
+    v[:, :, v_outlier_tokens, :] *= 2.5
+
+    return q.to(dtype), k.to(dtype), v.to(dtype)
+
+
 def infer_shape_spec(
     q: torch.Tensor,
     v: torch.Tensor,
@@ -1066,9 +1130,18 @@ def run_benchmark_generated(
         provider,
         device="cuda",
     ):
-        q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
+        q, k, v = generate_test_tensors(
+            BATCH,
+            HQ,
+            HK,
+            N_CTX_Q,
+            N_CTX_K,
+            D_HEAD,
+            D_HEAD_V,
+            dtype,
+            device,
+            args.input_distribution,
+        )
 
         q.requires_grad = False
         k.requires_grad = False
@@ -1137,10 +1210,17 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: List[LoadedMask]) -
         n_ctx_q = loaded.num_q_blocks * block_m
         n_ctx_k = loaded.num_kv_blocks * block_n
 
-        q = torch.randn((loaded.batch, HQ, n_ctx_q, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((loaded.batch, HK, n_ctx_k, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn(
-            (loaded.batch, HK, n_ctx_k, D_HEAD_V), device=device, dtype=dtype
+        q, k, v = generate_test_tensors(
+            loaded.batch,
+            HQ,
+            HK,
+            n_ctx_q,
+            n_ctx_k,
+            D_HEAD,
+            D_HEAD_V,
+            dtype,
+            device,
+            args.input_distribution,
         )
         q.requires_grad = False
         k.requires_grad = False
@@ -1177,9 +1257,18 @@ def run_block_sparse_repetitions(
     dtype = arg_to_torch_dtype[args.dtype]
     device = "cuda"
 
-    q = torch.randn((args.b, args.hq, args.sq, args.d), device=device, dtype=dtype)
-    k = torch.randn((args.b, args.hk, args.sk, args.d), device=device, dtype=dtype)
-    v = torch.randn((args.b, args.hk, args.sk, args.dv), device=device, dtype=dtype)
+    q, k, v = generate_test_tensors(
+        args.b,
+        args.hq,
+        args.hk,
+        args.sq,
+        args.sk,
+        args.d,
+        args.dv,
+        dtype,
+        device,
+        args.input_distribution,
+    )
     q.requires_grad = False
     k.requires_grad = False
     v.requires_grad = False
@@ -1356,7 +1445,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--layout", type=str, default="bshd", choices=["bshd", "bhsd"])
     parser.add_argument("--causal", action="store_true", help="Enable causal attention")
-
+    parser.add_argument(
+        "--input-distribution",
+        type=str,
+        default="normal",
+        choices=["normal", "transformer"],
+        help="Distribution used for generated Q/K/V tensors",
+    )
     parser.add_argument(
         "--metric",
         type=str,
@@ -1530,9 +1625,18 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     d_head = args.d if args.d else 128
     d_head_v = args.dv if args.dv else d_head
 
-    q = torch.randn((args.b, args.hq, args.sq, d_head), device=device, dtype=dtype)
-    k = torch.randn((args.b, hk, sk, d_head), device=device, dtype=dtype)
-    v = torch.randn((args.b, hk, sk, d_head_v), device=device, dtype=dtype)
+    q, k, v = generate_test_tensors(
+        args.b,
+        args.hq,
+        hk,
+        args.sq,
+        sk,
+        d_head,
+        d_head_v,
+        dtype,
+        device,
+        args.input_distribution,
+    )
     q.requires_grad = False
     k.requires_grad = False
     v.requires_grad = False
