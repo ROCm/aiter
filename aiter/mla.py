@@ -149,7 +149,7 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     num_kv_splits_indptr = torch.arange(
         0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
     )
-
+    print(f"num_kv_splits {num_kv_splits}")
     return num_kv_splits, num_kv_splits_indptr
 
 
@@ -207,6 +207,13 @@ def mla_decode_fwd(
                 num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
             )
 
+        # Force single split for causal mask kernel (SUB_KV=128, no multi-split support)
+        if causal_mask and num_kv_splits > 1:
+            num_kv_splits = 1
+            num_kv_splits_indptr = torch.arange(
+                0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device=device
+            )
+
         mgc = 64 if max_seqlen_q == 1 and nhead in [8, 16] else 16
         mgc = (
             32
@@ -230,7 +237,7 @@ def mla_decode_fwd(
         logits = (
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
             if (
-                num_kv_splits == 1
+                num_kv_splits == 1 and not causal_mask
                 and (
                     q.dtype == dtypes.fp8
                     or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
@@ -249,8 +256,8 @@ def mla_decode_fwd(
             )
         )
 
-        attn_lse = torch.empty(
-            (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
+        attn_lse = torch.full(
+            (total_s, num_kv_splits, nhead, 1), float("-inf"), dtype=dtypes.fp32, device=device
         )
         final_lse = (
             torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
@@ -282,7 +289,7 @@ def mla_decode_fwd(
             causal_mask,
         )
 
-        if num_kv_splits == 1 and (
+        if num_kv_splits == 1 and not causal_mask and (
             q.dtype == dtypes.fp8
             or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
             or (
@@ -294,6 +301,11 @@ def mla_decode_fwd(
         ):
             lse = final_lse if return_lse else attn_lse
             return logits.view(total_s, nhead, v_head_dim), lse
+
+        if num_kv_splits == 1 and causal_mask:
+            o.copy_(logits.view(total_s, nhead, v_head_dim).to(o.dtype))
+            lse = final_lse if return_lse else attn_lse
+            return o, lse
 
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
