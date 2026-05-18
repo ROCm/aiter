@@ -573,8 +573,13 @@ def _gluon_fp8_mqa_logits_kernel(
     cu_start_ptr,  # int32  [seq_len]
     cu_end_ptr,  # int32  [seq_len]
     logits_ptr,  # fp32   [seq_len, seq_len_kv]
+<<<<<<< HEAD
     seq_len,
     seq_len_kv,
+=======
+    seq_len: gl.int32,
+    seq_len_kv: gl.int32,
+>>>>>>> cagri/fp8_mqa_gfx1250_cdna4
     NUM_HEADS: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     stride_q_s: gl.int32,
