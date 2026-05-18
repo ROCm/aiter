@@ -471,6 +471,149 @@ Reference impl in the test file is fully self-contained:
 Larger B (4096, 8192) per design doc are not in the default parametrize set —
 they allocate ~256-512 MiB of bf16 X. Add to parametrize if you want them.
 
+## Measured baseline perf (v1.1, MI355X / gfx950, 256 CUs)
+
+Raw run output and the benchmark script live under
+[`fp8_einsum_perf/`](fp8_einsum_perf/):
+
+- `bench_fp8_einsum.py` — reproducible benchmark harness
+- `v1.1_baseline_mi355x.txt` — full run on this commit
+
+**Peak references** (MI355X published specs):
+- HBM3E: ~8 TB/s
+- FP8 dense MFMA: ~2.5 PFLOPS (no sparsity)
+
+### Default shape — H=8, D=1024, R=4096, batch sweep (tile 64×128×128)
+
+| B    | time (ms) | TFLOPS | % FP8 peak | GB/s | % BW peak |
+|-----:|----------:|-------:|-----------:|-----:|----------:|
+| 4    | 0.116     | 2.3    | 0.1%       | 292  | 3.6%      |
+| 32   | 0.124     | 17     | 0.7%       | 291  | 3.6%      |
+| 128  | 0.133     | 65     | 2.6%       | 332  | 4.2%      |
+| 512  | 0.142     | 243    | 9.7%       | 533  | 6.7%      |
+| 2048 | 0.394     | 349    | 14.0%      | 512  | 6.4%      |
+| 8192 | 1.605     | 343    | 13.7%      | 439  | 5.5%      |
+
+Throughput saturates around **~350-390 TFLOPS (~15% of FP8 peak)** past B=512,
+across all H/D/R shapes tested. Memory bandwidth caps out around **~550-880 GB/s
+(~7-11% of HBM3E peak)** — so the kernel is neither compute- nor memory-bound;
+it is **launch/latency- and pipeline-bound** by the v1 design choices below.
+
+### What's leaving perf on the table (v1.1)
+
+Ordered roughly by expected impact:
+
+1. **No LDS ping-pong (`lds_stage=1`).** The K-loop body is
+   `barrier → load A → barrier → compute → barrier → load A …`. Global loads
+   and MFMAs are serialized rather than overlapped. The template's
+   `lds_stage=2` pattern (see "Architectural follow-up" below for the
+   recommended path) should ~2× compute throughput on its own.
+2. **LDS roundtrip in the amax + s_x distribution.** Each K=128 group per `mi`
+   costs `barrier + LDS store + barrier + 4 LDS loads` (amax reduce) and
+   `barrier + LDS store + 4 LDS loads` (s_x distribute). That's a meaningful
+   per-group serialization. Replacements: `permlanex16` for the amax cross-lane
+   reduce; the same primitive (or a single broadcast) for s_x distribution.
+3. **No tile/wave autotune.** The tile sweep at B=2048 shows tile_m=32 wins by
+   ~3% over tile_m=64; a full grid over (tile_m, tile_n, tile_k, waves_per_eu,
+   xcd_swizzle, lds_stage) is likely worth another 10-30%.
+4. **Bug-#4 patch costs LDS bytes.** A is bf16 in LDS (2 bytes/elem) so a
+   single 16B LDS load gives only 8 K-elems per lane — half of what fp8 would
+   give. Net effect: more LDS traffic per MFMA and the template's K-distribution
+   needed a custom per-ku-pair byte formula. See "Architectural follow-up".
+
+## Architectural follow-up — fuse online quant into the template's fp8 pipeline
+
+**Idea:** quantize bf16→fp8 in **registers** after the global load and write
+**fp8** to LDS in the same `(n0, k0, klane=4, nlane=16, kpack=16)` preshuffle
+layout that B uses, so the inner MFMA loop becomes byte-for-byte identical to
+`preshuffle_gemm.py`'s fp8 path. We then inherit the template's already-tuned
+ping-pong, scheduling hints, and LDS-load primitives instead of maintaining a
+parallel bf16-in-LDS pipeline.
+
+### Why this is attractive
+
+- **LDS bytes per A tile drop 2×** (fp8 vs bf16). With `lds_stage=2` the active
+  footprint goes 4× smaller, freeing occupancy.
+- **LDS-load bytes per MFMA drop 2×** (8 fp8 = 1 i64 per lane vs 16 bf16
+  bytes today).
+- **A's per-lane MFMA-time K-distribution natively matches B's** (both fp8 with
+  `kpack_elems=16`, lane G holds K = G*16..G*16+15). The custom per-ku-pair
+  byte formula added to patch bug #4 disappears.
+- **MFMA inner loop is the template's**, so we get `sched_mfma`/`sched_dsrd`
+  scheduling, `lds_stage=2` ping-pong, and the cshuffle epilogue path for free.
+
+### The one real complication
+
+Per-K-128 quant requires the row's amax over all 128 K-elems. At global-load
+time each thread holds only a fragment of that row's K, distributed by the
+global-load layout (`tx → (row, col)`) — NOT by the MFMA compute-time layout
+(`lane → (row = lane_mod_16, K = lane_div_16*8 + ...)`). So the row-amax must
+either come from a cross-thread reduction on the load-time layout, OR we stage
+the data in bf16 LDS first and do the amax + quant there.
+
+### Recommended shape
+
+A two-stage LDS pipeline per K-tile, interleaved per K=128 group so the fp8
+LDS region only ever holds one quant-group's worth of A:
+
+```
+load bf16 A tile → bf16 LDS (staging)              # global → LDS
+barrier
+for g in groups_per_tile:                          # K=128 group cadence
+    # all four mfmas_per_group K-fragments live in registers
+    bf16 row fragments → fp32                      # LDS → reg
+    per-row amax + cross-lane reduce               # in regs (LDS exchange ok)
+    s_x = clamped / 448; inv_s = 1/s_x
+    fp8 = pack( bf16 * inv_s )                     # reg quant
+    store fp8 → fp8 LDS in preshuffle layout       # reg → LDS
+    barrier
+    template's MFMA inner loop over this K=128     # LDS → MFMA → scratch
+    promote scratch + (s_x * s_y) → global accs    # same DeepGEMM pattern
+```
+
+Compared to v1.1, the **structural diff** is steps 4-6 (replacing today's
+direct-from-bf16-LDS quant + MFMA with a separate fp8-LDS write then template
+MFMA load). The amax cross-lane reduce + s_x distribution + scratch-then-promote
+all stay as they are — those are the DeepGEMM accuracy contract, not perf
+hotspots.
+
+### Concrete migration plan
+
+1. **Add a second LDS region** for fp8 A: size `tile_m * 128` fp8 bytes per
+   stage (one K-128 group), aligned 16. With `lds_stage=2` that doubles.
+2. **Write a `store_fp8_to_lds_preshuffled` helper** that takes the per-lane
+   quantized fp8 packs and the (mi, group-K-index) pair, and writes to LDS in
+   the `(n0=1 always since one group, k0=1, klane=4, nlane=16, kpack=16)`
+   layout that the template expects. Borrow the swizzle from
+   `mfma_preshuffle_pipeline.py`.
+3. **Compute-side: lift the bf16-load + quant out of the MFMA `ku_in_g` inner
+   loop.** Do all 4 ku_in_g quants up-front per (g, mi), populate the fp8 LDS
+   region, then call the template's `lds_load_packs_k64` + `mfma_step` inner
+   loop.
+4. **Once correctness matches v1.1**, swap the K-tile driver for the template's
+   `lds_stage=2` pattern (the bf16 staging buffer ping-pongs, and the fp8
+   per-group buffer ping-pongs at a finer granularity — or just the bf16
+   ping-pongs and we re-quant on the fly).
+5. **Re-benchmark**, expect to clear the ping-pong + LDS-bandwidth limits. Target
+   is ≥ 30-50% of FP8 peak.
+
+### Open questions to validate during implementation
+
+- Whether the per-K-128 quant pass should run on ALL lanes (each lane quants its
+  own K-fragment, write to fp8 LDS) or on a subset (e.g., the load-time threads,
+  with a cross-lane shuffle on the way to fp8). The first is simpler and the
+  fp8 LDS region is small enough that bank conflicts are tractable.
+- Whether to keep the bf16 staging LDS at all, or do a cross-lane shuffle
+  directly from load-time registers to the quant-time lane distribution and
+  skip bf16 LDS entirely. Skipping bf16 LDS is the maximum-perf endpoint but
+  the shuffle pattern is non-trivial (the load layout decomposes `tx` as
+  `(row=tx/16, col=(tx*4)%64)` while quant wants `lane → (row=lane_mod_16,
+  K=lane_div_16*8+...)`).
+- Whether `mfma_scale_f32_16x16x128_f8f6f4` (the gfx950 scaled-MFMA op for
+  Step 4 / `scale_mode="ue8m0"`) can fold both the fp8 quant scale AND the per-
+  block weight scale, eliminating the scratch-then-promote entirely for the
+  ue8m0 path. The fp32 path stays as-is.
+
 ## Top three things likely to fail on first hardware run — RESOLVED
 
 (All three of the previously-suspected failure modes ended up not being the
