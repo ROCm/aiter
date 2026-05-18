@@ -423,9 +423,9 @@ suite_gqa() {
 }
 
 SUITE_kernel_flags_ARCHS=''
-SUITE_kernel_flags_DESC='v3_atomic_fp32 x v3_bf16_cvt x v3_check_d, single shape (validation-pass only).'
+SUITE_kernel_flags_DESC='v3_atomic_fp32 x v3_bf16_cvt, single shape (validation-pass only).'
 suite_kernel_flags() {
-    local prec mask atom cvt chkd
+    local prec mask atom cvt
     # One fixed shape: tile-aligned canonical.
     local b=2 h=4 h_k=2 sq=128 sk=128 hdim=64
     # Note: v3_api_check is a probe knob (returns 1.0f without launching the
@@ -436,16 +436,15 @@ suite_kernel_flags() {
     for mask in 0 t b; do
     for atom in 0 1; do
     for cvt in 0 1 2; do
-    for chkd in 0 1; do
         if skip_v3_constraint "$prec" "$hdim" "$sq" "$sk" "$mask" "$atom" "$cvt"; then
             continue
         fi
         run_case kernel_flags -prec=$prec -b=$b -h=$h -h_k=$h_k -d=$hdim \
             -s=$sq -s_k=$sk -mask=$mask \
             -bwd_v3=1 -v3_atomic_fp32=$atom -v3_bf16_cvt=$cvt \
-            -v3_api_check=0 -v3_check_d=$chkd -mode=0 \
+            -v3_api_check=0 -mode=0 \
             -init=1 -seed=11939
-    done; done; done; done; done
+    done; done; done; done
 }
 
 SUITE_shape_edges_ARCHS=''

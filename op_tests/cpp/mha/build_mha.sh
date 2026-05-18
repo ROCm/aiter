@@ -27,9 +27,8 @@ echo "######## linking mha fwd"
                      -DENABLE_CK=1 \
                      -DCK_TILE_FMHA_FWD_SPLITKV_API=$splitkv_api \
                      --offload-arch=native \
-                     $SCRIPT_DIR/benchmark_mha_fwd.cpp \
                      -L $SCRIPT_DIR -lmha_fwd \
-                     -o fwd.exe
+                     $SCRIPT_DIR/benchmark_mha_fwd.cpp -o fwd.exe
 fi
 
 if [ x"$FMA_API" = x"bwd" ] || [ x"$FMA_API" = x"bwd_v3" ] || [ x"$FMA_API" = x"" ] ; then
@@ -41,7 +40,6 @@ echo "######## linking mha bwd"
                      -DUSE_ROCM=1 \
                      -DENABLE_CK=1 \
                      --offload-arch=native \
-                     $SCRIPT_DIR/benchmark_mha_bwd.cpp \
                      -L $SCRIPT_DIR -lmha_bwd \
-                     -o bwd.exe
+                     $SCRIPT_DIR/benchmark_mha_bwd.cpp -o bwd.exe
 fi

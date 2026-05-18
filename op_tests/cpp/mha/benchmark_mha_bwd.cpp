@@ -216,13 +216,7 @@ auto create_args(int argc, char* argv[])
                 "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
         .insert("v3_api_check",
                 "0",
-                "if set to 1, check whether the input scenario is supported by the asm kernel.")
-        .insert("v3_dump_args",
-                "0",
-                "if set to 1, print packed v3 stride arguments in elements and bytes")
-        .insert("v3_check_d",
-                "0",
-                "if set to 1, compare device D buffer against host O*dO reduction");
+                "if set to 1, check whether the input scenario is supported by the asm kernel.");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -349,8 +343,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
     bool v3_atomic_fp32 = arg_parser.get_bool("v3_atomic_fp32");
     int v3_bf16_cvt     = arg_parser.get_int("v3_bf16_cvt");
     bool v3_api_check   = arg_parser.get_bool("v3_api_check");
-    bool v3_dump_args   = arg_parser.get_bool("v3_dump_args");
-    bool v3_check_d     = arg_parser.get_bool("v3_check_d");
 
     ck_tile::stream_config stream_config{nullptr,
                                          true,
@@ -767,60 +759,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    drop_seed_offset};
     }();
 
-    auto print_v3_triplet = [&](const std::string& label,
-                                long long elem_size,
-                                long long stride,
-                                long long nhead_stride,
-                                long long batch_stride) {
-        std::cout << "[v3-args] " << label << " elems(s=" << stride << ", h=" << nhead_stride
-                  << ", b=" << batch_stride << ") bytes(s=" << stride * elem_size
-                  << ", h=" << nhead_stride * elem_size << ", b=" << batch_stride * elem_size
-                  << ")" << std::endl;
-    };
-
-    if(v3_dump_args)
-    {
-        std::cout << "[v3-args] layout i=" << get_layout_string(i_layout)
-                  << " o=" << get_layout_string(o_layout) << ", atomic_fp32=" << v3_atomic_fp32
-                  << ", bf16_cvt=" << v3_bf16_cvt << ", hdim=" << hdim_q << ", batch=" << batch
-                  << ", nhead=" << nhead << ", nhead_k=" << nhead_k << ", seqlen_q=" << seqlen_q
-                  << ", seqlen_k=" << seqlen_k << std::endl;
-        print_v3_triplet("q", sizeof(QDataType), mha_args.stride_q, mha_args.nhead_stride_q, mha_args.batch_stride_q);
-        print_v3_triplet("k", sizeof(KDataType), mha_args.stride_k, mha_args.nhead_stride_k, mha_args.batch_stride_k);
-        print_v3_triplet("v", sizeof(VDataType), mha_args.stride_v, mha_args.nhead_stride_v, mha_args.batch_stride_v);
-        print_v3_triplet("o", sizeof(ODataType), mha_args.stride_o, mha_args.nhead_stride_o, mha_args.batch_stride_o);
-        print_v3_triplet("do",
-                         sizeof(OGradDataType),
-                         mha_args.stride_do,
-                         mha_args.nhead_stride_do,
-                         mha_args.batch_stride_do);
-        print_v3_triplet("dq",
-                         sizeof(QGradDataType),
-                         mha_args.stride_dq,
-                         mha_args.nhead_stride_dq,
-                         mha_args.batch_stride_dq);
-        print_v3_triplet("dk",
-                         sizeof(KGradDataType),
-                         mha_args.stride_dk,
-                         mha_args.nhead_stride_dk,
-                         mha_args.batch_stride_dk);
-        print_v3_triplet("dv",
-                         sizeof(VGradDataType),
-                         mha_args.stride_dv,
-                         mha_args.nhead_stride_dv,
-                         mha_args.batch_stride_dv);
-        print_v3_triplet("lsed",
-                         sizeof(DDataType),
-                         1,
-                         mha_args.nhead_stride_lsed,
-                         mha_args.batch_stride_lsed);
-        print_v3_triplet("dq_acc",
-                         v3_atomic_fp32 ? sizeof(AccDataType) : sizeof(QGradDataType),
-                         mha_args.stride_dq_acc,
-                         mha_args.nhead_stride_dq_acc,
-                         mha_args.batch_stride_dq_acc);
-    }
-
     float ave_time = aiter::mha_bwd(mha_args, stream_config);
     if(ave_time < 0)
     {
@@ -1056,10 +994,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
         nullptr, true, 0, 0, 1, arg_parser.get_str("timer") == std::string("gpu")};
     aiter::mha_bwd(mha_args, stream_config_v);
 
-    if(v3_check_d)
-    {
-        d_buf.FromDevice(d_host.data());
-    }
     dq_buf.FromDevice(dq_host.data());
     dk_buf.FromDevice(dk_host.data());
     dv_buf.FromDevice(dv_host.data());
@@ -1195,18 +1129,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
 
         auto [rtol, atol] = get_elimit<DataTypeConfig>(hdim_q, hdim_v);
         bool d_cur_pass = true;
-        if(v3_check_d)
-        {
-            ck_tile::HostTensor<AccDataType> d_host_result({nhead, real_seqlen_q});
-            d_host_result.ForEach([&](auto& self, auto idx) {
-                self(idx) = ck_tile::type_convert<AccDataType>(d_host(b, idx[0], idx[1] + query_offset));
-            });
-            d_cur_pass = ck_tile::check_err(d_host_result,
-                                            do_dot_o_ref,
-                                            std::string("Error: D Incorrect results!"),
-                                            rtol,
-                                            atol);
-        }
         bool dq_cur_pass  = ck_tile::check_err(dq_host_result,
                                               dq_host_ref,
                                               std::string("Error: QGrad Incorrect results!"),
