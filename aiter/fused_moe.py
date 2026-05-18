@@ -646,6 +646,9 @@ fused_moe_1stage_dict = {
         (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   True)  : aiter.fmoe_g1u1_tkw1,
         (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_g1u1,
         (ActivationType.Gelu,   QuantType.per_Token,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_g1u1,
+    },
+    "gfx1250":
+    {
     }
 }
 # fmt: on
@@ -684,8 +687,13 @@ class MOEMetadata:
     stage2_has_bias: bool = False
 
 
-def _needs_swiglu_bias_support(dtype, quant_type):
-    return dtype in [dtypes.bf16, dtypes.fp16] and quant_type == QuantType.per_1x32
+def _needs_swiglu_bias_support(dtype, quant_type, activation):
+    """Return True when the Swiglu+per_1x32 path needs bias forwarded to kernels."""
+    return (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and quant_type == QuantType.per_1x32
+        and activation == ActivationType.Swiglu
+    )
 
 
 def _normalize_bias_for_kernel(
@@ -800,6 +808,49 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
     )
 
+def _gfx1250_tile_env_overrides():
+    """Read ``AITER_GFX1250_*`` tile-config env vars.
+
+    Returns a 5-tuple ``(stage1_tile_n, stage1_tile_k, stage1_block_m,
+    stage2_tile_n, stage2_tile_k)`` where each entry is ``int`` if the
+    env var is set to a positive integer, else ``None`` (fall back to
+    the hardcoded default in ``get_2stage_cfgs``).
+
+    Designed to be called at each ``get_2stage_cfgs`` call site so the
+    resolved values become part of the ``lru_cache`` key; that way two
+    runs with different env settings get distinct cache entries instead
+    of silently sharing the first one's metadata.
+
+    Env vars recognised:
+
+    * ``AITER_GFX1250_STAGE1_TILE_N``
+    * ``AITER_GFX1250_STAGE1_TILE_K``
+    * ``AITER_GFX1250_BLOCK_M`` (== stage1/stage2 ``tile_m`` /
+      ``route_tile_m`` -- shared by both stages in the current
+      ``MOEMetadata.block_m`` plumbing)
+    * ``AITER_GFX1250_STAGE2_TILE_N``
+    * ``AITER_GFX1250_STAGE2_TILE_K``
+
+    Unset / empty / non-positive values fall back to ``None``.
+    """
+    def _g(name):
+        v = os.environ.get(name, "")
+        if not v:
+            return None
+        try:
+            iv = int(v)
+        except ValueError:
+            return None
+        return iv if iv > 0 else None
+
+    return (
+        _g("AITER_GFX1250_STAGE1_TILE_N"),
+        _g("AITER_GFX1250_STAGE1_TILE_K"),
+        _g("AITER_GFX1250_BLOCK_M"),
+        _g("AITER_GFX1250_STAGE2_TILE_N"),
+        _g("AITER_GFX1250_STAGE2_TILE_K"),
+    )
+
 
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
@@ -819,6 +870,11 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
+    stage1_tile_n=None,
+    stage1_tile_k=None,
+    stage1_block_m=None,
+    stage2_tile_n=None,
+    stage2_tile_k=None,
 ):
     gate_mode = GateMode(gate_mode)
     _INDEX_COLS = [
@@ -836,6 +892,85 @@ def get_2stage_cfgs(
         "use_g1u1",
         "doweight_stage1",
     ]
+
+
+    # gfx1250: bypass tuning configs and route directly to FlyDSL kernels
+    if get_gfx() == "gfx1250" and is_flydsl_available():
+        gfx1250_fmt = _gfx1250_data_format(q_dtype_a, q_dtype_w, q_type, dtype)
+        if gfx1250_fmt is not None:
+            out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
+            is_mxscale = gfx1250_fmt in ("fp4", "fp8", "a8w4")
+            # None here keeps the historical defaults
+            _default_tile_n = 128 if is_mxscale else 64
+            _default_tile_k = 128 if is_mxscale else 64
+            # default_block_m = 32
+            _default_block_m = 16
+            default_tile_n = (
+                stage1_tile_n if stage1_tile_n is not None else _default_tile_n
+            )
+            default_tile_k = (
+                stage1_tile_k if stage1_tile_k is not None else _default_tile_k
+            )
+            default_block_m = (
+                stage1_block_m if stage1_block_m is not None else _default_block_m
+            )
+            stage2_fmt = gfx1250_fmt
+            stage2_is_mxscale = stage2_fmt in ("fp4", "fp8", "a8w4")
+            _stage2_default_tile_n = 128 if stage2_is_mxscale else 64
+            _stage2_default_tile_k = 128 if stage2_is_mxscale else 64
+            _s2_tile_n_override = stage2_tile_n
+            _s2_tile_k_override = stage2_tile_k
+            stage2_tile_n = (
+                _s2_tile_n_override
+                if _s2_tile_n_override is not None
+                else _stage2_default_tile_n
+            )
+            stage2_tile_k = (
+                _s2_tile_k_override
+                if _s2_tile_k_override is not None
+                else _stage2_default_tile_k
+            )
+
+            logger.debug(
+                "[fused_moe] gfx1250 FlyDSL dispatch: format=%s, %s kernel",
+                gfx1250_fmt,
+                "mxscale" if is_mxscale else "wmma",
+            )
+            logger.debug(
+                "[fused_moe] input shapes: token=%s, model_dim=%s, "
+                "inter_dim=%s, expert=%s, topk=%s",
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+            )
+            
+            _gfx1250_has_bias = _needs_swiglu_bias_support(
+                dtype, q_type, activation
+            ) and is_mxscale
+            return MOEMetadata(
+                stage1=functools.partial(
+                    _gfx1250_moe_stage1,
+                    in_dtype=gfx1250_fmt,
+                    out_dtype_str=out_dtype_str,
+                    tile_n=default_tile_n,
+                    tile_k=default_tile_k,
+                    activation=activation,
+                ),
+                stage2=functools.partial(
+                    _gfx1250_moe_stage2,
+                    in_dtype=stage2_fmt,
+                    out_dtype_str=out_dtype_str,
+                    tile_n=stage2_tile_n,
+                    tile_k=stage2_tile_k,
+                ),
+                block_m=default_block_m,
+                ksplit=0,
+                run_1stage=False,
+                has_bias=_gfx1250_has_bias,
+                stage2_has_bias=_gfx1250_has_bias,
+            )
 
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -1010,6 +1145,17 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    if cfg is not None and get_gfx() == "gfx1250":
+        kn1 = str(cfg.get("kernelName1", ""))
+        kn2 = str(cfg.get("kernelName2", ""))
+        if kn1.startswith("moe_ck2stages") or kn2.startswith("moe_ck2stages"):
+            logger.warning(
+                f"[fused_moe] gfx1250: tuned cfg for {keys} contains a CK "
+                f"kernel ({kn1=}, {kn2=}); CK is unsupported on gfx1250, "
+                "discarding cfg and falling back to default heuristics."
+            )
+            cfg = None
+
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
@@ -1148,6 +1294,7 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 use_non_temporal_load=use_non_temporal_load,
             )
+        _has_bias = _needs_swiglu_bias_support(dtype, q_type, activation)
         _s1_fp8q = is_flydsl1 and "_fp8" in kernelName1.split("_t")[-1]
         _fuse_quant = "fp8" if _s1_fp8q else ("fp4" if _s1_fp4q else "")
         return MOEMetadata(
@@ -1331,7 +1478,7 @@ def get_2stage_cfgs(
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
-                split_k=_split_k,
+                split_k=max(ksplit, 1),
                 dtype=dtype,
                 post_activation_layout=(
                     "standard" if swiglu_mxfp4_bf16_cktile else "auto"
@@ -1459,6 +1606,7 @@ def fused_moe_2stages(
     dtype = moe_out.dtype
     device = hidden_states.device
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    _s1_tn, _s1_tk, _s1_bm, _s2_tn, _s2_tk = _gfx1250_tile_env_overrides()
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
@@ -1476,6 +1624,11 @@ def fused_moe_2stages(
         intermediate_pad,
         is_shuffled,
         gate_mode,
+        stage1_tile_n=_s1_tn,
+        stage1_tile_k=_s1_tk,
+        stage1_block_m=_s1_bm,
+        stage2_tile_n=_s2_tn,
+        stage2_tile_k=_s2_tk,
     )
     if (
         quant_type == QuantType.per_1x32
@@ -1508,6 +1661,75 @@ def fused_moe_2stages(
         # a16wi4: bf16 activations, int4 weights; no activation quantization needed
         a1 = hidden_states.to(dtype)
         a1_scale = None
+    elif quant_type == QuantType.per_1x32 and get_gfx() == "gfx1250":
+        if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
+            logger.info(
+                f"[probe] stage1 quant entry: q_dtype_a={q_dtype_a} "
+                f"q_dtype_w={q_dtype_w} hidden.dtype={hidden_states.dtype} "
+                f"a1_scale_is_None={a1_scale is None}"
+            )
+        if hidden_states.dtype == q_dtype_a and a1_scale is not None:
+            a1 = hidden_states
+            a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
+        elif q_dtype_a == dtypes.fp4x2:
+            # Use the triton kernel (per_1x32_f4_quant_triton): it's
+            # cuda-graph capturable (custom HIP ops with mutating kwargs
+            # break capture) and fast enough at warmup-sized M (the
+            # earlier 10-minute hang we saw with this path was the *pure
+            # torch* reference, not the triton kernel).
+            from aiter.ops.quant import per_1x32_f4_quant_triton
+            a1, a1_scale = per_1x32_f4_quant_triton(hidden_states, quant_dtype=dtypes.fp4x2)
+        elif q_dtype_a == dtypes.fp8:
+            # a8w4 / a8w8 path on gfx1250.  Match FlyDSL UT exactly
+            from aiter.utility import fp4_utils as _aiter_fp4u
+            try:
+                from FlyDSL.tests.kernels.utils import fp4_utils as _fly_fp4u
+            except ImportError:
+                import importlib, sys, os as _os
+                for _root in ("/app/FlyDSL",):
+                    if _root not in sys.path:
+                        sys.path.insert(0, _root)
+                _fly_fp4u = importlib.import_module(
+                    "tests.kernels.utils.fp4_utils"
+                )
+            BLOCK = 32
+            DTYPE_MAX = 240.0  # fnuz finfo.max -- matches UT
+            a1_flat = hidden_states.view(-1, hidden_states.shape[-1]).to(
+                dtypes.fp32
+            )
+            M_, K_ = a1_flat.shape
+            assert K_ % BLOCK == 0, (
+                f"per_1x32 fp8 quant on gfx1250 requires K%{BLOCK}==0 "
+                f"(got K={K_})"
+            )
+            blk = a1_flat.view(-1, BLOCK)
+            blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
+            max_abs = blk.abs().amax(dim=1)
+            scale_e8m0 = _aiter_fp4u.f32_to_e8m0(max_abs / DTYPE_MAX)
+            scale_f32 = _aiter_fp4u.e8m0_to_f32(scale_e8m0)
+            scale_f32 = torch.nan_to_num(scale_f32, nan=1.0, posinf=1.0, neginf=1.0)
+            scale_f32[scale_f32 == 0] = 1.0
+            y_f32 = blk.float() / scale_f32.unsqueeze(1)
+            y_f32 = torch.clamp(y_f32, min=-DTYPE_MAX, max=DTYPE_MAX)
+            a1 = _fly_fp4u._f32_to_floatx_unpacked(
+                y_f32.contiguous().view(-1), 4, 3
+            ).view(M_, K_)
+            if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
+                _ub2 = a1.view(torch.uint8).to(torch.int32)
+                logger.info(
+                    f"[probe] stage1 a1 fn-encoded: shape={tuple(a1.shape)} "
+                    f"dtype={a1.dtype} 0x80_count={int((_ub2 == 0x80).sum())} "
+                    f"byte_min={int(_ub2.min())} byte_max={int(_ub2.max())}"
+                )
+            a1 = a1.view(*hidden_states.shape[:-1], K_)
+            a1_scale = scale_e8m0.view(M_, K_ // BLOCK).view(torch.uint8).view(
+                dtypes.fp8_e8m0
+            )
+        else:
+            raise NotImplementedError(
+                f"gfx1250 fused_moe per_1x32 stage1 quant: unsupported "
+                f"q_dtype_a={q_dtype_a}"
+            )
     elif quant_type == QuantType.per_1x32:
         if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
             # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
@@ -1560,7 +1782,7 @@ def fused_moe_2stages(
         )
     extra_stage1_args = {}
     extra_stage2_args = {}
-    need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
+    need_bias_support = _needs_swiglu_bias_support(dtype, quant_type, activation)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:
@@ -1636,6 +1858,91 @@ def fused_moe_2stages(
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
         a2_scale = None
+    elif quant_type == QuantType.per_1x32 and get_gfx() == "gfx1250":
+        # Stage2 FlyDSL kernel expects scale_x in source order of shape
+        # (tokens*topk, inter_dim//32). See comment in stage1 path.
+        # Pick the quant width to match the FlyDSL stage2 kernel (which
+        # uses the same gfx1250 format string as stage1):
+        #   * a8w4 / fp8 -> fp8 (e4m3fnuz)
+        #   * fp4        -> fp4x2
+        if q_dtype_a == dtypes.fp4x2:
+            # Triton kernel: cuda-graph capturable + fast at warmup M
+            # (see matching note in the stage1 fp4 branch above).
+            from aiter.ops.quant import per_1x32_f4_quant_triton
+            a2_flat = a2.view(-1, inter_dim)
+            a2_flat, a2_scale = per_1x32_f4_quant_triton(a2_flat, quant_dtype=dtypes.fp4x2)
+            a2_scale = a2_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
+            a2 = a2_flat.view(token_num, topk, -1)
+        elif q_dtype_a == dtypes.fp8:
+            # Mirror the FlyDSL UT's _per_1x32_fp8_quant exactly: scale
+            # uses dtype_max=240 (fnuz max) but the byte encoding is fn
+            # (bias 7, via _f32_to_floatx_unpacked).  See stage1 elif
+            # above for full rationale.
+            from aiter.utility import fp4_utils as _aiter_fp4u
+            try:
+                from FlyDSL.tests.kernels.utils import fp4_utils as _fly_fp4u
+            except ImportError:
+                import importlib, sys
+                for _root in ("/app/FlyDSL",):
+                    if _root not in sys.path:
+                        sys.path.insert(0, _root)
+                _fly_fp4u = importlib.import_module(
+                    "tests.kernels.utils.fp4_utils"
+                )
+            BLOCK = 32
+            DTYPE_MAX = 240.0
+            if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
+                _af = a2.float()
+                logger.info(
+                    f"[probe] stage2 a2 pre-quant: shape={tuple(a2.shape)} "
+                    f"dtype={a2.dtype} min={float(_af.min()):.3f} "
+                    f"max={float(_af.max()):.3f} "
+                    f"absmax={float(_af.abs().max()):.3f} "
+                    f"nan={int(torch.isnan(_af).sum())} "
+                    f"inf={int(torch.isinf(_af).sum())}"
+                )
+            a2_flat = a2.view(-1, inter_dim).to(dtypes.fp32)
+            assert inter_dim % BLOCK == 0
+            blk = a2_flat.view(-1, BLOCK)
+            blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
+            max_abs = blk.abs().amax(dim=1)
+            scale_e8m0 = _aiter_fp4u.f32_to_e8m0(max_abs / DTYPE_MAX)
+            scale_f32 = _aiter_fp4u.e8m0_to_f32(scale_e8m0)
+            scale_f32 = torch.nan_to_num(scale_f32, nan=1.0, posinf=1.0, neginf=1.0)
+            scale_f32[scale_f32 == 0] = 1.0
+            y_f32 = blk.float() / scale_f32.unsqueeze(1)
+            y_f32 = torch.clamp(y_f32, min=-DTYPE_MAX, max=DTYPE_MAX)
+            a2_q = _fly_fp4u._f32_to_floatx_unpacked(
+                y_f32.contiguous().view(-1), 4, 3
+            ).view(-1, inter_dim)
+            if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
+                _ub2 = a2_q.view(torch.uint8).to(torch.int32)
+                logger.info(
+                    f"[probe] stage2 a2 fn-encoded: 0x80_count="
+                    f"{int((_ub2 == 0x80).sum())} "
+                    f"byte_min={int(_ub2.min())} byte_max={int(_ub2.max())}"
+                )
+            a2 = a2_q.view(token_num, topk, -1)
+            a2_scale = (
+                scale_e8m0.view(token_num * topk, inter_dim // BLOCK)
+                .view(torch.uint8)
+                .view(dtypes.fp8_e8m0)
+            )
+            if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):
+                _af = a2.view(torch.uint8).to(torch.int32)
+                _sf = a2_scale.view(torch.uint8).to(torch.int32)
+                logger.info(
+                    f"[probe] stage2 a2 post-quant: shape={tuple(a2.shape)} "
+                    f"dtype={a2.dtype} byte_min={int(_af.min())} "
+                    f"byte_max={int(_af.max())} "
+                    f"scale_shape={tuple(a2_scale.shape)} "
+                    f"scale_min={int(_sf.min())} scale_max={int(_sf.max())}"
+                )
+        else:
+            raise NotImplementedError(
+                f"gfx1250 fused_moe per_1x32 stage2 quant: unsupported "
+                f"q_dtype_a={q_dtype_a}"
+            )
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
         a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
