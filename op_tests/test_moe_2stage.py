@@ -27,7 +27,9 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.aot.flydsl.common import fail_on_aot_cache_miss
 from aiter.ops.flydsl.moe_common import GateMode
+import aiter.ops.flydsl.moe_kernels as _aiter_mk
 
 
 from aiter.ops.shuffle import (
@@ -64,6 +66,7 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=True,
     strict_accuracy=True,
+    check_aot_cache=True,
     swiglu_limit=0.0,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
@@ -383,6 +386,9 @@ def test_fmoe(
     return {"us": us2, "logits_diff": float(logits_diff)}
 
 
+test_fmoe_with_aot_cache_check = fail_on_aot_cache_miss(_aiter_mk)(test_fmoe)
+
+
 l_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
     (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
@@ -649,6 +655,7 @@ def _iter_csv_cases():
             )
             continue
         kwargs["strict_accuracy"] = True
+        kwargs["check_aot_cache"] = True
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
@@ -724,6 +731,7 @@ def _iter_legacy_cases():
             use_g1u1=True,
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
+            check_aot_cache=False,
             **over,
         )
 
@@ -827,7 +835,12 @@ for kwargs, extras in case_iter:
     if _force_moe_bound_zero:
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     try:
-        ret = test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+        run_test_fmoe = (
+            test_fmoe_with_aot_cache_check
+            if kwargs.get("check_aot_cache", False)
+            else test_fmoe
+        )
+        ret = run_test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:

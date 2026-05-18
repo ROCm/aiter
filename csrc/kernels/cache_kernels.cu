@@ -1293,6 +1293,10 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     if(token_idx >= num_tokens || head_idx >= n_heads)
         return;
 
+    const int64_t slot_idx = slot_mapping[token_idx];
+    if(slot_idx < 0)
+        return;
+
     const int64_t pos = positions[token_idx];
     const scalar_t* cos_ptr = cos_cache + pos * cos_stride0;
     const scalar_t* sin_ptr = sin_cache + pos * sin_stride0;
@@ -1350,10 +1354,6 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     }
 
     if(head_idx != 0)
-        return;
-
-    const int64_t slot_idx = slot_mapping[token_idx];
-    if(slot_idx < 0)
         return;
 
     __shared__ float normed[HEAD_DIM];
@@ -3578,7 +3578,7 @@ void indexer_k_quant_and_cache(aiter_tensor_t& k,        // [num_tokens, head_di
                                const std::string& scale_fmt,
                                bool preshuffle)
 {
-    int num_tokens       = k.size(0);
+    int num_tokens       = std::min(k.size(0), slot_mapping.size(0));
     int head_dim         = k.size(1);
     int cache_block_size = kv_cache.size(1);
     int cache_stride     = kv_cache.size(2);
@@ -3632,7 +3632,7 @@ void indexer_qk_rope_quant_and_cache(
     bool preshuffle,
     bool is_neox)
 {
-    int num_tokens       = k.size(0);
+    int num_tokens       = std::min(k.size(0), slot_mapping.size(0));
     int head_dim         = k.size(1);
     int n_heads          = q.size(1);
     int rope_dim         = cos_cache.size(-1) * 2;
@@ -3662,17 +3662,16 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(weights_out.dim() == 2, "weights_out must be [num_tokens, n_heads]");
     AITER_CHECK(cos_cache.dim() == 2, "cos_cache must be [max_position, rope_dim / 2]");
     AITER_CHECK(sin_cache.dim() == 2, "sin_cache must be [max_position, rope_dim / 2]");
-    AITER_CHECK(q.size(0) == num_tokens, "q token dimension must match k");
+    AITER_CHECK(q.size(0) >= num_tokens, "q must cover all indexed tokens");
     AITER_CHECK(q.size(2) == head_dim, "q head_dim must match k head_dim");
-    AITER_CHECK(slot_mapping.size(0) >= num_tokens, "slot_mapping must cover all k tokens");
-    AITER_CHECK(positions.size(0) >= num_tokens, "positions must cover all k tokens");
-    AITER_CHECK(q_out.size(0) == num_tokens && q_out.size(1) == n_heads &&
+    AITER_CHECK(positions.size(0) >= num_tokens, "positions must cover all indexed tokens");
+    AITER_CHECK(q_out.size(0) >= num_tokens && q_out.size(1) == n_heads &&
                     q_out.size(2) == head_dim,
-                "q_out shape must match q");
-    AITER_CHECK(weights.size(0) == num_tokens && weights.size(1) == n_heads,
-                "weights shape must match q [num_tokens, n_heads]");
-    AITER_CHECK(weights_out.size(0) == num_tokens && weights_out.size(1) == n_heads,
-                "weights_out shape must match weights");
+                "q_out must cover all indexed tokens");
+    AITER_CHECK(weights.size(0) >= num_tokens && weights.size(1) == n_heads,
+                "weights must cover all indexed tokens");
+    AITER_CHECK(weights_out.size(0) >= num_tokens && weights_out.size(1) == n_heads,
+                "weights_out must cover all indexed tokens");
     AITER_CHECK(cos_cache.size(0) == sin_cache.size(0) &&
                     cos_cache.size(1) == sin_cache.size(1),
                 "cos_cache and sin_cache shapes must match");
