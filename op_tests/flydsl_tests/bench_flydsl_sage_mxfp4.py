@@ -77,6 +77,7 @@ SHAPES: List[Tuple] = [
     (2, 8192, 16, 4, 128, False),       # GQA + long-S
     (1, 4096, 24, 24, 128, False),
     (1, 16384, 24, 24, 128, False),
+    (1, 75600, 5, 5, 128, False),  # large seq + many heads
 ]
 
 
