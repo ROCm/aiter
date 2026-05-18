@@ -8,6 +8,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+import triton as _triton
+import triton.language as tl
+
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
@@ -16,6 +19,76 @@ from . import triton
 from .enum import ActivationType, QuantType
 from ..jit.utils.chip_info import get_cu_num
 
+
+@_triton.jit
+def _per_1x32_fp8_e8m0_quant_kernel(
+    x_ptr,
+    y_ptr,
+    scale_ptr,
+    stride_x_m,
+    stride_x_n,
+    stride_y_m,
+    stride_y_n,
+    stride_s_m,
+    stride_s_n,
+    M,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+    DTYPE_MAX_POW2: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    DTYPE_MAX: tl.constexpr = 2.0**DTYPE_MAX_POW2
+
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask_n = offs_n < N
+
+    x_offs = pid_m * stride_x_m + offs_n * stride_x_n
+    x = tl.load(x_ptr + x_offs, mask=mask_n, other=0.0).to(tl.float32)
+
+    amax = tl.max(tl.abs(x))
+    raw = amax / DTYPE_MAX
+
+    raw_i32 = raw.to(tl.int32, bitcast=True)
+    exponent = ((raw_i32 >> 23) & 0xFF).to(tl.uint8)
+    round_bit = (raw_i32 & 0x400000) > 0
+    sticky = ((raw_i32 & 0x200000) > 0) | ((raw_i32 & 0x1FFFFF) > 0) | (exponent > 0)
+    exponent = tl.where(round_bit & sticky, exponent + 1, exponent)
+
+    scale_f32 = (exponent.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    y = x / scale_f32
+    y = tl.clamp(y, -DTYPE_MAX, DTYPE_MAX)
+
+    y_offs = pid_m * stride_y_m + offs_n * stride_y_n
+    tl.store(y_ptr + y_offs, y.to(y_ptr.type.element_ty), mask=mask_n)
+
+    tl.store(scale_ptr + pid_m * stride_s_m + pid_n * stride_s_n, exponent)
+
+def _per_1x32_f8_e8m0_quant_triton(x):
+    shape_original = x.shape
+    x = x.view(-1, shape_original[-1])
+    m, n = x.shape
+    BLOCK_SIZE = 32
+    assert n % BLOCK_SIZE == 0
+
+    y = torch.empty_like(x, dtype=dtypes.fp8)
+    scale = torch.empty((m, n // BLOCK_SIZE), dtype=torch.uint8, device=x.device)
+
+    grid = (m, n // BLOCK_SIZE)
+    _per_1x32_fp8_e8m0_quant_kernel[grid](
+        x, y, scale,
+        *x.stride(),
+        *y.stride(),
+        *scale.stride(),
+        M=m, N=n,
+        BLOCK_SIZE=BLOCK_SIZE,
+        DTYPE_MAX_POW2=8,
+    )
+
+    y = y.view(*shape_original[:-1], -1)
+    scale = scale.view(dtypes.fp8_e8m0)
+    return y, scale
 
 @compile_ops("module_smoothquant")
 def smoothquant_fwd(
