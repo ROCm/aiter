@@ -414,21 +414,53 @@ def fp8_quantize(
     return q_quant, k_quant, v_quant, q_descale, k_descale, v_descale
 
 
+def rotate_qk_for_quant(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    block_r: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if block_r <= 0:
+        raise ValueError("Hadamard block size must be positive")
+
+    head_dim = q.shape[-1]
+    if head_dim != k.shape[-1]:
+        raise ValueError("Q and K head dimensions must match for Hadamard rotation")
+    if block_r > head_dim:
+        raise ValueError(
+            f"Hadamard block size ({block_r}) must be <= head dim ({head_dim})"
+        )
+    if head_dim % block_r != 0:
+        raise ValueError(
+            f"Head dim ({head_dim}) must be divisible by Hadamard block size ({block_r})"
+        )
+
+    rotation = create_hadamard_matrix(block_r, device=q.device, dtype=torch.float32) / (
+        block_r**0.5
+    )
+    q_blocks = q.float().reshape(*q.shape[:-1], head_dim // block_r, block_r)
+    k_blocks = k.float().reshape(*k.shape[:-1], head_dim // block_r, block_r)
+    q_rot = torch.matmul(q_blocks, rotation).reshape_as(q).to(q.dtype)
+    k_rot = torch.matmul(k_blocks, rotation).reshape_as(k).to(k.dtype)
+    return q_rot, k_rot
+
+
 def i8fp8_quantize(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    q_clip: float = 0.8,
+    k_clip: float = 0.8,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     """Quantize Q/K to int8, V to fp8 (Sage-style)."""
     # Q -> int8
-    q_amax = torch.abs(q).max()
+    q_amax = torch.abs(q).max() * q_clip
     q_scale = q_amax / 127.0
     q_int8 = torch.clamp(torch.round(q / q_scale), -128, 127).to(torch.int8)
     q_descale = q_scale.reshape(1).to(torch.float32)
     # K -> int8
-    k_amax = torch.abs(k).max()
+    k_amax = torch.abs(k).max() * k_clip
     k_scale = k_amax / 127.0
     k_int8 = torch.clamp(torch.round(k / k_scale), -128, 127).to(torch.int8)
     k_descale = k_scale.reshape(1).to(torch.float32)
@@ -731,9 +763,22 @@ def make_kernel_runner(
         )
 
     if args.kernel == "aiter_i8fp8":
+        q_clip = args.q_clip if args.q_clip is not None else args.qk_clip
+        k_clip = args.k_clip if args.k_clip is not None else args.qk_clip
 
         def _run_aiter_i8fp8():
-            q_i8, k_i8, v_fp8, q_ds, k_ds, v_ds = i8fp8_quantize(q_bshd, k_bshd, v_bshd)
+            q_quant, k_quant = q_bshd, k_bshd
+            if args.i8_hadamard_rotate:
+                q_quant, k_quant = rotate_qk_for_quant(
+                    q_quant, k_quant, args.i8_hadamard_block_r
+                )
+            q_i8, k_i8, v_fp8, q_ds, k_ds, v_ds = i8fp8_quantize(
+                q_quant,
+                k_quant,
+                v_bshd,
+                q_clip=q_clip,
+                k_clip=k_clip,
+            )
             return flash_attn_i8fp8_pertensor_func(
                 q_i8,
                 k_i8,
@@ -746,8 +791,17 @@ def make_kernel_runner(
         if args.e2e:
             return _run_aiter_i8fp8
 
+        q_quant, k_quant = q_bshd, k_bshd
+        if args.i8_hadamard_rotate:
+            q_quant, k_quant = rotate_qk_for_quant(
+                q_quant, k_quant, args.i8_hadamard_block_r
+            )
         q_i8, k_i8, v_fp8, q_descale, k_descale, v_descale = i8fp8_quantize(
-            q_bshd, k_bshd, v_bshd
+            q_quant,
+            k_quant,
+            v_bshd,
+            q_clip=q_clip,
+            k_clip=k_clip,
         )
         return lambda: flash_attn_i8fp8_pertensor_func(
             q_i8,
@@ -1453,6 +1507,36 @@ def parse_args() -> argparse.Namespace:
         help="Distribution used for generated Q/K/V tensors",
     )
     parser.add_argument(
+        "--qk-clip",
+        type=float,
+        default=1.0,
+        help="Clip factor applied to Q and K absmax before int8 quantization for aiter_i8fp8",
+    )
+    parser.add_argument(
+        "--q-clip",
+        type=float,
+        default=None,
+        help="Optional Q-only absmax clip factor for aiter_i8fp8; overrides --qk-clip for Q",
+    )
+    parser.add_argument(
+        "--k-clip",
+        type=float,
+        default=None,
+        help="Optional K-only absmax clip factor for aiter_i8fp8; overrides --qk-clip for K",
+    )
+    parser.add_argument(
+        "--i8-hadamard-rotate",
+        type=lambda v: bool(int(v)),
+        default=False,
+        help="For aiter_i8fp8, apply Hadamard rotation to Q/K before int8 quantization: 1/0",
+    )
+    parser.add_argument(
+        "--i8-hadamard-block-r",
+        type=int,
+        default=128,
+        help="For aiter_i8fp8 Hadamard rotation, block size along the head dimension",
+    )
+    parser.add_argument(
         "--metric",
         type=str,
         default="all",
@@ -1550,7 +1634,18 @@ def parse_args() -> argparse.Namespace:
         help="do_bench warmup time in ms",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    for name in (
+        "qk_clip",
+        "q_clip",
+        "k_clip",
+    ):
+        value = getattr(args, name)
+        if value is not None and value <= 0.0:
+            parser.error(f"--{name.replace('_', '-')} must be > 0")
+    if args.i8_hadamard_block_r <= 0:
+        parser.error("--i8-hadamard-block-r must be > 0")
+    return args
 
 
 def print_vgpr_from_bench(runner: Any) -> None:
