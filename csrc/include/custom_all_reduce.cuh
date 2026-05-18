@@ -1149,7 +1149,11 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
         P rslt                           = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
         tmps[warp_id][rank * part + idx] = rslt;
     }
-    end_sync<ngpus, true>(sg, self_sg, rank);
+    // The fused RMSNorm stage is launched as a separate kernel and reads the
+    // tmp buffers written above, so this is not the final synchronization point.
+    // Use release/acquire semantics to make cross-device writes visible before
+    // the next kernel consumes them.
+    end_sync<ngpus>(sg, self_sg, rank);
 }
 
 template <int reduce_range>
@@ -2908,7 +2912,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     uint32_t num_cu = dev_prop.multiProcessorCount;
 
     auto pack_size = 16 / sizeof(T);
-    use_1stage     = use_1stage && (n % pack_size == 0) && (n / pack_size <= 1024);
+    use_1stage     = use_1stage && (m <= kMaxBlocks) && (n % pack_size == 0) &&
+                     (n / pack_size <= 1024);
 #define MAYBE_DISPATCH_1S_KERNEL(NGPUS)                                            \
     if(use_1stage)                                                                 \
     {                                                                              \
@@ -3100,7 +3105,7 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
 
     auto pack_size   = 16 / sizeof(T);
     bool n_constrain = (n % pack_size == 0) && (n / pack_size <= 1024);
-    use_1stage       = use_1stage && n_constrain;
+    use_1stage       = use_1stage && (m <= kMaxBlocks) && n_constrain;
 #define DISPATCH_AR_FUSION_KERNEL(NGPUS)                                                       \
     if(use_1stage)                                                                             \
     {                                                                                          \
@@ -3250,7 +3255,7 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
     auto pack_size   = 16 / sizeof(T);
     bool n_constrain = (n % pack_size == 0) && (n / pack_size <= 1024);
 
-    use_1stage = use_1stage && n_constrain;
+    use_1stage = use_1stage && (m <= kMaxBlocks) && n_constrain;
 
 #define DISPATCH_AR_FUSION_PG_KERNEL(NGPUS)                                               \
     if(use_1stage)                                                                         \
@@ -3319,7 +3324,7 @@ void dispatchFusedAllReduceRMSNormPerTensorQuant(hipStream_t stream,
     RankData* ptrs  = get_buffer_RD(stream, input);
     auto pack_size  = 16 / sizeof(T);
     bool n_constrain = (n % pack_size == 0) && (n / pack_size <= 1024);
-    use_1stage       = use_1stage && n_constrain;
+    use_1stage       = use_1stage && (m <= kMaxBlocks) && n_constrain;
 
 #define DISPATCH_AR_FUSION_PT_KERNEL(NGPUS)                                                    \
     if(use_1stage)                                                                             \

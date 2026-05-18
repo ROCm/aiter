@@ -481,7 +481,12 @@ namespace py = pybind11;
     m.def("get_meta_buffer_ipc_handle",                                                        \
           &aiter::get_meta_buffer_ipc_handle,                                                  \
           py::arg("inp_ptr"),                                                                  \
-          py::arg("out_handle_ptr"));
+          py::arg("out_handle_ptr"));                                                          \
+    m.def("get_meta_buffer_ipc_handle_with_offset",                                            \
+          &aiter::get_meta_buffer_ipc_handle_with_offset,                                      \
+          py::arg("inp_ptr"),                                                                  \
+          py::arg("out_handle_ptr"),                                                           \
+          py::arg("out_offset_ptr"));
 
 #define CUSTOM_PYBIND                                                                           \
     m.def("wvSpltK",                                                                            \

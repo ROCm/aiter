@@ -211,10 +211,13 @@ class IPCBufferPool:
     # ---- Private IPC primitives ----
 
     def _broadcast_ipc(self, data_ptr: int) -> Tuple[List, List]:
-        """Get IPC handle for *data_ptr* and broadcast across all ranks."""
+        """Get IPC base handle and pointer offset, then broadcast them."""
         handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
-        ops.get_meta_buffer_ipc_handle(data_ptr, handle.data_ptr())
-        return self._gather_ipc_meta((handle, 0))
+        offset = torch.empty(1, dtype=torch.int64)
+        ops.get_meta_buffer_ipc_handle_with_offset(
+            data_ptr, handle.data_ptr(), offset.data_ptr()
+        )
+        return self._gather_ipc_meta((handle, int(offset.item())))
 
     def _gather_ipc_meta(self, shard_data) -> Tuple[List, List]:
         """Exchange IPC metadata (handle + offset) across all ranks via TCP store.

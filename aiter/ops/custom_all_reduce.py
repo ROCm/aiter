@@ -153,3 +153,9 @@ def free_meta_buffer(ptr: int) -> None: ...
 
 @compile_ops("module_custom_all_reduce", develop=True)
 def get_meta_buffer_ipc_handle(inp_ptr: int, out_handle_ptr: int) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def get_meta_buffer_ipc_handle_with_offset(
+    inp_ptr: int, out_handle_ptr: int, out_offset_ptr: int
+) -> None: ...

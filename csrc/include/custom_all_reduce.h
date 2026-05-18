@@ -120,6 +120,9 @@ void register_graph_buffers(fptr_t _fa,
 int64_t allocate_meta_buffer(int64_t size);
 void free_meta_buffer(int64_t ptr);
 void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr);
+void get_meta_buffer_ipc_handle_with_offset(int64_t inp_ptr,
+                                            int64_t out_handle_ptr,
+                                            int64_t out_offset_ptr);
 #endif
 
 } // namespace aiter

@@ -349,6 +349,20 @@ void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr)
     HIP_CALL(hipIpcGetMemHandle((hipIpcMemHandle_t*)out_handle_ptr, (void*)inp_ptr));
 }
 
+void get_meta_buffer_ipc_handle_with_offset(int64_t inp_ptr,
+                                            int64_t out_handle_ptr,
+                                            int64_t out_offset_ptr)
+{
+    void* base_ptr;
+    if(hipPointerGetAttribute(&base_ptr,
+                              HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+                              (hipDeviceptr_t)inp_ptr) != hipSuccess)
+        throw std::runtime_error("failed to get pointer base address");
+    HIP_CALL(hipIpcGetMemHandle((hipIpcMemHandle_t*)out_handle_ptr, base_ptr));
+    *reinterpret_cast<int64_t*>(out_offset_ptr) =
+        reinterpret_cast<char*>(inp_ptr) - reinterpret_cast<char*>(base_ptr);
+}
+
 #endif
 
 // ---- Public collective APIs ----
