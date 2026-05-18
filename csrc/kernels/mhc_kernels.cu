@@ -118,7 +118,8 @@ namespace aiter {
                     for(int j = 0; j < fn_loads_per_row; j++) {
                         int K = lane_id + j * warp_size;
                         int K_swizzled = K ^ xor_mask;
-                        g_b.async_load(
+                        async_load(
+                            g_b,
                             s_fn_wr_ptr + i * tile_k + K,
                             fn_row * fn_stride + K_swizzled + k * tile_k + k_split_offset
                         );
@@ -132,7 +133,8 @@ namespace aiter {
                     int fn_row = fn_row_base + i;
                     int xor_mask = (fn_row & 0xF) << fn_xor_shift;
                     int K_swizzled = vec_col ^ xor_mask;
-                    g_b.template async_load<fn_vec_size>(
+                    async_load<fn_vec_size>(
+                        g_b,
                         s_fn_wr_ptr + i * tile_k + vec_col,
                         fn_row * fn_stride + K_swizzled + k * tile_k + k_split_offset
                     );
@@ -435,7 +437,7 @@ namespace aiter {
         auto sum_f = [](float a, float b) { return a + b; };
         for(int i = 0; i < rms_loop; i++) {
                 int offset = (land_id % rms_vec_load + i * rms_vec_load) * m + land_id / rms_vec_load;
-                opus::vector<float, 1>::type rms_tmp = buffer_gemm_out_sqrsum.load<1>(offset);
+                opus::vector<float, 1>::type rms_tmp = load<1>(buffer_gemm_out_sqrsum, offset);
                 float rms_sum = multithread_reduce(rms_tmp[0], sum_f, rms_vec_load);
                 for(int j = 0; j < num_rows; j++) {
                     rms[j] += __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, rms_sum), j * rms_vec_load));
@@ -458,7 +460,7 @@ namespace aiter {
                 for(int split_idx = split_lane; split_idx < n_splits; split_idx += reduce_splits_per_round) {
                     int offset = split_idx * m * gemm_out_mul_stride +
                                  row_idx * gemm_out_mul_stride + row_offset;
-                    fp32x4_t v_gemm_out_mul_tmp = buffer_gemm_out_mul.template load<4>(offset);
+                    fp32x4_t v_gemm_out_mul_tmp = load<4>(buffer_gemm_out_mul, offset);
                     #pragma unroll
                     for(int j = 0; j < 4; j++) {
                         v_gemm_out_mul[j] += v_gemm_out_mul_tmp[j];
@@ -524,9 +526,12 @@ namespace aiter {
             auto load_res_loop = [&](int i) {
                 halfx8_t v_res = {0};
                 if (i < out_loop && res_row_id < m_oob) {
-                    v_res = buffer_res.template load<8, cache_policy>(
+                    v_res = load<8>(
+                        buffer_res,
                         res_row_id * residual_stride + res_hc_id * residual_hc_stride +
-                        i * residual_block + K_swizzled);
+                        i * residual_block + K_swizzled,
+                        0,
+                        opus::number<cache_policy>{});
                 }
                 return v_res;
             };
@@ -540,7 +545,7 @@ namespace aiter {
                 if(threadIdx.x % hc_mult != 0) {
                     out_offset = -1;
                 }
-                buffer_layer_input.template store<8, halfx8_t, cache_policy>(v_res, out_offset);
+                store<8>(buffer_layer_input, v_res, out_offset, 0, opus::number<cache_policy>{});
             };
 
             halfx8_t v_res0 = load_res_loop(0);
@@ -740,7 +745,7 @@ namespace aiter {
             int offset = warp_id * hidden_size + k * residual_block;
             for(int i = 0; i < residual_load_waitcnt; i++) {
                 int offset_in_block = i * warp_size * r_async_load_vec + lane_id * r_async_load_vec;
-                g_residual.template async_load<r_async_load_vec>(s_residual_wr_ptr + warp_id * residual_block + offset_in_block, offset + offset_in_block);
+                async_load<r_async_load_vec>(g_residual, s_residual_wr_ptr + warp_id * residual_block + offset_in_block, offset + offset_in_block);
             }
         };
         
@@ -873,7 +878,7 @@ namespace aiter {
                 int offset = k * residual_block;
                 for(int i = 0; i < x_load_waitcnt; i++) {
                     int offset_in_block = i * x_async_load_threads * x_async_load_vec + threadIdx.x * x_async_load_vec;
-                    g_x.template async_load<x_async_load_vec, GROUP_NT>(s_x_wr_ptr + offset_in_block, offset + offset_in_block);
+                    async_load<x_async_load_vec>(g_x, s_x_wr_ptr + offset_in_block, offset + offset_in_block, 0, opus::number<GROUP_NT>{});
                 }
             }
         };
@@ -889,7 +894,7 @@ namespace aiter {
             int offset = warp_id * hidden_size + k * residual_block;
             for(int i = 0; i < residual_load_waitcnt; i++) {
                 int offset_in_block = i * warp_size * r_async_load_vec + lane_id * r_async_load_vec;
-                g_residual.template async_load<r_async_load_vec, GROUP_NT>(s_residual_wr_ptr + warp_id * residual_block + offset_in_block, offset + offset_in_block);
+                async_load<r_async_load_vec>(g_residual, s_residual_wr_ptr + warp_id * residual_block + offset_in_block, offset + offset_in_block, 0, opus::number<GROUP_NT>{});
             }
         };
         float post_mix_v = post_layer_mix[idx * hc_mult + warp_id];
