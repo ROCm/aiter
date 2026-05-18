@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
-aiter.ops.opus — opus kernel Python user-facing API.
+aiter.ops.opus -- opus kernel Python user-facing API.
 
 Per-dtype modules. a16w16 lives here today; a8w8 / a8w8_blockscale
 arrive in follow-up PRs. Each module owns its own Python surface and
@@ -9,9 +9,9 @@ pybind bindings but shares the underlying JIT module
 `module_deepgemm_opus` built from csrc/opus_gemm/.
 
 Public API:
-  * gemm_a16w16_opus       — shape-driven wrapper (CSV lookup + C++
+  * gemm_a16w16_opus       -- shape-driven wrapper (CSV lookup + C++
                              heuristic fallback). Typical user entry.
-  * opus_gemm_a16w16_tune  — id-based low-level binding (tuner / override).
+  * opus_gemm_a16w16_tune  -- id-based low-level binding (tuner / override).
 
 Arch gating
 -----------
@@ -28,7 +28,8 @@ import warnings
 
 from ._arch import _detect_arch
 
-_SUPPORTED = {"gfx950"}
+# Must match ARCH_REGISTRY.keys() in csrc/opus_gemm/opus_gemm_common.py
+_SUPPORTED = {"gfx950", "gfx942"}
 _FEATURE = "aiter.ops.opus (a16w16)"
 _HINT = (
     "opus_gemm uses gfx950-only intrinsics (MFMA, ds_read_b64_tr) and "
@@ -71,7 +72,7 @@ else:
     # aiter/__init__.py, where it would be caught by the surrounding
     # try/except and silently disable the 30+ subsequent op imports.
     warnings.warn(
-        f"{_FEATURE} is gfx950-only; detected arch={_detected_arch!r}. "
+        f"{_FEATURE} is gfx950/gfx942-only; detected arch={_detected_arch!r}. "
         f"opus_gemm_* calls will raise RuntimeError at invocation. {_HINT}",
         RuntimeWarning,
         stacklevel=2,

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// opus_gemm_arch.cuh — runtime architecture probe shared by all opus dispatch
+// opus_gemm_arch.cuh -- runtime architecture probe shared by all opus dispatch
 // shells. Holds:
-//   * OpusGfxArch enum  — extend when a new arch ships.
-//   * OpusArchInfo      — cached gcnArchName + device id snapshot.
-//   * opus_get_arch_info() / opus_get_gfx_arch() — one-shot probes.
+//   * OpusGfxArch enum  -- extend when a new arch ships.
+//   * OpusArchInfo      -- cached gcnArchName + device id snapshot.
+//   * opus_get_arch_info() / opus_get_gfx_arch() -- one-shot probes.
 //
 // Per-arch dispatch implementations live in opus_gemm_arch_<arch>.cuh and are
 // only included by opus_gemm.cu. Adding a new arch:
@@ -27,7 +27,8 @@ enum class OpusGfxArch
 {
     Unknown = 0,
     Gfx950,
-    // future: Gfx942, Gfx940, Gfx1100, ...
+    Gfx942,
+    // future: Gfx940, Gfx1100, ...
 };
 
 namespace opus_arch_detail
@@ -58,7 +59,7 @@ inline const opus_arch_detail::OpusArchInfo &opus_get_arch_info()
         {
             a = OpusGfxArch::Gfx950;
         }
-        // future: else if (name.rfind("gfx942", 0) == 0) a = OpusGfxArch::Gfx942;
+        else if (name.rfind("gfx942", 0) == 0) { a = OpusGfxArch::Gfx942; }
         return OpusArchInfo{a, std::move(name), dev};
     }();
     return info;

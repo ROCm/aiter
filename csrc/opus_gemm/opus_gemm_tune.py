@@ -17,11 +17,7 @@ from aiter.ops.opus.gemm_op_a16w16 import (
 # expected to be run from that directory (or with that directory on
 # sys.path) so the bare-name import resolves without needing a package
 # layout.
-from opus_gemm_common import (
-    a16w16_kernels_list,
-    a16w16_flatmm_kernels_list,
-    a16w16_flatmm_splitk_kernels_list,
-)
+from opus_gemm_common import ARCH_REGISTRY, detect_gfx_arch
 
 # opus-private tuned CSV default path. Lives under aiter/ops/opus/configs/
 # so all opus artifacts are co-located. The Python user-facing wrapper in
@@ -46,19 +42,16 @@ OPUS_A16W16_TUNED_CSV = os.getenv(
 _AITER_VERBOSE = bool(int(os.environ.get("AITER_VERBOSE", "0")))
 
 
-# Merge all three a16w16-family pipelines into one tuner search:
-#   * split-barrier a16w16 (kids 4..9) - ignores splitK
-#   * a16w16_flatmm       (kids 100..115) - ignores splitK
-#   * a16w16_flatmm_splitk (kids 200..210) - splitK = literal KBatch in {0, 2..32}
-a16w16_all_kernels = {
-    **a16w16_kernels_list,
-    **a16w16_flatmm_kernels_list,
-    **a16w16_flatmm_splitk_kernels_list,
-}
+# Merge a16w16-family pipelines into one tuner search, arch-aware.
+_gfx_arch = detect_gfx_arch()
+_arch_cfg = ARCH_REGISTRY[_gfx_arch]
+a16w16_all_kernels = {}
+for _tag in ("a16w16", "a16w16_flatmm", "a16w16_flatmm_splitk"):
+    a16w16_all_kernels.update(_arch_cfg["kernels"].get(_tag, {}))
 a16w16_kernel_ids = sorted(a16w16_all_kernels.keys())
 
 
-# ── dtype handling ──────────────────────────────────────────────────────────
+# -- dtype handling ----------------------------------------------------------
 #
 # CSV convention (matches gptoss_bf16_*_gemm.csv schema): dtype / outdtype
 # columns store the str(torch.dtype) form, i.e. "torch.bfloat16" or
@@ -594,7 +587,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         "untune_file": "aiter/configs/model_configs/gptoss_bf16_untuned_gemm.csv",
         # Tighter than GemmCommonTuner default (0.05). Under CUDA graph mode
         # the only numerical guard is mp_tuner.worker's post-run
-        # checkAllclose(err_ratio) — per-iter max_delta check is also done in
+        # checkAllclose(err_ratio) -- per-iter max_delta check is also done in
         # run_opus_gemm_bench (see below), but this gate catches silent "only
         # a few cells wrong" bugs (e.g. N not aligned to VEC_C vector store
         # width causes sporadic cross-row writes; only ~0.001 fraction of

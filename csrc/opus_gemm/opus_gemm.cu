@@ -18,25 +18,25 @@
 #ifndef __HIP_DEVICE_COMPILE__
 
 #include "opus_gemm_arch.cuh"                      // OpusGfxArch + opus_get_arch_info / opus_get_gfx_arch
-#include "gfx950/opus_gemm_arch_gfx950.cuh"        // opus_dispatch_a16w16_gfx950<T> / opus_a16w16_tune_dispatch_gfx950<T>
+#include "opus_gemm_arch_config.h"                 // OPUS_TARGET_GFX950 / OPUS_TARGET_GFX942
 #include "opus_gemm_common.cuh"
-#include "gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh"  // OpusA16W16NoscaleKernel
-#include "opus_gemm_manifest.h"                    // a8w8 launcher symbols
 #include "opus_gemm_utils.cuh"                     // bf16_t / fp32_t
+
+#if defined(OPUS_TARGET_GFX950)
+#include "gfx950/opus_gemm_arch_gfx950.cuh"
+#include "gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh"
+#include "opus_gemm_manifest.h"                    // a8w8 launcher symbols
+#elif defined(OPUS_TARGET_GFX942)
+#include "gfx942/opus_gemm_arch_gfx942.cuh"
+#include "gfx942/opus_gemm_heuristic_dispatch_gfx942.cuh"
+#else
+#error "opus_gemm.cu: no target arch defined. Check opus_gemm_arch_config.h / gen_instances.py."
+#endif
 
 #include <optional>
 
-// ── a8w8 / a8w8_scale launcher signatures ───────────────────────────────────
-//
-// a8w8 paths bypass the arch-routed dispatcher because there's currently a
-// single hardcoded launcher per dtype (no tuned lookup table). The fp8 entry
-// in opus_gemm() guards them with an explicit gfx950 AITER_CHECK so callers
-// on other archs see the same "pipeline TBD" error as the bf16 path.
-//
-// Plain function pointers (was: `std::function<...>`). Same rationale as
-// OpusA16W16NoscaleKernel: every callable stored here is one of the
-// explicit launcher template instantiations, no captures, so std::function's
-// type-erasure overhead and template instantiation cost are pure waste.
+// ── a8w8 / a8w8_scale launcher signatures (gfx950-only) ─────────────────────
+#if defined(OPUS_TARGET_GFX950)
 using OpusScaleKernel = void (*)(
     aiter_tensor_t &, aiter_tensor_t &,
     aiter_tensor_t &,
@@ -57,6 +57,7 @@ OpusNoscaleKernel opus_dispatch_a8w8(int M, int N, int K)
 {
   return opus_gemm_512x256x256x128_2x4_16x16x128_0x0x0<CDataType>;
 }
+#endif  // OPUS_TARGET_GFX950
 
 // ── a16w16 arch routers ─────────────────────────────────────────────────────
 //
@@ -70,39 +71,44 @@ OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch)
 {
   switch (opus_get_gfx_arch())
   {
+#if defined(OPUS_TARGET_GFX950)
     case OpusGfxArch::Gfx950:
       return opus_dispatch_a16w16_gfx950<CDataType>(M, N, K, batch);
-    // future: case OpusGfxArch::Gfx942: return opus_dispatch_a16w16_gfx942<CDataType>(M, N, K, batch);
+#elif defined(OPUS_TARGET_GFX942)
+    case OpusGfxArch::Gfx942:
+      return opus_dispatch_a16w16_gfx942<CDataType>(M, N, K, batch);
+#endif
     default:
     {
       const auto &info = opus_get_arch_info();
       AITER_CHECK(false,
-                  "opus_gemm: a16w16 dispatch is only implemented for gfx950 today; "
+                  "opus_gemm: a16w16 dispatch not available for "
                   "current device ", info.dev,
-                  " has gcnArchName='", info.name,
-                  "'. Other archs (gfx940 / gfx942 / gfx1100 / ...) will be added "
-                  "as more pipelines land.");
+                  " (gcnArchName='", info.name, "')");
     }
   }
 }
 
 template <typename CDataType>
-opus_gfx950_detail::OpusA16W16TuneKernel
+OpusA16W16NoscaleKernel
 opus_a16w16_tune_dispatch(int id)
 {
   switch (opus_get_gfx_arch())
   {
+#if defined(OPUS_TARGET_GFX950)
     case OpusGfxArch::Gfx950:
       return opus_a16w16_tune_dispatch_gfx950<CDataType>(id);
-    // future: case OpusGfxArch::Gfx942: return opus_a16w16_tune_dispatch_gfx942<CDataType>(id);
+#elif defined(OPUS_TARGET_GFX942)
+    case OpusGfxArch::Gfx942:
+      return opus_a16w16_tune_dispatch_gfx942<CDataType>(id);
+#endif
     default:
     {
       const auto &info = opus_get_arch_info();
       AITER_CHECK(false,
-                  "opus_gemm_a16w16_tune: dispatch is only implemented for gfx950 today; "
+                  "opus_gemm_a16w16_tune: dispatch not available for "
                   "current device ", info.dev,
-                  " has gcnArchName='", info.name,
-                  "'. Other archs will be added as more pipelines land.");
+                  " (gcnArchName='", info.name, "')");
     }
   }
 }
@@ -130,18 +136,7 @@ void opus_gemm(
 
   if (XQ.dtype() == AITER_DTYPE_fp8)
   {
-    // a8w8 / a8w8_scale launchers are gfx950-only today and don't yet flow
-    // through the arch-routed dispatcher (they pick a single hardcoded
-    // launcher). Guard the entry explicitly so non-gfx950 callers see the
-    // same "pipeline TBD for this arch" message as the bf16 path.
-    const auto &arch_info = opus_get_arch_info();
-    AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx950,
-                "opus_gemm: a8w8 path is only implemented for gfx950 today; "
-                "current device ", arch_info.dev,
-                " has gcnArchName='", arch_info.name,
-                "'. Other archs will be added as more pipelines land.");
-    // a8w8 / a8w8_scale launchers do not consume bias yet; reject up front
-    // rather than silently dropping it.
+#if defined(OPUS_TARGET_GFX950)
     AITER_CHECK(!bias.has_value(),
                 "opus_gemm: bias is not supported on a8w8 / a8w8_scale paths");
     if (has_scale)
@@ -156,6 +151,10 @@ void opus_gemm(
                   "opus_gemm a8w8 no-scale only supports fp32 output");
       opus_dispatch_a8w8<fp32_t>(M, N, K)(XQ, WQ, Y);
     }
+#else
+    AITER_CHECK(false,
+                "opus_gemm: a8w8/fp8 path is only implemented for gfx950");
+#endif
   }
   else if (XQ.dtype() == AITER_DTYPE_bf16)
   {

@@ -4,8 +4,8 @@
 End-to-end test of the a16w16 user-facing entry gemm_a16w16_opus.
 
 This is the single regression entry point for opus a16w16: it drives
-gemm_a16w16_opus end-to-end (Python CSV lookup → C++ tuned lookup →
-heuristic fallback → launcher → kernel), compares against torch.bmm,
+gemm_a16w16_opus end-to-end (Python CSV lookup -> C++ tuned lookup ->
+heuristic fallback -> launcher -> kernel), compares against torch.bmm,
 and prints per-shape TFLOPs. The id-based low-level binding
 (opus_gemm_a16w16_tune) is exercised indirectly when the CSV lookup
 hits, and the heuristic dispatch is exercised on miss.
@@ -35,7 +35,7 @@ import torch
 # a clean skip when GPU_ARCHS pins a non-supported arch on a gfx950 box.
 from aiter.ops.opus._arch import _detect_arch  # noqa: E402
 
-_arch_ok, _detected_gfx = _detect_arch({"gfx950"})
+_arch_ok, _detected_gfx = _detect_arch({"gfx950", "gfx942"})
 if not _arch_ok:
     print(f"[skip] test_opus_a16w16_gemm requires gfx950 (detected {_detected_gfx!r})")
     sys.exit(0)

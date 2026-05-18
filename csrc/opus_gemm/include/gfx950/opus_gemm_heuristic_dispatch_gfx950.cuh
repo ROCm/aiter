@@ -75,9 +75,12 @@
 // from the dispatcher TU's host pass and also avoids the per-call
 // virtual-dispatch overhead that std::function pays for the type
 // erasure we don't actually use.
+#ifndef OPUS_A16W16_NOSCALE_KERNEL_DEFINED
+#define OPUS_A16W16_NOSCALE_KERNEL_DEFINED
 using OpusA16W16NoscaleKernel = void (*)(
     aiter_tensor_t &, aiter_tensor_t &,
     aiter_tensor_t &, std::optional<aiter_tensor_t>, int);
+#endif
 
 // Single template body shared by both bf16 and fp32 specializations.
 // All splitk kids are forced to <fp32_t> (their main kernel only has the

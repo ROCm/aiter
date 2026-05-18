@@ -34,6 +34,9 @@ class OpusGemmInstance:
     # 0=LRU, 1=SC0(LLC Evict), 17=SC0+SC1(L2 Bypass).
     cachectl_a: int = -1
     cachectl_b: int = -1
+    # Optional arch prefix inserted after "opus_gemm_" in the generated name.
+    # e.g. arch_prefix="gfx942" -> "opus_gemm_gfx942_512x128x..."
+    arch_prefix: str = ""
 
     @property
     def name(self) -> str:
@@ -44,11 +47,14 @@ class OpusGemmInstance:
             "x".join(map(str, [self.W_M, self.W_N, self.W_K])),
             "x".join(map(str, [self.GROUP_M, self.GROUP_N, self.GROUP_K])),
         ]
+        if self.arch_prefix:
+            parts.insert(1, self.arch_prefix)
+        tag_insert = 1 + bool(self.arch_prefix)
         if self.kernel_tag == "a16w16_flatmm":
-            parts.insert(1, "flatmm")
+            parts.insert(tag_insert, "flatmm")
             parts.append(f"wgpcu{self.WG_PER_CU}")
         elif self.kernel_tag == "a16w16_flatmm_splitk":
-            parts.insert(1, "flatmm_splitk")
+            parts.insert(tag_insert, "flatmm_splitk")
             parts.append(f"wgpcu{self.WG_PER_CU}")
         if not self.has_oob:
             parts.append("nooob")
@@ -57,7 +63,7 @@ class OpusGemmInstance:
         return "_".join(parts)
 
 
-def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True):
+def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, arch_prefix=""):
     vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
     return OpusGemmInstance(
         bs,
@@ -78,6 +84,7 @@ def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True):
         "a16w16",
         ["fp32_t", "bf16_t"],
         has_oob=has_oob,
+        arch_prefix=arch_prefix,
     )
 
 
@@ -145,11 +152,11 @@ a8w8_kernels_list = {
 }
 
 a16w16_kernels_list = {
-    # ── MFMA 16x16x32, T_N=2, BS=256 (2-block/CU capable) ──
+    # -- MFMA 16x16x32, T_N=2, BS=256 (2-block/CU capable) --
     # 3:  _a16w16(256, 128, 128, 32,  2, 16, 16, 32),  # disabled: intermittent accuracy (suspected compiler issue with VGPR=104/AGPR=64)
     4:  _a16w16(256, 128, 256, 32,  2, 16, 16, 32),
     5:  _a16w16(256, 256, 128, 32,  2, 16, 16, 32),
-    # ── MFMA 16x16x32, T_N=4, BS=512 (1-block/CU) ──
+    # -- MFMA 16x16x32, T_N=4, BS=512 (1-block/CU) --
     6:  _a16w16(512, 128, 128, 64,  4, 16, 16, 32),
     7:  _a16w16(512, 256, 128, 64,  4, 16, 16, 32),
     8:  _a16w16(512, 128, 256, 64,  4, 16, 16, 32),
@@ -232,9 +239,9 @@ a16w16_kernels_list_nooob = {
 }
 
 # CPOL variants for a16w16: 3 policies per kid, tuner picks best per shape.
-#   M-heavy: A=SC0(1, LLC Evict), B=BYPASS_L2(17) — large A streams, small B cached
-#   N-heavy: A=BYPASS_L2(17), B=SC0(1, LLC Evict) — swapped
-#   Balanced: A=LRU(0), B=LRU(0) — both cached normally
+#   M-heavy: A=SC0(1, LLC Evict), B=BYPASS_L2(17) -- large A streams, small B cached
+#   N-heavy: A=BYPASS_L2(17), B=SC0(1, LLC Evict) -- swapped
+#   Balanced: A=LRU(0), B=LRU(0) -- both cached normally
 _CACHECTL_CONFIGS = [
     (2000, 1, 17, "Mheavy"),   # kid_offset, cachectl_a, cachectl_b
     (3000, 17, 1, "Nheavy"),
@@ -287,4 +294,126 @@ default_kernels_dict = {
     (-2): OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0,     "a8w8",       ["fp32_t"]),
     (-3): _a16w16(512, 256, 256, 64, 4, 16, 16, 32),  # same as a16w16 #9
 }
+
+# -- gfx942 kernel lists -------------------------------------------------
+# MFMA 16x16x16 (gfx942 does not have the 16x16x32 bf16 variant).
+# Uses ds_read_b128 instead of gfx950's ds_read_b64_tr; LDS cap is 64KB.
+gfx942_a16w16_kernels_list = {
+    6: _a16w16(512, 128, 128, 64, 4, 16, 16, 16, arch_prefix="gfx942"),
+}
+
+gfx942_kernels_list = {
+    **gfx942_a16w16_kernels_list,
+}
 # fmt: on
+
+# -- Arch registry -------------------------------------------------------
+# Single source of truth for all per-arch config consumed by
+# gen_instances.py, opus_gemm_tune.py, etc.  To add a new arch:
+#   1. Define its kernel lists above.
+#   2. Add an entry here.
+#   3. Add the per-arch .cuh directory under include/<arch>/.
+#   4. Add _SUPPORTED entry in aiter/ops/opus/__init__.py.
+ARCH_REGISTRY = {
+    "gfx950": {
+        "kernels": {
+            "a8w8_scale": a8w8_scale_kernels_list,
+            "a8w8": a8w8_kernels_list,
+            "a16w16": a16w16_kernels_list,
+            "a16w16_flatmm": a16w16_flatmm_kernels_list,
+            "a16w16_flatmm_splitk": a16w16_flatmm_splitk_kernels_list,
+        },
+        "all_kernels": kernels_list,
+        "pipeline_headers": {
+            "a8w8_scale": "gfx950/opus_gemm_pipeline_a8w8_scale_gfx950.cuh",
+            "a8w8": "gfx950/opus_gemm_pipeline_a8w8_noscale_gfx950.cuh",
+            "a16w16": "gfx950/opus_gemm_pipeline_a16w16_gfx950.cuh",
+            "a16w16_flatmm": "gfx950/opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh",
+            "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
+        },
+        "traits_headers": {
+            "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+            "a8w8": "gfx950/opus_gemm_traits_a8w8_noscale_gfx950.cuh",
+            "a16w16": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+            "a16w16_flatmm": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+            "a16w16_flatmm_splitk": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+        },
+        "traits_names": {
+            "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
+            "a8w8": "opus_gemm_a8w8_noscale_traits_gfx950",
+            "a16w16": "opus_gemm_a16w16_traits_gfx950",
+            "a16w16_flatmm": "opus_gemm_a16w16_flatmm_traits_gfx950",
+            "a16w16_flatmm_splitk": "opus_flatmm_splitk_traits_gfx950",
+        },
+        "kargs_names": {
+            "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
+            "a8w8": "opus_gemm_noscale_kargs_gfx950",
+            "a16w16": "opus_gemm_noscale_kargs_gfx950",
+            "a16w16_flatmm": "opus_gemm_flatmm_kargs_gfx950",
+            "a16w16_flatmm_splitk": "opus_gemm_flatmm_splitk_kargs_gfx950",
+        },
+        "splitk_reduce_header": "gfx950/splitk_reduce_gfx950.cuh",
+        "valid_bf16_mfma": {(16, 16, 32), (32, 32, 16)},
+        "valid_flatmm_mfma": {(16, 16, 32)},
+        "valid_flatmm_splitk_mfma": {(16, 16, 32)},
+        "has_oob_param": True,
+        "has_cachectl_param": True,
+        "lds_budget": 163840,
+        "validated_tags": {"a16w16", "a16w16_flatmm", "a16w16_flatmm_splitk"},
+    },
+    "gfx942": {
+        "kernels": {
+            "a16w16": gfx942_a16w16_kernels_list,
+        },
+        "all_kernels": gfx942_kernels_list,
+        "pipeline_headers": {
+            "a16w16": "gfx942/opus_gemm_pipeline_a16w16.cuh",
+        },
+        "traits_headers": {
+            "a16w16": "gfx942/opus_gemm_traits_a16w16.cuh",
+        },
+        "traits_names": {
+            "a16w16": "opus_gemm_a16w16_traits",
+        },
+        "kargs_names": {
+            "a16w16": "opus_gemm_noscale_kargs",
+        },
+        "splitk_reduce_header": None,
+        "valid_bf16_mfma": {(16, 16, 16)},
+        "valid_flatmm_mfma": set(),
+        "valid_flatmm_splitk_mfma": set(),
+        "has_oob_param": False,
+        "has_cachectl_param": False,
+        "lds_budget": 65536,
+        "validated_tags": set(),
+    },
+}
+
+DEFAULT_ARCH = "gfx950"
+
+
+def detect_gfx_arch() -> str:
+    """Auto-detect GPU arch, return a key from ARCH_REGISTRY.
+
+    Detection order:
+      1. GPU_ARCHS env var (explicit, set by user or CI)
+      2. torch.cuda runtime probe
+      3. fallback to DEFAULT_ARCH
+    """
+    import os
+    gpu_archs_env = os.getenv("GPU_ARCHS", "")
+    for gfx in (g.strip() for g in gpu_archs_env.split(";") if g.strip()):
+        if gfx in ARCH_REGISTRY:
+            return gfx
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gcn = getattr(
+                torch.cuda.get_device_properties(0), "gcnArchName", ""
+            )
+            for known in ARCH_REGISTRY:
+                if gcn.startswith(known):
+                    return known
+    except Exception:
+        pass
+    return DEFAULT_ARCH
