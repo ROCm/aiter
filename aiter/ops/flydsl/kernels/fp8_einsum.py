@@ -156,6 +156,16 @@ def compile_fp8_einsum_bhr_hdr_bhd(
     lds_alloc_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_alloc_offset + lds_total_elems_a * elem_bytes_a
 
+    # LDS scratch for per-wave amax exchange. Each lane writes its local fp32
+    # amax to lds_amax[wave_id * 64 + lane_id]; after a wave-local barrier,
+    # each lane reads the 4 values that share its `lane_mod_16` (i.e. lanes
+    # lane_mod_16 + {0, 16, 32, 48} within the wave) and reduces with max.
+    # 256 bytes per wave * num_waves.
+    lds_amax_elems_per_wave = 64       # 1 fp32 per lane
+    lds_amax_total_elems = lds_amax_elems_per_wave * num_waves  # 4 * 64 fp32
+    lds_amax_alloc_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_amax_alloc_offset + lds_amax_total_elems * 4  # fp32 bytes
+
     # ── Compile-time MFMA layout numbers ─────────────────────────────────────
     m_repeat = tile_m // 16
     n_per_wave = tile_n // num_waves
@@ -195,6 +205,9 @@ def compile_fp8_einsum_bhr_hdr_bhd(
         lds_alloc_offset=lds_alloc_offset,
         lds_total_elems_a=lds_total_elems_a,
         lds_stride_bytes=lds_stride_bytes,
+        lds_amax_alloc_offset=lds_amax_alloc_offset,
+        lds_amax_total_elems=lds_amax_total_elems,
+        lds_amax_elems_per_wave=lds_amax_elems_per_wave,
         m_repeat=m_repeat, n_per_wave=n_per_wave, num_acc_n=num_acc_n,
         k_unroll=k_unroll,
         n0_val=n0_val, k0_val=k0_val, kpack_elems=kpack_elems,
@@ -215,6 +228,7 @@ def _build_compiled(
     num_b_loads, b_load_bytes,
     bytes_per_thread_a, bytes_per_thread_b,
     allocator, lds_alloc_offset, lds_total_elems_a, lds_stride_bytes,
+    lds_amax_alloc_offset, lds_amax_total_elems, lds_amax_elems_per_wave,
     m_repeat, n_per_wave, num_acc_n, k_unroll,
     n0_val, k0_val, kpack_elems,
     _stride_n0, _stride_k0, _stride_klane, _stride_nlane,
@@ -261,6 +275,12 @@ def _build_compiled(
             fx.BFloat16.ir_type, shape=(lds_total_elems_a,),
         )
         lds_a = lds_a_ptr.get()
+        # Scratch for cross-lane amax exchange: one fp32 per lane per wave.
+        lds_amax_ptr = SmemPtr(
+            base_ptr, lds_amax_alloc_offset,
+            fx.Float32.ir_type, shape=(lds_amax_total_elems,),
+        )
+        lds_amax = lds_amax_ptr.get()
 
         # ── Buffer resources ────────────────────────────────────────────────
         # X: bf16 (B, H, R), num_records = B*H*R bf16 elems = B*H*R*2 bytes.
@@ -290,8 +310,14 @@ def _build_compiled(
         lane_mod_16 = fx.get(coord_lane16, 1)
 
         row_a_lds = lane_mod_16
-        # bf16: 8 elems per 16B; lane_div_16 ∈ {0..3} → byte offsets {0,16,32,48}
-        col_offset_base_bytes = lane_div_16 * 16
+        # For the K-distribution to MATCH B's preshuffled layout (per-lane
+        # K = lane_div_16*16..lane_div_16*16+15), each lane needs 16 bf16
+        # K-elems per K=64-byte chunk of MFMA work. That's a 32-byte slab
+        # of bf16 per lane per K=64 chunk, which we split into 2 × 16-byte
+        # halves (one per MFMA). Lane G's K-byte base per K=64 chunk =
+        # G*32. The two halves are at G*32 + 0 (MFMA-0, ku_pair=0) and
+        # G*32 + 16 (MFMA-1, ku_pair=1).
+        col_offset_base_bytes = lane_div_16 * 32
 
         # ── N-tile column indexing (per wave) ───────────────────────────────
         n_tile_base = wave_id * n_per_wave
@@ -361,11 +387,14 @@ def _build_compiled(
                     + (base_k_elem + col_elem_local)
                 )
 
-                # Issue 16B load → 8 bf16 elems
+                # Issue 16B load → 8 bf16 elems. Pass the raw element index
+                # (index-typed IR value); the helper does shrui(idx, 1)
+                # internally for elem_bytes=2. Do NOT wrap as fx.Int32 — the
+                # helper expects a raw MLIR Value, not a flydsl wrapper.
                 a_16B = buffer_copy_gmem16_dwordx4(
                     buffer_ops, fx.vector,
                     elem_type=fx.BFloat16.ir_type,
-                    idx_i32=fx.Int32(idx_elem),
+                    idx_i32=idx_elem,
                     rsrc=x_rsrc,
                     vec_elems=8,
                     elem_bytes=elem_bytes_a,
@@ -403,7 +432,10 @@ def _build_compiled(
                     + n_intra_list[ni] * _b_stride_nlane_c
                 ) + y_head_byte_off
                 for ku64 in range_constexpr(k_unroll // 2):
-                    k0 = fx.Index(k0_base) + fx.Index(ku64)
+                    # k0_base is already fx.Index (from base_k_elem // 64);
+                    # ku64 is a python int from range_constexpr. Adding a
+                    # python int to fx.Index works via the operator overload.
+                    k0 = k0_base + ku64
                     idx_byte = n_base_byte + k0 * _b_stride_k0_c
                     idx_dword = idx_byte // 4
                     # 16B = 16 fp8 elems = one (klane=4, kpack=16) entry,
@@ -467,58 +499,90 @@ def _build_compiled(
                 [w0, w1], fx.Int32,
             ).bitcast(fx.Int64)[0].ir_value()
 
+        # ── Cross-lane amax + s_x distribution via LDS ──────────────────────
+        # The previous DPP butterfly used row_xmask:1/2 with the assumption
+        # that those swap across DPP rows of 16 lanes (i.e. lane^16 / lane^32),
+        # but row_xmask actually swaps *within* a row (lane^N for N<16). For
+        # gfx950 there is no clean single-instruction DPP for lane^16/lane^32
+        # swaps, so we fall back to a correctness-first LDS roundtrip:
+        #   1) each lane writes its local amax to lds_amax[wave_id*64+lane_id]
+        #   2) wave-local barrier
+        #   3) each lane reads the 4 lanes that share its lane_mod_16
+        #      (offsets lane_mod_16 + {0,16,32,48}) and reduces with max.
+        # The same LDS region is reused for s_x distribution at promote-time:
+        # after writing s_x, each lane reads the s_x for output row
+        # (lane_div_16*4 + ii) by reading lds_amax[wave_id*64 + (ldiv*4+ii)].
+        c_lane_stride = fx.Index(1)
+        c_wave_stride = fx.Index(lds_amax_elems_per_wave)
+        c16 = fx.Index(16)
+        c32 = fx.Index(32)
+        c48 = fx.Index(48)
+
+        def _lds_amax_base():
+            return wave_id * c_wave_stride
+
+        def _lds_store_per_lane_f32(val_f32):
+            """Each lane writes val_f32 to lds_amax[wave_id*64 + lane_id]."""
+            idx = _lds_amax_base() + lane_id
+            v1 = Vec.from_elements([val_f32.ir_value()], fx.Float32)
+            v1.store(lds_amax, [idx])
+
+        def _lds_load_lane_f32(lane_within_wave_idx):
+            """Each lane reads lds_amax[wave_id*64 + lane_within_wave_idx]."""
+            idx = _lds_amax_base() + lane_within_wave_idx
+            v = Vec.load(Vec.make_type(1, fx.Float32), lds_amax, [idx])
+            return fx.Float32(v[0])
+
         def cross_lane_amax(local_amax_f32):
-            """2-step DPP butterfly: max across lane^16 then lane^32.
+            """LDS-based reduction across the 4 lanes that share lane_mod_16.
 
-            Both swaps use `row_xmask` DPP control (rows are 16 lanes wide):
-              row_xmask:1 → dpp_ctrl=0x101 → lanes swap across rows {0↔1, 2↔3}
-              row_xmask:2 → dpp_ctrl=0x102 → lanes swap across rows {0↔2, 1↔3}
-            Combined, all 4 lane_div_16 groups (rows 0..3 of the wave) hold
-            the same max for each lane_mod_16 column.
+            Sequence:
+              0) wave barrier (ensure prior LDS reads on this region done);
+              1) each lane stores its local_amax to LDS at slot lane_id;
+              2) wave barrier (ensure all stores visible);
+              3) each lane reads the 4 values at lane_mod_16 + {0,16,32,48}
+                 and maxes them.
             """
-            from flydsl._mlir.dialects import rocdl as _rocdl_low
-            local_i32 = fx.arith.bitcast(i32_ir, local_amax_f32.ir_value())
-            # Step 1: swap with lane ^ 16
-            sw1_i32 = _rocdl_low.update_dpp(
-                res=i32_ir, old=local_i32, src=local_i32,
-                dpp_ctrl=0x101, row_mask=0xF, bank_mask=0xF, bound_ctrl=True,
+            gpu.barrier()
+            _lds_store_per_lane_f32(local_amax_f32)
+            gpu.barrier()
+            base = lane_mod_16
+            v0 = _lds_load_lane_f32(base)
+            v1 = _lds_load_lane_f32(base + c16)
+            v2 = _lds_load_lane_f32(base + c32)
+            v3 = _lds_load_lane_f32(base + c48)
+            m01 = fx.Float32(
+                fx.arith.maximumf(v0.ir_value(), v1.ir_value())
             )
-            sw1_f32 = fx.arith.bitcast(f32_ir, sw1_i32)
-            mid = fx.arith.maximumf(local_amax_f32.ir_value(), sw1_f32)
-            # Step 2: swap with lane ^ 32
-            sw2_i32 = _rocdl_low.update_dpp(
-                res=i32_ir, old=fx.arith.bitcast(i32_ir, mid),
-                src=fx.arith.bitcast(i32_ir, mid),
-                dpp_ctrl=0x102, row_mask=0xF, bank_mask=0xF, bound_ctrl=True,
+            m23 = fx.Float32(
+                fx.arith.maximumf(v2.ir_value(), v3.ir_value())
             )
-            sw2_f32 = fx.arith.bitcast(f32_ir, sw2_i32)
-            final = fx.arith.maximumf(mid, sw2_f32)
-            return fx.Float32(final)
+            return fx.Float32(
+                fx.arith.maximumf(m01.ir_value(), m23.ir_value())
+            )
 
-        def ds_bpermute_f32(src_lane_index_i32, val_f32):
-            """ds_bpermute on fp32: each lane reads val from src_lane.
+        def distribute_s_x_then_read(s_x_f32, ii_const):
+            """Publish s_x to LDS, barrier, then each dest lane reads the
+            s_x for its output row ii.
 
-            src_lane_index_i32 is the per-lane SOURCE lane index (Int32),
-            but ds_bpermute expects byte offset = lane_idx * 4.
+            Output row for this lane at ii is (mi*16 + lane_div_16*4 + ii).
+            The lane in this wave with lane_id == lane_div_16*4 + ii holds
+            s_x for row (mi*16 + lane_div_16*4 + ii) iff that lane's
+            lane_mod_16 == lane_div_16*4 + ii AND lane_div_16 == 0 — which is
+            exactly lane_id < 16. Because after cross_lane_amax every group
+            of 4 lanes sharing lane_mod_16 hold the same s_x, we can read
+            from any of them; reading from lane_div_16=0 (lane_id = ldiv*4+ii)
+            keeps the formula clean.
             """
-            from flydsl._mlir.dialects import rocdl as _rocdl_low
-            idx_bytes = src_lane_index_i32 * fx.Int32(4)
-            src_i32 = fx.arith.bitcast(i32_ir, val_f32.ir_value())
-            permuted_i32 = _rocdl_low.ds_bpermute(
-                res=i32_ir, index=idx_bytes.ir_value(), src=src_i32,
-            )
-            return fx.Float32(fx.arith.bitcast(f32_ir, permuted_i32))
+            # NOTE: caller is expected to have published s_x via
+            # publish_s_x() once per (g, mi) BEFORE this is called for ii.
+            src = lane_div_16 * fx.Index(4) + fx.Index(ii_const)
+            return _lds_load_lane_f32(src)
 
-        # Per-output-row source-lane mapping. For each ii in {0,1,2,3}, the
-        # lane holding s_x for output row (mi*16 + lane_div_16*4 + ii) is
-        # the input-quant lane with lane_mod_16 == lane_div_16*4 + ii and
-        # lane_div_16 == 0. That lane's lane_id = lane_div_16*4 + ii.
-        # (Same for any mi — s_x is recomputed per mi.)
-        # We use the lane in lane_div_16=0 because all 4 lane_div_16 lanes
-        # hold the same final s_x post-DPP; any of them is a valid source.
-        def src_lane_for_ii(ii_const):
-            # ii is a python int compile-time; source lane = lane_div_16*4 + ii
-            return fx.Int32(lane_div_16 * 4 + ii_const)
+        def publish_s_x(s_x_f32):
+            """Store s_x to LDS at slot lane_id, then barrier."""
+            _lds_store_per_lane_f32(s_x_f32)
+            gpu.barrier()
 
         # Float32 constants reused inside the loop.
         c_inv_448 = fx.Float32(1.0 / 448.0)
@@ -542,16 +606,22 @@ def _build_compiled(
                 # ku range within this group: [g*4, g*4+4) for mfmas_per_group=4
                 # Per-lane bf16 fragments for the whole 128-K group: 32 bf16.
                 # We load 4 chunks of 8 bf16 (one per MFMA).
-                a_fp32_chunks = []  # list of 4 Vec<8xfp32>, one per MFMA
+                # Per-ku col-byte base for A LDS reads. We need lane G's A
+                # K-set to match B's K-set so MFMA's partial-dot is right.
+                # B per K=64 chunk (= 2 MFMAs) gives lane G K=G*16..G*16+15.
+                # That splits into MFMA-0 → K=G*16..G*16+7 and
+                # MFMA-1 → K=G*16+8..G*16+15. In bf16 bytes that's
+                # `col_base_bytes = ku64*128 + G*32 + ku_pair*16` where
+                # ku64 = ku_global // 2, ku_pair = ku_global % 2.
+                ku_col_bases = []
                 for ku_in_g in range_constexpr(mfmas_per_group):
                     ku_global = g * mfmas_per_group + ku_in_g
-                    col_base_bytes = col_offset_base_bytes + (ku_global * 64)
-                    # Note: this load is per-mi; we defer it until inside the
-                    # mi loop below since `a_fp32_chunks` is per-mi.
-                    a_fp32_chunks.append(col_base_bytes)
-                # ^ Above: `a_fp32_chunks` here actually holds col_base_bytes
-                # per ku for use inside mi loop. Renaming for clarity below.
-                ku_col_bases = a_fp32_chunks
+                    ku64 = ku_global // 2
+                    ku_pair = ku_global % 2
+                    col_base_bytes = (
+                        ku64 * 128 + col_offset_base_bytes + ku_pair * 16
+                    )
+                    ku_col_bases.append(col_base_bytes)
 
                 # Compute s_y for each ni for this K-128 group.
                 # arg_sy layout: (H, D//128, R//128) fp32.
@@ -633,11 +703,19 @@ def _build_compiled(
                                 [a_i64, b_packs[ni], scratch_accs[ni], 0, 0, 0],
                             )
 
-                    # Promote scratch -> global: per-ii, fetch s_x for output
-                    # row via ds_bpermute then multiply by (s_x * s_y) and add.
+                    # Publish s_x to LDS once; each ii reads its row's s_x.
+                    # We need a barrier BEFORE the store (so the LDS region —
+                    # which was used for the amax reduce above — is free of
+                    # in-flight reads) and AFTER the store (so all lanes can
+                    # read each other's writes).
+                    gpu.barrier()
+                    publish_s_x(s_x)
+
+                    # Promote scratch -> global: per-ii, look up s_x for the
+                    # output row this lane writes, multiply by (s_x * s_y),
+                    # and add to the global accumulator.
                     for ii in range_constexpr(4):
-                        src_lane_i32 = src_lane_for_ii(ii)
-                        s_x_for_out = ds_bpermute_f32(src_lane_i32, s_x)
+                        s_x_for_out = distribute_s_x_then_read(s_x, ii)
                         for ni in range_constexpr(num_acc_n):
                             acc_idx = mi * num_acc_n + ni
                             sxsy = s_x_for_out * sy_per_ni[ni]

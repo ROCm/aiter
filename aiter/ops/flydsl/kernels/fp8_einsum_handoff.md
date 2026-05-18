@@ -9,17 +9,70 @@ on AMD gfx950 in FlyDSL. Reads alongside `fp8_einsum_design.md` (the spec) and
 | Item | Status | Where |
 |---|---|---|
 | Skeleton + bf16 LDS pipeline + (h,m_tile) grouping | ✅ done | `fp8_einsum.py` |
-| Cross-lane per-row amax (DPP butterfly) | ✅ done | `cross_lane_amax` |
-| `scale_mode="fp32"` end-to-end compute_tile | ✅ done | `compute_tile_fp32` |
+| Cross-lane per-row amax (LDS exchange) | ✅ done, **DPP replaced** | `cross_lane_amax` |
+| `scale_mode="fp32"` end-to-end compute_tile | ✅ done, **bugs fixed** | `compute_tile_fp32` |
 | Unit test: compile trace (any host) | ✅ done | `test_fp8_einsum.py` |
-| Unit test: end-to-end accuracy (gfx950 only) | ✅ done, **unrun** | same |
+| Unit test: end-to-end accuracy (gfx950 only) | ✅ **passing on gfx950** | same |
 | `scale_mode="ue8m0"` | ❌ stubbed (`NotImplementedError`) | `compile_fp8_einsum_bhr_hdr_bhd:73` |
 | Perf sweep / autotune | ❌ pending | — |
 | LDS ping-pong (`lds_stage=2`) | ❌ pending (single-buffer only) | `compile_fp8_einsum_bhr_hdr_bhd:151` |
 
-**Cannot run accuracy test locally** — implementation was done on a gfx942 host;
-the kernel guards `gpu_arch.startswith("gfx95")` and the MFMA intrinsics
-(`mfma_f32_16x16x32_fp8_fp8`, `mfma_scale_f32_16x16x128_f8f6f4`) require gfx950.
+## Bugs fixed in the v1.1 pass on gfx950
+
+The previous gfx942 implementation compiled on gfx950 but produced wrong
+results. Three bugs were found and fixed:
+
+1. **`buffer_copy_gmem16_dwordx4` wrapping** (`load_a_tile_to_lds`). The
+   helper expects a raw MLIR `index`-typed value, NOT a wrapped `fx.Int32`.
+   Passing `fx.Int32(idx_elem)` triggered `AttributeError: 'Int32' object
+   has no attribute 'type'`. Fixed by passing `idx_elem` directly.
+2. **`fx.Index(...)` double-wrap in `load_b_tile`** (`k0 = fx.Index(k0_base)
+   + fx.Index(ku64)`). `k0_base` was already an `fx.Index`; re-wrapping
+   produced `Index(Index(...))` which the operator overload couldn't
+   reduce. Fixed by relying on python-int + fx.Index coercion:
+   `k0 = k0_base + ku64`.
+3. **DPP butterfly was the wrong reduction** (`cross_lane_amax`). The
+   previous code used `row_xmask:1` / `row_xmask:2` (dpp_ctrl 0x101/0x102)
+   believing they swap across DPP rows (lane^16, lane^32). They actually
+   swap *within* a row of 16 lanes (lane^1, lane^2). There is no single-
+   instruction DPP for lane^16 / lane^32 on gfx950, so this was replaced
+   with an LDS roundtrip: each lane writes its local amax to a per-wave
+   LDS slot at offset `lane_id`, barrier, then reads the 4 lanes that
+   share its `lane_mod_16` and reduces with `maximumf`.
+
+   The same LDS region is reused for s_x distribution at promote time
+   (`distribute_s_x_then_read` + `publish_s_x`): each lane writes its
+   `s_x` to `lds_amax[wave_id*64 + lane_id]`, barrier, then dest lane
+   reads `lds_amax[wave_id*64 + (lane_div_16*4 + ii)]` for its `ii`-th
+   output row. This replaces the previous `ds_bpermute_f32`.
+
+4. **A K-distribution per lane did NOT match B's** (this was the hardest
+   one — fp32-mode passed on uniform inputs but produced ~0.75 calc_diff
+   on random `bf16` × random pre-quantized `fp8`). For
+   `mfma_f32_16x16x32_fp8_fp8` the partial-dot lane mapping requires
+   that A and B's per-lane K-fragments span the **same** physical K-set.
+   B's preshuffle gives lane `G` (lane_div_16 = G) K-elems
+   `G*16..G*16+15` per K=64 chunk. With the previous A load
+   (`col_offset_base_bytes = lane_div_16 * 16`, 16 bytes per ku =
+   8 bf16 elems) lane G's A K-elems were `G*8..G*8+7` per MFMA — a
+   different K-set, so partial dots multiplied A[m, k1] * B[k2, n] for
+   k1 != k2. Symptom: all-positive inputs ~correct (sign cancellation
+   masks the mismatch), sign-mixed inputs catastrophic.
+
+   Fixed by changing the A LDS-load col-byte formula so each lane's two
+   per-K=64-chunk MFMAs read K-fragments `G*16..G*16+7` and `G*16+8..G*16+15`
+   respectively, matching B's b0/b1 split:
+
+   ```python
+   col_offset_base_bytes = lane_div_16 * 32          # was * 16
+   # per-ku-in-tile: ku64 = ku_global // 2, ku_pair = ku_global % 2
+   col_base_bytes = ku64 * 128 + col_offset_base_bytes + ku_pair * 16
+   ```
+
+   The template (`preshuffle_gemm.py`) gets the same K-distribution
+   "for free" because its A is fp8 (kpack_elems=16, so lane G holds
+   K=G*16..G*16+15 per ku — matches B). Our kernel uses bf16 A, so we
+   have to load 16 K-elems per lane per ku-pair as two halves.
 
 ## Files
 
@@ -418,22 +471,22 @@ Reference impl in the test file is fully self-contained:
 Larger B (4096, 8192) per design doc are not in the default parametrize set —
 they allocate ~256-512 MiB of bf16 X. Add to parametrize if you want them.
 
-## Top three things likely to fail on first hardware run
+## Top three things likely to fail on first hardware run — RESOLVED
 
-1. **`ds_bpermute` byte vs dword index**. The helper multiplies the lane index
-   by 4 (treating it as bytes). If `flydsl._mlir.dialects.rocdl.ds_bpermute`
-   already expects a lane index in dwords, this would be 4× off — and since the
-   `s_x` value is from a different lane than intended, results would be
-   plausibly-magnitude'd but wrong per-row.
+(All three of the previously-suspected failure modes ended up not being the
+actual bugs on first hardware run. The real bugs were the four listed under
+"Bugs fixed in the v1.1 pass on gfx950" above.)
 
-2. **MFMA output row layout assumption** (`src_lane_for_ii`). I assume the 4
-   elements of `Vec<4×f32>` returned by `mfma_f32_16x16x32_fp8_fp8` are 4
-   successive rows (`lane_div_16*4 + ii`). If instead they're 4 successive
-   columns, the per-`ii` `s_x_for_out` remap fetches from the wrong source lane.
+1. ~~`ds_bpermute` byte vs dword index.~~ Moot — `ds_bpermute` is no longer
+   used; s_x distribution is via LDS roundtrip.
 
-3. **`maximumf` NaN propagation**. `arith.maximumf` returns NaN if either input
-   is NaN. If inputs ever produce `0 * inf`, swap to `arith.maxnumf` (which
-   ignores NaNs).
+2. ~~MFMA output row layout assumption.~~ The MFMA output **does** lay out as
+   `row = lane_div_16*4 + ii`, confirmed by matching the template's per-row
+   epilogue. The mapping in `distribute_s_x_then_read` is correct.
+
+3. ~~`maximumf` NaN propagation.~~ Not triggered in practice with the test
+   inputs. Left in place; switch to `maxnumf` if extreme inputs (NaN amax)
+   ever appear.
 
 Less likely but worth checking:
 - Whether `bx_h * fx.Index(b_elems_per_head)` overflows i32 for large H*D*R.
