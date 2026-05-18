@@ -637,7 +637,7 @@ def _gluon_fp8_mqa_logits_kernel(
     start_ind = gl.load(cu_start_ptr + row_id)
     end_ind = gl.load(cu_end_ptr + row_id)
     start_ind = gl.maximum(start_ind, 0)
-    end_ind = gl.minimum(end_ind, seq_len_kv - 1)
+    end_ind = gl.minimum(end_ind, seq_len_kv)
 
     KVLoader: gl.constexpr = MQAAsyncKVLoader
 
