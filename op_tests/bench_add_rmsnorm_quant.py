@@ -5,7 +5,7 @@ import torch
 import argparse
 import pandas as pd
 import aiter
-from aiter import dtypes, QuantType
+from aiter import dtypes
 from aiter.test_common import perftest
 
 torch.set_default_device("cuda")
@@ -13,7 +13,9 @@ torch.set_default_device("cuda")
 
 @perftest()
 def bench_add_rmsnorm_quant(input, residual, output, residual_out, scale, weight, eps):
-    aiter.add_rmsnorm_quant(output, input, residual, residual_out, scale, weight, eps, 0)
+    aiter.add_rmsnorm_quant(
+        output, input, residual, residual_out, scale, weight, eps, 0
+    )
 
 
 def run(m, n, dtype, quant_dtype):
@@ -29,8 +31,8 @@ def run(m, n, dtype, quant_dtype):
     )
 
     # input + residual (read), weight (read), output (write), residual_out (write), scale (write)
-    read_bytes = (input.nbytes + residual.nbytes + weight.nbytes)
-    write_bytes = (output.nbytes + residual_out.nbytes + scale.nbytes)
+    read_bytes = input.nbytes + residual.nbytes + weight.nbytes
+    write_bytes = output.nbytes + residual_out.nbytes + scale.nbytes
     bw_gbs = (read_bytes + write_bytes) / us / 1024**3 * 1e6
 
     return {
