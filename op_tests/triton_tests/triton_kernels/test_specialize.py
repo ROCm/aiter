@@ -32,10 +32,13 @@ def get_specialized_kernel():
     if _specialized_kernel is not None:
         return _specialized_kernel
     import types
+
     spec_constants = {"fn": identity}
     spec_tuples = {}
     module = types.ModuleType("specialized_kernel")
-    module.specialized = specialize(template_kernel, module, spec_constants, spec_tuples)
+    module.specialized = specialize(
+        template_kernel, module, spec_constants, spec_tuples
+    )
     _specialized_kernel = module.specialized
     return _specialized_kernel
 
@@ -62,8 +65,10 @@ def test_cacheable(device, fresh_triton_cache, monkeypatch):
         module_name = kwargs["fn"].module
 
     triton.knobs.runtime.jit_cache_hook = cache_hook
-    o = torch.empty((1, ), dtype=torch.float32, device=device)
-    k = specialized_kernel[(1, )](o, )
+    o = torch.empty((1,), dtype=torch.float32, device=device)
+    k = specialized_kernel[(1,)](
+        o,
+    )
     hash = k.hash
     assert o.item() == 1.0
     assert module_name.endswith("test_specialize")
@@ -78,7 +83,9 @@ def test_cacheable(device, fresh_triton_cache, monkeypatch):
             assert ":18:5" in line
         if "store" in line:
             loc = line.split("(", 1)[1].split(")", 1)[0]
-    assert loc is not None, f"Expected to find a store instruction with location info, got: {ttir}"
+    assert (
+        loc is not None
+    ), f"Expected to find a store instruction with location info, got: {ttir}"
 
     compile_count = 0
 
@@ -99,5 +106,7 @@ def test_cacheable(device, fresh_triton_cache, monkeypatch):
 
     # verify that we hit the cache.
     compile_count = 0
-    specialized_kernel[(1, )](o, )
+    specialized_kernel[(1,)](
+        o,
+    )
     assert compile_count == 0

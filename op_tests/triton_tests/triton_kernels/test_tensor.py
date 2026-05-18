@@ -19,8 +19,10 @@ def test_make_ragged_tensor_metadata(n_slices):
     device = "cuda"
     max_slice_size = 200
     n_total_rows = max_slice_size * n_slices
-    slice_sizes = torch.randint(0, max_slice_size, (n_slices, ), dtype=torch.int32, device=device)
-    slice_sizes[torch.randint(0, n_slices, (1, ))] = 0
+    slice_sizes = torch.randint(
+        0, max_slice_size, (n_slices,), dtype=torch.int32, device=device
+    )
+    slice_sizes[torch.randint(0, n_slices, (1,))] = 0
     meta = make_ragged_tensor_metadata(slice_sizes, n_total_rows)
     ref = make_ragged_tensor_metadata_torch(slice_sizes, n_total_rows)
     assert_equal(meta.slice_sizes, ref.slice_sizes)
@@ -34,12 +36,14 @@ def test_remap_ragged_tensor_metadata(n_slices):
     device = "cuda"
     max_slice_size = 200
     n_total_rows = max_slice_size * n_slices
-    slice_sizes = torch.randint(0, max_slice_size, (n_slices, ), dtype=torch.int32, device=device)
-    slice_sizes[torch.randint(0, n_slices, (1, ))] = 0
+    slice_sizes = torch.randint(
+        0, max_slice_size, (n_slices,), dtype=torch.int32, device=device
+    )
+    slice_sizes[torch.randint(0, n_slices, (1,))] = 0
     # randomly permute slices
     slice_map = torch.randperm(n_slices, device=device, dtype=torch.int32)
     # discard random slices
-    slice_map[torch.randint(0, len(slice_map), (5, ))] = -1
+    slice_map[torch.randint(0, len(slice_map), (5,))] = -1
     tri_metadata = make_ragged_tensor_metadata(slice_sizes, n_total_rows)
     ref_metadata = make_ragged_tensor_metadata_torch(slice_sizes, n_total_rows)
     tri_metadata = remap_ragged_tensor_metadata(tri_metadata, slice_map)
@@ -64,9 +68,13 @@ def test_make_bitmatrix_metadata(n_rows, n_cols, k):
     indx = torch.sort(indx, dim=1)[0]
     # create bitmask
     rows = torch.arange(n_rows, device=device).unsqueeze(1).expand_as(indx)
-    bitmask_data = torch.zeros((n_rows, (n_cols + 31) // 32), dtype=torch.int32, device=device)
+    bitmask_data = torch.zeros(
+        (n_rows, (n_cols + 31) // 32), dtype=torch.int32, device=device
+    )
     bitmask_data.index_put_((rows, indx // 32), 1 << (indx % 32), accumulate=True)
-    bitmask = wrap_torch_tensor(bitmask_data.view(torch.uint32), dtype=BIT, shape=(n_rows, n_cols))
+    bitmask = wrap_torch_tensor(
+        bitmask_data.view(torch.uint32), dtype=BIT, shape=(n_rows, n_cols)
+    )
     # make metadata and compare
     metadata_tri = make_bitmatrix_metadata(indx, bitmask)
     metadata_ref = make_bitmatrix_metadata_torch(indx, bitmask)

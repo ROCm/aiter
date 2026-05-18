@@ -407,7 +407,8 @@ def _test_op(m, n, k, split_k, do_gather, do_scatter, inner_expt_opt, do_gamma, 
         c = c.mT.contiguous().mT
 
     # --- create precision config ---
-    wrap_list = lambda vals: torch.tensor(vals, dtype=torch.float32, device=device)
+    def wrap_list(vals):
+        return torch.tensor(vals, dtype=torch.float32, device=device)
     flex_a = InFlexData(c_dtype.torch_dtype, wrap_list([1.25])) if c_dtype.has_global_scale else InFlexData()
     flex_b = InFlexData(b_dtype.torch_dtype, wrap_list([1.25])) if b_dtype.has_global_scale else InFlexData()
     flex_c = OutFlexData(c_dtype.torch_dtype, wrap_list([4.00]), wrap_list([0]), None) if c_dtype.has_global_scale else OutFlexData()

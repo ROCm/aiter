@@ -10,7 +10,7 @@ import pytest
 
 def alloc_rand(shape, device, dtype, requires_grad=True):
     if dtype.itemsize == 1:
-        tmp = 2**-(torch.randint(4, 8, shape, device=device, dtype=torch.float16))
+        tmp = 2 ** -(torch.randint(4, 8, shape, device=device, dtype=torch.float16))
         return tmp.to(dtype).requires_grad_(requires_grad)
     return torch.randn(shape, device=device, dtype=dtype, requires_grad=requires_grad)
 

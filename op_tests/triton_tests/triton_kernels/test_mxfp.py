@@ -32,8 +32,12 @@ def test_mxfp4_rounding_cases(dst_dtype, device):
     }[dst_dtype]
     pad_values = [0] * 22
     # Construct an example where scale is 1 (when max value is 6.0, the maximum value of e2m1)
-    x = torch.tensor([6, 0, 0.24, 0.25, 0.75, 0.99, 1.2, 1.3, -1.25, two_point_five_plus_ulp] + pad_values,
-                     dtype=dst_dtype, device=device).view(1, -1, 1)
+    x = torch.tensor(
+        [6, 0, 0.24, 0.25, 0.75, 0.99, 1.2, 1.3, -1.25, two_point_five_plus_ulp]
+        + pad_values,
+        dtype=dst_dtype,
+        device=device,
+    ).view(1, -1, 1)
     quant, scale = downcast_to_mxfp(x, torch.uint8, axis=1)
     dequant = upcast_from_mxfp(quant, scale, dst_dtype, axis=1)
     # Tie-breaking cases (RTNE):
@@ -44,7 +48,10 @@ def test_mxfp4_rounding_cases(dst_dtype, device):
     # - -1.25 is halfway between -1.0 and -1.5. RTNE selects -1.0 (even). Away-from-zero would pick -1.5;
     #   towards-zero would pick -1.0.
     # - two_point_five_plus_ulp is slightly bigger than 0.25, so it rounds to 0.5.
-    assert dequant.flatten().tolist() == [6, 0, 0, 0.0, 1.0, 1.0, 1.0, 1.5, -1.0, 0.5] + pad_values, f"{dequant=}"
+    assert (
+        dequant.flatten().tolist()
+        == [6, 0, 0, 0.0, 1.0, 1.0, 1.0, 1.5, -1.0, 0.5] + pad_values
+    ), f"{dequant=}"
 
     quant_torch, scale_torch = downcast_to_mxfp_torch(x, torch.uint8, axis=1)
     assert_equal(quant_torch, quant)
@@ -59,8 +66,13 @@ def test_mxfp4_rounding_cases(dst_dtype, device):
     # and the other values are multiples of representable FP4 values times 8
     # that allow exact reconstruction.
     pad_values = [0] * 24
-    x = torch.tensor([33.0, 24.0, 16.0, 8.0, 4.0, 0.0, -32.0, 0.0] + pad_values,
-                     device=device).bfloat16().view(1, -1, 1)
+    x = (
+        torch.tensor(
+            [33.0, 24.0, 16.0, 8.0, 4.0, 0.0, -32.0, 0.0] + pad_values, device=device
+        )
+        .bfloat16()
+        .view(1, -1, 1)
+    )
     quant, scale = downcast_to_mxfp(
         x,
         torch.uint8,
@@ -87,13 +99,17 @@ def test_mxfp4_rounding_cases(dst_dtype, device):
 @pytest.mark.parametrize("src_dtype", ["float4_e2m1", "float8_e5m2", "float8_e4m3fn"])
 @pytest.mark.parametrize("dst_dtype", ["float16", "bfloat16", "float32"])
 def test_mxfp_extreme_values(src_dtype, dst_dtype, device):
-    if "float8" in src_dtype and (is_cuda() and torch.cuda.get_device_capability()[0] < 9):
+    if "float8" in src_dtype and (
+        is_cuda() and torch.cuda.get_device_capability()[0] < 9
+    ):
         pytest.skip("Float8 not tested on A100")
     src_dtype = dtype_str_to_torch(src_dtype)
     dst_dtype = dtype_str_to_torch(dst_dtype)
     BIG_VALUE = 65470 if dst_dtype == torch.float16 else 3.3895e38
     pad_values = [0] * 30
-    x = torch.tensor([BIG_VALUE, BIG_VALUE] + pad_values, dtype=dst_dtype, device=device)
+    x = torch.tensor(
+        [BIG_VALUE, BIG_VALUE] + pad_values, dtype=dst_dtype, device=device
+    )
     xq_value, xq_scale = downcast_to_mxfp(x, src_dtype, axis=-1)
     xdq = upcast_from_mxfp(xq_value, xq_scale, dst_dtype, axis=-1)
     xdq_ref = upcast_from_mxfp_torch(xq_value, xq_scale, dst_dtype, axis=-1)
@@ -104,7 +120,9 @@ def test_mxfp_extreme_values(src_dtype, dst_dtype, device):
 @pytest.mark.parametrize("src_dtype", ["float4_e2m1", "float8_e5m2", "float8_e4m3fn"])
 @pytest.mark.parametrize("dst_dtype", ["float16", "bfloat16", "float32"])
 def test_mxfp_quant_dequant(src_dtype, dst_dtype, device):
-    if "float8" in src_dtype and (is_cuda() and torch.cuda.get_device_capability()[0] < 9):
+    if "float8" in src_dtype and (
+        is_cuda() and torch.cuda.get_device_capability()[0] < 9
+    ):
         pytest.skip("Float8 not tested on A100")
     limit_range = src_dtype == "float8_e5m2" and dst_dtype == "float16"
 
@@ -118,7 +136,9 @@ def test_mxfp_quant_dequant(src_dtype, dst_dtype, device):
         max_val = 128
 
     # These are all the valid mxfp4 positive values.
-    pos_vals = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, max_val], device=device, dtype=dst_dtype)
+    pos_vals = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, max_val], device=device, dtype=dst_dtype
+    )
     neg_vals = -pos_vals
     k_dim = torch.cat([pos_vals, neg_vals])
     k_dim = k_dim.reshape([k_dim.shape[0], 1])
@@ -129,7 +149,9 @@ def test_mxfp_quant_dequant(src_dtype, dst_dtype, device):
     scales = 2**powers
     scales = scales.reshape([1, powers.shape[0]])
     weight = k_dim * scales
-    weight = weight.repeat((9, 32))  # Repeat the dimensions to test multi block launches.
+    weight = weight.repeat(
+        (9, 32)
+    )  # Repeat the dimensions to test multi block launches.
     weight = weight.reshape([1, weight.shape[0], weight.shape[1]])
     weight = weight.mT.contiguous().mT
     weight = torch.nn.functional.pad(weight, (0, 0, 0, 16))

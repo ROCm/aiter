@@ -23,7 +23,10 @@ def test_topk(n_rows, n_cols, k, apply_softmax, dtype):
     assert_close(sparse_x_tri.vals, sparse_x_ref.vals)
     assert_equal(sparse_x_tri.indx, sparse_x_ref.indx)
     assert_equal(sparse_x_tri.mask.storage.data, sparse_x_ref.mask.storage.data)
-    assert sparse_x_tri.mask.storage.data.stride() == sparse_x_ref.mask.storage.data.stride()
+    assert (
+        sparse_x_tri.mask.storage.data.stride()
+        == sparse_x_ref.mask.storage.data.stride()
+    )
     assert sparse_x_tri.mask.storage.data.shape == sparse_x_ref.mask.storage.data.shape
 
 
@@ -39,8 +42,12 @@ def bench_topk(n_rows, n_cols, k, apply_softmax, all_gather=False):
     # run benchmark
     x = torch.randn((n_rows, n_cols), dtype=torch.float32, device=f"cuda:{rank}")
     symm_mem_pool = SymmetricMemoryPool()
-    symm_mem_pool._reserve_region("topk", world_size * x.numel() * x.element_size(), 128, 0)
-    symm_mem_pool._initialize(world_size, group=torch.distributed.group.WORLD, device=x.device)
+    symm_mem_pool._reserve_region(
+        "topk", world_size * x.numel() * x.element_size(), 128, 0
+    )
+    symm_mem_pool._initialize(
+        world_size, group=torch.distributed.group.WORLD, device=x.device
+    )
     proton.start(f"profile_{rank}", hook="triton")
     # warmup
     proton.deactivate()
@@ -48,7 +55,13 @@ def bench_topk(n_rows, n_cols, k, apply_softmax, all_gather=False):
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         with torch.cuda.graph(g):
-            _ = topk(x, k, apply_softmax=apply_softmax, all_gather=all_gather, symm_mem_pool=symm_mem_pool)
+            _ = topk(
+                x,
+                k,
+                apply_softmax=apply_softmax,
+                all_gather=all_gather,
+                symm_mem_pool=symm_mem_pool,
+            )
     torch.cuda.synchronize()
     proton.activate()
     for i in range(100):

@@ -20,7 +20,10 @@ def fresh_knobs():
     needed to successfully compile kernels.
     """
     from triton._internal_testing import _fresh_knobs_impl
-    fresh_function, reset_function = _fresh_knobs_impl(skipped_attr={"build", "nvidia", "amd"})
+
+    fresh_function, reset_function = _fresh_knobs_impl(
+        skipped_attr={"build", "nvidia", "amd"}
+    )
     try:
         yield fresh_function()
     finally:
@@ -35,6 +38,7 @@ def fresh_knobs_including_libraries():
     environment isolation.
     """
     from triton._internal_testing import _fresh_knobs_impl
+
     fresh_function, reset_function = _fresh_knobs_impl()
     try:
         yield fresh_function()
@@ -56,5 +60,6 @@ def pytest_configure(config):
     worker_id = os.environ.get("PYTEST_XDIST_WORKER")
     if worker_id is not None and worker_id.startswith("gw"):
         import torch
+
         gpu_id = int(worker_id[2:])  # map gw0 → 0, gw1 → 1, ...
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id % torch.cuda.device_count())

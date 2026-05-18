@@ -2,7 +2,10 @@ import pytest
 import torch
 from triton.testing import do_bench
 from triton_kernels.reduce import reduce, reduce_torch, PostprocessFn, FnSpecs
-from triton_kernels.numerics_details.mxfp import upcast_from_mxfp_torch, downcast_to_mxfp_torch
+from triton_kernels.numerics_details.mxfp import (
+    upcast_from_mxfp_torch,
+    downcast_to_mxfp_torch,
+)
 from triton_kernels.numerics import InFlexData, OutFlexData
 from triton_kernels.target_info import is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4
 import triton
@@ -37,27 +40,36 @@ def plus_a_reduce(x, a):
     return tl.sum(y.reshape([x.shape[0], x.shape[1] // 2, 2]), axis=2)
 
 
-@pytest.mark.parametrize("B, M, N, postprocess_fn", [
-    (311, 384, 384, None),
-    (384, 311, 384, None),
-    (384, 384, 311, None),
-    (512, 512, 512, None),
-    (512, 512, 512, "plus_ten"),
-    (4, 4, 4, None),
-])
-@pytest.mark.parametrize("dtype_str", [
-    "float16",
-    "float32",
-    "mxfloat8",
-    "flexfloat8",
-])
-@pytest.mark.parametrize("mask_mode", [
-    "none",  # no mask
-    "full",  # full-sized mask [B,M,N]
-    "broadcast_b",  # broadcast over B: [1,M,N]
-    "broadcast_m",  # broadcast over M: [B,1,N]
-    "broadcast_n",  # broadcast over N: [B,M,1]
-])
+@pytest.mark.parametrize(
+    "B, M, N, postprocess_fn",
+    [
+        (311, 384, 384, None),
+        (384, 311, 384, None),
+        (384, 384, 311, None),
+        (512, 512, 512, None),
+        (512, 512, 512, "plus_ten"),
+        (4, 4, 4, None),
+    ],
+)
+@pytest.mark.parametrize(
+    "dtype_str",
+    [
+        "float16",
+        "float32",
+        "mxfloat8",
+        "flexfloat8",
+    ],
+)
+@pytest.mark.parametrize(
+    "mask_mode",
+    [
+        "none",  # no mask
+        "full",  # full-sized mask [B,M,N]
+        "broadcast_b",  # broadcast over B: [1,M,N]
+        "broadcast_m",  # broadcast over M: [B,1,N]
+        "broadcast_n",  # broadcast over N: [B,M,1]
+    ],
+)
 @pytest.mark.parametrize("dim", [0, 1, 2])
 def test_op(B, M, N, dtype_str, dim, mask_mode, postprocess_fn):
     # Check float8 hardware support
@@ -81,8 +93,12 @@ def test_op(B, M, N, dtype_str, dim, mask_mode, postprocess_fn):
         x_flex = InFlexData(scale=torch.tensor([2], device=device, dtype=torch.float32))
         x = x / x_flex.scale
         x = x.to(dtype)
-        y_flex_tri = OutFlexData(expected_scale=expected_scale, actual_scale=torch.empty_like(expected_scale))
-        y_flex_ref = OutFlexData(expected_scale=expected_scale, actual_scale=torch.empty_like(expected_scale))
+        y_flex_tri = OutFlexData(
+            expected_scale=expected_scale, actual_scale=torch.empty_like(expected_scale)
+        )
+        y_flex_ref = OutFlexData(
+            expected_scale=expected_scale, actual_scale=torch.empty_like(expected_scale)
+        )
     mask = init_mask(mask_mode, B, M, N, device)
     expected_exception = ValueError if dim == 2 and is_mx else None
     if expected_exception is not None:
@@ -90,34 +106,64 @@ def test_op(B, M, N, dtype_str, dim, mask_mode, postprocess_fn):
             reduce(x, dim=dim, mask=mask, x_mxscale=x_mscale)
         return
     if postprocess_fn == "plus_ten":
-        postprocess_fn_tri = PostprocessFn(specs=FnSpecs("plus_a", plus_a_reduce, ("a", ), reduction_n=2),
-                                           fn_args=(10, ))
-        postprocess_fn_ref = lambda x: (x + 10).reshape([x.shape[0], x.shape[1] // 2, 2]).sum(dim=2)
+        postprocess_fn_tri = PostprocessFn(
+            specs=FnSpecs("plus_a", plus_a_reduce, ("a",), reduction_n=2), fn_args=(10,)
+        )
+
+        def postprocess_fn_ref(x):
+            return (x + 10).reshape([x.shape[0], x.shape[1] // 2, 2]).sum(dim=2)
+
     else:
         postprocess_fn_tri = postprocess_fn_ref = None
     # run forward pass
     x_tri = x.clone().detach().requires_grad_(True)
     x_ref = x.clone().detach().requires_grad_(True)
-    y_tri, y_tri_mxscale = reduce(x_tri, dim=dim, mask=mask, x_mxscale=x_mscale, x_flex=x_flex, y_flex=y_flex_tri,
-                                  postprocess_fn1=postprocess_fn_tri)
-    y_ref, y_ref_mxscale = reduce_torch(x_ref, dim=dim, mask=mask, x_mxscale=x_mscale, x_flex=x_flex, y_flex=y_flex_ref,
-                                        postprocess_fn1=postprocess_fn_ref)
+    y_tri, y_tri_mxscale = reduce(
+        x_tri,
+        dim=dim,
+        mask=mask,
+        x_mxscale=x_mscale,
+        x_flex=x_flex,
+        y_flex=y_flex_tri,
+        postprocess_fn1=postprocess_fn_tri,
+    )
+    y_ref, y_ref_mxscale = reduce_torch(
+        x_ref,
+        dim=dim,
+        mask=mask,
+        x_mxscale=x_mscale,
+        x_flex=x_flex,
+        y_flex=y_flex_ref,
+        postprocess_fn1=postprocess_fn_ref,
+    )
     if is_mx:
         y_ref = upcast_from_mxfp_torch(y_ref, y_ref_mxscale, torch.float16, axis=-1)
         y_tri = upcast_from_mxfp_torch(y_tri, y_tri_mxscale, torch.float16, axis=-1)
     assert torch.allclose(y_tri.float(), y_ref.float(), atol=1e-3, rtol=1e-3)
     if is_flex:
-        torch.allclose(y_flex_tri.actual_scale, y_flex_ref.actual_scale, atol=1e-3, rtol=1e-3)
+        torch.allclose(
+            y_flex_tri.actual_scale, y_flex_ref.actual_scale, atol=1e-3, rtol=1e-3
+        )
     run_bwd = postprocess_fn is None and "float8" not in dtype_str
     if run_bwd:
         dy = torch.randn_like(y_tri)
         y_tri.backward(dy)
         y_ref.backward(dy)
-        assert torch.allclose(x_tri.grad.float(), x_ref.grad.float(), atol=1e-3, rtol=1e-3)
+        assert torch.allclose(
+            x_tri.grad.float(), x_ref.grad.float(), atol=1e-3, rtol=1e-3
+        )
 
 
-def bench_reduce(B: int = 4, M: int = 4096, N: int = 4096, *, dim: int = 0, dtype: torch.dtype = torch.float16,
-                 iters: int = 200, mask_mode: str = "none"):
+def bench_reduce(
+    B: int = 4,
+    M: int = 4096,
+    N: int = 4096,
+    *,
+    dim: int = 0,
+    dtype: torch.dtype = torch.float16,
+    iters: int = 200,
+    mask_mode: str = "none",
+):
     torch.manual_seed(0)
     device = "cuda"
     x = torch.randn((B, M, N), device=device, dtype=torch.float32).to(dtype)
