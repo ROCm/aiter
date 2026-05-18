@@ -823,18 +823,32 @@ def build_sage_attn_cdna_module(
             )
             k_ds_loc = fx.Float32(_load_ptr_f32(kds_ptr, k_descale_base_loc))
             qk_scale_loc = _fmul(q_ds, k_ds_loc)
-            qk_scale_v16_loc = Vec.from_elements(
-                [qk_scale_loc], fx.Float32
-            ).broadcast_to(16)
-            s_f32_loc = []
-            for st in range_constexpr(N_SUBTILES):
-                s_i32_vec = Vec(s_accs_loc[st])
-                s_f32_vec = s_i32_vec.to(fx.Float32)
-                s_scaled_vec = Vec(
-                    arith.mulf(s_f32_vec, qk_scale_v16_loc, fastmath=fm_fast)
-                )
-                for elem in range_constexpr(ELEMS_PER_TILE):
-                    s_f32_loc.append(s_scaled_vec[elem])
+            # Non-causal: defer the qk_scale multiply until softmax (mirrors
+            # ROCm/aiter#3247 `_sage_fwd_no_mask` fast path). Causal keeps
+            # eager scale because under non-`fast` fastmath the per-element
+            # FMA loses the nnan/ninf optimizations the original code had.
+            #   max(qk_int * scale) == max(qk_int) * scale  (scale > 0)
+            #   (qk_int * scale) - m_ij == fma(qk_int, scale, -m_ij)
+            if const_expr(not CAUSAL):
+                s_f32_loc = []
+                for st in range_constexpr(N_SUBTILES):
+                    s_i32_vec = Vec(s_accs_loc[st])
+                    s_f32_vec = s_i32_vec.to(fx.Float32)
+                    for elem in range_constexpr(ELEMS_PER_TILE):
+                        s_f32_loc.append(s_f32_vec[elem])
+            else:
+                qk_scale_v16_loc = Vec.from_elements(
+                    [qk_scale_loc], fx.Float32
+                ).broadcast_to(16)
+                s_f32_loc = []
+                for st in range_constexpr(N_SUBTILES):
+                    s_i32_vec = Vec(s_accs_loc[st])
+                    s_f32_vec = s_i32_vec.to(fx.Float32)
+                    s_scaled_vec = Vec(
+                        arith.mulf(s_f32_vec, qk_scale_v16_loc, fastmath=fm_fast)
+                    )
+                    for elem in range_constexpr(ELEMS_PER_TILE):
+                        s_f32_loc.append(s_scaled_vec[elem])
 
             # 3) Mask
             kv_start_i32_loc = fx.Int32(
@@ -900,11 +914,19 @@ def build_sage_attn_cdna_module(
                     _scf.YieldOp([_raw(v) for v in s_f32_loc])
                 s_f32_loc = list(if_op.results)
 
-            # 4) Softmax
+            # 4) Softmax. Non-causal folds the deferred qk_scale into the
+            # diff FMA via `contract` (preserves -inf semantics for OOB tile
+            # masking while still allowing mul+add → fma fusion). Causal
+            # stays on the eager-scale path with full `fast` fastmath.
             local_max_l = s_f32_loc[0]
             for r in range_constexpr(NUM_S_VALS - 1):
                 local_max_l = _fmax(local_max_l, s_f32_loc[r + 1])
             row_max_l = row_max_reduce(local_max_l)
+            if const_expr(not CAUSAL):
+                fm_contract = arith.FastMathFlags.contract
+                row_max_l = arith.mulf(
+                    _raw(row_max_l), _raw(qk_scale_loc), fastmath=fm_contract
+                )
             m_new_l = _fmax(m_in, row_max_l)
             diff_m_l = _fsub(m_in, m_new_l)
             corr_l = rocdl.exp2(ir.F32Type.get(), _raw(diff_m_l))
@@ -912,7 +934,13 @@ def build_sage_attn_cdna_module(
             p_vals_l = []
             local_sum_l = _raw(c_zero_f)
             for r in range_constexpr(NUM_S_VALS):
-                diff = _fadd(s_f32_loc[r], neg_max_l)
+                if const_expr(not CAUSAL):
+                    scaled = arith.mulf(
+                        _raw(s_f32_loc[r]), _raw(qk_scale_loc), fastmath=fm_contract
+                    )
+                    diff = arith.addf(scaled, _raw(neg_max_l), fastmath=fm_contract)
+                else:
+                    diff = _fadd(s_f32_loc[r], neg_max_l)
                 p = rocdl.exp2(ir.F32Type.get(), _raw(diff))
                 p_vals_l.append(p)
                 local_sum_l = _fadd(local_sum_l, p)
