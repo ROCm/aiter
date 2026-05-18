@@ -126,12 +126,10 @@ def test_fp8_mqa_logits(
     q_fp8 = q.to(e4m3_type)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
 
+    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits)
     ref_logits, ref_cost = ref_fp8_mqa_logits(
         q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
     )
-
-    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits)
-
     # If clean_logits is not set, clean the rest for testing
     if not clean_logits:
         assert logits.size() == (s_q, s_k)
