@@ -5,7 +5,7 @@
 //
 // Scoring functions (selected by string at the C++ entry):
 //   "sqrtsoftplus"  → sqrt(softplus(x))   — DeepSeek V4-Pro default
-//   "sigmoid"       → sigmoid(x)          — DeepSeek V4-Pro / Llama4
+//   "sigmoid"       → sigmoid(x)          — Llama4
 //   "softmax"       → softmax(x)          — DeepSeek V3 / classic MoE
 //
 // Kernel variants:
@@ -13,10 +13,11 @@
 //   topk_softplus_kernel      — shared-memory fallback (any expert count)
 
 #include "aiter_hip_common.h"
-#include "aiter_stream.h"
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
 #include "aiter_opus_plus.h"
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_runtime.h>
 #include <hipcub/hipcub.hpp>
 #include <torch/all.h>
@@ -31,12 +32,15 @@ namespace aiter {
 enum { SCORE_SQRTSOFTPLUS = 0, SCORE_SIGMOID = 1, SCORE_SOFTMAX = 2 };
 
 // Fused DPP warp argmax: 6× v_max_f32+DPP + ballot + ctzll + readlane ≈ 9 instr.
+// NaN-safe: if all lanes have NaN (val_o == max_val is always false), ballot is 0
+// and ctzll(0) is UB.  Detect this via the ballot result and fall back to lane 0.
 __device__ __forceinline__ void warpReduceMax_softplus(float& val_o, int& idx)
 {
-    float max_val = multithread_reduce_max_dpp<WARP_SIZE>(val_o);
-    int win_lane  = __builtin_ctzll(__ballot(val_o == max_val));
-    idx           = __builtin_amdgcn_readlane(idx, win_lane);
-    val_o         = max_val;
+    float max_val   = multithread_reduce_max_dpp<WARP_SIZE>(val_o);
+    uint64_t mask   = __ballot(val_o == max_val);
+    int win_lane    = (mask != 0) ? __builtin_ctzll(mask) : 0;
+    idx             = __builtin_amdgcn_readlane(idx, win_lane);
+    val_o           = max_val;
 }
 
 template <int SCORE_FUNC>
@@ -55,10 +59,10 @@ __device__ __forceinline__ float compute_score(float x)
     else
     {
         // sqrt(softplus(x)) = sqrt(log(1 + exp(x)))
-        // exp2f maps to v_exp_f32 HW instruction; log1pf preserves precision near 1.
-        // For extra speed (~20-35%) at ~0.5 ULP cost, replace log1pf with:
-        //   log2f(1.0f + exp_x) * 0.6931471805599453f
-        float sp = x > 20.0f ? x : log1pf(exp2f(x * 1.4426950408889634f));
+        // Highest-precision path: pure libm (expf + log1pf), ≤1 ULP.
+        // Faster alternatives (commented out, ~0.5-1 ULP extra error):
+        //   float sp = x > 20.0f ? x : log1pf(exp2f(x * 1.4426950408889634f));   // exp2f HW
+        float sp = x > 20.0f ? x : log2f(1.0f + exp2f(x * 1.4426950408889634f)) * 0.6931471805599453f;  // both HW
         return sqrtf(sp);
     }
 }
@@ -139,6 +143,11 @@ __device__ __forceinline__ void sort_network_desc(float* vals, float* orig, int*
 // via an optimal sorting network, then participates in a warp-level k-way
 // merge (iterative argmax) to extract the global top-K.
 // No shared memory, no __syncthreads.
+//
+// 1 warp = 1 token = 1 block.  Multi-warp-per-block was tried (WPB=2,4) and
+// regressed K≥4 cases (extra register pressure / wave-scheduling overhead),
+// while only marginally helping K=1~2.  K-merge serial chain is the actual
+// bottleneck, not block-launch overhead.
 // ---------------------------------------------------------------------------
 
 template <typename DTYPE_I, typename DTYPE_B, int NUM_EXPERTS,
@@ -403,11 +412,35 @@ void topk_softplus(torch::Tensor& topk_weights,
     const size_t stride_tk = topk_indices.stride(0);
     const bool has_bias    = correction_bias.numel() > 0;
 
+    // Both kernels assign one lane per top-K winner during writeout
+    // (`if (lane == k) topk_value = ...`), so topk must fit in a single warp
+    // and cannot exceed the number of routable experts.  Fail fast with a
+    // clear error rather than silently producing partial / wrong output.
+    AITER_CHECK(topk <= static_cast<int>(WARP_SIZE),
+                "topk (", topk, ") exceeds WARP_SIZE (", WARP_SIZE, ")");
+    AITER_CHECK(topk <= num_experts,
+                "topk (", topk, ") exceeds num_experts (", num_experts, ")");
+
+    // Softmax outputs are already a probability distribution that sums to 1
+    // across the routed top-K (post-selection); a second renorm would distort
+    // those weights.  Enforce here so direct C++ callers behave the same as
+    // the Python topk_gating() wrapper (which already forces this).
+    if(sf_code == SCORE_SOFTMAX)
+    {
+        need_renorm = false;
+    }
+
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());
 
-    HipDeviceGuard device_guard(gating_output.get_device());
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    // Use PyTorch's current stream so that the kernel runs on the same stream
+    // as the surrounding torch ops (avoids race conditions and works with CUDA
+    // graph capture).
+    // TODO: when this op is migrated to aiter_tensor_t (and @compile_ops uses
+    //       develop=True), switch to aiter::getCurrentHIPStream() — the wrapper
+    //       will then sync torch.cuda.current_stream() before each call.
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const auto gating_st = gating_output.scalar_type();
     const auto bias_st   = has_bias ? correction_bias.scalar_type() : gating_st;

@@ -87,12 +87,19 @@ def parse_csv(csv_path: str):
             )
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
-            # TODO: Replace this GPT-OSS-specific bias inference with an
-            # explicit CSV/config field once the model config can express it.
+            q_dtype_w = row.get("q_dtype_w", "")
+            q_dtype_a = row.get("q_dtype_a", "")
+            # Match the RT condition in fused_moe.py / test_moe_2stage.py:
+            #   _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == fp4x2
+            #   AND the caller actually passes a bias tensor (bias1 is not None).
+            # Bias is passed only when q_dtype_a is fp8 or bf16 (NOT fp4x2).
+            # For pure a4w4 models (q_dtype_a == fp4x2), bias1=None regardless of
+            # activation type (Silu or Swiglu), so enable_bias=False.
             enable_bias = (
-                act == "swiglu"
-                and q_type.strip().split(".")[-1] == "per_1x32"
+                q_type.strip().split(".")[-1] == "per_1x32"
                 and dtype in ("torch.bfloat16", "torch.float16")
+                and "float4_e2m1fn_x2" in q_dtype_w
+                and "float4_e2m1fn_x2" not in q_dtype_a  # fp8/bf16 activation only
             )
 
             for col in ("kernelName1", "kernelName2"):
@@ -186,6 +193,8 @@ def _precompile_to_cache(
             return torch.float16
         if dtype == "bf16":
             return torch.bfloat16
+        if dtype == "int4":
+            return torch.int4
         return torch.int8
 
     def _aot_sort_blocks() -> int:
@@ -358,12 +367,14 @@ def _precompile_to_cache(
                 out = torch.zeros(
                     tokens * topk * inter_dim, device=dev, dtype=torch.bfloat16
                 )
-                a = torch.zeros(tokens * model_dim, device=dev, dtype=torch.int8)
-                w = torch.zeros(
-                    E * 2 * inter_dim * model_dim, device=dev, dtype=torch.int8
-                )
+                # torch.zeros doesn't support int4 on CPU; use torch.empty for sub-byte types
+                _a_dtype_torch = _storage_dtype(a_dtype)
+                _b_dtype_torch = _storage_dtype(b_dtype)
+                a = torch.empty(1, device=dev, dtype=_a_dtype_torch)
+                w = torch.empty(1, device=dev, dtype=_b_dtype_torch)
                 a_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-                w_scale = torch.zeros(1, device=dev, dtype=torch.float32)
+                # W4A16 groupwise scales are bf16 (scale_is_bf16=True in compile_moe_gemm1)
+                w_scale = torch.zeros(1, device=dev, dtype=torch.bfloat16)
                 args = _s1_args_std(
                     out,
                     a,
@@ -454,10 +465,14 @@ def _precompile_to_cache(
                 )
             else:
                 out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
-                a = torch.zeros(tokens * topk * inter_dim, device=dev, dtype=torch.int8)
-                w = torch.zeros(E * model_dim * inter_dim, device=dev, dtype=torch.int8)
+                # torch.zeros doesn't support int4 on CPU; use torch.empty for sub-byte types
+                _a_dtype_torch = _storage_dtype(a_dtype)
+                _b_dtype_torch = _storage_dtype(b_dtype)
+                a = torch.empty(1, device=dev, dtype=_a_dtype_torch)
+                w = torch.empty(1, device=dev, dtype=_b_dtype_torch)
                 a_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-                w_scale = torch.zeros(1, device=dev, dtype=torch.float32)
+                # W4A16 groupwise scales are bf16 (scale_is_bf16=True in compile_moe_gemm1)
+                w_scale = torch.zeros(1, device=dev, dtype=torch.bfloat16)
                 args = _s2_args_std(
                     out,
                     a,

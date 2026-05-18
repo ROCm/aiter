@@ -12,6 +12,12 @@ from ..jit.utils.chip_info import get_cu_num
 from ..utility import dtypes
 
 
+# DEPRECATED: low-level binding kept for backward compatibility only.
+# Will be removed once all callers have migrated to topk_gating() below.
+# New code should use topk_gating(), which:
+#   - accepts an Optional[Tensor] correction_bias (None => no bias)
+#   - validates score_func string
+#   - exposes the same C++ kernel under a more accurate name
 @compile_ops("module_moe_topk")
 def topk_softplus(
     topk_weights: torch.Tensor,
@@ -40,7 +46,7 @@ def topk_gating(
 
     Args:
         score_func: one of {"sqrtsoftplus" (DeepSeek V4-Pro default),
-                            "sigmoid" (DeepSeek V4-Pro / Llama4),
+                            "sigmoid" (Llama4),
                             "softmax" (DeepSeek V3 / classic MoE)}.
         correction_bias: optional bias tensor, pass None for no bias.
 
@@ -50,7 +56,11 @@ def topk_gating(
         score_func in _VALID_SCORE_FUNCS
     ), f"Unknown score_func '{score_func}', expected one of {_VALID_SCORE_FUNCS}"
     if correction_bias is None:
-        correction_bias = torch.empty(0, device=gating_output.device)
+        # Match gating dtype/device so dispatch picks DTYPE_B == DTYPE_I,
+        # avoiding extra kernel template instantiations.
+        correction_bias = torch.empty(
+            0, dtype=gating_output.dtype, device=gating_output.device
+        )
     if score_func == "softmax":
         need_renorm = False
     topk_softplus(

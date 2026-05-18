@@ -15,6 +15,7 @@ This test can be run in two ways:
 
 import argparse
 import itertools
+import sys
 
 import pandas as pd
 import pytest
@@ -25,6 +26,13 @@ from aiter.test_common import (
     perftest,
 )
 from aiter.utility.dtypes import str2Dtype, str2tuple
+
+# NOTE on correctness metrics by score function:
+# - sigmoid uses element-wise comparison (score_errors/index_errors) because
+#   both torch/topk and fused paths return sorted top-K.
+# - softplus/softmax use set-based ID matching (id_errors/max_weight_err)
+#   because torch references intentionally use `topk(..., sorted=False)` to
+#   mirror routing behavior where top-K order is not semantically required.
 
 
 @perftest(num_iters=10, num_warmup=1)
@@ -44,16 +52,13 @@ def run_fused(gating_output: torch.Tensor, topk: int):
     router_indices = torch.empty(
         (tokens, topk), dtype=torch.int32, device=gating_output.device
     )
-    if num_experts <= 128:
-        aiter.topk_sigmoid(router_scores, router_indices, gating_output)
-    else:
-        aiter.topk_gating(
-            router_scores,
-            router_indices,
-            gating_output,
-            score_func="sigmoid",
-            need_renorm=False,
-        )
+    aiter.topk_gating(
+        router_scores,
+        router_indices,
+        gating_output,
+        score_func="sigmoid",
+        need_renorm=False,
+    )
     return router_scores, router_indices
 
 
@@ -324,12 +329,18 @@ def benchmark_topk_softmax(
 
 
 # Pytest-parametrized test functions -- topk_softplus
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# Mirrors DeepSeek-V4 model integration: gating fp32 + bias fp32 is the default.
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("bias_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("topk", [1, 2, 4, 6, 8])
 @pytest.mark.parametrize("num_tokens", [64, 1024, 2048])
 @pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
-def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype):
-    """Pytest test for correctness of topk_softplus (sqrtsoftplus) operation."""
+def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype, bias_dtype):
+    """Pytest test for correctness of topk_softplus (sqrtsoftplus) operation.
+
+    Covers the DeepSeek-V4-Pro use case: router_logits=fp32, bias=fp32.
+    Also covers fp16/bf16 gating with mixed bias dtypes.
+    """
     torch.random.manual_seed(0)
     route_scale = 2.5
 
@@ -340,7 +351,9 @@ def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype):
     )
     permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
     gating_output = torch.gather(gating_output, dim=-1, index=permutation)
-    bias = torch.randn(num_experts, dtype=dtype, device="cuda") * 0.1
+    bias = (torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1).to(
+        bias_dtype
+    )
 
     (w_torch, i_torch), _ = run_torch_softplus(
         gating_output.clone(), bias, topk, True, route_scale
@@ -353,9 +366,10 @@ def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype):
     for t in range(num_tokens):
         kern_set = set(i_fused[t].tolist())
         ref_set = set(i_torch[t].tolist())
-        assert (
-            kern_set == ref_set
-        ), f"Token {t}: ID mismatch kernel={sorted(kern_set)} ref={sorted(ref_set)}"
+        assert kern_set == ref_set, (
+            f"Token {t} (gating={dtype},bias={bias_dtype},E={num_experts},topk={topk}): "
+            f"ID mismatch kernel={sorted(kern_set)} ref={sorted(ref_set)}"
+        )
 
     # compare weights (match by expert id)
     for t in range(num_tokens):
@@ -470,8 +484,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str2Dtype,
-        default=[torch.float16, torch.bfloat16],
-        help="Comma-separated list of dtypes: fp16, bf16 (default: fp16,bf16)",
+        default=[torch.float16, torch.bfloat16, torch.float32],
+        help="Comma-separated list of dtypes: fp16, bf16, fp32 (default: fp16,bf16,fp32)",
     )
     parser.add_argument(
         "--test",
@@ -490,6 +504,10 @@ if __name__ == "__main__":
     num_tokens_list = to_list(args.num_tokens)
     topk_list = to_list(args.topk)
     dtype_list = to_list(args.dtype)
+
+    # Track whether any benchmark section saw a correctness regression
+    # (id_errors > 1%); exit non-zero at the end so CI catches it.
+    failed_sections: list[str] = []
 
     if args.test in ("sigmoid", "all"):
         sigmoid_experts = [e for e in num_experts_list]
@@ -511,6 +529,12 @@ if __name__ == "__main__":
         df = pd.DataFrame(collected)
         print(df.to_string(index=False))
         print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
+        # benchmark_topk_sigmoid uses {score,index}_errors columns
+        errors = df[(df["index_errors"] > 0.01) | (df["score_errors"] > 0.01)]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} sigmoid config(s) had errors > 1%!")
+            print(errors.to_string(index=False))
+            failed_sections.append("sigmoid")
 
     if args.test in ("softplus", "all"):
         softplus_configs = list(
@@ -530,10 +554,11 @@ if __name__ == "__main__":
         print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
         errors = df[df["id_errors"] > 0.01]
         if len(errors) > 0:
-            print(f"\nWARNING: {len(errors)} config(s) had id errors > 1%!")
+            print(f"\nERROR: {len(errors)} softplus config(s) had id errors > 1%!")
             print(errors.to_string(index=False))
+            failed_sections.append("softplus")
         else:
-            print("All tests passed!")
+            print("All softplus tests passed!")
 
     if args.test in ("softmax", "all"):
         softmax_configs = list(
@@ -553,8 +578,17 @@ if __name__ == "__main__":
         print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
         errors = df[df["id_errors"] > 0.01]
         if len(errors) > 0:
-            print(f"\nWARNING: {len(errors)} config(s) had id errors > 1%!")
+            print(f"\nERROR: {len(errors)} softmax config(s) had id errors > 1%!")
             print(errors.to_string(index=False))
+            failed_sections.append("softmax")
         else:
-            print("All tests passed!")
+            print("All softmax tests passed!")
     print("=" * 80)
+
+    if failed_sections:
+        print(
+            f"FAIL: correctness regression in section(s): "
+            f"{', '.join(failed_sections)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
