@@ -1820,6 +1820,198 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                                     eps);
 }
 
+template <typename T, typename OutT, int ngpus>
+__global__ void __launch_bounds__(1024, 1)
+    allreduce_fusion_kernel_1stage_old_ca(RankData* _dp,
+                                          RankSignals sg,
+                                          Signal* self_sg,
+                                          int rank,
+                                          T* __restrict__ residual_inp,
+                                          T* __restrict__ residual_out,
+                                          OutT* __restrict__ output,
+                                          T* __restrict__ weight,
+                                          float* __restrict__ scale_out,
+                                          int size,
+                                          int hidden_dim,
+                                          float eps)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    int block_size          = hidden_dim / pack_size;
+    bool active             = (int)threadIdx.x < block_size;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int tidx                = blockIdx.x;
+    int access_id_in_token  = threadIdx.x * pack_size;
+    int idx                 = tidx * hidden_dim + access_id_in_token;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    A acc{};
+    P vec{};
+    P weight_p{};
+    if(active)
+    {
+        vec = ptrs[0][idx / pack_size];
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            acc[v] = upcast_s(vec[v]);
+        }
+
+#pragma unroll
+        for(int r = 1; r < ngpus; ++r)
+        {
+            vec = ptrs[r][idx / pack_size];
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+            {
+                acc[v] += upcast_s(vec[v]);
+            }
+        }
+
+        // Match unfused allreduce -> bf16/fp16 -> residual-add numerics.
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            acc[v] = upcast_s(downcast_s<T>(acc[v]));
+        }
+
+        P res = *reinterpret_cast<P*>(residual_inp + idx);
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            acc[v] += upcast_s(res[v]);
+        }
+
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            vec[v] = downcast_s<T>(acc[v]);
+        }
+        *reinterpret_cast<P*>(residual_out + idx) = vec;
+        weight_p = *reinterpret_cast<P*>(weight + access_id_in_token);
+    }
+
+    int padded_block_size = (int)blockDim.x;
+    ar_fusion_epilogue<P, A, T, OutT, pack_size>(
+        acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size, output, scale_out, active);
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+template <typename T, typename OutT, int NGPUS>
+void allreduce_fusion_kernel_1stage_old_ca_launcher(RankData* _dp,
+                                                    RankSignals sg,
+                                                    Signal* self_sg,
+                                                    int rank,
+                                                    T* residual_inp,
+                                                    T* residual_out,
+                                                    OutT* output,
+                                                    T* weight,
+                                                    float* scale_out,
+                                                    int size,
+                                                    int hidden_dim,
+                                                    float eps,
+                                                    hipStream_t stream)
+{
+    constexpr int PACK_SIZE  = 16 / sizeof(T);
+    constexpr int WARP_SIZE  = 32;
+    int BLOCK_SIZE           = hidden_dim / PACK_SIZE;
+    int LAUNCH_THREADS       = ((BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+    int token_num            = size / hidden_dim;
+    if(token_num > kMaxBlocks)
+        throw std::runtime_error(
+            "Token number is too large for allreduce_fusion_kernel_1stage_old_ca kernel");
+    dim3 threadsPerBlock(LAUNCH_THREADS);
+    dim3 numBlocks(token_num);
+    allreduce_fusion_kernel_1stage_old_ca<T, OutT, NGPUS>
+        <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
+                                                    sg,
+                                                    self_sg,
+                                                    rank,
+                                                    residual_inp,
+                                                    residual_out,
+                                                    output,
+                                                    weight,
+                                                    scale_out,
+                                                    size,
+                                                    hidden_dim,
+                                                    eps);
+}
+
+template <typename T, int tnum, int n_loop>
+__global__ void __launch_bounds__(tnum, 1) local_tensor_load_rmsnorm_old_ca(
+    T* __restrict__ reduce_out,
+    T* __restrict__ residual_inp,
+    T* __restrict__ residual_out,
+    T* __restrict__ output,
+    T* __restrict__ weight,
+    float eps,
+    int m,
+    int n)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    __shared__ float smem[tnum];
+
+    for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
+    {
+        float square_sum = 0.0f;
+        A rms_inp_f32[n_loop];
+        P w_arr[n_loop];
+#pragma unroll
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
+        {
+            if(n_iter * tnum + threadIdx.x < (n / pack_size))
+            {
+                int read_idx        = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
+                P reduce_out_pack   = *(reinterpret_cast<P*>(reduce_out) + read_idx);
+                P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
+                w_arr[n_iter]       = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
+                A reduce_pack;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    float rms_inp = upcast_s(reduce_out_pack[i]) + upcast_s(residual_inp_pack[i]);
+                    rms_inp_f32[n_iter][i] = rms_inp;
+                    reduce_pack[i] = rms_inp * rms_inp;
+                }
+                square_sum += packReduce<AddFunctor, float, pack_size>(reduce_pack);
+            }
+        }
+        smem[threadIdx.x] = square_sum;
+        __syncthreads();
+        smemReduceSum<tnum>(&smem[0]);
+        float denom = rsqrtf(smem[0] / n + eps);
+
+#pragma unroll
+        for(int n_iter = 0; n_iter < n_loop; ++n_iter)
+        {
+            if(n_iter * tnum + threadIdx.x < (n / pack_size))
+            {
+                P rmsnorm_rslt;
+                P rmsnorm_inp;
+#pragma unroll
+                for(int i = 0; i < pack_size; ++i)
+                {
+                    float x_f32     = rms_inp_f32[n_iter][i];
+                    float w_f32     = upcast_s(w_arr[n_iter][i]);
+                    rmsnorm_inp[i]  = downcast_s<T>(x_f32);
+                    rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
+                }
+                int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
+                *(reinterpret_cast<P*>(output) + write_idx)       = rmsnorm_rslt;
+                *(reinterpret_cast<P*>(residual_out) + write_idx) = rmsnorm_inp;
+            }
+        }
+    }
+}
+
 template <typename T, int ngpus, int WARP_SIZE>
 __global__ void __launch_bounds__(1024, 1)
     qknorm_allreduce_fusion_kernel_2stage(RankData* _dp,
@@ -3111,7 +3303,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    float eps,
                                    int m,
                                    int n,
-                                   bool use_1stage)
+                                   bool use_1stage,
+                                   bool use_new = true)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -3130,6 +3323,99 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
 
     auto pack_size = 16 / sizeof(T);
     use_1stage     = use_1stage && (n % pack_size == 0) && (n / pack_size <= 1024);
+
+    if(!use_new)
+    {
+        if(use_1stage)
+        {
+#define DISPATCH_OLD_CA_1S_KERNEL(NGPUS)                                      \
+    allreduce_fusion_kernel_1stage_old_ca_launcher<T, T, NGPUS>(ptrs,          \
+                                                               sg_,            \
+                                                               self_sg_,       \
+                                                               rank_,          \
+                                                               residual_inp,   \
+                                                               residual_out,   \
+                                                               output,         \
+                                                               weight,         \
+                                                               nullptr,        \
+                                                               size,           \
+                                                               n,              \
+                                                               eps,            \
+                                                               stream);        \
+    return;
+            switch(world_size_)
+            {
+            case 8: DISPATCH_OLD_CA_1S_KERNEL(8); break;
+            case 4: DISPATCH_OLD_CA_1S_KERNEL(4); break;
+            case 2: DISPATCH_OLD_CA_1S_KERNEL(2); break;
+            default:
+                throw std::runtime_error(
+                    "old-CA fused allreduce rmsnorm: unsupported world_size=" +
+                    std::to_string(world_size_));
+            }
+#undef DISPATCH_OLD_CA_1S_KERNEL
+        }
+
+        allreduce<T>(stream, input, residual_out, size, /*use_new=*/false);
+
+        dim3 block(512);
+        dim3 grid;
+        auto setGrid = [&](int naive_grid_size, const void* kernel_ptr) {
+            int occupancy;
+            hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel_ptr, block.x, 0);
+            grid.x = naive_grid_size < num_cu * occupancy ? naive_grid_size : num_cu * occupancy;
+        };
+
+#define LAUNCH_OLD_CA_RMS_SPLIT(template_kernel)                               \
+    do                                                                         \
+    {                                                                          \
+        auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);      \
+        setGrid(naive_grid_size, kernel_ptr);                                  \
+        template_kernel<<<grid, block, 0, stream>>>(                           \
+            residual_out, residual_inp, residual_out, output, weight, eps, m, n); \
+    } while(0)
+
+        constexpr int ar_pack_size = 16 / sizeof(T);
+        int n_packs                = n / ar_pack_size;
+        int naive_grid_size        = m;
+        if(n_packs >= 256)
+        {
+            int n_loop = (n_packs + 511) / 512;
+            switch(n_loop)
+            {
+            case 1: LAUNCH_OLD_CA_RMS_SPLIT((local_tensor_load_rmsnorm_old_ca<T, 512, 1>)); break;
+            case 2: LAUNCH_OLD_CA_RMS_SPLIT((local_tensor_load_rmsnorm_old_ca<T, 512, 2>)); break;
+            case 3: LAUNCH_OLD_CA_RMS_SPLIT((local_tensor_load_rmsnorm_old_ca<T, 512, 3>)); break;
+            case 4: LAUNCH_OLD_CA_RMS_SPLIT((local_tensor_load_rmsnorm_old_ca<T, 512, 4>)); break;
+            default:
+                throw std::runtime_error(
+                    "old-CA fused allreduce rmsnorm: n too large, m=" +
+                    std::to_string(m) + " n=" + std::to_string(n));
+            }
+        }
+        else if(n_packs >= 64)
+        {
+            block.x    = 256;
+            int n_loop = (n_packs + 255) / 256;
+            switch(n_loop)
+            {
+            case 1: LAUNCH_OLD_CA_RMS_SPLIT((local_tensor_load_rmsnorm_old_ca<T, 256, 1>)); break;
+            case 2: LAUNCH_OLD_CA_RMS_SPLIT((local_tensor_load_rmsnorm_old_ca<T, 256, 2>)); break;
+            default:
+                throw std::runtime_error(
+                    "old-CA fused allreduce rmsnorm: n too large for tnum=256, m=" +
+                    std::to_string(m) + " n=" + std::to_string(n));
+            }
+        }
+        else
+        {
+            throw std::runtime_error(
+                "old-CA fused allreduce rmsnorm: n too small, m=" + std::to_string(m) +
+                " n=" + std::to_string(n) + " n_packs=" + std::to_string(n_packs));
+        }
+#undef LAUNCH_OLD_CA_RMS_SPLIT
+        return;
+    }
 #define MAYBE_DISPATCH_1S_KERNEL(NGPUS)                                            \
     if(use_1stage)                                                                 \
     {                                                                              \

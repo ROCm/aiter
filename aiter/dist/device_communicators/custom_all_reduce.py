@@ -685,6 +685,7 @@ class CustomAllreduce:
         registered: bool = False,
         use_1stage: bool = False,
         post_per_token_quant: bool = False,
+        use_new: bool = True,
     ):
         if res_out is None:
             res_out = torch.empty_like(inp)
@@ -705,6 +706,7 @@ class CustomAllreduce:
                 reg,
                 reg_bytes,
                 use_1stage,
+                use_new,
             )
             return out, res_out
         else:
@@ -737,10 +739,16 @@ class CustomAllreduce:
         weight: torch.Tensor,
         eps: float,
         use_1stage: bool,
+        use_new: bool = True,
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
+        if not use_new and input.shape[0] <= 80:
+            # The legacy-CA single-kernel path supports up to kMaxBlocks (80)
+            # tokens. Prefer it over the use-new byte threshold to keep graph
+            # capture on the single-kernel path for decode-sized batches.
+            use_1stage = True
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.fused_ar_rms(
@@ -750,6 +758,7 @@ class CustomAllreduce:
                     eps=eps,
                     registered=True,
                     use_1stage=use_1stage,
+                    use_new=use_new,
                 )
             else:
                 return torch.zeros_like(input), torch.zeros_like(input)
@@ -761,6 +770,7 @@ class CustomAllreduce:
                 eps=eps,
                 registered=False,
                 use_1stage=use_1stage,
+                use_new=use_new,
             )
 
     def custom_fused_ar_rms_quant(

@@ -76,6 +76,7 @@ def fused_allreduce_rmsnorm(
     reg_ptr: int,
     reg_bytes: int,
     use_1stage: bool,
+    use_new: bool = True,
 ) -> None: ...
 
 
