@@ -1395,7 +1395,7 @@ def compile_ops(
     gen_fake: Optional[Callable[..., Any]] = None,
     ffi_type: str = "pybind",
     develop: bool = False,
-    mutates_args: Union[bool, List[str]] = "unknown",
+    mutates_args: Union[str, List[str]] = "unknown",
 ):
     def decorator(func):
         loadName = fc_name if fc_name is not None else func.__name__
