@@ -246,7 +246,10 @@ def gen_fmha_v3_fwd_fake_tensors(
 
 
 @compile_ops(
-    "module_fmha_v3_fwd", fc_name="fmha_v3_fwd", gen_fake=gen_fmha_v3_fwd_fake_tensors
+    "module_fmha_v3_fwd",
+    fc_name="fmha_v3_fwd",
+    gen_fake=gen_fmha_v3_fwd_fake_tensors,
+    mutates_args=[],
 )
 def fmha_v3_fwd(
     q: Tensor,

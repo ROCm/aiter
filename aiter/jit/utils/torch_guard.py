@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 from packaging import version
 from packaging.version import Version
 import importlib
@@ -75,7 +75,7 @@ NONE_WRAPPED_OP = [
     "qr_destroy",
     "qr_open_handles",
     "qr_get_handle",
-    # These take pybind aiter_tensor_t, not torch.Tensor — incompatible with torch.compile
+    # These take pybind aiter_tensor_t, not torch.Tensor -- incompatible with torch.compile
     "all_reduce",
     "reduce_scatter",
     "all_gather_reg",
@@ -224,7 +224,7 @@ def torch_compile_guard(
             aiter_lib = Library("aiter", "FRAGMENT") if aiter_lib is None else aiter_lib
             schema = ""
             if calling_func.__name__ in MANUAL_SCHEMA_OPS:
-                schema = generate_schema(calling_func)
+                schema = generate_schema(calling_func, mutates_args=mutates_args)
             else:
                 sig = inspect.signature(calling_func)
                 if hasattr(torch.library, "infer_schema"):

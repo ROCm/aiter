@@ -247,7 +247,7 @@ def gen_gemm_a16w16_fake_tensor(
     )
 
 
-@torch_compile_guard(gen_fake=gen_gemm_a16w16_fake_tensor)
+@torch_compile_guard(mutates_args=[], gen_fake=gen_gemm_a16w16_fake_tensor)
 def gemm_a16w16(
     A: Tensor,
     B: Tensor,
