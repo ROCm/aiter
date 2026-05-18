@@ -2,6 +2,9 @@
 rocprof_*/
 rocprofv3_*/
 .rocprofv3/
+# But keep the analysis scripts + doc directory
+!rocprof_analysis/
+ua-test-scripts/rocprof_analysis/runs/
 
 # Sweep results
 sk_sweep_*.png
