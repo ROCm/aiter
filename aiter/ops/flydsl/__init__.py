@@ -42,6 +42,7 @@ if is_flydsl_available():
     from .fmha_kernels import flydsl_flash_attn_func
 
     # from .linear_attention_kernels import flydsl_gdr_decode
+    # from .linear_attention_prefill_kernels import flydsl_gdr_prefill
 
     __all__ += [
         "flydsl_preshuffle_gemm_a8",
@@ -50,4 +51,5 @@ if is_flydsl_available():
         "flydsl_hgemm",
         "flydsl_flash_attn_func",
         # "flydsl_gdr_decode",
+        # "flydsl_gdr_prefill",
     ]

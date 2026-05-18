@@ -27,24 +27,8 @@ def calculate_tflops(start_inds, end_inds, num_heads_q, head_dim, time_ms):
 
 
 def run_benchmark(args):
-    x_names = [
-        "batch_size",
-        "seq_q_l",
-        "seq_kv_l",
-        "num_heads_q",
-        "head_dim",
-        "clean_logits",
-    ]
-    x_vals_list = [
-        [
-            args.batch_size,
-            args.seq_q_l,
-            args.seq_kv_l,
-            args.num_heads_q,
-            args.head_dim,
-            args.clean_logits,
-        ]
-    ]
+    x_names = ["seq_q_l", "seq_kv_l", "num_heads_q", "head_dim"]
+    x_vals_list = [[args.seq_q_l, args.seq_kv_l, args.num_heads_q, args.head_dim]]
     if args.metric == "time":
         ylabel = "Time (ms)"
     elif args.metric == "throughput":
@@ -68,37 +52,24 @@ def run_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_fp8_mqa_logits(
-        batch_size,
-        seq_q_l,
-        seq_kv_l,
-        num_heads_q,
-        head_dim,
-        clean_logits,
-        metric,
-        **kwargs,
+        seq_q_l, seq_kv_l, num_heads_q, head_dim, metric, **kwargs
     ):
-        s_q = batch_size * seq_q_l
-        s_k = batch_size * seq_kv_l
+        q = torch.randn(
+            seq_q_l, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        kv = torch.randn(seq_kv_l, head_dim, device="cuda", dtype=torch.bfloat16)
+        weights = torch.randn(seq_q_l, num_heads_q, device="cuda", dtype=torch.float32)
 
-        q = torch.randn(s_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16)
-        kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
-        kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-        kv = (kv_fp8.to(torch.float32) * scales[:, None]).to(torch.bfloat16)
-        weights = torch.randn(s_q, num_heads_q, device="cuda", dtype=torch.float32)
-
-        ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
-        ke = torch.zeros(s_q, dtype=torch.int, device="cuda")
-        arange_q = torch.arange(seq_q_l, dtype=torch.int, device="cuda")
-        for b in range(batch_size):
-            qs = b * seq_q_l
-            kvs = b * seq_kv_l
-            ks[qs : qs + seq_q_l] = kvs
-            ke[qs : qs + seq_q_l] = kvs + (seq_kv_l - seq_q_l) + arange_q + 1
+        ks = torch.zeros(seq_q_l, dtype=torch.int, device="cuda")
+        ke = torch.arange(seq_q_l, dtype=torch.int, device="cuda") + (
+            seq_kv_l - seq_q_l
+        )
 
         q_fp8 = q.to(e4m3_dtype)
+        kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
 
         def func():
-            return fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits)
+            return fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke)
 
         time_ms = triton.testing.do_bench(func, warmup=25, rep=100)
         tflops = calculate_tflops(ks, ke, num_heads_q, head_dim, time_ms)
@@ -119,7 +90,6 @@ def main():
         description="FP8 MQA Logits Benchmark",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--batch_size", type=int, default=1, help="batch size")
     parser.add_argument("--num_heads_q", type=int, default=64, help="num. q heads")
     parser.add_argument("--head_dim", type=int, default=128, help="head dim size")
     parser.add_argument(
@@ -127,9 +97,6 @@ def main():
     )
     parser.add_argument(
         "--seq_kv_l", type=int, default=4096, help="Output sequence length"
-    )
-    parser.add_argument(
-        "--clean_logits", type=int, default=1, help="Clean the untouched logits"
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
