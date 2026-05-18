@@ -63,11 +63,11 @@ AITER_MOE_SKIP_REF=0 AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AI
 # original ``[:, :2880]`` slice is bit-identical to the unpadded run.
 AITER_K_TILE_ALIGN_PAD=1 AITER_MOE_SKIP_REF=0 AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
   -t 1 -dim 2880,2880 -e 128 -k 4 -q 7 -a swiglu --no-flydsl-csv -hip 0,0 \
-  -tn 128 -tk 512 -bm 16 --stage2-tile-n 256 --stage2-tile-k 256
+  -tn 256 -tk 512 -bm 16 --stage2-tile-n 256 --stage2-tile-k 256
 
 AITER_K_TILE_ALIGN_PAD=1 AITER_MOE_SKIP_REF=0 AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
   -t 64 -dim 2880,2880 -e 128 -k 4 -q 7 -a swiglu --no-flydsl-csv -hip 0,0 \
-  -tn 128 -tk 512 -bm 16 --stage2-tile-n 256 --stage2-tile-k 256
+  -tn 256 -tk 512 -bm 16 --stage2-tile-n 256 --stage2-tile-k 256
 
 AITER_GFX1250_NUM_BUFFERS=2 AITER_LOG_MORE=1 ENABLE_CK=0 AITER_USE_OPUS_MOE_SORTING=1 python op_tests/test_moe_2stage.py \
  -t 64 -dim 3072,3072 -e 128 -k 4 -q 7 --no-flydsl-csv -hip 0,0 \
