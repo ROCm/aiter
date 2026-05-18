@@ -117,7 +117,19 @@ def fp8_mqa_logits(
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
     if not use_gluon:
-        block_kv = 128
+        # gfx942 (MI300X) has 64 KB of LDS per CU. NUM_HEADS=64 + HEAD_SIZE=128
+        # (DeepSeek-V4 indexer config) needs ~96 KB at block_kv=128 +
+        # num_stages=2, and the kernel JIT aborts with
+        # `triton.runtime.errors.OutOfResources: Required: 98304,
+        # Hardware limit: 65536`. Drop to block_kv=64 + num_stages=1 (~33 KB)
+        # on gfx942; other architectures keep the original tile.
+        # gfx950/gfx1250 use the Gluon kernel above and don't reach this path.
+        if arch == "gfx942":
+            block_kv = 64
+            triton_num_stages = 1
+        else:
+            block_kv = 128
+            triton_num_stages = 2
 
         # heuristic for MFMA instruction shape
         matrix_instr_nonkdim = 32
@@ -163,7 +175,7 @@ def fp8_mqa_logits(
             stride_logits_k=stride_logits_k,
             BLOCK_KV=block_kv,
             num_warps=4,
-            num_stages=2,
+            num_stages=triton_num_stages,
             waves_per_eu=2,
             matrix_instr_nonkdim=matrix_instr_nonkdim,
         )
