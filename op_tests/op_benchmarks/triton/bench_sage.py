@@ -108,6 +108,21 @@ class LoadedMask:
     num_kv_blocks: int
 
 
+@dataclass
+class AccuracyMetrics:
+    mae: float
+    maxe: float
+    cosine: float
+
+
+@dataclass
+class AllKernelRow:
+    kernel: str
+    ms: float
+    tflops: float
+    accuracy: Optional[AccuracyMetrics] = None
+
+
 def layout_preprocess(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -842,6 +857,46 @@ def to_bshd_output_if_needed(
     return out
 
 
+def compute_accuracy_metrics(
+    current: torch.Tensor,
+    reference: torch.Tensor,
+) -> AccuracyMetrics:
+    current_f = current.float()
+    reference_f = reference.float()
+    abs_diff = (current_f - reference_f).abs()
+    cosine = torch.nn.functional.cosine_similarity(
+        current_f.flatten(), reference_f.flatten(), dim=0
+    ).item()
+    return AccuracyMetrics(
+        mae=abs_diff.mean().item(),
+        maxe=abs_diff.max().item(),
+        cosine=cosine,
+    )
+
+
+def fp8_max_diff_percentage(args: argparse.Namespace) -> float:
+    if args.input_distribution == "transformer":
+        return 2.0
+    return 0.5
+
+
+def check_output_against_reference(
+    args: argparse.Namespace,
+    current: torch.Tensor,
+    reference: torch.Tensor,
+) -> None:
+    compare_accuracy(current, reference)
+    if args.kernel in FP8_CHECK_KERNELS:
+        check_attention_outputs(
+            current,
+            reference,
+            fp8=True,
+            max_diff_percentage=fp8_max_diff_percentage(args),
+        )
+    else:
+        check_attention_outputs(current, reference, fp8=False)
+
+
 def make_reference_output(
     args: argparse.Namespace,
     q: torch.Tensor,
@@ -852,7 +907,7 @@ def make_reference_output(
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
     )
-    ref = args.ref or "torch"
+    ref = args.ref
 
     if block_attn_mask is not None:
         if ref != "torch":
@@ -932,18 +987,7 @@ def benchmark_single_case(
         current_primary = primary_output(fn())
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
-        compare_accuracy(current_primary, ref_primary)
-        if args.kernel in FP8_CHECK_KERNELS:
-            check_attention_outputs(
-                current_primary,
-                ref_primary,
-                fp8=True,
-                max_diff_percentage=(
-                    2.0 if args.input_distribution == "transformer" else 0.5
-                ),
-            )
-        else:
-            check_attention_outputs(current_primary, ref_primary, fp8=False)
+        check_output_against_reference(args, current_primary, ref_primary)
 
     total_flops = (
         2.0
@@ -1149,14 +1193,12 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.block_sparsity is not None and args.block_mask_file:
         logger.info("Using --block-mask-file; ignoring --block-sparsity")
 
-    if args.compare_to_ref and args.ref not in ("torch", "aiter_bf16"):
+    if args.ref not in ("torch", "aiter_bf16"):
         raise ValueError("--ref must be one of: torch, aiter_bf16")
 
     if args.kernel == "all":
         if args.block_sparsity is not None or args.block_mask_file:
             raise ValueError("--kernel=all does not support block-sparse mode")
-        if args.compare_to_ref:
-            raise ValueError("--kernel=all does not support --compare-to-ref")
         if args.load_captured:
             raise ValueError("--kernel=all does not support --load-captured")
 
@@ -1569,14 +1611,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--compare-to-ref", action="store_true", help="Compare against reference"
-    )
-    parser.add_argument(
         "--ref",
         type=str,
-        default="torch",
+        default="aiter_bf16",
         choices=["torch", "aiter_bf16"],
-        help="Reference kernel for --compare-to-ref",
+        help="Reference kernel for accuracy metrics/checks. --kernel=all reports MAE/MaxE/Cosine against this reference.",
+    )
+    parser.add_argument(
+        "--compare-to-ref",
+        action="store_true",
+        help="Run correctness checks against the selected --ref",
     )
 
     parser.add_argument(
@@ -1723,6 +1767,66 @@ def print_vgpr_from_bench(runner: Any) -> None:
         print("No VGPR metadata found in Triton dump output.")
 
 
+def benchmark_all_kernel_row(
+    args: argparse.Namespace,
+    kernel_name: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    total_flops: float,
+    ref_primary: Optional[torch.Tensor],
+) -> AllKernelRow:
+    saved_kernel = args.kernel
+    args.kernel = kernel_name
+    try:
+        fn = make_kernel_runner(args, q, k, v, block_lut=None)
+        ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+        tflops = total_flops / ms * 1e-9
+        accuracy = None
+        if ref_primary is not None:
+            current_primary = primary_output(fn())
+            current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+            accuracy = compute_accuracy_metrics(current_primary, ref_primary)
+        return AllKernelRow(kernel_name, ms, tflops, accuracy)
+    finally:
+        args.kernel = saved_kernel
+
+
+def skipped_all_kernel_row(kernel_name: str) -> AllKernelRow:
+    return AllKernelRow(kernel_name, float("nan"), float("nan"), None)
+
+
+def print_all_kernel_table(
+    rows: List[AllKernelRow],
+    include_accuracy: bool,
+) -> None:
+    if not include_accuracy:
+        print(f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10}")
+        print("-" * 38)
+        for row in rows:
+            if row.ms != row.ms:  # nan
+                print(f"{row.kernel:<16} {'SKIP':>10} {'SKIP':>10}")
+            else:
+                print(f"{row.kernel:<16} {row.ms:>10.4f} {row.tflops:>10.2f}")
+        return
+
+    print(
+        f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10} {'MAE':>12} {'MaxE':>12} {'Cosine':>12}"
+    )
+    print("-" * 78)
+    for row in rows:
+        if row.ms != row.ms or row.accuracy is None:  # nan or failed accuracy run
+            print(
+                f"{row.kernel:<16} {'SKIP':>10} {'SKIP':>10} {'SKIP':>12} {'SKIP':>12} {'SKIP':>12}"
+            )
+        else:
+            print(
+                f"{row.kernel:<16} {row.ms:>10.4f} {row.tflops:>10.2f} "
+                f"{row.accuracy.mae:>12.3e} {row.accuracy.maxe:>12.3e} "
+                f"{row.accuracy.cosine:>12.6f}"
+            )
+
+
 def run_all_kernels(args: argparse.Namespace) -> None:
     """Run all backends on the same QKV inputs and print a comparison table."""
     dtype = arg_to_torch_dtype[args.dtype]
@@ -1750,6 +1854,7 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=args.layout)
 
     shape = infer_shape_spec(q, v, args.layout)
+    ref_primary = make_reference_output(args, q, k, v, block_attn_mask=None).float()
     total_flops = (
         2.0
         * shape.batch
@@ -1759,32 +1864,29 @@ def run_all_kernels(args: argparse.Namespace) -> None:
         * (shape.d_head + shape.d_head_v)
     )
 
-    saved_kernel = args.kernel
-    rows: List[Tuple[str, float, float]] = []
+    rows: List[AllKernelRow] = []
 
     for kernel_name in ALL_KERNELS:
-        args.kernel = kernel_name
         try:
-            fn = make_kernel_runner(args, q, k, v, block_lut=None)
-            ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
-            tflops = total_flops / ms * 1e-9
-            rows.append((kernel_name, ms, tflops))
+            rows.append(
+                benchmark_all_kernel_row(
+                    args,
+                    kernel_name,
+                    q,
+                    k,
+                    v,
+                    total_flops,
+                    ref_primary,
+                )
+            )
         except Exception as e:
             logger.warning("Skipping %s: %s", kernel_name, e)
-            rows.append((kernel_name, float("nan"), float("nan")))
-
-    args.kernel = saved_kernel
+            rows.append(skipped_all_kernel_row(kernel_name))
 
     print(
-        f"\nbench_sage --kernel=all  (b={args.b} hq={args.hq} sq={args.sq} sk={sk} d={d_head}):"
+        f"\nbench_sage --kernel=all  (b={args.b} hq={args.hq} sq={args.sq} sk={sk} d={d_head} input={args.input_distribution}):"
     )
-    print(f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10}")
-    print("-" * 38)
-    for name, ms, tflops in rows:
-        if ms != ms:  # nan
-            print(f"{name:<16} {'SKIP':>10} {'SKIP':>10}")
-        else:
-            print(f"{name:<16} {ms:>10.4f} {tflops:>10.2f}")
+    print_all_kernel_table(rows, include_accuracy=True)
 
 
 def run_with_optional_vgpr(args: argparse.Namespace, runner: Any) -> int:
