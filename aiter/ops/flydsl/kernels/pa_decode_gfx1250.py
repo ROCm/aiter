@@ -208,10 +208,26 @@ def compile_pa_decode_main(
         raise ValueError(f"dtype must be 'bf16' or 'f16', got {dtype!r}")
 
     BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE // KV_BLOCK_SIZE
-    # Physical block IDs are loaded via s_buffer_load with vec_width ∈ {1, 2, 4}.
-    BT_VEC_WIDTH = 4 if BLOCKS_PER_COMPUTE >= 4 else BLOCKS_PER_COMPUTE
-    BT_NUM_LOADS = (BLOCKS_PER_COMPUTE + BT_VEC_WIDTH - 1) // BT_VEC_WIDTH
-    BT_TAIL_WIDTH = BLOCKS_PER_COMPUTE - (BT_NUM_LOADS - 1) * BT_VEC_WIDTH
+
+    # Physical block IDs are loaded via s_buffer_load, which only supports
+    # vec widths in {1, 2, 4}. Greedy-decompose BLOCKS_PER_COMPUTE into a
+    # sequence of those widths (e.g. BPC=3 → [2, 1]; BPC=7 → [4, 2, 1];
+    # BPC=11 → [4, 4, 2, 1]). Avoids producing a width-3 load which has no
+    # s_buffer_load encoding.
+    def _decompose_bt_widths(n):
+        widths = []
+        while n >= 4:
+            widths.append(4)
+            n -= 4
+        if n >= 2:
+            widths.append(2)
+            n -= 2
+        if n == 1:
+            widths.append(1)
+        return widths
+
+    BT_LOAD_WIDTHS = _decompose_bt_widths(BLOCKS_PER_COMPUTE)
+    BT_LOAD_OFFSETS = [sum(BT_LOAD_WIDTHS[:i]) for i in range(len(BT_LOAD_WIDTHS))]
 
     K_OPS_PER_WAVE = BLOCKS_PER_COMPUTE
     KV_OPS_PER_WAVE = 2 * K_OPS_PER_WAVE
@@ -444,10 +460,9 @@ def compile_pa_decode_main(
             logical positions [base, base + BLOCKS_PER_COMPUTE) where
             base = part_idx * BLOCKS_PER_PARTITION + compute_iter_idx * BLOCKS_PER_COMPUTE.
 
-            Max buffer_load vec_width is 4xi32. For BPC > 4 we issue BT_NUM_LOADS loads
-            of width BT_VEC_WIDTH (with the last load possibly narrower = BT_TAIL_WIDTH).
-
-            Loaded IDs whose logical index is past `live_blocks` are masked to 0.
+            BLOCKS_PER_COMPUTE is split into a sequence of width-{4,2,1} s_buffer_load
+            ops (see BT_LOAD_WIDTHS / BT_LOAD_OFFSETS). Loaded IDs whose logical index
+            is past ``live_blocks`` are masked to 0.
 
             Returns: list of `T.index` values, one per block in the tile.
             """
@@ -457,24 +472,23 @@ def compile_pa_decode_main(
             bt_base = seq_idx * stride_bt_seq + base_logical
 
             out = []
-            for ldi in range_constexpr(BT_NUM_LOADS):
-                # Last load uses BT_TAIL_WIDTH (may be < BT_VEC_WIDTH); all others use BT_VEC_WIDTH.
-                this_width = BT_TAIL_WIDTH if ldi == BT_NUM_LOADS - 1 else BT_VEC_WIDTH
-                bt_off = bt_base + arith.index(ldi * BT_VEC_WIDTH)
+            for ldi in range_constexpr(len(BT_LOAD_WIDTHS)):
+                this_width = BT_LOAD_WIDTHS[ldi]
+                this_offset = BT_LOAD_OFFSETS[ldi]
+                bt_off = bt_base + arith.index(this_offset)
                 # s_buffer_load offset is in BYTES — i32 elements ⇒ ×4.
                 bt_off_bytes_i32 = arith.index_cast(T.i32, bt_off * arith.index(4))
                 if this_width == 1:
                     phys_i32 = _s_buffer_load_b32(bt_rsrc_v4i32, bt_off_bytes_i32)
-                    logical_idx = base_logical + arith.index(ldi * BT_VEC_WIDTH)
+                    logical_idx = base_logical + arith.index(this_offset)
                     in_range = arith.cmpi(
                         arith.CmpIPredicate.slt, _raw(logical_idx), _raw(live_blocks)
                     )
                     phys_i32 = arith.select(in_range, _raw(phys_i32), _raw(zero_i32))
                     out.append(arith.index_cast(T.index, phys_i32))
                 else:
-                    # Vectorized scalar K$ load. b64 (width 2) and b128
-                    # (width 4) are the hardware-native sizes. Module-level
-                    # dispatch keeps the if/elif out of the rewriter's path.
+                    # Vectorized scalar K$ load. b64 (width 2) and b128 (width 4)
+                    # are the hardware-native sizes.
                     phys_vec = _s_buffer_load_vec(
                         bt_rsrc_v4i32, bt_off_bytes_i32, this_width
                     )
@@ -482,7 +496,7 @@ def compile_pa_decode_main(
                         elem = vector.extract(
                             phys_vec, static_position=[b], dynamic_position=[]
                         )
-                        logical_idx = base_logical + arith.index(ldi * BT_VEC_WIDTH + b)
+                        logical_idx = base_logical + arith.index(this_offset + b)
                         in_range = arith.cmpi(
                             arith.CmpIPredicate.slt,
                             _raw(logical_idx),
@@ -1133,6 +1147,19 @@ def compile_pa_decode_reduce(
             inv_l_vec = vector.broadcast(vec_f32_ty, inv_l)
             out_vec_f32 = arith.mulf(acc_final, inv_l_vec)
             out_vec_half = arith.trunc_f(vec_half_ty, out_vec_f32)
+
+            # Empty-seq guard: when num_parts_actual == 0 (seq_len == 0), every
+            # partition is invalid and the online softmax cascade produces NaN
+            # via -inf - -inf and 1 / 0. Mask the output to zero in that case.
+            is_empty = arith.cmpi(
+                arith.CmpIPredicate.eq,
+                _raw(num_parts_actual),
+                _raw(zero_idx),
+            )
+            zero_vec_half = arith.constant_vector(0.0, vec_half_ty)
+            out_vec_half = arith.select(
+                is_empty, _raw(zero_vec_half), _raw(out_vec_half)
+            )
 
             out_off = (
                 seq_idx * stride_out_seq
