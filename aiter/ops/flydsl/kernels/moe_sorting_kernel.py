@@ -1970,7 +1970,7 @@ def moe_sorting_get_workspace_size(M, num_experts, topk, unit_size=UNIT_SIZE):
     """Return workspace size (in i32 elements) needed for the prefill path.
     Returns 0 if the decode path will be used."""
     sub_tokens = _compute_sub_tokens(num_experts)
-    DECODE_MAX_T = 16
+    DECODE_MAX_T = min(sub_tokens, max(16, BLOCK_SIZE // max(topk, num_experts // 8)))
     if M <= min(sub_tokens, DECODE_MAX_T):
         return 0
     mesh_stride = ((M + unit_size - 1) // unit_size) * unit_size
@@ -2035,7 +2035,7 @@ def moe_sorting_flydsl(
     else:
         mask_tensor = expert_mask
 
-    DECODE_MAX_T = 16
+    DECODE_MAX_T = min(sub_tokens, max(16, BLOCK_SIZE // max(topk, num_experts // 8)))
 
     if M <= min(sub_tokens, DECODE_MAX_T):
         max_tokens = max(M, 8)
