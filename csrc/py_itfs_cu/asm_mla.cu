@@ -381,8 +381,6 @@ void mla_decode_stage1_asm_fwd(
         args.s_MQA = gqa_ratio;
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;
-    std::cout << "causal mask: " << causal << ", persistent: " << persistent << ", gqa_ratio: " << gqa_ratio 
-              << ", max_seqlen_q: " << max_seqlen_q << ", sub_Q: " << sub_Q << std::endl;
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
