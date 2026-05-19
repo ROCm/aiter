@@ -187,8 +187,13 @@ def main():
         t_paged  = time_path(False, out_paged)
         t_contig = time_path(True,  out_contig)
         speedup  = t_paged / t_contig if t_contig > 0 else float("inf")
-        print(f"  paged:  {t_paged:8.4f} ms")
-        print(f"  contig: {t_contig:8.4f} ms")
+        # 4 * sq * sk * hq * d for full attention; halve for causal (only
+        # the lower-triangular half is computed).
+        flops = 4.0 * sq * sk * hq * d * (0.5 if args.causal else 1.0)
+        tflops_paged  = flops / (t_paged  * 1e-3) / 1e12
+        tflops_contig = flops / (t_contig * 1e-3) / 1e12
+        print(f"  paged:  {t_paged:8.4f} ms  {tflops_paged:7.2f} TFLOPs/s")
+        print(f"  contig: {t_contig:8.4f} ms  {tflops_contig:7.2f} TFLOPs/s")
         print(f"  contiguous speedup: {speedup:.3f}x "
               f"({100*(t_paged-t_contig)/t_paged:+.1f}%)")
 
