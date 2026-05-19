@@ -69,7 +69,7 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      DOCKER_IMAGE: "rocm/pytorch:latest"
+      DOCKER_IMAGE: "rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
       TRITON_TEST: "op_tests/triton_tests/"
 
     steps:
@@ -193,7 +193,7 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     env:
-      DOCKER_IMAGE: "rocm/pytorch:latest"
+      DOCKER_IMAGE: "rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
       TRITON_TEST: "op_tests/triton_tests/"
 
     steps:
