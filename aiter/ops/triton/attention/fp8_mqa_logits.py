@@ -117,6 +117,8 @@ def fp8_mqa_logits(
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
     if not use_gluon:
+        # gfx942 has 64 KB LDS/CU; default (128, 2) tile needs ~96 KB. Use
+        # (64, 1) (~33 KB) so DSv4 indexer (NUM_HEADS=64, HEAD_SIZE=128) fits.
         if arch == "gfx942":
             block_kv = 64
             triton_num_stages = 1
