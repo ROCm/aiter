@@ -673,7 +673,7 @@ def compile_mixed_moe_gemm1(
 
             acc_init = arith.constant_vector(0.0, vec4_f32)
 
-            layout_x = fx.make_layout(
+            layout_x = fx.make_layout(  # noqa: F841
                 (arith.index_cast(i32, tokens_in), k_i32_v), stride=(k_i32_v, 1)
             )
 
@@ -718,7 +718,7 @@ def compile_mixed_moe_gemm1(
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=i32
             )
-            num_valid_idx = arith.index_cast(T.index, num_valid_i32)
+            num_valid_idx = arith.index_cast(T.index, num_valid_i32)  # noqa: F841
             bx_m_i32 = arith.index_cast(i32, bx_m)
             blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, num_valid_i32)
 
@@ -824,7 +824,7 @@ def compile_mixed_moe_gemm1(
                 x_vec_x_ty = T.vec(x_vec_elems, x_elem)
 
                 c_k_div4 = (k_in * arith.index(int(elem_bytes))) // arith.index(4)
-                c_k_div4_i32 = arith.index_cast(i32, c_k_div4)
+                c_k_div4_i32 = arith.index_cast(i32, c_k_div4)  # noqa: F841
                 tile_k_dwords = (int(tile_k) * int(elem_bytes)) // 4
                 layout_x_tile_div4 = fx.make_layout(
                     (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
@@ -5143,7 +5143,9 @@ def compile_mixed_moe_gemm2(
                     m_in = tokens_in * topk_idx
                     m_i32_v = arith.index_cast(i32, m_in)
                     k_i32_v = i32_k_in.ir_value()
-                    layout_x = fx.make_layout((m_i32_v, k_i32_v), stride=(k_i32_v, 1))
+                    layout_x = fx.make_layout(  # noqa: F841
+                        (m_i32_v, k_i32_v), stride=(k_i32_v, 1)
+                    )
 
                     # ===== A16W4 B layout (MXFP4 kpack=16, c_k = k_in // 2) =====
                     c2 = arith.index(2)
@@ -5200,7 +5202,7 @@ def compile_mixed_moe_gemm2(
 
                     c_k_div4 = (k_in * arith.index(int(elem_bytes))) // arith.index(4)
                     c_k_div4_i32 = arith.index_cast(i32, c_k_div4)
-                    layout_x_div4 = fx.make_layout(
+                    layout_x_div4 = fx.make_layout(  # noqa: F841
                         (m_i32_v, c_k_div4_i32), stride=(c_k_div4_i32, 1)
                     )
                     tile_k_dwords = (int(tile_k) * int(elem_bytes)) // 4
@@ -5903,7 +5905,9 @@ def compile_mixed_moe_gemm2(
                         sw_pf, tw_pf = epilogue_pf
 
                     # No per-channel weight scale for MXFP4 (scales already applied in dequant).
-                    sw_vals = [arith.constant(1.0, type=T.f32)] * num_acc_n
+                    sw_vals = [  # noqa: F841
+                        arith.constant(1.0, type=T.f32)
+                    ] * num_acc_n
 
                     def _a16_decode_lds_fused(idx):
                         """Load fused2 from lds_sorted_cache[idx]; decode (t, s, ts_ok)."""
@@ -6013,7 +6017,7 @@ def compile_mixed_moe_gemm2(
                             lds_out,
                         ):
                             _, _, _, ts_ok = _a16_decode_lds_fused(row_in_tile)
-                            row_valid = _row_valid_for(row, ts_ok)
+                            row_valid = _row_valid_for(row, ts_ok)  # noqa: F841
 
                             if const_expr(doweight_stage2):
                                 tw_idx = (mi * 4) + ii

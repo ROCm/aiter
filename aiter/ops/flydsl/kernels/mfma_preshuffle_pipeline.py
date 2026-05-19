@@ -791,6 +791,7 @@ __all__ = [
 # Groupwise scale load helper (shared by W4A16 and W4A8 groupwise paths)
 # ---------------------------------------------------------------------------
 
+
 def _load_groupwise_scale(
     buffer_ops,
     arith,
@@ -867,6 +868,7 @@ def extract_bf16_scale(arith, scale_raw_i32, ku: int):
 # ---------------------------------------------------------------------------
 # W4A16 groupwise load / unpack helpers
 # ---------------------------------------------------------------------------
+
 
 def load_b_raw_w4a16_groupwise(
     buffer_ops,
@@ -952,12 +954,14 @@ def _cvt_scalef32_pk_bf16_fp4(packed_i32, scale_f32, byte_idx, arith, vector):
         T.vec(2, T.bf16),
         "llvm.amdgcn.cvt.scalef32.pk.bf16.fp4",
         [packed_i32, scale_f32, byte_idx_i32],
-        [], [],
+        [],
+        [],
     )
     vec1_i32_t = T.vec(1, T.i32)
     return vector.extract(
         vector.bitcast(vec1_i32_t, result_v2bf16),
-        static_position=[0], dynamic_position=[],
+        static_position=[0],
+        dynamic_position=[],
     )
 
 
@@ -1011,7 +1015,8 @@ def _fp4x4_in_i32_to_bf16x4_i64(packed4, arith, vector, scale_f32=None):
         is_subnorm = arith.cmpi(arith.CmpIPredicate.eq, unsigned_val, c1)
 
         f32_bits = arith.select(
-            is_zero, c_zero,
+            is_zero,
+            c_zero,
             arith.select(is_subnorm, c_half_bits, f32_norm),
         )
         f32_bits = arith.ori(f32_bits, arith.shli(sign_bit, c31))
