@@ -978,6 +978,10 @@ def cmdGenFunc_mha_batch_prefill(
     # Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
     # Mutually exclusive with k_descale/v_descale
     kv_block_descale: Optional[Tensor] = None,  # [num_block, num_kv_head, 2]
+    # PER_TOKEN_HEAD mode descales (FP8 fine-grained, mutually exclusive with above)
+    q_descale_per_token: Optional[Tensor] = None,  # [total_q, nhead_q] fp32
+    k_descale_per_token: Optional[Tensor] = None,  # [num_total_pages, page_block_size, nhead_k] fp32
+    v_descale_per_head: Optional[Tensor] = None,   # [nhead_k] fp32
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[Tensor] = None,
@@ -1040,6 +1044,10 @@ def cmdGenFunc_mha_batch_prefill(
         # KV_BLOCKSCALE: Q per-tensor, K/V per-page
         md_name += "_kv_blockscale"
         filter_fwd += "_kv_blockscale*"
+    elif q_descale_per_token is not None:
+        # PER_TOKEN_HEAD: Q/K per-token-per-head, V per-head
+        md_name += "_per_token_head"
+        filter_fwd += "_per_token_head*"
     elif q_descale is None or k_descale is None or v_descale is None:
         md_name += "_nqscale"
         filter_fwd += "_nqscale*"
@@ -2773,6 +2781,10 @@ def mha_batch_prefill_fake_tensors(
     v_descale: Optional[torch.Tensor] = None,  # [1] per-tensor V descale
     # Per-page descale for KV_BLOCKSCALE mode (mutually exclusive with k_descale/v_descale)
     kv_block_descale: Optional[torch.Tensor] = None,  # [num_block, num_kv_head, 2]
+    # PER_TOKEN_HEAD mode descales
+    q_descale_per_token: Optional[torch.Tensor] = None,
+    k_descale_per_token: Optional[torch.Tensor] = None,
+    v_descale_per_head: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[torch.Tensor] = None,
@@ -2858,6 +2870,10 @@ def mha_batch_prefill(
     v_descale: Optional[torch.Tensor] = None,  # [1] per-tensor V descale
     # Per-page descale for KV_BLOCKSCALE mode (mutually exclusive with k_descale/v_descale)
     kv_block_descale: Optional[torch.Tensor] = None,  # [num_block, num_kv_head, 2]
+    # PER_TOKEN_HEAD mode descales
+    q_descale_per_token: Optional[torch.Tensor] = None,
+    k_descale_per_token: Optional[torch.Tensor] = None,
+    v_descale_per_head: Optional[torch.Tensor] = None,
     kv_last_page_lens: Optional[Tensor] = None,
     block_table: Optional[Tensor] = None,
     seqlen_k: Optional[Tensor] = None,
@@ -2897,6 +2913,9 @@ def _mha_batch_prefill(
     kv_block_descale: Optional[
         torch.Tensor
     ] = None,  # [num_block, num_kv_head, 2] per-page K/V descales
+    q_descale_per_token: Optional[torch.Tensor] = None,
+    k_descale_per_token: Optional[torch.Tensor] = None,
+    v_descale_per_head: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -2927,6 +2946,9 @@ def _mha_batch_prefill(
         k_descale,
         v_descale,
         kv_block_descale,
+        q_descale_per_token,
+        k_descale_per_token,
+        v_descale_per_head,
         kv_last_page_lens,
         block_table,
         seqlen_k,
@@ -2962,6 +2984,9 @@ def mha_batch_prefill_func(
     k_descale=None,
     v_descale=None,
     kv_block_descale=None,  # [num_block, num_kv_head, 2] per-page K/V descales
+    q_descale_per_token=None,  # [total_q, nhead_q] fp32 (PER_TOKEN_HEAD mode)
+    k_descale_per_token=None,  # [num_total_pages, page_block_size, nhead_k] fp32
+    v_descale_per_head=None,   # [nhead_k] fp32
     sink_ptr=None,
     sink_size: int = 0,
 ):
@@ -3028,6 +3053,9 @@ def mha_batch_prefill_func(
         k_descale=k_descale,
         v_descale=v_descale,
         kv_block_descale=kv_block_descale,
+        q_descale_per_token=q_descale_per_token,
+        k_descale_per_token=k_descale_per_token,
+        v_descale_per_head=v_descale_per_head,
         sink_ptr=sink_ptr,
     )
     out = out_padded[..., :head_size_v_og]

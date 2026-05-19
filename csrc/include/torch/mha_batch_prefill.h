@@ -34,6 +34,14 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                   // Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
                   // Mutually exclusive with k_descale/v_descale
                   std::optional<const at::Tensor> kv_block_descale, // [num_block, num_kv_head, 2]
+                  // PER_TOKEN_HEAD mode (Q/K per-token per-head, V per-head). All three must be
+                  // provided together; mutually exclusive with q/k/v_descale and kv_block_descale.
+                  //   q_descale_per_token: [total_q, nhead_q]                      fp32
+                  //   k_descale_per_token: [num_total_pages, page_block_size, nhead_k] fp32
+                  //   v_descale_per_head:  [nhead_k]                               fp32
+                  std::optional<const at::Tensor> q_descale_per_token,
+                  std::optional<const at::Tensor> k_descale_per_token,
+                  std::optional<const at::Tensor> v_descale_per_head,
                   std::optional<const at::Tensor> kv_last_page_lens,
                   std::optional<const at::Tensor> block_table,
                   std::optional<const at::Tensor> seqlen_k,
