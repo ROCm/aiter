@@ -18,7 +18,6 @@ _gemm_splitk_reduce_repr = make_kernel_repr(
 )
 
 
-@triton.heuristics({})
 @triton.jit(repr=_gemm_splitk_reduce_repr)
 def _gemm_splitk_reduce_kernel(
     c_in_ptr,
