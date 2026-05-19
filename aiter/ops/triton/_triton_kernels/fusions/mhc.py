@@ -1161,7 +1161,7 @@ def _mhc_post_pre_reduce_apply_kernel(
             acc_sq_ptr
             + ks_offs[:, None] * stride_acc_sq_k
             + m_offs_post_res[None, :] * stride_acc_sq_m,
-            mask=m_mask_post_res,
+            mask=ks_mask[:, None] & m_mask_post_res[None, :],
             other=0.0,
         )
         acc_sq_post_res = tl.sum(acc_sq_post_res, 0)
@@ -1203,7 +1203,7 @@ def _mhc_post_pre_reduce_apply_kernel(
             acc_sq_ptr
             + ks_offs[:, None] * stride_acc_sq_k
             + m_offs_post_res[None, :] * stride_acc_sq_m,
-            mask=m_mask_post_res,
+            mask=ks_mask[:, None] & m_mask_post_res[None, :],
             other=0.0,
         )
         acc_sq_post_res = tl.sum(acc_sq_post_res, 0)
