@@ -129,6 +129,17 @@ def flydsl_paged_attention_decode(
                 f"({query.device}), but {name} is on {t.device}"
             )
 
+    # --- Architecture check: kernel is gfx1250-only. ---
+    try:
+        arch = torch.cuda.get_device_properties(query.device.index).gcnArchName
+    except Exception:
+        arch = ""
+    arch_base = arch.lower().split(":")[0] if arch else ""
+    if not arch_base.startswith("gfx1250"):
+        raise ValueError(
+            f"flydsl_paged_attention_decode requires gfx1250, got {arch!r}"
+        )
+
     # --- Shape derivations + GQA / head-size checks ---
     num_seqs, num_q_heads, head_size = query.shape
     num_blocks, num_kv_heads, kv_block_size, head_size_kv = key_cache.shape
@@ -194,6 +205,10 @@ def flydsl_paged_attention_decode(
         raise ValueError("seq_lens must be contiguous")
 
     max_seq_len = int(seq_lens.max().item()) if num_seqs > 0 else 0
+    if max_seq_len == 0:
+        output.zero_()
+        return output
+
     num_partitions = max(1, (max_seq_len + partition_size - 1) // partition_size)
     max_blocks_per_seq = block_tables.shape[1]
 

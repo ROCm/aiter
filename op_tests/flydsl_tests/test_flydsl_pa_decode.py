@@ -11,8 +11,19 @@ import random
 
 import pytest
 import torch
+from aiter.ops.flydsl import is_flydsl_available  # noqa: E402
 
 from aiter.ops.flydsl.pa_decode import flydsl_paged_attention_decode
+
+
+def _is_gfx1250() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+    return arch.lower().split(":")[0].startswith("gfx1250")
 
 
 def _torch_reference(
@@ -168,6 +179,12 @@ def test_flydsl_pa_decode(
     partition_size,
     dtype,
 ):
+    if not is_flydsl_available():
+        pytest.skip("FlyDSL is not available")
+
+    if not _is_gfx1250():
+        pytest.skip("This pa_decode kernel is gfx1250 only")
+
     query, key_cache, value_cache, block_tables, seq_lens = _generate_inputs(
         num_seqs=num_seqs,
         num_kv_heads=num_kv_heads,
