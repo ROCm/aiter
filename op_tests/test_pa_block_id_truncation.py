@@ -47,8 +47,6 @@ import pytest
 import torch
 
 import aiter
-from aiter import dtypes
-
 
 # ---------- configuration matching the ATOM Eagle3 draft signature ----------
 # Production layout per TP=8 rank: num_q_heads = num_kv_heads = 8 (full MHA).
@@ -105,13 +103,22 @@ def _build_kv_cache():
 
     # K layout: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
     k_cache = torch.zeros(
-        NUM_BLOCKS, NUM_KV_HEADS, HEAD_DIM // x, BLOCK_SIZE, x,
-        dtype=dtype, device="cuda",
+        NUM_BLOCKS,
+        NUM_KV_HEADS,
+        HEAD_DIM // x,
+        BLOCK_SIZE,
+        x,
+        dtype=dtype,
+        device="cuda",
     )
     # V layout: [num_blocks, num_kv_heads, head_dim, block_size]
     v_cache = torch.zeros(
-        NUM_BLOCKS, NUM_KV_HEADS, HEAD_DIM, BLOCK_SIZE,
-        dtype=dtype, device="cuda",
+        NUM_BLOCKS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        BLOCK_SIZE,
+        dtype=dtype,
+        device="cuda",
     )
 
     for block_id, sig, _label in _FINGERPRINTS:
@@ -228,29 +235,32 @@ if __name__ == "__main__":
     # ---- Performance comparison ----
     # Measure latency across different block_id ranges and batch sizes
     # to verify no performance regression from the rebase fix.
-    import time
 
     print("=== Performance Comparison ===")
-    print(f"{'scenario':<30s} {'batch':>5s} {'ctx_len':>7s} {'max_qlen':>8s} "
-          f"{'avg_us':>8s} {'std_us':>8s}")
+    print(
+        f"{'scenario':<30s} {'batch':>5s} {'ctx_len':>7s} {'max_qlen':>8s} "
+        f"{'avg_us':>8s} {'std_us':>8s}"
+    )
     print("-" * 75)
 
     PERF_NUM_WARMUP = 5
     PERF_NUM_ITERS = 50
 
     perf_configs = [
-        ("low_block_ids",    1000,  1),
-        ("high_block_ids",  67000,  1),
-        ("low_block_ids",    1000,  4),
-        ("high_block_ids",  67000,  4),
+        ("low_block_ids", 1000, 1),
+        ("high_block_ids", 67000, 1),
+        ("low_block_ids", 1000, 4),
+        ("high_block_ids", 67000, 4),
     ]
 
     for num_seqs in [1, 8, 32]:
         for label, base_block_id, max_qlen in perf_configs:
             num_pages = 16
             block_tables = torch.full(
-                (num_seqs, num_pages), base_block_id,
-                dtype=torch.int32, device="cuda",
+                (num_seqs, num_pages),
+                base_block_id,
+                dtype=torch.int32,
+                device="cuda",
             )
             for i in range(num_seqs):
                 block_tables[i] = base_block_id + i
@@ -259,45 +269,73 @@ if __name__ == "__main__":
 
             ctx_len = BLOCK_SIZE * num_pages
             context_lens = torch.full(
-                (num_seqs,), ctx_len, dtype=torch.int32, device="cuda",
+                (num_seqs,),
+                ctx_len,
+                dtype=torch.int32,
+                device="cuda",
             )
             total_q = num_seqs * max_qlen
             cu_seqlens_q = torch.arange(
-                0, total_q + 1, max_qlen, dtype=torch.int32, device="cuda",
+                0,
+                total_q + 1,
+                max_qlen,
+                dtype=torch.int32,
+                device="cuda",
             )
             query = torch.randn(
-                total_q, NUM_Q_HEADS, HEAD_DIM,
-                dtype=torch.bfloat16, device="cuda",
+                total_q,
+                NUM_Q_HEADS,
+                HEAD_DIM,
+                dtype=torch.bfloat16,
+                device="cuda",
             )
 
             def _run():
                 return aiter.pa_fwd_asm(
-                    query, k_cache, v_cache, block_tables, context_lens,
-                    block_tables.stride(0), max_qlen=max_qlen,
-                    K_QScale=None, V_QScale=None, out_=None,
-                    qo_indptr=cu_seqlens_q, high_precision=0,
+                    query,
+                    k_cache,
+                    v_cache,
+                    block_tables,
+                    context_lens,
+                    block_tables.stride(0),
+                    max_qlen=max_qlen,
+                    K_QScale=None,
+                    V_QScale=None,
+                    out_=None,
+                    qo_indptr=cu_seqlens_q,
+                    high_precision=0,
                 )
 
             for _ in range(PERF_NUM_WARMUP):
                 _run()
             torch.cuda.synchronize()
 
-            start_events = [torch.cuda.Event(enable_timing=True) for _ in range(PERF_NUM_ITERS)]
-            end_events = [torch.cuda.Event(enable_timing=True) for _ in range(PERF_NUM_ITERS)]
+            start_events = [
+                torch.cuda.Event(enable_timing=True) for _ in range(PERF_NUM_ITERS)
+            ]
+            end_events = [
+                torch.cuda.Event(enable_timing=True) for _ in range(PERF_NUM_ITERS)
+            ]
             for i in range(PERF_NUM_ITERS):
                 start_events[i].record()
                 _run()
                 end_events[i].record()
             torch.cuda.synchronize()
 
-            latencies = [s.elapsed_time(e) * 1000 for s, e in zip(start_events, end_events)]
+            latencies = [
+                s.elapsed_time(e) * 1000 for s, e in zip(start_events, end_events)
+            ]
             avg_us = sum(latencies) / len(latencies)
             std_us = (sum((x - avg_us) ** 2 for x in latencies) / len(latencies)) ** 0.5
 
             tag = f"{label}_qlen{max_qlen}"
-            print(f"  {tag:<28s} {num_seqs:>5d} {ctx_len:>7d} {max_qlen:>8d} "
-                  f"{avg_us:>8.2f} {std_us:>8.2f}")
+            print(
+                f"  {tag:<28s} {num_seqs:>5d} {ctx_len:>7d} {max_qlen:>8d} "
+                f"{avg_us:>8.2f} {std_us:>8.2f}"
+            )
         print()
 
-    print("Note: low_block_ids (<65536) vs high_block_ids (>65536) should show\n"
-          "      similar latency — any significant gap indicates a regression.")
+    print(
+        "Note: low_block_ids (<65536) vs high_block_ids (>65536) should show\n"
+        "      similar latency — any significant gap indicates a regression."
+    )
