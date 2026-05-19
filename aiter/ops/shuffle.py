@@ -4,6 +4,19 @@
 import torch
 
 
+def preshuffle_fp8_weights_gfx1250(w: torch.Tensor) -> torch.Tensor:
+    assert w.ndim == 2, f"Expected 2D (N, K) weight tensor, got {w.ndim}D"
+    N, K = w.shape
+    assert N % 16 == 0, f"N ({N}) must be divisible by 16 for WMMA preshuffling"
+    assert K % 128 == 0, f"K ({K}) must be divisible by 128 (WMMA_K) for preshuffling"
+
+    w = w.view(N // 16, 16, K // 128, 2, 4, 16)
+    w = w.permute(0, 2, 4, 3, 1, 5).contiguous()
+    w = w.view(N // 16, K * 16)
+    w.is_shuffled = True
+    return w
+
+
 def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Tensor:
     # Hardcode BLOCK_K and BLOCK_N
     x_type = x.dtype

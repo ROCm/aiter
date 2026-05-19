@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""FlyDSL unit tests for A8W8 FP8 blockscale GEMM on gfx1250.
-
-Intentionally isolated from the triton test harness: this file does not import
-`aiter.ops.flydsl` or `aiter.ops.triton` at top-level because those can trigger
-an unrelated `module_aiter_core` build.
-"""
+"""FlyDSL unit tests for A8W8 FP8 blockscale GEMM on gfx1250."""
 
 import argparse
 import importlib.util
@@ -13,6 +8,8 @@ import os
 
 import pytest
 import torch
+
+from aiter.ops.shuffle import preshuffle_fp8_weights_gfx1250
 
 SCALE_BLOCK_N = 128
 SCALE_BLOCK_K = 128
@@ -186,6 +183,7 @@ def test_gemm_a8w8_blockscale_basic(M, N, K, dtype):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
+    w = preshuffle_fp8_weights_gfx1250(w)
     out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=dtype)
     _assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
@@ -199,6 +197,7 @@ def test_gemm_a8w8_blockscale_num_buffers(M, N, K, num_buffers):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = preshuffle_fp8_weights_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -219,6 +218,7 @@ def test_gemm_a8w8_blockscale_dtype(M, N, K, dtype):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
+    w = preshuffle_fp8_weights_gfx1250(w)
     out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=dtype)
 
     rtol = 1e-3 if dtype == torch.float32 else 1e-2
@@ -235,6 +235,7 @@ def test_gemm_a8w8_blockscale_preallocated_output(M, N, K):
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     y = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = preshuffle_fp8_weights_gfx1250(w)
 
     out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=torch.bfloat16, y=y)
     assert out.data_ptr() == y.data_ptr(), "Output should reuse pre-allocated y"
@@ -258,6 +259,7 @@ def test_gemm_a8w8_blockscale_scales_per_tile(M, N, K):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = preshuffle_fp8_weights_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -277,6 +279,7 @@ def test_gemm_a8w8_blockscale_large(M, N, K):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = preshuffle_fp8_weights_gfx1250(w)
     out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=torch.bfloat16)
     _assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
@@ -290,6 +293,7 @@ def test_gemm_a8w8_blockscale_tdm_store_basic(M, N, K, dtype):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
+    w = preshuffle_fp8_weights_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -310,6 +314,7 @@ def test_gemm_a8w8_blockscale_tdm_store_dtype(M, N, K, dtype):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
+    w = preshuffle_fp8_weights_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -333,6 +338,7 @@ def test_gemm_a8w8_blockscale_tdm_store_num_buffers(M, N, K, num_buffers):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = preshuffle_fp8_weights_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -354,6 +360,7 @@ def test_gemm_a8w8_blockscale_tdm_store_preallocated_output(M, N, K):
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     y = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = preshuffle_fp8_weights_gfx1250(w)
 
     out = gemm_a8w8_blockscale(
         x,
@@ -365,6 +372,153 @@ def test_gemm_a8w8_blockscale_tdm_store_preallocated_output(M, N, K):
         use_tdm_store=True,
     )
     assert out.data_ptr() == y.data_ptr(), "Output should reuse pre-allocated y"
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+def _experimental_supported(
+    M,
+    N,
+    K,
+    tile_n=128,
+    n_warp=4,
+    scale_block_k=SCALE_BLOCK_K,
+    scale_block_n=SCALE_BLOCK_N,
+):
+    warp_tile_n = tile_n // n_warp
+    scale_k = (K + scale_block_k - 1) // scale_block_k
+    return warp_tile_n <= scale_block_n and scale_k <= 32
+
+
+_EXPERIMENTAL_BASIC_SHAPES = [
+    s for s in get_basic_shapes() if _experimental_supported(*s)
+]
+_EXPERIMENTAL_TDM_SHAPES = [
+    s for s in get_tdm_store_shapes() if _experimental_supported(*s)
+]
+
+
+@pytest.mark.parametrize("M, N, K", _EXPERIMENTAL_BASIC_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("variant", ["experimental", "experimental_unroll2", "manual"])
+def test_gemm_a8w8_blockscale_experimental_basic(variant, M, N, K, dtype):
+    _check_gfx1250()
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
+    w = preshuffle_fp8_weights_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x,
+        w,
+        x_scale,
+        w_scale,
+        dtype=dtype,
+        variant=variant,
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("M, N, K", [(128, 256, 256), (256, 512, 512)])
+@pytest.mark.parametrize("num_buffers", [2, 3, 4])
+@pytest.mark.parametrize("variant", ["experimental", "experimental_unroll2", "manual"])
+def test_gemm_a8w8_blockscale_experimental_num_buffers(variant, M, N, K, num_buffers):
+    _check_gfx1250()
+    _check_shape_compat(M, N, K, num_buffers=num_buffers)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = preshuffle_fp8_weights_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x,
+        w,
+        x_scale,
+        w_scale,
+        dtype=torch.bfloat16,
+        num_buffers=num_buffers,
+        variant=variant,
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("M, N, K", _EXPERIMENTAL_TDM_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("variant", ["experimental", "experimental_unroll2", "manual"])
+def test_gemm_a8w8_blockscale_experimental_tdm_store(variant, M, N, K, dtype):
+    _check_gfx1250()
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
+    w = preshuffle_fp8_weights_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x,
+        w,
+        x_scale,
+        w_scale,
+        dtype=dtype,
+        variant=variant,
+        use_tdm_store=True,
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (128, 256, 256),
+        (128, 128, 512),
+        (1024, 1024, 1024),
+    ],
+)
+@pytest.mark.parametrize("variant", ["experimental", "experimental_unroll2", "manual"])
+def test_gemm_a8w8_blockscale_experimental_scales_per_tile(variant, M, N, K):
+    _check_gfx1250()
+    _check_shape_compat(M, N, K, tile_k=256)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = preshuffle_fp8_weights_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x,
+        w,
+        x_scale,
+        w_scale,
+        dtype=torch.bfloat16,
+        tile_k=256,
+        variant=variant,
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (128, 256, 4224),
+        (128, 256, 8192),
+        (128, 256, 12288),
+    ],
+)
+@pytest.mark.parametrize("variant", ["experimental", "experimental_unroll2", "manual"])
+def test_gemm_a8w8_blockscale_experimental_multi_chunk(variant, M, N, K):
+    _check_gfx1250()
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = preshuffle_fp8_weights_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x,
+        w,
+        x_scale,
+        w_scale,
+        dtype=torch.bfloat16,
+        variant=variant,
+    )
     _assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
 
@@ -385,6 +539,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Use the LDS-staged TDM-store epilogue.",
     )
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default="reg_preload",
+        choices=[
+            "reg_preload",
+            "no_op_preload",
+            "experimental",
+            "experimental_unroll2",
+            "manual",
+        ],
+    )
     args = parser.parse_args()
 
     dtype_map = {
@@ -399,6 +565,7 @@ if __name__ == "__main__":
 
     x, w, x_scale, w_scale = _generate_inputs(args.M, args.N, args.K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
+    w = preshuffle_fp8_weights_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -407,6 +574,7 @@ if __name__ == "__main__":
         dtype=dtype,
         num_buffers=args.num_buffers,
         use_tdm_store=args.tdm_store,
+        variant=args.variant,
     )
 
     torch.cuda.synchronize()
@@ -415,5 +583,6 @@ if __name__ == "__main__":
     _assert_close(out, ref, rtol=rtol, atol=atol)
     print(
         f"PASSED M={args.M} N={args.N} K={args.K} dtype={args.dtype} "
-        f"num_buffers={args.num_buffers} tdm_store={args.tdm_store}"
+        f"num_buffers={args.num_buffers} tdm_store={args.tdm_store} "
+        f"variant={args.variant}"
     )
