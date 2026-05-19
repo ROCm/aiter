@@ -114,7 +114,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
                 std::vector<int> splitK_list =
                     (log2_k_split >= 0 && cfg.splitK)
                         ? std::vector<int>{1 << log2_k_split}
-                        : (cfg.splitK ? std::vector<int>{2, 4, 8, 16} : std::vector<int>{1});
+                        : (cfg.splitK ? std::vector<int>{1, 2, 4, 8, 16} : std::vector<int>{1});
 
                 for(auto& splitK : splitK_list)
                 {
