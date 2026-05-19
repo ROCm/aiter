@@ -890,9 +890,9 @@ def flydsl_moe_stage1(
     )
     _run_compiled(exe, args)
 
-    # a16w4 split-K accumulates partials into f32 via atomics.
-    # All post-GEMM kernels (silu_and_mul_fq, silu_and_mul) expect bf16 input.
-    if _is_splitk and tmp_out is not None and tmp_out.dtype == torch.float32:
+    # a16w4 split-K accumulates partials into f32 via atomics; cast to bf16
+    # before the post-activation kernels, which all expect bf16 input.
+    if _is_splitk and _is_a16w4:
         tmp_out = tmp_out.to(dtypes.bf16)
 
     num_sorted_rows = sorted_token_ids.shape[0]
@@ -998,8 +998,6 @@ def flydsl_moe_stage1(
         )
 
         post_input = tmp_out.view(-1, inter_dim * 2)
-        if post_input.dtype == torch.float32:
-            post_input = post_input.to(dtypes.bf16)
         post_out = out.view(-1, inter_dim)
         post_bias = bias.contiguous() if bias is not None else None
         if bias is not None and act == "swiglu":
