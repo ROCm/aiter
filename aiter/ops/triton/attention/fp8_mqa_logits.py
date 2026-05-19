@@ -191,6 +191,7 @@ def fp8_mqa_logits(
             stride_logits_k=stride_logits_k,
             BLOCK_KV=block_kv,
             num_warps=4,
+            num_stages=num_stages,
             waves_per_eu=2,
             matrix_instr_nonkdim=matrix_instr_nonkdim,
         )
