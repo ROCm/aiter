@@ -2,6 +2,15 @@
 
 this is an example how to benchmark aiter mha fwd/bwd kernel through c++ API: `aiter::mha_fwd`, `aiter::mha_fwd_splitkv`, `aiter::mha_bwd`.
 
+## Small-sequence CK benchmarks (ck_pr_6764)
+
+Scenarios 1–2 (packed varlen) and `scenario_3_4` (fixed self-attn `sq=sk` sweep 2–17) live under **`small_attn_benchmark/`** — see that folder’s [README](small_attn_benchmark/README.md).
+
+```bash
+bash build_mha.sh
+cd small_attn_benchmark && ./run_all.sh
+```
+
 ## build and run
 We provide a simple script `build_mha.sh` to build the device library as well as a simple executable:
 ```
