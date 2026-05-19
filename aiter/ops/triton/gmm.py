@@ -89,6 +89,7 @@ def gmm(
     bias: Tensor | None = None,
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
+    work_stealing: bool = False,
     config: dict[str, int] | None = None,
     grid_dim: int | None = None,
 ) -> Tensor:
@@ -137,6 +138,9 @@ def gmm(
         allocated.
         If provided then it must have shape (M, N), its data type must match preferred_element_type
         and it must be on the same device of other input tensors.
+    work_stealing : bool, defaults to False
+        Enable work stealing, i.e. dynamic load-balancing where CUs with no assigned tiles "steal"
+        the next available tile to be computed.
     config : dict[str, int] or None, optional
         Optional dictionary with kernel metaparameters. If absent, config will be queried from
         internal tuning database.
@@ -229,15 +233,22 @@ def gmm(
         config["GRID_DIM"],
     )
 
+    tile_counter: torch.Tensor | None = (
+        torch.tensor((config["GRID_DIM"],), dtype=torch.int32, device=lhs.device)
+        if work_stealing
+        else None
+    )
+
     # fmt: off
     gmm_kernel[grid](
         # Tensor pointers:
-        lhs, rhs, group_sizes, out, bias,
+        lhs, rhs, group_sizes, out, bias, tile_counter,
         # Tensor shapes:
         M, K, N, G,
         # Meta-parameters:
         TRANS_RHS=trans_rhs,
         USE_BIAS=use_bias,
+        WORK_STEALING=work_stealing,
         **config,
     )
     # fmt: on
