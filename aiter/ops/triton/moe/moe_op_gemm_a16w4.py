@@ -6,7 +6,11 @@ import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
-    _moe_gemm_a16w4,
+    # _moe_gemm_a16w4,
+    _moe_gemm_a16w4 as _moe_gemm_a16w4_triton,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
+    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
 
@@ -28,8 +32,8 @@ def should_upcast_indices(*args):
 
 
 def allocate_output(
-    x,
-    w,
+    M,
+    N,
     out_dtype,
     reduction_n_matmul,
     reduction_n_reduction,
@@ -38,14 +42,15 @@ def allocate_output(
     scatter_indx,
     block_m,
     split_k,
+    device,
 ):
     # ---- output ------
-    N = w.shape[-1]
+    # N = w.shape[-1]
     # by default - M is number of rows in the activations
-    M = x.shape[-2]
+    # M = x.shape[-2]
     # if the activations are gathered, then M is number of gather indices
-    if gather_indx is not None:
-        M = gather_indx.shape[0]
+    # if gather_indx is not None:
+    #    M = gather_indx.shape[0]
     # final output
     if routing_data.n_expts_act == 1 or scatter_indx is None:
         y_rows = M
@@ -55,19 +60,73 @@ def allocate_output(
         )  # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
-    matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
+    matmul_output = torch.empty(matmul_shape, device=device, dtype=out_dtype)
     if scatter_indx is not None or split_k > 1:
-        final_output = torch.empty(final_shape, device=x.device, dtype=out_dtype)
+        final_output = torch.empty(final_shape, device=device, dtype=out_dtype)
     else:
         final_output = None
     return matmul_output, final_output
 
 
-def get_kernel_config(m, n, k, routing_data):
+def get_kernel_config_triton(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
     xcd_swizzle = num_xcds
+    w_cache_modifier = ".cg" if block_m <= 32 else None
+    num_stages = 1
+    split_k = 1
+    block_k = 256
+
+    if block_m == 16:
+        block_n = 128
+        num_warps = 2
+
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n >= 64 and grid < 256:
+            block_n = block_n // 2
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
+
+    elif block_m == 32:
+        if n <= 1024:
+            block_n = 128
+            num_warps = 2
+        elif n <= 4096:
+            block_n = 256
+            num_warps = 4
+        else:
+            block_n = 256
+            num_warps = 4
+
+    else:
+        block_n = 256
+        num_warps = 4
+
+    ret = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "group_m": group_m,
+        "xcd_swizzle": xcd_swizzle,
+        "w_cache_modifier": w_cache_modifier,
+        "split_k": split_k,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    }
+    return ret
+
+
+def get_kernel_config_gluon(m, n, k, routing_data):
+    block_m = routing_data.block_m
+    group_m = 4
+    xcd_swizzle = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 1
     split_k = 1
@@ -91,15 +150,15 @@ def get_kernel_config(m, n, k, routing_data):
             block_n = 128
             num_warps = 4
         elif n <= 4096:
-            block_n = 256
-            num_warps = 8
+            block_n = 128
+            num_warps = 4
         else:
-            block_n = 512
-            num_warps = 8
+            block_n = 128
+            num_warps = 4
 
     else:
-        block_n = 512
-        num_warps = 8
+        block_n = 128
+        num_warps = 4
 
     ret = {
         "block_m": block_m,
@@ -118,7 +177,7 @@ def get_kernel_config(m, n, k, routing_data):
     return ret
 
 
-def swizzle_scales(data):
+def swizzle_scales_gfx950(data):
     NON_K_PRESHUFFLE_BLOCK_SIZE = 32
     block_shape = data.shape
     SCALE_K = block_shape[-2]
@@ -129,6 +188,24 @@ def swizzle_scales(data):
     E = block_shape[0]
     data = data.reshape(E, N // 32, SCALE_K * 32)
     return data.transpose(-1, -2)
+
+
+def swizzle_scales_gfx1250(data):
+    E, K_SCALE, N = data.shape
+    preshuffle_factor = 128
+    num_chunk_n = N // preshuffle_factor
+    SCALE_KWIDTH = 4 if K_SCALE >= 4 else K_SCALE
+    num_chunk_k = K_SCALE // SCALE_KWIDTH
+
+    data = data.transpose(-1, -2)
+    data = data.view(
+        E, num_chunk_n, 4, preshuffle_factor // 4, num_chunk_k, SCALE_KWIDTH
+    )
+    data = data.permute(0, 1, 4, 3, 2, 5).contiguous()
+    data = data.view(E, N // preshuffle_factor, K_SCALE * preshuffle_factor)
+    data = data.transpose(-1, -2)
+
+    return data
 
 
 # -----------------------------------------------------------------------------
@@ -156,12 +233,14 @@ def moe_gemm_a16w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
+    use_gluon=False,
 ):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
+
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x_scales is None, "x_scales must be none"
     assert x_static_scale is None, "x_static_scale must be none"
@@ -176,8 +255,15 @@ def moe_gemm_a16w4(
     if unpadded_K and block_m == 16:
         K = unpadded_K
 
+    # if use_gluon:
+    #    w = w.transpose(1, 2)
+    #    w_scales = w_scales.transpose(1, 2)
+
     # compute optimization flags
-    config = get_kernel_config(M, N, K, routing_data)
+    if use_gluon:
+        config = get_kernel_config_gluon(M, N, K, routing_data)
+    else:
+        config = get_kernel_config_triton(M, N, K, routing_data)
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -196,8 +282,8 @@ def moe_gemm_a16w4(
 
     # allocate output memory
     y, y_final = allocate_output(
-        x,
-        w,
+        M,
+        N,
         out_dtype,
         reduction_n_matmul,
         reduction_n_reduction,
@@ -206,6 +292,7 @@ def moe_gemm_a16w4(
         scatter_indx,
         config["block_m"],
         config["split_k"],
+        x.device,
     )
     stride_bias = None if bias is None else bias.stride(0)
 
@@ -222,57 +309,125 @@ def moe_gemm_a16w4(
     grid = grid_m * grid_n * config["split_k"]
 
     # launch kernel
-    _moe_gemm_a16w4[(grid,)](
-        y,
-        y.stride(0),
-        y.stride(1),
-        y.stride(2),
-        x,
-        x.stride(0),
-        x.stride(1),
-        w,
-        w.stride(0),
-        w.stride(1),
-        w.stride(2),
-        w_scales,
-        w_scales.stride(0),
-        w_scales.stride(1),
-        w_scales.stride(2),
-        bias,
-        stride_bias,
-        gammas,
-        N,
-        K,
-        gather_indx,
-        expt_hist,
-        expt_token_offs_raw,
-        expt_hist_sum,
-        expt_block_pid_map,
-        grid_m,
-        grid_n,
-        apply_swiglu_matmul,
-        alpha,
-        limit,
-        reduction_n_matmul,
-        swiglu_add_residual,
-        routing_data.n_expts_act,
-        config["block_m"],
-        config["block_n"],
-        config["block_k"],
-        config["group_m"],
-        XCD_SWIZZLE=config["xcd_swizzle"],
-        SWIZZLE_MX_SCALE=swizzle_mx_scale,
-        SPLIT_K=config["split_k"],
-        EVEN_K=K % config["block_k"] == 0,
-        MASK_K_LIMIT=K % config["block_k"],
-        W_CACHE_MODIFIER=config["w_cache_modifier"],
-        num_warps=config["num_warps"],
-        num_stages=config["num_stages"],
-        UPCAST_INDICES=should_upcast_indices(x, w, y),
-        waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        kpack=config["kpack"],
-    )
+    if use_gluon:
+        if swizzle_mx_scale is not None:
+            raise NotImplementedError(
+                "use_gluon=True only supports swizzle_mx_scale=None — the gluon path "
+                "consumes pre-expanded e8m0 scales (one byte per fp4 element)."
+            )
+        # The gluon kernel dequantizes fp4 -> bf16 via `scaled_upcast`, which needs the
+        # e8m0 scale byte broadcast to each of the 32 fp4 elements in its group along K.
+        # The TDM descriptor on the kernel side views the scale per-expert as (N, K)
+        # with K innermost (stride 1), so we expand and transpose:
+        #   (E, K // 32, N) --repeat_interleave 32 on K-> (E, K, N) --transpose-> (E, N, K)
+        w_scales_kernel = (
+            w_scales.repeat_interleave(32, dim=1).transpose(1, 2).contiguous()
+        )
+        _moe_gemm_a16w4_gluon[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales_kernel,
+            w_scales_kernel.stride(0),  # stride_w_mx_e
+            w_scales_kernel.stride(2),  # stride_w_mx_k (innermost, = 1)
+            w_scales_kernel.stride(1),  # stride_w_mx_n
+            bias,
+            stride_bias,
+            gammas,
+            M,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            NUM_BUFFERS=2,
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            SPLIT_K=config["split_k"],
+            # EVEN_K=K % config["block_k"] == 0,
+            MASK_K_LIMIT=K % config["block_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+            kpack=config["kpack"],
+        )
+    else:
+        _moe_gemm_a16w4_triton[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            bias,
+            stride_bias,
+            gammas,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            SPLIT_K=config["split_k"],
+            EVEN_K=K % config["block_k"] == 0,
+            MASK_K_LIMIT=K % config["block_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+            kpack=config["kpack"],
+        )
 
     # Build grouped reduction inputs in a uniform way
     group_indx = (

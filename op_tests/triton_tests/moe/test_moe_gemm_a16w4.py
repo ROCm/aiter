@@ -4,6 +4,7 @@
 from dataclasses import dataclass, fields
 import pytest
 import torch
+import os
 
 # routing utilities
 from aiter.ops.triton.moe.moe_routing.routing import routing
@@ -12,7 +13,7 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
     moe_gemm_torch,
-    swizzle_scales,
+    swizzle_scales_gfx950,
 )
 
 # numerics utilities
@@ -174,12 +175,12 @@ class Case:
     [
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
-            Case(4, 4, 8, 2, 1),
             Case(4, 4, 8, 8, 2),
             Case(4, 4, 8, 128, 4),
             Case(4, 1024, 3072, 128, 4),
             Case(32, 6144, 3072, 128, 4),
             Case(16, 1024, 1024, 128, 4),
+            Case(16, 128, 128, 2, 1),
             Case(16, 256, 256, 128, 4),
             Case(4096, 256, 256, 128, 4),
             Case(1024, 3072, 512, 128, 4),
@@ -188,6 +189,7 @@ class Case:
             Case(300, 400, 800, 8, 4),
             Case(1000, 704, 800, 8, 2),
             Case(4097, 1024, 1024, 128, 4),
+            Case(16, 256, 256, 8, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 8, 4, hbm_swizzling=True),
             Case(16, 1024, 1024, 128, 4, hbm_swizzling=True),
@@ -211,6 +213,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
+@pytest.mark.parametrize("use_gluon", [True, False])
 def test_op(
     m,
     n,
@@ -219,11 +222,18 @@ def test_op(
     do_scatter,
     has_y_gammas,
     apply_swiglu,
+    use_gluon,
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
     device="cuda",
 ):
+
+    if int(os.environ.get("AITER_IN_FFM_AM", 0)) == 1:
+        if m > 1024 or n > 1024 or k > 1024 or n_expts_tot > 32:
+            pytest.skip("Test will take too long on FFM")
+    if arch_info.get_arch() != "gfx1250" and use_gluon:
+        pytest.skip("Gluon kernel is only available for gfx1250")
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
@@ -269,9 +279,13 @@ def test_op(
     # downcast to mxfp
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
-    if hbm_swizzling:
+    # Gluon doesn't have mfma operation for bf16 and fp4, so fp4 weight is upcasted to 16-bits
+    # and then mfma op is done. No need for scales
+    # May be for Triton also scale swizzling shouldn't be done because Triton
+    # does the upcasting as well
+    if hbm_swizzling and not use_gluon:
         swizzle_mx_scale = "CDNA4_SCALE"
-        w_scale_tri = swizzle_scales(w_scale_tri)
+        w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
     else:
         swizzle_mx_scale = None
 
@@ -301,5 +315,6 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        use_gluon=use_gluon,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
