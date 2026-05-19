@@ -237,7 +237,6 @@ def mla_decode_fwd(
                         q.dtype == dtypes.bf16
                         and kv_buffer.dtype == dtypes.bf16
                         and nhead == 32
-                        and max_seqlen_q == 1
                     )
                 )
             )
@@ -287,7 +286,6 @@ def mla_decode_fwd(
                 q.dtype == dtypes.bf16
                 and kv_buffer.dtype == dtypes.bf16
                 and nhead == 32
-                and max_seqlen_q == 1
             )
         ):
             lse = final_lse if return_lse else attn_lse

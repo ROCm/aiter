@@ -324,7 +324,7 @@ def _moe_gemm_a8w8_blockscale(
             WScalePtrs += offs_ks_step * stride_w_bs_k
 
         scale_matrix = x_scale[:, None] * w_scale[None, :]
-        acc += tl.dot(x, w, input_precision="ieee") * scale_matrix
+        acc += tl.dot(x, w) * scale_matrix
         XPtrs += BLOCK_K * stride_x_k
         WPtrs += BLOCK_K * stride_w_k
 
