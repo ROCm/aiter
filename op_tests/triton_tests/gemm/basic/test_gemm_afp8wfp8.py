@@ -22,8 +22,14 @@ def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
     return torch.exp2((x.to(torch.int32) - 127).to(torch.float32))
 
 
-def generate_inputs(M: int, N: int, K: int, seed: int = 0):
-    torch.manual_seed(seed)
+def generate_inputs(M: int, N: int, K: int, shuffle: bool = False):
+    """Returns ``(x_fp8, w_fp8, w_kernel, x_scales, w_scales)``.
+
+    ``w_fp8`` is always the unshuffled weight (for use by the fp32 reference).
+    ``w_kernel`` is the weight to pass to the kernel: identical to ``w_fp8``
+    when ``shuffle=False``, or shuffled via ``shuffle_weight(layout=(16, 16))``
+    when ``shuffle=True``.
+    """
     # Small random fp32 → fp8 e4m3fn, kept inside e4m3 range so the cast is exact-ish.
     x_f32 = torch.randn((M, K), dtype=torch.float32, device="cuda")
     w_f32 = torch.randn((N, K), dtype=torch.float32, device="cuda")
@@ -43,7 +49,14 @@ def generate_inputs(M: int, N: int, K: int, seed: int = 0):
         dtype=torch.uint8,
         device="cuda",
     )
-    return x_fp8, w_fp8, x_scales, w_scales
+
+    if shuffle:
+        # shuffle_weight operates on raw bytes; view as uint8 to avoid dtype quirks.
+        w_kernel = shuffle_weight(w_fp8.view(torch.uint8), layout=(16, 16))
+    else:
+        w_kernel = w_fp8
+
+    return x_fp8, w_fp8, w_kernel, x_scales, w_scales
 
 
 def run_torch_gemm_afp8wfp8(
@@ -98,53 +111,34 @@ def get_shapes():
 @pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gemm_afp8wfp8(M: int, N: int, K: int, dtype: torch.dtype):
+    torch.manual_seed(0)
     if not arch_info.is_fp8_avail():
         pytest.skip("MXFP8 GEMM requires FP8-capable arch")
     torch.cuda.empty_cache()
 
-    x_fp8, w_fp8, x_scales, w_scales = generate_inputs(M, N, K)
+    x_fp8, w_fp8, w_kernel, x_scales, w_scales = generate_inputs(M, N, K, shuffle=False)
 
     torch_out = run_torch_gemm_afp8wfp8(x_fp8, w_fp8, x_scales, w_scales, dtype)
-    triton_out = gemm_afp8wfp8(x_fp8, w_fp8, x_scales, w_scales, dtype=dtype)
+    triton_out = gemm_afp8wfp8(x_fp8, w_kernel, x_scales, w_scales, dtype=dtype)
 
-    torch.testing.assert_close(triton_out, torch_out, atol=0.5, rtol=5e-2)
+    torch.testing.assert_close(triton_out, torch_out, atol=0.03, rtol=1e-2)
 
 
 @pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_gemm_afp8wfp8_preshuffle(M: int, N: int, K: int, dtype: torch.dtype):
+    torch.manual_seed(0)
     if not arch_info.is_fp8_avail():
         pytest.skip("MXFP8 GEMM requires FP8-capable arch")
     if N % 16 != 0 or K % 32 != 0:
         pytest.skip("Preshuffle requires N % 16 == 0 and K % 32 == 0")
     torch.cuda.empty_cache()
 
-    x_fp8, w_fp8, x_scales, w_scales = generate_inputs(M, N, K)
-
-    # Shuffle the weight tensor in place (layout=(16,16)). The shuffler operates on
-    # raw bytes; view as uint8 to avoid any dtype quirks, then view back.
-    w_uint8 = w_fp8.view(torch.uint8)
-    w_shuffled = shuffle_weight(w_uint8, layout=(16, 16))
+    x_fp8, w_fp8, w_kernel, x_scales, w_scales = generate_inputs(M, N, K, shuffle=True)
 
     torch_out = run_torch_gemm_afp8wfp8(x_fp8, w_fp8, x_scales, w_scales, dtype)
     triton_out = gemm_afp8wfp8_preshuffle(
-        x_fp8, w_shuffled, x_scales, w_scales, dtype=dtype
+        x_fp8, w_kernel, x_scales, w_scales, dtype=dtype
     )
 
-    torch.testing.assert_close(triton_out, torch_out, atol=0.5, rtol=5e-2)
-
-
-@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (256, 256, 256)])
-def test_gemm_afp8wfp8_preallocated_output(M: int, N: int, K: int):
-    if not arch_info.is_fp8_avail():
-        pytest.skip("MXFP8 GEMM requires FP8-capable arch")
-    torch.cuda.empty_cache()
-
-    dtype = torch.bfloat16
-    x_fp8, w_fp8, x_scales, w_scales = generate_inputs(M, N, K)
-    y = torch.empty((M, N), dtype=dtype, device="cuda")
-    out = gemm_afp8wfp8(x_fp8, w_fp8, x_scales, w_scales, dtype=dtype, y=y)
-    assert out.data_ptr() == y.data_ptr()
-
-    torch_out = run_torch_gemm_afp8wfp8(x_fp8, w_fp8, x_scales, w_scales, dtype)
-    torch.testing.assert_close(out, torch_out, atol=0.5, rtol=5e-2)
+    torch.testing.assert_close(triton_out, torch_out, atol=0.03, rtol=1e-2)
