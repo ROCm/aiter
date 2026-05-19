@@ -117,7 +117,21 @@ pip install -r requirements.txt
 
 AITER includes Triton-based operators that require triton from AMD PyPI ([ROCm 7.0](https://pypi.amd.com/triton/release/rocm-7.0.0/simple/), [ROCm 7.1](https://pypi.amd.com/triton/release/rocm-7.1.0/simple/), [ROCm 7.2](https://pypi.amd.com/triton/release/rocm-7.2.0/simple/)), with the correct version selected based on your ROCm installation.
 
-If you install with `python3 setup.py develop`, triton is installed automatically. If you use `pip install -e .`, run the install script manually:
+`setup.py` declares `triton>=3.6.0` and pip resolves it against whichever indexes are configured.
+
+To install AITER with stock triton from pypi.org:
+
+```bash
+pip install -e .
+```
+
+To install AITER with the AMD-built triton wheel from AMD PyPI (replace `rocm-7.2.0` with your ROCm version):
+
+```bash
+pip install -e . --extra-index-url https://pypi.amd.com/triton/rocm-7.2.0/simple/
+```
+
+Or use the helper script, which installs the AMD-built triton wheel pinned in [`.github/requirements/triton-test.txt`](.github/requirements/triton-test.txt):
 
 ```bash
 ./.github/scripts/install_triton.sh
