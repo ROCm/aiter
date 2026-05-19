@@ -53,7 +53,6 @@ from .mfma_preshuffle_pipeline import (
     lds_store_4b_xor16,
     make_preshuffle_b_layout,
     make_preshuffle_scale_layout,
-    load_b_raw_mxfp4,
     load_b_raw_mxfp4_dwordx4,
     unpack_b_mxfp4_bf16,
     tile_chunk_coord_i32,
@@ -252,11 +251,10 @@ def compile_mixed_moe_gemm1(
             return _mfma_k32_raw(result_type, a, b, c, cbsz, abid, blgp, loc=loc, ip=ip)
 
     # ---- type helpers (A16W4 forces bf16 X / i8 W; generic dispatches on dtype flags) ----
-    out_mlir = lambda: (
-        (lambda ty: ty() if callable(ty) else ty)(
+    def out_mlir():
+        return (lambda ty: ty() if callable(ty) else ty)(
             T.f16 if out_dtype == "f16" else T.bf16
         )
-    )
 
     def _x_elem_type():
         if is_a16w4_stage1:
@@ -287,7 +285,6 @@ def compile_mixed_moe_gemm1(
             _k_per_batch = model_dim
         _k_dim = _k_per_batch
     else:
-        accumulate = False
         if _is_splitk:
             _k_per_batch = model_dim // k_batch
             assert (
@@ -583,7 +580,6 @@ def compile_mixed_moe_gemm1(
             i32 = T.i32
             i64 = T.i64
             vec4_f32 = T.vec(4, f32)
-            vec1_f16 = T.vec(1, f16)
             vec8_bf16 = T.vec(8, x_elem)
             vec16_x = T.vec(8, x_elem)
             vec2_i64 = T.vec(2, i64)
@@ -596,8 +592,6 @@ def compile_mixed_moe_gemm1(
                 den = one + emu
                 sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den], [], [])
                 return g * sig
-
-            silu = _silu_elem
 
             def _silu_mul_vec4(gate_v4, up_v4):
                 result_elems = []
@@ -803,7 +797,6 @@ def compile_mixed_moe_gemm1(
                 num_x_loads = bytes_per_thread_x // x_load_bytes
                 chunk_i32 = x_load_bytes // 4
                 x_vec_elems = x_load_bytes // elem_bytes
-                x_vec_i32_ty = T.vec(chunk_i32, i32) if chunk_i32 > 1 else T.vec(1, i32)
                 x_vec_x_ty = T.vec(x_vec_elems, x_elem)
 
                 c_k_div4 = (k_in * arith.index(int(elem_bytes))) // arith.index(4)
@@ -1803,8 +1796,6 @@ def compile_mixed_moe_gemm1(
                                 acc_up[_aidx] = arith.addf(acc_up[_aidx], _bsplat)
 
                 # ---- Epilogue ----
-                expert_off = expert_off_idx
-                bx_m0 = bx_m
                 tokens_i32_v = tokens_i32
                 topk_i32_v = topk_i32
                 inter_i32_v = arith.constant(inter_dim, type=T.i32)
@@ -4488,13 +4479,6 @@ def compile_mixed_moe_gemm2(
             a, b, c, cbsz, abid, blgp = _split_mfma(operands, loc=loc)
             return _mfma_k32_raw(result_type, a, b, c, cbsz, abid, blgp, loc=loc, ip=ip)
 
-    # Generic-specific: INT8 MFMA (rare, kept for completeness)
-    mfma_i32_k32 = None
-    if is_int8:
-        mfma_i32_k32 = getattr(rocdl, "mfma_i32_16x16x32i8", None) or getattr(
-            rocdl, "mfma_i32_16x16x32_i8", None
-        )
-
     def _x_elem_type():
         if is_a16w4:
             return T.bf16
@@ -5020,7 +5004,6 @@ def compile_mixed_moe_gemm2(
                     # i32 / f32 / i64 / vec4_f32 / vec2_i64 / acc_init come from
                     # the moe_gemm2 setup-level closure (already defined for the
                     # generic path and equivalent for A16W4 since is_int8=False).
-                    f16 = T.f16
                     _a16_x_elem = T.bf16
                     w_elem = T.i8
                     vec1_i32 = T.vec(1, T.i32)
@@ -5078,8 +5061,6 @@ def compile_mixed_moe_gemm2(
                         )
                     num_x_loads = bytes_per_thread_x // x_load_bytes
                     chunk_i32 = x_load_bytes // 4
-                    x_vec_elems = x_load_bytes // elem_bytes
-                    x_vec_i32_ty = T.vec(chunk_i32, i32) if chunk_i32 > 1 else T.vec(1, i32)
                     _a16_vec16_x = T.vec(8, _a16_x_elem)
 
                     c_k_div4 = (k_in * arith.index(int(elem_bytes))) // arith.index(4)
@@ -5665,7 +5646,6 @@ def compile_mixed_moe_gemm2(
                                 acc[_aidx] = arith.addf(acc[_aidx], _bsplat)
 
                     # ---- Epilogue ----
-                    expert_off = expert_off_idx
                     mask24_i32 = arith.constant(0xFFFFFF, type=T.i32)
                     model_i32 = arith.constant(model_dim, type=T.i32)
                     topk_i32_v = topk_i32
