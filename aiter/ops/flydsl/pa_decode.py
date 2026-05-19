@@ -54,6 +54,7 @@ def flydsl_paged_attention_decode(
     *,
     partition_size: int = _DEFAULT_PARTITION_SIZE,
     kv_compute_block_size: int = _DEFAULT_KV_COMPUTE_BLOCK_SIZE,
+    stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Paged-attention decode for gfx1250.
 
@@ -69,6 +70,9 @@ def flydsl_paged_attention_decode(
             ``kv_compute_block_size``.
         kv_compute_block_size: Number of KV tokens handled per loop iteration. Must
             be a multiple of page table's block size.
+        stream: Optional CUDA stream to launch on. If ``None``, uses
+            ``torch.cuda.current_stream(device=query.device)``. If provided,
+            it must be on the same device as ``query``.
 
     Returns:
         The ``output`` tensor.
@@ -153,57 +157,64 @@ def flydsl_paged_attention_decode(
         device=device,
     )
 
-    # Compile kernels (cached)
-    main_launch = compile_pa_decode_main(
-        HEAD_SIZE=head_size,
-        KV_BLOCK_SIZE=kv_block_size,
-        QUERY_GROUP_SIZE=query_group_size,
-        PARTITION_SIZE=partition_size,
-        KV_COMPUTE_BLOCK_SIZE=kv_compute_block_size,
-        dtype=dtype_str,
-    )
-    reduce_launch = compile_pa_decode_reduce(
-        HEAD_SIZE=head_size,
-        QUERY_GROUP_SIZE=query_group_size,
-        PARTITION_SIZE=partition_size,
-        NUM_PARTITIONS=num_partitions,
-        dtype=dtype_str,
-    )
+    # Resolve / validate the launch stream for the input's device.
+    if stream is None:
+        stream = torch.cuda.current_stream(device=device)
+    elif stream.device != device:
+        raise ValueError(f"`stream` must be on {device}, got {stream.device}")
 
     # Pack float32 attn_scale as i32 for kernel arg (kernel bitcasts back).
     scale_i32 = struct.unpack("<i", struct.pack("<f", float(attn_scale)))[0]
 
-    stream = torch.cuda.current_stream()
+    # Pin the current device so JIT compile + kernel launches go to query.device,
+    # regardless of the caller's current CUDA context.
+    with torch.cuda.device(device):
+        # Compile kernels (cached)
+        main_launch = compile_pa_decode_main(
+            HEAD_SIZE=head_size,
+            KV_BLOCK_SIZE=kv_block_size,
+            QUERY_GROUP_SIZE=query_group_size,
+            PARTITION_SIZE=partition_size,
+            KV_COMPUTE_BLOCK_SIZE=kv_compute_block_size,
+            dtype=dtype_str,
+        )
+        reduce_launch = compile_pa_decode_reduce(
+            HEAD_SIZE=head_size,
+            QUERY_GROUP_SIZE=query_group_size,
+            PARTITION_SIZE=partition_size,
+            NUM_PARTITIONS=num_partitions,
+            dtype=dtype_str,
+        )
 
-    # Launch main kernel. Flatten tensors to 1D views the kernels can index.
-    main_launch(
-        tmp_out.view(-1),
-        max_logits.view(-1),
-        exp_sums.view(-1),
-        query.view(-1),
-        key_cache.view(-1),
-        value_cache.view(-1),
-        block_tables.view(-1),
-        seq_lens.view(-1),
-        scale_i32,
-        num_seqs,
-        num_kv_heads,
-        num_partitions,
-        max_blocks_per_seq,
-        stream,
-    )
+        # Launch main kernel. Flatten tensors to 1D views the kernels can index.
+        main_launch(
+            tmp_out.view(-1),
+            max_logits.view(-1),
+            exp_sums.view(-1),
+            query.view(-1),
+            key_cache.view(-1),
+            value_cache.view(-1),
+            block_tables.view(-1),
+            seq_lens.view(-1),
+            scale_i32,
+            num_seqs,
+            num_kv_heads,
+            num_partitions,
+            max_blocks_per_seq,
+            stream,
+        )
 
-    reduce_launch(
-        output.view(-1),
-        tmp_out.view(-1),
-        max_logits.view(-1),
-        exp_sums.view(-1),
-        seq_lens.view(-1),
-        num_seqs,
-        num_kv_heads,
-        num_partitions,
-        stream,
-    )
+        reduce_launch(
+            output.view(-1),
+            tmp_out.view(-1),
+            max_logits.view(-1),
+            exp_sums.view(-1),
+            seq_lens.view(-1),
+            num_seqs,
+            num_kv_heads,
+            num_partitions,
+            stream,
+        )
     return output
 
 
