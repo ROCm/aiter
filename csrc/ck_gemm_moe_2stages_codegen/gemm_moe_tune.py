@@ -858,7 +858,6 @@ class FmoeTuner(TunerCommon):
             blockM,
             device,
         )
-        input = _data["input"]
         a1_qt = _data["a1_qt"]
         w1_qt = _data["w1_qt"]
         w2_qt = _data["w2_qt"]
@@ -870,10 +869,8 @@ class FmoeTuner(TunerCommon):
         num_valid_ids = _data["num_valid_ids"]
         topk_ids = _data["topk_ids"]
         topk_weights = _data["topk_weights"]
-        moe_buf = _data["moe_buf"]
         a1_scale = _data["a1_scale"]
         w1_scale = _data["w1_scale"]
-        w2_scale = _data["w2_scale"]
         if q_type == QuantType.per_1x128:
             ratio = a1_scale.element_size() // a1_qt.element_size()
             out1 = torch.zeros(
