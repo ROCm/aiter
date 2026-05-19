@@ -161,7 +161,7 @@ def _gemm_a8w8_kernel(
                     cache_modifier=cache_modifier,
                 )
 
-            accumulator += tl.dot(a, b, input_precision="ieee")
+            accumulator += tl.dot(a, b)
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
