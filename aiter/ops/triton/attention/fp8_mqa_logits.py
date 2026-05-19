@@ -139,12 +139,13 @@ def fp8_mqa_logits(
         # the kernel over 64 KB of LDS (e.g. the DSv4 indexer's NUM_HEADS=64,
         # HEAD_SIZE=128). Shrink only when the default would overflow so
         # smaller shapes keep their original throughput.
+        # TODO: gate on computed LDS budget instead of arch string
         if arch == "gfx942" and not _gfx942_default_tile_fits_lds(num_heads, head_size):
             block_kv = 64
-            triton_num_stages = 1
+            num_stages = 1
         else:
             block_kv = 128
-            triton_num_stages = 2
+            num_stages = 2
 
         # heuristic for MFMA instruction shape
         matrix_instr_nonkdim = 32
@@ -190,7 +191,7 @@ def fp8_mqa_logits(
             stride_logits_k=stride_logits_k,
             BLOCK_KV=block_kv,
             num_warps=4,
-            num_stages=triton_num_stages,
+            num_stages=num_stages,
             waves_per_eu=2,
             matrix_instr_nonkdim=matrix_instr_nonkdim,
         )
