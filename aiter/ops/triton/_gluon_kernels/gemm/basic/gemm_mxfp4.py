@@ -260,12 +260,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
     cur_B = depreshuffle_b_raw_to_kn(
         smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES
     ).load(layout=dot_b_layout)
-    cur_AS = depreshuffle_scales(smem_AS.index(slot_c), BLOCK_SIZE_M, K_GROUPS).load(
-        layout=a_scale_layout
-    )
-    cur_BS = depreshuffle_scales(smem_BS.index(slot_c), BLOCK_SIZE_N, K_GROUPS).load(
-        layout=b_scale_layout
-    )
+    cur_AS = smem_AS.index(slot_c).load(layout=a_scale_layout)
+    cur_BS = smem_BS.index(slot_c).load(layout=b_scale_layout)
 
     # --- 3. Main loop: WMMA(cur) → TDM(future) → wait → pre-load(next) ---
     main_iters = k_tiles - (NUM_BUFFERS - 1)
@@ -300,12 +296,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
             BLOCK_N=BLOCK_SIZE_N,
             BLOCK_K_BYTES=BLOCK_K_BYTES,
         ).load(layout=dot_b_layout)
-        cur_AS = depreshuffle_scales(
-            smem_AS.index(next_slot), BLOCK_SIZE_M, K_GROUPS
-        ).load(layout=a_scale_layout)
-        cur_BS = depreshuffle_scales(
-            smem_BS.index(next_slot), BLOCK_SIZE_N, K_GROUPS
-        ).load(layout=b_scale_layout)
+        cur_AS = smem_AS.index(next_slot).load(layout=a_scale_layout)
+        cur_BS = smem_BS.index(next_slot).load(layout=b_scale_layout)
         compute_idx += 1
 
     # --- 4. Epilogue: drain remaining tiles (no new TDM loads) ---
@@ -319,12 +311,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
             BLOCK_N=BLOCK_SIZE_N,
             BLOCK_K_BYTES=BLOCK_K_BYTES,
         ).load(layout=dot_b_layout)
-        next_AS = depreshuffle_scales(
-            smem_AS.index(next_slot), BLOCK_SIZE_M, K_GROUPS
-        ).load(layout=a_scale_layout)
-        next_BS = depreshuffle_scales(
-            smem_BS.index(next_slot), BLOCK_SIZE_N, K_GROUPS
-        ).load(layout=b_scale_layout)
+        next_AS = smem_AS.index(next_slot).load(layout=a_scale_layout)
+        next_BS = smem_BS.index(next_slot).load(layout=b_scale_layout)
 
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
