@@ -86,6 +86,7 @@ def generate_cp_test_data(seq_len, seq_len_kv):
 @pytest.mark.parametrize(
     "s_q, s_k",
     [
+        (1, 1),
         (1, 16),
         (1, 113),
         (17, 76),
@@ -113,7 +114,7 @@ def test_fp8_mqa_logits(
     q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-    kv = (kv_fp8.to(torch.float32) * scales[:, None]).to(torch.bfloat16)
+    kv = (kv_fp8.to(torch.float32) * scales.reshape(-1, 1)).to(torch.bfloat16)
     weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
     # to respect the aseert in generate_cp_test_data
     if disable_cp or s_k % s_q != 0 or s_q % 2 != 0:
@@ -145,4 +146,6 @@ def test_fp8_mqa_logits(
     ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
     logits = logits.masked_fill(neginf_mask, 0)
     diff = calc_diff(logits, ref_logits)
+    if ref_neginf_mask.all():
+        return  # nothing left to compare
     assert diff < 1e-3, f"{diff=}"
