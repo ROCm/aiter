@@ -1148,6 +1148,19 @@ def compile_pa_decode_reduce(
             out_vec_f32 = arith.mulf(acc_final, inv_l_vec)
             out_vec_half = arith.trunc_f(vec_half_ty, out_vec_f32)
 
+            # Empty-seq guard: when num_parts_actual == 0 (seq_len == 0), every
+            # partition is invalid and the online softmax cascade produces NaN
+            # via -inf - -inf and 1 / 0. Mask the output to zero in that case.
+            is_empty = arith.cmpi(
+                arith.CmpIPredicate.eq,
+                _raw(num_parts_actual),
+                _raw(zero_idx),
+            )
+            zero_vec_half = arith.constant_vector(0.0, vec_half_ty)
+            out_vec_half = arith.select(
+                is_empty, _raw(zero_vec_half), _raw(out_vec_half)
+            )
+
             out_off = (
                 seq_idx * stride_out_seq
                 + (kv_head * arith.index(QUERY_GROUP_SIZE) + r) * stride_out_head
