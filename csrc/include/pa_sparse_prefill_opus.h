@@ -435,8 +435,7 @@ __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr, opus::u32_t neg_
 }
 
 template<typename T, typename V>
-__device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_tile_idx,
-                                             opus::u32_t neg_inf_v, int lane_id) {
+__device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_tile_idx, opus::u32_t neg_inf_v) {
     using D_ACC = typename T::D_ACC;
     using D_ACC_X2 = opus::vector_t<D_ACC, 2>;
     using U32_X2 = opus::vector_t<opus::u32_t, 2>;
@@ -448,6 +447,8 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
 
     const int last_valid_kv_pos = valid_kv_len - 1;
     const int k_start_pos = kv_tile_idx * T::KV_TILE_SIZE;
+    int lane_id = opus::thread_id_x() % T::WARP_SIZE;
+    asm volatile("" : "+v"(lane_id));  // break CSE
     const int lane_group = lane_id / T::W_M;
 
     opus::static_for<T::GEMM0_E_N>([&](auto i_n) {
@@ -564,7 +565,7 @@ __device__ void pa_prefill_accum_le2_tiles(pa_sparse_prefill_kargs kargs,
     const opus::u32_t neg_inf_v = std::bit_cast<opus::u32_t>(-opus::numeric_limits<D_ACC>::infinity());
     auto mask_oob_scores = [&](auto& s, int tile_idx) {
         if ((tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len) {
-            attn_mask_oob_kv_tile<T>(s, valid_kv_len, tile_idx, neg_inf_v, lane_id);
+            attn_mask_oob_kv_tile<T>(s, valid_kv_len, tile_idx, neg_inf_v);
         }
     };
 
@@ -706,7 +707,7 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
     const opus::u32_t neg_inf_v = std::bit_cast<opus::u32_t>(-opus::numeric_limits<D_ACC>::infinity());
     auto mask_oob_scores = [&](auto& s, int tile_idx) {
         if ((tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len) {
-            attn_mask_oob_kv_tile<T>(s, valid_kv_len, tile_idx, neg_inf_v, lane_id);
+            attn_mask_oob_kv_tile<T>(s, valid_kv_len, tile_idx, neg_inf_v);
         }
     };
 
