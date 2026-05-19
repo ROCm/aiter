@@ -116,8 +116,6 @@ def unified_attention_sparse_mla(
     Q_SCALE = q_scale_t is not None
     K_SCALE = k_scale_t is not None
     V_SCALE = v_scale_t is not None
-    HAS_FP8 = Q_SCALE or K_SCALE or V_SCALE
-
     block_size = kv.shape[1]
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
