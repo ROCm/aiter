@@ -24,7 +24,6 @@ def ref_masked_attention(
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     if is_causal:
         s_q = query.shape[0]
-        print(s_q)
         s_k = key.shape[0]
         attn_bias = torch.zeros(s_q, s_k, dtype=query.dtype)
         temp_mask = torch.ones(s_q, s_k, dtype=torch.bool).tril(diagonal=s_k - s_q)
