@@ -394,3 +394,111 @@ under a minute.
 
 The wrapper script writes everything under `runs/<timestamp>/`. The
 result directories are intentionally not committed.
+
+---
+
+## 8. Follow-up: FP8 long-context decode (`b=128 sq=1 sk=128000 d=64`)
+
+The prior sections used a small prefill shape (`b=4 sq=8`). A separate
+investigation against a realistic long-context decode shape uncovered a
+second, totally different bottleneck — **FP8 was issuing 2x more
+async-load instructions than BF16 for the same byte volume.**
+
+Reproduce:
+
+```bash
+cd ua-test-scripts/rocprof_analysis
+OUT=runs/bf16_d64 ./run_profile.sh -b 128 -sq 1 -sk 128000 -hq 64 -hk 8 -d 64 \
+                    --num-blocks 12000 --block-size 32 --dtype bf16
+OUT=runs/fp8_d64 ./run_profile.sh -b 128 -sq 1 -sk 128000 -hq 64 -hk 8 -d 64 \
+                    --num-blocks 12000 --block-size 32 --dtype fp8
+```
+
+### 8.1 Symptom
+
+CK BF16 was *faster* than CK FP8 on this shape, opposite of Triton. Per
+`SQ_INSTS_*` (median over 6 post-warmup dispatches):
+
+| Counter | BF16 | FP8 (before fix) | Δ FP8 vs BF16 |
+|---|---:|---:|---:|
+| GRBM_GUI_ACTIVE | 116.5 M | 144.3 M | +24% |
+| SQ_INSTS_VMEM | 65.5 M | **131.1 M** | **+100%** |
+| SQ_INSTS_VALU | 1.34 B | **2.21 B** | **+65%** |
+| SQ_INSTS_MFMA | 32.8 M | 32.8 M | same |
+| TCC_BUSY_avr (L2) | 13.1 M | 17.2 M | +32% |
+
+PC-sample category shift: BF16 spends 27% in WAIT and 45% in
+VALU_OTHER; FP8 spends 15% in WAIT and **55%** in VALU_OTHER. The FP8
+kernel is **doing more work** rather than waiting more.
+
+### 8.2 Root cause: the FP8 `GetAlignmentK`/`GetAlignmentV` blanket cap
+
+`GetAlignmentK` previously returned `4 B/lane` (one `dword`) for every
+FP8 tile, regardless of `kBlockSize`, citing the static_assert in
+`amd_buffer_addressing_builtins` (only `dword`/`dwordx3`/`dwordx4` are
+supported on gfx950 LDS-direct loads) and a NumIssues=0.5 case in the
+8-warp prefill variants. That reasoning over-fitted to prefill.
+
+The actual constraint is per-tile:
+
+```
+NumIssues = (kPageBlockSize * kHeadDim) / (kBlockSize * KVector_elems)
+```
+
+`KVector_elems = 16` (`dwordx4` for FP8) works whenever `tile_bytes`
+is a multiple of `kBlockSize * 16`. For the seven decode/prefill
+variants currently compiled:
+
+| Variant | `kBlockSize` | `tile_elems` | NumIssues @ 16 B | Decision |
+|---|---:|---:|---:|:---|
+| `prefill_d128` | 512 | 32x128 = 4096 | 0.5 | fall back to dword |
+| `prefill_d64`  | 512 | 64x64 = 4096 | 0.5 | fall back to dword |
+| `decode_d128_m128` | 256 | 4096 | 1 | **use dwordx4** |
+| `decode_d128_m32`  |  64 | 4096 | 16 | **use dwordx4** |
+| `decode_d128_m16`  |  64 | 4096 | 16 | **use dwordx4** |
+| `decode_d64_m128`  | 256 | 4096 | 1 | **use dwordx4** |
+| `decode_d64_m64`   | 128 | 4096 | 2 | **use dwordx4** |
+| `decode_d64_m16`   |  64 | 4096 | 16 | **use dwordx4** |
+
+The fix in `unified_attention_pipeline_default_policy.hpp`
+(`GetKVAlignmentBytes<>`) picks `dwordx4` whenever it tiles cleanly and
+falls back to `dword` for the prefill tier. BF16/FP16 paths are
+unchanged.
+
+### 8.3 Result on the reference shape
+
+PMC re-collected with the same script after the fix:
+
+| Counter | FP8 (before) | FP8 (after) | Δ |
+|---|---:|---:|---:|
+| GRBM_GUI_ACTIVE | 144.3 M | **87.2 M** | **-40%** |
+| SQ_INSTS_VMEM | 131.1 M | **32.8 M** | **-75%** (4x fewer issues) |
+| SQ_INSTS_VALU | 2.21 B | **0.74 B** | -67% |
+| SQ_INSTS_SALU | 146.7 M | 73.0 M | -50% |
+| TCC_BUSY_avr | 17.2 M | 10.1 M | -41% |
+| SQ_WAIT_INST_ANY | 441.6 M | 203.3 M | -54% |
+
+Wallclock on the reference shape (b=128 sq=1 sk=128000 d=64):
+
+| | CK FP8 (before) | CK FP8 (after) | CK BF16 | Triton FP8 |
+|---|---:|---:|---:|---:|
+| ms | 7.17 | **4.57** | 6.06 | 7.44 |
+
+CK FP8 is now **35% faster than before** and the BF16/FP8 ordering
+matches expectation (FP8 < BF16, since BF16 still uses the same 16 B
+loads but moves 2x the bytes per element). On the broader decode sweep
+the speedup ranges 36-69% across `b ∈ {4, 128, 256}`, `d ∈ {64, 128}`,
+and prefill (which keeps the `dword` fall-back) is unchanged.
+
+### 8.4 Takeaways for future profiling
+
+- **Always sanity-check the issue count, not just bytes-moved.**
+  `SQ_INSTS_VMEM` and `SQ_INSTS_VALU` were the headline counters here;
+  the load-width misconfiguration was invisible from `TA_BUSY` or
+  `TCC_BUSY` alone.
+- **Compare FP8 against BF16 explicitly** on every shape — the 2x ratio
+  was an immediate red flag because FP8 should issue *fewer*, not more,
+  load instructions for the same data.
+- The original "FP8 needs dword on gfx950" comment was correct *for the
+  prefill tier* but over-applied. Per-variant analysis at compile time
+  is the right granularity, not per-dtype.
