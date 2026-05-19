@@ -167,8 +167,6 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 w_shuffle = gd["w_shuffle"]
                 x_scales_shuffle = gd["x_scales_shuffle"]
                 w_scales_shuffle = gd["w_scales_shuffle"]
-                out_ck = gd["out_ck"]
-                bias_f32 = gd["bias_f32"]
                 out, us = run_perftest(
                     gemm_a4w4,
                     x,
