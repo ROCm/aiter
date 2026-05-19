@@ -265,16 +265,9 @@ __global__ void add_rmsnorm_quant_kernel(
                 if constexpr(FUSE_QUANT) // must be fp4 here
                 {
                     float thread_max = 1e-10f;
-                    if constexpr(thread_data_size % 2 == 0)
+                    for(int i = 0; i < thread_data_size; i++)
                     {
-                        max = aiter::fp4_f32_to_e8m0_scale(max);
-                    }
-                    else
-                    {
-                        for(int i = 0; i < thread_data_size; i++)
-                        {
-                            thread_max = fmaxf(thread_max, fabsf(static_cast<float>(thread_data_float[i])));
-                        }
+                        thread_max = fmaxf(thread_max, fabsf(static_cast<float>(thread_data_float[i])));
                     }
                     auto fp4_scale = [](float tmp) {
                         uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
