@@ -248,7 +248,7 @@ def _moe_gemm_int8_smoothquant(
         if PRESHUFFLED:
             w = unshuffle_weights(w, BLOCK_N, BLOCK_K)
 
-        acc += tl.dot(x, w, input_precision="ieee")
+        acc += tl.dot(x, w)
 
         XPtrs += (BLOCK_K * SPLIT_K) * stride_x_k
         WPtrs += (PACKED_BLOCK_K * SPLIT_K) * stride_w_k
@@ -267,7 +267,7 @@ def _moe_gemm_int8_smoothquant(
         if PRESHUFFLED:
             w = unshuffle_weights(w, BLOCK_N, BLOCK_K)
 
-        acc += tl.dot(x, w, input_precision="ieee")
+        acc += tl.dot(x, w)
 
     # per-token activation scale
     offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)

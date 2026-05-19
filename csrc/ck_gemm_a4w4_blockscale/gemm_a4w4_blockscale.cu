@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include <torch/extension.h>
@@ -11,14 +11,19 @@
 #include "gemm_a4w4_blockscale_lookup.h"
 #include "gemm_a4w4_blockscale_manifest.h"
 
-using BlockwiseKernel = std::function<torch::Tensor(torch::Tensor&,
-                                                    torch::Tensor&,
-                                                    torch::Tensor&,
-                                                    torch::Tensor&,
-                                                    torch::Tensor&,
-                                                    int)>;
+using BlockwiseKernel = torch::Tensor (*)(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
 
-using BlockwiseKernelMap = std::unordered_map<std::string, BlockwiseKernel>;
+// Name-keyed dispatch table; see gemm_a8w8_blockscale.cu for the rationale
+// behind std::string_view keys + raw fn-ptr values (constant-init into
+// .data.rel.ro, matching PR #3255's GemmDispatchMap style).
+//
+// Note: the a4w4 tuned CSV mixes CK and ASM kernels; the ASM rows are
+// filtered out at codegen (see csrc/ck_gemm_a4w4_blockscale/gen_instances.py)
+// and dispatched separately by aiter/ops/gemm_op_a4w4.py based on the
+// kernelName prefix (_ZN... = mangled ASM symbol).  This map only contains
+// CK kernels.
+using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>;
 
 // Python-driven name-keyed dispatch (see gemm_a8w8_blockscale.cu for the
 // rationale).  Empty kernelName -> default heuristic; non-empty but unknown
@@ -43,7 +48,7 @@ BlockwiseKernel blockscale_dispatch(const std::string& kernelName)
 
     if(!kernelName.empty())
     {
-        auto it = lookup.find(kernelName);
+        auto it = lookup.find(std::string_view{kernelName});
         if(it != lookup.end())
         {
             return it->second;

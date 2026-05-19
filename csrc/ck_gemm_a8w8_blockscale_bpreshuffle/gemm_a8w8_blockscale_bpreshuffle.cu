@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include <torch/extension.h>
@@ -11,10 +11,13 @@
 #include "gemm_a8w8_blockscale_bpreshuffle_lookup.h"
 #include "gemm_a8w8_blockscale_bpreshuffle_manifest.h"
 
-using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
+using BlockwiseKernel = torch::Tensor (*)(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&);
 
-using BlockwiseKernelMap = std::unordered_map<std::string, BlockwiseKernel>;
+// Name-keyed dispatch table; see gemm_a8w8_blockscale.cu for the rationale
+// behind std::string_view keys + raw fn-ptr values (constant-init into
+// .data.rel.ro, matching PR #3255's GemmDispatchMap style).
+using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>;
 
 // Python-driven name-keyed dispatch (see gemm_a8w8_blockscale.cu for the
 // rationale).  Empty kernelName -> default heuristic; non-empty but unknown
@@ -39,7 +42,7 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(const std::string& kernelName)
 
     if(!kernelName.empty())
     {
-        auto it = lookup.find(kernelName);
+        auto it = lookup.find(std::string_view{kernelName});
         if(it != lookup.end())
         {
             return it->second;

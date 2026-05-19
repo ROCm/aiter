@@ -12,8 +12,7 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-
-import os
+from aiter.jit.core import is_experimental_enabled
 
 
 @triton.jit
@@ -238,7 +237,6 @@ def mla_decode_fwd(
                         q.dtype == dtypes.bf16
                         and kv_buffer.dtype == dtypes.bf16
                         and nhead == 32
-                        and max_seqlen_q == 1
                     )
                 )
             )
@@ -288,7 +286,6 @@ def mla_decode_fwd(
                 q.dtype == dtypes.bf16
                 and kv_buffer.dtype == dtypes.bf16
                 and nhead == 32
-                and max_seqlen_q == 1
             )
         ):
             lse = final_lse if return_lse else attn_lse
@@ -336,10 +333,32 @@ def mla_decode_fwd(
         if (
             nhead == 16
             or (
-                get_gfx() in ("gfx942", "gfx950")
+                get_gfx() == "gfx942"
                 and nhead == 128
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
+            )
+            or (
+                get_gfx() == "gfx950"
+                and nhead == 128
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and is_experimental_enabled()
+            )
+            or (
+                get_gfx() == "gfx942"
+                and nhead in (16, 32, 64)
+                and nhead * max_seqlen_q == 128
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and is_experimental_enabled()
+            )
+            or (
+                get_gfx() == "gfx950"
+                and nhead == 128
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q != 4
             )
             or (
                 get_gfx() == "gfx950"
@@ -354,12 +373,6 @@ def mla_decode_fwd(
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
                 and max_seqlen_q == 2
-            )
-            or (
-                get_gfx() == "gfx950"
-                and nhead * max_seqlen_q % 128 == 0
-                and q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
             )
             or (
                 get_gfx() == "gfx950"
@@ -381,6 +394,11 @@ def mla_decode_fwd(
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
                 and max_seqlen_q == 1
+            )
+            or (
+                get_gfx() == "gfx950"
+                and q.dtype == dtypes.bf16
+                and kv_buffer.dtype == dtypes.bf16
             )
         ):
             # Natively support cases
@@ -448,11 +466,19 @@ def mla_decode_fwd(
         )
 
         use_hk = (
-            nhead == 128
+            get_gfx() in ("gfx942", "gfx950")
+            and nhead * max_seqlen_q == 128
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
-            and page_size == 1
-            and os.getenv("AITER_ENABLE_EXPERIMENTAL", False)
+            and page_size in (1, 64)
+            and is_experimental_enabled()
+        ) or (
+            get_gfx() == "gfx950"
+            and nhead * max_seqlen_q == 64
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and page_size in (1, 64)
+            and is_experimental_enabled()
         )
 
         if use_hk:

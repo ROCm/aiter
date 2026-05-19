@@ -1243,6 +1243,208 @@ __global__ void indexer_k_quant_and_cache_kernel(
     *kv_cache_vec       = aiter::scaled_cast<cache_t>(k_val, scale);
 }
 
+template <typename scalar_t,
+          typename cache_t,
+          vllm::Fp8KVCacheDataType kv_dt,
+          int HEAD_DIM,
+          int ROPE_DIM>
+__global__ void indexer_qk_rope_quant_and_cache_kernel(
+    const scalar_t* __restrict__ q,           // [num_tokens, n_heads, head_dim]
+    cache_t* __restrict__ q_out,              // [num_tokens, n_heads, head_dim]
+    const scalar_t* __restrict__ weights,     // [num_tokens, n_heads]
+    float* __restrict__ weights_out,          // [num_tokens, n_heads]
+    const scalar_t* __restrict__ k,           // [num_tokens, head_dim]
+    cache_t* __restrict__ kv_cache,           // [num_blocks, block_size, cache_stride]
+    const int64_t* __restrict__ slot_mapping, // [num_tokens]
+    const scalar_t* __restrict__ norm_weight, // [head_dim]
+    const scalar_t* __restrict__ norm_bias,   // [head_dim]
+    const int64_t* __restrict__ positions,    // [num_tokens]
+    const scalar_t* __restrict__ cos_cache,   // [max_position, ..., rope_dim / 2]
+    const scalar_t* __restrict__ sin_cache,   // [max_position, ..., rope_dim / 2]
+    const int num_tokens,
+    const int n_heads,
+    const int quant_block_size,
+    const int cache_block_size,
+    const int cache_stride,
+    const int64_t q_stride_t,
+    const int64_t q_stride_h,
+    const int64_t q_stride_d,
+    const int64_t q_out_stride_t,
+    const int64_t q_out_stride_h,
+    const int64_t q_out_stride_d,
+    const int64_t weights_stride_t,
+    const int64_t weights_stride_h,
+    const int64_t weights_out_stride_t,
+    const int64_t weights_out_stride_h,
+    const int64_t cos_stride0,
+    const int64_t sin_stride0,
+    const float epsilon,
+    const float weights_scale,
+    const bool use_ue8m0,
+    const bool preshuffle,
+    const bool is_neox)
+{
+    static_assert(HEAD_DIM == 128, "Indexer fused qk cache currently supports head_dim=128");
+    static_assert(ROPE_DIM == 64, "Indexer fused qk cache currently supports rope_dim=64");
+
+    const int64_t token_idx = blockIdx.x;
+    const int head_idx      = blockIdx.y;
+    const int dim           = threadIdx.x;
+    if(token_idx >= num_tokens || head_idx >= n_heads)
+        return;
+
+    const int64_t slot_idx = slot_mapping[token_idx];
+    if(slot_idx < 0)
+        return;
+
+    const int64_t pos = positions[token_idx];
+    const scalar_t* cos_ptr = cos_cache + pos * cos_stride0;
+    const scalar_t* sin_ptr = sin_cache + pos * sin_stride0;
+
+    __shared__ float q_vals[HEAD_DIM];
+    const scalar_t* q_row = q + token_idx * q_stride_t + head_idx * q_stride_h;
+    float q_val = dim < HEAD_DIM ? static_cast<float>(q_row[dim * q_stride_d]) : 0.0f;
+    q_vals[dim] = q_val;
+    __syncthreads();
+
+    if(dim < ROPE_DIM)
+    {
+        if(is_neox)
+        {
+            constexpr int HALF = ROPE_DIM / 2;
+            const int pair_dim = dim < HALF ? dim + HALF : dim - HALF;
+            const float pair_val = q_vals[pair_dim];
+            const int cos_idx = dim < HALF ? dim : dim - HALF;
+            const float cos_v = static_cast<float>(cos_ptr[cos_idx]);
+            const float sin_v = static_cast<float>(sin_ptr[cos_idx]);
+            q_val = dim < HALF ? (q_val * cos_v - pair_val * sin_v)
+                               : (q_val * cos_v + pair_val * sin_v);
+        }
+        else
+        {
+            const int pair_dim = (dim % 2 == 0) ? dim + 1 : dim - 1;
+            const float pair_val = q_vals[pair_dim];
+            const int cos_idx = dim / 2;
+            const float cos_v = static_cast<float>(cos_ptr[cos_idx]);
+            const float sin_v = static_cast<float>(sin_ptr[cos_idx]);
+            q_val = (dim % 2 == 0) ? (q_val * cos_v - pair_val * sin_v)
+                                   : (q_val * cos_v + pair_val * sin_v);
+        }
+        // Match the separate RoPE path, which materializes q_pe before FP8 quant.
+        q_val = static_cast<float>(static_cast<scalar_t>(q_val));
+    }
+
+    auto max_func = [](float a, float b) { return fmaxf(a, b); };
+    float q_amax = fabsf(q_val);
+    q_amax = block_reduce<float, decltype(max_func), HEAD_DIM, true>(q_amax, max_func);
+
+    const float q_fp8_max = static_cast<float>(opus::finfo<cache_t>::max());
+    // Q scale is consumed by weights_out and must match the unfused quant path;
+    // only the K cache scale is encoded as UE8M0 for cache layout compatibility.
+    const float q_scale = fmaxf(q_amax, 1e-10f) / q_fp8_max;
+    const float q_inv_scale = 1.0f / q_scale;
+    q_out[token_idx * q_out_stride_t + head_idx * q_out_stride_h + dim * q_out_stride_d] =
+        opus::cast<cache_t>(q_val * q_inv_scale);
+    if(dim == 0)
+    {
+        const float w = static_cast<float>(
+            weights[token_idx * weights_stride_t + head_idx * weights_stride_h]);
+        weights_out[token_idx * weights_out_stride_t + head_idx * weights_out_stride_h] =
+            w * q_scale * weights_scale;
+    }
+
+    if(head_idx != 0)
+        return;
+
+    __shared__ float normed[HEAD_DIM];
+    const scalar_t* k_row = k + token_idx * HEAD_DIM;
+
+    float x = dim < HEAD_DIM ? static_cast<float>(k_row[dim]) : 0.0f;
+    auto sum_func = [](float a, float b) { return a + b; };
+    float sum = block_reduce<float, decltype(sum_func), HEAD_DIM, true>(x, sum_func);
+    const float mean = sum / static_cast<float>(HEAD_DIM);
+
+    float centered = x - mean;
+    float ss = block_reduce<float, decltype(sum_func), HEAD_DIM, true>(centered * centered, sum_func);
+    const float inv_std = rsqrtf(ss / static_cast<float>(HEAD_DIM) + epsilon);
+
+    float k_val = centered * inv_std * static_cast<float>(norm_weight[dim]) +
+                  static_cast<float>(norm_bias[dim]);
+    k_val = static_cast<float>(static_cast<scalar_t>(k_val));
+    normed[dim] = k_val;
+    __syncthreads();
+
+    if(dim < ROPE_DIM)
+    {
+        if(is_neox)
+        {
+            constexpr int HALF = ROPE_DIM / 2;
+            const int pair_dim = dim < HALF ? dim + HALF : dim - HALF;
+            const float pair_val = normed[pair_dim];
+            const int cos_idx = dim < HALF ? dim : dim - HALF;
+            const float cos_v = static_cast<float>(cos_ptr[cos_idx]);
+            const float sin_v = static_cast<float>(sin_ptr[cos_idx]);
+            k_val = dim < HALF ? (k_val * cos_v - pair_val * sin_v)
+                               : (k_val * cos_v + pair_val * sin_v);
+        }
+        else
+        {
+            const int pair_dim = (dim % 2 == 0) ? dim + 1 : dim - 1;
+            const float pair_val = normed[pair_dim];
+            const int cos_idx = dim / 2;
+            const float cos_v = static_cast<float>(cos_ptr[cos_idx]);
+            const float sin_v = static_cast<float>(sin_ptr[cos_idx]);
+            k_val = (dim % 2 == 0) ? (k_val * cos_v - pair_val * sin_v)
+                                   : (k_val * cos_v + pair_val * sin_v);
+        }
+        k_val = static_cast<float>(static_cast<scalar_t>(k_val));
+        normed[dim] = k_val;
+    }
+    __syncthreads();
+
+    float k_amax = fabsf(normed[dim]);
+    k_amax = block_reduce<float, decltype(max_func), HEAD_DIM, true>(k_amax, max_func);
+
+    float k_scale = fmaxf(k_amax, 1e-4f) / q_fp8_max;
+    if(use_ue8m0)
+    {
+        k_scale = exp2f(ceilf(log2f(k_scale)));
+    }
+
+    const int64_t block_idx    = slot_idx / cache_block_size;
+    const int64_t block_offset = slot_idx % cache_block_size;
+    int64_t dst_offset;
+    if(preshuffle)
+    {
+        constexpr int TILE       = 16;
+        const int token_tile_id  = block_offset / TILE;
+        const int token_in_tile  = block_offset % TILE;
+        const int col_tile_id    = dim / TILE;
+        const int col_in_tile    = dim % TILE;
+        dst_offset = block_idx * cache_block_size * cache_stride
+                   + token_tile_id * (TILE * HEAD_DIM)
+                   + col_tile_id   * (TILE * TILE)
+                   + token_in_tile * TILE
+                   + col_in_tile;
+    }
+    else
+    {
+        dst_offset =
+            block_idx * cache_block_size * cache_stride + block_offset * HEAD_DIM + dim;
+    }
+
+    if(dim == 0)
+    {
+        const int64_t dst_scale_idx =
+            block_idx * cache_block_size * cache_stride + cache_block_size * HEAD_DIM +
+            block_offset * HEAD_DIM * 4 / quant_block_size;
+        reinterpret_cast<float*>(kv_cache)[dst_scale_idx / 4] = k_scale;
+    }
+
+    const float k_inv_scale = 1.0f / k_scale;
+    kv_cache[dst_offset] = opus::cast<cache_t>(normed[dim] * k_inv_scale);
+}
+
 template <int BLOCK_X_SIZE, int BLOCK_Y_SIZE>
 __global__ void cp_gather_indexer_k_quant_cache_kernel(
     const char* __restrict__ kv_cache,   // [num_blocks, block_size,
@@ -1315,16 +1517,20 @@ __global__ void cp_gather_indexer_k_quant_cache_kernel(
         src_inblock_offset = src_block_offset + block_offset * head_dim + head_idx;
     }
 
-    reinterpret_cast<float4*>(dst_k)[dst_inblock_offset / VEC_SIZE] =
-        reinterpret_cast<const float4*>(kv_cache)[src_inblock_offset / VEC_SIZE];
+    // Inference engines like ATOM and vLLM allocate head_size+4 bytes for each block in kv_cache to
+    // store cache and scales. In models like DSv3.2 and GLM5, this gives 128+4=132 bytes per block,
+    // which is not divisible by VEC_SIZE=16. Therefore, use byte addressing to advance through the
+    // block before casting to dwordx4 for read/write.
+    *reinterpret_cast<float4*>(dst_k + dst_inblock_offset) =
+        *reinterpret_cast<const float4*>(kv_cache + src_inblock_offset);
     if(threadIdx.x == 0)
     {
         // Scale layout is unchanged regardless of preshuffle
         const int64_t cache_inblock_offset = block_offset * head_dim + head_idx;
         const int64_t src_scale_offset = src_block_offset + cache_block_size * head_dim +
                                          cache_inblock_offset * 4 / quant_block_size;
-        reinterpret_cast<float*>(dst_scale)[dst_inblock_offset / quant_block_size] =
-            reinterpret_cast<const float*>(kv_cache)[src_scale_offset / 4];
+        *reinterpret_cast<float*>(dst_scale + dst_inblock_offset * 4 / quant_block_size) =
+            *reinterpret_cast<const float*>(kv_cache + src_scale_offset);
     }
 }
 
@@ -2934,6 +3140,43 @@ void reshape_and_cache_flash(
                                      use_ue8m0,                                                   \
                                      do_preshuffle);
 
+#define CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                             \
+    aiter::indexer_qk_rope_quant_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, 128, 64>               \
+        <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(q.data_ptr()),                       \
+                                     reinterpret_cast<CACHE_T*>(q_out.data_ptr()),                \
+                                     reinterpret_cast<KV_T*>(weights.data_ptr()),                  \
+                                     reinterpret_cast<float*>(weights_out.data_ptr()),             \
+                                     reinterpret_cast<KV_T*>(k.data_ptr()),                       \
+                                     reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),             \
+                                     reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),          \
+                                     reinterpret_cast<KV_T*>(norm_weight.data_ptr()),              \
+                                     reinterpret_cast<KV_T*>(norm_bias.data_ptr()),                \
+                                     reinterpret_cast<int64_t*>(positions.data_ptr()),             \
+                                     reinterpret_cast<KV_T*>(cos_cache.data_ptr()),                \
+                                     reinterpret_cast<KV_T*>(sin_cache.data_ptr()),                \
+                                     num_tokens,                                                  \
+                                     n_heads,                                                     \
+                                     quant_block_size,                                            \
+                                     cache_block_size,                                            \
+                                     cache_stride,                                                \
+                                     q.stride(0),                                                 \
+                                     q.stride(1),                                                 \
+                                     q.stride(2),                                                 \
+                                     q_out.stride(0),                                             \
+                                     q_out.stride(1),                                             \
+                                     q_out.stride(2),                                             \
+                                     weights.stride(0),                                           \
+                                     weights.stride(1),                                           \
+                                     weights_out.stride(0),                                       \
+                                     weights_out.stride(1),                                       \
+                                     cos_cache.stride(0),                                         \
+                                     sin_cache.stride(0),                                         \
+                                     epsilon,                                                     \
+                                     weights_scale,                                               \
+                                     use_ue8m0,                                                   \
+                                     do_preshuffle,                                               \
+                                     is_neox);
+
 #define CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(BLOCK_Y_SIZE)          \
     aiter::cp_gather_indexer_k_quant_cache_kernel<8, BLOCK_Y_SIZE>  \
         <<<dim3((num_tokens + BLOCK_Y_SIZE - 1) / BLOCK_Y_SIZE,     \
@@ -3335,7 +3578,7 @@ void indexer_k_quant_and_cache(aiter_tensor_t& k,        // [num_tokens, head_di
                                const std::string& scale_fmt,
                                bool preshuffle)
 {
-    int num_tokens       = k.size(0);
+    int num_tokens       = std::min(k.size(0), slot_mapping.size(0));
     int head_dim         = k.size(1);
     int cache_block_size = kv_cache.size(1);
     int cache_stride     = kv_cache.size(2);
@@ -3367,6 +3610,109 @@ void indexer_k_quant_and_cache(aiter_tensor_t& k,        // [num_tokens, head_di
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
     DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(k.dtype(), "fp8_e4m3", CALL_INDEXER_K_QUANT_AND_CACHE);
+}
+
+void indexer_qk_rope_quant_and_cache(
+    aiter_tensor_t& q,            // [num_tokens, n_heads, head_dim]
+    aiter_tensor_t& q_out,        // [num_tokens, n_heads, head_dim]
+    aiter_tensor_t& weights,      // [num_tokens, n_heads]
+    aiter_tensor_t& weights_out,  // [num_tokens, n_heads]
+    aiter_tensor_t& k,            // [num_tokens, head_dim]
+    aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]
+    aiter_tensor_t& slot_mapping, // [num_tokens]
+    aiter_tensor_t& norm_weight,  // [head_dim]
+    aiter_tensor_t& norm_bias,    // [head_dim]
+    aiter_tensor_t& positions,    // [num_tokens]
+    aiter_tensor_t& cos_cache,    // [max_position, ..., rope_dim / 2]
+    aiter_tensor_t& sin_cache,    // [max_position, ..., rope_dim / 2]
+    double epsilon,
+    int64_t quant_block_size,
+    const std::string& scale_fmt,
+    double weights_scale,
+    bool preshuffle,
+    bool is_neox)
+{
+    int num_tokens       = std::min(k.size(0), slot_mapping.size(0));
+    int head_dim         = k.size(1);
+    int n_heads          = q.size(1);
+    int rope_dim         = cos_cache.size(-1) * 2;
+    int cache_block_size = kv_cache.size(1);
+    int cache_stride     = kv_cache.size(2);
+    bool use_ue8m0       = scale_fmt == "ue8m0";
+    bool do_preshuffle   = preshuffle;
+
+    AITER_CHECK(q.device_id == k.device_id, "q and k must be on the same device");
+    AITER_CHECK(q.device_id == q_out.device_id, "q and q_out must be on the same device");
+    AITER_CHECK(q.device_id == weights.device_id, "q and weights must be on the same device");
+    AITER_CHECK(q.device_id == weights_out.device_id,
+                "q and weights_out must be on the same device");
+    AITER_CHECK(q.device_id == kv_cache.device_id, "q and kv_cache must be on the same device");
+    AITER_CHECK(q.device_id == slot_mapping.device_id,
+                "q and slot_mapping must be on the same device");
+    AITER_CHECK(q.device_id == norm_weight.device_id,
+                "q and norm_weight must be on the same device");
+    AITER_CHECK(q.device_id == norm_bias.device_id, "q and norm_bias must be on the same device");
+    AITER_CHECK(q.device_id == positions.device_id, "q and positions must be on the same device");
+    AITER_CHECK(q.device_id == cos_cache.device_id, "q and cos_cache must be on the same device");
+    AITER_CHECK(q.device_id == sin_cache.device_id, "q and sin_cache must be on the same device");
+    AITER_CHECK(q.dim() == 3, "q must be [num_tokens, n_heads, head_dim]");
+    AITER_CHECK(q_out.dim() == 3, "q_out must be [num_tokens, n_heads, head_dim]");
+    AITER_CHECK(k.dim() == 2, "k must be [num_tokens, head_dim]");
+    AITER_CHECK(weights.dim() == 2, "weights must be [num_tokens, n_heads]");
+    AITER_CHECK(weights_out.dim() == 2, "weights_out must be [num_tokens, n_heads]");
+    AITER_CHECK(cos_cache.dim() == 2, "cos_cache must be [max_position, rope_dim / 2]");
+    AITER_CHECK(sin_cache.dim() == 2, "sin_cache must be [max_position, rope_dim / 2]");
+    AITER_CHECK(q.size(0) >= num_tokens, "q must cover all indexed tokens");
+    AITER_CHECK(q.size(2) == head_dim, "q head_dim must match k head_dim");
+    AITER_CHECK(positions.size(0) >= num_tokens, "positions must cover all indexed tokens");
+    AITER_CHECK(q_out.size(0) >= num_tokens && q_out.size(1) == n_heads &&
+                    q_out.size(2) == head_dim,
+                "q_out must cover all indexed tokens");
+    AITER_CHECK(weights.size(0) >= num_tokens && weights.size(1) == n_heads,
+                "weights must cover all indexed tokens");
+    AITER_CHECK(weights_out.size(0) >= num_tokens && weights_out.size(1) == n_heads,
+                "weights_out must cover all indexed tokens");
+    AITER_CHECK(cos_cache.size(0) == sin_cache.size(0) &&
+                    cos_cache.size(1) == sin_cache.size(1),
+                "cos_cache and sin_cache shapes must match");
+    AITER_CHECK(cos_cache.stride(1) == 1 && sin_cache.stride(1) == 1,
+                "cos_cache and sin_cache last dimension must be contiguous");
+    AITER_CHECK(head_dim == 128, "indexer fused qk cache only supports head_dim=128");
+    AITER_CHECK(rope_dim == 64, "indexer fused qk cache only supports rope_dim=64");
+    AITER_CHECK(quant_block_size == head_dim,
+                "indexer fused qk cache only supports quant_block_size == head_dim");
+    AITER_CHECK(k.stride(1) == 1 && k.stride(0) == head_dim,
+                "indexer fused qk cache requires contiguous [num_tokens, head_dim] k");
+    AITER_CHECK(k.dtype() == q.dtype(), "k dtype must match q dtype");
+    AITER_CHECK(q_out.dtype() == AITER_DTYPE_fp8, "q_out dtype must be fp8");
+    AITER_CHECK(weights.dtype() == q.dtype(), "weights dtype must match q dtype");
+    AITER_CHECK(weights_out.dtype() == AITER_DTYPE_fp32, "weights_out dtype must be fp32");
+    AITER_CHECK(norm_weight.dtype() == q.dtype(), "norm_weight dtype must match q dtype");
+    AITER_CHECK(norm_bias.dtype() == q.dtype(), "norm_bias dtype must match q dtype");
+    AITER_CHECK(cos_cache.dtype() == q.dtype(), "cos_cache dtype must match q dtype");
+    AITER_CHECK(sin_cache.dtype() == q.dtype(), "sin_cache dtype must match q dtype");
+    AITER_CHECK(norm_weight.size(0) == head_dim, "norm_weight size must match head_dim");
+    AITER_CHECK(norm_bias.size(0) == head_dim, "norm_bias size must match head_dim");
+    if(preshuffle)
+    {
+        AITER_CHECK(cache_block_size % 16 == 0,
+                    "preshuffle requires cache_block_size to be a multiple of 16, got ",
+                    cache_block_size);
+        AITER_CHECK(head_dim % 16 == 0,
+                    "preshuffle requires head_dim to be a multiple of 16, got ",
+                    head_dim);
+    }
+
+    dim3 grid(num_tokens, n_heads);
+    dim3 block(head_dim);
+    HipDeviceGuard device_guard(q.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    float eps = static_cast<float>(epsilon);
+    float w_scale = static_cast<float>(weights_scale);
+
+    DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(k.dtype(),
+                                            "fp8_e4m3",
+                                            CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE);
 }
 
 // copy from vllm: https://github.com/vllm-project/vllm/blob/main/csrc/cache_kernels.cu

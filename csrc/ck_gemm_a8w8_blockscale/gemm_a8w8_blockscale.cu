@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include <torch/extension.h>
@@ -11,10 +11,16 @@
 #include "gemm_a8w8_blockscale_lookup.h"
 #include "gemm_a8w8_blockscale_manifest.h"
 
-using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
+using BlockwiseKernel = torch::Tensor (*)(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
 
-using BlockwiseKernelMap = std::unordered_map<std::string, BlockwiseKernel>;
+// Name-keyed dispatch table.  Keys are std::string_view onto the kernel-name
+// string literals embedded in the generated *_lookup.h (static storage,
+// permanently valid).  Values are raw function pointers so the table is
+// trivially destructible and gets constant-initialized into .data.rel.ro,
+// matching the style of GemmDispatchMap introduced for the tuple-keyed
+// modules in PR #3255 (no per-pair std::function ctor / landing pad cost).
+using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>;
 
 // Python-driven name-keyed dispatch.  The Python frontend
 // (aiter/ops/gemm_op_a8w8.py) reads aiter/configs/a8w8_blockscale_tuned_gemm.csv
@@ -48,7 +54,7 @@ static BlockwiseKernel blockscale_dispatch(const std::string& kernelName)
 
     if(!kernelName.empty())
     {
-        auto it = lookup.find(kernelName);
+        auto it = lookup.find(std::string_view{kernelName});
         if(it != lookup.end())
         {
             return it->second;
