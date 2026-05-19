@@ -27,6 +27,7 @@ import torch
 from typing import Optional
 
 from ..jit.core import compile_ops
+from ..jit.utils.torch_guard import torch_compile_guard
 
 MD_NAME = "module_pa_sparse_prefill_opus"
 
@@ -46,6 +47,22 @@ def pa_sparse_prefill_opus_fwd(
 ) -> None: ...
 
 
+def _pa_sparse_prefill_opus_fake(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return out if out is not None else torch.empty_like(q)
+
+
+@torch_compile_guard(mutates_args=["out"], gen_fake=_pa_sparse_prefill_opus_fake)
 def pa_sparse_prefill_opus(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -108,12 +125,12 @@ def pa_sparse_prefill_opus(
     pa_sparse_prefill_opus_fwd(
         q,
         unified_kv,
-        kv_indices_prefix.to(torch.int32).contiguous(),
-        kv_indptr_prefix.to(torch.int32).contiguous(),
+        kv_indices_prefix,
+        kv_indptr_prefix,
         kv,
-        kv_indices_extend.to(torch.int32).contiguous(),
-        kv_indptr_extend.to(torch.int32).contiguous(),
-        attn_sink.to(torch.float32).contiguous(),
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
         out,
         float(softmax_scale),
     )

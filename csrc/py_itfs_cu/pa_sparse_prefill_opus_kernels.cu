@@ -66,8 +66,16 @@ void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
                     out.stride(2) == 1,
                 "Q/UnifiedKV/KV/O must be contiguous along the head-dim D");
 
+    // Kernel reads these 1-D buffers via raw pointer arithmetic; stride must be 1.
+    AITER_CHECK(kv_indices_prefix.is_contiguous() && kv_indptr_prefix.is_contiguous() &&
+                    kv_indices_extend.is_contiguous() && kv_indptr_extend.is_contiguous() &&
+                    attn_sink.is_contiguous(),
+                "kv_indices/kv_indptr (prefix+extend) and attn_sink must be contiguous");
+
     const int total_pages  = static_cast<int>(unified_kv.size(0));
     const int total_tokens = static_cast<int>(kv.size(0));
+
+    if (N == 0) return;
 
     // ---- Build kernel args -----------------------------------------------
     pa_sparse_prefill_kargs kargs{};
