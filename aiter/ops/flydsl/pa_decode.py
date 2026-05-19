@@ -139,6 +139,7 @@ def flydsl_paged_attention_decode(
         HEAD_SIZE=head_size,
         QUERY_GROUP_SIZE=query_group_size,
         PARTITION_SIZE=partition_size,
+        NUM_PARTITIONS=num_partitions,
         dtype=dtype_str,
     )
 
