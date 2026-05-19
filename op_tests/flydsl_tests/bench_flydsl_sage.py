@@ -96,6 +96,7 @@ SHAPES: List[Tuple] = [
     (2, 4096, 8, 8, 128, False),
     (1, 16384, 8, 8, 128, False),
     (1, 16384, 24, 24, 128, False),  # large seq + many heads
+    (1, 75600, 5, 5, 128, False),  # initial setting
 ]
 
 
