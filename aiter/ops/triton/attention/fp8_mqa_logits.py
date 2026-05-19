@@ -61,6 +61,23 @@ def _permute_accepts_constexpr_tuple() -> bool:
 ASYNC_COPY_SUPPORTS_DISTRIBUTED = _async_copy_accepts_distributed_layout()
 FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 
+# gfx942 (MI300X) has 64 KB of LDS per CU. Conservative upper bound on the
+# shared-memory `_fp8_mqa_logits_kernel` may request with BLOCK_KV=128,
+# num_stages=2 -- models the double-buffered KV tile, the fp32 scores
+# accumulator, and the Q tile. Triton may keep some of these in registers
+# depending on version/layout, so this can over-predict; the safety direction
+# is the right one (false positives just shrink the tile, never the reverse).
+_GFX942_LDS_BYTES = 64 * 1024
+
+
+def _gfx942_default_tile_fits_lds(num_heads: int, head_size: int) -> bool:
+    BLOCK_KV = 128
+    NUM_STAGES = 2
+    kv_bytes = head_size * BLOCK_KV * NUM_STAGES
+    scores_bytes = num_heads * BLOCK_KV * 4
+    q_bytes = num_heads * head_size
+    return q_bytes + kv_bytes + scores_bytes <= _GFX942_LDS_BYTES
+
 
 def fp8_mqa_logits(
     Q,
@@ -117,9 +134,12 @@ def fp8_mqa_logits(
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
     if not use_gluon:
-        # gfx942 has 64 KB LDS/CU; default (128, 2) tile needs ~96 KB. Use
-        # (64, 1) (~33 KB) so DSv4 indexer (NUM_HEADS=64, HEAD_SIZE=128) fits.
-        if arch == "gfx942":
+        # gfx942 (MI300X) can JIT-abort with `OutOfResources: shared memory`
+        # at the default (BLOCK_KV=128, num_stages=2) tile on shapes that push
+        # the kernel over 64 KB of LDS (e.g. the DSv4 indexer's NUM_HEADS=64,
+        # HEAD_SIZE=128). Shrink only when the default would overflow so
+        # smaller shapes keep their original throughput.
+        if arch == "gfx942" and not _gfx942_default_tile_fits_lds(num_heads, head_size):
             block_kv = 64
             triton_num_stages = 1
         else:
