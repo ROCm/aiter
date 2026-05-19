@@ -27,7 +27,7 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import math as math_dialect, scf as scf_dialect
+from flydsl._mlir.dialects import math as math_dialect
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
