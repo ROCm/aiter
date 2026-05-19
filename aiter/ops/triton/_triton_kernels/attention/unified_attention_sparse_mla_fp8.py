@@ -159,7 +159,7 @@ def _kernel_unified_attention_sparse_mla_2d(
     if K_SCALE:
         qk_scale = qk_scale * tl.load(k_scale)
 
-    block_table_offset = seq_idx * block_table_stride
+    seq_idx * block_table_stride
 
     # iterate topk indices in tiles of TILE_SIZE
     num_tiles = (topk_count + TILE_SIZE - 1) // TILE_SIZE
