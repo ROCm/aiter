@@ -273,9 +273,16 @@ def _compile_stage1_mxscale_kernel_impl(
     # loaders and the epilogue. Invalid rows are pre-filled with sentinel 0xFFFFFFFF so
     # that downstream tok/slot checks naturally reject them without needing row_in_route
     # or row_in_valid masks.
-    lds_tid_bytes = int(tile_m) * 4
-    off_tid = alloc._align(alloc.ptr, 16)
-    alloc.ptr = off_tid + lds_tid_bytes
+    # Only allocated when needed: TDM gather A path uses ``_a_tok_ids`` SGPRs
+    # produced by ``_precompute_a_row_indices`` (which reads from lds_tid), and
+    # the TDM-store epilogue gather-store path needs lds_tid too. In pure
+    # buffer-load mode (no TDM gather, no TDM store) the A loaders read
+    # sorted_token_ids directly and the epilogue accepts ``lds_tid=None``.
+    use_lds_sorted_id = bool(use_tdm_gather) or bool(use_tdm_store)
+    if use_lds_sorted_id:
+        lds_tid_bytes = int(tile_m) * 4
+        off_tid = alloc._align(alloc.ptr, 16)
+        alloc.ptr = off_tid + lds_tid_bytes
 
     if bool(use_tdm_store):
         from kernels.gemm_common_gfx1250 import store_acc_vec8_to_lds
@@ -431,7 +438,10 @@ def _compile_stage1_mxscale_kernel_impl(
                 lds_bsu_bufs.append(get_op_result_or_value(
                     SmemPtr(base_ptr, off_bsu_list[_bi], T.i8, shape=(lds_b_scale_bytes,)).get()))
 
-        lds_tid = SmemPtr(base_ptr, off_tid, T.i32, shape=(int(tile_m),)).get()
+        if const_expr(use_lds_sorted_id):
+            lds_tid = SmemPtr(base_ptr, off_tid, T.i32, shape=(int(tile_m),)).get()
+        else:
+            lds_tid = None
 
         if const_expr(bool(use_tdm_store)):
             from kernels.gemm_common_gfx1250 import get_lds_memref
@@ -479,31 +489,197 @@ def _compile_stage1_mxscale_kernel_impl(
 
         # TDM gather for A data
         _use_tdm_gather_a = bool(use_tdm_gather)
+        # When neither TDM gather nor TDM store is enabled, the buffer-load
+        # path reads sorted_token_ids directly from global memory (the L1 cache
+        # absorbs repeated reads of the same i32 across K-iterations) instead
+        # of round-tripping through lds_tid. This drops the per-CTA preload +
+        # barrier and the lds_tid LDS allocation.
+        _need_lds_tid = _use_tdm_gather_a or bool(use_tdm_store)
+
+        def _get_fused_for_row(row_index):
+            """Return the i32 ``fused = (slot << 24) | tok`` for ``row_index``.
+
+            In TDM/store mode, reads the preloaded ``lds_tid`` (sentinel
+            0xFFFFFFFF for invalid rows). In pure buffer-load mode, reads
+            ``sorted_token_ids[by*tile_m + row]`` directly and masks rows
+            outside ``route_tile_m`` or the valid prefix to the same
+            sentinel so downstream ``tok_ok`` / ``slot_ok`` decoding is
+            unchanged.
+            """
+            if const_expr(_need_lds_tid):
+                return _load_fused_from_lds(row_index)
+            if isinstance(row_index, int):
+                row_idx = arith.index(row_index)
+            else:
+                row_idx = row_index
+            _sorted_row = by * arith.index(int(tile_m)) + row_idx
+            _sorted_i32 = arith.index_cast(T.i32, _sorted_row)
+            _row_i32 = arith.index_cast(T.i32, row_idx)
+            _in_route = arith.cmpi(
+                arith.CmpIPredicate.ult, _row_i32,
+                arith.constant(int(route_tile_m), type=T.i32),
+            )
+            _in_valid = arith.cmpi(
+                arith.CmpIPredicate.slt, _sorted_i32, num_valid_i32)
+            _row_valid = arith.andi(_in_route, _in_valid)
+            _row_safe_i32 = arith.select(
+                _row_valid, _sorted_i32, block_row_start)
+            _raw = buffer_ops.buffer_load(
+                sorted_rsrc, _row_safe_i32, vec_width=1, dtype=T.i32)
+            _sentinel = arith.constant(-1, type=T.i32)  # 0xFFFFFFFF
+            return arith.select(_row_valid, _raw, _sentinel)
+
+        # Bytes loaded per thread per ``buffer_load`` issued by ``issue_a_load``
+        # — analog of ``mixed_moe_gemm_2stage.py:3317-3326`` ``x_load_bytes``
+        # picker. Same contract as mixed: ``bytes_per_thread_a`` must be a
+        # multiple of ``a_load_bytes`` so ``num_a_loads = bytes_per_thread_a //
+        # a_load_bytes`` is exact — then every round is full and the K-hot
+        # loop needs no per-thread OOB guard.
+        if const_expr(int(tile_m * packed_tile_k_a) % int(block_threads) != 0):
+            raise ValueError(
+                f"tile_m * packed_tile_k_a ({tile_m * packed_tile_k_a}) must "
+                f"be divisible by block_threads ({block_threads})"
+            )
+        bytes_per_thread_a = int(tile_m * packed_tile_k_a) // int(block_threads)
+        if const_expr(bytes_per_thread_a % 16 == 0):
+            a_load_bytes = 16
+        elif const_expr(bytes_per_thread_a % 8 == 0):
+            a_load_bytes = 8
+        elif const_expr(bytes_per_thread_a % 4 == 0):
+            a_load_bytes = 4
+        elif const_expr(bytes_per_thread_a % 2 == 0):
+            a_load_bytes = 2
+        else:
+            a_load_bytes = 1
+
+        # Per-thread row metadata cache for the buffer-load A / A-scale
+        # loaders. ``_get_fused_for_row(row)`` reads ``sorted_token_ids[...]``
+        # (or the preloaded LDS slot) and the resulting tok / load_ok values
+        # are K-invariant. We precompute them ONCE before the K-loop and let
+        # the per-K-tile loaders consume the cache instead of re-reading
+        # sorted_token_ids / re-decoding tok every iteration.
+        #
+        # Layout follows ``mixed_moe_gemm_2stage.py:751`` parallel-list style
+        # (one list per field, indexed by round number ``i``):
+        #   _a_x_row_base_i32[i] : i32 K-invariant base = tok_safe * K_packed_a + col_b
+        #   _a_lds_idx[i]        : index — K-invariant LDS write offset
+        #   _as_sx_row_base_i32[i] : i32 = tok_safe * K_scale + ksc_off
+        #   _as_lds_idx[i]       : index
+        #   _a_t_i32[i] / _a_t_valid[i] : K-invariant per-round decode shared
+        #                                 with A-scale when col counts match
+        #                                 (drops one sorted_token_ids
+        #                                 buffer_load per round). Names mirror
+        #                                 ``mixed_moe_gemm_2stage.py:765-770``.
+        # Neither loader has an in_range guard — A-data uses the divisibility
+        # contract (mixed_moe_gemm_2stage.py:707-708) and A-scale clamps
+        # ``elem`` so OOB threads land on slot 0 and redundantly write the
+        # SAME bits (mirrors mixed's ``t_safe`` address-clamp trick at the
+        # elem level).
+        _a_x_row_base_i32 = []
+        _a_lds_idx = []
+        _as_sx_row_base_i32 = []
+        _as_lds_idx = []
+        _a_t_i32 = []
+        _a_t_valid = []
+
+        def _precompute_a_load_meta():
+            """Populate the K-invariant A-data lists once, before the K-loop.
+
+            Pattern copied verbatim from ``mixed_moe_gemm_2stage.py:751-774``
+            (stage1 ``x_row_local`` / ``x_col_local_i32`` / ``x_row_base_div4``
+            parallel lists), adapted for byte-addressed scalar buffer_loads:
+              * column units are bytes (``col_local``) rather than dwordx4 lanes
+              * row base ``x_row_base_i32 = t_safe * K_packed_a + col_local`` is
+                the byte analog of ``x_row_base_div4[i] = t_safe * c_k_div4``.
+
+            Extra lists vs. mixed (mixed loads to registers, we write to LDS):
+              ``_a_lds_idx`` — K-invariant LDS write address; ``_a_t_i32`` /
+              ``_a_t_valid`` — K-invariant decode shared with the A-scale
+              loader. No ``in_range`` list — see ``_pick_a_load_bytes`` for
+              the divisibility contract that makes every round full.
+            """
+            if _a_x_row_base_i32:
+                return
+            _vec = int(a_load_bytes)
+            _row_bytes = int(packed_tile_k_a)
+            _cols_per_row = _row_bytes // _vec
+            _bt = int(block_threads)
+            total = int(tile_m) * _cols_per_row
+            assert total % _bt == 0, (
+                "A-data tile must divide exactly into block_threads — "
+                "_pick_a_load_bytes() enforces this"
+            )
+            num_x_loads = total // _bt
+            _K_i32 = arith.constant(K_packed_a, type=T.i32)
+            # Layout-based (row, col_chunk) decomposition — mirrors mixed_moe_
+            # gemm_2stage.py:757 ``tile_chunk_coord_i32``. ``_cols_per_row`` is
+            # always power-of-2 for MoE configs, so the layout pipeline lowers
+            # ``idx2crd`` to shifts + AND-masks instead of the divui / remui
+            # the manual ``elem // n`` / ``elem % n`` form generates.
+            _layout_x_tile = fx.make_layout(
+                (int(tile_m), _cols_per_row), stride=(_cols_per_row, 1))
+            mask24 = arith.constant((1 << 24) - 1, type=T.i32)
+            zero_i32 = arith.constant(0, type=T.i32)
+            for i in range(num_x_loads):
+                elem = tx + fx.Index(i * _bt)
+                coord_local = idx2crd(elem, _layout_x_tile)
+                row_local = fx.get(coord_local, 0)
+                col_local = fx.get(coord_local, 1) * arith.index(_vec)
+
+                # Inline decode — mirrors mixed_moe_gemm_2stage.py:762-770.
+                # Stage1 uses ``t_safe`` only (X row indexed by token_id, not
+                # t*topk+s). No OOB possible (perfect-tile contract) so the
+                # ``t_safe`` clamp uses ``t_valid`` directly.
+                fused_i = _get_fused_for_row(row_local)
+                t_i32 = arith.andi(fused_i, mask24)
+                t_valid = arith.cmpi(
+                    arith.CmpIPredicate.ult, t_i32, i32_tokens_in)
+                t_safe = arith.select(t_valid, t_i32, zero_i32)
+
+                # X row base — stage1 uses token_id only, no t*topk+s
+                # (mixed_moe_gemm_2stage.py:773-774).
+                col_local_i32 = arith.index_cast(T.i32, col_local)
+                _a_x_row_base_i32.append(t_safe * _K_i32 + col_local_i32)
+                _a_lds_idx.append(
+                    row_local * arith.index(lds_a_stride_bytes) + col_local)
+                # Stash what A-scale's cross-loader share path reads back:
+                # raw ``t_i32`` + ``t_valid`` (names per mixed_moe_gemm_
+                # 2stage.py:765-767). ``t_safe`` is recomputed by the
+                # consumer with its own ``in_range`` mask.
+                _a_t_i32.append(t_i32)
+                _a_t_valid.append(t_valid)
 
         def issue_a_load(k_packed_base, target_lds):
-            total = int(tile_m * packed_tile_k_a)
-            rounds = (total + block_threads - 1) // block_threads
-            for it in range(rounds):
-                elem = tx + fx.Index(it * block_threads)
-                in_range = arith.cmpi(arith.CmpIPredicate.ult, arith.index_cast(T.i32, elem), arith.constant(total, type=T.i32))
-                _if_elem = scf.IfOp(in_range)
-                with ir.InsertionPoint(_if_elem.then_block):
-                    row = elem // arith.index(int(packed_tile_k_a))
-                    col = elem % arith.index(int(packed_tile_k_a))
-                    # Use preloaded lds_tid instead of per-thread buffer_load(sorted_rsrc, ...).
-                    # Invalid rows were pre-filled with sentinel 0xFFFFFFFF at preload, so
-                    # tok=0xFFFFFF will make tok_ok=false for them.
-                    fused = _load_fused_from_lds(row)
-                    tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
-                    tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
-                    load_ok = tok_ok
-                    x_idx = tok * arith.constant(K_packed_a, type=T.i32) + arith.index_cast(T.i32, k_packed_base + col)
-                    x_idx_safe = arith.select(load_ok, x_idx, arith.constant(0, type=T.i32))
-                    x_val = arith.select(load_ok, buffer_ops.buffer_load(x_rsrc, x_idx_safe, vec_width=1, dtype=T.i8), arith.constant(0, type=T.i8))
-                    lds_idx = row * arith.index(lds_a_stride_bytes) + col
-                    v1 = vector.from_elements(T.vec(1, T.i8), [x_val])
-                    vector.store(v1, target_lds, [lds_idx], alignment=1)
-                    scf.YieldOp([])
+            """K-hot path A-data buffer loader (buffer-load mode).
+
+            Mirrors ``mixed_moe_gemm_2stage.py:776-786`` ``load_x_tile``: hot
+            body is ``x_idx = x_row_base + k_base`` + a single ``buffer_load``,
+            then a ``vector.store`` to LDS. No selects, no IfOp — the
+            precompute clamps ``t_safe = 0`` for invalid rows so the address
+            is always in-range, and ``_pick_a_load_bytes`` enforces
+            ``total % (block_threads * a_load_bytes) == 0`` so every thread
+            has a valid (row, col_chunk) — no OOB threads to skip. Any garbage
+            data in LDS for invalid rows is masked at the output epilogue,
+            exactly like mixed (mixed loads to regs and lets the epilogue mask
+            invalid output).
+            """
+            assert _a_x_row_base_i32, (
+                "_precompute_a_load_meta() must be invoked before "
+                "issue_a_load to ensure cache SSA dominates all K-iterations"
+            )
+            _vec = int(a_load_bytes)
+            k_packed_base_i32 = arith.index_cast(T.i32, k_packed_base)
+            for i in range(len(_a_x_row_base_i32)):
+                x_idx = _a_x_row_base_i32[i] + k_packed_base_i32
+                x_vec = buffer_ops.buffer_load(
+                    x_rsrc, x_idx, vec_width=_vec, dtype=T.i8)
+                if _vec > 1:
+                    vector.store(x_vec, target_lds, [_a_lds_idx[i]],
+                                 alignment=_vec)
+                else:
+                    v1 = vector.from_elements(T.vec(1, T.i8), [x_vec])
+                    vector.store(v1, target_lds, [_a_lds_idx[i]],
+                                 alignment=1)
 
         # Pre-compute token row indices for ALL tile_m rows (once, outside K-loop).
         # _a_tok_ids[i] = token_id for TDM gather A load
@@ -859,152 +1035,140 @@ def _compile_stage1_mxscale_kernel_impl(
         def make_desc_as(k_base):
             return k_base / arith.index(SCALE_BLOCK)
 
-        def issue_as_load(k_scale_base, target_lds):
-            """Vectorised scalar A-scale loader (Option B).
+        # A-scale load picker — same shape as A-data's, mirrors
+        # ``mixed_moe_gemm_2stage.py:3317-3326``. Perfect-tile contract:
+        # ``tile_m * scale_k_per_tile`` must divide evenly into
+        # ``block_threads * sx_load_bytes`` chunks so every thread has real
+        # work and the loader needs no OOB guard / clamp.
+        if const_expr(int(tile_m * scale_k_per_tile) % int(block_threads) != 0):
+            raise ValueError(
+                f"tile_m * scale_k_per_tile ({tile_m * scale_k_per_tile}) "
+                f"must be divisible by block_threads ({block_threads})"
+            )
+        bytes_per_thread_s = int(tile_m * scale_k_per_tile) // int(block_threads)
+        if const_expr(bytes_per_thread_s % 16 == 0):
+            sx_load_bytes = 16
+        elif const_expr(bytes_per_thread_s % 8 == 0):
+            sx_load_bytes = 8
+        elif const_expr(bytes_per_thread_s % 4 == 0):
+            sx_load_bytes = 4
+        elif const_expr(bytes_per_thread_s % 2 == 0):
+            sx_load_bytes = 2
+        else:
+            sx_load_bytes = 1
+        # Interleaved LDS layout writes one SCALES_PER_WMMA-byte slot per
+        # chunk into non-contiguous slots — sub-slot or multi-slot writes
+        # wouldn't lay out correctly, so pin the picker to one slot per
+        # chunk in that mode.
+        if const_expr(
+            (not _as_layout_rowmajor) and sx_load_bytes != int(SCALES_PER_WMMA)
+        ):
+            raise ValueError(
+                f"interleaved scale layout requires sx_load_bytes == "
+                f"{SCALES_PER_WMMA}; got {sx_load_bytes}. Adjust "
+                f"tile_m/tile_k for the perfect-tile contract."
+            )
 
-            Each thread loads one ``SCALES_PER_WMMA``-sized chunk (4 bytes)
-            and writes it either to the row-major LDS slot (``is_fp4`` or
-            ``wmma_m_rep == 1``) or to the interleaved LDS slot. Avoiding a
-            full-row i8 vector load is important for row widths such as 16
-            bytes, where LLVM cannot legalize ``v16i8`` raw buffer loads.
+        def _precompute_as_load_meta():
+            """Populate the K-invariant A-scale lists once, before the K-loop.
 
-            Rare fallback: ``scale_k_per_tile`` not a multiple of 4 falls back
-              to the original per-byte loop for correctness.
+            Mirrors A-data's precompute (and ``mixed_moe_gemm_2stage.py:751-
+            774``) — same parallel-list / inline-decode style, indexed in
+            ``sx_load_bytes`` byte chunks. Perfect-tile contract (enforced
+            by the picker) makes every (round, thread) → (row, col_byte)
+            mapping valid, so no OOB clamp is needed.
+
+            Cross-loader sharing: when ``cols_per_row_a == chunks_per_row``
+            the (round, thread)→row mapping coincides with A-data's, so we
+            reuse the cached ``_a_t_i32`` / ``_a_t_valid`` instead of
+            re-issuing ``buffer_load(sorted_rsrc, ...)``.
             """
-            _blk_bytes = int(SCALES_PER_WMMA)
-            _row_bytes = int(scale_k_per_tile)
-            if const_expr(_row_bytes % _blk_bytes == 0 and _row_bytes >= _blk_bytes):
-                _blk_vec_type = T.vec(_blk_bytes, T.i8)
-                _blks_per_row = _row_bytes // _blk_bytes
-                total = int(tile_m) * _blks_per_row
-                rounds = (total + block_threads - 1) // block_threads
-                for it in range(rounds):
-                    elem = tx + fx.Index(it * block_threads)
-                    in_range = arith.cmpi(
-                        arith.CmpIPredicate.ult,
-                        arith.index_cast(T.i32, elem),
-                        arith.constant(total, type=T.i32),
+            if _as_sx_row_base_i32:
+                return
+            _chunks_per_row = int(scale_k_per_tile) // int(sx_load_bytes)
+            _num_sx_loads = bytes_per_thread_s // int(sx_load_bytes)
+            _K_i32 = arith.constant(K_scale, type=T.i32)
+            _vec_a = int(a_load_bytes)
+            _cols_per_row_a = int(packed_tile_k_a) // _vec_a
+            _can_share_row = (_cols_per_row_a == _chunks_per_row)
+            _layout_sx_tile = fx.make_layout(
+                (int(tile_m), _chunks_per_row), stride=(_chunks_per_row, 1))
+            for i in range(_num_sx_loads):
+                elem = tx + fx.Index(i * int(block_threads))
+                coord_local = idx2crd(elem, _layout_sx_tile)
+                row_local = fx.get(coord_local, 0)
+                chunk_in_row = fx.get(coord_local, 1)
+                col_byte = chunk_in_row * arith.index(int(sx_load_bytes))
+                if _can_share_row and i < len(_a_t_i32):
+                    # Reuse A-data's decode — drops one ``buffer_load(sorted_rsrc)``
+                    # per round per thread.
+                    t_i32 = _a_t_i32[i]
+                    t_valid = _a_t_valid[i]
+                else:
+                    # Inline decode — mirrors mixed_moe_gemm_2stage.py:762-770.
+                    fused_i = _get_fused_for_row(row_local)
+                    t_i32 = arith.andi(
+                        fused_i, arith.constant((1 << 24) - 1, type=T.i32))
+                    t_valid = arith.cmpi(
+                        arith.CmpIPredicate.ult, t_i32, i32_tokens_in)
+                t_safe = arith.select(
+                    t_valid, t_i32, arith.constant(0, type=T.i32))
+                if const_expr(_as_layout_rowmajor):
+                    lds_idx = (
+                        row_local * arith.index(int(scale_k_per_tile))
+                        + col_byte
                     )
-                    _if_elem = scf.IfOp(in_range)
-                    with ir.InsertionPoint(_if_elem.then_block):
-                        row = elem // arith.index(_blks_per_row)
-                        ksc_blk = elem % arith.index(_blks_per_row)
-                        fused = _load_fused_from_lds(row)
-                        tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
-                        tok_ok = arith.cmpi(
-                            arith.CmpIPredicate.ult, tok, i32_tokens_in,
-                        )
-                        if const_expr(_as_layout_rowmajor):
-                            lds_idx = (
-                                row * arith.index(_row_bytes)
-                                + ksc_blk * arith.index(_blk_bytes)
-                            )
-                        else:
-                            warp_row_idx = row / arith.index(warp_tile_m)
-                            local_row = row % arith.index(warp_tile_m)
-                            lane_row = local_row % arith.index(WMMA_M)
-                            local_wm_idx = local_row / arith.index(WMMA_M)
-                            global_lds_row = (
-                                warp_row_idx * arith.index(WMMA_M) + lane_row
-                            )
-                            lds_idx = (
-                                global_lds_row
-                                * arith.index(interleaved_scale_cols_a)
-                                + ksc_blk
-                                * arith.index(wmma_m_rep * SCALES_PER_WMMA)
-                                + local_wm_idx * arith.index(SCALES_PER_WMMA)
-                            )
-                        _if_ok = scf.IfOp(tok_ok, has_else=True)
-                        with ir.InsertionPoint(_if_ok.then_block):
-                            chunk_off = (
-                                k_scale_base
-                                + ksc_blk * arith.index(_blk_bytes)
-                            )
-                            sx_idx = (
-                                tok * arith.constant(K_scale, type=T.i32)
-                                + arith.index_cast(T.i32, chunk_off)
-                            )
-                            sx_raw = buffer_ops.buffer_load(
-                                sx_rsrc,
-                                arith.shrui(
-                                    sx_idx,
-                                    arith.constant(2, type=T.i32),
-                                ),
-                                vec_width=1,
-                                dtype=T.i32,
-                            )
-                            sx_vec = vector.bitcast(
-                                _blk_vec_type,
-                                vector.from_elements(T.vec(1, T.i32), [sx_raw]),
-                            )
-                            vector.store(
-                                sx_vec, target_lds, [lds_idx],
-                                alignment=_blk_bytes,
-                            )
-                            scf.YieldOp([])
-                        with ir.InsertionPoint(_if_ok.else_block):
-                            fill_vec = vector.bitcast(
-                                _blk_vec_type,
-                                vector.from_elements(
-                                    T.vec(1, T.i32),
-                                    [arith.constant(0x7F7F7F7F, type=T.i32)],
-                                ),
-                            )
-                            vector.store(
-                                fill_vec, target_lds, [lds_idx],
-                                alignment=_blk_bytes,
-                            )
-                            scf.YieldOp([])
-                        scf.YieldOp([])
-            else:
-                # Rare fallback: keep per-byte loop for scale widths not aligned
-                # to 4 bytes (should not happen for gfx1250 MoE MX configs).
-                total = int(tile_m * scale_k_per_tile)
-                rounds = (total + block_threads - 1) // block_threads
-                for it in range(rounds):
-                    elem = tx + fx.Index(it * block_threads)
-                    in_range = arith.cmpi(
-                        arith.CmpIPredicate.ult,
-                        arith.index_cast(T.i32, elem),
-                        arith.constant(total, type=T.i32),
+                else:
+                    # Interleaved: sx_load_bytes == SCALES_PER_WMMA (picker
+                    # constraint), so chunk_in_row directly indexes ksc_blk.
+                    ksc_blk = chunk_in_row
+                    warp_row_idx = row_local / arith.index(warp_tile_m)
+                    local_row = row_local % arith.index(warp_tile_m)
+                    lane_row = local_row % arith.index(WMMA_M)
+                    local_wm_idx = local_row / arith.index(WMMA_M)
+                    global_lds_row = (
+                        warp_row_idx * arith.index(WMMA_M) + lane_row
                     )
-                    _if_elem = scf.IfOp(in_range)
-                    with ir.InsertionPoint(_if_elem.then_block):
-                        row = elem // arith.index(int(scale_k_per_tile))
-                        ksc = elem % arith.index(int(scale_k_per_tile))
-                        fused = _load_fused_from_lds(row)
-                        tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
-                        tok_ok = arith.cmpi(
-                            arith.CmpIPredicate.ult, tok, i32_tokens_in,
-                        )
-                        load_ok = tok_ok
-                        ksc_off = k_scale_base + ksc
-                        sx_idx = tok * arith.constant(K_scale, type=T.i32) + arith.index_cast(T.i32, ksc_off)
-                        sx_idx_safe = arith.select(load_ok, sx_idx, arith.constant(0, type=T.i32))
-                        sx_val = arith.select(
-                            load_ok,
-                            buffer_ops.buffer_load(sx_rsrc, sx_idx_safe, vec_width=1, dtype=T.i8),
-                            arith.constant(127, type=T.i8),
-                        )
-                        if is_fp4:
-                            lds_idx = row * arith.index(int(scale_k_per_tile)) + ksc
-                        else:
-                            warp_row_idx = row / arith.index(warp_tile_m)
-                            local_row = row % arith.index(warp_tile_m)
-                            lane_row = local_row % arith.index(WMMA_M)
-                            local_wm_idx = local_row / arith.index(WMMA_M)
-                            global_lds_row = warp_row_idx * arith.index(WMMA_M) + lane_row
-                            ksc_blk = ksc / arith.index(SCALES_PER_WMMA)
-                            ksc_sub = ksc % arith.index(SCALES_PER_WMMA)
-                            lds_idx = (
-                                global_lds_row * arith.index(interleaved_scale_cols_a)
-                                + ksc_blk * arith.index(wmma_m_rep * SCALES_PER_WMMA)
-                                + local_wm_idx * arith.index(SCALES_PER_WMMA)
-                                + ksc_sub
-                            )
-                        v1 = vector.from_elements(T.vec(1, T.i8), [sx_val])
-                        vector.store(v1, target_lds, [lds_idx], alignment=1)
-                        scf.YieldOp([])
+                    lds_idx = (
+                        global_lds_row
+                        * arith.index(interleaved_scale_cols_a)
+                        + ksc_blk
+                        * arith.index(wmma_m_rep * SCALES_PER_WMMA)
+                        + local_wm_idx * arith.index(SCALES_PER_WMMA)
+                    )
+                # Scale row base — analog of mixed's ``x_row_base_div4``
+                # (mixed_moe_gemm_2stage.py:773-774) but in scale-byte units.
+                col_byte_i32 = arith.index_cast(T.i32, col_byte)
+                _as_sx_row_base_i32.append(t_safe * _K_i32 + col_byte_i32)
+                _as_lds_idx.append(lds_idx)
+
+        def issue_as_load(k_scale_base, target_lds):
+            """K-hot path A-scale loader (buffer-load mode).
+
+            Mirrors A-data's ``issue_a_load`` (and mixed's ``load_x_tile``):
+            hot body is one ``buffer_load`` + ``vector.store`` per round,
+            no IfOp. The picker (above) enforces ``total_scale_bytes %
+            (block_threads * sx_load_bytes) == 0``, so every thread has a
+            real (row, col_byte) pair — no OOB threads, no clamping.
+            """
+            assert _as_sx_row_base_i32, (
+                "_precompute_as_load_meta() must be invoked before "
+                "issue_as_load to ensure cache SSA dominates all "
+                "K-iterations"
+            )
+            k_scale_base_i32 = arith.index_cast(T.i32, k_scale_base)
+            for i in range(len(_as_sx_row_base_i32)):
+                sx_idx = _as_sx_row_base_i32[i] + k_scale_base_i32
+                sx_vec = buffer_ops.buffer_load(
+                    sx_rsrc, sx_idx, vec_width=int(sx_load_bytes), dtype=T.i8)
+                if int(sx_load_bytes) > 1:
+                    vector.store(
+                        sx_vec, target_lds, [_as_lds_idx[i]],
+                        alignment=int(sx_load_bytes))
+                else:
+                    v1 = vector.from_elements(T.vec(1, T.i8), [sx_vec])
+                    vector.store(
+                        v1, target_lds, [_as_lds_idx[i]], alignment=1)
 
         def issue_as_load_tdm_gather(k_scale_base, target_lds):
             """TDM-gather A-scale loader (Option A).
@@ -1146,9 +1310,21 @@ def _compile_stage1_mxscale_kernel_impl(
 
         _if_blk = scf.IfOp(block_ok)
         with ir.InsertionPoint(_if_blk.then_block):
-            _preload_sorted_ids_to_lds()
+            if const_expr(_need_lds_tid):
+                _preload_sorted_ids_to_lds()
             if const_expr(_use_tdm_gather_a or bool(use_tdm_store)):
                 _precompute_a_row_indices()
+            # Buffer-load mode precompute: hoist the K-invariant per-thread
+            # sorted_token_ids decode out of the K-loop so issue_a_load /
+            # issue_as_load only compute K-variant offsets on the hot path.
+            # Must happen BEFORE the K-loop so the cached SSA dominates every
+            # issue_a_load / issue_as_load callsite (the K-loop is unrolled
+            # via range_constexpr but issue may still be called from inside
+            # conditional regions for pipeline prologue / tail).
+            if const_expr(not _use_tdm_gather_a):
+                _precompute_a_load_meta()
+            if const_expr(not _use_tdm_gather_as):
+                _precompute_as_load_meta()
             a_data_bases = _precompute_a_data_bases()
             b_data_bases = _precompute_b_data_bases()
             if const_expr(_merge_gate_up_tdm):
@@ -2439,9 +2615,13 @@ def _compile_stage2_mxscale_kernel_impl(
         off_bs_list.append(_obs)
 
     # lds_tid: preloaded sorted_token_ids for current M-tile (see stage1 comments).
-    lds_tid_bytes = int(tile_m) * 4
-    off_tid = alloc._align(alloc.ptr, 16)
-    alloc.ptr = off_tid + lds_tid_bytes
+    # Only allocated when TDM gather A or TDM store is enabled; the buffer-load
+    # path reads sorted_token_ids directly.
+    _need_lds_tid_s2 = bool(use_tdm_gather) or bool(use_tdm_store)
+    if _need_lds_tid_s2:
+        lds_tid_bytes = int(tile_m) * 4
+        off_tid = alloc._align(alloc.ptr, 16)
+        alloc.ptr = off_tid + lds_tid_bytes
 
     if bool(use_tdm_store):
         from kernels.gemm_common_gfx1250 import store_acc_vec8_to_lds
@@ -2586,7 +2766,10 @@ def _compile_stage2_mxscale_kernel_impl(
             lds_as_bufs.append(get_op_result_or_value(_sas.get()))
             lds_bs_bufs.append(get_op_result_or_value(_sbs.get()))
 
-        lds_tid = SmemPtr(base_ptr, off_tid, T.i32, shape=(int(tile_m),)).get()
+        if const_expr(_need_lds_tid_s2):
+            lds_tid = SmemPtr(base_ptr, off_tid, T.i32, shape=(int(tile_m),)).get()
+        else:
+            lds_tid = None
 
         if const_expr(bool(use_tdm_store)):
             from kernels.gemm_common_gfx1250 import get_lds_memref
@@ -2635,6 +2818,9 @@ def _compile_stage2_mxscale_kernel_impl(
             )
 
         _use_tdm_gather_a = bool(use_tdm_gather)
+        # See stage1 for rationale. In pure buffer-load mode neither lds_tid
+        # nor the per-row SGPR caches are needed.
+        _need_lds_tid = _use_tdm_gather_a or bool(use_tdm_store)
         _a_row_ids = []
         _a_row_valids = []
         _TDM_GATHER_CHUNK = 8
@@ -2718,33 +2904,153 @@ def _compile_stage2_mxscale_kernel_impl(
         def make_desc_a(k_base):
             return k_base / arith.index(PACK_FACTOR_A)
 
+        def _get_fused_for_row(row_index):
+            """Stage2 equivalent of the stage1 helper. See stage1 for rationale."""
+            if const_expr(_need_lds_tid):
+                return _load_fused_from_lds(row_index)
+            if isinstance(row_index, int):
+                row_idx = arith.index(row_index)
+            else:
+                row_idx = row_index
+            _sorted_row = by * arith.index(int(tile_m)) + row_idx
+            _sorted_i32 = arith.index_cast(T.i32, _sorted_row)
+            _row_i32 = arith.index_cast(T.i32, row_idx)
+            _in_route = arith.cmpi(
+                arith.CmpIPredicate.ult, _row_i32,
+                arith.constant(int(route_tile_m), type=T.i32),
+            )
+            _in_valid = arith.cmpi(
+                arith.CmpIPredicate.slt, _sorted_i32, num_valid_i32)
+            _row_valid = arith.andi(_in_route, _in_valid)
+            _row_safe_i32 = arith.select(
+                _row_valid, _sorted_i32, block_row_start)
+            _raw = buffer_ops.buffer_load(
+                sorted_rsrc, _row_safe_i32, vec_width=1, dtype=T.i32)
+            _sentinel = arith.constant(-1, type=T.i32)
+            return arith.select(_row_valid, _raw, _sentinel)
+
+        # See stage1 — mirrors mixed_moe_gemm_2stage.py:3317-3326.
+        if const_expr(int(tile_m * packed_tile_k_a) % int(block_threads) != 0):
+            raise ValueError(
+                f"stage2 tile_m * packed_tile_k_a ({tile_m * packed_tile_k_a}) "
+                f"must be divisible by block_threads ({block_threads})"
+            )
+        bytes_per_thread_a = int(tile_m * packed_tile_k_a) // int(block_threads)
+        if const_expr(bytes_per_thread_a % 16 == 0):
+            a_load_bytes = 16
+        elif const_expr(bytes_per_thread_a % 8 == 0):
+            a_load_bytes = 8
+        elif const_expr(bytes_per_thread_a % 4 == 0):
+            a_load_bytes = 4
+        elif const_expr(bytes_per_thread_a % 2 == 0):
+            a_load_bytes = 2
+        else:
+            a_load_bytes = 1
+
+        # Per-thread row metadata cache for the stage2 buffer-load loaders.
+        # See the stage1 equivalent for the rationale. Stage2 differs in that
+        # each row is addressed by ``row_ts = tok * topk + slot`` (rather than
+        # the raw token id) and the valid predicate folds in ``slot_ok`` too.
+        # Names mirror ``mixed_moe_gemm_2stage.py:3407-3417`` (``row_ts_i32`` /
+        # ``ts_valid`` / ``row_ts_safe``). Neither loader keeps an
+        # in_range list — A-data via perfect-tile contract, A-scale via
+        # elem clamping (see stage1 comment).
+        _a_x_row_base_i32 = []
+        _a_lds_idx = []
+        _as_sx_row_base_i32 = []
+        _as_lds_idx = []
+        _a_row_ts_i32 = []
+        _a_ts_valid = []
+
+        def _precompute_a_load_meta():
+            """Stage2 equivalent of stage1 ``_precompute_a_load_meta``.
+
+            Pattern copied from ``mixed_moe_gemm_2stage.py:3397-3420`` (stage2
+            uses ``row_ts_i32 = t_safe * topk + s_safe`` as the X row index;
+            stage1 uses ``t_safe`` only). Otherwise identical hoist:
+              ``x_row_base_i32 = row_ts_safe * K_packed_a + col_local`` plus
+              the OOB / LDS extras documented on the stage1 helper.
+            """
+            if _a_x_row_base_i32:
+                return
+            _vec = int(a_load_bytes)
+            _row_bytes = int(packed_tile_k_a)
+            _cols_per_row = _row_bytes // _vec
+            _bt = int(block_threads)
+            total = int(tile_m) * _cols_per_row
+            assert total % _bt == 0, (
+                "stage2 A-data tile must divide exactly into block_threads — "
+                "_pick_a_load_bytes() enforces this"
+            )
+            num_x_loads = total // _bt
+            _K_i32 = arith.constant(K_packed_a, type=T.i32)
+            # Layout-based (row, col_chunk) decomposition — see the
+            # stage1 ``_precompute_a_load_meta`` for the rationale (lowers
+            # to shifts/AND when ``_cols_per_row`` is power-of-2).
+            _layout_x_tile = fx.make_layout(
+                (int(tile_m), _cols_per_row), stride=(_cols_per_row, 1))
+            mask24 = arith.constant((1 << 24) - 1, type=T.i32)
+            shr24 = arith.constant(24, type=T.i32)
+            zero_i32 = arith.constant(0, type=T.i32)
+            for i in range(num_x_loads):
+                elem = tx + fx.Index(i * _bt)
+                coord_local = idx2crd(elem, _layout_x_tile)
+                row_local = fx.get(coord_local, 0)
+                col_local = fx.get(coord_local, 1) * arith.index(_vec)
+
+                # Inline decode — mirrors mixed_moe_gemm_2stage.py:3407-3417.
+                # Stage2 indexes A by ``row_ts = tok * topk + slot``. No OOB
+                # possible (perfect-tile contract), so ``row_ts_safe`` clamps
+                # via ``ts_valid`` directly.
+                fused_i = _get_fused_for_row(row_local)
+                t_i32 = arith.andi(fused_i, mask24)
+                s_i32 = arith.shrui(fused_i, shr24)
+                t_valid = arith.cmpi(
+                    arith.CmpIPredicate.ult, t_i32, i32_tokens_in)
+                s_valid = arith.cmpi(
+                    arith.CmpIPredicate.ult, s_i32, c_topk_i32)
+                ts_valid = arith.andi(t_valid, s_valid)
+                row_ts_i32 = t_i32 * c_topk_i32 + s_i32
+                row_ts_safe = arith.select(ts_valid, row_ts_i32, zero_i32)
+
+                # X row base — stage2 uses t*topk+s (mixed_moe_gemm_2stage.py:3420).
+                col_local_i32 = arith.index_cast(T.i32, col_local)
+                _a_x_row_base_i32.append(row_ts_safe * _K_i32 + col_local_i32)
+                _a_lds_idx.append(
+                    row_local * arith.index(lds_a_stride_bytes) + col_local)
+                # Cross-loader share cache: A-scale reuses these to skip a
+                # ``buffer_load(sorted_rsrc)`` when (round, thread)→row matches.
+                _a_row_ts_i32.append(row_ts_i32)
+                _a_ts_valid.append(ts_valid)
+
         def issue_a_load(k_packed_base, target_lds):
-            total = int(tile_m * packed_tile_k_a)
-            rounds = (total + block_threads - 1) // block_threads
-            for it in range(rounds):
-                elem = tx + fx.Index(it * block_threads)
-                in_range = arith.cmpi(arith.CmpIPredicate.ult, arith.index_cast(T.i32, elem), arith.constant(total, type=T.i32))
-                _if_elem = scf.IfOp(in_range)
-                with ir.InsertionPoint(_if_elem.then_block):
-                    row = elem // arith.index(int(packed_tile_k_a))
-                    col = elem % arith.index(int(packed_tile_k_a))
-                    # Use preloaded lds_tid instead of per-thread buffer_load(sorted_rsrc, ...).
-                    fused = _load_fused_from_lds(row)
-                    tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
-                    slot = fused >> arith.constant(24, type=T.i32)
-                    tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
-                    slot_ok0 = arith.cmpi(arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32))
-                    slot_ok1 = arith.cmpi(arith.CmpIPredicate.slt, slot, c_topk_i32)
-                    ts = tok * c_topk_i32 + slot
-                    ts_ok = arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
-                    load_ok = ts_ok
-                    x_idx = ts * arith.constant(K_packed_a, type=T.i32) + arith.index_cast(T.i32, k_packed_base + col)
-                    x_idx_safe = arith.select(load_ok, x_idx, arith.constant(0, type=T.i32))
-                    x_val = arith.select(load_ok, buffer_ops.buffer_load(x_rsrc, x_idx_safe, vec_width=1, dtype=T.i8), arith.constant(0, type=T.i8))
-                    lds_idx = row * arith.index(lds_a_stride_bytes) + col
-                    v1 = vector.from_elements(T.vec(1, T.i8), [x_val])
-                    vector.store(v1, target_lds, [lds_idx], alignment=1)
-                    scf.YieldOp([])
+            """K-hot path A-data buffer loader for stage2 (buffer-load mode).
+
+            Consumes ``_a_load_meta`` populated by ``_precompute_a_load_meta``
+            before the K-loop. The body only adds ``k_packed_base`` to the
+            cached K-invariant base and issues the buffer_load + LDS store.
+            """
+            assert _a_x_row_base_i32, (
+                "stage2 _precompute_a_load_meta() must be invoked before "
+                "issue_a_load to ensure cache SSA dominates all K-iterations"
+            )
+            # See stage1 ``issue_a_load`` for the rationale — perfect-tile
+            # contract means no IfOp guard. Hot body is just add +
+            # buffer_load + LDS store; ``row_ts_safe = 0`` clamps the address
+            # for invalid rows and the epilogue masks the resulting garbage.
+            _vec = int(a_load_bytes)
+            k_packed_base_i32 = arith.index_cast(T.i32, k_packed_base)
+            for i in range(len(_a_x_row_base_i32)):
+                x_idx = _a_x_row_base_i32[i] + k_packed_base_i32
+                x_vec = buffer_ops.buffer_load(
+                    x_rsrc, x_idx, vec_width=_vec, dtype=T.i8)
+                if _vec > 1:
+                    vector.store(x_vec, target_lds, [_a_lds_idx[i]],
+                                 alignment=_vec)
+                else:
+                    v1 = vector.from_elements(T.vec(1, T.i8), [x_vec])
+                    vector.store(v1, target_lds, [_a_lds_idx[i]],
+                                 alignment=1)
 
         # Cache of K-invariant pieces of the stage2 TDM gather descriptor.
         # See the stage1 equivalent for the field-by-field rationale; the
@@ -2849,158 +3155,128 @@ def _compile_stage2_mxscale_kernel_impl(
         def make_desc_as(k_base):
             return k_base / arith.index(SCALE_BLOCK)
 
-        def issue_as_load(k_scale_base, target_lds):
-            """Vectorised scalar A-scale loader (Option B) for stage2.
+        # Stage2 A-scale picker — see stage1 for the rationale.
+        if const_expr(int(tile_m * scale_k_per_tile) % int(block_threads) != 0):
+            raise ValueError(
+                f"stage2 tile_m * scale_k_per_tile "
+                f"({tile_m * scale_k_per_tile}) must be divisible by "
+                f"block_threads ({block_threads})"
+            )
+        bytes_per_thread_s = int(tile_m * scale_k_per_tile) // int(block_threads)
+        if const_expr(bytes_per_thread_s % 16 == 0):
+            sx_load_bytes = 16
+        elif const_expr(bytes_per_thread_s % 8 == 0):
+            sx_load_bytes = 8
+        elif const_expr(bytes_per_thread_s % 4 == 0):
+            sx_load_bytes = 4
+        elif const_expr(bytes_per_thread_s % 2 == 0):
+            sx_load_bytes = 2
+        else:
+            sx_load_bytes = 1
+        if const_expr(
+            (not _as_layout_rowmajor) and sx_load_bytes != int(SCALES_PER_WMMA)
+        ):
+            raise ValueError(
+                f"stage2 interleaved scale layout requires sx_load_bytes == "
+                f"{SCALES_PER_WMMA}; got {sx_load_bytes}."
+            )
 
-            See stage1 ``issue_as_load`` for the 4-byte chunking rationale.
-            Stage2 addresses rows by ``ts = tok * topk + slot`` and the
-            ``load_ok`` guard checks both ``tok_ok`` and ``slot_ok``.
+        def _precompute_as_load_meta():
+            """Stage2 equivalent of stage1 ``_precompute_as_load_meta``.
+
+            See stage1 for the picker / share-path rationale. Stage2 indexes
+            A by ``row_ts = tok * topk + slot`` (rather than the raw token
+            id); otherwise the structure is identical.
             """
-            _blk_bytes = int(SCALES_PER_WMMA)
-            _row_bytes = int(scale_k_per_tile)
-            if const_expr(_row_bytes % _blk_bytes == 0 and _row_bytes >= _blk_bytes):
-                _blk_vec_type = T.vec(_blk_bytes, T.i8)
-                _blks_per_row = _row_bytes // _blk_bytes
-                total = int(tile_m) * _blks_per_row
-                rounds = (total + block_threads - 1) // block_threads
-                for it in range(rounds):
-                    elem = tx + fx.Index(it * block_threads)
-                    in_range = arith.cmpi(
-                        arith.CmpIPredicate.ult,
-                        arith.index_cast(T.i32, elem),
-                        arith.constant(total, type=T.i32),
+            if _as_sx_row_base_i32:
+                return
+            _chunks_per_row = int(scale_k_per_tile) // int(sx_load_bytes)
+            _num_sx_loads = bytes_per_thread_s // int(sx_load_bytes)
+            _K_i32 = arith.constant(K_scale, type=T.i32)
+            _vec_a = int(a_load_bytes)
+            _cols_per_row_a = int(packed_tile_k_a) // _vec_a
+            _can_share_row = (_cols_per_row_a == _chunks_per_row)
+            _layout_sx_tile = fx.make_layout(
+                (int(tile_m), _chunks_per_row), stride=(_chunks_per_row, 1))
+            for i in range(_num_sx_loads):
+                elem = tx + fx.Index(i * int(block_threads))
+                coord_local = idx2crd(elem, _layout_sx_tile)
+                row_local = fx.get(coord_local, 0)
+                chunk_in_row = fx.get(coord_local, 1)
+                col_byte = chunk_in_row * arith.index(int(sx_load_bytes))
+                if _can_share_row and i < len(_a_row_ts_i32):
+                    # Reuse A-data's decode — drops one ``buffer_load(sorted_rsrc)``
+                    # per round per thread.
+                    row_ts_i32 = _a_row_ts_i32[i]
+                    ts_valid = _a_ts_valid[i]
+                else:
+                    # Inline decode — mirrors mixed_moe_gemm_2stage.py:3407-3417.
+                    fused_i = _get_fused_for_row(row_local)
+                    t_i32 = arith.andi(
+                        fused_i, arith.constant((1 << 24) - 1, type=T.i32))
+                    s_i32 = arith.shrui(
+                        fused_i, arith.constant(24, type=T.i32))
+                    t_valid = arith.cmpi(
+                        arith.CmpIPredicate.ult, t_i32, i32_tokens_in)
+                    s_valid = arith.cmpi(
+                        arith.CmpIPredicate.ult, s_i32, c_topk_i32)
+                    ts_valid = arith.andi(t_valid, s_valid)
+                    row_ts_i32 = t_i32 * c_topk_i32 + s_i32
+                row_ts_safe = arith.select(
+                    ts_valid, row_ts_i32, arith.constant(0, type=T.i32))
+                if const_expr(_as_layout_rowmajor):
+                    lds_idx = (
+                        row_local * arith.index(int(scale_k_per_tile))
+                        + col_byte
                     )
-                    _if_elem = scf.IfOp(in_range)
-                    with ir.InsertionPoint(_if_elem.then_block):
-                        row = elem // arith.index(_blks_per_row)
-                        ksc_blk = elem % arith.index(_blks_per_row)
-                        fused = _load_fused_from_lds(row)
-                        tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
-                        slot = fused >> arith.constant(24, type=T.i32)
-                        tok_ok = arith.cmpi(
-                            arith.CmpIPredicate.ult, tok, i32_tokens_in,
-                        )
-                        slot_ok0 = arith.cmpi(
-                            arith.CmpIPredicate.sge, slot,
-                            arith.constant(0, type=T.i32),
-                        )
-                        slot_ok1 = arith.cmpi(
-                            arith.CmpIPredicate.slt, slot, c_topk_i32,
-                        )
-                        ts = tok * c_topk_i32 + slot
-                        ts_ok = arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
-                        if const_expr(_as_layout_rowmajor):
-                            lds_idx = (
-                                row * arith.index(_row_bytes)
-                                + ksc_blk * arith.index(_blk_bytes)
-                            )
-                        else:
-                            warp_row_idx = row / arith.index(warp_tile_m)
-                            local_row = row % arith.index(warp_tile_m)
-                            lane_row = local_row % arith.index(WMMA_M)
-                            local_wm_idx = local_row / arith.index(WMMA_M)
-                            global_lds_row = (
-                                warp_row_idx * arith.index(WMMA_M) + lane_row
-                            )
-                            lds_idx = (
-                                global_lds_row
-                                * arith.index(interleaved_scale_cols_a)
-                                + ksc_blk
-                                * arith.index(wmma_m_rep * SCALES_PER_WMMA)
-                                + local_wm_idx * arith.index(SCALES_PER_WMMA)
-                            )
-                        _if_ok = scf.IfOp(ts_ok, has_else=True)
-                        with ir.InsertionPoint(_if_ok.then_block):
-                            chunk_off = (
-                                k_scale_base
-                                + ksc_blk * arith.index(_blk_bytes)
-                            )
-                            sx_idx = (
-                                ts * arith.constant(K_scale, type=T.i32)
-                                + arith.index_cast(T.i32, chunk_off)
-                            )
-                            sx_raw = buffer_ops.buffer_load(
-                                sx_rsrc,
-                                arith.shrui(
-                                    sx_idx,
-                                    arith.constant(2, type=T.i32),
-                                ),
-                                vec_width=1,
-                                dtype=T.i32,
-                            )
-                            sx_vec = vector.bitcast(
-                                _blk_vec_type,
-                                vector.from_elements(T.vec(1, T.i32), [sx_raw]),
-                            )
-                            vector.store(
-                                sx_vec, target_lds, [lds_idx],
-                                alignment=_blk_bytes,
-                            )
-                            scf.YieldOp([])
-                        with ir.InsertionPoint(_if_ok.else_block):
-                            fill_vec = vector.bitcast(
-                                _blk_vec_type,
-                                vector.from_elements(
-                                    T.vec(1, T.i32),
-                                    [arith.constant(0x7F7F7F7F, type=T.i32)],
-                                ),
-                            )
-                            vector.store(
-                                fill_vec, target_lds, [lds_idx],
-                                alignment=_blk_bytes,
-                            )
-                            scf.YieldOp([])
-                        scf.YieldOp([])
-            else:
-                total = int(tile_m * scale_k_per_tile)
-                rounds = (total + block_threads - 1) // block_threads
-                for it in range(rounds):
-                    elem = tx + fx.Index(it * block_threads)
-                    in_range = arith.cmpi(
-                        arith.CmpIPredicate.ult,
-                        arith.index_cast(T.i32, elem),
-                        arith.constant(total, type=T.i32),
+                else:
+                    ksc_blk = chunk_in_row
+                    warp_row_idx = row_local / arith.index(warp_tile_m)
+                    local_row = row_local % arith.index(warp_tile_m)
+                    lane_row = local_row % arith.index(WMMA_M)
+                    local_wm_idx = local_row / arith.index(WMMA_M)
+                    global_lds_row = (
+                        warp_row_idx * arith.index(WMMA_M) + lane_row
                     )
-                    _if_elem = scf.IfOp(in_range)
-                    with ir.InsertionPoint(_if_elem.then_block):
-                        row = elem // arith.index(int(scale_k_per_tile))
-                        ksc = elem % arith.index(int(scale_k_per_tile))
-                        fused = _load_fused_from_lds(row)
-                        tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
-                        slot = fused >> arith.constant(24, type=T.i32)
-                        tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
-                        slot_ok0 = arith.cmpi(arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32))
-                        slot_ok1 = arith.cmpi(arith.CmpIPredicate.slt, slot, c_topk_i32)
-                        ts = tok * c_topk_i32 + slot
-                        ts_ok = arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
-                        load_ok = ts_ok
-                        ksc_off = k_scale_base + ksc
-                        sx_idx = ts * arith.constant(K_scale, type=T.i32) + arith.index_cast(T.i32, ksc_off)
-                        sx_idx_safe = arith.select(load_ok, sx_idx, arith.constant(0, type=T.i32))
-                        sx_val = arith.select(
-                            load_ok,
-                            buffer_ops.buffer_load(sx_rsrc, sx_idx_safe, vec_width=1, dtype=T.i8),
-                            arith.constant(127, type=T.i8),
-                        )
-                        if is_fp4:
-                            lds_idx = row * arith.index(int(scale_k_per_tile)) + ksc
-                        else:
-                            warp_row_idx = row / arith.index(warp_tile_m)
-                            local_row = row % arith.index(warp_tile_m)
-                            lane_row = local_row % arith.index(WMMA_M)
-                            local_wm_idx = local_row / arith.index(WMMA_M)
-                            global_lds_row = warp_row_idx * arith.index(WMMA_M) + lane_row
-                            ksc_blk = ksc / arith.index(SCALES_PER_WMMA)
-                            ksc_sub = ksc % arith.index(SCALES_PER_WMMA)
-                            lds_idx = (
-                                global_lds_row * arith.index(interleaved_scale_cols_a)
-                                + ksc_blk * arith.index(wmma_m_rep * SCALES_PER_WMMA)
-                                + local_wm_idx * arith.index(SCALES_PER_WMMA)
-                                + ksc_sub
-                            )
-                        v1 = vector.from_elements(T.vec(1, T.i8), [sx_val])
-                        vector.store(v1, target_lds, [lds_idx], alignment=1)
-                        scf.YieldOp([])
+                    lds_idx = (
+                        global_lds_row
+                        * arith.index(interleaved_scale_cols_a)
+                        + ksc_blk
+                        * arith.index(wmma_m_rep * SCALES_PER_WMMA)
+                        + local_wm_idx * arith.index(SCALES_PER_WMMA)
+                    )
+                # Scale row base — analog of mixed's ``x_row_base_div4``
+                # (mixed_moe_gemm_2stage.py:3420) but in scale-byte units.
+                col_byte_i32 = arith.index_cast(T.i32, col_byte)
+                _as_sx_row_base_i32.append(row_ts_safe * _K_i32 + col_byte_i32)
+                _as_lds_idx.append(lds_idx)
+
+        def issue_as_load(k_scale_base, target_lds):
+            """K-hot path A-scale loader for stage2 (buffer-load mode).
+
+            Mirrors stage1 ``issue_as_load``. The picker above guarantees
+            a perfect tile (``bytes_per_thread_s % sx_load_bytes == 0``
+            and ``total_bytes % block_threads == 0``), so every thread
+            performs ``num_sx_loads`` unique chunked loads with no OOB
+            threads and no fallback.
+            """
+            assert _as_sx_row_base_i32, (
+                "stage2 _precompute_as_load_meta() must be invoked before "
+                "issue_as_load to ensure cache SSA dominates all K-iterations"
+            )
+            k_scale_base_i32 = arith.index_cast(T.i32, k_scale_base)
+            for i in range(len(_as_sx_row_base_i32)):
+                sx_idx = _as_sx_row_base_i32[i] + k_scale_base_i32
+                sx_vec = buffer_ops.buffer_load(
+                    sx_rsrc, sx_idx, vec_width=int(sx_load_bytes), dtype=T.i8)
+                if int(sx_load_bytes) > 1:
+                    vector.store(
+                        sx_vec, target_lds, [_as_lds_idx[i]],
+                        alignment=int(sx_load_bytes))
+                else:
+                    v1 = vector.from_elements(T.vec(1, T.i8), [sx_vec])
+                    vector.store(
+                        v1, target_lds, [_as_lds_idx[i]], alignment=1)
 
         def issue_as_load_tdm_gather(k_scale_base, target_lds):
             """TDM-gather A-scale loader (Option A) for stage2.
@@ -3184,9 +3460,22 @@ def _compile_stage2_mxscale_kernel_impl(
 
         _if_blk = scf.IfOp(block_ok)
         with ir.InsertionPoint(_if_blk.then_block):
-            _preload_sorted_ids_to_lds()
+            if const_expr(_need_lds_tid):
+                _preload_sorted_ids_to_lds()
             if const_expr(_use_tdm_gather_a):
                 _precompute_a_row_indices()
+            # Buffer-load mode: hoist the K-invariant per-thread
+            # sorted_token_ids decode out of the K-loop. The A-scale
+            # precompute opportunistically shares ``ts`` with the A-data
+            # cache when the round-to-row mapping matches; otherwise it
+            # falls back to an independent decode. Must run BEFORE the
+            # K-loop so the cached SSA dominates every issue callsite
+            # (including those inside pipeline-prologue / tail
+            # conditional regions).
+            if const_expr(not _use_tdm_gather_a):
+                _precompute_a_load_meta()
+            if const_expr(not _use_tdm_gather_as):
+                _precompute_as_load_meta()
             a_data_bases = _precompute_a_data_bases()
             b_data_bases = _precompute_b_data_bases()
             as_bases = _precompute_a_scale_lane_bases()
