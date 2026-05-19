@@ -18,27 +18,16 @@ if [[ -z "${TRITON_INDEX_URL}" || -z "${TRITON_SPEC}" ]]; then
     exit 1
 fi
 
-pip uninstall -y triton pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
+python3 -m pip uninstall -y triton pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
 
 echo "Installing ${TRITON_SPEC} from ${TRITON_INDEX_URL}"
-pip install --extra-index-url "${TRITON_INDEX_URL}" "${TRITON_SPEC}"
+python3 -m pip install --extra-index-url "${TRITON_INDEX_URL}" "${TRITON_SPEC}"
 
 python3 - <<'PY'
 import triton
+from packaging.version import Version
 
-
-def parse_version(version: str) -> tuple[int, ...]:
-    version = version.split("+", 1)[0].split("-", 1)[0]
-    parts: list[int] = []
-    for part in version.split("."):
-        try:
-            parts.append(int(part))
-        except ValueError:
-            break
-    return tuple(parts)
-
-
-if parse_version(triton.__version__) < (3, 6, 0):
+if Version(triton.__version__) < Version("3.6.0"):
     raise SystemExit(f"triton>=3.6.0 is required, found {triton.__version__}")
 
 print(f"Installed triton {triton.__version__}")
