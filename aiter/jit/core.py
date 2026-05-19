@@ -8,6 +8,7 @@ import logging
 import multiprocessing
 import os
 import re
+import shlex
 import shutil
 import sys
 import time
@@ -21,7 +22,7 @@ from packaging.version import Version, parse
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
 from chip_info import get_gfx, get_gfx_list  # noqa: E402
-from cpp_extension import _jit_compile, get_hip_version  # noqa: E402
+from cpp_extension import _jit_compile, executable_path, get_hip_version  # noqa: E402
 from file_baton import FileBaton  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
 
@@ -464,7 +465,7 @@ def hip_flag_checker(flag_hip: str) -> bool:
     import subprocess
 
     cmd = (
-        ["hipcc"]
+        [executable_path("hipcc")]
         + flag_hip.split()
         + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
     )
@@ -486,8 +487,8 @@ def check_LLVM_MAIN_REVISION():
     #define CK_TILE_HOST_DEVICE_EXTERN"""
     import subprocess
 
-    cmd = """echo "#include <tuple>
-__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
+    cmd = f"""echo "#include <tuple>
+__host__ __device__ void func(){{std::tuple<int, int> t = std::tuple(1, 1);}}" | {shlex.quote(executable_path("hipcc"))} -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
     try:
         subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError:
