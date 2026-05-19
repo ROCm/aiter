@@ -199,32 +199,109 @@ class CudaCommunicator(DeviceCommunicatorBase):
         weight_,
         eps,
         prefill_support: bool = False,
+        x_pad_to_multiple: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        n = input_.shape[-1]
+        from aiter.dist.device_communicators.custom_all_reduce import (
+            is_weak_contiguous,
+        )
+
+        input_is_weak_contiguous = is_weak_contiguous(input_)
+        residual_is_weak_contiguous = is_weak_contiguous(res_inp_)
+        use_general_path = (
+            not input_is_weak_contiguous or not residual_is_weak_contiguous
+        )
+        input_n = input_.shape[-1]
+        residual_n = res_inp_.shape[-1]
+        n = weight_.numel()
+        if input_n < n:
+            raise RuntimeError(
+                "fused_allreduce_rmsnorm requires input width >= weight width, "
+                f"got input_width={input_n}, weight_width={n}"
+            )
+        if residual_n != n:
+            raise RuntimeError(
+                "fused_allreduce_rmsnorm requires residual width == weight width, "
+                f"got residual_width={residual_n}, weight_width={n}"
+            )
+        out_n = n
+        if x_pad_to_multiple > 0:
+            out_n = (n + x_pad_to_multiple - 1) // x_pad_to_multiple * x_pad_to_multiple
         total_bytes = input_.numel() * input_.element_size()
         can_use_fuse_ar_rms = (
             n <= 16384 and total_bytes < 8 * 1024 * 8192 and self.world_size != 6
         )
         ca_comm = self.ca_comm
+        can_use_custom_ar = (
+            ca_comm is not None and not ca_comm.disabled and can_use_fuse_ar_rms
+        )
+        use_1stage = (
+            self._ar_1stage_override
+            if self._ar_1stage_override is not None
+            else (total_bytes <= 128 * 1024)
+        )
         if (
-            ca_comm is not None
-            and not ca_comm.disabled
+            not use_general_path
+            and can_use_custom_ar
             and ca_comm.should_custom_ar(input_, prefill_support)
-            and can_use_fuse_ar_rms
         ):
-            use_1stage = (
-                self._ar_1stage_override
-                if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
-            )
             out, res_out = ca_comm.custom_fused_ar_rms(
-                input_, res_inp_, weight_, eps, use_1stage
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                use_1stage,
+                out_hidden_dim=out_n,
             )
             assert out is not None
             assert res_out is not None
             return out, res_out
+
+        if (
+            can_use_custom_ar
+            and not input_is_weak_contiguous
+            and residual_is_weak_contiguous
+            and input_.stride(-1) == 1
+            and ca_comm.should_custom_ar_bytes(input_, prefill_support)
+        ):
+            out, res_out = ca_comm.custom_fused_ar_rms_packed_input(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                use_1stage,
+                out_hidden_dim=out_n,
+                prefill_support=prefill_support,
+            )
+            assert out is not None
+            assert res_out is not None
+            return out, res_out
+
+        input_for_ar = input_ if input_is_weak_contiguous else input_.contiguous()
+        ar_out = self.all_reduce(input_for_ar, prefill_support=prefill_support)
+        if input_n != n:
+            # The padded tail is semantically zero for the current MoE path, so
+            # the fallback path only needs the valid hidden region for RMSNorm.
+            ar_out = ar_out[..., :n].contiguous()
+
+        if use_general_path or x_pad_to_multiple > 0 or input_n != n:
+            # The custom fused AR+RMS kernel still falls back here for strided rows
+            # or when custom all-reduce is unavailable for padded outputs.
+            # Fall back to all-reduce + Triton RMSNorm so callers can pass strided
+            # inputs/residuals and optionally request a padded output width.
+            from aiter.ops.triton.normalization.fused_add_rmsnorm_pad import (
+                fused_add_rmsnorm_pad,
+            )
+
+            out, residual_out = fused_add_rmsnorm_pad(
+                ar_out,
+                weight_,
+                eps,
+                res_inp_,
+                x_pad_to_multiple=x_pad_to_multiple,
+            )
+            return out, residual_out
+
         # call split kernel
-        ar_out = self.all_reduce(input_, prefill_support=prefill_support)
         out = torch.empty_like(ar_out)
         residual_out = torch.empty_like(ar_out)
         from aiter import rmsnorm2d_fwd_with_add
