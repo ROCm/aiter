@@ -83,7 +83,7 @@ def _generate_a16w4_data(
         dtype=dtype,
         activation=ActivationType.Silu,
         quant_type=Q_TYPE,
-        a1_scale=None,   # a16w4: no activation quantization
+        a1_scale=None,  # a16w4: no activation quantization
         w1_scale=w1_scale,
         doweight=doweight_stage1,
     )
@@ -104,7 +104,7 @@ def _generate_a16w4_data(
         dtype=dtype,
         quant_type=Q_TYPE,
         w2_scale=w2_scale,
-        a2_scale=None,   # a16w4: no activation scale
+        a2_scale=None,  # a16w4: no activation scale
         doweight=not doweight_stage1,
     )
 
@@ -464,7 +464,9 @@ def main():
                         import traceback
 
                         traceback.print_exc()
-                        results.append((f"stage1_a16w4_t{token}_bm{bm}_kb{kb}", "ERROR", 0, 0))
+                        results.append(
+                            (f"stage1_a16w4_t{token}_bm{bm}_kb{kb}", "ERROR", 0, 0)
+                        )
 
             if "stage2" in args.stage:
                 for mode in args.mode:

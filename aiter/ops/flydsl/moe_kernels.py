@@ -765,7 +765,9 @@ def flydsl_moe_stage1(
             # A16W4 split-K kernel uses f32 atomics for partial sums.
             torch_tmp_out_dtype = torch.float32
         else:
-            torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
+            torch_tmp_out_dtype = (
+                dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
+            )
         tmp_out = torch.zeros(
             (token_num, topk, inter_dim * 2), dtype=torch_tmp_out_dtype, device=dev
         )
