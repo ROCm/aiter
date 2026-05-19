@@ -6,33 +6,17 @@ from typing import Optional
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_mxfp8 import (
-    _gemm_mxfp8_kernel,
-    _gemm_mxfp8_preshuffle_kernel,
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
+    _gemm_afp8wfp8_kernel,
+    _gemm_afp8wfp8_preshuffle_kernel,
+    _get_config,
 )
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
-
-_DEFAULT_CONFIG = {
-    "BLOCK_SIZE_M": 64,
-    "BLOCK_SIZE_N": 128,
-    "BLOCK_SIZE_K": 128,
-    "GROUP_SIZE_M": 8,
-    "NUM_KSPLIT": 1,
-    "num_warps": 4,
-    "num_stages": 2,
-    "waves_per_eu": 0,
-    "matrix_instr_nonkdim": 16,
-    "cache_modifier": "",
-}
-
-
-def _get_default_config() -> dict:
-    return dict(_DEFAULT_CONFIG)
-
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
+    _gemm_a8w8_blockscale_reduce_kernel,
+)
 
 # -----------------------------------------------------------------------------
-# Tuned-config lookup for gemm_mxfp8_preshuffle.
+# Tuned-config lookup for gemm_afp8wfp8_preshuffle.
 #
 # Configs live under aiter.ops.triton.configs.gemm using the standard aiter
 # naming: gfx{arch}-GEMM-MXFP8-PRESHUFFLE-N={N}-K={K}.json, keyed by
@@ -52,25 +36,7 @@ def _mark_oom(M: int, N: int, K: int):
     _OOM_SHAPES.add((M, N, K))
 
 
-def _get_config(M: int, N: int, K: int) -> dict:
-    """Load the best tuned config for (M, N, K) via the standard aiter JSON
-    config mechanism. Falls back to the generic fallback file or to
-    _DEFAULT_CONFIG if no JSON is available."""
-    try:
-        config, _ = get_gemm_config("GEMM-MXFP8-PRESHUFFLE", M, N, K)
-    except (AssertionError, KeyError, FileNotFoundError):
-        config = _get_default_config()
-    # Always pin NUM_KSPLIT=1 (this version of the kernel doesn't split K).
-    config["NUM_KSPLIT"] = 1
-    # The JSON uses cache_modifier=null which decodes to Python None; the
-    # kernel accepts None or "", but we keep the empty-string default from
-    # _DEFAULT_CONFIG to match the legacy code path.
-    if config.get("cache_modifier") is None:
-        config["cache_modifier"] = ""
-    return config
-
-
-def gemm_mxfp8(
+def gemm_afp8wfp8(
     x: torch.Tensor,
     w: torch.Tensor,
     x_scales: torch.Tensor,
@@ -78,6 +44,7 @@ def gemm_mxfp8(
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
+    skip_reduce: Optional[bool] = False,
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with MXFP8 activations and FP8
@@ -111,27 +78,35 @@ def gemm_mxfp8(
         w_t = w_t.view(torch.uint8)
 
     if config is None:
-        config = _get_default_config()
-    else:
-        # Merge with defaults so missing keys are filled.
-        merged = _get_default_config()
-        merged.update(config)
-        config = merged
+        config, _ = _get_config(M, N, K)
 
-    # First-version: NUM_KSPLIT must be 1
-    config["NUM_KSPLIT"] = 1
-
-    if y is None:
+    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
+    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
+        K, config["NUM_KSPLIT"]
+    )  # How big each split_k partition is
+    if config["NUM_KSPLIT"] > 1:
+        y_pp = torch.empty(
+            (config["NUM_KSPLIT"], M, N),
+            dtype=torch.float32,
+            device=x.device,
+        )
+    else:
+        y_pp = None
+
     grid = lambda META: (  # noqa: E731
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        (
+            META["NUM_KSPLIT"]
+            * triton.cdiv(M, META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+        ),
     )
 
-    _gemm_mxfp8_kernel[grid](
+    _gemm_afp8wfp8_kernel[grid](
         x,
         w_t,
-        y,
+        y if config["NUM_KSPLIT"] == 1 else y_pp,
         x_scales,
         w_scales,
         M,
@@ -141,8 +116,9 @@ def gemm_mxfp8(
         x.stride(1),
         w_t.stride(0),
         w_t.stride(1),
-        y.stride(0),
-        y.stride(1),
+        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
         x_scales.stride(0),
         x_scales.stride(1),
         w_scales.stride(0),
@@ -150,10 +126,38 @@ def gemm_mxfp8(
         **config,
     )
 
+    if config["NUM_KSPLIT"] > 1:
+        if skip_reduce:
+            return y_pp
+
+        REDUCE_BLOCK_SIZE_M = 32
+        REDUCE_BLOCK_SIZE_N = 32
+        ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
+
+        grid_reduce = (
+            triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
+            triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
+        )
+        _gemm_a8w8_blockscale_reduce_kernel[grid_reduce](
+            y_pp,
+            y,
+            M,
+            N,
+            y_pp.stride(0),
+            y_pp.stride(1),
+            y_pp.stride(2),
+            y.stride(0),
+            y.stride(1),
+            REDUCE_BLOCK_SIZE_M,
+            REDUCE_BLOCK_SIZE_N,
+            ACTUAL_KSPLIT,
+            triton.next_power_of_2(config["NUM_KSPLIT"]),
+        )
+
     return y
 
 
-def gemm_mxfp8_preshuffle(
+def gemm_afp8wfp8_preshuffle(
     x: torch.Tensor,
     w_shuffled: torch.Tensor,
     x_scales: torch.Tensor,
@@ -161,9 +165,10 @@ def gemm_mxfp8_preshuffle(
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
+    skip_reduce: Optional[bool] = False,
 ) -> torch.Tensor:
     """
-    Preshuffle variant of gemm_mxfp8. The weight tensor has already been
+    Preshuffle variant of gemm_afp8wfp8. The weight tensor has already been
     permuted via aiter.ops.shuffle.shuffle_weight(..., layout=(16, 16)). Scales
     are left unshuffled in the compact 128x128 layout.
 
@@ -194,63 +199,79 @@ def gemm_mxfp8_preshuffle(
         w_view = w_view.view(torch.uint8)
 
     if config is None:
-        if (M, N, K) in _OOM_SHAPES:
-            # We've previously OOM'd here under HIP-graph capture; skip the
-            # tuned lookup and use the conservative default.
-            config = _get_default_config()
-        else:
-            config = _get_config(M, N, K)
-    else:
-        merged = _get_default_config()
-        merged.update(config)
-        config = merged
+        config, _ = _get_config(M, N, K, shuffle=True)
 
-    config["NUM_KSPLIT"] = 1
-
-    if y is None:
+    if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
+    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
+        K, config["NUM_KSPLIT"]
+    )  # How big each split_k partition is
+    if config["NUM_KSPLIT"] > 1:
+        y_pp = torch.empty(
+            (config["NUM_KSPLIT"], M, N),
+            dtype=torch.float32,
+            device=x.device,
+        )
+    else:
+        y_pp = None
+
     grid = lambda META: (  # noqa: E731
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        (
+            META["NUM_KSPLIT"]
+            * triton.cdiv(M, META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+        ),
+    )
+    _gemm_afp8wfp8_preshuffle_kernel[grid](
+        x,
+        w_view,
+        y if config["NUM_KSPLIT"] == 1 else y_pp,
+        x_scales,
+        w_scales,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w_view.stride(0),
+        w_view.stride(1),
+        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+        x_scales.stride(0),
+        x_scales.stride(1),
+        w_scales.stride(0),
+        w_scales.stride(1),
+        **config,
     )
 
-    def _launch(cfg):
-        _gemm_mxfp8_preshuffle_kernel[grid](
-            x,
-            w_view,
+    if config["NUM_KSPLIT"] > 1:
+        if skip_reduce:
+            return y_pp
+
+        REDUCE_BLOCK_SIZE_M = 32
+        REDUCE_BLOCK_SIZE_N = 32
+        ACTUAL_KSPLIT = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
+
+        grid_reduce = (
+            triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
+            triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
+        )
+        _gemm_a8w8_blockscale_reduce_kernel[grid_reduce](
+            y_pp,
             y,
-            x_scales,
-            w_scales,
             M,
             N,
-            K,
-            x.stride(0),
-            x.stride(1),
-            w_view.stride(0),
-            w_view.stride(1),
+            y_pp.stride(0),
+            y_pp.stride(1),
+            y_pp.stride(2),
             y.stride(0),
             y.stride(1),
-            x_scales.stride(0),
-            x_scales.stride(1),
-            w_scales.stride(0),
-            w_scales.stride(1),
-            **cfg,
+            REDUCE_BLOCK_SIZE_M,
+            REDUCE_BLOCK_SIZE_N,
+            ACTUAL_KSPLIT,
+            triton.next_power_of_2(config["NUM_KSPLIT"]),
         )
-
-    try:
-        _launch(config)
-    except Exception as e:
-        # The tuned config may overflow gfx950 LDS (163840 bytes) under HIP
-        # graph capture even when the standalone bench succeeds. Fall back
-        # to default and cache the failure to avoid retrying on every call.
-        if (
-            "OutOfResources" in type(e).__name__
-            or "shared memory" in str(e)
-            or "Required" in str(e)
-        ):
-            _mark_oom(M, N, K)
-            _launch(_get_default_config() | {"NUM_KSPLIT": 1})
-        else:
-            raise
 
     return y

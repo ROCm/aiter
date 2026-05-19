@@ -25,6 +25,9 @@ def fused_clamp_act_mul(
     weights: Optional[torch.Tensor] = None,
     dtype_quant: torch.dtype | None = None,
     transpose_scale: bool = False,
+    quant_block_size: int = 128,
+    scale_dtype_fmt: Literal["fp32", "ue8m0"] = "fp32",
+    shuffle_scale: bool = False,
 ):
     """
     Fused clamp (SwiGLU-style) + act(gate) * up + optional weights, with optional FP8 group quant.
@@ -54,6 +57,25 @@ def fused_clamp_act_mul(
 
     HAS_QUANT = dtype_quant is not None
 
+    # Step 5 ue8m0 mode: per-1×32 group quant, uint8 scale.
+    assert scale_dtype_fmt in ("fp32", "ue8m0")
+    if scale_dtype_fmt == "ue8m0":
+        assert HAS_QUANT, "scale_dtype_fmt='ue8m0' requires dtype_quant"
+        assert (
+            quant_block_size == 32
+        ), f"ue8m0 requires quant_block_size=32 got {quant_block_size}"
+        assert dtype_quant in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ), f"ue8m0 requires fp8 e4m3, got {dtype_quant}"
+        if shuffle_scale and transpose_scale:
+            raise ValueError("shuffle_scale incompatible with transpose_scale")
+        _scale_storage_dtype = torch.uint8
+    else:
+        if shuffle_scale:
+            raise ValueError("shuffle_scale only valid with scale_dtype_fmt='ue8m0'")
+        _scale_storage_dtype = torch.float32
+
     if HAS_QUANT:
         if out is None:
             out = torch.empty((M, n_half), dtype=dtype_quant, device=inp.device)
@@ -65,15 +87,15 @@ def fused_clamp_act_mul(
                     dtype_quant,
                     out.dtype,
                 )
-        num_blocks = (n_half + 127) // 128
+        num_blocks = (n_half + quant_block_size - 1) // quant_block_size
         if scale is None:
             if transpose_scale:
                 scale = torch.empty(
-                    (num_blocks, M), dtype=torch.float32, device=inp.device
+                    (num_blocks, M), dtype=_scale_storage_dtype, device=inp.device
                 )
             else:
                 scale = torch.empty(
-                    (M, num_blocks), dtype=torch.float32, device=inp.device
+                    (M, num_blocks), dtype=_scale_storage_dtype, device=inp.device
                 )
         else:
             if transpose_scale:
@@ -153,7 +175,8 @@ def fused_clamp_act_mul(
         weights.stride(1) if HAVE_WEIGHTS else 0,
         swiglu_limit,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
-        QUANT_BLOCK_SIZE=128,
+        QUANT_BLOCK_SIZE=quant_block_size,
+        SCALE_FMT=scale_dtype_fmt,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
         HAVE_WEIGHTS=HAVE_WEIGHTS,
@@ -167,5 +190,9 @@ def fused_clamp_act_mul(
     if HAS_QUANT:
         if transpose_scale:
             scale = scale.view(M, num_bs_cols)
+        if shuffle_scale:
+            from aiter.utility import fp4_utils
+
+            scale = fp4_utils.e8m0_shuffle(scale)
         return out, scale
     return out

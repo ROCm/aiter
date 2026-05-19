@@ -5,10 +5,10 @@ import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
-
-_gemm_mxfp8_repr = make_kernel_repr(
-    "_gemm_mxfp8_kernel",
+_gemm_afp8wfp8_repr = make_kernel_repr(
+    "_gemm_afp8wfp8_kernel",
     [
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
@@ -29,8 +29,8 @@ _gemm_mxfp8_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % args["BLOCK_SIZE_K"] == 0),
     }
 )
-@triton.jit(repr=_gemm_mxfp8_repr)
-def _gemm_mxfp8_kernel(
+@triton.jit(repr=_gemm_afp8wfp8_repr)
+def _gemm_afp8wfp8_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -43,6 +43,7 @@ def _gemm_mxfp8_kernel(
     stride_ak,
     stride_bk,
     stride_bn,
+    stride_ck,
     stride_cm,
     stride_cn,
     stride_asm,
@@ -110,12 +111,8 @@ def _gemm_mxfp8_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    a_ptrs = a_ptr + (
-        offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
-    )
-    b_ptrs = b_ptr + (
-        offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-    )
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     # A-scale pointers: per-row (M) and per scale group (K // 32)
     offs_ks_a = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
@@ -180,9 +177,7 @@ def _gemm_mxfp8_kernel(
             a = tl.load(a_ptrs)
             b = tl.load(b_ptrs, cache_modifier=cache_modifier)
         else:
-            a = tl.load(
-                a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0
-            )
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0)
             b = tl.load(
                 b_ptrs,
                 mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
@@ -209,8 +204,8 @@ def _gemm_mxfp8_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-_gemm_mxfp8_preshuffle_repr = make_kernel_repr(
-    "_gemm_mxfp8_preshuffle_kernel",
+_gemm_afp8wfp8_preshuffle_repr = make_kernel_repr(
+    "_gemm_afp8wfp8_preshuffle_kernel",
     [
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
@@ -231,8 +226,8 @@ _gemm_mxfp8_preshuffle_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % args["BLOCK_SIZE_K"] == 0),
     }
 )
-@triton.jit(repr=_gemm_mxfp8_preshuffle_repr)
-def _gemm_mxfp8_preshuffle_kernel(
+@triton.jit(repr=_gemm_afp8wfp8_preshuffle_repr)
+def _gemm_afp8wfp8_preshuffle_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -245,6 +240,7 @@ def _gemm_mxfp8_preshuffle_kernel(
     stride_ak,
     stride_bn,
     stride_bk,
+    stride_ck,
     stride_cm,
     stride_cn,
     stride_asm,
@@ -265,7 +261,7 @@ def _gemm_mxfp8_preshuffle_kernel(
     cache_modifier: tl.constexpr,
 ):
     """
-    Preshuffle variant of _gemm_mxfp8_kernel. Weight tensor has been shuffled
+    Preshuffle variant of _gemm_afp8wfp8_kernel. Weight tensor has been shuffled
     via aiter.ops.shuffle.shuffle_weight(layout=(16, 16)) so that 16-row N tiles
     are interleaved with their 32-col K chunks in storage. The kernel loads the
     shuffled tile in storage order (BLOCK_SIZE_N // 16, BLOCK_SIZE_K * 16) then
@@ -345,9 +341,7 @@ def _gemm_mxfp8_preshuffle_kernel(
             a_scales = tl.load(a_scale_ptrs, mask=a_scale_mask, other=127)
 
         # Load and broadcast B scales (same as non-preshuffle path).
-        offs_bsk = (
-            k_base + offs_scale_k_a * SCALE_GROUP_SIZE
-        ) // B_SCALE_K_GROUP
+        offs_bsk = (k_base + offs_scale_k_a * SCALE_GROUP_SIZE) // B_SCALE_K_GROUP
         b_scale_ptrs = (
             b_scales_ptr
             + offs_bsn[:, None] * stride_bsn
@@ -371,9 +365,7 @@ def _gemm_mxfp8_preshuffle_kernel(
             a = tl.load(a_ptrs)
             b_shuf = tl.load(b_ptrs, cache_modifier=cache_modifier)
         else:
-            a = tl.load(
-                a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0
-            )
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0)
             b_shuf = tl.load(
                 b_ptrs,
                 mask=offs_k_shuffle[None, :] < (K - k * BLOCK_SIZE_K) * 16,
@@ -415,3 +407,18 @@ def _gemm_mxfp8_preshuffle_kernel(
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+    shuffle: bool = False,
+):
+    """Load the best tuned config for (M, N, K) via the standard aiter JSON
+    config mechanism. Falls back to the generic fallback file or to
+    _DEFAULT_CONFIG if no JSON is available."""
+    if shuffle:
+        return get_gemm_config("GEMM-AFP8WFP8-PRESHUFFLE", M, N, K)
+    else:
+        return get_gemm_config("GEMM-AFP8WFP8", M, N, K)
