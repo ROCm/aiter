@@ -78,24 +78,6 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
 
 
 @gluon.jit
-def depreshuffle_scales(
-    smem_scales,
-    BLOCK_M: gl.constexpr,
-    K_GROUPS: gl.constexpr,
-):
-    LANES_PER_STRIPE: gl.constexpr = 16
-    KG_PER_STRIPE: gl.constexpr = 4
-    NUM_STRIPES: gl.constexpr = K_GROUPS // KG_PER_STRIPE
-    return (
-        smem_scales.reshape(
-            (BLOCK_M // LANES_PER_STRIPE, NUM_STRIPES, LANES_PER_STRIPE, KG_PER_STRIPE)
-        )
-        .permute((0, 2, 1, 3))
-        .reshape((BLOCK_M, K_GROUPS))
-    )
-
-
-@gluon.jit
 def depreshuffle_b_raw_to_kn(
     b_raw,
     BLOCK_N: gl.constexpr,
@@ -169,7 +151,6 @@ def gemm_mxfp4_preshuffle_gfx1250(
     gl.static_assert(K_GROUPS * 32 == BLOCK_SIZE_K)
 
     gl.static_assert(BLOCK_SIZE_K % 32 == 0)
-    gl.static_assert(BLOCK_SIZE_K % 128 == 0)  # K_GROUPS divisible by KG_PER_STRIPE
     gl.static_assert(BLOCK_SIZE_M % LANES_PER_TDM == 0)
     gl.static_assert(BLOCK_SIZE_N % LANES_PER_TDM == 0)
 
@@ -205,24 +186,18 @@ def gemm_mxfp4_preshuffle_gfx1250(
     k_scale_cols = K_elems // SCALE_GROUP_ELEMS
 
     as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_scale_ptr + tile_m * (BLOCK_SIZE_M // LANES_PER_TDM) * stride_as_m,
-        shape=(
-            gl.cdiv(M, LANES_PER_TDM) - tile_m * (BLOCK_SIZE_M // LANES_PER_TDM),
-            k_scale_cols * LANES_PER_TDM,
-        ),
+        base=a_scale_ptr + tile_m * BLOCK_SIZE_M * stride_as_m,
+        shape=(M - tile_m * BLOCK_SIZE_M, k_scale_cols),
         strides=(stride_as_m, stride_as_k),
-        block_shape=(BLOCK_SIZE_M // LANES_PER_TDM, K_GROUPS * LANES_PER_TDM),
+        block_shape=(BLOCK_SIZE_M, K_GROUPS),
         layout=shared_S,
     )
 
     bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=b_scale_ptr + tile_n * (BLOCK_SIZE_N // LANES_PER_TDM) * stride_bs_n,
-        shape=(
-            gl.cdiv(N, LANES_PER_TDM) - tile_n * (BLOCK_SIZE_N // LANES_PER_TDM),
-            k_scale_cols * LANES_PER_TDM,
-        ),
+        base=b_scale_ptr + tile_n * BLOCK_SIZE_N * stride_bs_n,
+        shape=(N - tile_n * BLOCK_SIZE_N, k_scale_cols),
         strides=(stride_bs_n, stride_bs_k),
-        block_shape=(BLOCK_SIZE_N // LANES_PER_TDM, K_GROUPS * LANES_PER_TDM),
+        block_shape=(BLOCK_SIZE_N, K_GROUPS),
         layout=shared_S,
     )
 
@@ -243,13 +218,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
     smem_AS = gl.allocate_shared_memory(
         a_scale_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_SIZE_M // LANES_PER_TDM, K_GROUPS * LANES_PER_TDM],
+        [NUM_BUFFERS, BLOCK_SIZE_M, K_GROUPS],
         layout=shared_S,
     )
 
     smem_BS = gl.allocate_shared_memory(
         b_scale_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_SIZE_N // LANES_PER_TDM, K_GROUPS * LANES_PER_TDM],
+        [NUM_BUFFERS, BLOCK_SIZE_N, K_GROUPS],
         layout=shared_S,
     )
 
@@ -273,12 +248,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
         b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             b_desc, [0, BLOCK_K_BYTES * 16]
         )
-        as_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            as_desc, [0, K_GROUPS * LANES_PER_TDM]
-        )
-        bs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            bs_desc, [0, K_GROUPS * LANES_PER_TDM]
-        )
+        as_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(as_desc, [0, K_GROUPS])
+        bs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(bs_desc, [0, K_GROUPS])
         load_idx += 1
 
     # --- 2. Pre-load tile 0 from LDS into registers ---
@@ -315,12 +286,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
         b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             b_desc, [0, BLOCK_K_BYTES * 16]
         )
-        as_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            as_desc, [0, K_GROUPS * LANES_PER_TDM]
-        )
-        bs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            bs_desc, [0, K_GROUPS * LANES_PER_TDM]
-        )
+        as_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(as_desc, [0, K_GROUPS])
+        bs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(bs_desc, [0, K_GROUPS])
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 4)
         load_idx += 1

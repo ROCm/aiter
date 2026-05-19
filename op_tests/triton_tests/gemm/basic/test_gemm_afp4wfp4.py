@@ -42,38 +42,6 @@ def un_shuffle_scales(scales_shuffled: torch.Tensor):
     scales = scales.view(sm, sn)
     return scales
 
-
-def shuffle_scales_gfx1250(scales: torch.Tensor):
-    # LANES_PER_STRIPE = 16         128 B / 8 B-per-lane
-    # K_GROUPS_PER_LANE = 8         256 K elements / 32 K-per-group
-    # One 128-byte TDM stripe = 16 lanes × 8 scale-groups per lane
-    # (8 scale-groups × 32 K-per-group = 256 K elems contiguous per lane)
-    M, K_groups = scales.shape
-
-    out = scales.view(
-        M // 16,
-        16,  # rows  →  (m_tile, lane)
-        K_groups // 4,
-        4,  # cols  →  (k_tile, kg_in_lane)
-    )
-    out = out.permute(0, 2, 1, 3).contiguous()  # (m_tile, k_tile, lane, kg_in_lane)
-    out = out.view(M // 16, K_groups * 16)
-    return out
-
-
-def un_shuffle_scales_gfx1250(scales_shuffled: torch.Tensor):
-    rows, cols = scales_shuffled.shape
-    M = rows * 16
-    K_groups = cols // 16
-
-    out = scales_shuffled.view(
-        rows, K_groups // 4, 16, 4
-    )  # (m_tile, k_tile, lane, kg_in_lane)
-    out = out.permute(0, 2, 1, 3).contiguous()  # (m_tile, lane, k_tile, kg_in_lane)
-    out = out.view(M, K_groups)
-    return out
-
-
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
 
@@ -130,11 +98,8 @@ def generate_gemm_afp4wfp4_inputs(
     w_scales = w_scales.T
     if shuffle_scales_fg:
         if DEVICE_ARCH == "gfx1250":
-            if M >= 32:
-                x_scales_shuffled = shuffle_scales_gfx1250(x_scales)
-            else:
-                x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scales_gfx1250(w_scales)
+            x_scales_shuffled = x_scales.contiguous()
+            w_scales_shuffled = w_scales.contiguous()
         else:
             if M >= 32:
                 x_scales_shuffled = shuffle_scales(x_scales)
