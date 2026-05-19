@@ -6,13 +6,25 @@
 
 Runs on gfx942 (MI300X) / gfx950 (MI350).
 
+Speed mode (default):
+    Only the attention kernel is timed. Q/K/V quantization (``sage_quant``),
+    output allocation prep, and kernel-cache lookup are performed once,
+    outside the ``do_bench`` loop. This matches ``bench_sage.py`` without
+    ``--e2e`` and lets you compare raw kernel throughput across backends.
+
+End-to-end mode (``--e2e``):
+    The full high-precision wrapper is timed, including ``sage_quant`` on
+    every call (mirrors ``bench_sage.py --e2e``).
+
 Usage:
     python op_tests/flydsl_tests/bench_flydsl_sage.py
+    python op_tests/flydsl_tests/bench_flydsl_sage.py --e2e
     python op_tests/flydsl_tests/bench_flydsl_sage.py --csv results.csv
     python op_tests/flydsl_tests/bench_flydsl_sage.py --warmup 50 --rep 200
 """
 
 import argparse
+import math
 import os
 import sys
 
@@ -195,6 +207,163 @@ def run_accuracy(shapes, device):
 
 
 # ---------------------------------------------------------------------------
+# Kernel-only runner builders
+#
+# Both functions pre-compute everything the high-precision wrappers do *except*
+# the actual attention kernel launch, and return a thunk that runs only the
+# kernel. This mirrors ``bench_sage.py``'s default (non-e2e) timing path so
+# the Triton and FlyDSL columns are apples-to-apples kernel throughput.
+# ---------------------------------------------------------------------------
+
+
+def _build_triton_kernel_runner(q, k, v, causal, layout="bshd"):
+    """Return a thunk that times only the Triton ``fav3_sage_func`` kernel."""
+    import aiter as _aiter
+    from aiter.ops.triton.attention.fav3_sage import (
+        fav3_sage_func,
+        get_sage_fwd_configs,
+    )
+    from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+        sage_quant as _triton_sage_quant,
+    )
+
+    cfg = get_sage_fwd_configs()
+    fp8_type = _aiter.dtypes.fp8
+    fp8_max = torch.finfo(fp8_type).max
+
+    head_dim = q.shape[-1]
+    softmax_scale = head_dim**-0.5
+
+    q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale = _triton_sage_quant(
+        q,
+        k,
+        v,
+        fp8_type,
+        fp8_max,
+        BLKQ=cfg["BLOCK_M"],
+        BLKK=cfg["BLOCK_N"],
+        sm_scale=softmax_scale,
+        layout=layout,
+    )
+
+    return lambda: fav3_sage_func(
+        q_int8,
+        k_int8,
+        v_fp8,
+        q_scale,
+        k_scale,
+        v_scale,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_lse=False,
+        layout=layout,
+        config=cfg,
+    )
+
+
+def _build_flydsl_kernel_runner(q, k, v, causal, layout="bshd"):
+    """Return a thunk that times only the FlyDSL ``sage_attn_cdna`` kernel.
+
+    Replicates the prep work inside :func:`flydsl_sage_attn_func` once, then
+    captures everything needed for the kernel ``exe(...)`` call in the closure.
+    """
+    from aiter.utility.dtypes import fp8 as _fp8_dtype
+    from aiter.ops.flydsl.sage_kernels import (
+        sage_quant as _flydsl_sage_quant_dispatch,
+        _get_kernel as _flydsl_get_kernel,
+    )
+
+    if layout == "bshd":
+        batch, seq_q, num_q_heads, head_dim = q.shape
+        _, seq_k, num_kv_heads, _ = k.shape
+    else:
+        batch, num_q_heads, seq_q, head_dim = q.shape
+        _, num_kv_heads, seq_k, _ = k.shape
+
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    try:
+        cu_count = torch.cuda.get_device_properties(
+            q.device.index
+        ).multi_processor_count
+    except Exception:
+        cu_count = 256
+    grid_at_bm256 = batch * num_q_heads * ((seq_q + 255) // 256)
+    block_m = 128 if grid_at_bm256 < cu_count else 256
+    block_n = 128
+    waves_per_eu = 2
+
+    fp8_dtype = _fp8_dtype
+    fp8_max = torch.finfo(fp8_dtype).max
+
+    q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale = _flydsl_sage_quant_dispatch(
+        q,
+        k,
+        v,
+        FP8_TYPE=fp8_dtype,
+        FP8_MAX=fp8_max,
+        BLKQ=block_m,
+        BLKK=block_n,
+        sm_scale=softmax_scale,
+        layout=layout,
+    )
+
+    if layout == "bhsd":
+        q_int8 = q_int8.permute(0, 2, 1, 3).contiguous()
+        k_int8 = k_int8.permute(0, 2, 1, 3).contiguous()
+        v_fp8 = v_fp8.permute(0, 2, 1, 3).contiguous()
+    else:
+        q_int8 = q_int8.contiguous()
+        k_int8 = k_int8.contiguous()
+        v_fp8 = v_fp8.contiguous()
+
+    seq_q_pad = ((seq_q + block_m - 1) // block_m) * block_m
+    n_pad_q = seq_q_pad - seq_q
+    if n_pad_q > 0:
+        q_int8 = torch.nn.functional.pad(q_int8, (0, 0, 0, 0, 0, n_pad_q))
+
+    num_q_blocks = q_scale.shape[2]
+
+    exe = _flydsl_get_kernel(
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        causal=causal,
+        waves_per_eu=waves_per_eu,
+        block_m=block_m,
+        block_n=block_n,
+    )
+
+    q_flat = q_int8.reshape(-1)
+    k_flat = k_int8.reshape(-1)
+    v_flat = v_fp8.reshape(-1)
+    out_shape = (batch, seq_q_pad, num_q_heads, head_dim)
+    device_index = q.device.index
+
+    def _runner():
+        o = torch.empty(out_shape, dtype=torch.bfloat16, device=q.device)
+        launch_stream = torch.cuda.current_stream(q.device)
+        with torch.cuda.device(device_index):
+            exe(
+                q_flat,
+                k_flat,
+                v_flat,
+                o.reshape(-1),
+                q_scale,
+                k_scale,
+                v_scale,
+                batch,
+                seq_q_pad,
+                seq_k,
+                num_q_blocks,
+                stream=launch_stream,
+            )
+        return o
+
+    return _runner
+
+
+# ---------------------------------------------------------------------------
 # Speed
 # ---------------------------------------------------------------------------
 
@@ -215,9 +384,10 @@ def _do_bench(fn, warmup, rep):
     return (time.perf_counter() - t0) / 50 * 1000
 
 
-def run_speed(shapes, device, warmup, rep):
+def run_speed(shapes, device, warmup, rep, e2e):
+    mode = "e2e (wrapper, incl. sage_quant)" if e2e else "kernel-only (pre-quantized)"
     print("\n" + "=" * 110)
-    print(f"SPEED  (warmup={warmup}ms  rep={rep}ms)")
+    print(f"SPEED  (warmup={warmup}ms  rep={rep}ms  mode={mode})")
     print("=" * 110)
 
     hdr = (
@@ -255,12 +425,16 @@ def run_speed(shapes, device, warmup, rep):
         # Triton sage
         if HAS_TRITON_SAGE:
             try:
-                # Warm up JIT
-                fav3_sage_wrapper_func(q, k, v, causal=causal)
-                torch.cuda.synchronize()
+                if e2e:
 
-                def triton_fn():
-                    return fav3_sage_wrapper_func(q, k, v, causal=causal)
+                    def triton_fn():
+                        return fav3_sage_wrapper_func(q, k, v, causal=causal)
+
+                else:
+                    triton_fn = _build_triton_kernel_runner(q, k, v, causal)
+
+                triton_fn()
+                torch.cuda.synchronize()
 
                 triton_ms = _do_bench(triton_fn, warmup, rep)
                 triton_tflops = flops / triton_ms / 1e9
@@ -278,12 +452,16 @@ def run_speed(shapes, device, warmup, rep):
         # FlyDSL sage
         if HAS_FLYDSL_SAGE:
             try:
-                # Trigger JIT compilation outside timing
-                flydsl_sage_attn_func(q, k, v, causal=causal)
-                torch.cuda.synchronize()
+                if e2e:
 
-                def flydsl_fn():
-                    return flydsl_sage_attn_func(q, k, v, causal=causal)
+                    def flydsl_fn():
+                        return flydsl_sage_attn_func(q, k, v, causal=causal)
+
+                else:
+                    flydsl_fn = _build_flydsl_kernel_runner(q, k, v, causal)
+
+                flydsl_fn()
+                torch.cuda.synchronize()
 
                 flydsl_ms = _do_bench(flydsl_fn, warmup, rep)
                 flydsl_tflops = flops / flydsl_ms / 1e9
@@ -331,6 +509,15 @@ def main():
     )
     parser.add_argument("--accuracy-only", action="store_true")
     parser.add_argument("--speed-only", action="store_true")
+    parser.add_argument(
+        "--e2e",
+        action="store_true",
+        help=(
+            "End-to-end timing: include sage_quant in the timed region "
+            "(default: time only the attention kernel, with quantization "
+            "performed once outside the do_bench loop)."
+        ),
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -347,6 +534,7 @@ def main():
         f"Providers: triton_sage={'YES' if HAS_TRITON_SAGE else 'NO'}  "
         f"flydsl_sage={'YES' if HAS_FLYDSL_SAGE else 'NO'}"
     )
+    print(f"Speed mode: {'e2e (incl. sage_quant)' if args.e2e else 'kernel-only'}")
 
     if not HAS_TRITON_SAGE:
         print(f"  [triton sage unavailable: {_triton_sage_err}]")
@@ -358,7 +546,7 @@ def main():
 
     speed_rows = None
     if not args.accuracy_only:
-        speed_rows = run_speed(SHAPES, device, args.warmup, args.rep)
+        speed_rows = run_speed(SHAPES, device, args.warmup, args.rep, args.e2e)
 
     if args.csv and speed_rows:
         save_csv(args.csv, speed_rows)
