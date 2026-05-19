@@ -8,7 +8,7 @@ import torch
 
 _KERNEL_DIR = os.environ.get(
     "FLYDSL_MHA_KERNEL_DIR",
-    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "triton-to-flydsl", "flydsl-kernels"),
+    os.path.join(os.path.dirname(__file__), "kernels"),
 )
 
 HEAD_DIM_QK = 192
@@ -42,11 +42,11 @@ def _ensure_kernel():
     from flydsl._mlir import ir
     from flydsl.compiler.jit_function import CompilationContext
 
-    kernel_file = os.path.join(_KERNEL_DIR, "mha_fa_kernel_8wave.py")
+    kernel_file = os.path.join(_KERNEL_DIR, "mha_pipeline_gfx1250.py")
     if not os.path.isfile(kernel_file):
         raise FileNotFoundError(f"FlyDSL MHA kernel not found at {kernel_file}")
 
-    spec = importlib.util.spec_from_file_location("mha_kernel_8wave", kernel_file)
+    spec = importlib.util.spec_from_file_location("mha_pipeline_gfx1250", kernel_file)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
