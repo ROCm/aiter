@@ -148,6 +148,11 @@ CASES = [
     (128, 64, 16, 1, 1, 512, 64, 256),  # 4 compute iters per partition
     (64, 64, 8, 1, 4, 512, 64, 256),
     (64, 64, 8, 1, 4, 500, 64, 256),
+    # ---- BPC values that require width-{4,2,1} decomposition for s_buffer_load
+    # (BPC % 4 == 3 hits the no-width-3 corner — would fail compile pre-fix). ----
+    (128, 32, 16, 1, 1, 192, 96, 96),    # BPC=3, single-iter, 2 partitions
+    (128, 32, 16, 1, 1, 384, 96, 192),   # BPC=3, multi-iter (2 computes/partition)
+    (128, 32, 16, 1, 1, 448, 224, 224),  # BPC=7, single-iter, 2 partitions
 ]
 
 
