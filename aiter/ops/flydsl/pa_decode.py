@@ -23,7 +23,6 @@ Usage:
 from __future__ import annotations
 
 import struct
-from typing import Optional
 
 import torch
 
@@ -31,7 +30,6 @@ from .kernels.pa_decode_gfx1250 import (
     compile_pa_decode_main,
     compile_pa_decode_reduce,
 )
-
 
 _DEFAULT_PARTITION_SIZE = 256
 _DEFAULT_KV_COMPUTE_BLOCK_SIZE = 64
@@ -68,30 +66,59 @@ def flydsl_paged_attention_decode(
         seq_lens: [num_seqs], int32.
         attn_scale: Softmax scale (usually 1/sqrt(head_size)).
         partition_size: Number of KV tokens per partition. Must be a multiple of
-            ``kv_block_size``.
+            ``kv_compute_block_size``.
+        kv_compute_block_size: Number of KV tokens handled per loop iteration. Must
+            be a multiple of page table's block size.
 
     Returns:
-        The ``output`` tensor (for chaining).
+        The ``output`` tensor.
     """
     assert output.dim() == 3, f"output must be 3D, got {output.shape}"
     assert query.dim() == 3, f"query must be 3D, got {query.shape}"
     assert key_cache.dim() == 4, f"key_cache must be 4D, got {key_cache.shape}"
     assert value_cache.dim() == 4, f"value_cache must be 4D, got {value_cache.shape}"
-    assert block_tables.dim() == 2, f"block_tables must be 2D"
-    assert seq_lens.dim() == 1, f"seq_lens must be 1D"
-    assert output.dtype == query.dtype == key_cache.dtype == value_cache.dtype, \
-        "Q / KV / output dtypes must match"
+    assert block_tables.dim() == 2, f"block_tables must be 2D, got {block_tables.shape}"
+    assert seq_lens.dim() == 1, f"seq_lens must be 1D, got {seq_lens.shape}"
+    assert (
+        output.dtype == query.dtype == key_cache.dtype == value_cache.dtype
+    ), "Q / KV / output dtypes must match"
 
     num_seqs, num_q_heads, head_size = query.shape
     num_blocks, num_kv_heads, kv_block_size, head_size_kv = key_cache.shape
-    assert head_size == head_size_kv, f"Q head_size {head_size} != KV head_size {head_size_kv}"
-    assert num_q_heads % num_kv_heads == 0, f"num_q_heads {num_q_heads} not divisible by num_kv_heads {num_kv_heads}"
+    assert (
+        head_size == head_size_kv
+    ), f"Q head_size {head_size} != KV head_size {head_size_kv}"
+    assert (
+        num_q_heads % num_kv_heads == 0
+    ), f"num_q_heads {num_q_heads} not divisible by num_kv_heads {num_kv_heads}"
     query_group_size = num_q_heads // num_kv_heads
 
     assert block_tables.shape[0] == num_seqs
     assert seq_lens.shape[0] == num_seqs
     assert block_tables.dtype == torch.int32
     assert seq_lens.dtype == torch.int32
+
+    # Kernel tile constraints (mirrored in compile_pa_decode_main).
+    assert (
+        head_size % 32 == 0
+    ), f"head_size must be multiple of 32 (WMMA_K), got {head_size}"
+    assert (
+        kv_block_size % 16 == 0
+    ), f"kv_block_size must be multiple of 16, got {kv_block_size}"
+    assert (
+        kv_compute_block_size % 32 == 0
+    ), f"kv_compute_block_size must be multiple of 32 (WMMA_K), got {kv_compute_block_size}"
+    assert kv_compute_block_size % kv_block_size == 0, (
+        f"kv_compute_block_size {kv_compute_block_size} must be multiple of "
+        f"kv_block_size {kv_block_size}"
+    )
+    assert partition_size % kv_compute_block_size == 0, (
+        f"partition_size {partition_size} must be multiple of "
+        f"kv_compute_block_size {kv_compute_block_size}"
+    )
+    assert (
+        1 <= query_group_size <= 16
+    ), f"query_group_size must be in [1, 16] (WMMA_M), got {query_group_size}"
 
     # Contiguity: we assume canonical strides.
     assert query.is_contiguous(), "query must be contiguous"
@@ -177,7 +204,6 @@ def flydsl_paged_attention_decode(
         num_partitions,
         stream,
     )
-    torch.cuda.synchronize()
     return output
 
 
