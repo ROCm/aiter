@@ -11,12 +11,16 @@
 #       rows with mean_abs_diff > 0.05 -- the last column lights up the
 #       row-corruption tail-failure mode we're tracking.
 #
-# Decode variants currently compiled for FP8: decode_d{64,128}_m128 and the
-# prefill variants. The shapes below are chosen so the dispatch lands in
-# either the m128 decode kernel (avg_rows in (32, 128]) or the prefill
-# kernel (avg_rows > 128). decode_d*_m{16,32,64} are intentionally avoided
-# -- the FP8 instances for those tiers aren't compiled yet (see
-# unified_attention.cpp dispatch_variant<>).
+# Shapes:
+#   - decode: sq=1, batch∈{128, 256}, sk=128000 (long-context decode).
+#     With num_tokens==num_seqs the C++ select_config sets max_seqlen_q=1,
+#     avg_rows = 1*num_qpkv = 8 → lands in the decode_d{64,128}_m16 tier
+#     (1 warp, TinyDecode policy).
+#   - prefill: b=1, sq=sk=75600 (a single long-context prefill).
+#     max_rows = 75600 * num_qpkv → falls through to prefill_d{64,128} (8w).
+# FP8 dispatch is enabled on every UA variant after the recent
+# unified_attention.cpp update (prefill_d{64,128} + decode_d{64,128}_m{16,
+# 32,64,128}); see the FP8 branch in dispatch_variant<>().
 set -uo pipefail
 
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-7}"
@@ -28,24 +32,31 @@ LOG=/tmp/ua_fp8_sweep.log
 : > "$LOG"
 
 # Each shape: "<label>;<args>"
-# Constraints (so decode hits m128 rather than the unbuilt m16/m32):
-#   sq * num_qpkv >= 64 (decode), or sq*num_qpkv >= 256 forces prefill.
+# Realistic long-context coverage: short-query batch decode and single-batch
+# long prefill. hq=64 / hk=8 (GQA-8) on every row.
+#
+# Both backends decide split-KV (aka 3D / "FlashDecoding") at launch time
+# based on grid-vs-CU saturation:
+#   - aiter wraps CK with `_pick_num_splits`: num_splits = clamp(2*CUs /
+#     (num_kv_heads * q_tiles), 1, 16). Triggers ONLY on low-batch decode.
+#   - Triton's `use_2d_kernel` picks the 2D kernel when the 2D launch grid
+#     already exceeds 4*CUs; otherwise it routes to `kernel_unified_attention_3d`
+#     which is internal split-KV.
+# So both paths actually agree to "no split" on the high-batch rows below,
+# and both agree to "yes split" on the b=4 rows. The sweep covers both regimes
+# so any FP8-vs-BF16 split-KV regressions are visible.
 SHAPES=(
-    # ---- decode m128 (sq=8 * num_qpkv=8 = 64 rows -> m128) ----
-    "decode d=64  hq=64 hk=8 sq=8  sk=4096 b=4 ;-b 4 -sq 8  -sk 4096 -hq 64 -hk 8  -d 64  --block-size 32"
-    "decode d=64  hq=64 hk=8 sq=8  sk=8192 b=4 ;-b 4 -sq 8  -sk 8192 -hq 64 -hk 8  -d 64  --block-size 32"
-    "decode d=128 hq=64 hk=8 sq=8  sk=4096 b=4 ;-b 4 -sq 8  -sk 4096 -hq 64 -hk 8  -d 128 --block-size 32"
-    "decode d=128 hq=64 hk=8 sq=8  sk=8192 b=4 ;-b 4 -sq 8  -sk 8192 -hq 64 -hk 8  -d 128 --block-size 32"
-    # ---- decode m128 with block_size=64 ----
-    "decode d=64  hq=64 hk=8 sq=8  sk=4096 b=4 blk=64;-b 4 -sq 8  -sk 4096 -hq 64 -hk 8  -d 64  --block-size 64"
-    "decode d=128 hq=64 hk=8 sq=8  sk=4096 b=4 blk=64;-b 4 -sq 8  -sk 4096 -hq 64 -hk 8  -d 128 --block-size 64"
-    # ---- prefill (sq * num_qpkv > 256 -> prefill_d* path) ----
-    "prefill d=64  hq=64 hk=8 sq=512  sk=4096 b=2 ;-b 2 -sq 512  -sk 4096 -hq 64 -hk 8 -d 64  --block-size 32"
-    "prefill d=64  hq=64 hk=8 sq=1024 sk=4096 b=2 ;-b 2 -sq 1024 -sk 4096 -hq 64 -hk 8 -d 64  --block-size 32"
-    "prefill d=128 hq=64 hk=8 sq=512  sk=4096 b=2 ;-b 2 -sq 512  -sk 4096 -hq 64 -hk 8 -d 128 --block-size 32"
-    "prefill d=128 hq=64 hk=8 sq=1024 sk=4096 b=2 ;-b 2 -sq 1024 -sk 4096 -hq 64 -hk 8 -d 128 --block-size 32"
-    "prefill d=128 hq=64 hk=8 sq=2048 sk=4096 b=1 ;-b 1 -sq 2048 -sk 4096 -hq 64 -hk 8 -d 128 --block-size 32"
-    "prefill d=128 hq=64 hk=8 sq=1024 sk=4096 b=2 blk=64;-b 2 -sq 1024 -sk 4096 -hq 64 -hk 8 -d 128 --block-size 64"
+    # ---- decode high-batch (saturates 2D grid -> no split-KV on either side) ----
+    "decode d=64  sq=1 sk=128000 b=128 ;-b 128 -sq 1 -sk 128000 -hq 64 -hk 8 -d 64  --block-size 32"
+    "decode d=64  sq=1 sk=128000 b=256 ;-b 256 -sq 1 -sk 128000 -hq 64 -hk 8 -d 64  --block-size 32"
+    "decode d=128 sq=1 sk=128000 b=128 ;-b 128 -sq 1 -sk 128000 -hq 64 -hk 8 -d 128 --block-size 32"
+    "decode d=128 sq=1 sk=128000 b=256 ;-b 256 -sq 1 -sk 128000 -hq 64 -hk 8 -d 128 --block-size 32"
+    # ---- decode low-batch (split-KV path is on for BOTH backends) ----
+    "decode-lo d=64  sq=1 sk=128000 b=4 ;-b 4 -sq 1 -sk 128000 -hq 64 -hk 8 -d 64  --block-size 32"
+    "decode-lo d=128 sq=1 sk=128000 b=4 ;-b 4 -sq 1 -sk 128000 -hq 64 -hk 8 -d 128 --block-size 32"
+    # ---- prefill (sq=sk=75600, b=1) -> prefill_d{64,128} (8 warps) ----
+    "prefill d=64  sq=75600 sk=75600 b=1 ;-b 1 -sq 75600 -sk 75600 -hq 64 -hk 8 -d 64  --block-size 32"
+    "prefill d=128 sq=75600 sk=75600 b=1 ;-b 1 -sq 75600 -sk 75600 -hq 64 -hk 8 -d 128 --block-size 32"
 )
 
 # parse_run shape_args dtype tol_args -> echoes "<ck_ms> <triton_ms> <max_diff> <pct_above_0p05> <pct_bad_rows> <pass>"
@@ -87,8 +98,10 @@ for entry in "${SHAPES[@]}"; do
     args="${entry#*;}"
     # FP8 run -- relaxed tolerance to absorb the row-corruption tail until
     # the underlying CK bug is fixed; we still report the row-corrupt %
-    # column so regressions are visible.
-    fp8_line=$(parse_run "$args" fp8 "--atol 0.6 --rtol 0.6 --no-splitkv")
+    # column so regressions are visible. Both dtypes go through the same
+    # transparent split-KV wrapper (no `--no-splitkv`) so the aiter
+    # heuristic + Triton 2D/3D dispatcher are exercised symmetrically.
+    fp8_line=$(parse_run "$args" fp8 "--atol 0.6 --rtol 0.6")
     read fp8_ck fp8_tr fp8_mxd fp8_pct fp8_rows fp8_ok <<<"$fp8_line"
     # BF16 reference run -- same shape, no FP8 quirks.
     bf_line=$(parse_run "$args" bf16 "")
