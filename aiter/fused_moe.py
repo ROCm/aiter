@@ -896,6 +896,13 @@ def _gfx1250_moe_stage1(
     )
     _ensure_flydsl_kernels_path()
 
+    if block_m < 16:
+        raise ValueError(
+            f"_gfx1250_moe_stage1: block_m={block_m} < 16; opus moe_sorting "
+            f"pads to block_m rows and the kernel's M-tile requires block_m "
+            f">= 16. Increase via AITER_GFX1250_BLOCK_M / -bm."
+        )
+
     token_num = hidden_states.shape[0]
     E = w1.shape[0]
     inter_dim = w1.shape[1] // 2
@@ -997,11 +1004,9 @@ def _gfx1250_moe_stage1(
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
 
-    _sort_block_m = max(32, block_m)
     _all_blks = sorted_expert_ids.shape[0]
     _dense_blks = (
-        min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])
-        // _sort_block_m
+        min(token_num * topk * block_m, sorted_token_ids.shape[0]) // block_m
     )
     _grid_y = min(_dense_blks, _all_blks)
 

@@ -12,6 +12,7 @@ instructions for microscaling block formats with E8M0 scales.
 from __future__ import annotations
 
 import functools
+import os
 
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
@@ -205,11 +206,20 @@ def _compile_stage1_mxscale_kernel_impl(
     # of at least 4 bytes (TDM gather hardware constraint: row_width * elem_bytes % 4 == 0 and > 0).
     _as_layout_rowmajor = bool(is_fp4) or (int(wmma_m_rep) == 1)
     _as_row_bytes_ok = int(scale_k_per_tile) >= 4 and (int(scale_k_per_tile) % 4 == 0)
+    # Debug/perf knob: skip the A/B scale gmem loads and substitute the E8M0
+    # constant 0x7F (=2^0=1.0) at the wmma scale operand instead. Forces the
+    # scalar ``issue_as_load`` path because the TDM-gather path uses a
+    # ``tensor_load_to_lds`` descriptor that has no constant-fill variant —
+    # simpler to special-case the scalar path. The B-scale TDM loads are
+    # skipped outright, and both A and B scale consumer sites substitute the
+    # constant so DCE can remove the dependent LDS reads.
+    _fake_scale = int(os.environ.get("AITER_GFX1250_FAKE_SCALE", "0")) != 0
     _use_tdm_gather_as = (
         bool(use_tdm_gather_as)
         and bool(use_tdm_gather)
         and _as_layout_rowmajor
         and _as_row_bytes_ok
+        and not _fake_scale
     )
 
     # Pipeline calculations for multi-buffer
@@ -508,7 +518,14 @@ def _compile_stage1_mxscale_kernel_impl(
             """
             if const_expr(_need_lds_tid):
                 return _load_fused_from_lds(row_index)
-            if isinstance(row_index, int):
+            # const_expr: isinstance() is a Python-only check, but the AST
+            # rewriter treats ``isinstance(row_index, int)`` as dynamic and
+            # lifts the if-body into ``scf_if_dispatch``. ``row_idx`` is
+            # first-assigned in both branches, so _collect_assigned_vars
+            # filters it (in_active_symbols=False), leaving ``row_idx``
+            # undefined after the dispatch. const_expr unwraps to a plain
+            # ``if`` so the rewriter visits inline without dispatch.
+            if const_expr(isinstance(row_index, int)):
                 row_idx = arith.index(row_index)
             else:
                 row_idx = row_index
@@ -598,11 +615,9 @@ def _compile_stage1_mxscale_kernel_impl(
               loader. No ``in_range`` list — see ``_pick_a_load_bytes`` for
               the divisibility contract that makes every round full.
             """
-            if _a_x_row_base_i32:
-                return
-            _vec = int(a_load_bytes)
+            byte_per_load_a = int(a_load_bytes)
             _row_bytes = int(packed_tile_k_a)
-            _cols_per_row = _row_bytes // _vec
+            _cols_per_row = _row_bytes // byte_per_load_a
             _bt = int(block_threads)
             total = int(tile_m) * _cols_per_row
             assert total % _bt == 0, (
@@ -620,11 +635,15 @@ def _compile_stage1_mxscale_kernel_impl(
                 (int(tile_m), _cols_per_row), stride=(_cols_per_row, 1))
             mask24 = arith.constant((1 << 24) - 1, type=T.i32)
             zero_i32 = arith.constant(0, type=T.i32)
-            for i in range(num_x_loads):
+            # range_constexpr: keep the loop unrolled at AST-rewrite time
+            # so list ``.append()`` calls stay as outer-cell mutations
+            # rather than being rewritten to ``scf_for_dispatch`` (which
+            # would make these names local and break the closure binding).
+            for i in range_constexpr(num_x_loads):
                 elem = tx + fx.Index(i * _bt)
                 coord_local = idx2crd(elem, _layout_x_tile)
                 row_local = fx.get(coord_local, 0)
-                col_local = fx.get(coord_local, 1) * arith.index(_vec)
+                col_local = fx.get(coord_local, 1) * arith.index(byte_per_load_a)
 
                 # Inline decode — mirrors mixed_moe_gemm_2stage.py:762-770.
                 # Stage1 uses ``t_safe`` only (X row indexed by token_id, not
@@ -667,16 +686,47 @@ def _compile_stage1_mxscale_kernel_impl(
                 "_precompute_a_load_meta() must be invoked before "
                 "issue_a_load to ensure cache SSA dominates all K-iterations"
             )
-            _vec = int(a_load_bytes)
+            byte_per_load_a = int(a_load_bytes)
             k_packed_base_i32 = arith.index_cast(T.i32, k_packed_base)
-            for i in range(len(_a_x_row_base_i32)):
-                x_idx = _a_x_row_base_i32[i] + k_packed_base_i32
-                x_vec = buffer_ops.buffer_load(
-                    x_rsrc, x_idx, vec_width=_vec, dtype=T.i8)
-                if _vec > 1:
+            # range_constexpr: ``_a_x_row_base_i32`` is a Python list, so the
+            # body indexes it with the loop var ``i``. Plain ``range`` gets
+            # rewritten to ``scf_for_dispatch`` and makes ``i`` an ArithValue,
+            # which can't index a Python list. range_constexpr keeps the loop
+            # unrolled at AST-rewrite time so ``i`` stays a Python int.
+            #
+            # i32-typed dword path (vec >= 4): the i8-typed buffer_load
+            # (``dtype=T.i8, vec_width=16``) lowers to a v16i8 ``raw.ptr.
+            # buffer.load`` result that the gfx1250 AMDGPU backend can't
+            # type-legalize ("Do not know how to split"). The mixed kernel
+            # (mfma_preshuffle_pipeline._buffer_load_vec) gets ``buffer_
+            # load_dwordx4`` by loading as ``vec_width=vec/4, dtype=T.i32``
+            # and bitcasting to ``<vec x i8>``. Same fix here. Byte offset
+            # ``x_byte_i32`` is divided by 4 to get the dword index since
+            # ``buffer_load`` interprets the index in ``dtype`` units.
+            _two_i32 = arith.constant(2, type=T.i32)
+            for i in range_constexpr(len(_a_x_row_base_i32)):
+                x_byte_i32 = _a_x_row_base_i32[i] + k_packed_base_i32
+                if const_expr(byte_per_load_a >= 4):
+                    x_dword_i32 = arith.shrui(x_byte_i32, _two_i32)
+                    i32_val = buffer_ops.buffer_load(
+                        x_rsrc, x_dword_i32,
+                        vec_width=byte_per_load_a // 4, dtype=T.i32)
+                    if const_expr(byte_per_load_a // 4 == 1):
+                        i32_vec = vector.from_elements(
+                            T.vec(1, T.i32), [i32_val])
+                    else:
+                        i32_vec = i32_val
+                    x_vec = vector.bitcast(T.vec(byte_per_load_a, T.i8), i32_vec)
                     vector.store(x_vec, target_lds, [_a_lds_idx[i]],
-                                 alignment=_vec)
+                                 alignment=byte_per_load_a)
+                elif const_expr(byte_per_load_a > 1):
+                    x_vec = buffer_ops.buffer_load(
+                        x_rsrc, x_byte_i32, vec_width=byte_per_load_a, dtype=T.i8)
+                    vector.store(x_vec, target_lds, [_a_lds_idx[i]],
+                                 alignment=byte_per_load_a)
                 else:
+                    x_vec = buffer_ops.buffer_load(
+                        x_rsrc, x_byte_i32, vec_width=1, dtype=T.i8)
                     v1 = vector.from_elements(T.vec(1, T.i8), [x_vec])
                     vector.store(v1, target_lds, [_a_lds_idx[i]],
                                  alignment=1)
@@ -1083,8 +1133,6 @@ def _compile_stage1_mxscale_kernel_impl(
             reuse the cached ``_a_t_i32`` / ``_a_t_valid`` instead of
             re-issuing ``buffer_load(sorted_rsrc, ...)``.
             """
-            if _as_sx_row_base_i32:
-                return
             _chunks_per_row = int(scale_k_per_tile) // int(sx_load_bytes)
             _num_sx_loads = bytes_per_thread_s // int(sx_load_bytes)
             _K_i32 = arith.constant(K_scale, type=T.i32)
@@ -1093,13 +1141,14 @@ def _compile_stage1_mxscale_kernel_impl(
             _can_share_row = (_cols_per_row_a == _chunks_per_row)
             _layout_sx_tile = fx.make_layout(
                 (int(tile_m), _chunks_per_row), stride=(_chunks_per_row, 1))
-            for i in range(_num_sx_loads):
+            # range_constexpr: see _precompute_a_load_meta for rationale.
+            for i in range_constexpr(_num_sx_loads):
                 elem = tx + fx.Index(i * int(block_threads))
                 coord_local = idx2crd(elem, _layout_sx_tile)
                 row_local = fx.get(coord_local, 0)
                 chunk_in_row = fx.get(coord_local, 1)
                 col_byte = chunk_in_row * arith.index(int(sx_load_bytes))
-                if _can_share_row and i < len(_a_t_i32):
+                if const_expr(_can_share_row and i < len(_a_t_i32)):
                     # Reuse A-data's decode — drops one ``buffer_load(sorted_rsrc)``
                     # per round per thread.
                     t_i32 = _a_t_i32[i]
@@ -1156,12 +1205,21 @@ def _compile_stage1_mxscale_kernel_impl(
                 "issue_as_load to ensure cache SSA dominates all "
                 "K-iterations"
             )
+            # AITER_GFX1250_FAKE_SCALE: skip the load AND the LDS write —
+            # the consumer side substitutes a constant 0x7F7F7F7F i32 in the
+            # WMMA scale operand, so the LDS slots are dead and the
+            # ``ds_store_b8`` + ``ds_read_*`` round trip is unnecessary.
+            if const_expr(_fake_scale):
+                return
             k_scale_base_i32 = arith.index_cast(T.i32, k_scale_base)
-            for i in range(len(_as_sx_row_base_i32)):
+            # range_constexpr / const_expr: see issue_a_load for rationale —
+            # ``_as_sx_row_base_i32`` is a Python list and ``sx_load_bytes`` is
+            # a Python int, so both need to stay static at AST-rewrite time.
+            for i in range_constexpr(len(_as_sx_row_base_i32)):
                 sx_idx = _as_sx_row_base_i32[i] + k_scale_base_i32
                 sx_vec = buffer_ops.buffer_load(
                     sx_rsrc, sx_idx, vec_width=int(sx_load_bytes), dtype=T.i8)
-                if int(sx_load_bytes) > 1:
+                if const_expr(int(sx_load_bytes) > 1):
                     vector.store(
                         sx_vec, target_lds, [_as_lds_idx[i]],
                         alignment=int(sx_load_bytes))
@@ -1387,6 +1445,17 @@ def _compile_stage1_mxscale_kernel_impl(
                              for wn in range_constexpr(wmma_n_rep)]
                     bs_uv = [load_scale_i32(_up_bs_buf, bsu_bases[wn], ks)
                              for wn in range_constexpr(wmma_n_rep)]
+                # AITER_GFX1250_FAKE_SCALE: bypass the LDS load entirely.
+                # wmma_*_scale takes a packed i32 (4 E8M0 bytes); 0x7F7F7F7F
+                # means every micro-tile scale is 2^0 = 1.0. The producers
+                # already short-circuit (no ds_store_b8 / tdm bs load); the
+                # constant here lets DCE remove the dependent ds_reads too.
+                if const_expr(_fake_scale):
+                    _scale_const = arith.constant(0x7F7F7F7F, type=T.i32)
+                    as_v = [_scale_const for _ in range_constexpr(wmma_m_rep)]
+                    _bs_rep = b_scale_load_rep if is_fp4 else wmma_n_rep
+                    bs_gv = [_scale_const for _ in range_constexpr(_bs_rep)]
+                    bs_uv = [_scale_const for _ in range_constexpr(_bs_rep)]
                 return b_g, bs_gv, b_u, bs_uv, as_v
 
             def emit_wmma(accs, wm, wn, a_frag, b_frags, a_scales, b_scales):
@@ -1852,13 +1921,14 @@ def _compile_stage1_mxscale_kernel_impl(
                             _b_desc_cache["bg_pair_addr_hi"][buf_idx],
                             _k_data_off,
                         ))
-                    tdm_ops.tensor_load_2d(
-                        tdm_ops.update_tensor_descriptor_2d_addr64(
-                            _b_desc_cache["bs_pair"][buf_idx],
-                            _b_desc_cache["bs_pair_addr_lo"][buf_idx],
-                            _b_desc_cache["bs_pair_addr_hi"][buf_idx],
-                            _k_scale_off,
-                        ))
+                    if const_expr(not _fake_scale):
+                        tdm_ops.tensor_load_2d(
+                            tdm_ops.update_tensor_descriptor_2d_addr64(
+                                _b_desc_cache["bs_pair"][buf_idx],
+                                _b_desc_cache["bs_pair_addr_lo"][buf_idx],
+                                _b_desc_cache["bs_pair_addr_hi"][buf_idx],
+                                _k_scale_off,
+                            ))
                 else:
                     tdm_ops.tensor_load_2d(
                         tdm_ops.update_tensor_descriptor_2d_addr64(
@@ -1874,20 +1944,21 @@ def _compile_stage1_mxscale_kernel_impl(
                             _b_desc_cache["bu_addr_hi"][buf_idx],
                             _k_data_off,
                         ))
-                    tdm_ops.tensor_load_2d(
-                        tdm_ops.update_tensor_descriptor_2d_addr64(
-                            _b_desc_cache["bs"][buf_idx],
-                            _b_desc_cache["bs_addr_lo"][buf_idx],
-                            _b_desc_cache["bs_addr_hi"][buf_idx],
-                            _k_scale_off,
-                        ))
-                    tdm_ops.tensor_load_2d(
-                        tdm_ops.update_tensor_descriptor_2d_addr64(
-                            _b_desc_cache["bsu"][buf_idx],
-                            _b_desc_cache["bsu_addr_lo"][buf_idx],
-                            _b_desc_cache["bsu_addr_hi"][buf_idx],
-                            _k_scale_off,
-                        ))
+                    if const_expr(not _fake_scale):
+                        tdm_ops.tensor_load_2d(
+                            tdm_ops.update_tensor_descriptor_2d_addr64(
+                                _b_desc_cache["bs"][buf_idx],
+                                _b_desc_cache["bs_addr_lo"][buf_idx],
+                                _b_desc_cache["bs_addr_hi"][buf_idx],
+                                _k_scale_off,
+                            ))
+                        tdm_ops.tensor_load_2d(
+                            tdm_ops.update_tensor_descriptor_2d_addr64(
+                                _b_desc_cache["bsu"][buf_idx],
+                                _b_desc_cache["bsu_addr_lo"][buf_idx],
+                                _b_desc_cache["bsu_addr_hi"][buf_idx],
+                                _k_scale_off,
+                            ))
 
             def _issue_scalar_loads(k_base, buf_idx):
                 if const_expr(_use_tdm_gather_a):
@@ -2558,11 +2629,14 @@ def _compile_stage2_mxscale_kernel_impl(
     # that is a positive multiple of 4 bytes (TDM gather hardware constraint).
     _as_layout_rowmajor = bool(is_fp4) or (int(wmma_m_rep) == 1)
     _as_row_bytes_ok = int(scale_k_per_tile) >= 4 and (int(scale_k_per_tile) % 4 == 0)
+    # See stage1 for the AITER_GFX1250_FAKE_SCALE rationale.
+    _fake_scale = int(os.environ.get("AITER_GFX1250_FAKE_SCALE", "0")) != 0
     _use_tdm_gather_as = (
         bool(use_tdm_gather_as)
         and bool(use_tdm_gather)
         and _as_layout_rowmajor
         and _as_row_bytes_ok
+        and not _fake_scale
     )
 
     _use_pipeline = int(num_buffers) >= 2
@@ -2908,7 +2982,14 @@ def _compile_stage2_mxscale_kernel_impl(
             """Stage2 equivalent of the stage1 helper. See stage1 for rationale."""
             if const_expr(_need_lds_tid):
                 return _load_fused_from_lds(row_index)
-            if isinstance(row_index, int):
+            # const_expr: isinstance() is a Python-only check, but the AST
+            # rewriter treats ``isinstance(row_index, int)`` as dynamic and
+            # lifts the if-body into ``scf_if_dispatch``. ``row_idx`` is
+            # first-assigned in both branches, so _collect_assigned_vars
+            # filters it (in_active_symbols=False), leaving ``row_idx``
+            # undefined after the dispatch. const_expr unwraps to a plain
+            # ``if`` so the rewriter visits inline without dispatch.
+            if const_expr(isinstance(row_index, int)):
                 row_idx = arith.index(row_index)
             else:
                 row_idx = row_index
@@ -2971,11 +3052,9 @@ def _compile_stage2_mxscale_kernel_impl(
               ``x_row_base_i32 = row_ts_safe * K_packed_a + col_local`` plus
               the OOB / LDS extras documented on the stage1 helper.
             """
-            if _a_x_row_base_i32:
-                return
-            _vec = int(a_load_bytes)
+            byte_per_load_a = int(a_load_bytes)
             _row_bytes = int(packed_tile_k_a)
-            _cols_per_row = _row_bytes // _vec
+            _cols_per_row = _row_bytes // byte_per_load_a
             _bt = int(block_threads)
             total = int(tile_m) * _cols_per_row
             assert total % _bt == 0, (
@@ -2992,11 +3071,12 @@ def _compile_stage2_mxscale_kernel_impl(
             mask24 = arith.constant((1 << 24) - 1, type=T.i32)
             shr24 = arith.constant(24, type=T.i32)
             zero_i32 = arith.constant(0, type=T.i32)
-            for i in range(num_x_loads):
+            # range_constexpr: see stage1 _precompute_a_load_meta for rationale.
+            for i in range_constexpr(num_x_loads):
                 elem = tx + fx.Index(i * _bt)
                 coord_local = idx2crd(elem, _layout_x_tile)
                 row_local = fx.get(coord_local, 0)
-                col_local = fx.get(coord_local, 1) * arith.index(_vec)
+                col_local = fx.get(coord_local, 1) * arith.index(byte_per_load_a)
 
                 # Inline decode — mirrors mixed_moe_gemm_2stage.py:3407-3417.
                 # Stage2 indexes A by ``row_ts = tok * topk + slot``. No OOB
@@ -3038,16 +3118,47 @@ def _compile_stage2_mxscale_kernel_impl(
             # contract means no IfOp guard. Hot body is just add +
             # buffer_load + LDS store; ``row_ts_safe = 0`` clamps the address
             # for invalid rows and the epilogue masks the resulting garbage.
-            _vec = int(a_load_bytes)
+            byte_per_load_a = int(a_load_bytes)
             k_packed_base_i32 = arith.index_cast(T.i32, k_packed_base)
-            for i in range(len(_a_x_row_base_i32)):
-                x_idx = _a_x_row_base_i32[i] + k_packed_base_i32
-                x_vec = buffer_ops.buffer_load(
-                    x_rsrc, x_idx, vec_width=_vec, dtype=T.i8)
-                if _vec > 1:
+            # range_constexpr: ``_a_x_row_base_i32`` is a Python list, so the
+            # body indexes it with the loop var ``i``. Plain ``range`` gets
+            # rewritten to ``scf_for_dispatch`` and makes ``i`` an ArithValue,
+            # which can't index a Python list. range_constexpr keeps the loop
+            # unrolled at AST-rewrite time so ``i`` stays a Python int.
+            #
+            # i32-typed dword path (vec >= 4): the i8-typed buffer_load
+            # (``dtype=T.i8, vec_width=16``) lowers to a v16i8 ``raw.ptr.
+            # buffer.load`` result that the gfx1250 AMDGPU backend can't
+            # type-legalize ("Do not know how to split"). The mixed kernel
+            # (mfma_preshuffle_pipeline._buffer_load_vec) gets ``buffer_
+            # load_dwordx4`` by loading as ``vec_width=vec/4, dtype=T.i32``
+            # and bitcasting to ``<vec x i8>``. Same fix here. Byte offset
+            # ``x_byte_i32`` is divided by 4 to get the dword index since
+            # ``buffer_load`` interprets the index in ``dtype`` units.
+            _two_i32 = arith.constant(2, type=T.i32)
+            for i in range_constexpr(len(_a_x_row_base_i32)):
+                x_byte_i32 = _a_x_row_base_i32[i] + k_packed_base_i32
+                if const_expr(byte_per_load_a >= 4):
+                    x_dword_i32 = arith.shrui(x_byte_i32, _two_i32)
+                    i32_val = buffer_ops.buffer_load(
+                        x_rsrc, x_dword_i32,
+                        vec_width=byte_per_load_a // 4, dtype=T.i32)
+                    if const_expr(byte_per_load_a // 4 == 1):
+                        i32_vec = vector.from_elements(
+                            T.vec(1, T.i32), [i32_val])
+                    else:
+                        i32_vec = i32_val
+                    x_vec = vector.bitcast(T.vec(byte_per_load_a, T.i8), i32_vec)
                     vector.store(x_vec, target_lds, [_a_lds_idx[i]],
-                                 alignment=_vec)
+                                 alignment=byte_per_load_a)
+                elif const_expr(byte_per_load_a > 1):
+                    x_vec = buffer_ops.buffer_load(
+                        x_rsrc, x_byte_i32, vec_width=byte_per_load_a, dtype=T.i8)
+                    vector.store(x_vec, target_lds, [_a_lds_idx[i]],
+                                 alignment=byte_per_load_a)
                 else:
+                    x_vec = buffer_ops.buffer_load(
+                        x_rsrc, x_byte_i32, vec_width=1, dtype=T.i8)
                     v1 = vector.from_elements(T.vec(1, T.i8), [x_vec])
                     vector.store(v1, target_lds, [_a_lds_idx[i]],
                                  alignment=1)
@@ -3188,8 +3299,6 @@ def _compile_stage2_mxscale_kernel_impl(
             A by ``row_ts = tok * topk + slot`` (rather than the raw token
             id); otherwise the structure is identical.
             """
-            if _as_sx_row_base_i32:
-                return
             _chunks_per_row = int(scale_k_per_tile) // int(sx_load_bytes)
             _num_sx_loads = bytes_per_thread_s // int(sx_load_bytes)
             _K_i32 = arith.constant(K_scale, type=T.i32)
@@ -3198,13 +3307,14 @@ def _compile_stage2_mxscale_kernel_impl(
             _can_share_row = (_cols_per_row_a == _chunks_per_row)
             _layout_sx_tile = fx.make_layout(
                 (int(tile_m), _chunks_per_row), stride=(_chunks_per_row, 1))
-            for i in range(_num_sx_loads):
+            # range_constexpr: see stage1 _precompute_a_load_meta for rationale.
+            for i in range_constexpr(_num_sx_loads):
                 elem = tx + fx.Index(i * int(block_threads))
                 coord_local = idx2crd(elem, _layout_sx_tile)
                 row_local = fx.get(coord_local, 0)
                 chunk_in_row = fx.get(coord_local, 1)
                 col_byte = chunk_in_row * arith.index(int(sx_load_bytes))
-                if _can_share_row and i < len(_a_row_ts_i32):
+                if const_expr(_can_share_row and i < len(_a_row_ts_i32)):
                     # Reuse A-data's decode — drops one ``buffer_load(sorted_rsrc)``
                     # per round per thread.
                     row_ts_i32 = _a_row_ts_i32[i]
@@ -3264,12 +3374,21 @@ def _compile_stage2_mxscale_kernel_impl(
                 "stage2 _precompute_as_load_meta() must be invoked before "
                 "issue_as_load to ensure cache SSA dominates all K-iterations"
             )
+            # AITER_GFX1250_FAKE_SCALE: skip the load AND the LDS write —
+            # the consumer side substitutes a constant 0x7F7F7F7F i32 in the
+            # WMMA scale operand, so the LDS slots are dead and the
+            # ``ds_store_b8`` + ``ds_read_*`` round trip is unnecessary.
+            if const_expr(_fake_scale):
+                return
             k_scale_base_i32 = arith.index_cast(T.i32, k_scale_base)
-            for i in range(len(_as_sx_row_base_i32)):
+            # range_constexpr / const_expr: see issue_a_load for rationale —
+            # ``_as_sx_row_base_i32`` is a Python list and ``sx_load_bytes`` is
+            # a Python int, so both need to stay static at AST-rewrite time.
+            for i in range_constexpr(len(_as_sx_row_base_i32)):
                 sx_idx = _as_sx_row_base_i32[i] + k_scale_base_i32
                 sx_vec = buffer_ops.buffer_load(
                     sx_rsrc, sx_idx, vec_width=int(sx_load_bytes), dtype=T.i8)
-                if int(sx_load_bytes) > 1:
+                if const_expr(int(sx_load_bytes) > 1):
                     vector.store(
                         sx_vec, target_lds, [_as_lds_idx[i]],
                         alignment=int(sx_load_bytes))
@@ -3437,7 +3556,8 @@ def _compile_stage2_mxscale_kernel_impl(
             eid_idx = arith.index_cast(T.index, eid_i32)
             n_off = eid_idx * n_idx + blk_n
             tdm_ops.tensor_load_2d(make_desc_b(n_off, k_base, target_lds_b))
-            tdm_ops.tensor_load_2d(make_desc_bs(n_off, k_base, target_lds_bs))
+            if const_expr(not _fake_scale):
+                tdm_ops.tensor_load_2d(make_desc_bs(n_off, k_base, target_lds_bs))
 
         _ldrs = _make_mxscale_data_loaders(
             tiling=tp, warp_m_base=warp_m_base, warp_n_base=warp_n_base,
@@ -3533,6 +3653,11 @@ def _compile_stage2_mxscale_kernel_impl(
                                                wmma_m_rep, ks)
                         bs_v = [load_scale_i32(lds_bs_bufs[buf_idx], bs_bases[wn], ks)
                                 for wn in range_constexpr(wmma_n_rep)]
+                    if const_expr(_fake_scale):
+                        _scale_const = arith.constant(0x7F7F7F7F, type=T.i32)
+                        as_v = [_scale_const for _ in range_constexpr(wmma_m_rep)]
+                        _bs_rep = b_scale_load_rep if is_fp4 else wmma_n_rep
+                        bs_v = [_scale_const for _ in range_constexpr(_bs_rep)]
                     for wm in range_constexpr(wmma_m_rep):
                         a_frag = load_data_frag(lds_a_bufs[buf_idx],
                                                 a_data_bases[wm], ks)
@@ -3562,6 +3687,11 @@ def _compile_stage2_mxscale_kernel_impl(
                                            wmma_m_rep, ks)
                     bs_v = [load_scale_i32(lds_bs_bufs[buf_idx], bs_bases[wn], ks)
                             for wn in range_constexpr(wmma_n_rep)]
+                if const_expr(_fake_scale):
+                    _scale_const = arith.constant(0x7F7F7F7F, type=T.i32)
+                    as_v = [_scale_const for _ in range_constexpr(wmma_m_rep)]
+                    _bs_rep = b_scale_load_rep if is_fp4 else wmma_n_rep
+                    bs_v = [_scale_const for _ in range_constexpr(_bs_rep)]
                 return b_v, bs_v, as_v
 
             def _emit_rows(accs_in, start_wm, a_frags, b_frags, a_scales, b_scales):
