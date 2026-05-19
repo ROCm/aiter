@@ -39,7 +39,11 @@ void unified_attention_fwd(
     // back to the conservative heuristic at line below. Pass the real per-seq
     // max here to let the C++ dispatcher pick a tighter (smaller) BlockM tier
     // (e.g. decode_d128_m128 with 4 warps vs prefill_d128 with 8 warps).
-    int64_t max_seqlen_q_override)
+    int64_t max_seqlen_q_override,
+    // K/V layout selector. false (default) → paged KV cache. true →
+    // contiguous (THD) — `block_tables` is ignored and offsets become
+    // `token * row_stride`. See unified_attention_args::kv_contiguous.
+    bool kv_contiguous)
 {
     auto dtype = query.dtype();
     // FP8 path: Q is FP8E4M3 (e4m3fn on gfx950 / e4m3fnuz on gfx942). The
@@ -121,6 +125,7 @@ void unified_attention_fwd(
     args.seq_lens_ptr       = seq_lens.data_ptr<int32_t>();
     args.query_start_len_ptr = query_start_len.data_ptr<int32_t>();
     args.num_seqs            = num_seqs;
+    args.kv_contiguous       = kv_contiguous;
 
     // Graph-capture-safe max_seqlen_q estimation (no GPU→CPU copy).
     //   - Caller-provided override (>0) wins — lets the wrapper pick a tighter

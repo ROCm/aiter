@@ -132,7 +132,8 @@ namespace py = pybind11;
           py::arg("q_descale")                         = 1.0f,                  \
           py::arg("k_descale")                         = 1.0f,                  \
           py::arg("v_descale")                         = 1.0f,                  \
-          py::arg("max_seqlen_q_override")             = 0);
+          py::arg("max_seqlen_q_override")             = 0,                     \
+          py::arg("kv_contiguous")                     = false);
 
 #define ATTENTION_PYBIND                                          \
     m.def("paged_attention_rocm",                                 \

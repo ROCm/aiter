@@ -35,4 +35,14 @@ void unified_attention_fwd(
     // per-seq max here when known (e.g. uniform-sq benchmarks or when the
     // caller already has a host-side max) to let the dispatcher pick a tighter
     // tile-tier (e.g. decode_d128_m128 instead of prefill_d128).
-    int64_t max_seqlen_q_override = 0);
+    int64_t max_seqlen_q_override = 0,
+    // K/V layout selector. false (default) routes to the paged-KV-cache
+    // kernels (vLLM/SGLang convention — `block_tables` resolves logical →
+    // physical pages). true routes to the contiguous (THD) instance —
+    // `key_cache` / `value_cache` are flat
+    // [num_kv_tokens, num_kv_heads, head_size] tensors for the request and
+    // `block_tables` is ignored (caller may still pass a dummy 1-D tensor).
+    // The contiguous path skips the per-tile block_tables fetch and the
+    // / % page_size arithmetic entirely. Only prefill_d{64,128} have a
+    // contiguous instance; decode shapes fall back to the paged path.
+    bool kv_contiguous = false);

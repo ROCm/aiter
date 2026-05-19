@@ -40,6 +40,7 @@ def _gen_unified_attention_fwd_kernel_fake(
     k_descale: float = 1.0,
     v_descale: float = 1.0,
     max_seqlen_q_override: int = 0,
+    kv_contiguous: bool = False,
 ) -> None:
     return None
 
@@ -71,6 +72,7 @@ def _unified_attention_fwd_kernel(
     k_descale: float = 1.0,
     v_descale: float = 1.0,
     max_seqlen_q_override: int = 0,
+    kv_contiguous: bool = False,
 ) -> None: ...
 
 
@@ -271,6 +273,18 @@ def unified_attention_fwd(
     # tighter decode_d{64,128}_m{16,32,128} tiers instead of falling through
     # to prefill_d{64,128}.
     max_seqlen_q: int = 0,
+    # K/V layout. False (default) → paged KV cache (vLLM/SGLang); `key_cache`
+    # / `value_cache` are [num_blks, page_size, num_kv_heads, head_size] and
+    # `block_tables` resolves logical → physical pages. True → contiguous
+    # (THD) layout — `key_cache` / `value_cache` are flat
+    # [num_kv_tokens, num_kv_heads, head_size] tensors for the request and
+    # `block_tables` is ignored (callers may still pass a dummy 1-D
+    # int32 tensor). The contiguous path skips the per-tile block_tables
+    # fetch and the / % page_size arithmetic entirely; only prefill_d{64,128}
+    # have a contiguous-mode instance compiled. Note: split-KV is currently
+    # not wired through this path — set allow_splitkv=False (or accept the
+    # heuristic returning num_splits==1) when using kv_contiguous=True.
+    kv_contiguous: bool = False,
 ) -> None:
     explicit_override = (
         num_splits > 1
@@ -278,8 +292,12 @@ def unified_attention_fwd(
         or lse_acc_workspace is not None
     )
 
-    if explicit_override or not allow_splitkv:
-        # Explicit-override or opt-out: forward straight to the kernel.
+    if explicit_override or not allow_splitkv or kv_contiguous:
+        # Explicit-override / opt-out / contiguous path: forward straight to
+        # the kernel. (Contiguous instances are prefill-only and split-KV
+        # plumbing through the contiguous path isn't wired up — single
+        # launch is the right behaviour there anyway since prefill workloads
+        # already have enough CTAs.)
         _unified_attention_fwd_kernel(
             output,
             query,
@@ -302,6 +320,7 @@ def unified_attention_fwd(
             k_descale,
             v_descale,
             max_seqlen_q,
+            kv_contiguous,
         )
         return
 
@@ -331,6 +350,7 @@ def unified_attention_fwd(
             k_descale,
             v_descale,
             max_seqlen_q,
+            kv_contiguous,
         )
         return
 
@@ -369,5 +389,6 @@ def unified_attention_fwd(
         k_descale,
         v_descale,
         max_seqlen_q,
+        kv_contiguous,
     )
     _combine_splits(output, o_acc, lse_acc)

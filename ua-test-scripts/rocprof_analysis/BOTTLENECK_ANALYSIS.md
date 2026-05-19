@@ -656,3 +656,53 @@ Post-Tier-0+2+3 CK numbers vs the same Triton baseline:
 d=64 prefill (both dtypes) is at or below Triton. d=128 still trails;
 the remaining gap is mostly inside the address-comp / barrier chain
 that section 9.2 already flagged — not the page-table fetch.
+
+### 9.6 Tier 4 — optional paging (contiguous / THD K/V layout)
+
+Tier 0–3 attack the paged-KV-cache fast path. There is a separate
+class of callers (pretraining, flash-attention-style inference without
+a shared cache, microbenchmarks) that pass K/V as a flat
+`[num_kv_tokens, num_kv_heads, head_dim]` tensor and have no
+`block_tables` at all. For that case the entire per-tile page-table
+fetch chain — `block_tables_ptr_[block_table_offset + logical_page]`,
+the `/ % page_size` arithmetic, the Tier-0 scalar-promote, and the
+Tier-2 LDS-cache populate — is dead weight.
+
+Tier 4 adds a `bool kEnablePaging_` non-type template parameter on
+`UnifiedAttentionPipeline` (default `true` to preserve the paged
+behaviour) and a `bool args.kv_contiguous` runtime selector. The host
+dispatcher routes the contiguous request to a `kEnablePaging_ = false`
+instance whose `refresh_*_offsets` collapses to a single per-row
+`logical_token * row_stride` `imad`. Twelve new prefill instances are
+compiled (`prefill_d{64,128}` × `{fp16, bf16, fp8}` × `{mask, nmask}`)
+— decode variants don't need it (callers without a KV cache don't have
+decode workloads).
+
+Measured impact on the same physical memory (sq=1×4096, sk varied,
+page_size=32 paged baseline, causal, MI355, n=30 iters):
+
+| variant           | sk    | paged (ms) | contig (ms) | Δ        |
+|-------------------|------:|-----------:|------------:|---------:|
+| prefill_d64  bf16 |  4096 |     0.274  |     0.227   | -17.1 %  |
+| prefill_d64  bf16 | 16384 |     1.529  |     1.198   | -21.6 %  |
+| prefill_d64  bf16 | 32768 |     3.218  |     2.505   | -22.1 %  |
+| prefill_d64  fp8  |  4096 |     0.299  |     0.235   | -21.4 %  |
+| prefill_d64  fp8  | 16384 |     1.489  |     1.150   | -22.7 %  |
+| prefill_d64  fp8  | 32768 |     3.054  |     2.386   | -21.9 %  |
+| prefill_d128 bf16 |  4096 |     0.493  |     0.397   | -19.3 %  |
+| prefill_d128 bf16 | 16384 |     2.638  |     2.224   | -15.7 %  |
+| prefill_d128 bf16 | 32768 |     5.731  |     4.598   | -19.8 %  |
+| prefill_d128 fp8  |  4096 |     0.476  |     0.341   | -28.3 %  |
+| prefill_d128 fp8  | 16384 |     2.416  |     1.792   | -25.8 %  |
+| prefill_d128 fp8  | 32768 |     4.973  |     3.727   | -25.0 %  |
+
+`prefill_d128 fp8 -28 %` is the biggest single CK-UA optimisation
+ever measured on this kernel: it eclipses Tier 0 (-12 %), Tier 2 (-5 %)
+and the d=64 fp8 Tier-3 win (-16 %) in *relative* terms, and beats the
+Tier-3 d=64 fp8 win in absolute ms too on equal-sk shapes.
+
+The contiguous path is opt-in via `kv_contiguous=True`; callers that
+need a shared paged KV cache (vLLM/SGLang) keep using the paged
+instances and pay nothing. Correctness validated by bit-exact
+comparison against the paged instance with page_size=32 and an identity
+block_tables on 48 shape × dtype × mask combinations.
