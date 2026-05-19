@@ -120,15 +120,6 @@ def _generate_inputs(
     return query, key_cache, value_cache, block_tables, seq_lens
 
 
-# Small set of cases — FFM is slow, so keep them tiny.
-# WMMA kernel requires:
-#   HEAD_SIZE >= NUM_WARPS*WAVE_SIZE = 128 and HEAD_SIZE % 32 == 0
-#   KV_BLOCK_SIZE % 16 == 0
-#   KV_COMPUTE_BLOCK_SIZE % 64 == 0 (NUM_WARPS * WMMA_N) and % KV_BLOCK_SIZE == 0
-#   BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE/KV_BLOCK_SIZE: any positive int
-#   PARTITION_SIZE % KV_COMPUTE_BLOCK_SIZE == 0
-#   QUERY_GROUP_SIZE == 16 (WMMA M=16)
-#   (head, kvb, qg, nkv, nseqs, seq_len, kv_compute, partition)
 CASES = [
     # ---- Single-iter path: KV_COMPUTE_BLOCK_SIZE == PARTITION_SIZE ----
     (128, 32, 16, 1, 1, 256, 64, 64),     # BPC=2, 4 partitions
@@ -142,7 +133,7 @@ CASES = [
     (128, 32, 16, 1, 1, 256, 64, 128),    # 2 compute iters per partition
     (128, 64, 16, 1, 1, 512, 128, 256),   # 2 compute iters per partition
     (128, 32, 16, 1, 1, 384, 64, 192),    # 3 compute iters per partition
-    (64, 16, 8, 1, 1, 1024, 256, 256), # gpt-oss shape to test later after fixing Q masks
+    (64, 16, 8, 1, 1, 1024, 256, 256), # gpt-oss shape
 ]
 
 
