@@ -423,7 +423,8 @@ def test_write_name_keyed_lookup_header():
         write_name_keyed_lookup_header(
             path, kernels_dict, LOOKUP_head, LOOKUP_template, LOOKUP_end
         )
-        content = open(path).read()
+        with open(path) as f:
+            content = f.read()
 
         _check(
             "name-keyed: kernel alpha is registered with quoted string key",
