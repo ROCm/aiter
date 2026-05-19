@@ -147,8 +147,7 @@ def flydsl_paged_attention_decode(
         )
     if seq_lens.shape[0] != num_seqs:
         raise ValueError(
-            f"seq_lens.shape[0] ({seq_lens.shape[0]}) must equal "
-            f"num_seqs ({num_seqs})"
+            f"seq_lens.shape[0] ({seq_lens.shape[0]}) must equal num_seqs ({num_seqs})"
         )
     if block_tables.dtype != torch.int32:
         raise ValueError(f"block_tables must be int32, got {block_tables.dtype}")
@@ -157,13 +156,9 @@ def flydsl_paged_attention_decode(
 
     # --- Kernel tile constraints (mirrored in compile_pa_decode_main). ---
     if head_size % 32 != 0:
-        raise ValueError(
-            f"head_size must be multiple of 32 (WMMA_K), got {head_size}"
-        )
+        raise ValueError(f"head_size must be multiple of 32 (WMMA_K), got {head_size}")
     if kv_block_size % 16 != 0:
-        raise ValueError(
-            f"kv_block_size must be multiple of 16, got {kv_block_size}"
-        )
+        raise ValueError(f"kv_block_size must be multiple of 16, got {kv_block_size}")
     if kv_compute_block_size % 32 != 0:
         raise ValueError(
             f"kv_compute_block_size must be multiple of 32 (WMMA_K), "

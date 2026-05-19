@@ -135,19 +135,20 @@ def _generate_inputs(
 
 
 CASES = [
-    # ---- Single-iter path: KV_COMPUTE_BLOCK_SIZE == PARTITION_SIZE ----
     (128, 32, 16, 1, 1, 256, 64, 64),  # BPC=2, 4 partitions
     (128, 16, 16, 1, 1, 256, 64, 64),  # BPC=4, 4 partitions
     (128, 64, 16, 1, 1, 256, 64, 64),  # BPC=1, 4 partitions
     (128, 32, 16, 2, 2, 256, 64, 64),  # multi-seq, multi-kv-head
     (128, 16, 16, 1, 1, 512, 128, 128),  # BPC=8, 4 partitions
     (128, 16, 16, 1, 1, 512, 256, 256),  # BPC=16, 2 partitions
-    # ---- Multi-iter path: KV_COMPUTE_BLOCK_SIZE < PARTITION_SIZE ----
     (128, 32, 16, 1, 1, 256, 64, 128),  # 2 compute iters per partition
     (128, 32, 16, 1, 1, 384, 64, 192),  # 3 compute iters per partition
     (128, 64, 16, 1, 1, 512, 64, 256),  # 4 compute iters per partition
     (64, 64, 8, 1, 4, 512, 64, 256),
     (64, 64, 8, 1, 4, 500, 64, 256),
+    (128, 32, 16, 1, 1, 192, 96, 96),  # BPC=3, single-iter, 2 partitions
+    (128, 32, 16, 1, 1, 384, 96, 192),  # BPC=3, multi-iter (2 computes/partition)
+    (128, 32, 16, 1, 1, 448, 224, 224),  # BPC=7, single-iter, 2 partitions
 ]
 
 
