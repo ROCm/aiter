@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <cmath>
 #include <functional>
 #include <unordered_map>
 
@@ -14,8 +13,8 @@
 #include "gemm_a8w8_blockscale_cktile_lookup.h"
 #include "gemm_a8w8_blockscale_cktile_manifest.h"
 
-using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool)>;
+using BlockwiseKernel = torch::Tensor (*)(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool, int);
 
 using BlockwiseKernelMap = GemmDispatchMap<BlockwiseKernel>;
 
@@ -41,8 +40,8 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
         }
     }();
 
-    const int cu_num         = get_device_cu_num();
-    const std::string& gfx   = get_device_gfx();
+    const int cu_num           = get_device_cu_num();
+    const std::string_view gfx = get_device_gfx();
 
     // First check if this shape(M,N,K) is available in the direct lookup.
     auto it = lookup.find({gfx, cu_num, M, N, K});
@@ -83,24 +82,30 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
                                           torch::Tensor& x_scale,
                                           torch::Tensor& w_scale,
                                           torch::Tensor& Y,
-                                          bool preshuffleB)
+                                          bool preshuffleB,
+                                          int splitK)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
 
-    int M = XQ.size(0);
-    int N = WQ.size(0);
-    int K = XQ.size(1);
+    TORCH_CHECK(splitK >= 0 && splitK <= 30,
+                "splitK must be in the range [0, 30], got ",
+                splitK);
+
+    int M      = XQ.size(0);
+    int N      = WQ.size(0);
+    int K      = XQ.size(1);
+    int KBatch = 1 << splitK;
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
         blockscale_dispatch<TILE_FP32, TILE_FP16>(M, N, K)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
         blockscale_dispatch<TILE_FP32, TILE_BF16>(M, N, K)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
     }
     else
     {
@@ -116,5 +121,5 @@ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_cktile(torch::Tensor& XQ,
                                                       torch::Tensor& Y,
                                                       bool preshuffleB)
 {
-    return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+    return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y, preshuffleB, 0);
 }

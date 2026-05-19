@@ -5,6 +5,7 @@
 #include "py_itfs_common.h"
 #include "aiter_opus_plus.h"
 #include "dispatch_utils.h"
+#include "fp4_quant_utils.h"
 #include "rocprim/rocprim.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
@@ -194,21 +195,6 @@ __global__ void add_rmsnorm_quant_kernel(
                         thread_max = fmaxf(thread_max, fabsf(static_cast<float>(thread_data_float[i])));
                     }
                 }
-                auto fp4_scale = [](float tmp) {
-                    uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-                    uint32_t exponent = (u32 >> 23) & 0b11111111;
-                    if(exponent == 0b11111111)
-                    {
-                        return __builtin_bit_cast(float, exponent << 23);
-                    }
-                    if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-                        exponent += 1;
-                    return __builtin_bit_cast(float, exponent << 23);
-                };
-                auto fp4_scale_shuffle_id = [](int32_t scaleN_pad, int32_t x, int32_t y) {
-                    return (x / 32 * scaleN_pad) * 32 + (y / 8) * 256 + (y % 4) * 64 + (x % 16) * 4 +
-                        (y % 8) / 4 * 2 + (x % 32) / 16;
-                };
                 float quant_scale;
                 if(group_size ==  0)
                 {
@@ -225,7 +211,7 @@ __global__ void add_rmsnorm_quant_kernel(
                     float max= multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
                     if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
                     {
-                        max = fp4_scale(max);
+                        max = aiter::fp4_f32_to_e8m0_scale(max);
                     }
                     quant_scale = max * inverted_DTYPE_MAX;
                     if(threadIdx.x % reduce_thread_size == 0 && (threadIdx.x * thread_data_size) < n)
@@ -240,7 +226,7 @@ __global__ void add_rmsnorm_quant_kernel(
                             if(shuffle_scale)
                             {
                                 scaleN_pad = (scaleN_pad + 7) / 8 * 8;
-                                x = fp4_scale_shuffle_id(scaleN_pad, x, y);
+                                x = aiter::fp4_scale_shuffle_idx(scaleN_pad, x, y);
                             }
                             else
                             {

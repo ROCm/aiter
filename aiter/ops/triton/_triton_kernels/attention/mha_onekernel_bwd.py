@@ -392,6 +392,7 @@ def _bwd_dq_inner(
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    ENABLE_SINK: tl.constexpr,
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
@@ -417,6 +418,7 @@ def _bwd_dq_inner(
     curr_philox_offset = batch_philox_offset
     curr_dropout_offset = dropout_offset
     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
+    delta_recomp = tl.zeros([BLOCK_M2], dtype=tl.float32)
     for blk_idx in range(num_steps):
         if DEBUG_TRITON:
             print(f"iter {blk_idx}: curr_n = {curr_n}")  # noqa: E701
@@ -495,6 +497,9 @@ def _bwd_dq_inner(
             dp = tl.dot(do, vT)
         if ENABLE_DROPOUT:
             dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
+        if ENABLE_SINK:
+            # Equal to do_i . o_i but skips the bf16 round-trip through forward `o`.
+            delta_recomp += tl.sum(p * dp, axis=1)
         delta_i = Di[:, None]
         ds = p * (dp - delta_i)
         # Compute dQ.
@@ -516,7 +521,7 @@ def _bwd_dq_inner(
         if HAS_PE:
             kT_pe_ptrs += step_n * stride_kn
         vT_ptrs += step_n * stride_vn
-    return dq, dq_pe
+    return dq, dq_pe, delta_recomp
 
 
 _bwd_kernel_causal_repr = make_kernel_repr(
@@ -1089,16 +1094,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             m = m[:, None]
             delta = tl.load(Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0)
 
-            if ENABLE_SINK:
-                sink = tl.load(Sink + hqid).to(tl.float32)
-                if USE_EXP2:
-                    RCP_LN2: tl.constexpr = 1.4426950408889634
-                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
-                else:
-                    psink = tl.math.exp(sink - m)
-                dsink = tl.sum(-psink * delta[:, None])
-                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
-
             MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
             # start can only be 0 at minimum
             start_n = max(end_n - BLOCK_M2, 0)
@@ -1117,7 +1112,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
             else:
                 dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
-            dq, dq_pe = _bwd_dq_inner(
+            dq, dq_pe, delta_recomp_masked = _bwd_dq_inner(
                 dq,  # output tensor
                 dq_pe,  # optional output tensor
                 q,
@@ -1165,6 +1160,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 SLIDING_WINDOW=SLIDING_WINDOW,
+                ENABLE_SINK=ENABLE_SINK,
             )
             end_n -= num_steps * MASK_BLOCK_N2
             window_start_n = 0
@@ -1176,7 +1172,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 print(
                     f"unMasked: start_m: {start_m}, start_n: {start_n}, end_n: {end_n}, num_steps: {num_steps}"
                 )  # noqa: E701
-            dq, dq_pe = _bwd_dq_inner(
+            dq, dq_pe, delta_recomp_unmasked = _bwd_dq_inner(
                 dq,  # output tensor
                 dq_pe,  # optional output tensor
                 q,
@@ -1224,7 +1220,18 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 SLIDING_WINDOW=SLIDING_WINDOW,
+                ENABLE_SINK=ENABLE_SINK,
             )
+            if ENABLE_SINK:
+                sink = tl.load(Sink + hqid).to(tl.float32)
+                if USE_EXP2:
+                    RCP_LN2: tl.constexpr = 1.4426950408889634
+                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
+                else:
+                    psink = tl.math.exp(sink - m)
+                delta_recomp = delta_recomp_masked + delta_recomp_unmasked
+                dsink = tl.sum(-psink * delta_recomp[:, None])
+                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
@@ -1671,16 +1678,6 @@ def bwd_kernel_noncausal(
             m = m[:, None]
             delta = tl.load(Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0)
 
-            if ENABLE_SINK:
-                sink = tl.load(Sink + hqid).to(tl.float32)
-                if USE_EXP2:
-                    RCP_LN2: tl.constexpr = 1.4426950408889634
-                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
-                else:
-                    psink = tl.math.exp(sink - m)
-                dsink = tl.sum(-psink * delta[:, None])
-                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
-
             if IS_FP8:
                 descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
@@ -1699,7 +1696,7 @@ def bwd_kernel_noncausal(
                 dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
             else:
                 dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
-            dq, dq_pe = _bwd_dq_inner(
+            dq, dq_pe, delta_recomp = _bwd_dq_inner(
                 dq,  # output tensor
                 dq_pe,  # optional output tensor
                 q,
@@ -1747,7 +1744,17 @@ def bwd_kernel_noncausal(
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 SLIDING_WINDOW=SLIDING_WINDOW,
+                ENABLE_SINK=ENABLE_SINK,
             )
+            if ENABLE_SINK:
+                sink = tl.load(Sink + hqid).to(tl.float32)
+                if USE_EXP2:
+                    RCP_LN2: tl.constexpr = 1.4426950408889634
+                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
+                else:
+                    psink = tl.math.exp(sink - m)
+                dsink = tl.sum(-psink * delta_recomp[:, None])
+                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd

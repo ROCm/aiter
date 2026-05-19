@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # mypy: allow-untyped-defs
+import multiprocessing
 import os
 import time
 import logging
@@ -45,7 +46,10 @@ class FileBaton:
         The amount of time slept depends on the ``wait_seconds`` parameter
         passed to the constructor.
         """
-        logger.info(f"waiting for baton release at {self.lock_file_path}")
+        logger.info(
+            f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
+            f"waiting for baton release at {self.lock_file_path}"
+        )
         while os.path.exists(self.lock_file_path):
             time.sleep(self.wait_seconds)
 
