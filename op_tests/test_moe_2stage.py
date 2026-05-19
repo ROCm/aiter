@@ -853,6 +853,12 @@ def test_fmoe(
                           "all setup phases done; about to enter fused_moe")
 
     # ######################## stage 2 end ###########
+    # FFM model emulator (HSA_MODEL_LIB set by ffmlite_env.sh) returns
+    # wall-clock = 0 for cuda.Event timings, which would divide-by-zero
+    # in the bandwidth/tflops formulas. In that env, skip the timing
+    # loop entirely -- just run fused_moe once to get out2_ck and go
+    # straight to the logits_diff verdict.
+    _use_ffm = int(os.environ.get("USE_FFM", "0")) == 1
     # Direct torch.cuda.Event(enable_timing=True) timing path -- bypasses
     # run_perftest's torch.profiler trace so the reported `us2` is the
     # raw kernel-side wall-clock from CUDA events.  Tunables via env:
@@ -895,7 +901,13 @@ def test_fmoe(
         )
 
     out2_ck = None
-    if _use_graph:
+    if _use_ffm:
+        # FFM emulator: no meaningful wall-clock; one call is enough
+        # to populate out2_ck for the accuracy check.
+        out2_ck = _run_fused_moe()
+        torch.cuda.synchronize()
+        us2 = 0.0
+    elif _use_graph:
         # CUDAGraph capture protocol (see PyTorch docs / test_common.perftest):
         #   1. Warm up on a side stream so any one-shot kernel JIT
         #      (FlyDSL compile_moe_gemm1/2, triton per_1x32_*_quant) is
@@ -953,23 +965,24 @@ def test_fmoe(
             _ends[_i].record()
         torch.cuda.synchronize()
 
-    _lat_us_sorted = sorted(
-        s.elapsed_time(e) * 1000.0 for s, e in zip(_starts, _ends)
-    )
-    us2 = _lat_us_sorted[len(_lat_us_sorted) // 2]  # median, in us
-    _mean_us = sum(_lat_us_sorted) / len(_lat_us_sorted)
-    aiter.logger.info(
-        "[cuda.Event] moe fused us: median=%.2f mean=%.2f min=%.2f max=%.2f "
-        "(warmup=%d iters=%d L2_flush=%s graph=%s)",
-        us2,
-        _mean_us,
-        _lat_us_sorted[0],
-        _lat_us_sorted[-1],
-        _num_warmup,
-        _num_iters,
-        _l2_flush,
-        _use_graph,
-    )
+    if not _use_ffm:
+        _lat_us_sorted = sorted(
+            s.elapsed_time(e) * 1000.0 for s, e in zip(_starts, _ends)
+        )
+        us2 = _lat_us_sorted[len(_lat_us_sorted) // 2]  # median, in us
+        _mean_us = sum(_lat_us_sorted) / len(_lat_us_sorted)
+        aiter.logger.info(
+            "[cuda.Event] moe fused us: median=%.2f mean=%.2f min=%.2f max=%.2f "
+            "(warmup=%d iters=%d L2_flush=%s graph=%s)",
+            us2,
+            _mean_us,
+            _lat_us_sorted[0],
+            _lat_us_sorted[-1],
+            _num_warmup,
+            _num_iters,
+            _l2_flush,
+            _use_graph,
+        )
 
     def _summarize_event_us(pair_list, max_pairs):
         """Reduce a list of ``(start, end) cuda.Event`` pairs into
@@ -990,7 +1003,8 @@ def test_fmoe(
         )
 
     _stage_summary_active = (
-        _STAGE_EVENT_PATCHED
+        not _use_ffm
+        and _STAGE_EVENT_PATCHED
         and not _use_graph
         and (
             _STAGE_EVENT_BUCKETS["stage1"] or _STAGE_EVENT_BUCKETS["stage2"]
@@ -1046,7 +1060,6 @@ def test_fmoe(
             _ck_atol, _ck_rtol = 0.25, 0.5
         elif AQDType == dtypes.fp8 and WQDType == dtypes.fp8:    # fp8
             _ck_atol, _ck_rtol = 0.25, 0.25
-    _use_ffm = os.environ.get("USE_FFM", "0") not in ("0", "")
     if _use_ffm:
         _bw_GBps = 0.0
         _bw_msg = ""
