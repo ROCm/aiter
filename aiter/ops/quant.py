@@ -450,6 +450,16 @@ def per_tensor_quant_hip(
     return y, scale.view(1)
 
 
+def static_per_tensor_quant_fp8_hip(
+    x: Tensor,
+    scale: Tensor,
+) -> Tensor:
+    """Static FP8 per-tensor quant returning only the quantized tensor."""
+    y = torch.empty(x.shape, dtype=dtypes.fp8, device=x.device)
+    static_per_tensor_quant(y, x, scale)
+    return y
+
+
 def per_token_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     shape = x.shape
     device = x.device
