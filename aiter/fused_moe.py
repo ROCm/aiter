@@ -798,6 +798,9 @@ def _flydsl_stage2_wrapper(
         persist=parsed.get("persist", None),
         bias=bias2,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
+        out_already_filled_with_zeros=_kwargs.get(
+            "out_already_filled_with_zeros", "False"
+        ),
     )
 
 
@@ -1571,6 +1574,8 @@ def fused_moe_2stages(
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     if metadata.stage1.func is _flydsl_stage1_wrapper:
         extra_stage1_args["swiglu_limit"] = swiglu_limit
+    if metadata.stage2.func is _flydsl_stage2_wrapper:
+        extra_stage2_args["out_already_filled_with_zeros"] = True
     a2 = metadata.stage1(
         a1,
         w1,
