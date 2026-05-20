@@ -5,7 +5,14 @@ Compares against:
   - kv_blockscale FP8 (existing path)
 """
 
+import os
+import sys
+
 import torch
+
+# Allow running as `python op_tests/bench_per_token_head.py` from the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from op_tests.test_batch_prefill import (
     run_batch_prefill_per_token_head,
     run_batch_prefill_kv_blockscale,
