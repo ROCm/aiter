@@ -3,7 +3,7 @@ import torch
 import triton
 import math
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_bf16 import (
-    generate_batched_gemm_a16w16_inputs,
+    generate_batched_gemm_a16w16_inputs as generate_batched_gemm_bf16_inputs,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
@@ -22,19 +22,38 @@ from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
 
 def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
     c_dtype = torch.bfloat16
-    x, w, bias, y = generate_batched_gemm_a16w16_inputs(
-        batch, M, N, K, dtype=c_dtype, layout=layout, output=True
+
+    x, w, bias, y = generate_batched_gemm_bf16_inputs(
+        batch,
+        M,
+        N,
+        K,
+        dtype=c_dtype,
+        layout=layout,
+        output=True,
     )
-    # print(f"M: {M}, N: {N}, K: {K}, x.shape: {x.shape}, x.stride(): {x.stride()}, w.shape: {w.shape}, w.stride(): {w.stride()}")
-    # flops
-    flops = 2.0 * M * N * K * batch
-    # memory transfer
-    mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
-    mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
+
+    # FLOPs for batched GEMM:
+    # C[B, M, N] = A[B, M, K] @ W[B, N, K]^T
+    flops = 2.0 * batch * M * N * K
+
+    # Memory traffic.
+    mem_read = (
+        x.numel() * x.element_size()
+        + w.numel() * w.element_size()
+        + bias.numel() * bias.element_size()
+    )
+    mem_write = y.numel() * y.element_size()
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: batched_gemm_bf16(x, w, bias, c_dtype, YQ=y),
+        lambda: batched_gemm_bf16(
+            x,
+            w,
+            bias=bias,
+            dtype=c_dtype,
+            YQ=y,
+        ),
         warmup=25,
         rep=100,
     )
@@ -61,8 +80,14 @@ def run_model_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_a8w8(
-        M, hidden_dim, intermediate_dim, batch, metric, layer, **kwargs
+    def bench_batched_gemm_bf16(
+        M,
+        hidden_dim,
+        intermediate_dim,
+        batch,
+        metric,
+        layer,
+        **kwargs,
     ):
         if layer == "fc1":
             if args.no_glu:
@@ -71,15 +96,21 @@ def run_model_benchmark(args):
                 N, K = intermediate_dim * 2, hidden_dim
             # Divide N by tensor parallel
             N = math.ceil(N / args.tp)
+
         elif layer == "fc2":
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
-        # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
+
+        else:
+            raise ValueError(f"Unsupported layer: {layer}")
 
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
+    bench_batched_gemm_bf16.run(
+        save_path="." if args.o else None,
+        print_data=True,
+    )
 
 
 def run_shape_benchmark(args):
@@ -90,10 +121,13 @@ def run_shape_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_a8w8(batch, M, N, K, metric, **kwargs):
+    def bench_batched_gemm_bf16(batch, M, N, K, metric, **kwargs):
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
+    bench_batched_gemm_bf16.run(
+        save_path="." if args.o else None,
+        print_data=True,
+    )
 
 
 def run_benchmark(args, defaults):
@@ -125,7 +159,7 @@ def run_benchmark(args, defaults):
 
 
 def parse_args():
-    parser = get_parser("Batched A16W16 GEMM")
+    parser = get_parser("Batched BF16 GEMM")
     parser = add_argparse_ff(parser)
     parser.add_argument(
         "-B",
@@ -138,11 +172,13 @@ def parse_args():
 
 def main():
     args, defaults = parse_args()
+
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         fun = lambda: run_benchmark(args, defaults)  # noqa: E731
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
+
     run_benchmark(args, defaults)
 
 

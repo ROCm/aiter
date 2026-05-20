@@ -3,8 +3,8 @@ import torch
 import triton
 import math
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4_pre_quant import (
-    batched_gemm_afp4wfp4_pre_quant,
+from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
+    batched_gemm_a16wfp4,
 )
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
     generate_batched_gemm_a16wfp4_inputs,
@@ -47,7 +47,7 @@ def bench_gemm_fn(
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: batched_gemm_afp4wfp4_pre_quant(x, w, w_scale, c_dtype, y),
+        lambda: batched_gemm_a16wfp4(x, w, w_scale, c_dtype, y),
         warmup=25,
         rep=100,
     )
@@ -74,7 +74,7 @@ def run_model_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_afp4wfp4_pre_quant(
+    def bench_batched_gemm_a16wfp4(
         M, hidden_dim, intermediate_dim, batch, metric, layer, **kwargs
     ):
         if layer == "fc1":
@@ -92,7 +92,7 @@ def run_model_benchmark(args):
 
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_afp4wfp4_pre_quant.run(
+    bench_batched_gemm_a16wfp4.run(
         save_path="." if args.o else None, print_data=True
     )
 
@@ -105,7 +105,7 @@ def run_shape_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_afp4wfp4_pre_quant(
+    def bench_batched_gemm_a16wfp4(
         batch,
         M,
         N,
@@ -115,7 +115,7 @@ def run_shape_benchmark(args):
     ):
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_afp4wfp4_pre_quant.run(
+    bench_batched_gemm_a16wfp4.run(
         save_path="." if args.o else None, print_data=True
     )
 
