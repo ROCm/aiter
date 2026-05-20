@@ -17,6 +17,9 @@ from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import (
     gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
     get_gemm_afp4wfp4_preshuffle_layouts,
 )
+
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
