@@ -65,32 +65,38 @@ def select_2d_config(
 
 
 def select_3d_config(
-    head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms
+    head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms, num_kv_heads
 ):
+    arch = get_arch()
     reduce_num_warps = 2
     attn_warps = 2
-    TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+
+    gfx1151_low_gqa = arch.name == "gfx1151" and num_kv_heads <= 2
+
+    waves_per_eu = 4 if gfx1151_low_gqa else 2
+    TILE_SIZE = 16 if gfx1151_low_gqa else min(64, triton.next_power_of_2(block_size))
     # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
-    num_segments = math.ceil(target_num_prgms / num_2d_prgms)
+    num_segments = 32 if gfx1151_low_gqa else math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
     MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
     num_segments = max(num_segments, MIN_SEGMENTS)
     if num_segments == MIN_SEGMENTS:
         reduce_num_warps = 1
+
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_warps,
         "num_stages": 1,
-        "waves_per_eu": 2,
+        "waves_per_eu": waves_per_eu,
     }
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": reduce_num_warps,
         "num_stages": 1,
-        "waves_per_eu": 2,
+        "waves_per_eu": waves_per_eu,
     }
     return attn_config, reduce_config
 
@@ -251,6 +257,7 @@ def unified_attention(
             max_seqlen_k,
             target_num_prgms,
             num_2d_prgms,
+            num_kv_heads,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         segm_output = torch.empty(
