@@ -547,7 +547,7 @@ def _precompile_to_cache(
                 out_dtype=_gemm_out_dtype,
                 act=act,
                 use_async_copy=True,
-                k_batch=k_batch,
+                k_batch_intra_block=k_batch,
                 waves_per_eu=waves_per_eu,
                 b_nt=b_nt,
                 gate_mode=gate_mode,
