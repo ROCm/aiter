@@ -141,9 +141,7 @@ def _mxfp4_quant_op(
     qx = qx ^ s
 
     qx_fp32 = qx.to(tl.float32, bitcast=True)
-    saturate_mask = qx_fp32 >= max_normal
-    denormal_mask = (not saturate_mask) & (qx_fp32 < min_normal)
-    normal_mask = not (saturate_mask | denormal_mask)
+    denormal_mask = qx_fp32 < min_normal
 
     # Denormal numbers
     denorm_exp: tl.constexpr = (
@@ -157,7 +155,7 @@ def _mxfp4_quant_op(
     denormal_x -= denorm_mask_int
     denormal_x = denormal_x.to(tl.uint8)
 
-    # Normal numbers
+    # Normal numbers (computed unconditionally, clamped to handle saturation)
     normal_x = qx
     # resulting mantissa is odd
     mant_odd = (normal_x >> (MBITS_F32 - MBITS_FP4)) & 1
@@ -169,11 +167,11 @@ def _mxfp4_quant_op(
     # take the bits!
     normal_x = normal_x >> (MBITS_F32 - MBITS_FP4)
     normal_x = normal_x.to(tl.uint8)
+    # Clamp to 0x7 to handle saturation (values >= 6.0 produce normal_x > 7)
+    normal_x = tl.minimum(normal_x, tl.full(normal_x.type.get_block_shapes(), 0x7, dtype=tl.uint8))
 
-    # Merge results
-    e2m1_value = tl.full(qx.type.get_block_shapes(), 0x7, dtype=tl.uint8)
-    e2m1_value = tl.where(normal_mask, normal_x, e2m1_value)
-    e2m1_value = tl.where(denormal_mask, denormal_x, e2m1_value)
+    # Merge: use denormal path for < 1.0, clamped normal path for >= 1.0
+    e2m1_value = tl.where(denormal_mask, denormal_x, normal_x)
     # add sign back
     sign_lp = s >> (MBITS_F32 + EBITS_F32 - MBITS_FP4 - EBITS_FP4)
     sign_lp = sign_lp.to(tl.uint8)
