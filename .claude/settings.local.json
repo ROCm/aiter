@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker exec *)",
+      "Bash(awk -F',' '{printf \"%-60s Lat=%-8s Stall=%-8s Idle=%-8s\\\\n\", $3, $5, $6, $7}')",
+      "Bash(awk -F',' 'NR>1 {sum += $6} END {print \"Total stall:\", sum}' /mnt/raid0/huangyifeng/aiter-main/att-logs/stats_ui_output_agent_65224_dispatch_3.csv)",
+      "Bash(awk -F',' 'NR>1 {sum += $6} END {print \"Total stall:\", sum}' /mnt/raid0/yifehuan/att_perf/att-logs/stats_ui_output_agent_23025_dispatch_9.csv)",
+      "Bash(awk -F',' '{sum += $6} END {print \"MFMA stall:\", sum}')",
+      "Bash(awk -F',' '{sum += $6; idle += $7; cnt++} END {print \"count:\", cnt, \"stall:\", sum, \"idle:\", idle}')",
+      "Bash(awk -F',' 'NR>1 {print $4}' /mnt/raid0/huangyifeng/aiter-main/att-logs/stats_ui_output_agent_65224_dispatch_3.csv)",
+      "Bash(awk -F',' 'NR>1 {print $4}' /mnt/raid0/yifehuan/att_perf/att-logs/stats_ui_output_agent_23025_dispatch_9.csv)",
+      "Bash(awk -F',' 'NR>1 {sum_stall += $6; sum_hit += $4} END {print \"total_stall:\", sum_stall, \"total_hit:\", sum_hit, \"stall/hit:\", sum_stall/sum_hit}' /mnt/raid0/huangyifeng/aiter-main/att-logs/stats_ui_output_agent_65224_dispatch_3.csv)",
+      "Bash(awk -F',' 'NR>1 {sum_stall += $6; sum_hit += $4} END {print \"total_stall:\", sum_stall, \"total_hit:\", sum_hit, \"stall/hit:\", sum_stall/sum_hit}' /mnt/raid0/yifehuan/att_perf/att-logs/stats_ui_output_agent_23025_dispatch_9.csv)",
+      "Bash(awk -F',' '{sum_stall += $6; sum_hit += $4; sum_idle += $7; cnt++} END {print \"count:\", cnt, \"stall:\", sum_stall, \"idle:\", sum_idle, \"stall/hit:\", sum_stall/sum_hit}')",
+      "Bash(awk -F',' '{sum_stall += $6; sum_idle += $7; cnt++} END {print \"count:\", cnt, \"stall:\", sum_stall, \"idle:\", sum_idle}')",
+      "Bash(awk -F, '{ *)",
+      "Bash(awk -F',' '{printf \"line %-5s hit=%-5s stall/hit=%-8s %s\\\\n\", NR, $4, \\($4+0>0?$6/$4:\"N/A\"\\), $3}')",
+      "Bash(awk -F',' '{printf \"%-60s stall/hit=%-8s\\\\n\", $3, \\($4+0>0?$6/$4:\"N/A\"\\)}')",
+      "Bash(awk -F',' '/buffer_load/{exit} NR>1{print NR\": \"$3}' /mnt/raid0/huangyifeng/aiter-main/att-logs/stats_ui_output_agent_65224_dispatch_3.csv)",
+      "Bash(awk -F',' '/buffer_load/{exit} NR>1{print NR\": \"$3}' /mnt/raid0/yifehuan/att_perf/att-logs/stats_ui_output_agent_23025_dispatch_9.csv)",
+      "Bash(awk -F',' '{printf \"%-65s hit=%-4s stall/hit=%-8s\\\\n\", $3, $4, \\($4+0>0?$6/$4:\"N/A\"\\)}')",
+      "Bash(echo '__attribute__\\(\\(target\\(\"gfx942\"\\)\\)\\) void test\\(\\) { __builtin_amdgcn_buffer_wbinvl1_vol\\(\\); }')",
+      "Bash(/opt/rocm/bin/hipcc -c -x hip --offload-arch=gfx942 /tmp/test_inv.cpp -o /dev/null)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(cp /mnt/raid0/yifehuan/aiter/csrc/opus_gemm/include/gfx942/opus_gemm_pipeline_a16w16_splitk.cuh /mnt/raid0/yifehuan/opus_gemm_gfx942_splitk/)",
+      "Bash(cp /mnt/raid0/yifehuan/aiter/csrc/opus_gemm/gen_instances.py /mnt/raid0/yifehuan/opus_gemm_gfx942_splitk/)",
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(sqlite3 *)",
+      "Bash(sort -t_ -k5 -n)",
+      "Bash(/opt/rocm/lib/llvm/bin/llvm-objdump --disassemble-symbols='_Z31gemm_a16w16_splitk_fused_kernelI23opus_gemm_a16w16_traitsILi512EN4opus3seqIJLi128ELi128ELi64EEEENS1_5tupleIJDF16bDF16bffEEENS2_IJLi8ELi8ELi4EEEENS2_IJLi2ELi4ELi1EEEENS2_IJLi16ELi16ELi16EEEELb0EfEEv28opus_gemm_splitk_fused_kargs' /mnt/raid0/yifehuan/att_perf/opus/1024_64_7168/201/att-logs/hjbog-srdc-24/435802_gfx942_code_object_id_6.out)",
+      "Bash(xargs cat)"
+    ]
+  }
+}

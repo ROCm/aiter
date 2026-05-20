@@ -56,6 +56,10 @@ class OpusGemmInstance:
         elif self.kernel_tag == "a16w16_flatmm_splitk":
             parts.insert(tag_insert, "flatmm_splitk")
             parts.append(f"wgpcu{self.WG_PER_CU}")
+        elif self.kernel_tag == "a16w16_splitk":
+            parts.insert(tag_insert, "splitk")
+        elif self.kernel_tag == "a16w16_splitk_fused":
+            parts.insert(tag_insert, "splitk_fused")
         if not self.has_oob:
             parts.append("nooob")
         if self.cachectl_a >= 0 or self.cachectl_b >= 0:
@@ -83,6 +87,56 @@ def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, arch_prefix=""):
         0,
         "a16w16",
         ["fp32_t", "bf16_t"],
+        has_oob=has_oob,
+        arch_prefix=arch_prefix,
+    )
+
+
+def _a16w16_splitk(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, arch_prefix="gfx942"):
+    vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
+    return OpusGemmInstance(
+        bs,
+        bm,
+        bn,
+        bk,
+        2,
+        tn,
+        wm,
+        wn,
+        wk,
+        vec,
+        vec,
+        4,
+        0,
+        0,
+        0,
+        "a16w16_splitk",
+        ["fp32_t"],
+        has_oob=has_oob,
+        arch_prefix=arch_prefix,
+    )
+
+
+def _a16w16_splitk_fused(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, arch_prefix="gfx942"):
+    vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
+    return OpusGemmInstance(
+        bs,
+        bm,
+        bn,
+        bk,
+        2,
+        tn,
+        wm,
+        wn,
+        wk,
+        vec,
+        vec,
+        4,
+        0,
+        0,
+        0,
+        "a16w16_splitk_fused",
+        ["fp32_t"],
         has_oob=has_oob,
         arch_prefix=arch_prefix,
     )
@@ -302,8 +356,18 @@ gfx942_a16w16_kernels_list = {
     6: _a16w16(512, 128, 128, 64, 4, 16, 16, 16, arch_prefix="gfx942"),
 }
 
+gfx942_a16w16_splitk_kernels_list = {
+    200: _a16w16_splitk(512, 128, 128, 64, 4, 16, 16, 16, arch_prefix="gfx942"),
+}
+
+gfx942_a16w16_splitk_fused_kernels_list = {
+    201: _a16w16_splitk_fused(512, 128, 128, 64, 4, 16, 16, 16, arch_prefix="gfx942"),
+}
+
 gfx942_kernels_list = {
     **gfx942_a16w16_kernels_list,
+    **gfx942_a16w16_splitk_kernels_list,
+    **gfx942_a16w16_splitk_fused_kernels_list,
 }
 # fmt: on
 
@@ -364,21 +428,31 @@ ARCH_REGISTRY = {
     "gfx942": {
         "kernels": {
             "a16w16": gfx942_a16w16_kernels_list,
+            "a16w16_splitk": gfx942_a16w16_splitk_kernels_list,
+            "a16w16_splitk_fused": gfx942_a16w16_splitk_fused_kernels_list,
         },
         "all_kernels": gfx942_kernels_list,
         "pipeline_headers": {
             "a16w16": "gfx942/opus_gemm_pipeline_a16w16.cuh",
+            "a16w16_splitk": "gfx942/opus_gemm_pipeline_a16w16_splitk.cuh",
+            "a16w16_splitk_fused": "gfx942/opus_gemm_pipeline_a16w16_splitk_fused.cuh",
         },
         "traits_headers": {
             "a16w16": "gfx942/opus_gemm_traits_a16w16.cuh",
+            "a16w16_splitk": "gfx942/opus_gemm_traits_a16w16.cuh",
+            "a16w16_splitk_fused": "gfx942/opus_gemm_traits_a16w16.cuh",
         },
         "traits_names": {
             "a16w16": "opus_gemm_a16w16_traits",
+            "a16w16_splitk": "opus_gemm_a16w16_traits",
+            "a16w16_splitk_fused": "opus_gemm_a16w16_traits",
         },
         "kargs_names": {
             "a16w16": "opus_gemm_noscale_kargs",
+            "a16w16_splitk": "opus_gemm_splitk_kargs",
+            "a16w16_splitk_fused": "opus_gemm_splitk_fused_kargs",
         },
-        "splitk_reduce_header": None,
+        "splitk_reduce_header": "gfx942/splitk_reduce_gfx942.cuh",
         "valid_bf16_mfma": {(16, 16, 16)},
         "valid_flatmm_mfma": set(),
         "valid_flatmm_splitk_mfma": set(),

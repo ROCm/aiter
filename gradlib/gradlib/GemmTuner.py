@@ -56,11 +56,7 @@ try:
     _opus_csrc = os.path.join(os.path.dirname(__file__), "../../csrc/opus_gemm")
     if _opus_csrc not in _sys.path:
         _sys.path.insert(0, os.path.abspath(_opus_csrc))
-    from opus_gemm_common import (
-        a16w16_kernels_list as _opus_a16w16_kernels_list,
-        a16w16_flatmm_kernels_list as _opus_a16w16_flatmm_kernels_list,
-        a16w16_flatmm_splitk_kernels_list as _opus_a16w16_flatmm_splitk_kernels_list,
-    )
+    from opus_gemm_common import ARCH_REGISTRY, detect_gfx_arch
     from opus_gemm_tune import (
         _kid_rejects_shape as _opus_kid_rejects_shape,
         _kid_rejects_bias as _opus_kid_rejects_bias,
@@ -70,11 +66,12 @@ try:
         opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
     )
 
-    _opus_all_kernels = {
-        **_opus_a16w16_kernels_list,
-        **_opus_a16w16_flatmm_kernels_list,
-        **_opus_a16w16_flatmm_splitk_kernels_list,
-    }
+    _opus_gfx_arch = detect_gfx_arch()
+    _opus_arch_cfg = ARCH_REGISTRY[_opus_gfx_arch]
+    _opus_all_kernels = {}
+    for _tag in ("a16w16", "a16w16_splitk", "a16w16_splitk_fused",
+                 "a16w16_flatmm", "a16w16_flatmm_splitk"):
+        _opus_all_kernels.update(_opus_arch_cfg["kernels"].get(_tag, {}))
     _opus_kernel_ids = sorted(_opus_all_kernels.keys())
 except Exception as _opus_exc:
     _opus_gemm_a16w16_tune = None
@@ -611,7 +608,7 @@ class Gemm:
                 continue
             if _opus_kid_rejects_bias(k_inst, self.has_bias):
                 continue
-            if k_inst.kernel_tag == "a16w16_flatmm_splitk":
+            if k_inst.kernel_tag in ("a16w16_flatmm_splitk", "a16w16_splitk", "a16w16_splitk_fused"):
                 splitK_range = _opus_candidate_splitK(
                     self.m, self.n, self.k, 1, cu_num, k_inst
                 )

@@ -21,6 +21,8 @@ KERNEL_FUNC_MAP = {
     "a16w16": "gemm_a16w16_kernel",
     "a16w16_flatmm": "gemm_a16w16_flatmm_kernel",
     "a16w16_flatmm_splitk": "gemm_a16w16_flatmm_splitk_kernel",
+    "a16w16_splitk": "gemm_a16w16_splitk_kernel",
+    "a16w16_splitk_fused": "gemm_a16w16_splitk_fused_kernel",
 }
 
 INPUT_DTYPE_MAP = {
@@ -29,18 +31,20 @@ INPUT_DTYPE_MAP = {
     "a16w16": ("bf16_t", "bf16_t"),
     "a16w16_flatmm": ("bf16_t", "bf16_t"),
     "a16w16_flatmm_splitk": ("bf16_t", "bf16_t"),
+    "a16w16_splitk": ("bf16_t", "bf16_t"),
+    "a16w16_splitk_fused": ("bf16_t", "bf16_t"),
 }
 
 # Tags whose launchers take 3 torch tensors (XQ, WQ, Y) + int splitK. Splitk
 # launcher has the same Python-facing signature but with literal (non-trivial)
 # splitK semantics.
-NOSCALE_TAGS = {"a8w8", "a16w16", "a16w16_flatmm", "a16w16_flatmm_splitk"}
+NOSCALE_TAGS = {"a8w8", "a16w16", "a16w16_flatmm", "a16w16_flatmm_splitk", "a16w16_splitk", "a16w16_splitk_fused"}
 
 # a16w16-family tags whose launchers land in opus_gemm_a16w16_tune_lookup.h
 # and therefore need the 4-arg (XQ, WQ, Y, int splitK) signature so they can
 # share the std::function<Tensor(Tensor&,Tensor&,Tensor&,int)> slot.
 # Non-splitk tags in this set ignore the splitK param in their body.
-A16W16_TUNE_TAGS = {"a16w16", "a16w16_flatmm", "a16w16_flatmm_splitk"}
+A16W16_TUNE_TAGS = {"a16w16", "a16w16_flatmm", "a16w16_flatmm_splitk", "a16w16_splitk", "a16w16_splitk_fused"}
 
 WARP_SIZE = 64
 
@@ -489,6 +493,26 @@ class opus_gemm_codegen:
                 f"comrep=({info['com_rep_m']},{info['com_rep_n']}) "
                 f"LDS={info['lds_bytes'] // 1024}KiB K>={info['min_k']} WG={k.WG_PER_CU}"
             )
+        elif k.kernel_tag == "a16w16_splitk" and k.kernel_tag in validated_tags:
+            info = self._validate_a16w16(k)
+            print(
+                f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
+                f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
+                f"  LDS={info['lds_bytes'] // 1024}KiB"
+                f"  K>={info['min_k']} (splitk)"
+            )
+        elif k.kernel_tag == "a16w16_splitk":
+            print(f"  {k.name}: {self.target_gfx} a16w16_splitk (no validator for this arch)")
+        elif k.kernel_tag == "a16w16_splitk_fused" and k.kernel_tag in validated_tags:
+            info = self._validate_a16w16(k)
+            print(
+                f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
+                f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
+                f"  LDS={info['lds_bytes'] // 1024}KiB"
+                f"  K>={info['min_k']} (splitk_fused)"
+            )
+        elif k.kernel_tag == "a16w16_splitk_fused":
+            print(f"  {k.name}: {self.target_gfx} a16w16_splitk_fused (no validator for this arch)")
 
         pipeline_header = self.arch_cfg["pipeline_headers"][k.kernel_tag]
         traits_header = self.arch_cfg["traits_headers"][k.kernel_tag]
@@ -515,6 +539,28 @@ class opus_gemm_codegen:
             )
         elif k.kernel_tag == "a16w16_flatmm_splitk":
             self._gen_flatmm_splitk_instance(
+                k,
+                pipeline_header,
+                traits_header,
+                kernel_func,
+                da,
+                db,
+                traits_name,
+                kargs_name,
+            )
+        elif k.kernel_tag == "a16w16_splitk":
+            self._gen_splitk_instance(
+                k,
+                pipeline_header,
+                traits_header,
+                kernel_func,
+                da,
+                db,
+                traits_name,
+                kargs_name,
+            )
+        elif k.kernel_tag == "a16w16_splitk_fused":
+            self._gen_splitk_fused_instance(
                 k,
                 pipeline_header,
                 traits_header,
@@ -1227,6 +1273,445 @@ void
                 {"kid_name": k.name, "dtype": CDtype, "device_decl": device_decl}
             )
 
+    def _gen_splitk_instance(
+        self,
+        k,
+        pipeline_header,
+        traits_header,
+        kernel_func,
+        da,
+        db,
+        traits_name,
+        kargs_name,
+    ):
+        """Generate a gfx942 split-K launcher with independent reduce (a16w16_splitk).
+
+        Two-kernel pipeline (main + reduce). Main writes fp32 workspace;
+        reduce sums splits + casts fp32 -> D_OUT into Y. Workspace is
+        allocated inline via thread-local cache (graph-capture compatible).
+
+        splitK semantic: literal KBatch; 0 and 1 both mean no split (KBatch=1).
+        Host-side auto-clamp decrements split_k until every split has >= 2
+        K-tile iters (split-barrier pipeline requires at least 2 tiles: one
+        in LDS + one prefetched).
+
+        D_C template param is fp32_t (workspace is fp32); Y must be bf16 or fp32.
+        """
+        traits_extra = (
+            f",\n        opus::seq<{k.T_M}, {k.T_N}, 1>,"
+            f"\n        opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>"
+        )
+        traits_aliases = f"""
+template <typename D_C>
+using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, fp32_t, fp32_t>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
+    false,
+    fp32_t>;
+"""
+        has_oob_str = "true"
+        min_k = 2 * k.B_K
+        splitk_reduce_header = self.arch_cfg["splitk_reduce_header"]
+
+        INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include <optional>
+#endif
+#ifdef OPUS_FUSED_HOST_TU
+#include "{traits_header}"
+#ifndef OPUS_GEMM_SPLITK_KARGS_GFX942_DEFINED
+#define OPUS_GEMM_SPLITK_KARGS_GFX942_DEFINED
+struct opus_gemm_splitk_kargs {{
+    const void* __restrict__ ptr_a;
+    const void* __restrict__ ptr_b;
+    void*       __restrict__ ptr_workspace;
+    void*       __restrict__ ptr_c;
+    const void* __restrict__ ptr_bias;
+    int m, n, k, batch, split_k;
+    int stride_a, stride_b, stride_ws, stride_c;
+    int stride_a_batch, stride_b_batch, stride_ws_batch, stride_c_batch;
+    int stride_bias_batch;
+}};
+#endif
+template<typename Traits>
+__global__ void {kernel_func}({kargs_name} kargs);
+// splitk_reduce_kernel forward-declared at the top of the fused host TU;
+// do NOT #include the reduce header here -- doing so would generate device
+// stubs bound to this TU's empty fat binary, causing hipLaunchKernel to
+// fail at runtime ("Cannot find Symbol"). The actual GPU code lives in
+// splitk_reduce.device.cu.
+#else
+#include "{pipeline_header}"
+#endif
+{traits_aliases}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{k.name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int splitK)
+{{{{
+    static_assert(std::is_same<D_C, fp32_t>::value,
+        "splitk main kernel uses fp32 workspace; D_C template param must be fp32_t");
+
+    int batch = XQ.size(0);
+    int M = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
+                || Y.dtype() == AITER_DTYPE_fp32,
+        "a16w16_splitk requires Y dtype bf16 or fp32");
+    AITER_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
+        "M, N, K, batch must be >= 1");
+    AITER_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K due to a "
+        "latent K-tail accumulation bug; pass an even K)");
+{self.BIAS_HOST_VALIDATE}
+    using Traits = {k.name}_Traits<D_C>;
+
+    int split_k = (splitK <= 1) ? 1 : splitK;
+
+    // Host-side auto-clamp: split-barrier pipeline requires at least 2
+    // K-tile iterations per split (one in LDS + one prefetched).
+    int total_iters = (K + {k.B_K} - 1) / {k.B_K};
+    constexpr int min_iters_per_split = 2;
+    while (split_k > 1) {{{{
+        int iters_full = (total_iters + split_k - 1) / split_k;
+        int last_loops = total_iters - (split_k - 1) * iters_full;
+        if (iters_full >= min_iters_per_split && last_loops >= min_iters_per_split) break;
+        split_k--;
+    }}}}
+    AITER_CHECK(total_iters >= min_iters_per_split,
+        "K=", K, " too small for a16w16_splitk B_K={k.B_K}: "
+        "need K >= {min_k}");
+
+    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
+    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
+    int padded_M    = num_tiles_m * {k.B_M};
+    int padded_N    = num_tiles_n * {k.B_N};
+
+    // Workspace allocation: thread-local cache that grows on demand.
+    auto stream = aiter::getCurrentHIPStream();
+    size_t ws_bytes = (size_t)split_k * (size_t)batch
+                    * (size_t)padded_M * (size_t)padded_N * sizeof(float);
+    static thread_local void*  ws_cached_ptr   = nullptr;
+    static thread_local size_t ws_cached_bytes = 0;
+    if (ws_cached_ptr == nullptr || ws_bytes > ws_cached_bytes)
+    {{
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+        HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
+        AITER_CHECK(capture_status == hipStreamCaptureStatusNone,
+            "splitk workspace cache miss inside HIP graph capture is not "
+            "supported. Run the launcher once eagerly with the same shape "
+            "before capturing the graph.");
+
+        if (ws_cached_ptr != nullptr)
+        {{
+            HIP_CALL(hipDeviceSynchronize());
+            HIP_CALL(hipFree(ws_cached_ptr));
+        }}
+        const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
+        size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
+        HIP_CALL(hipMalloc(&ws_cached_ptr, grow_bytes));
+        ws_cached_bytes = grow_bytes;
+    }}
+    void* ptr_workspace_ = ws_cached_ptr;
+
+    {kargs_name} kargs{{{{}}}};
+    kargs.ptr_a         = XQ.data_ptr();
+    kargs.ptr_b         = WQ.data_ptr();
+    kargs.ptr_workspace = ptr_workspace_;
+    kargs.ptr_c         = Y.data_ptr();
+    kargs.ptr_bias      = ptr_bias_;
+    kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
+    kargs.split_k = split_k;
+    kargs.stride_a        = K;
+    kargs.stride_b        = K;
+    kargs.stride_ws       = padded_N;
+    kargs.stride_c        = N;
+    kargs.stride_a_batch  = M * K;
+    kargs.stride_b_batch  = N * K;
+    kargs.stride_ws_batch = padded_M * padded_N;
+    kargs.stride_c_batch  = M * N;
+    kargs.stride_bias_batch = stride_bias_batch_;
+
+    dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
+    dim3 block_main({k.BLOCK_SIZE});
+
+    constexpr int REDUCE_VEC = 16;
+    constexpr int REDUCE_BS  = 64;
+    dim3 grid_reduce((N + REDUCE_VEC * REDUCE_BS - 1) / (REDUCE_VEC * REDUCE_BS),
+                      batch * M, 1);
+    dim3 block_reduce(REDUCE_BS);
+
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid_main, block_main, 0, stream>>>(kargs);
+
+    if (Y.dtype() == AITER_DTYPE_bf16) {{{{
+        if (bias.has_value()) {{{{
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    reinterpret_cast<const float*>(ptr_workspace_),
+                    reinterpret_cast<__bf16*>(Y.data_ptr()),
+                    split_k, M, N, batch, padded_M, padded_N,
+                    reinterpret_cast<const __bf16*>(ptr_bias_),
+                    stride_bias_batch_);
+        }}}} else {{{{
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    reinterpret_cast<const float*>(ptr_workspace_),
+                    reinterpret_cast<__bf16*>(Y.data_ptr()),
+                    split_k, M, N, batch, padded_M, padded_N,
+                    nullptr, 0);
+        }}}}
+    }}}} else {{{{
+        if (bias.has_value()) {{{{
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    reinterpret_cast<const float*>(ptr_workspace_),
+                    reinterpret_cast<float*>(Y.data_ptr()),
+                    split_k, M, N, batch, padded_M, padded_N,
+                    reinterpret_cast<const float*>(ptr_bias_),
+                    stride_bias_batch_);
+        }}}} else {{{{
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    reinterpret_cast<const float*>(ptr_workspace_),
+                    reinterpret_cast<float*>(Y.data_ptr()),
+                    split_k, M, N, batch, padded_M, padded_N,
+                    nullptr, 0);
+        }}}}
+    }}}}
+}}}}
+#endif // launcher only on regular host pass
+"""
+        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+
+        for CDtype in k.output_dtypes:
+            host_decl = (
+                f"template void\n"
+                f"{k.name}<{CDtype}>(\n"
+                f"    aiter_tensor_t &XQ,\n"
+                f"    aiter_tensor_t &WQ,\n"
+                f"    aiter_tensor_t &Y,\n"
+                f"    std::optional<aiter_tensor_t>,\n"
+                f"    int);\n"
+            )
+            device_decl = (
+                f"template __global__ void {kernel_func}<\n"
+                f"    {k.name}_Traits<{CDtype}>>({kargs_name});\n"
+            )
+            self._host_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
+            )
+            self._device_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "device_decl": device_decl}
+            )
+
+    def _gen_splitk_fused_instance(
+        self,
+        k,
+        pipeline_header,
+        traits_header,
+        kernel_func,
+        da,
+        db,
+        traits_name,
+        kargs_name,
+    ):
+        """Generate a gfx942 fused split-K launcher (a16w16_splitk_fused, kid=201).
+
+        Single-kernel pipeline: main kernel writes fp32 workspace, last-arriving
+        workgroup (via atomic counter) reduces inline and writes final output.
+        No separate reduce kernel launch.
+
+        D_C template param is fp32_t (workspace is fp32); Y must be bf16 or fp32.
+        """
+        traits_extra = (
+            f",\n        opus::seq<{k.T_M}, {k.T_N}, 1>,"
+            f"\n        opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>"
+        )
+        traits_aliases = f"""
+template <typename D_C>
+using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, fp32_t, fp32_t>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
+    false,
+    fp32_t>;
+"""
+        min_k = 2 * k.B_K
+
+        INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include <optional>
+#endif
+#ifdef OPUS_FUSED_HOST_TU
+#include "{traits_header}"
+#ifndef OPUS_GEMM_SPLITK_FUSED_KARGS_GFX942_DEFINED
+#define OPUS_GEMM_SPLITK_FUSED_KARGS_GFX942_DEFINED
+struct opus_gemm_splitk_fused_kargs {{
+    const void* __restrict__ ptr_a;
+    const void* __restrict__ ptr_b;
+    void*       __restrict__ ptr_workspace;
+    void*       __restrict__ ptr_c;
+    const void* __restrict__ ptr_bias;
+    unsigned int* __restrict__ ptr_flags;
+    int m, n, k, batch, split_k;
+    int stride_a, stride_b, stride_ws, stride_c;
+    int stride_a_batch, stride_b_batch, stride_ws_batch, stride_c_batch;
+    int stride_bias_batch;
+}};
+#endif
+template<typename Traits>
+__global__ void {kernel_func}({kargs_name} kargs);
+#else
+#include "{pipeline_header}"
+#endif
+{traits_aliases}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{k.name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int splitK)
+{{{{
+    static_assert(std::is_same<D_C, fp32_t>::value,
+        "splitk_fused main kernel uses fp32 workspace; D_C template param must be fp32_t");
+
+    int batch = XQ.size(0);
+    int M = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
+                || Y.dtype() == AITER_DTYPE_fp32,
+        "a16w16_splitk_fused requires Y dtype bf16 or fp32");
+    AITER_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
+        "M, N, K, batch must be >= 1");
+    AITER_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K due to a "
+        "latent K-tail accumulation bug; pass an even K)");
+{self.BIAS_HOST_VALIDATE}
+    using Traits = {k.name}_Traits<D_C>;
+
+    int split_k = (splitK <= 1) ? 1 : splitK;
+
+    // Host-side auto-clamp: split-barrier pipeline requires at least 2
+    // K-tile iterations per split (one in LDS + one prefetched).
+    int total_iters = (K + {k.B_K} - 1) / {k.B_K};
+    constexpr int min_iters_per_split = 2;
+    while (split_k > 1) {{{{
+        int iters_full = (total_iters + split_k - 1) / split_k;
+        int last_loops = total_iters - (split_k - 1) * iters_full;
+        if (iters_full >= min_iters_per_split && last_loops >= min_iters_per_split) break;
+        split_k--;
+    }}}}
+    AITER_CHECK(total_iters >= min_iters_per_split,
+        "K=", K, " too small for a16w16_splitk_fused B_K={k.B_K}: "
+        "need K >= {min_k}");
+
+    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
+    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
+    int padded_M    = num_tiles_m * {k.B_M};
+    int padded_N    = num_tiles_n * {k.B_N};
+
+    // Workspace allocation: thread-local cache that grows on demand.
+    auto stream = aiter::getCurrentHIPStream();
+    size_t ws_bytes = (size_t)split_k * (size_t)batch
+                    * (size_t)padded_M * (size_t)padded_N * sizeof(float);
+    int num_flags = batch * num_tiles_m * num_tiles_n;
+    size_t total_bytes = ws_bytes + (size_t)num_flags * sizeof(unsigned int);
+    static thread_local void*  ws_cached_ptr   = nullptr;
+    static thread_local size_t ws_cached_bytes = 0;
+    if (ws_cached_ptr == nullptr || total_bytes > ws_cached_bytes)
+    {{
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+        HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
+        AITER_CHECK(capture_status == hipStreamCaptureStatusNone,
+            "splitk_fused workspace cache miss inside HIP graph capture is not "
+            "supported. Run the launcher once eagerly with the same shape "
+            "before capturing the graph.");
+
+        if (ws_cached_ptr != nullptr)
+        {{
+            HIP_CALL(hipDeviceSynchronize());
+            HIP_CALL(hipFree(ws_cached_ptr));
+        }}
+        const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
+        size_t grow_bytes = ((total_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
+        HIP_CALL(hipMalloc(&ws_cached_ptr, grow_bytes));
+        ws_cached_bytes = grow_bytes;
+    }}
+    void* ptr_workspace_ = ws_cached_ptr;
+    unsigned int* ptr_flags_ = reinterpret_cast<unsigned int*>(
+        static_cast<char*>(ws_cached_ptr) + ws_bytes);
+    HIP_CALL(hipMemsetAsync(ptr_flags_, 0, num_flags * sizeof(unsigned int), stream));
+
+    {kargs_name} kargs{{{{}}}};
+    kargs.ptr_a         = XQ.data_ptr();
+    kargs.ptr_b         = WQ.data_ptr();
+    kargs.ptr_workspace = ptr_workspace_;
+    kargs.ptr_c         = Y.data_ptr();
+    kargs.ptr_bias      = ptr_bias_;
+    kargs.ptr_flags     = ptr_flags_;
+    kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
+    kargs.split_k = split_k;
+    kargs.stride_a        = K;
+    kargs.stride_b        = K;
+    kargs.stride_ws       = padded_N;
+    kargs.stride_c        = N;
+    kargs.stride_a_batch  = M * K;
+    kargs.stride_b_batch  = N * K;
+    kargs.stride_ws_batch = padded_M * padded_N;
+    kargs.stride_c_batch  = M * N;
+    kargs.stride_bias_batch = stride_bias_batch_;
+
+    dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
+    dim3 block_main({k.BLOCK_SIZE});
+
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid_main, block_main, 0, stream>>>(kargs);
+}}}}
+#endif // launcher only on regular host pass
+"""
+        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+
+        for CDtype in k.output_dtypes:
+            host_decl = (
+                f"template void\n"
+                f"{k.name}<{CDtype}>(\n"
+                f"    aiter_tensor_t &XQ,\n"
+                f"    aiter_tensor_t &WQ,\n"
+                f"    aiter_tensor_t &Y,\n"
+                f"    std::optional<aiter_tensor_t>,\n"
+                f"    int);\n"
+            )
+            device_decl = (
+                f"template __global__ void {kernel_func}<\n"
+                f"    {k.name}_Traits<{CDtype}>>({kargs_name});\n"
+            )
+            self._host_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
+            )
+            self._device_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "device_decl": device_decl}
+            )
+
     def _gen_flatmm_splitk_instance(
         self,
         k,
@@ -1625,7 +2110,7 @@ void
                     row_outdtype = str(mnk[3])
                     if target_outdtype is not None and row_outdtype != target_outdtype:
                         continue
-                is_splitk = k.kernel_tag == "a16w16_flatmm_splitk"
+                is_splitk = k.kernel_tag in ("a16w16_flatmm_splitk", "a16w16_splitk", "a16w16_splitk_fused")
                 if not is_splitk and ctype not in k.output_dtypes:
                     continue
                 rows.append((int(mnk[0]), int(mnk[1]), int(mnk[2]), k.name, is_splitk))
@@ -1999,9 +2484,10 @@ void
         # any reduce symbol and the linker would warn about an unused
         # weak object). Probed by checking any device instantiation
         # whose kernel function name is the splitk one.
-        if any(
-            "flatmm_splitk" in row["kid_name"] for row in self._device_instantiations
-        ):
+        has_splitk = any(
+            "splitk" in row["kid_name"] for row in self._device_instantiations
+        )
+        if has_splitk:
             self._emit_splitk_reduce_tu()
 
         self.gen_lookup_dict(kernels_dict)

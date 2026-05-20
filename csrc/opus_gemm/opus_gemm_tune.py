@@ -46,7 +46,7 @@ _AITER_VERBOSE = bool(int(os.environ.get("AITER_VERBOSE", "0")))
 _gfx_arch = detect_gfx_arch()
 _arch_cfg = ARCH_REGISTRY[_gfx_arch]
 a16w16_all_kernels = {}
-for _tag in ("a16w16", "a16w16_flatmm", "a16w16_flatmm_splitk"):
+for _tag in ("a16w16", "a16w16_splitk", "a16w16_splitk_fused", "a16w16_flatmm", "a16w16_flatmm_splitk"):
     a16w16_all_kernels.update(_arch_cfg["kernels"].get(_tag, {}))
 a16w16_kernel_ids = sorted(a16w16_all_kernels.keys())
 
@@ -148,7 +148,10 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     """
     B_K = k_inst.B_K
     total_iters = _ceil_div(K, B_K)
-    pfk = _flatmm_splitk_pfk(k_inst)
+    if k_inst.kernel_tag in ("a16w16_splitk", "a16w16_splitk_fused"):
+        pfk = 2  # gfx942 split-barrier splitk: min 2 iters per split
+    else:
+        pfk = _flatmm_splitk_pfk(k_inst)
 
     candidates = {0}
 
@@ -561,6 +564,12 @@ def _kid_rejects_shape(k_inst, M, N, K):
                 return True
         return False
 
+    if k_inst.kernel_tag in ("a16w16_splitk", "a16w16_splitk_fused"):
+        # gfx942 split-barrier splitk: host launcher requires min 2 iters per split.
+        if loops < 2:
+            return True
+        return False
+
     return False
 
 
@@ -577,7 +586,7 @@ def _kid_rejects_bias(k_inst, bias):
     """
     if not bias:
         return False
-    return k_inst.kernel_tag not in ("a16w16", "a16w16_flatmm_splitk")
+    return k_inst.kernel_tag not in ("a16w16", "a16w16_flatmm_splitk", "a16w16_splitk")
 
 
 class OpusGemmA16W16Tuner(GemmCommonTuner):
@@ -776,6 +785,16 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             "or when the untuned CSV lacks a 'bias' column. Tuner emits "
             "bias=True / bias=False as a separate dedup key so the same "
             "(M,N,K) can be tuned with and without bias independently.",
+        )
+
+        self.parser.add_argument(
+            "--kid",
+            dest="filter_kid",
+            type=int,
+            nargs="+",
+            default=None,
+            help="Only test specified kernel id(s). E.g. --kid 6 or --kid 6 200. "
+            "Useful for debugging a single kernel without running the full search.",
         )
 
     def pre_process(self, args):
@@ -1191,6 +1210,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             info_keys = (cu_num, M, N, K, bias_v, dtype_str, outdtype_str)
 
             for kid in a16w16_kernel_ids:
+                if args.filter_kid and kid not in args.filter_kid:
+                    continue
                 k_inst = a16w16_all_kernels[kid]
 
                 # Pre-filter kids that can't produce correct output for
@@ -1209,7 +1230,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 
                 # SplitK candidate set per shape+kid. Non-splitk kids always
                 # get splitK=0; splitk kids go through the heuristic.
-                if k_inst.kernel_tag == "a16w16_flatmm_splitk":
+                if k_inst.kernel_tag in ("a16w16_splitk", "a16w16_splitk_fused", "a16w16_flatmm_splitk"):
                     splitK_range = candidate_splitK(M, N, K, batch, cu_num, k_inst)
                 else:
                     splitK_range = [0]

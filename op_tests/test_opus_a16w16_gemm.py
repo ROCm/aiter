@@ -42,6 +42,7 @@ if not _arch_ok:
 
 from aiter.test_common import checkAllclose, run_perftest  # noqa: E402
 from aiter.ops.opus import gemm_a16w16_opus  # noqa: E402
+from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune  # noqa: E402
 
 
 def _torch_ref(A: torch.Tensor, B: torch.Tensor, out_dtype):
@@ -66,33 +67,53 @@ def _make_b(batch: int, N: int, K: int) -> torch.Tensor:
     return B2D.unsqueeze(0).expand(batch, -1, -1).contiguous()
 
 
-def test_a16w16(batch: int, M: int, N: int, K: int, out_dtype=torch.bfloat16):
-    # gemm_a16w16_opus accepts either 2D or 3D A; test 3D to exercise the
-    # batched reshape path. B is 2D when batch==1, 3D contiguous otherwise.
+def test_a16w16(batch: int, M: int, N: int, K: int, out_dtype=torch.bfloat16,
+                kid: int = None, splitk: int = 0):
     A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
     B = _make_b(batch, N, K)
 
     ref = _torch_ref(A, B, out_dtype)
 
-    Y, us = run_perftest(
-        gemm_a16w16_opus,
-        A,
-        B,
-        None,
-        out_dtype,
-    )
+    if kid is not None:
+        B_3d = B.unsqueeze(0).expand(batch, -1, -1).contiguous() if B.dim() == 2 else B
+        Y = torch.empty(batch, M, N, device="cuda", dtype=out_dtype)
+
+        for _ in range(3):
+            opus_gemm_a16w16_tune(A, B_3d, Y, None, kernelId=kid, splitK=splitk)
+        torch.cuda.synchronize()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        num_iters = 101
+        start.record()
+        for _ in range(num_iters):
+            opus_gemm_a16w16_tune(A, B_3d, Y, None, kernelId=kid, splitK=splitk)
+        end.record()
+        end.synchronize()
+        us = start.elapsed_time(end) * 1000.0 / num_iters
+
+        tag = f"a16w16 b={batch} m={M} n={N} k={K} kid={kid} splitK={splitk}"
+    else:
+        Y, us = run_perftest(
+            gemm_a16w16_opus,
+            A,
+            B,
+            None,
+            out_dtype,
+        )
+        tag = f"a16w16 b={batch} m={M} n={N} k={K}"
 
     err = checkAllclose(
         Y,
         ref,
-        msg=f"a16w16 b={batch} m={M} n={N} k={K}",
+        msg=tag,
         rtol=0.1,
         atol=0.5,
     )
     flops = 2.0 * batch * M * N * K
     tflops = flops / us / 1e6
     print(
-        f"[a16w16] batch={batch} M={M} N={N} K={K} dtype={out_dtype} "
+        f"[a16w16] {tag} dtype={out_dtype} "
         f"| {us:.1f}us | {tflops:.2f} TFLOPs | err={err}"
     )
     return err
@@ -162,6 +183,14 @@ if __name__ == "__main__":
             "single-shape test and runs a full sweep instead."
         ),
     )
+    parser.add_argument(
+        "--kid", type=int, default=None,
+        help="Kernel ID to test directly via opus_gemm_a16w16_tune (bypass heuristic)",
+    )
+    parser.add_argument(
+        "--splitk", type=int, default=0,
+        help="splitK value (used with --kid, default: 0)",
+    )
     args = parser.parse_args()
 
     out_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
@@ -175,4 +204,5 @@ if __name__ == "__main__":
         # to 128 to make the default smoke invocation work on every
         # kid the heuristic could pick.
         k_eff = max(args.k, 128)
-        test_a16w16(args.batch, args.m, args.n, k_eff, out_dtype=out_dtype)
+        test_a16w16(args.batch, args.m, args.n, k_eff, out_dtype=out_dtype,
+                    kid=args.kid, splitk=args.splitk)
