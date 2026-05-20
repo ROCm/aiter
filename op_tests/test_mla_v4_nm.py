@@ -225,7 +225,7 @@ def test_v4_nm_smoke_default_shape():
     for b in range(num_seqs):
         ut = (logits[b] == SENTINEL).float().mean().item()
         assert ut < 0.01, (
-            f"kernel skipped batch {b}: {ut*100:.1f}% still SENTINEL. "
+            f"kernel skipped batch {b}: {ut * 100:.1f}% still SENTINEL. "
             f"Check qo_indptr/kv_indptr/split_indptr against poc_kl "
             f"initialize_indices, and the logits shape against the kernel's "
             f"flat [batch, passes, head, m, n] layout."
@@ -290,12 +290,12 @@ def test_v4_nm_determinism():
     # uninitialized memory and may legitimately differ between calls.
     written1 = logits1_bits[:, 0]
     written2 = logits2.view(torch.int32)[:, 0]
-    assert torch.equal(
-        written1, written2
-    ), "v4 nm logits are non-deterministic (likely uninit accumulator/LDS)"
-    assert torch.equal(
-        lse1_bits[:, 0], lse2.view(torch.int32)[:, 0]
-    ), "v4 nm attn_lse is non-deterministic"
+    assert torch.equal(written1, written2), (
+        "v4 nm logits are non-deterministic (likely uninit accumulator/LDS)"
+    )
+    assert torch.equal(lse1_bits[:, 0], lse2.view(torch.int32)[:, 0]), (
+        "v4 nm attn_lse is non-deterministic"
+    )
 
 
 @needs_gfx950
@@ -695,9 +695,9 @@ def _cal_diff(x, y, name, cos_thresh):
     )
     amax = (xd - yd).abs().max().item()
     print(f"  {name}: cos_diff={cos_diff:.4e}, RMSE={rmse:.4e}, amax={amax:.4e}")
-    assert (
-        cos_diff < cos_thresh
-    ), f"{name}: cos_diff={cos_diff:.4e} >= {cos_thresh:.1e} (RMSE={rmse:.4e}, amax={amax:.4e})"
+    assert cos_diff < cos_thresh, (
+        f"{name}: cos_diff={cos_diff:.4e} >= {cos_thresh:.1e} (RMSE={rmse:.4e}, amax={amax:.4e})"
+    )
 
 
 def _print_per_v_tile_diff(x_ref, y_asm, label):
@@ -721,7 +721,7 @@ def _print_per_v_tile_diff(x_ref, y_asm, label):
         ratio = masm / mref if mref > 1e-12 else float("nan")
         max_diff = (xf[:, i : i + 64] - yf[:, i : i + 64]).abs().max().item()
         print(
-            f"    V[{i:3d}:{i+64:3d}]  |ref|={mref:.3e}  |asm|={masm:.3e}  "
+            f"    V[{i:3d}:{i + 64:3d}]  |ref|={mref:.3e}  |asm|={masm:.3e}  "
             f"asm/ref={ratio:.3f}  max|diff|={max_diff:.3e}"
         )
 
@@ -1015,16 +1015,16 @@ def asm_sparse_attn_v4_paged_decode(
     qo_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=device) * 4
     # kv_indptr at every 4th position (group's shared span); validate constancy.
     kv_indptr_per_seq = kv_indptr[::4].to(torch.int32).contiguous()
-    assert (
-        kv_indptr_per_seq.size(0) == batch + 1
-    ), f"kv_indptr layout invalid for groups-of-4: got len {kv_indptr.size(0)}, expected {batch * 4 + 1}"
+    assert kv_indptr_per_seq.size(0) == batch + 1, (
+        f"kv_indptr layout invalid for groups-of-4: got len {kv_indptr.size(0)}, expected {batch * 4 + 1}"
+    )
     # Sanity: within each group, kv_indptr must be constant relative to its base.
     for b in range(batch):
         base = int(kv_indptr[b * 4].item())
         for j in range(1, 4):
-            assert (
-                int(kv_indptr[b * 4 + j].item()) == base
-            ), f"asm v4 nm wrapper requires kv_indptr constant per group-of-4 (batch {b}, offset {j})"
+            assert int(kv_indptr[b * 4 + j].item()) == base, (
+                f"asm v4 nm wrapper requires kv_indptr constant per group-of-4 (batch {b}, offset {j})"
+            )
 
     kv_page_indices = kv_indices.to(torch.int32).contiguous()
     kv_last_page_lens = torch.ones(batch, dtype=torch.int32, device=device)
