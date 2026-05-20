@@ -427,6 +427,151 @@ struct opus_flatmm_splitk_traits_gfx950 {
     static constexpr int mma_insts = COM_REP_M * COM_REP_N * COM_REP_K;
 };
 
+// ============================================================================
+// Persistent a16w16 traits (M-outer + N-fast XCD swizzle)
+// ============================================================================
+//
+// Pipeline: opus_gemm_pipeline_a16w16_persistent_gfx950.cuh (ported from the
+// standalone reference kernel gemm_a16w16_8wave_mouter.cc).
+//
+// Layout: each WG handles m_per_wg tile_m × 1 tile_n (M outer loop). Within
+// one XCD, consecutive launch-wave WGs share the same m_grp and span all 8
+// tile_n stripes; this lets the A tile stay resident in L2 across 8 N tiles
+// for the duration of one m_grp.
+//
+// CACHECTL_A / CACHECTL_B default to (0, 17) = (LRU, BYPASS_L2), matching
+// the split-barrier traits. Other (cachectl_a, cachectl_b) combos are
+// exposed as separate KIDs by the tuner.
+//
+// NUM_XCD is fixed to 8 (gfx950 = MI350); the swizzle is hard-wired to
+// N-fast inside the persistent pipeline body and does NOT take SWIZZLE_W/C
+// parameters (those belong to the HipKittens split-barrier swizzle, which
+// is a different, orthogonal optimization).
+template<int BLOCK_SIZE_,
+        typename BLOCK_,
+        typename DTYPE_,
+        typename VEC_,
+        typename TILE_,
+        typename WAVE_,
+        bool HAS_OOB_ = true,
+        int CACHECTL_A_ = 0,
+        int CACHECTL_B_ = 17>
+struct opus_gemm_a16w16_persistent_traits_gfx950 {
+    using BLOCK = opus::remove_cvref_t<BLOCK_>;
+    using DTYPE = opus::remove_cvref_t<DTYPE_>;
+    using VEC   = opus::remove_cvref_t<VEC_>;
+    using TILE  = opus::remove_cvref_t<TILE_>;
+    using WAVE  = opus::remove_cvref_t<WAVE_>;
+
+    static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
+
+    static constexpr int B_M = opus::get<0>(BLOCK{});
+    static constexpr int B_N = opus::get<1>(BLOCK{});
+    static constexpr int B_K = opus::get<2>(BLOCK{});
+
+    using D_A   = opus::tuple_element_t<0, DTYPE>;
+    using D_B   = opus::tuple_element_t<1, DTYPE>;
+    using D_C   = opus::tuple_element_t<2, DTYPE>;
+    using D_ACC = opus::tuple_element_t<3, DTYPE>;
+    static_assert(std::is_same<D_A, D_B>::value);
+
+    static constexpr bool HAS_OOB = HAS_OOB_;
+
+    static constexpr int T_M = opus::get<0>(TILE{});
+    static constexpr int T_N = opus::get<1>(TILE{});
+    static constexpr int T_K = opus::get<2>(TILE{});
+
+    static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N * T_K);
+    static_assert(T_K == 1);
+
+    static constexpr int W_M = opus::get<0>(WAVE{});
+    static constexpr int W_N = opus::get<1>(WAVE{});
+    static constexpr int W_K = opus::get<2>(WAVE{});
+
+    static constexpr int HALF_B_M = B_M / 2;
+    static constexpr int HALF_B_N = B_N / 2;
+
+    static_assert(HALF_B_M % (W_M * T_M) == 0);
+    static_assert(HALF_B_N % (W_N * T_N) == 0);
+    static_assert(B_K % (W_K * T_K) == 0);
+
+    static constexpr int E_M = HALF_B_M / (W_M * T_M);
+    static constexpr int E_N = HALF_B_N / (W_N * T_N);
+    static constexpr int E_K = B_K / (W_K * T_K);
+
+    static constexpr int VEC_A = opus::get<0>(VEC{});
+    static constexpr int VEC_B = opus::get<1>(VEC{});
+    static constexpr int VEC_C = opus::get<2>(VEC{});
+
+    static_assert(VEC_A == 16 / sizeof(D_A));
+    static constexpr int smem_linear_wave = opus::get_warp_size() * 16 / sizeof(D_A);
+    static constexpr int smem_sub = smem_linear_wave / B_K;
+    static constexpr int smem_m_rep = HALF_B_M / smem_sub;
+    static constexpr int smem_n_rep = HALF_B_N / smem_sub;
+    static constexpr int smem_padding = 2 * 16 / sizeof(D_A);
+
+    static constexpr int a_buffer_load_insts = HALF_B_M * B_K / (BLOCK_SIZE * VEC_A);
+    static constexpr int b_buffer_load_insts = HALF_B_N * B_K / (BLOCK_SIZE * VEC_B);
+    static constexpr int a_ds_read_insts = (E_M * E_K * W_M * W_K) / (opus::get_warp_size() * VEC_A);
+    static constexpr int b_ds_read_insts = (E_N * E_K * W_N * W_K) / (opus::get_warp_size() * VEC_B);
+
+    // Cache policy for A/B loads (CDNA4 ISA Table 49).
+    static constexpr int CACHECTL_A = CACHECTL_A_;
+    static constexpr int CACHECTL_B = CACHECTL_B_;
+
+    // MI350 = 8 XCDs. Persistent swizzle uses N-fast within each XCD
+    // (see kargs.num_tiles_n / kargs.m_grp_per_xcd).
+    static constexpr int NUM_XCD = 8;
+};
+
+#ifndef OPUS_GEMM_PERSISTENT_KARGS_GFX950_DEFINED
+#define OPUS_GEMM_PERSISTENT_KARGS_GFX950_DEFINED
+// Kernel arguments for the a16w16 persistent pipeline.
+//
+// Beyond the usual (M, N, K, batch, stride_*) fields this struct carries
+// three persistent-specific values that the launcher computes on the host:
+//   m_per_wg       : how many tile_m iters one WG covers in its M outer loop
+//                    (= num_tiles_m / split_m, where split_m is the WG grid
+//                    extent along M chosen by the launcher heuristic).
+//   num_tiles_n    : = grid.x (number of tile_n stripes; the in-kernel
+//                    swizzle reads this back instead of using gridDim.x).
+//   split_m        : un-padded m_grp count requested by the launcher
+//                    (= num_tiles_m / m_per_wg). Used by the kernel's
+//                    wave-uniform early-return guard for the over-shoot
+//                    WGs introduced when grid.y is padded up to a
+//                    NUM_XCD multiple (small-split_m case; no-op when
+//                    split_m % NUM_XCD == 0 so zero perf cost on the
+//                    large-M shapes the swizzle is tuned for).
+//   m_grp_per_xcd  : = ceil_div(split_m, NUM_XCD); used by the in-kernel
+//                    swizzle to compute the m_grp owned by this XCD slot.
+//                    Combined with grid.y = NUM_XCD * m_grp_per_xcd
+//                    (the padded grid the launcher uses), the swizzle
+//                    is bijective onto [0, NUM_XCD * m_grp_per_xcd).
+//
+// NOTE: persistent pipeline does NOT support bias yet (matches the original
+// mouter.cc reference); this struct intentionally omits ptr_bias /
+// stride_bias_batch to keep the kargs surface minimal.
+struct opus_gemm_persistent_kargs_gfx950 {
+    const void* __restrict__ ptr_a;
+    const void* __restrict__ ptr_b;
+    void* __restrict__ ptr_c;
+    int m;
+    int n;
+    int k;
+    int batch;
+    int stride_a;
+    int stride_b;
+    int stride_c;
+    int stride_a_batch;
+    int stride_b_batch;
+    int stride_c_batch;
+    int m_per_wg;
+    int num_tiles_n;
+    int split_m;
+    int m_grp_per_xcd;
+};
+#endif
+
 #ifndef OPUS_GEMM_FLATMM_SPLITK_KARGS_DEFINED
 #define OPUS_GEMM_FLATMM_SPLITK_KARGS_DEFINED
 // Kernel arguments for the a16w16 flatmm split-K pipeline.
