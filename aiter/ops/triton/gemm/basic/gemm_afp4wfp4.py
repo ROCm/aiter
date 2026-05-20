@@ -11,18 +11,17 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
     _gemm_afp4wfp4_kernel as _triton_gemm_afp4wfp4_kernel,
     _gemm_afp4wfp4_preshuffle_kernel as _triton_gemm_afp4wfp4_preshuffle_kernel,
     _gemm_afp4wfp4_kernel_preshuffle_scales as _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
-    _gemm_afp4wfp4_reduce_kernel as _triton_gemm_afp4wfp4_reduce_kernel,
     _get_config,
 )
 from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import (
     gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
     get_gemm_afp4wfp4_preshuffle_layouts,
 )
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.jit.utils.torch_guard import torch_compile_guard
 
-import os
-from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
+)
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
@@ -233,9 +232,10 @@ def gemm_afp4wfp4_(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _triton_gemm_afp4wfp4_reduce_kernel[grid_reduce](
+        _gemm_splitk_reduce_kernel[grid_reduce](
             y_pp,
             y,
+            None,
             M,
             N,
             y_pp.stride(0),
@@ -247,6 +247,10 @@ def gemm_afp4wfp4_(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
+            ADD_BIAS=False,
+            activation="",
+            use_activation=False,
+            KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
         )
 
     return y
@@ -388,9 +392,10 @@ def gemm_afp4wfp4_preshuffled_scales(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _triton_gemm_afp4wfp4_reduce_kernel[grid_reduce](
+        _gemm_splitk_reduce_kernel[grid_reduce](
             y_pp,
             y,
+            None,
             M,
             N,
             y_pp.stride(0),
@@ -402,6 +407,10 @@ def gemm_afp4wfp4_preshuffled_scales(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
+            ADD_BIAS=False,
+            activation="",
+            use_activation=False,
+            KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
         )
 
     return y
@@ -417,7 +426,6 @@ def gemm_afp4wfp4_preshuffle(
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
-    use_aot: Optional[bool] = True,
     skip_reduce: Optional[bool] = False,
 ) -> torch.Tensor:
     """
@@ -550,57 +558,28 @@ def gemm_afp4wfp4_preshuffle(
         )
         return y
 
-    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_triton_gemm_afp4wfp4_preshuffle_kernel.fn.__name__}_M={M_POW2}-N={N}-K={K_elems}"
-    if use_aot and os.path.exists(metadata_pth):
-        with AOTMetadataContext(
-            _triton_gemm_afp4wfp4_preshuffle_kernel.fn.__name__,
-            f"{metadata_pth}",
-        ):
-            _triton_gemm_afp4wfp4_preshuffle_kernel[grid](
-                x_fp4,
-                w_preshuf,
-                y if config["NUM_KSPLIT"] == 1 else y_pp,
-                x_scales,
-                w_scales,
-                M,
-                N,
-                K_elems,
-                x_fp4.stride(0),
-                x_fp4.stride(1),
-                w_preshuf.stride(0),
-                w_preshuf.stride(1),
-                0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-                y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-                y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-                x_scales.stride(0),
-                x_scales.stride(1),
-                w_scales.stride(0),
-                w_scales.stride(1),
-                **config,
-            )
-    else:
-        _triton_gemm_afp4wfp4_preshuffle_kernel[grid](
-            x_fp4,
-            w_preshuf,
-            y if config["NUM_KSPLIT"] == 1 else y_pp,
-            x_scales,
-            w_scales,
-            M,
-            N,
-            K_elems,
-            x_fp4.stride(0),
-            x_fp4.stride(1),
-            w_preshuf.stride(0),
-            w_preshuf.stride(1),
-            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-            x_scales.stride(0),
-            x_scales.stride(1),
-            w_scales.stride(0),
-            w_scales.stride(1),
-            **config,
-        )
+    _triton_gemm_afp4wfp4_preshuffle_kernel[grid](
+        x_fp4,
+        w_preshuf,
+        y if config["NUM_KSPLIT"] == 1 else y_pp,
+        x_scales,
+        w_scales,
+        M,
+        N,
+        K_elems,
+        x_fp4.stride(0),
+        x_fp4.stride(1),
+        w_preshuf.stride(0),
+        w_preshuf.stride(1),
+        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+        x_scales.stride(0),
+        x_scales.stride(1),
+        w_scales.stride(0),
+        w_scales.stride(1),
+        **config,
+    )
 
     if return_y_pp:
         return y_pp
@@ -616,9 +595,10 @@ def gemm_afp4wfp4_preshuffle(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _triton_gemm_afp4wfp4_reduce_kernel[grid_reduce](
+        _gemm_splitk_reduce_kernel[grid_reduce](
             y_pp,
             y,
+            None,
             M,
             N,
             y_pp.stride(0),
@@ -630,6 +610,10 @@ def gemm_afp4wfp4_preshuffle(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
+            ADD_BIAS=False,
+            activation="",
+            use_activation=False,
+            KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
         )
 
     return y
@@ -643,7 +627,6 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
-    use_aot: Optional[bool] = True,
 ):
     """
     This this a backward-compatible API and will be deprecated in future release
@@ -651,7 +634,7 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
     _LOGGER.info(
         "gemm_afp4wfp4_preshuffled_weight_scales will be deprecated in future AITER release, please switch to gemm_afp4wfp4_preshuffle"
     )
-    return gemm_afp4wfp4_preshuffle(x, w, x_scales, w_scales, dtype, y, config, use_aot)
+    return gemm_afp4wfp4_preshuffle(x, w, x_scales, w_scales, dtype, y, config)
 
 
 if __name__ == "__main__":
