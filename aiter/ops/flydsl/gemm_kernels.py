@@ -79,6 +79,12 @@ HGEMM_MAX_SPLIT_K = 13
 KERNEL_CONFIG_VARIANTS = (
     {
         "block_m_warps": 1,
+        "block_n_warps": 1,
+        "block_k_warps": 2,
+        "b_to_lds": False,
+    },
+    {
+        "block_m_warps": 1,
         "block_n_warps": 2,
         "block_k_warps": 1,
         "b_to_lds": False,
@@ -112,6 +118,12 @@ KERNEL_CONFIG_VARIANTS = (
         "block_n_warps": 2,
         "block_k_warps": 2,
         "b_to_lds": False,
+    },
+    {
+        "block_m_warps": 1,
+        "block_n_warps": 1,
+        "block_k_warps": 2,
+        "b_to_lds": True,
     },
     {
         "block_m_warps": 1,

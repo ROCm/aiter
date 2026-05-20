@@ -155,6 +155,7 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         split_k=config["split_k"],
         block_m_warps=config["block_m_warps"],
         block_n_warps=config["block_n_warps"],
+        block_k_warps=config["block_k_warps"],
         n_tile_repeat=config.get("n_tile_repeat", 1),
         persistent_n_tiles=config.get("persistent_n_tiles", 1),
         waves_per_eu=config.get("waves_per_eu", 0),
