@@ -32,14 +32,31 @@ def flydsl_kernel_name(
     tile_k: int,
     mode: str = "",
     sort_block_m: int = 0,
+    quant_type: str = "",
 ) -> str:
-    """Construct kernel name: ``flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{mode}][_sbm{S}]``."""
+    """Construct kernel name: ``flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{qtag}][_{mode}][_sbm{S}]``.
+
+    quant_type: optional quantization type tag (e.g. "per_1x128" → "qbs" for blockscale).
+    """
     name = f"flydsl_moe{stage}_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
+    qtag = _quant_type_tag(quant_type)
+    if qtag:
+        name += f"_{qtag}"
     if mode:
         name += f"_{mode}"
     if sort_block_m > 0 and sort_block_m != tile_m:
         name += f"_sbm{sort_block_m}"
     return name
+
+
+def _quant_type_tag(quant_type: str) -> str:
+    """Map quant_type string to short kernel-name tag. Empty for unspecified."""
+    if not quant_type:
+        return ""
+    q = quant_type.lower()
+    if q == "per_1x128" or q == "per_128x128":
+        return "qbs"  # block-scale (FP8 a8w8 blockscale MoE)
+    return ""
 
 
 def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
@@ -261,6 +278,103 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_blockscale(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for FP8 a8w8 blockscale stage1 configs.
+
+    Routed by triple (a_dtype="fp8", b_dtype="fp8", quant_type="per_1x128").
+    Search space focuses on tile sizes compatible with ScaleBlockN=128.
+    tile_m=16 is included so token<=8 shapes can pack tighter waves with
+    split-K and beat ASM 1-stage variants on very small M.
+    """
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "fp8"
+    quant_type = "per_1x128"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128, 256]
+    k_batches = [1, 2, 3, 4, 5, 6, 7, 8]
+    waves_per_eus = [2, 3, 4]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for kb in k_batches:
+                    for wpe in waves_per_eus:
+                        name = flydsl_kernel_name(
+                            1, a_dtype, b_dtype, out_dtype, tm, tn, tk,
+                            quant_type=quant_type,
+                        )
+                        if kb != 1:
+                            name += f"_kb{kb}"
+                        if wpe != 2:
+                            name += f"_w{wpe}"
+                        kernels[name] = {
+                            "stage": 1,
+                            "a_dtype": a_dtype,
+                            "b_dtype": b_dtype,
+                            "out_dtype": out_dtype,
+                            "tile_m": tm,
+                            "tile_n": tn,
+                            "tile_k": tk,
+                            "MPerBlock": tm,
+                            "k_batch": kb,
+                            "waves_per_eu": wpe,
+                            "quant_type": quant_type,
+                        }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_blockscale(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for FP8 a8w8 blockscale stage2 configs.
+
+    Stage2 has no split-K (atomic-accumulates into out directly), so we only
+    sweep tile sizes and waves_per_eu. tile_m=16 helps tiny-batch tokens that
+    don't fill a tile_m=32 wave; tile_n=256 cuts the model_dim n-tile count in
+    half (model_dim=7168 -> 28 instead of 56 tiles).
+    """
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "fp8"
+    quant_type = "per_1x128"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128, 256]
+    waves_per_eus = [2, 3]
+
+    # Two accumulation modes:
+    #   "atomic": bf16 atomic_add into out — cheap memory, contention scales with M.
+    #   "reduce": write into a [token, topk, model_dim] staging buffer (no atomics),
+    #            then torch.sum across topk. Wins on large tokens where atomic
+    #            contention dominates stage2 latency.
+    modes = ("atomic", "reduce")
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for wpe in waves_per_eus:
+                    for mode in modes:
+                        name = flydsl_kernel_name(
+                            2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode,
+                            quant_type=quant_type,
+                        )
+                        if wpe != 2:
+                            name += f"_w{wpe}"
+                        kernels[name] = {
+                            "stage": 2,
+                            "a_dtype": a_dtype,
+                            "b_dtype": b_dtype,
+                            "out_dtype": out_dtype,
+                            "tile_m": tm,
+                            "tile_n": tn,
+                            "tile_k": tk,
+                            "mode": mode,
+                            "MPerBlock": tm,
+                            "waves_per_eu": wpe,
+                            "quant_type": quant_type,
+                        }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
@@ -272,6 +386,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+    # FP8 a8w8 blockscale (per_1x128/per_128x128) configs.
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_blockscale(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_blockscale(out))
 
 
 _register_all_configs()
@@ -302,8 +420,35 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    quant_type: str = "",
 ):
-    """Compile stage1 kernel (cached via underlying lru_cache)."""
+    """Compile stage1 kernel (cached via underlying lru_cache).
+
+    quant_type: optional quantization tag. When (a_dtype, b_dtype, quant_type)
+    == ("fp8", "fp8", "per_1x128") route to the blockscale stage1 kernel.
+    """
+    # FP8 a8w8 blockscale MoE (per-128x128 weight blocks + per-token-group-128 activation).
+    if (
+        a_dtype == "fp8"
+        and b_dtype == "fp8"
+        and quant_type.lower() in ("per_1x128", "per_128x128")
+    ):
+        from .kernels.moe_blockscale_2stage import compile_moe_blockscale_gemm1
+
+        return compile_moe_blockscale_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            scale_block_k=128,
+            out_dtype=out_dtype,
+            waves_per_eu=waves_per_eu,
+            k_batch=k_batch,
+        )
     if b_dtype == "fp4":
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
         from .moe_common import GateMode
@@ -383,8 +528,36 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    waves_per_eu: int = 2,
+    quant_type: str = "",
 ):
-    """Compile stage2 kernel (cached via underlying lru_cache)."""
+    """Compile stage2 kernel (cached via underlying lru_cache).
+
+    quant_type: optional quantization tag. When (a_dtype, b_dtype, quant_type)
+    == ("fp8", "fp8", "per_1x128") route to the blockscale stage2 kernel.
+    """
+    # FP8 a8w8 blockscale MoE (matches stage1 dispatch).
+    if (
+        a_dtype == "fp8"
+        and b_dtype == "fp8"
+        and quant_type.lower() in ("per_1x128", "per_128x128")
+    ):
+        from .kernels.moe_blockscale_2stage import compile_moe_blockscale_gemm2
+
+        return compile_moe_blockscale_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            scale_block_k=128,
+            out_dtype=out_dtype,
+            accumulate=accumulate,
+            waves_per_eu=waves_per_eu,
+        )
     if b_dtype == "fp4":
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
@@ -661,6 +834,170 @@ def _get_compiled_swiglu(inter_dim: int):
     return build_swiglu_and_mul_module(inter_dim)
 
 
+# ────────────────────────────────────────────────────────────────────────
+# FP8 a8w8 blockscale path (per_1x128/per_128x128) — internal helpers.
+# Routed by the (a_dtype, b_dtype, quant_type) triplet in `flydsl_moe_stage1/2`.
+# ────────────────────────────────────────────────────────────────────────
+
+
+def _flydsl_moe_stage1_blockscale(
+    *,
+    a: torch.Tensor,
+    w1: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    out: Optional[torch.Tensor],
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    out_dtype: str,
+    w1_scale: Optional[torch.Tensor],
+    a1_scale: Optional[torch.Tensor],
+    sorted_weights: Optional[torch.Tensor],
+    k_batch: int,
+    waves_per_eu: int,
+    E: int,
+    inter_dim: int,
+    model_dim: int,
+    token_num: int,
+) -> torch.Tensor:
+    """FP8 a8w8 blockscale stage1.
+
+    Inputs (caller pre-quantizes):
+        a:          [token_num, model_dim] fp8 (quantized)
+        a1_scale:   [nblk_k, token_num] f32 (transposed; flat view OK)
+        w1:         [E, 2*inter_dim, model_dim] fp8 (preshuffled, same layout as
+                    `FlyDSL.kernels.moe_blockscale_2stage` expects)
+        w1_scale:   [E, 2*inter_dim/128, nblk_k] f32 (flat view OK)
+
+    Output:
+        out: [token_num, topk, inter_dim] f16/bf16 (silu(gate) * up applied).
+
+    Split-K: when k_batch > 1, an internal [tokens, topk, 2*inter] bf16 buffer
+    accumulates gate/up partials via bf16 atomic add; `silu_and_mul` then writes
+    the final output (post-silu).
+    """
+    if a1_scale is None or w1_scale is None:
+        raise ValueError("blockscale stage1 requires a1_scale and w1_scale")
+    if out_dtype not in ("f16", "fp16", "bf16"):
+        raise ValueError(f"blockscale stage1 only supports f16/bf16, got {out_dtype!r}")
+
+    dev = a.device
+    dtypes = _get_dtypes()
+    torch_out_dtype = dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
+
+    flat_a_scale = a1_scale.view(-1)
+    flat_w_scale = w1_scale.view(-1)
+    sw = (
+        sorted_weights
+        if sorted_weights is not None
+        else torch.empty(0, device=dev, dtype=torch.float32)
+    )
+
+    size_expert_ids = sorted_expert_ids.shape[0]
+    stream = torch.cuda.current_stream()
+    _is_splitk = k_batch > 1
+
+    if _is_splitk:
+        # Split-K: stage1 writes f16/bf16 partials via atomic add into a zeroed
+        # `[token, topk, 2*inter]` buffer; silu_and_mul then writes the final
+        # output. Partials dtype = out_dtype so silu_and_mul reduces in-place
+        # (silu_and_mul requires input/output dtype match).
+        if out is None:
+            out = torch.empty(
+                (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
+            )
+        elif out.dtype != torch_out_dtype:
+            raise ValueError(
+                f"blockscale stage1 split-K requires out.dtype={torch_out_dtype}, "
+                f"got out.dtype={out.dtype} (caller should match out_dtype={out_dtype!r})"
+            )
+
+        tmp_out = torch.zeros(
+            (token_num, topk, inter_dim * 2), dtype=torch_out_dtype, device=dev
+        )
+        _splitk_compile_out_dtype = "bf16" if out_dtype == "bf16" else "f16"
+        exe = compile_flydsl_moe_stage1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=False,
+            a_dtype="fp8",
+            b_dtype="fp8",
+            out_dtype=_splitk_compile_out_dtype,
+            k_batch=k_batch,
+            waves_per_eu=waves_per_eu,
+            quant_type="per_1x128",
+        )
+        exe(
+            tmp_out.view(-1),
+            a.view(-1),
+            w1,
+            flat_a_scale,
+            flat_w_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            token_num,
+            inter_dim,
+            model_dim,
+            size_expert_ids,
+            stream,
+        )
+
+        from aiter.ops.activation import silu_and_mul
+
+        silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+        return out
+
+    if out is None:
+        out = torch.empty(
+            (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
+        )
+
+    # Non-splitk: kernel fuses silu(gate)*up directly into `out`.
+    exe = compile_flydsl_moe_stage1(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage1=sorted_weights is not None,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        out_dtype=out_dtype if out_dtype != "fp16" else "f16",
+        k_batch=1,
+        waves_per_eu=waves_per_eu,
+        quant_type="per_1x128",
+    )
+    exe(
+        out.view(-1),
+        a.view(-1),
+        w1,
+        flat_a_scale,
+        flat_w_scale,
+        sorted_token_ids,
+        sorted_expert_ids,
+        sw,
+        num_valid_ids,
+        token_num,
+        inter_dim,
+        model_dim,
+        size_expert_ids,
+        stream,
+    )
+    return out
+
+
 # Public API
 
 
@@ -696,6 +1033,7 @@ def flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    quant_type: str = "",
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -724,6 +1062,36 @@ def flydsl_moe_stage1(
 
     if a_dtype == "fp4":
         model_dim = model_dim * 2
+
+    # ── FP8 a8w8 blockscale path (per_1x128/per_128x128) ──────────────────
+    # Dispatch on the (a_dtype, b_dtype, quant_type) triplet; no new dtype string.
+    if (
+        a_dtype == "fp8"
+        and b_dtype == "fp8"
+        and quant_type.lower() in ("per_1x128", "per_128x128")
+    ):
+        return _flydsl_moe_stage1_blockscale(
+            a=a,
+            w1=w1,
+            sorted_token_ids=sorted_token_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+            out=out,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            out_dtype=out_dtype,
+            w1_scale=w1_scale,
+            a1_scale=a1_scale,
+            sorted_weights=sorted_weights,
+            k_batch=k_batch,
+            waves_per_eu=waves_per_eu,
+            E=E,
+            inter_dim=inter_dim,
+            model_dim=model_dim,
+            token_num=token_num,
+        )
 
     _need_fp4 = out_dtype == "fp4"
     _need_fp8 = out_dtype == "fp8"
@@ -1040,6 +1408,8 @@ def flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     bias: Optional[torch.Tensor] = None,
+    waves_per_eu: int = 2,
+    quant_type: str = "",
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1063,6 +1433,19 @@ def flydsl_moe_stage2(
 
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
+
+    _is_blockscale = (
+        a_dtype == "fp8"
+        and b_dtype == "fp8"
+        and quant_type.lower() in ("per_1x128", "per_128x128")
+    )
+    if _is_blockscale:
+        if a2_scale is None or w2_scale is None:
+            raise ValueError("blockscale stage2 requires a2_scale and w2_scale")
+        if out_dtype not in ("f16", "fp16", "bf16"):
+            raise ValueError(
+                f"blockscale stage2 only supports f16/bf16, got {out_dtype!r}"
+            )
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
     if out is None:
@@ -1171,6 +1554,8 @@ def flydsl_moe_stage2(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        waves_per_eu=waves_per_eu,
+        quant_type=quant_type,
     )
     _run_compiled(exe, args)
 
