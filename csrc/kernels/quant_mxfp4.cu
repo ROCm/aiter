@@ -11,12 +11,28 @@
 namespace aiter {
 
 // Scale rounding modes for MXFP4 quantization.
-// Ref: Quark/quark/torch/quantization/utils.py (RoundMode enum)
-//      Quark/quark/torch/kernel/mx/triton.py  (_compute_quant_and_scale)
+// Names follow AMD Quark's RoundMode for AMD-side familiarity. Each value is
+// 1:1 mathematically equivalent to a PyTorch torchao ScaleCalculationMode
+// (see csrc/kernels/quant.md "Cross-Stack Mode Alignment Reference"):
+//   Quark RoundMode (this enum) <-> torchao ScaleCalculationMode
+//   RoundDown                   <-> FLOOR
+//   RoundUp                     <-> RCEIL
+//   Even                        <-> EVEN
+//   Ceil                        <-> CEIL    (no Quark equivalent)
+// Ref: Quark/quark/torch/quantization/utils.py     (RoundMode enum)
+//      Quark/quark/torch/kernel/mx/triton.py        (_compute_quant_and_scale)
+//      torchao/prototype/mx_formats/config.py       (ScaleCalculationMode)
+//      torchao/prototype/mx_formats/mx_tensor.py    (_to_mx_rceil and friends)
 enum class MxFp4RoundMode : int {
-    RoundDown = 0, // OCP standard: floor_pow2(amax) / 4. ~37% max clipping.
-    RoundUp   = 1, // DSv4 Pro : ceil_pow2(amax / 6). 0% clipping.
-    Even      = 2, // Quark EVEN: round_pow2_1.75(amax) / 4. ~21% max clipping.
+    RoundDown = 0, // OCP / NV ROUND_DOWN / torchao FLOOR:
+                   //   scale = floor_pow2(amax) / 4. ~37% max clipping.
+    RoundUp   = 1, // NV / DSv4 Pro / FlashInfer / torchao RCEIL:
+                   //   scale = ceil_pow2(amax / 6). 0% max clipping. (industry default)
+    Even      = 2, // Quark EVEN / torchao EVEN:
+                   //   scale = round_pow2_1.75(amax) / 4. ~21% max clipping.
+    Ceil      = 3, // torchao CEIL (no Quark / NV equivalent):
+                   //   scale = ceil_pow2(amax) / 4. 0% max clipping but
+                   //   coarser grid than RoundUp on [2^k, 1.5*2^k).
 };
 
 #define EVEN_ROUND_FP32_SIGN_EXP_MASK 0x7F800000u
@@ -129,10 +145,10 @@ void quant_mxfp4_kernel(
     uint8_t biased_exp;
 
     if constexpr (rmode == MxFp4RoundMode::RoundDown) {
-        dequant_scale = aiter::fp4_f32_to_e8m0_scale(group_max);
+        dequant_scale = aiter::fp4_f32_to_e8m0_scale_ocp(group_max);
         biased_exp    = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
     } else if constexpr (rmode == MxFp4RoundMode::RoundUp) {
-        dequant_scale = aiter::fp4_f32_to_e8m0_scale_roundup(group_max);
+        dequant_scale = aiter::fp4_f32_to_e8m0_scale(group_max);
         biased_exp    = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
     } else if constexpr (rmode == MxFp4RoundMode::Even) {
         max_bits          = (max_bits + EVEN_ROUND_VAL_TO_ADD) & EVEN_ROUND_FP32_SIGN_EXP_MASK;
@@ -142,6 +158,12 @@ void quant_mxfp4_kernel(
         scale_unbiased       = fminf(fmaxf(scale_unbiased, -127.0f), 127.0f);
         dequant_scale        = exp2f(scale_unbiased);
         biased_exp           = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
+    } else if constexpr (rmode == MxFp4RoundMode::Ceil) {
+        // torchao CEIL: ceil_pow2(amax) / 4. Same as RoundDown but bumps the
+        // exponent by 1 whenever any mantissa bit is set, so scale is the
+        // smallest power-of-two >= amax/4 (vs. RoundDown's largest pow2 <= amax/4).
+        dequant_scale = aiter::fp4_f32_to_e8m0_scale_ceil(group_max);
+        biased_exp    = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
     }
 
     u8x16_t packed;
@@ -241,8 +263,11 @@ void quant_mxfp4(
     AITER_CHECK(out_packed.is_contiguous(), __func__, " expected out_packed to be contiguous");
     AITER_CHECK(out_scale.is_contiguous(), __func__, " expected out_scale to be contiguous");
     AITER_CHECK(group_size == 32, __func__, " expected group_size=32");
-    AITER_CHECK(round_mode >= 0 && round_mode <= 2, __func__,
-                " round_mode must be 0 (RoundDown/OCP), 1 (RoundUp/DSv4 Pro), or 2 (Even/Quark)");
+    AITER_CHECK(round_mode >= 0 && round_mode <= 3, __func__,
+                " round_mode must be 0 (RoundDown / torchao FLOOR), "
+                "1 (RoundUp / torchao RCEIL), "
+                "2 (Even / torchao EVEN), or "
+                "3 (Ceil / torchao CEIL)");
     AITER_CHECK(!(e8m0_shuffle && a16w4_shuffle),
                 __func__, " e8m0_shuffle and a16w4_shuffle are mutually exclusive");
     AITER_CHECK(!shuffle_weight || e8m0_shuffle || a16w4_shuffle,
@@ -285,6 +310,8 @@ void quant_mxfp4(
                 MXFP4_DISPATCH(scalar_t, MxFp4RoundMode::RoundUp); break;
             case MxFp4RoundMode::Even:
                 MXFP4_DISPATCH(scalar_t, MxFp4RoundMode::Even); break;
+            case MxFp4RoundMode::Ceil:
+                MXFP4_DISPATCH(scalar_t, MxFp4RoundMode::Ceil); break;
             }
         });
 }

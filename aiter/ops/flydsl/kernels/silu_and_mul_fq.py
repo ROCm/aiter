@@ -125,6 +125,8 @@ def build_silu_and_mul_fq_module(
         c256_i32 = arith.constant(256, type=i32)
         c0xFF800000_i32 = arith.constant(0xFF800000, type=i32)
         c0x400000_i32 = arith.constant(0x400000, type=i32)
+        c0x7FFFFF_i32 = arith.constant(0x7FFFFF, type=i32)  # f32 mantissa mask
+        c0xFF_i32 = arith.constant(0xFF, type=i32)  # e8m0 exponent mask
         c0x7FFFFFFF_i32 = arith.constant(0x7FFFFFFF, type=i32)
         c0x80000000_i32 = arith.constant(0x80000000, type=i32)
         c0x3F800000_i32 = arith.constant(0x3F800000, type=i32)  # 1.0f
@@ -132,6 +134,8 @@ def build_silu_and_mul_fq_module(
         c0x4A800000_i32 = arith.constant(0x4A800000, type=i32)
         c0xC11FFFFF_i32 = arith.constant(0xC11FFFFF, type=i32)
         c0x7_i32 = arith.constant(0x7, type=i32)
+        # 1.0f / 6.0f ? 0.16666666 fp32 bits (used for FP4 ceil_pow2(amax/6) scale).
+        c0x3E2AAAAB_i32 = arith.constant(0x3E2AAAAB, type=i32)
         c0_f32 = arith.constant(0.0, type=f32)
         c1_f32 = arith.constant(1.0, type=f32)
         c_headroom_i32 = arith.constant(_fp_headroom, type=i32)
@@ -343,12 +347,37 @@ def build_silu_and_mul_fq_module(
                             peer = local_max.shuffle_xor(off, c64_i32)
                             local_max = arith.maximumf(local_max, peer)
 
-                        max_i32_v = local_max.bitcast(i32)
-                        # Match fp4_utils.f32_to_e8m0(max_abs / 4): round the
-                        # exponent at the 1.5x threshold before dropping mantissa.
-                        max_rounded = (max_i32_v + c0x400000_i32) & c0xFF800000_i32
-                        exp_field = max_rounded >> c23_i32
-                        e8m0_biased = arith.maxsi(exp_field - c_headroom_i32, c0_i32)
+                        if const_expr(_need_fp4):
+                            # NV ROUND_UP / DSv4 Pro / FlashInfer (industry default):
+                            # scale = ceil_pow2(max_abs / 6).  0% max-value clipping.
+                            # Matches fp4_utils.f32_to_e8m0_ceil(max_abs / 6) and HIP
+                            # aiter::fp4_f32_to_e8m0_scale.
+                            inv6_f32 = c0x3E2AAAAB_i32.bitcast(f32)
+                            amax_div6 = local_max * inv6_f32
+                            amax_div6_i32 = amax_div6.bitcast(i32)
+                            mantissa = amax_div6_i32 & c0x7FFFFF_i32
+                            exp_field_raw = (amax_div6_i32 >> c23_i32) & c0xFF_i32
+                            mant_nonzero = arith.cmpi(
+                                CmpIPredicate.ne, mantissa, c0_i32
+                            )
+                            exp_field = arith.select(
+                                mant_nonzero,
+                                exp_field_raw + c1_i32,
+                                exp_field_raw,
+                            )
+                            e8m0_biased = arith.maxsi(exp_field, c0_i32)
+                        else:
+                            # FP8 path: round_pow2_1.5(max_abs) / 2^headroom (Group D).
+                            # Bumps exponent when mantissa >= 0.5*2^k (1.5x threshold),
+                            # giving 0% max-value clipping for fp8 representation.
+                            # Matches the legacy aiter behavior used pre-PR; not the
+                            # OCP floor that ``f32_to_e8m0`` Python helper now does.
+                            max_i32_v = local_max.bitcast(i32)
+                            max_rounded = (max_i32_v + c0x400000_i32) & c0xFF800000_i32
+                            exp_field = max_rounded >> c23_i32
+                            e8m0_biased = arith.maxsi(
+                                exp_field - c_headroom_i32, c0_i32
+                            )
                         quant_exp = c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << c23_i32).bitcast(f32)
 

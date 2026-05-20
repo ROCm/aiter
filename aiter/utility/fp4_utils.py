@@ -47,11 +47,98 @@ def mxfp4_to_f32(x):
 
 
 def f32_to_e8m0(x):
+    """Floor pow2 of x, encoded as E8M0.
+
+    OCP RoundDown / torchao FLOOR semantics. Caller passes ``amax / dtypeMax``
+    and the result is ``floor_pow2(amax) / dtypeMax``. NaN/Inf preserved as 0xFF.
+
+    Cross-stack equivalence (caller controls divisor):
+      - ``f32_to_e8m0(amax / 4)`` == OCP RoundDown == torchao FLOOR (FP4 default)
+      - ``f32_to_e8m0(amax / 256)`` is the FP8 e4m3 sibling used by some
+        per-block FP8 quant helpers in :mod:`aiter.ops.quant`.
+    """
     u32 = x.view(torch.int32)
     exponent = ((u32 >> 23) & 0xFF).view(torch.uint32).to(torch.uint8)
     nan_case = exponent == 0xFF
     exponent[nan_case] = 0xFF
     return exponent.view(dtypes.fp8_e8m0)
+
+
+def f32_to_e8m0_ceil(x):
+    """Ceil pow2 of x, encoded as E8M0.
+
+    NV ROUND_UP / DSv4 Pro / FlashInfer / torchao RCEIL semantics. For MXFP4
+    the canonical use is ``f32_to_e8m0_ceil(amax / 6)`` (FP4 max normal = 6.0),
+    which evaluates to ``ceil_pow2(amax / 6)`` and guarantees 0% max-value
+    clipping; passing ``amax / 4`` instead reproduces torchao's ``CEIL`` mode
+    (a coarser, divisor-4 ceil-pow2). NaN/Inf preserved as 0xFF.
+
+    Cross-stack equivalence (caller controls divisor):
+      - ``f32_to_e8m0_ceil(amax / 6)`` == NV ROUND_UP   == torchao RCEIL
+      - ``f32_to_e8m0_ceil(amax / 4)`` ==                  torchao CEIL
+    """
+    u32 = x.view(torch.int32)
+    exponent = ((u32 >> 23) & 0xFF).view(torch.uint32).to(torch.uint8)
+    nan_case = exponent == 0xFF
+    # Bump exponent up by 1 if any mantissa bit is set, but not for NaN/Inf
+    # (exponent == 0xFF) and never roll past 0xFF.
+    mantissa_nonzero = (u32 & 0x7FFFFF) != 0
+    nonmax_exp = exponent < 0xFF
+    bump = mantissa_nonzero & nonmax_exp
+    exponent = torch.where(bump, exponent + 1, exponent)
+    exponent[nan_case] = 0xFF
+    return exponent.view(dtypes.fp8_e8m0)
+
+
+# ---------------------------------------------------------------------------
+# Aliases mirroring PyTorch torchao's ScaleCalculationMode names. The four
+# mode names FLOOR / RCEIL / CEIL / EVEN come from
+# torchao/prototype/mx_formats/config.py::ScaleCalculationMode and are 1:1
+# mathematically equivalent to aiter's MxFp4RoundMode (Quark naming):
+#
+#   torchao FLOOR  <-> Quark / aiter RoundDown
+#   torchao RCEIL  <-> Quark / aiter RoundUp     <-- industry default
+#   torchao CEIL   <-> aiter Ceil  (no Quark name)
+#   torchao EVEN   <-> Quark / aiter Even
+#
+# Provided so callers porting code from torchao can use familiar names.
+# See csrc/kernels/quant.md "Cross-Stack Mode Alignment Reference" for the
+# full table.
+# ---------------------------------------------------------------------------
+f32_to_e8m0_floor = f32_to_e8m0
+
+
+def f32_to_e8m0_rceil(amax: Tensor, max_pos: float = 6.0) -> Tensor:
+    """torchao RCEIL: ``ceil_pow2(amax / max_pos)`` encoded as E8M0.
+
+    Equivalent to ``f32_to_e8m0_ceil(amax / max_pos)``. The default
+    ``max_pos = 6.0`` matches FP4 (E2M1) and reproduces NV ROUND_UP /
+    DSv4 / FlashInfer; pass ``max_pos = 448.0`` for FP8 e4m3.
+    """
+    return f32_to_e8m0_ceil(amax / max_pos)
+
+
+def f32_to_e8m0_torchao_ceil(amax: Tensor, max_pow2: float = 4.0) -> Tensor:
+    """torchao CEIL: ``ceil_pow2(amax / max_pow2)`` encoded as E8M0.
+
+    Equivalent to ``f32_to_e8m0_ceil(amax / max_pow2)``. The default
+    ``max_pow2 = 4.0`` matches FP4 (the largest pow-2 <= FP4 max normal
+    of 6.0). 0% max-value clipping but coarser grid than ``f32_to_e8m0_rceil``.
+    """
+    return f32_to_e8m0_ceil(amax / max_pow2)
+
+
+def f32_to_e8m0_even(amax: Tensor, max_pow2: float = 4.0) -> Tensor:
+    """torchao EVEN / Quark EVEN: ``round_pow2_1.75(amax) / max_pow2`` encoded as E8M0.
+
+    Implementation matches the +0x200000 mantissa bump used by
+    ``aiter/utility/fp4_utils.py::_dynamic_mxfp4_quant_kernel_asm_layout``,
+    AMD Quark's EVEN mode, and torchao's ``ScaleCalculationMode.EVEN``.
+    """
+    u32 = amax.view(torch.int32)
+    rounded = (u32 + 0x200000) & 0xFF800000
+    rounded_f = rounded.view(torch.float32)
+    return f32_to_e8m0(rounded_f / max_pow2)
 
 
 def e8m0_to_f32(scale_e8m0_biased):

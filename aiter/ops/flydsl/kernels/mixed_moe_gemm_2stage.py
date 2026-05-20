@@ -126,7 +126,7 @@ def compile_mixed_moe_gemm1(
     is large, so each CTA is already compute-heavy. persist_m>1 serializes M blocks
     that the GPU can process in parallel.
 
-    gate_mode controls the gate/up computation strategy — see GateMode enum.
+    gate_mode controls the gate/up computation strategy -- see GateMode enum.
     """
     gpu_arch = get_hip_arch()
     allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem0")
@@ -2207,6 +2207,10 @@ def compile_mixed_moe_gemm1(
                 _c256_i32 = arith.constant(256, type=T.i32)
                 _c0xFF800000_i32 = arith.constant(0xFF800000, type=T.i32)
                 _c0x400000_i32 = arith.constant(0x400000, type=T.i32)
+                _c0x7FFFFF_i32 = arith.constant(
+                    0x7FFFFF, type=T.i32
+                )  # f32 mantissa mask
+                _c0xFF_i32 = arith.constant(0xFF, type=T.i32)  # e8m0 exponent mask
                 _c0x7FFFFFFF_i32 = arith.constant(0x7FFFFFFF, type=T.i32)
                 _c0x80000000_i32 = arith.constant(0x80000000, type=T.i32)
                 _c0x3F800000_i32 = arith.constant(0x3F800000, type=T.i32)  # 1.0f
@@ -2215,6 +2219,8 @@ def compile_mixed_moe_gemm1(
                 _c0xC11FFFFF_i32 = arith.constant(0xC11FFFFF, type=T.i32)
                 _c0x7_i32 = arith.constant(0x7, type=T.i32)
                 _c0_f32 = arith.constant(0.0, type=T.f32)
+                # 1.0f / 6.0f ? 0.16666666 fp32 bits (FP4 ceil_pow2(amax/6) scale).
+                _c0x3E2AAAAB_i32 = arith.constant(0x3E2AAAAB, type=T.i32)
 
                 _c8_i32 = arith.constant(8, type=T.i32)
                 _fp_headroom = 2 if _need_fp4 else (8 if _need_fp8 else 0)
@@ -2275,12 +2281,37 @@ def compile_mixed_moe_gemm1(
                             peer = local_max.shuffle_xor(off, _c64_i32)
                             local_max = arith.maximumf(local_max, peer)
 
-                        max_i32 = local_max.bitcast(T.i32)
-                        # Match fp4_utils.f32_to_e8m0(max_abs / 4): round the
-                        # exponent at the 1.5x threshold before dropping mantissa.
-                        max_rounded = (max_i32 + _c0x400000_i32) & _c0xFF800000_i32
-                        exp_field = max_rounded >> _c23_i32
-                        e8m0_biased = arith.maxsi(exp_field - _c_headroom_i32, _c0_i32)
+                        if const_expr(_need_fp4):
+                            # NV ROUND_UP / DSv4 Pro / FlashInfer (industry default):
+                            # scale = ceil_pow2(max_abs / 6).  0% max-value clipping.
+                            # Matches fp4_utils.f32_to_e8m0_ceil(max_abs / 6) and HIP
+                            # aiter::fp4_f32_to_e8m0_scale.
+                            inv6_f32 = _c0x3E2AAAAB_i32.bitcast(T.f32)
+                            amax_div6 = local_max * inv6_f32
+                            amax_div6_i32 = amax_div6.bitcast(T.i32)
+                            mantissa = amax_div6_i32 & _c0x7FFFFF_i32
+                            exp_field_raw = (amax_div6_i32 >> _c23_i32) & _c0xFF_i32
+                            mant_nonzero = arith.cmpi(
+                                CmpIPredicate.ne, mantissa, _c0_i32
+                            )
+                            exp_field = arith.select(
+                                mant_nonzero,
+                                exp_field_raw + _c1_i32,
+                                exp_field_raw,
+                            )
+                            e8m0_biased = arith.maxsi(exp_field, _c0_i32)
+                        else:
+                            # FP8 path: round_pow2_1.5(max_abs) / 2^headroom (Group D).
+                            # Bumps exponent when mantissa >= 0.5*2^k (1.5x threshold),
+                            # giving 0% max-value clipping for fp8 representation.
+                            # Matches the legacy aiter behavior used pre-PR; not the
+                            # OCP floor that ``f32_to_e8m0`` Python helper now does.
+                            max_i32 = local_max.bitcast(T.i32)
+                            max_rounded = (max_i32 + _c0x400000_i32) & _c0xFF800000_i32
+                            exp_field = max_rounded >> _c23_i32
+                            e8m0_biased = arith.maxsi(
+                                exp_field - _c_headroom_i32, _c0_i32
+                            )
 
                         quant_exp = _c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << _c23_i32).bitcast(T.f32)

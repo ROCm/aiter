@@ -2,7 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from typing import Optional, Tuple
+from enum import IntEnum
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +16,32 @@ from ..utility import dtypes, fp4_utils
 from . import triton
 from .enum import ActivationType, QuantType
 from ..jit.utils.chip_info import get_cu_num
+
+
+class MxFp4RoundMode(IntEnum):
+    """FP4 (E2M1) per-block scale rounding strategy.
+
+    Names follow AMD Quark's ``RoundMode``; the equivalent PyTorch torchao
+    ``ScaleCalculationMode`` is shown in the comments. The integer values
+    match the HIP-side ``enum class MxFp4RoundMode`` in
+    ``csrc/kernels/quant_mxfp4.cu`` 1:1, so this Python enum and a bare
+    ``int`` are interchangeable -- existing callers passing ``round_mode=1``
+    keep working unchanged (``IntEnum`` instances satisfy ``isinstance(x, int)``
+    and compare equal to their integer value).
+
+    See ``csrc/kernels/quant.md`` "Cross-Stack Mode Alignment Reference" for
+    the full table mapping these to torchao / NV Triton / DSv4 / FlashInfer
+    / AMD Quark naming.
+    """
+
+    RoundDown = 0  # torchao FLOOR  (OCP / NV ROUND_DOWN)
+    RoundUp = 1  # torchao RCEIL  (NV ROUND_UP / DSv4 Pro / FlashInfer) -- DEFAULT
+    Even = 2  # torchao EVEN   (Quark EVEN)
+    Ceil = 3  # torchao CEIL   (no Quark / NV equivalent)
+
+
+# Public alias to make this importable side-by-side with QuantType / ActivationType.
+RoundModeLike = Union[int, MxFp4RoundMode]
 
 
 @compile_ops("module_smoothquant")
@@ -73,39 +100,53 @@ def pertoken_quant(
 
 
 def per_1x32_f4_quant(
-    x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False, pack_dim=-1
+    x,
+    scale=None,
+    quant_dtype=dtypes.fp4x2,
+    shuffle=False,
+    pack_dim=-1,
+    round_mode: RoundModeLike = MxFp4RoundMode.RoundUp,
 ):
-    """Quantize a tensor to MXFP4 (e2m1) format with per-1x32 block scaling.
+    """Torch reference for MXFP4 (E2M1) per-1x32 block-scale quantization.
 
-    By default, packing is along the last dimension (dim=-1), which produces
-    output suitable for ``tl.dot_scaled`` **LHS** operand:
-        A(M, K) -> fp4=(M, K//2), scale=(M, K//32)
-
-    For ``tl.dot_scaled`` **RHS** operand, set ``pack_dim=0`` so the packing
-    is along the first dimension (the K / contraction dimension):
-        B(K, N) -> fp4=(K//2, N), scale=(K//32, N)
+    Mirrors the HIP path (:func:`per_1x32_f4_quant_hip` /
+    :func:`quant_mxfp4_hip`) and the Triton path
+    (:func:`per_1x32_f4_quant_triton`); all share the E8M0 block layout and
+    the :class:`MxFp4RoundMode` enum. PyTorch equivalent:
+    ``torchao/prototype/mx_formats/{config,mx_tensor}.py``.
 
     Args:
-        x: Input tensor of shape (..., N) or (M, N).
-        scale: Pre-computed scale tensor (optional, usually None).
-        quant_dtype: Target quantized dtype, must be ``dtypes.fp4x2``.
-        shuffle: Whether to apply e8m0 scale shuffling for hardware.
-        pack_dim: Dimension along which to pack two FP4 values into one byte.
-            -1 (default): pack along the last dimension (for dot_scaled LHS).
-             0: pack along the first dimension (for dot_scaled RHS).
+        x: Input of shape ``(..., N)`` or ``(M, N)``.
+        scale: Pre-computed scale (optional, usually ``None``).
+        quant_dtype: Must be ``dtypes.fp4x2``.
+        shuffle: Apply e8m0 scale shuffling for hardware.
+        pack_dim: ``-1`` (default) packs the last dim -> ``tl.dot_scaled``
+            **LHS** ``A(M,K) -> fp4=(M,K//2), scale=(M,K//32)``;
+            ``0`` packs the first dim -> **RHS**
+            ``B(K,N) -> fp4=(K//2,N), scale=(K//32,N)``.
+        round_mode: :class:`MxFp4RoundMode` or bare ``int`` 0..3
+            (interchangeable). torchao ``ScaleCalculationMode`` mapping:
+
+            - ``RoundDown`` (0) / torchao ``FLOOR`` --
+              ``floor_pow2(amax)/4`` (OCP / NV ROUND_DOWN).
+            - ``RoundUp``   (1) / torchao ``RCEIL`` --
+              ``ceil_pow2(amax/6)``. **Default**
+              (NV ROUND_UP / DSv4 Pro / FlashInfer).
+            - ``Even``      (2) / torchao ``EVEN``  --
+              ``round_pow2_1.75(amax)/4`` (Quark EVEN; AMD Quark / SGLang
+              / vLLM QDQ default).
+            - ``Ceil``      (3) / torchao ``CEIL``  --
+              ``ceil_pow2(amax)/4``; coarser than RoundUp on
+              ``[2^k, 1.5*2^k)``.
 
     Returns:
-        Tuple of (quantized_tensor, scale_tensor).
+        ``(quantized_tensor, scale_tensor)``.
     """
     assert quant_dtype == dtypes.fp4x2
     block_size = 32
-    F8E8M0_EXP_BIAS = 127  # noqa:F841
-    F4E2M1_MAX = 6.0
-    MAX_POW2 = int(torch.log2(torch.tensor(F4E2M1_MAX, dtype=torch.float32)).item())
-    # dtypeMax = F4E2M1_MAX
-    dtypeMax = 2.0**MAX_POW2
 
-    # For pack_dim=0, transpose so packing always happens along last dim internally
+    # Internally we always pack along the last dim. For RHS layout
+    # (pack_dim=0) transpose the input here and the outputs at the end.
     transposed = False
     if pack_dim == 0:
         assert x.dim() == 2, "pack_dim=0 requires a 2D input tensor (K, N)"
@@ -118,13 +159,26 @@ def per_1x32_f4_quant(
     m, n = x.shape
     x = x.view(-1, block_size)
     max_abs = torch.amax(torch.abs(x.float()), 1)
-    # max_abs = max_abs.view(torch.int32)
-    # max_abs = ((max_abs + 0x200000) & 0xFF800000).view(torch.float32)
 
-    # fp8e8m0fnu_from_fp32_value
-    scale_e8m0_biased = fp4_utils.f32_to_e8m0(max_abs / dtypeMax)
+    # E8M0 block-scale dispatch. RoundUp uses max_pos=6 (FP4 max normal);
+    # the other three rely on max_pow2=4 (largest pow-2 <= 6) by spec.
+    # See MxFp4RoundMode docstring for cross-stack equivalences.
+    if round_mode == MxFp4RoundMode.RoundDown:
+        scale_e8m0_biased = fp4_utils.f32_to_e8m0_floor(max_abs / 4.0)
+    elif round_mode == MxFp4RoundMode.RoundUp:
+        scale_e8m0_biased = fp4_utils.f32_to_e8m0_rceil(max_abs, max_pos=6.0)
+    elif round_mode == MxFp4RoundMode.Even:
+        scale_e8m0_biased = fp4_utils.f32_to_e8m0_even(max_abs, max_pow2=4.0)
+    elif round_mode == MxFp4RoundMode.Ceil:
+        scale_e8m0_biased = fp4_utils.f32_to_e8m0_torchao_ceil(max_abs, max_pow2=4.0)
+    else:
+        raise ValueError(
+            "per_1x32_f4_quant: invalid "
+            f"round_mode={round_mode!r} (type={type(round_mode).__name__}); "
+            "expected 0 (RoundDown/FLOOR), 1 (RoundUp/RCEIL), "
+            "2 (Even), 3 (Ceil), or any MxFp4RoundMode value."
+        )
 
-    # Float8_e8m0fnu to float
     scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0_biased)
 
     y = x.float() / scale_f32.view(-1, 1)
@@ -135,7 +189,6 @@ def per_1x32_f4_quant(
         scale = fp4_utils.e8m0_shuffle(scale)
     scale = scale.view(dtypes.fp8_e8m0)
 
-    # For pack_dim=0, transpose results back: (N, K//2) -> (K//2, N)
     if transposed:
         y = y.T.contiguous()
         scale = scale.view(torch.uint8).T.contiguous().view(dtypes.fp8_e8m0)
@@ -166,7 +219,13 @@ def per_1x32_i4_quant(weight, group_size=32):
     return weight_qt, weight_scale
 
 
-def per_1x32_f4_quant_for_dot_scaled(lhs, rhs, quant_dtype=dtypes.fp4x2, shuffle=False):
+def per_1x32_f4_quant_for_dot_scaled(
+    lhs,
+    rhs,
+    quant_dtype=dtypes.fp4x2,
+    shuffle=False,
+    round_mode: RoundModeLike = MxFp4RoundMode.RoundUp,
+):
     """Convenience function: quantize both LHS and RHS for ``tl.dot_scaled``.
 
     Handles the packing dimension automatically:
@@ -179,15 +238,25 @@ def per_1x32_f4_quant_for_dot_scaled(lhs, rhs, quant_dtype=dtypes.fp4x2, shuffle
     Args:
         lhs: LHS tensor of shape (M, K).
         rhs: RHS tensor of shape (K, N).
+        round_mode: Scale rounding strategy, forwarded to
+            :func:`per_1x32_f4_quant`. Default 1 (RoundUp / torchao RCEIL).
 
     Returns:
         Tuple of (lhs_fp4, lhs_scale, rhs_fp4, rhs_scale).
     """
     lhs_fp4, lhs_scale = per_1x32_f4_quant(
-        lhs, quant_dtype=quant_dtype, shuffle=shuffle, pack_dim=-1
+        lhs,
+        quant_dtype=quant_dtype,
+        shuffle=shuffle,
+        pack_dim=-1,
+        round_mode=round_mode,
     )
     rhs_fp4, rhs_scale = per_1x32_f4_quant(
-        rhs, quant_dtype=quant_dtype, shuffle=shuffle, pack_dim=0
+        rhs,
+        quant_dtype=quant_dtype,
+        shuffle=shuffle,
+        pack_dim=0,
+        round_mode=round_mode,
     )
     return lhs_fp4, lhs_scale, rhs_fp4, rhs_scale
 
@@ -701,33 +770,78 @@ def quant_mxfp4(
 def quant_mxfp4_hip(
     x: torch.Tensor,
     group_size: int = 32,
-    round_mode: int = 0,
+    round_mode: RoundModeLike = MxFp4RoundMode.RoundUp,
     e8m0_shuffle: bool = False,
     a16w4_shuffle: bool = False,
     gate_up: bool = False,
     shuffle_weight: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """MXFP4 quantization with optional weight/scale shuffle.
+    """HIP MXFP4 (E2M1) per-1x32 block-scale quantization.
+
+    Production fast path. Numerical reference is :func:`per_1x32_f4_quant`;
+    Triton variant is :func:`per_1x32_f4_quant_triton`. The C++ kernel lives
+    in ``csrc/kernels/quant_mxfp4.cu`` and dispatches on the same
+    :class:`MxFp4RoundMode` enum. PyTorch equivalent:
+    ``torchao/prototype/mx_formats/{config,mx_tensor}.py``.
+
+    When ``round_mode == RoundUp`` and no shuffle/gate_up flags are set, this
+    routes to :func:`per_1x32_f4_quant_hip` (the default FP4 path using
+    ``fp4_f32_to_e8m0_scale = ceil_pow2(amax/6)``).
 
     Args:
-        round_mode: Scale rounding strategy (aligned with Quark RoundMode):
-            0 = RoundDown -- OCP standard: floor_pow2(amax) / 4. ~37% max clipping.
-            1 = RoundUp   --  DSv4 Pro: ceil_pow2(amax / 6).
-                             0% max clipping.
-            2 = Even      -- triton: round_pow2_1.75(amax) / 4. ~21% max clipping.
-                             gfx950 uses HW builtin (exact RNE);
-                             gfx942 uses SW fallback (round-half-away).
-        Ref: Quark/quark/torch/quantization/utils.py  (RoundMode enum)
-             Quark/quark/torch/kernel/mx/triton.py   (_compute_quant_and_scale)
+        x: Input tensor, 2D, contiguous, dtype ``float16`` or ``bfloat16``.
+        group_size: Block size along the last dim (must divide ``cols``;
+            spec = 32).
+        round_mode: :class:`MxFp4RoundMode` or bare ``int`` 0..3
+            (interchangeable). torchao ``ScaleCalculationMode`` mapping:
+
+            - ``RoundDown`` (0) / torchao ``FLOOR`` --
+              ``floor_pow2(amax)/4`` (OCP / NV ROUND_DOWN).
+            - ``RoundUp``   (1) / torchao ``RCEIL`` --
+              ``ceil_pow2(amax/6)``. **Default**
+              (NV ROUND_UP / DSv4 Pro / FlashInfer).
+            - ``Even``      (2) / torchao ``EVEN``  --
+              ``round_pow2_1.75(amax)/4`` (Quark EVEN; gfx950 uses HW
+              builtin RNE, gfx942 uses SW round-half-away).
+            - ``Ceil``      (3) / torchao ``CEIL``  --
+              ``ceil_pow2(amax)/4``; coarser than RoundUp on
+              ``[2^k, 1.5*2^k)``.
+        e8m0_shuffle: Apply HW e8m0 scale shuffling layout.
+        a16w4_shuffle: Apply A16W4 weight shuffling.
+        gate_up: Pack gate / up activations together (MoE).
+        shuffle_weight: Apply weight shuffling.
+
+    Returns:
+        ``(out_packed, out_scale)`` -- fp4 (``float4_e2m1fn_x2``) and e8m0
+        (``float8_e8m0fnu``) tensors. With ``e8m0_shuffle=True`` the scale
+        tensor is row/col-padded for the HW shuffle layout.
     """
     assert x.is_contiguous() and x.dim() == 2
     assert x.dtype in (torch.float16, torch.bfloat16)
     rows, cols = x.shape
     assert cols % group_size == 0
 
-    # RoundDown (OCP) without a16w4/gate_up/shuffle_weight ->
-    # route to dynamic_per_group_scaled_quant_fp4 (the default FP4 quant path).
-    if round_mode == 0 and not a16w4_shuffle and not gate_up and not shuffle_weight:
+    # Normalise to the raw int the C++ ``static_cast<MxFp4RoundMode>(int)``
+    # binding expects. ``MxFp4RoundMode`` is an ``IntEnum`` so this is also
+    # a no-op (and a cheap one) for callers that already pass a bare int.
+    try:
+        round_mode_int = int(round_mode)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            "quant_mxfp4_hip: invalid "
+            f"round_mode={round_mode!r} (type={type(round_mode).__name__}); "
+            "expected int in {0,1,2,3} or MxFp4RoundMode."
+        ) from e
+
+    # RoundUp (NV / DSv4 default) without a16w4/gate_up/shuffle_weight ->
+    # route to dynamic_per_group_scaled_quant_fp4 (the default FP4 quant path
+    # which uses fp4_f32_to_e8m0_scale = ceil_pow2(amax/6)).
+    if (
+        round_mode_int == MxFp4RoundMode.RoundUp
+        and not a16w4_shuffle
+        and not gate_up
+        and not shuffle_weight
+    ):
         return per_1x32_f4_quant_hip(x, shuffle=e8m0_shuffle)
 
     fp4x2 = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
@@ -752,7 +866,7 @@ def quant_mxfp4_hip(
         out_packed,
         out_scale,
         group_size,
-        round_mode,
+        round_mode_int,
         e8m0_shuffle,
         a16w4_shuffle,
         gate_up,
