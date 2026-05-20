@@ -76,104 +76,26 @@ HGEMM_TILE_K_OPTIONS = (64, 128, 256)
 HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 96, 128, 256)
 HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 14))
 HGEMM_MAX_SPLIT_K = 13
-KERNEL_CONFIG_VARIANTS = (
+HGEMM_WARP_SHAPE_OPTIONS = [
+    (wm, wn, wk) for wm, wn, wk in product([1, 2, 4], repeat=3) if wm * wn * wk <= 8
+]
+KERNEL_CONFIG_VARIANTS = [
     {
-        "block_m_warps": 1,
-        "block_n_warps": 1,
-        "block_k_warps": 2,
+        "block_m_warps": wm,
+        "block_n_warps": wn,
+        "block_k_warps": wk,
         "b_to_lds": False,
-    },
+    }
+    for wm, wn, wk in HGEMM_WARP_SHAPE_OPTIONS
+] + [
     {
-        "block_m_warps": 1,
-        "block_n_warps": 1,
-        "block_k_warps": 4,
-        "b_to_lds": False,
-    },
-    {
-        "block_m_warps": 1,
-        "block_n_warps": 2,
-        "block_k_warps": 1,
-        "b_to_lds": False,
-    },
-    {
-        "block_m_warps": 1,
-        "block_n_warps": 4,
-        "block_k_warps": 1,
-        "b_to_lds": False,
-    },
-    {
-        "block_m_warps": 2,
-        "block_n_warps": 2,
-        "block_k_warps": 1,
-        "b_to_lds": False,
-    },
-    {
-        "block_m_warps": 1,
-        "block_n_warps": 2,
-        "block_k_warps": 2,
-        "b_to_lds": False,
-    },
-    {
-        "block_m_warps": 1,
-        "block_n_warps": 4,
-        "block_k_warps": 2,
-        "b_to_lds": False,
-    },
-    {
-        "block_m_warps": 2,
-        "block_n_warps": 2,
-        "block_k_warps": 2,
-        "b_to_lds": False,
-    },
-    {
-        "block_m_warps": 1,
-        "block_n_warps": 1,
-        "block_k_warps": 2,
+        "block_m_warps": wm,
+        "block_n_warps": wn,
+        "block_k_warps": wk,
         "b_to_lds": True,
-    },
-    {
-        "block_m_warps": 1,
-        "block_n_warps": 1,
-        "block_k_warps": 4,
-        "b_to_lds": True,
-    },
-    {
-        "block_m_warps": 1,
-        "block_n_warps": 2,
-        "block_k_warps": 1,
-        "b_to_lds": True,
-    },
-    {
-        "block_m_warps": 1,
-        "block_n_warps": 4,
-        "block_k_warps": 1,
-        "b_to_lds": True,
-    },
-    {
-        "block_m_warps": 2,
-        "block_n_warps": 2,
-        "block_k_warps": 1,
-        "b_to_lds": True,
-    },
-    {
-        "block_m_warps": 1,
-        "block_n_warps": 2,
-        "block_k_warps": 2,
-        "b_to_lds": True,
-    },
-    {
-        "block_m_warps": 1,
-        "block_n_warps": 4,
-        "block_k_warps": 2,
-        "b_to_lds": True,
-    },
-    {
-        "block_m_warps": 2,
-        "block_n_warps": 2,
-        "block_k_warps": 2,
-        "b_to_lds": True,
-    },
-)
+    }
+    for wm, wn, wk in HGEMM_WARP_SHAPE_OPTIONS
+]
 
 _SPLITK_HGEMM_KERNELS: Dict[str, Dict] = {}
 
