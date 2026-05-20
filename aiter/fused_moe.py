@@ -855,6 +855,7 @@ def _flydsl_stage1_wrapper(
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
+        quant_type=parsed.get("quant_type", ""),
     )
 
 
@@ -908,6 +909,7 @@ def _flydsl_stage2_wrapper(
         model_dim_pad=model_dim_pad,
         bias=bias2,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
+        quant_type=parsed.get("quant_type", ""),
     )
 
 
@@ -1698,7 +1700,10 @@ def fused_moe_2stages(
                 num_rows=num_local_tokens,
             )
     elif hidden_states.dtype != q_dtype_a:
-        if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+        if quant_type == QuantType.per_1x128 and metadata.stage1.func in (
+            asm_stage1,
+            _flydsl_stage1_wrapper,
+        ):
             quant_func = functools.partial(quant_func, transpose_scale=True)
         a1, a1_scale = quant_func(
             hidden_states,
