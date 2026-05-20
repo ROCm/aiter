@@ -764,6 +764,18 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
         if (work_meta_data != nullptr)
         {
+            // work_meta_data[0:1] must always reflect the current work_indptr and
+            // work_info_set data_ptrs. When the caller deep-copies tensors for
+            // benchmark rotation, the copied work_meta_data retains stale pointers
+            // from the original allocation, so we refresh them unconditionally here.
+            AITER_CHECK(work_indptr != nullptr && work_info_set != nullptr,
+                        __func__, ": work_indptr and work_info_set must be provided");
+            uint64_t meta_ptrs[2] = {
+                (uint64_t)work_indptr->data_ptr(),
+                (uint64_t)work_info_set->data_ptr(),
+            };
+            hipMemcpyAsync(work_meta_data->data_ptr(), meta_ptrs, 2 * sizeof(uint64_t),
+                           hipMemcpyHostToDevice, stream);
             args.ptr_STP = work_meta_data->data_ptr();
         }
         else
