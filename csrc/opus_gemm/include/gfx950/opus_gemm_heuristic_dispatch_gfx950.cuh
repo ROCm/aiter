@@ -3,49 +3,35 @@
 //
 // a16w16 family heuristic dispatcher (gfx950).
 //
-// gfx950-specific because the kernel symbols it returns are gfx950 tile
-// sizes (e.g. 256x256x64 split-barrier, splitk 64x64x64 WG=2). Future archs
-// will have their own opus_gemm_heuristic_dispatch_<arch>.cuh next to this
-// one; the public OpusA16W16NoscaleKernel launcher signature stays
-// arch-agnostic so the arch router in opus_gemm.cu can dispatch without
-// caring about the per-arch tile choice.
+// The heuristic is the "no-tuned-CSV fallback" arm of opus_dispatch_a16w16:
+// when a runtime (M,N,K) shape has no row in opus_gemm_lookup.h, we still
+// need to pick *some* valid a16w16 kernel for it. This file defines that
+// pick as a pure ``(M,N,K) -> kid`` mapping; the caller (see
+// opus_gemm_arch_gfx950.cuh) then resolves the kid through
+// opus_a16w16_tune_dispatch_gfx950<>() against the (gen_instances.py-
+// emitted) tune lookup table.
 //
-// Split out of opus_gemm.cu so the dispatcher tree (M-bucket -> kernel)
-// has its own home and can be edited without touching the
-// opus_gemm()/opus_gemm_a16w16_tune() entry points. The runtime
-// (M,N,K)->kernel lookup map (driven by the tuned CSV) and the
-// torch-extension entry points stay in opus_gemm.cu; only the fall-
-// through heuristic and the OpusA16W16NoscaleKernel signature live
-// here.
+// Why kid integers instead of launcher symbol names?
+// ---------------------------------------------------
+// The previous version of this file returned bare ``&opus_gemm_..._wgpcu1
+// <fp32_t>`` symbols. That coupled the heuristic to specific .so symbol
+// names, which is a real problem in the subset-compile world: if a build
+// excludes the splitk-128 launcher (because the CSV doesn't ask for it
+// and the heuristic doesn't either), but the .cuh still references the
+// symbol, the link fails. By returning an integer kid here and routing
+// through the tune lookup, the only invariant is "every kid this function
+// can return must also be in the compiled subset S". That invariant is
+// enforced at *codegen* time by csrc/opus_gemm/gen_instances.py
+//   assert HEURISTIC_DEFAULT_KIDS.issubset(S)
+// using the single source of truth in opus_gemm_common.py.
 //
-// Mirrors the ck_gemm_a8w8 pattern (see csrc/ck_gemm_a8w8/gemm_a8w8.cu
-// rowwise_dispatch): first consult a compile-time (M,N,K)->kernel table
-// baked in from the opus-private tuned CSV via gen_instances.py
-// --tune_file, then fall through to this hand-written heuristic if-else
-// tree. The heuristic guarantees *some* valid kernel for every shape;
-// its choice is deliberately conservative (favor splitk for small M
-// because its host-side auto-clamp makes it alignment-tolerant, and
-// the traditional a16w16 tile for M>128 where split-barrier pipelines
-// still win throughput).
+// Keep the integer kid returns in opus_a16w16_heuristic_kid_gfx950() below
+// in sync with the HEURISTIC_DEFAULT_KIDS frozenset in
+// csrc/opus_gemm/opus_gemm_common.py. The two are coupled by intent.
 //
-// The template parameter CDataType refers to the *accumulator / dispatch*
-// type seen by the id-based tune lookup tables, NOT the user-visible Y
-// dtype. Concretely:
-//   * Traditional a16w16 kid 4..9 has both <bf16_t> and <fp32_t>
-//     instantiations; CDataType == Y dtype.
-//   * Splitk kid 200..210 only exists in <fp32_t> form (traits
-//     static_assert D_C=float). Y can be bf16 or fp32 -- the reduce
-//     kernel (splitk_reduce_kernel) is templated on D_OUT and chosen at
-//     launch time based on Y.dtype(), so the same <fp32_t> main-kernel
-//     instantiation feeds both output dtypes.
-//
-// Therefore:
-//   * Y == bf16: any kid; splitk instances must be specialized on
-//     <fp32_t> despite Y being bf16 (this is exactly what
-//     opus_gemm_a16w16_tune does -- see OPUS_SPLITK_KID_MIN routing).
-//   * Y == fp32: any kid; splitk instances are again specialized on
-//     <fp32_t>, and the reduce kernel writes fp32 directly without
-//     casting.
+// gfx950-specific because the choices below were profiled on MI350's
+// 256-CU / 160 KB LDS budget. Future archs will have their own
+// opus_gemm_heuristic_dispatch_<arch>.cuh next to this one.
 #pragma once
 
 #include <optional>
@@ -79,13 +65,22 @@ using OpusA16W16NoscaleKernel = void (*)(
     aiter_tensor_t &, aiter_tensor_t &,
     aiter_tensor_t &, std::optional<aiter_tensor_t>, int);
 
-// Single template body shared by both bf16 and fp32 specializations.
-// All splitk kids are forced to <fp32_t> (their main kernel only has the
-// fp32_t instantiation; the reduce kernel D_OUT is selected at launch
-// time based on Y.dtype()). split-barrier kid 9 follows CDataType.
-template <typename CDataType>
-inline OpusA16W16NoscaleKernel opus_a16w16_heuristic_dispatch_gfx950(
-    int M, int N, int K, int /*batch*/)
+
+// Pure (M, N, K, has_bias) -> integer kid mapping. No reference to launcher
+// symbols here -- the caller resolves the returned kid through
+// opus_a16w16_tune_dispatch_gfx950<CDataType>(kid).
+//
+// IMPORTANT: every kid this function can return MUST also be in
+// HEURISTIC_DEFAULT_KIDS in csrc/opus_gemm/opus_gemm_common.py, so
+// the subset-compile codegen always includes them in S.
+//
+// `has_bias` matters because the persistent / kspl pipelines do not yet
+// implement HAS_BIAS=true; when the user passes a non-empty bias the
+// heuristic must stay on the bias-aware splitk family even if the M-bucket
+// would otherwise return a persistent kid. Splitk kids 200/206/208 (+
+// nooob mirrors) are all bias-aware (see opus_kid_supports_bias in
+// opus_gemm.cu and BIAS_AWARE_KIDS in opus_gemm_common.py).
+inline int opus_a16w16_heuristic_kid_gfx950(int M, int N, int K, bool has_bias = false)
 {
   const bool split_barrier_ok =
       (N % 16 == 0) && (K % 64 == 0) && ((K / 64) % 2 == 0);
@@ -93,32 +88,40 @@ inline OpusA16W16NoscaleKernel opus_a16w16_heuristic_dispatch_gfx950(
   if (M <= 4)
   {
     // Extremely skinny M: cc recommends (64,64,128) WG=1 for deep K.
+    // kid 208 (oob) / 1208 (nooob): a16w16_flatmm_splitk_64x64x128_wgpcu1.
     if ((M % 64 == 0) && (N % 64 == 0) && (K % 128 == 0))
-      return opus_gemm_flatmm_splitk_256x64x64x128_2x1_16x16x32_0x0x0_wgpcu1_nooob<fp32_t>;
-    return opus_gemm_flatmm_splitk_256x64x64x128_2x1_16x16x32_0x0x0_wgpcu1<fp32_t>;
+      return 1208;
+    return 208;
   }
   if (M <= 64)
   {
     // Mid-skinny: cc-recommended medium-M kernel (64,32,128) WG=2.
+    // kid 206 (oob) / 1206 (nooob): a16w16_flatmm_splitk_64x32x128_wgpcu2.
     if ((M % 64 == 0) && (N % 32 == 0) && (K % 128 == 0))
-      return opus_gemm_flatmm_splitk_256x64x32x128_2x1_16x16x32_0x0x0_wgpcu2_nooob<fp32_t>;
-    return opus_gemm_flatmm_splitk_256x64x32x128_2x1_16x16x32_0x0x0_wgpcu2<fp32_t>;
+      return 1206;
+    return 206;
   }
   if (M <= 128)
   {
     // Sweet spot: (64,64,64) WG=2.
+    // kid 200 (oob) / 1200 (nooob): a16w16_flatmm_splitk_64x64x64_wgpcu2.
     if ((M % 64 == 0) && (N % 64 == 0) && (K % 64 == 0))
-      return opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2_nooob<fp32_t>;
-    return opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2<fp32_t>;
+      return 1200;
+    return 200;
   }
   // M > 128
-  if (split_barrier_ok)
+  if (split_barrier_ok && !has_bias)
   {
+    // Persistent (256, 256, 64) tile; CDataType-templated by caller.
+    // kid 300 (oob) / 1300 (nooob). Persistent does not yet support bias --
+    // when has_bias is true we fall through to the splitk path below.
     if ((M % 256 == 0) && (N % 256 == 0) && (K % 64 == 0))
-      return opus_gemm_512x256x256x64_2x4_16x16x32_0x0x0_nooob<CDataType>;
-    return opus_gemm_512x256x256x64_2x4_16x16x32_0x0x0<CDataType>;
+      return 1300;
+    return 300;
   }
+  // M > 128 but split-barrier prerequisites failed (or bias requested) --
+  // fall back to the splitk sweet-spot tile. Splitk supports bias.
   if ((M % 64 == 0) && (N % 64 == 0) && (K % 64 == 0))
-    return opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2_nooob<fp32_t>;
-  return opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2<fp32_t>;
+    return 1200;
+  return 200;
 }

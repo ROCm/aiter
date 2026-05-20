@@ -66,13 +66,13 @@ OpusNoscaleKernel opus_dispatch_a8w8(int M, int N, int K)
 // one extra `case` in each router below.
 
 template <typename CDataType>
-OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch)
+OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch, bool has_bias = false)
 {
   switch (opus_get_gfx_arch())
   {
     case OpusGfxArch::Gfx950:
-      return opus_dispatch_a16w16_gfx950<CDataType>(M, N, K, batch);
-    // future: case OpusGfxArch::Gfx942: return opus_dispatch_a16w16_gfx942<CDataType>(M, N, K, batch);
+      return opus_dispatch_a16w16_gfx950<CDataType>(M, N, K, batch, has_bias);
+    // future: case OpusGfxArch::Gfx942: return opus_dispatch_a16w16_gfx942<CDataType>(M, N, K, batch, has_bias);
     default:
     {
       const auto &info = opus_get_arch_info();
@@ -173,13 +173,14 @@ void opus_gemm(
     // only split-barrier 4..9 and a16w16_flatmm_splitk 200..299 ever
     // appear), so a non-empty bias is always safe at this entry.
     int batch = XQ.size(0);
+    const bool has_bias = bias.has_value();
     if (Y.dtype() == AITER_DTYPE_bf16)
     {
-      opus_dispatch_a16w16<bf16_t>(M, N, K, batch)(XQ, WQ, Y, bias, 0);
+      opus_dispatch_a16w16<bf16_t>(M, N, K, batch, has_bias)(XQ, WQ, Y, bias, 0);
     }
     else if (Y.dtype() == AITER_DTYPE_fp32)
     {
-      opus_dispatch_a16w16<fp32_t>(M, N, K, batch)(XQ, WQ, Y, bias, 0);
+      opus_dispatch_a16w16<fp32_t>(M, N, K, batch, has_bias)(XQ, WQ, Y, bias, 0);
     }
     else
     {
@@ -209,10 +210,22 @@ void opus_gemm(
 static constexpr int OPUS_SPLITK_KID_MIN = 200;
 static constexpr int OPUS_SPLITK_KID_MAX = 300;
 // Split-barrier a16w16 kids live in [4, 10) with non-OOB variants at [1004, 1010).
+// Cpol variants (3 cache-policy groups) live at +2000/+3000/+4000 offsets.
 static constexpr int OPUS_A16W16_SB_KID_MIN = 4;
 static constexpr int OPUS_A16W16_SB_KID_MAX = 10;
+// Persistent a16w16 kids: compact [300, 316) = 4 tiles × 4 cpol groups.
+// Nooob mirrors at +1000 = [1300, 1316). See opus_gemm_common.py
+// :: a16w16_persistent_kernels_list / _cpol / _nooob / _cpol_nooob
+// for the per-kid (tile, cpol) layout.
+static constexpr int OPUS_PERSISTENT_KID_MIN = 300;
+static constexpr int OPUS_PERSISTENT_KID_MAX = 316;
 // non-OOB kid offset
 static constexpr int OPUS_NOOOB_KID_OFFSET = 1000;
+// Experimental K-split (kspl) DEMO kids: parallel to persistent.
+// Single tile / cpol today; range [2300, 2316) reserves room for future
+// sweep. Not in heuristic dispatch; tune-only.
+static constexpr int OPUS_KSPL_KID_MIN = 2300;
+static constexpr int OPUS_KSPL_KID_MAX = 2316;
 
 static inline bool opus_kid_is_splitk(int kid)
 {
@@ -223,13 +236,40 @@ static inline bool opus_kid_is_splitk(int kid)
 
 static inline bool opus_kid_is_a16w16_sb(int kid)
 {
-  return (kid >= OPUS_A16W16_SB_KID_MIN && kid < OPUS_A16W16_SB_KID_MAX) ||
-         (kid >= OPUS_A16W16_SB_KID_MIN + OPUS_NOOOB_KID_OFFSET &&
-          kid < OPUS_A16W16_SB_KID_MAX + OPUS_NOOOB_KID_OFFSET);
+  // Split-barrier a16w16 kid layout (see opus_gemm_common.py):
+  //   base legacy:        [4, 10)
+  //   nooob mirror:       [1004, 1010)
+  //   cpol Mheavy:        [2004, 2010)
+  //   cpol Nheavy:        [3004, 3010)
+  //   cpol balanced:      [4004, 4010)
+  //   cpol Mheavy nooob:  [5004, 5010)
+  //   cpol Nheavy nooob:  [6004, 6010)
+  //   cpol balanced nooob:[7004, 7010)
+  for (int base : {0, 1000, 2000, 3000, 4000, 5000, 6000, 7000})
+  {
+    if (kid >= base + OPUS_A16W16_SB_KID_MIN && kid < base + OPUS_A16W16_SB_KID_MAX)
+      return true;
+  }
+  return false;
+}
+
+static inline bool opus_kid_is_persistent(int kid)
+{
+  return (kid >= OPUS_PERSISTENT_KID_MIN && kid < OPUS_PERSISTENT_KID_MAX) ||
+         (kid >= OPUS_PERSISTENT_KID_MIN + OPUS_NOOOB_KID_OFFSET &&
+          kid < OPUS_PERSISTENT_KID_MAX + OPUS_NOOOB_KID_OFFSET);
+}
+
+static inline bool opus_kid_is_kspl(int kid)
+{
+  return (kid >= OPUS_KSPL_KID_MIN && kid < OPUS_KSPL_KID_MAX) ||
+         (kid >= OPUS_KSPL_KID_MIN + OPUS_NOOOB_KID_OFFSET &&
+          kid < OPUS_KSPL_KID_MAX + OPUS_NOOOB_KID_OFFSET);
 }
 
 static inline bool opus_kid_supports_bias(int kid)
 {
+  // persistent and kspl do not yet support bias (kargs lacks ptr_bias/stride_bias_batch).
   return opus_kid_is_a16w16_sb(kid) || opus_kid_is_splitk(kid);
 }
 
