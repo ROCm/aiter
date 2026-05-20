@@ -1,7 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+import json
+import os
 from dataclasses import dataclass, field
 from typing import List
+
+# Legacy cache policy = traits default for split-barrier & persistent
+# a16w16 (see opus_gemm_traits_a16w16_gfx950.cuh).
+# Instances carrying this exact (cachectl_a, cachectl_b) tuple are
+# treated as "the baseline" and emit the bare .so symbol with NO
+# `_cA0cB17` suffix; see OpusGemmInstance.name.
+_LEGACY_CACHECTL = (0, 17)
 
 
 @dataclass
@@ -50,16 +59,49 @@ class OpusGemmInstance:
         elif self.kernel_tag == "a16w16_flatmm_splitk":
             parts.insert(1, "flatmm_splitk")
             parts.append(f"wgpcu{self.WG_PER_CU}")
+        elif self.kernel_tag == "a16w16_persistent":
+            parts.insert(1, "persistent")
+        elif self.kernel_tag == "a16w16_kspl":
+            parts.insert(1, "kspl")
         if not self.has_oob:
             parts.append("nooob")
-        if self.cachectl_a >= 0 or self.cachectl_b >= 0:
+        # Legacy cache policy = traits default for split-barrier &
+        # persistent a16w16: CACHECTL_A=0 (LRU), CACHECTL_B=17
+        # (BYPASS_L2). When a kid carries this exact policy, suppress
+        # the `_cA0cB17` suffix so the emitted .so symbol stays
+        # bit-identical to the pre-cpol baseline. This keeps:
+        #   * opus_gemm_heuristic_dispatch_gfx950.cuh hardcoded symbol
+        #     names (line 118-119) resolvable;
+        #   * aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv
+        #     `kernelName` column unchanged for legacy 4..9 winners
+        #     (80 rows in production).
+        # C++ side, `Traits<..., 0, 17>` and `Traits<...>` (with traits
+        # defaults `CACHECTL_A_=0, CACHECTL_B_=17`) are ODR-equivalent
+        # template specializations and produce one and only one
+        # instantiation, so the legacy and explicit forms are
+        # bit-identical in the compiled .so.
+        if (self.cachectl_a, self.cachectl_b) != _LEGACY_CACHECTL and (
+            self.cachectl_a >= 0 or self.cachectl_b >= 0
+        ):
             parts.append(f"cA{self.cachectl_a}cB{self.cachectl_b}")
         return "_".join(parts)
 
 
-def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True):
+def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, cachectl_a=0, cachectl_b=17):
+    """Factory for a16w16 split-barrier kid instances.
+
+    cachectl_a / cachectl_b default to (0, 17) = (LRU, BYPASS_L2), which
+    matches the traits-default cache policy for the split-barrier pipeline
+    (see opus_gemm_a16w16_traits_gfx950 in
+    csrc/opus_gemm/include/gfx950/opus_gemm_traits_a16w16_gfx950.cuh).
+    This is the "legacy" policy used by KID 4..9 and 1004..1009 — the
+    `_LEGACY_CACHECTL` special-case in OpusGemmInstance.name keeps these
+    kids emitting the bare `..._0x0x0` symbol (no `_cA0cB17` suffix) so
+    the production heuristic dispatcher and the opus tuned CSV stay
+    bit-compatible.
+    """
     vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
-    return OpusGemmInstance(
+    inst = OpusGemmInstance(
         bs,
         bm,
         bn,
@@ -79,6 +121,9 @@ def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True):
         ["fp32_t", "bf16_t"],
         has_oob=has_oob,
     )
+    inst.cachectl_a = cachectl_a
+    inst.cachectl_b = cachectl_b
+    return inst
 
 
 def _a16w16_flatmm_splitk(bm, bn, bk, wg_per_cu, has_oob=True):
@@ -223,10 +268,14 @@ a16w16_flatmm_splitk_kernels_list = {
 
 # non-OOB variants: kid + 1000, same tile but HAS_OOB=false.
 # Only valid when shape is tile-aligned (M%B_M==N%B_N==K%B_K==0).
+# Explicitly inherits cachectl from the parent so the legacy (0, 17)
+# policy is propagated; the _LEGACY_CACHECTL special-case in name
+# keeps the .so symbol bare (`..._nooob`, no `_cA0cB17`).
 a16w16_kernels_list_nooob = {
     kid + 1000: _a16w16(
         inst.BLOCK_SIZE, inst.B_M, inst.B_N, inst.B_K,
         inst.T_N, inst.W_M, inst.W_N, inst.W_K, has_oob=False,
+        cachectl_a=inst.cachectl_a, cachectl_b=inst.cachectl_b,
     )
     for kid, inst in a16w16_kernels_list.items()
 }
@@ -269,6 +318,131 @@ a16w16_flatmm_splitk_kernels_list_nooob = {
     for kid, inst in a16w16_flatmm_splitk_kernels_list.items()
 }
 
+# ── a16w16 persistent (M-outer + N-fast XCD swizzle) ──────────────────────
+#
+# Pipeline:
+#   csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh
+# Traits:
+#   csrc/opus_gemm/include/gfx950/opus_gemm_traits_a16w16_gfx950.cuh
+#   :: opus_gemm_a16w16_persistent_traits_gfx950
+#
+# Compact KID layout:
+#   kid = 300 + cpol_group * 6 + tile_idx
+#     cpol_group: 0=legacy (0,17), 1=Mheavy (1,17), 2=Nheavy (17,1), 3=balanced (0,0)
+#     tile_idx:   0..5 (see _PERSISTENT_TILES below)
+#   nooob mirror at +1000: kid range [1300, 1324).
+#
+# Total: 6 tile × 4 cpol × {has_oob, nooob} = 48 kid.
+#
+# Persistent kernel locks BLOCK_SIZE=512, T_M=2, T_N=4, MFMA 16x16x32
+# (matches the standalone reference gemm_a16w16_8wave_mouter.cc).
+
+
+def _a16w16_persistent(bm, bn, bk, has_oob=True,
+                       cachectl_a=0, cachectl_b=17):
+    vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
+    inst = OpusGemmInstance(
+        512,         # BLOCK_SIZE
+        bm, bn, bk,  # BLOCK
+        2, 4,        # T_M, T_N
+        16, 16, 32,  # W_M, W_N, W_K  (MFMA 16x16x32)
+        vec, vec, 4, # VEC
+        0, 0, 0,     # GROUP (unused for persistent)
+        "a16w16_persistent",
+        ["bf16_t", "fp32_t"],
+        has_oob=has_oob,
+    )
+    inst.cachectl_a = cachectl_a
+    inst.cachectl_b = cachectl_b
+    return inst
+
+
+# 4-tile sweep, all B_K=64. The ra/rb LDS read layout in the shared
+# split-barrier traits enforces B_K == T_N * W_K / 2 = 4 * 32 / 2 = 64
+# (see _validate_a16w16 in csrc/opus_gemm/gen_instances.py), so other
+# B_K values are not currently representable on the T_M=2, T_N=4,
+# W_K=32 axis we lock for persistent. Shallow/deep-K variants would
+# require a different T_N or W_K axis -- left as future work.
+_PERSISTENT_TILES = [
+    # (B_M, B_N, B_K)
+    (256, 256, 64),  # tile 0: mouter default; 32K×2K×7K best 1208 TFLOPS
+    (128, 256, 64),  # tile 1: narrow M
+    (256, 128, 64),  # tile 2: narrow N
+    (128, 128, 64),  # tile 3: small
+]
+
+# Legacy (300..303): cachectl == (0, 17). Same as traits default, so the
+# _LEGACY_CACHECTL special-case in OpusGemmInstance.name suppresses the
+# `_cA0cB17` suffix and the emitted .so symbol is just
+# `opus_gemm_persistent_512x..._0x0x0`.
+a16w16_persistent_kernels_list = {
+    300 + i: _a16w16_persistent(bm, bn, bk)
+    for i, (bm, bn, bk) in enumerate(_PERSISTENT_TILES)
+}
+
+# Cpol variants (304..315): 3 groups × 4 tiles, mirroring _CACHECTL_CONFIGS
+# but with a single compact base offset per cpol group. Each emitted .so
+# carries its `_cA*cB*` suffix.
+_PERSISTENT_CPOL_GROUPS = [
+    # (base_kid, cachectl_a, cachectl_b)
+    (304,  1, 17),   # Mheavy
+    (308, 17,  1),   # Nheavy
+    (312,  0,  0),   # balanced
+]
+a16w16_persistent_kernels_list_cpol = {}
+for _base, _ca, _cb in _PERSISTENT_CPOL_GROUPS:
+    for i, (bm, bn, bk) in enumerate(_PERSISTENT_TILES):
+        a16w16_persistent_kernels_list_cpol[_base + i] = _a16w16_persistent(
+            bm, bn, bk, cachectl_a=_ca, cachectl_b=_cb
+        )
+
+# Nooob mirrors at +1000 for both legacy (1300..1305) and cpol (1306..1323).
+# Explicit cachectl inheritance keeps name() consistent with parents.
+a16w16_persistent_kernels_list_nooob = {
+    kid + 1000: _a16w16_persistent(
+        inst.B_M, inst.B_N, inst.B_K, has_oob=False,
+        cachectl_a=inst.cachectl_a, cachectl_b=inst.cachectl_b,
+    )
+    for kid, inst in a16w16_persistent_kernels_list.items()
+}
+a16w16_persistent_kernels_list_cpol_nooob = {
+    kid + 1000: _a16w16_persistent(
+        inst.B_M, inst.B_N, inst.B_K, has_oob=False,
+        cachectl_a=inst.cachectl_a, cachectl_b=inst.cachectl_b,
+    )
+    for kid, inst in a16w16_persistent_kernels_list_cpol.items()
+}
+
+# ─── a16w16 K-split (kspl) DEMO ──────────────────────────────────────────────
+# Experimental wave-producer pipeline parallel to persistent. KID 2300 only
+# (single tile, single cpol, has_oob). Not in heuristic dispatch; tune-only.
+# Not yet exhaustively tile-sweep'd; intent is to A/B vs persistent KID 300.
+
+
+def _a16w16_kspl(bm, bn, bk, has_oob=True, cachectl_a=0, cachectl_b=17):
+    vec = 16 // 2
+    inst = OpusGemmInstance(
+        512,         # BLOCK_SIZE
+        bm, bn, bk,  # BLOCK
+        2, 4,        # T_M, T_N
+        16, 16, 32,  # W_M, W_N, W_K
+        vec, vec, 4, # VEC
+        0, 0, 0,     # GROUP (unused)
+        "a16w16_kspl",
+        ["bf16_t", "fp32_t"],
+        has_oob=has_oob,
+    )
+    inst.cachectl_a = cachectl_a
+    inst.cachectl_b = cachectl_b
+    return inst
+
+
+a16w16_kspl_kernels_list = {
+    # KID 2300 = K-split demo, 256x256x64, has_oob, legacy cachectl.
+    2300: _a16w16_kspl(256, 256, 64),
+}
+
+
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
     **a8w8_scale_kernels_list,
@@ -280,6 +454,11 @@ kernels_list = {
     **a16w16_flatmm_kernels_list,
     **a16w16_flatmm_splitk_kernels_list,
     **a16w16_flatmm_splitk_kernels_list_nooob,
+    **a16w16_persistent_kernels_list,
+    **a16w16_persistent_kernels_list_cpol,
+    **a16w16_persistent_kernels_list_nooob,
+    **a16w16_persistent_kernels_list_cpol_nooob,
+    **a16w16_kspl_kernels_list,
 }
 
 default_kernels_dict = {
@@ -288,3 +467,93 @@ default_kernels_dict = {
     (-3): _a16w16(512, 256, 256, 64, 4, 16, 16, 32),  # same as a16w16 #9
 }
 # fmt: on
+
+
+# =============================================================================
+# Subset-compile kid taxonomy (consumed by gen_instances.py for the
+# `HEURISTIC_DEFAULT_KIDS ⊆ S` assert + the per-pipeline classifier sets).
+#
+# These are pure data constants -- no tuner / runtime logic lives here. The
+# tune-time helpers (candidate_kids_for_shape, candidate_splitK,
+# kid_rejects_shape, kid_rejects_bias, _ensure_kids_compiled, ...) live in
+# csrc/opus_gemm/opus_gemm_tune.py and are imported by gradlib's GemmTuner
+# and the debug-only opus_gemm_tune.py main entry from there.
+# =============================================================================
+
+# Splitk kids: a16w16_flatmm_splitk pipeline (kid 200..223 + nooob mirror).
+# These are bias-aware. They are the only kids that consume a literal `splitK`
+# KBatch argument.
+SPLITK_KIDS = frozenset(a16w16_flatmm_splitk_kernels_list.keys()) | frozenset(
+    a16w16_flatmm_splitk_kernels_list_nooob.keys()
+)
+
+# Non-splitk a16w16-family kids: split-barrier 4..9 + cpol/nooob mirrors,
+# persistent 300..315 + cpol/nooob mirrors, kspl 2300.
+# Note: persistent / kspl currently do NOT support bias.
+NON_SPLITK_KIDS = (
+    frozenset(a16w16_kernels_list.keys())
+    | frozenset(a16w16_kernels_list_nooob.keys())
+    | frozenset(a16w16_kernels_list_cpol.keys())
+    | frozenset(a16w16_kernels_list_cpol_nooob.keys())
+    | frozenset(a16w16_persistent_kernels_list.keys())
+    | frozenset(a16w16_persistent_kernels_list_cpol.keys())
+    | frozenset(a16w16_persistent_kernels_list_nooob.keys())
+    | frozenset(a16w16_persistent_kernels_list_cpol_nooob.keys())
+    | frozenset(a16w16_kspl_kernels_list.keys())
+)
+
+# Bias-aware kids: split-barrier (4..9 + cpol/nooob mirrors) and the entire
+# splitk family. Persistent / kspl are excluded because their launchers
+# currently reject any non-empty bias up front.
+BIAS_AWARE_KIDS = (
+    frozenset(a16w16_kernels_list.keys())
+    | frozenset(a16w16_kernels_list_nooob.keys())
+    | frozenset(a16w16_kernels_list_cpol.keys())
+    | frozenset(a16w16_kernels_list_cpol_nooob.keys())
+    | SPLITK_KIDS
+)
+
+# Heuristic-dispatch fallback kids (gfx950). MUST match the integer returns
+# of opus_a16w16_heuristic_kid_gfx950() in
+# csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh.
+# These kids MUST always be in the subset-compile set S, otherwise heuristic
+# fallback for an unbaked (M,N,K) shape will fail at runtime with
+# `AITER_CHECK: Kernel id X not found in a16w16 tune lookup table`.
+#
+# gen_instances.py asserts HEURISTIC_DEFAULT_KIDS.issubset(S) before writing
+# the sidecar, so any drift here vs the C++ side surfaces at codegen time
+# rather than at runtime.
+HEURISTIC_DEFAULT_KIDS = frozenset(
+    {
+        # splitk fallback (small M / non-aligned big M)
+        200,
+        1200,  # cc tile 0: (64, 64, 64) WG=2
+        206,
+        1206,  # cc tile 6: (64, 32, 128) WG=2
+        208,
+        1208,  # cc tile 8: (64, 64, 128) WG=1
+        # persistent fallback (large M, tile-aligned)
+        300,
+        1300,  # persistent (256, 256, 64)
+        # K-split DEMO (experimental, opt-in via explicit kid).
+        2300,  # kspl (256, 256, 64), has_oob, legacy cachectl
+    }
+)
+
+
+def _opus_sidecar_path():
+    """Return the on-disk path of the subset-compile sidecar.
+
+    Lives in ``{bd_dir}/`` (one level above the per-module build dir) so
+    it survives ``aiter.jit.core.clear_build("module_deepgemm_opus")`` --
+    which ``build_module()`` calls when ``AITER_REBUILD == 1`` -- and is
+    therefore the canonical "what kids should be in the next .so" source
+    that ``gen_instances.py`` consumes. The tuner expands this sidecar
+    BEFORE triggering the rebuild; if it lived inside the build dir,
+    clear_build would wipe it out before gen_instances could read it.
+    """
+    # Import lazily to avoid circular import at module load (aiter imports
+    # opus_gemm_common, opus_gemm_common imports aiter.jit.core).
+    from aiter.jit.core import bd_dir
+
+    return os.path.join(bd_dir, "compiled_kids_opus.json")

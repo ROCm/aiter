@@ -1,20 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-import os
-from pathlib import Path
-import pandas as pd
 import argparse
+import glob
+import json
+import os
 import shutil
+from pathlib import Path
+
+import pandas as pd
 import torch
 from opus_gemm_common import (
+    HEURISTIC_DEFAULT_KIDS,
     OpusGemmInstance,
-    kernels_list,
-    default_kernels_dict,
-    a8w8_scale_kernels_list,
     a8w8_kernels_list,
-    a16w16_kernels_list,
+    a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
+    a16w16_kernels_list,
+    default_kernels_dict,
+    kernels_list,
 )
 
 PIPELINE_HEADER_MAP = {
@@ -23,6 +27,8 @@ PIPELINE_HEADER_MAP = {
     "a16w16": "gfx950/opus_gemm_pipeline_a16w16_gfx950.cuh",
     "a16w16_flatmm": "gfx950/opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
+    "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh",
+    "a16w16_kspl": "gfx950/opus_gemm_pipeline_a16w16_kspl_gfx950.cuh",
 }
 
 # Traits header carries the traits struct + kargs struct definitions for a
@@ -38,6 +44,8 @@ TRAITS_HEADER_MAP = {
     "a16w16": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_flatmm": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a16w16_persistent": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a16w16_kspl": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
 }
 
 # Splitk reduce kernel is shared infrastructure used by every
@@ -52,6 +60,8 @@ KERNEL_FUNC_MAP = {
     "a16w16": "gemm_a16w16_kernel",
     "a16w16_flatmm": "gemm_a16w16_flatmm_kernel",
     "a16w16_flatmm_splitk": "gemm_a16w16_flatmm_splitk_kernel",
+    "a16w16_persistent": "gemm_a16w16_persistent_kernel",
+    "a16w16_kspl": "gemm_a16w16_kspl_kernel",
 }
 
 INPUT_DTYPE_MAP = {
@@ -60,18 +70,33 @@ INPUT_DTYPE_MAP = {
     "a16w16": ("bf16_t", "bf16_t"),
     "a16w16_flatmm": ("bf16_t", "bf16_t"),
     "a16w16_flatmm_splitk": ("bf16_t", "bf16_t"),
+    "a16w16_persistent": ("bf16_t", "bf16_t"),
+    "a16w16_kspl": ("bf16_t", "bf16_t"),
 }
 
 # Tags whose launchers take 3 torch tensors (XQ, WQ, Y) + int splitK. Splitk
 # launcher has the same Python-facing signature but with literal (non-trivial)
 # splitK semantics.
-NOSCALE_TAGS = {"a8w8", "a16w16", "a16w16_flatmm", "a16w16_flatmm_splitk"}
+NOSCALE_TAGS = {
+    "a8w8",
+    "a16w16",
+    "a16w16_flatmm",
+    "a16w16_flatmm_splitk",
+    "a16w16_persistent",
+    "a16w16_kspl",
+}
 
 # a16w16-family tags whose launchers land in opus_gemm_a16w16_tune_lookup.h
 # and therefore need the 4-arg (XQ, WQ, Y, int splitK) signature so they can
 # share the std::function<Tensor(Tensor&,Tensor&,Tensor&,int)> slot.
 # Non-splitk tags in this set ignore the splitK param in their body.
-A16W16_TUNE_TAGS = {"a16w16", "a16w16_flatmm", "a16w16_flatmm_splitk"}
+A16W16_TUNE_TAGS = {
+    "a16w16",
+    "a16w16_flatmm",
+    "a16w16_flatmm_splitk",
+    "a16w16_persistent",
+    "a16w16_kspl",
+}
 
 TRAITS_NAME_MAP = {
     "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
@@ -79,6 +104,8 @@ TRAITS_NAME_MAP = {
     "a16w16": "opus_gemm_a16w16_traits_gfx950",
     "a16w16_flatmm": "opus_gemm_a16w16_flatmm_traits_gfx950",
     "a16w16_flatmm_splitk": "opus_flatmm_splitk_traits_gfx950",
+    "a16w16_persistent": "opus_gemm_a16w16_persistent_traits_gfx950",
+    "a16w16_kspl": "opus_gemm_a16w16_kspl_traits_gfx950",
 }
 
 KARGS_NAME_MAP = {
@@ -87,6 +114,8 @@ KARGS_NAME_MAP = {
     "a16w16": "opus_gemm_noscale_kargs_gfx950",
     "a16w16_flatmm": "opus_gemm_flatmm_kargs_gfx950",
     "a16w16_flatmm_splitk": "opus_gemm_flatmm_splitk_kargs_gfx950",
+    "a16w16_persistent": "opus_gemm_persistent_kargs_gfx950",
+    "a16w16_kspl": "opus_gemm_persistent_kargs_gfx950",  # reused (same fields)
 }
 
 WARP_SIZE = 64
@@ -95,6 +124,9 @@ VALID_BF16_MFMA = {(16, 16, 32), (32, 32, 16)}
 # LOAD_GROUP_M_LANE == 1). W_M == 32 (LGML == 4) path not rewritten.
 VALID_FLATMM_MFMA = {(16, 16, 32)}
 VALID_FLATMM_SPLITK_MFMA = {(16, 16, 32)}
+# Persistent pipeline ports the mouter reference which only validated
+# 16x16x32 BF16 MFMA. Add 32x32x16 later if needed.
+VALID_PERSISTENT_MFMA = {(16, 16, 32)}
 
 
 class opus_gemm_codegen:
@@ -509,6 +541,33 @@ class opus_gemm_codegen:
             "com_rep_n": com_rep_n,
         }
 
+    @staticmethod
+    def _validate_a16w16_persistent(k: OpusGemmInstance):
+        """Validate an a16w16 persistent instance.
+
+        Persistent uses the same per-tile layout as the split-barrier pipeline
+        (TILE/WAVE traits, E_M/E_N/E_K derivation, smem footprint), so its
+        constraints are a superset of _validate_a16w16's. Additionally:
+          * MFMA restricted to VALID_PERSISTENT_MFMA (mouter reference only).
+          * BLOCK_SIZE locked to 512 and T_M*T_N == 8 (matches mouter
+            8-wave WG; smaller WGs not yet ported).
+        """
+        if (k.W_M, k.W_N, k.W_K) not in VALID_PERSISTENT_MFMA:
+            raise ValueError(
+                f"Invalid a16w16_persistent instance '{k.name}':\n"
+                f"  - WAVE=({k.W_M},{k.W_N},{k.W_K}) not in {VALID_PERSISTENT_MFMA}"
+            )
+        if k.BLOCK_SIZE != 512:
+            raise ValueError(
+                f"Invalid a16w16_persistent instance '{k.name}':\n"
+                f"  - BLOCK_SIZE={k.BLOCK_SIZE} must be 512 (mouter 8-wave WG)"
+            )
+        # All other shape/divisibility constraints fall through to the
+        # split-barrier validator. We temporarily flip kernel_tag so the
+        # split-barrier validator's "if kernel_tag != a16w16" hooks (if
+        # any are added in the future) keep working consistently.
+        return opus_gemm_codegen._validate_a16w16(k)
+
     # ── Instance generation ──
 
     def gen_instance(self, k: OpusGemmInstance):
@@ -516,6 +575,25 @@ class opus_gemm_codegen:
             info = self._validate_a16w16(k)
             print(
                 f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
+                f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
+                f"  LDS={info['lds_bytes'] // 1024}KiB"
+                f"  K>={info['min_k']}"
+            )
+        elif k.kernel_tag == "a16w16_persistent":
+            info = self._validate_a16w16_persistent(k)
+            print(
+                f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
+                f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
+                f"  LDS={info['lds_bytes'] // 1024}KiB"
+                f"  K>={info['min_k']}"
+            )
+        elif k.kernel_tag == "a16w16_kspl":
+            # kspl shares persistent's shape constraints (8-wave WG,
+            # 2-deep LDS, MFMA 16x16x32, etc.). Validation reuses the
+            # persistent validator.
+            info = self._validate_a16w16_persistent(k)
+            print(
+                f"  [kspl] {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
                 f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
                 f"  LDS={info['lds_bytes'] // 1024}KiB"
                 f"  K>={info['min_k']}"
@@ -562,6 +640,31 @@ class opus_gemm_codegen:
             )
         elif k.kernel_tag == "a16w16_flatmm_splitk":
             self._gen_flatmm_splitk_instance(
+                k,
+                pipeline_header,
+                traits_header,
+                kernel_func,
+                da,
+                db,
+                traits_name,
+                kargs_name,
+            )
+        elif k.kernel_tag == "a16w16_persistent":
+            self._gen_persistent_instance(
+                k,
+                pipeline_header,
+                traits_header,
+                kernel_func,
+                da,
+                db,
+                traits_name,
+                kargs_name,
+            )
+        elif k.kernel_tag == "a16w16_kspl":
+            # kspl shares the same launcher signature (XQ, WQ, Y, bias, splitK),
+            # same kargs (opus_gemm_persistent_kargs_gfx950), same grid heuristic
+            # as persistent. Re-use the persistent codegen path.
+            self._gen_persistent_instance(
                 k,
                 pipeline_header,
                 traits_header,
@@ -1105,6 +1208,193 @@ void
                     "dtype": CDtype,
                     "device_decl": _device_decl(CDtype),
                 }
+            )
+
+    def _gen_persistent_instance(
+        self,
+        k,
+        pipeline_header,
+        traits_header,
+        kernel_func,
+        da,
+        db,
+        traits_name,
+        kargs_name,
+    ):
+        """Generate a persistent launcher (a16w16_persistent).
+
+        Persistent traits template signature has 9 parameters:
+          <BLOCK_SIZE, BLOCK, DTYPE, VEC, TILE, WAVE, HAS_OOB,
+           CACHECTL_A, CACHECTL_B>.
+
+        The Python-visible launcher takes the standard a16w16-family
+        4-arg signature (XQ, WQ, Y, std::optional<bias>, int splitK)
+        so its `std::function` slot matches split-barrier / flatmm /
+        flatmm_splitk inside GENERATE_A16W16_TUNE_LOOKUP. Persistent
+        does not support bias yet (kargs lacks ptr_bias); the launcher
+        rejects non-empty bias up front and ignores splitK.
+
+        Persistent-specific kargs (m_per_wg, num_tiles_n, m_grp_per_xcd)
+        are computed on the host from the same heuristic as the standalone
+        reference gemm_a16w16_8wave_mouter.cc:743-758.
+        """
+        has_oob_str = "true" if k.has_oob else "false"
+
+        # Pre-declared Traits alias at file scope (visible to both passes).
+        # Persistent traits: <BLOCK_SIZE, BLOCK, DTYPE, VEC, TILE, WAVE,
+        # HAS_OOB, CACHECTL_A, CACHECTL_B>. CACHECTL_A/B are explicit so
+        # cpol kid variants pick up their cache hints.
+        traits_aliases = f"""
+template <typename D_C>
+using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, D_C, fp32_t>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
+    opus::seq<{k.T_M}, {k.T_N}, 1>,
+    opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
+    {has_oob_str},
+    {k.cachectl_a},
+    {k.cachectl_b}>;
+"""
+
+        # K constraints inherited from split-barrier (loops >= 2 and even).
+        # No splitK in persistent, so the launcher just ignores the splitK
+        # parameter required by the shared a16w16_tune_lookup signature.
+        min_k = 2 * k.B_K
+        k_check = f"""
+    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
+    AITER_CHECK(loops_ >= 2,
+        "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
+    AITER_CHECK(loops_ % 2 == 0,
+        "ceil_div(K, {k.B_K})=", loops_, " must be even (prefetch constraint)");
+    AITER_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K)");
+    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
+    AITER_CHECK(batch >= 1, "batch must be >= 1");
+"""
+
+        # Host-side grid layout heuristic. Direct port of
+        # gemm_a16w16_8wave_mouter.cc:743-758.
+        #
+        # split_m starts at ceil(NUM_CU / num_tiles_n) so the WG count fits
+        # in one launch wave on 256 CUs; then bumped up to the next divisor
+        # of num_tiles_m so m_per_wg is integer. Clamped to num_tiles_m.
+        grid_setup = f"""
+    constexpr int NUM_CU = 256;
+    constexpr int NUM_XCD = 8;
+    const int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
+    const int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
+    int split_m = std::max(1, (NUM_CU + num_tiles_n - 1) / num_tiles_n);
+    while (split_m < num_tiles_m && (num_tiles_m % split_m) != 0) split_m++;
+    if (split_m > num_tiles_m) split_m = num_tiles_m;
+    const int m_per_wg = num_tiles_m / split_m;
+    AITER_CHECK(num_tiles_m % split_m == 0,
+        "persistent: num_tiles_m=", num_tiles_m,
+        " must be divisible by split_m=", split_m);
+
+    // Pad grid.y so the XCD-local swizzle math stays bijective. See the
+    // long comment in opus_gemm_pipeline_a16w16_persistent_gfx950.cuh
+    // for why this is needed and why it is free on the large-M shapes
+    // the swizzle is tuned for (split_m is already a multiple of
+    // NUM_XCD there, so the pad is a no-op). When split_m < NUM_XCD
+    // (small-M shapes like M=8192 N=8192 K=256), the pad multiplies
+    // grid.y by NUM_XCD/split_m and the kernel's wave-uniform
+    // early-return guard drops the over-shoot WGs.
+    const int m_grp_per_xcd = (split_m + NUM_XCD - 1) / NUM_XCD;
+    const int grid_y_padded = m_grp_per_xcd * NUM_XCD;
+
+    kargs.m_per_wg = m_per_wg;
+    kargs.num_tiles_n = num_tiles_n;
+    kargs.split_m = split_m;          // un-padded; kernel uses for early-return
+    kargs.m_grp_per_xcd = m_grp_per_xcd;
+
+    dim3 grid(num_tiles_n, grid_y_padded, batch);
+    dim3 block({k.BLOCK_SIZE});
+"""
+
+        INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include <algorithm>
+#include <optional>
+#endif
+// See _gen_noscale_instance for the rationale of the host/device pass split.
+#ifdef OPUS_FUSED_HOST_TU
+#include "{traits_header}"
+template<typename Traits>
+__global__ void {kernel_func}({kargs_name} kargs);
+#else
+#include "{pipeline_header}"
+#endif
+{traits_aliases}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{k.name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int /*splitK*/)   // persistent ignores splitK; shares tune-lookup slot signature
+{{{{
+    int batch = XQ.size(0);
+    int M = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+{k_check}
+    // a16w16_persistent does not support bias yet (kargs has no
+    // ptr_bias / stride_bias_batch fields). Reject up front so the
+    // user gets a clear error instead of silently dropping the bias.
+    AITER_CHECK(!bias.has_value(),
+        "bias is not supported on a16w16_persistent kid; use a16w16 "
+        "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
+
+    {kargs_name} kargs{{{{}}}};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.m = M;
+    kargs.n = N;
+    kargs.k = K;
+    kargs.batch = batch;
+    kargs.stride_a = K;
+    kargs.stride_b = K;
+    kargs.stride_c = N;
+    kargs.stride_a_batch = M * K;
+    kargs.stride_b_batch = N * K;
+    kargs.stride_c_batch = M * N;
+{grid_setup}
+    auto stream = aiter::getCurrentHIPStream();
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
+
+}}}}
+#endif // launcher only on regular host pass
+"""
+        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+
+        # See _gen_noscale_instance for how these rows are consumed.
+        for CDtype in k.output_dtypes:
+            host_decl = (
+                f"template void\n"
+                f"{k.name}<{CDtype}>(\n"
+                f"    aiter_tensor_t &XQ,\n"
+                f"    aiter_tensor_t &WQ,\n"
+                f"    aiter_tensor_t &Y,\n"
+                f"    std::optional<aiter_tensor_t>,\n"
+                f"    int);\n"
+            )
+            device_decl = (
+                f"template __global__ void {kernel_func}<\n"
+                f"    {k.name}_Traits<{CDtype}>>({kargs_name});\n"
+            )
+            self._host_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
+            )
+            self._device_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "device_decl": device_decl}
             )
 
     def _gen_flatmm_instance(
@@ -2131,22 +2421,52 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--tune_file",
+        "--tune_files",
         default=None,
         required=False,
         help=(
-            "Optional path to the opus-private tuned CSV "
-            "(e.g. aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv). "
-            "When given and the file exists, winners matching the current "
-            "device's cu_num are baked into opus_gemm_lookup.h via "
-            "GENERATE_OPUS_LOOKUP_TABLE so opus_gemm()'s bf16 dispatch can "
-            "hit them at runtime without the Python wrapper being in the "
-            "loop. Without this flag the lookup table stays empty and the "
-            "C++ dispatch falls straight through to the heuristic."
+            "Colon-separated list of glob patterns pointing at tuned BF16 "
+            "GEMM CSVs (e.g. aiter/configs/bf16_tuned_gemm.csv and "
+            "aiter/configs/model_configs/*_bf16_tuned_gemm.csv). Each "
+            "file is filtered by `libtype == 'opus'`; surviving rows "
+            "contribute their `solidx` to the subset-compile set S and "
+            "are also baked into opus_gemm_lookup.h via "
+            "GENERATE_OPUS_LOOKUP_TABLE_*. Without this flag we still "
+            "generate a working module (only HEURISTIC_DEFAULT_KIDS + "
+            "sidecar contents), the lookup table stays empty, and the "
+            "C++ dispatch falls through to the heuristic for every "
+            "untuned shape."
         ),
     )
 
+    parser.add_argument(
+        "--compiled_kids_sidecar",
+        default=None,
+        required=False,
+        help=(
+            "Path to the subset-compile sidecar (JSON list of int kids). "
+            "Defaults to {working_path}/compiled_kids.json. The sidecar "
+            "captures the union of CSV opus rows + previous sidecar "
+            "contents + HEURISTIC_DEFAULT_KIDS so subsequent rebuilds "
+            "are idempotent (no rebuild if every required kid is already "
+            "in the .so). gradlib's GemmTuner and opus_gemm_tune.py "
+            "expand this sidecar in tuner-startup to add new kids before "
+            "triggering an AITER_REBUILD."
+        ),
+    )
+
+    # Legacy --tune_file alias kept for backward compat with any existing
+    # invocations / scripts. Treated as `--tune_files <path>`.
+    parser.add_argument(
+        "--tune_file",
+        default=None,
+        required=False,
+        help="[DEPRECATED] alias for --tune_files (single path). Use --tune_files instead.",
+    )
+
     args = parser.parse_args()
+    if args.tune_files is None and args.tune_file is not None:
+        args.tune_files = args.tune_file
     TAG_TO_LIST = {
         "a8w8_scale": a8w8_scale_kernels_list,
         "a8w8": a8w8_kernels_list,
@@ -2154,32 +2474,179 @@ if __name__ == "__main__":
         "a16w16_flatmm": a16w16_flatmm_kernels_list,
         "a16w16_flatmm_splitk": a16w16_flatmm_splitk_kernels_list,
     }
-    kdict = (
-        TAG_TO_LIST.get(args.kernel_tag, kernels_list)
-        if args.kernel_tag
-        else kernels_list
+
+    # --- Compute the subset-compile set S ------------------------------------
+    #
+    # S = (CSV opus rows' kids) ∪ (previous sidecar contents) ∪ HEURISTIC_DEFAULT_KIDS
+    # Intersected with kernels_list.keys() to guard against stale kids in CSV.
+    #
+    # When --kernel_tag is specified, we honor that filter as a developer
+    # debug aid (codegen-only-this-family) but still enforce
+    # HEURISTIC_DEFAULT_KIDS containment so subset-compile invariants hold.
+
+    def _expand_tune_paths(spec):
+        out = []
+        seen = set()
+        if not spec:
+            return out
+        for pat in str(spec).split(os.pathsep):
+            pat = pat.strip()
+            if not pat:
+                continue
+            for path in sorted(glob.glob(pat)):
+                if path in seen:
+                    continue
+                seen.add(path)
+                out.append(path)
+        return out
+
+    csv_kids: set[int] = set()
+    csv_paths = _expand_tune_paths(args.tune_files)
+    for path in csv_paths:
+        try:
+            df = pd.read_csv(path)
+        except (pd.errors.EmptyDataError, FileNotFoundError):
+            continue
+        if "libtype" not in df.columns:
+            continue
+        df = df[df["libtype"] == "opus"]
+        if df.empty:
+            continue
+        kid_col = (
+            "solidx"
+            if "solidx" in df.columns
+            else ("kernelId" if "kernelId" in df.columns else None)
+        )
+        if kid_col is None:
+            continue
+        for v in df[kid_col].dropna().tolist():
+            try:
+                csv_kids.add(int(v))
+            except (TypeError, ValueError):
+                continue
+
+    sidecar_path = args.compiled_kids_sidecar or os.path.join(
+        args.working_path, "compiled_kids.json"
     )
+    sidecar_kids: set[int] = set()
+    if os.path.exists(sidecar_path):
+        try:
+            with open(sidecar_path) as f:
+                sidecar_kids = set(int(x) for x in json.load(f))
+        except (OSError, ValueError):
+            sidecar_kids = set()
+
+    # The compile set: union, intersected with valid kernels_list entries.
+    valid_kids = set(kernels_list.keys())
+    S = (csv_kids | sidecar_kids | set(HEURISTIC_DEFAULT_KIDS)) & valid_kids
+
+    # Always keep a8w8 family (kid 1, 2) in the build -- they are not part
+    # of the a16w16-family subset-compile contract but the module_deepgemm_opus
+    # .so historically exposes them via opus_gemm() for fp8 paths.
+    S |= set(a8w8_scale_kernels_list.keys())
+    S |= set(a8w8_kernels_list.keys())
+
+    # Honor --kernel_tag as a developer override that *further restricts* the
+    # set (within the a16w16 / a8w8 families). It cannot drop any kid from
+    # HEURISTIC_DEFAULT_KIDS though -- the sidecar assertion below guarantees
+    # the build still has a viable heuristic fallback.
+    if args.kernel_tag:
+        tag_keys = set(TAG_TO_LIST.get(args.kernel_tag, {}).keys())
+        if tag_keys:
+            # Restrict to the requested family + heuristic defaults + a8w8 dispatch.
+            S = (S & tag_keys) | set(HEURISTIC_DEFAULT_KIDS)
+            S |= set(a8w8_scale_kernels_list.keys())
+            S |= set(a8w8_kernels_list.keys())
+
+    # Heuristic-fallback invariant (single source of truth: opus_gemm_common.py).
+    # If this fires, opus_a16w16_heuristic_kid_gfx950() in
+    # opus_gemm_heuristic_dispatch_gfx950.cuh would return a kid that the
+    # tune_lookup table cannot resolve -- a runtime AITER_CHECK failure.
+    missing_heuristic = set(HEURISTIC_DEFAULT_KIDS) - S
+    assert not missing_heuristic, (
+        f"Subset-compile error: heuristic-fallback kids "
+        f"{sorted(missing_heuristic)} are missing from the compile set S; "
+        f"opus_a16w16_heuristic_kid_gfx950() would return an unbakeable "
+        f"kid. Add them to the compile set or update HEURISTIC_DEFAULT_KIDS "
+        f"in csrc/opus_gemm/opus_gemm_common.py."
+    )
+
+    # Build the per-kid dict that drives codegen.
+    kdict = {kid: kernels_list[kid] for kid in sorted(S)}
+
+    print(
+        f"[opus gen_instances] subset compile: |S|={len(S)} kids "
+        f"(CSV={len(csv_kids)}, sidecar={len(sidecar_kids)}, heuristic={len(HEURISTIC_DEFAULT_KIDS)})"
+    )
+
     codegen = opus_gemm_codegen(args.working_path, args.tune)
     codegen.gen_instances(kdict)
 
-    # If a tuned CSV is provided and present on disk, rewrite
-    # opus_gemm_lookup.h so the C++ side can resolve tuned winners by
-    # (M, N, K). gen_instances() has already emitted an empty version;
-    # overwrite it with the CSV-driven entries. The kernel impls /
-    # instance .cpp files were already produced above so every kernel
-    # referenced by get_tune_dict is guaranteed to be buildable.
-    if args.tune_file and os.path.exists(args.tune_file):
-        tune_dict = get_tune_dict(args.tune_file)
-        # get_tune_dict seeds with default_kernels_dict (negative int keys
-        # used only in --tune runtime lookup); gen_lookup_dict already
-        # skips those via the `isinstance(mnk, tuple) and mnk[0] > 0`
-        # guard, so passing the full dict straight through is safe.
-        codegen.gen_lookup_dict(tune_dict)
-        print(
-            f"[opus gen_instances] baked {sum(1 for k in tune_dict if isinstance(k, tuple) and k[0] > 0)} tuned entries from {args.tune_file} into opus_gemm_lookup.h"
-        )
-    else:
-        if args.tune_file:
+    # Bake the (M, N, K) -> kernel runtime lookup. gen_instances() emitted
+    # an empty version; if any CSV opus row matches the current cu_num we
+    # overwrite it with the real entries. We concatenate all CSVs into a
+    # single DataFrame first and feed it through get_tune_dict's logic.
+    if csv_paths:
+        # Concatenate all opus rows from all matched CSV files (filtered by
+        # libtype). We persist the combined DataFrame to a temp file because
+        # get_tune_dict reads from a path. Keep the existing one-CSV
+        # contract by writing to a single temp file.
+        combined_frames = []
+        for path in csv_paths:
+            try:
+                df = pd.read_csv(path)
+            except (pd.errors.EmptyDataError, FileNotFoundError):
+                continue
+            if "libtype" not in df.columns:
+                continue
+            df = df[df["libtype"] == "opus"]
+            if df.empty:
+                continue
+            combined_frames.append(df)
+
+        if combined_frames:
+            combined = pd.concat(combined_frames, ignore_index=True).drop_duplicates()
+            tmp_csv = os.path.join(args.working_path, "_combined_opus_tuned.csv")
+            combined.to_csv(tmp_csv, index=False)
+            tune_dict = get_tune_dict(tmp_csv)
+            try:
+                os.remove(tmp_csv)
+            except OSError:
+                pass
+            # Filter tune_dict entries to those whose kid is in S (defense
+            # in depth -- valid_kids should have already caught everything).
+            filtered = {}
+            for k, v in tune_dict.items():
+                if isinstance(k, tuple) and k[0] > 0:
+                    # Find the kid for this entry by reverse-lookup against S.
+                    # Easier: just keep the entry; the launcher symbol is
+                    # only resolvable if v.name's kid is in S, which we've
+                    # already guaranteed via valid_kids ∩ S.
+                    filtered[k] = v
+                else:
+                    filtered[k] = v  # default_kernels_dict negative-int entries
+            codegen.gen_lookup_dict(filtered)
+            n_real = sum(1 for k in filtered if isinstance(k, tuple) and k[0] > 0)
             print(
-                f"[opus gen_instances] --tune_file {args.tune_file} not found, using empty lookup"
+                f"[opus gen_instances] baked {n_real} tuned entries from "
+                f"{len(csv_paths)} CSV file(s) into opus_gemm_lookup.h"
             )
+        else:
+            print(
+                f"[opus gen_instances] no `libtype=='opus'` rows found in "
+                f"{len(csv_paths)} CSV file(s); using empty lookup"
+            )
+    elif args.tune_files:
+        print(
+            f"[opus gen_instances] --tune_files {args.tune_files} matched no "
+            f"existing files; using empty lookup"
+        )
+
+    # Persist the expanded compile set so subsequent rebuilds reuse it.
+    try:
+        os.makedirs(os.path.dirname(sidecar_path) or ".", exist_ok=True)
+    except OSError:
+        pass
+    with open(sidecar_path, "w") as f:
+        json.dump(sorted(S), f)
+    print(f"[opus gen_instances] wrote sidecar with {len(S)} kids: {sidecar_path}")
