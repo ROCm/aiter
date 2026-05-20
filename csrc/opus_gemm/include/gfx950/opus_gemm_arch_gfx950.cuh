@@ -24,7 +24,7 @@
 
 #include "../opus_gemm_arch.cuh"
 #include "../opus_gemm_common.cuh"
-#include "opus_gemm_heuristic_dispatch_gfx950.cuh"  // OpusA16W16NoscaleKernel + opus_a16w16_heuristic_dispatch_gfx950<>
+#include "opus_gemm_heuristic_dispatch_gfx950.cuh"  // OpusA16W16NoscaleKernel + opus_a16w16_heuristic_kid_gfx950()
 #include "opus_gemm_lookup.h"                       // GENERATE_OPUS_LOOKUP_TABLE_BF16 / FP32
 #include "opus_gemm_a16w16_tune_lookup.h"           // GENERATE_A16W16_TUNE_LOOKUP_BF16 / FP32
 #include "opus_gemm_manifest.h"                     // launcher symbols referenced by the lookup macros
@@ -93,47 +93,23 @@ constexpr bool tune_entry_less(const OpusA16W16TuneEntry& a,
 using OpusA16W16TuneKernel = OpusA16W16NoscaleKernel;
 }  // namespace opus_gfx950_detail
 
-// ── a16w16 runtime dispatch (tuned lookup → heuristic fallback) ─────────────
-
-template <typename CDataType>
-inline OpusA16W16NoscaleKernel
-opus_dispatch_a16w16_gfx950(int M, int N, int K, int batch);
-
-template <>
-inline OpusA16W16NoscaleKernel
-opus_dispatch_a16w16_gfx950<bf16_t>(int M, int N, int K, int batch)
+// Splitk kid range. Kept in this header (rather than relying on the
+// opus_gemm.cu copy in OPUS_SPLITK_KID_MIN/MAX) so the heuristic-fallback
+// path below can route splitk kids to <fp32_t> tune_dispatch without a
+// cross-TU dependency. The numbers must match opus_gemm.cu.
+namespace opus_gfx950_detail
 {
-    using namespace opus_gfx950_detail;
-    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
-        GENERATE_OPUS_LOOKUP_TABLE_BF16(bf16_t)
-    };
-    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
-    if (it != kLookup + kSize && entry_eq(*it, needle))
-    {
-        return it->func;
-    }
-    return opus_a16w16_heuristic_dispatch_gfx950<bf16_t>(M, N, K, batch);
-}
+constexpr int kSplitkKidMin       = 200;
+constexpr int kSplitkKidMax       = 300;
+constexpr int kNooobKidOffset     = 1000;
 
-template <>
-inline OpusA16W16NoscaleKernel
-opus_dispatch_a16w16_gfx950<fp32_t>(int M, int N, int K, int batch)
+constexpr bool kid_is_splitk(int kid) noexcept
 {
-    using namespace opus_gfx950_detail;
-    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
-        GENERATE_OPUS_LOOKUP_TABLE_FP32(fp32_t)
-    };
-    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
-    if (it != kLookup + kSize && entry_eq(*it, needle))
-    {
-        return it->func;
-    }
-    return opus_a16w16_heuristic_dispatch_gfx950<fp32_t>(M, N, K, batch);
+    return (kid >= kSplitkKidMin && kid < kSplitkKidMax) ||
+           (kid >= kSplitkKidMin + kNooobKidOffset &&
+            kid < kSplitkKidMax + kNooobKidOffset);
 }
+}  // namespace opus_gfx950_detail
 
 // ── a16w16 tune dispatch (id-based, two specializations) ────────────────────
 //
@@ -179,4 +155,63 @@ opus_a16w16_tune_dispatch_gfx950<fp32_t>(int id)
                 "Kernel id ", id,
                 " not found in a16w16 fp32 tune lookup table");
     return it->func;
+}
+
+// ── a16w16 runtime dispatch (tuned lookup → heuristic fallback) ─────────────
+//
+// On miss the heuristic returns an integer kid; we re-dispatch through
+// opus_a16w16_tune_dispatch_gfx950<>(). Splitk kids only have a <fp32_t>
+// instantiation (their traits static_assert D_C=float; the reduce kernel
+// templated on Y dtype handles bf16/fp32 output at launch time), so we
+// force the <fp32_t> branch for those regardless of the dispatcher's
+// CDataType template parameter.
+
+template <typename CDataType>
+inline OpusA16W16NoscaleKernel
+opus_dispatch_a16w16_gfx950(int M, int N, int K, int batch, bool has_bias = false);
+
+template <>
+inline OpusA16W16NoscaleKernel
+opus_dispatch_a16w16_gfx950<bf16_t>(int M, int N, int K, int batch, bool has_bias)
+{
+    using namespace opus_gfx950_detail;
+    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
+        GENERATE_OPUS_LOOKUP_TABLE_BF16(bf16_t)
+    };
+    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
+    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
+    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
+    if (it != kLookup + kSize && entry_eq(*it, needle))
+    {
+        return it->func;
+    }
+    (void)batch;  // heuristic does not currently use batch.
+    // has_bias forces the heuristic to skip persistent / kspl kids (which
+    // do not yet implement HAS_BIAS=true) and return a splitk kid instead.
+    const int kid = opus_a16w16_heuristic_kid_gfx950(M, N, K, has_bias);
+    if (kid_is_splitk(kid))
+        return opus_a16w16_tune_dispatch_gfx950<fp32_t>(kid);
+    return opus_a16w16_tune_dispatch_gfx950<bf16_t>(kid);
+}
+
+template <>
+inline OpusA16W16NoscaleKernel
+opus_dispatch_a16w16_gfx950<fp32_t>(int M, int N, int K, int batch, bool has_bias)
+{
+    using namespace opus_gfx950_detail;
+    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
+        GENERATE_OPUS_LOOKUP_TABLE_FP32(fp32_t)
+    };
+    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
+    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
+    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
+    if (it != kLookup + kSize && entry_eq(*it, needle))
+    {
+        return it->func;
+    }
+    (void)batch;
+    const int kid = opus_a16w16_heuristic_kid_gfx950(M, N, K, has_bias);
+    // splitk kids only have <fp32_t> in the tune table; non-splitk kids
+    // have an <fp32_t> entry in the fp32 lookup, so the branch is uniform.
+    return opus_a16w16_tune_dispatch_gfx950<fp32_t>(kid);
 }
