@@ -213,13 +213,18 @@ def _compile_stage1_mxscale_kernel_impl(
     # simpler to special-case the scalar path. The B-scale TDM loads are
     # skipped outright, and both A and B scale consumer sites substitute the
     # constant so DCE can remove the dependent LDS reads.
-    _fake_scale = int(os.environ.get("AITER_GFX1250_FAKE_SCALE", "0")) != 0
+    #   AITER_GFX1250_FAKE_SCALE   = 1 -> fake both A and B scales
+    #   AITER_GFX1250_FAKE_SCALE_A = 1 -> fake only A-scale (B keeps real load)
+    _fake_scale_all = int(os.environ.get("AITER_GFX1250_FAKE_SCALE", "0")) != 0
+    _fake_scale_a = _fake_scale_all or int(
+        os.environ.get("AITER_GFX1250_FAKE_SCALE_A", "0")) != 0
+    _fake_scale_b = _fake_scale_all
     _use_tdm_gather_as = (
         bool(use_tdm_gather_as)
         and bool(use_tdm_gather)
         and _as_layout_rowmajor
         and _as_row_bytes_ok
-        and not _fake_scale
+        and not _fake_scale_a
     )
 
     # Pipeline calculations for multi-buffer
@@ -1205,11 +1210,11 @@ def _compile_stage1_mxscale_kernel_impl(
                 "issue_as_load to ensure cache SSA dominates all "
                 "K-iterations"
             )
-            # AITER_GFX1250_FAKE_SCALE: skip the load AND the LDS write —
+            # AITER_GFX1250_FAKE_SCALE[_A]: skip the load AND the LDS write —
             # the consumer side substitutes a constant 0x7F7F7F7F i32 in the
             # WMMA scale operand, so the LDS slots are dead and the
             # ``ds_store_b8`` + ``ds_read_*`` round trip is unnecessary.
-            if const_expr(_fake_scale):
+            if const_expr(_fake_scale_a):
                 return
             k_scale_base_i32 = arith.index_cast(T.i32, k_scale_base)
             # range_constexpr / const_expr: see issue_a_load for rationale —
@@ -1445,17 +1450,19 @@ def _compile_stage1_mxscale_kernel_impl(
                              for wn in range_constexpr(wmma_n_rep)]
                     bs_uv = [load_scale_i32(_up_bs_buf, bsu_bases[wn], ks)
                              for wn in range_constexpr(wmma_n_rep)]
-                # AITER_GFX1250_FAKE_SCALE: bypass the LDS load entirely.
+                # AITER_GFX1250_FAKE_SCALE[_A/_B]: bypass the LDS load entirely.
                 # wmma_*_scale takes a packed i32 (4 E8M0 bytes); 0x7F7F7F7F
                 # means every micro-tile scale is 2^0 = 1.0. The producers
                 # already short-circuit (no ds_store_b8 / tdm bs load); the
                 # constant here lets DCE remove the dependent ds_reads too.
-                if const_expr(_fake_scale):
-                    _scale_const = arith.constant(0x7F7F7F7F, type=T.i32)
-                    as_v = [_scale_const for _ in range_constexpr(wmma_m_rep)]
+                if const_expr(_fake_scale_a):
+                    _scale_const_a = arith.constant(0x7F7F7F7F, type=T.i32)
+                    as_v = [_scale_const_a for _ in range_constexpr(wmma_m_rep)]
+                if const_expr(_fake_scale_b):
+                    _scale_const_b = arith.constant(0x7F7F7F7F, type=T.i32)
                     _bs_rep = b_scale_load_rep if is_fp4 else wmma_n_rep
-                    bs_gv = [_scale_const for _ in range_constexpr(_bs_rep)]
-                    bs_uv = [_scale_const for _ in range_constexpr(_bs_rep)]
+                    bs_gv = [_scale_const_b for _ in range_constexpr(_bs_rep)]
+                    bs_uv = [_scale_const_b for _ in range_constexpr(_bs_rep)]
                 return b_g, bs_gv, b_u, bs_uv, as_v
 
             def emit_wmma(accs, wm, wn, a_frag, b_frags, a_scales, b_scales):
@@ -1921,7 +1928,7 @@ def _compile_stage1_mxscale_kernel_impl(
                             _b_desc_cache["bg_pair_addr_hi"][buf_idx],
                             _k_data_off,
                         ))
-                    if const_expr(not _fake_scale):
+                    if const_expr(not _fake_scale_b):
                         tdm_ops.tensor_load_2d(
                             tdm_ops.update_tensor_descriptor_2d_addr64(
                                 _b_desc_cache["bs_pair"][buf_idx],
@@ -1944,7 +1951,7 @@ def _compile_stage1_mxscale_kernel_impl(
                             _b_desc_cache["bu_addr_hi"][buf_idx],
                             _k_data_off,
                         ))
-                    if const_expr(not _fake_scale):
+                    if const_expr(not _fake_scale_b):
                         tdm_ops.tensor_load_2d(
                             tdm_ops.update_tensor_descriptor_2d_addr64(
                                 _b_desc_cache["bs"][buf_idx],
@@ -2629,14 +2636,17 @@ def _compile_stage2_mxscale_kernel_impl(
     # that is a positive multiple of 4 bytes (TDM gather hardware constraint).
     _as_layout_rowmajor = bool(is_fp4) or (int(wmma_m_rep) == 1)
     _as_row_bytes_ok = int(scale_k_per_tile) >= 4 and (int(scale_k_per_tile) % 4 == 0)
-    # See stage1 for the AITER_GFX1250_FAKE_SCALE rationale.
-    _fake_scale = int(os.environ.get("AITER_GFX1250_FAKE_SCALE", "0")) != 0
+    # See stage1 for the AITER_GFX1250_FAKE_SCALE / FAKE_SCALE_A rationale.
+    _fake_scale_all = int(os.environ.get("AITER_GFX1250_FAKE_SCALE", "0")) != 0
+    _fake_scale_a = _fake_scale_all or int(
+        os.environ.get("AITER_GFX1250_FAKE_SCALE_A", "0")) != 0
+    _fake_scale_b = _fake_scale_all
     _use_tdm_gather_as = (
         bool(use_tdm_gather_as)
         and bool(use_tdm_gather)
         and _as_layout_rowmajor
         and _as_row_bytes_ok
-        and not _fake_scale
+        and not _fake_scale_a
     )
 
     _use_pipeline = int(num_buffers) >= 2
@@ -3374,11 +3384,11 @@ def _compile_stage2_mxscale_kernel_impl(
                 "stage2 _precompute_as_load_meta() must be invoked before "
                 "issue_as_load to ensure cache SSA dominates all K-iterations"
             )
-            # AITER_GFX1250_FAKE_SCALE: skip the load AND the LDS write —
+            # AITER_GFX1250_FAKE_SCALE[_A]: skip the load AND the LDS write —
             # the consumer side substitutes a constant 0x7F7F7F7F i32 in the
             # WMMA scale operand, so the LDS slots are dead and the
             # ``ds_store_b8`` + ``ds_read_*`` round trip is unnecessary.
-            if const_expr(_fake_scale):
+            if const_expr(_fake_scale_a):
                 return
             k_scale_base_i32 = arith.index_cast(T.i32, k_scale_base)
             # range_constexpr / const_expr: see issue_a_load for rationale —
@@ -3556,7 +3566,7 @@ def _compile_stage2_mxscale_kernel_impl(
             eid_idx = arith.index_cast(T.index, eid_i32)
             n_off = eid_idx * n_idx + blk_n
             tdm_ops.tensor_load_2d(make_desc_b(n_off, k_base, target_lds_b))
-            if const_expr(not _fake_scale):
+            if const_expr(not _fake_scale_b):
                 tdm_ops.tensor_load_2d(make_desc_bs(n_off, k_base, target_lds_bs))
 
         _ldrs = _make_mxscale_data_loaders(
@@ -3653,11 +3663,13 @@ def _compile_stage2_mxscale_kernel_impl(
                                                wmma_m_rep, ks)
                         bs_v = [load_scale_i32(lds_bs_bufs[buf_idx], bs_bases[wn], ks)
                                 for wn in range_constexpr(wmma_n_rep)]
-                    if const_expr(_fake_scale):
-                        _scale_const = arith.constant(0x7F7F7F7F, type=T.i32)
-                        as_v = [_scale_const for _ in range_constexpr(wmma_m_rep)]
+                    if const_expr(_fake_scale_a):
+                        _scale_const_a = arith.constant(0x7F7F7F7F, type=T.i32)
+                        as_v = [_scale_const_a for _ in range_constexpr(wmma_m_rep)]
+                    if const_expr(_fake_scale_b):
+                        _scale_const_b = arith.constant(0x7F7F7F7F, type=T.i32)
                         _bs_rep = b_scale_load_rep if is_fp4 else wmma_n_rep
-                        bs_v = [_scale_const for _ in range_constexpr(_bs_rep)]
+                        bs_v = [_scale_const_b for _ in range_constexpr(_bs_rep)]
                     for wm in range_constexpr(wmma_m_rep):
                         a_frag = load_data_frag(lds_a_bufs[buf_idx],
                                                 a_data_bases[wm], ks)
@@ -3687,11 +3699,13 @@ def _compile_stage2_mxscale_kernel_impl(
                                            wmma_m_rep, ks)
                     bs_v = [load_scale_i32(lds_bs_bufs[buf_idx], bs_bases[wn], ks)
                             for wn in range_constexpr(wmma_n_rep)]
-                if const_expr(_fake_scale):
-                    _scale_const = arith.constant(0x7F7F7F7F, type=T.i32)
-                    as_v = [_scale_const for _ in range_constexpr(wmma_m_rep)]
+                if const_expr(_fake_scale_a):
+                    _scale_const_a = arith.constant(0x7F7F7F7F, type=T.i32)
+                    as_v = [_scale_const_a for _ in range_constexpr(wmma_m_rep)]
+                if const_expr(_fake_scale_b):
+                    _scale_const_b = arith.constant(0x7F7F7F7F, type=T.i32)
                     _bs_rep = b_scale_load_rep if is_fp4 else wmma_n_rep
-                    bs_v = [_scale_const for _ in range_constexpr(_bs_rep)]
+                    bs_v = [_scale_const_b for _ in range_constexpr(_bs_rep)]
                 return b_v, bs_v, as_v
 
             def _emit_rows(accs_in, start_wm, a_frags, b_frags, a_scales, b_scales):
