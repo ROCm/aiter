@@ -26,6 +26,7 @@ env:
   GPU_ARCH_LIST: "gfx942;gfx950"
   AITER_TEST: "op_tests"
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
+  AITER_PREBUILD_MAX_JOBS: "96"
 
 jobs:
   check-signal:
@@ -93,10 +94,13 @@ jobs:
           set -euo pipefail
           docker run --rm \
             --network=host \
+            -e AITER_PREBUILD_MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
+            -e AITER_RUNNER_NAME="${RUNNER_NAME:-unknown}" \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash -lc '
+              set -euo pipefail
               git config --global --add safe.directory /workspace &&
               git -C /workspace rev-parse HEAD >/dev/null &&
               shopt -s nullglob &&
@@ -107,10 +111,45 @@ jobs:
               pip install --upgrade "ninja>=1.11.1" &&
               pip install --upgrade setuptools_scm &&
               pip install tabulate &&
-              echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, and MAX_JOBS: 128" &&
-              PREBUILD_KERNELS=1 MAX_JOBS=128 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel &&
+              echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, and MAX_JOBS: ${AITER_PREBUILD_MAX_JOBS}" &&
+              export PREBUILD_KERNELS=1 &&
+              export MAX_JOBS="${AITER_PREBUILD_MAX_JOBS}" &&
+              export GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" &&
+              prebuild_start=$(date +%s) &&
+              set +e &&
+              python setup.py bdist_wheel 2>&1 | tee .aiter-prebuild.log
+              build_status=${PIPESTATUS[0]}
+              set -e
+              prebuild_end=$(date +%s)
+              {
+                echo "BUILD_STATUS=${build_status}"
+                echo "PREBUILD_START=${prebuild_start}"
+                echo "PREBUILD_END=${prebuild_end}"
+              } > .aiter-prebuild.env
+              if [ "${build_status}" -ne 0 ]; then
+                exit "${build_status}"
+              fi
               ls -lh dist/*.whl
             '
+
+      - name: Summarize Aiter prebuild
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [ ! -f .aiter-prebuild.env ]; then
+            echo "::warning::Aiter prebuild metadata was not generated"
+            exit 0
+          fi
+          . ./.aiter-prebuild.env
+          AITER_RUNNER_NAME="${RUNNER_NAME:-unknown}" \
+          GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" \
+          PREBUILD_KERNELS=1 \
+          MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
+          python3 .github/scripts/aiter_prebuild_summary.py \
+            --log .aiter-prebuild.log \
+            --build-status "${BUILD_STATUS}" \
+            --start "${PREBUILD_START}" \
+            --end "${PREBUILD_END}"
 
       - name: Verify prebuilt kernels in wheel
         run: |
@@ -248,23 +287,23 @@ jobs:
             label: MI35X
             shard_total: 5
             shard_idx: 4
-          - runner: linux-aiter-mi300x-1
+          - runner: aiter-1gpu-runner
             label: MI300X
             shard_total: 5
             shard_idx: 0
-          - runner: linux-aiter-mi300x-1
+          - runner: aiter-1gpu-runner
             label: MI300X
             shard_total: 5
             shard_idx: 1
-          - runner: linux-aiter-mi300x-1
+          - runner: aiter-1gpu-runner
             label: MI300X
             shard_total: 5
             shard_idx: 2
-          - runner: linux-aiter-mi300x-1
+          - runner: aiter-1gpu-runner
             label: MI300X
             shard_total: 5
             shard_idx: 3
-          - runner: linux-aiter-mi300x-1
+          - runner: aiter-1gpu-runner
             label: MI300X
             shard_total: 5
             shard_idx: 4
@@ -340,6 +379,19 @@ jobs:
           --name aiter_test \
           $IMAGE_TAG
 
+      - name: Check GPU visibility
+        run: |
+          set -euo pipefail
+          if docker exec \
+            -w /workspace \
+            aiter_test \
+            bash -lc './.github/scripts/aiter_gpu_visibility_check.sh'; then
+            echo "GPU visibility check completed"
+          else
+            status=$?
+            echo "::warning::GPU visibility check failed with exit code ${status}; continuing"
+          fi
+
       - name: Sync CK submodule
         run: |
           set -ex
@@ -380,7 +432,36 @@ jobs:
             pip show amd-aiter
           "
 
-      - name: Install amd-triton
+      - name: Sync prebuilt kernels into source tree
+        run: |
+          set -euo pipefail
+          docker exec -i \
+          -w /workspace \
+          aiter_test \
+          python3 - <<'PY'
+          from importlib.metadata import distribution
+          from pathlib import Path
+          from shutil import copy2
+
+          dist = distribution("amd-aiter")
+          installed_jit = Path(dist.locate_file("aiter/jit")).resolve()
+          workspace_jit = Path("/workspace/aiter/jit").resolve()
+
+          kernels = sorted(installed_jit.glob("*.so"))
+          if not kernels:
+              raise SystemExit(f"No prebuilt kernels found in {installed_jit}")
+
+          workspace_jit.mkdir(parents=True, exist_ok=True)
+          for kernel in kernels:
+              copy2(kernel, workspace_jit / kernel.name)
+
+          print(
+              f"Synced {len(kernels)} prebuilt kernels from {installed_jit} "
+              f"to {workspace_jit}"
+          )
+          PY
+
+      - name: Install triton
         run: |
           # Ensure install_triton.sh is available even when the PR branch
           # was created before the script was added to main (#2959).
@@ -395,7 +476,7 @@ jobs:
             chmod +x .github/scripts/install_triton.sh
           fi
           docker exec -w /workspace aiter_test \
-            bash -c "./.github/scripts/install_triton.sh && pip show amd-triton"
+            bash -c "./.github/scripts/install_triton.sh && pip show triton"
 
       - name: Show Aiter version
         run: |
@@ -458,7 +539,7 @@ jobs:
           echo "Checking Standard Test Results..."
           all_passed=true
           for shard in {0..4}; do
-            for runner in {linux-aiter-mi35x-1,linux-aiter-mi300x-1}; do
+            for runner in {linux-aiter-mi35x-1,aiter-1gpu-runner}; do
               if [ ! -f standard-test-log-${runner}-shard-${shard}/latest_test.log ]; then
                 echo "Test report for ${runner} shard ${shard} not found."
                 all_passed=false
@@ -483,7 +564,7 @@ jobs:
         include:
           - runner: linux-aiter-mi35x-8
             label: MI35X
-          - runner: linux-aiter-mi300x-8
+          - runner: aiter-8gpu-runner
             label: MI300X
     runs-on: ${{ matrix.runner }}
 
@@ -541,6 +622,19 @@ jobs:
           --name aiter_test \
           $IMAGE_TAG
 
+      - name: Check GPU visibility
+        run: |
+          set -euo pipefail
+          if docker exec \
+            -w /workspace \
+            aiter_test \
+            bash -lc './.github/scripts/aiter_gpu_visibility_check.sh'; then
+            echo "GPU visibility check completed"
+          else
+            status=$?
+            echo "::warning::GPU visibility check failed with exit code ${status}; continuing"
+          fi
+
       - name: Sync CK submodule
         run: |
           set -ex
@@ -581,7 +675,36 @@ jobs:
             pip show amd-aiter
           "
 
-      - name: Install amd-triton
+      - name: Sync prebuilt kernels into source tree
+        run: |
+          set -euo pipefail
+          docker exec -i \
+          -w /workspace \
+          aiter_test \
+          python3 - <<'PY'
+          from importlib.metadata import distribution
+          from pathlib import Path
+          from shutil import copy2
+
+          dist = distribution("amd-aiter")
+          installed_jit = Path(dist.locate_file("aiter/jit")).resolve()
+          workspace_jit = Path("/workspace/aiter/jit").resolve()
+
+          kernels = sorted(installed_jit.glob("*.so"))
+          if not kernels:
+              raise SystemExit(f"No prebuilt kernels found in {installed_jit}")
+
+          workspace_jit.mkdir(parents=True, exist_ok=True)
+          for kernel in kernels:
+              copy2(kernel, workspace_jit / kernel.name)
+
+          print(
+              f"Synced {len(kernels)} prebuilt kernels from {installed_jit} "
+              f"to {workspace_jit}"
+          )
+          PY
+
+      - name: Install triton
         run: |
           # Ensure install_triton.sh is available even when the PR branch
           # was created before the script was added to main (#2959).
@@ -596,7 +719,7 @@ jobs:
             chmod +x .github/scripts/install_triton.sh
           fi
           docker exec -w /workspace aiter_test \
-            bash -c "./.github/scripts/install_triton.sh && pip show amd-triton"
+            bash -c "./.github/scripts/install_triton.sh && pip show triton"
 
       - name: Show Aiter version
         run: |

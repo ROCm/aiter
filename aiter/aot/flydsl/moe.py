@@ -37,15 +37,15 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
-    compile_flydsl_moe_stage1,
-    compile_flydsl_moe_stage2,
-    get_flydsl_kernel_params,
     _get_compiled_silu_fused,
     _run_compiled,
     _s1_args_fp4,
     _s1_args_std,
     _s2_args_fp4,
     _s2_args_std,
+    compile_flydsl_moe_stage1,
+    compile_flydsl_moe_stage2,
+    get_flydsl_kernel_params,
 )
 
 # Keep the default AOT coverage aligned with runtime config resolution.
@@ -53,6 +53,22 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
 ]
 MOE_AOT_ARCH_DEFAULT = "gfx950"
+
+
+def _parse_optional_float(value, source: str) -> float | None:
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value == "":
+        return None
+    try:
+        return float(value)
+    except ValueError as e:
+        raise ValueError(f"{source} must be a float, got {value!r}") from e
+
+
+def _row_swiglu_limit(row: dict[str, str]) -> float:
+    return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit") or 0.0
 
 
 def parse_csv(csv_path: str):
@@ -87,13 +103,31 @@ def parse_csv(csv_path: str):
             )
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
-            # TODO: Replace this GPT-OSS-specific bias inference with an
-            # explicit CSV/config field once the model config can express it.
+            q_dtype_w = row.get("q_dtype_w", "")
+            q_dtype_a = row.get("q_dtype_a", "")
+            swiglu_limit = _row_swiglu_limit(row)
+            # Match the RT condition in fused_moe.py / test_moe_2stage.py:
+            #   _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == fp4x2
+            #   AND the caller actually passes a bias tensor (bias1 is not None).
+            # Bias is passed only when q_dtype_a is fp8 or bf16 (NOT fp4x2).
+            # For pure a4w4 models (q_dtype_a == fp4x2), bias1=None regardless of
+            # activation type (Silu or Swiglu), so enable_bias=False.
             enable_bias = (
-                act == "swiglu"
-                and q_type.strip().split(".")[-1] == "per_1x32"
+                q_type.strip().split(".")[-1] == "per_1x32"
                 and dtype in ("torch.bfloat16", "torch.float16")
+                and "float4_e2m1fn_x2" in q_dtype_w
+                and "float4_e2m1fn_x2" not in q_dtype_a  # fp8/bf16 activation only
             )
+
+            # Detect stage1's fuse_quant from kernel suffix to align stage2's
+            # a2_scale shape with what runtime actually passes.
+            stage1_name = row.get("kernelName1", "").strip()
+            stage1_params = (
+                get_flydsl_kernel_params(stage1_name)
+                if stage1_name.startswith("flydsl_")
+                else None
+            )
+            stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
 
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
@@ -116,9 +150,16 @@ def parse_csv(csv_path: str):
                     print(f"  [WARN] Unknown kernel name: {name}, skipping")
                     continue
 
+                job["token_num"] = token
+                job["block_m"] = block_m
+                job["swiglu_limit"] = swiglu_limit
+                # Stage2 needs to know whether stage1 fuses fp4/fp8 quant —
+                # this changes the shape of a2_scale (sorted scale buffer
+                # vs separate quant call output).
                 if params["stage"] == 2:
-                    job["token_num"] = token
-                    job["block_m"] = block_m
+                    job["stage1_fuse_quant"] = (
+                        stage1_out_dtype if stage1_out_dtype in ("fp4", "fp8") else None
+                    )
 
                 full_job = {**job, **params}
                 key = job_identity(full_job)
@@ -158,26 +199,36 @@ def _precompile_to_cache(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    stage1_fuse_quant=None,
+    swiglu_limit: float = 0.0,
     **kwargs,
 ):
-    """Trigger MLIR compilation with dummy tensors and COMPILE_ONLY=1.
+    """Trigger MLIR compilation by calling the runtime stage1/stage2 entry points
+    with dummy GPU tensors and ``COMPILE_ONLY=1``.
 
-    Constructs minimal zero-filled tensors matching the kernel's expected
-    signature, then calls the JitFunction.  With COMPILE_ONLY=1 the compiled
-    artifact is saved to the pkl cache without executing on GPU.
-    No dependency on HIP ops (moe_sorting, shuffle_weight, etc.).
+    Builds dummy inputs that exactly mirror the tensor shapes that
+    ``fused_moe_2stages`` would pass into ``flydsl_moe_stage1`` /
+    ``flydsl_moe_stage2`` for a given ``(token_num, model_dim, inter_dim, E,
+    topk, a_dtype, b_dtype, ...)`` combination, then dispatches into the same
+    runtime entry points used by the fused-MoE op.  ``COMPILE_ONLY=1`` causes
+    the executor to compile and persist the artifact without launching a
+    kernel.  This guarantees that the cache key written here equals the cache
+    key the runtime will look up at inference time.
     """
     import torch
 
     dev = torch.device("cpu")
-    _stream = 0
     is_fp4_weight = b_dtype == "fp4"
-    tokens = tile_m
+    is_int4_weight = b_dtype == "int4"
+    tokens = token_num if token_num > 0 else tile_m
     E = experts
-    _grid_y = 1
+    _sort_block_m = sort_block_m if sort_block_m > 0 else tile_m
+    _block_m_for_sort = block_m if block_m > 0 else _sort_block_m
 
-    def _storage_numel(element_count: int, dtype: str) -> int:
-        return element_count // 2 if dtype == "fp4" else element_count
+    max_num_tokens_padded = tokens * topk + E * _block_m_for_sort - topk
+    max_num_m_blocks = (
+        max_num_tokens_padded + _block_m_for_sort - 1
+    ) // _block_m_for_sort
 
     def _storage_dtype(dtype: str):
         if dtype in ("fp4", "fp8"):
@@ -186,199 +237,300 @@ def _precompile_to_cache(
             return torch.float16
         if dtype == "bf16":
             return torch.bfloat16
+        if dtype == "int4":
+            return torch.int4 if hasattr(torch, "int4") else torch.uint8
         return torch.int8
 
-    def _aot_sort_blocks() -> int:
-        token_count = token_num if token_num > 0 else tokens
-        sorting_block_m = block_m if block_m > 0 else tile_m
-        max_tokens_padded = token_count * topk + E * sorting_block_m - topk
-        return (max_tokens_padded + sorting_block_m - 1) // sorting_block_m
+    def _alloc(shape, dtype):
+        # torch.zeros doesn't support sub-byte dtypes (int4); use empty for those.
+        # Cache key only depends on shape+dtype+strides — values don't matter.
+        if dtype == getattr(torch, "int4", None):
+            return torch.empty(shape, device=dev, dtype=dtype)
+        return torch.zeros(shape, device=dev, dtype=dtype)
 
-    def _aot_stage2_m_blocks() -> int:
-        token_count = token_num if token_num > 0 else tokens
-        _sbm = sort_block_m if sort_block_m > 0 else tile_m
-        sort_blocks = _aot_sort_blocks()
-        if _sbm == tile_m:
-            return min(sort_blocks, token_count * topk)
-        total_sorted = sort_blocks * _sbm
-        return (total_sorted + tile_m - 1) // tile_m
+    def _user_a_shape():
+        # User-level activation shape: (token_num, model_dim) in storage dtype.
+        if a_dtype == "fp4":
+            return (tokens, model_dim // 2)
+        return (tokens, model_dim)
 
-    def _aot_stage2_persist_m(m_blocks: int) -> int:
-        if persist is True:
-            persist_m = -1
-        elif persist is False:
-            persist_m = 4 if m_blocks > 256 else 1
-        else:
-            persist_m = -1 if m_blocks > 256 else 1
+    def _user_w1_shape():
+        # User-level w1 shape: (E, 2*inter_dim, model_dim) in storage dtype.
+        if b_dtype == "fp4":
+            return (E, 2 * inter_dim, model_dim // 2)
+        if b_dtype == "int4":
+            # int4 packed: 2 elements per byte
+            return (E, 2 * inter_dim, model_dim // 2)
+        return (E, 2 * inter_dim, model_dim)
 
+    def _user_w2_shape():
+        # User-level w2 shape: (E, model_dim, inter_dim) in storage dtype.
+        if b_dtype == "fp4":
+            return (E, model_dim, inter_dim // 2)
+        if b_dtype == "int4":
+            return (E, model_dim, inter_dim // 2)
+        return (E, model_dim, inter_dim)
+
+    def _make_routing():
+        sorted_token_ids = torch.zeros(
+            max_num_tokens_padded, device=dev, dtype=torch.int32
+        )
+        sorted_expert_ids = torch.zeros(max_num_m_blocks, device=dev, dtype=torch.int32)
+        num_valid_ids = torch.zeros(2, device=dev, dtype=torch.int32)
+        return sorted_token_ids, sorted_expert_ids, num_valid_ids
+
+    def _make_sorted_weights(doweight: bool):
+        if doweight:
+            return torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.float32)
+        return None
+
+    def _make_a1_scale():
+        """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
+        if not is_fp4_weight:
+            if is_int4_weight:
+                # a16wi4: bf16 activations, int4 weights — no activation scale.
+                return None
+            return None
         if a_dtype == "fp8":
-            persist_m = 1
+            if a_scale_one:
+                # fused_moe_2stages: metadata.fuse_quant == "fp8"
+                return torch.empty(0, dtype=torch.uint8, device=dev)
+            # fused_moe_2stages line 1501
+            return torch.ones(
+                [max_num_tokens_padded, model_dim // 32],
+                dtype=torch.uint8,
+                device=dev,
+            )
+        if a_dtype == "bf16":
+            return torch.ones(
+                [max_num_tokens_padded, model_dim // 32],
+                dtype=torch.uint8,
+                device=dev,
+            )
+        if a_dtype == "fp4":
+            # fused_dynamic_mxfp4_quant_moe_sort or mxfp4_moe_sort_fwd:
+            # output shape is ((sorted_ids+31)//32*32, (cols+31)//32) in fp8_e8m0.
+            rows = (max_num_tokens_padded + 31) // 32 * 32
+            cols = (model_dim + 31) // 32
+            return torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
+        return None
 
-        return persist_m
+    def _make_a2_scale_for_stage2():
+        """Stage2 a2_scale construction per fused_moe_2stages.
 
-    def _precompile_silu_fused():
-        is_splitk = k_batch > 1
-        need_fp4 = out_dtype == "fp4"
-        need_fp8 = out_dtype == "fp8"
-        fuse_any_quant = need_fp4 or need_fp8
-        gate_up_interleave = gate_mode == "interleave"
-        splitk_fp4 = is_splitk and need_fp4
-        gui_sk = gate_up_interleave and is_splitk
-        gui_sk_fused = gui_sk and fuse_any_quant
+        When upstream stage1 fuses fp4/fp8 quant (``stage1_fuse_quant`` set),
+        stage2 receives stage1's ``out_scale_sorted`` buffer directly — that
+        buffer is padded to 256 rows and 8 cols.  Otherwise stage2 quantizes
+        its own input and the resulting sorted scale uses 32-row alignment.
+        """
+        if not is_fp4_weight:
+            return None
+        if stage1_fuse_quant in ("fp4", "fp8"):
+            # mirror flydsl_moe_stage1's out_scale_sorted_flat allocation:
+            #   sorted_size = max(sorted_token_ids.shape[0],
+            #                     sorted_expert_ids.shape[0] * sort_block_m)
+            #   padded_rows = (sorted_size + 255) // 256 * 256
+            #   padded_cols = (inter_dim // 32 + 7) // 8 * 8
+            _sorted_size = max(
+                max_num_tokens_padded,
+                max_num_m_blocks * tile_m,
+            )
+            _padded_rows = (_sorted_size + 255) // 256 * 256
+            _padded_cols = ((inter_dim // 32) + 7) // 8 * 8
+            return torch.zeros(
+                _padded_rows * _padded_cols, dtype=torch.uint8, device=dev
+            )
+        if a_dtype == "fp8":
+            if act == "silu" and swiglu_limit == 0.0:
+                # fused_moe_2stages uses fused_quant_fp8_sort for this path.
+                rows = (max_num_tokens_padded + 31) // 32 * 32
+                cols = (inter_dim + 31) // 32
+                return torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
 
-        if gui_sk_fused:
-            quant_mode = "fp4" if need_fp4 else "fp8"
-            gui_layout = True
-        elif gui_sk:
-            quant_mode = "none"
-            gui_layout = True
-        elif splitk_fp4:
-            quant_mode = "fp4"
-            gui_layout = False
-        else:
-            return
+            # Otherwise fused_moe_2stages reuses a1_scale for stage2.
+            return torch.ones(
+                [max_num_tokens_padded, model_dim // 32],
+                dtype=torch.uint8,
+                device=dev,
+            )
+        if a_dtype == "fp4":
+            # fused_dynamic_mxfp4_quant_moe_sort / mxfp4_moe_sort_fwd path:
+            # 32-row alignment.
+            rows = (max_num_tokens_padded + 31) // 32 * 32
+            cols = (inter_dim + 31) // 32
+            return torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
+        if a_dtype == "bf16":
+            return None
+        return None
 
-        silu_fused = _get_compiled_silu_fused(
-            inter_dim,
-            topk,
-            quant_mode,
-            gui_layout,
-            act=act,
-            enable_bias=enable_bias,
-        )
-        sorted_len = max(tokens * topk, _aot_sort_blocks() * tile_m)
-        padded_cols = ((inter_dim // 32) + 7) // 8 * 8
-        scale_rows = (sorted_len + 255) // 256 * 256
-        tmp_out = torch.zeros(
-            tokens * topk * inter_dim * 2, device=dev, dtype=torch.bfloat16
-        )
-        out_buf = torch.zeros(
-            (
-                tokens * topk * inter_dim * 2
-                if quant_mode == "none"
-                else _storage_numel(tokens * topk * inter_dim, quant_mode)
-            ),
-            device=dev,
-            dtype=torch.uint8,
-        )
-        out_scale_sorted = torch.zeros(
-            scale_rows * padded_cols,
-            device=dev,
-            dtype=torch.uint8,
-        )
-        sorted_token_ids = torch.zeros(sorted_len, device=dev, dtype=torch.int32)
-        num_valid = torch.zeros(1, device=dev, dtype=torch.int32)
-        topk_ids = torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
-        bias = torch.zeros(E * inter_dim * 2, device=dev, dtype=torch.float32)
-        _run_compiled(
-            silu_fused,
-            (
-                tmp_out.view(-1, inter_dim * 2),
-                out_buf.view(-1),
-                out_scale_sorted,
-                sorted_token_ids,
-                num_valid,
-                topk_ids,
-                bias,
-                tokens,
-                sorted_len,
-                _stream,
-            ),
-        )
+    def _make_w_scale(scale_storage_numel: int):
+        # mxfp4 e8m0 scale — viewed as uint8 by _view_safe before kernel launch.
+        return torch.zeros(scale_storage_numel, dtype=torch.uint8, device=dev)
 
-    # Dummy routing tensors (shape matters, data doesn't)
-    sorted_ids = torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
-    sorted_expert_ids = torch.zeros(_grid_y, device=dev, dtype=torch.int32)
-    num_valid_ids = torch.zeros(1, device=dev, dtype=torch.int32)
-    sw = torch.zeros(tokens * topk, device=dev, dtype=torch.float32)
+    def _make_a_user(a_dtype_user_shape):
+        return _alloc(a_dtype_user_shape, _storage_dtype(a_dtype))
 
     _cu_num_str = str(cu_num) if cu_num > 0 else None
     with compile_only_env(), override_env("CU_NUM", _cu_num_str):
-        # Clear cached CU count so get_cu_num() re-reads the env var.
         from aiter.jit.utils.chip_info import get_cu_num
 
         get_cu_num.cache_clear()
 
+        sorted_token_ids, sorted_expert_ids, num_valid_ids = _make_routing()
+
         if stage == 1:
+            a = _make_a_user(_user_a_shape())
+            w1_shape = _user_w1_shape()
+            w1 = _alloc(w1_shape, _storage_dtype(b_dtype))
 
+            _need_fp4 = out_dtype == "fp4"
+            _need_fp8 = out_dtype == "fp8"
+            _fuse_any_quant = _need_fp4 or _need_fp8
+            _base_out_dtype = "bf16" if _fuse_any_quant else out_dtype
             _is_splitk = k_batch > 1
-            n_in = inter_dim * 2 if is_fp4_weight else inter_dim
-            k_in = model_dim
+            _splitk_fp4 = _is_splitk and _need_fp4
+            _gui_sk = gate_mode == "interleave" and _is_splitk
+            _gui_sk_fused = _gui_sk and _fuse_any_quant
+            _gemm_out_dtype = _base_out_dtype if _is_splitk else out_dtype
+            _gemm_out_torch_dtype = (
+                torch.bfloat16 if _gemm_out_dtype == "bf16" else torch.float16
+            )
 
-            if is_fp4_weight:
-                gemm_out_dtype = (
-                    "bf16" if _is_splitk and out_dtype in ("fp4", "fp8") else out_dtype
-                )
-                gemm_out_elems = tokens * topk * inter_dim
-                if _is_splitk:
-                    gemm_out_elems *= 2
-                out = torch.zeros(
-                    _storage_numel(gemm_out_elems, gemm_out_dtype),
+            if _is_splitk:
+                tmp_out = torch.zeros(
+                    (tokens, topk, inter_dim * 2),
+                    dtype=_gemm_out_torch_dtype,
                     device=dev,
-                    dtype=_storage_dtype(gemm_out_dtype),
                 )
-                a = torch.zeros(
-                    _storage_numel(tokens * model_dim, a_dtype),
-                    device=dev,
-                    dtype=_storage_dtype(a_dtype),
-                )
-                w = torch.zeros(
-                    _storage_numel(E * 2 * inter_dim * model_dim, b_dtype),
-                    device=dev,
-                    dtype=_storage_dtype(b_dtype),
-                )
-                a_scale = (
-                    torch.zeros(1, device=dev, dtype=torch.uint8)
-                    if a_dtype in ("fp4", "fp8")
-                    else torch.empty(0, device=dev, dtype=torch.float32)
-                )
-                w_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
-                out_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
-                bias = torch.zeros(1, device=dev, dtype=torch.float32)
-                args = _s1_args_fp4(
-                    out,
-                    a,
-                    w,
-                    a_scale,
-                    w_scale,
-                    sorted_ids,
-                    sorted_expert_ids,
-                    sw,
-                    num_valid_ids,
-                    out_scale,
-                    tokens,
-                    n_in,
-                    k_in,
-                    _grid_y,
-                    dev,
-                    bias=bias if enable_bias else None,
-                    stream=_stream,
+                out = (
+                    torch.zeros(
+                        (tokens, topk, inter_dim // 2), device=dev, dtype=torch.uint8
+                    )
+                    if _need_fp4
+                    else (
+                        torch.zeros(
+                            (tokens, topk, inter_dim), device=dev, dtype=torch.uint8
+                        )
+                        if _need_fp8
+                        else torch.empty(
+                            (tokens, topk, inter_dim),
+                            device=dev,
+                            dtype=_gemm_out_torch_dtype,
+                        )
+                    )
                 )
             else:
-                out = torch.zeros(
-                    tokens * topk * inter_dim, device=dev, dtype=torch.bfloat16
+                tmp_out = None
+                out = (
+                    torch.empty(
+                        (tokens, topk, inter_dim // 2), device=dev, dtype=torch.uint8
+                    )
+                    if _need_fp4
+                    else (
+                        torch.empty(
+                            (tokens, topk, inter_dim), device=dev, dtype=torch.uint8
+                        )
+                        if _need_fp8
+                        else torch.empty(
+                            (tokens, topk, inter_dim),
+                            device=dev,
+                            dtype=_gemm_out_torch_dtype,
+                        )
+                    )
                 )
-                a = torch.zeros(tokens * model_dim, device=dev, dtype=torch.int8)
-                w = torch.zeros(
-                    E * 2 * inter_dim * model_dim, device=dev, dtype=torch.int8
+
+            a1_scale = _make_a1_scale()
+            # w1_scale: per-32 group along K dimension. Storage size in bytes.
+            if is_fp4_weight:
+                w1_scale = _make_w_scale(E * 2 * inter_dim * (model_dim // 32))
+            elif is_int4_weight:
+                # a16wi4: bf16 groupwise scale over (E, K//32, N).
+                w1_scale = torch.zeros(
+                    E * (model_dim // 32) * (2 * inter_dim),
+                    device=dev,
+                    dtype=torch.bfloat16,
                 )
-                a_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-                w_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-                args = _s1_args_std(
-                    out,
-                    a,
-                    w,
-                    a_scale,
-                    w_scale,
-                    sorted_ids,
+            else:
+                w1_scale = torch.zeros(1, device=dev, dtype=torch.float32)
+
+            sw = _make_sorted_weights(doweight_stage1)
+            bias = (
+                torch.zeros(E * inter_dim * 2, device=dev, dtype=torch.float32)
+                if enable_bias
+                else None
+            )
+
+            flat_a_scale = (
+                a1_scale.view(-1)
+                if a1_scale is not None
+                else torch.empty(0, device=dev)
+            )
+            flat_w_scale = (
+                w1_scale.view(-1)
+                if w1_scale is not None
+                else torch.empty(0, device=dev)
+            )
+            sw_arg = (
+                sw
+                if sw is not None
+                else torch.empty(0, device=dev, dtype=torch.float32)
+            )
+            _grid_y = min(max_num_m_blocks, tokens * topk)
+            _kernel_out = tmp_out if _is_splitk else out
+            kernel_bias = None if _is_splitk else bias
+            _n_in = inter_dim * 2 if is_fp4_weight else inter_dim
+            _k_in = model_dim
+
+            scale_cols = inter_dim // 32
+            sorted_size = max(max_num_tokens_padded, max_num_m_blocks * tile_m)
+            padded_rows = (sorted_size + 255) // 256 * 256
+            padded_cols = (scale_cols + 7) // 8 * 8
+            out_scale_sorted_flat = (
+                torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
+                if (_fuse_any_quant or _splitk_fp4 or _gui_sk_fused)
+                else torch.empty(0, dtype=torch.uint8, device=dev)
+            )
+
+            if is_fp4_weight:
+                args = _s1_args_fp4(
+                    _kernel_out.view(-1),
+                    a.view(-1),
+                    w1.view(-1),
+                    flat_a_scale,
+                    flat_w_scale,
+                    sorted_token_ids,
                     sorted_expert_ids,
-                    sw,
+                    sw_arg,
+                    num_valid_ids,
+                    out_scale_sorted_flat.view(-1),
+                    tokens,
+                    _n_in,
+                    _k_in,
+                    _grid_y,
+                    dev,
+                    bias=(
+                        kernel_bias.view(-1)
+                        if kernel_bias is not None
+                        else torch.empty(0, device=dev)
+                    ),
+                    stream=0,
+                )
+            else:
+                args = _s1_args_std(
+                    _kernel_out.view(-1),
+                    a.view(-1),
+                    w1.view(-1),
+                    flat_a_scale,
+                    flat_w_scale,
+                    sorted_token_ids,
+                    sorted_expert_ids,
+                    sw_arg,
                     num_valid_ids,
                     tokens,
-                    n_in,
-                    k_in,
+                    _n_in,
+                    _k_in,
                     _grid_y,
-                    stream=_stream,
+                    stream=0,
                 )
 
             exe = compile_flydsl_moe_stage1(
@@ -389,90 +541,169 @@ def _precompile_to_cache(
                 tile_m=tile_m,
                 tile_n=tile_n,
                 tile_k=tile_k,
-                doweight_stage1=doweight_stage1,
+                doweight_stage1=(sw is not None),
                 a_dtype=a_dtype,
                 b_dtype=b_dtype,
-                out_dtype=gemm_out_dtype if is_fp4_weight else out_dtype,
+                out_dtype=_gemm_out_dtype,
                 act=act,
                 use_async_copy=True,
-                waves_per_eu=waves_per_eu,
                 k_batch=k_batch,
+                waves_per_eu=waves_per_eu,
                 b_nt=b_nt,
                 gate_mode=gate_mode,
+                enable_bias=(kernel_bias is not None),
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
-                enable_bias=enable_bias,
+                swiglu_limit=swiglu_limit,
             )
             _run_compiled(exe, args)
-            if is_fp4_weight:
-                _precompile_silu_fused()
+
+            if _gui_sk_fused or _gui_sk or _splitk_fp4:
+                if _gui_sk_fused:
+                    quant_mode = "fp4" if _need_fp4 else "fp8"
+                    gui_layout = True
+                elif _gui_sk:
+                    quant_mode = "none"
+                    gui_layout = True
+                else:
+                    quant_mode = "fp4"
+                    gui_layout = False
+                silu_fused = _get_compiled_silu_fused(
+                    inter_dim,
+                    topk,
+                    quant_mode,
+                    gui_layout=gui_layout,
+                    act=act,
+                    enable_bias=False,
+                    swiglu_limit=swiglu_limit,
+                )
+                _run_compiled(
+                    silu_fused,
+                    (
+                        tmp_out.view(-1, inter_dim * 2),
+                        out.view(-1).view(torch.uint8),
+                        out_scale_sorted_flat,
+                        sorted_token_ids,
+                        num_valid_ids,
+                        sorted_token_ids.view(-1),
+                        torch.empty(0, device=dev, dtype=torch.float32),
+                        tokens,
+                        sorted_token_ids.shape[0],
+                        0,
+                    ),
+                )
 
         elif stage == 2:
+            # Stage2 input is (token_num, topk, inter_dim) in a_dtype storage.
+            if a_dtype == "fp4":
+                a_shape = (tokens, topk, inter_dim // 2)
+            else:
+                a_shape = (tokens, topk, inter_dim)
+            a = _alloc(a_shape, _storage_dtype(a_dtype))
+            w2_shape = _user_w2_shape()
+            w2 = _alloc(w2_shape, _storage_dtype(b_dtype))
 
-            accumulate = mode != "reduce"
-            _m_blocks = _aot_stage2_m_blocks()
-            _persist_m = _aot_stage2_persist_m(_m_blocks)
-            n_in = model_dim
-            k_in = inter_dim
-
+            a2_scale = _make_a2_scale_for_stage2()
             if is_fp4_weight:
-                out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
-                a = torch.zeros(
-                    _storage_numel(tokens * topk * inter_dim, a_dtype),
+                w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
+            elif is_int4_weight:
+                w2_scale = torch.zeros(
+                    E * (inter_dim // 32) * model_dim,
                     device=dev,
-                    dtype=_storage_dtype(a_dtype),
-                )
-                w = torch.zeros(
-                    _storage_numel(E * model_dim * inter_dim, b_dtype),
-                    device=dev,
-                    dtype=_storage_dtype(b_dtype),
-                )
-                a_scale = (
-                    torch.zeros(1, device=dev, dtype=torch.uint8)
-                    if a_dtype in ("fp4", "fp8")
-                    else torch.empty(0, device=dev, dtype=torch.float32)
-                )
-                w_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
-                bias = torch.zeros(1, device=dev, dtype=torch.float32)
-                args = _s2_args_fp4(
-                    out,
-                    a,
-                    w,
-                    a_scale,
-                    w_scale,
-                    sorted_ids,
-                    sorted_expert_ids,
-                    sw,
-                    num_valid_ids,
-                    tokens,
-                    n_in,
-                    k_in,
-                    _m_blocks,
-                    dev,
-                    bias=bias if enable_bias else None,
-                    stream=_stream,
+                    dtype=torch.bfloat16,
                 )
             else:
-                out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
-                a = torch.zeros(tokens * topk * inter_dim, device=dev, dtype=torch.int8)
-                w = torch.zeros(E * model_dim * inter_dim, device=dev, dtype=torch.int8)
-                a_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-                w_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-                args = _s2_args_std(
-                    out,
+                w2_scale = torch.zeros(1, device=dev, dtype=torch.float32)
+
+            sw = _make_sorted_weights(not doweight_stage1)
+            bias = (
+                torch.zeros(E * model_dim, device=dev, dtype=torch.float32)
+                if enable_bias
+                else None
+            )
+
+            torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
+            accumulate = mode != "reduce"
+            out = torch.zeros((tokens, model_dim), dtype=torch_out_dtype, device=dev)
+            target = out
+            if not accumulate:
+                target = torch.empty(
+                    (tokens * topk * model_dim,),
+                    device=dev,
+                    dtype=torch_out_dtype,
+                )
+
+            flat_a_scale = (
+                a2_scale.view(-1)
+                if a2_scale is not None
+                else torch.empty(0, device=dev)
+            )
+            flat_w_scale = (
+                w2_scale.view(-1)
+                if w2_scale is not None
+                else torch.empty(0, device=dev)
+            )
+            sw_arg = (
+                sw
+                if sw is not None
+                else torch.empty(
+                    sorted_token_ids.shape, dtype=torch.float32, device=dev
+                )
+            )
+
+            _sbm = sort_block_m if sort_block_m > 0 else tile_m
+            if _sbm == tile_m:
+                m_blocks = min(sorted_expert_ids.shape[0], tokens * topk)
+            else:
+                total_sorted = sorted_expert_ids.shape[0] * _sbm
+                m_blocks = (total_sorted + tile_m - 1) // tile_m
+            if persist is True:
+                _persist_m = -1
+            elif persist is False:
+                _persist_m = 4 if m_blocks > 256 else 1
+            else:
+                _persist_m = -1 if m_blocks > 256 else 1
+            if a_dtype == "fp8":
+                _persist_m = 1
+
+            _n_in = model_dim
+            _k_in = inter_dim
+
+            if is_fp4_weight:
+                args = _s2_args_fp4(
+                    target,
                     a,
-                    w,
-                    a_scale,
-                    w_scale,
-                    sorted_ids,
+                    w2,
+                    flat_a_scale,
+                    flat_w_scale,
+                    sorted_token_ids,
                     sorted_expert_ids,
-                    sw,
+                    sw_arg,
                     num_valid_ids,
                     tokens,
-                    n_in,
-                    k_in,
-                    _grid_y,
-                    stream=_stream,
+                    _n_in,
+                    _k_in,
+                    m_blocks,
+                    dev,
+                    bias=bias,
+                    stream=0,
+                )
+            else:
+                args = _s2_args_std(
+                    target,
+                    a,
+                    w2,
+                    flat_a_scale,
+                    flat_w_scale,
+                    sorted_token_ids,
+                    sorted_expert_ids,
+                    sw_arg,
+                    num_valid_ids,
+                    tokens,
+                    _n_in,
+                    _k_in,
+                    m_blocks,
+                    stream=0,
                 )
 
             exe = compile_flydsl_moe_stage2(
@@ -483,7 +714,7 @@ def _precompile_to_cache(
                 tile_m=tile_m,
                 tile_n=tile_n,
                 tile_k=tile_k,
-                doweight_stage2=not doweight_stage1,
+                doweight_stage2=(sw is not None),
                 a_dtype=a_dtype,
                 b_dtype=b_dtype,
                 out_dtype=out_dtype,
@@ -526,9 +757,13 @@ def compile_one_config(
         "compile_arch": aot_arch,
     }
 
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
     t0 = time.time()
     try:
-        with override_env("ARCH", aot_arch), override_env("FLYDSL_GPU_ARCH", aot_arch):
+        with override_env("ARCH", aot_arch), override_env(
+            "FLYDSL_GPU_ARCH", aot_arch
+        ), FakeTensorMode():
             _precompile_to_cache(
                 model_dim=model_dim,
                 inter_dim=inter_dim,
