@@ -11,13 +11,13 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
 
     # Warp/register layout bases depend on warp count
     if num_warps == 2:
-        warp_bases = [[0, 1]]
+        warp_bases = [[1, 0]]
         reg_bases = []
     elif num_warps == 4:
-        warp_bases = [[0, 2], [2, 0]]
-        reg_bases = [[1, 0], [0, 1]]
+        warp_bases = [[0, 1], [2, 0]]
+        reg_bases = [[1, 0]]
     else:
-        warp_bases = [[0, 1], [0, 2], [1, 0]]
+        warp_bases = [[1, 0], [0, 1], [2, 0]]
         reg_bases = []
 
     # e2m1 uses instr_shape [16,16,64] for operands
@@ -26,7 +26,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=reg_bases,
-        instr_shape=[16, 16, 64],
+        instr_shape=[32, 16, 64],
     )
 
     wmma_acc_layout = gl.amd.AMDWMMALayout(
@@ -34,7 +34,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=reg_bases,
-        instr_shape=[16, 16, 128],
+        instr_shape=[32, 16, 128],
     )
 
     # Shared memory layouts
@@ -146,10 +146,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
     BLOCK_K_BYTES: gl.constexpr = BLOCK_SIZE_K // FP4_ELEMS_PER_BYTE
     K_GROUPS: gl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_ELEMS
-    LANES_PER_B128: gl.constexpr = 4
+    LANES_PER_TDM: gl.constexpr = 16
+
+    gl.static_assert(K_GROUPS * 32 == BLOCK_SIZE_K)
 
     gl.static_assert(BLOCK_SIZE_K % 32 == 0)
-    gl.static_assert(K_GROUPS * 32 == BLOCK_SIZE_K)
+    gl.static_assert(BLOCK_SIZE_M % LANES_PER_TDM == 0)
+    gl.static_assert(BLOCK_SIZE_N % LANES_PER_TDM == 0)
 
     pid = gl.program_id(axis=0)
     tiles_n = gl.cdiv(N, BLOCK_SIZE_N)
@@ -183,24 +186,18 @@ def gemm_mxfp4_preshuffle_gfx1250(
     k_scale_cols = K_elems // SCALE_GROUP_ELEMS
 
     as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_scale_ptr + tile_m * (BLOCK_SIZE_M // LANES_PER_B128) * stride_as_m,
-        shape=(
-            gl.cdiv(M, LANES_PER_B128) - tile_m * (BLOCK_SIZE_M // LANES_PER_B128),
-            k_scale_cols * LANES_PER_B128,
-        ),
+        base=a_scale_ptr + tile_m * BLOCK_SIZE_M * stride_as_m,
+        shape=(M - tile_m * BLOCK_SIZE_M, k_scale_cols),
         strides=(stride_as_m, stride_as_k),
-        block_shape=(BLOCK_SIZE_M // LANES_PER_B128, K_GROUPS * LANES_PER_B128),
+        block_shape=(BLOCK_SIZE_M, K_GROUPS),
         layout=shared_S,
     )
 
     bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=b_scale_ptr + tile_n * (BLOCK_SIZE_N // LANES_PER_B128) * stride_bs_n,
-        shape=(
-            gl.cdiv(N, LANES_PER_B128) - tile_n * (BLOCK_SIZE_N // LANES_PER_B128),
-            k_scale_cols * LANES_PER_B128,
-        ),
+        base=b_scale_ptr + tile_n * BLOCK_SIZE_N * stride_bs_n,
+        shape=(N - tile_n * BLOCK_SIZE_N, k_scale_cols),
         strides=(stride_bs_n, stride_bs_k),
-        block_shape=(BLOCK_SIZE_N // LANES_PER_B128, K_GROUPS * LANES_PER_B128),
+        block_shape=(BLOCK_SIZE_N, K_GROUPS),
         layout=shared_S,
     )
 
@@ -221,13 +218,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
     smem_AS = gl.allocate_shared_memory(
         a_scale_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_SIZE_M // LANES_PER_B128, K_GROUPS * LANES_PER_B128],
+        [NUM_BUFFERS, BLOCK_SIZE_M, K_GROUPS],
         layout=shared_S,
     )
 
     smem_BS = gl.allocate_shared_memory(
         b_scale_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_SIZE_N // LANES_PER_B128, K_GROUPS * LANES_PER_B128],
+        [NUM_BUFFERS, BLOCK_SIZE_N, K_GROUPS],
         layout=shared_S,
     )
 
@@ -247,39 +244,24 @@ def gemm_mxfp4_preshuffle_gfx1250(
         gl.amd.gfx1250.tdm.async_load(b_desc, [0, 0], smem_B.index(slot))
         gl.amd.gfx1250.tdm.async_load(as_desc, [0, 0], smem_AS.index(slot))
         gl.amd.gfx1250.tdm.async_load(bs_desc, [0, 0], smem_BS.index(slot))
-        a_desc = gl.amd.gfx1250.tdm.advance(
-            a_desc, [0, BLOCK_K_BYTES]
-        )
-        b_desc = gl.amd.gfx1250.tdm.advance(
+        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_desc, [0, BLOCK_K_BYTES])
+        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             b_desc, [0, BLOCK_K_BYTES * 16]
         )
-        as_desc = gl.amd.gfx1250.tdm.advance(
-            as_desc, [0, K_GROUPS * LANES_PER_B128]
-        )
-        bs_desc = gl.amd.gfx1250.tdm.advance(
-            bs_desc, [0, K_GROUPS * LANES_PER_B128]
-        )
+        as_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(as_desc, [0, K_GROUPS])
+        bs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(bs_desc, [0, K_GROUPS])
         load_idx += 1
 
     # --- 2. Pre-load tile 0 from LDS into registers ---
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 4)
 
     slot_c = compute_idx % NUM_BUFFERS
-    cur_A = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        smem_A.index(slot_c), layout=dot_a_layout
-    )
-    cur_B = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        depreshuffle_b_raw_to_kn(
-            smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES
-        ),
-        layout=dot_b_layout,
-    )
-    cur_AS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        smem_AS.index(slot_c).reshape((BLOCK_SIZE_M, K_GROUPS)), layout=a_scale_layout
-    )
-    cur_BS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        smem_BS.index(slot_c).reshape((BLOCK_SIZE_N, K_GROUPS)), layout=b_scale_layout
-    )
+    cur_A = smem_A.index(slot_c).load(layout=dot_a_layout)
+    cur_B = depreshuffle_b_raw_to_kn(
+        smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES
+    ).load(layout=dot_b_layout)
+    cur_AS = smem_AS.index(slot_c).load(layout=a_scale_layout)
+    cur_BS = smem_BS.index(slot_c).load(layout=b_scale_layout)
 
     # --- 3. Main loop: WMMA(cur) → TDM(future) → wait → pre-load(next) ---
     main_iters = k_tiles - (NUM_BUFFERS - 1)
@@ -289,50 +271,33 @@ def gemm_mxfp4_preshuffle_gfx1250(
         )
 
         # TDM load next tile (descriptors are already positioned by
-        # the previous iter's / prologue's trailing advance)
+        # the previous iter's / prologue's trailing update_tensor_descriptor)
         slot = load_idx % NUM_BUFFERS
 
         gl.amd.gfx1250.tdm.async_load(a_desc, [0, 0], smem_A.index(slot))
         gl.amd.gfx1250.tdm.async_load(b_desc, [0, 0], smem_B.index(slot))
         gl.amd.gfx1250.tdm.async_load(as_desc, [0, 0], smem_AS.index(slot))
         gl.amd.gfx1250.tdm.async_load(bs_desc, [0, 0], smem_BS.index(slot))
-        a_desc = gl.amd.gfx1250.tdm.advance(
-            a_desc, [0, BLOCK_K_BYTES]
-        )
-        b_desc = gl.amd.gfx1250.tdm.advance(
+        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_desc, [0, BLOCK_K_BYTES])
+        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             b_desc, [0, BLOCK_K_BYTES * 16]
         )
-        as_desc = gl.amd.gfx1250.tdm.advance(
-            as_desc, [0, K_GROUPS * LANES_PER_B128]
-        )
-        bs_desc = gl.amd.gfx1250.tdm.advance(
-            bs_desc, [0, K_GROUPS * LANES_PER_B128]
-        )
+        as_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(as_desc, [0, K_GROUPS])
+        bs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(bs_desc, [0, K_GROUPS])
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 4)
         load_idx += 1
 
         # Pre-load next tile from LDS into registers
         next_slot = (compute_idx + 1) % NUM_BUFFERS
-        cur_A = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_A.index(next_slot), layout=dot_a_layout
-        )
-        cur_B = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            depreshuffle_b_raw_to_kn(
-                smem_B.index(next_slot),
-                BLOCK_N=BLOCK_SIZE_N,
-                BLOCK_K_BYTES=BLOCK_K_BYTES,
-            ),
-            layout=dot_b_layout,
-        )
-        cur_AS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_AS.index(next_slot).reshape((BLOCK_SIZE_M, K_GROUPS)),
-            layout=a_scale_layout,
-        )
-        cur_BS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_BS.index(next_slot).reshape((BLOCK_SIZE_N, K_GROUPS)),
-            layout=b_scale_layout,
-        )
+        cur_A = smem_A.index(next_slot).load(layout=dot_a_layout)
+        cur_B = depreshuffle_b_raw_to_kn(
+            smem_B.index(next_slot),
+            BLOCK_N=BLOCK_SIZE_N,
+            BLOCK_K_BYTES=BLOCK_K_BYTES,
+        ).load(layout=dot_b_layout)
+        cur_AS = smem_AS.index(next_slot).load(layout=a_scale_layout)
+        cur_BS = smem_BS.index(next_slot).load(layout=b_scale_layout)
         compute_idx += 1
 
     # --- 4. Epilogue: drain remaining tiles (no new TDM loads) ---
@@ -340,25 +305,14 @@ def gemm_mxfp4_preshuffle_gfx1250(
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 4)
 
         next_slot = (compute_idx + 1) % NUM_BUFFERS
-        next_A = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_A.index(next_slot), layout=dot_a_layout
-        )
-        next_B = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            depreshuffle_b_raw_to_kn(
-                smem_B.index(next_slot),
-                BLOCK_N=BLOCK_SIZE_N,
-                BLOCK_K_BYTES=BLOCK_K_BYTES,
-            ),
-            layout=dot_b_layout,
-        )
-        next_AS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_AS.index(next_slot).reshape((BLOCK_SIZE_M, K_GROUPS)),
-            layout=a_scale_layout,
-        )
-        next_BS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_BS.index(next_slot).reshape((BLOCK_SIZE_N, K_GROUPS)),
-            layout=b_scale_layout,
-        )
+        next_A = smem_A.index(next_slot).load(layout=dot_a_layout)
+        next_B = depreshuffle_b_raw_to_kn(
+            smem_B.index(next_slot),
+            BLOCK_N=BLOCK_SIZE_N,
+            BLOCK_K_BYTES=BLOCK_K_BYTES,
+        ).load(layout=dot_b_layout)
+        next_AS = smem_AS.index(next_slot).load(layout=a_scale_layout)
+        next_BS = smem_BS.index(next_slot).load(layout=b_scale_layout)
 
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
@@ -368,7 +322,6 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
     # --- 5. Final WMMA ---
     acc = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc)
-
 
     # =====================================================================
     # Store output

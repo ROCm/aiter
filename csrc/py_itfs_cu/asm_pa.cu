@@ -90,6 +90,8 @@ struct __attribute__((packed)) PsKernelArgs
     p2 _p25;
     unsigned int stride_scale_blk;
     p3 _p26;
+    unsigned int stride_scale_page;
+    p3 _p27;
 };
 
 
@@ -345,6 +347,9 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     int stride_scale_blk = (K_QScale != nullptr)
                                ? (K_QScale->stride(1) * K_QScale->element_size())
                                : (block_size * sizeof(float));
+    int stride_scale_page = (K_QScale != nullptr)
+                                ? (K_QScale->stride(0) * K_QScale->element_size())
+                                : (num_kv_heads * block_size * sizeof(float));
     float k_log2e      = f_log2E;
     float k_scalar     = sqrt(dim);
     k_scalar           = (float)((double)k_log2e / (double)k_scalar);
@@ -381,6 +386,7 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     args.ptr_SplitO   = (work_info != nullptr) ? splitData->data_ptr() : nullptr;
     args.ptr_SplitLSE = (work_info != nullptr) ? splitLse->data_ptr() : nullptr;
     args.stride_scale_blk = stride_scale_blk;
+    args.stride_scale_page = stride_scale_page;
     args.mtp          = max_qlen - 1;
 
     const HipDeviceGuard device_guard(Q->device_id);

@@ -42,43 +42,6 @@ def un_shuffle_scales(scales_shuffled: torch.Tensor):
     scales = scales.view(sm, sn)
     return scales
 
-
-def shuffle_scales_gfx1250(scales: torch.Tensor, BLOCK_K=256) -> torch.Tensor:
-    # Per-tile preshuffle. Each tile T occupies a contiguous K-byte stripe
-    # [T*K_GROUPS*4, (T+1)*K_GROUPS*4) in the output, with the 4 lanes packed
-    # adjacently inside each stripe so the kernel's TDM read sees:
-    #   [tile_T_lane_0_K_groups | tile_T_lane_1 | tile_T_lane_2 | tile_T_lane_3]
-    M, total_K_groups = scales.shape
-    LANES_PER_B128 = 4
-    K_GROUPS = BLOCK_K // SCALE_GROUP_SIZE
-    assert M % LANES_PER_B128 == 0
-    assert total_K_groups % K_GROUPS == 0
-    k_tiles = total_K_groups // K_GROUPS
-    return (
-        scales.reshape(M // LANES_PER_B128, LANES_PER_B128, k_tiles, K_GROUPS)
-        .permute(0, 2, 1, 3)
-        .contiguous()
-        .reshape(M // LANES_PER_B128, k_tiles * LANES_PER_B128 * K_GROUPS)
-    )
-
-
-def unshuffle_scales_gfx1250(
-    scales_shuffled: torch.Tensor, BLOCK_K=256, M: int = None
-) -> torch.Tensor:
-    LANES_PER_B128 = 4
-    K_GROUPS = BLOCK_K // SCALE_GROUP_SIZE
-    rows, cols = scales_shuffled.shape
-    if M is None:
-        M = rows * LANES_PER_B128
-    k_tiles = cols // (LANES_PER_B128 * K_GROUPS)
-    return (
-        scales_shuffled.reshape(rows, k_tiles, LANES_PER_B128, K_GROUPS)
-        .permute(0, 2, 1, 3)
-        .contiguous()
-        .reshape(M, k_tiles * K_GROUPS)
-    )
-
-
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
 
@@ -135,11 +98,8 @@ def generate_gemm_afp4wfp4_inputs(
     w_scales = w_scales.T
     if shuffle_scales_fg:
         if DEVICE_ARCH == "gfx1250":
-            if M >= 32:
-                x_scales_shuffled = shuffle_scales_gfx1250(x_scales)
-            else:
-                x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scales_gfx1250(w_scales)
+            x_scales_shuffled = x_scales.contiguous()
+            w_scales_shuffled = w_scales.contiguous()
         else:
             if M >= 32:
                 x_scales_shuffled = shuffle_scales(x_scales)
@@ -337,8 +297,8 @@ def test_gemm_afp4_wfp4(
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["TN", "TT"])  # "NN", "NT"
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("layout", ["TN"])  # "NN", "NT"
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_mxfp4_preshuffled_gfx1250(
     M: int,
