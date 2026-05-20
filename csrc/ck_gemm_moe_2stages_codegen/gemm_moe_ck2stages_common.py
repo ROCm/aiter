@@ -89,6 +89,8 @@ class kernelInstanceGEMM2:
     CDEElementOp: str = "TypeCast"
     QuantType: int = 1
     stage: int = 2
+    # MNPerXDLArg: MFMA tile size (16 = mfma_f32_16x16x32f8f8 default; 32 = mfma_f32_32x32x16f8f8 for KPerBlock=32 nopad path)
+    MNPerXDLArg: int = 16
 
     @property
     def name(self) -> str:
@@ -199,8 +201,18 @@ a8w8_gemm1_blockscale_kernels_list= {
      4: kernelInstanceGEMM1(       256,       16,         64,       256,     1,       4,        1,),
      5: kernelInstanceGEMM1(       256,       32,         64,       128,     1,       4,        1,),
      6: kernelInstanceGEMM1(       256,       64,         64,       128,     1,       4,        1,),
-     # NWaves=4 variant of #3 (added on main); renumbered to 7 to avoid collision with NPerBlock=64 set above
-     7: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        1,),
+     # NPerBlock=32 kernel for inter_dim divisible by 32 but not 64 (e.g. tp=8 inter_dim=160)
+     # gfx942 fp8 path: KPack=16 (not 32 — entry 10 §7.4 is gfx950), min KPerBlock=64; pick 128 mimic id 1
+     # NWaves cannot be 4 (32/(16*4)=0.5); pick NWaves=2 -> BLOCKSIZE=1*2*64=128 (mimic id 1 small block)
+     # PipelineVer=1: V3 requires MRepeat>=4, NPerBlock=32 + V3 not validated in W1
+     7: kernelInstanceGEMM1(       128,       16,         32,       128,     1,       2,        1,),
+     # W3: extend NPerBlock=32 to block_m=32 / 64 sub-cases
+     # block_m=32 (id 8): mimic id=7 (BLOCKSIZE=128, MWaves=1, NWaves=2, V=1), MXDLPerWave=2
+     # block_m=64 (id 9): B' fallback (BLOCKSIZE=256, MWaves=2, NWaves=2, V=1), MXDLPerWave=2 — 低风险路径, lead R01 P1-A 决策
+     8: kernelInstanceGEMM1(       128,       32,         32,       128,     1,       2,        1,),
+     9: kernelInstanceGEMM1(       256,       64,         32,       128,     2,       2,        1,),
+     # NWaves=4 variant of #3 (added on main); renumbered to 10 to avoid collision with NPerBlock=32 nopad set above
+     10: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        1,),
 }
 
 # gemm1 out:bf16/fp16 A:fp8 B:win4
@@ -318,7 +330,8 @@ a8w8_gemm2_kernels_list= {
 }
 
 # gemm2 MXDLPerWave out:bf16/fp16 AB:fp8/i8
-a8w8_gemm2_blockscale_kernels_list= {
+# gfx950: 仅 NPerBlock=128, KPerBlock>=128 (KPack=32 强制) — T10/T12 已证 KPerBlock<128 不可行
+a8w8_gemm2_blockscale_kernels_list_gfx950= {
      0: kernelInstanceGEMM2(       256,       16,        128,       256,     1,       4,        1,),
      1: kernelInstanceGEMM2(       128,       16,        128,       128,     1,       2,        1,),
      2: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
@@ -326,7 +339,30 @@ a8w8_gemm2_blockscale_kernels_list= {
      # NOTE: KPerBlock=64 for FP8 blockscale is NOT supported on gfx950:
      # static_assert(KPerThread % KPack == 0) fails (KPack=32 for FP8 mfma).
      # Stage2 K=inter_dim requires padding to next multiple of 128.
-     5: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        1,),
+}
+
+# gfx942 (default): 含 NPerBlock=128 现有 0-3 + NPerBlock=32 KPerBlock=32 nopad 4-6
+# T15 §1.3 + T11 verdict: MPerXdl=NPerXdl=32 唯一可行; NWaves=1 forced; KPack=16
+a8w8_gemm2_blockscale_kernels_list= {
+     0: kernelInstanceGEMM2(       256,       16,        128,       256,     1,       4,        1,),
+     1: kernelInstanceGEMM2(       128,       16,        128,       128,     1,       2,        1,),
+     2: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
+     3: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
+     # [T15 NEW] NPerBlock=32 KPerBlock=32 stage 2 nopad for tp=8 inter_dim=160 gfx942
+     # T11 §1 verdict: only MNPerXDL=32 path PASSes (KPerThread=16=KPack)
+     # gfx942 only — gfx950 blocked by KPack=32 (T10/T12)
+     # block_m=16 entry (id 4) skipped: MPerBlock=16 + MPerXdl=32 → MXDLPerWave=0.5 invalid
+     # (T15 §3.3 / §4 caveat); block_m must be >=32 for NPerBlock=32 path
+     # MNPerXDLArg=32 explicitly required: mfma_32x32x16f8f8 (k_per_blk=8, num_input_blks=2)
+     # → K0PerXdlops=2 → KPerThread=KPerBlock/2=16 → KRepeat=16/KPack(16)=1 → 16%16==0 PASS
+     # vs default MNPerXDLArg=16 → mfma_16x16x32f8f8 → K0PerXdlops=4 → KPerThread=8 → 8%16!=0 FAIL
+     5: kernelInstanceGEMM2(        64,       32,         32,        32,     1,       1,        1, MNPerXDLArg=32),
+     6: kernelInstanceGEMM2(       128,       64,         32,        32,     2,       1,        1, MNPerXDLArg=32),
+     #2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
+     # NOTE: KPerBlock=64 for FP8 blockscale is NOT supported on gfx950:
+     # static_assert(KPerThread % KPack == 0) fails (KPack=32 for FP8 mfma).
+     # Stage2 K=inter_dim requires padding to next multiple of 128.
+     7: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        1,),
 }
 
 # gemm2 out:bf16/fp16 A:fp8 B:in4
@@ -365,6 +401,7 @@ gemm2_kernels_dict = {
     "a16w16": a16w16_gemm2_kernels_list,
     "a8w8_gfx950": a8w8_gemm2_kernels_list_gfx950,
     "a8w8": a8w8_gemm2_kernels_list,
+    "a8w8blkscale_gfx950": a8w8_gemm2_blockscale_kernels_list_gfx950,
     "a8w8blkscale": a8w8_gemm2_blockscale_kernels_list,
     "a8w4": a8w4_gemm2_kernels_list,
     "a4w4": a4w4_gemm2_kernels_list,
@@ -472,7 +509,10 @@ def get_gemm2_kernels_list(
         and Adtype == Adtype
         and QuantType in QuantType_list
     ):
-        tag = "a8w8blkscale"
+        if arch == "gfx950":
+            tag = "a8w8blkscale_gfx950"
+        else:
+            tag = "a8w8blkscale"
     elif Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype:
         if arch == "gfx950":
             tag = "a8w8_gfx950"
@@ -502,7 +542,7 @@ def get_gemm2_kernels_list(
 
         if tag == "a8w4":
             kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
-        elif tag == "a8w8blkscale":
+        elif tag == "a8w8blkscale" or tag == "a8w8blkscale_gfx950":
             kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
         elif tag == "a8w8" or tag == "a4w4_bns":
             kernel.CDEElementOp = "MulABScaleExpertWeight"

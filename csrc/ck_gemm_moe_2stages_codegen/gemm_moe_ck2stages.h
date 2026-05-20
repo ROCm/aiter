@@ -456,7 +456,8 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP>
+          int ActOP        = 0,
+          int MNPerXDLArg  = 16> // T19 sync with NT-switch wrapper in common_blockscale.cuh:489-490
 void ck_moe_stage2_gemm(
     const hipStream_t& stream,
     int tokens,

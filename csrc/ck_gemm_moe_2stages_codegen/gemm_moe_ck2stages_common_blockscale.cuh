@@ -330,8 +330,9 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP = 0,
-          bool NT   = false>
+          int ActOP        = 0,
+          bool NT          = false,
+          int MNPerXDLArg  = 16>
 void ck_moe_stage2_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -380,7 +381,9 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
     // static constexpr ck::index_t BLOCKSIZE = 256;
     static constexpr ck::index_t WAVES       = BLOCKSIZE / 64;
-    static constexpr ck::index_t MNPerXDL    = 16;
+    // [T17] MNPerXDL parameterized via template arg MNPerXDLArg (default 16 preserves existing callers).
+    // T15 stage 2 NPerBlock=32 KPerBlock=32 nopad path needs MNPerXDL=32 (T11 verdict).
+    static constexpr ck::index_t MNPerXDL    = MNPerXDLArg;
     static constexpr ck::index_t MXDLPerWave = MPerBlock / (MNPerXDL * MWaves);
     static constexpr ck::index_t NXDLPerWave = NPerBlock / (MNPerXDL * NWaves);
     static constexpr ck::index_t CShuffleMXDLPerWave =
@@ -393,7 +396,10 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     static constexpr ck::index_t AK1           = 16 / sizeof(A0DataType);
     static constexpr ck::index_t BK1 =
         ck::is_same_v<B0DataType, I4> ? 32 / sizeof(B0DataType) : 16 / sizeof(B0DataType);
-    static constexpr ck::index_t CSHUFFLE_N_THREADS = 64;
+    // [T21 nopad path fix] Bound CSHUFFLE_N_THREADS so per-thread N slice >= EVec=2 (vectorization requirement).
+    // Old NPerBlock=128 path: 64 (preserved, 128/64=2 ≥ 2). New NPerBlock=32 nopad path: 16 (32/16=2 ≥ 2).
+    // Formula: NPerBlock / EVec is the upper bound; cap at 64 for backward compat.
+    static constexpr ck::index_t CSHUFFLE_N_THREADS = (NPerBlock <= 32) ? (NPerBlock / 2) : 64;
     static constexpr ck::index_t CSHUFFLE_M_THREADS = BLOCKSIZE / CSHUFFLE_N_THREADS;
     static constexpr ck::index_t EVec               = 2;
     static constexpr ck::index_t D0Vec              = 1;
@@ -483,7 +489,8 @@ template <
     bool Nswizzle,
     bool PerTensorQuant,
     bool MulRoutedWeight,
-    int ActOP = 0>
+    int ActOP,
+    int MNPerXDLArg>
 void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, int N, int K,
                         int topk,
                         void *&inter_states,            // [max_num_tokens_padded, k], input token
@@ -501,7 +508,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt.value() << std::endl;
     if (nt.has_value() && nt.value()) {
-        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, true>(
+        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, true, MNPerXDLArg>(
             stream,
             tokens,
             sorted_size,
@@ -520,7 +527,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
             a2_scale,
             splitk);
     } else {
-        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, false>(
+        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, false, MNPerXDLArg>(
             stream,
             tokens,
             sorted_size,
@@ -541,6 +548,26 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     }
 }
 
+
+// CK_MOE_STAGE2_GEMM_DEFINE_MNX: explicit MNPerXDLArg (17th template arg) — for NPerBlock=32 KPerBlock=32 nopad path
+// 必须显式传 MNPerXDLArg, header default=16 与 NPerBlock=32 配 mfma_16x16x32f8f8 触发 KPerThread%KPack 静态断言失败
+#define CK_MOE_STAGE2_GEMM_DEFINE_MNX(BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, PipelineVer, MNPerXDLArg_val)                                                                \
+    template void ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, MNPerXDLArg_val>( \
+        const hipStream_t &stream,                                                                                                                                   \
+        int tokens, int sorted_size, int N, int K,                                                                                                                   \
+        int topk,                                                                                                                                                    \
+        void *&inter_states,                                                                                                                                         \
+        void *&w1,                                                                                                                                                   \
+        void *&w2,                                                                                                                                                   \
+        void *&sorted_token_ids,                                                                                                                                     \
+        void *&sorted_expert_ids,                                                                                                                                    \
+        void *&sorted_weights,                                                                                                                                       \
+        void *&num_valid_ids,                                                                                                                                        \
+        void *&out,                                                                                                                                                  \
+        std::optional<void *> w2_scale,                                                                                                                              \
+        std::optional<void *> a2_scale,                                                                                                                              \
+        std::optional<int>   splitk,                                                                                                                                 \
+        std::optional<bool>   nt);
 
 #define CK_MOE_STAGE2_GEMM_DEFINE(BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, PipelineVer)                                                                                    \
     template void ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP>( \

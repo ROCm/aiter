@@ -27,6 +27,23 @@ const int ActOP = {ActOP};
 CK_MOE_STAGE{Stage}_GEMM_DEFINE({BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, V{PipelineVer})
 """
 
+# stage 2 explicit MNPerXDLArg variant (NPerBlock=32 nopad path requires MNPerXDLArg=32)
+STG_INSTANCE_IMPL_MNX = """// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "gemm_moe_ck2stages_common{quanttype}.cuh"
+
+using A0DataType = {A0DataType};
+using B0DataType = {B0DataType};
+using AccDataType = {AccDataType};
+using EDataType = {EDataType};
+using CDEElementOp = {CDEElementOp};
+const bool Nswizzle = {Nswizzle};
+const bool PerTensorQuant = {Quant} == static_cast<int>(QuantType::per_Tensor);
+const bool MulRoutedWeight = {MulRoutedWeight};
+const int ActOP = {ActOP};
+CK_MOE_STAGE2_GEMM_DEFINE_MNX({BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, V{PipelineVer}, {MNPerXDLArg})
+"""
+
 
 LOOKUP_head = """#pragma once
 // SPDX-License-Identifier: MIT
@@ -39,6 +56,12 @@ LOOKUP_head = """#pragma once
 LOOKUP_template = """
        {{"{kernel_tag}",                                                                                                       \\
         ck_moe_stage{Stage}_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V{PipelineVer}, {BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>}},                       \\"""
+
+# stage 2 explicit MNPerXDLArg variant for runtime kernel resolution (symbol matches MNX .cu)
+# NT-switch wrapper template signature = 16 args (ActOP, MNPerXDLArg); NT is runtime via std::optional<bool> nt
+LOOKUP_template_MNX = """
+       {{"{kernel_tag}",                                                                                                       \\
+        ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V{PipelineVer}, {BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {MNPerXDLArg}>}},                       \\"""
 
 LOOKUP_end = """
    }
@@ -368,6 +391,40 @@ A8W8_blockscale_gemm1_heuristic_dispatch = """
                 TORCH_CHECK(
                     false,
                     "Unsupported block_m value for NPerBlock=64 blockscale dispatch: ",
+                    block_m);
+            }}
+        }}
+        else if (inter_dim % 128 != 0 && inter_dim % 64 != 0 && inter_dim % 32 == 0)
+        {{
+            // NPerBlock=32: inter_dim is 32-aligned but not 64-aligned (e.g. tp=8 inter_dim=160, inter_dim=96)
+            // scale index block_n_id*32/128 (integer div) maps groups of 4 tiles to one per_1x128 scale
+            // W1_RESULTS §1.2: ScaleSliceSizeN = ceil(NPerBlock=32, ScaleBlockN=128) = 1
+            // W1_RESULTS §2 candidate A: BLOCKSIZE=128, MPerBlock=16, KPerBlock=128, MWaves=1, NWaves=2, PipelineVer=V1
+            // [W3 EXTEND] sub-case ladder for block_m in {{16, 32, 64}} — fixes W2-V2-block_m_64 caveat
+            // [W3] block_m=32/64 instance bound to lead R01 P1-A finalize (T1 §3.8 candidate A id=8 + B' fallback id=9)
+            if (block_m == 16)
+            {{
+                // [W2 V01-supp PASS] candidate A: V1, 128, 16, 32, 128/sizeof(A0DataType), 1, 2
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 16, 32, 128/sizeof({A0DataType}), 1, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 32)
+            {{
+                // [W3 NEW] lead R01 P1-A binding: A (id=8) — V1, 128, 32, 32, 128/sizeof(A0DataType), 1, 2
+                // mimic id=7 minimal drift; MXDLPerWave=2, M-axis line 1607 extension carries [unverified inference] caveat (T1 §3.5)
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 32, 32, 128/sizeof({A0DataType}), 1, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 64)
+            {{
+                // [W3 NEW] lead R01 P1-A binding: B' fallback (id=9) — V1, 256, 64, 32, 128/sizeof(A0DataType), 2, 2
+                // BLOCKSIZE=256/MWaves=2/MXDLPerWave=2 low-risk; rejected T1 main B (BLOCKSIZE=128/MWaves=1/MXDLPerWave=4)
+                // PipelineVer=1 (single-LDS) — Run_2Lds caveat (W1 §4.3 #3) NOT triggered
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 32, 128/sizeof({A0DataType}), 2, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else
+            {{
+                TORCH_CHECK(
+                    false,
+                    "Unsupported block_m value for NPerBlock=32 blockscale dispatch: ",
                     block_m);
             }}
         }}
@@ -765,7 +822,63 @@ A4W4_bns_gemm2_heuristic_dispatch = """
 #endif
 """
 
+# gfx942 (default): 含 NPerBlock=32 KPerBlock=32 nopad outer-if (T15 + T16 spec)
+# K=160 (32-aligned, 64-non-aligned) 命中 nopad; K=192 (64-aligned) 不命中走 pad fallback
+# 18th template arg = MNPerXDLArg=32 (T17 wrapper template extension; default 16 backward compat)
 A8W8_blockscale_gemm2_heuristic_dispatch = """
+
+    if (dtype_checker<{A0DataType}>{{}}(x_dtype)
+        && dtype_checker<{B0DataType}>{{}}(w_dtype)
+        && dtype_checker<{EDataType}>{{}}(y_dtype)
+        && {MulRoutedWeight} == mul_routed_weight_stage
+        && {Quant} == quant)
+    {{
+        if (inter_dim % 128 != 0 && inter_dim % 64 != 0 && inter_dim % 32 == 0)
+        {{
+            // [T15+T16+T17 NEW] NPerBlock=32 / KPerBlock=32 nopad path (gfx942 only)
+            // T11 verdict: KPack=16, MPerXdl=NPerXdl=32 唯一可行 (KPerThread=KPerBlock/K0PerXdlops=32/2=16=KPack)
+            // gfx950 不会到达此分支 (由 codegen-time tag 拆分到 a8w8blkscale_gfx950)
+            // K=160 命中 (160%128!=0, 160%64!=0, 160%32==0), K=192 (192%64==0) 不命中
+            // 17th-18th template args: ActOP, MNPerXDLArg=32 (T17 wrapper extension; default 16 backward compat)
+            // block_m=16 fallback to else: MPerBlock=16 + MPerXdl=32 → MXDLPerWave=0.5 invalid (T15 §3.3 caveat)
+            if (block_m == 32)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 32, 32/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, 32>;
+            }}
+            else if (block_m == 64)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 64, 32, 32/sizeof({A0DataType}), 2, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, 32>;
+            }}
+            // block_m=16 falls through to pad path below
+        }}
+        if (block_m == 16)
+        {{
+            if (inter_dim % 256 == 0)
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            else
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 16, 128, 128/sizeof({A0DataType}), 1, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else if (block_m == 32)
+        {{
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else if (block_m == 64)
+        {{
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+        }}
+        else
+        {{
+            TORCH_CHECK(
+                false,
+                "Unsupported block_m value for moe heuristic dispatch: ",
+                block_m);
+        }}
+    }}
+"""
+
+# gfx950 path: 仅 NPerBlock=128 / KPerBlock>=128 (KPack=32 强制); K=160 强制 pad 到 128 整数倍
+# 字面同现 a8w8blkscale stage 2 行为 (W3 pre-T17 状态)
+A8W8_blockscale_gemm2_gfx950_heuristic_dispatch = """
 
     if (dtype_checker<{A0DataType}>{{}}(x_dtype)
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
@@ -811,6 +924,10 @@ heuristic_dispatch_dict = {
     "a8w8blkscale": [
         A8W8_blockscale_gemm1_heuristic_dispatch,
         A8W8_blockscale_gemm2_heuristic_dispatch,
+    ],
+    "a8w8blkscale_gfx950": [
+        A8W8_blockscale_gemm1_heuristic_dispatch,
+        A8W8_blockscale_gemm2_gfx950_heuristic_dispatch,
     ],
     "a16w16_gfx950": [
         A16W16_A8W8_gemm1_gfx950_heuristic_dispatch,
@@ -951,7 +1068,13 @@ class ck_moe_2stage_gemm_codegen:
                 )
                 if not os.path.exists(f_instance):
                     with open(f_instance, "a") as f_ins:
-                        stage_instance = STG_INSTANCE_IMPL.format(
+                        # Select MNX variant if stage==2 and kernel has non-default MNPerXDLArg
+                        use_mnx = (
+                            kernel.stage == 2
+                            and getattr(kernel, "MNPerXDLArg", 16) != 16
+                        )
+                        impl_template = STG_INSTANCE_IMPL_MNX if use_mnx else STG_INSTANCE_IMPL
+                        fmt_kwargs = dict(
                             quanttype=quanttype,
                             A0DataType=self.a_dtype,
                             B0DataType=self.b_dtype,
@@ -975,6 +1098,9 @@ class ck_moe_2stage_gemm_codegen:
                                 self.mul_routed_weight_stage == kernel.stage
                             ).lower(),
                         )
+                        if use_mnx:
+                            fmt_kwargs["MNPerXDLArg"] = kernel.MNPerXDLArg
+                        stage_instance = impl_template.format(**fmt_kwargs)
                         if "FP4" in self.b_dtype:
                             stage_instance = (
                                 "#ifndef __gfx942__\n" + stage_instance + "\n#endif\n"
@@ -982,7 +1108,11 @@ class ck_moe_2stage_gemm_codegen:
                         f_ins.write(stage_instance)
 
                 ## generate lookUpTable
-                lookup_ele = LOOKUP_template.format(
+                use_mnx = (
+                    kernel.stage == 2 and getattr(kernel, "MNPerXDLArg", 16) != 16
+                )
+                lookup_template_choice = LOOKUP_template_MNX if use_mnx else LOOKUP_template
+                lookup_kwargs = dict(
                     kernel_tag=kernel.name,
                     A0DataType=self.a_dtype,
                     B0DataType=self.b_dtype,
@@ -1004,6 +1134,9 @@ class ck_moe_2stage_gemm_codegen:
                         self.mul_routed_weight_stage == kernel.stage
                     ).lower(),
                 )
+                if use_mnx:
+                    lookup_kwargs["MNPerXDLArg"] = kernel.MNPerXDLArg
+                lookup_ele = lookup_template_choice.format(**lookup_kwargs)
                 f_lookup.write(lookup_ele)
 
         f_gemm1_heuristic_dispatch = os.path.join(
