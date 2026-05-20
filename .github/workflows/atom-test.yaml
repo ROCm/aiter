@@ -80,7 +80,7 @@ jobs:
                   "extraArgs": "--kv_cache_dtype fp8 -tp 8",
                   "env_vars": "",
                   "accuracy_test_threshold": "0.94",
-                  "runner": "aiter-8gpu-runner",
+                  "runner": "linux-aiter-mi300x-8",
                   "run_on_pr": True,
                   "job_name": "ATOM Benchmark (DeepSeek-R1-0528, MI300X)",
               },
