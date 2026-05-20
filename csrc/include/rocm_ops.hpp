@@ -2207,22 +2207,35 @@ namespace py = pybind11;
           py::arg("split_output"),          \
           py::arg("split_lse"),             \
           py::arg("final_output"));
-#define MLA_HK_V40_PYBIND                   \
-    m.def("hk_mla_v40_decode_fwd",          \
-          &hk_mla_v40_decode_fwd,           \
-          "hk_mla_v40_decode_fwd",          \
-          py::arg("query"),                 \
-          py::arg("query_rope"),            \
-          py::arg("kv_buffer"),             \
-          py::arg("kv_buffer_rope"),        \
-          py::arg("qo_indptr"),             \
-          py::arg("kv_indptr"),             \
-          py::arg("kv_page_indices"),       \
-          py::arg("kv_last_page_lens"),     \
-          py::arg("work_indptr"),           \
-          py::arg("work_info_set"),         \
-          py::arg("max_seqlen_q"),          \
-          py::arg("softmax_scale"),         \
-          py::arg("split_output"),          \
-          py::arg("split_lse"),             \
-          py::arg("final_output"));
+#define MLA_HK_V40_PYBIND                                     \
+    m.def("hk_mla_v40_decode_fwd",                            \
+          &hk_mla_v40_decode_fwd,                             \
+          "hk_mla_v40_decode_fwd",                            \
+          py::arg("query"),                                   \
+          py::arg("query_rope"),                              \
+          py::arg("kv_buffer"),                               \
+          py::arg("kv_buffer_rope"),                          \
+          py::arg("qo_indptr"),                               \
+          py::arg("kv_indptr"),                               \
+          py::arg("kv_page_indices"),                         \
+          py::arg("kv_last_page_lens"),                       \
+          py::arg("work_indptr"),                             \
+          py::arg("work_info_set"),                           \
+          py::arg("max_seqlen_q"),                            \
+          py::arg("softmax_scale"),                           \
+          py::arg("split_output"),                            \
+          py::arg("split_lse"),                               \
+          py::arg("final_output"));                           \
+    m.def("hk_mla_v40_qmanager_v1_unit_test",                 \
+          &hk_mla_v40_qmanager_v1_unit_test,                  \
+          "hk_mla_v40_qmanager_v1_unit_test",                 \
+          py::arg("query"),                                   \
+          py::arg("query_rope"),                              \
+          py::arg("q_vgpr_out"),                              \
+          py::arg("q_lds_out"));                              \
+    m.def("hk_mla_v40_qmanager_v1_p1_ladder_probe",           \
+          &hk_mla_v40_qmanager_v1_p1_ladder_probe,            \
+          "hk_mla_v40_qmanager_v1_p1_ladder_probe",           \
+          py::arg("query"),                                   \
+          py::arg("query_rope"),                              \
+          py::arg("dump_out"));

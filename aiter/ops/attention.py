@@ -1542,3 +1542,29 @@ def hk_mla_v40_decode_fwd(
     split_lse: torch.Tensor,
     final_output: torch.Tensor,
 ) -> None: ...
+
+
+@compile_ops("module_hk_mla_v40_fwd", develop=True)
+def hk_mla_v40_qmanager_v1_unit_test(
+    # [1, 128, 576] FP8 packed Q (1 token, 128 heads, per-token packing)
+    query: torch.Tensor,
+    # [1, 128, 64]  BF16
+    query_rope: torch.Tensor,
+    # [8, 16, 256]  BF16  -- VGPR half (Q[:, 0:256]),
+    #                       indexed [warp_idx, head_in_warp, feat]
+    q_vgpr_out: torch.Tensor,
+    # [8, 16, 256]  BF16  -- LDS half (Q[:, 256:512]); raw 64 KB dump,
+    #                       Python decodes using wave-major sub-block layout
+    q_lds_out: torch.Tensor,
+) -> None: ...
+
+
+@compile_ops("module_hk_mla_v40_fwd", develop=True)
+def hk_mla_v40_qmanager_v1_p1_ladder_probe(
+    # [1, 128, 576] FP8 packed Q (1 token, 128 heads)
+    query: torch.Tensor,
+    # [1, 128, 64]  BF16  -- unused; kept for API parity
+    query_rope: torch.Tensor,
+    # [8, 4, 512]   BF16  -- 4 KB/warp: 4 checkpoint slots x 1024 B raw staging
+    dump_out: torch.Tensor,
+) -> None: ...

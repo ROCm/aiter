@@ -1438,10 +1438,18 @@
     "module_hk_mla_v40_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_hk_v40_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/hk_v40_decode_fwd.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk_v40_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk_v40_qmgr_v1_unit_test.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "f'-DHKMLA_V40_PROBE_QVGPR_ITER={os.environ.get(\"V40_PROBE_QVGPR_ITER\", \"0\")}'",
+            "f'-DHKMLA_V40_PROBE_QLDS_ITER={os.environ.get(\"V40_PROBE_QLDS_ITER\", \"0\")}'",
+            "f'-DHKMLA_V40_PROBE_KVTOP_ITER={os.environ.get(\"V40_PROBE_KVTOP_ITER\", \"0\")}'",
+            "f'-DHKMLA_V40_PROBE_P1_STAGING_CHUNK={os.environ.get(\"V40_PROBE_P1_STAGING_CHUNK\", \"0\")}'",
+            "f'{(\"-DHKMLA_V40_PROBE_P1_STAGING=1\" if os.environ.get(\"V40_PROBE_P1_STAGING\", \"\") else \"\")}'",
+            "f'{(\"-DHKMLA_V40_PROBE_P1_SENTINEL=1\" if os.environ.get(\"V40_PROBE_P1_SENTINEL\", \"\") else \"\")}'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",

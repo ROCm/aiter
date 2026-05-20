@@ -235,13 +235,29 @@ enum class PvGemmEpilogueType : uint32_t
 namespace hk_mla {
 
 // Decode an E8M0 scale byte (8-bit unsigned biased exponent, bias = 127) into
-// its fp32 representation. Encoding: B in [0, 255] decodes to 2^(B - 127),
-// produced by placing (B + 127) into the exponent field of an IEEE fp32:
-//   bits = (B + 127) << 23, then bit_cast to float. (E8M0 has no mantissa,
-// so the mantissa field is all zeros, giving an exact power of two.)
+// its fp32 representation. Encoding:
+//   B == 0   -> 0.0f          (special: the "zero scale" slot)
+//   B == 255 -> +inf          (handled naturally: 255 << 23 is the IEEE
+//                              encoding for +inf when the mantissa is 0)
+//   else     -> 2^(B - 127)   (IEEE fp32 with biased exponent = B, mantissa = 0,
+//                              i.e. bits = B << 23, then bit_cast to float).
 __device__ __forceinline__ float e8m0_to_f32(uint32_t b)
 {
-    return __builtin_bit_cast(float, (b + 127u) << 23);
+    // The lshl MUST be inline-asm volatile so the compiler keeps it in
+    // source order with the upstream `hkm::buffer_load_ubyte` (also asm
+    // volatile) and the intervening `s_waitcnt vmcnt(0)` builtin.
+    // Plain `b << 23` is a pure expression that LLVM happily hoists into
+    // the same basic block as the load (no SSA-level vmem dep on `b`),
+    // which races the vmem completion and lets the cvt see scale=garbage
+    // -> denormal bf16 output. Bug reproduced in module_hk_mla_v40_fwd
+    // (V40 -c=1 all-zero output).
+    if(b == 0u)
+    {
+        return 0.0f;
+    }
+    float result;
+    asm volatile("v_lshlrev_b32 %0, 23, %1" : "=v"(result) : "v"(b));
+    return result;
 }
 
 // Encode the immediate operand for `__builtin_amdgcn_s_waitcnt(int)` on

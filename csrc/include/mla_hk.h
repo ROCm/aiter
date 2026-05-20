@@ -45,3 +45,27 @@ void hk_mla_v40_decode_fwd(aiter_tensor_t& query,
                            aiter_tensor_t& split_output,
                            aiter_tensor_t& split_lse,
                            aiter_tensor_t& final_output);
+
+// QManager8to16bitsV1 standalone unit test entry. Runs only the Q loader
+// (no QK / softmax / PV / epilogue) and dumps the result to two tensors.
+//   query        : [1, 128, 576]  FP8 packed Q (1 token, 128 heads)
+//   query_rope   : [1, 128, 64]   BF16
+//   q_vgpr_out   : [8, 16, 256]   BF16 -- VGPR half (Q[:, 0:256])
+//                  laid out as [warp_idx, head_in_warp (0..15), feat (0..255)]
+//   q_lds_out    : [8, 16, 256]   BF16 -- LDS  half (Q[:, 256:512])
+//                  same indexing as q_vgpr_out
+void hk_mla_v40_qmanager_v1_unit_test(aiter_tensor_t& query,
+                                      aiter_tensor_t& query_rope,
+                                      aiter_tensor_t& q_vgpr_out,
+                                      aiter_tensor_t& q_lds_out);
+
+// Diagnostic for QManager8to16bitsV1 Phase-1 ladder: replays the chunk 0/1/2/3
+// producer ladder with checkpoint LDS dumps. dump_out layout:
+//   [warp_idx (0..7), slot (0..3), 512 bf16] = 4 KB/warp
+// slot 0 = buf 0 after chunk-0 producer
+// slot 1 = buf 1 after chunk-1 producer
+// slot 2 = buf 0 after chunk-0 consumer + chunk-2 producer
+// slot 3 = buf 1 after chunk-1 consumer + chunk-3 producer
+void hk_mla_v40_qmanager_v1_p1_ladder_probe(aiter_tensor_t& query,
+                                            aiter_tensor_t& query_rope,
+                                            aiter_tensor_t& dump_out);
