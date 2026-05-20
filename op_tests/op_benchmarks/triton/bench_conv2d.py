@@ -77,9 +77,12 @@ METHODS = {
 }
 
 
-# Default sweep shapes — same set as the test edge cases. Kept in sync by hand
-# (12 tuples; trivial duplication, see _helpers.get_edge_case_shapes).
-DEFAULT_SHAPES = [
+# Edge-case smoke set — same shapes as the unit-test edge cases (see
+# _helpers.get_edge_case_shapes). These exercise degenerate paths (C=1,
+# dilation>1, asymmetric dims, stride>1, etc.) that real production
+# models don't hit. Used only when --smoke is passed; otherwise the sweep
+# defaults to a real model from model_shapes.json.
+EDGE_CASE_SHAPES = [
     # (N, C, H, W, K, R, S, stride, padding, dilation, desc)
     (1, 3, 7, 7, 8, 3, 3, (1, 1), (1, 1), (1, 1), "3x3 same padding"),
     (1, 3, 8, 8, 16, 1, 1, (1, 1), (0, 0), (1, 1), "1x1 stride1"),
@@ -660,7 +663,7 @@ def _load_model_shapes(model_pattern: str) -> tuple[str, list]:
 
     model_pattern: case-insensitive substring matched against model keys.
     Returns (matched_model_name, list of shape tuples in the same form as
-    DEFAULT_SHAPES — desc is "<model> L<i>").
+    EDGE_CASE_SHAPES — desc is "<model> L<i>").
     """
     with open(_MODEL_SHAPES_PATH) as f:
         data = json.load(f)
@@ -705,18 +708,24 @@ def run_sweep(args) -> None:
     """Iterate the chosen shape set, then print three summary tables."""
     dtype = _torch_dtype(args.dtype)
 
-    if args.model:
+    if args.smoke:
+        shapes = EDGE_CASE_SHAPES
+        print(
+            f"# Sweep source: EDGE_CASE_SHAPES ({len(shapes)} shapes) — smoke / "
+            "degenerate-path coverage, NOT representative of production workloads"
+        )
+    else:
+        # Default: real-model sweep. --model picks one; absent → resnet50.
+        model_name = args.model if args.model else "resnet50"
         try:
-            model, shapes = _load_model_shapes(args.model)
-            print(
-                f"# Sweep source: model_shapes.json :: {model} ({len(shapes)} layers)"
-            )
+            model, shapes = _load_model_shapes(model_name)
+            label = f":: {model} ({len(shapes)} layers)"
+            if not args.model:
+                label += "  (default — pass --model X or --smoke to change)"
+            print(f"# Sweep source: model_shapes.json {label}")
         except (FileNotFoundError, ValueError) as e:
             print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(1)
-    else:
-        shapes = DEFAULT_SHAPES
-        print(f"# Sweep source: built-in DEFAULT_SHAPES ({len(shapes)} shapes)")
 
     print(
         f"# dtype={args.dtype} method={args.method} layout={args.layout} "
@@ -847,7 +856,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=None,
         help="sweep mode: load conv2d shapes for this model from "
         "model_shapes.json (case-insensitive substring match). If omitted, "
-        "the built-in DEFAULT_SHAPES list is used.",
+        "defaults to resnet50 unless --smoke is passed.",
+    )
+    p.add_argument(
+        "--smoke",
+        action="store_true",
+        help="sweep mode: use the EDGE_CASE_SHAPES set instead of a real model. "
+        "Exercises degenerate paths (C=1, dilation>1, asymmetric dims, etc.) "
+        "for regression smoke-testing. NOT representative of production perf.",
     )
 
     # Single-shape mode (used by bench_models.py and one-off measurements).

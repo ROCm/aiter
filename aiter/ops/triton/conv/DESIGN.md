@@ -27,8 +27,6 @@ tolerance model used by the test suite, and how to add a new kernel.
   left to PyTorch/MIOpen.
 - **`padding_mode != "zeros"`** (reflect / replicate / circular). Same fall-back.
 - **fp32 / fp8 inputs not supported.**
-- Tuning, autotune configs, and the `_select_3x3_method`
-  routing table are RDNA4-specific for now.
 
 ---
 
@@ -126,8 +124,13 @@ aiter/ops/triton/conv/
 
 aiter/ops/triton/_triton_kernels/conv/
   __init__.py          empty marker (kernels are imported by full path)
-  helpers.py           shared autotune config lists (consumed by @triton.autotune
-                       in each kernel file) + _tanh helper
+  helpers.py           _tanh helper (shared by all kernels for the gelu path),
+                       plus AUTOTUNE_*_CONFIGS candidate-config lists and the
+                       CONV_AUTOTUNE_ENABLED env-var gate (consumed when
+                       AITER_CONV_AUTOTUNE=1).
+                       Steady-state per-kernel configs live in JSON under
+                       aiter/ops/triton/configs/conv/, loaded via
+                       aiter/ops/triton/utils/conv_config_utils.py.
   conv_1x1.py          1×1 GEMM kernel (NCHW + NHWC via LAYOUT constexpr)
   conv_3x3.py          3×3 NHWC kernel + 3×3 cblocked (NCHWc) kernel
   conv_general.py      K-major reduction with on-the-fly (c, r, s) decoding
@@ -166,7 +169,7 @@ def conv2d(x, w_oihw, bias=None, stride=(1,1), padding=(0,0), dilation=(1,1),
 The semi-public method-specific functions (`conv2d_nchw_cblocked`,
 `conv2d_winograd_f4x3_cblocked`, …) take an internal `block_k=64` channel-pack
 tile size used by the prepack caches. It is intentionally not surfaced on the
-public `conv2d` — every autotune config in `helpers.py` assumes 64, so the
+public `conv2d` — every shipped config in `configs/conv/` assumes 64, so the
 parameter has no good user story.
 
 Both `x.dtype` and (when explicitly passed) `out_dtype` are validated at
@@ -238,7 +241,7 @@ into the user's chosen output layout.
 
 ### 5.0 A platform note on `num_stages`
 
-Every autotune config in `helpers.py` pins **`num_stages=1`**. That is
+Every shipped config in `configs/conv/` pins **`num_stages=1`**. That is
 deliberate.
 
 The `num_stages > 1` Triton knob is meant to lower to a software-pipelined
@@ -271,10 +274,9 @@ The kernel fuses this with the index unwrap `m → (n, p, q)` and a
 `LAYOUT` constexpr (0 = NCHW, 1 = NHWC) that selects the strides on read/write.
 Highlights:
 
-- **Tile shape:** `BLOCK_M × BLOCK_N × BLOCK_K`, autotuned over the
-  `AUTOTUNE_1x1_CONFIGS` grid in `helpers.py`. On RDNA4 the winners cluster
-  around `BM=128, BN=128`, `BK ∈ {32, 64}`, 8 warps (`num_stages=1` —
-  see 5.0).
+- **Tile shape:** `BLOCK_M × BLOCK_N × BLOCK_K`, set per-arch in
+  `aiter/ops/triton/configs/conv/{arch}-CONV-1X1.json` and loaded at launch
+  via `get_conv_config("CONV-1X1")`. `num_stages=1` always — see 5.0.
 - **L2 cache swizzle.** Tiles are reordered into super-groups of
   `GROUP_SIZE_M` along the `M` axis so each weight (`N`-axis) tile is reused
   across `GROUP_SIZE_M` consecutive workgroups before moving on — the same
@@ -302,9 +304,9 @@ NHWC-native 3×3 with **K-major weight layout** `W3[K_out, 9, C_pad]`:
   load addressing collapses to a single base + linear stride; the compiler
   emits one vectorized load per row.
 - **Same L2 swizzle as 5.1**: workgroups are reordered into super-groups of
-  `GROUP_SIZE_M` along the `M` axis (autotuned to 4 or 8 in
-  `AUTOTUNE_3x3_NHWC_CONFIGS`) so each weight (`N`-axis) tile stays hot in
-  L2 across `GROUP_SIZE_M` consecutive workgroups.
+  `GROUP_SIZE_M` along the `M` axis (set to 4 or 8 in
+  `configs/conv/{arch}-CONV-3X3-NHWC.json`) so each weight (`N`-axis) tile
+  stays hot in L2 across `GROUP_SIZE_M` consecutive workgroups.
 
 ### 5.3 `_conv2d_3x3_cblocked_kernel`
 
@@ -335,7 +337,7 @@ Highlights:
   block index and `c_offs % Cb` the offset within the block. This stays
   coalesced **only when `BLOCK_C ≤ Cb`** — at the boundary, `cblock_idx`
   jumps and the load address discontinues. This is an implicit constraint
-  on `AUTOTUNE_3x3_CBLOCKED_CONFIGS`; new configs must respect it.
+  on `configs/conv/{arch}-CONV-3X3-CBLOCKED.json`; new configs must respect it.
 - **Same L2 swizzle as 5.1/5.2** — workgroups are reordered into
   super-groups of `GROUP_SIZE_M` along the `M` axis so each weight
   (`N`-axis) tile stays hot in L2 across `GROUP_SIZE_M` consecutive
@@ -654,8 +656,9 @@ tolerance dispatch — is automatic. You do not edit any of those.
 Concretely, to add (say) a `winograd_f6x3` variant:
 
 1. **Implement the kernel.** New file under `aiter/ops/triton/_triton_kernels/conv/`.
-   Use the autotune config sets in `helpers.py` if a standard one fits; only
-   write a new one if a different shape really needs it.
+   Add a `_get_config()` helper that calls `get_conv_config("CONV-<NAME>")`,
+   and ship `{arch}-CONV-<NAME>.json` files under `aiter/ops/triton/configs/conv/`
+   for each supported arch.
 2. **Add a launch wrapper** in `_launch.py` (`_launch_winograd_f6x3`) that
    sets up the grid and turns Python ints into Triton constexprs.
 3. **Add a public function** in `conv2d.py`

@@ -31,7 +31,9 @@ This op takes the opposite approach: a single set of Triton kernels
 that runs **fp16 and bf16 through the same code path**, supports
 **both NCHW and NHWC end-to-end** (NHWC inputs run on an NHWC kernel —
 no NHWC↔NCHW conversion), and gets reasonable performance across the
-full matrix **without per-architecture hand tuning**. A shape-driven
+full matrix **without per-architecture kernel implementations** (one
+set of Triton kernels for every arch, with a thin per-arch JSON config
+layer — see Tuning). A shape-driven
 router picks between five kernel families (1×1, 3×3 cblocked, 3×3 NHWC,
 Winograd F(4×4, 3×3), general) so the right kernel runs per layer
 automatically. Some kernels do repack inputs/weights into kernel-local
@@ -52,7 +54,7 @@ To measure on your stack:
 
 ```bash
 python -m op_tests.op_benchmarks.triton.bench_conv2d \
-    --model <resnet50|"stable-diffusion-3.5-medium"|"FLUX.2"> \
+    --model <resnet50|"stable-diffusion-3.5-medium"|"FLUX.2-klein-9B"> \
     --dtype <fp16|bf16> \
     [--miopen-solvers]   # opt-in; ~60-120s upfront subprocess
 ```
@@ -111,8 +113,7 @@ images visually indistinguishable from the PyTorch / MIOpen reference.
 
 Pixel-level agreement on FLUX.2-klein-9B (50 diffusion steps, same prompt
 and seed under both backends, only VAE convs swapped to Triton): max diff
-**6 / 255**, mean diff **0.17 / 255**. See `examples/flux2_inference.py`
-to reproduce and inspect the generated images.
+**6 / 255**, mean diff **0.17 / 255**.
 
 ---
 
@@ -132,7 +133,7 @@ to reproduce and inspect the generated images.
 
 Run from the AITER repo root (`/app/aiter` in this tree, or `PYTHONPATH=/app/aiter`).
 
-### Correctness (CDNA CI runs this)
+### Correctness (CI-collected; skipped on unsupported archs)
 
 ```bash
 pytest op_tests/triton_tests/conv/                                # full matrix, 74 tests
@@ -156,17 +157,19 @@ python -m op_tests.op_benchmarks.triton.bench_conv2d \
     --N 1 --C 64 --H 56 --W 56 --K 64 --R 3 --S 3 --pad-h 1 --pad-w 1
 ```
 
-**Built-in 12-shape sweep** (no model required, three box-drawn tables):
+**Real-model sweep** (default — uses ResNet50 if no `--model` given):
 
 ```bash
-python -m op_tests.op_benchmarks.triton.bench_conv2d --dtype fp16
+python -m op_tests.op_benchmarks.triton.bench_conv2d --dtype fp16              # default = resnet50
+python -m op_tests.op_benchmarks.triton.bench_conv2d --model resnet50
+python -m op_tests.op_benchmarks.triton.bench_conv2d --model "FLUX.2-klein-9B" --miopen-solvers
 ```
 
-**Real-model sweep** (reads shapes from `model_shapes.json`):
+**Edge-case smoke sweep** (degenerate paths: `C=1`, dilation>1, asymmetric dims —
+NOT representative of production):
 
 ```bash
-python -m op_tests.op_benchmarks.triton.bench_conv2d --model resnet50
-python -m op_tests.op_benchmarks.triton.bench_conv2d --model "FLUX.2" --miopen-solvers
+python -m op_tests.op_benchmarks.triton.bench_conv2d --dtype fp16 --smoke
 ```
 
 Cross-axis flags:
@@ -191,6 +194,21 @@ python -m op_tests.op_benchmarks.triton.model_benchmarking_tool.extract_conv_sha
 ```
 
 Tested on ROCm 7.2 / PyTorch `2.9.1+gitff65f5b` / Triton 3.7 (commit `23f4e522d`).
+
+### Tuning
+
+Per-kernel configs ship as JSON under `aiter/ops/triton/configs/conv/`, one
+file per `(arch, kernel)` — e.g. `gfx1201-CONV-3X3-NHWC.json`. The loader walks
+three tiers: literal shape pin → `M_LEQ_x` bucket → `"any"` fallback. No
+runtime autotune in the hot path, so CI compile time stays predictable and
+the first call hits no tuning tax.
+
+Tuned for RDNA4 today (configs ship as `gfx1201-*.json` and `gfx1200-*.json`).
+
+If you need to retune at runtime (e.g. while developing a new kernel), set
+`AITER_CONV_AUTOTUNE=1` — this restores the original `@triton.autotune`
+behaviour across the candidate-config lists in
+`_triton_kernels/conv/helpers.py::AUTOTUNE_*_CONFIGS` for the current process.
 
 ---
 
@@ -217,7 +235,7 @@ aiter/ops/triton/conv/                Kernel library
 aiter/ops/triton/_triton_kernels/conv/   @triton.jit kernels
   (1x1, 3x3 cblocked, 3x3 NHWC, general, 5 Winograd kernels)
 
-op_tests/triton_tests/conv/           Pytest unit tests (CDNA CI runs this)
+op_tests/triton_tests/conv/           Pytest unit tests (CI-collected; skipped on unsupported archs)
   test_conv2d.py                      The only collected test file
   _helpers.py                         TestSuite, registry, shape generators
 
