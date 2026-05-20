@@ -473,14 +473,30 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
         prefill_support: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return fused_allreduce_rmsnorm_quant_(
+        quant_type: Any = "per_token",
+        group_size: int = 128,
+        emit_bf16: bool = False,
+    ):
+        if quant_type == "per_token" and group_size == 128 and not emit_bf16:
+            return fused_allreduce_rmsnorm_quant_(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                group_name=self.unique_name,
+                prefill_support=prefill_support,
+            )
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant(
             input_,
             residual_inp_,
             weight_,
             eps,
-            group_name=self.unique_name,
-            prefill_support=prefill_support,
+            prefill_support,
+            quant_type=quant_type,
+            group_size=group_size,
+            emit_bf16=emit_bf16,
         )
 
     def fused_allreduce_rmsnorm_quant_per_group(
@@ -493,10 +509,14 @@ class GroupCoordinator:
         prefill_support: bool = False,
         emit_bf16: bool = False,
     ):
-        if self.device_communicator is None:
-            raise ValueError("No device communicator found")
-        return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
-            input_, residual_inp_, weight_, eps, group_size, prefill_support,
+        return self.fused_allreduce_rmsnorm_quant(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            prefill_support,
+            quant_type="per_group",
+            group_size=group_size,
             emit_bf16=emit_bf16,
         )
     
@@ -522,10 +542,13 @@ class GroupCoordinator:
         prefill_support: bool = False,
         emit_bf16: bool = False,
     ):
-        if self.device_communicator is None:
-            raise ValueError("No device communicator found")
-        return self.device_communicator.fused_allreduce_rmsnorm_mxfp4_quant(
-            input_, residual_inp_, weight_, eps, prefill_support,
+        return self.fused_allreduce_rmsnorm_quant(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            prefill_support,
+            quant_type="mxfp4",
             emit_bf16=emit_bf16,
         )
 

@@ -79,7 +79,17 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     weight_: torch.Tensor,
     eps: float,
     prefill_support: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    quant_type: Any = "per_token",
+    group_size: int = 128,
+    emit_bf16: bool = False,
+):
+    """Fused tensor-parallel all-reduce + RMSNorm + quantization.
+
+    ``quant_type`` selects the quantization epilogue:
+    ``"per_token"`` for existing FP8 per-token quantization,
+    ``"per_group"`` / ``"per_1x128"`` for FP8 per-group quantization, and
+    ``"mxfp4"`` / ``"per_1x32"`` for MXFP4 quantization.
+    """
     _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm_quant")
     return get_tp_group().fused_allreduce_rmsnorm_quant(
         input_,
@@ -87,6 +97,9 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         weight_,
         eps,
         prefill_support,
+        quant_type=quant_type,
+        group_size=group_size,
+        emit_bf16=emit_bf16,
     )
 
 
@@ -99,13 +112,14 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     prefill_support: bool = False,
     emit_bf16: bool = False,
 ):
-    return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
+    return tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         input_,
         residual_inp_,
         weight_,
         eps,
-        group_size,
         prefill_support,
+        quant_type="per_group",
+        group_size=group_size,
         emit_bf16=emit_bf16,
     )
 
@@ -118,12 +132,13 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
     prefill_support: bool = False,
     emit_bf16: bool = False,
 ):
-    return get_tp_group().fused_allreduce_rmsnorm_mxfp4_quant(
+    return tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         input_,
         residual_inp_,
         weight_,
         eps,
         prefill_support,
+        quant_type="mxfp4",
         emit_bf16=emit_bf16,
     )
 

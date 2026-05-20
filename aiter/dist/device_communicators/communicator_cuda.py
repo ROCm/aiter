@@ -6,12 +6,53 @@ import os
 import torch
 from torch.distributed import ProcessGroup
 
-should_nccl_symm_mem_allreduce = False
-from aiter.dist.parallel_state import is_global_first_rank
 from aiter import logger, get_hip_quant
-from aiter.utility.dtypes import fp8
+from aiter.dist.parallel_state import is_global_first_rank
 from aiter.ops.enum import QuantType
+from aiter.utility.dtypes import fp8
 from .base_device_communicator import DeviceCommunicatorBase
+
+should_nccl_symm_mem_allreduce = False
+
+_FUSED_AR_RMS_QUANT_ALIASES = {
+    "fp8": "per_token",
+    "fp8_per_token": "per_token",
+    "per-token": "per_token",
+    "per_token": "per_token",
+    "per_token_fp8": "per_token",
+    "fp8_per_group": "per_group",
+    "per-group": "per_group",
+    "per_group": "per_group",
+    "per_group_fp8": "per_group",
+    "per_1x128": "per_group",
+    "fp4": "mxfp4",
+    "fp4_e2m1": "mxfp4",
+    "mx_fp4": "mxfp4",
+    "mxfp4": "mxfp4",
+    "per_1x32": "mxfp4",
+}
+
+
+def _normalize_fused_ar_rms_quant_type(quant_type):
+    if isinstance(quant_type, str):
+        normalized = _FUSED_AR_RMS_QUANT_ALIASES.get(quant_type.lower())
+        if normalized is not None:
+            return normalized
+    else:
+        if quant_type == QuantType.per_Token:
+            return "per_token"
+        if quant_type in (QuantType.per_1x128, getattr(QuantType, "per_128x128", None)):
+            return "per_group"
+        if quant_type == QuantType.per_1x32:
+            return "mxfp4"
+        try:
+            return _normalize_fused_ar_rms_quant_type(QuantType(quant_type))
+        except Exception:
+            pass
+    raise ValueError(
+        "unsupported fused AR+RMSNorm quant_type="
+        f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
+    )
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -247,7 +288,32 @@ class CudaCommunicator(DeviceCommunicatorBase):
         weight_,
         eps,
         prefill_support: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        quant_type="per_token",
+        group_size=128,
+        emit_bf16: bool = False,
+    ):
+        quant_type = _normalize_fused_ar_rms_quant_type(quant_type)
+        if quant_type == "per_group":
+            return self.fused_allreduce_rmsnorm_quant_per_group(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                group_size=group_size,
+                prefill_support=prefill_support,
+                emit_bf16=emit_bf16,
+            )
+        if quant_type == "mxfp4":
+            return self.fused_allreduce_rmsnorm_mxfp4_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                prefill_support=prefill_support,
+                emit_bf16=emit_bf16,
+            )
+        if emit_bf16:
+            raise ValueError("emit_bf16 is not supported for per-token FP8 quant")
         total_bytes = input_.numel() * input_.element_size()
         if (
             int(input_.shape[-1]) in [512, 1024, 2048, 4096]
@@ -310,7 +376,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             try:
                 result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
-                    input_, res_inp_, weight_, eps, group_size, use_1stage,
+                    input_,
+                    res_inp_,
+                    weight_,
+                    eps,
+                    group_size,
+                    use_1stage,
                     emit_bf16=emit_bf16,
                 )
                 if emit_bf16:
@@ -409,10 +480,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         if override is None:
             prefer_2stage = (
-                can_2stage
-                and self.world_size == 8
-                and token_num >= 16
-                and K <= 6144
+                can_2stage and self.world_size == 8 and token_num >= 16 and K <= 6144
             )
             if prefer_2stage:
                 can_1stage = False

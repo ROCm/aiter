@@ -135,14 +135,14 @@ def _run_rank(
     torch.cuda.synchronize()
 
     from aiter.dist.communication_op import (
-        tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant,
+        tensor_model_parallel_fused_allreduce_rmsnorm_quant,
     )
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    result = tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
-        x, residual, weight, eps, emit_bf16=emit_bf16
+    result = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+        x, residual, weight, eps, quant_type="mxfp4", emit_bf16=emit_bf16
     )
     end.record()
     torch.cuda.synchronize()
@@ -221,9 +221,7 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49383"
     if distributed_init_method is None:
-        distributed_init_method = get_distributed_init_method(
-            get_ip(), get_open_port()
-        )
+        distributed_init_method = get_distributed_init_method(get_ip(), get_open_port())
 
     eps = 1e-6
     x = torch.randn(shape, dtype=dtype)
@@ -322,19 +320,19 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
 # AR+RMSNorm + dynamic_mxfp4_quant.
 CI_SHAPES = [
     # Covers all three dispatch paths at the default --tp-size 8:
-    (1, 4096),    # direct_1stage (K<=4096 -> M<=32 at TP=8)
-    (16, 7168),   # direct_2stage (16*7168*2 = 224 KiB <= 512 KiB; 7168%8 == 0)
+    (1, 4096),  # direct_1stage (K<=4096 -> M<=32 at TP=8)
+    (16, 7168),  # direct_2stage (16*7168*2 = 224 KiB <= 512 KiB; 7168%8 == 0)
     (128, 7168),  # fallback (1.75 MiB exceeds the 2-stage 512 KiB budget)
 ]
 
 FULL_SHAPES = [
-    (1, 4096),    # 1-stage
-    (8, 7168),    # 1-stage
-    (32, 7168),   # 2-stage at TP=8 (32*7168*2 = 448 KiB <= 512 KiB)
-    (56, 7168),   # fallback at TP=8 (56*7168*2 = 784 KiB > 512 KiB)
-    (16, 4096),   # 2-stage (block_size=512, 16*4096*2 = 128 KiB)
-    (32, 8192),   # 2-stage at TP=8 (block_size=1024, 32*8192*2 = 512 KiB)
-    (64, 7168),   # fallback (64*7168*2 = 896 KiB > 512 KiB)
+    (1, 4096),  # 1-stage
+    (8, 7168),  # 1-stage
+    (32, 7168),  # 2-stage at TP=8 (32*7168*2 = 448 KiB <= 512 KiB)
+    (56, 7168),  # fallback at TP=8 (56*7168*2 = 784 KiB > 512 KiB)
+    (16, 4096),  # 2-stage (block_size=512, 16*4096*2 = 128 KiB)
+    (32, 8192),  # 2-stage at TP=8 (block_size=1024, 32*8192*2 = 512 KiB)
+    (64, 7168),  # fallback (64*7168*2 = 896 KiB > 512 KiB)
     (128, 7168),  # fallback
 ]
 
