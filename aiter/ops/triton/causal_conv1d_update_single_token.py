@@ -172,17 +172,22 @@ def fused_reshape_causal_conv1d_update_single_token(
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
     validate_data: bool = False,
-    gqa_interleaved_layout: bool = True,
+    qkvz_layout: str = "interleaved",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused reshape + causal-conv1d update for a packed GDN qkvz tensor.
 
-    ``gqa_interleaved_layout`` (default True for backward compatibility):
-      - True  — ``x`` packs each K-head as ``[q_chunk | k_chunk | v_chunk | z_chunk]``
-                contiguously, and ``ba`` interleaves ``[b_g, a_g]`` per K-head group.
-                (Used by Qwen3-Next.)
-      - False — ``x`` packs as flat ``[q_all | k_all | v_all | z_all]`` and
-                ``ba`` concatenates ``[b_all | a_all]``. (Used by Qwen3.5.)
+    ``qkvz_layout`` selects the packing of the input ``x`` and ``ba`` tensors:
+      - ``"interleaved"`` (default) — ``x`` packs each K-head as
+        ``[q_chunk | k_chunk | v_chunk | z_chunk]`` and ``ba`` interleaves
+        ``[b_g, a_g]`` per K-head group. (Used by Qwen3-Next.)
+      - ``"flat"`` — ``x`` packs as ``[q_all | k_all | v_all | z_all]`` and
+        ``ba`` concatenates ``[b_all | a_all]``. (Used by Qwen3.5.)
     """
+    assert qkvz_layout in (
+        "interleaved",
+        "flat",
+    ), f"qkvz_layout must be 'interleaved' or 'flat', got {qkvz_layout!r}"
+    interleaved = qkvz_layout == "interleaved"
     assert (
         num_accepted_tokens is None
     ), f"num_accepted_tokens must be None, got {num_accepted_tokens}"
@@ -220,7 +225,7 @@ def fused_reshape_causal_conv1d_update_single_token(
     head_dim = head_k_dim + head_k_dim + head_v_dim * num_v_heads // num_k_heads
     head_qkvz_dim = head_dim + head_v_dim * num_v_heads // num_k_heads
     dim = num_k_heads * head_dim
-    if gqa_interleaved_layout:
+    if interleaved:
         expected_qkvz_dim = num_k_heads * head_qkvz_dim
     else:
         expected_qkvz_dim = (
@@ -337,7 +342,7 @@ def fused_reshape_causal_conv1d_update_single_token(
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
-        GQA_INTERLEAVED_LAYOUT=gqa_interleaved_layout,
+        INTERLEAVED_QKVZ=interleaved,
     )
     if unsqueeze:
         out = out.squeeze(-1)

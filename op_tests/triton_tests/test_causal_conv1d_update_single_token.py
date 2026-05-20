@@ -115,9 +115,9 @@ def _logical_feat_to_qkvz_col_v2(
     head_v_dim: int,
     head_qkvz_dim: int,
     hv_ratio: int,
-    gqa_interleaved_layout: bool = True,
+    qkvz_layout: str = "interleaved",
 ) -> int:
-    if not gqa_interleaved_layout:
+    if qkvz_layout != "interleaved":
         # Non-interleaved: x = [q_all | k_all | v_all | z_all]; q/k/v packing
         # is identity vs. the flat conv output indexing.
         return idx_feats
@@ -154,7 +154,7 @@ def ref_fused_reshape_causal_conv1d_update_single_token(
     activation: str | None,
     conv_state_indices: torch.Tensor | None,
     pad_slot_id: int | None,
-    gqa_interleaved_layout: bool = True,
+    qkvz_layout: str = "interleaved",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference: extract b/a/z like the kernel, build logical QKV, run ``ref_causal_conv1d_update_single_token``."""
     num_tokens = x.shape[0]
@@ -170,7 +170,7 @@ def ref_fused_reshape_causal_conv1d_update_single_token(
     a_out = torch.empty_like(b_out)
     for idx_seq in range(num_actual_tokens):
         for idx_hv in range(num_v_heads):
-            if gqa_interleaved_layout:
+            if qkvz_layout == "interleaved":
                 idx_h = idx_hv // hv_ratio
                 idx_v = idx_hv % hv_ratio
                 b_off = idx_h * (2 * hv_ratio) + idx_v
@@ -187,7 +187,7 @@ def ref_fused_reshape_causal_conv1d_update_single_token(
     z_base_non_interleaved = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
     for idx_seq in range(num_tokens):
         for idx_z in range(num_v_heads * head_v_dim):
-            if gqa_interleaved_layout:
+            if qkvz_layout == "interleaved":
                 idx_z_x = (
                     (idx_z // gs) * head_qkvz_dim
                     + 2 * head_k_dim
@@ -216,7 +216,7 @@ def ref_fused_reshape_causal_conv1d_update_single_token(
                 head_v_dim,
                 head_qkvz_dim,
                 hv_ratio,
-                gqa_interleaved_layout,
+                qkvz_layout,
             )
             for t in range(seqlen):
                 x_lin[b, f, t] = x[b, col, t]
@@ -344,7 +344,7 @@ def test_causal_conv1d_update_single_token_matches_ref(
 
 
 @cuda_ok
-@pytest.mark.parametrize("gqa_interleaved_layout", [True, False])
+@pytest.mark.parametrize("qkvz_layout", ["interleaved", "flat"])
 @pytest.mark.parametrize(
     "num_k_heads,num_v_heads,head_k_dim,head_v_dim,num_tokens,num_actual_tokens,width",
     [
@@ -360,7 +360,7 @@ def test_fused_reshape_causal_conv1d_update_single_token_matches_ref(
     num_tokens,
     num_actual_tokens,
     width,
-    gqa_interleaved_layout,
+    qkvz_layout,
 ):
     device = "cuda"
     torch.manual_seed(1)
@@ -368,7 +368,7 @@ def test_fused_reshape_causal_conv1d_update_single_token_matches_ref(
     assert hv_ratio * num_k_heads == num_v_heads
     head_dim = head_k_dim + head_k_dim + head_v_dim * hv_ratio
     head_qkvz_dim = head_dim + head_v_dim * hv_ratio
-    if gqa_interleaved_layout:
+    if qkvz_layout == "interleaved":
         qkvz_dim = num_k_heads * head_qkvz_dim
     else:
         qkvz_dim = 2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim
@@ -407,7 +407,7 @@ def test_fused_reshape_causal_conv1d_update_single_token_matches_ref(
             "silu",
             None,
             PAD_SLOT_ID,
-            gqa_interleaved_layout=gqa_interleaved_layout,
+            qkvz_layout=qkvz_layout,
         )
     )
 
@@ -430,7 +430,7 @@ def test_fused_reshape_causal_conv1d_update_single_token_matches_ref(
         activation="silu",
         conv_state_indices=None,
         pad_slot_id=PAD_SLOT_ID,
-        gqa_interleaved_layout=gqa_interleaved_layout,
+        qkvz_layout=qkvz_layout,
     )
 
     torch.testing.assert_close(out_tr.float(), out_ref.float(), rtol=rtol, atol=atol)
