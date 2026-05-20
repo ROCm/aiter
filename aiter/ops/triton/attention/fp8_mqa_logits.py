@@ -61,13 +61,22 @@ def _permute_accepts_constexpr_tuple() -> bool:
 ASYNC_COPY_SUPPORTS_DISTRIBUTED = _async_copy_accepts_distributed_layout()
 FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 
-# gfx942 (MI300X) has 64 KB of LDS per CU. Conservative upper bound on the
-# shared-memory `_fp8_mqa_logits_kernel` may request with BLOCK_KV=128,
-# num_stages=2 -- models the double-buffered KV tile, the fp32 scores
-# accumulator, and the Q tile. Triton may keep some of these in registers
-# depending on version/layout, so this can over-predict; the safety direction
-# is the right one (false positives just shrink the tile, never the reverse).
-_GFX942_LDS_BYTES = 64 * 1024
+# gfx942 (MI300X) has 64 KB of LDS per CU. We accept the default
+# (BLOCK_KV=128, num_stages=2) tile only when *both* of these hold:
+#
+# 1. Occupancy gate. With waves_per_eu=2 and num_warps=4 we target two
+#    workgroups co-resident on a CU -> per-WG LDS budget = 32 KB. Triton 3.6+
+#    keeps Q in registers (loop-invariant) and the fp32 scores accumulator
+#    in VGPRs (heavy VALU), so only the double-buffered KV tile lives in
+#    LDS. A 0.9 safety factor leaves headroom for any LDS overhead the
+#    compiler may add.
+#
+# 2. Hardware ceiling. Defensive upper bound that also counts Q and scores
+#    against the 64 KB CU limit, in case a Triton version (older or future)
+#    decides to spill them to LDS. False positives here only shrink the
+#    tile; false negatives are JIT-aborts, so we lean conservative.
+_GFX942_CU_LDS_BYTES = 64 * 1024
+_GFX942_PER_WG_LDS_BUDGET_BYTES = _GFX942_CU_LDS_BYTES * 9 // 20  # ~28.8 KiB
 
 
 def _gfx942_default_tile_fits_lds(num_heads: int, head_size: int) -> bool:
@@ -76,7 +85,9 @@ def _gfx942_default_tile_fits_lds(num_heads: int, head_size: int) -> bool:
     kv_bytes = head_size * BLOCK_KV * NUM_STAGES
     scores_bytes = num_heads * BLOCK_KV * 4
     q_bytes = num_heads * head_size
-    return q_bytes + kv_bytes + scores_bytes <= _GFX942_LDS_BYTES
+    fits_occupancy = kv_bytes < _GFX942_PER_WG_LDS_BUDGET_BYTES
+    fits_hardware = q_bytes + kv_bytes + scores_bytes <= _GFX942_CU_LDS_BYTES
+    return fits_occupancy and fits_hardware
 
 
 def fp8_mqa_logits(
@@ -134,11 +145,13 @@ def fp8_mqa_logits(
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
     if not use_gluon:
-        # gfx942 (MI300X) can JIT-abort with `OutOfResources: shared memory`
-        # at the default (BLOCK_KV=128, num_stages=2) tile on shapes that push
-        # the kernel over 64 KB of LDS (e.g. the DSv4 indexer's NUM_HEADS=64,
-        # HEAD_SIZE=128). Shrink only when the default would overflow so
-        # smaller shapes keep their original throughput.
+        # gfx942 (MI300X): the default (BLOCK_KV=128, num_stages=2) tile
+        # double-buffers a `HEAD_SIZE * 128`-byte KV tile in LDS. With
+        # waves_per_eu=2, num_warps=4 we want two workgroups co-resident on a
+        # CU (per-WG LDS budget ~32 KB), so shapes with HEAD_SIZE >= 128 spill
+        # past that budget and either lose occupancy or, on older Triton,
+        # JIT-abort with `OutOfResources: shared memory`. Shrink only when
+        # the default would overflow so smaller shapes keep their throughput.
         # TODO: gate on computed LDS budget instead of arch string
         if arch == "gfx942" and not _gfx942_default_tile_fits_lds(num_heads, head_size):
             block_kv = 64
