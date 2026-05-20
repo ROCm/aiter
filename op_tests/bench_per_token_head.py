@@ -81,6 +81,7 @@ for b, qo, kv, nhq, nhk, hd, c, sc in SHAPES:
         contiguous_kv=True,
         seed=42,
         profile=True,
+        skip_reference=True,
     )
     pth = run_batch_prefill_per_token_head(**common)
     kvb = run_batch_prefill_kv_blockscale(**common)

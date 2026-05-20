@@ -2400,6 +2400,7 @@ def run_batch_prefill_kv_blockscale(
     contiguous_kv,
     seed,
     profile=False,
+    skip_reference=False,
 ):
     """
     Test FP8 batch prefill with per-page KV descale (KV_BLOCKSCALE mode).
@@ -2475,19 +2476,22 @@ def run_batch_prefill_kv_blockscale(
     q_indptr_cpu = convert_lens_to_indptr(qo_lens)
 
     # Build FP32 reference output (same as pertensor test)
-    o_ref = build_reference_output(
-        q,
-        q_indptr_cpu,
-        kv_data_fp32,
-        kv_indices,
-        kv_indptr,
-        kv_last_page_len_cpu,
-        num_kv_heads,
-        head_dim,
-        dtype,
-        causal,
-        logits_soft_cap,
-    )
+    if skip_reference:
+        o_ref = None
+    else:
+        o_ref = build_reference_output(
+            q,
+            q_indptr_cpu,
+            kv_data_fp32,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len_cpu,
+            num_kv_heads,
+            head_dim,
+            dtype,
+            causal,
+            logits_soft_cap,
+        )
 
     # Quantize K/V with per-page scale
     # k_paged_ref is [num_pages, page_size, num_kv_heads, head_dim]
@@ -2574,6 +2578,8 @@ def run_batch_prefill_kv_blockscale(
         out_fp8 = run_result
 
     # Run BF16 reference kernel (no quantization) - no profiling for reference
+    if skip_reference:
+        return profile_result
     out_bf16 = run_ck(
         batch_size,
         num_kv_heads,
@@ -2670,6 +2676,7 @@ def run_batch_prefill_per_token_head(
     contiguous_kv,
     seed,
     profile=False,
+    skip_reference=False,
 ):
     """
     FP8 batch prefill with PER_TOKEN_HEAD quantization:
@@ -2738,19 +2745,22 @@ def run_batch_prefill_per_token_head(
     q_indptr_cpu = convert_lens_to_indptr(qo_lens)
 
     # FP32 reference (bf16 ground truth)
-    o_ref = build_reference_output(
-        q,
-        q_indptr_cpu,
-        kv_data_fp32,
-        kv_indices,
-        kv_indptr,
-        kv_last_page_len_cpu,
-        num_kv_heads,
-        head_dim,
-        dtype,
-        causal,
-        logits_soft_cap,
-    )
+    if skip_reference:
+        o_ref = None
+    else:
+        o_ref = build_reference_output(
+            q,
+            q_indptr_cpu,
+            kv_data_fp32,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len_cpu,
+            num_kv_heads,
+            head_dim,
+            dtype,
+            causal,
+            logits_soft_cap,
+        )
 
     # PER_TOKEN_HEAD quantization
     q_fp8, q_descale_per_token = per_token_per_head_quant_q(q, quant_dtype)
@@ -2834,6 +2844,9 @@ def run_batch_prefill_per_token_head(
         profile_result = {"status": "passed", "time_us": time_us, "tflops": tflops}
     else:
         out_fp8 = run_result
+
+    if skip_reference:
+        return profile_result
 
     out_bf16 = run_ck(
         batch_size,
