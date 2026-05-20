@@ -2,11 +2,11 @@
 # Used by frameworks-devops-dashboard to display GPU architecture
 # Update this when runners are added/changed in CI workflows
 runners:
-  linux-aiter-mi300x-1:
+  aiter-1gpu-runner:
     gpu_arch: MI300X
     gpu_count: 1
 
-  linux-aiter-mi300x-8:
+  aiter-8gpu-runner:
     gpu_arch: MI300X
     gpu_count: 8
 

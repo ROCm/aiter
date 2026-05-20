@@ -24,12 +24,12 @@ def _load_kv_scales_block(
     BLOCK_KV: gl.constexpr,
     mfma_layout: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
-    end_ind=0,
+    rel_end_ind=0,
     masked: gl.constexpr = False,
 ):
     offsets = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, mfma_layout))
     if masked:
-        mask = offsets < (end_ind - offset_into_segment)
+        mask = offsets < (rel_end_ind - offset_into_segment)
     else:
         mask = None
     if USE_BUFFER_LOAD:
@@ -445,7 +445,7 @@ def mqa_logits_loop_double_buf(
         USE_BUFFER_LOAD=USE_BUFFER_LOAD,
         masked=True,
     )
-
+    relative_end: gl.int32 = end_ind - start_ind
     # Body: full tiles only. With loop bound `num_full_tiles - 2`, the prefetch
     # at i+2 is guaranteed to address a full tile (i+2 in [2, num_full_tiles-1]),
     # so no mask is needed
@@ -457,7 +457,7 @@ def mqa_logits_loop_double_buf(
             BLOCK_KV,
             mfma_layout,
             USE_BUFFER_LOAD,
-            end_ind,
+            relative_end,
         )
         mfma_k = kv_loader.load_from_shared(
             wait_count=1, target_layout=dot_b_layout, buffer_id=buf_cur
@@ -488,7 +488,7 @@ def mqa_logits_loop_double_buf(
             BLOCK_KV,
             mfma_layout,
             USE_BUFFER_LOAD,
-            end_ind,
+            relative_end,
         )
         mfma_k = kv_loader.load_from_shared(
             wait_count=1, target_layout=dot_b_layout, buffer_id=buf_cur
@@ -520,7 +520,7 @@ def mqa_logits_loop_double_buf(
         BLOCK_KV,
         mfma_layout,
         USE_BUFFER_LOAD,
-        end_ind,
+        relative_end,
         masked=True,
     )
     mfma_k = kv_loader.load_from_shared(
@@ -549,7 +549,7 @@ def mqa_logits_loop_double_buf(
         BLOCK_KV,
         mfma_layout,
         USE_BUFFER_LOAD,
-        end_ind,
+        relative_end,
         masked=True,
     )
     mfma_k = kv_loader.load_from_shared(
@@ -575,8 +575,8 @@ def _gluon_fp8_mqa_logits_kernel(
     cu_start_ptr,  # int32  [seq_len]
     cu_end_ptr,  # int32  [seq_len]
     logits_ptr,  # fp32   [seq_len, seq_len_kv]
-    seq_len,
-    seq_len_kv,
+    seq_len: gl.int32,
+    seq_len_kv: gl.int32,
     NUM_HEADS: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     stride_q_s: gl.int32,
