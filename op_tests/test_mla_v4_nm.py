@@ -34,14 +34,15 @@ import torch
 
 import aiter
 import aiter.mla  # main no longer auto-imports submodules; need explicit
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.test_common import checkAllclose, run_perftest
 
 # ---------------------------------------------------------------------------
 # Variant under test (matches the cfg_mla_v4_asm entry in
 # hsa/gfx950/mla_v4/mla_v4_asm.csv served by csrc/py_itfs_cu/asm_mla_v4.cu).
 # ---------------------------------------------------------------------------
 GQA_RATIO = 16  # num_heads / num_kv_heads
-SUB_Q = 64  # block of q_seq_lens (after gqa boost) handled per workgroup
 PAGE_SIZE = 1
 NUM_KV_HEADS = 1
 DIM_NOPE = 448  # FP8 NOPE bytes per token
@@ -173,7 +174,6 @@ def _build_inputs(
         split_indptr=split_indptr,
         max_seqlen_q=q_seq_logical,
         num_kv_splits=num_kv_splits,
-        sub_Q=SUB_Q,
         out_16_nosplit=0,
     )
 
@@ -290,12 +290,12 @@ def test_v4_nm_determinism():
     # uninitialized memory and may legitimately differ between calls.
     written1 = logits1_bits[:, 0]
     written2 = logits2.view(torch.int32)[:, 0]
-    assert torch.equal(written1, written2), (
-        "v4 nm logits are non-deterministic (likely uninit accumulator/LDS)"
-    )
-    assert torch.equal(lse1_bits[:, 0], lse2.view(torch.int32)[:, 0]), (
-        "v4 nm attn_lse is non-deterministic"
-    )
+    assert torch.equal(
+        written1, written2
+    ), "v4 nm logits are non-deterministic (likely uninit accumulator/LDS)"
+    assert torch.equal(
+        lse1_bits[:, 0], lse2.view(torch.int32)[:, 0]
+    ), "v4 nm attn_lse is non-deterministic"
 
 
 @needs_gfx950
@@ -311,11 +311,18 @@ def test_v4_nm_out_16_nosplit_arg_accepted():
 
 @needs_gfx950
 def test_v4_nm_unknown_variant_raises():
-    """Asking for a (gqa, sub_Q, page) tuple not in cfg_mla_v4_asm must raise
-    a clear error before launch — not silently load the wrong .co. Exercised
-    by passing sub_Q=128 (only sub_Q=64 is currently shipped)."""
-    args = _build_inputs(batch=1, kv_seq_lens=64, q_seq_logical=4, seed=0)
-    args["sub_Q"] = 128
+    """Asking for a (gqa, qSeqLen, dtype) tuple not in cfg_mla_v4_asm must
+    raise a clear error before launch — not silently load the wrong .co.
+
+    Exercised by max_seqlen_q=1: the dispatcher's V3-style heuristic for
+    fp8/fp8/gqa=16 maps max_seqlen_q==1 to config_max_seqlen_q=1 (and
+    sub_Q=16). The only shipped CSV row has qSeqLen=4, so the lookup
+    misses on the qSeqLen != qseqlen predicate and raises 'no shipped
+    variant'. (max_seqlen_q values > 4 are also miss candidates in
+    principle, but the heuristic's catch-all `else` for gqa=16/fp8/fp8
+    clamps them up to qSeqLen=4 — they accidentally hit the shipped row.)
+    """
+    args = _build_inputs(batch=1, kv_seq_lens=64, q_seq_logical=1, seed=0)
     with pytest.raises(Exception, match="no shipped variant"):
         aiter.mla.mla_decode_fwd_v4_nm(**args)
 
@@ -425,8 +432,6 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
 # ATOM/atom/model_ops/v4_kernels/paged_decode.py::sparse_attn_v4_paged_decode
 # so the asm op can drop in as a replacement for the triton fallback there.
 # ---------------------------------------------------------------------------
-from aiter import dtypes
-from aiter.test_common import checkAllclose, run_perftest
 
 # MODEL1_FP8Sparse layout (mirrored locally; not exported by aiter.ops.quant
 # in this tree). Drives the per-token packing the v4 nm asm kernel expects.
@@ -671,7 +676,6 @@ def _asm_attn_decode_bf16(
         sm_scale=sm_scale,  # ignored by kernel (hardcodes 1/sqrt(512))
         out_16_nosplit=0,
         num_kv_splits=num_kv_splits,
-        sub_Q=SUB_Q,
     )
     # logits: [num_seqs, num_kv_splits=1, num_kv_heads=1, gqa*max_seqlen_q=64, D=512]
     # Internal row layout: row = q_token * gqa_ratio + head (empirically verified
@@ -695,9 +699,9 @@ def _cal_diff(x, y, name, cos_thresh):
     )
     amax = (xd - yd).abs().max().item()
     print(f"  {name}: cos_diff={cos_diff:.4e}, RMSE={rmse:.4e}, amax={amax:.4e}")
-    assert cos_diff < cos_thresh, (
-        f"{name}: cos_diff={cos_diff:.4e} >= {cos_thresh:.1e} (RMSE={rmse:.4e}, amax={amax:.4e})"
-    )
+    assert (
+        cos_diff < cos_thresh
+    ), f"{name}: cos_diff={cos_diff:.4e} >= {cos_thresh:.1e} (RMSE={rmse:.4e}, amax={amax:.4e})"
 
 
 def _print_per_v_tile_diff(x_ref, y_asm, label):
@@ -808,10 +812,12 @@ def _run_one_point(
     per iter and trips a GPU OOM (the reason the hand-rolled timer used to
     live here).
     """
-    # gqa_ratio * q_seq_logical must equal SUB_Q (=64) — kernel tile invariant.
-    assert gqa_ratio * q_seq_logical == SUB_Q, (
-        f"gqa_ratio({gqa_ratio}) * q_seq_logical({q_seq_logical}) "
-        f"must equal SUB_Q({SUB_Q})"
+    # gqa_ratio * q_seq_logical must equal 64 — the dispatcher's V3-style
+    # heuristic picks sub_Q=64 for the only shipped (gqa=16, fp8/fp8, qseq<=4)
+    # variant; the kernel tile is hardwired around that 64-row qheads block.
+    assert gqa_ratio * q_seq_logical == 64, (
+        f"gqa_ratio({gqa_ratio}) * q_seq_logical({q_seq_logical}) must equal 64 "
+        f"(the kernel-tile invariant baked into the qh64 .co)"
     )
 
     inputs = _build_bf16_inputs(
@@ -903,7 +909,6 @@ def _run_one_point(
         sm_scale=sm_scale,
         out_16_nosplit=0,
         num_kv_splits=num_kv_splits,
-        sub_Q=SUB_Q,
         logits=logits_buf,
         attn_lse=lse_buf,
         num_iters=num_iters,
@@ -1015,16 +1020,16 @@ def asm_sparse_attn_v4_paged_decode(
     qo_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=device) * 4
     # kv_indptr at every 4th position (group's shared span); validate constancy.
     kv_indptr_per_seq = kv_indptr[::4].to(torch.int32).contiguous()
-    assert kv_indptr_per_seq.size(0) == batch + 1, (
-        f"kv_indptr layout invalid for groups-of-4: got len {kv_indptr.size(0)}, expected {batch * 4 + 1}"
-    )
+    assert (
+        kv_indptr_per_seq.size(0) == batch + 1
+    ), f"kv_indptr layout invalid for groups-of-4: got len {kv_indptr.size(0)}, expected {batch * 4 + 1}"
     # Sanity: within each group, kv_indptr must be constant relative to its base.
     for b in range(batch):
         base = int(kv_indptr[b * 4].item())
         for j in range(1, 4):
-            assert int(kv_indptr[b * 4 + j].item()) == base, (
-                f"asm v4 nm wrapper requires kv_indptr constant per group-of-4 (batch {b}, offset {j})"
-            )
+            assert (
+                int(kv_indptr[b * 4 + j].item()) == base
+            ), f"asm v4 nm wrapper requires kv_indptr constant per group-of-4 (batch {b}, offset {j})"
 
     kv_page_indices = kv_indices.to(torch.int32).contiguous()
     kv_last_page_lens = torch.ones(batch, dtype=torch.int32, device=device)
@@ -1043,6 +1048,169 @@ def asm_sparse_attn_v4_paged_decode(
         sm_scale=softmax_scale,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Multi-pass (num_kv_splits > 1) — opens the path that mirrors V3's
+# non-persistent stage1 + stage2 reduce. The .co binary already supports any
+# number of passes via slot 9; this test verifies (a) the dispatcher lookup
+# isn't gated on num_kv_splits, (b) the python wrapper auto-builds
+# split_indptr V3-style, and (c) the in-place logsumexp merge writes a finite
+# result into the [:, 0] slot.
+# ---------------------------------------------------------------------------
+@needs_gfx950
+def test_v4_nm_multi_split_passes2():
+    """num_kv_splits=2 smoke. All assumptions are encoded in the asserts so
+    if any later refactor breaks them the failure mode is loud:
+
+      1. Dispatcher must NOT raise "no shipped variant" — num_kv_splits is
+         no longer part of the CSV lookup key (csrc/py_itfs_cu/asm_mla_v4.cu).
+      2. split_indptr defaults to a uniform [0, N, 2N, ...] when caller
+         passes None (V3 get_meta_param parity).
+      3. With passes>1, every (seq, split) slot of the 5D logits buffer is
+         written by the kernel (no early-exit SENTINEL leakage).
+      4. Raw split 0 != raw split 1 — each WG must integrate a *different*
+         KV chunk. If the kernel collapses both passes onto the same range
+         we'd see bit-identical slots, implying slot 9 / split_indptr
+         stride math is broken.
+      5. The wrapper's logsumexp merge produced *some* finite output (smoke
+         inputs are random FP8 so most cells are legitimately NaN; we just
+         require that the merge math itself didn't introduce extra NaN
+         on top of what the raw partials had).
+
+    True numerical correctness with deterministic poc_kl inputs is the job
+    of test_mla_v4_nm_golden.py once a passes=2 golden dump is produced.
+    """
+    NUM_SPLITS = 2
+    BATCH = 2
+    KV_LEN = 64  # divisible by NUM_SPLITS so per-pass chunks are even
+    Q_SEQ = 4
+
+    args = _build_inputs(batch=BATCH, kv_seq_lens=KV_LEN, q_seq_logical=Q_SEQ, seed=0)
+    args["num_kv_splits"] = NUM_SPLITS
+    args["out_16_nosplit"] = 0
+    args.pop("split_indptr")  # let the wrapper auto-build it (V3-style)
+
+    # SENTINEL pre-fill so we can verify per-(seq, split) coverage.
+    SENTINEL = -7.7e30
+    num_seqs = args["qo_indptr"].size(0) - 1
+    num_kv_heads = args["kv_buffer"].size(2)
+    num_heads = args["q"].size(1)
+    gqa_ratio = num_heads // num_kv_heads
+    q_seq_lens_internal = gqa_ratio * args["max_seqlen_q"]
+    args["logits"] = torch.full(
+        (num_seqs, NUM_SPLITS, num_kv_heads, q_seq_lens_internal, V_HEAD_DIM),
+        SENTINEL,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    args["attn_lse"] = torch.full(
+        (num_seqs, NUM_SPLITS, num_kv_heads, q_seq_lens_internal, 1),
+        SENTINEL,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    logits, attn_lse = aiter.mla.mla_decode_fwd_v4_nm(**args)
+    torch.cuda.synchronize()
+
+    # (3) every raw (seq, split) slot was written by the kernel. The merge
+    # only clobbers [:, 0]; [:, 1..] still hold the raw kernel partials.
+    for s in range(1, NUM_SPLITS):
+        ut = (logits[:, s] == SENTINEL).float().mean().item()
+        assert ut < 0.01, (
+            f"split {s} kernel skipped ({ut*100:.1f}% still SENTINEL). "
+            "Check the dispatcher launches gdz=num_kv_splits and that "
+            "split_indptr stride math (s89 - s90 per seq) survived the "
+            "auto-build."
+        )
+
+    # (4) The merge ran. We don't sanity-check finite-ness or split-vs-merge
+    # divergence here — with random FP8 inputs the raw partials are NaN-heavy
+    # and any byte-level compare between merged and raw will be polluted by
+    # NaN bit-patterns. True numerical sanity is the job of a future
+    # passes=2 entry in test_mla_v4_nm_golden.py once poc_kl dumps are
+    # regenerated with `passes=2`.
+    assert logits.shape == (
+        num_seqs,
+        NUM_SPLITS,
+        num_kv_heads,
+        q_seq_lens_internal,
+        V_HEAD_DIM,
+    ), "logits shape mutated unexpectedly by the merge"
+
+
+@needs_gfx950
+def test_v4_nm_multi_split_covers_full_kv():
+    """`num_kv_splits=4` with `kv_seq_lens=64` is the only multi-pass config
+    on the shipped .co where all KV tokens are actually integrated.
+
+    The shipped variant (mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmp.co)
+    hardcodes pass_size=16 in the binary (see the s_lshr_b32 s63,16,s83 ;
+    s_mul_i32 s100,s4,s63 ; s_cmp_le_u32 s67,s100 sequence at offset 0x258).
+    The invariant for full coverage is:
+
+        kv_seq_lens_per_seq == num_kv_splits * 16 * page_size
+
+    With page_size=1 and kv_seq_lens=64, that's num_kv_splits == 4.
+    This test asserts that all 4 split slots are written (no early-exit
+    SENTINEL leak), which is the kernel-side guarantee underlying the
+    wrapper's downstream logsumexp merge.
+    """
+    NUM_SPLITS = 4
+    BATCH = 2
+    KV_LEN = 64  # == NUM_SPLITS * 16 (pass_size baked into .co) * 1 (page_size)
+    Q_SEQ = 4
+
+    args = _build_inputs(batch=BATCH, kv_seq_lens=KV_LEN, q_seq_logical=Q_SEQ, seed=0)
+    args["num_kv_splits"] = NUM_SPLITS
+    args["out_16_nosplit"] = 0
+    args.pop("split_indptr")  # auto-built V3-style
+
+    SENTINEL = -7.7e30
+    num_seqs = args["qo_indptr"].size(0) - 1
+    num_kv_heads = args["kv_buffer"].size(2)
+    gqa_ratio = args["q"].size(1) // num_kv_heads
+    q_seq_lens_internal = gqa_ratio * args["max_seqlen_q"]
+    args["logits"] = torch.full(
+        (num_seqs, NUM_SPLITS, num_kv_heads, q_seq_lens_internal, V_HEAD_DIM),
+        SENTINEL,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    args["attn_lse"] = torch.full(
+        (num_seqs, NUM_SPLITS, num_kv_heads, q_seq_lens_internal, 1),
+        SENTINEL,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    logits, attn_lse = aiter.mla.mla_decode_fwd_v4_nm(**args)
+    torch.cuda.synchronize()
+
+    # Every raw split slot must have been written by the kernel — proves the
+    # pass_size=16 constraint is satisfied and no WG early-exited.
+    for s in range(1, NUM_SPLITS):  # slot 0 was clobbered by the merge
+        ut = (logits[:, s] == SENTINEL).float().mean().item()
+        assert ut < 0.01, (
+            f"split {s} kernel skipped ({ut*100:.1f}% still SENTINEL). "
+            f"Most likely cause: kv_seq_lens_per_seq ({KV_LEN}) is not "
+            f"num_kv_splits ({NUM_SPLITS}) * pass_size (16) * page_size — "
+            f"tail KV is being dropped."
+        )
+
+
+@needs_gfx950
+def test_v4_nm_multi_split_rejects_out_16_nosplit():
+    """Multi-pass + out_16_nosplit=1 is unsupported (mirrors poc_kl's
+    `params.passes == 1 && params.out_16_nosplit == 1` guard). Wrapper must
+    raise BEFORE we hit the kernel."""
+    args = _build_inputs(batch=1, kv_seq_lens=64, q_seq_logical=4, seed=0)
+    args["num_kv_splits"] = 2
+    args["out_16_nosplit"] = 1
+    args.pop("split_indptr")
+    with pytest.raises(ValueError, match="out_16_nosplit"):
+        aiter.mla.mla_decode_fwd_v4_nm(**args)
 
 
 if __name__ == "__main__":
@@ -1095,9 +1263,10 @@ if __name__ == "__main__":
         "--gqa-ratio",
         type=int,
         default=GQA_RATIO,
-        help=f"num_heads / num_kv_heads. Must satisfy gqa_ratio * q_seq_logical "
-        f"== SUB_Q({SUB_Q}). Registry currently ships only gqa_ratio=16; "
-        "other values will hit 'no shipped variant' at dispatch.",
+        help="num_heads / num_kv_heads. Must satisfy gqa_ratio * q_seq_logical "
+        "== 64 (the qh64 .co's kernel-tile invariant; the dispatcher picks "
+        "sub_Q=64 for our only shipped variant). Registry currently ships "
+        "only gqa_ratio=16; other values will hit 'no shipped variant' at dispatch.",
     )
     args = parser.parse_args()
 

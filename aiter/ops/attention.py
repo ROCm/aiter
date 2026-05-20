@@ -716,9 +716,6 @@ def mla_decode_v4_asm(
     softmax_scale: float,
     # 0 = fp32 split-out path; 1 = bf16 nosplit reduce path
     out_16_nosplit: int,
-    # poc_kl `sub_Q` (= per-WG Q tile); only 64 currently shipped
-    sub_Q: int,
-    # poc_kl `passes`
     num_kv_splits: int,
     # outputs
     # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim] FP32

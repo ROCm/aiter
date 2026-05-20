@@ -75,14 +75,24 @@ static constexpr int kV4DimNope = 448;
 static constexpr int kV4DimRope = 64;
 
 // ----------------------------------------------------------------------------
-// Kernel selection.
+// Kernel selection — mirrors csrc/py_itfs_cu/asm_mla.cu::get_heuristic_kernel_mla
+// 1:1 in key set so v3 and v4 stay structurally identical.
+//
+// Lookup keys: (qType, kvType, Gqa, ps, qSeqLen, prefill, causal, lse).
+// `sub_Q` and `page_size` are NOT keys — sub_Q is derived in the dispatcher
+// (see the V3-style decision tree below) and page_size comes from KV->size(1).
+//
+// `num_kv_splits` ("passes") is also NOT a key — the .co supports any value
+// at runtime via slot 9 of the kernarg packet (mirrors poc_kl `params.passes`).
 // ----------------------------------------------------------------------------
 static std::string get_heuristic_kernel_mla_v4(const std::string& q_type,
                                                const std::string& kv_type,
                                                int gqa,
-                                               int sub_Q,
-                                               int page_size,
-                                               int num_kv_splits,
+                                               int ps,
+                                               int prefill,
+                                               int causal,
+                                               int qseqlen,
+                                               int lse,
                                                const std::string& arch_id,
                                                CFG* cfgs)
 {
@@ -93,9 +103,11 @@ static std::string get_heuristic_kernel_mla_v4(const std::string& q_type,
         const auto& cfg = el.second;
         if(cfg.qType != q_type || cfg.kvType != kv_type)
             continue;
-        if(cfg.gqa != gqa || cfg.sub_Q != sub_Q || cfg.page_size != page_size)
+        if(cfg.Gqa != gqa || cfg.ps != ps || cfg.prefill != prefill)
             continue;
-        if(cfg.num_kv_splits != num_kv_splits)
+        if(cfg.causal != causal || cfg.qSeqLen != qseqlen)
+            continue;
+        if(cfg.lse != lse)
             continue;
         return el.first;
     }
@@ -105,9 +117,11 @@ static std::string get_heuristic_kernel_mla_v4(const std::string& q_type,
                 " q_type:", q_type,
                 " kv_type:", kv_type,
                 " gqa:", gqa,
-                " sub_Q:", sub_Q,
-                " page_size:", page_size,
-                " num_kv_splits:", num_kv_splits,
+                " ps:", ps,
+                " qSeqLen:", qseqlen,
+                " prefill:", prefill,
+                " causal:", causal,
+                " lse:", lse,
                 " arch:", arch_id);
     return "";
 }
@@ -139,15 +153,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      int max_seqlen_q,
      float softmax_scale,                // ignored; v4 hardcodes 1/sqrt(512). Kept for API parity.
      int out_16_nosplit,
-     int sub_Q,                          // dispatcher key (matches poc_kl `sub_Q`); only 64 supported now
-     int num_kv_splits,                  // == poc_kl `passes`
+     int num_kv_splits,                  //
      // outputs
      aiter_tensor_t* splitData,          // [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim] FP32
      aiter_tensor_t* splitLse,           // [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, 1]          FP32
      aiter_tensor_t* output,             // [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
      hipStream_t stream),
     (Q, qrope, KV, kvrope, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens,
-     split_indptr, max_seqlen_q, softmax_scale, out_16_nosplit, sub_Q, num_kv_splits,
+     split_indptr, max_seqlen_q, softmax_scale, out_16_nosplit, num_kv_splits,
      splitData, splitLse, output, stream))
 {
     (void)softmax_scale;
@@ -232,13 +245,69 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     else
         AITER_CHECK(false, __func__, ": unsupport KV dtype:", AiterDtype_to_str(kv_dtype));
 
+    // ------------------------------------------------------------------
+    // V3-style per-shape heuristic. Mirrors the decision tree in
+    // csrc/py_itfs_cu/asm_mla.cu (~lines 272-318) for gqa_ratio=16 fp8;
+    // produces a `sub_Q` (per-WG Q tile, used in grid math) and a
+    // `config_max_seqlen_q` (padded qseq used as CSV lookup key against
+    // `qSeqLen`). v4 nm ships exactly one variant today; the heuristic
+    // mirrors V3's structure so adding future variants is mechanical.
+    // ------------------------------------------------------------------
+    int sub_Q               = 64;            // default (matches V3 default)
+    int config_max_seqlen_q = max_seqlen_q;
+    int ps                  = 0;              // v4 nm always non-persistent today
+    int prefill             = 0;              // decode stage
+    int causal              = 0;
+    int lse_flag            = 0;
+
+    if(gqa_ratio == 16 && q_type == "fp8" && kv_type == "fp8")
+    {
+        if(max_seqlen_q == 4)
+        {
+            sub_Q               = 64;
+            config_max_seqlen_q = 4;
+        }
+        else if(max_seqlen_q == 1)
+        {
+            sub_Q               = 16;
+            config_max_seqlen_q = 1;
+        }
+        else if(max_seqlen_q == 2)
+        {
+            sub_Q               = 32;
+            config_max_seqlen_q = 2;
+        }
+        else
+        {
+            config_max_seqlen_q = 4;
+        }
+    }
+    else if (gqa_ratio == 64 && q_type == "fp8" && kv_type == "fp8")
+    {
+        if(max_seqlen_q == 1)
+        {
+            sub_Q               = 64;
+            config_max_seqlen_q = 1;
+        }
+        else if(max_seqlen_q == 2)
+        {
+            sub_Q               = 128;
+            config_max_seqlen_q = 2;
+        }
+        else
+        {
+            config_max_seqlen_q = 1;
+        }
+    }
+
     // Kernel lookup (cached across calls).
     std::string arch_id  = get_gpu_arch();
     CFG* config_map      = &cfg_mla_v4_asm;
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     std::string kernelName = get_heuristic_kernel_mla_v4(
-        q_type, kv_type, gqa_ratio, sub_Q, page_size, num_kv_splits, arch_id, config_map);
+        q_type, kv_type, gqa_ratio, ps, prefill, causal, config_max_seqlen_q,
+        lse_flag, arch_id, config_map);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
 
     AiterAsmKernel* impl_ptr = nullptr;

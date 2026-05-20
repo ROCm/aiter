@@ -1017,12 +1017,11 @@ def mla_decode_fwd_v4_nm(
     kv_indptr,  # [num_seqs+1]
     kv_page_indices,  # [num_page_used]
     kv_last_page_lens,  # [num_seqs]
-    split_indptr,  # [num_seqs+1]
     max_seqlen_q,
+    split_indptr=None,  # [num_seqs+1]; auto-built uniform if None (matches V3 get_meta_param)
     sm_scale=None,  # ignored on v4 nm; kernel hardcodes 1/sqrt(512)
     out_16_nosplit=0,
     num_kv_splits=1,
-    sub_Q=64,
     logits=None,
     attn_lse=None,
 ):
@@ -1030,13 +1029,34 @@ def mla_decode_fwd_v4_nm(
 
     Routes through the canonical aiter JIT C-ABI module
     `module_mla_v4_asm` (csrc/py_itfs_cu/asm_mla_v4.cu). Returns
-    (logits, attn_lse) — caller is responsible for any post-reduce /
-    final-O work.
-
-    logits/attn_lse may be pre-allocated (e.g. for SENTINEL pre-fill in
-    correctness tests); if not, we allocate the canonical 5D layout
+    `(logits, attn_lse)` — both 5D
     `[num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim]`
-    (and `[..., 1]` for attn_lse) inferred from the input shapes.
+    (and `[..., 1]` for attn_lse).
+
+    Single-pass mode (`num_kv_splits == 1`):
+      Caller can pre-allocate logits/attn_lse for sentinel testing, or leave
+      None and let us allocate. `output[total_q, num_heads, v_head_dim]` BF16
+      is only written by the kernel when `out_16_nosplit == 1`.
+
+    Multi-pass mode (`num_kv_splits > 1`):
+      Following the V3 architecture (`mla_decode_fwd` non-persistent path):
+        1. If `split_indptr` is None, build a uniform one:
+           `[0, N, 2N, ..., bs*N]` so every seq uses all N passes.
+        2. Force `out_16_nosplit = 0` — the kernel's bf16-direct-write path
+           does not support multi-pass.
+        3. After the kernel returns 5D FP32 partials, do a FlashAttention
+           logsumexp merge across the splits axis in pytorch and overwrite
+           `logits[:, 0]` / `attn_lse[:, 0]` with the merged result. Caller
+           reads `logits[:, 0]` to get the post-reduce values regardless of
+           how many splits were used. The remaining `logits[:, 1:]` /
+           `attn_lse[:, 1:]` slots are left as the kernel wrote them.
+
+      The merge intentionally stays inside the 5D tensor — it does NOT touch
+      `output` BF16 because the in-memory ordering of (max_seqlen_q, gqa) inside
+      the q_seq_lens_internal dim is kernel-specific (poc_kl reorders via
+      `mla_reorder_gpuO` before BF16 export). Callers that need
+      `output[total_q, num_heads, v_head_dim]` must perform that reorder
+      themselves; integrating it into this wrapper is a follow-up.
     """
     num_seqs = qo_indptr.shape[0] - 1
     num_heads = q.size(1)
@@ -1044,6 +1064,27 @@ def mla_decode_fwd_v4_nm(
     num_kv_heads = kv_buffer.size(2)
     gqa_ratio = num_heads // num_kv_heads
     q_seq_lens_internal = gqa_ratio * max_seqlen_q
+
+    # ---- V3-style auto-fill of split_indptr (== num_kv_splits_indptr) ----
+    # V3 `get_meta_param` builds this exact tensor when caller didn't provide
+    # one; mirror that here so the multi-split path is a one-liner for the
+    # caller.
+    if split_indptr is None:
+        split_indptr = torch.arange(
+            0,
+            (num_seqs + 1) * num_kv_splits,
+            num_kv_splits,
+            dtype=torch.int32,
+            device=q.device,
+        )
+
+    # ---- Multi-pass requires the FP32 split-output path ----
+    if num_kv_splits > 1 and out_16_nosplit != 0:
+        raise ValueError(
+            f"mla_decode_fwd_v4_nm: num_kv_splits={num_kv_splits} requires "
+            f"out_16_nosplit=0 (the kernel's bf16-direct-write path only "
+            f"supports passes==1). Got out_16_nosplit={out_16_nosplit}."
+        )
 
     if logits is None:
         logits = torch.empty(
@@ -1075,10 +1116,54 @@ def mla_decode_fwd_v4_nm(
         max_seqlen_q,
         sm_scale_arg,
         int(out_16_nosplit),
-        int(sub_Q),
         int(num_kv_splits),
         logits,
         attn_lse,
         output,
     )
+
+    # ---- FlashAttention-style merge across the splits axis ----------------
+    # Each (seq, split) WG wrote a `attn_lse[seq, split, ...]` scalar (log of
+    # the softmax denominator for that KV chunk) plus the partial value
+    # `logits[seq, split, ...]`. The merge over `K` chunks is:
+    #     m  = max_k lse[k]
+    #     w_k = exp(lse[k] - m)
+    #     V  = sum_k(w_k * V[k]) / sum_k(w_k)
+    #     lse_merged = m + log(sum_k(w_k))
+    # All slots `split >= split_indptr[seq+1] - split_indptr[seq]` are
+    # uninitialized memory; we mask them out via lse = -inf so their weights
+    # become 0 and they don't perturb the merge.
+    if num_kv_splits > 1:
+        device = logits.device
+        passes_per_seq = split_indptr[1:].to(torch.int32) - split_indptr[:-1].to(
+            torch.int32
+        )  # [num_seqs]
+        split_ids = torch.arange(num_kv_splits, device=device, dtype=torch.int32)
+        # mask[s, k] = True iff split k is valid for seq s
+        mask = split_ids.unsqueeze(0) < passes_per_seq.unsqueeze(1)  # [bs, splits]
+        # Broadcast to [bs, splits, 1, 1, 1] so it lines up with attn_lse.
+        mask_b = mask.view(num_seqs, num_kv_splits, 1, 1, 1)
+        neg_inf = torch.tensor(float("-inf"), device=device, dtype=attn_lse.dtype)
+        # Masked LSE: invalid slots → -inf so exp(-inf)=0 → weight=0.
+        lse_masked = torch.where(mask_b, attn_lse, neg_inf)
+        m = lse_masked.amax(dim=1, keepdim=True)  # [bs, 1, kv, m, 1]
+        # If a seq has zero valid passes (degenerate; shouldn't happen with
+        # uniform split_indptr) m is -inf — guard by clamping.
+        m_safe = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
+        w = torch.exp(lse_masked - m_safe)  # [bs, splits, kv, m, 1]
+        w_sum = w.sum(dim=1, keepdim=True)  # [bs, 1, kv, m, 1]
+        # Avoid 0/0 — fallback to uniform weight 1 over valid passes when
+        # everything was -inf. Edge case only; uniform split_indptr makes this
+        # unreachable in practice.
+        w_sum_safe = torch.where(w_sum > 0, w_sum, torch.ones_like(w_sum))
+        # Weighted sum of partials.
+        v_merged = (logits * w * mask_b.to(logits.dtype)).sum(
+            dim=1, keepdim=True
+        ) / w_sum_safe  # [bs, 1, kv, m, v]
+        lse_merged = m_safe + torch.log(w_sum_safe)  # [bs, 1, kv, m, 1]
+        # Overwrite the [:, 0] slot with the merged result so callers can read
+        # logits[:, 0] uniformly across single- and multi-split modes.
+        logits[:, 0:1].copy_(v_merged)
+        attn_lse[:, 0:1].copy_(lse_merged)
+
     return logits, attn_lse

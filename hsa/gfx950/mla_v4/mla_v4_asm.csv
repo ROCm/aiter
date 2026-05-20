@@ -3,18 +3,35 @@
 //
 // v4 MLA decode kernel registry (mi350 nm-recompile family).
 //
-// Schema columns (consumed by hsa/codegen.py -m mla_v4):
-//   qType         : Q dtype string (fp8 / bf16)
-//   kvType        : KV dtype string (fp8 / bf16)
-//   gqa           : gqa_ratio
-//   sub_Q         : per-WG Q tile (= block_size_x divisor; matches poc_kl `sub_Q`)
-//   page_size     : KV page size
-//   num_kv_splits : == poc_kl `passes`
-//   prefill       : 0 for decode, reserved for future prefill variants
-//   causal        : 0 for non-causal, reserved
-//   knl_name      : kernel symbol in the .co
-//   co_name       : .co file path relative to this CSV's directory
+// Schema is IDENTICAL to hsa/gfx950/mla/mla_asm.csv so the v3 and v4
+// registries are 1:1 column-compatible. The dispatcher in
+// csrc/py_itfs_cu/asm_mla_v4.cu computes the v4-specific dispatch keys
+// (sub_Q, page_size) internally — sub_Q via the same gqa × dtype ×
+// max_seqlen_q decision tree as v3's asm_mla.cu (~lines 272-318), and
+// page_size from the KV tensor shape.
+//
+// Columns (consumed by hsa/codegen.py -m mla_v4):
+//   qType    : Q dtype string (fp8 / bf16)
+//   kvType   : KV dtype string (fp8 / bf16)
+//   Gqa      : gqa_ratio
+//   ps       : persistent scheduling flag (0 = non-persistent; v4 nm only
+//              ships non-persistent today)
+//   qSeqLen  : max_seqlen_q (post-padding) baked into the kernel binary
+//              (4 for the qseqlen4 variant)
+//   prefill  : 0 for decode, reserved for future prefill variants
+//   causal   : 0 for non-causal, reserved
+//   lse      : final-LSE export flag (0 = no, v4 nm always 0 today)
+//   knl_name : kernel symbol in the .co
+//   co_name  : .co file path relative to this CSV's directory
+//
+// Dispatcher keys lookup on (qType, kvType, Gqa, ps, qSeqLen, prefill,
+// causal, lse) — exactly the same set as v3.
+//
+// NOTE on num_kv_splits / "passes": deliberately NOT a column. The .co
+// supports any value at runtime — slot 9 of the kernarg packet carries it
+// per launch. Host only sizes splitData/splitLse's split dim to match.
 //
 // Required columns last (per codegen.py convention): knl_name, co_name.
-qType,kvType,gqa,sub_Q,page_size,num_kv_splits,prefill,causal,knl_name,co_name
-fp8,fp8,16,64,1,1,0,0,_ZN5aiter42mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmpE,mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmp.co
+qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,knl_name,co_name
+fp8,fp8,16,0,4,0,0,0,_ZN5aiter42mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmpE,mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmp.co
+fp8,fp8,64,0,1,0,0,0,_ZN5aiter42mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmpE,mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmp.co
