@@ -4,7 +4,6 @@
 import triton
 import triton.language as tl
 
-
 # MXFP8 activation quant: per-1x32 e8m0 scale + FP8 e4m3 values.
 # Follows aiter.ops.quant.per_1x32_f8_scale_f8_quant:
 #   MAX_POW2 = int(log2(448)) = 8
@@ -324,9 +323,7 @@ def _dual_rmsnorm_mxfp8_quant_kernel(
             mask=q_mask,
             other=0.0,
         ).to(tl.float32)
-        g_q = tl.load(gq_ptr + q_col_offsets, mask=q_mask, other=0.0).to(
-            tl.float32
-        )
+        g_q = tl.load(gq_ptr + q_col_offsets, mask=q_mask, other=0.0).to(tl.float32)
 
         ss_q = tl.sum(x_q * x_q, axis=-1)
         norm_q = tl.math.rsqrt((ss_q / KQ) + eps_q)
@@ -368,9 +365,7 @@ def _dual_rmsnorm_mxfp8_quant_kernel(
             mask=k_mask,
             other=0.0,
         ).to(tl.float32)
-        g_k = tl.load(gk_ptr + k_col_offsets, mask=k_mask, other=0.0).to(
-            tl.float32
-        )
+        g_k = tl.load(gk_ptr + k_col_offsets, mask=k_mask, other=0.0).to(tl.float32)
 
         ss_k = tl.sum(x_k * x_k, axis=-1)
         norm_k = tl.math.rsqrt((ss_k / KK) + eps_k)
