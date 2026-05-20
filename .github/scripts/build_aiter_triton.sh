@@ -33,7 +33,7 @@ echo "==== Install dependencies and aiter ===="
 git config --global --add safe.directory /workspace
 pip config set global.retries 15
 pip config set global.timeout 120
-pip install -r .github/requirements/triton-test.txt
+retry_cmd 3 pip install -r .github/requirements/triton-test.txt
 .github/scripts/install_triton.sh
 pip uninstall -y aiter || true
 retry_cmd 3 pip install --no-build-isolation -e .
