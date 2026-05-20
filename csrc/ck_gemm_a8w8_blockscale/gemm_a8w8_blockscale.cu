@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <functional>
-#include <unordered_map>
-
 #include <torch/extension.h>
 
 #include "gemm_common.h"
@@ -13,8 +10,8 @@
 #include "gemm_a8w8_blockscale_lookup.h"
 #include "gemm_a8w8_blockscale_manifest.h"
 
-using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
+using BlockwiseKernel = torch::Tensor (*)(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
 
 using BlockwiseKernelMap = GemmDispatchMap<BlockwiseKernel>;
 
@@ -40,8 +37,8 @@ static BlockwiseKernel blockscale_dispatch(int M, int N, int K)
         }
     }();
 
-    const int cu_num         = get_device_cu_num();
-    const std::string& gfx   = get_device_gfx();
+    const std::string_view gfx = get_device_gfx();
+    const int cu_num           = get_device_cu_num();
 
     // First check if this shape(M,N,K) is available in the direct lookup.
     auto it = lookup.find({gfx, cu_num, M, N, K});

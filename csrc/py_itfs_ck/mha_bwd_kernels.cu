@@ -147,6 +147,17 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         return workspace.data_ptr();
     };
 
+    // Pinned host buffer allocator backed by PyTorch's CachingHostAllocator.
+    // Provided so dispatcher's async pipeline path is available even in batch
+    // mode (where the dispatcher itself currently bypasses D2H, but keeps the
+    // ABI uniform across batch/group entry points).
+    auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
+        auto t = std::make_shared<at::Tensor>(torch::empty(
+            {static_cast<int64_t>(bytes)},
+            torch::TensorOptions().dtype(at::kByte).pinned_memory(true)));
+        return std::shared_ptr<void>(t, t->data_ptr());
+    };
+
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
         dk_expanded = torch::empty({batch_size, seqlen_k, num_heads, head_size_q}, opts);
@@ -388,7 +399,8 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                                 p_dropout,
                                 p_undrop,
                                 drop_seed_offset,
-                                workspace_alloc};
+                                workspace_alloc,
+                                pinned_host_alloc};
         }();
 
         float t = aiter::mha_bwd(args, stream_config);
