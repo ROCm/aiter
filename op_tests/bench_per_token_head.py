@@ -44,6 +44,15 @@ H20_REF = {
     (2, 131072): 272.8, (4, 131072): 274.2, (6, 131072): 272.1, (8, 131072): 272.1,
 }
 
+# H20 latency reference (ms) from the same PDF "Prefill Latency (ms)" table.
+H20_LAT_MS = {
+    (2,   1024):   0.029, (4,   1024):   0.051, (6,   1024):   0.069, (8,   1024):   0.091,
+    (2,  16384):   4.13,  (4,  16384):   8.15,  (6,  16384):  12.21,  (8,  16384):  16.41,
+    (2,  32768):  16.31,  (4,  32768):  32.30,  (6,  32768):  48.43,  (8,  32768):  65.08,
+    (2,  65536):  64.97,  (4,  65536): 128.61,  (6,  65536): 192.89,  (8,  65536): 259.22,
+    (2, 131072): 257.92,  (4, 131072): 513.27,  (6, 131072): 775.93,  (8, 131072): 1034.50,
+}
+
 SHAPES = [
     (b, s, s, 8, 1, 128, True, 0.0)
     for s in (1024, 16384, 32768, 65536, 131072)
@@ -60,9 +69,9 @@ def fmt(r):
 print(
     f"{'batch':>5} {'seq':>6} {'nhq':>4} {'nhk':>4} {'hd':>4} | "
     f"{'PER_TOKEN_HEAD':>26} | {'KV_BLOCKSCALE':>26} | "
-    f"{'H20 ref':>9} | {'MI300/H20':>9}"
+    f"{'H20 TFLOPS':>10} | {'H20 lat(ms)':>11} | {'MI300/H20 TF':>12} | {'H20/MI300 lat':>13}"
 )
-print("-" * 120)
+print("-" * 160)
 
 for b, qo, kv, nhq, nhk, hd, c, sc in SHAPES:
     common = dict(
@@ -85,14 +94,19 @@ for b, qo, kv, nhq, nhk, hd, c, sc in SHAPES:
     )
     pth = run_batch_prefill_per_token_head(**common)
     kvb = run_batch_prefill_kv_blockscale(**common)
-    h20 = H20_REF.get((b, kv))
-    if pth.get("status") == "passed" and h20:
-        ratio = f"{pth['tflops'] / h20:>8.2f}x"
+    h20_tf = H20_REF.get((b, kv))
+    h20_ms = H20_LAT_MS.get((b, kv))
+    if pth.get("status") == "passed" and h20_tf:
+        tf_ratio = f"{pth['tflops'] / h20_tf:>11.2f}x"
+        # MI300 latency in ms = us / 1000; H20 latency / MI300 latency = speedup factor
+        lat_ratio = f"{(h20_ms * 1000.0) / pth['time_us']:>12.2f}x"
     else:
-        ratio = "  -"
-    h20_str = f"{h20:>9.1f}" if h20 else f"{'-':>9}"
+        tf_ratio = "  -"
+        lat_ratio = "  -"
+    h20_tf_str = f"{h20_tf:>10.1f}" if h20_tf else f"{'-':>10}"
+    h20_ms_str = f"{h20_ms:>11.3f}" if h20_ms else f"{'-':>11}"
     print(
         f"{b:>5} {kv:>6} {nhq:>4} {nhk:>4} {hd:>4} | "
         f"{fmt(pth):>26} | {fmt(kvb):>26} | "
-        f"{h20_str} | {ratio:>9}"
+        f"{h20_tf_str} | {h20_ms_str} | {tf_ratio:>12} | {lat_ratio:>13}"
     )
