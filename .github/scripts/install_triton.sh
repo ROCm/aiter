@@ -1,27 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
-REQ_FILE=${TRITON_REQUIREMENTS_FILE:-"${REPO_ROOT}/.github/requirements/triton-test.txt"}
-
-if [[ ! -f "${REQ_FILE}" ]]; then
-    echo "Triton requirements file not found: ${REQ_FILE}" >&2
-    exit 1
-fi
-
-TRITON_INDEX_URL=$(awk '$1 == "--extra-index-url" { print $2; exit }' "${REQ_FILE}")
-TRITON_SPEC=$(awk '/^triton==/ { print; exit }' "${REQ_FILE}")
-
-if [[ -z "${TRITON_INDEX_URL}" || -z "${TRITON_SPEC}" ]]; then
-    echo "Could not find Triton index URL and pin in ${REQ_FILE}" >&2
-    exit 1
-fi
 
 python3 -m pip uninstall -y triton pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
 
-echo "Installing ${TRITON_SPEC} from ${TRITON_INDEX_URL}"
-python3 -m pip install --extra-index-url "${TRITON_INDEX_URL}" "${TRITON_SPEC}"
+TRITON_INDEX_URL="https://pypi.amd.com/triton/rocm-7.0.0/simple/"
+ROCM_VERSION=$(dpkg -l rocm-core 2>/dev/null | awk '/^ii/{print $3}')
+if [[ -n "$ROCM_VERSION" ]]; then
+    ROCM_MAJOR_MINOR=$(echo "$ROCM_VERSION" | cut -d. -f1,2)
+    TRITON_INDEX_URL="https://pypi.amd.com/triton/rocm-${ROCM_MAJOR_MINOR}.0/simple/"
+fi
+
+echo "Installing triton from $TRITON_INDEX_URL"
+pip install --extra-index-url "$TRITON_INDEX_URL" triton
 
 python3 - <<'PY'
 import triton
