@@ -467,6 +467,6 @@ def _get_config(
     config mechanism. Falls back to the generic fallback file or to
     _DEFAULT_CONFIG if no JSON is available."""
     if shuffle:
-        return get_gemm_config("GEMM-AFP8WFP8-PRESHUFFLE", M, N, K)
+        return get_gemm_config("GEMM-AFP8WFP8_PRESHUFFLED", M, N, K)
     else:
         return get_gemm_config("GEMM-AFP8WFP8", M, N, K)
