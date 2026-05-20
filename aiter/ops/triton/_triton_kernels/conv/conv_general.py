@@ -4,17 +4,16 @@
 from __future__ import annotations
 import triton
 import triton.language as tl
-from .helpers import _tanh, AUTOTUNE_GENERAL_CONFIGS
+from aiter.ops.triton.utils.conv_config_utils import get_conv_config
+from .helpers import _tanh, AUTOTUNE_GENERAL_CONFIGS, CONV_AUTOTUNE_ENABLED
 
 
-@triton.autotune(
-    configs=AUTOTUNE_GENERAL_CONFIGS,
-    key=["M_total", "K_out", "K_pad"],
-    reset_to_zero=["Y"],
-    warmup=50,
-    rep=200,
-    cache_results=True,
-)
+def _get_config(shape_key=None, M=None):
+    if CONV_AUTOTUNE_ENABLED:
+        return {}
+    return get_conv_config("CONV-GENERAL", shape_key=shape_key, M=M)
+
+
 @triton.jit
 def _conv2d_general_kernel(
     X,
@@ -161,3 +160,14 @@ def _conv2d_general_kernel(
         acc,
         mask=(n_valid & (p_idx < P) & (q_idx < Q) & kout_mask[None, :]),
     )
+
+
+if CONV_AUTOTUNE_ENABLED:
+    _conv2d_general_kernel = triton.autotune(
+        configs=AUTOTUNE_GENERAL_CONFIGS,
+        key=["M_total", "K_out", "K_pad"],
+        reset_to_zero=["Y"],
+        warmup=50,
+        rep=200,
+        cache_results=True,
+    )(_conv2d_general_kernel)

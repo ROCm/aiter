@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
+import os
 import triton
 import triton.language as tl
 
@@ -13,8 +14,19 @@ def _tanh(x):
     return (e2x - 1) / (e2x + 1)
 
 
+# Env-var escape hatch: set AITER_CONV_AUTOTUNE=1 to bypass JSON-loaded configs
+# and let @triton.autotune do a runtime search across AUTOTUNE_*_CONFIGS below.
+# Default off — production / CI path uses JSON configs from configs/conv/.
+CONV_AUTOTUNE_ENABLED = os.environ.get("AITER_CONV_AUTOTUNE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
 # ========================================================================
-# AUTOTUNE CONFIGS — centralized to avoid duplication and cross-imports
+# AUTOTUNE CONFIGS — search space for env-var autotune mode
 # ========================================================================
 
 # -- 1x1 kernel --

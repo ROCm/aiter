@@ -12,11 +12,20 @@ except Exception:
     tl = None
 
 from aiter.ops.triton.conv._utils import _out_hw, _is_winograd_eligible
-from aiter.ops.triton._triton_kernels.conv.conv_1x1 import _conv2d_1x1_kernel
-from aiter.ops.triton._triton_kernels.conv.conv_general import _conv2d_general_kernel
+from aiter.ops.triton.utils.conv_config_utils import format_shape_key
+from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
+    _conv2d_1x1_kernel,
+    _get_config as _get_config_1x1,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_general import (
+    _conv2d_general_kernel,
+    _get_config as _get_config_general,
+)
 from aiter.ops.triton._triton_kernels.conv.conv_3x3 import (
     _conv2d_3x3_nhwc_kernel,
     _conv2d_3x3_cblocked_kernel,
+    _get_config_nhwc,
+    _get_config_cblocked,
 )
 from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
     _winograd_f4x3_input_transform_kernel,
@@ -24,6 +33,10 @@ from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
     _winograd_f4x3_batched_gemm_kernel,
     _winograd_f4x3_output_transform_kernel,
     _winograd_f4x3_fused_gemm_output_kernel,
+    _get_config_input as _get_config_wino_input,
+    _get_config_gemm as _get_config_wino_gemm,
+    _get_config_output as _get_config_wino_output,
+    _get_config_fused as _get_config_wino_fused,
 )
 
 
@@ -107,6 +120,23 @@ def _launch_1x1(
 
     M_total = N * P * Q
 
+    shape_key = format_shape_key(
+        N=N,
+        C=C,
+        H=H,
+        W=W_in,
+        K=K_out,
+        R=1,
+        S=1,
+        sh=sh,
+        sw=sw,
+        ph=ph,
+        pw=pw,
+        dh=1,
+        dw=1,
+    )
+    config = _get_config_1x1(shape_key=shape_key, M=M_total)
+
     _conv2d_1x1_kernel[grid](
         x,
         w,
@@ -127,6 +157,7 @@ def _launch_1x1(
         HAS_BIAS=1 if bias_fp32 is not None else 0,
         ACT_TYPE=ACT_MAP.get(activation, 0),
         LAYOUT=layout,
+        **config,
     )
 
 
@@ -166,6 +197,23 @@ def _launch_3x3_nhwc(
 
     M_total = N * P * Q
 
+    shape_key = format_shape_key(
+        N=N,
+        C=C,
+        H=H,
+        W=W_in,
+        K=K_out,
+        R=3,
+        S=3,
+        sh=sh,
+        sw=sw,
+        ph=ph,
+        pw=pw,
+        dh=dh,
+        dw=dw,
+    )
+    config = _get_config_nhwc(shape_key=shape_key, M=M_total)
+
     _conv2d_3x3_nhwc_kernel[grid](
         x,
         w_3x3,
@@ -188,6 +236,7 @@ def _launch_3x3_nhwc(
         M_total,
         HAS_BIAS=1 if bias_fp32 is not None else 0,
         ACT_TYPE=ACT_MAP.get(activation, 0),
+        **config,
     )
 
 
@@ -228,6 +277,23 @@ def _launch_3x3_cblocked(
 
     M_total = N * P * Q
 
+    shape_key = format_shape_key(
+        N=N,
+        C=C,
+        H=H,
+        W=W_in,
+        K=K_out,
+        R=3,
+        S=3,
+        sh=sh,
+        sw=sw,
+        ph=ph,
+        pw=pw,
+        dh=dh,
+        dw=dw,
+    )
+    config = _get_config_cblocked(shape_key=shape_key, M=M_total)
+
     _conv2d_3x3_cblocked_kernel[grid](
         x_blocked,
         w_3x3,
@@ -251,6 +317,7 @@ def _launch_3x3_cblocked(
         M_total,
         HAS_BIAS=1 if bias_fp32 is not None else 0,
         ACT_TYPE=ACT_MAP.get(activation, 0),
+        **config,
     )
 
 
@@ -297,6 +364,23 @@ def _launch_general(
 
     M_total = N * P * Q
 
+    shape_key = format_shape_key(
+        N=N,
+        C=C,
+        H=H,
+        W=W_in,
+        K=K_out,
+        R=R,
+        S=S,
+        sh=sh,
+        sw=sw,
+        ph=ph,
+        pw=pw,
+        dh=dh,
+        dw=dw,
+    )
+    config = _get_config_general(shape_key=shape_key, M=M_total)
+
     _conv2d_general_kernel[grid](
         x,
         w_k,
@@ -322,6 +406,7 @@ def _launch_general(
         HAS_BIAS=1 if bias_fp32 is not None else 0,
         ACT_TYPE=ACT_MAP.get(activation, 0),
         LAYOUT=layout,
+        **config,
     )
 
 
@@ -354,6 +439,24 @@ def _launch_winograd_f4x3_fused(
     input_dtype = x.dtype
     V = torch.empty((36, T, C_pad), device=x.device, dtype=input_dtype)
 
+    shape_key = format_shape_key(
+        N=N,
+        C=C,
+        H=H,
+        W=W_in,
+        K=K_out,
+        R=3,
+        S=3,
+        sh=1,
+        sw=1,
+        ph=ph,
+        pw=pw,
+        dh=1,
+        dw=1,
+    )
+    input_config = _get_config_wino_input(shape_key=shape_key, M=T)
+    fused_config = _get_config_wino_fused(shape_key=shape_key, M=T)
+
     # 1. Input transform
     def input_grid_f4(meta):
         return (T, triton.cdiv(C_pad, meta["BLOCK_C"]))
@@ -373,6 +476,7 @@ def _launch_winograd_f4x3_fused(
         pw,
         INPUT_DTYPE=_torch_dtype_to_tl(input_dtype),
         LAYOUT=layout_int,
+        **input_config,
     )
 
     # 2. Fused GEMM + output transform
@@ -398,6 +502,7 @@ def _launch_winograd_f4x3_fused(
         HAS_BIAS=1 if bias_fp32 is not None else 0,
         ACT_TYPE=ACT_MAP.get(activation, 0),
         LAYOUT=layout_int,
+        **fused_config,
     )
 
 
@@ -431,6 +536,25 @@ def _launch_winograd_f4x3(
     V = torch.empty((36, T, C_pad), device=x.device, dtype=input_dtype)
     M = torch.empty((36, T, K_out), device=x.device, dtype=torch.float32)
 
+    shape_key = format_shape_key(
+        N=N,
+        C=C,
+        H=H,
+        W=W_in,
+        K=K_out,
+        R=3,
+        S=3,
+        sh=1,
+        sw=1,
+        ph=ph,
+        pw=pw,
+        dh=1,
+        dw=1,
+    )
+    input_config = _get_config_wino_input(shape_key=shape_key, M=T)
+    gemm_config = _get_config_wino_gemm(shape_key=shape_key, M=T)
+    output_config = _get_config_wino_output(shape_key=shape_key, M=T)
+
     # 1. Input transform
     def input_grid_f4(meta):
         return (T, triton.cdiv(C_pad, meta["BLOCK_C"]))
@@ -450,6 +574,7 @@ def _launch_winograd_f4x3(
         pw,
         INPUT_DTYPE=_torch_dtype_to_tl(input_dtype),
         LAYOUT=layout_int,
+        **input_config,
     )
 
     # 2. Batched GEMM
@@ -465,6 +590,7 @@ def _launch_winograd_f4x3(
         T,
         K_out,
         C_pad,
+        **gemm_config,
     )
 
     # 3. Output transform
@@ -488,6 +614,7 @@ def _launch_winograd_f4x3(
         HAS_BIAS=1 if bias_fp32 is not None else 0,
         ACT_TYPE=ACT_MAP.get(activation, 0),
         LAYOUT=layout_int,
+        **output_config,
     )
 
 
@@ -522,6 +649,25 @@ def _launch_winograd_f4x3_cblocked(
     V = torch.empty((36, T, C_pad), device=x_blocked.device, dtype=input_dtype)
     M = torch.empty((36, T, K_out), device=x_blocked.device, dtype=torch.float32)
 
+    shape_key = format_shape_key(
+        N=N,
+        C=C,
+        H=H,
+        W=W_in,
+        K=K_out,
+        R=3,
+        S=3,
+        sh=1,
+        sw=1,
+        ph=ph,
+        pw=pw,
+        dh=1,
+        dw=1,
+    )
+    input_config = _get_config_wino_input(shape_key=shape_key, M=T)
+    gemm_config = _get_config_wino_gemm(shape_key=shape_key, M=T)
+    output_config = _get_config_wino_output(shape_key=shape_key, M=T)
+
     # 1. Cblocked input transform
     def input_grid_f4(meta):
         return (T, triton.cdiv(C_pad, meta["BLOCK_C"]))
@@ -541,6 +687,7 @@ def _launch_winograd_f4x3_cblocked(
         pw,
         Cb,
         INPUT_DTYPE=_torch_dtype_to_tl(input_dtype),
+        **input_config,
     )
 
     def gemm_grid(meta):
@@ -555,6 +702,7 @@ def _launch_winograd_f4x3_cblocked(
         T,
         K_out,
         C_pad,
+        **gemm_config,
     )
 
     ACT_MAP = {"none": 0, "relu": 1, "relu6": 2, "gelu": 3}
@@ -576,4 +724,5 @@ def _launch_winograd_f4x3_cblocked(
         T,
         HAS_BIAS=1 if bias_fp32 is not None else 0,
         ACT_TYPE=ACT_MAP.get(activation, 0),
+        **output_config,
     )

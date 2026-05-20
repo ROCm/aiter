@@ -4,20 +4,41 @@
 from __future__ import annotations
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 from .helpers import (
     _tanh,
     AUTOTUNE_WINO4_INPUT_CONFIGS,
     AUTOTUNE_WINO_GEMM_CONFIGS,
     AUTOTUNE_WINO4_OUTPUT_CONFIGS,
     AUTOTUNE_FUSED_F4X3_CONFIGS,
+    CONV_AUTOTUNE_ENABLED,
 )
 
 
-@triton.autotune(
-    configs=AUTOTUNE_WINO4_INPUT_CONFIGS,
-    key=["T", "C_pad"],
-    cache_results=True,
-)
+def _get_config_input(shape_key=None, M=None):
+    if CONV_AUTOTUNE_ENABLED:
+        return {}
+    return get_conv_config("CONV-WINO-F4X3-INPUT", shape_key=shape_key, M=M)
+
+
+def _get_config_gemm(shape_key=None, M=None):
+    if CONV_AUTOTUNE_ENABLED:
+        return {}
+    return get_conv_config("CONV-WINO-F4X3-GEMM", shape_key=shape_key, M=M)
+
+
+def _get_config_output(shape_key=None, M=None):
+    if CONV_AUTOTUNE_ENABLED:
+        return {}
+    return get_conv_config("CONV-WINO-F4X3-OUTPUT", shape_key=shape_key, M=M)
+
+
+def _get_config_fused(shape_key=None, M=None):
+    if CONV_AUTOTUNE_ENABLED:
+        return {}
+    return get_conv_config("CONV-WINO-F4X3-FUSED", shape_key=shape_key, M=M)
+
+
 @triton.jit
 def _winograd_f4x3_input_transform_kernel(
     X,
@@ -367,11 +388,6 @@ def _winograd_f4x3_input_transform_kernel(
     tl.store(v_base + 35 * stride_v_alpha, v55, mask=c_store_mask)
 
 
-@triton.autotune(
-    configs=AUTOTUNE_WINO4_INPUT_CONFIGS,
-    key=["T", "C_pad"],
-    cache_results=True,
-)
 @triton.jit
 def _winograd_f4x3_cblocked_input_transform_kernel(
     X,
@@ -707,11 +723,6 @@ def _winograd_f4x3_cblocked_input_transform_kernel(
     tl.store(v_base + 35 * stride_v_alpha, v55, mask=c_store_mask)
 
 
-@triton.autotune(
-    configs=AUTOTUNE_WINO_GEMM_CONFIGS,
-    key=["T", "K_out", "C_pad"],
-    cache_results=True,
-)
 @triton.jit
 def _winograd_f4x3_batched_gemm_kernel(
     V,
@@ -787,11 +798,6 @@ def _winograd_f4x3_batched_gemm_kernel(
     tl.store(m_ptrs, acc, mask=m_mask)
 
 
-@triton.autotune(
-    configs=AUTOTUNE_WINO4_OUTPUT_CONFIGS,
-    key=["T", "K_out"],
-    cache_results=True,
-)
 @triton.jit
 def _winograd_f4x3_output_transform_kernel(
     M_in,
@@ -1095,11 +1101,6 @@ def _winograd_f4x3_output_transform_kernel(
                         )
 
 
-@triton.autotune(
-    configs=AUTOTUNE_FUSED_F4X3_CONFIGS,
-    key=["T", "K_out", "C_pad"],
-    cache_results=True,
-)
 @triton.jit
 def _winograd_f4x3_fused_gemm_output_kernel(
     V,
@@ -1478,3 +1479,35 @@ def _winograd_f4x3_fused_gemm_output_kernel(
                     tl.store(ptrs_ij, y32, mask=mask_ij)
                 else:
                     tl.store(ptrs_ij, y33, mask=mask_ij)
+
+
+if CONV_AUTOTUNE_ENABLED:
+    _winograd_f4x3_input_transform_kernel = triton.autotune(
+        configs=AUTOTUNE_WINO4_INPUT_CONFIGS,
+        key=["T", "C_pad"],
+        cache_results=True,
+    )(_winograd_f4x3_input_transform_kernel)
+
+    _winograd_f4x3_cblocked_input_transform_kernel = triton.autotune(
+        configs=AUTOTUNE_WINO4_INPUT_CONFIGS,
+        key=["T", "C_pad"],
+        cache_results=True,
+    )(_winograd_f4x3_cblocked_input_transform_kernel)
+
+    _winograd_f4x3_batched_gemm_kernel = triton.autotune(
+        configs=AUTOTUNE_WINO_GEMM_CONFIGS,
+        key=["T", "K_out", "C_pad"],
+        cache_results=True,
+    )(_winograd_f4x3_batched_gemm_kernel)
+
+    _winograd_f4x3_output_transform_kernel = triton.autotune(
+        configs=AUTOTUNE_WINO4_OUTPUT_CONFIGS,
+        key=["T", "K_out"],
+        cache_results=True,
+    )(_winograd_f4x3_output_transform_kernel)
+
+    _winograd_f4x3_fused_gemm_output_kernel = triton.autotune(
+        configs=AUTOTUNE_FUSED_F4X3_CONFIGS,
+        key=["T", "K_out", "C_pad"],
+        cache_results=True,
+    )(_winograd_f4x3_fused_gemm_output_kernel)
