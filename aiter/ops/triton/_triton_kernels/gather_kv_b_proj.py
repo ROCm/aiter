@@ -83,9 +83,14 @@ def _triton_gather_kv_b_proj(
     PER_ROW_SCALE: tl.constexpr = False,
     NO_SCALE: tl.constexpr = False,
 ):
-    stride_k_buffer: tl.constexpr = KBlockSize * (KV_CDim + KV_PeDim)
-    stride_k_prefix: tl.constexpr = TpNumHeads * (QkNopeHeadDim + KV_PeDim)
-    stride_v_prefix: tl.constexpr = TpNumHeads * VHeadDim
+    # All three strides are multiplied by runtime indices that can overflow
+    # i32 at large scales. Promote the scalar (broadcast) side to i64 so the multiply
+    # is i32-zext x i64 -> i64
+    stride_k_buffer = tl.full([], KBlockSize * (KV_CDim + KV_PeDim), dtype=tl.int64)
+    stride_k_prefix = tl.full(
+        [], TpNumHeads * (QkNopeHeadDim + KV_PeDim), dtype=tl.int64
+    )
+    stride_v_prefix = tl.full([], TpNumHeads * VHeadDim, dtype=tl.int64)
 
     ScaleKGranularity: tl.constexpr = 128
     ScaleNGranularity: tl.constexpr = 128
@@ -266,13 +271,17 @@ def _triton_gather_kv_b_proj(
         ).to(tl.float32)
 
     for chunk_id in range(total_kv_chunk):
+        block_lane_valid = (
+            chunk_id * KBlocksPerChunkK + tl.arange(0, ChunkK) // KBlockSize
+            < total_kv_block
+        )
         kv_block_idx = tl.load(
             kv_indices
             + kv_block_start
             + chunk_id * KBlocksPerChunkK
             + tl.arange(0, ChunkK) // KBlockSize,
-            mask=chunk_id * KBlocksPerChunkK + tl.arange(0, ChunkK) // KBlockSize
-            < total_kv_block,
+            mask=block_lane_valid,
+            other=0,
         )
         kv_c_data_base_offset = (
             kv_block_idx[:, None] * stride_k_buffer
@@ -283,27 +292,46 @@ def _triton_gather_kv_b_proj(
         accum_k = tl.zeros((ChunkK, PaddedK), dtype=tl.float32)
         accum_v = tl.zeros((ChunkK, PaddedV), dtype=tl.float32)
 
-        kv_c_data_0 = tl.load(k_buffer + kv_c_data_base_offset + 0 * ScaleKGranularity)
-        kv_c_data_1 = tl.load(k_buffer + kv_c_data_base_offset + 1 * ScaleKGranularity)
-        kv_c_data_2 = tl.load(k_buffer + kv_c_data_base_offset + 2 * ScaleKGranularity)
-        kv_c_data_3 = tl.load(k_buffer + kv_c_data_base_offset + 3 * ScaleKGranularity)
+        row_mask = block_lane_valid[:, None]
+        kv_c_data_0 = tl.load(
+            k_buffer + kv_c_data_base_offset + 0 * ScaleKGranularity,
+            mask=row_mask,
+            other=0.0,
+        )
+        kv_c_data_1 = tl.load(
+            k_buffer + kv_c_data_base_offset + 1 * ScaleKGranularity,
+            mask=row_mask,
+            other=0.0,
+        )
+        kv_c_data_2 = tl.load(
+            k_buffer + kv_c_data_base_offset + 2 * ScaleKGranularity,
+            mask=row_mask,
+            other=0.0,
+        )
+        kv_c_data_3 = tl.load(
+            k_buffer + kv_c_data_base_offset + 3 * ScaleKGranularity,
+            mask=row_mask,
+            other=0.0,
+        )
         kv_pe_data = tl.load(
             k_buffer
             + kv_block_idx[:, None] * stride_k_buffer
             + tl.arange(0, ChunkK)[:, None] % KBlockSize * (KV_CDim + KV_PeDim)
             + KV_CDim
             + tl.arange(0, KV_PeDim)[None, :],
+            mask=row_mask,
+            other=0.0,
         )
 
         if NO_SCALE:
-            accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T)
-            accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T)
-            accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T)
-            accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T)
-            accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T)
-            accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T)
-            accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T)
-            accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T)
+            accum_k = tl.dot(kv_c_data_0, k_nope_weight_0.T, acc=accum_k)
+            accum_v = tl.dot(kv_c_data_0, v_nope_weight_0.T, acc=accum_v)
+            accum_k = tl.dot(kv_c_data_1, k_nope_weight_1.T, acc=accum_k)
+            accum_v = tl.dot(kv_c_data_1, v_nope_weight_1.T, acc=accum_v)
+            accum_k = tl.dot(kv_c_data_2, k_nope_weight_2.T, acc=accum_k)
+            accum_v = tl.dot(kv_c_data_2, v_nope_weight_2.T, acc=accum_v)
+            accum_k = tl.dot(kv_c_data_3, k_nope_weight_3.T, acc=accum_k)
+            accum_v = tl.dot(kv_c_data_3, v_nope_weight_3.T, acc=accum_v)
         elif PER_ROW_SCALE:
             accum_k += (
                 tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_vec[None, :]
