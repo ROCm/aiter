@@ -48,6 +48,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"split_k(?P<split_k>\d+)_"
     r"block_m_warp(?P<block_m_warps>\d+)_"
     r"block_n_warp(?P<block_n_warps>\d+)_"
+    r"block_k_warp(?P<block_k_warps>\d+)_"
     r"async_copy(?P<async_copy>True|False)_"
     r"b_to_lds(?P<b_to_lds>True|False)_"
     r"b_preshuffle(?P<b_preshuffle>True|False)_"
@@ -73,32 +74,79 @@ SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
 HGEMM_TILE_N_OPTIONS = (64, 128, 256)
 HGEMM_TILE_K_OPTIONS = (64, 128, 256)
 HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 96, 128, 256)
-HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 9))
+HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 14))
 HGEMM_MAX_SPLIT_K = 8
 KERNEL_CONFIG_VARIANTS = (
     {
         "block_m_warps": 1,
         "block_n_warps": 2,
+        "block_k_warps": 1,
         "b_to_lds": False,
     },
     {
         "block_m_warps": 1,
         "block_n_warps": 4,
+        "block_k_warps": 1,
         "b_to_lds": False,
     },
     {
         "block_m_warps": 2,
         "block_n_warps": 2,
+        "block_k_warps": 1,
+        "b_to_lds": False,
+    },
+    {
+        "block_m_warps": 1,
+        "block_n_warps": 2,
+        "block_k_warps": 2,
         "b_to_lds": False,
     },
     {
         "block_m_warps": 1,
         "block_n_warps": 4,
+        "block_k_warps": 2,
+        "b_to_lds": False,
+    },
+    {
+        "block_m_warps": 2,
+        "block_n_warps": 2,
+        "block_k_warps": 2,
+        "b_to_lds": False,
+    },
+    {
+        "block_m_warps": 1,
+        "block_n_warps": 2,
+        "block_k_warps": 1,
+        "b_to_lds": True,
+    },
+    {
+        "block_m_warps": 1,
+        "block_n_warps": 4,
+        "block_k_warps": 1,
         "b_to_lds": True,
     },
     {
         "block_m_warps": 2,
         "block_n_warps": 2,
+        "block_k_warps": 1,
+        "b_to_lds": True,
+    },
+    {
+        "block_m_warps": 1,
+        "block_n_warps": 2,
+        "block_k_warps": 2,
+        "b_to_lds": True,
+    },
+    {
+        "block_m_warps": 1,
+        "block_n_warps": 4,
+        "block_k_warps": 2,
+        "b_to_lds": True,
+    },
+    {
+        "block_m_warps": 2,
+        "block_n_warps": 2,
+        "block_k_warps": 2,
         "b_to_lds": True,
     },
 )
@@ -141,6 +189,7 @@ def flydsl_kernel_name(
     split_k: int,
     block_m_warp: int,
     block_n_warp: int,
+    block_k_warp: int,
     async_copy: bool,
     b_to_lds: bool,
     b_preshuffle: bool = False,
@@ -167,7 +216,7 @@ def flydsl_kernel_name(
     name = (
         f"flydsl_gemm{stage}_a{dtype}_w{dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
     )
-    name += f"_split_k{split_k}_block_m_warp{block_m_warp}_block_n_warp{block_n_warp}"
+    name += f"_split_k{split_k}_block_m_warp{block_m_warp}_block_n_warp{block_n_warp}_block_k_warp{block_k_warp}"
     name += (
         f"_async_copy{async_copy}_b_to_lds{b_to_lds}_b_preshuffle{b_preshuffle}"
         f"_c_to_lds{c_to_lds}"
@@ -332,6 +381,7 @@ def _validate_hgemm_tiling(
     stages: int,
     block_m_warps: int,
     block_n_warps: int,
+    block_k_warps: int,
     b_to_lds: bool,
 ) -> None:
     del m
@@ -340,10 +390,10 @@ def _validate_hgemm_tiling(
         raise ValueError(
             f"Tile sizes must be positive, got tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}"
         )
-    if block_m_warps < 1 or block_n_warps < 1:
+    if block_m_warps < 1 or block_n_warps < 1 or block_k_warps < 1:
         raise ValueError(
             "Warp tiling must be positive, got "
-            f"block_m_warps={block_m_warps}, block_n_warps={block_n_warps}"
+            f"block_m_warps={block_m_warps}, block_n_warps={block_n_warps}, block_k_warps={block_k_warps}"
         )
     if tile_k < 32:
         raise ValueError(
@@ -396,7 +446,7 @@ def _validate_hgemm_tiling(
             f">= tile_k={tile_k} and % tile_k == 0"
         )
 
-    block_threads = block_m_warps * block_n_warps * 64
+    block_threads = block_m_warps * block_n_warps * block_k_warps * 64
     ldg_vec_size = 8
     block_vecs = ldg_vec_size * block_threads
     block_mk_size = tile_m * tile_k
@@ -457,6 +507,7 @@ def _normalize_registry_config(
     split_k: int,
     block_m_warps: int,
     block_n_warps: int,
+    block_k_warps: int,
     b_to_lds: bool,
 ) -> Optional[Dict]:
     config = {
@@ -468,6 +519,7 @@ def _normalize_registry_config(
         "split_k": int(split_k),
         "block_m_warps": int(block_m_warps),
         "block_n_warps": int(block_n_warps),
+        "block_k_warps": int(block_k_warps),
         "async_copy": KERNEL_ASYNC_COPY,
         "b_to_lds": bool(b_to_lds),
         "b_preshuffle": False,
@@ -490,6 +542,7 @@ def _normalize_registry_config(
             stages=FIXED_STAGE,
             block_m_warps=config["block_m_warps"],
             block_n_warps=config["block_n_warps"],
+            block_k_warps=config["block_k_warps"],
             b_to_lds=config["b_to_lds"],
         )
     except ValueError:
@@ -519,6 +572,7 @@ def _parse_hgemm_kernel_params(name: str) -> Optional[Dict]:
         "split_k": int(m.group("split_k")),
         "block_m_warps": int(m.group("block_m_warps")),
         "block_n_warps": int(m.group("block_n_warps")),
+        "block_k_warps": int(m.group("block_k_warps")),
         "async_copy": m.group("async_copy") == "True",
         "b_to_lds": m.group("b_to_lds") == "True",
         "b_preshuffle": m.group("b_preshuffle") == "True",
@@ -582,6 +636,7 @@ def get_flydsl_splitk_hgemm_kernels(
                 split_k=split_k,
                 block_m_warps=variant["block_m_warps"],
                 block_n_warps=variant["block_n_warps"],
+                block_k_warps=variant["block_k_warps"],
                 b_to_lds=variant["b_to_lds"],
             )
             if config is None:
@@ -599,6 +654,7 @@ def get_flydsl_splitk_hgemm_kernels(
                 config["split_k"],
                 config["block_m_warps"],
                 config["block_n_warps"],
+                config["block_k_warps"],
                 config["async_copy"],
                 config["b_to_lds"],
                 config["b_preshuffle"],
@@ -699,8 +755,9 @@ def _compile_flydsl_hgemm(
     k: int,
     *,
     tile_k: int = 64,
-    block_m_warps: int = 1,
-    block_n_warps: int = 4,
+    block_m_warps: int = 2,
+    block_n_warps: int = 2,
+    block_k_warps: int = 1,
     tile_m: int = 128,
     tile_n: int = 128,
     pack_n: int = 1,
@@ -740,6 +797,7 @@ def _compile_flydsl_hgemm(
             stages=stages,
             block_m_warps=block_m_warps,
             block_n_warps=block_n_warps,
+            block_k_warps=block_k_warps,
             b_to_lds=b_to_lds,
         )
     elif kernel_family == KERNEL_FAMILY_SMALL_M:
@@ -776,6 +834,7 @@ def _compile_flydsl_hgemm(
         split_k=split_k,
         block_m_warps=block_m_warps,
         block_n_warps=block_n_warps,
+        block_k_warps=block_k_warps,
         n_tile_repeat=n_tile_repeat,
         persistent_n_tiles=persistent_n_tiles,
         waves_per_eu=waves_per_eu,
@@ -835,8 +894,9 @@ def flydsl_hgemm(
     tile_k: int = 64,
     pack_n: int = 1,
     split_k: int = 1,
-    block_m_warps: int = 1,
-    block_n_warps: int = 4,
+    block_m_warps: int = 2,
+    block_n_warps: int = 2,
+    block_k_warps: int = 1,
     n_tile_repeat: int = 1,
     persistent_n_tiles: int = 1,
     waves_per_eu: int = 0,
@@ -887,6 +947,7 @@ def flydsl_hgemm(
         tile_k=tile_k,
         block_m_warps=block_m_warps,
         block_n_warps=block_n_warps,
+        block_k_warps=block_k_warps,
         tile_m=tile_m,
         tile_n=tile_n,
         pack_n=pack_n,
