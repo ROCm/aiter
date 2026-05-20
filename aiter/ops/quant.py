@@ -710,7 +710,7 @@ def quant_mxfp4_hip(
     """MXFP4 quantization with optional weight/scale shuffle.
 
     Args:
-        round_mode: 0 = Even — e8m0 scale via even-rounding group max
+        round_mode: 0 = Even -- e8m0 scale via even-rounding group max
             to nearest power-of-2. gfx950 uses HW builtin (exact RNE);
             gfx942 uses SW fallback (round-half-away).
     """
@@ -806,10 +806,12 @@ def partial_transpose(
 
 
 @compile_ops("module_dsv4_rotate_quant", develop=True)
-def rotate_activation_fp4quant_inplace(
+def rotate_activation_fp4quant(
     out: torch.Tensor,
+    scale: torch.Tensor,
     input: torch.Tensor,
     group_size: int = 32,
+    shuffle_scale: bool = True,
 ) -> None:
     """Hadamard-rotate activation, FP4-quantize, then dequantize back to BF16 in-place."""
     ...
@@ -825,17 +827,19 @@ def rotate_activation(
 
 
 @compile_ops("module_dsv4_rotate_quant", develop=True)
-def rope_rotate_activation_fp4quant_inplace(
+def rope_rotate_activation_fp4quant(
     out: torch.Tensor,
+    scale: torch.Tensor,
     input: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
     group_size: int = 32,
+    shuffle_scale: bool = True,
 ) -> None:
-    """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate,
-    FP4-quantize, then dequantize back to BF16."""
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``,
+    Hadamard-rotate, FP4-quantize, then dequantize back to BF16."""
     ...
 
 
@@ -848,5 +852,5 @@ def rope_rotate_activation(
     positions: torch.Tensor,
     rope_dim: int,
 ) -> None:
-    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
     ...

@@ -9,18 +9,22 @@ from aiter.test_common import (
 import torch
 import aiter
 from aiter import dtypes, get_gfx
+from aiter.utility.fp4_utils import f32_to_mxfp4, mxfp4_to_f32
 import argparse
 import pandas as pd
 
 torch.set_default_device("cuda")
 
-# FP4 e2m1 representable magnitudes (positive half). Symmetric around 0.
-_FP4_MAGNITUDES = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
-)
+
+def tensor_nbytes(*tensors: torch.Tensor) -> int:
+    return sum(t.numel() * t.element_size() for t in tensors)
 
 
-def fp4_act_quant_inplace(x: torch.Tensor, block_size: int = 32) -> None:
+def bandwidth_tbs(num_bytes: int, us: float) -> float:
+    return num_bytes / us / 1e6
+
+
+def fp4_act_quant(x: torch.Tensor, block_size: int = 32):
     fp4_max = 6.0
     fp4_max_inv = 1.0 / fp4_max
     eps_amax = 6.0 * (2.0**-126)
@@ -34,20 +38,41 @@ def fp4_act_quant_inplace(x: torch.Tensor, block_size: int = 32) -> None:
 
     normalized = (blocks / scale).clamp(min=-fp4_max, max=fp4_max)
 
-    fp4_vals = _FP4_MAGNITUDES.to(normalized.device)
-    diff = (normalized.abs().unsqueeze(-1) - fp4_vals).abs()
-    snapped_mag = fp4_vals[diff.argmin(dim=-1)]
-    snapped = torch.where(normalized < 0, -snapped_mag, snapped_mag)
+    return f32_to_mxfp4(normalized.reshape(*prefix, n)), scale.squeeze(-1).to(
+        dtypes.fp8_e8m0
+    )
 
-    dequant = snapped * scale
-    x.copy_(dequant.reshape(*prefix, n).to(x.dtype))
+
+def dsv4_shuffle_scale(scale: torch.Tensor):
+    *prefix, head_num, groups_per_row = scale.shape
+    assert head_num % 16 == 0, f"head_num {head_num} not divisible by 16"
+    assert (
+        groups_per_row % 4 == 0
+    ), f"groups_per_row {groups_per_row} not divisible by 4"
+
+    m_tiles = head_num // 16
+    k_tiles = groups_per_row // 4
+    qs_pad = ((m_tiles + 3) // 4) * 4
+    prefix_dims = tuple(range(len(prefix)))
+    scale_real = scale.view(torch.uint8).reshape(*prefix, m_tiles, 16, k_tiles, 4)
+    scale_real = scale_real.permute(
+        *prefix_dims,
+        len(prefix) + 2,
+        len(prefix) + 3,
+        len(prefix) + 1,
+        len(prefix),
+    ).contiguous()
+    return (
+        torch.nn.functional.pad(scale_real, (0, qs_pad - m_tiles))
+        .contiguous()
+        .view(dtypes.fp8_e8m0)
+    )
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     n = x.shape[-1]
     assert n > 0 and (n & (n - 1)) == 0, f"last dim {n} must be a power of 2"
 
-    orig_dtype = x.dtype
     *prefix, _ = x.shape
     flat = x.reshape(-1, n).float().contiguous()
 
@@ -60,63 +85,98 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         h *= 2
 
     flat = flat * (n**-0.5)
-    return flat.reshape(*prefix, n).to(orig_dtype)
+    return flat.reshape(*prefix, n)
 
 
-def rotate_fp4quant_inplace_torch(x: torch.Tensor, block_size: int = 32):
+def rotate_fp4quant_torch(
+    x: torch.Tensor, block_size: int = 32, shuffle_scale: bool = False
+):
     x = rotate_activation(x)
-    fp4_act_quant_inplace(x, block_size)
-    return x
+    x_q, scale = fp4_act_quant(x, block_size)
+    if shuffle_scale:
+        scale = dsv4_shuffle_scale(scale)
+    return x_q, scale
 
 
-def rope_inplace_torch(
+def rope_torch(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
 ):
+    x = x.float()
     rope = x[..., -rope_dim:]
     rope_complex = torch.view_as_complex(rope.float().unflatten(-1, (-1, 2)))
     freqs = torch.complex(cos[positions].float(), sin[positions].float())
     rope_out = torch.view_as_real(rope_complex * freqs.view(-1, 1, rope_dim // 2))
-    rope.copy_(rope_out.flatten(-2).to(x.dtype))
+    x[..., -rope_dim:] = rope_out.flatten(-2)
     return x
 
 
-def rope_rotate_fp4quant_inplace_torch(
+def rope_rotate_fp4quant_torch(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
     block_size: int = 32,
+    shuffle_scale: bool = False,
 ):
-    rope_inplace_torch(x, cos, sin, positions, rope_dim)
+    x = rope_torch(x, cos, sin, positions, rope_dim)
     x = rotate_activation(x)
-    fp4_act_quant_inplace(x, block_size)
-    return x
+    x_q, scale = fp4_act_quant(x, block_size)
+    if shuffle_scale:
+        scale = dsv4_shuffle_scale(scale)
+    return x_q, scale
 
 
 @benchmark()
-def test_rotate_fp4quant_inplace(M, head_num, N, dtype=torch.bfloat16):
+def test_rotate_fp4quant(M, head_num, N, dtype=torch.bfloat16, shuffle_scale=False):
     if get_gfx() == "gfx942":
         aiter.logger.info("gfx942 is not supported")
         return {}
     x = torch.randn((M, head_num, N), dtype=dtype, device="cuda")
-    ref = rotate_fp4quant_inplace_torch(x.clone())
-    y = torch.empty_like(x)
-    _, us = run_perftest(aiter.rotate_activation_fp4quant_inplace, y, x, group_size=32)
-    err = checkAllclose(ref, y, atol=1e-2, rtol=1e-2)
+    y_ref, scale_ref = rotate_fp4quant_torch(
+        x.clone(), block_size=32, shuffle_scale=shuffle_scale
+    )
+    y = torch.empty((*x.shape[:-1], N // 2), dtype=dtypes.fp4x2, device="cuda")
+    scale = torch.empty_like(scale_ref)
+    _, us = run_perftest(
+        aiter.rotate_activation_fp4quant,
+        y,
+        scale,
+        x,
+        group_size=32,
+        shuffle_scale=shuffle_scale,
+    )
+    err = checkAllclose(
+        mxfp4_to_f32(y_ref),
+        mxfp4_to_f32(y),
+        atol=0,
+        rtol=0,
+        msg="y",
+    )
+    checkAllclose(
+        scale_ref.view(torch.uint8).to(torch.int16),
+        scale.view(torch.uint8).to(torch.int16),
+        atol=0,
+        rtol=0,
+        msg="scale",
+    )
     ret = {}
     ret["op"] = "rotate"
+    ret["shuffle_scale"] = shuffle_scale
     ret["err"] = err
     ret["us"] = us
+    ret["TB/s"] = bandwidth_tbs(tensor_nbytes(x, y, scale), us)
     return ret
 
 
 @benchmark()
-def test_rope_rotate_fp4quant_inplace(M, head_num, N, dtype=torch.bfloat16):
+def test_rope_rotate_fp4quant(
+    M, head_num, N, dtype=torch.bfloat16, shuffle_scale=False
+):
     if get_gfx() == "gfx942":
         aiter.logger.info("gfx942 is not supported")
         return {}
@@ -127,27 +187,55 @@ def test_rope_rotate_fp4quant_inplace(M, head_num, N, dtype=torch.bfloat16):
     freqs = torch.randn((max_pos, rope_dim // 2), dtype=torch.float32, device="cuda")
     cos = torch.cos(freqs).to(dtype)
     sin = torch.sin(freqs).to(dtype)
-    ref = rope_rotate_fp4quant_inplace_torch(
-        x.clone(), cos, sin, positions, rope_dim, block_size=32
+    y_ref, scale_ref = rope_rotate_fp4quant_torch(
+        x.clone(),
+        cos,
+        sin,
+        positions,
+        rope_dim,
+        block_size=32,
+        shuffle_scale=shuffle_scale,
     )
-    y = torch.empty_like(x)
+    y = torch.empty((*x.shape[:-1], N // 2), dtype=dtypes.fp4x2, device="cuda")
+    scale = torch.empty_like(scale_ref)
     _, us = run_perftest(
-        aiter.rope_rotate_activation_fp4quant_inplace,
+        aiter.rope_rotate_activation_fp4quant,
         y,
+        scale,
         x,
         cos,
         sin,
         positions,
         rope_dim,
         group_size=32,
+        shuffle_scale=shuffle_scale,
     )
-    err = checkAllclose(ref, y, atol=1e-2, rtol=1e-2)
+    err = checkAllclose(
+        mxfp4_to_f32(y_ref),
+        mxfp4_to_f32(y),
+        atol=0,
+        rtol=0,
+        msg="y",
+    )
+    checkAllclose(
+        scale_ref.view(torch.uint8).to(torch.int16),
+        scale.view(torch.uint8).to(torch.int16),
+        atol=0,
+        rtol=0,
+        msg="scale",
+    )
     ret = {}
     ret["op"] = "rope_rotate"
     ret["head_num"] = head_num
     ret["rope_dim"] = rope_dim
+    ret["shuffle_scale"] = shuffle_scale
     ret["err"] = err
     ret["us"] = us
+    rope_bytes = M * head_num * rope_dim * cos.element_size()
+    position_bytes = M * positions.element_size()
+    ret["TB/s"] = bandwidth_tbs(
+        tensor_nbytes(x, y, scale) + rope_bytes + position_bytes, us
+    )
     return ret
 
 
@@ -202,6 +290,16 @@ parser.add_argument(
     help="""rope. Default: False.
     --rope # True""",
 )
+parser.add_argument(
+    "-s",
+    "--shuffle",
+    "--shuffle_scale",
+    "--shuffle-scale",
+    dest="shuffle_scale",
+    action="store_true",
+    help="""shuffle scale. Default: False.
+    --shuffle # True""",
+)
 
 args = parser.parse_args()
 
@@ -211,13 +309,23 @@ for dtype in args.dtype:
         for dim in args.dim:
             for m in args.m:
                 if args.rope:
-                    ret = test_rope_rotate_fp4quant_inplace(
-                        m, head_num, dim, dtype=dtype
+                    ret = test_rope_rotate_fp4quant(
+                        m,
+                        head_num,
+                        dim,
+                        dtype=dtype,
+                        shuffle_scale=args.shuffle_scale,
                     )
                 else:
-                    ret = test_rotate_fp4quant_inplace(m, head_num, dim, dtype=dtype)
+                    ret = test_rotate_fp4quant(
+                        m,
+                        head_num,
+                        dim,
+                        dtype=dtype,
+                        shuffle_scale=args.shuffle_scale,
+                    )
                 df.append(ret)
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
-aiter.logger.info("rotate_fp4quant_inplace summary (markdown):\n%s", df_md)
+aiter.logger.info("rotate_fp4quant summary (markdown):\n%s", df_md)

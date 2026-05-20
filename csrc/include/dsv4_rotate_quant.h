@@ -7,21 +7,25 @@
 
 namespace aiter {
 
-void rotate_activation_fp4quant_inplace(aiter_tensor_t& out,
+void rotate_activation_fp4quant(aiter_tensor_t& out,
+                                        aiter_tensor_t& scale,
                                         const aiter_tensor_t& input,
-                                        int32_t group_size = 32);
+                                        int32_t group_size = 32,
+                                        bool shuffle_scale = true);
 
 
 void rotate_activation(aiter_tensor_t& out,
                        const aiter_tensor_t& input);
 
-void rope_rotate_activation_fp4quant_inplace(aiter_tensor_t& out,
+void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
+                                            aiter_tensor_t& scale,
                                             const aiter_tensor_t& input,
                                             const aiter_tensor_t& cos,
                                             const aiter_tensor_t& sin,
                                             const aiter_tensor_t& positions,
                                             int32_t rope_dim,
-                                            int32_t group_size = 32);
+                                            int32_t group_size = 32,
+                                            bool shuffle_scale = true);
 
 void rope_rotate_activation(aiter_tensor_t& out,
                             const aiter_tensor_t& input,

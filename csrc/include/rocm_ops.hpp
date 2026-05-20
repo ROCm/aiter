@@ -1428,24 +1428,28 @@ namespace py = pybind11;
           py::arg("shuffle_weight")  = false);
 
 #define DSV4_ROTATE_QUANT_PYBIND                                         \
-    m.def("rotate_activation_fp4quant_inplace",                          \
-          &aiter::rotate_activation_fp4quant_inplace,                    \
+    m.def("rotate_activation_fp4quant",                                  \
+          &aiter::rotate_activation_fp4quant,                            \
           py::arg("out"),                                                \
+          py::arg("scale"),                                              \
           py::arg("input"),                                              \
-          py::arg("group_size") = 32);                                   \
+          py::arg("group_size") = 32,                                    \
+          py::arg("shuffle_scale") = true);                              \
     m.def("rotate_activation",                                           \
           &aiter::rotate_activation,                                     \
           py::arg("out"),                                                \
           py::arg("input"));                                             \
-    m.def("rope_rotate_activation_fp4quant_inplace",                     \
-          &aiter::rope_rotate_activation_fp4quant_inplace,               \
+    m.def("rope_rotate_activation_fp4quant",                             \
+          &aiter::rope_rotate_activation_fp4quant,                       \
           py::arg("out"),                                                \
+          py::arg("scale"),                                              \
           py::arg("input"),                                              \
           py::arg("cos"),                                                \
           py::arg("sin"),                                                \
           py::arg("positions"),                                          \
           py::arg("rope_dim"),                                           \
-          py::arg("group_size") = 32);                                   \
+          py::arg("group_size") = 32,                                    \
+          py::arg("shuffle_scale") = true);                              \
     m.def("rope_rotate_activation",                                      \
           &aiter::rope_rotate_activation,                                \
           py::arg("out"),                                                \
