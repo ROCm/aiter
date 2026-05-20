@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Run small-attn scenarios (CK ck_pr_6764 only). Build once from parent mha/.
+# Run CK scenarios only. Add JAX later: python3 run_jax_benchmark.py all
 #
 #   cd op_tests/cpp/mha && bash build_mha.sh
 #   cd small_attn_benchmark && ./run_all.sh
