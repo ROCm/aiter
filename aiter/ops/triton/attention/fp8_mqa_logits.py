@@ -14,14 +14,17 @@ TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
 arch = arch_info.get_arch()
 _gluon_fp8_mqa_logits_kernel = None
 if TRITON_GE_36:
-    if arch == "gfx950":
-        from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
-            _gluon_fp8_mqa_logits_kernel,
-        )
-    elif arch == "gfx1250":
-        from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
-            _gluon_fp8_mqa_logits_kernel,
-        )
+    try:
+        if arch == "gfx950":
+            from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
+                _gluon_fp8_mqa_logits_kernel,
+            )
+        elif arch == "gfx1250":
+            from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
+                _gluon_fp8_mqa_logits_kernel,
+            )
+    except Exception:
+        _gluon_fp8_mqa_logits_kernel = None
 
 
 # Hacks to see if we can use some newer features
@@ -32,7 +35,7 @@ def _async_copy_accepts_distributed_layout() -> bool:
         from triton.experimental.gluon.language.amd.cdna4 import async_copy
 
         src = inspect.getsource(async_copy.global_load_to_shared)
-    except (OSError, TypeError, ImportError):
+    except (OSError, TypeError, ImportError, AttributeError):
         return False
     return "DistributedLayout" in src
 
