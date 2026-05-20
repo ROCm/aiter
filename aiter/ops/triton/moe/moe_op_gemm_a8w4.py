@@ -4,7 +4,6 @@
 import functools
 import itertools
 import os
-import json
 import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
@@ -45,8 +44,8 @@ def should_upcast_indices(*args):
 
 
 def allocate_output(
-    M,
-    N,
+    x,
+    w,
     out_dtype,
     reduction_n_matmul,
     reduction_n_reduction,
@@ -55,8 +54,11 @@ def allocate_output(
     scatter_indx,
     block_m,
     split_k,
-    device,
 ):
+    # ---- output ------
+    N = w.shape[-1]
+    # by default - M is number of rows in the activations
+    M = x.shape[-2]
     # if the activations are gathered, then M is number of gather indices
     if gather_indx is not None:
         M = gather_indx.shape[0]
@@ -75,6 +77,17 @@ def allocate_output(
     else:
         final_output = None
     return matmul_output, final_output
+
+
+def recommend_block_m(m: int) -> int:
+    """Recommend block_m for moe_gemm_a8w4 based on M.
+
+    Prefill (M >= 256) → 64. Decode (M < 256) → 32.
+    Both regimes overridable via env: AITER_A8W4_PREFILL_BM / AITER_A8W4_DECODE_BM.
+    """
+    if m >= 256:
+        return int(os.environ.get("AITER_A8W4_PREFILL_BM", "64"))
+    return int(os.environ.get("AITER_A8W4_DECODE_BM", "16"))
 
 
 def get_kernel_config_triton(m, n, k, routing_data):
@@ -141,10 +154,18 @@ def get_kernel_config_triton(m, n, k, routing_data):
     block_k = 256
     num_stages = 2
 
-    if arch == "gfx942":
-        if block_m == 16:
-            block_n = 128
-            num_warps = 4
+    if block_m == 16:
+        block_n = 128
+        num_warps = 4
+
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        # Floor at 64 (was 32): out_mx_quant=True with apply_swiglu requires
+        # OUT_BLOCK_N = BLOCK_N // 2 >= 32. Loop boundary changed to keep
+        # block_n >= 64 for both MX and non-MX paths.
+        while block_n >= 128 and grid < get_num_sms():
+            block_n = block_n // 2
             grid_m = routing_data.n_blocks(m, block_m)
             grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
@@ -161,53 +182,17 @@ def get_kernel_config_triton(m, n, k, routing_data):
                 block_n = 256
                 num_warps = 8
         else:
-            block_n = 128
-            num_warps = 4 if block_m == 128 else 8
-    elif arch == "gfx950":
-        num_stages = 1
-        if block_m == 16:
-            block_n = 128
-            num_warps = 4
-
-            grid_m = routing_data.n_blocks(m, block_m)
-            grid_n = triton.cdiv(n, block_n)
-            grid = grid_m * grid_n * split_k
-            # Floor at 64 (was 32): out_mx_quant=True with apply_swiglu requires
-            # OUT_BLOCK_N = BLOCK_N // 2 >= 32. Loop boundary changed to keep
-            # block_n >= 64 for both MX and non-MX paths.
-            while block_n >= 128 and grid < get_num_sms():
-                block_n = block_n // 2
-                grid_m = routing_data.n_blocks(m, block_m)
-                grid_n = triton.cdiv(n, block_n)
-                grid = grid_m * grid_n * split_k
-
-            if k >= 512:
-                block_k = 512
-
-        elif block_m == 32:
-            if n <= 1024:
-                block_n = 128
-                num_warps = 4
-            elif n <= 4096:
-                block_n = 256
-                num_warps = 4
-            else:
-                block_n = 512
-                num_warps = 4
-
-        elif block_m == 64:
-            # V4-Flash prefill-tuned (rocprof brute force v2): for block_m=64,
-            # (bn=128, nw=4, ns=1) gives 2-4x speedup over the previous bn=512/nw=8
-            # default on all four V4-Flash prefill shapes.
-            block_n = 128
-            num_warps = 4
-            num_stages = 1
-
-        else:
             block_n = 512
-            # routing caps block_m at 128; nw=4 wins ~2x at block_m=128 on gpt-oss
-            # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
-            num_warps = 4 if block_m == 128 else 8
+            num_warps = 4
+
+    elif block_m == 64:
+        # V4-Flash prefill-tuned (rocprof brute force v2): for block_m=64,
+        # (bn=128, nw=4, ns=1) gives 2-4x speedup over the previous bn=512/nw=8
+        # default on all four V4-Flash prefill shapes.
+        block_n = 128
+        num_warps = 4
+        num_stages = 1
+
     else:
         block_n = 128
         num_warps = 4
@@ -226,6 +211,23 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
+    # Env-driven overrides split by regime: block_m>=64 → PREFILL_*, else DECODE_*.
+    # Generic AITER_A8W4_* still works as a fallback when the regime-specific var is unset.
+    _regime = "PREFILL" if block_m >= 64 else "DECODE"
+    _knobs = (
+        "block_n", "block_k", "num_warps", "num_stages",
+        "group_m", "waves_per_eu", "matrix_instr_nonkdim", "split_k",
+    )
+    for key in _knobs:
+        env_specific = f"AITER_A8W4_{_regime}_{key.upper()}"
+        env_generic = f"AITER_A8W4_{key.upper()}"
+        v = os.environ.get(env_specific, os.environ.get(env_generic))
+        if v is not None:
+            try:
+                ret[key] = int(v)
+            except ValueError:
+                pass
+    return ret
 
 
 def get_kernel_config_gluon(m, n, k, routing_data):
@@ -391,13 +393,13 @@ def moe_gemm_a8w4(
             "out_mx_quant currently only supported for GEMM1-style (no scatter); "
             "scatter+combine would need fp8-aware reduce_grouped"
         )
-        out_dtype = torch.float8_e4m3fn
+        out_dtype_actual = torch.float8_e4m3fn
     else:
-        out_dtype = out_dtype
+        out_dtype_actual = out_dtype
     y, y_final = allocate_output(
-        M,
-        padded_N,
-        out_dtype,
+        x,
+        w,
+        out_dtype_actual,
         reduction_n_matmul,
         reduction_n_reduction,
         routing_data,
@@ -545,11 +547,15 @@ def moe_gemm_a8w4(
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
             kpack=config["kpack"],
             YMxScale=y_scale,
-            stride_y_mx_m=stride_y_mx_m,
-            stride_y_mx_n=stride_y_mx_n,
-            HAS_MX_OUT=out_mx_quant,
-        )
+        stride_y_mx_m=stride_y_mx_m,
+        stride_y_mx_n=stride_y_mx_n,
+        HAS_MX_OUT=out_mx_quant,
+    )
 
+    # MXFP8 emit path: scatter_indx is None and split_k==1, so we bypass
+    # reduce_grouped and return (fp8 values, ue8m0 scales) directly.
+    if out_mx_quant:
+        return y.squeeze(0), y_scale
     # MXFP8 emit path: scatter_indx is None and split_k==1, so we bypass
     # reduce_grouped and return (fp8 values, ue8m0 scales) directly.
     if out_mx_quant:

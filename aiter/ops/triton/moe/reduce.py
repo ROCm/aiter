@@ -15,7 +15,8 @@ def reduce_grouped(
     reduction_n=1,
     out_dtype=None,
     add_residual: bool = True,
-    residual: Optional[torch.Tensor] = None,
+    # Step 9: optional external residual folded into the writeback.
+    residual: "torch.Tensor | None" = None,
 ):
     """
     Grouped row reduction used during moe scatter and also compatible with split-k reduce.
@@ -57,9 +58,9 @@ def reduce_grouped(
 
     # Step 9: prep external residual buffer + strides for the kernel.
     if residual is not None:
-        assert (
-            residual.shape == out.shape
-        ), f"residual.shape {tuple(residual.shape)} must match out.shape {tuple(out.shape)}"
+        assert residual.shape == out.shape, (
+            f"residual.shape {tuple(residual.shape)} must match out.shape {tuple(out.shape)}"
+        )
         res_stride_m = residual.stride(0)
         res_stride_n = residual.stride(1)
         has_ext_residual = True
