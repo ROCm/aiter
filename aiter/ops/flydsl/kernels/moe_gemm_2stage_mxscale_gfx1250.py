@@ -219,12 +219,26 @@ def _compile_stage1_mxscale_kernel_impl(
     _fake_scale_a = _fake_scale_all or int(
         os.environ.get("AITER_GFX1250_FAKE_SCALE_A", "0")) != 0
     _fake_scale_b = _fake_scale_all
+    # Direct gmem->VGPR A-scale prefetch (bypass LDS). Replaces the
+    # ``buffer_load_u8 + ds_store_b8`` cluster with a per-lane
+    # ``buffer_load_dword`` straight to VGPR; the WMMA consumer reads
+    # the VGPR directly. Gated to the rowmajor scale layout
+    # (``is_fp4`` or ``wmma_m_rep == 1``) -- the interleaved-layout
+    # b128 LDS path is left alone. Disabled when ``_fake_scale_a`` is
+    # set so the constant short-circuit still wins.
+    #   AITER_GFX1250_A_SCALE_DIRECT = 1 -> stage1 direct mode
+    _use_direct_a_scale = (
+        int(os.environ.get("AITER_GFX1250_A_SCALE_DIRECT", "0")) != 0
+        and _as_layout_rowmajor
+        and not _fake_scale_a
+    )
     _use_tdm_gather_as = (
         bool(use_tdm_gather_as)
         and bool(use_tdm_gather)
         and _as_layout_rowmajor
         and _as_row_bytes_ok
         and not _fake_scale_a
+        and not _use_direct_a_scale
     )
 
     # Pipeline calculations for multi-buffer
@@ -1293,6 +1307,126 @@ def _compile_stage1_mxscale_kernel_impl(
                     tdm_ops.tensor_load_gather(desc)
                     scf.YieldOp([])
 
+        # Direct-mode A-scale state (populated only when _use_direct_a_scale).
+        # _as_direct_row_bases: list[wmma_m_rep] of K-invariant per-lane SSA
+        #   i32 = tok_safe(row) * K_scale, computed once before the K-loop.
+        # _as_direct_ring: {buf_idx: list[wmma_m_rep][k_wmma_steps] of i32
+        #   SSA} populated by issue_as_load_direct, read by the consumer.
+        _as_direct_row_bases = []
+        _as_direct_ring = {}
+        # Direct loads emitted per ``issue_as_load_direct`` call. Used by the
+        # pipeline fences to size ``s_wait_loadcnt`` (we drain to 0 at every
+        # fence; the count is the per-buf size × in-flight buffers, useful
+        # for future "keep N in flight" tuning).
+        _direct_loads_per_buf = (
+            int(wmma_m_rep) * int(k_wmma_steps)
+            if _use_direct_a_scale else 0
+        )
+
+        def _direct_ring_flatten(buf_indices):
+            """Flatten ring SSAs (over given buf_idx range) for fx.range carry.
+
+            For slots not yet present in ``_as_direct_ring`` (e.g. the
+            uninitialised buffer at the start of the loop body before
+            mid-compute populates it) we substitute a constant 0; the
+            corresponding consumer slot is guaranteed to be overwritten
+            before its WMMA reads it.
+            """
+            out = []
+            _zero = arith.constant(0, type=T.i32)
+            for _bi in buf_indices:
+                if _bi in _as_direct_ring:
+                    for wm in range(int(wmma_m_rep)):
+                        for ks in range(int(k_wmma_steps)):
+                            out.append(_as_direct_ring[_bi][wm][ks])
+                else:
+                    for _ in range(_direct_loads_per_buf):
+                        out.append(_zero)
+            return out
+
+        def _direct_ring_unflatten(state, offset, buf_indices):
+            """Inverse of ``_direct_ring_flatten`` — pop slots from a carry tuple."""
+            _ro = offset
+            for _bi in buf_indices:
+                rows = []
+                for wm in range(int(wmma_m_rep)):
+                    row = []
+                    for ks in range(int(k_wmma_steps)):
+                        row.append(state[_ro])
+                        _ro += 1
+                    rows.append(row)
+                _as_direct_ring[_bi] = rows
+            return _ro
+
+        def _precompute_as_direct_row_bases():
+            """Per-lane K-invariant gmem row base for direct-mode A-scale.
+
+            Returns list[wmma_m_rep] of i32 SSA = ``tok_safe(row) * K_scale``
+            where ``row = warp_m_base + lane16 + wm * WMMA_M`` (matches the
+            WMMA scale operand's lane->row layout — see
+            ``_mxscale_precompute_rowmajor_scale_lane_bases``).
+            ``k_scale_base + ks * SCALES_PER_WMMA`` is added at issue time.
+
+            OOB-row policy: clamp invalid rows to row 0 (same redundant-load
+            trick as ``_precompute_as_load_meta``); the WMMA output for
+            invalid rows is dropped by the epilogue.
+            """
+            _K_i32 = arith.constant(int(K_scale), type=T.i32)
+            zero_i32 = arith.constant(0, type=T.i32)
+            mask24 = arith.constant((1 << 24) - 1, type=T.i32)
+            for wm in range_constexpr(wmma_m_rep):
+                row_idx = (
+                    warp_m_base + lane16 + arith.index(wm * int(WMMA_M))
+                )
+                fused = _get_fused_for_row(row_idx)
+                t_i32 = arith.andi(fused, mask24)
+                t_valid = arith.cmpi(
+                    arith.CmpIPredicate.ult, t_i32, i32_tokens_in)
+                t_safe = arith.select(t_valid, t_i32, zero_i32)
+                _as_direct_row_bases.append(t_safe * _K_i32)
+
+        def issue_as_load_direct(k_scale_base, buf_idx):
+            """Direct gmem->VGPR A-scale prefetch (per-lane buffer_load_dword).
+
+            Issues ``wmma_m_rep * k_wmma_steps`` ``buffer_load`` ops (1 i32
+            per lane each) into VGPR and stashes the SSAs in
+            ``_as_direct_ring[buf_idx]``. The matching consumer in
+            ``_load_gate_up_b_and_scales`` reads back the VGPRs directly,
+            bypassing LDS entirely. The AMDGPU backend tracks the per-VGPR
+            data dependency and inserts ``s_wait_loadcnt`` at the consumer
+            automatically — no explicit fence is required.
+            """
+            assert _as_direct_row_bases, (
+                "_precompute_as_direct_row_bases() must be invoked before "
+                "issue_as_load_direct"
+            )
+            k32 = arith.index_cast(T.i32, k_scale_base)
+            ring = []
+            for wm in range_constexpr(wmma_m_rep):
+                per_step = []
+                for ks in range_constexpr(k_wmma_steps):
+                    ks_byte = arith.constant(
+                        ks * int(SCALES_PER_WMMA), type=T.i32)
+                    # ``buffer_load`` interprets ``offset`` as elements and
+                    # multiplies by ``dtype`` width to get bytes. ``sx_rsrc``
+                    # is an i8-typed scale matrix and ``voff`` is already in
+                    # bytes, so load as 4×i8 and bitcast to i32 (matches the
+                    # LDS-DMA path at lines 1239-1244).
+                    # voff in scale BYTES. ``buffer_load(dtype=T.i32)``
+                    # multiplies by 4 internally, so pre-divide by 4.
+                    # Alignment OK: tok*K_scale is a multiple of K_scale (8
+                    # for K=256), k_scale_base is k_base/SCALE_BLOCK with
+                    # k_base a multiple of tile_k (≥WMMA_K) -> ≥4-byte
+                    # aligned, and ks*SCALES_PER_WMMA is multiple of 4.
+                    voff_bytes = _as_direct_row_bases[wm] + k32 + ks_byte
+                    voff_dw = arith.shrui(voff_bytes,
+                                          arith.constant(2, type=T.i32))
+                    v_i32 = buffer_ops.buffer_load(
+                        sx_rsrc, voff_dw, vec_width=1, dtype=T.i32)
+                    per_step.append(v_i32)
+                ring.append(per_step)
+            _as_direct_ring[buf_idx] = ring
+
         def make_desc_b(lds_b_mem, n_off, k_base):
             if const_expr(is_fp4):
                 return tdm_ops.make_tensor_descriptor_2d(
@@ -1386,7 +1520,11 @@ def _compile_stage1_mxscale_kernel_impl(
             # conditional regions for pipeline prologue / tail).
             if const_expr(not _use_tdm_gather_a):
                 _precompute_a_load_meta()
-            if const_expr(not _use_tdm_gather_as):
+            if const_expr(_use_direct_a_scale):
+                # Direct-mode skips the LDS DMA precompute entirely; the
+                # per-lane gmem base list is all we need.
+                _precompute_as_direct_row_bases()
+            elif const_expr(not _use_tdm_gather_as):
                 _precompute_as_load_meta()
             a_data_bases = _precompute_a_data_bases()
             b_data_bases = _precompute_b_data_bases()
@@ -1450,6 +1588,14 @@ def _compile_stage1_mxscale_kernel_impl(
                              for wn in range_constexpr(wmma_n_rep)]
                     bs_uv = [load_scale_i32(_up_bs_buf, bsu_bases[wn], ks)
                              for wn in range_constexpr(wmma_n_rep)]
+                # AITER_GFX1250_A_SCALE_DIRECT: replace the LDS-resident
+                # A-scale with the VGPR prefetched by issue_as_load_direct.
+                # Must come BEFORE the fake-scale block so the constant
+                # short-circuit still wins when both knobs are set.
+                if const_expr(_use_direct_a_scale):
+                    _ring_slot = _as_direct_ring[buf_idx]
+                    as_v = [_ring_slot[wm][ks]
+                            for wm in range_constexpr(wmma_m_rep)]
                 # AITER_GFX1250_FAKE_SCALE[_A/_B]: bypass the LDS load entirely.
                 # wmma_*_scale takes a packed i32 (4 E8M0 bytes); 0x7F7F7F7F
                 # means every micro-tile scale is 2^0 = 1.0. The producers
@@ -1972,7 +2118,12 @@ def _compile_stage1_mxscale_kernel_impl(
                     issue_a_load_tdm_gather(k_base, buf_idx)
                 else:
                     issue_a_load(make_desc_a(k_base), lds_ag_bufs[buf_idx])
-                if _use_tdm_gather_as:
+                if const_expr(_use_direct_a_scale):
+                    # make_desc_as(k_base) = k_base / SCALE_BLOCK = byte
+                    # offset into the per-token scale row. Reuse it as the
+                    # gmem-byte K-offset for direct-mode prefetch.
+                    issue_as_load_direct(make_desc_as(k_base), buf_idx)
+                elif _use_tdm_gather_as:
                     issue_as_load_tdm_gather(make_desc_as(k_base), lds_as_bufs[buf_idx])
                 else:
                     issue_as_load(make_desc_as(k_base), lds_as_bufs[buf_idx])
@@ -2052,15 +2203,23 @@ def _compile_stage1_mxscale_kernel_impl(
                         # Carry the (addr_lo, addr_hi) pair through the
                         # pipeline state so the carry chain survives across
                         # iterations.
+                        _ring_init = (
+                            _direct_ring_flatten(range(_nb))
+                            if _use_direct_a_scale else []
+                        )
                         _init = (
                             list(acc_g) + list(acc_u)
                             + [active_b_addr_lo, active_b_addr_hi]
+                            + _ring_init
                         )
                         for _li, _st in fx.range(0, loop_iters, 1, init=_init):
                             _ag = list(_st[:n_accs])
                             _au = list(_st[n_accs:2 * n_accs])
                             _cur_b_addr_lo = _st[2 * n_accs]
                             _cur_b_addr_hi = _st[2 * n_accs + 1]
+                            if const_expr(_use_direct_a_scale):
+                                _direct_ring_unflatten(
+                                    _st, 2 * n_accs + 2, range(_nb))
                             for _bi in range_constexpr(_nb):
                                 _lb = (_bi + _nb - 1) % _nb
                                 _kt = (_li * fx.Index(_nb)
@@ -2091,19 +2250,34 @@ def _compile_stage1_mxscale_kernel_impl(
                                 )
                                 if const_expr(_use_scheduled_compute):
                                     _hot_loop_scheduler_scheduled()
+                            _ring_yield = (
+                                _direct_ring_flatten(range(_nb))
+                                if _use_direct_a_scale else []
+                            )
                             _res = yield (
                                 list(_ag) + list(_au)
                                 + [_cur_b_addr_lo, _cur_b_addr_hi]
+                                + _ring_yield
                             )
                         acc_g = list(_res[:n_accs])
                         acc_u = list(_res[n_accs:2 * n_accs])
                         active_b_addr_lo = _res[2 * n_accs]
                         active_b_addr_hi = _res[2 * n_accs + 1]
+                        if const_expr(_use_direct_a_scale):
+                            _direct_ring_unflatten(
+                                _res, 2 * n_accs + 2, range(_nb))
                     else:
-                        _init = list(acc_g) + list(acc_u)
+                        _ring_init = (
+                            _direct_ring_flatten(range(_nb))
+                            if _use_direct_a_scale else []
+                        )
+                        _init = list(acc_g) + list(acc_u) + _ring_init
                         for _li, _st in fx.range(0, loop_iters, 1, init=_init):
                             _ag = list(_st[:n_accs])
                             _au = list(_st[n_accs:2 * n_accs])
+                            if const_expr(_use_direct_a_scale):
+                                _direct_ring_unflatten(
+                                    _st, 2 * n_accs, range(_nb))
                             for _bi in range_constexpr(_nb):
                                 _lb = (_bi + _nb - 1) % _nb
                                 _kt = (_li * fx.Index(_nb)
@@ -2128,9 +2302,18 @@ def _compile_stage1_mxscale_kernel_impl(
                                 )
                                 if const_expr(_use_scheduled_compute):
                                     _hot_loop_scheduler_scheduled()
-                            _res = yield list(_ag) + list(_au)
+                            _ring_yield = (
+                                _direct_ring_flatten(range(_nb))
+                                if _use_direct_a_scale else []
+                            )
+                            _res = yield (
+                                list(_ag) + list(_au) + _ring_yield
+                            )
                         acc_g = list(_res[:n_accs])
                         acc_u = list(_res[n_accs:2 * n_accs])
+                        if const_expr(_use_direct_a_scale):
+                            _direct_ring_unflatten(
+                                _res, 2 * n_accs, range(_nb))
 
                 # ── post-loop fence ──
                 if const_expr(loop_iters > 0):

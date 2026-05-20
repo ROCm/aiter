@@ -114,6 +114,9 @@ def pipeline_fence(outstanding=0, use_cluster=False):
     """Fused READY+REUSE fence for gfx1250 multi-buffer pipeline.
 
     Issues ``s_wait_tensorcnt`` followed by the appropriate barrier.
+    Direct-mode A-scale ``buffer_load``s do not need an explicit
+    ``s_wait_loadcnt`` here — the AMDGPU backend tracks the per-VGPR
+    data dependency and inserts vmcnt at the consumer automatically.
     """
     tdm_ops.tensor_wait(outstanding)
     workgroup_barrier(use_cluster=use_cluster)
