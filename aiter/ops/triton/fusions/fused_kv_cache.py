@@ -30,6 +30,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     decode_q_pe_out: torch.Tensor = None,
     k_pe_out: torch.Tensor = None,
     q_out_dtype: torch.dtype = None,
+    shuffled_kv_cache: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
@@ -87,6 +88,7 @@ def fused_qk_rope_cat_and_cache_mla(
     decode_q_pe_out: torch.Tensor = None,
     k_pe_out: torch.Tensor = None,
     q_out_dtype: torch.dtype = None,
+    shuffled_kv_cache: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
@@ -116,7 +118,11 @@ def fused_qk_rope_cat_and_cache_mla(
     b2, qh2, d_pe = q_pe.shape
     bk, kh, dk_nope = k_nope.shape
     bk2, kh2, dk2 = k_pe.shape
-    b_cache, h_cache, d_cache = kv_cache.shape
+    block_size = 1
+    if shuffled_kv_cache:
+        b_cache, h_cache, block_size, d_cache = kv_cache.shape
+    else:
+        b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     # allow bk >= b to support prefill + decode mixed scenario
@@ -183,6 +189,17 @@ def fused_qk_rope_cat_and_cache_mla(
             device=q_nope.device,
         )
 
+    if shuffled_kv_cache:
+        kv_cache_stride_b = kv_cache.stride(0)
+        kv_cache_stride_h = kv_cache.stride(1)
+        kv_cache_stride_blk = kv_cache.stride(2)
+        kv_cache_stride_d = kv_cache.stride(3)
+    else:
+        kv_cache_stride_b = kv_cache.stride(0)
+        kv_cache_stride_h = kv_cache.stride(1)
+        kv_cache_stride_blk = 0
+        kv_cache_stride_d = kv_cache.stride(2)
+
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
     _fused_qk_rope_cat_and_cache_mla_kernel[grid](
@@ -215,7 +232,10 @@ def fused_qk_rope_cat_and_cache_mla(
         q_nope_zeros_out.stride(0) if q_nope_zeros_out is not None else 0,
         q_nope_zeros_out.stride(1) if q_nope_zeros_out is not None else 0,
         q_nope_zeros_out.stride(2) if q_nope_zeros_out is not None else 0,
-        *kv_cache.stride(),
+        kv_cache_stride_b,
+        kv_cache_stride_h,
+        kv_cache_stride_blk,
+        kv_cache_stride_d,
         k_scale_ptr=k_scale,
         QH_PER_KH=qh // kh,
         QH=qh,
@@ -226,6 +246,8 @@ def fused_qk_rope_cat_and_cache_mla(
         BLOCK_DK_nope=dk_nope,
         BLOCK_D_pe=d_pe,
         BLOCK_D_HALF_pe=d_pe // 2,
+        BLOCK_SIZE=block_size,
+        SHUFFLED_KV_CACHE=shuffled_kv_cache,
         OUTPUT_Q_NOPE_ZEROS=(q_nope_zeros_out is not None),
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         num_warps=1,
