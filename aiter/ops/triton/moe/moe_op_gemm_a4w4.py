@@ -54,9 +54,12 @@ def allocate_output(
     scatter_indx,
     block_m,
     split_k,
+    preshuffle_weights,
 ):
     # ---- output ------
     N = w.shape[-1]
+    if preshuffle_weights:
+        N = N * 16
     # by default - M is number of rows in the activations
     M = x.shape[-2]
     # if the activations are gathered, then M is number of gather indices
@@ -182,6 +185,15 @@ def swizzle_scales_gfx1250(data):
     return data.transpose(-1, -2)
 
 
+def preshuffle_weights_gfx1250(data):
+    E, K, N = data.shape
+    data = data.transpose(-1, -2) # [E, N, K]
+    data = data.view(E, N // 16, 16, K // 16, 16) # [E, N // 16, 16, K // 16, 16]
+    data = data.permute(0, 1, 3, 2, 4).contiguous() # [E, N // 16, K // 16, 16, 16]
+    data = data.view(E, N // 16, K * 16) # [E, N // 16, K * 16]
+    return data.transpose(-1, -2)
+
+
 @gluon.constexpr_function
 def get_wmma_layout(num_warps, packed, scale_preshuffle):
     assert num_warps in (4, 8)
@@ -276,6 +288,7 @@ def moe_gemm_a4w4(
     scatter_indx=None,
     gammas=None,
     swizzle_mx_scale=None,
+    preshuffle_weights=False,
     out_dtype=torch.bfloat16,
     apply_swiglu=False,
     alpha=1.0,
@@ -291,42 +304,43 @@ def moe_gemm_a4w4(
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
-    backend = (
-        backend
-        if backend is not None
-        else ("gluon" if is_gluon_supported() else "triton")
-    )
+    if backend is None:
+        # default to gluon backend if supported
+        backend = "gluon" if is_gluon_supported() else "triton"
     assert backend in ["triton", "gluon"], f"Invalid backend: {backend}"
     if backend == "gluon":
+        # make sure gluon backend is supported on this architecture
         assert (
             is_gluon_supported()
         ), f"Gluon backend is not supported on this architecture: {get_arch()}"
     use_gluon = backend == "gluon"
+
+    if preshuffle_weights:
+        assert use_gluon, "Preshuffled weights are only supported on gluon backend"
+
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
-    x_has_mx = x_scales is not None
-    if x_has_mx:
-        assert x.stride(-1) == 1, "'x' must be row-major when it has data-type mxfp"
-    if x_has_mx:
-        stride_x_mx_m = x_scales.stride(0)
-        stride_x_mx_k = x_scales.stride(1)
-    else:
-        stride_x_mx_m = 0
-        stride_x_mx_k = 0
+    assert x.stride(-1) == 1, "'x' must be row-major when it has data-type mxfp"
+
     # determine shapes
     num_tokens = x.shape[-2]
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1] * 2, w.shape[-1]
+    if preshuffle_weights:
+        N = N * 16
+
     block_m = routing_data.block_m
     if unpadded_N and block_m == 16:
         N = unpadded_N
     if unpadded_K and block_m == 16:
         K = unpadded_K
+
     # compute optimization flags
     if config is None:
         if use_gluon:
             config = get_kernel_config_gluon(M, N, K, routing_data)
         else:
             config = get_kernel_config_triton(M, N, K, routing_data)
+
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -342,6 +356,7 @@ def moe_gemm_a4w4(
         reduction_n_matmul = 1
         apply_swiglu_reduction = False
         reduction_n_reduction = 1
+
     # allocate output memory
     y, y_final = allocate_output(
         x,
@@ -354,18 +369,23 @@ def moe_gemm_a4w4(
         scatter_indx,
         config["block_m"],
         config["split_k"],
+        preshuffle_weights,
     )
+
     stride_bias = None if bias is None else bias.stride(0)
+
     # moe metadata
     expt_data = routing_data.expt_data
     expt_hist = None if expt_data is None else expt_data.hist
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
+
     # spmd grid
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
+
     # launch kernel
     if use_gluon and get_arch() == "gfx1250":
         # layouts
@@ -378,6 +398,7 @@ def moe_gemm_a4w4(
         assert (
             config["split_k"] == 1
         ), "Split-k is not supported for Gluon backend on gfx1250"
+        # launch gluon kernel
         _moe_gemm_a4w4_gfx1250[(grid,)](
             y,
             y.stride(0),
@@ -387,8 +408,8 @@ def moe_gemm_a4w4(
             x.stride(0),
             x.stride(1),
             x_scales,
-            stride_x_mx_m,
-            stride_x_mx_k,
+            x_scales.stride(0),
+            x_scales.stride(1),
             w,
             w.stride(0),
             w.stride(1),
@@ -422,6 +443,7 @@ def moe_gemm_a4w4(
             SPLIT_K=config["split_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            PRESHUFFLE_WEIGHTS=preshuffle_weights,
             NUM_BUFFERS=config["num_buffers"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             WMMA_LAYOUT=WMMA_LAYOUT,
@@ -432,6 +454,7 @@ def moe_gemm_a4w4(
             waves_per_eu=config["waves_per_eu"],
         )
     else:
+        # launch triton kernel
         _moe_gemm_a4w4[(grid,)](
             y,
             y.stride(0),
@@ -441,8 +464,8 @@ def moe_gemm_a4w4(
             x.stride(0),
             x.stride(1),
             x_scales,
-            stride_x_mx_m,
-            stride_x_mx_k,
+            x_scales.stride(0),
+            x_scales.stride(1),
             w,
             w.stride(0),
             w.stride(1),
@@ -488,6 +511,7 @@ def moe_gemm_a4w4(
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
             kpack=config["kpack"],
         )
+
     # Build grouped reduction inputs in a uniform way
     group_indx = (
         None
@@ -505,6 +529,7 @@ def moe_gemm_a4w4(
         out_dtype=out_dtype,
         add_residual=add_residual,
     )
+    
     return y_final
 
 

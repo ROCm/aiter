@@ -16,6 +16,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     moe_gemm_torch,
     swizzle_scales_gfx950,
     swizzle_scales_gfx1250,
+    preshuffle_weights_gfx1250,
 )
 
 # numerics utilities
@@ -177,6 +178,7 @@ class Case:
     n_expts_tot: int = 1
     n_expts_act: int = 1
     hbm_swizzling: bool = False
+    preshuffle_weights: bool = False
 
 
 @pytest.mark.parametrize(
@@ -227,6 +229,7 @@ def test_op(
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
+    preshuffle_weights,
     backend,
     device="cuda",
 ):
@@ -239,6 +242,14 @@ def test_op(
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
             )
+
+    if preshuffle_weights:
+        if get_arch() != "gfx1250":
+            pytest.skip(f"Preshuffling weights is only supported on gfx1250")
+        if backend != "gluon":
+            pytest.skip(f"Preshuffling weights is only supported on gluon backend")
+        if n % 16 != 0 and k % 16 != 0:
+            pytest.skip(f"Preshuffling weights is only supported on shapes where n and k are divisible by 16")
 
     # skip gluon backend if not supported
     if backend == "gluon" and not is_gluon_supported():
@@ -283,6 +294,8 @@ def test_op(
             assert False, "Unsupported architecture"
     else:
         swizzle_mx_scale = None
+    if preshuffle_weights:
+        w_tri = preshuffle_weights_gfx1250(w_tri)
 
     x_tri, x_mx_scales_tri = mxfp4_quant(x_tri)
     x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)
@@ -309,6 +322,7 @@ def test_op(
         sindx,
         gammas,
         swizzle_mx_scale,
+        preshuffle_weights,
         out_dtype,
         apply_swiglu,
         backend=backend,
