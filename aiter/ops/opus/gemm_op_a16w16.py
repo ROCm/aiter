@@ -14,11 +14,11 @@ Public entry points:
        unsupported).
     2. If `kernelId` is given explicitly -> opus_gemm_a16w16_tune (bias
        is forwarded; the C++ dispatcher rejects non-bias-aware kids).
-    3. Otherwise query opus-private tuned CSV via aiter.ops.opus.common
-       (key includes bias=True/False); on hit -> opus_gemm_a16w16_tune
+    3. Otherwise query the global aiter BF16 tuned CSVs via
+       aiter.ops.opus.common (filtered by `libtype == 'opus'`, key
+       includes bias=True/False); on hit -> opus_gemm_a16w16_tune
        with the tuned (solidx, splitK).
-    4. On miss -> autolog the shape (AITER_OPUS_LOG_UNTUNED=1) and fall
-       through to the private bf16 no-scale binding
+    4. On miss -> fall through to the private bf16 no-scale binding
        `_opus_gemm_bf16_dispatch`, which forwards to the C++ entry
        `opus_gemm` whose bf16 branch does its own lookup + heuristic
        dispatch (see csrc/opus_gemm/opus_gemm.cu). bias is forwarded
@@ -463,21 +463,16 @@ def gemm_a16w16_opus(
         opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kid, int(cfg["splitK"]))
         return _finalize_output(Y, reshape_out_to_2d)
 
-    # 3) CSV miss: log the shape (for offline tuning later) and fall
-    #    through to the C++ heuristic dispatcher via opus_gemm. Bias is
-    #    forwarded through; the C++ entry skips its bias-agnostic lookup
-    #    map when bias is present and routes directly to the heuristic
-    #    (which only ever returns bias-aware split-barrier / splitk kids).
-    _opus_common.maybe_log_untuned_shape(
-        M=M,
-        N=N,
-        K=K,
-        bias=(bias is not None),
-        dtype=A.dtype,
-        outdtype=dtype,
-        scaleAB=False,
-        bpreshuffle=False,
-    )
+    # 3) CSV miss: fall through to the C++ heuristic dispatcher via
+    #    opus_gemm. Bias is forwarded through; the C++ entry skips its
+    #    bias-agnostic lookup map when bias is present and routes
+    #    directly to the heuristic (which only ever returns bias-aware
+    #    split-barrier / splitk kids).
+    #
+    #    (Note: this used to call `_opus_common.maybe_log_untuned_shape`
+    #    to autolog the missed shape to a private CSV for offline tuning.
+    #    The autolog feature has been removed -- collect untuned shapes
+    #    via gradlib's standard --input_file flow instead.)
     _opus_gemm_bf16_dispatch(XQ, WQ, Y, None, None, None, bias)
     return _finalize_output(Y, reshape_out_to_2d)
 

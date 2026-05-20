@@ -79,8 +79,9 @@ under `aiter.ops.opus.*`. Those paths currently reject non-empty
 ## 2. How Dispatch Works
 
 When the user calls `gemm_a16w16_opus(A, B)` without an explicit kernel
-id, the wrapper routes the request through **two independent lookup
-mechanisms plus a heuristic**:
+id, the wrapper does **one** lookup against the global aiter BF16 tuned
+CSVs (filtered by `libtype == 'opus'`), then falls through to the C++
+dispatcher:
 
 ```
 gemm_a16w16_opus(A, B, bias=...)
@@ -88,36 +89,60 @@ gemm_a16w16_opus(A, B, bias=...)
   │       (C++ dispatcher TORCH_CHECKs that kid is bias-aware
   │        when bias.has_value())
   │
-  ├─ Python-side CSV lookup  ───hit──►  opus_gemm_a16w16_tune(solidx, splitK, bias)
-  │       (key = (cu_num, M, N, K, bias, dtype, outdtype, scaleAB,
-  │        bpreshuffle); lru_cache'd from
-  │        aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv)
+  ├─ Python-side global-CSV lookup  ───hit──►  opus_gemm_a16w16_tune(solidx, splitK, bias)
+  │       (scans aiter/configs/bf16_tuned_gemm.csv +
+  │        aiter/configs/model_configs/*_bf16_tuned_gemm.csv,
+  │        filters `libtype=='opus'`, key =
+  │        (cu_num, M, N, K, bias, dtype, outdtype, scaleAB,
+  │        bpreshuffle); cached for process lifetime)
   │
-  └─ miss ──► (optional autolog) ──► opus_gemm(..., bias) [C++]
-                                         ├─ C++ compile-time lookup (same CSV
-                                         │   baked into opus_gemm_lookup.h
-                                         │   at JIT time; key is (M,N,K) only,
-                                         │   bias is forwarded to the matched
-                                         │   launcher)
-                                         └─ miss ──► opus_a16w16_heuristic_dispatch
-                                                     (hand-written if-else by M;
-                                                      always returns a bias-aware
-                                                      kid family, so bias is safe
-                                                      to forward unconditionally)
+  └─ miss ──►  opus_gemm(..., bias) [C++]
+                  ├─ C++ compile-time (M,N,K) lookup
+                  │   (same global CSV opus rows baked into
+                  │    opus_gemm_lookup.h at JIT-codegen time;
+                  │    key is (M,N,K) only, bias forwarded to
+                  │    the matched launcher)
+                  └─ miss ──► opus_a16w16_heuristic_kid_gfx950
+                              (M-bucket rule -> integer kid -> tune_lookup
+                               table; always returns a bias-aware kid so
+                               bias is safe to forward unconditionally)
 ```
 
-Two CSV lookups coexist on purpose:
+There is **one** CSV source of truth now: the global aiter BF16 tuned
+CSVs. The opus runtime dispatch (`aiter/ops/opus/common.py`) reads opus
+rows live every new process; CSV edits take effect immediately on the
+Python side. The C++ side bakes the same opus rows into
+`opus_gemm_lookup.h` at JIT-codegen time via
+`gen_instances.py --tune_files`, and **requires `AITER_REBUILD=1` to
+pick up CSV edits**.
 
-- The **Python layer** reads the CSV live every new process; edits to
-  the CSV take effect immediately. Its key includes `bias`, so `bias=False`
-  and `bias=True` rows do not collide.
-- The **C++ layer** (generated into `opus_gemm_lookup.h` by
-  `gen_instances.py --tune_file`) serves the `opus_gemm()` C++ entry
-  and has zero Python overhead per call, but **requires
-  `AITER_REBUILD=1` to pick up CSV edits**. The C++ map keys on
-  `(M, N, K)` only — it is bias-agnostic and relies on the lookup
-  containing only bias-aware kid families (`a16w16_flatmm_kernels_list`
-  is empty by default).
+The heuristic-fallback path no longer hardcodes launcher symbol names.
+`opus_a16w16_heuristic_kid_gfx950(M, N, K)` returns an integer kid, and
+the caller resolves it through `opus_a16w16_tune_dispatch_gfx950<>` (the
+same table that powers `opus_gemm_a16w16_tune`). The kids the heuristic
+can return are listed in `HEURISTIC_DEFAULT_KIDS` in
+`csrc/opus_gemm/opus_gemm_common.py`; `gen_instances.py` asserts they
+are all in the subset-compile set `S` before writing
+`compiled_kids.json`.
+
+### Subset compile
+
+`module_deepgemm_opus` only compiles the kids it actually needs, not
+the full `kernels_list`. The compile set `S` is the union of:
+
+1. Kids referenced by the **global tuned CSVs** with `libtype == 'opus'`.
+2. Kids previously baked into the **sidecar** at
+   `~/.aiter/build/module_deepgemm_opus/blob/compiled_kids.json`.
+3. The **8 `HEURISTIC_DEFAULT_KIDS`** (200, 206, 208, 300 + their nooob
+   mirrors at +1000) so heuristic fallback always has a viable kernel.
+4. The **2 a8w8** kids (1, 2) since the opus `.so` also exposes the
+   a8w8 dispatch entry.
+
+A typical build today is `|S| = 10` kids (~20 device TUs after
+× {bf16_t, fp32_t}); the full kernels_list has ~130 kids. Adding new
+shapes via tuning expands `S` automatically (the tuner writes new
+solidx rows to the global CSV + extends the sidecar, then triggers an
+`AITER_REBUILD`).
 
 Explicit `kernelId=` bypass exists for tuning, debugging, and future
 integrations (e.g. `aiter.tuned_gemm.solMap["opus"]`). The C++
@@ -129,73 +154,71 @@ bias to a non-bias-aware kid is a hard error.
 
 ## 3. Tuning Your Shapes
 
-The shipped `aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv` covers
-a handful of models. For anything else the heuristic kicks in, which is
-correct but not necessarily fastest. To get peak perf on your shapes:
+For production tuning use **gradlib**: it integrates opus alongside
+asm / triton / skinny / flydsl / torch / hipblaslt backends and writes
+to the global tuned CSV.
 
-### 3.1 One-shot: run the tuner directly
+### 3.1 Production: gradlib with `--libtype opus`
 
 ```bash
-# bias=False shapes (legacy bf16_untuned_gemm.csv layout)
-python3 csrc/opus_gemm/opus_gemm_tune.py \
-    -i aiter/configs/bf16_untuned_gemm.csv \
-    -o aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv
+# Tune only opus, single shape (or pass --input_file to sweep a CSV):
+python3 gradlib/gemm_tuner.py --libtype opus \
+    --input_file aiter/configs/bf16_untuned_gemm.csv
 
-# bias=True shapes (e.g. gpt-oss; the input CSV's `bias` column is
-# already True for every row)
-python3 csrc/opus_gemm/opus_gemm_tune.py \
-    -i aiter/configs/model_configs/gptoss_bf16_untuned_gemm.csv \
-    -o aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv
+# Or tune all backends in one pass; gradlib picks the winning libtype
+# per shape:
+python3 gradlib/gemm_tuner.py --libtype all \
+    --input_file aiter/configs/bf16_untuned_gemm.csv
 
-# single-shape with bias from CLI (no input CSV)
-python3 csrc/opus_gemm/opus_gemm_tune.py \
-    -m 128 -n 2880 -k 4096 --bias --dtype bf16 --outdtype bf16
+# Output path follows gradlib's existing --tuned_file / GTUNE_TUNED CLI;
+# default is aiter/configs/bf16_tuned_gemm.csv. To write to a sandbox
+# during testing:
+GTUNE_TUNED=/tmp/test_tuned.csv \
+    python3 gradlib/gemm_tuner.py --libtype opus --input_file ...
 ```
 
-The input CSV must have at least `M, N, K` columns; `bias`, `dtype`,
-`outdtype` columns are honored when present and override the CLI
-defaults. Missing columns fall back to `--bias` / `--dtype` /
-`--outdtype` at the CLI. `-o` defaults to `$AITER_OPUS_A16W16_TUNED_CSV`,
-which points at the shipped opus-private tuned CSV (see
-[§6 Environment](#6-environment)).
+gradlib stamps every opus row with `libtype='opus'` so the opus runtime
+dispatch picks it up via the libtype filter in
+`aiter/ops/opus/common.py`. Other backends' rows (asm / triton / ...) in
+the same CSV stay there and are picked up by their respective dispatch
+modules.
 
-The tuner's dedup / `self.keys` is a 7-tuple
-`(cu_num, M, N, K, bias, dtype, outdtype)`, so the same `(M, N, K)`
-shape can be tuned independently with `bias=True` and `bias=False` (and
-similarly across `outdtype`). bias=True candidates are restricted to
-the bias-aware kid families (split-barrier 4..9 and splitk 200..299);
-flatmm kid 100..115 are filtered out before mp_tuner sees them.
+**Candidate kid selection**: rather than benchmarking every kid for
+every shape, gradlib (via `candidate_kids_for_shape` in
+`opus_gemm_common.py`) uses an occupancy heuristic on a `128 × 128`
+proxy tile: if `ceil(M/128) * ceil(N/128) < 2 * cu_num`, only splitk
+kids are tuned (a non-splitk tile can't fill the device twice); for
+larger problems both splitk and non-splitk classes compete. Two
+structural fallbacks force splitk-only: K not aligned for non-splitk
+launchers (need `K%64==0` and `ceil(K/64)%2==0`), and bias=True when
+the candidate set has no bias-aware non-splitk kids.
 
-Verify winners work by running the end-to-end test against any shape
-that should now hit your tuned entry; the dispatcher will pick it up
-once the JIT module is rebuilt:
+**First tune triggers a rebuild**: the first time gradlib touches an
+opus kid not yet in the sidecar, it expands `compiled_kids.json` and
+forces `AITER_REBUILD=1`. The next call into `module_deepgemm_opus`
+re-runs codegen, which now includes the new kids. Expect ~11 s extra
+on the very first tune; subsequent tunes that hit the same kids are
+sidecar-cached and don't trigger a rebuild.
+
+### 3.2 Debug-only: `opus_gemm_tune.py` (single shape / kid)
+
+```bash
+python3 csrc/opus_gemm/opus_gemm_tune.py \
+    -m 128 -n 2880 -k 4096 --dtype bf16 --outdtype bf16
+# default -o is /tmp/opus_debug_tuned.csv (NOT aiter/configs/)
+```
+
+This is retained for single-shape smoke / debug runs against a
+specific kid. **It never writes to the global aiter/configs/ tree**
+unless you explicitly pass `-o aiter/configs/bf16_tuned_gemm.csv`,
+which is discouraged -- use gradlib for that.
+
+Verify winners with the end-to-end test:
 
 ```bash
 python3 op_tests/test_opus_a16w16_gemm.py -m 128 -n 256 -k 1024 -b 1
 # expected: allclose passed
 ```
-
-### 3.2 Autolog: collect shapes first, tune later
-
-Point your workload at `gemm_a16w16_opus` with autolog enabled, then
-feed the untuned CSV back to the tuner:
-
-```bash
-# 1. Run your model / benchmark with autolog on.
-AITER_OPUS_LOG_UNTUNED=1 python3 your_script.py
-
-# 2. Tune the shapes the Python layer observed.
-python3 csrc/opus_gemm/opus_gemm_tune.py \
-    -i aiter/ops/opus/configs/opus_a16w16_untuned_gemm.csv \
-    -o aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv
-
-# 3. (Optional) Rebuild the JIT C++ lookup so the zero-Python
-#    opus_gemm() entry also benefits.
-AITER_REBUILD=1 python3 -c "from aiter.ops.opus import gemm_a16w16_opus"
-```
-
-Autolog only records shapes that **missed** the tuned CSV. Hits are not
-rewritten, and duplicates are deduped on each write.
 
 ---
 
@@ -283,17 +306,18 @@ python3 op_tests/test_opus_a16w16_gemm.py --csv /path/to/shapes.csv
 
 ## 6. Environment
 
-All opus-specific env vars live here; **nothing opus-specific leaks
-into `aiter/jit/core.py`'s `AITER_CONFIGS`** (that module is reserved
-for aiter-global configuration shared across backends).
-
 | Env var | Default | Effect |
 |---|---|---|
-| `AITER_OPUS_A16W16_TUNED_CSV` | `aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv` | Path to the opus-private tuned CSV. Read by `common.py` (Python lookup) and by `gen_instances.py --tune_file` (C++ lookup bake-in). |
-| `AITER_OPUS_A16W16_UNTUNED_CSV` | `aiter/ops/opus/configs/opus_a16w16_untuned_gemm.csv` | Autolog target. Written with dedup when `AITER_OPUS_LOG_UNTUNED=1`. |
-| `AITER_OPUS_LOG_UNTUNED` | `0` | `1` turns on runtime shape collection at every CSV miss. |
+| `AITER_OPUS_TUNED_CSV_GLOB` | `aiter/configs/bf16_tuned_gemm.csv:aiter/configs/model_configs/*_bf16_tuned_gemm.csv` | Colon-separated glob list of tuned BF16 GEMM CSVs that the opus runtime dispatch (`common.py::lookup_tuned`) and the C++ codegen (`gen_instances.py --tune_files`) read. Each file is filtered by `libtype == 'opus'`. |
+| `AITER_OPUS_DEBUG_TUNED_CSV` | `/tmp/opus_debug_tuned.csv` | Default `-o` for the debug-only `opus_gemm_tune.py`. Never set this to a path under `aiter/configs/` -- use gradlib for production tuning. |
 | `AITER_REBUILD` | `0` | `1` forces JIT rebuild of `module_deepgemm_opus`. Needed after CSV edits if you want the C++ lookup to pick them up. |
+| `GTUNE_TUNED` | `$AITER_CONFIG_GEMM_BF16` (`aiter/configs/bf16_tuned_gemm.csv`) | gradlib output path. Pass `--tuned_file <path>` to override on the CLI. |
 | `FLATMM_HIP_CLANG_PATH` | unset | Optional hipcc override (see `optCompilerConfig.json`). |
+
+**Removed env vars** (autolog feature deleted in this release):
+`AITER_OPUS_A16W16_TUNED_CSV`, `AITER_OPUS_A16W16_UNTUNED_CSV`,
+`AITER_OPUS_LOG_UNTUNED`. The autolog code path is gone; collect
+untuned shapes via gradlib's standard `--input_file` flow instead.
 
 ---
 
@@ -301,24 +325,40 @@ for aiter-global configuration shared across backends).
 
 ### 7.1 Two-level dispatch (mirrors `csrc/ck_gemm_a8w8/gemm_a8w8.cu`)
 
-`opus_dispatch_a16w16<CDataType>` in
-[csrc/opus_gemm/opus_gemm.cu](../../../csrc/opus_gemm/opus_gemm.cu):
+`opus_dispatch_a16w16_gfx950<CDataType>` in
+[csrc/opus_gemm/include/gfx950/opus_gemm_arch_gfx950.cuh](../../../csrc/opus_gemm/include/gfx950/opus_gemm_arch_gfx950.cuh)
+binary-searches a sorted flat array of `(M, N, K) -> kernel` entries
+generated from the global tuned CSV; on miss it routes to the
+heuristic-kid path:
 
 ```cpp
 template <>
-OpusA16W16NoscaleKernel opus_dispatch_a16w16<bf16_t>(int M, int N, int K, int batch)
+inline OpusA16W16NoscaleKernel
+opus_dispatch_a16w16_gfx950<bf16_t>(int M, int N, int K, int batch)
 {
-  static const auto lookup = [] {
-    return OpusA16W16RuntimeMap{GENERATE_OPUS_LOOKUP_TABLE_BF16(bf16_t)};
-  }();
-  auto it = lookup.find({M, N, K});
-  if (it != lookup.end()) return it->second;
-  return opus_a16w16_heuristic_dispatch<bf16_t>(M, N, K, batch);
+    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
+        GENERATE_OPUS_LOOKUP_TABLE_BF16(bf16_t)
+    };
+    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
+    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
+    if (it != kLookup + kSize && entry_eq(*it, needle))
+        return it->func;
+
+    // Miss: ask the heuristic for an integer kid, resolve through
+    // tune_lookup. Splitk kids force <fp32_t> (their main kernel only
+    // has the <fp32_t> instantiation; the reduce kernel templated on Y
+    // dtype handles bf16/fp32 output at launch time).
+    const int kid = opus_a16w16_heuristic_kid_gfx950(M, N, K);
+    if (kid_is_splitk(kid))
+        return opus_a16w16_tune_dispatch_gfx950<fp32_t>(kid);
+    return opus_a16w16_tune_dispatch_gfx950<bf16_t>(kid);
 }
 ```
 
 The `<fp32_t>` specialization is analogous, using
-`GENERATE_OPUS_LOOKUP_TABLE_FP32`.
+`GENERATE_OPUS_LOOKUP_TABLE_FP32` and always routing the heuristic kid
+through `<fp32_t>` (splitk kid is forced; non-splitk kid happens to be
+the same in the fp32 lookup table).
 
 ### 7.2 Kernel inventory (see [opus_gemm_common.py](../../../csrc/opus_gemm/opus_gemm_common.py))
 
@@ -357,25 +397,32 @@ is orthogonal to this module and does not require changes here.
 
 ### 7.3 Heuristic fallback (bf16 Y path)
 
-In
-[csrc/opus_gemm/opus_gemm.cu](../../../csrc/opus_gemm/opus_gemm.cu)
-`opus_a16w16_heuristic_dispatch<bf16_t>`:
+`opus_a16w16_heuristic_kid_gfx950(M, N, K) -> int` in
+[csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh](../../../csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh)
+returns an integer kid based on M-bucket rules; the caller resolves the
+kid through the same tune lookup that powers `opus_gemm_a16w16_tune`:
 
-| M range | Kernel | Rationale |
-|---|---|---|
-| `M ≤ 4` | kid 208 splitk `(64, 64, 128)` WG=1 | Very skinny M; deep K keeps splitk workspace small |
-| `M ≤ 64` | kid 206 splitk `(64, 32, 128)` WG=2 | cc-recommended mid-M tile |
-| `M ≤ 128` | kid 200 splitk `(64, 64, 64)` WG=2 | splitk sweet spot |
-| `M > 128`, N%16 + K%64 + loops even | kid 9 a16w16 `(256, 256, 64)` | Traditional split-barrier wins large aligned |
-| `M > 128`, misaligned | kid 200 splitk | splitk tolerates arbitrary N (per-element tail store) |
+| M range | kid (oob / nooob) | Pipeline | Rationale |
+|---|---|---|---|
+| `M ≤ 4` | 208 / 1208 | splitk `(64, 64, 128)` WG=1 | Very skinny M; deep K keeps splitk workspace small |
+| `M ≤ 64` | 206 / 1206 | splitk `(64, 32, 128)` WG=2 | cc-recommended mid-M tile |
+| `M ≤ 128` | 200 / 1200 | splitk `(64, 64, 64)` WG=2 | splitk sweet spot |
+| `M > 128`, N%16 + K%64 + loops even | 300 / 1300 | persistent `(256, 256, 64)` | Persistent + XCD swizzle wins large aligned |
+| `M > 128`, misaligned | 200 / 1200 | splitk `(64, 64, 64)` WG=2 | splitk tolerates arbitrary N (per-element tail store) |
 
-The same heuristic table is used for both `<bf16_t>` and `<fp32_t>`
-specializations; the splitk kid 200..210 main-kernel instantiation is
-locked to `<fp32_t>` (its traits `static_assert(D_C == float)`), but
-the reduce kernel honors the actual `Y.dtype()` so both bf16 and fp32
-output land on the same heuristic kid. Every kid the heuristic returns
-supports bias (`HAS_BIAS=true`); CSV-miss requests with bias are
-forwarded to the same path unchanged.
+These 8 kids form `HEURISTIC_DEFAULT_KIDS` in
+`csrc/opus_gemm/opus_gemm_common.py`; `gen_instances.py` asserts they
+are all in the subset-compile set `S` before writing
+`compiled_kids.json`, so heuristic fallback is guaranteed never to
+return an unbakeable kid.
+
+The same heuristic kid function is used for both `<bf16_t>` and
+`<fp32_t>` dispatch specializations; splitk kids force the `<fp32_t>`
+tune_lookup branch regardless of CDataType (their main kernel only has
+`<fp32_t>`; the reduce kernel handles Y dtype at launch time).
+Persistent kid 300/1300 honors CDataType so both bf16 and fp32 output
+work. Every kid the heuristic returns supports bias (`HAS_BIAS=true`);
+CSV-miss requests with bias are forwarded unchanged.
 
 ### 7.4 The splitk `<fp32_t>` trick in the BF16 lookup map
 
@@ -405,14 +452,19 @@ entries entirely (launcher `TORCH_CHECK`s `Y.dtype() == BFloat16`).
 1. `aiter.ops.opus.gemm_op_a16w16` triggers `compile_ops("module_deepgemm_opus")`.
 2. [aiter/jit/optCompilerConfig.json](../../jit/optCompilerConfig.json)
    invokes
-   `csrc/opus_gemm/gen_instances.py --working_path {blob_dir} --tune_file aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv`
-3. `gen_instances.py` writes:
-   - `impl/*.cuh` — per-kid kernel launcher templates
-   - `instances/*.cpp` — explicit template instantiations
+   `csrc/opus_gemm/gen_instances.py --working_path {blob_dir} --tune_files aiter/configs/bf16_tuned_gemm.csv:aiter/configs/model_configs/*_bf16_tuned_gemm.csv`
+3. `gen_instances.py` computes the subset-compile set
+   `S = (CSV opus rows' solidx) ∪ (sidecar contents) ∪ HEURISTIC_DEFAULT_KIDS ∪ a8w8_kids`,
+   asserts `HEURISTIC_DEFAULT_KIDS ⊆ S`, then writes:
+   - `compiled_kids.json` — the sidecar listing every kid in `S` (~10 today)
+   - `impl/*.cuh` — per-kid kernel launcher templates (one per kid in `S`)
+   - `instances/all_instances_host.cu` — fused host TU (one per build)
+   - `instances/{kid_name}_C{bf16_t,fp32_t}.device.cu` — per-(kid, dtype) device TU
+   - `instances/splitk_reduce.device.cu` — dedicated splitk reduce TU
    - `opus_gemm_manifest.h` — forward declarations
-   - `opus_gemm_a16w16_tune_lookup.h` — int-id → kernel maps
-   - `opus_gemm_lookup.h` — **(M, N, K) → kernel** maps baked from the
-     tuned CSV (two macros: `_BF16`, `_FP32`)
+   - `opus_gemm_a16w16_tune_lookup.h` — int-id → kernel maps for the kids in `S`
+   - `opus_gemm_lookup.h` — **(M, N, K) → kernel** maps baked from CSV opus rows
+     (two macros: `_BF16`, `_FP32`)
 4. `opus_gemm.cu` is compiled and linked against the generated
    instances into `module_deepgemm_opus.so`.
 
@@ -995,15 +1047,19 @@ design notes.
 | Path | Role |
 |---|---|
 | [aiter/ops/opus/gemm_op_a16w16.py](gemm_op_a16w16.py) | `gemm_a16w16_opus` wrapper + low-level `opus_gemm_a16w16_tune` pybind + private `_opus_gemm_bf16_dispatch` fallback binding |
-| [aiter/ops/opus/common.py](common.py) | Python tuned-CSV lookup + autolog |
+| [aiter/ops/opus/common.py](common.py) | Python tuned-CSV lookup against `aiter/configs/bf16_tuned_gemm.csv` (+ `model_configs/*_bf16_tuned_gemm.csv`), filtered by `libtype=='opus'` |
 | [aiter/ops/opus/__init__.py](__init__.py) | Public symbol aggregator |
-| [aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv](configs/opus_gemm_a16w16_tuned.csv) | Shipped tuned winners (17-column schema) |
+| [aiter/configs/bf16_tuned_gemm.csv](../../configs/bf16_tuned_gemm.csv) | Global tuned BF16 GEMM CSV. Opus rows live here (`libtype=='opus'`) alongside asm / triton / skinny / flydsl / torch / hipblaslt rows. |
+| [aiter/configs/model_configs/](../../configs/model_configs/) | Per-model tuned BF16 GEMM CSVs (gptoss / dsv4 / glm5 / kimik2 / qwen / ...). Same schema; same `libtype` filter. |
 | [aiter/ops/deepgemm.py](../deepgemm.py) | CK backend (`deepgemm_ck` + `deepgemm()` forwarder). Also hosts the `opus_gemm_a16w16_tune` deprecation shim. |
-| [csrc/opus_gemm/opus_gemm_common.py](../../../csrc/opus_gemm/opus_gemm_common.py) | Kernel instance metadata (all kids live here) |
-| [csrc/opus_gemm/opus_gemm_tune.py](../../../csrc/opus_gemm/opus_gemm_tune.py) | Offline tuner |
-| [csrc/opus_gemm/gen_instances.py](../../../csrc/opus_gemm/gen_instances.py) | JIT codegen; `--tune_file` drives `opus_gemm_lookup.h` |
-| [csrc/opus_gemm/opus_gemm.cu](../../../csrc/opus_gemm/opus_gemm.cu) | Runtime dispatch (two-level) + pybind entries |
-| [csrc/opus_gemm/include/gfx950/](../../../csrc/opus_gemm/include/gfx950/) | Kernel source (a16w16, flatmm, flatmm_splitk) for gfx950 |
+| [csrc/opus_gemm/opus_gemm_common.py](../../../csrc/opus_gemm/opus_gemm_common.py) | Kernel instance metadata + shared host helpers: `SPLITK_KIDS / NON_SPLITK_KIDS / BIAS_AWARE_KIDS / HEURISTIC_DEFAULT_KIDS`, `candidate_kids_for_shape()`, `candidate_splitK()`, `kid_rejects_shape() / kid_rejects_bias()`, `_ensure_kids_compiled()` |
+| [csrc/opus_gemm/opus_gemm_tune.py](../../../csrc/opus_gemm/opus_gemm_tune.py) | **Debug-only** single-shape tuner; default `-o /tmp/opus_debug_tuned.csv`. Production tuning uses gradlib. |
+| [gradlib/gradlib/GemmTuner.py](../../../gradlib/gradlib/GemmTuner.py) | Production tuner; `--libtype opus` adds opus to the candidate sweep alongside other backends. |
+| [csrc/opus_gemm/gen_instances.py](../../../csrc/opus_gemm/gen_instances.py) | JIT codegen with subset-compile; `--tune_files` (glob) drives both the (M,N,K) lookup table and the compile set `S`. Writes `compiled_kids.json` sidecar. |
+| [csrc/opus_gemm/opus_gemm.cu](../../../csrc/opus_gemm/opus_gemm.cu) | Pybind entries (`opus_gemm`, `opus_gemm_a16w16_tune`) + per-arch router |
+| [csrc/opus_gemm/include/gfx950/opus_gemm_arch_gfx950.cuh](../../../csrc/opus_gemm/include/gfx950/opus_gemm_arch_gfx950.cuh) | gfx950 dispatch: (M,N,K) lookup + heuristic-kid fallback |
+| [csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh](../../../csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh) | `opus_a16w16_heuristic_kid_gfx950(M,N,K) -> int` (single source: integer kid only, no launcher symbol names) |
+| [csrc/opus_gemm/include/gfx950/](../../../csrc/opus_gemm/include/gfx950/) | Kernel source (a16w16, flatmm, flatmm_splitk, persistent, kspl) for gfx950 |
 | [op_tests/test_opus_a16w16_gemm.py](../../../op_tests/test_opus_a16w16_gemm.py) | End-to-end `gemm_a16w16_opus` (single-shape + CSV sweep) |
 
 ---
@@ -1015,8 +1071,6 @@ design notes.
 
 Future work (separate plans / PRs):
 
-- Plug `opus` into `aiter.tuned_gemm.solMap` so `aiter.gemm_a16w16` can
-  pick `libtype=opus` from a merged global tuned CSV.
 - Fill the a8w8 / a8w8_blockscale Python interfaces under
   `aiter/ops/opus/`, mirroring this module's shape; extend bias support
   through them.
