@@ -28,7 +28,9 @@ for _dep in reversed(_LOCAL_DEPS):
         sys.path.insert(0, _dep)
 
 from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (  # noqa: E402
+    compile_moe_grouped_gemm1_a8w4_masked,
     compile_moe_grouped_gemm1_mxfp4_masked,
+    compile_moe_grouped_gemm2_a8w4_masked,
     compile_moe_grouped_gemm2_mxfp4_masked,
 )
 from aiter.test_common import run_perftest  # noqa: E402
@@ -232,6 +234,12 @@ def _kernel_kwargs(s: dict) -> dict:
     return {k: s[k] for k in _KERNEL_OPTION_KEYS if k in s}
 
 
+def _stage2_kernel_kwargs(s: dict) -> dict:
+    kwargs = _kernel_kwargs(s)
+    kwargs["split_k"] = 1
+    return kwargs
+
+
 def _masked_m(experts: int, max_m: int, *, mode: str = "mixed", override: int | None = None) -> torch.Tensor:
     if override is not None:
         if override < 0 or override > max_m:
@@ -265,36 +273,134 @@ def _constant_mxfp4(rows: int, cols: int, byte: int = 0x11) -> torch.Tensor:
     return torch.full((rows, cols // 2), byte, dtype=torch.uint8)
 
 
+def _randn_to_mxfp4_unpacked(shape: tuple[int, ...], *, seed: int, device: str) -> torch.Tensor:
+    """Generate randn values and quantize to nearest E2M1 MXFP4 code."""
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed))
+    x = torch.randn(shape, generator=gen, device=device, dtype=torch.float32)
+    ax = x.abs()
+    thresholds = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+        dtype=torch.float32,
+        device=device,
+    )
+    mag_code = torch.bucketize(ax, thresholds).to(torch.uint8)
+    sign_code = torch.where(x < 0, torch.full_like(mag_code, 8), torch.zeros_like(mag_code))
+    return mag_code | sign_code
+
+
 def _mxfp4_batch(experts: int, rows: int, cols: int, *, mode: str, seed: int) -> torch.Tensor:
-    if mode == "pattern":
+    if mode in ("pattern", "randn"):
         if cols % 2 != 0:
             raise ValueError(f"cols must be even, got {cols}")
-        # Vectorized GPU build. The pattern values are {0,1,8,9} which equals
-        # (idx & 1) | ((idx & 2) << 2) for idx in [0..3], so we can avoid a
-        # 64-bit gather lookup entirely. We chunk over experts to bound peak
-        # GPU memory (each chunk allocates an int32 index tile of size
-        # chunk*R*C*4 bytes).
+        # Vectorized GPU build. Chunk over experts to bound peak memory.
         device = "cuda" if torch.cuda.is_available() else "cpu"
         per_expert_rxc = rows * cols
         max_chunk_bytes = 256 * 1024 * 1024
         max_chunk = max(1, min(experts, max_chunk_bytes // max(per_expert_rxc * 4, 1)))
         out = torch.empty((experts, rows, cols // 2), dtype=torch.uint8, device=device)
-        base = torch.arange(per_expert_rxc, dtype=torch.int32, device=device)
+        base = None
+        if mode == "pattern":
+            base = torch.arange(per_expert_rxc, dtype=torch.int32, device=device)
         for start in range(0, experts, max_chunk):
             end = min(experts, start + max_chunk)
-            seeds = torch.arange(start + seed, end + seed,
-                                 dtype=torch.int32, device=device)
-            idx = (base.view(1, -1) + seeds.view(-1, 1)) & 3                   # (chunk, R*C) i32, in [0,3]
-            # u4 = (idx & 1) | ((idx & 2) << 2). Compute as i32 then cast.
-            u4_i32 = (idx & 1) | ((idx & 2) << 2)                              # (chunk, R*C) i32, in {0,1,8,9}
-            u4 = u4_i32.to(torch.uint8).view(end - start, rows, cols)
+            if mode == "randn":
+                u4 = _randn_to_mxfp4_unpacked(
+                    (end - start, rows, cols),
+                    seed=seed + start,
+                    device=device,
+                )
+            else:
+                seeds = torch.arange(start + seed, end + seed,
+                                     dtype=torch.int32, device=device)
+                idx = (base.view(1, -1) + seeds.view(-1, 1)) & 3               # (chunk, R*C) i32, in [0,3]
+                # u4 = (idx & 1) | ((idx & 2) << 2), values {0,1,8,9}.
+                u4_i32 = (idx & 1) | ((idx & 2) << 2)
+                u4 = u4_i32.to(torch.uint8).view(end - start, rows, cols)
             low = u4[..., 0::2] & 0x0F
             high = (u4[..., 1::2] & 0x0F) << 4
             out[start:end] = (low | high)
-            del idx, u4_i32, u4, low, high
+            del u4, low, high
         return out.cpu()
     assert cols % 2 == 0
     return torch.full((experts, rows, cols // 2), 0x11, dtype=torch.uint8)
+
+
+def _float_to_fp8_bytes(x: torch.Tensor) -> torch.Tensor:
+    return x.to(dtypes.fp8).view(torch.uint8).contiguous()
+
+
+def _fp8_to_f32(x: torch.Tensor) -> torch.Tensor:
+    return x.contiguous().view(dtypes.fp8).float()
+
+
+def _fp8_batch(experts: int, rows: int, cols: int, *, mode: str, seed: int) -> torch.Tensor:
+    """Generate activation bytes for the A8W4 path (e4m3fn + e8m0 scale)."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if mode == "constant":
+        return _float_to_fp8_bytes(torch.full((experts, rows, cols), 1.0, dtype=torch.float32, device=device)).cpu()
+
+    per_expert_rxc = rows * cols
+    max_chunk_bytes = 256 * 1024 * 1024
+    max_chunk = max(1, min(experts, max_chunk_bytes // max(per_expert_rxc * 4, 1)))
+    out = torch.empty((experts, rows, cols), dtype=torch.uint8, device=device)
+    base = None
+    if mode == "pattern":
+        base = torch.arange(per_expert_rxc, dtype=torch.int32, device=device)
+        values = torch.tensor([0.0, 0.5, -0.5, 1.0], dtype=torch.float32, device=device)
+    for start in range(0, experts, max_chunk):
+        end = min(experts, start + max_chunk)
+        if mode == "randn":
+            gen = torch.Generator(device=device)
+            gen.manual_seed(int(seed + start))
+            x = torch.randn((end - start, rows, cols), generator=gen, device=device, dtype=torch.float32)
+        elif mode == "pattern":
+            seeds = torch.arange(start + seed, end + seed, dtype=torch.int32, device=device)
+            idx = (base.view(1, -1) + seeds.view(-1, 1)) & 3
+            x = values[idx.long()].view(end - start, rows, cols)
+        else:
+            raise ValueError(f"unknown data mode {mode!r}")
+        out[start:end] = _float_to_fp8_bytes(x)
+    return out.cpu()
+
+
+def _activation_batch(
+    data_format: str,
+    experts: int,
+    rows: int,
+    cols: int,
+    *,
+    mode: str,
+    seed: int,
+) -> torch.Tensor:
+    if data_format == "fp4":
+        return _mxfp4_batch(experts, rows, cols, mode=mode, seed=seed)
+    if data_format == "a8w4":
+        return _fp8_batch(experts, rows, cols, mode=mode, seed=seed)
+    raise ValueError(f"unknown data_format {data_format!r}")
+
+
+def _preshuffle_b_n16_packed(b: torch.Tensor) -> torch.Tensor:
+    """Pack B into the physical layout consumed by the FP4 TDM B path.
+
+    The kernel views B as rows of 16 output columns. Inside each row, packed K
+    is tiled in 16-byte chunks, and each chunk stores all 16 N lanes:
+        logical  (N, K_pack)
+        physical (N/16, K_pack/16, 16 lanes, 16 bytes)
+    """
+    experts, rows, k_pack = b.shape
+    if rows % 16 != 0:
+        raise ValueError(f"B rows must be divisible by 16, got {rows}")
+    if k_pack % 16 != 0:
+        raise ValueError(f"B packed K must be divisible by 16, got {k_pack}")
+    return (
+        b.contiguous()
+        .view(experts, rows // 16, 16, k_pack)
+        .view(experts, rows // 16, 16, k_pack // 16, 16)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .view(experts, rows, k_pack)
+    )
 
 
 def _mock_topk(tokens: int, topk: int, experts: int, *, mode: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -361,6 +467,15 @@ def _mock_grouped_mxfp4(
         return torch.full((experts, max_m, cols // 2), 0x11, dtype=torch.uint8)
     if cols % 2 != 0:
         raise ValueError(f"cols must be even, got {cols}")
+    if mode == "randn":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        valid = slot_token_ids.to(device) >= 0
+        u4 = _randn_to_mxfp4_unpacked((experts, max_m, cols), seed=seed, device=device)
+        low = u4[..., 0::2] & 0x0F
+        high = (u4[..., 1::2] & 0x0F) << 4
+        packed = (low | high)
+        packed = packed * valid.unsqueeze(-1).to(torch.uint8)
+        return packed.contiguous().cpu()
 
     # Vectorized: build per-(expert, row, col) pattern indices on GPU using
     # i32 arithmetic only (no 64-bit gather lookup), then bit-twiddle to the
@@ -385,6 +500,52 @@ def _mock_grouped_mxfp4(
     packed = (low | high)
     packed = packed * valid.unsqueeze(-1).to(torch.uint8)
     return packed.contiguous().cpu()
+
+
+def _mock_grouped_fp8(
+    slot_token_ids: torch.Tensor,
+    slot_rank_ids: torch.Tensor,
+    cols: int,
+    *,
+    mode: str,
+    seed: int,
+) -> torch.Tensor:
+    experts, max_m = slot_token_ids.shape
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    valid = (slot_token_ids.to(device) >= 0).unsqueeze(-1)
+    if mode == "constant":
+        x = torch.full((experts, max_m, cols), 1.0, dtype=torch.float32, device=device)
+    elif mode == "randn":
+        gen = torch.Generator(device=device)
+        gen.manual_seed(int(seed))
+        x = torch.randn((experts, max_m, cols), generator=gen, device=device, dtype=torch.float32)
+    else:
+        slot_tok = slot_token_ids.to(device, dtype=torch.int32)
+        slot_rnk = slot_rank_ids.to(device, dtype=torch.int32)
+        expert_idx = torch.arange(experts, dtype=torch.int32, device=device).view(experts, 1)
+        base_seed = seed + slot_tok.clamp(min=0) * 17 + slot_rnk.clamp(min=0) * 3 + expert_idx
+        base_idx = torch.arange(cols, dtype=torch.int32, device=device).view(1, 1, cols)
+        idx = (base_idx + base_seed.unsqueeze(-1)) & 3
+        values = torch.tensor([0.0, 0.5, -0.5, 1.0], dtype=torch.float32, device=device)
+        x = values[idx.long()]
+    x = torch.where(valid, x, torch.zeros_like(x))
+    return _float_to_fp8_bytes(x).cpu()
+
+
+def _mock_grouped_activation(
+    data_format: str,
+    slot_token_ids: torch.Tensor,
+    slot_rank_ids: torch.Tensor,
+    cols: int,
+    *,
+    mode: str,
+    seed: int,
+) -> torch.Tensor:
+    if data_format == "fp4":
+        return _mock_grouped_mxfp4(slot_token_ids, slot_rank_ids, cols, mode=mode, seed=seed)
+    if data_format == "a8w4":
+        return _mock_grouped_fp8(slot_token_ids, slot_rank_ids, cols, mode=mode, seed=seed)
+    raise ValueError(f"unknown data_format {data_format!r}")
 
 
 def _mxfp4_to_f32(x: torch.Tensor) -> torch.Tensor:
@@ -482,6 +643,35 @@ def _reference_mxfp4_batched(
     a_scaled = a_f32 * a_sc                                    # (B, M, K)
     b_scaled = (b_f32 * b_sc).transpose(-1, -2).contiguous()    # (B, K, N)
     return torch.matmul(a_scaled, b_scaled)                     # (B, M, N)
+
+
+def _reference_mxscale_batched(
+    a_raw: torch.Tensor,
+    b_fp4: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    *,
+    k: int,
+    data_format: str,
+) -> torch.Tensor:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    a_raw = a_raw.to(device, non_blocking=True).contiguous()
+    if data_format == "fp4":
+        a_f32 = _mxfp4_to_f32(a_raw.view(torch.uint8))[..., :k]
+    elif data_format == "a8w4":
+        a_f32 = _fp8_to_f32(a_raw.view(torch.uint8))[..., :k]
+    else:
+        raise ValueError(f"unknown data_format {data_format!r}")
+
+    b_fp4 = b_fp4.to(device, non_blocking=True).contiguous()
+    a_scale = a_scale.to(device, non_blocking=True).contiguous()
+    b_scale = b_scale.to(device, non_blocking=True).contiguous()
+    b_f32 = _mxfp4_to_f32(b_fp4.view(torch.uint8))[..., :k]
+    a_sc = _e8m0_to_f32(a_scale.view(torch.uint8)).repeat_interleave(SCALE_BLOCK, dim=-1)[..., :k]
+    b_sc = _e8m0_to_f32(b_scale.view(torch.uint8)).repeat_interleave(SCALE_BLOCK, dim=-1)[..., :k]
+    a_scaled = a_f32 * a_sc
+    b_scaled = (b_f32 * b_sc).transpose(-1, -2).contiguous()
+    return torch.matmul(a_scaled, b_scaled)
 
 
 # Relative L2 distance is the canonical metric for low-precision GEMM checks:
@@ -640,9 +830,12 @@ def _assert_batched_close(
     B, M_pad, _ = actual.shape
     row_idx = torch.arange(M_pad, device=actual.device).view(1, M_pad)
     masked_m_dev = masked_m_cpu.to(actual.device, dtype=torch.int32).view(B, 1)
-    row_mask = (row_idx < masked_m_dev).unsqueeze(-1).float()  # (B, M_pad, 1)
-    actual_masked = actual * row_mask
-    expected_masked = expected * row_mask
+    row_mask_bool = (row_idx < masked_m_dev).unsqueeze(-1)  # (B, M_pad, 1)
+    row_mask = row_mask_bool.float()
+    # Do not multiply by a float mask here: NaN * 0 is still NaN, and fused
+    # kernels intentionally leave masked-out rows untouched.
+    actual_masked = torch.where(row_mask_bool, actual, torch.zeros_like(actual))
+    expected_masked = torch.where(row_mask_bool, expected, torch.zeros_like(expected))
     diff = (actual_masked - expected_masked).abs()
     n_valid = float(row_mask.sum()) * actual.shape[-1]
     max_abs = float(diff.max())
@@ -726,6 +919,36 @@ def _assert_batched_close(
         )
 
 
+def _print_batched_l2(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    masked_m_cpu: torch.Tensor,
+) -> None:
+    actual = actual.float()
+    expected = expected.to(actual.device).float()
+    B, M_pad, _ = actual.shape
+    row_idx = torch.arange(M_pad, device=actual.device).view(1, M_pad)
+    masked_m_dev = masked_m_cpu.to(actual.device, dtype=torch.int32).view(B, 1)
+    row_mask_bool = (row_idx < masked_m_dev).unsqueeze(-1)
+    actual_masked = torch.where(row_mask_bool, actual, torch.zeros_like(actual))
+    expected_masked = torch.where(row_mask_bool, expected, torch.zeros_like(expected))
+    valid_mask = row_mask_bool.expand_as(actual)
+    metric, ref_norm, used_abs = _l2_metrics(
+        actual_masked[valid_mask],
+        expected_masked[valid_mask],
+    )
+    label = "abs_rms" if used_abs else "rel_l2"
+    diff = (actual_masked - expected_masked).abs()
+    print(
+        f"[masked-grouped-moe-gemm] {name}: {label}={metric:.4e} "
+        f"ref_norm={ref_norm:.3e} max_abs={float(diff.max()):.4e} "
+        f"actual {_stat_summary(actual_masked[valid_mask])} | "
+        f"expected {_stat_summary(expected_masked[valid_mask])}",
+        flush=True,
+    )
+
+
 def _run_stage1(
     s: dict[str, int],
     *,
@@ -739,22 +962,31 @@ def _run_stage1(
     bench_mode: str = "event",
     bench_scope: str = "wrapper",
     rotate: int = 0,
+    data_format: str = "fp4",
 ) -> dict[str, float]:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
-    _log(f"stage1 persistent={persistent}: build inputs")
+    _log(f"stage1 persistent={persistent} data_format={data_format}: build inputs")
     masked_m = _masked_m(E, max_m, mode=masked_mode, override=masked_m_override)
-    x_raw = _mxfp4_batch(E, max_m, model_dim, mode=data, seed=0)
-    w_raw = _mxfp4_batch(E, 2 * inter_dim, model_dim, mode=data, seed=17)
+    x_raw = _activation_batch(data_format, E, max_m, model_dim, mode=data, seed=0)
+    w_logical = _mxfp4_batch(E, 2 * inter_dim, model_dim, mode=data, seed=17)
+    w_raw = _preshuffle_b_n16_packed(w_logical)
     x_scale_raw = torch.full((E, max_m, model_dim // SCALE_BLOCK), DEFAULT_SCALE_U8, dtype=torch.uint8)
     w_scale_raw = torch.full((E, 2 * inter_dim, model_dim // SCALE_BLOCK), DEFAULT_SCALE_U8, dtype=torch.uint8)
     _log(f"stage1 persistent={persistent}: preshuffle scales")
     x_scale = _prep_scale_batch(x_scale_raw, warp_tile=s["tile_m"] // s["m_warp"], tile_k=s["tile_k"])
     w_scale = _prep_scale_batch(w_scale_raw, warp_tile=s["tile_n"] // s["n_warp"], tile_k=s["tile_k"])
     y = torch.empty((E, max_m, inter_dim), device="cuda", dtype=torch.float16)
+    timed_prefix = _make_m_tile_prefix_for_shape(masked_m, s) if persistent else None
+    timed_map = _make_m_tile_map_for_shape(masked_m, s) if persistent else None
     _log(f"stage1 persistent={persistent}: compile")
     compile_start = time.perf_counter()
-    kernel = compile_moe_grouped_gemm1_mxfp4_masked(
+    compile_stage1 = (
+        compile_moe_grouped_gemm1_a8w4_masked
+        if data_format == "a8w4"
+        else compile_moe_grouped_gemm1_mxfp4_masked
+    )
+    kernel = compile_stage1(
         model_dim=model_dim, inter_dim=inter_dim, experts=E, max_m=max_m,
         out_dtype="f16", grouped_persistent_m=persistent,
         **_kernel_kwargs(s),
@@ -793,18 +1025,22 @@ def _run_stage1(
             kernel(y, x_list[i], w_list[i], x_scale_list[i], w_scale_list[i],
                    masked_m, max_m, inter_dim, model_dim, E,
                    stream=torch.cuda.current_stream(),
-                   _gemm_events=(start_ev, end_ev) if start_ev is not None else None)
+                   _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
+                   _m_tile_prefix=timed_prefix,
+                   _m_tile_map=timed_map)
     else:
         rotate_select = None
 
         def launch(start_ev=None, end_ev=None):
             kernel(y, x, w, x_scale, w_scale, masked_m, max_m, inter_dim, model_dim, E,
                    stream=torch.cuda.current_stream(),
-                   _gemm_events=(start_ev, end_ev) if start_ev is not None else None)
+                   _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
+                   _m_tile_prefix=timed_prefix,
+                   _m_tile_map=timed_map)
 
     perf_iter = [0]
-    bench_prefix = _make_m_tile_prefix_for_shape(masked_m, s) if persistent and bench_scope == "gemm" else None
-    bench_map = _make_m_tile_map_for_shape(masked_m, s) if persistent and bench_scope == "gemm" else None
+    bench_prefix = timed_prefix if persistent else None
+    bench_map = timed_map if persistent else None
     bench_tmp = (
         torch.empty((E, max_m, 2 * inter_dim), device=y.device, dtype=y.dtype)
         if bench_scope == "gemm"
@@ -856,29 +1092,64 @@ def _run_stage1(
         timings["run_perftest_us"] = us
         _log(f"stage1 persistent={persistent}: run_perftest done us={us:.2f}")
     if verify:
-        if bench_scope == "gemm" or rotate_select is not None:
-            if rotate_select is not None:
-                rotate_select(0)
-            launch()
-            torch.cuda.synchronize()
+        if rotate_select is not None:
+            rotate_select(0)
+        # Always run one clean, untimed launch for correctness. run_perftest may
+        # exercise profiler/rotation paths; verification should inspect buffer 0.
+        launch()
+        torch.cuda.synchronize()
         masked_m_cpu_full = masked_m.cpu()
         active_idx = torch.nonzero(masked_m_cpu_full > 0, as_tuple=False).flatten().tolist()
         if active_idx:
             active_t = torch.tensor(active_idx, dtype=torch.long)
-            gate_up_all = _reference_mxfp4_batched(
-                x_raw[active_t], w_raw[active_t],
+            gate_up_all = _reference_mxscale_batched(
+                x_raw[active_t], w_logical[active_t],
                 x_scale_raw[active_t], w_scale_raw[active_t],
                 k=model_dim,
+                data_format=data_format,
             )  # (A, max_m, 2*inter_dim)
             gate = gate_up_all[..., :inter_dim]
             up = gate_up_all[..., inter_dim:]
             expected_active = (torch.nn.functional.silu(gate) * up).to(torch.float16).float()
             actual_active = y[active_t].float()
-            _assert_batched_close(
-                f"stage1 persistent={persistent}",
-                actual_active, expected_active,
-                masked_m_cpu_full[active_t],
-            )
+            check_name = f"stage1 persistent={persistent}"
+            try:
+                _assert_batched_close(
+                    check_name,
+                    actual_active, expected_active,
+                    masked_m_cpu_full[active_t],
+                )
+            except AssertionError:
+                # Force the wrapper down the unfused raw-GEMM + finalize path on
+                # the same physical inputs. This separates fused epilogue/dual-B
+                # bugs from common GEMM/reference layout bugs.
+                diag_y = torch.empty_like(y)
+                diag_tmp = torch.empty((E, max_m, 2 * inter_dim), device=y.device, dtype=y.dtype)
+                kernel(
+                    diag_y, x, w, x_scale, w_scale, masked_m,
+                    max_m, inter_dim, model_dim, E,
+                    stream=torch.cuda.current_stream(),
+                    _m_tile_prefix=timed_prefix,
+                    _m_tile_map=timed_map,
+                    _tmp=diag_tmp,
+                )
+                torch.cuda.synchronize()
+                diag_active = diag_y[active_t].float()
+                raw_expected = gate_up_all.to(torch.float16).float()
+                raw_actual = diag_tmp[active_t].float()
+                _print_batched_l2(
+                    f"{check_name} diag raw-gemm vs ref",
+                    raw_actual, raw_expected, masked_m_cpu_full[active_t],
+                )
+                _print_batched_l2(
+                    f"{check_name} diag unfused-finalize vs ref",
+                    diag_active, expected_active, masked_m_cpu_full[active_t],
+                )
+                _print_batched_l2(
+                    f"{check_name} diag fused vs unfused-finalize",
+                    actual_active, diag_active, masked_m_cpu_full[active_t],
+                )
+                raise
     return timings
 
 
@@ -895,25 +1166,34 @@ def _run_stage2(
     bench_mode: str = "event",
     bench_scope: str = "wrapper",
     rotate: int = 0,
+    data_format: str = "fp4",
 ) -> dict[str, float]:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
-    _log(f"stage2 persistent={persistent}: build inputs")
+    _log(f"stage2 persistent={persistent} data_format={data_format}: build inputs")
     masked_m = _masked_m(E, max_m, mode=masked_mode, override=masked_m_override)
-    x_raw = _mxfp4_batch(E, max_m, inter_dim, mode=data, seed=31)
-    w_raw = _mxfp4_batch(E, model_dim, inter_dim, mode=data, seed=47)
+    x_raw = _activation_batch(data_format, E, max_m, inter_dim, mode=data, seed=31)
+    w_logical = _mxfp4_batch(E, model_dim, inter_dim, mode=data, seed=47)
+    w_raw = _preshuffle_b_n16_packed(w_logical)
     x_scale_raw = torch.full((E, max_m, inter_dim // SCALE_BLOCK), DEFAULT_SCALE_U8, dtype=torch.uint8)
     w_scale_raw = torch.full((E, model_dim, inter_dim // SCALE_BLOCK), DEFAULT_SCALE_U8, dtype=torch.uint8)
     _log(f"stage2 persistent={persistent}: preshuffle scales")
     x_scale = _prep_scale_batch(x_scale_raw, warp_tile=s["tile_m"] // s["m_warp"], tile_k=s["tile_k"])
     w_scale = _prep_scale_batch(w_scale_raw, warp_tile=s["tile_n"] // s["n_warp"], tile_k=s["tile_k"])
     y = torch.empty((E, max_m, model_dim), device="cuda", dtype=torch.float16)
+    timed_prefix = _make_m_tile_prefix_for_shape(masked_m, s) if persistent else None
+    timed_map = _make_m_tile_map_for_shape(masked_m, s) if persistent else None
     _log(f"stage2 persistent={persistent}: compile")
     compile_start = time.perf_counter()
-    kernel = compile_moe_grouped_gemm2_mxfp4_masked(
+    compile_stage2 = (
+        compile_moe_grouped_gemm2_a8w4_masked
+        if data_format == "a8w4"
+        else compile_moe_grouped_gemm2_mxfp4_masked
+    )
+    kernel = compile_stage2(
         model_dim=model_dim, inter_dim=inter_dim, experts=E, max_m=max_m,
         out_dtype="f16", grouped_persistent_m=persistent,
-        **_kernel_kwargs(s),
+        **_stage2_kernel_kwargs(s),
     )
     _log(f"stage2 persistent={persistent}: compile done in {time.perf_counter() - compile_start:.2f}s")
     x = x_raw.cuda()
@@ -949,18 +1229,22 @@ def _run_stage2(
             kernel(y, x_list[i], w_list[i], x_scale_list[i], w_scale_list[i],
                    masked_m, max_m, model_dim, inter_dim, E,
                    stream=torch.cuda.current_stream(),
-                   _gemm_events=(start_ev, end_ev) if start_ev is not None else None)
+                   _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
+                   _m_tile_prefix=timed_prefix,
+                   _m_tile_map=timed_map)
     else:
         rotate_select = None
 
         def launch(start_ev=None, end_ev=None):
             kernel(y, x, w, x_scale, w_scale, masked_m, max_m, model_dim, inter_dim, E,
                    stream=torch.cuda.current_stream(),
-                   _gemm_events=(start_ev, end_ev) if start_ev is not None else None)
+                   _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
+                   _m_tile_prefix=timed_prefix,
+                   _m_tile_map=timed_map)
 
     perf_iter = [0]
-    bench_prefix = _make_m_tile_prefix_for_shape(masked_m, s) if persistent and bench_scope == "gemm" else None
-    bench_map = _make_m_tile_map_for_shape(masked_m, s) if persistent and bench_scope == "gemm" else None
+    bench_prefix = timed_prefix if persistent else None
+    bench_map = timed_map if persistent else None
 
     def launch_perftest():
         if rotate_select is not None:
@@ -1011,10 +1295,11 @@ def _run_stage2(
         active_idx = torch.nonzero(masked_m_cpu_full > 0, as_tuple=False).flatten().tolist()
         if active_idx:
             active_t = torch.tensor(active_idx, dtype=torch.long)
-            expected_active = _reference_mxfp4_batched(
-                x_raw[active_t], w_raw[active_t],
+            expected_active = _reference_mxscale_batched(
+                x_raw[active_t], w_logical[active_t],
                 x_scale_raw[active_t], w_scale_raw[active_t],
                 k=inter_dim,
+                data_format=data_format,
             ).to(torch.float16).float()
             actual_active = y[active_t].float()
             _assert_batched_close(
@@ -1039,6 +1324,7 @@ def _run_mock_moe(
     rotate: int = 0,
     bench_mode: str = "event",
     bench_scope: str = "wrapper",
+    data_format: str = "fp4",
 ) -> tuple[dict[str, float], dict[str, float]]:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
@@ -1047,7 +1333,7 @@ def _run_mock_moe(
     masked_m = masked_m_cpu.cuda()
     _log(
         "mock moe route: "
-        f"tokens={tokens} topk={topk} mode={route_mode} "
+        f"tokens={tokens} topk={topk} mode={route_mode} data_format={data_format} "
         f"max_expert_m={int(masked_m_cpu.max().item())} non_empty={int((masked_m_cpu > 0).sum().item())}/{E}"
     )
     # CPU-side mirror of the persistent early-exit predicate. The kernel only
@@ -1061,7 +1347,7 @@ def _run_mock_moe(
         rounding_mode="floor",
     )
     total_m_tiles = int(m_tiles_cpu.sum().item())
-    stage1_n_tiles = (2 * inter_dim + s["tile_n"] - 1) // s["tile_n"]
+    stage1_n_tiles = (inter_dim + s["tile_n"] - 1) // s["tile_n"]
     stage2_n_tiles = (model_dim + s["tile_n"] - 1) // s["tile_n"]
     _log(
         "mock moe early-exit mirror: "
@@ -1077,16 +1363,24 @@ def _run_mock_moe(
         _log(f"mock moe persistent auto-workers={s['persistent_workers']} (total_m_tiles={total_m_tiles})")
 
     _log(f"mock moe stage1 persistent={persistent}: build inputs")
-    x1_raw = _mock_grouped_mxfp4(slot_token_ids, slot_rank_ids, model_dim, mode=data, seed=0)
-    w1_raw = _mxfp4_batch(E, 2 * inter_dim, model_dim, mode=data, seed=17)
+    x1_raw = _mock_grouped_activation(data_format, slot_token_ids, slot_rank_ids, model_dim, mode=data, seed=0)
+    w1_logical = _mxfp4_batch(E, 2 * inter_dim, model_dim, mode=data, seed=17)
+    w1_raw = _preshuffle_b_n16_packed(w1_logical)
     x1_scale_raw = torch.full((E, max_m, model_dim // SCALE_BLOCK), DEFAULT_SCALE_U8, dtype=torch.uint8)
     w1_scale_raw = torch.full((E, 2 * inter_dim, model_dim // SCALE_BLOCK), DEFAULT_SCALE_U8, dtype=torch.uint8)
     x1_scale = _prep_scale_batch(x1_scale_raw, warp_tile=s["tile_m"] // s["m_warp"], tile_k=s["tile_k"])
     w1_scale = _prep_scale_batch(w1_scale_raw, warp_tile=s["tile_n"] // s["n_warp"], tile_k=s["tile_k"])
     y1 = torch.empty((E, max_m, inter_dim), device="cuda", dtype=torch.float16)
+    timed_prefix_s1 = _make_m_tile_prefix_for_shape(masked_m, s) if persistent else None
+    timed_map_s1 = _make_m_tile_map_for_shape(masked_m, s) if persistent else None
     _log(f"mock moe stage1 persistent={persistent}: compile")
     compile_start = time.perf_counter()
-    k1 = compile_moe_grouped_gemm1_mxfp4_masked(
+    compile_stage1 = (
+        compile_moe_grouped_gemm1_a8w4_masked
+        if data_format == "a8w4"
+        else compile_moe_grouped_gemm1_mxfp4_masked
+    )
+    k1 = compile_stage1(
         model_dim=model_dim, inter_dim=inter_dim, experts=E, max_m=max_m,
         out_dtype="f16", grouped_persistent_m=persistent,
         **_kernel_kwargs(s),
@@ -1133,6 +1427,8 @@ def _run_mock_moe(
                masked_m, max_m, inter_dim, model_dim, E,
                stream=torch.cuda.current_stream(),
                _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
+               _m_tile_prefix=timed_prefix_s1,
+               _m_tile_map=timed_map_s1,
                _debug_tmp_sentinel=_debug_tmp_sentinel,
                _debug_tmp_out=_debug_tmp_out)
     else:
@@ -1142,12 +1438,14 @@ def _run_mock_moe(
             k1(y1, x1, w1, x1_scale_dev, w1_scale_dev, masked_m, max_m, inter_dim, model_dim, E,
                stream=torch.cuda.current_stream(),
                _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
+               _m_tile_prefix=timed_prefix_s1,
+               _m_tile_map=timed_map_s1,
                _debug_tmp_sentinel=_debug_tmp_sentinel,
                _debug_tmp_out=_debug_tmp_out)
 
     perf_iter_s1 = [0]
-    bench_prefix_s1 = _make_m_tile_prefix_for_shape(masked_m, s) if persistent and bench_scope == "gemm" else None
-    bench_map_s1 = _make_m_tile_map_for_shape(masked_m, s) if persistent and bench_scope == "gemm" else None
+    bench_prefix_s1 = timed_prefix_s1 if persistent else None
+    bench_map_s1 = timed_map_s1 if persistent else None
     bench_tmp_s1 = (
         torch.empty((E, max_m, 2 * inter_dim), device=y1.device, dtype=y1.dtype)
         if bench_scope == "gemm"
@@ -1205,33 +1503,9 @@ def _run_mock_moe(
         y1.fill_(_VERIFY_SENTINEL)
         if rotate_select_s1 is not None:
             cur[0] = 0
-        # Capture raw GEMM output (pre-silu*up) so we can tell whether the
-        # GEMM kernel itself wrote anything, separate from the epilogue.
-        _tmp_capture = []
         torch.cuda.synchronize()
-        launch_stage1(_debug_tmp_sentinel=_VERIFY_SENTINEL, _debug_tmp_out=_tmp_capture)
+        launch_stage1()
         torch.cuda.synchronize()
-        if _tmp_capture:
-            tmp_dbg = _tmp_capture[0]
-            tmp_flat = tmp_dbg.flatten()
-            n_sent = _sentinel_count(tmp_flat)
-            print(
-                f"[masked-grouped-moe-gemm] mock stage1 persistent={persistent} "
-                f"raw-tmp diag: shape={tuple(tmp_dbg.shape)} "
-                f"sentinel_remaining={n_sent}/{tmp_flat.numel()} "
-                f"({100.0*n_sent/tmp_flat.numel():.2f}%) -- {_stat_summary(tmp_dbg)}",
-                flush=True,
-            )
-            # Also dump first active expert's pre-epilogue first 8 values.
-            active_idx_dbg = torch.nonzero(masked_m_cpu > 0, as_tuple=False).flatten().tolist()
-            if active_idx_dbg:
-                e0 = int(active_idx_dbg[0])
-                row = tmp_dbg[e0, 0, :8].float().tolist()
-                print(
-                    f"[masked-grouped-moe-gemm] mock stage1 persistent={persistent} "
-                    f"raw-tmp expert{e0} row0[:8]: {[f'{v:+.4e}' for v in row]}",
-                    flush=True,
-                )
 
         active_idx = torch.nonzero(masked_m_cpu > 0, as_tuple=False).flatten().tolist()
         if active_idx:
@@ -1245,10 +1519,11 @@ def _run_mock_moe(
                 )
             except AssertionError as exc:
                 _handle_verify_failure(check_name, exc)
-            gate_up_all = _reference_mxfp4_batched(
-                x1_raw[active_t], w1_raw[active_t],
+            gate_up_all = _reference_mxscale_batched(
+                x1_raw[active_t], w1_logical[active_t],
                 x1_scale_raw[active_t], w1_scale_raw[active_t],
                 k=model_dim,
+                data_format=data_format,
             )
             gate = gate_up_all[..., :inter_dim]
             up = gate_up_all[..., inter_dim:]
@@ -1266,19 +1541,27 @@ def _run_mock_moe(
     # Future integration point: replace this mocked quantized intermediate with
     # quantization of y1 once the end-to-end grouped MoE path is wired in.
     _log(f"mock moe stage2 persistent={persistent}: build inputs")
-    x2_raw = _mock_grouped_mxfp4(slot_token_ids, slot_rank_ids, inter_dim, mode=data, seed=31)
-    w2_raw = _mxfp4_batch(E, model_dim, inter_dim, mode=data, seed=47)
+    x2_raw = _mock_grouped_activation(data_format, slot_token_ids, slot_rank_ids, inter_dim, mode=data, seed=31)
+    w2_logical = _mxfp4_batch(E, model_dim, inter_dim, mode=data, seed=47)
+    w2_raw = _preshuffle_b_n16_packed(w2_logical)
     x2_scale_raw = torch.full((E, max_m, inter_dim // SCALE_BLOCK), DEFAULT_SCALE_U8, dtype=torch.uint8)
     w2_scale_raw = torch.full((E, model_dim, inter_dim // SCALE_BLOCK), DEFAULT_SCALE_U8, dtype=torch.uint8)
     x2_scale = _prep_scale_batch(x2_scale_raw, warp_tile=s["tile_m"] // s["m_warp"], tile_k=s["tile_k"])
     w2_scale = _prep_scale_batch(w2_scale_raw, warp_tile=s["tile_n"] // s["n_warp"], tile_k=s["tile_k"])
     y2 = torch.empty((E, max_m, model_dim), device="cuda", dtype=torch.float16)
+    timed_prefix_s2 = _make_m_tile_prefix_for_shape(masked_m, s) if persistent else None
+    timed_map_s2 = _make_m_tile_map_for_shape(masked_m, s) if persistent else None
     _log(f"mock moe stage2 persistent={persistent}: compile")
     compile_start = time.perf_counter()
-    k2 = compile_moe_grouped_gemm2_mxfp4_masked(
+    compile_stage2 = (
+        compile_moe_grouped_gemm2_a8w4_masked
+        if data_format == "a8w4"
+        else compile_moe_grouped_gemm2_mxfp4_masked
+    )
+    k2 = compile_stage2(
         model_dim=model_dim, inter_dim=inter_dim, experts=E, max_m=max_m,
         out_dtype="f16", grouped_persistent_m=persistent,
-        **_kernel_kwargs(s),
+        **_stage2_kernel_kwargs(s),
     )
     _log(f"mock moe stage2 persistent={persistent}: compile done in {time.perf_counter() - compile_start:.2f}s")
     x2 = x2_raw.cuda()
@@ -1316,18 +1599,22 @@ def _run_mock_moe(
             k2(y2, x2_list[i], w2_list[i], x2_scale_list[i], w2_scale_list[i],
                masked_m, max_m, model_dim, inter_dim, E,
                stream=torch.cuda.current_stream(),
-               _gemm_events=(start_ev, end_ev) if start_ev is not None else None)
+               _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
+               _m_tile_prefix=timed_prefix_s2,
+               _m_tile_map=timed_map_s2)
     else:
         rotate_select_s2 = None
 
         def launch_stage2(start_ev=None, end_ev=None):
             k2(y2, x2, w2, x2_scale_dev, w2_scale_dev, masked_m, max_m, model_dim, inter_dim, E,
                stream=torch.cuda.current_stream(),
-               _gemm_events=(start_ev, end_ev) if start_ev is not None else None)
+               _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
+               _m_tile_prefix=timed_prefix_s2,
+               _m_tile_map=timed_map_s2)
 
     perf_iter_s2 = [0]
-    bench_prefix_s2 = _make_m_tile_prefix_for_shape(masked_m, s) if persistent and bench_scope == "gemm" else None
-    bench_map_s2 = _make_m_tile_map_for_shape(masked_m, s) if persistent and bench_scope == "gemm" else None
+    bench_prefix_s2 = timed_prefix_s2 if persistent else None
+    bench_map_s2 = timed_map_s2 if persistent else None
 
     def launch_stage2_perftest():
         if rotate_select_s2 is not None:
@@ -1391,10 +1678,11 @@ def _run_mock_moe(
                 )
             except AssertionError as exc:
                 _handle_verify_failure(check_name, exc)
-            expected_all = _reference_mxfp4_batched(
-                x2_raw[active_t], w2_raw[active_t],
+            expected_all = _reference_mxscale_batched(
+                x2_raw[active_t], w2_logical[active_t],
                 x2_scale_raw[active_t], w2_scale_raw[active_t],
                 k=inter_dim,
+                data_format=data_format,
             ).to(torch.float16).float()  # (A, max_m, model_dim)
             actual_active = actual_active_raw.float()
             try:
@@ -1441,19 +1729,7 @@ def _run_mock_moe(
     return timings1, timings2
 
 
-@pytest.mark.parametrize("persistent", [False, True])
-def test_masked_grouped_moe_gemm_stage1_mxfp4_silu(persistent: bool):
-    _require_gfx1250()
-    _run_stage1(_shape(), persistent=persistent, verify=True, data="pattern", masked_mode="mixed", warmup=0, iters=1)
-
-
-@pytest.mark.parametrize("persistent", [False, True])
-def test_masked_grouped_moe_gemm_stage2_mxfp4(persistent: bool):
-    _require_gfx1250()
-    _run_stage2(_shape(), persistent=persistent, verify=True, data="pattern", masked_mode="mixed", warmup=0, iters=1)
-
-
-def test_mock_moe_usage_mxfp4():
+def test_mock_moe_usage_a4w4():
     _require_gfx1250()
     _run_mock_moe(
         _shape(experts=3, max_m=16),
@@ -1468,18 +1744,19 @@ def test_mock_moe_usage_mxfp4():
     )
 
 
-def test_mock_moe_expert_balance_mxfp4():
+def test_mock_moe_usage_a8w4():
     _require_gfx1250()
     _run_mock_moe(
-        _shape(experts=8, max_m=16),
-        tokens=16,
-        topk=4,
+        _shape(experts=3, max_m=16),
+        tokens=8,
+        topk=2,
         route_mode="expert_balance",
         persistent=True,
         verify=True,
         data="pattern",
         warmup=0,
         iters=1,
+        data_format="a8w4",
     )
 
 
@@ -1554,7 +1831,10 @@ def main() -> None:
                         help="Absolute L2 RMS tolerance used when ||expected||_2 is "
                              "near-zero (default: %(default)s). RMS = "
                              "||actual - expected||_2 / sqrt(N).")
-    parser.add_argument("--data", choices=("constant", "pattern"), default="constant")
+    parser.add_argument("--data-format", choices=("fp4", "a8w4"), default="fp4",
+                        help="Activation/weight format under test. fp4 is MXFP4xMXFP4; "
+                             "a8w4 uses FP8 activations with MXFP4 weights.")
+    parser.add_argument("--data", choices=("constant", "pattern", "randn"), default="constant")
     parser.add_argument("--masked-mode", choices=("mixed", "full", "descending"), default="mixed")
     parser.add_argument("--masked-m-override", type=int, default=None,
                         help="Force every expert's valid_m to this value (0..max_m). "
@@ -1565,8 +1845,9 @@ def main() -> None:
                         help="Timing path. run_perftest measures wrapper/profile latency; "
                              "event measures GEMM-only cuda.Event timing inside the wrapper.")
     parser.add_argument("--bench-scope", choices=("gemm", "wrapper"), default="gemm",
-                        help="Scope for run_perftest timing. gemm precomputes persistent "
-                             "metadata and skips stage1 epilogue; wrapper times the full Python wrapper.")
+                        help="Scope for run_perftest timing. Persistent prefix/map metadata "
+                             "is precomputed outside both scopes to keep profiler output focused "
+                             "on kernels under test. gemm skips stage1 epilogue; wrapper keeps it.")
     parser.add_argument("--rotate", type=int, default=0,
                         help="Rotate-buffer count (0=off). Each timed iter uses a "
                              "different on-device weight/activation buffer so L2/HBM "
@@ -1611,7 +1892,7 @@ def main() -> None:
 
     print(
         f"[masked-grouped-moe-gemm] scenario={args.scenario} shape={s} stage={args.stage} "
-        f"verify={args.verify} data={args.data} masked_mode={args.masked_mode} "
+        f"verify={args.verify} data_format={args.data_format} data={args.data} masked_mode={args.masked_mode} "
         f"bench_mode={args.bench_mode} bench_scope={args.bench_scope} rotate={args.rotate}",
         flush=True,
     )
@@ -1630,6 +1911,7 @@ def main() -> None:
                 rotate=args.rotate,
                 bench_mode=args.bench_mode,
                 bench_scope=args.bench_scope,
+                data_format=args.data_format,
             )
             print(
                 f"[masked-grouped-moe-gemm] mock_moe persistent={persistent} "
@@ -1651,6 +1933,7 @@ def main() -> None:
                 bench_mode=args.bench_mode,
                 bench_scope=args.bench_scope,
                 rotate=args.rotate,
+                data_format=args.data_format,
             )
             print(f"[masked-grouped-moe-gemm] stage1 persistent={persistent} {_format_timing_summary(timings)}", flush=True)
         if args.stage in ("2", "both"):
@@ -1666,6 +1949,7 @@ def main() -> None:
                 bench_mode=args.bench_mode,
                 bench_scope=args.bench_scope,
                 rotate=args.rotate,
+                data_format=args.data_format,
             )
             print(f"[masked-grouped-moe-gemm] stage2 persistent={persistent} {_format_timing_summary(timings)}", flush=True)
 
