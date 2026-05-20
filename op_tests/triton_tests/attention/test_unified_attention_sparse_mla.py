@@ -309,7 +309,7 @@ def dense_indices_to_csr(abs_indices, indices_in_kvcache):
 @pytest.mark.parametrize("s_q", [1, 64, 177])
 @pytest.mark.parametrize("s_k", [1, 64, 177])
 @pytest.mark.parametrize("top_k", [64, 78])
-@pytest.mark.parametrize("num_q_heads", [16, 32])
+@pytest.mark.parametrize("num_q_heads", [8, 16, 32])
 @pytest.mark.parametrize("lora_dim", [256, 512])
 @pytest.mark.parametrize("block_size", [16, 64])
 @torch.inference_mode()
@@ -396,7 +396,7 @@ def test_triton_unified_attn(
 @pytest.mark.parametrize("s_k", [64, 2048])
 @pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("lora_dim", [512])
-@pytest.mark.parametrize("num_q_heads", [16])
+@pytest.mark.parametrize("num_q_heads", [8, 16])
 @torch.inference_mode()
 def test_triton_unified_attn_csr_fp8(
     s_k: int,
@@ -516,7 +516,7 @@ def test_triton_unified_attn_csr_fp8(
 
 @pytest.mark.parametrize("s_q", [1, 17])
 @pytest.mark.parametrize("s_k", [1, 64])
-@pytest.mark.parametrize("num_q_heads", [16, 32])
+@pytest.mark.parametrize("num_q_heads", [8, 16, 32])
 @pytest.mark.parametrize("lora_dim", [256, 512])
 @pytest.mark.parametrize("block_size", [16, 64])
 @torch.inference_mode()
