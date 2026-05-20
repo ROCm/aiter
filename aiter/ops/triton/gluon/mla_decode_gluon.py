@@ -2,20 +2,21 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # Gluon MLA decode kernel originated from FlashMLA triton kernel(https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
-# Stage-1 split-KV MLA attention using explicit Gluon layouts. When
-# NUM_KV_SPLITS=1 the kernel writes the final attention output to O directly
-# and no reduce is launched; when NUM_KV_SPLITS>1 each program writes per-split
-# (acc, lse) to a temp buffer and stage-2 (_mla_softmax_reducev_kernel) combines
-# them. NUM_KV_SPLITS is auto-picked in the wrapper so the launch grid fills
-# ~256 workgroups (one wave on MI350).
-# Constraints: CDNA4 (gfx950), bf16, PAGE_SIZE=1, BLOCK_H=64, BLOCK_N=64,
-#   head_dim_ckv=512, head_dim_kpe=64,
-#   nhead in {64, 128}, batch_size in {64, 128, 256},
-#   min_kv_seq_len > NUM_KV_SPLITS * (PIPELINE_STAGES*BLOCK_N + NUM_KV_SPLITS)
-#   where PIPELINE_STAGES=3 (sufficient to keep per-split num_iter > 3;
-#   see wrapper assert).
+# Stage-1 split-KV MLA attention using explicit Gluon layouts. Two regimes:
 #
-# 3-stage software pipeline (double-buffered, BLOCK_N=64 with 2x32 KV slices):
+#   REGIME='bh64'      - bf16 Q + bf16 KV, BLOCK_H=64, BLOCK_N=64,
+#                        nhead in {64, 128}, batch_size in {64, 128, 256},
+#                        NUM_KV_SPLITS auto-picked to fill ~256 WGs (in {1,2,4}).
+#                        Fast path: when NUM_KV_SPLITS==1, stage-1 writes the
+#                        final output directly to O and stage-2 reduce is skipped.
+#   REGIME='bh16bn128' - bf16 Q + fp8 KV, BLOCK_H=16, BLOCK_N=128,
+#                        nhead in {4, 8, 16}, batch_size=1, NUM_KV_SPLITS=256.
+#                        Always splits + always reduces.
+#
+# For NUM_KV_SPLITS>1 each program writes per-split (acc, lse) to a temp buffer
+# and stage-2 (_mla_softmax_reducev_kernel) combines them.
+#
+# 3-stage software pipeline (double-buffered, BLOCK_N with 2x(BLOCK_N/2) KV slices):
 #   AC = async_copy (global->LDS), LL = load (LDS->reg), P = page, K = K-cache, V = V-cache
 #
 #                      iter i          iter i+1        iter i+2
@@ -48,6 +49,7 @@ def _mla_decode_gluon(
     B_seq_len,
     O,  # noqa: E741
     sm_scale,
+    kv_scale,
     stride_q_nope_bs,
     stride_q_nope_h,
     stride_q_pe_bs,
@@ -68,10 +70,18 @@ def _mla_decode_gluon(
     USE_2D_VIEW: gl.constexpr,
     WITHIN_2GB: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    NHEAD: gl.constexpr,
+    REGIME: gl.constexpr,
 ):
-    cur_batch = gl.program_id(0) + (gl.program_id(2) // NUM_KV_SPLITS) * NUM_XCDS
-    cur_head_id = gl.program_id(1)
-    split_kv_id = gl.program_id(2) % NUM_KV_SPLITS
+    # Grid mapping: bh64 uses 3-D XCD-aware multi-batch, bh16bn128 uses 1-D split-only.
+    if REGIME == 'bh64':
+        cur_batch = gl.program_id(0) + (gl.program_id(2) // NUM_KV_SPLITS) * NUM_XCDS
+        cur_head_id = gl.program_id(1)
+        split_kv_id = gl.program_id(2) % NUM_KV_SPLITS
+    else:
+        cur_batch = 0
+        cur_head_id = 0
+        split_kv_id = gl.program_id(0)
 
     # USE_2D_VIEW=True: fixed len or max padded VarLen
     # Req_to_tokens = block_table[batch, max_seqlen], B_seq_len = cache_seqlens[batch]
@@ -84,98 +94,191 @@ def _mla_decode_gluon(
         batch_page_start = gl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
 
-    # layout for Q
-    # 64x512
-    blocked_q_nope: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[1, 64],
-        warps_per_cta=[4, 1],
-        order=[1, 0],
-    )
-    shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
-        interval_padding_pairs=[[512, 16]],
-        offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
-        cga_layout=[],
-        shape=[64, 512]
-    )
-    # 64x64
-    blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((0, 1), (0, 2), (0, 4), (32, 0)),
-        lane_bases=((0, 8), (0, 16), (0, 32), (4, 0), (8, 0), (16, 0)),
-        warp_bases=((1, 0), (2, 0)),
-        block_bases=[],
-        shape=[64, 64],
-    )
-    shared_q_pe: gl.constexpr = gl.PaddedSharedLayout(
-        interval_padding_pairs=[[512, 16]],
-        offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [4, 0], [8, 0], [16, 0], [1, 0], [2, 0], [32, 0]],
-        cga_layout=[],
-        shape=[64, 64]
-    )
-    dtype = Q_nope.type.element_ty
-    buf_q_nope = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_CKV], layout=shared_q_nope)
-    buf_q_pe = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe)
+    ######### layout setting begin #########
+    if REGIME == 'bh64':
+        # layout for Q : 64x512xbf16
+        blocked_q_nope: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8],
+            threads_per_warp=[1, 64],
+            warps_per_cta=[4, 1],
+            order=[1, 0],
+        )
+        shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[512, 16]],
+            offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+            cga_layout=[],
+            shape=[64, 512]
+        )
+        # 64x64
+        blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0, 1), (0, 2), (0, 4), (32, 0)),
+            lane_bases=((0, 8), (0, 16), (0, 32), (4, 0), (8, 0), (16, 0)),
+            warp_bases=((1, 0), (2, 0)),
+            block_bases=[],
+            shape=[64, 64],
+        )
+        shared_q_pe: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[512, 16]],
+            offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [4, 0], [8, 0], [16, 0], [1, 0], [2, 0], [32, 0]],
+            cga_layout=[],
+            shape=[64, 64]
+        )
+        # layout for KV : 512x64xbf16
+        blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16), (0, 32)),
+            lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
+            warp_bases=((0, 1), (0, 2)),
+            block_bases=[],
+            shape=[512, 64],
+        )
+        shared_kv: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[512, 16]],
+            offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 1], [0, 2], [0, 8], [0, 4], [0, 16], [0, 32]],
+            cga_layout=[],
+            shape=[512, 64]
+        )
+        # 64x64
+        blocked_kpe: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((1, 0), (2, 0), (4, 0), (0, 32)),
+            lane_bases=((8, 0), (16, 0), (32, 0), (0, 4), (0, 8), (0, 16)),
+            warp_bases=((0, 1), (0, 2)),
+            block_bases=[],
+            shape=[64, 64],
+        )
+        shared_kpe: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[512, 16]],
+            offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2], [0, 32]],
+            cga_layout=[],
+            shape=[64, 64]
+        )
+        linear_v: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
+            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
+            warp_bases=((0, 0), (0, 0)),
+            block_bases=[],
+            shape=[512, 64],
+        )
+        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[4, 1],
+        )
+        blocked_page: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0,),),
+            lane_bases=((1,), (2,), (4,), (8,), (16,), (32,)),
+            warp_bases=((0,), (0,)),
+            block_bases=[],
+            shape=[64],
+        )
+        blocked_kv_slice: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16)),
+            lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
+            warp_bases=((0, 1), (0, 2)),
+            block_bases=[],
+            shape=[512, 32],
+        )
+    else:
+        # layout for Q : 16x512xbf16
+        blocked_q_nope: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8],
+            threads_per_warp=[1, 64],
+            warps_per_cta=[4, 1],
+            order=[1, 0],
+        )
+        shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[512, 16]],
+            offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1, 0], [2, 0], [4, 0], [8, 0]],
+            cga_layout=[],
+            shape=[16, 512]
+        )
+        # 16x64xbf16
+        blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0, 1), (0, 2), (0, 4)),
+            lane_bases=((0, 8), (0, 16), (0, 32), (1, 0), (2, 0), (4, 0)),
+            warp_bases=((8, 0), (0, 0)),
+            block_bases=[],
+            shape=[16, 64],
+        )
+        shared_q_pe: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[1, 0])
+        # layout for KV : 512x128xfp8
+        blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 4), (0, 32), (0, 64)),
+            lane_bases=((16, 0), (32, 0), (64, 0), (128, 0), (256, 0), (0, 16)),
+            warp_bases=((0, 1), (0, 2)),
+            block_bases=[],
+            shape=[512, 128],
+        )
+        shared_kv: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[1024, 32], [8192, 16]],
+            offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 16], [0, 1], [0, 2], [0, 8], [0, 4], [0, 32], [0, 64]],
+            cga_layout=[],
+            shape=[512, 128]
+        )
+        # 64x128xfp8
+        blocked_kpe: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 2)),
+            lane_bases=((16, 0), (32, 0), (0, 4), (0, 8), (0, 16), (0, 32)),
+            warp_bases=((0, 64), (0, 1)),
+            block_bases=[],
+            shape=[64, 128],
+        )
+        shared_kpe: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[2048, 16]],
+            offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 1], [0, 2]],
+            cga_layout=[],
+            shape=[64, 128]
+        )
+        linear_v: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (0, 64), (64, 0), (128, 0), (256, 0)),
+            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
+            warp_bases=((16, 0), (32, 0)),
+            block_bases=[],
+            shape=[512, 128],
+        )
+        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[1, 4],
+        )
+        blocked_page: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0,),),
+            lane_bases=((1,), (2,), (4,), (8,), (16,), (32,)),
+            warp_bases=((64,), (0,)),
+            block_bases=[],
+            shape=[128],
+        )
+        blocked_kv_slice: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 4), (0, 32)),
+            lane_bases=((16, 0), (32, 0), (64, 0), (128, 0), (256, 0), (0, 16)),
+            warp_bases=((0, 1), (0, 2)),
+            block_bases=[],
+            shape=[512, 64],
+        )
 
-    # layout for KV
-    # 512x64
-    blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16), (0, 32)),
-        lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
-        warp_bases=((0, 1), (0, 2)),
-        block_bases=[],
-        shape=[512, 64],
-    )
-    shared_kv: gl.constexpr = gl.PaddedSharedLayout(
-        interval_padding_pairs=[[512, 16]],
-        offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 1], [0, 2], [0, 8], [0, 4], [0, 16], [0, 32]],
-        cga_layout=[],
-        shape=[512, 64]
-    )
-
-    # 64x64
-    blocked_kpe: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((1, 0), (2, 0), (4, 0), (0, 32)),
-        lane_bases=((8, 0), (16, 0), (32, 0), (0, 4), (0, 8), (0, 16)),
-        warp_bases=((0, 1), (0, 2)),
-        block_bases=[],
-        shape=[64, 64],
-    )
-    shared_kpe: gl.constexpr = gl.PaddedSharedLayout(
-        interval_padding_pairs=[[512, 16]],
-        offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2], [0, 32]],
-        cga_layout=[],
-        shape=[64, 64]
-    )
-    linear_v: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
-        lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
-        warp_bases=((0, 0), (0, 0)),
-        block_bases=[],
-        shape=[512, 64],
-    )
-
-    # layout for mfma
-    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4,
-        instr_shape=[16, 16, 32],
-        transposed=True,
-        warps_per_cta=[4, 1],
-    )
     mfma_layout_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
     mfma_layout_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
+    dtype = Q_nope.type.element_ty
+    kvtype = Kv_c_cache.type.element_ty
+    ######### layout setting end #########
+
+    buf_q_nope = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_CKV], layout=shared_q_nope)
+    buf_q_pe = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe)
 
     # load q_nope
     offs_d_ckv = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, blocked_q_nope))
     cur_head = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope))
     offs_q_nope = cur_batch * stride_q_nope_bs + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope)
+    ### For nhead < BLOCK_H, mask OOB heads to zero on Q load and skip OOB O stores; wasted MFMA lanes are free (memory-bound).
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask = (cur_head < NHEAD)[:, None] if NHEAD < BLOCK_H else None)
     gl.amd.cdna4.async_copy.commit_group()
 
     # load q_pe
     offs_d_kpe = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(0, blocked_q_pe))
     cur_head_qpe = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
     offs_q_pe = cur_batch * stride_q_pe_bs + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask = (cur_head_qpe < NHEAD)[:, None] if NHEAD < BLOCK_H else None)
     gl.amd.cdna4.async_copy.commit_group()
 
     e_max = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf")
@@ -190,13 +293,6 @@ def _mla_decode_gluon(
     start_n = split_kv_start
 
     ### bufs of page_number
-    blocked_page: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((0,),),
-        lane_bases=((1,), (2,), (4,), (8,), (16,), (32,)),
-        warp_bases=((0,), (0,)),
-        block_bases=[],
-        shape=[64],
-    )
     shared_page: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
     bufs_page = gl.allocate_shared_memory(gl.int32, shape=[2, BLOCK_N], layout=shared_page)
     gl.static_assert(PAGE_SIZE == 1)
@@ -223,16 +319,8 @@ def _mla_decode_gluon(
     q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, mfma_layout_a)
 
     #################### move here to work around allocate_shared_memory bug
-    bufs_kv = gl.allocate_shared_memory(dtype, shape=[2, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
-    bufs_kpe = gl.allocate_shared_memory(dtype, shape=[2, HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
-
-    blocked_kv_slice: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16)),
-        lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
-        warp_bases=((0, 1), (0, 2)),
-        block_bases=[],
-        shape=[512, 32],
-    )
+    bufs_kv = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
+    bufs_kpe = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
 
     #### global load K
     # local load page number
@@ -242,14 +330,14 @@ def _mla_decode_gluon(
     kv_loc_pe = kv_page_number_pe
 
     # local load page number for slice 0
-    bufs_page_0 = bufs_page.index(0).slice(0, 32, 0)
+    bufs_page_0 = bufs_page.index(0).slice(0, BLOCK_N // 2, 0)
     kv_page_number_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_0, gl.SliceLayout(0, blocked_kv_slice))
     kv_loc0 = kv_page_number_0
 
     # global load K_nope slice 0
     offs_d_ckv_10 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv_slice))
     offs_k_c0 = kv_loc0[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
-    bufs_kv0 = bufs_kv.index(0).slice(0, 32, 1)
+    bufs_kv0 = bufs_kv.index(0).slice(0, BLOCK_N // 2, 1)
     if WITHIN_2GB:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv0, Kv_c_cache, offs_k_c0)
     else:
@@ -266,12 +354,12 @@ def _mla_decode_gluon(
     gl.amd.cdna4.async_copy.commit_group()
 
     # local load page number for slice 1
-    bufs_page_1 = bufs_page.index(0).slice(32, 32, 0)
+    bufs_page_1 = bufs_page.index(0).slice(BLOCK_N // 2, BLOCK_N // 2, 0)
     kv_page_number_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_1, gl.SliceLayout(0, blocked_kv_slice))
     kv_loc1 = kv_page_number_1
 
     # global load K_nope slice 1
-    bufs_kv1 = bufs_kv.index(0).slice(32, 32, 1)
+    bufs_kv1 = bufs_kv.index(0).slice(BLOCK_N // 2, BLOCK_N // 2, 1)
     offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
     if WITHIN_2GB:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv1, Kv_c_cache, offs_k_c1)
@@ -279,7 +367,7 @@ def _mla_decode_gluon(
         gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv1, Kv_c_cache + offs_k_c1)
     gl.amd.cdna4.async_copy.commit_group()
 
-    gl.assume(num_iter > 3)
+    gl.assume(num_iter >= 3)
     buf_idx = 0
     ################ loop
     for i in range(num_iter - 2):
@@ -293,14 +381,14 @@ def _mla_decode_gluon(
         gl.amd.cdna4.async_copy.commit_group()
 
         #### global load K
-        bufs_kv0 = bufs_kv.index(async_idx).slice(0, 32, 1)
-        bufs_kv1 = bufs_kv.index(async_idx).slice(32, 32, 1)
+        bufs_kv0 = bufs_kv.index(async_idx).slice(0, BLOCK_N // 2, 1)
+        bufs_kv1 = bufs_kv.index(async_idx).slice(BLOCK_N // 2, BLOCK_N // 2, 1)
         # local load page number for slice 0
-        bufs_page_0 = bufs_page.index(async_idx).slice(0, 32, 0)
+        bufs_page_0 = bufs_page.index(async_idx).slice(0, BLOCK_N // 2, 0)
         kv_page_number_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_0, gl.SliceLayout(0, blocked_kv_slice))
         kv_loc0 = kv_page_number_0
         # global load K_nope slice 0
-        offs_n_nope0 = start_n + gl.arange(0, 32, layout=gl.SliceLayout(0, blocked_kv_slice))
+        offs_n_nope0 = start_n + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, blocked_kv_slice))
         offs_d_ckv_10 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv_slice))
         offs_k_c0 = kv_loc0[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
         if WITHIN_2GB:
@@ -330,16 +418,16 @@ def _mla_decode_gluon(
         #### dot, softmax, dot (part0)
         k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), mfma_layout_b)
         zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-        qk = gl.amd.cdna4.mfma(q_nope, k_c.to(q_nope.dtype), zeros)
+        qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
         k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kpe.index(buf_idx), mfma_layout_b)
-        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(q_pe.dtype), qk)
+        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
 
         # local load page number for slice 1
-        bufs_page_1 = bufs_page.index(async_idx).slice(32, 32, 0)
+        bufs_page_1 = bufs_page.index(async_idx).slice(BLOCK_N // 2, BLOCK_N // 2, 0)
         kv_page_number_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_1, gl.SliceLayout(0, blocked_kv_slice))
         kv_loc1 = kv_page_number_1
         # global load K_nope slice 1
-        offs_n1 = offs_n_nope0 + 32
+        offs_n1 = offs_n_nope0 + BLOCK_N // 2
         offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
         if WITHIN_2GB:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv1, Kv_c_cache, offs_k_c1, mask=offs_n1[None, :] < split_kv_end)
@@ -362,6 +450,7 @@ def _mla_decode_gluon(
         p = gl.convert_layout(p, mfma_layout_a)
         acc *= re_scale[:, None]
         v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), linear_v)
+        v_c = v_c.to(dtype)
         v_c = gl.permute(v_c, [1, 0])
         v_c = gl.convert_layout(v_c, mfma_layout_b)
         acc = gl.amd.cdna4.mfma(p, v_c, acc)
@@ -402,10 +491,10 @@ def _mla_decode_gluon(
     gl.amd.cdna4.async_copy.wait_group(2)
     k_c = bufs_kv.index(buf_idx).load(layout=mfma_layout_b)
     zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-    qk = gl.amd.cdna4.mfma(q_nope, k_c.to(q_nope.dtype), zeros)
+    qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
 
     k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_layout_b)
-    qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(q_pe.dtype), qk)
+    qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
     qk *= sm_scale
     offs_n_qk = split_kv_start + (num_iter - 2) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
     qk = gl.where(offs_n_qk[None, :] < split_kv_end, qk, float("-inf"))
@@ -419,6 +508,7 @@ def _mla_decode_gluon(
     p = gl.convert_layout(p, mfma_layout_a)
     acc *= re_scale[:, None]
     v_c = bufs_kv.index(buf_idx).load(layout=linear_v)
+    v_c = v_c.to(dtype)
     v_c = gl.permute(v_c, [1, 0])
     v_c = gl.convert_layout(v_c, mfma_layout_b)
     acc = gl.amd.cdna4.mfma(p, v_c, acc)
@@ -430,10 +520,10 @@ def _mla_decode_gluon(
     gl.amd.cdna4.async_copy.wait_group(0)
     k_c = bufs_kv.index(buf_idx).load(layout=mfma_layout_b)
     zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-    qk = gl.amd.cdna4.mfma(q_nope, k_c.to(q_nope.dtype), zeros)
+    qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
 
     k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_layout_b)
-    qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(q_pe.dtype), qk)
+    qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
     qk *= sm_scale
     offs_n_qk = split_kv_start + (num_iter - 1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
     qk = gl.where(offs_n_qk[None, :] < split_kv_end, qk, float("-inf"))
@@ -446,6 +536,7 @@ def _mla_decode_gluon(
     p = gl.convert_layout(p, mfma_layout_a)
     acc *= re_scale[:, None]
     v_c = bufs_kv.index(buf_idx).load(layout=linear_v)
+    v_c = v_c.to(dtype)
     v_c = gl.permute(v_c, [1, 0])
     v_c = gl.convert_layout(v_c, mfma_layout_b)
     acc = gl.amd.cdna4.mfma(p, v_c, acc)
@@ -453,14 +544,21 @@ def _mla_decode_gluon(
     cur_head_o = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
     offs_d_ckv_o = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, mfma_layout))
     offs_o = cur_batch * stride_o_b + cur_head_o[:, None] * stride_o_h + split_kv_id * stride_o_s + offs_d_ckv_o[None, :]
+    acc *= kv_scale
     rcp = 1.0 / e_sum
     stored_value = (acc * rcp[:, None]).to(dtype)
-    gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
+    if NHEAD < BLOCK_H:
+        gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
+    else:
+        gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
     if NUM_KV_SPLITS > 1:
         # Per-split lse for stage-2 reduce (stored at the trailing slot).
         offs_o_lse = cur_batch * stride_o_b + cur_head_o * stride_o_h + split_kv_id * stride_o_s + HEAD_DIM_CKV
         lse = e_max + gl.log(e_sum)
-        gl.amd.cdna4.buffer_store(lse.to(dtype), ptr=O, offsets=offs_o_lse)
+        if NHEAD < BLOCK_H:
+            gl.amd.cdna4.buffer_store(lse.to(dtype), ptr=O, offsets=offs_o_lse, mask=(cur_head_o < NHEAD))
+        else:
+            gl.amd.cdna4.buffer_store(lse.to(dtype), ptr=O, offsets=offs_o_lse)
 # fmt: on
 
 
@@ -539,6 +637,7 @@ def mla_decode_gluon(
     k_pe=None,
     kv_pe_offset=512,
     use_2d_view=True,
+    kv_scale=1.0,
     min_kv_seq_len=1,
 ):
     if k_pe is None:
@@ -547,50 +646,75 @@ def mla_decode_gluon(
     batch_size, nhead, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
 
-    PAGE_SIZE = 1
-    BLOCK_H = 64
-    BLOCK_N = 64
-    NUM_XCDS = get_num_xcds()
-
-    # Auto-pick NUM_KV_SPLITS so the launch fills ~256 workgroups (one wave on
-    # MI350). For the supported (batch, nhead) matrix the result is in {1, 2, 4}.
-    TARGET_GRID = 256
-    base_grid = NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * (batch_size // NUM_XCDS)
-    NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(TARGET_GRID, base_grid)))
-
     assert (
         arch_info.get_arch() == "gfx950"
     ), f"mla_decode_gluon requires gfx950 (CDNA4), got {arch_info.get_arch()}"
-    assert batch_size in (
-        64,
-        128,
-        256,
-    ), f"mla_decode_gluon requires batch_size in (64, 128, 256), got {batch_size}"
-    assert nhead in (
-        64,
-        128,
-    ), f"mla_decode_gluon requires nhead in (64, 128), got {nhead}"
     assert (
         head_dim_ckv == 512
     ), f"mla_decode_gluon requires head_dim_ckv=512, got {head_dim_ckv}"
     assert (
         head_dim_kpe == 64
     ), f"mla_decode_gluon requires head_dim_kpe=64, got {head_dim_kpe}"
-    # gl.assume(num_iter > PIPELINE_STAGES) inside the kernel requires every
-    # split to have > PIPELINE_STAGES * BLOCK_N tokens. The smallest split
-    # (last) for a batch of length s is s - (k-1)*ceil(s/k); a sufficient
-    # bound that keeps this > min_per_split_tokens for all s >= min_kv_seq_len
-    # is min_kv_seq_len > k * (min_per_split_tokens + k).
-    PIPELINE_STAGES = 3  # matches gl.assume(num_iter > 3) inside the kernel
-    min_per_split_tokens = PIPELINE_STAGES * BLOCK_N  # 192
-    min_kv_seq_len_required = NUM_KV_SPLITS * (min_per_split_tokens + NUM_KV_SPLITS)
-    assert (
-        min_kv_seq_len > min_kv_seq_len_required
-    ), f"mla_decode_gluon requires min_kv_seq_len > {min_kv_seq_len_required} (NUM_KV_SPLITS={NUM_KV_SPLITS}), got {min_kv_seq_len}"
-    assert q_nope.dtype == torch.bfloat16, f"q_nope must be bf16, got {q_nope.dtype}"
-    assert q_pe.dtype == torch.bfloat16, f"q_pe must be bf16, got {q_pe.dtype}"
-    assert kv_c.dtype == torch.bfloat16, f"kv_c must be bf16, got {kv_c.dtype}"
-    assert k_pe.dtype == torch.bfloat16, f"k_pe must be bf16, got {k_pe.dtype}"
+
+    # Pick regime by nhead.
+    if nhead in (64, 128):
+        REGIME = "bh64"
+    elif nhead in (4, 8, 16):
+        REGIME = "bh16bn128"
+    else:
+        raise AssertionError(
+            f"mla_decode_gluon requires nhead in (4,8,16) [bh16bn128] or (64,128) [bh64], got {nhead}"
+        )
+
+    PAGE_SIZE = 1
+
+    if REGIME == "bh64":
+        BLOCK_H = 64
+        BLOCK_N = 64
+        NUM_XCDS = get_num_xcds()
+        # Auto-pick NUM_KV_SPLITS so the launch fills ~256 workgroups (one wave on
+        # MI350). For the supported (batch, nhead) matrix the result is in {1, 2, 4}.
+        TARGET_GRID = 256
+        base_grid = NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * (batch_size // NUM_XCDS)
+        NUM_KV_SPLITS = max(
+            1, triton.next_power_of_2(triton.cdiv(TARGET_GRID, base_grid))
+        )
+
+        assert batch_size in (
+            64,
+            128,
+            256,
+        ), f"mla_decode_gluon[bh64] requires batch_size in (64, 128, 256), got {batch_size}"
+        # gl.assume(num_iter > PIPELINE_STAGES) inside the kernel requires every
+        # split to have > PIPELINE_STAGES * BLOCK_N tokens. The smallest split
+        # (last) for a batch of length s is s - (k-1)*ceil(s/k); a sufficient
+        # bound that keeps this > min_per_split_tokens for all s >= min_kv_seq_len
+        # is min_kv_seq_len > k * (min_per_split_tokens + k).
+        PIPELINE_STAGES = 3  # matches gl.assume(num_iter > 3) inside the kernel
+        min_per_split_tokens = PIPELINE_STAGES * BLOCK_N  # 192
+        min_kv_seq_len_required = NUM_KV_SPLITS * (min_per_split_tokens + NUM_KV_SPLITS)
+        assert (
+            min_kv_seq_len > min_kv_seq_len_required
+        ), f"mla_decode_gluon[bh64] requires min_kv_seq_len > {min_kv_seq_len_required} (NUM_KV_SPLITS={NUM_KV_SPLITS}), got {min_kv_seq_len}"
+        assert (
+            q_nope.dtype == torch.bfloat16
+        ), f"q_nope must be bf16, got {q_nope.dtype}"
+        assert q_pe.dtype == torch.bfloat16, f"q_pe must be bf16, got {q_pe.dtype}"
+        assert kv_c.dtype == torch.bfloat16, f"kv_c must be bf16, got {kv_c.dtype}"
+        assert k_pe.dtype == torch.bfloat16, f"k_pe must be bf16, got {k_pe.dtype}"
+    else:
+        BLOCK_H = 16
+        BLOCK_N = 128
+        NUM_XCDS = 1  # unused by bh16bn128 grid mapping
+        NUM_CU = 256
+        NUM_KV_SPLITS = NUM_CU
+        assert (
+            batch_size == 1
+        ), f"mla_decode_gluon[bh16bn128] requires batch_size=1, got {batch_size}"
+        min_seq_len_wg = min_kv_seq_len // NUM_KV_SPLITS
+        assert (
+            min_seq_len_wg >= BLOCK_N * 3
+        ), f"mla_decode_gluon[bh16bn128] requires min_seq_len_wg >= BLOCK_N * 3, got min_seq_len_wg={min_seq_len_wg}"
 
     # buffer_load uses scalar base + 32-bit offsets, limiting addressable range.
     # For KV caches > 2 GB the kernel falls back to global_load (64-bit pointers).
@@ -610,11 +734,14 @@ def mla_decode_gluon(
             device=o.device,
         )
 
-    grid = (
-        NUM_XCDS,
-        triton.cdiv(nhead, BLOCK_H),
-        (batch_size // NUM_XCDS) * NUM_KV_SPLITS,
-    )
+    if REGIME == "bh64":
+        grid = (
+            NUM_XCDS,
+            triton.cdiv(nhead, BLOCK_H),
+            (batch_size // NUM_XCDS) * NUM_KV_SPLITS,
+        )
+    else:
+        grid = (NUM_KV_SPLITS,)
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
     _mla_decode_gluon[grid](
@@ -626,6 +753,7 @@ def mla_decode_gluon(
         seq_info,
         attn_logits,
         sm_scale,
+        kv_scale,
         q_nope.stride(0),
         q_nope.stride(1),
         q_pe.stride(0),
@@ -646,6 +774,8 @@ def mla_decode_gluon(
         USE_2D_VIEW=use_2d_view,
         WITHIN_2GB=within_2gb,
         NUM_XCDS=NUM_XCDS,
+        NHEAD=nhead,
+        REGIME=REGIME,
     )
 
     if NUM_KV_SPLITS > 1:
@@ -670,4 +800,4 @@ def mla_decode_gluon(
             num_warps=8,
         )
 
-    return attn_logits, None
+    return o, None
