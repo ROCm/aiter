@@ -124,7 +124,7 @@ def get_flydsl_stage1_kernels(
                                         "tile_k": tk,
                                         "MPerBlock": tm,
                                         "waves_per_eu": wpe,
-                                        "k_batch": kb,
+                                        "k_batch_intra_block": kb,
                                         "b_nt": bnt,
                                         "gate_mode": (
                                             "mock_gate_only"
@@ -218,7 +218,7 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
                         "tile_k": tk,
                         "MPerBlock": tm,
                         "in_dtype": "int4_bf16",
-                        "k_batch": kb,
+                        "k_batch_intra_block": kb,
                     }
     return kernels
 
@@ -263,7 +263,7 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
 
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
-    for a in ("fp8", "fp4", "fp16"):
+    for a in ("fp8", "fp4", "fp16", "bf16"):
         for b in ("fp4",):
             for out in ("bf16", "f16"):
                 _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
@@ -292,7 +292,7 @@ def compile_flydsl_moe_stage1(
     act: str = "silu",
     persist_m: int = 1,
     use_async_copy: bool = False,
-    k_batch: int = 1,
+    k_batch_intra_block: int = 1,
     waves_per_eu: int = 3,
     b_nt: int = 2,
     gate_mode: str = "separated",
@@ -301,12 +301,10 @@ def compile_flydsl_moe_stage1(
     enable_bias: bool = False,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
-    swiglu_limit: float = 0.0,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
-    if b_dtype == "fp4":
-        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
-        from .moe_common import GateMode
+    if b_dtype in ("fp4", "mxfp4") and a_dtype == "bf16":
+        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1, GateMode
 
         return compile_mixed_moe_gemm1(
             model_dim=model_dim,
@@ -323,7 +321,7 @@ def compile_flydsl_moe_stage1(
             act=act,
             persist_m=persist_m,
             use_async_copy=use_async_copy,
-            k_batch=k_batch,
+            k_batch=k_batch_intra_block,
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
             gate_mode=GateMode(gate_mode),
@@ -332,14 +330,13 @@ def compile_flydsl_moe_stage1(
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
-            swiglu_limit=swiglu_limit,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
 
         # split-K needs cshuffle (None -> auto-enable); non-split-K uses direct epilog
-        _use_cshuffle = None if k_batch > 1 else False
+        _use_cshuffle = None if k_batch_intra_block > 1 else False
 
         return compile_moe_gemm1(
             model_dim=model_dim,
@@ -355,7 +352,7 @@ def compile_flydsl_moe_stage1(
             out_dtype=out_dtype,
             use_cshuffle_epilog=_use_cshuffle,
             scale_is_bf16=True,
-            k_batch=k_batch,
+            k_batch=k_batch_intra_block,
         )
     else:
         raise ValueError(
@@ -383,6 +380,7 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    k_batch_intra_block: int = 1,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -408,6 +406,7 @@ def compile_flydsl_moe_stage2(
             inter_dim_pad=inter_dim_pad,
             xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
+            k_batch=k_batch_intra_block,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -685,7 +684,7 @@ def flydsl_moe_stage1(
     sorted_weights: Optional[torch.Tensor] = None,
     persist_m: int = 0,
     use_async_copy: bool = False,
-    k_batch: int = 1,
+    k_batch_intra_block: int = 1,
     waves_per_eu: int = 3,
     b_nt: int = 0,
     gate_mode: str = "separated",
@@ -708,7 +707,7 @@ def flydsl_moe_stage1(
     When fuse_quant=True, the kernel fuses quantization (fp4/fp8, inferred from
     out_dtype) and writes e8m0 scales in sorted tiled layout directly.
 
-    When k_batch>1 (split-K), the kernel outputs gate/up partials via atomic
+    When k_batch_intra_block>1 (split-K), the kernel outputs gate/up partials via atomic
     add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
 
     gate_mode controls the gate/up computation strategy (see GateMode enum).
@@ -737,7 +736,7 @@ def flydsl_moe_stage1(
         torch_out_dtype = dtypes.fp8
     else:
         torch_out_dtype = dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
-    _is_splitk = k_batch > 1
+    _is_splitk = k_batch_intra_block > 1
     gate_up_interleave = gate_mode == "interleave"
 
     dev = a.device
@@ -760,7 +759,14 @@ def flydsl_moe_stage1(
             )
 
     if _is_splitk:
-        torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
+        _is_a16w4 = a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")
+        if _is_a16w4:
+            # A16W4 split-K kernel uses f32 atomics for partial sums.
+            torch_tmp_out_dtype = torch.float32
+        else:
+            torch_tmp_out_dtype = (
+                dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
+            )
         tmp_out = torch.zeros(
             (token_num, topk, inter_dim * 2), dtype=torch_tmp_out_dtype, device=dev
         )
@@ -813,7 +819,7 @@ def flydsl_moe_stage1(
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
-    is_fp4 = b_dtype == "fp4"
+    is_fp4 = b_dtype in ("fp4", "mxfp4")
     _n_in = inter_dim * 2 if is_fp4 else inter_dim
     _k_in = model_dim
 
@@ -872,7 +878,7 @@ def flydsl_moe_stage1(
         act=act,
         persist_m=_persist_m,
         use_async_copy=use_async_copy,
-        k_batch=k_batch,
+        k_batch_intra_block=k_batch_intra_block,
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
         gate_mode=gate_mode,
@@ -881,9 +887,13 @@ def flydsl_moe_stage1(
         enable_bias=(kernel_bias is not None),
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
-        swiglu_limit=swiglu_limit,
     )
     _run_compiled(exe, args)
+
+    # a16w4 split-K accumulates partials into f32 via atomics; cast to bf16
+    # before the post-activation kernels, which all expect bf16 input.
+    if _is_splitk and _is_a16w4:
+        tmp_out = tmp_out.to(dtypes.bf16)
 
     num_sorted_rows = sorted_token_ids.shape[0]
     use_splitk_bias = _is_splitk and bias is not None
@@ -1040,6 +1050,7 @@ def flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     bias: Optional[torch.Tensor] = None,
+    k_batch_intra_block: int = 1,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1171,6 +1182,7 @@ def flydsl_moe_stage2(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        k_batch_intra_block=k_batch_intra_block,
     )
     _run_compiled(exe, args)
 
