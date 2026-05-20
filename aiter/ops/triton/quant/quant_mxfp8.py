@@ -12,7 +12,6 @@ from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
     _dual_rmsnorm_mxfp8_quant_kernel,
 )
 
-
 _QUANT_BLOCK_SIZE = 32
 
 
@@ -107,9 +106,10 @@ def fp8_legacy_to_mxfp8(
     M, N = x_fnuz.shape
     assert N % _QUANT_BLOCK_SIZE == 0
     assert N % _LEGACY_BLOCK_SIZE == 0
-    assert x_scale_fp32.shape == (M, N // _LEGACY_BLOCK_SIZE), (
-        f"x_scale_fp32 shape {x_scale_fp32.shape} != ({M},{N // _LEGACY_BLOCK_SIZE})"
-    )
+    assert x_scale_fp32.shape == (
+        M,
+        N // _LEGACY_BLOCK_SIZE,
+    ), f"x_scale_fp32 shape {x_scale_fp32.shape} != ({M},{N // _LEGACY_BLOCK_SIZE})"
 
     Ns = N // _QUANT_BLOCK_SIZE
     if y_fn is None:
@@ -238,9 +238,9 @@ def dual_rmsnorm_mxfp8_quant(
     assert M == Mk, f"q rows {M} != k rows {Mk}"
     assert q_weight.shape == (KQ,), f"q_weight shape {q_weight.shape} != ({KQ},)"
     assert k_weight.shape == (KK,), f"k_weight shape {k_weight.shape} != ({KK},)"
-    assert KQ % _QUANT_BLOCK_SIZE == 0, (
-        f"KQ={KQ} must be a multiple of {_QUANT_BLOCK_SIZE}"
-    )
+    assert (
+        KQ % _QUANT_BLOCK_SIZE == 0
+    ), f"KQ={KQ} must be a multiple of {_QUANT_BLOCK_SIZE}"
     if eps_k is None:
         eps_k = eps_q
 
