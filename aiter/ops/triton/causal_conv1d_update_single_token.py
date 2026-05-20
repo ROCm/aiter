@@ -228,9 +228,7 @@ def fused_reshape_causal_conv1d_update_single_token(
     if interleaved:
         expected_qkvz_dim = num_k_heads * head_qkvz_dim
     else:
-        expected_qkvz_dim = (
-            2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim
-        )
+        expected_qkvz_dim = 2 * num_k_heads * head_k_dim + 2 * num_v_heads * head_v_dim
     assert (
         qkvz_dim == expected_qkvz_dim
     ), f"ERROR: expect qkvz_dim to be {expected_qkvz_dim}, got {qkvz_dim}"

@@ -11,7 +11,9 @@ import triton.language as tl
 
 
 @triton.jit
-def _ba_source_offsets(idx_hv, num_v_heads, num_k_heads, INTERLEAVED_QKVZ: tl.constexpr):
+def _ba_source_offsets(
+    idx_hv, num_v_heads, num_k_heads, INTERLEAVED_QKVZ: tl.constexpr
+):
     """Return (b_off, a_off) into the packed ba tensor for one v-head index."""
     if INTERLEAVED_QKVZ:
         G = num_v_heads // num_k_heads
@@ -26,8 +28,15 @@ def _ba_source_offsets(idx_hv, num_v_heads, num_k_heads, INTERLEAVED_QKVZ: tl.co
 
 
 @triton.jit
-def _z_source_idx(idx_z, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
-                  head_qkvz_dim, INTERLEAVED_QKVZ: tl.constexpr):
+def _z_source_idx(
+    idx_z,
+    num_k_heads,
+    num_v_heads,
+    head_k_dim,
+    head_v_dim,
+    head_qkvz_dim,
+    INTERLEAVED_QKVZ: tl.constexpr,
+):
     """Map flat z index to source column in the packed x tensor."""
     if INTERLEAVED_QKVZ:
         G = num_v_heads // num_k_heads
@@ -38,8 +47,15 @@ def _z_source_idx(idx_z, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
 
 
 @triton.jit
-def _feat_source_idx(idx_feats, num_k_heads, head_k_dim, head_v_dim,
-                     head_qkvz_dim, num_v_heads, INTERLEAVED_QKVZ: tl.constexpr):
+def _feat_source_idx(
+    idx_feats,
+    num_k_heads,
+    head_k_dim,
+    head_v_dim,
+    head_qkvz_dim,
+    num_v_heads,
+    INTERLEAVED_QKVZ: tl.constexpr,
+):
     """Map logical conv-output feature index to source column in packed x."""
     if INTERLEAVED_QKVZ:
         nk = num_k_heads
@@ -346,8 +362,13 @@ def _reshape_causal_conv1d_update_single_token_kernel(
     elif tl.program_id(1) < 1 + num_program_write_z:
         idx_z = (tl.program_id(1) - 1) * BLOCK_Z + tl.arange(0, BLOCK_Z)
         idx_z_x = _z_source_idx(
-            idx_z, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
-            head_qkvz_dim, INTERLEAVED_QKVZ
+            idx_z,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            head_qkvz_dim,
+            INTERLEAVED_QKVZ,
         )
         z_source_ptrs = x_ptr + idx_seq * stride_x_seq + idx_z_x * stride_x_dim
         mask_z = idx_z < num_v_heads * head_v_dim
@@ -377,8 +398,13 @@ def _reshape_causal_conv1d_update_single_token_kernel(
             0, BLOCK_N
         )
         idx_feats_x = _feat_source_idx(
-            idx_feats, num_k_heads, head_k_dim, head_v_dim,
-            head_qkvz_dim, num_v_heads, INTERLEAVED_QKVZ
+            idx_feats,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            head_qkvz_dim,
+            num_v_heads,
+            INTERLEAVED_QKVZ,
         )
 
         if IS_APC_ENABLED:
