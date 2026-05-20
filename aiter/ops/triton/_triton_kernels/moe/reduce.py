@@ -27,6 +27,12 @@ def _reduce_grouped(
     EVEN_N: tl.constexpr,
     ADD_RESIDUAL: tl.constexpr,
     USE_TDM: tl.constexpr,
+    # Step 9: external residual fold-in. When HAS_EXT_RESIDUAL=True,
+    # Residual[token, :] is added to `acc` before the writeback.
+    Residual,
+    stride_extres_m: tl.uint64,
+    stride_extres_n,
+    HAS_EXT_RESIDUAL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     pid_t = pid // num_blocks
@@ -76,6 +82,20 @@ def _reduce_grouped(
     # Compute per-32-col MXFP scales for this tile if requested
     Nrem = N // ACTIVATION_REDUCTION_N
 
+    # Step 9: optional external residual fold-in: load residual at this
+    # tile and add to acc before writeback. Same per-token-row layout as Out.
+    if HAS_EXT_RESIDUAL:
+        res_offs_n = pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT)
+        res_ptr = (
+            Residual + pid_t * stride_extres_m + res_offs_n * stride_extres_n
+        )
+        if EVEN_N:
+            res = tl.load(res_ptr).to(tl.float32)
+            acc = acc + res
+        else:
+            res_mask = res_offs_n < Nrem
+            res = tl.load(res_ptr, mask=res_mask, other=0.0).to(tl.float32)
+            acc = acc + res
     # write-back for this tile
     out_ptr = OutPtrs + pid_t * stride_om
     if EVEN_N:

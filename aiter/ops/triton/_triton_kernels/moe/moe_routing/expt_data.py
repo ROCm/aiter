@@ -90,3 +90,37 @@ def _expt_data_compute_stage2_fused(expt_id, Hist, TileStart, TileInfo):
         return
     TileInfo += tl.load(TileStart + expt_id)
     tl.store(TileInfo, expt_id)
+
+
+@triton.jit
+def _expt_data_only_kernel(
+    Hist,
+    n_expts_tot,
+    TokenStart,
+    TileStart,
+    MDTileInfo,
+    max_num_tiles,
+    n_gates,
+    tile_dim_log2: tl.constexpr,
+    BLOCK: tl.constexpr,
+    EQUAL_BLOCK: tl.constexpr,
+):
+    """Standalone stage1+stage2 launch — builds ExptData from a precomputed
+    histogram with no memset. Grid: (n_expts_tot,)."""
+    pid = tl.program_id(0)
+
+    _expt_data_compute_stage1(
+        pid,
+        Hist,
+        n_expts_tot,
+        TokenStart,
+        TileStart,
+        MDTileInfo,
+        max_num_tiles,
+        n_gates,
+        tile_dim_log2,
+        BLOCK,
+        EQUAL_BLOCK,
+    )
+
+    _expt_data_compute_stage2(pid, Hist, TileStart, MDTileInfo, tile_dim_log2)
