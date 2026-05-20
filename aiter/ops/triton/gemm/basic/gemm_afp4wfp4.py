@@ -560,57 +560,28 @@ def gemm_afp4wfp4_preshuffle(
         )
         return y
 
-    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_triton_gemm_afp4wfp4_preshuffle_kernel.fn.__name__}_M={M_POW2}-N={N}-K={K_elems}"
-    if use_aot and os.path.exists(metadata_pth):
-        with AOTMetadataContext(
-            _triton_gemm_afp4wfp4_preshuffle_kernel.fn.__name__,
-            f"{metadata_pth}",
-        ):
-            _triton_gemm_afp4wfp4_preshuffle_kernel[grid](
-                x_fp4,
-                w_preshuf,
-                y if config["NUM_KSPLIT"] == 1 else y_pp,
-                x_scales,
-                w_scales,
-                M,
-                N,
-                K_elems,
-                x_fp4.stride(0),
-                x_fp4.stride(1),
-                w_preshuf.stride(0),
-                w_preshuf.stride(1),
-                0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-                y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-                y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-                x_scales.stride(0),
-                x_scales.stride(1),
-                w_scales.stride(0),
-                w_scales.stride(1),
-                **config,
-            )
-    else:
-        _triton_gemm_afp4wfp4_preshuffle_kernel[grid](
-            x_fp4,
-            w_preshuf,
-            y if config["NUM_KSPLIT"] == 1 else y_pp,
-            x_scales,
-            w_scales,
-            M,
-            N,
-            K_elems,
-            x_fp4.stride(0),
-            x_fp4.stride(1),
-            w_preshuf.stride(0),
-            w_preshuf.stride(1),
-            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-            x_scales.stride(0),
-            x_scales.stride(1),
-            w_scales.stride(0),
-            w_scales.stride(1),
-            **config,
-        )
+    _triton_gemm_afp4wfp4_preshuffle_kernel[grid](
+        x_fp4,
+        w_preshuf,
+        y if config["NUM_KSPLIT"] == 1 else y_pp,
+        x_scales,
+        w_scales,
+        M,
+        N,
+        K_elems,
+        x_fp4.stride(0),
+        x_fp4.stride(1),
+        w_preshuf.stride(0),
+        w_preshuf.stride(1),
+        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+        x_scales.stride(0),
+        x_scales.stride(1),
+        w_scales.stride(0),
+        w_scales.stride(1),
+        **config,
+    )
 
     if return_y_pp:
         return y_pp
