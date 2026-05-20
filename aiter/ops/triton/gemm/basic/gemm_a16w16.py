@@ -6,10 +6,8 @@ import torch
 import triton
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
     _gemm_a16_w16_kernel,
+    _gemm_a16w16_reduce_kernel,
     _get_config,
-)
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
 )
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -112,10 +110,10 @@ def gemm_a16w16(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _gemm_a16w16_reduce_kernel[grid_reduce](
+            bias,
             y_pp,
             y,
-            bias,
             M,
             N,
             y_pp.stride(0),
@@ -127,10 +125,9 @@ def gemm_a16w16(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=(bias is not None),
             activation=_get_activation_from_str(activation) if activation else "",
             use_activation=activation is not None,
-            KERNEL_NAME="_gemm_a16w16_reduce_kernel",
+            ADD_BIAS=(bias is not None),
         )
 
     return y

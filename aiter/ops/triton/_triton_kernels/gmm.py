@@ -198,7 +198,7 @@ def gmm_kernel(
                         rhs_ptrs, mask=offs_k[:, None] < k_mask_limit, other=0
                     )
 
-                acc = tl.dot(lhs, rhs, acc=acc)
+                acc += tl.dot(lhs, rhs)
 
                 lhs_ptrs += BLOCK_SIZE_K
 
@@ -360,7 +360,7 @@ def tgmm_persistent_kernel(
                 lhs = tl.load(lhs_ptrs)
                 rhs = tl.load(rhs_ptrs)
 
-                acc = tl.dot(lhs, rhs, acc=acc)
+                acc += tl.dot(lhs, rhs)
 
                 # Accumulate for bias gradient: sum lhs across M dimension
                 if COMPUTE_BIAS_GRAD and tile_n == 0:
@@ -385,7 +385,7 @@ def tgmm_persistent_kernel(
                 offs_m = loop_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
                 lhs = tl.load(lhs_ptrs, mask=offs_m[None, :] < m, other=0)
                 rhs = tl.load(rhs_ptrs, mask=offs_m[:, None] < m, other=0)
-                acc = tl.dot(lhs, rhs, acc=acc)
+                acc += tl.dot(lhs, rhs)
 
                 # Accumulate last chunk for bias gradient
                 if COMPUTE_BIAS_GRAD and tile_n == 0:
@@ -531,7 +531,7 @@ def tgmm_non_persistent_kernel(
         lhs = tl.load(lhs_ptrs)
         rhs = tl.load(rhs_ptrs)
 
-        acc = tl.dot(lhs, rhs, acc=acc)
+        acc += tl.dot(lhs, rhs)
 
         # Accumulate for bias gradient: sum lhs across M dimension
         if COMPUTE_BIAS_GRAD and tile_n == 0:
@@ -554,7 +554,7 @@ def tgmm_non_persistent_kernel(
         offs_m = loop_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         lhs = tl.load(lhs_ptrs, mask=offs_m[None, :] < m, other=0)
         rhs = tl.load(rhs_ptrs, mask=offs_m[:, None] < m, other=0)
-        acc = tl.dot(lhs, rhs, acc=acc)
+        acc += tl.dot(lhs, rhs)
         # Accumulate last chunk for bias gradient
         if COMPUTE_BIAS_GRAD and tile_n == 0:
             bias_acc += tl.sum(lhs, axis=1)

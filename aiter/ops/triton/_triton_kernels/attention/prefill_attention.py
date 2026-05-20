@@ -120,7 +120,7 @@ def _fwd_kernel(
         # mask = tl.load(mask_ptrs + start_n, mask=start_n + offs_n < cur_batch_end_loc, other=0.0)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk = tl.dot(q, k, acc=qk)
+        qk += tl.dot(q, k)
         qk *= sm_scale
 
         if IS_CAUSAL:
@@ -159,7 +159,7 @@ def _fwd_kernel(
         )
 
         p = p.to(v.dtype)
-        acc = tl.dot(p, v, acc=acc)
+        acc += tl.dot(p, v)
         # update m_i and l_i
         l_i = l_i_new
         m_i = m_i_new

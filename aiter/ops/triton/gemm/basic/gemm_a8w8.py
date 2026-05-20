@@ -6,10 +6,8 @@ import torch
 import triton
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
     _gemm_a8w8_kernel,
+    _gemm_a8w8_reduce_kernel,
     _get_config,
-)
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -115,7 +113,7 @@ def gemm_a8w8(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _gemm_a8w8_reduce_kernel[grid_reduce](
             y_pp,
             y,
             bias,
@@ -126,14 +124,11 @@ def gemm_a8w8(
             y_pp.stride(2),
             y.stride(0),
             y.stride(1),
+            bias is not None,
             BLOCK_SIZE_M=REDUCE_BLOCK_SIZE_M,
             BLOCK_SIZE_N=REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT=ACTUAL_KSPLIT,
             MAX_KSPLIT=triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=bias is not None,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_a8w8_reduce_kernel",
         )
 
     return y

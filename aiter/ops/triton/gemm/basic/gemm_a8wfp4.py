@@ -7,10 +7,8 @@ import triton
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8wfp4 import (
     _gemm_a8wfp4_kernel,
+    _gemm_afp4_wfp4_reduce_kernel,
     _get_config,
-)
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -153,10 +151,9 @@ def gemm_a8wfp4(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _gemm_afp4_wfp4_reduce_kernel[grid_reduce](
             y_pp,
             y,
-            None,
             M,
             N,
             y_pp.stride(0),
@@ -168,8 +165,4 @@ def gemm_a8wfp4(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             config["NUM_KSPLIT"],
-            ADD_BIAS=False,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_afp4_wfp4_reduce_kernel",
         )

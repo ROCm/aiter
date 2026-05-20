@@ -178,8 +178,8 @@ def _attn_fwd_inner(
         # -- compute qk ----
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if HAS_PE:
-            qk = tl.dot(q_pe, k_pe, acc=qk)
-        qk = tl.dot(q, k, acc=qk)
+            qk += tl.dot(q_pe, k_pe)
+        qk += tl.dot(q, k)
         if IS_FP8:
             qk = qk * (qk_scale * descale_q * descale_k)
         else:
@@ -256,7 +256,7 @@ def _attn_fwd_inner(
                 tl.dot((p * scale_p).to(v.type.element_ty), v) * descale_p * descale_v
             )
         else:
-            acc = tl.dot(p.to(v.type.element_ty), v, acc=acc)
+            acc += tl.dot(p.to(v.type.element_ty), v)
 
         k_ptrs += BLOCK_N * stride_kn
         if HAS_PE:

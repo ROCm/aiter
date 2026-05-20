@@ -397,6 +397,13 @@ def mla_decode_fwd(
             )
             or (
                 get_gfx() == "gfx950"
+                and nhead == 32
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q == 1
+            )
+            or (
+                get_gfx() == "gfx950"
                 and q.dtype == dtypes.bf16
                 and kv_buffer.dtype == dtypes.bf16
             )
@@ -498,6 +505,12 @@ def mla_decode_fwd(
                 o,
             )
         else:
+            torch.cuda.synchronize()
+            wm = work_meta_data.view(torch.int64)[:2].tolist()
+            print(f"[DEBUG mla] {q.shape=} {nhead=} {max_seqlen_q=} {logits.shape=} {work_indptr.shape=} {reduce_partial_map.shape=}")
+            print(f"[DEBUG mla] ptr work_meta_data=0x{work_meta_data.data_ptr():016x} work_indptr=0x{work_indptr.data_ptr():016x} work_info_set=0x{work_info_set.data_ptr():016x}")
+            print(f"[DEBUG mla] work_meta_data[:2]=[0x{wm[0]:016x}, 0x{wm[1]:016x}]")
+            print(f"[DEBUG mla] match: indptr={wm[0]==work_indptr.data_ptr()} info_set={wm[1]==work_info_set.data_ptr()}")
             aiter.mla_decode_stage1_asm_fwd(
                 q,
                 kv_buffer,

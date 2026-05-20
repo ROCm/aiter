@@ -264,7 +264,7 @@ def _fwd_grouped_kernel_stage1_rope(
 
             # (16, 512) x (512, 32)
             # dot product of nope parts
-            qk = tl.dot(q, kv, acc=qk)
+            qk += tl.dot(q, kv)
 
             qk *= sm_scale
 
@@ -287,7 +287,7 @@ def _fwd_grouped_kernel_stage1_rope(
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
             # (16, 32) x (32, 512)
-            acc = tl.dot(p.to(v.dtype), v, acc=acc)
+            acc += tl.dot(p.to(v.dtype), v)
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max

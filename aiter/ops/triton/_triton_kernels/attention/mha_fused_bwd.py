@@ -276,7 +276,7 @@ def _bwd_dkdvdq_inner(
                     * descale_do
                 )
             else:
-                dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
+                dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
             if IS_FP8:
                 scale_pT, descale_pT = _compute_fp8_scaling_factors(pT, FP8_MAX)
@@ -286,7 +286,7 @@ def _bwd_dkdvdq_inner(
                     * descale_do
                 )
             else:
-                dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
+                dv += tl.dot(pT.to(do.type.element_ty), do)
 
         # Load delta
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
@@ -312,7 +312,7 @@ def _bwd_dkdvdq_inner(
                 * descale_q
             )
         else:
-            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
+            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
 
         # We can compute the dq_partial here and do a atomic add to the correct memory location
         # NOTE: Possible problems with the atomic add: contention, is inside a loop which has achieved bad perf before

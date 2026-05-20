@@ -200,9 +200,7 @@ def _batched_gemm_a16wfp4_kernel(
                     a_bf16, BLOCK_SIZE_K, BLOCK_SIZE_M, SCALE_GROUP_SIZE
                 )
 
-            accumulator = tl.dot_scaled(
-                a, a_scales, "e2m1", b, b_scales, "e2m1", acc=accumulator
-            )
+            accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak

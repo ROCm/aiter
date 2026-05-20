@@ -158,9 +158,7 @@ def _gemm_a16wfp4_kernel(
 
             a, a_scales = _mxfp4_quant_op(a_bf16, BLOCK_SIZE_K, BLOCK_SIZE_M, 32)
 
-            accumulator = tl.dot_scaled(
-                a, a_scales, "e2m1", b, b_scales, "e2m1", acc=accumulator
-            )
+            accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -356,9 +354,7 @@ def _gemm_a16wfp4_preshuffle_kernel(
             if PREQUANT:
                 a, a_scales = _mxfp4_quant_op(a_bf16, BLOCK_SIZE_K, BLOCK_SIZE_M, 32)
 
-            accumulator = tl.dot_scaled(
-                a, a_scales, "e2m1", b, b_scales, "e2m1", acc=accumulator
-            )
+            accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak

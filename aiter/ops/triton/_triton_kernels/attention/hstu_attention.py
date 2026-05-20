@@ -489,7 +489,7 @@ def _hstu_attn_bwd_one_block(  # noqa C901
         mask=mask_m[:, None],
         other=0.0,
     )
-    dv = tl.dot(silu_trans, do, allow_tf32=ALLOW_TF32, acc=dv)
+    dv += tl.dot(silu_trans, do, allow_tf32=ALLOW_TF32)
 
     # compute dk and dq
     dqk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
@@ -500,7 +500,7 @@ def _hstu_attn_bwd_one_block(  # noqa C901
     dqk_trans = dqk_trans.to(k.dtype)
 
     # Note: the factor `alpha` is delayed until the end of the function to reduce the cost
-    dk = tl.dot(dqk_trans, tl.trans(q_trans), allow_tf32=ALLOW_TF32, acc=dk)
+    dk += tl.dot(dqk_trans, tl.trans(q_trans), allow_tf32=ALLOW_TF32)
     if ATOMIC_ADD:
         lock_id = start_m // BLOCK_M
         stride_lock = tl.cdiv(MAX_SEQ_LEN, BLOCK_M)

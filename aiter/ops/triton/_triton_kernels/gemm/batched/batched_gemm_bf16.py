@@ -145,7 +145,7 @@ def _batched_gemm_bf16_kernel(
             a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-        accumulator = tl.dot(a, b, acc=accumulator)
+        accumulator += tl.dot(a, b)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak

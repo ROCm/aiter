@@ -209,9 +209,7 @@ def _batched_gemm_afp4_wfp4_kernel(
                     b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
                 )
 
-            accumulator = tl.dot_scaled(
-                a, a_scales, "e2m1", b, b_scales, "e2m1", acc=accumulator
-            )
+            accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
 
             # Advance the ptrs to the next K block.
             a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak

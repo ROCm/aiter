@@ -448,8 +448,24 @@ def test_mla(
             num_kv_splits=split_per_batch,
         )
 
-        # print(f"{out_ref.view(total_q, -1)=}")
-        # print(f"{out_asm.view(total_q, -1)=}")
+        print(f"{out_ref.view(total_q, -1)=}")
+        print(f"{out_asm.view(total_q, -1)=}")
+        atol = 0.01
+        dim = out_ref.shape[2]
+        idxs = [0, 1, dim-2, dim-1]
+        def fmt_vals(t, h):
+            return ".. ".join(" ".join(f"{t[0, h, i].item():>9.4f}" for i in pair) for pair in [idxs[:2], idxs[2:]])
+        header = f"{'head':>4} | " + ".. ".join(" ".join(f"{'ref['+str(i)+']':>9}" for i in pair) for pair in [idxs[:2], idxs[2:]]) + " | " + ".. ".join(" ".join(f"{'asm['+str(i)+']':>9}" for i in pair) for pair in [idxs[:2], idxs[2:]]) + f" | {'max_delta':>10} {'%_diff':>10}"
+        print(header)
+        print("-" * len(header))
+        for h in range(out_ref.shape[1]):
+            ref_h = out_ref[0, h].float()
+            asm_h = out_asm[0, h].float()
+            delta = (ref_h - asm_h).abs()
+            max_delta = delta.max().item()
+            n_diff = (delta > atol).sum().item()
+            total = delta.numel()
+            print(f"{h:>4} | {fmt_vals(out_ref, h)} | {fmt_vals(out_asm, h)} | {max_delta:>10.4f} {100*n_diff/total:>9.1f}%")
         # checkAllclose(logits_ref, attn_logits,
         #               msg=f'attn_logits [golden vs aiter_asm]')
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
@@ -515,7 +531,7 @@ def test_mla(
         128,
     ]:
         err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and nhead in [8, 16, 128]:
+    elif kvtype == dtypes.fp8 and nhead in [8, 16, 32, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
 
     ret["decode:err"] = err

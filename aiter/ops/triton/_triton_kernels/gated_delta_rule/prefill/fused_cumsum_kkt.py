@@ -209,7 +209,7 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_kb = b_k * b_beta[:, None]
-        b_A = tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k), acc=b_A)
+        b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
 
     b_g_diff = b_g_cumsum[:, None] - b_g_cumsum[None, :]
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)

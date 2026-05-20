@@ -7,10 +7,8 @@ import triton
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _gemm_a8w8_blockscale_kernel,
     _gemm_a8w8_blockscale_preshuffle_kernel,
+    _gemm_a8w8_blockscale_reduce_kernel,
     _get_config,
-)
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
@@ -137,10 +135,9 @@ def gemm_a8w8_blockscale(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _gemm_a8w8_blockscale_reduce_kernel[grid_reduce](
             y_pp,
             y,
-            None,
             M,
             N,
             y_pp.stride(0),
@@ -152,10 +149,6 @@ def gemm_a8w8_blockscale(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=False,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
         )
 
     return y
@@ -294,10 +287,9 @@ def gemm_a8w8_blockscale_preshuffle(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_splitk_reduce_kernel[grid_reduce](
+        _gemm_a8w8_blockscale_reduce_kernel[grid_reduce](
             y_pp,
             y,
-            None,
             M,
             N,
             y_pp.stride(0),
@@ -309,10 +301,6 @@ def gemm_a8w8_blockscale_preshuffle(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
-            ADD_BIAS=False,
-            activation="",
-            use_activation=False,
-            KERNEL_NAME="_gemm_a8w8_blockscale_reduce_kernel",
         )
 
     return y

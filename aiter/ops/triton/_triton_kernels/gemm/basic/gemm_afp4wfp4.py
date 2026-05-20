@@ -715,6 +715,65 @@ def _gemm_afp4wfp4_preshuffle_kernel(
         tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
 
 
+_gemm_afp4wfp4_reduce_repr = make_kernel_repr(
+    "_gemm_afp4wfp4_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
+
+
+@triton.heuristics({})  # dummy heuristics to invoke kernel re-naming
+@triton.jit(repr=_gemm_afp4wfp4_reduce_repr)
+def _gemm_afp4wfp4_reduce_kernel(
+    c_in_ptr,
+    c_out_ptr,
+    M,
+    N,
+    stride_c_in_k,
+    stride_c_in_m,
+    stride_c_in_n,
+    stride_c_out_m,
+    stride_c_out_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    ACTUAL_KSPLIT: tl.constexpr,
+    MAX_KSPLIT: tl.constexpr,
+):
+
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, MAX_KSPLIT)
+    c_in_ptrs = (
+        c_in_ptr
+        + (offs_k[:, None, None] * stride_c_in_k)
+        + (offs_m[None, :, None] * stride_c_in_m)
+        + (offs_n[None, None, :] * stride_c_in_n)
+    )
+
+    if ACTUAL_KSPLIT == MAX_KSPLIT:
+        c = tl.load(c_in_ptrs)
+    else:
+        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT)
+    c = tl.sum(c, axis=0)
+
+    c = c.to(c_out_ptr.type.element_ty)
+
+    c_out_ptrs = (
+        c_out_ptr
+        + (offs_m[:, None] * stride_c_out_m)
+        + (offs_n[None, :] * stride_c_out_n)
+    )
+
+    tl.store(c_out_ptrs, c)
+
+
 def _get_config(
     M: int,
     N: int,

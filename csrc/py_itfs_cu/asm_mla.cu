@@ -162,6 +162,18 @@ void mla_decode_stage1_asm_fwd(
 
         if (work_meta_data != nullptr)
         {
+            // work_meta_data[0:1] must always reflect the current work_indptr and
+            // work_info_set data_ptrs. When the caller deep-copies tensors for
+            // benchmark rotation, the copied work_meta_data retains stale pointers
+            // from the original allocation, so we refresh them unconditionally here.
+            AITER_CHECK(work_indptr != nullptr && work_info_set != nullptr,
+                        __func__, ": work_indptr and work_info_set must be provided");
+            uint64_t meta_ptrs[2] = {
+                (uint64_t)work_indptr->data_ptr(),
+                (uint64_t)work_info_set->data_ptr(),
+            };
+            hipMemcpyAsync(work_meta_data->data_ptr(), meta_ptrs, 2 * sizeof(uint64_t),
+                           hipMemcpyHostToDevice, stream);
             args.ptr_STP = work_meta_data->data_ptr();
         }
         else
@@ -328,9 +340,12 @@ void mla_decode_stage1_asm_fwd(
             } else if((max_seqlen_q == 2) && persistent){
                 config_max_seqlen_q = 2;
                 sub_Q = 128;
+            } else if((max_seqlen_q == 1) && persistent){
+                config_max_seqlen_q = 1;
+                sub_Q = 32;
             } else {
-                AITER_CHECK(false, __func__, 
-                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=2,4 in persistent mode");
+                AITER_CHECK(false, __func__,
+                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=1,2,4 in persistent mode");
             }
         }
     } else if (gqa_ratio == 64){

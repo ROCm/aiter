@@ -186,7 +186,7 @@ def _attn_fwd_inner(
     if IS_FP8:
         qk += tl.dot(q, kT) * q_descale * k_descale  # Apply FP8 scaling
     else:
-        qk = tl.dot(q, kT, acc=qk)  # noqa: F821
+        qk += tl.dot(q, kT)  # noqa: F821
 
     if USE_ALIBI:
         row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -270,7 +270,7 @@ def _attn_fwd_inner(
     if IS_FP8:
         acc += tl.dot(p.to(v.dtype), v) * v_descale  # Apply FP8 scaling for V
     else:
-        acc = tl.dot(p.to(v.dtype), v, acc=acc)
+        acc += tl.dot(p.to(v.dtype), v)
 
     return m_i, l_i, acc
 

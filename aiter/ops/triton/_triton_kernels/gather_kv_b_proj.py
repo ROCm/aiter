@@ -324,14 +324,14 @@ def _triton_gather_kv_b_proj(
         )
 
         if NO_SCALE:
-            accum_k = tl.dot(kv_c_data_0, k_nope_weight_0.T, acc=accum_k)
-            accum_v = tl.dot(kv_c_data_0, v_nope_weight_0.T, acc=accum_v)
-            accum_k = tl.dot(kv_c_data_1, k_nope_weight_1.T, acc=accum_k)
-            accum_v = tl.dot(kv_c_data_1, v_nope_weight_1.T, acc=accum_v)
-            accum_k = tl.dot(kv_c_data_2, k_nope_weight_2.T, acc=accum_k)
-            accum_v = tl.dot(kv_c_data_2, v_nope_weight_2.T, acc=accum_v)
-            accum_k = tl.dot(kv_c_data_3, k_nope_weight_3.T, acc=accum_k)
-            accum_v = tl.dot(kv_c_data_3, v_nope_weight_3.T, acc=accum_v)
+            accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T)
+            accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T)
+            accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T)
+            accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T)
+            accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T)
+            accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T)
+            accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T)
+            accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T)
         elif PER_ROW_SCALE:
             accum_k += (
                 tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_vec[None, :]

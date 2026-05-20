@@ -234,7 +234,7 @@ def _kernel_unified_attention_sparse_mla_2d(
             cache_modifier=KV_cache_modifier,
         )
 
-        acc = tl.dot(P.to(V_lora.dtype), V_lora, acc=acc)
+        acc += tl.dot(P.to(V_lora.dtype), V_lora)
 
     # epilogue
     one_over_L = 1.0 / L[:, None]
