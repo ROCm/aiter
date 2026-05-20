@@ -43,7 +43,6 @@ import sys
 import pandas as pd
 import torch
 from aiter import dtypes, logger
-from aiter.jit.core import AITER_ROOT_DIR
 from aiter.utility.base_tuner import GemmCommonTuner, INVALID_TIME
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.opus.gemm_op_a16w16 import (
@@ -275,19 +274,6 @@ def kid_rejects_shape(k_inst, M, N, K):
             if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
                 return True
         return False
-
-    if k_inst.kernel_tag == "a16w16_kspl":
-        # Experimental wave-producer pipeline (kid 2300 today). It is a
-        # demo / WIP -- the gmem buffer-resource OOB clamp that the
-        # persistent pipeline carries is not yet ported, so kspl will
-        # GPU memory-access-fault on shapes where the swizzle's tile
-        # coverage exceeds the launcher grid. Confirmed via the 6144^3
-        # probe sweep where every other 213 candidates passed and only
-        # kid 2300 produced a hard memory access fault. Reject the
-        # entire tag unconditionally until kspl's OOB story matches
-        # persistent. Remove this block once the kspl pipeline is
-        # finished.
-        return True
 
     return False
 

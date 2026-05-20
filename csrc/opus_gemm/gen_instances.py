@@ -28,7 +28,6 @@ PIPELINE_HEADER_MAP = {
     "a16w16_flatmm": "gfx950/opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh",
-    "a16w16_kspl": "gfx950/opus_gemm_pipeline_a16w16_kspl_gfx950.cuh",
 }
 
 # Traits header carries the traits struct + kargs struct definitions for a
@@ -45,7 +44,6 @@ TRAITS_HEADER_MAP = {
     "a16w16_flatmm": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
-    "a16w16_kspl": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
 }
 
 # Splitk reduce kernel is shared infrastructure used by every
@@ -61,7 +59,6 @@ KERNEL_FUNC_MAP = {
     "a16w16_flatmm": "gemm_a16w16_flatmm_kernel",
     "a16w16_flatmm_splitk": "gemm_a16w16_flatmm_splitk_kernel",
     "a16w16_persistent": "gemm_a16w16_persistent_kernel",
-    "a16w16_kspl": "gemm_a16w16_kspl_kernel",
 }
 
 INPUT_DTYPE_MAP = {
@@ -71,7 +68,6 @@ INPUT_DTYPE_MAP = {
     "a16w16_flatmm": ("bf16_t", "bf16_t"),
     "a16w16_flatmm_splitk": ("bf16_t", "bf16_t"),
     "a16w16_persistent": ("bf16_t", "bf16_t"),
-    "a16w16_kspl": ("bf16_t", "bf16_t"),
 }
 
 # Tags whose launchers take 3 torch tensors (XQ, WQ, Y) + int splitK. Splitk
@@ -83,7 +79,6 @@ NOSCALE_TAGS = {
     "a16w16_flatmm",
     "a16w16_flatmm_splitk",
     "a16w16_persistent",
-    "a16w16_kspl",
 }
 
 # a16w16-family tags whose launchers land in opus_gemm_a16w16_tune_lookup.h
@@ -95,7 +90,6 @@ A16W16_TUNE_TAGS = {
     "a16w16_flatmm",
     "a16w16_flatmm_splitk",
     "a16w16_persistent",
-    "a16w16_kspl",
 }
 
 TRAITS_NAME_MAP = {
@@ -105,7 +99,6 @@ TRAITS_NAME_MAP = {
     "a16w16_flatmm": "opus_gemm_a16w16_flatmm_traits_gfx950",
     "a16w16_flatmm_splitk": "opus_flatmm_splitk_traits_gfx950",
     "a16w16_persistent": "opus_gemm_a16w16_persistent_traits_gfx950",
-    "a16w16_kspl": "opus_gemm_a16w16_kspl_traits_gfx950",
 }
 
 KARGS_NAME_MAP = {
@@ -115,7 +108,6 @@ KARGS_NAME_MAP = {
     "a16w16_flatmm": "opus_gemm_flatmm_kargs_gfx950",
     "a16w16_flatmm_splitk": "opus_gemm_flatmm_splitk_kargs_gfx950",
     "a16w16_persistent": "opus_gemm_persistent_kargs_gfx950",
-    "a16w16_kspl": "opus_gemm_persistent_kargs_gfx950",  # reused (same fields)
 }
 
 WARP_SIZE = 64
@@ -587,17 +579,6 @@ class opus_gemm_codegen:
                 f"  LDS={info['lds_bytes'] // 1024}KiB"
                 f"  K>={info['min_k']}"
             )
-        elif k.kernel_tag == "a16w16_kspl":
-            # kspl shares persistent's shape constraints (8-wave WG,
-            # 2-deep LDS, MFMA 16x16x32, etc.). Validation reuses the
-            # persistent validator.
-            info = self._validate_a16w16_persistent(k)
-            print(
-                f"  [kspl] {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
-                f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
-                f"  LDS={info['lds_bytes'] // 1024}KiB"
-                f"  K>={info['min_k']}"
-            )
         elif k.kernel_tag == "a16w16_flatmm":
             info = self._validate_a16w16_flatmm(k)
             print(
@@ -650,20 +631,6 @@ class opus_gemm_codegen:
                 kargs_name,
             )
         elif k.kernel_tag == "a16w16_persistent":
-            self._gen_persistent_instance(
-                k,
-                pipeline_header,
-                traits_header,
-                kernel_func,
-                da,
-                db,
-                traits_name,
-                kargs_name,
-            )
-        elif k.kernel_tag == "a16w16_kspl":
-            # kspl shares the same launcher signature (XQ, WQ, Y, bias, splitK),
-            # same kargs (opus_gemm_persistent_kargs_gfx950), same grid heuristic
-            # as persistent. Re-use the persistent codegen path.
             self._gen_persistent_instance(
                 k,
                 pipeline_header,

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-import json
 import os
 from dataclasses import dataclass, field
 from typing import List
@@ -61,8 +60,6 @@ class OpusGemmInstance:
             parts.append(f"wgpcu{self.WG_PER_CU}")
         elif self.kernel_tag == "a16w16_persistent":
             parts.insert(1, "persistent")
-        elif self.kernel_tag == "a16w16_kspl":
-            parts.insert(1, "kspl")
         if not self.has_oob:
             parts.append("nooob")
         # Legacy cache policy = traits default for split-barrier &
@@ -413,36 +410,6 @@ a16w16_persistent_kernels_list_cpol_nooob = {
     for kid, inst in a16w16_persistent_kernels_list_cpol.items()
 }
 
-# ─── a16w16 K-split (kspl) DEMO ──────────────────────────────────────────────
-# Experimental wave-producer pipeline parallel to persistent. KID 2300 only
-# (single tile, single cpol, has_oob). Not in heuristic dispatch; tune-only.
-# Not yet exhaustively tile-sweep'd; intent is to A/B vs persistent KID 300.
-
-
-def _a16w16_kspl(bm, bn, bk, has_oob=True, cachectl_a=0, cachectl_b=17):
-    vec = 16 // 2
-    inst = OpusGemmInstance(
-        512,         # BLOCK_SIZE
-        bm, bn, bk,  # BLOCK
-        2, 4,        # T_M, T_N
-        16, 16, 32,  # W_M, W_N, W_K
-        vec, vec, 4, # VEC
-        0, 0, 0,     # GROUP (unused)
-        "a16w16_kspl",
-        ["bf16_t", "fp32_t"],
-        has_oob=has_oob,
-    )
-    inst.cachectl_a = cachectl_a
-    inst.cachectl_b = cachectl_b
-    return inst
-
-
-a16w16_kspl_kernels_list = {
-    # KID 2300 = K-split demo, 256x256x64, has_oob, legacy cachectl.
-    2300: _a16w16_kspl(256, 256, 64),
-}
-
-
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
     **a8w8_scale_kernels_list,
@@ -458,7 +425,6 @@ kernels_list = {
     **a16w16_persistent_kernels_list_cpol,
     **a16w16_persistent_kernels_list_nooob,
     **a16w16_persistent_kernels_list_cpol_nooob,
-    **a16w16_kspl_kernels_list,
 }
 
 default_kernels_dict = {
@@ -488,8 +454,8 @@ SPLITK_KIDS = frozenset(a16w16_flatmm_splitk_kernels_list.keys()) | frozenset(
 )
 
 # Non-splitk a16w16-family kids: split-barrier 4..9 + cpol/nooob mirrors,
-# persistent 300..315 + cpol/nooob mirrors, kspl 2300.
-# Note: persistent / kspl currently do NOT support bias.
+# persistent 300..315 + cpol/nooob mirrors.
+# Note: persistent currently does NOT support bias.
 NON_SPLITK_KIDS = (
     frozenset(a16w16_kernels_list.keys())
     | frozenset(a16w16_kernels_list_nooob.keys())
@@ -499,12 +465,11 @@ NON_SPLITK_KIDS = (
     | frozenset(a16w16_persistent_kernels_list_cpol.keys())
     | frozenset(a16w16_persistent_kernels_list_nooob.keys())
     | frozenset(a16w16_persistent_kernels_list_cpol_nooob.keys())
-    | frozenset(a16w16_kspl_kernels_list.keys())
 )
 
 # Bias-aware kids: split-barrier (4..9 + cpol/nooob mirrors) and the entire
-# splitk family. Persistent / kspl are excluded because their launchers
-# currently reject any non-empty bias up front.
+# splitk family. Persistent is excluded because its launcher currently
+# rejects any non-empty bias up front.
 BIAS_AWARE_KIDS = (
     frozenset(a16w16_kernels_list.keys())
     | frozenset(a16w16_kernels_list_nooob.keys())
@@ -535,8 +500,6 @@ HEURISTIC_DEFAULT_KIDS = frozenset(
         # persistent fallback (large M, tile-aligned)
         300,
         1300,  # persistent (256, 256, 64)
-        # K-split DEMO (experimental, opt-in via explicit kid).
-        2300,  # kspl (256, 256, 64), has_oob, legacy cachectl
     }
 )
 
