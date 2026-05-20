@@ -442,7 +442,6 @@ else:
         "einops",
         "psutil",
         "packaging",
-        "triton>=3.6.0",
         FLYDSL_VERSION,
     ]
 

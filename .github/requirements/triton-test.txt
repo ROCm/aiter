@@ -1,8 +1,4 @@
-# Primary dep: triton wheel from AMD's index, paired with the ROCm base image.
-# Bump with:
-#   pip index versions triton --index-url https://pypi.amd.com/triton/rocm-7.2.0/simple/
---extra-index-url https://pypi.amd.com/triton/rocm-7.2.0/simple/
-triton==3.7.0+amd.rocm7.2.0.gitd1660454
+# Triton is installed via .github/scripts/install_triton.sh (auto-detects ROCm version).
 
 # Build deps (needed for --no-build-isolation editable install).
 setuptools>=45

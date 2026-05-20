@@ -11,8 +11,8 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
     _gemm_afp8wfp8_preshuffle_kernel,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
-    _gemm_a8w8_blockscale_reduce_kernel,
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
 )
 
 # -----------------------------------------------------------------------------
@@ -138,9 +138,10 @@ def gemm_afp8wfp8(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_a8w8_blockscale_reduce_kernel[grid_reduce](
+        _gemm_splitk_reduce_kernel[grid_reduce](
             y_pp,
             y,
+            None,
             M,
             N,
             y_pp.stride(0),
@@ -148,10 +149,14 @@ def gemm_afp8wfp8(
             y_pp.stride(2),
             y.stride(0),
             y.stride(1),
-            REDUCE_BLOCK_SIZE_M,
-            REDUCE_BLOCK_SIZE_N,
-            ACTUAL_KSPLIT,
-            triton.next_power_of_2(config["NUM_KSPLIT"]),
+            BLOCK_SIZE_M=REDUCE_BLOCK_SIZE_M,
+            BLOCK_SIZE_N=REDUCE_BLOCK_SIZE_N,
+            ACTUAL_KSPLIT=ACTUAL_KSPLIT,
+            MAX_KSPLIT=triton.next_power_of_2(config["NUM_KSPLIT"]),
+            ADD_BIAS=False,
+            activation=None,
+            use_activation=False,
+            KERNEL_NAME="_gemm_afp8wfp8_reduce_kernel",
         )
 
     return y
@@ -258,9 +263,10 @@ def gemm_afp8wfp8_preshuffle(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_a8w8_blockscale_reduce_kernel[grid_reduce](
+        _gemm_splitk_reduce_kernel[grid_reduce](
             y_pp,
             y,
+            None,
             M,
             N,
             y_pp.stride(0),
@@ -268,10 +274,14 @@ def gemm_afp8wfp8_preshuffle(
             y_pp.stride(2),
             y.stride(0),
             y.stride(1),
-            REDUCE_BLOCK_SIZE_M,
-            REDUCE_BLOCK_SIZE_N,
-            ACTUAL_KSPLIT,
-            triton.next_power_of_2(config["NUM_KSPLIT"]),
+            BLOCK_SIZE_M=REDUCE_BLOCK_SIZE_M,
+            BLOCK_SIZE_N=REDUCE_BLOCK_SIZE_N,
+            ACTUAL_KSPLIT=ACTUAL_KSPLIT,
+            MAX_KSPLIT=triton.next_power_of_2(config["NUM_KSPLIT"]),
+            ADD_BIAS=False,
+            activation=None,
+            use_activation=False,
+            KERNEL_NAME="_gemm_afp8wfp8_preshuffle_reduce_kernel",
         )
 
     return y
