@@ -2621,6 +2621,7 @@ def run_batch_prefill_kv_blockscale(
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("table_layout", ["sglang", "vllm"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("page_size", [64, 1024])
 def test_batch_prefill_per_token_head_pytest(
     batch_size,
     num_qo_heads,
@@ -2631,6 +2632,7 @@ def test_batch_prefill_per_token_head_pytest(
     causal,
     table_layout,
     logits_soft_cap,
+    page_size,
 ):
     """Pytest wrapper for PER_TOKEN_HEAD FP8 batch prefill test.
 
@@ -2648,7 +2650,7 @@ def test_batch_prefill_per_token_head_pytest(
         batch_size=batch_size,
         qo_len=qo_len,
         kv_len=kv_len,
-        page_size=1024,
+        page_size=page_size,
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
@@ -2688,9 +2690,11 @@ def run_batch_prefill_per_token_head(
         torch.manual_seed(seed)
 
     quant_dtype = dtypes.fp8
-    if page_size != 1024:
+    SUPPORTED_PAGE_SIZES = (64, 1024)
+    if page_size not in SUPPORTED_PAGE_SIZES:
         if skip_test_if(
-            True, f"PER_TOKEN_HEAD only supports page_size=1024, got {page_size}"
+            True,
+            f"PER_TOKEN_HEAD only supports page_size in {SUPPORTED_PAGE_SIZES}, got {page_size}",
         ):
             return {"status": "skipped"}
 

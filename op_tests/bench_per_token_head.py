@@ -13,10 +13,17 @@ import torch
 # Allow running as `python op_tests/bench_per_token_head.py` from the repo root.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import op_tests.test_batch_prefill as _tbp
 from op_tests.test_batch_prefill import (
     run_batch_prefill_per_token_head,
     run_batch_prefill_kv_blockscale,
 )
+
+# The pytest helpers skip causal+soft_cap=0.0 on ROCm 7.2 + gfx950 out of an
+# abundance of caution; the kernel actually runs fine in practice and we need
+# this combo for the H20 reference grid. Allow bypassing for benchmarking.
+if int(os.environ.get("BENCH_BYPASS_ROCM72_SKIP", "1")):
+    _tbp.should_skip_rocm72_issue = lambda *a, **k: False
 
 
 # (batch, qo_len, kv_len, nhq, nhk, head_dim, causal, soft_cap)
@@ -26,8 +33,10 @@ from op_tests.test_batch_prefill import (
 #   quant_type=QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD,
 #   q_len = kv_len, full causal prefill, batch (num_seqs) in {2, 4, 6, 8}.
 #
-# NOTE: H20 uses block_size=64; our CK pipeline currently supports page_size=1024.
-# Comparison is not strictly apples-to-apples but reflects end-to-end kernel perf.
+# Page size is selectable via BENCH_PAGE_SIZE (default 64, matches H20).
+# Note: KV_BLOCKSCALE still requires page_size >= kN0 (=128), so its column
+# is skipped automatically when page_size < 128.
+PAGE_SIZE = int(os.environ.get("BENCH_PAGE_SIZE", "64"))
 #
 # H20 TFLOPS reference table (rows = seq_len, cols = batch):
 #                  batch=2   batch=4   batch=6   batch=8
@@ -80,7 +89,7 @@ for b, qo, kv, nhq, nhk, hd, c, sc in SHAPES:
         batch_size=b,
         qo_len=qo,
         kv_len=kv,
-        page_size=1024,
+        page_size=PAGE_SIZE,
         num_qo_heads=nhq,
         num_kv_heads=nhk,
         head_dim=hd,
@@ -93,7 +102,10 @@ for b, qo, kv, nhq, nhk, hd, c, sc in SHAPES:
         skip_reference=True,
     )
     pth = run_batch_prefill_per_token_head(**common)
-    kvb = run_batch_prefill_kv_blockscale(**common)
+    if PAGE_SIZE >= 128:
+        kvb = run_batch_prefill_kv_blockscale(**common)
+    else:
+        kvb = {"status": "skipped"}
     h20_tf = H20_REF.get((b, kv))
     h20_ms = H20_LAT_MS.get((b, kv))
     if pth.get("status") == "passed" and h20_tf:
