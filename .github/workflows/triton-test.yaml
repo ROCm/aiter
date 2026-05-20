@@ -15,6 +15,8 @@ on:
       - ".github/scripts/build_aiter_triton.sh"
       - ".github/scripts/select_triton_tests.py"
       - ".github/scripts/split_tests.sh"
+      - ".github/scripts/verify_triton_pin.py"
+      - ".github/requirements/triton-test.txt"
   workflow_dispatch:
 
 concurrency:
@@ -132,29 +134,11 @@ jobs:
           --name triton_test \
           ${{ env.DOCKER_IMAGE }}
 
-      - name: Setup pip config
-        run: |
-          docker exec -u root triton_test bash -c "pip config set global.default-timeout 60"
-          docker exec -u root triton_test bash -c "pip config set global.retries 10"
-
       - name: Setup Aiter and Triton
         run: |
           set -ex
           echo "Setting up Aiter and Triton..."
-          docker exec \
-          -e BUILD_TRITON=0 \
-          -w /workspace \
-          triton_test \
-          ./.github/scripts/build_aiter_triton.sh
-
-      - name: Install Pytest
-        run: |
-          set -ex
-          echo "Installing Pytest..."
-          docker exec \
-          -w /workspace \
-          triton_test \
-          pip install pytest
+          docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.sh
 
       # TODO: Uncomment [docker exec -w /workspace triton_test cat "${ENV_FILE}" >> "${GITHUB_ENV}"]
       #       command to enable test selection.
@@ -202,7 +186,7 @@ jobs:
   triton-mi300x:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
     name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
-    runs-on: linux-aiter-mi300x-1
+    runs-on: aiter-1gpu-runner
     needs: [split_triton_tests, check-signal]
     strategy:
       fail-fast: false
@@ -274,29 +258,11 @@ jobs:
           --name triton_test \
           ${{ env.DOCKER_IMAGE }}
 
-      - name: Setup pip config
-        run: |
-          docker exec -u root triton_test bash -c "pip config set global.default-timeout 60"
-          docker exec -u root triton_test bash -c "pip config set global.retries 10"
-
       - name: Setup Aiter and Triton
         run: |
           set -ex
           echo "Setting up Aiter and Triton..."
-          docker exec \
-          -e BUILD_TRITON=0 \
-          -w /workspace \
-          triton_test \
-          ./.github/scripts/build_aiter_triton.sh
-
-      - name: Install Pytest
-        run: |
-          set -ex
-          echo "Installing Pytest..."
-          docker exec \
-          -w /workspace \
-          triton_test \
-          pip install pytest
+          docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.sh
 
       - name: Triton Tests
         run: |
