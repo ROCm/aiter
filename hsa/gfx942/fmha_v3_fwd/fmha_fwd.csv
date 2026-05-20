@@ -27,3 +27,4 @@ fp8bf16,128,128,0,0,1,256,64,_ZN5aiter18fmha_fwd_hd128_fp8E,fwd_hd128_fp8.co
 fp8bf16,128,128,2,0,1,256,64,_ZN5aiter25fmha_fwd_hd128_fp8_causalE,fwd_hd128_fp8_causal.co
 fp8bf16,128,128,0,1,1,256,64,_ZN5aiter24fmha_fwd_hd128_fp8_groupE,fwd_hd128_fp8_group.co
 fp8bf16,128,128,2,1,1,256,64,_ZN5aiter31fmha_fwd_hd128_fp8_causal_groupE,fwd_hd128_fp8_causal_group.co
+i8fp8bf16,128,128,0,0,1,256,64,_ZN5aiter20fmha_fwd_hd128_i8fp8E,fwd_hd128_i8fp8.co

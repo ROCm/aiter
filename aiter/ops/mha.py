@@ -1309,7 +1309,7 @@ def _flash_attn_forward(
         return ret
 
     def is_fmha_v3_i8fp8():
-        ret = get_gfx() == "gfx950"
+        ret = get_gfx() in ("gfx942", "gfx950")
         ret = ret and (hdim_q == 128)
         ret = ret and (q.dtype == torch.int8)
         ret = ret and (k.dtype == torch.int8)
