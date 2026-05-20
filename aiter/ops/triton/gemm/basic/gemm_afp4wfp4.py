@@ -14,7 +14,11 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
     _gemm_afp4wfp4_reduce_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.jit.utils.torch_guard import torch_compile_guard
+
+import os
+from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 _LOGGER = AiterTritonLogger()
 
@@ -407,6 +411,7 @@ def gemm_afp4wfp4_preshuffle(
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
+    use_aot: Optional[bool] = True,
     skip_reduce: Optional[bool] = False,
 ) -> torch.Tensor:
     """
@@ -488,28 +493,60 @@ def gemm_afp4wfp4_preshuffle(
         ),
     )
 
-    _gemm_afp4wfp4_preshuffle_kernel[grid](
-        x,
-        w,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
-        x_scales,
-        w_scales,
-        M,
-        N,
-        K,
-        x.stride(0),
-        x.stride(1),
-        w.stride(0),
-        w.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
-        x_scales.stride(0),
-        x_scales.stride(1),
-        w_scales.stride(0),
-        w_scales.stride(1),
-        **config,
-    )
+    M_POW2 = triton.next_power_of_2(M)
+    if M < 32 and M_POW2 > 16:
+        M_POW2 = 16
+    metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/gemm/aot/{_gemm_afp4wfp4_preshuffle_kernel.fn.__name__}_M={M_POW2}-N={N}-K={K*2}"
+    if use_aot and os.path.exists(metadata_pth):
+        with AOTMetadataContext(
+            _gemm_afp4wfp4_preshuffle_kernel.fn.__name__,
+            f"{metadata_pth}",
+        ):
+            _gemm_afp4wfp4_preshuffle_kernel[grid](
+                x,
+                w,
+                y if config["NUM_KSPLIT"] == 1 else y_pp,
+                x_scales,
+                w_scales,
+                M,
+                N,
+                K,
+                x.stride(0),
+                x.stride(1),
+                w.stride(0),
+                w.stride(1),
+                0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+                y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+                y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+                x_scales.stride(0),
+                x_scales.stride(1),
+                w_scales.stride(0),
+                w_scales.stride(1),
+                **config,
+            )
+    else:
+        _gemm_afp4wfp4_preshuffle_kernel[grid](
+            x,
+            w,
+            y if config["NUM_KSPLIT"] == 1 else y_pp,
+            x_scales,
+            w_scales,
+            M,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            w.stride(0),
+            w.stride(1),
+            0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
+            y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
+            y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+            x_scales.stride(0),
+            x_scales.stride(1),
+            w_scales.stride(0),
+            w_scales.stride(1),
+            **config,
+        )
 
     if return_y_pp:
         return y_pp
@@ -552,6 +589,7 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
     dtype: Optional[torch.dtype] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
+    use_aot: Optional[bool] = True,
 ):
     """
     This this a backward-compatible API and will be deprecated in future release
@@ -559,4 +597,4 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
     _LOGGER.info(
         "gemm_afp4wfp4_preshuffled_weight_scales will be deprecated in future AITER release, please switch to gemm_afp4wfp4_preshuffle"
     )
-    return gemm_afp4wfp4_preshuffle(x, w, x_scales, w_scales, dtype, y, config)
+    return gemm_afp4wfp4_preshuffle(x, w, x_scales, w_scales, dtype, y, config, use_aot)

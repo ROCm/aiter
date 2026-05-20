@@ -368,7 +368,6 @@ def varlen_fwd(
     softcap: float,
     return_softmax: bool,
     gen_: Optional[torch.Tensor] = None,
-    num_splits: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
 
     if str(q.dtype).startswith("torch.float8"):
@@ -391,10 +390,6 @@ def varlen_fwd(
     if seqused_k is not None:
         raise NotImplementedError(
             "seqused_k is not supported in AMD Triton FA2 varlen_fwd."
-        )
-    if num_splits not in (0, 1):
-        raise NotImplementedError(
-            "num_splits > 1 not supported in AMD Triton FA2 varlen_fwd."
         )
 
     if DEBUG:
