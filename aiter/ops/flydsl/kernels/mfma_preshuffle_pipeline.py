@@ -773,7 +773,6 @@ __all__ = [
     "make_preshuffle_scale_layout",
     "load_b_pack_k32",
     "extract_bf16_scale",
-    "load_b_raw_mxfp4",
     "load_b_raw_mxfp4_dwordx4",
     "load_b_raw_w4a16",
     "load_b_raw_w4a16_groupwise",

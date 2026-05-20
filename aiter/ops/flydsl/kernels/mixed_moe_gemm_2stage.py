@@ -1040,11 +1040,10 @@ def compile_mixed_moe_gemm1(
                 m_repeat = tile_m // 16
                 k_unroll = (tile_k_bytes // 64) // _k_batch
 
-                _pad_k_elems = (
-                    (model_dim_pad % tile_k)
-                    if (not _is_splitk and _k_batch == 1 and model_dim_pad > 0)
-                    else 0
-                )
+                if const_expr(not _is_splitk and _k_batch == 1 and model_dim_pad > 0):
+                    _pad_k_elems = model_dim_pad % tile_k
+                else:
+                    _pad_k_elems = 0
                 _pad_ku_skip = _pad_k_elems // 32
                 _tail_ku = k_unroll - _pad_ku_skip
                 _tail_k0_count = (_tail_ku + 3) // 4 if _pad_ku_skip > 0 else None

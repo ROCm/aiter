@@ -9,11 +9,11 @@ Tests:
   - End-to-end (stage1 -> stage2 combined)
 
 Usage:
-    python aiter/ops/flydsl/test_flydsl_moe_a16w4.py                   # all tests
-    python aiter/ops/flydsl/test_flydsl_moe_a16w4.py --stage stage1    # stage1 only
-    python aiter/ops/flydsl/test_flydsl_moe_a16w4.py --stage stage2    # stage2 only
-    python aiter/ops/flydsl/test_flydsl_moe_a16w4.py --stage e2e       # end-to-end only
-    python aiter/ops/flydsl/test_flydsl_moe_a16w4.py -t 16 -t 128     # specific token counts
+    python op_tests/flydsl_tests/test_flydsl_moe_a16w4.py                   # all tests
+    python op_tests/flydsl_tests/test_flydsl_moe_a16w4.py --stage stage1    # stage1 only
+    python op_tests/flydsl_tests/test_flydsl_moe_a16w4.py --stage stage2    # stage2 only
+    python op_tests/flydsl_tests/test_flydsl_moe_a16w4.py --stage e2e       # end-to-end only
+    python op_tests/flydsl_tests/test_flydsl_moe_a16w4.py -t 16 -t 128     # specific token counts
 """
 
 import argparse
@@ -33,7 +33,7 @@ from aiter.utility.fp4_utils import (
     e8m0_shuffle,
 )
 
-torch.set_default_device("cuda")
+_CUDA = torch.device("cuda")
 
 Q_TYPE = QuantType.per_1x32
 Q_DTYPE_W = dtypes.fp4x2
@@ -60,10 +60,10 @@ def _generate_a16w4_data(
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
 
-    inp = torch.randn((token, model_dim), dtype=dtype) / 10
-    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
-    score = torch.randn((token, E), dtype=dtype)
+    inp = torch.randn((token, model_dim), dtype=dtype, device=_CUDA) / 10
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device=_CUDA) / 10
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device=_CUDA) / 10
+    score = torch.randn((token, E), dtype=dtype, device=_CUDA)
     topk_weights, topk_ids = fused_topk(inp, score, topk, True)
 
     # Quantize weights only (a16w4: activations stay in bf16)
@@ -188,7 +188,7 @@ def test_flydsl_stage1_a16w4(
     E: int = 64,
     topk: int = 4,
     block_m: int = 32,
-    k_batch: int = 1,
+    k_batch_intra_block: int = 1,
     atol: float = 1.0,
     rtol: float = 0.05,
 ):
@@ -197,7 +197,7 @@ def test_flydsl_stage1_a16w4(
     print(f"\n{'='*70}")
     print(
         f"[TEST] FlyDSL stage1 A16W4: token={token}, dim=({model_dim},{inter_dim}), "
-        f"E={E}, topk={topk}, block_m={block_m}, k_batch={k_batch}"
+        f"E={E}, topk={topk}, block_m={block_m}, k_batch_intra_block={k_batch_intra_block}"
     )
     print(f"{'='*70}")
 
@@ -228,13 +228,18 @@ def test_flydsl_stage1_a16w4(
         w1_scale=data["w1_scale_shuf"],
         a1_scale=None,
         sorted_weights=data["sorted_weights_s1"],
-        k_batch=k_batch,
+        k_batch_intra_block=k_batch_intra_block,
     )
     torch.cuda.synchronize()
 
     ref = data["ref_stage1"]
     print(f"  ref shape: {ref.shape}, out shape: {out.shape}")
-    return _check_result(ref, out, "stage1_a16w4", atol=atol, rtol=rtol)
+    passed, max_delta, pct_close = _check_result(
+        ref, out, "stage1_a16w4", atol=atol, rtol=rtol
+    )
+    assert (
+        passed
+    ), f"stage1_a16w4 FAIL: max_delta={max_delta:.4f}, {pct_close:.1f}% close"
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +300,12 @@ def test_flydsl_stage2_a16w4(
 
     ref = data["ref_stage2"]
     print(f"  ref shape: {ref.shape}, out shape: {out.shape}")
-    return _check_result(ref, out, f"stage2_a16w4_{mode}", atol=atol, rtol=rtol)
+    passed, max_delta, pct_close = _check_result(
+        ref, out, f"stage2_a16w4_{mode}", atol=atol, rtol=rtol
+    )
+    assert (
+        passed
+    ), f"stage2_a16w4_{mode} FAIL: max_delta={max_delta:.4f}, {pct_close:.1f}% close"
 
 
 # ---------------------------------------------------------------------------
@@ -378,9 +388,12 @@ def test_flydsl_e2e_a16w4(
 
     ref = data["ref_stage2"]
     print(f"  ref shape: {ref.shape}, e2e_out shape: {e2e_out.shape}")
-    return _check_result(
+    passed, max_delta, pct_close = _check_result(
         ref, e2e_out, f"e2e_a16w4_{mode}", atol=atol, rtol=rtol, pass_pct=90.0
     )
+    assert (
+        passed
+    ), f"e2e_a16w4_{mode} FAIL: max_delta={max_delta:.4f}, {pct_close:.1f}% close"
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +424,7 @@ def main():
         type=int,
         nargs="+",
         default=[1],
-        help="k_batch (split-K) values for stage1 sweep (default: 1)",
+        help="k_batch_intra_block (split-K) values for stage1 sweep (default: 1)",
     )
     parser.add_argument(
         "--mode", type=str, nargs="+", default=["atomic"], choices=["atomic", "reduce"]
@@ -440,38 +453,31 @@ def main():
         for bm in args.block_m:
             if "stage1" in args.stage:
                 for kb in args.k_batch:
+                    name = f"stage1_a16w4_t{token}_bm{bm}_kb{kb}"
                     try:
-                        passed, max_delta, pct = test_flydsl_stage1_a16w4(
+                        test_flydsl_stage1_a16w4(
                             token=token,
                             model_dim=args.model_dim,
                             inter_dim=args.inter_dim,
                             E=args.experts,
                             topk=args.topk,
                             block_m=bm,
-                            k_batch=kb,
+                            k_batch_intra_block=kb,
                             atol=args.atol,
                             rtol=args.rtol,
                         )
-                        results.append(
-                            (
-                                f"stage1_a16w4_t{token}_bm{bm}_kb{kb}",
-                                "PASS" if passed else "FAIL",
-                                max_delta,
-                                pct,
-                            )
-                        )
+                        results.append((name, "PASS"))
                     except Exception:
                         import traceback
 
                         traceback.print_exc()
-                        results.append(
-                            (f"stage1_a16w4_t{token}_bm{bm}_kb{kb}", "ERROR", 0, 0)
-                        )
+                        results.append((name, "ERROR"))
 
             if "stage2" in args.stage:
                 for mode in args.mode:
+                    name = f"stage2_a16w4_t{token}_bm{bm}_{mode}"
                     try:
-                        passed, max_delta, pct = test_flydsl_stage2_a16w4(
+                        test_flydsl_stage2_a16w4(
                             token=token,
                             model_dim=args.model_dim,
                             inter_dim=args.inter_dim,
@@ -482,26 +488,18 @@ def main():
                             atol=args.atol,
                             rtol=args.rtol,
                         )
-                        results.append(
-                            (
-                                f"stage2_a16w4_t{token}_bm{bm}_{mode}",
-                                "PASS" if passed else "FAIL",
-                                max_delta,
-                                pct,
-                            )
-                        )
+                        results.append((name, "PASS"))
                     except Exception:
                         import traceback
 
                         traceback.print_exc()
-                        results.append(
-                            (f"stage2_a16w4_t{token}_bm{bm}_{mode}", "ERROR", 0, 0)
-                        )
+                        results.append((name, "ERROR"))
 
             if "e2e" in args.stage:
                 for mode in args.mode:
+                    name = f"e2e_a16w4_t{token}_bm{bm}_{mode}"
                     try:
-                        passed, max_delta, pct = test_flydsl_e2e_a16w4(
+                        test_flydsl_e2e_a16w4(
                             token=token,
                             model_dim=args.model_dim,
                             inter_dim=args.inter_dim,
@@ -512,35 +510,24 @@ def main():
                             atol=args.atol,
                             rtol=args.rtol,
                         )
-                        results.append(
-                            (
-                                f"e2e_a16w4_t{token}_bm{bm}_{mode}",
-                                "PASS" if passed else "FAIL",
-                                max_delta,
-                                pct,
-                            )
-                        )
+                        results.append((name, "PASS"))
                     except Exception:
                         import traceback
 
                         traceback.print_exc()
-                        results.append(
-                            (f"e2e_a16w4_t{token}_bm{bm}_{mode}", "ERROR", 0, 0)
-                        )
+                        results.append((name, "ERROR"))
 
     # Summary
     print(f"\n{'='*70}")
     print("SUMMARY")
     print(f"{'='*70}")
-    for name, status, delta, pct in results:
-        print(
-            f"  {status:>5s}  {name:<50s}  max_delta={delta:>8.4f}  close={pct:>5.1f}%"
-        )
+    for name, status in results:
+        print(f"  {status:>5s}  {name}")
 
-    n_pass = sum(1 for _, s, _, _ in results if s == "PASS")
+    n_pass = sum(1 for _, s in results if s == "PASS")
     print(f"\n  {n_pass}/{len(results)} passed")
 
-    if any(s in ("FAIL", "ERROR") for _, s, _, _ in results):
+    if any(s in ("FAIL", "ERROR") for _, s in results):
         sys.exit(1)
 
 
