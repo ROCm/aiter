@@ -40,6 +40,7 @@ def allocate_output(
     scatter_indx,
     block_m,
     split_k,
+    device,
 ):
     # ---- output ------
     N = w.shape[-1]
@@ -146,8 +147,14 @@ def get_kernel_config_triton(m, n, k, routing_data):
     # Generic AITER_A8W4_* still works as a fallback when the regime-specific var is unset.
     _regime = "PREFILL" if block_m >= 64 else "DECODE"
     _knobs = (
-        "block_n", "block_k", "num_warps", "num_stages",
-        "group_m", "waves_per_eu", "matrix_instr_nonkdim", "split_k",
+        "block_n",
+        "block_k",
+        "num_warps",
+        "num_stages",
+        "group_m",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "split_k",
     )
     for key in _knobs:
         env_specific = f"AITER_A8W4_{_regime}_{key.upper()}"
@@ -474,10 +481,10 @@ def moe_gemm_a8w4(
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
             kpack=config["kpack"],
             YMxScale=y_scale,
-        stride_y_mx_m=stride_y_mx_m,
-        stride_y_mx_n=stride_y_mx_n,
-        HAS_MX_OUT=out_mx_quant,
-    )
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
+        )
 
     # MXFP8 emit path: scatter_indx is None and split_k==1, so we bypass
     # reduce_grouped and return (fp8 values, ue8m0 scales) directly.
