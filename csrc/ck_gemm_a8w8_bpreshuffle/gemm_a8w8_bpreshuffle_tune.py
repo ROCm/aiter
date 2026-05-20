@@ -136,6 +136,7 @@ def run_gemm_a8w8_asm(
 
 def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
     ki = kernels_list_flydsl[kernel_id]
+    xcd = getattr(ki, "xcd_swizzle", 0)
     flydsl_preshuffle_gemm_a8(
         x,
         weight_shuffle,
@@ -149,6 +150,7 @@ def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
         ki.use_cshuffle_epilog,
         ki.use_async_copy,
         ki.waves_per_eu,
+        xcd,
     )
     return out
 
@@ -196,11 +198,11 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
     }
 
     def _clear_op_caches(self):
-        from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
+        from aiter.ops import gemm_op_a8w8 as _op
 
-        get_GEMM_config_with_quant_type.cache_clear()
-        if hasattr(get_GEMM_config_with_quant_type, "file_cache"):
-            get_GEMM_config_with_quant_type.file_cache.clear()
+        _op.get_GEMM_config_with_quant_type.cache_clear()
+        _op._GEMM_QUANT_TYPE_CACHE.clear()
+        _op._GEMM_QUANT_TYPE_HAS_GFX.clear()
 
     def _setup_specific_arguments(self):
         self.parser.add_argument(
@@ -261,7 +263,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
 
     def get_asm_gemm_i8_tasks(self, info_keys, useSplitK, kernel_id_start, seed=0):
         task = []
-        cu_num, M, N, K, q_dtype_w = info_keys
+        gfx, cu_num, M, N, K, q_dtype_w = info_keys
         if eval(q_dtype_w) != dtypes.i8:
             return task
         asm_kernel_list_csv = f"{get_asm_dir()}/i8gemm/i8gemm_bf16_perTokenI8.csv"
@@ -321,7 +323,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         useSplitK,
         seed,
     ):
-        cu_num, M, N, K, q_dtype_w = info_keys
+        gfx, cu_num, M, N, K, q_dtype_w = info_keys
         if eval(q_dtype_w) != dtypes.fp8:
             print(
                 f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
@@ -384,7 +386,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         useSplitK,
         seed,
     ):
-        cu_num, M, N, K, q_dtype_w = info_keys
+        gfx, cu_num, M, N, K, q_dtype_w = info_keys
         if eval(q_dtype_w) != dtypes.fp8:
             print(
                 f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
@@ -443,7 +445,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         info_keys,
         seed,
     ):
-        cu_num, M, N, K, q_dtype_w = info_keys
+        gfx, cu_num, M, N, K, q_dtype_w = info_keys
         q_dtype_eval = eval(q_dtype_w)
         if q_dtype_eval == dtypes.fp8:
             pass
@@ -481,6 +483,13 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             if M >= 4096 and ki.tile_m < 32:
                 continue
             if M >= 2048 and ki.tile_m == 16 and ki.tile_n <= 128:
+                continue
+            # XCD workgroup-id swizzle needs enough workgroups to leave room
+            # for cross-XCD remapping. With <64 wg the swizzle degenerates
+            # into noise (empirically <1.5% of picked-xcd4 winners fall below
+            # this threshold), so skip xcd>0 candidates to halve the
+            # candidate count on small shapes.
+            if getattr(ki, "xcd_swizzle", 0) > 0 and num_ctas < 64:
                 continue
             kernel_name = ki.name
             info = (info_keys, i, 0, kernel_name, "flydsl")
@@ -522,6 +531,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
+        gfx = self.get_gfx()
         task = []
         tasks_data = []  # [(kernel_nums, datas)]
         seed = 10000
@@ -532,7 +542,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             q_dtype_w = untunedf.loc[i, "q_dtype_w"]
             seed = seed + 1
             prev_task_count = len(task)
-            info_keys = (cu_num, M, N, K, q_dtype_w)
+            info_keys = (gfx, cu_num, M, N, K, q_dtype_w)
             if "all" in args.libtype or "ck" in args.libtype:
                 task.extend(
                     self.get_ck_gemm_a8w8_bpreshuffle_tune_task(
@@ -659,18 +669,24 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 err_ratio = checkAllclose(
                     out.to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
                 )
-                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                status = (
+                    "ok"
+                    if err_ratio <= args.errRatio
+                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
+            finally:
+                torch.cuda.empty_cache()
         return results
 
 
 if __name__ == "__main__":
     ## use default key and resultList
-    key = ["cu_num", "M", "N", "K", "q_dtype_w"]
+    key = ["gfx", "cu_num", "M", "N", "K", "q_dtype_w"]
     resultList = [
         "libtype",
         "kernelId",

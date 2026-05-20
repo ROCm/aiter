@@ -70,26 +70,9 @@ def e8m0_to_f32(scale_e8m0_biased):
 
 
 def e8m0_shuffle(scale):
-    if scale is None:
-        return scale
-    if scale.dtype == torch.float32:
-        return scale
-    assert scale.ndim == 2, "scale must be a 2D tensor"
-    m, n = scale.shape
-    scale_padded = torch.empty(
-        (m + 255) // 256 * 256,
-        (n + 7) // 8 * 8,
-        dtype=scale.dtype,
-        device=scale.device,
-    )
+    from aiter.ops.shuffle import shuffle_scale
 
-    scale_padded[:m, :n] = scale
-    scale = scale_padded
-    sm, sn = scale.shape
-    scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
-    scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
-    scale = scale.view(sm, sn)
-    return scale
+    return shuffle_scale(scale)
 
 
 def down_size(size):
@@ -386,11 +369,11 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
             + bs_offs_2 * 2 * 2
             + bs_offs_5 * 2 * 2 * 16
             + bs_offs_3 * 2 * 2 * 16 * 4
-            + bs_offs_0 * 2 * 16 * scaleN
+            + bs_offs_0 * 2 * 16 * scaleN_pad
         )
         bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
         bs_mask2 = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[None, :]
-        bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
+        bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 0)
         tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask2)
     else:
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n

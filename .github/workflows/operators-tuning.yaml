@@ -108,6 +108,7 @@ jobs:
         with:
           name: tuned-csvs
           path: aiter/configs/*.csv
+          retention-days: 7
       
       - name: Cleanup
         if: always()

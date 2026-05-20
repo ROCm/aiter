@@ -184,14 +184,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                    std::hash<int>()(splitk_key) ^ std::hash<bool>()(shuffle_key);
         }
     };
-    static std::unordered_map<DictKey, std::tuple<std::string, int>, SimpleHash>
+    static SynchronizedCache<DictKey, std::tuple<std::string, int>, SimpleHash>
         heuristic_kernel_dict;
 
     if(config_map->empty())
     {
         AITER_CHECK(false, __func__, " no kernel support a8w8 for this gpu arch");
     }
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     std::string arch_id = get_gpu_arch();
     std::string selectedName = (kernelName && kernelName[0] != '\0')
                                    ? arch_id + kernelName
@@ -199,22 +199,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int selectedksplit = opt_splitK.value_or(0) ?: 1;
     if(selectedName.empty())
     {
-        auto it = heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, opt_splitK, opt_bpreshuffle));
-        if(it != heuristic_kernel_dict.end())
-        {
-            auto res       = it->second;
-            selectedName   = std::get<0>(res);
-            selectedksplit = std::get<1>(res);
-        }
-        else
-        {
-            auto it = get_heuristic_kernel(Mdim, Ndim, Kdim, arch_id, opt_splitK, opt_bpreshuffle, config_map);
-
-            selectedName   = std::get<0>(it);
-            selectedksplit = std::get<1>(it);
-            heuristic_kernel_dict[{Mdim, Ndim, Kdim, opt_splitK, opt_bpreshuffle}] =
-                std::make_tuple(selectedName, selectedksplit);
-        }
+        std::tie(selectedName, selectedksplit) = heuristic_kernel_dict.get_or_create(
+            DictKey(Mdim, Ndim, Kdim, splitK, bpreshuffle), [&]() {
+                return get_heuristic_kernel(
+                    Mdim, Ndim, Kdim, arch_id, splitK, bpreshuffle, config_map);
+            });
     }
 
     AiterAsmKernel* impl_ptr = nullptr;
@@ -279,12 +268,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             }
         }
         gdx         = gdx * selectedksplit;
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel ", selectedName);

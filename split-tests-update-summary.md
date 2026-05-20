@@ -7,22 +7,22 @@
 
 ### Aiter
 - runs used: `10`
-- discovered files: `62`
-- with samples: `62`
-- added: `1`
-- updated: `49`
-- unchanged: `12`
+- discovered files: `68`
+- with samples: `68`
+- added: `2`
+- updated: `52`
+- unchanged: `14`
 - defaulted (no history): `0`
-- removed stale entries: `0`
+- removed stale entries: `1`
 - defaulted files list: `none`
 
 ### Triton
 - runs used: `10`
-- discovered files: `71`
-- with samples: `71`
-- added: `1`
-- updated: `40`
-- unchanged: `30`
+- discovered files: `94`
+- with samples: `94`
+- added: `5`
+- updated: `69`
+- unchanged: `20`
 - defaulted (no history): `0`
 - removed stale entries: `0`
 - defaulted files list: `none`

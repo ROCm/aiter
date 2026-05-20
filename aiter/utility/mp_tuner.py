@@ -9,6 +9,14 @@ from aiter import dtypes
 from aiter import logger
 
 
+def _is_mapping_error(exc: BaseException) -> bool:
+    return isinstance(exc, KeyError)
+
+
+def _is_accelerator_error(exc: BaseException) -> bool:
+    return type(exc).__name__ == "AcceleratorError"
+
+
 def worker(
     gpu_id,
     info,
@@ -20,6 +28,7 @@ def worker(
     atol=1e-2,
     printLog=False,
     tol_err_ratio=0.05,
+    compare_fn=None,
 ):
     from aiter.test_common import run_perftest
 
@@ -36,7 +45,7 @@ def worker(
             res, us = run_perftest(func, *args, **kwargs)
             us = round(us, 4)
 
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             print(f"run gpu func warning: info:{info}\t {e}", flush=True)
             us = -1  # not support or error
             max_err_ratio = 1.0
@@ -50,6 +59,8 @@ def worker(
         if us == 0:
             print(f"Warning: try run {max_retries} times, but still get 0!")
         torch.cuda.synchronize()
+        if us == -1 or res is None:
+            return info, us, round(max_err_ratio, 4)
         if ref is not None:
             if isinstance(ref, torch.Tensor):
                 ref = [ref]
@@ -67,18 +78,26 @@ def worker(
                 if isinstance(ref[i], torch.Tensor):
                     if res[i].shape != ref[i].shape:
                         res[i] = res[i].view(-1)[: ref[i].numel()].view(ref[i].shape)
-                    if ref[i].dtype.itemsize == 1:
-                        ref[i] = ref[i].view(torch.uint8).to(dtypes.fp32)
-                        res[i] = res[i].view(torch.uint8).to(dtypes.fp32)
-                    err_ratio = checkAllclose(
-                        ref[i],
-                        res[i],
-                        atol=atol,
-                        rtol=rtol,
-                        tol_err_ratio=tol_err_ratio,
-                        printLog=printLog,
-                        msg=f"info:{info} res[{i}] ",
-                    )
+                    if compare_fn is not None:
+                        err_ratio = compare_fn(
+                            ref[i],
+                            res[i],
+                            msg=f"info:{info} res[{i}] ",
+                            printLog=printLog,
+                        )
+                    else:
+                        if ref[i].dtype.itemsize == 1:
+                            ref[i] = ref[i].view(torch.uint8).to(dtypes.fp32)
+                            res[i] = res[i].view(torch.uint8).to(dtypes.fp32)
+                        err_ratio = checkAllclose(
+                            ref[i],
+                            res[i],
+                            atol=atol,
+                            rtol=rtol,
+                            tol_err_ratio=tol_err_ratio,
+                            printLog=printLog,
+                            msg=f"info:{info} res[{i}] ",
+                        )
                     max_err_ratio = max(max_err_ratio, err_ratio)
     except RuntimeError as e:
         if "CUDA" in str(e) or "HIP" in str(e) or "out of memory" in str(e).lower():
@@ -208,9 +227,11 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                     torch.cuda.synchronize()
                     _prev_ref_key = _cur_key
 
-            # Extract rtol, atol from rest if available, otherwise use defaults
+            # Extract rtol, atol from rest if available, otherwise use defaults.
+            # Optional rest[2]: custom compare callable (e.g. cosine diff for a8w4).
             rtol = rest[0] if len(rest) > 0 else 1e-2
             atol = rest[1] if len(rest) > 1 else 1e-2
+            compare_fn = rest[2] if len(rest) > 2 and callable(rest[2]) else None
 
             work_args = (
                 gpu_id,
@@ -223,6 +244,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 atol,
                 verbose,  # Use the verbose from work_group parameter
                 err_ratio,  # Use the err_ratio from work_group parameter
+                compare_fn,
             )
 
             # Run worker with explicit GPU ID
@@ -409,7 +431,7 @@ def mp_tuner(
                 elapsed = time.time() - task_start_times[k]
                 if verbose:
                     print(
-                        f"[Done] Task {k}/{len(rets)-1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)"
+                        f"[Done] Task {k}/{len(rets) - 1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)"
                     )
 
             except MPTimeoutError:
@@ -448,14 +470,13 @@ def mp_tuner(
             except Exception as e:
                 # Check if it's a process crash (segfault, memory fault, etc.)
                 error_type = type(e).__name__
-
-                # Special handling for KeyError (PID mapping issue)
-                is_mapping_error = error_type == "KeyError"
+                is_mapping_error = _is_mapping_error(e)
+                is_accelerator_error = _is_accelerator_error(e)
                 # not restart as this is not root use
                 if is_mapping_error:
                     error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map: {error_type} - {e}"
                     dummy_failed_tasks.append((k, "mapping error"))
-                elif error_type == "AcceleratorError":
+                elif is_accelerator_error:
                     # GPU fault (e.g. illegal memory access): worker returns exception instead of
                     # hanging. Unlike hang->timeout, the faulting worker may stay alive and accept
                     # more tasks on the same bad GPU. Break immediately to trigger restart and
@@ -566,14 +587,14 @@ def mp_tuner(
         timeout_count = sum(1 for _, reason in failed_tasks if reason == "timeout")
         crash_count = len(failed_tasks) - timeout_count
         summary = (
-            f"\n{'='*60}\n"
+            f"\n{'=' * 60}\n"
             f"Tuning Summary:\n"
             f"  Total tasks: {len(rets)}\n"
             f"  Successful: {len(rets) - len(failed_tasks)}\n"
             f"  Failed: {len(failed_tasks)}\n"
             f"    - Timeouts (GPU hang): {timeout_count}\n"
             f"    - Crashes (memory fault): {crash_count}\n"
-            f"{'='*60}"
+            f"{'=' * 60}"
         )
         logger.warning(summary)
 
