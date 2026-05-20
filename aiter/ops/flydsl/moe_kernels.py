@@ -878,7 +878,7 @@ def flydsl_moe_stage1(
         act=act,
         persist_m=_persist_m,
         use_async_copy=use_async_copy,
-        k_batch=k_batch_intra_block,
+        k_batch_intra_block=k_batch_intra_block,
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
         gate_mode=gate_mode,
@@ -1182,7 +1182,7 @@ def flydsl_moe_stage2(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
-        k_batch=k_batch_intra_block,
+        k_batch_intra_block=k_batch_intra_block,
     )
     _run_compiled(exe, args)
 
