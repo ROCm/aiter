@@ -1059,7 +1059,7 @@ design notes.
 | [csrc/opus_gemm/opus_gemm.cu](../../../csrc/opus_gemm/opus_gemm.cu) | Pybind entries (`opus_gemm`, `opus_gemm_a16w16_tune`) + per-arch router |
 | [csrc/opus_gemm/include/gfx950/opus_gemm_arch_gfx950.cuh](../../../csrc/opus_gemm/include/gfx950/opus_gemm_arch_gfx950.cuh) | gfx950 dispatch: (M,N,K) lookup + heuristic-kid fallback |
 | [csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh](../../../csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh) | `opus_a16w16_heuristic_kid_gfx950(M,N,K) -> int` (single source: integer kid only, no launcher symbol names) |
-| [csrc/opus_gemm/include/gfx950/](../../../csrc/opus_gemm/include/gfx950/) | Kernel source (a16w16, flatmm, flatmm_splitk, persistent, kspl) for gfx950 |
+| [csrc/opus_gemm/include/gfx950/](../../../csrc/opus_gemm/include/gfx950/) | Kernel source (a16w16, flatmm, flatmm_splitk, persistent) for gfx950 |
 | [op_tests/test_opus_a16w16_gemm.py](../../../op_tests/test_opus_a16w16_gemm.py) | End-to-end `gemm_a16w16_opus` (single-shape + CSV sweep) |
 
 ---

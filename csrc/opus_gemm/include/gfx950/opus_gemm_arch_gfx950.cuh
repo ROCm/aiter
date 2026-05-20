@@ -186,7 +186,7 @@ opus_dispatch_a16w16_gfx950<bf16_t>(int M, int N, int K, int batch, bool has_bia
         return it->func;
     }
     (void)batch;  // heuristic does not currently use batch.
-    // has_bias forces the heuristic to skip persistent / kspl kids (which
+    // has_bias forces the heuristic to skip persistent kids (which
     // do not yet implement HAS_BIAS=true) and return a splitk kid instead.
     const int kid = opus_a16w16_heuristic_kid_gfx950(M, N, K, has_bias);
     if (kid_is_splitk(kid))

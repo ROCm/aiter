@@ -74,7 +74,7 @@ using OpusA16W16NoscaleKernel = void (*)(
 // HEURISTIC_DEFAULT_KIDS in csrc/opus_gemm/opus_gemm_common.py, so
 // the subset-compile codegen always includes them in S.
 //
-// `has_bias` matters because the persistent / kspl pipelines do not yet
+// `has_bias` matters because the persistent pipeline does not yet
 // implement HAS_BIAS=true; when the user passes a non-empty bias the
 // heuristic must stay on the bias-aware splitk family even if the M-bucket
 // would otherwise return a persistent kid. Splitk kids 200/206/208 (+

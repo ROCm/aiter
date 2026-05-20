@@ -221,11 +221,6 @@ static constexpr int OPUS_PERSISTENT_KID_MIN = 300;
 static constexpr int OPUS_PERSISTENT_KID_MAX = 316;
 // non-OOB kid offset
 static constexpr int OPUS_NOOOB_KID_OFFSET = 1000;
-// Experimental K-split (kspl) DEMO kids: parallel to persistent.
-// Single tile / cpol today; range [2300, 2316) reserves room for future
-// sweep. Not in heuristic dispatch; tune-only.
-static constexpr int OPUS_KSPL_KID_MIN = 2300;
-static constexpr int OPUS_KSPL_KID_MAX = 2316;
 
 static inline bool opus_kid_is_splitk(int kid)
 {
@@ -260,16 +255,9 @@ static inline bool opus_kid_is_persistent(int kid)
           kid < OPUS_PERSISTENT_KID_MAX + OPUS_NOOOB_KID_OFFSET);
 }
 
-static inline bool opus_kid_is_kspl(int kid)
-{
-  return (kid >= OPUS_KSPL_KID_MIN && kid < OPUS_KSPL_KID_MAX) ||
-         (kid >= OPUS_KSPL_KID_MIN + OPUS_NOOOB_KID_OFFSET &&
-          kid < OPUS_KSPL_KID_MAX + OPUS_NOOOB_KID_OFFSET);
-}
-
 static inline bool opus_kid_supports_bias(int kid)
 {
-  // persistent and kspl do not yet support bias (kargs lacks ptr_bias/stride_bias_batch).
+  // persistent does not yet support bias (kargs lacks ptr_bias/stride_bias_batch).
   return opus_kid_is_a16w16_sb(kid) || opus_kid_is_splitk(kid);
 }
 
