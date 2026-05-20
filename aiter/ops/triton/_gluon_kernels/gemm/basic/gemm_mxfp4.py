@@ -87,9 +87,8 @@ def depreshuffle_scales(
     KG_PER_STRIPE: gl.constexpr = 4
     NUM_STRIPES: gl.constexpr = K_GROUPS // KG_PER_STRIPE
     return (
-        smem_scales.reshape(
-            (BLOCK_M // LANES_PER_STRIPE, NUM_STRIPES, LANES_PER_STRIPE, KG_PER_STRIPE)
-        )
+        smem_scales
+        .reshape((BLOCK_M // LANES_PER_STRIPE, NUM_STRIPES, LANES_PER_STRIPE, KG_PER_STRIPE))
         .permute((0, 2, 1, 3))
         .reshape((BLOCK_M, K_GROUPS))
     )

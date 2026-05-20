@@ -61,19 +61,6 @@ def shuffle_scales_gfx1250(scales: torch.Tensor):
     return out
 
 
-def un_shuffle_scales_gfx1250(scales_shuffled: torch.Tensor):
-    rows, cols = scales_shuffled.shape
-    M = rows * 16
-    K_groups = cols // 16
-
-    out = scales_shuffled.view(
-        rows, K_groups // 4, 16, 4
-    )  # (m_tile, k_tile, lane, kg_in_lane)
-    out = out.permute(0, 2, 1, 3).contiguous()  # (m_tile, lane, k_tile, kg_in_lane)
-    out = out.view(M, K_groups)
-    return out
-
-
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
 
