@@ -27,6 +27,7 @@ import torch
 from typing import Optional
 
 from ..jit.core import compile_ops
+from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 
 MD_NAME = "module_pa_sparse_prefill_opus"
@@ -101,6 +102,10 @@ def pa_sparse_prefill_opus(
     Returns:
       ``out`` (``[T, H, D]`` same dtype as ``q``).
     """
+    gfx = get_gfx_runtime()
+    if gfx != "gfx950":
+        raise RuntimeError(f"pa_sparse_prefill_opus requires gfx950, got {gfx}")
+
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_sparse_prefill_opus expects fp16/bf16 q, got {q.dtype}")
     if unified_kv.dtype != q.dtype:

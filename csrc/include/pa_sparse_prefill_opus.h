@@ -140,9 +140,8 @@ __host__ __device__ inline int ceil_div(int a, int b) { return (a + b - 1) / b; 
 template <class Traits>
 __global__ void pa_prefill_kernel(pa_sparse_prefill_kargs kargs);
 
-// Pull in the device kernel template body on the device pass only.
-// On the host pass we keep an empty stub so __device_stub__ symbols still resolve.
-#ifndef __HIP_DEVICE_COMPILE__
+// Pull in the device kernel template body only on the gfx950 device pass.
+#if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 template <class Traits>
 __global__ void pa_prefill_kernel(pa_sparse_prefill_kargs)
 {
