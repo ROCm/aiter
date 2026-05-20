@@ -399,9 +399,9 @@ def fused_moe_(
         and stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1)
         and expert_mask is not None
     )
-    assert not metadata.flat or get_gfx() == "gfx950", (
-        f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
-    )
+    assert (
+        not metadata.flat or get_gfx() == "gfx950"
+    ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
     sorting_ret = moe_sorting(
         topk_ids,
         topk_weight,
