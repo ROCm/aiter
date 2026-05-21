@@ -872,6 +872,4 @@ if _csv_out and len(df) > 0:
         csv_df = df.copy()
     csv_df = csv_df.drop(columns=["logits_diff"], errors="ignore")
     csv_df.to_csv(_csv_out, index=False)
-    aiter.logger.info(
-        "moe_2stage: wrote %d csv-mode rows to %s", len(csv_df), _csv_out
-    )
+    aiter.logger.info("moe_2stage: wrote %d csv-mode rows to %s", len(csv_df), _csv_out)

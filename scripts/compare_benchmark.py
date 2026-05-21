@@ -45,9 +45,13 @@ NON_KEY = {METRIC, *KERNEL_COLS}
 # Cols kept in the join key (for correct shape matching) but hidden from
 # the printed table (low signal — usually constant across runs).
 HIDE_DISPLAY_COLS = (
-    "preshuffle", "strict_accuracy", "check_aot_cache", "swiglu_limit",
+    "preshuffle",
+    "strict_accuracy",
+    "check_aot_cache",
+    "swiglu_limit",
     # Source cols folded into derived `hip` column below
-    "hidden_pad", "intermediate_pad",
+    "hidden_pad",
+    "intermediate_pad",
 )
 
 # Derived display columns. Each entry: derived_name -> (source_col_a, source_col_b)
@@ -67,10 +71,10 @@ _VALUE_ABBREV = {
     "torch.bfloat16": "bf16",
     "torch.float16": "fp16",
     "torch.float32": "fp32",
-    "torch.float8_e4m3fnuz": "fp8",        # AMD default
-    "torch.float8_e4m3fn": "fp8e4m3fn",    # OCP
+    "torch.float8_e4m3fnuz": "fp8",  # AMD default
+    "torch.float8_e4m3fn": "fp8e4m3fn",  # OCP
     "torch.float8_e5m2": "fp8e5m2",
-    "torch.float4_e2m1fn_x2": "fp4",       # x2 = packed (2 elems per byte)
+    "torch.float4_e2m1fn_x2": "fp4",  # x2 = packed (2 elems per byte)
     "torch.fp8": "fp8",
     "torch.fp4x2": "fp4",
     "torch.int8": "i8",
@@ -90,7 +94,7 @@ def _abbreviate(val: str) -> str:
         return _VALUE_ABBREV[val]
     for prefix in _STRIP_PREFIXES:
         if val.startswith(prefix):
-            return val[len(prefix):]
+            return val[len(prefix) :]
     return val
 
 
@@ -153,9 +157,7 @@ def _fmt_key_compact(
     return " ".join(parts) if parts else "(common)"
 
 
-def _find_constants(
-    keys: list[Key], key_cols_order: Tuple[str, ...]
-) -> Dict[str, str]:
+def _find_constants(keys: list[Key], key_cols_order: Tuple[str, ...]) -> Dict[str, str]:
     """Return cols whose value is identical across all `keys`."""
     if not keys:
         return {}
@@ -268,8 +270,12 @@ def main() -> int:
     METRIC_HDRS = ("cur(us)", "base(us)", "ratio")
 
     # Build display_cols: walk key_cols, drop hidden, splice derived in place
-    _derived_sources = {src for sources in DERIVED_TUPLE_COLS.values() for src in sources}
-    _derived_first_src = {sources[0]: name for name, sources in DERIVED_TUPLE_COLS.items()}
+    _derived_sources = {
+        src for sources in DERIVED_TUPLE_COLS.values() for src in sources
+    }
+    _derived_first_src = {
+        sources[0]: name for name, sources in DERIVED_TUPLE_COLS.items()
+    }
     display_cols: list[str] = []
     for c in key_cols:
         if c in _derived_first_src:
