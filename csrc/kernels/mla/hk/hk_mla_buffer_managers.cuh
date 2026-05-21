@@ -747,7 +747,15 @@ class QManager8to16bitsV1
         const uint32_t lane_idx     = opus::lane_id();
         const uint32_t row_in_warp  = lane_idx >> 2;                            // 0..15
         const uint32_t col_quad     = lane_idx & 3u;                            // 0..3
-        const uint32_t v_off        = row_in_warp * kPackedNopeStride + col_quad * 16u;
+        // Swizzle: 16x64 chunk tiled into 4x4 sub-tiles (4 rows x 16 cols).
+        // Within each 4-row band R (R = row_in_warp >> 2 = lane_idx >> 4),
+        // permute the 4 col sub-tiles by C_phys = C_log XOR R. Breaks the
+        // 4-row alias on bank `addr[7:3]` so the consumer ds_read_b64 sees no
+        // bank conflict. Identity on R=0; inner-swap on R=1; outer-swap on R=2;
+        // both on R=3. Reader must apply the same XOR.
+        const uint32_t R            = lane_idx >> 4;                            // 0..3 (row-band)
+        const uint32_t col_quad_swz = col_quad ^ R;                             // 0..3 (physical)
+        const uint32_t v_off        = row_in_warp * kPackedNopeStride + col_quad_swz * 16u;
         // Scale must be loaded for the row that the CONSUMER attributes to this
         // lane (consumer uses lane & 15, NOT lane >> 2 -- see
         // p1_staging_to_vgpr_chunk). Otherwise each lane scales row R's fp8 data
@@ -814,14 +822,26 @@ class QManager8to16bitsV1
 
         const uint32_t lane_idx    = opus::lane_id();
         const uint32_t row_in_warp = lane_idx & 15u;                           // 0..15 (= row in warp tile)
-        const uint32_t col_byte    = (lane_idx >> 4) * 8u;                     // 0,8,16,24 (= mfma col base)
 
-        // ds_read addresses: per-lane base is independent of kBufIdx; the
-        // kBufIdx*kP1StagingBytesPerWarp offset is folded into the ds_read_b64
-        // immediate `offset:` field (DS imm is 16-bit, fits 1024+32 easily).
-        // This lets the compiler share addr_base across both buffers.
-        const uintptr_t addr_base =
-            p_lds_warp_staging + row_in_warp * (kP1ChunkCols) + col_byte;
+        // Swizzle-aware addressing (mirror of p1_vmem_to_staging_chunk writer).
+        // Logical col sub-tile within chunk: iter0 ∈ {0,1}, iter1 ∈ {2,3}.
+        // Physical col sub-tile: C_phys = C_log XOR R, where R is the 4-row
+        // band index = row_in_warp >> 2. Iter1 cannot fold +32 into the
+        // ds_read imm offset anymore because the per-lane delta between iter0
+        // and iter1 is ±32 depending on R bit-1; compute both addrs separately.
+        const uint32_t R            = (lane_idx >> 2) & 3u;                    // 0..3
+        const uint32_t C_log_iter0  = lane_idx >> 5;                           // 0 or 1
+        const uint32_t C_log_iter1  = C_log_iter0 ^ 2u;                        // 2 or 3
+        const uint32_t C_phys_iter0 = C_log_iter0 ^ R;
+        const uint32_t C_phys_iter1 = C_log_iter1 ^ R;
+        const uint32_t byte_off     = ((lane_idx >> 4) & 1u) * 8u;             // 0 or 8
+
+        // kStagingI is still folded into the ds_read imm `offset:` field so
+        // the two staging buffers share these per-lane address computations.
+        const uintptr_t addr_iter0 =
+            p_lds_warp_staging + row_in_warp * kP1ChunkCols + C_phys_iter0 * 16u + byte_off;
+        const uintptr_t addr_iter1 =
+            p_lds_warp_staging + row_in_warp * kP1ChunkCols + C_phys_iter1 * 16u + byte_off;
 
         // Drain BOTH vmcnt AND lgkmcnt:
         //  - vmcnt covers the vmem-fetch side of buffer_load_lds + the scale
@@ -835,11 +855,12 @@ class QManager8to16bitsV1
         __builtin_amdgcn_sched_barrier(0);
 
         // 8 fp8/lane per iter -> 2 dwords/lane via ds_read_b64. kStagingI is
-        // folded into the imm offset so addr_base is reused across kBufIdx.
+        // folded into the imm offset so the per-lane addrs are shared across
+        // kBufIdx.
         const hk::u32x2 fp8_iter0 = hkm::ds_read_b64<hk::u32x2>(
-            static_cast<uint32_t>(addr_base), static_cast<int>(kStagingI));
+            static_cast<uint32_t>(addr_iter0), static_cast<int>(kStagingI));
         const hk::u32x2 fp8_iter1 = hkm::ds_read_b64<hk::u32x2>(
-            static_cast<uint32_t>(addr_base), static_cast<int>(kStagingI + 32u));
+            static_cast<uint32_t>(addr_iter1), static_cast<int>(kStagingI));
 
         // V4 shares one E8M0 scale across the full 64-col chunk -> single
         // scale_f for both 32-col mfma A-tiles (iter0 cols [0,32), iter1
