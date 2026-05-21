@@ -104,7 +104,6 @@ def parse_csv(csv_path: str):
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
             q_dtype_w = row.get("q_dtype_w", "")
-            q_dtype_a = row.get("q_dtype_a", "")
             swiglu_limit = _row_swiglu_limit(row)
             # Match the RT condition in fused_moe.py:get_2stage_cfgs():
             #   _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == fp4x2.
