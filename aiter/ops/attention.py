@@ -168,10 +168,35 @@ def _should_use_asm_kernel(
     head_size: int,
     kv_cache_tensor_dtype: torch.dtype,
     high_precision: int,
+    max_qlen: int = 1,
+    block_size: Optional[int] = None,
+    num_kv_heads: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    batch: Optional[int] = None,
+    kv_cache_dtype: str = "auto",
 ) -> bool:
     # ASM kernel only supports head_size == 128; all other head sizes use HIP.
     if head_size != 128:
         return False
+
+    # Uniform MTP decode with shuffled FP8 KV: the QTP-driven ASM kernels
+    # (CSV Mtp=1 generic kernels) handle qlen 2/3/4 via qo_indptr and are
+    # more accurate than the generated HIP shuffled-MTP path for this shape.
+    # gqa_ratio == 10 deliberately excluded: asm_pa.cu:get_heuristic_kernel
+    # would fall back to the gqa=16 kernel via gqa_flags={10,16}, running
+    # with mismatched args.GQA and producing incorrect output.
+    if (
+        max_qlen in (2, 3, 4)
+        and num_kv_heads is not None
+        and num_heads // num_kv_heads in (8, 16)
+        and get_gfx() in ("gfx942", "gfx950")
+        and block_size == 16
+        and v_dim == 5
+        and batch is not None
+        and num_seqs == batch * max_qlen
+        and kv_cache_dtype in ("fp8", "fp8_e4m3")
+    ):
+        return True
 
     # high_precision == 2 forces ASM for maximum precision (fp8 kvcache only)
     if high_precision == 2:
@@ -231,7 +256,17 @@ def paged_attention_common(
     num_seqs, num_heads, head_size = Q.shape
 
     use_asm_kernel = _should_use_asm_kernel(
-        num_seqs, num_heads, head_size, kv_cache_tensor_dtype, high_precision
+        num_seqs,
+        num_heads,
+        head_size,
+        kv_cache_tensor_dtype,
+        high_precision,
+        max_qlen=max_qlen,
+        block_size=int(K.size(3)),
+        num_kv_heads=int(K.size(1)),
+        v_dim=V.dim(),
+        batch=context_lens.numel(),
+        kv_cache_dtype=kv_cache_dtype,
     )
 
     if use_asm_kernel:
