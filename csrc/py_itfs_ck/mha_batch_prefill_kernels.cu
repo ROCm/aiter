@@ -142,7 +142,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     else if(kv_memory_layout ==
             ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT)
     {
-        // Tencent Cross-Layer 5D KV cache, per-layer non-contiguous view.
+        // Cross-Layer 5D KV cache, per-layer non-contiguous view.
         // K/V layout: [NumBlocks, NumHeads, PageSize, HeadDim]
         //   stride(0) -> NumBlocks (block) stride           (== batch_stride_k)
         //   stride(1) -> NumHeads stride                    (== nhead_stride_k)
@@ -596,7 +596,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     //   -1 = auto-detect from k.dim() (preserves legacy behavior)
     //    0 = VECTORIZED_LAYOUT (5D swizzled)
     //    1 = LINEAR_LAYOUT (4D [N, B, H, D] or 3D [N, H, D])
-    //    2 = LINEAR_HEADS_FIRST_LAYOUT (4D [N, H, B, D], Tencent cross-layer 5D view)
+    //    2 = LINEAR_HEADS_FIRST_LAYOUT (4D [N, H, B, D], cross-layer 5D view)
     ck_tile::BlockAttentionKVCacheMemoryLayoutEnum kv_memory_layout;
     int num_heads_k     = 0;
     int page_block_size = 0;

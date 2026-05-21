@@ -23,7 +23,7 @@ from ..utility import dtypes
 KV_LAYOUT_AUTO = -1
 KV_LAYOUT_VECTORIZED = 0
 KV_LAYOUT_LINEAR = 1
-# Tencent cross-layer 5D KV cache: per-layer non-contiguous view of a 6D physical
+# Cross-layer 5D KV cache: per-layer non-contiguous view of a 6D physical
 # buffer (NumBlocks, NumHeads, NumLayers, 2, PageSize, HeadDim). K and V are
 # 4D [NumBlocks, NumHeads, PageSize, HeadDim] each (already sliced out of the
 # 5D (2, ...) view by the framework).
@@ -2991,7 +2991,7 @@ def mha_batch_prefill_func(
     kv_block_descale=None,  # [num_block, num_kv_head, 2] per-page K/V descales
     sink_ptr=None,
     sink_size: int = 0,
-    # Tencent cross-layer 5D KV cache entry point: if supplied, this is a 5D
+    # Cross-layer 5D KV cache entry point: if supplied, this is a 5D
     # per-layer view `[2, NumBlocks, NumKVHeads, PageSize, HeadDim]` (typically
     # non-contiguous, sliced from a 6D physical buffer of shape
     # `(NumBlocks, NumKVHeads, NumLayers, 2, PageSize, HeadDim)`). When provided,

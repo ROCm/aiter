@@ -2554,7 +2554,7 @@ def _make_cross_layer_5d_view(
     device: str = "cuda",
     fill: torch.Tensor | None = None,
 ):
-    """Build a Tencent-style Cross-Layer 5D KV cache and return the per-layer
+    """Build a Cross-Layer 5D KV cache and return the per-layer
     non-contiguous 5D view ``(2, num_blocks, num_kv_heads, page_size, head_dim)``.
 
     Mirrors the construction in
@@ -2605,7 +2605,7 @@ def test_batch_prefill_cross_layer_5d_layout_strides(
     num_qo_heads,
     head_dim,
 ):
-    """Metadata-only test for Tencent Cross-Layer 5D KV cache.
+    """Metadata-only test for Cross-Layer 5D KV cache.
 
     Verifies that the per-layer 5D view produced by the framework-side construction
     has exactly the stride pattern documented in section 5.3 ("Stride in
@@ -2736,7 +2736,7 @@ def test_batch_prefill_cross_layer_5d_layout_matches_contiguous(
     causal,
     dtype,
 ):
-    """Functional test for Tencent Cross-Layer 5D KV cache prefill.
+    """Functional test for Cross-Layer 5D KV cache prefill.
 
     Builds a 6D physical KV buffer, fills the layer-of-interest slot with random
     data, then runs ``mha_batch_prefill_func`` two ways:
@@ -2845,6 +2845,153 @@ def test_batch_prefill_cross_layer_5d_layout_matches_contiguous(
 
     rtol, atol = get_tolerances(dtype, is_fp8=False)
     torch.testing.assert_close(out_xlayer_t, out_packed_t, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_batch_prefill_cross_layer_5d_matches_torch_reference(causal):
+    """End-to-end correctness test: cross-layer 5D prefill vs pure-torch reference.
+
+    Companion to ``test_batch_prefill_cross_layer_5d_layout_matches_contiguous``,
+    which only validates kernel-vs-kernel self-consistency between the packed
+    and cross-layer paths. This one feeds the cross-layer kernel output through
+    ``ref_masked_attention`` (einsum + softmax) so the actual attention math
+    is independently validated on the non-contiguous ``[N, H, B, D]`` view.
+
+    Single hard-coded scenario chosen to cover the gaps in the existing
+    cross-layer tests in one shot:
+
+      - ``num_layers = 80``  -- nominal cross-layer value; exercises the
+        pathological per-head / per-block stride magnitudes
+        (``L*2*B*D = 327_680`` elements).
+      - ``layer_idx = 2``    -- non-zero, catches a layer-select offset bug.
+      - ``batch_size = 2``   -- per-batch page counts ``[3, 2]`` exercise the
+        multi-page-per-sequence path that the existing tests skip.
+      - ``last_page_lens = [5, 11]`` -- partial last pages of different sizes,
+        which the existing tests likewise skip (they all use full last pages).
+      - ``GQA num_kv_heads=1 -> num_qo_heads=4``.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA/HIP device")
+
+    torch.manual_seed(0xCA5CADE)
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    num_layers = 80
+    layer_idx = 2
+    num_blocks = 8
+    page_size = 16
+    head_dim = 128
+    num_kv_heads = 1
+    num_qo_heads = 4
+    pages_per_seq = [3, 2]
+    last_page_lens = [5, 11]
+    qo_lens = [10, 7]
+    batch_size = len(pages_per_seq)
+
+    # Build the 6D physical buffer; only fill the layer of interest with random
+    # K/V. Other layers stay zeroed so a stride-leak bug into another layer
+    # would corrupt the attention output and trip the reference comparison.
+    physical = torch.zeros(
+        num_blocks, num_kv_heads, num_layers, 2, page_size, head_dim,
+        dtype=dtype, device=device,
+    )
+    layer_data = torch.randn(
+        2, num_blocks, num_kv_heads, page_size, head_dim,
+        dtype=dtype, device=device,
+    ) * 0.1
+    logical6d = physical.permute(2, 3, 0, 1, 4, 5)  # (L, 2, N, H, B, D)
+    logical6d[layer_idx].copy_(layer_data)
+    kv_cache_view = logical6d[layer_idx]  # (2, N, H, B, D), non-contiguous
+
+    # Sanity: assert the layout we fed the kernel matches the documented spec.
+    H, B, D, L = num_kv_heads, page_size, head_dim, num_layers
+    assert kv_cache_view.shape == (2, num_blocks, H, B, D)
+    assert kv_cache_view.stride() == (B * D, L * 2 * H * B * D, L * 2 * B * D, D, 1)
+    assert not kv_cache_view.is_contiguous()
+
+    total_q = sum(qo_lens)
+    cu_seqlens_q = torch.tensor(
+        [0] + list(itertools.accumulate(qo_lens)),
+        dtype=torch.int32, device=device,
+    )
+    kv_indptr = torch.tensor(
+        [0] + list(itertools.accumulate(pages_per_seq)),
+        dtype=torch.int32, device=device,
+    )
+    # Distinct pages per batch out of the available [0, num_blocks).
+    kv_page_indices_list: list[int] = []
+    cursor = 0
+    for npages in pages_per_seq:
+        kv_page_indices_list.extend(range(cursor, cursor + npages))
+        cursor += npages
+    assert cursor <= num_blocks
+    kv_page_indices = torch.tensor(
+        kv_page_indices_list, dtype=torch.int32, device=device
+    )
+    kv_last_page_lens = torch.tensor(
+        last_page_lens, dtype=torch.int32, device=device
+    )
+    seqlen_k_per_batch = [
+        (pages_per_seq[b] - 1) * page_size + last_page_lens[b]
+        for b in range(batch_size)
+    ]
+    max_seqlen_k = max(seqlen_k_per_batch)
+
+    q = torch.randn(
+        total_q, num_qo_heads, head_dim, dtype=dtype, device=device,
+    ) * 0.1
+
+    out = aiter.mha_batch_prefill_func(
+        q,
+        cu_seqlens_q=cu_seqlens_q,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        max_seqlen_q=max(qo_lens),
+        max_seqlen_k=max_seqlen_k,
+        causal=causal,
+        kv_cache=kv_cache_view,
+        kv_last_page_lens=kv_last_page_lens,
+    )
+    out_t = out[0] if isinstance(out, (list, tuple)) else out
+
+    # Per-batch torch reference: gather K/V tokens for this batch's pages out
+    # of the cross-layer view, repeat for GQA, hand to ref_masked_attention.
+    k_view = kv_cache_view[0]  # [N, H, B, D]
+    v_view = kv_cache_view[1]
+    cu_q_cpu = cu_seqlens_q.cpu().tolist()
+    iptr_cpu = kv_indptr.cpu().tolist()
+    pidx_cpu = kv_page_indices.cpu().tolist()
+    gqa_ratio = num_qo_heads // num_kv_heads
+    rtol, atol = get_tolerances(dtype, is_fp8=False)
+
+    for b in range(batch_size):
+        pages_b = pidx_cpu[iptr_cpu[b]:iptr_cpu[b + 1]]
+        last_len_b = last_page_lens[b]
+        k_segs, v_segs = [], []
+        for j, p in enumerate(pages_b):
+            tokens_in_page = page_size if j < len(pages_b) - 1 else last_len_b
+            # k_view[p] is [H, B, D]; transpose to [B, H, D] then truncate to
+            # the valid token range for the last page.
+            k_segs.append(
+                k_view[p, :, :tokens_in_page, :].permute(1, 0, 2).contiguous()
+            )
+            v_segs.append(
+                v_view[p, :, :tokens_in_page, :].permute(1, 0, 2).contiguous()
+            )
+        ki = torch.cat(k_segs, dim=0)  # [seqlen_k, H, D]
+        vi = torch.cat(v_segs, dim=0)
+        if gqa_ratio > 1:
+            ki = ki.repeat_interleave(gqa_ratio, dim=1)
+            vi = vi.repeat_interleave(gqa_ratio, dim=1)
+        qi = q[cu_q_cpu[b]:cu_q_cpu[b + 1]]
+        ref_b = ref_masked_attention(qi, ki, vi, causal=causal)
+        torch.testing.assert_close(
+            out_t[cu_q_cpu[b]:cu_q_cpu[b + 1]],
+            ref_b,
+            rtol=rtol,
+            atol=atol,
+        )
 
 
 parser = argparse.ArgumentParser(
@@ -3339,7 +3486,7 @@ def run_batch_prefill_sink(
 # (the bisect family that isolated the bug to total cache size, i.e. the page
 # table is read past the valid region).
 #
-# Crash shape from Tencent Hunyuan / MI-308X:
+# Crash shape from Hunyuan / MI-308X:
 #   prefill (q=2042, kv=2042), 10 q-heads, 1 kv-head, head_dim=128,
 #   page_size=16, bf16, causal=True
 #

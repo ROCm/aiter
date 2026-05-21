@@ -17,7 +17,7 @@ MD_NAME = "module_cache"
 KV_LAYOUT_AUTO = -1
 KV_LAYOUT_VECTORIZED = 0
 KV_LAYOUT_LINEAR = 1
-# Tencent cross-layer 5D KV cache: per-layer non-contiguous view of a 6D
+# Cross-layer 5D KV cache: per-layer non-contiguous view of a 6D
 # physical buffer (NumBlocks, NumHeads, NumLayers, 2, PageSize, HeadDim).
 # key_cache and value_cache are each 4D [NumBlocks, NumHeads, PageSize, HeadDim],
 # sliced out of the 5D (2, ...) view by the framework.
@@ -60,7 +60,7 @@ def reshape_and_cache_flash(
     v_scale: Tensor,
     # See KV_LAYOUT_* constants. KV_LAYOUT_AUTO (-1) preserves the legacy
     # packed [N, B, H, D] fast path. Set to KV_LAYOUT_LINEAR_HEADS_FIRST (2)
-    # for Tencent cross-layer 5D KV cache writes against a [N, H, B, D] view.
+    # for cross-layer 5D KV cache writes against a [N, H, B, D] view.
     kv_layout: int = KV_LAYOUT_AUTO,
 ) -> None: ...
 
@@ -74,7 +74,7 @@ def reshape_and_cache_flash_func(
     kv_cache_dtype: str = "auto",
     k_scale: Optional[Tensor] = None,
     v_scale: Optional[Tensor] = None,
-    # Tencent cross-layer 5D KV cache entry point: 5D per-layer view
+    # Cross-layer 5D KV cache entry point: 5D per-layer view
     # `[2, NumBlocks, NumKVHeads, PageSize, HeadDim]`, typically non-contiguous.
     # When supplied, the wrapper auto-slices into key_cache/value_cache and
     # forces kv_layout=KV_LAYOUT_LINEAR_HEADS_FIRST; explicit
@@ -90,7 +90,7 @@ def reshape_and_cache_flash_func(
     1. Legacy packed K/V caches: pass `key_cache` and `value_cache` directly,
        both 4D `[NumBlocks, PageSize, NumKVHeads, HeadDim]`.
 
-    2. Tencent cross-layer 5D KV cache: pass `kv_cache` instead, a 5D
+    2. Cross-layer 5D KV cache: pass `kv_cache` instead, a 5D
        per-layer view `[2, NumBlocks, NumKVHeads, PageSize, HeadDim]`
        (typically non-contiguous, sliced from a 6D physical buffer of shape
        `(NumBlocks, NumKVHeads, NumLayers, 2, PageSize, HeadDim)`). The

@@ -286,7 +286,7 @@ __global__ void reshape_and_cache_flash_kernel(
         const int head_offset           = i % head_size;
         // Generic stride-based addressing: works for both the packed
         // [N, B, H, D] layout (cache_page_stride = num_heads*head_size,
-        // cache_head_stride = head_size) and the Tencent cross-layer
+        // cache_head_stride = head_size) and the cross-layer
         // [N, H, B, D] non-contiguous view (cache_page_stride = head_size,
         // cache_head_stride = num_layers*2*block_size*head_size).
         const int64_t tgt_key_value_idx = static_cast<int64_t>(block_idx) * block_stride +
@@ -2943,7 +2943,7 @@ namespace aiter {
 // kv_layout values for reshape_and_cache_flash (mirrors the
 // ck_tile::BlockAttentionKVCacheMemoryLayoutEnum used by mha_batch_prefill):
 //   -1 / 1 : LINEAR_LAYOUT, packed K/V cache  [N, B, H, D] (legacy, default)
-//        2 : LINEAR_HEADS_FIRST_LAYOUT, Tencent cross-layer 5D non-contiguous view
+//        2 : LINEAR_HEADS_FIRST_LAYOUT, cross-layer 5D non-contiguous view
 //            K, V each 4D [N, H, B, D] sliced out of a per-layer 5D view of the
 //            6D physical buffer (N, H, L, 2, B, D). Innermost head_dim must be
 //            contiguous; per-head and per-block strides typically embed the

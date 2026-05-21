@@ -27,7 +27,7 @@ void reshape_and_cache(aiter_tensor_t& key,
 
 // kv_layout selects the K/V cache tensor interpretation:
 //   -1 or 1 : LINEAR_LAYOUT, packed [N, B, H, D] (legacy default)
-//         2 : LINEAR_HEADS_FIRST_LAYOUT, Tencent cross-layer 5D non-contiguous
+//         2 : LINEAR_HEADS_FIRST_LAYOUT, cross-layer 5D non-contiguous
 //             per-layer view. K and V are 4D [N, H, B, D] each, sliced from a
 //             6D physical buffer (N, H, L, 2, B, D). Innermost head_dim must
 //             be contiguous; per-head and per-block strides typically embed
