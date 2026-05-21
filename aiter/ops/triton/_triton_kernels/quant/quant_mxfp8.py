@@ -377,3 +377,71 @@ def _dual_rmsnorm_mxfp8_quant_kernel(
             y_k_out,
             mask=k_mask,
         )
+
+
+# Flatten-then-MXFP8 quant. Takes (M, N1, N2) input, flattens the trailing two
+# dims into N = N1 * N2, and emits per-1x32 MXFP8 (FP8 e4m3fn values + uint8
+# e8m0 scales) along the flattened axis. One program per (m, n1); each program
+# handles a row of N2 elements that contributes BLOCK_SIZE_N2 // 32 groups to
+# the M-th row of the (M, N) flattened output.
+
+
+@triton.jit
+def _fused_flatten_mxfp8_quant_kernel(
+    x_ptr,
+    out_ptr,
+    out_scales_ptr,
+    x_stride_m,
+    x_stride_n1,
+    x_stride_n2,
+    out_stride_m,
+    out_stride_n,
+    out_scales_stride_m,
+    out_scales_stride_n,
+    N2,
+    BLOCK_SIZE_N2: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,
+):
+    m = tl.program_id(0)
+    n1 = tl.program_id(1)
+
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N2 // QUANT_BLOCK_SIZE
+    # In the flattened (M, N1 * N2) output, each n1 segment is exactly N2 wide
+    # (not BLOCK_SIZE_N2), so stride between n1 segments must use N2 — otherwise
+    # non-power-of-2 N2 (e.g. 7168) would gap-write the output.
+    n2_groups = N2 // QUANT_BLOCK_SIZE
+
+    n2_offs = tl.arange(0, BLOCK_SIZE_N2)
+    x_mask = n2_offs < N2
+    x_offs = m * x_stride_m + n1 * x_stride_n1 + n2_offs * x_stride_n2
+    x = tl.load(x_ptr + x_offs, mask=x_mask, other=0.0).to(tl.float32)
+
+    # Per-1x32 MXFP8 quant: same recipe as _mxfp8_quant_kernel.
+    x_2d = tl.reshape(x, (NUM_QUANT_BLOCKS, QUANT_BLOCK_SIZE))
+    amax = tl.max(tl.abs(x_2d), axis=1, keep_dims=True)
+
+    amax_i32 = amax.to(tl.int32, bitcast=True)
+    amax_i32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax_p2 = amax_i32.to(tl.float32, bitcast=True)
+    scale_unbiased = tl.log2(amax_p2).floor() - 8
+    scale_unbiased = tl.clamp(scale_unbiased, min=-127, max=127)
+    scale_e8m0 = (scale_unbiased.to(tl.int32) + 127).to(tl.uint8)
+    quant_scale = tl.exp2(-scale_unbiased)
+
+    qx_2d = x_2d * quant_scale
+    qx = tl.reshape(qx_2d, (BLOCK_SIZE_N2,))
+    tl.store(
+        out_ptr + m * out_stride_m + (n1 * N2 + n2_offs) * out_stride_n,
+        qx.to(out_ptr.type.element_ty),
+        mask=x_mask,
+    )
+
+    block_scale_offs = tl.arange(0, NUM_QUANT_BLOCKS)
+    scale_flat = tl.reshape(scale_e8m0, (NUM_QUANT_BLOCKS,))
+    tl.store(
+        out_scales_ptr
+        + m * out_scales_stride_m
+        + (n1 * n2_groups + block_scale_offs) * out_scales_stride_n,
+        scale_flat,
+        mask=block_scale_offs < n2_groups,
+    )
