@@ -5,6 +5,9 @@ import torch
 import os
 import subprocess
 
+from aiter.jit.utils.chip_info import get_gfx
+from csrc.cpp_itfs.utils import AITER_CORE_DIR
+
 _is_hip_library_api_supported_ = False
 
 
@@ -239,3 +242,18 @@ def get_kernel(kernel_path_prefix, constexpr_args: tuple = ()):
         )
 
     return CallableKernel
+
+class HSACO:
+    def __init__(self, base = None):
+        self.base = f"{AITER_CORE_DIR}/hsa/{get_gfx()}" if base is None else base
+
+    def __getattr__(self, name):
+        return HSACO(f"{self.base}/{name}")
+    
+    def __call__(self, *args, **kwargs):
+        # kwargs is hsaco file name
+        # args is runtime-args
+        kernel = get_kernel(self.base, tuple(kwargs.items()))
+        kernel(*args)
+
+hsaco = HSACO()

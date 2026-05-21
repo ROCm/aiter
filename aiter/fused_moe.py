@@ -142,40 +142,6 @@ def fused_moe(
     bias2=None,
     splitk=0,
 ):
-    # Fast path for small batches for Qwen3.5 397B FP8 PTPC TP8 on gfx942 (only used for decoding phase: batch size 1~32)
-    # B=1~32, E=512, N1=256, K1=4096, N2=4096, K2=128, TOPK=10
-    if (os.environ.get("AITER_MOE_SMALL_BATCH", "0") == "1"
-        and 1 <= hidden_states.shape[0] <= 32
-        and hidden_states.dtype == torch.bfloat16
-        and expert_mask is None
-        and activation == ActivationType.Silu
-        and (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)
-        and get_gfx() == "gfx942"
-        and topk_ids.shape[1] == 10
-        and w1.shape[1] == 256
-        and w1.shape[2] == 4096
-        and w2.shape[1] == 4096
-        and w2.shape[2] == 128
-    ):
-        from aiter.fused_moe_ptpc_fp8 import fused_moe_ptpc_fp8
-        moe_buf = fused_moe_ptpc_fp8(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            activation,
-            quant_type,
-            w1_scale,
-            w2_scale,
-            expert_mask,
-            num_local_tokens,
-            moe_sorting_dispatch_policy,
-        )
-
-        if moe_buf is not None:
-            return moe_buf
-
     if not block_size_M:
         block_size_M = -1
     return fused_moe_(
@@ -324,6 +290,22 @@ def fused_moe_(
         intermediate_pad,
         isShuffled,
     )
+
+    if metadata.stage0 is not None:
+        return metadata.stage0(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            activation,
+            quant_type,
+            w1_scale,
+            w2_scale,
+            expert_mask,
+            num_local_tokens,
+            moe_sorting_dispatch_policy,
+        )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
@@ -656,6 +638,7 @@ class MOEMetadata:
     has_bias: bool = False
     use_non_temporal_load: bool = True
     fuse_fp4_quant: bool = False
+    stage0: Callable = None
 
 
 def _flydsl_stage1_wrapper(
@@ -954,6 +937,11 @@ def get_2stage_cfgs(
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
+
+    if kernelName1.startswith("fused_moe_ptpc_fp8"):
+        from aiter.fused_moe_asmjit_aot import fused_moe_asmjit_aot
+        return MOEMetadata(None, None, block_m, ksplit, run_1stage,
+                           stage0=functools.partial(fused_moe_asmjit_aot, config_string = kernelName1.split("__")[1]))
 
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
