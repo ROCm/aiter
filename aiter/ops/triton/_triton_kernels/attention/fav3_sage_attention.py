@@ -286,30 +286,48 @@ def _sage_fwd_blocksparse_nomask(
                 v = tl.load(v_ptrs, mask=v_mask, other=0.0)
             else:
                 v = tl.load(v_ptrs)
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
-        qk += tl.dot(q, k) * (q_descale * k_descale)
-        qk_scaled = qk
-        if USE_ALIBI:
-            q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            alibi_block = compute_alibi_block(
-                alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
-            )
-            qk_scaled += alibi_block
+
+        # -- compute qk ----
+        # Same optimization as in `_sage_fwd_no_mask`: defer the
+        # (q_descale * k_descale) descale until softmax so it can be fused
+        # with the m_ij subtract into a single FMA. Mathematically equivalent
+        # because scale > 0:
+        #   max(qk_int * scale) == max(qk_int) * scale
+        #   (qk_int * scale) - m_ij == fma(qk_int, scale, -m_ij)
+        qk_int = tl.dot(q, k)
+        scale = q_descale * k_descale
+
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
 
-        if USE_BIAS:
-            bias_ptrs = bias_base_ptrs + start_n * stride_bn
-            bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk_scaled += bias
+        if USE_ALIBI or USE_BIAS:
+            # Bias / alibi live in the scaled domain, materialize scaled qk.
+            qk_scaled = qk_int.to(ACCUMULATOR_TYPE) * scale
+            if USE_ALIBI:
+                q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                alibi_block = compute_alibi_block(
+                    alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
+                )
+                qk_scaled += alibi_block
+            if USE_BIAS:
+                bias_ptrs = bias_base_ptrs + start_n * stride_bn
+                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
+                qk_scaled += bias
 
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
-
-        if USE_BIAS:
-            q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
-            )
+            m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+            if USE_BIAS:
+                q_shifted = tl.where(
+                    m_ij[:, None] == float("-inf"),
+                    float("-inf"),
+                    qk_scaled - m_ij[:, None],
+                )
+            else:
+                q_shifted = qk_scaled - m_ij[:, None]
         else:
-            q_shifted = qk_scaled - m_ij[:, None]
+            # Fast path: keep qk in unscaled f32 and fuse scale into the FMA.
+            qk = qk_int.to(ACCUMULATOR_TYPE)
+            row_max_unscaled = tl.max(qk, 1)
+            m_ij = tl.maximum(m_i, row_max_unscaled * scale)
+            q_shifted = qk * scale - m_ij[:, None]
 
         if USE_EXP2:
             p = tl.math.exp2(q_shifted)
@@ -440,27 +458,51 @@ def _sage_fwd_blocksparse_mask(
             else:
                 v_mask = v_n_mask
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
-        qk += tl.dot(q, k) * (q_descale * k_descale)
-        qk_scaled = qk
-        if USE_ALIBI:
-            q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            alibi_block = compute_alibi_block(
-                alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
-            )
-            qk_scaled += alibi_block
+
+        # -- compute qk ----
+        # Same optimization as `_sage_fwd_no_mask`: defer the
+        # (q_descale * k_descale) descale until softmax so it can be fused
+        # with the m_ij subtract into a single FMA. Padding positions are
+        # masked to -inf, which is invariant under multiplication by the
+        # positive scale, so we can apply the mask in either domain.
+        qk_int = tl.dot(q, k)
+        scale = q_descale * k_descale
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-        if USE_BIAS:
-            bias_ptrs = bias_base_ptrs + start_n * stride_bn
-            bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk_scaled += bias
-        qk_scaled = tl.where(
-            qk_mask, qk_scaled, float("-inf")
-        )  # mask padding before softmax
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
-        q_shifted = tl.where(
-            m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
-        )
+
+        if USE_ALIBI or USE_BIAS:
+            # Bias / alibi live in the scaled domain, materialize scaled qk.
+            qk_scaled = qk_int.to(ACCUMULATOR_TYPE) * scale
+            if USE_ALIBI:
+                q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                alibi_block = compute_alibi_block(
+                    alibi_slope, seqlen_q, seqlen_k, q_offs_m, kv_offs_n
+                )
+                qk_scaled += alibi_block
+            if USE_BIAS:
+                bias_ptrs = bias_base_ptrs + start_n * stride_bn
+                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
+                qk_scaled += bias
+            qk_scaled = tl.where(
+                qk_mask, qk_scaled, float("-inf")
+            )  # mask padding before softmax
+            m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+            q_shifted = tl.where(
+                m_ij[:, None] == float("-inf"),
+                float("-inf"),
+                qk_scaled - m_ij[:, None],
+            )
+        else:
+            # Fast path: keep qk in unscaled f32 and fuse scale into the FMA.
+            qk = qk_int.to(ACCUMULATOR_TYPE)
+            qk = tl.where(qk_mask, qk, float("-inf"))
+            row_max_unscaled = tl.max(qk, 1)
+            m_ij = tl.maximum(m_i, row_max_unscaled * scale)
+            q_shifted = tl.where(
+                m_ij[:, None] == float("-inf"),
+                float("-inf"),
+                qk * scale - m_ij[:, None],
+            )
+
         if USE_EXP2:
             p = tl.math.exp2(q_shifted)
         else:
