@@ -697,13 +697,6 @@ class QManager8to16bitsV1
         cvt_scalef32_pk_bf16_fp8_pinned(uint32_t fp8_dw, float scale_f)
     {
         static_assert(DST_GPR < 256, "Pinned dst must be a VGPR (id < 256).");
-        // NOTE: direct cvt into a pinned vgpr (v[%0]) is correct on gfx950, but
-        // the compiler's HazardRecognizer cannot bridge the VALU(cvt)->MFMA hazard
-        // across two opaque `asm volatile` blocks (def of v_pinned and use of
-        // v_pinned are both hidden). Callers MUST emit one s_nop block after the
-        // last cvt and before the consuming MFMA (1 s_nop covers all writes since
-        // the cvts themselves issue back-to-back and the last write is the only
-        // hazard-relevant one).
         if constexpr(kOpSelHigh)
         {
             asm volatile("v_cvt_scalef32_pk_bf16_fp8 v[%0], %1, %2 op_sel:[1,0,0]"
@@ -872,15 +865,6 @@ class QManager8to16bitsV1
         cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 5u, true >(fp8_iter1[0], scale_f);
         cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 6u, false>(fp8_iter1[1], scale_f);
         cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 7u, true >(fp8_iter1[1], scale_f);
-        // VALU(v_cvt_scalef32_pk_bf16_fp8) -> MFMA hazard across opaque
-        // inline-asm: LLVM cannot see the def-of-pinned-vgpr inside this
-        // helper or the use-of-pinned-vgpr inside hk::mma_ABt, so it does
-        // NOT insert the required wait states. Without this s_nop the MFMA
-        // reads stale data for the LAST cvts in this chunk (the earlier
-        // cvts are bridged by the back-to-back issue of their successors).
-        // 1 nop is sufficient on gfx950 for this hazard (per v40-cvt-inline-
-        // asm-gotcha memory note).
-        asm volatile("s_nop 7" ::);
     }
 
     // ---- Phase 2: NoPE fp8 chunk -> bf16 LDS (cvt-at-store, mirrors KvManager) ----

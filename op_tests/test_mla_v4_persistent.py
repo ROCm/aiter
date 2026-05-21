@@ -33,7 +33,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.test_common import checkAllclose
+from aiter.test_common import checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -690,7 +690,8 @@ def test_mla_v4(
     # (nhead*decode_qlen)==128 is satisfied.
     if max_seqlen_qo * nhead == 128:
         out_v40 = torch.empty((total_q, nhead, V4_DIM_V), dtype=out_dtype)
-        v40_logits, _v40_final_lse = aiter.mla.mla_v40_decode_fwd(
+        (v40_logits, _v40_final_lse), us_v40_decode = run_perftest(
+            aiter.mla.mla_v40_decode_fwd,
             q_packed,
             q_rope_bf16,
             kv_packed,
@@ -708,6 +709,7 @@ def test_mla_v4(
             reduce_partial_map,
             sm_scale=sm_scale,
         )
+        ret["v40_us"] = us_v40_decode
         err = checkAllclose(
             out_silver.to(out_dtype),
             out_v40,
