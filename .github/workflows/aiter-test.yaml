@@ -507,7 +507,9 @@ jobs:
         if: success()
         with:
           name: standard-test-log-${{ matrix.runner }}-shard-${{ matrix.shard_idx }}
-          path: latest_test.log
+          path: |
+            latest_test.log
+            moe_bench.csv
           retention-days: 7
 
       - name: Cleanup container
@@ -756,3 +758,148 @@ jobs:
         if: always()
         run: |
           ./.github/scripts/clean_up_rocm.sh
+
+  bench_moe:
+    # MoE perf regression check.
+    # - PR: pull last main baseline CSV, compare current shard's CSV, warn-only
+    # - push to main / workflow_dispatch: publish current CSV as next baseline
+    # Only consumes csv from linux-aiter-mi35x-1 runner to avoid cross-arch noise.
+    name: MoE Bench Regression
+    if: >-
+      !github.event.pull_request.draft &&
+      github.event.action != 'labeled' &&
+      github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    needs: [standard]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download standard test logs (mi35x only)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: standard-test-log-linux-aiter-mi35x-1-shard-*
+          path: /tmp/logs/
+
+      - name: Locate current moe_bench.csv
+        id: current
+        run: |
+          shopt -s nullglob
+          csv_files=(/tmp/logs/*/moe_bench.csv)
+          if [[ ${#csv_files[@]} -eq 0 ]]; then
+              echo "::warning::No moe_bench.csv found in any mi35x shard; skipping bench_moe"
+              echo "found=false" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          if [[ ${#csv_files[@]} -gt 1 ]]; then
+              echo "::warning::Multiple moe_bench.csv found, using first: ${csv_files[0]}"
+              printf '  %s\n' "${csv_files[@]}"
+          fi
+          cp "${csv_files[0]}" /tmp/current.csv
+          echo "Current CSV: ${csv_files[0]} ($(wc -l < /tmp/current.csv) lines)"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      # ── PR path: compare vs baseline ──
+      - name: Fetch baseline from PR base.sha
+        if: steps.current.outputs.found == 'true' && github.event_name == 'pull_request'
+        id: baseline_pinned
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: aiter-test.yaml
+          commit: ${{ github.event.pull_request.base.sha }}
+          name: moe-bench-${{ github.event.pull_request.base.sha }}
+          path: /tmp/baseline_pinned/
+          if_no_artifact_found: warn
+
+      - name: Fallback — fetch baseline from latest main
+        if: >-
+          steps.current.outputs.found == 'true' &&
+          github.event_name == 'pull_request' &&
+          steps.baseline_pinned.outcome != 'success'
+        id: baseline_main
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: aiter-test.yaml
+          branch: main
+          name_is_regexp: true
+          name: ^moe-bench-[a-f0-9]+$
+          path: /tmp/baseline_main/
+          if_no_artifact_found: warn
+
+      - name: Compare
+        if: steps.current.outputs.found == 'true' && github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CURR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -e
+          baseline_csv=""
+          if [[ -f /tmp/baseline_pinned/moe_bench.csv ]]; then
+              baseline_csv=/tmp/baseline_pinned/moe_bench.csv
+              echo "Using baseline pinned to PR.base.sha=${BASE_SHA:0:7}"
+          else
+              # fallback: pick first match under /tmp/baseline_main/*
+              shopt -s nullglob
+              candidates=(/tmp/baseline_main/*/moe_bench.csv /tmp/baseline_main/moe_bench.csv)
+              for c in "${candidates[@]}"; do
+                  if [[ -f "$c" ]]; then
+                      baseline_csv="$c"
+                      echo "Using fallback baseline from latest main: $c"
+                      break
+                  fi
+              done
+          fi
+          if [[ -z "$baseline_csv" ]]; then
+              echo "::warning::No MoE baseline found (neither pinned PR.base.sha nor latest main); skipping compare."
+              {
+                  echo "## MoE Bench"
+                  echo
+                  echo "_No baseline available — first run on this branch or main hasn't published baseline yet._"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+          fi
+          echo "## MoE Bench (vs baseline)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          bash .github/scripts/check_moe_regression.sh \
+              "$baseline_csv" /tmp/current.csv \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # ── main push / workflow_dispatch path: publish baseline ──
+      - name: Stage baseline payload
+        if: >-
+          steps.current.outputs.found == 'true' &&
+          (github.event_name == 'push' && github.ref == 'refs/heads/main'
+           || github.event_name == 'workflow_dispatch')
+        run: |
+          mkdir -p /tmp/publish
+          cp /tmp/current.csv /tmp/publish/moe_bench.csv
+          python3 -c "
+          import json, os, datetime
+          meta = {
+              'commit': os.environ['GITHUB_SHA'],
+              'ref': os.environ['GITHUB_REF'],
+              'event': os.environ['GITHUB_EVENT_NAME'],
+              'runner_pool': 'linux-aiter-mi35x-1',
+              'gpu_arch_list': os.environ.get('GPU_ARCH_LIST', ''),
+              'ran_at': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+          }
+          with open('/tmp/publish/metadata.json', 'w') as f:
+              json.dump(meta, f, indent=2)
+          print(json.dumps(meta, indent=2))
+          "
+          ls -la /tmp/publish/
+          wc -l /tmp/publish/moe_bench.csv
+
+      - name: Publish baseline artifact
+        if: >-
+          steps.current.outputs.found == 'true' &&
+          (github.event_name == 'push' && github.ref == 'refs/heads/main'
+           || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@v4
+        with:
+          name: moe-bench-${{ github.sha }}
+          path: /tmp/publish/
+          retention-days: 90
