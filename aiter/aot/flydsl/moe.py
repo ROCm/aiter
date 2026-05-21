@@ -27,6 +27,7 @@ import csv
 import os
 import sys
 import time
+from typing import Optional
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -186,7 +187,14 @@ def _precompile_to_cache(
     out_dtype: str = "bf16",
     act: str = "silu",
     doweight_stage1: bool = False,
-    waves_per_eu: int = 3,
+    # Must match the runtime default of ``compile_mixed_moe_gemm2`` /
+    # ``compile_mixed_moe_gemm1`` (``Optional[int] = None``). A scalar default
+    # (e.g. ``3``) would make the AOT-side ``_cache_tag`` tuple disagree with
+    # the runtime-side tuple for any legacy kernel that does not explicitly
+    # pin ``waves_per_eu`` in ``get_flydsl_stage{1,2}_kernels`` (only the
+    # production-variant ``_persist_async_w4_cumul3`` does), causing
+    # ``AOT cache miss`` at runtime even though the .pkl is present on disk.
+    waves_per_eu: Optional[int] = None,
     k_batch: int = 1,
     b_nt: int = 2,
     gate_mode: str = "separated",
