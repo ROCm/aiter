@@ -577,7 +577,8 @@ def lds_store_4b_xor16(
     col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
     coord_store = (row_local, col_swz)
     idx0 = crd2idx(coord_store, layout_lds) + lds_base
-    v4 = vector.bitcast(vec4_ty, vec_part_i32x1)
+    vec_i32x1 = vector.from_elements(T.vec(1, T.i32), [vec_part_i32x1])
+    v4 = vector.bitcast(vec4_ty, vec_i32x1)
     vector.store(v4, lds_memref, [idx0])
 
 

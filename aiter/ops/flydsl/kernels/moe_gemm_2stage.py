@@ -1689,7 +1689,7 @@ def compile_moe_gemm1(
                         for ni in range_constexpr(num_acc_n):
                             col_i32 = col_i32_list[ni]
                             sw_gate = sw_gate_vals[ni]
-                            sw_up = sw_up_vals[ni] if not use_g1u1 else None
+                            sw_up = sw_up_vals[ni] if use_g1u1 else None
 
                             acc_idx = mi * num_acc_n + ni
                             vg = vector.extract(
@@ -1980,7 +1980,7 @@ def compile_moe_gemm2(
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}"
-        f"_abi3"  # mask sentinel token ids on loads/stores to avoid illegal address faults
+        f"_abi4"  # keep CShuffle block-size mapping aligned with dynamic thread count
     ).replace("-", "_")
 
     # ── CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel
@@ -2322,9 +2322,9 @@ def compile_moe_gemm2(
                         if x_load_bytes == 16:
                             parts.append(vector.bitcast(T.i32x4, x_vec))
                         elif x_load_bytes == 8:
-                            parts.append(vector.bitcast(T.vec(2, T.i32), x_vec))
+                            parts.append(x_vec)
                         else:
-                            parts.append(vector.bitcast(T.vec(1, T.i32), x_vec))
+                            parts.append(x_vec)
                     return parts
 
                 # tx -> wave/lane (GEMM-style decomposition).
@@ -3310,6 +3310,7 @@ def compile_moe_gemm2(
                         range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
+                        block_size=total_threads,
                         e_vec=e_vec,
                         m_repeat=m_repeat,
                         num_acc_n=num_acc_n,

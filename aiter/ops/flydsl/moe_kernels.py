@@ -8,6 +8,7 @@ import os
 import re
 
 from typing import Dict, Optional
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility import dtypes
 
 import flydsl.compiler as flyc
@@ -24,6 +25,28 @@ _KERNEL_NAME_RE = re.compile(
 
 _MFMA16_ALIASES = {"16", "16x16", "16x16x128", "mfma16", "mfma16k128"}
 _MFMA32_ALIASES = {"32", "32x32", "32x32x64", "mfma32", "mfma32k64"}
+_LDS_LIMIT_BYTES_BY_GFX = {
+    "gfx942": 64 * 1024,
+    "gfx950": 160 * 1024,
+}
+
+
+def _current_gfx() -> str:
+    return str(get_gfx()).split(":", 1)[0].lower()
+
+
+def _expand_per_tensor_scale(scale: Optional[torch.Tensor], rows: int, cols: int):
+    """Expand compact per-tensor/per-expert scales to FlyDSL row-scale layout."""
+    if scale is None:
+        return None
+    flat = scale.view(-1)
+    if flat.numel() == 1:
+        return flat.expand(rows).contiguous()
+    if flat.numel() == rows:
+        return flat
+    if cols > 1 and flat.numel() * cols == rows:
+        return flat.view(-1, 1).expand(-1, cols).contiguous().view(-1)
+    return flat
 
 
 def _stage2_mfma_variant_tag(tile_k: int, a_dtype: str, b_dtype: str) -> str:
@@ -164,34 +187,104 @@ def _x_load_supported(
     return bytes_per_thread_x % 4 == 0
 
 
+@functools.lru_cache(maxsize=1)
+def _device_lds_limit_bytes() -> int:
+    """Return the supported gfx target's per-workgroup LDS limit in bytes."""
+    gfx = _current_gfx()
+    if gfx not in _LDS_LIMIT_BYTES_BY_GFX:
+        raise RuntimeError(f"FlyDSL MoE LDS filtering does not support {gfx!r}.")
+    return _LDS_LIMIT_BYTES_BY_GFX[gfx]
+
+
+def _async_copy_candidates() -> list[bool]:
+    gfx = _current_gfx()
+    if gfx == "gfx942":
+        #TODO: gfx942 not support buffer load from global memory to LDS directly, so we only support false
+        return [False]
+    if gfx == "gfx950":
+        return [False, True]
+    raise RuntimeError(f"FlyDSL MoE async-copy enumeration does not support {gfx!r}.")
+
+
+def _lds_within_limit(
+    a_dtype: str,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    waves_per_eu: int,
+    *,
+    use_cshuffle_epilog: bool = True,
+    lds_limit_bytes: Optional[int] = None,
+) -> bool:
+    """Filter candidates that exceed the supported gfx target's LDS limit."""
+    if lds_limit_bytes is None:
+        lds_limit_bytes = _device_lds_limit_bytes()
+    elem_bytes = 2 if a_dtype in ("fp16", "bf16", "int4_bf16") else 1
+    lds_x_bytes = 2 * int(tile_m) * int(tile_k) * int(elem_bytes)
+    lds_out_bytes = 2 * int(tile_m) * int(tile_n) if use_cshuffle_epilog else 0
+    lds_tid_bytes = int(tile_m) * 4
+    lds_total_bytes = max(lds_x_bytes, lds_out_bytes) + lds_tid_bytes
+    if waves_per_eu >= 1:
+        # Match compile_moe_gemm{1,2}: waves_per_eu reserves minimum LDS to
+        # influence occupancy. With 160KB total LDS, waves_per_eu=1 raises
+        # allocation to ~82KB.
+        min_lds = (160 * 1024) // (waves_per_eu + 1) + 1
+        lds_total_bytes = max(lds_total_bytes, min_lds)
+    return lds_total_bytes <= lds_limit_bytes
+
+
 def get_flydsl_stage1_kernels(
-    a_dtype: str, b_dtype: str, out_dtype: str, model_dim: Optional[int] = None
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str,
+    model_dim: Optional[int] = None,
+    n_dim: Optional[int] = None,
 ) -> Dict[str, Dict]:
     """Return {kernelName: params} for all supported stage1 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
 
-    tile_ns = [32, 64, 128, 256] if is_fp4 else [128, 256]
+    tile_ns = [32, 64, 128, 256] if is_fp4 else [64, 128, 256]
     tile_ks = [256] if is_fp4 else [128, 256]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     waves_per_eus = [1, 2, 3, 4] if is_fp4 else [0, 1, 2, 3, 4]
     k_batches = [1, 2, 4, 8, 16] if is_fp4 else [1]
     b_nts = [0, 2] if is_fp4 else [0, 2]
-    # Stage1: fp4 (mixed) and non-fp4 (moe_gemm_2stage) both honor ``use_async_copy``.
-    async_copies = [False, True]
-
+    async_copies = _async_copy_candidates()
     for tm in tile_ms:
+        stage1_tile_ns = tile_ns
         if is_fp4:
             if tm in [16, 32]:
-                tile_ns = [32, 64, 128]
+                stage1_tile_ns = [32, 64, 128]
             else:
-                tile_ns = [64, 128, 256]
-        for tn in tile_ns:
+                stage1_tile_ns = [64, 128, 256]
+        for tn in stage1_tile_ns:
+            if n_dim is not None and n_dim % tn != 0:
+                continue
+            use_cshuffle_epilog = None if is_fp4 or tn % 128 == 0 else False
             for tk in tile_ks:
+                if model_dim is not None and model_dim % tk != 0:
+                    continue
                 for async_copy in async_copies:
                     if not _x_load_supported(a_dtype, tm, tn, tk, async_copy):
                         continue
                     for wpe in waves_per_eus:
+                        if (
+                            not is_fp4
+                            and not _lds_within_limit(
+                                a_dtype,
+                                tm,
+                                tn,
+                                tk,
+                                wpe,
+                                use_cshuffle_epilog=(
+                                    True
+                                    if use_cshuffle_epilog is None
+                                    else bool(use_cshuffle_epilog)
+                                ),
+                            )
+                        ):
+                            continue
                         for kb in k_batches if wpe == 3 else [1]:
                             if is_fp4:
                                 if tk == 512 and kb == 16:
@@ -235,6 +328,7 @@ def get_flydsl_stage1_kernels(
                                         "tile_n": tn,
                                         "tile_k": tk,
                                         "MPerBlock": tm,
+                                        "use_cshuffle_epilog": use_cshuffle_epilog,
                                         "use_async_copy": async_copy,
                                         "waves_per_eu": wpe,
                                         "k_batch": kb,
@@ -245,22 +339,30 @@ def get_flydsl_stage1_kernels(
 
 
 def get_flydsl_stage2_kernels(
-    a_dtype: str, b_dtype: str, out_dtype: str
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str,
+    k_dim: Optional[int] = None,
+    n_dim: Optional[int] = None,
 ) -> Dict[str, Dict]:
     """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     tile_ns = [128, 256] if is_fp4 else [128, 256]
-    tile_ks = [128, 256] if is_fp4 else [128, 256]
+    tile_ks = [128, 256] if is_fp4 else [64, 128, 256]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
     waves_per_eus = [0] if is_fp4 else [0, 1, 2, 3, 4]
     b_nts = [0] if is_fp4 else [0, 2]
-    async_copies = [False, True]
+    async_copies = _async_copy_candidates()
 
     for tm in tile_ms:
         for tn in tile_ns:
+            if n_dim is not None and n_dim % tn != 0:
+                continue
             for tk in tile_ks:
+                if k_dim is not None and k_dim % tk != 0:
+                    continue
                 mfma_variant_tag = _stage2_mfma_variant_tag(tk, a_dtype, b_dtype)
                 if is_fp4 and tk == 128:
                     # tile_k=128 uses the dedicated MFMA32/K64 stage2 path.
@@ -275,6 +377,10 @@ def get_flydsl_stage2_kernels(
                         if not _x_load_supported(a_dtype, tm, tn, tk, async_copy):
                             continue
                         for wpe in waves_per_eus:
+                            if not is_fp4 and not _lds_within_limit(
+                                a_dtype, tm, tn, tk, wpe
+                            ):
+                                continue
                             for bnt in b_nts:
                                 base_name = flydsl_kernel_name(
                                     2,
@@ -313,12 +419,6 @@ def get_flydsl_stage2_kernels(
                                 if mfma_variant_tag:
                                     base_params["mfma_variant"] = mfma_variant_tag
                                 kernels[base_name] = base_params
-                                # # Persistent variant: round-robin over M tiles, grid_y=cu_num.
-                                # if is_fp4:
-                                #     kernels[base_name + "_persist"] = {
-                                #         **base_params,
-                                #         "persist": True,
-                                #     }
     return kernels
 
 
@@ -357,6 +457,7 @@ def compile_flydsl_moe_stage1(
     fuse_fp4_quant: bool = False,
     fuse_sort_scale: bool = False,
     use_async_copy: bool = False,
+    use_cshuffle_epilog: Optional[bool] = None,
     k_batch: int = 1,
     waves_per_eu: int = 3,
     b_nt: int = 2,
@@ -405,6 +506,7 @@ def compile_flydsl_moe_stage1(
             out_dtype=out_dtype,
             act=act,
             use_g1u1=use_g1u1,
+            use_cshuffle_epilog=use_cshuffle_epilog,
             use_async_copy=use_async_copy,
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
@@ -682,6 +784,7 @@ def flydsl_moe_stage1(
     fuse_fp4_quant: bool = False,
     fuse_sort_scale: bool = False,
     use_async_copy: bool = False,
+    use_cshuffle_epilog: Optional[bool] = None,
     k_batch: int = 1,
     waves_per_eu: int = 3,
     b_nt: int = 2,
@@ -793,12 +896,12 @@ def flydsl_moe_stage1(
     else:
         tmp_out = None
 
-    flat_a_scale = (
-        a1_scale.view(-1) if a1_scale is not None else torch.empty(0, device=dev)
-    )
-    flat_w_scale = (
-        w1_scale.view(-1) if w1_scale is not None else torch.empty(0, device=dev)
-    )
+    flat_a_scale = _expand_per_tensor_scale(a1_scale, token_num, 1)
+    if flat_a_scale is None:
+        flat_a_scale = torch.empty(0, device=dev)
+    flat_w_scale = _expand_per_tensor_scale(w1_scale, E * w1.shape[1], w1.shape[1])
+    if flat_w_scale is None:
+        flat_w_scale = torch.empty(0, device=dev)
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -902,6 +1005,9 @@ def flydsl_moe_stage1(
         fuse_fp4_quant=_gemm_fq,
         fuse_sort_scale=_gemm_fss,
         use_async_copy=use_async_copy,
+        use_cshuffle_epilog=False
+        if use_cshuffle_epilog is None and tile_n % 128 != 0
+        else use_cshuffle_epilog,
         k_batch=k_batch,
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
@@ -1015,12 +1121,12 @@ def flydsl_moe_stage2(
         )
 
     dev = inter_states.device
-    flat_a_scale = (
-        a2_scale.view(-1) if a2_scale is not None else torch.empty(0, device=dev)
-    )
-    flat_w_scale = (
-        w2_scale.view(-1) if w2_scale is not None else torch.empty(0, device=dev)
-    )
+    flat_a_scale = _expand_per_tensor_scale(a2_scale, token_num * topk, 1)
+    if flat_a_scale is None:
+        flat_a_scale = torch.empty(0, device=dev)
+    flat_w_scale = _expand_per_tensor_scale(w2_scale, E * model_dim, model_dim)
+    if flat_w_scale is None:
+        flat_w_scale = torch.empty(0, device=dev)
     sw = (
         sorted_weights
         if sorted_weights is not None

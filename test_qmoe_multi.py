@@ -86,6 +86,12 @@ QUANT_PRESETS: Dict[str, QuantSpec] = {
     ),
 }
 
+QTYPE_PRESETS = {
+    "per_token": QuantType.per_Token,
+    "per_tensor": QuantType.per_Tensor,
+    "per_1x32": QuantType.per_1x32,
+}
+
 
 EVAL_GLOBALS = {
     "__builtins__": {},
@@ -267,6 +273,14 @@ def quantize_weight(
     q_dtype_w: torch.dtype,
     chunk_experts: int = 0,
 ):
+    if q_type == QuantType.per_Tensor and q_dtype_w != torch.int4 and weight.dim() == 3:
+        # FMOE kernels use one scale per expert for per_tensor weights.
+        expert = weight.shape[0]
+        weight_qt, weight_scale = aiter.pertoken_quant(
+            weight.view(expert, -1), quant_dtype=q_dtype_w
+        )
+        return weight_qt.view(weight.shape), weight_scale
+
     torch_quant = get_torch_quant(q_type)
     if (
         q_type == QuantType.per_1x32
@@ -487,6 +501,11 @@ def torch_moe_reference(
         and not quant.is_hybrid
         and quant.q_type in {QuantType.per_Token, QuantType.per_Tensor}
         and quant.q_dtype_w != dtypes.fp4x2
+        and not (
+            quant.q_type == QuantType.per_Tensor
+            and w1_scale is not None
+            and w1_scale.numel() == case.expert
+        )
     ):
         return torch_moe(
             hidden,
@@ -587,7 +606,7 @@ def run_fused_moe(
     )
 
 
-def check_result(ref_out, test_out, atol=1.0, rtol=0.05, pass_pct=95.0):
+def check_result(ref_out, test_out, atol=1.0, rtol=0.05, pass_pct=95.0, min_cos=0.99):
     delta = (ref_out.float() - test_out.float()).abs()
     max_delta = float(delta.max().item())
     close_mask = torch.isclose(ref_out.float(), test_out.float(), atol=atol, rtol=rtol)
@@ -598,17 +617,41 @@ def check_result(ref_out, test_out, atol=1.0, rtol=0.05, pass_pct=95.0):
         ).item()
     )
     return {
-        "pass": pct_close >= pass_pct,
+        "pass": pct_close >= pass_pct and cos > min_cos,
         "max_delta": max_delta,
         "pct_close": pct_close,
         "cos": cos,
     }
 
 
-def _build_quant_pair(stage1_quant: str, stage2_quant: str) -> QuantSpec:
-    q1 = QUANT_PRESETS[stage1_quant]
-    q2 = QUANT_PRESETS[stage2_quant]
-    name = stage1_quant if stage1_quant == stage2_quant else f"{stage1_quant}->{stage2_quant}"
+def _build_stage_quant(quant_name: str, qtype_name: str) -> QuantSpec:
+    quant = QUANT_PRESETS[quant_name]
+    q_type = quant.q_type if qtype_name == "default" else QTYPE_PRESETS[qtype_name]
+
+    if quant_name == "fp4" and q_type != QuantType.per_1x32:
+        raise ValueError("--quant-type for fp4 must be per_1x32")
+    if quant_name != "fp4" and q_type == QuantType.per_1x32:
+        raise ValueError("--quant-type per_1x32 is only supported for fp4")
+
+    name = quant_name if quant.q_type == q_type else f"{quant_name}_{qtype_name}"
+    return QuantSpec(
+        name=name,
+        q_type=q_type,
+        q_dtype_a=quant.q_dtype_a,
+        q_dtype_w=quant.q_dtype_w,
+    )
+
+
+def _build_quant_pair(
+    stage1_quant: str,
+    stage2_quant: str,
+    stage1_qtype: str = "default",
+    stage2_qtype: str = "same",
+) -> QuantSpec:
+    q1 = _build_stage_quant(stage1_quant, stage1_qtype)
+    q2_qtype = stage1_qtype if stage2_qtype == "same" else stage2_qtype
+    q2 = _build_stage_quant(stage2_quant, q2_qtype)
+    name = q1.name if q1.name == q2.name else f"{q1.name}->{q2.name}"
     return QuantSpec(
         name=name,
         q_type=q1.q_type,
@@ -620,7 +663,13 @@ def _build_quant_pair(stage1_quant: str, stage2_quant: str) -> QuantSpec:
     )
 
 
-def expand_quant_list(case: CaseSpec, selected_quant: List[str], stage2_quant: str) -> List[QuantSpec]:
+def expand_quant_list(
+    case: CaseSpec,
+    selected_quant: List[str],
+    stage2_quant: str,
+    stage1_qtype: str,
+    stage2_qtype: str,
+) -> List[QuantSpec]:
     if case.csv_quant is not None:
         csv_stage1_name = case.csv_quant.name.split("->", 1)[0]
         if selected_quant and case.csv_quant.name in selected_quant:
@@ -630,7 +679,12 @@ def expand_quant_list(case: CaseSpec, selected_quant: List[str], stage2_quant: s
         return [case.csv_quant]
     resolved_stage2 = stage2_quant if stage2_quant != "same" else None
     return [
-        _build_quant_pair(stage1_q, stage1_q if resolved_stage2 is None else resolved_stage2)
+        _build_quant_pair(
+            stage1_q,
+            stage1_q if resolved_stage2 is None else resolved_stage2,
+            stage1_qtype,
+            stage2_qtype,
+        )
         for stage1_q in selected_quant
     ]
 
@@ -660,6 +714,20 @@ def parse_args():
         choices=["same", "int8", "fp8", "fp4"],
         default="same",
         help="Stage2 quant mode when CSV does not provide q_type2/q_dtype_*2.",
+    )
+    parser.add_argument(
+        "--quant-type",
+        type=str,
+        choices=["default", "per_token", "per_tensor", "per_1x32"],
+        default="default",
+        help="Override stage1 q_type for CLI cases.",
+    )
+    parser.add_argument(
+        "--quant2-type",
+        type=str,
+        choices=["same", "default", "per_token", "per_tensor", "per_1x32"],
+        default="same",
+        help="Override stage2 q_type for CLI cases; 'same' follows --quant-type.",
     )
     parser.add_argument(
         "--run",
@@ -695,6 +763,7 @@ def parse_args():
     parser.add_argument("--atol", type=float, default=1.0)
     parser.add_argument("--rtol", type=float, default=0.05)
     parser.add_argument("--pass-pct", type=float, default=95.0)
+    parser.add_argument("--min-cos", type=float, default=0.99)
     parser.add_argument(
         "--fmoe-config",
         type=str,
@@ -743,7 +812,9 @@ def main():
     results = []
     global_idx = 0
     for case in cases:
-        quant_list = expand_quant_list(case, args.quant, args.quant2)
+        quant_list = expand_quant_list(
+            case, args.quant, args.quant2, args.quant_type, args.quant2_type
+        )
         if not quant_list:
             print(f"[SKIP] {case.case_name}: quant filter excludes this case.")
             continue
@@ -848,6 +919,7 @@ def main():
                         atol=args.atol,
                         rtol=args.rtol,
                         pass_pct=args.pass_pct,
+                        min_cos=args.min_cos,
                     )
                     print(
                         f"[FUNC] pass={stat['pass']} "
