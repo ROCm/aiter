@@ -17,7 +17,11 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict, write_lookup_header  # noqa: E402
+from chip_info import (  # noqa: E402
+    build_tune_dict,
+    write_lookup_header,
+    write_name_keyed_lookup_header,
+)
 
 from gemm_a8w8_blockscale_cktile_instance import (  # noqa: E402
     default_kernels_cktile_dict,
@@ -74,7 +78,8 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    bool preshuffleB
+    bool preshuffleB,
+    int k_batch
     )
 {{
     // Get M, N, K from input tensors.
@@ -96,10 +101,11 @@ torch::Tensor
             {str(k.TransposeC).lower()},
             {str(k.UsePersistentKernel).lower()},
             ck_tile::GemmPipelineScheduler::{k.Scheduler},
-            {k.BlockPerCu}>;
+            {k.BlockPerCu},
+            {str(k.AQRowMajor).lower()}>;
 
         // Run kernel instance.
-        return gemm_a8w8_blockscale_cktile_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+        return gemm_a8w8_blockscale_cktile_impl<DDataType, EDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, preshuffleB, k_batch);
 """
 
         TILE_INSTANCE_IMPL_str = TILE_INSTANCE_IMPL.replace(
@@ -122,7 +128,8 @@ template torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    bool preshuffleB
+    bool preshuffleB,
+    int k_batch
     );
 
 """
@@ -143,10 +150,19 @@ template torch::Tensor
 
     def gen_lookup_dict(self, kernels_dict: dict):
         """
-        Generate lookup dictionary for kernel instances
+        Generate lookup dictionary for kernel instances.
+
+        - Tune mode (istune=True): emits a kernelId-keyed table for *_tune.cu.
+        - Non-tune mode (istune=False): emits a name-keyed registry consumed
+          by gemm_a8w8_blockscale_cktile.cu's Python-driven dispatch.
         """
 
-        LOOKUP_head = """#pragma once
+        output_path = os.path.join(
+            self.working_path, "gemm_a8w8_blockscale_cktile_lookup.h"
+        )
+
+        if self.istune:
+            LOOKUP_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -155,23 +171,49 @@ template torch::Tensor
 #define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
    {                                                                                                                             \\"""
 
-        LOOKUP_template = """
+            LOOKUP_template = """
        {{{MNK},                                                                                                       \\
         {kernel_name}<DTYPE, ETYPE>}},                       \\"""
 
-        LOOKUP_end = """
+            LOOKUP_end = """
    }
 
 #endif // USE_ROCM
 """
-        write_lookup_header(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_lookup.h"),
-            kernels_dict,
-            LOOKUP_head,
-            LOOKUP_template,
-            LOOKUP_end,
-            self.istune,
-        )
+            write_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+                self.istune,
+            )
+        else:
+            LOOKUP_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
+   {                                                                                                                             \\"""
+
+            LOOKUP_template = """
+       {{"{kernel_name}",                                                                                                       \\
+        {kernel_name}<DTYPE, ETYPE>}},                       \\"""
+
+            LOOKUP_end = """
+   }
+
+#endif // USE_ROCM
+"""
+            write_name_keyed_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+            )
 
     def gen_manifest_head(self, kernels_dict):
         """
@@ -197,7 +239,8 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    bool preshuffleB);
+    bool preshuffleB,
+    int k_batch);
 """
         MAINFEST_end = """
 
