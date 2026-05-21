@@ -10,35 +10,9 @@
 
 namespace aiter {
 
-// E8M0 block-scale rounding modes for the whole MX format family
-// (mxfp4 / mxfp6 / mxfp8 / mxint8) -- the four formulas FLOOR / RCEIL /
-// CEIL / EVEN are dtype-agnostic, only ``max_pos`` / ``max_pow2`` constants
-// differ (see PyTorch torchao ``ScaleCalculationMode`` for the same design).
-// Used here by the mxfp4 kernel; future mx kernels can reuse this enum.
-//
-// Names follow AMD Quark's RoundMode for AMD-side familiarity. Each value is
-// 1:1 mathematically equivalent to a PyTorch torchao ScaleCalculationMode
-// (see csrc/kernels/quant.md "Cross-Stack Mode Alignment Reference"):
-//   Quark RoundMode (this enum) <-> torchao ScaleCalculationMode
-//   RoundDown                   <-> FLOOR
-//   RoundUp                     <-> RCEIL
-//   Even                        <-> EVEN
-//   Ceil                        <-> CEIL    (no Quark equivalent)
-// Ref: Quark/quark/torch/quantization/utils.py     (RoundMode enum)
-//      Quark/quark/torch/kernel/mx/triton.py        (_compute_quant_and_scale)
-//      torchao/prototype/mx_formats/config.py       (ScaleCalculationMode)
-//      torchao/prototype/mx_formats/mx_tensor.py    (_to_mx_rceil and friends)
-enum class MxScaleRoundMode : int {
-    RoundDown = 0, // OCP / NV ROUND_DOWN / torchao FLOOR:
-                   //   scale = floor_pow2(amax) / 4. ~37% max clipping.
-    RoundUp   = 1, // NV / DSv4 Pro / FlashInfer / torchao RCEIL:
-                   //   scale = ceil_pow2(amax / 6). 0% max clipping. (industry default)
-    Even      = 2, // Quark EVEN / torchao EVEN:
-                   //   scale = round_pow2_1.75(amax) / 4. ~21% max clipping.
-    Ceil      = 3, // torchao CEIL (no Quark / NV equivalent):
-                   //   scale = ceil_pow2(amax) / 4. 0% max clipping but
-                   //   coarser grid than RoundUp on [2^k, 1.5*2^k).
-};
+// MxScaleRoundMode lives in fp4_quant_utils.h so future mx kernels
+// (quant_mxfp6.cu / quant_mxfp8.cu / quant_mxint8.cu) can reuse the same
+// enum without redefining it.
 
 #define EVEN_ROUND_FP32_SIGN_EXP_MASK 0x7F800000u
 #define EVEN_ROUND_VAL_TO_ADD         0x00200000u
