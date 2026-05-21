@@ -154,7 +154,7 @@ def _mhc_fused_kernel(
             other=0.0,
         )
 
-        acc += tl.dot(x_tile, phi_tile)
+        acc = tl.dot(x_tile, phi_tile, acc=acc)
         x_tile_f32 = x_tile.to(tl.float32)
         acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
 
@@ -317,7 +317,7 @@ def _mhc_fused_split_kernel(
             other=0.0,
         )
 
-        acc += tl.dot(x_tile, phi_tile)
+        acc = tl.dot(x_tile, phi_tile, acc=acc)
         x_tile_f32 = x_tile.to(tl.float32)
         acc_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
 
