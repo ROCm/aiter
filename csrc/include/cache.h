@@ -27,6 +27,13 @@ void reshape_and_cache(torch::Tensor& key,
                        std::optional<torch::Tensor> v_scale,
                        const bool asm_layout);
 
+// kv_layout selects the K/V cache tensor interpretation:
+//   -1 or 1 : LINEAR_LAYOUT, packed [N, B, H, D] (legacy default)
+//         2 : LINEAR_HEADS_FIRST_LAYOUT, Tencent cross-layer 5D non-contiguous
+//             per-layer view. K and V are 4D [N, H, B, D] each, sliced from a
+//             6D physical buffer (N, H, L, 2, B, D). Innermost head_dim must
+//             be contiguous; per-head and per-block strides typically embed
+//             the cross-layer factor (2 * num_layers).
 void reshape_and_cache_flash(torch::Tensor& key,
                              torch::Tensor& value,
                              torch::Tensor& key_cache,
@@ -34,7 +41,8 @@ void reshape_and_cache_flash(torch::Tensor& key,
                              torch::Tensor& slot_mapping,
                              const std::string& kv_cache_dtype,
                              torch::Tensor& k_scale,
-                             torch::Tensor& v_scale);
+                             torch::Tensor& v_scale,
+                             int kv_layout = -1);
 
 void reshape_and_cache_with_pertoken_quant(torch::Tensor& key,
                                            torch::Tensor& value,

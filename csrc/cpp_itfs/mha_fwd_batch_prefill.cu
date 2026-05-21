@@ -47,6 +47,21 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     int head_size_q  = args.hdim_q;
     int head_size_v  = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
+
+    // LINEAR_HEADS_FIRST_LAYOUT (Tencent cross-layer 5D KV cache) shares the same
+    // address arithmetic as LINEAR_LAYOUT inside the kernel: the kernel computes
+    //     addr = base + head_idx * nhead_stride + page * batch_stride + tok * stride
+    // and never inspects the enum at runtime. The wrapper above already produced
+    // the correct (non-contiguous) strides for the heads-first 4D [N,H,B,D] view,
+    // so we just collapse the enum to LINEAR_LAYOUT at dispatch time to reuse the
+    // existing generated CK Tile kernel instances and avoid combinatorial codegen.
+    auto dispatch_kv_memory_layout = args.kv_memory_layout;
+    if(dispatch_kv_memory_layout ==
+       ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT)
+    {
+        dispatch_kv_memory_layout =
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT;
+    }
     auto traits      = get_mha_batch_prefill_traits(head_size_q,
                                                head_size_v,
                                                q_dtype_str,
@@ -57,7 +72,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                                has_lse,
                                                has_dropout,
                                                qscale_type,
-                                               args.kv_memory_layout,
+                                               dispatch_kv_memory_layout,
                                                args.kv_lookup_table,
                                                args.page_block_size);
     return fmha_batch_prefill(traits, args, stream_config);
