@@ -169,18 +169,17 @@ def get_kernel_config_triton(m, n, k, routing_data):
             grid_m = routing_data.n_blocks(m, block_m)
             grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
-            while block_n >= 64 and grid < 256:
-                block_n = block_n // 2
-                grid_m = routing_data.n_blocks(m, block_m)
-                grid_n = triton.cdiv(n, block_n)
-                grid = grid_m * grid_n * split_k
-        elif block_m == 32:
-            if n <= 1024:
-                block_n = 128
-                num_warps = 4
-            else:
-                block_n = 256
-                num_warps = 8
+
+        if k >= 512:
+            block_k = 512
+
+    elif block_m == 32:
+        if n <= 1024:
+            block_n = 128
+            num_warps = 4
+        elif n <= 4096:
+            block_n = 256
+            num_warps = 4
         else:
             block_n = 512
             num_warps = 4
