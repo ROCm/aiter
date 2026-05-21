@@ -11,7 +11,6 @@ from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4,
 )
 
-from aiter.ops.triton.gluon.triton_version import TRITON_VERSION_EQ_3_5
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.shuffle import shuffle_weight, shuffle_weight_gfx1250
@@ -284,7 +283,7 @@ def test_gemm_afp4_wfp4(
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     if shuffle_weight_scales:
-        use_aot: bool = TRITON_VERSION_EQ_3_5 and dtype == torch.bfloat16
+        use_aot: bool = dtype == torch.bfloat16
         triton_out = gemm_afp4wfp4_preshuffle(
             x,
             w_triton,
