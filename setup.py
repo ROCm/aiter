@@ -17,12 +17,19 @@ FLYDSL_VERSION = "flydsl==0.1.7"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+# Comma-separated allowlist of module names to prebuild. When set, only the
+# listed modules are built; PREBUILD_KERNELS mode-specific extras (MHA varlen
+# variants, MoE ck2stages variants, FlyDSL AOT) are skipped.
+PREBUILD_ONLY = [
+    m.strip() for m in os.environ.get("PREBUILD_ONLY", "").split(",") if m.strip()
+]
 PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
 if IS_WINDOWS:
     ENABLE_CK = False
     PREBUILD_KERNELS = False
+    PREBUILD_ONLY = []
 
 
 def getMaxJobs():
@@ -222,6 +229,19 @@ def get_exclude_ops():
         exclude_ops.extend(sorted(core._get_ck_exclude_modules()))
         return exclude_ops
 
+    # PREBUILD_ONLY allowlist takes precedence over PREBUILD_KERNELS modes.
+    if PREBUILD_ONLY:
+        unknown = [m for m in PREBUILD_ONLY if m not in all_modules]
+        if unknown:
+            print(
+                f"[aiter] PREBUILD_ONLY contains unknown module(s): {unknown}; "
+                f"known modules: {sorted(all_modules)}"
+            )
+        for module in all_modules:
+            if module not in PREBUILD_ONLY:
+                exclude_ops.append(module)
+        return exclude_ops
+
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
             # Exclude tune modules; for MHA keep only fmha_v3 fwd variants
@@ -248,7 +268,7 @@ def get_exclude_ops():
     return exclude_ops
 
 
-if PREBUILD_KERNELS != 0:
+if PREBUILD_KERNELS != 0 or PREBUILD_ONLY:
     has_torch = True
     try:
         import torch as _
@@ -257,7 +277,7 @@ if PREBUILD_KERNELS != 0:
 
     if not has_torch:
         print(
-            "[aiter] PREBUILD_KERNELS set but torch not installed, "
+            "[aiter] PREBUILD_KERNELS/PREBUILD_ONLY set but torch not installed, "
             "skip precompilation in this environment"
         )
     else:
@@ -279,7 +299,7 @@ if PREBUILD_KERNELS != 0:
             filtered_opts_args_build.append(one_opt_args)
         all_opts_args_build = filtered_opts_args_build
 
-        if ENABLE_CK and moe_base_args is not None:
+        if ENABLE_CK and moe_base_args is not None and not PREBUILD_ONLY:
             moe_variants = get_moe_ck2stages_prebuild_variants(core.AITER_CSRC_DIR)
             for v in moe_variants:
                 all_opts_args_build.append(
@@ -360,19 +380,24 @@ if PREBUILD_KERNELS != 0:
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
         # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---
-        _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
-        os.environ["AITER_AOT_IMPORT"] = "1"
-        try:
-            from aiter.aot.flydsl.common import start_aot, wait_aot
+        # Skipped when PREBUILD_ONLY is set: the allowlist is per CK module and
+        # FlyDSL precompiles unrelated MoE/GEMM kernels.
+        if not PREBUILD_ONLY:
+            _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
+            os.environ["AITER_AOT_IMPORT"] = "1"
+            try:
+                from aiter.aot.flydsl.common import start_aot, wait_aot
 
-            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            pool, futures = start_aot(flydsl_cache_dir)
-            wait_aot(pool, futures)
-        finally:
-            if _prev_aot_import is None:
-                os.environ.pop("AITER_AOT_IMPORT", None)
-            else:
-                os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
+                flydsl_cache_dir = os.path.join(
+                    this_dir, "aiter", "jit", "flydsl_cache"
+                )
+                pool, futures = start_aot(flydsl_cache_dir)
+                wait_aot(pool, futures)
+            finally:
+                if _prev_aot_import is None:
+                    os.environ.pop("AITER_AOT_IMPORT", None)
+                else:
+                    os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
 
         # --- CK kernel builds ---
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
@@ -423,7 +448,7 @@ setup_requires = [
     "setuptools_scm",
     "vcs_versioning",  # transitive dep of setuptools_scm>=10
 ]
-if PREBUILD_KERNELS != 0:
+if PREBUILD_KERNELS != 0 or PREBUILD_ONLY:
     setup_requires.append("pandas")
 
 
