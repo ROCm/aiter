@@ -10,6 +10,7 @@ from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
     _fp8_legacy_to_mxfp8_kernel,
     _rmsnorm_mxfp8_quant_kernel,
     _dual_rmsnorm_mxfp8_quant_kernel,
+    _fused_flatten_mxfp8_quant_kernel,
 )
 
 _QUANT_BLOCK_SIZE = 32
@@ -287,3 +288,55 @@ def dual_rmsnorm_mxfp8_quant(
         NUM_PRGMS=NUM_PRGMS,
     )
     return yq, sq, yk
+
+
+def fused_flatten_mxfp8_quant(
+    x: torch.Tensor,
+    quant_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Flatten the last two dimensions of x and apply per-1x32 MXFP8 quant along
+    the flattened axis (FP8 e4m3 values + uint8 e8m0 scales).
+
+    Equivalent in shape to `fused_flatten_fp8_group_quant` but emits MXFP8
+    1x32 (e8m0) scales using the same recipe as `per_1x32_mxfp8_quant_triton`.
+
+    Args:
+        x: Input tensor of shape (M, N1, N2). N2 must be a multiple of 32.
+        quant_dtype: FP8 dtype to cast quantized values to (defaults to
+            torch.float8_e4m3fn).
+
+    Returns:
+        Tuple of:
+            out: FP8 tensor of shape (M, N1 * N2).
+            out_scales: e8m0 (uint8) scale tensor of shape
+                (M, (N1 * N2) // 32).
+    """
+    assert x.dim() == 3, f"x must be 3D, got {x.dim()}"
+    M, N1, N2 = x.shape
+    assert (
+        N2 % _QUANT_BLOCK_SIZE == 0
+    ), f"N2={N2} must be a multiple of {_QUANT_BLOCK_SIZE}"
+
+    BLOCK_SIZE_N2 = max(triton.next_power_of_2(N2), _QUANT_BLOCK_SIZE)
+    N = N1 * N2
+
+    out = torch.empty((M, N), dtype=quant_dtype, device=x.device)
+    out_scales = torch.empty(
+        (M, N // _QUANT_BLOCK_SIZE), dtype=torch.uint8, device=x.device
+    )
+
+    grid = (M, N1)
+    _fused_flatten_mxfp8_quant_kernel[grid](
+        x,
+        out,
+        out_scales,
+        *x.stride(),
+        *out.stride(),
+        *out_scales.stride(),
+        N2,
+        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
+        QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
+    )
+
+    return out, out_scales

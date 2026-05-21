@@ -9,6 +9,7 @@ from aiter.ops.triton.quant.quant_mxfp8 import (
     fp8_legacy_to_mxfp8,
     rmsnorm_mxfp8_quant,
     dual_rmsnorm_mxfp8_quant,
+    fused_flatten_mxfp8_quant,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
@@ -360,3 +361,77 @@ def test_dual_rmsnorm_mxfp8_quant_default_eps_k():
     torch.testing.assert_close(yq_a.view(torch.uint8), yq_b.view(torch.uint8))
     torch.testing.assert_close(sq_a, sq_b)
     torch.testing.assert_close(yk_a, yk_b)
+
+
+# -----------------------------------------------------------------------------
+# fused_flatten_mxfp8_quant
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "M, N1, N2",
+    [
+        (1, 1, 32),
+        (1, 4, 64),
+        (8, 2, 128),
+        (16, 3, 256),
+        (32, 4, 512),
+        (64, 1, 1024),
+        (37, 5, 64),  # non-pow-2 M
+        (128, 8, 32),
+        (64, 8, 7168),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_flatten_mxfp8_quant(M: int, N1: int, N2: int, dtype: torch.dtype):
+    if not arch_info.is_fp8_avail():
+        pytest.skip("FP8 not supported on this arch")
+    torch.cuda.empty_cache()
+    torch.manual_seed(17)
+
+    # x = torch.randn((M, N1, N2), dtype=dtype, device="cuda") * 4.0
+    x = torch.randn((N1, M, N2), dtype=dtype, device="cuda").transpose(0, 1) * 4.0
+
+    # Reference: flatten (M, N1, N2) -> (M, N1 * N2), then MXFP8 quant in fp32.
+    x_flat_fp32 = x.reshape(M, N1 * N2).to(torch.float32)
+    y_ref, s_ref = torch_mxfp8_quant_from_fp32(x_flat_fp32)
+
+    y_kern, s_kern = fused_flatten_mxfp8_quant(x)
+
+    assert y_kern.shape == (M, N1 * N2)
+    assert s_kern.shape == (M, (N1 * N2) // QUANT_BLOCK_SIZE)
+
+    # Scales must be bit-exact (integer-only after fp32 cast).
+    torch.testing.assert_close(s_kern, s_ref)
+
+    # Quantized values: compare via uint8 view, allow off-by-1 for fp32->fp8
+    # rounding-mode subtlety.
+    torch.testing.assert_close(
+        y_kern.view(torch.uint8).to(torch.int32),
+        y_ref.view(torch.uint8).to(torch.int32),
+        atol=1,
+        rtol=0,
+    )
+
+
+def test_fused_flatten_mxfp8_quant_matches_per_1x32_after_flatten():
+    """Sanity: the flatten+quant path should match per_1x32_mxfp8_quant_triton
+    applied to the pre-flattened (M, N1 * N2) tensor."""
+    if not arch_info.is_fp8_avail():
+        pytest.skip("FP8 not supported on this arch")
+    torch.cuda.empty_cache()
+    torch.manual_seed(19)
+
+    M, N1, N2 = 16, 4, 128
+    x = torch.randn((M, N1, N2), dtype=torch.bfloat16, device="cuda")
+
+    y_flat, s_flat = fused_flatten_mxfp8_quant(x)
+    y_ref, s_ref = per_1x32_mxfp8_quant_triton(x.reshape(M, N1 * N2).contiguous())
+
+    torch.testing.assert_close(s_flat, s_ref)
+    torch.testing.assert_close(
+        y_flat.view(torch.uint8).to(torch.int32),
+        y_ref.view(torch.uint8).to(torch.int32),
+        atol=1,
+        rtol=0,
+    )
