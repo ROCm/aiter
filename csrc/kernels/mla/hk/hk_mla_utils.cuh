@@ -243,18 +243,20 @@ namespace hk_mla {
 //                              i.e. bits = B << 23, then bit_cast to float).
 __device__ __forceinline__ float e8m0_to_f32(uint32_t b)
 {
-    // The lshl MUST be inline-asm volatile so the compiler keeps it in
-    // source order with the upstream `hkm::buffer_load_ubyte` (also asm
-    // volatile) and the intervening `s_waitcnt vmcnt(0)` builtin.
-    // Plain `b << 23` is a pure expression that LLVM happily hoists into
-    // the same basic block as the load (no SSA-level vmem dep on `b`),
-    // which races the vmem completion and lets the cvt see scale=garbage
-    // -> denormal bf16 output. Bug reproduced in module_hk_mla_v40_fwd
-    // (V40 -c=1 all-zero output).
-    if(b == 0u)
-    {
-        return 0.0f;
-    }
+    // MUST use asm volatile. Pure C++ `__builtin_bit_cast(float, b << 23)`
+    // is a side-effect-free SSA expression -- LLVM's machine scheduler
+    // (and earlier sink/LICM passes) will hoist `v_lshlrev_b32` to the
+    // SSA def site of `b` (the asm-volatile buffer_load_ubyte). Once
+    // hoisted, the shift races the still-pending vmem load and the cvt
+    // sees a garbage scale. sched_barrier(0) at the caller does NOT help
+    // -- it's an intra-basic-block fence, while the hoist crosses BB
+    // boundaries (verified by ISA inspection 2026-05-21: the shift jumped
+    // 330+ lines upward across two function inlines, past waitcnt+
+    // sched_barrier, into the prefetch BB right after buffer_load_ubyte).
+    // `asm volatile` is the only construct LLVM treats as a cross-BB
+    // ordering constraint with other `asm volatile` ops (including
+    // hkm::buffer_load_ubyte). B == 0 falls out naturally:
+    // v_lshlrev_b32(0, 23) = 0x0 = +0.0f.
     float result;
     asm volatile("v_lshlrev_b32 %0, 23, %1" : "=v"(result) : "v"(b));
     return result;
