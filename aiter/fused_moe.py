@@ -754,6 +754,8 @@ def _flydsl_stage1_wrapper(
     bias1=None,
     topk_ids=None,
     swiglu_limit: float = 0.0,
+    inter_dim_pad: int = 0,
+    model_dim_pad: int = 0,
     **_kwargs,
 ):
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
@@ -784,6 +786,8 @@ def _flydsl_stage1_wrapper(
         waves_per_eu=parsed.get("waves_per_eu", 3),
         b_nt=parsed.get("b_nt", 2),
         gate_mode=parsed.get("gate_mode", "separated"),
+        inter_dim_pad=inter_dim_pad,
+        model_dim_pad=model_dim_pad,
         bias=_normalize_bias_for_kernel(bias1),
         topk_ids=topk_ids,
         a_scale_one=_a_scale_one,
@@ -806,6 +810,8 @@ def _flydsl_stage2_wrapper(
     a2_scale=None,
     sorted_weights=None,
     bias2=None,
+    inter_dim_pad: int = 0,
+    model_dim_pad: int = 0,
     **_kwargs,
 ):
     # `parsed` is the static per-kernel params dict registered at
@@ -845,6 +851,8 @@ def _flydsl_stage2_wrapper(
         cu_num_mul=parsed.get("cu_num_mul", 1),
         b_nt=parsed.get("b_nt", 0),
         persist=parsed.get("persist", None),
+        inter_dim_pad=inter_dim_pad,
+        model_dim_pad=model_dim_pad,
         bias=bias2,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
     )
@@ -1172,6 +1180,8 @@ def get_2stage_cfgs(
                 _flydsl_stage1_wrapper,
                 kernelName=kernelName1,
                 activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
             )
         else:
             stage1_func = functools.partial(
@@ -1188,6 +1198,8 @@ def get_2stage_cfgs(
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
             )
         else:
             stage2_func = functools.partial(
@@ -1272,10 +1284,14 @@ def get_2stage_cfgs(
                 _flydsl_stage1_wrapper,
                 kernelName=kn1,
                 activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
             ),
             functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
             ),
             _tile_m,
             _ksplit,
@@ -1347,10 +1363,14 @@ def get_2stage_cfgs(
                 _flydsl_stage1_wrapper,
                 kernelName=kn1,
                 activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
             ),
             functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
             ),
             _tile_m,
             int(ksplit),
@@ -1417,6 +1437,8 @@ def get_2stage_cfgs(
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
             )
         else:
             stage2_func = functools.partial(
