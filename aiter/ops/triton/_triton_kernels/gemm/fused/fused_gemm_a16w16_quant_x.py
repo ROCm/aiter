@@ -11,8 +11,8 @@ from aiter.ops.triton.utils.gemm_config_utils import (
 
 import triton
 
-_fused_gemm_a16w16_copy_x_repr = make_kernel_repr(
-    "_fused_gemm_a16w16_copy_x_kernel",
+_fused_gemm_a16w16_quant_x_repr = make_kernel_repr(
+    "_fused_gemm_a16w16_quant_x_kernel",
     [
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
@@ -20,6 +20,7 @@ _fused_gemm_a16w16_copy_x_repr = make_kernel_repr(
         "GROUP_SIZE_M",
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
+        "QUANT_BLOCK_SIZE",
         "EVEN_K",
         "EVEN_MN",
         "cache_modifier",
@@ -40,15 +41,16 @@ _fused_gemm_a16w16_copy_x_repr = make_kernel_repr(
     }
 )
 @triton.jit(
-    repr=_fused_gemm_a16w16_copy_x_repr,
+    repr=_fused_gemm_a16w16_quant_x_repr,
     do_not_specialize=["M", "N"],
 )
-def _fused_gemm_a16w16_copy_x_kernel(
+def _fused_gemm_a16w16_quant_x_kernel(
     a_ptr,
     b_ptr,
     bias_ptr,
     c_ptr,
-    a_copy_ptr,
+    a_quant_ptr,
+    a_scale_ptr,
     M,
     N,
     K,
@@ -59,8 +61,10 @@ def _fused_gemm_a16w16_copy_x_kernel(
     stride_ck,
     stride_cm,
     stride_cn,
-    stride_a_copy_m,
-    stride_a_copy_k,
+    stride_a_quant_m,
+    stride_a_quant_k,
+    stride_a_scale_m,
+    stride_a_scale_n,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -68,6 +72,7 @@ def _fused_gemm_a16w16_copy_x_kernel(
     GROUP_SIZE_M: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     EVEN_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
@@ -76,7 +81,7 @@ def _fused_gemm_a16w16_copy_x_kernel(
     ADD_BIAS: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
 ):
-    """Kernel that computes C = A x B and also emits a downcasted copy of A.
+    """Kernel that computes C = A x B and also emits an MXFP8-quantized A.
 
     The grid is laid out as a single 1D program-id space split into two
     contiguous regions:
@@ -84,11 +89,12 @@ def _fused_gemm_a16w16_copy_x_kernel(
       * `[0, NUM_KSPLIT * num_pid_m * num_pid_n)` runs the GEMM (identical to
         the unfused a16w16 kernel).
       * `[NUM_KSPLIT * num_pid_m * num_pid_n, GEMM_GRID + num_pid_m * num_pid_k_copy)`
-        runs the pure downcast-copy of A: each program handles one
-        `BLOCK_SIZE_M x BLOCK_SIZE_K` tile of A and writes it to `a_copy_ptr`.
+        runs the per-1x32 MXFP8 quantization of A: each program handles one
+        `BLOCK_SIZE_M x BLOCK_SIZE_K` tile of A, derives per-1x32 e8m0 scales,
+        and writes both the FP8 values and the uint8 scales.
 
-    Decoupling the copy from the GEMM body keeps the GEMM hot loop unchanged
-    and lets the copy programs schedule independently.
+    BLOCK_SIZE_K must be a multiple of QUANT_BLOCK_SIZE (=32) so that each tile
+    contains a whole number of MXFP8 groups per row.
     """
 
     tl.assume(stride_am > 0)
@@ -98,8 +104,10 @@ def _fused_gemm_a16w16_copy_x_kernel(
     tl.assume(stride_ck > 0)
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
-    tl.assume(stride_a_copy_m > 0)
-    tl.assume(stride_a_copy_k > 0)
+    tl.assume(stride_a_quant_m > 0)
+    tl.assume(stride_a_quant_k > 0)
+    tl.assume(stride_a_scale_m > 0)
+    tl.assume(stride_a_scale_n > 0)
 
     pid_unified = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -199,7 +207,7 @@ def _fused_gemm_a16w16_copy_x_kernel(
                 c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
                 tl.store(c_ptrs, c, mask=c_mask)
     else:
-        # ---- Downcast-copy branch ------------------------------------------
+        # ---- MXFP8 quant branch --------------------------------------------
         pid_copy = pid_unified - GEMM_GRID
         pid_m = pid_copy // num_pid_k_copy
         pid_k = pid_copy % num_pid_k_copy
@@ -211,13 +219,39 @@ def _fused_gemm_a16w16_copy_x_kernel(
         offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
 
         a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-        a_copy_ptrs = a_copy_ptr + (
-            offs_m[:, None] * stride_a_copy_m + offs_k[None, :] * stride_a_copy_k
-        )
-
         mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-        a = tl.load(a_ptrs, mask=mask, other=0.0)
-        tl.store(a_copy_ptrs, a.to(a_copy_ptr.type.element_ty), mask=mask)
+        a = tl.load(a_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        # Per-1x32 MXFP8 quant. Group along K within this tile.
+        n_groups: tl.constexpr = BLOCK_SIZE_K // QUANT_BLOCK_SIZE
+        a_2d = tl.reshape(a, (BLOCK_SIZE_M, n_groups, QUANT_BLOCK_SIZE))
+        amax = tl.max(tl.abs(a_2d), axis=2, keep_dims=True)  # (M, G, 1)
+
+        amax_i32 = amax.to(tl.int32, bitcast=True)
+        amax_i32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+        amax_p2 = amax_i32.to(tl.float32, bitcast=True)
+        scale_unbiased = tl.log2(amax_p2).floor() - 8
+        scale_unbiased = tl.clamp(scale_unbiased, min=-127, max=127)
+        scale_e8m0 = (scale_unbiased.to(tl.int32) + 127).to(tl.uint8)  # (M, G, 1)
+        quant_scale = tl.exp2(-scale_unbiased)  # (M, G, 1)
+
+        qa_2d = a_2d * quant_scale
+        qa = tl.reshape(qa_2d, (BLOCK_SIZE_M, BLOCK_SIZE_K))
+        a_quant_ptrs = a_quant_ptr + (
+            offs_m[:, None] * stride_a_quant_m + offs_k[None, :] * stride_a_quant_k
+        )
+        tl.store(a_quant_ptrs, qa.to(a_quant_ptr.type.element_ty), mask=mask)
+
+        # Store scales: shape (M, K // QUANT_BLOCK_SIZE).
+        offs_s_n = pid_k * n_groups + tl.arange(0, n_groups)
+        scale_2d = tl.reshape(scale_e8m0, (BLOCK_SIZE_M, n_groups))
+        a_scale_ptrs = a_scale_ptr + (
+            offs_m[:, None] * stride_a_scale_m + offs_s_n[None, :] * stride_a_scale_n
+        )
+        scale_mask = (offs_m[:, None] < M) & (
+            offs_s_n[None, :] < (K // QUANT_BLOCK_SIZE)
+        )
+        tl.store(a_scale_ptrs, scale_2d, mask=scale_mask)
 
 
 def _get_config(
@@ -226,6 +260,6 @@ def _get_config(
     K: int,
 ):
     # Use the same tuning portal as the unfused gemm_a16w16 — the extra
-    # downcast copy is assumed not to shift the optimal config.
+    # MXFP8 quant is assumed not to shift the optimal config.
     config, is_tunned = get_gemm_config("GEMM-A16W16", M, N, K)
     return compute_splitk_params(config, K), is_tunned
