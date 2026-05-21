@@ -515,13 +515,19 @@ namespace py = pybind11;
     m.def("gemm_w4a16",                                                                \
           &gemm_w4a16,                                                                 \
           "CK WMMA W4A16 b_scale GEMM (gfx1151). scaled_zp=None for symmetric, "      \
-          "(zp - 8) * scale for asymmetric AWQ.",                                      \
+          "(zp - 8) * scale for asymmetric AWQ. pre_dequant_to_lds=true selects "     \
+          "the pre-dequant-to-LDS variant (currently STUBBED, see "                   \
+          "TODO(AIESW-32282)). truncate_bf16_round=true selects the bf16 dequant "    \
+          "truncate path (runtime template flag; both flavors share the .so as "      \
+          "distinct template-mangled symbols).",                                       \
           py::arg("in_a"),                                                             \
           py::arg("in_b"),                                                             \
           py::arg("in_s"),                                                             \
           py::arg("Y"),                                                                \
           py::arg("group_size"),                                                       \
-          py::arg("scaled_zp") = std::nullopt);
+          py::arg("scaled_zp") = std::nullopt,                                         \
+          py::arg("pre_dequant_to_lds") = std::nullopt,                                \
+          py::arg("truncate_bf16_round") = std::nullopt);
 
 #define GEMM_A8W8_BLOCKSCALE_PYBIND \
     m.def("gemm_a8w8_blockscale",   \

@@ -22,9 +22,11 @@ import aiter
 torch.manual_seed(0)
 DEVICE = "cuda"
 
-# AIESW-32176 target shape (Qwen3-4B gate_up_proj)
+# Default shape: AIESW-32176 target (Qwen3-4B gate_up_proj, G=128). The G=32
+# variant uses the Qwen3-VL-4B gate_up_proj shape (same N=19456, K=2560)
+# from AIESW-32282 — K is divisible by both 32 and 128 so we keep N/K
+# identical across G to make the bench numbers directly comparable.
 M, N, K = 2048, 19456, 2560
-G = 128
 KPerBlock = 32
 
 # fp16 GEMM with K=2560 + ~0.05 magnitude products has per-output sigma ~2.5;
@@ -64,7 +66,7 @@ def _repack_vllm_to_ck_b_scale(w_q_vllm: torch.Tensor, kperblock: int = KPerBloc
     )
 
 
-def _build_case(asym: bool, dtype: torch.dtype):
+def _build_case(asym: bool, dtype: torch.dtype, G: int):
     """Returns (a, w_q_ck, w_s, scaled_zp_or_None, w_dequant_for_ref)."""
     # fp16 quantization math is fine; cast to dtype at the end.
     w = (torch.randn(N, K, dtype=torch.float16, device=DEVICE) * 0.1).contiguous()
@@ -103,12 +105,23 @@ def _build_case(asym: bool, dtype: torch.dtype):
     return a, w_q_ck, w_s, scaled_zp, w_dequant.to(dtype)
 
 
-def _run_one(asym: bool, dtype: torch.dtype) -> tuple[bool, float]:
-    label = f"{'asym' if asym else 'sym '} {str(dtype).split('.')[-1]:7s}"
+def _run_one(asym: bool, dtype: torch.dtype, G: int,
+             pre_dequant_to_lds: bool = False,
+             truncate_bf16_round: bool = False) -> tuple[bool, float]:
+    pdl_tag = "PDL " if pre_dequant_to_lds else "    "
+    tbt_tag = "TRUNC" if truncate_bf16_round else "RTE  "
+    label = (
+        f"G={G:<3d} {'asym' if asym else 'sym '} "
+        f"{str(dtype).split('.')[-1]:7s} {pdl_tag}{tbt_tag}"
+    )
     try:
-        a, w_q_ck, w_s, scaled_zp, w_dequant = _build_case(asym=asym, dtype=dtype)
+        a, w_q_ck, w_s, scaled_zp, w_dequant = _build_case(asym=asym, dtype=dtype, G=G)
         Y = torch.empty((M, N), dtype=dtype, device=DEVICE)
-        aiter.gemm_w4a16(a, w_q_ck, w_s, Y, G, scaled_zp)
+        aiter.gemm_w4a16(
+            a, w_q_ck, w_s, Y, G, scaled_zp,
+            pre_dequant_to_lds=pre_dequant_to_lds,
+            truncate_bf16_round=truncate_bf16_round,
+        )
         torch.cuda.synchronize()
     except Exception as exc:  # noqa: BLE001
         print(f"  [{label}] SKIP — {type(exc).__name__}: {exc}")
@@ -126,20 +139,35 @@ def _run_one(asym: bool, dtype: torch.dtype) -> tuple[bool, float]:
     return ok, rel
 
 
-def _bench_one(asym: bool, dtype: torch.dtype, reps: int = 100):
-    label = f"{'asym' if asym else 'sym '} {str(dtype).split('.')[-1]:7s}"
+def _bench_one(asym: bool, dtype: torch.dtype, G: int, reps: int = 100,
+               pre_dequant_to_lds: bool = False,
+               truncate_bf16_round: bool = False):
+    pdl_tag = "PDL " if pre_dequant_to_lds else "    "
+    tbt_tag = "TRUNC" if truncate_bf16_round else "RTE  "
+    label = (
+        f"G={G:<3d} {'asym' if asym else 'sym '} "
+        f"{str(dtype).split('.')[-1]:7s} {pdl_tag}{tbt_tag}"
+    )
     try:
-        a, w_q_ck, w_s, scaled_zp, _ = _build_case(asym=asym, dtype=dtype)
+        a, w_q_ck, w_s, scaled_zp, _ = _build_case(asym=asym, dtype=dtype, G=G)
         Y = torch.empty((M, N), dtype=dtype, device=DEVICE)
         # warmup
         for _ in range(10):
-            aiter.gemm_w4a16(a, w_q_ck, w_s, Y, G, scaled_zp)
+            aiter.gemm_w4a16(
+                a, w_q_ck, w_s, Y, G, scaled_zp,
+                pre_dequant_to_lds=pre_dequant_to_lds,
+                truncate_bf16_round=truncate_bf16_round,
+            )
         torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         for _ in range(reps):
-            aiter.gemm_w4a16(a, w_q_ck, w_s, Y, G, scaled_zp)
+            aiter.gemm_w4a16(
+                a, w_q_ck, w_s, Y, G, scaled_zp,
+                pre_dequant_to_lds=pre_dequant_to_lds,
+                truncate_bf16_round=truncate_bf16_round,
+            )
         end.record()
         torch.cuda.synchronize()
         ms = start.elapsed_time(end) / reps
@@ -156,20 +184,68 @@ def main():
     parser.add_argument("--no-bf16", action="store_true",
                         help="Skip bf16 cases (use if CK was built fp16-only).")
     parser.add_argument("--reps", type=int, default=100)
+    parser.add_argument(
+        "--groups",
+        type=int,
+        nargs="+",
+        default=[128, 32],
+        help="AWQ group_size values to test (default: 128 32).",
+    )
+    parser.add_argument(
+        "--pre-dequant",
+        action="store_true",
+        help=(
+            "Also exercise the PreDequantToLDS=true path. Currently STUBBED "
+            "and expected to TORCH_CHECK at runtime — see TODO(AIESW-32282)."
+        ),
+    )
+    parser.add_argument(
+        "--truncate-bf16",
+        action="store_true",
+        help=(
+            "Also exercise the TruncateBf16Round=true path. True runtime "
+            "template flag — both flavors live in the same .so as distinct "
+            "template-mangled symbols. fp16 cases pass through unchanged."
+        ),
+    )
     args = parser.parse_args()
 
     dtypes = [torch.float16] + ([] if args.no_bf16 else [torch.bfloat16])
-    cases = [(asym, dt) for dt in dtypes for asym in (False, True)]
+    base_cases = [
+        (asym, dt, G)
+        for G in args.groups
+        for dt in dtypes
+        for asym in (False, True)
+    ]
+    # PDL flag dimension: always include false; include true iff --pre-dequant.
+    pdl_flags = (False,) + ((True,) if args.pre_dequant else ())
+    # TruncateBf16Round flag dimension: always include false; include true iff
+    # --truncate-bf16.
+    tbt_flags = (False,) + ((True,) if args.truncate_bf16 else ())
+    cases = [
+        (asym, dt, G, pdl, tbt)
+        for asym, dt, G in base_cases
+        for pdl in pdl_flags
+        for tbt in tbt_flags
+    ]
 
-    print(f"== Correctness (M={M} N={N} K={K} G={G}) ==")
+    print(f"== Correctness (M={M} N={N} K={K} G={args.groups}) ==")
     all_ok = True
-    for asym, dt in cases:
-        ok, _ = _run_one(asym=asym, dtype=dt)
-        all_ok &= ok
+    for asym, dt, G, pdl, tbt in cases:
+        ok, _ = _run_one(asym=asym, dtype=dt, G=G,
+                         pre_dequant_to_lds=pdl,
+                         truncate_bf16_round=tbt)
+        # PDL=True is a known-stub failure; don't gate the overall result on
+        # it. TruncateBf16Round=true is correctness-equivalent to RTE
+        # within the 5e-3 op-test tolerance, so it IS gated.
+        if not pdl:
+            all_ok &= ok
 
     print(f"\n== Timing ({args.reps} reps each) ==")
-    for asym, dt in cases:
-        _bench_one(asym=asym, dtype=dt, reps=args.reps)
+    for asym, dt, G, pdl, tbt in cases:
+        _bench_one(asym=asym, dtype=dt, G=G, reps=args.reps,
+                   pre_dequant_to_lds=pdl,
+                   truncate_bf16_round=tbt)
 
     print(f"\nResult: {'PASS' if all_ok else 'FAIL'}")
     sys.exit(0 if all_ok else 1)
