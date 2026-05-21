@@ -32,6 +32,7 @@ def worker(
     max_abs_delta=None,
     output_keys=None,
     _arg_key_list=None,
+    catastrophic_check=True,
 ):
     from aiter.test_common import run_perftest
 
@@ -122,6 +123,7 @@ def worker(
                             printLog=printLog,
                             msg=f"info:{info} res[{i}] ",
                             max_abs_delta=max_abs_delta,
+                            catastrophic_check=catastrophic_check,
                         )
                     max_err_ratio = max(max_err_ratio, err_ratio)
     except RuntimeError as e:

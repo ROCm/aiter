@@ -396,22 +396,52 @@ def get_trace_perf(prof, num_iters):
     return df.at[avg_name, "device_time_sum"]
 
 
-def _check_catastrophic(actual_max_delta, a, b, max_abs_delta):
+_CATASTROPHIC_REL_THRESHOLD = 0.5
+
+
+def _relmag_catastrophic(actual_max_delta, b):
+    """Relative-magnitude catastrophic heuristic.
+
+    Triggers when ``max(|a - b|) > ref_abs_max * 0.5`` -- i.e. a single
+    element diverges by more than half of the reference tensor's peak
+    magnitude. Designed to catch real precision regressions in kernels that
+    write plausible-looking but wrong values to specific positions (e.g.
+    bpreshuffle precision drift, wrong scale/quant, half-broken pipeline).
+
+    By contract, ``catastrophic_check=True`` is opt-in: the caller asserts
+    the comparison is *position-sensitive* (no sort/ties permutation
+    semantics). For position-insensitive data (sorted topk_ids, sort+gather
+    weights with degenerate scores, byte-viewed fp4) this heuristic would
+    misfire, so callers MUST NOT enable it there.
+
+    For non-floating-point tensors this returns False -- there is no
+    meaningful "magnitude" notion for integer indices/IDs. Callers who want
+    a hard cap on integer deltas can still use explicit ``max_abs_delta``.
+    """
+    if not b.is_floating_point():
+        return False
+    ref_abs_max = max(b.abs().max().item(), 1.0)
+    return actual_max_delta > ref_abs_max * _CATASTROPHIC_REL_THRESHOLD
+
+
+def _check_catastrophic(actual_max_delta, a, b, max_abs_delta, catastrophic_check):
     """Decide whether a checkAllclose mismatch is "catastrophic" (fail-fast).
 
-    Catastrophic == "unambiguously broken kernel". We deliberately keep this
-    narrow to avoid false positives from legitimate numerical noise:
+    Priority order (returns True at the first hit):
 
-    - NaN / Inf in either tensor: always catastrophic. This covers the main
-      tuner use case (mp_tuner.worker pre-fills outputs with NaN, so any
-      kernel that does not fully write the output leaves NaN sentinels) as
-      well as kernels that produce Inf from numerical blow-up.
-    - Explicit ``max_abs_delta``: opt-in hard cap. Tuner tasks set it via the
-      task spec; unit tests can pass ``max_abs_delta=...`` to checkAllclose
-      when they want a fail-fast bound. Without this, relative-magnitude
-      heuristics tend to misfire on order-sensitive comparisons (sort + ties,
-      topk with degenerate scores, byte-viewed fp4, etc.) so we do NOT apply
-      one by default.
+    1. NaN / Inf in either tensor -- always catastrophic regardless of
+       any flag. Covers tuner partial-write (mp_tuner.worker fills outputs
+       with NaN sentinel) and any kernel that crashes / blows up
+       numerically.
+    2. Explicit ``max_abs_delta`` -- opt-in hard cap, takes precedence over
+       the relative heuristic for callers that know the acceptable absolute
+       magnitude.
+    3. ``catastrophic_check=True`` -- enables the relative-magnitude
+       heuristic (delta > ref_max * 0.5). Caller asserts the comparison is
+       position-sensitive; do NOT enable on sort/permutation-sensitive
+       data.
+    4. Otherwise: not catastrophic. The caller gets ``err_ratio`` back via
+       the normal return value and decides what to do with it.
 
     ``torch.isfinite`` is safe on integer / byte tensors (returns all True),
     so this function works uniformly across dtypes.
@@ -420,10 +450,12 @@ def _check_catastrophic(actual_max_delta, a, b, max_abs_delta):
         return True
     if max_abs_delta is not None:
         return actual_max_delta > max_abs_delta
+    if catastrophic_check:
+        return _relmag_catastrophic(actual_max_delta, b)
     return False
 
 
-def _catastrophic_check_silent(a, b, max_abs_delta):
+def _catastrophic_check_silent(a, b, max_abs_delta, catastrophic_check):
     """Same policy as ``_check_catastrophic`` but without an already-computed
     ``actual_max_delta``. Used by the not-printLog (tuner) fast path so we
     avoid materialising masked tensors when ``isclose`` already failed."""
@@ -431,6 +463,8 @@ def _catastrophic_check_silent(a, b, max_abs_delta):
         return True
     if max_abs_delta is not None:
         return (a - b).abs().max().item() > max_abs_delta
+    if catastrophic_check:
+        return _relmag_catastrophic((a - b).abs().max().item(), b)
     return False
 
 
@@ -444,6 +478,7 @@ def checkAllclose(
     printNum=8,
     printLog=True,
     max_abs_delta=None,
+    catastrophic_check=False,
 ):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
 
@@ -460,7 +495,9 @@ def checkAllclose(
             if not printLog:
                 if percent >= tol_err_ratio:
                     return percent
-                is_cat = _catastrophic_check_silent(a, b, max_abs_delta)
+                is_cat = _catastrophic_check_silent(
+                    a, b, max_abs_delta, catastrophic_check
+                )
                 return 1.0 if is_cat else percent
             a_msked = a[mask]
             b_msked = b[mask]
@@ -473,14 +510,18 @@ def checkAllclose(
             if not printLog:
                 if percent >= tol_err_ratio:
                     return percent
-                is_cat = _catastrophic_check_silent(a, b, max_abs_delta)
+                is_cat = _catastrophic_check_silent(
+                    a, b, max_abs_delta, catastrophic_check
+                )
                 return 1.0 if is_cat else percent
             a_msked = a[mask]
             b_msked = b[mask]
             delta = (a_msked - b_msked).abs()
 
         actual_max_delta = delta.max().item()
-        is_catastrophic = _check_catastrophic(actual_max_delta, a, b, max_abs_delta)
+        is_catastrophic = _check_catastrophic(
+            actual_max_delta, a, b, max_abs_delta, catastrophic_check
+        )
 
         if is_catastrophic:
             logger.info(
