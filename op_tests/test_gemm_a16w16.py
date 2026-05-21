@@ -119,7 +119,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         ), f"b={b.dtype}, expected output dtype={otype}, input dtype={dtype}"
 
     msg_b = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us,B uplift: {avg_a/avg_b-1:<5.1%}, "
-    err_tgemm = checkAllclose(a, b, msg=msg_b)
+    err_tgemm = checkAllclose(a, b, msg=msg_b, catastrophic_check=True)
     ret["torch us"] = avg_a
     ret["tgemm us"] = avg_b
     ret["tgemm err"] = err_tgemm
@@ -144,7 +144,11 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
             c.dtype == otype
         ), f"c={c.dtype}, expected output dtype={otype}, input dtype={dtype}"
         msg_c = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, C avg: {avg_c:<8.2f} us, C uplift: {avg_a/avg_c-1:<5.1%}, "
-        err_hipb = checkAllclose(a, c, msg=msg_c) if c is not None else None
+        err_hipb = (
+            checkAllclose(a, c, msg=msg_c, catastrophic_check=True)
+            if c is not None
+            else None
+        )
         ret["hipb us"] = avg_c
         ret["hipb err"] = err_hipb
 
@@ -163,18 +167,18 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
             x, wshuffle, out_asm, bias, bpreshuffle=wshuffle.is_shuffled
         )
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-bpreshuffle avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
-        err_asm = checkAllclose(a, d, msg=msg)
+        err_asm = checkAllclose(a, d, msg=msg, catastrophic_check=True)
         ### no shuffle
         e, avg_e = run_bf16gemm_asm(x, weight, out_asm, bias)
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-noshuffle avg: {avg_e:<8.2f} us, uplift: {avg_b/avg_e-1:<5.1%}"
-        err_asm_noshuffle = checkAllclose(a, e, msg=msg)
+        err_asm_noshuffle = checkAllclose(a, e, msg=msg, catastrophic_check=True)
         ret["asm-bpshuff us"] = avg_d
         ret["asm-bpshuff err"] = err_asm
         ret["asm-nshuff us"] = avg_e
         ret["asm-nshuff err"] = err_asm_noshuffle
 
     a, us = run_gemm_triton(x, weight, bias, otype, scaleA, scaleB)
-    err = checkAllclose(b, a)
+    checkAllclose(b, a, catastrophic_check=True)
     ret["triton us"] = us
 
     return ret

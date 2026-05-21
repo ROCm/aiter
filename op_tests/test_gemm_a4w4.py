@@ -116,7 +116,7 @@ def test_gemm(dtype, M, N, K):
         w_scales_shuffle,
         bpreshuffle=True,
     )
-    err = checkAllclose(a, c, msg="unified api")
+    err = checkAllclose(a, c, msg="unified api", catastrophic_check=True)
     ret["us"] = us
     ret["TFLOPS"] = M * N * K * 2 / us / 1e6
     ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6

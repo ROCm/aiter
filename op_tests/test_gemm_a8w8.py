@@ -161,20 +161,21 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
                 printLog=False,
             )
         else:
-            err_b = checkAllclose(a, b, msg="ck: ", rtol=1e-2, atol=1e-2)
+            err_b = checkAllclose(
+                a, b, msg="ck: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
+            )
     if quantDtype != dtypes.i8:
         c, avg_c = run_gemm_ck_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
         # c = c + bias
-        err_c = checkAllclose(a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2)
+        err_c = checkAllclose(
+            a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
+        )
     else:
         avg_c = None
         err_c = None
 
     avg_d = None
     err_d = None
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
     if (
         dtype == dtypes.bf16
         and quantDtype == dtypes.i8
@@ -184,7 +185,9 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
         bias_f32 = bias.to(dtypes.fp32)
         d, avg_d = run_gemm_asm(x_asm, weightshuffle, x_scale, w_scale, bias_f32, dtype)
         if d is not None:
-            err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
+            err_d = checkAllclose(
+                a, d, msg="asm: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
+            )
         else:
             avg_d = None
 
@@ -193,7 +196,14 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
         init_hipblas()
         e, avg_e = run_aiter_hip_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
         # e = e + bias
-        err_e = checkAllclose(a, e, msg="hipmm bpreshuffle: ", rtol=1e-2, atol=1e-2)
+        err_e = checkAllclose(
+            a,
+            e,
+            msg="hipmm bpreshuffle: ",
+            rtol=1e-2,
+            atol=1e-2,
+            catastrophic_check=True,
+        )
     else:
         avg_e = None
         err_e = None
@@ -224,7 +234,9 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
         b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
-    checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
+    checkAllclose(
+        a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01, catastrophic_check=True
+    )
 
 
 def get_boundary_test_cases(cu_count, aligned_k):
