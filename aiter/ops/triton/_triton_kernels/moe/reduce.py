@@ -86,9 +86,7 @@ def _reduce_grouped(
     # tile and add to acc before writeback. Same per-token-row layout as Out.
     if HAS_EXT_RESIDUAL:
         res_offs_n = pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT)
-        res_ptr = (
-            Residual + pid_t * stride_extres_m + res_offs_n * stride_extres_n
-        )
+        res_ptr = Residual + pid_t * stride_extres_m + res_offs_n * stride_extres_n
         if EVEN_N:
             res = tl.load(res_ptr).to(tl.float32)
             acc = acc + res

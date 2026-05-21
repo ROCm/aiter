@@ -9,6 +9,9 @@ from _utils import (
 import torch
 import triton
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_quant_x import (
+    fused_gemm_a16w16_quant_x,
+)
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
@@ -36,7 +39,10 @@ for config in config_list:
     def fn():
         ############################################################
         # <run API>
-        gemm_a16w16(x, w, bias, dtype, y, config=config)
+        # gemm_a16w16(x, w, bias, dtype, y, config=config)
+        fused_gemm_a16w16_quant_x(
+            x, w, bias, dtype, torch.float8_e4m3fn, y, config=config
+        )
         ############################################################
 
     run_profile(fn)

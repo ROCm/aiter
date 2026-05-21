@@ -224,7 +224,9 @@ def _topk(
     # Post-selection ops (bias-subtract, renorm, scaling) must operate on
     # real entries only — otherwise -inf poisons the renorm sum, and the
     # sentinel y_indices (== N_EXPTS_PAD) would OOB the Bias array.
-    real_mask = y_indices != N_EXPTS_PAD if N_EXPTS_ACT != N_EXPTS_ACT_PAD else (y_indices >= 0)
+    real_mask = (
+        y_indices != N_EXPTS_PAD if N_EXPTS_ACT != N_EXPTS_ACT_PAD else (y_indices >= 0)
+    )
 
     # For SCORE_MODE="sqrtsoftplus" with HAS_BIAS, the y_values returned by
     # streaming_topk are biased scores (sqrt(softplus(x)) + bias) — used for
@@ -275,30 +277,30 @@ def _topk(
 
 @triton.jit
 def _hash_routing(
-    InputIds,           # int32 [n_rows] — token-id per row
-    Tid2Eid,            # int32 [vocab_size, K] — per-token-id top-K expert table
-    stride_t2e_v,       # row stride of Tid2Eid (= K)
-    X,                  # [n_rows, n_expts_tot] router logits (bf16/fp32)
+    InputIds,  # int32 [n_rows] — token-id per row
+    Tid2Eid,  # int32 [vocab_size, K] — per-token-id top-K expert table
+    stride_t2e_v,  # row stride of Tid2Eid (= K)
+    X,  # [n_rows, n_expts_tot] router logits (bf16/fp32)
     stride_xm,
-    Yv,                 # output expt_scal [n_rows, N_EXPTS_ACT_PAD]
-    Yi,                 # output expt_indx [n_rows, N_EXPTS_ACT_PAD] (int16)
+    Yv,  # output expt_scal [n_rows, N_EXPTS_ACT_PAD]
+    Yi,  # output expt_indx [n_rows, N_EXPTS_ACT_PAD] (int16)
     stride_ym,
-    Bits,               # bitmatrix data
+    Bits,  # bitmatrix data
     stride_rm,
     stride_rn,
     n_rows,
     n_expts_tot,
-    S,                  # bitmatrix scratchpad (must memset to 0)
+    S,  # bitmatrix scratchpad (must memset to 0)
     BLOCK_S: tl.constexpr,
     s_blocks,
-    SP,                 # bitmatrix partials (must memset to 0)
+    SP,  # bitmatrix partials (must memset to 0)
     BLOCK_SP: tl.constexpr,
     sp_blocks,
     sp_size,
     BLOCK_M: tl.constexpr,
-    N_EXPTS_PAD: tl.constexpr,     # padded n_expts_tot (power of 2 ≥ n_expts_tot)
+    N_EXPTS_PAD: tl.constexpr,  # padded n_expts_tot (power of 2 ≥ n_expts_tot)
     N_EXPTS_ACT: tl.constexpr,
-    N_EXPTS_ACT_PAD: tl.constexpr, # next pow2 of K
+    N_EXPTS_ACT_PAD: tl.constexpr,  # next pow2 of K
     BLOCK_N: tl.constexpr,
     SCORE_MODE: tl.constexpr = "sqrtsoftplus",
     APPLY_RENORM: tl.constexpr = True,
@@ -345,7 +347,11 @@ def _hash_routing(
     # 1. Load input_ids for this BLOCK_M, then tid2eid[input_ids[i], :K]
     input_ids = tl.load(InputIds + offs_m, mask=mask_m, other=0).to(tl.int32)
     offs_k = tl.arange(0, N_EXPTS_ACT_PAD)
-    mask_k = offs_k < N_EXPTS_ACT if N_EXPTS_ACT != N_EXPTS_ACT_PAD else tl.full([N_EXPTS_ACT_PAD], 1, tl.int1)
+    mask_k = (
+        offs_k < N_EXPTS_ACT
+        if N_EXPTS_ACT != N_EXPTS_ACT_PAD
+        else tl.full([N_EXPTS_ACT_PAD], 1, tl.int1)
+    )
     # Gather Tid2Eid[input_ids[m], k] for m in BLOCK_M, k in K
     t2e_offs = input_ids[:, None] * stride_t2e_v + offs_k[None, :]
     expt_indx = tl.load(
@@ -364,7 +370,9 @@ def _hash_routing(
         offs_x_n = i * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_n = offs_x_n < n_expts_tot
         X_ptrs = X + offs_m[:, None] * stride_xm + offs_x_n[None, :]
-        x = tl.load(X_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(tl.float32)
+        x = tl.load(X_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(
+            tl.float32
+        )
         # sqrt(softplus(x)) — numerically stable
         if SCORE_MODE == "sqrtsoftplus":
             softplus_x = tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x)))

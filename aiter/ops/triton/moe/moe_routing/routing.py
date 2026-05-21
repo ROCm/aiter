@@ -368,7 +368,6 @@ def routing_a8w4(
     return routing_data, topk_indx, gate_indx
 
 
-
 def routing_a8w4_from_hash(
     router_logits: torch.Tensor,
     tid2eid: torch.Tensor,
