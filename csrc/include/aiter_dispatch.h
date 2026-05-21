@@ -197,3 +197,158 @@ using cpp_type_from_aiter_dtype_t = typename cpp_type_from_aiter_dtype<DTYPE>::t
 #define VLLM_DISPATCH_INTEGRAL_TYPES_rmTorch(TYPE, NAME, ...)      \
     AT_DISPATCH_SWITCH_rmTorch(                                     \
         TYPE, NAME, VLLM_DISPATCH_CASE_INTEGRAL_TYPES_rmTorch(__VA_ARGS__))
+
+// ============================================================================
+// KV cache dtype dispatch macros (_rmTorch)
+//
+// These use opus::* and vllm::Fp8KVCacheDataType types which must be visible
+// at the point of macro expansion (not here).
+// ============================================================================
+
+#define DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(SRC_DTYPE, KV_DTYPE, FN)               \
+    if(KV_DTYPE == "auto")                                                             \
+    {                                                                                  \
+        if(SRC_DTYPE == AITER_DTYPE_fp32)                                              \
+        {                                                                              \
+            FN(float, float, vllm::Fp8KVCacheDataType::kAuto);                         \
+        }                                                                              \
+        else if(SRC_DTYPE == AITER_DTYPE_fp16)                                         \
+        {                                                                              \
+            FN(opus::fp16_t, opus::fp16_t, vllm::Fp8KVCacheDataType::kAuto);           \
+        }                                                                              \
+        else if(SRC_DTYPE == AITER_DTYPE_bf16)                                         \
+        {                                                                              \
+            FN(opus::bf16_t, opus::bf16_t, vllm::Fp8KVCacheDataType::kAuto);           \
+        }                                                                              \
+        else                                                                           \
+        {                                                                              \
+            AITER_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);     \
+        }                                                                              \
+    }                                                                                  \
+    else                                                                               \
+    {                                                                                  \
+        if(KV_DTYPE == "fp8" || KV_DTYPE == "fp8_e4m3")                                \
+        {                                                                              \
+            if(SRC_DTYPE == AITER_DTYPE_fp32)                                          \
+            {                                                                          \
+                FN(float, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);            \
+            }                                                                          \
+            else if(SRC_DTYPE == AITER_DTYPE_fp16)                                     \
+            {                                                                          \
+                FN(opus::fp16_t, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);     \
+            }                                                                          \
+            else if(SRC_DTYPE == AITER_DTYPE_bf16)                                     \
+            {                                                                          \
+                FN(opus::bf16_t, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);     \
+            }                                                                          \
+            else                                                                       \
+            {                                                                          \
+                AITER_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE); \
+            }                                                                          \
+        }                                                                              \
+        else                                                                           \
+        {                                                                              \
+            AITER_CHECK(false, "Unsupported data type of kv cache: ", KV_DTYPE);       \
+        }                                                                              \
+    }
+
+#define DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(SRC_DTYPE, KV_DTYPE, QUERY_DTYPE, FN)        \
+    if(KV_DTYPE == "auto" && QUERY_DTYPE == "auto")                                               \
+    {                                                                                             \
+        if(SRC_DTYPE == AITER_DTYPE_fp32)                                                         \
+        {                                                                                         \
+            FN(float,                                                                             \
+               float,                                                                             \
+               float,                                                                             \
+               vllm::Fp8KVCacheDataType::kAuto,                                                   \
+               vllm::Fp8KVCacheDataType::kAuto);                                                  \
+        }                                                                                         \
+        else if(SRC_DTYPE == AITER_DTYPE_fp16)                                                    \
+        {                                                                                         \
+            FN(opus::fp16_t,                                                                      \
+               opus::fp16_t,                                                                      \
+               opus::fp16_t,                                                                      \
+               vllm::Fp8KVCacheDataType::kAuto,                                                   \
+               vllm::Fp8KVCacheDataType::kAuto);                                                  \
+        }                                                                                         \
+        else if(SRC_DTYPE == AITER_DTYPE_bf16)                                                    \
+        {                                                                                         \
+            FN(opus::bf16_t,                                                                      \
+               opus::bf16_t,                                                                      \
+               opus::bf16_t,                                                                      \
+               vllm::Fp8KVCacheDataType::kAuto,                                                   \
+               vllm::Fp8KVCacheDataType::kAuto);                                                  \
+        }                                                                                         \
+        else                                                                                      \
+        {                                                                                         \
+            AITER_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);                \
+        }                                                                                         \
+    }                                                                                             \
+    else if((KV_DTYPE == "fp8" || KV_DTYPE == "fp8_e4m3") && (QUERY_DTYPE == "auto"))             \
+    {                                                                                             \
+        if(SRC_DTYPE == AITER_DTYPE_fp32)                                                         \
+        {                                                                                         \
+            FN(float,                                                                             \
+               opus::fp8_t,                                                                       \
+               float,                                                                             \
+               vllm::Fp8KVCacheDataType::kFp8E4M3,                                                \
+               vllm::Fp8KVCacheDataType::kAuto);                                                  \
+        }                                                                                         \
+        else if(SRC_DTYPE == AITER_DTYPE_fp16)                                                    \
+        {                                                                                         \
+            FN(opus::fp16_t,                                                                      \
+               opus::fp8_t,                                                                       \
+               opus::fp16_t,                                                                      \
+               vllm::Fp8KVCacheDataType::kFp8E4M3,                                                \
+               vllm::Fp8KVCacheDataType::kAuto);                                                  \
+        }                                                                                         \
+        else if(SRC_DTYPE == AITER_DTYPE_bf16)                                                    \
+        {                                                                                         \
+            FN(opus::bf16_t,                                                                      \
+               opus::fp8_t,                                                                       \
+               opus::bf16_t,                                                                      \
+               vllm::Fp8KVCacheDataType::kFp8E4M3,                                                \
+               vllm::Fp8KVCacheDataType::kAuto);                                                  \
+        }                                                                                         \
+        else                                                                                      \
+        {                                                                                         \
+            AITER_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);                \
+        }                                                                                         \
+    }                                                                                             \
+    else if((KV_DTYPE == "fp8" || KV_DTYPE == "fp8_e4m3") &&                                      \
+            (QUERY_DTYPE == "fp8" || QUERY_DTYPE == "fp8_e4m3"))                                  \
+    {                                                                                             \
+        if(SRC_DTYPE == AITER_DTYPE_fp32)                                                         \
+        {                                                                                         \
+            FN(float,                                                                             \
+               opus::fp8_t,                                                                       \
+               opus::fp8_t,                                                                       \
+               vllm::Fp8KVCacheDataType::kFp8E4M3,                                                \
+               vllm::Fp8KVCacheDataType::kFp8E4M3);                                               \
+        }                                                                                         \
+        else if(SRC_DTYPE == AITER_DTYPE_fp16)                                                    \
+        {                                                                                         \
+            FN(opus::fp16_t,                                                                      \
+               opus::fp8_t,                                                                       \
+               opus::fp8_t,                                                                       \
+               vllm::Fp8KVCacheDataType::kFp8E4M3,                                                \
+               vllm::Fp8KVCacheDataType::kFp8E4M3);                                               \
+        }                                                                                         \
+        else if(SRC_DTYPE == AITER_DTYPE_bf16)                                                    \
+        {                                                                                         \
+            FN(opus::bf16_t,                                                                      \
+               opus::fp8_t,                                                                       \
+               opus::fp8_t,                                                                       \
+               vllm::Fp8KVCacheDataType::kFp8E4M3,                                                \
+               vllm::Fp8KVCacheDataType::kFp8E4M3);                                               \
+        }                                                                                         \
+        else                                                                                      \
+        {                                                                                         \
+            AITER_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);                \
+        }                                                                                         \
+    }                                                                                             \
+    else                                                                                          \
+    {                                                                                             \
+        AITER_CHECK(                                                                              \
+            false, "Unsupported data type of kv cache: ", KV_DTYPE, "Query type: ", QUERY_DTYPE); \
+    }

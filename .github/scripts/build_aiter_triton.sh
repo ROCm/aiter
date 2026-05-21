@@ -2,6 +2,28 @@
 
 set -ex
 
+retry_cmd() {
+    local max_attempts="$1"
+    shift
+    local attempt=1
+    local rc=0
+
+    while true; do
+        if "$@"; then
+            return 0
+        fi
+        rc=$?
+        if [[ "$attempt" -ge "$max_attempts" ]]; then
+            echo "Command failed after ${attempt} attempts: $*"
+            return "$rc"
+        fi
+        local sleep_seconds=$((attempt * 20))
+        echo "Attempt ${attempt}/${max_attempts} failed; retrying in ${sleep_seconds}s..."
+        sleep "${sleep_seconds}"
+        attempt=$((attempt + 1))
+    done
+}
+
 echo
 echo "==== ROCm Packages Installed ===="
 dpkg -l | grep rocm || echo "No ROCm packages found."
@@ -9,15 +31,18 @@ dpkg -l | grep rocm || echo "No ROCm packages found."
 echo
 echo "==== Install dependencies and aiter ===="
 git config --global --add safe.directory /workspace
-pip install --upgrade pandas zmq einops numpy==1.26.2
+pip config set global.retries 15
+pip config set global.timeout 120
+pip install -r .github/requirements/triton-test.txt
 pip uninstall -y aiter || true
-pip install --upgrade "pybind11>=3.0.1"
-pip install --upgrade "ninja>=1.11.1"
-pip install tabulate
-pip install -e .
+retry_cmd 3 pip install --no-build-isolation -e .
 
-# Read BUILD_TRITON env var, default to 1. If 1, install Triton; if 0, skip installation.
-BUILD_TRITON=${BUILD_TRITON:-1}
+echo
+echo "==== Verify pinned triton ===="
+python .github/scripts/verify_triton_pin.py .github/requirements/triton-test.txt
+
+# Read BUILD_TRITON env var, default to 0. If 1, override the pinned triton wheel with a source build; if 0, use the pinned wheel from triton-test.txt.
+BUILD_TRITON=${BUILD_TRITON:-0}
 
 if [[ "$BUILD_TRITON" == "1" ]]; then
     echo
@@ -40,13 +65,9 @@ if [[ "$BUILD_TRITON" == "1" ]]; then
         MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
         cd ..
     fi
-    pip install filecheck
-    # NetworkX is a dependency of Triton test selection script
-    # `.github/scripts/select_triton_tests.py`.
-    pip install networkx
 else
     echo
-    echo "[SKIP] Triton installation skipped because BUILD_TRITON=$BUILD_TRITON"
+    echo "[SKIP] Triton source build skipped; using pinned wheel from triton-test.txt."
 fi
 
 echo

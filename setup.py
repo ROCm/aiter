@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.1.5.dev515"
+FLYDSL_VERSION = "flydsl==0.1.8"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -70,6 +70,50 @@ if not IS_WINDOWS and is_develop_mode():
                 FLYDSL_VERSION,
             ]
         )
+
+
+def _is_triton_installed():
+    from importlib.metadata import version as pkg_version
+
+    for pkg in [
+        "triton",
+        "amd-triton",
+        "pytorch-triton",
+        "pytorch-triton-rocm",
+        "triton-rocm",
+    ]:
+        try:
+            return pkg, pkg_version(pkg)
+        except Exception:
+            pass
+    return None
+
+
+def _run_install_triton():
+    print("[aiter] Installing triton via .github/scripts/install_triton.sh")
+    install_triton = os.path.join(this_dir, ".github", "scripts", "install_triton.sh")
+    subprocess.check_call(["bash", install_triton])
+
+
+AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", 0))
+
+_triton_info = _is_triton_installed()
+if AITER_USE_SYSTEM_TRITON and _triton_info:
+    print(
+        f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping existing"
+        f" {_triton_info[0]}=={_triton_info[1]}"
+    )
+else:
+    if _triton_info:
+        print(
+            f"[aiter] Replacing existing {_triton_info[0]}=={_triton_info[1]}"
+            " with aiter-compatible triton"
+            " (if needed, set AITER_USE_SYSTEM_TRITON=1 to keep your triton)"
+        )
+    try:
+        _run_install_triton()
+    except Exception:
+        print("[aiter] Skipping triton install via .github/scripts/install_triton.sh")
 
 
 def write_install_mode():
@@ -398,6 +442,7 @@ else:
         "einops",
         "psutil",
         "packaging",
+        "triton>=3.6.0",
         FLYDSL_VERSION,
     ]
 
