@@ -63,6 +63,7 @@ REAL_SHAPES: list[tuple[int, int, int, int]] = [
     ( 393216,  2048,  1408,  64),  # deepseekv2-16B
     (  32768,  6144, 16384,   8),  # Mixtral 8x22B
     (  32768, 16384,  6144,   8),  # Mixtral 8x22B
+    ( 267424,  1280,  2560,  32),  # real workload, but unknown model
 ]
 # fmt: on
 
