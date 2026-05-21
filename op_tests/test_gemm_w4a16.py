@@ -106,13 +106,11 @@ def _build_case(asym: bool, dtype: torch.dtype, G: int):
 
 
 def _run_one(asym: bool, dtype: torch.dtype, G: int,
-             pre_dequant_to_lds: bool = False,
-             truncate_bf16_round: bool = False) -> tuple[bool, float]:
+             pre_dequant_to_lds: bool = False) -> tuple[bool, float]:
     pdl_tag = "PDL " if pre_dequant_to_lds else "    "
-    tbt_tag = "TRUNC" if truncate_bf16_round else "RTE  "
     label = (
         f"G={G:<3d} {'asym' if asym else 'sym '} "
-        f"{str(dtype).split('.')[-1]:7s} {pdl_tag}{tbt_tag}"
+        f"{str(dtype).split('.')[-1]:7s} {pdl_tag}"
     )
     try:
         a, w_q_ck, w_s, scaled_zp, w_dequant = _build_case(asym=asym, dtype=dtype, G=G)
@@ -120,7 +118,6 @@ def _run_one(asym: bool, dtype: torch.dtype, G: int,
         aiter.gemm_w4a16(
             a, w_q_ck, w_s, Y, G, scaled_zp,
             pre_dequant_to_lds=pre_dequant_to_lds,
-            truncate_bf16_round=truncate_bf16_round,
         )
         torch.cuda.synchronize()
     except Exception as exc:  # noqa: BLE001
@@ -140,13 +137,11 @@ def _run_one(asym: bool, dtype: torch.dtype, G: int,
 
 
 def _bench_one(asym: bool, dtype: torch.dtype, G: int, reps: int = 100,
-               pre_dequant_to_lds: bool = False,
-               truncate_bf16_round: bool = False):
+               pre_dequant_to_lds: bool = False):
     pdl_tag = "PDL " if pre_dequant_to_lds else "    "
-    tbt_tag = "TRUNC" if truncate_bf16_round else "RTE  "
     label = (
         f"G={G:<3d} {'asym' if asym else 'sym '} "
-        f"{str(dtype).split('.')[-1]:7s} {pdl_tag}{tbt_tag}"
+        f"{str(dtype).split('.')[-1]:7s} {pdl_tag}"
     )
     try:
         a, w_q_ck, w_s, scaled_zp, _ = _build_case(asym=asym, dtype=dtype, G=G)
@@ -156,7 +151,6 @@ def _bench_one(asym: bool, dtype: torch.dtype, G: int, reps: int = 100,
             aiter.gemm_w4a16(
                 a, w_q_ck, w_s, Y, G, scaled_zp,
                 pre_dequant_to_lds=pre_dequant_to_lds,
-                truncate_bf16_round=truncate_bf16_round,
             )
         torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
@@ -166,7 +160,6 @@ def _bench_one(asym: bool, dtype: torch.dtype, G: int, reps: int = 100,
             aiter.gemm_w4a16(
                 a, w_q_ck, w_s, Y, G, scaled_zp,
                 pre_dequant_to_lds=pre_dequant_to_lds,
-                truncate_bf16_round=truncate_bf16_round,
             )
         end.record()
         torch.cuda.synchronize()
@@ -199,15 +192,6 @@ def main():
             "and expected to TORCH_CHECK at runtime — see TODO(AIESW-32282)."
         ),
     )
-    parser.add_argument(
-        "--truncate-bf16",
-        action="store_true",
-        help=(
-            "Also exercise the TruncateBf16Round=true path. True runtime "
-            "template flag — both flavors live in the same .so as distinct "
-            "template-mangled symbols. fp16 cases pass through unchanged."
-        ),
-    )
     args = parser.parse_args()
 
     dtypes = [torch.float16] + ([] if args.no_bf16 else [torch.bfloat16])
@@ -219,33 +203,26 @@ def main():
     ]
     # PDL flag dimension: always include false; include true iff --pre-dequant.
     pdl_flags = (False,) + ((True,) if args.pre_dequant else ())
-    # TruncateBf16Round flag dimension: always include false; include true iff
-    # --truncate-bf16.
-    tbt_flags = (False,) + ((True,) if args.truncate_bf16 else ())
     cases = [
-        (asym, dt, G, pdl, tbt)
+        (asym, dt, G, pdl)
         for asym, dt, G in base_cases
         for pdl in pdl_flags
-        for tbt in tbt_flags
     ]
 
     print(f"== Correctness (M={M} N={N} K={K} G={args.groups}) ==")
     all_ok = True
-    for asym, dt, G, pdl, tbt in cases:
+    for asym, dt, G, pdl in cases:
         ok, _ = _run_one(asym=asym, dtype=dt, G=G,
-                         pre_dequant_to_lds=pdl,
-                         truncate_bf16_round=tbt)
+                         pre_dequant_to_lds=pdl)
         # PDL=True is a known-stub failure; don't gate the overall result on
-        # it. TruncateBf16Round=true is correctness-equivalent to RTE
-        # within the 5e-3 op-test tolerance, so it IS gated.
+        # it.
         if not pdl:
             all_ok &= ok
 
     print(f"\n== Timing ({args.reps} reps each) ==")
-    for asym, dt, G, pdl, tbt in cases:
+    for asym, dt, G, pdl in cases:
         _bench_one(asym=asym, dtype=dt, G=G, reps=args.reps,
-                   pre_dequant_to_lds=pdl,
-                   truncate_bf16_round=tbt)
+                   pre_dequant_to_lds=pdl)
 
     print(f"\nResult: {'PASS' if all_ok else 'FAIL'}")
     sys.exit(0 if all_ok else 1)

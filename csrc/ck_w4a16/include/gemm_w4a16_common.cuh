@@ -43,8 +43,6 @@ using Col = ck::tensor_layout::gemm::ColumnMajor;
 using PassThrough = ck::tensor_operation::element_wise::PassThrough;
 using DequantPack8WithZp =
     ck::tensor_operation::element_wise::DequantPack8WithZp;
-using DequantPack8WithZpTruncate =
-    ck::tensor_operation::element_wise::DequantPack8WithZpTruncate;
 
 namespace ck_w4a16 {
 
@@ -97,63 +95,36 @@ inline constexpr ck::index_t KPerBlock = 32;
 //     occupancy. Currently STUBBED — see DeviceGemmInstance<...,true>
 //     specialization below and TODO(AIESW-32282).
 //
-// TruncateBf16Round selects bf16 dequant rounding mode (orthogonal to
-// PreDequantToLDS — both flags compose):
-//   - false (default): IEEE round-to-nearest-even. type_convert<bhalf_t>(
-//     float) lowers on RDNA3.5 to v_add3_u32 +0x7fff + v_cmp_o_f32 +
-//     v_cndmask_b16 0x7fc0 (NaN quietening). Accounts for ~30% of the
-//     bf16 dequant ISA (vllm4/notes/ck-w4a16-isa/README.md).
-//   - true: bit-cast truncate. Drops the upper 16 bits of fp32 directly
-//     (bf16 IS the upper 16 bits of fp32). Worst-case 0.5 ULP of bf16
-//     error vs RTE (~4e-3 relative), well inside the W4A16 op-test
-//     tolerance. CK analog of vLLM PR ROCm/vllm#953's Triton trick.
-//
-// AIESW-32282: TruncateBf16Round is selected at template-instantiation time.
-// The CK threadwise transfer (ck::ThreadwiseTensorSliceTransfer_v4 in
-// threadwise_tensor_slice_transfer.hpp) was extended in this branch to
-// forward an explicit dequant element-op template parameter down to the
-// per-nibble call site. The chain is: this device-op's `BElementwiseOperation`
-// slot -> gridwise_gemm_wmma_cshuffle_v3_common.hpp uses
-// ck::DequantPolicyFor<> to derive the (sym, asym) pair ->
-// BlockGemmPipeline_Selector forwards both ->
-// BlockwiseGemmWmmaops_pipeline_v1's resolved-types reach the threadwise
-// transfer's templated Run<BElementOp>(...). So both the runtime
-// TruncateBf16Round=true and =false flavors live in the same .so as
-// distinct template-mangled symbols and the flag is a true runtime switch
-// (no rebuild). fp16 is unaffected (already uses the optimal bit-trick
-// path; DequantPack8WithZpTruncate's fp16 overload delegates to
-// DequantPack8WithZp).
+// Bf16 dequant rounding: truncate-to-bf16 is now the only behavior. The
+// IEEE-correct round-to-nearest-even path was retired after lm_eval verified
+// truncate is statistically indistinguishable from Triton on gsm8k 5-shot
+// (Orion-zhen/Qwen3-1.7B-AWQ n=500, McNemar p=1.000) and TTFT on Qwen3-8B-
+// quantized.w4a16 showed truncate is the only setting where CK beats Triton
+// on bf16. The choice is baked into DequantPack8 / DequantPack8WithZp in CK
+// (see [CK] AIESW-32282 commit on matthias.gfx11_ck / matthias/threadwise-
+// element-op-template), so there's no runtime/template axis to flip.
 //
 // clang-format off
 template <typename T,
           ck::index_t ScaleBlockK,
-          bool PreDequantToLDS  = false,
-          bool TruncateBf16Round = false>
+          bool PreDequantToLDS  = false>
 struct DeviceGemmInstanceImpl;
 
 // PreDequantToLDS = false : the fused-dequant baseline.
 //
 // AIESW-32282: BDequantOp (the trailing template slot on
-// DeviceGemm_BScale_Wmma_CShuffleV3) carries the dequant element-op
-// (DequantPack8WithZp or its truncate variant) down to the CK threadwise
-// transfer at the pk_i4 dequant call sites. CK's DequantPolicyFor<> trait
-// in unary_element_wise_operation.hpp maps the asym carrier to the
-// matching (sym, asym) pair both branches need to compile in the same v1
-// pipeline instantiation. Selecting DequantPack8WithZp vs
-// DequantPack8WithZpTruncate at template-instantiation time is what lets
-// the runtime TruncateBf16Round flag pick the dequant rounding policy
-// without rebuilding the .so. The BElementwiseOperation slot is left as
-// PassThrough because the gridwise also applies it at the B global->LDS
-// copy (ThreadwiseTensorSliceTransfer_v3r1) which expects a 2-arg
-// operator().
-template <typename T, ck::index_t ScaleBlockK, bool TruncateBf16Round>
+// DeviceGemm_BScale_Wmma_CShuffleV3) carries the dequant element-op down to
+// the CK threadwise transfer at the pk_i4 dequant call sites. CK's
+// DequantPolicyFor<> trait in unary_element_wise_operation.hpp maps the
+// asym carrier to the matching (sym, asym) pair both branches need to
+// compile in the same v1 pipeline instantiation. The BElementwiseOperation
+// slot is left as PassThrough because the gridwise also applies it at the
+// B global->LDS copy (ThreadwiseTensorSliceTransfer_v3r1) which expects a
+// 2-arg operator().
+template <typename T, ck::index_t ScaleBlockK>
 struct DeviceGemmInstanceImpl<T, ScaleBlockK,
-                              /*PreDequantToLDS=*/false,
-                              TruncateBf16Round> {
-  using BDequantOp =
-      typename std::conditional<TruncateBf16Round,
-                                DequantPack8WithZpTruncate,
-                                DequantPack8WithZp>::type;
+                              /*PreDequantToLDS=*/false> {
+  using BDequantOp = DequantPack8WithZp;
   using type = ck::tensor_operation::device::DeviceGemm_BScale_Wmma_CShuffleV3<
       // ---- Tensor layouts (A: Row, B: Col = K-major, C: Row) ----
       ALayout,
@@ -219,7 +190,7 @@ struct DeviceGemmInstanceImpl<T, ScaleBlockK,
       // ---- Layout permute flags ----
       PermuteA,
       PermuteB,
-      // ---- AIESW-32282: dequant element-op slot (selects RTE vs truncate at instantiation) ----
+      // ---- AIESW-32282: dequant element-op slot (carrier; trait derives the sym/asym pair) ----
       BDequantOp>;
 };
 
@@ -248,28 +219,23 @@ struct DeviceGemmInstanceImpl<T, ScaleBlockK,
 // (= 2 KB) and grows to 128 * 32 * sizeof(T) = 8 KB per stage when
 // dequantized — should still fit alongside the A tile but check occupancy
 // before declaring done.
-template <typename T, ck::index_t ScaleBlockK, bool TruncateBf16Round>
+template <typename T, ck::index_t ScaleBlockK>
 struct DeviceGemmInstanceImpl<T, ScaleBlockK,
-                              /*PreDequantToLDS=*/true,
-                              TruncateBf16Round> {
+                              /*PreDequantToLDS=*/true> {
   // Type aliases match the PreDequantToLDS=false specialization so the
   // dispatcher and op_tests link; the runtime path is guarded by a
   // TORCH_CHECK in gemm_w4a16.cu.
   using BDequantOp =
-      typename DeviceGemmInstanceImpl<T, ScaleBlockK, false,
-                                      TruncateBf16Round>::BDequantOp;
+      typename DeviceGemmInstanceImpl<T, ScaleBlockK, false>::BDequantOp;
   using type =
-      typename DeviceGemmInstanceImpl<T, ScaleBlockK, false,
-                                      TruncateBf16Round>::type;
+      typename DeviceGemmInstanceImpl<T, ScaleBlockK, false>::type;
 };
 
 template <typename T,
           ck::index_t ScaleBlockK,
-          bool PreDequantToLDS  = false,
-          bool TruncateBf16Round = false>
+          bool PreDequantToLDS  = false>
 using DeviceGemmInstance =
-    typename DeviceGemmInstanceImpl<T, ScaleBlockK, PreDequantToLDS,
-                                    TruncateBf16Round>::type;
+    typename DeviceGemmInstanceImpl<T, ScaleBlockK, PreDequantToLDS>::type;
 // clang-format on
 
 }  // namespace ck_w4a16

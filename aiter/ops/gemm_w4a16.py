@@ -19,7 +19,6 @@ def _gemm_w4a16_fake(
     group_size: int,
     scaled_zp: Optional[Tensor] = None,
     pre_dequant_to_lds: Optional[bool] = None,
-    truncate_bf16_round: Optional[bool] = None,
 ) -> Tensor:
     return Y
 
@@ -33,7 +32,6 @@ def gemm_w4a16(
     group_size: int,
     scaled_zp: Optional[Tensor] = None,
     pre_dequant_to_lds: Optional[bool] = None,
-    truncate_bf16_round: Optional[bool] = None,
 ) -> Tensor:
     """CK WMMA W4A16 b_scale GEMM (gfx1151 / RDNA 3.5).
 
@@ -65,17 +63,12 @@ def gemm_w4a16(
                      from LDS). The ``True`` path is currently **STUBBED** and
                      will raise at runtime — see TODO(AIESW-32282) in
                      ``csrc/ck_w4a16/include/gemm_w4a16_common.cuh``.
-        truncate_bf16_round:
-                     Optional bool, defaults to ``False``. ``False`` keeps the
-                     existing IEEE round-to-nearest-even fp32->bf16 step in
-                     the bf16 dequant. ``True`` switches to a bit-cast
-                     truncate (drops the upper 16 bits of fp32 directly,
-                     saving ~3 RDNA3.5 VALU instructions per nibble at
-                     <0.5 ULP of bf16 error vs RTE). Silently ignored on the
-                     fp16 path (fp16 already uses the optimal bit-trick).
-                     True runtime template flag — both flavors live in the
-                     same JIT-built ``.so`` as distinct template-mangled
-                     symbols (no rebuild required to flip).
+
+    Note (AIESW-32282): the bf16 dequant uses a bit-cast truncate
+    (drops the low 16 bits of fp32) as the only rounding mode. The
+    previous IEEE round-to-nearest-even path was retired after lm_eval
+    verified truncate is statistically indistinguishable from Triton
+    on gsm8k. fp16 path is unaffected.
 
     Returns:
         ``Y``, populated in place with ``in_a @ dequant(in_b, in_s, scaled_zp).T``.

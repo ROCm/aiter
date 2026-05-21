@@ -23,15 +23,13 @@ namespace {
 using namespace ck_w4a16;
 
 // Hot-path build of the CK Argument struct + invoker call. Templated on T
-// (fp16 or bf16), ScaleBlockK (32 or 128 — AWQ group_size),
+// (fp16 or bf16), ScaleBlockK (32 or 128 — AWQ group_size), and
 // PreDequantToLDS (false = fused-dequant baseline, true = pre-dequant-to-LDS
-// variant — see DeviceGemmInstance docs in gemm_w4a16_common.cuh), and
-// TruncateBf16Round (false = IEEE round-to-nearest-even, true = bit-cast
-// truncate). `p_b_zero_point` is nullptr for the symmetric path.
-// Argument validation (dtype / shape / contiguity) is done by the
-// dispatcher one level up before we get here.
-template <typename T, ck::index_t ScaleBlockK, bool PreDequantToLDS,
-          bool TruncateBf16Round>
+// variant — see DeviceGemmInstance docs in gemm_w4a16_common.cuh).
+// `p_b_zero_point` is nullptr for the symmetric path. Argument validation
+// (dtype / shape / contiguity) is done by the dispatcher one level up
+// before we get here.
+template <typename T, ck::index_t ScaleBlockK, bool PreDequantToLDS>
 inline void run_kernel_inner(const at::Tensor& in_a,
                              const at::Tensor& in_b,
                              const at::Tensor& in_s,
@@ -40,24 +38,17 @@ inline void run_kernel_inner(const at::Tensor& in_a,
                              const T* p_b_zero_point) {
   // TODO(AIESW-32282): drop this guard once the pre-dequant-to-LDS pipeline
   // is implemented. The template surface is wired end-to-end (4x dtypes/G
-  // pairs x 2 PreDequantToLDS flavors x 2 TruncateBf16Round flavors = 16
-  // instantiations), so the test + dispatcher can route here even though
-  // the kernel body for PreDequantToLDS=true is currently the same as the
-  // false specialization (see the DeviceGemmInstanceImpl<..., true> stub
-  // in gemm_w4a16_common.cuh).
+  // pairs x 2 PreDequantToLDS flavors = 8 instantiations), so the test +
+  // dispatcher can route here even though the kernel body for
+  // PreDequantToLDS=true is currently the same as the false specialization
+  // (see the DeviceGemmInstanceImpl<..., true> stub in
+  // gemm_w4a16_common.cuh).
   if constexpr (PreDequantToLDS) {
     TORCH_CHECK(false,
                 "CK W4A16 b_scale GEMM: PreDequantToLDS=true is not yet "
                 "implemented (template hook surfaced, kernel body pending — "
                 "see TODO(AIESW-32282) in gemm_w4a16_common.cuh).");
   }
-
-  // AIESW-32282: TruncateBf16Round is now a true runtime template flag. Both
-  // truncate / RTE flavors instantiate as separate template-mangled symbols
-  // in the same .so. The fp16 path silently ignores the flag (fp16 has no
-  // rounding chain to skip; i4_to_half4_scale is already the optimal
-  // bit-trick path — DequantPack8WithZpTruncate's fp16 overload delegates
-  // to DequantPack8WithZp).
 
   const ck::index_t M = static_cast<ck::index_t>(in_a.size(0));
   const ck::index_t K = static_cast<ck::index_t>(in_a.size(1));
@@ -76,7 +67,7 @@ inline void run_kernel_inner(const at::Tensor& in_a,
 #endif
 
   auto gemm =
-      DeviceGemmInstance<T, ScaleBlockK, PreDequantToLDS, TruncateBf16Round>{};
+      DeviceGemmInstance<T, ScaleBlockK, PreDequantToLDS>{};
   auto invoker = gemm.MakeInvoker();
   auto argument = gemm.MakeArgument(
       reinterpret_cast<const T*>(in_a.data_ptr()),
@@ -103,17 +94,14 @@ inline void run_kernel_inner(const at::Tensor& in_a,
 #endif
 }
 
-// Runtime dispatch on group_size + PreDequantToLDS + TruncateBf16Round
-// into the matching template instantiation. Only group_size in {32, 128}
-// are wired today (the two AWQ group sizes shipped by the models we target
-// on gfx1151); the dispatcher one level up gates `group_size` to those two
-// before we ever get here. The two bool flags multiply the instantiation
-// count to 8 per dtype (2 group sizes x 2 PreDequantToLDS x 2
-// TruncateBf16Round); kernel build time scales accordingly. The
-// PreDequantToLDS=true path currently TORCH_CHECKs at runtime (see
-// TODO(AIESW-32282)). The TruncateBf16Round flag is asserted against the
-// build-time mode (see run_kernel_inner; build-time switch because the CK
-// threadwise transfer hardcodes DequantPack8 / DequantPack8WithZp).
+// Runtime dispatch on group_size + PreDequantToLDS into the matching
+// template instantiation. Only group_size in {32, 128} are wired today
+// (the two AWQ group sizes shipped by the models we target on gfx1151);
+// the dispatcher one level up gates `group_size` to those two before we
+// ever get here. The PreDequantToLDS flag multiplies the instantiation
+// count to 4 per dtype (2 group sizes x 2 PreDequantToLDS); kernel build
+// time scales accordingly. The PreDequantToLDS=true path currently
+// TORCH_CHECKs at runtime (see TODO(AIESW-32282)).
 template <typename T>
 inline void run_kernel(const at::Tensor& in_a,
                        const at::Tensor& in_b,
@@ -121,31 +109,23 @@ inline void run_kernel(const at::Tensor& in_a,
                        at::Tensor& out,
                        int64_t group_size,
                        bool pre_dequant_to_lds,
-                       bool truncate_bf16_round,
                        const T* p_b_zero_point) {
-  // 2x2x2 dispatch: group_size x pre_dequant_to_lds x truncate_bf16_round.
-  auto dispatch_g = [&](auto g_const, auto pdl_const, auto trunc_const) {
+  // 2x2 dispatch: group_size x pre_dequant_to_lds.
+  auto dispatch_g = [&](auto g_const, auto pdl_const) {
     constexpr ck::index_t G = decltype(g_const)::value;
     constexpr bool PDL      = decltype(pdl_const)::value;
-    constexpr bool TBT      = decltype(trunc_const)::value;
-    run_kernel_inner<T, G, PDL, TBT>(in_a, in_b, in_s, out, group_size,
-                                     p_b_zero_point);
+    run_kernel_inner<T, G, PDL>(in_a, in_b, in_s, out, group_size,
+                                p_b_zero_point);
   };
 
 #define _CK_W4A16_DISPATCH_G(G_VAL)                                            \
   do {                                                                         \
-    if (pre_dequant_to_lds && truncate_bf16_round) {                           \
+    if (pre_dequant_to_lds) {                                                  \
       dispatch_g(std::integral_constant<ck::index_t, G_VAL>{},                 \
-                 std::true_type{}, std::true_type{});                          \
-    } else if (pre_dequant_to_lds) {                                           \
-      dispatch_g(std::integral_constant<ck::index_t, G_VAL>{},                 \
-                 std::true_type{}, std::false_type{});                         \
-    } else if (truncate_bf16_round) {                                          \
-      dispatch_g(std::integral_constant<ck::index_t, G_VAL>{},                 \
-                 std::false_type{}, std::true_type{});                         \
+                 std::true_type{});                                            \
     } else {                                                                   \
       dispatch_g(std::integral_constant<ck::index_t, G_VAL>{},                 \
-                 std::false_type{}, std::false_type{});                        \
+                 std::false_type{});                                           \
     }                                                                          \
   } while (0)
 
@@ -201,26 +181,18 @@ inline const T* zp_ptr(const std::optional<at::Tensor>& scaled_zp) {
 //              WMMA reads activation-dtype B from LDS). The true path is
 //              currently STUBBED and will TORCH_CHECK at runtime — see
 //              TODO(AIESW-32282) in include/gemm_w4a16_common.cuh.
-// truncate_bf16_round:
-//              optional bool, defaults to false. False = IEEE round-to-
-//              nearest-even (the existing path). True = bit-cast truncate
-//              for the trailing fp32->bf16 step in the bf16 dequant; saves
-//              ~3 RDNA3.5 VALU instructions per nibble (v_add3_u32 +0x7fff
-//              round bias, v_cmp_o_f32 + v_cndmask_b16 0x7fc0 NaN-quietening
-//              chain) at <0.5 ULP of bf16 error. Silently ignored on the
-//              fp16 path (fp16 already uses the optimal bit-trick). True
-//              runtime switch — both flavors share the .so as distinct
-//              template-mangled symbols (AIESW-32282: BElementwiseOperation
-//              now threads through the CK threadwise transfer; see
-//              gemm_w4a16_common.cuh).
+//
+// AIESW-32282: bf16 rounding mode is no longer a runtime axis. The CK
+// kernel ships truncate-to-bf16 only (i4_to_bhalf4_scale /
+// i4_to_bhalf4_zp_scale in unary_element_wise_operation.hpp), verified
+// statistically indistinguishable from Triton on lm_eval gsm8k 5-shot.
 torch::Tensor gemm_w4a16(at::Tensor& in_a,
                          at::Tensor& in_b,
                          at::Tensor& in_s,
                          at::Tensor& Y,
                          int64_t group_size,
                          std::optional<at::Tensor> scaled_zp,
-                         std::optional<bool> pre_dequant_to_lds,
-                         std::optional<bool> truncate_bf16_round) {
+                         std::optional<bool> pre_dequant_to_lds) {
   TORCH_CHECK(in_a.is_cuda() && in_b.is_cuda() && in_s.is_cuda() &&
                   Y.is_cuda(),
               "All tensors must be on GPU");
@@ -269,16 +241,15 @@ torch::Tensor gemm_w4a16(at::Tensor& in_a,
   }
 
   const bool pdl = pre_dequant_to_lds.value_or(false);
-  const bool tbt = truncate_bf16_round.value_or(false);
   if (Y.dtype() == at::kHalf) {
-    run_kernel<F16>(in_a, in_b, in_s, Y, group_size, pdl, tbt,
+    run_kernel<F16>(in_a, in_b, in_s, Y, group_size, pdl,
                     zp_ptr<F16>(scaled_zp));
   } else {  // at::kBFloat16
     // The CK submodule now ships the bf16 DequantPack8 / DequantPack8WithZp
     // overloads (commit "[CK] DequantPack8 + DequantPack8WithZp bf16
     // overloads (asymmetric int4 / AWQ)"), so the bhalf8_t instantiation
     // links cleanly. Dispatch to the same templated kernel.
-    run_kernel<B16>(in_a, in_b, in_s, Y, group_size, pdl, tbt,
+    run_kernel<B16>(in_a, in_b, in_s, Y, group_size, pdl,
                     zp_ptr<B16>(scaled_zp));
   }
   return Y;
