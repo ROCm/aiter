@@ -29,7 +29,8 @@ using namespace ck_w4a16;
 // `p_b_zero_point` is nullptr for the symmetric path. Argument validation
 // (dtype / shape / contiguity) is done by the dispatcher one level up
 // before we get here.
-template <typename T, ck::index_t ScaleBlockK, bool PreDequantToLDS>
+template <typename T, ck::index_t ScaleBlockK, bool PreDequantToLDS,
+          ck_w4a16::TileConfigKind Tile>
 inline void run_kernel_inner(const at::Tensor& in_a,
                              const at::Tensor& in_b,
                              const at::Tensor& in_s,
@@ -67,31 +68,45 @@ inline void run_kernel_inner(const at::Tensor& in_a,
 #endif
 
   auto gemm =
-      DeviceGemmInstance<T, ScaleBlockK, PreDequantToLDS>{};
+      DeviceGemmInstance<T, ScaleBlockK, PreDequantToLDS, Tile>{};
   auto invoker = gemm.MakeInvoker();
-  auto argument = gemm.MakeArgument(
-      reinterpret_cast<const T*>(in_a.data_ptr()),
-      reinterpret_cast<const BDataType*>(in_b.data_ptr()),
-      reinterpret_cast<T*>(out.data_ptr()), M, N, K, StrideA, StrideB, StrideC,
-      Scale_Stride_BN, reinterpret_cast<const T*>(in_s.data_ptr()), KBatch,
-      PassThrough{}, PassThrough{}, PassThrough{}, p_b_zero_point);
-
-  // IsSupportedArgument check is debug-only — measured ~840 us/call overhead
-  // when run on every dispatch and the device-op rejects shapes only on
-  // misuse (group_size != ScaleBlockK, K not divisible by KPerBlock, etc.)
-  // which are already caught by the TORCH_CHECKs in the dispatcher above.
-  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
-      gemm.IsSupportedArgument(argument),
-      "CK W4A16 b_scale device op rejected shape (M=", M, ", N=", N,
-      ", K=", K, ", G=", group_size, ")");
-
+  // AIESW-32735 B'': the Baseline_PackedSb tile uses BScaleDataType=float
+  // (per-group fp32 carrying both scale and bias_eff), so the in_s pointer
+  // must be cast to const float* and p_b_zero_point must be nullptr (sym
+  // branch of the v1 pipeline). All other tiles use BScaleDataType=T.
+  auto launch_with_args = [&](auto&& argument) {
+    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
+        gemm.IsSupportedArgument(argument),
+        "CK W4A16 b_scale device op rejected shape (M=", M, ", N=", N,
+        ", K=", K, ", G=", group_size, ")");
 #ifdef USE_ROCM
-  invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStream()});
+    invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStream()});
 #else
-  StreamConfig stream;
-  stream.stream_id_ = at::cuda::getCurrentCUDAStream();
-  invoker.Run(argument, stream);
+    StreamConfig stream;
+    stream.stream_id_ = at::cuda::getCurrentCUDAStream();
+    invoker.Run(argument, stream);
 #endif
+  };
+
+  if constexpr (Tile == ck_w4a16::TileConfigKind::Baseline_PackedSb &&
+                !PreDequantToLDS) {
+    auto argument = gemm.MakeArgument(
+        reinterpret_cast<const T*>(in_a.data_ptr()),
+        reinterpret_cast<const BDataType*>(in_b.data_ptr()),
+        reinterpret_cast<T*>(out.data_ptr()), M, N, K, StrideA, StrideB, StrideC,
+        Scale_Stride_BN, reinterpret_cast<const float*>(in_s.data_ptr()), KBatch,
+        PassThrough{}, PassThrough{}, PassThrough{},
+        /*p_b_zero_point=*/static_cast<const float*>(nullptr));
+    launch_with_args(argument);
+  } else {
+    auto argument = gemm.MakeArgument(
+        reinterpret_cast<const T*>(in_a.data_ptr()),
+        reinterpret_cast<const BDataType*>(in_b.data_ptr()),
+        reinterpret_cast<T*>(out.data_ptr()), M, N, K, StrideA, StrideB, StrideC,
+        Scale_Stride_BN, reinterpret_cast<const T*>(in_s.data_ptr()), KBatch,
+        PassThrough{}, PassThrough{}, PassThrough{}, p_b_zero_point);
+    launch_with_args(argument);
+  }
 }
 
 // Runtime dispatch on group_size + PreDequantToLDS into the matching
@@ -109,23 +124,91 @@ inline void run_kernel(const at::Tensor& in_a,
                        at::Tensor& out,
                        int64_t group_size,
                        bool pre_dequant_to_lds,
+                       int64_t tile_config_kind,
                        const T* p_b_zero_point) {
-  // 2x2 dispatch: group_size x pre_dequant_to_lds.
-  auto dispatch_g = [&](auto g_const, auto pdl_const) {
-    constexpr ck::index_t G = decltype(g_const)::value;
-    constexpr bool PDL      = decltype(pdl_const)::value;
-    run_kernel_inner<T, G, PDL>(in_a, in_b, in_s, out, group_size,
-                                p_b_zero_point);
+  // 2 x 2 x 4 dispatch: group_size x pre_dequant_to_lds x tile_config_kind.
+  auto launch = [&](auto g_const, auto pdl_const, auto tile_const) {
+    constexpr ck::index_t G                  = decltype(g_const)::value;
+    constexpr bool PDL                       = decltype(pdl_const)::value;
+    constexpr ck_w4a16::TileConfigKind Tile  = decltype(tile_const)::value;
+    run_kernel_inner<T, G, PDL, Tile>(in_a, in_b, in_s, out, group_size,
+                                      p_b_zero_point);
   };
+
+  // AIESW-32735: only the AWQ-asym fp16 path needs experimental tile configs
+  // today; we still need the macro to work for both group_size values and
+  // both pre_dequant_to_lds branches because that's the existing surface.
+  // The tile_config dimension is the new axis. The default (Baseline) tile
+  // keeps the existing kernel selection bit-for-bit.
+#define _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY, TILE_KIND)                \
+  launch(std::integral_constant<ck::index_t, G_VAL>{},                         \
+         PDL_TY{},                                                             \
+         std::integral_constant<ck_w4a16::TileConfigKind, TILE_KIND>{})
+
+#define _CK_W4A16_DISPATCH_G_PDL(G_VAL, PDL_TY)                                \
+  do {                                                                         \
+    switch (static_cast<ck_w4a16::TileConfigKind>(tile_config_kind)) {         \
+      case ck_w4a16::TileConfigKind::Baseline:                                 \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline);    \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::WideM:                                    \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::WideM);       \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::LargeK:                                   \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::LargeK);      \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::WideM_LargeK:                             \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::WideM_LargeK);\
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::Tile64:                                   \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Tile64);      \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::Tile64_LargeK:                            \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Tile64_LargeK);\
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::NarrowN:                                  \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::NarrowN);     \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_Sym_V1:                          \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_Sym_V1); \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_Sym_V3:                          \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_Sym_V3); \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_Bias:                            \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_Bias); \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_PackedSb:                        \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_PackedSb); \
+        break;                                                                 \
+      default:                                                                 \
+        TORCH_CHECK(false,                                                     \
+                    "CK W4A16 b_scale GEMM: unsupported tile_config_kind=",    \
+                    tile_config_kind,                                          \
+                    " (valid: 0=Baseline, 1=WideM, 2=LargeK, "                 \
+                    "3=WideM_LargeK, 4=Tile64, 5=Tile64_LargeK, "              \
+                    "6=NarrowN, 7=Baseline_Sym_V1, 8=Baseline_Sym_V3, "        \
+                    "9=Baseline_Bias, 10=Baseline_PackedSb)");                 \
+    }                                                                          \
+  } while (0)
 
 #define _CK_W4A16_DISPATCH_G(G_VAL)                                            \
   do {                                                                         \
     if (pre_dequant_to_lds) {                                                  \
-      dispatch_g(std::integral_constant<ck::index_t, G_VAL>{},                 \
-                 std::true_type{});                                            \
+      _CK_W4A16_DISPATCH_G_PDL(G_VAL, std::true_type);                         \
     } else {                                                                   \
-      dispatch_g(std::integral_constant<ck::index_t, G_VAL>{},                 \
-                 std::false_type{});                                           \
+      _CK_W4A16_DISPATCH_G_PDL(G_VAL, std::false_type);                        \
     }                                                                          \
   } while (0)
 
@@ -139,6 +222,8 @@ inline void run_kernel(const at::Tensor& in_a,
                 " (only 32 and 128 are wired)");
   }
 #undef _CK_W4A16_DISPATCH_G
+#undef _CK_W4A16_DISPATCH_G_PDL
+#undef _CK_W4A16_DISPATCH_G_PDL_TILE
 }
 
 // Type-erase the optional zero-point pointer for the dispatcher.
@@ -192,13 +277,33 @@ torch::Tensor gemm_w4a16(at::Tensor& in_a,
                          at::Tensor& Y,
                          int64_t group_size,
                          std::optional<at::Tensor> scaled_zp,
-                         std::optional<bool> pre_dequant_to_lds) {
+                         std::optional<bool> pre_dequant_to_lds,
+                         std::optional<int64_t> tile_config) {
   TORCH_CHECK(in_a.is_cuda() && in_b.is_cuda() && in_s.is_cuda() &&
                   Y.is_cuda(),
               "All tensors must be on GPU");
-  TORCH_CHECK(in_a.dtype() == Y.dtype() && in_s.dtype() == Y.dtype(),
-              "in_a / in_s / Y must share dtype (fp16 or bf16); got in_a=",
-              in_a.dtype(), " in_s=", in_s.dtype(), " Y=", Y.dtype());
+  // AIESW-32735 B'': for tile_config=10 (Baseline_PackedSb) the in_s slot
+  // carries a packed fp32 buffer (scale in low 16, bias_eff in high 16) so
+  // the in_s dtype is float32 and the shape's K-dim stays the same. All
+  // other tiles use the activation dtype for in_s.
+  const int64_t _early_tile_kind = tile_config.value_or(0);
+  const bool _is_packed_sb_tile = (_early_tile_kind == 10);
+  TORCH_CHECK(in_a.dtype() == Y.dtype(),
+              "in_a / Y must share dtype (fp16 or bf16); got in_a=",
+              in_a.dtype(), " Y=", Y.dtype());
+  if (_is_packed_sb_tile) {
+    TORCH_CHECK(in_s.dtype() == at::kFloat,
+                "tile_config=10 (Baseline_PackedSb) requires in_s dtype fp32 "
+                "(packed scale+bias_eff); got in_s=", in_s.dtype());
+    TORCH_CHECK(!scaled_zp.has_value(),
+                "tile_config=10 (Baseline_PackedSb) must be called with "
+                "scaled_zp=None — the sym branch of the v1 pipeline is used "
+                "(packed buffer carries both scale and bias_eff).");
+  } else {
+    TORCH_CHECK(in_s.dtype() == Y.dtype(),
+                "in_s / Y must share dtype (fp16 or bf16); got in_s=",
+                in_s.dtype(), " Y=", Y.dtype());
+  }
   TORCH_CHECK(Y.dtype() == at::kHalf || Y.dtype() == at::kBFloat16,
               "Y dtype must be float16 or bfloat16; got ", Y.dtype());
   TORCH_CHECK(in_a.dim() == 2, "in_a must be 2-D [M, K]");
@@ -241,15 +346,16 @@ torch::Tensor gemm_w4a16(at::Tensor& in_a,
   }
 
   const bool pdl = pre_dequant_to_lds.value_or(false);
+  const int64_t tile_kind = tile_config.value_or(0);
   if (Y.dtype() == at::kHalf) {
-    run_kernel<F16>(in_a, in_b, in_s, Y, group_size, pdl,
+    run_kernel<F16>(in_a, in_b, in_s, Y, group_size, pdl, tile_kind,
                     zp_ptr<F16>(scaled_zp));
   } else {  // at::kBFloat16
     // The CK submodule now ships the bf16 DequantPack8 / DequantPack8WithZp
     // overloads (commit "[CK] DequantPack8 + DequantPack8WithZp bf16
     // overloads (asymmetric int4 / AWQ)"), so the bhalf8_t instantiation
     // links cleanly. Dispatch to the same templated kernel.
-    run_kernel<B16>(in_a, in_b, in_s, Y, group_size, pdl,
+    run_kernel<B16>(in_a, in_b, in_s, Y, group_size, pdl, tile_kind,
                     zp_ptr<B16>(scaled_zp));
   }
   return Y;

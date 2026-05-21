@@ -567,14 +567,16 @@ namespace py = pybind11;
           "(zp - 8) * scale for asymmetric AWQ. pre_dequant_to_lds=true selects "     \
           "the pre-dequant-to-LDS variant (currently STUBBED, see "                   \
           "TODO(AIESW-32282)). bf16 dequant always uses bit-cast truncate "           \
-          "(AIESW-32282).",                                                            \
+          "(AIESW-32282). AIESW-32735: tile_config selects an experimental "          \
+          "tile-tuning kind (0=Baseline, 1=WideM, 2=LargeK, 3=WideM_LargeK).",        \
           py::arg("in_a"),                                                             \
           py::arg("in_b"),                                                             \
           py::arg("in_s"),                                                             \
           py::arg("Y"),                                                                \
           py::arg("group_size"),                                                       \
           py::arg("scaled_zp") = std::nullopt,                                         \
-          py::arg("pre_dequant_to_lds") = std::nullopt);
+          py::arg("pre_dequant_to_lds") = std::nullopt,                                \
+          py::arg("tile_config") = std::nullopt);
 
 #define GEMM_A8W8_BLOCKSCALE_PYBIND \
     m.def("gemm_a8w8_blockscale",   \

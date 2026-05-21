@@ -14,4 +14,5 @@ torch::Tensor gemm_w4a16(at::Tensor& in_a,
                          at::Tensor& Y,
                          int64_t group_size,
                          std::optional<at::Tensor> scaled_zp,
-                         std::optional<bool> pre_dequant_to_lds);
+                         std::optional<bool> pre_dequant_to_lds,
+                         std::optional<int64_t> tile_config);
