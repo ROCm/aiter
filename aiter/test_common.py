@@ -397,22 +397,41 @@ def get_trace_perf(prof, num_iters):
 
 
 def _check_catastrophic(actual_max_delta, a, b, max_abs_delta):
+    """Decide whether a checkAllclose mismatch is "catastrophic" (fail-fast).
+
+    Catastrophic == "unambiguously broken kernel". We deliberately keep this
+    narrow to avoid false positives from legitimate numerical noise:
+
+    - NaN / Inf in either tensor: always catastrophic. This covers the main
+      tuner use case (mp_tuner.worker pre-fills outputs with NaN, so any
+      kernel that does not fully write the output leaves NaN sentinels) as
+      well as kernels that produce Inf from numerical blow-up.
+    - Explicit ``max_abs_delta``: opt-in hard cap. Tuner tasks set it via the
+      task spec; unit tests can pass ``max_abs_delta=...`` to checkAllclose
+      when they want a fail-fast bound. Without this, relative-magnitude
+      heuristics tend to misfire on order-sensitive comparisons (sort + ties,
+      topk with degenerate scores, byte-viewed fp4, etc.) so we do NOT apply
+      one by default.
+
+    ``torch.isfinite`` is safe on integer / byte tensors (returns all True),
+    so this function works uniformly across dtypes.
+    """
+    if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+        return True
     if max_abs_delta is not None:
         return actual_max_delta > max_abs_delta
-    ref_abs_max = max(b.abs().max().item(), 1.0)
-    return actual_max_delta > ref_abs_max * 0.5
+    return False
 
 
 def _catastrophic_check_silent(a, b, max_abs_delta):
-    """Compute catastrophic check without creating masked tensors (for not-printLog path)."""
-    if torch.isnan(a).any() or torch.isnan(b).any():
+    """Same policy as ``_check_catastrophic`` but without an already-computed
+    ``actual_max_delta``. Used by the not-printLog (tuner) fast path so we
+    avoid materialising masked tensors when ``isclose`` already failed."""
+    if not torch.isfinite(a).all() or not torch.isfinite(b).all():
         return True
     if max_abs_delta is not None:
-        actual_max_delta = (a - b).abs().max().item()
-        return actual_max_delta > max_abs_delta
-    diff_abs = (a - b).abs()
-    vals = torch.stack([diff_abs.max(), b.abs().max()]).tolist()
-    return vals[0] > max(vals[1], 1.0) * 0.5
+        return (a - b).abs().max().item() > max_abs_delta
+    return False
 
 
 def checkAllclose(
