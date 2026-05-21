@@ -92,12 +92,29 @@ namespace py = pybind11;
           py::arg("input"),                             \
           py::arg("expert_ids"),                        \
           py::arg("bias"));                             \
+    m.def("gelu_and_mul_bias",                          \
+          &aiter::gelu_and_mul_bias,                    \
+          "GELU gating with per-expert bias.",          \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("expert_ids"),                        \
+          py::arg("bias"));                             \
     m.def("scaled_silu_and_mul",                        \
           &aiter::scaled_silu_and_mul,                  \
           "Activation function used in scaled SwiGLU.", \
           py::arg("out"),                               \
           py::arg("input"),                             \
           py::arg("scale"));                            \
+    m.def("silu_and_mul_quant",                         \
+          &aiter::silu_and_mul_quant,                   \
+          "Fused silu_and_mul with per-group "          \
+          "quantization to fp4 or fp8.",                \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("scale"),                             \
+          py::arg("group_size"),                        \
+          py::arg("limit") = 0.0f,                     \
+          py::arg("shuffle_scale") = false);            \
     m.def("gelu_and_mul",                               \
           &aiter::gelu_and_mul,                         \
           "Activation function used in GELU.",          \
@@ -327,6 +344,26 @@ namespace py = pybind11;
           py::arg("quant_block_size"),                                              \
           py::arg("scale_fmt"),                                                     \
           py::arg("preshuffle") = false);                                           \
+    m.def("indexer_qk_rope_quant_and_cache",                                        \
+          &aiter::indexer_qk_rope_quant_and_cache,                                  \
+          py::arg("q"),                                                             \
+          py::arg("q_out"),                                                         \
+          py::arg("weights"),                                                       \
+          py::arg("weights_out"),                                                   \
+          py::arg("k"),                                                             \
+          py::arg("kv_cache"),                                                      \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("norm_weight"),                                                   \
+          py::arg("norm_bias"),                                                     \
+          py::arg("positions"),                                                     \
+          py::arg("cos_cache"),                                                     \
+          py::arg("sin_cache"),                                                     \
+          py::arg("epsilon"),                                                       \
+          py::arg("quant_block_size"),                                              \
+          py::arg("scale_fmt"),                                                     \
+          py::arg("weights_scale"),                                                 \
+          py::arg("preshuffle") = false,                                            \
+          py::arg("is_neox") = true);                                               \
     m.def("cp_gather_indexer_k_quant_cache",                                        \
           &aiter::cp_gather_indexer_k_quant_cache,                                  \
           py::arg("kv_cache"),                                                      \
@@ -434,6 +471,18 @@ namespace py = pybind11;
           py::arg("reg_bytes"),                                                                 \
           py::arg("use_1stage"),                                                                \
           py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                                   \
+    m.def("fused_qknorm_allreduce",                                                             \
+          &aiter::fused_qknorm_allreduce,                                                       \
+          py::arg("_fa"),                                                                       \
+          py::arg("qkv_in"),                                                                    \
+          py::arg("q_w"),                                                                       \
+          py::arg("k_w"),                                                                       \
+          py::arg("q_out"),                                                                     \
+          py::arg("k_out"),                                                                     \
+          py::arg("v_out"),                                                                     \
+          py::arg("eps"),                                                                       \
+          py::arg("reg_ptr"),                                                                   \
+          py::arg("reg_bytes"));                                                                \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
     m.def("register_input_buffer",                                                             \
@@ -1238,7 +1287,8 @@ namespace py = pybind11;
           py::arg("local_expert_mask") = std::nullopt, \
           py::arg("num_local_tokens")  = std::nullopt, \
           py::arg("workspace")         = std::nullopt, \
-          py::arg("dispatch_policy")   = 0);
+          py::arg("dispatch_policy")   = 0,            \
+          py::arg("local_topk_ids")    = std::nullopt);
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \

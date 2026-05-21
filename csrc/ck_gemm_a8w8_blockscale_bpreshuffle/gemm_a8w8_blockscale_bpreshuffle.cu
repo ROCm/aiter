@@ -9,8 +9,8 @@
 
 #include <cmath>
 
-using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
+using BlockwiseKernel = torch::Tensor (*)(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&);
 
 using BlockwiseKernelMap = GemmDispatchMap<BlockwiseKernel>;
 
@@ -44,8 +44,8 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
         }
     }();
 
-    const int cu_num         = get_device_cu_num();
-    const std::string& gfx   = get_device_gfx();
+    const int cu_num           = get_device_cu_num();
+    const std::string_view gfx = get_device_gfx();
 
     // First check if this shape(M,N,K) is available in the direct lookup.
     auto it = lookup.find({gfx, cu_num, M, N, K});
