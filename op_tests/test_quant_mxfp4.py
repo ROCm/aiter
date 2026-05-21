@@ -169,7 +169,7 @@ fp32_to_e2m1 = fp32_to_e2m1_rne if get_gfx() == "gfx950" else fp32_to_e2m1_rha
 
 
 def ref_quant_mxfp4(inp: torch.Tensor, round_mode: int = 1, group_size: int = 32):
-    """Python reference quantizer for all four MxFp4RoundMode values.
+    """Python reference quantizer for all four MxScaleRoundMode values.
 
     Mode mapping (Quark name <-> torchao name):
         0: RoundDown <-> FLOOR

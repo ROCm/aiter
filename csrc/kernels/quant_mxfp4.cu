@@ -10,7 +10,12 @@
 
 namespace aiter {
 
-// Scale rounding modes for MXFP4 quantization.
+// E8M0 block-scale rounding modes for the whole MX format family
+// (mxfp4 / mxfp6 / mxfp8 / mxint8) -- the four formulas FLOOR / RCEIL /
+// CEIL / EVEN are dtype-agnostic, only ``max_pos`` / ``max_pow2`` constants
+// differ (see PyTorch torchao ``ScaleCalculationMode`` for the same design).
+// Used here by the mxfp4 kernel; future mx kernels can reuse this enum.
+//
 // Names follow AMD Quark's RoundMode for AMD-side familiarity. Each value is
 // 1:1 mathematically equivalent to a PyTorch torchao ScaleCalculationMode
 // (see csrc/kernels/quant.md "Cross-Stack Mode Alignment Reference"):
@@ -23,7 +28,7 @@ namespace aiter {
 //      Quark/quark/torch/kernel/mx/triton.py        (_compute_quant_and_scale)
 //      torchao/prototype/mx_formats/config.py       (ScaleCalculationMode)
 //      torchao/prototype/mx_formats/mx_tensor.py    (_to_mx_rceil and friends)
-enum class MxFp4RoundMode : int {
+enum class MxScaleRoundMode : int {
     RoundDown = 0, // OCP / NV ROUND_DOWN / torchao FLOOR:
                    //   scale = floor_pow2(amax) / 4. ~37% max clipping.
     RoundUp   = 1, // NV / DSv4 Pro / FlashInfer / torchao RCEIL:
@@ -102,7 +107,7 @@ __device__ __forceinline__ int a16w4_shuffle_scale_id(
            K_Pack_idx * 2 + N_Pack_idx;
 }
 
-template <typename float_type, MxFp4RoundMode rmode, bool e8m0_shuffle, bool a16w4_shuffle, bool shuffle_weight>
+template <typename float_type, MxScaleRoundMode rmode, bool e8m0_shuffle, bool a16w4_shuffle, bool shuffle_weight>
 __global__ __launch_bounds__(kBlockThreads)
 void quant_mxfp4_kernel(
     const float_type* __restrict__ inp,
@@ -144,13 +149,13 @@ void quant_mxfp4_kernel(
     float dequant_scale;
     uint8_t biased_exp;
 
-    if constexpr (rmode == MxFp4RoundMode::RoundDown) {
+    if constexpr (rmode == MxScaleRoundMode::RoundDown) {
         dequant_scale = aiter::fp4_f32_to_e8m0_scale_ocp(group_max);
         biased_exp    = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
-    } else if constexpr (rmode == MxFp4RoundMode::RoundUp) {
+    } else if constexpr (rmode == MxScaleRoundMode::RoundUp) {
         dequant_scale = aiter::fp4_f32_to_e8m0_scale(group_max);
         biased_exp    = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
-    } else if constexpr (rmode == MxFp4RoundMode::Even) {
+    } else if constexpr (rmode == MxScaleRoundMode::Even) {
         max_bits          = (max_bits + EVEN_ROUND_VAL_TO_ADD) & EVEN_ROUND_FP32_SIGN_EXP_MASK;
         float max_rounded = __uint_as_float(max_bits);
 
@@ -158,7 +163,7 @@ void quant_mxfp4_kernel(
         scale_unbiased       = fminf(fmaxf(scale_unbiased, -127.0f), 127.0f);
         dequant_scale        = exp2f(scale_unbiased);
         biased_exp           = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
-    } else if constexpr (rmode == MxFp4RoundMode::Ceil) {
+    } else if constexpr (rmode == MxScaleRoundMode::Ceil) {
         // torchao CEIL: ceil_pow2(amax) / 4. Same as RoundDown but bumps the
         // exponent by 1 whenever any mantissa bit is set, so scale is the
         // smallest power-of-two >= amax/4 (vs. RoundDown's largest pow2 <= amax/4).
@@ -303,15 +308,15 @@ void quant_mxfp4(
 
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
         inp.dtype(), "quant_mxfp4_kernel", [&] {
-            switch (static_cast<MxFp4RoundMode>(round_mode)) {
-            case MxFp4RoundMode::RoundDown:
-                MXFP4_DISPATCH(scalar_t, MxFp4RoundMode::RoundDown); break;
-            case MxFp4RoundMode::RoundUp:
-                MXFP4_DISPATCH(scalar_t, MxFp4RoundMode::RoundUp); break;
-            case MxFp4RoundMode::Even:
-                MXFP4_DISPATCH(scalar_t, MxFp4RoundMode::Even); break;
-            case MxFp4RoundMode::Ceil:
-                MXFP4_DISPATCH(scalar_t, MxFp4RoundMode::Ceil); break;
+            switch (static_cast<MxScaleRoundMode>(round_mode)) {
+            case MxScaleRoundMode::RoundDown:
+                MXFP4_DISPATCH(scalar_t, MxScaleRoundMode::RoundDown); break;
+            case MxScaleRoundMode::RoundUp:
+                MXFP4_DISPATCH(scalar_t, MxScaleRoundMode::RoundUp); break;
+            case MxScaleRoundMode::Even:
+                MXFP4_DISPATCH(scalar_t, MxScaleRoundMode::Even); break;
+            case MxScaleRoundMode::Ceil:
+                MXFP4_DISPATCH(scalar_t, MxScaleRoundMode::Ceil); break;
             }
         });
 }

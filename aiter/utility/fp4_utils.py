@@ -94,7 +94,7 @@ def f32_to_e8m0_ceil(x):
 # Aliases mirroring PyTorch torchao's ScaleCalculationMode names. The four
 # mode names FLOOR / RCEIL / CEIL / EVEN come from
 # torchao/prototype/mx_formats/config.py::ScaleCalculationMode and are 1:1
-# mathematically equivalent to aiter's MxFp4RoundMode (Quark naming):
+# mathematically equivalent to aiter's MxScaleRoundMode (Quark naming):
 #
 #   torchao FLOOR  <-> Quark / aiter RoundDown
 #   torchao RCEIL  <-> Quark / aiter RoundUp     <-- industry default
