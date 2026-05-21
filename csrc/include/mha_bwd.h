@@ -247,42 +247,6 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     p3 _p43;
 };
 
-struct __attribute__((packed)) fmha_bwd_odo_args
-{
-    const void* ptr_o;
-    p2 _p0;
-    const void* ptr_do;
-    p2 _p1;
-    void* ptr_d;
-    p2 _p2;
-    unsigned int Hs_o;
-    p3 _p3;
-    unsigned int BAs_o;
-    p3 _p4;
-    unsigned int Seqs_o;
-    p3 _p5;
-    unsigned int Hs_do;
-    p3 _p6;
-    unsigned int BAs_do;
-    p3 _p7;
-    unsigned int Seqs_do;
-    p3 _p8;
-    unsigned int Hs_d;
-    p3 _p9;
-    unsigned int BAs_d;
-    p3 _p10;
-    unsigned int Seqs_d;
-    p3 _p11;
-    unsigned int seqlen_q;
-    p3 _p12;
-    unsigned int head_dim;
-    p3 _p13;
-    const void* ptr_qseq;
-    p2 _p14;
-    const void* ptr_qseq_padded;
-    p2 _p15;
-};
-
 // dq_shuffle & dq_convert post process kernel args
 struct __attribute__((packed)) fmha_bwd_post_kernel_args
 {
