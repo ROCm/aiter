@@ -2225,17 +2225,4 @@ namespace py = pybind11;
           py::arg("softmax_scale"),                           \
           py::arg("split_output"),                            \
           py::arg("split_lse"),                               \
-          py::arg("final_output"));                           \
-    m.def("hk_mla_v40_qmanager_v1_unit_test",                 \
-          &hk_mla_v40_qmanager_v1_unit_test,                  \
-          "hk_mla_v40_qmanager_v1_unit_test",                 \
-          py::arg("query"),                                   \
-          py::arg("query_rope"),                              \
-          py::arg("q_vgpr_out"),                              \
-          py::arg("q_lds_out"));                              \
-    m.def("hk_mla_v40_qmanager_v1_p1_ladder_probe",           \
-          &hk_mla_v40_qmanager_v1_p1_ladder_probe,            \
-          "hk_mla_v40_qmanager_v1_p1_ladder_probe",           \
-          py::arg("query"),                                   \
-          py::arg("query_rope"),                              \
-          py::arg("dump_out"));
+          py::arg("final_output"));
