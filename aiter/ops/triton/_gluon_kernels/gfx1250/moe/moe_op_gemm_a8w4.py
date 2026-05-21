@@ -365,7 +365,7 @@ def _moe_gemm_a8w4(
 
     read_idx = 0
     write_idx = 0
-    for _ in gl.static_range(NUM_BUFFERS - 1):
+    for _ in gl.static_range(NUM_BUFFERS):
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
@@ -407,9 +407,9 @@ def _moe_gemm_a8w4(
 
     num_k_iter = tl.cdiv(K, BLOCK_K)
 
-    # After TDM prologue there are (NUM_BUFFERS-1)*3 ops in-flight; waiting for
-    # (NUM_BUFFERS-2)*3 lets exactly one tile (tile 0) complete.
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * NUM_TDM_OPS)
+    # After TDM prologue there are NUM_BUFFERS*3 ops in-flight; waiting for
+    # (NUM_BUFFERS-1)*3 lets exactly one tile (tile 0) complete.
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
 
     # Register pre-load prologue: wait for tile 0 then read it into cur_x/cur_w/cur_w_scales.
     cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
@@ -433,7 +433,7 @@ def _moe_gemm_a8w4(
     read_idx += 1
 
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
-    for k in range(num_k_iter - (NUM_BUFFERS - 1)):
+    for k in range(num_k_iter - NUM_BUFFERS):
         if is_x_microscaled:
             acc = gl.amd.gfx1250.wmma_scaled(
                 cur_x, cur_x_scales, "e4m3", cur_w, cur_w_scales, "e2m1", acc
@@ -482,7 +482,7 @@ def _moe_gemm_a8w4(
                 )
         write_idx += 1
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * NUM_TDM_OPS)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
 
         next_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         next_w = (
@@ -513,9 +513,19 @@ def _moe_gemm_a8w4(
         read_idx += 1
 
     # Epilogue: drain remaining pipeline stages (no new TDM loads).
-    # The first NUM_BUFFERS-2 iterations still use the pre-load / WMMA pattern.
-    for k_ep in gl.static_range(NUM_BUFFERS - 2):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - k_ep) * NUM_TDM_OPS)
+    # The first NUM_BUFFERS-1 iterations still use the pre-load / WMMA pattern.
+
+    for k_ep in gl.static_range(NUM_BUFFERS - 1):
+        if is_x_microscaled:
+            acc = gl.amd.gfx1250.wmma_scaled(
+                cur_x, cur_x_scales, "e4m3", cur_w, cur_w_scales, "e2m1", acc
+            )
+        else:
+            acc = gl.amd.gfx1250.wmma_scaled(
+                cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc
+            )
+
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS)
 
         next_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         next_w = (
@@ -538,14 +548,6 @@ def _moe_gemm_a8w4(
                 layout=DOT_LAYOUT_X_SCALES
             )
 
-        if is_x_microscaled:
-            acc = gl.amd.gfx1250.wmma_scaled(
-                cur_x, cur_x_scales, "e4m3", cur_w, cur_w_scales, "e2m1", acc
-            )
-        else:
-            acc = gl.amd.gfx1250.wmma_scaled(
-                cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc
-            )
         cur_x = next_x
         cur_w = next_w
         cur_w_scales = next_w_scales
