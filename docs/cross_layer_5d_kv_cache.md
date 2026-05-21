@@ -9,11 +9,12 @@
 
 ## 1. Ticket context
 
-Tencent's HY3 model on Kunlun XPU uses a "Cross-Layer KV Cache" layout where the
+The HY3 model on Kunlun XPU uses a "Cross-Layer KV Cache" layout where the
 KV cache is allocated as a single 6D physical tensor and exposed per-layer as a
-non-contiguous 5D view. They asked AMD to provide the same support in AITER so
-HY3 can run on MI-class GPUs through the same vLLM integration. The two source
-specs that drive this work are kept in the AITER repo root for reference:
+non-contiguous 5D view. The customer asked AMD to provide the same support in
+AITER so HY3 can run on MI-class GPUs through the same vLLM integration. The
+two source specs that drive this work are kept in the AITER repo root for
+reference:
 
 - `Cross-Layer_5D_KV_Cache_Operator_Adaptation_Plan_EN.md`
 - `Hover_Cache_EN.md`
@@ -26,7 +27,7 @@ The original ticket asks three things:
 2. Does `reshape_and_cache` (vLLM's `csrc/cache_kernels.cu`) accept non-contiguous
    KV cache? If not, fix or suggest an alternative. — **covered in Part B
    below.**
-3. There is no Tencent-side Python repro yet; we have to validate this on synthetic
+3. There is no customer-side Python repro yet; we have to validate this on synthetic
    inputs that mirror the doc's section 9.2 numeric example.
 
 The companion "Hover Cache" design (a GPU/CPU/KVStore tiered prefix-cache
@@ -66,7 +67,7 @@ stride:  (B*D, L*2*H*B*D, L*2*B*D, D, 1)
 
 This view is intentionally **non-contiguous**. Calling `.contiguous()` per layer
 per step would copy the entire KV cache (multiple GB) every forward pass; that's
-the option Tencent explicitly rejects. So the operator side has to consume the
+the option the spec explicitly rejects. So the operator side has to consume the
 view as-is and walk it through stride metadata.
 
 Two properties of the layout make it tractable for CK Tile:
@@ -84,7 +85,7 @@ The full layout zoo we now support in `mha_batch_prefill_func`:
 | `VECTORIZED_LAYOUT`          | 5D   | `[N, H, D/V, B, V]` (swizzled)      | existing (SGLang/vLLM vectorized)     |
 | `LINEAR_LAYOUT` (4D)         | 4D   | `[N, B, H, D]`                      | existing (SGLang/vLLM linear)         |
 | `LINEAR_LAYOUT` (3D, page=1) | 3D   | `[N, H, D]`                         | existing                              |
-| `LINEAR_HEADS_FIRST_LAYOUT`  | 4D   | `[N, H, B, D]` (non-contiguous)     | **new**: Tencent Cross-Layer 5D view  |
+| `LINEAR_HEADS_FIRST_LAYOUT`  | 4D   | `[N, H, B, D]` (non-contiguous)     | **new**: Cross-Layer 5D view          |
 
 The new variant differs from the existing 4D linear by one transposition: heads
 sit before page in the dim order, mirroring what falls out of slicing
@@ -121,7 +122,7 @@ Seven files were changed in total.
 
 Added `LINEAR_HEADS_FIRST_LAYOUT = 2` alongside the existing
 `VECTORIZED_LAYOUT = 0` and `LINEAR_LAYOUT = 1`, with a doc comment naming the
-Tencent cross-layer origin and explaining that the kernel treats it as
+cross-layer origin and explaining that the kernel treats it as
 `LINEAR_LAYOUT` at dispatch time (only the AITER wrapper distinguishes them
 when extracting strides). **No CK kernel template, codegen, or instance files
 were touched.**
@@ -246,7 +247,7 @@ Three new tests next to the existing `kv_blockscale` ones:
 | `test_batch_prefill_cross_layer_5d_layout_matches_contiguous` | Functional GPU test: runs `mha_batch_prefill_func` twice on the same numerical data — once via packed contiguous `[N, B, H, D]` `LINEAR_LAYOUT`, once via the non-contiguous cross-layer `[N, H, B, D]` `LINEAR_HEADS_FIRST_LAYOUT` view sliced from the 6D buffer — and asserts the outputs match. 64 parametrizations: `dtype ∈ {bf16, fp16}` × `causal ∈ {False, True}` × `qo_len ∈ {16, 32}` × `batch_size ∈ {1, 2}` × `GQA ∈ {(1,4), (2,8)}` × `layer_idx ∈ {0, 2}`. |
 
 Helper `_make_cross_layer_5d_view(...)` reproduces the framework-side
-construction from sections 1.1/2.2 of the Tencent doc (allocate 6D, permute to
+construction from sections 1.1/2.2 of the cross-layer adaptation doc (allocate 6D, permute to
 logical 6D, index by `layer_idx` to get the 5D non-contiguous view).
 
 ## 5. Verification
@@ -311,7 +312,7 @@ out in either order.
     [aiter/csrc/kernels/attention.cu](../csrc/kernels/attention.cu). The
     wrapper for that path reads `block_size = key_cache.size(3)`, which
     implicitly assumes the x-vectorized 5D cache layout
-    `[N, H, D/x, B, x]` — different layout family from Tencent's cross-layer
+    `[N, H, D/x, B, x]` — different layout family from the cross-layer
     `[N, H, B, D]`.
   - **AITER already has two newer decode entry points** that handle the
     heads-first `[N, H, B, D]` ("HND") layout via runtime stride dispatch:
@@ -337,14 +338,14 @@ out in either order.
        callers opt into cross-layer without changing entry point.
 - **`reshape_and_cache`** (vLLM x-vectorized variant in
   `csrc/cache_kernels.cu`). This kernel targets the legacy x-vectorized cache
-  layout `[N, H, D/x, B, x]` which is a different layout family from Tencent's
+  layout `[N, H, D/x, B, x]` which is a different layout family from the
   cross-layer 5D scheme; it is not the right kernel for HY3. The
   `reshape_and_cache_flash` writer (which targets `[N, B, H, D]`) **is**
   addressed in Part B below.
-- **Reference Python test from Tencent**: NOTE#2 in the original ticket says
-  Tencent will provide one. The synthetic tests in §4.6 and §B.5 are
+- **Reference Python test from the customer**: NOTE#2 in the original ticket
+  says the customer will provide one. The synthetic tests in §4.6 and §B.5 are
   sufficient for kernel-level correctness, but the integration test against
-  Tencent's actual KV-cache management should be run once the script is
+  the customer's actual KV-cache management should be run once the script is
   available.
 
 ## 8. Risks and open items
@@ -361,7 +362,7 @@ out in either order.
   strides, so GQA where `nhead_k < nhead_q` works unchanged.
 - **Layout disambiguation.** `VECTORIZED_LAYOUT` (5D swizzled) and the new
   `LINEAR_HEADS_FIRST_LAYOUT` (4D heads-first) both originate from "5D" in
-  Tencent's terminology but mean different things. The wrapper dispatches by
+  the cross-layer adaptation doc's terminology but mean different things. The wrapper dispatches by
   `kv_memory_layout` enum, not by tensor rank, to avoid confusion; the public
   Python helper hides this by accepting the 5D `kv_cache=` view and inferring
   the right enum value internally.
@@ -402,7 +403,7 @@ AITER ships two related writer kernels for KV cache, both mirroring vLLM:
 | `reshape_and_cache` ([aiter/csrc/kernels/cache_kernels.cu](../csrc/kernels/cache_kernels.cu#L175)) | `[N, H, D/x, B, x]` (vLLM x-vectorized) | Legacy vLLM paged-attention pipelines |
 | `reshape_and_cache_flash` (same file, L#251) | `[N, B, H, D]` (FlashAttention-style) | vLLM Flash-attn / FlashInfer paths and the prefill kernel covered in Part A |
 
-Tencent's Cross-Layer 5D cache is a **non-x-vectorized** linear cache, so
+The Cross-Layer 5D cache is a **non-x-vectorized** linear cache, so
 `reshape_and_cache` (x-vectorized) is not the right writer kernel at all — it
 would have to be rewritten end-to-end. `reshape_and_cache_flash` on the other
 hand uses the same `[N, ?, ?, D]` family as the prefill kernel and is one
@@ -533,7 +534,7 @@ the new pybind signature. Same `rm` recipe, substitute `module_cache` for
 ## B.6 What is still NOT covered
 
 - The vLLM x-vectorized `reshape_and_cache` kernel (not _flash_) is unchanged.
-  Tencent's design doesn't use that layout family, so there's no benefit to
+  The cross-layer design doesn't use that layout family, so there's no benefit to
   generalizing it — but if a future Kunlun-XPU pathway insists on the
   x-vectorized cache combined with cross-layer addressing, that kernel would
   need an analogous rewrite.

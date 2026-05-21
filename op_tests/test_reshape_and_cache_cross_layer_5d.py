@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for Tencent Cross-Layer 5D KV Cache support in
+"""Tests for Cross-Layer 5D KV Cache support in
 ``aiter.reshape_and_cache_flash`` / ``aiter.reshape_and_cache_flash_func``.
 
 Verifies that the writer-side kernel correctly handles the non-contiguous
@@ -168,7 +168,7 @@ def test_reshape_and_cache_flash_cross_layer_5d_matches_packed(
     num_tokens,
     dtype,
 ):
-    """Functional test for Tencent Cross-Layer 5D KV cache writes.
+    """Functional test for Cross-Layer 5D KV cache writes.
 
     Runs `reshape_and_cache_flash` twice with identical input K/V tokens:
 

@@ -2116,7 +2116,7 @@ def _make_cross_layer_5d_view(
     device: str = "cuda",
     fill: torch.Tensor | None = None,
 ):
-    """Build a Tencent-style Cross-Layer 5D KV cache and return the per-layer
+    """Build a Cross-Layer 5D KV cache and return the per-layer
     non-contiguous 5D view ``(2, num_blocks, num_kv_heads, page_size, head_dim)``.
 
     Mirrors the construction in
@@ -2167,7 +2167,7 @@ def test_batch_prefill_cross_layer_5d_layout_strides(
     num_qo_heads,
     head_dim,
 ):
-    """Metadata-only test for Tencent Cross-Layer 5D KV cache.
+    """Metadata-only test for Cross-Layer 5D KV cache.
 
     Verifies that the per-layer 5D view produced by the framework-side construction
     has exactly the stride pattern documented in section 5.3 ("Stride in
@@ -2298,7 +2298,7 @@ def test_batch_prefill_cross_layer_5d_layout_matches_contiguous(
     causal,
     dtype,
 ):
-    """Functional test for Tencent Cross-Layer 5D KV cache prefill.
+    """Functional test for Cross-Layer 5D KV cache prefill.
 
     Builds a 6D physical KV buffer, fills the layer-of-interest slot with random
     data, then runs ``mha_batch_prefill_func`` two ways:
@@ -2407,6 +2407,153 @@ def test_batch_prefill_cross_layer_5d_layout_matches_contiguous(
 
     rtol, atol = get_tolerances(dtype, is_fp8=False)
     torch.testing.assert_close(out_xlayer_t, out_packed_t, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_batch_prefill_cross_layer_5d_matches_torch_reference(causal):
+    """End-to-end correctness test: cross-layer 5D prefill vs pure-torch reference.
+
+    Companion to ``test_batch_prefill_cross_layer_5d_layout_matches_contiguous``,
+    which only validates kernel-vs-kernel self-consistency between the packed
+    and cross-layer paths. This one feeds the cross-layer kernel output through
+    ``ref_masked_attention`` (einsum + softmax) so the actual attention math
+    is independently validated on the non-contiguous ``[N, H, B, D]`` view.
+
+    Single hard-coded scenario chosen to cover the gaps in the existing
+    cross-layer tests in one shot:
+
+      - ``num_layers = 80``  -- nominal cross-layer value; exercises the
+        pathological per-head / per-block stride magnitudes
+        (``L*2*B*D = 327_680`` elements).
+      - ``layer_idx = 2``    -- non-zero, catches a layer-select offset bug.
+      - ``batch_size = 2``   -- per-batch page counts ``[3, 2]`` exercise the
+        multi-page-per-sequence path that the existing tests skip.
+      - ``last_page_lens = [5, 11]`` -- partial last pages of different sizes,
+        which the existing tests likewise skip (they all use full last pages).
+      - ``GQA num_kv_heads=1 -> num_qo_heads=4``.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA/HIP device")
+
+    torch.manual_seed(0xCA5CADE)
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    num_layers = 80
+    layer_idx = 2
+    num_blocks = 8
+    page_size = 16
+    head_dim = 128
+    num_kv_heads = 1
+    num_qo_heads = 4
+    pages_per_seq = [3, 2]
+    last_page_lens = [5, 11]
+    qo_lens = [10, 7]
+    batch_size = len(pages_per_seq)
+
+    # Build the 6D physical buffer; only fill the layer of interest with random
+    # K/V. Other layers stay zeroed so a stride-leak bug into another layer
+    # would corrupt the attention output and trip the reference comparison.
+    physical = torch.zeros(
+        num_blocks, num_kv_heads, num_layers, 2, page_size, head_dim,
+        dtype=dtype, device=device,
+    )
+    layer_data = torch.randn(
+        2, num_blocks, num_kv_heads, page_size, head_dim,
+        dtype=dtype, device=device,
+    ) * 0.1
+    logical6d = physical.permute(2, 3, 0, 1, 4, 5)  # (L, 2, N, H, B, D)
+    logical6d[layer_idx].copy_(layer_data)
+    kv_cache_view = logical6d[layer_idx]  # (2, N, H, B, D), non-contiguous
+
+    # Sanity: assert the layout we fed the kernel matches the documented spec.
+    H, B, D, L = num_kv_heads, page_size, head_dim, num_layers
+    assert kv_cache_view.shape == (2, num_blocks, H, B, D)
+    assert kv_cache_view.stride() == (B * D, L * 2 * H * B * D, L * 2 * B * D, D, 1)
+    assert not kv_cache_view.is_contiguous()
+
+    total_q = sum(qo_lens)
+    cu_seqlens_q = torch.tensor(
+        [0] + list(itertools.accumulate(qo_lens)),
+        dtype=torch.int32, device=device,
+    )
+    kv_indptr = torch.tensor(
+        [0] + list(itertools.accumulate(pages_per_seq)),
+        dtype=torch.int32, device=device,
+    )
+    # Distinct pages per batch out of the available [0, num_blocks).
+    kv_page_indices_list: list[int] = []
+    cursor = 0
+    for npages in pages_per_seq:
+        kv_page_indices_list.extend(range(cursor, cursor + npages))
+        cursor += npages
+    assert cursor <= num_blocks
+    kv_page_indices = torch.tensor(
+        kv_page_indices_list, dtype=torch.int32, device=device
+    )
+    kv_last_page_lens = torch.tensor(
+        last_page_lens, dtype=torch.int32, device=device
+    )
+    seqlen_k_per_batch = [
+        (pages_per_seq[b] - 1) * page_size + last_page_lens[b]
+        for b in range(batch_size)
+    ]
+    max_seqlen_k = max(seqlen_k_per_batch)
+
+    q = torch.randn(
+        total_q, num_qo_heads, head_dim, dtype=dtype, device=device,
+    ) * 0.1
+
+    out = aiter.mha_batch_prefill_func(
+        q,
+        cu_seqlens_q=cu_seqlens_q,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        max_seqlen_q=max(qo_lens),
+        max_seqlen_k=max_seqlen_k,
+        causal=causal,
+        kv_cache=kv_cache_view,
+        kv_last_page_lens=kv_last_page_lens,
+    )
+    out_t = out[0] if isinstance(out, (list, tuple)) else out
+
+    # Per-batch torch reference: gather K/V tokens for this batch's pages out
+    # of the cross-layer view, repeat for GQA, hand to ref_masked_attention.
+    k_view = kv_cache_view[0]  # [N, H, B, D]
+    v_view = kv_cache_view[1]
+    cu_q_cpu = cu_seqlens_q.cpu().tolist()
+    iptr_cpu = kv_indptr.cpu().tolist()
+    pidx_cpu = kv_page_indices.cpu().tolist()
+    gqa_ratio = num_qo_heads // num_kv_heads
+    rtol, atol = get_tolerances(dtype, is_fp8=False)
+
+    for b in range(batch_size):
+        pages_b = pidx_cpu[iptr_cpu[b]:iptr_cpu[b + 1]]
+        last_len_b = last_page_lens[b]
+        k_segs, v_segs = [], []
+        for j, p in enumerate(pages_b):
+            tokens_in_page = page_size if j < len(pages_b) - 1 else last_len_b
+            # k_view[p] is [H, B, D]; transpose to [B, H, D] then truncate to
+            # the valid token range for the last page.
+            k_segs.append(
+                k_view[p, :, :tokens_in_page, :].permute(1, 0, 2).contiguous()
+            )
+            v_segs.append(
+                v_view[p, :, :tokens_in_page, :].permute(1, 0, 2).contiguous()
+            )
+        ki = torch.cat(k_segs, dim=0)  # [seqlen_k, H, D]
+        vi = torch.cat(v_segs, dim=0)
+        if gqa_ratio > 1:
+            ki = ki.repeat_interleave(gqa_ratio, dim=1)
+            vi = vi.repeat_interleave(gqa_ratio, dim=1)
+        qi = q[cu_q_cpu[b]:cu_q_cpu[b + 1]]
+        ref_b = ref_masked_attention(qi, ki, vi, causal=causal)
+        torch.testing.assert_close(
+            out_t[cu_q_cpu[b]:cu_q_cpu[b + 1]],
+            ref_b,
+            rtol=rtol,
+            atol=atol,
+        )
 
 
 parser = argparse.ArgumentParser(
@@ -2675,3 +2822,990 @@ if __name__ == "__main__":
     total = len(collected)
     print(f"\nTotal: {total}, Passed: {passed}, Skipped: {skipped}")
     print("=" * 100)
+
+
+# =============================================================================
+# StreamLLM Sink Token Tests
+# =============================================================================
+
+
+def ref_masked_attention_with_sink(
+    query,
+    key,
+    value,
+    window_left,
+    sink_size,
+    sink_ptr_value,
+):
+    """
+    Reference attention with StreamLLM sink semantics.
+
+    Args:
+        query:          [seqlen_q, num_heads, head_dim]
+        key:            [seqlen_k, num_heads, head_dim]
+        value:          [seqlen_k, num_heads, head_dim]
+        window_left:    left window size (-1 = infinite)
+        sink_size:      number of KV tokens at start always attended
+        sink_ptr_value: per-head float tensor [num_heads] or None.
+                        When not None, a virtual sink token with this scaled
+                        logit is appended to the attention matrix (it steals
+                        probability mass but has no V contribution).
+
+    Valid KV range for query at absolute position abs_q = seqlen_k - seqlen_q + i_q:
+        k < sink_size   (sink region, always valid)
+        OR
+        abs_q - window_left <= k <= abs_q   (window region, window_left=-1 means k >= 0)
+    """
+    head_dim = query.shape[2]
+    seqlen_q = query.shape[0]
+    seqlen_k = key.shape[0]
+    num_heads = query.shape[1]
+    scale = 1.0 / math.sqrt(head_dim)
+
+    # [num_heads, seqlen_q, seqlen_k]
+    attn = scale * torch.einsum("qhd,khd->hqk", query.float(), key.float())
+
+    # Build mask vectorized to avoid per-element GPU synchronization
+    # i_q: [seqlen_q, 1], i_k: [1, seqlen_k]
+    i_q = torch.arange(seqlen_q, device=query.device).unsqueeze(1)  # [sq, 1]
+    i_k = torch.arange(seqlen_k, device=query.device).unsqueeze(0)  # [1, sk]
+    abs_q = seqlen_k - seqlen_q + i_q  # [sq, 1]
+    k_end = abs_q  # causal boundary
+    if window_left < 0:
+        k_start_window = torch.zeros_like(abs_q)
+    else:
+        k_start_window = torch.clamp(abs_q - window_left, min=sink_size)
+    is_sink = i_k < sink_size  # [1, sk]
+    is_window = (i_k >= k_start_window) & (i_k <= k_end)  # [sq, sk]
+    valid = is_sink | is_window  # [sq, sk]
+    # attn: [H, sq, sk] -- broadcast mask over heads
+    attn.masked_fill_(~valid.unsqueeze(0), float("-inf"))
+
+    if sink_ptr_value is not None:
+        # Append virtual sink token column: logit = sink_ptr_value[h] (scaled space)
+        # Shape: [num_heads, seqlen_q, 1]
+        virt = sink_ptr_value.float().view(num_heads, 1, 1).expand(-1, seqlen_q, 1)
+        attn_ext = torch.cat([attn, virt], dim=-1)  # [H, sq, sk+1]
+        P_ext = torch.softmax(attn_ext, dim=-1)
+        P = P_ext[:, :, :seqlen_k]  # drop virtual column (V contribution = 0)
+    else:
+        P = torch.softmax(attn, dim=-1)
+
+    out = torch.einsum("hqk,khd->qhd", P, value.float())
+    return out.to(query.dtype)
+
+
+def run_batch_prefill_sink(
+    batch_size,
+    qo_len,
+    kv_len,
+    page_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    window_left,
+    sink_size,
+    sink_ptr_value,
+    dtype,
+    seed,
+):
+    """
+    Run batch_prefill with sink tokens and compare against torch reference.
+
+    sink_ptr_value: float or None. When float, a sink_ptr tensor of shape
+                    [num_qo_heads] filled with this value is passed to the kernel.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    k_vector_size = get_vector_size(dtype)
+
+    # kv_len must be large enough to create a real gap between sink and window
+    if skip_test_if(
+        kv_len <= sink_size + window_left + 1,
+        f"kv_len={kv_len} too small for gap (need >{sink_size + window_left + 1})",
+    ):
+        return {"status": "skipped"}
+
+    qo_lens = build_qo_lens(batch_size, qo_len, randomize=batch_size > 1)
+    kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=batch_size > 1)
+    max_qo_len = qo_lens.max().item()
+    max_kv_len = kv_lens.max().item()
+    q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+
+    total_q = q_indptr_cpu[-1]
+    q = build_q_tensor(total_q, num_qo_heads, head_dim, dtype, -5, 5)
+
+    kv_cache = build_paged_kv_cache(
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_lens,
+        -5,
+        5,
+        dtype,
+        contiguous_kv=True,
+    )
+    kv_data_fp32 = kv_cache["kv_data_fp32"]
+    kv_indices_cpu = kv_cache["kv_indices_cpu"]
+    kv_indptr_cpu_cache = kv_cache["kv_indptr_cpu"]
+    kv_last_page_len_cpu = kv_cache["kv_last_page_len_cpu"]
+
+    k_cache_ref, v_cache_ref = extract_kv_caches(kv_cache, contiguous_kv=True)
+    k_cache, v_cache = apply_kv_layout(
+        k_cache_ref,
+        v_cache_ref,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        k_vector_size,
+        "vectorized",
+    )
+
+    # Build sink_ptr tensor
+    sink_ptr = None
+    if sink_ptr_value is not None:
+        sink_ptr = torch.full(
+            (num_qo_heads,), sink_ptr_value, dtype=torch.float32, device="cuda"
+        )
+
+    # -- Torch reference ------------------------------------------------------
+    # kv_data_fp32: [total_pages, 2, page_size, num_kv_heads, head_dim]
+    #   dim 1: 0=K, 1=V
+    o_ref_list = []
+    for i in range(batch_size):
+        used_idx = kv_indices_cpu[kv_indptr_cpu_cache[i] : kv_indptr_cpu_cache[i + 1]]
+        last_len = kv_last_page_len_cpu[i].item()
+
+        # Full pages: [num_full_pages, page_size, num_kv_heads, head_dim]
+        # Last page: [:last_len, num_kv_heads, head_dim]
+        ki = torch.cat(
+            [
+                kv_data_fp32[used_idx[:-1], 0].reshape(-1, num_kv_heads, head_dim),
+                kv_data_fp32[used_idx[-1], 0, :last_len].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+            ],
+            dim=0,
+        ).to(dtype)
+        vi = torch.cat(
+            [
+                kv_data_fp32[used_idx[:-1], 1].reshape(-1, num_kv_heads, head_dim),
+                kv_data_fp32[used_idx[-1], 1, :last_len].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+            ],
+            dim=0,
+        ).to(dtype)
+
+        qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+
+        if num_qo_heads != num_kv_heads:
+            ratio = num_qo_heads // num_kv_heads
+            ki = ki.repeat_interleave(ratio, dim=1)
+            vi = vi.repeat_interleave(ratio, dim=1)
+
+        o_ref_list.append(
+            ref_masked_attention_with_sink(qi, ki, vi, window_left, sink_size, sink_ptr)
+        )
+    o_ref = torch.cat(o_ref_list, dim=0)
+
+    # -- CK kernel -------------------------------------------------------------
+    kv_indptr_gpu = kv_indptr_cpu_cache.to(0)
+    kv_indices_gpu = kv_indices_cpu.to(0)
+    kv_last_page_lens = kv_last_page_len_cpu.to(0)
+    cu_seqlens_q = q_indptr_cpu.to(0)
+
+    out = aiter.mha_batch_prefill_func(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        max_seqlen_q=max_qo_len,
+        max_seqlen_k=max_kv_len,
+        causal=True,
+        window_size=(window_left, -1),
+        sink_size=sink_size,
+        sink_ptr=sink_ptr,
+        kv_last_page_lens=kv_last_page_lens,
+        return_lse=False,
+    )
+
+    # -- Compare ---------------------------------------------------------------
+    rtol, atol = get_tolerances(dtype)
+    assert_output_matches_reference(out, q_indptr_cpu, o_ref, rtol, atol)
+    return {"status": "passed"}
+
+
+# ---------------------------------------------------------------------------
+# AICK-1171 reproducer: load_physical_pages OOB read on V prefetch lookahead
+#
+# Ported from 3rdparty/composable_kernel/test_rocm_mha_attn.py --case crash1_r8
+# (the bisect family that isolated the bug to total cache size, i.e. the page
+# table is read past the valid region).
+#
+# Crash shape from Hunyuan / MI-308X:
+#   prefill (q=2042, kv=2042), 10 q-heads, 1 kv-head, head_dim=128,
+#   page_size=16, bf16, causal=True
+#
+# Trigger conditions the standard `build_paged_kv_cache` masks:
+#   1. `kv_indices_cpu` here is built at EXACT length (no 128-element zero
+#      padding), so an OOB `page_idx[N]` read no longer falls into a benign
+#      pad region of value 0.
+#   2. The cache tensor has unused trailing pages (n_used < total_blocks)
+#      that we POISON with sentinel data -- if the kernel reads past the
+#      page table and into one of those pages, the output diverges from
+#      the reference and the assert fires.
+# ---------------------------------------------------------------------------
+def _build_aick1171_paged_kv_cache(
+    kv_len, page_size, num_kv_heads, head_dim, dtype, total_blocks, seed
+):
+    """Build a paged KV cache shaped exactly like the AICK-1171 reproducer.
+
+    Mirrors `build_paged_kv_cache`'s `make_scaled_rand` distribution (so the
+    tolerance picture matches the rest of the suite), but with two trigger
+    knobs that the standard helper masks:
+      - `kv_indices_cpu` is exactly `n_used` entries (no 128-element zero pad),
+        so an OOB `page_idx[N]` no longer falls into a benign 0-page.
+      - Cache slots `[n_used .. total_blocks-1]` are filled with a sentinel
+        value large enough to dominate softmax -- any OOB read of those pages
+        causes a numerically detectable mismatch.
+    """
+    n_used = (kv_len + page_size - 1) // page_size
+    assert total_blocks >= n_used
+
+    # Valid region: same distribution as build_paged_kv_cache (-5, 5).
+    valid_shape = [n_used, 2, page_size, num_kv_heads, head_dim]
+    valid = make_scaled_rand(-5, 5, *valid_shape, dtype=torch.float32).to(0)
+
+    kv_shape = [total_blocks, 2, page_size, num_kv_heads, head_dim]
+    kv_data_fp32 = torch.empty(*kv_shape, device="cuda", dtype=torch.float32)
+    kv_data_fp32[:n_used] = valid
+    kv_data_fp32[n_used:] = 50.0  # sentinel -- any read of these dominates softmax
+
+    kv_data = kv_data_fp32.to(dtype)
+
+    # Logical pages 0..n_used-1 map to a permutation of physical slots inside
+    # the valid region. kv_indices_cpu is exactly n_used long: the bug, if
+    # present, dereferences whatever lies past the tensor's buffer end.
+    page_perm = torch.randperm(
+        n_used, generator=torch.Generator().manual_seed(seed)
+    ).int()
+    kv_indices_cpu = page_perm.contiguous()
+
+    kv_indptr_cpu = torch.tensor([0, n_used], dtype=torch.int32)
+    kv_last_page_len_cpu = torch.tensor(
+        [(kv_len - 1) % page_size + 1], dtype=torch.int32
+    )
+    return {
+        "kv_data_fp32": kv_data_fp32,
+        "kv_data": kv_data,
+        "kv_indptr_cpu": kv_indptr_cpu,
+        "kv_indices_cpu": kv_indices_cpu,
+        "kv_last_page_len_cpu": kv_last_page_len_cpu,
+        "max_num_pages_per_seq": n_used,
+        "total_num_pages": total_blocks,
+    }
+
+
+@pytest.mark.parametrize(
+    "total_blocks",
+    # Mirrors crash1_r8_blocks_{160,164,168,176,208,256}: 128 used + padding.
+    # 160 was the smallest size that consistently faulted on MI-308X; 168
+    # was the bisect boundary; >=256 silently passed under the bug because
+    # OOB reads still landed in valid (zero) memory.
+    [160, 164, 168, 176, 208, 256],
+)
+def test_batch_prefill_aick1171_oob_page_table_read(total_blocks):
+    """AICK-1171: page-table OOB read in load_physical_pages V prefetch.
+
+    With the fix in place (clamp_token_idx / max_page_table_idx), output must
+    match the torch reference regardless of `total_blocks`. Without the fix,
+    runs with `total_blocks` ? {160..167} fault on gfx942/MI-308X, and the
+    larger sizes silently corrupt output by reading the sentinel pages.
+    """
+    torch.manual_seed(42)
+
+    # Exact crash1_r8 shape
+    qo_len = kv_len = 2042
+    num_qo_heads, num_kv_heads = 10, 1
+    head_dim = 128
+    page_size = 16
+    dtype = torch.bfloat16
+    causal = True
+
+    qo_lens = torch.tensor([qo_len], dtype=torch.int32)
+    q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+    total_q = q_indptr_cpu[-1].item()
+    q = build_q_tensor(total_q, num_qo_heads, head_dim, dtype, -10, 10)
+
+    kv_cache = _build_aick1171_paged_kv_cache(
+        kv_len=kv_len,
+        page_size=page_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        total_blocks=total_blocks,
+        seed=42,
+    )
+
+    q_indptr_gpu = q_indptr_cpu.to(0)
+    kv_indptr_gpu = kv_cache["kv_indptr_cpu"].to(0)
+    kv_indices_gpu = kv_cache["kv_indices_cpu"].to(0)
+    kv_last_page_len_gpu = kv_cache["kv_last_page_len_cpu"].to(0)
+
+    k_cache_ref, v_cache_ref = extract_kv_caches(kv_cache, contiguous_kv=True)
+    k_cache, v_cache = apply_kv_layout(
+        k_cache_ref,
+        v_cache_ref,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        get_vector_size(dtype),
+        "vectorized",
+    )
+
+    o_ref = build_reference_output(
+        q,
+        q_indptr_cpu,
+        kv_cache["kv_data_fp32"],
+        kv_cache["kv_indices_cpu"],
+        kv_cache["kv_indptr_cpu"],
+        kv_cache["kv_last_page_len_cpu"],
+        num_kv_heads,
+        head_dim,
+        dtype,
+        causal,
+        logits_soft_cap=0.0,
+    )
+
+    out = run_ck(
+        batch_size=1,
+        num_kv_heads=num_kv_heads,
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cu_seqlens_q=q_indptr_gpu,
+        kv_indptr=kv_indptr_gpu,
+        kv_page_indices=kv_indices_gpu,
+        max_seqlen_q=qo_len,
+        max_seqlen_k=kv_len,
+        causal=causal,
+        kv_last_page_lens=kv_last_page_len_gpu,
+    )
+
+    # Use the project-standard bf16 tolerance (matches main test_batch_prefill).
+    rtol, atol = get_tolerances(dtype)
+    assert_output_matches_reference(out, q_indptr_cpu, o_ref, rtol, atol)
+
+
+# ===========================================================================
+# HIP Virtual Memory Management (VMM) bindings -- used by the AICK-1171
+# guard-page test below.
+#
+# Allocates a GPU buffer that ends exactly at an unmapped virtual page boundary
+# so any read past the buffer end deterministically triggers a GPU memory access
+# fault. PyTorch's CUDACachingAllocator pads OOB reads with mapped pool memory
+# and silently masks the fault -- we need raw HIP VMM API to control the page
+# layout. This block is inlined (rather than a separate helper module) so the
+# test file is self-contained for committing.
+#
+# ROCm 7.x VMM API surface used:
+#   hipMemGetAllocationGranularity   - query min page size for VMM ops
+#   hipMemAddressReserve / Free      - reserve / release VA range
+#   hipMemCreate / Release           - allocate / release physical handle
+#   hipMemMap / Unmap                - bind physical to VA / unbind
+#   hipMemSetAccess                  - set RW permissions on mapped range
+# ===========================================================================
+
+_HIP_LIB = "libamdhip64.so"
+
+# Enum constants (mirror hip/hip_runtime_api.h)
+_HIP_MEM_LOCATION_TYPE_DEVICE = 1
+_HIP_MEM_ALLOCATION_TYPE_PINNED = 1
+_HIP_MEM_HANDLE_TYPE_NONE = 0
+_HIP_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
+_HIP_MEM_ALLOC_GRANULARITY_MINIMUM = 0
+_HIP_MEMCPY_HOST_TO_DEVICE = 1
+_HIP_MEMCPY_DEVICE_TO_HOST = 2
+
+
+# Structures (must mirror hip/hip_runtime_api.h byte layout exactly)
+class _HipMemLocation(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("id", ctypes.c_int),
+    ]
+
+
+class _HipMemAllocFlags(ctypes.Structure):
+    _fields_ = [
+        ("compressionType", ctypes.c_ubyte),
+        ("gpuDirectRDMACapable", ctypes.c_ubyte),
+        ("usage", ctypes.c_ushort),
+        ("reserved", ctypes.c_ubyte * 4),
+    ]
+
+
+class _HipMemAllocationProp(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("requestedHandleType", ctypes.c_int),
+        ("location", _HipMemLocation),
+        ("win32HandleMetaData", ctypes.c_void_p),
+        ("allocFlags", _HipMemAllocFlags),
+    ]
+
+
+class _HipMemAccessDesc(ctypes.Structure):
+    _fields_ = [
+        ("location", _HipMemLocation),
+        ("flags", ctypes.c_int),
+    ]
+
+
+# Catch silent ROCm header drift at import time. If a future ROCm release adds
+# a field to any of these structs without our binding being updated, ctypes
+# would silently write garbage into the new field's bytes. These assertions
+# fail loudly at module load instead. Sizes verified against ROCm 7.2.0.
+assert ctypes.sizeof(_HipMemLocation) == 8, (
+    f"_HipMemLocation size mismatch: {ctypes.sizeof(_HipMemLocation)} != 8 "
+    f"(ROCm header changed?)"
+)
+assert ctypes.sizeof(_HipMemAllocFlags) == 8, (
+    f"_HipMemAllocFlags size mismatch: {ctypes.sizeof(_HipMemAllocFlags)} != 8 "
+    f"(ROCm header changed?)"
+)
+assert ctypes.sizeof(_HipMemAllocationProp) == 32, (
+    f"_HipMemAllocationProp size mismatch: "
+    f"{ctypes.sizeof(_HipMemAllocationProp)} != 32 (ROCm header changed?)"
+)
+assert ctypes.sizeof(_HipMemAccessDesc) == 12, (
+    f"_HipMemAccessDesc size mismatch: {ctypes.sizeof(_HipMemAccessDesc)} != 12 "
+    f"(ROCm header changed?)"
+)
+
+
+# Library binding (lazy -- first call to make_guarded_int32_tensor populates).
+# Loading libamdhip64.so at module top would break test collection on non-ROCm
+# CI machines that import this file for unrelated tests.
+_hip = None
+
+
+def _hip_lib():
+    """Lazy CDLL loader + argtype/restype setup. Idempotent; subsequent calls
+    return the cached handle."""
+    global _hip
+    if _hip is not None:
+        return _hip
+    lib = ctypes.CDLL(_HIP_LIB)
+
+    lib.hipMemGetAllocationGranularity.argtypes = [
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(_HipMemAllocationProp),
+        ctypes.c_int,
+    ]
+    lib.hipMemGetAllocationGranularity.restype = ctypes.c_int
+
+    lib.hipMemAddressReserve.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_ulonglong,
+    ]
+    lib.hipMemAddressReserve.restype = ctypes.c_int
+
+    lib.hipMemAddressFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.hipMemAddressFree.restype = ctypes.c_int
+
+    lib.hipMemCreate.argtypes = [
+        ctypes.POINTER(ctypes.c_ulonglong),
+        ctypes.c_size_t,
+        ctypes.POINTER(_HipMemAllocationProp),
+        ctypes.c_ulonglong,
+    ]
+    lib.hipMemCreate.restype = ctypes.c_int
+
+    lib.hipMemRelease.argtypes = [ctypes.c_ulonglong]
+    lib.hipMemRelease.restype = ctypes.c_int
+
+    lib.hipMemMap.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_ulonglong,
+        ctypes.c_ulonglong,
+    ]
+    lib.hipMemMap.restype = ctypes.c_int
+
+    lib.hipMemUnmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.hipMemUnmap.restype = ctypes.c_int
+
+    lib.hipMemSetAccess.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(_HipMemAccessDesc),
+        ctypes.c_size_t,
+    ]
+    lib.hipMemSetAccess.restype = ctypes.c_int
+
+    lib.hipMemcpy.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    ]
+    lib.hipMemcpy.restype = ctypes.c_int
+
+    lib.hipGetErrorString.argtypes = [ctypes.c_int]
+    lib.hipGetErrorString.restype = ctypes.c_char_p
+
+    _hip = lib
+    return _hip
+
+
+def _hip_check(err: int, where: str):
+    if err != 0:
+        msg = _hip_lib().hipGetErrorString(err)
+        msg_str = msg.decode() if msg else f"unknown_err_{err}"
+        raise RuntimeError(f"HIP error in {where}: {err} ({msg_str})")
+
+
+def _build_alloc_prop(device: int) -> _HipMemAllocationProp:
+    prop = _HipMemAllocationProp()
+    prop.type = _HIP_MEM_ALLOCATION_TYPE_PINNED
+    prop.requestedHandleType = _HIP_MEM_HANDLE_TYPE_NONE
+    prop.location.type = _HIP_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = device
+    prop.win32HandleMetaData = None
+    return prop
+
+
+def _alloc_int32_with_guard_page(num_indices: int, device: int = 0):
+    """Allocate `num_indices * 4` bytes of int32 GPU memory with a guard page.
+
+    Memory layout:
+        [ mapped page (size=G) | UNMAPPED page (size=G) ]
+        |<-- (G - num*4) -->|<--- num*4 bytes --->|
+                             ^                    ^
+                          raw_ptr              raw_ptr + num*4 = page boundary
+
+    Any GPU access to addresses >= raw_ptr + num*4 hits the unmapped page and
+    causes hardware MEMORY_VIOLATION.
+
+    Returns: (raw_ptr, granularity, cleanup_handle)
+    """
+    if num_indices <= 0:
+        raise ValueError(f"num_indices must be positive, got {num_indices}")
+
+    hip = _hip_lib()
+    prop = _build_alloc_prop(device)
+    g = ctypes.c_size_t(0)
+    _hip_check(
+        hip.hipMemGetAllocationGranularity(
+            ctypes.byref(g),
+            ctypes.byref(prop),
+            _HIP_MEM_ALLOC_GRANULARITY_MINIMUM,
+        ),
+        "hipMemGetAllocationGranularity",
+    )
+    G = g.value
+
+    buf_size = num_indices * 4
+    if buf_size > G:
+        raise ValueError(
+            f"Buffer size {buf_size} exceeds VMM page granularity {G}; "
+            f"reduce num_indices to <= {G // 4}"
+        )
+
+    # 1. Reserve 2*G of contiguous VA. First half mapped, second half = guard.
+    va_ptr = ctypes.c_void_p(0)
+    _hip_check(
+        hip.hipMemAddressReserve(
+            ctypes.byref(va_ptr),
+            2 * G,
+            G,
+            ctypes.c_void_p(0),
+            ctypes.c_ulonglong(0),
+        ),
+        "hipMemAddressReserve",
+    )
+
+    # 2. Allocate physical handle of size G.
+    phys_handle = ctypes.c_ulonglong(0)
+    try:
+        _hip_check(
+            hip.hipMemCreate(
+                ctypes.byref(phys_handle),
+                G,
+                ctypes.byref(prop),
+                ctypes.c_ulonglong(0),
+            ),
+            "hipMemCreate",
+        )
+    except Exception:
+        hip.hipMemAddressFree(va_ptr, 2 * G)
+        raise
+
+    # 3. Map physical handle to first G of VA. Second G remains UNMAPPED.
+    try:
+        _hip_check(
+            hip.hipMemMap(va_ptr, G, 0, phys_handle, ctypes.c_ulonglong(0)),
+            "hipMemMap",
+        )
+    except Exception:
+        hip.hipMemRelease(phys_handle)
+        hip.hipMemAddressFree(va_ptr, 2 * G)
+        raise
+
+    # 4. Grant device RW access on the mapped page.
+    desc = _HipMemAccessDesc()
+    desc.location.type = _HIP_MEM_LOCATION_TYPE_DEVICE
+    desc.location.id = device
+    desc.flags = _HIP_MEM_ACCESS_FLAGS_PROT_READWRITE
+    try:
+        _hip_check(
+            hip.hipMemSetAccess(va_ptr, G, ctypes.byref(desc), 1),
+            "hipMemSetAccess",
+        )
+    except Exception:
+        hip.hipMemUnmap(va_ptr, G)
+        hip.hipMemRelease(phys_handle)
+        hip.hipMemAddressFree(va_ptr, 2 * G)
+        raise
+
+    # 5. Place buffer at the END of the mapped page so it touches the guard.
+    raw_ptr = va_ptr.value + (G - buf_size)
+    return raw_ptr, G, (va_ptr, phys_handle)
+
+
+def _free_guard_page(handle, granularity: int):
+    """Release VA + physical handle. Order matters: unmap, release, free VA."""
+    hip = _hip_lib()
+    va_ptr, phys_handle = handle
+    hip.hipMemUnmap(va_ptr, granularity)
+    hip.hipMemRelease(phys_handle)
+    hip.hipMemAddressFree(va_ptr, 2 * granularity)
+
+
+def make_guarded_int32_tensor(values, device: int = 0):
+    """Wrap a guarded int32 buffer as a torch.Tensor (zero-copy via CAI).
+
+    The tensor's data_ptr() points to memory with an unmapped page right
+    after the buffer end. Any GPU read past the buffer faults.
+
+    Used by test_batch_prefill_aick1171_hard_fault_via_guard_page below.
+    """
+    import numpy as np
+
+    if isinstance(values, torch.Tensor):
+        values_np = values.detach().cpu().to(torch.int32).contiguous().numpy()
+    else:
+        values_np = np.ascontiguousarray(np.asarray(values, dtype=np.int32))
+    n = values_np.size
+
+    raw_ptr, G, handle = _alloc_int32_with_guard_page(n, device=device)
+    _hip_check(
+        _hip_lib().hipMemcpy(
+            ctypes.c_void_p(raw_ptr),
+            ctypes.c_void_p(values_np.ctypes.data),
+            n * 4,
+            _HIP_MEMCPY_HOST_TO_DEVICE,
+        ),
+        "hipMemcpy H2D init",
+    )
+
+    cai_holder = type("_CAIHolder", (), {})()
+    cai_holder.__cuda_array_interface__ = {
+        "shape": (n,),
+        "typestr": "<i4",
+        "data": (raw_ptr, False),
+        "version": 3,
+        "strides": None,
+        "stream": torch.cuda.current_stream(device).cuda_stream,
+    }
+    tensor = torch.as_tensor(cai_holder, device=f"cuda:{device}")
+
+    # weakref.finalize survives interpreter-shutdown ordering (a naive __del__
+    # can fail because module globals like _hip get None'd before tensor.__del__
+    # runs, leaving VMM mappings leaked).
+    tensor._guard_finalizer = weakref.finalize(
+        tensor,
+        _free_guard_page,
+        handle,
+        G,
+    )
+    return tensor
+
+
+# ---------------------------------------------------------------------------
+# AICK-1171 hard-fault regression test (companion to the sentinel-padding test
+# above).
+#
+# Mechanism difference from test_batch_prefill_aick1171_oob_page_table_read:
+#   Sentinel test  : poisons KV cache with sentinel values; depends on the
+#                    OOB-read page index being CONSUMED by V load to detect
+#                    numerical corruption. Defends against future
+#                    "prefetch becomes consumed" regressions.
+#   Guard-page test: places kv_page_indices buffer against an unmapped HIP
+#                    VMM page. Any GPU read past the buffer end faults
+#                    deterministically (HSA MEMORY_VIOLATION), regardless of
+#                    whether the loaded value flows downstream. Catches the
+#                    actual AICK-1171 manifestation: GPU coredump from
+#                    speculative prefetch reading page_idx[128].
+#
+# Subprocess isolation is REQUIRED: GPU memory fault sends SIGABRT/SIGPIPE to
+# the entire process; no try/except in pytest can catch it.
+# ---------------------------------------------------------------------------
+def _aick1171_run_in_subprocess(child_code: str, timeout: int = 180):
+    """Run AICK-1171-shaped test body in a fresh Python subprocess.
+    HSA_DISABLE_COREDUMP_ON_EXCEPTION=1 prevents multi-GB GPU coredump files
+    when the host has the coredump tool installed (verified env var name on
+    ROCm 7.2.0 via `strings libhsa-runtime64.so | grep coredump`)."""
+    import subprocess as _sub
+    import sys as _sys
+
+    env = dict(os.environ)
+    env["HSA_DISABLE_COREDUMP_ON_EXCEPTION"] = "1"
+    return _sub.run(
+        [_sys.executable, "-c", child_code],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
+
+
+def _aick1171_fault_signature(rc: int, stderr: str) -> bool:
+    """Detect HSA GPU memory-fault death.
+
+    Empirically on ROCm 7.2.0 / MI300X the signal is SIGABRT (-6); on
+    ROCm 7.x with different coredump-tool config it can be SIGPIPE (-13).
+    Match on (process killed by ANY signal) AND (HSA fault keyword in
+    stderr) -- both conditions must hold to avoid false positives from
+    unrelated SIGPIPE / SIGABRT.
+    """
+    killed_by_signal = (rc < 0) or (128 <= rc < 256)
+    if not killed_by_signal:
+        return False
+    msg = stderr.lower()
+    return "memory access fault" in msg or "hsa_status_error_memory_fault" in msg
+
+
+# The OOB read at page_idx[128] overruns the kv_page_indices buffer (not
+# kv_data), so the fault trigger is independent of total_blocks. We still
+# parametrize two values [160, 192] as a defensive coverage hedge: if a
+# future kernel variant unexpectedly ties OOB-read consumption to a tile
+# shape that depends on total_blocks, the second config catches it.
+@pytest.mark.parametrize("total_blocks", [160, 192])
+def test_batch_prefill_aick1171_hard_fault_via_guard_page(total_blocks):
+    """AICK-1171: V prefetch reads page_idx[128] past valid range, GPU faults.
+
+    Pre-fix:  child subprocess dies via signal (SIGABRT/SIGPIPE), stderr
+              contains 'Memory access fault by GPU node-N on address 0x...'.
+    Post-fix: clamp_token_idx / max_page_table_idx prevents the OOB load,
+              kernel completes, output matches reference, child exits 0.
+
+    Detection requires subprocess isolation (see module-level comment).
+    """
+    import textwrap as _textwrap
+
+    aiter_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    child_code = _textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {aiter_root!r})
+        import torch
+        from op_tests.test_batch_prefill import (
+            _build_aick1171_paged_kv_cache,
+            build_q_tensor, convert_lens_to_indptr,
+            extract_kv_caches, apply_kv_layout, get_vector_size,
+            build_reference_output, run_ck,
+            get_tolerances, assert_output_matches_reference,
+        )
+        from op_tests.test_batch_prefill import make_guarded_int32_tensor
+
+        torch.manual_seed(42)
+
+        # Exact crash1_r8 shape from the AICK-1171 reproducer
+        qo_len = kv_len = 2042
+        num_qo_heads, num_kv_heads = 10, 1
+        head_dim = 128
+        page_size = 16
+        dtype = torch.bfloat16
+        causal = True
+        total_blocks = {total_blocks}
+
+        qo_lens = torch.tensor([qo_len], dtype=torch.int32)
+        q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+        total_q = q_indptr_cpu[-1].item()
+        q = build_q_tensor(total_q, num_qo_heads, head_dim, dtype, -10, 10)
+
+        kv_cache = _build_aick1171_paged_kv_cache(
+            kv_len=kv_len, page_size=page_size, num_kv_heads=num_kv_heads,
+            head_dim=head_dim, dtype=dtype,
+            total_blocks=total_blocks, seed=42,
+        )
+
+        # KEY DIFFERENCE vs sentinel test: kv_page_indices is allocated with a
+        # HIP VMM guard page right after the buffer. Any OOB read deterministically
+        # triggers MEMORY_VIOLATION instead of relying on allocator-pool garbage
+        # to leak into V loads.
+        kv_indices_gpu = make_guarded_int32_tensor(
+            kv_cache["kv_indices_cpu"], device=0,
+        )
+
+        q_indptr_gpu = q_indptr_cpu.to(0)
+        kv_indptr_gpu = kv_cache["kv_indptr_cpu"].to(0)
+        kv_last_page_len_gpu = kv_cache["kv_last_page_len_cpu"].to(0)
+
+        k_cache_ref, v_cache_ref = extract_kv_caches(kv_cache, contiguous_kv=True)
+        k_cache, v_cache = apply_kv_layout(
+            k_cache_ref, v_cache_ref,
+            num_kv_heads, head_dim, page_size,
+            get_vector_size(dtype), 'vectorized',
+        )
+
+        o_ref = build_reference_output(
+            q, q_indptr_cpu, kv_cache['kv_data_fp32'],
+            kv_cache['kv_indices_cpu'], kv_cache['kv_indptr_cpu'],
+            kv_cache['kv_last_page_len_cpu'],
+            num_kv_heads, head_dim, dtype, causal,
+            logits_soft_cap=0.0,
+        )
+
+        out = run_ck(
+            batch_size=1,
+            num_kv_heads=num_kv_heads,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cu_seqlens_q=q_indptr_gpu,
+            kv_indptr=kv_indptr_gpu,
+            kv_page_indices=kv_indices_gpu,
+            max_seqlen_q=qo_len,
+            max_seqlen_k=kv_len,
+            causal=causal,
+            kv_last_page_lens=kv_last_page_len_gpu,
+        )
+        torch.cuda.synchronize()  # surface async fault if any
+
+        # Post-fix path only -- verify numerical correctness
+        rtol, atol = get_tolerances(dtype)
+        assert_output_matches_reference(out, q_indptr_cpu, o_ref, rtol, atol)
+        print('AICK1171_GUARD_PAGE_OK', flush=True)
+    """)
+
+    result = _aick1171_run_in_subprocess(child_code)
+
+    if _aick1171_fault_signature(result.returncode, result.stderr):
+        pytest.fail(
+            "AICK-1171 hard fault detected -- V prefetch read past "
+            "kv_page_indices buffer end and hit guard page.\n"
+            f"  rc={result.returncode}\n"
+            f"  stderr (last 1KB):\n{result.stderr[-1024:]}\n"
+            "Fix in load_physical_pages (clamp page_id to max_page_table_idx) "
+            "is missing or has regressed."
+        )
+
+    if result.returncode != 0:
+        pytest.fail(
+            f"Child subprocess failed with non-fault error (rc={result.returncode}):\n"
+            f"  stdout: {result.stdout[-500:]}\n"
+            f"  stderr: {result.stderr[-1024:]}"
+        )
+
+    assert "AICK1171_GUARD_PAGE_OK" in result.stdout, (
+        f"Subprocess didn't reach completion marker:\n"
+        f"  stdout: {result.stdout!r}\n  stderr: {result.stderr!r}"
+    )
+
+
+@pytest.mark.parametrize("seed", [42])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "sink_ptr_value",
+    [None, 0.0, 2.0],
+    ids=["ptr=None", "ptr=0.0", "ptr=2.0"],
+)
+@pytest.mark.parametrize("sink_size", [4, 16])
+@pytest.mark.parametrize(
+    "window_left,kv_len",
+    [(128, 512), (1024, 2048)],
+    ids=["win=128/kv=512", "win=1024/kv=2048"],
+)
+@pytest.mark.parametrize("qo_len", [32, 128])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 1), (4, 4)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("page_size", [16])
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_batch_prefill_sink(
+    batch_size,
+    page_size,
+    head_dim,
+    num_qo_heads,
+    num_kv_heads,
+    qo_len,
+    window_left,
+    kv_len,
+    sink_size,
+    sink_ptr_value,
+    dtype,
+    seed,
+):
+    """
+    Test batch_prefill with StreamLLM sink token support.
+
+    Validates:
+    - sink_size: first sink_size KV positions always attended (never window-masked)
+    - sink_ptr: virtual sink token with fixed logit participates in softmax
+    - window_left + sink_size creates a real gap; gap tokens are correctly masked
+    """
+    run_batch_prefill_sink(
+        batch_size=batch_size,
+        qo_len=qo_len,
+        kv_len=kv_len,
+        page_size=page_size,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        window_left=window_left,
+        sink_size=sink_size,
+        sink_ptr_value=sink_ptr_value,
+        dtype=dtype,
+        seed=seed,
+    )
+
+
+# CI runs `python3 test_batch_prefill.py` (no pytest), so the __main__ block
+# above only executes the non-sink scenarios. Add a small representative sweep
+# of the StreamLLM sink scenarios here so they actually exercise in CI.
+if __name__ == "__main__":
+    sink_cases = list(
+        itertools.product(
+            [(128, 512), (1024, 2048)],  # (window_left, kv_len)
+            [4],  # sink_size
+            [None, 2.0],  # sink_ptr_value
+            [torch.bfloat16],  # dtype
+        )
+    )
+    for (window_left, kv_len), sink_size, sink_ptr_value, dtype in sink_cases:
+        run_batch_prefill_sink(
+            batch_size=1,
+            qo_len=128,
+            kv_len=kv_len,
+            page_size=16,
+            num_qo_heads=8,
+            num_kv_heads=1,
+            head_dim=128,
+            window_left=window_left,
+            sink_size=sink_size,
+            sink_ptr_value=sink_ptr_value,
+            dtype=dtype,
+            seed=42,
+        )
