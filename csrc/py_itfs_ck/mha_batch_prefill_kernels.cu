@@ -139,6 +139,70 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
         TORCH_CHECK(v_stride_batch % k_vector_size == 0,
                     "V batch stride must be a multiple of vector size");
     }
+    else if(kv_memory_layout ==
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT)
+    {
+        // Tencent Cross-Layer 5D KV cache, per-layer non-contiguous view.
+        // K/V layout: [NumBlocks, NumHeads, PageSize, HeadDim]
+        //   stride(0) -> NumBlocks (block) stride           (== batch_stride_k)
+        //   stride(1) -> NumHeads stride                    (== nhead_stride_k)
+        //   stride(2) -> PageSize stride (token-in-page)    (== stride_k)
+        //   stride(3) -> HeadDim stride (must be 1)
+        //
+        // Unlike the packed LINEAR_LAYOUT, the per-head and per-block strides here
+        // encode the cross-layer factor (typically `2 * num_layers`) and are much
+        // larger than a packed layout would imply, so the
+        // "page_stride >= num_heads * head_stride" packed-layout invariants do not
+        // hold. We only enforce contiguity of the innermost dim and 16B alignment
+        // for the multi-stride dims so vectorized loads remain valid.
+        TORCH_CHECK(k.dim() == 4,
+                    "Cross-layer linear-heads-first K must be 4D [NumBlocks, NumHeads, "
+                    "PageSize, HeadDim]");
+        TORCH_CHECK(v.dim() == 4,
+                    "Cross-layer linear-heads-first V must be 4D [NumBlocks, NumHeads, "
+                    "PageSize, HeadDim]");
+
+        stride_k = k.stride(2);
+        stride_v = v.stride(2);
+
+        const int64_t k_stride_batch = k.stride(0);
+        const int64_t k_stride_head  = k.stride(1);
+        const int64_t k_stride_page  = k.stride(2);
+        const int64_t k_stride_dim   = k.stride(3);
+
+        TORCH_CHECK(k_stride_dim == 1,
+                    "K last dim must be contiguous in LINEAR_HEADS_FIRST_LAYOUT");
+        TORCH_CHECK(k_stride_page == static_cast<int64_t>(d),
+                    "K page (PageSize) stride must equal head_size in "
+                    "LINEAR_HEADS_FIRST_LAYOUT");
+        TORCH_CHECK(k_stride_head % k_vector_size == 0,
+                    "K head stride (nhead_stride_k) must be a multiple of ",
+                    k_vector_size,
+                    " in LINEAR_HEADS_FIRST_LAYOUT; required for 16B vectorized loads");
+        TORCH_CHECK(k_stride_batch % k_vector_size == 0,
+                    "K batch stride (batch_stride_k) must be a multiple of ",
+                    k_vector_size,
+                    " in LINEAR_HEADS_FIRST_LAYOUT; required for 16B vectorized loads");
+
+        const int64_t v_stride_batch = v.stride(0);
+        const int64_t v_stride_head  = v.stride(1);
+        const int64_t v_stride_page  = v.stride(2);
+        const int64_t v_stride_dim   = v.stride(3);
+
+        TORCH_CHECK(v_stride_dim == 1,
+                    "V last dim must be contiguous in LINEAR_HEADS_FIRST_LAYOUT");
+        TORCH_CHECK(v_stride_page == static_cast<int64_t>(d_v),
+                    "V page (PageSize) stride must equal head_size in "
+                    "LINEAR_HEADS_FIRST_LAYOUT");
+        TORCH_CHECK(v_stride_head % k_vector_size == 0,
+                    "V head stride (nhead_stride_v) must be a multiple of ",
+                    k_vector_size,
+                    " in LINEAR_HEADS_FIRST_LAYOUT; required for 16B vectorized loads");
+        TORCH_CHECK(v_stride_batch % k_vector_size == 0,
+                    "V batch stride (batch_stride_v) must be a multiple of ",
+                    k_vector_size,
+                    " in LINEAR_HEADS_FIRST_LAYOUT; required for 16B vectorized loads");
+    }
     else
     {
         if(k.dim() == 4)
@@ -238,10 +302,22 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     ck_tile::index_t nhead_stride_q       = q.stride(-2);
     const bool is_vectorized_layout =
         kv_memory_layout == ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT;
-    // Vectorized: head dim at index 1. Linear: head dim at index 2.
+    const bool is_heads_first_layout =
+        kv_memory_layout ==
+        ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT;
+    // Head-dim position in the K/V tensor depending on layout:
+    //   VECTORIZED_LAYOUT       5D [N, H, ...]                -> head at index 1
+    //   LINEAR_LAYOUT (4D)      [N, B, H, D]                  -> head at index 2
+    //   LINEAR_LAYOUT (3D)      [N, H, D] (page_size=1)       -> head at index 1
+    //   LINEAR_HEADS_FIRST      [N, H, B, D] (cross-layer)    -> head at index 1
     ck_tile::index_t nhead_stride_k;
     ck_tile::index_t nhead_stride_v;
     if(is_vectorized_layout)
+    {
+        nhead_stride_k = k.stride(1);
+        nhead_stride_v = v.stride(1);
+    }
+    else if(is_heads_first_layout)
     {
         nhead_stride_k = k.stride(1);
         nhead_stride_v = v.stride(1);
@@ -434,7 +510,8 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                   std::optional<const at::Tensor> block_table_,
                   std::optional<const at::Tensor> seqlen_k_,
                   std::optional<const at::Tensor> sink_ptr,      // [hq]
-                  std::optional<at::Generator> gen_
+                  std::optional<at::Generator> gen_,
+                  int kv_layout
                 )
 {
     auto q_dtype = q.scalar_type();
@@ -514,16 +591,58 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     const int batch_size  = cu_seqlens_q.numel() - 1;
     int num_heads         = sizes[1];
     const int head_size_q = sizes[2];
-    
+
+    // kv_layout (caller hint):
+    //   -1 = auto-detect from k.dim() (preserves legacy behavior)
+    //    0 = VECTORIZED_LAYOUT (5D swizzled)
+    //    1 = LINEAR_LAYOUT (4D [N, B, H, D] or 3D [N, H, D])
+    //    2 = LINEAR_HEADS_FIRST_LAYOUT (4D [N, H, B, D], Tencent cross-layer 5D view)
     ck_tile::BlockAttentionKVCacheMemoryLayoutEnum kv_memory_layout;
     int num_heads_k     = 0;
     int page_block_size = 0;
     int head_size_v     = 0;
     int num_blocks      = 0;
 
-    if(k.dim() == 5)
+    auto detect_linear_heads_first = (kv_layout == 2);
+    auto detect_linear             = (kv_layout == 1);
+    auto detect_vectorized         = (kv_layout == 0);
+    auto detect_auto               = (kv_layout < 0);
+
+    TORCH_CHECK(detect_auto || detect_vectorized || detect_linear || detect_linear_heads_first,
+                "kv_layout must be -1 (auto), 0 (vectorized), 1 (linear), or 2 "
+                "(linear_heads_first), got ",
+                kv_layout);
+
+    // LINEAR_HEADS_FIRST_LAYOUT is intentionally NOT auto-detectable: its 4D shape
+    // collides with LINEAR_LAYOUT's 4D shape (only the dim ordering differs --
+    // [N, H, B, D] vs [N, B, H, D]) and only the framework knows which permutation
+    // it constructed. The caller must opt in via kv_layout=2.
+    if(detect_linear_heads_first)
+    {
+        kv_memory_layout =
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT;
+        TORCH_CHECK(k.dim() == 4,
+                    "LINEAR_HEADS_FIRST_LAYOUT requires 4D K [NumBlocks, NumHeads, "
+                    "PageSize, HeadDim], got dim ",
+                    k.dim());
+        TORCH_CHECK(v.dim() == 4,
+                    "LINEAR_HEADS_FIRST_LAYOUT requires 4D V [NumBlocks, NumHeads, "
+                    "PageSize, HeadDim], got dim ",
+                    v.dim());
+
+        // K/V: [NumBlocks, NumHeads, PageSize, HeadDim]
+        num_blocks      = k.size(0);
+        num_heads_k     = k.size(1);
+        page_block_size = k.size(2);
+        head_size_v     = v.size(3);
+    }
+    else if(detect_vectorized || (detect_auto && k.dim() == 5))
     {
         kv_memory_layout = ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT;
+        TORCH_CHECK(k.dim() == 5,
+                    "VECTORIZED_LAYOUT requires 5D K [NumBlocks, NumHeads, "
+                    "HeadDim/kVectorSize, PageSize, kVectorSize], got dim ",
+                    k.dim());
         TORCH_CHECK(
             v.dim() == 5,
             "V tensor must be 5D [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize]");
@@ -539,9 +658,13 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
         head_size_v = v.size(3);
         num_blocks  = k.size(0);
     }
-    else if(k.dim() == 4)
+    else if(detect_linear || (detect_auto && k.dim() == 4))
     {
         kv_memory_layout = ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT;
+        TORCH_CHECK(k.dim() == 4,
+                    "LINEAR_LAYOUT (4D) requires 4D K [NumBlocks, PageSize, NumHeads, "
+                    "HeadDim], got dim ",
+                    k.dim());
         TORCH_CHECK(v.dim() == 4,
                     "V tensor must be 4D [NumBlocks, PageSize, NumHeads, HeadDim]");
 
@@ -551,7 +674,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
         head_size_v     = v.size(3);
         num_blocks      = k.size(0);
     }
-    else if(k.dim() == 3)
+    else if(detect_auto && k.dim() == 3)
     {
         kv_memory_layout = ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT;
         TORCH_CHECK(v.dim() == 3, "V tensor must be 3D [NumBlocks, NumHeads, HeadDim]");
@@ -566,7 +689,11 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     {
         TORCH_CHECK(false,
                     "K tensor must be 5D (vectorized), 4D (linear), or 3D (linear, page_size=1) "
-                    "for batch prefill");
+                    "for batch prefill (got dim ",
+                    k.dim(),
+                    " and kv_layout=",
+                    kv_layout,
+                    ")");
     }
 
 
@@ -647,6 +774,13 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                     page_block_size / k_vector_size,
                     head_size_v,
                     k_vector_size);
+    }
+    else if(kv_memory_layout ==
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT)
+    {
+        // K/V: [NumBlocks, NumHeads, PageSize, HeadDim] (cross-layer 5D view)
+        CHECK_SHAPE(k, num_blocks, num_heads_k, page_block_size, head_size_q);
+        CHECK_SHAPE(v, num_blocks, num_heads_k, page_block_size, head_size_v);
     }
     else
     {

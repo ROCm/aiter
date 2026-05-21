@@ -16,6 +16,20 @@ from ..jit.utils.mha_recipes import (
 from ..utility import dtypes
 
 
+# KV cache memory layout selectors for batch prefill. Must stay in sync with the
+# ck_tile::BlockAttentionKVCacheMemoryLayoutEnum values in
+# 3rdparty/composable_kernel/include/ck_tile/ops/fmha/block/block_attention_kvcache_layout_enum.hpp
+# The negative value triggers auto-detection from the K tensor's dim count.
+KV_LAYOUT_AUTO = -1
+KV_LAYOUT_VECTORIZED = 0
+KV_LAYOUT_LINEAR = 1
+# Tencent cross-layer 5D KV cache: per-layer non-contiguous view of a 6D physical
+# buffer (NumBlocks, NumHeads, NumLayers, 2, PageSize, HeadDim). K and V are
+# 4D [NumBlocks, NumHeads, PageSize, HeadDim] each (already sliced out of the
+# 5D (2, ...) view by the framework).
+KV_LAYOUT_LINEAR_HEADS_FIRST = 2
+
+
 def cmdGenFunc_mha_fwd(
     q: Tensor,
     k: Tensor,
@@ -983,6 +997,10 @@ def cmdGenFunc_mha_batch_prefill(
     kv_last_page_lens: Optional[Tensor] = None,
     block_table: Optional[Tensor] = None,
     seqlen_k: Optional[Tensor] = None,
+    # kv_layout (see KV_LAYOUT_* constants); LINEAR_HEADS_FIRST reuses the same
+    # generated LINEAR_LAYOUT kernel instances (the wrapper drives stride-based
+    # addressing), so the kernel name / blob_gen filter is unaffected.
+    kv_layout: int = -1,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -2778,16 +2796,21 @@ def mha_batch_prefill_fake_tensors(
     kv_last_page_lens: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
     seqlen_k: Optional[torch.Tensor] = None,
+    kv_layout: int = -1,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     is_vectorized = k.dim() == 5 and v.dim() == 5
+    is_linear_heads_first = kv_layout == KV_LAYOUT_LINEAR_HEADS_FIRST
     is_linear = (k.dim() == 4 and v.dim() == 4) or (k.dim() == 3 and v.dim() == 3)
-    if not (is_vectorized or is_linear):
+    if not (is_vectorized or is_linear or is_linear_heads_first):
         raise ValueError(
-            "Batch prefill requires 5D vectorized, 4D linear, or 3D linear (page_size=1) K/V"
-            " tensors"
+            "Batch prefill requires 5D vectorized, 4D linear, 4D linear-heads-first"
+            " (cross-layer), or 3D linear (page_size=1) K/V tensors"
         )
     num_heads = q.size(1)  # num_heads = q.sizes()[1]
+    # Vectorized: head_dim is the second-to-last (the trailing vec dim is the
+    # innermost). Linear (4D / 3D) and linear-heads-first 4D: head_dim is the
+    # innermost (last) dim. Hence v.size(-1) covers both non-vectorized cases.
     head_size_v = v.size(-2) if is_vectorized else v.size(-1)
     total_q = q.size(0)  # total_q = q.size(0)
 
@@ -2863,6 +2886,8 @@ def mha_batch_prefill(
     seqlen_k: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    # See KV_LAYOUT_* module-level constants. -1 = auto-detect from k.dim().
+    kv_layout: int = -1,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -2898,6 +2923,7 @@ def _mha_batch_prefill(
         torch.Tensor
     ] = None,  # [num_block, num_kv_head, 2] per-page K/V descales
     sink_ptr: Optional[Tensor] = None,
+    kv_layout: int = KV_LAYOUT_AUTO,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2932,19 +2958,20 @@ def _mha_batch_prefill(
         seqlen_k,
         sink_ptr,
         None,
+        kv_layout,
     )
     return out, softmax_lse, S_dmask, rng_state
 
 
 def mha_batch_prefill_func(
     q,
-    k,
-    v,
-    cu_seqlens_q,
-    kv_indptr,
-    kv_page_indices,
-    max_seqlen_q,
-    max_seqlen_k,
+    k=None,
+    v=None,
+    cu_seqlens_q=None,
+    kv_indptr=None,
+    kv_page_indices=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
     dropout_p=0.0,
     softmax_scale=None,
     logits_soft_cap=0.0,
@@ -2964,7 +2991,46 @@ def mha_batch_prefill_func(
     kv_block_descale=None,  # [num_block, num_kv_head, 2] per-page K/V descales
     sink_ptr=None,
     sink_size: int = 0,
+    # Tencent cross-layer 5D KV cache entry point: if supplied, this is a 5D
+    # per-layer view `[2, NumBlocks, NumKVHeads, PageSize, HeadDim]` (typically
+    # non-contiguous, sliced from a 6D physical buffer of shape
+    # `(NumBlocks, NumKVHeads, NumLayers, 2, PageSize, HeadDim)`). When provided,
+    # the wrapper auto-slices into K/V and forces `kv_layout=KV_LAYOUT_LINEAR_HEADS_FIRST`,
+    # and the explicit `k`/`v` arguments must be None.
+    kv_cache=None,
+    # See KV_LAYOUT_* module-level constants. KV_LAYOUT_AUTO (-1) preserves the
+    # legacy auto-detect behavior based on `k.dim()`.
+    kv_layout=KV_LAYOUT_AUTO,
 ):
+    if kv_cache is not None:
+        # Cross-layer 5D path: slice into K/V and force the heads-first layout.
+        if k is not None or v is not None:
+            raise ValueError(
+                "mha_batch_prefill_func: pass either kv_cache (5D [2, N, H, B, D]) "
+                "or separate k/v tensors, not both"
+            )
+        if kv_cache.dim() != 5:
+            raise ValueError(
+                "kv_cache must be 5D [2, NumBlocks, NumKVHeads, PageSize, HeadDim], "
+                f"got dim {kv_cache.dim()}"
+            )
+        if kv_cache.size(0) != 2:
+            raise ValueError(
+                "kv_cache outer dim must be 2 (K, V), got " f"{kv_cache.size(0)}"
+            )
+        if kv_layout == KV_LAYOUT_AUTO:
+            kv_layout = KV_LAYOUT_LINEAR_HEADS_FIRST
+        elif kv_layout != KV_LAYOUT_LINEAR_HEADS_FIRST:
+            raise ValueError(
+                "kv_cache implies kv_layout=KV_LAYOUT_LINEAR_HEADS_FIRST, got "
+                f"kv_layout={kv_layout}"
+            )
+        k = kv_cache[0]
+        v = kv_cache[1]
+    if k is None or v is None:
+        raise ValueError(
+            "mha_batch_prefill_func: must pass k/v or kv_cache (got k=None, v=None)"
+        )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if sink_ptr is not None:
@@ -2975,12 +3041,19 @@ def mha_batch_prefill_func(
     head_size_q_og = q.size(-1)
     # 16 bytes = 128-bit (dwordx4) vector width assumed by CK kernels.
     k_vector_size = 16 // k.element_size()
-    is_vectorized = k.dim() == 5 and v.dim() == 5
-    is_linear = (k.dim() == 4 and v.dim() == 4) or (k.dim() == 3 and v.dim() == 3)
-    if not (is_vectorized or is_linear):
+    is_heads_first = kv_layout == KV_LAYOUT_LINEAR_HEADS_FIRST
+    is_vectorized = (
+        kv_layout == KV_LAYOUT_VECTORIZED
+        or (kv_layout == KV_LAYOUT_AUTO and k.dim() == 5 and v.dim() == 5)
+    )
+    is_linear = not is_vectorized and not is_heads_first and (
+        (k.dim() == 4 and v.dim() == 4) or (k.dim() == 3 and v.dim() == 3)
+    )
+    if not (is_vectorized or is_linear or is_heads_first):
         raise ValueError(
-            "Batch prefill requires 5D vectorized, 4D linear, or 3D linear (page_size=1) K/V"
-            " tensors"
+            "Batch prefill requires 5D vectorized, 4D linear, 4D linear-heads-first"
+            f" (cross-layer), or 3D linear (page_size=1) K/V tensors (got k.dim()={k.dim()},"
+            f" v.dim()={v.dim()}, kv_layout={kv_layout})"
         )
     head_size_v_og = v.size(-2) if is_vectorized else v.size(-1)
     if head_size_q_og % k_vector_size != 0 or head_size_v_og % k_vector_size != 0:
@@ -2994,6 +3067,22 @@ def mha_batch_prefill_func(
             )
         if v.size(-1) != k_vector_size:
             raise ValueError("Vectorized KV requires last dim equal to vector size")
+    elif is_heads_first:
+        # K/V: [NumBlocks, NumKVHeads, PageSize, HeadDim]
+        if k.dim() != 4 or v.dim() != 4:
+            raise ValueError(
+                "LINEAR_HEADS_FIRST KV must be 4D [NumBlocks, NumKVHeads, PageSize, "
+                f"HeadDim]; got k.dim()={k.dim()}, v.dim()={v.dim()}"
+            )
+        if k.size(-1) != head_size_q_og:
+            raise ValueError(
+                "K linear-heads-first layout last dim does not match Q head size"
+            )
+        if k.size(0) != v.size(0) or k.size(1) != v.size(1) or k.size(2) != v.size(2):
+            raise ValueError(
+                "K/V linear-heads-first layout must match NumBlocks, NumKVHeads and"
+                " PageSize across K and V"
+            )
     else:
         if k.size(-1) != head_size_q_og:
             raise ValueError("K linear layout does not match Q head size")
@@ -3029,6 +3118,7 @@ def mha_batch_prefill_func(
         v_descale=v_descale,
         kv_block_descale=kv_block_descale,
         sink_ptr=sink_ptr,
+        kv_layout=kv_layout,
     )
     out = out_padded[..., :head_size_v_og]
 

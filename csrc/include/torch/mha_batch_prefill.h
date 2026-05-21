@@ -38,7 +38,16 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                   std::optional<const at::Tensor> block_table,
                   std::optional<const at::Tensor> seqlen_k,
                   std::optional<const at::Tensor> sink_ptr_, // [hq];
-                  std::optional<at::Generator> gen_);
+                  std::optional<at::Generator> gen_,
+                  // kv_layout selects the K/V tensor interpretation:
+                  //   -1 : auto-detect from k.dim() (legacy default)
+                  //    0 : VECTORIZED_LAYOUT (5D swizzled)
+                  //    1 : LINEAR_LAYOUT (4D [N,B,H,D] or 3D [N,H,D])
+                  //    2 : LINEAR_HEADS_FIRST_LAYOUT (4D [N,H,B,D], Tencent cross-layer
+                  //        5D non-contiguous per-layer view of a 6D physical buffer
+                  //        (N, H, L, 2, B, D); the AITER wrapper drives stride-based
+                  //        addressing via the existing CK Tile LINEAR_LAYOUT kernel)
+                  int kv_layout = -1);
 
 } // namespace torch_itfs
 } // namespace aiter

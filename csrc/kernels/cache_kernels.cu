@@ -245,12 +245,19 @@ template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
 __global__ void reshape_and_cache_flash_kernel(
     const scalar_t* __restrict__ key,         // [num_tokens, num_heads, head_size]
     const scalar_t* __restrict__ value,       // [num_tokens, num_heads, head_size]
-    cache_t* __restrict__ key_cache,          // [num_blocks, block_size, num_heads,
-                                              // head_size]
-    cache_t* __restrict__ value_cache,        // [num_blocks, block_size, num_heads,
-                                              // head_size]
+    cache_t* __restrict__ key_cache,          // packed:        [num_blocks, block_size, num_heads, head_size]
+                                              // heads-first:   [num_blocks, num_heads, block_size, head_size]
+    cache_t* __restrict__ value_cache,        // same as key_cache (must share strides)
     const int64_t* __restrict__ slot_mapping, // [num_tokens]
     const int block_stride,
+    // Per-token-in-page (block_offset) stride into the K/V cache. For the
+    // existing packed [N, B, H, D] layout this equals num_heads * head_size;
+    // for the cross-layer [N, H, B, D] non-contiguous view it equals head_size.
+    const int cache_page_stride,
+    // Per-kv-head stride into the K/V cache. For the existing packed layout
+    // this equals head_size; for the cross-layer view it equals
+    // num_layers * 2 * block_size * head_size.
+    const int cache_head_stride,
     const int key_stride,
     const int value_stride,
     const int num_heads,
@@ -277,9 +284,15 @@ __global__ void reshape_and_cache_flash_kernel(
         const int64_t src_value_idx     = token_idx * value_stride + i;
         const int head_idx              = i / head_size;
         const int head_offset           = i % head_size;
-        const int64_t tgt_key_value_idx = block_idx * block_stride +
-                                          block_offset * num_heads * head_size +
-                                          head_idx * head_size + head_offset;
+        // Generic stride-based addressing: works for both the packed
+        // [N, B, H, D] layout (cache_page_stride = num_heads*head_size,
+        // cache_head_stride = head_size) and the Tencent cross-layer
+        // [N, H, B, D] non-contiguous view (cache_page_stride = head_size,
+        // cache_head_stride = num_layers*2*block_size*head_size).
+        const int64_t tgt_key_value_idx = static_cast<int64_t>(block_idx) * block_stride +
+                                          static_cast<int64_t>(block_offset) * cache_page_stride +
+                                          static_cast<int64_t>(head_idx) * cache_head_stride +
+                                          head_offset;
         scalar_t tgt_key   = key[src_key_idx];
         scalar_t tgt_value = value[src_value_idx];
         if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
@@ -2915,6 +2928,8 @@ void reshape_and_cache(
                                      reinterpret_cast<CACHE_T*>(value_cache.data_ptr()), \
                                      reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                   \
                                      block_stride,                                       \
+                                     cache_page_stride,                                  \
+                                     cache_head_stride,                                  \
                                      key_stride,                                         \
                                      value_stride,                                       \
                                      num_heads,                                          \
@@ -2925,25 +2940,122 @@ void reshape_and_cache(
 
 namespace aiter {
 
+// kv_layout values for reshape_and_cache_flash (mirrors the
+// ck_tile::BlockAttentionKVCacheMemoryLayoutEnum used by mha_batch_prefill):
+//   -1 / 1 : LINEAR_LAYOUT, packed K/V cache  [N, B, H, D] (legacy, default)
+//        2 : LINEAR_HEADS_FIRST_LAYOUT, Tencent cross-layer 5D non-contiguous view
+//            K, V each 4D [N, H, B, D] sliced out of a per-layer 5D view of the
+//            6D physical buffer (N, H, L, 2, B, D). Innermost head_dim must be
+//            contiguous; per-head and per-block strides typically embed the
+//            cross-layer factor (2 * num_layers).
 void reshape_and_cache_flash(
     aiter_tensor_t& key,          // [num_tokens, num_heads, head_size]
     aiter_tensor_t& value,        // [num_tokens, num_heads, head_size]
-    aiter_tensor_t& key_cache,    // [num_blocks, block_size, num_heads, head_size]
-    aiter_tensor_t& value_cache,  // [num_blocks, block_size, num_heads, head_size]
+    aiter_tensor_t& key_cache,    // packed:      [num_blocks, block_size, num_heads, head_size]
+                                  // heads-first: [num_blocks, num_heads, block_size, head_size]
+    aiter_tensor_t& value_cache,  // same layout as key_cache
     aiter_tensor_t& slot_mapping, // [num_tokens]
     const std::string& kv_cache_dtype,
     aiter_tensor_t& k_scale,
-    aiter_tensor_t& v_scale)
+    aiter_tensor_t& v_scale,
+    int kv_layout)
 {
     int num_tokens = key.size(0);
     int num_heads  = key.size(1);
     int head_size  = key.size(2);
-    int block_size = key_cache.size(1);
 
     int key_stride   = key.stride(0);
     int value_stride = value.stride(0);
+
+    int block_size;
     int block_stride = key_cache.stride(0);
-    AITER_CHECK(key_cache.stride(0) == value_cache.stride(0));
+    int cache_page_stride;
+    int cache_head_stride;
+
+    // kv_layout == 2 -> ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT
+    // (see 3rdparty/composable_kernel/include/ck_tile/ops/fmha/block/block_attention_kvcache_layout_enum.hpp).
+    // The integer literal is used here to keep this kernel file free of CK Tile
+    // includes; the enum is mirrored in aiter/ops/cache.py as
+    // KV_LAYOUT_LINEAR_HEADS_FIRST.
+    if(kv_layout == 2)
+    {
+        // LINEAR_HEADS_FIRST_LAYOUT: K/V cache shape is [N, H, B, D].
+        AITER_CHECK(key_cache.dim() == 4,
+                    "kv_layout=2 (LINEAR_HEADS_FIRST) requires 4D key_cache [N, H, B, D]; "
+                    "got dim ",
+                    key_cache.dim());
+        AITER_CHECK(value_cache.dim() == 4,
+                    "kv_layout=2 (LINEAR_HEADS_FIRST) requires 4D value_cache [N, H, B, D]; "
+                    "got dim ",
+                    value_cache.dim());
+        AITER_CHECK(key_cache.size(1) == num_heads,
+                    "key_cache.size(1) (num_heads) must match key.size(1)");
+        AITER_CHECK(value_cache.size(1) == num_heads,
+                    "value_cache.size(1) (num_heads) must match key.size(1)");
+        AITER_CHECK(key_cache.size(3) == head_size,
+                    "key_cache.size(3) (head_size) must match key.size(2)");
+        AITER_CHECK(value_cache.size(3) == head_size,
+                    "value_cache.size(3) (head_size) must match key.size(2)");
+
+        block_size        = key_cache.size(2);
+        cache_head_stride = key_cache.stride(1); // = num_layers * 2 * B * D in cross-layer
+        cache_page_stride = key_cache.stride(2); // = head_size
+
+        AITER_CHECK(key_cache.stride(3) == 1,
+                    "key_cache last dim (head_size) must be contiguous in "
+                    "LINEAR_HEADS_FIRST_LAYOUT");
+        AITER_CHECK(value_cache.stride(3) == 1,
+                    "value_cache last dim (head_size) must be contiguous in "
+                    "LINEAR_HEADS_FIRST_LAYOUT");
+        AITER_CHECK(cache_page_stride == head_size,
+                    "key_cache page (block_size) stride must equal head_size in "
+                    "LINEAR_HEADS_FIRST_LAYOUT (got ",
+                    cache_page_stride,
+                    " expected ",
+                    head_size,
+                    ")");
+        AITER_CHECK(value_cache.stride(2) == head_size,
+                    "value_cache page (block_size) stride must equal head_size in "
+                    "LINEAR_HEADS_FIRST_LAYOUT");
+
+        // 16-byte alignment guards for the strides that aren't constrained
+        // to a packed multiple anymore. CK and the existing AITER vector
+        // loaders assume 16B = 128-bit alignment along head_size.
+        const int elem_bytes  = static_cast<int>(key.element_size());
+        const int vector_size = 16 / elem_bytes;
+        AITER_CHECK(cache_head_stride % vector_size == 0,
+                    "key_cache nhead stride must be a multiple of ",
+                    vector_size,
+                    " elements (16B) in LINEAR_HEADS_FIRST_LAYOUT");
+        AITER_CHECK(value_cache.stride(1) % vector_size == 0,
+                    "value_cache nhead stride must be a multiple of ",
+                    vector_size,
+                    " elements (16B) in LINEAR_HEADS_FIRST_LAYOUT");
+        AITER_CHECK(block_stride % vector_size == 0,
+                    "key_cache block stride must be a multiple of ",
+                    vector_size,
+                    " elements (16B) in LINEAR_HEADS_FIRST_LAYOUT");
+        AITER_CHECK(value_cache.stride(0) % vector_size == 0,
+                    "value_cache block stride must be a multiple of ",
+                    vector_size,
+                    " elements (16B) in LINEAR_HEADS_FIRST_LAYOUT");
+
+        // K and V must share strides for the single-index kernel to work.
+        AITER_CHECK(key_cache.stride(0) == value_cache.stride(0),
+                    "K/V cache block strides must match");
+        AITER_CHECK(key_cache.stride(1) == value_cache.stride(1),
+                    "K/V cache nhead strides must match");
+        AITER_CHECK(key_cache.stride(2) == value_cache.stride(2),
+                    "K/V cache page strides must match");
+    }
+    else
+    {
+        // Legacy LINEAR_LAYOUT: packed [N, B, H, D] (the existing behavior).
+        block_size        = key_cache.size(1);
+        cache_page_stride = num_heads * head_size;
+        cache_head_stride = head_size;
+        AITER_CHECK(key_cache.stride(0) == value_cache.stride(0));
+    }
 
     dim3 grid(num_tokens);
     dim3 block(std::min(num_heads * head_size, 512));

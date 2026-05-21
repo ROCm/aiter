@@ -25,6 +25,13 @@ void reshape_and_cache(aiter_tensor_t& key,
                        std::optional<aiter_tensor_t> v_scale,
                        const bool asm_layout);
 
+// kv_layout selects the K/V cache tensor interpretation:
+//   -1 or 1 : LINEAR_LAYOUT, packed [N, B, H, D] (legacy default)
+//         2 : LINEAR_HEADS_FIRST_LAYOUT, Tencent cross-layer 5D non-contiguous
+//             per-layer view. K and V are 4D [N, H, B, D] each, sliced from a
+//             6D physical buffer (N, H, L, 2, B, D). Innermost head_dim must
+//             be contiguous; per-head and per-block strides typically embed
+//             the cross-layer factor (2 * num_layers).
 void reshape_and_cache_flash(aiter_tensor_t& key,
                              aiter_tensor_t& value,
                              aiter_tensor_t& key_cache,
@@ -32,7 +39,8 @@ void reshape_and_cache_flash(aiter_tensor_t& key,
                              aiter_tensor_t& slot_mapping,
                              const std::string& kv_cache_dtype,
                              aiter_tensor_t& k_scale,
-                             aiter_tensor_t& v_scale);
+                             aiter_tensor_t& v_scale,
+                             int kv_layout = -1);
 
 void reshape_and_cache_with_pertoken_quant(aiter_tensor_t& key,
                                            aiter_tensor_t& value,

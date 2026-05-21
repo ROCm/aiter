@@ -9,6 +9,21 @@ from ..jit.core import compile_ops
 MD_NAME = "module_cache"
 
 
+# KV cache memory layout selectors for reshape_and_cache_flash. Must stay in
+# sync with the ck_tile::BlockAttentionKVCacheMemoryLayoutEnum values in
+# 3rdparty/composable_kernel/include/ck_tile/ops/fmha/block/block_attention_kvcache_layout_enum.hpp
+# and with the mirror in aiter/ops/mha.py. Negative value triggers the
+# legacy / packed-layout fast path inside the C++ wrapper.
+KV_LAYOUT_AUTO = -1
+KV_LAYOUT_VECTORIZED = 0
+KV_LAYOUT_LINEAR = 1
+# Tencent cross-layer 5D KV cache: per-layer non-contiguous view of a 6D
+# physical buffer (NumBlocks, NumHeads, NumLayers, 2, PageSize, HeadDim).
+# key_cache and value_cache are each 4D [NumBlocks, NumHeads, PageSize, HeadDim],
+# sliced out of the 5D (2, ...) view by the framework.
+KV_LAYOUT_LINEAR_HEADS_FIRST = 2
+
+
 @compile_ops("module_cache", develop=True)
 def swap_blocks(src: Tensor, dst: Tensor, block_mapping: Tensor) -> None: ...
 
@@ -43,7 +58,97 @@ def reshape_and_cache_flash(
     kv_cache_dtype: str,
     k_scale: Tensor,
     v_scale: Tensor,
+    # See KV_LAYOUT_* constants. KV_LAYOUT_AUTO (-1) preserves the legacy
+    # packed [N, B, H, D] fast path. Set to KV_LAYOUT_LINEAR_HEADS_FIRST (2)
+    # for Tencent cross-layer 5D KV cache writes against a [N, H, B, D] view.
+    kv_layout: int = KV_LAYOUT_AUTO,
 ) -> None: ...
+
+
+def reshape_and_cache_flash_func(
+    key: Tensor,
+    value: Tensor,
+    key_cache: Optional[Tensor] = None,
+    value_cache: Optional[Tensor] = None,
+    slot_mapping: Optional[Tensor] = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: Optional[Tensor] = None,
+    v_scale: Optional[Tensor] = None,
+    # Tencent cross-layer 5D KV cache entry point: 5D per-layer view
+    # `[2, NumBlocks, NumKVHeads, PageSize, HeadDim]`, typically non-contiguous.
+    # When supplied, the wrapper auto-slices into key_cache/value_cache and
+    # forces kv_layout=KV_LAYOUT_LINEAR_HEADS_FIRST; explicit
+    # key_cache/value_cache must be None.
+    kv_cache: Optional[Tensor] = None,
+    kv_layout: int = KV_LAYOUT_AUTO,
+) -> None:
+    """High-level wrapper around `reshape_and_cache_flash` that mirrors the
+    ergonomics of `aiter.mha_batch_prefill_func`.
+
+    Two call patterns are supported:
+
+    1. Legacy packed K/V caches: pass `key_cache` and `value_cache` directly,
+       both 4D `[NumBlocks, PageSize, NumKVHeads, HeadDim]`.
+
+    2. Tencent cross-layer 5D KV cache: pass `kv_cache` instead, a 5D
+       per-layer view `[2, NumBlocks, NumKVHeads, PageSize, HeadDim]`
+       (typically non-contiguous, sliced from a 6D physical buffer of shape
+       `(NumBlocks, NumKVHeads, NumLayers, 2, PageSize, HeadDim)`). The
+       wrapper extracts `key_cache = kv_cache[0]` and
+       `value_cache = kv_cache[1]` and dispatches with
+       `kv_layout=KV_LAYOUT_LINEAR_HEADS_FIRST`.
+    """
+    if kv_cache is not None:
+        if key_cache is not None or value_cache is not None:
+            raise ValueError(
+                "reshape_and_cache_flash_func: pass either kv_cache "
+                "(5D [2, N, H, B, D]) or separate key_cache/value_cache, not both"
+            )
+        if kv_cache.dim() != 5:
+            raise ValueError(
+                "kv_cache must be 5D [2, NumBlocks, NumKVHeads, PageSize, HeadDim], "
+                f"got dim {kv_cache.dim()}"
+            )
+        if kv_cache.size(0) != 2:
+            raise ValueError(
+                "kv_cache outer dim must be 2 (K, V), got " f"{kv_cache.size(0)}"
+            )
+        if kv_layout == KV_LAYOUT_AUTO:
+            kv_layout = KV_LAYOUT_LINEAR_HEADS_FIRST
+        elif kv_layout != KV_LAYOUT_LINEAR_HEADS_FIRST:
+            raise ValueError(
+                "kv_cache implies kv_layout=KV_LAYOUT_LINEAR_HEADS_FIRST, got "
+                f"kv_layout={kv_layout}"
+            )
+        key_cache = kv_cache[0]
+        value_cache = kv_cache[1]
+
+    if key_cache is None or value_cache is None:
+        raise ValueError(
+            "reshape_and_cache_flash_func: must pass key_cache/value_cache or kv_cache"
+        )
+    if slot_mapping is None:
+        raise ValueError("reshape_and_cache_flash_func: slot_mapping is required")
+
+    # k_scale / v_scale are mandatory tensors in the underlying pybind binding
+    # even when the dtype is "auto"; provide a sensible default for that case
+    # so callers don't have to construct dummy tensors themselves.
+    if k_scale is None:
+        k_scale = torch.tensor([1.0], dtype=torch.float32, device=key.device)
+    if v_scale is None:
+        v_scale = torch.tensor([1.0], dtype=torch.float32, device=key.device)
+
+    reshape_and_cache_flash(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        kv_layout,
+    )
 
 
 @compile_ops("module_cache", develop=True)

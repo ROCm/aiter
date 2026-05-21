@@ -51,6 +51,21 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     bool has_dropout = args.p_drop > 0.f;
     bool has_sink    = args.sink_size > 0;
 
+    // LINEAR_HEADS_FIRST_LAYOUT (Tencent cross-layer 5D KV cache) shares the same
+    // address arithmetic as LINEAR_LAYOUT inside the kernel: the kernel computes
+    //     addr = base + head_idx * nhead_stride + page * batch_stride + tok * stride
+    // and never inspects the enum at runtime. The wrapper above already produced
+    // the correct (non-contiguous) strides for the heads-first 4D [N,H,B,D] view,
+    // so we just collapse the enum to LINEAR_LAYOUT at dispatch time to reuse the
+    // existing generated CK Tile kernel instances and avoid combinatorial codegen.
+    auto dispatch_kv_memory_layout = args.kv_memory_layout;
+    if(dispatch_kv_memory_layout ==
+       ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_HEADS_FIRST_LAYOUT)
+    {
+        dispatch_kv_memory_layout =
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::LINEAR_LAYOUT;
+    }
+
     // The kUseGlobalLoad decision (>2GB KV cache → use `global_load_lds_*`
     // instead of SRD `buffer_load_*`) is made per-arm inside the auto-generated
     // dispatcher in fmha_batch_prefill_api.cpp, where each arm knows its own
@@ -66,7 +81,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                                has_lse,
                                                has_dropout,
                                                qscale_type,
-                                               args.kv_memory_layout,
+                                               dispatch_kv_memory_layout,
                                                args.kv_lookup_table,
                                                args.page_block_size,
                                                /*skip_min_seqlen_q=*/false,

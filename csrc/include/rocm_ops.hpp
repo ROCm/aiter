@@ -304,7 +304,16 @@ namespace py = pybind11;
           py::arg("v_scale")    = std::nullopt,                                     \
           py::arg("asm_layout") = false);                                           \
     m.def("reshape_and_cache_flash",                                                \
-          &aiter::reshape_and_cache_flash);                                         \
+          &aiter::reshape_and_cache_flash,                                          \
+          py::arg("key"),                                                           \
+          py::arg("value"),                                                         \
+          py::arg("key_cache"),                                                     \
+          py::arg("value_cache"),                                                   \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("kv_cache_dtype"),                                                \
+          py::arg("k_scale"),                                                       \
+          py::arg("v_scale"),                                                       \
+          py::arg("kv_layout") = -1);                                               \
     m.def("reshape_and_cache_with_pertoken_quant",                                  \
           &aiter::reshape_and_cache_with_pertoken_quant,                            \
           py::arg("key"),                                                           \
@@ -1161,7 +1170,8 @@ namespace py = pybind11;
           py::arg("block_table")       = std::nullopt, \
           py::arg("seqlen_k")          = std::nullopt, \
           py::arg("sink_ptr")          = std::nullopt, \
-          py::arg("gen")               = std::nullopt);
+          py::arg("gen")               = std::nullopt, \
+          py::arg("kv_layout")         = -1);
 
 #define MOE_OP_PYBIND                                                          \
     m.def("topk_softmax",                                                      \
