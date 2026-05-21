@@ -491,6 +491,7 @@ def flydsl_gemm(
         b_to_lds=config["b_to_lds"],
         b_preshuffle=config.get("b_preshuffle", False),
         c_to_lds=config.get("c_to_lds", False),
+        stream=torch.cuda.current_stream(),
     )
 
     if bias is not None and fused_bias is None:
