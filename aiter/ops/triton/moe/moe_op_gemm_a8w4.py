@@ -104,6 +104,9 @@ def get_kernel_config_triton(m, n, k, routing_data):
             grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
 
+        if k >= 512:
+            block_k = 512
+
     elif block_m == 32:
         if n <= 1024:
             block_n = 128
