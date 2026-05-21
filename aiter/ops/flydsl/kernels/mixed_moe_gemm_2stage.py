@@ -429,7 +429,7 @@ def compile_mixed_moe_gemm1(
 
     if True:
 
-        @flyc.kernel
+        @flyc.kernel(name=module_name)
         def moe_gemm1(
             arg_out: fx.Tensor,
             arg_x: fx.Tensor,
@@ -3040,7 +3040,7 @@ def compile_mixed_moe_gemm2(
 
     if True:
 
-        @flyc.kernel
+        @flyc.kernel(name=module_name)
         def moe_gemm2(
             arg_out: fx.Tensor,
             arg_x: fx.Tensor,
