@@ -1,50 +1,42 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark Cross-Layer 5D KV cache prefill kernel performance.
+"""Benchmark: does the cross-layer 5D stride pattern slow down the prefill kernel?
 
-Compares ``aiter.mha_batch_prefill_func`` runtime on the same numerical K/V data
-fed through three layouts:
+This script answers exactly one question: when ``mha_batch_prefill_func`` is
+fed a non-contiguous ``[N, H, B, D]`` cross-layer view instead of a contiguous
+``[N, B, H, D]`` packed buffer, does the prefill kernel itself run faster,
+slower, or the same?
 
-  1. ``packed``         -- legacy LINEAR_LAYOUT (4D ``[N, B, H, D]``, contiguous).
-                           This is what aiter has historically shipped; per-layer
-                           buffers are allocated separately.
-  2. ``xlayer_view``    -- LINEAR_HEADS_FIRST_LAYOUT (4D ``[N, H, B, D]``,
-                           non-contiguous, sliced from a single 6D physical
-                           buffer ``[N, H, L, 2, B, D]``). This is the
-                           cross-layer mode the customer wants enabled.
-  3. ``xlayer_contig``  -- the "naive copy" anti-pattern: take the cross-layer
-                           non-contiguous view and call ``.contiguous()`` to
-                           produce a packed clone, then run packed kernel. This
-                           is what would happen if the operator did not support
-                           non-contiguous strides; reported here so the
-                           per-step copy cost the cross-layer scheme avoids is
-                           visible.
+It runs ``aiter.mha_batch_prefill_func`` on identical numerical K/V data
+through two layouts:
+
+  1. ``packed_contig``   -- legacy LINEAR_LAYOUT, contiguous ``[N, B, H, D]``.
+                            Per-layer buffer allocated standalone.
+  2. ``xlayer_strided``  -- LINEAR_HEADS_FIRST_LAYOUT, non-contiguous
+                            ``[N, H, B, D]`` sliced from a single 6D
+                            ``[N, H, L, 2, B, D]`` cross-layer physical buffer.
 
 For each shape we report:
 
-  * ``packed_us``        kernel time on the packed layout (median CUDA event).
-  * ``xlayer_us``        kernel time on the cross-layer non-contiguous view.
-  * ``xlayer/packed``    speedup (>1.0 means cross-layer is slower).
-  * ``contig_us``        cost of ``.contiguous()`` on the cross-layer view
-                         (this is what the cross-layer scheme avoids per layer
-                         per step).
-  * ``contig_e2e_us``    contig_us + packed_us, i.e. what cross-layer would
-                         cost end-to-end if the operator forced a contiguous
-                         copy (the explicitly-rejected "Plan A" in the
-                         adaptation doc).
-  * ``e2e_speedup``      contig_e2e_us / xlayer_us, i.e. how much the
-                         cross-layer non-contiguous path saves vs the naive
-                         copy approach for a single layer.
+  * ``packed_us``         kernel time on the contiguous packed layout
+                          (median CUDA event time, microseconds).
+  * ``xlayer_us``         kernel time on the non-contiguous cross-layer view
+                          (median CUDA event time, microseconds).
+  * ``xlayer/packed``     ratio of xlayer to packed kernel time. > 1.0 means
+                          the stride change costs us kernel performance.
+                          < 1.0 means the stride change is faster.
+                          ~1.0 means it makes no measurable difference.
 
-Note: kernel-only (``xlayer_us`` vs ``packed_us``) is the right comparison for
-"does the kernel get slower on the non-contiguous view?". End-to-end vs
-``contig_e2e_us`` is the comparison the customer's TTFT improvement claim
-hinges on — see ``docs/cross_layer_5d_kv_cache.md``.
+Before timing, packed and xlayer outputs are checked numerically equal so the
+two paths are doing the same work. Per-call overhead from the Python wrapper
+is included in both numbers (apples-to-apples), but no per-step memcpy or
+allocation of the packed buffer is included -- this is strictly the
+kernel-launch cost.
 
 Usage:
     PYTHONPATH=$PWD python op_tests/bench_cross_layer_5d.py
-    PYTHONPATH=$PWD python op_tests/bench_cross_layer_5d.py --preset hy3_16k
+    PYTHONPATH=$PWD python op_tests/bench_cross_layer_5d.py --preset hy3_16k_b1
     PYTHONPATH=$PWD python op_tests/bench_cross_layer_5d.py \\
         --batch_size 1 --prefill_len 8192 --num_layers 80 \\
         --num_kv_heads 1 --num_qo_heads 32 --head_dim 128
@@ -215,11 +207,12 @@ def build_inputs(shape: Shape, device: str = "cuda"):
 
 
 # ---------------------------------------------------------------------------
-# The three call paths under test
+# The two call paths under test
 # ---------------------------------------------------------------------------
 
 
-def call_packed(args):
+def call_packed_contig(args):
+    """Run prefill on the contiguous packed [N, B, H, D] K and V tensors."""
     return aiter.mha_batch_prefill_func(
         args["q"],
         args["kv_packed"][0],
@@ -234,7 +227,8 @@ def call_packed(args):
     )
 
 
-def call_xlayer_view(args):
+def call_xlayer_strided(args):
+    """Run prefill on the non-contiguous [N, H, B, D] cross-layer 5D view."""
     return aiter.mha_batch_prefill_func(
         args["q"],
         cu_seqlens_q=args["cu_seqlens_q"],
@@ -248,21 +242,6 @@ def call_xlayer_view(args):
     )
 
 
-def time_contiguous_copy(args):
-    """Time only the ``permute(0, 2, 1, 3).contiguous()`` step that turns the
-    non-contiguous cross-layer view into a packed copy. This is the per-layer
-    per-step cost the cross-layer scheme avoids."""
-    kv_xlayer = args["kv_xlayer"]
-
-    def fn():
-        # kv_xlayer is (2, N, H, B, D); to get packed [2, N, B, H, D] you'd
-        # permute and copy. Approximate that via per-half permute + contig.
-        _ = kv_xlayer[0].permute(0, 2, 1, 3).contiguous()
-        _ = kv_xlayer[1].permute(0, 2, 1, 3).contiguous()
-
-    return time_cuda(fn)
-
-
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -272,20 +251,19 @@ def bench_one(shape: Shape, *, warmup: int, iters: int, sanity: bool) -> dict:
     args = build_inputs(shape)
 
     if sanity:
-        out_pk = call_packed(args)
-        out_xl = call_xlayer_view(args)
+        out_pk = call_packed_contig(args)
+        out_xl = call_xlayer_strided(args)
         out_pk_t = out_pk[0] if isinstance(out_pk, (list, tuple)) else out_pk
         out_xl_t = out_xl[0] if isinstance(out_xl, (list, tuple)) else out_xl
         # bf16 tolerance per the existing cross-layer matches_contiguous test.
         torch.testing.assert_close(out_xl_t, out_pk_t, rtol=2e-2, atol=1e-2)
 
-    pk_med, pk_min, pk_mean = time_cuda(
-        lambda: call_packed(args), warmup=warmup, iters=iters,
+    pk_med, pk_min, _ = time_cuda(
+        lambda: call_packed_contig(args), warmup=warmup, iters=iters,
     )
-    xl_med, xl_min, xl_mean = time_cuda(
-        lambda: call_xlayer_view(args), warmup=warmup, iters=iters,
+    xl_med, xl_min, _ = time_cuda(
+        lambda: call_xlayer_strided(args), warmup=warmup, iters=iters,
     )
-    contig_med, contig_min, _ = time_contiguous_copy(args)
 
     return {
         "shape": shape.name,
@@ -298,10 +276,7 @@ def bench_one(shape: Shape, *, warmup: int, iters: int, sanity: bool) -> dict:
         "packed_min_us": pk_min * 1000.0,
         "xlayer_us": xl_med * 1000.0,
         "xlayer_min_us": xl_min * 1000.0,
-        "speedup_kernel": pk_med / xl_med if xl_med > 0 else float("nan"),
-        "contig_us": contig_med * 1000.0,
-        "contig_e2e_us": (contig_med + pk_med) * 1000.0,
-        "e2e_speedup": (contig_med + pk_med) / xl_med if xl_med > 0 else float("nan"),
+        "ratio_xlayer_over_packed": (xl_med / pk_med) if pk_med > 0 else float("nan"),
     }
 
 
@@ -311,17 +286,9 @@ def print_table(rows: List[dict]) -> None:
         "packed_us",
         "xlayer_us",
         "xlayer/packed",
-        "contig_us",
-        "contig_e2e_us",
-        "e2e_speedup",
     ]
-    widths = [16, 12, 12, 14, 12, 14, 12]
+    widths = [18, 12, 12, 14]
     sep = "  "
-
-    def fmt(v):
-        if isinstance(v, float):
-            return f"{v:.2f}"
-        return str(v)
 
     print(sep.join(h.ljust(w) for h, w in zip(headers, widths)))
     print(sep.join("-" * w for w in widths))
@@ -330,17 +297,18 @@ def print_table(rows: List[dict]) -> None:
             r["shape"],
             f"{r['packed_us']:.1f}",
             f"{r['xlayer_us']:.1f}",
-            f"{1.0 / r['speedup_kernel']:.3f}",  # show xlayer/packed (>1 means xlayer slower)
-            f"{r['contig_us']:.1f}",
-            f"{r['contig_e2e_us']:.1f}",
-            f"{r['e2e_speedup']:.2f}x",
+            f"{r['ratio_xlayer_over_packed']:.3f}",
         ]
         print(sep.join(c.ljust(w) for c, w in zip(cells, widths)))
 
     # Per-row params printed underneath in a smaller block, for readability.
     print()
     for r in rows:
-        print(f"  {r['shape']:<16}  {r['params']}")
+        print(f"  {r['shape']:<18}  {r['params']}")
+    print()
+    print("  xlayer/packed > 1.0 -> non-contiguous cross-layer strides cost kernel perf")
+    print("  xlayer/packed < 1.0 -> non-contiguous cross-layer strides help kernel perf")
+    print("  xlayer/packed ~ 1.0 -> stride change has no measurable effect on kernel")
 
 
 def parse_args() -> argparse.Namespace:
@@ -420,12 +388,10 @@ def main():
         # Streaming output: print each row as soon as it's measured (so a long
         # bench is observable while it's still running).
         print(
-            f"  {row['shape']:<16}  "
+            f"  {row['shape']:<18}  "
             f"packed={row['packed_us']:>9.1f}us  "
             f"xlayer={row['xlayer_us']:>9.1f}us  "
-            f"({1.0 / row['speedup_kernel']:>5.3f}x)  "
-            f"contig={row['contig_us']:>9.1f}us  "
-            f"e2e_speedup={row['e2e_speedup']:.2f}x"
+            f"  xlayer/packed={row['ratio_xlayer_over_packed']:>5.3f}"
         )
 
     if not rows:
