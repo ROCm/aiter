@@ -8,7 +8,7 @@ from itertools import product
 from abc import ABC, abstractmethod
 
 from flydsl._mlir.dialects import fly, llvm
-from flydsl.compiler.protocol import extract_to_ir_values as fly_values
+from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl._mlir import ir
 from flydsl.expr.typing import T
 
@@ -313,7 +313,9 @@ class GTensor(TensorBase):
     def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
         bytes_offset_i64 = arith.index_cast(T.i64, bytes_offset_i64)
         _ptr_type = ir.Type.parse(ptr_type)
-        base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, fly_values(ptr)[0])
+        base_ptr = fly.extract_aligned_pointer_as_index(
+            _ptr_type, extract_to_ir_values(ptr)[0]
+        )
         base_ptr = llvm.PtrToIntOp(T.i64, base_ptr).result
         llvm_ptr = llvm.AddOp(
             base_ptr, bytes_offset_i64, llvm.IntegerOverflowFlags(0)
