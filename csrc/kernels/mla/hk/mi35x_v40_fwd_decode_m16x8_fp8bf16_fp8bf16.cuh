@@ -12,112 +12,14 @@
 
 using namespace hk_mla;
 
-// TEMP DEBUG: enable LDS dump probe for V40 c>=2 bug localization.
-// #define HKMLA_V40_PROBE_KV_LDS 1
-// TEMP DEBUG: enable p_mfma dump probe (warp 0, all 64 lanes), after softmax+pack
-// but before PV GEMM. Each lane writes 4 dwords (= 8 bf16 = its p_mfma) to
-// out[0, 0, lid*8 .. lid*8+7] in the destination buffer. Use only with kIsFirstIter
-// path (single-tile c<=32) so the dump captures the FIRST and ONLY p_mfma.
-#define HKMLA_V40_PROBE_PMFMA 1
-// TEMP DEBUG: dump p_comp (8 fp32/lane, raw QK output AFTER full QK GEMM but
-// BEFORE softmax) for warp 0 all 64 lanes. Lane T writes 32 B at out[0, 0, T*16
-// .. T*16+15] (8 fp32 reinterpreted as 16 bf16 = 32 B). Layout matches PMFMA:
-// lane (g, l) p_comp[s=0..3] = scaled_score[head=l, K=g*4+s] (first 16-col tile),
-// p_comp[s=4..7] = scaled_score[head=l, K=g*4+16..g*4+19] (second tile).
-// Disables softmax + pack + PV + epilogue so the dump survives.
-// #define HKMLA_V40_PROBE_PCOMP 1
-// Skip Phase B entirely so the PCOMP dump captures Phase A's contribution only.
-// #define HKMLA_V40_PROBE_PCOMP_PHASE_A_ONLY 1
-// TEMP DEBUG: dump kv_top (QK A-operand) after Phase A iter <kKvTopIter> for
-// warp 0, all 64 lanes -> out[0, 0, lane*8 .. lane*8+7]. Verifies LDS->VGPR
-// load path for K=1 at kColOffset = kKvTopIter*32.
-// #define HKMLA_V40_PROBE_KVTOP 1
-// TEMP DEBUG: dump RAW KV LDS bytes for 8 sub-blocks (row_tile=0,
-// col_tile=0..7) of p_lds_kv_curr, right after the cross-warp s_barrier.
-// Each sub-block is 1024 B = 64 lanes * 16 B. Layout per lane T:
-//   split_output[ct*1024 + T*16 .. +T*16+15] = LDS[sb_off(0,ct) + T*16 .. +15]
-// Localizes the writer-side bug: if sub_block(0,0) has K cols 0..31 but
-// sub_block(0,1) has the SAME data instead of K cols 32..63, the writer
-// is mis-routing waves.
-// #define HKMLA_V40_PROBE_KV_LDS 1
-// TEMP DEBUG: dump q_vgpr (Phase A pinned Q[:, 0:256]) at iter <ITER> for warp 0,
-// all 64 lanes -> split_output bytes lane*16. Layout: lane (g, l) bf16[0..7] =
-// Q[head=l, feat = ITER*32 + g*8 .. + g*8+7] (B-operand of mma_ABt).
-// #define HKMLA_V40_PROBE_QVGPR 1
-// DEBUG: when QVGPR/QLDS/KVTOP probes are enabled, the standalone QManager
-// unit test passes but the integrated kernel mismatches at mfma iter >= 1.
-// Hypothesis: probe inline-asm + the larger surrounding kernel body push
-// compiler scratch into v68..v71 (which is q_rope and the low edge of
-// q_vgpr). Even though amdgpu_num_vgpr(68) is honored in the no-debug build,
-// the probe asm widens the register window the compiler needs.
-//
-// Mitigation: shrink k_o_sz to 4 vgprs (no PV needed for QK/softmax probes),
-// which pushes ALL other pinned regs up to v192..v255 and frees v0..v191
-// entirely for the compiler. This requires commenting out PV GEMM + epilogue
-// blocks (they touch the now-4-vgpr oaccu).
-#define HKMLA_V40_DEBUG_NO_PV 1
-// DEBUG: skip the prologue KV async_load_k. Q load + probe + KV LDS reads in
-// Phase A will all be against an uninitialized KV LDS (kv_top/kv_bot will hold
-// garbage), but we only care about QVGPR probe correctness — Phase A still
-// runs the ds_read + mfma sequence so the schedule matches as closely as
-// possible to the original. Test hypothesis: does the prologue async_load_k's
-// m0 manipulation or buffer_load lds: clobber load_q's pending pipeline?
-// #define HKMLA_V40_DEBUG_NO_PROLOGUE_KV 1
-// DEBUG: skip prologue async_load_k AND the entire per-warp dispatch ladder
-// (every call to mla_main). Right after load_q + sched_barrier(0), dump ALL 32
-// pinned q_vgpr vgprs for warp 0 to split_output. Verifies that load_q in
-// isolation -- with NO consumer touching kv_top/p_comp/etc., NO ds_read from
-// KV LDS, NO mfma -- produces correct pinned q for all 4 chunks. If this
-// passes, the bug is downstream (something in mla_main runtime-interferes with
-// load_q's still-in-flight cvts). If this fails, the bug is in load_q itself.
-// #define HKMLA_V40_DEBUG_SKIP_MLA_MAIN 1
-// Bisect variants paired with SKIP_MLA_MAIN. All three independently PASSed
-// (warp 0 q_vgpr clean across all 4 chunks) -- corruption only appears under
-// the FULL Phase A unrolled loop. Leaving disabled by default.
-// #define HKMLA_V40_DEBUG_SKIP_MLA_MAIN_RUN_PROLOGUE 1
-// #define HKMLA_V40_DEBUG_SKIP_MLA_MAIN_RUN_LOAD_K  1
-// #define HKMLA_V40_DEBUG_SKIP_MLA_MAIN_RUN_MFMA    1
-#ifndef HKMLA_V40_PROBE_QVGPR_ITER
-// Probe runs at this iter and dumps ALL 4 chunks (lower+upper halves of each).
-// 0 = end of load_q, before any mfma reads pinned q.
-// 7 = end of Phase A, after every mfma has read pinned q.
-#define HKMLA_V40_PROBE_QVGPR_ITER 7
-#endif
-// TEMP DEBUG: dump q_k (Phase B unpinned, Q LDS-fed) at iter <ITER> for warp 0,
-// all 64 lanes -> split_output bytes lane*16. Layout: lane (g, l) bf16[0..7] =
-// Q[head=l, feat = 256 + ITER*32 + g*8 .. + g*8+7].
-// #define HKMLA_V40_PROBE_QLDS 1
-#ifndef HKMLA_V40_PROBE_QLDS_ITER
-#define HKMLA_V40_PROBE_QLDS_ITER 0
-#endif
-#ifndef HKMLA_V40_PROBE_KVTOP_ITER
-#define HKMLA_V40_PROBE_KVTOP_ITER 1
-#endif
-// TEMP DEBUG: dump raw P1 staging fp8 bytes for chunk <CHUNK> via an
-// isolation re-issue (BEFORE production load_q) for warp 0, all 64 lanes ->
-// split_output bytes lane*16. Layout: bytes [0,8) = ds_read(staging, off:0),
-// bytes [8,16) = ds_read(staging, off:32). Decode per-lane (head=lane&15,
-// g=lane>>4): bytes[0..8) = packed_q[0, head, g*8 .. g*8+7];
-//                  bytes[8..16) = packed_q[0, head, g*8+32 .. g*8+39].
-// #define HKMLA_V40_PROBE_P1_STAGING 1
-#ifndef HKMLA_V40_PROBE_P1_STAGING_CHUNK
-#define HKMLA_V40_PROBE_P1_STAGING_CHUNK 0
-#endif
-
 // V4.0 mi35x m16x8 decode kernel: separate FP8 NOPE + BF16 ROPE buffers for
 // both Q and KV. End-to-end body (Phases 4a..4g) in place: prologue (Q load +
 // first KV tile) -> per-warp dispatch ladder over mla_main (QK GEMM + softmax
 // + PV GEMM + epilogue, with online-softmax rescale across K-tile iters).
 #if defined(__gfx950__)
 template <typename T>
-#if defined(HKMLA_V40_DEBUG_NO_PV)
-    // DEBUG: pinned regs shifted to v192..v255 (k_o_sz=4); compiler gets v0..v191.
-    __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
-    __attribute__((amdgpu_num_vgpr(192))) void
-#else
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     __attribute__((amdgpu_num_vgpr(68))) void
-#endif
     kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16(HkMlaV40DecodeFwdParams<T> params)
 {
     using q_nope_t  = T::q_nope_t;
@@ -157,13 +59,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     // Pinned total = 184 (matches spec). Compiler is constrained to v0..v67
     // for scratch via amdgpu_num_vgpr(68) on the __global__ -- without this,
     // scratch leaks into v68..v255 and clobbers pinned q_vgpr/kv/p_comp/oaccu.
-#if defined(HKMLA_V40_DEBUG_NO_PV)
-    // DEBUG: oaccu stubbed to 4 vgprs (one 16x16 fp32 base tile). PV GEMM,
-    // rescale, and epilogue must be disabled (they assume full 128-vgpr oaccu).
-    constexpr uint32_t k_o_sz        = 4;
-#else
     constexpr uint32_t k_o_sz        = 128;
-#endif
     constexpr uint32_t k_p_comp_sz   = 8;
     constexpr uint32_t k_p_mfma_sz   = 4;
     constexpr uint32_t k_kv_sz       = 8;
@@ -268,13 +164,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     // p_mfma: bf16 P-operand for PV mfma, row_l 16x32 (4 vgprs/lane = 1 base tile).
     hk::art<mfma_ab_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, p_mfma_ranges> p_mfma;
     // oaccu: full kVoHeadDim=512 wide, kTileM=16 rows, row_l 16x16 sub-tiles (fp32).
-#if defined(HKMLA_V40_DEBUG_NO_PV)
-    // DEBUG: stub oaccu to (kTileM, 16) so the art fits in k_o_sz=4 vgprs.
-    // Unused: PV GEMM + rescale + epilogue blocks are #if-disabled below.
-    hk::art<comp_t, T::kTileM, 16, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
-#else
     hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
-#endif
 
     // ---- Runtime constants ----
     const uint32_t warp_idx = __builtin_amdgcn_readfirstlane(threadIdx.x / opus::get_warp_size());
@@ -427,105 +317,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         // Load Q: Q[:, 0:256] -> VGPR pinned at k_q_vgpr_begin (32 vgprs/lane).
         //         Q[:, 256:512] -> bf16 final LDS region inside p_lds_q.
         // Q rope/nope buffers are separate tensors in V4.0.
-#if defined(HKMLA_V40_PROBE_P1_STAGING)
-        // Isolation probe (PRE-load_q): re-issue chunk's vmem->staging fresh,
-        // ds_read offset:0 and offset:32, dump raw fp8 to split_output.
-        // Tests vmem->LDS->ds_read primitive without load_q's chunk-2/3 reuse.
-        if((blockIdx.x == 0u) && (work_idx == work_start_idx))
-        {
-            q_manager.template probe_p1_staging_dump<HKMLA_V40_PROBE_P1_STAGING_CHUNK, 0>(
-                params.query, warp_idx, qo_start, p_lds_q, split_out_br);
-        }
-#endif
         q_manager.template load_q<k_q_vgpr_begin>(
             params.query, params.query_rope, warp_idx, qo_start, p_lds_q);
         __builtin_amdgcn_sched_barrier(0);
 
-#if defined(HKMLA_V40_DEBUG_SKIP_MLA_MAIN) && \
-    defined(HKMLA_V40_DEBUG_SKIP_MLA_MAIN_RUN_PROLOGUE)
-        // Variant: run the prologue async_load_k BEFORE dumping. Tests whether
-        // the prologue's buffer_load lds: / m0 writes / sched_barrier interact
-        // with load_q's still-in-flight cvts and corrupt pinned q_vgpr.
-        if(kv_len < T::kBlockN)
-        {
-            kv_manager.template async_load_k<true>(p_lds_kv_curr,
-                                                   warp_idx,
-                                                   params.kv_buffer,
-                                                   params.kv_buffer_rope,
-                                                   row_kv_ld_first);
-        }
-        else
-        {
-            kv_manager.template async_load_k<false>(p_lds_kv_curr,
-                                                    warp_idx,
-                                                    params.kv_buffer,
-                                                    params.kv_buffer_rope,
-                                                    row_kv_ld_first);
-        }
-        __builtin_amdgcn_sched_barrier(0);
-#endif
-
-#if defined(HKMLA_V40_DEBUG_SKIP_MLA_MAIN) && \
-    defined(HKMLA_V40_DEBUG_SKIP_MLA_MAIN_RUN_LOAD_K)
-        // Variant: run the very start of mla_main -- drain + barrier + 2x
-        // load_k_to_gpr (Phase A iter 0's K reads + cvt clusters) -- BEFORE
-        // the probe. Tests whether the cvt cluster in load_k_to_gpr (writing
-        // to kv_top/kv_bot = v112..v119) somehow clobbers pinned q_vgpr.
-        __builtin_amdgcn_s_waitcnt(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-        kv_manager.template load_k_to_gpr<0u,  0u>(kv_top, p_lds_kv_curr);
-        kv_manager.template load_k_to_gpr<16u, 0u>(kv_bot, p_lds_kv_curr);
-        __builtin_amdgcn_s_waitcnt(0);
-        __builtin_amdgcn_sched_barrier(0);
-#if defined(HKMLA_V40_DEBUG_SKIP_MLA_MAIN_RUN_MFMA)
-        // 2x mma_ABt(p_comp, kv_top/bot, q_k=chunk0 lower).
-        // q_k overlays vgprs k_q_vgpr_begin+0..+3 (4 vgprs of chunk 0 lower).
-        {
-            constexpr uint32_t kQReg = k_q_vgpr_begin + 0u;
-            using q_range_k          = hkdart::split_many_t<
-                hkdart::type_list<hkdart::range<kQReg, kQReg + 3u>>, 4>;
-            hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l,
-                    hk::rt_16x32_s, q_range_k> q_k;
-            hk::mma_ABt(p_comp_lo, kv_top, q_k);
-            hk::mma_ABt(p_comp_hi, kv_bot, q_k);
-            __builtin_amdgcn_s_waitcnt(0);
-            __builtin_amdgcn_sched_barrier(0);
-        }
-#endif
-#endif
-
-#if defined(HKMLA_V40_DEBUG_SKIP_MLA_MAIN)
-        // PROBE: dump ALL 32 pinned q_vgpr vgprs (= full Q[:, 0:256] for the 16
-        // heads owned by warp 0) immediately after load_q. NO mla_main calls.
-        // Drain everything first so all cvts have committed.
-        //
-        // Layout: split_output is [B=1, KV=1, NumQHeads=128, kVoHeadDim=512]
-        // fp32 = 256 KB. Lane T (warp 0) writes 32 dwords (128 B) at
-        //   byte_offset = T * 128
-        // Reinterpret as bf16 in python: 64 bf16/lane. Lane T = (g=T>>4, l=T&15):
-        //   bf16[iter*8 + s] = Q[head = l + warp_idx*16,
-        //                        feat = iter*32 + g*8 + s]
-        // for iter in 0..7, s in 0..7. Matches mfma A-operand layout used by
-        // load_q's kQReg = k_q_vgpr_begin + iter*4 destination.
-        if((blockIdx.x == 0u) && (warp_idx == 0u) &&
-           (work_idx == work_start_idx))
-        {
-            __builtin_amdgcn_s_waitcnt(0);
-            const uint32_t v_off = lane_idx * 128u;
-            hkm::buffer_store_dwordx4<k_q_vgpr_begin +  0>(split_out_br, v_off, 0u,   0);
-            hkm::buffer_store_dwordx4<k_q_vgpr_begin +  4>(split_out_br, v_off, 0u,  16);
-            hkm::buffer_store_dwordx4<k_q_vgpr_begin +  8>(split_out_br, v_off, 0u,  32);
-            hkm::buffer_store_dwordx4<k_q_vgpr_begin + 12>(split_out_br, v_off, 0u,  48);
-            hkm::buffer_store_dwordx4<k_q_vgpr_begin + 16>(split_out_br, v_off, 0u,  64);
-            hkm::buffer_store_dwordx4<k_q_vgpr_begin + 20>(split_out_br, v_off, 0u,  80);
-            hkm::buffer_store_dwordx4<k_q_vgpr_begin + 24>(split_out_br, v_off, 0u,  96);
-            hkm::buffer_store_dwordx4<k_q_vgpr_begin + 28>(split_out_br, v_off, 0u, 112);
-        }
-        continue; // skip prologue async_load_k + per-warp dispatch ladder
-#endif
-
-#if !defined(HKMLA_V40_DEBUG_NO_PROLOGUE_KV)
         // Prologue: prefetch + cvt+store the first KV tile into the curr pong.
         // kCheckBoundary is true when the tile straddles the batch tail.
         if(kv_len < T::kBlockN)
@@ -544,7 +339,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                                                     params.kv_buffer_rope,
                                                     row_kv_ld_first);
         }
-#endif
 
         // ---- mla_main lambda (Phase 4g) ----
         //
@@ -582,30 +376,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             __builtin_amdgcn_s_waitcnt(0);
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
-
-#if defined(HKMLA_V40_PROBE_KV_LDS)
-            // Right after the cross-warp barrier: dump raw bytes from
-            // p_lds_kv_curr for 8 sub-blocks at (row_tile=0, col_tile=0..7).
-            // Each sub-block is 1024 B; each lane reads 16 B at flat offset
-            // T*16 within the sub-block. Uses kv_top vgpr range as scratch
-            // (dead until the first Phase A load_k_to_gpr below).
-            if((blockIdx.x == 0u) && (warp_idx == 0u) &&
-               (work_idx == work_start_idx))
-            {
-                opus::static_for<8>([&](auto ct_idx) {
-                    constexpr uint32_t kCt    = ct_idx.value;
-                    constexpr uint32_t kSbOff = (kCt * 2u + 0u) * 1024u;
-                    const uintptr_t p_src = p_lds_kv_curr + lane_idx * 16u;
-                    hkm::ds_read_b128<k_kv_begin>(
-                        static_cast<uint32_t>(p_src), kSbOff);
-                    __builtin_amdgcn_s_waitcnt(
-                        hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
-                    const uint32_t v_off = kCt * 1024u + lane_idx * 16u;
-                    hkm::buffer_store_dwordx4<k_kv_begin>(
-                        split_out_br, v_off, 0u, 0);
-                });
-            }
-#endif
 
             // Snapshot next-tile KV row (set by prior call or prologue).
             int32_t row_kv_ld_next = 0;
@@ -650,33 +420,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     kv_manager.template load_k_to_gpr<0u,  kColOffset>(kv_top, p_lds_kv_curr);
                     kv_manager.template load_k_to_gpr<16u, kColOffset>(kv_bot, p_lds_kv_curr);
 
-#if defined(HKMLA_V40_PROBE_QVGPR)
-                    // Phase A q_vgpr probe: at iter == HKMLA_V40_PROBE_QVGPR_ITER,
-                    // dump ALL 4 chunks (32 vgprs = 128 B/lane) of the pinned
-                    // q_vgpr region. Layout per lane: 8 x 16-byte chunks at
-                    // v_off = lane_idx*128 + chunk*16 (chunk = q vgpr group of 4).
-                    if constexpr(idx.value == HKMLA_V40_PROBE_QVGPR_ITER)
-                    {
-                        if((blockIdx.x == 0u) && (warp_idx == 0u) &&
-                           (work_idx == work_start_idx))
-                        {
-                            // Wait for all preceding mfmas to release pinned q.
-                            __builtin_amdgcn_s_waitcnt(
-                                hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/-1));
-                            asm volatile("s_nop 15");
-                            asm volatile("s_nop 15");
-                            const uint32_t v_off = lane_idx * 128u;
-                            hkm::buffer_store_dwordx4<k_q_vgpr_begin +  0>(split_out_br, v_off, 0u,   0);
-                            hkm::buffer_store_dwordx4<k_q_vgpr_begin +  4>(split_out_br, v_off, 0u,  16);
-                            hkm::buffer_store_dwordx4<k_q_vgpr_begin +  8>(split_out_br, v_off, 0u,  32);
-                            hkm::buffer_store_dwordx4<k_q_vgpr_begin + 12>(split_out_br, v_off, 0u,  48);
-                            hkm::buffer_store_dwordx4<k_q_vgpr_begin + 16>(split_out_br, v_off, 0u,  64);
-                            hkm::buffer_store_dwordx4<k_q_vgpr_begin + 20>(split_out_br, v_off, 0u,  80);
-                            hkm::buffer_store_dwordx4<k_q_vgpr_begin + 24>(split_out_br, v_off, 0u,  96);
-                            hkm::buffer_store_dwordx4<k_q_vgpr_begin + 28>(split_out_br, v_off, 0u, 112);
-                        }
-                    }
-#endif
                     // ds_read + mfma asm wrappers are opaque to the compiler, so
                     // the lgkmcnt drain isn't inserted automatically. Drain to <=1
                     // (kv_top ready, kv_bot still in flight) -- overlaps the bot
@@ -684,24 +427,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     // mma.
                     __builtin_amdgcn_s_waitcnt(
                         hk_mla::encode_s_waitcnt(/*lgkmcnt=*/1, /*vmcnt=*/-1));
-#if defined(HKMLA_V40_PROBE_KVTOP)
-                    // Dump kv_top (4 dwords/lane = 16 bytes) to split_output for
-                    // warp 0, all 64 lanes. split_output is unused on c<=kBlockN
-                    // (num_works=1), so safe to clobber. Layout: write to
-                    // split_output as a flat byte stream at offset lane_idx*16.
-                    if constexpr(idx.value == HKMLA_V40_PROBE_KVTOP_ITER)
-                    {
-                        if((blockIdx.x == 0u) && (warp_idx == 0u) &&
-                           (work_idx == work_start_idx))
-                        {
-                            __builtin_amdgcn_s_waitcnt(
-                                hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
-                            const uint32_t v_off = lane_idx * 16u;
-                            hkm::buffer_store_dwordx4<k_kv_begin + 0>(
-                                split_out_br, v_off, 0u, 0);
-                        }
-                    }
-#endif
                     if constexpr(idx.value == 0)
                     {
                         hk::mma_ABt(p_comp_lo, kv_top, q_k);
@@ -725,7 +450,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 // range overlaying pv_v_aux's first 4 vgprs -- safe because
                 // pv_v_aux is dead until the PV phase.
                 constexpr uint32_t kQLdsScratchReg = k_pv_v_aux_begin;
-#if !defined(HKMLA_V40_PROBE_PCOMP_PHASE_A_ONLY)
                 opus::static_for<kNumQkVgprIter>([&](auto idx) {
                     constexpr uint32_t kColTile   = idx.value; // 0..7
                     constexpr uint32_t kColOffset = (kNumQkVgprIter + idx.value) * T::kBlockK;
@@ -743,54 +467,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     // the top mma; lgkmcnt(0) drains kv_bot before the bot mma.
                     __builtin_amdgcn_s_waitcnt(
                         hk_mla::encode_s_waitcnt(/*lgkmcnt=*/1, /*vmcnt=*/-1));
-#if defined(HKMLA_V40_PROBE_QLDS)
-                    // Phase B q_lds probe: after drain (q_k in q_k registers),
-                    // dump 4 vgprs (8 bf16/lane) of q_k to split_output.
-                    if constexpr(idx.value == HKMLA_V40_PROBE_QLDS_ITER)
-                    {
-                        if((blockIdx.x == 0u) && (warp_idx == 0u) &&
-                           (work_idx == work_start_idx))
-                        {
-                            __builtin_amdgcn_s_waitcnt(
-                                hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
-                            const uint32_t v_off = lane_idx * 16u;
-                            hkm::buffer_store_dwordx4<kQLdsScratchReg>(
-                                split_out_br, v_off, 0u, 0);
-                        }
-                    }
-#endif
                     hk::mma_ABt(p_comp_lo, kv_top, q_k, p_comp_lo);
                     __builtin_amdgcn_s_waitcnt(
                         hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
                     hk::mma_ABt(p_comp_hi, kv_bot, q_k, p_comp_hi);
                 });
-#endif
             }
 
-#if defined(HKMLA_V40_PROBE_PCOMP)
-            // PROBE: dump raw p_comp (v120..v127, 8 fp32/lane = 32B) for warp 0
-            // all 64 lanes to out[0, 0, lane*16 .. lane*16+15] (= bytes
-            // lane*32 .. lane*32+31). Layout per softmax_scale_p_8: lane (g, l)
-            // p_comp[s=0..3] = score[head=l, K=g*4+s] (first 16-col tile),
-            // p_comp[s=4..7] = score[head=l, K=g*4+16..+19] (second tile).
-            if((blockIdx.x == 0u) && (warp_idx == 0u) &&
-               (work_idx == work_start_idx))
-            {
-                __builtin_amdgcn_s_waitcnt(
-                    hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
-                // mfma → buffer_store hazard: drain mfma writeback before
-                // probing p_comp.
-                asm volatile("s_nop 15");
-                asm volatile("s_nop 15");
-                asm volatile("s_nop 15");
-                asm volatile("s_nop 15");
-                const uint32_t v_off = lane_idx * 32u;
-                hkm::buffer_store_dwordx4<k_p_comp_begin + 0>(out_br, v_off, 0u, 0);
-                hkm::buffer_store_dwordx4<k_p_comp_begin + 4>(out_br, v_off, 0u, 16);
-            }
-#endif
-
-#if !defined(HKMLA_V40_PROBE_PCOMP)
             // ---- Phase B+C: wait + cvt + store NEXT tile to LDS ----
             // Sequenced after QK so the QK ds_reads from p_lds_kv_curr aren't
             // delayed by the cvt+store traffic on p_lds_kv_next.
@@ -872,24 +555,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 pack_2f32_to_bf16_pair_pinned<k_p_mfma_begin + 1, k_p_comp_begin + 2>();
                 pack_2f32_to_bf16_pair_pinned<k_p_mfma_begin + 2, k_p_comp_begin + 4>();
                 pack_2f32_to_bf16_pair_pinned<k_p_mfma_begin + 3, k_p_comp_begin + 6>();
-
-#if defined(HKMLA_V40_PROBE_PMFMA)
-                // PROBE: dump p_mfma (v120..v123, 4 dwords = 8 bf16) per lane for
-                // ALL 8 warps to out[0, 0, warp_idx*512 .. (warp_idx+1)*512] bf16
-                // (= bytes warp_idx*1024 + lane*16). Each warp owns 16 heads
-                // (warp w -> heads w*16..w*16+15). Total 8 KB = within out_v40
-                // single-head slice (128 KB). PV GEMM + epilogue are disabled
-                // below so this probe data survives to the host.
-                if((blockIdx.x == 0u) &&
-                   (work_idx == work_start_idx))
-                {
-                    const uint32_t v_off = warp_idx * 1024u + lane_idx * 16u;
-                    hkm::buffer_store_dwordx4<k_p_mfma_begin>(out_br, v_off, 0u, 0);
-                }
-#endif
             }
 
-#if !defined(HKMLA_V40_PROBE_PMFMA) && !defined(HKMLA_V40_DEBUG_NO_PV)
             // ---- Rescale accumulated oaccu before PV mfma (non-first iter) ----
             // Online-softmax: oaccu_new = oaccu_prev * exp(row_max_prev - row_max_new) + P_new @ V_new.
             // Apply the scalar rescale to oaccu BEFORE the 4-arg accum mfmas below.
@@ -897,7 +564,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             {
                 hk::mul_vgpr(oaccu, oaccu, rescale);
             }
-#endif
 
             // ---- PV GEMM ----
             //
@@ -912,7 +578,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             //
             // Single-buffered (pv_v_aux unused in Gen.1 -- deferred).
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / T::kBlockN; // 16
-#if !defined(HKMLA_V40_PROBE_PMFMA) && !defined(HKMLA_V40_DEBUG_NO_PV)
             if constexpr(kSkipCompute == false)
             {
                 opus::static_for<num_pv_iter>([&](auto i) {
@@ -958,9 +623,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     }
                 });
             }
-#endif // !HKMLA_V40_PROBE_PMFMA
 
-#if !defined(HKMLA_V40_PROBE_PMFMA) && !defined(HKMLA_V40_DEBUG_NO_PV)
             // ---- Epilogue ----
             //
             // Rescale oaccu by 1/row_sum_e (single mul_vgpr over full 128-vgpr
@@ -989,37 +652,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                             p_lds_o,
                             num_qheads);
                     });
-#if defined(HKMLA_V40_PROBE_KV_LDS)
-                    // PROBE: write known sentinel bf16 constants to verify
-                    // the buffer_store path lands at out[0, 0, 0..15].
-                    // 0x3F80 = 1.0 bf16; 0xBF80 = -1.0 bf16; 0x4000 = 2.0;
-                    // 0xC000 = -2.0; 0x4040 = 3.0; 0xC040 = -3.0; 0x4080 = 4.0;
-                    // 0xC080 = -4.0.
-                    __builtin_amdgcn_s_waitcnt(
-                        hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/0));
-                    const bool kIsProbeLane = (blockIdx.x == 0u) &&
-                                              (warp_idx == 0u) &&
-                                              (lane_idx == 0u) &&
-                                              (work_idx == work_start_idx);
-                    if(kIsProbeLane)
-                    {
-                        const uint32_t lds_addr = static_cast<uint32_t>(p_lds_kv_curr);
-                        // Bytes 0..31 (= K[k=0, h=0, col=0..15]) -> out[0..15]
-                        hkm::ds_read_b128<k_kv_begin + 0>(lds_addr,  0);
-                        hkm::ds_read_b128<k_kv_begin + 4>(lds_addr, 16);
-                        __builtin_amdgcn_s_waitcnt(
-                            hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
-                        hkm::buffer_store_dwordx4<k_kv_begin + 0>(out_br, 0u, 0u,  0);
-                        hkm::buffer_store_dwordx4<k_kv_begin + 4>(out_br, 0u, 0u, 16);
-                        // Bytes 64..95 (= K[k=1, h=0, col=0..15]) -> out[16..31]
-                        hkm::ds_read_b128<k_kv_begin + 0>(lds_addr, 64);
-                        hkm::ds_read_b128<k_kv_begin + 4>(lds_addr, 80);
-                        __builtin_amdgcn_s_waitcnt(
-                            hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
-                        hkm::buffer_store_dwordx4<k_kv_begin + 0>(out_br, 0u, 0u, 32);
-                        hkm::buffer_store_dwordx4<k_kv_begin + 4>(out_br, 0u, 0u, 48);
-                    }
-#endif
                 }
                 else
                 {
@@ -1057,8 +689,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             {
                 std::swap(p_lds_kv_curr, p_lds_kv_next);
             }
-#endif // !HKMLA_V40_PROBE_PMFMA (epilogue+swap block)
-#endif // !HKMLA_V40_PROBE_PCOMP (Phase B+C..swap block)
         };
 
         // ---- Per-warp dispatch ladder ----

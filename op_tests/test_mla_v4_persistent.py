@@ -532,6 +532,7 @@ def test_mla_v4(
 
     # Silver Q: FP8 nope + E8M0 bpad8 scale + BF16 rope (the kernel's input layout).
     q_nope_fp8, q_nope_scale_e8m0, q_rope_bf16, _ = quantize_v4_q(q)
+    q_rope_bf16 = q_rope_bf16.contiguous()
 
     # Pack Q/KV into the 576-byte/token kernel layout (NOPE + dup-scale + zero
     # pad). This is the exact byte stream mla.py will hand to the ASM kernel
