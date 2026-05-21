@@ -399,7 +399,7 @@ _EXPERIMENTAL_TDM_SHAPES = [
 
 @pytest.mark.parametrize("M, N, K", _EXPERIMENTAL_BASIC_SHAPES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("variant", ["experimental", "experimental_unroll2", "manual"])
+@pytest.mark.parametrize("variant", ["manual"])
 def test_gemm_a8w8_blockscale_experimental_basic(variant, M, N, K, dtype):
     _check_gfx1250()
     _check_shape_compat(M, N, K)
@@ -421,7 +421,7 @@ def test_gemm_a8w8_blockscale_experimental_basic(variant, M, N, K, dtype):
 
 @pytest.mark.parametrize("M, N, K", [(128, 256, 256), (256, 512, 512)])
 @pytest.mark.parametrize("num_buffers", [2, 3, 4])
-@pytest.mark.parametrize("variant", ["experimental", "experimental_unroll2", "manual"])
+@pytest.mark.parametrize("variant", ["manual"])
 def test_gemm_a8w8_blockscale_experimental_num_buffers(variant, M, N, K, num_buffers):
     _check_gfx1250()
     _check_shape_compat(M, N, K, num_buffers=num_buffers)
@@ -444,7 +444,7 @@ def test_gemm_a8w8_blockscale_experimental_num_buffers(variant, M, N, K, num_buf
 
 @pytest.mark.parametrize("M, N, K", _EXPERIMENTAL_TDM_SHAPES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("variant", ["experimental", "experimental_unroll2", "manual"])
+@pytest.mark.parametrize("variant", ["manual"])
 def test_gemm_a8w8_blockscale_experimental_tdm_store(variant, M, N, K, dtype):
     _check_gfx1250()
     _check_shape_compat(M, N, K)
@@ -473,7 +473,7 @@ def test_gemm_a8w8_blockscale_experimental_tdm_store(variant, M, N, K, dtype):
         (1024, 1024, 1024),
     ],
 )
-@pytest.mark.parametrize("variant", ["experimental", "experimental_unroll2", "manual"])
+@pytest.mark.parametrize("variant", ["manual"])
 def test_gemm_a8w8_blockscale_experimental_scales_per_tile(variant, M, N, K):
     _check_gfx1250()
     _check_shape_compat(M, N, K, tile_k=256)
@@ -502,7 +502,7 @@ def test_gemm_a8w8_blockscale_experimental_scales_per_tile(variant, M, N, K):
         (128, 256, 12288),
     ],
 )
-@pytest.mark.parametrize("variant", ["experimental", "experimental_unroll2", "manual"])
+@pytest.mark.parametrize("variant", ["manual"])
 def test_gemm_a8w8_blockscale_experimental_multi_chunk(variant, M, N, K):
     _check_gfx1250()
     _check_shape_compat(M, N, K)
@@ -543,13 +543,7 @@ if __name__ == "__main__":
         "--variant",
         type=str,
         default="reg_preload",
-        choices=[
-            "reg_preload",
-            "no_op_preload",
-            "experimental",
-            "experimental_unroll2",
-            "manual",
-        ],
+        choices=["reg_preload", "manual"],
     )
     args = parser.parse_args()
 
