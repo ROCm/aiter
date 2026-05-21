@@ -383,140 +383,224 @@ def _ensure_kids_compiled(candidate_kids):
        get the stale subset .so and fail with
        ``AITER_CHECK: Kernel id X not found in a16w16 tune lookup table``.
 
+    Concurrency model
+    -----------------
+    Two race vectors are explicitly defended against:
+
+    A. **Concurrent GemmTuner / parent processes** (multi-GPU multi-script):
+       sidecar read + expand + write + build is wrapped in a ``FileBaton``
+       (`$JIT_BUILD/lock_ensure_kids_opus`). One parent runs the full
+       expand+build; the rest spin on the baton, then re-read the sidecar
+       (it may already contain what they need, in which case they skip).
+
+    B. **mp_tuner spawn-ed children inheriting `AITER_REBUILD=1`**:
+       if the user launched the tuner with `AITER_REBUILD=1` in env
+       (the usual workflow after editing source), every spawn child
+       re-reads the env at import time and would `clear_build()` +
+       rebuild on its first `compile_ops("module_deepgemm_opus")` call.
+       The first child wins the FileBaton, deletes the .so we just
+       baked, and the rest then race against an in-flight build,
+       producing intermittent `FileNotFoundError` / partial ELF errors.
+       To shut this off we **also clear `os.environ["AITER_REBUILD"]`**
+       once our synchronous build succeeds, so every spawn child
+       inherits a clean env (read: `AITER_REBUILD=0`) and goes straight
+       to `dlopen()` of the .so we just produced. The original env is
+       restored on the parent process only after this call returns;
+       the parent itself does not need the rebuild flag past this
+       point because we already added ``module_deepgemm_opus`` to
+       ``rebuilded_list``.
+
     Returns
     -------
     bool
         True if a rebuild was triggered (sidecar grew), False if every
         required kid was already compiled.
     """
+    from aiter.jit import core as _jit_core
+    from aiter.jit.utils.file_baton import FileBaton
+
     candidate_kids = frozenset(int(k) for k in candidate_kids)
+    required = candidate_kids | HEURISTIC_DEFAULT_KIDS
+
+    def _read_sidecar(path):
+        if not os.path.exists(path):
+            return set()
+        try:
+            with open(path) as f:
+                return set(json.load(f))
+        except (OSError, ValueError):
+            return set()
 
     sidecar = _opus_sidecar_path()
-    if os.path.exists(sidecar):
-        try:
-            with open(sidecar) as f:
-                compiled = set(json.load(f))
-        except (OSError, ValueError):
-            compiled = set()
-    else:
-        compiled = set()
 
-    required = candidate_kids | HEURISTIC_DEFAULT_KIDS
-    missing = required - compiled
-    if not missing:
+    # Fast path: no lock needed if we are already a strict subset of
+    # whatever sidecar happens to be on disk. Even if a concurrent
+    # writer is mid-update, the only race window is "we read while
+    # a strictly larger superset is being written" -- both states
+    # contain our required kids, so it is safe to skip.
+    if required <= _read_sidecar(sidecar):
         return False
 
-    sys.stderr.write(
-        f"[opus _ensure_kids_compiled] need to add {len(missing)} kids "
-        f"to sidecar (existing={len(compiled)}, target={len(compiled | required)})\n"
-    )
+    os.makedirs(_jit_core.bd_dir, exist_ok=True)
+    lock_path = f"{_jit_core.bd_dir}/lock_ensure_kids_opus"
+    baton = FileBaton(lock_path)
 
-    # Persist the expanded set.
-    new_set = sorted(compiled | required)
-    os.makedirs(os.path.dirname(sidecar), exist_ok=True)
-    with open(sidecar, "w") as f:
-        json.dump(new_set, f)
-    sys.stderr.write(
-        f"[opus _ensure_kids_compiled] wrote sidecar at {sidecar} with {len(new_set)} kids; "
-        f"triggering build...\n"
-    )
+    if not baton.try_acquire():
+        # A peer parent (multi-GPU / multi-process tune harness) is
+        # already extending the sidecar + rebuilding. Spin until they
+        # finish and re-evaluate; in the common case the peer's set
+        # already covers ours and we exit without rebuilding.
+        baton.wait()
+        if required <= _read_sidecar(sidecar):
+            return False
+        # Peer's expand didn't cover us (rare: peer's `required` set was
+        # disjoint from ours). Re-enter to extend further.
+        return _ensure_kids_compiled(candidate_kids)
 
-    # Force a JIT rebuild. Mirrors
-    # aiter.utility.base_tuner._set_config_env_for_run_config but scopes
-    # the AITER_REBUILD override to JUST this build call (we reset it in
-    # the finally block) so spawned mp_tuner children -- whose Python
-    # state is independent but whose env can leak through fork-mode --
-    # don't try to re-enter clear_build()+rebuild themselves and race
-    # against the .so we just produced.
-    from aiter.jit import core as _jit_core
-
-    _prev_rebuild = _jit_core.AITER_REBUILD
-    _jit_core.AITER_REBUILD = 1
-    _jit_core.get_module.cache_clear()
-    # __mds is name-mangled inside the module; access via private name.
-    _mds = getattr(_jit_core, "_core__mds", None) or getattr(_jit_core, "__mds", None)
-    if _mds is None:
-        # The dict is module-level `__mds = {}`; access through __dict__.
-        _mds = _jit_core.__dict__.get("__mds")
-    if isinstance(_mds, dict):
-        _mds.clear()
-    # Reset rebuilded_list (used by compile_ops to track "we already
-    # rebuilt this once in this process"). Keep module_aiter_enum on the
-    # list because it's the bootstrap module and rebuilding it during a
-    # running tuner triggers a circular reload.
-    _prev_rebuilded_list = list(_jit_core.rebuilded_list)
-    _jit_core.rebuilded_list = ["module_aiter_enum"]
-
-    # Synchronously drive the rebuild in this (parent) process so that
-    # mp_tuner's spawn-ed children see a fully-baked .so on disk.
-    _build_exc = None
     try:
-        d_args = _jit_core.get_args_of_build("module_deepgemm_opus")
-        _jit_core.build_module(
-            md_name="module_deepgemm_opus",
-            srcs=d_args["srcs"],
-            flags_extra_cc=d_args["flags_extra_cc"],
-            flags_extra_hip=d_args["flags_extra_hip"],
-            blob_gen_cmd=d_args["blob_gen_cmd"],
-            extra_include=d_args["extra_include"],
-            extra_ldflags=d_args["extra_ldflags"],
-            verbose=d_args.get("verbose", False),
-            is_python_module=d_args.get("is_python_module", True),
-            is_standalone=d_args.get("is_standalone", False),
-            torch_exclude=d_args.get("torch_exclude", False),
-            third_party=d_args.get("third_party", []),
-            hipify=d_args.get("hipify", False),
-            flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
-        )
-        # Mark this module as "already rebuilt in this process" so the
-        # @compile_ops wrapper in the parent (and any fork-mode child)
-        # doesn't trigger ANOTHER rebuild on the next opus call. Without
-        # this, the parent's next @compile_ops call would re-enter
-        # clear_build() -> destroy the .so we just made -> child workers
-        # racing import fail.
-        if "module_deepgemm_opus" not in _jit_core.rebuilded_list:
-            _jit_core.rebuilded_list.append("module_deepgemm_opus")
-    except Exception as exc:
-        _build_exc = exc
-        import traceback
+        compiled = _read_sidecar(sidecar)
+        missing = required - compiled
+        if not missing:
+            # Another writer beat us inside the critical section.
+            return False
 
         sys.stderr.write(
-            f"[opus _ensure_kids_compiled] synchronous build_module FAILED:\n"
-            f"  {type(_build_exc).__name__}: {_build_exc}\n"
+            f"[opus _ensure_kids_compiled] need to add {len(missing)} kids "
+            f"to sidecar (existing={len(compiled)}, target={len(compiled | required)})\n"
         )
-        traceback.print_exc()
-        # Scrub the half-baked .so / build dir so workers don't dlopen
-        # a stale subset .so and silently mis-dispatch kids. Better to
-        # surface a clean "module not found" than to silently run
-        # wrong kernels.
+
+        # Persist the expanded set.
+        new_set = sorted(compiled | required)
+        os.makedirs(os.path.dirname(sidecar), exist_ok=True)
+        with open(sidecar, "w") as f:
+            json.dump(new_set, f)
+        sys.stderr.write(
+            f"[opus _ensure_kids_compiled] wrote sidecar at {sidecar} with "
+            f"{len(new_set)} kids; triggering build...\n"
+        )
+
+        # Force a JIT rebuild scoped to JUST this build call.
+        _prev_rebuild = _jit_core.AITER_REBUILD
+        _prev_rebuild_env = os.environ.get("AITER_REBUILD")
+        _jit_core.AITER_REBUILD = 1
+        # Set env to "1" only for the synchronous build below; we reset
+        # to "0" once it succeeds so spawn-ed children don't redo it.
+        os.environ["AITER_REBUILD"] = "1"
+        _jit_core.get_module.cache_clear()
+        # __mds is name-mangled inside the module; access via private name.
+        _mds = getattr(_jit_core, "_core__mds", None) or getattr(
+            _jit_core, "__mds", None
+        )
+        if _mds is None:
+            _mds = _jit_core.__dict__.get("__mds")
+        if isinstance(_mds, dict):
+            _mds.clear()
+        # Reset rebuilded_list (used by compile_ops to track "we already
+        # rebuilt this once in this process"). Keep module_aiter_enum on
+        # the list because it's the bootstrap module and rebuilding it
+        # during a running tuner triggers a circular reload.
+        _jit_core.rebuilded_list = ["module_aiter_enum"]
+        # Reset the in-process torch JIT extension versioner so the second
+        # synchronous rebuild here (sidecar grew between shape N and N+1)
+        # does NOT trip torch's `bump_version_if_changed` path -- otherwise
+        # the .so would be written as `module_deepgemm_opus_v1.so` and
+        # `build_module()` would `FileNotFoundError` looking for the
+        # unsuffixed name. clear_build() already wiped the on-disk build
+        # dir but the versioner is module-level singleton state.
+        #
+        # IMPORTANT: aiter.jit.core imports cpp_extension as a bare
+        # top-level module (because aiter/jit/utils is on sys.path),
+        # which produces a SEPARATE module instance from the dotted
+        # path `aiter.jit.utils.cpp_extension`. The versioner singleton
+        # therefore exists twice. We must reset whichever one core.py
+        # actually uses, so reach into sys.modules for the bare name.
         try:
-            _so = os.path.join(_jit_core.get_user_jit_dir(), "module_deepgemm_opus.so")
-            if os.path.exists(_so):
-                os.remove(_so)
+            import sys as _sys
+
+            for _modname in ("cpp_extension", "aiter.jit.utils.cpp_extension"):
+                _mod = _sys.modules.get(_modname)
+                if _mod is None:
+                    continue
+                _jev = getattr(_mod, "JIT_EXTENSION_VERSIONER", None)
+                if _jev is None:
+                    continue
+                _entries = getattr(_jev, "entries", None)
+                if isinstance(_entries, dict):
+                    _entries.pop("module_deepgemm_opus", None)
         except Exception:
             pass
+
+        # Synchronously drive the rebuild in this (parent) process so
+        # that mp_tuner's spawn-ed children see a fully-baked .so on
+        # disk and a clean env -- they will dlopen() straight without
+        # tripping into another clear_build+rebuild themselves.
+        _build_exc = None
+        try:
+            d_args = _jit_core.get_args_of_build("module_deepgemm_opus")
+            _jit_core.build_module(
+                md_name="module_deepgemm_opus",
+                srcs=d_args["srcs"],
+                flags_extra_cc=d_args["flags_extra_cc"],
+                flags_extra_hip=d_args["flags_extra_hip"],
+                blob_gen_cmd=d_args["blob_gen_cmd"],
+                extra_include=d_args["extra_include"],
+                extra_ldflags=d_args["extra_ldflags"],
+                verbose=d_args.get("verbose", False),
+                is_python_module=d_args.get("is_python_module", True),
+                is_standalone=d_args.get("is_standalone", False),
+                torch_exclude=d_args.get("torch_exclude", False),
+                third_party=d_args.get("third_party", []),
+                hipify=d_args.get("hipify", False),
+                flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
+            )
+            if "module_deepgemm_opus" not in _jit_core.rebuilded_list:
+                _jit_core.rebuilded_list.append("module_deepgemm_opus")
+        except Exception as exc:
+            _build_exc = exc
+            import traceback
+
+            sys.stderr.write(
+                f"[opus _ensure_kids_compiled] synchronous build_module FAILED:\n"
+                f"  {type(_build_exc).__name__}: {_build_exc}\n"
+            )
+            traceback.print_exc()
+            # Scrub the half-baked .so so workers don't dlopen a stale
+            # subset .so and silently mis-dispatch kids.
+            try:
+                _so = os.path.join(
+                    _jit_core.get_user_jit_dir(), "module_deepgemm_opus.so"
+                )
+                if os.path.exists(_so):
+                    os.remove(_so)
+            except Exception:
+                pass
+        finally:
+            # Restore in-process flag for the parent (mp_tuner children
+            # spawn from os.environ, not from this in-process value).
+            _jit_core.AITER_REBUILD = _prev_rebuild
+            # For children: if build succeeded, force AITER_REBUILD=0
+            # in env so spawned workers go straight to dlopen(); if
+            # build failed, restore the original env so the next caller
+            # can retry.
+            if _build_exc is None:
+                os.environ["AITER_REBUILD"] = "0"
+            else:
+                if _prev_rebuild_env is None:
+                    os.environ.pop("AITER_REBUILD", None)
+                else:
+                    os.environ["AITER_REBUILD"] = _prev_rebuild_env
+
+        if _build_exc is not None:
+            raise RuntimeError(
+                "opus_gemm subset-compile rebuild failed; see hipcc / "
+                "codegen error in stderr above. The expanded sidecar "
+                "has already been written (rerun will pick up where "
+                "this left off)."
+            ) from _build_exc
+
+        return True
     finally:
-        # Always restore AITER_REBUILD so the next call into the JIT
-        # core (which may be from a different module's @compile_ops in
-        # the same process) doesn't get tricked into clear_build()ing
-        # a perfectly-good module.
-        _jit_core.AITER_REBUILD = _prev_rebuild
-
-    if _build_exc is not None:
-        # Hard-fail rather than silently letting workers retry: the
-        # gradlib mp_tuner spawns many short-lived processes that each
-        # try the same rebuild and fight over the FileBaton; letting
-        # them all crash piecemeal swamps stderr with confusing
-        # "no opus module" errors that hide the real hipcc / codegen
-        # error printed above. Raising here surfaces the actual cause
-        # exactly once.
-        raise RuntimeError(
-            "opus_gemm subset-compile rebuild failed; see hipcc / codegen "
-            "error in stderr above. The expanded sidecar has already "
-            "been written (rerun will pick up where this left off)."
-        ) from _build_exc
-
-    return True
+        baton.release()
 
 
 # Backwards-compat aliases for the old leading-underscore names.
