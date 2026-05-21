@@ -475,40 +475,42 @@ def _moe_gemm_a4w4_gfx1250(
 
     # prologue: fill NUM_BUFFERS-1 LDS slots via TDM
     for _ in gl.static_range(NUM_BUFFERS - 1):
+        idx_x = load_idx * PACKED_BLOCK_K_X
+        idx_w = load_idx * W_BLOCK_K
+        idx_x_scales = load_idx * MX_SCALE_BLOCK_K
+        idx_w_scales = load_idx * PACKED_MX_BLOCK
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
-                [offs_x_m, load_idx * PACKED_BLOCK_K_X],
+                [offs_x_m, idx_x],
                 x_buffer.index(load_idx % NUM_BUFFERS),
+            )
+            gl.amd.gfx1250.tdm.async_load(
+                x_scales_desc,
+                [offs_x_m, idx_x_scales],
+                x_scales_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
-                load_idx * PACKED_BLOCK_K_X,
+                idx_x,
                 x_buffer.index(load_idx % NUM_BUFFERS),
+            )
+            gl.amd.gfx1250.tdm.async_gather(
+                x_scales_desc,
+                offs_x_m,
+                idx_x_scales,
+                x_scales_buffer.index(load_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
-            [offs_w_n, load_idx * W_BLOCK_K],
+            [offs_w_n, idx_w],
             w_buffer.index(load_idx % NUM_BUFFERS),
         )
-        if GatherIndx is None:
-            gl.amd.gfx1250.tdm.async_load(
-                x_scales_desc,
-                [offs_x_m, load_idx * MX_SCALE_BLOCK_K],
-                x_scales_buffer.index(load_idx % NUM_BUFFERS),
-            )
-        else:
-            gl.amd.gfx1250.tdm.async_gather(
-                x_scales_desc,
-                offs_x_m,
-                load_idx * MX_SCALE_BLOCK_K,
-                x_scales_buffer.index(load_idx % NUM_BUFFERS),
-            )
         gl.amd.gfx1250.tdm.async_load(
             w_scales_desc,
-            [offs_w_n_scale, load_idx * PACKED_MX_BLOCK],
+            [offs_w_n_scale, idx_w_scales],
             w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
         load_idx += 1
@@ -542,40 +544,42 @@ def _moe_gemm_a4w4_gfx1250(
         )
 
         # fill next tile to LDS
+        idx_x = load_idx * PACKED_BLOCK_K_X
+        idx_w = load_idx * W_BLOCK_K
+        idx_x_scales = load_idx * MX_SCALE_BLOCK_K
+        idx_w_scales = load_idx * PACKED_MX_BLOCK
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
-                [offs_x_m, load_idx * PACKED_BLOCK_K_X],
+                [offs_x_m, idx_x],
                 x_buffer.index(load_idx % NUM_BUFFERS),
+            )
+            gl.amd.gfx1250.tdm.async_load(
+                x_scales_desc,
+                [offs_x_m, idx_x_scales],
+                x_scales_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
-                load_idx * PACKED_BLOCK_K_X,
+                idx_x,
                 x_buffer.index(load_idx % NUM_BUFFERS),
+            )
+            gl.amd.gfx1250.tdm.async_gather(
+                x_scales_desc,
+                offs_x_m,
+                idx_x_scales,
+                x_scales_buffer.index(load_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
-            [offs_w_n, load_idx * W_BLOCK_K],
+            [offs_w_n, idx_w],
             w_buffer.index(load_idx % NUM_BUFFERS),
         )
-        if GatherIndx is None:
-            gl.amd.gfx1250.tdm.async_load(
-                x_scales_desc,
-                [offs_x_m, load_idx * MX_SCALE_BLOCK_K],
-                x_scales_buffer.index(load_idx % NUM_BUFFERS),
-            )
-        else:
-            gl.amd.gfx1250.tdm.async_gather(
-                x_scales_desc,
-                offs_x_m,
-                load_idx * MX_SCALE_BLOCK_K,
-                x_scales_buffer.index(load_idx % NUM_BUFFERS),
-            )
         gl.amd.gfx1250.tdm.async_load(
             w_scales_desc,
-            [offs_w_n_scale, load_idx * PACKED_MX_BLOCK],
+            [offs_w_n_scale, idx_w_scales],
             w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
         load_idx += 1
