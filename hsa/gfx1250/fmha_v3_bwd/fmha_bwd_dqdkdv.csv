@@ -1,3 +1,3 @@
 dtype,hdim_q,hdim_v,mask,atomic32,pssk,pddv,mode,bf16_cvt,ts_qo,ts,knl_name,co_name
-bf16,128,128,0,1,1,1,0,3,32,128,_ZN5aiter28fmha_bwd_hd128_bf16_a32_psskE,bwd_hd128_bf16_a32_pssk.co
-bf16,128,128,2,1,1,1,0,3,32,128,_ZN5aiter38fmha_bwd_hd128_bf16_causal_br_a32_psskE,bwd_hd128_bf16_causal_br_a32_pssk.co
+bf16,128,128,0,1,0,0,0,3,32,128,_ZN5aiter28fmha_bwd_hd128_bf16_a32_psskE,bwd_hd128_bf16_a32_pssk.co
+bf16,128,128,2,1,0,0,0,3,32,128,_ZN5aiter38fmha_bwd_hd128_bf16_causal_br_a32_psskE,bwd_hd128_bf16_causal_br_a32_pssk.co
