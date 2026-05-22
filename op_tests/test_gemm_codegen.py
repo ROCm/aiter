@@ -634,36 +634,62 @@ def test_blockscale_kernel_name_forwarding():
                 f"recorded kwargs={record.get('kwargs')}",
             )
 
-        # 6.4 No tuned row for the shape → kernelName="" forwarded (default
-        # heuristic kicks in inside C++).  This guards the empty-name fallback
-        # path that's intentionally distinct from the wrong-name hard error.
+        # 6.4 No tuned row for the shape → shape-aware heuristic on gfx942,
+        # empty-string default on other architectures.
         csv_empty = _make_temp_csv(
             "gfx,cu_num,M,N,K,kernelId,libtype,splitK,us,kernelName,"
             "tflops,bw,errRatio\n"
         )
         csv_paths.append(csv_empty)
-        a8w8_mod._CKGEMM_CONFIG_CACHE = {}
-        a8w8_mod._CKGEMM_HAS_GFX = {}
-        get_CKGEMM_config.cache_clear()
-        with _override_blockscale_csv(csv_empty):
-            record.clear()
-            a8w8_mod.gemm_a8w8_blockscale(
-                XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
-            )
-            # With no row matched, the dispatcher hits the "no config" fallback,
-            # which calls gemm_a8w8_blockscale_ck without kernelName= — Python's
-            # default kwarg ("") then propagates to C++.
-            _check(
-                "no tuned row: still routed to gemm_a8w8_blockscale_ck (default path)",
-                record.get("libtype") == "ck",
-                f"recorded libtype={record.get('libtype')}",
-            )
-            _check(
-                "no tuned row: kernelName not explicitly set "
-                "(C++ sees default empty string)",
-                "kernelName" not in record.get("kwargs", {}),
-                f"recorded kwargs={record.get('kwargs')}",
-            )
+
+        saved_get_gfx = a8w8_mod.get_gfx
+
+        try:
+            # 6.4a gfx942: heuristic selects a specific kernelName.
+            a8w8_mod.get_gfx = lambda: "gfx942"
+            a8w8_mod._CKGEMM_CONFIG_CACHE = {}
+            a8w8_mod._CKGEMM_HAS_GFX = {}
+            get_CKGEMM_config.cache_clear()
+            with _override_blockscale_csv(csv_empty):
+                record.clear()
+                a8w8_mod.gemm_a8w8_blockscale(
+                    XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+                )
+                _check(
+                    "no tuned row (gfx942): routed to gemm_a8w8_blockscale_ck",
+                    record.get("libtype") == "ck",
+                    f"recorded libtype={record.get('libtype')}",
+                )
+                _check(
+                    "no tuned row (gfx942): heuristic kernelName explicitly set",
+                    "kernelName" in record.get("kwargs", {})
+                    and record["kwargs"]["kernelName"] != "",
+                    f"recorded kwargs={record.get('kwargs')}",
+                )
+
+            # 6.4b non-gfx942: no kernelName kwarg — C++ sees its own default.
+            a8w8_mod.get_gfx = lambda: "gfx950"
+            a8w8_mod._CKGEMM_CONFIG_CACHE = {}
+            a8w8_mod._CKGEMM_HAS_GFX = {}
+            get_CKGEMM_config.cache_clear()
+            with _override_blockscale_csv(csv_empty):
+                record.clear()
+                a8w8_mod.gemm_a8w8_blockscale(
+                    XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+                )
+                _check(
+                    "no tuned row (non-gfx942): routed to gemm_a8w8_blockscale_ck",
+                    record.get("libtype") == "ck",
+                    f"recorded libtype={record.get('libtype')}",
+                )
+                _check(
+                    "no tuned row (non-gfx942): kernelName not explicitly set "
+                    "(C++ sees default empty string)",
+                    "kernelName" not in record.get("kwargs", {}),
+                    f"recorded kwargs={record.get('kwargs')}",
+                )
+        finally:
+            a8w8_mod.get_gfx = saved_get_gfx
 
     finally:
         a8w8_mod.gemm_a8w8_blockscale_ck = saved["ck"]
