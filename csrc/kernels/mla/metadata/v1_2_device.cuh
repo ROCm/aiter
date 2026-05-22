@@ -165,9 +165,12 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
 
                 auto fill_work_info = [&](const int32_t split_idx) {
                     const int32_t global_qo_tile_idx = tot_qo_tiles;
+                    const int32_t curr_batch_kv =
+                        Traits::kIsSparse ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
+                                          : (curr_batch / params.qk_batch_ratio);
 
                     MlaWorkInfo work_info{};
-                    work_info.batch_idx = curr_batch;
+                    work_info.batch_idx = curr_batch_kv;
                     work_info.qo_start =
                         qo_state.get_begin(curr_batch) + curr_qo_tile_idx * qo_tile_size;
                     work_info.qo_end =
@@ -212,7 +215,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                             (curr_kv_end - work_info.kv_end == 0)
                                 ? 0
                                 : ((curr_kv_end - work_info.kv_end - 1) * page_size +
-                                   params.p_kv_last_page_lens[curr_batch]);
+                                   params.p_kv_last_page_lens[curr_batch_kv]);
                     }
                     // split related info
                     if(curr_n_split_idx > 0)
@@ -312,8 +315,12 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                         remain_payload - params.fixed_over_head_num_blocks;
 
                     auto fill_work_info = [&]() {
+                        const int32_t curr_batch_kv =
+                            Traits::kIsSparse
+                                ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
+                                : (curr_batch / params.qk_batch_ratio);
                         MlaWorkInfo work_info{};
-                        work_info.batch_idx = curr_batch;
+                        work_info.batch_idx = curr_batch_kv;
                         work_info.qo_start =
                             qo_state.get_begin(curr_batch) + curr_qo_tile_idx * qo_tile_size;
                         work_info.qo_end = opus::min(work_info.qo_start + qo_tile_size,
@@ -359,7 +366,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                                 (curr_kv_end - work_info.kv_end == 0)
                                     ? 0
                                     : ((curr_kv_end - work_info.kv_end - 1) * page_size +
-                                       params.p_kv_last_page_lens[curr_batch]);
+                                       params.p_kv_last_page_lens[curr_batch_kv]);
                         }
                         work_info.partial_qo_loc = partial_idx;
                         if(!cur_tail_done)
