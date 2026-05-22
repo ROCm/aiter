@@ -167,7 +167,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                     const int32_t global_qo_tile_idx = tot_qo_tiles;
                     const int32_t curr_batch_kv =
                         Traits::kIsSparse ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
-                                          : (curr_batch / params.qk_batch_ratio);
+                                          : curr_batch;
 
                     MlaWorkInfo work_info{};
                     work_info.batch_idx = curr_batch_kv;
@@ -318,7 +318,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                         const int32_t curr_batch_kv =
                             Traits::kIsSparse
                                 ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
-                                : (curr_batch / params.qk_batch_ratio);
+                                : curr_batch;
                         MlaWorkInfo work_info{};
                         work_info.batch_idx = curr_batch_kv;
                         work_info.qo_start =
