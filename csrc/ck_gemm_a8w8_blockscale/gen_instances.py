@@ -28,6 +28,7 @@ from gemm_a8w8_blockscale_instance import (  # noqa: E402
     KernelInstance,
     candidate_kernels_dict,
     candidate_kernels_by_name,
+    heuristic_kernels_dict,
 )
 
 """
@@ -406,8 +407,11 @@ torch::Tensor
             # generate code for default kernels
             self.gen_code(candidate_kernels_dict)
         else:
-            # generate code for tuned kernels from tune_file
-            self.gen_code(self.get_tune_dict(self.tune_file))
+            # generate code for tuned kernels from tune_file, always including
+            # heuristic kernels so they are in the name-keyed lookup table
+            # regardless of which tuned CSVs are installed.
+            tune_dict = self.get_tune_dict(self.tune_file)
+            self.gen_code({**tune_dict, **heuristic_kernels_dict})
 
 
 if __name__ == "__main__":

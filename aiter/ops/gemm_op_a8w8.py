@@ -716,8 +716,55 @@ def gemm_a8w8_blockscale(
                 )
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
+        # No tuned row: select kernel by shape.
+        # K=128: KPerBLOCK=128 v1 kernels avoid KPadding vs the KPerBLOCK=256 defaults.
+        # K<384 (not 128): v3 pipeline requires K≥384; substitute v1 kernel.
+        _mn = m * n
+        if k == 128:
+            # v3 pipeline unsupported at K=128; use v1 throughout this branch.
+            if _mn <= 307200:
+                _heuristic_kernel = (          # 16×64, v1
+                    "a8w8_blockscale_1x128x128_256x16x64x128_8x16_16x16_1x1"
+                    "_16x16x1_8x32x1_1x16x1x16_4_1x1_intrawave_v1"
+                )
+            elif _mn <= 2000000:
+                _heuristic_kernel = (          # 32×64, v1
+                    "a8w8_blockscale_1x128x128_256x32x64x128_16x16_16x16_2x1"
+                    "_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1"
+                )
+            else:
+                _heuristic_kernel = (          # 64×64, v1
+                    "a8w8_blockscale_1x128x128_256x64x64x128_16x16_32x32_1x1"
+                    "_8x32x1_8x32x1_1x32x1x8_8_1x1_intrawave_v1"
+                )
+        elif _mn <= 307200:
+            _heuristic_kernel = (              # 16×64, v1
+                "a8w8_blockscale_1x128x128_256x16x64x256_16x16_16x16_1x1"
+                "_16x16x1_16x16x1_1x16x1x16_4_1x1_intrawave_v1"
+            )
+        elif _mn <= 1050000:
+            _heuristic_kernel = (              # 64×64, v1
+                "a8w8_blockscale_1x128x128_256x64x64x256_16x16_32x32_1x1"
+                "_16x16x1_16x16x1_1x32x1x8_8_1x1_intrawave_v1"
+            )
+        elif k < 384:
+            _heuristic_kernel = (              # 64×64, v1 — v3 unsupported below K=384
+                "a8w8_blockscale_1x128x128_256x64x64x256_16x16_32x32_1x1"
+                "_16x16x1_16x16x1_1x32x1x8_8_1x1_intrawave_v1"
+            )
+        elif _mn <= 2500000:
+            _heuristic_kernel = (              # 64×128, v3
+                "a8w8_blockscale_1x128x128_256x64x128x128_16x16_32x32_1x2"
+                "_8x32x1_8x32x1_1x32x1x8_8_1x1_intrawave_v3"
+            )
+        else:
+            _heuristic_kernel = (              # 128×128, v3
+                "a8w8_blockscale_1x128x128_256x128x128x128_16x16_32x32_2x2"
+                "_8x32x1_8x32x1_1x32x1x8_8_1x1_intrawave_v3"
+            )
         try:
-            return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y,
+                                           kernelName=_heuristic_kernel)
         except RuntimeError as e:
             raise RuntimeError(
                 f"gemm_a8w8_blockscale failed for shape M={m}, N={n}, K={k}, "
