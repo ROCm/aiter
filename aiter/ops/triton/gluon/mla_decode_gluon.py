@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # Gluon MLA decode kernel originated from FlashMLA triton kernel(https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
-# Stage-1 split-KV MLA attention using explicit Gluon layouts. Two regimes:
+# Stage-1 split-KV MLA attention using explicit Gluon layouts. Three regimes:
 #
 #   REGIME='bh64'      - bf16 Q + bf16 KV, BLOCK_H=64, BLOCK_N=64,
 #                        nhead in {64, 128}, batch_size in {64, 128, 256},
@@ -10,8 +10,16 @@
 #                        Fast path: when NUM_KV_SPLITS==1, stage-1 writes the
 #                        final output directly to O and stage-2 reduce is skipped.
 #   REGIME='bh16bn128' - bf16 Q + fp8 KV, BLOCK_H=16, BLOCK_N=128,
-#                        nhead in {4, 8, 16}, batch_size=1, NUM_KV_SPLITS=256.
-#                        Always splits + always reduces.
+#                        nhead <= 16, batch_size=1, NUM_KV_SPLITS=256.
+#                        Always splits + always reduces. NHEAD < BLOCK_H masks
+#                        OOB heads on Q load and O store.
+#   REGIME='bh16bn64'  - bf16 Q + bf16 KV, BLOCK_H=16, BLOCK_N=64,
+#                        nhead <= 16, batch_size=1, NUM_KV_SPLITS=256.
+#                        Always splits + always reduces. NHEAD < BLOCK_H masks
+#                        OOB heads on Q load and O store.
+#
+# Wrapper dispatch: nhead in {64,128} -> bh64; nhead <= 16 routes by KV dtype
+# (bf16 -> bh16bn64, fp8 -> bh16bn128).
 #
 # For NUM_KV_SPLITS>1 each program writes per-split (acc, lse) to a temp buffer
 # and stage-2 (_mla_softmax_reducev_kernel) combines them.
@@ -95,8 +103,10 @@ def _mla_decode_gluon(
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
 
     ######### layout setting begin #########
-    if REGIME == 'bh64':
-        # layout for Q : 64x512xbf16
+    # Q-side layouts + mfma_layout: switch by BLOCK_H.
+    # bh64 has BLOCK_H=64; bh16bn128 and bh16bn64 share BLOCK_H=16 (identical Q layouts + mfma orientation).
+    if BLOCK_H == 64:
+        # bh64: Q is [64, 512] / [64, 64]; warps tile M.
         blocked_q_nope: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 8],
             threads_per_warp=[1, 64],
@@ -109,7 +119,6 @@ def _mla_decode_gluon(
             cga_layout=[],
             shape=[64, 512]
         )
-        # 64x64
         blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
             reg_bases=((0, 1), (0, 2), (0, 4), (32, 0)),
             lane_bases=((0, 8), (0, 16), (0, 32), (4, 0), (8, 0), (16, 0)),
@@ -123,7 +132,88 @@ def _mla_decode_gluon(
             cga_layout=[],
             shape=[64, 64]
         )
-        # layout for KV : 512x64xbf16
+        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[4, 1],
+        )
+    else:
+        # BLOCK_H == 16: shared by bh16bn128 and bh16bn64. Q is [16, 512] / [16, 64]; warps tile K.
+        blocked_q_nope: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8],
+            threads_per_warp=[1, 64],
+            warps_per_cta=[4, 1],
+            order=[1, 0],
+        )
+        shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[512, 16]],
+            offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1, 0], [2, 0], [4, 0], [8, 0]],
+            cga_layout=[],
+            shape=[16, 512]
+        )
+        blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0, 1), (0, 2), (0, 4)),
+            lane_bases=((0, 8), (0, 16), (0, 32), (1, 0), (2, 0), (4, 0)),
+            warp_bases=((8, 0), (0, 0)),
+            block_bases=[],
+            shape=[16, 64],
+        )
+        shared_q_pe: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[1, 0])
+        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=4,
+            instr_shape=[16, 16, 32],
+            transposed=True,
+            warps_per_cta=[1, 4],
+        )
+
+    # KV-side layouts: switch by BLOCK_N.
+    # bh16bn128 (BLOCK_N=128, fp8 KV) needs distinct K layouts; bh64 and bh16bn64 share BLOCK_N=64 bf16 KV.
+    if BLOCK_N == 128:
+        # bh16bn128: K is [512, 128]fp8, KPE is [64, 128]fp8.
+        blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 4), (0, 32), (0, 64)),
+            lane_bases=((16, 0), (32, 0), (64, 0), (128, 0), (256, 0), (0, 16)),
+            warp_bases=((0, 1), (0, 2)),
+            block_bases=[],
+            shape=[512, 128],
+        )
+        shared_kv: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[1024, 32], [8192, 16]],
+            offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 16], [0, 1], [0, 2], [0, 8], [0, 4], [0, 32], [0, 64]],
+            cga_layout=[],
+            shape=[512, 128]
+        )
+        blocked_kpe: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 2)),
+            lane_bases=((16, 0), (32, 0), (0, 4), (0, 8), (0, 16), (0, 32)),
+            warp_bases=((0, 64), (0, 1)),
+            block_bases=[],
+            shape=[64, 128],
+        )
+        shared_kpe: gl.constexpr = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[2048, 16]],
+            offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 1], [0, 2]],
+            cga_layout=[],
+            shape=[64, 128]
+        )
+        blocked_page: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0,),),
+            lane_bases=((1,), (2,), (4,), (8,), (16,), (32,)),
+            warp_bases=((64,), (0,)),
+            block_bases=[],
+            shape=[128],
+        )
+        blocked_kv_slice: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 4), (0, 32)),
+            lane_bases=((16, 0), (32, 0), (64, 0), (128, 0), (256, 0), (0, 16)),
+            warp_bases=((0, 1), (0, 2)),
+            block_bases=[],
+            shape=[512, 64],
+        )
+    else:
+        # BLOCK_N == 64: shared by bh64 and bh16bn64 (both bf16 KV).
+        # K is [512, 64]bf16, KPE is [64, 64]bf16.
         blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
             reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16), (0, 32)),
             lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
@@ -137,7 +227,6 @@ def _mla_decode_gluon(
             cga_layout=[],
             shape=[512, 64]
         )
-        # 64x64
         blocked_kpe: gl.constexpr = gl.DistributedLinearLayout(
             reg_bases=((1, 0), (2, 0), (4, 0), (0, 32)),
             lane_bases=((8, 0), (16, 0), (32, 0), (0, 4), (0, 8), (0, 16)),
@@ -150,19 +239,6 @@ def _mla_decode_gluon(
             offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2], [0, 32]],
             cga_layout=[],
             shape=[64, 64]
-        )
-        linear_v: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
-            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
-            warp_bases=((0, 0), (0, 0)),
-            block_bases=[],
-            shape=[512, 64],
-        )
-        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4,
-            instr_shape=[16, 16, 32],
-            transposed=True,
-            warps_per_cta=[4, 1],
         )
         blocked_page: gl.constexpr = gl.DistributedLinearLayout(
             reg_bases=((0,),),
@@ -178,57 +254,18 @@ def _mla_decode_gluon(
             block_bases=[],
             shape=[512, 32],
         )
-    else:
-        # layout for Q : 16x512xbf16
-        blocked_q_nope: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[1, 8],
-            threads_per_warp=[1, 64],
-            warps_per_cta=[4, 1],
-            order=[1, 0],
-        )
-        shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[512, 16]],
-            offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1, 0], [2, 0], [4, 0], [8, 0]],
-            cga_layout=[],
-            shape=[16, 512]
-        )
-        # 16x64xbf16
-        blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((0, 1), (0, 2), (0, 4)),
-            lane_bases=((0, 8), (0, 16), (0, 32), (1, 0), (2, 0), (4, 0)),
-            warp_bases=((8, 0), (0, 0)),
+
+    # linear_v: each regime has unique warp/reg mapping (bh64 has degenerate warp_bases,
+    # bh16bn128 has an extra K reg base for the 128-wide K, bh16bn64 has the bh16 warp layout at 64-wide K).
+    if REGIME == 'bh64':
+        linear_v: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
+            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
+            warp_bases=((0, 0), (0, 0)),
             block_bases=[],
-            shape=[16, 64],
+            shape=[512, 64],
         )
-        shared_q_pe: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[1, 0])
-        # layout for KV : 512x128xfp8
-        blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 4), (0, 32), (0, 64)),
-            lane_bases=((16, 0), (32, 0), (64, 0), (128, 0), (256, 0), (0, 16)),
-            warp_bases=((0, 1), (0, 2)),
-            block_bases=[],
-            shape=[512, 128],
-        )
-        shared_kv: gl.constexpr = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[1024, 32], [8192, 16]],
-            offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 16], [0, 1], [0, 2], [0, 8], [0, 4], [0, 32], [0, 64]],
-            cga_layout=[],
-            shape=[512, 128]
-        )
-        # 64x128xfp8
-        blocked_kpe: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 2)),
-            lane_bases=((16, 0), (32, 0), (0, 4), (0, 8), (0, 16), (0, 32)),
-            warp_bases=((0, 64), (0, 1)),
-            block_bases=[],
-            shape=[64, 128],
-        )
-        shared_kpe: gl.constexpr = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[2048, 16]],
-            offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 1], [0, 2]],
-            cga_layout=[],
-            shape=[64, 128]
-        )
+    elif REGIME == 'bh16bn128':
         linear_v: gl.constexpr = gl.DistributedLinearLayout(
             reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (0, 64), (64, 0), (128, 0), (256, 0)),
             lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
@@ -236,23 +273,11 @@ def _mla_decode_gluon(
             block_bases=[],
             shape=[512, 128],
         )
-        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4,
-            instr_shape=[16, 16, 32],
-            transposed=True,
-            warps_per_cta=[1, 4],
-        )
-        blocked_page: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((0,),),
-            lane_bases=((1,), (2,), (4,), (8,), (16,), (32,)),
-            warp_bases=((64,), (0,)),
-            block_bases=[],
-            shape=[128],
-        )
-        blocked_kv_slice: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 4), (0, 32)),
-            lane_bases=((16, 0), (32, 0), (64, 0), (128, 0), (256, 0), (0, 16)),
-            warp_bases=((0, 1), (0, 2)),
+    else:
+        linear_v: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (64, 0), (128, 0), (256, 0)),
+            lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
+            warp_bases=((16, 0), (32, 0)),
             block_bases=[],
             shape=[512, 64],
         )
@@ -656,14 +681,17 @@ def mla_decode_gluon(
         head_dim_kpe == 64
     ), f"mla_decode_gluon requires head_dim_kpe=64, got {head_dim_kpe}"
 
-    # Pick regime by nhead.
+    # Pick regime by (nhead, kv dtype).
     if nhead in (64, 128):
         REGIME = "bh64"
-    elif nhead in (4, 8, 16):
-        REGIME = "bh16bn128"
+    elif 1 <= nhead <= 16:
+        if kv_c.dtype == torch.bfloat16:
+            REGIME = "bh16bn64"
+        else:
+            REGIME = "bh16bn128"
     else:
         raise AssertionError(
-            f"mla_decode_gluon requires nhead in (4,8,16) [bh16bn128] or (64,128) [bh64], got {nhead}"
+            f"mla_decode_gluon requires nhead <= 16 [bh16bn128/bh16bn64] or nhead in (64,128) [bh64], got {nhead}"
         )
 
     PAGE_SIZE = 1
@@ -702,7 +730,7 @@ def mla_decode_gluon(
         assert q_pe.dtype == torch.bfloat16, f"q_pe must be bf16, got {q_pe.dtype}"
         assert kv_c.dtype == torch.bfloat16, f"kv_c must be bf16, got {kv_c.dtype}"
         assert k_pe.dtype == torch.bfloat16, f"k_pe must be bf16, got {k_pe.dtype}"
-    else:
+    elif REGIME == "bh16bn128":
         BLOCK_H = 16
         BLOCK_N = 128
         NUM_XCDS = 1  # unused by bh16bn128 grid mapping
@@ -715,6 +743,25 @@ def mla_decode_gluon(
         assert (
             min_seq_len_wg >= BLOCK_N * 3
         ), f"mla_decode_gluon[bh16bn128] requires min_seq_len_wg >= BLOCK_N * 3, got min_seq_len_wg={min_seq_len_wg}"
+    else:  # bh16bn64
+        BLOCK_H = 16
+        BLOCK_N = 64
+        NUM_XCDS = 1  # unused by bh16bn64 grid mapping
+        NUM_CU = 256
+        NUM_KV_SPLITS = NUM_CU
+        assert (
+            batch_size == 1
+        ), f"mla_decode_gluon[bh16bn64] requires batch_size=1, got {batch_size}"
+        min_seq_len_wg = min_kv_seq_len // NUM_KV_SPLITS
+        assert (
+            min_seq_len_wg >= BLOCK_N * 3
+        ), f"mla_decode_gluon[bh16bn64] requires min_seq_len_wg >= BLOCK_N * 3, got min_seq_len_wg={min_seq_len_wg}"
+        assert (
+            q_nope.dtype == torch.bfloat16
+        ), f"q_nope must be bf16, got {q_nope.dtype}"
+        assert q_pe.dtype == torch.bfloat16, f"q_pe must be bf16, got {q_pe.dtype}"
+        assert kv_c.dtype == torch.bfloat16, f"kv_c must be bf16, got {kv_c.dtype}"
+        assert k_pe.dtype == torch.bfloat16, f"k_pe must be bf16, got {k_pe.dtype}"
 
     # buffer_load uses scalar base + 32-bit offsets, limiting addressable range.
     # For KV caches > 2 GB the kernel falls back to global_load (64-bit pointers).
