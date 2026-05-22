@@ -29,6 +29,7 @@ from flydsl.expr import arith, gpu, buffer_ops, vector, rocdl
 from flydsl._mlir.dialects import llvm, scf, memref
 from flydsl._mlir.dialects.arith import CmpIPredicate
 
+from .kernels_common import per_cu_lds_bytes
 from .mfma_preshuffle_pipeline import (
     _buffer_load_vec,
     buffer_copy_gmem16_dwordx4,
@@ -277,7 +278,7 @@ def compile_mixed_moe_gemm1(
     #     waves_per_eu = 1
 
     if waves_per_eu is not None and waves_per_eu >= 1:
-        _total_cu_lds = 160 * 1024
+        _total_cu_lds = per_cu_lds_bytes()
         _min_lds = _total_cu_lds // (waves_per_eu + 1) + 1
         _pong_sz = allocator_pong._align(allocator_pong.ptr, 128)
         _ping_sz = allocator_ping._align(allocator_ping.ptr, 128)

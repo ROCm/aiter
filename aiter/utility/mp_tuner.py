@@ -51,9 +51,21 @@ def worker(
             print(f"Warning: try run {max_retries} times, but still get 0!")
         torch.cuda.synchronize()
         if ref is not None:
+            if res is None:
+                if printLog:
+                    print(
+                        f"skip result check: info:{info} returned no output "
+                        f"(likely unsupported candidate)"
+                    )
+                max_err_ratio = 1.0
+                return info, us, round(max_err_ratio, 4)
             if isinstance(ref, torch.Tensor):
                 ref = [ref]
             if isinstance(res, torch.Tensor):
+                res = [res]
+            elif isinstance(res, tuple):
+                res = list(res)
+            elif not isinstance(res, list):
                 res = [res]
             ref = [
                 (
@@ -65,6 +77,22 @@ def worker(
             ]
             for i in range(len(ref)):
                 if isinstance(ref[i], torch.Tensor):
+                    if i >= len(res) or res[i] is None:
+                        if printLog:
+                            print(
+                                f"skip result check: info:{info} missing output "
+                                f"res[{i}]"
+                            )
+                        max_err_ratio = 1.0
+                        continue
+                    if not isinstance(res[i], torch.Tensor):
+                        if printLog:
+                            print(
+                                f"skip result check: info:{info} res[{i}] is "
+                                f"{type(res[i]).__name__}, expected Tensor"
+                            )
+                        max_err_ratio = 1.0
+                        continue
                     if res[i].shape != ref[i].shape:
                         res[i] = res[i].view(-1)[: ref[i].numel()].view(ref[i].shape)
                     if ref[i].dtype.itemsize == 1:
