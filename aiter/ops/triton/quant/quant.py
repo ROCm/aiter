@@ -6,6 +6,8 @@ import torch
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_tensor_quant_fp8_i8_kernel,
+    _per_tensor_amax_kernel,
+    _quant_from_per_tensor_amax_kernel,
     _dynamic_per_token_quant_fp8_i8_kernel,
     _dynamic_mxfp4_quant_kernel,
     _mxfp4_quant_op,
@@ -15,6 +17,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 __all__ = [
     "static_per_tensor_quant_fp8_i8",
     "dynamic_per_tensor_quant_fp8_i8",
+    "dynamic_per_tensor_quant_fp8_i8_nozero",
     "dynamic_per_token_quant_fp8_i8",
     "dynamic_mxfp4_quant",
     "_mxfp4_quant_op",
@@ -88,6 +91,51 @@ def dynamic_per_tensor_quant_fp8_i8(
         qx, x_in, scale_out, cols, x_in.stride(0), NUM_COL_POW2=NUM_COL_POW2
     )
 
+    return qx, scale_out
+
+
+def dynamic_per_tensor_quant_fp8_i8_nozero(
+    qx: torch.Tensor,
+    x_in: torch.Tensor,
+    scale_out: torch.Tensor,
+    amax: torch.Tensor,
+    block_size: int = 2048,
+):
+    """
+    Dynamic per-tensor quantization that does not require pre-zeroing scale_out.
+
+    The first kernel writes per-block amax values into `amax`; the second kernel
+    reduces those values, stores the final scale, and quantizes the input.
+    """
+    _LOGGER.info(f"DYNAMIC_PER_TENSOR_QUANT_FP8_I8_NOZERO: x={tuple(x_in.shape)}")
+    assert scale_out.numel() == 1
+    qx_flat = qx.reshape(-1)
+    x_flat = x_in.reshape(-1)
+    n_elements = x_flat.numel()
+    n_blocks = triton.cdiv(n_elements, block_size)
+    assert amax.numel() >= n_blocks
+    amax_block_size = triton.next_power_of_2(n_blocks)
+    _per_tensor_amax_kernel[(n_blocks,)](
+        x_flat,
+        amax,
+        n_elements,
+        BLOCK_SIZE=block_size,
+    )
+    _quant_from_per_tensor_amax_kernel[(n_blocks,)](
+        qx_flat,
+        x_flat,
+        amax,
+        scale_out,
+        n_elements,
+        n_blocks,
+        DTYPE_MAX=(
+            torch.finfo(qx.dtype).max
+            if torch.is_floating_point(qx)
+            else torch.iinfo(qx.dtype).max
+        ),
+        BLOCK_SIZE=block_size,
+        AMAX_BLOCK_SIZE=amax_block_size,
+    )
     return qx, scale_out
 
 

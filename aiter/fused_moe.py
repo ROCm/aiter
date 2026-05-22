@@ -393,7 +393,24 @@ def fused_moe_(
     block_size_M1 = int(block_size_M1)
     block_size_M2 = int(block_size_M2)
 
-    if metadata.run_1stage or block_size_M1 == block_size_M2:
+    stage1_params, stage2_params = _flydsl_2stage_params(metadata)
+    direct_2stage = (
+        not metadata.run_1stage
+        and _is_direct_params(stage1_params)
+        and _is_direct_params(stage2_params)
+    )
+
+    if direct_2stage:
+        device = topk_ids.device
+        sorted_ids1 = topk_ids
+        sorted_weights1 = None
+        sorted_expert_ids1, num_valid_ids1 = _direct_dummy_sort_tensors(device)
+        moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
+        sorted_ids2 = sorted_ids1
+        sorted_weights2 = sorted_weights1
+        sorted_expert_ids2 = sorted_expert_ids1
+        num_valid_ids2 = num_valid_ids1
+    elif metadata.run_1stage or block_size_M1 == block_size_M2:
         sorted_ids1, sorted_weights1, sorted_expert_ids1, num_valid_ids1, moe_buf = (
             moe_sorting(
                 topk_ids,
@@ -510,6 +527,8 @@ def fused_moe_(
             bias1=bias1,
             bias2=bias2,
             fc1_smooth_scale=fc1_smooth_scale,
+            topk_ids=topk_ids,
+            topk_weight=topk_weight,
         )
 
 
@@ -770,6 +789,131 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 
 cfg_2stages = None
+_DIRECT_STAGE1_QUANT_A1 = None
+_DIRECT_STAGE1_QUANT_SCALE = None
+_DIRECT_STAGE1_QUANT_AMAX = None
+_DIRECT_STAGE2_QUANT_A2 = None
+_DIRECT_STAGE2_QUANT_SCALE = None
+_DIRECT_STAGE2_QUANT_AMAX = None
+_DIRECT_DUMMY_SORTED_EXPERT_IDS = None
+_DIRECT_DUMMY_NUM_VALID_IDS = None
+_DIRECT_STAGE1_OUT_A2 = None
+
+
+def _cached_empty(buf, shape, dtype, device):
+    if buf is None or buf.shape != shape or buf.dtype != dtype or buf.device != device:
+        return torch.empty(shape, dtype=dtype, device=device)
+    return buf
+
+
+def _flydsl_params_from_stage(stage, wrapper):
+    if getattr(stage, "func", None) is not wrapper:
+        return None
+    kernel_name = getattr(stage, "keywords", {}).get("kernelName", "")
+    return aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
+
+
+def _flydsl_2stage_params(metadata):
+    return (
+        _flydsl_params_from_stage(metadata.stage1, _flydsl_stage1_wrapper),
+        _flydsl_params_from_stage(metadata.stage2, _flydsl_stage2_wrapper),
+    )
+
+
+def _is_direct_params(params):
+    return params is not None and params.get("direct", False)
+
+
+def _direct_per_tensor_quant_cached(
+    x,
+    scale,
+    quant_dtype,
+    qbuf,
+    sbuf,
+    amax,
+    *,
+    flatten_last_dim=False,
+):
+    if quant_dtype not in [dtypes.fp8, dtypes.i8]:
+        raise ValueError(f"unsupported direct quant dtype: {quant_dtype=}")
+
+    qbuf = _cached_empty(qbuf, x.shape, quant_dtype, x.device)
+    quant_input = x.view(-1, x.shape[-1]) if flatten_last_dim else x
+    if scale is not None:
+        from aiter.ops.triton.quant import static_per_tensor_quant_fp8_i8
+
+        static_per_tensor_quant_fp8_i8(qbuf, quant_input, scale)
+        return qbuf, sbuf, amax, scale.view(1)
+
+    sbuf = _cached_empty(sbuf, (1,), dtypes.fp32, x.device)
+    n_blocks = (quant_input.numel() + 1023) // 1024
+    if (
+        amax is None
+        or amax.numel() < n_blocks
+        or amax.dtype != dtypes.fp32
+        or amax.device != x.device
+    ):
+        amax = torch.empty(n_blocks, dtype=dtypes.fp32, device=x.device)
+    from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8_nozero
+
+    dynamic_per_tensor_quant_fp8_i8_nozero(qbuf, quant_input, sbuf, amax)
+    return qbuf, sbuf, amax, sbuf.view(1)
+
+
+def _direct_dummy_sort_tensors(device):
+    global _DIRECT_DUMMY_SORTED_EXPERT_IDS, _DIRECT_DUMMY_NUM_VALID_IDS
+    empty_ids = _DIRECT_DUMMY_SORTED_EXPERT_IDS
+    if empty_ids is None or empty_ids.device != device:
+        empty_ids = torch.empty(0, dtype=dtypes.i32, device=device)
+        _DIRECT_DUMMY_SORTED_EXPERT_IDS = empty_ids
+    num_valid = _DIRECT_DUMMY_NUM_VALID_IDS
+    if num_valid is None or num_valid.device != device:
+        num_valid = torch.empty(2, dtype=dtypes.i32, device=device)
+        _DIRECT_DUMMY_NUM_VALID_IDS = num_valid
+    return empty_ids, num_valid
+
+
+def _direct_stage1_out_buffer(token_num, topk, inter_dim, dtype, device):
+    global _DIRECT_STAGE1_OUT_A2
+    _DIRECT_STAGE1_OUT_A2 = _cached_empty(
+        _DIRECT_STAGE1_OUT_A2, (token_num, topk, inter_dim), dtype, device
+    )
+    return _DIRECT_STAGE1_OUT_A2
+
+
+def _direct_stage1_per_tensor_quant(hidden_states, scale, quant_dtype):
+    """Quantize direct stage1 input into a cached activation buffer."""
+    global _DIRECT_STAGE1_QUANT_A1, _DIRECT_STAGE1_QUANT_SCALE, _DIRECT_STAGE1_QUANT_AMAX
+    _DIRECT_STAGE1_QUANT_A1, _DIRECT_STAGE1_QUANT_SCALE, _DIRECT_STAGE1_QUANT_AMAX, out_scale = (
+        _direct_per_tensor_quant_cached(
+            hidden_states,
+            scale,
+            quant_dtype,
+            _DIRECT_STAGE1_QUANT_A1,
+            _DIRECT_STAGE1_QUANT_SCALE,
+            _DIRECT_STAGE1_QUANT_AMAX,
+        )
+    )
+    return _DIRECT_STAGE1_QUANT_A1, out_scale
+
+
+def _direct_stage2_per_tensor_quant(a2, scale, quant_dtype):
+    """Quantize direct stage1 output into a cached stage2 activation buffer."""
+    global _DIRECT_STAGE2_QUANT_A2, _DIRECT_STAGE2_QUANT_SCALE, _DIRECT_STAGE2_QUANT_AMAX
+    _DIRECT_STAGE2_QUANT_A2, _DIRECT_STAGE2_QUANT_SCALE, _DIRECT_STAGE2_QUANT_AMAX, out_scale = (
+        _direct_per_tensor_quant_cached(
+            a2,
+            scale,
+            quant_dtype,
+            _DIRECT_STAGE2_QUANT_A2,
+            _DIRECT_STAGE2_QUANT_SCALE,
+            _DIRECT_STAGE2_QUANT_AMAX,
+            flatten_last_dim=True,
+        )
+    )
+    return _DIRECT_STAGE2_QUANT_A2, out_scale
+
+
 # fmt: off
 fused_moe_1stage_dict = {
     "gfx942":
@@ -852,6 +996,7 @@ def _flydsl_stage1_wrapper(
     w1_scale=None,
     a1_scale=None,
     sorted_weights=None,
+    topk_ids=None,
     fuse_fp4_quant=False,
     fuse_sort_scale=False,
     **_kwargs,
@@ -869,6 +1014,28 @@ def _flydsl_stage1_wrapper(
         act = "silu"
     _fq = fuse_fp4_quant or parsed.get("fuse_fp4_quant", False)
     _fss = fuse_sort_scale or (_fq and not fuse_sort_scale)
+    if parsed.get("direct", False):
+        if topk_ids is None:
+            raise ValueError("direct FlyDSL stage1 requires topk_ids")
+        return aiter.ops.flydsl.flydsl_moe_stage1_direct(
+            a=hidden_states,
+            w1=w1,
+            topk_ids=topk_ids,
+            out=out,
+            topk=topk,
+            tile_m=parsed["tile_m"],
+            tile_n=parsed["tile_n"],
+            tile_k=parsed["tile_k"],
+            a_dtype=parsed["a_dtype"],
+            b_dtype=parsed["b_dtype"],
+            out_dtype=parsed["out_dtype"],
+            w1_scale=w1_scale,
+            a1_scale=a1_scale,
+            routes_per_block=parsed.get("routes_per_block", 1),
+            num_waves=parsed.get("num_waves", 0),
+            k_batch=parsed.get("k_batch", 1),
+            splitk_mode=parsed.get("splitk_mode", "atomic"),
+        )
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
         w1=w1,
@@ -895,6 +1062,8 @@ def _flydsl_stage1_wrapper(
         waves_per_eu=parsed.get("waves_per_eu", 3),
         b_nt=parsed.get("b_nt", 2),
         gate_only=parsed.get("gate_only", False),
+        n_per_wave=parsed.get("n_per_wave", 32),
+        splitk_mode=parsed.get("splitk_mode", "atomic"),
     )
 
 
@@ -911,12 +1080,34 @@ def _flydsl_stage2_wrapper(
     w2_scale=None,
     a2_scale=None,
     sorted_weights=None,
+    topk_ids=None,
+    topk_weights=None,
     **_kwargs,
 ):
 
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    if parsed.get("direct", False):
+        if topk_ids is None or topk_weights is None:
+            raise ValueError("direct FlyDSL stage2 requires topk_ids/topk_weights")
+        return aiter.ops.flydsl.flydsl_moe_stage2_direct(
+            inter_states=inter_states,
+            w2=w2,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            out=out,
+            topk=topk,
+            tile_m=parsed["tile_m"],
+            tile_n=parsed["tile_n"],
+            tile_k=parsed["tile_k"],
+            a_dtype=parsed["a_dtype"],
+            b_dtype=parsed["b_dtype"],
+            out_dtype=parsed["out_dtype"],
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            split_reduce=parsed.get("split_reduce", False),
+        )
     return aiter.ops.flydsl.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
@@ -943,6 +1134,8 @@ def _flydsl_stage2_wrapper(
         # Keep stage2 persist behavior aligned with kernel naming.
         # For migrated old kernels (non `_persist` names), force legacy non-persistent path.
         persist=parsed.get("persist", False),
+        n_per_wave=parsed.get("n_per_wave", 32),
+        k_batch=parsed.get("k_batch", 1),
     )
 
 
@@ -1498,6 +1691,8 @@ def fused_moe_2stages(
     bias1=None,
     bias2=None,
     fc1_smooth_scale=None,  # shared [model_dim]
+    topk_ids=None,
+    topk_weight=None,
 ):
     quant_func = get_quant(quant_type)
     q_type2 = quant_type if q_type2 is None else QuantType(q_type2)
@@ -1548,6 +1743,7 @@ def fused_moe_2stages(
         q_dtype_w2=q_dtype_w2,
         q_type2=q_type2,
     )
+    stage1_params, stage2_params = _flydsl_2stage_params(metadata)
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1621,6 +1817,13 @@ def fused_moe_2stages(
                 q_dtype_a,
                 num_rows=num_local_tokens,
             )
+        elif (
+            _is_direct_params(stage1_params)
+            and quant_type == QuantType.per_Tensor
+        ):
+            a1, a1_scale = _direct_stage1_per_tensor_quant(
+                hidden_states, a1_scale, q_dtype_a
+            )
         elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
             quant_func = functools.partial(quant_func, transpose_scale=True)
             a1, a1_scale = quant_func(
@@ -1646,6 +1849,10 @@ def fused_moe_2stages(
             a1_scale is not None or quant_type == QuantType.No
         ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
+    direct_2stage = (
+        _is_direct_params(stage1_params)
+        and _is_direct_params(stage2_params)
+    )
     if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
         a2 = torch.empty(
@@ -1653,6 +1860,8 @@ def fused_moe_2stages(
             dtype=q_dtype_a,
             device=device,
         )
+    elif direct_2stage:
+        a2 = _direct_stage1_out_buffer(token_num, topk, inter_dim, dtype, device)
     else:
         a2 = torch.empty(
             (token_num, topk, inter_dim),
@@ -1670,6 +1879,11 @@ def fused_moe_2stages(
     ):
         extra_stage1_args["bias1"] = bias1
         extra_stage2_args["bias2"] = bias2
+    if _is_direct_params(stage1_params):
+        extra_stage1_args["topk_ids"] = topk_ids
+    if _is_direct_params(stage2_params):
+        extra_stage2_args["topk_ids"] = topk_ids
+        extra_stage2_args["topk_weights"] = topk_weight
     a2 = metadata.stage1(
         a1,
         w1,
@@ -1740,6 +1954,12 @@ def fused_moe_2stages(
             .view(token_num, -1)
         )
         a2 = a2_v
+    elif (
+        _is_direct_params(stage2_params)
+        and q_type2 == QuantType.per_Tensor
+    ):
+        a2, a2_scale = _direct_stage2_per_tensor_quant(a2, a2_scale, q_dtype_a2)
+        a2 = a2.view(token_num, topk, inter_dim)
     else:
         a2, a2_scale = quant_func2(
             a2,
