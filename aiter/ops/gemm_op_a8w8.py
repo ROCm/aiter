@@ -611,6 +611,25 @@ def gemm_a8w8_bpreshuffle(
     n = WQ.shape[0]
     k = XQ.shape[-1]
 
+    # Unconditional shape check -- protects against silent shape drift even
+    # when padding metadata is absent (e.g., torch.nn.Parameter wrapping
+    # strips tensor.__dict__).
+    assert XQ.shape[-1] == WQ.shape[-1], (
+        f"gemm_a8w8_bpreshuffle requires XQ.shape[-1] == WQ.shape[-1], got "
+        f"XQ.shape[-1]={XQ.shape[-1]}, WQ.shape[-1]={WQ.shape[-1]}"
+    )
+    # Padding metadata, if present, lets us emit a clearer error when the
+    # caller forgot to pad activations to match a padded weight.
+    weight_original_k = getattr(WQ, "aiter_original_k", WQ.shape[-1])
+    weight_padded_k = getattr(WQ, "aiter_padded_k", WQ.shape[-1])
+    if weight_padded_k != weight_original_k:
+        assert XQ.shape[-1] == weight_padded_k, (
+            f"WQ was padded from K={weight_original_k} to K={weight_padded_k} "
+            f"(via aiter.ops.shuffle.pad_weight_for_bpreshuffle); "
+            f"XQ.shape[-1]={XQ.shape[-1]} must match padded K. The caller "
+            f"must pad activations using a graph-safe scratch buffer."
+        )
+
     # if (
     #     ck_config is None
     #     and dtype == dtypes.bf16
