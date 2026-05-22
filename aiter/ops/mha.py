@@ -1299,13 +1299,15 @@ def _flash_attn_forward(
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
         )
-        # support per tensor and per head quant scale
-        ret = ret and (
+        pertensor_or_perhead = (
             q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
+        ) and q_descale.shape == k_descale.shape and q_descale.shape == v_descale.shape
+        qkptph_vph = (
+            q_descale.shape == (batch_size, nhead_q, seqlen_q)
+            and k_descale.shape == (batch_size, nhead_k, seqlen_k)
+            and v_descale.shape in ((nhead_k,), (batch_size, nhead_k))
         )
-        ret = ret and (
-            q_descale.shape == k_descale.shape and q_descale.shape == v_descale.shape
-        )
+        ret = ret and (pertensor_or_perhead or qkptph_vph)
         return ret
 
     def can_impl_fmha_v3_fwd():

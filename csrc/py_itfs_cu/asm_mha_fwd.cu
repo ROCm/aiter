@@ -80,6 +80,12 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
     ck_tile::index_t batch_stride_descale_k = 0;
     ck_tile::index_t batch_stride_descale_v = 0;
 
+    constexpr int asm_qscale_pertensor   = 0;
+    constexpr int asm_qscale_qkptph_vph  = 1;
+    const bool use_qkptph_vph =
+        q_descale_.has_value() && q_descale_.value().dim() == 3;
+    int asm_qscale_type = use_qkptph_vph ? asm_qscale_qkptph_vph : asm_qscale_pertensor;
+
     void *q_descale_ptr = nullptr;
     void *k_descale_ptr = nullptr;
     void *v_descale_ptr = nullptr;
@@ -104,30 +110,63 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
     if (q_descale_.has_value()) {
         auto q_descale = q_descale_.value();
         CHECK_DEVICE(q_descale);
-        TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({1}) || q_descale.sizes() == torch::IntArrayRef({b, h_k}));
-        if (q_descale.dim() == 2) {
+        if (use_qkptph_vph) {
+            TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({b, h, seqlen_q}),
+                        "q_descale for qkptph_vph must be [batch, q_heads, seqlen_q]");
+            TORCH_CHECK(q_descale.stride(2) == 1,
+                        "q_descale for qkptph_vph must be contiguous in token dimension");
             batch_stride_descale_q = q_descale.stride(0);
             nhead_stride_descale_q = q_descale.stride(1);
+        } else {
+            TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({1}) || q_descale.sizes() == torch::IntArrayRef({b, h_k}));
+            if (q_descale.dim() == 2) {
+                batch_stride_descale_q = q_descale.stride(0);
+                nhead_stride_descale_q = q_descale.stride(1);
+            }
         }
         q_descale_ptr = q_descale.data_ptr();
     }
     if (k_descale_.has_value()) {
         auto k_descale = k_descale_.value();
         CHECK_DEVICE(k_descale);
-        TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef({1}) || k_descale.sizes() == torch::IntArrayRef({b, h_k}));
-        if (k_descale.dim() == 2) {
+        if (use_qkptph_vph) {
+            TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef({b, h_k, seqlen_k}),
+                        "k_descale for qkptph_vph must be [batch, kv_heads, seqlen_k]");
+            TORCH_CHECK(k_descale.stride(2) == 1,
+                        "k_descale for qkptph_vph must be contiguous in token dimension");
             batch_stride_descale_k = k_descale.stride(0);
             nhead_stride_descale_k = k_descale.stride(1);
+        } else {
+            TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef({1}) || k_descale.sizes() == torch::IntArrayRef({b, h_k}));
+            if (k_descale.dim() == 2) {
+                batch_stride_descale_k = k_descale.stride(0);
+                nhead_stride_descale_k = k_descale.stride(1);
+            }
         }
         k_descale_ptr = k_descale.data_ptr();
     }
     if (v_descale_.has_value()) {
         auto v_descale = v_descale_.value();
         CHECK_DEVICE(v_descale);
-        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({1}) || v_descale.sizes() == torch::IntArrayRef({b, h_k}));
-        if (v_descale.dim() == 2) {
-            batch_stride_descale_v = v_descale.stride(0);
-            nhead_stride_descale_v = v_descale.stride(1);
+        if (use_qkptph_vph) {
+            TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({h_k}) ||
+                            v_descale.sizes() == torch::IntArrayRef({b, h_k}),
+                        "v_descale for qkptph_vph must be [kv_heads] or [batch, kv_heads]");
+            TORCH_CHECK(v_descale.stride(-1) == 1,
+                        "v_descale for qkptph_vph must be contiguous in head dimension");
+            if (v_descale.dim() == 2) {
+                batch_stride_descale_v = v_descale.stride(0);
+                nhead_stride_descale_v = v_descale.stride(1);
+            } else {
+                batch_stride_descale_v = 0;
+                nhead_stride_descale_v = v_descale.stride(0);
+            }
+        } else {
+            TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({1}) || v_descale.sizes() == torch::IntArrayRef({b, h_k}));
+            if (v_descale.dim() == 2) {
+                batch_stride_descale_v = v_descale.stride(0);
+                nhead_stride_descale_v = v_descale.stride(1);
+            }
         }
         v_descale_ptr = v_descale.data_ptr();
     }
@@ -139,7 +178,7 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                         false, // is_group_mode
                         static_cast<int>(bias_type),
                         has_lse,
-                        0, // qscale_type
+                        asm_qscale_type,
                         false, //has_sink
                         q.data_ptr(),
                         k.data_ptr(),
@@ -312,7 +351,8 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     // H/t Daniel Haziza
     const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k &&
         window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size_q % 8 == 0 &&
-        !alibi_slopes_.has_value() && !bias_.has_value();
+        !alibi_slopes_.has_value() && !bias_.has_value() &&
+        !(is_qkv_fp8 && q_descale_.has_value() && q_descale_.value().dim() == 3);
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size_q}).transpose(1, 2);
