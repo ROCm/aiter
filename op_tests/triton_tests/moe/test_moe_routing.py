@@ -16,7 +16,7 @@ def assert_equal(ref, tri):
     if isinstance(ref, torch.Tensor):
         # CI may be failing using this:
         # assert torch.all(ref == tri)
-        assert ((ref - tri) ** 2).sum() == 0
+        assert ((ref.cpu().numpy() - tri.cpu().numpy()) ** 2).sum() == 0
     else:
         assert ref == tri
 
