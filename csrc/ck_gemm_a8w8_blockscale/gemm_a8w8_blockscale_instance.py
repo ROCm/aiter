@@ -129,12 +129,20 @@ candidate_kernels_by_name = {v.name: v for v in candidate_kernels_dict.values()}
 # and must appear in the name-keyed C++ lookup table in every build.  Keep in
 # sync with the heuristic if kernel selections change.
 heuristic_kernels_dict = {
-    "heuristic_small_mn":  candidate_kernels_dict[8],   # 16×64  tile, v1 — small M×N
-    "heuristic_medium_mn": candidate_kernels_dict[18],  # 64×64  tile, v1 — medium M×N; also K<384 fallback
-    "heuristic_large_mn":  candidate_kernels_dict[2],   # 64×128 tile, v3 — large M×N
-    "heuristic_xlarge_mn": candidate_kernels_dict[0],   # 128×128 tile, v3 — xlarge M×N
+    "heuristic_small_mn": candidate_kernels_dict[8],  # 16×64  tile, v1 — small M×N
+    "heuristic_medium_mn": candidate_kernels_dict[
+        18
+    ],  # 64×64  tile, v1 — medium M×N; also K<384 fallback
+    "heuristic_large_mn": candidate_kernels_dict[2],  # 64×128 tile, v3 — large M×N
+    "heuristic_xlarge_mn": candidate_kernels_dict[0],  # 128×128 tile, v3 — xlarge M×N
     # K=128: KPerBLOCK=128 exact fit avoids KPadding overhead; v3 unsupported at K=128.
-    "heuristic_k128_xsmall_mn":      candidate_kernels_dict[6],   # 16×64 tile, v1 — K=128, small M×N
-    "heuristic_k128_medium_large_mn": candidate_kernels_dict[11],  # 32×64 tile, v1 — K=128, medium M×N
-    "heuristic_k128_xlarge_mn":      candidate_kernels_dict[16],  # 64×64 tile, v1 — K=128, large M×N
+    "heuristic_k128_xsmall_mn": candidate_kernels_dict[
+        6
+    ],  # 16×64 tile, v1 — K=128, small M×N
+    "heuristic_k128_medium_large_mn": candidate_kernels_dict[
+        11
+    ],  # 32×64 tile, v1 — K=128, medium M×N
+    "heuristic_k128_xlarge_mn": candidate_kernels_dict[
+        16
+    ],  # 64×64 tile, v1 — K=128, large M×N
 }
