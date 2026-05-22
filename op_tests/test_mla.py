@@ -317,9 +317,16 @@ def test_mla(
         return us_asm
 
     us_asm = None
+    # Absorb-prefill ref (mla_torch) builds [nhead, (batch*ctx_kv)^2] fp32 attn
+    # weights -- O(N^2) memory. Tile-area gate alone is not enough: bh16 CI
+    # sweeps run with decode-scale ctx_lens (-c 49152, -c 98304, -c 10000000)
+    # and would OOM the host. Mirror the normal-prefill gate's explicit
+    # ctx_lens <= 16384 cap to skip the ref for those configs.
     if (
-        dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128]
-    ) and batch_size * ctx_lens * nhead < 32 * 8192 * 16:
+        (dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128])
+        and batch_size * ctx_lens * nhead < 32 * 8192 * 16
+        and ctx_lens <= 16384
+    ):
         us_asm = test_absorb_prefill()
         ret["prefill:asm_576"] = us_asm
 
@@ -551,7 +558,7 @@ def test_mla(
             out_gluon,
             msg=f"mla_decode-absorb    [golden vs gluon_{name}]: {us_decode:>8.2f} us......",
         )
-        cal_diff(out_ref, out_gluon, f"out_gluon_{name}", True)
+        cal_diff(out_ref, out_gluon, f"out_gluon_{name}", use_fp8=(name == "bh16bn128"))
         return err, us_decode
 
     err = None

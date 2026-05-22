@@ -97,8 +97,8 @@ Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/bench
 | BLOCK_N | 64 | 128 | 64 |
 | MFMA | 16&times;16&times;32, warps=[4,1] | 16&times;16&times;32, warps=[1,4] | 16&times;16&times;32, warps=[1,4] |
 | NUM_KV_SPLITS | auto &isin; {1, 2, 4} from (batch, nhead) | 256 (fixed) | 256 (fixed) |
-| `kv_scale` | unused (pass 1.0) | dequant scale applied to final `acc` | unused (pass 1.0) |
-| Seq constraint | `min_kv_seq_len > NUM_KV_SPLITS * (PIPELINE_STAGES * BLOCK_N + NUM_KV_SPLITS)` with `PIPELINE_STAGES=3` | `min_kv_seq_len // 256 &ge; BLOCK_N * 3 = 384` | `min_kv_seq_len // 256 &ge; BLOCK_N * 3 = 192` |
+| `kv_scale` | unused (pass 1.0) | dequant scale folded into `qk_scale` (applied before softmax for fp8 correctness) | unused (pass 1.0) |
+| Seq constraint | `min_kv_seq_len > NUM_KV_SPLITS * (3 * BLOCK_N + NUM_KV_SPLITS)` (the `3` matches the kernel's `gl.assume(num_iter > 3)`) | `min_kv_seq_len // 256 &ge; BLOCK_N * 3 = 384` | `min_kv_seq_len // 256 &ge; BLOCK_N * 3 = 192` |
 | Stage-2 reduce | skipped when `NUM_KV_SPLITS == 1` | always runs | always runs |
 
 **`bh64` NUM_KV_SPLITS selection** (NUM_XCDS=8, BLOCK_H=64):
