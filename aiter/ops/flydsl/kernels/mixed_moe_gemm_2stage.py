@@ -620,6 +620,7 @@ def compile_mixed_moe_gemm1(
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
             )
+            num_valid_records_i32 = rocdl.ReadfirstlaneOp(T.i32, num_valid_i32).res
 
             sx_rsrc = 1
             sw_rsrc = 1
@@ -672,8 +673,24 @@ def compile_mixed_moe_gemm1(
             _sorted_scale_cols_i32 = arith.constant(_sorted_scale_cols, type=T.i32)
             sorted_scale_rsrc = None
             if const_expr(_need_sort):
+                _sort_rows_idx = arith.index_cast(
+                    ir.IndexType.get(), num_valid_records_i32
+                )
+                _sort_padded_rows = (
+                    (_sort_rows_idx + arith.constant(255, index=True))
+                    / arith.constant(256, index=True)
+                    * arith.constant(256, index=True)
+                )
+                _sort_padded_cols = arith.constant(
+                    ((_sorted_scale_cols + 7) // 8) * 8, index=True
+                )
+                _sort_scale_nbytes = arith.index_cast(
+                    T.i32, _sort_padded_rows * _sort_padded_cols
+                )
                 sorted_scale_rsrc = buffer_ops.create_buffer_resource(
-                    arg_out_scale_sorted, max_size=False
+                    arg_out_scale_sorted,
+                    max_size=False,
+                    num_records_bytes=_sort_scale_nbytes,
                 )
 
             # ---- persist_m loop (same pattern as stage2) ----

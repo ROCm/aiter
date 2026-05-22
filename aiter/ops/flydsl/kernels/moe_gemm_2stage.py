@@ -532,11 +532,16 @@ def compile_moe_gemm1(
                         arg_scale_w, max_size=False
                     )
 
+                sorted_nbytes_idx = size_expert_ids_in * fx.Index(tile_m) * fx.Index(4)
                 sorted_rsrc = buffer_ops.create_buffer_resource(
-                    arg_sorted_token_ids, max_size=False
+                    arg_sorted_token_ids,
+                    max_size=False,
+                    num_records_bytes=sorted_nbytes_idx,
                 )
                 sorted_w_rsrc = buffer_ops.create_buffer_resource(
-                    arg_sorted_weights, max_size=False
+                    arg_sorted_weights,
+                    max_size=False,
+                    num_records_bytes=sorted_nbytes_idx,
                 )
 
                 # expert ids: [blocks] i32 -> bytes = size_expert_ids_in*4

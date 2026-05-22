@@ -456,11 +456,19 @@ def compile_preshuffle_gemm_a8(
             arg_c, max_size=False, num_records_bytes=_c_nrec
         )
         _needs_per_token_scale = not is_f16_or_bf16 and not is_fp4
-        scale_a_rsrc = (
-            None
-            if (is_f16_or_bf16)
-            else buffer_ops.create_buffer_resource(arg_scale_a, max_size=False)
-        )
+        scale_a_rsrc = None
+        if const_expr(not is_f16_or_bf16):
+            if const_expr(is_fp4):
+                _scale_a_rows = (c_m + fx.Index(31)) // fx.Index(32)
+                _scale_a_stride_elems = fx.Index((K // (32 * 4 * 2)) * 64)
+                _scale_a_nrec = fx.Int64(
+                    _scale_a_rows * _scale_a_stride_elems * fx.Index(4)
+                )
+            else:
+                _scale_a_nrec = fx.Int64(c_m * fx.Index(4))
+            scale_a_rsrc = buffer_ops.create_buffer_resource(
+                arg_scale_a, max_size=False, num_records_bytes=_scale_a_nrec
+            )
 
         # ---- Bias buffer resource (for fused epilogue) ----
         # Use max_size=True so the buffer descriptor's size is taken from the
