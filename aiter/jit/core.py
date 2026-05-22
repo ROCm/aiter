@@ -215,7 +215,14 @@ class AITER_CONFIG(object):
                 f"when merging '{merge_name}'."
             )
 
-        _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
+        _FILL_DEFAULTS = {
+            "xbf16": 0,
+            "run_1stage": 0,
+            "ksplit": 0,
+            "hidden_pad": 0,
+            "hiddne_pad": 0,
+            "intermediate_pad": 0,
+        }
         all_cols = list(source_pairs[0][1].columns)
         for _, df in source_pairs[1:]:
             for c in df.columns:
@@ -252,6 +259,9 @@ class AITER_CONFIG(object):
                 keys.append("cu_num")
             if "gfx" in merge_df.columns and "gfx" not in keys:
                 keys.append("gfx")
+            for pad_col in ("hidden_pad", "hiddne_pad", "intermediate_pad"):
+                if pad_col in merge_df.columns and pad_col not in keys:
+                    keys.append(pad_col)
             dedup_keys = keys + ["_tag"] if has_tag else keys
             duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():

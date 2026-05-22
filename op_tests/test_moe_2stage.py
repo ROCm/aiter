@@ -583,7 +583,16 @@ def _str2enum(s, enum_cls):
 
 
 def _row_to_kwargs(row):
-    # csv rows store already-effective dims, so pad defaults to 0.
+    def _row_int(name, *aliases):
+        for key in (name, *aliases):
+            if key not in row:
+                continue
+            value = row.get(key)
+            if pd.isna(value) or str(value).strip() == "":
+                return 0
+            return int(value)
+        return 0
+
     q_type = _str2enum(row["q_type"], aiter.QuantType)
     aq_dtype = _str2dtype(row["q_dtype_a"])
     wq_dtype = _str2dtype(row["q_dtype_w"])
@@ -605,8 +614,8 @@ def _row_to_kwargs(row):
         WQDType=wq_dtype,
         use_g1u1=dtypes.str2bool(str(row["use_g1u1"])),
         doweight_stage1=dtypes.str2bool(str(row["doweight_stage1"])),
-        hidden_pad=0,
-        intermediate_pad=0,
+        hidden_pad=_row_int("hidden_pad", "hiddne_pad"),
+        intermediate_pad=_row_int("intermediate_pad"),
         preshuffle=True,
     )
 

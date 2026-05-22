@@ -880,12 +880,27 @@ def get_2stage_cfgs(
         "q_type",
         "use_g1u1",
         "doweight_stage1",
+        "hidden_pad",
+        "intermediate_pad",
     ]
+
+    def _normalize_pad_cols(df):
+        if "hidden_pad" not in df.columns:
+            if "hiddne_pad" in df.columns:
+                df["hidden_pad"] = df["hiddne_pad"]
+            else:
+                df["hidden_pad"] = 0
+        df["hidden_pad"] = df["hidden_pad"].fillna(0).astype(int)
+        if "intermediate_pad" not in df.columns:
+            df["intermediate_pad"] = 0
+        df["intermediate_pad"] = df["intermediate_pad"].fillna(0).astype(int)
+        return df
 
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
         df = pd.read_csv(tune_file)
+        df = _normalize_pad_cols(df)
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
 
@@ -927,6 +942,7 @@ def get_2stage_cfgs(
             _flydsl_fallback_cache[tune_file] = {}
             return {}
         df = pd.read_csv(tune_file)
+        df = _normalize_pad_cols(df)
         if "_tag" not in df.columns:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
@@ -969,6 +985,8 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
+        hidden_pad,
+        intermediate_pad,
     )
     keys_disabled = (
         cu_num,
@@ -984,17 +1002,19 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
+        hidden_pad,
+        intermediate_pad,
     )
 
     def MainFunc():
         with open(untune_file, "a") as f:
             if os.path.getsize(untune_file) == 0:
                 f.write(
-                    "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
+                    "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,hidden_pad,intermediate_pad"
                 )
             q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
             f.write(
-                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
+                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)},{hidden_pad},{intermediate_pad}"
             )
         logger.info("\033[34m Start tuning fmoe")
         os.system(

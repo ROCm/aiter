@@ -71,6 +71,21 @@ def _row_swiglu_limit(row: dict[str, str]) -> float:
     return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit") or 0.0
 
 
+def _row_optional_int(row: dict[str, str], name: str, *aliases: str) -> int:
+    for key in (name, *aliases):
+        value = row.get(key)
+        if value is None:
+            continue
+        value = str(value).strip()
+        if value == "":
+            return 0
+        try:
+            return int(value)
+        except ValueError as e:
+            raise ValueError(f"{key} must be an int, got {value!r}") from e
+    return 0
+
+
 def parse_csv(csv_path: str):
     """Parse the CSV and return a list of unique compile jobs.
 
@@ -93,6 +108,8 @@ def parse_csv(csv_path: str):
             experts = int(row["expert"])
             topk = int(row["topk"])
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
+            hidden_pad = _row_optional_int(row, "hidden_pad", "hiddne_pad")
+            intermediate_pad = _row_optional_int(row, "intermediate_pad")
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
             act_type = row.get("act_type", "")
@@ -143,6 +160,8 @@ def parse_csv(csv_path: str):
                         "experts": experts,
                         "topk": topk,
                         "doweight_stage1": doweight_stage1,
+                        "hidden_pad": hidden_pad,
+                        "intermediate_pad": intermediate_pad,
                         "cu_num": cu_num,
                         "act": act,
                         "enable_bias": enable_bias,
@@ -200,6 +219,8 @@ def _precompile_to_cache(
     enable_bias: bool = False,
     stage1_fuse_quant=None,
     swiglu_limit: float = 0.0,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
     **kwargs,
 ):
     """Trigger MLIR compilation by calling the runtime stage1/stage2 entry points
@@ -554,6 +575,8 @@ def _precompile_to_cache(
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
                 swiglu_limit=swiglu_limit,
+                model_dim_pad=hidden_pad,
+                inter_dim_pad=intermediate_pad,
             )
             _run_compiled(exe, args)
 
@@ -723,6 +746,8 @@ def _precompile_to_cache(
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
+                model_dim_pad=hidden_pad,
+                inter_dim_pad=intermediate_pad,
             )
             _run_compiled(exe, args)
 
@@ -747,6 +772,8 @@ def compile_one_config(
     shape_str = (
         f"{kernel_name}  "
         f"model_dim={model_dim} inter_dim={inter_dim} "
+        f"hidden_pad={kwargs.get('hidden_pad', 0)} "
+        f"intermediate_pad={kwargs.get('intermediate_pad', 0)} "
         f"E={experts} topk={topk}"
     )
     result = {
