@@ -249,10 +249,15 @@ def compile_moe_gemm1(
 
     ir.ShapedType.get_dynamic_size()
     # W is packed int4 for W4A8/W4A16/W4A_FP8: 2 values per byte.
-    (
+    w_nbytes = (
         (experts * (2 * inter_dim) * model_dim) // 2
         if w_is_int4
-        else (experts * (2 * inter_dim) * model_dim)
+        else (experts * (2 * inter_dim) * model_dim * elem_bytes)
+    )
+    sw_nbytes = (
+        experts * (2 * inter_dim) * num_groups * (2 if _scale_is_bf16 else 4)
+        if needs_scale_w
+        else 0
     )
 
     total_threads = 256
@@ -498,7 +503,9 @@ def compile_moe_gemm1(
                     arg_x, max_size=False, num_records_bytes=x_nbytes_idx
                 )
 
-                w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+                w_rsrc = buffer_ops.create_buffer_resource(
+                    arg_w, max_size=False, num_records_bytes=w_nbytes
+                )
 
                 # OUT: normal=[tokens, topk, inter] f16/bf16,
                 #      split-K=[tokens*topk, 2*inter] f32 (or bf16 for bf16 split-K)
@@ -529,7 +536,7 @@ def compile_moe_gemm1(
                     sw_rsrc = None
                 else:
                     sw_rsrc = buffer_ops.create_buffer_resource(
-                        arg_scale_w, max_size=False
+                        arg_scale_w, max_size=False, num_records_bytes=sw_nbytes
                     )
 
                 sorted_nbytes_idx = size_expert_ids_in * fx.Index(tile_m) * fx.Index(4)
@@ -2136,10 +2143,15 @@ def compile_moe_gemm2(
 
     ir.ShapedType.get_dynamic_size()
     # W is packed int4 for W4A8/W4A16/W4A_FP8: 2 values per byte.
-    (
+    w_nbytes = (
         (experts * model_dim * inter_dim) // 2
         if w_is_int4
-        else (experts * model_dim * inter_dim)
+        else (experts * model_dim * inter_dim * elem_bytes)
+    )
+    sw_nbytes = (
+        experts * model_dim * num_groups * (2 if _scale_is_bf16 else 4)
+        if needs_scale_w
+        else 0
     )
 
     total_threads = 256
@@ -2377,7 +2389,9 @@ def compile_moe_gemm2(
                 arg_x, max_size=False, num_records_bytes=x_nbytes_idx
             )
 
-            w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+            w_rsrc = buffer_ops.create_buffer_resource(
+                arg_w, max_size=False, num_records_bytes=w_nbytes
+            )
 
             # OUT: [tokens, model_dim] -> clamp to descriptor max (i32 bytes) to avoid overflow on huge tokens.
             out_elem_bytes = 4 if out_is_f32 else 2
@@ -2403,7 +2417,9 @@ def compile_moe_gemm2(
                 sw_rsrc = None
             else:
                 # scale_w: [experts*model_dim] f32 (static shape in practice)
-                sw_rsrc = buffer_ops.create_buffer_resource(arg_scale_w, max_size=False)
+                sw_rsrc = buffer_ops.create_buffer_resource(
+                    arg_scale_w, max_size=False, num_records_bytes=sw_nbytes
+                )
 
             # sorted_token_ids / sorted_weights: [blocks*tile_m] (CK-style padded length)
             sorted_nbytes_idx = size_expert_ids_in * fx.Index(tile_m) * fx.Index(4)
