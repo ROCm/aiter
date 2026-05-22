@@ -18,7 +18,11 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
+from aiter import (
+    fused_dynamic_mxfp4_quant_moe_sort,
+    fused_dynamic_mxfp8_quant_moe_sort,
+    mxfp4_moe_sort_fwd,
+)
 
 BLOCK_SIZE_M = 32
 
@@ -26,6 +30,7 @@ BLOCK_SIZE_M = 32
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
+_MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
 
 def _moe_sorting_impl(
@@ -1555,13 +1560,25 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         # and activation == aiter.ActivationType.Swiglu
     ):
-        a1 = hidden_states.to(dtypes.fp8)
-        M = sorted_ids.shape[0]
-        N = a1.shape[-1]
-        if metadata.fuse_quant == "fp8":
-            a1_scale = torch.empty(0, dtype=torch.uint8, device=a1.device)
+        if not _MOE_A8W4_BYPASS_QUANT:
+            # stage1 input is not topk-replicated, so M==token_num and the
+            # HIP launcher infers TOPK=1 from input.numel() / (cols * token_num).
+            a1, a1_scale = fused_dynamic_mxfp8_quant_moe_sort(
+                hidden_states,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                topk=topk,
+                block_size=block_size_M,
+            )
         else:
-            a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
+            a1 = hidden_states.to(dtypes.fp8)
+            M = sorted_ids.shape[0]
+            N = a1.shape[-1]
+            if metadata.fuse_quant == "fp8":
+                a1_scale = torch.empty(0, dtype=torch.uint8, device=a1.device)
+            else:
+                a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
 
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights; no activation quantization needed
@@ -1676,17 +1693,15 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
     ):
-        if activation == ActivationType.Silu and swiglu_limit == 0.0:
-            from aiter.ops.triton.quant.fused_mxfp4_quant import fused_quant_fp8_sort
-
+        if not _MOE_A8W4_BYPASS_QUANT:
             a2 = a2.view(-1, inter_dim)
-            a2, a2_scale = fused_quant_fp8_sort(
+            a2, a2_scale = fused_dynamic_mxfp8_quant_moe_sort(
                 a2,
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
-                block_size=32,
-                quant_dtype=dtypes.fp8,
+                topk=topk,
+                block_size=block_size_M,
             )
             a2 = a2.view(token_num, topk, -1)
         else:

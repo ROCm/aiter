@@ -685,6 +685,23 @@ def fused_dynamic_mxfp4_quant_moe_sort_hip(
 
 
 @compile_ops("module_quant", develop=True)
+def fused_dynamic_mxfp8_quant_moe_sort_hip(
+    out: torch.Tensor,
+    scales: torch.Tensor,
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    block_m: int,
+    group_size: int = 32,
+) -> None:
+    """
+    HIP path for fused dynamic MXFP8 quantization and MoE scale sorting.
+    """
+    ...
+
+
+@compile_ops("module_quant", develop=True)
 def quant_mxfp4(
     inp: torch.Tensor,
     out_packed: torch.Tensor,
@@ -794,6 +811,44 @@ def fused_dynamic_mxfp4_quant_moe_sort(
             input, None, dtypes.fp4x2, num_rows=num_rows, num_rows_factor=topk
         )
         mxfp4_moe_sort_hip(scale, scale_, sorted_ids, num_valid_ids, token_num, N)
+    return out, scale
+
+
+def fused_dynamic_mxfp8_quant_moe_sort(
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+    block_size: int,
+    group_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """HIP replacement for Triton fused_quant_fp8_sort.
+
+    Returns (fp8_out, e8m0_scale) with the scale tensor laid out as
+    (pad32(M_o), N_o) fp8_e8m0 — the same byte layout the FlyDSL stage1/stage2
+    GEMM consumes. ``topk`` is accepted for parity with the fp4 wrapper but
+    is inferred inside the HIP launcher from ``input.numel() / (cols * token_num)``.
+    """
+    M, N = input.view(-1, input.shape[-1]).shape
+    N_o = (N + 31) // 32
+    out = torch.empty(M, N, dtype=dtypes.fp8, device=input.device)
+    scale = torch.empty(
+        (sorted_ids.shape[0] + 31) // 32 * 32,
+        N_o,
+        dtype=dtypes.fp8_e8m0,
+        device=input.device,
+    )
+    fused_dynamic_mxfp8_quant_moe_sort_hip(
+        out,
+        scale,
+        input,
+        sorted_ids,
+        num_valid_ids,
+        token_num,
+        block_size,
+        group_size,
+    )
     return out, scale
 
 

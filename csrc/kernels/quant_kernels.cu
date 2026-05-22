@@ -1596,10 +1596,18 @@ __global__ void mxfp4_quant_moe_sort_kernel(
                                                 : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4));
     using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
     using vec_f = opus::vector_t<float, vec_size_i>;
+    // For e8m0-scaled dtypes (fp4, fp8) use 1 / floor_pow2(DTYPE_MAX) so that
+    // `row_scale = pow2(absMax) * inverted_DTYPE_MAX` is itself a pure power of 2 —
+    // that keeps the quant divisor consistent with the dequant scale `2^(byte-127)`
+    // we encode in the e8m0 byte (the `>> 23` extraction below otherwise discards
+    // mantissa bits and breaks accuracy). For other dtypes fall back to the exact
+    // 1 / DTYPE_MAX divisor.
     const float inverted_DTYPE_MAX =
         std::is_same_v<DTYPE_O, opus::fp4_t>
-            ? 0.25
-            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+            ? 0.25f /* 1/4, fp4 max=6 */
+            : (std::is_same_v<DTYPE_O, opus::fp8_t>
+                   ? 1.0f / 256.0f /* fp8 e4m3 max=448 */
+                   : 1.0f / static_cast<float>(opus::finfo<DTYPE_O>::max()));
     const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
     const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
 
@@ -1647,9 +1655,12 @@ __global__ void mxfp4_quant_moe_sort_kernel(
             }
             absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
 
-            float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                                  ? aiter::fp4_f32_to_e8m0_scale(absMax) * inverted_DTYPE_MAX
-                                  : absMax * inverted_DTYPE_MAX;
+            float row_scale =
+                std::is_same_v<DTYPE_O, opus::fp4_t>
+                    ? aiter::fp4_f32_to_e8m0_scale(absMax) * inverted_DTYPE_MAX
+                    : (std::is_same_v<DTYPE_O, opus::fp8_t>
+                           ? aiter::fp4_f32_to_e8m0_scale(absMax) * inverted_DTYPE_MAX
+                           : absMax * inverted_DTYPE_MAX);
 
             const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
             if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
@@ -1759,6 +1770,42 @@ void fused_dynamic_mxfp4_quant_moe_sort_hip(
 #else
     AITER_CHECK(false, __func__, ": not support fp4x2 on this device");
 #endif
+}
+
+void fused_dynamic_mxfp8_quant_moe_sort_hip(
+    aiter_tensor_t& output,
+    aiter_tensor_t& scale,
+    const aiter_tensor_t& input,
+    const aiter_tensor_t& sorted_ids,
+    const aiter_tensor_t& num_valid_ids,
+    int token_num,
+    int block_m,
+    int group_size
+)
+{
+    int cols = input.size(-1);
+    int topk = input.numel() / (cols * token_num);
+    int num_experts = (sorted_ids.size(0) + topk - topk * token_num) / block_m;
+
+    const int num_cu = get_num_cu_func();
+    int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;
+    AITER_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
+    int tgs_per_block_m = block_m / sub_block_m;
+    int num_blocks = (sorted_ids.size(0) + sub_block_m - 1) / sub_block_m;
+    const bool persistent_mode = false;
+    const int input_stride     = input.stride(-2);
+
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    if(output.dtype() == AITER_DTYPE_fp8)
+    {
+        MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(opus::fp8_t, cols);
+    }
+    else
+    {
+        AITER_CHECK(false, __func__, ": not support output type: ", AiterDtype_to_str(output.dtype()));
+    }
 }
 
 template <int block_size, int num_rows, int thread_data_size = 16, int group_size = 32>
