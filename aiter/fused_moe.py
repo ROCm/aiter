@@ -2131,6 +2131,7 @@ def get_2stage_cfgs(
                 ksplit=0,
                 run_1stage=False,
                 has_bias=_gfx1250_has_bias,
+                stage2_has_bias=_gfx1250_has_bias,
             )
 
     def get_cfg_2stages(tune_file):
