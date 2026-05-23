@@ -575,7 +575,7 @@ def _moe_gemm_a8w4(
     if X_static_scale is not None:
         acc = acc * gl.load(X_static_scale)
 
-    if bias is not None:
+    if B is not None:
         acc = acc + bias[None, :]
 
     if APPLY_SWIGLU:
