@@ -86,6 +86,14 @@ def _gfx1250_fp8_round_trip_bf16(x: torch.Tensor) -> torch.Tensor:
             ):
                 if _root not in sys.path:
                     sys.path.insert(0, _root)
+            for _stale in (
+                "tests.kernels.utils.fp4_utils",
+                "tests.kernels.utils",
+                "tests.kernels",
+                "tests",
+            ):
+                sys.modules.pop(_stale, None)
+            importlib.invalidate_caches()
             _fly_fp4u_rt = importlib.import_module(
                 "tests.kernels.utils.fp4_utils"
             )
