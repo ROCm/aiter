@@ -165,27 +165,22 @@ def _moe_gemm_a8w4(
     yN = N // ACTIVATION_REDUCTION_N
 
     pid = gl.program_id(0)
-    if ExptOffsSum is not None:
-        # Determine how much padding there is on the expert data. This allows us to
-        # know the true grid size and avoid processing padding tiles.
-        padding_m = grid_m - gl.load(ExptOffsSum)
-    else:
-        padding_m: tl.constexpr = 0
 
     index_type: tl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
 
-    unpadded_m = grid_m - padding_m
-    total_actual_tiles = unpadded_m * grid_n
-    if padding_m > 0 and pid >= total_actual_tiles:
-        return
-
-    pid_mn = pid % (unpadded_m * grid_n)
     if XCD_SWIZZLE != 1:
-        pid_mn = remap_xcd(pid_mn, total_actual_tiles, XCD_SWIZZLE)
-    pid_m, pid_n = pid_grid(pid_mn, unpadded_m, grid_n, 1)
+        padding_m = grid_m - gl.load(ExptOffsSum)
+        unpadded_m = grid_m - padding_m
+        total_actual_tiles = unpadded_m * grid_n
+        if padding_m > 0 and pid >= total_actual_tiles:
+            return
+        pid = remap_xcd(pid, total_actual_tiles, XCD_SWIZZLE)
+    else:
+        unpadded_m = grid_m
+    pid_m, pid_n = pid_grid(pid, unpadded_m, grid_n, 1)
     # unpack expert data
     expt_data = gl.load(ExptData + pid_m)
-    if expt_data == -1:
+    if XCD_SWIZZLE == 1 and expt_data == -1:
         return
     expt_id = expt_data & 0x0000FFFF
     block_id = expt_data >> 16
@@ -305,18 +300,18 @@ def _moe_gemm_a8w4(
                 layout=SHARED_LAYOUT_X_SCALES,
             )
 
-    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+    if BLOCK_M == 16:
         WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
             3,
             transposed=True,
-            warp_bases=[[0, 1], [1, 0]],
+            warp_bases=[[0, 1], [0, 2]],
             reg_bases=[],
             instr_shape=[16, 16, 128],
         )
         WMMA_LAYOUT_PACKED: gl.constexpr = gl.amd.AMDWMMALayout(
             3,
             transposed=True,
-            warp_bases=[[0, 1], [1, 0]],
+            warp_bases=[[0, 1], [0, 2]],
             reg_bases=[],
             instr_shape=[16, 16, 64],
         )
@@ -512,9 +507,21 @@ def _moe_gemm_a8w4(
             cur_x_scales = next_x_scales
         read_idx += 1
 
+    # bias
+    offs_m = BLOCK_M * block_id + gl.arange(
+        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+    )
+    offs_y_n = BLOCK_N * pid_n + gl.arange(
+        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+    )
+    mask_m = offs_m < M
+    mask_n = offs_y_n < N
+    if B is not None:
+        BPtrs = B + expt_id * stride_b_e
+        bias = gl.amd.gfx1250.buffer_load(BPtrs, offs_y_n, mask=mask_n)
+
     # Epilogue: drain remaining pipeline stages (no new TDM loads).
     # The first NUM_BUFFERS-1 iterations still use the pre-load / WMMA pattern.
-
     for k_ep in gl.static_range(NUM_BUFFERS - 1):
         if is_x_microscaled:
             acc = gl.amd.gfx1250.wmma_scaled(
@@ -567,19 +574,10 @@ def _moe_gemm_a8w4(
     # scalar fp8 scale
     if X_static_scale is not None:
         acc = acc * gl.load(X_static_scale)
-    # bias
-    offs_m = BLOCK_M * block_id + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-    )
-    offs_y_n = BLOCK_N * pid_n + gl.arange(
-        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-    )
-    mask_m = offs_m < M
-    mask_n = offs_y_n < N
-    if B is not None:
-        BPtrs = B + expt_id * stride_b_e
-        bias = gl.amd.gfx1250.buffer_load(BPtrs, offs_y_n, mask=mask_n)
+
+    if bias is not None:
         acc = acc + bias[None, :]
+
     if APPLY_SWIGLU:
         out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=ADD_RESIDUAL)
         tl.static_assert(
@@ -612,4 +610,34 @@ def _moe_gemm_a8w4(
     mask = mask_m[:, None] & mask_n[None, :]
     if Quant_static_scale is None:
         out = out.to(tl.bfloat16)
-    gl.amd.gfx1250.buffer_store(out, Y, offs_y, mask=mask)
+
+    # TDM Store: accumulator → shared memory → global memory
+    if Quant_static_scale is None:
+        SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
+        )
+    else:
+        SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_N, 16]], [BLOCK_M, BLOCK_N], [1, 0]
+        )
+    y_buffer = gl.allocate_shared_memory(
+        Y.type.element_ty,
+        shape=[BLOCK_M, BLOCK_N],
+        layout=SHARED_LAYOUT_Y,
+    )
+    y_buffer.store(out)
+
+    # Ensure all wavefronts have finished writing to LDS before TDM reads it.
+    gl.barrier()
+
+    y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=Y,
+        shape=(M, N),
+        strides=(stride_y_m, stride_y_n),
+        block_shape=(BLOCK_M, BLOCK_N),
+        layout=SHARED_LAYOUT_Y,
+    )
+    gl.amd.gfx1250.tdm.async_store(
+        y_desc, [block_id * BLOCK_M, pid_n * BLOCK_N], y_buffer
+    )
+    gl.amd.gfx1250.tdm.async_wait(0)
