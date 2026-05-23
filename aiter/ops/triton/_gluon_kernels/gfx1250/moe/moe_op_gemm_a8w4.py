@@ -243,6 +243,14 @@ def _moe_gemm_a8w4(
         SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[256, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0]
         )
+    if Quant_static_scale is not None:
+        SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_N, 16]], [BLOCK_M, BLOCK_N], [1, 0]
+        )
+    else:
+        SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
+        )
 
     if GatherIndx is None:
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -609,22 +617,13 @@ def _moe_gemm_a8w4(
 
     # quant
     if Quant_static_scale is not None:
-        SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_N, 16]], [BLOCK_M, BLOCK_N], [1, 0]
-        )
         out = _compute_static_fp8_quant(out, gl.load(Quant_static_scale))
     else:
-        SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
-        )
         out = out.to(tl.bfloat16)
 
     # TDM Store: accumulator → shared memory → global memory
     Y += start_m * stride_y_m
     y_buffer.store(out)
-
-    # Ensure all wavefronts have finished writing to LDS before TDM reads it.
-    gl.barrier()
 
     y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=Y,
