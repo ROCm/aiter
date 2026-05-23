@@ -71,7 +71,9 @@ def test_fmoe(
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
-    assert 0 <= hidden_pad < model_dim, f"invalid hidden_pad={hidden_pad} for model_dim={model_dim}"
+    assert (
+        0 <= hidden_pad < model_dim
+    ), f"invalid hidden_pad={hidden_pad} for model_dim={model_dim}"
     assert (
         0 <= intermediate_pad < inter_dim
     ), f"invalid intermediate_pad={intermediate_pad} for inter_dim={inter_dim}"
