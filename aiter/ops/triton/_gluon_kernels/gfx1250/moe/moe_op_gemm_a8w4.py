@@ -245,11 +245,11 @@ def _moe_gemm_a8w4(
         )
     if Quant_static_scale is not None:
         SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_N, 16]], [BLOCK_M, BLOCK_N], [1, 0]
+            [[OUT_BLOCK_N, 16]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
         )
     else:
         SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
+            [[OUT_BLOCK_N, 8]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
         )
 
     if GatherIndx is None:
@@ -594,22 +594,12 @@ def _moe_gemm_a8w4(
         )
         offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
         mask_m = offs_m < M
-        y_buffer = gl.allocate_shared_memory(
-            Y.type.element_ty,
-            shape=[BLOCK_M, OUT_BLOCK_N],
-            layout=SHARED_LAYOUT_Y,
-        )
     else:
         tl.static_assert(
             ACTIVATION_REDUCTION_N == 1,
             "Activation reduction must be 1 if no activation fn is provided",
         )
         out = acc
-        y_buffer = gl.allocate_shared_memory(
-            Y.type.element_ty,
-            shape=[BLOCK_M, BLOCK_N],
-            layout=SHARED_LAYOUT_Y,
-        )
 
     if Gammas is not None:
         gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
@@ -623,16 +613,20 @@ def _moe_gemm_a8w4(
 
     # TDM Store: accumulator → shared memory → global memory
     Y += start_m * stride_y_m
-    y_buffer.store(out)
-
+    y_buffer = gl.allocate_shared_memory(
+        Y.type.element_ty,
+        shape=[BLOCK_M, OUT_BLOCK_N],
+        layout=SHARED_LAYOUT_Y,
+    )
     y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=Y,
         shape=(M, yN),
         strides=(stride_y_m, stride_y_n),
-        block_shape=(BLOCK_M, BLOCK_N),
+        block_shape=(BLOCK_M, OUT_BLOCK_N),
         layout=SHARED_LAYOUT_Y,
     )
+    y_buffer.store(out)
     gl.amd.gfx1250.tdm.async_store(
-        y_desc, [block_id * BLOCK_M, pid_n * BLOCK_N], y_buffer
+        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
     )
     gl.amd.gfx1250.tdm.async_wait(0)
