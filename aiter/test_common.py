@@ -429,28 +429,25 @@ def _check_catastrophic(actual_max_delta, a, b, max_abs_delta, catastrophic_chec
 
     Priority order (returns True at the first hit):
 
-    1. NaN / Inf in either tensor -- always catastrophic regardless of
-       any flag. Covers tuner partial-write (mp_tuner.worker fills outputs
-       with NaN sentinel) and any kernel that crashes / blows up
-       numerically.
-    2. Explicit ``max_abs_delta`` -- opt-in hard cap, takes precedence over
+    1. Explicit ``max_abs_delta`` -- opt-in hard cap, takes precedence over
        the relative heuristic for callers that know the acceptable absolute
        magnitude.
-    3. ``catastrophic_check=True`` -- enables the relative-magnitude
-       heuristic (delta > ref_max * 0.5). Caller asserts the comparison is
-       position-sensitive; do NOT enable on sort/permutation-sensitive
-       data.
-    4. Otherwise: not catastrophic. The caller gets ``err_ratio`` back via
+    2. ``catastrophic_check=True`` -- enables NaN/Inf detection and the
+       relative-magnitude heuristic (delta > ref_max * 0.5). NaN/Inf in
+       either tensor is catastrophic (covers tuner NaN sentinel and
+       numerically blown-up kernels). Do NOT enable on data that may
+       legitimately contain NaN in padding regions.
+    3. Otherwise: not catastrophic. The caller gets ``err_ratio`` back via
        the normal return value and decides what to do with it.
 
     ``torch.isfinite`` is safe on integer / byte tensors (returns all True),
     so this function works uniformly across dtypes.
     """
-    if not torch.isfinite(a).all() or not torch.isfinite(b).all():
-        return True
     if max_abs_delta is not None:
         return actual_max_delta > max_abs_delta
     if catastrophic_check:
+        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+            return True
         return _relmag_catastrophic(actual_max_delta, b)
     return False
 
@@ -459,11 +456,11 @@ def _catastrophic_check_silent(a, b, max_abs_delta, catastrophic_check):
     """Same policy as ``_check_catastrophic`` but without an already-computed
     ``actual_max_delta``. Used by the not-printLog (tuner) fast path so we
     avoid materialising masked tensors when ``isclose`` already failed."""
-    if not torch.isfinite(a).all() or not torch.isfinite(b).all():
-        return True
     if max_abs_delta is not None:
         return (a - b).abs().max().item() > max_abs_delta
     if catastrophic_check:
+        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+            return True
         return _relmag_catastrophic((a - b).abs().max().item(), b)
     return False
 
