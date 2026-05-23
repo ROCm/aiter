@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+#include <string>
 #include <torch/all.h>
 #include <torch/extension.h>
 
@@ -10,7 +11,9 @@ torch::Tensor gemm_a8w8_blockscale_cktile(torch::Tensor& XQ,
                                           torch::Tensor& x_scale,
                                           torch::Tensor& w_scale,
                                           torch::Tensor& Y,
-                                          bool preshuffleB);
+                                          bool preshuffleB,
+                                          int splitK             = 0,
+                                          std::string kernelName = "");
 
 torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
                                                torch::Tensor& WQ,

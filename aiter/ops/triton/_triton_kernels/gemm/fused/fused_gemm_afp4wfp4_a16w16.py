@@ -205,7 +205,9 @@ def _fused_gemm_afp4wfp4_a16w16_kernel(
                         cache_modifier=cache_modifier,
                     )
 
-                accumulator_fp4 += tl.dot_scaled(a, a_scale, "e2m1", b, b_scale, "e2m1")
+                accumulator_fp4 = tl.dot_scaled(
+                    a, a_scale, "e2m1", b, b_scale, "e2m1", acc=accumulator_fp4
+                )
 
                 a_fp4_ptrs += (BLOCK_SIZE_K // 2) * stride_a_fp4_k
                 b_fp4_ptrs += (BLOCK_SIZE_K // 2) * stride_b_fp4_k
@@ -282,7 +284,7 @@ def _fused_gemm_afp4wfp4_a16w16_kernel(
                         cache_modifier=cache_modifier,
                     )
 
-                accumulator_bf16 += tl.dot(a, b, input_precision="ieee")
+                accumulator_bf16 = tl.dot(a, b, acc=accumulator_bf16)
 
                 a_ptrs += BLOCK_SIZE_K * stride_a_bf16_k
                 b_ptrs += BLOCK_SIZE_K * stride_b_bf16_k
@@ -572,7 +574,9 @@ def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel(
                     .trans(1, 0)
                 )
 
-                accumulator_fp4 += tl.dot_scaled(a, a_scale, "e2m1", b, b_scale, "e2m1")
+                accumulator_fp4 = tl.dot_scaled(
+                    a, a_scale, "e2m1", b, b_scale, "e2m1", acc=accumulator_fp4
+                )
 
                 a_fp4_ptrs += (BLOCK_SIZE_K // 2) * stride_a_fp4_k
                 b_fp4_ptrs += (BLOCK_SIZE_K // 2) * 16 * stride_b_fp4_k
@@ -652,7 +656,7 @@ def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel(
                         cache_modifier=cache_modifier,
                     )
 
-                accumulator_bf16 += tl.dot(a, b, input_precision="ieee")
+                accumulator_bf16 = tl.dot(a, b, acc=accumulator_bf16)
 
                 a_ptrs += BLOCK_SIZE_K * stride_a_bf16_k
                 b_ptrs += BLOCK_SIZE_K * stride_b_bf16_k

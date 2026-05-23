@@ -21,6 +21,7 @@ from aiter.int4_utils import (
     rearrange_4bit_elements,
     convert_int8_to_uint32_int4,
 )
+from aiter.ops.quant import per_1x32_i4_quant
 from aiter.utility import fp4_utils
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_gfx, get_cu_num
@@ -33,15 +34,22 @@ import logging
 from aiter.fused_moe import (
     fused_topk,
     fused_moe,
+    get_2stage_cfgs,
+    get_padded_M,
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.aot.flydsl.common import fail_on_aot_cache_miss
+from aiter.ops.flydsl.moe_common import GateMode
+import aiter.ops.flydsl.moe_kernels as _aiter_mk
 
 
 from aiter.ops.shuffle import (
     shuffle_weight,
     shuffle_scale_a16w4,
     shuffle_weight_a16w4,
+    pack_int8_to_packed_int4,
+    shuffle_scale_for_int4,
 )
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
@@ -164,6 +172,7 @@ def test_fmoe(
     E,
     topk,
     actType,
+    gateMode,
     qType,
     AQDType,
     WQDType,
@@ -175,6 +184,8 @@ def test_fmoe(
     strict_accuracy=True,
     use_bias=True,
     require_grouped_gemm=False,
+    check_aot_cache=True,
+    swiglu_limit=0.0,
 ):
     if require_grouped_gemm and os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
         print("[grouped-gemm-debug] enter test_fmoe", flush=True)
@@ -223,8 +234,9 @@ def test_fmoe(
             w1 = torch.full((E, inter_dim * 2, model_dim), _input_scale, dtype=dtype)
         else:
             w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) * _input_scale
-        if hidden_pad != 0 and intermediate_pad != 0:
+        if hidden_pad != 0:
             w1[:, :, -hidden_pad:] = 0
+        if intermediate_pad != 0:
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
         if _fast_init:
@@ -249,8 +261,9 @@ def test_fmoe(
         w2 = torch.full((E, model_dim, inter_dim), _w2_scale, dtype=dtype)
     else:
         w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) * _w2_scale
-    if hidden_pad != 0 and intermediate_pad != 0:
+    if intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
+    if hidden_pad != 0:
         w2[:, -hidden_pad:, :] = 0
     if _fast_init:
         exp_bias2 = torch.zeros((E, model_dim), dtype=dtype)
@@ -308,6 +321,13 @@ def test_fmoe(
     elif qType == aiter.QuantType.per_Token and WQDType == torch.int4:  # int4 w quant
         w1_qt, w1_scale = aiter.pertoken_quant(w1, quant_dtype=dtypes.i8, dtypeMax=7)
         w2_qt, w2_scale = aiter.pertoken_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
+    elif (
+        qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2
+    ):  # a16wi4: int4 weights, bf16 activations
+        w1_qt, w1_scale = per_1x32_i4_quant(w1)
+        w1_qt = w1_qt.view(dtypes.i4x2)
+        w2_qt, w2_scale = per_1x32_i4_quant(w2)
+        w2_qt = w2_qt.view(dtypes.i4x2)
     elif qType == aiter.QuantType.per_128x128:
 
         def weight_per_128x128_quant(weight, quant_dtype):
@@ -344,12 +364,12 @@ def test_fmoe(
 
     _grouped_debug("weight quant done")
 
-    if qType != aiter.QuantType.per_1x32:
-        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
-        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
-    else:
+    if qType == aiter.QuantType.per_1x32 and WQDType != dtypes.i4x2:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+    else:
+        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
+        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
 
     # Quant-ing a
     if qType == aiter.QuantType.per_128x128:
@@ -376,6 +396,9 @@ def test_fmoe(
             and WQDType == dtypes.fp4x2
         ):
             a1_qt = _gfx1250_fp8_round_trip_bf16(input)
+    elif qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2:  # a16wi4
+        a1_qt = input.to(dtypes.bf16)
+        a1_scale = None
     elif _skip_ref and qType == aiter.QuantType.per_1x32 and AQDType == dtypes.fp4x2:
         a1_qt = input
         a1_scale = None
@@ -413,6 +436,11 @@ def test_fmoe(
         else:
             exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
             exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
+    elif (
+        qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2
+    ):  # a16wi4: no bias
+        exp_bias1_aiter = exp_bias1 = None
+        exp_bias2_aiter = exp_bias2 = None
     else:
         exp_bias1_aiter = exp_bias1 = None
         exp_bias2_aiter = exp_bias2 = None
@@ -503,7 +531,27 @@ def test_fmoe(
                     flush=True,
                 )
         # For all gfx1250 FlyDSL paths scales stay RAW (no e8m0_shuffle).
-    elif WQDType == torch.int4:  # int4 w quant
+    elif qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2:  # a16wi4
+        w1_qt_aiter = pack_int8_to_packed_int4(
+            shuffle_weight(w1_qt_aiter.view(dtypes.i8), (16, 16))
+        )
+        w1_qt_aiter = w1_qt_aiter.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2).view(
+            dtypes.i4x2
+        )
+        w2_qt_aiter = pack_int8_to_packed_int4(
+            shuffle_weight(w2_qt_aiter.view(dtypes.i8), (16, 16))
+        )
+        w2_qt_aiter = w2_qt_aiter.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2).view(
+            dtypes.i4x2
+        )
+        # groupwise scale: [E, K//32, N] bf16 -> shuffle and flatten for kernel
+        w1_scale_aiter = (
+            shuffle_scale_for_int4(w1_scale, group_size=32).view(-1).contiguous()
+        )
+        w2_scale_aiter = (
+            shuffle_scale_for_int4(w2_scale, group_size=32).view(-1).contiguous()
+        )
+    elif WQDType == torch.int4:  # int4 w quant (a8w4)
         w1_qt_aiter = rearrange_4bit_elements(
             convert_int8_to_uint32_int4(
                 shuffle_weight(w1_qt_aiter, (16, 16), use_int4=True)
@@ -538,19 +586,54 @@ def test_fmoe(
         _grouped_debug("layout prep done; start reference or skip")
 
     # # ######################## stage 1 start ###########
+        stage1_ref_dtype = dtype
+        if (
+            actType == aiter.ActivationType.Swiglu
+            and qType == aiter.QuantType.per_1x32
+            and WQDType == dtypes.fp4x2
+        ):
+            runtime_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
+                token, actType, gateMode, qType, AQDType, WQDType
+            )
+            if runtime_aq_dtype == dtypes.fp4x2:
+                metadata = get_2stage_cfgs(
+                    get_padded_M(token),
+                    model_dim,
+                    inter_dim,
+                    E,
+                    topk,
+                    dtype,
+                    runtime_aq_dtype,
+                    WQDType,
+                    qType,
+                    w1.shape[1] == (inter_dim * 2),
+                    actType,
+                    doweight_stage1,
+                    hidden_pad,
+                    intermediate_pad,
+                    getattr(w1_qt_aiter, "is_shuffled", False)
+                    or getattr(w2_qt_aiter, "is_shuffled", False),
+                    gateMode,
+                )
+                if metadata.fuse_quant == "fp4":
+                    # Fused Swiglu MXFP4 quantizes the f32 activation directly.
+                    # Keep the torch reference at f32 until the quantization step.
+                    stage1_ref_dtype = dtypes.fp32
+
         out1_ref = torch_moe_stage1(
             a1_qt,
             w1_qt,
             w2_qt,
             topk_weights,
             topk_ids,
-            dtype=dtype,
+            dtype=stage1_ref_dtype,
             activation=actType,
             quant_type=qType,
             a1_scale=a1_scale,
             w1_scale=w1_scale,
             w1_bias=exp_bias1,
             doweight=doweight_stage1,
+            swiglu_limit=swiglu_limit,
         )
 
         # ######################## stage 2 start ###########
@@ -576,6 +659,11 @@ def test_fmoe(
                 and WQDType == dtypes.fp4x2
             ):
                 a2_qt = _gfx1250_fp8_round_trip_bf16(out1_ref)
+        elif (
+            qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2
+        ):  # a16wi4: bf16 pass-through
+            a2_qt = out1_ref
+            a2_scale = None
         else:
             a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
         a2_qt = a2_qt.view(token, topk, -1)
@@ -619,6 +707,8 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
+        swiglu_limit=swiglu_limit,
+        gate_mode=gateMode,
         num_iters=3,
         num_warmup=1,
         testGraph=_test_graph,
@@ -767,6 +857,9 @@ def test_fmoe(
     }
 
 
+test_fmoe_with_aot_cache_check = fail_on_aot_cache_miss(_aiter_mk)(test_fmoe)
+
+
 l_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
     (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
@@ -776,6 +869,7 @@ l_quant = [
     (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
+    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16wi4
 ]
 
 
@@ -820,6 +914,7 @@ parser.add_argument(
         256,
         1024,
         4096,
+        8192,
         163840,
     ],
     help="""Number of tokens.
@@ -839,7 +934,8 @@ parser.add_argument(
     4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
     5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8,
     6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2,  # a16w4,
-    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,""",
+    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,
+    8: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2,  # a16wi4,""",
 )
 
 parser.add_argument(
@@ -924,6 +1020,13 @@ parser.add_argument(
     action="store_true",
     help="Add an explicit gfx1250 a8w4 grouped_gemm case and assert it hits the grouped path.",
 )
+parser.add_argument(
+    "--swiglu-limit",
+    "-sl",
+    type=float,
+    default=0.0,
+    help="Limit the number of experts for swiglu activation type. Default is 0.0.",
+)
 
 args = parser.parse_args()
 
@@ -966,12 +1069,10 @@ def _row_to_kwargs(row):
     q_type = _str2enum(row["q_type"], aiter.QuantType)
     aq_dtype = _str2dtype(row["q_dtype_a"])
     wq_dtype = _str2dtype(row["q_dtype_w"])
-    act_type = _effective_act_type(
-        q_type,
-        aq_dtype,
-        wq_dtype,
-        _str2enum(row["act_type"], aiter.ActivationType),
-    )
+    act_type = _str2enum(row["act_type"], aiter.ActivationType)
+    # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
+    # from the selected activation/weight dtype layout used by fused_moe.
+    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
     return dict(
         dtype=_str2dtype(row["dtype"]),
         token=int(row["token"]),
@@ -980,6 +1081,7 @@ def _row_to_kwargs(row):
         E=int(row["expert"]),
         topk=int(row["topk"]),
         actType=act_type,
+        gateMode=gate_mode,
         qType=q_type,
         AQDType=aq_dtype,
         WQDType=wq_dtype,
@@ -1013,7 +1115,31 @@ def _iter_csv_cases():
                 e,
             )
             continue
+        # The reference path below uses the CSV q_dtype_a directly, while
+        # fused_moe selects q_dtype_a from the current Swiglu MXFP4 runtime mode.
+        # Skip CSV rows that are tuned for a different mode to avoid comparing
+        # e.g. an fp4x2 reference against a bf16/fp8 runtime dispatch.
+        expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
+            kwargs["token"],
+            kwargs["actType"],
+            kwargs["gateMode"],
+            kwargs["qType"],
+            kwargs["AQDType"],
+            kwargs["WQDType"],
+        )
+        if expected_aq_dtype is not None and kwargs["AQDType"] != expected_aq_dtype:
+            aiter.logger.info(
+                "skip row token=%s dim=(%s,%s): q_dtype_a=%s does not match "
+                "current Swiglu MXFP4 runtime mode (expected %s)",
+                row.get("token"),
+                row.get("model_dim"),
+                row.get("inter_dim"),
+                kwargs["AQDType"],
+                expected_aq_dtype,
+            )
+            continue
         kwargs["strict_accuracy"] = True
+        kwargs["check_aot_cache"] = True
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
@@ -1023,12 +1149,39 @@ def _iter_csv_cases():
 _PER1X32_BF16_FP4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2)
 _PER1X32_FP8_FP4 = (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2)
 _PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
+_PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
 
-def _effective_act_type(quant_type, aq_dtype, wq_dtype, act_type):
+def _effective_gate_mode(aq_dtype, wq_dtype):
+    if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
+        return GateMode.INTERLEAVE.value
+    return GateMode.SEPARATED.value
+
+
+def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
-        return aiter.ActivationType.Swiglu
-    return act_type
+        return swiglu_limit
+    return 0.0
+
+
+def _runtime_swiglu_mxfp4_q_dtype_a(
+    token, act_type, gate_mode, q_type, aq_dtype, wq_dtype
+):
+    """Return the q_dtype_a that fused_moe will select for Swiglu MXFP4."""
+    if act_type != aiter.ActivationType.Swiglu:
+        return None
+    if q_type != aiter.QuantType.per_1x32 or wq_dtype != dtypes.fp4x2:
+        return None
+    if aq_dtype not in [dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.fp4x2]:
+        return None
+
+    gate_mode = GateMode(gate_mode)
+    if gate_mode == GateMode.SEPARATED:
+        bound = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
+        return dtypes.bf16 if token < bound else dtypes.fp4x2
+
+    bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
+    return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
 
 
 def _iter_legacy_cases():
@@ -1054,13 +1207,15 @@ def _iter_legacy_cases():
             inter_dim=inter_dim,
             E=args.expert,
             topk=args.topk,
-            actType=_effective_act_type(quant_type, aq_dtype, wq_dtype, act_type),
+            actType=act_type,
+            gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
             use_g1u1=True,
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
+            check_aot_cache=False,
             **over,
         )
 
@@ -1148,6 +1303,19 @@ def _iter_legacy_cases():
                                 use_bias=False,
                                 require_grouped_gemm=True,
                             ), {"model": "grouped_gemm"}
+        elif triple == _PER1X32_BF16_I4:
+            for m in args.tokenNum:
+                yield _kw(
+                    dtype,
+                    m,
+                    model_dim,
+                    inter_dim,
+                    quant_type,
+                    aq_dtype,
+                    wq_dtype,
+                    doweight_stage1,
+                    aiter.ActivationType.Silu,
+                ), extras
         else:
             for act_type in args.act:
                 for m in args.tokenNum:
@@ -1182,7 +1350,33 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
-    ret = test_fmoe(**kwargs)
+    swiglu_limit = _effective_swiglu_limit(
+        kwargs["qType"],
+        kwargs["AQDType"],
+        kwargs["WQDType"],
+        args.swiglu_limit,
+    )
+    _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
+    _force_moe_bound_zero = (
+        kwargs["qType"],
+        kwargs["AQDType"],
+        kwargs["WQDType"],
+    ) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4)
+    if _force_moe_bound_zero:
+        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+    try:
+        run_test_fmoe = (
+            test_fmoe_with_aot_cache_check
+            if kwargs.get("check_aot_cache", False)
+            else test_fmoe
+        )
+        ret = run_test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+    finally:
+        if _force_moe_bound_zero:
+            if _old_moe_bound is None:
+                os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
+            else:
+                os.environ["AITER_BF16_FP8_MOE_BOUND"] = _old_moe_bound
     if ret is None:
         continue
     ret.update(extras)

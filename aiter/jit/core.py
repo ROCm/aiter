@@ -28,6 +28,18 @@ from torch_guard import torch_compile_guard  # noqa: E402
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
 
+
+def is_experimental_enabled() -> bool:
+    # Mirror the C++ side (atoi(...) != 0): treat unset and "0" as disabled,
+    # any other integer value as enabled. Non-numeric strings are treated as
+    # disabled to avoid accidentally turning on experimental code paths.
+    val = os.environ.get("AITER_ENABLE_EXPERIMENTAL", "0")
+    try:
+        return int(val) != 0
+    except ValueError:
+        return False
+
+
 aiter_lib = None
 
 
@@ -216,7 +228,12 @@ class AITER_CONFIG(object):
                     df[c] = _FILL_DEFAULTS.get(c, 0)
             source_pairs[i] = (path, df[all_cols])
 
-        merge_df = pd.concat([df for _, df in source_pairs], ignore_index=True)
+        non_empty = [df for _, df in source_pairs if not df.empty]
+        merge_df = (
+            pd.concat(non_empty, ignore_index=True)
+            if non_empty
+            else source_pairs[0][1].iloc[0:0].copy()
+        )
         has_tag = "_tag" in merge_df.columns
         if has_tag:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
@@ -693,7 +710,7 @@ def clone_3rdparty(third_party: str) -> None:
         dir_path = HIP_KITTENS_DIR
         third_party_info = {
             "url": "https://github.com/HazyResearch/HipKittens.git",
-            "commit": "b027c06ba935b80a53a7c7f7f82c0f9cbd0bf3cb",
+            "commit": "a5e308a7ec633b1e94a952de629f41653a0874f3",
         }
     elif third_party == "ComposableKernel":
         # TODO: ComposableKernel will be supported in the future
@@ -742,7 +759,10 @@ def build_module(
         elif AITER_REBUILD >= 2:
             rm_module(md_name)
         op_dir = f"{bd_dir}/{md_name}"
-        logger.info(f"start build [{md_name}] under {op_dir}")
+        logger.info(
+            f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
+            f"start build [{md_name}] under {op_dir}"
+        )
 
         opbd_dir = f"{op_dir}/build"
         src_dir = f"{op_dir}/build/srcs"
@@ -927,6 +947,7 @@ def build_module(
 
     def FinalFunc():
         logger.info(
+            f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
             f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
         )
 
@@ -1037,9 +1058,10 @@ def get_args_of_build(ops_name: str, exclude=[]):
             else:
                 pass
 
-        # undefined compile features will be replaced with default value
-        d_opt_build_args.update(d_ops)
-        return d_opt_build_args
+        # Use a fresh copy so keys from previous modules don't leak
+        result = dict(d_opt_build_args)
+        result.update(d_ops)
+        return result
 
     with open(this_dir + "/optCompilerConfig.json", "r") as file:
         data = json.load(file)
@@ -1070,7 +1092,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
                         continue
                     single_ops = convert(d_ops)
                     # exclude experimental ops if AITER_ENABLE_EXPERIMENTAL is not set
-                    if not os.getenv("AITER_ENABLE_EXPERIMENTAL", False):
+                    if not is_experimental_enabled():
                         if single_ops.get("is_experimental", False):
                             continue
                     d_single_ops = {

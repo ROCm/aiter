@@ -103,20 +103,20 @@ def gemm_a8w8_bpreshuffle_cktile(
 
 
 def _parse_flydsl_kernel_name(kernel_name: str):
-    """Parse tile config from flydsl kernelName, e.g.
-    'flydsl_bpreshuflle_128x64x256_F8_F8_B16_2x0x1x1_default'
-    -> (tile_m=128, tile_n=64, tile_k=256, lds_stage=2, cshuffle=0, async_copy=1, wpe=1)
-    Returns None on parse failure.
+    """Parse tile config from flydsl kernelName.
+    Returns ``(tile_m, tile_n, tile_k, lds_stage, cshuffle, async_copy,
+    waves_per_eu, xcd_swizzle)`` or None on parse failure.
     """
     import re
 
     m = re.match(
-        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)x(\d+)x(\d+)",
+        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_"
+        r"(\d+)x(\d+)x(\d+)x(\d+)x(\d+)",
         kernel_name,
     )
     if m is None:
         return None
-    return tuple(int(m.group(i)) for i in range(1, 8))
+    return tuple(int(m.group(i)) for i in range(1, 9))
 
 
 def gemm_a8w8_bpreshuffle_flydsl(
@@ -133,7 +133,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
     parsed = _parse_flydsl_kernel_name(str(kernel_name))
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
-    tm, tn, tk, lds, csh, acp, wpe = parsed
+    tm, tn, tk, lds, csh, acp, wpe, xcd = parsed
 
     flydsl_preshuffle_gemm_a8(
         XQ.contiguous(),
@@ -148,6 +148,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
         csh,
         acp,
         wpe,
+        xcd,
     )
     return Out
 
@@ -216,6 +217,8 @@ def gemm_a8w8_blockscale_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
+    kernelName: str = "",
 ) -> torch.Tensor: ...
 
 
@@ -231,6 +234,8 @@ def gemm_a8w8_blockscale_cktile(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     isBpreshuffled: bool = False,
+    splitK: int = 0,
+    kernelName: str = "",
 ) -> torch.Tensor: ...
 
 
@@ -245,6 +250,7 @@ def gemm_a8w8_blockscale_bpreshuffle_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    kernelName: str = "",
 ) -> torch.Tensor: ...
 
 
@@ -260,6 +266,7 @@ def gemm_a8w8_blockscale_bpreshuffle_cktile(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     isBpreshuffled: bool = True,
+    kernelName: str = "",
 ) -> torch.Tensor: ...
 
 
@@ -685,10 +692,28 @@ def gemm_a8w8_blockscale(
         )
         if config is not None:
             libtype = config["libtype"]
+            splitK = int(config.get("splitK", 0))
+            kernelName = str(config.get("kernelName", ""))
             if libtype == "ck":
-                return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+                return gemm_a8w8_blockscale_ck(
+                    XQ,
+                    WQ,
+                    x_scale,
+                    w_scale,
+                    Y,
+                    splitK=splitK,
+                    kernelName=kernelName,
+                )
             elif libtype == "cktile":
-                return gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Y)
+                return gemm_a8w8_blockscale_cktile(
+                    XQ,
+                    WQ,
+                    x_scale,
+                    w_scale,
+                    Y,
+                    splitK=splitK,
+                    kernelName=kernelName,
+                )
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
         try:
@@ -748,12 +773,16 @@ def gemm_a8w8_blockscale_bpreshuffle(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if config is not None:
         libtype = config["libtype"]
+        kernelName = str(config.get("kernelName", ""))
         if libtype == "cktile":
-            return gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_blockscale_bpreshuffle_cktile(
+                XQ, WQ, x_scale, w_scale, Y, kernelName=kernelName
+            )
         elif libtype == "ck":
-            return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_blockscale_bpreshuffle_ck(
+                XQ, WQ, x_scale, w_scale, Y, kernelName=kernelName
+            )
         elif libtype == "asm":
-            kernelName = config["kernelName"]
             splitK = config["splitK"]
             return gemm_a8w8_blockscale_bpreshuffle_asm(
                 XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
