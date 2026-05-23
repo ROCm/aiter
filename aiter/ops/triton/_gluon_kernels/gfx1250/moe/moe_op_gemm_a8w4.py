@@ -594,32 +594,25 @@ def _moe_gemm_a8w4(
             "Activation reduction must be 1 if no activation fn is provided",
         )
         out = acc
+
     if Gammas is not None:
         gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
         out *= gammas[:, None]
+
     # quant
     if Quant_static_scale is not None:
-        out = _compute_static_fp8_quant(out, gl.load(Quant_static_scale))
-    # write-back
-    Y += start_m * stride_y_m
-    offs_y_m = offs_m
-    offs_y = (
-        offs_y_m.to(index_type)[:, None] * stride_y_m
-        + offs_y_n.to(index_type)[None, :] * stride_y_n
-    )
-    mask = mask_m[:, None] & mask_n[None, :]
-    if Quant_static_scale is None:
-        out = out.to(tl.bfloat16)
-
-    # TDM Store: accumulator → shared memory → global memory
-    if Quant_static_scale is None:
-        SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
-        )
-    else:
         SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[BLOCK_N, 16]], [BLOCK_M, BLOCK_N], [1, 0]
         )
+        out = _compute_static_fp8_quant(out, gl.load(Quant_static_scale))
+    else:
+        SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
+        )
+        out = out.to(tl.bfloat16)
+
+    # TDM Store: accumulator → shared memory → global memory
+    Y += start_m * stride_y_m
     y_buffer = gl.allocate_shared_memory(
         Y.type.element_ty,
         shape=[BLOCK_M, BLOCK_N],
