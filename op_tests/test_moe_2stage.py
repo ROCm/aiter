@@ -71,6 +71,11 @@ def test_fmoe(
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
+    assert 0 <= hidden_pad < model_dim, f"invalid hidden_pad={hidden_pad} for model_dim={model_dim}"
+    assert (
+        0 <= intermediate_pad < inter_dim
+    ), f"invalid intermediate_pad={intermediate_pad} for inter_dim={inter_dim}"
+
     torch_quant = aiter.get_torch_quant(qType)
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
@@ -81,15 +86,27 @@ def test_fmoe(
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
         exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
+        # Dense torch reference still evaluates padded lanes; keep padded
+        # bias zero so invalid lanes do not affect activation quantization.
+        if intermediate_pad != 0:
+            exp_bias1[:, -intermediate_pad:] = 0
+            exp_bias1[:, inter_dim - intermediate_pad : inter_dim] = 0
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
+        # Dense torch reference still evaluates padded lanes; keep padded
+        # bias zero so invalid lanes do not affect activation quantization.
+        if intermediate_pad != 0:
+            exp_bias1.view(E, inter_dim)[:, -intermediate_pad:] = 0
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
     if intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
     if hidden_pad != 0:
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
+    # The padded hidden tail is outside the logical output dimension.
+    if hidden_pad != 0:
+        exp_bias2[:, -hidden_pad:] = 0
     if AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0
@@ -359,9 +376,12 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
+    valid_model_dim = model_dim - hidden_pad
+    out2_ref_check = out2_ref[:, :valid_model_dim]
+    out2_ck_check = out2_ck[:, :valid_model_dim]
     err = checkAllclose(
-        out2_ref,
-        out2_ck,
+        out2_ref_check,
+        out2_ck_check,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
@@ -371,7 +391,7 @@ def test_fmoe(
         sim = 2 * (x * y).sum() / denominator
         return 1 - sim
 
-    logits_diff = calc_diff(out2_ref, out2_ck)
+    logits_diff = calc_diff(out2_ref_check, out2_ck_check)
     if logits_diff > 1e-3:
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
