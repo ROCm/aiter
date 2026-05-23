@@ -864,7 +864,7 @@ df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
 
-_csv_out = os.environ.get("AITER_MOE_BENCH_CSV", "moe_bench.csv")
+_csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
 if _csv_out and len(df) > 0:
     if "model" in df.columns:
         csv_df = df[df["model"] != "legacy"].copy()

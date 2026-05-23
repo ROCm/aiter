@@ -509,7 +509,7 @@ jobs:
           name: standard-test-log-${{ matrix.runner }}-shard-${{ matrix.shard_idx }}
           path: |
             latest_test.log
-            moe_bench.csv
+            tuned_op_bench.csv
           retention-days: 7
 
       - name: Cleanup container
@@ -759,12 +759,12 @@ jobs:
         run: |
           ./.github/scripts/clean_up_rocm.sh
 
-  bench_moe:
-    # MoE perf regression check.
+  tuned_op_bench:
+    # Tuned operator perf regression check.
     # - PR: pull last main baseline CSV, compare current shard's CSV, warn-only
     # - push to main / workflow_dispatch: publish current CSV as next baseline
     # Only consumes csv from linux-aiter-mi35x-1 runner to avoid cross-arch noise.
-    name: MoE Bench Regression
+    name: Tuned Op Bench
     if: >-
       !github.event.pull_request.draft &&
       github.event.action != 'labeled' &&
@@ -781,18 +781,18 @@ jobs:
           pattern: standard-test-log-linux-aiter-mi35x-1-shard-*
           path: /tmp/logs/
 
-      - name: Locate current moe_bench.csv
+      - name: Locate current tuned_op_bench.csv
         id: current
         run: |
           shopt -s nullglob
-          csv_files=(/tmp/logs/*/moe_bench.csv)
+          csv_files=(/tmp/logs/*/tuned_op_bench.csv)
           if [[ ${#csv_files[@]} -eq 0 ]]; then
-              echo "::warning::No moe_bench.csv found in any mi35x shard; skipping bench_moe"
+              echo "::warning::No tuned op benchmark CSV found in any mi35x shard; skipping tuned_op_bench"
               echo "found=false" >> "$GITHUB_OUTPUT"
               exit 0
           fi
           if [[ ${#csv_files[@]} -gt 1 ]]; then
-              echo "::warning::Multiple moe_bench.csv found, using first: ${csv_files[0]}"
+              echo "::warning::Multiple tuned op benchmark CSVs found, using first: ${csv_files[0]}"
               printf '  %s\n' "${csv_files[@]}"
           fi
           cp "${csv_files[0]}" /tmp/current.csv
@@ -808,7 +808,7 @@ jobs:
         with:
           workflow: aiter-test.yaml
           commit: ${{ github.event.pull_request.base.sha }}
-          name: moe-bench-${{ github.event.pull_request.base.sha }}
+          name: tuned-op-bench-${{ github.event.pull_request.base.sha }}
           path: /tmp/baseline_pinned/
           if_no_artifact_found: warn
 
@@ -824,7 +824,7 @@ jobs:
           workflow: aiter-test.yaml
           branch: main
           name_is_regexp: true
-          name: ^moe-bench-[a-f0-9]+$
+          name: ^tuned-op-bench-[a-f0-9]+$
           path: /tmp/baseline_main/
           if_no_artifact_found: warn
 
@@ -836,13 +836,13 @@ jobs:
         run: |
           set -e
           baseline_csv=""
-          if [[ -f /tmp/baseline_pinned/moe_bench.csv ]]; then
-              baseline_csv=/tmp/baseline_pinned/moe_bench.csv
+          if [[ -f /tmp/baseline_pinned/tuned_op_bench.csv ]]; then
+              baseline_csv=/tmp/baseline_pinned/tuned_op_bench.csv
               echo "Using baseline pinned to PR.base.sha=${BASE_SHA:0:7}"
           else
               # fallback: pick first match under /tmp/baseline_main/*
               shopt -s nullglob
-              candidates=(/tmp/baseline_main/*/moe_bench.csv /tmp/baseline_main/moe_bench.csv)
+              candidates=(/tmp/baseline_main/*/tuned_op_bench.csv /tmp/baseline_main/tuned_op_bench.csv)
               for c in "${candidates[@]}"; do
                   if [[ -f "$c" ]]; then
                       baseline_csv="$c"
@@ -852,17 +852,17 @@ jobs:
               done
           fi
           if [[ -z "$baseline_csv" ]]; then
-              echo "::warning::No MoE baseline found (neither pinned PR.base.sha nor latest main); skipping compare."
+              echo "::warning::No tuned op benchmark baseline found (neither pinned PR.base.sha nor latest main); skipping compare."
               {
-                  echo "## MoE Bench"
+                  echo "## Tuned Op Bench"
                   echo
                   echo "_No baseline available — first run on this branch or main hasn't published baseline yet._"
               } >> "$GITHUB_STEP_SUMMARY"
               exit 0
           fi
-          echo "## MoE Bench (vs baseline)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Tuned Op Bench (vs baseline)" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          bash .github/scripts/check_moe_regression.sh \
+          bash .github/scripts/check_tuned_op_regression.sh \
               "$baseline_csv" /tmp/current.csv \
               | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -875,7 +875,7 @@ jobs:
            || github.event_name == 'workflow_dispatch')
         run: |
           mkdir -p /tmp/publish
-          cp /tmp/current.csv /tmp/publish/moe_bench.csv
+          cp /tmp/current.csv /tmp/publish/tuned_op_bench.csv
           python3 -c "
           import json, os, datetime
           meta = {
@@ -891,7 +891,7 @@ jobs:
           print(json.dumps(meta, indent=2))
           "
           ls -la /tmp/publish/
-          wc -l /tmp/publish/moe_bench.csv
+          wc -l /tmp/publish/tuned_op_bench.csv
 
       - name: Publish baseline artifact
         if: >-
@@ -900,6 +900,6 @@ jobs:
            || github.event_name == 'workflow_dispatch')
         uses: actions/upload-artifact@v4
         with:
-          name: moe-bench-${{ github.sha }}
+          name: tuned-op-bench-${{ github.sha }}
           path: /tmp/publish/
           retention-days: 90

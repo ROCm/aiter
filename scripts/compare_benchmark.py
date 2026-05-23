@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Compare two MoE benchmark CSVs (wide-table, metric=us, lower is better).
+"""Compare two tuned operator benchmark CSVs (wide-table, metric=us, lower is better).
 
-Used by .github/workflows/aiter-test.yaml bench_moe job to flag MoE
+Used by .github/workflows/aiter-test.yaml tuned_op_bench job to flag tuned operator
 performance regressions between a PR and main.
 
 CSV schema:
@@ -215,7 +215,7 @@ def main() -> int:
     baseline, _ = _read_csv(args.baseline_csv)
     current, key_cols = _read_csv(args.current_csv)
 
-    print(f"=== MoE bench: {args.current_label} vs {args.baseline_label} ===")
+    print(f"=== Tuned op bench: {args.current_label} vs {args.baseline_label} ===")
     print(f"  baseline: {args.baseline_csv}  ({len(baseline)} rows)")
     print(f"  current:  {args.current_csv}  ({len(current)} rows)")
     print(f"  thresholds: warn>{args.warn:.2f}, fail>{args.fail:.2f}")
@@ -262,12 +262,12 @@ def main() -> int:
     entries.sort(key=_entry_sort_key)
 
     # ── Build proper tabular output ──
-    # Columns: status, *display_cols, cur(us), base(us), ratio
+    # Columns: status, ratio, cur(us), base(us), *display_cols
     # display_cols = key_cols minus HIDE_DISPLAY_COLS, with each derived
     # tuple col inserted at the position of its first source col.
     # Hidden source cols still contribute to the join key.
     # Kernel diffs (not in table) go on indented ↳ sub-lines below each row.
-    METRIC_HDRS = ("cur(us)", "base(us)", "ratio")
+    METRIC_HDRS = ("ratio", "cur(us)", "base(us)")
 
     # Build display_cols: walk key_cols, drop hidden, splice derived in place
     _derived_sources = {
@@ -292,14 +292,14 @@ def main() -> int:
     def _row_cells(rank, tag, key, b_us, c_us, ratio):
         d = dict(key)
         cells = [f"[{tag}]"]
-        for c in display_cols:
-            cells.append(_cell_value(c, d))
+        cells.append(f"{ratio:.3f}" if ratio is not None else "-")
         cells.append(f"{c_us:.2f}" if c_us is not None else "-")
         cells.append(f"{b_us:.2f}" if b_us is not None else "-")
-        cells.append(f"{ratio:.3f}" if ratio is not None else "-")
+        for c in display_cols:
+            cells.append(_cell_value(c, d))
         return cells
 
-    header = ["status", *display_cols, *METRIC_HDRS]
+    header = ["status", *METRIC_HDRS, *display_cols]
     body = [_row_cells(*e) for e in entries]
 
     # Column widths = max(header, max value)
@@ -311,9 +311,8 @@ def main() -> int:
     # Right-justify the 3 metric cols (numbers), left-justify the rest.
     def _fmt_row(cells):
         out = []
-        n = len(cells)
         for i, c in enumerate(cells):
-            justify = str.rjust if i >= n - 3 else str.ljust
+            justify = str.rjust if 1 <= i <= 3 else str.ljust
             out.append(justify(c, widths[i]))
         return "  ".join(out)
 
