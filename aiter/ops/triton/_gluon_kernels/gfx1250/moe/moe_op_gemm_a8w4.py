@@ -627,7 +627,7 @@ def _moe_gemm_a8w4(
 
     y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=Y,
-        shape=(M, N),
+        shape=(M, yN),
         strides=(stride_y_m, stride_y_n),
         block_shape=(BLOCK_M, BLOCK_N),
         layout=SHARED_LAYOUT_Y,
