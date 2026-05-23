@@ -585,15 +585,23 @@ def _moe_gemm_a8w4(
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
         )
         offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
-        offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(0, OUT_BLOCK_N)
         mask_m = offs_m < M
-        mask_n = offs_y_n < yN
+        y_buffer = gl.allocate_shared_memory(
+            Y.type.element_ty,
+            shape=[BLOCK_M, OUT_BLOCK_N],
+            layout=SHARED_LAYOUT_Y,
+        )
     else:
         tl.static_assert(
             ACTIVATION_REDUCTION_N == 1,
             "Activation reduction must be 1 if no activation fn is provided",
         )
         out = acc
+        y_buffer = gl.allocate_shared_memory(
+            Y.type.element_ty,
+            shape=[BLOCK_M, BLOCK_N],
+            layout=SHARED_LAYOUT_Y,
+        )
 
     if Gammas is not None:
         gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
@@ -613,11 +621,6 @@ def _moe_gemm_a8w4(
 
     # TDM Store: accumulator → shared memory → global memory
     Y += start_m * stride_y_m
-    y_buffer = gl.allocate_shared_memory(
-        Y.type.element_ty,
-        shape=[BLOCK_M, BLOCK_N],
-        layout=SHARED_LAYOUT_Y,
-    )
     y_buffer.store(out)
 
     # Ensure all wavefronts have finished writing to LDS before TDM reads it.
