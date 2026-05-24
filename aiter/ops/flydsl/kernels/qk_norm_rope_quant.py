@@ -709,7 +709,11 @@ _DEFAULT_COMPILE_HINTS = {
 }
 
 
-@lru_cache(maxsize=None)
+# Bounded to keep parity with sibling flydsl ops (see fmha_kernels._get_kernel).
+# In V4-Pro deployment only a handful of (H, D, RD, quant, group_size,
+# scale_dtype, q_weighted) combinations actually fire, so 32 leaves wide
+# headroom while preventing unbounded growth from sweep/test enumeration.
+@lru_cache(maxsize=32)
 def compile_flydsl_qk_norm_rope_quant(
     *,
     num_q_heads: int,
@@ -787,11 +791,15 @@ def flydsl_qk_norm_rope_quant(
         q_weight: optional per-channel RMSNorm weight for Q, shape ``[D]``,
             bf16. When ``None`` (default, V4-Pro), Q is weightless. When
             provided, applied just like ``kv_weight``.
-        quant: if True, write fp8 (e4m3fnuz); else bf16.
+        quant: if True, write fp8 in the per-GFX native encoding selected by
+            ``aiter.dtypes.fp8`` (typically ``e4m3fnuz`` on gfx942 and
+            ``e4m3fn`` on gfx950); else bf16.
         quant_group_size: width of the 1×G scale block. Defaults to
-            ``head_dim`` (per-row scale). Supported values for sub-row:
-            ``{32, 64, 128}`` — must divide ``head_dim`` and be a multiple
-            of ``head_dim // BLOCK_THREADS`` (= 8 for V4-Pro).
+            ``head_dim`` (per-row scale). Any value that divides ``head_dim``
+            is accepted by the wrapper; the underlying kernel currently
+            requires ``G`` to be a multiple of ``head_dim // BLOCK_THREADS``
+            (= 8 for V4-Pro at D=512, BLOCK_THREADS=64), so the typical
+            sub-row choices are ``{32, 64, 128}``.
         scale_dtype: ``"fp32"`` (default) or ``"e8m0"`` (MX-format uint8).
         q_out, kv_out, q_scale, kv_scale: output buffers; allocated if None.
             ``q_out`` shape ``[T, H, D]``, ``kv_out`` shape ``[T, D]``,
@@ -808,28 +816,45 @@ def flydsl_qk_norm_rope_quant(
         (q_out, kv_out, q_scale_or_None, kv_scale_or_None)
         Scales are ``None`` when ``quant=False``.
     """
-    assert q.dtype == torch.bfloat16, f"q must be bf16, got {q.dtype}"
-    assert kv.dtype == torch.bfloat16, f"kv must be bf16, got {kv.dtype}"
-    assert (
-        kv_weight.dtype == torch.bfloat16
-    ), f"kv_weight must be bf16, got {kv_weight.dtype}"
-    assert kv.stride(-1) == 1, f"kv must be dense in the last dim, stride={kv.stride()}"
-    assert (
-        positions.dtype == torch.int64
-    ), f"positions must be int64, got {positions.dtype}"
-    assert (
-        scale_dtype in SCALE_DTYPE_OPTIONS
-    ), f"scale_dtype {scale_dtype!r} not in {SCALE_DTYPE_OPTIONS}"
-    if q_weight is not None:
-        assert (
-            q_weight.dtype == torch.bfloat16
-        ), f"q_weight must be bf16, got {q_weight.dtype}"
+    # Validate user-facing inputs with raise (not assert) so the checks are
+    # not stripped under ``python -O``. Internal codegen invariants inside
+    # _build_kernel/_store_*_vec_g remain as asserts on purpose.
+    if q.dtype != torch.bfloat16:
+        raise TypeError(f"q must be bf16, got {q.dtype}")
+    if kv.dtype != torch.bfloat16:
+        raise TypeError(f"kv must be bf16, got {kv.dtype}")
+    if kv_weight.dtype != torch.bfloat16:
+        raise TypeError(f"kv_weight must be bf16, got {kv_weight.dtype}")
+    if kv.stride(-1) != 1:
+        raise ValueError(
+            f"kv must be dense in the last dim, stride={kv.stride()}"
+        )
+    # The KV inner loop casts bf16 vectors to dword (i32) and computes the
+    # buffer-load offset as ``(row * kv.stride(0) + tid * VEC) >> 1``. That
+    # ``>> 1`` is only correct when the byte offset is dword-aligned for every
+    # row, which requires the row stride (in bf16 elements) to be even.
+    if kv.stride(0) % 2 != 0:
+        raise ValueError(
+            "kv row stride (in bf16 elements) must be even for dword-cast "
+            f"buffer loads, got kv.stride(0)={kv.stride(0)}"
+        )
+    if positions.dtype != torch.int64:
+        raise TypeError(f"positions must be int64, got {positions.dtype}")
+    if scale_dtype not in SCALE_DTYPE_OPTIONS:
+        raise ValueError(
+            f"scale_dtype {scale_dtype!r} not in {SCALE_DTYPE_OPTIONS}"
+        )
+    if q_weight is not None and q_weight.dtype != torch.bfloat16:
+        raise TypeError(f"q_weight must be bf16, got {q_weight.dtype}")
 
     H, D, RD = num_q_heads, head_dim, rope_head_dim
     T_tok = q.shape[0]
     G = quant_group_size if quant_group_size is not None else D
     NG = D // G
-    assert D % G == 0, f"head_dim {D} must be divisible by quant_group_size {G}"
+    if D % G != 0:
+        raise ValueError(
+            f"head_dim {D} must be divisible by quant_group_size {G}"
+        )
     q_weighted = q_weight is not None
     # Kernel always reads the q_weight parameter; pass a 1-elem dummy when
     # q_weighted=False (the const_expr gate inside the kernel ensures the
@@ -839,26 +864,39 @@ def flydsl_qk_norm_rope_quant(
 
     # Normalize Q to [T, H, D] (the kernel expects 3D).
     if q.dim() == 2:
-        assert q.shape[1] == H * D, f"q shape {tuple(q.shape)} != [T, H*D={H*D}]"
-        assert q.is_contiguous(), "2D q must be contiguous to .view as [T,H,D]"
+        if q.shape[1] != H * D:
+            raise ValueError(
+                f"q shape {tuple(q.shape)} != [T, H*D={H*D}]"
+            )
+        if not q.is_contiguous():
+            raise ValueError("2D q must be contiguous to .view as [T,H,D]")
         q_view = q.view(T_tok, H, D)
     else:
-        assert q.dim() == 3 and q.shape == (
-            T_tok,
-            H,
-            D,
-        ), f"q shape {tuple(q.shape)} != (T, H, D)=({T_tok}, {H}, {D})"
+        if q.dim() != 3 or q.shape != (T_tok, H, D):
+            raise ValueError(
+                f"q shape {tuple(q.shape)} != (T, H, D)=({T_tok}, {H}, {D})"
+            )
         q_view = q
+        # The kernel linearly indexes q_in as if it were dense [T,H,D] with
+        # the (H,D) inner block contiguous. Strided views (e.g. a slice of a
+        # wider tensor along an inner axis) would silently read the wrong
+        # elements, so reject anything that is not dense in the (H,D) tail.
+        if q_view.stride(-1) != 1 or q_view.stride(-2) != D:
+            raise ValueError(
+                "3D q must be contiguous in the (H, D) inner block "
+                f"(stride(-1)==1 and stride(-2)==D={D}), got stride={q_view.stride()}"
+            )
 
     # Normalize cos/sin to 2D [max_pos, RD/2]. Accept any shape whose last
     # dim is RD/2 (DeepSeek-V4 stores [max_pos, 1, 1, RD/2]).
-    assert (
-        cos_cache.shape[-1] == RD // 2
-    ), f"cos_cache last dim {cos_cache.shape[-1]} != RD/2 ({RD // 2})"
-    assert sin_cache.shape == cos_cache.shape, "cos/sin shape mismatch"
-    assert (
-        cos_cache.is_contiguous() and sin_cache.is_contiguous()
-    ), "cos/sin must be contiguous"
+    if cos_cache.shape[-1] != RD // 2:
+        raise ValueError(
+            f"cos_cache last dim {cos_cache.shape[-1]} != RD/2 ({RD // 2})"
+        )
+    if sin_cache.shape != cos_cache.shape:
+        raise ValueError("cos/sin shape mismatch")
+    if not (cos_cache.is_contiguous() and sin_cache.is_contiguous()):
+        raise ValueError("cos/sin must be contiguous")
     cos_2d = cos_cache.view(cos_cache.shape[0], RD // 2)
     sin_2d = sin_cache.view(sin_cache.shape[0], RD // 2)
 

@@ -294,6 +294,64 @@ def test_flydsl_qk_norm_rope_quant(
     }
 
 
+def test_flydsl_qk_norm_rope_quant_cos_sin_4d():
+    """Cover the advertised cos/sin layout that DeepSeek-V4 uses.
+
+    The wrapper docstring states cos/sin caches may have any leading shape
+    whose last dim is RD/2 — DeepSeek-V4 stores them as
+    ``[max_pos, 1, 1, RD/2]``. The matrix sweep above only exercises the
+    2D ``[max_pos, RD/2]`` shape, so add a single smoke case that reshapes
+    cos/sin to 4D and verifies the output is bit-identical to the 2D path.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+
+    T, H, D, RD = 16, 16, 512, 64
+
+    max_pos = max(T, 64)
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, RD, 2, device=device).float() / RD))
+    pos_range = torch.arange(max_pos, device=device).float()
+    freqs = torch.einsum("i,j->ij", pos_range, inv_freq)
+    cos_2d = freqs.cos().to(torch.bfloat16).contiguous()
+    sin_2d = freqs.sin().to(torch.bfloat16).contiguous()
+    cos_4d = cos_2d.view(max_pos, 1, 1, RD // 2)
+    sin_4d = sin_2d.view(max_pos, 1, 1, RD // 2)
+
+    q = torch.randn(T, H * D, dtype=torch.bfloat16, device=device) * 0.1
+    Q_LORA = 1536
+    qkv_a = torch.randn(T, Q_LORA + D, dtype=torch.bfloat16, device=device) * 0.1
+    _, kv = torch.split(qkv_a, [Q_LORA, D], dim=-1)
+    kv_w = torch.randn(D, dtype=torch.bfloat16, device=device).abs() + 0.5
+    pos = torch.randint(0, max_pos - 1, (T,), dtype=torch.int64, device=device)
+
+    out_2d = flydsl_qk_norm_rope_quant(
+        q,
+        kv,
+        kv_w,
+        cos_2d,
+        sin_2d,
+        pos,
+        num_q_heads=H,
+        head_dim=D,
+        rope_head_dim=RD,
+    )
+    out_4d = flydsl_qk_norm_rope_quant(
+        q,
+        kv,
+        kv_w,
+        cos_4d,
+        sin_4d,
+        pos,
+        num_q_heads=H,
+        head_dim=D,
+        rope_head_dim=RD,
+    )
+    # 2D vs 4D cos/sin must produce bit-identical results — the wrapper just
+    # .view()s the cache; identical underlying storage means identical loads.
+    torch.testing.assert_close(out_2d[0], out_4d[0], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(out_2d[1], out_4d[1], atol=0.0, rtol=0.0)
+
+
 # ============================================================================
 # argparse + matrix sweep
 # ============================================================================
@@ -367,6 +425,9 @@ parser.add_argument(
     help="bf16 only (ignore -q).",
 )
 args = parser.parse_args()
+
+# Smoke-test the advertised 4D cos/sin layout once before sweeping.
+test_flydsl_qk_norm_rope_quant_cos_sin_4d()
 
 quant_keys = ["bf16"] if args.no_quant else args.quant
 qweight_modes = [False, True] if args.qweight else [False]
