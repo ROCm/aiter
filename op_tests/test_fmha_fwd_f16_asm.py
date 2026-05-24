@@ -156,13 +156,20 @@ def _nrms(actual: torch.Tensor, expected: torch.Tensor) -> float:
     Definition matches op_tests/test_mha_mxfp8.py:
         nrms = sqrt(sum((|a-b| / max(|b|, eps))^2)) /
                (sqrt(numel) * max(|a|.max, |b|.max, eps))
-    A small relative metric (~1e-3 for bf16, ~1e-6 for fp32) regardless of
-    output magnitude — useful complement to the absolute max-diff check.
+
+    eps must be chosen above the dtype's effective resolution; otherwise the
+    `1 / max(|b|, eps)` term blows up for the (legitimately) near-zero
+    elements common in softmax outputs, producing huge nrms values that have
+    nothing to do with the kernel actually being wrong.  For bf16 (relative
+    precision ~3.9e-3) we use eps=1e-3: this lets ~0 outputs contribute at
+    most a per-element relative error of `|a-b| / 1e-3`, which for valid
+    bf16-precision kernel output is well under 1 (consistent with the
+    overall metric being a small ~1e-3 number on PASSing kernels).
     """
     a32 = actual.detach().float().cpu()
     b32 = expected.detach().float().cpu()
     abs_diff = (a32 - b32).abs()
-    eps = 1e-7
+    eps = 1e-3
     max_item = max(a32.abs().max().item(), b32.abs().max().item(), eps)
     sq_diff = (abs_diff / b32.abs().clamp(min=eps)).pow(2)
     return (sq_diff.sum().sqrt() / (math.sqrt(b32.numel()) * max_item)).item()
@@ -311,7 +318,11 @@ def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("is_causal", [False, True])
+# Only causal kernels are shipped on gfx1250 (CSV registers only `mask=1`
+# entries — the nocausal `_brd_v8` binaries were removed).  is_causal is kept
+# as a parameter so the kernel-call sites still receive the (now always-True)
+# flag explicitly; if a nocausal binary is re-added, just add `False` back.
+@pytest.mark.parametrize("is_causal", [True])
 @pytest.mark.parametrize(
     "head_dim,hq,hk,sq,sk,batch",
     [
@@ -430,7 +441,12 @@ def test_fmha_fwd_f16_correctness(head_dim, hq, hk, sq, sk, batch, is_causal):
 
 
 def test_fmha_fwd_f16_ops_layer():
-    """Direct ops-layer call: bshd qkv (sbhd memory layout), D64 + non-zero sink."""
+    """Direct ops-layer call: bshd qkv (sbhd memory layout), D64 + non-zero sink.
+
+    Uses is_causal=True because only causal binaries are registered in the
+    CSV (mask=1 rows).  The test purpose is to exercise the low-level ops
+    entry point with a D64+sink call; causal vs nocausal is orthogonal here.
+    """
     if get_gfx() not in ["gfx1250"]:
         return
     device = "cuda"
@@ -456,11 +472,11 @@ def test_fmha_fwd_f16_ops_layer():
         k,
         v,
         scale=scale,
-        is_causal=False,
+        is_causal=True,
         sink=sink,
         via="ops",
     )
-    out_ref, lse_ref = run_ref(q, k, v, is_causal=False, sink=sink)
+    out_ref, lse_ref = run_ref(q, k, v, is_causal=True, sink=sink)
 
     _cmp(out_kernel, out_ref, rtol=1e-2, atol=1e-2)
     _cmp(lse_asm, lse_ref, rtol=1e-2, atol=1e-2)
@@ -488,8 +504,10 @@ def test_fmha_fwd_f16_d64_requires_sink():
         device=device,
     )
     scale = 1.0 / math.sqrt(64)
+    # is_causal=True because only causal kernels are registered in the CSV;
+    # the error path being tested (D64 + sink=None) is orthogonal to causal.
     with pytest.raises(RuntimeError, match="D64.*sink"):
-        aiter.fmha_fwd_f16_asm(q, k, v, scale, False, True, sink=None)
+        aiter.fmha_fwd_f16_asm(q, k, v, scale, True, True, sink=None)
 
 
 # ---------------------------------------------------------------------------
@@ -522,16 +540,19 @@ def test_fmha_fwd_f16_layout(layout, head_dim):
     scale = 1.0 / math.sqrt(head_dim)
     sink = _d64_sink(hq, device) if head_dim == 64 else None
 
+    # is_causal=True: only causal kernels are registered in the CSV.  The
+    # layout test purpose (verify non-contiguous bshd views work) is
+    # orthogonal to causal masking, so causal=True is a fine choice here.
     out_kernel, lse_asm = run_kernel(
         q,
         k,
         v,
         scale=scale,
-        is_causal=False,
+        is_causal=True,
         sink=sink,
         via="public",
     )
-    out_ref, lse_ref = run_ref(q, k, v, is_causal=False, sink=sink)
+    out_ref, lse_ref = run_ref(q, k, v, is_causal=True, sink=sink)
 
     _cmp(
         out_kernel,
@@ -557,7 +578,8 @@ def test_fmha_fwd_f16_layout(layout, head_dim):
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("is_causal", [False, True])
+# Only causal kernels are shipped (see test_fmha_fwd_f16_correctness comment).
+@pytest.mark.parametrize("is_causal", [True])
 def test_fmha_fwd_f16_via_flash_attn_func(head_dim, is_causal):
     if get_gfx() not in ["gfx1250"]:
         return
@@ -618,9 +640,45 @@ def test_fmha_fwd_f16_via_flash_attn_func(head_dim, is_causal):
 # ---------------------------------------------------------------------------
 
 
+# Initialization patterns for perf q/k/v buffers.
+#   "randn"     : standard normal (default; exercises real attention math).
+#   "const0.25" : fill every element with 0.25 — matches poc_kl
+#                 fmha_batch_init `init_pattern=10` used in cpp perf runs.
+#                 Useful when comparing pytest perf numbers to a cpp baseline
+#                 that was produced with constant-fill inputs (rules out any
+#                 perf swings caused by data-dependent kernel behavior, e.g.
+#                 denormal handling or softmax-saturation paths).
+_PERF_INITS = ["randn", "const0.25"]
+
+
+def _make_qkv_perf(init: str, *, layout, sq, sk, batch, hq, hk, d, dtype, device):
+    """Allocate (q, k, v) in `layout` memory with bshd-shaped views, using the
+    requested perf-init pattern.  See `make_qkv_bshd` for layout semantics."""
+    if init == "randn":
+        return make_qkv_bshd(
+            layout=layout, sq=sq, sk=sk, batch=batch, hq=hq, hk=hk, d=d,
+            dtype=dtype, device=device,
+        )
+    if init == "const0.25":
+        # Use randn-allocated bshd-shaped views (so .stride() reflects the
+        # requested layout's memory), then fill in-place with 0.25.  In-place
+        # `.fill_()` is layout-agnostic so this works for non-contiguous views.
+        q, k, v = make_qkv_bshd(
+            layout=layout, sq=sq, sk=sk, batch=batch, hq=hq, hk=hk, d=d,
+            dtype=dtype, device=device,
+        )
+        q.fill_(0.25)
+        k.fill_(0.25)
+        v.fill_(0.25)
+        return q, k, v
+    raise ValueError(f"unknown perf init pattern: {init!r}")
+
+
+@pytest.mark.parametrize("init", _PERF_INITS)
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("is_causal", [False, True])
-def test_fmha_fwd_f16_perf(head_dim, is_causal):
+# Only causal kernels are shipped (see test_fmha_fwd_f16_correctness comment).
+@pytest.mark.parametrize("is_causal", [True])
+def test_fmha_fwd_f16_perf(head_dim, is_causal, init):
     if get_gfx() not in ["gfx1250"]:
         return
     device = "cuda"
@@ -634,7 +692,8 @@ def test_fmha_fwd_f16_perf(head_dim, is_causal):
         sq, batch, hq, hk, sk = 8192, 2, 64, 8, 8192
     else:  # head_dim == 128
         sq, batch, hq, hk, sk = 4096, 2, 64, 4, 4096
-    q, k, v = make_qkv_bshd(
+    q, k, v = _make_qkv_perf(
+        init,
         layout=2,
         sq=sq,
         sk=sk,
@@ -657,14 +716,17 @@ def test_fmha_fwd_f16_perf(head_dim, is_causal):
         is_causal,
         False,
         sink=sink,
-        num_iters=10,
-        num_warmup=2,
+        num_iters=20,
+        num_warmup=10,
     )
     flops = 2.0 * batch * hq * sq * sk * (2 * head_dim)
     if is_causal:
         flops /= 2.0
     tflops = flops / (us * 1e-6) / 1e12
-    print(f"[perf] d={head_dim} causal={is_causal}: {us:.1f}us, {tflops:.2f} TFLOPS")
+    print(
+        f"[perf] d={head_dim} causal={is_causal} init={init}: "
+        f"{us:.1f}us, {tflops:.2f} TFLOPS"
+    )
     # Sanity: catch silent-PASS when timing infrastructure breaks (e.g. profiler
     # / ROCTracer drops events → us=0, TFLOPS=inf).  Without these asserts the
     # test would PASS with bogus numbers.

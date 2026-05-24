@@ -298,11 +298,21 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         name, [&]() { return AiterAsmKernel(name, co_name); });
 
     // ---- launch ------------------------------------------------------------
+    // gdx = ceil(q_seq_len / sub_Q) is the total number of Q-tiles to compute.
+    // When s_opt bit1 (double_q) is set, each WG processes 2 Q-tiles internally,
+    // so launch_gdx must be halved.  Mirrors poc_kl fmha_fwd_f16.cpp:
+    //   int tg_div = (double_q != 0) ? 2 : 1;
+    //   global_size_x = (q_tile_count + tg_div - 1) / tg_div * blockSizeX;
+    // The four shipped _brd v8 kernel binaries all support runtime double_q=1
+    // (D64 _rxy_sink_brd / _rxy_sink_cas_brd, D128 _rxy_brd / _rxy_cas_brd).
     const int wv_tg = 4;
     const int bdx   = (wv_tg == 4) ? 128 : 256;
-    const int gdx   = (q_seq_len + sub_Q - 1) / sub_Q;  // Q-tile count
-    const int gdy   = q_head_num;
-    const int gdz   = batch;
+    const int q_tile_count = (q_seq_len + sub_Q - 1) / sub_Q;
+    const bool double_q    = (args.opt & 0x2) != 0;  // bit1 of s_opt
+    const int  tg_div      = double_q ? 2 : 1;
+    const int  gdx         = (q_tile_count + tg_div - 1) / tg_div;
+    const int  gdy         = q_head_num;
+    const int  gdz         = batch;
 
     // All _rxy kernels use remap_xy=1: swap gdx↔gdy at launch so that
     // bid.x indexes heads and bid.y indexes Q-tiles.
