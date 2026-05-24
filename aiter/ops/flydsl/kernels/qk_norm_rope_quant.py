@@ -52,7 +52,11 @@ from typing import Optional, Tuple
 
 import torch
 
-from aiter import dtypes as aiter_dtypes
+# Import via aiter.utility (not the top-level `from aiter import dtypes`):
+# the latter only resolves after aiter/__init__.py finishes, which is not
+# the case during setup.py's AOT-compile pass that walks the package
+# before its __init__ has fully run.
+from aiter.utility import dtypes as aiter_dtypes
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
