@@ -656,16 +656,30 @@ def _make_qkv_perf(init: str, *, layout, sq, sk, batch, hq, hk, d, dtype, device
     requested perf-init pattern.  See `make_qkv_bshd` for layout semantics."""
     if init == "randn":
         return make_qkv_bshd(
-            layout=layout, sq=sq, sk=sk, batch=batch, hq=hq, hk=hk, d=d,
-            dtype=dtype, device=device,
+            layout=layout,
+            sq=sq,
+            sk=sk,
+            batch=batch,
+            hq=hq,
+            hk=hk,
+            d=d,
+            dtype=dtype,
+            device=device,
         )
     if init == "const0.25":
         # Use randn-allocated bshd-shaped views (so .stride() reflects the
         # requested layout's memory), then fill in-place with 0.25.  In-place
         # `.fill_()` is layout-agnostic so this works for non-contiguous views.
         q, k, v = make_qkv_bshd(
-            layout=layout, sq=sq, sk=sk, batch=batch, hq=hq, hk=hk, d=d,
-            dtype=dtype, device=device,
+            layout=layout,
+            sq=sq,
+            sk=sk,
+            batch=batch,
+            hq=hq,
+            hk=hk,
+            d=d,
+            dtype=dtype,
+            device=device,
         )
         q.fill_(0.25)
         k.fill_(0.25)
