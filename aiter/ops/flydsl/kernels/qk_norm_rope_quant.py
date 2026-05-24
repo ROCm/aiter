@@ -52,11 +52,13 @@ from typing import Optional, Tuple
 
 import torch
 
-# Import via aiter.utility (not the top-level `from aiter import dtypes`):
-# the latter only resolves after aiter/__init__.py finishes, which is not
-# the case during setup.py's AOT-compile pass that walks the package
-# before its __init__ has fully run.
-from aiter.utility import dtypes as aiter_dtypes
+# NOTE: ``aiter.utility.dtypes`` transitively imports ``aiter.ops.enum``,
+# whose ``ActivationType = type(_ActivationType(0))`` triggers a JIT call
+# into ``module_aiter_core``. That JIT module is not yet built when
+# setup.py's AOT-compile pass walks the package, so importing dtypes at
+# module load time crashes setup with ``KeyError: 'module_aiter_core'``.
+# Defer the import until the first runtime call instead — sibling modules
+# (moe_kernels._get_dtypes, gemm_kernels._get_dtypes) use the same pattern.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -72,18 +74,33 @@ from .tensor_shim import GTensor, _to_raw
 # --- shape constants (V4-Pro MVP) -------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64
 
-# fp8 + rstd-cancellation algebra coefficients. ``aiter.dtypes.fp8`` resolves
-# to the per-gfx native fp8 (e4m3fnuz on gfx942 MI300; e4m3fn on gfx950 MI355
-# / gfx1250). ``cvt_pk_fp8_f32`` emits bytes in the per-gfx native format, so
-# FP8_MAX must track that — hardcoding ``e4m3fnuz``'s 240 on gfx950 would (a)
-# clip outputs to a stricter range than needed and (b) leave the stored
-# dequant scale inconsistent with downstream consumers reading the tensor as
-# ``aiter.dtypes.fp8``.
-_FP8_DTYPE = aiter_dtypes.fp8
-_FP8_MAX = float(torch.finfo(_FP8_DTYPE).max)
+# SQRT2 has no aiter dependency, so it stays at module level.
 _SQRT2 = math.sqrt(2.0)
-_FP8_MAX_OVER_SQRT2 = _FP8_MAX / _SQRT2  # forward-factor coefficient
-_INV_FP8_MAX_SQRT2 = _SQRT2 / _FP8_MAX  # stored-scale coefficient
+
+
+@lru_cache(maxsize=1)
+def _fp8_const():
+    """Lazy-resolve fp8 algebra coefficients (per-GFX native fp8).
+
+    ``aiter.utility.dtypes.fp8`` selects e4m3fnuz on gfx942 MI300 and
+    e4m3fn on gfx950 MI355 / gfx1250. ``cvt_pk_fp8_f32`` emits bytes in
+    the per-gfx native format, so FP8_MAX must track that — hardcoding
+    e4m3fnuz's 240 on gfx950 would (a) clip outputs to a stricter range
+    than needed and (b) leave the stored dequant scale inconsistent with
+    downstream consumers reading the tensor as ``aiter.dtypes.fp8``.
+    Cached on first call (kernel build / launcher call), not at import.
+    """
+    from aiter.utility import dtypes as aiter_dtypes
+
+    fp8_dtype = aiter_dtypes.fp8
+    fp8_max = float(torch.finfo(fp8_dtype).max)
+    return {
+        "dtype": fp8_dtype,
+        "max": fp8_max,
+        "max_over_sqrt2": fp8_max / _SQRT2,  # forward-factor coefficient
+        "inv_max_sqrt2": _SQRT2 / fp8_max,  # stored-scale coefficient
+    }
+
 
 # --- supported quant-group sizes (1 × group_size block-scales) --------------
 # group_size == head_dim → per-row scale (single scale per token-head).
@@ -413,9 +430,10 @@ def _build_kernel(
                     rcp_am = llvm.call_intrinsic(
                         f32, "llvm.amdgcn.rcp.f32", [am_safe], [], []
                     )
-                    factor = arith.constant(_FP8_MAX_OVER_SQRT2, type=f32) * rcp_am
+                    _fc = _fp8_const()
+                    factor = arith.constant(_fc["max_over_sqrt2"], type=f32) * rcp_am
                     scale_val = (
-                        am_safe * rstd * arith.constant(_INV_FP8_MAX_SQRT2, type=f32)
+                        am_safe * rstd * arith.constant(_fc["inv_max_sqrt2"], type=f32)
                     )
 
                 # Group-leader lanes (one per quant group) write the scale.
@@ -908,7 +926,7 @@ def flydsl_qk_norm_rope_quant(
     cos_2d = cos_cache.view(cos_cache.shape[0], RD // 2)
     sin_2d = sin_cache.view(sin_cache.shape[0], RD // 2)
 
-    out_dtype = _FP8_DTYPE if quant else torch.bfloat16
+    out_dtype = _fp8_const()["dtype"] if quant else torch.bfloat16
     if q_out is None:
         q_out = torch.empty((T_tok, H, D), dtype=out_dtype, device=q.device)
     if kv_out is None:
