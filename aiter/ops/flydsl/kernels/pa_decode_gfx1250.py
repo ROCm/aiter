@@ -45,7 +45,6 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, tdm_ops, vector
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
-from flydsl.expr.numeric import Float32 as fxFloat32, Int32 as fxInt32
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
@@ -289,22 +288,20 @@ def compile_pa_decode_main(
         seq_idx = gpu.block_id("x")
         part_idx = gpu.block_id("z")
         lane_id = gpu.thread_id("x")
-        lane_kgrp = lane_id / arith.index(WMMA_M)  # 0 or 1
-        lane16 = lane_id % arith.index(WMMA_M)  # 0..15
+        lane_kgrp = lane_id / fx.Index(WMMA_M)  # 0 or 1
+        lane16 = lane_id % fx.Index(WMMA_M)  # 0..15
         kv_head = gpu.block_id("y")
-        num_kv_heads = arith.index_cast(T.index, i32_num_kv_heads.ir_value())
-        num_parts = arith.index_cast(T.index, i32_num_parts.ir_value())
-        max_blocks = arith.index_cast(T.index, i32_max_blocks_per_seq.ir_value())
+        num_kv_heads = fx.Index(i32_num_kv_heads)
+        num_parts = fx.Index(i32_num_parts)
+        max_blocks = fx.Index(i32_max_blocks_per_seq)
 
         sl_rsrc = buffer_ops.create_buffer_resource(arg_seq_lens, max_size=True)
         seq_len_i32 = buffer_ops.buffer_load(sl_rsrc, seq_idx, vec_width=1, dtype=T.i32)
-        seq_len = arith.index_cast(T.index, seq_len_i32)
+        seq_len = fx.Index(seq_len_i32)
 
         # check if partition is valid
-        part_first_tok = part_idx * arith.index(PARTITION_SIZE)
-        is_live = arith.cmpi(
-            arith.CmpIPredicate.slt, _raw(part_first_tok), _raw(seq_len)
-        )
+        part_first_tok = part_idx * fx.Index(PARTITION_SIZE)
+        is_live = part_first_tok < seq_len
 
         elem_ty = T.bf16 if dtype == "bf16" else T.f16
         wmma_op = (
@@ -314,20 +311,20 @@ def compile_pa_decode_main(
         )
 
         # --- Runtime strides ---
-        num_q_heads = num_kv_heads * arith.index(QUERY_GROUP_SIZE)
+        num_q_heads = num_kv_heads * fx.Index(QUERY_GROUP_SIZE)
 
         stride_bt_seq = max_blocks
 
         stride_o_seq = (
-            num_kv_heads * num_parts * arith.index(QUERY_GROUP_SIZE * HEAD_SIZE)
+            num_kv_heads * num_parts * fx.Index(QUERY_GROUP_SIZE * HEAD_SIZE)
         )
-        stride_o_head = num_parts * arith.index(QUERY_GROUP_SIZE * HEAD_SIZE)
-        stride_o_part = arith.index(QUERY_GROUP_SIZE * HEAD_SIZE)
-        stride_o_row = arith.index(HEAD_SIZE)
+        stride_o_head = num_parts * fx.Index(QUERY_GROUP_SIZE * HEAD_SIZE)
+        stride_o_part = fx.Index(QUERY_GROUP_SIZE * HEAD_SIZE)
+        stride_o_row = fx.Index(HEAD_SIZE)
 
-        stride_lse_seq = num_kv_heads * num_parts * arith.index(QUERY_GROUP_SIZE)
-        stride_lse_head = num_parts * arith.index(QUERY_GROUP_SIZE)
-        stride_lse_part = arith.index(QUERY_GROUP_SIZE)
+        stride_lse_seq = num_kv_heads * num_parts * fx.Index(QUERY_GROUP_SIZE)
+        stride_lse_head = num_parts * fx.Index(QUERY_GROUP_SIZE)
+        stride_lse_part = fx.Index(QUERY_GROUP_SIZE)
 
         # --- Buffer resources ---
         bt_rsrc_v4i32 = _build_v4i32_buffer_rsrc(arg_block_tables, arch=gpu_arch)
@@ -349,17 +346,19 @@ def compile_pa_decode_main(
         v_lds.get()
 
         # --- qk_scale in log2 domain (so we can use exp2) ---
-        qk_scale_f32 = arith.bitcast(T.f32, _raw(i32_qk_scale))
-        LOG2E = arith.constant(1.4426950408889634, type=T.f32)
-        qk_scale_log2_scalar = arith.mulf(qk_scale_f32, LOG2E)
-        qk_scale_log2_vec = vector.broadcast(T.vec(8, T.f32), qk_scale_log2_scalar)
+        qk_scale_f32 = fx.Float32(arith.bitcast(T.f32, i32_qk_scale.ir_value()))
+        LOG2E = fx.Float32(1.4426950408889634)
+        qk_scale_log2_scalar = qk_scale_f32 * LOG2E
+        qk_scale_log2_vec = vector.broadcast(
+            T.vec(8, T.f32), qk_scale_log2_scalar.ir_value()
+        )
 
         # --- Running state ---
         # SWAPPED-WMMA LAYOUT: the QK and PV WMMAs are invoked with operands
         # swapped (e.g. wmma(K, Q, …) instead of wmma(Q, K, …)) so that
         # each lane owns ONE QGSP-row (= lane16) and one kgrp.
-        neg_inf_f32 = arith.constant(float("-inf"), type=T.f32)
-        zero_f32 = arith.constant(0.0, type=T.f32)
+        neg_inf_f32 = fx.Float32(float("-inf"))
+        zero_f32 = fx.Float32(0.0)
 
         m_state = neg_inf_f32  # per-lane scalar (for row = lane16)
         l_state = zero_f32  # per-lane scalar
@@ -370,8 +369,8 @@ def compile_pa_decode_main(
         ]
 
         # lane decomposition for ds_load_tr16_b128
-        lane8 = lane16 % arith.index(8)
-        lane_ngrp = lane16 / arith.index(8)
+        lane8 = lane16 % fx.Index(8)
+        lane_ngrp = lane16 / fx.Index(8)
 
         # ---------------- Row mask for padded query-group rows ----------------
         # In swapped layout, QGSP-row = lane16. So is_row_valid is a single
@@ -381,8 +380,8 @@ def compile_pa_decode_main(
             -3.4e38
         )  # to avoid `exp2(-inf - -inf) = NaN` for fully-masked rows.
         neg_finite_max_vec8 = arith.constant_vector(NEG_FINITE_MAX, T.vec(8, T.f32))
-        qgs_idx = arith.index(QUERY_GROUP_SIZE)
-        is_row_valid = arith.cmpi(arith.CmpIPredicate.slt, _raw(lane16), _raw(qgs_idx))
+        qgs_idx = fx.Index(QUERY_GROUP_SIZE)
+        is_row_valid = lane16 < qgs_idx
 
         # ---------------- LDS load helpers ----------------
         def _load_wmma_A_frag(
@@ -399,10 +398,10 @@ def compile_pa_decode_main(
             lds_mem = lds_ptr.get()
             chunks = []
             for k0 in range_constexpr(2):
-                kk_base = arith.index(k_base_elem) + (
-                    arith.index(k0 * 2) + lane_kgrp
-                ) * arith.index(8)
-                elem_off = row_base_idx * arith.index(row_stride) + kk_base
+                kk_base = fx.Index(k_base_elem) + (
+                    fx.Index(k0 * 2) + lane_kgrp
+                ) * fx.Index(8)
+                elem_off = row_base_idx * fx.Index(row_stride) + kk_base
                 if stage_elem_off is not None:
                     elem_off = stage_elem_off + elem_off
                 chunk = vector.load_op(T.vec(8, elem_ty), lds_mem, [elem_off])
@@ -425,16 +424,16 @@ def compile_pa_decode_main(
             to pick the stage out of the V-slab.
             """
             lds_mem = lds_ptr.get()
-            k_row_in_lane = lane_kgrp * arith.index(8) + lane8
-            n_col_in_lane = n_col_base + lane_ngrp * arith.index(8)
-            base = (arith.index(k_base_elem) + k_row_in_lane) * arith.index(
+            k_row_in_lane = lane_kgrp * fx.Index(8) + lane8
+            n_col_in_lane = n_col_base + lane_ngrp * fx.Index(8)
+            base = (fx.Index(k_base_elem) + k_row_in_lane) * fx.Index(
                 row_stride
             ) + n_col_in_lane
             if stage_elem_off is not None:
                 base = stage_elem_off + base
             chunks = []
             for k_half in range_constexpr(2):
-                k_row_extra = arith.index(k_half * 16) * arith.index(row_stride)
+                k_row_extra = fx.Index(k_half * 16) * fx.Index(row_stride)
                 elem_off = base + k_row_extra
                 v = rocdl.lds_transpose_load(
                     T.vec(8, elem_ty), lds_mem, elem_off, elem_bytes
@@ -449,8 +448,8 @@ def compile_pa_decode_main(
         # Number of physical blocks this seq actually uses. We use this to
         # mask any block-table read whose logical index lies past the
         # seq's live block count to phys_blk = 0
-        KVB_idx = arith.index(KV_BLOCK_SIZE)
-        live_blocks = (seq_len + KVB_idx - arith.index(1)) / KVB_idx
+        KVB_idx = fx.Index(KV_BLOCK_SIZE)
+        live_blocks = (seq_len + KVB_idx - fx.Index(1)) / KVB_idx
         zero_i32 = arith.constant(0, type=T.i32)
 
         def _phys_blks_for_compute(compute_iter_idx):
@@ -466,26 +465,24 @@ def compile_pa_decode_main(
 
             Returns: list of `T.index` values, one per block in the tile.
             """
-            base_logical = part_idx * arith.index(
+            base_logical = part_idx * fx.Index(
                 BLOCKS_PER_PARTITION
-            ) + compute_iter_idx * arith.index(BLOCKS_PER_COMPUTE)
+            ) + compute_iter_idx * fx.Index(BLOCKS_PER_COMPUTE)
             bt_base = seq_idx * stride_bt_seq + base_logical
 
             out = []
             for ldi in range_constexpr(len(BT_LOAD_WIDTHS)):
                 this_width = BT_LOAD_WIDTHS[ldi]
                 this_offset = BT_LOAD_OFFSETS[ldi]
-                bt_off = bt_base + arith.index(this_offset)
+                bt_off = bt_base + fx.Index(this_offset)
                 # s_buffer_load offset is in BYTES — i32 elements ⇒ ×4.
-                bt_off_bytes_i32 = arith.index_cast(T.i32, bt_off * arith.index(4))
+                bt_off_bytes_i32 = arith.index_cast(T.i32, bt_off * fx.Index(4))
                 if this_width == 1:
                     phys_i32 = _s_buffer_load_b32(bt_rsrc_v4i32, bt_off_bytes_i32)
-                    logical_idx = base_logical + arith.index(this_offset)
-                    in_range = arith.cmpi(
-                        arith.CmpIPredicate.slt, _raw(logical_idx), _raw(live_blocks)
-                    )
-                    phys_i32 = arith.select(in_range, _raw(phys_i32), _raw(zero_i32))
-                    out.append(arith.index_cast(T.index, phys_i32))
+                    logical_idx = base_logical + fx.Index(this_offset)
+                    in_range = logical_idx < live_blocks
+                    phys_i32 = arith.select(in_range, phys_i32, zero_i32)
+                    out.append(fx.Index(phys_i32))
                 else:
                     # Vectorized scalar K$ load. b64 (width 2) and b128 (width 4)
                     # are the hardware-native sizes.
@@ -496,14 +493,10 @@ def compile_pa_decode_main(
                         elem = vector.extract(
                             phys_vec, static_position=[b], dynamic_position=[]
                         )
-                        logical_idx = base_logical + arith.index(this_offset + b)
-                        in_range = arith.cmpi(
-                            arith.CmpIPredicate.slt,
-                            _raw(logical_idx),
-                            _raw(live_blocks),
-                        )
-                        elem = arith.select(in_range, _raw(elem), _raw(zero_i32))
-                        out.append(arith.index_cast(T.index, elem))
+                        logical_idx = base_logical + fx.Index(this_offset + b)
+                        in_range = logical_idx < live_blocks
+                        elem = arith.select(in_range, elem, zero_i32)
+                        out.append(fx.Index(elem))
             return out
 
         def _issue_kv_load_single_block(
@@ -511,11 +504,11 @@ def compile_pa_decode_main(
         ):
             """Issue one TDM async 2D load of [KVB, HEAD] into LDS at byte offset
             `lds_byte_off` relative to the base of `lds_memref`."""
-            outer_off = (phys_blk * num_kv_heads + kv_head) * arith.index(KV_BLOCK_SIZE)
+            outer_off = (phys_blk * num_kv_heads + kv_head) * fx.Index(KV_BLOCK_SIZE)
             desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=kv_tensor,
                 lds_memref=lds_memref,
-                global_offset=(outer_off, arith.index(0)),
+                global_offset=(outer_off, fx.Index(0)),
                 tensor_shape=(KV_BLOCK_SIZE, HEAD_SIZE),
                 strides=(HEAD_SIZE, 1),
                 tile_shape=(KV_BLOCK_SIZE, HEAD_SIZE),
@@ -539,7 +532,7 @@ def compile_pa_decode_main(
 
             # K
             for b in range_constexpr(BLOCKS_PER_COMPUTE):
-                lds_sub_off = stage_byte_off + arith.index(b * one_block_bytes)
+                lds_sub_off = stage_byte_off + fx.Index(b * one_block_bytes)
                 _issue_kv_load_single_block(
                     arg_key_cache,
                     k_lds_mem,
@@ -550,7 +543,7 @@ def compile_pa_decode_main(
 
             # V
             for b in range_constexpr(BLOCKS_PER_COMPUTE):
-                lds_sub_off = stage_byte_off + arith.index(b * one_block_bytes)
+                lds_sub_off = stage_byte_off + fx.Index(b * one_block_bytes)
                 _issue_kv_load_single_block(
                     arg_value_cache,
                     v_lds_mem,
@@ -563,13 +556,13 @@ def compile_pa_decode_main(
 
         def _issue_q_load():
 
-            q_outer_off = seq_idx * num_q_heads + kv_head * arith.index(
+            q_outer_off = seq_idx * num_q_heads + kv_head * fx.Index(
                 QUERY_GROUP_SIZE
             )
             desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_query,
                 lds_memref=q_lds.get(),
-                global_offset=(q_outer_off, arith.index(0)),
+                global_offset=(q_outer_off, fx.Index(0)),
                 tensor_shape=(QUERY_GROUP_SIZE, HEAD_SIZE),
                 strides=(HEAD_SIZE, 1),
                 tile_shape=(QUERY_GROUP_SIZE, HEAD_SIZE),
@@ -583,13 +576,13 @@ def compile_pa_decode_main(
         # ---------------- Prologue: Q + compute tile 0 loads ----------------
         _issue_q_load()
         phys_blks_tile0 = _phys_blks_for_compute(
-            arith.index(0)
+            fx.Index(0)
         )  # load physical blocks for compute iter 0
         _issue_kv_tile_loads(
             k_lds.get(),
             v_lds.get(),
             phys_blks_tile0,
-            stage_byte_off=arith.index(0),  # tile 0 lands in stage 0
+            stage_byte_off=fx.Index(0),  # tile 0 lands in stage 0
         )
         tdm_ops.tensor_wait(FENCE_OUTSTANDING)  # we only wait for Q
 
@@ -613,39 +606,42 @@ def compile_pa_decode_main(
         # live partitions run COMPUTES_PER_PARTITION iters, dead partitions run 0
         iters_to_run = arith.select(
             is_live,
-            _raw(arith.index(COMPUTES_PER_PARTITION)),
-            _raw(arith.index(0)),
+            fx.Index(COMPUTES_PER_PARTITION),
+            fx.Index(0),
         )
-        init_state = [m_state, l_state, *pv_accs, arith.index(0)]
+
+        # Unwrap wrapped fx values for the scf.for init list (the loop expects
+        # raw MLIR Values; we re-wrap scalars at use sites inside the body).
+        def _unwrap(v):
+            return v.ir_value() if hasattr(v, "ir_value") else v
+
+        init_state = [_unwrap(m_state), _unwrap(l_state), *pv_accs, fx.Index(0)]
 
         for iv, state in range(
-            arith.index(0), iters_to_run, arith.index(1), init=init_state
+            fx.Index(0), iters_to_run, fx.Index(1), init=init_state
         ):
-            # Unpack loop-carried state.
-            m_state = state[0]
-            l_state = state[1]
+            # Unpack loop-carried state. Scalars get re-wrapped as fx.Float32 so
+            # subsequent operators / .maximumf() / .exp2() calls work naturally.
+            m_state = fx.Float32(state[0])
+            l_state = fx.Float32(state[1])
             pv_accs = list(state[2 : 2 + N_PV_TILES])
             cur_stage = state[2 + N_PV_TILES]
-            nxt_stage = arith.index(1) - cur_stage
+            nxt_stage = fx.Index(1) - cur_stage
 
             # Per-iter runtime stage offsets.
-            nxt_stage_byte_off = nxt_stage * arith.index(kv_one_bytes)
-            cur_stage_elem_off = cur_stage * arith.index(kv_lds_elems)
+            nxt_stage_byte_off = nxt_stage * fx.Index(kv_one_bytes)
+            cur_stage_elem_off = cur_stage * fx.Index(kv_lds_elems)
 
-            tile_first_tok = part_idx * arith.index(PARTITION_SIZE) + iv * arith.index(
+            tile_first_tok = part_idx * fx.Index(PARTITION_SIZE) + iv * fx.Index(
                 KV_COMPUTE_BLOCK_SIZE
             )
 
             # is_not_last → (iv < COMPUTES_PER_PARTITION - 1)
-            is_not_last = arith.cmpi(
-                arith.CmpIPredicate.slt,
-                _raw(iv),
-                _raw(arith.index(COMPUTES_PER_PARTITION - 1)),
-            )
+            is_not_last = iv < fx.Index(COMPUTES_PER_PARTITION - 1)
 
             # ---------- prefetch next tile + drain current K ----------
             if is_not_last:
-                next_iter_idx = iv + arith.index(1)
+                next_iter_idx = iv + fx.Index(1)
                 next_phys_blks = _phys_blks_for_compute(next_iter_idx)
                 _issue_kv_tile_loads(
                     k_lds_mem,
@@ -666,7 +662,7 @@ def compile_pa_decode_main(
                 arith.constant_vector(0.0, T.vec(8, T.f32)) for _ in range(N_QK_TILES)
             ]
             for n_tile in range_constexpr(N_QK_TILES):
-                n_row_lds = arith.index(n_tile * WMMA_M) + lane16
+                n_row_lds = fx.Index(n_tile * WMMA_M) + lane16
                 for ks in range_constexpr(K_QK_TILES):
                     k_frag = _load_wmma_A_frag(
                         k_lds,
@@ -690,10 +686,10 @@ def compile_pa_decode_main(
 
             # Scale by qk_scale * log2e so we can use exp2 later.
             for n_tile in range_constexpr(N_QK_TILES):
-                qk_accs[n_tile] = arith.mulf(qk_accs[n_tile], qk_scale_log2_vec)
+                qk_accs[n_tile] = qk_accs[n_tile] * qk_scale_log2_vec
 
             # Col mask (token < seq_len)
-            neg_inf_f32_local = arith.constant(float("-inf"), type=T.f32)
+            neg_inf_f32_local = fx.Float32(float("-inf"))
             for n_tile in range_constexpr(N_QK_TILES):
                 new_vals = []
                 for mi in range_constexpr(8):
@@ -702,14 +698,12 @@ def compile_pa_decode_main(
                     )
                     tok_abs_mi = (
                         tile_first_tok
-                        + arith.index(n_tile * WMMA_M)
-                        + lane_kgrp * arith.index(8)
-                        + arith.index(mi)
+                        + fx.Index(n_tile * WMMA_M)
+                        + lane_kgrp * fx.Index(8)
+                        + fx.Index(mi)
                     )
-                    in_range = arith.cmpi(
-                        arith.CmpIPredicate.slt, _raw(tok_abs_mi), _raw(seq_len)
-                    )
-                    v = arith.select(in_range, _raw(v), _raw(neg_inf_f32_local))
+                    in_range = tok_abs_mi < seq_len
+                    v = arith.select(in_range, v, neg_inf_f32_local)
                     new_vals.append(v)
                 qk_accs[n_tile] = vector.from_elements(T.vec(8, T.f32), new_vals)
 
@@ -718,8 +712,8 @@ def compile_pa_decode_main(
                 for n_tile in range_constexpr(N_QK_TILES):
                     qk_accs[n_tile] = arith.select(
                         is_row_valid,
-                        _raw(qk_accs[n_tile]),
-                        _raw(neg_finite_max_vec8),
+                        qk_accs[n_tile],
+                        neg_finite_max_vec8,
                     )
 
             # ------------------------ Online softmax (1-warp) ------------------------
@@ -727,31 +721,30 @@ def compile_pa_decode_main(
             # m_state, l_state, alpha are SCALAR per lane (lane16 = row).
 
             # Step 1: per-lane local max across all (n_tile, mi) → scalar.
-            local_max = vector.extract(
-                qk_accs[0], static_position=[0], dynamic_position=[]
+            local_max = fx.Float32(
+                vector.extract(qk_accs[0], static_position=[0], dynamic_position=[])
             )
             for mi in range_constexpr(1, 8):
                 v = vector.extract(
                     qk_accs[0], static_position=[mi], dynamic_position=[]
                 )
-                local_max = arith.maximumf(local_max, v)
+                local_max = local_max.maximumf(v)
             if N_QK_TILES > 1:
                 for n_tile in range_constexpr(1, N_QK_TILES):
                     for mi in range_constexpr(8):
                         v = vector.extract(
                             qk_accs[n_tile], static_position=[mi], dynamic_position=[]
                         )
-                        local_max = arith.maximumf(local_max, v)
+                        local_max = local_max.maximumf(v)
 
             # Step 2: within-warp max via shfl_xor(by 16) — swaps lane_kgrp halves.
             # After shfl, both lanes (kgrp=0/1, lane16=R) have the row-max for row R.
-            x = fxFloat32(local_max)
-            peer = x.shuffle_xor(fxInt32(16), fxInt32(WAVE_SIZE))
-            row_max = x.maximumf(peer).ir_value()
+            peer = local_max.shuffle_xor(fx.Int32(16), fx.Int32(WAVE_SIZE))
+            row_max = local_max.maximumf(peer)
 
             # Step 3: update m_state, compute alpha (scalars).
-            new_m = arith.maximumf(m_state, row_max)
-            alpha = rocdl.exp2(T.f32, arith.subf(m_state, new_m))
+            new_m = m_state.maximumf(row_max)
+            alpha = (m_state - new_m).exp2(fastmath=arith.FastMathFlags.fast)
 
             # Step 4: compute p = exp2(qk - new_m) IN-PLACE into qk_accs (now
             # they hold p), and accumulate row_sum (scalar). Keeping P in the
@@ -764,24 +757,23 @@ def compile_pa_decode_main(
                     q_ij = vector.extract(
                         qk_accs[n_tile], static_position=[mi], dynamic_position=[]
                     )
-                    p_ij = rocdl.exp2(T.f32, arith.subf(q_ij, new_m))
+                    p_ij = (q_ij - new_m).exp2(fastmath=arith.FastMathFlags.fast)
                     vals_new.append(p_ij)
-                    row_sum_partial = arith.addf(row_sum_partial, p_ij)
+                    row_sum_partial = row_sum_partial + p_ij
                 qk_accs[n_tile] = vector.from_elements(T.vec(8, T.f32), vals_new)
 
             # Step 5: within-warp sum via shfl_xor(by 16).
-            x = fxFloat32(row_sum_partial)
-            peer = x.shuffle_xor(fxInt32(16), fxInt32(WAVE_SIZE))
-            row_sum = (x + peer).ir_value()
+            peer = row_sum_partial.shuffle_xor(fx.Int32(16), fx.Int32(WAVE_SIZE))
+            row_sum = row_sum_partial + peer
 
             # Step 6: update l_state and m_state (scalars).
-            l_state = arith.addf(arith.mulf(alpha, l_state), row_sum)
+            l_state = alpha * l_state + row_sum
             m_state = new_m
 
             # Step 7: rescale pv_accs by alpha (vec<8> *= scalar via broadcast).
-            alpha_vec = vector.broadcast(T.vec(8, T.f32), alpha)
+            alpha_vec = vector.broadcast(T.vec(8, T.f32), alpha.ir_value())
             for pv_n in range_constexpr(N_PV_TILES):
-                pv_accs[pv_n] = arith.mulf(pv_accs[pv_n], alpha_vec)
+                pv_accs[pv_n] = pv_accs[pv_n] * alpha_vec
 
             # ---------- drain current V ----------
             if is_not_last:
@@ -800,7 +792,7 @@ def compile_pa_decode_main(
                     p_frag = arith.trunc_f(T.vec(16, elem_ty), p_f32)
                     v_frag = _load_wmma_B_frag_tr(
                         v_lds,
-                        arith.index(pv_n * WMMA_M),  # base in HEAD dim
+                        fx.Index(pv_n * WMMA_M),  # base in HEAD dim
                         ks * WMMA_K,  # base in KVB dim
                         KV_LDS_ROW_STRIDE,  # row stride (V LDS [KVB, HEAD+pad])
                         stage_elem_off=cur_stage_elem_off,
@@ -819,7 +811,7 @@ def compile_pa_decode_main(
                     ).result
 
             # Yield updated state for next iter. cur_stage toggles to nxt_stage.
-            results = yield [m_state, l_state, *pv_accs, nxt_stage]
+            results = yield [_unwrap(m_state), _unwrap(l_state), *pv_accs, nxt_stage]
 
         # After the loop: pull final state out of `results` (last yielded values).
         m_state = results[0]
@@ -837,17 +829,17 @@ def compile_pa_decode_main(
         )
 
         for pv_n in range_constexpr(N_PV_TILES):
-            head_col_base = arith.index(pv_n * WMMA_M) + lane_kgrp * arith.index(8)
+            head_col_base = fx.Index(pv_n * WMMA_M) + lane_kgrp * fx.Index(8)
             off_lo = out_base + lane16 * stride_o_row + head_col_base
-            off_hi = off_lo + arith.index(4)
+            off_hi = off_lo + fx.Index(4)
             lo = vector.shuffle(pv_accs[pv_n], pv_accs[pv_n], [0, 1, 2, 3])
             hi = vector.shuffle(pv_accs[pv_n], pv_accs[pv_n], [4, 5, 6, 7])
-            if arith.cmpi(arith.CmpIPredicate.slt, _raw(lane16), _raw(qgs_idx)):
+            if lane16 < qgs_idx:
                 buffer_ops.buffer_store(lo, out_rsrc, off_lo)
                 buffer_ops.buffer_store(hi, out_rsrc, off_hi)
 
         off_lse = lse_base + lane16
-        if arith.cmpi(arith.CmpIPredicate.slt, _raw(lane16), _raw(qgs_idx)):
+        if lane16 < qgs_idx:
             buffer_ops.buffer_store(m_state, ml_rsrc, off_lse)
             buffer_ops.buffer_store(l_state, es_rsrc, off_lse)
 
@@ -885,10 +877,6 @@ def compile_pa_decode_main(
             allocator.finalized = False
             allocator.finalize()
 
-        gx = _raw(arith.index_cast(T.index, i32_num_seqs.ir_value()))
-        gy = _raw(arith.index_cast(T.index, i32_num_kv_heads.ir_value()))
-        gz = _raw(arith.index_cast(T.index, i32_num_parts.ir_value()))
-
         launcher = kernel_pa_decode_main(
             arg_out,
             arg_max_logits,
@@ -923,7 +911,7 @@ def compile_pa_decode_main(
                 op.attributes["rocdl.flat_work_group_size"] = flat_wg_attr
 
         launcher.launch(
-            grid=(gx, gy, gz),
+            grid=(i32_num_seqs, i32_num_kv_heads, i32_num_parts),
             block=(block_threads, 1, 1),
             stream=stream,
         )
@@ -981,53 +969,53 @@ def compile_pa_decode_reduce(
         seq_idx = gpu.block_id("x")
         kv_head = gpu.block_id("y")
 
-        warp_id = tx / arith.index(WAVE_SIZE)
-        lane_id = tx % arith.index(WAVE_SIZE)
+        warp_id = tx / fx.Index(WAVE_SIZE)
+        lane_id = tx % fx.Index(WAVE_SIZE)
 
-        num_kv_heads = arith.index_cast(T.index, i32_num_kv_heads.ir_value())
-        num_parts = arith.index_cast(T.index, i32_num_parts.ir_value())
-        num_q_heads = num_kv_heads * arith.index(QUERY_GROUP_SIZE)
+        num_kv_heads = fx.Index(i32_num_kv_heads)
+        num_parts = fx.Index(i32_num_parts)
+        num_q_heads = num_kv_heads * fx.Index(QUERY_GROUP_SIZE)
 
         sl_rsrc = buffer_ops.create_buffer_resource(arg_seq_lens, max_size=True)
         seq_len_i32 = buffer_ops.buffer_load(sl_rsrc, seq_idx, vec_width=1, dtype=T.i32)
-        seq_len = arith.index_cast(T.index, seq_len_i32)
-        part_size_idx = arith.index(PARTITION_SIZE)
-        num_parts_actual = (seq_len + part_size_idx - arith.index(1)) / part_size_idx
+        seq_len = fx.Index(seq_len_i32)
+        part_size_idx = fx.Index(PARTITION_SIZE)
+        num_parts_actual = (seq_len + part_size_idx - fx.Index(1)) / part_size_idx
 
         stride_tmp_seq = (
-            num_kv_heads * num_parts * arith.index(QUERY_GROUP_SIZE * HEAD_SIZE)
+            num_kv_heads * num_parts * fx.Index(QUERY_GROUP_SIZE * HEAD_SIZE)
         )
-        stride_tmp_head = num_parts * arith.index(QUERY_GROUP_SIZE * HEAD_SIZE)
-        stride_tmp_part = arith.index(QUERY_GROUP_SIZE * HEAD_SIZE)
-        stride_tmp_row = arith.index(HEAD_SIZE)
+        stride_tmp_head = num_parts * fx.Index(QUERY_GROUP_SIZE * HEAD_SIZE)
+        stride_tmp_part = fx.Index(QUERY_GROUP_SIZE * HEAD_SIZE)
+        stride_tmp_row = fx.Index(HEAD_SIZE)
 
-        stride_lse_seq = num_kv_heads * num_parts * arith.index(QUERY_GROUP_SIZE)
-        stride_lse_head = num_parts * arith.index(QUERY_GROUP_SIZE)
-        stride_lse_part = arith.index(QUERY_GROUP_SIZE)
+        stride_lse_seq = num_kv_heads * num_parts * fx.Index(QUERY_GROUP_SIZE)
+        stride_lse_head = num_parts * fx.Index(QUERY_GROUP_SIZE)
+        stride_lse_part = fx.Index(QUERY_GROUP_SIZE)
 
-        stride_out_seq = num_q_heads * arith.index(HEAD_SIZE)
-        stride_out_head = arith.index(HEAD_SIZE)
+        stride_out_seq = num_q_heads * fx.Index(HEAD_SIZE)
+        stride_out_head = fx.Index(HEAD_SIZE)
 
         tmp_rsrc = buffer_ops.create_buffer_resource(arg_tmp_out, max_size=True)
         out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
         ml_rsrc_v4i32 = _build_v4i32_buffer_rsrc(arg_max_logits, arch=gpu_arch)
         es_rsrc_v4i32 = _build_v4i32_buffer_rsrc(arg_exp_sums, arch=gpu_arch)
 
-        zero_f32 = arith.constant(0.0, type=T.f32)
-        neg_inf_f32 = arith.constant(float("-inf"), type=T.f32)
-        zero_idx = arith.index(0)
-        one_idx = arith.index(1)
-        f32_bytes_idx = arith.index(f32_bytes)
+        zero_f32 = fx.Float32(0.0)
+        neg_inf_f32 = fx.Float32(float("-inf"))
+        zero_idx = fx.Index(0)
+        one_idx = fx.Index(1)
+        f32_bytes_idx = fx.Index(f32_bytes)
 
         # Each warp processes a block of ROWS_PER_WARP consecutive rows.
-        warp_first_row = warp_id * arith.index(ROWS_PER_WARP)
+        warp_first_row = warp_id * fx.Index(ROWS_PER_WARP)
         # Block-cyclic col assignment: lane `l` owns cols
         # [l*COLS_PER_THREAD, l*COLS_PER_THREAD + COLS_PER_THREAD - 1].
         # Cols within a lane are adjacent in memory, enabling vec loads/stores.
-        lane_col_base = lane_id * arith.index(COLS_PER_THREAD)
+        lane_col_base = lane_id * fx.Index(COLS_PER_THREAD)
 
         for r_local in range_constexpr(ROWS_PER_WARP):
-            r = warp_first_row + arith.index(r_local)
+            r = warp_first_row + fx.Index(r_local)
 
             lse_row_base = seq_idx * stride_lse_seq + kv_head * stride_lse_head + r
             tmp_row_base = (
@@ -1048,8 +1036,8 @@ def compile_pa_decode_reduce(
                 lse_off_sgpr_l = rocdl.readfirstlane(T.i32, lse_off_bytes_l)
                 m_i32 = _s_buffer_load_b32(ml_rsrc_v4i32, lse_off_sgpr_l)
                 l_i32 = _s_buffer_load_b32(es_rsrc_v4i32, lse_off_sgpr_l)
-                m_f = arith.bitcast(T.f32, m_i32)
-                l_f = arith.bitcast(T.f32, l_i32)
+                m_f = fx.Float32(arith.bitcast(T.f32, m_i32))
+                l_f = fx.Float32(arith.bitcast(T.f32, l_i32))
 
                 tmp_off_l = tmp_row_base + p_idx * stride_tmp_part + lane_col_base
                 v_vec_l = buffer_ops.buffer_load(
@@ -1063,12 +1051,8 @@ def compile_pa_decode_reduce(
             # Safe clamp ceiling: for `num_parts_actual == 0` we substitute 0
             # (the actual data is junk but masked out by `is_valid` anyway).
             last_p_raw = num_parts_actual - one_idx
-            nonzero_n = arith.cmpi(
-                arith.CmpIPredicate.ugt,
-                _raw(num_parts_actual),
-                _raw(zero_idx),
-            )
-            last_p = arith.select(nonzero_n, _raw(last_p_raw), _raw(zero_idx))
+            nonzero_n = num_parts_actual > zero_idx
+            last_p = arith.select(nonzero_n, last_p_raw, zero_idx)
 
             def _prefetch_clamped(p_py):
                 """Issue loads for Python-int partition index `p_py`, with a
@@ -1077,13 +1061,9 @@ def compile_pa_decode_reduce(
                 wave-uniform `is_valid` predicate used to mask softmax
                 contributions for invalid partitions.
                 """
-                p_const = arith.index(p_py)
-                is_valid = arith.cmpi(
-                    arith.CmpIPredicate.ult,
-                    _raw(p_const),
-                    _raw(num_parts_actual),
-                )
-                p_safe = arith.select(is_valid, _raw(p_const), _raw(last_p))
+                p_const = fx.Index(p_py)
+                is_valid = p_const < num_parts_actual
+                p_safe = arith.select(is_valid, p_const, last_p)
                 m_p, l_p, v_p_vec = _prefetch_partition(p_safe)
                 return m_p, l_p, v_p_vec, is_valid
 
@@ -1105,28 +1085,18 @@ def compile_pa_decode_reduce(
                 m_p_next, l_p_next, v_p_next, valid_next = _prefetch_clamped(next_p_py)
 
                 # ---- Consume current partition (online softmax update) ----
-                new_m = arith.maximumf(m_state, m_p)
-                alpha_old = rocdl.exp2(T.f32, arith.subf(m_state, new_m))
-                alpha_this_raw = rocdl.exp2(T.f32, arith.subf(m_p, new_m))
+                new_m = m_state.maximumf(m_p)
+                alpha_old = (m_state - new_m).exp2(fastmath=arith.FastMathFlags.fast)
+                alpha_this_raw = (m_p - new_m).exp2(fastmath=arith.FastMathFlags.fast)
                 # Mask invalid partitions: alpha_this = 0 → no contribution
                 # to l_state / acc_vec. (m_state may shift to m_p_dup but
                 # that's harmless since m_p_dup <= m_state by induction.)
-                alpha_this = arith.select(
-                    valid,
-                    _raw(alpha_this_raw),
-                    _raw(zero_f32),
-                )
+                alpha_this = arith.select(valid, alpha_this_raw, zero_f32)
 
-                new_l = arith.addf(
-                    arith.mulf(alpha_old, l_state),
-                    arith.mulf(alpha_this, l_p),
-                )
-                alpha_old_vec = vector.broadcast(vec_f32_ty, alpha_old)
+                new_l = alpha_old * l_state + alpha_this * l_p
+                alpha_old_vec = vector.broadcast(vec_f32_ty, alpha_old.ir_value())
                 alpha_this_vec = vector.broadcast(vec_f32_ty, alpha_this)
-                new_acc = arith.addf(
-                    arith.mulf(alpha_old_vec, acc_vec),
-                    arith.mulf(alpha_this_vec, v_p_vec),
-                )
+                new_acc = alpha_old_vec * acc_vec + alpha_this_vec * v_p_vec
 
                 m_state = new_m
                 l_state = new_l
@@ -1143,27 +1113,21 @@ def compile_pa_decode_reduce(
             l_final = l_state
             acc_final = acc_vec
 
-            inv_l = rocdl.rcp(T.f32, l_final)
+            inv_l = rocdl.rcp(T.f32, l_final.ir_value())
             inv_l_vec = vector.broadcast(vec_f32_ty, inv_l)
-            out_vec_f32 = arith.mulf(acc_final, inv_l_vec)
+            out_vec_f32 = acc_final * inv_l_vec
             out_vec_half = arith.trunc_f(vec_half_ty, out_vec_f32)
 
             # Empty-seq guard: when num_parts_actual == 0 (seq_len == 0), every
             # partition is invalid and the online softmax cascade produces NaN
             # via -inf - -inf and 1 / 0. Mask the output to zero in that case.
-            is_empty = arith.cmpi(
-                arith.CmpIPredicate.eq,
-                _raw(num_parts_actual),
-                _raw(zero_idx),
-            )
+            is_empty = num_parts_actual == zero_idx
             zero_vec_half = arith.constant_vector(0.0, vec_half_ty)
-            out_vec_half = arith.select(
-                is_empty, _raw(zero_vec_half), _raw(out_vec_half)
-            )
+            out_vec_half = arith.select(is_empty, zero_vec_half, out_vec_half)
 
             out_off = (
                 seq_idx * stride_out_seq
-                + (kv_head * arith.index(QUERY_GROUP_SIZE) + r) * stride_out_head
+                + (kv_head * fx.Index(QUERY_GROUP_SIZE) + r) * stride_out_head
                 + lane_col_base
             )
             buffer_ops.buffer_store(out_vec_half, out_rsrc, out_off)
@@ -1192,9 +1156,6 @@ def compile_pa_decode_reduce(
         _ = cache_tag
         ctx = CompilationContext.get_current()
 
-        gx = _raw(arith.index_cast(T.index, i32_num_seqs.ir_value()))
-        gy = _raw(arith.index_cast(T.index, i32_num_kv_heads.ir_value()))
-
         launcher = kernel_pa_decode_reduce(
             arg_out,
             arg_tmp_out,
@@ -1213,7 +1174,7 @@ def compile_pa_decode_reduce(
                 op.attributes["rocdl.flat_work_group_size"] = flat_wg_attr
 
         launcher.launch(
-            grid=(gx, gy, 1),
+            grid=(i32_num_seqs, i32_num_kv_heads, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )
