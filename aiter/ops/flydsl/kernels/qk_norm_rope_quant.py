@@ -185,7 +185,6 @@ def _build_kernel(
     D = head_dim
     RD = rope_head_dim
     NOPE = D - RD
-    ROPE_HALF = RD // 2
     VEC = D // BLOCK_THREADS
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
