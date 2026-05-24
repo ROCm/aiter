@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
-from typing import Optional
+from typing import Optional, Union
 
 import triton
 import torch
@@ -41,8 +41,8 @@ def paged_attention_decode(
     attn_scale: float,
     max_seq_len: int,
     compute_type,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
+    k_scale: Union[float, torch.Tensor],
+    v_scale: Union[float, torch.Tensor],
     num_seq_partitions: int = 0,  # TODO use this below
     alibi_slopes: torch.Tensor = None,
 ) -> None:
@@ -60,9 +60,14 @@ def paged_attention_decode(
         attn_scale (float): Attention scale, typically 1/sqrt(head_dim).
         max_seq_len (int): Maximum sequence length in batch.
         compute_type: Compute precision type.
-        k_scale (torch.Tensor): Key quantization scale. Scalar for per-tensor,
-            shape (num_blocks, num_kv_heads, block_size) for per-token.
-        v_scale (torch.Tensor): Value quantization scale with same shape as k_scale.
+        k_scale (Union[float, torch.Tensor]): Key quantization scale.
+            Pass a Python float (or 1-element Tensor) for per-tensor quant;
+            pass a Tensor of shape (num_blocks, num_kv_heads, block_size)
+            for per-token quant. Passing a Python float avoids a
+            GPU-to-CPU sync and is the only path safe inside a CUDAGraph
+            capture.
+        v_scale (Union[float, torch.Tensor]): Value quantization scale
+            with the same semantics as k_scale.
         num_seq_partitions (int): Number of sequence partitions (not currently used).
         alibi_slopes (Optional[torch.Tensor]): ALiBi position bias slopes.
 
@@ -83,7 +88,10 @@ def paged_attention_decode(
     use_v1 = max_seq_len <= 8192 and (
         max_num_partitions == 1 or num_seqs * num_q_heads > 512
     )
-    if k_scale.numel() > 1:
+    # Per-token quant path: per-token-scale Tensor (shape > 1) routes to the
+    # quant-aware kernels unchanged.
+    is_per_token = isinstance(k_scale, torch.Tensor) and k_scale.numel() > 1
+    if is_per_token:
         if use_v1:
             paged_attn_decode_v1_per_token_quant(
                 output,
@@ -117,40 +125,50 @@ def paged_attention_decode(
                 v_scale,
                 max_num_partitions,
             )
+        return
+
+    # Per-tensor scalar path: accept either a Python float or a 1-element
+    # Tensor. Tensor->float resolution happens here, at the wrapper boundary,
+    # so a caller that already has the scalar can pass it directly and avoid
+    # the GPU-to-CPU sync (illegal inside a CUDAGraph capture).
+    if isinstance(k_scale, torch.Tensor):
+        k_scale = k_scale.item()
+    if isinstance(v_scale, torch.Tensor):
+        v_scale = v_scale.item()
+
+    if use_v1:
+        paged_attn_decode_v1(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            compute_type,
+            num_kv_heads,
+            attn_scale,
+            alibi_slopes,
+            k_scale,
+            v_scale,
+        )
     else:
-        if use_v1:
-            paged_attn_decode_v1(
-                output,
-                query,
-                key_cache,
-                value_cache,
-                block_tables,
-                seq_lens,
-                max_seq_len,
-                compute_type,
-                num_kv_heads,
-                attn_scale,
-                alibi_slopes,
-                k_scale.item(),
-                v_scale.item(),
-            )
-        else:
-            paged_attn_decode_v2(
-                output,
-                query,
-                key_cache,
-                value_cache,
-                block_tables,
-                seq_lens,
-                max_seq_len,
-                compute_type,
-                num_kv_heads,
-                attn_scale,
-                alibi_slopes,
-                k_scale.item(),
-                v_scale.item(),
-                max_num_partitions,
-            )
+        paged_attn_decode_v2(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            compute_type,
+            num_kv_heads,
+            attn_scale,
+            alibi_slopes,
+            k_scale,
+            v_scale,
+            max_num_partitions,
+        )
 
 
 def paged_attn_decode_v1(

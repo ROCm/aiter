@@ -381,3 +381,85 @@ def test_paged_attn_per_token_quant(
         print(f"torch_output={torch_output}")
 
     torch.testing.assert_close(triton_output, torch_output, rtol=2.5e-1, atol=2.5e-1)
+
+
+# -----------------------------------------------------------------------------
+# Tests for the Union[float, torch.Tensor] scale path on paged_attention_decode.
+# Passing scalar scales as Python floats avoids a GPU->CPU sync at the wrapper
+# boundary, which is the only path safe inside a CUDAGraph capture. The output
+# must be byte-identical to the existing torch.Tensor-scale path for the same
+# scalar value.
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (16, 16), (16, 4)])
+@pytest.mark.parametrize("KV_BLK_SZ", [16])
+@pytest.mark.parametrize("SEQ_LEN", [128, 1024])
+@pytest.mark.parametrize("compute_type", [tl.float16, tl.bfloat16])
+def test_paged_attention_decode_float_scale(
+    B, H_Q, H_KV, KV_BLK_SZ, SEQ_LEN, compute_type
+):
+    """Python-float k_scale/v_scale must produce the same output as
+    torch.tensor([float])."""
+    head_size = 128
+    num_blocks = 64
+    dtype = torch.bfloat16 if compute_type == tl.bfloat16 else torch.float16
+    output_type = dtype
+    kv_cache_dtype = dtype
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+
+    (
+        query,
+        triton_output_t,  # Tensor-scale output
+        _key_cache_ref,
+        _value_cache_ref,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        max_context_len,
+    ) = input_helper(
+        B, H_Q, H_KV, head_size, KV_BLK_SZ, SEQ_LEN,
+        dtype, kv_cache_dtype, output_type, num_blocks,
+    )
+    attn_scale = 1.0 / (head_size ** 0.5)
+    triton_output_f = torch.zeros_like(triton_output_t)
+
+    # Tensor scale (existing behavior)
+    paged_attention_decode(
+        triton_output_t,
+        query,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        attn_scale,
+        max_context_len,
+        compute_type,
+        k_scale=torch.tensor([1.0]),
+        v_scale=torch.tensor([1.0]),
+        num_seq_partitions=0,
+        alibi_slopes=None,
+    )
+
+    # Python float scale (new path; CUDAGraph-safe)
+    paged_attention_decode(
+        triton_output_f,
+        query,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        attn_scale,
+        max_context_len,
+        compute_type,
+        k_scale=1.0,
+        v_scale=1.0,
+        num_seq_partitions=0,
+        alibi_slopes=None,
+    )
+
+    torch.testing.assert_close(triton_output_f, triton_output_t, rtol=0, atol=0)
