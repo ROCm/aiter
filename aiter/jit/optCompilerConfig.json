@@ -234,7 +234,9 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_pybind.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
-            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale.cu'"
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_lookup_fp16.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_lookup_bf16.cu'"
         ],
         "extra_include": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'"
