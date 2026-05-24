@@ -8,8 +8,9 @@
 #include <torch/extension.h>
 
 #include "gemm_a8w8_blockscale_common.cuh"
-// lookup.h is included by the two dtype-specific TUs below, not here,
-// so ninja can expand GENERATE_LOOKUP_TABLE for FP16 and BF16 in parallel.
+// lookup.h is included by gemm_a8w8_blockscale_lookup_fp16.cu and
+// gemm_a8w8_blockscale_lookup_bf16.cu, not here, so ninja can expand
+// GENERATE_LOOKUP_TABLE for FP16 and BF16 in parallel.
 #include "gemm_a8w8_blockscale_manifest.h"
 
 using BlockwiseKernel = torch::Tensor (*)(
