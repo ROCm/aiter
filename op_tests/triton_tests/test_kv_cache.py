@@ -120,3 +120,111 @@ def test_fused_qk_rope_cat_and_cache_mla(
         )
 
     torch.testing.assert_close(torch_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
+import pytest
+import torch
+
+from aiter.ops.triton.kv_cache import reshape_and_cache
+
+
+def _torch_reference(key, value, key_cache, value_cache, slot_mapping, block_size):
+    expected_k = key_cache.clone()
+    expected_v = value_cache.clone()
+    for tok_idx in range(slot_mapping.shape[0]):
+        slot = int(slot_mapping[tok_idx].item())
+        if slot < 0:
+            continue
+        block_id = slot // block_size
+        within = slot % block_size
+        expected_k[block_id, :, within, :] = key[tok_idx]
+        expected_v[block_id, :, within, :] = value[tok_idx]
+    return expected_k, expected_v
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 256])
+@pytest.mark.parametrize("num_kv_heads", [1, 8])
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("skip_fraction", [0.0, 0.5])
+def test_reshape_and_cache(
+    num_tokens, num_kv_heads, block_size, head_dim, skip_fraction
+):
+    torch.manual_seed(0)
+    num_blocks = 32
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    key = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
+    value = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
+
+    key_cache = torch.randn(
+        num_blocks, num_kv_heads, block_size, head_dim, dtype=dtype, device=device
+    )
+    value_cache = torch.randn(
+        num_blocks, num_kv_heads, block_size, head_dim, dtype=dtype, device=device
+    )
+
+    # Use a permutation (not randint) so slots are unique - duplicate
+    # slots race in the parallel kernel; serial reference cannot model that.
+    perm = torch.randperm(num_blocks * block_size, device=device)
+    slot_mapping = perm[:num_tokens].to(torch.int64)
+    if skip_fraction > 0.0:
+        num_skip = max(1, int(num_tokens * skip_fraction))
+        skip_idx = torch.randperm(num_tokens, device=device)[:num_skip]
+        slot_mapping[skip_idx] = -1
+
+    expected_k, expected_v = _torch_reference(
+        key, value, key_cache, value_cache, slot_mapping, block_size
+    )
+
+    reshape_and_cache(key, value, key_cache, value_cache, slot_mapping)
+
+    torch.testing.assert_close(key_cache, expected_k, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(value_cache, expected_v, atol=1e-2, rtol=1e-2)
+
+
+def test_reshape_and_cache_all_skipped():
+    """All slots = -1: cache must be byte-identical to input."""
+    num_tokens, num_kv_heads, block_size, head_dim, num_blocks = 16, 4, 16, 64, 8
+    dtype = torch.bfloat16
+    device = "cuda"
+    key = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
+    value = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
+    key_cache = torch.randn(
+        num_blocks, num_kv_heads, block_size, head_dim, dtype=dtype, device=device
+    )
+    value_cache = torch.randn(
+        num_blocks, num_kv_heads, block_size, head_dim, dtype=dtype, device=device
+    )
+    slot_mapping = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
+
+    k_before = key_cache.clone()
+    v_before = value_cache.clone()
+
+    reshape_and_cache(key, value, key_cache, value_cache, slot_mapping)
+
+    torch.testing.assert_close(key_cache, k_before)
+    torch.testing.assert_close(value_cache, v_before)
+
+
+def test_reshape_and_cache_empty():
+    """num_tokens == 0: must be a no-op without launching the kernel."""
+    num_kv_heads, block_size, head_dim, num_blocks = 4, 16, 64, 8
+    dtype = torch.bfloat16
+    device = "cuda"
+    key = torch.empty(0, num_kv_heads, head_dim, dtype=dtype, device=device)
+    value = torch.empty(0, num_kv_heads, head_dim, dtype=dtype, device=device)
+    key_cache = torch.randn(
+        num_blocks, num_kv_heads, block_size, head_dim, dtype=dtype, device=device
+    )
+    value_cache = torch.randn(
+        num_blocks, num_kv_heads, block_size, head_dim, dtype=dtype, device=device
+    )
+    slot_mapping = torch.empty(0, dtype=torch.int64, device=device)
+
+    k_before = key_cache.clone()
+    v_before = value_cache.clone()
+
+    reshape_and_cache(key, value, key_cache, value_cache, slot_mapping)
+
+    torch.testing.assert_close(key_cache, k_before)
+    torch.testing.assert_close(value_cache, v_before)

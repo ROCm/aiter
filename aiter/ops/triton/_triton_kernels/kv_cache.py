@@ -109,3 +109,53 @@ def _cat_and_cache_mla_kernel(
                 kv_cache_ptrs + (d_pe_offs + BLOCK_D_nope) * kv_cache_stride_d,
                 k_pe,
             )
+
+
+@triton.jit
+def _reshape_and_cache_kernel(
+    k_new_ptr,                 # [N, KH, D]
+    v_new_ptr,                 # [N, KH, D]
+    slot_mapping_ptr,          # [N] int64; slot < 0 => skip
+    k_cache_ptr,               # [num_blocks, KH, BLOCK_SIZE, D]
+    v_cache_ptr,               # [num_blocks, KH, BLOCK_SIZE, D]
+    new_stride_token,
+    new_stride_head,
+    cache_stride_block,
+    cache_stride_head,
+    cache_stride_within,
+    N: tl.constexpr,
+    KH: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """One program per token; copies the token's full (KH, D) K/V slab into
+    cache[block_id, :, within, :]. slot < 0 entries are skipped in-kernel
+    so callers do not need a Python-side conditional (CUDAGraph-safe)."""
+    token_idx = tl.program_id(0)
+    if token_idx >= N:
+        return
+    slot = tl.load(slot_mapping_ptr + token_idx)
+    if slot < 0:
+        return
+    block_id = slot // BLOCK_SIZE
+    within = slot % BLOCK_SIZE
+
+    head_offs = tl.arange(0, KH)
+    d_offs = tl.arange(0, D)
+
+    new_off = (
+        token_idx * new_stride_token
+        + head_offs[:, None] * new_stride_head
+        + d_offs[None, :]
+    )
+    cache_off = (
+        block_id * cache_stride_block
+        + head_offs[:, None] * cache_stride_head
+        + within * cache_stride_within
+        + d_offs[None, :]
+    )
+
+    k_vals = tl.load(k_new_ptr + new_off)
+    v_vals = tl.load(v_new_ptr + new_off)
+    tl.store(k_cache_ptr + cache_off, k_vals)
+    tl.store(v_cache_ptr + cache_off, v_vals)

@@ -1,5 +1,8 @@
 import torch
-from aiter.ops.triton._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
+from aiter.ops.triton._triton_kernels.kv_cache import (
+    _cat_and_cache_mla_kernel,
+    _reshape_and_cache_kernel,
+)
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -97,4 +100,75 @@ def cat_and_cache_mla(
         SHUFFLED_KV_CACHE=shuffled_kv_cache,
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         num_warps=1,
+    )
+
+
+def reshape_and_cache(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """
+    Scatter (key, value) tokens into paged KV cache at the slots given by
+    slot_mapping. Slots equal to a negative value are skipped (no write),
+    which lets callers pre-fill slot_mapping with ``-1`` for padded
+    positions without a Python-side branch — the kernel is CUDAGraph-safe.
+
+    Layouts:
+      key, value      : [num_tokens, num_kv_heads, head_dim]
+      key_cache,
+      value_cache     : [num_blocks, num_kv_heads, block_size, head_dim]
+      slot_mapping    : [num_tokens] (int64). slot = block_id * block_size + within.
+
+    num_kv_heads, head_dim, and block_size must be powers of two (triton
+    block-size constraint).
+
+    Returns:
+      None. key_cache / value_cache are updated in place.
+    """
+    _LOGGER.info(
+        f"RESHAPE_AND_CACHE: key={tuple(key.shape)} value={tuple(value.shape)} "
+        + f"key_cache={tuple(key_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
+    )
+
+    (num_tokens,) = slot_mapping.shape
+    if num_tokens == 0:
+        return
+    n_k, kh_k, d_k = key.shape
+    n_v, kh_v, d_v = value.shape
+    num_blocks, kh_c, block_size, d_c = key_cache.shape
+
+    assert n_k == n_v == num_tokens, "key/value first dim must match slot_mapping"
+    assert kh_k == kh_v == kh_c, "kv head count must match between inputs and cache"
+    assert d_k == d_v == d_c, "head_dim must match between inputs and cache"
+    assert key_cache.shape == value_cache.shape, "key_cache and value_cache must share layout"
+
+    key_c = key.contiguous() if not key.is_contiguous() else key
+    val_c = value.contiguous() if not value.is_contiguous() else value
+    slot_i64 = (
+        slot_mapping.to(torch.int64)
+        if slot_mapping.dtype != torch.int64
+        else slot_mapping
+    )
+
+    new_stride = key_c.stride()
+    cache_stride = key_cache.stride()
+
+    _reshape_and_cache_kernel[(num_tokens,)](
+        key_c,
+        val_c,
+        slot_i64,
+        key_cache,
+        value_cache,
+        new_stride[0],
+        new_stride[1],
+        cache_stride[0],
+        cache_stride[1],
+        cache_stride[2],
+        N=num_tokens,
+        KH=kh_c,
+        D=d_c,
+        BLOCK_SIZE=block_size,
     )
