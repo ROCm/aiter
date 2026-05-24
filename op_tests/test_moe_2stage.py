@@ -818,6 +818,28 @@ if not args.no_legacy:
     _case_iters.append(_iter_legacy_cases())
 case_iter = itertools.chain(*_case_iters)
 
+_csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
+if _csv_out and os.path.exists(_csv_out):
+    os.remove(_csv_out)
+
+
+def _write_bench_csv(rows):
+    if not _csv_out or len(rows) == 0:
+        return
+    csv_df = pd.DataFrame(rows)
+    if "model" in csv_df.columns:
+        csv_df = csv_df[csv_df["model"] != "legacy"].copy()
+    else:
+        csv_df = csv_df.copy()
+    if len(csv_df) == 0:
+        return
+    csv_df = csv_df.drop(columns=["logits_diff"], errors="ignore")
+    csv_df.to_csv(_csv_out, index=False)
+    aiter.logger.info(
+        "moe_2stage: wrote %d csv-mode rows to %s", len(csv_df), _csv_out
+    )
+
+
 df = []
 seen = 0
 for kwargs, extras in case_iter:
@@ -853,6 +875,7 @@ for kwargs, extras in case_iter:
         continue
     ret.update(extras)
     df.append(ret)
+    _write_bench_csv(df)
 
 aiter.logger.info(
     "moe_2stage: scanned %d cases, recorded %d results (skipped %d)",
@@ -863,13 +886,3 @@ aiter.logger.info(
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
-
-_csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
-if _csv_out and len(df) > 0:
-    if "model" in df.columns:
-        csv_df = df[df["model"] != "legacy"].copy()
-    else:
-        csv_df = df.copy()
-    csv_df = csv_df.drop(columns=["logits_diff"], errors="ignore")
-    csv_df.to_csv(_csv_out, index=False)
-    aiter.logger.info("moe_2stage: wrote %d csv-mode rows to %s", len(csv_df), _csv_out)
