@@ -92,6 +92,13 @@ namespace py = pybind11;
           py::arg("input"),                             \
           py::arg("expert_ids"),                        \
           py::arg("bias"));                             \
+    m.def("gelu_and_mul_bias",                          \
+          &aiter::gelu_and_mul_bias,                    \
+          "GELU gating with per-expert bias.",          \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("expert_ids"),                        \
+          py::arg("bias"));                             \
     m.def("scaled_silu_and_mul",                        \
           &aiter::scaled_silu_and_mul,                  \
           "Activation function used in scaled SwiGLU.", \
@@ -542,27 +549,29 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-#define GEMM_A4W4_BLOCKSCALE_PYBIND \
-    m.def("gemm_a4w4_blockscale",   \
-          &gemm_a4w4_blockscale,    \
-          "fp4 blockscale gemm",    \
-          py::arg("XQ"),            \
-          py::arg("WQ"),            \
-          py::arg("x_scale"),       \
-          py::arg("w_scale"),       \
-          py::arg("Out"),           \
-          py::arg("splitK") = 0);
+#define GEMM_A4W4_BLOCKSCALE_PYBIND     \
+    m.def("gemm_a4w4_blockscale",       \
+          &gemm_a4w4_blockscale,        \
+          "fp4 blockscale gemm",        \
+          py::arg("XQ"),                \
+          py::arg("WQ"),                \
+          py::arg("x_scale"),           \
+          py::arg("w_scale"),           \
+          py::arg("Out"),               \
+          py::arg("splitK")     = 0,    \
+          py::arg("kernelName") = "");
 
-#define GEMM_A8W8_BLOCKSCALE_PYBIND \
-    m.def("gemm_a8w8_blockscale",   \
-          &gemm_a8w8_blockscale,    \
-          "fp8 blockscale gemm",    \
-          py::arg("XQ"),            \
-          py::arg("WQ"),            \
-          py::arg("x_scale"),       \
-          py::arg("w_scale"),       \
-          py::arg("Out"),           \
-          py::arg("splitK") = 0);
+#define GEMM_A8W8_BLOCKSCALE_PYBIND     \
+    m.def("gemm_a8w8_blockscale",       \
+          &gemm_a8w8_blockscale,        \
+          "fp8 blockscale gemm",        \
+          py::arg("XQ"),                \
+          py::arg("WQ"),                \
+          py::arg("x_scale"),           \
+          py::arg("w_scale"),           \
+          py::arg("Out"),               \
+          py::arg("splitK")     = 0,    \
+          py::arg("kernelName") = "");
 
 #define GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_tune",   \
@@ -586,7 +595,8 @@ namespace py = pybind11;
           py::arg("w_scale"),              \
           py::arg("Out"),                  \
           py::arg("preshuffleB") = false,  \
-          py::arg("splitK") = 0);
+          py::arg("splitK")      = 0,      \
+          py::arg("kernelName")  = "");
 
 #define GEMM_A8W8_BLOCKSCALE_CKTILE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_cktile_tune",   \
@@ -609,7 +619,8 @@ namespace py = pybind11;
           py::arg("WQ"),                        \
           py::arg("x_scale"),                   \
           py::arg("w_scale"),                   \
-          py::arg("Out"));
+          py::arg("Out"),                       \
+          py::arg("kernelName") = "");
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_bpreshuffle_tune",   \
@@ -632,7 +643,8 @@ namespace py = pybind11;
           py::arg("x_scale"),                          \
           py::arg("w_scale"),                          \
           py::arg("Out"),                              \
-          py::arg("preshuffleB") = true);
+          py::arg("preshuffleB") = true,               \
+          py::arg("kernelName")  = "");
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_CKTILE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_bpreshuffle_cktile_tune",   \
@@ -1262,7 +1274,22 @@ namespace py = pybind11;
           py::arg("local_expert_mask") = std::nullopt, \
           py::arg("num_local_tokens")  = std::nullopt, \
           py::arg("workspace")         = std::nullopt, \
-          py::arg("dispatch_policy")   = 0);
+          py::arg("dispatch_policy")   = 0,            \
+          py::arg("local_topk_ids")    = std::nullopt);
+
+#define PA_SPARSE_PREFILL_OPUS_PYBIND                  \
+    m.def("pa_sparse_prefill_opus_fwd",        \
+          &pa_sparse_prefill_opus_fwd,         \
+          py::arg("q"),                                \
+          py::arg("unified_kv"),                       \
+          py::arg("kv_indices_prefix"),                \
+          py::arg("kv_indptr_prefix"),                 \
+          py::arg("kv"),                               \
+          py::arg("kv_indices_extend"),                \
+          py::arg("kv_indptr_extend"),                 \
+          py::arg("attn_sink"),                        \
+          py::arg("out"),                              \
+          py::arg("softmax_scale"));
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
