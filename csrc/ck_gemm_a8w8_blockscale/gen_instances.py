@@ -17,12 +17,17 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict, write_lookup_header  # noqa: E402
+from chip_info import (  # noqa: E402
+    build_tune_dict,
+    write_lookup_header,
+    write_name_keyed_lookup_header,
+)
 
 from gemm_a8w8_blockscale_instance import (  # noqa: E402
     default_kernels_dict,
     KernelInstance,
     candidate_kernels_dict,
+    candidate_kernels_by_name,
 )
 
 """
@@ -51,6 +56,7 @@ class gemm_a8w8_blockscale_codegen:
                 default_kernels_dict,
                 candidate_kernels_dict,
                 libtype="ck",
+                kernels_by_name=candidate_kernels_by_name,
             )
         return default_kernels_dict
 
@@ -261,10 +267,20 @@ template torch::Tensor
 
     def gen_lookup_dict(self, kernels_dict):
         """
-        Generate lookup dictionary for kernel instances
+        Generate lookup dictionary for kernel instances.
+
+        - Tune mode (istune=True): emits a kernelId-keyed table for the
+          tuner's *_tune.cu, unchanged from before.
+        - Non-tune mode (istune=False): emits a name-keyed registry consumed
+          by gemm_a8w8_blockscale.cu's Python-driven dispatch.  The Python
+          frontend (aiter/ops/gemm_op_a8w8.py) reads the tuned CSV and passes
+          the resolved kernelName string in; C++ looks it up directly here.
         """
 
-        LOOKUP_head = """#pragma once
+        output_path = os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup.h")
+
+        if self.istune:
+            LOOKUP_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -273,23 +289,49 @@ template torch::Tensor
 #define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
    {                                                                                                                             \\"""
 
-        LOOKUP_template = """
+            LOOKUP_template = """
        {{{MNK},                                                                                                       \\
         {kernel_name}<DTYPE, ETYPE>}},                       \\"""
 
-        LOOKUP_end = """
+            LOOKUP_end = """
    }
 
 #endif // USE_ROCM
 """
-        write_lookup_header(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup.h"),
-            kernels_dict,
-            LOOKUP_head,
-            LOOKUP_template,
-            LOOKUP_end,
-            self.istune,
-        )
+            write_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+                self.istune,
+            )
+        else:
+            LOOKUP_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
+   {                                                                                                                             \\"""
+
+            LOOKUP_template = """
+       {{"{kernel_name}",                                                                                                       \\
+        {kernel_name}<DTYPE, ETYPE>}},                       \\"""
+
+            LOOKUP_end = """
+   }
+
+#endif // USE_ROCM
+"""
+            write_name_keyed_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+            )
 
     def gen_manifest_head(self, kernels_dict):
         """
