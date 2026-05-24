@@ -381,19 +381,19 @@ if PREBUILD_KERNELS != 0:
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
         # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---
-        _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
-        os.environ["AITER_AOT_IMPORT"] = "1"
-        try:
-            from aiter.aot.flydsl.common import start_aot, wait_aot
+        # Guard: AITER_AOT_IMPORT=1 is set before spawning workers and
+        # inherited by spawn child processes. Skip start_aot() in worker
+        # re-executions to prevent recursive pool creation.
+        if not os.environ.get("AITER_AOT_IMPORT"):
+            os.environ["AITER_AOT_IMPORT"] = "1"
+            try:
+                from aiter.aot.flydsl.common import start_aot, wait_aot
 
-            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            pool, futures = start_aot(flydsl_cache_dir)
-            wait_aot(pool, futures)
-        finally:
-            if _prev_aot_import is None:
+                flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
+                pool, futures = start_aot(flydsl_cache_dir)
+                wait_aot(pool, futures)
+            finally:
                 os.environ.pop("AITER_AOT_IMPORT", None)
-            else:
-                os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
 
         # --- CK kernel builds ---
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:

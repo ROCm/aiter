@@ -11,6 +11,7 @@ import functools
 import inspect
 from dataclasses import dataclass
 import enum
+import multiprocessing
 import os
 from typing import Any, Callable, Iterator
 
@@ -312,15 +313,17 @@ def start_aot(
         f"{max_workers} worker processes (cache: {cache_dir})"
     )
 
-    # Default fork start method is fine here: _compile_one immediately
-    # delegates to compile_one_config, which shells out to the FlyDSL
-    # compiler subprocess. The child never re-enters torch / FlyDSL /
-    # sccache-client Python in a way that would acquire an inherited
-    # mutex, so the classic fork-after-import deadlock pattern (parent
-    # thread holds lock at fork time -> child tries to acquire same lock
-    # -> deadlock) doesn't apply. Validated empirically at 64 workers
-    # (test job 299597), no hangs.
-    pool = ProcessPoolExecutor(max_workers=max_workers)
+    # Use spawn so that workers start a fresh interpreter without inheriting
+    # the parent CUDA context. When AITER is installed inside a live GPU
+    # container (e.g. SGLang/vLLM), the parent process has an active CUDA
+    # context at fork time; forked workers that subsequently import torch
+    # trigger CUDA re-initialization errors. Spawn avoids this entirely.
+    # The upstream fork-safe analysis (mutex/deadlock) remains valid under
+    # spawn as well — workers shell out to the FlyDSL compiler subprocess.
+    pool = ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=multiprocessing.get_context("spawn"),
+    )
     futures: dict[Future, JobLabel] = {}
     for kind, job in all_jobs:
         f = pool.submit(_compile_one, kind, job)
