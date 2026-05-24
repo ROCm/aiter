@@ -15,7 +15,7 @@ from ..jit.core import compile_ops
 from ..utility import dtypes, fp4_utils
 from . import triton
 from .enum import ActivationType, QuantType
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 
 
 class MxScaleRoundMode(IntEnum):
@@ -842,11 +842,15 @@ def quant_mxfp4_hip(
     # RoundUp (NV / DSv4 default) without a16w4/gate_up/shuffle_weight ->
     # route to dynamic_per_group_scaled_quant_fp4 (the default FP4 quant path
     # which uses fp4_f32_to_e8m0_scale = ceil_pow2(amax/6)).
+    # Skip on gfx942: dynamic_per_group_scaled_quant_fp4 requires
+    # __Float4_e2m1fn_x2 which is not available on gfx942; fall through
+    # to the quant_mxfp4 kernel instead.
     if (
         round_mode_int == MxScaleRoundMode.RoundUp
         and not a16w4_shuffle
         and not gate_up
         and not shuffle_weight
+        and get_gfx() != "gfx942"
     ):
         return per_1x32_f4_quant_hip(x, shuffle=e8m0_shuffle)
 
