@@ -36,7 +36,15 @@ binds current stream, handles strided KV and 4D cos/sin views). Internal
 who already have all buffers and want the lowest-overhead path.
 """
 
-from __future__ import annotations
+# NOTE: do NOT add `from __future__ import annotations` to this file.
+# PEP 563 turns all annotations into strings, which defeats flydsl's
+# JitFunction._make_cache_key runtime detection:
+#   is_runtime = hasattr(ann, "__get_c_pointers__")
+# A string like 'fx.Int32' fails that check, so flydsl treats the
+# `kv_in_row_stride` and `num_tokens` Int32 parameters as compile-time
+# constants and embeds their VALUE in the cache key. Every distinct
+# batch size / KV stride then triggers a fresh ~30-70ms JIT compile
+# instead of hitting the in-memory CallState cache.
 
 import math
 from functools import lru_cache
@@ -654,8 +662,12 @@ def _build_kernel(
                     scale_base_off=None,
                 )
 
+    # Name the launcher explicitly so the flydsl disk cache directory becomes
+    # `~/.flydsl/cache/launch_qk_norm_rope_quant_<hash>/` instead of the
+    # generic `launcher_<hash>/`, which collides visually with every other
+    # @flyc.jit function in the codebase.
     @flyc.jit
-    def launcher(
+    def launch_qk_norm_rope_quant(
         q_in: fx.Tensor,
         kv_in: fx.Tensor,
         q_weight: fx.Tensor,
@@ -692,7 +704,7 @@ def _build_kernel(
             stream=stream,
         )
 
-    return launcher
+    return launch_qk_norm_rope_quant
 
 
 # ============================================================================
@@ -826,9 +838,7 @@ def flydsl_qk_norm_rope_quant(
     if kv_weight.dtype != torch.bfloat16:
         raise TypeError(f"kv_weight must be bf16, got {kv_weight.dtype}")
     if kv.stride(-1) != 1:
-        raise ValueError(
-            f"kv must be dense in the last dim, stride={kv.stride()}"
-        )
+        raise ValueError(f"kv must be dense in the last dim, stride={kv.stride()}")
     # The KV inner loop casts bf16 vectors to dword (i32) and computes the
     # buffer-load offset as ``(row * kv.stride(0) + tid * VEC) >> 1``. That
     # ``>> 1`` is only correct when the byte offset is dword-aligned for every
@@ -841,9 +851,7 @@ def flydsl_qk_norm_rope_quant(
     if positions.dtype != torch.int64:
         raise TypeError(f"positions must be int64, got {positions.dtype}")
     if scale_dtype not in SCALE_DTYPE_OPTIONS:
-        raise ValueError(
-            f"scale_dtype {scale_dtype!r} not in {SCALE_DTYPE_OPTIONS}"
-        )
+        raise ValueError(f"scale_dtype {scale_dtype!r} not in {SCALE_DTYPE_OPTIONS}")
     if q_weight is not None and q_weight.dtype != torch.bfloat16:
         raise TypeError(f"q_weight must be bf16, got {q_weight.dtype}")
 
@@ -852,9 +860,7 @@ def flydsl_qk_norm_rope_quant(
     G = quant_group_size if quant_group_size is not None else D
     NG = D // G
     if D % G != 0:
-        raise ValueError(
-            f"head_dim {D} must be divisible by quant_group_size {G}"
-        )
+        raise ValueError(f"head_dim {D} must be divisible by quant_group_size {G}")
     q_weighted = q_weight is not None
     # Kernel always reads the q_weight parameter; pass a 1-elem dummy when
     # q_weighted=False (the const_expr gate inside the kernel ensures the
@@ -865,9 +871,7 @@ def flydsl_qk_norm_rope_quant(
     # Normalize Q to [T, H, D] (the kernel expects 3D).
     if q.dim() == 2:
         if q.shape[1] != H * D:
-            raise ValueError(
-                f"q shape {tuple(q.shape)} != [T, H*D={H*D}]"
-            )
+            raise ValueError(f"q shape {tuple(q.shape)} != [T, H*D={H*D}]")
         if not q.is_contiguous():
             raise ValueError("2D q must be contiguous to .view as [T,H,D]")
         q_view = q.view(T_tok, H, D)
