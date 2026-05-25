@@ -325,6 +325,10 @@ def compile_mixed_moe_gemm1(
 
     kpack_bytes = 8 if is_int4 else 16
     out_elem_bytes = 4 if out_is_f32 else 2
+    w_elem_bytes = 2 if is_f16_b else 1
+    w_elem_pack = 2 if (is_f4_b or is_int4) else 1
+    w_nbytes = (experts * (2 * inter_dim) * model_dim * w_elem_bytes) // w_elem_pack
+    bias_nbytes = experts * (2 * inter_dim) * 4
 
     _e_vec_s1 = min(tile_n // 32, 8)
     if _need_quant:
@@ -609,7 +613,9 @@ def compile_mixed_moe_gemm1(
                 arg_x, max_size=False, num_records_bytes=x_nbytes_i32
             )
 
-            w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+            w_rsrc = buffer_ops.create_buffer_resource(
+                arg_w, max_size=False, num_records_bytes=w_nbytes
+            )
 
             # Out: [tokens*topk, inter_dim]
             numids_rsrc = buffer_ops.create_buffer_resource(
@@ -662,7 +668,9 @@ def compile_mixed_moe_gemm1(
                 arg_expert_ids, max_size=False, num_records_bytes=eid_nbytes_i32
             )
             bias_rsrc = (
-                buffer_ops.create_buffer_resource(arg_bias, max_size=False)
+                buffer_ops.create_buffer_resource(
+                    arg_bias, max_size=False, num_records_bytes=bias_nbytes
+                )
                 if enable_bias
                 else None
             )
@@ -2890,6 +2898,10 @@ def compile_mixed_moe_gemm2(
             "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16'}"
         )
     is_int4 = b_dtype == "int4"
+    w_elem_bytes = 2 if is_f16_b else 1
+    w_elem_pack = 2 if (is_f4_b or is_int4) else 1
+    w_nbytes = (experts * model_dim * inter_dim * w_elem_bytes) // w_elem_pack
+    bias_nbytes = experts * model_dim * 4
     # INT4 here means W4A8: A2 is int8, W is packed int4 and unpacked to int8 in-kernel.
     is_int8 = False
 
@@ -3176,7 +3188,9 @@ def compile_mixed_moe_gemm2(
                 arg_x, max_size=False, num_records_bytes=x_nbytes_i32
             )
 
-            w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+            w_rsrc = buffer_ops.create_buffer_resource(
+                arg_w, max_size=False, num_records_bytes=w_nbytes
+            )
 
             # OUT: [tokens, model_dim] -> clamp to descriptor max (i32 bytes) to avoid overflow on huge tokens.
             out_elem_bytes = 4 if out_is_f32 else 2
@@ -3272,7 +3286,9 @@ def compile_mixed_moe_gemm2(
                 arg_expert_ids, max_size=False, num_records_bytes=eid_nbytes_i32
             )
             bias_rsrc = (
-                buffer_ops.create_buffer_resource(arg_bias, max_size=False)
+                buffer_ops.create_buffer_resource(
+                    arg_bias, max_size=False, num_records_bytes=bias_nbytes
+                )
                 if enable_bias
                 else None
             )
