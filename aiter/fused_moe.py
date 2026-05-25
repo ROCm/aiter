@@ -892,7 +892,10 @@ def get_2stage_cfgs(
             if col not in df.columns:
                 df[col] = 0
             df[col] = df[col].fillna(0).astype(int)
-        df["bias"] = df["bias"].eq("True") if "bias" in df.columns else False
+        if "bias" in df.columns:
+            df["bias"] = df["bias"].astype(str).str.strip().eq("True")
+        else:
+            df["bias"] = False
         return df
 
     def get_cfg_2stages(tune_file):

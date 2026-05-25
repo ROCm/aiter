@@ -210,24 +210,15 @@ def test_fmoe(
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
 
-    # bias dtype convert: presence is governed by the `bias` flag (from csv).
-    # Only the a16w4 quant path (per_1x32, fp4 weight, bf16/fp16/fp8 input) has
-    # a kernel that accepts bias today; other paths (a4w4, a16wi4, ...) drop it
-    # to None to match historical test behavior. TODO: extend once the
-    # corresponding kernels expose a bias-aware variant.
+    # bias dtype convert: `bias` flag (from csv) is the source of truth. When
+    # set, cast to fp32 (kernel ABI). When csv has no bias column, exp_bias1
+    # is already None (default False) and this is a no-op.
     if exp_bias1 is None:
         exp_bias1_aiter = None
         exp_bias2_aiter = None
-    elif (
-        qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
-        and (WQDType == dtypes.fp4x2)
-    ):  # a16w4: kernel expects fp32 bias
+    else:
         exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
         exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
-    else:
-        exp_bias1 = exp_bias1_aiter = None
-        exp_bias2 = exp_bias2_aiter = None
 
     # pre-shuffle
     w1_scale_aiter = w1_scale
