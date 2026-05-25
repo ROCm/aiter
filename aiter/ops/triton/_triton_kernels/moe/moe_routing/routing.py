@@ -55,7 +55,7 @@ def _routing_compute_indx(
             strides=(LOAD_SIZE, 1),
             block_shape=(1, LOAD_SIZE),
         )
-        expert = tl.reshape(expt_desc.load([0, 0]), (LOAD_SIZE,)).to(tl.uint32)
+        expert = tl.reshape(expt_desc.load([0, 0]), (LOAD_SIZE,))
         expert = tl.where(offs < n_gates, expert, -1).to(tl.uint32)
     elif EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
         expert = tl.load(ExptIndx + offs).to(tl.uint32)
@@ -129,7 +129,7 @@ def _routing_compute_indx_fused(
             strides=(LOAD_SIZE, 1),
             block_shape=(1, LOAD_SIZE),
         )
-        expert = tl.reshape(expt_desc.load([0, 0]), (LOAD_SIZE,)).to(tl.uint32)
+        expert = tl.reshape(expt_desc.load([0, 0]), (LOAD_SIZE,))
         expert = tl.where(offs < n_gates, expert, -1).to(tl.uint32)
     elif EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
         expert = tl.load(ExptIndx + offs).to(tl.uint32)
