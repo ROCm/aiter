@@ -1424,6 +1424,35 @@ __device__ __forceinline__ T ar_fusion_epilogue_block_reduce(T val, int block_si
     return val;
 }
 
+// Dual sum+max block reduce with a single __syncthreads().
+// Fuses the square_sum (AddFunctor) and xw_max (MaxFunctor) reductions used
+// by the quantized epilogue path, eliminating one full block_reduce call.
+template <int WARP_SIZE = 32>
+__device__ __forceinline__ void
+ar_fusion_epilogue_block_reduce_dual(float& sq_sum, float& v_max, int block_size)
+{
+    static __shared__ float shared[64]; // [0..31]: sum, [32..63]: max
+    const int tid       = threadIdx.x;
+    const int w_tid     = tid % WARP_SIZE;
+    const int wid       = tid / WARP_SIZE;
+    const int num_warps = block_size / WARP_SIZE;
+    int reduce_width    = 1;
+    while(reduce_width < num_warps)
+        reduce_width <<= 1;
+    sq_sum = warpReduce<AddFunctor, float, WARP_SIZE>(sq_sum);
+    v_max  = warpReduce<MaxFunctor, float, WARP_SIZE>(v_max);
+    if(w_tid == 0)
+    {
+        shared[wid]             = sq_sum;
+        shared[32 + wid]        = v_max;
+    }
+    __syncthreads(); // single sync
+    sq_sum = (w_tid < num_warps) ? shared[w_tid]      : 0.f;
+    v_max  = (w_tid < num_warps) ? shared[32 + w_tid] : 0.f;
+    sq_sum = warpReduceRuntime<AddFunctor, float>(sq_sum, reduce_width);
+    v_max  = warpReduceRuntime<MaxFunctor, float>(v_max,  reduce_width);
+}
+
 template <typename P,
           typename A,
           typename O,
@@ -1499,19 +1528,37 @@ __device__ __forceinline__ void ar_fusion_epilogue(A& in,
     }
     else
     {
+        // Single-sync path for per-token fp8/i8 quantization.
+        // Key: max(|in*weight*rms|) = rms * max(|in*weight|), so xw_max can be
+        // accumulated alongside square_sum before the reduction, saving one full
+        // block_reduce (and its two __syncthreads()) vs the two-phase original.
         float FP8_UPBOUND = opus::cast<opus::fp32_t>(opus::numeric_limits<opus::fp8_t>::max());
         using OP          = opus::vector_t<OutT, PACK_SIZE>;
+        float sq_sum = 0.f, xw_max = 1e-30f;
+        A xw;
+#pragma unroll
+        for(int i = 0; i < PACK_SIZE; ++i)
+        {
+            float xi       = upcast_s(in[i]);
+            float xwi      = xi * upcast_s(weight[i]);
+            sq_sum        += xi * xi;
+            xw[i]          = xwi;
+            float abs_xwi  = xwi < 0.f ? -xwi : xwi;
+            xw_max         = xw_max > abs_xwi ? xw_max : abs_xwi;
+        }
+        ar_fusion_epilogue_block_reduce_dual(sq_sum, xw_max, block_size);
+        float rms       = rsqrtf(sq_sum / hidden_dim + eps);
+        float inv_scale = xw_max == 0.f ? FP8_UPBOUND : FP8_UPBOUND / xw_max;
+        if(threadIdx.x == 0)
+            scale_out[tidx] = rms * xw_max / FP8_UPBOUND;
         OP out_quant;
-        A out;
-        ar_fusion_epilogue_rms_norm<P, A, A, float, PACK_SIZE>(
-            out, in, weight, eps, hidden_dim, block_size);
-        float amax  = ar_fusion_epilogue_reduce_abs_max<A, PACK_SIZE>(out, block_size);
-        float scale = amax == 0.f ? 1.f : amax / FP8_UPBOUND;
-        out_quant   = packQuant<opus::fp32_t, PACK_SIZE>(out, scale);
+#pragma unroll
+        for(int i = 0; i < PACK_SIZE; ++i)
+        {
+            out_quant[i] = downcast_s<OutT>(rms * xw[i] * inv_scale);
+        }
         if(active)
             *reinterpret_cast<OP*>(output + idx) = out_quant;
-        if(threadIdx.x == 0)
-            scale_out[tidx] = scale;
     }
 }
 
