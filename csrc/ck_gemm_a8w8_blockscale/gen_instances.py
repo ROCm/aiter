@@ -369,8 +369,11 @@ torch::Tensor
             "w",
         ) as f:
             f.write(MAINFEST_head)
+            seen_kernel_names = set()
             for _, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+                if k.name not in seen_kernel_names:
+                    seen_kernel_names.add(k.name)
+                    f.write(MAINFEST_template.format(kernel_name=k.name))
             f.write(MAINFEST_end)
 
     def gen_code(self, kernels_dict: dict):

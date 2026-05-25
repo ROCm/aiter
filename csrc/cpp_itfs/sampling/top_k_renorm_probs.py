@@ -4,7 +4,6 @@
 
 from jinja2 import Template
 from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR
-import math
 
 MD_NAME = "top_k_renorm_probs"
 
@@ -16,7 +15,6 @@ with open(
 
 
 def compile(
-    vec_size: int,
     folder: str = None,
 ):
     return compile_template_op(
@@ -27,7 +25,6 @@ def compile(
             f"{AITER_CORE_DIR}/csrc/cpp_itfs/sampling/sampling.cuh",
             f"{AITER_CORE_DIR}/csrc/cpp_itfs/sampling/vec_dtypes.cuh",
         ],
-        vec_size=vec_size,
         folder=folder,
     )
 
@@ -46,10 +43,9 @@ def top_k_renorm_probs(
 
     batch_size = probs.size(0)
     vocab_size = probs.size(1)
-    vec_size = math.gcd(16 // probs.element_size(), vocab_size)
     renorm_probs = torch.empty_like(probs)
 
-    func = compile(vec_size)
+    func = compile()
     (
         probs_ptr,
         renorm_probs_ptr,
@@ -83,7 +79,6 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--d", type=int, required=True)
     parser.add_argument("--folder", type=str, default=None)
     args = parser.parse_args()
     compile(**vars(args))
