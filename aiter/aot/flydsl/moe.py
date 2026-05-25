@@ -71,19 +71,32 @@ def _row_swiglu_limit(row: dict[str, str]) -> float:
     return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit") or 0.0
 
 
-def _row_optional_int(row: dict[str, str], name: str, *aliases: str) -> int:
-    for key in (name, *aliases):
-        value = row.get(key)
-        if value is None:
-            continue
-        value = str(value).strip()
-        if value == "":
-            return 0
-        try:
-            return int(value)
-        except ValueError as e:
-            raise ValueError(f"{key} must be an int, got {value!r}") from e
-    return 0
+def _row_optional_int(row: dict[str, str], name: str) -> int:
+    value = row.get(name)
+    if value is None:
+        return 0
+    value = str(value).strip()
+    if value == "":
+        return 0
+    try:
+        return int(value)
+    except ValueError as e:
+        raise ValueError(f"{name} must be an int, got {value!r}") from e
+
+
+def _row_optional_bool(row: dict[str, str], name: str) -> bool | None:
+    value = row.get(name)
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value == "":
+        return None
+    value_lower = value.lower()
+    if value_lower in ("1", "true", "t", "yes", "y"):
+        return True
+    if value_lower in ("0", "false", "f", "no", "n"):
+        return False
+    raise ValueError(f"{name} must be a bool, got {value!r}")
 
 
 def parse_csv(csv_path: str):
@@ -108,7 +121,7 @@ def parse_csv(csv_path: str):
             experts = int(row["expert"])
             topk = int(row["topk"])
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
-            hidden_pad = _row_optional_int(row, "hidden_pad", "hiddne_pad")
+            hidden_pad = _row_optional_int(row, "hidden_pad")
             intermediate_pad = _row_optional_int(row, "intermediate_pad")
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
@@ -122,15 +135,18 @@ def parse_csv(csv_path: str):
             dtype = row.get("dtype", "")
             q_dtype_w = row.get("q_dtype_w", "")
             swiglu_limit = _row_swiglu_limit(row)
-            # Cover both runtime bias choices for fp4-weight MoE. Model configs
-            # share kernel families, and runtime bias selection can vary by
-            # activation dtype/model semantics.
             bias_supported = (
                 q_type.strip().split(".")[-1] == "per_1x32"
                 and dtype in ("torch.bfloat16", "torch.float16")
                 and "float4_e2m1fn_x2" in q_dtype_w
             )
-            enable_bias_options = [False, True] if bias_supported else [False]
+            bias = _row_optional_bool(row, "bias")
+            if bias is not None:
+                enable_bias_options = [bias]
+            elif bias_supported:
+                enable_bias_options = [False, True]
+            else:
+                enable_bias_options = [False]
 
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
@@ -759,6 +775,8 @@ def compile_one_config(
     experts: int,
     topk: int,
     cu_num: int = 0,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
     **kwargs,
 ) -> dict:
     """Compile one MoE kernel configuration and save to cache.
@@ -772,8 +790,8 @@ def compile_one_config(
     shape_str = (
         f"{kernel_name}  "
         f"model_dim={model_dim} inter_dim={inter_dim} "
-        f"hidden_pad={kwargs.get('hidden_pad', 0)} "
-        f"intermediate_pad={kwargs.get('intermediate_pad', 0)} "
+        f"hidden_pad={hidden_pad} "
+        f"intermediate_pad={intermediate_pad} "
         f"E={experts} topk={topk}"
     )
     result = {
@@ -796,6 +814,8 @@ def compile_one_config(
                 experts=experts,
                 topk=topk,
                 cu_num=cu_num,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
                 **kwargs,
             )
         elapsed = time.time() - t0

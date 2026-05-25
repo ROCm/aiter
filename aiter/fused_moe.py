@@ -13,7 +13,14 @@ import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
 from aiter import logger
-from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
+from aiter.jit.core import (
+    AITER_CONFIGS,
+    AITER_CSRC_DIR,
+    PAD_COLUMNS,
+    PY,
+    bd_dir,
+    mp_lock,
+)
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
@@ -344,6 +351,7 @@ def fused_moe_(
         intermediate_pad,
         isShuffled,
         gate_mode,
+        bias=(bias1 is not None or bias2 is not None),
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -864,6 +872,7 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
+    bias=False,
 ):
     gate_mode = GateMode(gate_mode)
     _INDEX_COLS = [
@@ -880,27 +889,38 @@ def get_2stage_cfgs(
         "q_type",
         "use_g1u1",
         "doweight_stage1",
-        "hidden_pad",
-        "intermediate_pad",
+        "bias",
+        *PAD_COLUMNS,
     ]
 
-    def _normalize_pad_cols(df):
-        if "hidden_pad" not in df.columns:
-            if "hiddne_pad" in df.columns:
-                df["hidden_pad"] = df["hiddne_pad"]
-            else:
-                df["hidden_pad"] = 0
-        df["hidden_pad"] = df["hidden_pad"].fillna(0).astype(int)
-        if "intermediate_pad" not in df.columns:
-            df["intermediate_pad"] = 0
-        df["intermediate_pad"] = df["intermediate_pad"].fillna(0).astype(int)
+    _BIAS_TRUE = {"true", "1", "yes", "y", "t"}
+
+    def _parse_bias_cell(v):
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            # NaN -> False
+            return False if v != v else bool(v)
+        return str(v).strip().lower() in _BIAS_TRUE
+
+    def _normalize_lookup_cols(df):
+        for col in PAD_COLUMNS:
+            if col not in df.columns:
+                df[col] = 0
+            df[col] = df[col].fillna(0).astype(int)
+        if "bias" not in df.columns:
+            df["bias"] = False
+        else:
+            df["bias"] = df["bias"].map(_parse_bias_cell).astype(bool)
         return df
 
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
         df = pd.read_csv(tune_file)
-        df = _normalize_pad_cols(df)
+        df = _normalize_lookup_cols(df)
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
 
@@ -942,7 +962,7 @@ def get_2stage_cfgs(
             _flydsl_fallback_cache[tune_file] = {}
             return {}
         df = pd.read_csv(tune_file)
-        df = _normalize_pad_cols(df)
+        df = _normalize_lookup_cols(df)
         if "_tag" not in df.columns:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
@@ -971,6 +991,7 @@ def get_2stage_cfgs(
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
+    bias_key = bool(bias)
     keys = (
         cu_num,
         token,
@@ -985,6 +1006,7 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
+        bias_key,
         hidden_pad,
         intermediate_pad,
     )
@@ -1002,19 +1024,41 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
+        bias_key,
         hidden_pad,
         intermediate_pad,
     )
 
     def MainFunc():
+        header = "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,bias,hidden_pad,intermediate_pad"
+        # Migrate legacy untuned CSV (no `bias` column) so appended rows stay aligned.
+        if os.path.exists(untune_file) and os.path.getsize(untune_file) > 0:
+            with open(untune_file, "r") as f:
+                lines = f.read().splitlines()
+            if lines and "bias" not in lines[0].split(","):
+                old_cols = lines[0].split(",")
+                try:
+                    insert_at = old_cols.index("doweight_stage1") + 1
+                except ValueError:
+                    insert_at = len(old_cols) - len(PAD_COLUMNS)
+                new_lines = [
+                    ",".join(old_cols[:insert_at] + ["bias"] + old_cols[insert_at:])
+                ]
+                for line in lines[1:]:
+                    if not line.strip():
+                        new_lines.append(line)
+                        continue
+                    parts = line.split(",")
+                    parts = parts[:insert_at] + ["False"] + parts[insert_at:]
+                    new_lines.append(",".join(parts))
+                with open(untune_file, "w") as f:
+                    f.write("\n".join(new_lines))
         with open(untune_file, "a") as f:
             if os.path.getsize(untune_file) == 0:
-                f.write(
-                    "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,hidden_pad,intermediate_pad"
-                )
+                f.write(header)
             q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
             f.write(
-                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)},{hidden_pad},{intermediate_pad}"
+                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)},{bool(bias)},{hidden_pad},{intermediate_pad}"
             )
         logger.info("\033[34m Start tuning fmoe")
         os.system(
@@ -1555,6 +1599,7 @@ def fused_moe_2stages(
         intermediate_pad,
         is_shuffled,
         gate_mode,
+        bias=(bias1 is not None or bias2 is not None),
     )
     if (
         quant_type == QuantType.per_1x32

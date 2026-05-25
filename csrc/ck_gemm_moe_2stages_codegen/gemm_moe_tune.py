@@ -116,6 +116,32 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
     return cos_diff if cos_diff >= COS_DIFF_THRESHOLD else 0.0
 
 
+def _untuned_to_bool(value):
+    """Parse a bool from an untuned CSV cell. Accepts True/False/0/1/empty."""
+    if value is None or (isinstance(value, float) and value != value):  # NaN
+        return False
+    if isinstance(value, (bool, int)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in ("", "false", "0", "no", "n", "f"):
+        return False
+    if s in ("true", "1", "yes", "y", "t"):
+        return True
+    raise ValueError(f"cannot parse bool from {value!r}")
+
+
+def _untuned_to_int(value):
+    """Parse an int from an untuned CSV cell. Empty/NaN -> 0."""
+    if value is None or (isinstance(value, float) and value != value):  # NaN
+        return 0
+    if isinstance(value, (int, bool)):
+        return int(value)
+    s = str(value).strip()
+    if s == "":
+        return 0
+    return int(float(s))
+
+
 class FmoeTuner(TunerCommon):
     ARG_DEFAULTS = {
         **TunerCommon.ARG_DEFAULTS,
@@ -1719,6 +1745,9 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            bias,
+            hidden_pad,
+            intermediate_pad,
         ) = key
         if us == self.INVALID_TIME or us == self.INF_TIME:
             return 0, 0
@@ -1829,6 +1858,9 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            bias,
+            hidden_pad,
+            intermediate_pad,
         ) = info
         ## asm moe 1 stage tuning
         get_gfx()
@@ -2004,6 +2036,9 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            bias,
+            hidden_pad,
+            intermediate_pad,
         ) = info
         kernels_list_csv = f"{get_asm_dir()}/fmoe_2stages/fmoe_stage1_bf16_pertoken{{quantDtype}}{{extraInfo}}_g1u1.csv"
         extraInfo = ""
@@ -2115,6 +2150,9 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            bias,
+            hidden_pad,
+            intermediate_pad,
         ) = info
 
         _is_a8w4 = (
@@ -2306,6 +2344,9 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            bias,
+            hidden_pad,
+            intermediate_pad,
         ) = info
 
         _gen_data_args_s1 = (
@@ -2424,6 +2465,9 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            bias,
+            hidden_pad,
+            intermediate_pad,
         ) = info
 
         if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
@@ -2644,6 +2688,9 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            bias,
+            hidden_pad,
+            intermediate_pad,
         ) = info
 
         if not (q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2):
@@ -3073,12 +3120,18 @@ class FmoeTuner(TunerCommon):
                 q_type,
                 use_g1u1,
                 doweight_stage1,
+                bias,
+                hidden_pad,
+                intermediate_pad,
             ) = line
             dtype = eval(dtype)
             q_dtype_a = eval(q_dtype_a)
             q_dtype_w = eval(q_dtype_w)
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
+            bias = _untuned_to_bool(bias)
+            hidden_pad = _untuned_to_int(hidden_pad)
+            intermediate_pad = _untuned_to_int(intermediate_pad)
             print("\nStart tuning", line)
             if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
                 print(f"{q_type} is not supported on {get_gfx()}")
@@ -3101,6 +3154,9 @@ class FmoeTuner(TunerCommon):
                 q_type,
                 use_g1u1,
                 doweight_stage1,
+                bias,
+                hidden_pad,
+                intermediate_pad,
             )
             tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
             tasks_ck.extend(self.gen_2stages_task(info, blockMs))
@@ -3243,6 +3299,9 @@ class FmoeTuner(TunerCommon):
                 q_type,
                 use_g1u1,
                 doweight_stage1,
+                bias,
+                hidden_pad,
+                intermediate_pad,
             ) = key
             import re
 
@@ -3270,6 +3329,9 @@ class FmoeTuner(TunerCommon):
                         q_type,
                         use_g1u1,
                         doweight_stage1,
+                        bias,
+                        hidden_pad,
+                        intermediate_pad,
                         block_m,
                         row_ksplit,
                         us,
@@ -3643,6 +3705,22 @@ class FmoeTuner(TunerCommon):
         else:
             return pd.DataFrame()
 
+    # Optional untuned columns: backfilled with these defaults so older untuned
+    # CSVs (without bias / hidden_pad / intermediate_pad) still load cleanly.
+    OPTIONAL_UNTUNED_DEFAULTS = {
+        "bias": False,
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+    }
+
+    def _backfill_optional_untuned_cols(self, df):
+        for col, default in self.OPTIONAL_UNTUNED_DEFAULTS.items():
+            if col not in df.columns:
+                df[col] = default
+            else:
+                df[col] = df[col].fillna(default)
+        return df
+
     def pre_process(self, args):
         if args.all:
             self.get_retune_gemm_list(args)
@@ -3665,6 +3743,8 @@ class FmoeTuner(TunerCommon):
                     self.tunedf[untunedf_cols].apply(tuple, axis=1)
                 )
                 self.untunedf = self.untunedf[~mask]
+        if self.untunedf is not None:
+            self.untunedf = self._backfill_optional_untuned_cols(self.untunedf)
 
 
 if __name__ == "__main__":
@@ -3682,6 +3762,9 @@ if __name__ == "__main__":
         "q_type",
         "use_g1u1",
         "doweight_stage1",
+        "bias",
+        "hidden_pad",
+        "intermediate_pad",
     ]
     resultList = [
         "block_m",
