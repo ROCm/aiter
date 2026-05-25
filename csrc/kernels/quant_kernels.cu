@@ -1739,47 +1739,7 @@ __global__ void mxfp4_quant_moe_sort_kernel(
         AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize);  \
     }
 
-void fused_dynamic_mxfp4_quant_moe_sort_hip(
-    aiter_tensor_t& output,
-    aiter_tensor_t& scale,
-    const aiter_tensor_t& input,
-    const aiter_tensor_t& sorted_ids,
-    const aiter_tensor_t& num_valid_ids,
-    int token_num,
-    int block_m,
-    int group_size
-)
-{
-    int cols = input.size(-1);
-    int topk = input.numel() / (cols * token_num);
-    int num_experts = (sorted_ids.size(0) + topk - topk * token_num) / block_m;
-
-    const int num_cu = get_num_cu_func();
-    int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;
-    AITER_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
-    int tgs_per_block_m = block_m / sub_block_m;
-    int num_blocks = (sorted_ids.size(0) + sub_block_m - 1) / sub_block_m;
-    const bool persistent_mode = false;
-    const int input_stride     = input.stride(-2);
-
-    HipDeviceGuard device_guard(input.device_id);
-    const hipStream_t stream = aiter::getCurrentHIPStream();
-
-#if defined(__Float4_e2m1fn_x2)
-    if(output.dtype() == AITER_DTYPE_fp4x2 || output.dtype() == AITER_DTYPE_u8)
-    {
-        MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(opus::fp4_t, cols);
-    }
-    else
-    {
-        AITER_CHECK(false, __func__, ": not support output type: ", AiterDtype_to_str(output.dtype()));
-    }
-#else
-    AITER_CHECK(false, __func__, ": not support fp4x2 on this device");
-#endif
-}
-
-void fused_dynamic_mxfp8_quant_moe_sort_hip(
+void fused_dynamic_mx_quant_moe_sort_hip(
     aiter_tensor_t& output,
     aiter_tensor_t& scale,
     const aiter_tensor_t& input,
@@ -1809,6 +1769,12 @@ void fused_dynamic_mxfp8_quant_moe_sort_hip(
     {
         MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(opus::fp8_t, cols);
     }
+#if defined(__Float4_e2m1fn_x2)
+    else if(output.dtype() == AITER_DTYPE_fp4x2 || output.dtype() == AITER_DTYPE_u8)
+    {
+        MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(opus::fp4_t, cols);
+    }
+#endif
     else
     {
         AITER_CHECK(false, __func__, ": not support output type: ", AiterDtype_to_str(output.dtype()));

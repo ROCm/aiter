@@ -668,7 +668,7 @@ def mxfp4_moe_sort_fwd(
 
 
 @compile_ops("module_quant", develop=True)
-def fused_dynamic_mxfp4_quant_moe_sort_hip(
+def fused_dynamic_mx_quant_moe_sort_hip(
     out: torch.Tensor,
     scales: torch.Tensor,
     input: torch.Tensor,
@@ -679,24 +679,9 @@ def fused_dynamic_mxfp4_quant_moe_sort_hip(
     group_size: int = 32,
 ) -> None:
     """
-    HIP path for fused dynamic MXFP4 quantization and MoE scale sorting.
-    """
-    ...
-
-
-@compile_ops("module_quant", develop=True)
-def fused_dynamic_mxfp8_quant_moe_sort_hip(
-    out: torch.Tensor,
-    scales: torch.Tensor,
-    input: torch.Tensor,
-    sorted_ids: torch.Tensor,
-    num_valid_ids: torch.Tensor,
-    token_num: int,
-    block_m: int,
-    group_size: int = 32,
-) -> None:
-    """
-    HIP path for fused dynamic MXFP8 quantization and MoE scale sorting.
+    HIP path for fused dynamic MX (fp4 or fp8) quantization and MoE scale
+    sorting. The output dtype of ``out`` selects the quant target: fp4x2/uint8
+    for MXFP4, fp8 for MXFP8.
     """
     ...
 
@@ -796,7 +781,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         or group_size != 32
     ):
         out = torch.empty(M, N // 2, dtype=dtypes.fp4x2, device=input.device)
-        fused_dynamic_mxfp4_quant_moe_sort_hip(
+        fused_dynamic_mx_quant_moe_sort_hip(
             out,
             scale,
             input,
@@ -839,7 +824,7 @@ def fused_dynamic_mxfp8_quant_moe_sort(
         dtype=dtypes.fp8_e8m0,
         device=input.device,
     )
-    fused_dynamic_mxfp8_quant_moe_sort_hip(
+    fused_dynamic_mx_quant_moe_sort_hip(
         out,
         scale,
         input,

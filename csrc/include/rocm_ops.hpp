@@ -1411,18 +1411,8 @@ namespace py = pybind11;
           py::arg("block_m"),                                            \
           py::arg("shuffle_scale") = false,                              \
           py::arg("transpose_out") = false);                             \
-    m.def("fused_dynamic_mxfp4_quant_moe_sort_hip",                      \
-          &aiter::fused_dynamic_mxfp4_quant_moe_sort_hip,                \
-          py::arg("out"),                                                \
-          py::arg("scales"),                                             \
-          py::arg("input"),                                              \
-          py::arg("sorted_ids"),                                         \
-          py::arg("num_valid_ids"),                                      \
-          py::arg("token_num"),                                          \
-          py::arg("block_m"),                                            \
-          py::arg("group_size") = 32);                                   \
-    m.def("fused_dynamic_mxfp8_quant_moe_sort_hip",                      \
-          &aiter::fused_dynamic_mxfp8_quant_moe_sort_hip,                \
+    m.def("fused_dynamic_mx_quant_moe_sort_hip",                      \
+          &aiter::fused_dynamic_mx_quant_moe_sort_hip,                \
           py::arg("out"),                                                \
           py::arg("scales"),                                             \
           py::arg("input"),                                              \

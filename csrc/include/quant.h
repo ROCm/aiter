@@ -68,16 +68,7 @@ void moe_smooth_per_token_scaled_quant_v2(aiter_tensor_t& out,         // [..., 
                                           bool shuffle_scale = false,
                                           bool transpose_out = false);
 
-void fused_dynamic_mxfp4_quant_moe_sort_hip(aiter_tensor_t& out,         // [token_num * topk, d / 2]
-                                            aiter_tensor_t& scales,      // swizzled e8m0 bytes
-                                            const aiter_tensor_t& input, // [token_num * topk, d]
-                                            const aiter_tensor_t& sorted_ids,
-                                            const aiter_tensor_t& num_valid_ids,
-                                            int token_num,
-                                            int block_m,
-                                            int group_size = 32);
-
-void fused_dynamic_mxfp8_quant_moe_sort_hip(aiter_tensor_t& out,         // [token_num * topk, d]
+void fused_dynamic_mx_quant_moe_sort_hip(aiter_tensor_t& out,         // [token_num * topk, d] for fp8 or [token_num * topk, d / 2] for fp4
                                             aiter_tensor_t& scales,      // swizzled e8m0 bytes
                                             const aiter_tensor_t& input, // [token_num * topk, d]
                                             const aiter_tensor_t& sorted_ids,
