@@ -187,7 +187,7 @@ def _precompile_to_cache(
     act: str = "silu",
     doweight_stage1: bool = False,
     waves_per_eu: int = 3,
-    k_batch: int = 1,
+    k_batch_intra_block: int = 1,
     b_nt: int = 2,
     gate_mode: str = "separated",
     mode: str = "atomic",
@@ -387,7 +387,7 @@ def _precompile_to_cache(
             _need_fp8 = out_dtype == "fp8"
             _fuse_any_quant = _need_fp4 or _need_fp8
             _base_out_dtype = "bf16" if _fuse_any_quant else out_dtype
-            _is_splitk = k_batch > 1
+            _is_splitk = k_batch_intra_block > 1
             _splitk_fp4 = _is_splitk and _need_fp4
             _gui_sk = gate_mode == "interleave" and _is_splitk
             _gui_sk_fused = _gui_sk and _fuse_any_quant
@@ -547,14 +547,13 @@ def _precompile_to_cache(
                 out_dtype=_gemm_out_dtype,
                 act=act,
                 use_async_copy=True,
-                k_batch_intra_block=k_batch,
+                k_batch_intra_block=k_batch_intra_block,
                 waves_per_eu=waves_per_eu,
                 b_nt=b_nt,
                 gate_mode=gate_mode,
                 enable_bias=(kernel_bias is not None),
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
-                swiglu_limit=swiglu_limit,
             )
             _run_compiled(exe, args)
 

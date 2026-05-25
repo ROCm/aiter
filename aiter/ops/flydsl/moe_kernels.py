@@ -331,6 +331,31 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
         )
+    elif b_dtype in ("fp4", "mxfp4") and a_dtype not in ("bf16",):
+        # a4w4 (fp4 act) or a8w4 (fp8 act) — any non-bf16 activation with fp4 weights
+        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1, GateMode
+
+        return compile_mixed_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype=out_dtype,
+            act=act,
+            persist_m=persist_m,
+            use_async_copy=use_async_copy,
+            k_batch=k_batch_intra_block,
+            waves_per_eu=waves_per_eu,
+            b_nt=b_nt,
+            gate_mode=GateMode(gate_mode),
+            xcd_swizzle=xcd_swizzle,
+        )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
