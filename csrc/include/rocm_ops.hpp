@@ -1751,7 +1751,11 @@ namespace py = pybind11;
           "                     Tensor sin_cache,"                                  \
           "                     float eps,"                                         \
           "                     bool is_neox,"                                      \
-          "                     bool is_nope_first)->()",                           \
+          "                     bool is_nope_first,"                                \
+          "                     Tensor? q_weight=None,"                             \
+          "                     Tensor!? q_scale=None,"                             \
+          "                     int quant_group_size=64,"                           \
+          "                     str scale_dtype='e8m0')->()",                       \
           py::arg("q"),                                                             \
           py::arg("kv"),                                                            \
           py::arg("k_pe_out"),                                                      \
@@ -1764,7 +1768,11 @@ namespace py = pybind11;
           py::arg("sin_cache"),                                                     \
           py::arg("eps"),                                                           \
           py::arg("is_neox"),                                                       \
-          py::arg("is_nope_first"));
+          py::arg("is_nope_first"),                                                 \
+          py::arg("q_weight") = py::none(),                                         \
+          py::arg("q_scale") = py::none(),                                          \
+          py::arg("quant_group_size") = 64,                                         \
+          py::arg("scale_dtype") = std::string("e8m0"));
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \

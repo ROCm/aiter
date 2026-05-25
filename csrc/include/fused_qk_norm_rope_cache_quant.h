@@ -116,13 +116,26 @@ void fused_qk_norm_rope_group_quant_cache(
     at::Tensor& k_pe_out,      // [num_tokens, (k_num_heads,) pe_dim] (RoPE'd output)
     at::Tensor& k_weight,      // [head_dim] RMSNorm weights
     at::Tensor& kv_cache,      // [num_blocks, block_size, (k_num_heads,) head_dim]
-    at::Tensor& q_out,         // [num_tokens, num_heads, head_dim] bf16 output (RMS norm + RoPE)
+    at::Tensor& q_out,         // [num_tokens, num_heads, head_dim] bf16 OR fp8 output
     at::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
     at::Tensor& positions,     // [num_tokens]
     at::Tensor& cos_cache,     // [max_position, rot_dim//2]
     at::Tensor& sin_cache,     // [max_position, rot_dim//2]
     double eps,                   // epsilon for RMS norm
     bool is_neox,
-    bool is_nope_first);
+    bool is_nope_first,
+    // --- NEW (flydsl-alignment) optional features ---
+    // q_weight: optional per-channel RMSNorm weight for Q [head_dim]. nullopt = weightless (V4-Pro).
+    std::optional<at::Tensor> q_weight = std::nullopt,
+    // q_scale: required when q_out.dtype is fp8. Shape [num_tokens, num_heads, head_dim/quant_group_size].
+    // dtype: float32 when scale_dtype="fp32", uint8 (e8m0) when scale_dtype="e8m0".
+    std::optional<at::Tensor> q_scale = std::nullopt,
+    // quant_group_size: width of the 1xG scale block applied to Q. Must be one of {32, 64, 128}
+    // and divide head_dim. Default 64 (matches existing K-side hard-coded group). When q_out is
+    // bf16 this is ignored.
+    int64_t quant_group_size = 64,
+    // scale_dtype: "e8m0" (1-byte MX) or "fp32" (4-byte). Controls the dtype of q_scale and how
+    // the per-group scale is encoded. Ignored when q_out is bf16.
+    const std::string& scale_dtype = "e8m0");
 
 } // namespace aiter

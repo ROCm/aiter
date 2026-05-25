@@ -271,7 +271,7 @@ def fused_qk_norm_rope_group_quant_cache(
     k_pe_out: Tensor,  # [num_tokens, (k_num_heads,) pe_dim] (RoPE'd output)
     k_weight: Tensor,  # [head_dim] RMSNorm weights
     kv_cache: Tensor,  # [num_blocks, block_size, (k_num_heads,) head_dim]
-    q_out: Tensor,  # [num_tokens, num_heads, head_dim] bf16 output
+    q_out: Tensor,  # [num_tokens, num_heads, head_dim] bf16 OR fp8 output
     slot_mapping: Tensor,  # [num_tokens]
     positions: Tensor,  # [num_tokens]
     cos_cache: Tensor,  # [max_position, rot_dim//2]
@@ -279,4 +279,16 @@ def fused_qk_norm_rope_group_quant_cache(
     eps: float,
     is_neox: bool,
     is_nope_first: bool,
+    # --- NEW (flydsl-alignment) optional features ---
+    # q_weight: optional per-channel RMSNorm weight for Q [head_dim]. None = weightless (V4-Pro).
+    q_weight: Optional[Tensor] = None,
+    # q_scale: required when q_out.dtype is fp8.
+    #   shape: [num_tokens, num_heads, head_dim // quant_group_size]
+    #   dtype: torch.float32 (scale_dtype='fp32') or torch.uint8 (scale_dtype='e8m0')
+    q_scale: Optional[Tensor] = None,
+    # quant_group_size: 1xG block-scale width for Q. Must be one of {32, 64, 128} and divide head_dim.
+    # Ignored when q_out is bf16.
+    quant_group_size: int = 64,
+    # scale_dtype: 'e8m0' (1-byte MX) or 'fp32' (4-byte). Ignored when q_out is bf16.
+    scale_dtype: str = "e8m0",
 ) -> None: ...

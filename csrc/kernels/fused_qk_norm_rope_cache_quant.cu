@@ -2202,6 +2202,11 @@ namespace aiter {
         int q_out_stride_0, q_out_stride_1;
         int kv_stride_0, kv_stride_1;
         int k_pe_out_stride_0, k_pe_out_stride_1;
+        // Q scale strides (used only when Q is fp8-quantised).
+        // q_scale shape [num_tokens, num_heads, num_q_groups]; for typical contiguous layout:
+        //   q_scale_stride_0 = num_heads * num_q_groups
+        //   q_scale_stride_1 = num_q_groups
+        int q_scale_stride_0, q_scale_stride_1;
         int block_size_log2;
         int num_tokens;
         int num_kv_heads;
@@ -2209,14 +2214,19 @@ namespace aiter {
     };
 
     template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt,
-              bool is_neox, bool is_nope_first, int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1>
+              bool is_neox, bool is_nope_first,
+              // --- NEW (flydsl-alignment) compile-time options ---
+              int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
+              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1>
     __device__ void fuse_qk_norm_rope_group_quant_cache_kernel_impl(
         const scalar_t* __restrict__ q,       // [num_tokens, num_heads, head_dim]
         const scalar_t* __restrict__ kv,      // [num_tokens, (k_num_heads,) head_dim]
         scalar_t* __restrict__ k_pe_out,      // [num_tokens, (k_num_heads,) pe_dim]
         const scalar_t* __restrict__ k_weight, // [head_dim]
+        const scalar_t* __restrict__ q_weight, // [head_dim] (may be nullptr if !HAS_Q_WEIGHT)
         cache_t* __restrict__ kv_cache,
-        scalar_t* __restrict__ q_out,         // [num_tokens, num_heads, head_dim] bf16 output
+        query_t* __restrict__ q_out,          // [num_tokens, num_heads, head_dim] bf16 or fp8
+        void* __restrict__ q_scale_raw,       // [num_tokens, num_heads, num_q_groups] f32 or u8
         const int64_t* __restrict__ slot_mapping,
         const int64_t* __restrict__ positions,
         const scalar_t *__restrict__ cos_cache,
@@ -2409,7 +2419,12 @@ namespace aiter {
           }
         }
       } else { // Q processing — multi-head loop
-      // ============ Q Processing: weightless RMS norm + RoPE ============
+      // ============ Q Processing: RMS norm + optional q_weight + RoPE + optional fp8 group quant ============
+      // Layout: every thread `tid` owns elements [tid*vec_size_i .. tid*vec_size_i+vec_size_i).
+      // - nope threads: own non-rope elements; just write q_normed
+      // - pe threads:   own rope elements; write q_normed AFTER RoPE rotation
+      // When Q is fp8-quantised, the group-amax DPP reduce happens over Q_REDUCE threads at the END
+      // (after RoPE), so we accumulate post-rope absolute max for every thread (whether nope or pe).
       const int32_t q_wave_idx = combined_head_idx - params.num_kv_heads;
       const int32_t num_q_waves = static_cast<int32_t>(gridDim.y) - params.num_kv_heads;
       const int32_t q_heads_per_wave = (params.num_heads + num_q_waves - 1) / num_q_waves;
@@ -2418,6 +2433,20 @@ namespace aiter {
 
       const int32_t token_q_base = token_idx * params.q_stride_0;
       const int32_t token_qout_base = token_idx * params.q_out_stride_0;
+
+      // Q-quant constants. Q_REDUCE must be in {1,2,4,8,16,32,64} and Q_GROUP_SIZE must divide head_dim.
+      constexpr int32_t Q_REDUCE = Q_GROUP_SIZE / vec_size_i;
+      constexpr int32_t Q_NUM_GROUPS = head_size / Q_GROUP_SIZE;
+      static_assert(head_size % Q_GROUP_SIZE == 0, "head_size must be divisible by Q_GROUP_SIZE");
+      static_assert(Q_REDUCE >= 1 && Q_REDUCE <= 64 && (Q_REDUCE & (Q_REDUCE - 1)) == 0,
+                    "Q_REDUCE (Q_GROUP_SIZE/vec_size_i) must be a power of 2 in [1,64]");
+
+      // q_weight is loaded once per Q head (same across all heads since the weight is shared).
+      // We could hoist this out of the head loop, but the cost is negligible (1 load / 16B / thread).
+      opus_vec_i vec_q_weight;
+      if constexpr (HAS_Q_WEIGHT) {
+        vec_q_weight = *reinterpret_cast<const opus_vec_i*>(&q_weight[tid * vec_size_i]);
+      }
 
       for (int32_t q_head_idx = q_head_start; q_head_idx < q_head_end; q_head_idx++) {
         const scalar_t* q_head_ptr = q + token_q_base + q_head_idx * params.q_stride_1;
@@ -2438,32 +2467,22 @@ namespace aiter {
         float total_sum_sq = wave_reduce<float, decltype(sum_func), vec_stride, true>(sum_sq, sum_func);
         const float q_rms_scale = rsqrtf(total_sum_sq / static_cast<float>(head_size) + eps);
 
-        scalar_t* q_out_head = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
-
-        // Nope threads: write normalized nope to q_out
-        const bool is_q_nope_thread = (tid < nope_vec && is_nope_first) || (tid >= pe_tid_end && !is_nope_first);
-        if (is_q_nope_thread) {
-          opus_vec_i vec_out;
-          #pragma unroll
-          for (int i = 0; i < vec_size_i; i++) {
-            vec_out[i] = static_cast<scalar_t>(static_cast<float>(vec_q[i]) * q_rms_scale);
+        // Step 1: per-thread normalized + (optional) q_weight
+        float q_normed[vec_size_i];
+        #pragma unroll
+        for (int i = 0; i < vec_size_i; i++) {
+          float v = static_cast<float>(vec_q[i]) * q_rms_scale;
+          if constexpr (HAS_Q_WEIGHT) {
+            v *= static_cast<float>(vec_q_weight[i]);
           }
-          auto q_out_buf = opus::make_gmem<scalar_t>(q_out_head, q_oob_o * sizeof(scalar_t));
-          q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
+          q_normed[i] = v;
         }
 
-        // Pe threads: norm + RoPE + write to q_out pe region
-        if (tid >= pe_tid_start && tid < pe_tid_end) {
+        // Step 2: RoPE on pe threads, identity on nope threads → `rotated[]`
+        float rotated[vec_size_i];
+        const bool is_pe_thread = (tid >= pe_tid_start && tid < pe_tid_end);
+        if (is_pe_thread) {
           const int32_t pe_local_tid = tid - pe_tid_start;  // 0..7
-          scalar_t* q_pe_out_base = q_out_head + pe_offset;
-
-          // Apply norm first
-          float q_normed[vec_size_i];
-          #pragma unroll
-          for (int i = 0; i < vec_size_i; i++) {
-            q_normed[i] = static_cast<float>(vec_q[i]) * q_rms_scale;
-          }
-
           if constexpr (is_neox) {
             constexpr int32_t half_pe_threads = pe_dim / vec_size_i / 2;  // 4
             const bool is_x_half = (pe_local_tid < half_pe_threads);
@@ -2474,13 +2493,8 @@ namespace aiter {
               int32_t cos_i = is_x_half ? (pe_local_tid * vec_size_i + i) : ((pe_local_tid - half_pe_threads) * vec_size_i + i);
               float f32_cos = static_cast<float>(cos_ptr[cos_i]);
               float f32_sin = static_cast<float>(sin_ptr[cos_i]);
-              float rot;
-              if (is_x_half) {
-                rot = my_val * f32_cos - pair_val * f32_sin;
-              } else {
-                rot = my_val * f32_cos + pair_val * f32_sin;
-              }
-              q_pe_out_base[pe_local_tid * vec_size_i + i] = static_cast<scalar_t>(rot);
+              rotated[i] = is_x_half ? (my_val * f32_cos - pair_val * f32_sin)
+                                     : (my_val * f32_cos + pair_val * f32_sin);
             }
           } else {
             #pragma unroll
@@ -2490,25 +2504,106 @@ namespace aiter {
               int32_t cos_i = (pe_local_tid * vec_size_i + i) >> 1;
               float f32_cos = static_cast<float>(cos_ptr[cos_i]);
               float f32_sin = static_cast<float>(sin_ptr[cos_i]);
-              q_pe_out_base[pe_local_tid * vec_size_i + i] = static_cast<scalar_t>(fqx * f32_cos - fqy * f32_sin);
-              q_pe_out_base[pe_local_tid * vec_size_i + i + 1] = static_cast<scalar_t>(fqy * f32_cos + fqx * f32_sin);
+              rotated[i]     = fqx * f32_cos - fqy * f32_sin;
+              rotated[i + 1] = fqy * f32_cos + fqx * f32_sin;
             }
           }
+        } else {
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; i++) rotated[i] = q_normed[i];
+        }
+
+        // Step 3: write out. q_out base is the per-token-per-head row; every thread writes 8 elements
+        // at offset tid*vec_size_i. For nope_first this puts nope in [0..nope_dim), pe in [nope_dim..head_size);
+        // for !nope_first the same tid*vec_size_i mapping places pe threads (tid<8) at [0..pe_dim) and
+        // nope threads (tid>=8) at [pe_dim..head_size). Either way, this is a fully coalesced 64-lane store.
+        if constexpr (q_dt != vllm::Fp8KVCacheDataType::kAuto) {
+          // FP8 group quant
+          float thread_max = 0.0f;
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; i++) thread_max = fmaxf(thread_max, fabsf(rotated[i]));
+          // Group-amax reduce via butterfly __shfl_xor.
+          // We intentionally do NOT use multithread_reduce_max_dpp<Q_REDUCE> here
+          // because its `row_half_mirror` step has been observed to silently
+          // skip the reduce for the upper half-row (lanes 56..63) in some Q
+          // launch configs, leaving thread_max at its lane-local value (off by
+          // up to 1 e8m0 step in the resulting scale).
+          // __shfl_xor reduces over the 8-lane group regardless of base lane.
+          #pragma unroll
+          for (int offset = Q_REDUCE / 2; offset > 0; offset >>= 1) {
+            thread_max = fmaxf(thread_max, __shfl_xor(thread_max, offset, WARP_SIZE));
+          }
+          const float inverted_DTYPE_MAX = 1.f / opus::finfo<query_t>::max();
+          const float group_scale = thread_max * inverted_DTYPE_MAX;
+          float inv_scale;
+          if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
+            // e8m0 round-up encoding: bump exponent if mantissa is non-zero
+            uint32_t u32 = __builtin_bit_cast(uint32_t, group_scale);
+            uint32_t exponent = (u32 >> 23) & 0xFF;
+            if (u32 & 0x7FFFFF) exponent += 1;
+            uint32_t e8m0_u32 = exponent << 23;
+            inv_scale = 1.0f / __builtin_bit_cast(float, e8m0_u32);
+            // Group-leader writes the scale
+            if (tid % Q_REDUCE == 0) {
+              const int32_t group_id = static_cast<int32_t>(tid / Q_REDUCE);
+              const int32_t qs_offset = token_idx * params.q_scale_stride_0
+                                      + q_head_idx * params.q_scale_stride_1
+                                      + group_id;
+              if constexpr (Q_SCALE_FP32) {
+                // fp32: store the actual float scale (am / FP8_MAX style — matches flydsl ref)
+                reinterpret_cast<float*>(q_scale_raw)[qs_offset] = __builtin_bit_cast(float, e8m0_u32);
+              } else {
+                reinterpret_cast<uint8_t*>(q_scale_raw)[qs_offset] = static_cast<uint8_t>(exponent);
+              }
+            }
+          } else {
+            // Non-fp8 query_t shouldn't reach here (dispatcher gates on q_dt), but be safe.
+            inv_scale = (group_scale > 0.f) ? (1.0f / group_scale) : 0.0f;
+            if (tid % Q_REDUCE == 0 && Q_SCALE_FP32) {
+              const int32_t group_id = static_cast<int32_t>(tid / Q_REDUCE);
+              const int32_t qs_offset = token_idx * params.q_scale_stride_0
+                                      + q_head_idx * params.q_scale_stride_1
+                                      + group_id;
+              reinterpret_cast<float*>(q_scale_raw)[qs_offset] = group_scale;
+            }
+          }
+          opus_vec_q vec_out;
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; i++) {
+            vec_out[i] = opus::cast<query_t>(rotated[i] * inv_scale);
+          }
+          query_t* q_out_head = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
+          auto q_out_buf = opus::make_gmem<query_t>(q_out_head, q_oob_o * sizeof(query_t));
+          q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
+        } else {
+          // bf16 output — write rotated as scalar_t (no quant)
+          opus_vec_i vec_out;
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; i++) {
+            vec_out[i] = static_cast<scalar_t>(rotated[i]);
+          }
+          scalar_t* q_out_head = reinterpret_cast<scalar_t*>(q_out) + token_qout_base + q_head_idx * params.q_out_stride_1;
+          auto q_out_buf = opus::make_gmem<scalar_t>(q_out_head, q_oob_o * sizeof(scalar_t));
+          q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
         }
       } // end multi-head Q loop
       } // end Q processing (else branch of is_k_wave)
     }
     // Unified prefill kernel with RMS Norm and Group Quantization
     // TOKENS_PER_BLOCK=1: single-wave (decode/small prefill), TOKENS_PER_BLOCK>1: multi-wave
-    template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt, int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1>
+    template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt,
+              int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
+              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1>
     __global__ __launch_bounds__(TOKENS_PER_BLOCK * 64, 512 / (TOKENS_PER_BLOCK * 64))
     void fuse_qk_norm_rope_group_quant_cache_kernel(
         const scalar_t* __restrict__ q,
         const scalar_t* __restrict__ kv,
         scalar_t* __restrict__ k_pe_out,
         const scalar_t* __restrict__ k_weight,
+        const scalar_t* __restrict__ q_weight,
         cache_t* __restrict__ kv_cache,
-        scalar_t* __restrict__ q_out,
+        query_t* __restrict__ q_out,
+        void* __restrict__ q_scale_raw,
         const int64_t* __restrict__ slot_mapping,
         const int64_t* __restrict__ positions,
         const scalar_t *__restrict__ cos_cache,
@@ -2518,8 +2613,9 @@ namespace aiter {
         bool is_neox, bool is_nope_first
     ) {
       #define DISPATCH_NEOX_NOPE(NEOX, NOPE_FIRST) \
-        fuse_qk_norm_rope_group_quant_cache_kernel_impl<scalar_t,cache_t,query_t, kv_dt, q_dt, NEOX, NOPE_FIRST, HEAD_DIM, TOKENS_PER_BLOCK>( \
-            q, kv, k_pe_out, k_weight, kv_cache, q_out, slot_mapping, positions, \
+        fuse_qk_norm_rope_group_quant_cache_kernel_impl<scalar_t,cache_t,query_t, kv_dt, q_dt, NEOX, NOPE_FIRST, \
+            Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT, HEAD_DIM, TOKENS_PER_BLOCK>( \
+            q, kv, k_pe_out, k_weight, q_weight, kv_cache, q_out, q_scale_raw, slot_mapping, positions, \
             cos_cache, sin_cache, eps, params)
 
       if (is_neox && is_nope_first)        { DISPATCH_NEOX_NOPE(true, true); }
@@ -2532,18 +2628,23 @@ namespace aiter {
 } // namespace aiter
 
 // Unified macro for fused QK norm + RoPE + group quant + cache kernel
-// Requires: head_dim_val, tokens_per_block_val as constexpr in scope
+// Requires the following constexpr/locals in scope at the call site:
+//   head_dim_val, tokens_per_block_val, q_group_size_val, q_scale_fp32_val, has_q_weight_val
+//   q_weight_ptr (scalar_t*, may be nullptr), q_scale_ptr (void*, may be nullptr)
 #define CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
-         aiter::fuse_qk_norm_rope_group_quant_cache_kernel<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, head_dim_val, tokens_per_block_val> \
+         aiter::fuse_qk_norm_rope_group_quant_cache_kernel<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, \
+                 q_group_size_val, q_scale_fp32_val, has_q_weight_val, head_dim_val, tokens_per_block_val> \
                <<<grid, block, 0, stream>>>(                                                             \
                  reinterpret_cast<const KV_T*>(q.data_ptr()),                                            \
                  reinterpret_cast<const KV_T*>(kv.data_ptr()),                                           \
                  reinterpret_cast<KV_T*>(k_pe_out.data_ptr()),                                           \
                  reinterpret_cast<const KV_T*>(k_weight.data_ptr()),                                     \
+                 reinterpret_cast<const KV_T*>(q_weight_ptr),                                            \
                  reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                                        \
-                 reinterpret_cast<KV_T*>(q_out.data_ptr()),                                              \
-                 reinterpret_cast<const int64_t*>(slot_mapping.data_ptr()),                                 \
-                 reinterpret_cast<const int64_t*>(positions.data_ptr()),                                  \
+                 reinterpret_cast<QUERY_T*>(q_out.data_ptr()),                                           \
+                 reinterpret_cast<void*>(q_scale_ptr),                                                   \
+                 reinterpret_cast<const int64_t*>(slot_mapping.data_ptr()),                              \
+                 reinterpret_cast<const int64_t*>(positions.data_ptr()),                                 \
                  reinterpret_cast<const KV_T*>(cos_cache.data_ptr()),                                    \
                  reinterpret_cast<const KV_T*>(sin_cache.data_ptr()),                                    \
                  static_cast<float>(eps),                                                                \
@@ -2558,14 +2659,18 @@ void fused_qk_norm_rope_group_quant_cache(
     at::Tensor& k_pe_out,      // [num_tokens, (k_num_heads,) pe_dim] (RoPE'd output)
     at::Tensor& k_weight,      // [head_dim] RMSNorm weights
     at::Tensor& kv_cache,      // [num_blocks, block_size, (k_num_heads,) head_dim]
-    at::Tensor& q_out,         // [num_tokens, num_heads, head_dim] bf16 output (RMS norm + RoPE)
+    at::Tensor& q_out,         // [num_tokens, num_heads, head_dim] bf16 OR fp8 output
     at::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
     at::Tensor& positions,     // [num_tokens]
     at::Tensor& cos_cache,     // [max_position, rot_dim//2]
     at::Tensor& sin_cache,     // [max_position, rot_dim//2]
     double eps,                   // epsilon for RMS norm
     bool is_neox,
-    bool is_nope_first
+    bool is_nope_first,
+    std::optional<at::Tensor> q_weight,
+    std::optional<at::Tensor> q_scale,
+    int64_t quant_group_size,
+    const std::string& scale_dtype
 ) {
   int num_tokens = slot_mapping.size(0);
   int head_dim = kv.size(-1);
@@ -2578,6 +2683,47 @@ void fused_qk_norm_rope_group_quant_cache(
   TORCH_CHECK(q_out.size(2) == head_dim, "q_out last dim must match head_dim");
   TORCH_CHECK(k_weight.size(0) == head_dim, "k_weight size must match head_dim");
   TORCH_CHECK(kv.stride(-1) == 1, "kv stride(-1) must be equal to 1");
+
+  // --- NEW: validate Q-quant / q_weight options ---
+  const bool has_q_weight = q_weight.has_value();
+  if (has_q_weight) {
+    TORCH_CHECK(q_weight->size(0) == head_dim, "q_weight size must match head_dim");
+    TORCH_CHECK(q_weight->scalar_type() == q.scalar_type(),
+                "q_weight dtype must match q dtype");
+    TORCH_CHECK(q_weight->stride(-1) == 1, "q_weight must be contiguous in last dim");
+  }
+  // q_out_type: "auto" = bf16/same-as-input, "fp8" = group-quantised fp8
+  std::string q_out_type = "auto";
+  if (q_out.scalar_type() == torch_fp8) {
+    q_out_type = "fp8";
+  }
+  const bool q_is_fp8 = (q_out_type == "fp8");
+  // When Q is fp8, we need q_scale + group_size + scale_dtype to be valid.
+  if (q_is_fp8) {
+    TORCH_CHECK(q_scale.has_value(),
+                "q_scale tensor is required when q_out is fp8");
+    TORCH_CHECK(quant_group_size == 32 || quant_group_size == 64 || quant_group_size == 128,
+                "quant_group_size must be one of {32, 64, 128}, got ", quant_group_size);
+    TORCH_CHECK(head_dim % quant_group_size == 0,
+                "head_dim must be divisible by quant_group_size");
+    TORCH_CHECK(scale_dtype == "e8m0" || scale_dtype == "fp32",
+                "scale_dtype must be 'e8m0' or 'fp32', got ", scale_dtype);
+    const int64_t num_q_groups = head_dim / quant_group_size;
+    TORCH_CHECK(q_scale->dim() == 3,
+                "q_scale must be 3D [num_tokens, num_heads, num_q_groups]");
+    TORCH_CHECK(q_scale->size(0) == num_tokens && q_scale->size(1) == num_heads
+                && q_scale->size(2) == num_q_groups,
+                "q_scale shape mismatch: expected [", num_tokens, ", ", num_heads,
+                ", ", num_q_groups, "], got ", q_scale->sizes());
+    if (scale_dtype == "fp32") {
+      TORCH_CHECK(q_scale->scalar_type() == at::ScalarType::Float,
+                  "q_scale dtype must be float32 when scale_dtype='fp32'");
+    } else {
+      TORCH_CHECK(q_scale->scalar_type() == at::ScalarType::Byte,
+                  "q_scale dtype must be uint8 when scale_dtype='e8m0'");
+    }
+    TORCH_CHECK(q_scale->stride(-1) == 1, "q_scale must be contiguous in last dim");
+  }
 
   int num_kv_heads;
   if (kv.dim() == 3) {
@@ -2602,7 +2748,7 @@ void fused_qk_norm_rope_group_quant_cache(
 
   auto stream = at::hip::getCurrentHIPStream(kv.get_device());
 
-  std::string q_out_type = "auto";
+  // q_out_type was determined above when validating q_scale/quant args.
   std::string kv_cache_dtype = "auto";
   auto cache_st = kv_cache.scalar_type();
   if (cache_st == at::ScalarType::Float ||
@@ -2630,12 +2776,24 @@ void fused_qk_norm_rope_group_quant_cache(
   mla_params.kv_stride_1 = kv_stride_1;
   mla_params.k_pe_out_stride_0 = k_pe_out_stride_0;
   mla_params.k_pe_out_stride_1 = k_pe_out_stride_1;
+  // q_scale strides only matter when q_is_fp8; default to 0 otherwise (unused).
+  if (q_is_fp8) {
+    mla_params.q_scale_stride_0 = static_cast<int>(q_scale->stride(0));
+    mla_params.q_scale_stride_1 = static_cast<int>(q_scale->stride(1));
+  } else {
+    mla_params.q_scale_stride_0 = 0;
+    mla_params.q_scale_stride_1 = 0;
+  }
   TORCH_CHECK(block_size > 0 && (block_size & (block_size - 1)) == 0,
               "block_size must be a power of 2, got ", block_size);
   mla_params.block_size_log2 = __builtin_ctz(block_size);
   mla_params.num_tokens = num_tokens;
   mla_params.num_kv_heads = num_kv_heads;
   mla_params.num_heads = num_heads;
+
+  // --- New: pointer locals used by CALL macro ---
+  void*  q_weight_ptr = has_q_weight ? q_weight->data_ptr() : nullptr;
+  void*  q_scale_ptr  = q_is_fp8     ? q_scale ->data_ptr() : nullptr;
 
   int device;
   hipGetDevice(&device);
@@ -2669,8 +2827,20 @@ void fused_qk_norm_rope_group_quant_cache(
               "head_dim<=512 and rot_dim=64. Got head_dim=", head_dim,
               " and rot_dim=", rot_dim);
 
-  auto launch_kernel = [&](auto head_dim_tag) {
-    constexpr int head_dim_val = decltype(head_dim_tag)::value;
+  TORCH_CHECK(head_dim == 512,
+              "Unsupported head_dim=", head_dim, ". Supported: 512");
+
+  // 4-level dispatch (HEAD_DIM, Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT) collapsed into
+  // a single generic lambda. The kernel templates instantiate one .co per combination.
+  //   - 1 head_dim x 3 group sizes x 2 scale dtypes x 2 q_weight flags x 2 tokens_per_block x
+  //     4 dtype combos = 96 instantiations per source dtype (bf16 typical → 96 ko).
+  // Q_GROUP_SIZE / Q_SCALE_FP32 are only meaningful when q_out is fp8 (q_dt != kAuto);
+  // for bf16 q_out we collapse onto (G=64, e8m0) — the kernel ignores them.
+  auto launch_all = [&](auto group_size_tag, auto scale_fp32_tag, auto has_qw_tag) {
+    constexpr int  head_dim_val      = 512;
+    constexpr int  q_group_size_val  = decltype(group_size_tag)::value;
+    constexpr bool q_scale_fp32_val  = decltype(scale_fp32_tag)::value;
+    constexpr bool has_q_weight_val  = decltype(has_qw_tag)::value;
     if (use_decode_path) {
       constexpr int tokens_per_block_val = 1;
       dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val, num_kv_heads + num_q_waves);
@@ -2686,12 +2856,30 @@ void fused_qk_norm_rope_group_quant_cache(
     }
   };
 
-  if (head_dim == 512) {
-    launch_kernel(std::integral_constant<int, 512>{});
+  const int  g  = q_is_fp8 ? static_cast<int>(quant_group_size) : 64;
+  const bool sf = q_is_fp8 ? (scale_dtype == "fp32")            : false;
+  const bool hw = has_q_weight;
+
+#define _CALL_QW(GS, SF)                                                                          \
+    do {                                                                                          \
+      if (hw) launch_all(std::integral_constant<int, (GS)>{},                                     \
+                         std::integral_constant<bool, (SF)>{},                                    \
+                         std::true_type{});                                                       \
+      else    launch_all(std::integral_constant<int, (GS)>{},                                     \
+                         std::integral_constant<bool, (SF)>{},                                    \
+                         std::false_type{});                                                      \
+    } while(0)
+
+  if (g == 32) {
+    if (sf) _CALL_QW(32, true); else _CALL_QW(32, false);
+  } else if (g == 64) {
+    if (sf) _CALL_QW(64, true); else _CALL_QW(64, false);
+  } else if (g == 128) {
+    if (sf) _CALL_QW(128, true); else _CALL_QW(128, false);
   } else {
-    TORCH_CHECK(false, "Unsupported head_dim=", head_dim,
-                ". Supported: 512");
+    TORCH_CHECK(false, "Unsupported quant_group_size=", g);
   }
+#undef _CALL_QW
 }
 
 } // namespace aiter
