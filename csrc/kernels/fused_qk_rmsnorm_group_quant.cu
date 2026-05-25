@@ -958,6 +958,8 @@ void fused_qk_rmsnorm_group_quant(
                 n1,
                 ", n2=",
                 n2);
+    // Small token counts: GPU under-saturated, separate x2 blocks add useful parallelism.
+    // Large token counts: GPU saturated, fusing x2 into same block halves block count.
     // --- grid_y strategy ---
     // When n2 > n1 across different size tiers ("K dominates"), the fused path
     // wastes threads on Q.  For small/medium m, separate Q/K blocks (grid_y=2)
@@ -977,10 +979,6 @@ void fused_qk_rmsnorm_group_quant(
         has_second_input && n2 > n1 && (size_tier(n1) != size_tier(n2));
     const int grid_y =
         (has_second_input && (m <= 1024 || (k_dominates && m <= 4096))) ? 2 : 1;
-
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp1));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-
     const int max_n = n1 > n2 ? n1 : n2;
     // fp4x2 path reuses fp8 kernels but requires thread_data_size >= 8 for store packing.
     const int thread_data_size = per_token_quant
@@ -1017,9 +1015,9 @@ void fused_qk_rmsnorm_group_quant(
     HipDeviceGuard device_guard(inp1.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
     (void)get_num_cu_func();
-    // gfx950-specific: use more threads with smaller TDS to improve occupancy
-    // and reduce barrier stall in the fused Q+K path (matching Triton's strategy
-    // of using a larger BlockSize for better thread utilization).
+
+    // gfx950 path: use a wider block / smaller thread_data_size combination
+    // for residual group-quant to improve occupancy.
     const bool gfx950_wide_block =
         get_gpu_arch() == "gfx950" && has_residual && group_size <= WARP_SIZE * 8;
 
