@@ -1554,17 +1554,27 @@ def fused_moe_2stages(
         a1 = hidden_states.to(dtype)
         a1_scale = None
     elif (
-        quant_type == aiter.QuantType.per_1x32
+        quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        # and activation == aiter.ActivationType.Swiglu
     ):
-        if not _MOE_A8W4_BYPASS_QUANT and metadata.fuse_quant != "fp8":
-            # stage1 input is not topk-replicated, so M==token_num and the
-            # HIP launcher infers TOPK=1 from input.numel() / (cols * token_num).
-            # When fuse_quant == "fp8" the FlyDSL stage1 kernel quantizes a1
-            # internally, so we must NOT pre-quantize here.
+        # a8w4 mxfp8 activations + mxfp4 weights.
+        if metadata.fuse_quant == "fp8":
+            # FlyDSL stage1 fuses the fp8 quant of a1 internally, but the
+            # kernel dispatch requires an fp8-typed tensor.
+            a1 = hidden_states.to(dtypes.fp8)
+            a1_scale = torch.empty(0, dtype=torch.uint8, device=a1.device)
+        elif _MOE_A8W4_BYPASS_QUANT:
+            # Debug bypass: skip real quant, feed unit scales.
+            a1 = hidden_states.to(dtypes.fp8)
+            M = sorted_ids.shape[0]
+            a1_scale = torch.ones(
+                [M, a1.shape[-1] // 32], dtype=dtypes.fp8_e8m0, device=a1.device
+            )
+        else:
+            # stage1 input is not topk-replicated, so M==token_num and the HIP
+            # launcher infers TOPK=1 from input.numel() / (cols * token_num).
             a1, a1_scale = fused_dynamic_mxfp8_quant_moe_sort(
                 hidden_states,
                 sorted_ids=sorted_ids,
@@ -1573,16 +1583,6 @@ def fused_moe_2stages(
                 topk=topk,
                 block_size=block_size_M,
             )
-        else:
-            a1 = hidden_states.to(dtypes.fp8)
-            M = sorted_ids.shape[0]
-            N = a1.shape[-1]
-            if metadata.fuse_quant == "fp8":
-                a1_scale = torch.empty(0, dtype=torch.uint8, device=a1.device)
-            else:
-                a1_scale = torch.ones(
-                    [M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device
-                )
 
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights; no activation quantization needed
