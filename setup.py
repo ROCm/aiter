@@ -97,8 +97,26 @@ def _run_install_triton():
 
 AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", 0))
 
+
+def _torch_version_below(min_version):
+    try:
+        import torch
+        from packaging.version import Version
+
+        return Version(torch.__version__.split("+")[0].split("dev")[0]) < Version(
+            min_version
+        )
+    except Exception:
+        return False
+
+
 _triton_info = _is_triton_installed()
-if AITER_USE_SYSTEM_TRITON and _triton_info:
+if _torch_version_below("2.9.1"):
+    print(
+        f"[aiter] torch < 2.9.1 detected, skipping triton reinstall"
+        f"{f' (keeping {_triton_info[0]}=={_triton_info[1]})' if _triton_info else ''}"
+    )
+elif AITER_USE_SYSTEM_TRITON and _triton_info:
     print(
         f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping existing"
         f" {_triton_info[0]}=={_triton_info[1]}"

@@ -8,7 +8,9 @@
 #include <torch/extension.h>
 
 #include "gemm_a8w8_blockscale_common.cuh"
-#include "gemm_a8w8_blockscale_lookup.h"
+// lookup.h is included by gemm_a8w8_blockscale_lookup_fp16.cu and
+// gemm_a8w8_blockscale_lookup_bf16.cu, not here, so ninja can expand
+// GENERATE_LOOKUP_TABLE for FP16 and BF16 in parallel.
 #include "gemm_a8w8_blockscale_manifest.h"
 
 using BlockwiseKernel = torch::Tensor (*)(
@@ -21,6 +23,10 @@ using BlockwiseKernel = torch::Tensor (*)(
 // matching the style of GemmDispatchMap introduced for the tuple-keyed
 // modules in PR #3255 (no per-pair std::function ctor / landing pad cost).
 using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>;
+
+// Defined in gemm_a8w8_blockscale_lookup_{fp16,bf16}.cu.
+extern const BlockwiseKernelMap& get_blockscale_lookup_fp16();
+extern const BlockwiseKernelMap& get_blockscale_lookup_bf16();
 
 // Python-driven name-keyed dispatch.  The Python frontend
 // (aiter/ops/gemm_op_a8w8.py) reads aiter/configs/a8w8_blockscale_tuned_gemm.csv
@@ -37,14 +43,14 @@ using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>
 template <typename DDataType, typename EDataType = DDataType>
 static BlockwiseKernel blockscale_dispatch(const std::string& kernelName)
 {
-    static const auto lookup = [] {
+    static const BlockwiseKernelMap& lookup = [] -> const BlockwiseKernelMap& {
         if constexpr(std::is_same_v<EDataType, FP16>)
         {
-            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, FP16)};
+            return get_blockscale_lookup_fp16();
         }
         else if constexpr(std::is_same_v<EDataType, BF16>)
         {
-            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, BF16)};
+            return get_blockscale_lookup_bf16();
         }
         else
         {
