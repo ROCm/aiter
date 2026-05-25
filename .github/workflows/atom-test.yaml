@@ -73,39 +73,8 @@ jobs:
           import os
 
           default_models = [
-              {
-                  "model_name": "DeepSeek-R1-0528",
-                  "label": "MI300X",
-                  "model_path": "deepseek-ai/DeepSeek-R1-0528",
-                  "extraArgs": "--kv_cache_dtype fp8 -tp 8",
-                  "env_vars": "",
-                  "accuracy_test_threshold": "0.94",
-                  "runner": "aiter-8gpu-runner",
-                  "run_on_pr": True,
-                  "job_name": "ATOM Benchmark (DeepSeek-R1-0528, MI300X)",
-              },
-              {
-                  "model_name": "DeepSeek-R1-0528",
-                  "label": "MI35X",
-                  "model_path": "deepseek-ai/DeepSeek-R1-0528",
-                  "extraArgs": "--kv_cache_dtype fp8 -tp 8",
-                  "env_vars": "",
-                  "accuracy_test_threshold": "0.94",
-                  "runner": "linux-aiter-mi35x-8",
-                  "run_on_pr": True,
-                  "job_name": "ATOM Benchmark (DeepSeek-R1-0528, MI35X)",
-              },
-              {
-                  "model_name": "gpt-oss-120b",
-                  "label": "MI35X",
-                  "model_path": "openai/gpt-oss-120b",
-                  "extraArgs": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3",
-                  "env_vars": "ATOM_GPT_OSS_MODEL=1\nHSA_NO_SCRATCH_RECLAIM=1",
-                  "accuracy_test_threshold": "0.38",
-                  "runner": "linux-aiter-mi35x-1",
-                  "run_on_pr": True,
-                  "job_name": "ATOM Benchmark (gpt-oss-120b, MI35X)",
-              },
+              {"model_name": "DeepSeek-R1-0528"},
+              {"model_name": "gpt-oss-120b"},
           ]
 
           labels_raw = os.environ.get("LABELS_JSON") or "[]"
@@ -113,30 +82,48 @@ jobs:
           if labels is None:
               labels = []
 
+          with open(".github/benchmark/models_accuracy.json", encoding="utf-8") as f:
+              atom_models = json.load(f)
+
+          runner_overrides = {
+              "atom-mi355-8gpu.predownload": "linux-aiter-mi35x-8",
+              "linux-atom-mi35x-4": "linux-aiter-mi35x-4",
+              "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
+          }
+
+          def prepare_model(model):
+              model = dict(model)
+              model["runner"] = runner_overrides.get(model["runner"], model["runner"])
+              model["label"] = model.get("runner", "")
+              model["accuracy_test_threshold"] = str(model.get("accuracy_threshold", 0))
+              model["run_on_pr"] = True
+              model["job_name"] = (
+                  f"Accuracy ({model['model_name']}, {model['model_path']}, "
+                  f"{model.get('extraArgs', '')}, {model['runner']})"
+              )
+              return model
+
           full_atom = os.environ["EVENT_NAME"] == "pull_request" and "ci:atom_full" in labels
           if not full_atom:
-              selected = default_models
-          else:
-              with open(".github/benchmark/models_accuracy.json", encoding="utf-8") as f:
-                  selected = [
-                      model
-                      for model in json.load(f)
-                      if str(model.get("test_level", "")).lower() in {"pr", "main"}
-                  ]
-              runner_overrides = {
-                  "atom-mi355-8gpu.predownload": "linux-aiter-mi35x-8",
-                  "linux-atom-mi35x-4": "linux-aiter-mi35x-4",
-                  "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
-              }
-              for model in selected:
-                  model["runner"] = runner_overrides.get(model["runner"], model["runner"])
-                  model["label"] = model.get("runner", "")
-                  model["accuracy_test_threshold"] = str(model.get("accuracy_threshold", 0))
-                  model["run_on_pr"] = True
-                  model["job_name"] = (
-                      f"Accuracy ({model['model_name']}, {model['model_path']}, "
-                      f"{model.get('extraArgs', '')}, {model['runner']})"
+              default_model_names = [model["model_name"] for model in default_models]
+              atom_models_by_name = {model["model_name"]: model for model in atom_models}
+              missing_models = [
+                  name for name in default_model_names if name not in atom_models_by_name
+              ]
+              if missing_models:
+                  raise SystemExit(
+                      "Missing default model(s) in ATOM accuracy config: "
+                      + ", ".join(missing_models)
                   )
+              selected = [
+                  prepare_model(atom_models_by_name[name]) for name in default_model_names
+              ]
+          else:
+              selected = [
+                  prepare_model(model)
+                  for model in atom_models
+                  if str(model.get("test_level", "")).lower() in {"pr", "main"}
+              ]
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"models_json={json.dumps(selected)}\n")
@@ -310,6 +297,7 @@ jobs:
         timeout-minutes: 90
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
+          CLIENT_COMMAND: ${{ matrix.client_command || '' }}
         run: |
           set -euo pipefail
           echo ""
@@ -329,7 +317,9 @@ jobs:
             docker exec -i atom_aiter_test bash -l
           echo ""
           echo "========== Running accuracy test =========="
-          docker exec atom_aiter_test bash -lc "
+          docker exec \
+            -e CLIENT_COMMAND="${CLIENT_COMMAND}" \
+            atom_aiter_test bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
           " 2>&1 | tee atom_accuracy_output.txt
 
