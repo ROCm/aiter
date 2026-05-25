@@ -67,10 +67,6 @@ def emit_mx_e8m0_scale(
     ``dtype`` only selects ``target_max_pow2`` / ``max_pos`` / ``mbits``
     constants from :data:`_DTYPE_CFG`.
 
-    Both ``mode`` and ``dtype`` are Python compile-time values (FlyDSL
-    kernel parameters), so the branch is resolved before any IR is
-    emitted -- no runtime cost.
-
     See :class:`MxScaleRoundMode` (``aiter.utility.mx_types``) and
     ``csrc/kernels/quant.md`` "Cross-Stack Mode Alignment Reference"
     for the four formulas and cross-stack mapping (PyTorch torchao / NV
