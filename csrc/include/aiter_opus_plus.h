@@ -22,9 +22,21 @@ using index_t = int;
 
 OPUS_D fp32x2_t pk_mul_f32(fp32x2_t a, fp32x2_t b)
 {
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
+    // CDNA-family archs have `v_pk_mul_f32`; keep the asm form so the
+    // packed instruction is guaranteed (compiler auto-vectorization is
+    // best-effort).
     fp32x2_t c;
     asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
     return c;
+#else
+    // RDNA archs (gfx10xx and later) and host: no `v_pk_mul_f32` in the
+    // ISA, so fall back to the portable element-wise form. Compiler
+    // emits two `v_mul_f32` on RDNA.
+    return fp32x2_t{a[0] * b[0], a[1] * b[1]};
+#endif
 }
 
 // fp32x2 -> fp8x2 with scale + saturation clamp (E4M3)
