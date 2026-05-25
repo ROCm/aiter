@@ -46,10 +46,20 @@ enum class MxScaleRoundMode : int {
 };
 
 // MX-format element dtype tag selecting per-dtype constants.
-// Values **must** stay 1:1 with ``aiter.utility.mx_types.MxDtype``.
+// Values **must** stay 1:1 with ``aiter.utility.mx_types.MxDtype`` (the
+// pybind11 binding in ``rocm_ops.hpp::AITER_CORE_PYBIND``).
+//
+// Note that ``FP8_E4M3`` (a.k.a. ``e4m3fn``) and ``FP8_E4M3_FNUZ`` are
+// **different formats** with different ``max_pos`` (448 vs 240) and
+// different ``target_max_pow2`` (8 vs 7); they are NOT interchangeable.
+//   * ``FP8_E4M3``      = OCP / NVIDIA H100 / AMD gfx950+ / FlashInfer.
+//                         exp_bias = 7, max_normal = 448.
+//   * ``FP8_E4M3_FNUZ`` = AMD gfx942 hardware FP8 (MI300 family).
+//                         exp_bias = 8, max_normal = 240.
 enum class MxDtype : int {
-    FP4_E2M1 = 0, // max_pos = 6.0,    target_max_pow2 = 2 (= log2(4)),    mbits = 1
-    FP8_E4M3 = 1, // max_pos = 448.0,  target_max_pow2 = 8 (= log2(256)),  mbits = 3
+    FP4_E2M1      = 0, // max_pos = 6.0,    target_max_pow2 = 2,  mbits = 1
+    FP8_E4M3      = 1, // max_pos = 448.0,  target_max_pow2 = 8,  mbits = 3
+    FP8_E4M3_FNUZ = 2, // max_pos = 240.0,  target_max_pow2 = 7,  mbits = 3
     // FP8_E5M2 / FP6_* / MX_INT8 -- reserved.
 };
 
@@ -73,10 +83,23 @@ template <> struct MxDtypeConfig<MxDtype::FP4_E2M1> {
 };
 
 template <> struct MxDtypeConfig<MxDtype::FP8_E4M3> {
-    static constexpr int      target_max_pow2 = 8;              // log2(256)
+    static constexpr int      target_max_pow2 = 8;              // log2(256), 256 <= 448
     static constexpr float    max_pos         = 448.0f;
-    static constexpr float    inv_max_pos     = 1.0f / 448.0f;  // 0x3B125641
-    static constexpr float    inv_max_pow2    = 1.0f / 256.0f;  // 1/256
+    static constexpr float    inv_max_pos     = 1.0f / 448.0f;  // 0x3B124925
+    static constexpr float    inv_max_pow2    = 1.0f / 256.0f;  // 1/256 = 0x3B800000
+    static constexpr int      mbits           = 3;
+    static constexpr uint32_t even_val_to_add = 0x00080000u;    // 1 << (23 - 3 - 1) = 1 << 19
+};
+
+// AMD gfx942 hardware FP8 (e4m3fnuz): exp_bias = 8 (one bigger than the
+// OCP e4m3fn = 7), so max_normal = 240.0 (= 1.875 * 2^7) and the
+// largest pow-2 fitting under it is 128 = 2^7. Mantissa width is the
+// same 3 bits, so EVEN's val_to_add is identical to FP8_E4M3.
+template <> struct MxDtypeConfig<MxDtype::FP8_E4M3_FNUZ> {
+    static constexpr int      target_max_pow2 = 7;              // log2(128), 128 <= 240
+    static constexpr float    max_pos         = 240.0f;
+    static constexpr float    inv_max_pos     = 1.0f / 240.0f;  // 0x3B888889
+    static constexpr float    inv_max_pow2    = 1.0f / 128.0f;  // 1/128 = 0x3C000000
     static constexpr int      mbits           = 3;
     static constexpr uint32_t even_val_to_add = 0x00080000u;    // 1 << (23 - 3 - 1) = 1 << 19
 };

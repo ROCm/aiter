@@ -39,9 +39,16 @@ from aiter.utility.mx_types import MxDtype, MxScaleRoundMode
 # - mbits = mantissa bits of the target dtype (used only by EVEN mode)
 # dict keyed by ``int(MxDtype.X)`` so lookups work regardless of whether
 # the caller passes a pybind enum value or a bare ``int``.
+# Tuple form: (target_max_pow2, max_pos_inv_f32_bits, mbits)
+# - max_pos_inv_f32_bits = bit pattern of fp32(1.0 / max_normal(dtype)),
+#   used by RoundUp's ceil_pow2(amax / max_pos) implementation.
 _DTYPE_CFG = {
-    int(MxDtype.FP4_E2M1): (2, 0x3E2AAAAB, 1),  # 1/6.0 ~= 0.16666667
-    int(MxDtype.FP8_E4M3): (8, 0x3B125641, 3),  # 1/448.0 ~= 0.00223214
+    # FP4 e2m1: max_pos=6.0
+    int(MxDtype.FP4_E2M1): (2, 0x3E2AAAAB, 1),  # 1/6.0      ~= 0.16666667
+    # FP8 e4m3 (OCP / H100 / gfx950+): max_pos=448.0
+    int(MxDtype.FP8_E4M3): (8, 0x3B124925, 3),  # 1/448.0    ~= 0.00223214
+    # FP8 e4m3fnuz (AMD gfx942 hardware): max_pos=240.0
+    int(MxDtype.FP8_E4M3_FNUZ): (7, 0x3B888889, 3),  # 1/240.0    ~= 0.00416667
 }
 
 

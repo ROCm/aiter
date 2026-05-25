@@ -74,9 +74,11 @@ def mxfp4_to_f32(x):
 # - mbits = mantissa bits of the target dtype (used only by EVEN mode)
 # dict keyed by ``int(MxDtype.X)`` so lookups work regardless of whether
 # the caller passes a pybind enum value or a bare ``int``.
+# Tuple form: (target_max_pow2, max_pos, mbits)
 _DTYPE_CFG = {
-    int(MxDtype.FP4_E2M1): (2, 6.0, 1),
-    int(MxDtype.FP8_E4M3): (8, 448.0, 3),
+    int(MxDtype.FP4_E2M1): (2, 6.0, 1),  # OCP MXFP4 / DSv4 / FlashInfer
+    int(MxDtype.FP8_E4M3): (8, 448.0, 3),  # OCP / NVIDIA H100 / gfx950+ (e4m3fn)
+    int(MxDtype.FP8_E4M3_FNUZ): (7, 240.0, 3),  # AMD gfx942 hardware FP8 (e4m3fnuz)
 }
 
 

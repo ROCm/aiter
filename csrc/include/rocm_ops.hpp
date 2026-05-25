@@ -40,8 +40,9 @@ namespace py = pybind11;
         .value("Ceil",      aiter::MxScaleRoundMode::Ceil)                                     \
         .export_values();                                                                      \
     pybind11::enum_<aiter::MxDtype>(m, "MxDtype")                                              \
-        .value("FP4_E2M1", aiter::MxDtype::FP4_E2M1)                                           \
-        .value("FP8_E4M3", aiter::MxDtype::FP8_E4M3)                                           \
+        .value("FP4_E2M1",      aiter::MxDtype::FP4_E2M1)                                      \
+        .value("FP8_E4M3",      aiter::MxDtype::FP8_E4M3)                                      \
+        .value("FP8_E4M3_FNUZ", aiter::MxDtype::FP8_E4M3_FNUZ)                                 \
         .export_values();                                                                      \
     pybind11::implicitly_convertible<int, QuantType>();                                         \
     pybind11::implicitly_convertible<int, ActivationType>();                                    \
