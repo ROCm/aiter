@@ -243,7 +243,7 @@ def _int32_overflow_possible(num_blocks, block_size, num_kv_heads, head_size) ->
 # does proper torch profiler timing per the test_pa convention.
 # ----------------------------------------------------------------------------
 @perftest()
-def run_ck(out, tensors, mask_type):
+def run_ck(out, tensors, mask_type, allow_splitkv=True):
     from aiter.ops.unified_attention import unified_attention_fwd
 
     q = tensors["q_fp8"] if tensors["q_fp8"] is not None else tensors["query"]
@@ -268,9 +268,12 @@ def run_ck(out, tensors, mask_type):
         scale_v=1.0,
         scale_out=1.0,
         cache_ptr_int32_overflow_possible=overflow,
-        # Let the transparent split-KV wrapper pick num_splits — that's the
-        # default production path, so we want to measure it as-is.
-        allow_splitkv=True,
+        # By default we let the transparent split-KV wrapper pick num_splits,
+        # since that is what production callers will see. Set
+        # `allow_splitkv=False` (via the `--no-splitkv` CLI flag) to force
+        # the single-launch path — useful for isolating the combine overhead
+        # and for A/B-ing the heuristic, not as a correctness workaround.
+        allow_splitkv=allow_splitkv,
         q_descale=float(tensors["q_descale"]),
         k_descale=float(tensors["k_descale"]),
         v_descale=float(tensors["v_descale"]),
@@ -353,6 +356,7 @@ def test_unified_attention_ck(
     device: str = "cuda",
     run_triton_backend: bool = True,
     skip_reference: bool = False,
+    allow_splitkv: bool = True,
 ) -> dict:
     cfg = CaseConfig(
         seq_lens=seq_lens,
@@ -380,7 +384,7 @@ def test_unified_attention_ck(
     # NOTE: @perftest deep-copies args for L2-cache rotation, so the output
     # captured for correctness comes from the kernel's return value (the
     # `out` of the *last* rotated copy), not the `out_ck` we passed in.
-    out_ck, time_ck = run_ck(out_ck, t, mask_type=2)
+    out_ck, time_ck = run_ck(out_ck, t, mask_type=2, allow_splitkv=allow_splitkv)
 
     # Triton kernel for cross-check + perf comparison.
     time_triton = None
@@ -478,6 +482,11 @@ def main():
                         help="Skip the Triton backend (CK + reference only).")
     parser.add_argument("--no-reference", action="store_true",
                         help="Skip the torch reference (perf-only run).")
+    parser.add_argument("--no-splitkv", action="store_true",
+                        help="Force the CK single-launch path (disable the "
+                             "transparent split-KV wrapper). Useful for "
+                             "measuring the kernel directly or working "
+                             "around split-KV bugs.")
     args = parser.parse_args()
 
     if args.quick:
@@ -531,6 +540,7 @@ def main():
                                     seed=args.seed,
                                     run_triton_backend=not args.no_triton,
                                     skip_reference=args.no_reference,
+                                    allow_splitkv=not args.no_splitkv,
                                 )
                                 rows.append(ret)
                                 # Release the deep-copied rotation buffers
@@ -547,7 +557,8 @@ def main():
     df = pd.DataFrame(rows)
     # `@benchmark()` merges the call kwargs into the row dict; drop the
     # ones that are constant across runs to keep the summary table readable.
-    for noise_col in ("seed", "device", "run_triton_backend", "skip_reference"):
+    for noise_col in ("seed", "device", "run_triton_backend",
+                       "skip_reference", "allow_splitkv"):
         if noise_col in df.columns:
             df = df.drop(columns=[noise_col])
     aiter.logger.info(
