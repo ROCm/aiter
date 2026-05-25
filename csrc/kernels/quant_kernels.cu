@@ -1602,11 +1602,18 @@ __global__ void mxfp4_quant_moe_sort_kernel(
     // we encode in the e8m0 byte (the `>> 23` extraction below otherwise discards
     // mantissa bits and breaks accuracy). For other dtypes fall back to the exact
     // 1 / DTYPE_MAX divisor.
+#if defined(__gfx942__)
+    /* gfx942 fp8 e4m3 fnuz max=240, floor_pow2(240)=128 */
+    constexpr float fp8_power2_limit = 1.0f / 128.0f;
+#else
+    /* gfx950 fp8 e4m3 max=448, floor_pow2(448)=256 */
+    constexpr float fp8_power2_limit = 1.0f / 256.0f;
+#endif
     const float inverted_DTYPE_MAX =
         std::is_same_v<DTYPE_O, opus::fp4_t>
             ? 0.25f /* 1/4, fp4 max=6 */
             : (std::is_same_v<DTYPE_O, opus::fp8_t>
-                   ? 1.0f / 256.0f /* fp8 e4m3 max=448 */
+                   ? fp8_power2_limit
                    : 1.0f / static_cast<float>(opus::finfo<DTYPE_O>::max()));
     const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
     const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
