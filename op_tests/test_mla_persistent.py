@@ -4,6 +4,7 @@
 import torch
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.core import is_experimental_enabled
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter import dtypes
 import random
@@ -86,7 +87,7 @@ def dump_mla_metadata_v1_txt(
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
         return False
-    if dtype == dtypes.bf16 and nhead == 32:
+    if dtype == dtypes.bf16 and nhead == 32 and get_gfx() == "gfx942":
         return False
     return True
 
@@ -455,10 +456,39 @@ def torch_mla_extend_split_kv(
         or (get_gfx() == "gfx942" and nheads == 128 and is_fp8_q and is_fp8_kvc)
         or (
             get_gfx() == "gfx950"
+            and nheads == 128
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q != 4
+        )
+        or (
+            get_gfx() == "gfx950"
+            and nheads == 128
+            and is_fp8_q
+            and is_fp8_kvc
+            and is_experimental_enabled()
+        )
+        or (
+            get_gfx() == "gfx942"
+            and nheads in (16, 32, 64)
+            and nheads * max_seqlen_q == 128
+            and is_fp8_q
+            and is_fp8_kvc
+            and is_experimental_enabled()
+        )
+        or (
+            get_gfx() == "gfx950"
             and nheads == 32
             and is_fp8_q
             and is_fp8_kvc
             and max_seqlen_q == 4
+        )
+        or (
+            get_gfx() == "gfx950"
+            and nheads == 32
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q == 2
         )
         or (
             get_gfx() == "gfx950"
@@ -468,12 +498,20 @@ def torch_mla_extend_split_kv(
             and max_seqlen_q == 4
         )
         or (
+            get_gfx() == "gfx942"
+            and nheads == 8
+            and not is_fp8_q
+            and not is_fp8_kvc
+            and max_seqlen_q == 2
+        )
+        or (
             get_gfx() == "gfx950"
             and nheads == 64
             and is_fp8_q
             and is_fp8_kvc
             and max_seqlen_q == 1
         )
+        or (get_gfx() == "gfx950" and not is_fp8_q and not is_fp8_kvc)
     ):
         # Natively support cases
         pass
@@ -1103,6 +1141,7 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+        page_size=page_size,
         kv_granularity=max(page_size, 16),  # for qh32 kv split is disabled
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
@@ -1305,6 +1344,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
+            return_lse=return_lse,
         )
 
         err = checkAllclose(
@@ -1312,7 +1352,12 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-
+        if not non_persistent_mode and return_lse:
+            checkAllclose(
+                lse_ref,
+                attn_lse.reshape(total_q, nhead),
+                msg=f"mla_decode-absorb    [lse_ref vs attn_lse]: {us_asm_decode:>8.2f} us......",
+            )
         if not non_persistent_mode:
             partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
                 torch_mla_split_kv_and_reduce(
@@ -1340,18 +1385,20 @@ def test_mla(
             checkAllclose(
                 split_out_ref,
                 out_asm,
-                msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+                msg=f"mla_decode-absorb    [golden split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
             )
             if partial_out_ref.shape[0] > 0:
                 checkAllclose(
                     partial_out_ref,
                     attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
-                    msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
+                    msg=f"mla_decode-absorb    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
                 )
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
-        kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+        # Use the kv_last_page_lens computed in the outer scope (varlen / ctx_lens
+        # aware). The previous unconditional ones() overwrite was correct only
+        # for page_size == 1.
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
         q_fp8 = q.to(dtypes.fp8)

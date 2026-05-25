@@ -5,6 +5,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
 )
+from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
 
 @dataclass
@@ -77,7 +78,10 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
     hist = hist[:n_expts_tot]
     assert hist.dtype == torch.int32
     # scratchpad
-    combined_indx = torch.empty(n_gates * 2, dtype=torch.int32, device=device)
+    if n_gates <= 65536:
+        combined_indx = torch.empty(n_gates * 2, dtype=torch.uint16, device=device)
+    else:
+        combined_indx = torch.empty(n_gates * 2, dtype=torch.int32, device=device)
     # output
     topk_indx = combined_indx[:n_gates]
     gate_indx = combined_indx[n_gates:]
@@ -115,6 +119,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
+        USE_TDM=is_tdm_avail(),
         num_warps=1,
     )
 
@@ -145,7 +150,10 @@ def sort_tokens_fused(
     assert hist.dtype == torch.int32
     num_blocks_bitmatrix = cdiv(bitmatrix.shape[1], 32)
     # scratchpad
-    combined_indx = torch.empty(n_gates * 2, dtype=torch.int32, device=device)
+    if n_gates <= 65536:
+        combined_indx = torch.empty(n_gates * 2, dtype=torch.uint16, device=device)
+    else:
+        combined_indx = torch.empty(n_gates * 2, dtype=torch.int32, device=device)
     # output
     topk_indx = combined_indx[:n_gates]
     gate_indx = combined_indx[n_gates:]
@@ -183,6 +191,7 @@ def sort_tokens_fused(
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
+        USE_TDM=is_tdm_avail(),
         num_warps=1,
     )
 
@@ -215,8 +224,11 @@ def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
         max_n_tiles = n_gates
     else:
         max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // block_m)
+
     # allocate memory
-    pad = lambda x: cdiv(x, BLOCK) * BLOCK
+    def pad(x):
+        return cdiv(x, BLOCK) * BLOCK
+
     dtype = torch.int32
 
     token_offs_combined = torch.empty(

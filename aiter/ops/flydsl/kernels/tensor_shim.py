@@ -1,14 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import torch
 import numpy as np
+import flydsl.compiler as flyc
 from itertools import product
 from abc import ABC, abstractmethod
 
+from flydsl._mlir.dialects import fly, llvm
+from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl._mlir import ir
 from flydsl.expr.typing import T
 
-from flydsl.expr import buffer_ops, range_constexpr, vector
+from flydsl.expr import buffer_ops, range_constexpr, vector, arith
+
+
+def _run_compiled(exe, *args):
+    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
+    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+    """
+    cf = getattr(exe, "_cf", None)
+    if cf is None:
+        cf = flyc.compile(exe, *args)
+        exe._cf = cf
+    else:
+        cf(*args)
 
 
 def _to_raw(v):
@@ -20,6 +36,15 @@ def _to_raw(v):
     return ir.Value._CAPICreate(v._CAPIPtr)
 
 
+def get_dtype_str(dtype):
+    if dtype == torch.float:
+        return "f32"
+    elif dtype == torch.half:
+        return "f16"
+    elif dtype == torch.bfloat16:
+        return "bf16"
+
+
 def get_dtype_in_kernel(dtype: str):
     if dtype == "f32":
         return T.f32
@@ -27,6 +52,24 @@ def get_dtype_in_kernel(dtype: str):
         return T.f16
     elif dtype == "bf16":
         return T.bf16
+
+
+def get_dtype_vec_size(dtype: str):
+    if dtype == "f32":
+        return 4
+    elif dtype == "f16":
+        return 8
+    elif dtype == "bf16":
+        return 8
+
+
+def get_dtype_bytes(dtype: str):
+    if dtype == "f32":
+        return 4
+    elif dtype == "f16":
+        return 2
+    elif dtype == "bf16":
+        return 2
 
 
 class TensorView:
@@ -239,9 +282,23 @@ class TorchTensor(TensorBase):
 
 
 class GTensor(TensorBase):
-    def __init__(self, memref, dtype, shape, stride=None, base_offset=0):
+    def __init__(
+        self,
+        memref,
+        dtype,
+        shape,
+        stride=None,
+        base_offset=0,
+        cache_modifier=0,
+        static_bytes_offset_i64=None,
+    ):
         super().__init__(dtype, shape, stride, base_offset)
-        self.rsrc = buffer_ops.create_buffer_resource(memref, max_size=True)
+        if static_bytes_offset_i64 is None:
+            self.rsrc = buffer_ops.create_buffer_resource(memref, max_size=True)
+        else:
+            array_base_i64 = self.get_llvm_ptr(memref, (static_bytes_offset_i64))
+            self.rsrc = buffer_ops.create_buffer_resource_from_addr(array_base_i64)
+        self.cache_modifier = cache_modifier
 
     def load(self, offset, vec_size=1):
         return buffer_ops.buffer_load(
@@ -249,7 +306,21 @@ class GTensor(TensorBase):
         )
 
     def store(self, offset, value, vec_size=1):
-        buffer_ops.buffer_store(value, self.rsrc, offset)
+        buffer_ops.buffer_store(
+            value, self.rsrc, offset, cache_modifier=self.cache_modifier
+        )
+
+    def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
+        bytes_offset_i64 = arith.index_cast(T.i64, bytes_offset_i64)
+        _ptr_type = ir.Type.parse(ptr_type)
+        base_ptr = fly.extract_aligned_pointer_as_index(
+            _ptr_type, extract_to_ir_values(ptr)[0]
+        )
+        base_ptr = llvm.PtrToIntOp(T.i64, base_ptr).result
+        llvm_ptr = llvm.AddOp(
+            base_ptr, bytes_offset_i64, llvm.IntegerOverflowFlags(0)
+        ).result
+        return llvm_ptr
 
 
 class STensor(TensorBase):

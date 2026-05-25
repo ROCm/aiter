@@ -6,17 +6,45 @@
 #include "aiter_hip_common.h"
 #include "custom_all_reduce.cuh"
 #include "mla.h"
+#include "opus/opus.hpp"
 #include "pa.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/python.h>
 
-CK_TILE_HOST_DEVICE int32_t cal_cost(const int32_t qo_len, const int32_t kv_len)
+// Integer utility helpers (replacing ck_tile equivalents)
+template <typename T>
+__host__ __device__ constexpr T integer_divide_ceil(T x, T y)
+{
+    return (x + y - 1) / y;
+}
+
+template <typename T>
+__host__ __device__ constexpr T integer_least_multiple(T x, T y)
+{
+    return integer_divide_ceil(x, y) * y;
+}
+
+template <typename T>
+__host__ __device__ constexpr T next_power_of_two(T x)
+{
+    if(x <= 1)
+        return 1;
+    --x;
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    return x + 1;
+}
+
+__host__ __device__ int32_t cal_cost(const int32_t qo_len, const int32_t kv_len)
 {
     return 2 * qo_len + kv_len;
 }
 
-CK_TILE_HOST_DEVICE int32_t cal_kv_len(const int32_t cost, const int32_t qo_len)
+__host__ __device__ int32_t cal_kv_len(const int32_t cost, const int32_t qo_len)
 {
     return cost - 2 * qo_len;
 }
@@ -78,45 +106,45 @@ struct PaMetadataV1KernelParameter : MlaMetadataV1KernelParameter
 };
 
 template <typename T>
-CK_TILE_DEVICE T warp_sum(const T* p_data, const int32_t size)
+__device__ T warp_sum(const T* p_data, const int32_t size)
 {
     T sum = T(0);
 
-    for(int32_t idx = ck_tile::get_lane_id(); idx < size; idx += ck_tile::get_warp_size())
+    for(int32_t idx = opus::lane_id(); idx < size; idx += opus::get_warp_size())
     {
         sum += p_data[idx];
     }
 
-    sum = aiter::warpReduce<aiter::AddFunctor, T, ck_tile::get_warp_size()>(sum);
+    sum = aiter::warpReduce<aiter::AddFunctor, T, opus::get_warp_size()>(sum);
 
     return sum;
 }
 
 template <typename T>
-CK_TILE_DEVICE T warp_prefix_sum(T value, const int32_t size)
+__device__ T warp_prefix_sum(T value, const int32_t size)
 {
 // Always assume that size is power of 2
 #pragma unroll
-    for(int32_t offset = 1; offset <= (ck_tile::get_warp_size() >> 1); offset *= 2)
+    for(int32_t offset = 1; offset <= (opus::get_warp_size() >> 1); offset *= 2)
     {
-        const T remote = ck_tile::warp_shuffle_up(value, offset);
-        value += (ck_tile::get_lane_id() >= offset) ? remote : 0;
+        const T remote = opus::shfl(value, opus::lane_id() - offset);
+        value += (opus::lane_id() >= offset) ? remote : 0;
     }
     return value;
 }
 
 // Warp level customized bitonic sort for sorting batch idx based on cost. High cost first.
-CK_TILE_DEVICE void warp_sort(int32_t* p_batch_idx,
-                              int32_t* p_workspace,
-                              const int32_t* p_qo_lens,
-                              const int32_t* p_kv_lens,
-                              const int32_t num_batches)
+__device__ void warp_sort(int32_t* p_batch_idx,
+                          int32_t* p_workspace,
+                          const int32_t* p_qo_lens,
+                          const int32_t* p_kv_lens,
+                          const int32_t num_batches)
 {
-    const int32_t lane_idx = ck_tile::get_lane_id();
+    const int32_t lane_idx = opus::lane_id();
 
-    const int32_t num_batches_padded = ck_tile::integer_least_multiple(
-        ck_tile::next_power_of_two(num_batches), ck_tile::get_warp_size());
-    const int32_t warp_loops = num_batches_padded / ck_tile::get_warp_size();
+    const int32_t num_batches_padded =
+        integer_least_multiple(next_power_of_two(num_batches), opus::get_warp_size());
+    const int32_t warp_loops = num_batches_padded / opus::get_warp_size();
     int32_t* p_costs         = p_workspace;
     int32_t* p_indices       = p_costs + num_batches_padded;
 
@@ -135,13 +163,13 @@ CK_TILE_DEVICE void warp_sort(int32_t* p_batch_idx,
 
     // Initialize smem
     // Pre-calculate cost for each batch
-    for(int32_t bid = lane_idx; bid < num_batches; bid += ck_tile::get_warp_size())
+    for(int32_t bid = lane_idx; bid < num_batches; bid += opus::get_warp_size())
     {
         p_costs[bid]   = cal_cost(p_qo_lens[bid], p_kv_lens[bid]);
         p_indices[bid] = bid;
     }
     for(int32_t bid = lane_idx + num_batches; bid < num_batches_padded;
-        bid += ck_tile::get_warp_size())
+        bid += opus::get_warp_size())
     {
         p_costs[bid]   = 0;
         p_indices[bid] = bid;
@@ -152,7 +180,7 @@ CK_TILE_DEVICE void warp_sort(int32_t* p_batch_idx,
         const int32_t max_stride = size >> 1;
         for(int32_t loop_idx = 0; loop_idx < warp_loops; ++loop_idx)
         {
-            const int32_t thr_idx = lane_idx + loop_idx * ck_tile::get_warp_size();
+            const int32_t thr_idx = lane_idx + loop_idx * opus::get_warp_size();
             if(thr_idx * 2 < num_batches_padded)
             {
                 const bool dir = ((thr_idx & max_stride) == 0);
@@ -171,7 +199,7 @@ CK_TILE_DEVICE void warp_sort(int32_t* p_batch_idx,
         const int32_t stride_m1 = stride - 1;
         for(int32_t loop_idx = 0; loop_idx < warp_loops; ++loop_idx)
         {
-            const int32_t thr_idx = lane_idx + loop_idx * ck_tile::get_warp_size();
+            const int32_t thr_idx = lane_idx + loop_idx * opus::get_warp_size();
             if(thr_idx * 2 < num_batches_padded)
             {
                 const int32_t idx = 2 * thr_idx - (thr_idx & stride_m1);
@@ -181,14 +209,14 @@ CK_TILE_DEVICE void warp_sort(int32_t* p_batch_idx,
     }
 
     // Output results
-    for(int32_t bid = lane_idx; bid < num_batches; bid += ck_tile::get_warp_size())
+    for(int32_t bid = lane_idx; bid < num_batches; bid += opus::get_warp_size())
     {
         p_batch_idx[bid] = p_indices[bid];
     }
 }
 
 template <typename T>
-CK_TILE_DEVICE T integer_divide_ceil_power2(T x, T y, T y_log2)
+__device__ T integer_divide_ceil_power2(T x, T y, T y_log2)
 {
     return (x + y - 1) >> y_log2;
 }
@@ -207,7 +235,7 @@ std::vector<T> flatten(const std::vector<std::vector<T>>& vec, const int size_af
     return result;
 }
 
-CK_TILE_HOST_DEVICE int32_t cal_packed_causal_kv_len(const int32_t qo_len,
+__host__ __device__ int32_t cal_packed_causal_kv_len(const int32_t qo_len,
                                                      const int32_t kv_len,
                                                      const int32_t qo_tile_idx,
                                                      const int32_t packed_qo_tile_len,
@@ -221,8 +249,9 @@ CK_TILE_HOST_DEVICE int32_t cal_packed_causal_kv_len(const int32_t qo_len,
     {
         const int kv_len_init = kv_len - qo_len;
         const int kv_len_slop =
-            ck_tile::integer_divide_ceil((qo_tile_idx + 1) * packed_qo_tile_len, num_heads);
-        result = ck_tile::min(kv_len_init + kv_len_slop, kv_len);
+            integer_divide_ceil((qo_tile_idx + 1) * packed_qo_tile_len, num_heads);
+        const int sum = kv_len_init + kv_len_slop;
+        result        = (sum < kv_len) ? sum : kv_len;
     }
 
     return result;
@@ -232,10 +261,10 @@ template <typename Traits>
 class QoState
 {
     public:
-    CK_TILE_DEVICE explicit QoState(const int32_t uni_seqlen_qo,
-                                    const int32_t ori_seqlen_qo,
-                                    const int32_t* p_lds_seqlens_qo,
-                                    const int32_t* p_seqlens_qo_indptr)
+    __device__ explicit QoState(const int32_t uni_seqlen_qo,
+                                const int32_t ori_seqlen_qo,
+                                const int32_t* p_lds_seqlens_qo,
+                                const int32_t* p_seqlens_qo_indptr)
         : uni_seqlen_qo_(uni_seqlen_qo),
           ori_seqlen_qo_(ori_seqlen_qo),
           p_lds_seqlens_qo_(p_lds_seqlens_qo),
@@ -243,9 +272,9 @@ class QoState
     {
     }
 
-    CK_TILE_HOST_DEVICE static constexpr bool is_unique() { return Traits::kUniSeqlenQo >= 0; }
+    __host__ __device__ static constexpr bool is_unique() { return Traits::kUniSeqlenQo >= 0; }
 
-    CK_TILE_DEVICE int32_t get_seqlen(const int32_t batch_idx)
+    __device__ int32_t get_seqlen(const int32_t batch_idx)
     {
         if constexpr(Traits::kUniSeqlenQo == 0)
         {
@@ -262,7 +291,7 @@ class QoState
         }
     }
 
-    CK_TILE_DEVICE int32_t get_begin(const int32_t batch_idx)
+    __device__ int32_t get_begin(const int32_t batch_idx)
     {
         if constexpr(Traits::kUniSeqlenQo == 0)
         {
@@ -279,7 +308,7 @@ class QoState
         }
     }
 
-    CK_TILE_DEVICE int32_t get_end(const int32_t batch_idx)
+    __device__ int32_t get_end(const int32_t batch_idx)
     {
         if constexpr(Traits::kUniSeqlenQo == 0)
         {
@@ -296,7 +325,7 @@ class QoState
         }
     }
 
-    CK_TILE_DEVICE int32_t get_q_head_range(const int32_t q_head_start, const int32_t q_head_end)
+    __device__ int32_t get_q_head_range(const int32_t q_head_start, const int32_t q_head_end)
     {
         int32_t q_head_range = (q_head_end << 16) | (q_head_start & 0xFFFF);
         return q_head_range;
@@ -338,33 +367,53 @@ class QoState
     }                                                 \
     }
 
-#define MLA_METADATA_DISPATCHER(                                                         \
-    MAX_PACKED_SEQLEN_QO, PACKED_QO_LEN_PER_WG, UNI_SEQLEN_QO, TOPK, ...)                \
-    if(((MAX_PACKED_SEQLEN_QO) > 0) && ((MAX_PACKED_SEQLEN_QO) <= PACKED_QO_LEN_PER_WG)) \
-    {                                                                                    \
-        constexpr bool kQoSplits = false;                                                \
-        if((TOPK) < 0)                                                                   \
-        {                                                                                \
-            constexpr bool kIsSparse = false;                                            \
-            MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                     \
-        }                                                                                \
-        else                                                                             \
-        {                                                                                \
-            constexpr bool kIsSparse = true;                                             \
-            MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                     \
-        }                                                                                \
-    }                                                                                    \
-    else                                                                                 \
-    {                                                                                    \
-        constexpr bool kQoSplits = true;                                                 \
-        if((TOPK) < 0)                                                                   \
-        {                                                                                \
-            constexpr bool kIsSparse = false;                                            \
-            MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                     \
-        }                                                                                \
-        else                                                                             \
-        {                                                                                \
-            constexpr bool kIsSparse = true;                                             \
-            MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                     \
-        }                                                                                \
+#define MLA_PACKED_QO_LEN_PER_WG_CASE(C_PACKED_QO_LEN_PER_WG, ...)    \
+    case C_PACKED_QO_LEN_PER_WG: {                                    \
+        constexpr int32_t kPackedQoLenPerWg = C_PACKED_QO_LEN_PER_WG; \
+        __VA_ARGS__;                                                  \
+        break;                                                        \
     }
+
+#define MLA_PACKED_QO_LEN_PER_WG_DISPATCHER(PACKED_QO_LEN_PER_WG, ...) \
+    switch(PACKED_QO_LEN_PER_WG)                                       \
+    {                                                                  \
+        MLA_PACKED_QO_LEN_PER_WG_CASE(128, __VA_ARGS__);               \
+        MLA_PACKED_QO_LEN_PER_WG_CASE(64, __VA_ARGS__);                \
+        MLA_PACKED_QO_LEN_PER_WG_CASE(32, __VA_ARGS__);                \
+        MLA_PACKED_QO_LEN_PER_WG_CASE(16, __VA_ARGS__);                \
+    default: {                                                         \
+        constexpr int32_t kPackedQoLenPerWg = 128;                     \
+        __VA_ARGS__;                                                   \
+        break;                                                         \
+    }                                                                  \
+    }
+
+#define MLA_METADATA_DISPATCHER(                                                            \
+    MAX_PACKED_SEQLEN_QO, PACKED_QO_LEN_PER_WG, UNI_SEQLEN_QO, TOPK, ...)                   \
+    MLA_PACKED_QO_LEN_PER_WG_DISPATCHER(                                                    \
+        PACKED_QO_LEN_PER_WG,                                                               \
+        if(((MAX_PACKED_SEQLEN_QO) > 0) && ((MAX_PACKED_SEQLEN_QO) <= kPackedQoLenPerWg)) { \
+            constexpr bool kQoSplits = false;                                               \
+            if((TOPK) < 0)                                                                  \
+            {                                                                               \
+                constexpr bool kIsSparse = false;                                           \
+                MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                    \
+            }                                                                               \
+            else                                                                            \
+            {                                                                               \
+                constexpr bool kIsSparse = true;                                            \
+                MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                    \
+            }                                                                               \
+        } else {                                                                            \
+            constexpr bool kQoSplits = true;                                                \
+            if((TOPK) < 0)                                                                  \
+            {                                                                               \
+                constexpr bool kIsSparse = false;                                           \
+                MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                    \
+            }                                                                               \
+            else                                                                            \
+            {                                                                               \
+                constexpr bool kIsSparse = true;                                            \
+                MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                    \
+            }                                                                               \
+        })

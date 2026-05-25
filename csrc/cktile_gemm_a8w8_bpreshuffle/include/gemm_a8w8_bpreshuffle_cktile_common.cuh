@@ -136,8 +136,7 @@ float flatmm_calc(const ck_tile::ScaleFlatmmHostArgs<ScaleM, ScaleN>& args,
                                              CodegenPipelineProblem::TransposeC,
                                              FlatmmConfig::NumWaveGroups,
                                              false,
-                                             1,
-                                             false>>;
+                                             1>>;
 
         // Now we only use the BlockGemmASmemBSmemCRegV1DefaultPolicy.
         using Kernel = ck_tile::FlatmmKernel<TilePartitioner, CodegenFlatmmPipeline, GemmEpilogue>;

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import copy
 from dataclasses import dataclass
 import os
 import sys
@@ -184,7 +185,9 @@ a8w8_gemm1_blockscale_kernels_list= {
      1: kernelInstanceGEMM1(       128,       16,        128,       128,     1,       2,        1,),
      2: kernelInstanceGEMM1(       256,       32,        128,       128,     1,       4,        1,),
      3: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
-     #2: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
+    # 4: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
+     5: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        1,),
+    # 6: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        1,),
 }
 
 # gemm1 out:bf16/fp16 A:fp8 B:win4
@@ -307,7 +310,9 @@ a8w8_gemm2_blockscale_kernels_list= {
      1: kernelInstanceGEMM2(       128,       16,        128,       128,     1,       2,        1,),
      2: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
      3: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
-     #2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
+    # 4: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
+     5: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        1,),
+    # 6: kernelInstanceGEMM2(       256,      128,        128,       128,     1,       4,        1,),
 }
 
 # gemm2 out:bf16/fp16 A:fp8 B:in4
@@ -402,7 +407,7 @@ def get_gemm1_kernels_list(
 
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
-    kernels_list = gemm1_kernels_dict[tag]
+    kernels_list = {k: copy.deepcopy(v) for k, v in gemm1_kernels_dict[tag].items()}
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.ActOP = ActOP == "silu"
@@ -472,7 +477,7 @@ def get_gemm2_kernels_list(
             tag = "a4w4_bns"
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
-    kernels_list = gemm2_kernels_dict[tag]
+    kernels_list = {k: copy.deepcopy(v) for k, v in gemm2_kernels_dict[tag].items()}
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.Nswizzle = Nswizzle
