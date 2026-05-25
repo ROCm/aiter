@@ -1109,7 +1109,7 @@ def flydsl_moe_stage2(
     target = out
     if not accumulate:
         target = torch.empty(
-            (token_num * topk * model_dim,),
+            (token_num, topk, model_dim),
             device=out.device,
             dtype=out.dtype,
         )
@@ -1173,6 +1173,6 @@ def flydsl_moe_stage2(
     _run_compiled(exe, args)
 
     if not accumulate:
-        torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+        torch.sum(target, dim=1, out=out)
 
     return out
