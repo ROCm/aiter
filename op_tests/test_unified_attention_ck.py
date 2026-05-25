@@ -241,28 +241,54 @@ def _int32_overflow_possible(num_blocks, block_size, num_kv_heads, head_size) ->
 # ----------------------------------------------------------------------------
 # Kernel runners — exactly one per backend so @perftest amortises warmup +
 # does proper torch profiler timing per the test_pa convention.
+#
+# IMPORTANT: every GPU tensor the kernel reads is passed as a *positional*
+# argument here. @perftest's `device_memory_profiling` sums positional-tensor
+# bytes to size its L2-cache rotation buffer; tensors hidden inside dicts or
+# kwargs are invisible to it, so it would clamp to its 101-iter ceiling and
+# OOM at long-context / large-batch shapes (multi-GB per copy). Keeping the
+# bulky tensors positional lets the auto-sizer scale rotations to the GPU's
+# free memory, which is what makes the long-context FP8 sweep run end-to-end
+# without manual rotation tuning.
 # ----------------------------------------------------------------------------
 @perftest()
-def run_ck(out, tensors, mask_type, allow_splitkv=True):
+def run_ck(
+    out,
+    query,
+    key_cache,
+    value_cache,
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    block_tables,
+    kv_lens,
+    cu_seqlens_q,
+    *,
+    q_descale,
+    k_descale,
+    v_descale,
+    scale,
+    max_query_len,
+    mask_type,
+    allow_splitkv=True,
+):
     from aiter.ops.unified_attention import unified_attention_fwd
 
-    q = tensors["q_fp8"] if tensors["q_fp8"] is not None else tensors["query"]
-    k = tensors["k_fp8"] if tensors["k_fp8"] is not None else tensors["key_cache"]
-    v = tensors["v_fp8"] if tensors["v_fp8"] is not None else tensors["value_cache"]
-    overflow = _int32_overflow_possible(
-        k.shape[0], k.shape[1], k.shape[2], k.shape[3]
-    )
+    q = q_fp8 if q_fp8 is not None else query
+    k = k_fp8 if k_fp8 is not None else key_cache
+    v = v_fp8 if v_fp8 is not None else value_cache
+    overflow = _int32_overflow_possible(k.shape[0], k.shape[1], k.shape[2], k.shape[3])
 
     unified_attention_fwd(
         out,
         q,
         k,
         v,
-        tensors["block_tables"],
-        tensors["kv_lens"],
-        tensors["cu_seqlens_q"],
+        block_tables,
+        kv_lens,
+        cu_seqlens_q,
         mask_type=mask_type,
-        scale_s=tensors["scale"],
+        scale_s=scale,
         scale=1.0,
         scale_k=1.0,
         scale_v=1.0,
@@ -274,33 +300,48 @@ def run_ck(out, tensors, mask_type, allow_splitkv=True):
         # the single-launch path — useful for isolating the combine overhead
         # and for A/B-ing the heuristic, not as a correctness workaround.
         allow_splitkv=allow_splitkv,
-        q_descale=float(tensors["q_descale"]),
-        k_descale=float(tensors["k_descale"]),
-        v_descale=float(tensors["v_descale"]),
-        max_seqlen_q=tensors["max_query_len"],
+        q_descale=float(q_descale),
+        k_descale=float(k_descale),
+        v_descale=float(v_descale),
+        max_seqlen_q=max_query_len,
     )
     return out
 
 
 @perftest()
-def run_triton(out, tensors):
+def run_triton(
+    out,
+    query,
+    key_cache,
+    value_cache,
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    block_tables,
+    kv_lens,
+    cu_seqlens_q,
+    *,
+    q_descale,
+    k_descale,
+    v_descale,
+    scale,
+    max_query_len,
+    max_kv_len,
+):
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
-    q = tensors["q_fp8"] if tensors["q_fp8"] is not None else tensors["query"]
-    k = tensors["k_fp8"] if tensors["k_fp8"] is not None else tensors["key_cache"]
-    v = tensors["v_fp8"] if tensors["v_fp8"] is not None else tensors["value_cache"]
-
+    q = q_fp8 if q_fp8 is not None else query
+    k = k_fp8 if k_fp8 is not None else key_cache
+    v = v_fp8 if v_fp8 is not None else value_cache
+    fp8 = q_fp8 is not None
     q_descale_t = (
-        torch.tensor([tensors["q_descale"]], dtype=dtypes.fp32, device=out.device)
-        if tensors["q_fp8"] is not None else None
+        torch.tensor([q_descale], dtype=dtypes.fp32, device=out.device) if fp8 else None
     )
     k_descale_t = (
-        torch.tensor([tensors["k_descale"]], dtype=dtypes.fp32, device=out.device)
-        if tensors["q_fp8"] is not None else None
+        torch.tensor([k_descale], dtype=dtypes.fp32, device=out.device) if fp8 else None
     )
     v_descale_t = (
-        torch.tensor([tensors["v_descale"]], dtype=dtypes.fp32, device=out.device)
-        if tensors["q_fp8"] is not None else None
+        torch.tensor([v_descale], dtype=dtypes.fp32, device=out.device) if fp8 else None
     )
 
     unified_attention(
@@ -308,14 +349,14 @@ def run_triton(out, tensors):
         k=k,
         v=v,
         out=out,
-        cu_seqlens_q=tensors["cu_seqlens_q"],
-        seqused_k=tensors["kv_lens"],
-        max_seqlen_q=tensors["max_query_len"],
-        max_seqlen_k=tensors["max_kv_len"],
-        softmax_scale=tensors["scale"],
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
         causal=True,
         window_size=(-1, -1),
-        block_table=tensors["block_tables"],
+        block_table=block_tables,
         softcap=0.0,
         q_descale=q_descale_t,
         k_descale=k_descale_t,
@@ -384,7 +425,15 @@ def test_unified_attention_ck(
     # NOTE: @perftest deep-copies args for L2-cache rotation, so the output
     # captured for correctness comes from the kernel's return value (the
     # `out` of the *last* rotated copy), not the `out_ck` we passed in.
-    out_ck, time_ck = run_ck(out_ck, t, mask_type=2, allow_splitkv=allow_splitkv)
+    out_ck, time_ck = run_ck(
+        out_ck,
+        t["query"], t["key_cache"], t["value_cache"],
+        t["q_fp8"], t["k_fp8"], t["v_fp8"],
+        t["block_tables"], t["kv_lens"], t["cu_seqlens_q"],
+        q_descale=t["q_descale"], k_descale=t["k_descale"], v_descale=t["v_descale"],
+        scale=t["scale"], max_query_len=t["max_query_len"],
+        mask_type=2, allow_splitkv=allow_splitkv,
+    )
 
     # Triton kernel for cross-check + perf comparison.
     time_triton = None
@@ -392,7 +441,15 @@ def test_unified_attention_ck(
     if run_triton_backend:
         out_triton_buf = torch.empty_like(out_ck)
         try:
-            out_triton, time_triton = run_triton(out_triton_buf, t)
+            out_triton, time_triton = run_triton(
+                out_triton_buf,
+                t["query"], t["key_cache"], t["value_cache"],
+                t["q_fp8"], t["k_fp8"], t["v_fp8"],
+                t["block_tables"], t["kv_lens"], t["cu_seqlens_q"],
+                q_descale=t["q_descale"], k_descale=t["k_descale"], v_descale=t["v_descale"],
+                scale=t["scale"], max_query_len=t["max_query_len"],
+                max_kv_len=t["max_kv_len"],
+            )
         except Exception as e:
             aiter.logger.info(f"Triton run failed for {cfg}: {e}")
             out_triton = None
