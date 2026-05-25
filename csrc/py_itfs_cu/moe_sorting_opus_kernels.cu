@@ -22,7 +22,9 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           int unit_size,
                           std::optional<aiter_tensor_t> local_expert_mask,
                           std::optional<aiter_tensor_t> num_local_tokens,
-                          int dispatch_policy)
+                          std::optional<aiter_tensor_t> workspace,
+                          int dispatch_policy,
+                          std::optional<aiter_tensor_t> local_topk_ids)
 {
     AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
                 "topk_weights must be FP32 (float32)");
@@ -31,18 +33,23 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
     int num_tokens = topk_ids.size(0);
     int topk       = topk_ids.size(1);
 
+    if(local_topk_ids.has_value())
+    {
+        auto& ids_out = local_topk_ids.value();
+        AITER_CHECK(ids_out.dim() == 2 && ids_out.size(0) == topk_ids.size(0) &&
+                        ids_out.size(1) == topk_ids.size(1),
+                    "local_topk_ids must have the same [tokens, topk] shape as topk_ids");
+        AITER_CHECK(ids_out.dtype() == topk_ids.dtype(),
+                    "local_topk_ids dtype must match topk_ids");
+        AITER_CHECK(ids_out.device_id == topk_ids.device_id,
+                    "local_topk_ids must be on the same device as topk_ids");
+        AITER_CHECK(ids_out.is_contiguous(), "local_topk_ids must be contiguous");
+    }
+
     HipDeviceGuard device_guard(topk_ids.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    int workspace_size = moe_sorting_opus_get_workspace_size(num_tokens, num_experts, topk, dispatch_policy);
-    std::optional<AiterTensor> ws;
-    void* ws_ptr = nullptr;
-    if (workspace_size > 0)
-    {
-        ws.emplace(AiterTensor::empty(
-            {workspace_size}, topk_ids.dtype(), topk_ids.device_id, stream));
-        ws_ptr = ws->data_ptr();
-    }
+    void* ws_ptr = workspace.has_value() ? workspace.value().data_ptr() : nullptr;
 
     moe_sorting_opus(
         {
@@ -62,6 +69,7 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
          num_valid_ids.data_ptr(),
          moe_buf.data_ptr(),
          ws_ptr,
+         local_topk_ids.has_value() ? local_topk_ids.value().data_ptr() : nullptr,
          num_tokens,
          unit_size,
          num_experts,

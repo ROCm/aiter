@@ -515,7 +515,7 @@ def test_mla(
         128,
     ]:
         err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and nhead in [16, 128]:
+    elif kvtype == dtypes.fp8 and nhead in [8, 16, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
 
     ret["decode:err"] = err
@@ -660,7 +660,19 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=[(8, 1), (16, 1), (16, 2), (16, 4), (64, 1), (128, 1), (128, 2), (128, 4)],
+    choices=[
+        (8, 1),
+        (16, 1),
+        (16, 2),
+        (16, 4),
+        (32, 1),
+        (32, 2),
+        (32, 4),
+        (64, 1),
+        (128, 1),
+        (128, 2),
+        (128, 4),
+    ],
     nargs="*",
     const=None,
     default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],

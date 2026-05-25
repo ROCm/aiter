@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+import functools
 from itertools import product
 from typing import Dict, Optional
 
@@ -653,27 +654,15 @@ def _register_all_configs():
 _register_all_configs()
 
 
+@functools.lru_cache(maxsize=128)
 def _get_split_k_tensors(
+    device: torch.device,
     stream: torch.cuda.Stream,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    key = _stream_cache_key(stream)
-    semaphore = SPLIT_K_GLOBAL_SEMAPHORE.get(key)
-    signal = SPLIT_K_GLOBAL_SIGNAL.get(key)
-    with torch.cuda.device(stream.device), torch.cuda.stream(stream):
-        if semaphore is None:
-            semaphore = torch.zeros(
-                (SPLIT_K_SEMAPHORE_MAX_LEN,),
-                dtype=torch.int32,
-                device=stream.device,
-            )
-            SPLIT_K_GLOBAL_SEMAPHORE[key] = semaphore
-        if signal is None:
-            signal = torch.zeros(
-                (SPLIT_K_SEMAPHORE_MAX_LEN,),
-                dtype=torch.int32,
-                device=stream.device,
-            )
-            SPLIT_K_GLOBAL_SIGNAL[key] = signal
+    semaphore = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
+    )
+    signal = torch.zeros((SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device)
     return semaphore, signal
 
 
@@ -808,7 +797,7 @@ def _compile_flydsl_hgemm(
         runtime_m = int(a.shape[0])
         launch_stream = _normalize_launch_stream(a.device, stream)
         _check_split_k_semaphore_capacity(runtime_m, n, tile_m, tile_n, split_k)
-        semaphore, signal = _get_split_k_tensors(launch_stream)
+        semaphore, signal = _get_split_k_tensors(a.device, launch_stream)
         return _run_compiled(
             kernel,
             out,
@@ -950,6 +939,7 @@ def flydsl_preshuffle_gemm_a8(
     use_cshuffle_epilog: int = 0,
     use_async_copy: int = 0,
     waves_per_eu: int = 0,
+    xcd_swizzle: int = 0,
 ) -> Tensor:
     """Compile (cached via lru_cache) and run a FlyDSL preshuffle GEMM kernel."""
     compile_fn = _get_compile_fn()
@@ -1001,12 +991,17 @@ def flydsl_preshuffle_gemm_a8(
         use_cshuffle_epilog=bool(use_cshuffle_epilog),
         use_async_copy=bool(use_async_copy),
         waves_per_eu=wpe,
+        xcd_swizzle=int(xcd_swizzle),
     )
 
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
     out_contig = Out.contiguous()
+    # FlyDSL's preshuffle kernel requires an arg_bias slot (used only when
+    # epilogue != "none"). Pass an empty tensor as a placeholder for the
+    # default epilogue="none" path.
+    _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
     _run_compiled(
         exe,
         out_contig.view(-1),
@@ -1014,6 +1009,7 @@ def flydsl_preshuffle_gemm_a8(
         _as_i8(WQ.contiguous()).view(-1),
         x_scale.contiguous().view(-1),
         w_scale.contiguous().view(-1),
+        _dummy_bias,
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),

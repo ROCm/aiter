@@ -8,8 +8,8 @@
 #include "gemm_dispatch_utils.h"
 #include <cmath>
 
-using RowwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
+using RowwiseKernel = torch::Tensor (*)(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
 
 using RowwiseKernelMap = GemmDispatchMap<RowwiseKernel>;
 
@@ -130,8 +130,8 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
         }
     }();
 
-    const int cu_num         = get_device_cu_num();
-    const std::string& gfx   = get_device_gfx();
+    const int cu_num           = get_device_cu_num();
+    const std::string_view gfx = get_device_gfx();
 
     // First check if this shape(M,N,K) is available in the direct lookup.
     auto it = lookup.find({gfx, cu_num, M, N, K});

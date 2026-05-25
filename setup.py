@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.1.5"
+FLYDSL_VERSION = "flydsl==0.1.8"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -77,6 +77,7 @@ def _is_triton_installed():
 
     for pkg in [
         "triton",
+        "amd-triton",
         "pytorch-triton",
         "pytorch-triton-rocm",
         "triton-rocm",
@@ -89,18 +90,44 @@ def _is_triton_installed():
 
 
 def _run_install_triton():
-    print("[aiter] Installing amd-triton via .github/scripts/install_triton.sh")
+    print("[aiter] Installing triton via .github/scripts/install_triton.sh")
     install_triton = os.path.join(this_dir, ".github", "scripts", "install_triton.sh")
     subprocess.check_call(["bash", install_triton])
 
 
-_triton_info = _is_triton_installed() if is_develop_mode() else None
-if _triton_info:
+AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", 0))
+
+
+def _torch_version_below(min_version):
+    try:
+        import torch
+        from packaging.version import Version
+
+        return Version(torch.__version__.split("+")[0].split("dev")[0]) < Version(
+            min_version
+        )
+    except Exception:
+        return False
+
+
+_triton_info = _is_triton_installed()
+if _torch_version_below("2.9.1"):
     print(
-        f"[aiter] {_triton_info[0]}=={_triton_info[1]} is already installed,"
-        " recommend using .github/scripts/install_triton.sh to install triton"
+        f"[aiter] torch < 2.9.1 detected, skipping triton reinstall"
+        f"{f' (keeping {_triton_info[0]}=={_triton_info[1]})' if _triton_info else ''}"
+    )
+elif AITER_USE_SYSTEM_TRITON and _triton_info:
+    print(
+        f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping existing"
+        f" {_triton_info[0]}=={_triton_info[1]}"
     )
 else:
+    if _triton_info:
+        print(
+            f"[aiter] Replacing existing {_triton_info[0]}=={_triton_info[1]}"
+            " with aiter-compatible triton"
+            " (if needed, set AITER_USE_SYSTEM_TRITON=1 to keep your triton)"
+        )
     try:
         _run_install_triton()
     except Exception:
@@ -291,6 +318,9 @@ if PREBUILD_KERNELS != 0:
             req_md_names = [
                 "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale",
                 "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale",
+                "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_skip_nqscale",
+                "mha_varlen_fwd_bf16_nlogits_nbias_mask_lse_ndropout_skip_nqscale",
+                "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_skip_nqscale",
             ]
             variants = get_mha_varlen_prebuild_variants_by_names(req_md_names, ck_dir)
             base_args = core.get_args_of_build("module_mha_varlen_fwd")

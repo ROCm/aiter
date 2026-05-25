@@ -448,6 +448,7 @@ def moe_gemm_smoothquant_torch(
         if gather_indx is None:
             idx = torch.arange(lo, hi, device=x.device)
         else:
+            gather_indx = gather_indx.to(torch.int32)
             idx = gather_indx[lo:hi] // n_expts_act
         out = (
             torch.matmul(x[idx, :].float(), w[i].float())
@@ -464,6 +465,7 @@ def moe_gemm_smoothquant_torch(
     if scatter_indx is None:
         return y
     # accumulate output from all experts
+    scatter_indx = scatter_indx.to(torch.int32)
     n_rows_out = y.shape[0] // n_expts_act
     out = torch.zeros((n_rows_out, y.shape[-1]), dtype=torch.float32, device=x.device)
     src_idx = scatter_indx.view(-1, n_expts_act)

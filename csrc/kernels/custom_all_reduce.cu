@@ -595,4 +595,72 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
     }
 }
 
+void fused_qknorm_allreduce(fptr_t _fa,
+                            const aiter_tensor_t& qkv_in,
+                            const aiter_tensor_t& q_w,
+                            const aiter_tensor_t& k_w,
+                            const aiter_tensor_t& q_out,
+                            const aiter_tensor_t& k_out,
+                            const aiter_tensor_t& v_out,
+                            double eps,
+                            int64_t reg_ptr,
+                            int64_t reg_bytes)
+{
+    HipDeviceGuard device_guard(qkv_in.device_id);
+    hipStream_t stream   = aiter::getCurrentHIPStream();
+    auto dtype           = qkv_in.dtype();
+    int64_t hidden_dim_q = q_w.numel();
+    int64_t hidden_dim_k = k_w.numel();
+    int64_t token_num    = qkv_in.size(0);
+    int64_t hidden_dim_v = qkv_in.size(1) - (hidden_dim_q + hidden_dim_k);
+    auto fa              = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int64_t data_bytes   = qkv_in.numel() * qkv_in.element_size();
+    void* inp_ptr        = qkv_in.data_ptr();
+
+    if(reg_ptr != 0)
+    {
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, qkv_in.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        inp_ptr = (void*)reg_ptr;
+    }
+
+#define DISPATCH_AR_FUSION(DTYPE)                                                           \
+    {                                                                                       \
+        fa->dispatchFusedQKNormAllReduce<DTYPE>(stream,                                     \
+                                                reinterpret_cast<DTYPE*>(inp_ptr),          \
+                                                reinterpret_cast<DTYPE*>(q_w.data_ptr()),   \
+                                                reinterpret_cast<DTYPE*>(k_w.data_ptr()),   \
+                                                reinterpret_cast<DTYPE*>(q_out.data_ptr()), \
+                                                reinterpret_cast<DTYPE*>(k_out.data_ptr()), \
+                                                reinterpret_cast<DTYPE*>(v_out.data_ptr()), \
+                                                token_num,                                  \
+                                                hidden_dim_q,                               \
+                                                hidden_dim_k,                               \
+                                                hidden_dim_v,                               \
+                                                eps);                                       \
+    }
+
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp32: {
+        DISPATCH_AR_FUSION(opus::fp32_t)
+        break;
+    }
+    case AITER_DTYPE_fp16: {
+        DISPATCH_AR_FUSION(opus::fp16_t)
+        break;
+    }
+#if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16: {
+        DISPATCH_AR_FUSION(opus::bf16_t)
+        break;
+    }
+#endif
+    default:
+        throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
+    }
+}
+
 } // namespace aiter
