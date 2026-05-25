@@ -1,6 +1,25 @@
 from typing import List, Dict, Tuple
 
 
+def _ck_targets_flag() -> str:
+    """Return ``--targets <runtime arch>`` when the runtime GPU is not gfx9.
+
+    ck-tile's ``generate.py`` defaults to ``--targets gfx9,gfx950``, so any
+    non-gfx9 host (gfx10/11/12) ends up with an empty kernel set and ``mha_fwd``
+    fails at dispatch with "invalid argument for fmha_fwd". For gfx9 hosts we
+    keep the default (covers both gfx942 and gfx950 like before).
+    """
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        gfx = get_gfx()
+    except Exception:
+        return ""
+    if gfx.startswith("gfx9"):
+        return ""
+    return f" --targets {gfx}"
+
+
 def compose_mha_fwd_variant_suffix_and_filter(
     dtype: str,
     logits_positive: bool,
@@ -104,8 +123,8 @@ def get_mha_varlen_prebuild_variants_by_names(
             has_qscale=has_qscale,
         )
         blob_gen_cmd = [
-            f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt {receipt} --filter {filter_pattern} --output_dir {{}}",
-            f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt {receipt} --filter " @ " --output_dir {{}}',
+            f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt {receipt} --filter {filter_pattern} --output_dir {{}}{_ck_targets_flag()}",
+            f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt {receipt} --filter " @ " --output_dir {{}}{_ck_targets_flag()}',
         ]
         variants.append(
             {"md_name": f"mha_varlen_fwd{suffix}", "blob_gen_cmd": blob_gen_cmd}
