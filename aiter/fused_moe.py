@@ -451,28 +451,61 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
         return None
     os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "default"
+
+    use_grouped = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in (
+        "1", "true", "True", "TRUE", "yes", "YES",
+    )
+
+    def _bail(reason: str):
+        if use_grouped:
+            logger.warning(
+                f"[grouped] AITER_USE_GROUPED_GEMM=1 set but cannot run grouped path: {reason}"
+            )
+        else:
+            _grouped_dbg(f"bail: {reason}")
+        return None
+
+    def _soft(reason: str):
+        if use_grouped:
+            logger.warning(
+                f"[grouped] forcing grouped-gemm path despite: {reason}"
+            )
+            return False
+        _grouped_dbg(f"soft bail: {reason}")
+        return True
+
     if expert_mask is not None or bias1 is not None or bias2 is not None:
-        return None
+        if _soft("expert_mask / bias1 / bias2 not natively supported"):
+            return None
     if hidden_pad != 0 or intermediate_pad != 0:
-        return None
-    if not isG1U1 or quant_type != QuantType.per_1x32:
-        return None
+        if _soft(f"hidden_pad={hidden_pad} intermediate_pad={intermediate_pad}"):
+            return None
+    if not isG1U1:
+        return _bail("requires G1U1 weight layout (w1.shape[1] == 2*inter_dim)")
+    if quant_type != QuantType.per_1x32:
+        return _bail(f"quant_type={quant_type} != per_1x32")
     if activation not in (ActivationType.Silu, ActivationType.Swiglu):
-        return None
+        if _soft(f"activation={activation} not in (Silu, Swiglu)"):
+            return None
+
     is_grouped_a4w4 = q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2
     is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and (q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8)
     if not (is_grouped_a4w4 or is_grouped_a8w4):
-        return None
+        return _bail(
+            f"dtype mismatch q_a={q_dtype_a} q_w={q_dtype_w} w1.dtype={w1.dtype}"
+        )
     data_format = "fp4" if is_grouped_a4w4 else "a8w4"
     _grouped_dbg(f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
-        return None
+        return _bail("missing w1_scale / w2_scale")
+
     _gfx_env = ";".join(
         str(os.environ.get(k, "")).lower()
         for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS", "AITER_FORCE_GFX1250")
     )
     if get_gfx() != "gfx1250" and "gfx1250" not in _gfx_env and "1" not in _gfx_env:
-        return None
+        if _soft(f"arch get_gfx()={get_gfx()} is not gfx1250"):
+            return None
 
     if os.environ.get("AITER_GROUPED_CKTILE_MASKED", "0") not in ("0", "false", "False"):
         token_num, topk = topk_ids.shape
