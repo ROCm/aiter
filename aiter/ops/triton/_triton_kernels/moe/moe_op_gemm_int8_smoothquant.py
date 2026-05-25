@@ -28,6 +28,7 @@ def matmul_launch_metadata(grid, kernel, args):
     ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
     gindx = args.get("GatherIndx", None)
     if gindx is not None:
+        gindx = gindx.to(torch.int32)
         ret["name"] += "_layer1"
     else:
         ret["name"] += "_layer2"
