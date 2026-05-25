@@ -109,9 +109,8 @@ def per_1x32_f4_quant(
         round_mode: :class:`MxScaleRoundMode` or bare ``int`` 0..3
             (interchangeable). Default ``RoundUp`` (industry default:
             NV ROUND_UP / DSv4 Pro / FlashInfer / torchao RCEIL).
-            See :class:`MxScaleRoundMode` and ``csrc/kernels/quant.md``
-            "Cross-Stack Mode Alignment Reference" for the four
-            formulas and cross-stack mapping.
+            See :class:`MxScaleRoundMode` for the four formulas and
+            cross-stack mapping.
 
     Returns:
         ``(quantized_tensor, scale_tensor)``.
@@ -772,9 +771,8 @@ def quant_mxfp4_hip(
         round_mode: :class:`MxScaleRoundMode` or bare ``int`` 0..3
             (interchangeable). Default ``RoundUp`` (industry default:
             NV ROUND_UP / DSv4 Pro / FlashInfer / torchao RCEIL).
-            See :class:`MxScaleRoundMode` and ``csrc/kernels/quant.md``
-            "Cross-Stack Mode Alignment Reference" for the four
-            formulas and cross-stack mapping. (Note: ``Even`` mode uses
+            See :class:`MxScaleRoundMode` for the four formulas and
+            cross-stack mapping. (Note: ``Even`` mode uses
             HW builtin RNE on gfx950 vs SW round-half-away on gfx942.)
         e8m0_shuffle: Apply HW e8m0 scale shuffling layout.
         a16w4_shuffle: Apply A16W4 weight shuffling.

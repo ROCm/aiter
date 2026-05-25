@@ -59,10 +59,6 @@ def mxfp4_to_f32(x):
 # ``MxScaleRoundMode`` enum (csrc/include/mx_quant_utils.h) and the
 # FlyDSL IR-builder helpers in
 # ``aiter/ops/flydsl/kernels/quant_utils.py::emit_mx_e8m0_scale``.
-#
-# See ``csrc/kernels/quant.md`` "Cross-Stack Mode Alignment Reference"
-# for the full table mapping these to torchao / NV Triton / DSv4 /
-# FlashInfer / AMD Quark naming.
 # ---------------------------------------------------------------------------
 
 
@@ -97,10 +93,9 @@ def f32_to_mx_e8m0_scale(
     only selects ``target_max_pow2`` / ``max_pos`` / ``mbits`` constants
     from :data:`_DTYPE_CFG`.
 
-    See :class:`MxScaleRoundMode` (``aiter.utility.mx_types``) and
-    ``csrc/kernels/quant.md`` "Cross-Stack Mode Alignment Reference"
-    for the four formulas and cross-stack mapping (PyTorch torchao / NV
-    / DSv4 / FlashInfer / AMD Quark naming).
+    See :class:`MxScaleRoundMode` (``aiter.utility.mx_types``) for the four
+    formulas and cross-stack mapping (PyTorch torchao / NV / DSv4 /
+    FlashInfer / AMD Quark naming).
 
     Args:
         amax: f32 (or castable) tensor of per-block ``max(|x|)`` values.

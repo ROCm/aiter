@@ -21,8 +21,8 @@ Importers:
   - ``aiter.ops.quant``                   (Python user-facing quant ops)
   - ``aiter.ops.flydsl.kernels.quant_utils`` (FlyDSL IR builders)
 
-See ``csrc/kernels/quant.md`` "Cross-Stack Mode Alignment Reference" for
-the full table mapping these to torchao / NV / DSv4 / FlashInfer / Quark.
+Cross-stack naming aligns with PyTorch torchao ``ScaleCalculationMode``,
+NV Triton, DSv4, FlashInfer, and AMD Quark ``RoundMode``.
 """
 
 from ..jit.core import compile_ops

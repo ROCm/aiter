@@ -13,7 +13,7 @@ namespace aiter {
 //
 // Names follow AMD Quark's RoundMode for AMD-side familiarity. Each value is
 // 1:1 mathematically equivalent to a PyTorch torchao ScaleCalculationMode
-// (see csrc/kernels/quant.md "Cross-Stack Mode Alignment Reference"):
+// (cross-stack mapping):
 //   Quark RoundMode (this enum) <-> torchao ScaleCalculationMode
 //   RoundDown                   <-> FLOOR
 //   RoundUp                     <-> RCEIL

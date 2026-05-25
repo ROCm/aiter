@@ -17,10 +17,10 @@ and are dtype-agnostic across the whole MX format family
 PyTorch torchao's and the HIP-side ``MxScaleRoundMode`` design (see
 ``csrc/include/mx_quant_utils.h`` and ``aiter.ops.quant.MxScaleRoundMode``).
 
-See ``csrc/kernels/quant.md`` "Cross-Stack Mode Alignment Reference" for the
-full table mapping these to PyTorch torchao / NV Triton / DSv4 / FlashInfer
-/ AMD Quark naming, and ``aiter/utility/fp4_utils.py`` for the CPU torch
-reference implementations.
+See :class:`MxScaleRoundMode` (``aiter.utility.mx_types``) and
+``aiter/utility/fp4_utils.py`` for cross-stack naming (PyTorch torchao /
+NV Triton / DSv4 / FlashInfer / AMD Quark) and CPU torch reference
+implementations.
 """
 
 from flydsl.expr import arith
@@ -67,10 +67,9 @@ def emit_mx_e8m0_scale(
     ``dtype`` only selects ``target_max_pow2`` / ``max_pos`` / ``mbits``
     constants from :data:`_DTYPE_CFG`.
 
-    See :class:`MxScaleRoundMode` (``aiter.utility.mx_types``) and
-    ``csrc/kernels/quant.md`` "Cross-Stack Mode Alignment Reference"
-    for the four formulas and cross-stack mapping (PyTorch torchao / NV
-    / DSv4 / FlashInfer / AMD Quark naming).
+    See :class:`MxScaleRoundMode` (``aiter.utility.mx_types``) for the four
+    formulas and cross-stack mapping (PyTorch torchao / NV / DSv4 /
+    FlashInfer / AMD Quark naming).
 
     Args:
         local_max: f32 IR value, the (warp-reduced) ``max(|x|)`` of one
