@@ -113,9 +113,17 @@ Row = Dict[str, str]
 Key = Tuple[Tuple[str, str], ...]
 
 
-def _read_csv(path: Path) -> Tuple[Dict[Key, Row], Tuple[str, ...]]:
-    """Return ({key: row}, key_col_order). Whitespace stripped from values."""
-    rows: Dict[Key, Row] = {}
+def _normalize_row(raw: Row) -> Row:
+    """Strip whitespace and coerce missing CSV fields to empty strings."""
+    return {
+        k: ("" if v is None else v.strip() if isinstance(v, str) else str(v))
+        for k, v in raw.items()
+        if k is not None
+    }
+
+
+def _read_csv_rows(path: Path) -> Tuple[list[Row], Tuple[str, ...]]:
+    """Return (rows, fieldnames). Whitespace stripped from values."""
     if not path.exists():
         raise SystemExit(f"input csv not found: {path}")
     with path.open(newline="") as f:
@@ -125,14 +133,28 @@ def _read_csv(path: Path) -> Tuple[Dict[Key, Row], Tuple[str, ...]]:
                 f"{path} missing required column `{METRIC}`; "
                 f"got columns: {reader.fieldnames}"
             )
-        key_cols = tuple(c for c in reader.fieldnames if c not in NON_KEY)
-        for raw in reader:
-            # Strip whitespace from every value to avoid silent join misses
-            # caused by trailing/leading spaces.
-            raw = {k: (v.strip() if isinstance(v, str) else v) for k, v in raw.items()}
-            key = tuple(sorted((c, raw.get(c, "")) for c in key_cols))
-            rows[key] = raw
-    return rows, key_cols
+        rows = [_normalize_row(raw) for raw in reader]
+    return rows, tuple(reader.fieldnames)
+
+
+def _key_cols(base_cols: Tuple[str, ...], cur_cols: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Stable key column order across baseline/current schema drift."""
+    cols = []
+    seen = set()
+    for col in (*base_cols, *cur_cols):
+        if col in NON_KEY or col in seen:
+            continue
+        cols.append(col)
+        seen.add(col)
+    return tuple(cols)
+
+
+def _index_rows(rows: list[Row], key_cols: Tuple[str, ...]) -> Dict[Key, Row]:
+    indexed: Dict[Key, Row] = {}
+    for row in rows:
+        key = tuple(sorted((c, row.get(c, "")) for c in key_cols))
+        indexed[key] = row
+    return indexed
 
 
 def _parse_us(raw: Row) -> float | None:
@@ -212,8 +234,11 @@ def main() -> int:
     if args.warn >= args.fail:
         raise SystemExit(f"--warn ({args.warn}) must be < --fail ({args.fail})")
 
-    baseline, _ = _read_csv(args.baseline_csv)
-    current, key_cols = _read_csv(args.current_csv)
+    baseline_rows, baseline_cols = _read_csv_rows(args.baseline_csv)
+    current_rows, current_cols = _read_csv_rows(args.current_csv)
+    key_cols = _key_cols(baseline_cols, current_cols)
+    baseline = _index_rows(baseline_rows, key_cols)
+    current = _index_rows(current_rows, key_cols)
 
     print(f"=== Tuned op bench: {args.current_label} vs {args.baseline_label} ===")
     print(f"  baseline: {args.baseline_csv}  ({len(baseline)} rows)")

@@ -12,6 +12,7 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter import hipb_mm, hipb_create_extension
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx, get_cu_num
+from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 import pandas as pd
 import argparse
 from functools import lru_cache
@@ -409,7 +410,7 @@ def test_skinny_gemm_a8w8_pertoken_quant():
 
 
 def _iter_flydsl_csv_cases():
-    """Yield test_gemm kwargs for every flydsl row in the merged bpreshuffle tuned CSV."""
+    """Yield (test_gemm kwargs, bench metadata) for flydsl tuned CSV rows."""
     gfx, cu = get_gfx(), get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
     df = pd.read_csv(merged_csv)
@@ -423,14 +424,21 @@ def _iter_flydsl_csv_cases():
     )
     for _, row in rows.iterrows():
         q_dtype = dtypes.fp8 if "float8" in str(row["q_dtype_w"]) else dtypes.i8
-        yield dict(
-            dtype=dtypes.bf16,
-            m=int(row["M"]),
-            n=int(row["N"]),
-            k=int(row["K"]),
-            quantDtype=q_dtype,
-            pad_a=128,
-            skip_ck=True,
+        yield (
+            dict(
+                dtype=dtypes.bf16,
+                m=int(row["M"]),
+                n=int(row["N"]),
+                k=int(row["K"]),
+                quantDtype=q_dtype,
+                pad_a=128,
+                skip_ck=True,
+            ),
+            {
+                "source": "flydsl_csv",
+                "libtype": str(row.get("libtype", "")),
+                "kernelName1": str(row.get("kernelName", "")),
+            },
         )
 
 
@@ -558,8 +566,21 @@ parser.add_argument(
 args = parser.parse_args()
 
 if not args.no_flydsl_csv:
-    for kwargs in _iter_flydsl_csv_cases():
-        test_gemm(**kwargs)
+    bench_csv = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
+    for kwargs, extras in _iter_flydsl_csv_cases():
+        ret = test_gemm(**kwargs)
+        ret.update(extras)
+        written = append_tuned_op_bench_rows(
+            bench_csv,
+            [ret],
+            op_name="gemm_a8w8",
+        )
+        if written:
+            aiter.logger.info(
+                "gemm_a8w8: appended %d tuned op bench row(s) to %s",
+                written,
+                bench_csv,
+            )
 
 if not args.no_legacy:
     if args.csv is not None:

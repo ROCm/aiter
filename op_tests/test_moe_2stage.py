@@ -30,6 +30,7 @@ from aiter.fused_moe import (
 from aiter.aot.flydsl.common import fail_on_aot_cache_miss
 from aiter.ops.flydsl.moe_common import GateMode
 import aiter.ops.flydsl.moe_kernels as _aiter_mk
+from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 
 
 from aiter.ops.shuffle import (
@@ -819,23 +820,25 @@ if not args.no_legacy:
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
-if _csv_out and os.path.exists(_csv_out):
-    os.remove(_csv_out)
 
 
 def _write_bench_csv(rows):
     if not _csv_out or len(rows) == 0:
         return
-    csv_df = pd.DataFrame(rows)
-    if "model" in csv_df.columns:
-        csv_df = csv_df[csv_df["model"] != "legacy"].copy()
-    else:
-        csv_df = csv_df.copy()
-    if len(csv_df) == 0:
+    row = rows[-1]
+    if row.get("model") == "legacy":
         return
-    csv_df = csv_df.drop(columns=["logits_diff"], errors="ignore")
-    csv_df.to_csv(_csv_out, index=False)
-    aiter.logger.info("moe_2stage: wrote %d csv-mode rows to %s", len(csv_df), _csv_out)
+    written = append_tuned_op_bench_rows(
+        _csv_out,
+        [row],
+        op_name="moe_2stage",
+        metric_cols=("us",),
+        default_impl="fused_moe",
+    )
+    if written:
+        aiter.logger.info(
+            "moe_2stage: appended %d tuned op bench row(s) to %s", written, _csv_out
+        )
 
 
 df = []

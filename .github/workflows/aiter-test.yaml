@@ -795,12 +795,37 @@ jobs:
               echo "found=false" >> "$GITHUB_OUTPUT"
               exit 0
           fi
-          if [[ ${#csv_files[@]} -gt 1 ]]; then
-              echo "::warning::Multiple tuned op benchmark CSVs found, using first: ${csv_files[0]}"
-              printf '  %s\n' "${csv_files[@]}"
-          fi
-          cp "${csv_files[0]}" /tmp/current.csv
-          echo "Current CSV: ${csv_files[0]} ($(wc -l < /tmp/current.csv) lines)"
+          echo "Merging tuned op benchmark CSVs:"
+          printf '  %s\n' "${csv_files[@]}"
+          python3 - "${csv_files[@]}" <<'PY'
+          import csv
+          import sys
+
+          rows = []
+          fieldnames = []
+          seen = set()
+          for path in sys.argv[1:]:
+              with open(path, newline="") as f:
+                  reader = csv.DictReader(f)
+                  if not reader.fieldnames:
+                      continue
+                  for name in reader.fieldnames:
+                      if name not in seen:
+                          fieldnames.append(name)
+                          seen.add(name)
+                  rows.extend(reader)
+
+          if "us" not in seen:
+              raise SystemExit("merged tuned op benchmark CSV is missing required `us` column")
+
+          with open("/tmp/current.csv", "w", newline="") as f:
+              writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+              writer.writeheader()
+              for row in rows:
+                  writer.writerow({name: row.get(name, "") for name in fieldnames})
+          print(f"Merged {len(rows)} row(s) into /tmp/current.csv")
+          PY
+          echo "Current merged CSV: /tmp/current.csv ($(wc -l < /tmp/current.csv) lines)"
           echo "found=true" >> "$GITHUB_OUTPUT"
 
       # ── PR path: compare vs baseline ──
@@ -819,8 +844,7 @@ jobs:
       - name: Fallback — fetch baseline from latest main
         if: >-
           steps.current.outputs.found == 'true' &&
-          github.event_name == 'pull_request' &&
-          steps.baseline_pinned.outcome != 'success'
+          github.event_name == 'pull_request'
         id: baseline_main
         continue-on-error: true
         uses: dawidd6/action-download-artifact@v3
@@ -838,7 +862,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           CURR_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          set -e
+          set -euo pipefail
           baseline_csv=""
           if [[ -f /tmp/baseline_pinned/tuned_op_bench.csv ]]; then
               baseline_csv=/tmp/baseline_pinned/tuned_op_bench.csv
