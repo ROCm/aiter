@@ -3,7 +3,7 @@
 """Correctness + performance tests for fmha_fwd_f16 (BF16 ASM, gfx1250).
 
 Public API:    aiter.flash_attn_func          (preferred)
-Ops layer:     aiter.fmha_fwd_f16_asm         (low-level, ~v3 style)
+Ops layer:     aiter.fmha_fwd_with_sink_asm         (low-level, ~v3 style)
 
 
 Layout convention used in tests
@@ -278,11 +278,11 @@ def run_kernel(
 ):
     """Call the kernel and return (out, lse).
 
-    via = "ops"        → low-level aiter.fmha_fwd_f16_asm
+    via = "ops"        → low-level aiter.fmha_fwd_with_sink_asm
     via = "public"     → public aiter.flash_attn_func (dispatcher → asm path)
     """
     if via == "ops":
-        return aiter.fmha_fwd_f16_asm(
+        return aiter.fmha_fwd_with_sink_asm(
             q,
             k,
             v,
@@ -507,7 +507,7 @@ def test_fmha_fwd_f16_d64_requires_sink():
     # is_causal=True because only causal kernels are registered in the CSV;
     # the error path being tested (D64 + sink=None) is orthogonal to causal.
     with pytest.raises(RuntimeError, match="D64.*sink"):
-        aiter.fmha_fwd_f16_asm(q, k, v, scale, True, True, sink=None)
+        aiter.fmha_fwd_with_sink_asm(q, k, v, scale, True, True, sink=None)
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +572,7 @@ def test_fmha_fwd_f16_layout(layout, head_dim):
 
 # ---------------------------------------------------------------------------
 # Integration test: aiter.flash_attn_func -> mha._flash_attn_forward dispatcher
-# -> our fmha_fwd_f16_asm branch.  Verifies the public-API path on gfx1250
+# -> our fmha_fwd_with_sink_asm branch.  Verifies the public-API path on gfx1250
 # matches a direct ops-layer call bit-for-bit (same kernel, same args).
 # ---------------------------------------------------------------------------
 
@@ -626,7 +626,7 @@ def test_fmha_fwd_f16_via_flash_attn_func(head_dim, is_causal):
     do = (out_via.float() - out_direct.float()).abs().max().item()
     dl = (lse_via.float() - lse_direct.float()).abs().max().item()
     assert do == 0.0, (
-        f"flash_attn_func != fmha_fwd_f16_asm "
+        f"flash_attn_func != fmha_fwd_with_sink_asm "
         f"(d={head_dim}, causal={is_causal})  max|dO|={do}"
     )
     assert dl == 0.0, (
@@ -642,8 +642,8 @@ def test_fmha_fwd_f16_via_flash_attn_func(head_dim, is_causal):
 
 # Initialization patterns for perf q/k/v buffers.
 #   "randn"     : standard normal (default; exercises real attention math).
-#   "const0.25" : fill every element with 0.25 — matches poc_kl
-#                 fmha_batch_init `init_pattern=10` used in cpp perf runs.
+#   "const0.25" : fill every element with 0.25 — matches the cpp perf-test
+#                 init pattern (`init_pattern=10`) used in cpp perf runs.
 #                 Useful when comparing pytest perf numbers to a cpp baseline
 #                 that was produced with constant-fill inputs (rules out any
 #                 perf swings caused by data-dependent kernel behavior, e.g.
@@ -722,7 +722,7 @@ def test_fmha_fwd_f16_perf(head_dim, is_causal, init):
     sink = _d64_sink(hq, device) if head_dim == 64 else None
 
     us = _bench(
-        aiter.fmha_fwd_f16_asm,
+        aiter.fmha_fwd_with_sink_asm,
         q,
         k,
         v,
@@ -839,7 +839,7 @@ def run_cli(
 
     if do_perf:
         us = _bench(
-            aiter.fmha_fwd_f16_asm,
+            aiter.fmha_fwd_with_sink_asm,
             q,
             k,
             v,
@@ -868,7 +868,7 @@ def run_cli(
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
-    description="Run aiter.fmha_fwd_f16_asm on a single shape and dump kernel args.",
+    description="Run aiter.fmha_fwd_with_sink_asm on a single shape and dump kernel args.",
 )
 parser.add_argument("-b", "--batch", type=int, default=1, help="batch size (default 1)")
 parser.add_argument(

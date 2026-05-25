@@ -271,7 +271,7 @@ def fmha_v3_fwd(
 
 
 # ---------------------------------------------------------------------------
-# fmha_fwd_f16 (BF16 ASM, gfx1250) — single-shot batched FMHA forward.
+# fmha_fwd_with_sink_asm (gfx1250) — single-shot batched FMHA forward.
 #
 # API contract: q/k/v are **bshd shape** ([batch, seq, head, dim]); strides are
 # read directly from the tensor so non-contiguous bshd-shaped views (e.g. of
@@ -282,15 +282,15 @@ def fmha_v3_fwd(
 # Memory-allocation policy: all GPU tensors (out, lse, sink) are allocated on
 # the Python side; the C++ entry point performs only pointer + stride
 # bookkeeping and kernel launch (no torch dependency).  The public wrapper
-# `fmha_fwd_f16_asm` below handles allocation and the AITER-post-scale →
+# `fmha_fwd_with_sink_asm` below handles allocation and the AITER-post-scale →
 # kernel-pre-scale conversion for sink (multiply by sqrt(qk_head_dim)).
 # ---------------------------------------------------------------------------
 @compile_ops(
-    "module_fmha_fwd_f16_asm",
-    fc_name="fmha_fwd_f16_asm",
+    "module_fmha_fwd_with_sink_asm",
+    fc_name="fmha_fwd_with_sink_asm",
     ffi_type="ctypes",
 )
-def _fmha_fwd_f16_asm(
+def _fmha_fwd_with_sink_asm(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -303,7 +303,7 @@ def _fmha_fwd_f16_asm(
 ) -> None: ...
 
 
-def fmha_fwd_f16_asm(
+def fmha_fwd_with_sink_asm(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -348,7 +348,7 @@ def fmha_fwd_f16_asm(
         sink_for_kernel = (sink * (qk_head_dim**0.5)).to(torch.float32).contiguous()
     elif qk_head_dim == 64:
         raise RuntimeError(
-            "fmha_fwd_f16_asm: D64 kernels require an explicit `sink` tensor "
+            "fmha_fwd_with_sink_asm: D64 kernels require an explicit `sink` tensor "
             f"of shape [q_head_num]={q_head_num} fp32 (AITER post-scale "
             "convention). Pass `sink=torch.zeros(q_head_num, dtype=torch.float32)` "
             "if you want a zero-logit sink."
@@ -357,7 +357,7 @@ def fmha_fwd_f16_asm(
         # D128: kernel never reads sink contents but slot must be non-null.
         sink_for_kernel = torch.zeros(q_head_num, dtype=torch.float32, device=q.device)
 
-    _fmha_fwd_f16_asm(
+    _fmha_fwd_with_sink_asm(
         q,
         k,
         v,
@@ -1425,8 +1425,8 @@ def _flash_attn_forward(
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         return ret
 
-    def can_impl_fmha_fwd_f16():
-        # gfx1250 ASM bf16 forward (fmha_fwd_f16_asm).  Single-shot batched
+    def can_impl_fmha_fwd_with_sink_asm():
+        # gfx1250 ASM bf16 forward (fmha_fwd_with_sink_asm).  Single-shot batched
         # (no varlen / dropout / swa / quant / alibi / bias).  Sink logits
         # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
         ret = get_gfx() == "gfx1250"
@@ -1459,11 +1459,11 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_q", cu_seqlens_q)
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
-    if can_impl_fmha_fwd_f16():
+    if can_impl_fmha_fwd_with_sink_asm():
         # gfx1250 ASM bf16 path: q/k/v are bshd; kernel reads strides directly,
         # no API-side permute.  softmax_scale is forwarded as-is (kernel applies
         # it internally to Q·K^T).  sink_ptr is in AITER post-scale convention;
-        # the public `fmha_fwd_f16_asm` wrapper multiplies it by
+        # the public `fmha_fwd_with_sink_asm` wrapper multiplies it by
         # sqrt(qk_head_dim) and auto-fills the D64 zero-sink case internally,
         # so we just forward the user's sink_ptr here.
         sink_for_kernel = sink_ptr
@@ -1471,7 +1471,7 @@ def _flash_attn_forward(
             # D64 kernels always read SINK; pass an explicit zero-logit so the
             # wrapper does not raise on us.
             sink_for_kernel = torch.zeros(nhead_q, dtype=torch.float32, device=q.device)
-        out_, softmax_lse = fmha_fwd_f16_asm(
+        out_, softmax_lse = fmha_fwd_with_sink_asm(
             q,
             k,
             v,

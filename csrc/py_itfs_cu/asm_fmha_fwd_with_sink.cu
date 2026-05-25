@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// ASM FMHA forward (BF16, gfx1250) — ported from poc_kl fmha_fwd_f16.
+// ASM FMHA forward (BF16, gfx1250).
 //
 // Layout: q/k/v expected in **bshd shape** ([batch, seq, head, dim]).  The
 // kernel reads per-dim strides directly from the input tensor, so callers may
@@ -29,12 +29,11 @@
 #include <cmath>
 #include <memory>
 
-// Kernel argument block — packed ABI (132 B = 0x84), matches
-// FmhaFwdKernelArgsBase in poc_kl/mi400/fmha_fwd_f16/fmha_fwd_f16.cpp
-// and the .args YAML emitted into the v8 .s patched HSA metadata.
+// Kernel argument block — packed ABI (132 B = 0x84), matches the .args YAML
+// emitted into the v8 .s patched HSA metadata.
 //
-// Field names mirror poc_kl: short names (d_addr / q_seqs / k_hs / ...)
-// rather than the older 528-B slot-padded layout we used pre-v8.
+// Field naming uses short forms (d_addr / q_seqs / k_hs / ...) rather than
+// the older 528-B slot-padded layout we used pre-v8.
 //
 //   d   = output O
 //   q/k/v_seqs = stride along seq dim (bytes)
@@ -81,7 +80,7 @@ struct KernelArgs
 };
 #pragma pack(pop)
 static_assert(sizeof(KernelArgs) == 0x84,
-              "fmha_fwd_f16_asm: KernelArgs must be 132B packed (matches v8 .args)");
+              "fmha_fwd_with_sink_asm: KernelArgs must be 132B packed (matches v8 .args)");
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -107,7 +106,7 @@ static std::string get_heuristic_kernel_fmha_fwd_f16(const std::string& dtype,
         return el.first;
     }
     AITER_CHECK(false,
-                "fmha_fwd_f16_asm: no kernel for dtype=", dtype,
+                "fmha_fwd_with_sink_asm: no kernel for dtype=", dtype,
                 " hdim_q=", hdim_q, " hdim_v=", hdim_v,
                 " mask=", mask_flag,
                 " arch=", arch_id);
@@ -135,7 +134,7 @@ AITER_CTYPES_ERROR_DEF
 //        slot must still be a valid non-null pointer of the right size, but
 //        contents are ignored — pass a zero buffer.
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
-    fmha_fwd_f16_asm,
+    fmha_fwd_with_sink_asm,
     (aiter_tensor_t* q,
      aiter_tensor_t* k,
      aiter_tensor_t* v,
@@ -151,25 +150,25 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // ---- arch + dtype validation ------------------------------------------
     const std::string arch_id = get_gpu_arch();
     AITER_CHECK(arch_id == "gfx1250",
-                "fmha_fwd_f16_asm: only supported on gfx1250, got ", arch_id);
+                "fmha_fwd_with_sink_asm: only supported on gfx1250, got ", arch_id);
 
     AITER_CHECK(q && k && v && out && lse && sink,
-                "fmha_fwd_f16_asm: q/k/v/out/lse/sink must all be non-null");
+                "fmha_fwd_with_sink_asm: q/k/v/out/lse/sink must all be non-null");
     AITER_CHECK(q->dtype() == AITER_DTYPE_bf16 &&
                 k->dtype() == AITER_DTYPE_bf16 &&
                 v->dtype() == AITER_DTYPE_bf16,
-                "fmha_fwd_f16_asm: q/k/v must be bf16");
+                "fmha_fwd_with_sink_asm: q/k/v must be bf16");
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16,
-                "fmha_fwd_f16_asm: out must be bf16");
+                "fmha_fwd_with_sink_asm: out must be bf16");
     AITER_CHECK(lse->dtype() == AITER_DTYPE_fp32,
-                "fmha_fwd_f16_asm: lse must be fp32");
+                "fmha_fwd_with_sink_asm: lse must be fp32");
     AITER_CHECK(sink->dtype() == AITER_DTYPE_fp32,
-                "fmha_fwd_f16_asm: sink must be fp32");
+                "fmha_fwd_with_sink_asm: sink must be fp32");
 
     AITER_CHECK(q->dim() == 4 && k->dim() == 4 && v->dim() == 4,
-                "fmha_fwd_f16_asm: q/k/v must be 4-D tensors (bshd shape)");
+                "fmha_fwd_with_sink_asm: q/k/v must be 4-D tensors (bshd shape)");
     AITER_CHECK(q->stride(-1) == 1 && k->stride(-1) == 1 && v->stride(-1) == 1,
-                "fmha_fwd_f16_asm: q/k/v must have contiguous last dim");
+                "fmha_fwd_with_sink_asm: q/k/v must have contiguous last dim");
 
     // ---- dimension extraction (bshd) ---------------------------------------
     const int batch        = (int)q->size(0);
@@ -181,39 +180,42 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int kv_head_num  = (int)k->size(2);
     const int v_head_dim   = (int)v->size(3);
 
-    AITER_CHECK((int)k->size(0) == batch,        "fmha_fwd_f16_asm: k batch mismatch");
-    AITER_CHECK((int)v->size(0) == batch,        "fmha_fwd_f16_asm: v batch mismatch");
-    AITER_CHECK((int)k->size(3) == qk_head_dim,  "fmha_fwd_f16_asm: k head_dim mismatch");
-    AITER_CHECK((int)v->size(1) == kv_seq_len,   "fmha_fwd_f16_asm: v seq_len mismatch with k");
-    AITER_CHECK((int)v->size(2) == kv_head_num,  "fmha_fwd_f16_asm: v head_num mismatch with k");
-    AITER_CHECK(q_head_num % kv_head_num == 0,   "fmha_fwd_f16_asm: q_head_num must be a multiple of kv_head_num");
+    AITER_CHECK((int)k->size(0) == batch,        "fmha_fwd_with_sink_asm: k batch mismatch");
+    AITER_CHECK((int)v->size(0) == batch,        "fmha_fwd_with_sink_asm: v batch mismatch");
+    AITER_CHECK((int)k->size(3) == qk_head_dim,  "fmha_fwd_with_sink_asm: k head_dim mismatch");
+    AITER_CHECK((int)v->size(1) == kv_seq_len,   "fmha_fwd_with_sink_asm: v seq_len mismatch with k");
+    AITER_CHECK((int)v->size(2) == kv_head_num,  "fmha_fwd_with_sink_asm: v head_num mismatch with k");
+    AITER_CHECK(q_head_num % kv_head_num == 0,   "fmha_fwd_with_sink_asm: q_head_num must be a multiple of kv_head_num");
     AITER_CHECK(qk_head_dim == 64 || qk_head_dim == 128,
-                "fmha_fwd_f16_asm: only head_dim 64 or 128 supported, got ", qk_head_dim);
+                "fmha_fwd_with_sink_asm: only head_dim 64 or 128 supported, got ", qk_head_dim);
     AITER_CHECK(v_head_dim == qk_head_dim,
-                "fmha_fwd_f16_asm: v_head_dim must equal qk_head_dim");
+                "fmha_fwd_with_sink_asm: v_head_dim must equal qk_head_dim");
 
     AITER_CHECK(out->dim() == 4 &&
                 (int)out->size(0) == batch    && (int)out->size(1) == q_seq_len &&
                 (int)out->size(2) == q_head_num && (int)out->size(3) == v_head_dim,
-                "fmha_fwd_f16_asm: out shape must be [batch, q_seq_len, q_head_num, v_head_dim]");
+                "fmha_fwd_with_sink_asm: out shape must be [batch, q_seq_len, q_head_num, v_head_dim]");
     AITER_CHECK(out->stride(-1) == 1,
-                "fmha_fwd_f16_asm: out must have contiguous last dim");
+                "fmha_fwd_with_sink_asm: out must have contiguous last dim");
 
     AITER_CHECK(lse->dim() == 3 &&
                 (int)lse->size(0) == batch &&
                 (int)lse->size(1) == q_head_num &&
                 (int)lse->size(2) == q_seq_len,
-                "fmha_fwd_f16_asm: lse shape must be [batch, q_head_num, q_seq_len]");
+                "fmha_fwd_with_sink_asm: lse shape must be [batch, q_head_num, q_seq_len]");
 
     AITER_CHECK(sink->dim() == 1 && (int)sink->size(0) == q_head_num,
-                "fmha_fwd_f16_asm: sink must be 1-D with size q_head_num (", q_head_num, ")");
+                "fmha_fwd_with_sink_asm: sink must be 1-D with size q_head_num (", q_head_num, ")");
 
     const int gqa       = q_head_num / kv_head_num;
     const int mask_flag = is_causal ? 1 : 0;
 
     // ---- stride extraction (in bytes), bshd dim layout --------------------
     // bshd: dim0=b, dim1=s, dim2=h, dim3=d
-    const int elem_size = (int)q->element_size();  // 2 for bf16
+    // q/k/v and out element sizes are tracked separately so future f8-input /
+    // bf16-output configurations can use this same stride-extraction block.
+    const int elem_size   = (int)q->element_size();    // qkv element size (2 for bf16, 1 for f8)
+    const int elem_size_o = (int)out->element_size();  // out element size (2 for bf16)
 
     const int stride_q_batch = (int)q->stride(0) * elem_size;
     const int stride_q_seq   = (int)q->stride(1) * elem_size;
@@ -227,17 +229,16 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int stride_v_seq   = (int)v->stride(1) * elem_size;
     const int stride_v_head  = (int)v->stride(2) * elem_size;
 
-    const int stride_o_batch = (int)out->stride(0) * elem_size;
-    const int stride_o_seq   = (int)out->stride(1) * elem_size;
-    const int stride_o_head  = (int)out->stride(2) * elem_size;
+    const int stride_o_batch = (int)out->stride(0) * elem_size_o;
+    const int stride_o_seq   = (int)out->stride(1) * elem_size_o;
+    const int stride_o_head  = (int)out->stride(2) * elem_size_o;
 
     const int sub_Q           = 128;  // ts_qo: Q-tile size used by all kernels
     const int stride_q_tg     = sub_Q * stride_q_seq;
     const int stride_lse_head = q_seq_len * (int)sizeof(float);  // fixed layout
 
     // ---- kernel args -------------------------------------------------------
-    // ABI = FmhaFwdKernelArgsBase from poc_kl/mi400/fmha_fwd_f16/fmha_fwd_f16.cpp
-    // (132 B packed).  Field naming follows the poc_kl source-of-truth.
+    // 132 B packed KernelArgs (see `struct KernelArgs` above for ABI layout).
     KernelArgs args;
     memset(&args, 0, sizeof(args));
     args.d_addr     = out->data_ptr();
@@ -255,8 +256,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.k_seqs     = stride_k_seq;
     args.k_hs       = stride_k_head;
     args.k_bas      = stride_k_batch;
-    // s_opt SGPR: packs three host-side switches.  Bit layout matches
-    // poc_kl/.../fmha_fwd_f16.cpp::opt_packed and the S_OPT_BIT_* defines:
+    // s_opt SGPR: packs three host-side switches.  Bit layout:
     //   bit0: reverse_kv   (compile-time gated by CAS_MASK build; ignored by mask=0 kernels)
     //   bit1: double_q     (compile-time gated by DOUBLE_Q   build; ignored by non-_dq kernels)
     //   bit2: remap_xy     (must be 1 — we swap gdx/gdy at launch below)
@@ -290,7 +290,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         dtype, qk_head_dim, v_head_dim, mask_flag, arch_id, cfg_map);
     auto it = cfg_map->find(kernel_key);
     AITER_CHECK(it != cfg_map->end(),
-                "fmha_fwd_f16_asm: kernel not found in CFG: ", kernel_key);
+                "fmha_fwd_with_sink_asm: kernel not found in CFG: ", kernel_key);
 
     const char* name    = it->second.knl_name.c_str();
     const char* co_name = it->second.co_name.c_str();
@@ -300,7 +300,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // ---- launch ------------------------------------------------------------
     // gdx = ceil(q_seq_len / sub_Q) is the total number of Q-tiles to compute.
     // When s_opt bit1 (double_q) is set, each WG processes 2 Q-tiles internally,
-    // so launch_gdx must be halved.  Mirrors poc_kl fmha_fwd_f16.cpp:
+    // so launch_gdx must be halved:
     //   int tg_div = (double_q != 0) ? 2 : 1;
     //   global_size_x = (q_tile_count + tg_div - 1) / tg_div * blockSizeX;
     // The four shipped _brd v8 kernel binaries all support runtime double_q=1
