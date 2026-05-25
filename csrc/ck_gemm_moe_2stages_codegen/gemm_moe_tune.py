@@ -2131,7 +2131,7 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
-    def run_config(self, args, target_fused_moe = None, try_extra_ref = False):
+    def run_config(self, args, target_fused_moe=None, try_extra_ref=False):
         from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import run_perftest, checkAllclose
 
@@ -2306,61 +2306,78 @@ class FmoeTuner(TunerCommon):
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
                 )
-                err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
-                if try_extra_ref:
-                    # try compare with extra references (due to different implementations)
-                    try:
-                        # use weight-decompression only algorithm as second reference
-                        w1_deq = w1_qt.to(dtype=hidden.dtype) * w1_scale.view(w1_scale.shape[0], -1, 1).to(dtype=hidden.dtype)
-                        w2_deq = w2_qt.to(dtype=hidden.dtype) * w2_scale.view(w2_scale.shape[0], -1, 1).to(dtype=hidden.dtype)
-
-                        ref2 = self.torch_moe_2stages(
-                            hidden,
-                            w1_deq,
-                            w2_deq,
-                            topk_weights,
-                            topk_ids,
-                            dtype=dtype,
-                            activation=act_type,
-                            quant_type=QuantType.No,
-                            doweight_stage1=doweight_stage1,
-                        )
-                        err_ratio2 = checkAllclose(out, ref2, msg=f"run_config {shape_str}")
-                        err_ratio = min(err_ratio, err_ratio2)
-                    except:
-                        pass
-
-                    if q_type == QuantType.per_Tensor:
+                if out.count_nonzero() == 0 and ref.count_nonzero() > 0:
+                    status = "error:output is all zeros (kernel produced no output)"
+                    err_ratio = 1.0
+                else:
+                    err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                    if try_extra_ref:
+                        # try compare with extra references (due to different implementations)
                         try:
-                            # inputs are quantized per-Token while weights are quantized per-Tensor
-                            a1_qt, a1_scale = aiter.get_torch_quant(QuantType.per_Token)(hidden, quant_dtype=q_dtype_a)                        
+                            # use weight-decompression only algorithm as second reference
+                            w1_deq = w1_qt.to(dtype=hidden.dtype) * w1_scale.view(
+                                w1_scale.shape[0], -1, 1
+                            ).to(dtype=hidden.dtype)
+                            w2_deq = w2_qt.to(dtype=hidden.dtype) * w2_scale.view(
+                                w2_scale.shape[0], -1, 1
+                            ).to(dtype=hidden.dtype)
+
                             ref2 = self.torch_moe_2stages(
-                                a1_qt,
-                                w1_qt,
-                                w2_qt,
+                                hidden,
+                                w1_deq,
+                                w2_deq,
                                 topk_weights,
                                 topk_ids,
-                                a1_scale=a1_scale,
-                                w1_scale=w1_scale,
-                                w2_scale=w2_scale,                            
                                 dtype=dtype,
                                 activation=act_type,
-                                quant_type=QuantType.per_Token,
+                                quant_type=QuantType.No,
                                 doweight_stage1=doweight_stage1,
                             )
-                            err_ratio2 = checkAllclose(out, ref2, msg=f"run_config {shape_str}")
+                            err_ratio2 = checkAllclose(
+                                out, ref2, msg=f"run_config {shape_str}"
+                            )
                             err_ratio = min(err_ratio, err_ratio2)
-                        except:
+                        except Exception:
                             pass
 
-                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                        if q_type == QuantType.per_Tensor:
+                            try:
+                                # inputs are quantized per-Token while weights are quantized per-Tensor
+                                a1_qt, a1_scale = aiter.get_torch_quant(
+                                    QuantType.per_Token
+                                )(hidden, quant_dtype=q_dtype_a)
+                                ref2 = self.torch_moe_2stages(
+                                    a1_qt,
+                                    w1_qt,
+                                    w2_qt,
+                                    topk_weights,
+                                    topk_ids,
+                                    a1_scale=a1_scale,
+                                    w1_scale=w1_scale,
+                                    w2_scale=w2_scale,
+                                    dtype=dtype,
+                                    activation=act_type,
+                                    quant_type=QuantType.per_Token,
+                                    doweight_stage1=doweight_stage1,
+                                )
+                                err_ratio2 = checkAllclose(
+                                    out, ref2, msg=f"run_config {shape_str}"
+                                )
+                                err_ratio = min(err_ratio, err_ratio2)
+                            except Exception:
+                                pass
+
+                    if err_ratio <= args.errRatio:
+                        status = "ok"
+                    else:
+                        status = f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
                 results.append(
                     {
                         "shape": shape_str,
                         "e2e_us": us,
                         "kernel_us": kernel_us,
                         "status": status,
-                        "err_ratio" : err_ratio,
+                        "err_ratio": err_ratio,
                     }
                 )
             except Exception as e:
@@ -2370,7 +2387,7 @@ class FmoeTuner(TunerCommon):
                         "e2e_us": -1,
                         "kernel_us": kernel_us,
                         "status": f"error:{e}",
-                        "err_ratio" : 1
+                        "err_ratio": 1,
                     }
                 )
         return results
@@ -2899,7 +2916,7 @@ class FmoeTuner(TunerCommon):
         choosing best kernels based on (stage1_us + stage2_us) or (single_stage_us)
         may overlook some overheads between stages, and this e2e tune is a complement.
         """
-        results_base = self.run_config(args, target_fused_moe = None, try_extra_ref=True)
+        results_base = self.run_config(args, target_fused_moe=None, try_extra_ref=True)
         better_kernels = {}
         cu_num = self.get_cu_num()
 
@@ -2921,37 +2938,53 @@ class FmoeTuner(TunerCommon):
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
-            key = cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1            
-            keyname = ' '.join(map(str, row[self.keys].values))
+            key = (
+                cu_num,
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                act_type,
+                dtype,
+                q_dtype_a,
+                q_dtype_w,
+                q_type,
+                use_g1u1,
+                doweight_stage1,
+            )
+            keyname = " ".join(map(str, row[self.keys].values))
             better_kernels[i] = {
-                "name":keyname,
-                "key":key,
+                "name": keyname,
+                "key": key,
                 "row": row,
-                "kernel_name":None,
+                "kernel_name": None,
                 "e2e_us": e2e_us,
-                "err_ratio" : err_ratio,
+                "err_ratio": err_ratio,
                 "e2e_us_base": e2e_us,
-                "err_ratio_base" : err_ratio,
+                "err_ratio_base": err_ratio,
             }
             print(keyname, e2e_us, err_ratio)
 
         from functools import partial
 
-        def target_fused_moe(hidden_states,
-                            w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
-                            w2,  # [expert(local_expert:EP), dim, inter_dim]
-                            topk_weight,
-                            topk_ids,
-                            expert_mask=None,
-                            activation=ActivationType.Silu,
-                            quant_type=QuantType.No,
-                            doweight_stage1=False,
-                            w1_scale=None,
-                            w2_scale=None,
-                            num_local_tokens=None,
-                            moe_sorting_dispatch_policy=0,
-                            dtype=None,
-                            config_string=""):
+        def target_fused_moe(
+            hidden_states,
+            w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+            w2,  # [expert(local_expert:EP), dim, inter_dim]
+            topk_weight,
+            topk_ids,
+            expert_mask=None,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.No,
+            doweight_stage1=False,
+            w1_scale=None,
+            w2_scale=None,
+            num_local_tokens=None,
+            moe_sorting_dispatch_policy=0,
+            dtype=None,
+            config_string="",
+        ):
             return fused_moe_asmjit_aot(
                 hidden_states,
                 w1,
@@ -2965,19 +2998,24 @@ class FmoeTuner(TunerCommon):
                 expert_mask,
                 num_local_tokens,
                 moe_sorting_dispatch_policy,
-                config_string = config_string
+                config_string=config_string,
             )
+
         GREEN = "\033[0;32m"
         YELLOW = "\033[1;33m"
         RED = "\033[0;31m"
         END = "\033[0m"
         for config_string in get_tune_space():
-            results_cur = self.run_config(args, target_fused_moe = partial(target_fused_moe, config_string=config_string),try_extra_ref=True)
+            results_cur = self.run_config(
+                args,
+                target_fused_moe=partial(target_fused_moe, config_string=config_string),
+                try_extra_ref=True,
+            )
             block_m = 16
             ksplit = 0
             run_1stage = 1
-            err1="0%"
-            err2="0%"
+            err1 = "0%"
+            err2 = "0%"
             kernelName1 = "fused_moe_asmjit_aot__" + config_string
             kernelName2 = ""
             for i in range(len(self.untunedf)):
@@ -2987,10 +3025,14 @@ class FmoeTuner(TunerCommon):
                 err_ratio = results_cur[i]["err_ratio"]
                 # skip invalid kernel
                 if e2e_us < 0 or status != "ok":
-                    print(f"{k['name']} {RED} {e2e_us=:.3f} {status=} {END} {kernelName1}")
+                    print(
+                        f"{k['name']} {RED} {e2e_us=:.3f} {status=} {END} {kernelName1}"
+                    )
                     continue
                 row = self.untunedf.iloc[i]
-                print(f"{k['name']} {YELLOW} {float(k['e2e_us_base']):.3f}us -> {float(e2e_us):.3f}us (err: {k['err_ratio']*100:.0f}%) {END} {kernelName1}")
+                print(
+                    f"{k['name']} {YELLOW} {float(k['e2e_us_base']):.3f}us -> {float(e2e_us):.3f}us (err: {k['err_ratio']*100:.0f}%) {END} {kernelName1}"
+                )
                 if e2e_us < k["e2e_us"]:
                     k["e2e_us"] = e2e_us
                     k["err_ratio"] = err_ratio
@@ -3001,9 +3043,12 @@ class FmoeTuner(TunerCommon):
         tune_results = []
 
         for i, k in better_kernels.items():
-            if k["kernel_name"] is None : continue
+            if k["kernel_name"] is None:
+                continue
             tune_results.append([*k["row"].values, *k["results"]])
-            print(f"{k['name']} {GREEN} {float(k['e2e_us_base']):.3f}us -> {float(k['e2e_us']):.3f}us  (err: {k['err_ratio_base']*100:.0f}% -> {k['err_ratio']*100:.0f}%)  {END} {k['kernel_name']}")
+            print(
+                f"{k['name']} {GREEN} {float(k['e2e_us_base']):.3f}us -> {float(k['e2e_us']):.3f}us  (err: {k['err_ratio_base']*100:.0f}% -> {k['err_ratio']*100:.0f}%)  {END} {k['kernel_name']}"
+            )
 
         new_tunedf = pd.DataFrame(tune_results, columns=self.columns)
         output_file = self.get_out_file(args.tune_file)
@@ -3020,6 +3065,7 @@ class FmoeTuner(TunerCommon):
 
         resultdf.to_csv(output_file, index=False)
         print(f"{args.tune_file} has been updated!")
+
 
 if __name__ == "__main__":
 

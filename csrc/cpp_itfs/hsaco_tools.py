@@ -243,17 +243,19 @@ def get_kernel(kernel_path_prefix, constexpr_args: tuple = ()):
 
     return CallableKernel
 
+
 class HSACO:
-    def __init__(self, base = None):
+    def __init__(self, base=None):
         self.base = f"{AITER_CORE_DIR}/hsa/{get_gfx()}" if base is None else base
 
     def __getattr__(self, name):
         return HSACO(f"{self.base}/{name}")
-    
+
     def __call__(self, *args, **kwargs):
         # kwargs is hsaco file name
         # args is runtime-args
         kernel = get_kernel(self.base, tuple(kwargs.items()))
         kernel(*args)
+
 
 hsaco = HSACO()

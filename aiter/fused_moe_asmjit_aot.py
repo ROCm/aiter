@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+
 """Qwen3.5 397B MoE PTPC FP8 TP8 run with prebuilt hasco artifacts on gfx942:
 ``fused_moe()`` calls ``fused_moe_ptpc_fp8`` only when the following conditions are met:
 - B=1~32, E=512, N1=256, K1=4096, N2=4096, K2=128, TOPK=10
@@ -20,17 +21,20 @@
 """
 
 import os
+
 from typing import Any, Optional
 
 import torch
 
 import aiter
+
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.fused_moe import moe_sorting
 from csrc.cpp_itfs.hsaco_tools import hsaco
 
 from dataclasses import dataclass
+
 
 @dataclass
 class Config:
@@ -39,15 +43,27 @@ class Config:
     use_prefill: bool
 
     def to_string(self):
-        return str(self.BLOCK_M) + "_" + str(self.use_down_loopn) + "_" + str(self.use_prefill)
+        return (
+            str(self.BLOCK_M)
+            + "_"
+            + str(self.use_down_loopn)
+            + "_"
+            + str(self.use_prefill)
+        )
 
     @classmethod
     def from_string(cls, data: str):
         parts = data.split("_")
         return cls(*[eval(p) for p in parts])
 
+
 def get_tune_space():
-    return [Config(16, True, False).to_string(), Config(64, True, True).to_string(), Config(128, True, True).to_string()]
+    return [
+        Config(16, True, False).to_string(),
+        Config(64, True, True).to_string(),
+        Config(128, True, True).to_string(),
+    ]
+
 
 def fused_moe_asmjit_aot(
     hidden_states: torch.Tensor,
@@ -81,19 +97,22 @@ def fused_moe_asmjit_aot(
     if (quant_type != QuantType.per_Token and quant_type != QuantType.per_Tensor):
         return None
 
+
     qtype_str = str(quant_type).split(".")[1]
 
     E, N1, K1 = w1.shape
     N2, K2 = w2.shape[1], w2.shape[2]
     TOPK = topk_ids.shape[1]
-    fp8_ptpc = w1.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) and (quant_type == QuantType.per_Token)
-    num_CU = torch.cuda.get_device_properties(hidden_states.device).multi_processor_count
+    fp8_ptpc = w1.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) and (
+        quant_type == QuantType.per_Token
+    )
+    num_CU = torch.cuda.get_device_properties(
+        hidden_states.device
+    ).multi_processor_count
     assert N1 == 2 * K2
 
     topk_w_f32 = (
-        topk_weight
-        if topk_weight.dtype == torch.float32
-        else topk_weight.float()
+        topk_weight if topk_weight.dtype == torch.float32 else topk_weight.float()
     )
 
     gemm1_out = torch.empty(
@@ -104,16 +123,18 @@ def fused_moe_asmjit_aot(
 
     if kcfgs.use_prefill:
         BLOCK_TILE_SIZE_N = 128
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
-            topk_ids,
-            topk_weight,
-            E,
-            N2,     # reduce dim is same with output dim
-            hidden_states.dtype,
-            kcfgs.BLOCK_M,
-            None,
-            None,
-            0,
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = (
+            moe_sorting(
+                topk_ids,
+                topk_weight,
+                E,
+                N2,  # reduce dim is same with output dim
+                hidden_states.dtype,
+                kcfgs.BLOCK_M,
+                None,
+                None,
+                0,
+            )
         )
         quant_func = aiter.get_hip_quant(aiter.QuantType.per_Token)
         hidden_states_q, hidden_states_scale = quant_func(
@@ -122,56 +143,73 @@ def fused_moe_asmjit_aot(
             quant_dtype=w1.dtype,
             num_rows=None,
         )
-        hsaco.fmoe_asmjit.moe_2stage_gateup([N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0]], [256],
-                    hidden_states_q, w1, 
-                    gemm1_out, 
-                    sorted_ids, 
-                    sorted_expert_ids, 
-                    num_valid_ids, 
-                    hidden_states_scale,
-                    w1_scale, B, N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0],
-                    weight_dtype = str(w1.dtype),
-                    TOPK = TOPK,
-                    K=K1,
-                    N=N1,
-                    BLOCK_TILE_SIZE_M = kcfgs.BLOCK_M,
-                    BLOCK_TILE_SIZE_N = BLOCK_TILE_SIZE_N,
-                    quant_type_w = f"QuantType.{qtype_str}",
-                    )
+        hsaco.fmoe_asmjit.moe_2stage_gateup(
+            [N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0]],
+            [256],
+            hidden_states_q,
+            w1,
+            gemm1_out,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            hidden_states_scale,
+            w1_scale,
+            B,
+            N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0],
+            weight_dtype=str(w1.dtype),
+            TOPK=TOPK,
+            K=K1,
+            N=N1,
+            BLOCK_TILE_SIZE_M=kcfgs.BLOCK_M,
+            BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
+            quant_type_w=f"QuantType.{qtype_str}",
+        )
         gemm1_out_q, gemm1_out_scale = quant_func(
             gemm1_out.view(B * TOPK, -1),
             scale=None,
             quant_dtype=w2.dtype,
             num_rows=None,
         )
-        gemm2_out = torch.empty(B, TOPK, N2, dtype=torch.bfloat16, device=gemm1_out_q.device)
-        hsaco.fmoe_asmjit.moe_2stage_down([1, sorted_expert_ids.shape[0]], [256],
-                    gemm1_out_q, w2, 
-                    gemm2_out, #cur_out,
-                    sorted_ids,
-                    sorted_weights,
-                    sorted_expert_ids,
-                    num_valid_ids,
-                    gemm1_out_scale,
-                    w2_scale,
-                    B,
-                    sorted_expert_ids.shape[0],
-                    weight_dtype = str(w2.dtype),
-                    TOPK = TOPK,
-                    K = K2,
-                    N = N2,
-                    with_silu = False,
-                    BLOCK_TILE_SIZE_M = kcfgs.BLOCK_M,
-                    BLOCK_TILE_SIZE_N = BLOCK_TILE_SIZE_N,
-                    quant_type_w = f"QuantType.{qtype_str}")
+        gemm2_out = torch.empty(
+            B, TOPK, N2, dtype=torch.bfloat16, device=gemm1_out_q.device
+        )
+        hsaco.fmoe_asmjit.moe_2stage_down(
+            [1, sorted_expert_ids.shape[0]],
+            [256],
+            gemm1_out_q,
+            w2,
+            gemm2_out,  # cur_out,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            gemm1_out_scale,
+            w2_scale,
+            B,
+            sorted_expert_ids.shape[0],
+            weight_dtype=str(w2.dtype),
+            TOPK=TOPK,
+            K=K2,
+            N=N2,
+            with_silu=False,
+            BLOCK_TILE_SIZE_M=kcfgs.BLOCK_M,
+            BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
+            quant_type_w=f"QuantType.{qtype_str}",
+        )
         num_WG = num_CU * 4
         num_tokens_wg = B // num_WG
         num_extra_tokens = B % num_WG
-        hsaco.fmoe_asmjit.moe_gemm_final_reduce_bf16([num_WG], [64],
-                                gemm2_out,
-                                cur_out,
-                                num_tokens_wg, num_extra_tokens, B,
-                                TOPK = TOPK, OC = N2)
+        hsaco.fmoe_asmjit.moe_gemm_final_reduce_bf16(
+            [num_WG],
+            [64],
+            gemm2_out,
+            cur_out,
+            num_tokens_wg,
+            num_extra_tokens,
+            B,
+            TOPK=TOPK,
+            OC=N2,
+        )
         return cur_out
 
     if B == 1:
@@ -191,9 +229,9 @@ def fused_moe_asmjit_aot(
             1,
             N1,
             K1,
-            weight_dtype = torch.float8_e4m3fnuz,
+            weight_dtype=torch.float8_e4m3fnuz,
             with_silu=True,
-            quant_type_str = qtype_str
+            quant_type_str=qtype_str,
         )
         hsaco.fmoe_asmjit.moe_gemm_batch1(
             [N2 // 32, TOPK],
@@ -207,24 +245,26 @@ def fused_moe_asmjit_aot(
             1,
             N2,
             K2,
-            weight_dtype = torch.float8_e4m3fnuz,
+            weight_dtype=torch.float8_e4m3fnuz,
             with_silu=False,
-            quant_type_str = qtype_str                
+            quant_type_str=qtype_str,
         )
     elif 2 <= B <= 32:
         # Stage 1: Shared ``moe_sorting`` + ``moe_gemm_batch``;
         # stage 2: Choose between ``moe_2stage_down_loopn`` and ``moe_2stage_splitk`` based on ``use_down_loopn`` condition.
         BLOCK_M = kcfgs.BLOCK_M
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
-            topk_ids,
-            topk_weight,
-            E,
-            K1,
-            hidden_states.dtype,
-            BLOCK_M,
-            expert_mask,
-            num_local_tokens,
-            moe_sorting_dispatch_policy,
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = (
+            moe_sorting(
+                topk_ids,
+                topk_weight,
+                E,
+                K1,
+                hidden_states.dtype,
+                BLOCK_M,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+            )
         )
         grid = int(sorted_expert_ids.shape[0])
         if B * TOPK <= E:
@@ -247,7 +287,7 @@ def fused_moe_asmjit_aot(
             TOPK,
             weight_dtype=torch.float8_e4m3fnuz,
             with_silu=True,
-            quant_type_str=qtype_str
+            quant_type_str=qtype_str,
         )
 
         BLOCK_N = 1024
@@ -289,7 +329,7 @@ def fused_moe_asmjit_aot(
                 fp8_ptpc=True,
                 BLOCK_N=BLOCK_N,
                 atomic_write=False,
-                STAGES=3
+                STAGES=3,
             )
             cur_out = torch.sum(gemm2_out, dim=1)
         else:
@@ -313,8 +353,11 @@ def fused_moe_asmjit_aot(
                 with_silu=False,
                 BLOCK_TILE_SIZE_M=16,
                 BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
-                quant_type_str=qtype_str
+                quant_type_str=qtype_str,
             )
+
     else:
         return None
+
+
     return cur_out
