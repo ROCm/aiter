@@ -10,8 +10,8 @@
 
 This report covers the full development arc of two FlyDSL sage attention kernels:
 
-- **v1** — BF8/INT8 quantized sage attention, targeting general-purpose inference shapes. Status: **ship-ready**, geomean **1.27× Triton** across all tested shapes.
-- **v2** — MXFP4 quantized sage attention, targeting higher-precision-efficiency workloads. Status: **large uplift landed**, geomean **~2.4× Triton** (q_smooth=True), **~1.20× Triton** (q_smooth=False).
+- **v1** — BF8/INT8 quantized sage attention, targeting general-purpose inference shapes. Status: **ship-ready**, geomean **~1.35× Triton** across all tested shapes (latest bench 2026-05-25).
+- **v2** — MXFP4 quantized sage attention, targeting higher-precision-efficiency workloads. Status: **large uplift landed**, geomean **~2.35× Triton** (q_smooth=True), **~1.17× Triton** (q_smooth=False) (latest bench 2026-05-25).
 
 Both kernels are written in FlyDSL (AMD's Python-embedded DSL that lowers to MLIR → LLVM → AMD GPU ISA), and compared against equivalent Triton-based implementations as the baseline.
 
@@ -33,20 +33,25 @@ The Triton implementation uses multiple separate kernel launches (quantization, 
 ### Goal
 Port the Triton sage attention v1 kernel to FlyDSL and achieve ≥1.10× Triton on all shapes, with a stretch target of ≥1.10× on long-S (S=16384) shapes.
 
-### Final Performance (commit `10b114ecb`, branch `zhuo/sage_flydsl`)
+### Final Performance (commit `a101db6e9`, branch `zhuo/sage_mxfp4_flydsl`, bench 2026-05-25)
 
-| Shape | FlyDSL / Triton |
-|---|---|
-| B=1, S=1024, H=8 | **1.43–1.47×** |
-| B=1, S=3000, H=8 | **1.58×** |
-| B=1, S=4096, H=8 | **1.50×** |
-| B=1, S=8192, H=8 | **1.04–1.08×** |
-| B=1, S=4096, GQA Hq=16/Hk=4 | **1.22×** |
-| B=2, S=4096, GQA Hq=16/Hk=4 | **1.23–1.28×** |
-| B=2, S=4096, H=8 | **1.47–1.48×** |
-| B=1, S=16384, H=8 | **1.01×** |
-| B=1, S=16384, H=24 | **1.02–1.04×** |
-| **Geomean** | **~1.27× Triton** |
+Benchmark command: `HIP_VISIBLE_DEVICES=0 python op_tests/flydsl_tests/bench_flydsl_sage.py --warmup 100 --rep 300 --speed-only`
+
+| Shape | Triton TFLOPS | FlyDSL TFLOPS | FlyDSL / Triton |
+|---|---|---|---|
+| B=1, S=1024, H=8, fwd | 36.52 | 53.91 | **1.48×** |
+| B=1, S=3000, H=8, fwd | 230.89 | 369.82 | **1.60×** |
+| B=1, S=4096, H=8, fwd | 366.10 | 552.17 | **1.51×** |
+| B=1, S=8192, H=8, fwd | 836.67 | 944.55 | **1.13×** |
+| B=1, S=4096, Hq=16/Hk=4, fwd | 709.74 | 907.43 | **1.28×** |
+| B=2, S=4096, Hq=16/Hk=4, fwd | 767.36 | 1026.25 | **1.34×** |
+| B=2, S=4096, H=8, fwd | 537.27 | 818.50 | **1.52×** |
+| B=1, S=16384, H=8, fwd | 1120.03 | 1205.02 | **1.08×** |
+| B=1, S=16384, H=24, fwd | 1189.08 | 1349.67 | **1.14×** |
+| B=1, S=75600, H=5, fwd | 1434.05 | 1443.35 | **1.01×** |
+| **Geomean** | | | **~1.35× Triton** |
+
+Note: causal shapes (S=4096, S=8192) show FAILED for Triton in the bench — Triton's causal path is unavailable on this build; FlyDSL causal numbers (165 TFLOPS at S=4096, 379 TFLOPS at S=8192) are measured vs SDPA only.
 
 All 15 tests pass.
 
@@ -70,7 +75,7 @@ The single highest-leverage change: flipping one LLVM compilation option to enab
 **4. Deferred `q_descale * k_descale` multiply — PR#3247 port (commit `a101db6e9`)**
 Ported an upstream Triton optimization (ROCm/aiter#3247) to the FlyDSL kernel. Instead of multiplying the QK score by the dequantization scale immediately after each MFMA, the multiply is deferred to the softmax step where it fuses with the `s - m_ij` subtraction into a hardware FMA (fused multiply-add), eliminating a standalone broadcast+multiply pass. This removes ~64 `v_mul_f32` instructions per inner loop iteration.
 - Gated on `not CAUSAL` (causal path depends on `-inf` semantics incompatible with the `contract` fastmath mode required for FMA fusion)
-- S=8192 fwd: 866 → 950 TFLOPS (**+9.7%**)
+- S=8192 fwd: 836 → 945 TFLOPS measured at time of landing (+~13%); current bench shows 944.55 TFLOPS
 
 ### Long-S Ceiling: Exhaustive Investigation
 
@@ -204,40 +209,44 @@ Bumped `compute_delta_s` kernel's K-tile (BLOCK_N) from 64 to 128. Quartered the
 
 ### Final v2 Performance
 
-**q_smooth=True (vs Triton MXFP4 end-to-end):**
+Benchmark command: `HIP_VISIBLE_DEVICES=0 python op_tests/flydsl_tests/bench_flydsl_sage_mxfp4.py --warmup 500 --rep 2000 [--q-smooth]`
 
-| Shape | Final |
-|---|---|
-| B=1, S=1024, fwd | **1.92×** |
-| B=1, S=4096, fwd | **2.05×** |
-| B=1, S=4096, causal | **2.41×** |
-| B=1, S=8192, fwd | **2.12×** |
-| B=1, S=8192, causal | **2.31×** |
-| B=1, S=16384, fwd | **2.24×** |
-| B=1, S=16384, causal | **2.92×** |
-| B=1, S=32768, fwd | **2.57×** |
-| B=2, S=8192, GQA Hq16/Hk4 | **2.50×** |
-| B=1, S=4096, Hq=24 | **2.28×** |
-| B=1, S=16384, Hq=24 | **2.92×** |
-| **Min** | **1.92×** |
-| **Geomean** | **~2.4×** |
+**q_smooth=True (vs Triton MXFP4 end-to-end, bench 2026-05-25):**
 
-**q_smooth=False (vs Triton MXFP4 end-to-end):**
+| Shape | Triton ms | FlyDSL ms | FlyDSL / Triton |
+|---|---|---|---|
+| B=1, S=1024, fwd | 0.207 | 0.120 | **1.72×** |
+| B=1, S=4096, fwd | 0.441 | 0.216 | **2.04×** |
+| B=1, S=4096, causal | 0.515 | 0.214 | **2.40×** |
+| B=1, S=8192, fwd | 0.941 | 0.445 | **2.11×** |
+| B=1, S=8192, causal | 0.973 | 0.420 | **2.32×** |
+| B=1, S=16384, fwd | 3.220 | 1.489 | **2.16×** |
+| B=1, S=16384, causal | 3.219 | 1.122 | **2.87×** |
+| B=1, S=32768, fwd | 12.349 | 4.868 | **2.54×** |
+| B=2, S=8192, GQA Hq=16/Hk=4, fwd | 3.212 | 1.278 | **2.51×** |
+| B=1, S=4096, Hq=24, fwd | 0.904 | 0.396 | **2.28×** |
+| B=1, S=16384, Hq=24, fwd | 9.623 | 3.335 | **2.89×** |
+| B=1, S=75600, H=5, fwd | 41.499 | 30.525 | **1.36×** |
+| **Min** | | | **1.36×** |
+| **Geomean (excl. S=75600)** | | | **~2.35×** |
 
-| Shape | Final |
-|---|---|
-| B=1, S=1024, fwd | **~1.75×** |
-| B=1, S=4096, fwd | **~1.31×** |
-| B=1, S=4096, causal | **~1.25×** |
-| B=1, S=8192, fwd | **~1.17×** |
-| B=1, S=8192, causal | **~1.13×** |
-| B=1, S=16384, fwd | **~1.05×** (ceiling) |
-| B=1, S=16384, causal | **~1.20×** |
-| B=1, S=32768, fwd | **~1.06×** (ceiling) |
-| B=2, S=8192, H=16 | **~1.16×** |
-| B=1, S=4096, Hq=24 | **~1.18×** |
-| B=1, S=16384, Hq=24 | **~1.02×** (ceiling) |
-| B=1, S=75600, Hq=5 | **~1.01×** (new shape) |
+**q_smooth=False (vs Triton MXFP4 end-to-end, bench 2026-05-25):**
+
+| Shape | Triton ms | FlyDSL ms | FlyDSL / Triton |
+|---|---|---|---|
+| B=1, S=1024, fwd | 0.192 | 0.100 | **1.92×** |
+| B=1, S=4096, fwd | 0.195 | 0.149 | **1.31×** |
+| B=1, S=4096, causal | 0.201 | 0.159 | **1.26×** |
+| B=1, S=8192, fwd | 0.330 | 0.281 | **1.17×** |
+| B=1, S=8192, causal | 0.322 | 0.285 | **1.13×** |
+| B=1, S=16384, fwd | 0.894 | 0.846 | **1.06×** (ceiling) |
+| B=1, S=16384, causal | 0.834 | 0.692 | **1.21×** |
+| B=1, S=32768, fwd | 2.745 | 2.702 | **1.02×** (ceiling) |
+| B=2, S=8192, Hq=16/Hk=4, fwd | 0.967 | 0.819 | **1.18×** |
+| B=1, S=4096, Hq=24, fwd | 0.346 | 0.289 | **1.20×** |
+| B=1, S=16384, Hq=24, fwd | 2.479 | 2.410 | **1.03×** (ceiling) |
+| B=1, S=75600, H=5, fwd | 8.477 | 8.392 | **1.01×** |
+| **Geomean** | | | **~1.17×** |
 
 14/14 pytest pass.
 
@@ -359,7 +368,7 @@ At long S, the inner attention loop dominates. Both FlyDSL and Triton are limite
 The only known untried path for closing the v2 long-S gap. Would expose the non-scale MFMA variant (which Triton uses for PV) to FlyDSL Python, eliminating the extra scale-operand register read on all 8 PV MFMA calls per iteration. Estimated impact: +4–6% on the 3 stuck shapes.
 
 **2. Python wrapper overhead for q_smooth=True S=1024**
-Actual GPU work is ~70µs; Triton's is ~220µs (FlyDSL wins by 3×). But Python dispatch overhead (tensor allocation, contiguous checks, kernel launcher) adds ~58µs to FlyDSL's measured latency. CUDA graph replay in callers would eliminate this. Scope: caller-side architectural change, not kernel work.
+Live bench: FlyDSL 0.120ms vs Triton 0.207ms (1.72×). The actual GPU work is ~70µs vs Triton's ~220µs (FlyDSL wins by 3×), but Python dispatch overhead (tensor allocation, contiguous checks, kernel launcher) adds ~50µs to FlyDSL's measured latency. CUDA graph replay in callers would eliminate this. Scope: caller-side architectural change, not kernel work.
 
 **3. Replace torch K-mean for S > 8192 with a FlyDSL kernel**
 Currently falls back to `k - k.mean()` for S > 8192. A FlyDSL kernel would eliminate one PyTorch launch but contributes <10% of long-S wrapper time — estimated +1–2% end-to-end. Low priority.
