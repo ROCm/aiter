@@ -116,32 +116,6 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
     return cos_diff if cos_diff >= COS_DIFF_THRESHOLD else 0.0
 
 
-def _untuned_to_bool(value):
-    """Parse a bool from an untuned CSV cell. Accepts True/False/0/1/empty."""
-    if value is None or (isinstance(value, float) and value != value):  # NaN
-        return False
-    if isinstance(value, (bool, int)):
-        return bool(value)
-    s = str(value).strip().lower()
-    if s in ("", "false", "0", "no", "n", "f"):
-        return False
-    if s in ("true", "1", "yes", "y", "t"):
-        return True
-    raise ValueError(f"cannot parse bool from {value!r}")
-
-
-def _untuned_to_int(value):
-    """Parse an int from an untuned CSV cell. Empty/NaN -> 0."""
-    if value is None or (isinstance(value, float) and value != value):  # NaN
-        return 0
-    if isinstance(value, (int, bool)):
-        return int(value)
-    s = str(value).strip()
-    if s == "":
-        return 0
-    return int(float(s))
-
-
 class FmoeTuner(TunerCommon):
     ARG_DEFAULTS = {
         **TunerCommon.ARG_DEFAULTS,
@@ -3129,9 +3103,9 @@ class FmoeTuner(TunerCommon):
             q_dtype_w = eval(q_dtype_w)
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
-            bias = _untuned_to_bool(bias)
-            hidden_pad = _untuned_to_int(hidden_pad)
-            intermediate_pad = _untuned_to_int(intermediate_pad)
+            bias = bool(bias)
+            hidden_pad = int(hidden_pad)
+            intermediate_pad = int(intermediate_pad)
             print("\nStart tuning", line)
             if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
                 print(f"{q_type} is not supported on {get_gfx()}")
@@ -3444,6 +3418,9 @@ class FmoeTuner(TunerCommon):
                     "q_type",
                     "use_g1u1",
                     "doweight_stage1",
+                    "bias",
+                    "hidden_pad",
+                    "intermediate_pad",
                     "block_m",
                 ],
                 how="inner",
@@ -3471,6 +3448,9 @@ class FmoeTuner(TunerCommon):
                         q_type,
                         use_g1u1,
                         doweight_stage1,
+                        bias,
+                        hidden_pad,
+                        intermediate_pad,
                         0,
                         0,
                         self.INVALID_TIME,

@@ -78,9 +78,6 @@ AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
 
 
-PAD_COLUMNS = ("hidden_pad", "intermediate_pad")
-
-
 # config_env start here
 AITER_CONFIG_GEMM_A4W4 = os.getenv(
     "AITER_CONFIG_GEMM_A4W4",
@@ -222,7 +219,8 @@ class AITER_CONFIG(object):
             "xbf16": 0,
             "run_1stage": 0,
             "ksplit": 0,
-            **{c: 0 for c in PAD_COLUMNS},
+            "hidden_pad": 0,
+            "intermediate_pad": 0,
         }
         all_cols = list(source_pairs[0][1].columns)
         for _, df in source_pairs[1:]:
@@ -260,7 +258,7 @@ class AITER_CONFIG(object):
                 keys.append("cu_num")
             if "gfx" in merge_df.columns and "gfx" not in keys:
                 keys.append("gfx")
-            for pad_col in PAD_COLUMNS:
+            for pad_col in ("hidden_pad", "intermediate_pad"):
                 if pad_col in merge_df.columns and pad_col not in keys:
                     keys.append(pad_col)
             dedup_keys = keys + ["_tag"] if has_tag else keys

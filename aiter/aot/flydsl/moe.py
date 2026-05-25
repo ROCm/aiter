@@ -131,22 +131,8 @@ def parse_csv(csv_path: str):
                 if act_type.strip().split(".")[-1].lower() == "swiglu"
                 else "silu"
             )
-            q_type = row.get("q_type", "")
-            dtype = row.get("dtype", "")
-            q_dtype_w = row.get("q_dtype_w", "")
             swiglu_limit = _row_swiglu_limit(row)
-            bias_supported = (
-                q_type.strip().split(".")[-1] == "per_1x32"
-                and dtype in ("torch.bfloat16", "torch.float16")
-                and "float4_e2m1fn_x2" in q_dtype_w
-            )
-            bias = _row_optional_bool(row, "bias")
-            if bias is not None:
-                enable_bias_options = [bias]
-            elif bias_supported:
-                enable_bias_options = [False, True]
-            else:
-                enable_bias_options = [False]
+            enable_bias_options = [bool(_row_optional_bool(row, "bias"))]
 
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.

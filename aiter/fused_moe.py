@@ -13,14 +13,7 @@ import torch
 from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
 from aiter import logger
-from aiter.jit.core import (
-    AITER_CONFIGS,
-    AITER_CSRC_DIR,
-    PAD_COLUMNS,
-    PY,
-    bd_dir,
-    mp_lock,
-)
+from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
@@ -890,30 +883,16 @@ def get_2stage_cfgs(
         "use_g1u1",
         "doweight_stage1",
         "bias",
-        *PAD_COLUMNS,
+        "hidden_pad",
+        "intermediate_pad",
     ]
 
-    _BIAS_TRUE = {"true", "1", "yes", "y", "t"}
-
-    def _parse_bias_cell(v):
-        if v is None:
-            return False
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, (int, float)):
-            # NaN -> False
-            return False if v != v else bool(v)
-        return str(v).strip().lower() in _BIAS_TRUE
-
     def _normalize_lookup_cols(df):
-        for col in PAD_COLUMNS:
+        for col in ("hidden_pad", "intermediate_pad"):
             if col not in df.columns:
                 df[col] = 0
             df[col] = df[col].fillna(0).astype(int)
-        if "bias" not in df.columns:
-            df["bias"] = False
-        else:
-            df["bias"] = df["bias"].map(_parse_bias_cell).astype(bool)
+        df["bias"] = df["bias"].eq("True") if "bias" in df.columns else False
         return df
 
     def get_cfg_2stages(tune_file):
@@ -1040,7 +1019,7 @@ def get_2stage_cfgs(
                 try:
                     insert_at = old_cols.index("doweight_stage1") + 1
                 except ValueError:
-                    insert_at = len(old_cols) - len(PAD_COLUMNS)
+                    insert_at = len(old_cols) - 2
                 new_lines = [
                     ",".join(old_cols[:insert_at] + ["bias"] + old_cols[insert_at:])
                 ]
