@@ -29,20 +29,34 @@ def gather_kv_b_proj(
 
     qk_nope_head_dim = weight_n // tp_k_head_num_k - v_head_dim
 
-    per_row_scale = kv_proj_scale.dim() == 1 or (
-        kv_proj_scale.dim() == 2 and kv_proj_scale.shape[1] == 1
-    )
-    if per_row_scale:
-        assert kv_proj_scale.numel() == weight_n, (
-            f"per-row kv_proj_scale must have shape ({weight_n},) or ({weight_n}, 1), "
-            f"got {tuple(kv_proj_scale.shape)}"
-        )
+    # Three scale modes:
+    #   - kv_proj_scale is None   : weight is unquantized (e.g. bf16
+    #     kv_b_proj on Kimi-K2.5-MXFP4). Kernel skips scale-load and
+    #     scale-multiply entirely (NO_SCALE branch).
+    #   - kv_proj_scale.dim() == 1 (or [N, 1]) : per-row scale.
+    #   - else                     : per-block scale ([N//128, K//128]).
+    no_scale = kv_proj_scale is None
+    if no_scale:
+        # Triton requires a non-None tensor pointer for every kernel argument
+        # even if NO_SCALE=True makes it unread. Pass the weight tensor as a
+        # placeholder; the kernel does not load from it in this branch.
+        kv_proj_scale = kv_proj_weight
+        per_row_scale = False  # ignored when NO_SCALE=True
     else:
-        scale_n, scale_k = kv_proj_scale.shape
-        scale_k_granularity = weight_k // scale_k
-        scale_n_granularity = weight_n // scale_n
-        assert scale_k_granularity == 128
-        assert scale_n_granularity == 128
+        per_row_scale = kv_proj_scale.dim() == 1 or (
+            kv_proj_scale.dim() == 2 and kv_proj_scale.shape[1] == 1
+        )
+        if per_row_scale:
+            assert kv_proj_scale.numel() == weight_n, (
+                f"per-row kv_proj_scale must have shape ({weight_n},) or ({weight_n}, 1), "
+                f"got {tuple(kv_proj_scale.shape)}"
+            )
+        else:
+            scale_n, scale_k = kv_proj_scale.shape
+            scale_k_granularity = weight_k // scale_k
+            scale_n_granularity = weight_n // scale_n
+            assert scale_k_granularity == 128
+            assert scale_n_granularity == 128
 
     ChunkK = 16 if k_buffer.dtype in [torch.float16, torch.bfloat16] else 32
 
@@ -76,5 +90,6 @@ def gather_kv_b_proj(
         PaddedV=padded_v,
         WEIGHT_PRESHUFFLE=weight_preshuffle,
         PER_ROW_SCALE=per_row_scale,
+        NO_SCALE=no_scale,
         num_stages=3,
     )

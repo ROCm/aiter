@@ -113,6 +113,16 @@ Or install all optional dependencies at once:
 pip install -r requirements.txt
 ```
 
+### Triton
+
+AITER includes Triton-based operators that require triton from AMD PyPI, with the correct version selected based on your ROCm installation.
+
+If you install with `python3 setup.py develop`, triton is installed automatically. If you use `pip install -e .`, run the install script manually:
+
+```bash
+./.github/scripts/install_triton.sh
+```
+
 ### Opus — Lightweight C++ Template for Kernel Development
 
 [Opus](csrc/include/opus/) is a single-header C++ template library (`opus.hpp`) for writing HIP kernels on AMD GPUs — vectorized load/store, layout abstractions, and MFMA wrappers with a strong focus on **build time optimization** (up to 61x faster than standard torch extension builds). See the [Opus README](csrc/include/opus/README.md) and [`op_tests/opus/`](op_tests/opus/) for details.

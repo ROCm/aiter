@@ -104,7 +104,7 @@ def _ff_a16w16_fused_ungated(
                 cache_modifier=cache_modifier,
             )
 
-        acc += tl.dot(x, w1, input_precision="ieee")
+        acc = tl.dot(x, w1, acc=acc)
 
         # Advance the ptrs to the next K block.
         x_ptrs += BLOCK_SIZE_K * stride_xk
