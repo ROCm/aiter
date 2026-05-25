@@ -7,7 +7,7 @@ import torch
 import functools
 from aiter import dtypes
 from torch import Tensor
-
+from typing import Optional
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.torch_guard import torch_compile_guard
@@ -36,6 +36,26 @@ def mhc_pre_big_fuse(
     rms_eps: float = 1e-6,
     hc_pre_eps: float = 1e-6,
     hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+) -> None: ...
+
+
+@compile_ops("module_mhc")
+def mhc_pre_big_fuse_rmsnorm(
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    out: Tensor,
+    gemm_out_mul: Tensor,
+    gemm_out_sqrsum: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    residual: Tensor,
+    norm_weight: Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    norm_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
 ) -> None: ...
@@ -87,6 +107,8 @@ def mhc_pre_fake(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -109,6 +131,8 @@ def mhc_pre(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -132,21 +156,40 @@ def mhc_pre(
     post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
     comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
     layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
-    mhc_pre_big_fuse(
-        post_mix,
-        comb_mix,
-        layer_input,
-        out,
-        sqrsum,
-        hc_scale,
-        hc_base,
-        residual,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-    )
+    if norm_weight is not None:
+        mhc_pre_big_fuse_rmsnorm(
+            post_mix,
+            comb_mix,
+            layer_input,
+            out,
+            sqrsum,
+            hc_scale,
+            hc_base,
+            residual,
+            norm_weight,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            norm_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+    else:
+        mhc_pre_big_fuse(
+            post_mix,
+            comb_mix,
+            layer_input,
+            out,
+            sqrsum,
+            hc_scale,
+            hc_base,
+            residual,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
 
     return post_mix, comb_mix, layer_input
 

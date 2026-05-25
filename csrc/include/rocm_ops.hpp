@@ -2010,7 +2010,25 @@ namespace py = pybind11;
           py::arg("hc_pre_eps")         = 1e-6, \
           py::arg("hc_sinkhorn_eps")    = 1e-6, \
           py::arg("hc_post_mult_value") = 1.0,  \
-          py::arg("sinkhorn_repeat")    = 20);     \
+          py::arg("sinkhorn_repeat")    = 20);   \
+    m.def("mhc_pre_big_fuse_rmsnorm",            \
+          &aiter::mhc_pre_big_fuse_rmsnorm,      \
+          "mhc_pre_big_fuse_rmsnorm",            \
+          py::arg("post_mix"),                   \
+          py::arg("comb_mix"),                   \
+          py::arg("out"),                        \
+          py::arg("gemm_out_mul"),               \
+          py::arg("gemm_out_sqrsum"),            \
+          py::arg("hc_scale"),                   \
+          py::arg("hc_base"),                    \
+          py::arg("residual"),                   \
+          py::arg("norm_weight"),                \
+          py::arg("rms_eps")            = 1e-6,  \
+          py::arg("hc_pre_eps")         = 1e-6,  \
+          py::arg("hc_sinkhorn_eps")    = 1e-6,  \
+          py::arg("norm_eps")           = 1e-6,  \
+          py::arg("hc_post_mult_value") = 1.0,   \
+          py::arg("sinkhorn_repeat")    = 20);   \
     m.def("mhc_post",                           \
           &aiter::mhc_post,                     \
           "mhc_post",                           \
