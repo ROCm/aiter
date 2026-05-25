@@ -3,6 +3,7 @@
 #pragma once
 
 #include "aiter_tensor.h"
+#include "mx_quant_utils.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -32,8 +33,20 @@ namespace py = pybind11;
         .value("Gelu", ActivationType::Gelu)                                                   \
         .value("Swiglu", ActivationType::Swiglu)                                              \
         .export_values();                                                                      \
+    pybind11::enum_<aiter::MxScaleRoundMode>(m, "MxScaleRoundMode")                            \
+        .value("RoundDown", aiter::MxScaleRoundMode::RoundDown)                                \
+        .value("RoundUp",   aiter::MxScaleRoundMode::RoundUp)                                  \
+        .value("Even",      aiter::MxScaleRoundMode::Even)                                     \
+        .value("Ceil",      aiter::MxScaleRoundMode::Ceil)                                     \
+        .export_values();                                                                      \
+    pybind11::enum_<aiter::MxDtype>(m, "MxDtype")                                              \
+        .value("FP4_E2M1", aiter::MxDtype::FP4_E2M1)                                           \
+        .value("FP8_E4M3", aiter::MxDtype::FP8_E4M3)                                           \
+        .export_values();                                                                      \
     pybind11::implicitly_convertible<int, QuantType>();                                         \
     pybind11::implicitly_convertible<int, ActivationType>();                                    \
+    pybind11::implicitly_convertible<int, aiter::MxScaleRoundMode>();                          \
+    pybind11::implicitly_convertible<int, aiter::MxDtype>();                                   \
     AITER_SET_STREAM_PYBIND                                                                    \
     pybind11::class_<aiter_tensor_t>(m, "aiter_tensor_t")                                      \
         .def(pybind11::init<>())                                                               \

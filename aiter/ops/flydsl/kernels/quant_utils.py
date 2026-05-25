@@ -37,9 +37,11 @@ from aiter.utility.mx_types import MxDtype, MxScaleRoundMode
 # - target_max_pow2 = log2(largest pow2 <= max_normal(dtype))
 # - max_pos_inv_f32_bits = bit pattern of fp32(1.0 / max_normal(dtype))
 # - mbits = mantissa bits of the target dtype (used only by EVEN mode)
+# dict keyed by ``int(MxDtype.X)`` so lookups work regardless of whether
+# the caller passes a pybind enum value or a bare ``int``.
 _DTYPE_CFG = {
-    MxDtype.FP4_E2M1: (2, 0x3E2AAAAB, 1),  # 1/6.0 ~= 0.16666667
-    MxDtype.FP8_E4M3: (8, 0x3B125641, 3),  # 1/448.0 ~= 0.00223214
+    int(MxDtype.FP4_E2M1): (2, 0x3E2AAAAB, 1),  # 1/6.0 ~= 0.16666667
+    int(MxDtype.FP8_E4M3): (8, 0x3B125641, 3),  # 1/448.0 ~= 0.00223214
 }
 
 
@@ -85,12 +87,16 @@ def emit_mx_e8m0_scale(
         f32) for the multiplicative quant scale, and stores
         ``e8m0_biased`` as a ``uint8`` in the per-block scale tensor.
     """
-    if dtype not in _DTYPE_CFG:
+    # Normalise int / pybind enum into a plain int -- pybind11 enum classes
+    # don't auto-compare equal to ``int`` (unlike ``IntEnum``).
+    mode_int = int(mode)
+    dtype_int = int(dtype)
+    if dtype_int not in _DTYPE_CFG:
         raise ValueError(
             f"emit_mx_e8m0_scale: unsupported dtype {dtype!r}; "
             f"supported: {list(_DTYPE_CFG)}"
         )
-    target_max_pow2, max_pos_inv_bits, mbits = _DTYPE_CFG[dtype]
+    target_max_pow2, max_pos_inv_bits, mbits = _DTYPE_CFG[dtype_int]
 
     c0_i32 = arith.constant(0, type=T.i32)
     c1_i32 = arith.constant(1, type=T.i32)
@@ -99,7 +105,7 @@ def emit_mx_e8m0_scale(
     c0x7FFFFF_i32 = arith.constant(0x7FFFFF, type=T.i32)  # f32 mantissa mask
     target_max_pow2_i32 = arith.constant(target_max_pow2, type=T.i32)
 
-    if mode == MxScaleRoundMode.RoundUp:
+    if mode_int == int(MxScaleRoundMode.RoundUp):
         # ceil_pow2(amax / max_pos): multiply by reciprocal of max_pos to get
         # the working value, then bump the exponent if any mantissa bit is
         # set. Bit-equivalent to HIP ``aiter::fp4_f32_to_e8m0_scale`` (when
@@ -119,14 +125,14 @@ def emit_mx_e8m0_scale(
         )
         return arith.maxsi(exp_field, c0_i32)
 
-    if mode == MxScaleRoundMode.RoundDown:
+    if mode_int == int(MxScaleRoundMode.RoundDown):
         # floor_pow2(amax) / 2^target_max_pow2: drop the f32 mantissa, then
         # subtract target_max_pow2 from the biased exponent.
         amax_i32 = local_max.bitcast(T.i32)
         biased_exp = (amax_i32 >> c23_i32) & c0xFF_i32
         return arith.maxsi(biased_exp - target_max_pow2_i32, c0_i32)
 
-    if mode == MxScaleRoundMode.Ceil:
+    if mode_int == int(MxScaleRoundMode.Ceil):
         # ceil_pow2(amax) / 2^target_max_pow2: same as RoundDown but bump
         # the exponent if any mantissa bit is set.
         amax_i32 = local_max.bitcast(T.i32)
@@ -140,7 +146,7 @@ def emit_mx_e8m0_scale(
         )
         return arith.maxsi(biased_exp_bumped - target_max_pow2_i32, c0_i32)
 
-    if mode == MxScaleRoundMode.Even:
+    if mode_int == int(MxScaleRoundMode.Even):
         # round_pow2_special(amax) / 2^target_max_pow2: add a half-step at
         # the "(mbits+1)-th-from-top" mantissa bit, then drop all mantissa
         # bits. ``val_to_add = 1 << (23 - mbits - 1)`` so that the carry

@@ -145,13 +145,16 @@ def per_1x32_f4_quant(
     # E8M0 block-scale dispatch. RoundUp uses max_pos=6 (FP4 max normal);
     # the other three rely on max_pow2=4 (largest pow-2 <= 6) by spec.
     # See MxScaleRoundMode docstring for cross-stack equivalences.
-    if round_mode == MxScaleRoundMode.RoundDown:
+    # Normalise int / pybind enum into a plain int -- pybind11 enum classes
+    # don't auto-compare equal to ``int`` (unlike ``IntEnum``).
+    round_mode_int = int(round_mode)
+    if round_mode_int == int(MxScaleRoundMode.RoundDown):
         scale_e8m0_biased = fp4_utils.f32_to_e8m0_floor(max_abs / 4.0)
-    elif round_mode == MxScaleRoundMode.RoundUp:
+    elif round_mode_int == int(MxScaleRoundMode.RoundUp):
         scale_e8m0_biased = fp4_utils.f32_to_e8m0_rceil(max_abs, max_pos=6.0)
-    elif round_mode == MxScaleRoundMode.Even:
+    elif round_mode_int == int(MxScaleRoundMode.Even):
         scale_e8m0_biased = fp4_utils.f32_to_e8m0_even(max_abs, max_pow2=4.0)
-    elif round_mode == MxScaleRoundMode.Ceil:
+    elif round_mode_int == int(MxScaleRoundMode.Ceil):
         scale_e8m0_biased = fp4_utils.f32_to_e8m0_torchao_ceil(max_abs, max_pow2=4.0)
     else:
         raise ValueError(
@@ -822,7 +825,7 @@ def quant_mxfp4_hip(
     # __Float4_e2m1fn_x2 which is not available on gfx942; fall through
     # to the quant_mxfp4 kernel instead.
     if (
-        round_mode_int == MxScaleRoundMode.RoundUp
+        round_mode_int == int(MxScaleRoundMode.RoundUp)
         and not a16w4_shuffle
         and not gate_up
         and not shuffle_weight

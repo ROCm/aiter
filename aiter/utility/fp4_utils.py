@@ -72,9 +72,11 @@ def mxfp4_to_f32(x):
 # - target_max_pow2 = log2(largest pow2 <= max_normal(dtype))
 # - max_pos = max_normal(dtype) (e.g. 6.0 for fp4 e2m1, 448.0 for fp8 e4m3)
 # - mbits = mantissa bits of the target dtype (used only by EVEN mode)
+# dict keyed by ``int(MxDtype.X)`` so lookups work regardless of whether
+# the caller passes a pybind enum value or a bare ``int``.
 _DTYPE_CFG = {
-    MxDtype.FP4_E2M1: (2, 6.0, 1),
-    MxDtype.FP8_E4M3: (8, 448.0, 3),
+    int(MxDtype.FP4_E2M1): (2, 6.0, 1),
+    int(MxDtype.FP8_E4M3): (8, 448.0, 3),
 }
 
 
@@ -120,27 +122,32 @@ def f32_to_mx_e8m0_scale(
         E8M0-encoded biased exponent tensor (``dtypes.fp8_e8m0``), same
         shape as ``amax``. NaN/Inf inputs map to ``0xFF`` (E8M0 NaN).
     """
-    if dtype not in _DTYPE_CFG:
+    # Normalise int / pybind enum into a plain int -- pybind11 enum classes
+    # do not auto-compare equal to ``int`` (unlike ``IntEnum``), so callers
+    # passing ``mode=1`` would otherwise mis-dispatch.
+    mode_int = int(mode)
+    dtype_int = int(dtype)
+    if dtype_int not in _DTYPE_CFG:
         raise ValueError(
             f"f32_to_mx_e8m0_scale: unsupported dtype {dtype!r}; "
             f"supported: {list(_DTYPE_CFG)}"
         )
-    target_max_pow2, max_pos, mbits = _DTYPE_CFG[dtype]
+    target_max_pow2, max_pos, mbits = _DTYPE_CFG[dtype_int]
     target_pow2_factor = float(1 << target_max_pow2)  # 2^target_max_pow2
 
-    if mode == MxScaleRoundMode.RoundUp:
+    if mode_int == int(MxScaleRoundMode.RoundUp):
         # ceil_pow2(amax / max_pos) -- NV / DSv4 / FlashInfer / torchao RCEIL.
         return _f32_to_e8m0_ceil_impl(amax / max_pos)
 
-    if mode == MxScaleRoundMode.RoundDown:
+    if mode_int == int(MxScaleRoundMode.RoundDown):
         # floor_pow2(amax) / 2^target_max_pow2 -- OCP MX / torchao FLOOR.
         return _f32_to_e8m0_floor_impl(amax / target_pow2_factor)
 
-    if mode == MxScaleRoundMode.Ceil:
+    if mode_int == int(MxScaleRoundMode.Ceil):
         # ceil_pow2(amax) / 2^target_max_pow2 -- torchao CEIL.
         return _f32_to_e8m0_ceil_impl(amax / target_pow2_factor)
 
-    if mode == MxScaleRoundMode.Even:
+    if mode_int == int(MxScaleRoundMode.Even):
         # round_pow2_special(amax) / 2^target_max_pow2 -- torchao EVEN /
         # Quark EVEN. val_to_add is mantissa-precision-aware:
         # FP4 (mbits=1) -> 0x200000 (1.5x threshold)
