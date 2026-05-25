@@ -56,7 +56,7 @@ def mxfp4_to_f32(x):
 # mxint8). Only ``target_max_pow2`` / ``max_pos`` / ``mbits`` constants
 # differ between dtypes. This mirrors PyTorch torchao's
 # ``to_mx(scaling_mode, elem_dtype)`` design, the HIP-side
-# ``MxScaleRoundMode`` enum (csrc/include/fp4_quant_utils.h) and the
+# ``MxScaleRoundMode`` enum (csrc/include/mx_quant_utils.h) and the
 # FlyDSL IR-builder helpers in
 # ``aiter/ops/flydsl/kernels/quant_utils.py::emit_mx_e8m0_scale``.
 #

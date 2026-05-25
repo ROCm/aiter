@@ -5,12 +5,12 @@
 #include "aiter_dispatch.h"
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
-#include "fp4_quant_utils.h"
+#include "mx_quant_utils.h"
 #include "quant.h"
 
 namespace aiter {
 
-// MxScaleRoundMode lives in fp4_quant_utils.h so future mx kernels
+// MxScaleRoundMode lives in mx_quant_utils.h so future mx kernels
 // (quant_mxfp6.cu / quant_mxfp8.cu / quant_mxint8.cu) can reuse the same
 // enum without redefining it.
 

@@ -11,7 +11,7 @@ These enums are imported by:
 Defined in ``aiter.utility`` (which has no aiter-internal dependencies) so
 every layer above can import without triggering a circular import. The
 integer values match the HIP-side ``enum class MxScaleRoundMode`` in
-``csrc/include/fp4_quant_utils.h`` 1:1; whenever the C++ enum changes,
+``csrc/include/mx_quant_utils.h`` 1:1; whenever the C++ enum changes,
 update this file in the same PR.
 
 See ``csrc/kernels/quant.md`` "Cross-Stack Mode Alignment Reference" for

@@ -6,7 +6,7 @@
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
 #include "quant.h"
-#include "fp4_quant_utils.h"
+#include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
 #include <hipcub/hipcub.hpp>
 

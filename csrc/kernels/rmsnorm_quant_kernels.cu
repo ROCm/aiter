@@ -5,7 +5,7 @@
 #include "py_itfs_common.h"
 #include "aiter_opus_plus.h"
 #include "dispatch_utils.h"
-#include "fp4_quant_utils.h"
+#include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>

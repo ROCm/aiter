@@ -15,7 +15,7 @@ and are dtype-agnostic across the whole MX format family
 (mxfp4 / mxfp6 / mxfp8 / mxint8) -- only the ``target_max_pow2`` /
 ``max_pos`` / ``mbits`` constants differ between dtypes. This matches both
 PyTorch torchao's and the HIP-side ``MxScaleRoundMode`` design (see
-``csrc/include/fp4_quant_utils.h`` and ``aiter.ops.quant.MxScaleRoundMode``).
+``csrc/include/mx_quant_utils.h`` and ``aiter.ops.quant.MxScaleRoundMode``).
 
 See ``csrc/kernels/quant.md`` "Cross-Stack Mode Alignment Reference" for the
 full table mapping these to PyTorch torchao / NV Triton / DSv4 / FlashInfer

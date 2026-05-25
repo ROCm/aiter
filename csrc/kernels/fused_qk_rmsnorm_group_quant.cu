@@ -3,7 +3,7 @@
 
 #include "aiter_hip_common.h"
 #include "aiter_opus_plus.h"
-#include "fp4_quant_utils.h"
+#include "mx_quant_utils.h"
 #include "aiter_dispatch.h"
 #include "aiter_stream.h"
 #include "fused_qk_rmsnorm_group_quant.h"
