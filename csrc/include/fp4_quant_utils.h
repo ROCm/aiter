@@ -10,8 +10,6 @@ namespace aiter {
 // (mxfp4 / mxfp6 / mxfp8 / mxint8) -- the four formulas FLOOR / RCEIL /
 // CEIL / EVEN are dtype-agnostic, only ``max_pos`` / ``max_pow2`` constants
 // differ (see PyTorch torchao ``ScaleCalculationMode`` for the same design).
-// Currently consumed by the mxfp4 kernel; future mx kernels can reuse this
-// enum directly via ``#include "fp4_quant_utils.h"``.
 //
 // Names follow AMD Quark's RoundMode for AMD-side familiarity. Each value is
 // 1:1 mathematically equivalent to a PyTorch torchao ScaleCalculationMode
@@ -25,63 +23,170 @@ namespace aiter {
 //      Quark/quark/torch/kernel/mx/triton.py        (_compute_quant_and_scale)
 //      torchao/prototype/mx_formats/config.py       (ScaleCalculationMode)
 //      torchao/prototype/mx_formats/mx_tensor.py    (_to_mx_rceil and friends)
+//
+// Values **must** stay 1:1 with ``aiter.utility.mx_types.MxScaleRoundMode``
+// and the FlyDSL re-export
+// ``aiter.ops.flydsl.kernels.quant_utils.MxScaleRoundMode``.
 enum class MxScaleRoundMode : int {
     RoundDown = 0, // OCP / NV ROUND_DOWN / torchao FLOOR:
-                   //   scale = floor_pow2(amax) / 4. ~37% max clipping.
+                   //   scale = floor_pow2(amax) / 2^target_max_pow2.
+                   //   ~37% max clipping (FP4 default).
     RoundUp   = 1, // NV / DSv4 Pro / FlashInfer / torchao RCEIL:
-                   //   scale = ceil_pow2(amax / 6). 0% max clipping. (industry default)
+                   //   scale = ceil_pow2(amax / max_pos).
+                   //   0% max clipping. (industry default)
     Even      = 2, // Quark EVEN / torchao EVEN:
-                   //   scale = round_pow2_1.75(amax) / 4. ~21% max clipping.
+                   //   scale = floor_pow2(round_pow2_special(amax)) /
+                   //   2^target_max_pow2 with val_to_add =
+                   //   1 << (23 - mbits - 1).
+                   //   AMD Quark default for MXFP4/MXFP8.
     Ceil      = 3, // torchao CEIL (no Quark / NV equivalent):
-                   //   scale = ceil_pow2(amax) / 4. 0% max clipping but
-                   //   coarser grid than RoundUp on [2^k, 1.5*2^k).
+                   //   scale = ceil_pow2(amax) / 2^target_max_pow2.
+                   //   0% max clipping but coarser grid than RoundUp on
+                   //   [2^k, 1.5*2^k).
 };
 
-// Default MXFP4 E8M0 scale: NV ROUND_UP / DSv4 Pro / FlashInfer (industry mainstream).
-// scale = ceil_pow2(amax / 6).  Guarantees 0% max-value clipping (scale * 6 >= amax).
-// NaN/Inf inputs yield exponent 0xFF (E8M0 NaN); mantissa is always stripped.
-__device__ __forceinline__ float fp4_f32_to_e8m0_scale(float amax)
+// MX-format element dtype tag selecting per-dtype constants.
+// Values **must** stay 1:1 with ``aiter.utility.mx_types.MxDtype``.
+enum class MxDtype : int {
+    FP4_E2M1 = 0, // max_pos = 6.0,    target_max_pow2 = 2 (= log2(4)),    mbits = 1
+    FP8_E4M3 = 1, // max_pos = 448.0,  target_max_pow2 = 8 (= log2(256)),  mbits = 3
+    // FP8_E5M2 / FP6_* / MX_INT8 -- reserved.
+};
+
+// Per-MX-dtype constants. The four scale rounding formulas depend on:
+//   * max_pos        : max representable normal value of the target dtype
+//                      (used by RoundUp / RCEIL: ceil_pow2(amax / max_pos)).
+//   * target_max_pow2: log2(largest pow2 <= max_pos)
+//                      (used by RoundDown / Ceil / Even: divisor
+//                      2^target_max_pow2).
+//   * mbits          : mantissa bits of the target dtype
+//                      (used by Even: val_to_add = 1 << (23 - mbits - 1)).
+template <MxDtype dtype> struct MxDtypeConfig;
+
+template <> struct MxDtypeConfig<MxDtype::FP4_E2M1> {
+    static constexpr int      target_max_pow2 = 2;        // log2(4)
+    static constexpr float    max_pos         = 6.0f;
+    static constexpr float    inv_max_pos     = 1.0f / 6.0f;   // 0x3E2AAAAB
+    static constexpr float    inv_max_pow2    = 0.25f;         // 1/4
+    static constexpr int      mbits           = 1;
+    static constexpr uint32_t even_val_to_add = 0x00200000u;   // 1 << (23 - 1 - 1) = 1 << 21
+};
+
+template <> struct MxDtypeConfig<MxDtype::FP8_E4M3> {
+    static constexpr int      target_max_pow2 = 8;              // log2(256)
+    static constexpr float    max_pos         = 448.0f;
+    static constexpr float    inv_max_pos     = 1.0f / 448.0f;  // 0x3B125641
+    static constexpr float    inv_max_pow2    = 1.0f / 256.0f;  // 1/256
+    static constexpr int      mbits           = 3;
+    static constexpr uint32_t even_val_to_add = 0x00080000u;    // 1 << (23 - 3 - 1) = 1 << 19
+};
+
+// Generic E8M0 dequant scale computation.
+//
+// Returns the *dequantization* scale as an f32 with a power-of-2 bit
+// pattern, ready for direct multiplication into the dequantized data and
+// for E8M0 bit extraction via ``(__float_as_uint(s) >> 23) & 0xFF``.
+//
+// This template mirrors PyTorch torchao's ``to_mx(scaling_mode, elem_dtype)``
+// 1:1 and is the C++ analogue of:
+//   * Python CPU ref: ``aiter.utility.fp4_utils.f32_to_mx_e8m0_scale``
+//   * FlyDSL builder: ``aiter.ops.flydsl.kernels.quant_utils.emit_mx_e8m0_scale``
+//
+// The template parameters are compile-time constants (selected by the
+// caller's switch over runtime ``round_mode``), so the ``if constexpr``
+// branch is fully resolved before codegen -- no runtime dispatch overhead.
+//
+// NaN/Inf inputs preserve the f32 exponent (0xFF) which downstream consumers
+// interpret as E8M0 NaN.
+template <MxScaleRoundMode rmode = MxScaleRoundMode::RoundUp,
+          MxDtype          dtype = MxDtype::FP4_E2M1>
+__device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
 {
-    constexpr float inv_fp4_max = 1.0f / 6.0f;
-    uint32_t u32      = __builtin_bit_cast(uint32_t, amax * inv_fp4_max);
-    uint32_t exponent = (u32 >> 23) & 0xFFu;
-    if(exponent < 0xFFu && (u32 & 0x7FFFFFu))
-        exponent += 1;
-    return __builtin_bit_cast(float, exponent << 23);
+    using Cfg = MxDtypeConfig<dtype>;
+
+    if constexpr (rmode == MxScaleRoundMode::RoundUp)
+    {
+        // ceil_pow2(amax / max_pos): NV / DSv4 / FlashInfer / torchao RCEIL.
+        const uint32_t u32      = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pos);
+        uint32_t       exponent = (u32 >> 23) & 0xFFu;
+        if(exponent < 0xFFu && (u32 & 0x7FFFFFu))
+            exponent += 1;
+        return __builtin_bit_cast(float, exponent << 23);
+    }
+    else if constexpr (rmode == MxScaleRoundMode::RoundDown)
+    {
+        // floor_pow2(amax) / 2^target_max_pow2: OCP MX / torchao FLOOR.
+        const uint32_t u32      = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pow2);
+        const uint32_t exponent = (u32 >> 23) & 0xFFu;
+        return __builtin_bit_cast(float, exponent << 23);
+    }
+    else if constexpr (rmode == MxScaleRoundMode::Ceil)
+    {
+        // ceil_pow2(amax) / 2^target_max_pow2: torchao CEIL.
+        const uint32_t u32      = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pow2);
+        uint32_t       exponent = (u32 >> 23) & 0xFFu;
+        if(exponent < 0xFFu && (u32 & 0x7FFFFFu))
+            exponent += 1;
+        return __builtin_bit_cast(float, exponent << 23);
+    }
+    else if constexpr (rmode == MxScaleRoundMode::Even)
+    {
+        // floor_pow2(round_pow2_special(amax)) / 2^target_max_pow2:
+        // Quark EVEN / torchao EVEN. Add a half-step at the
+        // ``(mbits+1)``-th-from-top mantissa bit, drop mantissa, then
+        // subtract target_max_pow2 from the biased exponent (saturating
+        // to >= 0). NaN/Inf input preserves exponent 0xFF.
+        const uint32_t bits     = __builtin_bit_cast(uint32_t, amax);
+        const uint32_t rounded  = (bits + Cfg::even_val_to_add) & 0xFF800000u;
+        const uint32_t raw_exp  = (rounded >> 23) & 0xFFu;
+        const uint32_t exponent = (raw_exp >= static_cast<uint32_t>(Cfg::target_max_pow2))
+                                      ? (raw_exp - static_cast<uint32_t>(Cfg::target_max_pow2))
+                                      : 0u;
+        return __builtin_bit_cast(float, exponent << 23);
+    }
 }
 
-// Backward-compat alias: same as fp4_f32_to_e8m0_scale (now the default round-up form).
+// ---------------------------------------------------------------------------
+// Backwards-compatible thin wrappers (specialized for FP4 E2M1).
+//
+// These preserve the names/signatures used by callers in
+// ``csrc/kernels/quant_kernels.cu`` and elsewhere. New code should prefer
+// the generic ``fp_f32_to_e8m0_scale<rmode, dtype>`` so the choice of mode
+// and dtype is explicit at the call site.
+// ---------------------------------------------------------------------------
+
+// Default MXFP4 E8M0 scale: NV ROUND_UP / DSv4 Pro / FlashInfer (industry
+// mainstream). scale = ceil_pow2(amax / 6). 0% max-value clipping.
+__device__ __forceinline__ float fp4_f32_to_e8m0_scale(float amax)
+{
+    return fp_f32_to_e8m0_scale<MxScaleRoundMode::RoundUp, MxDtype::FP4_E2M1>(amax);
+}
+
+// BC alias of fp4_f32_to_e8m0_scale (RCEIL / RoundUp).
 __device__ __forceinline__ float fp4_f32_to_e8m0_scale_roundup(float amax)
 {
-    return fp4_f32_to_e8m0_scale(amax);
+    return fp_f32_to_e8m0_scale<MxScaleRoundMode::RoundUp, MxDtype::FP4_E2M1>(amax);
 }
 
 // OCP standard / NV ROUND_DOWN / torchao FLOOR:
-// scale = floor_pow2(amax / 4) = floor_pow2(amax) / 4.
-// ~37% of random inputs will have amax > scale * 6 (max clipping).  Opt-in only;
-// callers that explicitly request OCP RoundDown semantics should use this.
-// NaN/Inf inputs yield exponent 0xFF (E8M0 NaN); mantissa is always stripped.
+// scale = floor_pow2(amax) / 4. ~37% max clipping. Opt-in only.
 __device__ __forceinline__ float fp4_f32_to_e8m0_scale_ocp(float amax)
 {
-    constexpr float inv_fp4_pow2_max = 0.25f; // 1 / max_pow2(FP4 E2M1) = 1/4
-    uint32_t u32      = __builtin_bit_cast(uint32_t, amax * inv_fp4_pow2_max);
-    uint32_t exponent = (u32 >> 23) & 0xFFu;
-    return __builtin_bit_cast(float, exponent << 23);
+    return fp_f32_to_e8m0_scale<MxScaleRoundMode::RoundDown, MxDtype::FP4_E2M1>(amax);
 }
 
-// torchao CEIL: scale = ceil_pow2(amax / 4) = ceil_pow2(amax) / 4.
-// 0% max-value clipping but coarser quantization grid than the default
-// round-up (which uses divisor 6).  No Quark / NV equivalent; this exists
-// purely to mirror the fourth ScaleCalculationMode in PyTorch torchao.
-// NaN/Inf inputs yield exponent 0xFF (E8M0 NaN); mantissa is always stripped.
+// torchao CEIL: scale = ceil_pow2(amax) / 4. 0% max-value clipping but
+// coarser grid than ``fp4_f32_to_e8m0_scale``.
 __device__ __forceinline__ float fp4_f32_to_e8m0_scale_ceil(float amax)
 {
-    constexpr float inv_fp4_pow2_max = 0.25f; // 1 / max_pow2(FP4 E2M1) = 1/4
-    uint32_t u32      = __builtin_bit_cast(uint32_t, amax * inv_fp4_pow2_max);
-    uint32_t exponent = (u32 >> 23) & 0xFFu;
-    if(exponent < 0xFFu && (u32 & 0x7FFFFFu))
-        exponent += 1;
-    return __builtin_bit_cast(float, exponent << 23);
+    return fp_f32_to_e8m0_scale<MxScaleRoundMode::Ceil, MxDtype::FP4_E2M1>(amax);
+}
+
+// AMD Quark EVEN / torchao EVEN: scale =
+// floor_pow2(round_pow2_special(amax)) / 4 with val_to_add = 0x200000.
+__device__ __forceinline__ float fp4_f32_to_e8m0_scale_even(float amax)
+{
+    return fp_f32_to_e8m0_scale<MxScaleRoundMode::Even, MxDtype::FP4_E2M1>(amax);
 }
 
 // Compute the swizzled E8M0 scale index for tiled FP4 layout.
