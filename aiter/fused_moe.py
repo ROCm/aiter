@@ -1560,9 +1560,11 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         # and activation == aiter.ActivationType.Swiglu
     ):
-        if not _MOE_A8W4_BYPASS_QUANT:
+        if not _MOE_A8W4_BYPASS_QUANT and metadata.fuse_quant != "fp8":
             # stage1 input is not topk-replicated, so M==token_num and the
             # HIP launcher infers TOPK=1 from input.numel() / (cols * token_num).
+            # When fuse_quant == "fp8" the FlyDSL stage1 kernel quantizes a1
+            # internally, so we must NOT pre-quantize here.
             a1, a1_scale = fused_dynamic_mxfp8_quant_moe_sort(
                 hidden_states,
                 sorted_ids=sorted_ids,
