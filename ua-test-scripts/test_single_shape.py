@@ -45,7 +45,15 @@ def parse_args():
     p.add_argument("--block-size", type=int, default=32,
                    help="KV cache block size (default: 32)")
     p.add_argument("--num-blocks", type=int, default=None,
-                   help="Total number of KV cache blocks (default: auto)")
+                   help="Size of the KV cache pool in physical blocks. "
+                        "If omitted, defaults to `batch * ceil(seqlen_k / "
+                        "block_size)` — exactly enough for every (sequence, "
+                        "position) to map to its own unique physical block, "
+                        "matching how vLLM/SGLang-style allocators hand "
+                        "out blocks. If you pass a smaller value, it is "
+                        "clamped up (a warning is printed) — block reuse "
+                        "across sequences is never allowed because it "
+                        "creates fake L2 reuse and sandbags the benchmark.")
     p.add_argument("--dtype", choices=["bf16", "fp16", "fp8"], default="bf16",
                    help="Data type for Q/K/V (default: bf16). "
                         "`fp8` quantises Q/K/V to e4m3 (e4m3fn on gfx950, "
@@ -203,10 +211,28 @@ def make_tensors(args, device="cuda"):
 
     total_q = b * sq
     max_blocks_per_seq = (sk + blk - 1) // blk
+
+    # We want every (sequence, position) → physical-block mapping in the
+    # block_table to be UNIQUE. This matches how a real KV-cache allocator
+    # (vLLM, SGLang, etc.) hands blocks out: each prefill slot lives in its
+    # own physical block, and decode sequences don't share blocks with each
+    # other. Required pool size: b * max_blocks_per_seq. If the caller asks
+    # for a smaller pool we clamp up (warning printed) — block reuse across
+    # sequences silently turns the test into an L2-resident sandbag, since
+    # a randomly-picked block ends up referenced N×(b*per_seq/num_blocks)
+    # times across the launch (cf. `decode b=128 sk=128k num_blocks=8k`
+    # which oversubscribes 64× and reports >peak-HBM bandwidth).
+    required_blocks = b * max_blocks_per_seq
     if args.num_blocks is not None:
-        num_blocks = args.num_blocks
+        if args.num_blocks < required_blocks:
+            print(f"  NOTE: --num-blocks {args.num_blocks:,} is below the "
+                  f"unique-per-(seq,pos) requirement of {required_blocks:,} "
+                  f"for this shape; clamping up.")
+            num_blocks = required_blocks
+        else:
+            num_blocks = args.num_blocks
     else:
-        num_blocks = max(1024, 2 * max_blocks_per_seq)
+        num_blocks = required_blocks
 
     scale = 1.0 / math.sqrt(d)
 
@@ -252,12 +278,23 @@ def make_tensors(args, device="cuda"):
     # Metadata
     cu_seqlens_q = torch.arange(0, b + 1, dtype=torch.int32, device=device) * sq
     seq_lens_k = torch.full((b,), sk, dtype=torch.int32, device=device)
-    block_table = torch.randint(0, num_blocks, (b, max_blocks_per_seq),
-                                dtype=torch.int32, device=device)
 
-    # for 10 first samples add the num blocks as the first value in the row, in order to test possible overflow if the
-    # kv cache size is larger than the int32 max.
-    block_table[:10, 0] = num_blocks - 1
+    # Sample `required_blocks` UNIQUE physical block indices from
+    # [0, num_blocks) via randperm, then reshape to (b, max_blocks_per_seq).
+    # Each (seq, position) thereby gets its own physical block, so the only
+    # L2 reuse during a kernel launch comes from a sequence revisiting its
+    # own tiles (it doesn't — each tile is read once per pass), not from
+    # multiple sequences hammering the same block. randperm on >1M elements
+    # is well under 1ms on MI355, so this isn't a benchmark hot path.
+    perm = torch.randperm(num_blocks, device=device)[:required_blocks]
+    block_table = perm.to(torch.int32).view(b, max_blocks_per_seq).contiguous()
+    # NOTE: previously we injected `num_blocks-1` into the first 10 rows'
+    # column-0 slot to stress the int32-stride-overflow path. That is
+    # redundant now: the overflow flag is computed from
+    # `num_blocks * stride_k_cache_0 > INT32_MAX`, so passing any
+    # num_blocks above that threshold automatically exercises the long
+    # path on every K/V load. (And blindly overwriting a slot would
+    # silently re-introduce duplicate block indices.)
 
     return {
         'q': q, 'k': k, 'v': v,
