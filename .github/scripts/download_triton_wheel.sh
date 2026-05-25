@@ -19,7 +19,8 @@ echo "Downloading triton wheel from ${TRITON_INDEX_URL} into ${TRITON_WHEEL_DIR}
 python3 -m pip download \
     --only-binary=:all: \
     --dest "${TRITON_WHEEL_DIR}" \
-    --extra-index-url "${TRITON_INDEX_URL}" \
+    --index-url "${TRITON_INDEX_URL}" \
+    --extra-index-url https://pypi.org/simple \
     triton
 
 ls -lh "${TRITON_WHEEL_DIR}"
