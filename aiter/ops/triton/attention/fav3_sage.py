@@ -137,7 +137,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             return_lse=return_lse,
         )
         if return_lse:
-            q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, sage_lse_delta = sq_result
+            q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, sage_lse_delta = (
+                sq_result
+            )
         else:
             q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sq_result
             sage_lse_delta = None

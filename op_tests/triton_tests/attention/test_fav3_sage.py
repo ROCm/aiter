@@ -738,9 +738,7 @@ def test_sage_mxfp4_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat
 
 @pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(256, 256), (512, 512)])
-@pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 16), (16, 4)]
-)
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 16), (16, 4)])
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
 def test_sage_return_lse_matches_reference(
     BATCH: int,
@@ -797,9 +795,9 @@ def test_sage_return_lse_matches_reference(
     qk = (q_b.float() @ k_b.float().transpose(-1, -2)) * softmax_scale
     lse_ref = torch.logsumexp(qk, dim=-1)
 
-    assert triton_lse.shape == lse_ref.shape, (
-        f"LSE shape {tuple(triton_lse.shape)} != reference {tuple(lse_ref.shape)}"
-    )
+    assert (
+        triton_lse.shape == lse_ref.shape
+    ), f"LSE shape {tuple(triton_lse.shape)} != reference {tuple(lse_ref.shape)}"
     # Pre-PR (no K-mean correction) the LSE is offset by
     # softmax_scale * Q . mean(K)^T, which is O(1)+ in magnitude.
     # With the correction, the residual is bounded by sage's int8/fp8 quant noise.
@@ -903,9 +901,7 @@ def test_sage_ring_merge_matches_single_call(
         if out_acc is None:
             out_acc, lse_acc = out_s, lse_s
         else:
-            out_acc, lse_acc = _fa_merge_partial(
-                out_acc, lse_acc, out_s, lse_s, layout
-            )
+            out_acc, lse_acc = _fa_merge_partial(out_acc, lse_acc, out_s, lse_s, layout)
 
     merged_out = out_acc.to(full_out.dtype)
     assert merged_out.shape == full_out.shape

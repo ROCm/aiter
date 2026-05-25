@@ -333,9 +333,7 @@ def sage_quant(
     # an un-smoothed K would produce. Return delta so the caller can add it
     # back.
     if k_mean is None:
-        delta_lse = torch.zeros(
-            (b, h_qo, qo_len), device=q.device, dtype=torch.float32
-        )
+        delta_lse = torch.zeros((b, h_qo, qo_len), device=q.device, dtype=torch.float32)
     else:
         if layout == "bhsd":
             q_bhsd = q
@@ -345,14 +343,14 @@ def sage_quant(
             kmean_bhsd = k_mean.transpose(1, 2)
 
         if h_qo != h_kv:
-            assert h_qo % h_kv == 0, (
-                f"GQA ratio must be integer, got h_qo={h_qo}, h_kv={h_kv}"
-            )
+            assert (
+                h_qo % h_kv == 0
+            ), f"GQA ratio must be integer, got h_qo={h_qo}, h_kv={h_kv}"
             kmean_bhsd = kmean_bhsd.repeat_interleave(h_qo // h_kv, dim=1)
 
-        delta_lse = (
-            q_bhsd.to(torch.float32) * kmean_bhsd.to(torch.float32)
-        ).sum(dim=-1) * sm_scale
+        delta_lse = (q_bhsd.to(torch.float32) * kmean_bhsd.to(torch.float32)).sum(
+            dim=-1
+        ) * sm_scale
 
     return q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale, delta_lse
 
