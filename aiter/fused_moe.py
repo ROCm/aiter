@@ -1578,7 +1578,9 @@ def fused_moe_2stages(
             if metadata.fuse_quant == "fp8":
                 a1_scale = torch.empty(0, dtype=torch.uint8, device=a1.device)
             else:
-                a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
+                a1_scale = torch.ones(
+                    [M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device
+                )
 
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights; no activation quantization needed
