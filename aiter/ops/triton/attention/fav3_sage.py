@@ -76,6 +76,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         return_lse: bool = True,
         layout: str = "bshd",
         config: Optional[dict] = None,
+        smooth_k: bool = True,
         block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ):
         # 1. Dimension Mapping & Config Setup
@@ -122,7 +123,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         fp8_dtype = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_dtype).max
 
-        q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
+        sq_result = sage_quant(
             q,
             k,
             v,
@@ -132,7 +133,14 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             BLKQ=BLKQ,
             BLKK=BLKK,
             layout=layout,
+            smooth_k=smooth_k,
+            return_lse=return_lse,
         )
+        if return_lse:
+            q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale, sage_lse_delta = sq_result
+        else:
+            q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sq_result
+            sage_lse_delta = None
 
         # 4. Verify Descale Shapes (Grouped scaling for GQA/MQA)
         num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
@@ -172,6 +180,12 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         )
 
         if return_lse:
+            # Recover the un-smoothed LSE. The kernel computed the LSE
+            # against (K - k_mean); adding delta = sm_scale * Q . k_mean^T
+            # shifts it back so it is consistent with a kernel call on the
+            # un-smoothed K (required for correct ring-attention merging).
+            if sage_lse_delta is not None:
+                softmax_lse = softmax_lse + sage_lse_delta.to(softmax_lse.dtype)
             return out, softmax_lse
 
         return out
@@ -192,6 +206,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # return_lse
             None,  # layout
             None,  # config
+            None,  # smooth_k
             None,  # block_lut
         )
 
@@ -210,6 +225,7 @@ def fav3_sage_wrapper_func(
     return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    smooth_k: bool = True,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     """
@@ -242,6 +258,7 @@ def fav3_sage_wrapper_func(
         layout: bshd or bhsd layout for the inputs
         config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
                 waves_per_eu, PRE_LOAD_V, num_stages, num_warps
+        smooth_k: Whether to apply k-smoothing to the K tensor
         block_lut: Optional ragged LUT for block-sparse attention,
                 (kv_block_indices, lut_start, lut_count) from block_attn_mask_to_ragged_lut.
                 When None, dense attention is used.
@@ -290,6 +307,7 @@ def fav3_sage_wrapper_func(
         return_lse,
         layout,
         config,
+        smooth_k,
         block_lut,
     )
 
