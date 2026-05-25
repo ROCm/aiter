@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# Wrap scripts/compare_benchmark.py for the tuned_op_bench CI job.
+# Wrap .github/scripts/compare_benchmark.py for the tuned_op_bench CI job.
 # Prints a comparison table to stdout (captured by the job step into
 # $GITHUB_STEP_SUMMARY). Exits 0 unless --fail-on-regress is passed and
 # at least one REGRESS row is found.
@@ -27,7 +27,7 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-python3 "${REPO_ROOT}/scripts/compare_benchmark.py" \
+python3 "${REPO_ROOT}/.github/scripts/compare_benchmark.py" \
     "$BASE" "$CURR" \
     --baseline-label "$BASE_LABEL" \
     --current-label "$CURR_LABEL" \

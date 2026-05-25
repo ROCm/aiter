@@ -30,7 +30,13 @@ from aiter.fused_moe import (
 from aiter.aot.flydsl.common import fail_on_aot_cache_miss
 from aiter.ops.flydsl.moe_common import GateMode
 import aiter.ops.flydsl.moe_kernels as _aiter_mk
-from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
+
+try:
+    from tuned_op_bench_utils import append_tuned_op_bench_rows
+except ModuleNotFoundError as e:
+    if e.name != "tuned_op_bench_utils":
+        raise
+    from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 
 
 from aiter.ops.shuffle import (

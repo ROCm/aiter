@@ -295,9 +295,6 @@ def main() -> int:
     METRIC_HDRS = ("ratio", "cur(us)", "base(us)")
 
     # Build display_cols: walk key_cols, drop hidden, splice derived in place
-    _derived_sources = {
-        src for sources in DERIVED_TUPLE_COLS.values() for src in sources
-    }
     _derived_first_src = {
         sources[0]: name for name, sources in DERIVED_TUPLE_COLS.items()
     }
