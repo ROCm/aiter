@@ -1191,19 +1191,6 @@ def get_2stage_cfgs(
                 model_dim_pad=hidden_pad,
             )
         elif is_cktile2:
-            # cktile_* kernels live in module_moe_cktile2stages, not in
-            # module_moe_ck2stages. Dispatching them via ck_moe_stage2_fwd
-            # misses the lookup table and falls back to heuristic, which
-            # breaks cudagraph capture.
-            #
-            # Do NOT forward kernelName2: the CSV value `cktile_a8w4_bm{N}`
-            # is just a tuner label (gemm_moe_tune.py:2344,2377), not a real
-            # key in get_cktile_name_lookup() (real names are e.g.
-            # `moe_cktile2stages_gemm2_256x32x256x256_...`). The tuner itself
-            # (gemm_moe_tune.py:394-409) calls cktile_moe_stage2 with empty
-            # kernel_name + block_m, hitting the heuristic dispatch in
-            # moe_cktile2stages.cu:456-487. Match that here so we land on the
-            # same kernel as the tuner measured.
             stage2_func = functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,
@@ -1450,14 +1437,6 @@ def get_2stage_cfgs(
                 model_dim_pad=hidden_pad,
             )
         elif kernelName2 and kernelName2.startswith("cktile_"):
-            # cktile_* kernels must be dispatched via cktile_moe_stage2 (in
-            # module_moe_cktile2stages); ck_moe_stage2_fwd only knows about
-            # module_moe_ck2stages kernels.
-            #
-            # Do NOT forward kernelName2: `cktile_a8w4_bm{N}` is a tuner label,
-            # not a key in get_cktile_name_lookup(). The tuner itself uses
-            # empty kernel_name + block_m and relies on the heuristic dispatch
-            # in moe_cktile2stages.cu — match that here.
             stage2_func = functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,
@@ -1495,14 +1474,6 @@ def get_2stage_cfgs(
         block_m = ([el for el in tmpList if block_m < el] + [128])[0]
 
     if kernelName2 and kernelName2.startswith("cktile_"):
-        # cktile_* kernels must be dispatched via cktile_moe_stage2 (in
-        # module_moe_cktile2stages); ck_moe_stage2_fwd only knows about
-        # module_moe_ck2stages kernels.
-        #
-        # Do NOT forward kernelName2: `cktile_a8w4_bm{N}` is a tuner label,
-        # not a key in get_cktile_name_lookup(). The tuner itself uses empty
-        # kernel_name + block_m and relies on the heuristic dispatch in
-        # moe_cktile2stages.cu — match that here.
         stage2_func = functools.partial(
             cktile_moe_stage2,
             n_pad_zeros=hidden_pad // 64 * 64,
