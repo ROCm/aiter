@@ -13,6 +13,8 @@ on:
       - "op_tests/op_benchmarks/triton/**"
       - ".github/workflows/triton-test.yaml"
       - ".github/scripts/build_aiter_triton.sh"
+      - ".github/scripts/download_triton_wheel.sh"
+      - ".github/scripts/install_triton.sh"
       - ".github/scripts/select_triton_tests.py"
       - ".github/scripts/split_tests.sh"
       - ".github/scripts/verify_triton_pin.py"
@@ -58,12 +60,41 @@ jobs:
           path: triton_shard_*.list
           retention-days: 7
 
+  prepare_triton_wheel:
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
+    runs-on: ubuntu-latest
+    needs: [check-signal]
+    env:
+      DOCKER_IMAGE: "rocm/pytorch:latest"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Triton wheel
+        id: download_triton_wheel
+        continue-on-error: true
+        run: |
+          set -ex
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            ${{ env.DOCKER_IMAGE }} \
+            bash ./.github/scripts/download_triton_wheel.sh triton_wheels
+
+      - name: Upload Triton wheel artifact
+        if: ${{ steps.download_triton_wheel.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: triton_wheelhouse
+          path: triton_wheels/
+          retention-days: 7
+
   # Step 2: MI35X matrix jobs
   triton:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
     name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-mi35x-1
-    needs: [split_triton_tests, check-signal]
+    needs: [split_triton_tests, prepare_triton_wheel, check-signal]
     strategy:
       fail-fast: false
       matrix:
@@ -83,6 +114,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: triton_shards
+
+      - name: Download Triton wheel artifact
+        id: download_triton_wheel
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: triton_wheelhouse
+          path: triton_wheels
 
       - name: List test shard files
         run: |
@@ -127,6 +166,7 @@ jobs:
           docker run -dt \
           --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
+          -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
@@ -187,7 +227,7 @@ jobs:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
     name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
     runs-on: aiter-1gpu-runner
-    needs: [split_triton_tests, check-signal]
+    needs: [split_triton_tests, prepare_triton_wheel, check-signal]
     strategy:
       fail-fast: false
       matrix:
@@ -207,6 +247,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: triton_shards
+
+      - name: Download Triton wheel artifact
+        id: download_triton_wheel
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: triton_wheelhouse
+          path: triton_wheels
 
       - name: List test shard files
         run: |
@@ -251,6 +299,7 @@ jobs:
           docker run -dt \
           --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
+          -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \

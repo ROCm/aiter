@@ -135,7 +135,13 @@ def gemm_a4w4(
     ):
         splitK = 0 if splitK is None else splitK
         return gemm_a4w4_blockscale(
-            A.view(m, k // 2), B, A_scale, B_scale, out, splitK=splitK
+            A.view(m, k // 2),
+            B,
+            A_scale,
+            B_scale,
+            out,
+            splitK=splitK,
+            kernelName=kernelName,
         )[:m]
     assert (
         out.shape[0] % 32 == 0
@@ -226,6 +232,7 @@ def gemm_a4w4_blockscale(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     splitK: int = 0,
+    kernelName: str = "",
 ) -> Tensor: ...
 
 

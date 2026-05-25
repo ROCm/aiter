@@ -229,6 +229,7 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_routing_sigmoid_top1_fused.py]=1
     FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_topk.py]=1
     FILE_TIMES[op_tests/triton_tests/triton_metadata_redirect/test_metadata_redirect.py]=1
+    FILE_TIMES[op_tests/triton_tests/torch_compile/test_compile_constexpr_mutation.py]=2
 fi
 
 get_time() {
