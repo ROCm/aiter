@@ -1685,7 +1685,8 @@ struct gmem {
         }
         #undef GPTR_
         #undef LPTR_
-#elif __clang_major__ >= 20   // start from rocm 7.0,introduced by https://github.com/llvm/llvm-project/pull/132048, 133055, 132957
+#elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__)   // CDNA: buffer-load lands directly in LDS (vmem-to-lds-load-insts).
+#if __clang_major__ >= 20    // clang 20+ raw_ptr builtin (rocm 7.0+)
         if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  4, v_os, s_os, 0, aux); }
@@ -1703,6 +1704,10 @@ struct gmem {
         else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 12, v_os, s_os, 0, aux); }
         else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 16, v_os, s_os, 0, aux); }
 #endif
+#endif
+#else
+        auto val = _load<vec, aux>(v_os, s_os, number<aux>{});  // No buffer->LDS hardware: synchronous load->VGPR->LDS fallback.
+        *reinterpret_cast<OPUS_LDS_ADDR type*>(dst) = val;
 #endif
     }
 
