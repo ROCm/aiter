@@ -215,7 +215,9 @@ def sage_quant(
     Args:
         q: Query tensor
         k: Key tensor
-        km: Optional pre-computed K smoothing factors (if None and smooth_k=True, will be computed)
+        v: Value tensor
+        FP8_TYPE: Floating-point type for the quantized V tensor
+        FP8_MAX: Maximum value for the quantized V tensor
         BLKQ: Block size for Q quantization
         BLKK: Block size for K quantization
         sm_scale: Softmax scale factor (defaults to head_dim^-0.5)

@@ -76,8 +76,8 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         return_lse: bool = True,
         layout: str = "bshd",
         config: Optional[dict] = None,
-        smooth_k: bool = True,
         block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        smooth_k: bool = True,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -206,8 +206,8 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # return_lse
             None,  # layout
             None,  # config
-            None,  # smooth_k
             None,  # block_lut
+            None,  # smooth_k
         )
 
 
@@ -225,8 +225,8 @@ def fav3_sage_wrapper_func(
     return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
-    smooth_k: bool = True,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    smooth_k: bool = True,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -243,25 +243,21 @@ def fav3_sage_wrapper_func(
         q: Query tensor [batch, seqlen, num_q_heads, head_dim] (BF16/FP32)
         k: Key tensor [batch, seqlen, num_kv_heads, head_dim] (BF16/FP32)
         v: Value tensor [batch, seqlen, num_kv_heads, head_dim] (BF16/FP32)
-        k_mean: Mean of k to conduct k-smoothing
         softmax_scale: Scaling factor for softmax (default: 1/sqrt(head_dim))
         causal: Whether to apply causal masking
-        qv: Extra query-value tensor (not yet supported)
         window_size: Sliding window attention size (left, right)
         attention_chunk: Chunking parameter (0 or 1 only)
         softcap: Softcapping value (not yet supported)
-        num_splits: Number of splits for parallel processing (not yet supported)
-        pack_gqa: GQA packing flag (not yet supported)
         deterministic: Whether to use deterministic backward (not yet supported)
         sm_margin: SM margin parameter (not yet supported)
         return_lse: return softmax_lse if True, otherwise return None
         layout: bshd or bhsd layout for the inputs
         config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
                 waves_per_eu, PRE_LOAD_V, num_stages, num_warps
-        smooth_k: Whether to apply k-smoothing to the K tensor
         block_lut: Optional ragged LUT for block-sparse attention,
                 (kv_block_indices, lut_start, lut_count) from block_attn_mask_to_ragged_lut.
                 When None, dense attention is used.
+        smooth_k: Whether to apply k-smoothing to the K tensor
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -270,7 +266,7 @@ def fav3_sage_wrapper_func(
         - Supports GQA/MQA (num_q_heads != num_kv_heads)
         - Automatically handles grouped quantization for GQA/MQA queries
         - backward is not yet supported
-        - qv, softcap, num_splits, pack_gqa, and sm_margin are not yet supported in FP8 mode
+        - softcap is not yet supported in FP8 mode
     """
 
     # Check that inputs are high precision
@@ -307,8 +303,8 @@ def fav3_sage_wrapper_func(
         return_lse,
         layout,
         config,
-        smooth_k,
         block_lut,
+        smooth_k,
     )
 
 
@@ -340,21 +336,23 @@ def fav3_sage_func(
         q: Query tensor [batch, seqlen, num_q_heads, head_dim] (int8)
         k: Key tensor [batch, seqlen, num_kv_heads, head_dim] (int8)
         v: Value tensor [batch, seqlen, num_kv_heads, head_dim] (BF16/FP16)
-        k_mean: Mean of k to conduct k-smoothing
+        q_descale: Descale factors for Q (float32)
+        k_descale: Descale factors for K (float32)
+        v_descale: Descale factors for V (float32)
         softmax_scale: Scaling factor for softmax (default: 1/sqrt(head_dim))
         causal: Whether to apply causal masking
-        qv: Extra query-value tensor (not yet supported)
         window_size: Sliding window attention size (left, right)
         attention_chunk: Chunking parameter (0 or 1 only)
         softcap: Softcapping value (not yet supported)
-        num_splits: Number of splits for parallel processing (not yet supported)
-        pack_gqa: GQA packing flag (not yet supported)
-        deterministic: Whether to use deterministic backward (not yet supported)
         sm_margin: SM margin parameter (not yet supported)
         return_lse: return softmax_lse if True, otherwise return None
         layout: bshd or bhsd layout for the inputs
         config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
                 waves_per_eu, PRE_LOAD_V, num_stages, num_warps
+        kv_block_indices: Optional ragged LUT for block-sparse attention.
+        lut_start: Optional start index for the ragged LUT
+        lut_count: Optional count of the ragged LUT
+        use_block_sparse: Whether to use block-sparse attention
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)

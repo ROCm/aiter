@@ -734,3 +734,187 @@ def test_sage_mxfp4_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat
         rtol=RTOL_fp8,
         max_diff_percentage=1.5,
     )
+
+
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(256, 256), (512, 512)])
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 16), (16, 4)]
+)
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_sage_return_lse_matches_reference(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """
+    With smooth_k=True the kernel computes LSE against (K - mean(K)). The
+    wrapper's correction term should make the returned LSE match the LSE that
+    an un-smoothed K would produce (within sage's int8/fp8 quant noise).
+    This is the property that FA-style ring-attention merging relies on.
+    """
+    HEAD_SZ = 128
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    _, triton_lse = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=True,
+        layout=layout,
+        smooth_k=True,
+    )
+
+    if layout == "bshd":
+        q_b = q.permute(0, 2, 1, 3).contiguous()
+        k_b = k.permute(0, 2, 1, 3).contiguous()
+    else:
+        q_b = q
+        k_b = k
+    if NUM_Q_HEADS != NUM_K_HEADS:
+        assert NUM_Q_HEADS % NUM_K_HEADS == 0
+        k_b = k_b.repeat_interleave(NUM_Q_HEADS // NUM_K_HEADS, dim=1)
+    qk = (q_b.float() @ k_b.float().transpose(-1, -2)) * softmax_scale
+    lse_ref = torch.logsumexp(qk, dim=-1)
+
+    assert triton_lse.shape == lse_ref.shape, (
+        f"LSE shape {tuple(triton_lse.shape)} != reference {tuple(lse_ref.shape)}"
+    )
+    # Pre-PR (no K-mean correction) the LSE is offset by
+    # softmax_scale * Q . mean(K)^T, which is O(1)+ in magnitude.
+    # With the correction, the residual is bounded by sage's int8/fp8 quant noise.
+    torch.testing.assert_close(
+        triton_lse,
+        lse_ref.to(triton_lse.dtype),
+        atol=2e-1,
+        rtol=5e-2,
+    )
+
+
+def _fa_merge_partial(out_a, lse_a, out_b, lse_b, layout: str):
+    """FA log-sum-exp partial merge. LSE is (B, H_q, S_q); output layout varies."""
+    m = torch.maximum(lse_a, lse_b)
+    w_a = (lse_a - m).exp()
+    w_b = (lse_b - m).exp()
+    denom = w_a + w_b
+    if layout == "bhsd":
+        w_a4 = w_a.unsqueeze(-1)
+        w_b4 = w_b.unsqueeze(-1)
+        denom4 = denom.unsqueeze(-1)
+    else:  # bshd: out is (B, S_q, H_q, D); merge weights into that layout.
+        w_a4 = w_a.transpose(1, 2).unsqueeze(-1)
+        w_b4 = w_b.transpose(1, 2).unsqueeze(-1)
+        denom4 = denom.transpose(1, 2).unsqueeze(-1)
+    out = (out_a * w_a4 + out_b * w_b4) / denom4
+    lse = m + denom.log()
+    return out, lse
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize("SEQLEN", [512, 1024])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 4)])
+@pytest.mark.parametrize("RING_DEGREE", [2, 4])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_sage_ring_merge_matches_single_call(
+    BATCH: int,
+    SEQLEN: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    RING_DEGREE: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """
+    Mimic ring attention: split K/V along the sequence dim into RING_DEGREE shards,
+    run sage per shard with return_lse=True, FA-merge the partial (out, lse) pairs,
+    and assert the merged output matches a single-call sage forward (within sage's
+    int8/fp8 quant noise). Pre-PR this diverges with RING_DEGREE because each
+    shard uses a different K mean; post-PR it stays bounded.
+    """
+    HEAD_SZ = 128
+    assert SEQLEN % RING_DEGREE == 0
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN,
+        SEQLEN,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    full_out, _ = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=True,
+        layout=layout,
+        smooth_k=True,
+    )
+
+    seq_dim_kv = 2 if layout == "bhsd" else 1
+    k_shards = k.chunk(RING_DEGREE, dim=seq_dim_kv)
+    v_shards = v.chunk(RING_DEGREE, dim=seq_dim_kv)
+
+    out_acc = None
+    lse_acc = None
+    for k_s, v_s in zip(k_shards, v_shards):
+        out_s, lse_s = fav3_sage_wrapper_func(
+            q,
+            k_s.contiguous(),
+            v_s.contiguous(),
+            softmax_scale,
+            causal=False,
+            return_lse=True,
+            layout=layout,
+            smooth_k=True,
+        )
+        out_s = out_s.float()
+        lse_s = lse_s.float()
+        if out_acc is None:
+            out_acc, lse_acc = out_s, lse_s
+        else:
+            out_acc, lse_acc = _fa_merge_partial(
+                out_acc, lse_acc, out_s, lse_s, layout
+            )
+
+    merged_out = out_acc.to(full_out.dtype)
+    assert merged_out.shape == full_out.shape
+
+    check_attention_outputs(
+        merged_out,
+        full_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=1.0,
+    )
