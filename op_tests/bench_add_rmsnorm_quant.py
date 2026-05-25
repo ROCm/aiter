@@ -49,7 +49,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Benchmark aiter.add_rmsnorm_quant (per-token, int8/fp8)"
     )
-    parser.add_argument("-m", type=int, nargs="*", default=[8, 256, 2048, 2560, 32768])
+    parser.add_argument("-m", type=int, nargs="*", default=[8, 256, 2048, 2560, 4096, 16384, 32768])
     parser.add_argument("-n", type=int, nargs="*", default=[1024, 2048, 4096, 8192])
     parser.add_argument(
         "-d",
@@ -73,6 +73,8 @@ if __name__ == "__main__":
         for n in args.n:
             for m in args.m:
                 rows.append(run(m, n, dtype, args.quant_dtype))
+        for m in [4096, 16384]:
+            rows.append(run(m, 2880, dtype, args.quant_dtype))
 
     df = pd.DataFrame(rows)
     print(df.to_string(index=False))
