@@ -1457,7 +1457,22 @@ namespace py = pybind11;
           py::arg("cos"),                                                \
           py::arg("sin"),                                                \
           py::arg("positions"),                                          \
-          py::arg("rope_dim"));
+          py::arg("rope_dim"));                                          \
+    m.def("rmsnorm_rope_rotate_activation_fp4quant_kvcache",             \
+          &aiter::rmsnorm_rope_rotate_activation_fp4quant_kvcache,       \
+          py::arg("kvcache"),                                            \
+          py::arg("scale"),                                              \
+          py::arg("input"),                                              \
+          py::arg("norm_weight"),                                        \
+          py::arg("cos"),                                                \
+          py::arg("sin"),                                                \
+          py::arg("positions"),                                          \
+          py::arg("epsilon"),                                            \
+          py::arg("rope_dim"),                                           \
+          py::arg("kv_block_size") = 16,                                 \
+          py::arg("group_size") = 32,                                    \
+          py::arg("shuffle_scale") = true,                               \
+          py::arg("do_rotate_act") = false);
 
 #define QUICK_ALL_REDUCE_PYBIND                                                            \
     m.def("init_custom_qr",                                                                \

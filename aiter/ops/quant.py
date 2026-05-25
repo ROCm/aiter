@@ -854,3 +854,28 @@ def rope_rotate_activation(
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
     ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rmsnorm_rope_rotate_activation_fp4quant_kvcache(
+    kvcache: torch.Tensor,
+    scale: torch.Tensor,
+    input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    epsilon: float,
+    rope_dim: int,
+    kv_block_size: int = 16,
+    group_size: int = 32,
+    shuffle_scale: bool = True,
+    do_rotate_act: bool = False,
+) -> None:
+    """Fused RMSNorm, RoPE, optional Hadamard rotate, FP4 quant, and KV cache write.
+
+    When ``shuffle_scale`` is True, writes FlyDSL KV preshuffle layout:
+    kvcache [num_blocks, k_tiles, 4, kv_block_size, 16],
+    scale [num_blocks, k_tiles, 4, kv_block_size].
+    """
+    ...
