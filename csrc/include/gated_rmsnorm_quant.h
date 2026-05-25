@@ -41,4 +41,18 @@ void gated_rmsnorm_fp8_group_quant(
     bool transpose_scale = false);
 
 
+/**
+ * BF16/FP16 output variant: Gated RMSNorm without quantization.
+ *
+ * Performs: out = rms_norm(x, weight, eps) * silu(z)
+ * Output is bf16/fp16 (same dtype as input), no scale tensor needed.
+ */
+void gated_rmsnorm_bf16(
+    torch::Tensor& out,            // [num_tokens, num_heads * head_dim] (bf16/fp16)
+    torch::Tensor const& x,        // [num_tokens, num_heads, head_dim] - input to normalize
+    torch::Tensor const& z,        // [num_tokens, num_heads, head_dim] - gating tensor
+    torch::Tensor const& weight,   // [head_dim] - RMSNorm weight
+    double epsilon);
+
+
 } // namespace aiter

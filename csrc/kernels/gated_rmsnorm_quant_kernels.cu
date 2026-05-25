@@ -36,7 +36,7 @@ namespace aiter {
  * - Loop unrolling with #pragma unroll
  * - Coalesced memory access
  */
-template <typename DTYPE_I, typename DTYPE_O, int GROUP_SIZE = 128, int THREAD_DATA_SIZE = 16, int BLOCK_SIZE = 256, bool TRANSPOSE_SCALE = false>
+template <typename DTYPE_I, typename DTYPE_O, int GROUP_SIZE = 128, int THREAD_DATA_SIZE = 16, int BLOCK_SIZE = 256, bool TRANSPOSE_SCALE = false, bool FUSE_QUANT = true>
 __global__ void gated_rmsnorm_fp8_group_quant_kernel(
     DTYPE_O* __restrict__ out,           // [num_tokens, num_heads * head_dim]
     float* __restrict__ scale,           // [num_heads, num_tokens] (transposed) or [num_tokens, num_heads]
@@ -141,45 +141,57 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
         gated_vals[i] = normed_vals[i] * silu_z;
     }
 
-    // Step 4: Find max absolute value for FP8 quantization
-    float local_max = -INFINITY;  // FIX: Initialize to -infinity, not 0
-    #pragma unroll
-    for (int i = 0; i < THREAD_DATA_SIZE; i++) {
-        local_max = fmaxf(local_max, fabsf(gated_vals[i]));
-    }
-
-    // Group-local reduce max (only within threads of this group)
-    #pragma unroll
-    for (int mask = threads_per_group / 2; mask > 0; mask >>= 1) {
-        local_max = fmaxf(local_max, __shfl_xor(local_max, mask));
-    }
-
-    // Step 5: Compute scale for FP8 quantization
-    constexpr float FP8_MAX = static_cast<float>(opus::finfo<DTYPE_O>::max());
-    float quant_scale = (local_max > 1e-10f) ? (local_max / FP8_MAX) : 1e-10f;
-    float quant_scale_inv = 1.0f / quant_scale;
-
-    // Step 6: Quantize and store
+    // Output base offset (shared by both paths)
     const int out_base = token_id * (num_heads * head_dim) + head_id * head_dim;
-    using DTYPE_O_STORE = typename opus::vector_traits<DTYPE_O>::dtype;
-    DTYPE_O_STORE* out_ptr = reinterpret_cast<DTYPE_O_STORE*>(out + out_base);
 
-    #pragma unroll
-    for (int i = 0; i < THREAD_DATA_SIZE; i++) {
-        float clamped = fminf(fmaxf(gated_vals[i] * quant_scale_inv, -FP8_MAX), FP8_MAX);
-        DTYPE_O quantized = opus::cast<DTYPE_O>(clamped);
-        out_ptr[elem_id + i] = quantized;
-    }
-
-    // Step 7: Thread 0 of each group stores scale
-    if (thread_in_group == 0) {
-        int scale_idx;
-        if constexpr (TRANSPOSE_SCALE) {
-            scale_idx = head_id * num_tokens + token_id;
-        } else {
-            scale_idx = token_id * num_heads + head_id;
+    if constexpr (FUSE_QUANT) {
+        // Step 4: Find max absolute value for FP8 quantization
+        float local_max = -INFINITY;
+        #pragma unroll
+        for (int i = 0; i < THREAD_DATA_SIZE; i++) {
+            local_max = fmaxf(local_max, fabsf(gated_vals[i]));
         }
-        scale[scale_idx] = quant_scale;
+
+        // Group-local reduce max (only within threads of this group)
+        #pragma unroll
+        for (int mask = threads_per_group / 2; mask > 0; mask >>= 1) {
+            local_max = fmaxf(local_max, __shfl_xor(local_max, mask));
+        }
+
+        // Step 5: Compute scale for FP8 quantization
+        constexpr float FP8_MAX = static_cast<float>(opus::finfo<DTYPE_O>::max());
+        float quant_scale = (local_max > 1e-10f) ? (local_max / FP8_MAX) : 1e-10f;
+        float quant_scale_inv = 1.0f / quant_scale;
+
+        // Step 6: Quantize and store
+        using DTYPE_O_STORE = typename opus::vector_traits<DTYPE_O>::dtype;
+        DTYPE_O_STORE* out_ptr = reinterpret_cast<DTYPE_O_STORE*>(out + out_base);
+
+        #pragma unroll
+        for (int i = 0; i < THREAD_DATA_SIZE; i++) {
+            float clamped = fminf(fmaxf(gated_vals[i] * quant_scale_inv, -FP8_MAX), FP8_MAX);
+            DTYPE_O quantized = opus::cast<DTYPE_O>(clamped);
+            out_ptr[elem_id + i] = quantized;
+        }
+
+        // Step 7: Thread 0 of each group stores scale
+        if (thread_in_group == 0) {
+            int scale_idx;
+            if constexpr (TRANSPOSE_SCALE) {
+                scale_idx = head_id * num_tokens + token_id;
+            } else {
+                scale_idx = token_id * num_heads + head_id;
+            }
+            scale[scale_idx] = quant_scale;
+        }
+    } else {
+        // BF16/FP16 direct output path: skip quantization, cast gated result directly
+        DTYPE_O* out_ptr = out + out_base;
+
+        #pragma unroll
+        for (int i = 0; i < THREAD_DATA_SIZE; i++) {
+            out_ptr[elem_id + i] = opus::cast<DTYPE_O>(gated_vals[i]);
+        }
     }
 }
 
@@ -192,7 +204,7 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
  * - 128 threads (2 warps): Better occupancy, recommended for most cases
  * - 256 threads (4 warps): Maximum occupancy, best for large workloads
  */
-template <typename DTYPE_I, typename DTYPE_O, int THREAD_DATA_SIZE, int BLOCK_SIZE, bool TRANSPOSE_SCALE>
+template <typename DTYPE_I, typename DTYPE_O, int THREAD_DATA_SIZE, int BLOCK_SIZE, bool TRANSPOSE_SCALE, bool FUSE_QUANT = true>
 void gated_rmsnorm_fp8_group_quant_launcher_impl(
     torch::Tensor& out,
     torch::Tensor& scale,
@@ -223,10 +235,10 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
     const int64_t z_token_stride = z.stride(0);
     const int64_t z_head_stride  = z.stride(1);
 
-    gated_rmsnorm_fp8_group_quant_kernel<DTYPE_I, DTYPE_O, GROUP_SIZE, THREAD_DATA_SIZE, BLOCK_SIZE, TRANSPOSE_SCALE>
+    gated_rmsnorm_fp8_group_quant_kernel<DTYPE_I, DTYPE_O, GROUP_SIZE, THREAD_DATA_SIZE, BLOCK_SIZE, TRANSPOSE_SCALE, FUSE_QUANT>
         <<<grid, block, 0, stream>>>(
             reinterpret_cast<DTYPE_O*>(out.data_ptr()),
-            reinterpret_cast<float*>(scale.data_ptr()),
+            FUSE_QUANT ? reinterpret_cast<float*>(scale.data_ptr()) : nullptr,
             reinterpret_cast<DTYPE_I const*>(x.data_ptr()),
             reinterpret_cast<DTYPE_I const*>(z.data_ptr()),
             reinterpret_cast<DTYPE_I const*>(weight.data_ptr()),
@@ -314,6 +326,71 @@ void gated_rmsnorm_fp8_group_quant(
     } else {
         TORCH_CHECK(false, "Unsupported dtype combination. Input: ", x.scalar_type(),
                     ", Output: ", out.scalar_type());
+    }
+}
+
+/**
+ * BF16/FP16 output variant: Gated RMSNorm without quantization.
+ *
+ * Performs: out = rms_norm(x, weight, eps) * silu(z)
+ * Output is bf16/fp16 (same dtype as input), no scale tensor needed.
+ */
+template <typename DTYPE_I>
+void gated_rmsnorm_bf16_launcher(
+    torch::Tensor& out,
+    torch::Tensor const& x,
+    torch::Tensor const& z,
+    torch::Tensor const& weight,
+    double epsilon)
+{
+    TORCH_CHECK(x.dim() == 3, "Input x must be 3D: [num_tokens, num_heads, head_dim]");
+    TORCH_CHECK(z.dim() == 3, "Input z must be 3D: [num_tokens, num_heads, head_dim]");
+    const int num_tokens = x.size(0);
+    const int num_heads = x.size(1);
+    const int head_dim = x.size(2);
+
+    TORCH_CHECK(z.size(0) == num_tokens && z.size(1) == num_heads && z.size(2) == head_dim,
+                "Gating tensor z must have same shape as x");
+    TORCH_CHECK(head_dim == 128, "ONLY head_dim=128 is supported, got ", head_dim);
+    TORCH_CHECK(weight.size(0) == head_dim, "Weight size must match head_dim");
+    TORCH_CHECK(x.stride(2) == 1, "x.stride(2) must be 1 (head_dim contiguous), got ", x.stride(2));
+    TORCH_CHECK(z.stride(2) == 1, "z.stride(2) must be 1 (head_dim contiguous), got ", z.stride(2));
+
+    // Dummy scale tensor (not accessed when FUSE_QUANT=false)
+    torch::Tensor scale = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+
+    // For the bf16 path (no quantization), we only need the variance reduction
+    // across threads in each group — no max-reduction step. A single warp
+    // (BLOCK_SIZE=64) processes 8 heads and creates more grid tiles, improving
+    // GPU occupancy across all workload sizes.
+    constexpr int thread_data_size = 16;
+    gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_I, thread_data_size, 64, false, false>(
+        out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
+}
+
+void gated_rmsnorm_bf16(
+    torch::Tensor& out,
+    torch::Tensor const& x,
+    torch::Tensor const& z,
+    torch::Tensor const& weight,
+    double epsilon)
+{
+    TORCH_CHECK(x.is_cuda(), "Input x must be on CUDA device");
+    TORCH_CHECK(z.is_cuda(), "Input z must be on CUDA device");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be on CUDA device");
+    TORCH_CHECK(out.is_cuda(), "Output must be on CUDA device");
+
+    if (x.scalar_type() == at::ScalarType::BFloat16) {
+        TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16,
+                    "Output must be BFloat16 when input is BFloat16");
+        gated_rmsnorm_bf16_launcher<opus::bf16_t>(out, x, z, weight, epsilon);
+    } else if (x.scalar_type() == at::ScalarType::Half) {
+        TORCH_CHECK(out.scalar_type() == at::ScalarType::Half,
+                    "Output must be Half when input is Half");
+        gated_rmsnorm_bf16_launcher<opus::fp16_t>(out, x, z, weight, epsilon);
+    } else {
+        TORCH_CHECK(false, "Unsupported input dtype: ", x.scalar_type(),
+                    ". Only BFloat16 and Half are supported.");
     }
 }
 
