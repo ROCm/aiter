@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from enum import IntEnum
 from typing import Optional, Tuple, Union
 
 import torch
@@ -13,33 +12,10 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
 from ..utility import dtypes, fp4_utils
+from ..utility.mx_types import MxScaleRoundMode
 from . import triton
 from .enum import ActivationType, QuantType
 from ..jit.utils.chip_info import get_cu_num, get_gfx
-
-
-class MxScaleRoundMode(IntEnum):
-    """MX-format per-block E8M0 scale rounding strategy.
-
-    Applies to the whole MX format family (mxfp4 / mxfp6 / mxfp8 / mxint8) --
-    PyTorch torchao's ``ScaleCalculationMode`` is dtype-agnostic in the same
-    way: the formulas (FLOOR / RCEIL / CEIL / EVEN) are identical, only the
-    ``max_pos`` / ``max_pow2`` constants are dtype-specific (e.g. 6 vs 448).
-
-    Names follow AMD Quark's ``RoundMode``; the equivalent PyTorch torchao
-    ``ScaleCalculationMode`` is shown in the comments. The integer values
-    match the HIP-side ``enum class MxScaleRoundMode`` in
-    ``csrc/kernels/quant_mxfp4.cu`` 1:1, so this Python enum and a bare
-    ``int`` are interchangeable -- existing callers passing ``round_mode=1``
-    keep working unchanged (``IntEnum`` instances satisfy ``isinstance(x, int)``
-    and compare equal to their integer value).
-    """
-
-    RoundDown = 0  # torchao FLOOR  (OCP / NV ROUND_DOWN)
-    RoundUp = 1  # torchao RCEIL  (NV ROUND_UP / DSv4 Pro / FlashInfer) -- DEFAULT
-    Even = 2  # torchao EVEN   (Quark EVEN)
-    Ceil = 3  # torchao CEIL   (no Quark / NV equivalent)
-
 
 # BC alias: the previous name was fp4-specific, but this enum is shared
 # across the whole MX family. Existing callers using ``MxFp4RoundMode``

@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-from enum import IntEnum
-
 import torch
 from torch import Tensor
 import triton
 import triton.language as tl
 
 from . import dtypes
+from .mx_types import MxDtype, MxScaleRoundMode
 
 
 def f32_to_mxfp4(x):
@@ -67,36 +66,8 @@ def mxfp4_to_f32(x):
 # ---------------------------------------------------------------------------
 
 
-class MxScaleRoundMode(IntEnum):
-    """E8M0 block-scale rounding mode for any MX format.
-
-    Re-defined locally (rather than imported from ``aiter.ops.quant``) to
-    avoid a circular import: ``aiter.ops.quant`` already imports
-    ``aiter.utility.fp4_utils``. Values **must** stay 1:1 with the HIP-side
-    ``enum class MxScaleRoundMode`` in ``csrc/include/fp4_quant_utils.h``,
-    the Python ``aiter.ops.quant.MxScaleRoundMode`` ``IntEnum``, and the
-    FlyDSL ``aiter.ops.flydsl.kernels.quant_utils.MxScaleRoundMode``.
-    """
-
-    RoundDown = 0  # torchao FLOOR  (OCP / NV ROUND_DOWN)
-    RoundUp = 1  # torchao RCEIL  (NV ROUND_UP / DSv4 Pro / FlashInfer) -- DEFAULT
-    Even = 2  # torchao EVEN   (Quark EVEN)
-    Ceil = 3  # torchao CEIL
-
-
-class MxDtype(IntEnum):
-    """Element dtype tag passed to :func:`f32_to_mx_e8m0_scale`.
-
-    Each tag selects a small bundle of dtype-specific constants
-    (``target_max_pow2``, ``max_pos``, ``mbits``) used by the four
-    rounding modes; the formulas themselves are dtype-agnostic.
-    """
-
-    FP4_E2M1 = 0  # max_pos = 6.0,    target_max_pow2 = 2 (= log2(4)),    mbits = 1
-    FP8_E4M3 = 1  # max_pos = 448.0,  target_max_pow2 = 8 (= log2(256)),  mbits = 3
-    # FP8_E5M2 / FP6_* -- reserved; add when a CPU caller needs them.
-
-
+# ``MxScaleRoundMode`` and ``MxDtype`` live in :mod:`aiter.utility.mx_types`
+# (single source of truth across HIP / Python ops / CPU ref / FlyDSL).
 # Per-MX-dtype constants. Tuple form: (target_max_pow2, max_pos, mbits)
 # - target_max_pow2 = log2(largest pow2 <= max_normal(dtype))
 # - max_pos = max_normal(dtype) (e.g. 6.0 for fp4 e2m1, 448.0 for fp8 e4m3)

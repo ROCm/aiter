@@ -23,42 +23,15 @@ full table mapping these to PyTorch torchao / NV Triton / DSv4 / FlashInfer
 reference implementations.
 """
 
-from enum import IntEnum
-
 from flydsl.expr import arith
 from flydsl.expr.typing import T
 from flydsl.expr.arith import CmpIPredicate
 
-
-class MxScaleRoundMode(IntEnum):
-    """E8M0 block-scale rounding mode for any MX format.
-
-    Re-defined here (rather than imported from ``aiter.ops.quant``) so the
-    FlyDSL kernel build path stays self-contained -- ``aiter.ops.quant``
-    transitively pulls in heavy dependencies. Values **must** stay 1:1
-    with the HIP-side ``enum class MxScaleRoundMode`` in
-    ``csrc/include/fp4_quant_utils.h`` and the Python
-    ``aiter.ops.quant.MxScaleRoundMode`` ``IntEnum``.
-    """
-
-    RoundDown = 0  # torchao FLOOR  (OCP / NV ROUND_DOWN)
-    RoundUp = 1  # torchao RCEIL  (NV ROUND_UP / DSv4 Pro / FlashInfer) -- DEFAULT
-    Even = 2  # torchao EVEN   (Quark EVEN)
-    Ceil = 3  # torchao CEIL
-
-
-class MxDtype(IntEnum):
-    """Element dtype tag passed to :func:`emit_mx_e8m0_scale`.
-
-    Each tag selects a small bundle of dtype-specific constants
-    (``target_max_pow2``, ``max_pos`` reciprocal, ``mbits``) used by the
-    four rounding modes; the formulas themselves are dtype-agnostic.
-    """
-
-    FP4_E2M1 = 0  # max_pos = 6.0,    target_max_pow2 = 2 (= log2(4)), mbits = 1
-    FP8_E4M3 = 1  # max_pos = 448.0,  target_max_pow2 = 8 (= log2(256)), mbits = 3
-    # FP8_E5M2 / FP6_* -- reserved; add when a FlyDSL caller needs them.
-
+# ``MxScaleRoundMode`` and ``MxDtype`` live in :mod:`aiter.utility.mx_types`
+# (single source of truth across HIP / Python ops / CPU ref / FlyDSL).
+# That module has no aiter-internal dependencies, so importing it here
+# does not pull torch into the FlyDSL kernel build path.
+from aiter.utility.mx_types import MxDtype, MxScaleRoundMode
 
 # Per-MX-dtype constants. Tuple form: (target_max_pow2, max_pos_inv_f32_bits, mbits)
 # - target_max_pow2 = log2(largest pow2 <= max_normal(dtype))
