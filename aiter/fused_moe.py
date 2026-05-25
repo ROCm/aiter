@@ -938,7 +938,7 @@ def get_2stage_cfgs(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
 
-    if kernelName1.startswith("fused_moe_ptpc_fp8"):
+    if kernelName1.startswith("fused_moe_asmjit_aot"):
         from aiter.fused_moe_asmjit_aot import fused_moe_asmjit_aot
         return MOEMetadata(None, None, block_m, ksplit, run_1stage,
                            stage0=functools.partial(fused_moe_asmjit_aot, config_string = kernelName1.split("__")[1]))
