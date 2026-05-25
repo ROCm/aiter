@@ -621,7 +621,7 @@ class QManager8to16bitsV1
     // The LDS half is 192 bf16 NoPE cols (record bytes 256..448) + 64 bf16 RoPE
     // cols (= 8 col_tiles total in the LDS sub-block grid).
     static constexpr uint32_t kVgprHalfCols    = 256;
-    static constexpr uint32_t kLdsHalfCols     = 256;
+    static constexpr uint32_t kLdsHalfCols     = T::kQkHeadDim - kVgprHalfCols;     // 256
     static constexpr uint32_t kLdsHalfNopeCols = T::kQkNopeHeadDim - kVgprHalfCols; // 192
     static constexpr uint32_t kLdsHalfRopeCols = T::kQkRopeHeadDim;                 // 64
     static_assert(kLdsHalfNopeCols + kLdsHalfRopeCols == kLdsHalfCols,
@@ -631,7 +631,7 @@ class QManager8to16bitsV1
     static constexpr uint32_t kFinalLdsRowTiles = kFinalLdsRows / kSubBlockRows;    // 8
     static constexpr uint32_t kFinalLdsColTiles = kLdsHalfCols / kSubBlockCols;     // 8
     static constexpr uint32_t kFinalLdsBytes =
-        kFinalLdsRows * kLdsHalfCols * sizeof(hk::bf16);                             // 64 KB
+        kFinalLdsRows * kLdsHalfCols * sizeof(hk::bf16);                            // 64 KB
     // Wave-major contiguous layout: each wave owns 16 rows x 256 cols of bf16
     // = 8 KB exclusively, contiguous within the 64 KB final region. This is the
     // KEY invariant for race-freedom: wave w's Phase 1 staging aliases the
@@ -918,7 +918,12 @@ class QManager8to16bitsV1
         const uint32_t row_in_warp = lane_idx >> 2;                                    // 0..15
         const uint32_t col_group   = lane_idx & 3u;                                    // 0..3
 
-        const uint32_t v_off_nope = row_in_warp * kPackedNopeStride + col_group * 16u;
+        // Row-conditional half-swap (vmem-load side): rows 8..15 swap the two
+        // 16-col halves of their fp8 NoPE row. Mirrored at LDS reader via
+        // `swz = (row & 8) << 2`. Eliminates Site C 2-way bank conflicts
+        // (rows differing by 8 land in same ds_read_b128 cycle).
+        const uint32_t col_group_swz = col_group ^ ((row_in_warp & 8u) >> 3);
+        const uint32_t v_off_nope = row_in_warp * kPackedNopeStride + col_group_swz * 16u;
         const uint32_t v_off_scale =
             row_in_warp * kPackedNopeStride + (col_group >> 1);                        // +0/+1
 
@@ -981,6 +986,11 @@ class QManager8to16bitsV1
         hi_dw[3] = __builtin_bit_cast(uint32_t, r);
 
         const uint32_t col_tile = kColTileBase + sb_in_chunk;
+        // Site C bank-conflict mitigation: the vmem-load-side half-swap in
+        // p2_vmem_to_vgpr_nope_chunk (col_group XOR by row_in_warp[3]) places
+        // fp8 elements exactly where load_q_lds_to_gpr expects after its
+        // matching reader-side XOR, so the LDS dst address itself stays
+        // straight here.
         const uintptr_t p_dst_lane =
             p_lds_q + sub_block_byte_offset(warp_idx, col_tile) +
             row_in_warp * (kSubBlockCols * sizeof(hk::bf16)) + byte_in_sb;
@@ -1017,16 +1027,24 @@ class QManager8to16bitsV1
 
         constexpr uint32_t kVStride = kSubBlockCols * sizeof(q_rope_t);            // 64
 
-        const uint32_t v_off_lo = row_in_warp * kRopeStride + col_quad * 16u;
+        // Row-conditional half-swap (vmem-load side, RoPE): rows 8..15 swap
+        // their two 32-col halves (col_quad XOR 2). Mirrors NoPE writer
+        // + reader half-swap so the bf16 LDS layout is consistent.
+        const uint32_t col_quad_swz = col_quad ^ ((row_in_warp & 8u) >> 2);
+        const uint32_t v_off_lo = row_in_warp * kRopeStride + col_quad_swz * 16u;
+
+        // LDS dst is straight: the vmem-load-side col_quad XOR above already
+        // places the 32-col half where the reader expects after its XOR.
+        const uint32_t lds_off = lane_idx * 16u;
 
         const uintptr_t p_dst_lo =
-            p_lds_q + sub_block_byte_offset(warp_idx, kColTileLo) + lane_idx * 16u;
+            p_lds_q + sub_block_byte_offset(warp_idx, kColTileLo) + lds_off;
         // p_dst_hi - kVStride: prebake the negative kVStride into the LDS dst
         // so the 2nd load can use the same i_off=kVStride to advance vmem by
         // +64 B; that imm offset also adds kVStride to LDS, giving p_dst_hi.
         // Net: the second voffset VGPR (v_off_lo + 64) is eliminated.
         const uintptr_t p_dst_hi_adj =
-            p_lds_q + sub_block_byte_offset(warp_idx, kColTileHi) + lane_idx * 16u
+            p_lds_q + sub_block_byte_offset(warp_idx, kColTileHi) + lds_off
             - kVStride;
 
         const hk::i32x4 srsrc = hk::make_srsrc(p_q_rope_warp, 0xffffffff);
@@ -1156,8 +1174,22 @@ class QManager8to16bitsV1
         const uint32_t row      = lane_idx % kMfmaRows;
         const uint32_t col      = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
 
+        // Site C bank-conflict swizzle: ds_read_b128 spec lane grouping pairs
+        // rows that differ by 12 (same row mod 4) in the same cycle, giving
+        // 2-way conflicts at sites where col_band aliases. XOR the 32-byte
+        // half of each row for rows 8..15 (= swap the (col_band 0,1) and
+        // (col_band 2,3) halves). Writers (p2_cvt_store_nope_chunk and
+        // p2_load_rope_chunk) mirror the same XOR.
+        // Site C bank-conflict swizzle (reader side): ds_read_b128 per-cycle
+        // lane grouping pairs rows differing by 8 (= same row mod 4 across
+        // cycle halves), giving 2-way conflicts when their col_band aliases.
+        // XOR col*2 with 32 for rows 8..15 (= swap the (col_band 0,1) and
+        // (col_band 2,3) halves). Writers mirror the swap on the vmem-load
+        // side so the NoPE / RoPE bf16 LDS contents match what the reader
+        // pulls. Eliminates the 2-way conflict; rows 0..7 are unchanged.
+        const uint32_t swz       = (row & 8u) << 2;
         const uint32_t in_sb_byte =
-            row * (kSubBlockCols * sizeof(hk::bf16)) + col * sizeof(hk::bf16);
+            row * (kSubBlockCols * sizeof(hk::bf16)) + (col * sizeof(hk::bf16) ^ swz);
 
         constexpr uint32_t kColTileBytes = kColTile * kSubBlockBytes;
 
