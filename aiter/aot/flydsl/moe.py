@@ -71,34 +71,6 @@ def _row_swiglu_limit(row: dict[str, str]) -> float:
     return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit") or 0.0
 
 
-def _row_optional_int(row: dict[str, str], name: str) -> int:
-    value = row.get(name)
-    if value is None:
-        return 0
-    value = str(value).strip()
-    if value == "":
-        return 0
-    try:
-        return int(value)
-    except ValueError as e:
-        raise ValueError(f"{name} must be an int, got {value!r}") from e
-
-
-def _row_optional_bool(row: dict[str, str], name: str) -> bool | None:
-    value = row.get(name)
-    if value is None:
-        return None
-    value = str(value).strip()
-    if value == "":
-        return None
-    value_lower = value.lower()
-    if value_lower in ("1", "true", "t", "yes", "y"):
-        return True
-    if value_lower in ("0", "false", "f", "no", "n"):
-        return False
-    raise ValueError(f"{name} must be a bool, got {value!r}")
-
-
 def parse_csv(csv_path: str):
     """Parse the CSV and return a list of unique compile jobs.
 
@@ -121,8 +93,8 @@ def parse_csv(csv_path: str):
             experts = int(row["expert"])
             topk = int(row["topk"])
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
-            hidden_pad = _row_optional_int(row, "hidden_pad")
-            intermediate_pad = _row_optional_int(row, "intermediate_pad")
+            hidden_pad = int(row.get("hidden_pad", "0") or "0")
+            intermediate_pad = int(row.get("intermediate_pad", "0") or "0")
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
             act_type = row.get("act_type", "")
@@ -132,7 +104,7 @@ def parse_csv(csv_path: str):
                 else "silu"
             )
             swiglu_limit = _row_swiglu_limit(row)
-            enable_bias_options = [bool(_row_optional_bool(row, "bias"))]
+            enable_bias_options = [str(row.get("bias", "")).strip() == "True"]
 
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
