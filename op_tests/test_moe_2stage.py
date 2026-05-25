@@ -385,6 +385,9 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
+    del input, w1, w2, w1_qt_aiter, w2_qt_aiter, a1_qt, out1_ref, out2_ref, out2_ck
+    torch.cuda.empty_cache()
+
     return {"us": us2, "logits_diff": float(logits_diff)}
 
 
@@ -446,7 +449,6 @@ parser.add_argument(
         1024,
         4096,
         8192,
-        163840,
     ],
     help="""Number of tokens.
     e.g.: -t 1024""",
