@@ -1,34 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-
-
-"""Qwen3.5 397B MoE PTPC FP8 TP8 run with prebuilt hasco artifacts on gfx942:
-``fused_moe()`` calls ``fused_moe_ptpc_fp8`` only when the following conditions are met:
-- B=1~32, E=512, N1=256, K1=4096, N2=4096, K2=128, TOPK=10
-- if (os.environ.get("AITER_MOE_SMALL_BATCH", "0") == "1"
-    and 1 <= hidden_states.shape[0] <= 32
-    and hidden_states.dtype == torch.bfloat16
-    and expert_mask is None
-    and activation == ActivationType.Silu
-    and (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)
-    and get_gfx() == "gfx942"
-    and topk_ids.shape[1] == 10
-    and w1.shape[1] == 256
-    and w1.shape[2] == 4096
-    and w2.shape[1] == 4096
-    and w2.shape[2] == 128)
-- Requires matching artifacts under ``hsa/gfx942/fmoe_asmjit/``, and loading via ``csrc.cpp_itfs.hsaco_tools.get_kernel``.
-"""
-
-import os
-
 from typing import Any, Optional
 
 import torch
 
 import aiter
-
-from aiter import ActivationType, QuantType, dtypes, logger
+from aiter import ActivationType, QuantType
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.fused_moe import moe_sorting
 from csrc.cpp_itfs.hsaco_tools import hsaco
@@ -41,6 +18,7 @@ class Config:
     BLOCK_M: int
     use_down_loopn: bool
     use_prefill: bool
+    use_dyn_sched: bool
 
     def to_string(self):
         return (
@@ -49,6 +27,8 @@ class Config:
             + str(self.use_down_loopn)
             + "_"
             + str(self.use_prefill)
+            + "_"
+            + str(self.use_dyn_sched)
         )
 
     @classmethod
@@ -59,9 +39,10 @@ class Config:
 
 def get_tune_space():
     return [
-        Config(16, True, False).to_string(),
-        Config(64, True, True).to_string(),
-        Config(128, True, True).to_string(),
+        Config(16, True, False, False).to_string(),
+        Config(64, True, True, False).to_string(),
+        Config(128, True, True, False).to_string(),
+        Config(128, True, True, True).to_string(),
     ]
 
 
@@ -89,14 +70,15 @@ def fused_moe_asmjit_aot(
         hidden_states.dtype != torch.bfloat16
         or expert_mask is not None
         or activation != ActivationType.Silu
+        or w1.dtype != torch.float8_e4m3fnuz
+        or w2.dtype != torch.float8_e4m3fnuz
     ):
-        return None
-    if not (w1.dtype == torch.float8_e4m3fnuz and get_gfx() == "gfx942"):
-        return None
+        raise Exception("Unsupported input")
+    if get_gfx() != "gfx942":
+        raise Exception("Unsupported platform")
 
-    if (quant_type != QuantType.per_Token and quant_type != QuantType.per_Tensor):
-        return None
-
+    if quant_type != QuantType.per_Token and quant_type != QuantType.per_Tensor:
+        raise Exception(f"Unsupported quant_type:{quant_type}")
 
     qtype_str = str(quant_type).split(".")[1]
 
@@ -122,7 +104,6 @@ def fused_moe_asmjit_aot(
     )
 
     if kcfgs.use_prefill:
-        BLOCK_TILE_SIZE_N = 128
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = (
             moe_sorting(
                 topk_ids,
@@ -143,9 +124,25 @@ def fused_moe_asmjit_aot(
             quant_dtype=w1.dtype,
             num_rows=None,
         )
+        if kcfgs.use_dyn_sched:
+            dyn_buf1 = torch.zeros(64, dtype=torch.int32, device=hidden_states_q.device)
+            dyn_buf2 = torch.zeros(64, dtype=torch.int32, device=hidden_states_q.device)
+            grid_gate_up = torch.cuda.get_device_properties().multi_processor_count
+            grid_down = torch.cuda.get_device_properties().multi_processor_count * 2 # occupancy is 2
+            GATEUP_BLOCK_TILE_SIZE_N = 256
+            DOWN_BLOCK_TILE_SIZE_N = 128
+        else:
+            GATEUP_BLOCK_TILE_SIZE_N = 128
+            DOWN_BLOCK_TILE_SIZE_N = 128
+            dyn_buf1 = None
+            dyn_buf2 = None
+            grid_gate_up = N1 // GATEUP_BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0]
+            grid_down = sorted_expert_ids.shape[0]
+
         hsaco.fmoe_asmjit.moe_2stage_gateup(
-            [N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0]],
+            [grid_gate_up],
             [256],
+            dyn_buf1,
             hidden_states_q,
             w1,
             gemm1_out,
@@ -155,14 +152,15 @@ def fused_moe_asmjit_aot(
             hidden_states_scale,
             w1_scale,
             B,
-            N1 // BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0],
+            N1 // GATEUP_BLOCK_TILE_SIZE_N * sorted_expert_ids.shape[0],
             weight_dtype=str(w1.dtype),
             TOPK=TOPK,
             K=K1,
             N=N1,
             BLOCK_TILE_SIZE_M=kcfgs.BLOCK_M,
-            BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
+            BLOCK_TILE_SIZE_N=GATEUP_BLOCK_TILE_SIZE_N,
             quant_type_w=f"QuantType.{qtype_str}",
+            dyn=kcfgs.use_dyn_sched,
         )
         gemm1_out_q, gemm1_out_scale = quant_func(
             gemm1_out.view(B * TOPK, -1),
@@ -174,8 +172,9 @@ def fused_moe_asmjit_aot(
             B, TOPK, N2, dtype=torch.bfloat16, device=gemm1_out_q.device
         )
         hsaco.fmoe_asmjit.moe_2stage_down(
-            [1, sorted_expert_ids.shape[0]],
+            [grid_down],
             [256],
+            dyn_buf2,
             gemm1_out_q,
             w2,
             gemm2_out,  # cur_out,
@@ -193,8 +192,9 @@ def fused_moe_asmjit_aot(
             N=N2,
             with_silu=False,
             BLOCK_TILE_SIZE_M=kcfgs.BLOCK_M,
-            BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
+            BLOCK_TILE_SIZE_N=DOWN_BLOCK_TILE_SIZE_N,
             quant_type_w=f"QuantType.{qtype_str}",
+            dyn=kcfgs.use_dyn_sched,
         )
         num_WG = num_CU * 4
         num_tokens_wg = B // num_WG
@@ -355,9 +355,6 @@ def fused_moe_asmjit_aot(
                 BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
                 quant_type_str=qtype_str,
             )
-
     else:
-        return None
-
-
+        raise Exception(f"Unsupported batch-size {B}")
     return cur_out
