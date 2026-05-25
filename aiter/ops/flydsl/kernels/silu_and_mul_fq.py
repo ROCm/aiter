@@ -28,6 +28,12 @@ from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
 
 from flydsl._mlir import ir
+
+from aiter.ops.flydsl.kernels.quant_utils import (
+    emit_f32_to_e2m1,
+    emit_fp4_e8m0_scale_round_up,
+    emit_fp8_e8m0_scale_round_up_legacy,
+)
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import buffer_ops
 
@@ -173,30 +179,10 @@ def build_silu_and_mul_fq_module(
         s_ok = arith.cmpi(CmpIPredicate.ult, slot_id, topk_i32)
         is_valid = arith.andi(row_in_range, arith.andi(t_ok, s_ok))
 
-        if const_expr(_need_fp4):
-
-            def _f32_to_e2m1(qx_f32):
-                # Match fp4_utils.f32_to_mxfp4 / HIP quant: saturate, denorm,
-                # and normal round-to-nearest-even paths.
-                qx = qx_f32.bitcast(i32)
-                s = qx & c0x80000000_i32
-                qx_abs = qx & c0x7FFFFFFF_i32
-                denormal_mask = arith.cmpi(CmpIPredicate.ult, qx_abs, c0x3F800000_i32)
-                normal_mask = arith.andi(
-                    arith.cmpi(CmpIPredicate.ult, qx_abs, c0x40C00000_i32),
-                    arith.cmpi(CmpIPredicate.uge, qx_abs, c0x3F800000_i32),
-                )
-
-                denorm_f32 = qx_abs.bitcast(f32) + c0x4A800000_i32.bitcast(f32)
-                denormal_x = denorm_f32.bitcast(i32) - c0x4A800000_i32
-
-                mant_odd = (qx_abs >> c22_i32) & c1_i32
-                normal_x = qx_abs + c0xC11FFFFF_i32 + mant_odd
-                normal_x = normal_x >> c22_i32
-
-                e2m1 = arith.select(normal_mask, normal_x, c0x7_i32)
-                e2m1 = arith.select(denormal_mask, denormal_x, e2m1)
-                return (s >> c28_i32) | e2m1
+        # FP4/FP8 scale and f32->fp4 conversion are shared with
+        # mixed_moe_gemm_2stage; helpers live in
+        # aiter.ops.flydsl.kernels.quant_utils.
+        _f32_to_e2m1 = emit_f32_to_e2m1
 
         thread_id = ArithValue(tid)
         COLS_PER_ITER = BLOCK_THREADS * VEC
@@ -348,35 +334,14 @@ def build_silu_and_mul_fq_module(
                             local_max = arith.maximumf(local_max, peer)
 
                         if const_expr(_need_fp4):
-                            # NV ROUND_UP / DSv4 Pro / FlashInfer (industry default):
-                            # scale = ceil_pow2(max_abs / 6).  0% max-value clipping.
-                            # Matches fp4_utils.f32_to_e8m0_ceil(max_abs / 6) and HIP
-                            # aiter::fp4_f32_to_e8m0_scale.
-                            inv6_f32 = c0x3E2AAAAB_i32.bitcast(f32)
-                            amax_div6 = local_max * inv6_f32
-                            amax_div6_i32 = amax_div6.bitcast(i32)
-                            mantissa = amax_div6_i32 & c0x7FFFFF_i32
-                            exp_field_raw = (amax_div6_i32 >> c23_i32) & c0xFF_i32
-                            mant_nonzero = arith.cmpi(
-                                CmpIPredicate.ne, mantissa, c0_i32
-                            )
-                            exp_field = arith.select(
-                                mant_nonzero,
-                                exp_field_raw + c1_i32,
-                                exp_field_raw,
-                            )
-                            e8m0_biased = arith.maxsi(exp_field, c0_i32)
+                            # FP4 industry default (NV ROUND_UP / DSv4 / FlashInfer):
+                            # scale = ceil_pow2(amax / 6). 0% max-value clipping.
+                            e8m0_biased = emit_fp4_e8m0_scale_round_up(local_max)
                         else:
-                            # FP8 path: round_pow2_1.5(max_abs) / 2^headroom (Group D).
-                            # Bumps exponent when mantissa >= 0.5*2^k (1.5x threshold),
-                            # giving 0% max-value clipping for fp8 representation.
-                            # Matches the legacy aiter behavior used pre-PR; not the
-                            # OCP floor that ``f32_to_e8m0`` Python helper now does.
-                            max_i32_v = local_max.bitcast(i32)
-                            max_rounded = (max_i32_v + c0x400000_i32) & c0xFF800000_i32
-                            exp_field = max_rounded >> c23_i32
-                            e8m0_biased = arith.maxsi(
-                                exp_field - c_headroom_i32, c0_i32
+                            # FP8 path keeps the legacy Group D 1.5-threshold
+                            # round-up; not aligned to NV ROUND_UP this PR.
+                            e8m0_biased = emit_fp8_e8m0_scale_round_up_legacy(
+                                local_max, headroom_i32=c_headroom_i32
                             )
                         quant_exp = c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << c23_i32).bitcast(f32)
