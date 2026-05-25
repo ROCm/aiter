@@ -107,19 +107,11 @@ def per_1x32_f4_quant(
             ``0`` packs the first dim -> **RHS**
             ``B(K,N) -> fp4=(K//2,N), scale=(K//32,N)``.
         round_mode: :class:`MxScaleRoundMode` or bare ``int`` 0..3
-            (interchangeable). torchao ``ScaleCalculationMode`` mapping:
-
-            - ``RoundDown`` (0) / torchao ``FLOOR`` --
-              ``floor_pow2(amax)/4`` (OCP / NV ROUND_DOWN).
-            - ``RoundUp``   (1) / torchao ``RCEIL`` --
-              ``ceil_pow2(amax/6)``. **Default**
-              (NV ROUND_UP / DSv4 Pro / FlashInfer).
-            - ``Even``      (2) / torchao ``EVEN``  --
-              ``round_pow2_1.75(amax)/4`` (Quark EVEN; AMD Quark / SGLang
-              / vLLM QDQ default).
-            - ``Ceil``      (3) / torchao ``CEIL``  --
-              ``ceil_pow2(amax)/4``; coarser than RoundUp on
-              ``[2^k, 1.5*2^k)``.
+            (interchangeable). Default ``RoundUp`` (industry default:
+            NV ROUND_UP / DSv4 Pro / FlashInfer / torchao RCEIL).
+            See :class:`MxScaleRoundMode` and ``csrc/kernels/quant.md``
+            "Cross-Stack Mode Alignment Reference" for the four
+            formulas and cross-stack mapping.
 
     Returns:
         ``(quantized_tensor, scale_tensor)``.
@@ -778,19 +770,12 @@ def quant_mxfp4_hip(
         group_size: Block size along the last dim (must divide ``cols``;
             spec = 32).
         round_mode: :class:`MxScaleRoundMode` or bare ``int`` 0..3
-            (interchangeable). torchao ``ScaleCalculationMode`` mapping:
-
-            - ``RoundDown`` (0) / torchao ``FLOOR`` --
-              ``floor_pow2(amax)/4`` (OCP / NV ROUND_DOWN).
-            - ``RoundUp``   (1) / torchao ``RCEIL`` --
-              ``ceil_pow2(amax/6)``. **Default**
-              (NV ROUND_UP / DSv4 Pro / FlashInfer).
-            - ``Even``      (2) / torchao ``EVEN``  --
-              ``round_pow2_1.75(amax)/4`` (Quark EVEN; gfx950 uses HW
-              builtin RNE, gfx942 uses SW round-half-away).
-            - ``Ceil``      (3) / torchao ``CEIL``  --
-              ``ceil_pow2(amax)/4``; coarser than RoundUp on
-              ``[2^k, 1.5*2^k)``.
+            (interchangeable). Default ``RoundUp`` (industry default:
+            NV ROUND_UP / DSv4 Pro / FlashInfer / torchao RCEIL).
+            See :class:`MxScaleRoundMode` and ``csrc/kernels/quant.md``
+            "Cross-Stack Mode Alignment Reference" for the four
+            formulas and cross-stack mapping. (Note: ``Even`` mode uses
+            HW builtin RNE on gfx950 vs SW round-half-away on gfx942.)
         e8m0_shuffle: Apply HW e8m0 scale shuffling layout.
         a16w4_shuffle: Apply A16W4 weight shuffling.
         gate_up: Pack gate / up activations together (MoE).

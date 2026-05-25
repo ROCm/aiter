@@ -60,26 +60,21 @@ def emit_mx_e8m0_scale(
 ):
     """Emit IR computing the E8M0 block scale for an MX format.
 
-    Mirrors PyTorch torchao ``to_mx(scaling_mode=..., elem_dtype=...)``
-    semantics 1:1: the four rounding formulas (FLOOR / RCEIL / CEIL / EVEN)
-    are identical across MX dtypes, and the ``mode`` argument selects which
-    formula to emit. ``dtype`` only chooses ``target_max_pow2`` /
-    ``max_pos`` / ``mbits`` constants. Both ``mode`` and ``dtype`` are
-    Python compile-time values (FlyDSL kernel parameters), so the branch
-    is resolved before any IR is emitted -- there is no runtime cost.
+    FlyDSL IR-builder analogue of PyTorch torchao ``to_mx(scaling_mode,
+    elem_dtype)`` and the CPU torch ref
+    :func:`aiter.utility.fp4_utils.f32_to_mx_e8m0_scale`. The four
+    rounding formulas (FLOOR / RCEIL / CEIL / EVEN) are dtype-agnostic;
+    ``dtype`` only selects ``target_max_pow2`` / ``max_pos`` / ``mbits``
+    constants from :data:`_DTYPE_CFG`.
 
-    Modes (with cross-stack equivalences; see ``csrc/kernels/quant.md``):
+    Both ``mode`` and ``dtype`` are Python compile-time values (FlyDSL
+    kernel parameters), so the branch is resolved before any IR is
+    emitted -- no runtime cost.
 
-    - ``RoundDown`` / torchao ``FLOOR``  -- ``floor_pow2(amax) / 2^target_max_pow2``
-      (OCP MX spec; pre-PR aiter Python ref default).
-    - ``RoundUp``   / torchao ``RCEIL``  -- ``ceil_pow2(amax / max_pos)``.
-      *Default*: matches NV ROUND_UP / DSv4 Pro / FlashInfer / NV cuBLAS
-      ``cvt.rp.satfinite.ue8m0x2.f32`` / DeepSeek-V3.1 ``scale_fmt=ue8m0``.
-    - ``Even``      / torchao ``EVEN``   -- ``floor_pow2(round_pow2_special(amax))
-      / 2^target_max_pow2`` with ``val_to_add = 1 << (23 - mbits - 1)``
-      (AMD Quark default; SGLang-on-ROCm dynamic; vLLM Quark QDQ).
-    - ``Ceil``      / torchao ``CEIL``   -- ``ceil_pow2(amax) / 2^target_max_pow2``
-      (torchao only; coarser grid than RCEIL, no Quark/NV name).
+    See :class:`MxScaleRoundMode` (``aiter.utility.mx_types``) and
+    ``csrc/kernels/quant.md`` "Cross-Stack Mode Alignment Reference"
+    for the four formulas and cross-stack mapping (PyTorch torchao / NV
+    / DSv4 / FlashInfer / AMD Quark naming).
 
     Args:
         local_max: f32 IR value, the (warp-reduced) ``max(|x|)`` of one

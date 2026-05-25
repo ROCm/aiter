@@ -92,26 +92,15 @@ def f32_to_mx_e8m0_scale(
 
     Mirrors PyTorch torchao ``to_mx(scaling_mode, elem_dtype)`` semantics
     1:1, and is the CPU-side analogue of the FlyDSL
-    ``emit_mx_e8m0_scale(local_max, mode, dtype)`` IR builder. The four
-    rounding formulas are identical across MX dtypes; ``dtype`` only
-    selects ``target_max_pow2`` / ``max_pos`` / ``mbits`` constants.
+    :func:`aiter.ops.flydsl.kernels.quant_utils.emit_mx_e8m0_scale` IR
+    builder. The four rounding formulas are dtype-agnostic; ``dtype``
+    only selects ``target_max_pow2`` / ``max_pos`` / ``mbits`` constants
+    from :data:`_DTYPE_CFG`.
 
-    Modes (with cross-stack equivalences):
-
-    - ``RoundDown`` / torchao ``FLOOR``  --
-      ``floor_pow2(amax) / 2^target_max_pow2``.
-      OCP MX spec; pre-PR aiter Python ref default.
-    - ``RoundUp``   / torchao ``RCEIL``  --
-      ``ceil_pow2(amax / max_pos)``.
-      *Default*: matches NV ROUND_UP / DSv4 Pro / FlashInfer / NV cuBLAS
-      ``cvt.rp.satfinite.ue8m0x2.f32`` / DeepSeek-V3.1 ``scale_fmt=ue8m0``.
-    - ``Even``      / torchao ``EVEN``   --
-      ``floor_pow2(round_pow2_special(amax)) / 2^target_max_pow2`` with
-      ``val_to_add = 1 << (23 - mbits - 1)``.
-      AMD Quark default; SGLang-on-ROCm dynamic; vLLM Quark QDQ.
-    - ``Ceil``      / torchao ``CEIL``   --
-      ``ceil_pow2(amax) / 2^target_max_pow2``.
-      torchao only; coarser grid than RCEIL, no Quark/NV name.
+    See :class:`MxScaleRoundMode` (``aiter.utility.mx_types``) and
+    ``csrc/kernels/quant.md`` "Cross-Stack Mode Alignment Reference"
+    for the four formulas and cross-stack mapping (PyTorch torchao / NV
+    / DSv4 / FlashInfer / AMD Quark naming).
 
     Args:
         amax: f32 (or castable) tensor of per-block ``max(|x|)`` values.
