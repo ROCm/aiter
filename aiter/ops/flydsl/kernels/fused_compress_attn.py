@@ -255,7 +255,6 @@ def _build_kernel(
         # --- constants ---
         c_neg_inf = arith.constant(_NEG_INF, type=f32)
         c_zero_f32 = arith.constant(0.0, type=f32)
-        c_one_f32 = arith.constant(1.0, type=f32)
         c_eps = arith.constant(rms_eps, type=f32)
         c_inv_D = arith.constant(1.0 / D, type=f32)
         c_log2e = arith.constant(_LOG2E, type=f32)
@@ -712,7 +711,6 @@ def _build_kernel(
                     w_p1 = list(phase1_state[2 * VEC : 3 * VEC])
                     scf.YieldOp(list(m_p1) + list(kv_p1) + list(w_p1))
 
-                m_final = list(_if_tail.results[0:VEC])
                 kv_final = list(_if_tail.results[VEC : 2 * VEC])
                 w_final = list(_if_tail.results[2 * VEC : 3 * VEC])
 

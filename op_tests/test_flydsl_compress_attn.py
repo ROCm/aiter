@@ -382,9 +382,7 @@ for mode in args.modes:
     for shape_label, mtp, bs in itertools.product(args.shapes, mtp_list, bs_list):
         df.append(test_flydsl_compress_attn(shape_label, bs, mtp, mode, "single"))
         if shape_label == "hca_main":
-            df.append(
-                test_flydsl_compress_attn(shape_label, bs, mtp, mode, "2kernel")
-            )
+            df.append(test_flydsl_compress_attn(shape_label, bs, mtp, mode, "2kernel"))
 df = pd.DataFrame(df)
 aiter.logger.info(
     "flydsl_compress_attn summary (markdown):\n%s", df.to_markdown(index=False)
