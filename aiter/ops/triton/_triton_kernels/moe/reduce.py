@@ -14,6 +14,7 @@ def _reduce_grouped(
     stride_on,  # output tensor
     InIndx,
     B,
+    M,
     N,
     num_blocks,
     # fused activation function
@@ -25,6 +26,7 @@ def _reduce_grouped(
     BLOCK_N: tl.constexpr,
     EVEN_N: tl.constexpr,
     ADD_RESIDUAL: tl.constexpr,
+    USE_TDM: tl.constexpr,
 ):
     pid = tl.program_id(0)
     pid_t = pid // num_blocks
@@ -44,16 +46,24 @@ def _reduce_grouped(
 
     acc = tl.zeros([BLOCK_N_OUT], dtype=tl.float32)
     x_n_mask = pid_n * BLOCK_N + tl.arange(0, BLOCK_N) < N
+    if USE_TDM and EVEN_N:
+        x_desc = tl.make_tensor_descriptor(
+            base=X, shape=(B * M, N), strides=(N, 1), block_shape=(1, BLOCK_N)
+        )
     # accumulate contributions for this tile
     for i in tl.static_range(0, K):
         curr = tl.zeros([BLOCK_N], dtype=tl.float32)
         # iterate over split_k partial values
         for b in tl.range(0, B):
-            x_row_ptr = XPtrs + indxs[i] * stride_xm + b * stride_xb
-            if EVEN_N:
-                vals = tl.load(x_row_ptr)
+            if USE_TDM and EVEN_N:
+                row = b * M + indxs[i]
+                vals = tl.reshape(x_desc.load([row, pid_n * BLOCK_N]), (BLOCK_N,))
             else:
-                vals = tl.load(x_row_ptr, mask=x_n_mask, other=0.0)
+                x_row_ptr = XPtrs + indxs[i] * stride_xm + b * stride_xb
+                if EVEN_N:
+                    vals = tl.load(x_row_ptr)
+                else:
+                    vals = tl.load(x_row_ptr, mask=x_n_mask, other=0.0)
             vals = vals.to(tl.float32)
             curr += vals
 

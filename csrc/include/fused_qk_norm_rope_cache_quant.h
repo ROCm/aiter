@@ -78,14 +78,29 @@ void fused_qk_norm_rope_2way(aiter_tensor_t& q0,
                              aiter_tensor_t& out_q01,
                              aiter_tensor_t& out_k01);
 
-void fused_qk_rmsnorm(aiter_tensor_t& q,
-                       aiter_tensor_t& q_weight,
-                       double q_eps,
-                       aiter_tensor_t& k,
-                       aiter_tensor_t& k_weight,
-                       double k_eps,
-                       aiter_tensor_t& q_out,
-                       aiter_tensor_t& k_out);
+void fused_qk_norm_rope_1way(at::Tensor& q,
+                             at::Tensor& k,
+                             at::Tensor& w_q,
+                             at::Tensor& w_k,
+                             at::Tensor& cos_sin,
+                             int64_t batch_size,
+                             int64_t num_tokens,
+                             int64_t num_heads_q,
+                             int64_t num_heads_k,
+                             int64_t head_size,
+                             bool is_interleaved,
+                             double eps,
+                             at::Tensor& out_q,
+                             at::Tensor& out_k);
+
+std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm(at::Tensor& q,
+                                                    at::Tensor& q_weight,
+                                                    double q_eps,
+                                                    at::Tensor& k,
+                                                    at::Tensor& k_weight,
+                                                    double k_eps,
+                                                    std::optional<at::Tensor> q_out,
+                                                    std::optional<at::Tensor> k_out);
 
 void fused_qk_norm_rope_cache_block_quant_shuffle(
     aiter_tensor_t& qkv,

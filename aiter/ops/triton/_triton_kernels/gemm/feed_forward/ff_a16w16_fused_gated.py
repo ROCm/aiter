@@ -133,8 +133,8 @@ def _ff_a16w16_fused_gated(
                 cache_modifier=cache_modifier,
             )
 
-        acc0 += tl.dot(x, w1n0, input_precision="ieee")
-        acc1 += tl.dot(x, w1n1, input_precision="ieee")
+        acc0 = tl.dot(x, w1n0, acc=acc0)
+        acc1 = tl.dot(x, w1n1, acc=acc1)
 
         # Advance the ptrs to the next K block.
         x_ptrs += BLOCK_SIZE_K * stride_xk
