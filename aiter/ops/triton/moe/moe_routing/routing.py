@@ -5,6 +5,12 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
 )
+from aiter.ops.triton.fusions.fused_routing_from_topk import (
+    fused_routing_from_topk,
+)
+from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
+    _expt_data_only_kernel,
+)
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
 
@@ -457,12 +463,6 @@ def routing_a8w4_from_topk(
     and ``scatter_indx`` are raw int32 tensors — same contract as
     ``routing_a8w4`` — so ``_a8w4_fused_experts`` consumes them unchanged.
     """
-    from aiter.ops.triton.fusions.fused_routing_from_topk import (
-        fused_routing_from_topk,
-    )
-    from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
-        _expt_data_only_kernel,
-    )
 
     n_tokens, n_expts_act = topk_weights.shape
     n_gates = n_tokens * n_expts_act

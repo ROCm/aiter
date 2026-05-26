@@ -30,12 +30,10 @@ def topk(
     renorm: renormalize weights to sum=1 per row before multiplying by
     routed_scaling_factor.
     """
-    # print(f"topk {x.dtype=} {x.shape=} {k=} {apply_softmax=} {dim=} {return_bitmatrix=} {HIST_BLOCK_M=} {score_mode=} {bias.dtype} {bias.shape} {renorm=} {routed_scaling_factor=}")
     assert len(x.shape) == 2
     n_rows, n_cols = x.shape
 
     # BLOCK_M=1 for small n_rows keeps the grid wide enough to overlap with
-    # the bitmatrix-scratchpad memset pids (see /app/_test/verify-perf-topk.py).
     BLOCK_M = 1 if n_rows <= 256 else 32
     BLOCK_N = 128  # triton.next_power_of_2(x_shape[1])  # 128
     BLOCK_S = 128

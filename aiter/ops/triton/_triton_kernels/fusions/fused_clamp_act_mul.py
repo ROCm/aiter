@@ -59,6 +59,8 @@ def _fused_clamp_silu_mul_kernel(
     HAVE_SWIGLU_CLAMP: tl.constexpr,
     HAS_QUANT: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    SHUFFLE: tl.constexpr,
+    SCALE_N_PAD: tl.constexpr,
 ):
     m_pid = tl.program_id(0)
     n_offs = tl.arange(0, BLOCK_SIZE_N)
@@ -135,11 +137,34 @@ def _fused_clamp_silu_mul_kernel(
         num_bs = tl.cdiv(n_half, QUANT_BLOCK_SIZE)
         NUM_QB_S: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
         g_offs = tl.arange(0, NUM_QB_S)
-        tl.store(
-            scale_ptr + m_pid * scale_stride_m + g_offs * scale_stride_n,
-            block_scales.to(scale_ptr.dtype.element_ty),
-            mask=g_offs < num_bs,
-        )
+        if SHUFFLE:
+            bs_offs_0 = m_pid // 32
+            bs_offs_1 = m_pid % 32
+            bs_offs_2 = bs_offs_1 % 16
+            bs_offs_1 = bs_offs_1 // 16
+            bs_offs_3 = g_offs // 8
+            bs_offs_4 = g_offs % 8
+            bs_offs_5 = bs_offs_4 % 4
+            bs_offs_4 = bs_offs_4 // 4
+            bs_offs = (
+                bs_offs_1
+                + bs_offs_4 * 2
+                + bs_offs_2 * 2 * 2
+                + bs_offs_5 * 2 * 2 * 16
+                + bs_offs_3 * 2 * 2 * 16 * 4
+                + bs_offs_0 * 2 * 16 * SCALE_N_PAD
+            )
+            tl.store(
+                scale_ptr + bs_offs,
+                block_scales.to(scale_ptr.dtype.element_ty),
+                mask=g_offs < num_bs,
+            )
+        else:
+            tl.store(
+                scale_ptr + m_pid * scale_stride_m + g_offs * scale_stride_n,
+                block_scales.to(scale_ptr.dtype.element_ty),
+                mask=g_offs < num_bs,
+            )
     else:
         tl.store(
             out_ptr + m_pid * out_stride_m + n_offs * out_stride_n,
