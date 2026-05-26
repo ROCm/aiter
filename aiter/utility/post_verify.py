@@ -43,6 +43,11 @@ def _materialize_args(task, device):
     ``args[0]`` is a tuple of keys into the dict returned by
     ``gen_data(*gen_args, device=...)``; remaining positional args are
     passed through as-is. ``ref_args[0]`` follows the same convention.
+
+    Returns ``(real_args, ref, arg_key_list)`` where ``arg_key_list`` is
+    the ordered list of keys used to look up tensors in ``data`` (or
+    ``None`` if the task does not use ``gen_data``). It is needed by
+    callers that want to NaN-fill output tensors via ``output_keys``.
     """
     (
         _info,
@@ -65,17 +70,48 @@ def _materialize_args(task, device):
         )
 
     data = gen_data(*gen_args, device=device)
-    real_args = tuple(data[k] for k in args[0]) + tuple(args[1:])
+    real_args = list(data[k] for k in args[0]) + list(args[1:])
+    arg_key_list = list(args[0])
 
     if ref is None and ref_func is not None:
         keys, *rest = ref_args
         ref = ref_func(*tuple(data[k] for k in keys), *rest, **ref_kwargs)
 
-    return real_args, ref
+    return real_args, ref, arg_key_list
+
+
+def _fill_nan_sentinel(real_args, arg_key_list, output_keys):
+    """Fill output tensors with NaN so any unwritten region is detectable.
+
+    Mirrors the NaN-sentinel logic in ``mp_tuner.worker``; needed in
+    ``--fast_tune`` mode where the worker skips reference comparison and
+    therefore never observes a NaN it would have rejected. Without this,
+    a partial-write kernel produces non-NaN garbage from
+    ``torch.empty`` and can sneak past the per-element relative-error
+    check (small-magnitude garbage is, by definition, close to small
+    reference values).
+    """
+    if not output_keys or arg_key_list is None:
+        return
+    for key in output_keys:
+        if key not in arg_key_list:
+            continue
+        idx = arg_key_list.index(key)
+        if idx < len(real_args) and isinstance(real_args[idx], torch.Tensor):
+            real_args[idx].fill_(float("nan"))
+    torch.cuda.synchronize()
 
 
 def _run_and_compare(task, device) -> float:
     """Re-execute one task once on ``device`` and return max per-element rel err.
+
+    Two failure modes are detected:
+
+    1. *Partial-write* kernels: output tensors are NaN-filled before the
+       kernel runs (mirroring ``mp_tuner.worker``); any surviving NaN /
+       Inf in the output is treated as an infinite relative error.
+    2. *Wide-range* output errors: per-element ``|a-b|/|b|`` is computed
+       in fp32; the maximum value is returned.
 
     Note: ``task[5]`` (``kwargs``) is the dict that ``mp_tuner.worker``
     forwards to ``run_perftest``. ``run_perftest`` peels off its own
@@ -84,10 +120,15 @@ def _run_and_compare(task, device) -> float:
     that kernels which legitimately receive extra kwargs continue to
     work.
     """
-    real_args, ref = _materialize_args(task, device)
+    real_args, ref, arg_key_list = _materialize_args(task, device)
     _func = task[3]
     raw_kwargs = task[5] or {}
     func_kwargs = {k: v for k, v in raw_kwargs.items() if k not in _PERFTEST_KWARGS}
+    output_keys = (
+        task[14] if len(task) > 14 and isinstance(task[14], (list, tuple)) else None
+    )
+
+    _fill_nan_sentinel(real_args, arg_key_list, output_keys)
 
     out = _func(*real_args, **func_kwargs)
     torch.cuda.synchronize()
@@ -101,6 +142,11 @@ def _run_and_compare(task, device) -> float:
     ]
     if not tensor_pairs:
         return 0.0
+
+    for o, _ in tensor_pairs:
+        if not torch.isfinite(o).all():
+            return float("inf")
+
     return max(_max_rel_err(o, r) for o, r in tensor_pairs)
 
 
@@ -108,7 +154,7 @@ def verify_top1(
     tasks,
     result,
     *,
-    rel_tol: float = 10.0,
+    rel_tol: float = 0.5,
     max_fallback: int = 3,
     gpu_id: int = 0,
     verbose: bool = False,
@@ -121,9 +167,12 @@ def verify_top1(
         result: list of ``(info, us, err_ratio)`` returned by
             ``mp_tuner``; mutated in place.
         rel_tol: maximum allowed per-element relative error
-            (``|a-b| / |b|``). The default of ``10.0`` is the same
-            "10x off" threshold reviewers requested for wide-range
-            outputs; smaller values mean stricter checks.
+            (``|a-b| / |b|``). The default of ``0.5`` (50%) is well
+            above the bit-quantization noise of correct bf16/fp16 GEMM
+            kernels (empirically ~0-1%) while being strict enough to
+            catch the dominant wide-range failure mode (a kernel that
+            writes ``0`` at a position whose reference value is large
+            produces ``rel_err = 1.0``).
         max_fallback: max number of candidates per shape to verify
             (top-1, top-2, ..., top-max_fallback). Demoted entries
             have ``err_ratio`` set to ``1.0`` so the caller's sort
@@ -170,13 +219,18 @@ def verify_top1(
                 rel_err = float("inf")
 
             if rel_err <= rel_tol:
+                if verbose:
+                    suffix = (
+                        f" (top-1 accepted, max_rel_err={rel_err:.3g})"
+                        if attempt == 0
+                        else (
+                            f" (top-{attempt + 1} accepted after "
+                            f"{attempt} demotion(s), max_rel_err={rel_err:.3g})"
+                        )
+                    )
+                    print(f"[post-verify] {shape_key}:{suffix}")
                 if attempt > 0:
                     n_late_accept += 1
-                    if verbose:
-                        print(
-                            f"[post-verify] {shape_key}: accepted top-{attempt + 1} "
-                            f"after {attempt} demotion(s) (max_rel_err={rel_err:.3g})"
-                        )
                 break
 
             n_demoted += 1

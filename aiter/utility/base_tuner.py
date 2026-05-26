@@ -225,6 +225,17 @@ class TunerCommon:
             help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
         self.parser.add_argument(
+            "--fast_tune",
+            action="store_true",
+            default=False,
+            help="During multi-process tuning, skip the reference computation "
+            "and accuracy comparison entirely (every kernel gets err_ratio=0). "
+            "Removes all checkAllclose-related GPU/CPU syncs from the tune hot "
+            "path, which is the cleanest setting for multi-GPU timing accuracy. "
+            "MUST be combined with --post_verify, otherwise the picked kernel "
+            "has no correctness guarantee.",
+        )
+        self.parser.add_argument(
             "--post_verify",
             action="store_true",
             default=False,
@@ -237,10 +248,13 @@ class TunerCommon:
         self.parser.add_argument(
             "--post_verify_rel_tol",
             type=float,
-            default=10.0,
+            default=0.5,
             help="With --post_verify, maximum allowed per-element relative error "
-            "(|a-b|/|b|). Default 10.0 catches >10x deviations; smaller values "
-            "are stricter.",
+            "(|a-b|/|b|). The default of 0.5 (50%%) sits well above the "
+            "bit-quantization noise of correct bf16/fp16 GEMM kernels (empirically "
+            "~0-1%%) while being strict enough to catch kernels that write 0 "
+            "where the reference is a large value (rel_err = 1.0) -- the most "
+            "common wide-range failure mode. Raise to be more lenient.",
         )
         self.parser.add_argument(
             "--post_verify_max_fallback",
@@ -254,6 +268,11 @@ class TunerCommon:
         args = self.parser.parse_args()
         if args.update_improved and not args.compare:
             self.parser.error("--update_improved requires --compare")
+        if args.fast_tune and not args.post_verify:
+            self.parser.error(
+                "--fast_tune requires --post_verify (without verification the "
+                "picked kernel has no correctness guarantee)"
+            )
         return args
 
     @abstractmethod
