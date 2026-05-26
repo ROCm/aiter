@@ -265,7 +265,13 @@ namespace py = pybind11;
           py::arg("asm_layout") = false);                                           \
     m.def("reshape_and_cache_flash",                                                \
           &aiter::reshape_and_cache_flash,                                          \
-          "reshape_and_cache_flash",                                                \
+          "reshape_and_cache_flash(Tensor key, Tensor value,"                       \
+          "                        Tensor! key_cache,"                              \
+          "                        Tensor! value_cache,"                            \
+          "                        Tensor slot_mapping,"                            \
+          "                        str kv_cache_dtype,"                             \
+          "                        float k_scale, float v_scale,"                   \
+          "                        int kv_layout=-1) -> ()",                        \
           py::arg("key"),                                                           \
           py::arg("value"),                                                         \
           py::arg("key_cache"),                                                     \
