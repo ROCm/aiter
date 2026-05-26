@@ -22,9 +22,21 @@ using index_t = int;
 
 OPUS_D fp32x2_t pk_mul_f32(fp32x2_t a, fp32x2_t b)
 {
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
+    // CDNA-family archs have `v_pk_mul_f32`; keep the asm form so the
+    // packed instruction is guaranteed (compiler auto-vectorization is
+    // best-effort).
     fp32x2_t c;
     asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
     return c;
+#else
+    // RDNA archs (gfx10xx and later) and host: no `v_pk_mul_f32` in the
+    // ISA, so fall back to the portable element-wise form. Compiler
+    // emits two `v_mul_f32` on RDNA.
+    return fp32x2_t{a[0] * b[0], a[1] * b[1]};
+#endif
 }
 
 // fp32x2 -> fp8x2 with scale + saturation clamp (E4M3)
@@ -679,7 +691,7 @@ __device__ opus::vector_t<T, vec_size> load_vector_nbytes(opus::gmem<T>& buffer,
             reinterpret_cast<opus::vector_t<T, chunk_size_elements>*>(
                 result_ptr + i.value * chunk_size_elements);
         *chunk_ptr =
-            buffer.template load<chunk_size_elements, aux>(row_offset, chunk_offset_elements);
+            load<chunk_size_elements>(buffer, row_offset, chunk_offset_elements, opus::number<aux>{});
     });
 
     return result;
@@ -760,23 +772,23 @@ __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
                     chunk_convert[j] = opus::cast<T_R>((*chunk_ptr)[j]);
                 }
                 store_type& chunk_store = reinterpret_cast<store_type&>(chunk_convert);
-                buffer.template store<store_chunk_size_elements, store_type, aux>(
-                    chunk_store, row_offset, chunk_offset_elements);
+                store<store_chunk_size_elements>(
+                    buffer, chunk_store, row_offset, chunk_offset_elements, opus::number<aux>{});
             }
             else if constexpr(std::is_same_v<T_R, opus::fp4_t>)
             {
                 auto chunk_convert      = scaled_cast<T_R>(*chunk_ptr, inverted_scale);
                 store_type& chunk_store = reinterpret_cast<store_type&>(chunk_convert);
-                buffer.template store<store_chunk_size_elements, store_type, aux>(
-                    chunk_store, row_offset, chunk_offset_elements);
+                store<store_chunk_size_elements>(
+                    buffer, chunk_store, row_offset, chunk_offset_elements, opus::number<aux>{});
             }
             else
             {
                 opus::vector_t<T_R, chunk_size_elements> chunk_convert;
                 chunk_convert           = scaled_cast<T_R>(*chunk_ptr, inverted_scale);
                 store_type& chunk_store = reinterpret_cast<store_type&>(chunk_convert);
-                buffer.template store<store_chunk_size_elements, store_type, aux>(
-                    chunk_store, row_offset, chunk_offset_elements);
+                store<store_chunk_size_elements>(
+                    buffer, chunk_store, row_offset, chunk_offset_elements, opus::number<aux>{});
             }
             // Workaround: compiler may not insert s_nop after the last buffer_store, causing a
             // WAR hazard where vdata VGPRs are overwritten before buffer_store finishes reading
@@ -786,8 +798,8 @@ __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
         else
         {
             const store_type* chunk_store_ptr = reinterpret_cast<const store_type*>(chunk_ptr);
-            buffer.template store<store_chunk_size_elements, store_type, aux>(
-                *chunk_store_ptr, row_offset, chunk_offset_elements);
+            store<store_chunk_size_elements>(
+                buffer, *chunk_store_ptr, row_offset, chunk_offset_elements, opus::number<aux>{});
         }
     });
 }
