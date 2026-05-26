@@ -398,8 +398,8 @@ class TestUpdateConfigFiles(unittest.TestCase):
             if os.path.exists(merged_path):
                 os.unlink(merged_path)
 
-    def test_column_mismatch_raises(self):
-        """Two CSVs with different columns -> AssertionError."""
+    def test_column_mismatch_merges(self):
+        """Two CSVs with different columns -> merged with missing cols filled."""
         tuner = _StubTuner.get()
         h1 = [
             "gfx",
@@ -438,8 +438,17 @@ class TestUpdateConfigFiles(unittest.TestCase):
             h2,
             [[TEST_GFX, 304, 1, 1024, 512, "x", 100.0, "k0", 1.0, 1.0, 0.01]],
         )
-        with self.assertRaises(AssertionError):
-            tuner.update_config_files(f"{f1}{os.pathsep}{f2}", "test_mismatch")
+        merged_path = tuner.update_config_files(
+            f"{f1}{os.pathsep}{f2}", "test_mismatch"
+        )
+        try:
+            df = pd.read_csv(merged_path)
+            self.assertIn("extra_col", df.columns)
+            self.assertIn("kernelId", df.columns)
+            self.assertIn("splitK", df.columns)
+        finally:
+            if os.path.exists(merged_path):
+                os.unlink(merged_path)
 
     def test_missing_second_file(self):
         """Second path doesn't exist -> only first file data."""

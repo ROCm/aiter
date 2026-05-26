@@ -3,6 +3,7 @@
 
 import functools
 import glob
+import json
 import os
 import re
 
@@ -175,3 +176,70 @@ def get_mhc_config(
     raise KeyError(
         f"No matching config for M={M}, C={C}, mode={mode} in '{config_name}'"
     )
+
+
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def get_mhc_post_config(M: int, C: int) -> dict:
+    """Pick the mhc_post config for ``(M, C)`` from ``{arch}-MHC_POST.json``.
+
+    Picks the largest ``C_<value> <= C``, else ``"default"``.
+    """
+    if M <= 1024 and C == 4096:
+        return {
+            "BLOCK_M": 8,
+            "BLOCK_C": 512,
+            "num_warps": 8,
+            "num_stages": 1,
+            "waves_per_eu": 3,
+        }
+
+    if not hasattr(get_mhc_post_config, "_file_cache"):
+        get_mhc_post_config._file_cache = {}
+
+    dev = arch_info.get_arch()
+    if dev not in get_mhc_post_config._file_cache:
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHC_POST.json"
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(
+                f"Required MHC_POST config file doesn't exist: {fpath}"
+            )
+        with open(fpath, "r") as f:
+            get_mhc_post_config._file_cache[dev] = json.load(f)
+
+    cfg = get_mhc_post_config._file_cache[dev]
+
+    c_thresholds = sorted(
+        int(k[2:]) for k in cfg if k.startswith("C_") and k[2:].isdigit()
+    )
+    for c_threshold in reversed(c_thresholds):
+        if C >= c_threshold:
+            return dict(cfg[f"C_{c_threshold}"])
+
+    if "default" in cfg:
+        return dict(cfg["default"])
+
+    raise KeyError(f"No matching config for M={M}, C={C} in 'MHC_POST'")
+
+
+def hip_post_dispatch_block(C: int, arch_id: str) -> int | None:
+    """Return the ``residual_block`` ``aiter.mhc_post`` selects for this C.
+
+    Mirrors ``MHC_POST_KERNEL_DISPATCH`` in
+    ``csrc/kernels/mhc_kernels.cu``:
+
+        non-gfx942 + C % 1024 == 0 -> 1024
+        C % 512 == 0               -> 512
+        C % 256 == 0               -> 256
+        else                       -> None  (unsupported, caller should skip)
+
+    The HIP kernel additionally enforces ``C >= 2 * residual_block`` via
+    ``TORCH_CHECK``, so callers should reject shapes where
+    ``C < 2 * hip_post_dispatch_block(C, arch_id)``.
+    """
+    if arch_id != "gfx942" and C % 1024 == 0:
+        return 1024
+    if C % 512 == 0:
+        return 512
+    if C % 256 == 0:
+        return 256
+    return None

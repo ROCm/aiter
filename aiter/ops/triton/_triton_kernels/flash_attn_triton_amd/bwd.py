@@ -842,7 +842,7 @@ def _bwd_dq_inner_split(
             ds_transposed = tl.trans(ds).to(kT.type.element_ty)
             dq += tl.trans(tl.dot(kT, ds_transposed)) * descale_k
         else:
-            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
+            dq = tl.dot(ds.to(kT.type.element_ty), tl.trans(kT), acc=dq)
 
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
@@ -968,9 +968,9 @@ def _bwd_dkdv_inner_split(
         # dV
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
         else:
-            dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
         # Load delta
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
@@ -995,7 +995,7 @@ def _bwd_dkdv_inner_split(
             dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
 
         # increment pointers
         curr_m += step_m
@@ -1150,9 +1150,9 @@ def _bwd_dkdvdq_inner_atomic(
         # dV
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
         else:
-            dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
         # Load delta
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
@@ -1177,7 +1177,7 @@ def _bwd_dkdvdq_inner_atomic(
             dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
 
         # We can compute the dq_partial here and do a atomic add to the correct memory location
         # NOTE: Possible problems with the atomic add: contention, is inside a loop which has achieved bad perf before
@@ -2920,10 +2920,10 @@ def _bwd_dkdv_inner(
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
         # Compute dV.
         if ENABLE_DROPOUT:
-            pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            pT_dropout = pT * dropout_mask.to(pT.dtype) * dropout_scale
+            dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
         else:
-            dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
         if DEBUG_TRITON_DETAIL:
             if start_n == 256:
@@ -2946,7 +2946,7 @@ def _bwd_dkdv_inner(
             dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
@@ -3110,7 +3110,7 @@ def _bwd_dq_inner(
             ds_transposed = tl.trans(ds).to(kT.type.element_ty)
             dq += tl.trans(tl.dot(kT, ds_transposed)) * descale_k
         else:
-            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
+            dq = tl.dot(ds.to(kT.type.element_ty), tl.trans(kT), acc=dq)
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
