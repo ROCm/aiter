@@ -133,8 +133,19 @@ def unified_attention(
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    # Paged KV cache memory layout:
+    #   "NHD" (default): [num_blocks, block_size, num_kv_heads, head_size]
+    #   "HND":           [num_blocks, num_kv_heads, block_size, head_size]
+    # The kernel is stride-based; this only affects how the wrapper unpacks
+    # the cache shape and reorders strides at the kernel call site. Same
+    # recipe as aiter.ops.triton.kv_cache.reshape_and_cache and
+    # aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache.
+    kv_cache_layout: str = "NHD",
 ):
     assert causal, "Only causal attention is supported"
+    assert kv_cache_layout in ("NHD", "HND"), (
+        f"kv_cache_layout must be 'NHD' or 'HND', got {kv_cache_layout!r}"
+    )
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -143,10 +154,22 @@ def unified_attention(
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
-    block_size = v.shape[1]
+    if kv_cache_layout == "NHD":
+        block_size = v.shape[1]
+        num_kv_heads = k.shape[2]
+        stride_k_cache_within = k.stride(1)
+        stride_k_cache_head = k.stride(2)
+        stride_v_cache_within = v.stride(1)
+        stride_v_cache_head = v.stride(2)
+    else:  # "HND"
+        block_size = v.shape[2]
+        num_kv_heads = k.shape[1]
+        stride_k_cache_within = k.stride(2)
+        stride_k_cache_head = k.stride(1)
+        stride_v_cache_within = v.stride(2)
+        stride_v_cache_head = v.stride(1)
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
-    num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
@@ -230,12 +253,12 @@ def unified_attention(
             USE_SINKS=(sinks is not None),
             SLIDING_WINDOW=SLIDING_WINDOW,
             stride_k_cache_0=k.stride(0),
-            stride_k_cache_1=k.stride(1),
-            stride_k_cache_2=k.stride(2),
+            stride_k_cache_1=stride_k_cache_within,
+            stride_k_cache_2=stride_k_cache_head,
             stride_k_cache_3=k.stride(3),
             stride_v_cache_0=v.stride(0),
-            stride_v_cache_1=v.stride(1),
-            stride_v_cache_2=v.stride(2),
+            stride_v_cache_1=stride_v_cache_within,
+            stride_v_cache_2=stride_v_cache_head,
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
@@ -308,12 +331,12 @@ def unified_attention(
             USE_SINKS=(sinks is not None),
             SLIDING_WINDOW=SLIDING_WINDOW,
             stride_k_cache_0=k.stride(0),
-            stride_k_cache_1=k.stride(1),
-            stride_k_cache_2=k.stride(2),
+            stride_k_cache_1=stride_k_cache_within,
+            stride_k_cache_2=stride_k_cache_head,
             stride_k_cache_3=k.stride(3),
             stride_v_cache_0=v.stride(0),
-            stride_v_cache_1=v.stride(1),
-            stride_v_cache_2=v.stride(2),
+            stride_v_cache_1=stride_v_cache_within,
+            stride_v_cache_2=stride_v_cache_head,
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
