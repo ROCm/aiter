@@ -1148,7 +1148,7 @@
         "verbose": "False",
         "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --targets gfx9,gfx950,gfx115 --output_dir {{}}'"
         ]
     },
     "module_mha_varlen_fwd": {
@@ -1175,8 +1175,8 @@
         "verbose": "False",
         "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --targets gfx9,gfx950,gfx115 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --targets gfx9,gfx950,gfx115 --output_dir {{}}'"
         ]
     },
     "module_mha_batch_prefill": {
@@ -1200,7 +1200,7 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --filter \"*_ndropout_*\" --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --targets gfx9,gfx950,gfx115 --filter \"*_ndropout_*\" --output_dir {{}}'"
         ]
     },
     "module_fmha_v3_bwd": {
@@ -1329,9 +1329,9 @@
         "is_standalone": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --targets gfx9,gfx950,gfx115 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --targets gfx9,gfx950,gfx115 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --targets gfx9,gfx950,gfx115 --output_dir {{}}'"
         ]
     },
     "libmha_bwd": {

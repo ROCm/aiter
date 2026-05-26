@@ -104,8 +104,8 @@ def get_mha_varlen_prebuild_variants_by_names(
             has_qscale=has_qscale,
         )
         blob_gen_cmd = [
-            f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt {receipt} --filter {filter_pattern} --output_dir {{}}",
-            f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt {receipt} --filter " @ " --output_dir {{}}',
+            f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt {receipt} --targets gfx9,gfx950,gfx115 --filter {filter_pattern} --output_dir {{}}",
+            f'{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt {receipt} --targets gfx9,gfx950,gfx115 --filter " @ " --output_dir {{}}',
         ]
         variants.append(
             {"md_name": f"mha_varlen_fwd{suffix}", "blob_gen_cmd": blob_gen_cmd}
