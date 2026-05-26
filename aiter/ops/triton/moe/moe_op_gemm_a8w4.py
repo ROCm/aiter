@@ -67,14 +67,11 @@ def allocate_output(
 
 
 def recommend_block_m(m: int) -> int:
-    """Recommend block_m for moe_gemm_a8w4 based on M.
-
-    Prefill (M >= 256) → 64. Decode (M < 256) → 32.
-    Both regimes overridable via env: AITER_A8W4_PREFILL_BM / AITER_A8W4_DECODE_BM.
     """
-    if m >= 256:
-        return int(os.environ.get("AITER_A8W4_PREFILL_BM", "64"))
-    return int(os.environ.get("AITER_A8W4_DECODE_BM", "16"))
+    Recommend block_m for moe_gemm_a8w4 based on M.
+    Prefill (M >= 256) → 64. Decode (M < 256) → 32.
+    """
+    return 64 if m >= 256 else 16
 
 
 def get_kernel_config_triton(m, n, k, routing_data):

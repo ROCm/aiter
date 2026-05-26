@@ -1,3 +1,4 @@
+from typing import Optional
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.moe.reduce import _reduce_grouped
@@ -14,8 +15,7 @@ def reduce_grouped(
     reduction_n=1,
     out_dtype=None,
     add_residual: bool = True,
-    # Step 9: optional external residual folded into the writeback.
-    residual: "torch.Tensor | None" = None,
+    residual: Optional[torch.Tensor] = None,
 ):
     """
     Grouped row reduction used during moe scatter and also compatible with split-k reduce.
