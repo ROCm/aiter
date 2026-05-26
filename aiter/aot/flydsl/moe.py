@@ -513,6 +513,7 @@ def _precompile_to_cache(
                         else torch.empty(0, device=dev)
                     ),
                     stream=0,
+                    inter_dim_pad=0,
                 )
             else:
                 args = _s1_args_std(
@@ -686,6 +687,8 @@ def _precompile_to_cache(
                     dev,
                     bias=bias,
                     stream=0,
+                    model_dim_pad=0,
+                    inter_dim_pad=0,
                 )
             else:
                 args = _s2_args_std(
