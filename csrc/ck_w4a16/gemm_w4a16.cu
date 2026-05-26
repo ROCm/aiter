@@ -208,6 +208,22 @@ inline void run_kernel(const at::Tensor& in_a,
         _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
                                       ck_w4a16::TileConfigKind::Baseline_CShufflePad); \
         break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_CShuffleB32Pack:                 \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_CShuffleB32Pack); \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_CShuffleNXor2:                   \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_CShuffleNXor2); \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_CShuffleNXor4:                   \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_CShuffleNXor4); \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_CShuffleNXor8:                   \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_CShuffleNXor8); \
+        break;                                                                 \
       default:                                                                 \
         TORCH_CHECK(false,                                                     \
                     "CK W4A16 b_scale GEMM: unsupported tile_config_kind=",    \
@@ -217,7 +233,11 @@ inline void run_kernel(const at::Tensor& in_a,
                     "6=NarrowN, 7=Baseline_Sym_V1, 8=Baseline_Sym_V3, "        \
                     "9=Baseline_Bias, 10=Baseline_PackedSb, "                  \
                     "11=Baseline_NoBPad, 12=Baseline_NoAPad, "                 \
-                    "13=Baseline_NoABPad, 14=Baseline_CShufflePad)");          \
+                    "13=Baseline_NoABPad, 14=Baseline_CShufflePad, "           \
+                    "15=Baseline_CShuffleNXor2, "                              \
+                    "16=Baseline_CShuffleB32Pack, "                            \
+                    "17=Baseline_CShuffleNXor4, "                              \
+                    "18=Baseline_CShuffleNXor8)");                             \
     }                                                                          \
   } while (0)
 

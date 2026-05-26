@@ -168,6 +168,42 @@ enum class TileConfigKind : int {
   // Baseline (M=128 N=128 K=32 MRep=4 NRep=2 BlockSize=256 Interwave v1,
   // DequantPack8WithZp).
   Baseline_CShufflePad = 14,
+  // AIESW-32735 W2-cshuffle-nxor: Baseline tile + cshuffle LDS XOR-swizzle on
+  // the N (lane) axis. Same tile/pipeline/dequant as Baseline (M=128 N=128
+  // K=32 MRep=4 NRep=2 BlockSize=256 Interwave v1, DequantPack8WithZp). The
+  // new CK template parameter `CShuffleLdsNXorMask` splits N into
+  // (N/8, 8 = vector-read width), splits M into (M/M_xor, M_xor), and
+  // XOR-permutes N_outer with M_xor so the per-lane LDS DWORD index breaks
+  // the m_subgroup=0/1 bank alias that the row-pad fix (tile_config=14)
+  // missed (W2-isa-analysis identified the conflict as on the lane axis,
+  // not the row axis the pad affects).
+  //
+  // Three variants sweep M_xor — the task brief asked for an iteration over
+  // mask choices to find the best within an XOR-mechanism budget:
+  //   - 15 = Baseline_CShuffleNXor2  : M_xor=2 (2-way; targets exactly the
+  //                                    m_subgroup=0/1 alias identified in
+  //                                    W2-isa-analysis)
+  //   - 17 = Baseline_CShuffleNXor4  : M_xor=4 (4-way)
+  //   - 18 = Baseline_CShuffleNXor8  : M_xor=8 (8-way; covers all 8 lanes of
+  //                                    the merge group)
+  // See notes/ck_layout_tuning/W2_cshuffle_nxor_results.md for the per-mask
+  // PMC + wall-time numbers.
+  Baseline_CShuffleNXor2 = 15,
+  // AIESW-32735 W2-b32pack: Baseline tile + Vgpr->LDS scalar-per-vector = 2 in
+  // the cshuffle epilogue so the threadwise transfer emits ds_store_b32
+  // instead of ds_store_b16. CK's default cshuffle LDS layout has MAccVgprs
+  // stride = NPerShRepeatTotal (>= 64 fp16) so this packed-width store is
+  // structurally inconsistent with the LDS layout (the second packed fp16
+  // would go to LDS offset+2 instead of offset+NPerShRepeatTotal). The tile
+  // config is shipped as a no-op A/B comparator so the template chain is
+  // exercised (the build verifies the plumbing compiles and the device-op
+  // dispatches); correctness is expected to FAIL on this tile until the LDS
+  // layout is restructured to make MAccVgprs the stride-1 dim. See
+  // notes/ck_layout_tuning/W2_cshuffle_b32pack_results.md.
+  Baseline_CShuffleB32Pack = 16,
+  // AIESW-32735 W2-cshuffle-nxor: see Baseline_CShuffleNXor2 above.
+  Baseline_CShuffleNXor4 = 17,
+  Baseline_CShuffleNXor8 = 18,
 };
 
 // Supported per-group scale-block-K values. ScaleBlockK == KPerBlock (32) gives
@@ -560,6 +596,109 @@ struct DeviceGemmInstanceImpl<T, ScaleBlockK, false, TileConfigKind::Baseline_CS
       BDequantOp,
       /*CShuffleLdsExtraN=*/8>;
 };
+
+// AIESW-32735 W2-b32pack: hand-written specialization for
+// Baseline_CShuffleB32Pack. Identical to Baseline except for the trailing
+// CShuffleVgprToLdsScalarPerVector = 2 (and CShuffleLdsExtraN = 0 to keep the
+// LDS row layout unchanged). The device-op template chain
+//   DeviceGemm_BScale_Wmma_CShuffleV3 -> GridwiseGemm_wmma_cshuffle_v3_ab_scale
+//     -> GridwiseGemm_wmma_cshuffle_v3_base -> EpilogueCShuffle
+//     -> EpilogueCShuffleBase
+// threads the value down to `ThreadwiseTensorSliceTransfer_v1r3<...,
+// DstScalarPerVector=2, ...>` in the cshuffle Vgpr->LDS copy. The transfer
+// then packs two adjacent MAccVgprs values into one DWORD and emits a single
+// `ds_store_b32` instead of two `ds_store_b16` instructions, halving the
+// dynamic LDS store count in the cshuffle epilogue.
+//
+// CORRECTNESS WARNING: with the default cshuffle descriptor, adjacent
+// MAccVgprs values are NPerShRepeatTotal fp16 apart in LDS (>= 64 fp16 stride
+// for the production tile), so writing them as a contiguous DWORD at the
+// lower of the two LDS offsets corrupts the next-N element and skips the
+// second MAccVgprs slot. Bit-identical correctness is therefore expected to
+// FAIL on this tile config — it is shipped as a research / structural-probe
+// vehicle. The build, dispatch, and ISA-verification path are exercised so a
+// future restructure of the cshuffle LDS layout (putting MAccVgprs at
+// stride 1) can immediately plug in here without re-plumbing.
+template <typename T, ck::index_t ScaleBlockK>
+struct DeviceGemmInstanceImpl<T, ScaleBlockK, false, TileConfigKind::Baseline_CShuffleB32Pack> {
+  static constexpr ck::index_t kMPerBlock = 128;
+  static constexpr ck::index_t kNPerBlock = 128;
+  static constexpr ck::index_t kKPerBlock = 32;
+  using BDequantOp = DequantPack8WithZp;
+  using type = ck::tensor_operation::device::DeviceGemm_BScale_Wmma_CShuffleV3<
+      ALayout, BLayout, CLayout,
+      T, BDataType, T, T, AccDataType, T,
+      PassThrough, PassThrough, PassThrough,
+      GemmDefault,
+      256,
+      Scale_Block_N, ScaleBlockK,
+      128, 128, 32,
+      8, 8,
+      16, 16,
+      4, 2,
+      S<4, 64, 1>,
+      S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+      S<4, 64, 1>,
+      S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+      1, 1,
+      S<1, 32, 1, 8>, 8,
+      ck::BlockGemmPipelineScheduler::Interwave,
+      ck::BlockGemmPipelineVersion::v1,
+      T, T,
+      PermuteA, PermuteB,
+      BDequantOp,
+      /*CShuffleLdsExtraN=*/0,
+      /*CShuffleVgprToLdsScalarPerVector=*/2>;
+};
+
+// AIESW-32735 W2-cshuffle-nxor: hand-written specializations for the three
+// CShuffleLdsNXorMask variants. Identical to Baseline (tile / pipeline /
+// dequant) except for the trailing CShuffleLdsNXorMask template slot. The
+// device-op template chain
+//   DeviceGemm_BScale_Wmma_CShuffleV3 -> GridwiseGemm_wmma_cshuffle_v3_ab_scale
+//     -> GridwiseGemm_wmma_cshuffle_v3_base -> EpilogueCShuffle
+//     -> EpilogueCShuffleBase
+// threads the value down to GetCShuffleBlockDescriptor_*, where a non-zero
+// value selects the XOR-with-modulo descriptor that swizzles N_outer with
+// M_xor. CShuffleLdsExtraN and CShuffleVgprToLdsScalarPerVector stay at
+// their Baseline values (0 and 1) so this isolates the XOR-swizzle.
+#define _CK_W4A16_DEFINE_NXOR(_TILE_KIND_, _M_XOR_)                                          \
+  template <typename T, ck::index_t ScaleBlockK>                                             \
+  struct DeviceGemmInstanceImpl<T, ScaleBlockK, false, _TILE_KIND_> {                        \
+    static constexpr ck::index_t kMPerBlock = 128;                                           \
+    static constexpr ck::index_t kNPerBlock = 128;                                           \
+    static constexpr ck::index_t kKPerBlock = 32;                                            \
+    using BDequantOp = DequantPack8WithZp;                                                   \
+    using type = ck::tensor_operation::device::DeviceGemm_BScale_Wmma_CShuffleV3<            \
+        ALayout, BLayout, CLayout,                                                           \
+        T, BDataType, T, T, AccDataType, T,                                                  \
+        PassThrough, PassThrough, PassThrough,                                               \
+        GemmDefault,                                                                         \
+        256,                                                                                 \
+        Scale_Block_N, ScaleBlockK,                                                          \
+        128, 128, 32,                                                                        \
+        8, 8,                                                                                \
+        16, 16,                                                                              \
+        4, 2,                                                                                \
+        S<4, 64, 1>,                                                                         \
+        S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,                                               \
+        S<4, 64, 1>,                                                                         \
+        S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,                                               \
+        1, 1,                                                                                \
+        S<1, 32, 1, 8>, 8,                                                                   \
+        ck::BlockGemmPipelineScheduler::Interwave,                                           \
+        ck::BlockGemmPipelineVersion::v1,                                                    \
+        T, T,                                                                                \
+        PermuteA, PermuteB,                                                                  \
+        BDequantOp,                                                                          \
+        /*CShuffleLdsExtraN=*/0,                                                             \
+        /*CShuffleVgprToLdsScalarPerVector=*/1,                                              \
+        /*CShuffleLdsNXorMask=*/_M_XOR_>;                                                    \
+  }
+_CK_W4A16_DEFINE_NXOR(TileConfigKind::Baseline_CShuffleNXor2, 2);
+_CK_W4A16_DEFINE_NXOR(TileConfigKind::Baseline_CShuffleNXor4, 4);
+_CK_W4A16_DEFINE_NXOR(TileConfigKind::Baseline_CShuffleNXor8, 8);
+#undef _CK_W4A16_DEFINE_NXOR
 
 #undef _CK_W4A16_DEFINE_TILE
 #undef _CK_W4A16_DEFINE_TILE_FULL
