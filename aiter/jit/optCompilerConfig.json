@@ -1437,10 +1437,14 @@
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_softmax.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi3xx_v32_fwd_decode_m16x8_fp8_fp8.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi35x_v32_fwd_decode_m16x8_fp8_fp8.cuh'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi35x_v32_fwd_decode_m16x4_fp8_fp8.cuh'"
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi35x_v32_fwd_decode_m16x4_fp8_fp8.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/mla_a16w16_16mx8_32nx1_ps.hpp'",
+            "f'{AITER_CSRC_DIR}/include/mla_decode_defs.h'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-ffast-math'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",

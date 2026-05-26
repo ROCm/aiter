@@ -4,6 +4,7 @@
 #include "hk/mi35x_v32_fwd_decode_m16x4_fp8_fp8.cuh"
 #include "hk/mi35x_v32_fwd_decode_m16x8_fp8_fp8.cuh"
 #include "hk/mi3xx_v32_fwd_decode_m16x8_fp8_fp8.cuh"
+#include "hk/mla_a16w16_16mx8_32nx1_ps.hpp"
 #include "mla.h"
 
 void hk_mla_decode_fwd(torch::Tensor& query,
@@ -22,9 +23,34 @@ void hk_mla_decode_fwd(torch::Tensor& query,
 {
     const int32_t num_head = query.size(1);
 
-    if((num_head * max_seqlen_q) == 128)
+    const std::string gfx     = get_gpu_arch();
+    const int32_t     block_m = num_head * max_seqlen_q;
+
+    // On gfx950, bf16/fp16 (D_qk=576, D_v=512) always go through the opus-based
+    // a16w16 persistent kernel for BlockM in {64, 128}.
+    const auto q_dtype = query.scalar_type();
+    const bool is_a16  = (q_dtype == at::ScalarType::BFloat16 ||
+                          q_dtype == at::ScalarType::Half);
+    if (gfx == "gfx950" && is_a16 && (block_m == 64 || block_m == 128))
     {
-        const std::string gfx = get_gpu_arch();
+        hk_mla_a16w16_16mx8_32nx1_ps(query,
+                                     kv_buffer,
+                                     qo_indptr,
+                                     kv_indptr,
+                                     kv_page_indices,
+                                     kv_last_page_lens,
+                                     work_indptr,
+                                     work_info_set,
+                                     max_seqlen_q,
+                                     softmax_scale,
+                                     split_output,
+                                     split_lse,
+                                     final_output);
+        return;
+    }
+
+    if(block_m == 128)
+    {
         if(gfx == "gfx942")
         {
             hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(query,
@@ -65,9 +91,8 @@ void hk_mla_decode_fwd(torch::Tensor& query,
                         "' (supported: gfx942, gfx950).");
         }
     }
-    else if((num_head * max_seqlen_q) == 64)
+    else if(block_m == 64)
     {
-        const std::string gfx = get_gpu_arch();
         if(gfx == "gfx950")
         {
             hk_mi35x_mla_v32_fwd_decode_m16x4_fp8_fp8(query,
