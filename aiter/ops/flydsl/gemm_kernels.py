@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+import functools
 from itertools import product
 from typing import Dict, Optional
 
@@ -653,27 +654,15 @@ def _register_all_configs():
 _register_all_configs()
 
 
+@functools.lru_cache(maxsize=128)
 def _get_split_k_tensors(
+    device: torch.device,
     stream: torch.cuda.Stream,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    key = _stream_cache_key(stream)
-    semaphore = SPLIT_K_GLOBAL_SEMAPHORE.get(key)
-    signal = SPLIT_K_GLOBAL_SIGNAL.get(key)
-    with torch.cuda.device(stream.device), torch.cuda.stream(stream):
-        if semaphore is None:
-            semaphore = torch.zeros(
-                (SPLIT_K_SEMAPHORE_MAX_LEN,),
-                dtype=torch.int32,
-                device=stream.device,
-            )
-            SPLIT_K_GLOBAL_SEMAPHORE[key] = semaphore
-        if signal is None:
-            signal = torch.zeros(
-                (SPLIT_K_SEMAPHORE_MAX_LEN,),
-                dtype=torch.int32,
-                device=stream.device,
-            )
-            SPLIT_K_GLOBAL_SIGNAL[key] = signal
+    semaphore = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
+    )
+    signal = torch.zeros((SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device)
     return semaphore, signal
 
 
@@ -808,7 +797,7 @@ def _compile_flydsl_hgemm(
         runtime_m = int(a.shape[0])
         launch_stream = _normalize_launch_stream(a.device, stream)
         _check_split_k_semaphore_capacity(runtime_m, n, tile_m, tile_n, split_k)
-        semaphore, signal = _get_split_k_tensors(launch_stream)
+        semaphore, signal = _get_split_k_tensors(a.device, launch_stream)
         return _run_compiled(
             kernel,
             out,
