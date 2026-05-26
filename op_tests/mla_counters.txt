@@ -4,8 +4,8 @@
 # Pass 1: wavefronts and compute utilization
 pmc : Wavefronts VALUUtilization MemUnitBusy MemUnitStalled
 
-# Pass 2: HBM fetch bandwidth (TCC-based, needs its own pass)
-pmc : FetchSize
+# Pass 2: HBM fetch bandwidth via raw TCC counters (FetchSize = (32B_reqs*32 + 64B_reqs*64) / 1024 KB)
+pmc : TCC_EA_RDREQ_sum TCC_EA_RDREQ_32B_sum
 
 # Pass 3: HBM write bandwidth + cache hit rate
 pmc : WriteSize L2CacheHit
