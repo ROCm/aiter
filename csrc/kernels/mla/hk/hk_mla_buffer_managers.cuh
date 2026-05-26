@@ -918,12 +918,10 @@ class QManager8to16bitsV1
         const uint32_t row_in_warp = lane_idx >> 2;                                    // 0..15
         const uint32_t col_group   = lane_idx & 3u;                                    // 0..3
 
-        // Row-conditional half-swap (vmem-load side): rows 8..15 swap the two
-        // 16-col halves of their fp8 NoPE row. Mirrored at LDS reader via
-        // `swz = (row & 8) << 2`. Eliminates Site C 2-way bank conflicts
-        // (rows differing by 8 land in same ds_read_b128 cycle).
-        const uint32_t col_group_swz = col_group ^ ((row_in_warp & 8u) >> 3);
-        const uint32_t v_off_nope = row_in_warp * kPackedNopeStride + col_group_swz * 16u;
+        // Bank-conflict swizzle lives on the LDS-write side (see
+        // p2_cvt_store_nope_chunk) to mirror KvManager8to16bitsV1's
+        // cvt_and_store_kv_tile pattern. vmem-load address is straight.
+        const uint32_t v_off_nope = row_in_warp * kPackedNopeStride + col_group * 16u;
         const uint32_t v_off_scale =
             row_in_warp * kPackedNopeStride + (col_group >> 1);                        // +0/+1
 
@@ -986,14 +984,16 @@ class QManager8to16bitsV1
         hi_dw[3] = __builtin_bit_cast(uint32_t, r);
 
         const uint32_t col_tile = kColTileBase + sb_in_chunk;
-        // Site C bank-conflict mitigation: the vmem-load-side half-swap in
-        // p2_vmem_to_vgpr_nope_chunk (col_group XOR by row_in_warp[3]) places
-        // fp8 elements exactly where load_q_lds_to_gpr expects after its
-        // matching reader-side XOR, so the LDS dst address itself stays
-        // straight here.
+        // Site C bank-conflict swizzle (LDS-write side, Method 1): XOR
+        // byte_in_sb by 32 on sub-tile-rows 1 & 3 (rows 4..7 and 12..15)
+        // so the per-lane ds_write_b128 pair lands at the swizzled position
+        // load_q_lds_to_gpr expects. Same row pattern KvManager8to16bitsV1
+        // uses -- both managers share one bank-arithmetic invariant.
+        const uint32_t row_bank_swap  = ((row_in_warp >> 2) & 1u) << 5;
+        const uint32_t byte_in_sb_swz = byte_in_sb ^ row_bank_swap;
         const uintptr_t p_dst_lane =
             p_lds_q + sub_block_byte_offset(warp_idx, col_tile) +
-            row_in_warp * (kSubBlockCols * sizeof(hk::bf16)) + byte_in_sb;
+            row_in_warp * (kSubBlockCols * sizeof(hk::bf16)) + byte_in_sb_swz;
 
         // No swap needed: the prior bank-conflict-free pattern combined a
         // data-cndmask swap with an address +0/+16 swap that exactly canceled
@@ -1027,10 +1027,12 @@ class QManager8to16bitsV1
 
         constexpr uint32_t kVStride = kSubBlockCols * sizeof(q_rope_t);            // 64
 
-        // Row-conditional half-swap (vmem-load side, RoPE): rows 8..15 swap
-        // their two 32-col halves (col_quad XOR 2). Mirrors NoPE writer
-        // + reader half-swap so the bf16 LDS layout is consistent.
-        const uint32_t col_quad_swz = col_quad ^ ((row_in_warp & 8u) >> 2);
+        // Row-conditional half-swap (vmem-load side, RoPE): swap the two
+        // 32-col halves (col_quad XOR 2) on sub-tile-rows 1 & 3 (rows 4..7
+        // and 12..15). buffer_load_lds has HW-fixed LDS dst, so RoPE must
+        // do Method 2 (vmem-side swap) even though the NoPE writer uses
+        // Method 1 -- both still target the same swizzle row pattern.
+        const uint32_t col_quad_swz = col_quad ^ (((row_in_warp >> 2) & 1u) << 1);
         const uint32_t v_off_lo = row_in_warp * kRopeStride + col_quad_swz * 16u;
 
         // LDS dst is straight: the vmem-load-side col_quad XOR above already
@@ -1174,20 +1176,13 @@ class QManager8to16bitsV1
         const uint32_t row      = lane_idx % kMfmaRows;
         const uint32_t col      = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
 
-        // Site C bank-conflict swizzle: ds_read_b128 spec lane grouping pairs
-        // rows that differ by 12 (same row mod 4) in the same cycle, giving
-        // 2-way conflicts at sites where col_band aliases. XOR the 32-byte
-        // half of each row for rows 8..15 (= swap the (col_band 0,1) and
-        // (col_band 2,3) halves). Writers (p2_cvt_store_nope_chunk and
-        // p2_load_rope_chunk) mirror the same XOR.
-        // Site C bank-conflict swizzle (reader side): ds_read_b128 per-cycle
-        // lane grouping pairs rows differing by 8 (= same row mod 4 across
-        // cycle halves), giving 2-way conflicts when their col_band aliases.
-        // XOR col*2 with 32 for rows 8..15 (= swap the (col_band 0,1) and
-        // (col_band 2,3) halves). Writers mirror the swap on the vmem-load
-        // side so the NoPE / RoPE bf16 LDS contents match what the reader
-        // pulls. Eliminates the 2-way conflict; rows 0..7 are unchanged.
-        const uint32_t swz       = (row & 8u) << 2;
+        // Site C bank-conflict swizzle (reader side): XOR byte-in-sub-block
+        // by 32 on sub-tile-rows 1 & 3 (rows 4..7 and 12..15 of the 16-row
+        // sub-block). Identical pattern to KvManager8to16bitsV1 readers
+        // (load_k_to_gpr, load_transposed_v_to_gpr) so both managers share
+        // one bank-arithmetic invariant. Writers mirror the swap so the
+        // bf16 LDS contents match what the reader pulls.
+        const uint32_t swz       = ((row >> 2) & 1u) << 5;
         const uint32_t in_sb_byte =
             row * (kSubBlockCols * sizeof(hk::bf16)) + (col * sizeof(hk::bf16) ^ swz);
 
@@ -2305,13 +2300,21 @@ class KvManager8to16bitsV1
             // distinct row of the 32-row KV tile, see get_kv_ld_row_base_idx),
             // so it MUST live in v_offset -- routing it via s_offset would force
             // v_readfirstlane and collapse all lanes onto row 0.
-            //   v_offset (per-lane)   = row_kv_ld * 576 + col_group * 16
+            //   v_offset (per-lane)   = row_kv_ld * 576 + col_group_swz * 16
             //   s_offset (wave-unif)  = col_tile_in_tile * 64
             //   i_offset (compile-tm) = kTileIdx * 256
+            //
+            // Bank-conflict swizzle (vmem-load side, Method 2): for rows whose
+            // sub-tile-row is odd (rows 4..7, 12..15) swap the 16 B chunk that
+            // this lane loads with its in-pair neighbour (col_group XOR 1).
+            // Pairs with the matching XOR on load_k_to_gpr/load_transposed_v_to_gpr
+            // readers, and lets cvt_and_store_kv_tile keep the LDS dst address
+            // straight -- same pattern QManager8to16bitsV1 ships.
+            const uint32_t col_group_swz = col_group ^ ((lane_idx >> 4) & 1u);
             const uint32_t v_off_nope =
                 in_bounds
                     ? (static_cast<uint32_t>(row_kv_ld) * kPackedStride +
-                       col_group * 16u)
+                       col_group_swz * 16u)
                     : 0u;
             const uint32_t s_off_nope = col_tile_in_tile * kWaveTileCols;
             constexpr int  i_off_nope = static_cast<int>(kTileIdx * kTileCols);
@@ -2386,9 +2389,20 @@ class KvManager8to16bitsV1
                 // cols 0..31). row_kv_ld already encodes the lane's row
                 // (row_tile*16 + lane>>2); col_group=lane&3 picks the 16 B
                 // (= 8 bf16) slice within the 32-bf16 lo half.
+                //
+                // Bank-conflict swizzle (vmem-load-side, matches the LDS-dst
+                // XOR-by-32 the NoPE writer applies for sub-tile-rows 1,3 of
+                // each 16-row sub-block). buffer_load_lds places lane t at
+                // LDS byte t*16 = (row_in_sb*64 + col_group*16), so the LDS
+                // dst is HW-fixed -- we instead permute the vmem source so
+                // the *data* landing at LDS (row, col_group) for swizzled
+                // rows is what would logically belong at (row, col_group ^ 2).
+                // row_in_sb = lane_idx>>2; sub-tile-row bit = (lane_idx>>4)&1.
+                const uint32_t col_group_swz =
+                    col_group ^ (((lane_idx >> 4) & 1u) << 1);
                 const uint32_t v_off_lo =
                     static_cast<uint32_t>(row_kv_ld) * kRopeStride +
-                    col_group * 16u;
+                    col_group_swz * 16u;
 
                 const uintptr_t p_dst_lo =
                     p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileLo) +
@@ -2484,6 +2498,11 @@ class KvManager8to16bitsV1
                 kTileIdx * kColTilesPerTile + col_tile_in_tile * kWaveColTilesPerWaveTile +
                 sb_idx_in_wave_tile;
 
+            // LDS dst is straight: the vmem-load-side col_group_swz in
+            // prefetch_kv_tile (NoPE branch) already loaded the swapped fp8
+            // chunk for sub-tile-rows 1 & 3, so writing at the unswizzled
+            // byte_in_sb_base places the right *data* at the position the
+            // reader expects after its own row_bank_swap XOR.
             const uintptr_t p_dst_lane =
                 p_lds_kv + sub_block_byte_offset(row_tile, col_tile_global) +
                 row_in_tile * (kSubBlockCols * sizeof(hk::bf16)) + byte_in_sb_base;
@@ -2573,9 +2592,13 @@ class KvManager8to16bitsV1
         const uint32_t row      = lane_idx % kMfmaRows;
         const uint32_t col      = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
 
-        // Per-lane byte offset inside the 16x32 bf16 sub-block (row-major).
+        // Un-swizzle: writer XORs intra-sub-block byte position by 32 on
+        // sub-tile-rows 1 & 3 (rows 4..7 and 12..15) to break the 2-way bank
+        // conflict; the reader applies the same XOR on the col-byte component.
+        const uint32_t row_bank_swap = ((row >> 2) & 1u) << 5;
         const uint32_t in_sb_byte =
-            row * (kSubBlockCols * sizeof(hk::bf16)) + col * sizeof(hk::bf16);
+            row * (kSubBlockCols * sizeof(hk::bf16)) +
+            ((col * sizeof(hk::bf16)) ^ row_bank_swap);
 
         // Constexpr sub-block selector (compiles to immediate offset).
         constexpr uint32_t kFixedOffset =
@@ -2613,9 +2636,13 @@ class KvManager8to16bitsV1
     //   * the sub-block (row_tile = kRowOffset/16, col_tile = kColOffset/32), and
     //   * the 16-col half within that 32-col sub-block: kColOffset%32 -> +0 or +32 B.
     //
-    // TODO(v4.0): row 8..15 LDS swizzle is intentionally not applied (per design
-    // discussion with Niels). Lane groups 2 and 3 will hit a few bank conflicts on
-    // these reads; revisit if PV becomes the hot loop.
+    // Un-swizzle: writer XORs intra-sub-block byte position by 32 on rows
+    // whose sub-tile-row index is odd (rows 4..7 and 12..15 within the 16-row
+    // sub-block). The reader applies the same XOR. With this swizzle both
+    // cycles of ds_read_b64_tr_b16 (lanes 0..31 covering rows 0..7, lanes
+    // 32..63 covering rows 8..15) hit 32 distinct conflict slots -- fully
+    // conflict-free. See [[v40-qlds-bank-conflict-swizzle]] for the analogous
+    // QManager fix and the bank-arithmetic derivation.
     template <uint32_t kRowOffset, uint32_t kColOffset, uint32_t GPR>
     __device__ __forceinline__ static void load_transposed_v_to_gpr(const uintptr_t p_lds_v)
     {
@@ -2627,13 +2654,25 @@ class KvManager8to16bitsV1
         constexpr uint32_t kRowTile      = kRowOffset / kSubBlockRows;            // 0 or 1
         constexpr uint32_t kColTile      = kColOffset / kSubBlockCols;            // 0..15
         constexpr uint32_t kColInSbBytes = (kColOffset % kSubBlockCols) * sizeof(hk::bf16);
-        constexpr uint32_t kFixedOffset  =
+        // Bank-swizzle re-expressed as a conditional ±32 delta so that
+        // (kFixedOffset + kColInSbBytes) stays fully constexpr in the
+        // ds_read_b64_tr_b16 immediate offset: XOR-by-32 against a constexpr
+        // value flips bit 5, equivalent to "+32 if bit was 0, else -32".
+        // The sign is compile-time (from kColInSbBytes's bit 5); only the
+        // boolean `is_swz` (1 bit per lane) is runtime. Avoids materialising
+        // kColInSbBytes as a runtime VGPR (vs. the plain XOR formulation),
+        // which freed 2 unpinned VGPRs in the audit.
+        constexpr int32_t  kSwzDelta    = (kColInSbBytes & 32u) ? -32 : +32;
+        constexpr uint32_t kFixedOffset =
             sub_block_byte_offset(kRowTile, kColTile) + kColInSbBytes;
 
-        const uint32_t lane_idx = opus::lane_id();
-        const uint32_t in_sb    = (lane_idx >> 2) * (kSubBlockCols * sizeof(hk::bf16))
-                                + (lane_idx & 3u) * 8u;
-        const uint32_t addr     = static_cast<uint32_t>(p_lds_v) + in_sb;
+        const uint32_t lane_idx  = opus::lane_id();
+        const uint32_t row_in_sb = lane_idx >> 2;
+        const uint32_t is_swz    = (row_in_sb >> 2) & 1u;             // 0 or 1
+        const uint32_t in_sb     =
+            row_in_sb * (kSubBlockCols * sizeof(hk::bf16)) +
+            (lane_idx & 3u) * 8u + is_swz * static_cast<uint32_t>(kSwzDelta);
+        const uint32_t addr      = static_cast<uint32_t>(p_lds_v) + in_sb;
 
         hkm::ds_read_b64_tr_b16<GPR>(addr, kFixedOffset);
     }
