@@ -2,6 +2,7 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "v1_comm.cuh"
+#include <cstdlib>
 
 template <int32_t kPackedQoLenPerWg_,
           bool kQoSplits_,
@@ -499,9 +500,13 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         ((num_heads == 16) || (num_heads == 32) || (num_heads == 64) || (num_heads == 128)) &&
         enable_experimental;
 
+    const bool force_qh16_fold =
+        (std::getenv("MLA_FORCE_QH16_FOLD") != nullptr) &&
+        (std::getenv("MLA_FORCE_QH16_FOLD")[0] == '1');
+
     const bool natively_supported =
         (num_heads == 16) ||
-        ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
+        (!force_qh16_fold && (arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
          (max_seqlen_qo == 1)) ||
         ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
          (max_seqlen_qo == 2)) ||

@@ -19,6 +19,8 @@ from typing import Union
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
+_FORCE_QH16_FOLD = os.environ.get("MLA_FORCE_QH16_FOLD", "0") == "1"
+
 
 def dump_mla_metadata_v1_txt(
     filepath: Union[str, Path],
@@ -491,7 +493,8 @@ def torch_mla_extend_split_kv(
             and max_seqlen_q == 2
         )
         or (
-            get_gfx() == "gfx950"
+            not _FORCE_QH16_FOLD
+            and get_gfx() == "gfx950"
             and nheads == 32
             and is_fp8_q
             and is_fp8_kvc
