@@ -322,14 +322,18 @@ void mla_decode_stage1_asm_fwd(
                 sub_Q = 64;
             }
         }else if (q_type == "fp8" && kv_type == "fp8"){
+            // fp8/fp8 PS GQA catch-all (below) handles any case satisfying
+            //   (gqa_ratio * max_seqlen_q >= 128) || (gqa_ratio > 64)  (and != 48)
+            bool fp8_ps_catchall_handles = (arch_id == "gfx950" && persistent
+                && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48);
             if((max_seqlen_q == 4) && persistent){
                 config_max_seqlen_q = 4;
                 sub_Q = 128;
             } else if((max_seqlen_q == 2) && persistent){
                 config_max_seqlen_q = 2;
                 sub_Q = 128;
-            } else {
-                AITER_CHECK(false, __func__, 
+            } else if(!fp8_ps_catchall_handles){
+                AITER_CHECK(false, __func__,
                     ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=2,4 in persistent mode");
             }
         }
@@ -344,9 +348,11 @@ void mla_decode_stage1_asm_fwd(
                 sub_Q = 64;
             }
         } else if (q_type == "fp8" && kv_type == "fp8"){
+            bool fp8_ps_catchall_handles = (arch_id == "gfx950" && persistent
+                && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48);
             if (persistent && max_seqlen_q == 1){
                 config_max_seqlen_q = 1;
-            } else {
+            } else if(!fp8_ps_catchall_handles){
                 AITER_CHECK(false, __func__,
                     ": fp8/fp8 with gqa_ratio=64 only supports decode_qlen=1 in persistent mode");
             }
@@ -372,6 +378,13 @@ void mla_decode_stage1_asm_fwd(
     } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && gqa_ratio != 32 && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio > 16)){
         config_max_seqlen_q = 1;
         config_gqa_ratio = 64;
+        args.s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
+        // fp8/fp8 PS GQA catch-all: route to QH32 PS GQA kernel (qseqlen=4, gqa=32 entry)
+        // which now reads s_MQA as s_gqa_ratio.
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 32;
+        causal = 0;  // PS GQA kernel handles mask via work_info; CSV is registered with causal=0
         args.s_MQA = gqa_ratio;
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;

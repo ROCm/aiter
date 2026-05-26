@@ -969,13 +969,6 @@ def get_mla_metadata_info_v1(
         )
         or (
             get_gfx() == "gfx950"
-            and num_head_qo == 128
-            and kv_dtype == dtypes.fp8
-            and q_dtype == dtypes.fp8
-            and effective_seqlen_qo != 4
-        )
-        or (
-            get_gfx() == "gfx950"
             and num_head_qo == 64
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
@@ -987,8 +980,6 @@ def get_mla_metadata_info_v1(
     elif (
         get_gfx() == "gfx950"
         and ((num_head_qo * effective_seqlen_qo) >= 128 or num_head_qo > 64)
-        and kv_dtype == dtypes.bf16
-        and q_dtype == dtypes.bf16
         and num_head_qo != 48
     ):
         if num_head_qo * 2 > 128:
