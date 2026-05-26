@@ -10,7 +10,7 @@ bandwidth utilization.
 
 Sweeps:
 - T (sequence / decode-batch length)
-- (group_size, scale_dtype) combos: per-row fp32, 1×128 fp32 / e8m0, 1×64 …
+- (group_size, scale_dtype) combos: per-row fp32, 1x128 fp32 / e8m0, 1x64 ...
 - with vs without optional ``q_weight``
 
 Usage:
@@ -38,7 +38,6 @@ _EPS = 1e-6
 _SQRT2 = math.sqrt(2.0)
 _FP8_DTYPE = dtypes.fp8
 _FP8_MAX = float(torch.finfo(_FP8_DTYPE).max)
-_E8M0_HEADROOM = 7  # matches kernel constant
 
 
 # ============================================================================
@@ -61,18 +60,30 @@ def _rope_tail_ref(x, cos2d, sin2d, pos, *, D, RD):
     return torch.cat([x[..., :NOPE], tail_new], dim=-1)
 
 
-def _e8m0_encode_ref(amax_safe):
-    """Mirror the kernel's bit-manip e8m0 encoding.
+# fp32 reciprocal of FP8_MAX, matching the kernel's ``inv_max_pos`` constant
+# (round-trip through float32 to capture the same 1-ULP rounding the kernel
+# would see at codegen time).
+_INV_FP8_MAX_F32 = torch.tensor(1.0 / _FP8_MAX, dtype=torch.float32).item()
 
+
+def _e8m0_encode_ref(amax_safe):
+    """Mirror the kernel's MX E8M0 RoundUp encoding.
+
+    NV ROUND_UP / torchao RCEIL: ``scale = ceil_pow2(amax / FP8_MAX)``.
     Returns ``(byte_uint8, factor_fp32)``. ``factor`` is the multiplier
     applied to ``x_norm`` so that ``out = x_norm * factor`` lands in fp8
     range. ``byte`` is the MX e8m0 stored byte; dequant scale = 2^(byte-127).
+
+    ``working = amax * inv_max_pos_f32`` mirrors the kernel exactly --
+    using ``amax / FP8_MAX`` instead would diverge by 1 ULP at fp32
+    boundaries.
     """
     af = amax_safe.float().contiguous()
-    bits = af.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
-    bits_up = (bits + 0x400000) & 0xFF800000
-    exp_field = (bits_up >> 23) & 0xFF
-    e8m0_biased = (exp_field - _E8M0_HEADROOM).clamp(0, 255)
+    working = (af * _INV_FP8_MAX_F32).view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    biased_exp = (working >> 23) & 0xFF
+    mantissa = working & 0x7FFFFF
+    exp_field = torch.where(mantissa != 0, biased_exp + 1, biased_exp)
+    e8m0_biased = exp_field.clamp(0, 255)
     quant_exp = (254 - e8m0_biased).to(torch.int32)
     factor = (quant_exp << 23).view(torch.float32)
     return e8m0_biased.to(torch.uint8), factor
@@ -121,7 +132,7 @@ def _flydsl_qk_norm_rope_ref(
             None,
         )
 
-    # Per-group amax of pre-RoPE x_norm × SQRT2 (post-rope upper bound).
+    # Per-group amax of pre-RoPE x_norm x SQRT2 (post-rope upper bound).
     q_groups = q_n.reshape(T, H, NG, G)
     kv_groups = kv_n.reshape(T, NG, G)
     am_q = (q_groups.abs().amax(-1) * _SQRT2).clamp_min(1e-12)
@@ -146,7 +157,7 @@ def _flydsl_qk_norm_rope_ref(
 
 
 # ============================================================================
-# Dequant for fp8 → fp32 comparison
+# Dequant for fp8 -> fp32 comparison
 # ============================================================================
 
 
@@ -157,7 +168,7 @@ def _dequant(out_fp8, scale, *, D, quant_group_size, scale_dtype):
     if scale_dtype == "fp32":
         scale_f = scale.float()
     else:
-        # MX e8m0: dequant_scale = 2^(byte - 127) → bits = (byte << 23)
+        # MX e8m0: dequant_scale = 2^(byte - 127) -> bits = (byte << 23)
         bits = scale.to(torch.int32) << 23
         scale_f = bits.view(torch.float32)
     scale_full = scale_f.unsqueeze(-1).expand(*scale_f.shape, G).reshape(T, *leading, D)
@@ -250,8 +261,8 @@ def test_flydsl_qk_norm_rope_quant(
         ref_deq = _dequant(ref_q, ref_qs, **deq_kw)
         got_kv_deq = _dequant(got_kv, got_ks, **deq_kw)
         ref_kv_deq = _dequant(ref_kv, ref_ks, **deq_kw)
-        # Looser tolerance under fp8 + group quant — pow2 rounding plus bf16
-        # RoPE noise pushes per-element diffs into the 0.1–10 range depending
+        # Looser tolerance under fp8 + group quant -- pow2 rounding plus bf16
+        # RoPE noise pushes per-element diffs into the 0.1-10 range depending
         # on amax. cos-sim (computed via checkAllclose's atol on row sums)
         # remains > 0.999 in all configs we ship.
         rtol, atol = 0.05, 5.0
@@ -298,7 +309,7 @@ def test_flydsl_qk_norm_rope_quant_cos_sin_4d():
     """Cover the advertised cos/sin layout that DeepSeek-V4 uses.
 
     The wrapper docstring states cos/sin caches may have any leading shape
-    whose last dim is RD/2 — DeepSeek-V4 stores them as
+    whose last dim is RD/2 -- DeepSeek-V4 stores them as
     ``[max_pos, 1, 1, RD/2]``. The matrix sweep above only exercises the
     2D ``[max_pos, RD/2]`` shape, so add a single smoke case that reshapes
     cos/sin to 4D and verifies the output is bit-identical to the 2D path.
@@ -346,7 +357,7 @@ def test_flydsl_qk_norm_rope_quant_cos_sin_4d():
         head_dim=D,
         rope_head_dim=RD,
     )
-    # 2D vs 4D cos/sin must produce bit-identical results — the wrapper just
+    # 2D vs 4D cos/sin must produce bit-identical results -- the wrapper just
     # .view()s the cache; identical underlying storage means identical loads.
     torch.testing.assert_close(out_2d[0], out_4d[0], atol=0.0, rtol=0.0)
     torch.testing.assert_close(out_2d[1], out_4d[1], atol=0.0, rtol=0.0)
