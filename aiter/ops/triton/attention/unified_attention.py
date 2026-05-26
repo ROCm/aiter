@@ -143,9 +143,10 @@ def unified_attention(
     kv_cache_layout: str = "NHD",
 ):
     assert causal, "Only causal attention is supported"
-    assert kv_cache_layout in ("NHD", "HND"), (
-        f"kv_cache_layout must be 'NHD' or 'HND', got {kv_cache_layout!r}"
-    )
+    assert kv_cache_layout in (
+        "NHD",
+        "HND",
+    ), f"kv_cache_layout must be 'NHD' or 'HND', got {kv_cache_layout!r}"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
