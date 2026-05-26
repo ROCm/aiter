@@ -422,10 +422,18 @@ def test_paged_attention_decode_float_scale(
         block_tables,
         max_context_len,
     ) = input_helper(
-        B, H_Q, H_KV, head_size, KV_BLK_SZ, SEQ_LEN,
-        dtype, kv_cache_dtype, output_type, num_blocks,
+        B,
+        H_Q,
+        H_KV,
+        head_size,
+        KV_BLK_SZ,
+        SEQ_LEN,
+        dtype,
+        kv_cache_dtype,
+        output_type,
+        num_blocks,
     )
-    attn_scale = 1.0 / (head_size ** 0.5)
+    attn_scale = 1.0 / (head_size**0.5)
     triton_output_f = torch.zeros_like(triton_output_t)
 
     # Tensor scale (existing behavior)

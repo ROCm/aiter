@@ -122,8 +122,6 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
 
 
-
-
 def _torch_reference(key, value, key_cache, value_cache, slot_mapping, block_size):
     expected_k = key_cache.clone()
     expected_v = value_cache.clone()

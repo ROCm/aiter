@@ -143,7 +143,9 @@ def reshape_and_cache(
     assert n_k == n_v == num_tokens, "key/value first dim must match slot_mapping"
     assert kh_k == kh_v == kh_c, "kv head count must match between inputs and cache"
     assert d_k == d_v == d_c, "head_dim must match between inputs and cache"
-    assert key_cache.shape == value_cache.shape, "key_cache and value_cache must share layout"
+    assert (
+        key_cache.shape == value_cache.shape
+    ), "key_cache and value_cache must share layout"
 
     key_c = key.contiguous() if not key.is_contiguous() else key
     val_c = value.contiguous() if not value.is_contiguous() else value
