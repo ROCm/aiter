@@ -4,6 +4,9 @@ from .quant import (
     dynamic_per_token_quant_fp8_i8,
     dynamic_mxfp4_quant,
     _mxfp4_quant_op,
+    dynamic_mxfp8_quant,
+    fp8_legacy_to_mxfp8,
+    _mxfp8_quant_op,
 )
 
 from .fused_fp8_quant import (
@@ -25,6 +28,12 @@ from .fused_mxfp4_quant import (
     fused_dynamic_mxfp4_quant_moe_sort,
 )
 
+from .fused_mxfp8_quant import (
+    fused_rms_mxfp8_quant,
+    fused_dual_rmsnorm_mxfp8_quant,
+    fused_flatten_mxfp8_quant,
+)
+
 __all__ = [
     # quant.py exports
     "static_per_tensor_quant_fp8_i8",
@@ -32,6 +41,9 @@ __all__ = [
     "dynamic_per_token_quant_fp8_i8",
     "dynamic_mxfp4_quant",
     "_mxfp4_quant_op",
+    "dynamic_mxfp8_quant",
+    "fp8_legacy_to_mxfp8",
+    "_mxfp8_quant_op",
     # fused_fp8_quant.py exports
     "calc_rows_per_block",
     "get_fp8_min_max_bounds",
@@ -47,4 +59,8 @@ __all__ = [
     "fused_reduce_act_mul_and_mxfp4_quant",
     "fused_reduce_rms_mxfp4_quant",
     "fused_dynamic_mxfp4_quant_moe_sort",
+    # fused_mxfp8_quant.py exports
+    "fused_rms_mxfp8_quant",
+    "fused_dual_rmsnorm_mxfp8_quant",
+    "fused_flatten_mxfp8_quant",
 ]

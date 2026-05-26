@@ -15,26 +15,6 @@ from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
 
-# -----------------------------------------------------------------------------
-# Tuned-config lookup for gemm_afp8wfp8_preshuffle.
-#
-# Configs live under aiter.ops.triton.configs.gemm using the standard aiter
-# naming: gfx{arch}-GEMM-MXFP8-PRESHUFFLE-N={N}-K={K}.json, keyed by
-# M_LEQ_x / M_GEQ_x / any per STANDARD_M_BOUNDS. A generic fallback
-# gfx{arch}-GEMM-MXFP8-PRESHUFFLE.json covers untuned (N, K) shapes.
-# -----------------------------------------------------------------------------
-
-# Shapes that have OOM'd at runtime with the tuned config. Future calls
-# bypass the tuned lookup for these and use _DEFAULT_CONFIG. The tuned
-# benches don't run under HIP-graph capture, so they can pick configs that
-# look fine in isolation but blow LDS once captured. This cache survives
-# across requests in the same process.
-_OOM_SHAPES: set = set()
-
-
-def _mark_oom(M: int, N: int, K: int):
-    _OOM_SHAPES.add((M, N, K))
-
 
 def gemm_afp8wfp8(
     x: torch.Tensor,

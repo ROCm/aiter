@@ -4,11 +4,13 @@
 import pytest
 import torch
 
-from aiter.ops.triton.quant.quant_mxfp8 import (
-    per_1x32_mxfp8_quant_triton,
+from aiter.ops.triton.quant.quant import (
+    dynamic_mxfp8_quant,
     fp8_legacy_to_mxfp8,
-    rmsnorm_mxfp8_quant,
-    dual_rmsnorm_mxfp8_quant,
+)
+from aiter.ops.triton.quant.fused_mxfp8_quant import (
+    fused_rms_mxfp8_quant,
+    fused_dual_rmsnorm_mxfp8_quant,
     fused_flatten_mxfp8_quant,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
@@ -20,7 +22,7 @@ _E8M0_MASK_INT32 = -8388608
 
 
 def torch_mxfp8_quant_from_fp32(x_fp32: torch.Tensor):
-    """Bit-faithful port of `_mxfp8_quant_kernel` quant logic, taking fp32 input.
+    """Bit-faithful port of `_dynamic_mxfp8_quant_kernel` quant logic, taking fp32 input.
 
     Computes per-1x32 e8m0 scale (uint8) and FP8 e4m3fn values.
     """
@@ -53,7 +55,7 @@ def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
 
 
 # -----------------------------------------------------------------------------
-# per_1x32_mxfp8_quant_triton
+# dynamic_mxfp8_quant
 # -----------------------------------------------------------------------------
 
 
@@ -87,7 +89,7 @@ def test_per_1x32_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
     y_ref, s_ref = torch_mxfp8_quant_from_fp32(x_fp32)
 
     # Triton path.
-    y_kern, s_kern = per_1x32_mxfp8_quant_triton(x)
+    y_kern, s_kern = dynamic_mxfp8_quant(x)
 
     # Scales must be bit-exact: the e8m0 derivation is integer-only after
     # the fp32 cast, and amax is order-independent.
@@ -114,7 +116,7 @@ def test_per_1x32_mxfp8_quant_preallocated_scale():
     scale_pre = torch.empty(
         (M, K // QUANT_BLOCK_SIZE), dtype=torch.uint8, device="cuda"
     )
-    y, s = per_1x32_mxfp8_quant_triton(x, scale=scale_pre)
+    y, s = dynamic_mxfp8_quant(x, scale=scale_pre)
     assert s.data_ptr() == scale_pre.data_ptr()
 
     y_ref, s_ref = torch_mxfp8_quant_from_fp32(x.to(torch.float32))
@@ -130,7 +132,7 @@ def test_per_1x32_mxfp8_quant_multidim():
 
     B, M, K = 4, 8, 128
     x = torch.randn((B, M, K), dtype=torch.bfloat16, device="cuda")
-    y, s = per_1x32_mxfp8_quant_triton(x)
+    y, s = dynamic_mxfp8_quant(x)
     assert y.shape == (B, M, K)
     assert s.shape == (B, M, K // QUANT_BLOCK_SIZE)
 
@@ -213,7 +215,7 @@ def test_fp8_legacy_to_mxfp8_preallocated():
 
 
 # -----------------------------------------------------------------------------
-# rmsnorm_mxfp8_quant
+# fused_rms_mxfp8_quant
 # -----------------------------------------------------------------------------
 
 
@@ -255,7 +257,7 @@ def test_rmsnorm_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
     eps = 1e-5
 
     y_ref, s_ref = torch_rmsnorm_mxfp8_quant(x, weight, eps)
-    y_kern, s_kern = rmsnorm_mxfp8_quant(x, weight, eps)
+    y_kern, s_kern = fused_rms_mxfp8_quant(x, weight, eps)
 
     # Hardware rsqrt vs torch.rsqrt can disagree by a ULP; that may flip a single
     # e8m0 bin near a power-of-2 boundary. Compare dequantized values instead.
@@ -278,13 +280,13 @@ def test_rmsnorm_mxfp8_quant_preallocated():
     weight = torch.randn((K,), dtype=torch.bfloat16, device="cuda")
     y_pre = torch.empty((M, K), dtype=torch.float8_e4m3fn, device="cuda")
     s_pre = torch.empty((M, K // QUANT_BLOCK_SIZE), dtype=torch.uint8, device="cuda")
-    y, s = rmsnorm_mxfp8_quant(x, weight, 1e-5, y=y_pre, scale=s_pre)
+    y, s = fused_rms_mxfp8_quant(x, weight, 1e-5, y=y_pre, scale=s_pre)
     assert y.data_ptr() == y_pre.data_ptr()
     assert s.data_ptr() == s_pre.data_ptr()
 
 
 # -----------------------------------------------------------------------------
-# dual_rmsnorm_mxfp8_quant
+# fused_dual_rmsnorm_mxfp8_quant
 # -----------------------------------------------------------------------------
 
 
@@ -324,7 +326,7 @@ def test_dual_rmsnorm_mxfp8_quant(M: int, KQ: int, KK: int, dtype: torch.dtype):
     yq_ref, sq_ref, yk_ref = torch_dual_rmsnorm_mxfp8_quant(
         q, k, q_weight, k_weight, eps_q, eps_k
     )
-    yq_kern, sq_kern, yk_kern = dual_rmsnorm_mxfp8_quant(
+    yq_kern, sq_kern, yk_kern = fused_dual_rmsnorm_mxfp8_quant(
         q, k, q_weight, k_weight, eps_q, eps_k
     )
 
@@ -354,8 +356,8 @@ def test_dual_rmsnorm_mxfp8_quant_default_eps_k():
     k_weight = torch.randn((KK,), dtype=dtype, device="cuda")
     eps = 1e-5
 
-    yq_a, sq_a, yk_a = dual_rmsnorm_mxfp8_quant(q, k, q_weight, k_weight, eps)
-    yq_b, sq_b, yk_b = dual_rmsnorm_mxfp8_quant(
+    yq_a, sq_a, yk_a = fused_dual_rmsnorm_mxfp8_quant(q, k, q_weight, k_weight, eps)
+    yq_b, sq_b, yk_b = fused_dual_rmsnorm_mxfp8_quant(
         q, k, q_weight, k_weight, eps, eps_k=eps
     )
     torch.testing.assert_close(yq_a.view(torch.uint8), yq_b.view(torch.uint8))
@@ -415,7 +417,7 @@ def test_fused_flatten_mxfp8_quant(M: int, N1: int, N2: int, dtype: torch.dtype)
 
 
 def test_fused_flatten_mxfp8_quant_matches_per_1x32_after_flatten():
-    """Sanity: the flatten+quant path should match per_1x32_mxfp8_quant_triton
+    """Sanity: the flatten+quant path should match dynamic_mxfp8_quant
     applied to the pre-flattened (M, N1 * N2) tensor."""
     if not arch_info.is_fp8_avail():
         pytest.skip("FP8 not supported on this arch")
@@ -426,7 +428,7 @@ def test_fused_flatten_mxfp8_quant_matches_per_1x32_after_flatten():
     x = torch.randn((M, N1, N2), dtype=torch.bfloat16, device="cuda")
 
     y_flat, s_flat = fused_flatten_mxfp8_quant(x)
-    y_ref, s_ref = per_1x32_mxfp8_quant_triton(x.reshape(M, N1 * N2).contiguous())
+    y_ref, s_ref = dynamic_mxfp8_quant(x.reshape(M, N1 * N2).contiguous())
 
     torch.testing.assert_close(s_flat, s_ref)
     torch.testing.assert_close(

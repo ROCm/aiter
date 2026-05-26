@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton.language as tl
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import (
@@ -225,15 +226,7 @@ def _fused_gemm_a16w16_quant_x_kernel(
         # Per-1x32 MXFP8 quant. Group along K within this tile.
         n_groups: tl.constexpr = BLOCK_SIZE_K // QUANT_BLOCK_SIZE
         a_2d = tl.reshape(a, (BLOCK_SIZE_M, n_groups, QUANT_BLOCK_SIZE))
-        amax = tl.max(tl.abs(a_2d), axis=2, keep_dims=True)  # (M, G, 1)
-
-        amax_i32 = amax.to(tl.int32, bitcast=True)
-        amax_i32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-        amax_p2 = amax_i32.to(tl.float32, bitcast=True)
-        scale_unbiased = tl.log2(amax_p2).floor() - 8
-        scale_unbiased = tl.clamp(scale_unbiased, min=-127, max=127)
-        scale_e8m0 = (scale_unbiased.to(tl.int32) + 127).to(tl.uint8)  # (M, G, 1)
-        quant_scale = tl.exp2(-scale_unbiased)  # (M, G, 1)
+        scale_e8m0, quant_scale = _mxfp8_quant_op(a_2d, QUANT_AXIS=2)
 
         qa_2d = a_2d * quant_scale
         qa = tl.reshape(qa_2d, (BLOCK_SIZE_M, BLOCK_SIZE_K))

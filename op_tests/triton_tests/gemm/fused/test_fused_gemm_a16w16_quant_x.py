@@ -18,7 +18,7 @@ _E8M0_MASK_INT32 = -8388608
 
 
 def torch_mxfp8_quant_from_fp32(x_fp32: torch.Tensor):
-    """Bit-faithful port of `_mxfp8_quant_kernel` quant logic, taking fp32 input.
+    """Bit-faithful port of `_dynamic_mxfp8_quant_kernel` quant logic, taking fp32 input.
 
     Computes per-1x32 e8m0 scale (uint8) and FP8 e4m3fn values.
     """
