@@ -11,6 +11,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="${VIRTUAL_ENV:+${VIRTUAL_ENV}/bin/python}${VIRTUAL_ENV:-$(command -v python3 || command -v python)}"
 OUTPUT="${1:-${SCRIPT_DIR}/bench_qh32_vs_qh16fold_results.txt}"
 
 BATCH_SIZES=(1 4 16)
@@ -27,7 +28,7 @@ run_sweep() {
     for batch in "${BATCH_SIZES[@]}"; do
         for ctx in "${CTX_LENS[@]}"; do
             echo "  batch=${batch}  ctxLen=${ctx}" | tee -a "${OUTPUT}"
-            MLA_FORCE_QH16_FOLD="${force_fold}" python "${SCRIPT_DIR}/test_mla_persistent.py" \
+            MLA_FORCE_QH16_FOLD="${force_fold}" "${PYTHON}" "${SCRIPT_DIR}/test_mla_persistent.py" \
                 --nhead 32,1 \
                 --dtype fp8 \
                 --kv_dtype fp8 \
