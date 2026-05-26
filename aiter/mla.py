@@ -4,6 +4,7 @@
 # user interface
 
 import functools
+import os
 from typing import Optional
 import torch
 import triton
@@ -14,6 +15,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.core import is_experimental_enabled
 
+_FORCE_QH16_FOLD = os.environ.get("MLA_FORCE_QH16_FOLD", "0") == "1"
 
 @triton.jit
 def _fwd_kernel_stage2_asm(
@@ -396,7 +398,8 @@ def mla_decode_fwd(
                 and max_seqlen_q == 1
             )
             or (
-                get_gfx() == "gfx950"
+                not _FORCE_QH16_FOLD
+                and get_gfx() == "gfx950"
                 and nhead == 32
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
