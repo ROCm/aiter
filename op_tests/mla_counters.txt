@@ -1,8 +1,8 @@
 # MLA kernel hardware counter collection
 # rocprof re-runs the app once per pmc line
 
-# Pass 1: wavefronts and compute utilization
-pmc : Wavefronts VALUUtilization MemUnitBusy MemUnitStalled
+# Pass 1: wavefronts, compute utilization, GPU active cycles
+pmc : Wavefronts VALUUtilization MemUnitBusy MemUnitStalled GRBM_GUI_ACTIVE
 
 # Pass 2: HBM fetch bandwidth via raw TCC counters (FetchSize = (32B_reqs*32 + 64B_reqs*64) / 1024 KB)
 pmc : TCC_EA_RDREQ_sum TCC_EA_RDREQ_32B_sum
