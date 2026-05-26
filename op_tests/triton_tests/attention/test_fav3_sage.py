@@ -1184,9 +1184,7 @@ def test_sage_mxfp4_ring_merge_matches_single_call(
         if out_acc is None:
             out_acc, lse_acc = out_s, lse_s
         else:
-            out_acc, lse_acc = _fa_merge_partial(
-                out_acc, lse_acc, out_s, lse_s, layout
-            )
+            out_acc, lse_acc = _fa_merge_partial(out_acc, lse_acc, out_s, lse_s, layout)
 
     merged_out = out_acc.to(full_out.dtype)
     assert merged_out.shape == full_out.shape

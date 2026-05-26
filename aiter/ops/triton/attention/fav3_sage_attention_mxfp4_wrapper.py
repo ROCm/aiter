@@ -265,9 +265,7 @@ def fav3_sage_mxfp4_func(
         device=q.device,
     )
     softmax_lse = (
-        torch.empty(
-            (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
-        )
+        torch.empty((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
         if return_lse
         else None
     )

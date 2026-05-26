@@ -959,10 +959,7 @@ def sage_fwd_mxfp4(
         log_l_i = tl.where(invalid_mask, 0.0, tl.math.log2(l_i_safe))
         softmax_lse = tl.where(invalid_mask, float("-inf"), (m_i + log_l_i) * LN2)
         l_offset = (
-            LSE
-            + off_z * stride_lse_z
-            + off_h_q * stride_lse_h
-            + q_start * stride_lse_m
+            LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + q_start * stride_lse_m
         )
         l_ptrs = l_offset + offs_m * stride_lse_m
         tl.store(l_ptrs, softmax_lse, mask=offs_m < seqlen_q)

@@ -227,9 +227,9 @@ def sage_quant_mxfp4(
                 h_qo % h_kv == 0
             ), f"GQA ratio must be integer, got h_qo={h_qo}, h_kv={h_kv}"
             kmean_bhsd = kmean_bhsd.repeat_interleave(h_qo // h_kv, dim=1)
-        delta_lse = (
-            q_bhsd.to(torch.float32) * kmean_bhsd.to(torch.float32)
-        ).sum(dim=-1) * sm_scale
+        delta_lse = (q_bhsd.to(torch.float32) * kmean_bhsd.to(torch.float32)).sum(
+            dim=-1
+        ) * sm_scale
 
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s, delta_lse
 
