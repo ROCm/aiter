@@ -1,0 +1,11 @@
+# MLA kernel hardware counter collection
+# rocprof re-runs the app once per pmc line
+
+# Pass 1: bandwidth and wavefronts
+pmc : Wavefronts FetchSize WriteSize VALUUtilization
+
+# Pass 2: cache and memory stalls
+pmc : L2CacheHit MemUnitStalled
+
+# Only capture the MLA kernels, skip everything else
+kernel: mla_a8w8_qh32 mla_a8w8_qh16
