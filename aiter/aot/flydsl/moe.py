@@ -101,19 +101,8 @@ def parse_csv(csv_path: str):
                 if act_type.strip().split(".")[-1].lower() == "swiglu"
                 else "silu"
             )
-            q_type = row.get("q_type", "")
-            dtype = row.get("dtype", "")
-            q_dtype_w = row.get("q_dtype_w", "")
             swiglu_limit = _row_swiglu_limit(row)
-            # Cover both runtime bias choices for fp4-weight MoE. Model configs
-            # share kernel families, and runtime bias selection can vary by
-            # activation dtype/model semantics.
-            bias_supported = (
-                q_type.strip().split(".")[-1] == "per_1x32"
-                and dtype in ("torch.bfloat16", "torch.float16")
-                and "float4_e2m1fn_x2" in q_dtype_w
-            )
-            enable_bias_options = [False, True] if bias_supported else [False]
+            enable_bias_options = [str(row.get("bias", "")).strip() == "True"]
 
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
