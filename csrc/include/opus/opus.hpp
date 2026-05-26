@@ -2192,8 +2192,7 @@ template<typename T, index_t N> using mfma_vtype_t = typename impl::mfma_vtype<T
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
     return inst_(__builtin_bit_cast(long, a), __builtin_bit_cast(long, b), c, cbsz, abid, blgp); }
 
-// scaled MFMA (f8f6f4): input always bitcast to i32x8_t (256 bits); uses format codes and runtime scale.
-// scale_op_sel_a / scale_op_sel_b are 2-bit byte-selectors inside the packed-int32 scale word.
+// scaled MFMA (f8f6f4): input bitcast to i32x8_t (256 bits); uses format codes, runtime scale, and 2-bit byte-selectors (scale_op_sel_a/b) into the packed-int32 scale word.
 #define DISPATCH_MFMA_SCALE_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
     return inst_(__builtin_bit_cast(i32x8_t, a), __builtin_bit_cast(i32x8_t, b), c, fmt_a, fmt_b, scale_op_sel_a, scale_a, scale_op_sel_b, scale_b); }
@@ -2265,9 +2264,7 @@ struct mfma {
 
     // Scaled MFMA dispatch (gfx950: f8f6f4 with E8M0 block exponent scaling)
     // scale_a, scale_b are runtime E8M0 exponent values; 127 = no scaling (2^0 = 1.0).
-    // scale_op_sel_a, scale_op_sel_b are compile-time 2-bit byte-selectors picking
-    // which byte of the packed-int32 scale word feeds this MFMA. Default 0 matches
-    // the legacy behavior of treating scale_a/scale_b as scalar values (low byte).
+    // scale_op_sel_a/b: compile-time 2-bit byte-selectors picking which byte of the packed-int32 scale word feeds this MFMA; 0 = low byte = legacy scalar behavior.
     template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) -> vtype_c {
         (void)a; (void)b; (void)c; (void)scale_a; (void)scale_b;  // used by DISPATCH_MFMA_SCALE_; suppress -Wunused-parameter on host
@@ -2944,13 +2941,7 @@ struct tiled_mma_adaptor : public MMA_ {
     static constexpr index_t tile_c_len = EXPAND_M * EXPAND_N * mma_c_len;
 
     // input a/b/c is array of ext type e.g. "fp16x2_t a[2];", pass "a" to this function
-    //
-    // `#pragma unroll` is required: trip counts are all constexpr, but
-    // clang's default heuristic gives up on large tiles, leaving the
-    // body as a runtime loop with runtime indices into vtype_a/b/c.
-    // GFX9 has no "load VGPR by runtime index" instruction, so each
-    // unrolled-out access compiles to an N-way s_cselect_b64 chain that
-    // blows up SGPR pressure and triggers SGPR-spill-to-VGPR-lane.
+    // #pragma unroll required: constexpr trip counts but clang's heuristic gives up on large tiles → runtime indices into vtype_a/b/c → N-way s_cselect_b64 chain on GFX9 → SGPR-spill-to-VGPR-lane blow-up.
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
                     std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
@@ -2999,9 +2990,7 @@ struct tiled_mma_adaptor : public MMA_ {
         return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
 
-    // Scaled MFMA (f8f6f4): forward scale_a, scale_b and per-call scale_op_sel to underlying MMA.
-    // All sub-MFMAs in this call share the same scale_op_sel (they reside at the same
-    // K position in the packed-int32 scale word).
+    // Scaled MFMA (f8f6f4): forward scale_a, scale_b and per-call scale_op_sel to underlying MMA; all sub-MFMAs in this call share the same scale_op_sel (same K position in the packed-int32 scale word).
     template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
