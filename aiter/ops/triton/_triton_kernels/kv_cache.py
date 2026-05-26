@@ -113,11 +113,11 @@ def _cat_and_cache_mla_kernel(
 
 @triton.jit
 def _reshape_and_cache_kernel(
-    k_new_ptr,                 # [N, KH, D]
-    v_new_ptr,                 # [N, KH, D]
-    slot_mapping_ptr,          # [N] int64; slot < 0 => skip
-    k_cache_ptr,               # [num_blocks, KH, BLOCK_SIZE, D]
-    v_cache_ptr,               # [num_blocks, KH, BLOCK_SIZE, D]
+    k_new_ptr,  # [N, KH, D]
+    v_new_ptr,  # [N, KH, D]
+    slot_mapping_ptr,  # [N] int64; slot < 0 => skip
+    k_cache_ptr,  # [num_blocks, KH, BLOCK_SIZE, D]
+    v_cache_ptr,  # [num_blocks, KH, BLOCK_SIZE, D]
     new_stride_token,
     new_stride_head,
     cache_stride_block,

@@ -87,7 +87,7 @@ jobs:
         with:
           name: triton_wheelhouse
           path: triton_wheels/
-          retention-days: 7
+          retention-days: 3
 
   # Step 2: MI35X matrix jobs
   triton:
