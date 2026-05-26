@@ -716,9 +716,7 @@ def gemm_a8w8_blockscale(
 
             xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
             wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
-            return _gemm_a8w8_blockscale_triton(
-                xq, wq, x_scale, w_scale, dtype=dtype
-            )
+            return _gemm_a8w8_blockscale_triton(xq, wq, x_scale, w_scale, dtype=dtype)
         config = get_CKGEMM_config(
             m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
         )
@@ -818,14 +816,25 @@ def gemm_a8w8_blockscale_bpreshuffle(
         # PRESHUFFLED tuning file exists on origin/main yet; pass explicitly
         # so _get_config doesn't look one up and fail.
         _fallback_cfg = {
-            "BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2,
-            "waves_per_eu": 8, "matrix_instr_nonkdim": 16,
-            "cache_modifier": ".cg", "NUM_KSPLIT": 1, "kpack": 2,
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 16,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "waves_per_eu": 8,
+            "matrix_instr_nonkdim": 16,
+            "cache_modifier": ".cg",
+            "NUM_KSPLIT": 1,
+            "kpack": 2,
         }
         return _gemm_a8w8_blockscale_preshuffle_triton(
-            xq, wq.reshape(n // 16, k * 16), x_scale, w_scale,
-            dtype=dtype, config=_fallback_cfg,
+            xq,
+            wq.reshape(n // 16, k * 16),
+            x_scale,
+            w_scale,
+            dtype=dtype,
+            config=_fallback_cfg,
         )
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
