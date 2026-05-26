@@ -28,7 +28,7 @@ DEVICE = "cuda"
 # Returns ``(hist, topk_indx, gate_indx, gate_scal)`` for direct comparison
 # against the fused kernel.
 # ---------------------------------------------------------------------------
-def routing_from_topk_reference(topk_weights, topk_ids, n_expts_tot):
+def routing_from_topk_reference(topk_weights, topk_ids, n_expts_tot, expert_map=None):
     """Multi-kernel torch reference for fused_routing_from_topk.
 
     Per-row sort of ``topk_ids`` followed by a stable global argsort by
@@ -37,6 +37,12 @@ def routing_from_topk_reference(topk_weights, topk_ids, n_expts_tot):
     version), unlike the fused kernel which is non-deterministic at
     intra-expert ordering.
     """
+    if expert_map is not None:
+        local_ids = expert_map[topk_ids.long()]
+        invalid = local_ids < 0
+        topk_weights = topk_weights.masked_fill(invalid, 0.0)
+        topk_ids = local_ids.masked_fill(invalid, 0).to(torch.int32)
+
     expt_indx_sorted, sort_indices = torch.sort(topk_ids.int(), dim=1)
     expt_scal_sorted = torch.gather(topk_weights, 1, sort_indices.long())
 
@@ -251,3 +257,64 @@ def test_fused_routing_from_topk(n_tokens, n_expts_act, n_expts_tot, dtype):
         test_hist, test_topk_indx, test_gate_scal, n_expts_act
     )
     _compare_buckets(ref_buckets, test_buckets)
+
+
+@pytest.mark.parametrize(
+    "n_tokens, n_expts_act, n_expts_tot,n_expts_global",
+    [
+        (16, 6, 64, 256),
+        (64, 6, 128, 256),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32])
+def test_fused_routing_from_topk_with_expert_map(
+    n_tokens, n_expts_act, n_expts_tot, n_expts_global, dtype
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    torch.manual_seed(0)
+    topk_ids, topk_weights = _make_inputs(
+        n_tokens, n_expts_act, n_expts_global, dtype, DEVICE, seed=0
+    )
+
+    expert_map = torch.full((n_expts_global,), -1, dtype=torch.int32, device=DEVICE)
+    expert_map[: n_expts_tot // 2] = torch.arange(
+        n_expts_tot // 2, dtype=torch.int32, device=DEVICE
+    )
+
+    ref_hist, ref_topk_indx, ref_gate_indx, ref_gate_scal = routing_from_topk_reference(
+        topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
+    )
+    _check_routing_invariants(
+        ref_hist,
+        ref_topk_indx,
+        ref_gate_indx,
+        ref_gate_scal,
+        topk_ids,
+        n_expts_tot,
+        bucket_unsorted_layout=False,
+    )
+
+    test_hist, test_topk_indx, test_gate_indx, test_gate_scal = fused_routing_from_topk(
+        topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
+    )
+    _check_routing_invariants(
+        test_hist,
+        test_topk_indx,
+        test_gate_indx,
+        test_gate_scal,
+        topk_ids,
+        n_expts_tot,
+        bucket_unsorted_layout=False,
+    )
+
+    assert torch.equal(ref_hist, test_hist), f"hist mismatch:\n  ref={ref_hist}\n  fused={test_hist}"
+
+    # Intra-expert ordering can differ between fused and reference,
+    # especially in expert-0 bucket where invalid experts are redirected.
+    # Compare zeroed-weight cardinality instead of elementwise positions.
+    ref_zero_count = int((ref_gate_scal == 0).sum().item())
+    test_zero_count = int((test_gate_scal == 0).sum().item())
+    assert (
+        ref_zero_count == test_zero_count
+    ), f"zero-masked count mismatch: ref={ref_zero_count}, fused={test_zero_count}"
