@@ -109,6 +109,7 @@ def reshape_and_cache(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    kv_cache_layout: str = "HND",
 ) -> None:
     """
     Scatter (key, value) tokens into paged KV cache at the slots given by
@@ -118,9 +119,14 @@ def reshape_and_cache(
 
     Layouts:
       key, value      : [num_tokens, num_kv_heads, head_dim]
-      key_cache,
-      value_cache     : [num_blocks, num_kv_heads, block_size, head_dim]
       slot_mapping    : [num_tokens] (int64). slot = block_id * block_size + within.
+
+      key_cache, value_cache (selected by ``kv_cache_layout``):
+        "HND" (default): [num_blocks, num_kv_heads, block_size, head_dim]
+        "NHD":           [num_blocks, block_size, num_kv_heads, head_dim]
+
+    The "NHD" layout matches what aiter.ops.triton.attention.unified_attention.unified_attention
+    reads (it indexes ``k.shape[1]`` as block_size, ``k.shape[2]`` as num_kv_heads).
 
     num_kv_heads, head_dim, and block_size must be powers of two (triton
     block-size constraint).
@@ -128,6 +134,9 @@ def reshape_and_cache(
     Returns:
       None. key_cache / value_cache are updated in place.
     """
+    assert kv_cache_layout in ("HND", "NHD"), (
+        f"kv_cache_layout must be 'HND' or 'NHD', got {kv_cache_layout!r}"
+    )
     _LOGGER.info(
         f"RESHAPE_AND_CACHE: key={tuple(key.shape)} value={tuple(value.shape)} "
         + f"key_cache={tuple(key_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
@@ -138,7 +147,16 @@ def reshape_and_cache(
         return
     n_k, kh_k, d_k = key.shape
     n_v, kh_v, d_v = value.shape
-    num_blocks, kh_c, block_size, d_c = key_cache.shape
+    if kv_cache_layout == "HND":
+        num_blocks, kh_c, block_size, d_c = key_cache.shape
+        cache_stride_block = key_cache.stride(0)
+        cache_stride_head = key_cache.stride(1)
+        cache_stride_within = key_cache.stride(2)
+    else:  # NHD
+        num_blocks, block_size, kh_c, d_c = key_cache.shape
+        cache_stride_block = key_cache.stride(0)
+        cache_stride_within = key_cache.stride(1)
+        cache_stride_head = key_cache.stride(2)
 
     assert n_k == n_v == num_tokens, "key/value first dim must match slot_mapping"
     assert kh_k == kh_v == kh_c, "kv head count must match between inputs and cache"
@@ -154,7 +172,6 @@ def reshape_and_cache(
     )
 
     new_stride = key_c.stride()
-    cache_stride = key_cache.stride()
 
     _reshape_and_cache_kernel[(num_tokens,)](
         key_c,
@@ -164,9 +181,9 @@ def reshape_and_cache(
         value_cache,
         new_stride[0],
         new_stride[1],
-        cache_stride[0],
-        cache_stride[1],
-        cache_stride[2],
+        cache_stride_block,
+        cache_stride_head,
+        cache_stride_within,
         N=num_tokens,
         KH=kh_c,
         D=d_c,
