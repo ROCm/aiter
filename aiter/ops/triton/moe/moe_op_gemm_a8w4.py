@@ -261,7 +261,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 3
+    num_buffers = 3
     split_k = 1
     block_k = 512
 
@@ -296,7 +296,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "block_n": block_n,
         "block_k": block_k,
         "num_warps": num_warps,
-        "num_stages": num_stages,
+        "num_buffers": num_buffers,
         "xcd_swizzle": num_xcds,
         "split_k": split_k,
         "w_cache_modifier": w_cache_modifier,
@@ -537,7 +537,7 @@ def moe_gemm_a8w4(
             config["block_n"],
             config["block_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=config["num_stages"],
+            NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             MASK_K_LIMIT=K % config["block_k"],
             W_CACHE_MODIFIER=config["w_cache_modifier"],
@@ -589,7 +589,7 @@ def moe_gemm_a8w4(
             config["block_n"],
             config["block_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=config["num_stages"],
+            NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLED=preshuffled,
             MASK_K_LIMIT=K % config["block_k"],
@@ -809,7 +809,7 @@ def main():
         help="Enable HBM scale swizzling (default: False).",
     )
     parser.add_argument(
-        "--mxfp8_act", action=argparse.BooleanOptionalAction, default=True,
+        "--mxfp8_act", action=argparse.BooleanOptionalAction, default=False,
         help="Use mxfp8 microscaled activation instead of static fp8 (default: False).",
     )
     # PRESHUFFLE
