@@ -1619,7 +1619,7 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
                                            const T* k_,
                                            const T* w_q,
                                            const T* w_k,
-                                           const T* cos_sin,
+                                           const float* cos_sin,
                                            int num_tokens,
                                            int num_heads_q,
                                            int num_heads_k,
@@ -1659,7 +1659,12 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
     int head_id_in_token;
     int data_offset;
 
-    vec_t<T, VEC_SIZE> w_vec, x_vec, cos_sin_vec, cos_vec, sin_vec;
+    vec_t<T, VEC_SIZE> w_vec, x_vec;
+    // cos_sin is fp32 per the diffusers reference (qwen-image-edit
+    // _apply_rope_complex passes complex freqs in fp32, so the underlying
+    // cos/sin pairs carry full fp32 precision). Loading as fp32 keeps the
+    // input precision unchanged through the rope multiply.
+    vec_t<float, VEC_SIZE> cos_sin_vec, cos_vec, sin_vec;
 
     if(is_q)
     {
@@ -1746,7 +1751,7 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
     {
         // ds_swizzle XOR-by-NEIGHBOR_XOR — replaces the prior runtime `lane + neighbor_offset`
         // path that lowered to ds_bpermute_b32. Same semantics as `__shfl(v, lane ^ NEIGHBOR_XOR, 32)`.
-        auto nb_cos_sin_vec = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_SIZE>(
+        auto nb_cos_sin_vec = mrope_utils::warp_shfl_xor_sync_vec<float, VEC_SIZE>(
             cos_sin_vec, opus::number<NEIGHBOR_XOR>{});
         auto nb_x_vec = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_SIZE>(
             x_vec, opus::number<NEIGHBOR_XOR>{});
@@ -1916,7 +1921,7 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
                                                    const T* k_,
                                                    const T* w_q,
                                                    const T* w_k,
-                                                   const T* cos_sin,
+                                                   const float* cos_sin,
                                                    int num_tokens,
                                                    int num_heads_q,
                                                    int num_heads_k,
@@ -2050,8 +2055,10 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
         w_vec.load(w_k + access_id_in_head);
     }
 
-    vec_t<T, VEC_PAIR> cos_sin_vec;
-    vec_t<T, VEC_PAIR / 2> cos_vec_pair, sin_vec_pair;
+    // cos_sin is fp32 per the diffusers reference — see comment in
+    // fused_rope_rms_1way_kernel for the rationale.
+    vec_t<float, VEC_PAIR> cos_sin_vec;
+    vec_t<float, VEC_PAIR / 2> cos_vec_pair, sin_vec_pair;
     if constexpr(IS_NEOX)
     {
         cos_sin_vec.load(cos_sin + token_id * HEAD_SIZE + access_id_in_head);
@@ -2121,7 +2128,7 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
     if constexpr(IS_NEOX)
     {
         // Single shuffle of cos_sin reused by both pairs.
-        auto nb_cos_sin_vec = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_PAIR>(
+        auto nb_cos_sin_vec = mrope_utils::warp_shfl_xor_sync_vec<float, VEC_PAIR>(
             cos_sin_vec, opus::number<NEIGHBOR_XOR_PAIR>{});
         // Per-pair x shuffles.
         auto nb_x_pair_0 = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_PAIR>(
@@ -2210,7 +2217,7 @@ void fused_rope_rms_1way(const T* q,
                          const T* k,
                          const T* w_q,
                          const T* w_k,
-                         const T* cos_sin,
+                         const float* cos_sin,
                          int64_t batch_size,
                          int64_t num_tokens,
                          int64_t num_heads_q,
@@ -2866,6 +2873,13 @@ void fused_qk_norm_rope_1way(at::Tensor& q,
     TORCH_CHECK(w_q.is_contiguous() && w_k.is_contiguous());
     TORCH_CHECK(cos_sin.is_contiguous());
     TORCH_CHECK(out_q.is_contiguous() && out_k.is_contiguous());
+    // cos_sin must be fp32 to match the qwen-image-edit / diffusers reference,
+    // where the complex RoPE freqs carry full fp32 precision before the rope
+    // multiply. Passing bf16/fp16 cos_sin truncates the input before the
+    // kernel even runs, producing precision drift in the generated image.
+    TORCH_CHECK(cos_sin.scalar_type() == at::kFloat,
+                "fused_qk_norm_rope_1way requires cos_sin in float32 (got ",
+                cos_sin.scalar_type(), ")");
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(q));
     auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -2875,7 +2889,7 @@ void fused_qk_norm_rope_1way(at::Tensor& q,
                                    (T*)k.data_ptr<scalar_t>(),
                                    (T*)w_q.data_ptr<scalar_t>(),
                                    (T*)w_k.data_ptr<scalar_t>(),
-                                   (T*)cos_sin.data_ptr<scalar_t>(),
+                                   cos_sin.data_ptr<float>(),
                                    batch_size,
                                    num_tokens,
                                    num_heads_q,

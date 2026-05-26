@@ -280,4 +280,15 @@ def fused_qk_norm_rope_1way(
     eps: float,
     out_q: Tensor,
     out_k: Tensor,
-) -> None: ...
+) -> None:
+    """Fused per-head RMSNorm + RoPE on q/k for the 1way (single-stream) layout.
+
+    Dtype contract:
+        q, k, w_q, w_k, out_q, out_k : torch.bfloat16 or torch.float16 (same dtype)
+        cos_sin                      : torch.float32  (REQUIRED)
+
+    cos_sin must be float32 to match the diffusers / qwen-image-edit reference
+    (RoPE freqs are computed in fp32 there and the precision is consumed by the
+    fp32 rope multiply). Passing bf16/fp16 cos_sin will raise inside the kernel.
+    """
+    ...
