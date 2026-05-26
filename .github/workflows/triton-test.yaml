@@ -100,7 +100,7 @@ jobs:
         with:
           name: ${{ steps.resolve_triton_wheel.outputs.artifact_name }}
           path: triton_wheels/
-          retention-days: 90
+          retention-days: 3
 
   # Step 2: MI35X matrix jobs
   triton:
