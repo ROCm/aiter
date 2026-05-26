@@ -343,26 +343,25 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
     # --- 4. Epilogue: drain remaining tiles (no new TDM loads) ---
     for i in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
+        acc = gl.amd.gfx1250.wmma_scaled(
+            cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
+        )
+
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 4)
 
         next_slot = (compute_idx + 1) % NUM_BUFFERS
-        next_A = smem_A.index(next_slot).load(layout=dot_a_layout)
-        next_B = depreshuffle_b_raw_to_kn(
+        cur_A = smem_A.index(next_slot).load(layout=dot_a_layout)
+        cur_B = depreshuffle_b_raw_to_kn(
             smem_B.index(next_slot),
             BLOCK_N=BLOCK_SIZE_N,
             BLOCK_K_BYTES=BLOCK_K_BYTES,
         ).load(layout=dot_b_layout)
-        next_AS = depreshuffle_scales(
+        cur_AS = depreshuffle_scales(
             smem_AS.index(next_slot), BLOCK_SIZE_M, K_GROUPS
         ).load(layout=a_scale_layout)
-        next_BS = depreshuffle_scales(
+        cur_BS = depreshuffle_scales(
             smem_BS.index(next_slot), BLOCK_SIZE_N, K_GROUPS
         ).load(layout=b_scale_layout)
-
-        acc = gl.amd.gfx1250.wmma_scaled(
-            cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
-        )
-        cur_A, cur_B, cur_AS, cur_BS = next_A, next_B, next_AS, next_BS
         compute_idx += 1
 
     # --- 5. Final WMMA ---
