@@ -97,6 +97,20 @@ def gemm_w4a16(
                      the v1 pipeline is used because there is only one
                      per-group buffer).
 
+                     ``19 = Baseline_PackedSb_V3`` (AIESW-32735 W3-impl-5)
+                     combines the PackedSb fp32-packed scale+bias_eff
+                     carrier (same per-group load reduction as tile=10)
+                     with the v3 Intrawave block-GEMM pipeline (deeper
+                     K-prefetch than v1 Interwave). Same ``in_s``
+                     packed-fp32 requirement and same
+                     ``scaled_zp=None`` rule as tile=10. Target shapes
+                     are deep-K MLP layers (e.g. Qwen3-8B ``down``,
+                     K=12288) where the W3-impl-4 sweep showed
+                     ``Baseline_Sym_V3`` (tile=8) was within 1.79 % of
+                     ``Baseline_PackedSb`` (tile=10) — combining the
+                     two mechanisms is intended to extend PackedSb's
+                     win on deep-K shapes.
+
     Note (AIESW-32282): the bf16 dequant uses a bit-cast truncate
     (drops the low 16 bits of fp32) as the only rounding mode. The
     previous IEEE round-to-nearest-even path was retired after lm_eval

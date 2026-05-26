@@ -88,7 +88,8 @@ inline void run_kernel_inner(const at::Tensor& in_a,
 #endif
   };
 
-  if constexpr (Tile == ck_w4a16::TileConfigKind::Baseline_PackedSb &&
+  if constexpr ((Tile == ck_w4a16::TileConfigKind::Baseline_PackedSb ||
+                 Tile == ck_w4a16::TileConfigKind::Baseline_PackedSb_V3) &&
                 !PreDequantToLDS) {
     auto argument = gemm.MakeArgument(
         reinterpret_cast<const T*>(in_a.data_ptr()),
@@ -224,6 +225,10 @@ inline void run_kernel(const at::Tensor& in_a,
         _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
                                       ck_w4a16::TileConfigKind::Baseline_CShuffleNXor8); \
         break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_PackedSb_V3:                     \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_PackedSb_V3); \
+        break;                                                                 \
       default:                                                                 \
         TORCH_CHECK(false,                                                     \
                     "CK W4A16 b_scale GEMM: unsupported tile_config_kind=",    \
@@ -237,7 +242,8 @@ inline void run_kernel(const at::Tensor& in_a,
                     "15=Baseline_CShuffleNXor2, "                              \
                     "16=Baseline_CShuffleB32Pack, "                            \
                     "17=Baseline_CShuffleNXor4, "                              \
-                    "18=Baseline_CShuffleNXor8)");                             \
+                    "18=Baseline_CShuffleNXor8, "                              \
+                    "19=Baseline_PackedSb_V3)");                             \
     }                                                                          \
   } while (0)
 
@@ -320,22 +326,25 @@ torch::Tensor gemm_w4a16(at::Tensor& in_a,
   TORCH_CHECK(in_a.is_cuda() && in_b.is_cuda() && in_s.is_cuda() &&
                   Y.is_cuda(),
               "All tensors must be on GPU");
-  // AIESW-32735 B'': for tile_config=10 (Baseline_PackedSb) the in_s slot
-  // carries a packed fp32 buffer (scale in low 16, bias_eff in high 16) so
-  // the in_s dtype is float32 and the shape's K-dim stays the same. All
-  // other tiles use the activation dtype for in_s.
+  // AIESW-32735 B'': for tile_config=10 (Baseline_PackedSb) and tile_config=19
+  // (Baseline_PackedSb_V3) the in_s slot carries a packed fp32 buffer (scale in
+  // low 16, bias_eff in high 16) so the in_s dtype is float32 and the shape's
+  // K-dim stays the same. All other tiles use the activation dtype for in_s.
   const int64_t _early_tile_kind = tile_config.value_or(0);
-  const bool _is_packed_sb_tile = (_early_tile_kind == 10);
+  const bool _is_packed_sb_tile =
+      (_early_tile_kind == 10 || _early_tile_kind == 19);
   TORCH_CHECK(in_a.dtype() == Y.dtype(),
               "in_a / Y must share dtype (fp16 or bf16); got in_a=",
               in_a.dtype(), " Y=", Y.dtype());
   if (_is_packed_sb_tile) {
     TORCH_CHECK(in_s.dtype() == at::kFloat,
-                "tile_config=10 (Baseline_PackedSb) requires in_s dtype fp32 "
+                "tile_config=", _early_tile_kind,
+                " (Baseline_PackedSb*) requires in_s dtype fp32 "
                 "(packed scale+bias_eff); got in_s=", in_s.dtype());
     TORCH_CHECK(!scaled_zp.has_value(),
-                "tile_config=10 (Baseline_PackedSb) must be called with "
-                "scaled_zp=None — the sym branch of the v1 pipeline is used "
+                "tile_config=", _early_tile_kind,
+                " (Baseline_PackedSb*) must be called with "
+                "scaled_zp=None — the sym branch of the pipeline is used "
                 "(packed buffer carries both scale and bias_eff).");
   } else {
     TORCH_CHECK(in_s.dtype() == Y.dtype(),

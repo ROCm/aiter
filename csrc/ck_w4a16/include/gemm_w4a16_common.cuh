@@ -189,6 +189,22 @@ enum class TileConfigKind : int {
   // See notes/ck_layout_tuning/W2_cshuffle_nxor_results.md for the per-mask
   // PMC + wall-time numbers.
   Baseline_CShuffleNXor2 = 15,
+  // AIESW-32735 W3-impl-5: PackedSb (fp32-packed scale+bias_eff carrier, single
+  // per-group load) combined with the v3 Intrawave pipeline (deeper K-prefetch
+  // than v1 Interwave). Mechanism is additive: PackedSb (tile_config=10)
+  // already wins +6 % wall-time vs Baseline on the production fp16 sym g=128
+  // shape because it cuts the per-K-block per-group VMEM issue count in half;
+  // v3 (tile_config=8 Baseline_Sym_V3) was within 1.79 % of PackedSb on the
+  // deep-K `down` shape (K=12288) and the two mechanisms target orthogonal
+  // critical-path components. The v3 pipeline accepts an Empty
+  // BZeroPointStruct (see blockwise_gemm_pipeline_wmmaops_v3.hpp
+  // AIESW-32176 comment) so PackedSb's sym-only carrier composes cleanly.
+  // Tile shape and cluster lengths match Baseline_PackedSb (M=128 N=128 K=32
+  // MRep=4 NRep=2 BlockSize=256, A/B-cluster S<4,64,1>, CShuf_N=8); the only
+  // delta vs tile_config=10 is BlockGemmPipelineVersion::v3 (Intrawave).
+  // BScaleDataType stays `float` to match the packed-(scale,bias_eff) host
+  // buffer; same `in_s` fp32 requirement and `scaled_zp` MUST be nullptr.
+  Baseline_PackedSb_V3 = 19,
   // AIESW-32735 W2-b32pack: Baseline tile + Vgpr->LDS scalar-per-vector = 2 in
   // the cshuffle epilogue so the threadwise transfer emits ds_store_b32
   // instead of ds_store_b16. CK's default cshuffle LDS layout has MAccVgprs
@@ -522,6 +538,47 @@ struct DeviceGemmInstanceImpl<T, ScaleBlockK, false, TileConfigKind::Baseline_Pa
       S<1, 32, 1, 8>, 8,
       ck::BlockGemmPipelineScheduler::Interwave,
       ck::BlockGemmPipelineVersion::v1,
+      T, T,
+      PermuteA, PermuteB,
+      BDequantOp>;
+};
+
+// AIESW-32735 W3-impl-5: PackedSb carrier composed with v3 (Intrawave) pipeline.
+// Hand-written specialization (mirrors Baseline_PackedSb except for
+// BlockGemmPipelineVersion::v3 and BlockGemmPipelineScheduler::Intrawave).
+// BScaleDataType is `float` (fp32-packed scale+bias_eff) so the gridwise
+// issues 4-byte per-group loads carrying both halves. Caller's `in_s` slot
+// must hold the packed fp32 buffer; `scaled_zp` MUST be nullptr so the v3
+// pipeline hits the sym branch (Empty BZeroPointStruct). v3's deeper K-
+// prefetch (Intrawave schedule) should compose additively with PackedSb's
+// per-K-block VMEM issue-count reduction on deep-K shapes.
+template <typename T, ck::index_t ScaleBlockK>
+struct DeviceGemmInstanceImpl<T, ScaleBlockK, false, TileConfigKind::Baseline_PackedSb_V3> {
+  static constexpr ck::index_t kMPerBlock = 128;
+  static constexpr ck::index_t kNPerBlock = 128;
+  static constexpr ck::index_t kKPerBlock = 32;
+  using BDequantOp = DequantPack8WithPackedScaleBias;
+  using type = ck::tensor_operation::device::DeviceGemm_BScale_Wmma_CShuffleV3<
+      ALayout, BLayout, CLayout,
+      T, BDataType,
+      /*BScaleDataType=*/float,
+      T, AccDataType, T,
+      PassThrough, PassThrough, PassThrough,
+      GemmDefault,
+      256,
+      Scale_Block_N, ScaleBlockK,
+      128, 128, 32,
+      8, 8,
+      16, 16,
+      4, 2,
+      S<4, 64, 1>,
+      S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+      S<4, 64, 1>,
+      S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+      1, 1,
+      S<1, 32, 1, 8>, 8,
+      ck::BlockGemmPipelineScheduler::Intrawave,
+      ck::BlockGemmPipelineVersion::v3,
       T, T,
       PermuteA, PermuteB,
       BDequantOp>;
