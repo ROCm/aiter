@@ -42,4 +42,5 @@ void ck_moe_stage2(torch::Tensor& inter_states, // [m, k], input token
                    std::optional<int> splitk,
                    bool nt,
                    std::optional<std::string> dst_type,
-                   bool is_shuffled);
+                   bool is_shuffled,
+                   bool no_combine);

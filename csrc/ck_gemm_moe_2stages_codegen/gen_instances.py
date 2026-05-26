@@ -18,6 +18,7 @@ const bool Nswizzle = {Nswizzle};
 const bool PerTensorQuant = {Quant} == static_cast<int>(QuantType::per_Tensor);
 const bool MulRoutedWeight = {MulRoutedWeight};
 const int ActOP = {ActOP};
+[[maybe_unused]] const bool NoCombine = {NoCombine};
 CK_MOE_STAGE{Stage}_GEMM_DEFINE({BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, V{PipelineVer})
 """
 
@@ -32,7 +33,7 @@ LOOKUP_head = """#pragma once
 
 LOOKUP_template = """
        {{"{kernel_tag}",                                                                                                       \\
-        ck_moe_stage{Stage}_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V{PipelineVer}, {BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>}},                       \\"""
+        ck_moe_stage{Stage}_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V{PipelineVer}, {BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}{NoCombineSuffix}>}},                       \\"""
 
 LOOKUP_end = """
    }
@@ -54,7 +55,7 @@ gemm2_heuristic_dispatch_head = """#pragma once
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "gemm_moe_ck2stages.h"
 
-MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool is_shuffled)
+MoeKernel moe_stage2_heuristic_dispatch(int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant, bool mul_routed_weight_stage, bool is_shuffled, bool no_combine)
 {{
 """
 
@@ -366,50 +367,51 @@ A16W16_gemm2_gfx950_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+        && {Quant} == quant
+        && {NoCombine} == no_combine)
     {{
         if (block_m == 32)
         {{
             if (inter_dim <= 192)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
         }}
         else if (block_m == 64)
         {{
             if (inter_dim <= 192)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
         }}
         else if (block_m == 128)
         {{
             if (inter_dim <= 192)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
         }}
         else if (block_m == 256)
         {{
             if (inter_dim <= 192)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
         }}
         else
@@ -428,23 +430,24 @@ A8W8_gemm2_gfx950_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+        && {Quant} == quant
+        && {NoCombine} == no_combine)
     {{
         if (block_m == 32)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
         }}
         else if (block_m == 64)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
         }}
         else if (block_m == 128)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
         }}
         else if (block_m == 256)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
         }}
         else
         {{
@@ -461,50 +464,51 @@ A16W16_gemm2_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+        && {Quant} == quant
+        && {NoCombine} == no_combine)
     {{
         if (block_m == 32)
         {{
             if (inter_dim <= 192)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
         }}
         else if (block_m == 64)
         {{
             if (inter_dim <= 192)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
         }}
         else if (block_m == 128)
         {{
             if (inter_dim <= 192)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
         }}
         else if (block_m == 256)
         {{
             if (inter_dim <= 192)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
         }}
         else
@@ -522,54 +526,55 @@ A8W8_gemm2_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+        && {Quant} == quant
+        && {NoCombine} == no_combine)
     {{
         if (block_m == 16)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 16, 64, 64, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 16, 64, 64, 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
         }}
         else if (block_m == 32)
         {{
             if (inter_dim <= 192)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
         }}
         else if (block_m == 64)
         {{
             if (inter_dim <= 192)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
         }}
         else if (block_m == 128)
         {{
             if (inter_dim <= 192)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
         }}
         else if (block_m == 256)
         {{
             if (inter_dim <= 192)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 64, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
         }}
         else
@@ -587,23 +592,24 @@ A8W4_gemm2_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+        && {Quant} == quant
+        && {NoCombine} == no_combine)
     {{
         if (block_m == 32)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
         }}
         else if (block_m == 64)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
         }}
         else if (block_m == 128)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
         }}
         else if (block_m == 256)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 256, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
         }}
         else
         {{
@@ -623,21 +629,22 @@ A4W4_gemm2_heuristic_dispatch = """
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant
-        && {Preshuffle} == is_shuffled)
+        && {Preshuffle} == is_shuffled
+        && {NoCombine} == no_combine)
     {{
         if (inter_dim <= 256)
         {{
             if (block_m == 32)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 32, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 32, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else if (block_m == 64)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 64, 64, 128, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 64, 64, 128, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else if (block_m == 128)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 64, 128, 128, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 64, 128, 128, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
@@ -651,15 +658,15 @@ A4W4_gemm2_heuristic_dispatch = """
         {{
             if (block_m == 32)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else if (block_m == 64)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else if (block_m == 128)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
@@ -680,21 +687,22 @@ A4W4_bns_gemm2_heuristic_dispatch = """
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant
-        && {Preshuffle} == is_shuffled)
+        && {Preshuffle} == is_shuffled
+        && {NoCombine} == no_combine)
     {{
         if (inter_dim <= 256)
         {{
             if (block_m == 32)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 32, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 32, 32, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else if (block_m == 64)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 64, 64, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 64, 64, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else if (block_m == 128)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 128, 128, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 64, 128, 128, 128/sizeof({A0DataType}), 1, 1, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
@@ -708,15 +716,15 @@ A4W4_bns_gemm2_heuristic_dispatch = """
         {{
             if (block_m == 32)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else if (block_m == 64)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 64, 128/sizeof({A0DataType}), 2, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 64, 128/sizeof({A0DataType}), 2, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else if (block_m == 128)
             {{
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 128/sizeof({A0DataType}), 2, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 64, 128/sizeof({A0DataType}), 2, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             }}
             else
             {{
@@ -736,22 +744,23 @@ A8W8_blockscale_gemm2_heuristic_dispatch = """
         && dtype_checker<{B0DataType}>{{}}(w_dtype)
         && dtype_checker<{EDataType}>{{}}(y_dtype)
         && {MulRoutedWeight} == mul_routed_weight_stage
-        && {Quant} == quant)
+        && {Quant} == quant
+        && {NoCombine} == no_combine)
     {{
         if (block_m == 16)
         {{
             if (inter_dim % 256 == 0)
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
             else
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 16, 128, 128/sizeof({A0DataType}), 1, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 16, 128, 128/sizeof({A0DataType}), 1, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
         }}
         else if (block_m == 32)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
         }}
         else if (block_m == 64)
         {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}, {NoCombine}>;
         }}
         else
         {{
@@ -854,6 +863,7 @@ class ck_moe_2stage_gemm_codegen:
         mul_routed_weight_stage,
         preshuffle,
         splitk,
+        no_combine: bool = False,
     ):
         self.working_path = working_path
         self.a_dtype = a_dtype.upper()
@@ -865,19 +875,23 @@ class ck_moe_2stage_gemm_codegen:
         self.nswizzle = False
         self.preshuffle = preshuffle
         self.splitk = splitk
+        self.no_combine = no_combine
 
     def generate_instance_and_lookUpTable(self):
-        _, gemm1_kernel_list = get_gemm1_kernels_list(
-            self.a_dtype,
-            self.b_dtype,
-            self.c_dtype,
-            self.nswizzle,
-            self.quant_type,
-            self.activation,
-            self.mul_routed_weight_stage == 1,
-            self.preshuffle,
-            self.splitk,
-        )
+        if not self.no_combine:
+            _, gemm1_kernel_list = get_gemm1_kernels_list(
+                self.a_dtype,
+                self.b_dtype,
+                self.c_dtype,
+                self.nswizzle,
+                self.quant_type,
+                self.activation,
+                self.mul_routed_weight_stage == 1,
+                self.preshuffle,
+                self.splitk,
+            )
+        else:
+            gemm1_kernel_list = {}
         tag, gemm2_kernel_list = get_gemm2_kernels_list(
             self.a_dtype,
             self.b_dtype,
@@ -886,6 +900,7 @@ class ck_moe_2stage_gemm_codegen:
             self.quant_type,
             self.mul_routed_weight_stage == 2,
             self.preshuffle,
+            self.no_combine,
         )
         kernel_list = list(gemm1_kernel_list.values()) + list(
             gemm2_kernel_list.values()
@@ -941,6 +956,9 @@ class ck_moe_2stage_gemm_codegen:
                             MulRoutedWeight=str(
                                 self.mul_routed_weight_stage == kernel.stage
                             ).lower(),
+                            NoCombine=str(
+                                self.no_combine and kernel.stage == 2
+                            ).lower(),
                         )
                         if "FP4" in self.b_dtype:
                             stage_instance = (
@@ -970,30 +988,36 @@ class ck_moe_2stage_gemm_codegen:
                     MulRoutedWeight=str(
                         self.mul_routed_weight_stage == kernel.stage
                     ).lower(),
+                    NoCombineSuffix=(
+                        f", {str(self.no_combine).lower()}"
+                        if kernel.stage == 2
+                        else ""
+                    ),
                 )
                 f_lookup.write(lookup_ele)
 
-        f_gemm1_heuristic_dispatch = os.path.join(
-            self.working_path, "ck2stages_moe_stage1_heuristic_dispatch.hpp"
-        )
         gemm1_heuristic_dispatch, gemm2_heuristic_dispatch = heuristic_dispatch_dict[
             tag
         ]
-        with open(f_gemm1_heuristic_dispatch, "a") as f_h:
-            gemm1_fp32 = self.splitk and (quanttype == "_blockscale")
-            gemm1_heuristic_dispatch_str = gemm1_heuristic_dispatch.format(
-                A0DataType=self.a_dtype,
-                B0DataType=self.b_dtype,
-                AccDataType="F32" if self.a_dtype != "I8" else "I32",
-                EDataType="F32" if gemm1_fp32 else self.c_dtype,
-                CDEElementOp=kernel_list[0].CDEElementOp,
-                Nswizzle=str(self.nswizzle).lower(),
-                Quant=self.quant_type,
-                ActOP=str(int(self.activation == "silu")),
-                MulRoutedWeight=str(self.mul_routed_weight_stage == 1).lower(),
-                Preshuffle=str(self.preshuffle).lower(),
+        if not self.no_combine:
+            f_gemm1_heuristic_dispatch = os.path.join(
+                self.working_path, "ck2stages_moe_stage1_heuristic_dispatch.hpp"
             )
-            f_h.write(gemm1_heuristic_dispatch_str)
+            with open(f_gemm1_heuristic_dispatch, "a") as f_h:
+                gemm1_fp32 = self.splitk and (quanttype == "_blockscale")
+                gemm1_heuristic_dispatch_str = gemm1_heuristic_dispatch.format(
+                    A0DataType=self.a_dtype,
+                    B0DataType=self.b_dtype,
+                    AccDataType="F32" if self.a_dtype != "I8" else "I32",
+                    EDataType="F32" if gemm1_fp32 else self.c_dtype,
+                    CDEElementOp=kernel_list[0].CDEElementOp,
+                    Nswizzle=str(self.nswizzle).lower(),
+                    Quant=self.quant_type,
+                    ActOP=str(int(self.activation == "silu")),
+                    MulRoutedWeight=str(self.mul_routed_weight_stage == 1).lower(),
+                    Preshuffle=str(self.preshuffle).lower(),
+                )
+                f_h.write(gemm1_heuristic_dispatch_str)
 
         f_gemm2_heuristic_dispatch = os.path.join(
             self.working_path, "ck2stages_moe_stage2_heuristic_dispatch.hpp"
@@ -1010,6 +1034,7 @@ class ck_moe_2stage_gemm_codegen:
                 ActOP=0,
                 MulRoutedWeight=str(self.mul_routed_weight_stage == 2).lower(),
                 Preshuffle=str(self.preshuffle).lower(),
+                NoCombine=str(self.no_combine).lower(),
             )
             f_h.write(gemm2_heuristic_dispatch_str)
 
@@ -1106,6 +1131,12 @@ if __name__ == "__main__":
         help="enable moe_stage1 splitk mode",
     )
 
+    parser.add_argument(
+        "--no_combine",
+        action="store_true",
+        help="emit a stage2 variant that writes per-route [M, topk, model_dim] without route reduction",
+    )
+
     args = parser.parse_args()
     args.quant_type = (
         "per_1x128" if args.quant_type == "per_128x128" else args.quant_type
@@ -1118,6 +1149,22 @@ if __name__ == "__main__":
         "per_1x32": 3,
         "per_1x128": 4,
     }
+
+    if args.no_combine:
+        if args.quant_type != "no":
+            parser.error(
+                f"--no_combine requires --quant_type=no; got {args.quant_type}"
+            )
+        if args.c_dtype != "b16":
+            parser.error(
+                f"--no_combine requires --c_dtype=b16; got {args.c_dtype}"
+            )
+        if args.b_dtype is not None:
+            non_b16 = [d for d in args.b_dtype if d != "b16"]
+            if non_b16:
+                parser.error(
+                    f"--no_combine requires --b_dtype to be only b16; got {non_b16}"
+                )
 
     generate_instance_and_lookUpTable_head(args.working_path)
     # build all
@@ -1203,6 +1250,21 @@ if __name__ == "__main__":
                 False,  # splitk
             )
             codegen.generate_instance_and_lookUpTable()
+            # NoCombine stage2 variant: QuantType.No x bf16 only
+            if b_dtype == "b16":
+                codegen_nc = ck_moe_2stage_gemm_codegen(
+                    args.working_path,
+                    a_dtype,
+                    b_dtype,
+                    c_dtype,
+                    quant_dict["no"],
+                    act,
+                    routed_weight,
+                    preshuffle_mode,
+                    False,  # splitk
+                    no_combine=True,
+                )
+                codegen_nc.generate_instance_and_lookUpTable()
     else:
         for b_dtype in args.b_dtype:
             a_dtype = b_dtype if b_dtype != "i4" else "f8"
@@ -1216,6 +1278,7 @@ if __name__ == "__main__":
                 args.mul_routed_weight_stage,
                 args.preshuffle,
                 args.issplitk,
+                no_combine=args.no_combine,
             )
             codegen.generate_instance_and_lookUpTable()
 

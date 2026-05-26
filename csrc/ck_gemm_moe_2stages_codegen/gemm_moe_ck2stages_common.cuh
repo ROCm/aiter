@@ -108,7 +108,11 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
                S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
                CShuffleMXDLPerWave,    CShuffleNXDLPerWave,   S<1, CShuffleMLane, 1, CShuffleNLane>, S<EVec, D0Vec, D1Vec>,
+#ifdef AITER_CK_HAS_NO_COMBINE_TEMPLATE
+               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, !PerTensorQuant, false, ck::index_t, A0DataType>;
+#else
                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType>;
+#endif
     // clang-format on
 
     auto a_element_op   = AElementOp{};
@@ -210,7 +214,8 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP = 0>
+          int ActOP,
+          bool NoCombine>
 void ck_moe_stage2_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -295,7 +300,15 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
               S<K0_A, K0_M, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
               S<K0_B, K0_N, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
               CShuffleMXDLPerWave,    CShuffleNXDLPerWave,   S<1, CShuffleMLane, 1, CShuffleNLane>, S<EVec, D0Vec, D1Vec, D2Vec>,
+#ifdef AITER_CK_HAS_NO_COMBINE_TEMPLATE
+              ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, Nswizzle, false, MulRoutedWeight, !PerTensorQuant, NoCombine, ck::index_t, A0DataType>;
+#else
               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, Nswizzle, false, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType>;
+    static_assert(!NoCombine,
+                  "ck_moe_stage2_gemm: NoCombine=true requires building with "
+                  "AITER_CK_HAS_NO_COMBINE_TEMPLATE defined and a CK DeviceMoeGemm "
+                  "that accepts the trailing NoCombine template parameter.");
+#endif
 
 
     auto a_element_op = AElementOp{};
@@ -346,7 +359,7 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
 }
 
 #define CK_MOE_STAGE2_GEMM_DEFINE(BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, PipelineVer)                                                                                    \
-    template void ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP>( \
+    template void ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerfBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP, NoCombine>( \
         const hipStream_t &stream,                                                                                                                                   \
         int tokens, int sorted_size, int N, int K,                                                                                                                   \
         int topk,                                                                                                                                                    \

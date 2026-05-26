@@ -171,6 +171,11 @@ def fused_moe(
     splitk=0,
     swiglu_limit=0.0,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    # When True, return per-route unweighted output of shape (M, topk, model_dim)
+    # instead of the combined (M, model_dim) output. Supported on the CK 2-stage
+    # path with QuantType.No and bf16 inputs/output; other configs raise
+    # NotImplementedError.
+    no_combine: bool = False,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -198,6 +203,7 @@ def fused_moe(
         bias2=bias2,
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
+        no_combine=no_combine,
     )
 
 
@@ -227,12 +233,16 @@ def fused_moe_fake(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    no_combine: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
     dtype = hidden_states.dtype if dtype is None else dtype
     model_dim = w2.shape[1]
-    moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
+    if no_combine:
+        moe_buf = torch.empty((M, topk, model_dim), dtype=dtype, device=device)
+    else:
+        moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
     return moe_buf
 
 
@@ -263,6 +273,7 @@ def fused_moe_(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    no_combine: bool = False,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -273,6 +284,38 @@ def fused_moe_(
     """user API"""
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+
+    # no_combine guards: reject early before any kernel launch so the
+    # per-route output contract is only attempted on the supported path
+    # (CK 2-stage, QuantType.No, bf16, no stage1 weighting).
+    if no_combine:
+        if quant_type != QuantType.No:
+            raise NotImplementedError(
+                f"fused_moe(no_combine=True) only supports quant_type=QuantType.No; "
+                f"got quant_type={quant_type!r}"
+            )
+        if doweight_stage1:
+            raise NotImplementedError(
+                "fused_moe(no_combine=True) is incompatible with doweight_stage1=True "
+                "(stage1 weighting contradicts the unweighted per-route output contract)"
+            )
+        if hidden_states.dtype != dtypes.bf16:
+            raise NotImplementedError(
+                f"fused_moe(no_combine=True) only supports bf16 inputs; "
+                f"got hidden_states.dtype={hidden_states.dtype}"
+            )
+        for _wname, _w in (("w1", w1), ("w2", w2)):
+            if _w.dtype != dtypes.bf16:
+                raise NotImplementedError(
+                    f"fused_moe(no_combine=True) only supports bf16 weights; "
+                    f"got {_wname}.dtype={_w.dtype}"
+                )
+        _resolved_out_dtype = hidden_states.dtype if dtype is None else dtype
+        if _resolved_out_dtype != dtypes.bf16:
+            raise NotImplementedError(
+                f"fused_moe(no_combine=True) only supports bf16 output dtype; "
+                f"got dtype={_resolved_out_dtype}"
+            )
 
     assert w1.shape[1] in [
         inter_dim,
@@ -351,6 +394,11 @@ def fused_moe_(
     )
 
     if metadata.run_1stage:
+        if no_combine:
+            raise NotImplementedError(
+                "fused_moe(no_combine=True) only supports the CK 2-stage path; "
+                "the configured shape selected the 1-stage dispatch (metadata.run_1stage=True)"
+            )
         return metadata.stage1(
             hidden_states,
             w1,
@@ -409,6 +457,7 @@ def fused_moe_(
             # only for flydsl dsv4
             swiglu_limit=swiglu_limit,
             gate_mode=gate_mode,
+            no_combine=no_combine,
         )
 
 
@@ -1451,6 +1500,7 @@ def fused_moe_2stages(
     topk_weights=None,
     swiglu_limit=0.0,
     gate_mode=GateMode.SEPARATED.value,
+    no_combine: bool = False,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -1477,6 +1527,21 @@ def fused_moe_2stages(
         is_shuffled,
         gate_mode,
     )
+
+    if no_combine:
+        _stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+        if _stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1, asm_stage1):
+            raise NotImplementedError(
+                f"fused_moe(no_combine=True) requires CK 2-stage stage1; "
+                f"the configured shape selected {getattr(_stage1_func, '__name__', _stage1_func)!r}."
+            )
+        _stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+        if _stage2_func is not aiter.ck_moe_stage2_fwd:
+            raise NotImplementedError(
+                f"fused_moe(no_combine=True) requires CK 2-stage stage2; "
+                f"the configured shape selected {getattr(_stage2_func, '__name__', _stage2_func)!r}."
+            )
+
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1666,6 +1731,36 @@ def fused_moe_2stages(
             num_rows_factor=topk,
         )
         a2 = a2.view(token_num, topk, inter_dim)
+
+    if no_combine:
+        per_route_out = torch.zeros(
+            (token_num, topk, model_dim),
+            dtype=dtype,
+            device=device,
+        )
+        metadata.stage2(
+            a2,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            per_route_out,
+            topk,
+            w2_scale=(
+                w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
+            ),
+            a2_scale=a2_scale,
+            block_m=block_size_M,
+            sorted_weights=None,
+            no_combine=True,
+            **extra_stage2_args,
+        )
+        if num_local_tokens is not None:
+            k_local = int(num_local_tokens.item())
+            if 0 <= k_local < token_num:
+                per_route_out[k_local:, :, :].zero_()
+        return per_route_out
 
     metadata.stage2(
         a2,

@@ -84,3 +84,6 @@ scripts/results/*.csv
 # vim swaps
 *.swo
 *.swp
+
+# Agents
+.humanize/

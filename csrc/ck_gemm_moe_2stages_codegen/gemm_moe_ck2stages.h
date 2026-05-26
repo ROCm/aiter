@@ -456,7 +456,8 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP>
+          int ActOP,
+          bool NoCombine = false>
 void ck_moe_stage2_gemm(
     const hipStream_t& stream,
     int tokens,

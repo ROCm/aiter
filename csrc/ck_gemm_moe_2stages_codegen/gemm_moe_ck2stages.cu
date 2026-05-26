@@ -16,12 +16,20 @@ using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 // API for user aiter.ck_moe_stage1(...)
 
 template <int stage = 1>
-MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant_type, bool mul_routed_weight, bool is_shuffled)
+MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant_type, bool mul_routed_weight, bool is_shuffled, bool no_combine = false)
 {
     static const auto lookup = []
     {
         return MoeKernelMap{GENERATE_LOOKUP_TABLE()};
     }();
+
+    if constexpr (stage == 2)
+    {
+        if (no_combine)
+        {
+            kernelName = "";
+        }
+    }
 
     if (kernelName != "")
     {
@@ -39,7 +47,7 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::
     }
     else
     {
-        return moe_stage2_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, 0, quant_type, mul_routed_weight, is_shuffled);
+        return moe_stage2_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, 0, quant_type, mul_routed_weight, is_shuffled, no_combine);
     }
 }
 
@@ -135,7 +143,8 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                    std::optional<int> splitk = 1,
                    bool nt = false,
                    std::optional<std::string> dst_type = std::nullopt,
-                   bool is_shuffled = true)
+                   bool is_shuffled = true,
+                   bool no_combine = false)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage2 called!" << nt << " " << block_m.value() << std::endl;
     TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
@@ -173,7 +182,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     }
 
     activation = !activation;
-    auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
+    auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled, no_combine);
 
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,

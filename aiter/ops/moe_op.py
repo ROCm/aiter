@@ -275,6 +275,7 @@ def cmdGenFunc_ck_moe_stage2(
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
     is_shuffled: bool = True,
+    no_combine: bool = False,
 ):
 
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
@@ -286,6 +287,7 @@ def cmdGenFunc_ck_moe_stage2(
         quant_type,
         mul_routed_weight_stage,
         is_shuffled,
+        no_combine=no_combine,
     )
     return {
         "md_name": md_name,
@@ -338,6 +340,7 @@ def ck_moe_stage2(
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
     is_shuffled: bool = True,
+    no_combine: bool = False,
 ) -> None: ...
 
 
@@ -491,6 +494,7 @@ def get_moe_stage_module(
     mul_routed_weight_stage,
     preshuffle_mode=False,
     is_splitk=False,
+    no_combine=False,
 ):
     if isinstance(activation, int):
         activation = ActivationType(activation)
@@ -506,6 +510,7 @@ def get_moe_stage_module(
         preshuffle_str = "--preshuffle"
 
     splitk_str = "--issplitk" if is_splitk else ""
+    no_combine_str = "--no_combine" if no_combine else ""
     quant_type = (
         QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
     )
@@ -524,9 +529,11 @@ def get_moe_stage_module(
     ]
     if is_splitk:
         parts.append("splitk")
+    if no_combine:
+        parts.append("no_combine")
     md_name = "_".join(parts)
     blob_gen_cmd = [
-        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} {splitk_str} -w {{}}"
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} {splitk_str} {no_combine_str} -w {{}}"
     ]
 
     return md_name, blob_gen_cmd
@@ -593,6 +600,7 @@ def ck_moe_stage2_fwd(
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
     use_non_temporal_load: Optional[bool] = False,
+    no_combine: bool = False,
 ):
     ck_moe_stage2(
         inter_states,
@@ -612,5 +620,6 @@ def ck_moe_stage2_fwd(
         activation.value,
         use_non_temporal_load=use_non_temporal_load,
         is_shuffled=getattr(w2, "is_shuffled", False),
+        no_combine=no_combine,
     )
     return out

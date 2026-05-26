@@ -78,6 +78,7 @@ class kernelInstanceGEMM2:
     GemmPipelineVersion: int
     Nswizzle: bool = False
     MulRoutedWeight: bool = True
+    NoCombine: bool = False
     CDEElementOp: str = "TypeCast"
     QuantType: int = 1
     stage: int = 2
@@ -104,6 +105,7 @@ class kernelInstanceGEMM2:
                 "Nswizzle" + str(int(self.Nswizzle)),
                 "Quant" + str(self.QuantType),
                 "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
+                "NoCombine" + str(int(self.NoCombine)),
                 self.Adtype.upper(),
                 self.Bdtype.upper(),
                 self.Cdtype.upper(),
@@ -444,6 +446,7 @@ def get_gemm2_kernels_list(
     QuantType: str,
     MulRoutedWeight: bool,
     preshuffle: bool = False,
+    NoCombine: bool = False,
 ) -> list:
     arch = get_gfx()
 
@@ -480,6 +483,7 @@ def get_gemm2_kernels_list(
     kernels_list = {k: copy.deepcopy(v) for k, v in gemm2_kernels_dict[tag].items()}
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
+        kernel.NoCombine = NoCombine
         kernel.Nswizzle = Nswizzle
         kernel.QuantType = QuantType
         kernel.Adtype = Adtype

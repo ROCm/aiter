@@ -818,6 +818,10 @@ def build_module(
         if not any("ENABLE_CK" in f for f in flags_extra_cc):
             flags_cc.append(f"-DENABLE_CK={enable_ck}")
 
+        if int(os.environ.get("AITER_CK_HAS_NO_COMBINE_TEMPLATE", "0")):
+            flags_hip.append("-DAITER_CK_HAS_NO_COMBINE_TEMPLATE")
+            flags_cc.append("-DAITER_CK_HAS_NO_COMBINE_TEMPLATE")
+
         enable_rope_positions_int32 = int(
             os.environ.get("ENABLE_ROPE_POSITIONS_INT32", "0")
         )
