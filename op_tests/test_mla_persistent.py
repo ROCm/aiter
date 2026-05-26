@@ -557,7 +557,7 @@ def torch_mla_extend_split_kv(
             q_ratio = 1
             q = q.view(total_s, nheads, -1)
         elif max_seqlen_q == 1:
-            q_ratio = fold_factor
+            q_ratio = 1 if (_FORCE_QH8_FOLD and ori_nheads == 32) else fold_factor
             q = q.view(total_s, nheads, -1)
         else:
             q_ratio = fold_factor
@@ -1167,6 +1167,81 @@ def test_mla(
         dtype_kv=kvtype,
     )
 
+    # For qh8 fold (fold_factor=4): regenerate metadata with expanded batch
+    # C++ auto-generates fold_factor=2 for nhead=32/fp8; qh8 needs fold_factor=4
+    if _FORCE_QH8_FOLD and nhead == 32 and max_seqlen_qo == 1:
+        _ff = nhead // 8
+        _new_bs = batch_size * _ff
+        _qo_ip_exp = torch.arange(_new_bs + 1, dtype=qo_indptr.dtype)
+        _kv_lens = kv_indptr[1:] - kv_indptr[:-1]
+        _kv_ip_exp = torch.cat([
+            torch.zeros(1, dtype=kv_indptr.dtype),
+            torch.cumsum(_kv_lens.repeat_interleave(_ff), 0),
+        ])
+        _kv_lpl_exp = kv_last_page_lens.repeat_interleave(_ff)
+        _kv_idx_exp = torch.cat([
+            kv_indices[kv_indptr[i].item():kv_indptr[i + 1].item()]
+            for i in range(batch_size)
+            for _ in range(_ff)
+        ])
+        (
+            (_wmd_sz, _wmd_ty),
+            (_wi_sz,  _wi_ty),
+            (_wis_sz, _wis_ty),
+            (_ri_sz,  _ri_ty),
+            (_rfm_sz, _rfm_ty),
+            (_rpm_sz, _rpm_ty),
+        ) = aiter.get_mla_metadata_info_v1(
+            _new_bs,
+            max_seqlen_qo,
+            nhead // _ff,
+            dtype,
+            kvtype,
+            is_sparse=False,
+            fast_mode=True if not non_persistent_mode else False,
+            num_kv_splits=max_split_per_batch,
+            intra_batch_mode=non_persistent_mode,
+        )
+        work_meta_data   = torch.empty(_wmd_sz, dtype=_wmd_ty, device="cuda")
+        work_indptr      = torch.empty(_wi_sz,  dtype=_wi_ty,  device="cuda")
+        work_info_set    = torch.empty(_wis_sz, dtype=_wis_ty, device="cuda")
+        reduce_indptr    = torch.empty(_ri_sz,  dtype=_ri_ty,  device="cuda")
+        reduce_final_map = torch.empty(_rfm_sz, dtype=_rfm_ty, device="cuda")
+        reduce_partial_map = torch.empty(_rpm_sz, dtype=_rpm_ty, device="cuda")
+        aiter.get_mla_metadata_v1(
+            _qo_ip_exp,
+            _kv_ip_exp,
+            _kv_lpl_exp,
+            (nhead // _ff) // nhead_kv,
+            nhead_kv,
+            False,
+            work_meta_data,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            page_size=page_size,
+            kv_granularity=max(page_size, 16),
+            max_seqlen_qo=int(max_seqlen_qo),
+            uni_seqlen_qo=decode_qlen,
+            fast_mode=True if not non_persistent_mode else False,
+            max_split_per_batch=max_split_per_batch,
+            intra_batch_mode=non_persistent_mode,
+            dtype_q=dtype,
+            dtype_kv=kvtype,
+        )
+        # Replace indptrs used in fp8 decode test with expanded versions
+        qo_indptr_exp      = _qo_ip_exp
+        kv_indptr_exp      = _kv_ip_exp
+        kv_last_page_lens_exp = _kv_lpl_exp
+        kv_indices_exp     = _kv_idx_exp
+    else:
+        qo_indptr_exp         = qo_indptr
+        kv_indptr_exp         = kv_indptr
+        kv_last_page_lens_exp = kv_last_page_lens
+        kv_indices_exp        = kv_indices
+
     if os.environ.get("DUMP_MLA_METADATA", ""):
         kv_gran = max(page_size, 16)
         max_num_blocks = max(
@@ -1443,10 +1518,10 @@ def test_mla(
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
             out_asm,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
+            qo_indptr_exp,
+            kv_indptr_exp,
+            kv_indices_exp,
+            kv_last_page_lens_exp,
             max_seqlen_qo,
             page_size,
             nhead_kv,
@@ -1487,10 +1562,10 @@ def test_mla(
                 torch_mla_split_kv_and_reduce(
                     q_fp8 if dtype == dtypes.fp8 else q,
                     kv_buffer_fp8,
-                    qo_indptr,
-                    kv_indptr,
-                    kv_indices,
-                    kv_last_page_lens,
+                    qo_indptr_exp,
+                    kv_indptr_exp,
+                    kv_indices_exp,
+                    kv_last_page_lens_exp,
                     sm_scale,
                     kv_lora_rank,
                     qk_rope_head_dim,
