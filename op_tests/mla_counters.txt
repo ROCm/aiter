@@ -10,5 +10,9 @@ pmc : TCC_EA_RDREQ_sum TCC_EA_RDREQ_32B_sum
 # Pass 3: HBM write bandwidth + cache hit rate
 pmc : WriteSize L2CacheHit
 
+# Pass 4: active CU proxy — idle CUs inflate SQ_WAVES but contribute ~0 VMEM reads
+# SQ_INSTS_VMEM_RD / SQ_WAVES = avg VMEM reads per wavefront; drops sharply when many CUs exit early
+pmc : SQ_WAVES SQ_INSTS_VMEM_RD SQ_ACTIVE_INST_VALU
+
 # Only capture the MLA kernels, skip everything else
 kernel: mla_a8w8_qh32 mla_a8w8_qh16
