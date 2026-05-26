@@ -2229,14 +2229,19 @@ def compile_mixed_moe_gemm1(
                 # NV ROUND_UP / torchao RCEIL block-scale formula
                 # (``ceil_pow2(amax / max_pos)``); FP8 dtype follows the HW
                 # FP8 variant (gfx942 e4m3fnuz max=240, gfx950+ e4m3fn max=448).
-                if _need_fp4:
-                    _mx_dtype = _D.FP4_E2M1
-                elif _need_fp8:
-                    _mx_dtype = (
-                        _D.FP8_E4M3_FNUZ if gpu_arch == "gfx942" else _D.FP8_E4M3
+                # Single-statement ternary mirrors the original ``_fp_headroom``
+                # pattern -- avoids closure-cell binding edge cases hit by
+                # FlyDSL AOT trace when the assignment is split across
+                # if/elif/else branches.
+                _mx_dtype = (
+                    _D.FP4_E2M1
+                    if _need_fp4
+                    else (
+                        (_D.FP8_E4M3_FNUZ if gpu_arch == "gfx942" else _D.FP8_E4M3)
+                        if _need_fp8
+                        else _D.FP4_E2M1
                     )
-                else:
-                    _mx_dtype = None
+                )
 
                 # FP4/FP8 scale and f32->fp4 conversion are shared with
                 # silu_and_mul_fq; helpers live in
@@ -4163,7 +4168,7 @@ def compile_mixed_moe_gemm2(
                                     b_scale_val = arith.shrui(b_scale_val, _nss)
 
                                 # Hoist B-pack i64x4_to_i32x8 outside the
-                                # imxdl loop — b128 is a function only of
+                                # imxdl loop -- b128 is a function only of
                                 # (ni, inxdl), not (mi, imxdl). Build once per
                                 # (ni, inxdl) and reuse across all mi/imxdl.
                                 b128_list = [None] * pack_N
@@ -4717,7 +4722,7 @@ def compile_mixed_moe_gemm2(
                 )
                 # 0x7FFF0000 is safely beyond out_rsrc.num_records_bytes
                 # (~470MB max for prefill DSV3 accumulate=True) and below
-                # INT32_MAX with room for column offset (≤tile_n*out_elem_bytes).
+                # INT32_MAX with room for column offset (<=tile_n*out_elem_bytes).
                 # HW drops OOB buffer atomics, so routing invalid rows here
                 # lets us drop the per-mr scf.IfOp in the cshuffle epilogue.
                 _OOB_safe_i32 = (

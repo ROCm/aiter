@@ -97,13 +97,19 @@ def build_silu_and_mul_fq_module(
 
     # All four MXFP4/MXFP8 scale modes share NV ROUND_UP today (industry default,
     # 0% max-value clipping). FP8 dtype follows the HW FP8 variant: gfx942 ships
-    # e4m3fnuz (max=240), gfx950+ ships OCP e4m3fn (max=448).
-    if _need_fp4:
-        _mx_dtype = _D.FP4_E2M1
-    elif _need_fp8:
-        _mx_dtype = _D.FP8_E4M3_FNUZ if get_hip_arch() == "gfx942" else _D.FP8_E4M3
-    else:
-        _mx_dtype = None
+    # e4m3fnuz (max=240), gfx950+ ships OCP e4m3fn (max=448). Single-statement
+    # ternary avoids closure-cell binding edge cases in FlyDSL AOT trace; the
+    # bf16 fallback uses FP4_E2M1 as a placeholder (guarded by
+    # ``const_expr(_need_quant)`` at the call site).
+    _mx_dtype = (
+        _D.FP4_E2M1
+        if _need_fp4
+        else (
+            (_D.FP8_E4M3_FNUZ if get_hip_arch() == "gfx942" else _D.FP8_E4M3)
+            if _need_fp8
+            else _D.FP4_E2M1
+        )
+    )
 
     @flyc.kernel
     def silu_and_mul_fq_kernel(
