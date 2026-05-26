@@ -235,9 +235,7 @@ def _kernel_kwargs(s: dict) -> dict:
 
 
 def _stage2_kernel_kwargs(s: dict) -> dict:
-    kwargs = _kernel_kwargs(s)
-    kwargs["split_k"] = 1
-    return kwargs
+    return _kernel_kwargs(s)
 
 
 def _masked_m(experts: int, max_m: int, *, mode: str = "mixed", override: int | None = None) -> torch.Tensor:
@@ -963,6 +961,7 @@ def _run_stage1(
     bench_scope: str = "wrapper",
     rotate: int = 0,
     data_format: str = "fp4",
+    use_bias: bool = False,
 ) -> dict[str, float]:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
@@ -977,6 +976,15 @@ def _run_stage1(
     x_scale = _prep_scale_batch(x_scale_raw, warp_tile=s["tile_m"] // s["m_warp"], tile_k=s["tile_k"])
     w_scale = _prep_scale_batch(w_scale_raw, warp_tile=s["tile_n"] // s["n_warp"], tile_k=s["tile_k"])
     y = torch.empty((E, max_m, inter_dim), device="cuda", dtype=torch.float16)
+    bias_cpu = None
+    bias = None
+    if use_bias:
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(91)
+        bias_cpu = (
+            torch.randn((E, 2 * inter_dim), generator=gen, dtype=torch.float32) * 1.0e-3
+        ).to(torch.float16)
+        bias = bias_cpu.cuda()
     timed_prefix = _make_m_tile_prefix_for_shape(masked_m, s) if persistent else None
     timed_map = _make_m_tile_map_for_shape(masked_m, s) if persistent else None
     _log(f"stage1 persistent={persistent}: compile")
@@ -1027,7 +1035,7 @@ def _run_stage1(
                    stream=torch.cuda.current_stream(),
                    _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                    _m_tile_prefix=timed_prefix,
-                   _m_tile_map=timed_map)
+                   _m_tile_map=timed_map, bias=bias)
     else:
         rotate_select = None
 
@@ -1036,7 +1044,7 @@ def _run_stage1(
                    stream=torch.cuda.current_stream(),
                    _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                    _m_tile_prefix=timed_prefix,
-                   _m_tile_map=timed_map)
+                   _m_tile_map=timed_map, bias=bias)
 
     perf_iter = [0]
     bench_prefix = timed_prefix if persistent else None
@@ -1067,6 +1075,7 @@ def _run_stage1(
                    stream=torch.cuda.current_stream(),
                    _m_tile_prefix=bench_prefix,
                    _m_tile_map=bench_map,
+                   bias=bias,
                    _tmp=bench_tmp,
                    _skip_epilogue=True)
         else:
@@ -1108,6 +1117,9 @@ def _run_stage1(
                 k=model_dim,
                 data_format=data_format,
             )  # (A, max_m, 2*inter_dim)
+            if bias_cpu is not None:
+                gate_up_all = gate_up_all.to(torch.float16).float()
+                gate_up_all = gate_up_all + bias_cpu[active_t].to(gate_up_all.device).float().unsqueeze(1)
             gate = gate_up_all[..., :inter_dim]
             up = gate_up_all[..., inter_dim:]
             expected_active = (torch.nn.functional.silu(gate) * up).to(torch.float16).float()
@@ -1131,6 +1143,7 @@ def _run_stage1(
                     stream=torch.cuda.current_stream(),
                     _m_tile_prefix=timed_prefix,
                     _m_tile_map=timed_map,
+                    bias=bias,
                     _tmp=diag_tmp,
                 )
                 torch.cuda.synchronize()
@@ -1167,6 +1180,7 @@ def _run_stage2(
     bench_scope: str = "wrapper",
     rotate: int = 0,
     data_format: str = "fp4",
+    use_bias: bool = False,
 ) -> dict[str, float]:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
@@ -1181,6 +1195,15 @@ def _run_stage2(
     x_scale = _prep_scale_batch(x_scale_raw, warp_tile=s["tile_m"] // s["m_warp"], tile_k=s["tile_k"])
     w_scale = _prep_scale_batch(w_scale_raw, warp_tile=s["tile_n"] // s["n_warp"], tile_k=s["tile_k"])
     y = torch.empty((E, max_m, model_dim), device="cuda", dtype=torch.float16)
+    bias_cpu = None
+    bias = None
+    if use_bias:
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(97)
+        bias_cpu = (
+            torch.randn((E, model_dim), generator=gen, dtype=torch.float32) * 1.0e-3
+        ).to(torch.float16)
+        bias = bias_cpu.cuda()
     timed_prefix = _make_m_tile_prefix_for_shape(masked_m, s) if persistent else None
     timed_map = _make_m_tile_map_for_shape(masked_m, s) if persistent else None
     _log(f"stage2 persistent={persistent}: compile")
@@ -1231,7 +1254,7 @@ def _run_stage2(
                    stream=torch.cuda.current_stream(),
                    _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                    _m_tile_prefix=timed_prefix,
-                   _m_tile_map=timed_map)
+                   _m_tile_map=timed_map, bias=bias)
     else:
         rotate_select = None
 
@@ -1240,7 +1263,7 @@ def _run_stage2(
                    stream=torch.cuda.current_stream(),
                    _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                    _m_tile_prefix=timed_prefix,
-                   _m_tile_map=timed_map)
+                   _m_tile_map=timed_map, bias=bias)
 
     perf_iter = [0]
     bench_prefix = timed_prefix if persistent else None
@@ -1262,7 +1285,7 @@ def _run_stage2(
                    max_m, model_dim, inter_dim, E,
                    stream=torch.cuda.current_stream(),
                    _m_tile_prefix=bench_prefix,
-                   _m_tile_map=bench_map)
+                   _m_tile_map=bench_map, bias=bias)
         else:
             launch()
         return y
@@ -1286,7 +1309,7 @@ def _run_stage2(
         timings["run_perftest_us"] = us
         _log(f"stage2 persistent={persistent}: run_perftest done us={us:.2f}")
     if verify:
-        if bench_scope == "gemm" or rotate_select is not None:
+        if bench_scope == "gemm" or rotate_select is not None or not timings:
             if rotate_select is not None:
                 rotate_select(0)
             launch()
@@ -1301,6 +1324,10 @@ def _run_stage2(
                 k=inter_dim,
                 data_format=data_format,
             ).to(torch.float16).float()
+            if bias_cpu is not None:
+                expected_active = (
+                    expected_active + bias_cpu[active_t].to(expected_active.device).float().unsqueeze(1)
+                ).to(torch.float16).float()
             actual_active = y[active_t].float()
             _assert_batched_close(
                 f"stage2 persistent={persistent}",
@@ -1727,6 +1754,28 @@ def _run_mock_moe(
             _handle_verify_failure(check_name, exc)
     _log(f"mock moe scatter done: topk_out={tuple(topk_out.shape)} out={tuple(out.shape)}")
     return timings1, timings2
+
+
+def test_grouped_stage_bias_a4w4():
+    _require_gfx1250()
+    s = _shape(experts=3, max_m=16, model_dim=256, inter_dim=256)
+    _run_stage1(
+        s, persistent=True, verify=True, data="pattern", masked_mode="mixed",
+        warmup=0, iters=1, bench_mode="none", use_bias=True,
+    )
+    _run_stage2(
+        s, persistent=True, verify=True, data="pattern", masked_mode="mixed",
+        warmup=0, iters=1, bench_mode="none", use_bias=True,
+    )
+
+
+def test_grouped_stage2_bias_splitk_a4w4():
+    _require_gfx1250()
+    s = _shape(experts=3, max_m=16, model_dim=256, inter_dim=512, split_k=2)
+    _run_stage2(
+        s, persistent=True, verify=True, data="pattern", masked_mode="mixed",
+        warmup=0, iters=1, bench_mode="none", use_bias=True,
+    )
 
 
 def test_mock_moe_usage_a4w4():
