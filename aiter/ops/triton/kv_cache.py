@@ -134,9 +134,10 @@ def reshape_and_cache(
     Returns:
       None. key_cache / value_cache are updated in place.
     """
-    assert kv_cache_layout in ("HND", "NHD"), (
-        f"kv_cache_layout must be 'HND' or 'NHD', got {kv_cache_layout!r}"
-    )
+    assert kv_cache_layout in (
+        "HND",
+        "NHD",
+    ), f"kv_cache_layout must be 'HND' or 'NHD', got {kv_cache_layout!r}"
     _LOGGER.info(
         f"RESHAPE_AND_CACHE: key={tuple(key.shape)} value={tuple(value.shape)} "
         + f"key_cache={tuple(key_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
