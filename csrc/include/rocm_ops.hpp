@@ -1425,8 +1425,8 @@ namespace py = pybind11;
           py::arg("block_m"),                                            \
           py::arg("shuffle_scale") = false,                              \
           py::arg("transpose_out") = false);                             \
-    m.def("fused_dynamic_mxfp4_quant_moe_sort_hip",                      \
-          &aiter::fused_dynamic_mxfp4_quant_moe_sort_hip,                \
+    m.def("fused_dynamic_mx_quant_moe_sort_hip",                      \
+          &aiter::fused_dynamic_mx_quant_moe_sort_hip,                \
           py::arg("out"),                                                \
           py::arg("scales"),                                             \
           py::arg("input"),                                              \
