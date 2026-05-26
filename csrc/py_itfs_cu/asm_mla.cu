@@ -364,6 +364,9 @@ void mla_decode_stage1_asm_fwd(
             if(!persistent && max_seqlen_q == 1){
                 config_max_seqlen_q = 1;
                 sub_Q = 8;
+            } else if (persistent && max_seqlen_q == 1){
+                config_max_seqlen_q = 1;
+                sub_Q = 8;
             }
         }
     }

@@ -16,6 +16,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.core import is_experimental_enabled
 
 _FORCE_QH16_FOLD = os.environ.get("MLA_FORCE_QH16_FOLD", "0") == "1"
+_FORCE_QH8_FOLD = os.environ.get("MLA_FORCE_QH8_FOLD", "0") == "1"
 
 @triton.jit
 def _fwd_kernel_stage2_asm(
@@ -399,6 +400,7 @@ def mla_decode_fwd(
             )
             or (
                 not _FORCE_QH16_FOLD
+                and not _FORCE_QH8_FOLD
                 and get_gfx() == "gfx950"
                 and nhead == 32
                 and q.dtype == dtypes.fp8
@@ -429,6 +431,9 @@ def mla_decode_fwd(
             if use_qseqlen_fold and (ori_nhead == 64 and max_seqlen_q == 2):
                 fold_factor = ori_nhead // 32
                 nhead = 32
+            elif _FORCE_QH8_FOLD and ori_nhead == 32 and max_seqlen_q == 1:
+                fold_factor = ori_nhead // 8
+                nhead = 8
             else:
                 fold_factor = ori_nhead // 16
                 nhead = 16
