@@ -1331,7 +1331,7 @@ def sage_fwd(
         ) = compute_block_masking(
             seqlen_k,
             seqlen_q,
-            start_m,
+            start_m.to(tl.int32),  # int32 for consistent compute_block_masking return types
             IS_CAUSAL,
             USE_SLIDING_WINDOW,
             WINDOW_SIZE_LEFT,
@@ -1374,7 +1374,7 @@ def sage_fwd(
             mask=o_mask,
         )
 
-        # Write zeros to LSE
+        # Write -inf to LSE
         if RETURN_LSE:
             l_ptrs = (
                 LSE
@@ -1384,7 +1384,9 @@ def sage_fwd(
                 + offs_m * stride_lse_m
             )
             tl.store(
-                l_ptrs, tl.zeros([BLOCK_M], dtype=tl.float32), mask=offs_m < seqlen_q
+                l_ptrs,
+                tl.full([BLOCK_M], float("-inf"), dtype=tl.float32),
+                mask=offs_m < seqlen_q,
             )
         return
 
@@ -1832,9 +1834,9 @@ def sage_fwd(
                     z = 0.0
                     acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
 
-            # Zero out LSE for rows above diagonal
+            # Set LSE to -inf for rows above the causal diagonal (logsumexp over empty set).
             if RETURN_LSE:
-                softmax_lse = tl.where(causal_mask, 0.0, softmax_lse)
+                softmax_lse = tl.where(causal_mask, float("-inf"), softmax_lse)
 
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     if RETURN_LSE:

@@ -455,6 +455,120 @@ def test_sage_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat16):
     )
 
 
+@pytest.mark.parametrize("layout", ["bshd"])
+def test_sage_block_sparse_empty_kv_blocks_lse_is_neg_inf(
+    layout: str, dtype=torch.bfloat16
+):
+    """
+    For Q blocks that have no allowed KV blocks the kernel takes the
+    `_no_blocks` early-exit path. The returned softmax_lse for those rows must
+    be -inf so FA-style ring merges treat the shard as zero-weight; non-empty
+    Q blocks must keep finite LSE.
+    """
+    torch.cuda.empty_cache()
+    BATCH, SEQLEN_Q, SEQLEN_K = 1, 256, 256
+    NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 4, 4, 128
+    config = get_sage_fwd_configs()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    num_q_blocks = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
+    num_kv_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+    block_attn_mask = torch.ones(
+        BATCH, num_q_blocks, num_kv_blocks, dtype=torch.bool, device="cuda"
+    )
+    block_attn_mask[:, 0, :] = False
+
+    block_lut = block_attn_mask_to_ragged_lut(block_attn_mask, num_heads=NUM_Q_HEADS)
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    _, lse = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=True,
+        layout=layout,
+        block_lut=block_lut,
+    )
+
+    assert lse.shape == (BATCH, NUM_Q_HEADS, SEQLEN_Q)
+    empty_rows = lse[:, :, :BLOCK_M]
+    rest_rows = lse[:, :, BLOCK_M:]
+    assert torch.isneginf(
+        empty_rows
+    ).all(), f"Expected -inf LSE for empty Q block, got {empty_rows}"
+    assert torch.isfinite(
+        rest_rows
+    ).all(), "Expected finite LSE for Q blocks with valid KV"
+
+
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K", [(64, 16), (128, 32), (256, 64)]
+)
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 4)])
+def test_sage_causal_above_diagonal_lse_is_neg_inf(
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """
+    With causal masking and seqlen_q > seqlen_k, the first (seqlen_q - seqlen_k)
+    Q rows have no valid K positions. Their softmax_lse must be -inf (logsumexp
+    over empty set) so FA-style ring merges treat them correctly.
+    """
+    torch.cuda.empty_cache()
+    BATCH, HEAD_SZ = 2, 128
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    _, lse = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=True,
+        return_lse=True,
+        layout=layout,
+    )
+
+    assert lse.shape == (BATCH, NUM_Q_HEADS, SEQLEN_Q)
+    n_above = SEQLEN_Q - SEQLEN_K
+    above = lse[:, :, :n_above]
+    below = lse[:, :, n_above:]
+    assert torch.isneginf(
+        above
+    ).all(), f"Expected -inf LSE for rows above causal diagonal, got {above}"
+    assert torch.isfinite(
+        below
+    ).all(), "Expected finite LSE for rows on/below causal diagonal"
+
+
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
