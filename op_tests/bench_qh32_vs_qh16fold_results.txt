@@ -1,5 +1,5 @@
 MLA qh32 native vs qh16-fold benchmark
-Date: Tue May 26 09:40:45 UTC 2026
+Date: Tue May 26 10:26:38 UTC 2026
 GPU:          AMD EPYC 9534 64-Core Processor    
 unknown
 
@@ -31,21 +31,21 @@ calling test_mla(ctx_lens                     = 2048,
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:40:51 775:775 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:40:51 775:775 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:40:51.790987073 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    24.30 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.111328125, delta details: 0.3% (54 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    24.30 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.10546875, delta details: 0.3% (54 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    24.30 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.10546875, delta details: 0.3% (54 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    24.30 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.6314279437065125, delta details: 0.7% (2878 of 425984) elements
+USDT:2026-05-26 10:26:45 5453:5453 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:26:45 5453:5453 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:26:45.410332859 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    23.51 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.15625, delta details: 0.4% (58 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    23.51 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.150390625, delta details: 0.3% (57 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    23.51 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.15234375, delta details: 0.3% (57 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    23.51 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.7364957332611084, delta details: 0.7% (2800 of 425984) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|       2048 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |    0.0032959 |          24.2975 |      142606336 |        1230848 |         5.86918 |     0.0506574 |
+|       2048 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |     0.003479 |          23.5107 |      142606336 |        1230848 |          6.0656 |     0.0523527 |
 
   batch=1  ctxLen=8192
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -72,21 +72,21 @@ calling test_mla(ctx_lens                     = 8192,
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:40:59 868:868 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:40:59 868:868 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:40:59.784373344 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    30.50 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.0908203125, delta details: 0.3% (52 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    30.50 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.087890625, delta details: 0.3% (52 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    30.50 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.0869140625, delta details: 0.3% (51 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    30.50 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.3859979808330536, delta details: 0.4% (1819 of 507904) elements
+USDT:2026-05-26 10:26:53 5546:5546 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:26:53 5546:5546 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:26:53.344700710 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    30.49 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.103515625, delta details: 0.3% (54 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    30.49 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.10595703125, delta details: 0.3% (54 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    30.49 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.10546875, delta details: 0.3% (54 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    30.49 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.5127058029174805, delta details: 0.4% (1802 of 507904) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|       8192 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00317383 |          30.4962 |      570425344 |        4769792 |         18.7048 |      0.156406 |
+|       8192 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |    0.0032959 |          30.4872 |      570425344 |        4769792 |         18.7103 |      0.156452 |
 
   batch=1  ctxLen=32768
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -113,21 +113,21 @@ calling test_mla(ctx_lens                     = 32768,
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:41:07 961:961 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:41:07 961:961 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:41:07.806919230 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    59.59 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.103515625, delta details: 0.3% (52 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    59.59 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+USDT:2026-05-26 10:27:01 5639:5639 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:27:01 5639:5639 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:27:01.361940520 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    59.61 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
 [aiter] -->max abs delta:0.1025390625, delta details: 0.3% (52 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    59.59 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.10302734375, delta details: 0.3% (52 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    59.59 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.21702900528907776, delta details: 0.3% (1784 of 524288) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    59.61 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.09814453125, delta details: 0.3% (53 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    59.61 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.09814453125, delta details: 0.3% (53 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    59.61 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.2778629660606384, delta details: 0.3% (1798 of 524288) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|      32768 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00317383 |          59.5897 |     2281701376 |       18925568 |         38.2902 |      0.317598 |
+|      32768 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00323486 |          59.6121 |     2281701376 |       18925568 |         38.2758 |      0.317478 |
 
   batch=4  ctxLen=2048
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -154,21 +154,21 @@ calling test_mla(ctx_lens                     = 2048,
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:41:15 1054:1054 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:41:15 1054:1054 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:41:15.817053760 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    26.21 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.16015625, delta details: 0.3% (199 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    26.21 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.15234375, delta details: 0.3% (198 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    26.21 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.15234375, delta details: 0.3% (198 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    26.21 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:1.0160845518112183, delta details: 0.7% (11921 of 1703936) elements
+USDT:2026-05-26 10:27:09 5732:5732 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:27:09 5732:5732 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:27:09.424316773 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    26.76 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.134765625, delta details: 0.3% (218 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    26.76 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.13671875, delta details: 0.3% (218 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    26.76 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.13671875, delta details: 0.3% (216 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    26.76 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.8636182546615601, delta details: 0.7% (12199 of 1703936) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|       2048 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00302124 |          26.2108 |      570425344 |        4923392 |          21.763 |      0.187838 |
+|       2048 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00332642 |          26.7563 |      570425344 |        4923392 |         21.3193 |      0.184009 |
 
   batch=4  ctxLen=8192
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -195,21 +195,21 @@ calling test_mla(ctx_lens                     = 8192,
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:41:24 1147:1147 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:41:24 1147:1147 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:41:24.151904714 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    34.87 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.11181640625, delta details: 0.3% (204 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    34.87 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.11083984375, delta details: 0.3% (201 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    34.87 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.11181640625, delta details: 0.3% (200 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    34.87 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.5048487186431885, delta details: 0.4% (7344 of 2031616) elements
+USDT:2026-05-26 10:27:17 5825:5825 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:27:17 5825:5825 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:27:17.736203784 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    34.96 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.12451171875, delta details: 0.3% (199 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    34.96 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1181640625, delta details: 0.3% (202 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    34.96 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.11865234375, delta details: 0.3% (201 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    34.96 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.4165434241294861, delta details: 0.4% (7278 of 2031616) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|       8192 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00306702 |          34.8746 |     2281701376 |       19079168 |         65.4259 |      0.547079 |
+|       8192 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00308228 |           34.961 |     2281701376 |       19079168 |         65.2642 |      0.545728 |
 
   batch=4  ctxLen=32768
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -236,21 +236,21 @@ calling test_mla(ctx_lens                     = 32768,
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:41:32 1240:1240 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:41:32 1240:1240 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:41:32.523565194 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    64.11 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1455078125, delta details: 0.3% (205 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    64.11 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.142578125, delta details: 0.3% (203 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    64.11 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.142578125, delta details: 0.3% (204 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    64.11 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.2707955539226532, delta details: 0.3% (7082 of 2129920) elements
+USDT:2026-05-26 10:27:25 5918:5918 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:27:25 5918:5918 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:27:25.064002911 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    63.65 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.14453125, delta details: 0.3% (215 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    63.65 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.138671875, delta details: 0.3% (215 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    63.65 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.138671875, delta details: 0.3% (211 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    63.65 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.3758098781108856, delta details: 0.3% (7052 of 2129920) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|      32768 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00309753 |          64.1096 |     9126805504 |       75702272 |         142.363 |       1.18083 |
+|      32768 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00328064 |          63.6507 |     9126805504 |       75702272 |         143.389 |       1.18934 |
 
   batch=16  ctxLen=2048
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -277,21 +277,21 @@ calling test_mla(ctx_lens                     = 2048,
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:41:40 1333:1333 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:41:40 1333:1333 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:41:40.919989024 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    28.51 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.171875, delta details: 0.3% (864 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    28.51 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1787109375, delta details: 0.3% (858 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    28.51 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1767578125, delta details: 0.3% (860 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    28.51 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.6138878464698792, delta details: 0.4% (16557 of 3932160) elements
+USDT:2026-05-26 10:27:34 6011:6011 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:27:34 6011:6011 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:27:34.411563453 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    28.56 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.2021484375, delta details: 0.3% (866 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    28.56 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.203125, delta details: 0.3% (861 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    28.56 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.2001953125, delta details: 0.3% (862 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    28.56 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.7596049904823303, delta details: 0.4% (16716 of 3932160) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|       2048 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00327301 |          28.5142 |     2281701376 |       19693568 |         80.0198 |      0.690658 |
+|       2048 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00328445 |          28.5615 |     2281701376 |       19693568 |         79.8873 |      0.689514 |
 
   batch=16  ctxLen=8192
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -318,21 +318,21 @@ calling test_mla(ctx_lens                     = 8192,
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:41:49 1426:1426 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:41:49 1426:1426 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:41:49.714232846 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    45.72 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1552734375, delta details: 0.3% (844 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    45.72 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1572265625, delta details: 0.3% (842 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    45.72 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1572265625, delta details: 0.3% (845 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    45.72 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.46604347229003906, delta details: 0.4% (14868 of 4194304) elements
+USDT:2026-05-26 10:27:43 6104:6104 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:27:43 6104:6104 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:27:43.194937916 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    45.57 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1416015625, delta details: 0.3% (819 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    45.57 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1416015625, delta details: 0.3% (818 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    45.57 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.140625, delta details: 0.3% (819 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    45.57 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.37229883670806885, delta details: 0.4% (14768 of 4194304) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|       8192 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00321198 |          45.7153 |     9126805504 |       76316672 |         199.645 |       1.66939 |
+|       8192 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00312042 |          45.5727 |     9126805504 |       76316672 |         200.269 |       1.67461 |
 
   batch=16  ctxLen=32768
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -359,21 +359,21 @@ calling test_mla(ctx_lens                     = 32768,
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:41:58 1519:1519 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:41:58 1519:1519 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:41:58.518190017 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:   107.19 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.14453125, delta details: 0.3% (831 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:   107.19 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.142578125, delta details: 0.3% (828 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:   107.19 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.142578125, delta details: 0.3% (828 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:   107.19 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.2371249496936798, delta details: 0.3% (14047 of 4194304) elements
+USDT:2026-05-26 10:27:51 6197:6197 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:27:51 6197:6197 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:27:51.008190899 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:   108.29 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1318359375, delta details: 0.3% (846 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:   108.29 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.126953125, delta details: 0.3% (843 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:   108.29 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.126953125, delta details: 0.3% (841 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:   108.29 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.20756040513515472, delta details: 0.3% (14007 of 4194304) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|      32768 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00315857 |          107.194 |    36507222016 |      302809088 |         340.572 |       2.82487 |
+|      32768 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00321579 |          108.288 |    36507222016 |      302809088 |          337.13 |       2.79632 |
 
 
 ===== qh16 FOLD fallback (old) =====
@@ -400,25 +400,21 @@ calling test_mla(ctx_lens                     = 2048,
                  scale_dim                    = 4,
                  return_lse                   = False)
 [aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
-[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:42:07 1620:1620 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:42:07 1620:1620 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:42:07.332015368 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    22.50 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.12890625, delta details: 0.3% (54 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    22.50 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.12890625, delta details: 0.3% (52 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    22.50 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.12890625, delta details: 0.3% (52 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    22.50 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:1.003332495689392, delta details: 0.7% (2788 of 425984) elements
+USDT:2026-05-26 10:28:00 6298:6298 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:28:00 6298:6298 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:28:00.848310785 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    16.60 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    16.60 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    16.60 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    16.60 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|       2048 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00317383 |          22.4958 |      142606336 |        1230848 |         6.33923 |     0.0547145 |
+|       2048 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |            0 |          16.5979 |      142606336 |        1230848 |         8.59182 |     0.0741567 |
 
   batch=1  ctxLen=8192
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -441,25 +437,22 @@ calling test_mla(ctx_lens                     = 8192,
                  scale_dim                    = 4,
                  return_lse                   = False)
 [aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
-[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:42:15 1713:1713 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:42:15 1713:1713 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:42:15.372695921 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    30.89 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.09521484375, delta details: 0.3% (51 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    30.89 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.09619140625, delta details: 0.3% (51 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    30.89 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.09521484375, delta details: 0.3% (51 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    30.89 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.38525450229644775, delta details: 0.4% (1809 of 507904) elements
+USDT:2026-05-26 10:28:08 6391:6391 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:28:08 6391:6391 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:28:08.534413112 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    21.00 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    21.00 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    21.00 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    21.00 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.014381110668182373, delta details: 0.0% (30 of 507904) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|       8192 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00311279 |          30.8859 |      570425344 |        4769792 |         18.4688 |      0.154433 |
+|       8192 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |            0 |          20.9958 |      570425344 |        4769792 |         27.1685 |      0.227178 |
 
   batch=1  ctxLen=32768
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -482,25 +475,21 @@ calling test_mla(ctx_lens                     = 32768,
                  scale_dim                    = 4,
                  return_lse                   = False)
 [aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
-[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:42:23 1806:1806 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:42:23 1806:1806 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:42:23.399616246 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    59.58 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.177734375, delta details: 0.3% (51 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    59.58 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1806640625, delta details: 0.3% (50 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    59.58 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1806640625, delta details: 0.3% (50 of 16384) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    59.58 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.2898871898651123, delta details: 0.3% (1808 of 524288) elements
+USDT:2026-05-26 10:28:16 6484:6484 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:28:16 6484:6484 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:28:16.549686985 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    34.95 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    34.95 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    34.95 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    34.95 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|      32768 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00305176 |           59.584 |     2281701376 |       18925568 |         38.2939 |      0.317628 |
+|      32768 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |            0 |           34.945 |     2281701376 |       18925568 |          65.294 |      0.541581 |
 
   batch=4  ctxLen=2048
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -523,25 +512,23 @@ calling test_mla(ctx_lens                     = 2048,
                  scale_dim                    = 4,
                  return_lse                   = False)
 [aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
-[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:42:31 1899:1899 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:42:31 1899:1899 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:42:31.443464682 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    27.48 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1640625, delta details: 0.3% (208 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    27.48 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.162109375, delta details: 0.3% (207 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    27.48 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.162109375, delta details: 0.3% (206 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    27.48 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.7440670132637024, delta details: 0.7% (11802 of 1703936) elements
+USDT:2026-05-26 10:28:24 6577:6577 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:28:24 6577:6577 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:28:24.309057167 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    18.68 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.01171875, delta details: 0.0% (2 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    18.68 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    18.68 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    18.68 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.019623026251792908, delta details: 0.0% (41 of 1703936) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|       2048 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00315857 |           27.482 |      570425344 |        4923392 |         20.7563 |       0.17915 |
+|       2048 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |            0 |          18.6783 |      570425344 |        4923392 |         30.5394 |      0.263588 |
 
   batch=4  ctxLen=8192
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -564,25 +551,22 @@ calling test_mla(ctx_lens                     = 8192,
                  scale_dim                    = 4,
                  return_lse                   = False)
 [aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
-[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:42:39 1992:1992 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:42:39 1992:1992 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:42:39.762021084 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    34.23 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.134765625, delta details: 0.3% (195 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    34.23 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.138671875, delta details: 0.3% (199 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    34.23 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1376953125, delta details: 0.3% (198 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    34.23 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.4799976944923401, delta details: 0.4% (7296 of 2031616) elements
+USDT:2026-05-26 10:28:32 6670:6670 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:28:32 6670:6670 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:28:32.658861985 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    25.24 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    25.24 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    25.24 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    25.24 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.015023283660411835, delta details: 0.0% (126 of 2031616) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|       8192 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |    0.0030365 |          34.2311 |     2281701376 |       19079168 |         66.6559 |      0.557364 |
+|       8192 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |            0 |          25.2406 |     2281701376 |       19079168 |         90.3979 |      0.755891 |
 
   batch=4  ctxLen=32768
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -605,25 +589,22 @@ calling test_mla(ctx_lens                     = 32768,
                  scale_dim                    = 4,
                  return_lse                   = False)
 [aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
-[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:42:48 2085:2085 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:42:48 2085:2085 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:42:48.125724342 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    64.12 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1318359375, delta details: 0.3% (186 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    64.12 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1328125, delta details: 0.3% (184 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    64.12 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1328125, delta details: 0.3% (185 of 65536) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    64.12 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.29976680874824524, delta details: 0.3% (7013 of 2129920) elements
+USDT:2026-05-26 10:28:40 6763:6763 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:28:40 6763:6763 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:28:40.072814793 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    40.92 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    40.92 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    40.92 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    40.92 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.012053318321704865, delta details: 0.0% (4 of 2129920) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|      32768 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00280762 |          64.1215 |     9126805504 |       75702272 |         142.336 |       1.18061 |
+|      32768 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |            0 |           40.923 |     9126805504 |       75702272 |         223.024 |       1.84987 |
 
   batch=16  ctxLen=2048
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -646,25 +627,23 @@ calling test_mla(ctx_lens                     = 2048,
                  scale_dim                    = 4,
                  return_lse                   = False)
 [aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
-[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:42:56 2178:2178 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:42:56 2178:2178 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:42:56.513851732 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    28.63 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.166015625, delta details: 0.3% (873 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    28.63 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1640625, delta details: 0.3% (865 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    28.63 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.166015625, delta details: 0.3% (863 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    28.63 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.6331291198730469, delta details: 0.4% (16697 of 3932160) elements
+USDT:2026-05-26 10:28:49 6856:6856 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:28:49 6856:6856 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:28:49.555865253 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    21.09 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.01220703125, delta details: 0.0% (6 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    21.09 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    21.09 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    21.09 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.013672396540641785, delta details: 0.0% (116 of 2097152) elements
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|       2048 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00329971 |          28.6307 |     2281701376 |       19693568 |         79.6943 |      0.687849 |
+|       2048 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |            0 |          21.0902 |     2281701376 |       19693568 |         108.188 |      0.933778 |
 
   batch=16  ctxLen=8192
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -687,25 +666,21 @@ calling test_mla(ctx_lens                     = 8192,
                  scale_dim                    = 4,
                  return_lse                   = False)
 [aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
-[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:43:05 2271:2271 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:43:05 2271:2271 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:43:05.310633211 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    45.57 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1474609375, delta details: 0.3% (816 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    45.57 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1455078125, delta details: 0.3% (822 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    45.57 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.146484375, delta details: 0.3% (818 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    45.57 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.44571778178215027, delta details: 0.4% (14756 of 4194304) elements
+USDT:2026-05-26 10:28:57 6949:6949 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:28:57 6949:6949 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:28:57.050478595 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    35.33 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    35.33 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    35.33 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    35.33 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|       8192 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00313568 |          45.5718 |     9126805504 |       76316672 |         200.273 |       1.67465 |
+|       8192 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |            0 |          35.3301 |     9126805504 |       76316672 |          258.33 |       2.16011 |
 
   batch=16  ctxLen=32768
 [aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
@@ -728,24 +703,20 @@ calling test_mla(ctx_lens                     = 32768,
                  scale_dim                    = 4,
                  return_lse                   = False)
 [aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
-[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
 [aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
 /usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-USDT:2026-05-26 09:43:13 2364:2364 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-05-26 09:43:14 2364:2364 ActivityProfilerController.cpp:455] profiler_stop
-[W526 09:43:14.118423363 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
-[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:   107.25 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.13671875, delta details: 0.3% (855 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:   107.25 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.1376953125, delta details: 0.3% (854 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:   107.25 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.13671875, delta details: 0.3% (853 of 262144) elements
-[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:   107.25 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
-[aiter] -->max abs delta:0.22586581110954285, delta details: 0.3% (14103 of 4194304) elements
+USDT:2026-05-26 10:29:06 7042:7042 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 10:29:06 7042:7042 ActivityProfilerController.cpp:455] profiler_stop
+[W526 10:29:06.243329371 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    93.97 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    93.97 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    93.97 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    93.97 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
 [aiter] mla_persistent summary (markdown):
 |   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
 |-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
-|      32768 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00325775 |          107.246 |    36507222016 |      302809088 |         340.408 |       2.82351 |
+|      32768 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |            0 |          93.9661 |    36507222016 |      302809088 |         388.515 |       3.22254 |
 
 
