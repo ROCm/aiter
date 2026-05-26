@@ -25,8 +25,10 @@ namespace aiter {
 //      torchao/prototype/mx_formats/mx_tensor.py    (_to_mx_rceil and friends)
 //
 // Values **must** stay 1:1 with ``aiter.utility.mx_types.MxScaleRoundMode``
-// and the FlyDSL re-export
-// ``aiter.ops.flydsl.kernels.quant_utils.MxScaleRoundMode``.
+// (the pybind11 binding) and ``aiter.utility.mx_types.MxScaleRoundModeInt``
+// (the JIT-free int mirror used by FlyDSL AOT). The lazy loader in
+// ``mx_types.py::__getattr__`` asserts the int values match on first
+// pybind enum access.
 enum class MxScaleRoundMode : int {
     RoundDown = 0, // OCP / NV ROUND_DOWN / torchao FLOOR:
                    //   scale = floor_pow2(amax) / 2^target_max_pow2.
@@ -114,6 +116,8 @@ template <> struct MxDtypeConfig<MxDtype::FP8_E4M3_FNUZ> {
 // 1:1 and is the C++ analogue of:
 //   * Python CPU ref: ``aiter.utility.fp4_utils.f32_to_mx_e8m0_scale``
 //   * FlyDSL builder: ``aiter.ops.flydsl.kernels.quant_utils.emit_mx_e8m0_scale``
+//     (uses the JIT-free ``MxScaleRoundModeInt`` / ``MxDtypeInt`` mirrors so
+//     wheel ``PREBUILD_KERNELS`` can AOT-compile FlyDSL kernels before HIP)
 //
 // The template parameters are compile-time constants (selected by the
 // caller's switch over runtime ``round_mode``), so the ``if constexpr``

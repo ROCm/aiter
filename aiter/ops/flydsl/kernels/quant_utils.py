@@ -17,46 +17,59 @@ and are dtype-agnostic across the whole MX format family
 PyTorch torchao's and the HIP-side ``MxScaleRoundMode`` design (see
 ``csrc/include/mx_quant_utils.h`` and ``aiter.ops.quant.MxScaleRoundMode``).
 
-See :class:`MxScaleRoundMode` (``aiter.utility.mx_types``) and
-``aiter/utility/fp4_utils.py`` for cross-stack naming (PyTorch torchao /
+See ``aiter/utility/fp4_utils.py`` for cross-stack naming (PyTorch torchao /
 NV Triton / DSv4 / FlashInfer / AMD Quark) and CPU torch reference
 implementations.
+
+This module imports only the *bare-int* mirrors
+(:class:`MxScaleRoundModeInt` / :class:`MxDtypeInt`) from
+:mod:`aiter.utility.mx_types`; the pybind11 :class:`MxScaleRoundMode` /
+:class:`MxDtype` from the same module are loaded lazily and would
+trigger a ``module_aiter_core`` JIT build on attribute access, which is
+incompatible with wheel ``PREBUILD_KERNELS`` (FlyDSL AOT runs before the
+HIP modules are built; see ``setup.py``). Callers may still pass either
+view to :func:`emit_mx_e8m0_scale` -- both round-trip through
+``int(...)``.
 """
+
+from __future__ import annotations
 
 from flydsl.expr import arith
 from flydsl.expr.typing import T
 from flydsl.expr.arith import CmpIPredicate
 
-# ``MxScaleRoundMode`` and ``MxDtype`` live in :mod:`aiter.utility.mx_types`
-# (single source of truth across HIP / Python ops / CPU ref / FlyDSL).
-# That module has no aiter-internal dependencies, so importing it here
-# does not pull torch into the FlyDSL kernel build path.
-from aiter.utility.mx_types import MxDtype, MxScaleRoundMode
+# Bare-int mirrors of MxScaleRoundMode / MxDtype (mx_quant_utils.h). Same
+# numeric values as the pybind11 enum classes, but importing them is
+# JIT-free, which is required at FlyDSL AOT time.
+from aiter.utility.mx_types import MxDtypeInt as _D, MxScaleRoundModeInt as _M
 
 # Per-MX-dtype constants. Tuple form: (target_max_pow2, max_pos_inv_f32_bits, mbits)
-# - target_max_pow2 = log2(largest pow2 <= max_normal(dtype))
-# - max_pos_inv_f32_bits = bit pattern of fp32(1.0 / max_normal(dtype))
-# - mbits = mantissa bits of the target dtype (used only by EVEN mode)
-# dict keyed by ``int(MxDtype.X)`` so lookups work regardless of whether
-# the caller passes a pybind enum value or a bare ``int``.
-# Tuple form: (target_max_pow2, max_pos_inv_f32_bits, mbits)
-# - max_pos_inv_f32_bits = bit pattern of fp32(1.0 / max_normal(dtype)),
-#   used by RoundUp's ceil_pow2(amax / max_pos) implementation.
+# - target_max_pow2        = log2(largest pow2 <= max_normal(dtype))
+# - max_pos_inv_f32_bits   = bit pattern of fp32(1.0 / max_normal(dtype)),
+#                            used by RoundUp's ceil_pow2(amax / max_pos)
+# - mbits                  = mantissa bits of the target dtype (EVEN only)
+# Dict keyed by ``int(MxDtype.X)`` so callers may pass either bare int or
+# pybind enum interchangeably.
 _DTYPE_CFG = {
-    # FP4 e2m1: max_pos=6.0
-    int(MxDtype.FP4_E2M1): (2, 0x3E2AAAAB, 1),  # 1/6.0      ~= 0.16666667
-    # FP8 e4m3 (OCP / H100 / gfx950+): max_pos=448.0
-    int(MxDtype.FP8_E4M3): (8, 0x3B124925, 3),  # 1/448.0    ~= 0.00223214
-    # FP8 e4m3fnuz (AMD gfx942 hardware): max_pos=240.0
-    int(MxDtype.FP8_E4M3_FNUZ): (7, 0x3B888889, 3),  # 1/240.0    ~= 0.00416667
+    _D.FP4_E2M1: (2, 0x3E2AAAAB, 1),  # max_pos=6.0,    1/6.0    ~= 0.16666667
+    _D.FP8_E4M3: (
+        8,
+        0x3B124925,
+        3,
+    ),  # max_pos=448.0,  1/448.0  ~= 0.00223214 (OCP / H100 / gfx950+)
+    _D.FP8_E4M3_FNUZ: (
+        7,
+        0x3B888889,
+        3,
+    ),  # max_pos=240.0,  1/240.0  ~= 0.00416667 (AMD gfx942)
 }
 
 
 def emit_mx_e8m0_scale(
     local_max,
     *,
-    mode: MxScaleRoundMode = MxScaleRoundMode.RoundUp,
-    dtype: MxDtype = MxDtype.FP4_E2M1,
+    mode: int = _M.RoundUp,
+    dtype: int = _D.FP4_E2M1,
 ):
     """Emit IR computing the E8M0 block scale for an MX format.
 
@@ -67,16 +80,22 @@ def emit_mx_e8m0_scale(
     ``dtype`` only selects ``target_max_pow2`` / ``max_pos`` / ``mbits``
     constants from :data:`_DTYPE_CFG`.
 
-    See :class:`MxScaleRoundMode` (``aiter.utility.mx_types``) for the four
-    formulas and cross-stack mapping (PyTorch torchao / NV / DSv4 /
-    FlashInfer / AMD Quark naming).
+    See ``csrc/include/mx_quant_utils.h`` (``MxScaleRoundMode`` /
+    ``MxDtype``) and :mod:`aiter.utility.mx_types` for the four formulas
+    and cross-stack mapping (PyTorch torchao / NV / DSv4 / FlashInfer /
+    AMD Quark naming).
 
     Args:
         local_max: f32 IR value, the (warp-reduced) ``max(|x|)`` of one
             block. Caller is responsible for the per-block reduction.
-        mode: :class:`MxScaleRoundMode`. Default ``RoundUp`` (industry
+        mode: ``MxScaleRoundMode`` value -- accepts either the bare-int
+            mirror :class:`aiter.utility.mx_types.MxScaleRoundModeInt`
+            (recommended for FlyDSL kernel definitions) or the pybind11
+            enum :class:`aiter.utility.mx_types.MxScaleRoundMode` (from
+            user-facing code paths). Default ``RoundUp`` (industry
             consensus for MXFP4 and MXFP8).
-        dtype: :class:`MxDtype`. Default ``FP4_E2M1``.
+        dtype: ``MxDtype`` value -- bare-int mirror or pybind11 enum.
+            Default ``FP4_E2M1``.
 
     Returns:
         e8m0_biased: i32 IR value in the range ``[0, 0xFF]``. The caller
@@ -102,7 +121,7 @@ def emit_mx_e8m0_scale(
     c0x7FFFFF_i32 = arith.constant(0x7FFFFF, type=T.i32)  # f32 mantissa mask
     target_max_pow2_i32 = arith.constant(target_max_pow2, type=T.i32)
 
-    if mode_int == int(MxScaleRoundMode.RoundUp):
+    if mode_int == _M.RoundUp:
         # ceil_pow2(amax / max_pos): multiply by reciprocal of max_pos to get
         # the working value, then bump the exponent if any mantissa bit is
         # set. Bit-equivalent to HIP ``aiter::fp4_f32_to_e8m0_scale`` (when
@@ -122,14 +141,14 @@ def emit_mx_e8m0_scale(
         )
         return arith.maxsi(exp_field, c0_i32)
 
-    if mode_int == int(MxScaleRoundMode.RoundDown):
+    if mode_int == _M.RoundDown:
         # floor_pow2(amax) / 2^target_max_pow2: drop the f32 mantissa, then
         # subtract target_max_pow2 from the biased exponent.
         amax_i32 = local_max.bitcast(T.i32)
         biased_exp = (amax_i32 >> c23_i32) & c0xFF_i32
         return arith.maxsi(biased_exp - target_max_pow2_i32, c0_i32)
 
-    if mode_int == int(MxScaleRoundMode.Ceil):
+    if mode_int == _M.Ceil:
         # ceil_pow2(amax) / 2^target_max_pow2: same as RoundDown but bump
         # the exponent if any mantissa bit is set.
         amax_i32 = local_max.bitcast(T.i32)
@@ -143,7 +162,7 @@ def emit_mx_e8m0_scale(
         )
         return arith.maxsi(biased_exp_bumped - target_max_pow2_i32, c0_i32)
 
-    if mode_int == int(MxScaleRoundMode.Even):
+    if mode_int == _M.Even:
         # round_pow2_special(amax) / 2^target_max_pow2: add a half-step at
         # the "(mbits+1)-th-from-top" mantissa bit, then drop all mantissa
         # bits. ``val_to_add = 1 << (23 - mbits - 1)`` so that the carry
@@ -159,8 +178,10 @@ def emit_mx_e8m0_scale(
         return arith.maxsi(biased_exp - target_max_pow2_i32, c0_i32)
 
     raise ValueError(
-        f"emit_mx_e8m0_scale: unknown MxScaleRoundMode {mode!r} "
-        f"(expected one of {list(MxScaleRoundMode)})"
+        f"emit_mx_e8m0_scale: unknown mode int {mode_int} for {mode!r} "
+        f"(expected one of MxScaleRoundModeInt: "
+        f"RoundDown={_M.RoundDown}, RoundUp={_M.RoundUp}, "
+        f"Even={_M.Even}, Ceil={_M.Ceil})"
     )
 
 
@@ -170,18 +191,14 @@ def emit_fp4_e8m0_scale_round_up(local_max):
     Equivalent to::
 
         emit_mx_e8m0_scale(local_max,
-                           mode=MxScaleRoundMode.RoundUp,
-                           dtype=MxDtype.FP4_E2M1)
+                           mode=MxScaleRoundModeInt.RoundUp,
+                           dtype=MxDtypeInt.FP4_E2M1)
 
     See :func:`emit_mx_e8m0_scale` for the full mode/dtype semantics. New
     code should prefer the generic entry point so the choice of mode and
     dtype is explicit at the call site.
     """
-    return emit_mx_e8m0_scale(
-        local_max,
-        mode=MxScaleRoundMode.RoundUp,
-        dtype=MxDtype.FP4_E2M1,
-    )
+    return emit_mx_e8m0_scale(local_max, mode=_M.RoundUp, dtype=_D.FP4_E2M1)
 
 
 def emit_fp8_e8m0_scale_round_up_legacy(local_max, *, headroom_i32):
@@ -192,7 +209,7 @@ def emit_fp8_e8m0_scale_round_up_legacy(local_max, *, headroom_i32):
     used by the FlyDSL FP8 activation path pre-this-PR. The FP8 path was
     deliberately not migrated to NV ROUND_UP in this PR to keep a8w4
     sweep results stable; aligning it to ``emit_mx_e8m0_scale(mode=RoundUp,
-    dtype=MxDtype.FP8_E4M3)`` (which matches NV TransformerEngine MXFP8 /
+    dtype=FP8_E4M3)`` (which matches NV TransformerEngine MXFP8 /
     DeepSeek-V3.1 ``scale_fmt=ue8m0``) is a follow-up PR.
 
     Numerically this is equivalent to ``emit_mx_e8m0_scale(mode=Even, ...)``
