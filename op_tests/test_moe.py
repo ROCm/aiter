@@ -15,11 +15,6 @@ import argparse
 
 BLOCK_SIZE_M = 32
 
-# _FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-
-
-# def is_fp8_weight_dtype(dtype) -> bool:
-#     return dtype in _FP8_WEIGHT_DTYPES
 
 
 def permute_weight_a(x: torch.Tensor) -> torch.Tensor:
