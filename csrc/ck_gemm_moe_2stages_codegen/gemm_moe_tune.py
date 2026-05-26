@@ -1713,9 +1713,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
-            hidden_pad,
-            intermediate_pad,
         ) = key
         if us == self.INVALID_TIME or us == self.INF_TIME:
             return 0, 0
@@ -1826,9 +1823,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
-            hidden_pad,
-            intermediate_pad,
         ) = info
         ## asm moe 1 stage tuning
         get_gfx()
@@ -2057,9 +2051,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
-            hidden_pad,
-            intermediate_pad,
         ) = info
         kernels_list_csv = f"{get_asm_dir()}/fmoe_2stages/fmoe_stage1_bf16_pertoken{{quantDtype}}{{extraInfo}}_g1u1.csv"
         extraInfo = ""
@@ -2171,9 +2162,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
-            hidden_pad,
-            intermediate_pad,
         ) = info
 
         _is_a8w4 = (
@@ -2405,9 +2393,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
-            hidden_pad,
-            intermediate_pad,
         ) = info
 
         _gen_data_args_s1 = (
@@ -2567,9 +2552,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
-            hidden_pad,
-            intermediate_pad,
         ) = info
 
         if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
@@ -2835,9 +2817,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
-            hidden_pad,
-            intermediate_pad,
         ) = info
 
         if not (q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2):
@@ -3362,18 +3341,12 @@ class FmoeTuner(TunerCommon):
                 q_type,
                 use_g1u1,
                 doweight_stage1,
-                bias,
-                hidden_pad,
-                intermediate_pad,
             ) = line
             dtype = eval(dtype)
             q_dtype_a = eval(q_dtype_a)
             q_dtype_w = eval(q_dtype_w)
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
-            bias = bool(bias)
-            hidden_pad = int(hidden_pad)
-            intermediate_pad = int(intermediate_pad)
             print("\nStart tuning", line)
             if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
                 print(f"{q_type} is not supported on {get_gfx()}")
@@ -3396,9 +3369,6 @@ class FmoeTuner(TunerCommon):
                 q_type,
                 use_g1u1,
                 doweight_stage1,
-                bias,
-                hidden_pad,
-                intermediate_pad,
             )
             tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
             tasks_ck.extend(self.gen_2stages_task(info, blockMs))
@@ -3541,9 +3511,6 @@ class FmoeTuner(TunerCommon):
                 q_type,
                 use_g1u1,
                 doweight_stage1,
-                bias,
-                hidden_pad,
-                intermediate_pad,
             ) = key
             import re
 
@@ -3571,9 +3538,6 @@ class FmoeTuner(TunerCommon):
                         q_type,
                         use_g1u1,
                         doweight_stage1,
-                        bias,
-                        hidden_pad,
-                        intermediate_pad,
                         block_m,
                         row_ksplit,
                         us,
@@ -3686,9 +3650,6 @@ class FmoeTuner(TunerCommon):
                     "q_type",
                     "use_g1u1",
                     "doweight_stage1",
-                    "bias",
-                    "hidden_pad",
-                    "intermediate_pad",
                     "block_m",
                 ],
                 how="inner",
@@ -3716,9 +3677,6 @@ class FmoeTuner(TunerCommon):
                         q_type,
                         use_g1u1,
                         doweight_stage1,
-                        bias,
-                        hidden_pad,
-                        intermediate_pad,
                         0,
                         0,
                         self.INVALID_TIME,
@@ -3953,22 +3911,6 @@ class FmoeTuner(TunerCommon):
         else:
             return pd.DataFrame()
 
-    # Optional untuned columns: backfilled with these defaults so older untuned
-    # CSVs (without bias / hidden_pad / intermediate_pad) still load cleanly.
-    OPTIONAL_UNTUNED_DEFAULTS = {
-        "bias": False,
-        "hidden_pad": 0,
-        "intermediate_pad": 0,
-    }
-
-    def _backfill_optional_untuned_cols(self, df):
-        for col, default in self.OPTIONAL_UNTUNED_DEFAULTS.items():
-            if col not in df.columns:
-                df[col] = default
-            else:
-                df[col] = df[col].fillna(default)
-        return df
-
     def pre_process(self, args):
         if args.all:
             self.get_retune_gemm_list(args)
@@ -3991,8 +3933,6 @@ class FmoeTuner(TunerCommon):
                     self.tunedf[untunedf_cols].apply(tuple, axis=1)
                 )
                 self.untunedf = self.untunedf[~mask]
-        if self.untunedf is not None:
-            self.untunedf = self._backfill_optional_untuned_cols(self.untunedf)
 
 
 if __name__ == "__main__":
@@ -4010,9 +3950,6 @@ if __name__ == "__main__":
         "q_type",
         "use_g1u1",
         "doweight_stage1",
-        "bias",
-        "hidden_pad",
-        "intermediate_pad",
     ]
     resultList = [
         "block_m",

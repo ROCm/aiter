@@ -71,7 +71,6 @@ def test_fmoe(
     doweight_stage1=False,
     hidden_pad=0,
     intermediate_pad=0,
-    bias=False,
     preshuffle=True,
     strict_accuracy=True,
     check_aot_cache=True,
@@ -79,13 +78,6 @@ def test_fmoe(
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
-    assert (
-        0 <= hidden_pad < model_dim
-    ), f"invalid hidden_pad={hidden_pad} for model_dim={model_dim}"
-    assert (
-        0 <= intermediate_pad < inter_dim
-    ), f"invalid intermediate_pad={intermediate_pad} for inter_dim={inter_dim}"
-
     torch_quant = aiter.get_torch_quant(qType)
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
@@ -95,39 +87,16 @@ def test_fmoe(
         if intermediate_pad != 0:
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
-        if bias:
-            exp_bias1 = torch.clamp(
-                torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0
-            )
-            # Dense torch reference still evaluates padded lanes; keep padded
-            # bias zero so invalid lanes do not affect activation quantization.
-            if intermediate_pad != 0:
-                exp_bias1[:, -intermediate_pad:] = 0
-                exp_bias1[:, inter_dim - intermediate_pad : inter_dim] = 0
-        else:
-            exp_bias1 = None
+        exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
-        if bias:
-            exp_bias1 = torch.clamp(
-                torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0
-            )
-            if intermediate_pad != 0:
-                exp_bias1.view(E, inter_dim)[:, -intermediate_pad:] = 0
-        else:
-            exp_bias1 = None
+        exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
     if intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
     if hidden_pad != 0:
         w2[:, -hidden_pad:, :] = 0
-    if bias:
-        exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
-        # The padded hidden tail is outside the logical output dimension.
-        if hidden_pad != 0:
-            exp_bias2[:, -hidden_pad:] = 0
-    else:
-        exp_bias2 = None
+    exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0
@@ -217,15 +186,22 @@ def test_fmoe(
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
 
-    # bias dtype convert: `bias` flag (from csv) is the source of truth. When
-    # set, cast to fp32 (kernel ABI). When csv has no bias column, exp_bias1
-    # is already None (default False) and this is a no-op.
-    if exp_bias1 is None:
-        exp_bias1_aiter = None
-        exp_bias2_aiter = None
-    else:
+    # bias dtype convert
+    if (
+        qType == aiter.QuantType.per_1x32
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and (WQDType == dtypes.fp4x2)
+    ):  # a16w4
         exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
         exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
+    elif (
+        qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2
+    ):  # a16wi4: no bias
+        exp_bias1_aiter = exp_bias1 = None
+        exp_bias2_aiter = exp_bias2 = None
+    else:
+        exp_bias1_aiter = exp_bias1 = None
+        exp_bias2_aiter = exp_bias2 = None
 
     # pre-shuffle
     w1_scale_aiter = w1_scale
@@ -310,7 +286,6 @@ def test_fmoe(
                 getattr(w1_qt_aiter, "is_shuffled", False)
                 or getattr(w2_qt_aiter, "is_shuffled", False),
                 gateMode,
-                bias=exp_bias1_aiter is not None,
             )
             if metadata.fuse_quant == "fp4":
                 # Fused Swiglu MXFP4 quantizes the f32 activation directly.
@@ -391,12 +366,9 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
-    valid_model_dim = model_dim - hidden_pad
-    out2_ref_check = out2_ref[:, :valid_model_dim]
-    out2_ck_check = out2_ck[:, :valid_model_dim]
     err = checkAllclose(
-        out2_ref_check,
-        out2_ck_check,
+        out2_ref,
+        out2_ck,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
@@ -406,7 +378,7 @@ def test_fmoe(
         sim = 2 * (x * y).sum() / denominator
         return 1 - sim
 
-    logits_diff = calc_diff(out2_ref_check, out2_ck_check)
+    logits_diff = calc_diff(out2_ref, out2_ck)
     if logits_diff > 1e-3:
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
@@ -618,14 +590,7 @@ def _str2enum(s, enum_cls):
 
 
 def _row_to_kwargs(row):
-    def _row_int(name):
-        if name not in row:
-            return 0
-        value = row.get(name)
-        if pd.isna(value) or str(value).strip() == "":
-            return 0
-        return int(value)
-
+    # csv rows store already-effective dims, so pad defaults to 0.
     q_type = _str2enum(row["q_type"], aiter.QuantType)
     aq_dtype = _str2dtype(row["q_dtype_a"])
     wq_dtype = _str2dtype(row["q_dtype_w"])
@@ -647,9 +612,8 @@ def _row_to_kwargs(row):
         WQDType=wq_dtype,
         use_g1u1=dtypes.str2bool(str(row["use_g1u1"])),
         doweight_stage1=dtypes.str2bool(str(row["doweight_stage1"])),
-        hidden_pad=_row_int("hidden_pad"),
-        intermediate_pad=_row_int("intermediate_pad"),
-        bias=dtypes.str2bool(str(row.get("bias", "False"))),
+        hidden_pad=0,
+        intermediate_pad=0,
         preshuffle=True,
     )
 
@@ -803,7 +767,6 @@ def _iter_legacy_cases():
                         aiter.ActivationType.Swiglu,
                         hidden_pad=hidden_pad,
                         intermediate_pad=intermediate_pad,
-                        bias=True,
                     ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
