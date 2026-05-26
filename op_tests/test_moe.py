@@ -4,7 +4,8 @@
 import torch
 from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes, get_gfx
-from aiter.fused_moe import torch_moe, fused_topk
+from aiter import QuantType
+from aiter.fused_moe import torch_moe, fused_topk, fused_moe
 from aiter.fused_moe_bf16_asm import asm_moe
 from aiter.ops.shuffle import shuffle_weight
 from aiter import pertoken_quant
@@ -13,6 +14,12 @@ from aiter import ActivationType
 import argparse
 
 BLOCK_SIZE_M = 32
+
+# _FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+
+# def is_fp8_weight_dtype(dtype) -> bool:
+#     return dtype in _FP8_WEIGHT_DTYPES
 
 
 def permute_weight_a(x: torch.Tensor) -> torch.Tensor:
@@ -88,6 +95,32 @@ def asm_moe_test(
         None,
         None,
         activation,
+    )
+
+
+@perftest()
+def fused_moe_test(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    fc1_scale=None,
+    fc2_scale=None,
+    activation=ActivationType.Silu,
+    quant_type=QuantType.per_Token,
+):
+    return fused_moe(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        w1_scale=fc1_scale,
+        w2_scale=fc2_scale,
+        quant_type=quant_type,
+        activation=activation,
+        doweight_stage1=False,
     )
 
 
@@ -258,6 +291,25 @@ def test_fmoe(
             activation=activation,
         )
 
+        out_ck = None
+        avg_ck = None
+        #if not use_int4 and is_fp8_weight_dtype(w1b.dtype):
+        # force use ptpc kernel for fp8 weight
+        if w1b.dtype == torch.float8_e4m3fnuz:
+            print("[info] force use fused_moe kernel for fp8 weight ")
+            out_ck, avg_ck = fused_moe_test(
+            input,
+            w1b,
+            w2b,
+            topk_weights,
+            topk_ids,
+            fc1_scale,
+            fc2_scale,
+                activation=activation,
+                quant_type=QuantType.per_Token,
+            )
+      
+
         def calculateTensorsSize(*args):
             num_btype = 0
             for el in args:
@@ -313,8 +365,26 @@ def test_fmoe(
                 msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
                 checkAllclose(ref2, out_b2, atol=100, msg=msg)
 
-        msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
-        checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
+        if avg_ck is not None:
+            msg = (
+                f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, "
+                f"{E=}, {shared_E=}, {topk=}, dtype: {dtype}, "
+                f"torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us, "
+                f"ck_avg: {avg_ck:>8.2f} us, asm/torch uplift: {avg_c/avg_b-1:.1%}, "
+                f"ck/torch uplift: {avg_c/avg_ck-1:.1%}, asm/ck: {avg_ck/avg_b-1:.1%}"
+            )
+            checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg + " [asm vs torch]")
+            checkAllclose(
+                ref2, out_ck, rtol=0.01, atol=100, msg=msg + " [ck fused_moe vs torch]"
+            )
+        else:
+            msg = (
+                f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, "
+                f"{E=}, {shared_E=}, {topk=}, dtype: {dtype}, "
+                f"torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... "
+                f"uplift: {avg_c/avg_b-1:.1%}"
+            )
+            checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
 
 
 parser = argparse.ArgumentParser(
