@@ -27,6 +27,7 @@ env:
   AITER_TEST: "op_tests"
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
   AITER_PREBUILD_MAX_JOBS: "96"
+  TRITON_WHEEL_ARTIFACT_NAME: triton_wheelhouse
 
 jobs:
   check-signal:
@@ -261,12 +262,6 @@ jobs:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     needs: check-signal
-    outputs:
-      artifact_name: ${{ steps.resolve_triton_wheel.outputs.artifact_name }}
-      artifact_run_id: ${{ steps.resolve_triton_wheel.outputs.artifact_run_id }}
-    permissions:
-      actions: read
-      contents: read
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
     steps:
@@ -284,17 +279,11 @@ jobs:
             ${{ env.DOCKER_IMAGE }} \
             bash ./.github/scripts/download_triton_wheel.sh triton_wheels
 
-      - name: Resolve Triton wheel artifact
-        id: resolve_triton_wheel
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash ./.github/scripts/resolve_triton_wheel_artifact.sh triton_wheels
-
       - name: Upload Triton wheel artifact
-        if: ${{ steps.resolve_triton_wheel.outputs.upload_artifact == 'true' }}
+        if: ${{ steps.download_triton_wheel.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.resolve_triton_wheel.outputs.artifact_name }}
+          name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels/
           retention-days: 3
 
@@ -304,9 +293,6 @@ jobs:
       github.event.action != 'labeled'
     name: Standard Tests (1 GPU)
     needs: [build_aiter_wheels, split_aiter_tests, prepare_triton_wheel]
-    permissions:
-      actions: read
-      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -384,10 +370,8 @@ jobs:
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          name: ${{ needs.prepare_triton_wheel.outputs.artifact_name }}
+          name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
-          github-token: ${{ github.token }}
-          run-id: ${{ needs.prepare_triton_wheel.outputs.artifact_run_id }}
 
       - name: Docker login
         if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
