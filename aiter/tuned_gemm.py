@@ -451,10 +451,8 @@ def flydsl_gemm(
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
-    flydsl_config = (
-        aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
-            config["kernelName"]
-        )
+    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+        config["kernelName"]
     )
     stages = flydsl_config.get("stages", flydsl_config.get("stage", 2))
     fused_bias = None
