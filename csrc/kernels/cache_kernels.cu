@@ -2706,6 +2706,7 @@ namespace aiter {
 //            6D physical buffer (N, H, L, 2, B, D). Innermost head_dim must be
 //            contiguous; per-head and per-block strides typically embed the
 //            cross-layer factor (2 * num_layers).
+void reshape_and_cache_flash(
     torch::Tensor& key,          // [num_tokens, num_heads, head_size]
     torch::Tensor& value,        // [num_tokens, num_heads, head_size]
     torch::Tensor& key_cache,    // packed:      [num_blocks, block_size, num_heads, head_size]
