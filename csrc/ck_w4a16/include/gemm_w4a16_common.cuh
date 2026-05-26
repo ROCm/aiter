@@ -141,6 +141,20 @@ enum class TileConfigKind : int {
   // packed buffer in the `in_s` (scale) slot and leave `scaled_zp` as nullptr
   // — the runtime dispatch enforces this (see gemm_w4a16.cu).
   Baseline_PackedSb = 10,
+  // AIESW-32735 W2-reset: LDS bank-conflict-mitigation experiments. The W2.P2
+  // PMC probe measured LDSBankConflict=47.4 % on Baseline (tile_config=0).
+  // CK ships two mitigations in
+  // gridwise_ab_transfer_thread_tiles.hpp::GetBlockDescriptor: (a) +1 N-row
+  // padding gated by ABlockLdsExtraM / BBlockLdsExtraN (the existing Baseline
+  // has both ON — pad branch); (b) make_xor_with_modulo_transform on the
+  // (N, BK0*MNLdsLayer) dims, hit when the flags are OFF. These three new
+  // tile configs flip the flags so the XOR branch is exercised on B-only,
+  // A-only, or both. Same tile/pipeline as Baseline (M=128 N=128 K=32 MRep=4
+  // NRep=2 BlockSize=256 Interwave v1, DequantPack8WithZp). See
+  // notes/ck_layout_tuning/W2_xor_swizzle_design.md for the analysis.
+  Baseline_NoBPad  = 11,  // BBlockLdsExtraN=false → XOR on B side
+  Baseline_NoAPad  = 12,  // ABlockLdsExtraM=false → XOR on A side
+  Baseline_NoABPad = 13,  // both flags false → XOR on both sides
 };
 
 // Supported per-group scale-block-K values. ScaleBlockK == KPerBlock (32) gives
@@ -234,6 +248,55 @@ struct DeviceGemmInstanceImpl;
         S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,                                              \
         S<_BCLUSTER_K_, _BCLUSTER_N_, 1>,                                                   \
         S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,                                              \
+        1, 1,                                                                               \
+        S<1, 32, 1, _CSHUF_N_>, 8,                                                          \
+        ck::BlockGemmPipelineScheduler::_PIPE_SCHED_,                                       \
+        ck::BlockGemmPipelineVersion::_PIPE_VER_,                                           \
+        T, T,                                                                               \
+        PermuteA, PermuteB,                                                                 \
+        BDequantOp>;                                                                        \
+  }
+
+// AIESW-32735 W2-reset: variant of _CK_W4A16_DEFINE_TILE_FULL_DEQ that exposes
+// the ABlockLdsExtraM / BBlockLdsExtraN flags. The default macro hardcodes
+// both to `true` (pad branch in GetBlockDescriptor). Setting either to false
+// routes that side through the make_xor_with_modulo_transform branch. Used
+// only by the Baseline_NoBPad / Baseline_NoAPad / Baseline_NoABPad tile
+// configs; all other tiles keep the existing pad-on behavior via the
+// non-LDS variant.
+#define _CK_W4A16_DEFINE_TILE_FULL_DEQ_LDS(_TILE_KIND_,                                     \
+                                           _BLOCKSIZE_,                                     \
+                                           _MPB_, _NPB_, _KPB_,                             \
+                                           _MREP_, _NREP_,                                  \
+                                           _ACLUSTER_K_, _ACLUSTER_M_,                      \
+                                           _BCLUSTER_K_, _BCLUSTER_N_,                      \
+                                           _CSHUF_N_,                                       \
+                                           _PIPE_SCHED_, _PIPE_VER_,                        \
+                                           _DEQ_OP_,                                        \
+                                           _A_LDS_EXTRA_M_, _B_LDS_EXTRA_N_)                \
+  template <typename T, ck::index_t ScaleBlockK>                                            \
+  struct DeviceGemmInstanceImpl<T, ScaleBlockK,                                             \
+                                false,                                                      \
+                                _TILE_KIND_> {                                              \
+    static constexpr ck::index_t kMPerBlock = _MPB_;                                        \
+    static constexpr ck::index_t kNPerBlock = _NPB_;                                        \
+    static constexpr ck::index_t kKPerBlock = _KPB_;                                        \
+    using BDequantOp = _DEQ_OP_;                                                            \
+    using type = ck::tensor_operation::device::DeviceGemm_BScale_Wmma_CShuffleV3<           \
+        ALayout, BLayout, CLayout,                                                          \
+        T, BDataType, T, T, AccDataType, T,                                                 \
+        PassThrough, PassThrough, PassThrough,                                              \
+        GemmDefault,                                                                        \
+        _BLOCKSIZE_,                                                                        \
+        Scale_Block_N, ScaleBlockK,                                                         \
+        _MPB_, _NPB_, _KPB_,                                                                \
+        8, 8,                                                                               \
+        16, 16,                                                                             \
+        _MREP_, _NREP_,                                                                     \
+        S<_ACLUSTER_K_, _ACLUSTER_M_, 1>,                                                   \
+        S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, _A_LDS_EXTRA_M_,                                   \
+        S<_BCLUSTER_K_, _BCLUSTER_N_, 1>,                                                   \
+        S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, _B_LDS_EXTRA_N_,                                   \
         1, 1,                                                                               \
         S<1, 32, 1, _CSHUF_N_>, 8,                                                          \
         ck::BlockGemmPipelineScheduler::_PIPE_SCHED_,                                       \
@@ -415,9 +478,45 @@ struct DeviceGemmInstanceImpl<T, ScaleBlockK, false, TileConfigKind::Baseline_Pa
       BDequantOp>;
 };
 
+// AIESW-32735 W2-reset: bank-conflict-mitigation A/B variants. All three
+// match Baseline (M=128 N=128 K=32 MRep=4 NRep=2 BlockSize=256 Interwave v1,
+// DequantPack8WithZp). The only difference is the (ABlockLdsExtraM,
+// BBlockLdsExtraN) pair, which selects between CK's pad branch (true) and
+// XOR branch (false) in GetBlockDescriptor. The Baseline already has both
+// flags = true → pad branch on both A and B; the 47.4 % LDSBankConflict
+// measured in W2.P2 motivates exercising the XOR branch instead.
+_CK_W4A16_DEFINE_TILE_FULL_DEQ_LDS(TileConfigKind::Baseline_NoBPad,
+                                   256,
+                                   128, 128, 32, 4, 2,
+                                   4, 64, 4, 64,
+                                   8,
+                                   Interwave, v1,
+                                   DequantPack8WithZp,
+                                   /*A_LDS_EXTRA_M=*/true,
+                                   /*B_LDS_EXTRA_N=*/false);
+_CK_W4A16_DEFINE_TILE_FULL_DEQ_LDS(TileConfigKind::Baseline_NoAPad,
+                                   256,
+                                   128, 128, 32, 4, 2,
+                                   4, 64, 4, 64,
+                                   8,
+                                   Interwave, v1,
+                                   DequantPack8WithZp,
+                                   /*A_LDS_EXTRA_M=*/false,
+                                   /*B_LDS_EXTRA_N=*/true);
+_CK_W4A16_DEFINE_TILE_FULL_DEQ_LDS(TileConfigKind::Baseline_NoABPad,
+                                   256,
+                                   128, 128, 32, 4, 2,
+                                   4, 64, 4, 64,
+                                   8,
+                                   Interwave, v1,
+                                   DequantPack8WithZp,
+                                   /*A_LDS_EXTRA_M=*/false,
+                                   /*B_LDS_EXTRA_N=*/false);
+
 #undef _CK_W4A16_DEFINE_TILE
 #undef _CK_W4A16_DEFINE_TILE_FULL
 #undef _CK_W4A16_DEFINE_TILE_FULL_DEQ
+#undef _CK_W4A16_DEFINE_TILE_FULL_DEQ_LDS
 
 // PreDequantToLDS = true : pre-dequant-to-LDS variant. Currently uses the
 // same CK device-op as the false specialization so the template machinery

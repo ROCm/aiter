@@ -192,6 +192,18 @@ inline void run_kernel(const at::Tensor& in_a,
         _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
                                       ck_w4a16::TileConfigKind::Baseline_PackedSb); \
         break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_NoBPad:                          \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_NoBPad); \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_NoAPad:                          \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_NoAPad); \
+        break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_NoABPad:                         \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_NoABPad); \
+        break;                                                                 \
       default:                                                                 \
         TORCH_CHECK(false,                                                     \
                     "CK W4A16 b_scale GEMM: unsupported tile_config_kind=",    \
@@ -199,7 +211,9 @@ inline void run_kernel(const at::Tensor& in_a,
                     " (valid: 0=Baseline, 1=WideM, 2=LargeK, "                 \
                     "3=WideM_LargeK, 4=Tile64, 5=Tile64_LargeK, "              \
                     "6=NarrowN, 7=Baseline_Sym_V1, 8=Baseline_Sym_V3, "        \
-                    "9=Baseline_Bias, 10=Baseline_PackedSb)");                 \
+                    "9=Baseline_Bias, 10=Baseline_PackedSb, "                  \
+                    "11=Baseline_NoBPad, 12=Baseline_NoAPad, "                 \
+                    "13=Baseline_NoABPad)");                                   \
     }                                                                          \
   } while (0)
 
