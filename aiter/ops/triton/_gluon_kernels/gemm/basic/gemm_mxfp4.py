@@ -370,18 +370,16 @@ def gemm_mxfp4_preshuffle_gfx1250(
     # =====================================================================
     # Store output
     # =====================================================================
-    # C store: build the offset tensor in the accumulator's own layout so
-    # buffer_store doesn't have to convert between layouts. Using
-    # SliceLayout(axis, wmma_acc_layout) keeps offs_c aligned with the
-    # accumulator's distribution.
-    offs_cm = tile_m * BLOCK_SIZE_M + gl.arange(
-        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_acc_layout)
+    c_ptr_tile = (
+        c_ptr + tile_m * BLOCK_SIZE_M * stride_c_m + tile_n * BLOCK_SIZE_N * stride_c_n
     )
-    offs_cn = tile_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_acc_layout)
-    )
+
+    offs_cm = gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_acc_layout))
+    offs_cn = gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_acc_layout))
     offs_c = stride_c_m * offs_cm[:, None] + stride_c_n * offs_cn[None, :]
-    mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    gl.amd.gfx1250.buffer_store(
-        acc.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
+    
+    mask_c = (tile_m * BLOCK_SIZE_M + offs_cm[:, None] < M) & (
+        tile_n * BLOCK_SIZE_N + offs_cn[None, :] < N
     )
+    
+    gl.store(c_ptr_tile + offs_c, acc.to(c_ptr.type.element_ty), mask=mask_c)
