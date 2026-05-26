@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$(command -v python3 || command -v python)"
 OUTPUT="${1:-${SCRIPT_DIR}/bench_qh32_vs_qh16fold_results.txt}"
 
-BATCH_SIZES=(1 4 16 32 64 128)
+BATCH_SIZES=(1 4 16 32 64 128 256 512 1024)
 CTX_LENS=(2048 8192 32768)
 
 run_sweep() {
