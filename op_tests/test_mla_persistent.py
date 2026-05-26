@@ -1176,7 +1176,7 @@ def test_mla(
         _kv_lens = kv_indptr[1:] - kv_indptr[:-1]
         _kv_ip_exp = torch.cat([
             torch.zeros(1, dtype=kv_indptr.dtype),
-            torch.cumsum(_kv_lens.repeat_interleave(_ff), 0),
+            torch.cumsum(_kv_lens.repeat_interleave(_ff), 0).to(kv_indptr.dtype),
         ])
         _kv_lpl_exp = kv_last_page_lens.repeat_interleave(_ff)
         _kv_idx_exp = torch.cat([
