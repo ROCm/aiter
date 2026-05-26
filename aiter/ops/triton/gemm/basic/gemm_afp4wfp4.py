@@ -462,6 +462,59 @@ def gemm_afp4wfp4_preshuffle(
     if config is None:
         config, _ = _get_config(M, N, K_cfg, True)
 
+    config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
+    if M < 32:
+        assert (
+            config["BLOCK_SIZE_M"] <= 16
+        ), "for M < 32, BLOCK_SIZE_M must be 16 or less as x_scale are assumed to be un-shuffled"
+    else:
+        assert (
+            config["BLOCK_SIZE_M"] >= 32
+        ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
+
+    grid = lambda META: (  # noqa: E731
+        (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])),
+    )
+
+    if use_gluon:
+        # gluon path does not support splitk; config has no NUM_KSPLIT / SPLITK_BLOCK_SIZE
+        if y is None:
+            y = torch.empty((M, N), dtype=dtype, device=x_fp4.device)
+
+        layouts = get_gemm_afp4wfp4_preshuffle_layouts(
+            config["num_warps"],
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+        )
+
+        # Kernel consumes preshuffled scales directly (address math inverts the shuffle in registers)
+        assert M >= 32, "gluon mxfp4 preshuffle path requires M >= 32"
+        _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
+            x_fp4,
+            w_preshuf,
+            y,
+            x_scales,
+            w_scales,
+            M,
+            N,
+            K_elems,
+            x_fp4.stride(0),
+            x_fp4.stride(1),
+            w_preshuf.stride(0),
+            w_preshuf.stride(1),
+            y.stride(0),
+            y.stride(-2),
+            y.stride(-1),
+            x_scales.stride(0),
+            x_scales.stride(1),
+            w_scales.stride(0),
+            w_scales.stride(1),
+            **config,
+            **layouts,
+        )
+        return y
+
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K_elems, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
@@ -492,71 +545,9 @@ def gemm_afp4wfp4_preshuffle(
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(K_elems)
         config["SPLITK_BLOCK_SIZE"] = K_elems
 
-    config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
-    if M < 32:
-        assert (
-            config["BLOCK_SIZE_M"] <= 16
-        ), "for M < 32, BLOCK_SIZE_M must be 16 or less as x_scale are assumed to be un-shuffled"
-    else:
-        assert (
-            config["BLOCK_SIZE_M"] >= 32
-        ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
-
-    grid = lambda META: (  # noqa: E731
-        (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])),
-    )
-
     M_POW2 = triton.next_power_of_2(M)
     if M < 32 and M_POW2 > 16:
         M_POW2 = 16
-
-    if use_gluon:
-        layouts = get_gemm_afp4wfp4_preshuffle_layouts(
-            config["num_warps"],
-            config["BLOCK_SIZE_M"],
-            config["BLOCK_SIZE_N"],
-            config["BLOCK_SIZE_K"],
-        )
-
-        _DROP_KEYS = (
-            "NUM_KSPLIT",
-            "SPLITK_BLOCK_SIZE",
-            "SPLITK_BLOCK",
-            "GROUP_SIZE_M",
-            "num_stages",
-            "waves_per_eu",
-            "matrix_instr_nonkdim",
-            "cache_modifier",
-        )
-        kernel_config = {k: v for k, v in config.items() if k not in _DROP_KEYS}
-        # Kernel consumes preshuffled scales directly (address math inverts the shuffle in registers)
-        assert M >= 32, "gluon mxfp4 preshuffle path requires M >= 32"
-        x_scales = x_scales.contiguous()
-        w_scales = w_scales.contiguous()
-        _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
-            x_fp4,
-            w_preshuf,
-            y,
-            x_scales,
-            w_scales,
-            M,
-            N,
-            K_elems,
-            x_fp4.stride(0),
-            x_fp4.stride(1),
-            w_preshuf.stride(0),
-            w_preshuf.stride(1),
-            0 if config["NUM_KSPLIT"] == 1 else y.stride(0),
-            y.stride(-2),
-            y.stride(-1),
-            x_scales.stride(0),
-            x_scales.stride(1),
-            w_scales.stride(0),
-            w_scales.stride(1),
-            **kernel_config,
-            **layouts,
-        )
-        return y
 
     _triton_gemm_afp4wfp4_preshuffle_kernel[grid](
         x_fp4,
