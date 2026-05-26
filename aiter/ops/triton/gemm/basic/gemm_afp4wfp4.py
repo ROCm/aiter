@@ -13,11 +13,6 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
     _gemm_afp4wfp4_kernel_preshuffle_scales as _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
     _get_config,
 )
-from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import (
-    gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
-    get_gemm_afp4wfp4_preshuffle_layouts,
-)
-
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
@@ -472,14 +467,26 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_M"] >= 32
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
-    grid = lambda META: (  # noqa: E731
-        (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])),
-    )
-
     if use_gluon:
+        from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import (
+            gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
+            get_gemm_afp4wfp4_preshuffle_layouts,
+        )
+
+        grid = lambda META: (  # noqa: E731
+            (
+                triton.cdiv(M, META["BLOCK_SIZE_M"])
+                * triton.cdiv(N, META["BLOCK_SIZE_N"])
+            ),
+        )
         # gluon path does not support splitk; config has no NUM_KSPLIT / SPLITK_BLOCK_SIZE
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x_fp4.device)
+
+        # Clamp NUM_BUFFERS so  prologue never advances TDM descriptors past the end of K when k_tiles < NUM_BUFFERS (BLOCK_K_BYTES = BLOCK_SIZE_K // 2)
+        BLOCK_K_BYTES = config["BLOCK_SIZE_K"] // 2
+        k_tiles = triton.cdiv(K_bytes, BLOCK_K_BYTES)
+        config["NUM_BUFFERS"] = min(config["NUM_BUFFERS"], k_tiles)
 
         layouts = get_gemm_afp4wfp4_preshuffle_layouts(
             config["num_warps"],
@@ -548,6 +555,14 @@ def gemm_afp4wfp4_preshuffle(
     M_POW2 = triton.next_power_of_2(M)
     if M < 32 and M_POW2 > 16:
         M_POW2 = 16
+
+    grid = lambda META: (
+        (
+            META["NUM_KSPLIT"]
+            * triton.cdiv(M, META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+        ),
+    )
 
     _triton_gemm_afp4wfp4_preshuffle_kernel[grid](
         x_fp4,
