@@ -103,9 +103,7 @@ def reshape_and_cache(
     )
     from .triton.kv_cache import reshape_and_cache as _reshape_and_cache_triton
 
-    return _reshape_and_cache_triton(
-        key, value, key_cache, value_cache, slot_mapping
-    )
+    return _reshape_and_cache_triton(key, value, key_cache, value_cache, slot_mapping)
 
 
 @compile_ops("module_cache", develop=True)
