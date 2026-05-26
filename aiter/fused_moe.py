@@ -505,6 +505,41 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             frame = inspect.stack()[stacklevel]
             print(f"[grouped-gemm-debug] {frame.filename}:{frame.lineno} {msg}", flush=True)
 
+    def _fmt(v):
+        if isinstance(v, torch.Tensor):
+            return f"Tensor(shape={tuple(v.shape)}, dtype={v.dtype})"
+        return repr(v)
+
+    _grouped_dbg(
+        "inputs: "
+        + ", ".join(
+            f"{k}={_fmt(v)}"
+            for k, v in [
+                ("hidden_states", hidden_states),
+                ("w1", w1),
+                ("w2", w2),
+                ("topk_weight", topk_weight),
+                ("topk_ids", topk_ids),
+                ("E", E),
+                ("model_dim", model_dim),
+                ("inter_dim", inter_dim),
+                ("dtype", dtype),
+                ("activation", activation),
+                ("quant_type", quant_type),
+                ("q_dtype_a", q_dtype_a),
+                ("q_dtype_w", q_dtype_w),
+                ("isG1U1", isG1U1),
+                ("doweight_stage1", doweight_stage1),
+                ("w1_scale", w1_scale),
+                ("w2_scale", w2_scale),
+                ("expert_mask", expert_mask),
+                ("hidden_pad", hidden_pad),
+                ("intermediate_pad", intermediate_pad),
+                ("bias1", bias1),
+                ("bias2", bias2),
+            ]
+        )
+    )
     _grouped_dbg("enter grouped helper")
     # Master opt-in switch: only enter the gfx1250 FlyDSL grouped-GEMM mode
     # when AITER_USE_GROUPED_GEMM is explicitly enabled. The legacy
@@ -514,15 +549,20 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("AITER_USE_GROUPED_GEMM not enabled; skip grouped mode")
         return None
     if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
+        _grouped_dbg("AITER_DISABLE_GROUPED_A8W4 enabled; skip grouped mode")
         return None
     os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "default"
     if expert_mask is not None or bias1 is not None or bias2 is not None:
-        return None
+        _grouped_dbg("bias1 and bias not none")
+        # return None
     if hidden_pad != 0 or intermediate_pad != 0:
+        _grouped_dbg("haspad")
         return None
     if not isG1U1 or quant_type != QuantType.per_1x32:
+        _grouped_dbg("not g1u1 or not 1x32")
         return None
     if activation not in (ActivationType.Silu, ActivationType.Swiglu):
+        _grouped_dbg("not silu or not swiglu")
         return None
     is_grouped_a4w4 = q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2
     is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and (q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8)
