@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 #include <memory>
 #include <unordered_map>
+#include <cstdlib>
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -329,8 +330,17 @@ void mla_decode_stage1_asm_fwd(
                 config_max_seqlen_q = 2;
                 sub_Q = 128;
             } else if((max_seqlen_q == 1) && persistent){
-                config_max_seqlen_q = 1;
-                sub_Q = 32;
+                // MLA_FORCE_QH16_FOLD=1: redirect to qh16 kernel for A/B benchmarking.
+                // mla.py still folds/unfolds nhead=32→16 transparently.
+                const char* force_fold = std::getenv("MLA_FORCE_QH16_FOLD");
+                if(force_fold && force_fold[0] == '1'){
+                    config_gqa_ratio = 16;
+                    config_max_seqlen_q = 1;
+                    sub_Q = 64;
+                } else {
+                    config_max_seqlen_q = 1;
+                    sub_Q = 32;
+                }
             } else {
                 AITER_CHECK(false, __func__,
                     ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=1,2,4 in persistent mode");
