@@ -19,8 +19,28 @@ def copy_blocks(
 ) -> None: ...
 
 
+# Arches where the prebuilt HIP CK module 'module_cache' ships matching
+# code objects. On any other arch (e.g. gfx1201 RDNA4 in
+# rocm/atom-dev:latest) the HIP kernel launch SIGSEGVs with no catchable
+# exception, so we must allowlist arches BEFORE calling the HIP path.
+# Update when the prebuilt distribution adds support. Same set + same
+# rationale as aiter.ops.gemm_op_a8w8._BLOCKSCALE_HIP_PREBUILT_ARCHES.
+_CACHE_HIP_PREBUILT_ARCHES = frozenset({"gfx940", "gfx941", "gfx942", "gfx950"})
+
+
+def _hip_cache_supported() -> bool:
+    """True when the prebuilt 'module_cache' has a code object for the
+    running device. False -> fall back to the triton variant."""
+    try:
+        from ..jit.utils.chip_info import get_gfx_runtime
+
+        return get_gfx_runtime() in _CACHE_HIP_PREBUILT_ARCHES
+    except Exception:
+        return False
+
+
 @compile_ops("module_cache", develop=True)
-def reshape_and_cache(
+def _reshape_and_cache_ck(
     key: torch.Tensor,
     value: torch.Tensor,
     key_cache: torch.Tensor,
@@ -31,6 +51,61 @@ def reshape_and_cache(
     v_scale: Optional[torch.Tensor] = None,
     asm_layout: bool = False,
 ) -> None: ...
+
+
+def reshape_and_cache(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+    asm_layout: bool = False,
+) -> None:
+    """Scatter (key, value) tokens into a paged KV cache.
+
+    On arches with a prebuilt HIP CK code object for module_cache
+    (gfx94x / gfx95x), dispatches to the CK kernel. On other arches
+    (e.g. gfx1201 RDNA4) falls back to
+    aiter.ops.triton.kv_cache.reshape_and_cache, which JIT-compiles for
+    any arch.
+
+    HND layout is used in both paths
+    ([num_blocks, num_kv_heads, block_size, head_dim]).
+
+    Triton-fallback constraints:
+      - k_scale / v_scale must be None (FP8 KV scales not yet supported
+        by the triton path)
+      - asm_layout must be False (CDNA-specific layout)
+    """
+    if _hip_cache_supported():
+        return _reshape_and_cache_ck(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            asm_layout,
+        )
+    # Triton fallback for non-CDNA archs.
+    assert k_scale is None and v_scale is None, (
+        "reshape_and_cache triton fallback does not yet support FP8 KV "
+        "cache scales (k_scale / v_scale must be None)"
+    )
+    assert not asm_layout, (
+        "reshape_and_cache triton fallback does not support asm_layout "
+        "(CDNA-specific cache layout)"
+    )
+    from .triton.kv_cache import reshape_and_cache as _reshape_and_cache_triton
+
+    return _reshape_and_cache_triton(
+        key, value, key_cache, value_cache, slot_mapping
+    )
 
 
 @compile_ops("module_cache", develop=True)
