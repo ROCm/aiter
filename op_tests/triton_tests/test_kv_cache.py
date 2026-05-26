@@ -120,6 +120,8 @@ def test_fused_qk_rope_cat_and_cache_mla(
         )
 
     torch.testing.assert_close(torch_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
+
+
 import pytest
 import torch
 
