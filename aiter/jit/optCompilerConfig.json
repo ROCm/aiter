@@ -87,6 +87,8 @@
             "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_mask_gqa8_local.cpp'",
             "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_mask_gqa8_bs32_narrow_local.cpp'",
             "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_mask_gqa8_bs32_narrow_local.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_mask_gqa8_bs32_decode_t_local.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_mask_gqa8_bs32_decode_t_local.cpp'",
             "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_mask_gqa8_bs32_decode_local.cpp'",
             "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_mask_gqa8_bs32_decode_local.cpp'"
         ],
