@@ -1,0 +1,899 @@
+rocprofiler-sdk:
+  counters-schema-version: 1
+  counters:
+  - name: TCC_HIT[0]
+    description: TCC_HIT on 0th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[0]])
+  - name: TCC_HIT[100]
+    description: TCC_HIT on 6th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[4]])
+  - name: TCC_HIT[101]
+    description: TCC_HIT on 6th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[5]])
+  - name: TCC_HIT[102]
+    description: TCC_HIT on 6th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[6]])
+  - name: TCC_HIT[103]
+    description: TCC_HIT on 6th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[7]])
+  - name: TCC_HIT[104]
+    description: TCC_HIT on 6th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[8]])
+  - name: TCC_HIT[105]
+    description: TCC_HIT on 6th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[9]])
+  - name: TCC_HIT[106]
+    description: TCC_HIT on 6th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[10]])
+  - name: TCC_HIT[107]
+    description: TCC_HIT on 6th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[11]])
+  - name: TCC_HIT[108]
+    description: TCC_HIT on 6th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[12]])
+  - name: TCC_HIT[109]
+    description: TCC_HIT on 6th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[13]])
+  - name: TCC_HIT[10]
+    description: TCC_HIT on 0th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[10]])
+  - name: TCC_HIT[110]
+    description: TCC_HIT on 6th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[14]])
+  - name: TCC_HIT[111]
+    description: TCC_HIT on 6th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[15]])
+  - name: TCC_HIT[112]
+    description: TCC_HIT on 7th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[0]])
+  - name: TCC_HIT[113]
+    description: TCC_HIT on 7th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[1]])
+  - name: TCC_HIT[114]
+    description: TCC_HIT on 7th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[2]])
+  - name: TCC_HIT[115]
+    description: TCC_HIT on 7th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[3]])
+  - name: TCC_HIT[116]
+    description: TCC_HIT on 7th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[4]])
+  - name: TCC_HIT[117]
+    description: TCC_HIT on 7th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[5]])
+  - name: TCC_HIT[118]
+    description: TCC_HIT on 7th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[6]])
+  - name: TCC_HIT[119]
+    description: TCC_HIT on 7th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[7]])
+  - name: TCC_HIT[11]
+    description: TCC_HIT on 0th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[11]])
+  - name: TCC_HIT[120]
+    description: TCC_HIT on 7th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[8]])
+  - name: TCC_HIT[121]
+    description: TCC_HIT on 7th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[9]])
+  - name: TCC_HIT[122]
+    description: TCC_HIT on 7th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[10]])
+  - name: TCC_HIT[123]
+    description: TCC_HIT on 7th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[11]])
+  - name: TCC_HIT[124]
+    description: TCC_HIT on 7th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[12]])
+  - name: TCC_HIT[125]
+    description: TCC_HIT on 7th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[13]])
+  - name: TCC_HIT[126]
+    description: TCC_HIT on 7th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[14]])
+  - name: TCC_HIT[127]
+    description: TCC_HIT on 7th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[15]])
+  - name: TCC_HIT[12]
+    description: TCC_HIT on 0th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[12]])
+  - name: TCC_HIT[13]
+    description: TCC_HIT on 0th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[13]])
+  - name: TCC_HIT[14]
+    description: TCC_HIT on 0th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[14]])
+  - name: TCC_HIT[15]
+    description: TCC_HIT on 0th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[15]])
+  - name: TCC_HIT[16]
+    description: TCC_HIT on 1th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[0]])
+  - name: TCC_HIT[17]
+    description: TCC_HIT on 1th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[1]])
+  - name: TCC_HIT[18]
+    description: TCC_HIT on 1th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[2]])
+  - name: TCC_HIT[19]
+    description: TCC_HIT on 1th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[3]])
+  - name: TCC_HIT[1]
+    description: TCC_HIT on 0th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[1]])
+  - name: TCC_HIT[20]
+    description: TCC_HIT on 1th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[4]])
+  - name: TCC_HIT[21]
+    description: TCC_HIT on 1th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[5]])
+  - name: TCC_HIT[22]
+    description: TCC_HIT on 1th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[6]])
+  - name: TCC_HIT[23]
+    description: TCC_HIT on 1th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[7]])
+  - name: TCC_HIT[24]
+    description: TCC_HIT on 1th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[8]])
+  - name: TCC_HIT[25]
+    description: TCC_HIT on 1th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[9]])
+  - name: TCC_HIT[26]
+    description: TCC_HIT on 1th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[10]])
+  - name: TCC_HIT[27]
+    description: TCC_HIT on 1th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[11]])
+  - name: TCC_HIT[28]
+    description: TCC_HIT on 1th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[12]])
+  - name: TCC_HIT[29]
+    description: TCC_HIT on 1th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[13]])
+  - name: TCC_HIT[2]
+    description: TCC_HIT on 0th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[2]])
+  - name: TCC_HIT[30]
+    description: TCC_HIT on 1th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[14]])
+  - name: TCC_HIT[31]
+    description: TCC_HIT on 1th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[15]])
+  - name: TCC_HIT[32]
+    description: TCC_HIT on 2th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[0]])
+  - name: TCC_HIT[33]
+    description: TCC_HIT on 2th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[1]])
+  - name: TCC_HIT[34]
+    description: TCC_HIT on 2th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[2]])
+  - name: TCC_HIT[35]
+    description: TCC_HIT on 2th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[3]])
+  - name: TCC_HIT[36]
+    description: TCC_HIT on 2th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[4]])
+  - name: TCC_HIT[37]
+    description: TCC_HIT on 2th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[5]])
+  - name: TCC_HIT[38]
+    description: TCC_HIT on 2th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[6]])
+  - name: TCC_HIT[39]
+    description: TCC_HIT on 2th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[7]])
+  - name: TCC_HIT[3]
+    description: TCC_HIT on 0th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[3]])
+  - name: TCC_HIT[40]
+    description: TCC_HIT on 2th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[8]])
+  - name: TCC_HIT[41]
+    description: TCC_HIT on 2th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[9]])
+  - name: TCC_HIT[42]
+    description: TCC_HIT on 2th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[10]])
+  - name: TCC_HIT[43]
+    description: TCC_HIT on 2th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[11]])
+  - name: TCC_HIT[44]
+    description: TCC_HIT on 2th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[12]])
+  - name: TCC_HIT[45]
+    description: TCC_HIT on 2th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[13]])
+  - name: TCC_HIT[46]
+    description: TCC_HIT on 2th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[14]])
+  - name: TCC_HIT[47]
+    description: TCC_HIT on 2th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[15]])
+  - name: TCC_HIT[48]
+    description: TCC_HIT on 3th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[0]])
+  - name: TCC_HIT[49]
+    description: TCC_HIT on 3th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[1]])
+  - name: TCC_HIT[4]
+    description: TCC_HIT on 0th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[4]])
+  - name: TCC_HIT[50]
+    description: TCC_HIT on 3th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[2]])
+  - name: TCC_HIT[51]
+    description: TCC_HIT on 3th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[3]])
+  - name: TCC_HIT[52]
+    description: TCC_HIT on 3th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[4]])
+  - name: TCC_HIT[53]
+    description: TCC_HIT on 3th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[5]])
+  - name: TCC_HIT[54]
+    description: TCC_HIT on 3th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[6]])
+  - name: TCC_HIT[55]
+    description: TCC_HIT on 3th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[7]])
+  - name: TCC_HIT[56]
+    description: TCC_HIT on 3th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[8]])
+  - name: TCC_HIT[57]
+    description: TCC_HIT on 3th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[9]])
+  - name: TCC_HIT[58]
+    description: TCC_HIT on 3th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[10]])
+  - name: TCC_HIT[59]
+    description: TCC_HIT on 3th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[11]])
+  - name: TCC_HIT[5]
+    description: TCC_HIT on 0th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[5]])
+  - name: TCC_HIT[60]
+    description: TCC_HIT on 3th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[12]])
+  - name: TCC_HIT[61]
+    description: TCC_HIT on 3th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[13]])
+  - name: TCC_HIT[62]
+    description: TCC_HIT on 3th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[14]])
+  - name: TCC_HIT[63]
+    description: TCC_HIT on 3th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[15]])
+  - name: TCC_HIT[64]
+    description: TCC_HIT on 4th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[0]])
+  - name: TCC_HIT[65]
+    description: TCC_HIT on 4th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[1]])
+  - name: TCC_HIT[66]
+    description: TCC_HIT on 4th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[2]])
+  - name: TCC_HIT[67]
+    description: TCC_HIT on 4th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[3]])
+  - name: TCC_HIT[68]
+    description: TCC_HIT on 4th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[4]])
+  - name: TCC_HIT[69]
+    description: TCC_HIT on 4th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[5]])
+  - name: TCC_HIT[6]
+    description: TCC_HIT on 0th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[6]])
+  - name: TCC_HIT[70]
+    description: TCC_HIT on 4th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[6]])
+  - name: TCC_HIT[71]
+    description: TCC_HIT on 4th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[7]])
+  - name: TCC_HIT[72]
+    description: TCC_HIT on 4th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[8]])
+  - name: TCC_HIT[73]
+    description: TCC_HIT on 4th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[9]])
+  - name: TCC_HIT[74]
+    description: TCC_HIT on 4th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[10]])
+  - name: TCC_HIT[75]
+    description: TCC_HIT on 4th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[11]])
+  - name: TCC_HIT[76]
+    description: TCC_HIT on 4th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[12]])
+  - name: TCC_HIT[77]
+    description: TCC_HIT on 4th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[13]])
+  - name: TCC_HIT[78]
+    description: TCC_HIT on 4th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[14]])
+  - name: TCC_HIT[79]
+    description: TCC_HIT on 4th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[15]])
+  - name: TCC_HIT[7]
+    description: TCC_HIT on 0th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[7]])
+  - name: TCC_HIT[80]
+    description: TCC_HIT on 5th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[0]])
+  - name: TCC_HIT[81]
+    description: TCC_HIT on 5th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[1]])
+  - name: TCC_HIT[82]
+    description: TCC_HIT on 5th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[2]])
+  - name: TCC_HIT[83]
+    description: TCC_HIT on 5th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[3]])
+  - name: TCC_HIT[84]
+    description: TCC_HIT on 5th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[4]])
+  - name: TCC_HIT[85]
+    description: TCC_HIT on 5th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[5]])
+  - name: TCC_HIT[86]
+    description: TCC_HIT on 5th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[6]])
+  - name: TCC_HIT[87]
+    description: TCC_HIT on 5th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[7]])
+  - name: TCC_HIT[88]
+    description: TCC_HIT on 5th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[8]])
+  - name: TCC_HIT[89]
+    description: TCC_HIT on 5th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[9]])
+  - name: TCC_HIT[8]
+    description: TCC_HIT on 0th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[8]])
+  - name: TCC_HIT[90]
+    description: TCC_HIT on 5th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[10]])
+  - name: TCC_HIT[91]
+    description: TCC_HIT on 5th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[11]])
+  - name: TCC_HIT[92]
+    description: TCC_HIT on 5th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[12]])
+  - name: TCC_HIT[93]
+    description: TCC_HIT on 5th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[13]])
+  - name: TCC_HIT[94]
+    description: TCC_HIT on 5th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[14]])
+  - name: TCC_HIT[95]
+    description: TCC_HIT on 5th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[15]])
+  - name: TCC_HIT[96]
+    description: TCC_HIT on 6th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[0]])
+  - name: TCC_HIT[97]
+    description: TCC_HIT on 6th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[1]])
+  - name: TCC_HIT[98]
+    description: TCC_HIT on 6th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[2]])
+  - name: TCC_HIT[99]
+    description: TCC_HIT on 6th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[3]])
+  - name: TCC_HIT[9]
+    description: TCC_HIT on 0th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_HIT,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[9]])

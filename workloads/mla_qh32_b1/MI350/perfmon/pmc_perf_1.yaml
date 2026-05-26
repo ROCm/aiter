@@ -1,0 +1,899 @@
+rocprofiler-sdk:
+  counters-schema-version: 1
+  counters:
+  - name: TCC_EA0_WRREQ[0]
+    description: TCC_EA0_WRREQ on 0th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_WRREQ[100]
+    description: TCC_EA0_WRREQ on 6th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_WRREQ[101]
+    description: TCC_EA0_WRREQ on 6th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_WRREQ[102]
+    description: TCC_EA0_WRREQ on 6th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_WRREQ[103]
+    description: TCC_EA0_WRREQ on 6th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_WRREQ[104]
+    description: TCC_EA0_WRREQ on 6th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_WRREQ[105]
+    description: TCC_EA0_WRREQ on 6th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_WRREQ[106]
+    description: TCC_EA0_WRREQ on 6th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_WRREQ[107]
+    description: TCC_EA0_WRREQ on 6th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_WRREQ[108]
+    description: TCC_EA0_WRREQ on 6th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_WRREQ[109]
+    description: TCC_EA0_WRREQ on 6th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_WRREQ[10]
+    description: TCC_EA0_WRREQ on 0th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_WRREQ[110]
+    description: TCC_EA0_WRREQ on 6th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_WRREQ[111]
+    description: TCC_EA0_WRREQ on 6th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_WRREQ[112]
+    description: TCC_EA0_WRREQ on 7th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_WRREQ[113]
+    description: TCC_EA0_WRREQ on 7th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_WRREQ[114]
+    description: TCC_EA0_WRREQ on 7th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_WRREQ[115]
+    description: TCC_EA0_WRREQ on 7th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_WRREQ[116]
+    description: TCC_EA0_WRREQ on 7th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_WRREQ[117]
+    description: TCC_EA0_WRREQ on 7th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_WRREQ[118]
+    description: TCC_EA0_WRREQ on 7th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_WRREQ[119]
+    description: TCC_EA0_WRREQ on 7th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_WRREQ[11]
+    description: TCC_EA0_WRREQ on 0th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_WRREQ[120]
+    description: TCC_EA0_WRREQ on 7th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_WRREQ[121]
+    description: TCC_EA0_WRREQ on 7th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_WRREQ[122]
+    description: TCC_EA0_WRREQ on 7th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_WRREQ[123]
+    description: TCC_EA0_WRREQ on 7th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_WRREQ[124]
+    description: TCC_EA0_WRREQ on 7th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_WRREQ[125]
+    description: TCC_EA0_WRREQ on 7th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_WRREQ[126]
+    description: TCC_EA0_WRREQ on 7th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_WRREQ[127]
+    description: TCC_EA0_WRREQ on 7th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_WRREQ[12]
+    description: TCC_EA0_WRREQ on 0th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_WRREQ[13]
+    description: TCC_EA0_WRREQ on 0th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_WRREQ[14]
+    description: TCC_EA0_WRREQ on 0th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_WRREQ[15]
+    description: TCC_EA0_WRREQ on 0th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_WRREQ[16]
+    description: TCC_EA0_WRREQ on 1th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_WRREQ[17]
+    description: TCC_EA0_WRREQ on 1th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_WRREQ[18]
+    description: TCC_EA0_WRREQ on 1th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_WRREQ[19]
+    description: TCC_EA0_WRREQ on 1th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_WRREQ[1]
+    description: TCC_EA0_WRREQ on 0th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_WRREQ[20]
+    description: TCC_EA0_WRREQ on 1th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_WRREQ[21]
+    description: TCC_EA0_WRREQ on 1th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_WRREQ[22]
+    description: TCC_EA0_WRREQ on 1th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_WRREQ[23]
+    description: TCC_EA0_WRREQ on 1th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_WRREQ[24]
+    description: TCC_EA0_WRREQ on 1th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_WRREQ[25]
+    description: TCC_EA0_WRREQ on 1th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_WRREQ[26]
+    description: TCC_EA0_WRREQ on 1th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_WRREQ[27]
+    description: TCC_EA0_WRREQ on 1th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_WRREQ[28]
+    description: TCC_EA0_WRREQ on 1th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_WRREQ[29]
+    description: TCC_EA0_WRREQ on 1th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_WRREQ[2]
+    description: TCC_EA0_WRREQ on 0th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_WRREQ[30]
+    description: TCC_EA0_WRREQ on 1th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_WRREQ[31]
+    description: TCC_EA0_WRREQ on 1th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_WRREQ[32]
+    description: TCC_EA0_WRREQ on 2th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_WRREQ[33]
+    description: TCC_EA0_WRREQ on 2th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_WRREQ[34]
+    description: TCC_EA0_WRREQ on 2th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_WRREQ[35]
+    description: TCC_EA0_WRREQ on 2th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_WRREQ[36]
+    description: TCC_EA0_WRREQ on 2th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_WRREQ[37]
+    description: TCC_EA0_WRREQ on 2th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_WRREQ[38]
+    description: TCC_EA0_WRREQ on 2th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_WRREQ[39]
+    description: TCC_EA0_WRREQ on 2th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_WRREQ[3]
+    description: TCC_EA0_WRREQ on 0th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_WRREQ[40]
+    description: TCC_EA0_WRREQ on 2th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_WRREQ[41]
+    description: TCC_EA0_WRREQ on 2th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_WRREQ[42]
+    description: TCC_EA0_WRREQ on 2th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_WRREQ[43]
+    description: TCC_EA0_WRREQ on 2th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_WRREQ[44]
+    description: TCC_EA0_WRREQ on 2th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_WRREQ[45]
+    description: TCC_EA0_WRREQ on 2th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_WRREQ[46]
+    description: TCC_EA0_WRREQ on 2th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_WRREQ[47]
+    description: TCC_EA0_WRREQ on 2th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_WRREQ[48]
+    description: TCC_EA0_WRREQ on 3th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_WRREQ[49]
+    description: TCC_EA0_WRREQ on 3th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_WRREQ[4]
+    description: TCC_EA0_WRREQ on 0th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_WRREQ[50]
+    description: TCC_EA0_WRREQ on 3th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_WRREQ[51]
+    description: TCC_EA0_WRREQ on 3th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_WRREQ[52]
+    description: TCC_EA0_WRREQ on 3th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_WRREQ[53]
+    description: TCC_EA0_WRREQ on 3th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_WRREQ[54]
+    description: TCC_EA0_WRREQ on 3th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_WRREQ[55]
+    description: TCC_EA0_WRREQ on 3th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_WRREQ[56]
+    description: TCC_EA0_WRREQ on 3th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_WRREQ[57]
+    description: TCC_EA0_WRREQ on 3th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_WRREQ[58]
+    description: TCC_EA0_WRREQ on 3th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_WRREQ[59]
+    description: TCC_EA0_WRREQ on 3th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_WRREQ[5]
+    description: TCC_EA0_WRREQ on 0th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_WRREQ[60]
+    description: TCC_EA0_WRREQ on 3th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_WRREQ[61]
+    description: TCC_EA0_WRREQ on 3th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_WRREQ[62]
+    description: TCC_EA0_WRREQ on 3th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_WRREQ[63]
+    description: TCC_EA0_WRREQ on 3th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_WRREQ[64]
+    description: TCC_EA0_WRREQ on 4th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_WRREQ[65]
+    description: TCC_EA0_WRREQ on 4th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_WRREQ[66]
+    description: TCC_EA0_WRREQ on 4th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_WRREQ[67]
+    description: TCC_EA0_WRREQ on 4th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_WRREQ[68]
+    description: TCC_EA0_WRREQ on 4th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_WRREQ[69]
+    description: TCC_EA0_WRREQ on 4th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_WRREQ[6]
+    description: TCC_EA0_WRREQ on 0th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_WRREQ[70]
+    description: TCC_EA0_WRREQ on 4th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_WRREQ[71]
+    description: TCC_EA0_WRREQ on 4th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_WRREQ[72]
+    description: TCC_EA0_WRREQ on 4th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_WRREQ[73]
+    description: TCC_EA0_WRREQ on 4th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_WRREQ[74]
+    description: TCC_EA0_WRREQ on 4th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_WRREQ[75]
+    description: TCC_EA0_WRREQ on 4th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_WRREQ[76]
+    description: TCC_EA0_WRREQ on 4th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_WRREQ[77]
+    description: TCC_EA0_WRREQ on 4th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_WRREQ[78]
+    description: TCC_EA0_WRREQ on 4th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_WRREQ[79]
+    description: TCC_EA0_WRREQ on 4th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_WRREQ[7]
+    description: TCC_EA0_WRREQ on 0th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_WRREQ[80]
+    description: TCC_EA0_WRREQ on 5th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_WRREQ[81]
+    description: TCC_EA0_WRREQ on 5th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_WRREQ[82]
+    description: TCC_EA0_WRREQ on 5th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_WRREQ[83]
+    description: TCC_EA0_WRREQ on 5th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_WRREQ[84]
+    description: TCC_EA0_WRREQ on 5th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_WRREQ[85]
+    description: TCC_EA0_WRREQ on 5th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_WRREQ[86]
+    description: TCC_EA0_WRREQ on 5th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_WRREQ[87]
+    description: TCC_EA0_WRREQ on 5th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_WRREQ[88]
+    description: TCC_EA0_WRREQ on 5th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_WRREQ[89]
+    description: TCC_EA0_WRREQ on 5th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_WRREQ[8]
+    description: TCC_EA0_WRREQ on 0th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_WRREQ[90]
+    description: TCC_EA0_WRREQ on 5th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_WRREQ[91]
+    description: TCC_EA0_WRREQ on 5th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_WRREQ[92]
+    description: TCC_EA0_WRREQ on 5th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_WRREQ[93]
+    description: TCC_EA0_WRREQ on 5th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_WRREQ[94]
+    description: TCC_EA0_WRREQ on 5th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_WRREQ[95]
+    description: TCC_EA0_WRREQ on 5th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_WRREQ[96]
+    description: TCC_EA0_WRREQ on 6th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_WRREQ[97]
+    description: TCC_EA0_WRREQ on 6th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_WRREQ[98]
+    description: TCC_EA0_WRREQ on 6th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_WRREQ[99]
+    description: TCC_EA0_WRREQ on 6th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_WRREQ[9]
+    description: TCC_EA0_WRREQ on 0th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_WRREQ,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[9]])

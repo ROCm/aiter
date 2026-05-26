@@ -1,0 +1,96 @@
+Rocprofiler-Compute version: 3.4.0
+Profiler choice: rocprofiler-sdk
+Path: /home/alyrakis/dev-platform/frameworks/aiter/workloads/mla_qh32_b1/MI350
+Target: MI350
+Command: python op_tests/test_mla_persistent.py --nhead 32,1 --dtype fp8 --kv_dtype fp8 --batchSize 1 --ctxLen 8192
+Kernel Selection: None
+Dispatch Selection: None
+Filtered sections: All
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Collecting Performance Counters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+[Run 1/20][Approximate profiling time left: pending first measurement...]
+[profiling] Current input file: /home/alyrakis/dev-platform/frameworks/aiter/workloads/mla_qh32_b1/MI350/perfmon/SQC_DCACHE_INFLIGHT_LEVEL.txt
+   |-> [rocprofiler-sdk] W20260526 11:30:20.232862 140543420978496 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.132684 sec
+   |-> [rocprofiler-sdk] W20260526 11:30:20.232944 140543420978496 simple_timer.cpp:55] [rocprofv3] 'python op_tests/test_mla_persistent.py --nhead 32,1 --dtype fp8 --kv_dtype fp8 --batchSize 1 --ctxLen 8192' ::     0.000000 sec
+   |-> [rocprofiler-sdk] F20260526 11:30:20.610613 140543420978496 tool.cpp:3294]  :: [/longer_pathname_so_that_rpms_can_support_packaging_the_debug_info_for_all_os_profiles/src/rocm-systems/projects/rocprofiler-sdk/source/lib/rocprofiler-sdk-tool/tool.cpp:3294]
+   |-> [rocprofiler-sdk] rocprofiler_at_intercept_table_registration(api_timestamps_callback, libs, nullptr)
+   |-> [rocprofiler-sdk] 
+   |-> [rocprofiler-sdk] api registration failed with error code 16: Configuration request occurred outside of valid rocprofiler configuration period
+   |-> [rocprofiler-sdk] @     0x7fd2dc03c700  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc03d637  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dbcc9ba4  rocprofiler_configure
+   |-> [rocprofiler-sdk] @     0x7fd2c83380be  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2db0c7ed3  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2c8333413  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2c82fa359  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2c82fa439  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc19871f  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc198824  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc1945b2  _dl_catch_exception
+   |-> [rocprofiler-sdk] @     0x7fd2dc19fd7c  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc19451c  _dl_catch_exception
+   |-> [rocprofiler-sdk] @     0x7fd2dc1a0164  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2db0be1a4  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc19451c  _dl_catch_exception
+   |-> [rocprofiler-sdk] @     0x7fd2dc194669  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2db0bdc83  (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2db0be25f  dlopen
+   |-> [rocprofiler-sdk] @           0x6bc8cc  (unknown)
+   |-> [rocprofiler-sdk] @           0x6a99ca  (unknown)
+   |-> [rocprofiler-sdk] @           0x6a9152  (unknown)
+   |-> [rocprofiler-sdk] @           0x582287  (unknown)
+   |-> [rocprofiler-sdk] @           0x5db532  _PyEval_EvalFrameDefault
+   |-> [rocprofiler-sdk] @           0x54a087  (unknown)
+   |-> [rocprofiler-sdk] @           0x54b903  PyObject_CallMethodObjArgs
+   |-> [rocprofiler-sdk] @           0x5fdd25  PyImport_ImportModuleLevelObject
+   |-> [rocprofiler-sdk] @           0x5dc6de  _PyEval_EvalFrameDefault
+   |-> [rocprofiler-sdk] @           0x5d58bb  PyEval_EvalCode
+   |-> [rocprofiler-sdk] @           0x5d36ac  (unknown)
+   |-> [rocprofiler-sdk] @           0x58206d  (unknown)
+   |-> [rocprofiler-sdk] @           0x5db532  _PyEval_EvalFrameDefault
+   |-> [rocprofiler-sdk] W20260526 11:30:20.619356 140543420978496 tool.cpp:3104] [PPID=15874][PID=15946][TID=15946][rocprofv3_error_signal_handler] rocprofv3 caught signal 6...
+   |-> [rocprofiler-sdk] W20260526 11:30:20.619383 140543420978496 tool.cpp:3127] [PPID=15874][PID=15946][TID=15946][rocprofv3_error_signal_handler] rocprofv3 will wait for 0 children to exit
+   |-> [rocprofiler-sdk] W20260526 11:30:20.619384 140543420978496 tool.cpp:3142] [PPID=15874][PID=15946][TID=15946][rocprofv3_error_signal_handler] rocprofv3 finalizing after signal 6...
+   |-> [rocprofiler-sdk] W20260526 11:30:20.620753 140543420978496 simple_timer.cpp:55] [rocprofv3] output generation ::     0.001072 sec
+   |-> [rocprofiler-sdk] W20260526 11:30:20.620804 140543420978496 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.001236 sec
+   |-> [rocprofiler-sdk] W20260526 11:30:20.620991 140543420978496 tool.cpp:3184] [PPID=15874][PID=15946][TID=15946][rocprofv3_error_signal_handler] rocprofv3 found chained signal handler for 6... executing chained sigaction (SIGINFO)
+   |-> [rocprofiler-sdk] *** Aborted at 1779795020 (unix time) try "date -d @1779795020" if you are using GNU date ***
+   |-> [rocprofiler-sdk] PC: @     0x7fd2db0c4b2c pthread_kill
+   |-> [rocprofiler-sdk] *** SIGABRT (@0x386200003e4a) received by PID 15946 (TID 0x7fd2d0aed540) from PID 15946; stack trace: ***
+   |-> [rocprofiler-sdk] @     0x7fd2db0c7ed3 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc046a20 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dbcccf04 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2db0c7ed3 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dbcc6018 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2db06b330 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2db0c4b2c pthread_kill
+   |-> [rocprofiler-sdk] @     0x7fd2db06b27e gsignal
+   |-> [rocprofiler-sdk] @     0x7fd2db04e8ff abort
+   |-> [rocprofiler-sdk] @     0x7fd2dbcb9065 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc03c700 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc03d637 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dbcc9ba4 rocprofiler_configure
+   |-> [rocprofiler-sdk] @     0x7fd2c83380be (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2db0c7ed3 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2c8333413 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2c82fa359 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2c82fa439 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc19871f (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc198824 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc1945b2 _dl_catch_exception
+   |-> [rocprofiler-sdk] @     0x7fd2dc19fd7c (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc19451c _dl_catch_exception
+   |-> [rocprofiler-sdk] @     0x7fd2dc1a0164 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2db0be1a4 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2dc19451c _dl_catch_exception
+   |-> [rocprofiler-sdk] @     0x7fd2dc194669 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2db0bdc83 (unknown)
+   |-> [rocprofiler-sdk] @     0x7fd2db0be25f dlopen
+   |-> [rocprofiler-sdk] @           0x6bc8cc (unknown)
+   |-> [rocprofiler-sdk] @           0x6a99ca (unknown)
+   |-> [rocprofiler-sdk] @           0x6a9152 (unknown)
+   |-> [rocprofiler-sdk] W20260526 11:30:20.633683 140543420978496 tool.cpp:3104] [PPID=15874][PID=15946][TID=15946][rocprofv3_error_signal_handler] rocprofv3 caught signal 6...
+Profiling execution failed.

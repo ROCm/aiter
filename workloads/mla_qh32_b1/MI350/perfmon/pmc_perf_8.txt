@@ -1,0 +1,5 @@
+pmc: TCC_MISS_sum TCC_NC_REQ_sum TCC_NORMAL_EVICT_sum TCC_NORMAL_WRITEBACK_sum
+
+gpu:
+range:
+kernel:

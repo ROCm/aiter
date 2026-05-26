@@ -1,0 +1,899 @@
+rocprofiler-sdk:
+  counters-schema-version: 1
+  counters:
+  - name: TCC_ATOMIC[0]
+    description: TCC_ATOMIC on 0th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[0]])
+  - name: TCC_ATOMIC[100]
+    description: TCC_ATOMIC on 6th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[4]])
+  - name: TCC_ATOMIC[101]
+    description: TCC_ATOMIC on 6th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[5]])
+  - name: TCC_ATOMIC[102]
+    description: TCC_ATOMIC on 6th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[6]])
+  - name: TCC_ATOMIC[103]
+    description: TCC_ATOMIC on 6th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[7]])
+  - name: TCC_ATOMIC[104]
+    description: TCC_ATOMIC on 6th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[8]])
+  - name: TCC_ATOMIC[105]
+    description: TCC_ATOMIC on 6th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[9]])
+  - name: TCC_ATOMIC[106]
+    description: TCC_ATOMIC on 6th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[10]])
+  - name: TCC_ATOMIC[107]
+    description: TCC_ATOMIC on 6th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[11]])
+  - name: TCC_ATOMIC[108]
+    description: TCC_ATOMIC on 6th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[12]])
+  - name: TCC_ATOMIC[109]
+    description: TCC_ATOMIC on 6th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[13]])
+  - name: TCC_ATOMIC[10]
+    description: TCC_ATOMIC on 0th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[10]])
+  - name: TCC_ATOMIC[110]
+    description: TCC_ATOMIC on 6th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[14]])
+  - name: TCC_ATOMIC[111]
+    description: TCC_ATOMIC on 6th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[15]])
+  - name: TCC_ATOMIC[112]
+    description: TCC_ATOMIC on 7th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[0]])
+  - name: TCC_ATOMIC[113]
+    description: TCC_ATOMIC on 7th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[1]])
+  - name: TCC_ATOMIC[114]
+    description: TCC_ATOMIC on 7th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[2]])
+  - name: TCC_ATOMIC[115]
+    description: TCC_ATOMIC on 7th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[3]])
+  - name: TCC_ATOMIC[116]
+    description: TCC_ATOMIC on 7th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[4]])
+  - name: TCC_ATOMIC[117]
+    description: TCC_ATOMIC on 7th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[5]])
+  - name: TCC_ATOMIC[118]
+    description: TCC_ATOMIC on 7th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[6]])
+  - name: TCC_ATOMIC[119]
+    description: TCC_ATOMIC on 7th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[7]])
+  - name: TCC_ATOMIC[11]
+    description: TCC_ATOMIC on 0th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[11]])
+  - name: TCC_ATOMIC[120]
+    description: TCC_ATOMIC on 7th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[8]])
+  - name: TCC_ATOMIC[121]
+    description: TCC_ATOMIC on 7th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[9]])
+  - name: TCC_ATOMIC[122]
+    description: TCC_ATOMIC on 7th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[10]])
+  - name: TCC_ATOMIC[123]
+    description: TCC_ATOMIC on 7th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[11]])
+  - name: TCC_ATOMIC[124]
+    description: TCC_ATOMIC on 7th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[12]])
+  - name: TCC_ATOMIC[125]
+    description: TCC_ATOMIC on 7th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[13]])
+  - name: TCC_ATOMIC[126]
+    description: TCC_ATOMIC on 7th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[14]])
+  - name: TCC_ATOMIC[127]
+    description: TCC_ATOMIC on 7th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[15]])
+  - name: TCC_ATOMIC[12]
+    description: TCC_ATOMIC on 0th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[12]])
+  - name: TCC_ATOMIC[13]
+    description: TCC_ATOMIC on 0th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[13]])
+  - name: TCC_ATOMIC[14]
+    description: TCC_ATOMIC on 0th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[14]])
+  - name: TCC_ATOMIC[15]
+    description: TCC_ATOMIC on 0th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[15]])
+  - name: TCC_ATOMIC[16]
+    description: TCC_ATOMIC on 1th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[0]])
+  - name: TCC_ATOMIC[17]
+    description: TCC_ATOMIC on 1th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[1]])
+  - name: TCC_ATOMIC[18]
+    description: TCC_ATOMIC on 1th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[2]])
+  - name: TCC_ATOMIC[19]
+    description: TCC_ATOMIC on 1th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[3]])
+  - name: TCC_ATOMIC[1]
+    description: TCC_ATOMIC on 0th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[1]])
+  - name: TCC_ATOMIC[20]
+    description: TCC_ATOMIC on 1th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[4]])
+  - name: TCC_ATOMIC[21]
+    description: TCC_ATOMIC on 1th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[5]])
+  - name: TCC_ATOMIC[22]
+    description: TCC_ATOMIC on 1th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[6]])
+  - name: TCC_ATOMIC[23]
+    description: TCC_ATOMIC on 1th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[7]])
+  - name: TCC_ATOMIC[24]
+    description: TCC_ATOMIC on 1th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[8]])
+  - name: TCC_ATOMIC[25]
+    description: TCC_ATOMIC on 1th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[9]])
+  - name: TCC_ATOMIC[26]
+    description: TCC_ATOMIC on 1th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[10]])
+  - name: TCC_ATOMIC[27]
+    description: TCC_ATOMIC on 1th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[11]])
+  - name: TCC_ATOMIC[28]
+    description: TCC_ATOMIC on 1th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[12]])
+  - name: TCC_ATOMIC[29]
+    description: TCC_ATOMIC on 1th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[13]])
+  - name: TCC_ATOMIC[2]
+    description: TCC_ATOMIC on 0th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[2]])
+  - name: TCC_ATOMIC[30]
+    description: TCC_ATOMIC on 1th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[14]])
+  - name: TCC_ATOMIC[31]
+    description: TCC_ATOMIC on 1th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[15]])
+  - name: TCC_ATOMIC[32]
+    description: TCC_ATOMIC on 2th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[0]])
+  - name: TCC_ATOMIC[33]
+    description: TCC_ATOMIC on 2th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[1]])
+  - name: TCC_ATOMIC[34]
+    description: TCC_ATOMIC on 2th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[2]])
+  - name: TCC_ATOMIC[35]
+    description: TCC_ATOMIC on 2th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[3]])
+  - name: TCC_ATOMIC[36]
+    description: TCC_ATOMIC on 2th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[4]])
+  - name: TCC_ATOMIC[37]
+    description: TCC_ATOMIC on 2th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[5]])
+  - name: TCC_ATOMIC[38]
+    description: TCC_ATOMIC on 2th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[6]])
+  - name: TCC_ATOMIC[39]
+    description: TCC_ATOMIC on 2th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[7]])
+  - name: TCC_ATOMIC[3]
+    description: TCC_ATOMIC on 0th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[3]])
+  - name: TCC_ATOMIC[40]
+    description: TCC_ATOMIC on 2th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[8]])
+  - name: TCC_ATOMIC[41]
+    description: TCC_ATOMIC on 2th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[9]])
+  - name: TCC_ATOMIC[42]
+    description: TCC_ATOMIC on 2th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[10]])
+  - name: TCC_ATOMIC[43]
+    description: TCC_ATOMIC on 2th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[11]])
+  - name: TCC_ATOMIC[44]
+    description: TCC_ATOMIC on 2th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[12]])
+  - name: TCC_ATOMIC[45]
+    description: TCC_ATOMIC on 2th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[13]])
+  - name: TCC_ATOMIC[46]
+    description: TCC_ATOMIC on 2th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[14]])
+  - name: TCC_ATOMIC[47]
+    description: TCC_ATOMIC on 2th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[15]])
+  - name: TCC_ATOMIC[48]
+    description: TCC_ATOMIC on 3th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[0]])
+  - name: TCC_ATOMIC[49]
+    description: TCC_ATOMIC on 3th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[1]])
+  - name: TCC_ATOMIC[4]
+    description: TCC_ATOMIC on 0th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[4]])
+  - name: TCC_ATOMIC[50]
+    description: TCC_ATOMIC on 3th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[2]])
+  - name: TCC_ATOMIC[51]
+    description: TCC_ATOMIC on 3th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[3]])
+  - name: TCC_ATOMIC[52]
+    description: TCC_ATOMIC on 3th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[4]])
+  - name: TCC_ATOMIC[53]
+    description: TCC_ATOMIC on 3th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[5]])
+  - name: TCC_ATOMIC[54]
+    description: TCC_ATOMIC on 3th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[6]])
+  - name: TCC_ATOMIC[55]
+    description: TCC_ATOMIC on 3th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[7]])
+  - name: TCC_ATOMIC[56]
+    description: TCC_ATOMIC on 3th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[8]])
+  - name: TCC_ATOMIC[57]
+    description: TCC_ATOMIC on 3th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[9]])
+  - name: TCC_ATOMIC[58]
+    description: TCC_ATOMIC on 3th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[10]])
+  - name: TCC_ATOMIC[59]
+    description: TCC_ATOMIC on 3th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[11]])
+  - name: TCC_ATOMIC[5]
+    description: TCC_ATOMIC on 0th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[5]])
+  - name: TCC_ATOMIC[60]
+    description: TCC_ATOMIC on 3th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[12]])
+  - name: TCC_ATOMIC[61]
+    description: TCC_ATOMIC on 3th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[13]])
+  - name: TCC_ATOMIC[62]
+    description: TCC_ATOMIC on 3th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[14]])
+  - name: TCC_ATOMIC[63]
+    description: TCC_ATOMIC on 3th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[15]])
+  - name: TCC_ATOMIC[64]
+    description: TCC_ATOMIC on 4th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[0]])
+  - name: TCC_ATOMIC[65]
+    description: TCC_ATOMIC on 4th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[1]])
+  - name: TCC_ATOMIC[66]
+    description: TCC_ATOMIC on 4th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[2]])
+  - name: TCC_ATOMIC[67]
+    description: TCC_ATOMIC on 4th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[3]])
+  - name: TCC_ATOMIC[68]
+    description: TCC_ATOMIC on 4th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[4]])
+  - name: TCC_ATOMIC[69]
+    description: TCC_ATOMIC on 4th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[5]])
+  - name: TCC_ATOMIC[6]
+    description: TCC_ATOMIC on 0th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[6]])
+  - name: TCC_ATOMIC[70]
+    description: TCC_ATOMIC on 4th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[6]])
+  - name: TCC_ATOMIC[71]
+    description: TCC_ATOMIC on 4th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[7]])
+  - name: TCC_ATOMIC[72]
+    description: TCC_ATOMIC on 4th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[8]])
+  - name: TCC_ATOMIC[73]
+    description: TCC_ATOMIC on 4th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[9]])
+  - name: TCC_ATOMIC[74]
+    description: TCC_ATOMIC on 4th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[10]])
+  - name: TCC_ATOMIC[75]
+    description: TCC_ATOMIC on 4th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[11]])
+  - name: TCC_ATOMIC[76]
+    description: TCC_ATOMIC on 4th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[12]])
+  - name: TCC_ATOMIC[77]
+    description: TCC_ATOMIC on 4th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[13]])
+  - name: TCC_ATOMIC[78]
+    description: TCC_ATOMIC on 4th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[14]])
+  - name: TCC_ATOMIC[79]
+    description: TCC_ATOMIC on 4th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[15]])
+  - name: TCC_ATOMIC[7]
+    description: TCC_ATOMIC on 0th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[7]])
+  - name: TCC_ATOMIC[80]
+    description: TCC_ATOMIC on 5th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[0]])
+  - name: TCC_ATOMIC[81]
+    description: TCC_ATOMIC on 5th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[1]])
+  - name: TCC_ATOMIC[82]
+    description: TCC_ATOMIC on 5th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[2]])
+  - name: TCC_ATOMIC[83]
+    description: TCC_ATOMIC on 5th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[3]])
+  - name: TCC_ATOMIC[84]
+    description: TCC_ATOMIC on 5th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[4]])
+  - name: TCC_ATOMIC[85]
+    description: TCC_ATOMIC on 5th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[5]])
+  - name: TCC_ATOMIC[86]
+    description: TCC_ATOMIC on 5th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[6]])
+  - name: TCC_ATOMIC[87]
+    description: TCC_ATOMIC on 5th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[7]])
+  - name: TCC_ATOMIC[88]
+    description: TCC_ATOMIC on 5th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[8]])
+  - name: TCC_ATOMIC[89]
+    description: TCC_ATOMIC on 5th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[9]])
+  - name: TCC_ATOMIC[8]
+    description: TCC_ATOMIC on 0th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[8]])
+  - name: TCC_ATOMIC[90]
+    description: TCC_ATOMIC on 5th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[10]])
+  - name: TCC_ATOMIC[91]
+    description: TCC_ATOMIC on 5th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[11]])
+  - name: TCC_ATOMIC[92]
+    description: TCC_ATOMIC on 5th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[12]])
+  - name: TCC_ATOMIC[93]
+    description: TCC_ATOMIC on 5th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[13]])
+  - name: TCC_ATOMIC[94]
+    description: TCC_ATOMIC on 5th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[14]])
+  - name: TCC_ATOMIC[95]
+    description: TCC_ATOMIC on 5th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[15]])
+  - name: TCC_ATOMIC[96]
+    description: TCC_ATOMIC on 6th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[0]])
+  - name: TCC_ATOMIC[97]
+    description: TCC_ATOMIC on 6th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[1]])
+  - name: TCC_ATOMIC[98]
+    description: TCC_ATOMIC on 6th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[2]])
+  - name: TCC_ATOMIC[99]
+    description: TCC_ATOMIC on 6th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[3]])
+  - name: TCC_ATOMIC[9]
+    description: TCC_ATOMIC on 0th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_ATOMIC,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[9]])

@@ -1,0 +1,39 @@
+attach_duration_msec: null
+attach_pid: null
+config_dir: /opt/rocm-7.2.2/libexec/rocprofiler-compute/rocprof_compute_soc/analysis_configs
+device: 0
+dispatch: null
+filter_blocks: []
+format_rocprof_output: csv
+hip_trace: false
+join_type: grid
+kernel: null
+kernel_names: false
+kokkos_trace: false
+list_available_metrics: false
+list_blocks: null
+list_metrics: null
+list_sets: false
+loglevel: 20
+mem_level: ALL
+mode: profile
+name: mla_qh32_b1
+no_roof: false
+path: /home/alyrakis/dev-platform/frameworks/aiter/workloads/mla_qh32_b1/MI350
+pc_sampling_interval: 1048576
+pc_sampling_method: stochastic
+quiet: false
+remaining: python op_tests/test_mla_persistent.py --nhead 32,1 --dtype fp8 --kv_dtype
+  fp8 --batchSize 1 --ctxLen 8192
+retain_rocpd_output: false
+rocprofiler_sdk_library_path: /opt/rocm/lib/librocprofiler-sdk.so
+roof_only: false
+roofline_data_type:
+- FP32
+set_selected: null
+sort: kernels
+spatial_multiplexing: null
+specs: false
+subpath: gpu_model
+target: null
+verbose: 0

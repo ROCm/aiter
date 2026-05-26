@@ -1,0 +1,899 @@
+rocprofiler-sdk:
+  counters-schema-version: 1
+  counters:
+  - name: TCC_MISS[0]
+    description: TCC_MISS on 0th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[0]])
+  - name: TCC_MISS[100]
+    description: TCC_MISS on 6th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[4]])
+  - name: TCC_MISS[101]
+    description: TCC_MISS on 6th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[5]])
+  - name: TCC_MISS[102]
+    description: TCC_MISS on 6th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[6]])
+  - name: TCC_MISS[103]
+    description: TCC_MISS on 6th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[7]])
+  - name: TCC_MISS[104]
+    description: TCC_MISS on 6th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[8]])
+  - name: TCC_MISS[105]
+    description: TCC_MISS on 6th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[9]])
+  - name: TCC_MISS[106]
+    description: TCC_MISS on 6th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[10]])
+  - name: TCC_MISS[107]
+    description: TCC_MISS on 6th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[11]])
+  - name: TCC_MISS[108]
+    description: TCC_MISS on 6th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[12]])
+  - name: TCC_MISS[109]
+    description: TCC_MISS on 6th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[13]])
+  - name: TCC_MISS[10]
+    description: TCC_MISS on 0th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[10]])
+  - name: TCC_MISS[110]
+    description: TCC_MISS on 6th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[14]])
+  - name: TCC_MISS[111]
+    description: TCC_MISS on 6th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[15]])
+  - name: TCC_MISS[112]
+    description: TCC_MISS on 7th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[0]])
+  - name: TCC_MISS[113]
+    description: TCC_MISS on 7th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[1]])
+  - name: TCC_MISS[114]
+    description: TCC_MISS on 7th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[2]])
+  - name: TCC_MISS[115]
+    description: TCC_MISS on 7th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[3]])
+  - name: TCC_MISS[116]
+    description: TCC_MISS on 7th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[4]])
+  - name: TCC_MISS[117]
+    description: TCC_MISS on 7th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[5]])
+  - name: TCC_MISS[118]
+    description: TCC_MISS on 7th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[6]])
+  - name: TCC_MISS[119]
+    description: TCC_MISS on 7th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[7]])
+  - name: TCC_MISS[11]
+    description: TCC_MISS on 0th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[11]])
+  - name: TCC_MISS[120]
+    description: TCC_MISS on 7th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[8]])
+  - name: TCC_MISS[121]
+    description: TCC_MISS on 7th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[9]])
+  - name: TCC_MISS[122]
+    description: TCC_MISS on 7th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[10]])
+  - name: TCC_MISS[123]
+    description: TCC_MISS on 7th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[11]])
+  - name: TCC_MISS[124]
+    description: TCC_MISS on 7th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[12]])
+  - name: TCC_MISS[125]
+    description: TCC_MISS on 7th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[13]])
+  - name: TCC_MISS[126]
+    description: TCC_MISS on 7th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[14]])
+  - name: TCC_MISS[127]
+    description: TCC_MISS on 7th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[15]])
+  - name: TCC_MISS[12]
+    description: TCC_MISS on 0th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[12]])
+  - name: TCC_MISS[13]
+    description: TCC_MISS on 0th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[13]])
+  - name: TCC_MISS[14]
+    description: TCC_MISS on 0th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[14]])
+  - name: TCC_MISS[15]
+    description: TCC_MISS on 0th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[15]])
+  - name: TCC_MISS[16]
+    description: TCC_MISS on 1th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[0]])
+  - name: TCC_MISS[17]
+    description: TCC_MISS on 1th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[1]])
+  - name: TCC_MISS[18]
+    description: TCC_MISS on 1th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[2]])
+  - name: TCC_MISS[19]
+    description: TCC_MISS on 1th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[3]])
+  - name: TCC_MISS[1]
+    description: TCC_MISS on 0th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[1]])
+  - name: TCC_MISS[20]
+    description: TCC_MISS on 1th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[4]])
+  - name: TCC_MISS[21]
+    description: TCC_MISS on 1th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[5]])
+  - name: TCC_MISS[22]
+    description: TCC_MISS on 1th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[6]])
+  - name: TCC_MISS[23]
+    description: TCC_MISS on 1th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[7]])
+  - name: TCC_MISS[24]
+    description: TCC_MISS on 1th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[8]])
+  - name: TCC_MISS[25]
+    description: TCC_MISS on 1th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[9]])
+  - name: TCC_MISS[26]
+    description: TCC_MISS on 1th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[10]])
+  - name: TCC_MISS[27]
+    description: TCC_MISS on 1th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[11]])
+  - name: TCC_MISS[28]
+    description: TCC_MISS on 1th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[12]])
+  - name: TCC_MISS[29]
+    description: TCC_MISS on 1th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[13]])
+  - name: TCC_MISS[2]
+    description: TCC_MISS on 0th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[2]])
+  - name: TCC_MISS[30]
+    description: TCC_MISS on 1th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[14]])
+  - name: TCC_MISS[31]
+    description: TCC_MISS on 1th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[15]])
+  - name: TCC_MISS[32]
+    description: TCC_MISS on 2th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[0]])
+  - name: TCC_MISS[33]
+    description: TCC_MISS on 2th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[1]])
+  - name: TCC_MISS[34]
+    description: TCC_MISS on 2th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[2]])
+  - name: TCC_MISS[35]
+    description: TCC_MISS on 2th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[3]])
+  - name: TCC_MISS[36]
+    description: TCC_MISS on 2th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[4]])
+  - name: TCC_MISS[37]
+    description: TCC_MISS on 2th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[5]])
+  - name: TCC_MISS[38]
+    description: TCC_MISS on 2th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[6]])
+  - name: TCC_MISS[39]
+    description: TCC_MISS on 2th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[7]])
+  - name: TCC_MISS[3]
+    description: TCC_MISS on 0th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[3]])
+  - name: TCC_MISS[40]
+    description: TCC_MISS on 2th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[8]])
+  - name: TCC_MISS[41]
+    description: TCC_MISS on 2th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[9]])
+  - name: TCC_MISS[42]
+    description: TCC_MISS on 2th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[10]])
+  - name: TCC_MISS[43]
+    description: TCC_MISS on 2th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[11]])
+  - name: TCC_MISS[44]
+    description: TCC_MISS on 2th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[12]])
+  - name: TCC_MISS[45]
+    description: TCC_MISS on 2th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[13]])
+  - name: TCC_MISS[46]
+    description: TCC_MISS on 2th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[14]])
+  - name: TCC_MISS[47]
+    description: TCC_MISS on 2th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[15]])
+  - name: TCC_MISS[48]
+    description: TCC_MISS on 3th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[0]])
+  - name: TCC_MISS[49]
+    description: TCC_MISS on 3th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[1]])
+  - name: TCC_MISS[4]
+    description: TCC_MISS on 0th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[4]])
+  - name: TCC_MISS[50]
+    description: TCC_MISS on 3th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[2]])
+  - name: TCC_MISS[51]
+    description: TCC_MISS on 3th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[3]])
+  - name: TCC_MISS[52]
+    description: TCC_MISS on 3th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[4]])
+  - name: TCC_MISS[53]
+    description: TCC_MISS on 3th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[5]])
+  - name: TCC_MISS[54]
+    description: TCC_MISS on 3th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[6]])
+  - name: TCC_MISS[55]
+    description: TCC_MISS on 3th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[7]])
+  - name: TCC_MISS[56]
+    description: TCC_MISS on 3th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[8]])
+  - name: TCC_MISS[57]
+    description: TCC_MISS on 3th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[9]])
+  - name: TCC_MISS[58]
+    description: TCC_MISS on 3th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[10]])
+  - name: TCC_MISS[59]
+    description: TCC_MISS on 3th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[11]])
+  - name: TCC_MISS[5]
+    description: TCC_MISS on 0th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[5]])
+  - name: TCC_MISS[60]
+    description: TCC_MISS on 3th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[12]])
+  - name: TCC_MISS[61]
+    description: TCC_MISS on 3th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[13]])
+  - name: TCC_MISS[62]
+    description: TCC_MISS on 3th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[14]])
+  - name: TCC_MISS[63]
+    description: TCC_MISS on 3th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[15]])
+  - name: TCC_MISS[64]
+    description: TCC_MISS on 4th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[0]])
+  - name: TCC_MISS[65]
+    description: TCC_MISS on 4th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[1]])
+  - name: TCC_MISS[66]
+    description: TCC_MISS on 4th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[2]])
+  - name: TCC_MISS[67]
+    description: TCC_MISS on 4th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[3]])
+  - name: TCC_MISS[68]
+    description: TCC_MISS on 4th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[4]])
+  - name: TCC_MISS[69]
+    description: TCC_MISS on 4th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[5]])
+  - name: TCC_MISS[6]
+    description: TCC_MISS on 0th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[6]])
+  - name: TCC_MISS[70]
+    description: TCC_MISS on 4th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[6]])
+  - name: TCC_MISS[71]
+    description: TCC_MISS on 4th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[7]])
+  - name: TCC_MISS[72]
+    description: TCC_MISS on 4th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[8]])
+  - name: TCC_MISS[73]
+    description: TCC_MISS on 4th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[9]])
+  - name: TCC_MISS[74]
+    description: TCC_MISS on 4th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[10]])
+  - name: TCC_MISS[75]
+    description: TCC_MISS on 4th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[11]])
+  - name: TCC_MISS[76]
+    description: TCC_MISS on 4th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[12]])
+  - name: TCC_MISS[77]
+    description: TCC_MISS on 4th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[13]])
+  - name: TCC_MISS[78]
+    description: TCC_MISS on 4th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[14]])
+  - name: TCC_MISS[79]
+    description: TCC_MISS on 4th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[15]])
+  - name: TCC_MISS[7]
+    description: TCC_MISS on 0th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[7]])
+  - name: TCC_MISS[80]
+    description: TCC_MISS on 5th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[0]])
+  - name: TCC_MISS[81]
+    description: TCC_MISS on 5th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[1]])
+  - name: TCC_MISS[82]
+    description: TCC_MISS on 5th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[2]])
+  - name: TCC_MISS[83]
+    description: TCC_MISS on 5th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[3]])
+  - name: TCC_MISS[84]
+    description: TCC_MISS on 5th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[4]])
+  - name: TCC_MISS[85]
+    description: TCC_MISS on 5th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[5]])
+  - name: TCC_MISS[86]
+    description: TCC_MISS on 5th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[6]])
+  - name: TCC_MISS[87]
+    description: TCC_MISS on 5th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[7]])
+  - name: TCC_MISS[88]
+    description: TCC_MISS on 5th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[8]])
+  - name: TCC_MISS[89]
+    description: TCC_MISS on 5th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[9]])
+  - name: TCC_MISS[8]
+    description: TCC_MISS on 0th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[8]])
+  - name: TCC_MISS[90]
+    description: TCC_MISS on 5th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[10]])
+  - name: TCC_MISS[91]
+    description: TCC_MISS on 5th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[11]])
+  - name: TCC_MISS[92]
+    description: TCC_MISS on 5th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[12]])
+  - name: TCC_MISS[93]
+    description: TCC_MISS on 5th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[13]])
+  - name: TCC_MISS[94]
+    description: TCC_MISS on 5th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[14]])
+  - name: TCC_MISS[95]
+    description: TCC_MISS on 5th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[15]])
+  - name: TCC_MISS[96]
+    description: TCC_MISS on 6th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[0]])
+  - name: TCC_MISS[97]
+    description: TCC_MISS on 6th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[1]])
+  - name: TCC_MISS[98]
+    description: TCC_MISS on 6th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[2]])
+  - name: TCC_MISS[99]
+    description: TCC_MISS on 6th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[3]])
+  - name: TCC_MISS[9]
+    description: TCC_MISS on 0th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_MISS,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[9]])

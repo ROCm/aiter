@@ -1,0 +1,899 @@
+rocprofiler-sdk:
+  counters-schema-version: 1
+  counters:
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[0]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[100]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[101]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[102]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[103]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[104]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[105]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[106]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[107]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[108]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[109]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[10]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[110]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[111]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[112]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[113]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[114]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[115]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[116]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[117]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[118]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[119]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[11]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[120]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[121]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[122]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[123]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[124]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[125]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[126]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[127]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 7th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[7], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[12]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[13]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[14]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[15]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[16]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[17]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[18]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[19]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[1]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[20]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[21]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[22]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[23]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[24]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[25]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[26]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[27]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[28]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[29]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[2]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[30]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[31]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 1th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[1], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[32]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[33]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[34]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[35]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[36]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[37]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[38]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[39]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[3]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[40]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[41]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[42]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[43]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[44]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[45]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[46]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[47]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 2th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[2], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[48]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[49]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[4]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[50]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[51]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[52]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[53]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[54]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[55]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[56]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[57]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[58]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[59]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[5]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[60]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[61]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[62]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[63]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 3th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[3], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[64]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[65]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[66]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[67]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[68]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[69]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[6]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[70]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[71]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[72]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[73]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[74]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[75]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[76]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[77]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[78]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[79]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 4th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[4], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[7]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[80]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[81]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[82]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[83]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[84]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 4th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[4]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[85]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 5th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[5]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[86]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 6th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[6]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[87]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 7th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[7]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[88]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[89]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[9]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[8]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 8th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[8]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[90]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 10th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[10]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[91]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 11th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[11]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[92]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 12th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[12]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[93]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 13th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[13]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[94]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 14th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[14]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[95]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 5th XCC and 15th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[5], DIMENSION_INSTANCE=[15]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[96]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 0th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[0]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[97]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 1th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[1]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[98]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 2th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[2]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[99]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 6th XCC and 3th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[6], DIMENSION_INSTANCE=[3]])
+  - name: TCC_EA0_RDREQ_IO_CREDIT_STALL[9]
+    description: TCC_EA0_RDREQ_IO_CREDIT_STALL on 0th XCC and 9th channel
+    properties: []
+    definitions:
+    - architectures:
+      - gfx950
+      expression: select(TCC_EA0_RDREQ_IO_CREDIT_STALL,[DIMENSION_XCC=[0], DIMENSION_INSTANCE=[9]])
