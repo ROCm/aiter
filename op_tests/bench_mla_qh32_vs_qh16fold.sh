@@ -11,7 +11,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="${VIRTUAL_ENV:+${VIRTUAL_ENV}/bin/python}"
+PYTHON="${VIRTUAL_ENV:+${VIRTUAL_ENV}/bin/python3}"
 PYTHON="${PYTHON:-$(command -v python3 || command -v python)}"
 OUTPUT="${1:-${SCRIPT_DIR}/bench_qh32_vs_qh16fold_results.txt}"
 
