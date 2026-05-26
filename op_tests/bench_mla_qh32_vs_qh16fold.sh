@@ -33,8 +33,7 @@ run_sweep() {
                 --kv_dtype fp8 \
                 --batchSize "${batch}" \
                 --ctxLen "${ctx}" \
-                2>&1 | grep -E "us\.\.\.\.\.\.|summary|batch|ctx|error|Error" \
-                | tee -a "${OUTPUT}"
+                2>&1 | tee -a "${OUTPUT}"
             echo "" | tee -a "${OUTPUT}"
         done
     done
