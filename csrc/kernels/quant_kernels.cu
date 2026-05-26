@@ -1592,23 +1592,24 @@ __global__ void mxfp4_quant_moe_sort_kernel(
                                                 : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4));
     using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
     using vec_f = opus::vector_t<float, vec_size_i>;
-    // For e8m0-scaled dtypes (fp4, fp8) use 1 / floor_pow2(DTYPE_MAX) so that
-    // `row_scale = pow2(absMax) * inverted_DTYPE_MAX` is itself a pure power of 2 —
-    // that keeps the quant divisor consistent with the dequant scale `2^(byte-127)`
-    // we encode in the e8m0 byte (the `>> 23` extraction below otherwise discards
-    // mantissa bits and breaks accuracy). For other dtypes fall back to the exact
-    // 1 / DTYPE_MAX divisor.
-#if defined(__gfx942__)
-    /* gfx942 fp8 e4m3 fnuz max=240, floor_pow2(240)=128 */
-    constexpr float fp8_power2_limit = 1.0f / 128.0f;
-#else
-    /* gfx950 fp8 e4m3 max=448, floor_pow2(448)=256 */
-    constexpr float fp8_power2_limit = 1.0f / 256.0f;
-#endif
+    // Continuous fp32 scale divisor for non-MX dtypes (e.g. int8). MX dtypes
+    // (fp4 / fp8) take the e8m0 path via fp_f32_to_e8m0_scale<RoundUp, dtype>
+    // below, which returns a pure pow-2 dequant scale directly.
     const float inverted_DTYPE_MAX =
-            (std::is_same_v<DTYPE_O, opus::fp8_t>
-                   ? fp8_power2_limit
-                   : 1.0f / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        1.0f / static_cast<float>(opus::finfo<DTYPE_O>::max());
+
+    // HW-native FP8 element dtype: gfx942 ships e4m3fnuz (max_pos=240),
+    // gfx950+ ships OCP e4m3fn (max_pos=448). The legacy
+    // ``fp4_f32_to_e8m0_scale(absMax) * 1/floor_pow2(MAX)`` formula here used
+    // to over-scale the FP8 working value by ~2x (factor*amax > max_pos),
+    // saturating the high tail; emit_mx_e8m0_scale<RoundUp, dtype> picks the
+    // correct ``ceil_pow2(amax / max_pos)`` per arch instead.
+    constexpr aiter::MxDtype kHwFp8Dtype =
+#if defined(__gfx942__)
+        aiter::MxDtype::FP8_E4M3_FNUZ;
+#else
+        aiter::MxDtype::FP8_E4M3;
+#endif
 
     const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
     const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
@@ -1657,12 +1658,25 @@ __global__ void mxfp4_quant_moe_sort_kernel(
             }
             absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
 
-            float row_scale =
-                std::is_same_v<DTYPE_O, opus::fp4_t>
-                    ? aiter::fp4_f32_to_e8m0_scale(absMax) 
-                    : (std::is_same_v<DTYPE_O, opus::fp8_t>
-                           ? aiter::fp4_f32_to_e8m0_scale(absMax) * inverted_DTYPE_MAX
-                           : absMax * inverted_DTYPE_MAX);
+            // MXFP4 / MXFP8 use NV ROUND_UP (ceil_pow2(amax / max_pos)). The
+            // helper returns the dequant scale as a pow-2 fp32, so the
+            // ``(>> 23) & 0xFF`` extraction below yields the stored e8m0 byte
+            // directly. Other dtypes fall back to a continuous fp32 scale.
+            float row_scale;
+            if constexpr (std::is_same_v<DTYPE_O, opus::fp4_t>)
+            {
+                row_scale = aiter::fp_f32_to_e8m0_scale<aiter::MxScaleRoundMode::RoundUp,
+                                                       aiter::MxDtype::FP4_E2M1>(absMax);
+            }
+            else if constexpr (std::is_same_v<DTYPE_O, opus::fp8_t>)
+            {
+                row_scale = aiter::fp_f32_to_e8m0_scale<aiter::MxScaleRoundMode::RoundUp,
+                                                       kHwFp8Dtype>(absMax);
+            }
+            else
+            {
+                row_scale = absMax * inverted_DTYPE_MAX;
+            }
 
             const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
             if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
