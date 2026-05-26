@@ -463,9 +463,6 @@ def _get_config(
     K: int,
     shuffle: bool = False,
 ):
-    """Load the best tuned config for (M, N, K) via the standard aiter JSON
-    config mechanism. Falls back to the generic fallback file or to
-    _DEFAULT_CONFIG if no JSON is available."""
     if shuffle:
         return get_gemm_config("GEMM-AFP8WFP8_PRESHUFFLED", M, N, K)
     else:
