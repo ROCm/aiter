@@ -2,7 +2,7 @@ import torch
 import pytest
 
 from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer
-from aiter.ops.triton.kv_cache import cat_and_cache_mla
+from aiter.ops.triton.kv_cache import cat_and_cache_mla, reshape_and_cache
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 
@@ -120,10 +120,8 @@ def test_fused_qk_rope_cat_and_cache_mla(
         )
 
     torch.testing.assert_close(torch_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
-import pytest
-import torch
 
-from aiter.ops.triton.kv_cache import reshape_and_cache
+
 
 
 def _torch_reference(key, value, key_cache, value_cache, slot_mapping, block_size):
