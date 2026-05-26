@@ -1402,9 +1402,9 @@ def run_torch_qk_norm_rope_1way(
     )
     # cos_sin must arrive as fp32 — diffusers / qwen-image-edit reference
     # passes the complex freqs in fp32 to keep the rope multiply precision.
-    assert cos_sin.dtype == torch.float32, (
-        f"cos_sin must be fp32 to match the diffusers reference, got {cos_sin.dtype}"
-    )
+    assert (
+        cos_sin.dtype == torch.float32
+    ), f"cos_sin must be fp32 to match the diffusers reference, got {cos_sin.dtype}"
     cos_sin = cos_sin.view(num_tokens, head_size)
     cos, sin = cos_sin.chunk(2, dim=-1)
     q = apply_rotary_emb_diffusers(q_by_head, cos, sin, is_neox_style)
