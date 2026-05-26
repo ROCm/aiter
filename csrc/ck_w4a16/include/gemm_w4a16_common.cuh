@@ -155,6 +155,19 @@ enum class TileConfigKind : int {
   Baseline_NoBPad  = 11,  // BBlockLdsExtraN=false → XOR on B side
   Baseline_NoAPad  = 12,  // ABlockLdsExtraM=false → XOR on A side
   Baseline_NoABPad = 13,  // both flags false → XOR on both sides
+  // AIESW-32735 W2-cshuffle-fix: Baseline tile + cshuffle LDS row padding of
+  // +8 fp16 elements (= +16 B = +4 DWORDs). The W2 ISA-analysis (see
+  // notes/ck_layout_tuning/W2_isa_analysis.md) identified the cshuffle
+  // epilogue's ds_store_b16 / ds_store_b16_d16_hi stores as the source of
+  // the 47.4 % LDSBankConflict measured in W2.P2; the standalone PMC probe
+  // at /scratch/mgehre/tmp/w2_asm_probe2 measured 93.65 % conflict on
+  // ds_store_b16 with a 64-byte per-lane bank-alias pattern that matches
+  // the CK production access. Padding each cshuffle LDS row by 8 fp16
+  // breaks the inter-store bank-alias without changing the descriptor
+  // lengths (only the row stride widens). Same tile/pipeline/dequant as
+  // Baseline (M=128 N=128 K=32 MRep=4 NRep=2 BlockSize=256 Interwave v1,
+  // DequantPack8WithZp).
+  Baseline_CShufflePad = 14,
 };
 
 // Supported per-group scale-block-K values. ScaleBlockK == KPerBlock (32) gives
@@ -512,6 +525,41 @@ _CK_W4A16_DEFINE_TILE_FULL_DEQ_LDS(TileConfigKind::Baseline_NoABPad,
                                    DequantPack8WithZp,
                                    /*A_LDS_EXTRA_M=*/false,
                                    /*B_LDS_EXTRA_N=*/false);
+
+// AIESW-32735 W2-cshuffle-fix: Baseline tile + cshuffle LDS row padding.
+// Hand-written specialization (rather than another macro) because this is
+// the only entry that exercises the new CK template parameter
+// `CShuffleLdsExtraN`. All other params match Baseline exactly.
+template <typename T, ck::index_t ScaleBlockK>
+struct DeviceGemmInstanceImpl<T, ScaleBlockK, false, TileConfigKind::Baseline_CShufflePad> {
+  static constexpr ck::index_t kMPerBlock = 128;
+  static constexpr ck::index_t kNPerBlock = 128;
+  static constexpr ck::index_t kKPerBlock = 32;
+  using BDequantOp = DequantPack8WithZp;
+  using type = ck::tensor_operation::device::DeviceGemm_BScale_Wmma_CShuffleV3<
+      ALayout, BLayout, CLayout,
+      T, BDataType, T, T, AccDataType, T,
+      PassThrough, PassThrough, PassThrough,
+      GemmDefault,
+      256,
+      Scale_Block_N, ScaleBlockK,
+      128, 128, 32,
+      8, 8,
+      16, 16,
+      4, 2,
+      S<4, 64, 1>,
+      S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+      S<4, 64, 1>,
+      S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+      1, 1,
+      S<1, 32, 1, 8>, 8,
+      ck::BlockGemmPipelineScheduler::Interwave,
+      ck::BlockGemmPipelineVersion::v1,
+      T, T,
+      PermuteA, PermuteB,
+      BDequantOp,
+      /*CShuffleLdsExtraN=*/8>;
+};
 
 #undef _CK_W4A16_DEFINE_TILE
 #undef _CK_W4A16_DEFINE_TILE_FULL

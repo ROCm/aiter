@@ -204,6 +204,10 @@ inline void run_kernel(const at::Tensor& in_a,
         _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
                                       ck_w4a16::TileConfigKind::Baseline_NoABPad); \
         break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_CShufflePad:                     \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_CShufflePad); \
+        break;                                                                 \
       default:                                                                 \
         TORCH_CHECK(false,                                                     \
                     "CK W4A16 b_scale GEMM: unsupported tile_config_kind=",    \
@@ -213,7 +217,7 @@ inline void run_kernel(const at::Tensor& in_a,
                     "6=NarrowN, 7=Baseline_Sym_V1, 8=Baseline_Sym_V3, "        \
                     "9=Baseline_Bias, 10=Baseline_PackedSb, "                  \
                     "11=Baseline_NoBPad, 12=Baseline_NoAPad, "                 \
-                    "13=Baseline_NoABPad)");                                   \
+                    "13=Baseline_NoABPad, 14=Baseline_CShufflePad)");          \
     }                                                                          \
   } while (0)
 
