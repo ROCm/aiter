@@ -224,6 +224,31 @@ class TunerCommon:
             default=defaults.get("min_improvement_pct", 3.0),
             help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
+        self.parser.add_argument(
+            "--post_verify",
+            action="store_true",
+            default=False,
+            help="After tuning, re-run each shape's top-1 picked kernel serially "
+            "on a single GPU and apply a strict per-element relative-error check. "
+            "On failure, demote and fall through to top-2/3. Catches wide-range "
+            "output errors that the tuner hot path's global max-magnitude "
+            "heuristic misses, without perturbing multi-GPU timing accuracy.",
+        )
+        self.parser.add_argument(
+            "--post_verify_rel_tol",
+            type=float,
+            default=10.0,
+            help="With --post_verify, maximum allowed per-element relative error "
+            "(|a-b|/|b|). Default 10.0 catches >10x deviations; smaller values "
+            "are stricter.",
+        )
+        self.parser.add_argument(
+            "--post_verify_max_fallback",
+            type=int,
+            default=3,
+            help="With --post_verify, maximum number of top-N candidates to "
+            "verify per shape before giving up (default 3).",
+        )
 
     def parse_args(self):
         args = self.parser.parse_args()

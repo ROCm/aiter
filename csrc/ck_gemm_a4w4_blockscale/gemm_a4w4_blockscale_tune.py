@@ -380,6 +380,16 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 timeout=args.timeout,
                 verbose=args.verbose,
             )
+            if getattr(args, "post_verify", False) and ret:
+                from aiter.utility.post_verify import verify_top1
+
+                ret = verify_top1(
+                    task,
+                    ret,
+                    rel_tol=args.post_verify_rel_tol,
+                    max_fallback=args.post_verify_max_fallback,
+                    verbose=args.verbose,
+                )
         return ret
 
 
