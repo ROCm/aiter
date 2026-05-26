@@ -35,7 +35,7 @@ def topk(
 
     # BLOCK_M=1 for small n_rows keeps the grid wide enough to overlap with
     BLOCK_M = 1 if n_rows <= 256 else 32
-    BLOCK_N = 128  # triton.next_power_of_2(x_shape[1])  # 128
+    BLOCK_N = 128
     BLOCK_S = 128
     BLOCK_SP = 128
     assert n_cols < 32768
