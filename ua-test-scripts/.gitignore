@@ -1,0 +1,8 @@
+# rocprofv3 captures and counters
+.rocprofv3/
+# generated CSV/JSON analysis runs
+rocprof_analysis/
+# generated build/perf artifacts
+*.csv
+*.json
+*.log
