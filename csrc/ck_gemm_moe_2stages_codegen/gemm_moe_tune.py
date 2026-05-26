@@ -55,6 +55,8 @@ if is_flydsl_available():
         get_flydsl_stage2_kernels,
         get_flydsl_stage1_kernels_int4_bf16,
         get_flydsl_stage2_kernels_int4_bf16,
+        get_flydsl_stage1_kernels_blockscale,
+        get_flydsl_stage2_kernels_blockscale,
         flydsl_moe_stage1,
         flydsl_moe_stage2,
     )
@@ -457,6 +459,7 @@ class FmoeTuner(TunerCommon):
             a_scale_one=a_scale_one,
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
+            quant_type=kparams.get("quant_type", ""),
         )
         if isinstance(result, tuple):
             out_raw = result[0]
@@ -516,6 +519,8 @@ class FmoeTuner(TunerCommon):
             b_nt=kparams.get("b_nt", 0),
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
+            waves_per_eu=kparams.get("waves_per_eu", 2),
+            quant_type=kparams.get("quant_type", ""),
         )
 
     @staticmethod
@@ -1342,6 +1347,50 @@ class FmoeTuner(TunerCommon):
         return ref1
 
     @staticmethod
+    def run_torch_moe_stage1_blockscale_bf16(
+        a1_qt,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        a1_scale,
+        w1_scale,
+        sorted_ids=None,
+        num_valid_ids=None,
+        w1_bias=None,
+        dtype=dtypes.bf16,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.per_1x128,
+        doweight_stage1=False,
+        topk=1,
+        blockM=32,
+    ):
+        """BF16-output reference for a8w8 per_1x128 stage1 tuning.
+
+        ``run_torch_moe_stage1`` quantizes the per_1x128 path output back to fp8
+        to match CK/ASM stage1 outputs. That post-quant is sensitive to small
+        bf16 GEMM noise (each 1x128 block's amax shifts → scale shifts → fp8
+        codes shift), producing huge spurious mismatch when comparing the fp8
+        bytes — even though decoded values are within ~0.1 typical noise.
+        For FlyDSL stage1 tuner candidates we compare in bf16 to stay close to
+        true numerical accuracy.
+        """
+        return torch_moe_stage1(
+            a1_qt,
+            w1_qt,
+            w2_qt,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            quant_type=quant_type,
+            dtype=dtype,
+            a1_scale=a1_scale,
+            w1_scale=w1_scale,
+            w1_bias=w1_bias,
+            doweight=doweight_stage1,
+        )
+
+    @staticmethod
     def run_torch_moe_stage2(
         a2_qt,
         w1_qt,
@@ -2130,6 +2179,20 @@ class FmoeTuner(TunerCommon):
         if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
             return tasks_ck
 
+        # The CK2stages a8w8 blockscale templates currently fail to build
+        # against the in-container ROCm/CK headers (device_moe_gemm_blockscale.hpp
+        # template signature mismatch). Repeated rebuild attempts also cause
+        # the worker pool to stall on the build baton lock. Skip CK candidates
+        # for fp8 blockscale and rely on ASM + FlyDSL until the CK side is
+        # re-aligned. Set AITER_FMOE_TUNE_INCLUDE_CK_BLOCKSCALE=1 to override.
+        if (
+            q_type == QuantType.per_1x128
+            and q_dtype_a == dtypes.fp8
+            and q_dtype_w == dtypes.fp8
+            and os.environ.get("AITER_FMOE_TUNE_INCLUDE_CK_BLOCKSCALE", "0") != "1"
+        ):
+            return tasks_ck
+
         # CK2stages codegen does not support SwiGLU activation. GPT-OSS MXFP4
         # cases are covered by FlyDSL (or the a8w4 CK-Tile path above).
         if (
@@ -2812,6 +2875,187 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
+    def gen_flydsl_blockscale_2stages_task(self, info, blockMs):
+        """Generate FlyDSL tasks for FP8 a8w8 blockscale (per_1x128) MoE.
+
+        Filter: q_type == per_1x128 AND q_dtype_a == fp8 AND q_dtype_w == fp8.
+        Routes through (a_dtype, b_dtype, quant_type) = (fp8, fp8, per_1x128).
+        """
+        tasks_flydsl = []
+        if not is_flydsl_available():
+            return tasks_flydsl
+        (
+            cu_num,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        ) = info
+
+        if not (
+            q_type == QuantType.per_1x128
+            and q_dtype_a == dtypes.fp8
+            and q_dtype_w == dtypes.fp8
+        ):
+            return tasks_flydsl
+
+        out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
+        a_dtype_str = "fp8"
+
+        flydsl_s1_kernels = get_flydsl_stage1_kernels_blockscale(out_dtype_str)
+        flydsl_s2_kernels = get_flydsl_stage2_kernels_blockscale(out_dtype_str)
+
+        for blockM in blockMs:
+            if blockM not in [16, 32, 64, 128] or not use_g1u1:
+                continue
+
+            for kname, kparams in flydsl_s1_kernels.items():
+                ktm = kparams["tile_m"]
+                if ktm != blockM:
+                    continue
+                # split-K compatibility (mirrors moe_blockscale kernel validation).
+                kb = kparams.get("k_batch", 1)
+                if kb > 1:
+                    if model_dim % kb != 0:
+                        continue
+                    k_per_batch = model_dim // kb
+                    if k_per_batch % kparams["tile_k"] != 0:
+                        continue
+                    k_tiles = k_per_batch // kparams["tile_k"]
+                    if k_tiles < 4 or k_tiles % 2 != 0:
+                        continue
+                    if k_per_batch % 128 != 0:  # scale_block_k
+                        continue
+
+                ref_args_extra = (
+                    [0, 10, 11, 12, 13, 3, 4, 5, 8, 22],
+                    dtype,
+                    act_type,
+                    q_type,
+                    doweight_stage1,
+                    topk,
+                    blockM,
+                )
+                tasks_flydsl.append(
+                    (
+                        (info, "stage1", kname, blockM),
+                        FmoeTuner.generate_data_2stages,
+                        (
+                            token,
+                            model_dim,
+                            inter_dim,
+                            expert,
+                            topk,
+                            act_type,
+                            dtype,
+                            q_dtype_a,
+                            q_dtype_w,
+                            q_type,
+                            use_g1u1,
+                            doweight_stage1,
+                            blockM,
+                            1,
+                        ),
+                        FmoeTuner.run_flydsl_stage1_out,
+                        (
+                            [0, 16, 5, 6, 7, 8, 18, 14, 22],
+                            dtype,
+                            topk,
+                            kparams,
+                            blockM,
+                            q_dtype_a,
+                            q_type,
+                            act_type,
+                        ),
+                        {},
+                        FmoeTuner.run_torch_moe_stage1_blockscale_bf16,
+                        ref_args_extra,
+                        {},
+                        (None),
+                        # bf16 tol: FlyDSL stage1 noise vs torch.fp32 ref is
+                        # bounded; atol 0.5 / rtol 0.1 leaves headroom for the
+                        # ~0.1 max-elem and ~0.07 mean errors observed.
+                        0.1,
+                        0.5,
+                        True,
+                    )
+                )
+
+            # Reduce-mode candidates trade contention-free GEMM writes for an
+            # extra zero+sum pass on a (token, topk, model_dim) staging buffer.
+            # Whether reduce beats atomic depends on (token, topk, model_dim);
+            # we keep the candidates available so tuning can pick the winner
+            # per shape, but allow opting out via env var for tuning speed.
+            _ENABLE_REDUCE = (
+                os.environ.get("AITER_FLYDSL_STAGE2_REDUCE", "1") not in ("0", "false", "False")
+            )
+            for kname, kparams in flydsl_s2_kernels.items():
+                s2_tile_m = kparams["tile_m"]
+                if s2_tile_m != blockM:
+                    continue
+                if (not _ENABLE_REDUCE) and kparams.get("mode", "atomic") == "reduce":
+                    continue
+                s2_kparams = {**kparams, "sort_block_m": blockM}
+
+                s2_ref_args = (
+                    [0, 10, 11, 12, 13, 3, 4, 22],
+                    dtype,
+                    q_type,
+                    doweight_stage1,
+                )
+                tasks_flydsl.append(
+                    (
+                        (info, "stage2", kname, blockM),
+                        FmoeTuner.generate_data_2stages,
+                        (
+                            token,
+                            model_dim,
+                            inter_dim,
+                            expert,
+                            topk,
+                            act_type,
+                            dtype,
+                            q_dtype_a,
+                            q_dtype_w,
+                            q_type,
+                            use_g1u1,
+                            doweight_stage1,
+                            blockM,
+                            2,
+                        ),
+                        FmoeTuner.run_flydsl_stage2_out,
+                        (
+                            [0, 17, 5, 6, 7, 8, 19, 14, 9, 22],
+                            dtype,
+                            topk,
+                            s2_kparams,
+                            blockM,
+                            q_type,
+                            act_type,
+                        ),
+                        {},
+                        FmoeTuner.run_torch_moe_stage2,
+                        s2_ref_args,
+                        {},
+                        (None),
+                        # Same rationale as stage1 — cascading fp8 quant chain
+                        # adds another quant->dequant step relative to torch ref.
+                        0.15,
+                        0.5,
+                        None,
+                    )
+                )
+
+        return tasks_flydsl
+
     def run_config(self, args):
         from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import run_perftest, checkAllclose
@@ -3106,6 +3350,7 @@ class FmoeTuner(TunerCommon):
             tasks_ck.extend(self.gen_2stages_task(info, blockMs))
             tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
             tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
+            tasks_ck.extend(self.gen_flydsl_blockscale_2stages_task(info, blockMs))
             task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
