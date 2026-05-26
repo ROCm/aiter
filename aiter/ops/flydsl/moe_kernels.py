@@ -343,7 +343,6 @@ def compile_flydsl_moe_stage1(
     b_nt: int = 2,
     gate_mode: str = "separated",
     model_dim_pad: int = 0,
-    inter_dim_pad: int = 0,
     enable_bias: bool = False,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
@@ -374,7 +373,6 @@ def compile_flydsl_moe_stage1(
             b_nt=b_nt,
             gate_mode=GateMode(gate_mode),
             model_dim_pad=model_dim_pad,
-            inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
@@ -428,8 +426,6 @@ def compile_flydsl_moe_stage2(
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,
-    model_dim_pad: int = 0,
-    inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
 ):
@@ -462,8 +458,6 @@ def compile_flydsl_moe_stage2(
             # per-dtype special cases.
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
-            model_dim_pad=model_dim_pad,
-            inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
@@ -524,6 +518,7 @@ def _s1_args_fp4(
     dev,
     bias=None,
     stream=None,
+    inter_dim_pad: int = 0,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
@@ -545,6 +540,7 @@ def _s1_args_fp4(
         n_in,
         k_in,
         size_expert_ids_in,
+        inter_dim_pad,
         stream,
     )
 
@@ -602,6 +598,8 @@ def _s2_args_fp4(
     dev,
     bias=None,
     stream=None,
+    model_dim_pad: int = 0,
+    inter_dim_pad: int = 0,
 ):
     _bias = (
         bias.view(-1)
@@ -625,6 +623,8 @@ def _s2_args_fp4(
         n_in,
         k_in,
         blocks,
+        model_dim_pad,
+        inter_dim_pad,
         stream,
     )
 
@@ -896,6 +896,7 @@ def flydsl_moe_stage1(
                 if kernel_bias is not None
                 else torch.empty(0, device=dev)
             ),
+            inter_dim_pad=inter_dim_pad,
         )
     else:
         args = _s1_args_std(
@@ -934,7 +935,6 @@ def flydsl_moe_stage1(
         b_nt=b_nt,
         gate_mode=gate_mode,
         model_dim_pad=model_dim_pad,
-        inter_dim_pad=inter_dim_pad,
         enable_bias=(kernel_bias is not None),
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
@@ -1197,6 +1197,8 @@ def flydsl_moe_stage2(
             m_blocks,
             dev,
             bias=bias,
+            model_dim_pad=model_dim_pad,
+            inter_dim_pad=inter_dim_pad,
         )
     else:
         args = _s2_args_std(
@@ -1234,8 +1236,6 @@ def flydsl_moe_stage2(
         use_async_copy=use_async_copy,
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
-        model_dim_pad=model_dim_pad,
-        inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
     )

@@ -521,6 +521,7 @@ def _precompile_to_cache(
                         else torch.empty(0, device=dev)
                     ),
                     stream=0,
+                    inter_dim_pad=intermediate_pad,
                 )
             else:
                 args = _s1_args_std(
@@ -562,8 +563,6 @@ def _precompile_to_cache(
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
                 swiglu_limit=swiglu_limit,
-                model_dim_pad=hidden_pad,
-                inter_dim_pad=intermediate_pad,
             )
             _run_compiled(exe, args)
 
@@ -696,6 +695,8 @@ def _precompile_to_cache(
                     dev,
                     bias=bias,
                     stream=0,
+                    model_dim_pad=hidden_pad,
+                    inter_dim_pad=intermediate_pad,
                 )
             else:
                 args = _s2_args_std(
@@ -736,8 +737,6 @@ def _precompile_to_cache(
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
-                model_dim_pad=hidden_pad,
-                inter_dim_pad=intermediate_pad,
             )
             _run_compiled(exe, args)
 

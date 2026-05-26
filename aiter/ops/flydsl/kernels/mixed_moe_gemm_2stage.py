@@ -106,8 +106,6 @@ def compile_mixed_moe_gemm1(
     act: str = "silu",
     use_cshuffle_epilog: bool | None = None,
     enable_bias: bool = False,
-    model_dim_pad: int = 0,
-    inter_dim_pad: int = 0,
     persist_m: int = 1,
     use_async_copy: bool = False,
     waves_per_eu: int = 4,
@@ -197,8 +195,9 @@ def compile_mixed_moe_gemm1(
     #   model_dim = model_dim_true + model_dim_pad   (K direction)
     #   inter_dim = inter_dim_true + inter_dim_pad   (N direction)
     # Tensor sizes use the padded dimensions (inter_dim, model_dim).
-    # Padding only affects kernel internal logic and grid computation.
-    _inter_dim_valid = inter_dim - inter_dim_pad
+    # Both pads are runtime SSA values: inter_dim_pad drives grid math;
+    # model_dim_pad is not consumed by stage1 (weight pad region is zero so
+    # running the full k_unroll is correct).
 
     # Split-K validation
     _is_splitk = k_batch > 1
@@ -447,6 +446,7 @@ def compile_mixed_moe_gemm1(
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            i32_inter_dim_pad_in: fx.Int32,
         ):
 
             tokens_in = arith.index_cast(ir.IndexType.get(), i32_tokens_in.ir_value())
@@ -454,6 +454,9 @@ def compile_mixed_moe_gemm1(
             k_in = arith.index_cast(ir.IndexType.get(), i32_k_in.ir_value())
             size_expert_ids_in = arith.index_cast(
                 ir.IndexType.get(), i32_size_expert_ids_in.ir_value()
+            )
+            inter_dim_pad_idx = arith.index_cast(
+                ir.IndexType.get(), i32_inter_dim_pad_in.ir_value()
             )
 
             x_elem = T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
@@ -514,13 +517,13 @@ def compile_mixed_moe_gemm1(
                 _NUM_XCDS_S1 = 8
                 _c1_sw = arith.constant(1, index=True)
                 _c_tn_sw = arith.constant(tile_n, index=True)
-                _c_idp_sw = arith.constant(2 * inter_dim_pad, index=True)
+                _c2_idp_sw = arith.constant(2, index=True) * inter_dim_pad_idx
                 if const_expr(mock_gate_only or gate_up_interleave):
-                    _gx = (n_in - _c_idp_sw + _c_tn_sw - _c1_sw) / _c_tn_sw
+                    _gx = (n_in - _c2_idp_sw + _c_tn_sw - _c1_sw) / _c_tn_sw
                 else:
                     _c2_sw = arith.constant(2, index=True)
                     _gx = (
-                        (n_in - _c_idp_sw + _c2_sw * _c_tn_sw - _c1_sw)
+                        (n_in - _c2_idp_sw + _c2_sw * _c_tn_sw - _c1_sw)
                         / _c_tn_sw
                         / _c2_sw
                     )
@@ -849,16 +852,13 @@ def compile_mixed_moe_gemm1(
                 num_acc_n_packed = num_acc_n // pack_N
 
                 _K_per_ku = tile_k // k_unroll
-                _pad_k_elems = (
-                    (model_dim_pad % tile_k)
-                    if (not _is_splitk and model_dim_pad > 0)
-                    else 0
-                )
-                _pad_ku_skip = _pad_k_elems // _K_per_ku
-                _tail_ku = k_unroll - _pad_ku_skip
-                _tail_ku_packed = (
-                    (_tail_ku + pack_K - 1) // pack_K if _pad_ku_skip > 0 else None
-                )
+                # stage1 no longer specializes K-tail on model_dim_pad: weight pad
+                # region is zero so always running the full k_unroll is correct
+                # and equally fast (see perf eval).
+                _pad_k_elems = 0
+                _pad_ku_skip = 0
+                _tail_ku = k_unroll
+                _tail_ku_packed = None
 
                 # B load for gate and up separately
                 def load_b_packs_k64(base_k, ku: int, n_blk, n_intra):
@@ -2659,8 +2659,6 @@ def compile_mixed_moe_gemm1(
         doweight_stage1,
         act,
         enable_bias,
-        model_dim_pad,
-        inter_dim_pad,
         use_cshuffle_epilog,
         persist_m,
         use_async_copy,
@@ -2688,6 +2686,7 @@ def compile_mixed_moe_gemm1(
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
         i32_size_expert_ids_in: fx.Int32,
+        i32_inter_dim_pad_in: fx.Int32,
         stream: fx.Stream,
     ):
         _ = _cache_tag
@@ -2700,7 +2699,10 @@ def compile_mixed_moe_gemm1(
 
         inter_in = arith.index_cast(ir.IndexType.get(), i32_inter_in.ir_value())
         tile_n_index = arith.constant(tile_n, index=True)
-        inter_dim_pad_total = arith.constant(2 * inter_dim_pad, index=True)
+        _inter_dim_pad_idx = arith.index_cast(
+            ir.IndexType.get(), i32_inter_dim_pad_in.ir_value()
+        )
+        inter_dim_pad_total = arith.constant(2, index=True) * _inter_dim_pad_idx
         if const_expr(mock_gate_only or gate_up_interleave):
             gx = (inter_in - inter_dim_pad_total + tile_n_index - 1) / tile_n_index
         else:
@@ -2732,6 +2734,7 @@ def compile_mixed_moe_gemm1(
             i32_inter_in,
             i32_k_in,
             i32_size_expert_ids_in,
+            i32_inter_dim_pad_in,
         ).launch(grid=(gx, gy, k_batch), block=(total_threads, 1, 1), stream=stream)
 
     return launch_mixed_moe_gemm1
@@ -2757,8 +2760,6 @@ def compile_mixed_moe_gemm2(
     # This can reduce atomic contention for small tokens at the cost of extra bandwidth / reduction.
     accumulate: bool = True,
     enable_bias: bool = False,
-    model_dim_pad: int = 0,
-    inter_dim_pad: int = 0,
     persist_m: int = 4,
     sort_block_m: int = 0,
     waves_per_eu: Optional[int] = None,
@@ -3058,12 +3059,20 @@ def compile_mixed_moe_gemm2(
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            i32_model_dim_pad_in: fx.Int32,
+            i32_inter_dim_pad_in: fx.Int32,
         ):
 
             tokens_in = arith.index_cast(ir.IndexType.get(), i32_tokens_in.ir_value())
             n_in = arith.index_cast(ir.IndexType.get(), i32_n_in.ir_value())
             k_in = arith.index_cast(ir.IndexType.get(), i32_k_in.ir_value())
             size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
+            model_dim_pad_idx = arith.index_cast(
+                ir.IndexType.get(), i32_model_dim_pad_in.ir_value()
+            )
+            inter_dim_pad_idx = arith.index_cast(
+                ir.IndexType.get(), i32_inter_dim_pad_in.ir_value()
+            )
             x_elem = T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
             # For int4, weights are stored as packed bytes (i8) and unpacked to i8 packs.
             f32 = T.f32
@@ -3091,12 +3100,6 @@ def compile_mixed_moe_gemm2(
             c_n_total = arith.constant(experts * model_dim, index=True)
             kpack_bytes = 8 if is_int4 else 16
             from .layout_utils import _div_pow2, _mod_pow2
-
-            def check_c_n_valid_gate(base_n):
-                return arith.cmpi(CmpIPredicate.ult, base_n, model_dim - model_dim_pad)
-
-            def check_c_k_valid_gate(base_k):
-                return arith.cmpi(CmpIPredicate.ult, base_k, inter_dim - inter_dim_pad)
 
             # A&B's scale preshuffle layout
             # For fp4, k_in is already packed (inter_dim // a_elem_vec_pack), so we need original inter_dim
@@ -3133,8 +3136,7 @@ def compile_mixed_moe_gemm2(
                 _NUM_XCDS_S = 8
                 _c1_sw = arith.constant(1, index=True)
                 _c_tn_sw = arith.constant(tile_n, index=True)
-                _c_mdp_sw = arith.constant(model_dim_pad, index=True)
-                _gx = (n_in - _c_mdp_sw + _c_tn_sw - _c1_sw) / _c_tn_sw
+                _gx = (n_in - model_dim_pad_idx + _c_tn_sw - _c1_sw) / _c_tn_sw
                 if const_expr(_persistent):
                     _gy = arith.constant(_cu_num, index=True)
                 else:
@@ -4888,8 +4890,6 @@ def compile_mixed_moe_gemm2(
         doweight_stage2,
         accumulate,
         enable_bias,
-        model_dim_pad,
-        inter_dim_pad,
         use_cshuffle_epilog,
         persist_m,
         _sort_block_m,
@@ -4915,6 +4915,8 @@ def compile_mixed_moe_gemm2(
         i32_n_in: fx.Int32,
         i32_k_in: fx.Int32,
         i32_size_expert_ids_in: fx.Int32,
+        i32_model_dim_pad_in: fx.Int32,
+        i32_inter_dim_pad_in: fx.Int32,
         stream: fx.Stream,
     ):
         _ = _cache_tag
@@ -4925,7 +4927,9 @@ def compile_mixed_moe_gemm2(
 
         n_in = arith.index_cast(ir.IndexType.get(), i32_n_in.ir_value())
         _tile_n_idx = arith.constant(tile_n, index=True)
-        _model_dim_pad_idx = arith.constant(model_dim_pad, index=True)
+        _model_dim_pad_idx = arith.index_cast(
+            ir.IndexType.get(), i32_model_dim_pad_in.ir_value()
+        )
         gx = (
             n_in - _model_dim_pad_idx + _tile_n_idx - arith.constant(1, index=True)
         ) / _tile_n_idx
@@ -4954,6 +4958,8 @@ def compile_mixed_moe_gemm2(
             i32_n_in,
             i32_k_in,
             i32_size_expert_ids_in,
+            i32_model_dim_pad_in,
+            i32_inter_dim_pad_in,
         )
         # Stamp rocdl.waves_per_eu on the emitted gpu.func so the backend
         # respects the occupancy request. Done here (not at kernel-body time)
