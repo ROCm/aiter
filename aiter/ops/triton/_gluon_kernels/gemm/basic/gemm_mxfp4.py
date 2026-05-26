@@ -263,7 +263,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
     # --- 1. Prologue: fill NUM_BUFFERS-1 LDS slots via TDM ---
     # Load-then-advance: each iter consumes the descriptor's current K
     # position, then steps it forward for the next load (prologue or main).
-    for _ in gl.static_range(NUM_BUFFERS - 1):
+    for _ in gl.static_range(NUM_BUFFERS):
         slot = load_idx % NUM_BUFFERS
         gl.amd.gfx1250.tdm.async_load(a_desc, [0, 0], smem_A.index(slot))
         gl.amd.gfx1250.tdm.async_load(b_desc, [0, 0], smem_B.index(slot))
@@ -282,7 +282,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
         load_idx += 1
 
     # --- 2. Pre-load tile 0 from LDS into registers ---
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 4)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
 
     slot_c = compute_idx % NUM_BUFFERS
     cur_A = smem_A.index(slot_c).load(layout=dot_a_layout)
@@ -297,7 +297,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
     )
 
     # --- 3. Main loop: WMMA(cur) → TDM(future) → wait → pre-load(next) ---
-    main_iters = k_tiles - (NUM_BUFFERS - 1)
+    main_iters = k_tiles - (NUM_BUFFERS)
     for _ in range(main_iters):
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc
@@ -322,7 +322,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
             bs_desc, [0, K_GROUPS * LANES_PER_TDM]
         )
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 4)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
         load_idx += 1
 
         # Pre-load next tile from LDS into registers
@@ -342,8 +342,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
         compute_idx += 1
 
     # --- 4. Epilogue: drain remaining tiles (no new TDM loads) ---
-    for i in gl.static_range(NUM_BUFFERS - 2):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 4)
+    for i in gl.static_range(NUM_BUFFERS - 1):
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
 
         next_slot = (compute_idx + 1) % NUM_BUFFERS
         next_A = smem_A.index(next_slot).load(layout=dot_a_layout)
