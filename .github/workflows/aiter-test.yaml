@@ -285,7 +285,7 @@ jobs:
         with:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels/
-          retention-days: 90
+          retention-days: 3
 
   standard:
     if: >-
