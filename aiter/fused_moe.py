@@ -42,6 +42,18 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 
+# Opt-in switch for the gfx1250 FlyDSL MoE grouped-GEMM path. When unset (or "0"),
+# the dispatcher skips ``_maybe_grouped_gfx1250_a8w4_moe`` entirely and falls back
+# to the default 2-stage flow. Set ``AITER_USE_GROUPED_GEMM=1`` to enable the
+# grouped-GEMM mode (still subject to the other eligibility checks inside the
+# helper, e.g. dtype / activation / gfx1250 dispatch / FlyDSL availability).
+_TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
+
+
+def _use_grouped_gemm_enabled() -> bool:
+    """Runtime check for AITER_USE_GROUPED_GEMM so tests can toggle it."""
+    return os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
+
 
 def _moe_sorting_torch_gfx1250(
     topk_ids,
@@ -492,6 +504,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             print(f"[grouped-gemm-debug] fused_moe: {msg}", flush=True)
 
     _grouped_dbg("enter grouped helper")
+    # Master opt-in switch: only enter the gfx1250 FlyDSL grouped-GEMM mode
+    # when AITER_USE_GROUPED_GEMM is explicitly enabled. The legacy
+    # AITER_DISABLE_GROUPED_A8W4 kill-switch is still honoured for users who
+    # want to force-disable the path even after opting in.
+    if not _use_grouped_gemm_enabled():
+        _grouped_dbg("AITER_USE_GROUPED_GEMM not enabled; skip grouped mode")
+        return None
     if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
         return None
     os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "default"
