@@ -1,0 +1,1111 @@
+MLA qh32 native vs qh16-fold benchmark
+Date: Tue May 26 09:22:15 UTC 2026
+GPU:          AMD EPYC 9534 64-Core Processor    
+unknown
+
+===== qh32 NATIVE kernel (new) =====
+  MLA_FORCE_QH16_FOLD=0
+
+  batch=1  ctxLen=2048
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 2048,
+                 batch_size                   = 1,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:22:22 42:42 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:22:22 42:42 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:22:22.548937149 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    23.47 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.09765625, delta details: 0.3% (55 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    23.47 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.0947265625, delta details: 0.3% (55 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    23.47 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.0947265625, delta details: 0.3% (55 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    23.47 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.6825882196426392, delta details: 0.7% (3150 of 425984) elements
+[aiter] mla_persistent summary (markdown):
+|   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
+|-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
+|       2048 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00335693 |          23.4703 |      142606336 |        1230848 |         6.07604 |     0.0524429 |
+
+  batch=1  ctxLen=8192
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 8192,
+                 batch_size                   = 1,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:22:30 135:135 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:22:30 135:135 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:22:30.546994655 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    33.24 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1123046875, delta details: 0.3% (51 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    33.24 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.10888671875, delta details: 0.3% (52 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    33.24 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.109375, delta details: 0.3% (52 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    33.24 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.3497295379638672, delta details: 0.4% (1819 of 507904) elements
+[aiter] mla_persistent summary (markdown):
+|   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
+|-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
+|       8192 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00317383 |          33.2418 |      570425344 |        4769792 |         17.1599 |      0.143488 |
+
+  batch=1  ctxLen=32768
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 32768,
+                 batch_size                   = 1,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:22:38 228:228 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:22:38 228:228 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:22:38.606492503 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    58.55 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.107421875, delta details: 0.3% (49 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    58.55 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1044921875, delta details: 0.3% (50 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    58.55 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.10498046875, delta details: 0.3% (51 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    58.55 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.2550922930240631, delta details: 0.3% (1784 of 524288) elements
+[aiter] mla_persistent summary (markdown):
+|   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
+|-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
+|      32768 |            1 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00305176 |          58.5507 |     2281701376 |       18925568 |         38.9697 |      0.323234 |
+
+  batch=4  ctxLen=2048
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 2048,
+                 batch_size                   = 4,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:22:46 321:321 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:22:46 321:321 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:22:46.671495740 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    27.46 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1259765625, delta details: 0.3% (219 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    27.46 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.12451171875, delta details: 0.3% (219 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    27.46 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.12451171875, delta details: 0.3% (220 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    27.46 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:1.1855835914611816, delta details: 0.7% (11457 of 1703936) elements
+[aiter] mla_persistent summary (markdown):
+|   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
+|-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
+|       2048 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00334167 |          27.4646 |      570425344 |        4923392 |         20.7694 |      0.179263 |
+
+  batch=4  ctxLen=8192
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 8192,
+                 batch_size                   = 4,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:22:54 414:414 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:22:54 414:414 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:22:54.941966126 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    34.73 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.173828125, delta details: 0.3% (206 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    34.73 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.181640625, delta details: 0.3% (207 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    34.73 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1826171875, delta details: 0.3% (206 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    34.73 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.47334912419319153, delta details: 0.4% (7227 of 2031616) elements
+[aiter] mla_persistent summary (markdown):
+|   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
+|-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
+|       8192 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00315857 |          34.7319 |     2281701376 |       19079168 |         65.6947 |      0.549327 |
+
+  batch=4  ctxLen=32768
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 32768,
+                 batch_size                   = 4,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:23:03 507:507 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:23:03 507:507 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:23:03.258948234 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    64.03 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1376953125, delta details: 0.3% (199 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    64.03 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.140625, delta details: 0.3% (200 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    64.03 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.140625, delta details: 0.3% (200 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    64.03 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.2751988172531128, delta details: 0.3% (6988 of 2129920) elements
+[aiter] mla_persistent summary (markdown):
+|   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
+|-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
+|      32768 |            4 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00305176 |          64.0301 |     9126805504 |       75702272 |         142.539 |       1.18229 |
+
+  batch=16  ctxLen=2048
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 2048,
+                 batch_size                   = 16,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:23:11 600:600 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:23:11 600:600 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:23:11.644169997 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    28.50 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1650390625, delta details: 0.3% (835 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    28.50 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1669921875, delta details: 0.3% (837 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    28.50 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1669921875, delta details: 0.3% (831 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    28.50 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.8253182172775269, delta details: 0.4% (16763 of 3932160) elements
+[aiter] mla_persistent summary (markdown):
+|   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
+|-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
+|       2048 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |    0.0031929 |          28.4963 |     2281701376 |       19693568 |         80.0702 |      0.691093 |
+
+  batch=16  ctxLen=8192
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 8192,
+                 batch_size                   = 16,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:23:20 693:693 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:23:20 693:693 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:23:20.471345989 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    45.56 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.15234375, delta details: 0.3% (810 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    45.56 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1552734375, delta details: 0.3% (815 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    45.56 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1552734375, delta details: 0.3% (813 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:    45.56 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.4073747992515564, delta details: 0.4% (14739 of 4194304) elements
+[aiter] mla_persistent summary (markdown):
+|   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
+|-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
+|       8192 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |   0.00310898 |          45.5556 |     9126805504 |       76316672 |         200.344 |       1.67524 |
+
+  batch=16  ctxLen=32768
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 32768,
+                 batch_size                   = 16,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh32_qseqlen1_gqaratio32_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh32_qseqlen1_gqaratio32_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:23:29 786:786 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:23:29 786:786 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:23:29.295705807 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:   107.23 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.1337890625, delta details: 0.3% (821 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:   107.23 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.13671875, delta details: 0.3% (823 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:   107.23 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.13671875, delta details: 0.3% (825 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]:   107.23 us......[checkAllclose atol=0.01 rtol=0.01 [33mwarning![0m] a and b results are not all close
+[aiter] -->max abs delta:0.24006839096546173, delta details: 0.3% (14080 of 4194304) elements
+[aiter] mla_persistent summary (markdown):
+|   ctx_lens |   batch_size |   nhead |   kv_lora_rank |   qk_nope_head_dim |   qk_rope_head_dim |   v_head_dim | dtype               | kvtype              |   page_size | varlen   |   decode_qlen |   max_split_per_batch | non_persistent_mode   | paged_layout   |   scale_dim | return_lse   |   decode:err |   decode:asm_576 |   decode:flops |   decode:bytes |   decode:TFLOPS |   decode:TB/s |
+|-----------:|-------------:|--------:|---------------:|-------------------:|-------------------:|-------------:|:--------------------|:--------------------|------------:|:---------|--------------:|----------------------:|:----------------------|:---------------|------------:|:-------------|-------------:|-----------------:|---------------:|---------------:|----------------:|--------------:|
+|      32768 |           16 |      32 |            512 |                512 |                 64 |          512 | torch.float8_e4m3fn | torch.float8_e4m3fn |           1 | False    |             1 |                    32 | False                 | LEGACY         |           4 | False        |    0.0031395 |          107.231 |    36507222016 |      302809088 |         340.455 |        2.8239 |
+
+
+===== qh16 FOLD fallback (old) =====
+  MLA_FORCE_QH16_FOLD=1
+
+  batch=1  ctxLen=2048
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 2048,
+                 batch_size                   = 1,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:23:38 887:887 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:23:38 887:887 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:23:38.150326003 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    15.59 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([1, 32, 512])
+           tensor([-0.0593,  0.0669, -0.0471, -0.0417, -0.0102, -0.0177,  0.0840, -0.0105],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([1, 32, 512])
+           tensor([-1., -1., -1., -1., -1., -1., -1., -1.], device='cuda:0',
+       dtype=torch.bfloat16)
+    delta:
+           tensor([0.9414, 1.0703, 0.9531, 0.9570, 0.9883, 0.9805, 1.0859, 0.9883],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.25, delta details: 50.0% (8192 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    15.59 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([1, 32, 512])
+           tensor([-0.0574,  0.0669, -0.0439, -0.0403, -0.0084, -0.0165,  0.0820, -0.0095],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([1, 32, 512])
+           tensor([-1., -1., -1., -1., -1., -1., -1., -1.], device='cuda:0',
+       dtype=torch.bfloat16)
+    delta:
+           tensor([0.9414, 1.0703, 0.9570, 0.9609, 0.9922, 0.9844, 1.0781, 0.9922],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.25, delta details: 50.0% (8192 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    15.59 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([1, 32, 512])
+           tensor([-0.0576,  0.0684, -0.0444, -0.0408, -0.0090, -0.0151,  0.0806, -0.0103],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([1, 32, 512])
+           tensor([-1., -1., -1., -1., -1., -1., -1., -1.], device='cuda:0',
+       dtype=torch.bfloat16)
+    delta:
+           tensor([0.9414, 1.0703, 0.9570, 0.9609, 0.9922, 0.9844, 1.0781, 0.9883],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.25, delta details: 50.0% (8192 of 16384) elements
+Traceback (most recent call last):
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1812, in <module>
+    ret = test_mla(
+          ^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 129, in wrapper
+    ret = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1642, in test_mla
+    err, us_asm_decode = test_absorb_decode_fp8()
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1510, in test_absorb_decode_fp8
+    checkAllclose(
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 402, in checkAllclose
+    isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py", line 122, in __torch_function__
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: The size of tensor a (32) must match the size of tensor b (16) at non-singleton dimension 1
+
+  batch=1  ctxLen=8192
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 8192,
+                 batch_size                   = 1,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:23:46 980:980 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:23:46 980:980 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:23:46.209643702 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    21.00 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([1, 32, 512])
+           tensor([ 0.0312, -0.0645,  0.0310,  0.0059, -0.0168, -0.0466,  0.0583, -0.0400],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([1, 32, 512])
+           tensor([-1., -1., -1., -1., -1., -1., -1., -1.], device='cuda:0',
+       dtype=torch.bfloat16)
+    delta:
+           tensor([1.0312, 0.9375, 1.0312, 1.0078, 0.9844, 0.9531, 1.0547, 0.9609],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.1484375, delta details: 50.0% (8192 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    21.00 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([1, 32, 512])
+           tensor([ 0.0325, -0.0640,  0.0300,  0.0040, -0.0186, -0.0479,  0.0571, -0.0386],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([1, 32, 512])
+           tensor([-1., -1., -1., -1., -1., -1., -1., -1.], device='cuda:0',
+       dtype=torch.bfloat16)
+    delta:
+           tensor([1.0312, 0.9375, 1.0312, 1.0078, 0.9805, 0.9531, 1.0547, 0.9609],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.1484375, delta details: 50.0% (8192 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    21.00 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([1, 32, 512])
+           tensor([ 0.0327, -0.0649,  0.0304,  0.0041, -0.0182, -0.0481,  0.0569, -0.0381],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([1, 32, 512])
+           tensor([-1., -1., -1., -1., -1., -1., -1., -1.], device='cuda:0',
+       dtype=torch.bfloat16)
+    delta:
+           tensor([1.0312, 0.9336, 1.0312, 1.0078, 0.9805, 0.9531, 1.0547, 0.9609],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.1484375, delta details: 50.0% (8192 of 16384) elements
+Traceback (most recent call last):
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1812, in <module>
+    ret = test_mla(
+          ^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 129, in wrapper
+    ret = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1642, in test_mla
+    err, us_asm_decode = test_absorb_decode_fp8()
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1510, in test_absorb_decode_fp8
+    checkAllclose(
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 402, in checkAllclose
+    isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py", line 122, in __torch_function__
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: The size of tensor a (32) must match the size of tensor b (16) at non-singleton dimension 1
+
+  batch=1  ctxLen=32768
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 32768,
+                 batch_size                   = 1,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:23:54 1073:1073 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:23:54 1073:1073 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:23:54.296100240 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    34.29 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([1, 32, 512])
+           tensor([-0.0291,  0.0003, -0.0610,  0.0240,  0.0508, -0.0496, -0.0215,  0.0129],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([1, 32, 512])
+           tensor([-1., -1., -1., -1., -1., -1., -1., -1.], device='cuda:0',
+       dtype=torch.bfloat16)
+    delta:
+           tensor([0.9727, 1.0000, 0.9375, 1.0234, 1.0469, 0.9492, 0.9766, 1.0156],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.1796875, delta details: 50.0% (8192 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    34.29 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([1, 32, 512])
+           tensor([-0.0302,  0.0010, -0.0615,  0.0247,  0.0510, -0.0481, -0.0220,  0.0125],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([1, 32, 512])
+           tensor([-1., -1., -1., -1., -1., -1., -1., -1.], device='cuda:0',
+       dtype=torch.bfloat16)
+    delta:
+           tensor([0.9688, 1.0000, 0.9375, 1.0234, 1.0547, 0.9531, 0.9766, 1.0156],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.1796875, delta details: 50.0% (8192 of 16384) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    34.29 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([1, 32, 512])
+           tensor([-0.0304,  0.0010, -0.0618,  0.0249,  0.0515, -0.0486, -0.0214,  0.0129],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([1, 32, 512])
+           tensor([-1., -1., -1., -1., -1., -1., -1., -1.], device='cuda:0',
+       dtype=torch.bfloat16)
+    delta:
+           tensor([0.9688, 1.0000, 0.9375, 1.0234, 1.0547, 0.9531, 0.9805, 1.0156],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.1796875, delta details: 50.0% (8192 of 16384) elements
+Traceback (most recent call last):
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1812, in <module>
+    ret = test_mla(
+          ^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 129, in wrapper
+    ret = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1642, in test_mla
+    err, us_asm_decode = test_absorb_decode_fp8()
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1510, in test_absorb_decode_fp8
+    checkAllclose(
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 402, in checkAllclose
+    isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py", line 122, in __torch_function__
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: The size of tensor a (32) must match the size of tensor b (16) at non-singleton dimension 1
+
+  batch=4  ctxLen=2048
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 2048,
+                 batch_size                   = 4,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:24:02 1166:1166 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:24:02 1166:1166 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:24:02.381274604 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    17.62 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([4, 32, 512])
+           tensor([ 0.0967, -0.0608,  0.0334, -0.0303,  0.0308, -0.0515, -0.0052,  0.0043],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([4, 32, 512])
+           tensor([ 0.0850, -0.0884,  0.0190,  0.0488,  0.0625, -0.0732, -0.0265, -0.0422],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0117, 0.0276, 0.0144, 0.0791, 0.0317, 0.0217, 0.0212, 0.0466],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.234375, delta details: 81.6% (53489 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    17.62 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([4, 32, 512])
+           tensor([-0.0640,  0.0327, -0.0317,  0.0327, -0.0522, -0.0065,  0.0064,  0.1328],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([4, 32, 512])
+           tensor([-0.0884,  0.0190,  0.0488,  0.0625, -0.0732, -0.0265, -0.0422,  0.0233],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0244, 0.0137, 0.0806, 0.0298, 0.0210, 0.0200, 0.0486, 0.1094],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.234375, delta details: 81.6% (53470 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    17.62 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([4, 32, 512])
+           tensor([-0.0640,  0.0325, -0.0309,  0.0339, -0.0505, -0.0060,  0.0053,  0.1328],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([4, 32, 512])
+           tensor([-0.0884,  0.0190,  0.0488,  0.0625, -0.0732, -0.0265, -0.0422,  0.0233],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0244, 0.0134, 0.0796, 0.0286, 0.0227, 0.0205, 0.0476, 0.1094],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.2421875, delta details: 81.5% (53433 of 65536) elements
+Traceback (most recent call last):
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1812, in <module>
+    ret = test_mla(
+          ^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 129, in wrapper
+    ret = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1642, in test_mla
+    err, us_asm_decode = test_absorb_decode_fp8()
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1510, in test_absorb_decode_fp8
+    checkAllclose(
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 402, in checkAllclose
+    isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py", line 122, in __torch_function__
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: The size of tensor a (32) must match the size of tensor b (16) at non-singleton dimension 1
+
+  batch=4  ctxLen=8192
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 8192,
+                 batch_size                   = 4,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:24:10 1259:1259 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:24:10 1259:1259 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:24:10.730311532 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    23.22 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([4, 32, 512])
+           tensor([-0.1611, -0.0366, -0.0220,  0.0493, -0.0645,  0.0273,  0.0176,  0.0219],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([4, 32, 512])
+           tensor([-0.1494, -0.0645,  0.0133,  0.0620, -0.0236,  0.0398,  0.0013, -0.0065],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0117, 0.0278, 0.0352, 0.0127, 0.0410, 0.0125, 0.0162, 0.0283],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.203125, delta details: 75.6% (49572 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    23.22 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([4, 32, 512])
+           tensor([-0.0359, -0.0211,  0.0461, -0.0625,  0.0286,  0.0181,  0.0234, -0.1318],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([4, 32, 512])
+           tensor([-0.0645,  0.0133,  0.0620, -0.0236,  0.0398,  0.0013, -0.0065, -0.1089],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0286, 0.0344, 0.0159, 0.0391, 0.0112, 0.0167, 0.0299, 0.0229],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.2109375, delta details: 75.5% (49487 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    23.22 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([4, 32, 512])
+           tensor([-0.0354, -0.0219,  0.0457, -0.0625,  0.0287,  0.0182,  0.0234, -0.1318],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([4, 32, 512])
+           tensor([-0.0645,  0.0133,  0.0620, -0.0236,  0.0398,  0.0013, -0.0065, -0.1089],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0291, 0.0352, 0.0164, 0.0391, 0.0111, 0.0168, 0.0299, 0.0229],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.2109375, delta details: 75.6% (49519 of 65536) elements
+Traceback (most recent call last):
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1812, in <module>
+    ret = test_mla(
+          ^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 129, in wrapper
+    ret = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1642, in test_mla
+    err, us_asm_decode = test_absorb_decode_fp8()
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1510, in test_absorb_decode_fp8
+    checkAllclose(
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 402, in checkAllclose
+    isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py", line 122, in __torch_function__
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: The size of tensor a (32) must match the size of tensor b (16) at non-singleton dimension 1
+
+  batch=4  ctxLen=32768
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 32768,
+                 batch_size                   = 4,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:24:19 1352:1352 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:24:19 1352:1352 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:24:19.201566394 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    38.08 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([4, 32, 512])
+           tensor([-0.0376, -0.0527, -0.0349, -0.0114,  0.0566, -0.0149, -0.0064, -0.0525],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([4, 32, 512])
+           tensor([-0.0225, -0.0320, -0.0143,  0.0146,  0.0723, -0.0286,  0.0104, -0.0664],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0151, 0.0208, 0.0205, 0.0259, 0.0156, 0.0137, 0.0168, 0.0139],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.2109375, delta details: 65.6% (42981 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    38.08 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([4, 32, 512])
+           tensor([-0.0361, -0.0542, -0.0330, -0.0115,  0.0593, -0.0153, -0.0060, -0.0535],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([4, 32, 512])
+           tensor([-0.0225, -0.0320, -0.0143,  0.0146,  0.0723, -0.0286,  0.0104, -0.0664],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0137, 0.0222, 0.0186, 0.0261, 0.0129, 0.0132, 0.0164, 0.0129],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.203125, delta details: 65.5% (42910 of 65536) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    38.08 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([4, 32, 512])
+           tensor([-0.0364, -0.0542, -0.0332, -0.0113,  0.0598, -0.0144, -0.0056, -0.0532],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([4, 32, 512])
+           tensor([-0.0225, -0.0320, -0.0143,  0.0146,  0.0723, -0.0286,  0.0104, -0.0664],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0139, 0.0222, 0.0188, 0.0259, 0.0125, 0.0142, 0.0160, 0.0132],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.203125, delta details: 65.5% (42898 of 65536) elements
+Traceback (most recent call last):
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1812, in <module>
+    ret = test_mla(
+          ^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 129, in wrapper
+    ret = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1642, in test_mla
+    err, us_asm_decode = test_absorb_decode_fp8()
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1510, in test_absorb_decode_fp8
+    checkAllclose(
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 402, in checkAllclose
+    isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py", line 122, in __torch_function__
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: The size of tensor a (32) must match the size of tensor b (16) at non-singleton dimension 1
+
+  batch=16  ctxLen=2048
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 2048,
+                 batch_size                   = 16,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:24:27 1445:1445 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:24:27 1445:1445 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:24:27.638456289 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    19.62 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([16, 32, 512])
+           tensor([ 0.0815, -0.1060, -0.0064,  0.0610, -0.0081,  0.0046, -0.0679,  0.0415],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([16, 32, 512])
+           tensor([-0.0089, -0.0366,  0.0302, -0.0298,  0.0243, -0.0211, -0.0835, -0.0084],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0903, 0.0693, 0.0366, 0.0908, 0.0325, 0.0256, 0.0156, 0.0498],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.265625, delta details: 89.3% (233982 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    19.62 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([16, 32, 512])
+           tensor([ 0.0801, -0.1079, -0.0069,  0.0569, -0.0070,  0.0087, -0.0688,  0.0410],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([16, 32, 512])
+           tensor([-0.0089, -0.0366,  0.0302, -0.0298,  0.0243, -0.0211, -0.0835, -0.0084],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0889, 0.0713, 0.0371, 0.0869, 0.0312, 0.0298, 0.0146, 0.0493],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.265625, delta details: 89.2% (233956 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    19.62 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([16, 32, 512])
+           tensor([ 0.0786, -0.1079, -0.0056,  0.0566, -0.0075,  0.0076, -0.0688,  0.0410],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([16, 32, 512])
+           tensor([-0.0089, -0.0366,  0.0302, -0.0298,  0.0243, -0.0211, -0.0835, -0.0084],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0874, 0.0713, 0.0356, 0.0864, 0.0317, 0.0287, 0.0146, 0.0493],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.265625, delta details: 89.2% (233872 of 262144) elements
+Traceback (most recent call last):
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1812, in <module>
+    ret = test_mla(
+          ^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 129, in wrapper
+    ret = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1642, in test_mla
+    err, us_asm_decode = test_absorb_decode_fp8()
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1510, in test_absorb_decode_fp8
+    checkAllclose(
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 402, in checkAllclose
+    isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py", line 122, in __torch_function__
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: The size of tensor a (32) must match the size of tensor b (16) at non-singleton dimension 1
+
+  batch=16  ctxLen=8192
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 8192,
+                 batch_size                   = 16,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:24:36 1538:1538 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:24:36 1538:1538 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:24:36.426912240 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    29.85 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([16, 32, 512])
+           tensor([-0.0547,  0.0454,  0.0013,  0.0359,  0.0070, -0.0219,  0.0255,  0.0864],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([16, 32, 512])
+           tensor([-0.0435,  0.0309, -0.0161,  0.0211,  0.0179, -0.0383,  0.0066,  0.0234],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0112, 0.0145, 0.0173, 0.0148, 0.0109, 0.0165, 0.0189, 0.0630],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.1953125, delta details: 82.1% (215209 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    29.85 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([16, 32, 512])
+           tensor([-0.0549,  0.0447,  0.0015,  0.0347,  0.0073, -0.0237,  0.0249,  0.0869],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([16, 32, 512])
+           tensor([-0.0435,  0.0309, -0.0161,  0.0211,  0.0179, -0.0383,  0.0066,  0.0234],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0115, 0.0138, 0.0176, 0.0135, 0.0107, 0.0146, 0.0183, 0.0635],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.203125, delta details: 82.1% (215148 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    29.85 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([16, 32, 512])
+           tensor([-0.0547,  0.0447,  0.0007,  0.0339,  0.0073, -0.0070, -0.0227,  0.0251],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([16, 32, 512])
+           tensor([-0.0435,  0.0309, -0.0161,  0.0211,  0.0179,  0.0038, -0.0383,  0.0066],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0112, 0.0138, 0.0167, 0.0128, 0.0106, 0.0109, 0.0156, 0.0186],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.203125, delta details: 82.1% (215149 of 262144) elements
+Traceback (most recent call last):
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1812, in <module>
+    ret = test_mla(
+          ^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 129, in wrapper
+    ret = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1642, in test_mla
+    err, us_asm_decode = test_absorb_decode_fp8()
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1510, in test_absorb_decode_fp8
+    checkAllclose(
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 402, in checkAllclose
+    isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py", line 122, in __torch_function__
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: The size of tensor a (32) must match the size of tensor b (16) at non-singleton dimension 1
+
+  batch=16  ctxLen=32768
+[aiter] import [module_aiter_core] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_aiter_core.so
+[aiter] 
+calling test_mla(ctx_lens                     = 32768,
+                 batch_size                   = 16,
+                 nhead                        = 32,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.float8_e4m3fn,
+                 kvtype                       = torch.float8_e4m3fn,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 decode_qlen                  = 1,
+                 max_split_per_batch          = 32,
+                 non_persistent_mode          = False,
+                 paged_layout                 = LEGACY,
+                 scale_dim                    = 4,
+                 return_lse                   = False)
+[aiter] import [module_mla_metadata] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_metadata.so
+[aiter] LoadKernel: _ZN5aiter36mla_a8w8_qh16_qseqlen1_gqaratio16_psE hsaco: /home/alyrakis/dev-platform/frameworks/aiter/hsa//gfx950/mla/mla_a8w8_qh16_qseqlen1_gqaratio16_ps.co
+[aiter] import [module_mla_reduce] under /home/alyrakis/dev-platform/frameworks/aiter/aiter/jit/module_mla_reduce.so
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-05-26 09:24:45 1631:1631 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-05-26 09:24:45 1631:1631 ActivityProfilerController.cpp:455] profiler_stop
+[W526 09:24:45.370114543 collection.cpp:1182] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[aiter] mla_decode-absorb_fp8    [golden vs aiter_asm]:    69.47 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([16, 32, 512])
+           tensor([ 0.0175, -0.0835, -0.0549, -0.0048,  0.0322, -0.0287,  0.0156, -0.0011],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([16, 32, 512])
+           tensor([ 0.0050, -0.0684, -0.0393,  0.0082,  0.0078, -0.0146,  0.0267,  0.0225],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0125, 0.0151, 0.0156, 0.0130, 0.0244, 0.0141, 0.0111, 0.0236],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.171875, delta details: 69.7% (182734 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]:    69.47 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([16, 32, 512])
+           tensor([ 0.0167, -0.0845, -0.0530, -0.0039,  0.0320, -0.0288,  0.0157, -0.0008],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([16, 32, 512])
+           tensor([ 0.0050, -0.0684, -0.0393,  0.0082,  0.0078, -0.0146,  0.0267,  0.0225],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0117, 0.0161, 0.0137, 0.0121, 0.0242, 0.0142, 0.0110, 0.0233],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.171875, delta details: 69.7% (182617 of 262144) elements
+[aiter] mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]:    69.47 us......[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([16, 32, 512])
+           tensor([ 0.0170, -0.0845, -0.0530, -0.0045,  0.0327, -0.0293,  0.0160, -0.0005],
+       device='cuda:0', dtype=torch.bfloat16)
+    b    : torch.Size([16, 32, 512])
+           tensor([ 0.0050, -0.0684, -0.0393,  0.0082,  0.0078, -0.0146,  0.0267,  0.0225],
+       device='cuda:0', dtype=torch.bfloat16)
+    delta:
+           tensor([0.0120, 0.0161, 0.0137, 0.0126, 0.0249, 0.0147, 0.0107, 0.0229],
+       device='cuda:0', dtype=torch.bfloat16)
+[aiter] -->max abs delta:1.171875, delta details: 69.7% (182647 of 262144) elements
+Traceback (most recent call last):
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1812, in <module>
+    ret = test_mla(
+          ^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 129, in wrapper
+    ret = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1642, in test_mla
+    err, us_asm_decode = test_absorb_decode_fp8()
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/alyrakis/dev-platform/frameworks/aiter/op_tests/test_mla_persistent.py", line 1510, in test_absorb_decode_fp8
+    checkAllclose(
+  File "/home/alyrakis/dev-platform/frameworks/aiter/aiter/test_common.py", line 402, in checkAllclose
+    isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_device.py", line 122, in __torch_function__
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: The size of tensor a (32) must match the size of tensor b (16) at non-singleton dimension 1
+
+
