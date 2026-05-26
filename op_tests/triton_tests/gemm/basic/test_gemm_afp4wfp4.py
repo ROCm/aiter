@@ -283,7 +283,6 @@ def test_gemm_afp4_wfp4(
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     if shuffle_weight_scales:
-        use_aot: bool = dtype == torch.bfloat16
         triton_out = gemm_afp4wfp4_preshuffle(
             x,
             w_triton,
@@ -291,7 +290,6 @@ def test_gemm_afp4_wfp4(
             w_scales_triton,
             dtype,
             y,
-            use_aot=use_aot,
             skip_reduce=skip_reduce,
         )
     else:
