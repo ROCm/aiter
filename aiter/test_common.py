@@ -237,7 +237,7 @@ def run_perftest(
     *args,
     num_iters=101,
     num_warmup=2,
-    testGraph=True,
+    testGraph=False,
     num_rotate_args=0,
     needTrace=False,
     **kwargs,
