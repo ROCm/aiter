@@ -62,7 +62,10 @@ def topk(
     # NOTE: these are not returned
     y_vals = torch.empty((n_rows, k), dtype=x.dtype, device=dev)
     y_indx = torch.empty((n_rows, k), dtype=torch.int16, device=dev)
-    k_pow2 = triton.next_power_of_2(k)
+    # Triton's tl.topk fails to compile for k=1 (log_k=0 reduces the hypercube
+    # to a 0-D tensor; the final reshape hits dtype.numel). Pad to ≥ 2 — the
+    # kernel already masks N_EXPTS_ACT < N_EXPTS_ACT_PAD on store.
+    k_pow2 = max(2, triton.next_power_of_2(k))
     # create bitmatrix in transposed memory layout:
     n_cols_pad = triton.cdiv(n_cols, BLOCK_N) * BLOCK_N
     n_cols_words = n_cols_pad // 32
@@ -163,7 +166,8 @@ def hash_routing(
 
     y_vals = torch.empty((n_rows, k), dtype=router_logits.dtype, device=dev)
     y_indx = torch.empty((n_rows, k), dtype=torch.int16, device=dev)
-    k_pow2 = triton.next_power_of_2(k)
+    # See note in topk(): pad to ≥ 2 to dodge tl.topk(k=1) compile bug.
+    k_pow2 = max(2, triton.next_power_of_2(k))
 
     n_cols_pad = triton.cdiv(n_cols, BLOCK_N) * BLOCK_N
     n_cols_words = n_cols_pad // 32
