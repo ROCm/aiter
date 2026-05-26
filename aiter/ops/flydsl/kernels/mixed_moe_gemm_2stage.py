@@ -29,11 +29,8 @@ from flydsl.expr import arith, gpu, buffer_ops, vector, rocdl, const_expr
 from flydsl._mlir.dialects import llvm, scf, memref
 from flydsl._mlir.dialects.arith import CmpIPredicate
 
-from aiter.ops.flydsl.kernels.quant_utils import (
-    emit_f32_to_e2m1,
-    emit_fp4_e8m0_scale_round_up,
-    emit_fp8_e8m0_scale_round_up_legacy,
-)
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
+from aiter.utility.mx_types import MxDtypeInt as _D, MxScaleRoundModeInt as _M
 
 from .mfma_preshuffle_pipeline import (
     _buffer_load_vec,
@@ -2228,9 +2225,17 @@ def compile_mixed_moe_gemm1(
                 # 1.0f / 6.0f ? 0.16666666 fp32 bits (FP4 ceil_pow2(amax/6) scale).
                 _c0x3E2AAAAB_i32 = arith.constant(0x3E2AAAAB, type=T.i32)
 
-                _c8_i32 = arith.constant(8, type=T.i32)
-                _fp_headroom = 2 if _need_fp4 else (8 if _need_fp8 else 0)
-                _c_headroom_i32 = arith.constant(_fp_headroom, type=T.i32)
+                # NV ROUND_UP / torchao RCEIL block-scale formula
+                # (``ceil_pow2(amax / max_pos)``); FP8 dtype follows the HW
+                # FP8 variant (gfx942 e4m3fnuz max=240, gfx950+ e4m3fn max=448).
+                if _need_fp4:
+                    _mx_dtype = _D.FP4_E2M1
+                elif _need_fp8:
+                    _mx_dtype = (
+                        _D.FP8_E4M3_FNUZ if gpu_arch == "gfx942" else _D.FP8_E4M3
+                    )
+                else:
+                    _mx_dtype = None
 
                 # FP4/FP8 scale and f32->fp4 conversion are shared with
                 # silu_and_mul_fq; helpers live in
@@ -2266,16 +2271,11 @@ def compile_mixed_moe_gemm1(
                             peer = local_max.shuffle_xor(off, _c64_i32)
                             local_max = arith.maximumf(local_max, peer)
 
-                        if const_expr(_need_fp4):
-                            # FP4 industry default (NV ROUND_UP / DSv4 / FlashInfer):
-                            # scale = ceil_pow2(amax / 6). 0% max-value clipping.
-                            e8m0_biased = emit_fp4_e8m0_scale_round_up(local_max)
-                        else:
-                            # FP8 path keeps the legacy Group D 1.5-threshold
-                            # round-up; not aligned to NV ROUND_UP this PR.
-                            e8m0_biased = emit_fp8_e8m0_scale_round_up_legacy(
-                                local_max, headroom_i32=_c_headroom_i32
-                            )
+                        # Same formula for FP4 / FP8; only ``max_pos`` differs
+                        # (selected by ``_mx_dtype``).
+                        e8m0_biased = emit_mx_e8m0_scale(
+                            local_max, mode=_M.RoundUp, dtype=_mx_dtype
+                        )
 
                         quant_exp = _c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << _c23_i32).bitcast(T.f32)

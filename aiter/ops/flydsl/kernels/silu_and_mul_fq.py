@@ -28,12 +28,10 @@ from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
 
 from flydsl._mlir import ir
+from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
-from aiter.ops.flydsl.kernels.quant_utils import (
-    emit_f32_to_e2m1,
-    emit_fp4_e8m0_scale_round_up,
-    emit_fp8_e8m0_scale_round_up_legacy,
-)
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
+from aiter.utility.mx_types import MxDtypeInt as _D, MxScaleRoundModeInt as _M
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import buffer_ops
 
@@ -61,7 +59,9 @@ def build_silu_and_mul_fq_module(
         Number of expert slots per token.
     quant_mode : str
         "fp4"  -> MXFP4 output + e8m0 scale (tiled layout)
-        "fp8"  -> MXFP8 (e4m3fn) output + e8m0 scale (tiled layout)
+        "fp8"  -> MXFP8 output + e8m0 scale (tiled layout). Element dtype is
+                  arch-dependent: e4m3fnuz (gfx942) or e4m3fn (gfx950+); the
+                  E8M0 RoundUp scale formula picks ``max_pos`` accordingly.
         "none" -> bf16 output, no quantization (out_scale_sorted ignored)
     gui_layout : bool
         False -> input is gate-up separated  [gate_0:N | up_0:N]
@@ -90,12 +90,20 @@ def build_silu_and_mul_fq_module(
         SHUFFLE_DISTS.append(d)
         d *= 2
 
-    _fp_headroom = 2 if _need_fp4 else 8
-
     elem_bytes_bf16 = 2
 
     if _need_fp8:
         from flydsl._mlir.dialects import rocdl
+
+    # All four MXFP4/MXFP8 scale modes share NV ROUND_UP today (industry default,
+    # 0% max-value clipping). FP8 dtype follows the HW FP8 variant: gfx942 ships
+    # e4m3fnuz (max=240), gfx950+ ships OCP e4m3fn (max=448).
+    if _need_fp4:
+        _mx_dtype = _D.FP4_E2M1
+    elif _need_fp8:
+        _mx_dtype = _D.FP8_E4M3_FNUZ if get_hip_arch() == "gfx942" else _D.FP8_E4M3
+    else:
+        _mx_dtype = None
 
     @flyc.kernel
     def silu_and_mul_fq_kernel(
@@ -129,7 +137,6 @@ def build_silu_and_mul_fq_module(
         c256_i32 = arith.constant(256, type=i32)
         c0_f32 = arith.constant(0.0, type=f32)
         c1_f32 = arith.constant(1.0, type=f32)
-        c_headroom_i32 = arith.constant(_fp_headroom, type=i32)
 
         scale_cols_i32 = arith.constant(scale_cols, type=i32)
         inter_dim_i32 = arith.constant(inter_dim, type=i32)
@@ -318,16 +325,12 @@ def build_silu_and_mul_fq_module(
                             peer = local_max.shuffle_xor(off, c64_i32)
                             local_max = arith.maximumf(local_max, peer)
 
-                        if const_expr(_need_fp4):
-                            # FP4 industry default (NV ROUND_UP / DSv4 / FlashInfer):
-                            # scale = ceil_pow2(amax / 6). 0% max-value clipping.
-                            e8m0_biased = emit_fp4_e8m0_scale_round_up(local_max)
-                        else:
-                            # FP8 path keeps the legacy Group D 1.5-threshold
-                            # round-up; not aligned to NV ROUND_UP this PR.
-                            e8m0_biased = emit_fp8_e8m0_scale_round_up_legacy(
-                                local_max, headroom_i32=c_headroom_i32
-                            )
+                        # NV ROUND_UP / torchao RCEIL: scale = ceil_pow2(amax / max_pos),
+                        # 0% max-value clipping. Same formula for FP4 / FP8; only
+                        # max_pos differs (selected by ``_mx_dtype``).
+                        e8m0_biased = emit_mx_e8m0_scale(
+                            local_max, mode=_M.RoundUp, dtype=_mx_dtype
+                        )
                         quant_exp = c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << c23_i32).bitcast(f32)
 

@@ -121,6 +121,12 @@ def emit_mx_e8m0_scale(
     c0x7FFFFF_i32 = arith.constant(0x7FFFFF, type=T.i32)  # f32 mantissa mask
     target_max_pow2_i32 = arith.constant(target_max_pow2, type=T.i32)
 
+    def _clamp_u8(x):
+        # Defensive clamp into the E8M0 storage range [0, 0xFF]. Pathological
+        # inputs (denormals, fp32 inf, mantissa bump from 0xFF -> 0x100) can
+        # otherwise corrupt the stored uint8.
+        return arith.minsi(arith.maxsi(x, c0_i32), c0xFF_i32)
+
     if mode_int == _M.RoundUp:
         # ceil_pow2(amax / max_pos): multiply by reciprocal of max_pos to get
         # the working value, then bump the exponent if any mantissa bit is
@@ -139,14 +145,14 @@ def emit_mx_e8m0_scale(
             biased_exp + c1_i32,
             biased_exp,
         )
-        return arith.maxsi(exp_field, c0_i32)
+        return _clamp_u8(exp_field)
 
     if mode_int == _M.RoundDown:
         # floor_pow2(amax) / 2^target_max_pow2: drop the f32 mantissa, then
         # subtract target_max_pow2 from the biased exponent.
         amax_i32 = local_max.bitcast(T.i32)
         biased_exp = (amax_i32 >> c23_i32) & c0xFF_i32
-        return arith.maxsi(biased_exp - target_max_pow2_i32, c0_i32)
+        return _clamp_u8(biased_exp - target_max_pow2_i32)
 
     if mode_int == _M.Ceil:
         # ceil_pow2(amax) / 2^target_max_pow2: same as RoundDown but bump
@@ -160,7 +166,7 @@ def emit_mx_e8m0_scale(
             biased_exp + c1_i32,
             biased_exp,
         )
-        return arith.maxsi(biased_exp_bumped - target_max_pow2_i32, c0_i32)
+        return _clamp_u8(biased_exp_bumped - target_max_pow2_i32)
 
     if mode_int == _M.Even:
         # round_pow2_special(amax) / 2^target_max_pow2: add a half-step at
@@ -175,7 +181,7 @@ def emit_mx_e8m0_scale(
         amax_i32 = local_max.bitcast(T.i32)
         amax_rounded = (amax_i32 + c_val_add) & c_sign_exp_mask
         biased_exp = (amax_rounded >> c23_i32) & c0xFF_i32
-        return arith.maxsi(biased_exp - target_max_pow2_i32, c0_i32)
+        return _clamp_u8(biased_exp - target_max_pow2_i32)
 
     raise ValueError(
         f"emit_mx_e8m0_scale: unknown mode int {mode_int} for {mode!r} "
@@ -183,56 +189,6 @@ def emit_mx_e8m0_scale(
         f"RoundDown={_M.RoundDown}, RoundUp={_M.RoundUp}, "
         f"Even={_M.Even}, Ceil={_M.Ceil})"
     )
-
-
-def emit_fp4_e8m0_scale_round_up(local_max):
-    """FP4 NV ROUND_UP block-scale -- thin alias for callers / git history.
-
-    Equivalent to::
-
-        emit_mx_e8m0_scale(local_max,
-                           mode=MxScaleRoundModeInt.RoundUp,
-                           dtype=MxDtypeInt.FP4_E2M1)
-
-    See :func:`emit_mx_e8m0_scale` for the full mode/dtype semantics. New
-    code should prefer the generic entry point so the choice of mode and
-    dtype is explicit at the call site.
-    """
-    return emit_mx_e8m0_scale(local_max, mode=_M.RoundUp, dtype=_D.FP4_E2M1)
-
-
-def emit_fp8_e8m0_scale_round_up_legacy(local_max, *, headroom_i32):
-    """Legacy aiter Group D FP8 e8m0 scale: ``round_pow2_1.5(amax) / 2^headroom``.
-
-    **Not** part of the PyTorch torchao 4-mode family. This is an aiter-
-    specific historical formula (round-half-up on the f32 mantissa MSB)
-    used by the FlyDSL FP8 activation path pre-this-PR. The FP8 path was
-    deliberately not migrated to NV ROUND_UP in this PR to keep a8w4
-    sweep results stable; aligning it to ``emit_mx_e8m0_scale(mode=RoundUp,
-    dtype=FP8_E4M3)`` (which matches NV TransformerEngine MXFP8 /
-    DeepSeek-V3.1 ``scale_fmt=ue8m0``) is a follow-up PR.
-
-    Numerically this is equivalent to ``emit_mx_e8m0_scale(mode=Even, ...)``
-    with a non-physical ``mbits=0`` and a runtime ``headroom_i32``; the
-    standalone helper is kept for clarity.
-
-    Args:
-        local_max: f32 IR value, the (warp-reduced) ``max(|x|)`` of the block.
-        headroom_i32: i32 IR value = ``log2(max_pow2(target_dtype))``. For
-            FP8 e4m3 with ``max_pow2 = 256 = 2^8`` use ``headroom_i32 = 8``.
-
-    Returns:
-        e8m0_biased: i32 IR value in the range ``[0, 0xFF]``.
-    """
-    c0_i32 = arith.constant(0, type=T.i32)
-    c23_i32 = arith.constant(23, type=T.i32)
-    c0x400000_i32 = arith.constant(0x400000, type=T.i32)  # 0.5 * 2^23
-    c0xFF800000_i32 = arith.constant(0xFF800000, type=T.i32)  # sign+exp mask
-
-    max_i32 = local_max.bitcast(T.i32)
-    max_rounded = (max_i32 + c0x400000_i32) & c0xFF800000_i32
-    exp_field = max_rounded >> c23_i32
-    return arith.maxsi(exp_field - headroom_i32, c0_i32)
 
 
 def emit_f32_to_e2m1(qx_f32):
