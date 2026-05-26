@@ -130,8 +130,8 @@ def emit_mx_e8m0_scale(
     if mode_int == _M.RoundUp:
         # ceil_pow2(amax / max_pos): multiply by reciprocal of max_pos to get
         # the working value, then bump the exponent if any mantissa bit is
-        # set. Bit-equivalent to HIP ``aiter::fp4_f32_to_e8m0_scale`` (when
-        # dtype=FP4_E2M1) and to PyTorch torchao ``_to_mx_rceil`` (modulo
+        # set. Bit-equivalent to HIP ``aiter::fp_f32_to_e8m0_scale<RoundUp,
+        # FP4_E2M1>`` and to PyTorch torchao ``_to_mx_rceil`` (modulo
         # the GPU-vs-CPU fp32 ULP boundary effects documented in the PR).
         c_inv_max_pos = arith.constant(max_pos_inv_bits, type=T.i32)
         inv_max_pos_f32 = c_inv_max_pos.bitcast(T.f32)

@@ -1600,7 +1600,7 @@ __global__ void mxfp4_quant_moe_sort_kernel(
 
     // HW-native FP8 element dtype: gfx942 ships e4m3fnuz (max_pos=240),
     // gfx950+ ships OCP e4m3fn (max_pos=448). The legacy
-    // ``fp4_f32_to_e8m0_scale(absMax) * 1/floor_pow2(MAX)`` formula here used
+    // ``fp_f32_to_e8m0_scale<RoundUp, FP4>(absMax) * 1/floor_pow2(MAX)`` formula here used
     // to over-scale the FP8 working value by ~2x (factor*amax > max_pos),
     // saturating the high tail; emit_mx_e8m0_scale<RoundUp, dtype> picks the
     // correct ``ceil_pow2(amax / max_pos)`` per arch instead.
@@ -1665,8 +1665,7 @@ __global__ void mxfp4_quant_moe_sort_kernel(
             float row_scale;
             if constexpr (std::is_same_v<DTYPE_O, opus::fp4_t>)
             {
-                row_scale = aiter::fp_f32_to_e8m0_scale<aiter::MxScaleRoundMode::RoundUp,
-                                                       aiter::MxDtype::FP4_E2M1>(absMax);
+                row_scale = aiter::fp4_f32_to_e8m0_scale(absMax);
             }
             else if constexpr (std::is_same_v<DTYPE_O, opus::fp8_t>)
             {

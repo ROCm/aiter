@@ -150,9 +150,22 @@ def f32_to_mx_e8m0_scale(
     )
 
 
+def fp4_f32_to_e8m0_scale(amax: Tensor) -> Tensor:
+    """Default MXFP4 E8M0 block scale: NV ROUND_UP / RCEIL with FP4 E2M1.
+
+    Thin convenience alias for ``f32_to_mx_e8m0_scale(amax,
+    mode=RoundUp, dtype=FP4_E2M1)`` -- i.e. ``ceil_pow2(amax / 6)``,
+    the industry-default MXFP4 formula (DSv4 Pro / FlashInfer / torchao
+    RCEIL). 1:1 mirror of the HIP helper
+    ``aiter::fp4_f32_to_e8m0_scale`` in ``csrc/include/mx_quant_utils.h``.
+    """
+    return f32_to_mx_e8m0_scale(
+        amax, mode=MxScaleRoundMode.RoundUp, dtype=MxDtype.FP4_E2M1
+    )
+
+
 # ---------------------------------------------------------------------------
-# Low-level implementation (used by both the generic dispatcher above and
-# the legacy thin-wrapper helpers below).
+# Low-level implementation used by the generic dispatcher above.
 #
 # ``_f32_to_e8m0_floor_impl`` and ``_f32_to_e8m0_ceil_impl`` are the only
 # two primitives that touch the f32 bit pattern; they take an
@@ -185,99 +198,6 @@ def _f32_to_e8m0_ceil_impl(x: Tensor) -> Tensor:
     exponent = torch.where(bump, exponent + 1, exponent)
     exponent[nan_case] = 0xFF
     return exponent.view(dtypes.fp8_e8m0)
-
-
-# ---------------------------------------------------------------------------
-# Backwards-compatible API surface.
-#
-# These thin wrappers preserve the original signatures used by callers in
-# ``aiter.ops.quant`` and ``op_tests/test_activation.py``. New code should
-# prefer :func:`f32_to_mx_e8m0_scale` so the choice of mode and dtype is
-# explicit at the call site.
-#
-# Naming matches PyTorch torchao's ``ScaleCalculationMode`` (FLOOR / RCEIL
-# / CEIL / EVEN) so callers porting code from torchao keep familiar names.
-# ---------------------------------------------------------------------------
-
-
-def f32_to_e8m0(x: Tensor) -> Tensor:
-    """Floor pow2 of x, encoded as E8M0 (caller passes ``amax / divisor``).
-
-    Generic primitive; for typed MX scaling prefer :func:`f32_to_mx_e8m0_scale`.
-
-    Cross-stack equivalence (caller controls divisor):
-      - ``f32_to_e8m0(amax / 4)``   == OCP RoundDown / torchao FLOOR (FP4)
-      - ``f32_to_e8m0(amax / 256)`` == OCP RoundDown / torchao FLOOR (FP8 e4m3)
-    """
-    return _f32_to_e8m0_floor_impl(x)
-
-
-def f32_to_e8m0_ceil(x: Tensor) -> Tensor:
-    """Ceil pow2 of x, encoded as E8M0 (caller passes ``amax / divisor``).
-
-    Generic primitive; for typed MX scaling prefer :func:`f32_to_mx_e8m0_scale`.
-
-    Cross-stack equivalence (caller controls divisor):
-      - ``f32_to_e8m0_ceil(amax / 6)``   == NV ROUND_UP / torchao RCEIL (FP4)
-      - ``f32_to_e8m0_ceil(amax / 448)`` == NV ROUND_UP / torchao RCEIL (FP8 e4m3)
-      - ``f32_to_e8m0_ceil(amax / 4)``   == torchao CEIL (FP4, coarser)
-    """
-    return _f32_to_e8m0_ceil_impl(x)
-
-
-# Alias retained because the primitive ``f32_to_e8m0`` is the OCP / torchao
-# FLOOR semantic (caller divides upfront). New code: prefer the generic
-# ``f32_to_mx_e8m0_scale(mode=RoundDown, dtype=...)`` entry point.
-f32_to_e8m0_floor = f32_to_e8m0
-
-
-def f32_to_e8m0_rceil(amax: Tensor, max_pos: float = 6.0) -> Tensor:
-    """torchao RCEIL: ``ceil_pow2(amax / max_pos)`` encoded as E8M0.
-
-    Default ``max_pos = 6.0`` matches FP4 E2M1 (industry-standard NV
-    ROUND_UP / DSv4 / FlashInfer); pass ``max_pos = 448.0`` for FP8 e4m3.
-
-    Equivalent to::
-
-        f32_to_mx_e8m0_scale(amax, mode=MxScaleRoundMode.RoundUp,
-                             dtype=MxDtype.FP4_E2M1)   # max_pos=6.0
-        f32_to_mx_e8m0_scale(amax, mode=MxScaleRoundMode.RoundUp,
-                             dtype=MxDtype.FP8_E4M3)   # max_pos=448.0
-
-    For arbitrary (non-supported) ``max_pos`` values, falls back to the
-    primitive ceil path.
-    """
-    return _f32_to_e8m0_ceil_impl(amax / max_pos)
-
-
-def f32_to_e8m0_torchao_ceil(amax: Tensor, max_pow2: float = 4.0) -> Tensor:
-    """torchao CEIL: ``ceil_pow2(amax / max_pow2)`` encoded as E8M0.
-
-    Default ``max_pow2 = 4.0`` matches FP4 (largest pow-2 <= FP4 max
-    normal of 6.0). 0% max-value clipping but coarser grid than
-    :func:`f32_to_e8m0_rceil`.
-
-    Equivalent to ``f32_to_mx_e8m0_scale(amax, mode=Ceil, dtype=FP4_E2M1)``
-    (default) or ``dtype=FP8_E4M3`` for ``max_pow2 = 256.0``.
-    """
-    return _f32_to_e8m0_ceil_impl(amax / max_pow2)
-
-
-def f32_to_e8m0_even(amax: Tensor, max_pow2: float = 4.0) -> Tensor:
-    """torchao EVEN / Quark EVEN: ``round_pow2_special(amax) / max_pow2``
-    encoded as E8M0.
-
-    ``val_to_add = 0x200000`` matches FP4 (mbits=1, "1.5x threshold");
-    matches the +0x200000 mantissa bump used by AMD Quark's EVEN mode and
-    torchao's ``ScaleCalculationMode.EVEN``.
-
-    For other dtypes use :func:`f32_to_mx_e8m0_scale` -- the generic
-    entry point uses the dtype-aware ``val_to_add = 1 << (23 - mbits - 1)``.
-    """
-    u32 = amax.view(torch.int32)
-    rounded = (u32 + 0x200000) & 0xFF800000
-    rounded_f = rounded.view(torch.float32)
-    return _f32_to_e8m0_floor_impl(rounded_f / max_pow2)
 
 
 def e8m0_to_f32(scale_e8m0_biased):

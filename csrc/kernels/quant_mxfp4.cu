@@ -124,10 +124,10 @@ void quant_mxfp4_kernel(
     uint8_t biased_exp;
 
     if constexpr (rmode == MxScaleRoundMode::RoundDown) {
-        dequant_scale = aiter::fp4_f32_to_e8m0_scale_ocp(group_max);
+        dequant_scale = aiter::fp_f32_to_e8m0_scale<aiter::MxScaleRoundMode::RoundDown, aiter::MxDtype::FP4_E2M1>(group_max);
         biased_exp    = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
     } else if constexpr (rmode == MxScaleRoundMode::RoundUp) {
-        dequant_scale = aiter::fp4_f32_to_e8m0_scale(group_max);
+        dequant_scale = aiter::fp_f32_to_e8m0_scale<aiter::MxScaleRoundMode::RoundUp, aiter::MxDtype::FP4_E2M1>(group_max);
         biased_exp    = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
     } else if constexpr (rmode == MxScaleRoundMode::Even) {
         max_bits          = (max_bits + EVEN_ROUND_VAL_TO_ADD) & EVEN_ROUND_FP32_SIGN_EXP_MASK;
@@ -141,7 +141,7 @@ void quant_mxfp4_kernel(
         // torchao CEIL: ceil_pow2(amax) / 4. Same as RoundDown but bumps the
         // exponent by 1 whenever any mantissa bit is set, so scale is the
         // smallest power-of-two >= amax/4 (vs. RoundDown's largest pow2 <= amax/4).
-        dequant_scale = aiter::fp4_f32_to_e8m0_scale_ceil(group_max);
+        dequant_scale = aiter::fp_f32_to_e8m0_scale<aiter::MxScaleRoundMode::Ceil, aiter::MxDtype::FP4_E2M1>(group_max);
         biased_exp    = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
     }
 

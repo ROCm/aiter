@@ -133,27 +133,23 @@ def per_1x32_f4_quant(
     x = x.view(-1, block_size)
     max_abs = torch.amax(torch.abs(x.float()), 1)
 
-    # E8M0 block-scale dispatch. RoundUp uses max_pos=6 (FP4 max normal);
-    # the other three rely on max_pow2=4 (largest pow-2 <= 6) by spec.
-    # See MxScaleRoundMode docstring for cross-stack equivalences.
-    # Normalise int / pybind enum into a plain int -- pybind11 enum classes
-    # don't auto-compare equal to ``int`` (unlike ``IntEnum``).
-    round_mode_int = int(round_mode)
-    if round_mode_int == int(MxScaleRoundMode.RoundDown):
-        scale_e8m0_biased = fp4_utils.f32_to_e8m0_floor(max_abs / 4.0)
-    elif round_mode_int == int(MxScaleRoundMode.RoundUp):
-        scale_e8m0_biased = fp4_utils.f32_to_e8m0_rceil(max_abs, max_pos=6.0)
-    elif round_mode_int == int(MxScaleRoundMode.Even):
-        scale_e8m0_biased = fp4_utils.f32_to_e8m0_even(max_abs, max_pow2=4.0)
-    elif round_mode_int == int(MxScaleRoundMode.Ceil):
-        scale_e8m0_biased = fp4_utils.f32_to_e8m0_torchao_ceil(max_abs, max_pow2=4.0)
-    else:
+    # E8M0 block-scale dispatch via the generic helper; ``mode`` selects the
+    # formula (RoundDown / RoundUp / Even / Ceil) and ``dtype`` selects the
+    # ``max_pos`` / ``target_max_pow2`` / ``mbits`` constants -- see
+    # MxScaleRoundMode docstring for cross-stack equivalences.
+    from aiter.utility.mx_types import MxDtype as _MxDtype
+
+    try:
+        scale_e8m0_biased = fp4_utils.f32_to_mx_e8m0_scale(
+            max_abs, mode=round_mode, dtype=_MxDtype.FP4_E2M1
+        )
+    except ValueError as e:
         raise ValueError(
             "per_1x32_f4_quant: invalid "
             f"round_mode={round_mode!r} (type={type(round_mode).__name__}); "
             "expected 0 (RoundDown/FLOOR), 1 (RoundUp/RCEIL), "
             "2 (Even), 3 (Ceil), or any MxScaleRoundMode value."
-        )
+        ) from e
 
     scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0_biased)
 
@@ -764,7 +760,7 @@ def quant_mxfp4_hip(
 
     When ``round_mode == RoundUp`` and no shuffle/gate_up flags are set, this
     routes to :func:`per_1x32_f4_quant_hip` (the default FP4 path using
-    ``fp4_f32_to_e8m0_scale = ceil_pow2(amax/6)``).
+    ``fp_f32_to_e8m0_scale<RoundUp, FP4_E2M1> = ceil_pow2(amax/6)``).
 
     Args:
         x: Input tensor, 2D, contiguous, dtype ``float16`` or ``bfloat16``.
@@ -805,7 +801,7 @@ def quant_mxfp4_hip(
 
     # RoundUp (NV / DSv4 default) without a16w4/gate_up/shuffle_weight ->
     # route to dynamic_per_group_scaled_quant_fp4 (the default FP4 quant path
-    # which uses fp4_f32_to_e8m0_scale = ceil_pow2(amax/6)).
+    # which uses fp_f32_to_e8m0_scale<RoundUp, FP4_E2M1> = ceil_pow2(amax/6)).
     # Skip on gfx942: dynamic_per_group_scaled_quant_fp4 requires
     # __Float4_e2m1fn_x2 which is not available on gfx942; fall through
     # to the quant_mxfp4 kernel instead.
@@ -908,7 +904,7 @@ def fused_dynamic_mxfp8_quant_moe_sort(
     """HIP replacement for Triton fused_quant_fp8_sort.
 
     Returns (fp8_out, e8m0_scale) with the scale tensor laid out as
-    (pad32(M_o), N_o) fp8_e8m0 — the same byte layout the FlyDSL stage1/stage2
+    (pad32(M_o), N_o) fp8_e8m0 -- the same byte layout the FlyDSL stage1/stage2
     GEMM consumes. ``topk`` is accepted for parity with the fp4 wrapper but
     is inferred inside the HIP launcher from ``input.numel() / (cols * token_num)``.
     """

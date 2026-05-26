@@ -173,47 +173,14 @@ __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Backwards-compatible thin wrappers (specialized for FP4 E2M1).
-//
-// These preserve the names/signatures used by callers in
-// ``csrc/kernels/quant_kernels.cu`` and elsewhere. New code should prefer
-// the generic ``fp_f32_to_e8m0_scale<rmode, dtype>`` so the choice of mode
-// and dtype is explicit at the call site.
-// ---------------------------------------------------------------------------
-
-// Default MXFP4 E8M0 scale: NV ROUND_UP / DSv4 Pro / FlashInfer (industry
-// mainstream). scale = ceil_pow2(amax / 6). 0% max-value clipping.
+// Default MXFP4 E8M0 scale helper: NV ROUND_UP / DSv4 / FlashInfer / torchao
+// RCEIL with FP4 E2M1 constants, i.e. ``ceil_pow2(amax / 6)``. This is the
+// industry-default MXFP4 block-scale formula and is preserved as a named
+// alias for readability / 1:1 mapping with the Python helper
+// :func:`aiter.utility.fp4_utils.fp4_f32_to_e8m0_scale`.
 __device__ __forceinline__ float fp4_f32_to_e8m0_scale(float amax)
 {
     return fp_f32_to_e8m0_scale<MxScaleRoundMode::RoundUp, MxDtype::FP4_E2M1>(amax);
-}
-
-// BC alias of fp4_f32_to_e8m0_scale (RCEIL / RoundUp).
-__device__ __forceinline__ float fp4_f32_to_e8m0_scale_roundup(float amax)
-{
-    return fp_f32_to_e8m0_scale<MxScaleRoundMode::RoundUp, MxDtype::FP4_E2M1>(amax);
-}
-
-// OCP standard / NV ROUND_DOWN / torchao FLOOR:
-// scale = floor_pow2(amax) / 4. ~37% max clipping. Opt-in only.
-__device__ __forceinline__ float fp4_f32_to_e8m0_scale_ocp(float amax)
-{
-    return fp_f32_to_e8m0_scale<MxScaleRoundMode::RoundDown, MxDtype::FP4_E2M1>(amax);
-}
-
-// torchao CEIL: scale = ceil_pow2(amax) / 4. 0% max-value clipping but
-// coarser grid than ``fp4_f32_to_e8m0_scale``.
-__device__ __forceinline__ float fp4_f32_to_e8m0_scale_ceil(float amax)
-{
-    return fp_f32_to_e8m0_scale<MxScaleRoundMode::Ceil, MxDtype::FP4_E2M1>(amax);
-}
-
-// AMD Quark EVEN / torchao EVEN: scale =
-// floor_pow2(round_pow2_special(amax)) / 4 with val_to_add = 0x200000.
-__device__ __forceinline__ float fp4_f32_to_e8m0_scale_even(float amax)
-{
-    return fp_f32_to_e8m0_scale<MxScaleRoundMode::Even, MxDtype::FP4_E2M1>(amax);
 }
 
 // Compute the swizzled E8M0 scale index for tiled FP4 layout.

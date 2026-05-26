@@ -164,7 +164,7 @@ __global__ void hadamard_rotate_activation_fp4quant_inplace_kernel(DTYPE_I* __re
         int num_thread_per_group = group_size / vec_size;
         absMax                  = multithread_reduce(absMax, max_op, num_thread_per_group);
 
-        float scale = aiter::fp4_f32_to_e8m0_scale_roundup(absMax);
+        float scale = aiter::fp4_f32_to_e8m0_scale(absMax);
 
         auto a_fp4       = scaled_cast<opus::fp4_t>(af, scale);
         halfxvec_t a_out = scaled_cast<DTYPE_I>(a_fp4, scale);
@@ -387,7 +387,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_inplace_kernel(DTYPE_I*
         int num_thread_per_group = group_size / vec_size;
         absMax                  = multithread_reduce(absMax, max_op, num_thread_per_group);
 
-        float scale = aiter::fp4_f32_to_e8m0_scale_roundup(absMax);
+        float scale = aiter::fp4_f32_to_e8m0_scale(absMax);
 
         auto a_fp4       = scaled_cast<opus::fp4_t>(af, scale);
         halfxvec_t a_out = scaled_cast<DTYPE_I>(a_fp4, scale);
