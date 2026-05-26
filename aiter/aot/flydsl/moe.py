@@ -94,6 +94,8 @@ def parse_csv(csv_path: str):
             experts = int(row["expert"])
             topk = int(row["topk"])
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
+            hidden_pad = int(row.get("hidden_pad", "0") or "0")
+            intermediate_pad = int(row.get("intermediate_pad", "0") or "0")
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
             act_type = row.get("act_type", "")
@@ -102,19 +104,8 @@ def parse_csv(csv_path: str):
                 if act_type.strip().split(".")[-1].lower() == "swiglu"
                 else "silu"
             )
-            q_type = row.get("q_type", "")
-            dtype = row.get("dtype", "")
-            q_dtype_w = row.get("q_dtype_w", "")
             swiglu_limit = _row_swiglu_limit(row)
-            # Cover both runtime bias choices for fp4-weight MoE. Model configs
-            # share kernel families, and runtime bias selection can vary by
-            # activation dtype/model semantics.
-            bias_supported = (
-                q_type.strip().split(".")[-1] == "per_1x32"
-                and dtype in ("torch.bfloat16", "torch.float16")
-                and "float4_e2m1fn_x2" in q_dtype_w
-            )
-            enable_bias_options = [False, True] if bias_supported else [False]
+            enable_bias_options = [str(row.get("bias", "")).strip() == "True"]
 
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
@@ -144,6 +135,8 @@ def parse_csv(csv_path: str):
                         "experts": experts,
                         "topk": topk,
                         "doweight_stage1": doweight_stage1,
+                        "hidden_pad": hidden_pad,
+                        "intermediate_pad": intermediate_pad,
                         "cu_num": cu_num,
                         "act": act,
                         "enable_bias": enable_bias,
@@ -208,6 +201,8 @@ def _precompile_to_cache(
     enable_bias: bool = False,
     stage1_fuse_quant=None,
     swiglu_limit: float = 0.0,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
     # Stage2-only kernel tuning knobs (registered by the production-variant
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
@@ -567,6 +562,8 @@ def _precompile_to_cache(
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
                 swiglu_limit=swiglu_limit,
+                model_dim_pad=hidden_pad,
+                inter_dim_pad=intermediate_pad,
             )
             _run_compiled(exe, args)
 
@@ -739,6 +736,8 @@ def _precompile_to_cache(
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
+                model_dim_pad=hidden_pad,
+                inter_dim_pad=intermediate_pad,
             )
             _run_compiled(exe, args)
 
@@ -750,6 +749,8 @@ def compile_one_config(
     experts: int,
     topk: int,
     cu_num: int = 0,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
     **kwargs,
 ) -> dict:
     """Compile one MoE kernel configuration and save to cache.
@@ -763,6 +764,8 @@ def compile_one_config(
     shape_str = (
         f"{kernel_name}  "
         f"model_dim={model_dim} inter_dim={inter_dim} "
+        f"hidden_pad={hidden_pad} "
+        f"intermediate_pad={intermediate_pad} "
         f"E={experts} topk={topk}"
     )
     result = {
@@ -785,6 +788,8 @@ def compile_one_config(
                 experts=experts,
                 topk=topk,
                 cu_num=cu_num,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
                 **kwargs,
             )
         elapsed = time.time() - t0
