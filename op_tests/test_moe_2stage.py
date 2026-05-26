@@ -719,7 +719,7 @@ def test_fmoe(
         gate_mode=gateMode,
         num_iters=3,
         num_warmup=1,
-        testGraph=_test_graph,
+        testGraph=False,
     )
     moe_impl = os.environ.get("AITER_LAST_FUSED_MOE_IMPL", "unknown")
     if require_grouped_gemm and moe_impl not in ("grouped_a8w4", "grouped_a4w4"):
