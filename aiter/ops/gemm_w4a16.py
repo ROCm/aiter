@@ -111,6 +111,16 @@ def gemm_w4a16(
                      two mechanisms is intended to extend PackedSb's
                      win on deep-K shapes.
 
+                     ``20 = Baseline_PackedSb_MR2`` (AIESW-32735 W3-
+                     impl-7) is PackedSb with MRepeat halved from 4
+                     to 2 (and MPerBlock halved from 128 to 64),
+                     shrinking the C-frag VGPR accumulator from
+                     ~256 fp32 VGPRs to ~128 fp32 VGPRs. The goal is
+                     to drop per-thread VGPR below 192 (the RDNA 3.5
+                     boundary for 8 waves/SIMD = 32 waves/CU). Same
+                     ``in_s`` packed-fp32 requirement and
+                     ``scaled_zp=None`` rule as tile=10.
+
     Note (AIESW-32282): the bf16 dequant uses a bit-cast truncate
     (drops the low 16 bits of fp32) as the only rounding mode. The
     previous IEEE round-to-nearest-even path was retired after lm_eval

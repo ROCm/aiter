@@ -205,6 +205,20 @@ enum class TileConfigKind : int {
   // BScaleDataType stays `float` to match the packed-(scale,bias_eff) host
   // buffer; same `in_s` fp32 requirement and `scaled_zp` MUST be nullptr.
   Baseline_PackedSb_V3 = 19,
+  // AIESW-32735 W3-impl-7: PackedSb with MRepeat=2 (instead of 4) to halve the
+  // C-frag VGPR accumulator block from MR*NR*8acc*4B = 256 fp32 VGPRs (4*2*8*4)
+  // down to 128 fp32 VGPRs (2*2*8*4). Hypothesis: the VGPR drop unlocks a finer
+  // RDNA 3.5 occupancy step (196 -> <=192 -> 8 waves/SIMD = 32 waves/CU).
+  // Trade-off: MPerBlock halves from 128 to 64, so each WG covers a smaller
+  // M-tile and DRAM B-side traffic doubles (B-block must be re-loaded twice
+  // as often per M sweep). Net wins only if the occupancy lift exceeds the
+  // DRAM-traffic regression on the production fp16 sym g=128 shape family.
+  //
+  // Tile shape: M=64 N=128 K=32 MRep=2 NRep=2 BlockSize=256 Interwave v1
+  // with DequantPack8WithPackedScaleBias carrier. MWaves = MPerBlock /
+  // (MPerWmma * MRepeat) = 64/(16*2)=2; NWaves = 128/(16*2)=4; total = 8 =
+  // BlockSize/32. BScaleDataType stays `float` (packed scale+bias_eff).
+  Baseline_PackedSb_MR2 = 20,
   // AIESW-32735 W2-b32pack: Baseline tile + Vgpr->LDS scalar-per-vector = 2 in
   // the cshuffle epilogue so the threadwise transfer emits ds_store_b32
   // instead of ds_store_b16. CK's default cshuffle LDS layout has MAccVgprs
@@ -579,6 +593,46 @@ struct DeviceGemmInstanceImpl<T, ScaleBlockK, false, TileConfigKind::Baseline_Pa
       S<1, 32, 1, 8>, 8,
       ck::BlockGemmPipelineScheduler::Intrawave,
       ck::BlockGemmPipelineVersion::v3,
+      T, T,
+      PermuteA, PermuteB,
+      BDequantOp>;
+};
+
+// AIESW-32735 W3-impl-7: PackedSb with MRepeat=2 to shrink C-frag accumulator
+// from 256 fp32 VGPRs (4*2*8acc) to 128 fp32 VGPRs (2*2*8acc). Same pipeline,
+// dequant carrier, BScaleDataType, and cluster lengths as Baseline_PackedSb.
+// Only MPerBlock (128 -> 64) and MRepeat (4 -> 2) differ. MWaves becomes
+// 64/(16*2)=2 instead of 128/(16*2)=4; total waves stays 8 (= BlockSize/32).
+// CShuffle params: CShuffleMRepeatPerShuffle stays 1 (= MRepeat / shuffle_steps);
+// CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock keeps
+// the same N-sharding S<1, 32, 1, 8> since NPerBlock=128 is unchanged.
+template <typename T, ck::index_t ScaleBlockK>
+struct DeviceGemmInstanceImpl<T, ScaleBlockK, false, TileConfigKind::Baseline_PackedSb_MR2> {
+  static constexpr ck::index_t kMPerBlock = 64;
+  static constexpr ck::index_t kNPerBlock = 128;
+  static constexpr ck::index_t kKPerBlock = 32;
+  using BDequantOp = DequantPack8WithPackedScaleBias;
+  using type = ck::tensor_operation::device::DeviceGemm_BScale_Wmma_CShuffleV3<
+      ALayout, BLayout, CLayout,
+      T, BDataType,
+      /*BScaleDataType=*/float,
+      T, AccDataType, T,
+      PassThrough, PassThrough, PassThrough,
+      GemmDefault,
+      256,
+      Scale_Block_N, ScaleBlockK,
+      64, 128, 32,
+      8, 8,
+      16, 16,
+      2, 2,
+      S<4, 64, 1>,
+      S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+      S<4, 64, 1>,
+      S<1, 0, 2>, S<1, 0, 2>, 2, 8, 8, true,
+      1, 1,
+      S<1, 32, 1, 8>, 8,
+      ck::BlockGemmPipelineScheduler::Interwave,
+      ck::BlockGemmPipelineVersion::v1,
       T, T,
       PermuteA, PermuteB,
       BDequantOp>;

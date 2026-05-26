@@ -89,7 +89,8 @@ inline void run_kernel_inner(const at::Tensor& in_a,
   };
 
   if constexpr ((Tile == ck_w4a16::TileConfigKind::Baseline_PackedSb ||
-                 Tile == ck_w4a16::TileConfigKind::Baseline_PackedSb_V3) &&
+                 Tile == ck_w4a16::TileConfigKind::Baseline_PackedSb_V3 ||
+                 Tile == ck_w4a16::TileConfigKind::Baseline_PackedSb_MR2) &&
                 !PreDequantToLDS) {
     auto argument = gemm.MakeArgument(
         reinterpret_cast<const T*>(in_a.data_ptr()),
@@ -229,6 +230,10 @@ inline void run_kernel(const at::Tensor& in_a,
         _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
                                       ck_w4a16::TileConfigKind::Baseline_PackedSb_V3); \
         break;                                                                 \
+      case ck_w4a16::TileConfigKind::Baseline_PackedSb_MR2:                    \
+        _CK_W4A16_DISPATCH_G_PDL_TILE(G_VAL, PDL_TY,                           \
+                                      ck_w4a16::TileConfigKind::Baseline_PackedSb_MR2); \
+        break;                                                                 \
       default:                                                                 \
         TORCH_CHECK(false,                                                     \
                     "CK W4A16 b_scale GEMM: unsupported tile_config_kind=",    \
@@ -243,7 +248,8 @@ inline void run_kernel(const at::Tensor& in_a,
                     "16=Baseline_CShuffleB32Pack, "                            \
                     "17=Baseline_CShuffleNXor4, "                              \
                     "18=Baseline_CShuffleNXor8, "                              \
-                    "19=Baseline_PackedSb_V3)");                             \
+                    "19=Baseline_PackedSb_V3, "                                \
+                    "20=Baseline_PackedSb_MR2)");                              \
     }                                                                          \
   } while (0)
 
@@ -332,7 +338,8 @@ torch::Tensor gemm_w4a16(at::Tensor& in_a,
   // K-dim stays the same. All other tiles use the activation dtype for in_s.
   const int64_t _early_tile_kind = tile_config.value_or(0);
   const bool _is_packed_sb_tile =
-      (_early_tile_kind == 10 || _early_tile_kind == 19);
+      (_early_tile_kind == 10 || _early_tile_kind == 19 ||
+       _early_tile_kind == 20);
   TORCH_CHECK(in_a.dtype() == Y.dtype(),
               "in_a / Y must share dtype (fp16 or bf16); got in_a=",
               in_a.dtype(), " Y=", Y.dtype());
