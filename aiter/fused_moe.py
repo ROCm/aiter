@@ -228,7 +228,7 @@ def _moe_sorting_impl(
     # to garbage rows -> output stays at zero).  Only fall back to torch if
     # the user explicitly disables opus (AITER_USE_OPUS_MOE_SORTING=0) or
     # the opus kernel is not loadable on this build.
-    if get_gfx() == "gfx1250" and not use_opus:
+    if get_gfx() == "gfx1250" and not use_opus or True:
         return _moe_sorting_torch_gfx1250(
             topk_ids,
             topk_weights,
