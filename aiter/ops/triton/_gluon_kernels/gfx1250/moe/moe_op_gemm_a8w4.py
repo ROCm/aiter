@@ -195,9 +195,18 @@ def _moe_gemm_a8w4(
     if GatherIndx is None:
         X += start_m * stride_x_m
     else:
-        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
-            0, gl.BlockedLayout([1, 8], [32, 1], [1, num_warps], [0, 1])
-        )
+        if GatherIndx.dtype.element_ty == gl.uint16:
+            IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
+                0, gl.BlockedLayout([1, 16], [32, 1], [1, num_warps], [0, 1])
+            )
+        else:
+            gl.static_assert(
+                GatherIndx.dtype.element_ty == gl.int32,
+                "Gather index datatype should be uint16 or int32",
+            )
+            IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
+                0, gl.BlockedLayout([1, 8], [32, 1], [1, num_warps], [0, 1])
+            )
         offs_x_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
         GatherIndx += start_m
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
