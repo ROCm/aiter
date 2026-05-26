@@ -556,7 +556,7 @@ def gemm_afp4wfp4_preshuffle(
     if M < 32 and M_POW2 > 16:
         M_POW2 = 16
 
-    grid = lambda META: (
+    grid = lambda META: (  # noqa: E731
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
