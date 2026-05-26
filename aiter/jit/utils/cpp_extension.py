@@ -282,7 +282,11 @@ def check_compiler_ok_for_platform(compiler: str) -> bool:
         True if the compiler is gcc/g++ on Linux or clang/clang++ on macOS,
         and always True for Windows.
     """
-    compiler_path = os.path.realpath(shutil.which(compiler))
+    found_compiler = shutil.which(compiler)
+    if not found_compiler:
+        return False
+
+    compiler_path = os.path.realpath(found_compiler)
     if not compiler_path:
         return False
 

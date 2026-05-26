@@ -199,7 +199,7 @@ def _sage_fwd_no_mask(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+        acc = tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
 
     return acc, l_i, m_i
 
@@ -352,7 +352,7 @@ def _sage_fwd_blocksparse_nomask(
                 v = tl.load(v_ptrs)
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+        acc = tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
     return acc, l_i, m_i
 
 
@@ -500,7 +500,7 @@ def _sage_fwd_blocksparse_mask(
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+        acc = tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
     return acc, l_i, m_i
 
 
@@ -858,7 +858,7 @@ def _sage_fwd_mask(
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        acc += tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32)
+        acc = tl.dot((p).to(v.type.element_ty), v, out_dtype=tl.float32, acc=acc)
 
     return acc, l_i, m_i
 

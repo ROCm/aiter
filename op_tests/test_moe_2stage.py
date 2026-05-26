@@ -22,10 +22,21 @@ import logging
 from aiter.fused_moe import (
     fused_topk,
     fused_moe,
+    get_2stage_cfgs,
+    get_padded_M,
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.aot.flydsl.common import fail_on_aot_cache_miss
 from aiter.ops.flydsl.moe_common import GateMode
+import aiter.ops.flydsl.moe_kernels as _aiter_mk
+
+try:
+    from tuned_op_bench_utils import append_tuned_op_bench_rows
+except ModuleNotFoundError as e:
+    if e.name != "tuned_op_bench_utils":
+        raise
+    from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 
 
 from aiter.ops.shuffle import (
@@ -62,6 +73,7 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=True,
     strict_accuracy=True,
+    check_aot_cache=True,
     swiglu_limit=0.0,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
@@ -70,8 +82,9 @@ def test_fmoe(
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
-        if hidden_pad != 0 and intermediate_pad != 0:
+        if hidden_pad != 0:
             w1[:, :, -hidden_pad:] = 0
+        if intermediate_pad != 0:
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
         exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
@@ -79,8 +92,9 @@ def test_fmoe(
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
-    if hidden_pad != 0 and intermediate_pad != 0:
+    if intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
+    if hidden_pad != 0:
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if AITER_MOE_EXPERT_BALANCE:
@@ -244,13 +258,47 @@ def test_fmoe(
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
     # # ######################## stage 1 start ###########
+    stage1_ref_dtype = dtype
+    if (
+        actType == aiter.ActivationType.Swiglu
+        and qType == aiter.QuantType.per_1x32
+        and WQDType == dtypes.fp4x2
+    ):
+        runtime_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
+            token, actType, gateMode, qType, AQDType, WQDType
+        )
+        if runtime_aq_dtype == dtypes.fp4x2:
+            metadata = get_2stage_cfgs(
+                get_padded_M(token),
+                model_dim,
+                inter_dim,
+                E,
+                topk,
+                dtype,
+                runtime_aq_dtype,
+                WQDType,
+                qType,
+                w1.shape[1] == (inter_dim * 2),
+                actType,
+                doweight_stage1,
+                hidden_pad,
+                intermediate_pad,
+                getattr(w1_qt_aiter, "is_shuffled", False)
+                or getattr(w2_qt_aiter, "is_shuffled", False),
+                gateMode,
+            )
+            if metadata.fuse_quant == "fp4":
+                # Fused Swiglu MXFP4 quantizes the f32 activation directly.
+                # Keep the torch reference at f32 until the quantization step.
+                stage1_ref_dtype = dtypes.fp32
+
     out1_ref = torch_moe_stage1(
         a1_qt,
         w1_qt,
         w2_qt,
         topk_weights,
         topk_ids,
-        dtype=dtype,
+        dtype=stage1_ref_dtype,
         activation=actType,
         quant_type=qType,
         a1_scale=a1_scale,
@@ -345,6 +393,9 @@ def test_fmoe(
         )
 
     return {"us": us2, "logits_diff": float(logits_diff)}
+
+
+test_fmoe_with_aot_cache_check = fail_on_aot_cache_miss(_aiter_mk)(test_fmoe)
 
 
 l_quant = [
@@ -544,6 +595,8 @@ def _row_to_kwargs(row):
     aq_dtype = _str2dtype(row["q_dtype_a"])
     wq_dtype = _str2dtype(row["q_dtype_w"])
     act_type = _str2enum(row["act_type"], aiter.ActivationType)
+    # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
+    # from the selected activation/weight dtype layout used by fused_moe.
     gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
     return dict(
         dtype=_str2dtype(row["dtype"]),
@@ -594,6 +647,7 @@ def _iter_csv_cases():
         expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
             kwargs["token"],
             kwargs["actType"],
+            kwargs["gateMode"],
             kwargs["qType"],
             kwargs["AQDType"],
             kwargs["WQDType"],
@@ -610,6 +664,7 @@ def _iter_csv_cases():
             )
             continue
         kwargs["strict_accuracy"] = True
+        kwargs["check_aot_cache"] = True
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
@@ -634,7 +689,9 @@ def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     return 0.0
 
 
-def _runtime_swiglu_mxfp4_q_dtype_a(token, act_type, q_type, aq_dtype, wq_dtype):
+def _runtime_swiglu_mxfp4_q_dtype_a(
+    token, act_type, gate_mode, q_type, aq_dtype, wq_dtype
+):
     """Return the q_dtype_a that fused_moe will select for Swiglu MXFP4."""
     if act_type != aiter.ActivationType.Swiglu:
         return None
@@ -643,11 +700,12 @@ def _runtime_swiglu_mxfp4_q_dtype_a(token, act_type, q_type, aq_dtype, wq_dtype)
     if aq_dtype not in [dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.fp4x2]:
         return None
 
-    if os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "0") == "1":
+    gate_mode = GateMode(gate_mode)
+    if gate_mode == GateMode.SEPARATED:
         bound = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
         return dtypes.bf16 if token < bound else dtypes.fp4x2
 
-    bound = int(os.environ.get("AITER_BF16_FP8_BOUND", "512"))
+    bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
     return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
 
 
@@ -682,6 +740,7 @@ def _iter_legacy_cases():
             use_g1u1=True,
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
+            check_aot_cache=False,
             **over,
         )
 
@@ -766,6 +825,28 @@ if not args.no_legacy:
     _case_iters.append(_iter_legacy_cases())
 case_iter = itertools.chain(*_case_iters)
 
+_csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
+
+
+def _write_bench_csv(rows):
+    if not _csv_out or len(rows) == 0:
+        return
+    row = rows[-1]
+    if row.get("model") == "legacy":
+        return
+    written = append_tuned_op_bench_rows(
+        _csv_out,
+        [row],
+        op_name="moe_2stage",
+        metric_cols=("us",),
+        default_impl="fused_moe",
+    )
+    if written:
+        aiter.logger.info(
+            "moe_2stage: appended %d tuned op bench row(s) to %s", written, _csv_out
+        )
+
+
 df = []
 seen = 0
 for kwargs, extras in case_iter:
@@ -785,7 +866,12 @@ for kwargs, extras in case_iter:
     if _force_moe_bound_zero:
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     try:
-        ret = test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+        run_test_fmoe = (
+            test_fmoe_with_aot_cache_check
+            if kwargs.get("check_aot_cache", False)
+            else test_fmoe
+        )
+        ret = run_test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
@@ -796,6 +882,7 @@ for kwargs, extras in case_iter:
         continue
     ret.update(extras)
     df.append(ret)
+    _write_bench_csv(df)
 
 aiter.logger.info(
     "moe_2stage: scanned %d cases, recorded %d results (skipped %d)",

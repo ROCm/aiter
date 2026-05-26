@@ -4,6 +4,7 @@
 import math
 
 import torch
+import functools
 from aiter import dtypes
 from torch import Tensor
 
@@ -38,6 +39,42 @@ def mhc_pre_big_fuse(
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
 ) -> None: ...
+
+
+@functools.lru_cache(maxsize=1024)
+def get_mhc_pre_splitk(m: int, hc_hidden_size: int) -> tuple[int, int]:
+    prefetch_stages = 2
+    tile_m = 16 * 4
+    num_cu = get_cu_num()
+    tile_k_tg_dict = {
+        128: 2 * num_cu,
+        64: 4 * num_cu,
+    }
+    selected_splitk = 1
+    selected_tile_k = 64
+    num_tg_m = (m + tile_m - 1) // tile_m
+    selected_score = num_tg_m / (num_cu * tile_k_tg_dict[selected_tile_k])
+    selected_score = selected_score / math.ceil(selected_score)
+    for tile_k, meanwhile_tg in tile_k_tg_dict.items():
+        if (hc_hidden_size % tile_k) != 0:
+            continue
+        for splitk in range(1, num_cu + 1):
+            if hc_hidden_size % (splitk * tile_k) != 0 or (hc_hidden_size // splitk) < (
+                tile_k * prefetch_stages
+            ):
+                continue
+            num_tg = num_tg_m * splitk
+            score = num_tg / meanwhile_tg
+            score = score / math.ceil(score)
+            if selected_score < score:
+                selected_splitk = splitk
+                selected_tile_k = tile_k
+                selected_score = score
+            # print(f"{selected_score=} {selected_splitk=} {selected_tile_k=} {score=} {splitk=} {tile_k=}")
+            if num_tg > meanwhile_tg * 2:
+                break
+
+    return selected_splitk, selected_tile_k
 
 
 def mhc_pre_fake(
@@ -81,39 +118,7 @@ def mhc_pre(
         hc_mult3 == hc_mult and sinkhorn_repeat == 0
     )
     hc_hidden_size = hc_mult * hidden_size
-
-    prefetch_stages = 2
-    tile_m = 16 * 4
-    tile_k_tg_dict = {
-        128: 2,
-        64: 4,
-    }
-    num_cu = get_cu_num()
-    selected_splitk = 1
-    selected_tile_k = 64
-    num_tg_m = (m + tile_m - 1) // tile_m
-    selected_score = num_tg_m / (num_cu * tile_k_tg_dict[selected_tile_k])
-    selected_score = selected_score / math.ceil(selected_score)
-    for tile_k, tg_per_cu in tile_k_tg_dict.items():
-        if (hc_hidden_size % tile_k) != 0:
-            continue
-        meanwhile_tg = num_cu * tg_per_cu
-        for splitk in range(1, 33):
-            if hc_hidden_size % (splitk * tile_k) != 0 or (hc_hidden_size // splitk) < (
-                tile_k * prefetch_stages
-            ):
-                continue
-            num_tg = num_tg_m * splitk
-            score = num_tg / meanwhile_tg
-            score = score / math.ceil(score)
-            if selected_score < score:
-                selected_splitk = splitk
-                selected_tile_k = tile_k
-                selected_score = score
-            # print(f"{selected_score=} {selected_splitk=} {selected_tile_k=} {score=} {splitk=} {tile_k=}")
-            if num_tg > meanwhile_tg * 4:
-                break
-
+    selected_splitk, selected_tile_k = get_mhc_pre_splitk(m, hc_hidden_size)
     device = residual.device
     out_pad = torch.empty(
         selected_splitk, m, (hc_mult3 + 31) // 32 * 32, dtype=dtypes.fp32, device=device

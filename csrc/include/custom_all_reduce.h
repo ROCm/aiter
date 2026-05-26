@@ -87,6 +87,16 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t reg_bytes,
                                              bool use_1stage,
                                              int64_t bf16_out_ptr = 0);
+void fused_qknorm_allreduce(fptr_t _fa,
+                            const aiter_tensor_t& qkv_in,
+                            const aiter_tensor_t& q_w,
+                            const aiter_tensor_t& k_w,
+                            const aiter_tensor_t& q_out,
+                            const aiter_tensor_t& k_out,
+                            const aiter_tensor_t& v_out,
+                            double eps,
+                            int64_t reg_ptr,
+                            int64_t reg_bytes);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_input_buffer(fptr_t _fa,
