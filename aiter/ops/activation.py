@@ -12,9 +12,7 @@ MD_NAME = "module_activation"
 # exception, so we must allowlist arches BEFORE calling the HIP path.
 # Same set as aiter.ops.gemm_op_a8w8._BLOCKSCALE_HIP_PREBUILT_ARCHES and
 # aiter.ops.cache._CACHE_HIP_PREBUILT_ARCHES.
-_ACTIVATION_HIP_PREBUILT_ARCHES = frozenset(
-    {"gfx940", "gfx941", "gfx942", "gfx950"}
-)
+_ACTIVATION_HIP_PREBUILT_ARCHES = frozenset({"gfx940", "gfx941", "gfx942", "gfx950"})
 
 
 def _hip_activation_supported() -> bool:
@@ -52,9 +50,9 @@ def silu_and_mul(out: Tensor, input: Tensor, limit: float = 0.0) -> None:
         "silu_and_mul triton fallback does not support the 'limit' clamp; "
         f"got limit={limit}"
     )
-    assert input.is_contiguous(), (
-        "silu_and_mul triton fallback requires a contiguous input tensor"
-    )
+    assert (
+        input.is_contiguous()
+    ), "silu_and_mul triton fallback requires a contiguous input tensor"
     assert input.size(-1) % 2 == 0, (
         f"silu_and_mul triton fallback requires an even last dim; "
         f"got {input.size(-1)}"
