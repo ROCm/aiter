@@ -1331,7 +1331,9 @@ def sage_fwd(
         ) = compute_block_masking(
             seqlen_k,
             seqlen_q,
-            start_m.to(tl.int32),  # int32 for consistent compute_block_masking return types
+            start_m.to(
+                tl.int32
+            ),  # int32 for consistent compute_block_masking return types
             IS_CAUSAL,
             USE_SLIDING_WINDOW,
             WINDOW_SIZE_LEFT,

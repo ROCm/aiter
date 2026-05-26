@@ -514,9 +514,7 @@ def test_sage_block_sparse_empty_kv_blocks_lse_is_neg_inf(
 
 
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
-@pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K", [(64, 16), (128, 32), (256, 64)]
-)
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(64, 16), (128, 32), (256, 64)])
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 4)])
 def test_sage_causal_above_diagonal_lse_is_neg_inf(
     SEQLEN_Q: int,
