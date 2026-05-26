@@ -52,7 +52,7 @@ _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 
 def _use_grouped_gemm_enabled() -> bool:
     """Runtime check for AITER_USE_GROUPED_GEMM so tests can toggle it."""
-    return os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
+    return os.environ.get("AITER_USE_GROUPED_GEMM", "1") in _TRUTHY_ENV
 
 
 def _moe_sorting_torch_gfx1250(
@@ -498,10 +498,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     intermediate_pad: int,
     bias1: Optional[torch.Tensor],
     bias2: Optional[torch.Tensor],
-):
-    def _grouped_dbg(msg: str):
+    ):
+    def _grouped_dbg(msg: str, stacklevel: int = 1):
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
-            print(f"[grouped-gemm-debug] fused_moe: {msg}", flush=True)
+            import inspect
+            frame = inspect.stack()[stacklevel]
+            print(f"[grouped-gemm-debug] {frame.filename}:{frame.lineno} {msg}", flush=True)
 
     _grouped_dbg("enter grouped helper")
     # Master opt-in switch: only enter the gfx1250 FlyDSL grouped-GEMM mode
@@ -2942,16 +2944,7 @@ def fused_moe_2stages(
             #   * layout:      a1 = (M, K) fn bytes (uint8 view-equivalent),
             #                  a1_scale = (M, K//32) e8m0 in src-token order.
             from aiter.utility import fp4_utils as _aiter_fp4u
-            try:
-                from FlyDSL.tests.kernels.utils import fp4_utils as _fly_fp4u
-            except ImportError:
-                import importlib, sys, os as _os
-                for _root in ("/root/data/FlyDSL/python", "/root/data/FlyDSL", "/app/FlyDSL"):
-                    if _root not in sys.path:
-                        sys.path.insert(0, _root)
-                _fly_fp4u = importlib.import_module(
-                    "tests.kernels.utils.fp4_utils"
-                )
+            _fly_fp4u = _aiter_fp4u
             BLOCK = 32
             DTYPE_MAX = 240.0  # fnuz finfo.max -- matches UT
             a1_flat = hidden_states.view(-1, hidden_states.shape[-1]).to(
@@ -3153,16 +3146,7 @@ def fused_moe_2stages(
             # (bias 7, via _f32_to_floatx_unpacked).  See stage1 elif
             # above for full rationale.
             from aiter.utility import fp4_utils as _aiter_fp4u
-            try:
-                from FlyDSL.tests.kernels.utils import fp4_utils as _fly_fp4u
-            except ImportError:
-                import importlib, sys
-                for _root in ("/root/data/FlyDSL/python", "/root/data/FlyDSL", "/app/FlyDSL"):
-                    if _root not in sys.path:
-                        sys.path.insert(0, _root)
-                _fly_fp4u = importlib.import_module(
-                    "tests.kernels.utils.fp4_utils"
-                )
+            _fly_fp4u = _aiter_fp4u
             BLOCK = 32
             DTYPE_MAX = 240.0
             if int(os.environ.get("AITER_GFX1250_DEBUG", "0")):

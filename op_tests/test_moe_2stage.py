@@ -72,31 +72,7 @@ def _gfx1250_fp8_round_trip_bf16(x: torch.Tensor) -> torch.Tensor:
     `_per_1x32_fp8_quant` (forward direction) and
     `_dequant_blockscale_fp8` (round trip).
     """
-    try:
-        from tests.kernels.utils import fp4_utils as _fly_fp4u_rt
-    except ImportError:
-        try:
-            from FlyDSL.tests.kernels.utils import fp4_utils as _fly_fp4u_rt
-        except ImportError:
-            import importlib, sys
-            for _root in (
-                "/root/data/FlyDSL",
-                "/app/FlyDSL",
-                os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "FlyDSL")),
-            ):
-                if _root not in sys.path:
-                    sys.path.insert(0, _root)
-            for _stale in (
-                "tests.kernels.utils.fp4_utils",
-                "tests.kernels.utils",
-                "tests.kernels",
-                "tests",
-            ):
-                sys.modules.pop(_stale, None)
-            importlib.invalidate_caches()
-            _fly_fp4u_rt = importlib.import_module(
-                "tests.kernels.utils.fp4_utils"
-            )
+    from aiter.utility import fp4_utils as _fly_fp4u_rt
     BLOCK = 32
     DTYPE_MAX = 240.0
     orig_shape = x.shape
@@ -495,22 +471,7 @@ def test_fmoe(
             )
         if not _gfx1250_is_fp4:
             # fp8 / a8w4: preshuffle weights with the FlyDSL helper.
-            try:
-                from FlyDSL.tests.kernels.utils import fp4_utils as _fly_fp4u
-            except ImportError:
-                # The FlyDSL Python tests live alongside the build tree;
-                # try a few likely locations before giving up.
-                import importlib, sys, os as _os
-                for _root in (
-                    "/app/FlyDSL",
-                    _os.path.join(_os.path.dirname(__file__), "..", "..", "FlyDSL"),
-                ):
-                    _p = _os.path.abspath(_root)
-                    if _p not in sys.path:
-                        sys.path.insert(0, _p)
-                _fly_fp4u = importlib.import_module(
-                    "tests.kernels.utils.fp4_utils"
-                )
+            from aiter.utility import fp4_utils as _fly_fp4u
             E_, N1_, K1_packed_ = w1_qt_aiter.shape
             E2_, N2_, K2_packed_ = w2_qt_aiter.shape
             if WQDType == dtypes.fp4x2:
