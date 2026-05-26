@@ -20,6 +20,7 @@ torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 _FORCE_QH16_FOLD = os.environ.get("MLA_FORCE_QH16_FOLD", "0") == "1"
+_FORCE_QH8_FOLD = os.environ.get("MLA_FORCE_QH8_FOLD", "0") == "1"
 
 
 def dump_mla_metadata_v1_txt(
@@ -494,6 +495,7 @@ def torch_mla_extend_split_kv(
         )
         or (
             not _FORCE_QH16_FOLD
+            and not _FORCE_QH8_FOLD
             and get_gfx() == "gfx950"
             and nheads == 32
             and is_fp8_q
@@ -526,7 +528,7 @@ def torch_mla_extend_split_kv(
         # Natively support cases
         pass
     elif nheads in range(32, 128 + 1, 16):
-        # we use nhead=16 to simulate such cases by customized metadata
+        # we use nhead=16 (or nhead=8) to simulate such cases by customized metadata
         # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
         ori_nheads = nheads
         use_qseqlen_fold = (
@@ -542,6 +544,9 @@ def torch_mla_extend_split_kv(
         if use_qseqlen_fold and nheads == 64 and max_seqlen_q == 2:
             fold_factor = nheads // 32
             nheads = 32
+        elif _FORCE_QH8_FOLD and nheads == 32 and max_seqlen_q == 1:
+            fold_factor = nheads // 8
+            nheads = 8
         else:
             fold_factor = nheads // 16
             nheads = 16
