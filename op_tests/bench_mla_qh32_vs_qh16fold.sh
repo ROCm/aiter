@@ -8,7 +8,7 @@
 #   MLA_FORCE_QH16_FOLD=1  -> forces the old qh16 fold path (set in env before launching)
 #   MLA_FORCE_QH16_FOLD=0  -> uses the new native qh32 kernel (default)
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT="${1:-${SCRIPT_DIR}/bench_qh32_vs_qh16fold_results.txt}"
