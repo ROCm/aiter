@@ -67,13 +67,15 @@ def _fused_routing_from_topk_hist_kernel(
     # Clamp the offset for masked-out lanes to 0 so the pointer arithmetic
     # below stays within the allocated buffers.
     safe_item = tl.where(item_mask, item_offs, 0)
-    global_expt = tl.load(topk_ids_ptr + safe_item, mask=item_mask, other=0).to(tl.int32)
+    global_expt = tl.load(topk_ids_ptr + safe_item, mask=item_mask, other=0).to(
+        tl.int32
+    )
     if HAS_EXPERT_MAP:
         map_mask = item_mask & (global_expt >= 0) & (global_expt < expert_map_numel)
         safe_global_expt = tl.where(map_mask, global_expt, 0)
-        local_expt = tl.load(expert_map_ptr + safe_global_expt, mask=map_mask, other=-1).to(
-            tl.int32
-        )
+        local_expt = tl.load(
+            expert_map_ptr + safe_global_expt, mask=map_mask, other=-1
+        ).to(tl.int32)
         # Match reference semantics: invalid experts are redirected to bucket 0
         # and later zeroed in gate_scal.
         expt = tl.where(local_expt >= 0, local_expt, 0)
@@ -141,14 +143,16 @@ def _fused_routing_from_topk_place_kernel(
     item_offs = tl.arange(0, BLOCK_NK)
     item_mask = item_offs < NK
     safe_item = tl.where(item_mask, item_offs, 0)
-    global_expt = tl.load(topk_ids_ptr + safe_item, mask=item_mask, other=0).to(tl.int32)
+    global_expt = tl.load(topk_ids_ptr + safe_item, mask=item_mask, other=0).to(
+        tl.int32
+    )
     weights = tl.load(topk_weights_ptr + safe_item, mask=item_mask, other=0.0)
     if HAS_EXPERT_MAP:
         map_mask = item_mask & (global_expt >= 0) & (global_expt < expert_map_numel)
         safe_global_expt = tl.where(map_mask, global_expt, 0)
-        local_expt = tl.load(expert_map_ptr + safe_global_expt, mask=map_mask, other=-1).to(
-            tl.int32
-        )
+        local_expt = tl.load(
+            expert_map_ptr + safe_global_expt, mask=map_mask, other=-1
+        ).to(tl.int32)
         invalid = local_expt < 0
         expt = tl.where(invalid, 0, local_expt)
         weights = tl.where(invalid, 0.0, weights)

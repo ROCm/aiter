@@ -308,7 +308,9 @@ def test_fused_routing_from_topk_with_expert_map(
         bucket_unsorted_layout=False,
     )
 
-    assert torch.equal(ref_hist, test_hist), f"hist mismatch:\n  ref={ref_hist}\n  fused={test_hist}"
+    assert torch.equal(
+        ref_hist, test_hist
+    ), f"hist mismatch:\n  ref={ref_hist}\n  fused={test_hist}"
 
     # Intra-expert ordering can differ between fused and reference,
     # especially in expert-0 bucket where invalid experts are redirected.
