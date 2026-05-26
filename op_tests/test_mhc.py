@@ -752,8 +752,8 @@ args = parser.parse_args()
 
 df = []
 for dtype in args.dtype:
-    for m in args.m:
-        for hidden_size in args.hidden_size:
+    for hidden_size in args.hidden_size:
+        for m in args.m:
             for hc_mult in [4]:
                 ret = test_mhc_pre(
                     m=m,
