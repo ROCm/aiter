@@ -3,6 +3,7 @@
 
 import functools
 import os
+import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -18,7 +19,11 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
+from aiter import (
+    fused_dynamic_mxfp4_quant_moe_sort,
+    fused_dynamic_mxfp8_quant_moe_sort,
+    mxfp4_moe_sort_fwd,
+)
 
 BLOCK_SIZE_M = 32
 
@@ -26,6 +31,7 @@ BLOCK_SIZE_M = 32
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
+_MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
 
 def _moe_sorting_impl(
@@ -344,7 +350,6 @@ def fused_moe_(
         intermediate_pad,
         isShuffled,
         gate_mode,
-        bias=(bias1 is not None or bias2 is not None),
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -815,16 +820,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     **_kwargs,
 ):
-    # `parsed` is the static per-kernel params dict registered at
-    # import time by `get_flydsl_stage2_kernels` (see
-    # aiter/ops/flydsl/moe_kernels.py) and pre-populated into
-    # `_KERNEL_PARAMS` by `_register_all_configs()`. Variant-specific
-    # knobs that live on the kernel name (e.g. the
-    # `..._persist_async_w4_cumul3` production variant adds
-    # `use_async_copy=True / waves_per_eu=4 / cu_num_mul=3`) are
-    # already baked into this dict, so the `parsed.get(..., default)`
-    # calls below pick up the registered values for that kernel name
-    # rather than always falling back to defaults.
+
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
@@ -847,9 +843,6 @@ def _flydsl_stage2_wrapper(
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
         sort_block_m=parsed.get("sort_block_m", 0),
-        waves_per_eu=parsed.get("waves_per_eu", None),
-        use_async_copy=parsed.get("use_async_copy", False),
-        cu_num_mul=parsed.get("cu_num_mul", 1),
         b_nt=parsed.get("b_nt", 0),
         persist=parsed.get("persist", None),
         inter_dim_pad=inter_dim_pad,
@@ -877,7 +870,6 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
-    bias=False,
 ):
     gate_mode = GateMode(gate_mode)
     _INDEX_COLS = [
@@ -894,27 +886,12 @@ def get_2stage_cfgs(
         "q_type",
         "use_g1u1",
         "doweight_stage1",
-        "bias",
-        "hidden_pad",
-        "intermediate_pad",
     ]
-
-    def _normalize_lookup_cols(df):
-        for col in ("hidden_pad", "intermediate_pad"):
-            if col not in df.columns:
-                df[col] = 0
-            df[col] = df[col].fillna(0).astype(int)
-        if "bias" in df.columns:
-            df["bias"] = df["bias"].astype(str).str.strip().eq("True")
-        else:
-            df["bias"] = False
-        return df
 
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
         df = pd.read_csv(tune_file)
-        df = _normalize_lookup_cols(df)
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
 
@@ -956,7 +933,6 @@ def get_2stage_cfgs(
             _flydsl_fallback_cache[tune_file] = {}
             return {}
         df = pd.read_csv(tune_file)
-        df = _normalize_lookup_cols(df)
         if "_tag" not in df.columns:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
@@ -985,7 +961,6 @@ def get_2stage_cfgs(
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
-    bias_key = bool(bias)
     keys = (
         cu_num,
         token,
@@ -1000,9 +975,6 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
-        bias_key,
-        hidden_pad,
-        intermediate_pad,
     )
     keys_disabled = (
         cu_num,
@@ -1018,41 +990,17 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
-        bias_key,
-        hidden_pad,
-        intermediate_pad,
     )
 
     def MainFunc():
-        header = "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,bias,hidden_pad,intermediate_pad"
-        # Migrate legacy untuned CSV (no `bias` column) so appended rows stay aligned.
-        if os.path.exists(untune_file) and os.path.getsize(untune_file) > 0:
-            with open(untune_file, "r") as f:
-                lines = f.read().splitlines()
-            if lines and "bias" not in lines[0].split(","):
-                old_cols = lines[0].split(",")
-                try:
-                    insert_at = old_cols.index("doweight_stage1") + 1
-                except ValueError:
-                    insert_at = len(old_cols) - 2
-                new_lines = [
-                    ",".join(old_cols[:insert_at] + ["bias"] + old_cols[insert_at:])
-                ]
-                for line in lines[1:]:
-                    if not line.strip():
-                        new_lines.append(line)
-                        continue
-                    parts = line.split(",")
-                    parts = parts[:insert_at] + ["False"] + parts[insert_at:]
-                    new_lines.append(",".join(parts))
-                with open(untune_file, "w") as f:
-                    f.write("\n".join(new_lines))
         with open(untune_file, "a") as f:
             if os.path.getsize(untune_file) == 0:
-                f.write(header)
+                f.write(
+                    "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
+                )
             q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
             f.write(
-                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)},{bool(bias)},{hidden_pad},{intermediate_pad}"
+                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
             )
         logger.info("\033[34m Start tuning fmoe")
         os.system(
@@ -1087,7 +1035,8 @@ def get_2stage_cfgs(
 
     cfg = _lookup_cfg(cfg_2stages)
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
-        lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
+        lock_name = re.sub(r"[^\w.\-]", "_", str(keys))
+        lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{lock_name}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
         cfg = _lookup_cfg(cfg_2stages)
@@ -1216,6 +1165,7 @@ def get_2stage_cfgs(
         )
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
+    is_cktile2 = bool(kernelName2) and kernelName2.startswith("cktile_")
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
@@ -1246,6 +1196,13 @@ def get_2stage_cfgs(
                 kernelName=kernelName2,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
+            )
+        elif is_cktile2:
+            stage2_func = functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
             )
         else:
             stage2_func = functools.partial(
@@ -1486,6 +1443,13 @@ def get_2stage_cfgs(
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
             )
+        elif kernelName2 and kernelName2.startswith("cktile_"):
+            stage2_func = functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            )
         else:
             stage2_func = functools.partial(
                 aiter.ck_moe_stage2_fwd,
@@ -1516,6 +1480,21 @@ def get_2stage_cfgs(
         tag = ""
         block_m = ([el for el in tmpList if block_m < el] + [128])[0]
 
+    if kernelName2 and kernelName2.startswith("cktile_"):
+        stage2_func = functools.partial(
+            cktile_moe_stage2,
+            n_pad_zeros=hidden_pad // 64 * 64,
+            k_pad_zeros=intermediate_pad // 128 * 128,
+            activation=activation,
+        )
+    else:
+        stage2_func = functools.partial(
+            aiter.ck_moe_stage2_fwd,
+            kernelName=kernelName2,
+            activation=activation,
+            quant_type=q_type,
+            use_non_temporal_load=use_non_temporal_load,
+        )
     return MOEMetadata(
         functools.partial(
             asm_stage1,
@@ -1523,13 +1502,7 @@ def get_2stage_cfgs(
             activation=activation,
             quant_type=q_type,
         ),
-        functools.partial(
-            aiter.ck_moe_stage2_fwd,
-            kernelName=kernelName2,
-            activation=activation,
-            quant_type=q_type,
-            use_non_temporal_load=use_non_temporal_load,
-        ),
+        stage2_func,
         block_m,
         ksplit,
         run_1stage,
@@ -1593,7 +1566,6 @@ def fused_moe_2stages(
         intermediate_pad,
         is_shuffled,
         gate_mode,
-        bias=(bias1 is not None or bias2 is not None),
     )
     if (
         quant_type == QuantType.per_1x32
@@ -1608,19 +1580,35 @@ def fused_moe_2stages(
         a1 = hidden_states.to(dtype)
         a1_scale = None
     elif (
-        quant_type == aiter.QuantType.per_1x32
+        quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        # and activation == aiter.ActivationType.Swiglu
     ):
-        a1 = hidden_states.to(dtypes.fp8)
-        M = sorted_ids.shape[0]
-        N = a1.shape[-1]
+        # a8w4 mxfp8 activations + mxfp4 weights.
         if metadata.fuse_quant == "fp8":
+            # FlyDSL stage1 fuses the fp8 quant of a1 internally, but the
+            # kernel dispatch requires an fp8-typed tensor.
+            a1 = hidden_states.to(dtypes.fp8)
             a1_scale = torch.empty(0, dtype=torch.uint8, device=a1.device)
+        elif _MOE_A8W4_BYPASS_QUANT:
+            # Debug bypass: skip real quant, feed unit scales.
+            a1 = hidden_states.to(dtypes.fp8)
+            M = sorted_ids.shape[0]
+            a1_scale = torch.ones(
+                [M, a1.shape[-1] // 32], dtype=dtypes.fp8_e8m0, device=a1.device
+            )
         else:
-            a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
+            # stage1 input is not topk-replicated, so M==token_num and the HIP
+            # launcher infers TOPK=1 from input.numel() / (cols * token_num).
+            a1, a1_scale = fused_dynamic_mxfp8_quant_moe_sort(
+                hidden_states,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                topk=topk,
+                block_size=block_size_M,
+            )
 
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights; no activation quantization needed
@@ -1735,17 +1723,15 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
     ):
-        if activation == ActivationType.Silu and swiglu_limit == 0.0:
-            from aiter.ops.triton.quant.fused_mxfp4_quant import fused_quant_fp8_sort
-
+        if not _MOE_A8W4_BYPASS_QUANT:
             a2 = a2.view(-1, inter_dim)
-            a2, a2_scale = fused_quant_fp8_sort(
+            a2, a2_scale = fused_dynamic_mxfp8_quant_moe_sort(
                 a2,
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
-                block_size=32,
-                quant_dtype=dtypes.fp8,
+                topk=topk,
+                block_size=block_size_M,
             )
             a2 = a2.view(token_num, topk, -1)
         else:
