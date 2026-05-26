@@ -666,7 +666,11 @@ def gemm_a8w8_blockscale_fake(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled=False,
+    out: Optional[Tensor] = None,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor:
+    if out is not None:
+        return out
     m = XQ.shape[0]
     n = WQ.shape[0]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
@@ -681,7 +685,26 @@ def gemm_a8w8_blockscale(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled: bool = False,
+    out: Optional[Tensor] = None,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor:
+    """FP8 a8w8 blockscale GEMM (non-bpreshuffle).
+
+    Optional kwargs (used by vLLM's zero-init SplitK fusion):
+      - out:          caller-provided output buffer. If None, allocated here.
+      - y_is_zeroed:  when True, caller guarantees ``out`` is pre-zeroed and
+                      the kernel skips its internal Y.zero_() before the
+                      SplitK atomic-add. Only honored by the cktile branch
+                      today; the legacy CK invoker ignores this flag (its
+                      kernel always zeros internally).
+
+    SplitK and kernel-name selection are *always* driven by the tuned CSV
+    (``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE``).  Callers cannot override
+    them: in current AITER main the C++ cktile dispatch is keyed by
+    ``kernelName``, and an empty name falls back to a non-tuned default
+    heuristic kernel.  Bypassing the CSV would therefore silently lose the
+    tuned kernel selection (the symptom that motivated this design choice).
+    """
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
@@ -689,7 +712,12 @@ def gemm_a8w8_blockscale(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    if out is None:
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    else:
+        assert out.shape == (m, n), f"out shape {tuple(out.shape)} != ({m}, {n})"
+        assert out.dtype == dtype, f"out dtype {out.dtype} != {dtype}"
+        Y = out
     if isBpreshuffled:
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
@@ -704,6 +732,12 @@ def gemm_a8w8_blockscale(
             splitK = int(config.get("splitK", 0))
             kernelName = str(config.get("kernelName", ""))
             if libtype == "ck":
+                # Legacy CK invoker doesn't honor y_is_zeroed; the kernel
+                # zeros Y internally.  We ignore the flag silently rather
+                # than re-routing to cktile, because the CK CSV row's
+                # kernelName is not in the cktile registry (cktile would
+                # then fall back to the default heuristic kernel and lose
+                # the per-shape tune).
                 return gemm_a8w8_blockscale_ck(
                     XQ,
                     WQ,
@@ -722,6 +756,7 @@ def gemm_a8w8_blockscale(
                     Y,
                     splitK=splitK,
                     kernelName=kernelName,
+                    y_is_zeroed=y_is_zeroed,
                 )
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
