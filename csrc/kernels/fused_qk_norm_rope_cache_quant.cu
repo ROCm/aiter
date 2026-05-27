@@ -2286,7 +2286,7 @@ void fused_rope_rms_1way(const T* q,
                          hipStream_t stream)
 {
     using mrope_utils::WARP_SIZE;
-    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int block_size = 256;
     auto num_warps_per_block = block_size / WARP_SIZE;
     dim3 threadsPerBlock(block_size);
@@ -2897,11 +2897,11 @@ void fused_qk_norm_rope_2way(aiter_tensor_t& q0,
     });
 }
 
-void fused_qk_norm_rope_1way(at::Tensor& q,
-                             at::Tensor& k,
-                             at::Tensor& w_q,
-                             at::Tensor& w_k,
-                             at::Tensor& cos_sin,
+void fused_qk_norm_rope_1way(aiter_tensor_t& q,
+                             aiter_tensor_t& k,
+                             aiter_tensor_t& w_q,
+                             aiter_tensor_t& w_k,
+                             aiter_tensor_t& cos_sin,
                              int64_t batch_size,
                              int64_t num_tokens,
                              int64_t num_heads_q,
@@ -2909,41 +2909,36 @@ void fused_qk_norm_rope_1way(at::Tensor& q,
                              int64_t head_size,
                              bool is_interleaved,
                              double eps,
-                             at::Tensor& out_q,
-                             at::Tensor& out_k)
+                             aiter_tensor_t& out_q,
+                             aiter_tensor_t& out_k)
 {
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous());
-    TORCH_CHECK(w_q.is_contiguous() && w_k.is_contiguous());
-    TORCH_CHECK(cos_sin.is_contiguous());
-    TORCH_CHECK(out_q.is_contiguous() && out_k.is_contiguous());
-    // cos_sin must be fp32 to match the qwen-image-edit / diffusers reference,
-    // where the complex RoPE freqs carry full fp32 precision before the rope
-    // multiply. Passing bf16/fp16 cos_sin truncates the input before the
-    // kernel even runs, producing precision drift in the generated image.
-    TORCH_CHECK(cos_sin.scalar_type() == at::kFloat,
+    AITER_CHECK(q.is_contiguous() && k.is_contiguous());
+    AITER_CHECK(w_q.is_contiguous() && w_k.is_contiguous());
+    AITER_CHECK(cos_sin.is_contiguous());
+    AITER_CHECK(out_q.is_contiguous() && out_k.is_contiguous());
+    AITER_CHECK(cos_sin.dtype() == AITER_DTYPE_fp32,
                 "fused_qk_norm_rope_1way requires cos_sin in float32 (got ",
-                cos_sin.scalar_type(), ")");
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(q));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kBFloat16, at::kHalf, q.scalar_type(), "fused_qk_norm_rope_1way", [&] {
-            using T = KernelElementType<scalar_t>::type;
-            fused_rope_rms_1way<T>((T*)q.data_ptr<scalar_t>(),
-                                   (T*)k.data_ptr<scalar_t>(),
-                                   (T*)w_q.data_ptr<scalar_t>(),
-                                   (T*)w_k.data_ptr<scalar_t>(),
-                                   cos_sin.data_ptr<float>(),
-                                   batch_size,
-                                   num_tokens,
-                                   num_heads_q,
-                                   num_heads_k,
-                                   head_size,
-                                   is_interleaved,
-                                   eps,
-                                   (T*)out_q.data_ptr<scalar_t>(),
-                                   (T*)out_k.data_ptr<scalar_t>(),
-                                   stream);
-        });
+                AiterDtype_to_str(cos_sin.dtype()), ")");
+    HipDeviceGuard device_guard(q.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(q.dtype(), "fused_qk_norm_rope_1way", [&] {
+        using T = scalar_t;
+        fused_rope_rms_1way<T>(reinterpret_cast<T*>(q.data_ptr()),
+                               reinterpret_cast<T*>(k.data_ptr()),
+                               reinterpret_cast<T*>(w_q.data_ptr()),
+                               reinterpret_cast<T*>(w_k.data_ptr()),
+                               reinterpret_cast<float*>(cos_sin.data_ptr()),
+                               batch_size,
+                               num_tokens,
+                               num_heads_q,
+                               num_heads_k,
+                               head_size,
+                               is_interleaved,
+                               eps,
+                               reinterpret_cast<T*>(out_q.data_ptr()),
+                               reinterpret_cast<T*>(out_k.data_ptr()),
+                               stream);
+    });
 }
 
 void fused_qk_norm_rope_cache_block_quant_shuffle(
