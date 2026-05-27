@@ -219,6 +219,12 @@ static constexpr int OPUS_A16W16_SB_KID_MAX = 10;
 // for the per-kid (tile, cpol) layout.
 static constexpr int OPUS_PERSISTENT_KID_MIN = 300;
 static constexpr int OPUS_PERSISTENT_KID_MAX = 316;
+// Mono-tile a16w16 kids: [1400, 1500). Mono-tile is intrinsically non-OOB
+// (no tail handling in the kernel body), so kids land in the >=1000 band
+// directly — there is no base/nooob mirror split for this family. See
+// opus_gemm_common.py :: a16w16_mono_tile_kernels_list.
+static constexpr int OPUS_MONO_TILE_KID_MIN = 1400;
+static constexpr int OPUS_MONO_TILE_KID_MAX = 1500;
 // non-OOB kid offset
 static constexpr int OPUS_NOOOB_KID_OFFSET = 1000;
 
@@ -255,9 +261,16 @@ static inline bool opus_kid_is_persistent(int kid)
           kid < OPUS_PERSISTENT_KID_MAX + OPUS_NOOOB_KID_OFFSET);
 }
 
+static inline bool opus_kid_is_mono_tile(int kid)
+{
+  // Mono-tile lives entirely in the non-OOB band [1400, 1500); no mirror.
+  return kid >= OPUS_MONO_TILE_KID_MIN && kid < OPUS_MONO_TILE_KID_MAX;
+}
+
 static inline bool opus_kid_supports_bias(int kid)
 {
-  // persistent does not yet support bias (kargs lacks ptr_bias/stride_bias_batch).
+  // persistent and mono-tile do not support bias (kargs lacks
+  // ptr_bias/stride_bias_batch; launchers reject non-empty bias up front).
   return opus_kid_is_a16w16_sb(kid) || opus_kid_is_splitk(kid);
 }
 

@@ -275,6 +275,19 @@ def kid_rejects_shape(k_inst, M, N, K):
                 return True
         return False
 
+    if k_inst.kernel_tag == "a16w16_mono_tile":
+        # mono_tile is divisible-only (has_oob=False is intrinsic; the
+        # launcher asserts M%B_M==N%B_N==K%B_K==0) and has no splitk /
+        # K-tail mask path. Reject any non-aligned shape up front.
+        if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
+            return True
+        # N%16 vector-store guard (same root cause as a16w16 family);
+        # already implied by N%B_N==0 with B_N % 64 == 0, but keep the
+        # explicit check for symmetry.
+        if N % 16 != 0:
+            return True
+        return False
+
     return False
 
 
