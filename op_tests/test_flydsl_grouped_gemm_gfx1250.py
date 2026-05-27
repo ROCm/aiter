@@ -1352,6 +1352,7 @@ def _run_mock_moe(
     bench_mode: str = "event",
     bench_scope: str = "wrapper",
     data_format: str = "fp4",
+    use_bias: bool = False,
 ) -> tuple[dict[str, float], dict[str, float]]:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
@@ -1398,6 +1399,15 @@ def _run_mock_moe(
     x1_scale = _prep_scale_batch(x1_scale_raw, warp_tile=s["tile_m"] // s["m_warp"], tile_k=s["tile_k"])
     w1_scale = _prep_scale_batch(w1_scale_raw, warp_tile=s["tile_n"] // s["n_warp"], tile_k=s["tile_k"])
     y1 = torch.empty((E, max_m, inter_dim), device="cuda", dtype=torch.float16)
+    bias1_cpu = None
+    bias1 = None
+    if use_bias:
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(91)
+        bias1_cpu = (
+            torch.randn((E, 2 * inter_dim), generator=gen, dtype=torch.float32) * 1.0e-3
+        ).to(torch.float16)
+        bias1 = bias1_cpu.cuda()
     timed_prefix_s1 = _make_m_tile_prefix_for_shape(masked_m, s) if persistent else None
     timed_map_s1 = _make_m_tile_map_for_shape(masked_m, s) if persistent else None
     _log(f"mock moe stage1 persistent={persistent}: compile")
@@ -1456,6 +1466,7 @@ def _run_mock_moe(
                _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                _m_tile_prefix=timed_prefix_s1,
                _m_tile_map=timed_map_s1,
+               bias=bias1,
                _debug_tmp_sentinel=_debug_tmp_sentinel,
                _debug_tmp_out=_debug_tmp_out)
     else:
@@ -1467,6 +1478,7 @@ def _run_mock_moe(
                _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                _m_tile_prefix=timed_prefix_s1,
                _m_tile_map=timed_map_s1,
+               bias=bias1,
                _debug_tmp_sentinel=_debug_tmp_sentinel,
                _debug_tmp_out=_debug_tmp_out)
 
@@ -1497,6 +1509,7 @@ def _run_mock_moe(
                stream=torch.cuda.current_stream(),
                _m_tile_prefix=bench_prefix_s1,
                _m_tile_map=bench_map_s1,
+               bias=bias1,
                _tmp=bench_tmp_s1,
                _skip_epilogue=True)
         else:
@@ -1552,6 +1565,9 @@ def _run_mock_moe(
                 k=model_dim,
                 data_format=data_format,
             )
+            if bias1_cpu is not None:
+                gate_up_all = gate_up_all.to(torch.float16).float()
+                gate_up_all = gate_up_all + bias1_cpu[active_t].to(gate_up_all.device).float().unsqueeze(1)
             gate = gate_up_all[..., :inter_dim]
             up = gate_up_all[..., inter_dim:]
             expected_active = (torch.nn.functional.silu(gate) * up).to(torch.float16).float()
@@ -1576,6 +1592,15 @@ def _run_mock_moe(
     x2_scale = _prep_scale_batch(x2_scale_raw, warp_tile=s["tile_m"] // s["m_warp"], tile_k=s["tile_k"])
     w2_scale = _prep_scale_batch(w2_scale_raw, warp_tile=s["tile_n"] // s["n_warp"], tile_k=s["tile_k"])
     y2 = torch.empty((E, max_m, model_dim), device="cuda", dtype=torch.float16)
+    bias2_cpu = None
+    bias2 = None
+    if use_bias:
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(97)
+        bias2_cpu = (
+            torch.randn((E, model_dim), generator=gen, dtype=torch.float32) * 1.0e-3
+        ).to(torch.float16)
+        bias2 = bias2_cpu.cuda()
     timed_prefix_s2 = _make_m_tile_prefix_for_shape(masked_m, s) if persistent else None
     timed_map_s2 = _make_m_tile_map_for_shape(masked_m, s) if persistent else None
     _log(f"mock moe stage2 persistent={persistent}: compile")
@@ -1628,7 +1653,8 @@ def _run_mock_moe(
                stream=torch.cuda.current_stream(),
                _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                _m_tile_prefix=timed_prefix_s2,
-               _m_tile_map=timed_map_s2)
+               _m_tile_map=timed_map_s2,
+               bias=bias2)
     else:
         rotate_select_s2 = None
 
@@ -1637,7 +1663,8 @@ def _run_mock_moe(
                stream=torch.cuda.current_stream(),
                _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                _m_tile_prefix=timed_prefix_s2,
-               _m_tile_map=timed_map_s2)
+               _m_tile_map=timed_map_s2,
+               bias=bias2)
 
     perf_iter_s2 = [0]
     bench_prefix_s2 = timed_prefix_s2 if persistent else None
@@ -1660,7 +1687,8 @@ def _run_mock_moe(
                masked_m, max_m, model_dim, inter_dim, E,
                stream=torch.cuda.current_stream(),
                _m_tile_prefix=bench_prefix_s2,
-               _m_tile_map=bench_map_s2)
+               _m_tile_map=bench_map_s2,
+               bias=bias2)
         else:
             launch_stage2()
         return y2
@@ -1684,6 +1712,9 @@ def _run_mock_moe(
         )
         timings2["run_perftest_us"] = us2
         _log(f"mock moe stage2 persistent={persistent}: run_perftest done us={us2:.2f}")
+    if not verify and bench_scope == "gemm":
+        _log("mock moe gemm-scope timing done; skip final scatter")
+        return timings1, timings2
     if verify:
         y2.fill_(_VERIFY_SENTINEL)
         if rotate_select_s2 is not None:
@@ -1711,6 +1742,10 @@ def _run_mock_moe(
                 k=inter_dim,
                 data_format=data_format,
             ).to(torch.float16).float()  # (A, max_m, model_dim)
+            if bias2_cpu is not None:
+                expected_all = (
+                    expected_all + bias2_cpu[active_t].to(expected_all.device).float().unsqueeze(1)
+                ).to(torch.float16).float()
             actual_active = actual_active_raw.float()
             try:
                 _assert_batched_close(
@@ -1736,7 +1771,8 @@ def _run_mock_moe(
     row_idx = torch.arange(max_m, device="cuda").view(1, max_m)
     valid_mask = (row_idx < masked_m.view(E, 1))                      # (E, max_m)  bool, GPU
     flat_mask = valid_mask.view(-1)                                    # (E*max_m,)
-    if flat_mask.any():
+    # Avoid GPU bool reductions here: Tensor.any() on bool can hang on gfx1250.
+    if int(masked_m_cpu.sum().item()) > 0:
         flat_tokens = slot_token_ids.to("cuda").view(-1)               # (E*max_m,)
         flat_ranks = slot_rank_ids.to("cuda").view(-1)
         flat_y = y2.view(E * max_m, model_dim)                         # (E*max_m, model_dim)
@@ -1883,6 +1919,8 @@ def main() -> None:
     parser.add_argument("--data-format", choices=("fp4", "a8w4"), default="fp4",
                         help="Activation/weight format under test. fp4 is MXFP4xMXFP4; "
                              "a8w4 uses FP8 activations with MXFP4 weights.")
+    parser.add_argument("--use-bias", action=argparse.BooleanOptionalAction, default=False,
+                        help="Pass per-expert bias into grouped GEMM stage1/stage2.")
     parser.add_argument("--data", choices=("constant", "pattern", "randn"), default="constant")
     parser.add_argument("--masked-mode", choices=("mixed", "full", "descending"), default="mixed")
     parser.add_argument("--masked-m-override", type=int, default=None,
@@ -1941,7 +1979,8 @@ def main() -> None:
 
     print(
         f"[masked-grouped-moe-gemm] scenario={args.scenario} shape={s} stage={args.stage} "
-        f"verify={args.verify} data_format={args.data_format} data={args.data} masked_mode={args.masked_mode} "
+        f"verify={args.verify} data_format={args.data_format} use_bias={args.use_bias} "
+        f"data={args.data} masked_mode={args.masked_mode} "
         f"bench_mode={args.bench_mode} bench_scope={args.bench_scope} rotate={args.rotate}",
         flush=True,
     )
@@ -1961,6 +2000,7 @@ def main() -> None:
                 bench_mode=args.bench_mode,
                 bench_scope=args.bench_scope,
                 data_format=args.data_format,
+                use_bias=args.use_bias,
             )
             print(
                 f"[masked-grouped-moe-gemm] mock_moe persistent={persistent} "
@@ -1983,6 +2023,7 @@ def main() -> None:
                 bench_scope=args.bench_scope,
                 rotate=args.rotate,
                 data_format=args.data_format,
+                use_bias=args.use_bias,
             )
             print(f"[masked-grouped-moe-gemm] stage1 persistent={persistent} {_format_timing_summary(timings)}", flush=True)
         if args.stage in ("2", "both"):
@@ -1999,6 +2040,7 @@ def main() -> None:
                 bench_scope=args.bench_scope,
                 rotate=args.rotate,
                 data_format=args.data_format,
+                use_bias=args.use_bias,
             )
             print(f"[masked-grouped-moe-gemm] stage2 persistent={persistent} {_format_timing_summary(timings)}", flush=True)
 
