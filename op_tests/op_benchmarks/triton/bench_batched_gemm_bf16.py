@@ -41,7 +41,7 @@ def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
     mem_read = (
         x.numel() * x.element_size()
         + w.numel() * w.element_size()
-        + bias.numel() * bias.element_size()
+        + (bias.numel() * bias.element_size() if bias is not None else 0)
     )
     mem_write = y.numel() * y.element_size()
     mem = mem_read + mem_write

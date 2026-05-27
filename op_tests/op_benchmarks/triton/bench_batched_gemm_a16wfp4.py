@@ -38,7 +38,11 @@ def bench_gemm_fn(
     # flops
     flops = 2.0 * M * N * K * batch
     # memory transfer
-    mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
+    mem_read = (
+        x.numel() * x.element_size()
+        + w.numel() * w.element_size()
+        + w_scale.numel() * w_scale.element_size()
+    )
     mem_write = y.numel() * y.element_size()
     mem = mem_read + mem_write
 

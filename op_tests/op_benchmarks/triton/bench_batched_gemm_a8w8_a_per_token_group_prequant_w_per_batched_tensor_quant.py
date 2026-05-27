@@ -47,13 +47,14 @@ def bench_gemm_fn(
     # flops
     flops = 2.0 * batch * M * N * K
     # memory transfer
-    mem = (
+    mem_read = (
         x.numel() * x.element_size()
         + weight.numel() * weight.element_size()
         + w_scale.numel() * w_scale.element_size()
         + (bias.numel() * bias.element_size() if bias is not None else 0)
-        + y.numel() * y.element_size()
     )
+    mem_write = y.numel() * y.element_size()
+    mem = mem_read + mem_write
 
     def fn():
         return batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
