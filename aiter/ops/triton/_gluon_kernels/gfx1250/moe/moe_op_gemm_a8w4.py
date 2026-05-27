@@ -699,6 +699,7 @@ def _moe_gemm_a8w4_prefill(
     NUM_BUFFERS: gl.constexpr,
     # One of ["GFX1250", None]
     SWIZZLE_MX_SCALE: gl.constexpr,
+    EVEN_K: gl.constexpr,
     MASK_K_LIMIT: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
@@ -891,10 +892,12 @@ def _moe_gemm_a8w4_prefill(
         offs_xs_m = off_x_m + gl.arange(
             0, BLOCK_M, layout=gl.SliceLayout(1, X_SCALES_LOAD_LAYOUT)
         )
+        offs_xs_m = gl.max_contiguous(
+            gl.multiple_of(offs_xs_m % M, BLOCK_M), BLOCK_M
+        )
         offs_xs_k = gl.arange(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
         )
-        mask_xs_m = offs_xs_m < M
         if GatherIndx is None:
             XMxScale += start_m * stride_x_mx_m
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -937,27 +940,30 @@ def _moe_gemm_a8w4_prefill(
     read_idx = 0
     write_idx = 0
     for _ in gl.static_range(NUM_BUFFERS):
+        idx_K = write_idx * BLOCK_K
+        idx_W = write_idx * PACKED_BLOCK_K_W
+        idx_MX = write_idx * PACKED_MX_BLOCK
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
-                [off_x_m, write_idx * BLOCK_K],
+                [off_x_m, idx_K],
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
-                write_idx * BLOCK_K,
+                idx_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
-            [off_w_n, write_idx * PACKED_BLOCK_K_W],
+            [off_w_n, idx_W],
             w_buffer.index(write_idx % NUM_BUFFERS),
         )
         gl.amd.gfx1250.tdm.async_load(
             w_scales_desc,
-            [off_w_n_scale, write_idx * PACKED_MX_BLOCK],
+            [off_w_n_scale, idx_MX],
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
@@ -965,8 +971,6 @@ def _moe_gemm_a8w4_prefill(
             async_copy.global_to_shared(
                 x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 xs_ptrs_base + xs_k.to(index_type)[None, :],
-                mask=mask_xs_m[:, None],
-                other=0.0,
             )
             async_copy.commit_group()
         write_idx += 1
@@ -1014,27 +1018,30 @@ def _moe_gemm_a8w4_prefill(
                 cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc
             )
 
+        idx_K = write_idx * BLOCK_K
+        idx_W = write_idx * PACKED_BLOCK_K_W
+        idx_MX = write_idx * PACKED_MX_BLOCK
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
-                [off_x_m, write_idx * BLOCK_K],
+                [off_x_m, idx_K],
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
-                write_idx * BLOCK_K,
+                idx_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
-            [off_w_n, write_idx * PACKED_BLOCK_K_W],
+            [off_w_n, idx_W],
             w_buffer.index(write_idx % NUM_BUFFERS),
         )
         gl.amd.gfx1250.tdm.async_load(
             w_scales_desc,
-            [off_w_n_scale, write_idx * PACKED_MX_BLOCK],
+            [off_w_n_scale, idx_MX],
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
@@ -1042,8 +1049,6 @@ def _moe_gemm_a8w4_prefill(
             async_copy.global_to_shared(
                 x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 xs_ptrs_base + xs_k.to(index_type)[None, :],
-                mask=mask_xs_m[:, None],
-                other=0.0,
             )
             async_copy.commit_group()
         write_idx += 1
