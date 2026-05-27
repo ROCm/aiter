@@ -187,12 +187,13 @@ def build_tune_dict(
                           If None, no libtype filtering is applied.
         kernels_by_name:  Optional dict mapping kernelName string → kernelInstance.
                           When provided and the CSV has a "kernelName" column, kernel
-                          lookup uses the name instead of kernelId. If the name is not
-                          found in kernels_by_name, the entry is skipped (heuristic
-                          default used) and a warning is logged — no kernelId fallback
-                          is attempted, because kernelIds are not stable across kernel
-                          list reorderings. Falls back to kernelId if the kernelName
-                          column is absent from the CSV.
+                          lookup uses the name instead of kernelId. Falls back to
+                          kernelId if the kernelName column is absent from the CSV.
+
+    Strict on stale tuned-CSV rows: any row whose kernelName (or kernelId, in the
+    fallback path) is not present in the registry will raise RuntimeError listing
+    every offending row. A row that codegen silently drops would otherwise compile
+    into a .so guaranteed to TORCH_CHECK(false, ...) at runtime for that shape.
 
     Returns:
         dict with mixed keys: negative ints (from default_dict) and
@@ -208,6 +209,7 @@ def build_tune_dict(
         logger.warning(
             "kernels_by_name provided but CSV has no kernelName column, falling back to kernelId."
         )
+    bad_rows: list[str] = []
     for _, row in filtered.iterrows():
         key = (
             str(row["gfx"]),
@@ -222,10 +224,9 @@ def build_tune_dict(
             if kernel is not None:
                 tune_dict[key] = kernel
             else:
-                logger.warning(
-                    f"kernelName '{kname}' not found in kernels_by_name "
-                    f"(gfx={key[0]}, cu_num={key[1]}, M={key[2]}, N={key[3]}, K={key[4]}); "
-                    f"falling back to heuristic default."
+                bad_rows.append(
+                    f"  kernelName={kname!r} not in kernels_by_name "
+                    f"(gfx={key[0]}, cu_num={key[1]}, M={key[2]}, N={key[3]}, K={key[4]})"
                 )
         else:
             kid = int(row["kernelId"])
@@ -233,11 +234,19 @@ def build_tune_dict(
             if kernel is not None:
                 tune_dict[key] = kernel
             else:
-                logger.warning(
-                    f"kernelId {kid} not in kernels_list "
+                bad_rows.append(
+                    f"  kernelId={kid} not in kernels_list "
                     f"(gfx={key[0]}, cu_num={key[1]}, M={key[2]}, N={key[3]}, K={key[4]}, "
-                    f"kernels_list size={len(kernels_list)}); falling back to heuristic default."
+                    f"kernels_list size={len(kernels_list)})"
                 )
+    if bad_rows:
+        raise RuntimeError(
+            "build_tune_dict: tuned CSV references kernels not in the build registry. "
+            "Either re-tune the CSV against the current kernel list or restore the "
+            "missing kernel definition; the build refuses to produce a .so that would "
+            "TORCH_CHECK(false, ...) at runtime for these shapes:\n"
+            + "\n".join(bad_rows)
+        )
     return tune_dict
 
 
@@ -264,6 +273,7 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
     filtered = filter_tune_df(tune_df, targets)
     if libtype is not None and "libtype" in tune_df.columns:
         filtered = filtered[filtered["libtype"] == libtype]
+    bad_rows: list[str] = []
     for _, row in filtered.iterrows():
         key = (
             str(row["gfx"]),
@@ -278,12 +288,59 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
         if kernel is not None:
             tune_dict[key] = kernel
         else:
-            logger.warning(
-                f"kernelId {kid} not in kernels_list "
+            bad_rows.append(
+                f"  kernelId={kid} not in kernels_list "
                 f"(gfx={key[0]}, cu_num={key[1]}, B={key[2]}, M={key[3]}, N={key[4]}, K={key[5]}, "
-                f"kernels_list size={len(kernels_list)}); falling back to heuristic default."
+                f"kernels_list size={len(kernels_list)})"
             )
+    if bad_rows:
+        raise RuntimeError(
+            "build_tune_dict_batched: tuned CSV references kernels not in the build "
+            "registry. Either re-tune the CSV against the current kernel list or "
+            "restore the missing kernel definition; the build refuses to produce a "
+            ".so that would TORCH_CHECK(false, ...) at runtime for these shapes:\n"
+            + "\n".join(bad_rows)
+        )
     return tune_dict
+
+
+def write_name_keyed_lookup_header(
+    output_path, kernels_dict, lookup_head, lookup_template, lookup_end
+):
+    """Write a name-keyed C++ GEMM dispatch lookup header from a kernels_dict.
+
+    Sister of write_lookup_header(), but emits {"<kernel_name>", &kernel<...>}
+    entries instead of (gfx,cu_num,M,N,K) tuple keys.  Used by the blockscale
+    GEMM modules whose runtime dispatch is now driven by Python-resolved
+    kernel name strings (read from the tuned CSV) rather than a build-time
+    tuple-keyed lookup.  The kernels_dict may contain duplicate entries for
+    the same kernel (multiple shapes mapping to the same kernel.name); we
+    dedupe by name so each kernel is registered exactly once.
+
+    Skips negative-int default_dict keys (heuristic fallbacks the dispatch
+    layer references directly by symbol).
+
+    Args:
+        output_path:     Full path of the .h file to write.
+        kernels_dict:    Dict returned by build_tune_dict.
+        lookup_head:     String written before the loop (defines the macro header).
+        lookup_template: String with {kernel_name} placeholder (used twice:
+                          once for the C++ string key, once for the symbol).
+        lookup_end:      String written after the loop (closes the macro / #endif).
+    """
+    seen = set()
+    with open(output_path, "w") as f:
+        f.write(lookup_head)
+        for key, k in kernels_dict.items():
+            if isinstance(key, int) and key < 0:
+                # default_dict heuristic-fallback entries; the dispatch layer
+                # references the heuristic kernel by symbol, not via the table.
+                continue
+            if k.name in seen:
+                continue
+            seen.add(k.name)
+            f.write(lookup_template.format(kernel_name=k.name))
+        f.write(lookup_end)
 
 
 def write_lookup_header(
