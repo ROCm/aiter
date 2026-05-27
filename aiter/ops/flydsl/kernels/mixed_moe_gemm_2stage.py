@@ -2981,10 +2981,16 @@ def compile_mixed_moe_gemm2(
     _sbm_tag = "" if _sort_block_m == tile_m else f"_sbm{_sort_block_m}"
     _pm_tag = f"_persist_cu{_cu_num}" if _persistent else f"_pm{persist_m}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    # The epilogue codegen below branches on `accumulate` via const_expr, so the
+    # generated MLIR / binary differs between atomic-add and direct-store paths.
+    # Add an ABI tag for accumulate=False to prevent FlyDSL compiler-cache
+    # collision with the default accumulate=True path; the default path keeps
+    # its existing module name so already-cached binaries remain valid.
+    _acc_tag = "" if accumulate else "_acc0"
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_vscale_fix3{_pm_tag}{_sbm_tag}{_xcd_tag}"
+        f"_vscale_fix3{_pm_tag}{_sbm_tag}{_xcd_tag}{_acc_tag}"
     ).replace("-", "_")
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Ping-pong A2 tiles via separate allocators (like stage1).
