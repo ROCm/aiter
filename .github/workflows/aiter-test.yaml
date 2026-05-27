@@ -27,6 +27,7 @@ env:
   AITER_TEST: "op_tests"
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
   AITER_PREBUILD_MAX_JOBS: "96"
+  TRITON_WHEEL_ARTIFACT_NAME: triton_wheelhouse
 
 jobs:
   check-signal:
@@ -257,12 +258,41 @@ jobs:
           path: aiter_shard_*.list
           retention-days: 7
 
+  prepare_triton_wheel:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    needs: check-signal
+    env:
+      DOCKER_IMAGE: "rocm/pytorch:latest"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Triton wheel
+        id: download_triton_wheel
+        continue-on-error: true
+        run: |
+          set -ex
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            ${{ env.DOCKER_IMAGE }} \
+            bash ./.github/scripts/download_triton_wheel.sh triton_wheels
+
+      - name: Upload Triton wheel artifact
+        if: ${{ steps.download_triton_wheel.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
+          path: triton_wheels/
+          retention-days: 3
+
   standard:
     if: >-
       (!github.event.pull_request || github.event.pull_request.draft == false) &&
       github.event.action != 'labeled'
     name: Standard Tests (1 GPU)
-    needs: [build_aiter_wheels, split_aiter_tests]
+    needs: [build_aiter_wheels, split_aiter_tests, prepare_triton_wheel]
     strategy:
       fail-fast: false
       matrix:
@@ -336,6 +366,13 @@ jobs:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
 
+      - name: Download Triton wheel artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
+          path: triton_wheels
+
       - name: Docker login
         if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
         env:
@@ -374,6 +411,7 @@ jobs:
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -e AITER_TEST="${AITER_TEST}" \
+          -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
@@ -504,10 +542,13 @@ jobs:
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
-        if: success()
+        if: always()
         with:
           name: standard-test-log-${{ matrix.runner }}-shard-${{ matrix.shard_idx }}
-          path: latest_test.log
+          path: |
+            latest_test.log
+            tuned_op_bench.csv
+          if-no-files-found: warn
           retention-days: 7
 
       - name: Cleanup container
@@ -756,3 +797,175 @@ jobs:
         if: always()
         run: |
           ./.github/scripts/clean_up_rocm.sh
+
+  tuned_op_bench:
+    # Tuned operator perf regression check.
+    # - PR: pull last main baseline CSV, compare current shard's CSV, warn-only
+    # - push to main / workflow_dispatch: publish current CSV as next baseline
+    # Only consumes csv from linux-aiter-mi35x-1 runner to avoid cross-arch noise.
+    name: Tuned Op Bench
+    if: >-
+      always() &&
+      !cancelled() &&
+      !github.event.pull_request.draft &&
+      github.event.action != 'labeled' &&
+      github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    needs: [standard]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download standard test logs (mi35x only)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: standard-test-log-linux-aiter-mi35x-1-shard-*
+          path: /tmp/logs/
+
+      - name: Locate current tuned_op_bench.csv
+        id: current
+        run: |
+          shopt -s nullglob
+          csv_files=(/tmp/logs/*/tuned_op_bench.csv)
+          if [[ ${#csv_files[@]} -eq 0 ]]; then
+              echo "::warning::No tuned op benchmark CSV found in any mi35x shard; skipping tuned_op_bench"
+              echo "found=false" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          echo "Merging tuned op benchmark CSVs:"
+          printf '  %s\n' "${csv_files[@]}"
+          python3 - "${csv_files[@]}" <<'PY'
+          import csv
+          import sys
+
+          rows = []
+          fieldnames = []
+          seen = set()
+          for path in sys.argv[1:]:
+              with open(path, newline="") as f:
+                  reader = csv.DictReader(f)
+                  if not reader.fieldnames:
+                      continue
+                  for name in reader.fieldnames:
+                      if name not in seen:
+                          fieldnames.append(name)
+                          seen.add(name)
+                  rows.extend(reader)
+
+          if "us" not in seen:
+              raise SystemExit("merged tuned op benchmark CSV is missing required `us` column")
+
+          with open("/tmp/current.csv", "w", newline="") as f:
+              writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+              writer.writeheader()
+              for row in rows:
+                  writer.writerow({name: row.get(name, "") for name in fieldnames})
+          print(f"Merged {len(rows)} row(s) into /tmp/current.csv")
+          PY
+          echo "Current merged CSV: /tmp/current.csv ($(wc -l < /tmp/current.csv) lines)"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      # ── PR path: compare vs baseline ──
+      - name: Fetch baseline from PR base.sha
+        if: steps.current.outputs.found == 'true' && github.event_name == 'pull_request'
+        id: baseline_pinned
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: aiter-test.yaml
+          commit: ${{ github.event.pull_request.base.sha }}
+          name: tuned-op-bench-${{ github.event.pull_request.base.sha }}
+          path: /tmp/baseline_pinned/
+          if_no_artifact_found: warn
+
+      - name: Fallback — fetch baseline from latest main
+        if: >-
+          steps.current.outputs.found == 'true' &&
+          github.event_name == 'pull_request'
+        id: baseline_main
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: aiter-test.yaml
+          branch: main
+          name_is_regexp: true
+          name: ^tuned-op-bench-[a-f0-9]+$
+          path: /tmp/baseline_main/
+          if_no_artifact_found: warn
+
+      - name: Compare
+        if: steps.current.outputs.found == 'true' && github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CURR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          baseline_csv=""
+          if [[ -f /tmp/baseline_pinned/tuned_op_bench.csv ]]; then
+              baseline_csv=/tmp/baseline_pinned/tuned_op_bench.csv
+              echo "Using baseline pinned to PR.base.sha=${BASE_SHA:0:7}"
+          else
+              # fallback: pick first match under /tmp/baseline_main/*
+              shopt -s nullglob
+              candidates=(/tmp/baseline_main/*/tuned_op_bench.csv /tmp/baseline_main/tuned_op_bench.csv)
+              for c in "${candidates[@]}"; do
+                  if [[ -f "$c" ]]; then
+                      baseline_csv="$c"
+                      echo "Using fallback baseline from latest main: $c"
+                      break
+                  fi
+              done
+          fi
+          if [[ -z "$baseline_csv" ]]; then
+              echo "::warning::No tuned op benchmark baseline found (neither pinned PR.base.sha nor latest main); skipping compare."
+              {
+                  echo "## Tuned Op Bench"
+                  echo
+                  echo "_No baseline available — first run on this branch or main hasn't published baseline yet._"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+          fi
+          echo "## Tuned Op Bench (vs baseline)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          bash .github/scripts/check_tuned_op_regression.sh \
+              "$baseline_csv" /tmp/current.csv \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # ── main push / workflow_dispatch path: publish baseline ──
+      - name: Stage baseline payload
+        if: >-
+          steps.current.outputs.found == 'true' &&
+          (github.event_name == 'push' && github.ref == 'refs/heads/main'
+           || github.event_name == 'workflow_dispatch')
+        run: |
+          mkdir -p /tmp/publish
+          cp /tmp/current.csv /tmp/publish/tuned_op_bench.csv
+          python3 -c "
+          import json, os, datetime
+          meta = {
+              'commit': os.environ['GITHUB_SHA'],
+              'ref': os.environ['GITHUB_REF'],
+              'event': os.environ['GITHUB_EVENT_NAME'],
+              'runner_pool': 'linux-aiter-mi35x-1',
+              'gpu_arch_list': os.environ.get('GPU_ARCH_LIST', ''),
+              'ran_at': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+          }
+          with open('/tmp/publish/metadata.json', 'w') as f:
+              json.dump(meta, f, indent=2)
+          print(json.dumps(meta, indent=2))
+          "
+          ls -la /tmp/publish/
+          wc -l /tmp/publish/tuned_op_bench.csv
+
+      - name: Publish baseline artifact
+        if: >-
+          steps.current.outputs.found == 'true' &&
+          (github.event_name == 'push' && github.ref == 'refs/heads/main'
+           || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuned-op-bench-${{ github.sha }}
+          path: /tmp/publish/
+          retention-days: 90
