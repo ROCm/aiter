@@ -445,7 +445,7 @@ def _moe_gemm_a4w4_gfx1250(
     # L2 prefetch prologue: warm L2 for the iterations that the first few main-loop
     # iterations will load but that aren't already covered by the LDS prologue.
     for i in gl.static_range(L2_PREFETCH_DISTANCE):
-        pref_idx = (NUM_BUFFERS - 1) + i
+        pref_idx = NUM_BUFFERS + i
         pref_pred = pref_idx < num_k_iter
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.prefetch(
@@ -473,8 +473,8 @@ def _moe_gemm_a4w4_gfx1250(
             speculative=True,
         )
 
-    # prologue: fill NUM_BUFFERS-1 LDS slots via TDM
-    for _ in gl.static_range(NUM_BUFFERS - 1):
+    # prologue: fill NUM_BUFFERS LDS slots via TDM
+    for _ in gl.static_range(NUM_BUFFERS):
         idx_x = load_idx * PACKED_BLOCK_K_X
         idx_w = load_idx * W_BLOCK_K
         idx_x_scales = load_idx * MX_SCALE_BLOCK_K
@@ -516,7 +516,7 @@ def _moe_gemm_a4w4_gfx1250(
         load_idx += 1
 
     # preload tile 0 from LDS into registers
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
     cur_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
     if PRESHUFFLE_WEIGHTS:
         cur_w = (
@@ -537,7 +537,7 @@ def _moe_gemm_a4w4_gfx1250(
 
     # main loop: perform wmma and fill LDS with next tile
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
-    for _ in range(num_k_iter - (NUM_BUFFERS - 1)):
+    for _ in range(num_k_iter - NUM_BUFFERS):
         # issue wmma
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
@@ -615,7 +615,7 @@ def _moe_gemm_a4w4_gfx1250(
             )
 
         # wait for next tile to be filled
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
 
         # load next tile from LDS into registers
         next_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
@@ -645,14 +645,14 @@ def _moe_gemm_a4w4_gfx1250(
         cur_w_scales = next_w_scales
 
     # epilogue: drain remaining tiles
-    for k_ep in gl.static_range(NUM_BUFFERS - 2):
+    for k_ep in gl.static_range(NUM_BUFFERS - 1):
         # issue wmma
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
         )
 
         # wait for next tile to be filled
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - k_ep) * NUM_LOADS_IN_BATCH)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - k_ep) * NUM_LOADS_IN_BATCH)
 
         # load next tile from LDS into registers
         next_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
