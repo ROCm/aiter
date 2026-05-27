@@ -379,6 +379,7 @@ def fused_moe_(
         intermediate_pad,
         isShuffled,
         gate_mode,
+        is_ep=expert_mask is not None,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -904,6 +905,7 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
+    is_ep=False,
 ):
     gate_mode = GateMode(gate_mode)
     _INDEX_COLS = [
@@ -995,6 +997,10 @@ def get_2stage_cfgs(
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
+    # EP convention: callers append one always-masked fake-expert slot to
+    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
+    # on routed_topk; strip the fake slot before building the lookup key.
+    topk -= int(is_ep)
     keys = (
         cu_num,
         token,
@@ -1611,6 +1617,7 @@ def fused_moe_2stages(
         intermediate_pad,
         is_shuffled,
         gate_mode,
+        is_ep=expert_mask is not None,
     )
     if (
         quant_type == QuantType.per_1x32
