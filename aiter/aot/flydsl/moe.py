@@ -627,7 +627,7 @@ def _precompile_to_cache(
             target = out
             if not accumulate:
                 target = torch.empty(
-                    (tokens * topk * model_dim,),
+                    (tokens, topk, model_dim),
                     device=dev,
                     dtype=torch_out_dtype,
                 )
