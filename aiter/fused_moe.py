@@ -892,6 +892,12 @@ def _flydsl_stage2_wrapper(
     )
 
 
+# v1 supports only these (a_dtype, b_dtype) FlyDSL stage2 quant pairs. Locked
+# in by gen-plan DEC-2. fp16/fp4 and a16wi4 are excluded; widen in v2 only
+# after the corresponding kernel paths have been verified end-to-end.
+_NO_COMBINE_SUPPORTED_DTYPES = frozenset({("fp4", "fp4"), ("fp8", "fp4")})
+
+
 def _validate_no_combine_route(metadata, doweight_stage1):
     """Raise NotImplementedError if the chosen MoE dispatch cannot serve no_combine=True.
 
@@ -921,9 +927,12 @@ def _validate_no_combine_route(metadata, doweight_stage1):
         raise NotImplementedError(
             f"no_combine=True: cannot parse FlyDSL kernel name {kernel_name!r}"
         )
-    if parsed.get("b_dtype") == "int4":
+    dtype_pair = (parsed.get("a_dtype"), parsed.get("b_dtype"))
+    if dtype_pair not in _NO_COMBINE_SUPPORTED_DTYPES:
+        supported = ", ".join(f"({a}/{b})" for a, b in sorted(_NO_COMBINE_SUPPORTED_DTYPES))
         raise NotImplementedError(
-            "no_combine=True does not support a16wi4 (b_dtype=int4)"
+            f"no_combine=True does not support (a_dtype, b_dtype)="
+            f"({dtype_pair[0]}/{dtype_pair[1]}) in v1; supported pairs: {supported}"
         )
 
 
