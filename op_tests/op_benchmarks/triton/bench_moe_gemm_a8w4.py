@@ -13,6 +13,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     swizzle_scales_gfx950,
     swizzle_scales_gfx1250,
+    preshuffle_weights_gfx1250,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
@@ -168,7 +169,8 @@ def quantize(x, dtype):
 
 
 def bench_mlp_single_weight_init(
-    batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+    batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex,
+    preshuffle=False,
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -193,6 +195,9 @@ def bench_mlp_single_weight_init(
     w2_scale, swizzle_mx_scale2 = check_and_swizzle_scales(
         w2_scale, dim1, dim2 // TP // 2
     )
+    if preshuffle:
+        w1 = preshuffle_weights_gfx1250(w1)
+        w2 = preshuffle_weights_gfx1250(w2)
 
     # -- benchmark --
     x_dtype_str = x_dtype
@@ -228,6 +233,7 @@ def bench_mlp_single_weight_init(
                 swizzle_mx_scale=swizzle_mx_scale1,
                 out_dtype=x_dtype,
                 apply_swiglu=True,
+                preshuffled=preshuffle,
             )
             x = moe_gemm_a8w4(
                 x,
@@ -240,6 +246,7 @@ def bench_mlp_single_weight_init(
                 rdata,
                 scatter_indx=scatter_indx,
                 swizzle_mx_scale=swizzle_mx_scale2,
+                preshuffled=preshuffle,
             )
         else:
             assert x_dtype_str == "mx8"
@@ -256,6 +263,7 @@ def bench_mlp_single_weight_init(
                 gather_indx=gather_indx,
                 swizzle_mx_scale=swizzle_mx_scale1,
                 apply_swiglu=True,
+                preshuffled=preshuffle,
             )
             x, x_scale = quantize(x, x_dtype_str)
             x = moe_gemm_a8w4(
@@ -269,6 +277,7 @@ def bench_mlp_single_weight_init(
                 rdata,
                 scatter_indx=scatter_indx,
                 swizzle_mx_scale=swizzle_mx_scale2,
+                preshuffled=preshuffle,
             )
     proton.finalize()
     return parse_profile(
@@ -287,11 +296,13 @@ def bench_mlp(
     TP,
     op_regex,
     num_weight_inits=1,
+    preshuffle=False,
 ):
     all_results = []
     for _ in range(num_weight_inits):
         result = bench_mlp_single_weight_init(
-            batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+            batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex,
+            preshuffle=preshuffle,
         )
         all_results.append(result)
 
@@ -319,6 +330,7 @@ def roofline_mlp(
     op_regex,
     name="",
     num_weight_inits=1,
+    preshuffle=False,
 ):
     # Avoid creating an empty directory named like the output CSV stem.
     out_dir = Path("logs") / name
@@ -336,6 +348,7 @@ def roofline_mlp(
         TP,
         op_regex,  # fixed args
         num_weight_inits,
+        preshuffle,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -387,6 +400,12 @@ def parse_args(args: list[str] | None = None):
         help="Number of different weight initializations to run for more stable results (default: 1). "
         "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
     )
+    parser.add_argument(
+        "--preshuffle",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Preshuffle the mxfp4 weights for the gfx1250 kernel (default: False).",
+    )
     return parser.parse_args(args=args)
 
 
@@ -423,6 +442,7 @@ def main(args: list[str] | None = None) -> None:
         op_regex=parsed_args.op_regex,
         name="gpt-oss-x2",
         num_weight_inits=parsed_args.num_weight_inits,
+        preshuffle=parsed_args.preshuffle,
     )
 
 
