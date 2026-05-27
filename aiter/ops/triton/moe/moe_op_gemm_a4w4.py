@@ -72,7 +72,12 @@ def get_kernel_config(m, n, k, routing_data):
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     arch = get_arch()
-    num_stages = 1 if arch == "gfx950" else 2
+    # gfx1250 workaround: with num_stages=2 the pipelined schedule emits
+    # llvm.amdgcn.s.waitcnt which the gfx1250 LLVM backend cannot select
+    # (it expects the split s_wait_loadcnt/s_wait_storecnt form on gfx12+),
+    # crashing JIT compile during DSR1 decode cudagraph capture. Mirror the
+    # gfx950 path and force num_stages=1.
+    num_stages = 1 if arch in ("gfx950", "gfx1250") else 2
 
     split_k = 1
     if block_m == 16:
@@ -179,6 +184,7 @@ def mxfp4_quant(
         BLOCK_SIZE_N=block_size_n,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         EVEN_M_N=(M % block_size_m == 0) and (N % block_size_n == 0),
+        num_stages=1,
     )
 
     return x_fp4, x_scale

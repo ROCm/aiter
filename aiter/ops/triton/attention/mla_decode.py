@@ -271,7 +271,7 @@ def _decode_att_m_fwd(
         PAGE_SIZE=page_size,
         logit_cap=logit_cap,
         num_warps=num_warps,
-        num_stages=2,
+        num_stages=1,
         Lk=Lk,
         Lv=Lv,
     )
@@ -641,7 +641,7 @@ def _decode_softmax_reducev_fwd(
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
         num_warps=4,
-        num_stages=2,
+        num_stages=1,
         **extra_kargs,
     )
 

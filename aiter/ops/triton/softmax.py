@@ -25,7 +25,7 @@ def softmax(x):
 
     waves_per_eu = 2
     num_warps = 8
-    num_stages = 2
+    num_stages = 1
 
     num_programs = n_rows
 

@@ -35,7 +35,7 @@ from aiter.fused_moe import (
 # 用 importlib 单文件加载, 避免把 /home/zxe/FlyDSL/tests 放进 sys.path
 # 后与 aiter.ops.flydsl.kernels 里 `from kernels.xxx import ...` 冲突.
 import importlib.util  # noqa: E402
-_FLYDSL_FP4_UTILS_PATH = "/home/zxe/FlyDSL/tests/kernels/utils/fp4_utils.py"
+_FLYDSL_FP4_UTILS_PATH = "/app/FlyDSL/tests/kernels/utils/fp4_utils.py"
 _spec = importlib.util.spec_from_file_location(
     "flydsl_fp4_utils", _FLYDSL_FP4_UTILS_PATH
 )

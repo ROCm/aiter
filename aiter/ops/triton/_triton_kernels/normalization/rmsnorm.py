@@ -137,7 +137,13 @@ def _rms_norm_kernel(
 
     else:
         mask = col_offsets < n_cols
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        # gfx1250 workaround: with num_stages=2 here the pipelined schedule
+        # emits llvm.amdgcn.s.waitcnt which the gfx1250 selector cannot
+        # lower (it expects the split s_wait_loadcnt/s_wait_storecnt form
+        # on gfx12+). The crash reproduces at NUM_PRGMS=32 BLOCK_SIZE=8192
+        # USE_BLOCKED=False during DSR1 decode cudagraph capture. Force
+        # num_stages=1 to disable the pipelining and dodge the bug.
+        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(
@@ -344,7 +350,10 @@ def _quant_rms_norm_kernel(
             tl.store(output_ptrs, output.to(output_ptr.dtype.element_ty), mask=mask)
     else:
         mask = col_offsets < n_cols
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        # gfx1250 workaround: forcing num_stages=1 on these persistent row
+        # loops; num_stages=2 makes Triton emit llvm.amdgcn.s.waitcnt that
+        # the gfx1250 selector can't lower (LLVM ERROR: Cannot select).
+        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(
@@ -509,7 +518,10 @@ def _fused_add_rmsnorm_kernel(
 
     else:
         mask = col_offsets < n_cols
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        # gfx1250 workaround: forcing num_stages=1 on these persistent row
+        # loops; num_stages=2 makes Triton emit llvm.amdgcn.s.waitcnt that
+        # the gfx1250 selector can't lower (LLVM ERROR: Cannot select).
+        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg")
@@ -724,7 +736,10 @@ def _quant_fused_add_rmsnorm_kernel(
 
     else:
         mask = col_offsets < n_cols
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        # gfx1250 workaround: forcing num_stages=1 on these persistent row
+        # loops; num_stages=2 makes Triton emit llvm.amdgcn.s.waitcnt that
+        # the gfx1250 selector can't lower (LLVM ERROR: Cannot select).
+        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             input_ptrs = tl.multiple_of(input_ptrs, (16,))
             row = tl.load(input_ptrs, mask=mask, other=0.0, cache_modifier=".cg")
@@ -876,7 +891,10 @@ def _rmsnorm_bwd_triton(
         mask = col_offsets < n_cols
         dg_col_redux = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
-        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+        # gfx1250 workaround: forcing num_stages=1 on these persistent row
+        # loops; num_stages=2 makes Triton emit llvm.amdgcn.s.waitcnt that
+        # the gfx1250 selector can't lower (LLVM ERROR: Cannot select).
+        for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=1):
             input_ptrs = input_ptr + row_idx * input_row_stride + col_offsets
             grad_output_ptrs = (
                 grad_output_ptr + row_idx * output_row_stride + col_offsets

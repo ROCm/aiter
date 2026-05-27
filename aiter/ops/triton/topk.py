@@ -54,7 +54,7 @@ def one_stage_topk(
         BLOCK=BLOCK,
         FILL_VALUE=torch.finfo(torch.float32).min,
         num_warps=4,
-        num_stages=2,
+        num_stages=1,
     )
     return out_v, out_i
 

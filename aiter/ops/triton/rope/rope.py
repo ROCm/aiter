@@ -906,7 +906,7 @@ def _rope_cached_thd_2c_fwd(
         grid = (SPLIT_H, SPLIT_T, 1)
         num_warps = 4
         waves_per_eu = 0
-        num_stages = 2 if SPLIT_H_SIZE > 1 else 1
+        num_stages = 1
 
         _rope_kernel_thd_cached_2c_fwd[grid](
             x,
@@ -948,7 +948,7 @@ def _rope_cached_thd_2c_fwd(
             grid = (kh, SPLIT_T, 1)
             num_warps = 4
             waves_per_eu = 0
-            num_stages = 2 if QH_per_G > 1 else 1
+            num_stages = 1
 
             _rope_kernel_cached_thd_2c_gqa_fwd[grid](
                 x,
@@ -1222,7 +1222,7 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
         grid = (SPLIT_H, SPLIT_T, 1)
         num_warps = 4
         waves_per_eu = 0
-        num_stages = 2 if SPLIT_H_SIZE > 1 else 1
+        num_stages = 1
 
         _rope_kernel_thd_cached_2c_bwd[grid](
             x,
@@ -1264,7 +1264,7 @@ def _rope_cached_thd_positions_offsets_2c_bwd(
             grid = (kh, SPLIT_T, 1)
             num_warps = 4
             waves_per_eu = 0
-            num_stages = 2 if QH_per_G > 1 else 1
+            num_stages = 1
 
             _rope_kernel_cached_thd_2c_gqa_bwd[grid](
                 x,

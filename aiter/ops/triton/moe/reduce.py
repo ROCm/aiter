@@ -69,5 +69,6 @@ def reduce_grouped(
         K=K,  #
         ADD_RESIDUAL=add_residual,
         num_warps=2,  #
+        num_stages=1,
     )
     return out

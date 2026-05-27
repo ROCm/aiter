@@ -21,7 +21,14 @@ _LOGGER = AiterTritonLogger()
 
 
 def num_programs(x):
-    return min(x.shape[0], get_num_sms())
+    # gfx1250 workaround: at NUM_PRGMS=32 with BLOCK_SIZE=8192, the AMDGPU
+    # backend can't lower llvm.amdgcn.s.waitcnt emitted by tl.load in this
+    # kernel (LLVM ERROR: Cannot select). NUM_PRGMS=64 and above compile
+    # fine, so floor at 64. The persistent row loop iterates correctly with
+    # any NUM_PRGMS >= n_rows (extra programs short-circuit on the loop
+    # bounds check), so the floor is safe — just a tiny launch-time
+    # overhead for very small decode batches.
+    return max(64, min(x.shape[0], get_num_sms()))
 
 
 def block_size(x):
@@ -61,6 +68,16 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
         blk_size,
         USE_BLOCKED,
         NUM_PRGMS,
+        # WORKAROUND (gfx1250): with the Triton default num_stages=2 the
+        # AMDGPU backend emits llvm.amdgcn.s.waitcnt during the pipelined
+        # global-load schedule; the gfx1250 selector can't lower that
+        # legacy intrinsic (it expects the split s_wait_loadcnt /
+        # s_wait_storecnt form on gfx12+), aborting the JIT with
+        #   `LLVM ERROR: Cannot select: intrinsic %llvm.amdgcn.s.waitcnt`
+        # for some NUM_PRGMS specializations (observed at NUM_PRGMS=32
+        # during a DSR1-MXFP4 decode CUDAGraph capture). num_stages=1
+        # disables the pipelining that produces the legacy waitcnt.
+        num_stages=1,
     )
 
     return y, rsigma
@@ -98,6 +115,8 @@ def _rmsnorm_forward_with_add(
         blk_size,
         USE_BLOCKED,
         NUM_PRGMS,
+        # gfx1250 workaround — see note above _rms_norm_kernel launch.
+        num_stages=1,
     )
 
 
@@ -596,6 +615,6 @@ def _rmsnorm_forward_large_m_small_n(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         num_warps=8,
-        num_stages=2,
+        num_stages=1,
     )
     return (y, rsigma) if return_rsigma else y

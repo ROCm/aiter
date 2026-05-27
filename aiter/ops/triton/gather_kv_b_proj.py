@@ -76,5 +76,5 @@ def gather_kv_b_proj(
         PaddedV=padded_v,
         WEIGHT_PRESHUFFLE=weight_preshuffle,
         PER_ROW_SCALE=per_row_scale,
-        num_stages=3,
+        num_stages=1,
     )

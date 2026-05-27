@@ -71,7 +71,9 @@ def get_kernel_config(m, n, k, routing_data):
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     arch = get_arch()
-    num_stages = 1 if arch == "gfx950" else 2
+    # See moe_op_gemm_a4w4.py: gfx1250 cannot lower llvm.amdgcn.s.waitcnt
+    # emitted by num_stages=2 pipelining.
+    num_stages = 1 if arch in ("gfx950", "gfx1250") else 2
     split_k = 1
     block_k = 256
 

@@ -7,7 +7,7 @@
         "NUM_KSPLIT": 1,
         "cache_modifier": null,
         "num_warps": 8,
-        "num_stages": 2,
+        "num_stages": 1,
         "waves_per_eu": 2,
         "matrix_instr_nonkdim": 32,
         "kpack": 1
