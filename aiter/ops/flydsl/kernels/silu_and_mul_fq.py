@@ -33,7 +33,6 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
     MxDtypeInt as _D,
-    MxScaleRoundModeInt as _M,
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
 from flydsl._mlir.dialects import llvm, scf

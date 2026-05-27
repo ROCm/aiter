@@ -79,7 +79,6 @@ from .tensor_shim import GTensor, _to_raw
 from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
     MxDtypeInt as _D,
-    MxScaleRoundModeInt as _M,
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
 
