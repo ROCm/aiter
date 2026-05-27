@@ -9,7 +9,7 @@ both repos for coherence):
 | Repo                          | Branch                              | HEAD (short) |
 |-------------------------------|-------------------------------------|--------------|
 | `ROCm/aiter`                  | `jukorhon/unified-attention-ck`     | bumped post-CK |
-| `ROCm/composable_kernel`      | `jukorhon/unified-attention-ck`     | `46e622539`  |
+| `ROCm/composable_kernel`      | `jukorhon/unified-attention-ck`     | `7772504f5`  |
 
 The aiter branch pins the CK submodule to the matching commit, so a
 recursive checkout is enough.
@@ -117,7 +117,8 @@ WITH_TRITON=1 ua-test-scripts/regression_decode.sh   # add Triton comparison
 ### CK side — `jukorhon/unified-attention-ck`
 
 ```
-46e622539  CK-UA: gate dwordx3/x4 global_load_lds builtin on clang≥21, inline-asm fallback   [LATEST]
+7772504f5  CK-UA: relocate amd_async_global_load_lds_raw to its own header   [LATEST]
+46e622539  CK-UA: gate dwordx3/x4 global_load_lds builtin on clang≥21, inline-asm fallback
 2645149bb  CK-UA: shrink Tier-2 page-table LDS cache to per-split window
 badc80702  CK-UA: enable Tier-2 LDS page-table cache on decode + fix split-KV bulk-load OOB
 310efc556  CK-UA: halve kBlockN for bf16/fp16 m16 decode + generalise PVAttrNumAccess
@@ -136,7 +137,8 @@ badc80702  CK-UA: enable Tier-2 LDS page-table cache on decode + fix split-KV bu
 ### aiter side — `jukorhon/unified-attention-ck`
 
 ```
-<next>     unified_attention_ck: bump CK for clang<21 inline-asm fallback   [LATEST]
+<next>     unified_attention_ck: bump CK to shrink core/arch footprint   [LATEST]
+d9c1a7f9e  unified_attention_ck: bump CK for clang<21 inline-asm global_load_lds fallback
 e78240f74  unified_attention_ck: bump CK + add decode regression script
 c3b09c3d7  unified_attention_ck: bump CK + add ua-test-scripts/ for shape-level testing
 b63386f0d  unified_attention: bump split-KV target to 4x CUs, cap 128
@@ -237,13 +239,19 @@ possible)` dispatch in `unified_attention_pipeline.hpp` is *not* `if
 constexpr`, so both branches are unconditionally compiled regardless of
 the workload's cache size.
 
-**Fix (CK `46e622539`).** Add a `CK_TILE_HAS_GLOBAL_LOAD_LDS_DWORDX4_BUILTIN`
-macro gated on `__clang_major__ >= 21`. When 1: existing `__builtin_…`
-path. When 0: emit `global_load_lds_dwordx{1,3,4}` via inline asm, with
-M0 set explicitly via `s_mov_b32` from the addrspace(3) `lptr` narrowed
-to its 32-bit LDS byte offset and wave-uniformed via `readfirstlane`.
-The inline asm bypasses the front-end ImmArg check; the assembler emits
-the same HW instruction the builtin would have lowered to.
+**Fix (CK `46e622539` + follow-up relocation).** Add a
+`CK_TILE_HAS_GLOBAL_LOAD_LDS_DWORDX4_BUILTIN` macro gated on
+`__clang_major__ >= 21`. When 1: existing `__builtin_…` path. When 0:
+emit `global_load_lds_dwordx{1,3,4}` via inline asm, with M0 set
+explicitly via `s_mov_b32` from the addrspace(3) `lptr` narrowed to its
+32-bit LDS byte offset and wave-uniformed via `readfirstlane`. The
+inline asm bypasses the front-end ImmArg check; the assembler emits the
+same HW instruction the builtin would have lowered to.
+
+The helper function (and the macro) live in their own header,
+`include/ck_tile/core/arch/amd_global_load_lds_raw.hpp` — keeping
+`amd_buffer_addressing[_builtins].hpp` bit-identical to upstream so the
+PR's footprint on long-standing HW utility files stays zero.
 
 We tried two simpler fallbacks first and rejected both:
 
