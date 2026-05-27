@@ -746,26 +746,29 @@ def flydsl_moe_stage1(
     if out is None:
         # Kernel grid skips padded N tiles, so padded columns retain whatever
         # was in the buffer; e8m0 byte 0xFF would decode to NaN and propagate
-        # into stage2 via atomicAdd. Zero-init when there is padding.
+        # into stage2 via atomicAdd. Clear only the padded tail columns.
         if _need_fp4 or (_gui_sk_fused and _need_fp4):
             out = torch.empty(
                 (token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
             )
-            if inter_dim_pad > 0:
-                out.view(torch.uint8).zero_()
         elif _need_fp8 or (_gui_sk_fused and _need_fp8):
-            _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
-            out = _alloc((token_num, topk, inter_dim), dtype=dtypes.fp8, device=dev)
+            out = torch.empty(
+                (token_num, topk, inter_dim), dtype=dtypes.fp8, device=dev
+            )
         else:
-            _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
-            out = _alloc(
+            out = torch.empty(
                 (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
             )
-    elif inter_dim_pad > 0:
+    if inter_dim_pad > 0:
         if out.dtype == dtypes.fp4x2:
-            out.view(torch.uint8).zero_()
+            # fp4x2 has no CUDA fill kernel; clear only the packed pad columns.
+            pad_packed_cols = inter_dim_pad // 2
+            if pad_packed_cols > 0:
+                out.view(torch.uint8).view(token_num, topk, -1)[
+                    ..., -pad_packed_cols:
+                ].zero_()
         else:
-            out.zero_()
+            out[..., -inter_dim_pad:].zero_()
 
     if _is_splitk:
         torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
@@ -807,12 +810,17 @@ def flydsl_moe_stage1(
     )
     padded_rows = (sorted_size + 255) // 256 * 256
     padded_cols = (scale_cols + 7) // 8 * 8
-    _scale_alloc = torch.zeros if (inter_dim_pad > 0) else torch.empty
     out_scale_sorted_flat = (
-        _scale_alloc(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
+        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
         if _need_sort
         else torch.empty(0, dtype=torch.uint8, device=dev)
     )
+    if _need_sort and inter_dim_pad > 0:
+        true_scale_cols = (inter_dim - inter_dim_pad + 31) // 32
+        if true_scale_cols < padded_cols:
+            out_scale_sorted_flat.view(padded_rows, padded_cols)[
+                :, true_scale_cols:
+            ].zero_()
 
     # split-K GEMM kernel does not fuse quant; the fused silu_and_mul_fq kernel
     # handles activation + quant + scale-sort after the GEMM completes.
