@@ -44,6 +44,8 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
     )
     shared_B = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
     shared_S = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+    # Output staging layout for the TDM store (acc -> LDS -> HBM)
+    shared_C = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
     # Register layouts for WMMA operands
     dot_a = gl.DotOperandLayout(operand_index=0, parent=wmma_layout, k_width=16)
@@ -63,6 +65,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
         "shared_A": shared_A,
         "shared_B": shared_B,
         "shared_S": shared_S,
+        "shared_C": shared_C,
         "dot_a_layout": dot_a,
         "dot_b_layout": dot_b,
         "a_scale_layout": scale_a,
@@ -153,6 +156,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
     shared_A: gl.constexpr,
     shared_B: gl.constexpr,
     shared_S: gl.constexpr,
+    shared_C: gl.constexpr,
     dot_a_layout: gl.constexpr,
     dot_b_layout: gl.constexpr,
     a_scale_layout: gl.constexpr,
@@ -370,10 +374,6 @@ def gemm_mxfp4_preshuffle_gfx1250(
     # =====================================================================
     # Store output via TDM: accumulator → shared memory → global memory.
     # =====================================================================
-
-    shared_C: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[1, 0]
-    )
 
     c_buffer = gl.allocate_shared_memory(
         c_ptr.type.element_ty,
