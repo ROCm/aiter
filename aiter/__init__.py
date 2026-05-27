@@ -125,7 +125,7 @@ try:
     from .ops.triton.comms import (
         IrisCommContext,  # noqa: F401
         calculate_heap_size,  # noqa: F401
-        reduce_scatter,  # noqa: F401
+        reduce_scatter as iris_reduce_scatter,  # noqa: F401  # avoid shadowing C++ reduce_scatter exported by custom_all_reduce.py
         all_gather,  # noqa: F401
         reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
         IRIS_COMM_AVAILABLE,  # noqa: F401
