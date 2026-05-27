@@ -60,7 +60,6 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
                 extra["out_dtype"] = "fp4"
             if m.group("fp8"):
                 extra["out_dtype"] = "fp8"
-                extra["a_scale_one"] = True
             if m.group("sbm") is not None:
                 extra["sort_block_m"] = int(m.group("sbm"))
             return {**params, **extra}
