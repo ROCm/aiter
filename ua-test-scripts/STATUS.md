@@ -9,7 +9,7 @@ both repos for coherence):
 | Repo                          | Branch                              | HEAD (short) |
 |-------------------------------|-------------------------------------|--------------|
 | `ROCm/aiter`                  | `jukorhon/unified-attention-ck`     | bumped post-CK |
-| `ROCm/composable_kernel`      | `jukorhon/unified-attention-ck`     | `7772504f5`  |
+| `ROCm/composable_kernel`      | `jukorhon/unified-attention-ck`     | `a3714e82c`  |
 
 The aiter branch pins the CK submodule to the matching commit, so a
 recursive checkout is enough.
@@ -117,7 +117,8 @@ WITH_TRITON=1 ua-test-scripts/regression_decode.sh   # add Triton comparison
 ### CK side — `jukorhon/unified-attention-ck`
 
 ```
-7772504f5  CK-UA: relocate amd_async_global_load_lds_raw to its own header   [LATEST]
+a3714e82c  CK-UA: revert unrelated fmha touches not consumed by unified_attention   [LATEST]
+7772504f5  CK-UA: relocate amd_async_global_load_lds_raw to its own header
 46e622539  CK-UA: gate dwordx3/x4 global_load_lds builtin on clang≥21, inline-asm fallback
 2645149bb  CK-UA: shrink Tier-2 page-table LDS cache to per-split window
 badc80702  CK-UA: enable Tier-2 LDS page-table cache on decode + fix split-KV bulk-load OOB
@@ -137,7 +138,8 @@ badc80702  CK-UA: enable Tier-2 LDS page-table cache on decode + fix split-KV bu
 ### aiter side — `jukorhon/unified-attention-ck`
 
 ```
-<next>     unified_attention_ck: bump CK to shrink core/arch footprint   [LATEST]
+<next>     unified_attention_ck: bump CK to drop fmha touches unused by UA   [LATEST]
+c1ebb1249  unified_attention_ck: bump CK to shrink core/arch footprint
 d9c1a7f9e  unified_attention_ck: bump CK for clang<21 inline-asm global_load_lds fallback
 e78240f74  unified_attention_ck: bump CK + add decode regression script
 c3b09c3d7  unified_attention_ck: bump CK + add ua-test-scripts/ for shape-level testing
