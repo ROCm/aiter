@@ -1108,7 +1108,7 @@ def flydsl_moe_stage2(
 
     target = out
     if not accumulate:
-        target = torch.empty(
+        target = torch.zeros(
             (token_num * topk * model_dim,),
             device=out.device,
             dtype=out.dtype,
