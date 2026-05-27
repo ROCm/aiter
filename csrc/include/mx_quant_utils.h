@@ -47,6 +47,8 @@ enum class MxScaleRoundMode : int {
                    //   [2^k, 1.5*2^k).
 };
 
+constexpr MxScaleRoundMode kDefaultMxScaleRoundMode = MxScaleRoundMode::RoundUp;
+
 // MX-format element dtype tag selecting per-dtype constants.
 // Values **must** stay 1:1 with ``aiter.utility.mx_types.MxDtype`` (the
 // pybind11 binding in ``rocm_ops.hpp::AITER_CORE_PYBIND``).
@@ -125,7 +127,7 @@ template <> struct MxDtypeConfig<MxDtype::FP8_E4M3_FNUZ> {
 //
 // NaN/Inf inputs preserve the f32 exponent (0xFF) which downstream consumers
 // interpret as E8M0 NaN.
-template <MxScaleRoundMode rmode = MxScaleRoundMode::RoundUp,
+template <MxScaleRoundMode rmode = kDefaultMxScaleRoundMode,
           MxDtype          dtype = MxDtype::FP4_E2M1>
 __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
 {
@@ -180,7 +182,7 @@ __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
 // :func:`aiter.utility.fp4_utils.fp4_f32_to_e8m0_scale`.
 __device__ __forceinline__ float fp4_f32_to_e8m0_scale(float amax)
 {
-    return fp_f32_to_e8m0_scale<MxScaleRoundMode::RoundUp, MxDtype::FP4_E2M1>(amax);
+    return fp_f32_to_e8m0_scale<kDefaultMxScaleRoundMode, MxDtype::FP4_E2M1>(amax);
 }
 
 // Compute the swizzled E8M0 scale index for tiled FP4 layout.

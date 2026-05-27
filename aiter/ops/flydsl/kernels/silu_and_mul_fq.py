@@ -31,7 +31,11 @@ from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
 from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
-from aiter.utility.mx_types import MxDtypeInt as _D, MxScaleRoundModeInt as _M
+from aiter.utility.mx_types import (
+    MxDtypeInt as _D,
+    MxScaleRoundModeInt as _M,
+    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
+)
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import buffer_ops
 
@@ -335,7 +339,7 @@ def build_silu_and_mul_fq_module(
                         # 0% max-value clipping. Same formula for FP4 / FP8; only
                         # max_pos differs (selected by ``_mx_dtype``).
                         e8m0_biased = emit_mx_e8m0_scale(
-                            local_max, mode=_M.RoundUp, dtype=_mx_dtype
+                            local_max, mode=_DEFAULT_MODE, dtype=_mx_dtype
                         )
                         quant_exp = c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << c23_i32).bitcast(f32)

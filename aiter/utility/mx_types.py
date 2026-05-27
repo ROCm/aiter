@@ -55,6 +55,15 @@ class MxDtypeInt:
 
 
 # --------------------------------------------------------------------------
+# Project-wide default round mode (Python single source of truth).
+# Must match ``kDefaultMxScaleRoundMode`` in ``mx_quant_utils.h``; the
+# drift check in ``__getattr__`` below and in ``test_quant_mxfp4.py``
+# verifies this at runtime.
+# --------------------------------------------------------------------------
+MX_DEFAULT_ROUND_MODE = MxScaleRoundModeInt.RoundUp
+
+
+# --------------------------------------------------------------------------
 # Lazy pybind11 enum loading.
 # --------------------------------------------------------------------------
 # ``_MxScaleRoundMode`` / ``_MxDtype`` are listed in
@@ -93,6 +102,21 @@ def __getattr__(name):
     pair = _PYBIND_FACTORIES.get(name)
     if pair is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    # On first load of MxScaleRoundMode, also verify that the C++
+    # kDefaultMxScaleRoundMode matches our Python MX_DEFAULT_ROUND_MODE.
+    if name == "MxScaleRoundMode":
+        from ..jit.core import get_module
+
+        cpp_default = getattr(
+            get_module("module_aiter_core"), "kDefaultMxScaleRoundMode", None
+        )
+        if cpp_default is not None and cpp_default != MX_DEFAULT_ROUND_MODE:
+            raise AssertionError(
+                f"MX_DEFAULT_ROUND_MODE={MX_DEFAULT_ROUND_MODE} but C++ "
+                f"kDefaultMxScaleRoundMode={cpp_default} "
+                f"(drift; update both in lockstep)"
+            )
     factory, int_mirror = pair
     cls = type(factory(0))
     # Guard against C++/Python enum drift: every named member of the int

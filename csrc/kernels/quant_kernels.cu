@@ -1669,7 +1669,7 @@ __global__ void mxfp4_quant_moe_sort_kernel(
             }
             else if constexpr (std::is_same_v<DTYPE_O, opus::fp8_t>)
             {
-                row_scale = aiter::fp_f32_to_e8m0_scale<aiter::MxScaleRoundMode::RoundUp,
+                row_scale = aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode,
                                                        kHwFp8Dtype>(absMax);
             }
             else

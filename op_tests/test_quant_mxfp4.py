@@ -375,6 +375,29 @@ def test_invalid_round_mode():
     return {"result": "PASS"}
 
 
+def test_default_round_mode_drift():
+    """Verify Python MX_DEFAULT_ROUND_MODE matches C++ kDefaultMxScaleRoundMode."""
+    from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE, MxScaleRoundModeInt
+    from aiter.jit.core import get_module
+
+    assert MX_DEFAULT_ROUND_MODE in (
+        MxScaleRoundModeInt.RoundDown,
+        MxScaleRoundModeInt.RoundUp,
+        MxScaleRoundModeInt.Even,
+        MxScaleRoundModeInt.Ceil,
+    ), f"MX_DEFAULT_ROUND_MODE={MX_DEFAULT_ROUND_MODE} not a valid mode"
+    mod = get_module("module_aiter_core")
+    cpp_default = getattr(mod, "kDefaultMxScaleRoundMode", None)
+    assert cpp_default is not None, "kDefaultMxScaleRoundMode not exposed via pybind11"
+    assert cpp_default == MX_DEFAULT_ROUND_MODE, (
+        f"DRIFT: Python MX_DEFAULT_ROUND_MODE={MX_DEFAULT_ROUND_MODE} "
+        f"!= C++ kDefaultMxScaleRoundMode={cpp_default}"
+    )
+    aiter.logger.info(
+        "test_default_round_mode_drift: PASS (default=%d)", MX_DEFAULT_ROUND_MODE
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--no_shuffle", action="store_true")
@@ -485,6 +508,9 @@ if __name__ == "__main__":
     if args.invalid_mode or run_all:
         test_invalid_round_mode()
         aiter.logger.info("test_invalid_round_mode: PASS")
+
+    if run_all:
+        test_default_round_mode_drift()
 
     df = pd.DataFrame(df)
     if "gate_up" in df.columns:

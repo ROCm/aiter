@@ -48,6 +48,7 @@ namespace py = pybind11;
     pybind11::implicitly_convertible<int, ActivationType>();                                    \
     pybind11::implicitly_convertible<int, aiter::MxScaleRoundMode>();                          \
     pybind11::implicitly_convertible<int, aiter::MxDtype>();                                   \
+    m.attr("kDefaultMxScaleRoundMode") = static_cast<int>(aiter::kDefaultMxScaleRoundMode);    \
     AITER_SET_STREAM_PYBIND                                                                    \
     pybind11::class_<aiter_tensor_t>(m, "aiter_tensor_t")                                      \
         .def(pybind11::init<>())                                                               \

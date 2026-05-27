@@ -77,7 +77,11 @@ from .tensor_shim import GTensor, _to_raw
 # access; we only pull the int classes here so module import stays JIT-free
 # (mirrors the FlyDSL AOT-friendly pattern in ``quant_utils``).
 from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
-from aiter.utility.mx_types import MxDtypeInt as _D, MxScaleRoundModeInt as _M
+from aiter.utility.mx_types import (
+    MxDtypeInt as _D,
+    MxScaleRoundModeInt as _M,
+    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
+)
 
 # --- shape constants (V4-Pro MVP) -------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64
@@ -406,7 +410,7 @@ def _build_kernel(
                     amax_post = am_safe * rstd * c_sqrt2
 
                     e8m0_biased = emit_mx_e8m0_scale(
-                        amax_post, mode=_M.RoundUp, dtype=_fp8_mx_dtype
+                        amax_post, mode=_DEFAULT_MODE, dtype=_fp8_mx_dtype
                     )
                     # quant_scale = 2^(127 - e8m0_biased) for x_norm. We apply
                     # to x_in directly, so absorb the per-row rstd: factor =

@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 
 from . import dtypes
-from .mx_types import MxDtype, MxScaleRoundMode
+from .mx_types import MX_DEFAULT_ROUND_MODE, MxDtype, MxScaleRoundMode
 
 
 def f32_to_mxfp4(x):
@@ -81,7 +81,7 @@ _DTYPE_CFG = {
 def f32_to_mx_e8m0_scale(
     amax: Tensor,
     *,
-    mode: MxScaleRoundMode = MxScaleRoundMode.RoundUp,
+    mode: MxScaleRoundMode = MX_DEFAULT_ROUND_MODE,
     dtype: MxDtype = MxDtype.FP4_E2M1,
 ) -> Tensor:
     """Compute the per-block E8M0 scale for an MX format (CPU torch ref).
@@ -160,7 +160,7 @@ def fp4_f32_to_e8m0_scale(amax: Tensor) -> Tensor:
     ``aiter::fp4_f32_to_e8m0_scale`` in ``csrc/include/mx_quant_utils.h``.
     """
     return f32_to_mx_e8m0_scale(
-        amax, mode=MxScaleRoundMode.RoundUp, dtype=MxDtype.FP4_E2M1
+        amax, mode=MX_DEFAULT_ROUND_MODE, dtype=MxDtype.FP4_E2M1
     )
 
 

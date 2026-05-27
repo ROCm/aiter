@@ -12,7 +12,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
 from ..utility import dtypes, fp4_utils
-from ..utility.mx_types import MxScaleRoundMode
+from ..utility.mx_types import MX_DEFAULT_ROUND_MODE, MxScaleRoundMode
 from . import triton
 from .enum import ActivationType, QuantType
 from ..jit.utils.chip_info import get_cu_num, get_gfx
@@ -87,7 +87,7 @@ def per_1x32_f4_quant(
     quant_dtype=dtypes.fp4x2,
     shuffle=False,
     pack_dim=-1,
-    round_mode: RoundModeLike = MxScaleRoundMode.RoundUp,
+    round_mode: RoundModeLike = MX_DEFAULT_ROUND_MODE,
 ):
     """Torch reference for MXFP4 (E2M1) per-1x32 block-scale quantization.
 
@@ -196,7 +196,7 @@ def per_1x32_f4_quant_for_dot_scaled(
     rhs,
     quant_dtype=dtypes.fp4x2,
     shuffle=False,
-    round_mode: RoundModeLike = MxScaleRoundMode.RoundUp,
+    round_mode: RoundModeLike = MX_DEFAULT_ROUND_MODE,
 ):
     """Convenience function: quantize both LHS and RHS for ``tl.dot_scaled``.
 
@@ -744,7 +744,7 @@ def quant_mxfp4(
 def quant_mxfp4_hip(
     x: torch.Tensor,
     group_size: int = 32,
-    round_mode: RoundModeLike = MxScaleRoundMode.RoundUp,
+    round_mode: RoundModeLike = MX_DEFAULT_ROUND_MODE,
     e8m0_shuffle: bool = False,
     a16w4_shuffle: bool = False,
     gate_up: bool = False,
