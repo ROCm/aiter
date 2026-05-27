@@ -267,9 +267,9 @@ def torch_mla_extend(
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, out_dtype, block_size, use_out_scale",
     [
-        # (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
-        # (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False),
-        # (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, False),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
+        (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, e4m3_dtype, 64, True),
         # (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
         # (torch.uint8, torch.uint8, torch.bfloat16, 128, False),

@@ -1,5 +1,6 @@
 import torch
 import pytest
+import triton
 
 from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
 from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
