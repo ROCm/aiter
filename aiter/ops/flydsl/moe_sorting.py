@@ -38,15 +38,15 @@ def flydsl_moe_sorting_fwd(
     topk = topk_ids.shape[1]
     device = topk_ids.device
 
-    # Pre-allocate workspace (cached per config for CUDA graph compatibility)
+    # Pre-allocate workspace (cached per device for CUDA graph compatibility).
+    # A larger workspace can satisfy smaller requests, so we keep the largest seen.
     ws_size = moe_sorting_get_workspace_size(M, num_experts, topk, unit_size)
     workspace = None
     if ws_size > 0:
-        cache_key = (ws_size, device)
-        workspace = _workspace_cache.get(cache_key)
+        workspace = _workspace_cache.get(device)
         if workspace is None or workspace.numel() < ws_size:
             workspace = torch.empty(ws_size, dtype=torch.int32, device=device)
-            _workspace_cache[cache_key] = workspace
+            _workspace_cache[device] = workspace
 
     moe_sorting_flydsl(
         topk_ids,

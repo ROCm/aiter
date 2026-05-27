@@ -1965,7 +1965,7 @@ def moe_sorting_flydsl(
             cache_key,
             launch_oneshot,
             oneshot_args,
-            torch.cuda.current_stream(),
+            torch.cuda.current_stream(device),
         )
     else:
         mesh_stride = ((M + unit_size - 1) // unit_size) * unit_size
@@ -1974,11 +1974,15 @@ def moe_sorting_flydsl(
         ws_total = ws_mesh_i32 + (num_experts + 1)
         if workspace is None:
             workspace = torch.empty(ws_total, dtype=torch.int32, device=device)
+        elif workspace.numel() < ws_total:
+            raise ValueError(
+                f"workspace too small: need {ws_total} i32 elements, got {workspace.numel()}"
+            )
 
         _, launch_p0v2_p23, launch_4k_fused = compile_moe_sorting(
             num_experts=num_experts, topk=topk, unit_size=unit_size, has_mask=has_mask
         )
-        stream = torch.cuda.current_stream()
+        stream = torch.cuda.current_stream(device)
         n_zero_blocks = min(
             (moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy
         )

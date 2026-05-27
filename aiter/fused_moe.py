@@ -213,7 +213,7 @@ def moe_sorting(
     accumulate=True,
     flat=False,
 ):
-    if _USE_FLYDSL_MOE_SORTING:
+    if _USE_FLYDSL_MOE_SORTING and is_flydsl_available() and not return_local_topk_ids:
         return _flydsl_moe_sorting(
             topk_ids,
             topk_weights,
