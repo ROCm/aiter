@@ -55,8 +55,8 @@ def bench_gemm_fn(
         + y.numel() * y.element_size()
     )
 
-    fn = (
-        lambda: batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+    def fn():
+        return batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             x,
             weight,
             w_scale,
@@ -66,7 +66,6 @@ def bench_gemm_fn(
             YQ=y,
             transpose_bm=transpose_bm,
         )
-    )
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)
 

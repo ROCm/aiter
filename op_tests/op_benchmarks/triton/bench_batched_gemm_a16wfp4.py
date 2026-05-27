@@ -39,11 +39,7 @@ def bench_gemm_fn(
     flops = 2.0 * M * N * K * batch
     # memory transfer
     mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
-    mem_read += (
-        x_scale.numel() * x_scale.element_size()
-        + w_scale.numel() * w_scale.element_size()
-    )
-    mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
+    mem_write = y.numel() * y.element_size()
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
@@ -92,9 +88,7 @@ def run_model_benchmark(args):
 
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_a16wfp4.run(
-        save_path="." if args.o else None, print_data=True
-    )
+    bench_batched_gemm_a16wfp4.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
@@ -115,9 +109,7 @@ def run_shape_benchmark(args):
     ):
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_a16wfp4.run(
-        save_path="." if args.o else None, print_data=True
-    )
+    bench_batched_gemm_a16wfp4.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_benchmark(args, defaults):

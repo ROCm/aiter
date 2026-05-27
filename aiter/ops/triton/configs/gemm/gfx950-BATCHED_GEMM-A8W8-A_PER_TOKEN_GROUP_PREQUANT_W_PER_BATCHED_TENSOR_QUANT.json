@@ -7,7 +7,6 @@
         "num_stages": 2,
         "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
         "cache_modifier": ".cg"
     },
     "M_LEQ_32": {
@@ -18,7 +17,6 @@
         "num_stages": 2,
         "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
         "cache_modifier": ".cg"
     },
     "M_LEQ_64": {
@@ -29,7 +27,6 @@
         "num_stages": 2,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
         "cache_modifier": ".cg"
     },
     "M_LEQ_128": {
@@ -40,7 +37,6 @@
         "num_stages": 2,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
         "cache_modifier": ".cg"
     },
     "M_LEQ_256": {
@@ -51,7 +47,6 @@
         "num_stages": 2,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
         "cache_modifier": ".cg"
     },
     "any": {
@@ -62,7 +57,6 @@
         "num_stages": 2,
         "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
         "cache_modifier": ".cg"
     }
 }
