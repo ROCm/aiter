@@ -91,25 +91,13 @@ for b in "${BATCH_LIST[@]}"; do
             continue
         fi
 
-        # Map the legacy "dt" combo to the canonical script's
-        # --dtype/--q-dtype split: bf16 activations always, with the
-        # optional fp8 per-tensor quantisation layered on top. (This is
-        # how test_unified_attention_ck.py models it — see the cfg.dtype
-        # vs cfg.q_dtype invariants in its docstring.)
-        if [[ "$dt" == "fp8" ]]; then
-            act_dtype="bf16"; q_dtype="fp8"
-        else
-            act_dtype="$dt"; q_dtype="none"
-        fi
-
         for ((i=1; i<=NUM_RUNS; i++)); do
             out=$(python3 op_tests/test_unified_attention_ck.py \
                   -b "$b" -sq 1 -sk "$SK" \
                   --num-heads 64,8 \
                   --head-size "$d" \
                   --block-size "$BLOCK_SIZE" \
-                  --dtype "$act_dtype" \
-                  --q-dtype "$q_dtype" \
+                  --dtype "$dt" \
                   --num-blocks auto \
                   $TRITON_FLAG \
                   --seed 42 2>&1 || true)

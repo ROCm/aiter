@@ -59,13 +59,13 @@ numbers add runtime + decouple regression detection from Triton perf).
 Override either default with `--triton` / `--no-triton`.
 
 ```bash
-# Grid: default (~48 configs, a few minutes; CK vs ref only)
+# Grid: default (~36 configs, a few minutes; CK vs ref only)
 HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py
 
-# Grid: smoke (~8 configs, <1 min)
+# Grid: smoke (~6 configs, <1 min)
 HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py --quick
 
-# Grid: full Triton-UA-style matrix (~288 configs, ~30 min)
+# Grid: full Triton-UA-style matrix (~216 configs, ~30 min)
 HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py --full
 
 # Grid: include Triton head-to-head
@@ -73,17 +73,18 @@ HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py --triton
 
 # Single-shape (Triton on by default; `--num-blocks auto` sizes the
 # KV pool so block_tables are unique per (seq, position) — no fake L2
-# reuse, mirroring vLLM/SGLang allocator behaviour)
+# reuse, mirroring vLLM/SGLang allocator behaviour). `--dtype fp8`
+# does the obvious thing: Q/K/V are quantised to e4m3.
 HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py \
     -b 64 -sq 1 -sk 128000 \
     --num-heads 64,8 --head-size 128 --block-size 16 \
-    --dtype bf16 --q-dtype none --num-blocks auto
+    --dtype bf16 --num-blocks auto
 
-# Single-shape, CK-only
+# Single-shape, CK-only, FP8-quantised
 HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py \
     -b 4 -sq 1 -sk 16384 \
     --num-heads 64,8 --head-size 128 --block-size 32 \
-    --dtype bf16 --q-dtype none --num-blocks auto --no-triton
+    --dtype fp8 --num-blocks auto --no-triton
 ```
 
 ### Sweep wrapper: `ua-test-scripts/regression_decode.sh`

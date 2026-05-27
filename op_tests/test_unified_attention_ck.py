@@ -9,8 +9,12 @@ CK kernel actually supports:
 
   * head_size  ∈ {64, 128}  (Triton also covers 256; CK has no 256 instance)
   * block_size ∈ {16, 32, 64} (Triton also covers 48; CK ships ps16/ps32/ps64)
-  * dtype      ∈ {bf16, fp16} for activations
-  * q_dtype    ∈ {None, e4m3}  (per-tensor FP8 quantisation of Q/K/V)
+  * dtype      ∈ {bf16, fp16, fp8}
+                  - bf16 / fp16 → Q/K/V stored at the activation dtype
+                  - fp8         → Q/K/V quantised to e4m3 (per-tensor symmetric)
+                                  on top of a bf16 source — vLLM / SGLang's
+                                  recipe; the same convention the CK FP8
+                                  problem traits resolve at compile time.
   * num_heads  ∈ {(4,4), (8,1), (16,2), (64,8)}  — MHA + GQA-{2,8}
 
 CK doesn't implement sliding-window, soft-cap, or alibi/sinks, so those
@@ -36,7 +40,13 @@ Example:
   python op_tests/test_unified_attention_ck.py \\
       -b 64 -sq 1 -sk 128000 \\
       --num-heads 64,8 --head-size 128 --block-size 16 \\
-      --dtype bf16 --q-dtype none --num-blocks auto
+      --dtype bf16 --num-blocks auto
+
+  # Same shape, FP8-quantised Q/K/V
+  python op_tests/test_unified_attention_ck.py \\
+      -b 64 -sq 1 -sk 128000 \\
+      --num-heads 64,8 --head-size 128 --block-size 32 \\
+      --dtype fp8 --num-blocks auto
 """
 
 from __future__ import annotations
@@ -81,8 +91,19 @@ DEFAULT_NUM_HEADS: List[Tuple[int, int]] = [
 ]
 DEFAULT_HEAD_SIZES: List[int] = [64, 128]
 DEFAULT_BLOCK_SIZES: List[int] = [16, 32, 64]
-DEFAULT_DTYPES: List[torch.dtype] = [dtypes.bf16, torch.float16]
-DEFAULT_Q_DTYPES: List[Optional[str]] = [None, "fp8"]
+# Single dtype axis combining the kernel's two internal dtype slots:
+#   source dtype (the activation dtype the reference + kernel consume)
+#   + optional FP8 per-tensor quantisation layered on top.
+# `fp8` covers the bf16-source / e4m3-quant path that vLLM and SGLang
+# actually use; bf16-source is the only quantisation source CK ships
+# traits for (and what the Triton FP8 reference also expects), so we
+# don't enumerate `fp16-source fp8` as a separate axis here. If someone
+# ever wants it they can hand-edit this list.
+DEFAULT_DTYPES: List[Tuple[torch.dtype, Optional[str]]] = [
+    (dtypes.bf16,   None),
+    (torch.float16, None),
+    (dtypes.bf16,   "fp8"),
+]
 DEFAULT_NUM_BLOCKS: List[int] = [2048]
 DEFAULT_SEQ_LENS: List[List[Tuple[int, int]]] = [
     [(1, 1328), (5, 18), (129, 463)],   # mixed prefill + decode
@@ -572,10 +593,23 @@ def _parse_seq_lens(s: str) -> List[Tuple[int, int]]:
     return out
 
 
-def _parse_dtype(s: str) -> torch.dtype:
+def _parse_dtype(s: str) -> Tuple[torch.dtype, Optional[str]]:
+    """Resolve a user-facing dtype name to the (source_dtype, q_dtype) pair
+    the kernel call expects.
+
+    The CK problem traits + the Triton FP8 reference both model FP8 as
+    "per-tensor symmetric quantisation of bf16 source tensors", so `fp8`
+    here is a shorthand for that combo — there is no `fp16-source fp8`
+    path. `--dtype fp8` does what the CLI name suggests: Q, K and V are
+    quantised to e4m3.
+    """
     return {
-        "bf16": dtypes.bf16, "bfloat16": dtypes.bf16,
-        "fp16": torch.float16, "float16": torch.float16, "half": torch.float16,
+        "bf16":     (dtypes.bf16,    None),
+        "bfloat16": (dtypes.bf16,    None),
+        "fp16":     (torch.float16,  None),
+        "float16":  (torch.float16,  None),
+        "half":     (torch.float16,  None),
+        "fp8":      (dtypes.bf16,    "fp8"),
     }[s]
 
 
@@ -594,11 +628,12 @@ def main():
     parser.add_argument("--block-size", type=int, nargs="*",
                         default=None, help="Restrict block sizes.")
     parser.add_argument("--dtype", type=_parse_dtype, nargs="*",
-                        default=None, help="Restrict dtypes (bf16, fp16).")
-    parser.add_argument("--q-dtype", type=str, nargs="*",
-                        default=None, choices=["none", "fp8"],
-                        help="Restrict quant dtypes: 'none' (full-precision) "
-                             "or 'fp8' (per-tensor e4m3).")
+                        default=None,
+                        help="Restrict dtypes. Values: bf16, fp16, fp8. "
+                             "`fp8` means Q/K/V are per-tensor symmetrically "
+                             "quantised to e4m3 from a bf16 source — the "
+                             "vLLM/SGLang convention the CK FP8 traits + "
+                             "Triton FP8 reference both expect.")
     parser.add_argument("--num-heads", type=str, nargs="*", default=None,
                         help="Restrict (HQ,HK) tuples, e.g. --num-heads 16,2 64,8")
     parser.add_argument("--num-blocks", type=str, nargs="*",
@@ -670,17 +705,14 @@ def main():
         seq_lens_grid  = DEFAULT_SEQ_LENS
 
     head_sizes    = DEFAULT_HEAD_SIZES
-    dtypes_list   = DEFAULT_DTYPES
-    q_dtypes_list = DEFAULT_Q_DTYPES
+    dtype_pairs   = DEFAULT_DTYPES
 
     if args.head_size:
         head_sizes = args.head_size
     if args.block_size:
         block_sizes = args.block_size
     if args.dtype:
-        dtypes_list = args.dtype
-    if args.q_dtype:
-        q_dtypes_list = [None if x == "none" else x for x in args.q_dtype]
+        dtype_pairs = args.dtype
     if args.num_heads:
         num_heads_cfg = [
             tuple(int(x) for x in s.split(","))
@@ -729,33 +761,32 @@ def main():
         for nh in num_heads_cfg:
             for hd in head_sizes:
                 for bs in block_sizes:
-                    for dt in dtypes_list:
-                        for qd in q_dtypes_list:
-                            for nb in num_blocks_lst:
-                                ret = test_unified_attention_ck(
-                                    seq_lens, nh, hd, bs, dt, qd, nb,
-                                    seed=args.seed,
-                                    run_triton_backend=run_triton,
-                                    skip_reference=args.no_reference,
-                                    allow_splitkv=not args.no_splitkv,
-                                )
-                                rows.append(ret)
-                                # Release the deep-copied rotation buffers
-                                # @perftest holds before the next config
-                                # claims VRAM. Without this the allocator
-                                # reuses the same chunks across configs and
-                                # we've observed sporadic NaN outputs from
-                                # CK at bs=64 + nh=(16,2) — the root cause
-                                # is still under investigation; the cache
-                                # flush sidesteps it cleanly here.
-                                gc.collect()
-                                torch.cuda.empty_cache()
+                    for (dt, qd) in dtype_pairs:
+                        for nb in num_blocks_lst:
+                            ret = test_unified_attention_ck(
+                                seq_lens, nh, hd, bs, dt, qd, nb,
+                                seed=args.seed,
+                                run_triton_backend=run_triton,
+                                skip_reference=args.no_reference,
+                                allow_splitkv=not args.no_splitkv,
+                            )
+                            rows.append(ret)
+                            # Release the deep-copied rotation buffers
+                            # @perftest holds before the next config
+                            # claims VRAM. Without this the allocator
+                            # reuses the same chunks across configs and
+                            # we've observed sporadic NaN outputs from
+                            # CK at bs=64 + nh=(16,2) — the root cause
+                            # is still under investigation; the cache
+                            # flush sidesteps it cleanly here.
+                            gc.collect()
+                            torch.cuda.empty_cache()
 
     if single_shape:
+        dt0, qd0 = dtype_pairs[0]
         _print_single_shape_report(rows[0], seq_lens_grid[0], num_heads_cfg[0],
                                    head_sizes[0], block_sizes[0],
-                                   dtypes_list[0], q_dtypes_list[0],
-                                   num_blocks_lst[0])
+                                   dt0, qd0, num_blocks_lst[0])
     else:
         df = pd.DataFrame(rows)
         # `@benchmark()` merges the call kwargs into the row dict; drop
