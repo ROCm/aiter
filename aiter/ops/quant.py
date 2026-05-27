@@ -143,6 +143,29 @@ def per_1x32_f4_quant(
     return y, scale
 
 
+def per_1x32_i4_quant(weight, group_size=32):
+    """Groupwise int4 [-7, 7] symmetric quantization along the last dim.
+
+    Input  : weight       [..., N, K]
+    Output : weight_qt    int8 container, same shape [..., N, K], values in [-7, 7]
+             weight_scale bf16, shape [..., K // group_size, N] (G/N transposed)
+    """
+    *batch_dims, N, K = weight.shape
+    G = K // group_size
+    w_groups = weight.view(*batch_dims, N, G, group_size)
+    w_group_max = w_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+    w_scale_raw = (w_group_max / 7.0).squeeze(-1)
+    weight_qt = (
+        (w_groups / w_scale_raw.unsqueeze(-1))
+        .round()
+        .clamp(-7, 7)
+        .to(dtypes.i8)
+        .view(*batch_dims, N, K)
+    )
+    weight_scale = w_scale_raw.transpose(-1, -2).contiguous().to(dtypes.bf16)
+    return weight_qt, weight_scale
+
+
 def per_1x32_f4_quant_for_dot_scaled(lhs, rhs, quant_dtype=dtypes.fp4x2, shuffle=False):
     """Convenience function: quantize both LHS and RHS for ``tl.dot_scaled``.
 
@@ -525,15 +548,15 @@ def moe_smooth_per_token_scaled_quant(
         )
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def static_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def dynamic_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def dynamic_per_token_scaled_quant(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -545,7 +568,7 @@ def dynamic_per_token_scaled_quant(
 ) -> None: ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def dynamic_per_group_scaled_quant_fp4(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -561,7 +584,7 @@ def dynamic_per_group_scaled_quant_fp4(
     ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def smooth_per_token_scaled_quant(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -576,7 +599,7 @@ def smooth_per_token_scaled_quant(
 ) -> None: ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def moe_smooth_per_token_scaled_quant_v1(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -593,7 +616,7 @@ def moe_smooth_per_token_scaled_quant_v1(
     ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def moe_smooth_per_token_scaled_quant_v2(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -612,7 +635,7 @@ def moe_smooth_per_token_scaled_quant_v2(
     ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def mxfp4_moe_sort_hip(
     out_scale: torch.Tensor,
     scale: torch.Tensor,
@@ -644,8 +667,8 @@ def mxfp4_moe_sort_fwd(
     return out_scale
 
 
-@compile_ops("module_quant")
-def fused_dynamic_mxfp4_quant_moe_sort_hip(
+@compile_ops("module_quant", develop=True)
+def fused_dynamic_mx_quant_moe_sort_hip(
     out: torch.Tensor,
     scales: torch.Tensor,
     input: torch.Tensor,
@@ -656,9 +679,77 @@ def fused_dynamic_mxfp4_quant_moe_sort_hip(
     group_size: int = 32,
 ) -> None:
     """
-    HIP path for fused dynamic MXFP4 quantization and MoE scale sorting.
+    HIP path for fused dynamic MX (fp4 or fp8) quantization and MoE scale
+    sorting. The output dtype of ``out`` selects the quant target: fp4x2/uint8
+    for MXFP4, fp8 for MXFP8.
     """
     ...
+
+
+@compile_ops("module_quant", develop=True)
+def quant_mxfp4(
+    inp: torch.Tensor,
+    out_packed: torch.Tensor,
+    out_scale: torch.Tensor,
+    group_size: int = 32,
+    round_mode: int = 0,
+    e8m0_shuffle: bool = False,
+    a16w4_shuffle: bool = False,
+    gate_up: bool = False,
+    shuffle_weight: bool = False,
+) -> None: ...
+
+
+def quant_mxfp4_hip(
+    x: torch.Tensor,
+    group_size: int = 32,
+    round_mode: int = 0,
+    e8m0_shuffle: bool = False,
+    a16w4_shuffle: bool = False,
+    gate_up: bool = False,
+    shuffle_weight: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP4 quantization with optional weight/scale shuffle.
+
+    Args:
+        round_mode: 0 = Even — e8m0 scale via even-rounding group max
+            to nearest power-of-2. gfx950 uses HW builtin (exact RNE);
+            gfx942 uses SW fallback (round-half-away).
+    """
+    assert x.is_contiguous() and x.dim() == 2
+    assert x.dtype in (torch.float16, torch.bfloat16)
+    rows, cols = x.shape
+    assert cols % group_size == 0
+
+    fp4x2 = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+    fp8_e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
+
+    out_packed = torch.empty(rows, cols // 2, dtype=fp4x2, device=x.device)
+
+    scaleN = cols // group_size
+    if e8m0_shuffle:
+        scaleN_pad = ((scaleN + 7) // 8) * 8
+        rows_pad = ((rows + 255) // 256) * 256
+        out_scale = torch.empty(
+            rows_pad, scaleN_pad, dtype=torch.uint8, device=x.device
+        ).view(fp8_e8m0)
+    else:
+        out_scale = torch.empty(rows, scaleN, dtype=torch.uint8, device=x.device).view(
+            fp8_e8m0
+        )
+
+    quant_mxfp4(
+        x,
+        out_packed,
+        out_scale,
+        group_size,
+        round_mode,
+        e8m0_shuffle,
+        a16w4_shuffle,
+        gate_up,
+        shuffle_weight,
+    )
+    return out_packed, out_scale
 
 
 def fused_dynamic_mxfp4_quant_moe_sort(
@@ -690,7 +781,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         or group_size != 32
     ):
         out = torch.empty(M, N // 2, dtype=dtypes.fp4x2, device=input.device)
-        fused_dynamic_mxfp4_quant_moe_sort_hip(
+        fused_dynamic_mx_quant_moe_sort_hip(
             out,
             scale,
             input,
@@ -708,9 +799,94 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     return out, scale
 
 
-@compile_ops("module_quant")
+def fused_dynamic_mxfp8_quant_moe_sort(
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+    block_size: int,
+    group_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """HIP replacement for Triton fused_quant_fp8_sort.
+
+    Returns (fp8_out, e8m0_scale) with the scale tensor laid out as
+    (pad32(M_o), N_o) fp8_e8m0 — the same byte layout the FlyDSL stage1/stage2
+    GEMM consumes. ``topk`` is accepted for parity with the fp4 wrapper but
+    is inferred inside the HIP launcher from ``input.numel() / (cols * token_num)``.
+    """
+    M, N = input.view(-1, input.shape[-1]).shape
+    N_o = (N + 31) // 32
+    out = torch.empty(M, N, dtype=dtypes.fp8, device=input.device)
+    scale = torch.empty(
+        (sorted_ids.shape[0] + 31) // 32 * 32,
+        N_o,
+        dtype=dtypes.fp8_e8m0,
+        device=input.device,
+    )
+    fused_dynamic_mx_quant_moe_sort_hip(
+        out,
+        scale,
+        input,
+        sorted_ids,
+        num_valid_ids,
+        token_num,
+        block_size,
+        group_size,
+    )
+    return out, scale
+
+
+@compile_ops("module_quant", develop=True)
 def partial_transpose(
     out: Tensor,
     input: Tensor,
     num_rows: Tensor,
 ) -> None: ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rotate_activation_fp4quant_inplace(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    group_size: int = 32,
+) -> None:
+    """Hadamard-rotate activation, FP4-quantize, then dequantize back to BF16 in-place."""
+    ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rotate_activation(
+    out: torch.Tensor,
+    input: torch.Tensor,
+) -> None:
+    """Apply Walsh-Hadamard transform along last dim with 1/sqrt(N) scaling."""
+    ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rope_rotate_activation_fp4quant_inplace(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    group_size: int = 32,
+) -> None:
+    """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate,
+    FP4-quantize, then dequantize back to BF16."""
+    ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rope_rotate_activation(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+) -> None:
+    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
+    ...

@@ -409,7 +409,7 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -809,8 +809,7 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        # if TILE_SIZE < 32 and V.dtype.is_fp8():
-        acc += tl.dot(P.to(V.dtype), V)
+        acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     if v_descale is not None:
         acc = acc * v_descale

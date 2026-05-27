@@ -284,6 +284,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     q_nope_zeros_out_stride_d,
     kv_cache_stride_b,
     kv_cache_stride_h,
+    kv_cache_stride_blk,
     kv_cache_stride_d,
     k_scale_ptr,
     QH_PER_KH: tl.constexpr,
@@ -395,6 +396,12 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                 else:
                     pid_t_slot = pid_slot
                     pid_blk = 0
+                if BLOCK_SIZE > 1:
+                    pid_t_slot = pid_slot // BLOCK_SIZE
+                    pid_blk = pid_slot % BLOCK_SIZE
+                else:
+                    pid_t_slot = pid_slot
+                    pid_blk = 0
                 if HAVE_K_SCALE:
                     k_scale = tl.load(k_scale_ptr)
                 else:
@@ -460,6 +467,12 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             pid_hk = pid % KH
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
             if pid_slot >= 0:
+                if BLOCK_SIZE > 1:
+                    pid_t_slot = pid_slot // BLOCK_SIZE
+                    pid_blk = pid_slot % BLOCK_SIZE
+                else:
+                    pid_t_slot = pid_slot
+                    pid_blk = 0
                 if BLOCK_SIZE > 1:
                     pid_t_slot = pid_slot // BLOCK_SIZE
                     pid_blk = pid_slot % BLOCK_SIZE

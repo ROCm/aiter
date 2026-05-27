@@ -1,0 +1,21 @@
+# Triton is installed via .github/scripts/install_triton.sh (auto-detects ROCm version).
+
+# Build deps (needed for --no-build-isolation editable install).
+setuptools>=45
+setuptools_scm[toml]>=6.2
+wheel
+pybind11==3.0.1
+ninja==1.11.1.4
+psutil
+packaging
+flydsl==0.1.8
+
+# Test deps.
+pandas==2.2.3
+pyzmq==26.2.0
+einops==0.8.0
+numpy==1.26.2
+tabulate==0.9.0
+pytest==8.3.4
+filecheck==1.0.1
+networkx==3.4.2

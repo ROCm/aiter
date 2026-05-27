@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from typing import Optional
 import argparse
+import pandas as pd
 from aiter import dtypes
 
 from aiter.dist.parallel_state import (
@@ -194,12 +195,14 @@ def reduce_scatter_perftest(
         ref = torch.concat((ref, input_list[i + 1]), -1)
 
     rets = [el.get() for el in rets]
+    all_us = [us for _, us in rets]
     for out, us in rets:
         msg = f"reduce_scatter (use custom {use_custom}): {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         print(msg)
-        # print(cpu_rslt[out.device.index])
-        # checkAllclose(ref, out.to(ref), msg=msg)
-        # checkAllclose(ref, out.to(ref), msg=msg)
+    return {
+        "min_us": min(all_us),
+        "max_us": max(all_us),
+    }
 
 
 l_dtype = ["bf16"]
@@ -241,6 +244,7 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
+    df = []
     for dtype in l_dtype:
         for shape in l_shape:
             print(f"accuracy test of dtype:{dtype}, shape:{shape}")
@@ -254,25 +258,31 @@ if __name__ == "__main__":
                 ),
             )
             print(f"perf test of dtype:{dtype}, shape:{shape}")
-            reduce_scatter_perftest(
-                8,
-                1,
-                shape,
-                dtype,
-                withGraph=False,
-                use_custom=True,
-                distributed_init_method=get_distributed_init_method(
-                    get_ip(), get_open_port()
-                ),
-            )
-            reduce_scatter_perftest(
-                8,
-                1,
-                shape,
-                dtype,
-                withGraph=False,
-                use_custom=False,
-                distributed_init_method=get_distributed_init_method(
-                    get_ip(), get_open_port()
-                ),
-            )
+            for use_custom in [True, False]:
+                ret = reduce_scatter_perftest(
+                    8,
+                    1,
+                    shape,
+                    dtype,
+                    withGraph=False,
+                    use_custom=use_custom,
+                    distributed_init_method=get_distributed_init_method(
+                        get_ip(), get_open_port()
+                    ),
+                )
+                df.append(ret)
+    df = pd.DataFrame(df)
+    show_cols = [
+        "tp_size",
+        "shape",
+        "dtype",
+        "withGraph",
+        "use_custom",
+        "min_us",
+        "max_us",
+    ]
+    show_cols = [c for c in show_cols if c in df.columns]
+    logger.info(
+        "reduce scatter summary (markdown):\n%s",
+        df[show_cols].to_markdown(index=False),
+    )

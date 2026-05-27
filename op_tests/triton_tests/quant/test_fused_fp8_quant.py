@@ -19,8 +19,6 @@ import aiter as rocm_aiter
 
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 
-torch.manual_seed(0)
-
 
 def rmsnorm(input, weight, eps=1e-6):
     row_norm = input * input
@@ -103,6 +101,7 @@ def run_torch_rms_fp8_per_tensor_static_quant(
 @pytest.mark.parametrize("N1, N2", [(128, 128), (128, 7168), (7168, 7168)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_rms_fp8_per_tensor_static_quant(M: int, N1: int, N2: int, dtype):
+    torch.manual_seed(0)
     dtype_quant = aiter.dtypes.fp8
     scale = torch.randn(1, dtype=torch.float32, device="cuda")
     x1, w1, x2, w2, res1 = generate_fused_rms_quant_data(M, N1, N2, dtype)
@@ -147,6 +146,7 @@ def test_fused_rms_fp8_per_tensor_static_quant(M: int, N1: int, N2: int, dtype):
 @pytest.mark.parametrize("N1, N2", [(128, 128), (128, 7168), (7168, 7168)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_rms_fp8_group_quant(M: int, N1: int, N2: int, dtype):
+    torch.manual_seed(0)
     group_size = 128
     dtype_quant = aiter.dtypes.fp8
     x1, w1, x2, w2, res1 = generate_fused_rms_quant_data(M, N1, N2, dtype)
@@ -220,6 +220,7 @@ def triton_rmsnorm_fp8_quantization_fuse(x, w, x_scale, eps, rocm_fp8_dtype):
     "m, n", [(m, n) for m in [1, 2, 4, 8, 256, 1024, 8192] for n in [128, 4096, 8192]]
 )
 def test_rmsnorm_quant_fuse(m, n):
+    torch.manual_seed(0)
     eps = 0.0012
     rocm_fp8_dtype = rocm_aiter_fp8_dtype
 
@@ -257,6 +258,7 @@ def test_rmsnorm_quant_fuse(m, n):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_rms_fp8_group_quant_transpose_scale(M: int, N1: int, N2: int, dtype):
     """Test that transpose_scale parameter returns scale with transposed memory layout."""
+    torch.manual_seed(0)
     group_size = 128
     dtype_quant = aiter.dtypes.fp8
     x1, w1, x2, w2, res1 = generate_fused_rms_quant_data(M, N1, N2, dtype)
@@ -366,6 +368,7 @@ def test_fused_flatten_fp8_group_quant(M: int, N1: int, N2: int, dtype):
 def run_torch_reduce_act_mul_fp8_group_quant(
     x, x2, activation, dtype, dtype_quant, group_size=128
 ):
+    torch.manual_seed(0)
     x = x.clone()
     y2 = None
     if x.dim() == 3:
@@ -411,6 +414,7 @@ def generate_fused_reduce_act_mul_fp8_group_quant(
 def test_fused_reduce_act_mul_fp8_group_quant(
     M: int, N1: int, N2: int, SPK: int, dtype, activation
 ):
+    torch.manual_seed(0)
     group_size = 128
     dtype_quant = aiter.dtypes.fp8
 
@@ -490,6 +494,7 @@ def generate_fused_reduce_rms_quant_data(M, N1, N2, N3, SPK, dtype=torch.bfloat1
 def test_fused_reduce_rms_fp8_group_quant(
     M: int, N1: int, N2: int, N3: int, SPK: int, dtype
 ):
+    torch.manual_seed(0)
     group_size = 128
     dtype_quant = aiter.dtypes.fp8
     x1, w1, x2, w2, res1, x3 = generate_fused_reduce_rms_quant_data(
@@ -554,6 +559,7 @@ def test_fused_reduce_rms_fp8_group_quant_transpose_scale(
     M: int, N1: int, N2: int, N3: int, SPK: int, dtype
 ):
     """Test that transpose_scale parameter returns scale with transposed memory layout."""
+    torch.manual_seed(0)
     group_size = 128
     dtype_quant = aiter.dtypes.fp8
     x1, w1, x2, w2, res1, x3 = generate_fused_reduce_rms_quant_data(
@@ -666,6 +672,7 @@ def triton_silu_mul_fp8_quantization_fuse(x, x_scale, rocm_fp8_dtype):
     "m, n", [(m, n) for m in [1, 2, 4, 8, 256, 1024, 8192] for n in [128, 4096, 8192]]
 )
 def test_silu_mul_quant_fuse(m, n):
+    torch.manual_seed(0)
     rocm_fp8_dtype = rocm_aiter_fp8_dtype
 
     x_shape = (m, 2 * n)

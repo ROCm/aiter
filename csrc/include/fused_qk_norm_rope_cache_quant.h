@@ -7,8 +7,8 @@ using namespace at;
 namespace aiter {
 
 void fused_qk_norm_rope_cache_quant_shuffle(
-    at::Tensor& qkv,                   // Combined QKV tensor [num_tokens,
-                                       // (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+    at::Tensor& qkv, // Deprecated concatenated QKV [num_tokens, total_heads*head_dim]. May be empty
+                     // when using opt_q/opt_k/opt_v only. If both are passed, q/k/v win; qkv is ignored.
     int64_t num_heads_q,               // Number of query heads
     int64_t num_heads_k,               // Number of key heads
     int64_t num_heads_v,               // Number of value heads
@@ -25,7 +25,10 @@ void fused_qk_norm_rope_cache_quant_shuffle(
     at::Tensor& slot_mapping,          // slot mapping
     const std::string& kv_cache_dtype, // kv cache data type
     std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
-    std::optional<at::Tensor> v_scale  // v scale tensor for quantized v cache
+    std::optional<at::Tensor> v_scale,  // v scale tensor for quantized v cache
+    std::optional<at::Tensor> opt_q = c10::nullopt, // 2D [T, Hq*D] or 3D [T, Hq, D]; arbitrary strides (kernel uses scalar path if dim stride != 1)
+    std::optional<at::Tensor> opt_k = c10::nullopt, // 2D [T, Hk*D] or 3D [T, Hk, D]
+    std::optional<at::Tensor> opt_v = c10::nullopt  // 2D [T, Hv*D] or 3D [T, Hv, D]
 );
 
 void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
@@ -74,6 +77,21 @@ void fused_qk_norm_rope_2way(at::Tensor& q0,
                              double eps,
                              at::Tensor& out_q01,
                              at::Tensor& out_k01);
+
+void fused_qk_norm_rope_1way(at::Tensor& q,
+                             at::Tensor& k,
+                             at::Tensor& w_q,
+                             at::Tensor& w_k,
+                             at::Tensor& cos_sin,
+                             int64_t batch_size,
+                             int64_t num_tokens,
+                             int64_t num_heads_q,
+                             int64_t num_heads_k,
+                             int64_t head_size,
+                             bool is_interleaved,
+                             double eps,
+                             at::Tensor& out_q,
+                             at::Tensor& out_k);
 
 std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm(at::Tensor& q,
                                                     at::Tensor& q_weight,

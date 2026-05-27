@@ -339,17 +339,16 @@ e5m2_type, e4m3_type = types.get_fp8_dtypes()
 #     (9728,8192,65536),
 #     (1,1280,8192)
 # ])
-@pytest.mark.parametrize("a_dtype", [e4m3_type])  # [e4m3_type, e5m2_type, torch.int8]
-@pytest.mark.parametrize(
-    "layout", ["TN"]
-)  # NOTE: Kernel will occasionally crash for layouts other than TN.
-def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, layout: str, CLEAR_GPUS=True):
+def test_gemm_a8wfp4(M: int, N: int, K: int, CLEAR_GPUS=True):
+    a_dtype = e4m3_type
+    layout = "TN"  # Kernel will occasionally crash for layouts other than TN.
     out_dtype = torch.bfloat16
-    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    torch.manual_seed(42)  # for reproducibility
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+    torch.manual_seed(42)  # for reproducibility
 
     # clean up to avoid hangs in large tests
     if CLEAR_GPUS:

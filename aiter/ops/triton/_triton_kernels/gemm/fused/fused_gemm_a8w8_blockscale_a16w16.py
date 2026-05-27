@@ -173,11 +173,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                 a_scale = tl.load(a_scale_ptrs)
                 b_scale = tl.load(b_scale_ptrs)
 
-                accumulator_fp8 += (
-                    tl.dot(a, b, input_precision="ieee")
-                    * a_scale[:, None]
-                    * b_scale[None, :]
-                )
+                accumulator_fp8 += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
 
                 a_fp8_ptrs += BLOCK_SIZE_K * stride_a_fp8_k
                 b_fp8_ptrs += BLOCK_SIZE_K * stride_b_fp8_k
@@ -219,7 +215,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                     bias_bf16_vals = tl.load(bias_bf16_ptr + offs_b_bf16_n).to(
                         dtype=acc_dtype
                     )
-                    accumulator_bf16 = accumulator_bf16 + bias_bf16_vals[None, :]
+                    accumulator_bf16 += bias_bf16_vals[None, :]
 
             for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
                 if EVEN_K:
@@ -236,7 +232,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                         cache_modifier=cache_modifier,
                     )
 
-                accumulator_bf16 += tl.dot(a, b, input_precision="ieee")
+                accumulator_bf16 = tl.dot(a, b, acc=accumulator_bf16)
 
                 a_ptrs += BLOCK_SIZE_K * stride_a_bf16_k
                 b_ptrs += BLOCK_SIZE_K * stride_b_bf16_k

@@ -87,6 +87,7 @@ def get_x_vals():
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
 def test_gemm(dtype, M, N1, N2, K, output, skip_reduce):
+    torch.manual_seed(0)
     block_shape_n, block_shape_k = block_shape
 
     x_fp8, w_fp8, _, x_fp8_scale, _, w_fp8_scale, y_fp8 = (

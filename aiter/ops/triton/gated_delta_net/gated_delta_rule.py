@@ -22,6 +22,8 @@ import triton
 from aiter.ops.triton._triton_kernels.gated_delta_rule import (
     _fused_recurrent_gated_delta_rule_fwd_kernel,
     chunk_gated_delta_rule_fwd,
+    chunk_gated_delta_rule_fwd_opt,
+    chunk_gated_delta_rule_fwd_opt_vk,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     l2norm_fwd,
@@ -322,6 +324,182 @@ def chunk_gated_delta_rule(
 
     # Call aiter's chunk forward pass
     g, o, A, final_state = chunk_gated_delta_rule_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+    )
+    return o.to(q.dtype), final_state
+
+
+def chunk_gated_delta_rule_opt(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float = None,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""
+    Optimized chunk-based gated delta rule operation using Triton (Forward only).
+
+    This function implements an optimized chunk-based parallel computation for the
+    gated delta rule, using fused kernels and transposed intermediate layouts to
+    reduce global memory round-trips.
+
+    Warning:
+        This function only supports forward pass and does NOT compute gradients.
+        Do not use this for training. For training, use flash-linear-attention library.
+
+    Args:
+        q (torch.Tensor):
+            queries of shape `[B, T, H, K]`.
+        k (torch.Tensor):
+            keys of shape `[B, T, H, K]`.
+        v (torch.Tensor):
+            values of shape `[B, T, H, V]`.
+        g (torch.Tensor):
+            g (decays in log space) of shape `[B, T, H]`.
+        beta (torch.Tensor):
+            betas of shape `[B, T, H]`.
+        scale (float, optional):
+            Scale factor for the attention scores.
+            If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
+        initial_state (torch.Tensor, optional):
+            Initial state of shape `[N, H, K, V]` for `N` input sequences.
+            For equal-length input sequences, `N` equals the batch size `B`.
+            Default: `None`.
+        output_final_state (bool):
+            Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
+        use_qk_l2norm_in_kernel (bool):
+            Whether to use L2 normalization in the kernel. Default: `False`.
+        cu_seqlens (torch.LongTensor, optional):
+            Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
+            consistent with the FlashAttention API. Default: `None`.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - o (torch.Tensor): Outputs of shape `[B, T, H, V]`.
+            - final_state (torch.Tensor): Final state of shape `[N, H, K, V]` if
+              `output_final_state=True` else `None`.
+
+    Raises:
+        ValueError: If input shapes are invalid when using cu_seqlens.
+    """
+    # Input validation
+    if cu_seqlens is not None:
+        if q.shape[0] != 1:
+            raise ValueError(
+                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`. "
+                f"Please flatten variable-length inputs before processing."
+            )
+        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
+            raise ValueError(
+                f"The number of initial states is expected to be equal to the number of input sequences, "
+                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
+            )
+
+    # Set default values
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+
+    # Log operation
+    _LOGGER.info(
+        f"CHUNK_GATED_DELTA_RULE_OPT: q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
+        f"scale={scale}, use_qk_l2norm={use_qk_l2norm_in_kernel}"
+    )
+
+    # Apply L2 normalization if requested
+    if use_qk_l2norm_in_kernel:
+        _LOGGER.info("Applying L2 normalization to q and k")
+        q, _ = l2norm_fwd(q)
+        k, _ = l2norm_fwd(k)
+
+    # Call aiter's optimized chunk forward pass
+    g_cumsum, o, final_state = chunk_gated_delta_rule_fwd_opt(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+    )
+    return o.to(q.dtype), final_state
+
+
+def chunk_gated_delta_rule_opt_vk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float = None,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""
+    Optimized chunk-based gated delta rule with h layout [V, K] (Forward only).
+
+    Same fused K12/K34 kernels as chunk_gated_delta_rule_opt, but K5/K6
+    use transposed hidden state layout [V, K] instead of [K, V].
+
+    Args:
+        q (torch.Tensor): queries of shape `[B, T, H, K]`.
+        k (torch.Tensor): keys of shape `[B, T, H, K]`.
+        v (torch.Tensor): values of shape `[B, T, H, V]`.
+        g (torch.Tensor): g (decays in log space) of shape `[B, T, H]`.
+        beta (torch.Tensor): betas of shape `[B, T, H]`.
+        scale (float, optional): Scale factor. Default: `1 / sqrt(K)`.
+        initial_state (torch.Tensor, optional):
+            Initial state of shape `[N, H, V, K]` — note transposed layout.
+        output_final_state (bool): Whether to output final state `[N, H, V, K]`.
+        use_qk_l2norm_in_kernel (bool): Whether to use L2 normalization.
+        cu_seqlens (torch.LongTensor, optional): Cumulative sequence lengths `[N+1]`.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - o: Outputs of shape `[B, T, H, V]`.
+            - final_state: `[N, H, V, K]` if `output_final_state=True` else `None`.
+    """
+    if cu_seqlens is not None:
+        if q.shape[0] != 1:
+            raise ValueError(
+                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
+            )
+        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
+            raise ValueError(
+                f"The number of initial states is expected to be equal to the number of input sequences, "
+                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
+            )
+
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+
+    _LOGGER.info(
+        f"CHUNK_GATED_DELTA_RULE_OPT_VK: q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
+        f"scale={scale}, use_qk_l2norm={use_qk_l2norm_in_kernel}"
+    )
+
+    if use_qk_l2norm_in_kernel:
+        _LOGGER.info("Applying L2 normalization to q and k")
+        q, _ = l2norm_fwd(q)
+        k, _ = l2norm_fwd(k)
+
+    g_cumsum, o, final_state = chunk_gated_delta_rule_fwd_opt_vk(
         q=q,
         k=k,
         v=v,

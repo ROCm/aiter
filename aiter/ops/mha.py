@@ -965,6 +965,7 @@ def cmdGenFunc_mha_batch_prefill(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
@@ -1046,6 +1047,17 @@ def cmdGenFunc_mha_batch_prefill(
         # PERTENSOR: per-tensor quantization
         md_name += "_pertensor"
         filter_fwd += "_pertensor*"
+    # Sink only applies when there is a causal/window mask; full attention
+    # (window_size_left==-1 and window_size_right==-1) ignores sink_size.
+    has_effective_sink = sink_size > 0 and (
+        causal or not (window_size_left == -1 and window_size_right == -1)
+    )
+    if has_effective_sink:
+        md_name += "_sink"
+        filter_fwd += "_sink*"
+    else:
+        md_name += "_nsink"
+        filter_fwd += "_nsink*"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
@@ -1281,7 +1293,7 @@ def _flash_attn_forward(
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def is_fmha_v3_fp8():
-        ret = get_gfx() == "gfx942"
+        ret = get_gfx() in ("gfx942", "gfx950")
         ret = ret and (hdim_q == 128)
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
@@ -1307,6 +1319,11 @@ def _flash_attn_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table
+        # (1,2,4,8,16); arbitrary divisor ratios route to CK.
+        if is_fmha_v3_fp8():
+            gqa_ratio = nhead_q // nhead_k
+            ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2062,7 +2079,7 @@ def _flash_attn_varlen_forward(
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def is_fmha_v3_fp8():
-        ret = get_gfx() == "gfx942"
+        ret = get_gfx() in ("gfx942", "gfx950")
         ret = ret and (hdim_q == 128)
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
@@ -2088,6 +2105,11 @@ def _flash_attn_varlen_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and logits_soft_cap == 0.0
+        # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table
+        # (1,2,4,8,16); arbitrary divisor ratios route to CK.
+        if is_fmha_v3_fp8():
+            gqa_ratio = nhead_q // nhead_k
+            ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2739,6 +2761,7 @@ def mha_batch_prefill_fake_tensors(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,
@@ -2823,6 +2846,7 @@ def mha_batch_prefill(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
@@ -2857,6 +2881,7 @@ def _mha_batch_prefill(
     logits_soft_cap: float = 0.0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    sink_size: int = 0,
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     return_lse: bool = False,
@@ -2892,6 +2917,7 @@ def _mha_batch_prefill(
         causal,
         window_size_left,
         window_size_right,
+        sink_size,
         return_lse,
         return_softmax,
         out,
@@ -2906,7 +2932,6 @@ def _mha_batch_prefill(
         seqlen_k,
         sink_ptr,
         None,
-        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -2938,6 +2963,7 @@ def mha_batch_prefill_func(
     v_descale=None,
     kv_block_descale=None,  # [num_block, num_kv_head, 2] per-page K/V descales
     sink_ptr=None,
+    sink_size: int = 0,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -2990,6 +3016,7 @@ def mha_batch_prefill_func(
         logits_soft_cap=logits_soft_cap,
         window_size_left=window_size[0],
         window_size_right=window_size[1],
+        sink_size=sink_size,
         alibi_slopes=alibi_slopes,
         return_lse=return_lse,
         return_softmax=return_attn_probs and dropout_p > 0,

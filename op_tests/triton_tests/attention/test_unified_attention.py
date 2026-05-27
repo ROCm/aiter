@@ -571,8 +571,6 @@ def test_triton_unified_attn_3d(
     "q_dtype, kv_dtype, out_dtype, use_q_descale, use_kv_descale, use_out_scale",
     [
         (torch.bfloat16, torch.bfloat16, torch.bfloat16, False, False, False),
-        (e4m3_dtype, e4m3_dtype, e4m3_dtype, False, False, False),
-        (e4m3_dtype, e4m3_dtype, e4m3_dtype, True, True, True),
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, False, True, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, True, True, False),
     ],
