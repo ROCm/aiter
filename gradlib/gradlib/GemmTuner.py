@@ -238,7 +238,16 @@ def generate_data(
     # if scaleAB:
     #    scaleB = scaleB.t()
     out_asm = torch.empty(m, n, dtype=outdtype, device=device)
-    return (inp, weights, weights.t(), bias, x_scale, out_asm, shuffleweights, w_scale)
+    return {
+        "inp": inp,
+        "weights": weights,
+        "weights_t": weights.t(),
+        "bias": bias,
+        "x_scale": x_scale,
+        "out_asm": out_asm,
+        "shuffleweights": shuffleweights,
+        "w_scale": w_scale,
+    }
 
 
 def get_gemm_ref(inp, weights, bias, scaleA, scaleB, indtype, outdtype):
@@ -315,16 +324,13 @@ class Gemm:
         self.outdtype = outdtype
         self.scaleAB = scaleAB
         self.nb = CACHE_INVALIDATE_BUFFERS
-        (
-            self.inp,
-            self.weights,
-            _,
-            self.bias,
-            self.x_scale,
-            _,
-            self.shuffleweights,
-            self.w_scale,
-        ) = generate_data(m, n, k, indtype, outdtype, scaleAB, is_shuffle, 0, bias)
+        data = generate_data(m, n, k, indtype, outdtype, scaleAB, is_shuffle, 0, bias)
+        self.inp = data["inp"]
+        self.weights = data["weights"]
+        self.bias = data["bias"]
+        self.x_scale = data["x_scale"]
+        self.shuffleweights = data["shuffleweights"]
+        self.w_scale = data["w_scale"]
         self.blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device="cuda")
         self.topn = 20  # number of top solutions from each source
         self.hipb_sols = []
@@ -530,17 +536,29 @@ class Gemm:
                             self.has_bias,
                         ),
                         run_gemm_bf16_asm,
-                        ([0, 6, 5, 3], splitK, kernelName, self.is_shuffle),
+                        (
+                            ["inp", "shuffleweights", "out_asm", "bias"],
+                            splitK,
+                            kernelName,
+                            self.is_shuffle,
+                        ),
                         {
                             "num_warmup": self.num_warmup,
                             "num_iters": 101,
                         },
                         get_gemm_ref,
-                        ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                        (
+                            ["inp", "weights", "bias", "x_scale", "w_scale"],
+                            self.indtype,
+                            self.outdtype,
+                        ),
                         {},
                         None,  # self.ref if fast_mode == 0 else None,
                         self.rtol,
                         self.atol,
+                        None,
+                        None,
+                        ("out_asm",),
                     )
                 )
 
@@ -586,7 +604,7 @@ class Gemm:
 
         task = []
         flydsl_catalog = get_flydsl_bf16_catalog(self.m, self.n, self.k)
-        weight_idx = 6 if self.is_shuffle else 1
+        weight_key = "shuffleweights" if self.is_shuffle else "weights"
         min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
         for solidx, kernel_name, config in flydsl_catalog:
             if config.get("b_preshuffle", False) != self.is_shuffle:
@@ -639,13 +657,17 @@ class Gemm:
                         self.has_bias,
                     ),
                     run_flydsl_gemm_bf16,
-                    ([0, weight_idx, 3], self.outdtype, config),
+                    (["inp", weight_key, "bias"], self.outdtype, config),
                     {
                         "num_warmup": self.num_warmup,
                         "num_iters": 101,
                     },
                     get_gemm_ref,
-                    ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                    (
+                        ["inp", "weights", "bias", "x_scale", "w_scale"],
+                        self.indtype,
+                        self.outdtype,
+                    ),
                     {},
                     None,
                     self.rtol,
@@ -704,13 +726,17 @@ class Gemm:
                     True if self.bias is not None else False,
                 ),
                 run_skinny_gemm_a16w16,
-                ([0, 1, 3], self.outdtype),
+                (["inp", "weights", "bias"], self.outdtype),
                 {
                     "num_warmup": self.num_warmup,
                     "num_iters": 101,
                 },
                 get_gemm_ref,
-                ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                (
+                    ["inp", "weights", "bias", "x_scale", "w_scale"],
+                    self.indtype,
+                    self.outdtype,
+                ),
                 {},
                 None,
                 self.rtol,
@@ -765,13 +791,20 @@ class Gemm:
                     True if self.bias is not None else False,
                 ),
                 run_torch_gemm_a16w16,
-                ([0, 1, 3, 4, 7], self.outdtype),
+                (
+                    ["inp", "weights", "bias", "x_scale", "w_scale"],
+                    self.outdtype,
+                ),
                 {
                     "num_warmup": self.num_warmup,
                     "num_iters": 101,
                 },
                 get_gemm_ref,
-                ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                (
+                    ["inp", "weights", "bias", "x_scale", "w_scale"],
+                    self.indtype,
+                    self.outdtype,
+                ),
                 {},
                 None,
                 self.rtol,
@@ -824,13 +857,17 @@ class Gemm:
                     True if self.bias is not None else False,
                 ),
                 run_triton_gemm_bf16,
-                ([0, 1, 3], self.outdtype),
+                (["inp", "weights", "bias"], self.outdtype),
                 {
                     "num_warmup": self.num_warmup,
                     "num_iters": 101,
                 },
                 get_gemm_ref,
-                ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                (
+                    ["inp", "weights", "bias", "x_scale", "w_scale"],
+                    self.indtype,
+                    self.outdtype,
+                ),
                 {},
                 None,  # self.ref if fast_mode == 0 else None,
                 self.rtol,
@@ -885,13 +922,22 @@ class Gemm:
                         self.has_bias,
                     ),
                     call_hipb_mm,
-                    ([0, 6, 3, 4, 7], solidx, self.outdtype, self.is_shuffle),
+                    (
+                        ["inp", "shuffleweights", "bias", "x_scale", "w_scale"],
+                        solidx,
+                        self.outdtype,
+                        self.is_shuffle,
+                    ),
                     {
                         "num_warmup": warmi,
                         "num_iters": coldi,
                     },
                     get_gemm_ref if fast_mode == 0 else None,
-                    ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                    (
+                        ["inp", "weights", "bias", "x_scale", "w_scale"],
+                        self.indtype,
+                        self.outdtype,
+                    ),
                     {},
                     None,  # self.ref if fast_mode == 0 else None,
                     self.rtol,
@@ -1116,29 +1162,37 @@ class GemmTuner(GemmCommonTuner):
         untunedf = self.untunedf
         results = []
         for i in range(len(untunedf)):
-            M = int(untunedf.loc[i, "M"])
-            N = int(untunedf.loc[i, "N"])
-            K = int(untunedf.loc[i, "K"])
-            bias = untunedf.loc[i, "bias"]
-            indtype = str(untunedf.loc[i, "dtype"])
-            outdtype = str(untunedf.loc[i, "outdtype"])
-            scaleAB = untunedf.loc[i, "scaleAB"]
-            bpreshuffle = untunedf.loc[i, "bpreshuffle"]
+            row = untunedf.iloc[i]
+            M = int(row["M"])
+            N = int(row["N"])
+            K = int(row["K"])
+            bias = row["bias"]
+            indtype = str(row["dtype"])
+            outdtype = str(row["outdtype"])
+            scaleAB = row["scaleAB"]
+            bpreshuffle = row["bpreshuffle"]
             shape_str = f"({M}, {N}, {K}, {indtype}, bias={bias})"
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
             try:
-                inp, weights, _, bias_tensor, x_scale, _, shuffleweights, w_scale = (
-                    generate_data(
-                        M,
-                        N,
-                        K,
-                        eval(indtype),
-                        eval(outdtype),
-                        scaleAB,
-                        bpreshuffle,
-                        0,
-                        bias,
-                    )
+                data = generate_data(
+                    M,
+                    N,
+                    K,
+                    eval(indtype),
+                    eval(outdtype),
+                    scaleAB,
+                    bpreshuffle,
+                    0,
+                    bias,
                 )
+                inp = data["inp"]
+                weights = data["weights"]
+                bias_tensor = data["bias"]
+                x_scale = data["x_scale"]
+                shuffleweights = data["shuffleweights"]
+                w_scale = data["w_scale"]
                 w = shuffleweights if bpreshuffle else weights
                 scale_a = x_scale if scaleAB else None
                 scale_b = w_scale if scaleAB else None
@@ -1167,7 +1221,11 @@ class GemmTuner(GemmCommonTuner):
                 err_ratio = checkAllclose(
                     out, ref, atol=_atol, rtol=_rtol, msg=f"run_config {shape_str}"
                 )
-                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                status = (
+                    "ok"
+                    if err_ratio <= allowed_err_ratio
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
+                )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
                 results.append(
