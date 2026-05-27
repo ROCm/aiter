@@ -269,10 +269,15 @@ def gemm_mxfp4_preshuffle_gfx1250(
     # position, then steps it forward for the next load (prologue or main).
     for _ in gl.static_range(NUM_BUFFERS):
         slot = load_idx % NUM_BUFFERS
-        gl.amd.gfx1250.tdm.async_load(a_desc, [0, 0], smem_A.index(slot))
-        gl.amd.gfx1250.tdm.async_load(b_desc, [0, 0], smem_B.index(slot))
-        gl.amd.gfx1250.tdm.async_load(as_desc, [0, 0], smem_AS.index(slot))
-        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, 0], smem_BS.index(slot))
+        # slot index math (arith.muli) ahead of the copies so the four tdm async_loads emit back-to-back and the compiler can merge them.
+        a_slot = smem_A.index(slot)
+        b_slot = smem_B.index(slot)
+        as_slot = smem_AS.index(slot)
+        bs_slot = smem_BS.index(slot)
+        gl.amd.gfx1250.tdm.async_load(a_desc, [0, 0], a_slot)
+        gl.amd.gfx1250.tdm.async_load(b_desc, [0, 0], b_slot)
+        gl.amd.gfx1250.tdm.async_load(as_desc, [0, 0], as_slot)
+        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, 0], bs_slot)
         a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_desc, [0, BLOCK_K_BYTES])
         b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             b_desc, [0, BLOCK_K_BYTES * 16]
@@ -311,10 +316,14 @@ def gemm_mxfp4_preshuffle_gfx1250(
         # the previous iter's / prologue's trailing update_tensor_descriptor)
         slot = load_idx % NUM_BUFFERS
 
-        gl.amd.gfx1250.tdm.async_load(a_desc, [0, 0], smem_A.index(slot))
-        gl.amd.gfx1250.tdm.async_load(b_desc, [0, 0], smem_B.index(slot))
-        gl.amd.gfx1250.tdm.async_load(as_desc, [0, 0], smem_AS.index(slot))
-        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, 0], smem_BS.index(slot))
+        a_slot = smem_A.index(slot)
+        b_slot = smem_B.index(slot)
+        as_slot = smem_AS.index(slot)
+        bs_slot = smem_BS.index(slot)
+        gl.amd.gfx1250.tdm.async_load(a_desc, [0, 0], a_slot)
+        gl.amd.gfx1250.tdm.async_load(b_desc, [0, 0], b_slot)
+        gl.amd.gfx1250.tdm.async_load(as_desc, [0, 0], as_slot)
+        gl.amd.gfx1250.tdm.async_load(bs_desc, [0, 0], bs_slot)
         a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_desc, [0, BLOCK_K_BYTES])
         b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             b_desc, [0, BLOCK_K_BYTES * 16]
