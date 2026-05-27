@@ -279,6 +279,7 @@ def _gemm_lds_bytes(
 def pick_gemm_num_stages(
     arch, block_m, block_n, block_k, bits_a, bits_b, use_async_padding=False
 ):
+    assert min(block_m, block_n, block_k, bits_a, bits_b) > 0
     # bits_a / bits_b: element bit-widths (8 for fp8, 4 for mxfp4).
     # use_async_padding: True when the kernel lowers to async direct-to-LDS
     # with padded shared encoding (e.g. a4w4 on gfx950).
