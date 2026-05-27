@@ -33,53 +33,81 @@ cd -
 pip install -e . --no-build-isolation
 ```
 
-### Canonical test script: `op_tests/test_unified_attention_ck.py`
+### The one test script: `op_tests/test_unified_attention_ck.py`
 
-This is the basic testing script — comprehensive grid (correctness vs
-`ref_paged_attn` + perf vs Triton) **and** single-shape mode for ad-hoc
-investigations.
+Everything CK-UA-related goes through this. It has two modes:
+
+* **Grid mode** (`--quick`, `--full`, no flags). Sweeps a Cartesian
+  product of (seq_lens × num_heads × head_size × block_size × dtype ×
+  q_dtype × num_blocks). Compares each row's CK output against the
+  torch reference, and (off by default) optionally against the Triton
+  kernel for a head-to-head perf number. Prints a DataFrame summary at
+  the end. Exit-code-non-zero on any correctness failure → CI-ready.
+* **Single-shape mode** (`-b -sq -sk` + dtype/head/block knobs).
+  Expands to one batch of `b` identical `(sq, sk)` sequences, runs the
+  same kernel path, and prints a focused report block (shape config,
+  GPU, **split-KV status**, correctness vs reference, time, GB/s,
+  TFLOPs, CK-vs-Triton speedup if applicable). The split-KV status row
+  tags the report with `num_splits=N (ACTIVE|off)` so any perf surprise
+  can be attributed to the combine-kernel + workspace cost vs. the
+  attention kernel proper.
+
+Triton comparison defaults are mode-aware: ON in single-shape (you
+almost always want the head-to-head when investigating one shape), OFF
+in grid runs (regression sweeps should be CK-vs-reference; Triton
+numbers add runtime + decouple regression detection from Triton perf).
+Override either default with `--triton` / `--no-triton`.
 
 ```bash
-# Default grid (~48 configs, a few minutes)
+# Grid: default (~48 configs, a few minutes; CK vs ref only)
 HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py
 
-# Smoke subset (~8 configs, <1 min)
+# Grid: smoke (~8 configs, <1 min)
 HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py --quick
 
-# Full Triton-UA-style matrix (~288 configs, ~30 min)
+# Grid: full Triton-UA-style matrix (~288 configs, ~30 min)
 HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py --full
 
-# Restrict any dimension(s) of the grid
-HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py \
-    --head-size 128 --dtype bf16 --q-dtype none
+# Grid: include Triton head-to-head
+HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py --triton
 
-# Single-shape mode (replaces the standalone test_single_shape.py for
-# routine correctness/perf checks). `--num-blocks auto` allocates a
-# unique-per-token KV pool so block_tables hold no fake L2 reuse.
+# Single-shape (Triton on by default; `--num-blocks auto` sizes the
+# KV pool so block_tables are unique per (seq, position) — no fake L2
+# reuse, mirroring vLLM/SGLang allocator behaviour)
 HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py \
     -b 64 -sq 1 -sk 128000 \
     --num-heads 64,8 --head-size 128 --block-size 16 \
     --dtype bf16 --q-dtype none --num-blocks auto
+
+# Single-shape, CK-only
+HIP_VISIBLE_DEVICES=2 python op_tests/test_unified_attention_ck.py \
+    -b 4 -sq 1 -sk 16384 \
+    --num-heads 64,8 --head-size 128 --block-size 32 \
+    --dtype bf16 --q-dtype none --num-blocks auto --no-triton
 ```
 
-Exit code is non-zero if any row's `ck_pass` or `triton_pass` is `False`,
-so it's CI-ready.
+### Sweep wrapper: `ua-test-scripts/regression_decode.sh`
 
-### Specialised scripts under `ua-test-scripts/`
+Bash wrapper that runs the canonical script across the 4 (d, dtype)
+decode combos at **two batch sizes**:
 
-These pre-date the single-shape mode on the canonical script and stay
-around for the specific things they do better than the comprehensive
-runner. Default to `test_unified_attention_ck.py` unless you specifically
-need one of these:
+* `b=128` (light split-KV, `num_splits=2`) — measures the attention
+  kernel itself; combine cost is negligible at this CTA count.
+* `b=4` (heavy split-KV, `num_splits=64`) — measures the
+  attention-kernel + combine pipeline. A regression that *only* shows
+  up here lives in the combine path (Triton
+  `reduce_segments_ck_layout`) or the wrapper's workspace alloc — not
+  the CK attention kernel.
 
-| Script                     | When to use it                                                                                                  |
-|----------------------------|-----------------------------------------------------------------------------------------------------------------|
-| `test_single_shape.py`     | Kernel-tuning iteration loop: CUDA-graph timing with `BENCH_START_CK`/`BENCH_END_CK` rocprof markers; reports GB/s + TFLOPs in addition to time. Faster turnaround than the @perftest path when you're scrubbing a single shape repeatedly. |
-| `regression_decode.sh`     | Multi-run median-of-N sweep across the 4 (d, dtype) decode combos; surfaces noise from shared-GPU runs.         |
-| `probe_decode_d128.sh`     | One-off perf probes used during the Tier-2 / scalar-prefetch investigation; kept for historical reproducibility. |
-| `probe_prefill_d128.sh`    | Same, prefill side.                                                                                              |
-| `tier2_decode_sweep.sh`    | Tier-2 LDS cache investigation sweeps.                                                                            |
-| `rocprof_analysis/`        | rocprof CSVs + analysis notebooks from the kernel investigation runs.                                            |
+Each row is tagged with `splitkv=N` (and an `*` suffix when N > 1) so
+the split-KV vs attention-only attribution is visible at a glance.
+CK-only by default; pass `WITH_TRITON=1` to add Triton.
+
+```bash
+ua-test-scripts/regression_decode.sh                 # defaults: sk=16384, 5 runs, GPU 2, block=32
+SK=32768 NUM_RUNS=7 GPU=3 ua-test-scripts/regression_decode.sh
+WITH_TRITON=1 ua-test-scripts/regression_decode.sh   # add Triton comparison
+```
 
 ---
 
@@ -208,7 +236,7 @@ of pages we used to read but never index — small but free.
 ## What lives where
 
 ```
-op_tests/test_unified_attention_ck.py        # canonical test (grid + single-shape mode)
+op_tests/test_unified_attention_ck.py        # the test script (grid + single-shape mode)
 aiter/ops/unified_attention.py               # Python wrapper + transparent split-KV
 aiter/jit/optCompilerConfig.json             # JIT build flags for module_unified_attention
 3rdparty/composable_kernel/include/ck_tile/ops/unified_attention/
@@ -219,7 +247,6 @@ aiter/jit/optCompilerConfig.json             # JIT build flags for module_unifie
     unified_attention_impl.hpp               # per-variant compile-time knobs (kBlockPerCu, FP8 traits, ...)
 ua-test-scripts/
     STATUS.md                                # this file
-    test_single_shape.py                     # legacy specialised script (rocprof / GB/s reporting)
-    regression_decode.sh                     # median-of-N decode sweep wrapper around test_single_shape.py
-    probe_*.sh, tier2_*.sh, rocprof_analysis # historical investigation artifacts
+    regression_decode.sh                     # median-of-N decode sweep across (b=128, b=4) × (d, dtype)
+    rocprof_analysis/                        # local rocprof CSV dumps (gitignored)
 ```
