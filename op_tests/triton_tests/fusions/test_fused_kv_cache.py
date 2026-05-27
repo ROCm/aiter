@@ -49,7 +49,8 @@ def split_unshuffle_nvfp4_kv_cache(key_or_value_cache):
         .reshape(-1, block_size, head_size // 2)
     )
     head_size_scales = head_size // 16
-    head_size_scales_k_width = max(4, min(16, triton.next_power_of_2(head_size_scales)))
+    head_size_scales_k_width = triton.next_power_of_2(head_size_scales)
+    head_size_scales_k_width = max(4, min(16, head_size_scales_k_width))
     key_or_value_cache_scales = (
         key_or_value_cache_scales.reshape(
             (
