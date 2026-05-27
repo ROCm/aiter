@@ -94,7 +94,7 @@ def get_kernel_config(m, n, k, routing_data):
         block_n = 256
         block_k = 256
         num_warps = 8
-    num_stages = pick_gemm_num_stages(arch, block_m, block_n, block_k, 1.0, 1.0)
+    num_stages = pick_gemm_num_stages(arch, block_m, block_n, block_k, 8, 8)
 
     ret = {
         "block_m": block_m,

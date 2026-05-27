@@ -32,10 +32,21 @@ def is_tdm_avail():
     return get_arch() in ("gfx1250",)
 
 
-def pick_gemm_num_stages(arch, block_m, block_n, block_k, elem_a, elem_b):
-    # gfx942 has no async_copy and num_stages=2 always fits.
-    # gfx950 enables async_copy; pick ns=1 only when ns=2 overflows the 160 KB cap.
-    if arch != "gfx950":
+_LDS_CAP_BYTES = {"gfx950": 163840, "gfx942": 65536}
+
+
+def _gemm_lds_bytes(block_m, block_n, block_k, bits_a, bits_b, num_stages):
+    # Non-async LDS usage (matches TensorAtlas calculate_lds_usage).
+    LDSA_bits = block_m * block_k * bits_a
+    LDSB_bits = block_n * block_k * bits_b
+    if num_stages <= 1:
+        return max(LDSA_bits, LDSB_bits) // 8
+    return (LDSA_bits + LDSB_bits) * (num_stages - 1) // 8
+
+
+def pick_gemm_num_stages(arch, block_m, block_n, block_k, bits_a, bits_b):
+    # bits_a / bits_b: element bit-widths (8 for fp8, 4 for mxfp4).
+    cap = _LDS_CAP_BYTES.get(arch)
+    if cap is None:
         return 2
-    lds_bytes = int(block_m * block_k * elem_a + block_n * block_k * elem_b)
-    return 2 if lds_bytes <= 163840 else 1
+    return 2 if _gemm_lds_bytes(block_m, block_n, block_k, bits_a, bits_b, 2) <= cap else 1
