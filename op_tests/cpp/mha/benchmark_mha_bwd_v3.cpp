@@ -382,6 +382,14 @@ void fill_trig(HostTensor<T>& t)
     }
 }
 
+template <typename T>
+void fill_constant(HostTensor<T>& t, float v)
+{
+    const T tv = from_float<T>(v);
+    for(std::size_t i = 0; i < t.numel(); ++i)
+        t.data()[i] = tv;
+}
+
 // -----------------------------------------------------------------------------
 // check_err
 // -----------------------------------------------------------------------------
@@ -786,7 +794,7 @@ std::tuple<bool, ArgParser> create_args(int argc, char** argv)
              "0",
              "0/'t'/'b' or 't:l,r' / 'b:l,r' / 'xt:w' / 'xb:w' / 'g:y,x'");
     p.insert("kname", "0", "if set to 1 will print kernel name");
-    p.insert("init", "1", "init method. 0:randint, 1:rand, 2:trig");
+    p.insert("init", "1", "init method. 0:randint, 1:rand, 2:trig, 3:const(0.1)");
     p.insert("seed", "11939", "random seed");
     p.insert("p_drop", "0", "must be 0 in the v3-only host");
     p.insert("drop_seed", "1", "");
@@ -921,7 +929,7 @@ bool run_bench(const ArgParser& arg)
         int sq = seqlens_q[b];
         int sk = seqlens_k[b];
         flop += static_cast<std::size_t>(nhead) *
-                (3u * 2u * sq * sk * hdim_q + 2u * 2u * sq * sk * hdim_v);
+                (3ull * 2ull * sq * sk * hdim_q + 2ull * 2ull * sq * sk * hdim_v);
         num_byte += static_cast<std::size_t>(nhead) *
                     (sizeof(Q) * sq * hdim_q + sizeof(K) * sk * hdim_q +
                      sizeof(V) * sk * hdim_v + sizeof(O) * sq * hdim_v +
@@ -967,12 +975,19 @@ bool run_bench(const ArgParser& arg)
         fill_uniform(v_host, -1.f, 1.f, eng);
         fill_uniform(do_host, -1.f, 1.f, eng);
     }
-    else
+    else if(init_method == 2)
     {
         fill_trig(q_host);
         fill_trig(k_host);
         fill_trig(v_host);
         fill_trig(do_host);
+    }
+    else
+    {
+        fill_constant(q_host, 0.1f);
+        fill_constant(k_host, 0.1f);
+        fill_constant(v_host, 0.1f);
+        fill_constant(do_host, 0.1f);
     }
 
     DeviceMem q_buf(q_host.bytes());
@@ -1470,28 +1485,78 @@ bool run_bench(const ArgParser& arg)
         bool dq_ok = check_err<DQ, DQ>(dq_got, dq_ref, "[dQ]", rtol, atol);
         bool dk_ok = check_err<DK, DK>(dk_got, dk_ref, "[dK]", rtol, atol);
         bool dv_ok = check_err<DV, DV>(dv_got, dv_ref, "[dV]", rtol, atol);
-        // Diagnostic peek at the first / last rows
-        std::cerr << "[peek] dQ_ref[h=0,q=0,d=0..3]=";
-        for(int d = 0; d < 4 && d < hdim_q; ++d)
-            std::cerr << to_float<DQ>(dq_ref(0, 0, d)) << " ";
-        std::cerr << " | dQ_got[h=0,q=0,d=0..3]=";
-        for(int d = 0; d < 4 && d < hdim_q; ++d)
-            std::cerr << to_float<DQ>(dq_got(0, 0, d)) << " ";
-        std::cerr << std::endl;
-        std::cerr << "[peek] dK_ref[h=0,k=sk-1,d=0..3]=";
-        for(int d = 0; d < 4 && d < hdim_q; ++d)
-            std::cerr << to_float<DK>(dk_ref(0, sk - 1, d)) << " ";
-        std::cerr << " | dK_got[h=0,k=sk-1,d=0..3]=";
-        for(int d = 0; d < 4 && d < hdim_q; ++d)
-            std::cerr << to_float<DK>(dk_got(0, sk - 1, d)) << " ";
-        std::cerr << std::endl;
-        std::cerr << "[peek] dV_ref[h=0,k=sk-1,d=0..3]=";
-        for(int d = 0; d < 4 && d < hdim_v; ++d)
-            std::cerr << to_float<DV>(dv_ref(0, sk - 1, d)) << " ";
-        std::cerr << " | dV_got[h=0,k=sk-1,d=0..3]=";
-        for(int d = 0; d < 4 && d < hdim_v; ++d)
-            std::cerr << to_float<DV>(dv_got(0, sk - 1, d)) << " ";
-        std::cerr << std::endl;
+        // Aggregate error stats (printed regardless of pass/fail).
+        // max_rel is gated to elements where |ref| >= 1e-3 * max|ref| to avoid
+        // blow-up near zero; nrmse = ||diff||_2 / ||ref||_2 is the global
+        // relative L2 error and is the most reliable single-number metric.
+        auto stats = [&](const char* label,
+                         auto&& got_at,
+                         auto&& ref_at,
+                         int total_rows,
+                         int total_cols) {
+            double sum_sq_diff  = 0.0;
+            double sum_sq_ref   = 0.0;
+            double sum_abs_diff = 0.0;
+            double max_abs_diff = 0.0;
+            double max_abs_ref  = 0.0;
+            std::size_t n = 0;
+            for(int h = 0; h < nhead; ++h)
+                for(int r = 0; r < total_rows; ++r)
+                    for(int c = 0; c < total_cols; ++c)
+                    {
+                        const double a    = got_at(h, r, c);
+                        const double b    = ref_at(h, r, c);
+                        const double diff = std::fabs(a - b);
+                        sum_sq_diff  += diff * diff;
+                        sum_sq_ref   += b * b;
+                        sum_abs_diff += diff;
+                        if(diff > max_abs_diff)
+                            max_abs_diff = diff;
+                        if(std::fabs(b) > max_abs_ref)
+                            max_abs_ref = std::fabs(b);
+                        ++n;
+                    }
+            const double rel_floor = std::max(1e-3 * max_abs_ref, 1e-12);
+            double max_rel_diff = 0.0;
+            for(int h = 0; h < nhead; ++h)
+                for(int r = 0; r < total_rows; ++r)
+                    for(int c = 0; c < total_cols; ++c)
+                    {
+                        const double b = ref_at(h, r, c);
+                        if(std::fabs(b) < rel_floor)
+                            continue;
+                        const double rel =
+                            std::fabs(got_at(h, r, c) - b) / std::fabs(b);
+                        if(rel > max_rel_diff)
+                            max_rel_diff = rel;
+                    }
+            const double denom_n  = static_cast<double>(std::max<std::size_t>(n, 1));
+            const double mean_abs = sum_abs_diff / denom_n;
+            const double rmse     = std::sqrt(sum_sq_diff / denom_n);
+            const double nrmse =
+                std::sqrt(sum_sq_diff) / std::max(std::sqrt(sum_sq_ref), 1e-30);
+            std::cerr << label << " stats: n=" << n
+                      << std::scientific << std::setprecision(3)
+                      << " max_abs=" << max_abs_diff
+                      << " mean_abs=" << mean_abs
+                      << " max_rel=" << max_rel_diff
+                      << " rmse=" << rmse
+                      << " nrmse=" << nrmse
+                      << " max|ref|=" << max_abs_ref
+                      << std::defaultfloat << std::endl;
+        };
+        stats("[dQ]",
+              [&](int h, int r, int c) { return to_float<DQ>(dq_got(h, r, c)); },
+              [&](int h, int r, int c) { return to_float<DQ>(dq_ref(h, r, c)); },
+              sq, hdim_q);
+        stats("[dK]",
+              [&](int h, int r, int c) { return to_float<DK>(dk_got(h, r, c)); },
+              [&](int h, int r, int c) { return to_float<DK>(dk_ref(h, r, c)); },
+              sk, hdim_q);
+        stats("[dV]",
+              [&](int h, int r, int c) { return to_float<DV>(dv_got(h, r, c)); },
+              [&](int h, int r, int c) { return to_float<DV>(dv_ref(h, r, c)); },
+              sk, hdim_v);
         pass &= dq_ok && dk_ok && dv_ok;
         auto dump_per_row = [&](const char* label,
                                 auto&& got_at,
