@@ -432,6 +432,16 @@ def moe_gemm_a8w4(
     # StridedLayout callers keep their tuned BK<256.
     if swizzle_mx_scale == "CDNA4_SCALE" and config["block_k"] < 256:
         config["block_k"] = 256
+    # pad x_scales to a whole number of BLOCK_K tiles for async_copy
+    if use_gluon and x_has_mx:
+        mx_scale_block_k = config["block_k"] // 32
+        padded_ks = triton.cdiv(K, config["block_k"]) * mx_scale_block_k
+        if padded_ks > x_scales.shape[-1]:
+            x_scales = torch.nn.functional.pad(
+                x_scales, (0, padded_ks - x_scales.shape[-1])
+            )
+        stride_x_mx_m = x_scales.stride(0)
+        stride_x_mx_k = x_scales.stride(1)
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
