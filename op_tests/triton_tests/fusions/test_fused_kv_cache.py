@@ -1,7 +1,6 @@
 import torch
 import pytest
 
-import triton
 from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
 from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
 from op_tests.triton_tests.attention.test_mla import (
@@ -323,7 +322,6 @@ def test_fused_qk_rope_reshape_and_cache(
     value_cache = torch.zeros(
         (num_blocks, block_size, KH, D), dtype=torch.bfloat16, device="cuda"
     )
-    x_size = 16 // key_cache.element_size()
     if cache_dtype != torch.bfloat16:
         k_scale = torch.randn(
             [

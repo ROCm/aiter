@@ -5,7 +5,6 @@ from typing import Optional
 
 import pytest
 import torch
-import triton
 
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.shuffle import shuffle_weight
