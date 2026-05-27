@@ -3745,10 +3745,16 @@ def compile_moe_reduction(
                                 # Fused EP gather: valid = expert_mask[topk_ids[token, k]] != 0
                                 tk_idx_i32 = fx.Int32(token_idx * c_topk + fx.Index(k))
                                 eid_i32 = buffer_ops.buffer_load(
-                                    topk_ids_rsrc, tk_idx_i32, vec_width=1, dtype=i32_type()
+                                    topk_ids_rsrc,
+                                    tk_idx_i32,
+                                    vec_width=1,
+                                    dtype=i32_type(),
                                 )
                                 valid_i32 = buffer_ops.buffer_load(
-                                    expert_mask_rsrc, eid_i32, vec_width=1, dtype=i32_type()
+                                    expert_mask_rsrc,
+                                    eid_i32,
+                                    vec_width=1,
+                                    dtype=i32_type(),
                                 )
                                 mv_ok = valid_i32 != fx.Int32(0)
 

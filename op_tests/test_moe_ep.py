@@ -359,7 +359,6 @@ def test_fmoe_ep(
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
 
 
-
 # ---------------------------------------------------------------------------
 # EP end-to-end with per_1x32 mxfp4 (a8w4 / a4w4) via fused_moe
 # ---------------------------------------------------------------------------
@@ -382,8 +381,9 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 summary_table = []
 
 
-def test_fmoe_ep_mxfp4(quant_label, token, model_dim, inter_dim, E, topk,
-                       shared_E=2, ep=8):
+def test_fmoe_ep_mxfp4(
+    quant_label, token, model_dim, inter_dim, E, topk, shared_E=2, ep=8
+):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}."""
     if get_gfx() not in ["gfx950"]:
@@ -392,7 +392,7 @@ def test_fmoe_ep_mxfp4(quant_label, token, model_dim, inter_dim, E, topk,
 
     ep_id = ep - 1
     expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
-    expert_mask[ep_id * (E // ep): (ep_id + 1) * E // ep] = 1
+    expert_mask[ep_id * (E // ep) : (ep_id + 1) * E // ep] = 1
     local_E = int(torch.sum(expert_mask).item())
     fake_expertid = expert_mask.numel() - 1
     expert_mask[-1] = 0
@@ -425,15 +425,11 @@ def test_fmoe_ep_mxfp4(quant_label, token, model_dim, inter_dim, E, topk,
 
     total_local = local_E + shared_E
     w1 = (
-        torch.randn(
-            (total_local, inter_dim * 2, model_dim), dtype=dtype, device="cuda"
-        )
+        torch.randn((total_local, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
         / 10
     )
     w2 = (
-        torch.randn(
-            (total_local, model_dim, inter_dim), dtype=dtype, device="cuda"
-        )
+        torch.randn((total_local, model_dim, inter_dim), dtype=dtype, device="cuda")
         / 10
     )
 
@@ -453,7 +449,11 @@ def test_fmoe_ep_mxfp4(quant_label, token, model_dim, inter_dim, E, topk,
     w1_deq = _dequant(w1_qt, w1_scale, w1.shape)
     w2_deq = _dequant(w2_qt, w2_scale, w2.shape)
     ref, _ = torch_moe_test(
-        input_, w1_deq, w2_deq, topk_weights, topk_ids,
+        input_,
+        w1_deq,
+        w2_deq,
+        topk_weights,
+        topk_ids,
         expert_mask=expert_mask,
     )
 
@@ -493,19 +493,28 @@ def test_fmoe_ep_mxfp4(quant_label, token, model_dim, inter_dim, E, topk,
         gate_mode = GateMode.SEPARATED.value
     out, us = run_perftest(
         fused_moe,
-        input_, w1_a, w2_a, topk_weights, topk_ids,
+        input_,
+        w1_a,
+        w2_a,
+        topk_weights,
+        topk_ids,
         expert_mask=expert_mask,
         activation=act,
         gate_mode=gate_mode,
         quant_type=QuantType.per_1x32,
-        w1_scale=w1_s, w2_scale=w2_s,
-        num_warmup=3, num_iters=16,
+        w1_scale=w1_s,
+        w2_scale=w2_s,
+        num_warmup=3,
+        num_iters=16,
     )
 
     err = checkAllclose(
-        ref, out, atol=5e-2, rtol=5e-2,
+        ref,
+        out,
+        atol=5e-2,
+        rtol=5e-2,
         msg=f"{quant_label} ep={ep} token={token} model_dim={model_dim} "
-            f"inter_dim={inter_dim} E={E} topk={topk}",
+        f"inter_dim={inter_dim} E={E} topk={topk}",
     )
 
     diff = (ref - out).float()
@@ -515,21 +524,23 @@ def test_fmoe_ep_mxfp4(quant_label, token, model_dim, inter_dim, E, topk,
     rel_mean = (abs_err / (ref.float().abs() + 1e-6)).mean().item()
     logits_diff = _calc_diff(ref, out)
 
-    summary_table.append({
-        "quant": quant_label,
-        "token": token,
-        "model_dim": model_dim,
-        "inter_dim": inter_dim,
-        "E": E,
-        "topk": topk,
-        "ep": ep,
-        "us": round(us, 2),
-        "logits_diff": round(logits_diff, 6),
-        "abs_mean": round(abs_mean, 4),
-        "abs_max": round(abs_max, 4),
-        "rel_mean": round(rel_mean, 4),
-        "checkAllclose_err": err,
-    })
+    summary_table.append(
+        {
+            "quant": quant_label,
+            "token": token,
+            "model_dim": model_dim,
+            "inter_dim": inter_dim,
+            "E": E,
+            "topk": topk,
+            "ep": ep,
+            "us": round(us, 2),
+            "logits_diff": round(logits_diff, 6),
+            "abs_mean": round(abs_mean, 4),
+            "abs_max": round(abs_max, 4),
+            "rel_mean": round(rel_mean, 4),
+            "checkAllclose_err": err,
+        }
+    )
 
 
 parser = argparse.ArgumentParser(
@@ -790,6 +801,7 @@ for test in args.test:
 if summary_table:
     try:
         import pandas as pd
+
         _df = pd.DataFrame(summary_table)
         print("\nmoe_ep_mxfp4 summary (markdown):")
         print(_df.to_markdown(index=False))
