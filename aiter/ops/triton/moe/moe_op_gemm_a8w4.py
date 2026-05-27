@@ -97,7 +97,9 @@ def get_kernel_config_triton(m, n, k, routing_data):
         # routing caps block_m at 128; nw=4 wins ~2x at block_m=128 on gpt-oss
         # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
         num_warps = 4 if block_m == 128 else 8
-    num_stages = pick_gemm_num_stages(arch, block_m, block_n, block_k, 8, 4)
+    num_stages = pick_gemm_num_stages(
+        arch, block_m, block_n, block_k, 8, 4, use_async_padding=True
+    )
 
     ret = {
         "block_m": block_m,
