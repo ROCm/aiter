@@ -491,13 +491,15 @@ def test_fmoe_ep_mxfp4(quant_label, token, model_dim, inter_dim, E, topk,
     else:
         act = ActivationType.Silu
         gate_mode = GateMode.SEPARATED.value
-    out = fused_moe(
+    out, us = run_perftest(
+        fused_moe,
         input_, w1_a, w2_a, topk_weights, topk_ids,
         expert_mask=expert_mask,
         activation=act,
         gate_mode=gate_mode,
         quant_type=QuantType.per_1x32,
         w1_scale=w1_s, w2_scale=w2_s,
+        num_warmup=3, num_iters=16,
     )
 
     err = checkAllclose(
@@ -505,6 +507,13 @@ def test_fmoe_ep_mxfp4(quant_label, token, model_dim, inter_dim, E, topk,
         msg=f"{quant_label} ep={ep} token={token} model_dim={model_dim} "
             f"inter_dim={inter_dim} E={E} topk={topk}",
     )
+
+    diff = (ref - out).float()
+    abs_err = diff.abs()
+    abs_mean = abs_err.mean().item()
+    abs_max = abs_err.max().item()
+    rel_mean = (abs_err / (ref.float().abs() + 1e-6)).mean().item()
+    logits_diff = _calc_diff(ref, out)
 
     summary_table.append({
         "quant": quant_label,
@@ -514,6 +523,7 @@ def test_fmoe_ep_mxfp4(quant_label, token, model_dim, inter_dim, E, topk,
         "E": E,
         "topk": topk,
         "ep": ep,
+        "us": round(us, 2),
         "logits_diff": round(logits_diff, 6),
         "abs_mean": round(abs_mean, 4),
         "abs_max": round(abs_max, 4),
@@ -751,7 +761,7 @@ for test in args.test:
                             idim,
                             args.expert,
                             args.topk,
-                            shared_E=2,
+                            shared_E=0,
                             ep=ep,
                         )
     elif test == "g1u1_fp8smoothquant":

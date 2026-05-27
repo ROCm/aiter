@@ -3647,9 +3647,14 @@ def compile_moe_reduction(
         )
         return ty() if callable(ty) else ty
 
+    module_name = (
+        f"moe_reduction_kernel_{'masked' if use_mask else 'plain'}"
+        f"_{dtype_str}_topk{topk}_md{model_dim}"
+    )
+
     if True:
 
-        @flyc.kernel
+        @flyc.kernel(name=module_name)
         def moe_reduction_kernel(
             X: fx.Tensor,
             Y: fx.Tensor,
