@@ -138,7 +138,8 @@ badc80702  CK-UA: enable Tier-2 LDS page-table cache on decode + fix split-KV bu
 ### aiter side — `jukorhon/unified-attention-ck`
 
 ```
-<next>     unified_attention_ck: bump CK to drop fmha touches unused by UA   [LATEST]
+<next>     unified_attention: cap split-KV at 1 for saturated-CTA prefill (production-shape fix)   [LATEST]
+7aa87cc1e  unified_attention_ck: bump CK to drop fmha touches unused by UA
 c1ebb1249  unified_attention_ck: bump CK to shrink core/arch footprint
 d9c1a7f9e  unified_attention_ck: bump CK for clang<21 inline-asm global_load_lds fallback
 e78240f74  unified_attention_ck: bump CK + add decode regression script
@@ -147,6 +148,157 @@ b63386f0d  unified_attention: bump split-KV target to 4x CUs, cap 128
 278e72ffa  unified_attention_ck: bump CK submodule for block_tables OOB fix
 30458aa15  Add correctness + perf tests for CK unified attention
 b518460f9  Wire CK unified attention kernel into aiter
+```
+
+---
+
+## Production-shape audit (May 2026)
+
+A collaborator captured 640 unified-attention shape records during a
+real model run (`AmirMM_extrapolated 1.jsonl`, gfx950, MI355X). The
+varying axes are only `(batch, max_seqlen_q, max_seqlen_k)`; everything
+else is fixed:
+
+  | param         | value                       |
+  |---------------|-----------------------------|
+  | head_size     | 128                         |
+  | block_size    | 64 (paged-KV page size)     |
+  | Hq, Hkv       | 12, 2 (GQA-6)               |
+  | q/k/v dtype   | float8_e4m3fn (FP8)         |
+  | out dtype     | bfloat16                    |
+  | mask          | causal, no sliding window   |
+  | softcap/alibi/sinks | off                   |
+
+The 640 records split into **448 decode** (Sq=1, Sk ∈ {1, 1000, 5000,
+10000, 50000, 131072, 196608}) and **192 square prefill** (Sq=Sk ∈
+{1000, 5000, 10000}). Batches range over 4..64 + {128, 256, 512}.
+
+`ua-test-scripts/sweep_amir_shapes.py` reduces this to 68
+representative cells (decode batch ladder × every Sk band; prefill
+batch ladder × every length) and feeds each through
+`op_tests/test_unified_attention_ck.py` in single-shape mode with
+`--triton`. `ua-test-scripts/analyze_sweep.py` renders the resulting
+CSV into a Markdown grid.
+
+### Results (post-fix, see heuristic patch below)
+
+**Decode (Sq=1):**
+
+| batch \ Sk |       1 |    1000 |    5000 |   10000 |   50000 |  131072 |  196608 |
+|---|---|---|---|---|---|---|---|
+|    4      |   1.25x |   1.42x |   1.54x |   1.25x |   1.16x |   1.30x |   1.29x |
+|    8      |   1.23x |   1.33x | **0.94x** |   1.03x |   0.95x |   1.23x |   1.26x |
+|   16      |   1.42x |   1.38x | **0.92x** |   1.01x |   0.96x |   1.24x |   1.25x |
+|   32      |   1.26x |   1.20x |   1.13x |   1.08x |   1.21x |   1.26x |   1.27x |
+|   64      |   1.28x |   1.15x |   1.15x |   1.14x |   1.25x |   1.20x |   1.23x |
+|  128      |   1.59x |   1.24x |   1.15x |   1.06x |   1.08x |   1.05x |   1.09x |
+|  256      |   1.44x |   1.37x |   1.12x |   1.06x | **0.93x** |   0.97x |   0.97x |
+|  512      |   1.69x |   0.96x |   1.01x |   1.01x |   1.02x |   1.05x |   1.07x |
+
+Decode aggregates: 48/56 cells (86%) are CK wins. Geomean 1.17×,
+median 1.20×, range 0.92×..1.69×. The handful of CK losses are all
+within 3-8% (sub-noise on individual perftest runs), no systematic
+regime.
+
+**Prefill (Sq=Sk):**
+
+| batch \ Sq=Sk |  1000 |  5000 | 10000 |
+|---|---|---|---|
+|    4          | **0.83x** | **0.70x** | **0.68x** |
+|    8          | **0.75x** | **0.66x** | **0.68x** |
+|   16          | **0.71x** | **0.66x** | **0.68x** |
+|   32          | **0.69x** | **0.66x** | **0.68x** |
+
+Prefill aggregates: 0/12 wins, geomean 0.70× (Triton is ~1.43× faster
+than CK on a typical square-prefill cell). The gap is remarkably
+batch-independent at each Sk band (e.g. 0.66× across all batches at
+Sq=Sk=5000), which points at a per-kernel-MFMA-utilization deficit
+rather than launch overhead or workspace cost — the prefill kernel
+itself needs work, not the wrapper. Two leads for follow-up:
+
+  1. **Q-tile size for irregular GQA**. Triton picks BLOCK_M=128 for
+     these shapes; the CK prefill_d128 tile-tier ladder (kBlockQ ∈
+     {2, 8, 16}) was calibrated for GQA-1 / GQA-4 / GQA-8 and never
+     specifically tuned for GQA-6 (qpkv=6). The "fallback" tier
+     (`kBlockQ = 128 // qpkv = 21`) is what gets selected here, and
+     21 is not a power-of-two — worth checking whether 16 or 32 with
+     a hand-tuned schedule beats it.
+  2. **FP8 prefill MFMA pipeline.** The 0.66×-0.68× plateau across
+     Sk=5000 and Sk=10000 (where the kernel is compute-bound, not
+     KV-bw-bound) is the regime where MFMA throughput dominates. CK's
+     FP8 prefill_d128 was the focus of `06e1a70e7`, `045b1f57b`,
+     `7a319d9a4`, `3431615ff` etc., but those landed primarily on
+     decode-tier instances; the prefill_d128 codegen for irregular
+     GQA may still be leaving MFMA cycles on the table.
+
+### Heuristic fix — split-KV saturation guard for prefill
+
+The pre-fix sweep showed the wrapper's `_pick_num_splits` mispicking
+on two short-prefill cells:
+
+  | shape (production trace)         | splits | CK ms   | Triton ms | speedup |
+  |----------------------------------|--------|---------|-----------|---------|
+  | b=4  sq=sk=1000 d=128 FP8         | **4**  | 0.140   | 0.044     | 0.32x   |
+  | b=8  sq=sk=1000 d=128 FP8         | **2**  | 0.160   | 0.068     | 0.41x   |
+
+The 4x-CU oversubscription rule was calibrated for decode (small
+total_q, base_ctas ≪ num_cus, sk dominates per-CTA work). On these
+shapes total_q is already 4000 / 8000 → q-tiles alone produce 500 /
+1000 CTAs at kBlockQ=16, comfortably above the 256-CU device count.
+Splitting K then just multiplies the combine kernel's per-(token,head)
+fan-in + the workspace alloc cost without buying useful parallelism.
+
+The fix adds one predicate at the top of `_pick_num_splits` in
+`aiter/aiter/ops/unified_attention.py`:
+
+```python
+# Prefill-regime saturation guard.
+if avg_q > 8 and base_ctas >= num_cus:
+    return 1
+```
+
+`avg_q > 8` selects the "prefill or chunked prefill" regime (the
+kBlockQ-ladder boundary above the largest decode tier). `base_ctas >=
+num_cus` checks that q-tiles alone already saturate the device.
+Decode is bit-identical (`avg_q == 1` keeps the predicate false on
+every batch). Chunked prefill is also bit-identical (small avg_q on
+top of long sk keeps `base_ctas < num_cus`, so the predicate stays
+false and the K-split oversubscription still happens, which is what
+keeps long-context decode at full bandwidth).
+
+**Measured impact on the two affected shapes (post-fix sweep):**
+
+  | shape                            | splits old→new | CK ms old→new | speedup old→new |
+  |----------------------------------|---------------|---------------|-----------------|
+  | b=4  sq=sk=1000 d=128 FP8         | 4 → 1         | 0.140 → 0.053 | 0.34x → 0.83x  |
+  | b=8  sq=sk=1000 d=128 FP8         | 2 → 1         | 0.160 → 0.086 | 0.42x → 0.75x  |
+
+Both shapes still PASS correctness vs the torch reference. The
+remaining 0.83x / 0.75x is the kernel-side prefill gap discussed
+above, not the heuristic.
+
+No other cell in the 68-cell sweep shifted by more than perftest's
+run-to-run noise (the `splits pre→post` column in the post-fix
+analysis was identical for every decode cell; the residual ±5-15%
+shifts shown on those rows are kernel-side measurement variance, not
+heuristic-driven).
+
+### Reproducing the sweep
+
+```bash
+# Full 68-cell sweep, ~5 min on a single MI355X.
+ua-test-scripts/sweep_amir_shapes.py --gpu 2
+
+# Smaller 13-cell smoke pass.
+ua-test-scripts/sweep_amir_shapes.py --quick --gpu 2
+
+# Render the result CSV into a Markdown grid.
+ua-test-scripts/analyze_sweep.py --csv ua-test-scripts/sweep_amir_shapes.csv
+
+# Before/after comparison.
+ua-test-scripts/analyze_sweep.py \
+    --pre  ua-test-scripts/sweep_amir_shapes.csv \
+    --post ua-test-scripts/sweep_amir_shapes_postfix.csv
 ```
 
 ---
