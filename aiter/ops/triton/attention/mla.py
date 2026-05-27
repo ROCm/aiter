@@ -91,7 +91,6 @@ def select_3d_config(
             attn_warps = 2
             waves_per_eu = 1
 
-    num_segments = 1
     TILE_SIZE = block_size
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
