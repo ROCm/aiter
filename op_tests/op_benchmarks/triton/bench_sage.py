@@ -31,6 +31,12 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
+from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_mixed_wrapper import (
+    fav3_sage_mxfp4_mixed_func,
+    fav3_sage_mxfp4_mixed_wrapper,
+    get_sage_fwd_configs_mxfp4_mixed,
+    _quantize_to_mixed,
+)
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
@@ -61,6 +67,7 @@ arg_to_torch_dtype = {
 KernelName = Literal[
     "sage_fp8",
     "sage_mxfp4",
+    "sage_mxfp4_mixed",
     "fav3_fp8",
     "aiter_fp8",
     "aiter_bf16",
@@ -69,6 +76,7 @@ KernelName = Literal[
 ALL_KERNELS: List[str] = [
     "sage_fp8",
     "sage_mxfp4",
+    "sage_mxfp4_mixed",
     "fav3_fp8",
     "aiter_fp8",
     "aiter_bf16",
@@ -220,6 +228,8 @@ def load_block_mask_from_json(
 def kernel_block_sizes(kernel: KernelName) -> Tuple[int, int]:
     if kernel == "sage_mxfp4":
         cfg = get_sage_fwd_configs_mxfp4()
+    elif kernel == "sage_mxfp4_mixed":
+        cfg = get_sage_fwd_configs_mxfp4_mixed()
     else:
         cfg = get_sage_fwd_configs()
     return cfg["BLOCK_M"], cfg["BLOCK_N"]
@@ -466,6 +476,7 @@ def make_kernel_runner(
     k: torch.Tensor,
     v: torch.Tensor,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    block_attn_mask: Optional[torch.Tensor] = None,
 ) -> Any:
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
@@ -585,6 +596,95 @@ def make_kernel_runner(
             lut_start=lut_s,
             lut_count=lut_c,
             use_block_sparse=sparse,
+        )
+
+    if args.kernel == "sage_mxfp4_mixed":
+        block_r = args.block_r
+        if block_r > q.shape[-1]:
+            raise ValueError(f"block_r ({block_r}) must be <= head dim ({q.shape[-1]})")
+
+        r = create_hadamard_matrix(block_r, device=q.device, dtype=q.dtype) / (
+            block_r**0.5
+        )
+
+        # In mixed mode, the block LUT identifies HIGH-precision blocks. The
+        # rest are LOW-precision (mxfp4). We need both the HP LUT and its
+        # complement (LP LUT). When no mask was supplied (dense mode), default
+        # to all HP (matches int8 dense behaviour for sparsity=0).
+        shape = infer_shape_spec(q, v, args.layout)
+        block_m, block_n = kernel_block_sizes(args.kernel)
+        num_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
+        num_kv_blocks = (shape.n_ctx_k + block_n - 1) // block_n
+
+        if block_attn_mask is None:
+            block_attn_mask = torch.ones(
+                shape.batch,
+                shape.hq,
+                num_q_blocks,
+                num_kv_blocks,
+                dtype=torch.bool,
+                device=q.device,
+            )
+        hp_mask = block_attn_mask
+        lp_mask = ~hp_mask
+        hp_block_lut = block_attn_mask_to_ragged_lut(hp_mask)
+        lp_block_lut = block_attn_mask_to_ragged_lut(lp_mask)
+
+        if args.e2e:
+            return lambda: fav3_sage_mxfp4_mixed_wrapper(
+                q,
+                k,
+                v,
+                layout=args.layout,
+                q_smooth=args.qsmooth,
+                R=r,
+                BLOCK_R=block_r,
+                hp_block_lut=hp_block_lut,
+                lp_block_lut=lp_block_lut,
+            )
+
+        cfg = get_sage_fwd_configs_mxfp4_mixed()
+        (
+            q_int8,
+            q_descale_int8,
+            k_int8,
+            k_descale_int8,
+            q_fp4,
+            q_descale_fp4,
+            k_fp4,
+            k_descale_fp4,
+            v_fp8,
+            v_descale,
+            delta_s,
+        ) = _quantize_to_mixed(
+            q,
+            k,
+            v,
+            BLKQ=cfg["BLOCK_M"],
+            BLKK=cfg["BLOCK_N"],
+            R=r,
+            BLOCK_R=block_r,
+            q_smoothing=args.qsmooth,
+            layout=args.layout,
+            sm_scale=q.shape[-1] ** -0.5,
+        )
+
+        return lambda: fav3_sage_mxfp4_mixed_func(
+            q_int8=q_int8,
+            q_fp4=q_fp4,
+            k_int8=k_int8,
+            k_fp4=k_fp4,
+            v_fp8=v_fp8,
+            q_descale_int8=q_descale_int8,
+            q_descale_fp4=q_descale_fp4,
+            k_descale_int8=k_descale_int8,
+            k_descale_fp4=k_descale_fp4,
+            v_descale=v_descale,
+            bias=delta_s,
+            layout=args.layout,
+            config=cfg,
+            hp_block_lut=hp_block_lut,
+            lp_block_lut=lp_block_lut,
         )
 
     if args.kernel == "aiter_bf16":
@@ -730,7 +830,9 @@ def benchmark_single_case(
         else None
     )
 
-    fn = make_kernel_runner(args, q, k, v, block_lut=block_lut)
+    fn = make_kernel_runner(
+        args, q, k, v, block_lut=block_lut, block_attn_mask=block_attn_mask
+    )
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
     if args.compare_to_ref:
@@ -738,7 +840,7 @@ def benchmark_single_case(
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
         compare_accuracy(current_primary, ref_primary)
-        if args.kernel == "sage_mxfp4":
+        if args.kernel in ("sage_mxfp4", "sage_mxfp4_mixed"):
             # MXFP4 is numerically noisier than BF16/FP32 and needs looser checks.
             check_attention_outputs(
                 current_primary, ref_primary, fp8=True, atol=3.0e-1, rtol=2.0e-1
@@ -755,7 +857,13 @@ def benchmark_single_case(
         * (shape.d_head + shape.d_head_v)
     )
 
-    if args.kernel in ("fav3_fp8", "aiter_fp8", "sage_fp8", "sage_mxfp4"):
+    if args.kernel in (
+        "fav3_fp8",
+        "aiter_fp8",
+        "sage_fp8",
+        "sage_mxfp4",
+        "sage_mxfp4_mixed",
+    ):
         q_elem_size = 1
         k_elem_size = 1
     else:
@@ -951,15 +1059,23 @@ def validate_args(args: argparse.Namespace) -> None:
         if args.load_captured:
             raise ValueError("--kernel=all does not support --load-captured")
 
-    _quantized_kernels = ("sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8")
+    _quantized_kernels = (
+        "sage_fp8",
+        "sage_mxfp4",
+        "sage_mxfp4_mixed",
+        "fav3_fp8",
+        "aiter_fp8",
+    )
 
     if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
 
-    if args.kernel not in ("sage_mxfp4", "all") and (
+    if args.kernel not in ("sage_mxfp4", "sage_mxfp4_mixed", "all") and (
         args.qsmooth or args.hadamard_rotate is False
     ):
-        logger.warning("MXFP4-specific flags are ignored unless --kernel=sage_mxfp4")
+        logger.warning(
+            "MXFP4-specific flags are ignored unless --kernel=sage_mxfp4 or sage_mxfp4_mixed"
+        )
 
 
 def run_benchmark_generated(
@@ -1110,7 +1226,9 @@ def run_block_sparse_repetitions(
         > args.block_sparsity
     ).to(torch.bool)
     warmup_lut = block_attn_mask_to_ragged_lut(warmup_mask, return_none_if_dense=True)
-    fn_warmup = make_kernel_runner(args, q, k, v, block_lut=warmup_lut)
+    fn_warmup = make_kernel_runner(
+        args, q, k, v, block_lut=warmup_lut, block_attn_mask=warmup_mask
+    )
     triton.testing.do_bench(fn_warmup, warmup=args.warmup, rep=args.rep)
 
     total_flops = (
@@ -1135,7 +1253,7 @@ def run_block_sparse_repetitions(
         ).to(torch.bool)
         lut = block_attn_mask_to_ragged_lut(mask, return_none_if_dense=True)
 
-        fn = make_kernel_runner(args, q, k, v, block_lut=lut)
+        fn = make_kernel_runner(args, q, k, v, block_lut=lut, block_attn_mask=mask)
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         latencies_ms.append(ms)
 
@@ -1249,6 +1367,7 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "sage_fp8",
             "sage_mxfp4",
+            "sage_mxfp4_mixed",
             "fav3_fp8",
             "aiter_fp8",
             "aiter_bf16",
