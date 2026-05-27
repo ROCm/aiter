@@ -744,18 +744,24 @@ def flydsl_moe_stage1(
     _gui_sk_fused = _gui_sk and _fuse_any_quant
 
     if out is None:
+        # Kernel grid skips padded N tiles, so padded columns retain whatever
+        # was in the buffer; e8m0 byte 0xFF would decode to NaN and propagate
+        # into stage2 via atomicAdd. Zero-init when there is padding.
+        _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
         if _need_fp4 or (_gui_sk_fused and _need_fp4):
-            out = torch.empty(
+            out = _alloc(
                 (token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
             )
         elif _need_fp8 or (_gui_sk_fused and _need_fp8):
-            out = torch.empty(
+            out = _alloc(
                 (token_num, topk, inter_dim), dtype=dtypes.fp8, device=dev
             )
         else:
-            out = torch.empty(
+            out = _alloc(
                 (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
             )
+    elif inter_dim_pad > 0:
+        out.zero_()
 
     if _is_splitk:
         torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
@@ -797,8 +803,9 @@ def flydsl_moe_stage1(
     )
     padded_rows = (sorted_size + 255) // 256 * 256
     padded_cols = (scale_cols + 7) // 8 * 8
+    _scale_alloc = torch.zeros if (inter_dim_pad > 0) else torch.empty
     out_scale_sorted_flat = (
-        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
+        _scale_alloc(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
         if _need_sort
         else torch.empty(0, dtype=torch.uint8, device=dev)
     )
@@ -1067,6 +1074,10 @@ def flydsl_moe_stage2(
         out = alloc_fn(
             (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
         )
+    elif accumulate:
+        # atomic-accumulate kernel needs zero starting buffer; callers (e.g.
+        # moe_sorting) hand in torch.empty() buffers.
+        out.zero_()
 
     dev = inter_states.device
     flat_a_scale = (
