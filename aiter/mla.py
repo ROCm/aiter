@@ -405,14 +405,10 @@ def mla_decode_fwd(
                 and kv_buffer.dtype == dtypes.fp8
                 and (
                     (max_seqlen_q * (ori_nhead // 16) == 4)
-                    or (ori_nhead == 64 and max_seqlen_q == 2)
                 )
             )
 
-            if use_qseqlen_fold and (ori_nhead == 64 and max_seqlen_q == 2):
-                fold_factor = ori_nhead // 32
-                nhead = 32
-            else:
+            if use_qseqlen_fold
                 fold_factor = ori_nhead // 16
                 nhead = 16
 
