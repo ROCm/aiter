@@ -60,6 +60,8 @@ class OpusGemmInstance:
             parts.append(f"wgpcu{self.WG_PER_CU}")
         elif self.kernel_tag == "a16w16_persistent":
             parts.insert(1, "persistent")
+        elif self.kernel_tag == "a16w16_mono_tile":
+            parts.insert(1, "mono_tile")
         if not self.has_oob:
             parts.append("nooob")
         # Legacy cache policy = traits default for split-barrier &
@@ -410,6 +412,64 @@ a16w16_persistent_kernels_list_cpol_nooob = {
     for kid, inst in a16w16_persistent_kernels_list_cpol.items()
 }
 
+# ── a16w16 mono-tile (single-MMA-per-K-iter, 8 waves) ─────────────────────
+#
+# Pipeline:
+#   csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh
+# Traits:
+#   csrc/opus_gemm/include/gfx950/opus_gemm_traits_a16w16_gfx950.cuh
+#   :: opus_gemm_a16w16_mono_tile_traits_gfx950
+#
+# Locks: BLOCK_SIZE=512, T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32 (MFMA
+# 16x16x32 BF16), VEC=8. Single v_c accumulator over the full B_M x B_N
+# tile per K iter (no quad-subtile, no split barrier). Intrinsically
+# non-OOB (launcher enforces M%B_M==N%B_N==K%B_K==0) and HAS_BIAS=false
+# (launcher rejects non-empty bias up front). No splitK.
+#
+# B_M ≤ 192 hard cap. The 7 tiles below were picked to cover
+# (M-bucket × N-bucket) combinations not already served well by the
+# persistent / splitk families.
+
+
+def _a16w16_mono_tile(bm, bn, bk):
+    vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
+    return OpusGemmInstance(
+        512,         # BLOCK_SIZE (8 waves * 64)
+        bm, bn, bk,  # BLOCK
+        2, 4,        # T_M, T_N
+        16, 16, 32,  # W_M, W_N, W_K  (MFMA 16x16x32)
+        vec, vec, vec,  # VEC_A=VEC_B=VEC_C=8
+        0, 0, 0,     # GROUP (unused)
+        "a16w16_mono_tile",
+        ["bf16_t", "fp32_t"],
+        has_oob=False,
+    )
+
+
+# 5 mono-tile tiles, kids 1400..1404. Kid range deliberately starts at
+# 1400 (above the persistent +1000 nooob mirror range that ends at 1323)
+# and below the next reserved family slot. No "base/nooob" mirror split:
+# mono-tile is non-OOB by construction, so kids land in the >=1000 band
+# the way other families' nooob mirrors do.
+#
+# B_K=128 tiles (e.g. (64,256,128), (128,128,128)) are intentionally
+# excluded: the pipeline uses 2x smem_a + 3x smem_b (A double-buffered,
+# B triple-buffered as r0/r1/w), which pushes those tiles to 165-231 KiB
+# of LDS -- over gfx950's 160 KiB budget. Re-enable only after the
+# pipeline drops B to two slots.
+_MONO_TILE_TILES = [
+    # (B_M, B_N, B_K)
+    (192, 256, 64),   # 1400
+    (128, 256, 64),   # 1401
+    (192, 128, 64),   # 1402
+    (128, 128, 64),   # 1403
+    ( 64, 128, 64),   # 1404
+]
+a16w16_mono_tile_kernels_list = {
+    1400 + i: _a16w16_mono_tile(bm, bn, bk)
+    for i, (bm, bn, bk) in enumerate(_MONO_TILE_TILES)
+}
+
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
     **a8w8_scale_kernels_list,
@@ -425,6 +485,7 @@ kernels_list = {
     **a16w16_persistent_kernels_list_cpol,
     **a16w16_persistent_kernels_list_nooob,
     **a16w16_persistent_kernels_list_cpol_nooob,
+    **a16w16_mono_tile_kernels_list,
 }
 
 default_kernels_dict = {
@@ -465,6 +526,7 @@ NON_SPLITK_KIDS = (
     | frozenset(a16w16_persistent_kernels_list_cpol.keys())
     | frozenset(a16w16_persistent_kernels_list_nooob.keys())
     | frozenset(a16w16_persistent_kernels_list_cpol_nooob.keys())
+    | frozenset(a16w16_mono_tile_kernels_list.keys())
 )
 
 # Bias-aware kids: split-barrier (4..9 + cpol/nooob mirrors) and the entire

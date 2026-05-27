@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Traits for a16w16 (bf16) pipelines. This header carries two independent
-// traits structs and two kargs structs:
+// Traits for a16w16 (bf16) pipelines. This header carries the traits and
+// kargs structs for every a16w16 pipeline family on gfx950:
 //
 //   opus_gemm_a16w16_traits_gfx950<..., TILE, WAVE, HAS_BIAS=false, D_BIAS=void>
 //     Split-barrier pipeline used by opus_gemm_pipeline_a16w16_gfx950.cuh.
@@ -17,6 +17,19 @@
 //     opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh. Derives prefetch depth dynamically
 //     from the LDS budget. Locked T_M=2/T_N=1/T_K=1. 5-tuple DTYPE.
 //     Ported from gcnasm/opus_fmm/flatmm_a16w16_4wave_wasp.cc.
+//
+//   opus_flatmm_splitk_traits_gfx950<..., MFMA, WG_PER_CU, HAS_BIAS, HAS_OOB>
+//     Split-K variant of the flatmm pipeline. Main kernel writes fp32
+//     workspace; a reduce kernel sums splits + casts to bf16 C.
+//
+//   opus_gemm_a16w16_persistent_traits_gfx950<..., TILE, WAVE, HAS_OOB,
+//                                              CACHECTL_A, CACHECTL_B>
+//     M-outer + N-fast XCD swizzle persistent pipeline.
+//
+//   opus_gemm_a16w16_mono_tile_traits_gfx950<..., DTYPE, VEC>
+//     Single-MMA-per-K mono-tile pipeline. Locked geometry (T_M=2, T_N=4,
+//     T_K=1, W=16x16x32, VEC=8, BLOCK_SIZE=512). Divisible-only; no HAS_BIAS
+//     / HAS_OOB template parameters.
 #pragma once
 
 #include "../opus_gemm_utils.cuh"
@@ -608,5 +621,159 @@ struct opus_gemm_flatmm_splitk_kargs_gfx950 {
     int stride_ws_batch;                    // = padded_M * padded_N
     int stride_c_batch;                     // = M * N
     int stride_bias_batch;                  // 0 (broadcast [N]) or N ([batch, N])
+};
+#endif
+
+// ============================================================================
+// Mono-tile a16w16 traits (single MMA across the full B_M x B_N tile per K)
+// ============================================================================
+//
+// Pipeline: opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh.
+//
+// Locked geometry, derived in the kernel itself:
+//   * T_M = 2, T_N = 4, T_K = 1  -> 8 waves / WG -> BLOCK_SIZE = 8 * 64 = 512.
+//   * W_M = 16, W_N = 16, W_K = 32 (MFMA 16x16x32 BF16).
+//   * VEC_A = VEC_B = VEC_C = 8.
+//
+// Constraints (mirror the kernel-internal static_asserts in
+// gemm_a16w16_mono_tile_kernel_template.hpp; static_asserts here surface
+// invalid tiles at traits instantiation):
+//   * BLOCK_SIZE == 512 (T_M * T_N * T_K * warp_size = 2 * 4 * 1 * 64).
+//   * B_M % (W_M * T_M) == 0  ->  B_M % 32 == 0.
+//   * B_N % (W_N * T_N) == 0  ->  B_N % 64 == 0.
+//   * B_K % (W_K * T_K) == 0  ->  B_K % 32 == 0.
+//   * smem_linear_wave / B_K must divide evenly (B_K must divide 512).
+//   * smem_m_rep = B_M / smem_sub must be >= 8 and divisible by 8 (num_waves).
+//   * smem_n_rep = B_N / smem_sub must be >= 8 and divisible by 8.
+//   * E_N = B_N / (W_N * T_N) must be divisible by (T_N / T_M) = 2.
+//   * ra layout requires (smem_sub / (W_M / T_N)) to divide E_M evenly.
+//   * D_A == D_B; D_A locked to bf16_t in current instances.
+//   * D_C in { bf16_t, fp32_t }.
+//
+// No HAS_BIAS / HAS_OOB / CACHECTL template parameters: the mono-tile
+// launcher rejects non-empty bias up front and is only instantiated for
+// tile-aligned shapes (the launcher enforces M%B_M==N%B_N==K%B_K==0).
+
+template<int BLOCK_SIZE_,
+        typename BLOCK_,
+        typename DTYPE_,
+        typename VEC_>
+struct opus_gemm_a16w16_mono_tile_traits_gfx950 {
+    using BLOCK = opus::remove_cvref_t<BLOCK_>;
+    using DTYPE = opus::remove_cvref_t<DTYPE_>;
+    using VEC   = opus::remove_cvref_t<VEC_>;
+
+    static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
+
+    static constexpr int B_M = opus::get<0>(BLOCK{});
+    static constexpr int B_N = opus::get<1>(BLOCK{});
+    static constexpr int B_K = opus::get<2>(BLOCK{});
+
+    using D_A   = opus::tuple_element_t<0, DTYPE>;
+    using D_B   = opus::tuple_element_t<1, DTYPE>;
+    using D_C   = opus::tuple_element_t<2, DTYPE>;
+    using D_ACC = opus::tuple_element_t<3, DTYPE>;
+    static_assert(std::is_same<D_A, D_B>::value,
+                  "mono_tile requires D_A == D_B");
+
+    static constexpr int VEC_A = opus::get<0>(VEC{});
+    static constexpr int VEC_B = opus::get<1>(VEC{});
+    static constexpr int VEC_C = opus::get<2>(VEC{});
+
+    // ── Locked tile/wave geometry (kernel-internal constants) ──
+    static constexpr int T_M = 2;
+    static constexpr int T_N = 4;
+    static constexpr int T_K = 1;
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 32;
+
+    // BLOCK_SIZE = (T_M * T_N * T_K) * warp_size = 8 * 64 = 512.
+    static_assert(BLOCK_SIZE == 512,
+                  "mono_tile requires BLOCK_SIZE = 512 (8 waves * 64 lanes)");
+
+    // ── Locked vector widths ──
+    static_assert(VEC_A == 8 && VEC_B == 8 && VEC_C == 8,
+                  "mono_tile requires VEC_A = VEC_B = VEC_C = 8");
+    static_assert(VEC_A == 16 / sizeof(D_A),
+                  "mono_tile VEC_A must equal 16 / sizeof(D_A) (= 8 for bf16)");
+
+    // ── Block tile divisibility ──
+    static_assert(B_M % (W_M * T_M) == 0,
+                  "mono_tile requires B_M divisible by W_M * T_M = 32");
+    static_assert(B_N % (W_N * T_N) == 0,
+                  "mono_tile requires B_N divisible by W_N * T_N = 64");
+    static_assert(B_K % (W_K * T_K) == 0,
+                  "mono_tile requires B_K divisible by W_K * T_K = 32");
+
+    // ── Derived MMA repeat counts ──
+    static constexpr int E_M = B_M / (W_M * T_M);
+    static constexpr int E_N = B_N / (W_N * T_N);
+    static constexpr int E_K = B_K / (W_K * T_K);
+
+    // E_N must be divisible by (T_N / T_M) for the rb layout grouping.
+    static_assert((E_N * T_M) % T_N == 0,
+                  "mono_tile requires E_N divisible by (T_N / T_M) = 2 "
+                  "-> B_N % 128 == 0 with the locked T_M=2,T_N=4 geometry");
+
+    // ── LDS layout ──
+    static constexpr int smem_linear_wave = 64 * 16 / sizeof(D_A); // 512 for bf16
+    static_assert(smem_linear_wave % B_K == 0,
+                  "mono_tile requires B_K to divide smem_linear_wave (=512 for bf16)");
+    static constexpr int smem_sub = smem_linear_wave / B_K;
+    static constexpr int smem_m_rep = B_M / smem_sub;
+    static constexpr int smem_n_rep = B_N / smem_sub;
+    static constexpr int smem_padding = 2 * 16 / sizeof(D_A);
+
+    static constexpr int num_waves = BLOCK_SIZE / 64;  // 8
+    static_assert(B_M % smem_sub == 0,
+                  "mono_tile: B_M / smem_sub must be integer (smem_m_rep)");
+    static_assert(B_N % smem_sub == 0,
+                  "mono_tile: B_N / smem_sub must be integer (smem_n_rep)");
+    static_assert(smem_m_rep >= num_waves && (smem_m_rep % num_waves) == 0,
+                  "mono_tile: smem_m_rep must be >= 8 and divisible by 8 (num_waves)");
+    static_assert(smem_n_rep >= num_waves && (smem_n_rep % num_waves) == 0,
+                  "mono_tile: smem_n_rep must be >= 8 and divisible by 8 (num_waves)");
+
+    // ra layout: smem_sub_e_m = smem_sub / (W_M / T_N) ; E_M must divide cleanly.
+    static_assert((W_M % T_N) == 0,
+                  "mono_tile: W_M must be divisible by T_N (W_M=16, T_N=4)");
+    static constexpr int smem_sub_e_m = smem_sub / (W_M / T_N);
+    static_assert(smem_sub_e_m > 0 && (E_M % smem_sub_e_m) == 0,
+                  "mono_tile: E_M must be divisible by smem_sub / (W_M/T_N)");
+
+    // ── Buffer / ds_read instruction counts (mirror kernel_traits<UT> in the
+    //    upstream template; recomputed here so codegen can sanity-print). ──
+    static constexpr int a_buffer_load_insts = B_M * B_K / (BLOCK_SIZE * VEC_A);
+    static constexpr int b_buffer_load_insts = B_N * B_K / (BLOCK_SIZE * VEC_B);
+    static constexpr int a_ds_read_insts = (E_M * E_K * W_M * W_K) / (64 * VEC_A);
+    static constexpr int b_ds_read_insts = (E_N * E_K * W_N * W_K) / (64 * VEC_B);
+};
+
+#ifndef OPUS_GEMM_MONO_TILE_KARGS_GFX950_DEFINED
+#define OPUS_GEMM_MONO_TILE_KARGS_GFX950_DEFINED
+// Kernel arguments for the a16w16 mono-tile pipeline.
+//
+// Mirrors `opus_gemm_kargs` from the upstream standalone reference
+// (yk_gcn/opus_gemm/bf16_gemm/gemm_defs.h). The kernel template casts
+// ptr_a, ptr_b, ptr_c to the traits-typed pointers internally.
+//
+// No bias / no splitK / no workspace fields: mono-tile is intrinsically
+// non-OOB (launcher enforces M%B_M==N%B_N==K%B_K==0) and the launcher
+// rejects any non-empty bias up front.
+struct opus_gemm_mono_tile_kargs_gfx950 {
+    const void* __restrict__ ptr_a;
+    const void* __restrict__ ptr_b;
+    void* __restrict__ ptr_c;
+    int m;
+    int n;
+    int k;
+    int batch;
+    int stride_a;
+    int stride_b;
+    int stride_c;
+    int stride_a_batch;
+    int stride_b_batch;
+    int stride_c_batch;
 };
 #endif

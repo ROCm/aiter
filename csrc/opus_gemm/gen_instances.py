@@ -17,6 +17,7 @@ from opus_gemm_common import (
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
     a16w16_kernels_list,
+    a16w16_mono_tile_kernels_list,
     default_kernels_dict,
     kernels_list,
 )
@@ -28,6 +29,7 @@ PIPELINE_HEADER_MAP = {
     "a16w16_flatmm": "gfx950/opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh",
+    "a16w16_mono_tile": "gfx950/opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh",
 }
 
 # Traits header carries the traits struct + kargs struct definitions for a
@@ -44,6 +46,7 @@ TRAITS_HEADER_MAP = {
     "a16w16_flatmm": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a16w16_mono_tile": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
 }
 
 # Splitk reduce kernel is shared infrastructure used by every
@@ -59,6 +62,7 @@ KERNEL_FUNC_MAP = {
     "a16w16_flatmm": "gemm_a16w16_flatmm_kernel",
     "a16w16_flatmm_splitk": "gemm_a16w16_flatmm_splitk_kernel",
     "a16w16_persistent": "gemm_a16w16_persistent_kernel",
+    "a16w16_mono_tile": "gemm_a16w16_mono_tile_kernel_gfx950",
 }
 
 INPUT_DTYPE_MAP = {
@@ -68,6 +72,7 @@ INPUT_DTYPE_MAP = {
     "a16w16_flatmm": ("bf16_t", "bf16_t"),
     "a16w16_flatmm_splitk": ("bf16_t", "bf16_t"),
     "a16w16_persistent": ("bf16_t", "bf16_t"),
+    "a16w16_mono_tile": ("bf16_t", "bf16_t"),
 }
 
 # Tags whose launchers take 3 torch tensors (XQ, WQ, Y) + int splitK. Splitk
@@ -79,6 +84,7 @@ NOSCALE_TAGS = {
     "a16w16_flatmm",
     "a16w16_flatmm_splitk",
     "a16w16_persistent",
+    "a16w16_mono_tile",
 }
 
 # a16w16-family tags whose launchers land in opus_gemm_a16w16_tune_lookup.h
@@ -90,6 +96,7 @@ A16W16_TUNE_TAGS = {
     "a16w16_flatmm",
     "a16w16_flatmm_splitk",
     "a16w16_persistent",
+    "a16w16_mono_tile",
 }
 
 TRAITS_NAME_MAP = {
@@ -99,6 +106,7 @@ TRAITS_NAME_MAP = {
     "a16w16_flatmm": "opus_gemm_a16w16_flatmm_traits_gfx950",
     "a16w16_flatmm_splitk": "opus_flatmm_splitk_traits_gfx950",
     "a16w16_persistent": "opus_gemm_a16w16_persistent_traits_gfx950",
+    "a16w16_mono_tile": "opus_gemm_a16w16_mono_tile_traits_gfx950",
 }
 
 KARGS_NAME_MAP = {
@@ -108,6 +116,7 @@ KARGS_NAME_MAP = {
     "a16w16_flatmm": "opus_gemm_flatmm_kargs_gfx950",
     "a16w16_flatmm_splitk": "opus_gemm_flatmm_splitk_kargs_gfx950",
     "a16w16_persistent": "opus_gemm_persistent_kargs_gfx950",
+    "a16w16_mono_tile": "opus_gemm_mono_tile_kargs_gfx950",
 }
 
 WARP_SIZE = 64
@@ -119,6 +128,9 @@ VALID_FLATMM_SPLITK_MFMA = {(16, 16, 32)}
 # Persistent pipeline ports the mouter reference which only validated
 # 16x16x32 BF16 MFMA. Add 32x32x16 later if needed.
 VALID_PERSISTENT_MFMA = {(16, 16, 32)}
+# Mono-tile pipeline: same MFMA lock as persistent (16x16x32 BF16) — the
+# kernel template hard-codes T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32.
+VALID_MONO_TILE_MFMA = {(16, 16, 32)}
 
 
 class opus_gemm_codegen:
@@ -560,6 +572,154 @@ class opus_gemm_codegen:
         # any are added in the future) keep working consistently.
         return opus_gemm_codegen._validate_a16w16(k)
 
+    @staticmethod
+    def _validate_a16w16_mono_tile(k: OpusGemmInstance):
+        """Validate an a16w16 mono-tile instance.
+
+        Mirrors the static_asserts in opus_gemm_a16w16_mono_tile_traits_gfx950
+        and the kernel-internal constraints in the mono-tile pipeline header.
+        Mono-tile locks T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32 (MFMA
+        16x16x32 BF16), VEC=8, BLOCK_SIZE=512 (8 waves * 64 lanes); the
+        tile must satisfy:
+          * B_M divisible by W_M*T_M = 32
+          * B_N divisible by W_N*T_N = 64
+          * B_K divisible by W_K*T_K = 32
+          * B_K divides smem_linear_wave = 512 (bf16)
+          * smem_m_rep = B_M / smem_sub >= 8 and divisible by 8 (num_waves)
+          * smem_n_rep = B_N / smem_sub >= 8 and divisible by 8
+          * E_N = B_N / (W_N*T_N) divisible by (T_N/T_M) = 2  ->  B_N % 128 == 0
+          * E_M divisible by smem_sub / (W_M/T_N)
+        Plus a user-imposed B_M ≤ 192 cap.
+        """
+        errors = []
+        sizeof_da = 2  # bf16 locked
+
+        # ── Locked config ──
+        if k.BLOCK_SIZE != 512:
+            errors.append(
+                f"BLOCK_SIZE={k.BLOCK_SIZE} must be 512 (mono-tile 8-wave WG)"
+            )
+        if k.T_M != 2:
+            errors.append(f"T_M={k.T_M} must be 2 (mono-tile locked)")
+        if k.T_N != 4:
+            errors.append(f"T_N={k.T_N} must be 4 (mono-tile locked)")
+        if (k.W_M, k.W_N, k.W_K) not in VALID_MONO_TILE_MFMA:
+            errors.append(
+                f"WAVE=({k.W_M},{k.W_N},{k.W_K}) not in {VALID_MONO_TILE_MFMA}"
+            )
+
+        # ── VEC ──
+        expected_vec = 16 // sizeof_da  # 8 for bf16
+        if (
+            k.VEC_A != expected_vec
+            or k.VEC_B != expected_vec
+            or k.VEC_C != expected_vec
+        ):
+            errors.append(
+                f"VEC=({k.VEC_A},{k.VEC_B},{k.VEC_C}) must all be {expected_vec}"
+            )
+
+        # ── User cap: B_M ≤ 192 ──
+        if k.B_M > 192:
+            errors.append(f"B_M={k.B_M} exceeds mono-tile cap of 192")
+
+        # ── Mono-tile must be non-OOB (intrinsic; launcher rejects unaligned) ──
+        if k.has_oob:
+            errors.append("mono-tile is intrinsically non-OOB; has_oob must be False")
+
+        # ── Block tile divisibility ──
+        if k.B_M % (k.W_M * k.T_M) != 0:
+            errors.append(f"B_M={k.B_M} not div by W_M*T_M={k.W_M * k.T_M}")
+        if k.B_N % (k.W_N * k.T_N) != 0:
+            errors.append(f"B_N={k.B_N} not div by W_N*T_N={k.W_N * k.T_N}")
+        if k.B_K % (k.W_K * 1) != 0:
+            errors.append(f"B_K={k.B_K} not div by W_K*T_K={k.W_K}")
+
+        E_M = k.B_M // (k.W_M * k.T_M) if (k.W_M * k.T_M) else 0
+        E_N = k.B_N // (k.W_N * k.T_N) if (k.W_N * k.T_N) else 0
+        E_K = k.B_K // k.W_K if k.W_K else 0
+
+        # ── E_N divisibility (rb layout grouping by T_N/T_M = 2) ──
+        if k.T_M and (E_N * k.T_M) % k.T_N != 0:
+            errors.append(
+                f"E_N={E_N} not div by T_N/T_M={k.T_N // k.T_M} "
+                f"(mono-tile rb layout grouping; needs B_N % 128 == 0)"
+            )
+
+        # ── LDS layout ──
+        smem_linear_wave = WARP_SIZE * 16 // sizeof_da  # 512 for bf16
+        if k.B_K and smem_linear_wave % k.B_K != 0:
+            errors.append(
+                f"B_K={k.B_K} does not divide smem_linear_wave={smem_linear_wave}"
+            )
+        elif k.B_K:
+            smem_sub = smem_linear_wave // k.B_K
+            num_waves = k.BLOCK_SIZE // WARP_SIZE  # 8
+            if k.B_M % smem_sub != 0:
+                errors.append(f"B_M={k.B_M} not div by smem_sub={smem_sub}")
+            if k.B_N % smem_sub != 0:
+                errors.append(f"B_N={k.B_N} not div by smem_sub={smem_sub}")
+            smem_m_rep = k.B_M // smem_sub if smem_sub else 0
+            smem_n_rep = k.B_N // smem_sub if smem_sub else 0
+            if smem_m_rep < num_waves or (smem_m_rep % num_waves) != 0:
+                errors.append(
+                    f"smem_m_rep={smem_m_rep} must be >= {num_waves} "
+                    f"and divisible by {num_waves}"
+                )
+            if smem_n_rep < num_waves or (smem_n_rep % num_waves) != 0:
+                errors.append(
+                    f"smem_n_rep={smem_n_rep} must be >= {num_waves} "
+                    f"and divisible by {num_waves}"
+                )
+            # ra layout: smem_sub_e_m = smem_sub / (W_M / T_N); E_M must
+            # divide cleanly.
+            if k.T_N and (k.W_M % k.T_N) != 0:
+                errors.append(
+                    f"W_M={k.W_M} not div by T_N={k.T_N} (mono-tile ra layout)"
+                )
+            else:
+                ratio = k.W_M // k.T_N
+                if ratio and smem_sub % ratio != 0:
+                    errors.append(
+                        f"smem_sub={smem_sub} not div by W_M/T_N={ratio} (ra layout)"
+                    )
+                else:
+                    smem_sub_e_m = smem_sub // ratio if ratio else 0
+                    if smem_sub_e_m == 0 or (E_M % smem_sub_e_m) != 0:
+                        errors.append(
+                            f"E_M={E_M} not div by smem_sub_e_m={smem_sub_e_m} "
+                            f"(ra layout)"
+                        )
+
+            # ── LDS footprint ──
+            # Mono-tile pipeline allocates `smem_a[2]` (double-buffered:
+            # one compute slot + one fetch slot) and `smem_b[3]` (two
+            # read slots sb_r0/sb_r1 plus a write slot sb_w; B is
+            # consumed twice per MMA pair under the T_N/T_M = 2 grouping).
+            # See the pipeline header (smem_a / smem_b allocation).
+            smem_padding = 2 * 16 // sizeof_da
+            smem_a_one = smem_m_rep * (smem_linear_wave + smem_padding) * sizeof_da
+            smem_b_one = smem_n_rep * (smem_linear_wave + smem_padding) * sizeof_da
+            total_lds = smem_a_one * 2 + smem_b_one * 3
+            if total_lds > 160 * 1024:
+                errors.append(f"LDS={total_lds // 1024}KiB exceeds 160KiB")
+        else:
+            total_lds = -1
+
+        if errors:
+            msg = f"Invalid a16w16_mono_tile instance '{k.name}':\n" + "\n".join(
+                f"  - {e}" for e in errors
+            )
+            raise ValueError(msg)
+
+        return {
+            "E_M": E_M,
+            "E_N": E_N,
+            "E_K": E_K,
+            "lds_bytes": total_lds,
+            "min_k": 2 * k.B_K,
+        }
+
     # ── Instance generation ──
 
     def gen_instance(self, k: OpusGemmInstance):
@@ -576,6 +736,13 @@ class opus_gemm_codegen:
             print(
                 f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
                 f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
+                f"  LDS={info['lds_bytes'] // 1024}KiB"
+                f"  K>={info['min_k']}"
+            )
+        elif k.kernel_tag == "a16w16_mono_tile":
+            info = self._validate_a16w16_mono_tile(k)
+            print(
+                f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
                 f"  LDS={info['lds_bytes'] // 1024}KiB"
                 f"  K>={info['min_k']}"
             )
@@ -632,6 +799,17 @@ class opus_gemm_codegen:
             )
         elif k.kernel_tag == "a16w16_persistent":
             self._gen_persistent_instance(
+                k,
+                pipeline_header,
+                traits_header,
+                kernel_func,
+                da,
+                db,
+                traits_name,
+                kargs_name,
+            )
+        elif k.kernel_tag == "a16w16_mono_tile":
+            self._gen_mono_tile_instance(
                 k,
                 pipeline_header,
                 traits_header,
@@ -1334,6 +1512,157 @@ void
     kargs.stride_b_batch = N * K;
     kargs.stride_c_batch = M * N;
 {grid_setup}
+    auto stream = aiter::getCurrentHIPStream();
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
+
+}}}}
+#endif // launcher only on regular host pass
+"""
+        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+
+        # See _gen_noscale_instance for how these rows are consumed.
+        for CDtype in k.output_dtypes:
+            host_decl = (
+                f"template void\n"
+                f"{k.name}<{CDtype}>(\n"
+                f"    aiter_tensor_t &XQ,\n"
+                f"    aiter_tensor_t &WQ,\n"
+                f"    aiter_tensor_t &Y,\n"
+                f"    std::optional<aiter_tensor_t>,\n"
+                f"    int);\n"
+            )
+            device_decl = (
+                f"template __global__ void {kernel_func}<\n"
+                f"    {k.name}_Traits<{CDtype}>>({kargs_name});\n"
+            )
+            self._host_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
+            )
+            self._device_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "device_decl": device_decl}
+            )
+
+    def _gen_mono_tile_instance(
+        self,
+        k,
+        pipeline_header,
+        traits_header,
+        kernel_func,
+        da,
+        db,
+        traits_name,
+        kargs_name,
+    ):
+        """Generate a mono-tile launcher (a16w16_mono_tile).
+
+        Mono-tile traits template signature has 4 parameters:
+          <BLOCK_SIZE, BLOCK, DTYPE, VEC>.
+        DTYPE is a 4-tuple <D_A, D_B, D_C, D_ACC>; D_ACC is fp32_t.
+
+        Locked tile/wave geometry (T_M=2, T_N=4, T_K=1, W_M=W_N=16,
+        W_K=32) is derived inside the traits header itself; this launcher
+        only forwards BLOCK / DTYPE / VEC.
+
+        Python-visible launcher takes the standard a16w16-family 4-arg
+        signature (XQ, WQ, Y, std::optional<bias>, int splitK) so its
+        function-pointer slot matches the other A16W16_TUNE_TAGS in
+        GENERATE_A16W16_TUNE_LOOKUP. Mono-tile does NOT support bias
+        (rejected up front) and ignores splitK.
+
+        Mono-tile is intrinsically tile-aligned: the launcher hard-asserts
+        M%B_M == N%B_N == K%B_K == 0 (no OOB tail handling exists in the
+        kernel body).
+        """
+        # Pre-declared Traits alias at file scope (visible to both passes).
+        # Mono-tile traits: <BLOCK_SIZE, BLOCK, DTYPE (4-tuple incl. D_ACC), VEC>.
+        traits_aliases = f"""
+template <typename D_C>
+using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, D_C, fp32_t>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>>;
+"""
+
+        # K constraints: mono-tile requires K % B_K == 0 (tile-aligned)
+        # and loops >= 2 (prefetch needs at least one fetch + one compute
+        # ahead). The K%2 rejection inherited from the family stands.
+        min_k = 2 * k.B_K
+        k_check = f"""
+    int loops_ = K / {k.B_K};
+    AITER_CHECK(K % {k.B_K} == 0,
+        "mono-tile requires K divisible by B_K={k.B_K}; got K=", K);
+    AITER_CHECK(loops_ >= 2,
+        "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
+    AITER_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K)");
+    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
+    AITER_CHECK(batch >= 1, "batch must be >= 1");
+    // Mono-tile is intrinsically non-OOB: the kernel body has no tail
+    // handling, so M and N must be tile-aligned. The dispatcher already
+    // filters this for tuned (M,N,K) entries, but enforce it here too so
+    // a direct `_tune` call with a misaligned shape errors cleanly.
+    AITER_CHECK(M % {k.B_M} == 0,
+        "mono-tile requires M divisible by B_M={k.B_M}; got M=", M);
+    AITER_CHECK(N % {k.B_N} == 0,
+        "mono-tile requires N divisible by B_N={k.B_N}; got N=", N);
+"""
+
+        INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include <optional>
+#endif
+// See _gen_noscale_instance for the rationale of the host/device pass split.
+#ifdef OPUS_FUSED_HOST_TU
+#include "{traits_header}"
+template<typename Traits>
+__global__ void {kernel_func}({kargs_name} kargs);
+#else
+#include "{pipeline_header}"
+#endif
+{traits_aliases}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{k.name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int /*splitK*/)   // mono-tile ignores splitK; shares tune-lookup slot signature
+{{{{
+    int batch = XQ.size(0);
+    int M = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+{k_check}
+    AITER_CHECK(!bias.has_value(),
+        "bias is not supported on a16w16_mono_tile kid; use a16w16 "
+        "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
+
+    {kargs_name} kargs{{{{}}}};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.m = M;
+    kargs.n = N;
+    kargs.k = K;
+    kargs.batch = batch;
+    kargs.stride_a = K;
+    kargs.stride_b = K;
+    kargs.stride_c = N;
+    kargs.stride_a_batch = M * K;
+    kargs.stride_b_batch = N * K;
+    kargs.stride_c_batch = M * N;
+
+    int num_tiles_m = M / {k.B_M};
+    int num_tiles_n = N / {k.B_N};
+    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
+    dim3 block({k.BLOCK_SIZE});
+
     auto stream = aiter::getCurrentHIPStream();
     {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
 
@@ -2440,6 +2769,7 @@ if __name__ == "__main__":
         "a16w16": a16w16_kernels_list,
         "a16w16_flatmm": a16w16_flatmm_kernels_list,
         "a16w16_flatmm_splitk": a16w16_flatmm_splitk_kernels_list,
+        "a16w16_mono_tile": a16w16_mono_tile_kernels_list,
     }
 
     # --- Compute the subset-compile set S ------------------------------------
