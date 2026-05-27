@@ -9,6 +9,15 @@
 #include <c10/util/Half.h>
 #include <hip/hip_bf16.h>
 
+#if defined(NDEBUG)
+#undef NDEBUG
+#include <assert.h>
+#define UNREACHABLE_CODE assert(false);
+#define NDEBUG
+#else
+#define UNREACHABLE_CODE assert(false);
+#endif
+
 namespace aiter {
 using namespace opus;
 #define RT 0
@@ -52,11 +61,15 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 #endif
     float a = tmp[0], b = tmp[1];
     int w;
+#if !defined (__GFX11__)
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
                  "v_med3_f32 %2, %2, %3, %4\n"
                  "v_cvt_pk_fp8_f32 %0, %1, %2"
                  : "=v"(w), "+v"(a), "+v"(b)
                  : "v"(lo), "v"(hi));
+#else
+    UNREACHABLE_CODE
+#endif
     return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
 }
 
@@ -77,11 +90,15 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
     constexpr float hi = 57344.0f, lo = -57344.0f;
     float a = tmp[0], b = tmp[1];
     int w;
+#if !defined (__GFX11__)
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
                  "v_med3_f32 %2, %2, %3, %4\n"
                  "v_cvt_pk_bf8_f32 %0, %1, %2"
                  : "=v"(w), "+v"(a), "+v"(b)
                  : "v"(lo), "v"(hi));
+#else
+    UNREACHABLE_CODE
+#endif
     return __builtin_bit_cast(bf8x2_t, static_cast<int16_t>(w));
 }
 
