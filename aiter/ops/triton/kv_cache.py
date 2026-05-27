@@ -66,9 +66,7 @@ def cat_and_cache_mla(
     SCALE_K_WIDTH_NOPE = 4
     SCALE_K_WIDTH_ROPE = 4
     if kv_cache_dtype == torch.uint8:
-        assert (
-            shuffled_kv_cache
-        ), "shuffle_kv_cache must be True for FP4 KV cache"
+        assert shuffled_kv_cache, "shuffle_kv_cache must be True for FP4 KV cache"
         b_cache, h_cache, block_size, d_cache = kv_cache.shape
         SCALE_K_LORA = d_nope // 16
         SCALE_K_ROPE = d_rope // 16
