@@ -27,6 +27,7 @@ import op_tests.test_batch_prefill as _tbp
 from op_tests.test_batch_prefill import (
     run_batch_prefill_per_token_head,
     run_batch_prefill_kv_blockscale,
+    run_fwd_per_token_head,
 )
 
 # The pytest helpers skip causal+soft_cap=0.0 on ROCm 7.2 + gfx950 out of an
@@ -111,16 +112,16 @@ _parser = argparse.ArgumentParser(
         "\n"
         "sample output (one row, abbreviated):\n"
         "  Config: nhq=8, nhk=1, hd=128, causal=True, soft_cap=0.0, page_size=1024\n"
-        "  batch | KV_BLOCKSCALE              vrf | PER_TOKEN_HEAD             vrf | H20 (ref)              | MI308/H20 TF | H20/MI308 lat\n"
+        "  batch | KV_BLOCKSCALE              vrf | PTH (batch_prefill)        vrf | PTH (fmha_fwd)             vrf | H20 (ref)              | H20/MI308 prefill | H20/MI308 fwd\n"
         "  seq=1024\n"
-        "      8 |   113 us   107.77 TFLOPS PASS |   192 us    63.12 TFLOPS PASS |    91 us  188.70 TFLOPS |        0.33x |         0.47x\n"
+        "      8 |   113 us   107.77 TFLOPS PASS |   192 us    63.12 TFLOPS PASS |    94 us   129.63 TFLOPS PASS |    91 us   188.70 TFLOPS |             0.47x |         0.97x\n"
         "  ...\n"
         "  Reading the row:\n"
-        "    KV_BLOCKSCALE / PER_TOKEN_HEAD : measured on this MI308 (us + TFLOPS).\n"
-        "    vrf                            : PASS / FAIL only when BENCH_VERIFY=1.\n"
-        "    H20 (ref)                      : reference numbers from the H20 PDF.\n"
-        "    MI308/H20 TF                   : PER_TOKEN_HEAD TFLOPS / H20 TFLOPS.\n"
-        "    H20/MI308 lat                  : H20 us / PER_TOKEN_HEAD us (>1 = MI308 faster).\n"
+        "    KV_BLOCKSCALE / PTH (...) : measured on this MI308 (us + TFLOPS).\n"
+        "    vrf                       : PASS / FAIL only when BENCH_VERIFY=1.\n"
+        "    H20 (ref)                 : reference numbers from the H20 PDF.\n"
+        "    H20/MI308 prefill         : H20 us / batch_prefill us (>1 = MI308 faster).\n"
+        "    H20/MI308 fwd             : H20 us / fmha_fwd us       (>1 = MI308 faster).\n"
         "\n"
         "environment variables:\n"
         "  BENCH_VERIFY=0|1            verify outputs vs FP32 reference\n"
@@ -233,25 +234,30 @@ def _run_one(shape):
         kvb = call_kernel(run_batch_prefill_kv_blockscale, **common)
     else:
         kvb = {"status": "skipped"}
-    return pth, kvb
+    # Non-paged fmha_fwd PER_TOKEN_HEAD (only wired for fp8bf16 + hdim=128 on gfx9).
+    fwd = call_kernel(run_fwd_per_token_head, **common)
+    return pth, kvb, fwd
 
 
-def _format_row(shape, pth, kvb):
+def _lat_ratio(r, h20_us):
+    """H20 latency / MI308 latency = speedup factor (both in us).
+    >1 means MI308 is faster than H20.
+    """
+    if r.get("status") != "passed" or h20_us is None or "time_us" not in r:
+        return "-"
+    return f"{h20_us / r['time_us']:.2f}x"
+
+
+def _format_row(shape, pth, kvb, fwd):
     b, qo, kv, nhq, nhk, hd, c, sc = shape
-    h20_tf = H20_REF.get((b, kv))
     h20_ms = H20_LAT_MS.get((b, kv))
     h20_us = h20_ms * 1000.0 if h20_ms is not None else None
-    if pth.get("status") == "passed" and h20_tf:
-        tf_ratio = f"{pth['tflops'] / h20_tf:>11.2f}x"
-        # H20 latency / MI308 latency = speedup factor (both in us)
-        lat_ratio = f"{h20_us / pth['time_us']:>12.2f}x"
-    else:
-        tf_ratio = "  -"
-        lat_ratio = "  -"
     return (
         f"{b:>5} | "
         f"{fmt(kvb):>27} {verify_str(kvb)} | {fmt(pth):>27} {verify_str(pth)} | "
-        f"{fmt_h20(b, kv):>27} | {tf_ratio:>12} | {lat_ratio:>13}"
+        f"{fmt(fwd):>27} {verify_str(fwd)} | "
+        f"{fmt_h20(b, kv):>27} | "
+        f"{_lat_ratio(pth, h20_us):>17} | {_lat_ratio(fwd, h20_us):>13}"
     )
 
 
@@ -295,7 +301,7 @@ def _run_silent(shape):
 # Trigger one-time JIT imports + first-call warnings BEFORE drawing the table,
 # so the header and rows aren't split by aiter import lines / ROCTracer warnings.
 print("Warming up kernels (one-time JIT setup, may take a moment)...", flush=True)
-_pth0, _kvb0 = _run_silent(SHAPES[0])
+_pth0, _kvb0, _fwd0 = _run_silent(SHAPES[0])
 
 # Constants are pulled out of the table to keep it narrow. nhq/nhk/hd/causal/
 # soft_cap are assumed constant across SHAPES; we sanity-check below.
@@ -316,8 +322,10 @@ print(
 )
 _HEADER = (
     f"{'batch':>5} | "
-    f"{'KV_BLOCKSCALE':>27} {'vrf':>6} | {'PER_TOKEN_HEAD':>27} {'vrf':>6} | "
-    f"{'H20 (ref)':>27} | {'MI308/H20 TF':>12} | {'H20/MI308 lat':>13}"
+    f"{'KV_BLOCKSCALE':>27} {'vrf':>6} | {'PTH (batch_prefill)':>27} {'vrf':>6} | "
+    f"{'PTH (fmha_fwd)':>27} {'vrf':>6} | "
+    f"{'H20 (ref)':>27} | "
+    f"{'H20/MI308 prefill':>17} | {'H20/MI308 fwd':>13}"
 )
 print(_HEADER)
 print("-" * len(_HEADER))
@@ -325,9 +333,13 @@ print("-" * len(_HEADER))
 failures = []
 
 
-def _record_failures(shape, pth, kvb):
+def _record_failures(shape, pth, kvb, fwd):
     b, _qo, kv, *_ = shape
-    for label, r in (("PER_TOKEN_HEAD", pth), ("KV_BLOCKSCALE", kvb)):
+    for label, r in (
+        ("PTH (batch_prefill)", pth),
+        ("KV_BLOCKSCALE", kvb),
+        ("PTH (fmha_fwd)", fwd),
+    ):
         if r.get("verify") == "fail":
             failures.append((b, kv, label, r.get("error", "")))
 
@@ -345,12 +357,12 @@ for _seq, _shapes in _groups.items():
     print(f"seq={_seq}")
     for shape in _shapes:
         if shape == SHAPES[0] and not _warmup_done:
-            pth, kvb = _pth0, _kvb0
+            pth, kvb, fwd = _pth0, _kvb0, _fwd0
             _warmup_done = True
         else:
-            pth, kvb = _run_one(shape)
-        print(_format_row(shape, pth, kvb), flush=True)
-        _record_failures(shape, pth, kvb)
+            pth, kvb, fwd = _run_one(shape)
+        print(_format_row(shape, pth, kvb, fwd), flush=True)
+        _record_failures(shape, pth, kvb, fwd)
 
 if VERIFY:
     if failures:

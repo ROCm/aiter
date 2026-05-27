@@ -243,6 +243,18 @@ struct mha_fwd_args
 
     ck_tile::index_t block_scale_size_q;
     ck_tile::index_t block_scale_size_kv;
+
+    // PER_TOKEN_HEAD: per-token row strides for the descale tensors. Unused (and 0)
+    // for NO_SCALE / PERTENSOR. Added with defaults so existing positional brace
+    // initializers in csrc/py_itfs_ck/mha_*_fwd_kernels.cu keep working unchanged.
+    //
+    // PER_TOKEN_HEAD layout (group / batch mode varlen, non-paged):
+    //   q_descale: [total_q, nhead_q]  fp32  -> stride_q_descale = nhead_q (or .stride(0))
+    //   k_descale: [total_k, nhead_k]  fp32  -> stride_k_descale = nhead_k (or .stride(0))
+    //   v_descale: [nhead_k]           fp32  -> stride_v_descale = 0 (per-head only)
+    ck_tile::index_t stride_q_descale = 0;
+    ck_tile::index_t stride_k_descale = 0;
+    ck_tile::index_t stride_v_descale = 0;
 };
 
 #if ENABLE_CK

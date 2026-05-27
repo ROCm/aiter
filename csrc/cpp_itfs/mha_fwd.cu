@@ -327,9 +327,9 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.stride_bias,
                        a.stride_randval,
                        a.stride_o,
-                       0, // stride_q_descale
-                       0, // stride_k_descale
-                       0, // stride_v_descale
+                       a.stride_q_descale, // PER_TOKEN_HEAD: nhead_q row stride; else 0
+                       a.stride_k_descale, // PER_TOKEN_HEAD: nhead_k row stride; else 0
+                       a.stride_v_descale, // PER_TOKEN_HEAD: 0 (V is per-head only)
                        a.nhead_stride_q,
                        a.nhead_stride_k,
                        a.nhead_stride_v,

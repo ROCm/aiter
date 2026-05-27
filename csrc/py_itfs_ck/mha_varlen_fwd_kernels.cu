@@ -109,6 +109,29 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     const void *v_descale_ptr = v_descale_.has_value() ? v_descale_.value().data_ptr() : nullptr;
     const void *sink_ptr = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
 
+    // PER_TOKEN_HEAD descale row strides (group mode, non-paged).
+    //   q_descale: [total_q, nhead_q]  fp32  -> stride_q_descale = stride(0) = h
+    //   k_descale: [total_k, nhead_k]  fp32  -> stride_k_descale = stride(0) = h_k
+    //   v_descale: [nhead_k]           fp32  -> stride_v_descale = 0 (per-head only)
+    // For NO_SCALE / PERTENSOR these stay 0.
+    ck_tile::index_t stride_q_descale = 0;
+    ck_tile::index_t stride_k_descale = 0;
+    ck_tile::index_t stride_v_descale = 0;
+    ck_tile::index_t nhead_stride_q_descale_v = 0;
+    ck_tile::index_t nhead_stride_k_descale_v = 0;
+    ck_tile::index_t nhead_stride_v_descale_v = 0;
+    if (qscale_type == quant_scale_enum::per_token_head) {
+        auto q_sc = q_descale_.value();
+        auto k_sc = k_descale_.value();
+        auto v_sc = v_descale_.value();
+        stride_q_descale         = q_sc.stride(0);
+        nhead_stride_q_descale_v = q_sc.stride(1);
+        stride_k_descale         = k_sc.stride(0);
+        nhead_stride_k_descale_v = k_sc.stride(1);
+        stride_v_descale         = 0; // V descale is per-head, no token dimension.
+        nhead_stride_v_descale_v = v_sc.stride(0);
+    }
+
     const void* seqstart_k_ptr = nullptr;
     const void* seqstart_q_ptr = nullptr;
     const void* cu_seqlen_k_ptr = nullptr;
@@ -179,9 +202,9 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                         nhead_stride_randval,
                         nhead_stride_lse,
                         nhead_stride_o,
-                        0, // nhead_stride_q_descale
-                        0, // nhead_stride_k_descale
-                        0, // nhead_stride_v_descale
+                        nhead_stride_q_descale_v, // PER_TOKEN_HEAD only; else 0
+                        nhead_stride_k_descale_v, // PER_TOKEN_HEAD only; else 0
+                        nhead_stride_v_descale_v, // PER_TOKEN_HEAD only; else 0
                         batch_stride_q,
                         batch_stride_k,
                         batch_stride_v,
@@ -201,7 +224,10 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                         has_dropout_randval,
                         drop_seed_offset,
                         128, // block_scale_size_q
-                        128}; // block_scale_size_kv
+                        128, // block_scale_size_kv
+                        stride_q_descale, // PER_TOKEN_HEAD only; else 0
+                        stride_k_descale, // PER_TOKEN_HEAD only; else 0
+                        stride_v_descale}; // PER_TOKEN_HEAD: always 0 (V is per-head)
 }
 
 fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
@@ -411,8 +437,28 @@ mha_varlen_fwd(
                 k_descale_.has_value() == v_descale_.has_value(),
                 "q_descale, k_descale, v_descale must be all provided or all not provided");
 
-    quant_scale_enum qscale_type =
-        q_descale_.has_value() ? quant_scale_enum::pertensor : quant_scale_enum::no_scale;
+    // Three supported modes for varlen fwd, disambiguated by descale tensor shape:
+    //   no_scale  : no descales provided
+    //   pertensor : q/k/v_descale rank <= 1 (scalar per tensor)
+    //   per_token_head : q_descale [total_q, nhead_q]  (rank 2),
+    //                    k_descale [total_k, nhead_k]  (rank 2),
+    //                    v_descale [nhead_k]           (rank 1)
+    quant_scale_enum qscale_type;
+    if (!q_descale_.has_value()) {
+        qscale_type = quant_scale_enum::no_scale;
+    } else if (q_descale_.value().dim() == 2) {
+        qscale_type = quant_scale_enum::per_token_head;
+        TORCH_CHECK(k_descale_.value().dim() == 2,
+                    "PER_TOKEN_HEAD requires k_descale to be 2D [total_k, nhead_k]");
+        TORCH_CHECK(v_descale_.value().dim() == 1,
+                    "PER_TOKEN_HEAD requires v_descale to be 1D [nhead_k]");
+        TORCH_CHECK(q_descale_.value().scalar_type() == at::kFloat &&
+                    k_descale_.value().scalar_type() == at::kFloat &&
+                    v_descale_.value().scalar_type() == at::kFloat,
+                    "PER_TOKEN_HEAD descales must all be float32");
+    } else {
+        qscale_type = quant_scale_enum::pertensor;
+    }
 
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     if (cu_seqlens_k.has_value()) {

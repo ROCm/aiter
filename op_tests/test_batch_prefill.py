@@ -2883,6 +2883,227 @@ def run_batch_prefill_per_token_head(
     return profile_result
 
 
+def run_fwd_per_token_head(
+    kvcache_layout,
+    table_layout,
+    batch_size,
+    qo_len,
+    kv_len,
+    page_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    causal,
+    logits_soft_cap,
+    dtype,
+    contiguous_kv,
+    seed,
+    profile=False,
+    skip_reference=False,
+):
+    """
+    Non-paged FP8 fmha_fwd with PER_TOKEN_HEAD quantization (varlen group mode).
+
+    This is the fmha_fwd analog of run_batch_prefill_per_token_head and is meant
+    to verify that the fmha_fwd qr_async PER_TOKEN_HEAD pipeline (gfx9, hdim=128,
+    fp8bf16) produces the same output as the batch_prefill kernel for the same
+    logical shapes / seed.
+
+    Layout:
+      Q       : (total_q, nhq, d) fp8
+      K       : (total_k, nhk, d) fp8     <- non-paged, contiguous along token axis
+      V       : (total_k, nhk, d) fp8     <- non-paged, contiguous along token axis
+      Q descale : (total_q, nhq) fp32     <- per-token-per-head
+      K descale : (total_k, nhk) fp32     <- per-token-per-head
+      V descale : (nhk,)         fp32     <- per-head only
+
+    page_size / kvcache_layout / table_layout / contiguous_kv are accepted only so
+    that the bench harness can call this helper with the same kwargs as
+    run_batch_prefill_per_token_head; they don't actually parameterize this path.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    quant_dtype = dtypes.fp8
+
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, logits_soft_cap),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return {"status": "skipped"}
+
+    # Match RNG-driven shape choices in run_batch_prefill_per_token_head so that
+    # the FP32 reference output computed below is the same one batch_prefill is
+    # benchmarked against.
+    qo_lens = build_qo_lens(batch_size, qo_len, randomize=batch_size > 1)
+    kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=batch_size > 1)
+    max_qo_len = qo_lens.max().item()
+    max_kv_len = kv_lens.max().item()
+    total_q = int(qo_lens.sum().item())
+    total_k = int(kv_lens.sum().item())
+
+    q = build_q_tensor_for_test(
+        qo_lens,
+        batch_size,
+        qo_len,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        None,
+        None,
+        is_input_fp8=True,
+    )
+
+    # Build a paged KV cache (just to share the FP32 ground-truth path with
+    # batch_prefill) and then immediately un-page into the flat varlen layout
+    # that fmha_fwd expects.
+    kv_cache = build_paged_kv_cache(
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_lens,
+        None,
+        None,
+        dtype,
+        use_uniform=True,
+        contiguous_kv=contiguous_kv,
+    )
+
+    kv_data_fp32 = kv_cache["kv_data_fp32"]
+    kv_indptr = kv_cache["kv_indptr_cpu"]
+    kv_indices = kv_cache["kv_indices_cpu"]
+    kv_last_page_len_cpu = kv_cache["kv_last_page_len_cpu"]
+
+    q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+    cu_seqlens_q = q_indptr_cpu.cuda()
+    cu_seqlens_k = convert_lens_to_indptr(kv_lens).cuda()
+
+    if skip_reference:
+        o_ref = None
+    else:
+        o_ref = build_reference_output(
+            q,
+            q_indptr_cpu,
+            kv_data_fp32,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len_cpu,
+            num_kv_heads,
+            head_dim,
+            dtype,
+            causal,
+            logits_soft_cap,
+        )
+
+    # Un-page FP32 K/V into flat (total_k, nhk, d) tensors (same per-batch
+    # gather pattern as build_reference_output).
+    k_flat_chunks = []
+    v_flat_chunks = []
+    for i in range(batch_size):
+        used = kv_indices[kv_indptr[i] : kv_indptr[i + 1]]
+        last_k = kv_data_fp32[used[-1], 0, : kv_last_page_len_cpu[i], :]
+        last_v = kv_data_fp32[used[-1], 1, : kv_last_page_len_cpu[i], :]
+        ki = torch.cat(
+            [
+                kv_data_fp32[used[:-1], 0].reshape(-1, num_kv_heads, head_dim),
+                last_k.reshape(-1, num_kv_heads, head_dim),
+            ],
+            dim=0,
+        )
+        vi = torch.cat(
+            [
+                kv_data_fp32[used[:-1], 1].reshape(-1, num_kv_heads, head_dim),
+                last_v.reshape(-1, num_kv_heads, head_dim),
+            ],
+            dim=0,
+        )
+        k_flat_chunks.append(ki)
+        v_flat_chunks.append(vi)
+    k_flat_fp32 = torch.cat(k_flat_chunks, dim=0).to("cuda")
+    v_flat_fp32 = torch.cat(v_flat_chunks, dim=0).to("cuda")
+    assert k_flat_fp32.shape[0] == total_k
+
+    # PER_TOKEN_HEAD descales over the flat layout.
+    fp8_max = torch.finfo(quant_dtype).max
+
+    q_abs_max = q.abs().amax(dim=-1).clamp(min=1e-12).float()  # [total_q, nhq]
+    q_descale = (q_abs_max / fp8_max).contiguous()
+    q_fp8 = (q.float() / q_descale.unsqueeze(-1)).to(quant_dtype).contiguous()
+
+    k_abs_max = k_flat_fp32.abs().amax(dim=-1).clamp(min=1e-12)  # [total_k, nhk]
+    k_descale = (k_abs_max / fp8_max).contiguous()
+    k_flat_fp8 = (k_flat_fp32 / k_descale.unsqueeze(-1)).to(quant_dtype).contiguous()
+
+    v_abs_max = v_flat_fp32.abs().amax(dim=(0, 2)).clamp(min=1e-12)  # [nhk]
+    v_descale = (v_abs_max / fp8_max).contiguous()
+    v_flat_fp8 = (v_flat_fp32 / v_descale.view(1, -1, 1)).to(quant_dtype).contiguous()
+
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    def _kernel():
+        return aiter.mha_varlen_fwd(
+            q_fp8,
+            k_flat_fp8,
+            v_flat_fp8,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_qo_len,
+            max_kv_len,
+            0,                # min_seqlen_q
+            0.0,              # dropout_p
+            softmax_scale,
+            logits_soft_cap,
+            False,            # zero_tensors
+            causal,
+            -1,               # window_size_left
+            -1,               # window_size_right
+            0,                # sink_size
+            False,            # return_softmax_lse
+            False,            # return_dropout_randval
+            None,             # out
+            None,             # block_table (non-paged)
+            None,             # bias
+            None,             # alibi_slopes
+            q_descale,        # PER_TOKEN_HEAD: rank 2 -> per_token_head mode picked up by binding
+            k_descale,
+            v_descale,
+            None,             # gen
+            None,             # cu_seqlens_q_padded
+            None,             # cu_seqlens_k_padded
+            None,             # sink_ptr
+        )
+
+    profile_result = {"status": "passed"}
+    if profile:
+        result, time_us = profile_func(_kernel)
+        out_fp8 = result[0]
+        total_flops = flops(
+            batch_size,
+            max_qo_len,
+            max_kv_len,
+            head_dim,
+            head_dim,
+            num_qo_heads,
+            num_kv_heads,
+            causal,
+        )
+        tflops = efficiency(total_flops, time_us)
+        profile_result = {"status": "passed", "time_us": time_us, "tflops": tflops}
+    else:
+        out_fp8 = _kernel()[0]
+
+    if skip_reference:
+        return profile_result
+
+    assert out_fp8.abs().max().item() > 1e-6, "fmha_fwd PER_TOKEN_HEAD output is all zeros!"
+    assert o_ref.abs().max().item() > 1e-6, "FP32 reference output is all zeros!"
+    verify_fp8_output(out_fp8, o_ref)
+
+    return profile_result
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",

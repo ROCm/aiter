@@ -1,6 +1,29 @@
 from typing import List, Dict, Tuple
 
 
+# Supported quant-scale modes for the varlen fwd kernel filter / module name.
+#   nqscale        : no quantization (bf16/fp16, or fp8 without descales)
+#   pertensor      : single Q/K/V scalar descale (FP8)
+#   per_token_head : Q/K per-(token,head) + V per-head descales (FP8 fine-grained)
+_QSCALE_TOKENS = ("nqscale", "pertensor", "per_token_head")
+
+
+def _coerce_qscale_mode(qscale_mode, has_qscale):
+    """Normalize the (qscale_mode, has_qscale) pair to a single token string.
+
+    Older callers pass ``has_qscale: bool`` (False -> "nqscale", True -> "pertensor").
+    New callers pass ``qscale_mode`` directly. Exactly one must be set.
+    """
+    if qscale_mode is not None:
+        assert (
+            qscale_mode in _QSCALE_TOKENS
+        ), f"qscale_mode must be one of {_QSCALE_TOKENS}, got {qscale_mode!r}"
+        return qscale_mode
+    if has_qscale is None:
+        return "nqscale"
+    return "pertensor" if has_qscale else "nqscale"
+
+
 def compose_mha_fwd_variant_suffix_and_filter(
     dtype: str,
     logits_positive: bool,
@@ -10,8 +33,11 @@ def compose_mha_fwd_variant_suffix_and_filter(
     return_lse: bool,
     dropout_zero: bool,
     skip_zero: bool,
-    has_qscale: bool,
+    has_qscale: bool = None,
+    qscale_mode: str = None,
 ) -> Tuple[str, str]:
+    qscale_token_name = _coerce_qscale_mode(qscale_mode, has_qscale)
+
     dtype_token = f"_{dtype}"
     logits_token = "_logits" if logits_positive else "_nlogits"
     if has_bias:
@@ -24,7 +50,7 @@ def compose_mha_fwd_variant_suffix_and_filter(
     lse_token = "_lse" if return_lse else "_nlse"
     dropout_token = "_ndropout" if dropout_zero else "_dropout"
     skip_token = "_nskip" if skip_zero else "_skip"
-    qscale_token = "_nqscale" if has_qscale else "_pertensor"
+    qscale_token = f"_{qscale_token_name}"
 
     suffix = (
         dtype_token
@@ -46,7 +72,7 @@ def compose_mha_fwd_variant_suffix_and_filter(
         + ("_lse*" if return_lse else "_nlse*")
         + ("_ndropout*" if dropout_zero else "_dropout*")
         + ("_nskip*" if skip_zero else "_skip*")
-        + ("_nqscale*" if has_qscale else "_pertensor*")
+        + f"_{qscale_token_name}*"
     )
     return suffix, filt
 
@@ -62,7 +88,14 @@ def _parse_mha_varlen_fwd_md_name(md_name: str):
     return_lse = "_lse" in md_name and "_nlse" not in md_name
     dropout_zero = "_ndropout" in md_name
     skip_zero = "_nskip" in md_name
-    has_qscale = "_nqscale" in md_name
+    # qscale token: order matters because "_pertensor" and "_per_token_head" share a
+    # common prefix; check the longer one first.
+    if "_per_token_head" in md_name:
+        qscale_mode = "per_token_head"
+    elif "_pertensor" in md_name:
+        qscale_mode = "pertensor"
+    else:
+        qscale_mode = "nqscale"
     return (
         dtype,
         logits_positive,
@@ -72,7 +105,7 @@ def _parse_mha_varlen_fwd_md_name(md_name: str):
         return_lse,
         dropout_zero,
         skip_zero,
-        has_qscale,
+        qscale_mode,
     )
 
 
@@ -90,7 +123,7 @@ def get_mha_varlen_prebuild_variants_by_names(
             return_lse,
             dropout_zero,
             skip_zero,
-            has_qscale,
+            qscale_mode,
         ) = _parse_mha_varlen_fwd_md_name(md_name)
         suffix, filter_pattern = compose_mha_fwd_variant_suffix_and_filter(
             dtype=dtype,
@@ -101,7 +134,7 @@ def get_mha_varlen_prebuild_variants_by_names(
             return_lse=return_lse,
             dropout_zero=dropout_zero,
             skip_zero=skip_zero,
-            has_qscale=has_qscale,
+            qscale_mode=qscale_mode,
         )
         blob_gen_cmd = [
             f"{ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --receipt {receipt} --filter {filter_pattern} --output_dir {{}}",

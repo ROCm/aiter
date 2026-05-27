@@ -327,7 +327,19 @@ def cmdGenFunc_mha_varlen_fwd(
         return_lse = return_softmax_lse
         dropout_zero = dropout_p == 0
         skip_zero = min_seqlen_q == 0
-        has_qscale = q_descale is None or k_descale is None or v_descale is None
+        # Map descale shape to a single qscale-mode token used by the codegen filter:
+        #   None              -> "nqscale"
+        #   rank <= 1         -> "pertensor"  (single Q/K/V scalar each)
+        #   rank == 2         -> "per_token_head"
+        #     q_descale: [total_q, nhead_q]
+        #     k_descale: [total_k, nhead_k]
+        #     v_descale: [nhead_k]
+        if q_descale is None or k_descale is None or v_descale is None:
+            qscale_mode = "nqscale"
+        elif q_descale.dim() == 2:
+            qscale_mode = "per_token_head"
+        else:
+            qscale_mode = "pertensor"
         suffix, filter_fwd = compose_mha_fwd_variant_suffix_and_filter(
             dtype=dtype_token,
             logits_positive=logits_positive,
@@ -337,7 +349,7 @@ def cmdGenFunc_mha_varlen_fwd(
             return_lse=return_lse,
             dropout_zero=dropout_zero,
             skip_zero=skip_zero,
-            has_qscale=has_qscale,
+            qscale_mode=qscale_mode,
         )
         md_name = f"mha_varlen_fwd{suffix}"
         variants = get_mha_varlen_prebuild_variants_by_names([md_name], CK_DIR)
