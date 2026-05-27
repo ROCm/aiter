@@ -86,13 +86,10 @@ def unswizzle_mx_scale_gfx1250(
 
 @gluon.jit
 def unshuffle_weight_gfx1250(w_buffer_slice, BLOCK_N, NATIVE_BLOCK_K_W):
-    return (
-        w_buffer_slice.reshape(
-            (BLOCK_N // 16, NATIVE_BLOCK_K_W // 16, 16, 16)
-        )
-        .permute((0, 2, 1, 3))
-        .reshape((BLOCK_N, NATIVE_BLOCK_K_W))
-    )
+    w = w_buffer_slice.reshape((BLOCK_N // 16, NATIVE_BLOCK_K_W // 16, 16, 16))
+    w = w.permute((0, 2, 1, 3))
+    w = w.reshape((BLOCK_N, NATIVE_BLOCK_K_W))
+    return w
 
 
 @gluon.jit(
