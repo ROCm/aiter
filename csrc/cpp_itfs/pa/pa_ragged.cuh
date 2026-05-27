@@ -38,6 +38,7 @@ template <int VERSION_ID,
           bool ALIBI_ENABLED,
           int GQA_RATIO,
           int MTP,
+          int PARTITION_SIZE_PARAM,
           typename AttentionVariant>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,      // [num_seqs, num_heads, head_size]
@@ -69,7 +70,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     const int seq_idx       = blockIdx.x;
     const int partition_idx = blockIdx.y;
 
-    constexpr int T_PAR_SIZE = 256; // token partition size set to 256
+    constexpr int T_PAR_SIZE = PARTITION_SIZE_PARAM; // token partition size (template)
 
     int context_len;
     if constexpr(BLOCK_SIZE > 1)
@@ -93,7 +94,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
 
     if constexpr (VERSION_ID == 0) // 0: GOLDEN VERSION
     {
-        _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, false>
+        _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, false, PARTITION_SIZE_PARAM>
         (block_table_seq, query_loc, context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, 0);
     }
     else // Experimental VERSION: head_dim 128
@@ -156,6 +157,7 @@ template <int VERSION_ID,
           bool ALIBI_ENABLED,
           int GQA_RATIO,
           int MTP,
+          int PARTITION_SIZE_PARAM,
           typename AttentionVariant>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,      // [num_seqs, num_heads, head_size]
