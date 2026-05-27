@@ -280,10 +280,10 @@ def _build_kernel(
     def kernel(
         q_in: fx.Pointer,  # [T, H, D]         bf16, contig (H, D)
         kv_in: fx.Pointer,  # [T, D]            bf16, may be strided
-        q_weight: fx.Pointer,  # [D]               bf16 (dummy when not q_weighted)
-        kv_weight: fx.Pointer,  # [D]               bf16
-        cos_cache: fx.Pointer,  # [max_pos, RD/2]   bf16
-        sin_cache: fx.Pointer,  # [max_pos, RD/2]   bf16
+        q_weight: fx.Tensor,  # [D]               bf16 (dummy when not q_weighted)
+        kv_weight: fx.Tensor,  # [D]               bf16
+        cos_cache: fx.Tensor,  # [max_pos, RD/2]   bf16
+        sin_cache: fx.Tensor,  # [max_pos, RD/2]   bf16
         positions: fx.Pointer,  # [T]               i64
         q_out: fx.Pointer,  # [T, H, D]         bf16 or fp8
         kv_out: fx.Pointer,  # [T, D]            bf16 or fp8
@@ -322,14 +322,17 @@ def _build_kernel(
             )
 
         # --- shared: load position (i64 -> i32) ---
-        pos_nbytes = fx.Int64((bid_t_idx + fx.Index(1)) * fx.Index(8))
-        pos_rsrc = _ptr_buffer_resource(positions, pos_nbytes)
+        pos_rsrc = _ptr_buffer_resource(positions)
         pos_val_i64 = buffer_ops.buffer_load(pos_rsrc, bid_t, vec_width=1, dtype=T.i64)
         pos_i32 = arith.trunci(i32, pos_val_i64)
 
         # --- shared: cos/sin buffer tensors (used by rope-threads only) ---
-        cos_g = GTensor(cos_cache, dtype=T.bf16, shape=(-1, RD // 2))
-        sin_g = GTensor(sin_cache, dtype=T.bf16, shape=(-1, RD // 2))
+        cos_buf = fx.rocdl.make_buffer_tensor(cos_cache)
+        sin_buf = fx.rocdl.make_buffer_tensor(sin_cache)
+        cos_row = fx.slice(cos_buf, (pos_i32, None))
+        sin_row = fx.slice(sin_buf, (pos_i32, None))
+        cos_div = fx.logical_divide(cos_row, rope_lay)
+        sin_div = fx.logical_divide(sin_row, rope_lay)
 
         def wave_reduce_add(x):
             w = _to_raw(x)
@@ -525,7 +528,6 @@ def _build_kernel(
         # the input is index-typed. Doing the math in index avoids large
         # H*D configs (e.g. H=128 D=512 → 128 KB/token, max offset 8.6 GiB
         # at bid_t=65534) silently producing garbage if we feed i64.
-        bid_t_idx = arith.index_cast(T.index, _to_raw(bid_t))
         q_tok_off_bytes = arith.MulIOp(
             bid_t_idx, arith.constant(H * D * 2, type=T.index)
         ).result
@@ -579,7 +581,7 @@ def _build_kernel(
                 qo_rsrc = qo_g_tmp.rsrc
                 # row_base_bytes is now token-relative (head_idx * D bytes for fp8).
                 row_base_bytes = ArithValue(head_idx) * arith.constant(D, type=i32)
-                qs_rsrc = buffer_ops.create_buffer_resource(q_scale, max_size=True)
+                qs_rsrc = _ptr_buffer_resource(q_scale)
                 # q_scale layout (T, H, NG) flat: bid_t * H*NG + head_idx * NG.
                 # Per-lane adds group_idx inside emit_body.
                 scale_base_off_q = ArithValue(bid_t) * arith.constant(
@@ -622,7 +624,7 @@ def _build_kernel(
             # buffer_ops with the explicit kv_in_row_stride argument, then
             # round-trip through an rmem tensor to get a Fly-wrapped vec that
             # the rest of emit_body (.to/.reduce/[i]) expects.
-            kv_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
+            kv_rsrc = _ptr_buffer_resource(kv_in)
             kv_off_elems = ArithValue(bid_t) * ArithValue(
                 kv_in_row_stride
             ) + ArithValue(tid) * arith.constant(VEC, type=i32)
@@ -655,7 +657,7 @@ def _build_kernel(
                 )
                 kvo_rsrc = kvo_g_tmp.rsrc
                 row_base_bytes = arith.constant(0, type=i32)  # already at token base
-                kvs_rsrc = buffer_ops.create_buffer_resource(kv_scale, max_size=True)
+                kvs_rsrc = _ptr_buffer_resource(kv_scale)
                 # kv_scale layout (T, NG) flat: bid_t * NG. Per-lane adds
                 # group_idx inside emit_body.
                 scale_base_off_kv = ArithValue(bid_t) * arith.constant(NG, type=i32)
@@ -697,17 +699,17 @@ def _build_kernel(
     # @flyc.jit function in the codebase.
     @flyc.jit
     def launch_qk_norm_rope_quant(
-        q_in: fx.Tensor,
-        kv_in: fx.Tensor,
+        q_in: fx.Pointer,
+        kv_in: fx.Pointer,
         q_weight: fx.Tensor,
         kv_weight: fx.Tensor,
         cos_cache: fx.Tensor,
         sin_cache: fx.Tensor,
-        positions: fx.Tensor,
-        q_out: fx.Tensor,
-        kv_out: fx.Tensor,
-        q_scale: fx.Tensor,
-        kv_scale: fx.Tensor,
+        positions: fx.Pointer,
+        q_out: fx.Pointer,
+        kv_out: fx.Pointer,
+        q_scale: fx.Pointer,
+        kv_scale: fx.Pointer,
         kv_in_row_stride: fx.Int32,
         num_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -970,6 +972,14 @@ def flydsl_qk_norm_rope_quant(
         stream = torch.cuda.current_stream()
     fx_stream = Stream(stream)
 
+    def _ptr_arg(t):
+        return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+
+    q_weight_static = flyc.from_dlpack(q_weight_arg)
+    kv_weight_static = flyc.from_dlpack(kv_weight)
+    cos_static = flyc.from_dlpack(cos_2d)
+    sin_static = flyc.from_dlpack(sin_2d)
+
     # HW grid Y is a 16-bit field on AMD HIP → cap 65535 blocks/launch. The
     # kernel uses per-token GTensor base-shift so each chunk's resource span
     # is small (just the chunk's tokens), but the grid Y dim itself is HW-
@@ -985,17 +995,17 @@ def flydsl_qk_norm_rope_quant(
         n = min(MAX_GRID_Y, T_tok - start)
         end = start + n
         launcher(
-            q_view[start:end],
-            kv[start:end],
-            q_weight_arg,
-            kv_weight,
-            cos_2d,
-            sin_2d,
-            positions[start:end],
-            q_out[start:end],
-            kv_out[start:end],
-            q_scale_arg[start:end] if quant else q_scale_arg,
-            kv_scale_arg[start:end] if quant else kv_scale_arg,
+            _ptr_arg(q_view[start:end]),
+            _ptr_arg(kv[start:end]),
+            q_weight_static,
+            kv_weight_static,
+            cos_static,
+            sin_static,
+            _ptr_arg(positions[start:end]),
+            _ptr_arg(q_out[start:end]),
+            _ptr_arg(kv_out[start:end]),
+            _ptr_arg(q_scale_arg[start:end] if quant else q_scale_arg),
+            _ptr_arg(kv_scale_arg[start:end] if quant else kv_scale_arg),
             kv.stride(0),
             n,
             stream=fx_stream,
