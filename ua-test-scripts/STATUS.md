@@ -8,8 +8,8 @@ both repos for coherence):
 
 | Repo                          | Branch                              | HEAD (short) |
 |-------------------------------|-------------------------------------|--------------|
-| `ROCm/aiter`                  | `jukorhon/unified-attention-ck`     | `e78240f74`  |
-| `ROCm/composable_kernel`      | `jukorhon/unified-attention-ck`     | `2645149bb`  |
+| `ROCm/aiter`                  | `jukorhon/unified-attention-ck`     | bumped post-CK |
+| `ROCm/composable_kernel`      | `jukorhon/unified-attention-ck`     | `46e622539`  |
 
 The aiter branch pins the CK submodule to the matching commit, so a
 recursive checkout is enough.
@@ -117,7 +117,8 @@ WITH_TRITON=1 ua-test-scripts/regression_decode.sh   # add Triton comparison
 ### CK side — `jukorhon/unified-attention-ck`
 
 ```
-2645149bb  CK-UA: shrink Tier-2 page-table LDS cache to per-split window   [LATEST]
+46e622539  CK-UA: gate dwordx3/x4 global_load_lds builtin on clang≥21, inline-asm fallback   [LATEST]
+2645149bb  CK-UA: shrink Tier-2 page-table LDS cache to per-split window
 badc80702  CK-UA: enable Tier-2 LDS page-table cache on decode + fix split-KV bulk-load OOB
 310efc556  CK-UA: halve kBlockN for bf16/fp16 m16 decode + generalise PVAttrNumAccess
 89b54563b  CK-UA: skip post-load page_offsets refresh on final K/V tile
@@ -135,7 +136,8 @@ badc80702  CK-UA: enable Tier-2 LDS page-table cache on decode + fix split-KV bu
 ### aiter side — `jukorhon/unified-attention-ck`
 
 ```
-e78240f74  unified_attention_ck: bump CK + add decode regression script   [LATEST]
+<next>     unified_attention_ck: bump CK for clang<21 inline-asm fallback   [LATEST]
+e78240f74  unified_attention_ck: bump CK + add decode regression script
 c3b09c3d7  unified_attention_ck: bump CK + add ua-test-scripts/ for shape-level testing
 b63386f0d  unified_attention: bump split-KV target to 4x CUs, cap 128
 278e72ffa  unified_attention_ck: bump CK submodule for block_tables OOB fix
@@ -206,6 +208,69 @@ prefill codegen is bit-identical.
 
 Side effect: the bulk-load bytes for splits ≥ 1 also drop by the number
 of pages we used to read but never index — small but free.
+
+---
+
+## Toolchain portability: `global_load_lds_dwordx{3,4}` on ROCm ≤ 7.1.1
+
+**Symptom (reported by a collaborator on a ROCm 7.1.1 container).**
+JIT-building `module_unified_attention` failed in CK with
+
+```
+amd_buffer_addressing_builtins.hpp:2743:
+  error: invalid size value
+   __builtin_amdgcn_global_load_lds(gptr, lptr, 16, byte_offset_imm, kCoherence);
+                                                ^~
+note: size must be 1, 2, or 4
+```
+
+(and the same for `size=12`).
+
+**Root cause.** AMD clang 20 (bundled with ROCm 7.1.1) only accepts `size`
+∈ {1, 2, 4} for `__builtin_amdgcn_global_load_lds`. The `size=12` /
+`size=16` ImmArg overloads for gfx950 only landed in clang ~21 (present
+in ROCm 7.11.0 / clang 22; absent in ROCm 7.1.1 / clang 20). The literal
+is checked during semantic analysis, so no compile flag avoids it. Our
+CK pipeline always instantiates the `amd_async_global_load_lds_raw<…,
+bytes={12,16}>` overload because the runtime `if(cache_ptr_int32_overflow_
+possible)` dispatch in `unified_attention_pipeline.hpp` is *not* `if
+constexpr`, so both branches are unconditionally compiled regardless of
+the workload's cache size.
+
+**Fix (CK `46e622539`).** Add a `CK_TILE_HAS_GLOBAL_LOAD_LDS_DWORDX4_BUILTIN`
+macro gated on `__clang_major__ >= 21`. When 1: existing `__builtin_…`
+path. When 0: emit `global_load_lds_dwordx{1,3,4}` via inline asm, with
+M0 set explicitly via `s_mov_b32` from the addrspace(3) `lptr` narrowed
+to its 32-bit LDS byte offset and wave-uniformed via `readfirstlane`.
+The inline asm bypasses the front-end ImmArg check; the assembler emits
+the same HW instruction the builtin would have lowered to.
+
+We tried two simpler fallbacks first and rejected both:
+
+| Variant                            | b=128 / sk=16384 / d=128 / bf16 | b=1 / sk=1M / d=128 / bf16 |
+|------------------------------------|---------------------------------|----------------------------|
+| Builtin dwordx4 (baseline)         | 1.517 ms — PASS                 | 0.769 ms — PASS            |
+| `N×` size=4 builtin, INST.OFFSET 0/4/8/12   | (skipped) — predicted wrong | 0.937 ms — **FAIL**        |
+| `N×` size=4 builtin, INST.OFFSET 0/256/512/768 + `gptr` step  | 4.665 ms — **FAIL**             | 2.340 ms — PASS            |
+| **Inline asm `dwordx4`** (chosen)  | **1.527 ms — PASS**             | **0.775 ms — PASS**        |
+
+The decompositions only happen to produce a correct LDS layout for some
+decode shapes — the in-LDS ordering of a native `dwordx4`'s 4 sub-issues
+doesn't reduce to any combination of dword INST.OFFSET steps we could
+find that survives all shapes. Asking the assembler for the literal
+instruction sidesteps the question.
+
+**Verified zero perf delta** on the full decode regression sweep (forced
+the fallback on by temporarily flipping the cutoff to `__clang_major__
+>= 999`); all 8 `(b, d, dtype)` configs match the builtin path to within
+run-to-run noise (≤ 1.5%). The colleague can either upgrade to a newer
+ROCm container (still the recommended option) or build the existing
+`jukorhon/unified-attention-ck` branch on ROCm 7.1.1 unchanged — the
+fallback activates automatically.
+
+Override the heuristic manually if your toolchain straddles the cutoff:
+`-DCK_TILE_HAS_GLOBAL_LOAD_LDS_DWORDX4_BUILTIN=0` to force the inline-asm
+path, `=1` to force the builtin path.
 
 ---
 
