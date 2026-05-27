@@ -408,7 +408,7 @@ def mla_decode_fwd(
                 )
             )
 
-            if use_qseqlen_fold
+            if use_qseqlen_fold:
                 fold_factor = ori_nhead // 16
                 nhead = 16
 
