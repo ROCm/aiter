@@ -249,10 +249,15 @@ def compile_moe_gemm1(
 
     ir.ShapedType.get_dynamic_size()
     # W is packed int4 for W4A8/W4A16/W4A_FP8: 2 values per byte.
-    (
+    w_nbytes = (
         (experts * (2 * inter_dim) * model_dim) // 2
         if w_is_int4
-        else (experts * (2 * inter_dim) * model_dim)
+        else (experts * (2 * inter_dim) * model_dim * elem_bytes)
+    )
+    sw_nbytes = (
+        experts * (2 * inter_dim) * num_groups * (2 if _scale_is_bf16 else 4)
+        if needs_scale_w
+        else 0
     )
 
     total_threads = 256
@@ -334,15 +339,15 @@ def compile_moe_gemm1(
 
         @flyc.kernel
         def moe_gemm1(
-            arg_out: fx.Tensor,
-            arg_x: fx.Tensor,
-            arg_w: fx.Tensor,
-            arg_scale_x: fx.Tensor,
-            arg_scale_w: fx.Tensor,
-            arg_sorted_token_ids: fx.Tensor,
-            arg_expert_ids: fx.Tensor,
-            arg_sorted_weights: fx.Tensor,
-            arg_max_token_ids: fx.Tensor,
+            arg_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_sorted_token_ids: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_sorted_weights: fx.Pointer,
+            arg_max_token_ids: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_inter_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -375,6 +380,13 @@ def compile_moe_gemm1(
             vec8_elems = 8 if elem_bytes == 1 else 4
             vec8_x = T.vec(vec8_elems, x_elem)
             vec16_x = T.vec(vec16_elems, x_elem)
+
+            def _ptr_buffer_resource(ptr, num_records_bytes):
+                addr = fx.ptrtoint(ptr)
+                addr_i64 = arith.index_cast(T.i64, addr)
+                return buffer_ops.create_buffer_resource_from_addr(
+                    addr_i64, num_records_bytes=num_records_bytes
+                )
 
             def silu(x):
                 # device fast path:
@@ -437,11 +449,7 @@ def compile_moe_gemm1(
             # Block validity: compute as early as possible so invalid blocks skip all buffer-resource
             # setup, LDS pointer math, and gmem prefetch work.
             bx_m = bx * fx.Index(tile_m)
-            maxids_rsrc = buffer_ops.create_buffer_resource(
-                arg_max_token_ids,
-                max_size=False,
-                num_records_bytes=fx.Index(4),
-            )
+            maxids_rsrc = _ptr_buffer_resource(arg_max_token_ids, fx.Index(4))
             max_token_id_i32 = buffer_ops.buffer_load(
                 maxids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
             )
@@ -494,11 +502,9 @@ def compile_moe_gemm1(
                 # X: [tokens, k] bytes = tokens*k*elem_bytes
                 x_rows = tokens_in * (c_topk if x_is_token_slot else fx.Index(1))
                 x_nbytes_idx = x_rows * k_in * arith.index(int(elem_bytes))
-                x_rsrc = buffer_ops.create_buffer_resource(
-                    arg_x, max_size=False, num_records_bytes=x_nbytes_idx
-                )
+                x_rsrc = _ptr_buffer_resource(arg_x, x_nbytes_idx)
 
-                w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+                w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
 
                 # OUT: normal=[tokens, topk, inter] f16/bf16,
                 #      split-K=[tokens*topk, 2*inter] f32 (or bf16 for bf16 split-K)
@@ -511,9 +517,7 @@ def compile_moe_gemm1(
                     out_nbytes_idx = (
                         tokens_in * c_topk * inter_in * fx.Index(out_elem_bytes)
                     )
-                out_rsrc = buffer_ops.create_buffer_resource(
-                    arg_out, max_size=False, num_records_bytes=out_nbytes_idx
-                )
+                out_rsrc = _ptr_buffer_resource(arg_out, out_nbytes_idx)
 
                 # scale_x: fp16/bf16 path ignores (implicit scale=1.0); int4_bf16 also uses 1.0.
                 if const_expr(is_f16_or_bf16):
@@ -521,30 +525,19 @@ def compile_moe_gemm1(
                 else:
                     sx_rows = tokens_in * (c_topk if x_is_token_slot else fx.Index(1))
                     sx_nbytes_idx = sx_rows * fx.Index(4)
-                    sx_rsrc = buffer_ops.create_buffer_resource(
-                        arg_scale_x, max_size=False, num_records_bytes=sx_nbytes_idx
-                    )
+                    sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_idx)
                 # scale_w: fp16/bf16 (non-int4) path ignores; int4_bf16 needs dequant scale.
                 if const_expr(not needs_scale_w):
                     sw_rsrc = None
                 else:
-                    sw_rsrc = buffer_ops.create_buffer_resource(
-                        arg_scale_w, max_size=False
-                    )
+                    sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes)
 
-                sorted_rsrc = buffer_ops.create_buffer_resource(
-                    arg_sorted_token_ids, max_size=False
-                )
-                sorted_w_rsrc = buffer_ops.create_buffer_resource(
-                    arg_sorted_weights, max_size=False
-                )
+                sorted_nbytes_idx = size_expert_ids_in * fx.Index(tile_m) * fx.Index(4)
+                sorted_rsrc = _ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes_idx)
+                sorted_w_rsrc = _ptr_buffer_resource(arg_sorted_weights, sorted_nbytes_idx)
 
                 # expert ids: [blocks] i32 -> bytes = size_expert_ids_in*4
-                expert_rsrc = buffer_ops.create_buffer_resource(
-                    arg_expert_ids,
-                    max_size=False,
-                    num_records_bytes=(size_expert_ids_in * fx.Index(4)),
-                )
+                expert_rsrc = _ptr_buffer_resource(arg_expert_ids, size_expert_ids_in * fx.Index(4))
 
                 # Expert id for this M tile (keep address math in `index`)
                 expert_i32 = buffer_ops.buffer_load(
@@ -1481,7 +1474,7 @@ def compile_moe_gemm1(
                         _splitk_use_bf16 and not _has_buffer_atomic_bf16_s1
                     )
 
-                    out_base_idx = buffer_ops.extract_base_index(arg_out)
+                    out_base_idx = arith.index_cast(T.index, fx.ptrtoint(arg_out))
                     _split_k_out_row_stride = (
                         inter_dim * 2 * out_elem_bytes
                     )  # bytes per row
@@ -1953,15 +1946,15 @@ def compile_moe_gemm1(
     # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
     @flyc.jit
     def launch_moe_gemm1(
-        arg_out: fx.Tensor,
-        arg_x: fx.Tensor,
-        arg_w: fx.Tensor,
-        arg_scale_x: fx.Tensor,
-        arg_scale_w: fx.Tensor,
-        arg_sorted_token_ids: fx.Tensor,
-        arg_expert_ids: fx.Tensor,
-        arg_sorted_weights: fx.Tensor,
-        arg_max_token_ids: fx.Tensor,
+        arg_out: fx.Pointer,
+        arg_x: fx.Pointer,
+        arg_w: fx.Pointer,
+        arg_scale_x: fx.Pointer,
+        arg_scale_w: fx.Pointer,
+        arg_sorted_token_ids: fx.Pointer,
+        arg_expert_ids: fx.Pointer,
+        arg_sorted_weights: fx.Pointer,
+        arg_max_token_ids: fx.Pointer,
         i32_tokens_in: fx.Int32,
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -2131,10 +2124,15 @@ def compile_moe_gemm2(
 
     ir.ShapedType.get_dynamic_size()
     # W is packed int4 for W4A8/W4A16/W4A_FP8: 2 values per byte.
-    (
+    w_nbytes = (
         (experts * model_dim * inter_dim) // 2
         if w_is_int4
-        else (experts * model_dim * inter_dim)
+        else (experts * model_dim * inter_dim * elem_bytes)
+    )
+    sw_nbytes = (
+        experts * model_dim * num_groups * (2 if _scale_is_bf16 else 4)
+        if needs_scale_w
+        else 0
     )
 
     total_threads = 256
@@ -2249,15 +2247,15 @@ def compile_moe_gemm2(
 
         @flyc.kernel
         def moe_gemm2(
-            arg_out: fx.Tensor,
-            arg_x: fx.Tensor,
-            arg_w: fx.Tensor,
-            arg_scale_x: fx.Tensor,
-            arg_scale_w: fx.Tensor,
-            arg_sorted_token_ids: fx.Tensor,
-            arg_expert_ids: fx.Tensor,
-            arg_sorted_weights: fx.Tensor,
-            arg_num_valid_ids: fx.Tensor,
+            arg_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_sorted_token_ids: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_sorted_weights: fx.Pointer,
+            arg_num_valid_ids: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -2289,6 +2287,13 @@ def compile_moe_gemm2(
             vec8_elems = 8 if elem_bytes == 1 else 4
             vec8_x = T.vec(vec8_elems, x_elem)
             vec16_x = T.vec(vec16_elems, x_elem)
+
+            def _ptr_buffer_resource(ptr, num_records_bytes):
+                addr = fx.ptrtoint(ptr)
+                addr_i64 = arith.index_cast(T.i64, addr)
+                return buffer_ops.create_buffer_resource_from_addr(
+                    addr_i64, num_records_bytes=num_records_bytes
+                )
 
             acc_init = (
                 arith.constant_vector(0, T.i32x4)
@@ -2368,11 +2373,9 @@ def compile_moe_gemm2(
 
             # X(A2): [tokens*topk, inter_dim] bytes = tokens*topk*k*elem_bytes
             x_nbytes_idx = (tokens_in * c_topk) * k_in * arith.index(int(elem_bytes))
-            x_rsrc = buffer_ops.create_buffer_resource(
-                arg_x, max_size=False, num_records_bytes=x_nbytes_idx
-            )
+            x_rsrc = _ptr_buffer_resource(arg_x, x_nbytes_idx)
 
-            w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+            w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
 
             # OUT: [tokens, model_dim] -> clamp to descriptor max (i32 bytes) to avoid overflow on huge tokens.
             out_elem_bytes = 4 if out_is_f32 else 2
@@ -2381,50 +2384,34 @@ def compile_moe_gemm2(
                 out_nbytes_idx = (
                     tokens_in * fx.Index(topk) * n_in * fx.Index(out_elem_bytes)
                 )
-            out_rsrc = buffer_ops.create_buffer_resource(
-                arg_out, max_size=False, num_records_bytes=out_nbytes_idx
-            )
+            out_rsrc = _ptr_buffer_resource(arg_out, out_nbytes_idx)
             # scale_x: fp16/bf16 path ignores (implicit scale=1.0); int4_bf16 also uses 1.0.
             if const_expr(is_f16_or_bf16):
                 sx_rsrc = None
             else:
                 # scale_x (A2 scale): [tokens*topk] f32 -> bytes = tokens*topk*4
                 sx_nbytes_idx = (tokens_in * c_topk) * fx.Index(4)
-                sx_rsrc = buffer_ops.create_buffer_resource(
-                    arg_scale_x, max_size=False, num_records_bytes=sx_nbytes_idx
-                )
+                sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_idx)
             # scale_w: fp16/bf16 (non-int4) path ignores; int4_bf16 needs dequant scale.
             if const_expr(not needs_scale_w):
                 sw_rsrc = None
             else:
                 # scale_w: [experts*model_dim] f32 (static shape in practice)
-                sw_rsrc = buffer_ops.create_buffer_resource(arg_scale_w, max_size=False)
+                sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes)
 
             # sorted_token_ids / sorted_weights: [blocks*tile_m] (CK-style padded length)
             sorted_nbytes_idx = size_expert_ids_in * fx.Index(tile_m) * fx.Index(4)
-            sorted_rsrc = buffer_ops.create_buffer_resource(
-                arg_sorted_token_ids,
-                max_size=False,
-                num_records_bytes=sorted_nbytes_idx,
-            )
-            sorted_w_rsrc = buffer_ops.create_buffer_resource(
-                arg_sorted_weights, max_size=False, num_records_bytes=sorted_nbytes_idx
-            )
+            sorted_rsrc = _ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes_idx)
+            sorted_w_rsrc = _ptr_buffer_resource(arg_sorted_weights, sorted_nbytes_idx)
 
             # expert ids: [blocks] i32 -> bytes = size_expert_ids_in*4
             eid_nbytes_idx = size_expert_ids_in * fx.Index(4)
-            expert_rsrc = buffer_ops.create_buffer_resource(
-                arg_expert_ids, max_size=False, num_records_bytes=eid_nbytes_idx
-            )
+            expert_rsrc = _ptr_buffer_resource(arg_expert_ids, eid_nbytes_idx)
             bx_m = bx * fx.Index(tile_m)
 
             # Early-exit guard (as in 2ce65fb): some routing paths can produce extra/garbage
             # expert blocks beyond `num_valid_ids`. Skip those blocks entirely to avoid OOB.
-            numids_rsrc = buffer_ops.create_buffer_resource(
-                arg_num_valid_ids,
-                max_size=False,
-                num_records_bytes=fx.Index(4),
-            )
+            numids_rsrc = _ptr_buffer_resource(arg_num_valid_ids, fx.Index(4))
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
             )
@@ -3384,7 +3371,7 @@ def compile_moe_gemm2(
                     # gfx950+ has buffer_atomic_pk_add_bf16, so bf16 uses buffer atomics there.
                     out_base_idx = None
                     if const_expr(_needs_global_atomic_bf16):
-                        out_base_idx = buffer_ops.extract_base_index(arg_out)
+                        out_base_idx = arith.index_cast(T.index, fx.ptrtoint(arg_out))
 
                     def write_row_to_lds(
                         *,
@@ -3544,15 +3531,15 @@ def compile_moe_gemm2(
     # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
     @flyc.jit
     def launch_moe_gemm2(
-        arg_out: fx.Tensor,
-        arg_x: fx.Tensor,
-        arg_w: fx.Tensor,
-        arg_scale_x: fx.Tensor,
-        arg_scale_w: fx.Tensor,
-        arg_sorted_token_ids: fx.Tensor,
-        arg_expert_ids: fx.Tensor,
-        arg_sorted_weights: fx.Tensor,
-        arg_num_valid_ids: fx.Tensor,
+        arg_out: fx.Pointer,
+        arg_x: fx.Pointer,
+        arg_w: fx.Pointer,
+        arg_scale_x: fx.Pointer,
+        arg_scale_w: fx.Pointer,
+        arg_sorted_token_ids: fx.Pointer,
+        arg_expert_ids: fx.Pointer,
+        arg_sorted_weights: fx.Pointer,
+        arg_num_valid_ids: fx.Pointer,
         i32_tokens_in: fx.Int32,
         i32_n_in: fx.Int32,
         i32_k_in: fx.Int32,
