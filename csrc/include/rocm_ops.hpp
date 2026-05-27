@@ -1922,6 +1922,7 @@ namespace py = pybind11;
           py::arg("reduce_final_map"),   \
           py::arg("reduce_partial_map"), \
           py::arg("max_seqlen_q"),       \
+          py::arg("num_kv_splits"),      \
           py::arg("final_output"),       \
           py::arg("final_lse") = std::nullopt);
 
