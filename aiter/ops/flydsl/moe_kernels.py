@@ -747,21 +747,25 @@ def flydsl_moe_stage1(
         # Kernel grid skips padded N tiles, so padded columns retain whatever
         # was in the buffer; e8m0 byte 0xFF would decode to NaN and propagate
         # into stage2 via atomicAdd. Zero-init when there is padding.
-        _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
         if _need_fp4 or (_gui_sk_fused and _need_fp4):
-            out = _alloc(
+            out = torch.empty(
                 (token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
             )
+            if inter_dim_pad > 0:
+                out.view(torch.uint8).zero_()
         elif _need_fp8 or (_gui_sk_fused and _need_fp8):
-            out = _alloc(
-                (token_num, topk, inter_dim), dtype=dtypes.fp8, device=dev
-            )
+            _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
+            out = _alloc((token_num, topk, inter_dim), dtype=dtypes.fp8, device=dev)
         else:
+            _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
             out = _alloc(
                 (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
             )
     elif inter_dim_pad > 0:
-        out.zero_()
+        if out.dtype == dtypes.fp4x2:
+            out.view(torch.uint8).zero_()
+        else:
+            out.zero_()
 
     if _is_splitk:
         torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
