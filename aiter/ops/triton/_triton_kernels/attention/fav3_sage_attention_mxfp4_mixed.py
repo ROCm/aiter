@@ -119,16 +119,19 @@ def _inner_hp_int8_nomask(
         else:
             v = tl.load(v_ptrs)
 
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACC_TYPE)
-        qk = qk + tl.dot(q_int8, k_tile).to(ACC_TYPE) * (q_descale_int8 * k_descale)
+        # Raw int32 -> fp32 GEMM result. We keep it un-descaled so that the
+        # descale multiply can be fused with the softmax shift below.
+        qk_raw = tl.dot(q_int8, k_tile).to(ACC_TYPE)
+        scale = q_descale_int8 * k_descale
 
         if USE_BIAS:
             bias_ptrs = bias_base + start_n * stride_bn
             bias_v = tl.load(bias_ptrs)
-            qk = qk + bias_v[None, :]
-
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        if USE_BIAS:
+            # ``qk_raw * scale + bias`` already lowers to a single FMA per
+            # element. The subsequent ``qk - m_ij`` stays separate because
+            # bias breaks the simple max-of-scaled equivalence.
+            qk = qk_raw * scale + bias_v[None, :]
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
             q_shifted = tl.where(
                 m_ij[:, None] == float("-inf"),
                 float("-inf"),
@@ -136,7 +139,14 @@ def _inner_hp_int8_nomask(
             )
             m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
         else:
-            q_shifted = qk - m_ij[:, None]
+            # Fused descale + softmax shift: ``scale`` is a positive scalar
+            # so ``max(qk_raw * scale) == max(qk_raw) * scale``. Doing the
+            # max in raw fp32 means we only multiply by ``scale`` on the
+            # tiny [BLOCK_M] reduction result, and ``qk_raw * scale -
+            # m_ij`` then lowers to a single v_fma_f32 per element instead
+            # of a full elementwise mul followed by a full elementwise sub.
+            m_ij = tl.maximum(m_i, tl.max(qk_raw, 1) * scale)
+            q_shifted = qk_raw * scale - m_ij[:, None]
             m_diff = m_i - m_ij
 
         p = tl.math.exp2(q_shifted)
@@ -209,19 +219,31 @@ def _inner_hp_int8_mask(
         v_mask = v_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
     v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
-    qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACC_TYPE)
-    qk = tl.where(kv_offs_n[None, :] < seqlen_k, qk, float("-inf"))
-    qk = qk + tl.dot(q_int8, k_tile).to(ACC_TYPE) * (q_descale_int8 * k_descale)
+    # Compute raw int32 GEMM, mask invalid columns to -inf, then defer the
+    # descale so it can be fused with the softmax shift below.
+    qk_raw = tl.dot(q_int8, k_tile).to(ACC_TYPE)
+    qk_raw = tl.where(kv_offs_n[None, :] < seqlen_k, qk_raw, float("-inf"))
+    scale = q_descale_int8 * k_descale
 
     if USE_BIAS:
         bias_ptrs = bias_base + start_n * stride_bn
         bias_v = tl.load(bias_ptrs, mask=kv_offs_n < seqlen_k, other=0.0)
-        qk = qk + bias_v[None, :]
-
-    m_ij = tl.maximum(m_i, tl.max(qk, 1))
-    q_shifted = tl.where(
-        m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
-    )
+        qk = qk_raw * scale + bias_v[None, :]
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        q_shifted = tl.where(
+            m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
+        )
+    else:
+        # Same fusion as the nomask path: ``qk_raw * scale - m_ij`` lowers
+        # to a v_fma_f32 per element. ``-inf * scale`` is still ``-inf``
+        # so masked columns continue to suppress contribution; the where
+        # below handles the m_ij == -inf row case (otherwise -inf - -inf
+        # would produce NaN).
+        m_ij = tl.maximum(m_i, tl.max(qk_raw, 1) * scale)
+        q_shifted_fma = qk_raw * scale - m_ij[:, None]
+        q_shifted = tl.where(
+            m_ij[:, None] == float("-inf"), float("-inf"), q_shifted_fma
+        )
     m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
 
     p = tl.math.exp2(q_shifted)
