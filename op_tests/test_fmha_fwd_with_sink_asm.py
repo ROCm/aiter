@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Correctness + performance tests for fmha_fwd_f16 (BF16 ASM, gfx1250).
+"""Correctness + performance tests for fmha_fwd_with_sink_asm (BF16 ASM, gfx1250).
 
 Public API:    aiter.flash_attn_func          (preferred)
 Ops layer:     aiter.fmha_fwd_with_sink_asm         (low-level, ~v3 style)
@@ -138,7 +138,7 @@ def _cmp(a: torch.Tensor, b: torch.Tensor, *, rtol=1e-2, atol=1e-2, msg: str = "
 
     On gfx1250 + ROCm 7.13 some bf16 element-wise GPU ops (isnan / isclose /
     contiguous) deadlock when invoked right after a custom ASM kernel.  The
-    deadlock is unrelated to fmha_fwd_f16 itself (it has been reproduced with
+    deadlock is unrelated to fmha_fwd_with_sink_asm itself (it has been reproduced with
     pure-PyTorch programs).  As a workaround we cast both tensors to fp32 on
     CPU before comparing -- this avoids triggering the buggy GPU bf16 path.
     """
@@ -339,14 +339,14 @@ def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
         (128, 8, 1, 130, 2048, 1),  # D128 q-unaligned
         (128, 8, 1, 128, 2300, 1),  # D128 kv-unaligned
         # ----- Large shapes aligned to run.sh perf_v4_d64 / perf_v4_d128 -
-        # Same memory pressure as test_fmha_fwd_f16_perf, batch=1 only
+        # Same memory pressure as test_fmha_fwd_with_sink_asm_perf, batch=1 only
         # because the reference path's fp32 attn matrix would otherwise
         # exceed device memory (D64 batch=2 sq=sk=8192 → 32 GB).
         (64, 64, 8, 8192, 8192, 1),  # D64  perf-sized, aligned
         (128, 64, 4, 4096, 4096, 1),  # D128 perf-sized, aligned
     ],
 )
-def test_fmha_fwd_f16_correctness(head_dim, hq, hk, sq, sk, batch, is_causal):
+def test_fmha_fwd_with_sink_asm_correctness(head_dim, hq, hk, sq, sk, batch, is_causal):
     if get_gfx() not in ["gfx1250"]:
         return
     device = "cuda"
@@ -440,7 +440,7 @@ def test_fmha_fwd_f16_correctness(head_dim, hq, hk, sq, sk, batch, is_causal):
     )
 
 
-def test_fmha_fwd_f16_ops_layer():
+def test_fmha_fwd_with_sink_asm_ops_layer():
     """Direct ops-layer call: bshd qkv (sbhd memory layout), D64 + non-zero sink.
 
     Uses is_causal=True because only causal binaries are registered in the
@@ -482,7 +482,7 @@ def test_fmha_fwd_f16_ops_layer():
     _cmp(lse_asm, lse_ref, rtol=1e-2, atol=1e-2)
 
 
-def test_fmha_fwd_f16_d64_requires_sink():
+def test_fmha_fwd_with_sink_asm_d64_requires_sink():
     """Direct ops-layer call without sink on D64 must raise the C++ check.
 
     Note: when going through aiter.flash_attn_func, the dispatcher auto-fills
@@ -519,7 +519,7 @@ def test_fmha_fwd_f16_d64_requires_sink():
 
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("layout", [0, 1, 2])
-def test_fmha_fwd_f16_layout(layout, head_dim):
+def test_fmha_fwd_with_sink_asm_layout(layout, head_dim):
     if get_gfx() not in ["gfx1250"]:
         return
     device = "cuda"
@@ -578,9 +578,9 @@ def test_fmha_fwd_f16_layout(layout, head_dim):
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-# Only causal kernels are shipped (see test_fmha_fwd_f16_correctness comment).
+# Only causal kernels are shipped (see test_fmha_fwd_with_sink_asm_correctness comment).
 @pytest.mark.parametrize("is_causal", [True])
-def test_fmha_fwd_f16_via_flash_attn_func(head_dim, is_causal):
+def test_fmha_fwd_with_sink_asm_via_flash_attn_func(head_dim, is_causal):
     if get_gfx() not in ["gfx1250"]:
         return
     device = "cuda"
@@ -690,9 +690,9 @@ def _make_qkv_perf(init: str, *, layout, sq, sk, batch, hq, hk, d, dtype, device
 
 @pytest.mark.parametrize("init", _PERF_INITS)
 @pytest.mark.parametrize("head_dim", [64, 128])
-# Only causal kernels are shipped (see test_fmha_fwd_f16_correctness comment).
+# Only causal kernels are shipped (see test_fmha_fwd_with_sink_asm_correctness comment).
 @pytest.mark.parametrize("is_causal", [True])
-def test_fmha_fwd_f16_perf(head_dim, is_causal, init):
+def test_fmha_fwd_with_sink_asm_perf(head_dim, is_causal, init):
     if get_gfx() not in ["gfx1250"]:
         return
     device = "cuda"

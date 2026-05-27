@@ -24,7 +24,7 @@
 //                   the kernel never reads its contents.  Pass a zero buffer.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
-#include "asm_fmha_fwd_f16_configs.hpp"
+#include "asm_fmha_fwd_bf16_configs.hpp"
 #include <hip/hip_runtime.h>
 #include <cmath>
 #include <memory>
@@ -88,7 +88,7 @@ static_assert(sizeof(KernelArgs) == 0x84,
 // _brd (border) kernel variants which are a strict superset (handle aligned
 // + unaligned q_seq_len/kv_seq_len uniformly).  The csv schema therefore has
 // no `border` column.
-static std::string get_heuristic_kernel_fmha_fwd_f16(const std::string& dtype,
+static std::string get_heuristic_kernel_fmha_fwd_bf16(const std::string& dtype,
                                                      int hdim_q,
                                                      int hdim_v,
                                                      int mask_flag,
@@ -283,10 +283,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // and unaligned q_seq_len/kv_seq_len uniformly (border path is a no-op
     // when sequences are aligned), so there's no runtime branch on alignment.
     const std::string dtype = "bf16";
-    CFG* cfg_map            = &cfg_fmha_fwd_f16;
+    CFG* cfg_map            = &cfg_fmha_fwd_bf16;
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
-    const std::string kernel_key = get_heuristic_kernel_fmha_fwd_f16(
+    const std::string kernel_key = get_heuristic_kernel_fmha_fwd_bf16(
         dtype, qk_head_dim, v_head_dim, mask_flag, arch_id, cfg_map);
     auto it = cfg_map->find(kernel_key);
     AITER_CHECK(it != cfg_map->end(),
