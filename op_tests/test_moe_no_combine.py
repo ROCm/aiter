@@ -556,6 +556,90 @@ def test_T2_public_api_returns_3d_shape_on_flydsl_fp4():
 
 
 @requires_flydsl
+def test_T3_numerical_correctness_reconstruction_equals_combined():
+    """Definitive numerical check: with moe_buf forced to zero-init, the
+    caller-side reconstruction `(per_slot * topk_weight.unsqueeze(-1)).sum(dim=1)`
+    must produce numerically close output to `fused_moe(..., no_combine=False)`.
+
+    The codebase's `moe_sorting._moe_sorting_impl` allocates `moe_buf` via
+    `torch.empty(...)`. The combined FlyDSL stage2 atomic-adds into that
+    buffer without zeroing, so combined output = uninitialized_memory +
+    sum(expert_contributions). This test patches the empty allocation to
+    return zeros so the comparison is meaningful. The patch only affects this
+    test; production behavior is preserved.
+    """
+    import aiter.fused_moe as fmoe_mod
+
+    device = "cuda"
+    M, topk, E, model_dim, inter_dim = 256, 4, 128, 3072, 3072
+    if not _probe_metadata_for_flydsl(M, topk, E, model_dim, inter_dim,
+                                       activation=ActivationType.Swiglu):
+        pytest.skip("no FlyDSL stage2 tuned config for the test shape")
+    (hidden_states, w1, w2, w1_scale, w2_scale,
+     topk_weight, topk_ids) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device)
+    common = dict(
+        hidden_states=hidden_states, w1=w1, w2=w2,
+        topk_weight=topk_weight, topk_ids=topk_ids,
+        activation=ActivationType.Swiglu,
+        quant_type=QuantType.per_1x32,
+        w1_scale=w1_scale, w2_scale=w2_scale,
+    )
+
+    # Patch moe_sorting_impl's `torch.empty` for moe_buf to torch.zeros. We
+    # specifically target the (M, model_dim) allocation that becomes moe_buf;
+    # leave other torch.empty calls untouched.
+    real_torch_empty = torch.empty
+
+    def patched_empty(*args, **kwargs):
+        out = real_torch_empty(*args, **kwargs)
+        # Heuristic: only zero allocations that match the moe_buf shape (M, D)
+        # in the test's dtype. Avoid touching the much larger intermediate
+        # allocations (which would slow other moe internals without benefit).
+        if out.dim() == 2 and out.shape == (M, model_dim) and out.dtype == hidden_states.dtype:
+            out.zero_()
+        return out
+
+    with patch.object(torch, "empty", side_effect=patched_empty):
+        combined = fused_moe(**common, no_combine=False)
+        per_slot = fused_moe(**common, no_combine=True)
+
+    # Both outputs are finite.
+    assert torch.isfinite(combined).all()
+    assert torch.isfinite(per_slot).all()
+
+    # Caller-side reconstruction recipe.
+    reconstructed = (per_slot.float() * topk_weight.unsqueeze(-1).float()).sum(dim=1).to(combined.dtype)
+
+    # Numerical comparison. bf16 has ~7-bit mantissa, so at the output's
+    # magnitude (max_abs) the smallest representable increment is roughly
+    # max_abs / 128. The combined path uses atomic adds in bf16, so any
+    # difference vs sequential fp32 reduction should be bounded by a few
+    # ulps of the output magnitude — NOT bounded as a fraction of each
+    # individual value (positions where combined ≈ 0 can legitimately
+    # differ by 1 ulp of the magnitude scale, giving large relative error
+    # but tiny absolute error).
+    max_abs = float(combined.abs().max().item())
+    bf16_ulp_at_scale = max_abs / 128  # ~1 ulp of bf16 at this magnitude
+    atol = max(bf16_ulp_at_scale * 4, 1.0)  # allow 4 ulps for atomic-add ordering
+    diff = (reconstructed - combined).abs()
+    max_diff = float(diff.max().item())
+    assert max_diff <= atol, (
+        f"max abs diff {max_diff:.2f} exceeds atol={atol:.2f} "
+        f"(4 ulps of bf16 at scale {max_abs:.0f}). The per-slot output "
+        f"does not reconstruct the combined path within bf16 precision."
+    )
+    # Also: relative error weighted by magnitude (not per-position) should
+    # be small — combined and reconstructed are the same operation modulo
+    # accumulation order, so the magnitude-weighted L2 norm should match.
+    relative_l2 = float((diff.float().pow(2).sum().sqrt()
+                         / (combined.float().pow(2).sum().sqrt() + 1e-6)).item())
+    assert relative_l2 < 0.02, (
+        f"magnitude-weighted relative L2 error {relative_l2:.4f} > 0.02; "
+        f"reconstruction does not numerically match combined."
+    )
+
+
+@requires_flydsl
 def test_T3_unweighted_per_slot_contract_on_flydsl_fp4():
     """AC-3 core contract: per-slot output is RAW (unweighted) expert
     outputs. Verified by:
