@@ -452,7 +452,7 @@ def gemm_afp4wfp4_preshuffle(
     N = n16 * 16
     K_elems = 2 * K_bytes
     # _get_config doubles K for config - 2 * K_bytes == K_elems
-    K_cfg = K_bytes
+    K_cfg = K_elems
 
     if config is None:
         config, _ = _get_config(M, N, K_cfg, True)
@@ -468,7 +468,7 @@ def gemm_afp4wfp4_preshuffle(
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
     if use_gluon:
-        from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import (
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
             get_gemm_afp4wfp4_preshuffle_layouts,
         )
