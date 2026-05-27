@@ -262,3 +262,33 @@ def fused_qk_norm_rope_2way(
     out_q01: Tensor,
     out_k01: Tensor,
 ) -> None: ...
+
+
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+def fused_qk_norm_rope_1way(
+    q: Tensor,
+    k: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    cos_sin: Tensor,
+    batch_size: int,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+    out_q: Tensor,
+    out_k: Tensor,
+) -> None:
+    """Fused per-head RMSNorm + RoPE on q/k for the 1way (single-stream) layout.
+
+    Dtype contract:
+        q, k, w_q, w_k, out_q, out_k : torch.bfloat16 or torch.float16 (same dtype)
+        cos_sin                      : torch.float32  (REQUIRED)
+
+    cos_sin must be float32 to match the diffusers / qwen-image-edit reference
+    (RoPE freqs are computed in fp32 there and the precision is consumed by the
+    fp32 rope multiply). Passing bf16/fp16 cos_sin will raise inside the kernel.
+    """
+    ...
