@@ -24,6 +24,7 @@ import pandas as pd
 import torch
 
 import aiter
+from aiter.utility import dtypes
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -31,6 +32,7 @@ from aiter.test_common import (
 )
 
 from aiter.ops.flydsl.kernels.fp8_einsum import fp8_einsum
+from aiter.ops.quant import per_group_quant_hip
 from aiter.ops.shuffle import shuffle_weight
 
 torch.set_default_device("cuda")
@@ -223,8 +225,12 @@ def test_fp8_einsum_bf16(H, D, R, B):
 
 @benchmark()
 def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
-    """qz output: kernel's fp8 × per-D128 scale should reconstruct the
-    fp32-reference einsum within fp8-quant tolerance."""
+    """qz output: kernel's (z_fp8, sz) should match `per_group_quant_hip` applied
+    to the fp32 reference einsum (cast to bf16), in the SAME (fp8, fp32-scale)
+    representation. Stricter than dequant-and-compare-in-fp32 because it tests
+    that the kernel produces the same quantized representation, not just the
+    same dequantized values.
+    """
     x_fp8, y_pre, sx_i32, sy_i32, x_ref, y_ref = build_inputs_with_ref(
         H,
         D,
@@ -233,6 +239,17 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
         torch.device("cuda"),
     )
     z_ref_f32 = einsum_ref_fp32(x_ref, y_ref)
+
+    # Quantize the bf16 reference with per_group_quant_hip — same D-128 group
+    # quant the kernel does internally. per_group_quant_hip requires bf16/fp16
+    # input (fp32 is unsupported) and operates on the last dim with group_size.
+    # Always produces scale in (B, H, D//128) layout regardless of transpose_scale.
+    z_ref_bf16 = z_ref_f32.bfloat16().contiguous()
+    z_ref_fp8, sz_ref = per_group_quant_hip(
+        z_ref_bf16,
+        quant_dtype=dtypes.fp8,
+        group_size=128,
+    )
 
     # Prime kernel cache outside the profiled region.
     _ = fp8_einsum_qz_kernel(x_fp8, y_pre, sx_i32, sy_i32, transpose_scale)
@@ -246,30 +263,34 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
         transpose_scale,
     )
 
-    # Normalize scale layout to (B, H, D/128) for dequant.
+    # Normalize the kernel's scale layout to (B, H, D/128) to match
+    # per_group_quant_hip's output layout for direct comparison.
     if transpose_scale:
-        # (D/128, B, H) → (B, H, D/128)
+        # Kernel produced (D/128, B, H); permute back to (B, H, D/128).
         sz_bhd = sz.permute(1, 2, 0).contiguous()
     else:
         sz_bhd = sz
 
-    # Dequant: z_recon[b,h,d] = z_fp8[b,h,d] * sz[b, h, d//128]
-    sz_exp = sz_bhd.unsqueeze(-1).expand(B, H, D // 128, 128).reshape(B, H, D)
-    z_recon = z_fp8.float() * sz_exp
-
-    # Accuracy: dequantized output vs the fp32 reference. The fp8-quant
-    # residual is bounded by 1/(2*448) ≈ 0.1% per-elem at typical pixels,
-    # but tail outliers within a 128-block can deviate by up to ~25%
-    # because the single fp32 scale must accommodate the block's amax.
-    # We set atol generously to cover those outliers; the failure-ratio
-    # threshold (default 5%) inside checkAllclose gates the actual pass.
-    ref_max = z_ref_f32.abs().max().item()
-    err = checkAllclose(
-        z_ref_f32,
-        z_recon,
+    # Accuracy: compare (z_fp8, sz) vs (z_ref_fp8, sz_ref) directly in the
+    # kernel's output representation. fp8 values are cast to fp32 for the
+    # numerical compare (still exact fp8-quantized values; no dequant via
+    # the scale).
+    err_z = checkAllclose(
+        z_ref_fp8.float(),
+        z_fp8.float(),
         rtol=1e-1,
-        atol=max(5e-1, 0.25 * ref_max),
-        msg="qz dequant",
+        atol=2e-1,
+        msg="qz z_fp8 (kernel vs per_group_quant_hip(ref))",
+    )
+    # The scale is a power-of-2 (UE8M0) on both sides. Use a generous rtol
+    # since both sides round to the same pow2 lattice but a single ULP at the
+    # amax-pow2 boundary doubles/halves the scale.
+    err_sz = checkAllclose(
+        sz_ref.float(),
+        sz_bhd.float(),
+        rtol=2.0,
+        atol=1e-6,
+        msg="qz sz_fp32 (kernel vs per_group_quant_hip(ref))",
     )
 
     # Scale must be strictly positive.
@@ -294,7 +315,8 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
     flops = 2 * B * H * D * R
     tf = flops / (kernel_us * 1e-6) / 1e12
     return {
-        "err": err,
+        "err_z": err_z,
+        "err_sz": err_sz,
         "kernel_us": kernel_us,
         "TFLOPS": tf,
         "det_z": det_z,
