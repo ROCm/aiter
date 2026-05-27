@@ -93,6 +93,26 @@ for file in "${sharded_files[@]}"; do
     } | tee -a latest_test.log
 done
 
+# Extra parameterized invocations for MLA bh16 gluon variants (bh16bn64 + bh16bn128, gfx950-only gates).
+# Run only in whichever shard actually owns test_mla.py — the shard layout can shift as tests
+# are added/removed, so we can't hardcode SHARD_IDX.
+mla_in_shard=false
+for f in "${sharded_files[@]}"; do
+    if [[ "$f" == "op_tests/test_mla.py" ]]; then
+        mla_in_shard=true
+        break
+    fi
+done
+if [[ "$mla_in_shard" == "true" && "$MULTIGPU" != "TRUE" ]]; then
+    for args in "-c 49152 -b 1 -n 16,1 -kvd bf16" "-c 98304 -b 1 -n 16,1 -kvd fp8"; do
+        echo "=== extra: test_mla.py $args ===" | tee -a latest_test.log
+        if ! timeout 10m python3 op_tests/test_mla.py $args 2>&1 | tee -a latest_test.log; then
+            testFailed=true
+            failedFiles+=("test_mla.py $args")
+        fi
+    done
+fi
+
 if [ "$testFailed" = true ]; then
     {
         echo "Failed test files (shard $SHARD_IDX):"

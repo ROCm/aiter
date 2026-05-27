@@ -1411,8 +1411,8 @@ namespace py = pybind11;
           py::arg("block_m"),                                            \
           py::arg("shuffle_scale") = false,                              \
           py::arg("transpose_out") = false);                             \
-    m.def("fused_dynamic_mxfp4_quant_moe_sort_hip",                      \
-          &aiter::fused_dynamic_mxfp4_quant_moe_sort_hip,                \
+    m.def("fused_dynamic_mx_quant_moe_sort_hip",                      \
+          &aiter::fused_dynamic_mx_quant_moe_sort_hip,                \
           py::arg("out"),                                                \
           py::arg("scales"),                                             \
           py::arg("input"),                                              \
@@ -1736,7 +1736,8 @@ namespace py = pybind11;
           py::arg("k_scale"),                                   \
           py::arg("v_scale"),                                   \
           py::arg("max_tokens_per_batch") = 0);                 \
-    m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);
+    m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);                  \
+    m.def("fused_qk_norm_rope_1way", &aiter::fused_qk_norm_rope_1way);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
