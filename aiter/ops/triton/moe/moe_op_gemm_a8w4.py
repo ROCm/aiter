@@ -12,10 +12,8 @@ from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_gluon,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
-from aiter.ops.triton.utils._triton.arch_info import (
-    get_arch,
-    pick_gemm_num_stages,
-)
+from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 
