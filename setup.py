@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==v0.1.9.dev599"
+FLYDSL_VERSION = "flydsl==0.1.9.dev599"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -57,8 +57,9 @@ def is_develop_mode():
 if not IS_WINDOWS and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
+        from packaging.version import Version
 
-        if pkg_version("flydsl") != FLYDSL_VERSION.split("==")[1]:
+        if Version(pkg_version("flydsl")) != Version(FLYDSL_VERSION.split("==")[1]):
             raise ImportError("version mismatch")
     except Exception:
         subprocess.check_call(
