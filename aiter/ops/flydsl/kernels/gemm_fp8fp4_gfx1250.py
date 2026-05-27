@@ -1470,13 +1470,15 @@ def compile_mxscale_gemm(
                 d_lane_base = (warp_lds_off
                                + lane16 * arith.index(_lds_d_stride_elems)
                                + lane_kgrp * arith.index(4 * elem_bytes_d))
-                wave_id_idx = arith.index_cast(T.index, rocdl.wave_id())
-                d_warp_off_sgpr = wave_id_idx * arith.index(warp_d_bytes) \
+                # Keep the TDM store descriptor in the same block-local warp
+                # coordinate system as the LDS stores above.  Using the raw
+                # hardware wave id here can point the descriptor at the wrong
+                # LDS tile when persistent workers are resident together.
+                local_wave_idx = wave_m_idx * arith.index(n_warp) + wave_n_idx
+                d_warp_off_sgpr = local_wave_idx * arith.index(warp_d_bytes) \
                     + arith.index(d_output_off)
-                warp_m_off_sgpr = (wave_id_idx / arith.index(n_warp)) \
-                    * arith.index(warp_tile_m)
-                warp_n_off_sgpr = (wave_id_idx % arith.index(n_warp)) \
-                    * arith.index(warp_tile_n)
+                warp_m_off_sgpr = wave_m_idx * arith.index(warp_tile_m)
+                warp_n_off_sgpr = wave_n_idx * arith.index(warp_tile_n)
                 d_desc = tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_c,
                     lds_memref=d_lds_base_ptr,
@@ -2093,7 +2095,7 @@ def compile_mxscale_gemm(
     # Bump this when changing generated IR in ways not otherwise reflected in
     # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
     # reusing a previously compiled kernel after source-only descriptor fixes.
-    tdm_store_descriptor_version = 21
+    tdm_store_descriptor_version = 22
 
     cache_tag = (data_format, K, tile_m, tile_n, tile_k, m_warp, n_warp,
                  num_buffers, compute_schedule_kind,
