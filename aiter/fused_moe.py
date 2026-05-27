@@ -46,6 +46,8 @@ def _moe_sorting_impl(
     dispatch_policy,
     use_opus,
     return_local_topk_ids=False,
+    need_reduce=False,
+    has_reduce_mask=False,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -58,7 +60,16 @@ def _moe_sorting_impl(
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    # moe_buf shape depends on the downstream stage2 path:
+    #  - has_reduce_mask: caller owns the [M, topk, model_dim] intermediate; placeholder here.
+    #  - need_reduce no mask: stage2 writes per-topk slabs into [M, topk*model_dim].
+    #  - else: stage2 atomically accumulates into [M, model_dim].
+    if need_reduce and has_reduce_mask:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    elif need_reduce:
+        moe_buf = torch.empty((M, topk * model_dim), dtype=moebuf_dtype, device=device)
+    else:
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
     local_topk_ids = torch.empty_like(topk_ids) if return_local_topk_ids else None
     if return_local_topk_ids:
         # CK sorting does not emit local ids; use Opus so callers do not need a slow
@@ -122,6 +133,8 @@ def moe_sorting(
     num_local_tokens=None,
     dispatch_policy=0,
     return_local_topk_ids=False,
+    need_reduce=False,
+    has_reduce_mask=False,
 ):
     try:
         return _moe_sorting_impl(
@@ -136,6 +149,8 @@ def moe_sorting(
             dispatch_policy,
             use_opus=not _USE_CK_MOE_SORTING,
             return_local_topk_ids=return_local_topk_ids,
+            need_reduce=need_reduce,
+            has_reduce_mask=has_reduce_mask,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -147,6 +162,20 @@ def moe_sorting(
             f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
         )
         raise e
+
+
+def get_topk_valid_mask(
+    topk_ids: torch.Tensor,
+    expert_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build valid_mask [token_num, topk] for EP mode.
+
+    valid_mask[t, k] = 1 if topk_ids[t, k] points to a local (non-fake) expert,
+    else 0. When expert_mask is None (non-EP), returns all-ones.
+    """
+    if expert_mask is None:
+        return torch.ones(topk_ids.shape, dtype=dtypes.i32, device=topk_ids.device)
+    return expert_mask[topk_ids]
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
@@ -452,6 +481,7 @@ def fused_moe_(
             # only for flydsl dsv4
             swiglu_limit=swiglu_limit,
             gate_mode=gate_mode,
+            expert_mask=expert_mask,
         )
 
 
@@ -818,6 +848,8 @@ def _flydsl_stage2_wrapper(
     bias2=None,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
+    expert_mask=None,
+    topk_ids=None,
     **_kwargs,
 ):
 
@@ -849,6 +881,8 @@ def _flydsl_stage2_wrapper(
         model_dim_pad=model_dim_pad,
         bias=bias2,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
+        expert_mask=expert_mask,
+        topk_ids=topk_ids,
     )
 
 
@@ -1300,57 +1334,67 @@ def get_2stage_cfgs(
             _ksplit,
             False,
         )
-    swiglu_mxfp4_flydsl = (
+    # Debug: AITER_FLYDSL_FORCE=1 is for debug use.
+    _flydsl_force = os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
+    use_mxfp4_flydsl = (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
-        and q_dtype_a == dtypes.fp4x2
+        and (activation == ActivationType.Swiglu or _flydsl_force)
+        and q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
         and is_flydsl_available()
     )
-    if swiglu_mxfp4_flydsl:
+    if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_kernel_name,
             get_flydsl_kernel_params,
         )
 
-        _out_str = "bf16" if dtype == dtypes.bf16 else "f16"
+        _out_type = "bf16" if dtype == dtypes.bf16 else "f16"
+        # a-dtype "fp4" => a4w4 fp4/fp4; "fp8" => a8w4 fp8/fp4 FlyDSL family.
+        _a_type = "fp4" if q_dtype_a == dtypes.fp4x2 else "fp8"
         if token < 2048:
             _tile_m = 32
-            _base_kn1 = flydsl_kernel_name(1, "fp4", "fp4", _out_str, 32, 128, 256)
+            _base_kn1 = flydsl_kernel_name(1, _a_type, "fp4", _out_type, 32, 128, 256)
             _base_kn2 = flydsl_kernel_name(
-                2, "fp4", "fp4", _out_str, 32, 128, 256, "atomic"
+                2, _a_type, "fp4", _out_type, 32, 128, 256, "atomic"
             )
             kn1 = f"{_base_kn1}_w2"
             kn2 = f"{_base_kn2}_bnt2"
         elif token < 4096:
             _tile_m = 64
-            _base_kn1 = flydsl_kernel_name(1, "fp4", "fp4", _out_str, 64, 128, 256)
+            _base_kn1 = flydsl_kernel_name(1, _a_type, "fp4", _out_type, 64, 128, 256)
             _base_kn2 = flydsl_kernel_name(
-                2, "fp4", "fp4", _out_str, 64, 128, 256, "atomic"
+                2, _a_type, "fp4", _out_type, 64, 128, 256, "atomic"
             )
             kn1 = f"{_base_kn1}_w3_bnt0"
             kn2 = _base_kn2
         elif token < 16384:
             _tile_m = 128
-            _base_kn1 = flydsl_kernel_name(1, "fp4", "fp4", _out_str, 128, 128, 256)
+            _base_kn1 = flydsl_kernel_name(1, _a_type, "fp4", _out_type, 128, 128, 256)
             _base_kn2 = flydsl_kernel_name(
-                2, "fp4", "fp4", _out_str, 128, 128, 256, "atomic"
+                2, _a_type, "fp4", _out_type, 128, 128, 256, "atomic"
             )
             kn1 = f"{_base_kn1}_w2_bnt0"
             kn2 = _base_kn2
         else:
             _tile_m = 64
-            _base_kn1 = flydsl_kernel_name(1, "fp4", "fp4", _out_str, 64, 128, 256)
+            _base_kn1 = flydsl_kernel_name(1, _a_type, "fp4", _out_type, 64, 128, 256)
             _base_kn2 = flydsl_kernel_name(
-                2, "fp4", "fp4", _out_str, 64, 128, 256, "atomic"
+                2, _a_type, "fp4", _out_type, 64, 128, 256, "atomic"
             )
             kn1 = f"{_base_kn1}_w4_bnt0"
             kn2 = _base_kn2
 
+        # fp8 stage1 kernel names always carry a "_gui" suffix
+        # (moe_kernels.py:114-115). Append it before the lookup so the fp8
+        # variants resolve; fp4 names are unchanged.
+        if _a_type == "fp8":
+            kn1 = f"{kn1}_gui"
+            _base_kn1 = f"{_base_kn1}_gui"
         if get_flydsl_kernel_params(kn1) is None:
             kn1 = _base_kn1
         if get_flydsl_kernel_params(kn2) is None:
@@ -1541,6 +1585,7 @@ def fused_moe_2stages(
     topk_weights=None,
     swiglu_limit=0.0,
     gate_mode=GateMode.SEPARATED.value,
+    expert_mask=None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -1668,6 +1713,7 @@ def fused_moe_2stages(
     extra_stage2_args = {}
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+    stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:
             extra_stage1_args["bias1"] = _normalize_bias_for_kernel(bias1)
@@ -1677,6 +1723,11 @@ def fused_moe_2stages(
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     if metadata.stage1.func is _flydsl_stage1_wrapper:
         extra_stage1_args["swiglu_limit"] = swiglu_limit
+    # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
+    # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
+    if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:
+        extra_stage2_args["expert_mask"] = expert_mask
+        extra_stage2_args["topk_ids"] = topk_ids
     a2 = metadata.stage1(
         a1,
         w1,

@@ -3604,11 +3604,14 @@ def compile_moe_reduction(
     """Compile a reduction kernel that sums over the topk dimension.
 
     Input:  X [tokens, topk, model_dim]
-            valid_mask [tokens, topk] (optional, if use_mask=True)
+            expert_mask [num_experts] i32 (optional, if use_mask=True)
+            topk_ids   [tokens, topk] i32 (optional, if use_mask=True)
     Output: Y [tokens, model_dim]
 
-    This kernel performs: Y[t, d] = sum(X[t, :, d]) for all t, d.
-    When use_mask=True, only sums slots where valid_mask[t,k]=1.
+    This kernel performs: Y[t, d] = sum_k(X[t, k, d]) for all t, d.
+    When use_mask=True, the kernel fuses the EP validity gather:
+        valid[t, k] = expert_mask[topk_ids[t, k]] != 0
+    and only accumulates X[t, k, :] when valid[t, k] is true.
     Used in conjunction with compile_moe_gemm2(accumulate=False) to avoid atomic contention.
     """
     get_hip_arch()
@@ -3650,24 +3653,30 @@ def compile_moe_reduction(
         def moe_reduction_kernel(
             X: fx.Tensor,
             Y: fx.Tensor,
-            valid_mask: fx.Tensor,
+            expert_mask: fx.Tensor,
+            topk_ids: fx.Tensor,
             i32_m_tokens: fx.Int32,
         ):
             m_tokens = fx.Index(i32_m_tokens)
             c_topk = fx.Index(topk)
             c_model_dim = fx.Index(model_dim)
-            mask_nbytes_idx = m_tokens * c_topk
+            topk_ids_nbytes_idx = m_tokens * c_topk * fx.Index(4)
             elem_bits = 32 if dtype_str == "f32" else 16
             copy_vec_width = 128 // elem_bits  # 8 for f16/bf16, 4 for f32
             n_sub = VEC_WIDTH // copy_vec_width  # 1 for f16/bf16, 2 for f32
             # Buffer-backed tensors via layout API (all dtypes)
             X_buf = fx.rocdl.make_buffer_tensor(X)
             Y_buf = fx.rocdl.make_buffer_tensor(Y)
-            # Scalar buffer resources for tail path and mask
+            # Scalar buffer resources for tail path and the fused EP gather
             x_rsrc = buffer_ops.create_buffer_resource(X, max_size=True)
             y_rsrc = buffer_ops.create_buffer_resource(Y, max_size=True)
-            mask_rsrc = buffer_ops.create_buffer_resource(
-                valid_mask, max_size=False, num_records_bytes=mask_nbytes_idx
+            # topk_ids: [tokens, topk] i32 ; expert_mask: [num_experts] i32
+            # (num_experts is not a compile-time constant — use max_size=True)
+            topk_ids_rsrc = buffer_ops.create_buffer_resource(
+                topk_ids, max_size=False, num_records_bytes=topk_ids_nbytes_idx
+            )
+            expert_mask_rsrc = buffer_ops.create_buffer_resource(
+                expert_mask, max_size=True
             )
 
             token_idx = gpu.block_id("x")
@@ -3728,11 +3737,15 @@ def compile_moe_reduction(
                             x_thread = x_div[None, tid_i32]
 
                             if const_expr(use_mask):
-                                m_idx_i32 = fx.Int32(token_idx * c_topk + fx.Index(k))
-                                mv = buffer_ops.buffer_load(
-                                    mask_rsrc, m_idx_i32, vec_width=1, dtype=i8_type()
+                                # Fused EP gather: valid = expert_mask[topk_ids[token, k]] != 0
+                                tk_idx_i32 = fx.Int32(token_idx * c_topk + fx.Index(k))
+                                eid_i32 = buffer_ops.buffer_load(
+                                    topk_ids_rsrc, tk_idx_i32, vec_width=1, dtype=i32_type()
                                 )
-                                mv_ok = mv != fx.Int8(0)
+                                valid_i32 = buffer_ops.buffer_load(
+                                    expert_mask_rsrc, eid_i32, vec_width=1, dtype=i32_type()
+                                )
+                                mv_ok = valid_i32 != fx.Int32(0)
 
                             if const_expr(n_sub > 1):
                                 x_inner = fx.logical_divide(
@@ -3811,14 +3824,21 @@ def compile_moe_reduction(
                                         (token_base + k_idx) * c_model_dim + col
                                     )
                                     if const_expr(use_mask):
-                                        m_idx_i32 = fx.Int32(token_base + k_idx)
-                                        mv = buffer_ops.buffer_load(
-                                            mask_rsrc,
-                                            m_idx_i32,
+                                        # Fused EP gather (tail): expert_mask[topk_ids[t,k]] != 0
+                                        tk_idx_i32 = fx.Int32(token_base + k_idx)
+                                        eid_i32 = buffer_ops.buffer_load(
+                                            topk_ids_rsrc,
+                                            tk_idx_i32,
                                             vec_width=1,
-                                            dtype=i8_type(),
+                                            dtype=i32_type(),
                                         )
-                                        v = (mv != fx.Int8(0)).select(
+                                        valid_i32 = buffer_ops.buffer_load(
+                                            expert_mask_rsrc,
+                                            eid_i32,
+                                            vec_width=1,
+                                            dtype=i32_type(),
+                                        )
+                                        v = (valid_i32 != fx.Int32(0)).select(
                                             buffer_ops.buffer_load(
                                                 x_rsrc,
                                                 x_idx_i32,
@@ -3852,12 +3872,13 @@ def compile_moe_reduction(
     def launch_moe_reduction(
         X: fx.Tensor,
         Y: fx.Tensor,
-        valid_mask: fx.Tensor,
+        expert_mask: fx.Tensor,
+        topk_ids: fx.Tensor,
         i32_m_tokens: fx.Int32,
         stream: fx.Stream,
     ):
         gx = fx.Index(i32_m_tokens)
-        moe_reduction_kernel(X, Y, valid_mask, i32_m_tokens).launch(
+        moe_reduction_kernel(X, Y, expert_mask, topk_ids, i32_m_tokens).launch(
             grid=(gx, gy_static, 1),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
@@ -3928,12 +3949,15 @@ class _MoeGemm2ReduceWrapper:
         n_in,
         k_in,
         size_expert_ids_in,
-        valid_mask=None,
+        expert_mask=None,
+        topk_ids=None,
         stream=None,
     ):
-        """Execute GEMM2 + reduce.
+        """Execute GEMM2 + masked reduce.
 
         Args match moe_gemm2 kernel signature (see compile_moe_gemm2).
+        When self._use_mask is True, expert_mask + topk_ids are required and
+        the reduction fuses ``valid = expert_mask[topk_ids[t, k]] != 0``.
         """
         import torch
 
@@ -3967,15 +3991,18 @@ class _MoeGemm2ReduceWrapper:
         # Phase 2: Reduce over topk -> [tokens, model_dim]
         X = intermediate.view(tokens_in, self._topk, self._model_dim)
         Y = arg_out.view(tokens_in, self._model_dim)
-        if not self._use_mask:
-            if valid_mask is not None:
-                logging.warning(
-                    "valid_mask provided but use_mask=False; ignoring valid_mask"
+        if self._use_mask:
+            if expert_mask is None or topk_ids is None:
+                raise ValueError(
+                    "expert_mask and topk_ids are required when use_mask=True"
                 )
-            valid_mask = torch.empty(
-                (0, self._topk), device=arg_out.device, dtype=torch.uint8
-            )
-        self._reduce_exe(X, Y, valid_mask, tokens_in, stream)
+            em = expert_mask.to(torch.int32).contiguous()
+            tk = topk_ids.to(torch.int32).contiguous()
+        else:
+            # Placeholders; kernel ignores them when use_mask=False (compile-time).
+            em = torch.empty(0, device=arg_out.device, dtype=torch.int32)
+            tk = torch.empty(0, device=arg_out.device, dtype=torch.int32)
+        self._reduce_exe(X, Y, em, tk, tokens_in, stream)
 
     @property
     def mode(self) -> str:
@@ -3999,7 +4026,7 @@ def compile_moe_gemm2_ex(
     use_cshuffle_epilog: bool | None = None,
     # Extended parameters for mode control
     mode: str = MoeGemm2Mode.ATOMIC,
-    valid_mask=None,
+    use_mask: bool = False,
     zero_intermediate: bool = True,
     scale_is_bf16: bool = False,
 ):
@@ -4012,6 +4039,10 @@ def compile_moe_gemm2_ex(
             - "atomic": Use atomic accumulation (original behavior)
             - "reduce": Use non-atomic write + reduce kernel
 
+        use_mask: If True, the reduction kernel fuses the EP gather
+            ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums
+            valid slots. Caller must pass expert_mask + topk_ids at call time.
+
         zero_intermediate: If all output slots are valid,
             set False to increase performance
 
@@ -4020,9 +4051,6 @@ def compile_moe_gemm2_ex(
     """
     # Compile based on mode
     if mode == MoeGemm2Mode.REDUCE:
-        # Determine if we need masked reduction
-        use_mask = valid_mask is not None
-
         # Compile GEMM2 with accumulate=False
         gemm2_exe = compile_moe_gemm2(
             model_dim=model_dim,
