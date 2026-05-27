@@ -640,6 +640,63 @@ def test_T3_numerical_correctness_reconstruction_equals_combined():
 
 
 @requires_flydsl
+def test_T3_numerical_correctness_on_flydsl_a8w4_fp8fp4():
+    """AC-7 + AC-3 on the A8W4 (fp8 activation / fp4 weight) FlyDSL path.
+
+    Uses the gptoss tok=512 D=3072 I=3072 E=128 K=4 Swiglu tuned shape, which
+    on gfx950 with M >= AITER_BF16_FP8_MOE_BOUND (default 256) dispatches to
+    `flydsl_moe2_afp8_wfp4_*`. Same moe_buf zero-patch + magnitude-aware
+    tolerance as the fp4/fp4 numerical test.
+    """
+    device = "cuda"
+    M, topk, E, model_dim, inter_dim = 512, 4, 128, 3072, 3072
+    if not _probe_metadata_for_flydsl(M, topk, E, model_dim, inter_dim,
+                                       activation=ActivationType.Swiglu):
+        pytest.skip("A8W4 FlyDSL stage2 not selected for this shape")
+    (hidden_states, w1, w2, w1_scale, w2_scale,
+     topk_weight, topk_ids) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device)
+    common = dict(
+        hidden_states=hidden_states, w1=w1, w2=w2,
+        topk_weight=topk_weight, topk_ids=topk_ids,
+        activation=ActivationType.Swiglu,
+        quant_type=QuantType.per_1x32,
+        w1_scale=w1_scale, w2_scale=w2_scale,
+    )
+
+    # Zero-patch the moe_buf allocation (same trick as the fp4/fp4 test)
+    real_torch_empty = torch.empty
+
+    def patched_empty(*args, **kwargs):
+        out = real_torch_empty(*args, **kwargs)
+        if out.dim() == 2 and out.shape == (M, model_dim) and out.dtype == hidden_states.dtype:
+            out.zero_()
+        return out
+
+    with patch.object(torch, "empty", side_effect=patched_empty):
+        combined = fused_moe(**common, no_combine=False)
+        per_slot = fused_moe(**common, no_combine=True)
+
+    assert combined.shape == (M, model_dim)
+    assert per_slot.shape == (M, topk, model_dim)
+    assert torch.isfinite(combined).all() and torch.isfinite(per_slot).all()
+
+    reconstructed = (per_slot.float() * topk_weight.unsqueeze(-1).float()).sum(dim=1).to(combined.dtype)
+    max_abs = float(combined.abs().max().item())
+    bf16_ulp_at_scale = max_abs / 128
+    atol = max(bf16_ulp_at_scale * 4, 1.0)
+    max_diff = float((reconstructed - combined).abs().max().item())
+    assert max_diff <= atol, (
+        f"A8W4 reconstruction max diff {max_diff:.2f} > atol {atol:.2f} "
+        f"(4 bf16 ulps at scale {max_abs:.0f})"
+    )
+    relative_l2 = float(((reconstructed - combined).float().pow(2).sum().sqrt()
+                         / (combined.float().pow(2).sum().sqrt() + 1e-6)).item())
+    assert relative_l2 < 0.02, (
+        f"A8W4 magnitude-weighted relative L2 {relative_l2:.4f} > 0.02"
+    )
+
+
+@requires_flydsl
 def test_T3_unweighted_per_slot_contract_on_flydsl_fp4():
     """AC-3 core contract: per-slot output is RAW (unweighted) expert
     outputs. Verified by:
