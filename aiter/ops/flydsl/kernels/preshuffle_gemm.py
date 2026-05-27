@@ -483,11 +483,7 @@ def compile_preshuffle_gemm_a8(
         if const_expr(_has_bias):
             bias_rsrc = _ptr_buffer_resource(arg_bias)
         b_rsrc = _ptr_buffer_resource(arg_b)
-        scale_b_rsrc = (
-            None
-            if (is_f16_or_bf16)
-            else _ptr_buffer_resource(arg_scale_b)
-        )
+        scale_b_rsrc = None if (is_f16_or_bf16) else _ptr_buffer_resource(arg_scale_b)
 
         bx_m = bx * tile_m
         by_n = by * tile_n

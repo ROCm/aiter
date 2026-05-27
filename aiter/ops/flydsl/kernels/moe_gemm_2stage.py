@@ -533,11 +533,17 @@ def compile_moe_gemm1(
                     sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes)
 
                 sorted_nbytes_idx = size_expert_ids_in * fx.Index(tile_m) * fx.Index(4)
-                sorted_rsrc = _ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes_idx)
-                sorted_w_rsrc = _ptr_buffer_resource(arg_sorted_weights, sorted_nbytes_idx)
+                sorted_rsrc = _ptr_buffer_resource(
+                    arg_sorted_token_ids, sorted_nbytes_idx
+                )
+                sorted_w_rsrc = _ptr_buffer_resource(
+                    arg_sorted_weights, sorted_nbytes_idx
+                )
 
                 # expert ids: [blocks] i32 -> bytes = size_expert_ids_in*4
-                expert_rsrc = _ptr_buffer_resource(arg_expert_ids, size_expert_ids_in * fx.Index(4))
+                expert_rsrc = _ptr_buffer_resource(
+                    arg_expert_ids, size_expert_ids_in * fx.Index(4)
+                )
 
                 # Expert id for this M tile (keep address math in `index`)
                 expert_i32 = buffer_ops.buffer_load(

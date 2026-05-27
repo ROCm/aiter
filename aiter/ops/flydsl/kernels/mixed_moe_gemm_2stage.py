@@ -621,7 +621,9 @@ def compile_mixed_moe_gemm1(
             w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
 
             # Out: [tokens*topk, inter_dim]
-            numids_rsrc = _ptr_buffer_resource(arg_num_valid_ids, arith.constant(4, type=T.i32))
+            numids_rsrc = _ptr_buffer_resource(
+                arg_num_valid_ids, arith.constant(4, type=T.i32)
+            )
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
             )
@@ -655,9 +657,7 @@ def compile_mixed_moe_gemm1(
             eid_nbytes_i32 = arith.index_cast(T.i32, eid_nbytes_idx)
             expert_rsrc = _ptr_buffer_resource(arg_expert_ids, eid_nbytes_i32)
             bias_rsrc = (
-                _ptr_buffer_resource(arg_bias, bias_nbytes)
-                if enable_bias
-                else None
+                _ptr_buffer_resource(arg_bias, bias_nbytes) if enable_bias else None
             )
 
             # Sorted-scale buffer resource for fused mxfp4 quantization
@@ -679,7 +679,9 @@ def compile_mixed_moe_gemm1(
                 _sort_scale_nbytes = arith.index_cast(
                     T.i32, _sort_padded_rows * _sort_padded_cols
                 )
-                sorted_scale_rsrc = _ptr_buffer_resource(arg_out_scale_sorted, _sort_scale_nbytes)
+                sorted_scale_rsrc = _ptr_buffer_resource(
+                    arg_out_scale_sorted, _sort_scale_nbytes
+                )
 
             # ---- persist_m loop (same pattern as stage2) ----
             _PERSIST_M = persist_m
@@ -3186,7 +3188,9 @@ def compile_mixed_moe_gemm2(
             out_rsrc = _ptr_buffer_resource(arg_out, out_nbytes_i32)
 
             # num_valid_ids (sorted padded MN) for scale sizing / guards.
-            numids_rsrc = _ptr_buffer_resource(arg_num_valid_ids, arith.constant(4, type=T.i32))
+            numids_rsrc = _ptr_buffer_resource(
+                arg_num_valid_ids, arith.constant(4, type=T.i32)
+            )
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
             )
@@ -3244,9 +3248,7 @@ def compile_mixed_moe_gemm2(
             eid_nbytes_i32 = arith.index_cast(T.i32, eid_nbytes_idx)
             expert_rsrc = _ptr_buffer_resource(arg_expert_ids, eid_nbytes_i32)
             bias_rsrc = (
-                _ptr_buffer_resource(arg_bias, bias_nbytes)
-                if enable_bias
-                else None
+                _ptr_buffer_resource(arg_bias, bias_nbytes) if enable_bias else None
             )
 
             # ---- persist loop ----

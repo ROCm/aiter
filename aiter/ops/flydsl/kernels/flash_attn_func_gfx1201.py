@@ -760,7 +760,11 @@ def build_flash_attn_func_module_primary(
         if hasattr(t, "data_ptr"):
             type_name = type(t).__name__
             module_name = type(t).__module__
-            ptr = 0 if type_name == "FakeTensor" or "fake_tensor" in module_name else t.data_ptr()
+            ptr = (
+                0
+                if type_name == "FakeTensor" or "fake_tensor" in module_name
+                else t.data_ptr()
+            )
             return flyc.from_c_void_p(fx.Uint8, ptr)
         return t
 

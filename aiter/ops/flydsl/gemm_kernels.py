@@ -76,6 +76,7 @@ def _ptr_view_safe(t: torch.Tensor):
         return flyc.from_c_void_p(fx.Uint8, 0)
     return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
+
 # Keep the generic auto-generated catalog aligned with the upstream FlyDSL
 # reference tuning space. The wider local one-off search space introduced
 # gfx950-faulting candidates (for example tile_k=160 and tile_n=160/192),
