@@ -33,8 +33,7 @@ def _fused_qk_norm_rope_cache_quant_shuffle_hip(
     q: Optional[Tensor] = None,
     k: Optional[Tensor] = None,
     v: Optional[Tensor] = None,
-) -> None:
-    ...
+) -> None: ...
 
 
 def fused_qk_norm_rope_cache_quant_shuffle(
@@ -136,8 +135,7 @@ def _fused_qk_rmsnorm_kernel(
     k_eps: float,
     q_out: Tensor,
     k_out: Tensor,
-) -> None:
-    ...
+) -> None: ...
 
 
 _FUSED_QK_FALLBACK_M = 16384
@@ -190,8 +188,7 @@ def fused_qk_norm_rope_cache_block_quant_shuffle(
     k_scale: Tensor,
     v_scale: Tensor,
     max_tokens_per_batch: int = 0,
-) -> None:
-    ...
+) -> None: ...
 
 
 @compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
@@ -221,8 +218,7 @@ def fused_qk_norm_rope_cache_pts_quant_shuffle(
     block_size: int,
     x: int,
     rotary_dim: int = 0,
-) -> None:
-    ...
+) -> None: ...
 
 
 @compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
@@ -247,8 +243,7 @@ def fused_qk_norm_rope_2way(
     eps: float,
     out_q01: Tensor,
     out_k01: Tensor,
-) -> None:
-    ...
+) -> None: ...
 
 
 @compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
