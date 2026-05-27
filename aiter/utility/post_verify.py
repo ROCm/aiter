@@ -29,11 +29,38 @@ _PERFTEST_KWARGS = frozenset(
 )
 
 
-def _max_rel_err(actual: torch.Tensor, ref: torch.Tensor, eps: float = 1e-6) -> float:
-    """Maximum per-element |a-b|/|b| over the full tensor, in fp32."""
+def _max_slack(
+    actual: torch.Tensor,
+    ref: torch.Tensor,
+    atol: float,
+    rtol: float,
+    tol_floor: float = 1e-12,
+) -> float:
+    """Maximum per-element ``|a-b| / (atol + rtol*|b|)`` over the tensor.
+
+    The denominator matches what ``torch.isclose(a, b, atol=atol, rtol=rtol)``
+    uses as its element-wise tolerance, so the returned ratio is "by how
+    many times does the worst element exceed the kernel's own
+    isclose-tolerance":
+
+    * value <= 1.0  -- every element is within isclose tolerance (the
+      kernel would already have errRatio=0 with these tols).
+    * value > 1.0   -- some element is over tolerance; how much is the
+      catastrophic-ness we want to gate on.
+
+    Anchoring to the local tolerance avoids the well-known pitfall of
+    naive ``|a-b| / |b|``: for small ``|b|`` (e.g. quantized outputs that
+    are legitimately near zero), the denominator collapses to ``eps``
+    and *correct* kernels look catastrophic. Using ``atol + rtol*|b|``
+    rejects this entire false-positive class while still flagging both
+    (i) a kernel that writes a wrong large value at a tiny-reference
+    position (the reviewer's wide-range example), and (ii) a kernel
+    that writes 0 where the reference is large.
+    """
     a = actual.float()
     b = ref.float()
-    return ((a - b).abs() / b.abs().clamp(min=eps)).max().item()
+    local_tol = (b.abs() * rtol).add_(atol).clamp_(min=tol_floor)
+    return ((a - b).abs() / local_tol).max().item()
 
 
 def _materialize_args(task, device):
@@ -103,15 +130,20 @@ def _fill_nan_sentinel(real_args, arg_key_list, output_keys):
 
 
 def _run_and_compare(task, device) -> float:
-    """Re-execute one task once on ``device`` and return max per-element rel err.
+    """Re-execute one task once on ``device`` and return max per-element slack.
 
     Two failure modes are detected:
 
     1. *Partial-write* kernels: output tensors are NaN-filled before the
        kernel runs (mirroring ``mp_tuner.worker``); any surviving NaN /
-       Inf in the output is treated as an infinite relative error.
-    2. *Wide-range* output errors: per-element ``|a-b|/|b|`` is computed
-       in fp32; the maximum value is returned.
+       Inf in the output is treated as an infinite slack.
+    2. *Wide-range* / wrong-value errors: per-element
+       ``|a-b| / (atol + rtol*|b|)`` is computed in fp32; the maximum
+       value is returned. The (atol, rtol) used are the ones the tune
+       task itself passed to ``checkAllclose`` (extracted from
+       ``task[10]``/``task[11]``), so this metric is on the same scale
+       as the tuner's tolerance: 1.0 means "exactly at the tune-time
+       isclose threshold", 10.0 means "10x past it".
 
     Note: ``task[5]`` (``kwargs``) is the dict that ``mp_tuner.worker``
     forwards to ``run_perftest``. ``run_perftest`` peels off its own
@@ -124,6 +156,8 @@ def _run_and_compare(task, device) -> float:
     _func = task[3]
     raw_kwargs = task[5] or {}
     func_kwargs = {k: v for k, v in raw_kwargs.items() if k not in _PERFTEST_KWARGS}
+    rtol = task[10] if len(task) > 10 and isinstance(task[10], (int, float)) else 1e-2
+    atol = task[11] if len(task) > 11 and isinstance(task[11], (int, float)) else 1e-2
     output_keys = (
         task[14] if len(task) > 14 and isinstance(task[14], (list, tuple)) else None
     )
@@ -147,14 +181,14 @@ def _run_and_compare(task, device) -> float:
         if not torch.isfinite(o).all():
             return float("inf")
 
-    return max(_max_rel_err(o, r) for o, r in tensor_pairs)
+    return max(_max_slack(o, r, atol=atol, rtol=rtol) for o, r in tensor_pairs)
 
 
 def verify_top1(
     tasks,
     result,
     *,
-    rel_tol: float = 0.5,
+    slack_tol: float = 10.0,
     max_fallback: int = 3,
     gpu_id: int = 0,
     verbose: bool = False,
@@ -166,13 +200,15 @@ def verify_top1(
             ``task[0]`` is the unique ``info`` tuple used as key.
         result: list of ``(info, us, err_ratio)`` returned by
             ``mp_tuner``; mutated in place.
-        rel_tol: maximum allowed per-element relative error
-            (``|a-b| / |b|``). The default of ``0.5`` (50%) is well
-            above the bit-quantization noise of correct bf16/fp16 GEMM
-            kernels (empirically ~0-1%) while being strict enough to
-            catch the dominant wide-range failure mode (a kernel that
-            writes ``0`` at a position whose reference value is large
-            produces ``rel_err = 1.0``).
+        slack_tol: maximum allowed per-element
+            ``|a-b| / (atol + rtol*|b|)`` (see ``_max_slack``). A value
+            of ``1.0`` is exactly what ``torch.isclose`` already allows;
+            anything above ``1.0`` is "by how many times past
+            tune-time tolerance is the worst element". The default of
+            ``10.0`` is a reasonable "10x past tolerance is suspicious"
+            gate that catches both wide-range and large-value
+            wrong-write failure modes without false-positives on
+            kernels that already pass tune-time isclose.
         max_fallback: max number of candidates per shape to verify
             (top-1, top-2, ..., top-max_fallback). Demoted entries
             have ``err_ratio`` set to ``1.0`` so the caller's sort
@@ -212,20 +248,20 @@ def verify_top1(
                     )
                 break
             try:
-                rel_err = _run_and_compare(task, device)
+                slack = _run_and_compare(task, device)
             except Exception as e:
                 if verbose:
                     print(f"[post-verify] {info}: verify crashed ({e}); demoting")
-                rel_err = float("inf")
+                slack = float("inf")
 
-            if rel_err <= rel_tol:
+            if slack <= slack_tol:
                 if verbose:
                     suffix = (
-                        f" (top-1 accepted, max_rel_err={rel_err:.3g})"
+                        f" (top-1 accepted, max_slack={slack:.3g})"
                         if attempt == 0
                         else (
                             f" (top-{attempt + 1} accepted after "
-                            f"{attempt} demotion(s), max_rel_err={rel_err:.3g})"
+                            f"{attempt} demotion(s), max_slack={slack:.3g})"
                         )
                     )
                     print(f"[post-verify] {shape_key}:{suffix}")
@@ -239,7 +275,7 @@ def verify_top1(
             if verbose:
                 print(
                     f"[post-verify] {shape_key}: top-{attempt + 1} demoted "
-                    f"(max_rel_err={rel_err:.3g} > {rel_tol})"
+                    f"(max_slack={slack:.3g} > {slack_tol})"
                 )
 
     print(

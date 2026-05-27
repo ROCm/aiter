@@ -246,15 +246,16 @@ class TunerCommon:
             "heuristic misses, without perturbing multi-GPU timing accuracy.",
         )
         self.parser.add_argument(
-            "--post_verify_rel_tol",
+            "--post_verify_slack_tol",
             type=float,
-            default=0.5,
-            help="With --post_verify, maximum allowed per-element relative error "
-            "(|a-b|/|b|). The default of 0.5 (50%%) sits well above the "
-            "bit-quantization noise of correct bf16/fp16 GEMM kernels (empirically "
-            "~0-1%%) while being strict enough to catch kernels that write 0 "
-            "where the reference is a large value (rel_err = 1.0) -- the most "
-            "common wide-range failure mode. Raise to be more lenient.",
+            default=10.0,
+            help="With --post_verify, maximum allowed per-element ratio of "
+            "|a-b| / (atol + rtol*|b|) -- i.e. how many times past the "
+            "kernel's own tune-time isclose tolerance the worst element is "
+            "allowed to be. 1.0 == exactly at tune tolerance; 10.0 (default) "
+            "== 10x past, the conventional catastrophic threshold. Anchoring "
+            "to (atol + rtol*|b|) avoids the small-|b| false-positive of "
+            "naive |a-b|/|b|.",
         )
         self.parser.add_argument(
             "--post_verify_max_fallback",

@@ -387,7 +387,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 ret = verify_top1(
                     task,
                     ret,
-                    rel_tol=args.post_verify_rel_tol,
+                    slack_tol=args.post_verify_slack_tol,
                     max_fallback=args.post_verify_max_fallback,
                     verbose=args.verbose,
                 )
