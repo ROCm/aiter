@@ -203,12 +203,15 @@ def fused_moe(
     combining.
 
     ``no_combine=True`` is currently supported only on the FlyDSL stage2 path
-    with ``b_dtype in {fp4, fp8}`` / ``w_dtype == fp4``. All other backends
-    (CK, CKTile, ASM, Triton, the 1-stage path), ``doweight_stage1=True``,
-    and ``b_dtype == int4`` (a16wi4) raise :class:`NotImplementedError` before
-    any sorting or kernel work. The per-slot output buffer is zero-initialized,
-    so positions corresponding to empty EP slots (``expert_mask``) are exactly
-    zero. Peak output memory grows by a factor of ``topk``.
+    with activation/weight dtype pairs ``(a_dtype, b_dtype) in {("fp4","fp4"),
+    ("fp8","fp4")}`` (A4W4 and the fp8-activation mixed-precision variant).
+    All other backends (CK, CKTile, ASM, Triton, the 1-stage path),
+    ``doweight_stage1=True``, and any other dtype pair (e.g. ``fp16``
+    activations or ``int4`` weights / a16wi4) raise
+    :class:`NotImplementedError` before any sorting or kernel work. The
+    per-slot output buffer is zero-initialized, so positions corresponding
+    to empty EP slots (``expert_mask``) are exactly zero. Peak output memory
+    grows by a factor of ``topk``.
     """
     if not block_size_M:
         block_size_M = -1
@@ -892,9 +895,10 @@ def _flydsl_stage2_wrapper(
     )
 
 
-# v1 supports only these (a_dtype, b_dtype) FlyDSL stage2 quant pairs. Locked
-# in by gen-plan DEC-2. fp16/fp4 and a16wi4 are excluded; widen in v2 only
-# after the corresponding kernel paths have been verified end-to-end.
+# Supported (a_dtype, b_dtype) FlyDSL stage2 quant pairs for the no_combine
+# return-per-slot path. Other registered FlyDSL kernels (e.g. fp16/fp4) and
+# the a16wi4 path are intentionally excluded; widen this allowlist only after
+# the corresponding kernel paths have been verified end-to-end.
 _NO_COMBINE_SUPPORTED_DTYPES = frozenset({("fp4", "fp4"), ("fp8", "fp4")})
 
 
