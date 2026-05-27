@@ -24,7 +24,6 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -47,17 +46,17 @@ def _per_128k_amax(t: torch.Tensor, k_dim: int) -> torch.Tensor:
     shape = list(t.shape)
     assert shape[k_dim] % 128 == 0
     nk = shape[k_dim] // 128
-    new_shape = shape[:k_dim] + [nk, 128] + shape[k_dim + 1:]
+    new_shape = shape[:k_dim] + [nk, 128] + shape[k_dim + 1 :]
     return t.float().reshape(new_shape).abs().amax(dim=k_dim + 1)
 
 
 def _fp32_to_ue8m0_byte(scale_f32: torch.Tensor) -> torch.Tensor:
     """fp32 scale → UE8M0 biased-exp byte (round-up to next pow2).
     Byte b represents 2^(b - 127). Clamped to [0, 254]."""
-    s = scale_f32.clamp_min(2.0 ** -126).float()
+    s = scale_f32.clamp_min(2.0**-126).float()
     m, e = torch.frexp(s)
     e = e.to(torch.int32)
-    is_pow2 = (m == 0.5)
+    is_pow2 = m == 0.5
     byte = torch.where(is_pow2, e - 1 + 127, e + 127)
     return byte.clamp(0, 254).to(torch.int32)
 
@@ -69,11 +68,15 @@ def _pack_ue8m0_bytes_to_i32(bytes_along_k: torch.Tensor) -> torch.Tensor:
     assert nk % 4 == 0
     b = bytes_along_k.to(torch.int32).reshape(*lead, nk // 4, 4)
     return (
-        (b[..., 0] & 0xFF)
-        | ((b[..., 1] & 0xFF) << 8)
-        | ((b[..., 2] & 0xFF) << 16)
-        | ((b[..., 3] & 0xFF) << 24)
-    ).contiguous().to(torch.int32)
+        (
+            (b[..., 0] & 0xFF)
+            | ((b[..., 1] & 0xFF) << 8)
+            | ((b[..., 2] & 0xFF) << 16)
+            | ((b[..., 3] & 0xFF) << 24)
+        )
+        .contiguous()
+        .to(torch.int32)
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +102,7 @@ def build_inputs_with_ref(H: int, D: int, R: int, B: int, device, seed: int = 0)
 
     # X: per-(B, H, K=128) quant → fp8 + per-block UE8M0 scale.
     sx_amax = _per_128k_amax(x_bf16, k_dim=2)
-    sx_scale_f32 = (sx_amax / 448.0).clamp_min(2.0 ** -126)
+    sx_scale_f32 = (sx_amax / 448.0).clamp_min(2.0**-126)
     sx_byte = _fp32_to_ue8m0_byte(sx_scale_f32)
     sx_pow2 = torch.ldexp(torch.ones_like(sx_scale_f32), sx_byte - 127)
     x_f32 = x_bf16.float().view(B, H, R // 128, 128)
@@ -108,13 +111,15 @@ def build_inputs_with_ref(H: int, D: int, R: int, B: int, device, seed: int = 0)
     sx_i32 = _pack_ue8m0_bytes_to_i32(sx_byte)
     # Reference X: round-trip through fp8 + pow2 dequant (NOT bf16 input)
     # so reference reflects the kernel's actual input.
-    x_ref_f32 = (x_fp8.float().view(B, H, R // 128, 128)
-                 * sx_pow2.unsqueeze(-1)).view(B, H, R)
+    x_ref_f32 = (x_fp8.float().view(B, H, R // 128, 128) * sx_pow2.unsqueeze(-1)).view(
+        B, H, R
+    )
 
     # Y: per-(D=128, K=128) block quant.
-    sy_amax = (y_bf16.float().view(H, D // 128, 128, R // 128, 128)
-               .abs().amax(dim=(2, 4)))
-    sy_scale_f32 = (sy_amax / 448.0).clamp_min(2.0 ** -126)
+    sy_amax = (
+        y_bf16.float().view(H, D // 128, 128, R // 128, 128).abs().amax(dim=(2, 4))
+    )
+    sy_scale_f32 = (sy_amax / 448.0).clamp_min(2.0**-126)
     sy_byte = _fp32_to_ue8m0_byte(sy_scale_f32)
     sy_pow2 = torch.ldexp(torch.ones_like(sy_scale_f32), sy_byte - 127)
     y_blk = y_bf16.float().view(H, D // 128, 128, R // 128, 128)
@@ -124,8 +129,10 @@ def build_inputs_with_ref(H: int, D: int, R: int, B: int, device, seed: int = 0)
     sy_i32 = _pack_ue8m0_bytes_to_i32(sy_byte)
     # Reference Y: dequant the fp8-rounded tensor (so reference matches
     # what the kernel internally sees).
-    y_ref_f32 = (y_fp8.float().view(H, D // 128, 128, R // 128, 128)
-                 * sy_pow2.unsqueeze(2).unsqueeze(-1)).view(H, D, R)
+    y_ref_f32 = (
+        y_fp8.float().view(H, D // 128, 128, R // 128, 128)
+        * sy_pow2.unsqueeze(2).unsqueeze(-1)
+    ).view(H, D, R)
 
     return x_fp8, y_pre, sx_i32, sy_i32, x_ref_f32, y_ref_f32
 
@@ -151,7 +158,10 @@ def fp8_einsum_bf16_kernel(x_fp8, y_pre, sx_i32, sy_i32):
 def fp8_einsum_qz_kernel(x_fp8, y_pre, sx_i32, sy_i32, transpose_scale):
     """Returns (z_fp8, sz_fp32)."""
     return fp8_einsum(
-        x_fp8, y_pre, sx_i32, sy_i32,
+        x_fp8,
+        y_pre,
+        sx_i32,
+        sy_i32,
         out_dtype=torch.float8_e4m3fn,
         transpose_scale=transpose_scale,
     )
@@ -164,7 +174,11 @@ def fp8_einsum_qz_kernel(x_fp8, y_pre, sx_i32, sy_i32, transpose_scale):
 def test_fp8_einsum_bf16(H, D, R, B):
     """bf16 output: compare auto-dispatched kernel vs fp32 reference."""
     x_fp8, y_pre, sx_i32, sy_i32, x_ref, y_ref = build_inputs_with_ref(
-        H, D, R, B, torch.device("cuda"),
+        H,
+        D,
+        R,
+        B,
+        torch.device("cuda"),
     )
     z_ref_f32 = einsum_ref_fp32(x_ref, y_ref)
     z_ref_bf16 = z_ref_f32.bfloat16()
@@ -174,21 +188,27 @@ def test_fp8_einsum_bf16(H, D, R, B):
     _ = fp8_einsum_bf16_kernel(x_fp8, y_pre, sx_i32, sy_i32)
 
     z_kernel, kernel_us = run_perftest(
-        fp8_einsum_bf16_kernel, x_fp8, y_pre, sx_i32, sy_i32,
+        fp8_einsum_bf16_kernel,
+        x_fp8,
+        y_pre,
+        sx_i32,
+        sy_i32,
     )
 
     # Accuracy: bf16 output should match the bf16-cast fp32 reference within
     # a generous tol (fp8 quant of inputs alone gives ~1% relative error on
     # the output before bf16 rounding). Tol values mirror test_mhc's style.
     err = checkAllclose(
-        z_ref_bf16, z_kernel, rtol=5e-2, atol=2e-1, msg="bf16 z",
+        z_ref_bf16,
+        z_kernel,
+        rtol=5e-2,
+        atol=2e-1,
+        msg="bf16 z",
     )
 
     # Determinism: second launch should be bit-exact.
     z_kernel_2 = fp8_einsum_bf16_kernel(x_fp8, y_pre, sx_i32, sy_i32)
-    det = (
-        z_kernel.view(torch.int16) == z_kernel_2.view(torch.int16)
-    ).all().item()
+    det = (z_kernel.view(torch.int16) == z_kernel_2.view(torch.int16)).all().item()
     aiter.logger.info(f"  bf16 determinism: {'PASS' if det else 'FAIL'}")
 
     flops = 2 * B * H * D * R
@@ -206,7 +226,11 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
     """qz output: kernel's fp8 × per-D128 scale should reconstruct the
     fp32-reference einsum within fp8-quant tolerance."""
     x_fp8, y_pre, sx_i32, sy_i32, x_ref, y_ref = build_inputs_with_ref(
-        H, D, R, B, torch.device("cuda"),
+        H,
+        D,
+        R,
+        B,
+        torch.device("cuda"),
     )
     z_ref_f32 = einsum_ref_fp32(x_ref, y_ref)
 
@@ -215,7 +239,11 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
 
     (z_fp8, sz), kernel_us = run_perftest(
         fp8_einsum_qz_kernel,
-        x_fp8, y_pre, sx_i32, sy_i32, transpose_scale,
+        x_fp8,
+        y_pre,
+        sx_i32,
+        sy_i32,
+        transpose_scale,
     )
 
     # Normalize scale layout to (B, H, D/128) for dequant.
@@ -237,7 +265,8 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
     # threshold (default 5%) inside checkAllclose gates the actual pass.
     ref_max = z_ref_f32.abs().max().item()
     err = checkAllclose(
-        z_ref_f32, z_recon,
+        z_ref_f32,
+        z_recon,
         rtol=1e-1,
         atol=max(5e-1, 0.25 * ref_max),
         msg="qz dequant",
@@ -245,12 +274,18 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
 
     # Scale must be strictly positive.
     sz_pos = (sz > 0).all().item()
-    aiter.logger.info(f"  qz sz_positive: {'PASS' if sz_pos else 'FAIL'}  "
-                      f"sz_range=[{sz.min().item():.3e}, {sz.max().item():.3e}]")
+    aiter.logger.info(
+        f"  qz sz_positive: {'PASS' if sz_pos else 'FAIL'}  "
+        f"sz_range=[{sz.min().item():.3e}, {sz.max().item():.3e}]"
+    )
 
     # Determinism: both z_fp8 and sz should be bit-exact across runs.
     z_fp8_2, sz_2 = fp8_einsum_qz_kernel(
-        x_fp8, y_pre, sx_i32, sy_i32, transpose_scale,
+        x_fp8,
+        y_pre,
+        sx_i32,
+        sy_i32,
+        transpose_scale,
     )
     det_z = (z_fp8.view(torch.int8) == z_fp8_2.view(torch.int8)).all().item()
     det_sz = (sz == sz_2).all().item()
@@ -276,14 +311,14 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
 # auto-dispatched kernel will raise ValueError.
 TUNED_SHAPES = [
     # (H, D, R, label)
-    ( 16, 1024, 4096, "decode-like"),
-    (  8, 8192, 8192, "prefill-like"),
+    (16, 1024, 4096, "decode-like"),
+    (8, 8192, 8192, "prefill-like"),
 ]
 # Default B sweep — subset of the tuned B set per shape, picked to cover
 # latency/mid/compute regimes. Override with -m.
 DEFAULT_BS = {
-    ( 16, 1024, 4096): [1, 16, 256, 1024, 16384],
-    (  8, 8192, 8192): [128, 512, 2048],
+    (16, 1024, 4096): [1, 16, 256, 1024, 16384],
+    (8, 8192, 8192): [128, 512, 2048],
 }
 
 parser = argparse.ArgumentParser(
@@ -321,22 +356,25 @@ args = parser.parse_args()
 labels = args.shape if args.shape else [lbl for *_, lbl in TUNED_SHAPES]
 shapes = [(h, d, r, lbl) for (h, d, r, lbl) in TUNED_SHAPES if lbl in labels]
 
+
 # Build the per-shape B list.
 def bs_for(H, D, R):
     return args.m if args.m else DEFAULT_BS[(H, D, R)]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Run bf16 sweep
 # ─────────────────────────────────────────────────────────────────────────────
 if args.mode in ("bf16", "all"):
     rows = []
-    for (H, D, R, label) in shapes:
+    for H, D, R, label in shapes:
         for B in bs_for(H, D, R):
             ret = test_fp8_einsum_bf16(H=H, D=D, R=R, B=B)
             rows.append({"shape": label, "H": H, "D": D, "R": R, "B": B, **ret})
     df = pd.DataFrame(rows)
     aiter.logger.info(
-        "fp8_einsum bf16 summary (markdown):\n%s", df.to_markdown(index=False),
+        "fp8_einsum bf16 summary (markdown):\n%s",
+        df.to_markdown(index=False),
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,7 +382,7 @@ if args.mode in ("bf16", "all"):
 # ─────────────────────────────────────────────────────────────────────────────
 if args.mode in ("qz", "all"):
     rows = []
-    for (H, D, R, label) in shapes:
+    for H, D, R, label in shapes:
         for B in bs_for(H, D, R):
             ret = test_fp8_einsum_qz(H=H, D=D, R=R, B=B, transpose_scale=False)
             rows.append({"shape": label, "H": H, "D": D, "R": R, "B": B, **ret})
@@ -359,7 +397,7 @@ if args.mode in ("qz", "all"):
 # ─────────────────────────────────────────────────────────────────────────────
 if args.mode in ("qz_tsz", "all"):
     rows = []
-    for (H, D, R, label) in shapes:
+    for H, D, R, label in shapes:
         for B in bs_for(H, D, R):
             ret = test_fp8_einsum_qz(H=H, D=D, R=R, B=B, transpose_scale=True)
             rows.append({"shape": label, "H": H, "D": D, "R": R, "B": B, **ret})

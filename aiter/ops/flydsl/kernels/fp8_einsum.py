@@ -25,12 +25,7 @@ Public entry points (all in this module):
 The experimental ni-rotated variant lives in fp8_einsum_clean.py as
 `compile_fp8_einsum_clean_ue8m0_ni_rotated` (not used by autotune dispatch).
 
-DeepGEMM-style clean FP8 einsum for gfx950 — v2 pipeline (preshuffle-style).
-
-Z[b,h,d] = einsum('bhr,hdr->bhd', X_fp8, Y_fp8) with per-token-per-K-128 packed
-UE8M0 scales — caller responsible for all quantization.
-
-ABI matches DeepGEMM SM100 packed-ue8m0 format (UNCHANGED from v1):
+ABI (DeepGEMM SM100 packed-UE8M0):
   arg_z : bf16 (B, H, D)
   arg_x : fp8 e4m3 (B, H, R)             — caller pre-quantizes
   arg_y : fp8 e4m3 preshuffled per head, layout (n0, k0, klane=4, nlane=16, kpack=16)
@@ -38,25 +33,14 @@ ABI matches DeepGEMM SM100 packed-ue8m0 format (UNCHANGED from v1):
   arg_sy: int32 (H, D // 128, R // 512)  — same packing along K
   i32_b : runtime batch size
 
-V2 pipeline (mirrors preshuffle_gemm's async pingpong, adapted to our scale-in-MFMA):
-  - async-A via raw_ptr_buffer_load_lds with swizzle-the-source (no register transit)
-  - Zero A registers carried across iters
+V2 pipeline (preshuffle-style async pingpong, scale-in-MFMA):
+  - async-A: raw_ptr_buffer_load_lds with swizzle-the-source (no reg transit)
   - B, sx_i32, sy_i32 all carried in registers across iters
-  - Scale fed DIRECTLY to MFMA (packed UE8M0 via opsel byte index) — no fp32 promote
+  - Scale fed DIRECTLY to MFMA (packed UE8M0 via opsel byte index)
   - a0_prefetch: first A pack of NEXT tile pre-loaded from LDS to regs before
-    next-iter MFMA fires (saves 1 ds_read from the inner-loop critical path)
-  - Unrolled pingpong: each loop iter handles 2 K-tiles (compute on pong + prefetch
-    ping, then compute on ping + prefetch pong) — matches preshuffle_gemm exactly
-  - Single waitcnt per half: vmcnt(N_b+N_sx+N_sy) + lgkmcnt(0) AFTER compute_tile
-
-Kernel body has only:
-  - async A load gmem→LDS (raw_ptr_buffer_load_lds)
-  - sync B load gmem→regs
-  - sync sx/sy load gmem→regs (packed i32, carried across iters)
-  - mfma_scale_f32_16x16x128_f8f6f4 with the i32 scales fed directly
-  - bf16 store
-
-No online quant, no fp32 promote step, no sx/sy LDS slab.
+    next-iter MFMA fires (hides 1 ds_read from the inner-loop critical path)
+  - Unrolled pingpong: each loop iter handles 2 K-tiles
+  - Single waitcnt per half: vmcnt(N_b+N_sx+N_sy)+lgkmcnt(0) AFTER compute_tile
 """
 
 import torch
@@ -75,7 +59,6 @@ from .mfma_preshuffle_pipeline import (
     xcd_remap_bx_by,
 )
 
-
 # ──────────────────────────────────────────────────────────────────────────
 # Autotune winners (per-shape best tiles)
 # ──────────────────────────────────────────────────────────────────────────
@@ -90,52 +73,51 @@ from .mfma_preshuffle_pipeline import (
 #
 # Regenerate by running the autotune scripts above and pasting winners here.
 # These tiles have been validated for correctness + were time-best on
-# gfx950 / MI355X (240 CUs, 2500 TF FP8 peak).
 _AUTOTUNE_WINNERS_BF16 = {
     # (H,  D,    R,    B    ) -> (tm, tn, tk, bsw)
     # H=16 D=1024 R=4096 dynamic-B sweep
-    ( 16, 1024, 4096,     1): (32, 128, 256, 2),
-    ( 16, 1024, 4096,     2): (32, 128, 256, 8),
-    ( 16, 1024, 4096,     4): (32, 128, 256, 0),
-    ( 16, 1024, 4096,     8): (32, 128, 256, 2),
-    ( 16, 1024, 4096,    16): (32, 128, 256, 0),
-    ( 16, 1024, 4096,    32): (32, 128, 256, 8),
-    ( 16, 1024, 4096,    64): (64, 128, 256, 0),
-    ( 16, 1024, 4096,   128): (64, 128, 256, 0),
-    ( 16, 1024, 4096,   256): (128, 128, 256, 0),
-    ( 16, 1024, 4096,   512): (64, 256, 128, 2),
-    ( 16, 1024, 4096,  1024): (64, 256, 128, 4),
-    ( 16, 1024, 4096,  4096): (128, 128, 128, 8),
-    ( 16, 1024, 4096,  8192): (128, 128, 128, 4),
-    ( 16, 1024, 4096, 16384): (128, 128, 128, 4),
-    ( 16, 1024, 4096, 32768): (128, 128, 128, 4),
+    (16, 1024, 4096, 1): (32, 128, 256, 2),
+    (16, 1024, 4096, 2): (32, 128, 256, 8),
+    (16, 1024, 4096, 4): (32, 128, 256, 0),
+    (16, 1024, 4096, 8): (32, 128, 256, 2),
+    (16, 1024, 4096, 16): (32, 128, 256, 0),
+    (16, 1024, 4096, 32): (32, 128, 256, 8),
+    (16, 1024, 4096, 64): (64, 128, 256, 0),
+    (16, 1024, 4096, 128): (64, 128, 256, 0),
+    (16, 1024, 4096, 256): (128, 128, 256, 0),
+    (16, 1024, 4096, 512): (64, 256, 128, 2),
+    (16, 1024, 4096, 1024): (64, 256, 128, 4),
+    (16, 1024, 4096, 4096): (128, 128, 128, 8),
+    (16, 1024, 4096, 8192): (128, 128, 128, 4),
+    (16, 1024, 4096, 16384): (128, 128, 128, 4),
+    (16, 1024, 4096, 32768): (128, 128, 128, 4),
     # H=8 D=R=8192 peak shapes
-    (  8, 8192, 8192,   128): (128, 128, 256, 0),
-    (  8, 8192, 8192,   512): (128, 256, 128, 0),
-    (  8, 8192, 8192,  2048): (128, 128, 256, 2),
+    (8, 8192, 8192, 128): (128, 128, 256, 0),
+    (8, 8192, 8192, 512): (128, 256, 128, 0),
+    (8, 8192, 8192, 2048): (128, 128, 256, 2),
 }
 
 _AUTOTUNE_WINNERS_QZ = {
     # H=16 D=1024 R=4096 dynamic-B sweep
-    ( 16, 1024, 4096,     1): (32, 128, 256, 2),
-    ( 16, 1024, 4096,     2): (32, 128, 256, 8),
-    ( 16, 1024, 4096,     4): (32, 128, 256, 0),
-    ( 16, 1024, 4096,     8): (32, 128, 256, 2),
-    ( 16, 1024, 4096,    16): (32, 128, 256, 0),
-    ( 16, 1024, 4096,    32): (32, 128, 256, 8),
-    ( 16, 1024, 4096,    64): (64, 128, 256, 0),
-    ( 16, 1024, 4096,   128): (64, 128, 256, 0),
-    ( 16, 1024, 4096,   256): (128, 128, 256, 0),
-    ( 16, 1024, 4096,   512): (64, 256, 128, 2),
-    ( 16, 1024, 4096,  1024): (64, 256, 128, 4),
-    ( 16, 1024, 4096,  4096): (128, 128, 128, 8),
-    ( 16, 1024, 4096,  8192): (128, 128, 128, 4),
-    ( 16, 1024, 4096, 16384): (128, 128, 128, 4),
-    ( 16, 1024, 4096, 32768): (128, 128, 128, 4),
+    (16, 1024, 4096, 1): (32, 128, 256, 2),
+    (16, 1024, 4096, 2): (32, 128, 256, 8),
+    (16, 1024, 4096, 4): (32, 128, 256, 0),
+    (16, 1024, 4096, 8): (32, 128, 256, 2),
+    (16, 1024, 4096, 16): (32, 128, 256, 0),
+    (16, 1024, 4096, 32): (32, 128, 256, 8),
+    (16, 1024, 4096, 64): (64, 128, 256, 0),
+    (16, 1024, 4096, 128): (64, 128, 256, 0),
+    (16, 1024, 4096, 256): (128, 128, 256, 0),
+    (16, 1024, 4096, 512): (64, 256, 128, 2),
+    (16, 1024, 4096, 1024): (64, 256, 128, 4),
+    (16, 1024, 4096, 4096): (128, 128, 128, 8),
+    (16, 1024, 4096, 8192): (128, 128, 128, 4),
+    (16, 1024, 4096, 16384): (128, 128, 128, 4),
+    (16, 1024, 4096, 32768): (128, 128, 128, 4),
     # H=8 D=R=8192 peak shapes
-    (  8, 8192, 8192,   128): (128, 128, 128, 0),
-    (  8, 8192, 8192,   512): (128, 128, 256, 0),
-    (  8, 8192, 8192,  2048): (128, 128, 256, 4),
+    (8, 8192, 8192, 128): (128, 128, 128, 0),
+    (8, 8192, 8192, 512): (128, 128, 256, 0),
+    (8, 8192, 8192, 2048): (128, 128, 256, 4),
 }
 
 
@@ -220,8 +202,13 @@ def compile_fp8_einsum_clean_ue8m0_auto(
     table = _AUTOTUNE_WINNERS_QZ if quant_output else _AUTOTUNE_WINNERS_BF16
     (tm, tn, tk, bsw), _ = _autotune_lookup(table, H, D, R, B)
     return compile_fp8_einsum_clean_ue8m0(
-        H=H, D=D, R=R,
-        tile_m=tm, tile_n=tn, tile_k=tk, block_swizzle_n=bsw,
+        H=H,
+        D=D,
+        R=R,
+        tile_m=tm,
+        tile_n=tn,
+        tile_k=tk,
+        block_swizzle_n=bsw,
         quant_output=quant_output,
         quant_transpose_scale=quant_transpose_scale,
     )
@@ -241,7 +228,10 @@ def compile_fp8_einsum_clean_ue8m0_qz_auto(
     quant_transpose_scale=transpose_scale)`.
     """
     return compile_fp8_einsum_clean_ue8m0_auto(
-        H=H, D=D, R=R, B=B,
+        H=H,
+        D=D,
+        R=R,
+        B=B,
         quant_output=True,
         quant_transpose_scale=transpose_scale,
     )
@@ -351,7 +341,11 @@ def fp8_einsum(
     if kernel is None:
         if is_qz:
             kernel = compile_fp8_einsum_clean_ue8m0_qz_auto(
-                H=H, D=D, R=R, B=B, transpose_scale=transpose_scale,
+                H=H,
+                D=D,
+                R=R,
+                B=B,
+                transpose_scale=transpose_scale,
             )
         else:
             kernel = compile_fp8_einsum_clean_ue8m0_auto(H=H, D=D, R=R, B=B)
@@ -424,9 +418,7 @@ def compile_fp8_einsum_clean_ue8m0(
                 f"(per-WG D-128 reduce). Got tile_n={tile_n}."
             )
     if quant_transpose_scale and not quant_output:
-        raise ValueError(
-            "quant_transpose_scale=True requires quant_output=True"
-        )
+        raise ValueError("quant_transpose_scale=True requires quant_output=True")
     if tile_k % 128 != 0:
         raise ValueError(f"tile_k must be a multiple of 128, got {tile_k}")
     if tile_m < 16 or (tile_m % 16) != 0:
@@ -450,9 +442,7 @@ def compile_fp8_einsum_clean_ue8m0(
 
     gpu_arch = get_hip_arch()
     if not str(gpu_arch).startswith("gfx95"):
-        raise RuntimeError(
-            f"clean ue8m0 kernel targets gfx950 only, got {gpu_arch}"
-        )
+        raise RuntimeError(f"clean ue8m0 kernel targets gfx950 only, got {gpu_arch}")
 
     elem_bytes_a = 1  # fp8
     elem_bytes_b = 1  # fp8
@@ -525,14 +515,7 @@ def compile_fp8_einsum_clean_ue8m0(
     )
     lds_a_fp8_k_blocks16 = lds_a_fp8_stride_bytes // 16
 
-    # B fp8 LDS — KEEPING ENABLED for user review of the prefetch attempt.
-    # This is the g-level prefetch variant (Task #58). Bench shows -22 to -32%
-    # vs baseline at peak shape because LLVM's scheduler reorders ds_reads
-    # to be tight against MFMAs (5-line gap observed, not 65-cyc hide window).
-    # Archive at att_bldsg_prefetch_regression/ for review.
-    # SNAPSHOT 1896 TF: B is in registers, no LDS allocation for B.
-    lds_b_fp8_bytes_per_stage = 0
-    lds_b_fp8_alloc_offsets, lds_b_fp8_allocs = [], []
+    # B fp8 is kept in registers (gmem→regs via load_b_tile); no LDS slab.
 
     # Number of N-128-blocks per WG (= tile_n / 128). At tile_n=128 this is
     # 1 (the original assumption); at tile_n=256, 2; etc.
@@ -544,7 +527,7 @@ def compile_fp8_einsum_clean_ue8m0(
     #   slot(nb_idx, k_packed_idx) = nb_idx * (R/512) + k_packed_idx
     # Bytes: n_blocks_per_tile * (R/512) * 4. At tn=128 R=8192: 1*16*4 = 64.
     # At tn=256 R=8192: 2*16*4 = 128.
-    _sy_lds_per_nb = R // 512                    # i32 entries per N-128-block
+    _sy_lds_per_nb = R // 512  # i32 entries per N-128-block
     _sy_lds_count = n_blocks_per_tile * _sy_lds_per_nb
     _sy_lds_bytes = _sy_lds_count * 4
     sy_lds_offset = allocator_pong._align(allocator_pong.ptr, 16)
@@ -555,8 +538,8 @@ def compile_fp8_einsum_clean_ue8m0(
     # the per-token-per-K-128 packed scale. Slab layout (row-major within WG):
     #   slot(row_in_tile, k_packed_idx) = row_in_tile * (R/512) + k_packed_idx
     # Bytes: tile_m * (R/512) * 4. At tm=128 R=8192: 128*16*4 = 8 KB per WG.
-    _sx_lds_per_row = R // 512                   # i32 entries per row
-    _sx_lds_count = tile_m * _sx_lds_per_row     # total i32 entries
+    _sx_lds_per_row = R // 512  # i32 entries per row
+    _sx_lds_count = tile_m * _sx_lds_per_row  # total i32 entries
     _sx_lds_bytes = _sx_lds_count * 4
     # We distribute the load across all 256 threads; require perfect
     # divisibility for a clean coalesced load with no bounds check.
@@ -590,9 +573,7 @@ def compile_fp8_einsum_clean_ue8m0(
     if quant_output:
         _qz_d128_per_tile = tile_n // 128
         _qz_waves_per_d128 = 4 if tile_n == 128 else 2
-        _qz_amax_count = (
-            tile_m * _qz_d128_per_tile * _qz_waves_per_d128
-        )
+        _qz_amax_count = tile_m * _qz_d128_per_tile * _qz_waves_per_d128
         _qz_amax_bytes = _qz_amax_count * 4
         qz_amax_lds_offset = allocator_pong._align(allocator_pong.ptr, 16)
         allocator_pong.ptr = qz_amax_lds_offset + max(16, _qz_amax_bytes)
@@ -648,7 +629,13 @@ def compile_fp8_einsum_clean_ue8m0(
     # We hoist the shared body into `_kernel_body(arg_z, arg_sz, arg_x, ...)`.
     # In bf16 mode `arg_sz` is None and the qz epilogue is skipped.
     def _kernel_body(
-        arg_z, arg_sz, arg_x, arg_y, arg_sx, arg_sy, i32_b,
+        arg_z,
+        arg_sz,
+        arg_x,
+        arg_y,
+        arg_sx,
+        arg_sy,
+        i32_b,
     ):
         Vec = fx.Vector
         fp8_dtype = fx.Float8E4M3FN
@@ -665,8 +652,12 @@ def compile_fp8_einsum_clean_ue8m0(
         if const_expr(block_swizzle_n > 0):
             _c_m_eff = gx * fx.Index(tile_m)
             bx, by = xcd_remap_bx_by(
-                bx_raw, by_raw, _c_m_eff,
-                tile_m=tile_m, tile_n=tile_n, N=D,
+                bx_raw,
+                by_raw,
+                _c_m_eff,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                N=D,
                 xcd_swizzle=block_swizzle_n,
             )
         else:
@@ -685,36 +676,31 @@ def compile_fp8_einsum_clean_ue8m0(
         for _off, _alloc in zip(lds_a_fp8_alloc_offsets, lds_a_fp8_allocs):
             _base = base_ptr_pong if _alloc is allocator_pong else base_ptr_ping
             _ptr = SmemPtr(
-                _base, _off, fp8_dtype.ir_type,
+                _base,
+                _off,
+                fp8_dtype.ir_type,
                 shape=(lds_a_fp8_bytes_per_stage,),
             )
             lds_a_fp8_stages.append(_ptr.get())
         lds_a_pong = lds_a_fp8_stages[0]
         lds_a_ping = lds_a_fp8_stages[1]
 
-        # B fp8 LDS — only allocated when Stage 2 (JIT B from LDS) is wired.
-        # Currently disabled; the K-loop driver uses load_b_tile (gmem→regs).
-        lds_b_fp8_stages = []
-        for _off, _alloc in zip(lds_b_fp8_alloc_offsets, lds_b_fp8_allocs):
-            _base = base_ptr_pong if _alloc is allocator_pong else base_ptr_ping
-            _ptr = SmemPtr(
-                _base, _off, fp8_dtype.ir_type,
-                shape=(lds_b_fp8_bytes_per_stage,),
-            )
-            lds_b_fp8_stages.append(_ptr.get())
-        lds_b_pong = lds_b_fp8_stages[0] if lds_b_fp8_stages else None
-        lds_b_ping = lds_b_fp8_stages[1] if len(lds_b_fp8_stages) >= 2 else None
+        # B fp8 is carried in registers via load_b_tile (gmem→regs); no LDS.
 
         # sy LDS slab — persistent, R/512 i32 entries (max R/512 = 16 at R=8192).
         _sy_lds_ptr = SmemPtr(
-            base_ptr_pong, sy_lds_offset, fx.Int32.ir_type,
+            base_ptr_pong,
+            sy_lds_offset,
+            fx.Int32.ir_type,
             shape=(max(4, _sy_lds_count),),
         )
         lds_sy = _sy_lds_ptr.get()
 
         # sx LDS slab — persistent, tile_m * R/512 i32 entries.
         _sx_lds_ptr = SmemPtr(
-            base_ptr_pong, sx_lds_offset, fx.Int32.ir_type,
+            base_ptr_pong,
+            sx_lds_offset,
+            fx.Int32.ir_type,
             shape=(max(4, _sx_lds_count),),
         )
         lds_sx = _sx_lds_ptr.get()
@@ -722,7 +708,9 @@ def compile_fp8_einsum_clean_ue8m0(
         # qz amax LDS slab.
         if quant_output:
             _qz_amax_lds_ptr = SmemPtr(
-                base_ptr_pong, qz_amax_lds_offset, fx.Float32.ir_type,
+                base_ptr_pong,
+                qz_amax_lds_offset,
+                fx.Float32.ir_type,
                 shape=(max(4, _qz_amax_count),),
             )
             lds_qz_amax = _qz_amax_lds_ptr.get()
@@ -788,9 +776,7 @@ def compile_fp8_einsum_clean_ue8m0(
         tile_k_dwords = tile_k // 4
         c4 = fx.Index(4)
         tx_i32_base = tx * c4
-        layout_a_tile_div4 = fx.make_layout(
-            (tile_m, tile_k_dwords), (tile_k_dwords, 1)
-        )
+        layout_a_tile_div4 = fx.make_layout((tile_m, tile_k_dwords), (tile_k_dwords, 1))
 
         def a_tile_chunk_coord(i):
             return tile_chunk_coord_i32(
@@ -828,21 +814,23 @@ def compile_fp8_einsum_clean_ue8m0(
                 fx.Int64.ir_type,
                 fx.Int64(wave_id * fx.Index(_a_wave_bytes_per_chunk)),
             )
-            lds_base = memref_dialect.extract_aligned_pointer_as_index(
-                lds_buffer
-            )
+            lds_base = memref_dialect.extract_aligned_pointer_as_index(lds_buffer)
             lds_ptr_base = buffer_ops.create_llvm_ptr(
-                fx.Int64(lds_base), address_space=3,
+                fx.Int64(lds_base),
+                address_space=3,
             )
             lds_ptr_wave = buffer_ops.get_element_ptr(
-                lds_ptr_base, wave_byte_off,
+                lds_ptr_base,
+                wave_byte_off,
             )
 
             for i in range_constexpr(num_a_loads):
                 row_a_local, col_dword_local = a_tile_chunk_coord(i)
                 col_byte_local = col_dword_local * c4
                 col_byte_swz = swizzle_xor16(
-                    row_a_local, col_byte_local, _lds_a_fp8_k_blocks16_c,
+                    row_a_local,
+                    col_byte_local,
+                    _lds_a_fp8_k_blocks16_c,
                 )
                 row_a_global = bx_m + row_a_local
                 idx_elem = (
@@ -859,20 +847,14 @@ def compile_fp8_einsum_clean_ue8m0(
                         static_byte_offset=i * _a_chunk_stride_bytes,
                     )
                 rocdl.raw_ptr_buffer_load_lds(
-                    x_rsrc, lds_dst,
+                    x_rsrc,
+                    lds_dst,
                     fx.Int32(_a_async_load_bytes),
                     global_offset_i32,
                     fx.Int32(0),
                     fx.Int32(0),
                     fx.Int32(1),
                 )
-
-        # Number of vec4 i32 chunks per lane per tile (one per ni, ku64).
-        # At tn=128 tk=256: num_acc_n=2, k_unroll/2=4 → 8 chunks/lane.
-        num_b_loads_per_lane = num_acc_n * (k_unroll // 2)
-        # Chunks per g per lane (used by lds_load_b_packs_for_g — dead helper
-        # kept for future experiments).
-        _b_chunks_per_ni_per_g = (k_unroll // 2) // groups_per_tile
 
         # ── B global load (preshuffled, per-head) — gmem→regs path ─────
         def load_b_tile(base_k_elem):
@@ -892,8 +874,10 @@ def compile_fp8_einsum_clean_ue8m0(
                     idx_byte = n_base_byte + k0 * _b_stride_k0_c
                     idx_dword = idx_byte // 4
                     b_vec4 = buffer_ops.buffer_load(
-                        y_rsrc, fx.Int32(idx_dword),
-                        vec_width=4, dtype=fx.Int32,
+                        y_rsrc,
+                        fx.Int32(idx_dword),
+                        vec_width=4,
+                        dtype=fx.Int32,
                     )
                     b16 = Vec(b_vec4).bitcast(fp8_dtype)
                     b_i64x2 = Vec(b16).bitcast(fx.Int64)
@@ -901,131 +885,11 @@ def compile_fp8_einsum_clean_ue8m0(
                     packs_flat[ku64 * 2 + 1].append(b_i64x2[1].ir_value())
             return packs_flat
 
-        # ── B async DMA: gmem → LDS direct (DEAD: kept for experiments) ──
-        # Per-lane "slot" layout: lane L within wave W writes its chunk i
-        # to LDS at byte:
-        #   wave_base[W] + chunk_i * (wave_size * 16) + L * 16
-        # where wave_base[W] = W * (wave_size * num_b_loads_per_lane * 16).
-        # Each lane owns num_b_loads_per_lane chunks; total per stage =
-        # total_threads * num_b_loads_per_lane * 16 = tile_n * tile_k bytes.
-        #
-        # No source swizzle needed — compute_tile reads lane L's own slots
-        # (no cross-lane B sharing in the MFMA layout).
-        _b_async_load_bytes = 16
-        _b_wave_bytes_per_chunk = wave_size * _b_async_load_bytes  # = 1024
-        _b_chunk_stride_bytes = wave_size * _b_async_load_bytes
-        _b_wave_total_bytes = num_b_loads_per_lane * _b_wave_bytes_per_chunk
-
-        def load_b_tile_to_lds_async(base_k_elem, lds_buffer):
-            """Issue async DMA: B gmem → LDS, per-lane slot layout.
-
-            Per lane, per chunk i = ni * (k_unroll/2) + ku64:
-              n_base_byte = n_blk_list[ni]*_stride_n0 + lane_div_16*_stride_klane
-                          + n_intra_list[ni]*_stride_nlane + y_head_byte_off
-              k0 = base_k_elem/64 + ku64
-              global_byte = n_base_byte + k0 * _stride_k0
-              LDS dst = wave_base + i*(wave_size*16) [+ lane*16 added by HW]
-
-            Caller must `s_waitcnt(lgkmcnt=0)` + barrier before reading back.
-            """
-            from flydsl._mlir.dialects import memref as memref_dialect
-
-            wave_byte_off = rocdl.readfirstlane(
-                fx.Int64.ir_type,
-                fx.Int64(wave_id * fx.Index(_b_wave_total_bytes)),
-            )
-            lds_base = memref_dialect.extract_aligned_pointer_as_index(
-                lds_buffer
-            )
-            lds_ptr_base = buffer_ops.create_llvm_ptr(
-                fx.Int64(lds_base), address_space=3,
-            )
-            lds_ptr_wave = buffer_ops.get_element_ptr(
-                lds_ptr_base, wave_byte_off,
-            )
-
-            k0_base = base_k_elem // 64
-            chunk_i = 0
-            for ni in range_constexpr(num_acc_n):
-                n_base_byte = (
-                    n_blk_list[ni] * _b_stride_n0_c
-                    + lane_div_16 * _b_stride_klane_c
-                    + n_intra_list[ni] * _b_stride_nlane_c
-                ) + y_head_byte_off
-                for ku64 in range_constexpr(k_unroll // 2):
-                    k0 = k0_base + ku64
-                    idx_byte = n_base_byte + k0 * _b_stride_k0_c
-                    global_offset_i32 = fx.Int32(idx_byte)
-
-                    lds_dst = lds_ptr_wave
-                    if const_expr(chunk_i > 0):
-                        lds_dst = buffer_ops.get_element_ptr(
-                            lds_ptr_wave,
-                            static_byte_offset=chunk_i * _b_chunk_stride_bytes,
-                        )
-                    rocdl.raw_ptr_buffer_load_lds(
-                        y_rsrc, lds_dst,
-                        fx.Int32(_b_async_load_bytes),
-                        global_offset_i32,
-                        fx.Int32(0),
-                        fx.Int32(0),
-                        fx.Int32(1),
-                    )
-                    chunk_i += 1
-
-        # ── B LDS read primitive (per-g, JIT inside compute_tile) ────
-        # Reads only the B packs needed for ONE g iteration.
-        # For g in [0, groups_per_tile), the chunks consumed are:
-        #   chunks = ni * (k_unroll/2) + g * _b_chunks_per_ni_per_g + local_ku
-        # where local_ku in [0, _b_chunks_per_ni_per_g).
-        # Per lane returns a list[num_acc_n][k_unroll/groups_per_tile] of
-        # i64 IR values, indexed as b_g_buf[ni][ku_local] where each chunk
-        # is 2 i64 packs. To match compute_tile's pattern (packs_flat[ku][ni]),
-        # we return a flat dict-of-lists indexed by ku that compute_tile can
-        # index with `g * mfmas_per_group + ku_local_offset`.
-        def lds_load_b_packs_for_g(lds_buffer, g):
-            """Read B packs for ONE g into reg buffer.
-            Returns: list of length mfmas_per_group, each entry is a
-                     list[num_acc_n] of i64 IR values.
-            Indexed in compute_tile as b_packs[ku_in_g][ni], matching the
-            old (b_pa, b_pb, b_pc, b_pd) pattern with ku_in_g = 0..3.
-            """
-            lane_byte_base = lane_id * fx.Index(_b_async_load_bytes)
-            wave_byte_base = wave_id * fx.Index(_b_wave_total_bytes)
-            # mfmas_per_group = 4 entries (covers K=128 across 4 K=32 MFMAs).
-            # Per ni, we have _b_chunks_per_ni_per_g vec4 chunks = 2 chunks
-            # (at peak), each yielding 2 i64 → 4 i64 = mfmas_per_group i64s.
-            b_packs = [[] for _ in range(mfmas_per_group)]
-            for ni in range_constexpr(num_acc_n):
-                for local_ku in range_constexpr(_b_chunks_per_ni_per_g):
-                    chunk_i = (
-                        ni * (k_unroll // 2)
-                        + g * _b_chunks_per_ni_per_g
-                        + local_ku
-                    )
-                    slot_byte = (
-                        wave_byte_base
-                        + fx.Index(chunk_i * _b_chunk_stride_bytes)
-                        + lane_byte_base
-                    )
-                    v16 = Vec.load(
-                        Vec.make_type(16, fp8_dtype),
-                        lds_buffer, [slot_byte],
-                    )
-                    b_i64x2 = Vec(v16).bitcast(fx.Int64)
-                    # Each chunk → 2 i64 packs, contributing to 2 adjacent
-                    # mfma steps within this g.
-                    b_packs[local_ku * 2 + 0].append(b_i64x2[0].ir_value())
-                    b_packs[local_ku * 2 + 1].append(b_i64x2[1].ir_value())
-            return b_packs
-
         # ── LDS A read primitive (16 fp8 bytes → 2 i64) ───────────
         def lds_load_a_packs_k64(row, col_base_bytes, lds_buffer):
             col_swz = swizzle_xor16(row, col_base_bytes, _lds_a_fp8_k_blocks16_c)
             idx = row * _lds_a_fp8_k_dim_c + col_swz
-            v16 = Vec.load(
-                Vec.make_type(16, fp8_dtype), lds_buffer, [idx]
-            )
+            v16 = Vec.load(Vec.make_type(16, fp8_dtype), lds_buffer, [idx])
             v2 = Vec(v16).bitcast(fx.Int64)
             return v2[0].ir_value(), v2[1].ir_value()
 
@@ -1041,12 +905,15 @@ def compile_fp8_einsum_clean_ue8m0(
             hold the row-fragment fmax.
             """
             from flydsl._mlir.dialects import rocdl as _rocdl_low
+
             val_i32 = fx.arith.bitcast(_i32_ir, local_f32.ir_value())
             for xor_n in (1, 2, 4, 8):
                 src_lane = lane_id_in_wave ^ fx.Int32(xor_n)
                 src_byte = src_lane * fx.Int32(4)
                 gather = _rocdl_low.ds_bpermute(
-                    res=_i32_ir, index=src_byte.ir_value(), src=val_i32,
+                    res=_i32_ir,
+                    index=src_byte.ir_value(),
+                    src=val_i32,
                 )
                 gather_f = fx.arith.bitcast(_f32_ir, gather)
                 cur_f = fx.arith.bitcast(_f32_ir, val_i32)
@@ -1094,8 +961,10 @@ def compile_fp8_einsum_clean_ue8m0(
                     + k_packed_idx
                 )
                 sx_val = buffer_ops.buffer_load(
-                    sx_rsrc, fx.Int32(sx_gmem_idx),
-                    vec_width=1, dtype=fx.Int32,
+                    sx_rsrc,
+                    fx.Int32(sx_gmem_idx),
+                    vec_width=1,
+                    dtype=fx.Int32,
                 )
                 v1 = Vec.from_elements([sx_val], fx.Int32)
                 v1.store(lds_sx, [slot_id])
@@ -1116,13 +985,13 @@ def compile_fp8_einsum_clean_ue8m0(
                 for g in range_constexpr(groups_per_tile):
                     k_block_global_int = kt * (tile_k // 128) + g
                     k_packed_idx = k_block_global_int // 4
-                    slot = (
-                        row_in_tile * fx.Index(_sx_lds_per_row)
-                        + fx.Index(k_packed_idx)
+                    slot = row_in_tile * fx.Index(_sx_lds_per_row) + fx.Index(
+                        k_packed_idx
                     )
                     v = Vec.load(
                         Vec.make_type(1, fx.Int32),
-                        lds_sx, [slot],
+                        lds_sx,
+                        [slot],
                     )
                     sx_for_mi.append(v[0].ir_value())
                 sx_per_mi.append(sx_for_mi)
@@ -1155,8 +1024,10 @@ def compile_fp8_einsum_clean_ue8m0(
                     + fx.Index(k_packed_idx)
                 )
                 sy_val = buffer_ops.buffer_load(
-                    sy_rsrc, fx.Int32(sy_gmem_idx),
-                    vec_width=1, dtype=fx.Int32,
+                    sy_rsrc,
+                    fx.Int32(sy_gmem_idx),
+                    vec_width=1,
+                    dtype=fx.Int32,
                 )
                 v1 = Vec.from_elements([sy_val], fx.Int32)
                 v1.store(lds_sy, [fx.Index(slot_id)])
@@ -1181,23 +1052,21 @@ def compile_fp8_einsum_clean_ue8m0(
                 # n_block_idx_local for this ni (wave-uniform within ni).
                 # = (wave_id * n_per_wave + ni * 16) // 128
                 # since lane_mod_16 < 16 < 128 doesn't shift the // 128 result.
-                n_col_in_tile_wave_uniform = (
-                    wave_id * fx.Index(n_per_wave) + fx.Index(ni * 16)
+                n_col_in_tile_wave_uniform = wave_id * fx.Index(n_per_wave) + fx.Index(
+                    ni * 16
                 )
-                n_block_idx_local = (
-                    n_col_in_tile_wave_uniform // fx.Index(128)
-                )
+                n_block_idx_local = n_col_in_tile_wave_uniform // fx.Index(128)
                 sy_for_ni = []
                 for g in range_constexpr(groups_per_tile):
                     k_block_global_int = kt * (tile_k // 128) + g
                     k_packed_idx = k_block_global_int // 4
-                    slot = (
-                        n_block_idx_local * fx.Index(_sy_lds_per_nb)
-                        + fx.Index(k_packed_idx)
+                    slot = n_block_idx_local * fx.Index(_sy_lds_per_nb) + fx.Index(
+                        k_packed_idx
                     )
                     v = Vec.load(
                         Vec.make_type(1, fx.Int32),
-                        lds_sy, [slot],
+                        lds_sy,
+                        [slot],
                     )
                     sy_for_ni.append(v[0].ir_value())
                 sy_per_ni.append(sy_for_ni)
@@ -1209,7 +1078,8 @@ def compile_fp8_einsum_clean_ue8m0(
 
         def pack_i64x4_to_i32x8(x0, x1, x2, x3):
             return Vec.from_elements(
-                [x0, x1, x2, x3], fx.Int64,
+                [x0, x1, x2, x3],
+                fx.Int64,
             ).bitcast(fx.Int32)
 
         # ── A0 prefetch helper ────────────────────────────────────
@@ -1217,7 +1087,7 @@ def compile_fp8_einsum_clean_ue8m0(
         # at lane's row/col. Pre-loaded into regs after barrier so the
         # next-iter compute_tile's first MFMA skips its ds_read.
         def lds_a0_prefetch(lds_buffer):
-            fp8_row = lane_mod_16   # mi=0
+            fp8_row = lane_mod_16  # mi=0
             fp8_col_bytes = lane_div_16 * 16  # g=0
             return lds_load_a_packs_k64(fp8_row, fp8_col_bytes, lds_buffer)
 
@@ -1227,8 +1097,13 @@ def compile_fp8_einsum_clean_ue8m0(
         # a0_prefetch is the optional (a0, a1) tuple for (mi=0, g=0, ku=0..1)
         # — when supplied, the first MFMA's A skips ds_read.
         def compute_tile(
-            accs_in, b_tile_in, kt, fp8_lds_buffer,
-            sx_per_mi, sy_per_ni, a0_prefetch=None,
+            accs_in,
+            b_tile_in,
+            kt,
+            fp8_lds_buffer,
+            sx_per_mi,
+            sy_per_ni,
+            a0_prefetch=None,
         ):
             """Compute one K-tile's MFMAs — 1896 TF reference (B-in-regs).
 
@@ -1258,16 +1133,18 @@ def compile_fp8_einsum_clean_ue8m0(
                     fp8_col_bytes_0 = fp8_group_col_base + lane_div_16 * 16
                     fp8_col_bytes_1 = fp8_col_bytes_0 + 64
 
-                    if const_expr(
-                        (a0_prefetch is not None) and (g == 0) and (mi == 0)
-                    ):
+                    if const_expr((a0_prefetch is not None) and (g == 0) and (mi == 0)):
                         a0, a1 = a0_prefetch
                     else:
                         a0, a1 = lds_load_a_packs_k64(
-                            fp8_row, fp8_col_bytes_0, fp8_lds_buffer,
+                            fp8_row,
+                            fp8_col_bytes_0,
+                            fp8_lds_buffer,
                         )
                     a2, a3 = lds_load_a_packs_k64(
-                        fp8_row, fp8_col_bytes_1, fp8_lds_buffer,
+                        fp8_row,
+                        fp8_col_bytes_1,
+                        fp8_lds_buffer,
                     )
                     a128 = pack_i64x4_to_i32x8(a0, a1, a2, a3)
 
@@ -1275,16 +1152,26 @@ def compile_fp8_einsum_clean_ue8m0(
 
                     for ni in range_constexpr(num_acc_n):
                         b128 = pack_i64x4_to_i32x8(
-                            b_pa[ni], b_pb[ni], b_pc[ni], b_pd[ni],
+                            b_pa[ni],
+                            b_pb[ni],
+                            b_pc[ni],
+                            b_pd[ni],
                         )
                         sy_i32 = sy_per_ni[ni][g]
                         acc_idx = mi * num_acc_n + ni
                         current_accs[acc_idx] = mfma_fp8_k128(
                             mfma_res_ty,
-                            [a128, b128, current_accs[acc_idx],
-                             0, 0,                          # cbsz, blgp
-                             byte_in_i32, sx_i32,           # opsel_a, scale_a
-                             byte_in_i32, sy_i32],          # opsel_b, scale_b
+                            [
+                                a128,
+                                b128,
+                                current_accs[acc_idx],
+                                0,
+                                0,  # cbsz, blgp
+                                byte_in_i32,
+                                sx_i32,  # opsel_a, scale_a
+                                byte_in_i32,
+                                sy_i32,
+                            ],  # opsel_b, scale_b
                         )
 
             return current_accs
@@ -1295,11 +1182,7 @@ def compile_fp8_einsum_clean_ue8m0(
         def store_output_bf16(final_accs):
             def body_row(*, mi, ii, row_in_tile, row):
                 col_base_n = by_n + n_tile_base + lane_mod_16
-                idx_base = (
-                    row * fx.Index(stride_b_z)
-                    + z_head_elem_off
-                    + col_base_n
-                )
+                idx_base = row * fx.Index(stride_b_z) + z_head_elem_off + col_base_n
                 for ni in range_constexpr(num_acc_n):
                     acc_idx = mi * num_acc_n + ni
                     acc = final_accs[acc_idx]
@@ -1353,7 +1236,6 @@ def compile_fp8_einsum_clean_ue8m0(
         c_pos_448 = fx.Float32(448.0)
         c_neg_448 = fx.Float32(-448.0)
         lane_id_i32 = fx.Int32(lane_id) if quant_output else None
-        wave_id_i32_const = wave_id  # index; cast where needed
 
         def store_output_qz(final_accs):
             """D-128 group fp8 quant epilogue.
@@ -1367,8 +1249,8 @@ def compile_fp8_einsum_clean_ue8m0(
             # slot(mi, ii, d128, wave_in_grp) =
             #   ((mi*4 + ii) * _qz_d128_per_tile + d128) * _qz_waves_per_d128
             #   + wave_in_grp
-            _waves_pd = _qz_waves_per_d128       # python int
-            _d128_pt  = _qz_d128_per_tile        # python int
+            _waves_pd = _qz_waves_per_d128  # python int
+            _d128_pt = _qz_d128_per_tile  # python int
             # Per-tn config: which d128 block (within tile) a given wave belongs
             # to, and which slot (0..waves_per_d128-1) inside that block.
             #   tn==128: wave 0..3 → d128_owner=0, wave_in_grp=wave_id
@@ -1389,7 +1271,6 @@ def compile_fp8_einsum_clean_ue8m0(
             # ni's are in that one block.
             # → In both cases, every ni a lane holds is in ONE d128 block
             #   (the one owned by its wave). num_acc_n_per_d128 = num_acc_n.
-            num_acc_n_per_d128 = num_acc_n  # invariant for both tn=128,256
 
             # === Phase 1: write per-(mi,ii,d128_owner,wave_in_grp) partial ===
             # We compute the amax for this lane's (mi, ii) over its
@@ -1407,9 +1288,7 @@ def compile_fp8_einsum_clean_ue8m0(
                             fx.arith.maximumf(v.ir_value(), neg_v.ir_value())
                         )
                         local_amax = fx.Float32(
-                            fx.arith.maximumf(
-                                local_amax.ir_value(), abs_v.ir_value()
-                            )
+                            fx.arith.maximumf(local_amax.ir_value(), abs_v.ir_value())
                         )
                     # In-wave 16-lane reduce (across lane_mod_16 → 16 cols).
                     row_amax = intra_16_max_f32(local_amax, lane_id_i32)
@@ -1418,14 +1297,11 @@ def compile_fp8_einsum_clean_ue8m0(
                     # row index — unique per row, so lanes with different
                     # lane_div_16 never race on the same slot.
                     row_in_tile_v = (
-                        fx.Index(mi * 16)
-                        + lane_div_16 * fx.Index(4)
-                        + fx.Index(ii)
+                        fx.Index(mi * 16) + lane_div_16 * fx.Index(4) + fx.Index(ii)
                     )
                     base_slot_v = (
-                        (row_in_tile_v * fx.Index(_d128_pt) + d128_owner_v)
-                        * fx.Index(_waves_pd) + wave_in_grp_v
-                    )
+                        row_in_tile_v * fx.Index(_d128_pt) + d128_owner_v
+                    ) * fx.Index(_waves_pd) + wave_in_grp_v
                     # All 16 lanes in the row-fragment hold the same
                     # row_amax value after intra_16_max_f32 (replicated).
                     # They all write the same bytes to the same LDS slot
@@ -1461,26 +1337,22 @@ def compile_fp8_einsum_clean_ue8m0(
                     # Read waves_per_d128 partials for this
                     # (row_in_tile, d128_owner). Matches Phase 1 layout.
                     row_in_tile_v2 = (
-                        fx.Index(mi * 16)
-                        + lane_div_16 * fx.Index(4)
-                        + fx.Index(ii)
+                        fx.Index(mi * 16) + lane_div_16 * fx.Index(4) + fx.Index(ii)
                     )
                     base_slot_v2 = (
-                        (row_in_tile_v2 * fx.Index(_d128_pt) + d128_owner_v)
-                        * fx.Index(_waves_pd)
-                    )
+                        row_in_tile_v2 * fx.Index(_d128_pt) + d128_owner_v
+                    ) * fx.Index(_waves_pd)
                     cross_amax = c_zero_f32
                     for w in range_constexpr(_waves_pd):
                         slot = base_slot_v2 + fx.Index(w)
                         v = Vec.load(
                             Vec.make_type(1, fx.Float32),
-                            lds_qz_amax, [slot],
+                            lds_qz_amax,
+                            [slot],
                         )
                         peer = fx.Float32(v[0])
                         cross_amax = fx.Float32(
-                            fx.arith.maximumf(
-                                cross_amax.ir_value(), peer.ir_value()
-                            )
+                            fx.arith.maximumf(cross_amax.ir_value(), peer.ir_value())
                         )
                     # Clamp + scale.
                     clamped = fx.Float32(
@@ -1509,9 +1381,7 @@ def compile_fp8_einsum_clean_ue8m0(
 
                     # gmem index in fp8 BYTES (1 elem = 1 byte):
                     z_idx_base = (
-                        row * fx.Index(stride_b_z)
-                        + z_head_elem_off
-                        + col_base_n
+                        row * fx.Index(stride_b_z) + z_head_elem_off + col_base_n
                     )
                     for ni in range_constexpr(num_acc_n):
                         acc_idx = mi * num_acc_n + ni
@@ -1548,11 +1418,14 @@ def compile_fp8_einsum_clean_ue8m0(
                         # Truncate i32 → i8 (low byte = the fp8 we want).
                         from flydsl._mlir.dialects import arith as _arith_d
                         from flydsl._mlir import ir as _ir
+
                         i8_ty = _ir.IntegerType.get_signless(8)
                         byte_val_i8 = _arith_d.TruncIOp(i8_ty, packed_w).result
                         z_idx_out = z_idx_base + fx.Index(ni * 16)
                         buffer_ops.buffer_store(
-                            byte_val_i8, z_rsrc, z_idx_out,
+                            byte_val_i8,
+                            z_rsrc,
+                            z_idx_out,
                         )
 
                     # ── Store scale ──
@@ -1573,9 +1446,7 @@ def compile_fp8_einsum_clean_ue8m0(
                     if quant_transpose_scale:
                         # Layout (D//128, B, H) — sz_idx = d128*(B*H) + b*H + h
                         sz_idx = (
-                            d128_global * (c_b * fx.Index(H))
-                            + row * fx.Index(H)
-                            + bx_h
+                            d128_global * (c_b * fx.Index(H)) + row * fx.Index(H) + bx_h
                         )
                     else:
                         # Layout (B, H, D//128) — sz_idx = b*(H*D//128) + h*(D//128) + d128
@@ -1601,6 +1472,7 @@ def compile_fp8_einsum_clean_ue8m0(
                         CmpIPredicate as _CmpIPred,
                     )
                     from flydsl._mlir import ir as _ir_d
+
                     _row_i32 = fx.Int32(row)
                     _b_i32 = fx.Int32(i32_b)
                     _row_in_range = fx.arith.cmpi(
@@ -1676,8 +1548,13 @@ def compile_fp8_einsum_clean_ue8m0(
 
         if const_expr(num_tiles == 1):
             accs = compute_tile(
-                accs, b_pong, 0, lds_a_pong,
-                sx_pong, sy_pong, a0_prefetch=a0_pong,
+                accs,
+                b_pong,
+                0,
+                lds_a_pong,
+                sx_pong,
+                sy_pong,
+                a0_prefetch=a0_pong,
             )
         else:
             if const_expr(num_tiles % 2 == 1):
@@ -1693,8 +1570,13 @@ def compile_fp8_einsum_clean_ue8m0(
                 sy_ping = prefetch_sy_tile(kt_base + 1)
 
                 accs = compute_tile(
-                    accs, b_pong, kt_base, lds_a_pong,
-                    sx_pong, sy_pong, a0_prefetch=a0_pong,
+                    accs,
+                    b_pong,
+                    kt_base,
+                    lds_a_pong,
+                    sx_pong,
+                    sy_pong,
+                    a0_prefetch=a0_pong,
                 )
 
                 rocdl.s_waitcnt(_waitcnt_imm)
@@ -1708,8 +1590,13 @@ def compile_fp8_einsum_clean_ue8m0(
                 sy_pong = prefetch_sy_tile(kt_base + 2)
 
                 accs = compute_tile(
-                    accs, b_ping, kt_base + 1, lds_a_ping,
-                    sx_ping, sy_ping, a0_prefetch=a0_ping,
+                    accs,
+                    b_ping,
+                    kt_base + 1,
+                    lds_a_ping,
+                    sx_ping,
+                    sy_ping,
+                    a0_prefetch=a0_ping,
                 )
 
                 rocdl.s_waitcnt(_waitcnt_imm)
@@ -1718,8 +1605,13 @@ def compile_fp8_einsum_clean_ue8m0(
 
             if const_expr(num_tiles % 2 == 1):
                 accs = compute_tile(
-                    accs, b_pong, _loop_end_excl, lds_a_pong,
-                    sx_pong, sy_pong, a0_prefetch=a0_pong,
+                    accs,
+                    b_pong,
+                    _loop_end_excl,
+                    lds_a_pong,
+                    sx_pong,
+                    sy_pong,
+                    a0_prefetch=a0_pong,
                 )
             else:
                 next_k1 = fx.Index((_loop_end_excl + 1) * tile_k)
@@ -1729,8 +1621,13 @@ def compile_fp8_einsum_clean_ue8m0(
                 sy_ping = prefetch_sy_tile(_loop_end_excl + 1)
 
                 accs = compute_tile(
-                    accs, b_pong, _loop_end_excl, lds_a_pong,
-                    sx_pong, sy_pong, a0_prefetch=a0_pong,
+                    accs,
+                    b_pong,
+                    _loop_end_excl,
+                    lds_a_pong,
+                    sx_pong,
+                    sy_pong,
+                    a0_prefetch=a0_pong,
                 )
 
                 rocdl.s_waitcnt(_waitcnt_imm)
@@ -1738,14 +1635,40 @@ def compile_fp8_einsum_clean_ue8m0(
                 a0_ping = lds_a0_prefetch(lds_a_ping)
 
                 accs = compute_tile(
-                    accs, b_ping, _loop_end_excl + 1, lds_a_ping,
-                    sx_ping, sy_ping, a0_prefetch=a0_ping,
+                    accs,
+                    b_ping,
+                    _loop_end_excl + 1,
+                    lds_a_ping,
+                    sx_ping,
+                    sy_ping,
+                    a0_prefetch=a0_ping,
                 )
 
         store_output(accs)
 
-    # Wrap _kernel_body in a kernel function with the right signature.
+    # ── Kernel + host launcher ───────────────────────────────
+    # The qz path threads arg_sz as a second tensor right after arg_z; the
+    # bf16 path omits it. We declare both kernels statically (flydsl's
+    # @flyc.kernel inspects the function signature at decoration time), then
+    # wrap each in a launch helper. The bodies are identical apart from the
+    # `arg_sz` argument plumbed through to `_kernel_body`.
+
+    def _finalize_allocators():
+        allocator_pong.finalized = False
+        allocator_ping.finalized = False
+        ctx = CompilationContext.get_current()
+        from flydsl._mlir import ir
+
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator_pong.finalize()
+            allocator_ping.finalize()
+
+    def _launch_grid(i32_b):
+        gx_per_h = (i32_b + (tile_m - 1)) // tile_m
+        return (gx_per_h * H, D // tile_n, 1)
+
     if quant_output:
+
         @flyc.kernel
         def kernel_gemm(
             arg_z: fx.Tensor,
@@ -1756,25 +1679,8 @@ def compile_fp8_einsum_clean_ue8m0(
             arg_sy: fx.Tensor,
             i32_b: fx.Int32,
         ):
-            _kernel_body(
-                arg_z, arg_sz, arg_x, arg_y, arg_sx, arg_sy, i32_b,
-            )
-    else:
-        @flyc.kernel
-        def kernel_gemm(
-            arg_z: fx.Tensor,
-            arg_x: fx.Tensor,
-            arg_y: fx.Tensor,
-            arg_sx: fx.Tensor,
-            arg_sy: fx.Tensor,
-            i32_b: fx.Int32,
-        ):
-            _kernel_body(
-                arg_z, None, arg_x, arg_y, arg_sx, arg_sy, i32_b,
-            )
+            _kernel_body(arg_z, arg_sz, arg_x, arg_y, arg_sx, arg_sy, i32_b)
 
-    # ── Host launcher ─────────────────────────────────────────
-    if quant_output:
         @flyc.jit
         def launch_gemm(
             arg_z: fx.Tensor,
@@ -1786,26 +1692,32 @@ def compile_fp8_einsum_clean_ue8m0(
             i32_b: fx.Int32,
             stream: fx.Stream,
         ):
-            allocator_pong.finalized = False
-            allocator_ping.finalized = False
-            ctx = CompilationContext.get_current()
-            from flydsl._mlir import ir
-            with ir.InsertionPoint(ctx.gpu_module_body):
-                allocator_pong.finalize()
-                allocator_ping.finalize()
-            gx_per_h = (i32_b + (tile_m - 1)) // tile_m
-            gx = gx_per_h * H
-            gy = D // tile_n
+            _finalize_allocators()
             kernel_gemm._func.__name__ = KERNEL_NAME
             launcher = kernel_gemm(
-                arg_z, arg_sz, arg_x, arg_y, arg_sx, arg_sy, i32_b,
+                arg_z,
+                arg_sz,
+                arg_x,
+                arg_y,
+                arg_sx,
+                arg_sy,
+                i32_b,
             )
-            launcher.launch(
-                grid=(gx, gy, 1),
-                block=(256, 1, 1),
-                stream=stream,
-            )
+            launcher.launch(grid=_launch_grid(i32_b), block=(256, 1, 1), stream=stream)
+
     else:
+
+        @flyc.kernel
+        def kernel_gemm(
+            arg_z: fx.Tensor,
+            arg_x: fx.Tensor,
+            arg_y: fx.Tensor,
+            arg_sx: fx.Tensor,
+            arg_sy: fx.Tensor,
+            i32_b: fx.Int32,
+        ):
+            _kernel_body(arg_z, None, arg_x, arg_y, arg_sx, arg_sy, i32_b)
+
         @flyc.jit
         def launch_gemm(
             arg_z: fx.Tensor,
@@ -1816,23 +1728,10 @@ def compile_fp8_einsum_clean_ue8m0(
             i32_b: fx.Int32,
             stream: fx.Stream,
         ):
-            allocator_pong.finalized = False
-            allocator_ping.finalized = False
-            ctx = CompilationContext.get_current()
-            from flydsl._mlir import ir
-            with ir.InsertionPoint(ctx.gpu_module_body):
-                allocator_pong.finalize()
-                allocator_ping.finalize()
-            gx_per_h = (i32_b + (tile_m - 1)) // tile_m
-            gx = gx_per_h * H
-            gy = D // tile_n
+            _finalize_allocators()
             kernel_gemm._func.__name__ = KERNEL_NAME
             launcher = kernel_gemm(arg_z, arg_x, arg_y, arg_sx, arg_sy, i32_b)
-            launcher.launch(
-                grid=(gx, gy, 1),
-                block=(256, 1, 1),
-                stream=stream,
-            )
+            launcher.launch(grid=_launch_grid(i32_b), block=(256, 1, 1), stream=stream)
 
     return launch_gemm
 
@@ -1879,8 +1778,12 @@ def compile_fp8_einsum_clean_ue8m0_qz(
     Other restrictions identical to the bf16 variant.
     """
     return compile_fp8_einsum_clean_ue8m0(
-        H=H, D=D, R=R,
-        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+        H=H,
+        D=D,
+        R=R,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
         block_swizzle_n=block_swizzle_n,
         quant_output=True,
         quant_transpose_scale=transpose_scale,

@@ -1059,7 +1059,7 @@ class GemmTuner(GemmCommonTuner):
             # nargs='+',
             # choices=['all', 'asm', 'hipblaslt', 'triton'],
             type=libtype_list,
-            default=['asm', 'torch', 'triton', 'flydsl', 'skinny'],
+            default=['all'],
             required=False,
             help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton', 'flydsl', 'torch', 'skinny']",
         )
