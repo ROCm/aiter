@@ -12,7 +12,10 @@ from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_gluon,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._triton.arch_info import (
+    get_arch,
+    pick_gemm_num_stages,
+)
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 
@@ -64,7 +67,6 @@ def get_kernel_config_triton(m, n, k, routing_data):
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     arch = get_arch()
-    num_stages = 1 if arch == "gfx950" else 2
     split_k = 1
     block_k = 256
 
@@ -97,6 +99,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         # routing caps block_m at 128; nw=4 wins ~2x at block_m=128 on gpt-oss
         # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
         num_warps = 4 if block_m == 128 else 8
+    num_stages = pick_gemm_num_stages(arch, block_m, block_n, block_k, 1.0, 0.5)
 
     ret = {
         "block_m": block_m,
