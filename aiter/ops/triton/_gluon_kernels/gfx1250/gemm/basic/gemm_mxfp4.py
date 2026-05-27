@@ -368,18 +368,30 @@ def gemm_mxfp4_preshuffle_gfx1250(
     acc = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc)
 
     # =====================================================================
-    # Store output
+    # Store output via TDM: accumulator → shared memory → global memory.
     # =====================================================================
-    c_ptr_tile = (
-        c_ptr + tile_m * BLOCK_SIZE_M * stride_c_m + tile_n * BLOCK_SIZE_N * stride_c_n
+
+    shared_C: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
 
-    offs_cm = gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_acc_layout))
-    offs_cn = gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_acc_layout))
-    offs_c = stride_c_m * offs_cm[:, None] + stride_c_n * offs_cn[None, :]
-
-    mask_c = (tile_m * BLOCK_SIZE_M + offs_cm[:, None] < M) & (
-        tile_n * BLOCK_SIZE_N + offs_cn[None, :] < N
+    c_buffer = gl.allocate_shared_memory(
+        c_ptr.type.element_ty,
+        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        layout=shared_C,
+    )
+    c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=c_ptr,
+        shape=(M, N),
+        strides=(stride_c_m, stride_c_n),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+        layout=shared_C,
     )
 
-    gl.store(c_ptr_tile + offs_c, acc.to(c_ptr.type.element_ty), mask=mask_c)
+    c_buffer.store(acc.to(c_ptr.type.element_ty))
+
+    gl.amd.gfx1250.tdm.async_store(
+        c_desc, [tile_m * BLOCK_SIZE_M, tile_n * BLOCK_SIZE_N], c_buffer
+    )
+
+    gl.amd.gfx1250.tdm.async_wait(0)
