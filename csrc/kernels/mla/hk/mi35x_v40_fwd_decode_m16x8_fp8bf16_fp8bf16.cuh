@@ -19,7 +19,7 @@ using namespace hk_mla;
 #if defined(__gfx950__)
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
-    __attribute__((amdgpu_num_vgpr(68))) void
+    __attribute__((amdgpu_num_vgpr(72))) void
     kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16(HkMlaV40DecodeFwdParams<T> params)
 {
     using q_nope_t  = T::q_nope_t;
@@ -53,19 +53,17 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     //   v112..v119  : kv        (8  bf16, single 32x16 KV tile -- no kv_alt; see spec §4.2)
     //   v104..v111  : pv_v_aux  (8  bf16, second V-tile staging during PV)
     //   v72 ..v103  : q_vgpr    (32 bf16, Q[:, 0:256] in mfma A layout)
-    //   v68 ..v71   : q_rope    (4  bf16, Q[:, 448:512] kept in VGPR for QK RoPE pass)
-    //   v0  ..v67   : free / scratch (cvt staging, scale dwords, ds_read_b64_tr, etc.)
+    //   v0  ..v71   : free / scratch (cvt staging, scale dwords, ds_read_b64_tr, etc.)
     //
-    // Pinned total = 184 (matches spec). Compiler is constrained to v0..v67
-    // for scratch via amdgpu_num_vgpr(68) on the __global__ -- without this,
-    // scratch leaks into v68..v255 and clobbers pinned q_vgpr/kv/p_comp/oaccu.
+    // Pinned total = 180. Compiler is constrained to v0..v71 for scratch via
+    // amdgpu_num_vgpr(72) on the __global__ -- without this, scratch leaks
+    // into v72..v255 and clobbers pinned q_vgpr/kv/p_comp/oaccu.
     constexpr uint32_t k_o_sz        = 128;
     constexpr uint32_t k_p_comp_sz   = 8;
     constexpr uint32_t k_p_mfma_sz   = 4;
     constexpr uint32_t k_kv_sz       = 8;
     constexpr uint32_t k_pv_v_aux_sz = 8;
     constexpr uint32_t k_q_vgpr_sz   = 32;
-    constexpr uint32_t k_q_rope_sz   = 4;
 
     constexpr uint32_t k_o_end          = 255;
     constexpr uint32_t k_o_begin        = k_o_end - k_o_sz + 1;             // 128
@@ -79,8 +77,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     constexpr uint32_t k_pv_v_aux_begin = k_pv_v_aux_end - k_pv_v_aux_sz + 1; // 104
     constexpr uint32_t k_q_vgpr_end     = k_pv_v_aux_begin - 1;             // 103
     constexpr uint32_t k_q_vgpr_begin   = k_q_vgpr_end - k_q_vgpr_sz + 1;   // 72
-    constexpr uint32_t k_q_rope_end     = k_q_vgpr_begin - 1;               // 71
-    constexpr uint32_t k_q_rope_begin   = k_q_rope_end - k_q_rope_sz + 1;   // 68
 
     // ---- art (auto-register-tile) range views ----
     //
@@ -89,9 +85,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     using q_vgpr_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_q_vgpr_begin, k_q_vgpr_end>>,
                              4>; // 32 vgprs -> 8 ranges of 4 (8 16x32 base tiles, bf16)
-    using q_rope_ranges =
-        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_q_rope_begin, k_q_rope_end>>,
-                             4>; // 4 vgprs -> 1 range of 4 (1 16x32 base tile, bf16)
     // split_many_t<list, N> splits each range into chunks of N vgprs each. N is
     // registers_per_thread per base tile for the chosen rt_shape + elem_t.
     //   rt_16x16_s + fp32 -> 4 vgprs/base
@@ -131,7 +124,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_o_begin, k_o_end>>, 4>; // 128 vgprs
 
     hkdart::clobber<q_vgpr_ranges>();
-    hkdart::clobber<q_rope_ranges>();
     hkdart::clobber<kv_ranges>();
     hkdart::clobber<pv_v_aux_ranges>();
     hkdart::clobber<p_comp_ranges>();
@@ -141,8 +133,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     // ---- Managers ----
     QManager8to16bitsV1<T> q_manager;
     KvManager8to16bitsV1<T> kv_manager;
-    OManager16bitsV2<T, out_t> o_manager;
-    OManager32bitsV2<T, split_t> split_o_manager;
+    OManager16bitsV3<T, out_t> o_manager;
+    OManager32bitsV3<T, split_t> split_o_manager;
 
     // ---- art tile declarations ----
     // q_vgpr: Q[:, 0:256] held bf16 in VGPR, mfma A-operand layout.
@@ -190,45 +182,54 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
     // ---- LDS layout ----
     //
-    // p_lds_kv_curr/   : 36 KB each (32 rows * 512 bf16 cols + RoPE * 2-buf).
+    // p_lds_kv_curr/   : 32 KB each (32 rows * 512 bf16 cols, 2 pongs).
     //  p_lds_kv_next     Placed FIRST so they cover the +0 LDS base.
-    // p_lds_q          : 64 KB - QManager region. Placed AFTER both KV pongs
-    //                    so warp 0's Phase-1 staging (at p_lds_q + 0) starts
-    //                    well above 0 in m0 -- this lets p1_vmem_to_staging_chunk
-    //                    pre-subtract up to 192 B (kColInRecord = 0/64/128/192)
-    //                    from the LDS dst without m0 underflowing mod 2^32.
-    //                    KvManager never uses the pre-subtract trick close to
-    //                    its base (its only pre-subtract is RoPE at sub-block
-    //                    (rt, 15) which sits 30 KB+ into the pong), so KV being
-    //                    at the LDS base is safe.
-    //                    After load_q returns, the first kSzLdsO bytes of
-    //                    p_lds_q are reused as the O bounce buffer.
+    // O bounce         : overlays p_lds_kv_next (the next pong is DEAD on the
+    //                    global last iter, where the epilogue runs, since the
+    //                    swap is a no-op). Per-warp strides differ between
+    //                    QManager (8 KB) and OManager V3 (2112 B bf16 /
+    //                    4352 B fp32), so placing the O bounce inside p_lds_q
+    //                    creates cross-warp aliasing with the next work_idx's
+    //                    load_q -- racy when a fast warp's load_q lands while
+    //                    a slow warp's epilogue is still in flight. Overlaying
+    //                    KV-next instead keeps the O bounce in a region whose
+    //                    next consumer (next work_idx's KV prologue) writes to
+    //                    p_lds_kv_curr, not next.
+    // p_lds_q          : 64 KB - QManager region. Placed AFTER both KV pongs +
+    //                    max(O, KV) so the O bounce never overlaps with Q,
+    //                    and so warp 0's Phase-1 staging (at p_lds_q + 0)
+    //                    starts well above 0 in m0 -- this lets
+    //                    p1_vmem_to_staging_chunk pre-subtract up to 192 B
+    //                    (kColInRecord = 0/64/128/192) from the LDS dst without
+    //                    m0 underflowing mod 2^32.
     //
-    // Total (occupancy=1): 2 * KvLds + 64 KB Q <= 160 KB.
+    // Total (occupancy=1): KvLds + max(KvLds, O) + 64 KB Q.
     extern __shared__ int32_t p_lds[];
 
+    // opus::max is device-only / non-constexpr; use inline ternary in constexpr
+    // contexts.
     constexpr uint32_t kSzLdsQ  = q_manager.get_lds_size_in_byte();
     constexpr uint32_t kSzLdsKv = kv_manager.get_lds_size_in_byte();
-    constexpr uint32_t kSzLdsO =
-        (o_manager.get_lds_size_in_byte() > split_o_manager.get_lds_size_in_byte())
-            ? o_manager.get_lds_size_in_byte()
-            : split_o_manager.get_lds_size_in_byte();
+    constexpr uint32_t kSzLdsO  = (o_manager.get_lds_size_in_byte() >
+                                   split_o_manager.get_lds_size_in_byte())
+                                      ? o_manager.get_lds_size_in_byte()
+                                      : split_o_manager.get_lds_size_in_byte();
 
-    // O bounce overlays the +0..16 KB window of p_lds_q (free after load_q).
-    static_assert(kSzLdsO <= kSzLdsQ,
-                  "kSzLdsO must fit within p_lds_q so the O bounce can overlay it.");
-    static_assert(kSzLdsQ + 2u * kSzLdsKv <= 160u * 1024u,
+    static_assert(kSzLdsQ + kSzLdsKv + (kSzLdsO > kSzLdsKv ? kSzLdsO : kSzLdsKv) <=
+                      160u * 1024u,
                   "V4.0 LDS budget exceeds 160 KB at kOccupancy=1.");
     // QManager pre-subtracts up to kLdsHeadPadBytes from p_lds_q in
     // p1_vmem_to_staging_chunk. Placing Q after both KV pongs gives that
     // subtraction enough headroom (m0 lands in KV-pong region, still valid LDS).
-    static_assert(2u * kSzLdsKv >= QManager8to16bitsV1<T>::kLdsHeadPadBytes,
+    static_assert(kSzLdsKv + (kSzLdsO > kSzLdsKv ? kSzLdsO : kSzLdsKv) >=
+                      QManager8to16bitsV1<T>::kLdsHeadPadBytes,
                   "KV pongs must precede Q LDS with enough bytes to absorb the "
                   "QManager P1 pre-subtract.");
 
     uintptr_t       p_lds_kv_curr = reinterpret_cast<uintptr_t>(p_lds);
     uintptr_t       p_lds_kv_next = p_lds_kv_curr + kSzLdsKv;
-    const uintptr_t p_lds_q       = p_lds_kv_next + kSzLdsKv;
+    const uintptr_t p_lds_q =
+        p_lds_kv_next + (kSzLdsO > kSzLdsKv ? kSzLdsO : kSzLdsKv);
 
     // ---- Work loop ----
     // Phase 4b is in place: per work item, read work_info, resolve kv extents,
@@ -628,24 +629,26 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             //
             // Rescale oaccu by 1/row_sum_e (single mul_vgpr over full 128-vgpr
             // tile), then write 16-row x kVoHeadDim tile to vmem.
-            //   partial_qo_loc < 0 -> final_output via OManager16bitsV2 (bf16).
-            //   partial_qo_loc >= 0 -> split_output via OManager32bitsV2 (fp32)
+            //   partial_qo_loc < 0 -> final_output via OManager16bitsV3 (bf16).
+            //   partial_qo_loc >= 0 -> split_output via OManager32bitsV3 (fp32)
             //                          + per-warp LSE row (lanes 0..15).
-            // O LDS bounce overlays p_lds_q's first kSzLdsO bytes (free after
-            // load_q).
+            // O LDS bounce overlays p_lds_kv_next (the next pong is dead on
+            // the global last iter -- the swap is a no-op and the next
+            // work_idx's KV prologue writes to p_lds_kv_curr).
             if constexpr(kDoEpilogue)
             {
                 const comp_t reci_row_sum_e = 1.0f / row_sum_e;
                 hk::mul_vgpr(oaccu, oaccu, reci_row_sum_e);
 
-                const uintptr_t p_lds_o = p_lds_q;
+                const uintptr_t p_lds_o = p_lds_kv_next;
+                constexpr uint32_t num_pv_pair_iter = T::kVoHeadDim / (2u * T::kBlockN); // 8
                 if constexpr(kEpilogueType == PvGemmEpilogueType::OutputFinal)
                 {
-                    opus::static_for<num_pv_iter>([&](auto i) {
+                    opus::static_for<num_pv_pair_iter>([&](auto i) {
                         constexpr uint32_t iter       = i.value;
-                        constexpr uint32_t kOaccuBase = k_o_begin + iter * 8u;
-                        constexpr uint32_t kColOff    = iter * T::kBlockN;
-                        o_manager.template output_to_vram<kOaccuBase, kColOff>(
+                        constexpr uint32_t kOaccuBase = k_o_begin + iter * 16u;
+                        constexpr uint32_t kColOff    = iter * (2u * T::kBlockN);
+                        o_manager.template output_to_vram_pair<kOaccuBase, kColOff>(
                             params.final_output.raw_ptr,
                             warp_idx,
                             qo_start,
@@ -655,11 +658,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 }
                 else
                 {
-                    opus::static_for<num_pv_iter>([&](auto i) {
+                    opus::static_for<num_pv_pair_iter>([&](auto i) {
                         constexpr uint32_t iter       = i.value;
-                        constexpr uint32_t kOaccuBase = k_o_begin + iter * 8u;
-                        constexpr uint32_t kColOff    = iter * T::kBlockN;
-                        split_o_manager.template output_to_vram<kOaccuBase, kColOff>(
+                        constexpr uint32_t kOaccuBase = k_o_begin + iter * 16u;
+                        constexpr uint32_t kColOff    = iter * (2u * T::kBlockN);
+                        split_o_manager.template output_to_vram_pair<kOaccuBase, kColOff>(
                             params.split_output.raw_ptr,
                             warp_idx,
                             static_cast<uint32_t>(partial_qo_loc),
