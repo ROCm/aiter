@@ -7,6 +7,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import buffer_ops, const_expr, gpu, math, range_constexpr, rocdl
+from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from .mfma_epilogues import mfma_epilog
@@ -344,12 +345,12 @@ def compile_preshuffle_gemm_a8(
 
     @flyc.kernel
     def kernel_gemm(
-        arg_c: fx.Tensor,
-        arg_a: fx.Tensor,
-        arg_b: fx.Tensor,
-        arg_scale_a: fx.Tensor,
-        arg_scale_b: fx.Tensor,
-        arg_bias: fx.Tensor,
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_scale_a: fx.Pointer,
+        arg_scale_b: fx.Pointer,
+        arg_bias: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
     ):
@@ -449,12 +450,18 @@ def compile_preshuffle_gemm_a8(
         # ---- Buffer resources (runtime byte sizes for OOB protection) ----
         _a_nrec = fx.Int64(c_m * (K * elem_bytes // a_elem_vec_pack))
         _c_nrec = fx.Int64(c_m * c_n * 2)
-        a_rsrc = buffer_ops.create_buffer_resource(
-            arg_a, max_size=False, num_records_bytes=_a_nrec
-        )
-        c_rsrc = buffer_ops.create_buffer_resource(
-            arg_c, max_size=False, num_records_bytes=_c_nrec
-        )
+
+        def _ptr_buffer_resource(ptr, num_records_bytes=None):
+            addr = fx.ptrtoint(ptr)
+            addr_i64 = fx.arith.index_cast(T.i64, addr)
+            if num_records_bytes is None:
+                return buffer_ops.create_buffer_resource_from_addr(addr_i64)
+            return buffer_ops.create_buffer_resource_from_addr(
+                addr_i64, num_records_bytes=num_records_bytes
+            )
+
+        a_rsrc = _ptr_buffer_resource(arg_a, _a_nrec)
+        c_rsrc = _ptr_buffer_resource(arg_c, _c_nrec)
         _needs_per_token_scale = not is_f16_or_bf16 and not is_fp4
         scale_a_rsrc = None
         if const_expr(not is_f16_or_bf16):
@@ -466,9 +473,7 @@ def compile_preshuffle_gemm_a8(
                 )
             else:
                 _scale_a_nrec = fx.Int64(c_m * fx.Index(4))
-            scale_a_rsrc = buffer_ops.create_buffer_resource(
-                arg_scale_a, max_size=False, num_records_bytes=_scale_a_nrec
-            )
+            scale_a_rsrc = _ptr_buffer_resource(arg_scale_a, _scale_a_nrec)
 
         # ---- Bias buffer resource (for fused epilogue) ----
         # Use max_size=True so the buffer descriptor's size is taken from the
@@ -476,12 +481,12 @@ def compile_preshuffle_gemm_a8(
         # size (was c_n * 2, which broke if out_dtype became fp32 etc.).
         bias_rsrc = None
         if const_expr(_has_bias):
-            bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
-        b_rsrc = buffer_ops.create_buffer_resource(arg_b, max_size=True)
+            bias_rsrc = _ptr_buffer_resource(arg_bias)
+        b_rsrc = _ptr_buffer_resource(arg_b)
         scale_b_rsrc = (
             None
             if (is_f16_or_bf16)
-            else buffer_ops.create_buffer_resource(arg_scale_b, max_size=True)
+            else _ptr_buffer_resource(arg_scale_b)
         )
 
         bx_m = bx * tile_m
@@ -2139,12 +2144,12 @@ def compile_preshuffle_gemm_a8(
     # ── Host launcher ──────────────────────────────────────────────────────
     @flyc.jit
     def launch_gemm(
-        arg_c: fx.Tensor,
-        arg_a: fx.Tensor,
-        arg_b: fx.Tensor,
-        arg_scale_a: fx.Tensor,
-        arg_scale_b: fx.Tensor,
-        arg_bias: fx.Tensor,
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_scale_a: fx.Pointer,
+        arg_scale_b: fx.Pointer,
+        arg_bias: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
