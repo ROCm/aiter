@@ -164,9 +164,19 @@ def run_aiter_pa_v1_swa(
     """
     num_seqs, num_heads, head_size = query.shape
     max_seq_len = int(seq_lens.max().item())
-    max_num_partitions = (
-        max_seq_len + _PARTITION_SIZE_ROCM - 1
-    ) // _PARTITION_SIZE_ROCM
+    # SWA-aware workspace sizing matches the in-op formula in pa_v1.py:
+    # when ctx > sw the dispatcher rebases each seq's partition_idx 0 to
+    # align_down(ctx_i - sw, partition_size), and grid_y caps at
+    # cdiv(sw, partition_size) + 1 (the +1 absorbs the align-down boundary).
+    sw_for_grid = _api_sliding_window(window_size)
+    if sw_for_grid > 0 and max_seq_len > sw_for_grid:
+        max_num_partitions = (
+            sw_for_grid + _PARTITION_SIZE_ROCM - 1
+        ) // _PARTITION_SIZE_ROCM + 1
+    else:
+        max_num_partitions = (
+            max_seq_len + _PARTITION_SIZE_ROCM - 1
+        ) // _PARTITION_SIZE_ROCM
     output = torch.empty_like(query)
 
     nbytes_per_qo_elem = torch.finfo(output.dtype).bits // 8
