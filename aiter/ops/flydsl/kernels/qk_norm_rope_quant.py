@@ -278,17 +278,17 @@ def _build_kernel(
 
     @flyc.kernel(name=_kname)
     def kernel(
-        q_in: fx.Tensor,  # [T, H, D]         bf16, contig (H, D)
-        kv_in: fx.Tensor,  # [T, D]            bf16, may be strided
-        q_weight: fx.Tensor,  # [D]               bf16 (dummy when not q_weighted)
-        kv_weight: fx.Tensor,  # [D]               bf16
-        cos_cache: fx.Tensor,  # [max_pos, RD/2]   bf16
-        sin_cache: fx.Tensor,  # [max_pos, RD/2]   bf16
-        positions: fx.Tensor,  # [T]               i64
-        q_out: fx.Tensor,  # [T, H, D]         bf16 or fp8
-        kv_out: fx.Tensor,  # [T, D]            bf16 or fp8
-        q_scale: fx.Tensor,  # [T, H, NG]        f32 or uint8 (e8m0)
-        kv_scale: fx.Tensor,  # [T, NG]           f32 or uint8 (e8m0)
+        q_in: fx.Pointer,  # [T, H, D]         bf16, contig (H, D)
+        kv_in: fx.Pointer,  # [T, D]            bf16, may be strided
+        q_weight: fx.Pointer,  # [D]               bf16 (dummy when not q_weighted)
+        kv_weight: fx.Pointer,  # [D]               bf16
+        cos_cache: fx.Pointer,  # [max_pos, RD/2]   bf16
+        sin_cache: fx.Pointer,  # [max_pos, RD/2]   bf16
+        positions: fx.Pointer,  # [T]               i64
+        q_out: fx.Pointer,  # [T, H, D]         bf16 or fp8
+        kv_out: fx.Pointer,  # [T, D]            bf16 or fp8
+        q_scale: fx.Pointer,  # [T, H, NG]        f32 or uint8 (e8m0)
+        kv_scale: fx.Pointer,  # [T, NG]           f32 or uint8 (e8m0)
         kv_in_row_stride: Int32,  # KV row stride in bf16 elements
     ):
         f32 = T.f32
@@ -310,19 +310,26 @@ def _build_kernel(
         bid_x = fx.block_idx.x  # 0..H-1 (Q head) or H (KV)
         bid_t = fx.block_idx.y  # token id (chunked at MAX_GRID_Y per launch)
         tid = fx.thread_idx.x
+        bid_t_idx = arith.index_cast(T.index, _to_raw(bid_t))
+
+        def _ptr_buffer_resource(ptr, num_records_bytes=None):
+            addr = fx.ptrtoint(ptr)
+            addr_i64 = arith.index_cast(T.i64, addr)
+            if num_records_bytes is None:
+                return buffer_ops.create_buffer_resource_from_addr(addr_i64)
+            return buffer_ops.create_buffer_resource_from_addr(
+                addr_i64, num_records_bytes=num_records_bytes
+            )
 
         # --- shared: load position (i64 -> i32) ---
-        pos_rsrc = buffer_ops.create_buffer_resource(positions, max_size=True)
+        pos_nbytes = fx.Int64((bid_t_idx + fx.Index(1)) * fx.Index(8))
+        pos_rsrc = _ptr_buffer_resource(positions, pos_nbytes)
         pos_val_i64 = buffer_ops.buffer_load(pos_rsrc, bid_t, vec_width=1, dtype=T.i64)
         pos_i32 = arith.trunci(i32, pos_val_i64)
 
         # --- shared: cos/sin buffer tensors (used by rope-threads only) ---
-        cos_buf = fx.rocdl.make_buffer_tensor(cos_cache)
-        sin_buf = fx.rocdl.make_buffer_tensor(sin_cache)
-        cos_row = fx.slice(cos_buf, (pos_i32, None))
-        sin_row = fx.slice(sin_buf, (pos_i32, None))
-        cos_div = fx.logical_divide(cos_row, rope_lay)
-        sin_div = fx.logical_divide(sin_row, rope_lay)
+        cos_g = GTensor(cos_cache, dtype=T.bf16, shape=(-1, RD // 2))
+        sin_g = GTensor(sin_cache, dtype=T.bf16, shape=(-1, RD // 2))
 
         def wave_reduce_add(x):
             w = _to_raw(x)
