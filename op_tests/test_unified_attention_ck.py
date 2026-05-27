@@ -26,6 +26,17 @@ Example:
   python op_tests/test_unified_attention_ck.py --quick           # smoke subset
   python op_tests/test_unified_attention_ck.py --head-size 128   # restrict
   python op_tests/test_unified_attention_ck.py --no-triton       # CK-only
+
+  # Single-shape mode — replaces the standalone ua-test-scripts/test_single_shape.py
+  # for ad-hoc correctness/perf checks; expands to one seq_lens batch of
+  # `b` identical (sq, sk) sequences. `--num-blocks auto` allocates exactly
+  # `b * ceil(sk / block_size)` physical blocks so block_tables hold unique
+  # indices (no fake L2 reuse), matching what vLLM/SGLang-style allocators
+  # produce in production.
+  python op_tests/test_unified_attention_ck.py \\
+      -b 64 -sq 1 -sk 128000 \\
+      --num-heads 64,8 --head-size 128 --block-size 16 \\
+      --dtype bf16 --q-dtype none --num-blocks auto
 """
 
 from __future__ import annotations
@@ -529,11 +540,34 @@ def main():
                              "or 'fp8' (per-tensor e4m3).")
     parser.add_argument("--num-heads", type=str, nargs="*", default=None,
                         help="Restrict (HQ,HK) tuples, e.g. --num-heads 16,2 64,8")
-    parser.add_argument("--num-blocks", type=int, nargs="*",
-                        default=None, help="Restrict KV-cache pool sizes.")
+    parser.add_argument("--num-blocks", type=str, nargs="*",
+                        default=None, help="Restrict KV-cache pool sizes. "
+                                            "Pass integers, or the literal "
+                                            "'auto' to size the pool to "
+                                            "`batch * ceil(sk / block_size)` "
+                                            "so block_tables hold unique "
+                                            "physical indices and the "
+                                            "benchmark sees no fake L2 "
+                                            "reuse (matches vLLM/SGLang-"
+                                            "style allocators). 'auto' "
+                                            "requires single-shape mode.")
     parser.add_argument("--seq-lens", type=_parse_seq_lens, nargs="*",
                         default=None, help="Restrict seq_lens batches, format: "
                                             "'1,1328;5,18;129,463'")
+
+    # Single-shape shortcut — turns `b` repeated `(sq, sk)` pairs into one
+    # seq_lens batch. Replaces the standalone ua-test-scripts/test_single_shape.py
+    # script for ad-hoc shape investigations during kernel-side iteration.
+    parser.add_argument("-b", "--batch", type=int, default=None,
+                        help="Single-shape mode: number of sequences. Requires "
+                             "--seq-q and --seq-k; mutually exclusive with "
+                             "--seq-lens.")
+    parser.add_argument("-sq", "--seq-q", type=int, default=None,
+                        help="Single-shape mode: query length per sequence "
+                             "(use 1 for decode).")
+    parser.add_argument("-sk", "--seq-k", type=int, default=None,
+                        help="Single-shape mode: KV (context) length per "
+                             "sequence.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-triton", action="store_true",
                         help="Skip the Triton backend (CK + reference only).")
@@ -579,10 +613,39 @@ def main():
             tuple(int(x) for x in s.split(","))
             for s in args.num_heads
         ]
-    if args.num_blocks:
-        num_blocks_lst = args.num_blocks
     if args.seq_lens:
         seq_lens_grid = args.seq_lens
+
+    # Single-shape mode is mutually exclusive with --seq-lens because
+    # both control the same axis. The shortcut just expands to one
+    # `seq_lens_grid` entry of `batch` identical `(seq_q, seq_k)` pairs.
+    single_shape_flags = [args.batch, args.seq_q, args.seq_k]
+    if any(v is not None for v in single_shape_flags):
+        if not all(v is not None for v in single_shape_flags):
+            parser.error("--batch/--seq-q/--seq-k must be passed together")
+        if args.seq_lens:
+            parser.error("--batch/--seq-q/--seq-k is mutually exclusive "
+                         "with --seq-lens")
+        seq_lens_grid = [[(args.seq_q, args.seq_k)] * args.batch]
+
+    # `--num-blocks auto` requires a single (batch, sk, block_size) so we
+    # can compute the exact pool size. It's most useful precisely in
+    # single-shape mode (the only mode where there's one well-defined sk).
+    if args.num_blocks:
+        if any(x.lower() == "auto" for x in args.num_blocks):
+            if len(args.num_blocks) != 1:
+                parser.error("--num-blocks auto must be the only --num-blocks "
+                             "value (can't mix 'auto' with explicit sizes)")
+            if not (all(v is not None for v in single_shape_flags)
+                    and len(block_sizes) == 1):
+                parser.error("--num-blocks auto requires --batch/--seq-q/"
+                             "--seq-k *and* a single --block-size so the "
+                             "pool size is unambiguously batch * "
+                             "ceil(sk / block_size).")
+            pages_per_seq = (args.seq_k + block_sizes[0] - 1) // block_sizes[0]
+            num_blocks_lst = [args.batch * pages_per_seq]
+        else:
+            num_blocks_lst = [int(x) for x in args.num_blocks]
 
     rows = []
     for seq_lens in seq_lens_grid:
