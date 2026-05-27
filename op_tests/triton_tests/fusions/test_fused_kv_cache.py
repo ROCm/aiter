@@ -105,7 +105,6 @@ def test_fused_qk_rope_cat_and_cache_mla(
         KH,
         QH_per_KH,
         D_pe,
-        D_pe,
         cached=True,
         reuse_freqs_front_part=reuse_freqs_front_part,
         nope=False,
@@ -227,7 +226,6 @@ def test_fused_qk_rope_cat_and_cache_mla(
             q_out=None,
             decode_q_pe_out=None,
             k_pe_out=None,
-            shuffled_kv_cache=shuffled_kv_cache,
             shuffled_kv_cache=shuffled_kv_cache,
         )
     )

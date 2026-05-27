@@ -2406,15 +2406,15 @@ def _unified_attention_gluon_kernel_3d(
     if cfg.NUM_SEGMENTS_PER_SEQ == 1:
         one_over_L = 1.0 / L[:, None]
         one_over_L = gl.convert_layout(one_over_L, layout=cfg.PV_WMMA_LAYOUT)
-    if KV_CACHE_DTYPE == "nvfp4" and cfg.HEAD_SIZE_SPLIT == 2:
+    if KV_CACHE_DTYPE == "nvfp4" and cfg.HEAD_SIZE_SPLIT > 1:
         acc0 = acc0 * out_factor
         acc1 = acc1 * out_factor
         if cfg.NUM_SEGMENTS_PER_SEQ == 1:
             acc0 = acc0 * one_over_L
             acc1 = acc1 * one_over_L
-        if out_scale_ptr is not None:
-            acc0 = tl.clamp(acc0, FP8_MIN, FP8_MAX)
-            acc1 = tl.clamp(acc1, FP8_MIN, FP8_MAX)
+            if segm_output_ptr.type.element_ty.is_fp8():
+                acc0 = tl.clamp(acc0, FP8_MIN, FP8_MAX)
+                acc1 = tl.clamp(acc1, FP8_MIN, FP8_MAX)
         pgm.store_output_3D_split_head(
             acc0,
             acc1,
@@ -2426,8 +2426,8 @@ def _unified_attention_gluon_kernel_3d(
         acc = acc * out_factor
         if cfg.NUM_SEGMENTS_PER_SEQ == 1:
             acc = acc * one_over_L
-        if out_scale_ptr is not None:
-            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+            if segm_output_ptr.type.element_ty.is_fp8():
+                acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
         pgm.store_output_3D(
             acc,

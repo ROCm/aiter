@@ -646,6 +646,8 @@ def _mla_decode_fwd_reduce_kernel(
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # int
+    FP8_MIN: tl.constexpr = float8_info.min,
+    FP8_MAX: tl.constexpr = float8_info.max,
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -707,10 +709,13 @@ def _mla_decode_fwd_reduce_kernel(
     if out_scale_ptr is not None:
         acc = acc * out_scale
 
+    if output_ptr.type.element_ty.is_fp8():
+        acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+
     # write result
     output_offset = (
         query_token_idx * output_stride_0
         + query_head_idx * output_stride_1
         + tl.arange(0, KV_LORA_RANK)
     )
-    tl.store(output_ptr + output_offset, acc)
+    tl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))

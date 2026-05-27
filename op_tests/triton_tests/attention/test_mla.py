@@ -21,6 +21,10 @@ DEVICE_ARCH = arch_info.get_arch()
 torch.set_default_device("cuda")
 
 
+def uniform_random(shape, start=0, end=1, dtype=None, device=None):
+    return (end - start) * torch.rand(shape, dtype=dtype, device=device) + start
+
+
 def shuffle_kv_buffer(
     kv_buffer: torch.Tensor,
     kv_lora_rank: int,
@@ -255,7 +259,7 @@ def torch_mla_extend(
 # @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("decode_qlen", [1])
-@pytest.mark.parametrize("ctx_lens", [8192])
+@pytest.mark.parametrize("ctx_lens", [1328])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("num_blocks", [128])
@@ -264,10 +268,11 @@ def torch_mla_extend(
     "q_dtype, kv_dtype, out_dtype, block_size, use_out_scale",
     [
         # (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
-        # (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, True),
-        # (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, True),
-        # (e4m3_dtype, torch.uint8, torch.bfloat16, 128, True),
-        (torch.uint8, torch.uint8, torch.bfloat16, 128, True),
+        # (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False),
+        # (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, False),
+        (e4m3_dtype, e4m3_dtype, e4m3_dtype, 64, True),
+        # (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
+        # (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
     ],
 )
 @pytest.mark.parametrize("shuffled_kv_cache", [True])
@@ -348,17 +353,23 @@ def test_mla_decode_fwd(
 
     q_descale = None
     kv_descale = None
+    output_scale = None
     if q_dtype != torch.bfloat16:
-        q_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
+        q_descale = uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+        )
 
     if kv_dtype != torch.bfloat16:
-        kv_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
+        kv_descale = uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+        )
 
-    out_scale = None
     if use_out_scale:
-        out_scale = 1 / torch.rand(1, dtype=torch.float32, device="cuda")
+        output_scale = 1 / uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+        )
 
-    out = torch.empty(
+    output = torch.empty(
         (total_num_query_tokens, num_query_heads, kv_lora_rank), dtype=out_dtype
     )
 
@@ -378,7 +389,7 @@ def test_mla_decode_fwd(
     mla_decode_fwd(
         q=maybe_quant_query,
         kv_buffer=maybe_shuffled_kv_buffer,
-        out=out,
+        out=output,
         cu_seqlens_q=cu_seqlens_q,
         seqused_k=seq_lens_kv,
         max_seqlen_kv=max_seqlen_kv,
@@ -390,11 +401,11 @@ def test_mla_decode_fwd(
         q_descale=q_descale,
         kv_descale=kv_descale,
         q_scales=query_scales,
-        out_scale=out_scale,
+        out_scale=output_scale,
         shuffled_kv_cache=shuffled_kv_cache,
     )
 
-    out_ref = torch_mla_extend(
+    ref_output = torch_mla_extend(
         query,
         kv_buffer,
         cu_seqlens_q,
@@ -404,16 +415,16 @@ def test_mla_decode_fwd(
         sm_scale,
         q_descale=q_descale,
         kv_descale=kv_descale,
-        out_scale=out_scale,
+        out_scale=output_scale,
         o_dtype=out_dtype,
     )
 
     atol, rtol = 1.5e-2, 1e-2
-    if q_dtype == e4m3_dtype or kv_dtype == e4m3_dtype:
+    if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
         atol, rtol = 1.5e-1, 1.5e-1
     torch.testing.assert_close(
-        out, out_ref, atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(out - out_ref))}"
+        output.to(torch.bfloat16), ref_output.to(torch.bfloat16), atol=atol, rtol=rtol
+    ), f"{torch.max(torch.abs(output.to(torch.bfloat16) - ref_output.to(torch.bfloat16)))}"
 
 
 @pytest.mark.parametrize("batch_size", [1])

@@ -543,6 +543,11 @@ def unified_attention(
                 q_descale_ptr=q_descale,
                 k_descale_ptr=k_descale,
                 v_descale_ptr=v_descale,
+                out_scale_ptr=(
+                    output_scale
+                    if (output_scale is not None and NUM_SEGMENTS == 1)
+                    else None
+                ),
                 softcap=softcap,
                 num_query_heads=num_query_heads,
                 num_queries_per_kv=num_queries_per_kv,

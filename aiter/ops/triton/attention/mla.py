@@ -150,6 +150,9 @@ def mla_prefill_fwd(
     num_queries_per_kv = num_query_heads // num_kv_heads
     q_dtype = q.dtype
     kv_buffer_dtype = kv_buffer.dtype
+    K_WIDTH = 16 if kv_buffer_dtype == e4m3_dtype else 8
+    QUERY_DTYPE = "fp8" if q_dtype == e4m3_dtype else "bf16"
+    KV_CACHE_DTYPE = "fp8" if kv_buffer_dtype == e4m3_dtype else "bf16"
 
     assert (
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
@@ -209,8 +212,9 @@ def mla_prefill_fwd(
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
             WARP_SIZE=WARP_SIZE,
-            IS_Q_FP8=(q_dtype == e4m3_dtype),
-            IS_KV_FP8=(kv_buffer_dtype == e4m3_dtype),
+            QUERY_DTYPE=QUERY_DTYPE,
+            KV_CACHE_DTYPE=KV_CACHE_DTYPE,
+            K_WIDTH=K_WIDTH,
             **attn_config,
         )
     else:
@@ -363,28 +367,33 @@ def mla_decode_fwd(
     )
 
     NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
-    segm_output = torch.empty(
-        total_num_tokens,
-        num_query_heads,
-        NUM_SEGMENTS,
-        triton.next_power_of_2(kv_lora_rank),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    segm_max = torch.empty(
-        total_num_tokens,
-        num_query_heads,
-        NUM_SEGMENTS,
-        dtype=torch.float32,
-        device=q.device,
-    )
-    segm_expsum = torch.empty(
-        total_num_tokens,
-        num_query_heads,
-        NUM_SEGMENTS,
-        dtype=torch.float32,
-        device=q.device,
-    )
+    if NUM_SEGMENTS > 1:
+        segm_output = torch.empty(
+            total_num_tokens,
+            num_query_heads,
+            NUM_SEGMENTS,
+            triton.next_power_of_2(kv_lora_rank),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        segm_max = torch.empty(
+            total_num_tokens,
+            num_query_heads,
+            NUM_SEGMENTS,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        segm_expsum = torch.empty(
+            total_num_tokens,
+            num_query_heads,
+            NUM_SEGMENTS,
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        segm_output = out
+        segm_max = out  # dummy ptr
+        segm_expsum = out  # dummy ptr
 
     if IS_DEVICE_ARCH_GFX12:
         if shuffled_kv_cache:
@@ -404,6 +413,9 @@ def mla_decode_fwd(
             SCALE=softmax_scale,
             q_scale_ptr=q_descale,
             kv_scale_ptr=kv_descale,
+            out_scale_ptr=(
+                out_scale if (out_scale is not None and NUM_SEGMENTS == 1) else None
+            ),
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,
             block_tables_stride=block_tables.stride(0),
@@ -466,8 +478,12 @@ def mla_decode_fwd(
             IS_KV_FP8=(kv_buffer_dtype == e4m3_dtype),
             **attn_config,
         )
-    if skip_reduce:
+
+    if NUM_SEGMENTS == 1:
+        return segm_output
+    elif skip_reduce:
         return segm_output, segm_max, segm_expsum
+
     _mla_decode_fwd_reduce_kernel[(total_num_tokens, num_query_heads)](
         output_ptr=out,
         segm_output_ptr=segm_output,

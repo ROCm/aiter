@@ -174,7 +174,7 @@ def check_kv_buffer(
         (torch.uint8, True, 128),
     ],
 )
-def test_fused_qk_rope_cat_and_cache_mla(
+def test_cat_and_cache_mla(
     T: int,
     KH: int,
     D_pe: int,

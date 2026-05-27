@@ -284,7 +284,6 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     q_nope_zeros_out_stride_d,
     kv_cache_stride_b,
     kv_cache_stride_h,
-    kv_cache_stride_blk,
     kv_cache_stride_d,
     k_scale_ptr,
     QH_PER_KH: tl.constexpr,

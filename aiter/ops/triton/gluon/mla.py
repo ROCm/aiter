@@ -1255,43 +1255,44 @@ class MLAProgram:
 
     @gluon.jit
     def store_L_M(self, L, M, segm_idx):
-        segm_offset = (
-            self.query_offset_0_qk
-            * (self.cfg.NUM_QUERY_HEADS * self.cfg.NUM_SEGMENTS_PER_SEQ)
-            + self.query_offset_1_qk * self.cfg.NUM_SEGMENTS_PER_SEQ
-            + segm_idx
-        )
-        L = gl.convert_layout(
-            L, layout=gl.SliceLayout(1, self.cfg.QK_WMMA_UNPACKED_LAYOUT)
-        )
-        M = gl.convert_layout(
-            M, layout=gl.SliceLayout(1, self.cfg.QK_WMMA_UNPACKED_LAYOUT)
-        )
+        if self.cfg.NUM_SEGMENTS_PER_SEQ > 1:
+            segm_offset = (
+                self.query_offset_0_qk
+                * (self.cfg.NUM_QUERY_HEADS * self.cfg.NUM_SEGMENTS_PER_SEQ)
+                + self.query_offset_1_qk * self.cfg.NUM_SEGMENTS_PER_SEQ
+                + segm_idx
+            )
+            L = gl.convert_layout(
+                L, layout=gl.SliceLayout(1, self.cfg.QK_WMMA_UNPACKED_LAYOUT)
+            )
+            M = gl.convert_layout(
+                M, layout=gl.SliceLayout(1, self.cfg.QK_WMMA_UNPACKED_LAYOUT)
+            )
 
-        if self.cfg.USE_STORE_BUFFER_OP:
-            gl.amd.cdna4.buffer_store(
-                stored_value=M,
-                ptr=self.segm_max_ptr,
-                offsets=segm_offset.to(gl.int32),
-                mask=self.query_mask_0_qk & self.query_mask_1_qk,
-            )
-            gl.amd.cdna4.buffer_store(
-                stored_value=L,
-                ptr=self.segm_expsum_ptr,
-                offsets=segm_offset.to(gl.int32),
-                mask=self.query_mask_0_qk & self.query_mask_1_qk,
-            )
-        else:
-            gl.store(
-                self.segm_max_ptr + segm_offset.to(gl.int64),
-                M,
-                mask=self.query_mask_0_qk & self.query_mask_1_qk,
-            )
-            gl.store(
-                self.segm_expsum_ptr + segm_offset.to(gl.int64),
-                L,
-                mask=self.query_mask_0_qk & self.query_mask_1_qk,
-            )
+            if self.cfg.USE_STORE_BUFFER_OP:
+                gl.amd.cdna4.buffer_store(
+                    stored_value=M,
+                    ptr=self.segm_max_ptr,
+                    offsets=segm_offset.to(gl.int32),
+                    mask=self.query_mask_0_qk & self.query_mask_1_qk,
+                )
+                gl.amd.cdna4.buffer_store(
+                    stored_value=L,
+                    ptr=self.segm_expsum_ptr,
+                    offsets=segm_offset.to(gl.int32),
+                    mask=self.query_mask_0_qk & self.query_mask_1_qk,
+                )
+            else:
+                gl.store(
+                    self.segm_max_ptr + segm_offset.to(gl.int64),
+                    M,
+                    mask=self.query_mask_0_qk & self.query_mask_1_qk,
+                )
+                gl.store(
+                    self.segm_expsum_ptr + segm_offset.to(gl.int64),
+                    L,
+                    mask=self.query_mask_0_qk & self.query_mask_1_qk,
+                )
 
     @gluon.jit
     def store_output_3D(self, acc, M, L, segm_idx):
@@ -1509,6 +1510,7 @@ def _mla_decode_fwd_kernel(
     SCALE: gl.constexpr,  # float32
     q_scale_ptr,  # float32
     kv_scale_ptr,  # float32
+    out_scale_ptr,  # float32
     num_query_heads: gl.constexpr,  # int
     num_kv_heads: gl.constexpr,  # int
     block_tables_stride: gl.int64,  # int
@@ -1540,6 +1542,8 @@ def _mla_decode_fwd_kernel(
     QUERY_DTYPE: gl.constexpr = "bf16",  # bool
     KV_CACHE_DTYPE: gl.constexpr = "bf16",  # bool
     BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
+    FP8_MIN: tl.constexpr = float8_info.min,
+    FP8_MAX: tl.constexpr = float8_info.max,
 ):
     assert SHUFFLED_KV_CACHE
     assert num_stages == 2
@@ -1602,11 +1606,16 @@ def _mla_decode_fwd_kernel(
     else:
         q_scale = None
 
+    out_factor: gl.float32 = 1.0
     if kv_scale_ptr is not None:
         kv_scale = gl.load(kv_scale_ptr)
         qk_factor = qk_factor * kv_scale
+        out_factor = kv_scale
     else:
         kv_scale = None
+
+    if out_scale_ptr is not None:
+        out_factor = out_factor / tl.load(out_scale_ptr)
 
     context_len = seq_len - num_tokens_per_seq
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_tables_stride
@@ -1972,14 +1981,25 @@ def _mla_decode_fwd_kernel(
         kv_lora_trans = pgm.tdm_shared_load_kv_lora_trans(0, buffer_id)
         acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
 
-    if kv_scale_ptr is not None:
-        if KV_CACHE_DTYPE == "nvfp4":
-            acc0 = acc0 * kv_scale
-            acc1 = acc1 * kv_scale
-        else:
-            acc = acc * kv_scale
+    # if kv_scale_ptr is not None:
+    #     if KV_CACHE_DTYPE == "nvfp4":
+    #         acc0 = acc0 * kv_scale
+    #         acc1 = acc1 * kv_scale
+    #     else:
+    #         acc = acc * kv_scale
 
-    if KV_CACHE_DTYPE == "nvfp4":
+    if cfg.NUM_SEGMENTS_PER_SEQ == 1:
+        one_over_L = 1.0 / L[:, None]
+        one_over_L = gl.convert_layout(one_over_L, layout=cfg.PV_WMMA_LAYOUT)
+    if KV_CACHE_DTYPE == "nvfp4" and cfg.HEAD_SIZE_SPLIT > 1:
+        acc0 = acc0 * out_factor
+        acc1 = acc1 * out_factor
+        if cfg.NUM_SEGMENTS_PER_SEQ == 1:
+            acc0 = acc0 * one_over_L
+            acc1 = acc1 * one_over_L
+            if segm_output_ptr.type.element_ty.is_fp8():
+                acc0 = tl.clamp(acc0, FP8_MIN, FP8_MAX)
+                acc1 = tl.clamp(acc1, FP8_MIN, FP8_MAX)
         pgm.store_output_3D_split_head(
             acc0,
             acc1,
@@ -1988,6 +2008,12 @@ def _mla_decode_fwd_kernel(
             segm_idx,
         )
     else:
+        acc = acc * out_factor
+        if cfg.NUM_SEGMENTS_PER_SEQ == 1:
+            acc = acc * one_over_L
+            if segm_output_ptr.type.element_ty.is_fp8():
+                acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+
         pgm.store_output_3D(
             acc,
             M,
@@ -2046,8 +2072,9 @@ def _mla_prefill_fwd_kernel_non_pipelined(
     WARP_SIZE: gl.constexpr,  # int
     num_warps: gl.constexpr,  # int
     num_stages: gl.constexpr,  # int
-    IS_Q_FP8: gl.constexpr = False,  # bool
-    IS_KV_FP8: gl.constexpr = False,  # bool
+    QUERY_DTYPE: gl.constexpr = "bf16",  # bool
+    KV_CACHE_DTYPE: gl.constexpr = "bf16",  # bool
+    K_WIDTH: gl.constexpr = 0,  # int
     FP8_MIN: gl.constexpr = float8_info.min,
     FP8_MAX: gl.constexpr = float8_info.max,
 ):
@@ -2068,9 +2095,15 @@ def _mla_prefill_fwd_kernel_non_pipelined(
         False,
         False,
         False,
-        IS_Q_FP8,
-        IS_KV_FP8,
+        QUERY_DTYPE,
+        KV_CACHE_DTYPE,
+        False,
+        K_WIDTH,
+        1,
+        1,
+        1,
     )
+
     kv_head_idx = gl.program_id(0)
     q_block_global_idx = gl.program_id(1)
 
@@ -2341,9 +2374,9 @@ def _mla_prefill_fwd_kernel_non_pipelined(
 
         # acc : (BLOCK_M, KV_LORA_RANK)
         KV_lora_trans = kv_lora_shared.load(layout=cfg.V_DOT_LAYOUT)
-        if IS_Q_FP8 and IS_KV_FP8:
+        if cfg.QUERY_DTYPE == "fp8":
             P = P.to(KV_lora_trans.dtype)
-        elif IS_KV_FP8:
+        elif cfg.KV_CACHE_DTYPE == "fp8":
             P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
             KV_lora_trans = KV_lora_trans.to(gl.bfloat16)
         else:

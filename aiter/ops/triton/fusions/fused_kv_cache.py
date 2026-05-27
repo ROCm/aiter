@@ -35,7 +35,6 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     k_pe_out: torch.Tensor = None,
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
-    shuffled_kv_cache: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
@@ -93,7 +92,6 @@ def fused_qk_rope_cat_and_cache_mla(
     decode_q_pe_out: torch.Tensor = None,
     k_pe_out: torch.Tensor = None,
     q_out_dtype: torch.dtype = None,
-    shuffled_kv_cache: bool = False,
     shuffled_kv_cache: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """

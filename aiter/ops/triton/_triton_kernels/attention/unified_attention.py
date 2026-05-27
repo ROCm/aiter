@@ -861,6 +861,10 @@ def reduce_segments(
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
 
+    out_scale = None
+    if out_scale_ptr is not None:
+        out_scale = 1 / tl.load(out_scale_ptr)
+
     seq_idx = find_seq_idx(
         query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
     )
@@ -917,7 +921,7 @@ def reduce_segments(
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 
     if out_scale_ptr is not None:
-        acc = acc / tl.load(out_scale_ptr)
+        acc = acc * out_scale
 
     if output_ptr.type.element_ty.is_fp8():
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
