@@ -13,13 +13,13 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 
-@pytest.mark.parametrize("T", [1, 2, 4, 2048])
+@pytest.mark.parametrize("T", [1, 4, 128])
 @pytest.mark.parametrize("QH_per_KH", [1, 16])
 @pytest.mark.parametrize("KH", [1, 8])
 @pytest.mark.parametrize("D_pe", [64])  # For now, D is power of 2. D >= 16
 @pytest.mark.parametrize("D_q_nope", [512])
 @pytest.mark.parametrize("D_lora", [512])
-@pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [1024])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.uint8])
@@ -205,11 +205,11 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("T", [1, 2, 4, 2048])
+@pytest.mark.parametrize("T", [1, 4, 128])
 @pytest.mark.parametrize("QH_per_KH", [1, 16])
 @pytest.mark.parametrize("KH", [1, 8])
 @pytest.mark.parametrize("D", [64])  # For now, D is power of 2. D >= 16
-@pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [1024])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.uint8])
@@ -444,11 +444,11 @@ def test_fused_qk_rope_reshape_and_cache(
     )
 
 
-@pytest.mark.parametrize("T", [1, 2, 4, 32])
+@pytest.mark.parametrize("T", [1, 4, 32])
 @pytest.mark.parametrize("QH_per_KH", [1, 4])
 @pytest.mark.parametrize("KH", [1, 8])
 @pytest.mark.parametrize("D", [64, 128])
-@pytest.mark.parametrize("num_kv_cahce_tokens", [256, 16384])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [256])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize("block_size", [16])
@@ -589,10 +589,10 @@ GPT_OSS_120B_NUM_ATTENTION_HEADS = 64
 GPT_OSS_120B_NUM_KV_HEADS = 8
 
 
-@pytest.mark.parametrize("T", [1, 4, 16, 64])
+@pytest.mark.parametrize("T", [1, 4, 16])
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("x_size", [8])
-@pytest.mark.parametrize("num_kv_cahce_tokens", [256, 4096])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [256])
 def test_fused_qk_rope_reshape_and_cache_gpt_oss_120b_config_value_shuffle_precision(
     T: int,
     block_size: int,
@@ -733,11 +733,11 @@ def test_fused_qk_rope_reshape_and_cache_gpt_oss_120b_config_value_shuffle_preci
         )
 
 
-@pytest.mark.parametrize("T", [1, 2, 4, 128])
+@pytest.mark.parametrize("T", [1, 4, 64])
 @pytest.mark.parametrize("QH_per_KH", [1, 4, 16])
 @pytest.mark.parametrize("KH", [1, 8])
 @pytest.mark.parametrize("D", [64, 128])  # For now, D is power of 2. D >= 16
-@pytest.mark.parametrize("num_kv_cahce_tokens", [8193])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [1025])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16])

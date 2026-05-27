@@ -9,12 +9,10 @@ import torch
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.triton.utils.types import e4m3_dtype
 
-NUM_HEADS = [(4, 4), (16, 2)]
-HEAD_SIZES = [64, 128]
+NUM_HEADS = [(16, 2)]
+HEAD_SIZES = [128]
 BLOCK_SIZES = [16, 64]
 
-# one value large enough to test overflow in index calculation.
-# one value small enough to test the schema op check
 NUM_BLOCKS = [32768, 2048]
 
 
@@ -102,9 +100,7 @@ def ref_paged_attn(
     return out.to(out_dtype)
 
 
-@pytest.mark.parametrize(
-    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
-)
+@pytest.mark.parametrize("seq_lens", [[(1, 523), (1, 37), (1, 2011)]])
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)

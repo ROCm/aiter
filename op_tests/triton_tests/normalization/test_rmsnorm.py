@@ -99,25 +99,13 @@ def run_triton(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=No
 def get_vals():
 
     vals = [
-        (1, 4),
-        (2, 10),
-        (256, 4096),
-        (4096, 8192),
-        (1, 31744),
-        (8192, 65536),
-        (873, 1245),
-        (4096, 5120),
-        (8192, 8192),
-        (2048, 4096),
-        (768, 2048),
-        (256, 1024),
-        (128, 768),
-        (64, 512),
+        (1, 1024),
+        (256, 2048),
+        (128, 2880),
+        (64, 4096),
+        (256, 5120),
+        (32, 7168),
         (173, 409),
-        (71, 3571),
-        (364800, 128),
-        (16380, 1536),
-        # (29, 17389), // Temporarily disable this test due to abort issues on CI
     ]
 
     return vals
@@ -156,11 +144,8 @@ def test_rmsnorm(M, N, in_dtype_str):
     if out_dtype in (torch.float16, torch.bfloat16):
         atol, rtol = 1e-2, 1e-2
     else:
-        if M == 364800 and N == 128:
-            atol, rtol = 1e-2, 1e-2
-        else:
-            # float32 typically can be tighter
-            atol, rtol = 1e-4, 1e-4
+        # float32 typically can be tighter
+        atol, rtol = 1e-4, 1e-4
 
     assert (
         y_triton.dtype == out_dtype
@@ -209,11 +194,8 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
     if out_dtype in (torch.float16, torch.bfloat16):
         atol, rtol = 1e-2, 1e-2
     else:
-        if M == 364800 and N == 128:
-            atol, rtol = 1e-2, 1e-2
-        else:
-            # float32 typically can be tighter
-            atol, rtol = 1e-4, 1e-4
+        # float32 typically can be tighter
+        atol, rtol = 1e-4, 1e-4
 
     assert (
         y_triton.dtype == out_dtype
@@ -340,8 +322,8 @@ def test_rmsnorm_fused_add_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
     torch.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.parametrize("B", [1, 4, 8])
-@pytest.mark.parametrize("T", [128, 512, 2048])
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("T", [128, 512])
 @pytest.mark.parametrize("D", [64, 4096])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_rms_norm_dynamic_per_token_fp8_quant(

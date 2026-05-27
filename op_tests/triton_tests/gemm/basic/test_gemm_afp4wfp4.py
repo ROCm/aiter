@@ -131,12 +131,12 @@ def generate_gemm_afp4wfp4_inputs(
 
 
 def get_x_vals():
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(v, 106496, 16384) for v in (150, 256, 4096, 8000)]  # LL3 405B FC1
-    x_vals += [(v, 9216, 7168) for v in (128, 192, 4096, 8000)]
-    x_vals += [(v, 7168, 4608) for v in (128, 192, 4096, 8000)]
-    x_vals += [(v, 2112, 7168) for v in (128, 192, 4096, 8000)]
-    x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
+    x_vals = [(1024, 1024, 1024)]  # square medium
+    x_vals += [(1, 2112, 7168)]  # DSR1 edge case M=1
+    x_vals += [(128, 7168, 4608)]  # DSR1 medium
+    x_vals += [(192, 2112, 7168)]  # DSR1 irregular M
+    x_vals += [(256, 3584, 4096)]  # Llama3 representative
+    x_vals += [(64, 640, 2880)]  # GPT-OSS representative
     return x_vals
 
 

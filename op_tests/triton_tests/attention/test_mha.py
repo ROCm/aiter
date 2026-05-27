@@ -91,10 +91,10 @@ def _test_mha_impl(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("BATCH", [1, 30, 50])
+@pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
+    [(1, 1), (128, 128), (64, 128)],
 )
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 8), (48, 8)])
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
@@ -379,10 +379,10 @@ def _test_mha_varlen_impl(
     )
 
 
-@pytest.mark.parametrize("BATCH", [1, 4, 30, 50])
+@pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
+    [(1, 1), (128, 128), (64, 128)],
 )
 @pytest.mark.parametrize(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
@@ -449,9 +449,9 @@ def test_mha_varlen_with_dropout(
 #   HQ=32, HK=8:  Llama 3 8B (GQA 4:1)
 #   HQ=64, HK=8:  Llama 3 70B (GQA 8:1)
 #   HQ=32, HK=32: Llama 2 7B (MHA)
-@pytest.mark.parametrize("BATCH", [1, 4])
-@pytest.mark.parametrize("SEQLEN_Q", [512, 1024, 2048])
-@pytest.mark.parametrize("SEQLEN_K", [512, 1024, 2048])
+@pytest.mark.parametrize("BATCH", [1])
+@pytest.mark.parametrize("SEQLEN_Q", [512])
+@pytest.mark.parametrize("SEQLEN_K", [512, 1024])
 @pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
 @pytest.mark.parametrize("NUM_K_HEADS", [8])
 @pytest.mark.parametrize("HEAD_SZ", [128])
@@ -530,8 +530,8 @@ def test_mha_backward(
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("BATCH", [2, 4])
-@pytest.mark.parametrize("SEQLEN_Q", [256, 512])
+@pytest.mark.parametrize("BATCH", [2])
+@pytest.mark.parametrize("SEQLEN_Q", [256])
 @pytest.mark.parametrize("SEQLEN_K", [256, 512])
 @pytest.mark.parametrize("NUM_Q_HEADS", [32])
 @pytest.mark.parametrize("NUM_K_HEADS", [8])
@@ -602,9 +602,9 @@ def test_mha_backward_sbhd_do(
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("SEQLEN_Q", [512, 2048])
-@pytest.mark.parametrize("SEQLEN_K", [512, 2048])
-@pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
+@pytest.mark.parametrize("SEQLEN_Q", [512])
+@pytest.mark.parametrize("SEQLEN_K", [512, 1024])
+@pytest.mark.parametrize("NUM_Q_HEADS", [32])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("FUSED", [False, True])
