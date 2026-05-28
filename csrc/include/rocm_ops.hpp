@@ -1887,7 +1887,8 @@ namespace py = pybind11;
           py::arg("has_initial_state"),                                     \
           py::arg("output_final_state"),                                    \
           py::arg("save_new_value"),                                        \
-          py::arg("use_exp2"));
+          py::arg("use_exp2"),                                              \
+          py::arg("g_head_major") = false);
 
 #define FUSED_SPLIT_GDR_UPDATE_PYBIND                                 \
     m.def("fused_split_gdr_update",                                   \

@@ -13,19 +13,25 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import autotune_cache_kwargs, IS_AMD, maybe_autotune
+from ..gated_delta_rule_utils import (
+    IS_AMD,
+    autotune_cache_kwargs,
+    gated_delta_rule_autotune_configs,
+)
 from ..utils import prepare_chunk_indices
 from ..utils.op import exp
 from ..utils.solve_tril import FLA_TRIL_PRECISION
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@maybe_autotune(
-    configs=[
-        triton.Config({}, num_warps=nw, num_stages=ns)
-        for nw in [2, 4, 8]
-        for ns in ([2, 3] if IS_AMD else [2, 3, 4])
-    ],
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config({}, num_warps=nw, num_stages=ns)
+            for nw in [2, 4, 8]
+            for ns in ([2, 3] if IS_AMD else [2, 3, 4])
+        ]
+    ),
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
@@ -214,7 +220,10 @@ def fused_solve_tril_recompute_w_u_kernel(
     # Phase 2: u = Ai @ (v * beta), w = Ai @ (k * beta * exp(g))
     # ================================================================
     beta_base = beta + bos * H + i_h
-    g_base = g + bos * H + i_h
+    if IS_VARLEN:
+        g_base = g + i_h * T_flat + bos
+    else:
+        g_base = g + (i_b * H + i_h) * T_flat
 
     p_b0 = tl.make_block_ptr(beta_base, (T,), (H,), (i_t * BT,), (16,), (0,))
     p_b1 = tl.make_block_ptr(beta_base, (T,), (H,), (i_t * BT + 16,), (16,), (0,))
@@ -225,10 +234,10 @@ def fused_solve_tril_recompute_w_u_kernel(
     bb2 = tl.load(p_b2, boundary_check=(0,))
     bb3 = tl.load(p_b3, boundary_check=(0,))
 
-    p_g0 = tl.make_block_ptr(g_base, (T,), (H,), (i_t * BT,), (16,), (0,))
-    p_g1 = tl.make_block_ptr(g_base, (T,), (H,), (i_t * BT + 16,), (16,), (0,))
-    p_g2 = tl.make_block_ptr(g_base, (T,), (H,), (i_t * BT + 32,), (16,), (0,))
-    p_g3 = tl.make_block_ptr(g_base, (T,), (H,), (i_t * BT + 48,), (16,), (0,))
+    p_g0 = tl.make_block_ptr(g_base, (T,), (1,), (i_t * BT,), (16,), (0,))
+    p_g1 = tl.make_block_ptr(g_base, (T,), (1,), (i_t * BT + 16,), (16,), (0,))
+    p_g2 = tl.make_block_ptr(g_base, (T,), (1,), (i_t * BT + 32,), (16,), (0,))
+    p_g3 = tl.make_block_ptr(g_base, (T,), (1,), (i_t * BT + 48,), (16,), (0,))
     if USE_EXP2:
         eg0 = tl.math.exp2(tl.load(p_g0, boundary_check=(0,)))
         eg1 = tl.math.exp2(tl.load(p_g1, boundary_check=(0,)))
@@ -367,7 +376,7 @@ def fused_solve_tril_recompute_w_u(
         k: [B, T, Hg, K]
         v: [B, T, H, V]
         beta: [B, T, H]
-        g_cumsum: [B, T, H] FP32, cumulative gate in the selected exponent base
+        g_cumsum: [B, H, T] FP32, cumulative gate in the selected exponent base
         cu_seqlens: [N+1]
         use_exp2: when True, interpret g_cumsum in log2 space
 

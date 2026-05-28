@@ -20,6 +20,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> chunk_gated_delta_rule_f
     bool has_initial_state,
     bool output_final_state,
     bool save_new_value,
-    bool use_exp2);
+    bool use_exp2,
+    bool g_head_major);
 
 } // namespace aiter
