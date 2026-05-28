@@ -3,6 +3,7 @@
 
 import functools
 import os
+import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -349,7 +350,6 @@ def fused_moe_(
         intermediate_pad,
         isShuffled,
         gate_mode,
-        bias=(bias1 is not None or bias2 is not None),
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -820,16 +820,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     **_kwargs,
 ):
-    # `parsed` is the static per-kernel params dict registered at
-    # import time by `get_flydsl_stage2_kernels` (see
-    # aiter/ops/flydsl/moe_kernels.py) and pre-populated into
-    # `_KERNEL_PARAMS` by `_register_all_configs()`. Variant-specific
-    # knobs that live on the kernel name (e.g. the
-    # `..._persist_async_w4_cumul3` production variant adds
-    # `use_async_copy=True / waves_per_eu=4 / cu_num_mul=3`) are
-    # already baked into this dict, so the `parsed.get(..., default)`
-    # calls below pick up the registered values for that kernel name
-    # rather than always falling back to defaults.
+
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
@@ -852,9 +843,6 @@ def _flydsl_stage2_wrapper(
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
         sort_block_m=parsed.get("sort_block_m", 0),
-        waves_per_eu=parsed.get("waves_per_eu", None),
-        use_async_copy=parsed.get("use_async_copy", False),
-        cu_num_mul=parsed.get("cu_num_mul", 1),
         b_nt=parsed.get("b_nt", 0),
         persist=parsed.get("persist", None),
         inter_dim_pad=inter_dim_pad,
@@ -882,7 +870,6 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
-    bias=False,
 ):
     gate_mode = GateMode(gate_mode)
     _INDEX_COLS = [
@@ -899,27 +886,12 @@ def get_2stage_cfgs(
         "q_type",
         "use_g1u1",
         "doweight_stage1",
-        "bias",
-        "hidden_pad",
-        "intermediate_pad",
     ]
-
-    def _normalize_lookup_cols(df):
-        for col in ("hidden_pad", "intermediate_pad"):
-            if col not in df.columns:
-                df[col] = 0
-            df[col] = df[col].fillna(0).astype(int)
-        if "bias" in df.columns:
-            df["bias"] = df["bias"].astype(str).str.strip().eq("True")
-        else:
-            df["bias"] = False
-        return df
 
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
         df = pd.read_csv(tune_file)
-        df = _normalize_lookup_cols(df)
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
 
@@ -961,7 +933,6 @@ def get_2stage_cfgs(
             _flydsl_fallback_cache[tune_file] = {}
             return {}
         df = pd.read_csv(tune_file)
-        df = _normalize_lookup_cols(df)
         if "_tag" not in df.columns:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
@@ -990,7 +961,6 @@ def get_2stage_cfgs(
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
-    bias_key = bool(bias)
     keys = (
         cu_num,
         token,
@@ -1005,9 +975,6 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
-        bias_key,
-        hidden_pad,
-        intermediate_pad,
     )
     keys_disabled = (
         cu_num,
@@ -1023,41 +990,17 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
-        bias_key,
-        hidden_pad,
-        intermediate_pad,
     )
 
     def MainFunc():
-        header = "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,bias,hidden_pad,intermediate_pad"
-        # Migrate legacy untuned CSV (no `bias` column) so appended rows stay aligned.
-        if os.path.exists(untune_file) and os.path.getsize(untune_file) > 0:
-            with open(untune_file, "r") as f:
-                lines = f.read().splitlines()
-            if lines and "bias" not in lines[0].split(","):
-                old_cols = lines[0].split(",")
-                try:
-                    insert_at = old_cols.index("doweight_stage1") + 1
-                except ValueError:
-                    insert_at = len(old_cols) - 2
-                new_lines = [
-                    ",".join(old_cols[:insert_at] + ["bias"] + old_cols[insert_at:])
-                ]
-                for line in lines[1:]:
-                    if not line.strip():
-                        new_lines.append(line)
-                        continue
-                    parts = line.split(",")
-                    parts = parts[:insert_at] + ["False"] + parts[insert_at:]
-                    new_lines.append(",".join(parts))
-                with open(untune_file, "w") as f:
-                    f.write("\n".join(new_lines))
         with open(untune_file, "a") as f:
             if os.path.getsize(untune_file) == 0:
-                f.write(header)
+                f.write(
+                    "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
+                )
             q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
             f.write(
-                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)},{bool(bias)},{hidden_pad},{intermediate_pad}"
+                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
             )
         logger.info("\033[34m Start tuning fmoe")
         os.system(
@@ -1092,7 +1035,8 @@ def get_2stage_cfgs(
 
     cfg = _lookup_cfg(cfg_2stages)
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
-        lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
+        lock_name = re.sub(r"[^\w.\-]", "_", str(keys))
+        lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{lock_name}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
         cfg = _lookup_cfg(cfg_2stages)
@@ -1622,7 +1566,6 @@ def fused_moe_2stages(
         intermediate_pad,
         is_shuffled,
         gate_mode,
-        bias=(bias1 is not None or bias2 is not None),
     )
     if (
         quant_type == QuantType.per_1x32

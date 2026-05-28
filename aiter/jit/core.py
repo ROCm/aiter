@@ -215,12 +215,7 @@ class AITER_CONFIG(object):
                 f"when merging '{merge_name}'."
             )
 
-        _FILL_DEFAULTS = {
-            "xbf16": 0,
-            "run_1stage": 0,
-            "ksplit": 0,
-            "bias": False,
-        }
+        _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
         all_cols = list(source_pairs[0][1].columns)
         for _, df in source_pairs[1:]:
             for c in df.columns:
@@ -257,9 +252,6 @@ class AITER_CONFIG(object):
                 keys.append("cu_num")
             if "gfx" in merge_df.columns and "gfx" not in keys:
                 keys.append("gfx")
-            for col in ("bias", "hidden_pad", "intermediate_pad"):
-                if col in merge_df.columns and col not in keys:
-                    keys.append(col)
             dedup_keys = keys + ["_tag"] if has_tag else keys
             duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():
@@ -747,6 +739,7 @@ def build_module(
     torch_exclude,
     third_party,
     hipify=False,
+    flags_extra_hip_per_source=None,
 ):
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
@@ -926,6 +919,7 @@ def build_module(
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
                 hipify=hipify,
+                extra_cuda_cflags_per_source=flags_extra_hip_per_source,
             )
             if is_python_module and not is_standalone:
                 shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
@@ -1046,10 +1040,21 @@ def get_args_of_build(ops_name: str, exclude=[]):
         "hip_clang_path": None,
         "blob_gen_cmd": "",
         "third_party": [],
+        # Optional per-source HIP flags. Maps a source path or fnmatch
+        # glob (e.g. "*_device.cu") to a list of additional flags that
+        # ninja will append to that single TU's $cuda_post_cflags. Used
+        # by opus_gemm to apply -D__HIPCC_RTC__ to kernel-only TUs while
+        # leaving dispatcher / pybind TUs untouched.
+        "flags_extra_hip_per_source": {},
     }
 
     def convert(d_ops: dict):
         for k, val in d_ops.items():
+            # `flags_extra_hip_per_source` is a dict-valued field
+            # whose string elements are plain compile flags (no env-var
+            # interpolation, no `eval`). Pass it through unchanged.
+            if k == "flags_extra_hip_per_source":
+                continue
             if isinstance(val, list):
                 for idx, el in enumerate(val):
                     if isinstance(el, str):
@@ -1190,6 +1195,7 @@ def _ctypes_call(func, fc_name, md_name):
                 d_args["is_standalone"],
                 d_args["torch_exclude"],
                 d_args.get("third_party", []),
+                flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
             )
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
@@ -1461,6 +1467,9 @@ def compile_ops(
                         prev_hip_clang_path = os.environ.get("HIP_CLANG_PATH", None)
                         os.environ["HIP_CLANG_PATH"] = hip_clang_path
 
+                    flags_extra_hip_per_source = d_args.get(
+                        "flags_extra_hip_per_source", {}
+                    )
                     build_module(
                         md_name,
                         srcs,
@@ -1475,6 +1484,7 @@ def compile_ops(
                         torch_exclude,
                         third_party,
                         hipify,
+                        flags_extra_hip_per_source=flags_extra_hip_per_source,
                     )
 
                     if hip_clang_path is not None:

@@ -125,11 +125,9 @@ def build(verbose=False, jobs=None):
     #
     # gfx1201 / gfx1200 (Navi 44/48, RDNA4): opus _async_load uses
     # __builtin_amdgcn_raw_ptr_buffer_load_lds which needs the
-    # `vmem-to-lds-load-insts` target feature (gfx9x / gfx950 / gfx1250 only).
-    _ARCH_SKIP_SOURCES = {
-        "gfx1200": {"test_async_load.cu", "test_load_store_if.cu"},
-        "gfx1201": {"test_async_load.cu", "test_load_store_if.cu"},
-    }
+    # Per-arch build-time skip list. Empty today; add entries here if a
+    # future kernel needs an arch-specific feature unavailable elsewhere.
+    _ARCH_SKIP_SOURCES = {}
     skip = _ARCH_SKIP_SOURCES.get(arch, set())
     sources = [s for s in _CU_SOURCES if s not in skip]
     if verbose and skip:
