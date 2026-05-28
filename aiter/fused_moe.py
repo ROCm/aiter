@@ -498,6 +498,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     intermediate_pad: int,
     bias1: Optional[torch.Tensor],
     bias2: Optional[torch.Tensor],
+    gate_mode: GateMode = GateMode.SEPARATED,
     ):
     def _grouped_dbg(msg: str, stacklevel: int = 1):
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
@@ -537,6 +538,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 ("intermediate_pad", intermediate_pad),
                 ("bias1", bias1),
                 ("bias2", bias2),
+                ("gate_mode", gate_mode),
             ]
         )
     )
@@ -564,6 +566,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if activation not in (ActivationType.Silu, ActivationType.Swiglu):
         _grouped_dbg("not silu or not swiglu")
         return None
+    if gate_mode not in (GateMode.SEPARATED, GateMode.INTERLEAVE):
+        _grouped_dbg(f"unsupported gate_mode={gate_mode}")
+        return None
+    stage1_weight_layout = "gugu" if gate_mode == GateMode.INTERLEAVE else "gguu"
     is_grouped_a4w4 = q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2
     is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and (q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8)
     if not (is_grouped_a4w4 or is_grouped_a8w4):
@@ -843,6 +849,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         num_buffers=2,
         expert_sched_mode=False,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
+        stage1_weight_layout=stage1_weight_layout,
     )
     _grouped_dbg("stage1 compile done; start launch")
     stage1(
@@ -1113,6 +1120,7 @@ def fused_moe_(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        gate_mode=gate_mode,
     )
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out

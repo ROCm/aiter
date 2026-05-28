@@ -64,6 +64,7 @@ def compile_mxscale_gemm(
     grouped_persistent_m: bool = False,
     persistent_workers: int | None = None,
     stage1_act: str | None = None,
+    stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
 ):
     """Compile an MXFP4 or MXFP8 GEMM kernel with TDM async copy.
@@ -101,6 +102,11 @@ def compile_mxscale_gemm(
     if grouped_persistent_m and not grouped_masked_m:
         raise ValueError("grouped_persistent_m requires grouped_masked_m=True")
     stage1_act_mode = None if stage1_act in (None, "", "none") else str(stage1_act)
+    stage1_weight_layout_mode = str(stage1_weight_layout)
+    if stage1_weight_layout_mode not in ("gguu", "gugu"):
+        raise ValueError(
+            f"stage1_weight_layout must be 'gguu' or 'gugu', got {stage1_weight_layout!r}"
+        )
     epilogue_bias_mode = bool(epilogue_bias)
     if epilogue_bias_mode and out_dtype not in ("bf16", "f16"):
         raise ValueError("epilogue_bias currently supports f16/bf16 outputs only")
@@ -114,6 +120,8 @@ def compile_mxscale_gemm(
             raise ValueError("stage1_act GEMM epilogue fuse requires use_tdm_store=False")
         if wave_specialized_tdm:
             raise ValueError("stage1_act GEMM epilogue fuse does not support wave_specialized_tdm")
+        if stage1_weight_layout_mode == "gugu" and N % 2 != 0:
+            raise ValueError("stage1 gugu fused epilogue requires raw N == 2*inter_dim")
     if grouped_persistent_m and (cluster_m > 1 or cluster_n > 1):
         raise ValueError("grouped_persistent_m currently requires cluster_m=cluster_n=1")
     if grouped_persistent_m:
@@ -170,7 +178,10 @@ def compile_mxscale_gemm(
     K_packed_b = K // PACK_FACTOR_B
     K_scale = K // SCALE_BLOCK
     split_k_chunk = K // split_k
-    B_TOTAL_N = N * 2 if stage1_act_mode is not None else N
+    stage1_act_interleave = stage1_act_mode is not None and stage1_weight_layout_mode == "gugu"
+    stage1_dual_b = stage1_act_mode is not None and not stage1_act_interleave
+    B_TOTAL_N = N if stage1_act_interleave else (N * 2 if stage1_dual_b else N)
+    C_N = N // 2 if stage1_act_interleave else N
 
     if K % tile_k != 0:
         raise ValueError(f"K must be divisible by tile_k={tile_k}, got K={K}")
@@ -257,7 +268,7 @@ def compile_mxscale_gemm(
     stage_layout.ptr = stage_a_data_rel_off + lds_a_data_bytes
     stage_b_data_rel_off = stage_layout._align(stage_layout.ptr, 16)
     stage_layout.ptr = stage_b_data_rel_off + lds_b_data_bytes
-    if stage1_act_mode is not None:
+    if stage1_dual_b:
         stage_b_up_data_rel_off = stage_layout._align(stage_layout.ptr, 16)
         stage_layout.ptr = stage_b_up_data_rel_off + lds_b_data_bytes
     else:
@@ -266,7 +277,7 @@ def compile_mxscale_gemm(
     stage_layout.ptr = stage_a_scale_rel_off + lds_a_scale_bytes
     stage_b_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
     stage_layout.ptr = stage_b_scale_rel_off + lds_b_scale_bytes
-    if stage1_act_mode is not None:
+    if stage1_dual_b:
         stage_b_up_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
         stage_layout.ptr = stage_b_up_scale_rel_off + lds_b_scale_bytes
     else:
@@ -345,7 +356,7 @@ def compile_mxscale_gemm(
     # tensor ops per wave per K-stage, while the wave-specialized path issues
     # only one tensor op from each dedicated loader wave.
     TDM_LOADS_PER_STEP = 1 if wave_specialized_tdm else (
-        6 if stage1_act_mode is not None else 4
+        6 if stage1_dual_b else 4
     )
     tail_plan = [
         (ls, cs, o * TDM_LOADS_PER_STEP // 2 if o > 0 else o)
@@ -497,7 +508,7 @@ def compile_mxscale_gemm(
             warp_n_base = wave_n_idx * arith.index(warp_tile_n)
 
             m_idx = arith.index_cast(T.index, i32_m.ir_value())
-            n_stride = arith.index(N)
+            n_stride = arith.index(C_N)
             if const_expr(batch_count > 1):
                 c_rows = arith.index(batch_count * M)
             else:
@@ -1232,6 +1243,23 @@ def compile_mxscale_gemm(
                     T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], [])
                 return g * sig
 
+            def _stage1_act_mul_scalar(g, u):
+                one = arith.constant(1.0, type=T.f32)
+                alpha = arith.constant(1.702, type=T.f32)
+                limit = arith.constant(7.0, type=T.f32)
+                neg_limit = arith.constant(-7.0, type=T.f32)
+                neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
+                if const_expr(stage1_act_mode == "swiglu"):
+                    g = arith.minimumf(g, limit)
+                    u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
+                    emu = llvm.call_intrinsic(
+                        T.f32, "llvm.amdgcn.exp2.f32",
+                        [g * alpha * neg_log2e], [], [])
+                    sig = llvm.call_intrinsic(
+                        T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], [])
+                    return g * sig * (u + one)
+                return _stage1_silu_elem(g) * u
+
             def _stage1_act_mul_vec8(gate_v8, up_v8):
                 elems = []
                 one = arith.constant(1.0, type=T.f32)
@@ -1244,17 +1272,7 @@ def compile_mxscale_gemm(
                         gate_v8, static_position=[vi], dynamic_position=[])
                     u = vector.extract(
                         up_v8, static_position=[vi], dynamic_position=[])
-                    if const_expr(stage1_act_mode == "swiglu"):
-                        g = arith.minimumf(g, limit)
-                        u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
-                        emu = llvm.call_intrinsic(
-                            T.f32, "llvm.amdgcn.exp2.f32",
-                            [g * alpha * neg_log2e], [], [])
-                        sig = llvm.call_intrinsic(
-                            T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], [])
-                        elems.append(g * sig * (u + one))
-                    else:
-                        elems.append(_stage1_silu_elem(g) * u)
+                    elems.append(_stage1_act_mul_scalar(g, u))
                 return vector.from_elements(T.vec(8, T.f32), elems)
 
             def epilogue_stage1_act_stores(gate_accs, up_accs, addrs):
@@ -1292,6 +1310,54 @@ def compile_mxscale_gemm(
                         else:
                             addr_idx += store_acc_vec8_to_buffer(
                                 out_sub8, c_rsrc, addrs[addr_idx:addr_idx + 2])
+
+            def epilogue_stage1_act_interleaved_stores(final_accs):
+                for acc_idx, vec_base, m_off, wn in _sub_tiles:
+                    raw_sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
+                    raw_sub8 = _add_bias_vec8(raw_sub8, wn)
+                    row_local = blk_m + warp_m_base + arith.index(m_off) + lane16
+                    row = batch_m_base + row_local
+                    raw_col_base = (blk_n + warp_n_base + arith.index(wn * WMMA_N)
+                                    + lane_kgrp * arith.index(8))
+                    out_col_base = raw_col_base / arith.index(2)
+                    store_valid = tile_valid
+                    if const_expr(needs_grouped_row_masked_store):
+                        row_valid = arith.cmpi(
+                            arith.CmpIPredicate.slt,
+                            arith.index_cast(T.i32, row_local),
+                            valid_m_i32,
+                        )
+                        store_valid = arith.andi(store_valid, row_valid)
+                    if const_expr(N % tile_n != 0):
+                        col_valid = arith.cmpi(
+                            arith.CmpIPredicate.slt,
+                            arith.index_cast(T.i32, out_col_base + arith.index(3)),
+                            arith.constant(C_N, type=T.i32),
+                        )
+                        store_valid = arith.andi(store_valid, col_valid)
+                    out_vals = []
+                    for pair in range_constexpr(4):
+                        g = vector.extract(
+                            raw_sub8, static_position=[pair * 2], dynamic_position=[])
+                        u = vector.extract(
+                            raw_sub8, static_position=[pair * 2 + 1], dynamic_position=[])
+                        out_vals.append(_stage1_act_mul_scalar(g, u))
+                    store_if = scf.IfOp(store_valid, results_=[], has_else=False)
+                    with ir.InsertionPoint(store_if.then_block):
+                        elem_off = row * arith.index(C_N) + out_col_base
+                        if const_expr(_bf16_out):
+                            h_vals = [arith.trunc_f(_out_elem_local, v) for v in out_vals]
+                            h_vec = vector.from_elements(T.vec(4, _out_elem_local), h_vals)
+                            i32_vec = vector.bitcast(T.vec(2, T.i32), h_vec)
+                            byte_off = elem_off * arith.index(elem_bytes_d)
+                            buffer_ops.buffer_store(
+                                i32_vec, c_rsrc, arith.index_cast(T.i32, byte_off),
+                                offset_is_bytes=True)
+                        else:
+                            f_vec = vector.from_elements(T.vec(4, T.f32), out_vals)
+                            buffer_ops.buffer_store(
+                                f_vec, c_rsrc, arith.index_cast(T.i32, elem_off))
+                        scf.YieldOp([])
 
             def epilogue_lds_stores(final_accs, d_buf, d_base):
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
@@ -1509,7 +1575,7 @@ def compile_mxscale_gemm(
                 stages_b_lds_addr.append(vector.extract(
                     make_desc_b(stages_b_mem[i], arith.index(0)).dgroup0,
                     static_position=[1], dynamic_position=[]))
-                if const_expr(stage1_act_mode is not None):
+                if const_expr(stage1_dual_b):
                     stages_b_up_lds_addr.append(vector.extract(
                         make_desc_b(stages_b_up_mem[i], arith.index(0), N).dgroup0,
                         static_position=[1], dynamic_position=[]))
@@ -1519,7 +1585,7 @@ def compile_mxscale_gemm(
                 stages_bs_lds_addr.append(vector.extract(
                     make_desc_bs(stages_bs_mem[i], arith.index(0)).dgroup0,
                     static_position=[1], dynamic_position=[]))
-                if const_expr(stage1_act_mode is not None):
+                if const_expr(stage1_dual_b):
                     stages_bs_up_lds_addr.append(vector.extract(
                         make_desc_bs(stages_bs_up_mem[i], arith.index(0), N).dgroup0,
                         static_position=[1], dynamic_position=[]))
@@ -1528,7 +1594,7 @@ def compile_mxscale_gemm(
             desc_b_init = make_desc_b(stages_b_mem[0], split_k_base)
             desc_as_init = make_desc_as(stages_as_mem[0], split_k_base)
             desc_bs_init = make_desc_bs(stages_bs_mem[0], split_k_base)
-            if const_expr(stage1_act_mode is not None):
+            if const_expr(stage1_dual_b):
                 desc_b_up_init = make_desc_b(stages_b_up_mem[0], split_k_base, N)
                 desc_bs_up_init = make_desc_bs(stages_bs_up_mem[0], split_k_base, N)
 
@@ -1581,7 +1647,7 @@ def compile_mxscale_gemm(
                 addr_hi_a = vector.extract(desc_a_init.dgroup0, static_position=[3], dynamic_position=[])
                 addr_lo_b = vector.extract(desc_b_init.dgroup0, static_position=[2], dynamic_position=[])
                 addr_hi_b = vector.extract(desc_b_init.dgroup0, static_position=[3], dynamic_position=[])
-                if const_expr(stage1_act_mode is not None):
+                if const_expr(stage1_dual_b):
                     addr_lo_b_up = vector.extract(
                         desc_b_up_init.dgroup0, static_position=[2], dynamic_position=[])
                     addr_hi_b_up = vector.extract(
@@ -1590,7 +1656,7 @@ def compile_mxscale_gemm(
                 addr_hi_as = vector.extract(desc_as_init.dgroup0, static_position=[3], dynamic_position=[])
                 addr_lo_bs = vector.extract(desc_bs_init.dgroup0, static_position=[2], dynamic_position=[])
                 addr_hi_bs = vector.extract(desc_bs_init.dgroup0, static_position=[3], dynamic_position=[])
-                if const_expr(stage1_act_mode is not None):
+                if const_expr(stage1_dual_b):
                     addr_lo_bs_up = vector.extract(
                         desc_bs_up_init.dgroup0, static_position=[2], dynamic_position=[])
                     addr_hi_bs_up = vector.extract(
@@ -1598,11 +1664,11 @@ def compile_mxscale_gemm(
 
                 dgroup1_a = desc_a_init.dgroup1
                 dgroup1_b = desc_b_init.dgroup1
-                if const_expr(stage1_act_mode is not None):
+                if const_expr(stage1_dual_b):
                     dgroup1_b_up = desc_b_up_init.dgroup1
                 dgroup1_as = desc_as_init.dgroup1
                 dgroup1_bs = desc_bs_init.dgroup1
-                if const_expr(stage1_act_mode is not None):
+                if const_expr(stage1_dual_b):
                     dgroup1_bs_up = desc_bs_up_init.dgroup1
 
             # Prologue
@@ -1624,7 +1690,7 @@ def compile_mxscale_gemm(
                         pred_const, stages_as_lds_addr[i], addr_lo_as, addr_hi_as])
                     dg0_bs = vector.from_elements(T.vec(4, T.i32), [
                         pred_const, stages_bs_lds_addr[i], addr_lo_bs, addr_hi_bs])
-                    if const_expr(stage1_act_mode is not None):
+                    if const_expr(stage1_dual_b):
                         dg0_b_up = vector.from_elements(T.vec(4, T.i32), [
                             pred_const, stages_b_up_lds_addr[i],
                             addr_lo_b_up, addr_hi_b_up])
@@ -1638,7 +1704,7 @@ def compile_mxscale_gemm(
                         tdm_ops.TDMDescriptor2D(dg0_as, dgroup1_as),
                         tdm_ops.TDMDescriptor2D(dg0_bs, dgroup1_bs),
                         wave_specialized=wave_specialized_tdm)
-                    if const_expr(stage1_act_mode is not None):
+                    if const_expr(stage1_dual_b):
                         tdm_ops.tensor_load_2d(
                             tdm_ops.TDMDescriptor2D(dg0_b_up, dgroup1_b_up))
                         tdm_ops.tensor_load_2d(
@@ -1646,11 +1712,11 @@ def compile_mxscale_gemm(
 
                     addr_lo_a = arith.addi(addr_lo_a, adv_a_i32)
                     addr_lo_b = arith.addi(addr_lo_b, adv_b_i32)
-                    if const_expr(stage1_act_mode is not None):
+                    if const_expr(stage1_dual_b):
                         addr_lo_b_up = arith.addi(addr_lo_b_up, adv_b_i32)
                     addr_lo_as = arith.addi(addr_lo_as, adv_as_i32)
                     addr_lo_bs = arith.addi(addr_lo_bs, adv_bs_i32)
-                    if const_expr(stage1_act_mode is not None):
+                    if const_expr(stage1_dual_b):
                         addr_lo_bs_up = arith.addi(addr_lo_bs_up, adv_bs_i32)
 
             pipeline_fence(outstanding=TDM_LOADS_PER_STEP * (num_buffers - 2),
@@ -1709,7 +1775,7 @@ def compile_mxscale_gemm(
                     accs = list(results[:n_accs])
                     active_addr_lo = results[n_accs]
                 else:
-                    if const_expr(stage1_act_mode is not None):
+                    if const_expr(stage1_dual_b):
                         init_args = (
                             list(accs) + list(accs_up)
                             + [addr_lo_a, addr_lo_b, addr_lo_b_up,
@@ -1721,7 +1787,7 @@ def compile_mxscale_gemm(
 
                     for loop_iter, state in range(0, loop_iters, 1, init=init_args):
                         accs_in = list(state[:n_accs])
-                        if const_expr(stage1_act_mode is not None):
+                        if const_expr(stage1_dual_b):
                             accs_up_in = list(state[n_accs:2 * n_accs])
                             _state_off = 2 * n_accs
                             cur_lo_a = state[_state_off]
@@ -1744,7 +1810,7 @@ def compile_mxscale_gemm(
                                 use_cluster=use_cluster)
                             pipeline_fence_wait(use_cluster=use_cluster)
 
-                            if const_expr(stage1_act_mode is not None):
+                            if const_expr(stage1_dual_b):
                                 addr_boxes = [[cur_lo_a], [cur_lo_b], [cur_lo_b_up],
                                               [cur_lo_as], [cur_lo_bs], [cur_lo_bs_up]]
                             else:
@@ -1764,19 +1830,19 @@ def compile_mxscale_gemm(
                                 dg0_b = vector.from_elements(T.vec(4, T.i32), [
                                     pred_const, stages_b_lds_addr[_ls],
                                     _ab[1][0], addr_hi_b])
-                                if const_expr(stage1_act_mode is not None):
+                                if const_expr(stage1_dual_b):
                                     dg0_b_up = vector.from_elements(T.vec(4, T.i32), [
                                         pred_const, stages_b_up_lds_addr[_ls],
                                         _ab[2][0], addr_hi_b_up])
                                 dg0_as = vector.from_elements(T.vec(4, T.i32), [
                                     pred_const, stages_as_lds_addr[_ls],
-                                    _ab[3][0] if stage1_act_mode is not None else _ab[2][0],
+                                    _ab[3][0] if stage1_dual_b else _ab[2][0],
                                     addr_hi_as])
                                 dg0_bs = vector.from_elements(T.vec(4, T.i32), [
                                     pred_const, stages_bs_lds_addr[_ls],
-                                    _ab[4][0] if stage1_act_mode is not None else _ab[3][0],
+                                    _ab[4][0] if stage1_dual_b else _ab[3][0],
                                     addr_hi_bs])
-                                if const_expr(stage1_act_mode is not None):
+                                if const_expr(stage1_dual_b):
                                     dg0_bs_up = vector.from_elements(T.vec(4, T.i32), [
                                         pred_const, stages_bs_up_lds_addr[_ls],
                                         _ab[5][0], addr_hi_bs_up])
@@ -1786,14 +1852,14 @@ def compile_mxscale_gemm(
                                     tdm_ops.TDMDescriptor2D(dg0_as, dgroup1_as),
                                     tdm_ops.TDMDescriptor2D(dg0_bs, dgroup1_bs),
                                     wave_specialized=wave_specialized_tdm)
-                                if const_expr(stage1_act_mode is not None):
+                                if const_expr(stage1_dual_b):
                                     tdm_ops.tensor_load_2d(
                                         tdm_ops.TDMDescriptor2D(dg0_b_up, dgroup1_b_up))
                                     tdm_ops.tensor_load_2d(
                                         tdm_ops.TDMDescriptor2D(dg0_bs_up, dgroup1_bs_up))
                                 _ab[0][0] = arith.addi(_ab[0][0], adv_a_i32)
                                 _ab[1][0] = arith.addi(_ab[1][0], adv_b_i32)
-                                if const_expr(stage1_act_mode is not None):
+                                if const_expr(stage1_dual_b):
                                     _ab[2][0] = arith.addi(_ab[2][0], adv_b_i32)
                                     _ab[3][0] = arith.addi(_ab[3][0], adv_as_i32)
                                     _ab[4][0] = arith.addi(_ab[4][0], adv_bs_i32)
@@ -1811,7 +1877,7 @@ def compile_mxscale_gemm(
                                 stages_as_idx[buf_idx],
                                 stages_bs_idx[buf_idx],
                                 mid_compute_callback=_mid_tdm_nws)
-                            if const_expr(stage1_act_mode is not None):
+                            if const_expr(stage1_dual_b):
                                 hot_loop_scheduler_scheduled()
                                 accs_up_in = compute_tile_scheduled(
                                     accs_up_in,
@@ -1821,7 +1887,7 @@ def compile_mxscale_gemm(
                                     stages_bs_up_idx[buf_idx])
                             cur_lo_a = addr_boxes[0][0]
                             cur_lo_b = addr_boxes[1][0]
-                            if const_expr(stage1_act_mode is not None):
+                            if const_expr(stage1_dual_b):
                                 cur_lo_b_up = addr_boxes[2][0]
                                 cur_lo_as = addr_boxes[3][0]
                                 cur_lo_bs = addr_boxes[4][0]
@@ -1831,7 +1897,7 @@ def compile_mxscale_gemm(
                                 cur_lo_bs = addr_boxes[3][0]
                             hot_loop_scheduler_scheduled()
 
-                        if const_expr(stage1_act_mode is not None):
+                        if const_expr(stage1_dual_b):
                             _yield_values = (
                                 list(accs_in) + list(accs_up_in)
                                 + [cur_lo_a, cur_lo_b, cur_lo_b_up,
@@ -1843,7 +1909,7 @@ def compile_mxscale_gemm(
                         results = yield _yield_values
 
                     accs = list(results[:n_accs])
-                    if const_expr(stage1_act_mode is not None):
+                    if const_expr(stage1_dual_b):
                         accs_up = list(results[n_accs:2 * n_accs])
                         _res_off = 2 * n_accs
                         addr_lo_a = results[_res_off]
@@ -1883,7 +1949,7 @@ def compile_mxscale_gemm(
                             stages_a_idx[_compute_stage], stages_b_idx[_compute_stage],
                             stages_as_idx[_compute_stage], stages_bs_idx[_compute_stage],
                             emit_filler=_emit_epi_addrs)
-                        if const_expr(stage1_act_mode is not None):
+                        if const_expr(stage1_dual_b):
                             accs_up = compute_tile_scheduled(
                                 accs_up,
                                 stages_a_idx[_compute_stage],
@@ -1911,7 +1977,7 @@ def compile_mxscale_gemm(
 
                             _tail_mid_cb = _tail_mid_ws
                         else:
-                            if const_expr(stage1_act_mode is not None):
+                            if const_expr(stage1_dual_b):
                                 _tail_ab = [[addr_lo_a], [addr_lo_b], [addr_lo_b_up],
                                             [addr_lo_as], [addr_lo_bs], [addr_lo_bs_up]]
                             else:
@@ -1925,19 +1991,19 @@ def compile_mxscale_gemm(
                                 dg0_b = vector.from_elements(T.vec(4, T.i32), [
                                     pred_const, stages_b_lds_addr[_ls],
                                     _ab[1][0], addr_hi_b])
-                                if const_expr(stage1_act_mode is not None):
+                                if const_expr(stage1_dual_b):
                                     dg0_b_up = vector.from_elements(T.vec(4, T.i32), [
                                         pred_const, stages_b_up_lds_addr[_ls],
                                         _ab[2][0], addr_hi_b_up])
                                 dg0_as = vector.from_elements(T.vec(4, T.i32), [
                                     pred_const, stages_as_lds_addr[_ls],
-                                    _ab[3][0] if stage1_act_mode is not None else _ab[2][0],
+                                    _ab[3][0] if stage1_dual_b else _ab[2][0],
                                     addr_hi_as])
                                 dg0_bs = vector.from_elements(T.vec(4, T.i32), [
                                     pred_const, stages_bs_lds_addr[_ls],
-                                    _ab[4][0] if stage1_act_mode is not None else _ab[3][0],
+                                    _ab[4][0] if stage1_dual_b else _ab[3][0],
                                     addr_hi_bs])
-                                if const_expr(stage1_act_mode is not None):
+                                if const_expr(stage1_dual_b):
                                     dg0_bs_up = vector.from_elements(T.vec(4, T.i32), [
                                         pred_const, stages_bs_up_lds_addr[_ls],
                                         _ab[5][0], addr_hi_bs_up])
@@ -1947,14 +2013,14 @@ def compile_mxscale_gemm(
                                     tdm_ops.TDMDescriptor2D(dg0_as, dgroup1_as),
                                     tdm_ops.TDMDescriptor2D(dg0_bs, dgroup1_bs),
                                     wave_specialized=wave_specialized_tdm)
-                                if const_expr(stage1_act_mode is not None):
+                                if const_expr(stage1_dual_b):
                                     tdm_ops.tensor_load_2d(
                                         tdm_ops.TDMDescriptor2D(dg0_b_up, dgroup1_b_up))
                                     tdm_ops.tensor_load_2d(
                                         tdm_ops.TDMDescriptor2D(dg0_bs_up, dgroup1_bs_up))
                                 _ab[0][0] = arith.addi(_ab[0][0], adv_a_i32)
                                 _ab[1][0] = arith.addi(_ab[1][0], adv_b_i32)
-                                if const_expr(stage1_act_mode is not None):
+                                if const_expr(stage1_dual_b):
                                     _ab[2][0] = arith.addi(_ab[2][0], adv_b_i32)
                                     _ab[3][0] = arith.addi(_ab[3][0], adv_as_i32)
                                     _ab[4][0] = arith.addi(_ab[4][0], adv_bs_i32)
@@ -1971,7 +2037,7 @@ def compile_mxscale_gemm(
                         stages_a_idx[_compute_stage], stages_b_idx[_compute_stage],
                         stages_as_idx[_compute_stage], stages_bs_idx[_compute_stage],
                         mid_compute_callback=_tail_mid_cb)
-                    if const_expr(stage1_act_mode is not None):
+                    if const_expr(stage1_dual_b):
                         hot_loop_scheduler_scheduled()
                         accs_up = compute_tile_scheduled(
                             accs_up,
@@ -1986,7 +2052,7 @@ def compile_mxscale_gemm(
                         else:
                             addr_lo_a = _tail_ab[0][0]
                             addr_lo_b = _tail_ab[1][0]
-                            if const_expr(stage1_act_mode is not None):
+                            if const_expr(stage1_dual_b):
                                 addr_lo_b_up = _tail_ab[2][0]
                                 addr_lo_as = _tail_ab[3][0]
                                 addr_lo_bs = _tail_ab[4][0]
@@ -1998,7 +2064,7 @@ def compile_mxscale_gemm(
                     hot_loop_scheduler_scheduled()
 
             accs = finalize_acc_layout(accs)
-            if const_expr(stage1_act_mode is not None):
+            if const_expr(stage1_dual_b):
                 accs_up = finalize_acc_layout(accs_up)
 
             if const_expr(use_tdm_store and not needs_grouped_row_masked_store):
@@ -2013,8 +2079,10 @@ def compile_mxscale_gemm(
                 rocdl.sched_barrier(0)
                 if const_expr(epi_addrs_box[0] is None):
                     epi_addrs_box[0] = epilogue_prepare_addrs()
-                if const_expr(stage1_act_mode is not None):
+                if const_expr(stage1_dual_b):
                     epilogue_stage1_act_stores(accs, accs_up, epi_addrs_box[0])
+                elif const_expr(stage1_act_interleave):
+                    epilogue_stage1_act_interleaved_stores(accs)
                 elif const_expr(split_k > 1):
                     epilogue_atomic_adds(accs, epi_addrs_box[0])
                 else:
@@ -2095,7 +2163,7 @@ def compile_mxscale_gemm(
     # Bump this when changing generated IR in ways not otherwise reflected in
     # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
     # reusing a previously compiled kernel after source-only descriptor fixes.
-    tdm_store_descriptor_version = 22
+    tdm_store_descriptor_version = 24
 
     cache_tag = (data_format, K, tile_m, tile_n, tile_k, m_warp, n_warp,
                  num_buffers, compute_schedule_kind,
@@ -2105,7 +2173,7 @@ def compile_mxscale_gemm(
                  use_scale_opsel, expert_sched_mode,
                  atomic_barrier_enable, batch_count, grouped_masked_m,
                  grouped_persistent_m, _persistent_workers,
-                 stage1_act_mode, epilogue_bias_mode,
+                 stage1_act_mode, stage1_weight_layout_mode, epilogue_bias_mode,
                  tdm_store_descriptor_version)
 
     @flyc.jit

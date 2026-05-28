@@ -672,6 +672,24 @@ def _reference_mxscale_batched(
     return torch.matmul(a_scaled, b_scaled)
 
 
+def _apply_stage1_act_ref(gate: torch.Tensor, up: torch.Tensor, act: str) -> torch.Tensor:
+    if act == "swiglu":
+        gate = gate.clamp(max=7.0)
+        up = up.clamp(min=-7.0, max=7.0)
+        return gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+    if act == "silu":
+        return torch.nn.functional.silu(gate) * up
+    raise ValueError(f"unknown stage1 act {act!r}")
+
+
+def _split_stage1_gate_up(gate_up: torch.Tensor, inter_dim: int, layout: str) -> tuple[torch.Tensor, torch.Tensor]:
+    if layout == "gugu":
+        return gate_up[..., 0::2], gate_up[..., 1::2]
+    if layout == "gguu":
+        return gate_up[..., :inter_dim], gate_up[..., inter_dim:]
+    raise ValueError(f"unknown stage1 weight layout {layout!r}")
+
+
 # Relative L2 distance is the canonical metric for low-precision GEMM checks:
 # entry-wise rtol/atol can flag legitimate per-element MXFP4 jitter while still
 # missing systematic bias. We bound ||actual-expected||_2 / ||expected||_2 instead.
@@ -962,6 +980,8 @@ def _run_stage1(
     rotate: int = 0,
     data_format: str = "fp4",
     use_bias: bool = False,
+    act: str = "silu",
+    stage1_weight_layout: str = "gguu",
 ) -> dict[str, float]:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
@@ -996,7 +1016,8 @@ def _run_stage1(
     )
     kernel = compile_stage1(
         model_dim=model_dim, inter_dim=inter_dim, experts=E, max_m=max_m,
-        out_dtype="f16", grouped_persistent_m=persistent,
+        out_dtype="f16", grouped_persistent_m=persistent, act=act,
+        stage1_weight_layout=stage1_weight_layout,
         **_kernel_kwargs(s),
     )
     _log(f"stage1 persistent={persistent}: compile done in {time.perf_counter() - compile_start:.2f}s")
@@ -1118,11 +1139,13 @@ def _run_stage1(
                 data_format=data_format,
             )  # (A, max_m, 2*inter_dim)
             if bias_cpu is not None:
-                gate_up_all = gate_up_all.to(torch.float16).float()
+                if s.get("split_k", 1) > 1:
+                    # Non-fused stage1 materializes the raw GEMM tmp as fp16
+                    # before the finalize+bias activation pass.
+                    gate_up_all = gate_up_all.to(torch.float16).float()
                 gate_up_all = gate_up_all + bias_cpu[active_t].to(gate_up_all.device).float().unsqueeze(1)
-            gate = gate_up_all[..., :inter_dim]
-            up = gate_up_all[..., inter_dim:]
-            expected_active = (torch.nn.functional.silu(gate) * up).to(torch.float16).float()
+            gate, up = _split_stage1_gate_up(gate_up_all, inter_dim, stage1_weight_layout)
+            expected_active = _apply_stage1_act_ref(gate, up, act).to(torch.float16).float()
             actual_active = y[active_t].float()
             check_name = f"stage1 persistent={persistent}"
             try:
@@ -1323,11 +1346,10 @@ def _run_stage2(
                 x_scale_raw[active_t], w_scale_raw[active_t],
                 k=inter_dim,
                 data_format=data_format,
-            ).to(torch.float16).float()
+            )
             if bias_cpu is not None:
-                expected_active = (
-                    expected_active + bias_cpu[active_t].to(expected_active.device).float().unsqueeze(1)
-                ).to(torch.float16).float()
+                expected_active = expected_active + bias_cpu[active_t].to(expected_active.device).float().unsqueeze(1)
+            expected_active = expected_active.to(torch.float16).float()
             actual_active = y[active_t].float()
             _assert_batched_close(
                 f"stage2 persistent={persistent}",
@@ -1353,6 +1375,8 @@ def _run_mock_moe(
     bench_scope: str = "wrapper",
     data_format: str = "fp4",
     use_bias: bool = False,
+    act: str = "silu",
+    stage1_weight_layout: str = "gguu",
 ) -> tuple[dict[str, float], dict[str, float]]:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
@@ -1419,7 +1443,8 @@ def _run_mock_moe(
     )
     k1 = compile_stage1(
         model_dim=model_dim, inter_dim=inter_dim, experts=E, max_m=max_m,
-        out_dtype="f16", grouped_persistent_m=persistent,
+        out_dtype="f16", grouped_persistent_m=persistent, act=act,
+        stage1_weight_layout=stage1_weight_layout,
         **_kernel_kwargs(s),
     )
     _log(f"mock moe stage1 persistent={persistent}: compile done in {time.perf_counter() - compile_start:.2f}s")
@@ -1566,11 +1591,13 @@ def _run_mock_moe(
                 data_format=data_format,
             )
             if bias1_cpu is not None:
-                gate_up_all = gate_up_all.to(torch.float16).float()
+                if s.get("split_k", 1) > 1:
+                    # Non-fused stage1 materializes the raw GEMM tmp as fp16
+                    # before the finalize+bias activation pass.
+                    gate_up_all = gate_up_all.to(torch.float16).float()
                 gate_up_all = gate_up_all + bias1_cpu[active_t].to(gate_up_all.device).float().unsqueeze(1)
-            gate = gate_up_all[..., :inter_dim]
-            up = gate_up_all[..., inter_dim:]
-            expected_active = (torch.nn.functional.silu(gate) * up).to(torch.float16).float()
+            gate, up = _split_stage1_gate_up(gate_up_all, inter_dim, stage1_weight_layout)
+            expected_active = _apply_stage1_act_ref(gate, up, act).to(torch.float16).float()
             actual_active = actual_active_raw.float()
             try:
                 _assert_batched_close(
@@ -1741,11 +1768,10 @@ def _run_mock_moe(
                 x2_scale_raw[active_t], w2_scale_raw[active_t],
                 k=inter_dim,
                 data_format=data_format,
-            ).to(torch.float16).float()  # (A, max_m, model_dim)
+            )  # (A, max_m, model_dim)
             if bias2_cpu is not None:
-                expected_all = (
-                    expected_all + bias2_cpu[active_t].to(expected_all.device).float().unsqueeze(1)
-                ).to(torch.float16).float()
+                expected_all = expected_all + bias2_cpu[active_t].to(expected_all.device).float().unsqueeze(1)
+            expected_all = expected_all.to(torch.float16).float()
             actual_active = actual_active_raw.float()
             try:
                 _assert_batched_close(
@@ -1921,6 +1947,10 @@ def main() -> None:
                              "a8w4 uses FP8 activations with MXFP4 weights.")
     parser.add_argument("--use-bias", action=argparse.BooleanOptionalAction, default=False,
                         help="Pass per-expert bias into grouped GEMM stage1/stage2.")
+    parser.add_argument("--act", choices=("silu", "swiglu"), default="silu",
+                        help="Stage1 activation epilogue. Stage2 has no activation.")
+    parser.add_argument("--stage1-weight-layout", choices=("gguu", "gugu"), default="gguu",
+                        help="Logical row layout for stage1 gate/up weights and bias.")
     parser.add_argument("--data", choices=("constant", "pattern", "randn"), default="constant")
     parser.add_argument("--masked-mode", choices=("mixed", "full", "descending"), default="mixed")
     parser.add_argument("--masked-m-override", type=int, default=None,
@@ -1980,6 +2010,7 @@ def main() -> None:
     print(
         f"[masked-grouped-moe-gemm] scenario={args.scenario} shape={s} stage={args.stage} "
         f"verify={args.verify} data_format={args.data_format} use_bias={args.use_bias} "
+        f"act={args.act} stage1_weight_layout={args.stage1_weight_layout} "
         f"data={args.data} masked_mode={args.masked_mode} "
         f"bench_mode={args.bench_mode} bench_scope={args.bench_scope} rotate={args.rotate}",
         flush=True,
@@ -2001,6 +2032,8 @@ def main() -> None:
                 bench_scope=args.bench_scope,
                 data_format=args.data_format,
                 use_bias=args.use_bias,
+                act=args.act,
+                stage1_weight_layout=args.stage1_weight_layout,
             )
             print(
                 f"[masked-grouped-moe-gemm] mock_moe persistent={persistent} "
@@ -2024,6 +2057,8 @@ def main() -> None:
                 rotate=args.rotate,
                 data_format=args.data_format,
                 use_bias=args.use_bias,
+                act=args.act,
+                stage1_weight_layout=args.stage1_weight_layout,
             )
             print(f"[masked-grouped-moe-gemm] stage1 persistent={persistent} {_format_timing_summary(timings)}", flush=True)
         if args.stage in ("2", "both"):
