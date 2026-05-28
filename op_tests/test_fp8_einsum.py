@@ -97,10 +97,19 @@ def build_inputs_with_ref(H: int, D: int, R: int, B: int, device, seed: int = 0)
       x_ref_f32 : fp32 (B, H, R) — dequantized X (x_fp8 * sx_pow2)
       y_ref_f32 : fp32 (H, D, R) — dequantized Y (y_fp8 * sy_pow2),
                   in the natural (H, D, R) layout (NOT preshuffled).
+      x_bf16    : fp32-cast of the original bf16 X *before* fp8 quant.
+                  Use this for a DeepGEMM-style strict reference einsum
+                  (the kernel's quant error is treated as part of its
+                  contract, not factored out by the reference).
+      y_bf16    : same, for Y.
     """
     torch.manual_seed(seed)
-    x_bf16 = torch.randn(B, H, R, dtype=torch.bfloat16, device=device) * 4.0
-    y_bf16 = torch.randn(H, D, R, dtype=torch.bfloat16, device=device) * 0.5
+    # DeepGEMM's test uses unit-variance randn for both X and Y; the *4.0 /
+    # *0.5 scaling here was a leftover from an earlier numeric-stress test
+    # and biases the per-128 amax distribution. Matching DeepGEMM here lets
+    # us reuse their <1e-3 calc_diff threshold directly.
+    x_bf16 = torch.randn(B, H, R, dtype=torch.bfloat16, device=device)
+    y_bf16 = torch.randn(H, D, R, dtype=torch.bfloat16, device=device)
 
     # X: per-(B, H, K=128) quant → fp8 + per-block UE8M0 scale.
     sx_amax = _per_128k_amax(x_bf16, k_dim=2)
@@ -136,12 +145,27 @@ def build_inputs_with_ref(H: int, D: int, R: int, B: int, device, seed: int = 0)
         * sy_pow2.unsqueeze(2).unsqueeze(-1)
     ).view(H, D, R)
 
-    return x_fp8, y_pre, sx_i32, sy_i32, x_ref_f32, y_ref_f32
+    return x_fp8, y_pre, sx_i32, sy_i32, x_ref_f32, y_ref_f32, x_bf16, y_bf16
 
 
 def einsum_ref_fp32(x_ref_f32, y_ref_f32):
     """Pure-torch fp32 reference for einsum('bhr,hdr->bhd', X, Y)."""
     return torch.einsum("bhr,hdr->bhd", x_ref_f32, y_ref_f32)
+
+
+def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
+    """DeepGEMM-style cosine error: 1 - 2<x,y>/(<x,x>+<y,y>).
+
+    Robust to magnitude scaling. Their fp8 GEMM tests assert <1e-3 against
+    the *unquantized* reference einsum, treating fp8 input quant as part of
+    the kernel's responsibility. Use this in addition to (not replacing)
+    the dequantized-input checkAllclose to catch wrong-scale-byte bugs.
+    """
+    x64, y64 = x.double(), y.double()
+    denom = (x64 * x64 + y64 * y64).sum()
+    if denom == 0:
+        return 0.0
+    return float(1.0 - 2.0 * (x64 * y64).sum() / denom)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,15 +199,21 @@ def fp8_einsum_qz_kernel(x_fp8, y_pre, sx_i32, sy_i32, transpose_scale):
 @benchmark()
 def test_fp8_einsum_bf16(H, D, R, B):
     """bf16 output: compare auto-dispatched kernel vs fp32 reference."""
-    x_fp8, y_pre, sx_i32, sy_i32, x_ref, y_ref = build_inputs_with_ref(
-        H,
-        D,
-        R,
-        B,
-        torch.device("cuda"),
+    x_fp8, y_pre, sx_i32, sy_i32, x_ref, y_ref, x_bf16, y_bf16 = (
+        build_inputs_with_ref(H, D, R, B, torch.device("cuda"))
     )
+    # Dequantized-input reference (matches what the kernel internally sees).
+    # Useful for catching bugs in the K-loop / accumulator / output cast,
+    # but BLIND to scale-application bugs (wrong opsel byte, wrong sx/sy
+    # group, wrong dequant axis) — those cancel out because both sides use
+    # the same dequant.
     z_ref_f32 = einsum_ref_fp32(x_ref, y_ref)
     z_ref_bf16 = z_ref_f32.bfloat16()
+    # Strict reference (DeepGEMM-style): einsum on the *unquantized* bf16
+    # inputs. Treats fp8 quant of inputs as part of the kernel's contract.
+    # This is what catches the V4-integration class of regressions where a
+    # mis-packed sx/sy or mis-shuffled Y silently degrades accuracy.
+    z_ref_strict = torch.einsum("bhr,hdr->bhd", x_bf16.float(), y_bf16.float())
 
     # Prime the kernel cache OUTSIDE the perftest's profiled region — flydsl
     # JIT compile inside torch.profiler segfaults.
@@ -197,15 +227,21 @@ def test_fp8_einsum_bf16(H, D, R, B):
         sy_i32,
     )
 
-    # Accuracy: bf16 output should match the bf16-cast fp32 reference within
-    # a generous tol (fp8 quant of inputs alone gives ~1% relative error on
-    # the output before bf16 rounding). Tol values mirror test_mhc's style.
+    # Loose check: kernel vs dequant-input reference (kept for backward
+    # compat; tolerance unchanged).
     err = checkAllclose(
         z_ref_bf16,
         z_kernel,
         rtol=5e-2,
         atol=2e-1,
-        msg="bf16 z",
+        msg="bf16 z (dequant-input ref)",
+    )
+    # Strict check: DeepGEMM's <1e-3 cosine-error contract.
+    cos_err = calc_diff(z_kernel, z_ref_strict)
+    strict_pass = cos_err < 1e-3
+    aiter.logger.info(
+        f"  bf16 strict (DeepGEMM-style) cos_err={cos_err:.3e}  "
+        f"{'PASS' if strict_pass else 'FAIL (>1e-3)'}"
     )
 
     # Determinism: second launch should be bit-exact.
@@ -217,6 +253,8 @@ def test_fp8_einsum_bf16(H, D, R, B):
     tf = flops / (kernel_us * 1e-6) / 1e12
     return {
         "err": err,
+        "cos_err": cos_err,
+        "strict": strict_pass,
         "kernel_us": kernel_us,
         "TFLOPS": tf,
         "det": det,
@@ -231,14 +269,12 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
     that the kernel produces the same quantized representation, not just the
     same dequantized values.
     """
-    x_fp8, y_pre, sx_i32, sy_i32, x_ref, y_ref = build_inputs_with_ref(
-        H,
-        D,
-        R,
-        B,
-        torch.device("cuda"),
+    x_fp8, y_pre, sx_i32, sy_i32, x_ref, y_ref, x_bf16, y_bf16 = (
+        build_inputs_with_ref(H, D, R, B, torch.device("cuda"))
     )
     z_ref_f32 = einsum_ref_fp32(x_ref, y_ref)
+    # Strict reference for cosine-error check below.
+    z_ref_strict = torch.einsum("bhr,hdr->bhd", x_bf16.float(), y_bf16.float())
 
     # Quantize the bf16 reference with per_group_quant_hip — same D-128 group
     # quant the kernel does internally. per_group_quant_hip requires bf16/fp16
@@ -270,6 +306,20 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
         sz_bhd = sz.permute(1, 2, 0).contiguous()
     else:
         sz_bhd = sz
+
+    # Strict cosine-error check (DeepGEMM-style): dequantize the kernel's
+    # (z_fp8, sz) and compare against the unquantized-input reference.
+    # Tolerance is 2e-3 instead of 1e-3 since qz adds one more fp8 cast
+    # at the output (input fp8 quant + accumulator-to-fp8 output quant).
+    z_kernel_deq = z_fp8.float() * sz_bhd.unsqueeze(-1).repeat_interleave(
+        128, dim=-1
+    ).view(z_fp8.shape).float()
+    cos_err = calc_diff(z_kernel_deq, z_ref_strict)
+    strict_pass = cos_err < 2e-3
+    aiter.logger.info(
+        f"  qz strict (DeepGEMM-style, deq) cos_err={cos_err:.3e}  "
+        f"{'PASS' if strict_pass else 'FAIL (>2e-3)'}"
+    )
 
     # Accuracy: compare (z_fp8, sz) vs (z_ref_fp8, sz_ref) directly in the
     # kernel's output representation. fp8 values are cast to fp32 for the
@@ -317,6 +367,8 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
     return {
         "err_z": err_z,
         "err_sz": err_sz,
+        "cos_err": cos_err,
+        "strict": strict_pass,
         "kernel_us": kernel_us,
         "TFLOPS": tf,
         "det_z": det_z,
