@@ -315,12 +315,13 @@ def chunk_gated_delta_rule(
         f"scale={scale}, use_qk_l2norm={use_qk_l2norm_in_kernel}"
     )
 
-    # Apply L2 normalization if requested
-    q_rstd, k_rstd = None, None
+    # Apply L2 normalization if requested. ``need_rstd`` defaults to
+    # False so rstd is neither allocated nor written -- this is a pure
+    # forward path and rstd was previously discarded anyway.
     if use_qk_l2norm_in_kernel:
         _LOGGER.info("Applying L2 normalization to q and k")
-        q, q_rstd = l2norm_fwd(q)
-        k, k_rstd = l2norm_fwd(k)
+        q, _ = l2norm_fwd(q)
+        k, _ = l2norm_fwd(k)
 
     # Call aiter's chunk forward pass
     g, o, A, final_state = chunk_gated_delta_rule_fwd(

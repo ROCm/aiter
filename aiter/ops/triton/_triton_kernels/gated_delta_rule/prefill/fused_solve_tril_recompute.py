@@ -9,6 +9,8 @@ Eliminates the intermediate Ai tensor (64x64 per chunk x head) global
 memory round-trip by keeping the inverse blocks in registers.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -20,19 +22,61 @@ from ..gated_delta_rule_utils import (
 )
 from ..utils import prepare_chunk_indices
 from ..utils.op import exp
-from ..utils.solve_tril import FLA_TRIL_PRECISION
+from ..utils.solve_tril import FLA_TRIL_PRECISION, solve_tril
+
+
+# Adaptive dispatch thresholds for K34 (triangular solve + recompute w, u).
+#
+# The fused kernel keeps Ai in registers but pays for it with high VGPR
+# pressure and ~2.5x more Phase-2 MFMAs than a plain matmul. The split path
+# (`solve_tril` + the head-major `recompute_w_u_head_major_kernel` below)
+# writes Ai to HBM (bf16) and uses tighter kernels.
+#
+# Empirically (MI35x, K=V=128, with K3 mask cleanup + K4_hm eager-load reorder
+# + Ai in k.dtype + solve_tril `empty_like` path):
+#   Short sequences (NT <= FUSE_NT_MAX, default 16 chunks ~= T <= 1K):
+#     fused wins by 5-15 us thanks to fewer launches.
+#   Long sequences (varlen and large contiguous):
+#     split wins for both MHA and GQA. The breakdown shows split K3+K4
+#     beats vllm K3+K4 in every T bucket (-0.3 to -15% per call), while
+#     fused K34 *loses* to vllm K3+K4 at 20K+ by ~2.8% per call.
+#
+# Env knobs (override the auto heuristic):
+#   AITER_K34_FUSE_NT_MAX      - max NT to keep on fused (default 16)
+#   AITER_K34_VARLEN_USE_SPLIT - "0"/"1" to force fused/split for varlen
+#                                (default: split)
+#   AITER_K34_FORCE            - "fused" or "split" to bypass all heuristics
+_K34_FUSE_NT_MAX = int(os.environ.get("AITER_K34_FUSE_NT_MAX", "16"))
+_K34_VARLEN_USE_SPLIT_OVERRIDE = os.environ.get("AITER_K34_VARLEN_USE_SPLIT")
+_K34_FORCE = os.environ.get("AITER_K34_FORCE", "").lower()  # "", "fused", "split"
+
+
+if IS_AMD:
+    _K34_CONFIGS = [
+        triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=3),
+        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=2),
+    ]
+else:
+    _K34_CONFIGS = [
+        triton.Config({"BK": BK, "BV": BV}, num_warps=nw, num_stages=ns)
+        for BK in [32, 64]
+        for BV in [32, 64]
+        for nw in [2, 4]
+        for ns in [2, 3, 4]
+    ]
+
+_K34_DEFAULT_CONFIG = triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=2)
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=gated_delta_rule_autotune_configs(
-        [
-            triton.Config({}, num_warps=nw, num_stages=ns)
-            for nw in [2, 4, 8]
-            for ns in ([2, 3] if IS_AMD else [2, 3, 4])
-        ]
+        _K34_CONFIGS,
+        default_config=_K34_DEFAULT_CONFIG,
     ),
-    key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
+    key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -359,6 +403,198 @@ def fused_solve_tril_recompute_w_u_kernel(
         tl.store(pw3, w3.to(pw3.dtype.element_ty), boundary_check=(0, 1))
 
 
+# =============================================================================
+# Split path: head-major recompute_w_u kernel (consumes pre-inverted Ai).
+#
+# Used by the adaptive dispatcher for long sequences where the fused kernel's
+# high register pressure / Phase-2 MFMA count regresses against running
+# solve_tril + plain matmul. Output layout is [B, H, T, K/V] head-major so
+# downstream K5 (chunk_h) sees the same tensors as the fused path.
+# =============================================================================
+if IS_AMD:
+    # Mirror vllm's K4 search space (sans nw=8, which underperforms on MI35x):
+    # fixed BK=BV=64, autotune over num_warps x num_stages.
+    _K4_HM_CONFIGS = [
+        triton.Config({"BK": 64, "BV": 64}, num_warps=nw, num_stages=ns)
+        for nw in [2, 4]
+        for ns in [2, 3, 4]
+    ]
+else:
+    _K4_HM_CONFIGS = [
+        triton.Config({"BK": 64, "BV": 64}, num_warps=nw, num_stages=ns)
+        for nw in [2, 4, 8]
+        for ns in [2, 3, 4]
+    ]
+
+_K4_HM_DEFAULT_CONFIG = triton.Config(
+    {"BK": 64, "BV": 64}, num_warps=2, num_stages=2
+)
+
+
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        _K4_HM_CONFIGS,
+        default_config=_K4_HM_DEFAULT_CONFIG,
+    ),
+    key=["H", "Hg", "K", "V", "BT", "IS_VARLEN"],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=["T"])
+def recompute_w_u_head_major_kernel(
+    k,
+    v,
+    beta,
+    Ai,
+    g,
+    w,
+    u,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """
+    Compute u = Ai @ (v * beta) and w = Ai @ (k * beta * exp(g)),
+    where Ai = (I + A_strict_lower)^{-1} is precomputed by `solve_tril`.
+
+    Output layout: [B, H, T, K/V] head-major contiguous (matches fused path).
+    Hg <= H supports GQA (k shared across H/Hg heads).
+    """
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    T_flat = T
+
+    if IS_VARLEN:
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
+        T = eos - bos
+    else:
+        bos = i_b * T
+
+    # Mirror vllm's wy_fast.recompute_w_u_fwd_kernel ordering: load beta,
+    # Ai (the inverted A), and the per-chunk gate eagerly so the compiler
+    # can hoist them out of the V/K loops and overlap their HBM latency.
+    p_beta = tl.make_block_ptr(
+        beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
+    )
+    p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+    p_Ai = tl.make_block_ptr(
+        Ai + (bos * H + i_h) * BT,
+        (T, BT),
+        (H * BT, 1),
+        (i_t * BT, 0),
+        (BT, BT),
+        (1, 0),
+    )
+    b_beta = tl.load(p_beta, boundary_check=(0,))
+    b_Ai = tl.load(p_Ai, boundary_check=(0, 1))
+    b_g = exp(tl.load(p_g, boundary_check=(0,)))
+
+    # ---- u = Ai @ (v * beta) -> head-major store ----
+    v_base = v + (bos * H + i_h) * V
+    if IS_VARLEN:
+        u_base = u + (i_h * T_flat + bos) * V
+    else:
+        u_base = u + ((i_b * H + i_h) * T_flat) * V
+
+    for i_v in range(tl.cdiv(V, BV)):
+        p_v = tl.make_block_ptr(
+            v_base, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        )
+        p_u = tl.make_block_ptr(
+            u_base, (T, V), (V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        )
+        b_v = tl.load(p_v, boundary_check=(0, 1))
+        b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
+        b_u = tl.dot(b_Ai, b_vb, allow_tf32=False)
+        tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
+
+    # ---- w = Ai @ (k * beta * exp(g)) -> head-major store ----
+    k_base = k + (bos * Hg + i_h // (H // Hg)) * K
+    if IS_VARLEN:
+        w_base = w + (i_h * T_flat + bos) * K
+    else:
+        w_base = w + ((i_b * H + i_h) * T_flat) * K
+
+    for i_k in range(tl.cdiv(K, BK)):
+        p_k = tl.make_block_ptr(
+            k_base, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+        )
+        p_w = tl.make_block_ptr(
+            w_base, (T, K), (K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+        )
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        # Single fused multiply-cast like vllm; default allow_tf32 (no-op on AMD).
+        b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
+        b_w = tl.dot(b_Ai, b_kb)
+        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
+
+
+def _run_split_path(
+    A_raw: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    cu_seqlens: torch.LongTensor | None,
+    chunk_indices: torch.LongTensor | None,
+    NT: int,
+    B: int,
+    T: int,
+    H: int,
+    Hg: int,
+    K: int,
+    V: int,
+    BT: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Long-sequence path: precompute Ai via solve_tril, then plain matmul.
+
+    Store Ai in k.dtype (bf16/fp16) to halve the HBM round-trip vs fp32 and
+    to allow `tl.dot(b_Ai, b_vb, allow_tf32=False)` in the K4 kernel (strict
+    same-dtype MFMA on AMD). Matches vllm's pipeline.
+    """
+    Ai = solve_tril(
+        A_raw,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        output_dtype=k.dtype,
+    )
+    u_out = v.new_empty(B, H, T, V)
+    w_out = k.new_empty(B, H, T, K)
+    recompute_w_u_head_major_kernel[(NT, B * H)](
+        k,
+        v,
+        beta,
+        Ai,
+        g_cumsum,
+        w_out,
+        u_out,
+        cu_seqlens,
+        chunk_indices,
+        T=T,
+        H=H,
+        Hg=Hg,
+        K=K,
+        V=V,
+        BT=BT,
+    )
+    return w_out, u_out
+
+
 def fused_solve_tril_recompute_w_u(
     A_raw: torch.Tensor,
     k: torch.Tensor,
@@ -369,7 +605,15 @@ def fused_solve_tril_recompute_w_u(
     use_exp2: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Fused triangular solve + recompute w, u in a single kernel.
+    Adaptive dispatcher for K34 (triangular solve + recompute w, u).
+
+    Strategy:
+      - Short sequences (NT <= AITER_K34_FUSE_NT_MAX, default 64 chunks ~= T<=4096):
+          run the single fused kernel. Saves the Ai global round-trip and a
+          second launch; the per-chunk register pressure is tolerable.
+      - Long sequences:
+          run solve_tril + a plain head-major recompute_w_u kernel. Avoids the
+          fused kernel's Phase-2 ~2.5x MFMA blowup that dominates at large NT.
 
     Args:
         A_raw: [B, T, H, BT=64], strictly lower triangular
@@ -381,14 +625,12 @@ def fused_solve_tril_recompute_w_u(
         use_exp2: when True, interpret g_cumsum in log2 space
 
     Returns:
-        w: [B, H, T, K], head-major contiguous layout
-        u: [B, H, T, V], head-major contiguous layout
+        w: [B, H, T, K], head-major contiguous
+        u: [B, H, T, V], head-major contiguous
     """
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
     BT = A_raw.shape[-1]
-    BK = 64
-    BV = 64
 
     if cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -396,6 +638,42 @@ def fused_solve_tril_recompute_w_u(
     else:
         chunk_indices = None
         NT = triton.cdiv(T, BT)
+
+    # Decide fused vs split.
+    if _K34_FORCE == "fused":
+        use_split = False
+    elif _K34_FORCE == "split":
+        use_split = True
+    else:
+        # Auto: pick split for any non-trivial NT. Split's per-stage
+        # breakdown beats both fused K34 and vllm K3+K4 across all T
+        # buckets we benchmark, regardless of GQA / MHA (the empty_like
+        # K3 path eliminated the Ai memset that previously made split a
+        # loss on GQA).
+        if cu_seqlens is not None and _K34_VARLEN_USE_SPLIT_OVERRIDE is not None:
+            varlen_split = _K34_VARLEN_USE_SPLIT_OVERRIDE == "1"
+            use_split = varlen_split and NT > _K34_FUSE_NT_MAX
+        else:
+            use_split = NT > _K34_FUSE_NT_MAX
+
+    if use_split:
+        return _run_split_path(
+            A_raw,
+            k,
+            v,
+            beta,
+            g_cumsum,
+            cu_seqlens,
+            chunk_indices,
+            NT,
+            B,
+            T,
+            H,
+            Hg,
+            K,
+            V,
+            BT,
+        )
 
     u_out = v.new_empty(B, H, T, V)
     w_out = k.new_empty(B, H, T, K)
@@ -416,8 +694,6 @@ def fused_solve_tril_recompute_w_u(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
-        BV=BV,
         DOT_PRECISION=FLA_TRIL_PRECISION,
         USE_EXP2=use_exp2,
         LOWP_DTYPE_IS_BF16=k.dtype == torch.bfloat16,
