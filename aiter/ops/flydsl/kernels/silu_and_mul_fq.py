@@ -93,13 +93,13 @@ def build_silu_and_mul_fq_module(
 
     @flyc.kernel
     def silu_and_mul_fq_kernel(
-        x: fx.Tensor,
-        out_buf: fx.Tensor,
-        out_scale_sorted: fx.Tensor,
-        sorted_ids: fx.Tensor,
-        num_valid_ids: fx.Tensor,
-        topk_ids: fx.Tensor,
-        bias: fx.Tensor,
+        x: fx.Pointer,
+        out_buf: fx.Pointer,
+        out_scale_sorted: fx.Pointer,
+        sorted_ids: fx.Pointer,
+        num_valid_ids: fx.Pointer,
+        topk_ids: fx.Pointer,
+        bias: fx.Pointer,
         token_num: Int32,
     ):
         bid = fx.block_idx.x
@@ -142,14 +142,19 @@ def build_silu_and_mul_fq_module(
         topk_i32 = arith.constant(topk, type=i32)
         n32_sort = scale_cols_i32 * c32_i32
 
-        in_rsrc = buffer_ops.create_buffer_resource(x, max_size=True)
-        out_rsrc = buffer_ops.create_buffer_resource(out_buf, max_size=True)
-        scale_rsrc = buffer_ops.create_buffer_resource(out_scale_sorted, max_size=True)
-        tid_rsrc = buffer_ops.create_buffer_resource(sorted_ids, max_size=True)
-        nv_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+        def _ptr_buffer_resource(ptr):
+            addr = fx.ptrtoint(ptr)
+            addr_i64 = arith.index_cast(T.i64, addr)
+            return buffer_ops.create_buffer_resource_from_addr(addr_i64)
+
+        in_rsrc = _ptr_buffer_resource(x)
+        out_rsrc = _ptr_buffer_resource(out_buf)
+        scale_rsrc = _ptr_buffer_resource(out_scale_sorted)
+        tid_rsrc = _ptr_buffer_resource(sorted_ids)
+        nv_rsrc = _ptr_buffer_resource(num_valid_ids)
         if enable_bias:
-            topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
-            bias_rsrc = buffer_ops.create_buffer_resource(bias, max_size=True)
+            topk_rsrc = _ptr_buffer_resource(topk_ids)
+            bias_rsrc = _ptr_buffer_resource(bias)
 
             def _load_bias_scalar(offset):
                 return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=f32)
@@ -551,13 +556,13 @@ def build_silu_and_mul_fq_module(
 
     @flyc.jit
     def launch_silu_and_mul_fq(
-        x: fx.Tensor,
-        out_buf: fx.Tensor,
-        out_scale_sorted: fx.Tensor,
-        sorted_ids: fx.Tensor,
-        num_valid_ids: fx.Tensor,
-        topk_ids: fx.Tensor,
-        bias: fx.Tensor,
+        x: fx.Pointer,
+        out_buf: fx.Pointer,
+        out_scale_sorted: fx.Pointer,
+        sorted_ids: fx.Pointer,
+        num_valid_ids: fx.Pointer,
+        topk_ids: fx.Pointer,
+        bias: fx.Pointer,
         token_num: fx.Int32,
         num_sorted_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
