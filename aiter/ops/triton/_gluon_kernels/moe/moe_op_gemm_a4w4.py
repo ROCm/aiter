@@ -216,7 +216,7 @@ def _moe_gemm_a4w4_gfx1250(
         BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR"
     )
 
-    NUM_LOADS_IN_BATCH: gl.constexpr = 4
+    NUM_LOADS_IN_BATCH: gl.constexpr = 3
     gl.static_assert(NUM_BUFFERS >= 3, "NUM_BUFFERS must be at least 3")
 
     w_type: gl.constexpr = W.dtype.element_ty
@@ -296,6 +296,9 @@ def _moe_gemm_a4w4_gfx1250(
     DOT_LAYOUT_W_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
         DOT_LAYOUT_W, [PACKED_BLOCK_N_W, MX_SCALE_BLOCK_K]
     )
+    BLOCKED_LAYOUT_X_SCALES: gl.constexpr = gl.BlockedLayout(
+        [1, MX_SCALE_BLOCK_K], [32, 1], [NUM_WARPS, 1], [1, 0]
+    )
 
     # A pointers
     offs_x_m = PACKED_BLOCK_M_X * block_id
@@ -326,6 +329,14 @@ def _moe_gemm_a4w4_gfx1250(
     # A scale pointers
     if GatherIndx is None:
         XMxScale += start_m * stride_x_mx_m
+        offs_x_m_scales = offs_x_m + gl.arange(
+            0, PACKED_BLOCK_M_X, layout=gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES)
+        )
+    else:
+        offs_x_m_scales = gl.convert_layout(offs_x_m, gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES))
+    offs_x_k_scales = gl.arange(
+        0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, BLOCKED_LAYOUT_X_SCALES)
+    )
 
     # B scale pointers
     WMxScale += expt_id * stride_w_mx_e
@@ -454,12 +465,6 @@ def _moe_gemm_a4w4_gfx1250(
                 pred=pref_pred,
                 speculative=True,
             )
-            gl.amd.gfx1250.tdm.prefetch(
-                x_scales_desc,
-                [offs_x_m, pref_idx * MX_SCALE_BLOCK_K],
-                pred=pref_pred,
-                speculative=True,
-            )
         gl.amd.gfx1250.tdm.prefetch(
             w_desc,
             [offs_w_n, pref_idx * W_BLOCK_K],
@@ -485,23 +490,12 @@ def _moe_gemm_a4w4_gfx1250(
                 [offs_x_m, idx_x],
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
-            gl.amd.gfx1250.tdm.async_load(
-                x_scales_desc,
-                [offs_x_m, idx_x_scales],
-                x_scales_buffer.index(load_idx % NUM_BUFFERS),
-            )
         else:
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
                 idx_x,
                 x_buffer.index(load_idx % NUM_BUFFERS),
-            )
-            gl.amd.gfx1250.tdm.async_gather(
-                x_scales_desc,
-                offs_x_m,
-                idx_x_scales,
-                x_scales_buffer.index(load_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
@@ -513,10 +507,21 @@ def _moe_gemm_a4w4_gfx1250(
             [offs_w_n_scale, idx_w_scales],
             w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
+        gl.amd.gfx1250.async_copy.global_to_shared(
+            x_scales_buffer.index(load_idx % NUM_BUFFERS),
+            (
+                XMxScale + 
+                offs_x_m_scales[:, None] * stride_x_mx_m + 
+                (offs_x_k_scales[None, :] + idx_x_scales) * stride_x_mx_k
+            ),
+        )
+        gl.amd.gfx1250.async_copy.commit_group()
+
         load_idx += 1
 
     # preload tile 0 from LDS into registers
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
+    gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 1)
     cur_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
     if PRESHUFFLE_WEIGHTS:
         cur_w = (
@@ -554,23 +559,12 @@ def _moe_gemm_a4w4_gfx1250(
                 [offs_x_m, idx_x],
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
-            gl.amd.gfx1250.tdm.async_load(
-                x_scales_desc,
-                [offs_x_m, idx_x_scales],
-                x_scales_buffer.index(load_idx % NUM_BUFFERS),
-            )
         else:
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
                 idx_x,
                 x_buffer.index(load_idx % NUM_BUFFERS),
-            )
-            gl.amd.gfx1250.tdm.async_gather(
-                x_scales_desc,
-                offs_x_m,
-                idx_x_scales,
-                x_scales_buffer.index(load_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
@@ -582,6 +576,15 @@ def _moe_gemm_a4w4_gfx1250(
             [offs_w_n_scale, idx_w_scales],
             w_scales_buffer.index(load_idx % NUM_BUFFERS),
         )
+        gl.amd.gfx1250.async_copy.global_to_shared(
+            x_scales_buffer.index(load_idx % NUM_BUFFERS),
+            (
+                XMxScale + 
+                offs_x_m_scales[:, None] * stride_x_mx_m + 
+                (offs_x_k_scales[None, :] + idx_x_scales) * stride_x_mx_k
+            ),
+        )
+        gl.amd.gfx1250.async_copy.commit_group()
         load_idx += 1
 
         # prefetch L2_PREFETCH_DISTANCE iters ahead of the load we just issued.
@@ -592,12 +595,6 @@ def _moe_gemm_a4w4_gfx1250(
                 gl.amd.gfx1250.tdm.prefetch(
                     x_desc,
                     [offs_x_m, pref_idx * PACKED_BLOCK_K_X],
-                    pred=pref_pred,
-                    speculative=True,
-                )
-                gl.amd.gfx1250.tdm.prefetch(
-                    x_scales_desc,
-                    [offs_x_m, pref_idx * MX_SCALE_BLOCK_K],
                     pred=pref_pred,
                     speculative=True,
                 )
@@ -616,6 +613,7 @@ def _moe_gemm_a4w4_gfx1250(
 
         # wait for next tile to be filled
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
+        gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 1)
 
         # load next tile from LDS into registers
         next_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
@@ -653,6 +651,7 @@ def _moe_gemm_a4w4_gfx1250(
 
         # wait for next tile to be filled
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - k_ep) * NUM_LOADS_IN_BATCH)
+        gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 2 - k_ep)
 
         # load next tile from LDS into registers
         next_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
