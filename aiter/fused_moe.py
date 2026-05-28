@@ -189,6 +189,7 @@ def fused_moe(
     splitk=0,
     swiglu_limit=0.0,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    mxfp4_activation_dtype: str = "",
     no_combine: bool = False,
 ):
     """Fused Mixture-of-Experts.
@@ -213,6 +214,12 @@ def fused_moe(
     per-slot output buffer is zero-initialized, so positions corresponding to
     empty EP slots (``expert_mask``) are exactly zero. Peak output memory
     grows by a factor of ``topk``.
+
+    ``mxfp4_activation_dtype`` overrides the default MXFP4 activation
+    heuristic for ``quant_type=per_1x32`` + fp4 weights. Accepts ``"bf16"``,
+    ``"fp8"``, or ``"fp4"``. Required for activations / gate_modes that the
+    heuristic would otherwise route to a different precision (e.g. forcing
+    fp8 activation for Silu + SEPARATED, which the heuristic picks fp4 for).
     """
     if not block_size_M:
         block_size_M = -1
@@ -240,6 +247,7 @@ def fused_moe(
         bias2=bias2,
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
+        mxfp4_activation_dtype=mxfp4_activation_dtype,
         no_combine=no_combine,
     )
 
@@ -270,6 +278,7 @@ def fused_moe_fake(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    mxfp4_activation_dtype: str = "",
     no_combine: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
@@ -309,6 +318,7 @@ def fused_moe_(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    mxfp4_activation_dtype: str = "",
     no_combine: bool = False,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
@@ -348,11 +358,34 @@ def fused_moe_(
     ):
         q_dtype_a = dtypes.fp8
     bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
+    mxfp4_activation_dtype = (mxfp4_activation_dtype or "").lower()
     if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
     elif quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
+        if mxfp4_activation_dtype in ("bf16", "bfloat16", "torch.bfloat16"):
+            q_dtype_a = dtypes.bf16
+        elif mxfp4_activation_dtype in (
+            "fp4",
+            "mxfp4",
+            "a4",
+            "torch.float4_e2m1fn_x2",
+        ):
+            q_dtype_a = dtypes.fp4x2
+        elif mxfp4_activation_dtype in (
+            "fp8",
+            "mxfp8",
+            "a8",
+            "torch.float8_e4m3fn",
+            "torch.float8_e4m3fnuz",
+        ):
+            q_dtype_a = dtypes.fp8
+        elif mxfp4_activation_dtype not in ("", "auto"):
+            raise ValueError(
+                "mxfp4_activation_dtype must be '', 'auto', 'bf16', 'fp8', or 'fp4', "
+                f"got {mxfp4_activation_dtype!r}"
+            )
+        elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
