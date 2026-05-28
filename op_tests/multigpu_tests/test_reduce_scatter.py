@@ -135,7 +135,11 @@ def get_reduce_scatter_output(
 
 
 def reduce_scatter_acctest(
-    tp_size, pp_size, shape, dtype, dim=0,
+    tp_size,
+    pp_size,
+    shape,
+    dtype,
+    dim=0,
     distributed_init_method: Optional[str] = None,
 ):
     input_list = [torch.randn(shape, dtype=dtype) for _ in range(tp_size)]
@@ -155,11 +159,17 @@ def reduce_scatter_acctest(
     for rankID in range(tp_size):
         expected = ref_chunks[rankID]
         msg = f"rank {rankID} dist vs ref (dim={dim})"
-        error += checkAllclose(expected, dist_rslt[rankID], rtol=0.05, atol=0.2, msg=msg)
+        error += checkAllclose(
+            expected, dist_rslt[rankID], rtol=0.05, atol=0.2, msg=msg
+        )
         msg = f"rank {rankID} aiter vs ref (dim={dim})"
-        error += checkAllclose(expected, aiter_rslt[rankID], rtol=0.05, atol=0.2, msg=msg)
+        error += checkAllclose(
+            expected, aiter_rslt[rankID], rtol=0.05, atol=0.2, msg=msg
+        )
         msg = f"rank {rankID} dist vs aiter (dim={dim})"
-        error += checkAllclose(dist_rslt[rankID], aiter_rslt[rankID], rtol=0.05, atol=0.2, msg=msg)
+        error += checkAllclose(
+            dist_rslt[rankID], aiter_rslt[rankID], rtol=0.05, atol=0.2, msg=msg
+        )
     if error == 0:
         print(f"accuracy pass (dim={dim})")
     else:
