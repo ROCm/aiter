@@ -216,7 +216,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
     as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=a_scale_ptr + tile_m * (BLOCK_SIZE_M // PRESHUFFLE_FACTOR) * stride_as_m,
         shape=(
-            gl.cdiv(M, PRESHUFFLE_FACTOR) - tile_m * (BLOCK_SIZE_M // PRESHUFFLE_FACTOR),
+            gl.cdiv(M, PRESHUFFLE_FACTOR)
+            - tile_m * (BLOCK_SIZE_M // PRESHUFFLE_FACTOR),
             k_scale_cols * PRESHUFFLE_FACTOR,
         ),
         strides=(stride_as_m, stride_as_k),
@@ -227,7 +228,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
     bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=b_scale_ptr + tile_n * (BLOCK_SIZE_N // PRESHUFFLE_FACTOR) * stride_bs_n,
         shape=(
-            gl.cdiv(N, PRESHUFFLE_FACTOR) - tile_n * (BLOCK_SIZE_N // PRESHUFFLE_FACTOR),
+            gl.cdiv(N, PRESHUFFLE_FACTOR)
+            - tile_n * (BLOCK_SIZE_N // PRESHUFFLE_FACTOR),
             k_scale_cols * PRESHUFFLE_FACTOR,
         ),
         strides=(stride_bs_n, stride_bs_k),
