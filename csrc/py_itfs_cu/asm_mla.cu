@@ -272,9 +272,6 @@ void mla_decode_stage1_asm_fwd(
         if (q_type == "bf16" && kv_type == "bf16" && arch_id == "gfx942"){
             ps = 0; // not use ps
         }
-        if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && max_seqlen_q > 1){
-            causal = 1;
-        }
     }
     else if(gqa_ratio == 16){
         sub_Q = 128;
@@ -322,8 +319,6 @@ void mla_decode_stage1_asm_fwd(
                 sub_Q = 64;
             }
         }else if (q_type == "fp8" && kv_type == "fp8"){
-            // fp8/fp8 PS GQA catch-all (below) handles any case satisfying
-            //   (gqa_ratio * max_seqlen_q >= 128) || (gqa_ratio > 64)  (and != 48)
             bool fp8_ps_catchall_handles = (arch_id == "gfx950" && persistent
                 && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48);
             if((max_seqlen_q == 4) && persistent){
@@ -380,11 +375,8 @@ void mla_decode_stage1_asm_fwd(
         config_gqa_ratio = 64;
         args.s_MQA = gqa_ratio;
     } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
-        // fp8/fp8 PS GQA catch-all: route to QH32 PS GQA kernel (qseqlen=4, gqa=32 entry)
-        // which now reads s_MQA as s_gqa_ratio.
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
-        causal = 0;  // PS GQA kernel handles mask via work_info; CSV is registered with causal=0
         args.s_MQA = gqa_ratio;
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;

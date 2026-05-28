@@ -449,7 +449,6 @@ def torch_mla_extend_split_kv(
     final_lse = torch.empty(total_q, nheads, dtype=torch.float32, device=dev)
 
     io_transformed = False
-    use_qseqlen_fold = False
     q_ratio = 1
     if (
         nheads == 16
@@ -513,29 +512,11 @@ def torch_mla_extend_split_kv(
         # we use nhead=16 to simulate such cases by customized metadata
         # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
         ori_nheads = nheads
-        use_qseqlen_fold = (
-            get_gfx() == "gfx950"
-            and is_fp8_q
-            and is_fp8_kvc
-            and (
-                (max_seqlen_q * (nheads // 16)) == 4
-                or (nheads == 64 and max_seqlen_q == 2)
-            )
-        )
 
-        if use_qseqlen_fold and nheads == 64 and max_seqlen_q == 2:
-            fold_factor = nheads // 32
-            nheads = 32
-        else:
-            fold_factor = nheads // 16
-            nheads = 16
-
+        fold_factor = nheads // 16
+        nheads = 16
         total_s = total_q * fold_factor
-        if use_qseqlen_fold:
-            max_seqlen_q = max_seqlen_q * fold_factor
-            q_ratio = 1
-            q = q.view(total_s, nheads, -1)
-        elif max_seqlen_q == 1:
+        if max_seqlen_q == 1:
             q_ratio = fold_factor
             q = q.view(total_s, nheads, -1)
         else:
@@ -637,14 +618,7 @@ def torch_mla_extend_split_kv(
         partial_lse,
     )
 
-    return (
-        partial_o,
-        partial_lse,
-        final_out,
-        final_lse,
-        io_transformed,
-        use_qseqlen_fold,
-    )
+    return (partial_o, partial_lse, final_out, final_lse, io_transformed)
 
 
 def torch_mla_reduce_v1(
@@ -818,7 +792,7 @@ def torch_mla_split_kv_and_reduce(
     kv_scale=None,
 ):
     total_q, nhead, _ = q.shape
-    partial_out, partial_lse, split_out, split_lse, io_transformed, use_qseqlen_fold = (
+    partial_out, partial_lse, split_out, split_lse, io_transformed = (
         torch_mla_extend_split_kv(
             q,
             kv_cache,
@@ -852,7 +826,7 @@ def torch_mla_split_kv_and_reduce(
     )
 
     if io_transformed:
-        if max_seqlen_q == 1 or use_qseqlen_fold:
+        if max_seqlen_q == 1:
             split_out = split_out.reshape(total_q, nhead, kv_lora_rank)
             split_lse = split_lse.reshape(total_q, nhead)
         else:

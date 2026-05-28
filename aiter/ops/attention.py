@@ -937,17 +937,6 @@ def get_mla_metadata_info_v1(
     if is_hk_m16x4:
         cu_num *= 2
 
-    use_qseqlen_fold = (
-        get_gfx() == "gfx950"
-        and q_dtype == dtypes.fp8
-        and kv_dtype == dtypes.fp8
-        and num_head_qo > 16
-        and not (num_head_qo == 32 and max_seqlen_qo == 2)
-        and (
-            (max_seqlen_qo * (num_head_qo // 16) == 4)
-        )
-    )
-
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
     max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 16))
     if (
@@ -973,7 +962,6 @@ def get_mla_metadata_info_v1(
             and kv_dtype == dtypes.fp8
             and effective_seqlen_qo == 1
         )
-        or use_qseqlen_fold
     ):
         max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
     elif (

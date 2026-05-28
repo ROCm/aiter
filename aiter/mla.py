@@ -397,27 +397,10 @@ def mla_decode_fwd(
             # Natively support cases
             pass
         elif nhead in range(32, 128 + 1, 16) and persistent_mode:
-            # we use nhead=16 to simulate such cases by customized metadata
-            # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
-            use_qseqlen_fold = (
-                get_gfx() == "gfx950"
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and (
-                    (max_seqlen_q * (ori_nhead // 16) == 4)
-                )
-            )
-
-            if use_qseqlen_fold:
-                fold_factor = ori_nhead // 16
-                nhead = 16
-
+            fold_factor = ori_nhead // 16
+            nhead = 16
             total_s = ori_total_s * fold_factor
-            if use_qseqlen_fold:
-                max_seqlen_q = max_seqlen_q * fold_factor
-                q = q.view(total_s, nhead, -1)
-                qseqlen_folded = True
-            elif max_seqlen_q == 1:
+            if max_seqlen_q == 1:
                 q = q.view(total_s, nhead, -1)
             else:
                 q = (
