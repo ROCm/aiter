@@ -131,7 +131,7 @@ def unshuffle_weights_gfx1250(
     )
 
 
-@gluon.jit(launch_metadata=matmul_launch_metadata, loop_carried_load_percent=0)
+@gluon.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a4w4_gfx1250(
     Y,
     stride_y_k,
@@ -484,6 +484,10 @@ def _moe_gemm_a4w4_gfx1250(
         idx_w = load_idx * W_BLOCK_K
         idx_x_scales = load_idx * MX_SCALE_BLOCK_K
         idx_w_scales = load_idx * PACKED_MX_BLOCK
+        x_scales_mask = (
+            (offs_x_m_scales[:, None] < (M if GatherIndx is None else num_tokens)) &
+            ((offs_x_k_scales[None, :] + idx_x_scales) < gl.cdiv(K, MX_PACK_DIVISOR))
+        )
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
@@ -514,6 +518,7 @@ def _moe_gemm_a4w4_gfx1250(
                 offs_x_m_scales[:, None] * stride_x_mx_m + 
                 (offs_x_k_scales[None, :] + idx_x_scales) * stride_x_mx_k
             ),
+            mask=x_scales_mask,
         )
         gl.amd.gfx1250.async_copy.commit_group()
 
@@ -553,6 +558,10 @@ def _moe_gemm_a4w4_gfx1250(
         idx_w = load_idx * W_BLOCK_K
         idx_x_scales = load_idx * MX_SCALE_BLOCK_K
         idx_w_scales = load_idx * PACKED_MX_BLOCK
+        x_scales_mask = (
+            (offs_x_m_scales[:, None] < (M if GatherIndx is None else num_tokens)) &
+            ((offs_x_k_scales[None, :] + idx_x_scales) < gl.cdiv(K, MX_PACK_DIVISOR))
+        )
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
@@ -583,6 +592,7 @@ def _moe_gemm_a4w4_gfx1250(
                 offs_x_m_scales[:, None] * stride_x_mx_m + 
                 (offs_x_k_scales[None, :] + idx_x_scales) * stride_x_mx_k
             ),
+            mask=x_scales_mask,
         )
         gl.amd.gfx1250.async_copy.commit_group()
         load_idx += 1
