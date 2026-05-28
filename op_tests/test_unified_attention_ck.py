@@ -9,8 +9,12 @@ CK kernel actually supports:
 
   * head_size  ∈ {64, 128}  (Triton also covers 256; CK has no 256 instance)
   * block_size ∈ {16, 32, 64} (Triton also covers 48; CK ships ps16/ps32/ps64)
-  * dtype      ∈ {bf16, fp16} for activations
-  * q_dtype    ∈ {None, e4m3}  (per-tensor FP8 quantisation of Q/K/V)
+  * dtype      ∈ {bf16, fp16, fp8}
+                  - bf16 / fp16 → Q/K/V stored at the activation dtype
+                  - fp8         → Q/K/V quantised to e4m3 (per-tensor symmetric)
+                                  on top of a bf16 source — vLLM / SGLang's
+                                  recipe; the same convention the CK FP8
+                                  problem traits resolve at compile time.
   * num_heads  ∈ {(4,4), (8,1), (16,2), (64,8)}  — MHA + GQA-{2,8}
 
 CK doesn't implement sliding-window, soft-cap, or alibi/sinks, so those
@@ -26,6 +30,23 @@ Example:
   python op_tests/test_unified_attention_ck.py --quick           # smoke subset
   python op_tests/test_unified_attention_ck.py --head-size 128   # restrict
   python op_tests/test_unified_attention_ck.py --no-triton       # CK-only
+
+  # Single-shape mode — replaces the standalone ua-test-scripts/test_single_shape.py
+  # for ad-hoc correctness/perf checks; expands to one seq_lens batch of
+  # `b` identical (sq, sk) sequences. `--num-blocks auto` allocates exactly
+  # `b * ceil(sk / block_size)` physical blocks so block_tables hold unique
+  # indices (no fake L2 reuse), matching what vLLM/SGLang-style allocators
+  # produce in production.
+  python op_tests/test_unified_attention_ck.py \\
+      -b 64 -sq 1 -sk 128000 \\
+      --num-heads 64,8 --head-size 128 --block-size 16 \\
+      --dtype bf16 --num-blocks auto
+
+  # Same shape, FP8-quantised Q/K/V
+  python op_tests/test_unified_attention_ck.py \\
+      -b 64 -sq 1 -sk 128000 \\
+      --num-heads 64,8 --head-size 128 --block-size 32 \\
+      --dtype fp8 --num-blocks auto
 """
 
 from __future__ import annotations
@@ -70,8 +91,19 @@ DEFAULT_NUM_HEADS: List[Tuple[int, int]] = [
 ]
 DEFAULT_HEAD_SIZES: List[int] = [64, 128]
 DEFAULT_BLOCK_SIZES: List[int] = [16, 32, 64]
-DEFAULT_DTYPES: List[torch.dtype] = [dtypes.bf16, torch.float16]
-DEFAULT_Q_DTYPES: List[Optional[str]] = [None, "fp8"]
+# Single dtype axis combining the kernel's two internal dtype slots:
+#   source dtype (the activation dtype the reference + kernel consume)
+#   + optional FP8 per-tensor quantisation layered on top.
+# `fp8` covers the bf16-source / e4m3-quant path that vLLM and SGLang
+# actually use; bf16-source is the only quantisation source CK ships
+# traits for (and what the Triton FP8 reference also expects), so we
+# don't enumerate `fp16-source fp8` as a separate axis here. If someone
+# ever wants it they can hand-edit this list.
+DEFAULT_DTYPES: List[Tuple[torch.dtype, Optional[str]]] = [
+    (dtypes.bf16,   None),
+    (torch.float16, None),
+    (dtypes.bf16,   "fp8"),
+]
 DEFAULT_NUM_BLOCKS: List[int] = [2048]
 DEFAULT_SEQ_LENS: List[List[Tuple[int, int]]] = [
     [(1, 1328), (5, 18), (129, 463)],   # mixed prefill + decode
@@ -236,6 +268,60 @@ def _make_inputs(cfg: CaseConfig, device: str, seed: int):
 def _int32_overflow_possible(num_blocks, block_size, num_kv_heads, head_size) -> bool:
     INT32_MAX = 2 ** 31 - 1
     return num_blocks * block_size * num_kv_heads * head_size > INT32_MAX
+
+
+def _attn_flops_and_mem_bytes(cfg: "CaseConfig", total_q: int) -> Tuple[int, int]:
+    """Theoretical attention FLOPs and HBM-traffic bytes for one launch.
+
+    Used by single-shape mode to report TFLOPs / GB/s (the same back-of-
+    the-envelope cost model the standalone test_single_shape.py used, so
+    bandwidth numbers stay directly comparable across the consolidation).
+
+    FLOPs: Q·Kᵀ and Attn·V are each `2 · total_q · seqlen_k · head_dim ·
+    num_q_heads` for causal/no-mask (the GQA broadcast doesn't change the
+    per-q-head MFMA count); softmax/mask are ignored as O(N) relative to
+    the O(N·D) matmuls.
+
+    Bytes: Q + K + V at the activation dtype (FP8 halves the K/V traffic
+    that dominates decode) + output at bf16 (CK FP8 outputs bf16 too).
+    Sum over all sequences in the batch; assumes the batch is N copies of
+    the same (sq, sk) shape, which is how single-shape mode synthesises
+    its seq_lens list.
+    """
+    batch = len(cfg.seq_lens)
+    sq, sk = cfg.seq_lens[0]
+    hq, hk = cfg.num_heads
+    d = cfg.head_size
+    bytes_per_elem = 1 if cfg.q_dtype == "fp8" else (
+        2 if cfg.dtype in (torch.bfloat16, torch.float16) else 4
+    )
+    bytes_per_out = 2  # bf16 always for the kernel outputs we benchmark
+    flops = 4 * total_q * sk * d * hq
+    mem_q = total_q * hq * d * bytes_per_elem
+    mem_k = batch * sk * hk * d * bytes_per_elem
+    mem_v = mem_k
+    mem_o = total_q * hq * d * bytes_per_out
+    return flops, mem_q + mem_k + mem_v + mem_o
+
+
+def _compute_num_splits(cfg: "CaseConfig", total_q: int, device: str) -> int:
+    """Return what aiter's split-KV wrapper would pick for this shape.
+
+    `_pick_num_splits` only reads tensor shapes + .device, so we can call
+    it on empty (no-data) tensors here — no need to materialise the full
+    KV cache just to probe the heuristic. Used by single-shape mode to
+    tag the report with `num_splits` so the reader can attribute any
+    perf surprise to the combine-kernel path vs. the attention kernel.
+    """
+    from aiter.ops.unified_attention import _pick_num_splits
+    hq, hk = cfg.num_heads
+    q = torch.empty((max(1, total_q), hq, cfg.head_size),
+                    dtype=cfg.dtype, device=device)
+    k = torch.empty((1, cfg.block_size, hk, cfg.head_size),
+                    dtype=cfg.dtype, device=device)
+    seq_lens = torch.empty((len(cfg.seq_lens),),
+                           dtype=torch.int32, device=device)
+    return int(_pick_num_splits(q, k, seq_lens))
 
 
 # ----------------------------------------------------------------------------
@@ -478,12 +564,19 @@ def test_unified_attention_ck(
             ) == 0
 
     speedup = (time_triton / time_ck) if (time_triton is not None) else None
+    # num_splits surfaces what the transparent split-KV wrapper picked
+    # for this shape. Single-shape mode tags the report with it so any
+    # perf surprise can be attributed to the combine-kernel path vs the
+    # attention kernel proper; grid mode treats it as just another data
+    # column in the DataFrame.
+    num_splits = _compute_num_splits(cfg, t["total_q"], device) if allow_splitkv else 1
     return {
         "ck_us":       round(time_ck, 2),
         "triton_us":   round(time_triton, 2) if time_triton is not None else None,
         "ck_vs_tri":   round(speedup, 2) if speedup is not None else None,
         "ck_pass":     ck_passed,
         "triton_pass": triton_passed,
+        "num_splits":  num_splits,
         "status":      "ok",
     }
 
@@ -500,10 +593,23 @@ def _parse_seq_lens(s: str) -> List[Tuple[int, int]]:
     return out
 
 
-def _parse_dtype(s: str) -> torch.dtype:
+def _parse_dtype(s: str) -> Tuple[torch.dtype, Optional[str]]:
+    """Resolve a user-facing dtype name to the (source_dtype, q_dtype) pair
+    the kernel call expects.
+
+    The CK problem traits + the Triton FP8 reference both model FP8 as
+    "per-tensor symmetric quantisation of bf16 source tensors", so `fp8`
+    here is a shorthand for that combo — there is no `fp16-source fp8`
+    path. `--dtype fp8` does what the CLI name suggests: Q, K and V are
+    quantised to e4m3.
+    """
     return {
-        "bf16": dtypes.bf16, "bfloat16": dtypes.bf16,
-        "fp16": torch.float16, "float16": torch.float16, "half": torch.float16,
+        "bf16":     (dtypes.bf16,    None),
+        "bfloat16": (dtypes.bf16,    None),
+        "fp16":     (torch.float16,  None),
+        "float16":  (torch.float16,  None),
+        "half":     (torch.float16,  None),
+        "fp8":      (dtypes.bf16,    "fp8"),
     }[s]
 
 
@@ -522,21 +628,57 @@ def main():
     parser.add_argument("--block-size", type=int, nargs="*",
                         default=None, help="Restrict block sizes.")
     parser.add_argument("--dtype", type=_parse_dtype, nargs="*",
-                        default=None, help="Restrict dtypes (bf16, fp16).")
-    parser.add_argument("--q-dtype", type=str, nargs="*",
-                        default=None, choices=["none", "fp8"],
-                        help="Restrict quant dtypes: 'none' (full-precision) "
-                             "or 'fp8' (per-tensor e4m3).")
+                        default=None,
+                        help="Restrict dtypes. Values: bf16, fp16, fp8. "
+                             "`fp8` means Q/K/V are per-tensor symmetrically "
+                             "quantised to e4m3 from a bf16 source — the "
+                             "vLLM/SGLang convention the CK FP8 traits + "
+                             "Triton FP8 reference both expect.")
     parser.add_argument("--num-heads", type=str, nargs="*", default=None,
                         help="Restrict (HQ,HK) tuples, e.g. --num-heads 16,2 64,8")
-    parser.add_argument("--num-blocks", type=int, nargs="*",
-                        default=None, help="Restrict KV-cache pool sizes.")
+    parser.add_argument("--num-blocks", type=str, nargs="*",
+                        default=None, help="Restrict KV-cache pool sizes. "
+                                            "Pass integers, or the literal "
+                                            "'auto' to size the pool to "
+                                            "`batch * ceil(sk / block_size)` "
+                                            "so block_tables hold unique "
+                                            "physical indices and the "
+                                            "benchmark sees no fake L2 "
+                                            "reuse (matches vLLM/SGLang-"
+                                            "style allocators). 'auto' "
+                                            "requires single-shape mode.")
     parser.add_argument("--seq-lens", type=_parse_seq_lens, nargs="*",
                         default=None, help="Restrict seq_lens batches, format: "
                                             "'1,1328;5,18;129,463'")
+
+    # Single-shape shortcut — turns `b` repeated `(sq, sk)` pairs into one
+    # seq_lens batch. Replaces the standalone ua-test-scripts/test_single_shape.py
+    # script for ad-hoc shape investigations during kernel-side iteration.
+    parser.add_argument("-b", "--batch", type=int, default=None,
+                        help="Single-shape mode: number of sequences. Requires "
+                             "--seq-q and --seq-k; mutually exclusive with "
+                             "--seq-lens.")
+    parser.add_argument("-sq", "--seq-q", type=int, default=None,
+                        help="Single-shape mode: query length per sequence "
+                             "(use 1 for decode).")
+    parser.add_argument("-sk", "--seq-k", type=int, default=None,
+                        help="Single-shape mode: KV (context) length per "
+                             "sequence.")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--no-triton", action="store_true",
-                        help="Skip the Triton backend (CK + reference only).")
+    # Triton comparison default depends on mode:
+    #   - single-shape  → ON  (you almost always want the head-to-head)
+    #   - grid (default/quick/full) → OFF (correctness vs ref only — keeps
+    #     CK-side regression sweeps fast + uncoupled from Triton's perf)
+    # Override explicitly with `--triton` / `--no-triton`. Using
+    # BooleanOptionalAction so the unset default (`None`) is distinguishable
+    # from an explicit `--no-triton`, which is what lets the per-mode
+    # default kick in only when the user hasn't expressed a preference.
+    parser.add_argument("--triton", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="Compare against the Triton kernel. Default: "
+                             "ON in single-shape mode, OFF for grid runs. "
+                             "Use --no-triton to force off (e.g. CK-only "
+                             "regression sweeps) or --triton to force on.")
     parser.add_argument("--no-reference", action="store_true",
                         help="Skip the torch reference (perf-only run).")
     parser.add_argument("--no-splitkv", action="store_true",
@@ -563,73 +705,214 @@ def main():
         seq_lens_grid  = DEFAULT_SEQ_LENS
 
     head_sizes    = DEFAULT_HEAD_SIZES
-    dtypes_list   = DEFAULT_DTYPES
-    q_dtypes_list = DEFAULT_Q_DTYPES
+    dtype_pairs   = DEFAULT_DTYPES
 
     if args.head_size:
         head_sizes = args.head_size
     if args.block_size:
         block_sizes = args.block_size
     if args.dtype:
-        dtypes_list = args.dtype
-    if args.q_dtype:
-        q_dtypes_list = [None if x == "none" else x for x in args.q_dtype]
+        dtype_pairs = args.dtype
     if args.num_heads:
         num_heads_cfg = [
             tuple(int(x) for x in s.split(","))
             for s in args.num_heads
         ]
-    if args.num_blocks:
-        num_blocks_lst = args.num_blocks
     if args.seq_lens:
         seq_lens_grid = args.seq_lens
+
+    # Single-shape mode is mutually exclusive with --seq-lens because
+    # both control the same axis. The shortcut just expands to one
+    # `seq_lens_grid` entry of `batch` identical `(seq_q, seq_k)` pairs.
+    single_shape_flags = [args.batch, args.seq_q, args.seq_k]
+    single_shape = any(v is not None for v in single_shape_flags)
+    if single_shape:
+        if not all(v is not None for v in single_shape_flags):
+            parser.error("--batch/--seq-q/--seq-k must be passed together")
+        if args.seq_lens:
+            parser.error("--batch/--seq-q/--seq-k is mutually exclusive "
+                         "with --seq-lens")
+        seq_lens_grid = [[(args.seq_q, args.seq_k)] * args.batch]
+
+    # Resolve the mode-dependent Triton default (see CLI comment).
+    run_triton = args.triton if args.triton is not None else single_shape
+
+    # `--num-blocks auto` requires a single (batch, sk, block_size) so we
+    # can compute the exact pool size. It's most useful precisely in
+    # single-shape mode (the only mode where there's one well-defined sk).
+    if args.num_blocks:
+        if any(x.lower() == "auto" for x in args.num_blocks):
+            if len(args.num_blocks) != 1:
+                parser.error("--num-blocks auto must be the only --num-blocks "
+                             "value (can't mix 'auto' with explicit sizes)")
+            if not (all(v is not None for v in single_shape_flags)
+                    and len(block_sizes) == 1):
+                parser.error("--num-blocks auto requires --batch/--seq-q/"
+                             "--seq-k *and* a single --block-size so the "
+                             "pool size is unambiguously batch * "
+                             "ceil(sk / block_size).")
+            pages_per_seq = (args.seq_k + block_sizes[0] - 1) // block_sizes[0]
+            num_blocks_lst = [args.batch * pages_per_seq]
+        else:
+            num_blocks_lst = [int(x) for x in args.num_blocks]
 
     rows = []
     for seq_lens in seq_lens_grid:
         for nh in num_heads_cfg:
             for hd in head_sizes:
                 for bs in block_sizes:
-                    for dt in dtypes_list:
-                        for qd in q_dtypes_list:
-                            for nb in num_blocks_lst:
-                                ret = test_unified_attention_ck(
-                                    seq_lens, nh, hd, bs, dt, qd, nb,
-                                    seed=args.seed,
-                                    run_triton_backend=not args.no_triton,
-                                    skip_reference=args.no_reference,
-                                    allow_splitkv=not args.no_splitkv,
-                                )
-                                rows.append(ret)
-                                # Release the deep-copied rotation buffers
-                                # @perftest holds before the next config
-                                # claims VRAM. Without this the allocator
-                                # reuses the same chunks across configs and
-                                # we've observed sporadic NaN outputs from
-                                # CK at bs=64 + nh=(16,2) — the root cause
-                                # is still under investigation; the cache
-                                # flush sidesteps it cleanly here.
-                                gc.collect()
-                                torch.cuda.empty_cache()
+                    for (dt, qd) in dtype_pairs:
+                        for nb in num_blocks_lst:
+                            ret = test_unified_attention_ck(
+                                seq_lens, nh, hd, bs, dt, qd, nb,
+                                seed=args.seed,
+                                run_triton_backend=run_triton,
+                                skip_reference=args.no_reference,
+                                allow_splitkv=not args.no_splitkv,
+                            )
+                            rows.append(ret)
+                            # Release the deep-copied rotation buffers
+                            # @perftest holds before the next config
+                            # claims VRAM. Without this the allocator
+                            # reuses the same chunks across configs and
+                            # we've observed sporadic NaN outputs from
+                            # CK at bs=64 + nh=(16,2) — the root cause
+                            # is still under investigation; the cache
+                            # flush sidesteps it cleanly here.
+                            gc.collect()
+                            torch.cuda.empty_cache()
 
-    df = pd.DataFrame(rows)
-    # `@benchmark()` merges the call kwargs into the row dict; drop the
-    # ones that are constant across runs to keep the summary table readable.
-    for noise_col in ("seed", "device", "run_triton_backend",
-                       "skip_reference", "allow_splitkv"):
-        if noise_col in df.columns:
-            df = df.drop(columns=[noise_col])
-    aiter.logger.info(
-        "unified_attention_ck summary (markdown):\n%s",
-        df.to_markdown(index=False),
-    )
-    # Surface any failure as a non-zero exit so CI flags it.
-    failed = df[
-        (df.get("ck_pass") == False) | (df.get("triton_pass") == False)  # noqa: E712
+    if single_shape:
+        dt0, qd0 = dtype_pairs[0]
+        _print_single_shape_report(rows[0], seq_lens_grid[0], num_heads_cfg[0],
+                                   head_sizes[0], block_sizes[0],
+                                   dt0, qd0, num_blocks_lst[0])
+    else:
+        df = pd.DataFrame(rows)
+        # `@benchmark()` merges the call kwargs into the row dict; drop
+        # the ones that are constant across rows to keep the table
+        # readable.
+        for noise_col in ("seed", "device", "run_triton_backend",
+                           "skip_reference", "allow_splitkv"):
+            if noise_col in df.columns:
+                df = df.drop(columns=[noise_col])
+        aiter.logger.info(
+            "unified_attention_ck summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+    # Surface any failure as a non-zero exit so CI flags it. Done in both
+    # modes — single-shape failure usually means "this shape is broken,
+    # please look", so we still want a non-zero exit there.
+    failed_rows = [
+        r for r in rows
+        if r.get("ck_pass") is False or r.get("triton_pass") is False
     ]
-    if not failed.empty:
-        aiter.logger.error("%d row(s) failed correctness:\n%s", len(failed),
-                           failed.to_markdown(index=False))
+    if failed_rows:
+        aiter.logger.error(
+            "%d row(s) failed correctness:\n%s",
+            len(failed_rows),
+            pd.DataFrame(failed_rows).to_markdown(index=False),
+        )
         raise SystemExit(1)
+
+
+def _print_single_shape_report(
+    row: dict,
+    seq_lens: List[Tuple[int, int]],
+    num_heads: Tuple[int, int],
+    head_size: int,
+    block_size: int,
+    dtype: torch.dtype,
+    q_dtype: Optional[str],
+    num_blocks: int,
+) -> None:
+    """Pretty-print a single-shape result block.
+
+    Replaces the report that used to live in the standalone
+    ua-test-scripts/test_single_shape.py. Output is intentionally
+    grep-friendly so downstream sweep scripts (e.g.
+    ua-test-scripts/regression_decode.sh) can scrape CK time / bandwidth /
+    correctness / split-KV status without parsing the DataFrame.
+    """
+    batch = len(seq_lens)
+    sq, sk = seq_lens[0]
+    hq, hk = num_heads
+    total_q = batch * sq
+    cfg = CaseConfig(
+        seq_lens=seq_lens, num_heads=num_heads, head_size=head_size,
+        block_size=block_size, dtype=dtype, q_dtype=q_dtype,
+        num_blocks=num_blocks,
+    )
+    flops, mem_bytes = _attn_flops_and_mem_bytes(cfg, total_q)
+    mem_gb = mem_bytes / 1e9
+    phase = "decode" if sq == 1 else "prefill"
+
+    print()
+    print("=" * 80)
+    print("CK unified attention — single-shape mode")
+    print("=" * 80)
+    print("Shape:")
+    print(f"  batch         = {batch}")
+    print(f"  seqlen_q      = {sq}")
+    print(f"  seqlen_k      = {sk}")
+    print(f"  num_q_heads   = {hq}")
+    print(f"  num_kv_heads  = {hk}")
+    print(f"  head_size     = {head_size}")
+    print(f"  block_size    = {block_size}")
+    print(f"  num_blocks    = {num_blocks}")
+    print(f"  dtype         = {dtype}  q_dtype={q_dtype}")
+    print(f"  phase         = {phase}")
+    print(f"  total_q       = {total_q}")
+    num_splits = row.get("num_splits")
+    if num_splits is not None:
+        active = "ACTIVE" if num_splits > 1 else "off"
+        # Heads-up next to the timing block: if num_splits > 1 you're
+        # paying for two launches (attention kernel + combine) plus the
+        # workspace alloc, so any per-shape under-perf relative to a
+        # b=128 sweep number may live in the combine path rather than
+        # the attention kernel proper.
+        print(f"  split-KV      = num_splits={num_splits} ({active})")
+    try:
+        gpu = torch.cuda.get_device_properties(0)
+        print(f"  GPU           = {gpu.gcnArchName}  "
+              f"CUs={gpu.multi_processor_count}  "
+              f"HBM={gpu.total_memory >> 20}MB")
+    except Exception:
+        pass
+
+    print("-" * 80)
+    print("Correctness (vs torch reference):")
+    ck_p = row.get("ck_pass")
+    tr_p = row.get("triton_pass")
+    if ck_p is not None:
+        print(f"  CK     vs ref:  {'PASS' if ck_p else 'FAIL'}")
+    if tr_p is not None:
+        print(f"  Triton vs ref:  {'PASS' if tr_p else 'FAIL'}")
+
+    print("-" * 80)
+    print("Timing (median of @perftest iters):")
+    ck_us = row.get("ck_us")
+    tr_us = row.get("triton_us")
+    if ck_us is not None:
+        ms = ck_us / 1e3
+        tflops = (flops / 1e12) / (ms / 1e3)
+        bw = mem_gb / (ms / 1e3)
+        print(f"  CK time        = {ms:8.4f} ms")
+        print(f"  CK Bandwidth   = {bw:8.2f} GB/s")
+        print(f"  CK TFLOPs      = {tflops:8.2f}")
+    if tr_us is not None:
+        ms = tr_us / 1e3
+        tflops = (flops / 1e12) / (ms / 1e3)
+        bw = mem_gb / (ms / 1e3)
+        print(f"  Triton time    = {ms:8.4f} ms")
+        print(f"  Triton Bandwidth={bw:8.2f} GB/s")
+        print(f"  Triton TFLOPs  = {tflops:8.2f}")
+    if ck_us is not None and tr_us is not None:
+        speedup = tr_us / ck_us
+        winner = "CK" if speedup >= 1.0 else "Triton"
+        print(f"  Speedup        = {speedup:.3f}x ({winner} wins)")
+    print("=" * 80)
 
 
 if __name__ == "__main__":

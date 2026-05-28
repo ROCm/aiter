@@ -270,7 +270,35 @@ def _pick_num_splits(
 
     q_tiles     = max(1, (total_q + kBlockQ - 1) // kBlockQ)
     base_ctas   = num_kv_heads * q_tiles
-    target_ctas = _num_cus(query.device) * 4
+    num_cus     = _num_cus(query.device)
+
+    # Prefill-regime saturation guard. The 4x-CU oversubscription rule
+    # is calibrated for the decode regime (small total_q, base_ctas
+    # well below num_cus, sk that dominates per-CTA work). For prefill
+    # (avg_q in the thousands) base_ctas typically already saturates
+    # the device with q-tiles alone, and splitting K just multiplies
+    # the combine kernel's per-(token,head) reduce + the workspace
+    # alloc, without adding useful parallelism — the per-CTA K-traversal
+    # was already short relative to combine's overhead.
+    #
+    # Measured on a vLLM-captured production trace (d=128, GQA-6, FP8,
+    # sq=sk=1000): the unguarded heuristic picks splits=4 for b=4 and
+    # splits=2 for b=8, costing 2.6x / 1.85x in CK time vs splits=1.
+    # Both shapes already have base_ctas >= num_cus (500 and 1000
+    # against 256 on MI355X), so the device is already saturated by Q
+    # tiles alone — the K-split fan-out is pure overhead.
+    #
+    # Decode is unaffected: avg_q == 1 keeps the predicate false on
+    # every batch in the production trace (the largest base_ctas a
+    # decode batch hits at avg_q=1 is num_kv_heads * ceil(batch/kBlockQ_tiny)).
+    #
+    # Chunked prefill (small avg_q on top of long sk) is also unaffected
+    # because base_ctas stays well below num_cus when q_tiles per
+    # sequence is small.
+    if avg_q > 8 and base_ctas >= num_cus:
+        return 1
+
+    target_ctas = num_cus * 4
     # ceil-div so a single under-saturated base_ctas still gets bumped
     # to the next power-of-2 splits tier instead of rounding down to 0.
     raw_splits  = (target_ctas + base_ctas - 1) // max(1, base_ctas)
