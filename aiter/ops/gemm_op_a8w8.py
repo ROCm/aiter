@@ -312,6 +312,19 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
 ) -> None: ...
 
 
+# Ref on https://github.com/ROCm/aiter/blob/1be4ee9f70a7a7de5e9f57de2c0ecb9d13ed5983/aiter/ops/gemm_op_a16w16.py#L37-L57
+@functools.lru_cache(maxsize=1024)
+def get_zero_bias_buf_keyed(
+    device: torch.device, stream_id: int, out_shape: int
+) -> Tensor:
+    return torch.zeros(1, out_shape, dtype=torch.float32, device=device)
+
+
+def get_zero_bias_buf(B: Tensor) -> Tensor:
+    stream = torch.cuda.current_stream(B.device)
+    return get_zero_bias_buf_keyed(B.device, stream.cuda_stream, B.shape[0])
+
+
 def gemm_a8w8_blockscale_bpreshuffle_asm(
     A: Tensor,
     B: Tensor,
@@ -325,7 +338,7 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     zero_bias_buf: Optional[Tensor] = None,
 ) -> Tensor:
     if bias is None and zero_bias_buf is None:
-        zero_bias_buf = torch.zeros(1, B.shape[0], dtype=torch.float32, device=A.device)
+        zero_bias_buf = get_zero_bias_buf(B)
     _gemm_a8w8_blockscale_bpreshuffle_asm(
         A,
         B,
@@ -748,7 +761,6 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    zero_bias_buf: Optional[Tensor] = None,
 ) -> Tensor:
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
@@ -760,7 +772,6 @@ def gemm_a8w8_blockscale_bpreshuffle(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    zero_bias_buf: Optional[Tensor] = None,
 ) -> Tensor:
     assert dtype in [
         dtypes.bf16,
@@ -787,14 +798,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
         elif libtype == "asm":
             splitK = config["splitK"]
             return gemm_a8w8_blockscale_bpreshuffle_asm(
-                XQ,
-                WQ,
-                Y,
-                x_scale,
-                w_scale,
-                splitK=splitK,
-                kernelName=kernelName,
-                zero_bias_buf=zero_bias_buf,
+                XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
             )
     try:
         return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
