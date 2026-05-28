@@ -17,7 +17,7 @@ jobs:
         with:
           submodules: 'recursive'
 
-      - name: Skip CK commit verification
+      - name: Verify 3rdparty commits
         if: github.ref != 'refs/heads/main'
         run: echo "Temporarily skipping CK dependency check."
 
