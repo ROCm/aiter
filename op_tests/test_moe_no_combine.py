@@ -324,6 +324,14 @@ def test_bf16_metadata_uses_ck_wrapper_for_no_combine(monkeypatch):
     _validate_no_combine_route(metadata, doweight_stage1=False)
 
 
+@pytest.mark.parametrize("stage2", [_fmoe.ck_moe_stage2, _fmoe.cktile_moe_stage2])
+def test_no_combine_route_rejects_doweight_stage1_for_ck_backends(stage2):
+    with pytest.raises(NotImplementedError, match="doweight_stage1"):
+        _validate_no_combine_route(
+            _FakeMetadata(stage2=stage2), doweight_stage1=True
+        )
+
+
 def test_w4a16_metadata_uses_cktile_by_default(monkeypatch):
     monkeypatch.setattr(_fmoe, "_ENABLE_FLYDSL_W4A16", False)
     monkeypatch.setattr(_fmoe, "is_flydsl_available", lambda: True)
@@ -458,16 +466,35 @@ def _slot_sort_inputs(token_num=3, topk=2, inter_dim=4, model_dim=5):
     return inter_states, w1, w2, sorted_token_ids, sorted_expert_ids, num_valid_ids
 
 
+def _patch_empty_with_sentinel(monkeypatch, sentinel):
+    real_empty = torch.empty
+
+    def patched_empty(*args, **kwargs):
+        return real_empty(*args, **kwargs).fill_(sentinel)
+
+    monkeypatch.setattr(torch, "empty", patched_empty)
+
+
+def _assert_only_active_flat_rows_are_written(out, active_rows, value):
+    flat = out.view(-1, out.shape[-1])
+    active_rows = torch.tensor(active_rows, dtype=torch.long, device=flat.device)
+    inactive = torch.ones(flat.shape[0], dtype=torch.bool, device=flat.device)
+    inactive[active_rows] = False
+    assert torch.equal(flat[active_rows], torch.full_like(flat[active_rows], value))
+    assert torch.equal(flat[inactive], torch.zeros_like(flat[inactive]))
+
+
 def test_ck_stage2_no_combine_flattens_topk_slots(monkeypatch):
     captured = {}
 
     def fake_ck_stage2(*args, **kwargs):
         captured["args"] = args
-        args[6].fill_(5)
+        args[6][args[3].to(torch.long)] = 5
         return args[6]
 
     monkeypatch.setattr(aiter, "ck_moe_stage2_fwd", fake_ck_stage2)
     inter_states, w1, w2, sorted_ids, sorted_experts, num_valid = _slot_sort_inputs()
+    _patch_empty_with_sentinel(monkeypatch, 9)
 
     out = _fmoe.ck_moe_stage2(
         inter_states,
@@ -486,7 +513,7 @@ def test_ck_stage2_no_combine_flattens_topk_slots(monkeypatch):
     )
 
     assert tuple(out.shape) == (3, 2, 5)
-    assert out.flatten().tolist() == [5] * out.numel()
+    _assert_only_active_flat_rows_are_written(out, [0, 1, 5, 2], 5)
     assert tuple(captured["args"][0].shape) == (6, 4)
     assert tuple(captured["args"][6].shape) == (6, 5)
     assert captured["args"][7] == 1
@@ -498,11 +525,12 @@ def test_cktile_stage2_no_combine_flattens_topk_slots(monkeypatch):
 
     def fake_cktile_stage2(*args, **kwargs):
         captured["args"] = args
-        args[2].fill_(3)
+        args[2][args[3].to(torch.long)] = 3
         return args[2]
 
     monkeypatch.setattr(aiter, "moe_cktile2stages_gemm2", fake_cktile_stage2)
     inter_states, w1, w2, sorted_ids, sorted_experts, num_valid = _slot_sort_inputs()
+    _patch_empty_with_sentinel(monkeypatch, 9)
 
     out = _fmoe.cktile_moe_stage2(
         inter_states,
@@ -520,11 +548,92 @@ def test_cktile_stage2_no_combine_flattens_topk_slots(monkeypatch):
     )
 
     assert tuple(out.shape) == (3, 2, 5)
-    assert out.flatten().tolist() == [3] * out.numel()
+    _assert_only_active_flat_rows_are_written(out, [0, 1, 5, 2], 3)
     assert tuple(captured["args"][0].shape) == (6, 4)
     assert tuple(captured["args"][2].shape) == (6, 5)
     assert captured["args"][6] == 1
     assert captured["args"][3].tolist() == [0, 1, 5, 2]
+
+
+@pytest.mark.parametrize("stage2_name", ["ck", "cktile"])
+def test_stage2_no_combine_zeroes_flat_user_buffer(stage2_name, monkeypatch):
+    if stage2_name == "ck":
+
+        def fake_stage2(*args, **kwargs):
+            args[6][args[3].to(torch.long)] = 11
+            return args[6]
+
+        monkeypatch.setattr(aiter, "ck_moe_stage2_fwd", fake_stage2)
+        stage2 = _fmoe.ck_moe_stage2
+        extra_kwargs = {"kernelName": "", "w2_scale": None, "a2_scale": None}
+    else:
+
+        def fake_stage2(*args, **kwargs):
+            args[2][args[3].to(torch.long)] = 11
+            return args[2]
+
+        monkeypatch.setattr(aiter, "moe_cktile2stages_gemm2", fake_stage2)
+        stage2 = _fmoe.cktile_moe_stage2
+        extra_kwargs = {"w2_scale": None, "a2_scale": None}
+
+    inter_states, w1, w2, sorted_ids, sorted_experts, num_valid = _slot_sort_inputs()
+    flat_out = torch.full((6, 5), 9, dtype=dtypes.bf16)
+
+    out = stage2(
+        inter_states,
+        w1,
+        w2,
+        sorted_ids,
+        sorted_experts,
+        num_valid,
+        out=flat_out,
+        topk=2,
+        block_m=32,
+        no_combine=True,
+        **extra_kwargs,
+    )
+
+    assert tuple(out.shape) == (3, 2, 5)
+    assert out.data_ptr() == flat_out.data_ptr()
+    _assert_only_active_flat_rows_are_written(out, [0, 1, 5, 2], 11)
+
+
+@pytest.mark.parametrize("stage2_name", ["ck", "cktile"])
+def test_stage2_no_combine_rejects_flat_index_overflow(stage2_name, monkeypatch):
+    if stage2_name == "ck":
+        monkeypatch.setattr(aiter, "ck_moe_stage2_fwd", lambda *args, **kwargs: None)
+        stage2 = _fmoe.ck_moe_stage2
+        extra_kwargs = {"kernelName": "", "w2_scale": None, "a2_scale": None}
+    else:
+        monkeypatch.setattr(
+            aiter, "moe_cktile2stages_gemm2", lambda *args, **kwargs: None
+        )
+        stage2 = _fmoe.cktile_moe_stage2
+        extra_kwargs = {"w2_scale": None, "a2_scale": None}
+
+    token_num = 1 << 23
+    topk = 3
+    a2 = torch.empty((token_num, topk, 1), dtype=dtypes.bf16, device="meta")
+    w1 = torch.empty((1, 2, 1), dtype=dtypes.bf16, device="meta")
+    w2 = torch.empty((1, 1, 1), dtype=dtypes.bf16, device="meta")
+    sorted_ids = torch.empty((0,), dtype=dtypes.i32)
+    sorted_experts = torch.empty((0,), dtype=dtypes.i32)
+    num_valid = torch.tensor([0], dtype=dtypes.i32)
+
+    with pytest.raises(AssertionError, match="flat index overflow"):
+        stage2(
+            a2,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_experts,
+            num_valid,
+            out=None,
+            topk=topk,
+            block_m=32,
+            no_combine=True,
+            **extra_kwargs,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +742,49 @@ def test_stage2_codegen_module_names_differ_for_accumulate(monkeypatch):
         captured.clear()
         mmg2.compile_mixed_moe_gemm2.cache_clear()
         mmg2.compile_mixed_moe_gemm2(**common, accumulate=False)
+        names_false = [name for name in captured if isinstance(name, str)]
+
+    name_true = next(name for name in names_true if name.startswith("mfma_moe2_"))
+    name_false = next(name for name in names_false if name.startswith("mfma_moe2_"))
+    assert "_acc0" not in name_true
+    assert "_acc0" in name_false
+    assert name_true != name_false
+
+
+def test_w4a16_moe_gemm2_codegen_module_names_differ_for_accumulate(monkeypatch):
+    import flydsl.compiler as flyc
+    from aiter.ops.flydsl.kernels import moe_gemm_2stage as mg2
+
+    captured = []
+    orig_kernel = flyc.kernel
+
+    def spy_kernel(*args, **kwargs):
+        captured.append(kwargs.get("name", args[0] if args else None))
+        return orig_kernel(*args, **kwargs)
+
+    common = dict(
+        model_dim=128,
+        inter_dim=128,
+        experts=4,
+        topk=2,
+        tile_m=32,
+        tile_n=128,
+        tile_k=128,
+        doweight_stage2=False,
+        in_dtype="fp4_bf16",
+        group_size=32,
+        out_dtype="bf16",
+        use_cshuffle_epilog=True,
+        scale_is_bf16=False,
+    )
+
+    mg2.compile_moe_gemm2.cache_clear()
+    with patch.object(flyc, "kernel", side_effect=spy_kernel):
+        mg2.compile_moe_gemm2(**common, accumulate=True)
+        names_true = [name for name in captured if isinstance(name, str)]
+        captured.clear()
+        mg2.compile_moe_gemm2.cache_clear()
+        mg2.compile_moe_gemm2(**common, accumulate=False)
         names_false = [name for name in captured if isinstance(name, str)]
 
     name_true = next(name for name in names_true if name.startswith("mfma_moe2_"))

@@ -33,113 +33,6 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 _ENABLE_FLYDSL_W4A16 = os.environ.get("AITER_ENABLE_FLYDSL_W4A16", "0") == "1"
-_aiter_stage_dump_done: set[tuple[int, int]] = set()
-
-
-def _debug_rank() -> int:
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        try:
-            return int(torch.distributed.get_rank())
-        except RuntimeError:
-            pass
-    try:
-        return int(os.environ.get("RANK", "0"))
-    except ValueError:
-        return 0
-
-
-def _sample_tensor_for_stage_dump(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    if tensor is None:
-        return None
-    max_tokens = int(os.environ.get("SGLANG_AITER_MOE_STAGE_DUMP_TOKENS", "2"))
-    sample = tensor
-    if sample.dim() > 0 and max_tokens > 0:
-        sample = sample[: min(max_tokens, sample.shape[0])]
-    return sample.detach().cpu()
-
-
-def _maybe_dump_stage_tensors(
-    *,
-    debug_dump_dir: str,
-    debug_layer_id: Optional[int],
-    token_num: int,
-    topk: int,
-    metadata,
-    q_dtype_a,
-    q_dtype_w,
-    sorted_ids: torch.Tensor,
-    sorted_expert_ids: torch.Tensor,
-    num_valid_ids: torch.Tensor,
-    a1: torch.Tensor,
-    a1_scale: Optional[torch.Tensor],
-    stage1_raw,
-    a2: torch.Tensor,
-    a2_scale: Optional[torch.Tensor],
-    stage2_out: torch.Tensor,
-) -> None:
-    if not debug_dump_dir or debug_layer_id is None:
-        return
-
-    rank = _debug_rank()
-    key = (rank, int(debug_layer_id))
-    if os.environ.get("SGLANG_AITER_MOE_STAGE_DUMP_ONCE", "1") != "0":
-        if key in _aiter_stage_dump_done:
-            return
-        _aiter_stage_dump_done.add(key)
-
-    os.makedirs(os.path.join(debug_dump_dir, f"rank_{rank}"), exist_ok=True)
-    stage1_keywords = getattr(metadata.stage1, "keywords", {}) or {}
-    stage2_keywords = getattr(metadata.stage2, "keywords", {}) or {}
-    if isinstance(stage1_raw, tuple):
-        raw_payload = {
-            "kind": "tuple",
-            "items": [_sample_tensor_for_stage_dump(item) for item in stage1_raw],
-        }
-    else:
-        raw_payload = _sample_tensor_for_stage_dump(stage1_raw)
-
-    path = os.path.join(
-        debug_dump_dir,
-        f"rank_{rank}",
-        f"aiter_stage_layer_{int(debug_layer_id)}.pt",
-    )
-    torch.save(
-        {
-            "rank": rank,
-            "layer_idx": int(debug_layer_id),
-            "token_num": int(token_num),
-            "topk": int(topk),
-            "metadata_fuse_quant": metadata.fuse_quant,
-            "metadata_ksplit": int(metadata.ksplit),
-            "metadata_block_m": int(metadata.block_m),
-            "stage1_kernel": stage1_keywords.get("kernelName", ""),
-            "stage2_kernel": stage2_keywords.get("kernelName", ""),
-            "q_dtype_a": str(q_dtype_a),
-            "q_dtype_w": str(q_dtype_w),
-            "sorted_ids": _sample_tensor_for_stage_dump(sorted_ids),
-            "sorted_expert_ids": sorted_expert_ids.detach().cpu(),
-            "num_valid_ids": num_valid_ids.detach().cpu(),
-            "a1": _sample_tensor_for_stage_dump(a1),
-            "a1_scale": _sample_tensor_for_stage_dump(a1_scale),
-            "stage1_raw": raw_payload,
-            "a2": _sample_tensor_for_stage_dump(a2),
-            "a2_scale": _sample_tensor_for_stage_dump(a2_scale),
-            "stage2_out": _sample_tensor_for_stage_dump(stage2_out),
-        },
-        path,
-    )
-    logger.warning(
-        "AITER stage dump layer=%s rank=%s path=%s stage1=%s stage2=%s "
-        "fuse_quant=%s q_dtype_a=%s q_dtype_w=%s",
-        debug_layer_id,
-        rank,
-        path,
-        stage1_keywords.get("kernelName", ""),
-        stage2_keywords.get("kernelName", ""),
-        metadata.fuse_quant,
-        q_dtype_a,
-        q_dtype_w,
-    )
 
 
 def _moe_sorting_impl(
@@ -299,8 +192,6 @@ def fused_moe(
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
     mxfp4_activation_dtype: str = "",
     no_combine: bool = False,
-    debug_layer_id: Optional[int] = None,
-    debug_dump_dir: str = "",
 ):
     """Fused Mixture-of-Experts.
 
@@ -357,8 +248,6 @@ def fused_moe(
         gate_mode=gate_mode,
         mxfp4_activation_dtype=mxfp4_activation_dtype,
         no_combine=no_combine,
-        debug_layer_id=debug_layer_id,
-        debug_dump_dir=debug_dump_dir,
     )
 
 
@@ -390,8 +279,6 @@ def fused_moe_fake(
     gate_mode: str = GateMode.SEPARATED.value,
     mxfp4_activation_dtype: str = "",
     no_combine: bool = False,
-    debug_layer_id: Optional[int] = None,
-    debug_dump_dir: str = "",
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -432,8 +319,6 @@ def fused_moe_(
     gate_mode: str = GateMode.SEPARATED.value,
     mxfp4_activation_dtype: str = "",
     no_combine: bool = False,
-    debug_layer_id: Optional[int] = None,
-    debug_dump_dir: str = "",
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -634,8 +519,6 @@ def fused_moe_(
             swiglu_limit=swiglu_limit,
             gate_mode=gate_mode,
             no_combine=no_combine,
-            debug_layer_id=debug_layer_id,
-            debug_dump_dir=debug_dump_dir,
         )
 
 
@@ -1052,6 +935,26 @@ def _flydsl_stage2_wrapper(
 _NO_COMBINE_SUPPORTED_DTYPES = frozenset(
     {("bf16", "fp4"), ("fp4", "fp4"), ("fp8", "fp4")}
 )
+_NO_COMBINE_MAX_FLAT_ROWS = 1 << 24
+
+
+def _prepare_no_combine_output(a2, out, token_num, topk, model_dim):
+    flat_rows = int(token_num) * int(topk)
+    assert flat_rows <= _NO_COMBINE_MAX_FLAT_ROWS, (
+        f"no_combine flat index overflow: token_num={token_num} * "
+        f"topk={topk} exceeds {_NO_COMBINE_MAX_FLAT_ROWS}"
+    )
+    if out is None:
+        out = torch.zeros(
+            (token_num, topk, model_dim),
+            dtype=a2.dtype,
+            device=a2.device,
+        )
+    else:
+        out.zero_()
+        if out.dim() == 2:
+            out = out.view(token_num, topk, model_dim)
+    return out, flat_rows
 
 
 def _validate_no_combine_route(metadata, doweight_stage1):
@@ -1067,6 +970,10 @@ def _validate_no_combine_route(metadata, doweight_stage1):
         raise NotImplementedError(
             "no_combine=True is not supported on the 1-stage MoE path"
         )
+    if doweight_stage1:
+        raise NotImplementedError(
+            "no_combine=True is not supported with doweight_stage1=True"
+        )
     stage2_fn = getattr(metadata.stage2, "func", metadata.stage2)
     if stage2_fn in (ck_moe_stage2, cktile_moe_stage2):
         return
@@ -1075,10 +982,6 @@ def _validate_no_combine_route(metadata, doweight_stage1):
         raise NotImplementedError(
             f"no_combine=True is only supported on the FlyDSL, CK, or CKTile stage2 path; "
             f"current stage2={name}"
-        )
-    if doweight_stage1:
-        raise NotImplementedError(
-            "no_combine=True is not supported with doweight_stage1=True"
         )
     keywords = getattr(metadata.stage2, "keywords", {}) or {}
     kernel_name = keywords.get("kernelName", "")
@@ -1589,7 +1492,7 @@ def get_2stage_cfgs(
         if get_flydsl_kernel_params(kn2) is None:
             raise NotImplementedError(f"missing FlyDSL W4A16 stage2 kernel {kn2}")
 
-        logger.warning(
+        logger.info(
             f"[fused_moe] no tuned FlyDSL W4A16 config for {keys}, "
             f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
         )
@@ -1682,7 +1585,7 @@ def get_2stage_cfgs(
                 f"missing FlyDSL W4A8 stage2 kernel for {_base_kn2}"
             )
 
-        logger.warning(
+        logger.info(
             f"[fused_moe] no tuned FlyDSL W4A8 config for {keys}, "
             f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
         )
@@ -1764,7 +1667,7 @@ def get_2stage_cfgs(
         if get_flydsl_kernel_params(kn2) is None:
             kn2 = _base_kn2
 
-        logger.warning(
+        logger.info(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
             f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
         )
@@ -1950,8 +1853,6 @@ def fused_moe_2stages(
     swiglu_limit=0.0,
     gate_mode=GateMode.SEPARATED.value,
     no_combine: bool = False,
-    debug_layer_id: Optional[int] = None,
-    debug_dump_dir: str = "",
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -2203,25 +2104,6 @@ def fused_moe_2stages(
         block_m=block_size_M,
         sorted_weights=None if no_combine else (sorted_weights if not doweight_stage1 else None),
         **extra_stage2_args,
-    )
-
-    _maybe_dump_stage_tensors(
-        debug_dump_dir=debug_dump_dir,
-        debug_layer_id=debug_layer_id,
-        token_num=token_num,
-        topk=topk,
-        metadata=metadata,
-        q_dtype_a=q_dtype_a,
-        q_dtype_w=q_dtype_w,
-        sorted_ids=sorted_ids,
-        sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids,
-        a1=a1,
-        a1_scale=a1_scale,
-        stage1_raw=stage1_raw,
-        a2=a2,
-        a2_scale=a2_scale,
-        stage2_out=stage2_out,
     )
 
     return stage2_out if no_combine else moe_out
@@ -2929,17 +2811,12 @@ def ck_moe_stage2(
         token_num = a2.shape[0]
         inter_dim = a2.shape[-1]
         model_dim = w2.shape[1]
-        if out is None:
-            out = torch.empty(
-                (token_num, topk, model_dim),
-                dtype=a2.dtype,
-                device=a2.device,
-            )
-        elif out.dim() == 2:
-            out = out.view(token_num, topk, model_dim)
+        out, flat_rows = _prepare_no_combine_output(
+            a2, out, token_num, topk, model_dim
+        )
 
-        flat_a2 = a2.reshape(token_num * topk, inter_dim).contiguous()
-        flat_out = out.view(token_num * topk, model_dim)
+        flat_a2 = a2.reshape(flat_rows, inter_dim).contiguous()
+        flat_out = out.view(flat_rows, model_dim)
         token_ids = torch.bitwise_and(sorted_token_ids, 0x00FFFFFF)
         slot_ids = torch.bitwise_right_shift(sorted_token_ids, 24)
         flat_sorted_token_ids = (token_ids * topk + slot_ids).to(
@@ -3011,17 +2888,12 @@ def cktile_moe_stage2(
         token_num = a2.shape[0]
         inter_dim = a2.shape[-1]
         model_dim = w2.shape[1]
-        if out is None:
-            out = torch.empty(
-                (token_num, topk, model_dim),
-                dtype=a2.dtype,
-                device=a2.device,
-            )
-        elif out.dim() == 2:
-            out = out.view(token_num, topk, model_dim)
+        out, flat_rows = _prepare_no_combine_output(
+            a2, out, token_num, topk, model_dim
+        )
 
-        flat_a2 = a2.reshape(token_num * topk, inter_dim).contiguous()
-        flat_out = out.view(token_num * topk, model_dim)
+        flat_a2 = a2.reshape(flat_rows, inter_dim).contiguous()
+        flat_out = out.view(flat_rows, model_dim)
         token_ids = torch.bitwise_and(sorted_token_ids, 0x00FFFFFF)
         slot_ids = torch.bitwise_right_shift(sorted_token_ids, 24)
         flat_sorted_token_ids = (token_ids * topk + slot_ids).to(

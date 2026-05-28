@@ -2418,10 +2418,13 @@ def compile_moe_gemm2(
     # Keep a distinct ABI tag so the compile cache never mixes with historical signatures.
     _gs_tag = f"_g{group_size}" if use_groupwise_scale else ""
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
+    # The epilogue branches on `accumulate` as a const_expr. Separate the
+    # direct-store no_combine binary from the default atomic-add binary.
+    _acc_tag = "" if accumulate else "_acc0"
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"{_gs_tag}{scale_tag}"
+        f"{_gs_tag}{scale_tag}{_acc_tag}"
         f"_abi4"  # explicit kernel name + MXFP4 W4A16 KPack/nibble layout
     ).replace("-", "_")
 
