@@ -66,5 +66,21 @@ def get_shared_memory_per_block(device=None, fallback_gfx: str = "") -> int:
     return _get_shared_memory_per_block_cached(device, fallback_gfx)
 
 
+@lru_cache(maxsize=1)
 def is_flydsl_available() -> bool:
-    return importlib.util.find_spec("flydsl") is not None
+    """Return True only if FlyDSL Python pkg *and* its compiled C extensions are loadable.
+
+    Subtle bug we hit before: ``flydsl._mlir`` is a PEP-420 namespace package
+    that ``find_spec`` happily returns even when the underlying ``_mlir_libs``
+    C extensions aren't on sys.path.  In that half-installed state the
+    dispatcher in ``aiter.fused_moe`` thought FlyDSL was available, took the
+    gfx1250 bypass, then segfaulted inside the kernel wrapper.  Force an
+    actual import to verify everything is wired up.
+    """
+    if importlib.util.find_spec("flydsl") is None:
+        return False
+    try:
+        import flydsl._mlir._mlir_libs._mlirDialectsFly  # noqa: F401
+    except Exception:
+        return False
+    return True
