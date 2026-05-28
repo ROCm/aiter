@@ -541,7 +541,9 @@ def compile_mixed_moe_gemm1(
                     _tile2_pad_sw = arith.constant(0, index=True)
 
                 if const_expr(mock_gate_only or gate_up_interleave):
-                    _gx = (n_in - _c2_idp_sw + _tile2_pad_sw + _c_tn_sw - _c1_sw) / _c_tn_sw
+                    _gx = (
+                        n_in - _c2_idp_sw + _tile2_pad_sw + _c_tn_sw - _c1_sw
+                    ) / _c_tn_sw
                 else:
                     _c2_sw = arith.constant(2, index=True)
                     _gx = (
@@ -2787,7 +2789,9 @@ def compile_mixed_moe_gemm1(
         else:
             _tile2_pad = arith.constant(0, index=True)
         if const_expr(mock_gate_only or gate_up_interleave):
-            gx = (inter_in - inter_dim_pad_total + _tile2_pad + tile_n_index - 1) / tile_n_index
+            gx = (
+                inter_in - inter_dim_pad_total + _tile2_pad + tile_n_index - 1
+            ) / tile_n_index
         else:
             gx = (
                 (inter_in - inter_dim_pad_total + _tile2_pad + 2 * tile_n_index - 1)
@@ -4048,16 +4052,12 @@ def compile_mixed_moe_gemm2(
                                                 results_=[mfma_res_ty],
                                                 has_else=True,
                                             )
-                                            with ir.InsertionPoint(
-                                                _if_mfma.then_block
-                                            ):
+                                            with ir.InsertionPoint(_if_mfma.then_block):
                                                 _new_acc = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                                                     mfma_res_ty, _mfma_operands
                                                 )
                                                 scf.YieldOp([_new_acc])
-                                            with ir.InsertionPoint(
-                                                _if_mfma.else_block
-                                            ):
+                                            with ir.InsertionPoint(_if_mfma.else_block):
                                                 scf.YieldOp([acc_list[acc_idx]])
                                             acc_list[acc_idx] = _if_mfma.results[0]
 
@@ -4364,9 +4364,7 @@ def compile_mixed_moe_gemm2(
                         a1_prefetch=a1_prefetch_ping,
                         prefetch_epilogue=True,
                         b_hi_loader=(
-                            _make_b_hi_loader(k_tail1_bk)
-                            if _b_split_enabled
-                            else None
+                            _make_b_hi_loader(k_tail1_bk) if _b_split_enabled else None
                         ),
                         runtime_tail_ku_idx=_tail_ku_idx_s2,
                     )
