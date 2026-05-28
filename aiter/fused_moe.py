@@ -1638,12 +1638,7 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
     ):
         # a8w4 mxfp8 activations + mxfp4 weights.
-        if metadata.fuse_quant == "fp8":
-            # FlyDSL stage1 fuses the fp8 quant of a1 internally, but the
-            # kernel dispatch requires an fp8-typed tensor.
-            a1 = hidden_states.to(dtypes.fp8)
-            a1_scale = torch.empty(0, dtype=torch.uint8, device=a1.device)
-        elif _MOE_A8W4_BYPASS_QUANT:
+        if _MOE_A8W4_BYPASS_QUANT:
             # Debug bypass: skip real quant, feed unit scales.
             a1 = hidden_states.to(dtypes.fp8)
             M = sorted_ids.shape[0]
