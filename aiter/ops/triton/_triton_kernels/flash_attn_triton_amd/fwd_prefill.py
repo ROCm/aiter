@@ -64,6 +64,21 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
                 ),
             ]
         elif arch.is_rdna:
+            # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni
+            # ViT prefill shape (B=1, S=3200, H=16, head_dim=72, fp16).
+            if arch.name == "gfx1151":
+                return [
+                    triton.Config(
+                        {
+                            "BLOCK_M": 128,
+                            "BLOCK_N": 64,
+                            "PRE_LOAD_V": False,
+                            "waves_per_eu": 2,
+                        },
+                        num_stages=1,
+                        num_warps=8,
+                    ),
+                ]
             BLOCK_N = 64 if arch.name == "gfx1100" else 32
             return [
                 triton.Config(
@@ -166,6 +181,21 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
                     )
                 ]
         elif arch.is_rdna:
+            # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni
+            # ViT prefill shape (B=1, S=3200, H=16, head_dim=72, fp16).
+            if arch.name == "gfx1151":
+                return [
+                    triton.Config(
+                        {
+                            "BLOCK_M": 128,
+                            "BLOCK_N": 64,
+                            "PRE_LOAD_V": False,
+                            "waves_per_eu": 2,
+                        },
+                        num_stages=1,
+                        num_warps=8,
+                    ),
+                ]
             BLOCK_N = 64 if arch.name == "gfx1100" else 32
             return [
                 triton.Config(
