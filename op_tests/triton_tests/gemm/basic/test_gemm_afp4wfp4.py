@@ -43,20 +43,21 @@ def un_shuffle_scales(scales_shuffled: torch.Tensor):
 
 
 def shuffle_scales_gfx1250(scales: torch.Tensor):
-    # LANES_PER_STRIPE = 16         128 B / 8 B-per-lane
-    # K_GROUPS_PER_LANE = 8         256 K elements / 32 K-per-group
-    # One 128-byte TDM stripe = 16 lanes × 8 scale-groups per lane
-    # (8 scale-groups × 32 K-per-group = 256 K elems contiguous per lane)
+    # PRESHUFFLE_FACTOR = 32        rows packed per stripe
+    # SCALE_KWIDTH      = 8         scale-groups contiguous per row
+    # (8 scale-groups × 32 K-per-group = 256 K elems contiguous per row)
+    PRESHUFFLE_FACTOR = 32
+    SCALE_KWIDTH = 8
     M, K_groups = scales.shape
 
     out = scales.view(
-        M // 16,
-        16,  # rows  →  (m_tile, lane)
-        K_groups // 4,
-        4,  # cols  →  (k_tile, kg_in_lane)
+        M // PRESHUFFLE_FACTOR,
+        PRESHUFFLE_FACTOR,  # rows  →  (m_tile, lane)
+        K_groups // SCALE_KWIDTH,
+        SCALE_KWIDTH,  # cols  →  (k_tile, kg_in_lane)
     )
     out = out.permute(0, 2, 1, 3).contiguous()  # (m_tile, k_tile, lane, kg_in_lane)
-    out = out.view(M // 16, K_groups * 16)
+    out = out.view(M // PRESHUFFLE_FACTOR, K_groups * PRESHUFFLE_FACTOR)
     return out
 
 

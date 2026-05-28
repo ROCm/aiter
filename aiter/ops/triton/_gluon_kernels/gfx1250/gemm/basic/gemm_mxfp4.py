@@ -86,12 +86,14 @@ def depreshuffle_scales(
     BLOCK_M: gl.constexpr,
     K_GROUPS: gl.constexpr,
 ):
-    LANES_PER_STRIPE: gl.constexpr = 16
-    KG_PER_STRIPE: gl.constexpr = 4
-    NUM_STRIPES: gl.constexpr = K_GROUPS // KG_PER_STRIPE
+    # Inverse of host shuffle_scales_gfx1250: PRESHUFFLE_FACTOR rows are packed
+    # per stripe, SCALE_KWIDTH scale-groups contiguous per row.
+    PRESHUFFLE_FACTOR: gl.constexpr = 32
+    SCALE_KWIDTH: gl.constexpr = 8
+    NUM_STRIPES: gl.constexpr = K_GROUPS // SCALE_KWIDTH
     return (
         smem_scales.reshape(
-            (BLOCK_M // LANES_PER_STRIPE, NUM_STRIPES, LANES_PER_STRIPE, KG_PER_STRIPE)
+            (BLOCK_M // PRESHUFFLE_FACTOR, NUM_STRIPES, PRESHUFFLE_FACTOR, SCALE_KWIDTH)
         )
         .permute((0, 2, 1, 3))
         .reshape((BLOCK_M, K_GROUPS))
@@ -168,14 +170,17 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
     BLOCK_K_BYTES: gl.constexpr = BLOCK_SIZE_K // FP4_ELEMS_PER_BYTE
     K_GROUPS: gl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_ELEMS
-    LANES_PER_TDM: gl.constexpr = 16
+    # Scale preshuffle: PRESHUFFLE_FACTOR rows packed per stripe, SCALE_KWIDTH
+    # scale-groups contiguous per row (must match the host shuffle_scales_gfx1250).
+    PRESHUFFLE_FACTOR: gl.constexpr = 32
+    SCALE_KWIDTH: gl.constexpr = 8
 
     gl.static_assert(K_GROUPS * 32 == BLOCK_SIZE_K)
 
     gl.static_assert(BLOCK_SIZE_K % 32 == 0)
-    gl.static_assert(BLOCK_SIZE_K % 128 == 0)  # K_GROUPS divisible by KG_PER_STRIPE
-    gl.static_assert(BLOCK_SIZE_M % LANES_PER_TDM == 0)
-    gl.static_assert(BLOCK_SIZE_N % LANES_PER_TDM == 0)
+    gl.static_assert(K_GROUPS % SCALE_KWIDTH == 0)  # K_GROUPS divisible by SCALE_KWIDTH
+    gl.static_assert(BLOCK_SIZE_M % PRESHUFFLE_FACTOR == 0)
+    gl.static_assert(BLOCK_SIZE_N % PRESHUFFLE_FACTOR == 0)
 
     pid = gl.program_id(axis=0)
     tiles_n = gl.cdiv(N, BLOCK_SIZE_N)
@@ -209,24 +214,24 @@ def gemm_mxfp4_preshuffle_gfx1250(
     k_scale_cols = K_elems // SCALE_GROUP_ELEMS
 
     as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_scale_ptr + tile_m * (BLOCK_SIZE_M // LANES_PER_TDM) * stride_as_m,
+        base=a_scale_ptr + tile_m * (BLOCK_SIZE_M // PRESHUFFLE_FACTOR) * stride_as_m,
         shape=(
-            gl.cdiv(M, LANES_PER_TDM) - tile_m * (BLOCK_SIZE_M // LANES_PER_TDM),
-            k_scale_cols * LANES_PER_TDM,
+            gl.cdiv(M, PRESHUFFLE_FACTOR) - tile_m * (BLOCK_SIZE_M // PRESHUFFLE_FACTOR),
+            k_scale_cols * PRESHUFFLE_FACTOR,
         ),
         strides=(stride_as_m, stride_as_k),
-        block_shape=(BLOCK_SIZE_M // LANES_PER_TDM, K_GROUPS * LANES_PER_TDM),
+        block_shape=(BLOCK_SIZE_M // PRESHUFFLE_FACTOR, K_GROUPS * PRESHUFFLE_FACTOR),
         layout=shared_S,
     )
 
     bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=b_scale_ptr + tile_n * (BLOCK_SIZE_N // LANES_PER_TDM) * stride_bs_n,
+        base=b_scale_ptr + tile_n * (BLOCK_SIZE_N // PRESHUFFLE_FACTOR) * stride_bs_n,
         shape=(
-            gl.cdiv(N, LANES_PER_TDM) - tile_n * (BLOCK_SIZE_N // LANES_PER_TDM),
-            k_scale_cols * LANES_PER_TDM,
+            gl.cdiv(N, PRESHUFFLE_FACTOR) - tile_n * (BLOCK_SIZE_N // PRESHUFFLE_FACTOR),
+            k_scale_cols * PRESHUFFLE_FACTOR,
         ),
         strides=(stride_bs_n, stride_bs_k),
-        block_shape=(BLOCK_SIZE_N // LANES_PER_TDM, K_GROUPS * LANES_PER_TDM),
+        block_shape=(BLOCK_SIZE_N // PRESHUFFLE_FACTOR, K_GROUPS * PRESHUFFLE_FACTOR),
         layout=shared_S,
     )
 
@@ -247,13 +252,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
     smem_AS = gl.allocate_shared_memory(
         a_scale_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_SIZE_M // LANES_PER_TDM, K_GROUPS * LANES_PER_TDM],
+        [NUM_BUFFERS, BLOCK_SIZE_M // PRESHUFFLE_FACTOR, K_GROUPS * PRESHUFFLE_FACTOR],
         layout=shared_S,
     )
 
     smem_BS = gl.allocate_shared_memory(
         b_scale_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_SIZE_N // LANES_PER_TDM, K_GROUPS * LANES_PER_TDM],
+        [NUM_BUFFERS, BLOCK_SIZE_N // PRESHUFFLE_FACTOR, K_GROUPS * PRESHUFFLE_FACTOR],
         layout=shared_S,
     )
 
@@ -283,10 +288,10 @@ def gemm_mxfp4_preshuffle_gfx1250(
             b_desc, [0, BLOCK_K_BYTES * 16]
         )
         as_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            as_desc, [0, K_GROUPS * LANES_PER_TDM]
+            as_desc, [0, K_GROUPS * PRESHUFFLE_FACTOR]
         )
         bs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            bs_desc, [0, K_GROUPS * LANES_PER_TDM]
+            bs_desc, [0, K_GROUPS * PRESHUFFLE_FACTOR]
         )
         load_idx += 1
 
@@ -329,10 +334,10 @@ def gemm_mxfp4_preshuffle_gfx1250(
             b_desc, [0, BLOCK_K_BYTES * 16]
         )
         as_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            as_desc, [0, K_GROUPS * LANES_PER_TDM]
+            as_desc, [0, K_GROUPS * PRESHUFFLE_FACTOR]
         )
         bs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            bs_desc, [0, K_GROUPS * LANES_PER_TDM]
+            bs_desc, [0, K_GROUPS * PRESHUFFLE_FACTOR]
         )
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
