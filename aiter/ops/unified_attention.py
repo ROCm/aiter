@@ -123,6 +123,8 @@ def _gen_unified_attention_fwd_kernel_fake(
     k_descale: float = 1.0,
     v_descale: float = 1.0,
     max_seqlen_q_override: int = 0,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
 ) -> None:
     return None
 
@@ -154,6 +156,8 @@ def _unified_attention_fwd_kernel(
     k_descale: float = 1.0,
     v_descale: float = 1.0,
     max_seqlen_q_override: int = 0,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
 ) -> None: ...
 
 
@@ -380,6 +384,12 @@ def unified_attention_fwd(
     # tighter decode_d{64,128}_m{16,32,128} tiers instead of falling through
     # to prefill_d{64,128}.
     max_seqlen_q: int = 0,
+    # Sliding-window attention bounds in vLLM/Flash-Attention semantics. -1
+    # means "unbounded" on that side. Combined with `mask_type == 2` (causal)
+    # the C++ layer maps this to `(window_size_left=-1, window_size_right=0,
+    # is_top_left=false)`
+    window_size_left: int = -1,
+    window_size_right: int = -1,
 ) -> None:
     explicit_override = (
         num_splits > 1
@@ -411,6 +421,8 @@ def unified_attention_fwd(
             k_descale,
             v_descale,
             max_seqlen_q,
+            window_size_left,
+            window_size_right,
         )
         return
 
@@ -440,6 +452,8 @@ def unified_attention_fwd(
             k_descale,
             v_descale,
             max_seqlen_q,
+            window_size_left,
+            window_size_right,
         )
         return
 
@@ -478,5 +492,7 @@ def unified_attention_fwd(
         k_descale,
         v_descale,
         max_seqlen_q,
+        window_size_left,
+        window_size_right,
     )
     _combine_splits(output, o_acc, lse_acc)
