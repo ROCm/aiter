@@ -6,17 +6,20 @@
 
 /**
  * @file opus/hip_minimal.hpp
- * @brief Minimal HIP host-side declarations for kernel launch and device management.
+ * @brief Minimal HIP replacement for <hip/hip_runtime.h>.
  *
- * Replaces <hip/hip_runtime.h> (~100K+ preprocessed lines) for the HOST pass only.
- * For device-side intrinsics, use opus::thread_id_x(), opus::block_id_x(), etc. from opus.hpp.
+ * Replaces <hip/hip_runtime.h> (~100K+ preprocessed lines) on BOTH passes
+ * for opus-based kernels:
+ *   * host pass: dim3, hipError_t, hipMalloc, hipLaunchKernelGGL, etc.
+ *   * device pass: __launch_bounds__ / __global__ / __device__ /
+ *     __forceinline__ keyword fallbacks.
  *
- * Usage (recommended separate host/device pattern):
- *   #ifdef __HIP_DEVICE_COMPILE__
- *   #include <opus/opus.hpp>        // device: template library + device intrinsics
- *   #else
- *   #include <opus/hip_minimal.hpp> // host: dim3, hipMalloc, hipLaunchKernelGGL, etc.
- *   #endif
+ * For device intrinsics (threadIdx / blockIdx / __syncthreads etc.),
+ * include <opus/opus.hpp> and use opus::thread_id_x() / opus::block_id_x()
+ * / opus::sync_threads() etc.
+ *
+ * Usage:
+ *   #include <opus/hip_minimal.hpp>   // both passes — drop-in replacement
  *
  * Compile: hipcc kernel.cu -I<aiter_root>/csrc/include -D__HIPCC_RTC__ ...
  */
@@ -33,16 +36,22 @@
     __launch_bounds_select__(__VA_ARGS__, __launch_bounds_impl1__, __launch_bounds_impl0__, )(__VA_ARGS__)
 #endif
 #ifndef __shared__
-#define __shared__ __attribute__((shared))
+#define __shared__      __attribute__((shared))
 #endif
 #ifndef __device__
-#define __device__ __attribute__((device))
+#define __device__      __attribute__((device))
 #endif
 #ifndef __global__
-#define __global__ __attribute__((global))
+#define __global__      __attribute__((global))
 #endif
 #ifndef __host__
-#define __host__ __attribute__((host))
+#define __host__        __attribute__((host))
+#endif
+#ifndef __forceinline__
+#define __forceinline__ inline __attribute__((always_inline))
+#endif
+#ifndef __noinline__
+#define __noinline__    __attribute__((noinline))
 #endif
 
 // ========== Host-side declarations (guarded to coexist with <hip/hip_runtime.h>) ==========

@@ -449,6 +449,19 @@ def _view_safe(t: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _ptr_view_safe(t: torch.Tensor):
+    """Pass only the device data pointer; shape is carried by explicit args."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    view = _view_safe(t)
+    type_name = type(view).__name__
+    module_name = type(view).__module__
+    if type_name == "FakeTensor" or "fake_tensor" in module_name:
+        return flyc.from_c_void_p(fx.Uint8, 0)
+    return flyc.from_c_void_p(fx.Uint8, view.data_ptr())
+
+
 def _s1_args_fp4(
     out,
     a,
@@ -473,17 +486,17 @@ def _s1_args_fp4(
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
-        _view_safe(out),
-        _view_safe(a),
-        _view_safe(w),
-        _view_safe(a_scale),
-        _view_safe(w_scale),
-        sorted_ids,
-        sorted_expert_ids,
-        sorted_weights,
-        num_valid_ids,
-        _bias,
-        out_scale_sorted,
+        _ptr_view_safe(out),
+        _ptr_view_safe(a),
+        _ptr_view_safe(w),
+        _ptr_view_safe(a_scale),
+        _ptr_view_safe(w_scale),
+        _ptr_view_safe(sorted_ids),
+        _ptr_view_safe(sorted_expert_ids),
+        _ptr_view_safe(sorted_weights),
+        _ptr_view_safe(num_valid_ids),
+        _ptr_view_safe(_bias),
+        _ptr_view_safe(out_scale_sorted),
         token_num,
         n_in,
         k_in,
@@ -511,15 +524,15 @@ def _s1_args_std(
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
-        out,
-        a,
-        w,
-        a_scale,
-        w_scale,
-        sorted_ids,
-        sorted_expert_ids,
-        sorted_weights,
-        num_valid_ids,
+        _ptr_view_safe(out),
+        _ptr_view_safe(a),
+        _ptr_view_safe(w),
+        _ptr_view_safe(a_scale),
+        _ptr_view_safe(w_scale),
+        _ptr_view_safe(sorted_ids),
+        _ptr_view_safe(sorted_expert_ids),
+        _ptr_view_safe(sorted_weights),
+        _ptr_view_safe(num_valid_ids),
         token_num,
         n_in,
         k_in,
@@ -554,16 +567,16 @@ def _s2_args_fp4(
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
-        _view_safe(target),
-        _view_safe(a),
-        _view_safe(w),
-        _view_safe(a_scale),
-        _view_safe(w_scale),
-        sorted_ids,
-        sorted_expert_ids,
-        sorted_weights,
-        num_valid_ids,
-        _bias,
+        _ptr_view_safe(target),
+        _ptr_view_safe(a),
+        _ptr_view_safe(w),
+        _ptr_view_safe(a_scale),
+        _ptr_view_safe(w_scale),
+        _ptr_view_safe(sorted_ids),
+        _ptr_view_safe(sorted_expert_ids),
+        _ptr_view_safe(sorted_weights),
+        _ptr_view_safe(num_valid_ids),
+        _ptr_view_safe(_bias),
         token_num,
         n_in,
         k_in,
@@ -591,15 +604,15 @@ def _s2_args_std(
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
-        target,
-        a,
-        w,
-        a_scale,
-        w_scale,
-        sorted_ids,
-        sorted_expert_ids,
-        sorted_weights,
-        num_valid_ids,
+        _ptr_view_safe(target),
+        _ptr_view_safe(a),
+        _ptr_view_safe(w),
+        _ptr_view_safe(a_scale),
+        _ptr_view_safe(w_scale),
+        _ptr_view_safe(sorted_ids),
+        _ptr_view_safe(sorted_expert_ids),
+        _ptr_view_safe(sorted_weights),
+        _ptr_view_safe(num_valid_ids),
         token_num,
         n_in,
         k_in,
@@ -919,13 +932,13 @@ def flydsl_moe_stage1(
         _run_compiled(
             _silu_fused_k,
             (
-                tmp_out.view(-1, inter_dim * 2),
-                out.view(-1).view(torch.uint8),
-                out_scale_sorted_flat,
-                sorted_token_ids,
-                num_valid_ids,
-                topk_ids_arg,
-                bias_arg,
+                _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
+                _ptr_view_safe(out.view(-1).view(torch.uint8)),
+                _ptr_view_safe(out_scale_sorted_flat),
+                _ptr_view_safe(sorted_token_ids),
+                _ptr_view_safe(num_valid_ids),
+                _ptr_view_safe(topk_ids_arg),
+                _ptr_view_safe(bias_arg),
                 token_num,
                 num_sorted_rows,
                 torch.cuda.current_stream(),
@@ -944,13 +957,13 @@ def flydsl_moe_stage1(
         _run_compiled(
             _silu_fused_k,
             (
-                tmp_out.view(-1, inter_dim * 2),
-                out.view(-1).view(torch.uint8),
-                out_scale_sorted_flat,
-                sorted_token_ids,
-                num_valid_ids,
-                topk_ids_arg,
-                bias_arg,
+                _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
+                _ptr_view_safe(out.view(-1).view(torch.uint8)),
+                _ptr_view_safe(out_scale_sorted_flat),
+                _ptr_view_safe(sorted_token_ids),
+                _ptr_view_safe(num_valid_ids),
+                _ptr_view_safe(topk_ids_arg),
+                _ptr_view_safe(bias_arg),
                 token_num,
                 num_sorted_rows,
                 torch.cuda.current_stream(),
@@ -967,13 +980,13 @@ def flydsl_moe_stage1(
         _run_compiled(
             _silu_fused_k,
             (
-                tmp_out.view(-1, inter_dim * 2),
-                out.view(-1).view(torch.uint8),
-                out_scale_sorted_flat,
-                sorted_token_ids,
-                num_valid_ids,
-                topk_ids_arg,
-                bias_arg,
+                _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
+                _ptr_view_safe(out.view(-1).view(torch.uint8)),
+                _ptr_view_safe(out_scale_sorted_flat),
+                _ptr_view_safe(sorted_token_ids),
+                _ptr_view_safe(num_valid_ids),
+                _ptr_view_safe(topk_ids_arg),
+                _ptr_view_safe(bias_arg),
                 token_num,
                 num_sorted_rows,
                 torch.cuda.current_stream(),

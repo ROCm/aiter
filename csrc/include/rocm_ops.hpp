@@ -281,6 +281,29 @@ namespace py = pybind11;
           py::arg("x_scale") = std::nullopt, \
           py::arg("w_scale") = std::nullopt);
 
+#define OPUS_GEMM_PYBIND                          \
+    m.def("opus_gemm",                            \
+          &opus_gemm,                             \
+          "opus_gemm",                            \
+          py::arg("XQ"),                          \
+          py::arg("WQ"),                          \
+          py::arg("Y"),                           \
+          py::arg("group_layout") = std::nullopt, \
+          py::arg("x_scale") = std::nullopt,      \
+          py::arg("w_scale") = std::nullopt,      \
+          py::arg("bias") = std::nullopt);
+
+#define OPUS_GEMM_A16W16_TUNE_PYBIND             \
+    m.def("opus_gemm_a16w16_tune",               \
+          &opus_gemm_a16w16_tune,                \
+          "opus_gemm_a16w16_tune",               \
+          py::arg("XQ"),                          \
+          py::arg("WQ"),                          \
+          py::arg("Y"),                           \
+          py::arg("bias") = std::nullopt,         \
+          py::arg("kernelId") = 0,                \
+          py::arg("splitK")   = 0);
+
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
           &aiter::swap_blocks,                                                      \
@@ -1411,8 +1434,8 @@ namespace py = pybind11;
           py::arg("block_m"),                                            \
           py::arg("shuffle_scale") = false,                              \
           py::arg("transpose_out") = false);                             \
-    m.def("fused_dynamic_mxfp4_quant_moe_sort_hip",                      \
-          &aiter::fused_dynamic_mxfp4_quant_moe_sort_hip,                \
+    m.def("fused_dynamic_mx_quant_moe_sort_hip",                      \
+          &aiter::fused_dynamic_mx_quant_moe_sort_hip,                \
           py::arg("out"),                                                \
           py::arg("scales"),                                             \
           py::arg("input"),                                              \
@@ -1736,7 +1759,8 @@ namespace py = pybind11;
           py::arg("k_scale"),                                   \
           py::arg("v_scale"),                                   \
           py::arg("max_tokens_per_batch") = 0);                 \
-    m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);
+    m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);                  \
+    m.def("fused_qk_norm_rope_1way", &aiter::fused_qk_norm_rope_1way);
 
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
