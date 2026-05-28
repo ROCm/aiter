@@ -642,33 +642,6 @@ class GroupCoordinator:
         input_size = input_.size()
 
         is_last_dim = dim == input_.dim() - 1
-        input_bytes = input_.numel() * input_.element_size()
-        # Measured small-message guards where custom all-gather is slower than
-        # RCCL. Keep larger aligned tensors on the custom path.
-        use_custom = use_custom and not (
-            (
-                world_size == 8
-                and input_.dtype == torch.int32
-                and input_.dim() > 1
-                and input_bytes <= 32768
-            )
-            or (
-                world_size == 8
-                and input_.dtype == torch.int64
-                and dim == 0
-                and input_.dim() > 1
-                and input_bytes <= 65536
-            )
-            or (
-                world_size == 2
-                and input_.dtype == torch.float32
-                and dim == 0
-                and input_.dim() == 1
-                and input_bytes <= 64
-            )
-            or (world_size == 8 and input_.dtype == torch.uint8 and input_bytes <= 8192)
-            or (world_size == 8 and input_.dtype == torch.int8 and input_bytes <= 8192)
-        )
         can_use_custom = use_custom and (
             dim == 0
             or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)

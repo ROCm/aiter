@@ -134,9 +134,16 @@ def dtype_name(dtype):
     return str(dtype)
 
 
-def time_all_gather(x, use_custom, dim, warmup, iters):
+def time_all_gather(x, use_custom, dim, warmup, iters, force_direct_custom=False):
+    custom_dim = dim if dim >= 0 else x.dim() + dim
+
+    def run_once():
+        if use_custom and force_direct_custom:
+            return get_tp_group()._all_gather_out_place(x, custom_dim)
+        return tensor_model_parallel_all_gather(x, use_custom=use_custom, dim=dim)
+
     for _ in range(warmup):
-        tensor_model_parallel_all_gather(x, use_custom=use_custom, dim=dim)
+        run_once()
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
@@ -144,7 +151,7 @@ def time_all_gather(x, use_custom, dim, warmup, iters):
     start.record()
     out = None
     for _ in range(iters):
-        out = tensor_model_parallel_all_gather(x, use_custom=use_custom, dim=dim)
+        out = run_once()
     end.record()
     end.synchronize()
     local_us = start.elapsed_time(end) * 1000.0 / iters
@@ -160,6 +167,7 @@ def sweep_worker(
     cases,
     warmup,
     iters,
+    force_direct_custom=False,
     distributed_init_method: Optional[str] = None,
 ):
     device = torch.device(f"cuda:{rank_id}")
@@ -209,7 +217,12 @@ def sweep_worker(
                 )
 
             custom_out, custom_us = time_all_gather(
-                x, use_custom=True, dim=dim, warmup=warmup, iters=iters
+                x,
+                use_custom=True,
+                dim=dim,
+                warmup=warmup,
+                iters=iters,
+                force_direct_custom=force_direct_custom,
             )
 
             custom_err = check_equal(
@@ -219,43 +232,17 @@ def sweep_worker(
             )
 
             input_bytes = x.numel() * x.element_size()
-            custom_eligible = (
-                input_bytes % 16 == 0
-                and (
-                    normalized_dim == 0
-                    or (
-                        normalized_dim == x.dim() - 1
-                        and x.shape[-1] * x.element_size() % 16 == 0
-                    )
-                )
-                and not (
-                    (
-                        tp_size == 8
-                        and dtype == torch.int32
-                        and x.dim() > 1
-                        and input_bytes <= 32768
-                    )
-                    or (
-                        tp_size == 8
-                        and dtype == torch.int64
-                        and normalized_dim == 0
-                        and x.dim() > 1
-                        and input_bytes <= 65536
-                    )
-                    or (
-                        tp_size == 2
-                        and dtype == torch.float32
-                        and normalized_dim == 0
-                        and x.dim() == 1
-                        and input_bytes <= 64
-                    )
-                    or (tp_size == 8 and dtype == torch.uint8 and input_bytes <= 8192)
-                    or (tp_size == 8 and dtype == torch.int8 and input_bytes <= 8192)
+            direct_supported = input_bytes % 16 == 0 and (
+                normalized_dim == 0
+                or (
+                    normalized_dim == x.dim() - 1
+                    and x.shape[-1] * x.element_size() % 16 == 0
                 )
             )
+            custom_eligible = direct_supported
             speedup = (
                 baseline_us / custom_us
-                if custom_eligible and baseline_us is not None and custom_us > 0
+                if direct_supported and baseline_us is not None and custom_us > 0
                 else None
             )
             rows.append(
@@ -265,6 +252,7 @@ def sweep_worker(
                     "dtype": dtype_name_value,
                     "dim": dim,
                     "input_bytes": input_bytes,
+                    "direct_supported": direct_supported,
                     "custom_eligible": custom_eligible,
                     "baseline_us": baseline_us,
                     "custom_us": custom_us,
@@ -290,6 +278,7 @@ def allgather_sweep(
     dims,
     warmup,
     iters,
+    force_direct_custom=False,
     distributed_init_method: Optional[str] = None,
 ):
     cases = [
@@ -309,6 +298,7 @@ def allgather_sweep(
                 cases,
                 warmup,
                 iters,
+                force_direct_custom,
                 distributed_init_method,
             ),
         )
@@ -573,6 +563,11 @@ parser.add_argument(
     default=None,
     help="Optional CSV path for sweep results.",
 )
+parser.add_argument(
+    "--force-direct-custom",
+    action="store_true",
+    help="Benchmark the custom all-gather kernel directly for crossover analysis.",
+)
 
 
 if __name__ == "__main__":
@@ -597,6 +592,7 @@ if __name__ == "__main__":
                 l_dim,
                 args.warmup,
                 args.iters,
+                args.force_direct_custom,
                 distributed_init_method=get_distributed_init_method(
                     get_ip(), get_open_port()
                 ),
@@ -608,6 +604,7 @@ if __name__ == "__main__":
             "dtype",
             "dim",
             "input_bytes",
+            "direct_supported",
             "custom_eligible",
             "baseline_us",
             "custom_us",
