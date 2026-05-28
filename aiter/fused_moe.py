@@ -964,7 +964,13 @@ def get_2stage_cfgs(
             BLOCK_SIZE_M
             if run_1stage
             else (
-                (64 if token > 32 else 16)
+                (
+                    # nopad path: inter_dim 非 128 对齐但 32 对齐 → 走 id 5/6 (NPerBlock=32, MNPerXDLArg=32)
+                    (64 if token > 32 else 32)
+                    if (inter_dim % 128 != 0 and inter_dim % 32 == 0)
+                    # 默认 padded path
+                    else (64 if token > 32 else 16)
+                )
                 if q_type == QuantType.per_1x128
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
