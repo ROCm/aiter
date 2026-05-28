@@ -648,10 +648,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                         constexpr uint32_t iter       = i.value;
                         constexpr uint32_t kOaccuBase = k_o_begin + iter * 16u;
                         constexpr uint32_t kColOff    = iter * (2u * T::kBlockN);
-                        o_manager.template output_to_vram_pair<kOaccuBase, kColOff>(
+                        o_manager.template output_to_vram_pair<kOaccuBase, kColOff, true>(
                             params.final_output.raw_ptr,
                             warp_idx,
                             qo_start,
+                            qo_end,
                             p_lds_o,
                             num_qheads);
                     });
@@ -662,10 +663,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                         constexpr uint32_t iter       = i.value;
                         constexpr uint32_t kOaccuBase = k_o_begin + iter * 16u;
                         constexpr uint32_t kColOff    = iter * (2u * T::kBlockN);
-                        split_o_manager.template output_to_vram_pair<kOaccuBase, kColOff>(
+                        split_o_manager.template output_to_vram_pair<kOaccuBase, kColOff, false>(
                             params.split_output.raw_ptr,
                             warp_idx,
                             static_cast<uint32_t>(partial_qo_loc),
+                            0,
                             p_lds_o,
                             num_qheads);
                     });
@@ -899,7 +901,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
         }
 
-        (void)qo_end;
         (void)out_br;
         (void)split_out_br;
     }

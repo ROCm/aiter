@@ -3399,10 +3399,12 @@ class OManager16bitsV3
 
     // GPR_START: starting GPR of the 16x64 wave-tile (16 fp32/lane = 16 vgprs).
     // kWaveTileColOff: element-wise col offset in the output buffer (multiple of 64).
-    template <uint32_t GPR_START, uint32_t kWaveTileColOff>
+    // See OManager16bitsV1 for the kCheckOOB contract.
+    template <uint32_t GPR_START, uint32_t kWaveTileColOff, bool kCheckOOB>
     __device__ __forceinline__ void output_to_vram_pair(const out_t* p_output,
                                                         const uint32_t warp_idx,
                                                         const uint32_t qo_start,
+                                                        const uint32_t qo_end,
                                                         const uintptr_t p_lds,
                                                         const uint32_t num_qheads)
     {
@@ -3438,15 +3440,20 @@ class OManager16bitsV3
         const uint32_t v_offset_lds_ld = get_v_offset_lds(row_lds_ld, col_lds_ld);
 
         // ---- VRAM store side: straight ----
-        const uint32_t row_vram_st = row_lds_ld + qo_start * num_qheads + warp_idx * kNumRows;
+        const uint32_t row_vram_st = row_lds_ld + warp_idx * kNumRows;
         const uint32_t col_vram_st = lane_in_row * kVramStElemPerLane;
         const uint32_t v_offset_vram_st =
             (row_vram_st * T::kVoHeadDim + col_vram_st) * sizeof(out_t);
 
-        const uintptr_t out_as_int = reinterpret_cast<uintptr_t>(p_output);
-        const uint64_t out_as_u64  = static_cast<uint64_t>(out_as_int);
+        const uintptr_t p_output_batch =
+            reinterpret_cast<uintptr_t>(p_output) +
+            uint64_t(qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t);
+        const uint32_t num_records =
+            kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
+                      : 0xFFFFFFFFu;
         const hk::buffer_resource out_br =
-            hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
+                                     num_records, 0x00020000);
 
         if constexpr(std::is_same_v<out_t, hk::bf16>)
         {
@@ -3523,10 +3530,12 @@ class OManager32bitsV3
         return T::kNumWarps * get_lds_size_per_warp_in_byte(); // 8*4352=34816
     }
 
-    template <uint32_t GPR_START, uint32_t kWaveTileColOff>
+    // See OManager16bitsV1 for the kCheckOOB contract.
+    template <uint32_t GPR_START, uint32_t kWaveTileColOff, bool kCheckOOB>
     __device__ __forceinline__ void output_to_vram_pair(const out_t* p_output,
                                                         const uint32_t warp_idx,
                                                         const uint32_t qo_start,
+                                                        const uint32_t qo_end,
                                                         const uintptr_t p_lds,
                                                         const uint32_t num_qheads)
     {
@@ -3559,15 +3568,20 @@ class OManager32bitsV3
         const uint32_t v_offset_lds_ld = get_v_offset_lds(row_lds_ld, col_lds_ld);
 
         // ---- VRAM store: straight ----
-        const uint32_t row_vram_st = row_lds_ld + qo_start * num_qheads + warp_idx * kNumRows;
+        const uint32_t row_vram_st = row_lds_ld + warp_idx * kNumRows;
         const uint32_t col_vram_st = lane_in_row * kVramStElemPerLane;
         const uint32_t v_offset_vram_st =
             (row_vram_st * T::kVoHeadDim + col_vram_st) * sizeof(out_t);
 
-        const uintptr_t out_as_int = reinterpret_cast<uintptr_t>(p_output);
-        const uint64_t out_as_u64  = static_cast<uint64_t>(out_as_int);
+        const uintptr_t p_output_batch =
+            reinterpret_cast<uintptr_t>(p_output) +
+            uint64_t(qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t);
+        const uint32_t num_records =
+            kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
+                      : 0xFFFFFFFFu;
         const hk::buffer_resource out_br =
-            hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
+                                     num_records, 0x00020000);
 
         if constexpr(std::is_same_v<out_t, float>)
         {
@@ -3649,10 +3663,12 @@ class OManager32bitsV3NoStage
         return 0;
     }
 
-    template <uint32_t GPR_START, uint32_t kWaveTileColOff>
+    // See OManager16bitsV1 for the kCheckOOB contract.
+    template <uint32_t GPR_START, uint32_t kWaveTileColOff, bool kCheckOOB>
     __device__ __forceinline__ void output_to_vram_pair(const out_t* p_output,
                                                         const uint32_t warp_idx,
                                                         const uint32_t qo_start,
+                                                        const uint32_t qo_end,
                                                         const uintptr_t /*p_lds*/,
                                                         const uint32_t num_qheads)
     {
@@ -3664,15 +3680,19 @@ class OManager32bitsV3NoStage
         const uint32_t row      = lane_idx % kNumRows;          // 0..15
         const uint32_t col_quad = lane_idx / kNumRows;          // 0..3
 
-        const uint32_t vram_row =
-            row + qo_start * num_qheads + warp_idx * kNumRows;
+        const uint32_t vram_row = row + warp_idx * kNumRows;
         const uint32_t row_base_bytes =
             vram_row * T::kVoHeadDim * sizeof(out_t);
 
-        const uintptr_t out_as_int = reinterpret_cast<uintptr_t>(p_output);
-        const uint64_t  out_as_u64 = static_cast<uint64_t>(out_as_int);
+        const uintptr_t p_output_batch =
+            reinterpret_cast<uintptr_t>(p_output) +
+            uint64_t(qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t);
+        const uint32_t num_records =
+            kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
+                      : 0xFFFFFFFFu;
         const hk::buffer_resource out_br =
-            hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
+                                     num_records, 0x00020000);
 
         if constexpr(std::is_same_v<out_t, float>)
         {
