@@ -25,7 +25,6 @@ from aiter.fused_moe import (
     fused_moe,
     fused_moe_fake,
     torch_moe_stage1,
-    torch_moe_stage2_no_combine,
 )
 
 
