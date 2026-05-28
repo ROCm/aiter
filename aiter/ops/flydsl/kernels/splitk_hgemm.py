@@ -215,13 +215,13 @@ def compile_hgemm_kernel(
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hgemm_kernel(
-        C: fx.Tensor,
-        A: fx.Tensor,
-        B: fx.Tensor,
-        BIAS: fx.Tensor,
+        C: fx.Pointer,
+        A: fx.Pointer,
+        B: fx.Pointer,
+        BIAS: fx.Pointer,
         m: fx.Int32,
-        semaphore: fx.Tensor,
-        signal: fx.Tensor,
+        semaphore: fx.Pointer,
+        signal: fx.Pointer,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
@@ -282,8 +282,7 @@ def compile_hgemm_kernel(
         c_frags = [acc_init] * C_FRAGS_LEN
 
         def get_llvm_ptr(ptr, offset, dtype_bytes):
-            base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, ptr)
-            base_ptr = llvm.PtrToIntOp(_i64_type, base_ptr).result
+            base_ptr = arith.index_cast(_i64_type, fx.ptrtoint(ptr))
             byte_offset = arith.index_cast(
                 T.i64, fx.Index(offset) * fx.Index(dtype_bytes)
             )
@@ -863,8 +862,7 @@ def compile_hgemm_kernel(
         if const_expr(IS_SPLIT_K):
             split_k_barrier()
             out_raw = C
-            out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
-            out_base_int = llvm.PtrToIntOp(_i64_type, out_base_ptr).result
+            out_base_int = arith.index_cast(_i64_type, fx.ptrtoint(out_raw))
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
@@ -943,13 +941,13 @@ def compile_hgemm_kernel(
 
     @flyc.jit
     def launch_hgemm_kernel(
-        C: fx.Tensor,
-        A: fx.Tensor,
-        B: fx.Tensor,
-        BIAS: fx.Tensor,
+        C: fx.Pointer,
+        A: fx.Pointer,
+        B: fx.Pointer,
+        BIAS: fx.Pointer,
         m: fx.Int32,
-        semaphore: fx.Tensor,
-        signal: fx.Tensor,
+        semaphore: fx.Pointer,
+        signal: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
