@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 import torch
@@ -40,6 +40,7 @@ def reduce_scatter(
     x,
     withGraph=False,
     use_custom=False,
+    dim=0,
     distributed_init_method: Optional[str] = None,
 ):
     device = torch.device(f"cuda:{rankID}")
@@ -65,7 +66,9 @@ def reduce_scatter(
         graph = torch.cuda.CUDAGraph()
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_reduce_scatter(x, use_custom=use_custom)
+                out = tensor_model_parallel_reduce_scatter(
+                    x, use_custom=use_custom, dim=dim
+                )
         out.fill_(0)
 
         @perftest()
@@ -73,14 +76,17 @@ def reduce_scatter(
             graph.replay()
 
         _, us = run_ca()
-        out = (out, us)
+        out = (rankID, out.cpu(), us)
     else:
 
         @perftest()
         def run_ca(x):
-            return tensor_model_parallel_reduce_scatter(x, use_custom=use_custom)
+            return tensor_model_parallel_reduce_scatter(
+                x, use_custom=use_custom, dim=dim
+            )
 
-        out = run_ca(x)
+        result, us = run_ca(x)
+        out = (rankID, result.cpu(), us)
 
     # destroy
     if dist.is_initialized():
@@ -93,10 +99,9 @@ def reduce_scatter(
 def get_reduce_scatter_output(
     tp_size,
     pp_size,
-    shape,
-    dtype,
-    rand_seed,
+    input_list,
     use_custom,
+    dim=0,
     distributed_init_method: Optional[str] = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -104,11 +109,6 @@ def get_reduce_scatter_output(
     pool = Pool(processes=tp_size)
     rets = []
     for i in range(tp_size):
-        # input = torch.randn(shape, dtype=dtype, device="cuda")
-        input_ = torch.ones(shape, dtype=dtype, device="cuda")
-        n = input_.numel()
-        chunk_size = n // 8
-        input = rand_seed.repeat_interleave(chunk_size)
         rets.append(
             pool.apply_async(
                 reduce_scatter,
@@ -116,42 +116,44 @@ def get_reduce_scatter_output(
                     tp_size,
                     pp_size,
                     i,
-                    input,
+                    input_list[i],
                     False,
                     use_custom,
-                    # 1,
+                    dim,
                     distributed_init_method,
                 ),
             )
-            # pool.apply_async(call_aiter_allgather_naive, args=(tp_size, pp_size, i, input, 1))
         )
     pool.close()
     pool.join()
 
-    ar_rslt = []
+    results = {}
     rets = [el.get() for el in rets]
-    for out, us in rets:
-        ar_rslt.append(out)
-    return ar_rslt
+    for rankID, out, us in rets:
+        results[rankID] = out
+    return results
 
 
 def reduce_scatter_acctest(
-    tp_size, pp_size, shape, dtype, distributed_init_method: Optional[str] = None
+    tp_size, pp_size, shape, dtype, dim=0,
+    distributed_init_method: Optional[str] = None,
 ):
-    rand_seed = torch.randint(1, 16, (tp_size,), dtype=dtype, device="cuda")
+    input_list = [torch.randn(shape, dtype=dtype) for _ in range(tp_size)]
     dist_rslt = get_reduce_scatter_output(
-        tp_size, pp_size, shape, dtype, rand_seed, False, distributed_init_method
+        tp_size, pp_size, input_list, False, dim, distributed_init_method
     )
     aiter_rslt = get_reduce_scatter_output(
-        tp_size, pp_size, shape, dtype, rand_seed, True, distributed_init_method
+        tp_size, pp_size, input_list, True, dim, distributed_init_method
     )
+
     error = 0.0
-    for i in range(len(dist_rslt)):
-        error += checkAllclose(dist_rslt[i], aiter_rslt[i])
+    for rankID in range(tp_size):
+        msg = f"rank {rankID} dist vs aiter (dim={dim})"
+        error += checkAllclose(dist_rslt[rankID], aiter_rslt[rankID], msg=msg)
     if error == 0:
-        print("accuracy pass")
+        print(f"accuracy pass (dim={dim})")
     else:
-        print("accuracy failed")
+        print(f"accuracy failed (dim={dim})")
 
 
 @benchmark()
@@ -162,13 +164,13 @@ def reduce_scatter_perftest(
     dtype,
     withGraph=False,
     use_custom=False,
+    dim=0,
     distributed_init_method: Optional[str] = None,
 ):
-    print(f"run perf test, use custom allgather {use_custom}")
+    print(f"run perf test, use_custom={use_custom}, dim={dim}")
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     pool = Pool(processes=tp_size)
-    ref = torch.zeros(shape, dtype=dtype)
     rets = []
     input_list = []
     for i in range(tp_size):
@@ -184,33 +186,42 @@ def reduce_scatter_perftest(
                     x,
                     withGraph,
                     use_custom,
+                    dim,
                     distributed_init_method,
                 ),
             )
         )
     pool.close()
     pool.join()
-    ref = input_list[0]
-    for i in range(tp_size - 1):
-        ref = torch.concat((ref, input_list[i + 1]), -1)
+
+    ref = input_list[0].clone()
+    for i in range(1, tp_size):
+        ref = ref + input_list[i]
+    ref_chunks = ref.chunk(tp_size, dim=dim)
 
     rets = [el.get() for el in rets]
-    all_us = [us for _, us in rets]
-    for out, us in rets:
-        msg = f"reduce_scatter (use custom {use_custom}): {shape=} {dtype=} {withGraph=} {us:>8.2f}"
-        print(msg)
+    all_us = [us for _, _, us in rets]
+    max_err = 0.0
+    for rankID, out, us in rets:
+        expected = ref_chunks[rankID]
+        msg = (
+            f"reduce_scatter (use_custom={use_custom}, dim={dim}): "
+            f"{shape=} {dtype=} {withGraph=} {us:>8.2f}"
+        )
+        err = checkAllclose(expected, out, rtol=0.05, atol=0.2, msg=msg)
+        max_err = max(max_err, err)
     return {
         "min_us": min(all_us),
         "max_us": max(all_us),
+        "err": max_err,
     }
 
 
 l_dtype = ["bf16"]
 l_shape = [
-    # (4096, 2048)
     (128, 8192),
     (32768, 8192),
-    # (16, 512)
+    (4, 8, 8192),
 ]
 
 parser = argparse.ArgumentParser(description="config input of test")
@@ -244,33 +255,46 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
+    l_dim = [0, 1, -1]
+    tp_size = 8
     df = []
     for dtype in l_dtype:
         for shape in l_shape:
-            print(f"accuracy test of dtype:{dtype}, shape:{shape}")
-            reduce_scatter_acctest(
-                8,
-                1,
-                shape,
-                dtype,
-                distributed_init_method=get_distributed_init_method(
-                    get_ip(), get_open_port()
-                ),
-            )
-            print(f"perf test of dtype:{dtype}, shape:{shape}")
-            for use_custom in [True, False]:
-                ret = reduce_scatter_perftest(
-                    8,
+            for dim in l_dim:
+                actual_dim = dim if dim >= 0 else dim + len(shape)
+                if shape[actual_dim] % tp_size != 0:
+                    print(
+                        f"skip shape={shape} dim={dim}: "
+                        f"shape[{actual_dim}]={shape[actual_dim]} "
+                        f"not divisible by tp_size={tp_size}"
+                    )
+                    continue
+                print(f"accuracy test of dtype:{dtype}, shape:{shape}, dim:{dim}")
+                reduce_scatter_acctest(
+                    tp_size,
                     1,
                     shape,
                     dtype,
-                    withGraph=False,
-                    use_custom=use_custom,
+                    dim=dim,
                     distributed_init_method=get_distributed_init_method(
                         get_ip(), get_open_port()
                     ),
                 )
-                df.append(ret)
+                print(f"perf test of dtype:{dtype}, shape:{shape}, dim:{dim}")
+                for use_custom in [True, False]:
+                    ret = reduce_scatter_perftest(
+                        tp_size,
+                        1,
+                        shape,
+                        dtype,
+                        withGraph=False,
+                        use_custom=use_custom,
+                        dim=dim,
+                        distributed_init_method=get_distributed_init_method(
+                            get_ip(), get_open_port()
+                        ),
+                    )
+                    df.append(ret)
     df = pd.DataFrame(df)
     show_cols = [
         "tp_size",
@@ -278,8 +302,10 @@ if __name__ == "__main__":
         "dtype",
         "withGraph",
         "use_custom",
+        "dim",
         "min_us",
         "max_us",
+        "err",
     ]
     show_cols = [c for c in show_cols if c in df.columns]
     logger.info(
