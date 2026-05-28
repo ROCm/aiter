@@ -308,6 +308,8 @@ def compile_flydsl_moe_stage1(
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
         from .moe_common import GateMode
 
+        # model_dim_pad / inter_dim_pad are runtime args passed at launch time
+        # (see _s1_args_fp4); no longer baked into the AOT compile.
         return compile_mixed_moe_gemm1(
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -327,8 +329,6 @@ def compile_flydsl_moe_stage1(
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
             gate_mode=GateMode(gate_mode),
-            model_dim_pad=model_dim_pad,
-            inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
@@ -388,6 +388,8 @@ def compile_flydsl_moe_stage2(
     if b_dtype == "fp4":
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
+        # model_dim_pad / inter_dim_pad are runtime args passed at launch time
+        # (see _s2_args_fp4); no longer baked into the AOT compile.
         return compile_mixed_moe_gemm2(
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -404,8 +406,6 @@ def compile_flydsl_moe_stage2(
             persist_m=persist_m,
             sort_block_m=sort_block_m,
             b_nt=b_nt,
-            model_dim_pad=model_dim_pad,
-            inter_dim_pad=inter_dim_pad,
             xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
         )
@@ -467,6 +467,8 @@ def _s1_args_fp4(
     dev,
     bias=None,
     stream=None,
+    model_dim_pad=0,
+    inter_dim_pad=0,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
@@ -488,6 +490,8 @@ def _s1_args_fp4(
         n_in,
         k_in,
         size_expert_ids_in,
+        model_dim_pad,
+        inter_dim_pad,
         stream,
     )
 
@@ -545,6 +549,8 @@ def _s2_args_fp4(
     dev,
     bias=None,
     stream=None,
+    model_dim_pad=0,
+    inter_dim_pad=0,
 ):
     _bias = (
         bias.view(-1)
@@ -568,6 +574,8 @@ def _s2_args_fp4(
         n_in,
         k_in,
         blocks,
+        model_dim_pad,
+        inter_dim_pad,
         stream,
     )
 
@@ -839,6 +847,8 @@ def flydsl_moe_stage1(
                 if kernel_bias is not None
                 else torch.empty(0, device=dev)
             ),
+            model_dim_pad=model_dim_pad,
+            inter_dim_pad=inter_dim_pad,
         )
     else:
         args = _s1_args_std(
@@ -1131,6 +1141,8 @@ def flydsl_moe_stage2(
             m_blocks,
             dev,
             bias=bias,
+            model_dim_pad=model_dim_pad,
+            inter_dim_pad=inter_dim_pad,
         )
     else:
         args = _s2_args_std(
