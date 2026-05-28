@@ -37,21 +37,23 @@ Port the Triton sage attention v1 kernel to FlyDSL and achieve ≥1.10× Triton 
 
 Benchmark command: `HIP_VISIBLE_DEVICES=0 python op_tests/flydsl_tests/bench_flydsl_sage.py --warmup 100 --rep 300 --speed-only`
 
-| Shape | Triton TFLOPS | FlyDSL TFLOPS | FlyDSL / Triton |
-|---|---|---|---|
-| B=1, S=1024, H=8, fwd | 36.52 | 53.91 | **1.48×** |
-| B=1, S=3000, H=8, fwd | 230.89 | 369.82 | **1.60×** |
-| B=1, S=4096, H=8, fwd | 366.10 | 552.17 | **1.51×** |
-| B=1, S=8192, H=8, fwd | 836.67 | 944.55 | **1.13×** |
-| B=1, S=4096, Hq=16/Hk=4, fwd | 709.74 | 907.43 | **1.28×** |
-| B=2, S=4096, Hq=16/Hk=4, fwd | 767.36 | 1026.25 | **1.34×** |
-| B=2, S=4096, H=8, fwd | 537.27 | 818.50 | **1.52×** |
-| B=1, S=16384, H=8, fwd | 1120.03 | 1205.02 | **1.08×** |
-| B=1, S=16384, H=24, fwd | 1189.08 | 1349.67 | **1.14×** |
-| B=1, S=75600, H=5, fwd | 1434.05 | 1443.35 | **1.01×** |
-| **Geomean** | | | **~1.35× Triton** |
+"Attn TFLOPS" = attention kernel only (pre-quantized inputs, no quant overhead).
 
-Note: causal shapes (S=4096, S=8192) show FAILED for Triton in the bench — Triton's causal path is unavailable on this build; FlyDSL causal numbers (165 TFLOPS at S=4096, 379 TFLOPS at S=8192) are measured vs SDPA only.
+| Shape | Triton TFLOPS | Triton attn TFLOPS | FlyDSL TFLOPS | FlyDSL attn TFLOPS | FlyDSL / Triton |
+|---|---|---|---|---|---|
+| B=1, S=1024, H=8, fwd | 35.48 | N/A | 52.70 | 146.59 | **1.49×** |
+| B=1, S=3000, H=8, fwd | 231.47 | N/A | 366.34 | 521.21 | **1.58×** |
+| B=1, S=4096, H=8, fwd | 364.50 | N/A | 549.13 | 741.04 | **1.51×** |
+| B=1, S=8192, H=8, fwd | 833.60 | 1213.10 | 946.28 | 1272.65 | **1.14×** |
+| B=1, S=4096, Hq=16/Hk=4, fwd | 705.33 | 1112.49 | 897.38 | 1228.53 | **1.27×** |
+| B=2, S=4096, Hq=16/Hk=4, fwd | 772.33 | 1177.78 | 1010.25 | 1261.94 | **1.31×** |
+| B=2, S=4096, H=8, fwd | 534.12 | 1103.03 | 817.24 | 1177.56 | **1.53×** |
+| B=1, S=16384, H=8, fwd | 1129.30 | 1323.03 | 1213.85 | 1386.77 | **1.07×** |
+| B=1, S=16384, H=24, fwd | 1198.58 | 1346.83 | 1233.87 | 1408.24 | **1.03×** |
+| B=1, S=75600, H=5, fwd | 1439.03 | 1488.34 | 1433.83 | 1493.33 | **1.00×** |
+| **Geomean** | | | | | **~1.35× Triton** |
+
+Note: causal shapes (S=4096, S=8192) show FAILED for Triton in the bench — Triton's causal path is unavailable on this build; FlyDSL causal numbers (164 TFLOPS at S=4096, 374 TFLOPS at S=8192) are measured vs SDPA only. Triton attn TFLOPS for short-S shapes (S≤4096) also show N/A because Triton's causal path failure prevents pre-running the JIT warm-up needed to benchmark the raw attn kernel.
 
 All 15 tests pass.
 
@@ -213,40 +215,44 @@ Benchmark command: `HIP_VISIBLE_DEVICES=0 python op_tests/flydsl_tests/bench_fly
 
 **q_smooth=True (vs Triton MXFP4 end-to-end, bench 2026-05-28):**
 
-| Shape | Triton TFLOPS | FlyDSL TFLOPS | FlyDSL / Triton |
-|---|---|---|---|
-| B=1, S=1024, fwd | 19.99 | 34.07 | **1.70×** |
-| B=1, S=4096, fwd | 154.48 | 314.96 | **2.04×** |
-| B=1, S=4096, causal | 66.60 | 159.54 | **2.40×** |
-| B=1, S=8192, fwd | 291.83 | 610.60 | **2.09×** |
-| B=1, S=8192, causal | 142.93 | 324.55 | **2.27×** |
-| B=1, S=16384, fwd | 339.28 | 751.77 | **2.22×** |
-| B=1, S=16384, causal | 169.20 | 496.60 | **2.94×** |
-| B=1, S=32768, fwd | 351.46 | 907.47 | **2.58×** |
-| B=2, S=8192, GQA Hq=16/Hk=4, fwd | 341.11 | 858.94 | **2.52×** |
-| B=1, S=4096, Hq=24, fwd | 228.27 | 519.96 | **2.28×** |
-| B=1, S=16384, Hq=24, fwd | 338.28 | 989.99 | **2.93×** |
-| B=1, S=75600, H=5, fwd | 347.84 | 478.82 | **1.38×** |
-| **Min** | | | **1.38×** |
-| **Geomean (excl. S=75600)** | | | **~2.35×** |
+"Attn TFLOPS" = attention kernel only (pre-quantized inputs, no quant overhead).
+
+| Shape | Triton TFLOPS | Triton attn TFLOPS | FlyDSL TFLOPS | FlyDSL attn TFLOPS | FlyDSL / Triton |
+|---|---|---|---|---|---|
+| B=1, S=1024, fwd | 21.65 | 47.72 | 34.20 | 63.01 | **1.58×** |
+| B=1, S=4096, fwd | 154.24 | 211.91 | 315.36 | 272.77 | **2.04×** |
+| B=1, S=4096, causal | 66.60 | 81.21 | 159.23 | 156.42 | **2.39×** |
+| B=1, S=8192, fwd | 292.07 | 347.61 | 610.16 | 867.96 | **2.09×** |
+| B=1, S=8192, causal | 141.44 | 165.35 | 323.99 | 467.46 | **2.29×** |
+| B=1, S=16384, fwd | 342.08 | 367.67 | 748.77 | 924.20 | **2.19×** |
+| B=1, S=16384, causal | 169.85 | 187.10 | 495.99 | 640.58 | **2.92×** |
+| B=1, S=32768, fwd | 351.48 | 377.13 | 907.77 | 1061.21 | **2.58×** |
+| B=2, S=8192, GQA Hq=16/Hk=4, fwd | 344.32 | 371.26 | 869.58 | 1114.76 | **2.53×** |
+| B=1, S=4096, Hq=24, fwd | 228.66 | 277.53 | 520.62 | 806.34 | **2.28×** |
+| B=1, S=16384, Hq=24, fwd | 338.03 | 369.22 | 989.51 | 1147.53 | **2.93×** |
+| B=1, S=75600, H=5, fwd | 347.46 | 367.53 | 478.20 | 549.96 | **1.38×** |
+| **Min** | | | | | **1.38×** |
+| **Geomean (excl. S=75600)** | | | | | **~2.35×** |
 
 **q_smooth=False (vs Triton MXFP4 end-to-end, bench 2026-05-28):**
 
-| Shape | Triton TFLOPS | FlyDSL TFLOPS | FlyDSL / Triton |
-|---|---|---|---|
-| B=1, S=1024, fwd | 24.03 | 42.78 | **1.78×** |
-| B=1, S=4096, fwd | 347.49 | 451.49 | **1.30×** |
-| B=1, S=4096, causal | 170.18 | 213.28 | **1.25×** |
-| B=1, S=8192, fwd | 833.03 | 968.23 | **1.16×** |
-| B=1, S=8192, causal | 426.59 | 478.76 | **1.12×** |
-| B=1, S=16384, fwd | 1233.41 | 1303.69 | **1.06×** (ceiling) |
-| B=1, S=16384, causal | 666.28 | 804.46 | **1.21×** |
-| B=1, S=32768, fwd | 1484.75 | 1508.46 | **1.02×** (ceiling) |
-| B=2, S=8192, Hq=16/Hk=4, fwd | 1137.63 | 1353.66 | **1.19×** |
-| B=1, S=4096, Hq=24, fwd | 597.99 | 704.63 | **1.18×** |
-| B=1, S=16384, Hq=24, fwd | 1338.28 | 1379.83 | **1.03×** (ceiling) |
-| B=1, S=75600, H=5, fwd | 1727.28 | 1744.08 | **1.01×** |
-| **Geomean** | | | **~1.17×** |
+"Attn TFLOPS" = attention kernel only (pre-quantized inputs, no quant overhead).
+
+| Shape | Triton TFLOPS | Triton attn TFLOPS | FlyDSL TFLOPS | FlyDSL attn TFLOPS | FlyDSL / Triton |
+|---|---|---|---|---|---|
+| B=1, S=1024, fwd | 24.34 | 126.35 | 40.18 | 144.87 | **1.65×** |
+| B=1, S=4096, fwd | 348.50 | 726.20 | 450.85 | 837.31 | **1.29×** |
+| B=1, S=4096, causal | 168.79 | 351.00 | 214.67 | 229.49 | **1.27×** |
+| B=1, S=8192, fwd | 831.32 | 1432.67 | 966.19 | 1437.13 | **1.16×** |
+| B=1, S=8192, causal | 426.41 | 776.02 | 479.62 | 672.94 | **1.12×** |
+| B=1, S=16384, fwd | 1233.57 | 1584.33 | 1303.91 | 1566.80 | **1.06×** (ceiling) |
+| B=1, S=16384, causal | 664.99 | 878.14 | 801.54 | 995.87 | **1.21×** |
+| B=1, S=32768, fwd | 1481.12 | 1835.21 | 1635.41 | 1678.79 | **1.10×** |
+| B=2, S=8192, Hq=16/Hk=4, fwd | 1141.24 | 1542.69 | 1345.85 | 1618.49 | **1.18×** |
+| B=1, S=4096, Hq=24, fwd | 598.22 | 1100.28 | 705.19 | 1070.20 | **1.18×** |
+| B=1, S=16384, Hq=24, fwd | 1338.67 | 1621.39 | 1391.50 | 1586.13 | **1.04×** (ceiling) |
+| B=1, S=75600, H=5, fwd | 1722.06 | 1833.11 | 1741.53 | 1820.27 | **1.01×** |
+| **Geomean** | | | | | **~1.17×** |
 
 14/14 pytest pass.
 
