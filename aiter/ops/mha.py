@@ -2612,7 +2612,6 @@ def flash_attn_varlen_func(
             "physical sequence padding (cu_seqlens_*_padded)."
         )
 
-    # gfx1250: dispatch to FlyDSL 8-wave MHA kernel
     if get_gfx() == "gfx1250" and q.shape[-1] == 192 and v.shape[-1] == 128 and q.dtype == torch.bfloat16:
         from .flydsl.mha_flydsl import flash_attn_varlen_flydsl
         return flash_attn_varlen_flydsl(
