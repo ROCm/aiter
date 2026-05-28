@@ -183,23 +183,23 @@ class Case:
     [
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
-            # Case(32, 6144, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
-            # Case(8192, 3072, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
-            # Case(4, 1024, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
-            # Case(1024, 3072, 512, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
-            # Case(4096, 3072, 3072, "float8_e4m3fn", 128, 4),
-            # Case(16, 1024, 1024, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
-            # Case(4096, 1024, 1024, "mxfloat8_e4m3fn", 128, 4),
-            # Case(16, 256, 256, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
-            # Case(4096, 256, 256, "mxfloat8_e4m3fn", 128, 4),
-            # Case(1000, 704, 800, "mxfloat8_e4m3fn", 8, 2),
-            # Case(300, 400, 800, "mxfloat8_e4m3fn", 8, 4),
+            Case(32, 6144, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(8192, 3072, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4, 1024, 3072, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(1024, 3072, 512, "float8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4096, 3072, 3072, "float8_e4m3fn", 128, 4),
+            Case(16, 1024, 1024, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4096, 1024, 1024, "mxfloat8_e4m3fn", 128, 4),
+            Case(16, 256, 256, "mxfloat8_e4m3fn", 128, 4, hbm_swizzling=True),
+            Case(4096, 256, 256, "mxfloat8_e4m3fn", 128, 4),
+            Case(1000, 704, 800, "mxfloat8_e4m3fn", 8, 2),
+            Case(300, 400, 800, "mxfloat8_e4m3fn", 8, 4),
             # smaller tests for gfx1250 ffm
             Case(16, 512, 512, "float8_e4m3fn", 32, 2),
             Case(16, 512, 512, "float8_e4m3fn", 32, 2, hbm_swizzling=True),
-            # Case(300, 400, 800, "float8_e4m3fn", 8, 4),
-            # Case(16, 512, 512, "mxfloat8_e4m3fn", 32, 2),
-            # Case(16, 512, 512, "mxfloat8_e4m3fn", 32, 2, hbm_swizzling=True),
+            Case(300, 400, 800, "float8_e4m3fn", 8, 4),
+            Case(16, 512, 512, "mxfloat8_e4m3fn", 32, 2),
+            Case(16, 512, 512, "mxfloat8_e4m3fn", 32, 2, hbm_swizzling=True),
         ]
     ],
 )
