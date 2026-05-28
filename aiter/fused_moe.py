@@ -893,7 +893,9 @@ def get_2stage_cfgs(
 
     def _normalize_lookup_cols(df):
         if "bias" in df.columns:
-            df["bias"] = df["bias"].astype(str).str.strip().eq("True")
+            df["bias"] = df["bias"].map(
+                lambda value: dtypes.str2bool(str(value).strip())
+            )
         else:
             df["bias"] = False
         return df

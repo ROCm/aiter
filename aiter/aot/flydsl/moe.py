@@ -36,6 +36,7 @@ from aiter.aot.flydsl.common import (
     override_env,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.utility import dtypes
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
     _ptr_view_safe,
@@ -103,7 +104,7 @@ def parse_csv(csv_path: str):
                 else "silu"
             )
             swiglu_limit = _row_swiglu_limit(row)
-            enable_bias_options = [str(row.get("bias", "")).strip() == "True"]
+            enable_bias_options = [dtypes.str2bool(row.get("bias", "False").strip())]
 
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
