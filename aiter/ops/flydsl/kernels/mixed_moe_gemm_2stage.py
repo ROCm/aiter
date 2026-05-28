@@ -325,6 +325,10 @@ def compile_mixed_moe_gemm1(
 
     kpack_bytes = 8 if is_int4 else 16
     out_elem_bytes = 4 if out_is_f32 else 2
+    w_elem_bytes = 2 if is_f16_b else 1
+    w_elem_pack = 2 if (is_f4_b or is_int4) else 1
+    w_nbytes = (experts * (2 * inter_dim) * model_dim * w_elem_bytes) // w_elem_pack
+    bias_nbytes = experts * (2 * inter_dim) * 4
 
     _e_vec_s1 = min(tile_n // 32, 8)
     if _need_quant:
@@ -429,19 +433,19 @@ def compile_mixed_moe_gemm1(
 
     if True:
 
-        @flyc.kernel
+        @flyc.kernel(name=module_name)
         def moe_gemm1(
-            arg_out: fx.Tensor,
-            arg_x: fx.Tensor,
-            arg_w: fx.Tensor,
-            arg_scale_x: fx.Tensor,
-            arg_scale_w: fx.Tensor,
-            arg_sorted_token_ids: fx.Tensor,
-            arg_expert_ids: fx.Tensor,
-            arg_sorted_weights: fx.Tensor,
-            arg_num_valid_ids: fx.Tensor,
-            arg_bias: fx.Tensor,
-            arg_out_scale_sorted: fx.Tensor,
+            arg_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_sorted_token_ids: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_sorted_weights: fx.Pointer,
+            arg_num_valid_ids: fx.Pointer,
+            arg_bias: fx.Pointer,
+            arg_out_scale_sorted: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -463,6 +467,13 @@ def compile_mixed_moe_gemm1(
             vec16_elems = 16 if a_elem_bytes == 1 else 8
             vec16_x = T.vec(vec16_elems, x_elem)
             vec2_i64 = T.vec(2, i64)
+
+            def _ptr_buffer_resource(ptr, num_records_bytes):
+                addr = fx.ptrtoint(ptr)
+                addr_i64 = arith.index_cast(T.i64, addr)
+                return buffer_ops.create_buffer_resource_from_addr(
+                    addr_i64, num_records_bytes=num_records_bytes
+                )
 
             acc_init = arith.constant_vector(0.0, vec4_f32)
 
@@ -605,17 +616,13 @@ def compile_mixed_moe_gemm1(
             # X: [tokens, model_dim]
             x_nbytes_idx = (tokens_in * k_in * c_elem_bytes) / c_a_pack
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
-            x_rsrc = buffer_ops.create_buffer_resource(
-                arg_x, max_size=False, num_records_bytes=x_nbytes_i32
-            )
+            x_rsrc = _ptr_buffer_resource(arg_x, x_nbytes_i32)
 
-            w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+            w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
 
             # Out: [tokens*topk, inter_dim]
-            numids_rsrc = buffer_ops.create_buffer_resource(
-                arg_num_valid_ids,
-                max_size=False,
-                num_records_bytes=arith.constant(4, type=T.i32),
+            numids_rsrc = _ptr_buffer_resource(
+                arg_num_valid_ids, arith.constant(4, type=T.i32)
             )
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
@@ -629,9 +636,7 @@ def compile_mixed_moe_gemm1(
                 kblk = k_in / c32
                 sx_nbytes_idx = sorted_m * kblk
                 sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
-                sx_rsrc = buffer_ops.create_buffer_resource(
-                    arg_scale_x, max_size=False, num_records_bytes=sx_nbytes_i32
-                )
+                sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
 
             if const_expr(not is_f16_b):
                 c32 = arith.constant(32, index=True)
@@ -639,32 +644,20 @@ def compile_mixed_moe_gemm1(
                 mn_w = arith.constant(experts * (2 * inter_dim), index=True)
                 sw_nbytes_idx = mn_w * kblk_w
                 sw_nbytes_i32 = arith.index_cast(T.i32, sw_nbytes_idx)
-                sw_rsrc = buffer_ops.create_buffer_resource(
-                    arg_scale_w, max_size=False, num_records_bytes=sw_nbytes_i32
-                )
+                sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
 
             sorted_nbytes_idx = size_expert_ids_in * arith.constant(
                 sort_block_m * 4, index=True
             )
             sorted_nbytes_i32 = arith.index_cast(T.i32, sorted_nbytes_idx)
-            sorted_rsrc = buffer_ops.create_buffer_resource(
-                arg_sorted_token_ids,
-                max_size=False,
-                num_records_bytes=sorted_nbytes_i32,
-            )
-            sorted_w_rsrc = buffer_ops.create_buffer_resource(
-                arg_sorted_weights, max_size=False, num_records_bytes=sorted_nbytes_i32
-            )
+            sorted_rsrc = _ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes_i32)
+            sorted_w_rsrc = _ptr_buffer_resource(arg_sorted_weights, sorted_nbytes_i32)
 
             eid_nbytes_idx = size_expert_ids_in * arith.constant(4, index=True)
             eid_nbytes_i32 = arith.index_cast(T.i32, eid_nbytes_idx)
-            expert_rsrc = buffer_ops.create_buffer_resource(
-                arg_expert_ids, max_size=False, num_records_bytes=eid_nbytes_i32
-            )
+            expert_rsrc = _ptr_buffer_resource(arg_expert_ids, eid_nbytes_i32)
             bias_rsrc = (
-                buffer_ops.create_buffer_resource(arg_bias, max_size=False)
-                if enable_bias
-                else None
+                _ptr_buffer_resource(arg_bias, bias_nbytes) if enable_bias else None
             )
 
             # Sorted-scale buffer resource for fused mxfp4 quantization
@@ -672,8 +665,22 @@ def compile_mixed_moe_gemm1(
             _sorted_scale_cols_i32 = arith.constant(_sorted_scale_cols, type=T.i32)
             sorted_scale_rsrc = None
             if const_expr(_need_sort):
-                sorted_scale_rsrc = buffer_ops.create_buffer_resource(
-                    arg_out_scale_sorted, max_size=False
+                _sort_rows_idx = size_expert_ids_in * arith.constant(
+                    sort_block_m, index=True
+                )
+                _sort_padded_rows = (
+                    (_sort_rows_idx + arith.constant(255, index=True))
+                    / arith.constant(256, index=True)
+                    * arith.constant(256, index=True)
+                )
+                _sort_padded_cols = arith.constant(
+                    ((_sorted_scale_cols + 7) // 8) * 8, index=True
+                )
+                _sort_scale_nbytes = arith.index_cast(
+                    T.i32, _sort_padded_rows * _sort_padded_cols
+                )
+                sorted_scale_rsrc = _ptr_buffer_resource(
+                    arg_out_scale_sorted, _sort_scale_nbytes
                 )
 
             # ---- persist_m loop (same pattern as stage2) ----
@@ -2097,13 +2104,7 @@ def compile_mixed_moe_gemm1(
                 topk_i32_v = topk_i32
                 tokens_i32_v = tokens_i32
 
-                from flydsl._mlir.dialects import fly as _fly
-
-                _llvm_ptr_ty = ir.Type.parse("!llvm.ptr")
-                out_base_ptr = _fly.extract_aligned_pointer_as_index(
-                    _llvm_ptr_ty, arg_out
-                )
-                out_base_i64 = llvm.ptrtoint(T.i64, out_base_ptr)
+                out_base_i64 = arith.index_cast(T.i64, fx.ptrtoint(arg_out))
                 out_base_idx = arith.index_cast(ir.IndexType.get(), out_base_i64)
 
                 if const_expr(lds_out is None):
@@ -2672,17 +2673,17 @@ def compile_mixed_moe_gemm1(
 
     @flyc.jit
     def launch_mixed_moe_gemm1(
-        arg_out: fx.Tensor,
-        arg_x: fx.Tensor,
-        arg_w: fx.Tensor,
-        arg_scale_x: fx.Tensor,
-        arg_scale_w: fx.Tensor,
-        arg_sorted_token_ids: fx.Tensor,
-        arg_expert_ids: fx.Tensor,
-        arg_sorted_weights: fx.Tensor,
-        arg_max_token_ids: fx.Tensor,
-        arg_bias: fx.Tensor,
-        arg_out_scale_sorted: fx.Tensor,
+        arg_out: fx.Pointer,
+        arg_x: fx.Pointer,
+        arg_w: fx.Pointer,
+        arg_scale_x: fx.Pointer,
+        arg_scale_w: fx.Pointer,
+        arg_sorted_token_ids: fx.Pointer,
+        arg_expert_ids: fx.Pointer,
+        arg_sorted_weights: fx.Pointer,
+        arg_max_token_ids: fx.Pointer,
+        arg_bias: fx.Pointer,
+        arg_out_scale_sorted: fx.Pointer,
         i32_tokens_in: fx.Int32,
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -2874,6 +2875,10 @@ def compile_mixed_moe_gemm2(
             "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16'}"
         )
     is_int4 = b_dtype == "int4"
+    w_elem_bytes = 2 if is_f16_b else 1
+    w_elem_pack = 2 if (is_f4_b or is_int4) else 1
+    w_nbytes = (experts * model_dim * inter_dim * w_elem_bytes) // w_elem_pack
+    bias_nbytes = experts * model_dim * 4
     # INT4 here means W4A8: A2 is int8, W is packed int4 and unpacked to int8 in-kernel.
     is_int8 = False
 
@@ -3009,18 +3014,18 @@ def compile_mixed_moe_gemm2(
 
     if True:
 
-        @flyc.kernel
+        @flyc.kernel(name=module_name)
         def moe_gemm2(
-            arg_out: fx.Tensor,
-            arg_x: fx.Tensor,
-            arg_w: fx.Tensor,
-            arg_scale_x: fx.Tensor,
-            arg_scale_w: fx.Tensor,
-            arg_sorted_token_ids: fx.Tensor,
-            arg_expert_ids: fx.Tensor,
-            arg_sorted_weights: fx.Tensor,
-            arg_num_valid_ids: fx.Tensor,
-            arg_bias: fx.Tensor,
+            arg_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_sorted_token_ids: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_sorted_weights: fx.Pointer,
+            arg_num_valid_ids: fx.Pointer,
+            arg_bias: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -3044,6 +3049,13 @@ def compile_mixed_moe_gemm2(
             vec4_elems = 4 if a_elem_bytes == 1 else 2
             vec16_x = T.vec(vec16_elems, x_elem)
             vec2_i64 = T.vec(2, i64)
+
+            def _ptr_buffer_resource(ptr, num_records_bytes):
+                addr = fx.ptrtoint(ptr)
+                addr_i64 = arith.index_cast(T.i64, addr)
+                return buffer_ops.create_buffer_resource_from_addr(
+                    addr_i64, num_records_bytes=num_records_bytes
+                )
 
             acc_init = (
                 arith.constant_vector(0, vec4_i32)
@@ -3156,11 +3168,9 @@ def compile_mixed_moe_gemm2(
                 (tokens_in * c_topk) * k_in * c_elem_bytes, int(a_elem_vec_pack)
             )
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
-            x_rsrc = buffer_ops.create_buffer_resource(
-                arg_x, max_size=False, num_records_bytes=x_nbytes_i32
-            )
+            x_rsrc = _ptr_buffer_resource(arg_x, x_nbytes_i32)
 
-            w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+            w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
 
             # OUT: [tokens, model_dim] -> clamp to descriptor max (i32 bytes) to avoid overflow on huge tokens.
             out_elem_bytes = 4 if out_is_f32 else 2
@@ -3175,15 +3185,11 @@ def compile_mixed_moe_gemm2(
                     * arith.constant(out_elem_bytes, index=True)
                 )
             out_nbytes_i32 = arith.index_cast(T.i32, out_nbytes_idx)
-            out_rsrc = buffer_ops.create_buffer_resource(
-                arg_out, max_size=False, num_records_bytes=out_nbytes_i32
-            )
+            out_rsrc = _ptr_buffer_resource(arg_out, out_nbytes_i32)
 
             # num_valid_ids (sorted padded MN) for scale sizing / guards.
-            numids_rsrc = buffer_ops.create_buffer_resource(
-                arg_num_valid_ids,
-                max_size=False,
-                num_records_bytes=arith.constant(4, type=T.i32),
+            numids_rsrc = _ptr_buffer_resource(
+                arg_num_valid_ids, arith.constant(4, type=T.i32)
             )
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
@@ -3205,16 +3211,12 @@ def compile_mixed_moe_gemm2(
                     kblk = _div_pow2(k_in, 32)
                     sx_nbytes_idx = num_valid_idx * kblk
                     sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
-                    sx_rsrc = buffer_ops.create_buffer_resource(
-                        arg_scale_x, max_size=False, num_records_bytes=sx_nbytes_i32
-                    )
+                    sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
                 else:
                     # scale_x (A2 scale): [tokens*topk] f32 -> bytes = tokens*topk*4
                     sx_nbytes_idx = (tokens_in * c_topk) * arith.constant(4, index=True)
                     sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
-                    sx_rsrc = buffer_ops.create_buffer_resource(
-                        arg_scale_x, max_size=False, num_records_bytes=sx_nbytes_i32
-                    )
+                    sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
 
             if const_expr(not is_f16_b):
                 # Weight microscale buffer (packed i32 holding e8m0 bytes).
@@ -3223,9 +3225,7 @@ def compile_mixed_moe_gemm2(
                 mn_w = arith.constant(experts * model_dim, index=True)
                 sw_nbytes_idx = mn_w * kblk_w  # bytes (e8m0)
                 sw_nbytes_i32 = arith.index_cast(T.i32, sw_nbytes_idx)
-                sw_rsrc = buffer_ops.create_buffer_resource(
-                    arg_scale_w, max_size=False, num_records_bytes=sw_nbytes_i32
-                )
+                sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
 
             # sorted_token_ids / sorted_weights: [blocks*tile_m] (padded length)
             sorted_nbytes_idx = (
@@ -3234,14 +3234,8 @@ def compile_mixed_moe_gemm2(
                 * arith.constant(4, index=True)
             )
             sorted_nbytes_i32 = arith.index_cast(T.i32, sorted_nbytes_idx)
-            sorted_rsrc = buffer_ops.create_buffer_resource(
-                arg_sorted_token_ids,
-                max_size=False,
-                num_records_bytes=sorted_nbytes_i32,
-            )
-            sorted_w_rsrc = buffer_ops.create_buffer_resource(
-                arg_sorted_weights, max_size=False, num_records_bytes=sorted_nbytes_i32
-            )
+            sorted_rsrc = _ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes_i32)
+            sorted_w_rsrc = _ptr_buffer_resource(arg_sorted_weights, sorted_nbytes_i32)
 
             # expert ids: [sort_blocks] i32.
             _c_sbm = arith.constant(_sort_block_m, index=True)
@@ -3252,13 +3246,9 @@ def compile_mixed_moe_gemm2(
             )
             eid_nbytes_idx = _sort_blocks_ub * arith.constant(4, index=True)
             eid_nbytes_i32 = arith.index_cast(T.i32, eid_nbytes_idx)
-            expert_rsrc = buffer_ops.create_buffer_resource(
-                arg_expert_ids, max_size=False, num_records_bytes=eid_nbytes_i32
-            )
+            expert_rsrc = _ptr_buffer_resource(arg_expert_ids, eid_nbytes_i32)
             bias_rsrc = (
-                buffer_ops.create_buffer_resource(arg_bias, max_size=False)
-                if enable_bias
-                else None
+                _ptr_buffer_resource(arg_bias, bias_nbytes) if enable_bias else None
             )
 
             # ---- persist loop ----
@@ -4306,13 +4296,7 @@ def compile_mixed_moe_gemm2(
                 # Both accumulate=True (global atomic) and accumulate=False (global store)
                 # need 64-bit addressing to avoid i32 offset overflow when
                 # tokens * model_dim * elem_bytes > INT32_MAX (~150K tokens for model_dim=7168).
-                from flydsl._mlir.dialects import fly as _fly
-
-                _llvm_ptr_ty = ir.Type.parse("!llvm.ptr")
-                out_base_ptr = _fly.extract_aligned_pointer_as_index(
-                    _llvm_ptr_ty, arg_out
-                )
-                out_base_i64 = llvm.ptrtoint(T.i64, out_base_ptr)
+                out_base_i64 = arith.index_cast(T.i64, fx.ptrtoint(arg_out))
                 out_base_idx = arith.index_cast(ir.IndexType.get(), out_base_i64)
 
                 def write_row_to_lds(
@@ -4513,16 +4497,16 @@ def compile_mixed_moe_gemm2(
 
     @flyc.jit
     def launch_mixed_moe_gemm2(
-        arg_out: fx.Tensor,
-        arg_x: fx.Tensor,
-        arg_w: fx.Tensor,
-        arg_scale_x: fx.Tensor,
-        arg_scale_w: fx.Tensor,
-        arg_sorted_token_ids: fx.Tensor,
-        arg_expert_ids: fx.Tensor,
-        arg_sorted_weights: fx.Tensor,
-        arg_num_valid_ids: fx.Tensor,
-        arg_bias: fx.Tensor,
+        arg_out: fx.Pointer,
+        arg_x: fx.Pointer,
+        arg_w: fx.Pointer,
+        arg_scale_x: fx.Pointer,
+        arg_scale_w: fx.Pointer,
+        arg_sorted_token_ids: fx.Pointer,
+        arg_expert_ids: fx.Pointer,
+        arg_sorted_weights: fx.Pointer,
+        arg_num_valid_ids: fx.Pointer,
+        arg_bias: fx.Pointer,
         i32_tokens_in: fx.Int32,
         i32_n_in: fx.Int32,
         i32_k_in: fx.Int32,

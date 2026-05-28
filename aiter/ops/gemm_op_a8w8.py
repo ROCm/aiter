@@ -218,6 +218,7 @@ def gemm_a8w8_blockscale_ck(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     splitK: int = 0,
+    kernelName: str = "",
 ) -> torch.Tensor: ...
 
 
@@ -234,6 +235,7 @@ def gemm_a8w8_blockscale_cktile(
     Out: torch.Tensor,
     isBpreshuffled: bool = False,
     splitK: int = 0,
+    kernelName: str = "",
 ) -> torch.Tensor: ...
 
 
@@ -248,6 +250,7 @@ def gemm_a8w8_blockscale_bpreshuffle_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    kernelName: str = "",
 ) -> torch.Tensor: ...
 
 
@@ -263,6 +266,7 @@ def gemm_a8w8_blockscale_bpreshuffle_cktile(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     isBpreshuffled: bool = True,
+    kernelName: str = "",
 ) -> torch.Tensor: ...
 
 
@@ -308,6 +312,19 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
 ) -> None: ...
 
 
+# Ref on https://github.com/ROCm/aiter/blob/1be4ee9f70a7a7de5e9f57de2c0ecb9d13ed5983/aiter/ops/gemm_op_a16w16.py#L37-L57
+@functools.lru_cache(maxsize=1024)
+def get_zero_bias_buf_keyed(
+    device: torch.device, stream_id: int, out_shape: int
+) -> Tensor:
+    return torch.zeros(1, out_shape, dtype=torch.float32, device=device)
+
+
+def get_zero_bias_buf(B: Tensor) -> Tensor:
+    stream = torch.cuda.current_stream(B.device)
+    return get_zero_bias_buf_keyed(B.device, stream.cuda_stream, B.shape[0])
+
+
 def gemm_a8w8_blockscale_bpreshuffle_asm(
     A: Tensor,
     B: Tensor,
@@ -321,7 +338,7 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     zero_bias_buf: Optional[Tensor] = None,
 ) -> Tensor:
     if bias is None and zero_bias_buf is None:
-        zero_bias_buf = torch.zeros(1, B.shape[0], dtype=torch.float32, device=A.device)
+        zero_bias_buf = get_zero_bias_buf(B)
     _gemm_a8w8_blockscale_bpreshuffle_asm(
         A,
         B,
@@ -689,13 +706,26 @@ def gemm_a8w8_blockscale(
         if config is not None:
             libtype = config["libtype"]
             splitK = int(config.get("splitK", 0))
+            kernelName = str(config.get("kernelName", ""))
             if libtype == "ck":
                 return gemm_a8w8_blockscale_ck(
-                    XQ, WQ, x_scale, w_scale, Y, splitK=splitK
+                    XQ,
+                    WQ,
+                    x_scale,
+                    w_scale,
+                    Y,
+                    splitK=splitK,
+                    kernelName=kernelName,
                 )
             elif libtype == "cktile":
                 return gemm_a8w8_blockscale_cktile(
-                    XQ, WQ, x_scale, w_scale, Y, splitK=splitK
+                    XQ,
+                    WQ,
+                    x_scale,
+                    w_scale,
+                    Y,
+                    splitK=splitK,
+                    kernelName=kernelName,
                 )
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
@@ -756,12 +786,16 @@ def gemm_a8w8_blockscale_bpreshuffle(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if config is not None:
         libtype = config["libtype"]
+        kernelName = str(config.get("kernelName", ""))
         if libtype == "cktile":
-            return gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_blockscale_bpreshuffle_cktile(
+                XQ, WQ, x_scale, w_scale, Y, kernelName=kernelName
+            )
         elif libtype == "ck":
-            return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_blockscale_bpreshuffle_ck(
+                XQ, WQ, x_scale, w_scale, Y, kernelName=kernelName
+            )
         elif libtype == "asm":
-            kernelName = config["kernelName"]
             splitK = config["splitK"]
             return gemm_a8w8_blockscale_bpreshuffle_asm(
                 XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName

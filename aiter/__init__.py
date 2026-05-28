@@ -75,6 +75,9 @@ else:
     # downstream regressions (e.g. vLLM-ROCm losing rmsnorm2d_fwd_with_add).
     # Any real import failure on Linux must surface as a loud ImportError
     # on `import aiter` -- that is what 0.1.10.post3 and earlier did.
+    # opus is gfx950-only but the package self-guards (warn + stubs on
+    # non-gfx950) inside aiter/ops/opus/__init__.py, so its import line
+    # is safe to put at top-level without try/except.
     from .jit import core as core  # noqa: E402
     from .utility import dtypes as dtypes  # noqa: E402
     from .ops.enum import *  # noqa: F403,E402
@@ -86,6 +89,7 @@ else:
     from .ops.batched_gemm_op_a8w8 import *  # noqa: F403,E402
     from .ops.batched_gemm_op_bf16 import *  # noqa: F403,E402
     from .ops.deepgemm import *  # noqa: F403,E402
+    from .ops.opus import *  # noqa: F403,E402
     from .ops.aiter_operator import *  # noqa: F403,E402
     from .ops.activation import *  # noqa: F403,E402
     from .ops.attention import *  # noqa: F403,E402
@@ -95,6 +99,7 @@ else:
     from .ops.moe_op import *  # noqa: F403,E402
     from .ops.moe_sorting import *  # noqa: F403,E402
     from .ops.moe_sorting_opus import *  # noqa: F403,E402
+    from .ops.pa_sparse_prefill_opus import *  # noqa: F403,E402
     from .ops.pos_encoding import *  # noqa: F403,E402
     from .ops.cache import *  # noqa: F403,E402
     from .ops.rmsnorm import *  # noqa: F403,E402
@@ -120,7 +125,7 @@ try:
     from .ops.triton.comms import (
         IrisCommContext,  # noqa: F401
         calculate_heap_size,  # noqa: F401
-        reduce_scatter,  # noqa: F401
+        reduce_scatter as iris_reduce_scatter,  # noqa: F401  # avoid shadowing C++ reduce_scatter exported by custom_all_reduce.py
         all_gather,  # noqa: F401
         reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
         IRIS_COMM_AVAILABLE,  # noqa: F401

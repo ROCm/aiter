@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+import functools
 from itertools import product
 from typing import Dict, Optional
 
@@ -13,6 +14,7 @@ import torch
 from torch import Tensor
 
 import flydsl.expr as fx
+import flydsl.compiler as flyc
 from aiter import logger
 from flydsl.runtime.device import get_rocm_arch
 
@@ -66,6 +68,15 @@ _HGEMM_KERNEL_RE = re.compile(
 SplitKStreamKey = tuple[int, int]
 SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
 SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
+
+
+def _ptr_view_safe(t: torch.Tensor):
+    type_name = type(t).__name__
+    module_name = type(t).__module__
+    if type_name == "FakeTensor" or "fake_tensor" in module_name:
+        return flyc.from_c_void_p(fx.Uint8, 0)
+    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+
 
 # Keep the generic auto-generated catalog aligned with the upstream FlyDSL
 # reference tuning space. The wider local one-off search space introduced
@@ -655,27 +666,15 @@ def _register_all_configs():
 _register_all_configs()
 
 
+@functools.lru_cache(maxsize=128)
 def _get_split_k_tensors(
+    device: torch.device,
     stream: torch.cuda.Stream,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    key = _stream_cache_key(stream)
-    semaphore = SPLIT_K_GLOBAL_SEMAPHORE.get(key)
-    signal = SPLIT_K_GLOBAL_SIGNAL.get(key)
-    with torch.cuda.device(stream.device), torch.cuda.stream(stream):
-        if semaphore is None:
-            semaphore = torch.zeros(
-                (SPLIT_K_SEMAPHORE_MAX_LEN,),
-                dtype=torch.int32,
-                device=stream.device,
-            )
-            SPLIT_K_GLOBAL_SEMAPHORE[key] = semaphore
-        if signal is None:
-            signal = torch.zeros(
-                (SPLIT_K_SEMAPHORE_MAX_LEN,),
-                dtype=torch.int32,
-                device=stream.device,
-            )
-            SPLIT_K_GLOBAL_SIGNAL[key] = signal
+    semaphore = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
+    )
+    signal = torch.zeros((SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device)
     return semaphore, signal
 
 
@@ -813,16 +812,16 @@ def _compile_flydsl_hgemm(
         runtime_m = int(a.shape[0])
         launch_stream = _normalize_launch_stream(a.device, stream)
         _check_split_k_semaphore_capacity(runtime_m, n, tile_m, tile_n, split_k)
-        semaphore, signal = _get_split_k_tensors(launch_stream)
+        semaphore, signal = _get_split_k_tensors(a.device, launch_stream)
         return _run_compiled(
             kernel,
-            out,
-            a,
-            b,
-            launch_bias,
+            _ptr_view_safe(out),
+            _ptr_view_safe(a),
+            _ptr_view_safe(b),
+            _ptr_view_safe(launch_bias),
             runtime_m,
-            semaphore,
-            signal,
+            _ptr_view_safe(semaphore),
+            _ptr_view_safe(signal),
             fx.Stream(launch_stream),
         )
 
@@ -1022,12 +1021,12 @@ def flydsl_preshuffle_gemm_a8(
     _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
     _run_compiled(
         exe,
-        out_contig.view(-1),
-        _as_i8(XQ.contiguous()).view(-1),
-        _as_i8(WQ.contiguous()).view(-1),
-        x_scale.contiguous().view(-1),
-        w_scale.contiguous().view(-1),
-        _dummy_bias,
+        _ptr_view_safe(out_contig.view(-1)),
+        _ptr_view_safe(_as_i8(XQ.contiguous()).view(-1)),
+        _ptr_view_safe(_as_i8(WQ.contiguous()).view(-1)),
+        _ptr_view_safe(x_scale.contiguous().view(-1)),
+        _ptr_view_safe(w_scale.contiguous().view(-1)),
+        _ptr_view_safe(_dummy_bias),
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),

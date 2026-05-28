@@ -221,13 +221,13 @@ def compile_hgemm_kernel(
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hgemm_kernel(
-        C: fx.Tensor,
-        A: fx.Tensor,
-        B: fx.Tensor,
-        BIAS: fx.Tensor,
+        C: fx.Pointer,
+        A: fx.Pointer,
+        B: fx.Pointer,
+        BIAS: fx.Pointer,
         m: fx.Int32,
-        semaphore: fx.Tensor,
-        signal: fx.Tensor,
+        semaphore: fx.Pointer,
+        signal: fx.Pointer,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         c_zero_d = arith.constant(0.0, type=dtype_)
@@ -287,11 +287,8 @@ def compile_hgemm_kernel(
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
         c_frags = [acc_init] * C_FRAGS_LEN
 
-        def get_llvm_ptr(
-            ptr, offset, dtype_bytes, ptr_type=ir.Type.parse("!llvm.ptr<1>")
-        ):
-            base_ptr = fly.extract_aligned_pointer_as_index(ptr_type, ptr)
-            base_ptr = llvm.PtrToIntOp(T.i64, base_ptr).result
+        def get_llvm_ptr(ptr, offset, dtype_bytes):
+            base_ptr = arith.index_cast(T.i64, fx.ptrtoint(ptr))
             byte_offset = arith.index_cast(
                 T.i64, fx.Index(offset) * fx.Index(dtype_bytes)
             )
@@ -923,13 +920,13 @@ def compile_hgemm_kernel(
 
     @flyc.jit
     def launch_hgemm_kernel(
-        C: fx.Tensor,
-        A: fx.Tensor,
-        B: fx.Tensor,
-        BIAS: fx.Tensor,
+        C: fx.Pointer,
+        A: fx.Pointer,
+        B: fx.Pointer,
+        BIAS: fx.Pointer,
         m: fx.Int32,
-        semaphore: fx.Tensor,
-        signal: fx.Tensor,
+        semaphore: fx.Pointer,
+        signal: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False

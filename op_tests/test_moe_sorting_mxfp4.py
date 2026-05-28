@@ -176,7 +176,7 @@ def test_moe_mxfp4_quant_sort(dtype, token_num, model_dim, E, topk, block_size, 
         device=input.device,
     )
     _, hip_us = run_perftest(
-        aiter.fused_dynamic_mxfp4_quant_moe_sort_hip,
+        aiter.fused_dynamic_mx_quant_moe_sort_hip,
         hip_out,
         hip_scale,
         input,
