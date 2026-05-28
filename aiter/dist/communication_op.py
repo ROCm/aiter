@@ -110,6 +110,20 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     )
 
 
+def tensor_model_parallel_fused_qknorm_allreduce(
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    eps: float,
+):
+    return get_tp_group().fused_qknorm_allreduce(
+        qkv_in,
+        q_w,
+        k_w,
+        eps,
+    )
+
+
 def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
     _assert_no_custom_group("tensor_model_parallel_custom_all_gather")
     return get_tp_group().custom_all_gather(input_)

@@ -200,7 +200,9 @@ def _batched_gemm_a16wfp4_kernel(
                     a_bf16, BLOCK_SIZE_K, BLOCK_SIZE_M, SCALE_GROUP_SIZE
                 )
 
-            accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
+            accumulator = tl.dot_scaled(
+                a, a_scales, "e2m1", b, b_scales, "e2m1", acc=accumulator
+            )
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -317,4 +319,4 @@ def _get_config(
 ):
     # Note: Config files use K=2*K in their naming because FP4 weights are packed,
     # so the actual K dimension in the config file corresponds to 2*K unpacked elements
-    return get_gemm_config("BATCHED_GEMM_PREQUANT-AFP4WFP4", M, N, 2 * K)
+    return get_gemm_config("BATCHED_GEMM-A16WFP4", M, N, 2 * K)

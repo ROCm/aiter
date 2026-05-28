@@ -34,6 +34,8 @@ env:
   FA_REPOSITORY_URL: https://github.com/Dao-AILab/flash-attention.git
   BASE_IMAGE: rocm/pytorch:latest@sha256:683765a52c61341e1674fe730ab3be861a444a45a36c0a8caae7653a08a0e208
   AITER_SUBMODULE_PATH: third_party/aiter
+  DOCKER_PULL_MAX_ATTEMPTS: "3"
+  DOCKER_PULL_RETRY_DELAY_SECONDS: "10"
 
 jobs:
   check-signal:
@@ -43,8 +45,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
 
-      - name: Download and check signal artifact
+      - name: Wait for Checks workflow
         run: ./.github/scripts/check_signal.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -59,6 +62,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -113,6 +117,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
 
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
@@ -133,7 +138,7 @@ jobs:
           exit 0
 
       - name: Pull base image
-        run: docker pull ${{ env.BASE_IMAGE }}
+        run: bash .github/scripts/docker_pull_with_retry.sh "${{ env.BASE_IMAGE }}"
 
       - name: Generate Dockerfile
         run: |
@@ -266,6 +271,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -274,7 +280,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip setuptools wheel
+          python -m pip install --upgrade pip setuptools wheel
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install triton-windows
         shell: bash
@@ -306,6 +312,42 @@ jobs:
             python -c "from flash_attn.flash_attn_interface import flash_attn_func; print('flash_attn_func loaded (fake ROCm):', flash_attn_func)"
         shell: bash
 
+  # Triton-backend users install aiter on a pip ROCm distribution that has no
+  # C++ build toolchain or CK. With AITER_TRITON_ONLY, `import aiter` must expose
+  # the Triton ops without triggering the C++ JIT build (see FA #2580). No GPU.
+  nightly_smoke:
+    if: ${{ needs.prechecks.outputs.run_triton == 'true' }}
+    name: Nightly Smoke Test
+    needs: [prechecks]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install torch (pip ROCm nightly)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --pre torch torchvision torchaudio \
+            --index-url https://rocm.nightlies.amd.com/v2/gfx110X-all/
+        shell: bash
+
+      - name: Install aiter
+        run: pip install -e . --no-build-isolation
+        shell: bash
+
+      - name: Import aiter (Triton ops only, no JIT)
+        env:
+          AITER_TRITON_ONLY: 1
+        run: python -c "import aiter; import aiter.ops.triton; print('triton-only import OK')"
+        shell: bash
+
   # =============================================================================
   # CK Backend
   # =============================================================================
@@ -321,6 +363,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
 
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
@@ -341,7 +384,7 @@ jobs:
           exit 0
 
       - name: Pull base image
-        run: docker pull ${{ env.BASE_IMAGE }}
+        run: bash .github/scripts/docker_pull_with_retry.sh "${{ env.BASE_IMAGE }}"
 
       - name: Generate Dockerfile
         run: |

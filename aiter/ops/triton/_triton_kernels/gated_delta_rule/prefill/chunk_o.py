@@ -110,9 +110,9 @@ def chunk_fwd_kernel_o(
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
-        b_o += tl.dot(b_q, b_h)
+        b_o = tl.dot(b_q, b_h, acc=b_o)
         # [BT, BK] @ [BK, BT] -> [BT, BT]
-        b_A += tl.dot(b_q, b_k)
+        b_A = tl.dot(b_q, b_k, acc=b_A)
 
     if USE_G:
         g += bos * H + i_h
@@ -262,17 +262,17 @@ def chunk_bwd_kernel_dqkwg(
         if USE_G:
             b_dg_last += tl.sum(b_h * b_dh)
         # [BT, BV] @ [BV, BT] -> [BT, BT]
-        b_ds += tl.dot(b_do, tl.trans(b_v))
+        b_ds = tl.dot(b_do, tl.trans(b_v), acc=b_ds)
         # [BT, BV] @ [BV, BK] -> [BT, BK]
-        b_dq += tl.dot(b_do, b_h.to(b_do.dtype))
+        b_dq = tl.dot(b_do, b_h.to(b_do.dtype), acc=b_dq)
         # [BT, BV] @ [BV, BK] -> [BT, BK]
-        b_dk += tl.dot(b_v, b_dh.to(b_v.dtype))
+        b_dk = tl.dot(b_v, b_dh.to(b_v.dtype), acc=b_dk)
         if USE_DW:
             p_dv = tl.make_block_ptr(
                 dv, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
             )
             b_dv = tl.load(p_dv, boundary_check=(0, 1))
-            b_dw += tl.dot(b_dv.to(b_v.dtype), b_h.to(b_v.dtype))
+            b_dw = tl.dot(b_dv.to(b_v.dtype), b_h.to(b_v.dtype), acc=b_dw)
 
     if USE_DW:
         p_dw = tl.make_block_ptr(
@@ -323,8 +323,8 @@ def chunk_bwd_kernel_dqkwg(
 
         b_ds = b_ds.to(b_k.dtype)
         # [BT, BK]
-        b_dq += tl.dot(b_ds, b_k)
-        b_dk += tl.dot(tl.trans(b_ds), b_q)
+        b_dq = tl.dot(b_ds, b_k, acc=b_dq)
+        b_dk = tl.dot(tl.trans(b_ds), b_q, acc=b_dk)
         p_dg = tl.make_block_ptr(dg, (T,), (H,), (i_t * BT,), (BT,), (0,))
         # (SY 09/21) revcumsum in a separate kernel due to strange triton compiler issue
         # b_dg = tl.dot(tl.where(o_t[:, None] <= o_t[None, :], 1., 0.), b_dg, allow_tf32=False) + b_dg_last)
@@ -339,15 +339,15 @@ def chunk_bwd_kernel_dqkwg(
         b_ds = tl.where(m_A, b_ds * exp(b_g[:, None] - b_g[None, :]), 0) * scale
         b_ds = b_ds.to(b_k.dtype)
         # [BT, BK]
-        b_dq += tl.dot(b_ds, b_k)
-        b_dk += tl.dot(tl.trans(b_ds), b_q)
+        b_dq = tl.dot(b_ds, b_k, acc=b_dq)
+        b_dk = tl.dot(tl.trans(b_ds), b_q, acc=b_dk)
         tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
 
     else:
         b_ds = tl.where(m_A, b_ds, 0)
         b_ds = b_ds.to(b_k.dtype)
-        b_dq += tl.dot(b_ds, b_k)
+        b_dq = tl.dot(b_ds, b_k, acc=b_dq)
         b_dk += tl.dot(tl.trans(b_ds), b_q) * scale
         b_dq *= scale
         tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
@@ -429,12 +429,12 @@ def chunk_bwd_kernel_dv(
         )
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_A += tl.dot(b_k, b_q)
+        b_A = tl.dot(b_k, b_q, acc=b_A)
         p_dh = tl.make_block_ptr(
             dh, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0)
         )
         b_dh = tl.load(p_dh, boundary_check=(0, 1))
-        b_dv += tl.dot(b_k, b_dh.to(b_k.dtype))
+        b_dv = tl.dot(b_k, b_dh.to(b_k.dtype), acc=b_dv)
 
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
@@ -463,7 +463,7 @@ def chunk_bwd_kernel_dv(
         dv, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
     )
     b_do = tl.load(p_do, boundary_check=(0, 1))
-    b_dv += tl.dot(b_A.to(b_do.dtype), b_do)
+    b_dv = tl.dot(b_A.to(b_do.dtype), b_do, acc=b_dv)
     tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -710,8 +710,8 @@ def chunk_fwd_kernel_o_opt(
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
-        b_o += tl.dot(b_q, b_h)
-        b_A += tl.dot(b_q, b_k)
+        b_o = tl.dot(b_q, b_h, acc=b_o)
+        b_A = tl.dot(b_q, b_k, acc=b_A)
 
     if USE_G:
         g += bos * H + i_h
@@ -892,8 +892,8 @@ def chunk_fwd_kernel_o_opt_vk(
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
-        b_o += tl.dot(b_q, tl.trans(b_h))
-        b_A += tl.dot(b_q, b_k)
+        b_o = tl.dot(b_q, tl.trans(b_h), acc=b_o)
+        b_A = tl.dot(b_q, b_k, acc=b_A)
 
     if USE_G:
         g += bos * H + i_h

@@ -41,7 +41,18 @@ def run_aiter_fused_qk_rmsnorm(
     k_weight: torch.Tensor,
     k_eps: float,
 ):
-    q_out, k_out = aiter.fused_qk_rmsnorm(q, q_weight, q_eps, k, k_weight, k_eps)
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
+    aiter.fused_qk_rmsnorm(
+        q_out_quantized=q_out,
+        q=q,
+        q_weight=q_weight,
+        q_epsilon=q_eps,
+        k_out=k_out,
+        k=k,
+        k_weight=k_weight,
+        k_epsilon=k_eps,
+    )
     return q_out, k_out
 
 
