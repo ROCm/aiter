@@ -1949,8 +1949,18 @@ def main() -> None:
                         help="Pass per-expert bias into grouped GEMM stage1/stage2.")
     parser.add_argument("--act", choices=("silu", "swiglu"), default="silu",
                         help="Stage1 activation epilogue. Stage2 has no activation.")
-    parser.add_argument("--stage1-weight-layout", choices=("gguu", "gugu"), default="gguu",
-                        help="Logical row layout for stage1 gate/up weights and bias.")
+    stage1_weight_layout_default = os.environ.get(
+        "AITER_GROUPED_STAGE1_WEIGHT_LAYOUT", "gguu"
+    ).strip().lower()
+    if stage1_weight_layout_default not in ("gguu", "gugu"):
+        parser.error(
+            "AITER_GROUPED_STAGE1_WEIGHT_LAYOUT must be 'gguu' or 'gugu', "
+            f"got {stage1_weight_layout_default!r}"
+        )
+    parser.add_argument("--stage1-weight-layout", choices=("gguu", "gugu"),
+                        default=stage1_weight_layout_default,
+                        help="Logical row layout for stage1 gate/up weights and bias. "
+                             "Defaults to AITER_GROUPED_STAGE1_WEIGHT_LAYOUT or gguu.")
     parser.add_argument("--data", choices=("constant", "pattern", "randn"), default="constant")
     parser.add_argument("--masked-mode", choices=("mixed", "full", "descending"), default="mixed")
     parser.add_argument("--masked-m-override", type=int, default=None,
