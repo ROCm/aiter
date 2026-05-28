@@ -536,7 +536,9 @@ def compile_mixed_moe_gemm1(
                     _c_tile_k_sw = arith.constant(tile_k, index=True)
                     _c_inter_dim_sw = arith.constant(inter_dim, index=True)
                     _inter_valid_sw = _c_inter_dim_sw - inter_dim_pad_idx
-                    _tile2_pad_sw = _c_tile_k_sw - (_inter_valid_sw % _c_tile_k_sw)
+                    _tile2_pad_sw = (
+                        _c_tile_k_sw - (_inter_valid_sw % _c_tile_k_sw)
+                    ) % _c_tile_k_sw
                 else:
                     _tile2_pad_sw = arith.constant(0, index=True)
 
@@ -2785,7 +2787,7 @@ def compile_mixed_moe_gemm1(
             _c_tile_k_l = arith.constant(tile_k, index=True)
             _c_inter_dim_l = arith.constant(inter_dim, index=True)
             _inter_valid_l = _c_inter_dim_l - _inter_dim_pad_idx
-            _tile2_pad = _c_tile_k_l - (_inter_valid_l % _c_tile_k_l)
+            _tile2_pad = (_c_tile_k_l - (_inter_valid_l % _c_tile_k_l)) % _c_tile_k_l
         else:
             _tile2_pad = arith.constant(0, index=True)
         if const_expr(mock_gate_only or gate_up_interleave):
