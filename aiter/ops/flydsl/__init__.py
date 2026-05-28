@@ -46,10 +46,23 @@ if is_flydsl_available():
 
     from .linear_attention_kernels import flydsl_gdr_decode
 
+    from .quant_kernels import (
+        flydsl_dynamic_per_tensor_quant,
+        flydsl_per_1x32_fp4_quant,
+        flydsl_per_1x32_fp4_quant_hadamard,
+        flydsl_per_1x32_fp4_quant_block_rotation,
+        flydsl_per_1x32_fp4_quant_block_rotation_mfma,
+    )
+
     __all__ += [
         "flydsl_preshuffle_gemm_a8",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_hgemm",
         "flydsl_gdr_decode",
+        "flydsl_dynamic_per_tensor_quant",
+        "flydsl_per_1x32_fp4_quant",
+        "flydsl_per_1x32_fp4_quant_hadamard",
+        "flydsl_per_1x32_fp4_quant_block_rotation",
+        "flydsl_per_1x32_fp4_quant_block_rotation_mfma",
     ]

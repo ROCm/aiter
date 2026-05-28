@@ -19,6 +19,11 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 
+if is_flydsl_available():
+    from aiter.ops.flydsl import flydsl_per_1x32_fp4_quant_block_rotation_mfma
+else:  # noqa: E501
+    flydsl_per_1x32_fp4_quant_block_rotation_mfma = None  # type: ignore[assignment]
+
 BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
@@ -153,6 +158,52 @@ def _apply_shared_fc1_smooth(hidden_states, fc1_smooth_scale):
     return hidden_states * smooth_scale.to(dtype=hidden_states.dtype)
 
 
+def _read_rot_transposed_attr(rot_R) -> bool:
+    attr = getattr(rot_R, "transpose", False)
+    return attr if isinstance(attr, bool) else False
+
+
+def _flydsl_rotation_mxfp4_quant_moe_sort(
+    x,
+    rot_R,
+    sorted_ids,
+    num_valid_ids,
+    token_num,
+    cols,
+):
+    """``flydsl_per_1x32_fp4_quant_block_rotation_mfma`` + MoE scale-sort.
+
+    Drop-in replacement for ``fused_dynamic_mxfp4_quant_moe_sort`` when a
+    per-block rotation matrix ``rot_R`` (shape ``(cols // 32, 32, 32)``,
+    dtype matching ``x``) needs to be folded into the per-1x32 MXFP4
+    quant. The rotation+quant runs in a single FlyDSL MFMA kernel; the
+    scale-scatter then runs separately via :func:`mxfp4_moe_sort_fwd`.
+    """
+    assert flydsl_per_1x32_fp4_quant_block_rotation_mfma is not None, (
+        "flydsl is not available; cannot apply block rotation via the "
+        "fused MFMA kernel"
+    )
+    rot_transposed = _read_rot_transposed_attr(rot_R)
+    rows = int(x.shape[0])
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not rot_R.is_contiguous():
+        rot_R = rot_R.contiguous()
+    a = torch.empty(rows, cols // 2, dtype=torch.uint8, device=x.device)
+    a_scale = torch.empty(rows, cols // 32, dtype=torch.uint8, device=x.device)
+    flydsl_per_1x32_fp4_quant_block_rotation_mfma(
+        a, x, rot_R, a_scale, rot_transposed=rot_transposed
+    )
+    a_scale = mxfp4_moe_sort_fwd(
+        a_scale.view(dtypes.fp8_e8m0),
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token_num,
+        cols=cols,
+    )
+    return a.view(dtypes.fp4x2), a_scale
+
+
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
 # We can use torch.compile(dynamic=False) to avoid
 @functools.lru_cache(maxsize=2048)
@@ -202,6 +253,14 @@ def fused_moe(
     bias2=None,
     splitk=0,
     fc1_smooth_scale: Optional[torch.tensor] = None,  # shared [model_dim] or [1, model_dim]
+    # Per-block rotation matrices folded into the per_1x32 fp4 quant of
+    # the stage1 / stage2 activations (must match w1 / w2 weight-side
+    # rotations applied offline). Shapes:
+    #   W1_R: (model_dim // 32, 32, 32) -- rotates hidden_states
+    #   W2_R: (inter_dim  // 32, 32, 32) -- rotates a2
+    # Dtype must match the activation (bf16 or fp16).
+    W1_R: Optional[torch.tensor] = None,
+    W2_R: Optional[torch.tensor] = None,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -231,6 +290,8 @@ def fused_moe(
         bias1=bias1,
         bias2=bias2,
         fc1_smooth_scale=fc1_smooth_scale,
+        W1_R=W1_R,
+        W2_R=W2_R,
     )
 
 
@@ -262,6 +323,8 @@ def fused_moe_fake(
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
     fc1_smooth_scale: Optional[torch.Tensor] = None,  # shared [model_dim]
+    W1_R: Optional[torch.Tensor] = None,
+    W2_R: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -300,6 +363,8 @@ def fused_moe_(
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
     fc1_smooth_scale: Optional[torch.Tensor] = None,  # shared [model_dim]
+    W1_R: Optional[torch.Tensor] = None,
+    W2_R: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -510,6 +575,8 @@ def fused_moe_(
             bias1=bias1,
             bias2=bias2,
             fc1_smooth_scale=fc1_smooth_scale,
+            W1_R=W1_R,
+            W2_R=W2_R,
         )
 
 
@@ -1429,8 +1496,21 @@ def _quantize_stage2_per_1x32(
     num_local_tokens,
     block_size_M2,
     is_flydsl_stage2,
+    W2_R=None,
 ):
     a2 = a2.view(-1, inter_dim)
+    if W2_R is not None:
+        # Fold the per-block rotation along inter_dim into the per-1x32
+        # fp4 quant via the FlyDSL MFMA kernel.
+        a2, a2_scale = _flydsl_rotation_mxfp4_quant_moe_sort(
+            a2,
+            W2_R,
+            sorted_ids=sorted_ids2,
+            num_valid_ids=num_valid_ids2,
+            token_num=token_num,
+            cols=inter_dim,
+        )
+        return a2.view(token_num, topk, -1), a2_scale
     if is_flydsl_stage2 and q_dtype_a2 == dtypes.fp4x2:
         # FlyDSL stage2 loads A2 by original token/topk row, but its scale
         # buffer follows the sorted MoE row order.
@@ -1498,6 +1578,8 @@ def fused_moe_2stages(
     bias1=None,
     bias2=None,
     fc1_smooth_scale=None,  # shared [model_dim]
+    W1_R=None,
+    W2_R=None,
 ):
     quant_func = get_quant(quant_type)
     q_type2 = quant_type if q_type2 is None else QuantType(q_type2)
@@ -1604,15 +1686,27 @@ def fused_moe_2stages(
                 if fc1_smooth_scale is not None
                 else hidden_states
             )
-            a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
-                a1_input,
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=token_num,
-                topk=topk,
-                block_size=block_size_M,
-                num_rows=num_local_tokens,
-            )
+            if W1_R is not None:
+                # Fold the per-block rotation into the per-1x32 fp4 quant
+                # via flydsl_per_1x32_fp4_quant_block_rotation_mfma.
+                a1, a1_scale = _flydsl_rotation_mxfp4_quant_moe_sort(
+                    a1_input,
+                    W1_R,
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token_num,
+                    cols=model_dim,
+                )
+            else:
+                a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
+                    a1_input,
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token_num,
+                    topk=topk,
+                    block_size=block_size_M,
+                    num_rows=num_local_tokens,
+                )
     elif hidden_states.dtype != q_dtype_a:
         if fc1_smooth_scale is not None:
             a1, a1_scale = _smooth_per_token_quant_stage1(
@@ -1730,6 +1824,7 @@ def fused_moe_2stages(
             num_local_tokens,
             block_size_M2,
             getattr(metadata.stage2, "func", None) is _flydsl_stage2_wrapper,
+            W2_R=W2_R,
         )
     elif q_type2 == QuantType.per_1x128 and quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         a2_v = a2[:token_num, :, :]
