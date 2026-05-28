@@ -1569,9 +1569,14 @@ void
         GENERATE_A16W16_TUNE_LOOKUP. Mono-tile does NOT support bias
         (rejected up front) and ignores splitK.
 
-        Mono-tile is intrinsically tile-aligned: the launcher hard-asserts
-        M%B_M == N%B_N == K%B_K == 0 (no OOB tail handling exists in the
-        kernel body).
+        Mono-tile has no K-tail mask, so K%B_K == 0 is hard-asserted.
+        M can be non-tile-aligned: the kernel body uses ceil tile counts
+        and the M-axis gmem buffer descriptor (size `(m-row)*stride`)
+        clamps OOB rows at the matrix edge. The host grid below uses
+        ceil tile counts to cover the last partial M tile.
+        N must stay tile-aligned: g_c is row-contiguous with stride=N,
+        so an OOB column write spills into the next row and is *not*
+        caught by the buffer descriptor.
         """
         # Pre-declared Traits alias at file scope (visible to both passes).
         # Mono-tile traits: <BLOCK_SIZE, BLOCK, DTYPE (4-tuple incl. D_ACC), VEC>.
@@ -1597,12 +1602,15 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         "K=", K, " must be even (a16w16 family rejects odd K)");
     AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
     AITER_CHECK(batch >= 1, "batch must be >= 1");
-    // Mono-tile is intrinsically non-OOB: the kernel body has no tail
-    // handling, so M and N must be tile-aligned. The dispatcher already
-    // filters this for tuned (M,N,K) entries, but enforce it here too so
-    // a direct `_tune` call with a misaligned shape errors cleanly.
-    AITER_CHECK(M % {k.B_M} == 0,
-        "mono-tile requires M divisible by B_M={k.B_M}; got M=", M);
+    // Mono-tile has no K-tail mask, so K must stay divisible by B_K.
+    // M may be non-tile-aligned: the kernel body uses ceil tile counts
+    // internally (`num_tiles_m = (m+B_M-1)/B_M`) and the gmem buffer
+    // descriptor for g_a / g_c is sized `(m-row)*stride * sizeof(...)`
+    // so M-tail OOB rows are clamped at the matrix edge.
+    // N must stay tile-aligned: g_c is row-contiguous with stride=N, so
+    // a tail-column write at (m_local, n_local >= N-col) lands inside
+    // the buffer descriptor bound but corrupts the next row. Empirically
+    // verified on kids 1400-1404; mismatch rate ~95%% for any N+1.
     AITER_CHECK(N % {k.B_N} == 0,
         "mono-tile requires N divisible by B_N={k.B_N}; got N=", N);
 """
@@ -1658,8 +1666,8 @@ void
     kargs.stride_b_batch = N * K;
     kargs.stride_c_batch = M * N;
 
-    int num_tiles_m = M / {k.B_M};
-    int num_tiles_n = N / {k.B_N};
+    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
+    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
     dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
     dim3 block({k.BLOCK_SIZE});
 
