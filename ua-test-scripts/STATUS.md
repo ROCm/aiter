@@ -214,22 +214,75 @@ than CK on a typical square-prefill cell). The gap is remarkably
 batch-independent at each Sk band (e.g. 0.66× across all batches at
 Sq=Sk=5000), which points at a per-kernel-MFMA-utilization deficit
 rather than launch overhead or workspace cost — the prefill kernel
-itself needs work, not the wrapper. Two leads for follow-up:
+itself needs work, not the wrapper.
 
-  1. **Q-tile size for irregular GQA**. Triton picks BLOCK_M=128 for
-     these shapes; the CK prefill_d128 tile-tier ladder (kBlockQ ∈
-     {2, 8, 16}) was calibrated for GQA-1 / GQA-4 / GQA-8 and never
-     specifically tuned for GQA-6 (qpkv=6). The "fallback" tier
-     (`kBlockQ = 128 // qpkv = 21`) is what gets selected here, and
-     21 is not a power-of-two — worth checking whether 16 or 32 with
-     a hand-tuned schedule beats it.
-  2. **FP8 prefill MFMA pipeline.** The 0.66×-0.68× plateau across
-     Sk=5000 and Sk=10000 (where the kernel is compute-bound, not
-     KV-bw-bound) is the regime where MFMA throughput dominates. CK's
-     FP8 prefill_d128 was the focus of `06e1a70e7`, `045b1f57b`,
-     `7a319d9a4`, `3431615ff` etc., but those landed primarily on
-     decode-tier instances; the prefill_d128 codegen for irregular
-     GQA may still be leaving MFMA cycles on the table.
+### Decomposing the prefill gap: FP8 vs BF16
+
+Re-ran the 12 prefill cells at `--dtype bf16` to isolate whether the
+gap is FP8-pipeline-specific or kernel-structural. Both backends
+fall back to the same `--num-blocks auto` allocator + the same Q/K/V
+layout so this is an apples-to-apples kernel-level comparison; only
+the activation dtype + the compiled instance differ.
+
+| shape (Sq=Sk)      | CK FP8 / Triton FP8 | CK BF16 / Triton BF16 | CK FP8 speedup | Triton FP8 speedup |
+|--------------------|---------------------|------------------------|----------------|---------------------|
+| b=4   sq=sk=1000   |  0.83x              |  0.60x                 |  1.35x         |  0.98x              |
+| b=4   sq=sk=5000   |  0.70x              |  0.76x                 |  1.21x         |  1.33x              |
+| b=4   sq=sk=10000  |  0.68x              |  0.77x                 |  1.24x         |  1.41x              |
+| b=8   sq=sk=1000   |  0.75x              |  0.69x                 |  1.23x         |  1.13x              |
+| b=8   sq=sk=5000   |  0.66x              |  0.80x                 |  1.15x         |  1.38x              |
+| b=8   sq=sk=10000  |  0.68x              |  0.80x                 |  1.22x         |  1.44x              |
+| b=16  sq=sk=1000   |  0.71x              |  0.70x                 |  1.24x         |  1.23x              |
+| b=16  sq=sk=5000   |  0.66x              |  0.82x                 |  1.13x         |  1.41x              |
+| b=16  sq=sk=10000  |  0.68x              |  0.83x                 |  1.21x         |  1.48x              |
+| b=32  sq=sk=1000   |  0.69x              |  0.69x                 |  1.28x         |  1.29x              |
+| b=32  sq=sk=5000   |  0.66x              |  0.84x                 |  1.14x         |  1.44x              |
+| b=32  sq=sk=10000  |  0.68x              |  0.84x                 |  1.20x         |  1.49x              |
+| **geomean**        | **0.70x**           | **0.76x**              | **1.22x**      | **1.32x**           |
+
+The "CK FP8 speedup" column is the absolute time ratio
+`CK_bf16_ms / CK_fp8_ms` — i.e., how much speedup CK extracts from
+switching the activation dtype from bf16 to FP8 on the same shape.
+"Triton FP8 speedup" is the same thing for the Triton kernel.
+
+Two independent gaps fall out:
+
+  1. **Kernel-structural gap (~24%, bf16 deficit).** CK is 0.76x of
+     Triton at bf16 (geomean) — that's the deficit the kernel
+     carries regardless of dtype. Plausibly explained by a
+     combination of:
+       - `kBlockM` ∈ {16, 32, 128, 256} is calibrated for `qpkv ∈ {1,
+         2, 4, 8, 16}` divisors. For GQA-6 (qpkv=6, our trace) every
+         tier truncates: `kBlockQ_dyn = kBlockM/qpkv` integer-floors,
+         leaving `kBlockM - kBlockQ_dyn*qpkv` redundant rows per
+         tile. Worst case is `decode_d128_m16` (25% per-tile waste);
+         `prefill_d128` is only 1.5%, so this is not the dominant
+         factor for prefill specifically.
+       - Triton picks `BLOCK_M=128` for these shapes; CK's
+         `prefill_d128` uses `kBlockM=256` with 8 warps + 32×32×16
+         MFMA. Tile geometry / warp schedule differences are the
+         likely larger contributor to the bf16 gap; would need
+         rocprof to confirm which counters move.
+
+  2. **FP8 pipeline gap (~10pp on top, only visible at long Sk).**
+     The "FP8 speedup" delta between Triton (1.32x geomean) and CK
+     (1.22x) means **Triton extracts about 10pp more relative
+     speedup from FP8 than we do** on prefill. At `Sq=Sk=10000`
+     specifically the delta widens to 25-29pp (Triton 1.41-1.49x vs
+     CK 1.20-1.24x), which is the regime where the FP8 PV-MFMA +
+     cvt + softmax-on-FP8 inner loop dominates. CK's FP8 prefill
+     plumbing got its main attention in commits `06e1a70e7`,
+     `045b1f57b`, `7a319d9a4`, `3431615ff`, but those landed
+     primarily on decode-tier instances; `prefill_d128_fp8` for
+     irregular GQA likely still has slack in the cvt + cross-lane
+     swap + PV-MFMA pipeline.
+
+Short prefill (`Sq=Sk=1000`) inverts the FP8 signal: CK extracts more
+benefit from FP8 there (1.23-1.35x) than Triton (0.98-1.29x) because
+launch overhead dominates and the BF16-vs-FP8 K/V-bandwidth
+difference is too small to amortize Triton's per-launch fixed cost.
+Below ~5k tokens we should look at launch overhead / wrapper cost,
+not the FP8 pipeline.
 
 ### Heuristic fix — split-KV saturation guard for prefill
 
@@ -286,11 +339,17 @@ heuristic-driven).
 ### Reproducing the sweep
 
 ```bash
-# Full 68-cell sweep, ~5 min on a single MI355X.
+# Full 68-cell sweep, ~5 min on a single MI355X. Default dtype is FP8
+# (matches the production trace).
 ua-test-scripts/sweep_amir_shapes.py --gpu 2
 
 # Smaller 13-cell smoke pass.
 ua-test-scripts/sweep_amir_shapes.py --quick --gpu 2
+
+# Just the prefill phase, in BF16, for the dtype-isolation study above.
+ua-test-scripts/sweep_amir_shapes.py --gpu 2 \
+    --dtype bf16 --phase prefill \
+    --csv ua-test-scripts/sweep_amir_shapes_prefill_bf16.csv
 
 # Render the result CSV into a Markdown grid.
 ua-test-scripts/analyze_sweep.py --csv ua-test-scripts/sweep_amir_shapes.csv

@@ -112,7 +112,8 @@ def _parse_run(stdout: str) -> dict:
 
 # --- Driver ---------------------------------------------------------------
 
-def _run_one(batch: int, sq: int, sk: int, gpu: str, timeout_s: int) -> dict:
+def _run_one(batch: int, sq: int, sk: int, gpu: str, timeout_s: int,
+             dtype: str = "fp8") -> dict:
     env = os.environ.copy()
     env["HIP_VISIBLE_DEVICES"] = gpu
 
@@ -125,7 +126,7 @@ def _run_one(batch: int, sq: int, sk: int, gpu: str, timeout_s: int) -> dict:
         "--num-heads", "12,2",
         "--head-size", "128",
         "--block-size", "64",
-        "--dtype", "fp8",
+        "--dtype", dtype,
         "--num-blocks", "auto",
         "--triton",
         "--no-reference",  # speed: corr is already validated on representative shapes
@@ -150,6 +151,7 @@ def _run_one(batch: int, sq: int, sk: int, gpu: str, timeout_s: int) -> dict:
         "batch": batch,
         "sq":    sq,
         "sk":    sk,
+        "dtype": dtype,
         "phase": "decode" if sq == 1 else "prefill",
         "rc":    rc,
         "wall_s": round(dt, 1),
@@ -167,12 +169,14 @@ def _build_matrix(args) -> list[tuple[int, int, int]]:
         db, dsk, pb, psk = (DECODE_BATCHES, DECODE_SKS,
                             PREFILL_BATCHES, PREFILL_SQ_SK)
     cells: list[tuple[int, int, int]] = []
-    for b in db:
-        for sk in dsk:
-            cells.append((b, 1, sk))
-    for b in pb:
-        for (sq, sk) in psk:
-            cells.append((b, sq, sk))
+    if args.phase in ("decode", "all"):
+        for b in db:
+            for sk in dsk:
+                cells.append((b, 1, sk))
+    if args.phase in ("prefill", "all"):
+        for b in pb:
+            for (sq, sk) in psk:
+                cells.append((b, sq, sk))
     return cells
 
 
@@ -187,16 +191,25 @@ def main():
                     help="Run a smaller subset (~10 cells) for iteration")
     ap.add_argument("--timeout", type=int, default=300,
                     help="Per-cell timeout in seconds (default: 300)")
+    ap.add_argument("--dtype", default="fp8", choices=["fp8", "bf16", "fp16"],
+                    help="Activation dtype to run the sweep at. "
+                         "The production trace pins this to FP8 (e4m3); other "
+                         "dtypes are useful for isolating whether observed "
+                         "gaps are dtype-pipeline-specific or kernel-structural.")
+    ap.add_argument("--phase", default="all",
+                    choices=["all", "decode", "prefill"],
+                    help="Restrict to one phase of the sweep. Default: run both.")
     args = ap.parse_args()
 
     matrix = _build_matrix(args)
-    print(f"[sweep] device={args.gpu}  cells={len(matrix)}  out={args.csv}")
+    print(f"[sweep] device={args.gpu}  dtype={args.dtype}  "
+          f"phase={args.phase}  cells={len(matrix)}  out={args.csv}")
 
     csv_path = Path(args.csv)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     fieldnames = [
-        "phase", "batch", "sq", "sk",
+        "phase", "batch", "sq", "sk", "dtype",
         "num_splits",
         "ck_ms", "triton_ms", "speedup",
         "ck_bw", "triton_bw", "ck_tflops",
@@ -209,7 +222,7 @@ def main():
         for i, (b, sq, sk) in enumerate(matrix, 1):
             print(f"[{i:>3}/{len(matrix)}] b={b:<3} sq={sq:<5} sk={sk:<7}",
                   end="", flush=True)
-            row = _run_one(b, sq, sk, args.gpu, args.timeout)
+            row = _run_one(b, sq, sk, args.gpu, args.timeout, dtype=args.dtype)
             ck   = row["ck_ms"]
             tri  = row["triton_ms"]
             sp   = row["speedup"]
