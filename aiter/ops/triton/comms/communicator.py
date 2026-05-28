@@ -83,8 +83,10 @@ class AiterCommunicator:
 
         try:
             import iris
+            from iris.ccl.config import Config
 
             self._shmem = iris.iris(heap_size=self._HEAP_SIZE)
+            self._gluon_config = Config(use_gluon=True)
         except Exception as e:
             logger.warning("Failed to initialize Allreduce: %s", e)
             return
@@ -132,14 +134,6 @@ class AiterCommunicator:
         return self._input_buf
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        # Out-of-place: stage into symmetric heap buffer, reduce in place
-        # there, copy back to a fresh output. Matches CustomAllreduce.
-        # The two_shot variant fuses an end-barrier into the AR kernel
-        # itself (peer-flag handshake on the symmetric heap before exit),
-        # mirroring cross_device_reduce_1stage's barrier_at_end. No
-        # wrapper-level sync needed — async_op=True skips the host barrier
-        # and the kernel-internal rendezvous keeps cross-rank skew from
-        # leaking into downstream ops.
         assert self._shmem is not None
         try:
             out = torch.empty_like(inp)
@@ -148,13 +142,16 @@ class AiterCommunicator:
 
             if self._workspace is None:
                 self._workspace = self._shmem.ccl.all_reduce_preamble(
-                    input_buf, input_buf
+                    out, input_buf, config=self._gluon_config
                 )
             self._workspace = self._shmem.ccl.all_reduce(
-                input_buf, input_buf, workspace=self._workspace, async_op=True
+                out,
+                input_buf,
+                workspace=self._workspace,
+                config=self._gluon_config,
+                async_op=True,
             )
 
-            out.copy_(input_buf)
             return out
         except Exception as e:
             logger.error(
