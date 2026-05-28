@@ -172,7 +172,15 @@ def quantize(x, dtype):
 
 
 def bench_mlp_single_weight_init(
-    batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex,
+    batch,
+    dim1,
+    dim2,
+    n_expts_tot,
+    n_expts_act,
+    x_dtype,
+    w_dtype,
+    TP,
+    op_regex,
     preshuffle=False,
 ):
     rank = 0
@@ -304,7 +312,15 @@ def bench_mlp(
     all_results = []
     for _ in range(num_weight_inits):
         result = bench_mlp_single_weight_init(
-            batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex,
+            batch,
+            dim1,
+            dim2,
+            n_expts_tot,
+            n_expts_act,
+            x_dtype,
+            w_dtype,
+            TP,
+            op_regex,
             preshuffle=preshuffle,
         )
         all_results.append(result)
