@@ -92,12 +92,15 @@ class SwaCase:
     window_size_left: int
     window_size_right: int
     dtype: torch.dtype = dtypes.bf16
-    q_dtype: Optional[str] = None  # None or "fp8". FP8 SWA not yet supported.
+    # None or "fp8" (per-tensor static fp8e4m3 quant + descale, as in the
+    # existing CK UA harness). FP8 SWA is fully supported once the
+    # fp8 SWA instance menu is wired (8 variants × fp8).
+    q_dtype: Optional[str] = None
     num_blocks: int = 1024
     # When set, the dispatcher is expected to return "no matching kernel"
-    # because the corresponding SWA instance is not built in aiter today
-    # (e.g. d=128 decode SWA). The case is reported as SKIP rather than
-    # FAIL so the suite stays green on currently-shipped instances;
+    # because the corresponding SWA instance is not built in aiter for
+    # this (variant, dtype) pair. The case is reported as SKIP rather
+    # than FAIL so the suite stays green on currently-shipped instances;
     # flipping this to False (and rebuilding) confirms a new instance
     # landed and the case is now a live correctness check.
     expect_no_kernel: bool = False
@@ -240,9 +243,8 @@ _PRE128_SEQS = [(257, 257), (512, 512)]
 # heuristic routes a batch with num_tokens > num_seqs to a prefill tier
 # (which has SWA), so to genuinely exercise the decode-d128 tier we need
 # `q_len = 1` everywhere (num_tokens == num_seqs ⇒ max_seqlen_q = 1).
-# The d=128 decode SWA instances are not built in aiter today, so the
-# dispatcher returns "no matching kernel" here — these cases are
-# reported as SKIP, not FAIL.
+# The d=128 decode SWA instances are now wired in aiter, so these cases
+# are live correctness checks rather than SKIPs.
 _DECODE_D128_SEQS = [(1, 256), (1, 256), (1, 256), (1, 256)]
 
 # `seq_lens` rows are (query_len, kv_len) tuples that the bash test feeds via
@@ -289,31 +291,61 @@ SMOKE_CASES: List[SwaCase] = [
         mask_type=2, window_size_left=64, window_size_right=0,
         category="smoke",
     ),
-    # Pure d=128 decode SWA — no kernel instance built today. Reported
-    # as SKIP so the suite green-codes what's currently shipped. The day
-    # a d=128 decode SWA instance lands, the dispatcher will accept the
-    # call; flip `expect_no_kernel` to False at that point to promote
-    # these to live correctness checks.
+    # Pure d=128 decode SWA. All three decode tiers (m128 / m32 / m16)
+    # now have SWA kernel instances, so these are live correctness
+    # checks. The dispatcher routes by `max_rows = max_q * num_qpkv`;
+    # `q_len=1, num_qpkv=1` gives max_rows=1 → decode_d128_m16. To also
+    # cover the m32 / m128 tiers we add two GQA-shaped variants below.
     SwaCase(
         name="decode d128 MHA Q=1 xb:64",
         seq_lens=_DECODE_D128_SEQS,
         num_heads=(8, 8), head_size=128, block_size=64,
         mask_type=2, window_size_left=64, window_size_right=0,
-        expect_no_kernel=True, category="smoke",
+        category="smoke",
     ),
     SwaCase(
         name="decode d128 MHA Q=1 xb:128",
         seq_lens=_DECODE_D128_SEQS,
         num_heads=(8, 8), head_size=128, block_size=64,
         mask_type=2, window_size_left=128, window_size_right=0,
-        expect_no_kernel=True, category="smoke",
+        category="smoke",
     ),
     SwaCase(
         name="decode d128 MHA Q=1 b:64,0",
         seq_lens=_DECODE_D128_SEQS,
         num_heads=(8, 8), head_size=128, block_size=64,
         mask_type=2, window_size_left=64, window_size_right=0,
-        expect_no_kernel=True, category="smoke",
+        category="smoke",
+    ),
+    # Force the d=128 decode m32 tier: GQA-8 q=1 ⇒ avg_rows=8, max_rows
+    # bounded by max_q * nqpkv = 8 — still inside the m16 envelope. Bump
+    # max_q via a small prefix to push the tile up to m32. Easiest path:
+    # GQA-32 q=1 → max_rows=32.
+    SwaCase(
+        name="decode d128 m32 GQA-32 Q=1 xb:64",
+        seq_lens=[(1, 256)] * 4,
+        num_heads=(32, 1), head_size=128, block_size=64,
+        mask_type=2, window_size_left=64, window_size_right=0,
+        category="smoke",
+    ),
+    # And the m128 tier: GQA-8 q=16 ⇒ max_rows=128 (exactly on the edge,
+    # still inside the m128 bucket since the dispatcher uses `<=`).
+    SwaCase(
+        name="decode d128 m128 GQA-8 Q=16 xb:64",
+        seq_lens=[(16, 256)] * 4,
+        num_heads=(8, 1), head_size=128, block_size=64,
+        mask_type=2, window_size_left=64, window_size_right=0,
+        category="smoke",
+    ),
+    # Force the d=64 decode_d64_m64 tier (8.2): MHA q=32 ⇒ avg_rows=32,
+    # max_rows=32 → m64 bucket (after the m16 cut-off at <=16). Without
+    # this case the suite never lands on the new m64 SWA instance.
+    SwaCase(
+        name="decode d64 m64 MHA Q=32 xb:64",
+        seq_lens=[(32, 256)] * 4,
+        num_heads=(8, 8), head_size=64, block_size=64,
+        mask_type=2, window_size_left=64, window_size_right=0,
+        category="smoke",
     ),
 ]
 
@@ -371,6 +403,47 @@ GPTOSS_CASES: List[SwaCase] = [
     SwaCase("DECODE_BS32 QM    b:127,0", [(512, 1024), (1024, 1024), (512, 1024), (1024, 1024)],
             (8, 1), 64, 32, 2, 127, 0, category="gptoss"),
 ]
+
+# -----------------------------------
+# FP8 SWA fixtures (per-tensor fp8e4m3 quant + descale).
+# -----------------------------------
+# These exercise the IsLocal=true × DType=fp8 corner of the dispatch
+# matrix that the new instance menu covers. Tolerances bump to the
+# fp8 envelope used by the existing CK UA test (atol=1.5e-1, rtol=
+# 1.5e-1) — fp8 SWA noise is dominated by per-tile descale rounding,
+# not the mask. block_size>=32 is mandatory: the fp8 path's per-tile
+# scale-fold relies on >= 32-byte page rows (see _ck_dispatch_supported).
+FP8_CASES: List[SwaCase] = [
+    # Prefill SWA on d=64 / d=128.
+    SwaCase("fp8 prefill d64  xb:64",     _PRE_64_SEQS,  (8, 1), 64,  64, 2, 64,  0,
+            q_dtype="fp8", category="fp8"),
+    SwaCase("fp8 prefill d64  b:32,8",    _PRE_64_SEQS,  (8, 1), 64,  64, 2, 32,  8,
+            q_dtype="fp8", category="fp8"),
+    SwaCase("fp8 prefill d128 xb:64",     _PRE_128_SEQS, (8, 1), 128, 64, 2, 64,  0,
+            q_dtype="fp8", category="fp8"),
+    SwaCase("fp8 prefill d128 xt:64",     _PRE_128_SEQS, (8, 1), 128, 64, 1, 64,  0,
+            q_dtype="fp8", category="fp8"),
+    # Decode SWA tiers — one case per (d, m-bucket) cell of the matrix.
+    # d=64 m16 (MHA q=1):
+    SwaCase("fp8 decode d64  m16  MHA Q=1 xb:128", [(1, 512)] * 4,
+            (8, 8), 64, 32, 2, 128, 0, q_dtype="fp8", category="fp8"),
+    # d=64 m64 (MHA q=32):
+    SwaCase("fp8 decode d64  m64  MHA Q=32 xb:64", [(32, 256)] * 4,
+            (8, 8), 64, 32, 2, 64, 0, q_dtype="fp8", category="fp8"),
+    # d=64 m128 (GQA-8 q=128 → max_rows=128):
+    SwaCase("fp8 decode d64  m128 GQA-8 Q=128 xb:128", [(128, 1024)] * 4,
+            (8, 1), 64, 32, 2, 128, 0, q_dtype="fp8", category="fp8"),
+    # d=128 m16 (MHA q=1):
+    SwaCase("fp8 decode d128 m16  MHA Q=1 xb:64", [(1, 256)] * 4,
+            (8, 8), 128, 64, 2, 64, 0, q_dtype="fp8", category="fp8"),
+    # d=128 m32 (GQA-32 q=1 → max_rows=32):
+    SwaCase("fp8 decode d128 m32  GQA-32 Q=1 xb:64", [(1, 256)] * 4,
+            (32, 1), 128, 64, 2, 64, 0, q_dtype="fp8", category="fp8"),
+    # d=128 m128 (GQA-8 q=16 → max_rows=128):
+    SwaCase("fp8 decode d128 m128 GQA-8 Q=16 xb:64", [(16, 256)] * 4,
+            (8, 1), 128, 64, 2, 64, 0, q_dtype="fp8", category="fp8"),
+]
+
 
 # -----------------------------------
 # Non-page-aligned stress (page_size != kPageBlockSize tile size).
@@ -520,6 +593,7 @@ def _all_cases(include: List[str]) -> List[SwaCase]:
         "edge":      EDGE_CASES,
         "gptoss":    GPTOSS_CASES,
         "non-align": NONALIGN_CASES,
+        "fp8":       FP8_CASES,
     }
     out = []
     for cat in include:
@@ -539,7 +613,7 @@ def main() -> int:
                         help="Smoke cases only.")
     parser.add_argument(
         "--category", "-c", nargs="*", default=None,
-        choices=["smoke", "edge", "gptoss", "non-align", "all"],
+        choices=["smoke", "edge", "gptoss", "non-align", "fp8", "all"],
         help="Restrict to one or more case categories (default: all).",
     )
     parser.add_argument("--filter", "-k", type=str, default=None,
@@ -560,7 +634,7 @@ def main() -> int:
     elif args.category and "all" not in args.category:
         categories = args.category
     else:
-        categories = ["smoke", "edge", "gptoss", "non-align"]
+        categories = ["smoke", "edge", "gptoss", "non-align", "fp8"]
 
     cases = _all_cases(categories)
     if args.filter:
