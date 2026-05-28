@@ -954,6 +954,7 @@ def get_mla_metadata_info_v1(
     fast_mode: bool = True,
     num_kv_splits: int = 32,
     intra_batch_mode: bool = False,
+    max_split_per_batch: int = -1,
 ):
     """
     Returns:
@@ -1042,6 +1043,14 @@ def get_mla_metadata_info_v1(
     else:
         max_work = tile_cnt * cu_num
         max_split_tiles = tile_cnt * cu_num
+
+    # Metadata's global split cap is `min(cu_num, max_split_per_batch * batch_size)`
+    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). A single tile can in
+    # the worst case absorb the entire global budget, so reduce_partial_map must
+    # hold up to tile_cnt * per_tile_cap entries.
+    if max_split_per_batch > 0:
+        per_tile_cap = min(cu_num, max_split_per_batch * batch_size)
+        max_split_tiles = max(max_split_tiles, tile_cnt * per_tile_cap)
 
     if not intra_batch_mode:
         return (

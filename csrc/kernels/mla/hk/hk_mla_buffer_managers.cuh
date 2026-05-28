@@ -1667,10 +1667,18 @@ class OManager16bitsV1
     // Convert one 16x32 MFMA-result tile (8 float32 elements per lane) and store to VRAM.
     // GPR_START: starting GPR index of the 16x32 tile.
     // kColOffset: element-wise column offset in the output buffer.
-    template <uint32_t GPR_START, uint32_t kColOffset>
+    // kCheckOOB: when true, set num_records = (qo_end - qo_start) * rowstride
+    // bytes so HW suppresses lanes whose lane-offset falls past the per-batch
+    // valid range. When false (e.g. for split_output where the host allocates
+    // the full extent), use the unbounded SRSRC. qo_end is ignored in the
+    // latter case. In both branches the base pointer is advanced to the start
+    // of the qo_start row so the lane offset is small and fits the 32-bit
+    // V# num_records field even for very large total_q.
+    template <uint32_t GPR_START, uint32_t kColOffset, bool kCheckOOB>
     __device__ __forceinline__ void output_to_vram(const out_t* p_output,
                                                    const uint32_t warp_idx,
                                                    const uint32_t qo_start,
+                                                   const uint32_t qo_end,
                                                    const uintptr_t p_lds,
                                                    const uint32_t num_qheads)
     {
@@ -1680,14 +1688,19 @@ class OManager16bitsV1
         constexpr uint32_t kOffsetInBytes1 = kOffsetInBytes0 + kMfmaCols * sizeof(out_t);
 
         const uint32_t lane_idx     = opus::lane_id();
-        const uint32_t row_idx      = lane_idx % 16 + warp_idx * 16 + qo_start * num_qheads;
+        const uint32_t row_idx      = lane_idx % 16 + warp_idx * 16;
         const uint32_t col_idx_base = (lane_idx / 16) * 4;
         const uint32_t offset       = (row_idx * T::kVoHeadDim + col_idx_base) * sizeof(out_t);
 
-        const uintptr_t out_as_int = reinterpret_cast<uintptr_t>(p_output);
-        const uint64_t out_as_u64  = static_cast<uint64_t>(out_as_int);
+        const uintptr_t p_output_batch =
+            reinterpret_cast<uintptr_t>(p_output) +
+            uint64_t(qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t);
+        const uint32_t num_records =
+            kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
+                      : 0xFFFFFFFFu;
         const hk::buffer_resource out_br =
-            hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
+                                     num_records, 0x00020000);
 
         v2ui b16_pair_0;
         v2ui b16_pair_1;
@@ -1754,10 +1767,12 @@ class OManager16bitsV2
     // Convert one 16x32 MFMA-result tile (8 float32 elements per lane) and store to VRAM.
     // GPR_START: starting GPR index of the 16x32 tile.
     // kColOffset: element-wise column offset in the output buffer.
-    template <uint32_t GPR_START, uint32_t kColOffset>
+    // See OManager16bitsV1 for the kCheckOOB contract.
+    template <uint32_t GPR_START, uint32_t kColOffset, bool kCheckOOB>
     __device__ __forceinline__ void output_to_vram(const out_t* p_output,
                                                    const uint32_t warp_idx,
                                                    const uint32_t qo_start,
+                                                   const uint32_t qo_end,
                                                    const uintptr_t p_lds,
                                                    const uint32_t num_qheads)
     {
@@ -1782,15 +1797,20 @@ class OManager16bitsV2
         const uint32_t col_lds_ld      = (lane_idx % kVramStLanePerRow) * kVramStElemPerLane;
         const uint32_t v_offset_lds_ld = get_v_offset_lds(row_lds_ld, col_lds_ld);
 
-        const uint32_t row_vram_st = row_lds_ld + qo_start * num_qheads + warp_idx * kNumRows;
+        const uint32_t row_vram_st = row_lds_ld + warp_idx * kNumRows;
         const uint32_t col_vram_st = col_lds_ld;
         const uint32_t v_offset_vram_st =
             (row_vram_st * T::kVoHeadDim + col_vram_st) * sizeof(out_t);
 
-        const uintptr_t out_as_int = reinterpret_cast<uintptr_t>(p_output);
-        const uint64_t out_as_u64  = static_cast<uint64_t>(out_as_int);
+        const uintptr_t p_output_batch =
+            reinterpret_cast<uintptr_t>(p_output) +
+            uint64_t(qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t);
+        const uint32_t num_records =
+            kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
+                      : 0xFFFFFFFFu;
         const hk::buffer_resource out_br =
-            hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
+                                     num_records, 0x00020000);
 
         v2ui b16_pair_0;
         v2ui b16_pair_1;
@@ -1835,10 +1855,12 @@ class OManager32bitsV1
     // Convert one 16x32 MFMA-result tile (8 float32 elements per lane) and store to VRAM.
     // GPR_START: starting GPR index of the 16x32 tile.
     // kColOffset: element-wise column offset in the output buffer.
-    template <uint32_t GPR_START, uint32_t kColOffset>
+    // See OManager16bitsV1 for the kCheckOOB contract.
+    template <uint32_t GPR_START, uint32_t kColOffset, bool kCheckOOB>
     __device__ __forceinline__ void output_to_vram(const out_t* p_output,
                                                    const uint32_t warp_idx,
                                                    const uint32_t qo_start,
+                                                   const uint32_t qo_end,
                                                    const uintptr_t p_lds,
                                                    const uint32_t num_qheads)
     {
@@ -1848,32 +1870,24 @@ class OManager32bitsV1
         constexpr uint32_t kOffsetInBytes1 = kOffsetInBytes0 + kMfmaCols * sizeof(out_t);
 
         const uint32_t lane_idx     = opus::lane_id();
-        const uint32_t row_idx      = lane_idx % 16 + warp_idx * 16 + qo_start * num_qheads;
+        const uint32_t row_idx      = lane_idx % 16 + warp_idx * 16;
         const uint32_t col_idx_base = (lane_idx / 16) * 4;
         const uint32_t offset       = (row_idx * T::kVoHeadDim + col_idx_base) * sizeof(out_t);
 
-        const uintptr_t out_as_int = reinterpret_cast<uintptr_t>(p_output);
-        const uint64_t out_as_u64  = static_cast<uint64_t>(out_as_int);
+        const uintptr_t p_output_batch =
+            reinterpret_cast<uintptr_t>(p_output) +
+            uint64_t(qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t);
+        const uint32_t num_records =
+            kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
+                      : 0xFFFFFFFFu;
         const hk::buffer_resource out_br =
-            hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
+                                     num_records, 0x00020000);
 
         if constexpr(std::is_same_v<out_t, float>)
         {
             hkm::buffer_store_dwordx4<GPR_START>(out_br, offset, 0, kOffsetInBytes0);
             hkm::buffer_store_dwordx4<GPR_START + 4>(out_br, offset, 0, kOffsetInBytes1);
-
-            // asm volatile("buffer_store_dwordx4 v[%0:%1], %4, %5, 0 offen offset:%6\n\t"
-            //              "buffer_store_dwordx4 v[%2:%3], %4, %5, 0 offen offset:%7"
-            //              :
-            //              : "i"(GPR_START),
-            //                "i"(GPR_START + 3),
-            //                "i"(GPR_START + 4),
-            //                "i"(GPR_START + 7),
-            //                "v"(offset),
-            //                "s"(*(hk::i32x4*)&out_br),
-            //                "i"(kOffsetInBytes0),
-            //                "i"(kOffsetInBytes1)
-            //              : "memory");
         }
         else
         {
@@ -1924,10 +1938,12 @@ class OManager32bitsV2
     // Convert one 16x32 MFMA-result tile (8 float32 elements per lane) and store to VRAM.
     // GPR_START: starting GPR index of the 16x32 tile.
     // kColOffset: element-wise column offset in the output buffer.
-    template <uint32_t GPR_START, uint32_t kColOffset>
+    // See OManager16bitsV1 for the kCheckOOB contract.
+    template <uint32_t GPR_START, uint32_t kColOffset, bool kCheckOOB>
     __device__ __forceinline__ void output_to_vram(const out_t* p_output,
                                                    const uint32_t warp_idx,
                                                    const uint32_t qo_start,
+                                                   const uint32_t qo_end,
                                                    const uintptr_t p_lds,
                                                    const uint32_t num_qheads)
     {
@@ -1950,15 +1966,20 @@ class OManager32bitsV2
         const uint32_t col_lds_ld      = (lane_idx % kVramStLanePerRow) * kVramStElemPerLane;
         const uint32_t v_offset_lds_ld = get_v_offset_lds(row_lds_ld, col_lds_ld);
 
-        const uint32_t row_vram_st = row_lds_ld + qo_start * num_qheads + warp_idx * kNumRows;
+        const uint32_t row_vram_st = row_lds_ld + warp_idx * kNumRows;
         const uint32_t col_vram_st = col_lds_ld;
         const uint32_t v_offset_vram_st =
             (row_vram_st * T::kVoHeadDim + col_vram_st) * sizeof(out_t);
 
-        const uintptr_t out_as_int = reinterpret_cast<uintptr_t>(p_output);
-        const uint64_t out_as_u64  = static_cast<uint64_t>(out_as_int);
+        const uintptr_t p_output_batch =
+            reinterpret_cast<uintptr_t>(p_output) +
+            uint64_t(qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t);
+        const uint32_t num_records =
+            kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
+                      : 0xFFFFFFFFu;
         const hk::buffer_resource out_br =
-            hk::make_buffer_resource(out_as_u64, 0xFFFFFFFF, 0x00020000);
+            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
+                                     num_records, 0x00020000);
 
         if constexpr(std::is_same_v<out_t, float>)
         {
