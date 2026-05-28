@@ -3039,9 +3039,17 @@ def compile_mixed_moe_gemm2(
             model_dim_pad_idx = arith.index_cast(
                 ir.IndexType.get(), i32_model_dim_pad_in.ir_value()
             )
-            # i32_inter_dim_pad_in is kept in the kernel signature for ABI
-            # parity with stage1; stage2's K-tail no longer specializes on it
-            # (weight pad region is zero -- full k_unroll is correct).
+            # Runtime K-tail handling: stage1's output `out` has uninitialized
+            # bytes in cols [inter_dim - inter_dim_pad, inter_dim) because
+            # stage1's grid skips those N-tiles. If stage2 reads those bytes
+            # into A, NaN propagates (W2 pad-K rows are 0 but 0*NaN = NaN).
+            # We mask A loads in the DMA path: chunks whose K-byte position
+            # extends past `k_in - inter_dim_pad` use an OOB sentinel offset,
+            # which makes raw_ptr_buffer_load_lds write 0 into LDS instead.
+            inter_dim_pad_idx_s2 = arith.index_cast(
+                ir.IndexType.get(), i32_inter_dim_pad_in.ir_value()
+            )
+            k_in_eff_s2 = arith.subi(k_in, inter_dim_pad_idx_s2)  # valid K
             x_elem = T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
             f32 = T.f32
             i32 = T.i32
@@ -3976,6 +3984,25 @@ def compile_mixed_moe_gemm2(
                         4,
                     )
 
+                    # Per-tile runtime mask vs (inter_dim - inter_dim_pad).
+                    #   valid_bytes_in_tile = clamp(k_in_eff - base_k, 0, tile_k)
+                    #                         * a_elem_bytes
+                    # Each thread loads _dma_bytes at byte offset col_local_sw
+                    # within the tile; if the chunk extends past valid_bytes,
+                    # we redirect global_offset to a large sentinel so the
+                    # HW buffer bounds-check writes 0 into LDS instead of NaN.
+                    _c_zero_idx = arith.constant(0, index=True)
+                    _c_tile_k_idx = arith.constant(int(tile_k), index=True)
+                    _diff_eff = arith.subi(k_in_eff_s2, base_k)
+                    _valid_in_tile = arith.maxsi(
+                        _c_zero_idx, arith.minsi(_c_tile_k_idx, _diff_eff)
+                    )
+                    _valid_bytes_in_tile = _valid_in_tile * arith.constant(
+                        int(a_elem_bytes), index=True
+                    )
+                    _sentinel_i32 = arith.constant(0x7FFFFFFF, type=T.i32)
+                    _c_dma_bytes_idx = arith.constant(int(_dma_bytes), index=True)
+
                     lds_ptr_i64 = None
                     for i in range_constexpr(_num_dma_loads):
                         row_local_i = x_row_local[i]
@@ -3986,6 +4013,18 @@ def compile_mixed_moe_gemm2(
                         row_k_dw = x_row_base_div4[i] + base_k_div4
                         global_byte_idx = row_k_dw * c4_idx + col_local_sw
                         global_offset = arith.index_cast(T.i32, global_byte_idx)
+
+                        # Mask chunks whose tail extends past valid bytes.
+                        _chunk_end_byte = arith.addi(
+                            arith.index_cast(ir.IndexType.get(), col_local_sw),
+                            _c_dma_bytes_idx,
+                        )
+                        _in_valid = arith.cmpi(
+                            CmpIPredicate.ule, _chunk_end_byte, _valid_bytes_in_tile
+                        )
+                        global_offset = arith.select(
+                            _in_valid, global_offset, _sentinel_i32
+                        )
 
                         if const_expr(i == 0):
                             lds_addr = memref.extract_aligned_pointer_as_index(
