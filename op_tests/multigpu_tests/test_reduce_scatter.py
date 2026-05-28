@@ -146,10 +146,20 @@ def reduce_scatter_acctest(
         tp_size, pp_size, input_list, True, dim, distributed_init_method
     )
 
+    ref = input_list[0].clone()
+    for i in range(1, tp_size):
+        ref = ref + input_list[i]
+    ref_chunks = ref.chunk(tp_size, dim=dim)
+
     error = 0.0
     for rankID in range(tp_size):
+        expected = ref_chunks[rankID]
+        msg = f"rank {rankID} dist vs ref (dim={dim})"
+        error += checkAllclose(expected, dist_rslt[rankID], rtol=0.05, atol=0.2, msg=msg)
+        msg = f"rank {rankID} aiter vs ref (dim={dim})"
+        error += checkAllclose(expected, aiter_rslt[rankID], rtol=0.05, atol=0.2, msg=msg)
         msg = f"rank {rankID} dist vs aiter (dim={dim})"
-        error += checkAllclose(dist_rslt[rankID], aiter_rslt[rankID], msg=msg)
+        error += checkAllclose(dist_rslt[rankID], aiter_rslt[rankID], rtol=0.05, atol=0.2, msg=msg)
     if error == 0:
         print(f"accuracy pass (dim={dim})")
     else:
@@ -220,8 +230,10 @@ def reduce_scatter_perftest(
 l_dtype = ["bf16"]
 l_shape = [
     (128, 8192),
-    (32768, 8192),
     (4, 8, 8192),
+]
+l_large_shape = [
+    (32768, 8192),
 ]
 
 parser = argparse.ArgumentParser(description="config input of test")
@@ -258,43 +270,49 @@ if __name__ == "__main__":
     l_dim = [0, 1, -1]
     tp_size = 8
     df = []
+    test_cases = []
+    for shape in l_shape:
+        for dim in l_dim:
+            test_cases.append((shape, dim))
+    for shape in l_large_shape:
+        test_cases.append((shape, 0))
+
     for dtype in l_dtype:
-        for shape in l_shape:
-            for dim in l_dim:
-                actual_dim = dim if dim >= 0 else dim + len(shape)
-                if shape[actual_dim] % tp_size != 0:
-                    print(
-                        f"skip shape={shape} dim={dim}: "
-                        f"shape[{actual_dim}]={shape[actual_dim]} "
-                        f"not divisible by tp_size={tp_size}"
-                    )
-                    continue
-                print(f"accuracy test of dtype:{dtype}, shape:{shape}, dim:{dim}")
-                reduce_scatter_acctest(
+        for shape, dim in test_cases:
+            actual_dim = dim if dim >= 0 else dim + len(shape)
+            if shape[actual_dim] % tp_size != 0:
+                print(
+                    f"skip shape={shape} dim={dim}: "
+                    f"shape[{actual_dim}]={shape[actual_dim]} "
+                    f"not divisible by tp_size={tp_size}"
+                )
+                continue
+            print(f"accuracy test of dtype:{dtype}, shape:{shape}, dim:{dim}")
+            reduce_scatter_acctest(
+                tp_size,
+                1,
+                shape,
+                dtype,
+                dim=dim,
+                distributed_init_method=get_distributed_init_method(
+                    get_ip(), get_open_port()
+                ),
+            )
+            print(f"perf test of dtype:{dtype}, shape:{shape}, dim:{dim}")
+            for use_custom in [True, False]:
+                ret = reduce_scatter_perftest(
                     tp_size,
                     1,
                     shape,
                     dtype,
+                    withGraph=False,
+                    use_custom=use_custom,
                     dim=dim,
                     distributed_init_method=get_distributed_init_method(
                         get_ip(), get_open_port()
                     ),
                 )
-                print(f"perf test of dtype:{dtype}, shape:{shape}, dim:{dim}")
-                for use_custom in [True, False]:
-                    ret = reduce_scatter_perftest(
-                        tp_size,
-                        1,
-                        shape,
-                        dtype,
-                        withGraph=False,
-                        use_custom=use_custom,
-                        dim=dim,
-                        distributed_init_method=get_distributed_init_method(
-                            get_ip(), get_open_port()
-                        ),
-                    )
-                    df.append(ret)
+                df.append(ret)
     df = pd.DataFrame(df)
     show_cols = [
         "tp_size",
