@@ -569,7 +569,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if gate_mode not in (GateMode.SEPARATED, GateMode.INTERLEAVE):
         _grouped_dbg(f"unsupported gate_mode={gate_mode}")
         return None
-    stage1_weight_layout = "gugu" if gate_mode == GateMode.INTERLEAVE else "gguu"
+    env_stage1_layout = os.environ.get("AITER_GROUPED_STAGE1_WEIGHT_LAYOUT", "").strip().lower()
+    if env_stage1_layout:
+        if env_stage1_layout not in ("gguu", "gugu"):
+            raise ValueError(
+                "AITER_GROUPED_STAGE1_WEIGHT_LAYOUT must be 'gguu' or 'gugu', "
+                f"got {env_stage1_layout!r}"
+            )
+        stage1_weight_layout = env_stage1_layout
+    else:
+        stage1_weight_layout = "gugu" if gate_mode == GateMode.INTERLEAVE else "gguu"
     is_grouped_a4w4 = q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2
     is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and (q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8)
     if not (is_grouped_a4w4 or is_grouped_a8w4):
