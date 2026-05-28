@@ -98,7 +98,7 @@ gfx950,256,4096,8192,28672,False,torch.bfloat16,torch.bfloat16,False,False,asm,1
 gfx950,256,8192,8192,1024,False,torch.bfloat16,torch.bfloat16,False,False,asm,10,1,121.9167,_ZN5aiter24bf16gemm_bf16_tn_256x256E,0.0,1127.32,1376.12
 gfx950,256,8192,8192,3584,False,torch.bfloat16,torch.bfloat16,False,False,asm,10,1,337.4416,_ZN5aiter24bf16gemm_bf16_tn_256x256E,0.0,1425.54,745.78
 gfx950,256,8192,8192,7168,False,torch.bfloat16,torch.bfloat16,False,False,asm,10,1,630.3348,_ZN5aiter24bf16gemm_bf16_tn_256x256E,0.0,1526.29,585.56
-gfx950,256,8192,8192,8192,False,torch.bfloat16,torch.bfloat16,False,False,asm,10,1,713.5721,_ZN5aiter24bf16gemm_bf16_tn_256x256E,0.0,1540.86,564.28
+gfx950,256,8192,8192,8192,False,torch.bfloat16,torch.bfloat16,False,False,asm,10,1,688.6517,_ZN5aiter24bf16gemm_bf16_tn_256x256E,0.0,1596.61,584.7
 gfx950,256,8192,8192,28672,False,torch.bfloat16,torch.bfloat16,False,False,asm,10,1,2497.3336,_ZN5aiter24bf16gemm_bf16_tn_256x256E,0.0,1540.96,429.96
 gfx950,256,16384,8192,1024,False,torch.bfloat16,torch.bfloat16,False,False,asm,10,1,236.8495,_ZN5aiter24bf16gemm_bf16_tn_256x256E,0.0,1160.56,1345.86
 gfx950,256,16384,8192,3584,False,torch.bfloat16,torch.bfloat16,False,False,asm,10,1,657.6327,_ZN5aiter24bf16gemm_bf16_tn_256x256E,0.0,1462.93,676.06

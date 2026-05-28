@@ -49,6 +49,45 @@ except ImportError as exc:
     get_flydsl_splitk_hgemm_kernels = None
     FLYDSL_TUNE_ERROR = str(exc)
 
+OPUS_TUNE_ERROR = None
+try:
+    import sys as _sys
+
+    _opus_csrc = os.path.join(os.path.dirname(__file__), "../../csrc/opus_gemm")
+    if _opus_csrc not in _sys.path:
+        _sys.path.insert(0, os.path.abspath(_opus_csrc))
+    # opus_gemm_common owns the data constants (kid sets); the host-side
+    # tune helpers (candidate_kids_for_shape, candidate_splitK,
+    # kid_rejects_*, _ensure_kids_compiled) live in opus_gemm_tune.py
+    # because they are tune-only logic and have no consumer at codegen
+    # time (gen_instances.py) or at runtime dispatch (aiter.ops.opus).
+    from opus_gemm_common import (
+        kernels_list as _opus_kernels_list,
+    )
+    from opus_gemm_tune import (
+        candidate_kids_for_shape as _opus_candidate_kids_for_shape,
+        candidate_splitK as _opus_candidate_splitK,
+        kid_rejects_shape as _opus_kid_rejects_shape,
+        kid_rejects_bias as _opus_kid_rejects_bias,
+        _ensure_kids_compiled as _opus_ensure_kids_compiled,
+    )
+    from aiter.ops.opus.gemm_op_a16w16 import (
+        opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
+    )
+
+    # The full kid universe (used for symbol resolution; the runtime kid
+    # subset per shape is computed by candidate_kids_for_shape()).
+    _opus_all_kernels = dict(_opus_kernels_list)
+except Exception as _opus_exc:
+    _opus_gemm_a16w16_tune = None
+    _opus_all_kernels = None
+    _opus_candidate_kids_for_shape = None
+    _opus_kid_rejects_shape = None
+    _opus_kid_rejects_bias = None
+    _opus_candidate_splitK = None
+    _opus_ensure_kids_compiled = None
+    OPUS_TUNE_ERROR = str(_opus_exc)
+
 
 @lru_cache(maxsize=1)
 def init_hipblas():
@@ -91,6 +130,71 @@ def run_gemm_bf16_asm(
 
 def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
+
+
+# Per-(kid, splitK, shape) max_delta-check cache.
+# --------------------------------------------------
+# The check itself (fp32 bmm + max diff) is HEAVY (e.g. ~8ms for
+# 32K x 2K x 7K), so running it on every iter of run_perftest's
+# num_iters=101 hot loop adds 100 * 8ms = 800ms of pure ref-compute
+# time to each candidate, AND inflates the reported per-iter latency
+# to (kernel + ref) ≈ kernel + ~8ms. That hides the true kernel
+# ranking (every candidate measures ~ref_time) and makes mp_tuner
+# pick a sub-optimal winner -- e.g. on 32K x 2K x 7K the tuner
+# reported kid=9 @ 108 TFLOPS while persistent kid=304 actually runs
+# at 1172 TFLOPS (11x faster).
+#
+# We keep the safety gate (it's the only thing that catches
+# silent-OOB / cluster-store / accumulator bugs that pass
+# err_ratio), but run it exactly ONCE per (kid, splitK, shape, bias)
+# combo per process. Cache lives at module scope so it survives the
+# repeated run_opus_gemm_bf16 calls inside run_perftest.
+_opus_max_delta_checked = set()
+
+
+def run_opus_gemm_bf16(inp, weight, out, bias=None, kid=0, splitK=0):
+    inp3 = inp.unsqueeze(0)
+    weight3 = weight.unsqueeze(0)
+    out3 = out.unsqueeze(0)
+    _opus_gemm_a16w16_tune(
+        inp3,
+        weight3,
+        out3,
+        bias=bias,
+        kernelId=kid,
+        splitK=splitK,
+    )
+    if torch.cuda.is_current_stream_capturing():
+        return out
+    cache_key = (
+        kid,
+        splitK,
+        inp.size(0),
+        weight.size(0),
+        inp.size(-1),
+        bias is not None,
+        str(out.dtype),
+    )
+    if cache_key in _opus_max_delta_checked:
+        return out
+    # First call for this (kid, shape, splitK, bias): build fp32 reference
+    # and gate on max_delta. See opus_gemm_tune.py:MAX_DELTA_SCALE for
+    # rationale (10% of max|ref|, floor 1.0).
+    ref_fp32 = torch.bmm(inp3.float(), weight3.float().transpose(-1, -2))
+    if bias is not None:
+        ref_fp32 = ref_fp32 + bias.float().unsqueeze(-1)
+    max_delta = (out3.float() - ref_fp32).abs().max().item()
+    max_ref = ref_fp32.abs().max().item()
+    bound = max(max_ref * 0.1, 1.0)
+    if max_delta > bound:
+        raise RuntimeError(
+            f"opus maxDelta {max_delta:.3f} > bound {bound:.3f} "
+            f"(max|ref|={max_ref:.3f}, scale=0.1) "
+            f"for kid={kid} splitK={splitK} bias={bias is not None} "
+            f"M={inp.size(0)} N={weight.size(0)} K={inp.size(-1)}"
+        )
+    _opus_max_delta_checked.add(cache_key)
+    return out
 
 
 @lru_cache(maxsize=1)
@@ -238,7 +342,16 @@ def generate_data(
     # if scaleAB:
     #    scaleB = scaleB.t()
     out_asm = torch.empty(m, n, dtype=outdtype, device=device)
-    return (inp, weights, weights.t(), bias, x_scale, out_asm, shuffleweights, w_scale)
+    return {
+        "inp": inp,
+        "weights": weights,
+        "weights_t": weights.t(),
+        "bias": bias,
+        "x_scale": x_scale,
+        "out_asm": out_asm,
+        "shuffleweights": shuffleweights,
+        "w_scale": w_scale,
+    }
 
 
 def get_gemm_ref(inp, weights, bias, scaleA, scaleB, indtype, outdtype):
@@ -315,16 +428,13 @@ class Gemm:
         self.outdtype = outdtype
         self.scaleAB = scaleAB
         self.nb = CACHE_INVALIDATE_BUFFERS
-        (
-            self.inp,
-            self.weights,
-            _,
-            self.bias,
-            self.x_scale,
-            _,
-            self.shuffleweights,
-            self.w_scale,
-        ) = generate_data(m, n, k, indtype, outdtype, scaleAB, is_shuffle, 0, bias)
+        data = generate_data(m, n, k, indtype, outdtype, scaleAB, is_shuffle, 0, bias)
+        self.inp = data["inp"]
+        self.weights = data["weights"]
+        self.bias = data["bias"]
+        self.x_scale = data["x_scale"]
+        self.shuffleweights = data["shuffleweights"]
+        self.w_scale = data["w_scale"]
         self.blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device="cuda")
         self.topn = 20  # number of top solutions from each source
         self.hipb_sols = []
@@ -530,7 +640,110 @@ class Gemm:
                             self.has_bias,
                         ),
                         run_gemm_bf16_asm,
-                        ([0, 6, 5, 3], splitK, kernelName, self.is_shuffle),
+                        (
+                            ["inp", "shuffleweights", "out_asm", "bias"],
+                            splitK,
+                            kernelName,
+                            self.is_shuffle,
+                        ),
+                        {
+                            "num_warmup": self.num_warmup,
+                            "num_iters": 101,
+                        },
+                        get_gemm_ref,
+                        (
+                            ["inp", "weights", "bias", "x_scale", "w_scale"],
+                            self.indtype,
+                            self.outdtype,
+                        ),
+                        {},
+                        None,  # self.ref if fast_mode == 0 else None,
+                        self.rtol,
+                        self.atol,
+                        None,
+                        None,
+                        ("out_asm",),
+                    )
+                )
+
+                solutions = solutions + 1
+        # ret = mp_tuner(task_asm, in_data, self.mp, False)
+        return task_asm
+
+    def opus_gemm_all_sols(self):
+        if _opus_gemm_a16w16_tune is None:
+            logger.warning(
+                "opus is not available for tuning, skip. " f"reason: {OPUS_TUNE_ERROR}"
+            )
+            return []
+        if self.scaleAB or self.indtype != dtypes.bf16:
+            return []
+        tasks = []
+        cu_num = get_cu_num()
+        # Smart candidate selection: instead of iterating ALL kids for every
+        # shape, ask the shared helper for the subset that's worth measuring
+        # given (M, N, K, bias, cu_num). The helper implements the
+        # "small-problem -> only splitk; otherwise both classes; K-misaligned
+        # or bias -> safe fallback" decision tree. See
+        # csrc/opus_gemm/opus_gemm_common.py::candidate_kids_for_shape.
+        cand_kids = _opus_candidate_kids_for_shape(
+            self.m, self.n, self.k, self.has_bias, cu_num
+        )
+        for kid in sorted(cand_kids):
+            k_inst = _opus_all_kernels.get(kid)
+            if k_inst is None:
+                # Defensive: candidate_kids_for_shape returns kids from
+                # SPLITK_KIDS | NON_SPLITK_KIDS, all of which live in
+                # kernels_list. Skip if somehow stale.
+                continue
+            # Apply the per-kid host-side reject filter on top (catches
+            # launcher TORCH_CHECK rejects + known correctness bugs for
+            # specific (kid, shape) combos that the coarse occupancy rule
+            # doesn't know about).
+            if _opus_kid_rejects_shape(k_inst, self.m, self.n, self.k):
+                continue
+            if _opus_kid_rejects_bias(k_inst, self.has_bias):
+                continue
+            if k_inst.kernel_tag == "a16w16_flatmm_splitk":
+                splitK_range = _opus_candidate_splitK(
+                    self.m, self.n, self.k, 1, cu_num, k_inst
+                )
+            else:
+                splitK_range = [0]
+            for sk in splitK_range:
+                info = (
+                    (
+                        self.m,
+                        self.n,
+                        self.k,
+                        self.has_bias,
+                        str(self.indtype),
+                        str(self.outdtype),
+                        self.scaleAB,
+                        self.is_shuffle,
+                    ),
+                    kid,
+                    sk,
+                    "opus",
+                    k_inst.name,
+                )
+                tasks.append(
+                    (
+                        info,
+                        generate_data,
+                        (
+                            self.m,
+                            self.n,
+                            self.k,
+                            self.indtype,
+                            self.outdtype,
+                            self.scaleAB,
+                            self.is_shuffle,
+                            0,
+                            self.has_bias,
+                        ),
+                        run_opus_gemm_bf16,
+                        ([0, 1, 5, 3], kid, sk),
                         {
                             "num_warmup": self.num_warmup,
                             "num_iters": 101,
@@ -538,15 +751,16 @@ class Gemm:
                         get_gemm_ref,
                         ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
                         {},
-                        None,  # self.ref if fast_mode == 0 else None,
-                        self.rtol,
-                        self.atol,
+                        None,
+                        2e-2,
+                        1.0,
                     )
                 )
-
-                solutions = solutions + 1
-        # ret = mp_tuner(task_asm, in_data, self.mp, False)
-        return task_asm
+        logger.info(
+            f"opus candidate count for M={self.m}, N={self.n}, K={self.k}: "
+            f"{len(tasks)}"
+        )
+        return tasks
 
     def run_asm_triton_sols(self):
         tasks = []
@@ -560,6 +774,21 @@ class Gemm:
             tasks.extend(self.triton_gemm_all_sols())
         if "all" in self.libtype or "asm" in self.libtype:
             tasks.extend(self.asm_gemm_all_solutions())
+        if "all" in self.libtype or "opus" in self.libtype:
+            opus_tasks = self.opus_gemm_all_sols()
+            # If opus is enabled and tasks are scheduled, ensure every kid
+            # they reference is compiled into module_deepgemm_opus.so. The
+            # helper expands the subset-compile sidecar + forces a JIT
+            # rebuild only if at least one candidate kid is missing.
+            if opus_tasks and _opus_ensure_kids_compiled is not None:
+                opus_kids = {t[0][1] for t in opus_tasks}  # info[1] is kid
+                if _opus_ensure_kids_compiled(opus_kids):
+                    logger.info(
+                        f"opus subset-compile: expanded sidecar to cover "
+                        f"{len(opus_kids)} candidate kids; "
+                        f"module_deepgemm_opus will rebuild on next call."
+                    )
+            tasks.extend(opus_tasks)
         solutions = len(tasks)
         in_data = [
             (
@@ -586,7 +815,7 @@ class Gemm:
 
         task = []
         flydsl_catalog = get_flydsl_bf16_catalog(self.m, self.n, self.k)
-        weight_idx = 6 if self.is_shuffle else 1
+        weight_key = "shuffleweights" if self.is_shuffle else "weights"
         min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
         for solidx, kernel_name, config in flydsl_catalog:
             if config.get("b_preshuffle", False) != self.is_shuffle:
@@ -639,13 +868,17 @@ class Gemm:
                         self.has_bias,
                     ),
                     run_flydsl_gemm_bf16,
-                    ([0, weight_idx, 3], self.outdtype, config),
+                    (["inp", weight_key, "bias"], self.outdtype, config),
                     {
                         "num_warmup": self.num_warmup,
                         "num_iters": 101,
                     },
                     get_gemm_ref,
-                    ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                    (
+                        ["inp", "weights", "bias", "x_scale", "w_scale"],
+                        self.indtype,
+                        self.outdtype,
+                    ),
                     {},
                     None,
                     self.rtol,
@@ -704,13 +937,17 @@ class Gemm:
                     True if self.bias is not None else False,
                 ),
                 run_skinny_gemm_a16w16,
-                ([0, 1, 3], self.outdtype),
+                (["inp", "weights", "bias"], self.outdtype),
                 {
                     "num_warmup": self.num_warmup,
                     "num_iters": 101,
                 },
                 get_gemm_ref,
-                ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                (
+                    ["inp", "weights", "bias", "x_scale", "w_scale"],
+                    self.indtype,
+                    self.outdtype,
+                ),
                 {},
                 None,
                 self.rtol,
@@ -765,13 +1002,20 @@ class Gemm:
                     True if self.bias is not None else False,
                 ),
                 run_torch_gemm_a16w16,
-                ([0, 1, 3, 4, 7], self.outdtype),
+                (
+                    ["inp", "weights", "bias", "x_scale", "w_scale"],
+                    self.outdtype,
+                ),
                 {
                     "num_warmup": self.num_warmup,
                     "num_iters": 101,
                 },
                 get_gemm_ref,
-                ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                (
+                    ["inp", "weights", "bias", "x_scale", "w_scale"],
+                    self.indtype,
+                    self.outdtype,
+                ),
                 {},
                 None,
                 self.rtol,
@@ -824,13 +1068,17 @@ class Gemm:
                     True if self.bias is not None else False,
                 ),
                 run_triton_gemm_bf16,
-                ([0, 1, 3], self.outdtype),
+                (["inp", "weights", "bias"], self.outdtype),
                 {
                     "num_warmup": self.num_warmup,
                     "num_iters": 101,
                 },
                 get_gemm_ref,
-                ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                (
+                    ["inp", "weights", "bias", "x_scale", "w_scale"],
+                    self.indtype,
+                    self.outdtype,
+                ),
                 {},
                 None,  # self.ref if fast_mode == 0 else None,
                 self.rtol,
@@ -885,13 +1133,22 @@ class Gemm:
                         self.has_bias,
                     ),
                     call_hipb_mm,
-                    ([0, 6, 3, 4, 7], solidx, self.outdtype, self.is_shuffle),
+                    (
+                        ["inp", "shuffleweights", "bias", "x_scale", "w_scale"],
+                        solidx,
+                        self.outdtype,
+                        self.is_shuffle,
+                    ),
                     {
                         "num_warmup": warmi,
                         "num_iters": coldi,
                     },
                     get_gemm_ref if fast_mode == 0 else None,
-                    ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                    (
+                        ["inp", "weights", "bias", "x_scale", "w_scale"],
+                        self.indtype,
+                        self.outdtype,
+                    ),
                     {},
                     None,  # self.ref if fast_mode == 0 else None,
                     self.rtol,
@@ -1002,6 +1259,7 @@ def libtype_list(string):
             "flydsl",
             "torch",
             "skinny",
+            "opus",
         ]:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
@@ -1116,29 +1374,37 @@ class GemmTuner(GemmCommonTuner):
         untunedf = self.untunedf
         results = []
         for i in range(len(untunedf)):
-            M = int(untunedf.loc[i, "M"])
-            N = int(untunedf.loc[i, "N"])
-            K = int(untunedf.loc[i, "K"])
-            bias = untunedf.loc[i, "bias"]
-            indtype = str(untunedf.loc[i, "dtype"])
-            outdtype = str(untunedf.loc[i, "outdtype"])
-            scaleAB = untunedf.loc[i, "scaleAB"]
-            bpreshuffle = untunedf.loc[i, "bpreshuffle"]
+            row = untunedf.iloc[i]
+            M = int(row["M"])
+            N = int(row["N"])
+            K = int(row["K"])
+            bias = row["bias"]
+            indtype = str(row["dtype"])
+            outdtype = str(row["outdtype"])
+            scaleAB = row["scaleAB"]
+            bpreshuffle = row["bpreshuffle"]
             shape_str = f"({M}, {N}, {K}, {indtype}, bias={bias})"
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
             try:
-                inp, weights, _, bias_tensor, x_scale, _, shuffleweights, w_scale = (
-                    generate_data(
-                        M,
-                        N,
-                        K,
-                        eval(indtype),
-                        eval(outdtype),
-                        scaleAB,
-                        bpreshuffle,
-                        0,
-                        bias,
-                    )
+                data = generate_data(
+                    M,
+                    N,
+                    K,
+                    eval(indtype),
+                    eval(outdtype),
+                    scaleAB,
+                    bpreshuffle,
+                    0,
+                    bias,
                 )
+                inp = data["inp"]
+                weights = data["weights"]
+                bias_tensor = data["bias"]
+                x_scale = data["x_scale"]
+                shuffleweights = data["shuffleweights"]
+                w_scale = data["w_scale"]
                 w = shuffleweights if bpreshuffle else weights
                 scale_a = x_scale if scaleAB else None
                 scale_b = w_scale if scaleAB else None
@@ -1167,7 +1433,11 @@ class GemmTuner(GemmCommonTuner):
                 err_ratio = checkAllclose(
                     out, ref, atol=_atol, rtol=_rtol, msg=f"run_config {shape_str}"
                 )
-                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                status = (
+                    "ok"
+                    if err_ratio <= allowed_err_ratio
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
+                )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
                 results.append(
