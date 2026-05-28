@@ -462,6 +462,103 @@ def torch_mla_extend_v4(
     return out, lse
 
 
+def torch_mla_v4_split_kv(
+    q_silver_bf16,
+    kv_silver_bf16,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    sm_scale,
+    work_info_set,
+    work_indptr,
+    is_causal=True,
+):
+    num_page, page_size, _, d_qk = kv_silver_bf16.shape
+    total_q, nheads, _ = q_silver_bf16.shape
+    dev = kv_silver_bf16.device
+
+    kvc = torch.index_select(kv_silver_bf16, 0, kv_indices)
+    kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
+    num_works = int(work_indptr[-1].item())
+
+    final_out = torch.empty(total_q, nheads, d_qk, dtype=torch.bfloat16, device=dev)
+    final_lse = torch.empty(total_q, nheads, dtype=torch.float32, device=dev)
+    partial_os, partial_lses = [], []
+
+    for work_idx in range(num_works):
+        row = work_info_set[work_idx]
+        batch_idx = int(row[0].item())
+        partial_qo_loc = int(row[1].item())
+        qo_start = int(row[2].item())
+        qo_end = int(row[3].item())
+        kv_start = int(row[4].item())
+        kv_offset = int(row[6].item())
+
+        cur_num_page = kvs[batch_idx].shape[0]
+        cur_real_kv_seq_len = (cur_num_page - 1) * page_size + int(
+            kv_last_page_lens[batch_idx].item()
+        )
+        real_sum_kv_seq_len = (
+            int(kv_indptr[batch_idx].item()) * page_size + cur_real_kv_seq_len
+        )
+
+        slice_k = kvc.flatten(0, 1)[
+            kv_start * page_size : real_sum_kv_seq_len - kv_offset
+        ]
+        slice_q = q_silver_bf16[qo_start:qo_end]
+
+        out_dtype = torch.float32 if partial_qo_loc != -1 else torch.bfloat16
+
+        causal_diagonal = None
+        if is_causal:
+            q_local_start = qo_start - int(qo_indptr[batch_idx].item())
+            kv_local_start = (kv_start - int(kv_indptr[batch_idx].item())) * page_size
+            total_q_len = int(qo_indptr[batch_idx + 1].item()) - int(
+                qo_indptr[batch_idx].item()
+            )
+            causal_diagonal = (
+                q_local_start - kv_local_start + cur_real_kv_seq_len - total_q_len
+            )
+
+        o, lse = ref_masked_attention_v4(
+            slice_q,
+            slice_k,
+            slice_k,
+            sm_scale,
+            out_dtype,
+            is_causal=is_causal,
+            causal_diagonal=causal_diagonal,
+        )
+
+        if partial_qo_loc == -1:
+            final_out[qo_start:qo_end, :, :] = o
+            final_lse[qo_start:qo_end, :] = lse.transpose(0, 1)
+        else:
+            partial_os.append(o)
+            partial_lses.append(lse)
+
+    partial_o = (
+        torch.concat(partial_os)
+        if partial_os
+        else torch.empty(0, nheads, d_qk, dtype=torch.float32, device=dev)
+    )
+    partial_lse = (
+        torch.concat(partial_lses, dim=1).transpose(0, 1)
+        if partial_lses
+        else torch.empty(0, nheads, dtype=torch.float32, device=dev)
+    )
+    partial_o = torch.where(
+        torch.isnan(partial_o), torch.zeros_like(partial_o), partial_o
+    )
+    partial_lse = torch.where(
+        torch.isnan(partial_lse),
+        torch.full_like(partial_lse, float("-inf")),
+        partial_lse,
+    )
+    return partial_o, partial_lse, final_out, final_lse
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -719,6 +816,56 @@ def test_mla_v4(
             ),
         )
         ret["v40_err"] = err
+
+        q_nope_bf16 = _v4_dequant_nope_bpad8(q_nope_fp8, q_nope_scale_e8m0)
+        q_silver_bf16 = torch.cat([q_nope_bf16, q_rope_bf16], dim=-1)
+        kv_nope_bf16 = _v4_dequant_nope_bpad8(kv_nope_fp8, kv_nope_scale_e8m0)
+        kv_silver_bf16 = torch.cat([kv_nope_bf16, kv_rope_bf16], dim=-1)
+
+        partial_out_ref, partial_lse_ref, _, _ = torch_mla_v4_split_kv(
+            q_silver_bf16,
+            kv_silver_bf16,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            sm_scale,
+            work_info_set,
+            work_indptr,
+            is_causal=True,
+        )
+
+        if partial_out_ref.shape[0] > 0:
+            v40_logits_flat = v40_logits[: partial_out_ref.shape[0]].flatten(0, 1)
+            checkAllclose(
+                partial_out_ref,
+                v40_logits_flat,
+                msg=(
+                    f"mla_v40_decode    [partial_out_ref vs attn_logits]: "
+                    f"{us_v40_decode:>8.2f} us......"
+                ),
+            )
+
+        total_kv = int(seq_lens_kv.sum().item())
+        flops = decode_qlen * total_kv * nhead * (V4_DIM_QK + V4_DIM_V) * 2
+
+        kv_bytes = total_kv * nhead_kv * (
+            V4_DIM_NOPE * 1            # FP8 NoPE
+            + V4_NUM_TILES * 1         # E8M0 scales actually consumed (7 B/token)
+            + V4_DIM_ROPE * 2          # BF16 RoPE
+        )
+        q_bytes = total_q * nhead * (
+            V4_DIM_NOPE * 1
+            + V4_NUM_TILES * 1
+            + V4_DIM_ROPE * 2
+        )
+        out_bytes = total_q * nhead * V4_DIM_V * out_v40.element_size()
+        bytes_v40 = kv_bytes + q_bytes + out_bytes
+
+        ret["v40_flops"] = flops
+        ret["v40_bytes"] = bytes_v40
+        ret["v40_TFLOPS"] = flops / us_v40_decode / 1e6
+        ret["v40_TB/s"] = bytes_v40 / us_v40_decode / 1e6
 
     ret["batch"] = batch_size
     ret["ctx_lens"] = ctx_lens
