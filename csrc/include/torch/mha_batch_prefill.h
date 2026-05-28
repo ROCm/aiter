@@ -43,7 +43,13 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                   std::optional<const at::Tensor> block_table,
                   std::optional<const at::Tensor> seqlen_k,
                   std::optional<const at::Tensor> sink_ptr_, // [hq];
-                  std::optional<at::Generator> gen_);
+                  std::optional<at::Generator> gen_,
+                  // PER_TOKEN_HEAD optional per-q-head P scale [num_head_q]
+                  // fp32. ``p_scale_inv`` is accepted for API parity with
+                  // explicit-multiply implementations but unused internally;
+                  // the kernel folds log2(p_scale) into the exp2 row-max shift.
+                  std::optional<const at::Tensor> p_scale = std::nullopt,
+                  std::optional<const at::Tensor> p_scale_inv = std::nullopt);
 
 } // namespace torch_itfs
 } // namespace aiter

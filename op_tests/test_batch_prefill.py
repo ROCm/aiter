@@ -1235,6 +1235,8 @@ def run_ck(
     kv_last_page_lens=None,
     block_table=None,
     seqlen_k=None,
+    p_scale=None,
+    p_scale_inv=None,
     profile=False,
     return_lse=False,
 ):
@@ -1270,6 +1272,8 @@ def run_ck(
         kv_last_page_lens=kv_last_page_lens,
         block_table=block_table,
         seqlen_k=seqlen_k,
+        p_scale=p_scale,
+        p_scale_inv=p_scale_inv,
         return_lse=return_lse,
     )
 
@@ -2662,6 +2666,63 @@ def test_batch_prefill_per_token_head_pytest(
     )
 
 
+# Caller-supplied softmax-P scale variants for PER_TOKEN_HEAD.
+# p_scale is per-q-head fp32 multiplier folded into the exp2 shift before fp8 P
+# quantization; it cancels mathematically in the final output, so the FP32
+# reference comparison must hold regardless of the value. Values kept <= 1.0 to
+# stay clear of FP8 e4m3 saturation (internal P quantization scale is 256).
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(32, 8)])
+@pytest.mark.parametrize("qo_len,kv_len", [(512, 2048)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("p_scale_mode", ["none", "ones", "half", "per_head_random"])
+def test_batch_prefill_per_token_head_p_scale_pytest(
+    batch_size,
+    num_qo_heads,
+    num_kv_heads,
+    qo_len,
+    kv_len,
+    causal,
+    p_scale_mode,
+):
+    """PER_TOKEN_HEAD FP8 batch prefill with caller-supplied softmax-P scale."""
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, 0.0),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return
+
+    if p_scale_mode == "none":
+        p_scale = None
+    elif p_scale_mode == "ones":
+        p_scale = torch.ones(num_qo_heads, dtype=torch.float32, device="cuda")
+    elif p_scale_mode == "half":
+        p_scale = torch.full((num_qo_heads,), 0.5, dtype=torch.float32, device="cuda")
+    else:  # per_head_random in [0.25, 1.0]
+        g = torch.Generator(device="cuda").manual_seed(123)
+        p_scale = 0.25 + 0.75 * torch.rand(
+            num_qo_heads, dtype=torch.float32, device="cuda", generator=g
+        )
+
+    run_batch_prefill_per_token_head(
+        kvcache_layout="linear",
+        table_layout="sglang",
+        batch_size=batch_size,
+        qo_len=qo_len,
+        kv_len=kv_len,
+        page_size=64,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        causal=causal,
+        logits_soft_cap=0.0,
+        dtype=torch.bfloat16,
+        contiguous_kv=True,
+        seed=42,
+        p_scale=p_scale,
+    )
+
+
 def run_batch_prefill_per_token_head(
     kvcache_layout,
     table_layout,
@@ -2679,18 +2740,24 @@ def run_batch_prefill_per_token_head(
     seed,
     profile=False,
     skip_reference=False,
+    p_scale=None,
+    p_scale_inv=None,
 ):
     """
     FP8 batch prefill with PER_TOKEN_HEAD quantization:
       Q descale: [total_q, nhead_q] fp32
       K descale: [num_total_pages, page_block_size, nhead_k] fp32
       V descale: [nhead_k] fp32
+
+    p_scale (optional, [num_qo_heads] fp32 on device): folded into the softmax
+    exp2 shift before fp8 P quantization. p_scale cancels in the final output,
+    so the FP32 reference comparison is unaffected.
     """
     if seed is not None:
         torch.manual_seed(seed)
 
     quant_dtype = dtypes.fp8
-    SUPPORTED_PAGE_SIZES = (64, 1024)
+    SUPPORTED_PAGE_SIZES = (16, 64, 1024)
     if page_size not in SUPPORTED_PAGE_SIZES:
         if skip_test_if(
             True,
@@ -2841,6 +2908,8 @@ def run_batch_prefill_per_token_head(
         kv_last_page_lens=kv_last_page_len_gpu,
         block_table=block_table_gpu,
         seqlen_k=seqlen_k_gpu,
+        p_scale=p_scale,
+        p_scale_inv=p_scale_inv,
         profile=profile,
     )
     if profile:

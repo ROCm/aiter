@@ -1194,7 +1194,9 @@ namespace py = pybind11;
           py::arg("block_table")          = std::nullopt, \
           py::arg("seqlen_k")             = std::nullopt, \
           py::arg("sink_ptr")             = std::nullopt, \
-          py::arg("gen")                  = std::nullopt);
+          py::arg("gen")                  = std::nullopt, \
+          py::arg("p_scale")              = std::nullopt, \
+          py::arg("p_scale_inv")          = std::nullopt);
 
 #define MOE_OP_PYBIND                                                          \
     m.def("topk_softmax",                                                      \

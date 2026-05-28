@@ -1,6 +1,5 @@
 """Benchmark FP8 PER_TOKEN_HEAD batch_prefill kernel.
 
-Compares PER_TOKEN_HEAD against KV_BLOCKSCALE (when page_size >= 128).
 Sequence lengths can be passed as positional args.
 
 Examples:
@@ -23,16 +22,16 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import op_tests.test_batch_prefill as _tbp
-from op_tests.test_batch_prefill import (
-    run_batch_prefill_per_token_head,
-    run_batch_prefill_kv_blockscale,
-)
+from op_tests.test_batch_prefill import run_batch_prefill_per_token_head
 
 if int(os.environ.get("BENCH_BYPASS_ROCM72_SKIP", "1")):
     _tbp.should_skip_rocm72_issue = lambda *a, **k: False
 
 PAGE_SIZE = int(os.environ.get("BENCH_PAGE_SIZE", "1024"))
 VERIFY = bool(int(os.environ.get("BENCH_VERIFY", "0")))
+# KV cache memory layout: "linear" (4D) or "vectorized" (5D swizzled).
+# Vectorized is the production layout used by serving frameworks.
+KV_LAYOUT = os.environ.get("BENCH_KV_LAYOUT", "linear")
 
 DEFAULT_SEQS = (1024, 16384, 32768, 65536, 131072)
 _parser = argparse.ArgumentParser(
@@ -50,11 +49,7 @@ _parser.add_argument(
 _args = _parser.parse_args()
 SEQS = tuple(_args.seqs)
 
-SHAPES = [
-    (b, s, s, 8, 1, 128, True, 0.0)
-    for s in SEQS
-    for b in (2, 4, 6, 8)
-]
+SHAPES = [(b, s, s, 8, 1, 128, True, 0.0) for s in SEQS for b in (2, 4, 6, 8)]
 
 
 def _fmt(r):
@@ -89,7 +84,7 @@ def _call_kernel(fn, **kwargs):
 def _run_one(shape):
     b, qo, kv, nhq, nhk, hd, c, sc = shape
     common = dict(
-        kvcache_layout="linear",
+        kvcache_layout=KV_LAYOUT,
         table_layout="sglang",
         batch_size=b,
         qo_len=qo,
@@ -105,20 +100,12 @@ def _run_one(shape):
         seed=42,
     )
     pth = _call_kernel(run_batch_prefill_per_token_head, **common)
-    if PAGE_SIZE >= 128:
-        kvb = _call_kernel(run_batch_prefill_kv_blockscale, **common)
-    else:
-        kvb = {"status": "skipped"}
-    return pth, kvb
+    return pth
 
 
-def _format_row(shape, pth, kvb):
+def _format_row(shape, pth):
     b = shape[0]
-    return (
-        f"{b:>5} | "
-        f"{_fmt(kvb):>27} {_verify_str(kvb)} | "
-        f"{_fmt(pth):>27} {_verify_str(pth)}"
-    )
+    return f"{b:>5} | {_fmt(pth):>27} {_verify_str(pth)}"
 
 
 def _run_silent(shape):
@@ -152,7 +139,7 @@ def _run_silent(shape):
 
 
 print("Warming up kernels (one-time JIT setup, may take a moment)...", flush=True)
-_pth0, _kvb0 = _run_silent(SHAPES[0])
+_pth0 = _run_silent(SHAPES[0])
 
 _nhq, _nhk, _hd, _causal, _sc = SHAPES[0][3:8]
 for _s in SHAPES:
@@ -164,24 +151,20 @@ else:
     print("Verification: OFF (set BENCH_VERIFY=1 to enable)")
 print(
     f"Config: nhq={_nhq}, nhk={_nhk}, hd={_hd}, "
-    f"causal={_causal}, soft_cap={_sc}, page_size={PAGE_SIZE}"
+    f"causal={_causal}, soft_cap={_sc}, page_size={PAGE_SIZE}, "
+    f"kv_layout={KV_LAYOUT}"
 )
-_HEADER = (
-    f"{'batch':>5} | "
-    f"{'KV_BLOCKSCALE':>27} {'vrf':>4} | "
-    f"{'PER_TOKEN_HEAD':>27} {'vrf':>4}"
-)
+_HEADER = f"{'batch':>5} | {'PER_TOKEN_HEAD':>27} {'vrf':>4}"
 print(_HEADER)
 print("-" * len(_HEADER))
 
 failures = []
 
 
-def _record_failures(shape, pth, kvb):
+def _record_failures(shape, pth):
     b, _qo, kv, *_ = shape
-    for label, r in (("PER_TOKEN_HEAD", pth), ("KV_BLOCKSCALE", kvb)):
-        if r.get("verify") == "fail":
-            failures.append((b, kv, label, r.get("error", "")))
+    if pth.get("verify") == "fail":
+        failures.append((b, kv, "PER_TOKEN_HEAD", pth.get("error", "")))
 
 
 _groups = {}
@@ -193,12 +176,12 @@ for _seq, _shapes in _groups.items():
     print(f"seq={_seq}")
     for shape in _shapes:
         if shape == SHAPES[0] and not _warmup_done:
-            pth, kvb = _pth0, _kvb0
+            pth = _pth0
             _warmup_done = True
         else:
-            pth, kvb = _run_one(shape)
-        print(_format_row(shape, pth, kvb), flush=True)
-        _record_failures(shape, pth, kvb)
+            pth = _run_one(shape)
+        print(_format_row(shape, pth), flush=True)
+        _record_failures(shape, pth)
 
 if VERIFY:
     if failures:

@@ -44,6 +44,9 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                                std::optional<const at::Tensor>& q_descale_per_token,
                                std::optional<const at::Tensor>& k_descale_per_token,
                                std::optional<const at::Tensor>& v_descale_per_head,
+                               // PER_TOKEN_HEAD optional per-q-head P scale.
+                               std::optional<const at::Tensor>& p_scale,
+                               std::optional<const at::Tensor>& p_scale_inv,
                                at::Tensor out,
                                at::Tensor softmax_lse,
                                at::Tensor dropout_randval,
@@ -447,6 +450,37 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
         args.stride_k_descale_token    = k_sc.stride(1);
         args.nhead_stride_k_descale    = k_sc.stride(2);
         args.nhead_stride_v_descale    = v_sc.stride(0);
+
+        // Optional per-q-head P scale. We fold log2(p_scale) into the exp2
+        // row-max shift in the kernel; p_scale_inv is accepted for API parity
+        // but unused (the shift-fold doesn't need a reciprocal).
+        if(p_scale.has_value())
+        {
+            auto p_sc = p_scale.value();
+            CHECK_DEVICE(p_sc);
+            TORCH_CHECK(p_sc.scalar_type() == at::kFloat,
+                        "p_scale must be float32");
+            TORCH_CHECK(p_sc.dim() == 1 && p_sc.size(0) == h,
+                        "p_scale must be 1D with shape [num_head_q]");
+            TORCH_CHECK(p_sc.stride(0) == 1,
+                        "p_scale must be contiguous along its head dim");
+            args.p_scale_ptr = p_sc.data_ptr();
+
+            if(p_scale_inv.has_value())
+            {
+                auto p_sc_inv = p_scale_inv.value();
+                CHECK_DEVICE(p_sc_inv);
+                TORCH_CHECK(p_sc_inv.scalar_type() == at::kFloat,
+                            "p_scale_inv must be float32");
+                TORCH_CHECK(p_sc_inv.dim() == 1 && p_sc_inv.size(0) == h,
+                            "p_scale_inv must be 1D with shape [num_head_q]");
+            }
+        }
+        else
+        {
+            TORCH_CHECK(!p_scale_inv.has_value(),
+                        "p_scale_inv may only be supplied together with p_scale.");
+        }
     }
 
     return args;
@@ -486,7 +520,10 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                   std::optional<const at::Tensor> block_table_,
                   std::optional<const at::Tensor> seqlen_k_,
                   std::optional<const at::Tensor> sink_ptr,      // [hq]
-                  std::optional<at::Generator> gen_
+                  std::optional<at::Generator> gen_,
+                  // PER_TOKEN_HEAD optional per-q-head P scale (see header).
+                  std::optional<const at::Tensor> p_scale,
+                  std::optional<const at::Tensor> p_scale_inv
                 )
 {
     auto q_dtype = q.scalar_type();
@@ -845,6 +882,8 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                                                    q_descale_per_token,
                                                    k_descale_per_token,
                                                    v_descale_per_head,
+                                                   p_scale,
+                                                   p_scale_inv,
                                                    out,
                                                    softmax_lse,
                                                    p,
