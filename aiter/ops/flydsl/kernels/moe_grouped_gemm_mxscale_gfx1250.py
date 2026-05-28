@@ -54,6 +54,7 @@ class _GroupedA8W4Config:
     persistent_workers: Optional[int] = None
     data_format: str = "a8w4"
     act: str = "silu"
+    stage1_weight_layout: str = "gguu"
 
 
 def _validate_common(cfg: _GroupedA8W4Config) -> None:
@@ -73,6 +74,10 @@ def _validate_common(cfg: _GroupedA8W4Config) -> None:
         raise ValueError(f"split_k must be >= 1, got {cfg.split_k}")
     if cfg.act not in ("silu", "swiglu"):
         raise ValueError(f"act must be 'silu' or 'swiglu', got {cfg.act!r}")
+    if cfg.stage1_weight_layout not in ("gguu", "gugu"):
+        raise ValueError(
+            f"stage1_weight_layout must be 'gguu' or 'gugu', got {cfg.stage1_weight_layout!r}"
+        )
     if cfg.grouped_persistent_m and (cfg.cluster_m != 1 or cfg.cluster_n != 1):
         raise ValueError("grouped_persistent_m currently requires cluster_m=cluster_n=1")
 
@@ -199,11 +204,14 @@ def _compile_stage1_finalize_act(
     inter_dim: int,
     out_dtype: str,
     act: str,
+    stage1_weight_layout: str = "gguu",
 ):
     if out_dtype not in ("f16", "bf16"):
         raise ValueError(f"stage1 finalize supports f16/bf16, got {out_dtype!r}")
     if act not in ("silu", "swiglu"):
         raise ValueError(f"stage1 finalize act must be silu/swiglu, got {act!r}")
+    if stage1_weight_layout not in ("gguu", "gugu"):
+        raise ValueError(f"stage1 finalize layout must be gguu/gugu, got {stage1_weight_layout!r}")
     block_threads = 256
     total_elems = int(experts) * int(max_m) * int(inter_dim)
     tmp_stride_e = int(max_m) * int(2 * inter_dim)
@@ -247,14 +255,19 @@ def _compile_stage1_finalize_act(
             )
             if_row = scf.IfOp(row_ok, results_=[], has_else=False)
             with ir.InsertionPoint(if_row.then_block):
-                tmp_base = e * arith.index(tmp_stride_e) \
-                    + row * arith.index(2 * inter_dim) + col
+                tmp_row_base = e * arith.index(tmp_stride_e) \
+                    + row * arith.index(2 * inter_dim)
+                if const_expr(stage1_weight_layout == "gugu"):
+                    gate_off = tmp_row_base + col * arith.index(2)
+                    up_off = gate_off + arith.index(1)
+                else:
+                    gate_off = tmp_row_base + col
+                    up_off = gate_off + arith.index(inter_dim)
                 gate_h = buffer_ops.buffer_load(
-                    tmp_rsrc, arith.index_cast(T.i32, tmp_base),
+                    tmp_rsrc, arith.index_cast(T.i32, gate_off),
                     vec_width=1, dtype=elem_ty)
                 up_h = buffer_ops.buffer_load(
-                    tmp_rsrc,
-                    arith.index_cast(T.i32, tmp_base + arith.index(inter_dim)),
+                    tmp_rsrc, arith.index_cast(T.i32, up_off),
                     vec_width=1, dtype=elem_ty)
                 g = gate_h.extf(T.f32)
                 u = up_h.extf(T.f32)
@@ -314,11 +327,14 @@ def _compile_stage1_finalize_act_bias(
     inter_dim: int,
     out_dtype: str,
     act: str,
+    stage1_weight_layout: str = "gguu",
 ):
     if out_dtype not in ("f16", "bf16"):
         raise ValueError(f"stage1 finalize supports f16/bf16, got {out_dtype!r}")
     if act not in ("silu", "swiglu"):
         raise ValueError(f"stage1 finalize act must be silu/swiglu, got {act!r}")
+    if stage1_weight_layout not in ("gguu", "gugu"):
+        raise ValueError(f"stage1 finalize layout must be gguu/gugu, got {stage1_weight_layout!r}")
     block_threads = 256
     total_elems = int(experts) * int(max_m) * int(inter_dim)
     tmp_stride_e = int(max_m) * int(2 * inter_dim)
@@ -365,22 +381,30 @@ def _compile_stage1_finalize_act_bias(
             )
             if_row = scf.IfOp(row_ok, results_=[], has_else=False)
             with ir.InsertionPoint(if_row.then_block):
-                tmp_base = e * arith.index(tmp_stride_e) \
-                    + row * arith.index(2 * inter_dim) + col
-                bias_base = e * arith.index(bias_stride_e) + col
+                tmp_row_base = e * arith.index(tmp_stride_e) \
+                    + row * arith.index(2 * inter_dim)
+                bias_row_base = e * arith.index(bias_stride_e)
+                if const_expr(stage1_weight_layout == "gugu"):
+                    gate_off = tmp_row_base + col * arith.index(2)
+                    up_off = gate_off + arith.index(1)
+                    gate_bias_off = bias_row_base + col * arith.index(2)
+                    up_bias_off = gate_bias_off + arith.index(1)
+                else:
+                    gate_off = tmp_row_base + col
+                    up_off = gate_off + arith.index(inter_dim)
+                    gate_bias_off = bias_row_base + col
+                    up_bias_off = gate_bias_off + arith.index(inter_dim)
                 gate_h = buffer_ops.buffer_load(
-                    tmp_rsrc, arith.index_cast(T.i32, tmp_base),
+                    tmp_rsrc, arith.index_cast(T.i32, gate_off),
                     vec_width=1, dtype=elem_ty)
                 up_h = buffer_ops.buffer_load(
-                    tmp_rsrc,
-                    arith.index_cast(T.i32, tmp_base + arith.index(inter_dim)),
+                    tmp_rsrc, arith.index_cast(T.i32, up_off),
                     vec_width=1, dtype=elem_ty)
                 gate_bias_h = buffer_ops.buffer_load(
-                    bias_rsrc, arith.index_cast(T.i32, bias_base),
+                    bias_rsrc, arith.index_cast(T.i32, gate_bias_off),
                     vec_width=1, dtype=elem_ty)
                 up_bias_h = buffer_ops.buffer_load(
-                    bias_rsrc,
-                    arith.index_cast(T.i32, bias_base + arith.index(inter_dim)),
+                    bias_rsrc, arith.index_cast(T.i32, up_bias_off),
                     vec_width=1, dtype=elem_ty)
                 g = gate_h.extf(T.f32) + gate_bias_h.extf(T.f32)
                 u = up_h.extf(T.f32) + up_bias_h.extf(T.f32)
@@ -465,6 +489,7 @@ def _compile_base_a8w4_gemm(
     cfg: _GroupedA8W4Config,
     stage1_act: str | None = None,
     epilogue_bias: bool = False,
+    stage1_weight_layout: str = "gguu",
 ):
     compiler = compile_mxfp4_gemm if cfg.data_format == "fp4" else compile_a8w4_gemm
     return compiler(
@@ -492,6 +517,7 @@ def _compile_base_a8w4_gemm(
         grouped_persistent_m=cfg.grouped_persistent_m,
         persistent_workers=cfg.persistent_workers,
         stage1_act=stage1_act,
+        stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
     )
 
@@ -522,6 +548,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     grouped_persistent_m: bool = True,
     persistent_workers: int | None = None,
     act: str = "silu",
+    stage1_weight_layout: str = "gguu",
     data_format: str = "a8w4",
 ):
     cfg = _GroupedA8W4Config(
@@ -534,16 +561,21 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         cluster_m=int(cluster_m), cluster_n=int(cluster_n), use_scale_opsel=bool(use_scale_opsel),
         expert_sched_mode=bool(expert_sched_mode), grouped_persistent_m=bool(grouped_persistent_m),
         persistent_workers=persistent_workers, data_format=str(data_format), act=str(act),
+        stage1_weight_layout=str(stage1_weight_layout),
     )
     _validate_common(cfg)
     fused_base = None
     fused_base_bias = None
+    fused_n = cfg.inter_dim
     if cfg.split_k == 1:
+        fused_n = 2 * cfg.inter_dim if cfg.stage1_weight_layout == "gugu" else cfg.inter_dim
         fused_base = _compile_base_a8w4_gemm(
-            K=cfg.model_dim, N=cfg.inter_dim, cfg=cfg, stage1_act=cfg.act)
+            K=cfg.model_dim, N=fused_n, cfg=cfg, stage1_act=cfg.act,
+            stage1_weight_layout=cfg.stage1_weight_layout)
         fused_base_bias = _compile_base_a8w4_gemm(
-            K=cfg.model_dim, N=cfg.inter_dim, cfg=cfg,
-            stage1_act=cfg.act, epilogue_bias=True)
+            K=cfg.model_dim, N=fused_n, cfg=cfg,
+            stage1_act=cfg.act, epilogue_bias=True,
+            stage1_weight_layout=cfg.stage1_weight_layout)
     raw_base = _compile_base_a8w4_gemm(
         K=cfg.model_dim, N=2 * cfg.inter_dim, cfg=cfg)
     finalize_act = _compile_stage1_finalize_act(
@@ -552,6 +584,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         inter_dim=cfg.inter_dim,
         out_dtype=cfg.out_dtype,
         act=cfg.act,
+        stage1_weight_layout=cfg.stage1_weight_layout,
     )
     finalize_act_bias = _compile_stage1_finalize_act_bias(
         experts=cfg.experts,
@@ -559,6 +592,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         inter_dim=cfg.inter_dim,
         out_dtype=cfg.out_dtype,
         act=cfg.act,
+        stage1_weight_layout=cfg.stage1_weight_layout,
     )
 
     def launch(y, x, w, scale_x, scale_w, masked_m, max_m_arg, inter_dim_arg,
@@ -617,12 +651,12 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     _run_compiled(
                         fused_gemm, y, x, w, scale_x, scale_w, bias,
                         masked_m, m_tile_prefix, m_tile_map,
-                        cfg.max_m, cfg.inter_dim, stream)
+                        cfg.max_m, fused_n, stream)
                 else:
                     _run_compiled(
                         fused_gemm, y, x, w, scale_x, scale_w,
                         masked_m, m_tile_prefix, m_tile_map,
-                        cfg.max_m, cfg.inter_dim, stream)
+                        cfg.max_m, fused_n, stream)
             else:
                 _run_compiled(
                     raw_base, tmp, x, w, scale_x, scale_w,
@@ -637,11 +671,11 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 if bias is not None:
                     _run_compiled(
                         fused_gemm, y, x, w, scale_x, scale_w, bias, masked_m,
-                        cfg.max_m, cfg.inter_dim, stream)
+                        cfg.max_m, fused_n, stream)
                 else:
                     _run_compiled(
                         fused_gemm, y, x, w, scale_x, scale_w, masked_m,
-                        cfg.max_m, cfg.inter_dim, stream)
+                        cfg.max_m, fused_n, stream)
             else:
                 _run_compiled(
                     raw_base, tmp, x, w, scale_x, scale_w, masked_m,
