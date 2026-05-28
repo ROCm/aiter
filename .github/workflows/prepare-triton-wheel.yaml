@@ -1,0 +1,50 @@
+name: Prepare Triton Wheel
+
+on:
+  workflow_call:
+    inputs:
+      docker-image:
+        description: Docker image used to resolve and download the matching Triton wheel.
+        required: false
+        type: string
+        default: rocm/pytorch:latest
+      artifact-name:
+        description: Name of the Triton wheel artifact uploaded for the caller workflow run.
+        required: false
+        type: string
+        default: triton_wheelhouse
+      retention-days:
+        description: Number of days to keep the Triton wheel artifact.
+        required: false
+        type: number
+        default: 3
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Triton wheel
+        id: download_triton_wheel
+        continue-on-error: true
+        run: |
+          set -ex
+          bash .github/scripts/docker_pull_with_retry.sh "${{ inputs.docker-image }}"
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            "${{ inputs.docker-image }}" \
+            bash ./.github/scripts/download_triton_wheel.sh triton_wheels
+
+      - name: Upload Triton wheel artifact
+        if: ${{ steps.download_triton_wheel.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: triton_wheels/
+          retention-days: ${{ inputs.retention-days }}
