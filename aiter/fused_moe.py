@@ -189,6 +189,12 @@ def fused_moe(
     splitk=0,
     swiglu_limit=0.0,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    # Host-side scheduling hint: average #tokens per local expert under uniform
+    # routing. Only meaningful for DeepEP/Mori low-latency dispatch, where
+    # topk_ids.shape[0] is the padded buffer size (num_max_dispatch_tokens_per_
+    # rank * world_size) and tells nothing about the real workload. When None,
+    # falls back to topk_ids.shape[0] -- bit-identical to old behavior.
+    expected_m: Optional[int] = None,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -216,6 +222,7 @@ def fused_moe(
         bias2=bias2,
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
+        expected_m=expected_m,
     )
 
 
@@ -245,6 +252,7 @@ def fused_moe_fake(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    expected_m: Optional[int] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -281,6 +289,7 @@ def fused_moe_(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    expected_m: Optional[int] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -333,8 +342,15 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
+    # In DeepEP/Mori low-latency dispatch, topk_ids.shape[0] is the padded
+    # buffer size (num_max_dispatch_tokens_per_rank * world_size), not the real
+    # workload, so the M passed to get_padded_M always pegs at the worst tier.
+    # If the caller has computed expected_m (host-side avg #tokens per local
+    # expert under uniform routing), use that instead for tier matching --
+    # mirrors DeepGEMM's `expected_m` SM-scheduling hint.
+    M_for_schedule = expected_m if expected_m is not None else M
     metadata = get_2stage_cfgs(
-        get_padded_M(M),  # consider token_num > 1024 as prefill
+        get_padded_M(M_for_schedule),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
