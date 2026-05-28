@@ -256,7 +256,7 @@ def _assert_reconstructs_combined(common, topk_weight, *, atol_scale=4):
 
 @pytest.mark.parametrize(
     "a_dtype,b_dtype",
-    [("fp4", "fp4"), ("fp8", "fp4"), ("bf16", "fp4")],
+    [("fp4", "fp4"), ("fp8", "fp4")],
 )
 def test_no_combine_route_accepts_supported_flydsl_dtype_pairs(a_dtype, b_dtype):
     with _patch_kernel_params(a_dtype=a_dtype, b_dtype=b_dtype):
@@ -333,7 +333,6 @@ def test_no_combine_route_rejects_doweight_stage1_for_ck_backends(stage2):
 
 
 def test_w4a16_metadata_uses_cktile_by_default(monkeypatch):
-    monkeypatch.setattr(_fmoe, "_ENABLE_FLYDSL_W4A16", False)
     monkeypatch.setattr(_fmoe, "is_flydsl_available", lambda: True)
     monkeypatch.setattr(_fmoe, "get_gfx", lambda: "gfx950")
     monkeypatch.setattr(_fmoe, "get_cu_num", lambda: 256)
@@ -344,24 +343,6 @@ def test_w4a16_metadata_uses_cktile_by_default(monkeypatch):
     assert _stage_func(metadata.stage1) is _fmoe.cktile_moe_stage1
     assert _stage_func(metadata.stage2) is _fmoe.cktile_moe_stage2
     _validate_no_combine_route(metadata, doweight_stage1=False)
-
-
-@pytest.mark.parametrize("activation", [ActivationType.Swiglu, ActivationType.Silu])
-def test_w4a16_metadata_can_opt_into_flydsl(monkeypatch, activation):
-    import aiter.ops.flydsl.moe_kernels as mk
-
-    monkeypatch.setattr(_fmoe, "_ENABLE_FLYDSL_W4A16", True)
-    monkeypatch.setattr(_fmoe, "is_flydsl_available", lambda: True)
-    monkeypatch.setattr(_fmoe, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(_fmoe, "get_cu_num", lambda: 256)
-    _fmoe.get_2stage_cfgs.cache_clear()
-
-    metadata = _get_metadata(q_dtype_a=dtypes.bf16, activation=activation)
-
-    assert _stage_func(metadata.stage2) is _flydsl_stage2_wrapper
-    parsed = mk.get_flydsl_kernel_params(metadata.stage2.keywords["kernelName"])
-    assert parsed is not None
-    assert (parsed["a_dtype"], parsed["b_dtype"]) == ("bf16", "fp4")
 
 
 @pytest.mark.parametrize("activation", [ActivationType.Swiglu, ActivationType.Silu])
@@ -384,66 +365,6 @@ def test_w4a8_metadata_uses_flydsl(monkeypatch, activation):
     assert (parsed_stage1["a_dtype"], parsed_stage1["b_dtype"]) == ("fp8", "fp4")
     assert (parsed_stage2["a_dtype"], parsed_stage2["b_dtype"]) == ("fp8", "fp4")
     assert not parsed_stage1.get("a_scale_one", False)
-
-
-def test_public_api_forwards_mxfp4_activation_dtype(monkeypatch):
-    captured = {}
-
-    def fake_fused_moe_(**kwargs):
-        captured.update(kwargs)
-        return torch.empty((4, 64), dtype=dtypes.bf16)
-
-    monkeypatch.setattr(_fmoe, "fused_moe_", fake_fused_moe_)
-    hidden_states, _, _, topk_weight, topk_ids = _make_bf16_inputs()
-    w1 = torch.empty((8, 128, 32), dtype=dtypes.fp4x2)
-    w2 = torch.empty((8, 64, 32), dtype=dtypes.fp4x2)
-
-    fused_moe(
-        hidden_states,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        quant_type=QuantType.per_1x32,
-        mxfp4_activation_dtype="fp8",
-    )
-
-    assert captured["mxfp4_activation_dtype"] == "fp8"
-
-
-@pytest.mark.parametrize(
-    "override,expected",
-    [("bf16", dtypes.bf16), ("fp8", dtypes.fp8), ("fp4", dtypes.fp4x2)],
-)
-def test_mxfp4_activation_dtype_override_selects_metadata_dtype(
-    monkeypatch, override, expected
-):
-    class StopAfterMetadata(Exception):
-        pass
-
-    captured = {}
-
-    def fake_get_2stage_cfgs(*args):
-        captured["q_dtype_a"] = args[6]
-        raise StopAfterMetadata
-
-    monkeypatch.setattr(_fmoe, "get_2stage_cfgs", fake_get_2stage_cfgs)
-    hidden_states, _, _, topk_weight, topk_ids = _make_bf16_inputs()
-    w1 = torch.empty((8, 128, 32), dtype=dtypes.fp4x2)
-    w2 = torch.empty((8, 64, 32), dtype=dtypes.fp4x2)
-
-    with pytest.raises(StopAfterMetadata):
-        _fmoe.fused_moe_(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            quant_type=QuantType.per_1x32.value,
-            mxfp4_activation_dtype=override,
-        )
-
-    assert captured["q_dtype_a"] == expected
 
 
 # ---------------------------------------------------------------------------
@@ -751,57 +672,7 @@ def test_stage2_codegen_module_names_differ_for_accumulate(monkeypatch):
     assert name_true != name_false
 
 
-def test_w4a16_moe_gemm2_codegen_module_names_differ_for_accumulate(monkeypatch):
-    import flydsl.compiler as flyc
-    from aiter.ops.flydsl.kernels import moe_gemm_2stage as mg2
-
-    captured = []
-    orig_kernel = flyc.kernel
-
-    def spy_kernel(*args, **kwargs):
-        captured.append(kwargs.get("name", args[0] if args else None))
-        return orig_kernel(*args, **kwargs)
-
-    common = dict(
-        model_dim=128,
-        inter_dim=128,
-        experts=4,
-        topk=2,
-        tile_m=32,
-        tile_n=128,
-        tile_k=128,
-        doweight_stage2=False,
-        in_dtype="fp4_bf16",
-        group_size=32,
-        out_dtype="bf16",
-        use_cshuffle_epilog=True,
-        scale_is_bf16=False,
-    )
-
-    mg2.compile_moe_gemm2.cache_clear()
-    with patch.object(flyc, "kernel", side_effect=spy_kernel):
-        mg2.compile_moe_gemm2(**common, accumulate=True)
-        names_true = [name for name in captured if isinstance(name, str)]
-        captured.clear()
-        mg2.compile_moe_gemm2.cache_clear()
-        mg2.compile_moe_gemm2(**common, accumulate=False)
-        names_false = [name for name in captured if isinstance(name, str)]
-
-    name_true = next(name for name in names_true if name.startswith("mfma_moe2_"))
-    name_false = next(name for name in names_false if name.startswith("mfma_moe2_"))
-    assert "_acc0" not in name_true
-    assert "_acc0" in name_false
-    assert name_true != name_false
-
-
-@pytest.mark.parametrize(
-    "case,expected",
-    [
-        ("w4a16", ("mfma_moe1_swiglu_mul_abf16_wfp4", "mfma_moe2_abf16_wfp4")),
-        ("w4a8", ("mfma_moe1_silu_mul_afp8_wfp4", None)),
-    ],
-)
-def test_mixed_precision_flydsl_builders_use_expected_dtype_names(case, expected):
+def test_w4a8_mixed_precision_flydsl_builder_uses_expected_dtype_name():
     import flydsl.compiler as flyc
     from aiter.ops.flydsl.kernels import mixed_moe_gemm_2stage as mmg2
 
@@ -828,39 +699,18 @@ def test_mixed_precision_flydsl_builders_use_expected_dtype_names(case, expected
     )
 
     mmg2.compile_mixed_moe_gemm1.cache_clear()
-    mmg2.compile_mixed_moe_gemm2.cache_clear()
     with patch.object(flyc, "kernel", side_effect=spy_kernel):
-        if case == "w4a16":
-            mmg2.compile_mixed_moe_gemm1(
-                **common,
-                doweight_stage1=False,
-                a_dtype="bf16",
-                act="swiglu",
-                use_async_copy=False,
-                k_batch=1,
-                gate_mode=_fmoe.GateMode.SEPARATED,
-            )
-            mmg2.compile_mixed_moe_gemm2(
-                **common,
-                doweight_stage2=False,
-                a_dtype="bf16",
-                accumulate=True,
-                sort_block_m=0,
-            )
-        else:
-            mmg2.compile_mixed_moe_gemm1(
-                **common,
-                doweight_stage1=False,
-                a_dtype="fp8",
-                act="silu",
-                use_async_copy=False,
-                k_batch=1,
-                gate_mode=_fmoe.GateMode.INTERLEAVE,
-            )
+        mmg2.compile_mixed_moe_gemm1(
+            **common,
+            doweight_stage1=False,
+            a_dtype="fp8",
+            act="silu",
+            use_async_copy=False,
+            k_batch=1,
+            gate_mode=_fmoe.GateMode.INTERLEAVE,
+        )
 
-    assert any(name and expected[0] in name for name in captured)
-    if expected[1] is not None:
-        assert any(name and expected[1] in name for name in captured)
+    assert any(name and "mfma_moe1_silu_mul_afp8_wfp4" in name for name in captured)
 
 
 # ---------------------------------------------------------------------------
@@ -921,77 +771,6 @@ def test_flydsl_stage2_rejects_invalid_user_out_buffer(bad_case, pattern):
             topk=topk,
             return_per_slot=True,
         )
-
-
-@requires_flydsl
-@pytest.mark.parametrize("activation", [ActivationType.Swiglu, ActivationType.Silu])
-def test_w4a16_flydsl_no_combine_matches_torch_reference(monkeypatch, activation):
-    monkeypatch.setattr(_fmoe, "_ENABLE_FLYDSL_W4A16", True)
-    _fmoe.get_2stage_cfgs.cache_clear()
-
-    device = "cuda"
-    token_num, topk, experts, model_dim, inter_dim = 16, 2, 4, 512, 512
-    if not _flydsl_selected(
-        token_num,
-        topk,
-        experts,
-        model_dim,
-        inter_dim,
-        q_dtype_a=dtypes.bf16,
-        activation=activation,
-    ):
-        pytest.skip("W4A16 FlyDSL route is not selected for this shape")
-
-    (
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        topk_weight,
-        topk_ids,
-    ) = _make_fp4_inputs(token_num, topk, experts, model_dim, inter_dim, device, seed=17)
-    w1_shuffled, w2_shuffled, w1_scale_shuffled, w2_scale_shuffled = _shuffle_a16w4(
-        w1, w2, w1_scale, w2_scale, experts
-    )
-
-    got = fused_moe(
-        hidden_states,
-        w1_shuffled,
-        w2_shuffled,
-        topk_weight,
-        topk_ids,
-        activation=activation,
-        quant_type=QuantType.per_1x32,
-        w1_scale=w1_scale_shuffled,
-        w2_scale=w2_scale_shuffled,
-        mxfp4_activation_dtype="bf16",
-        no_combine=True,
-    ).float()
-    stage1_ref = torch_moe_stage1(
-        hidden_states,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        dtype=dtypes.bf16,
-        activation=activation,
-        quant_type=QuantType.per_1x32,
-        w1_scale=w1_scale,
-    )
-    ref = torch_moe_stage2_no_combine(
-        stage1_ref,
-        w1,
-        w2,
-        topk_ids,
-        dtype=dtypes.bf16,
-        quant_type=QuantType.per_1x32,
-        w2_scale=w2_scale,
-    ).float()
-
-    rmse = (got - ref).pow(2).mean().sqrt()
-    rel = rmse / (ref.pow(2).mean().sqrt() + 1e-6)
-    assert float(rel) < 0.08
 
 
 @requires_flydsl
@@ -1075,7 +854,6 @@ def test_w4a8_flydsl_no_combine_returns_finite_per_slot_output(monkeypatch):
         quant_type=QuantType.per_1x32,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
-        mxfp4_activation_dtype="fp8",
         no_combine=True,
     )
 

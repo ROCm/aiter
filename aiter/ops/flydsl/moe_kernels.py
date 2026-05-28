@@ -75,12 +75,7 @@ def get_flydsl_stage1_kernels(
     is_fp4_b = b_dtype == "fp4"
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
-    # BF16/FP16 activations with FP4 weights use two bytes per activation.
-    # With tile_k=256 the mixed stage1 pipeline has two packed scale groups per
-    # tile, but the current scale prefetch path only carries one group through
-    # interleaved halves. Keep W4A16 on tile_k=128 for correctness until that
-    # pipeline is widened.
-    tile_ks = [256] if is_fp4_a else [128, 256]
+    tile_ks = [256]
     tile_ms = [32, 64, 128]
 
     waves_per_eus = [1, 2, 3, 4]
@@ -151,8 +146,7 @@ def get_flydsl_stage2_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     tile_ns = [128, 256] if is_fp4 else [128]
-    # Match stage1 for W4A16 correctness. A4W4 keeps the tuned tile_k=256 path.
-    tile_ks = [256] if (is_fp4 and a_dtype == "fp4") else ([128, 256] if is_fp4 else [128])
+    tile_ks = [256] if is_fp4 else [128]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
 
@@ -268,7 +262,7 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
 
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
-    for a in ("fp8", "fp4", "fp16", "bf16"):
+    for a in ("fp8", "fp4", "fp16"):
         for b in ("fp4",):
             for out in ("bf16", "f16"):
                 _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
@@ -309,27 +303,6 @@ def compile_flydsl_moe_stage1(
     swiglu_limit: float = 0.0,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
-    if a_dtype == "bf16" and b_dtype == "fp4":
-        from .kernels.moe_gemm_2stage import compile_moe_gemm1
-
-        return compile_moe_gemm1(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            doweight_stage1=doweight_stage1,
-            in_dtype="fp4_bf16",
-            group_size=32,
-            out_dtype=out_dtype,
-            use_cshuffle_epilog=False,
-            scale_is_bf16=False,
-            k_batch=k_batch,
-            act=act,
-            swiglu_limit=swiglu_limit,
-        )
     if b_dtype == "fp4":
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
         from .moe_common import GateMode
@@ -382,8 +355,6 @@ def compile_flydsl_moe_stage1(
             use_cshuffle_epilog=_use_cshuffle,
             scale_is_bf16=True,
             k_batch=k_batch,
-            act=act,
-            swiglu_limit=swiglu_limit,
         )
     else:
         raise ValueError(
@@ -413,24 +384,6 @@ def compile_flydsl_moe_stage2(
     enable_bias: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
-    if a_dtype == "bf16" and b_dtype == "fp4":
-        from .kernels.moe_gemm_2stage import compile_moe_gemm2
-
-        return compile_moe_gemm2(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            doweight_stage2=doweight_stage2,
-            in_dtype="fp4_bf16",
-            group_size=32,
-            out_dtype=out_dtype,
-            accumulate=accumulate,
-            scale_is_bf16=False,
-        )
     if b_dtype == "fp4":
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
@@ -872,11 +825,11 @@ def flydsl_moe_stage1(
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
-    uses_mixed_fp4_signature = b_dtype == "fp4" and a_dtype != "bf16"
-    _n_in = inter_dim * 2 if uses_mixed_fp4_signature else inter_dim
+    is_fp4 = b_dtype == "fp4"
+    _n_in = inter_dim * 2 if is_fp4 else inter_dim
     _k_in = model_dim
 
-    if uses_mixed_fp4_signature:
+    if is_fp4:
         args = _s1_args_fp4(
             _kernel_out.view(-1),
             a.view(-1),
@@ -902,10 +855,10 @@ def flydsl_moe_stage1(
     else:
         args = _s1_args_std(
             _kernel_out.view(-1),
-            _view_safe(a.view(-1)),
-            _view_safe(w1.view(-1)),
+            a.view(-1),
+            w1.view(-1),
             flat_a_scale,
-            _view_safe(flat_w_scale),
+            flat_w_scale,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
@@ -1205,6 +1158,7 @@ def flydsl_moe_stage2(
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
+    is_fp4 = b_dtype == "fp4"
     _n_in = model_dim
     _k_in = inter_dim
 
@@ -1221,8 +1175,7 @@ def flydsl_moe_stage2(
                 dtype=out.dtype,
             )
 
-    uses_mixed_fp4_signature = b_dtype == "fp4" and a_dtype != "bf16"
-    if uses_mixed_fp4_signature:
+    if is_fp4:
         args = _s2_args_fp4(
             target,
             inter_states,
@@ -1243,10 +1196,10 @@ def flydsl_moe_stage2(
     else:
         args = _s2_args_std(
             target,
-            _view_safe(inter_states),
-            _view_safe(w2),
+            inter_states,
+            w2,
             flat_a_scale,
-            _view_safe(flat_w_scale),
+            flat_w_scale,
             sorted_token_ids,
             sorted_expert_ids,
             sw,

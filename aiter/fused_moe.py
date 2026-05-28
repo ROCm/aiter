@@ -32,7 +32,6 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
-_ENABLE_FLYDSL_W4A16 = os.environ.get("AITER_ENABLE_FLYDSL_W4A16", "0") == "1"
 
 
 def _moe_sorting_impl(
@@ -190,7 +189,6 @@ def fused_moe(
     splitk=0,
     swiglu_limit=0.0,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
-    mxfp4_activation_dtype: str = "",
     no_combine: bool = False,
 ):
     """Fused Mixture-of-Experts.
@@ -205,20 +203,16 @@ def fused_moe(
     combining.
 
     ``no_combine=True`` is currently supported on the FlyDSL stage2 path with
-    activation/weight dtype pairs ``(a_dtype, b_dtype) in {("bf16","fp4"),
-    ("fp4","fp4"), ("fp8","fp4")}`` (W4A16, A4W4, and the fp8-activation
-    mixed-precision variant), on CK stage2 used by BF16 fallback MoE layers,
-    and on the CKTile stage2 path used by the default W4A16 MXFP4 route. All
-    other backends (ASM, Triton, the 1-stage path),
-    ``doweight_stage1=True``, and any other FlyDSL dtype pair (e.g. ``fp16``
-    ``int4`` weights / a16wi4) raise :class:`NotImplementedError` before any
-    sorting or kernel work. The per-slot output buffer is zero-initialized, so
-    positions corresponding to empty EP slots (``expert_mask``) are exactly
-    zero. Peak output memory grows by a factor of ``topk``.
-
-    ``mxfp4_activation_dtype`` overrides the default MXFP4 activation heuristic
-    for ``quant_type=per_1x32`` + fp4 weights. Use ``"bf16"`` for W4A16 and
-    ``"fp8"`` for W4A8, or ``"fp4"`` for true W4A4.
+    activation/weight dtype pairs ``(a_dtype, b_dtype) in {("fp4","fp4"),
+    ("fp8","fp4")}`` (A4W4 and the fp8-activation mixed-precision variant),
+    on CK stage2 used by BF16 fallback MoE layers, and on the CKTile stage2
+    path used by the default W4A16 MXFP4 route. All other backends (ASM,
+    Triton, the 1-stage path), ``doweight_stage1=True``, and any other FlyDSL
+    dtype pair (e.g. ``fp16`` ``int4`` weights / a16wi4) raise
+    :class:`NotImplementedError` before any sorting or kernel work. The
+    per-slot output buffer is zero-initialized, so positions corresponding to
+    empty EP slots (``expert_mask``) are exactly zero. Peak output memory
+    grows by a factor of ``topk``.
     """
     if not block_size_M:
         block_size_M = -1
@@ -246,7 +240,6 @@ def fused_moe(
         bias2=bias2,
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
-        mxfp4_activation_dtype=mxfp4_activation_dtype,
         no_combine=no_combine,
     )
 
@@ -277,7 +270,6 @@ def fused_moe_fake(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
-    mxfp4_activation_dtype: str = "",
     no_combine: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
@@ -317,7 +309,6 @@ def fused_moe_(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
-    mxfp4_activation_dtype: str = "",
     no_combine: bool = False,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
@@ -357,34 +348,11 @@ def fused_moe_(
     ):
         q_dtype_a = dtypes.fp8
     bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
-    mxfp4_activation_dtype = (mxfp4_activation_dtype or "").lower()
     if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
     elif quant_type == QuantType.per_1x32:
-        if mxfp4_activation_dtype in ("bf16", "bfloat16", "torch.bfloat16"):
-            q_dtype_a = dtypes.bf16
-        elif mxfp4_activation_dtype in (
-            "fp4",
-            "mxfp4",
-            "a4",
-            "torch.float4_e2m1fn_x2",
-        ):
-            q_dtype_a = dtypes.fp4x2
-        elif mxfp4_activation_dtype in (
-            "fp8",
-            "mxfp8",
-            "a8",
-            "torch.float8_e4m3fn",
-            "torch.float8_e4m3fnuz",
-        ):
-            q_dtype_a = dtypes.fp8
-        elif mxfp4_activation_dtype not in ("", "auto"):
-            raise ValueError(
-                "mxfp4_activation_dtype must be '', 'auto', 'bf16', 'fp8', or 'fp4', "
-                f"got {mxfp4_activation_dtype!r}"
-            )
-        elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
+        if activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
@@ -933,7 +901,7 @@ def _flydsl_stage2_wrapper(
 # excluded; widen this allowlist only after the corresponding kernel paths have
 # been verified end-to-end.
 _NO_COMBINE_SUPPORTED_DTYPES = frozenset(
-    {("bf16", "fp4"), ("fp4", "fp4"), ("fp8", "fp4")}
+    {("fp4", "fp4"), ("fp8", "fp4")}
 )
 _NO_COMBINE_MAX_FLAT_ROWS = 1 << 24
 
@@ -1447,77 +1415,6 @@ def get_2stage_cfgs(
             _ksplit,
             False,
         )
-    mxfp4_w4a16_flydsl = (
-        _ENABLE_FLYDSL_W4A16
-        and dtype in [dtypes.bf16]
-        and q_type == QuantType.per_1x32
-        and activation in (ActivationType.Silu, ActivationType.Swiglu)
-        and q_dtype_a == dtypes.bf16
-        and q_dtype_w == dtypes.fp4x2
-        and is_shuffled
-        and use_g1u1
-        and not doweight_stage1
-        and is_flydsl_available()
-    )
-    if mxfp4_w4a16_flydsl:
-        from aiter.ops.flydsl.moe_kernels import (
-            flydsl_kernel_name,
-            get_flydsl_kernel_params,
-        )
-
-        _out_str = "bf16"
-        if token < 2048:
-            _tile_m = 32
-        elif token < 16384:
-            _tile_m = 64
-        else:
-            _tile_m = 128
-        _tile_n1 = 128
-        _tile_n2 = 128
-        # The current mixed FlyDSL pipeline carries one packed B-scale group
-        # through interleaved halves. BF16 activations make tile_k=256 require
-        # two groups, so use tile_k=128 for the W4A16 correctness path until the
-        # pipeline is widened.
-        _tile_k = 128
-        _base_kn1 = flydsl_kernel_name(
-            1, "bf16", "fp4", _out_str, _tile_m, _tile_n1, _tile_k
-        )
-        _base_kn2 = flydsl_kernel_name(
-            2, "bf16", "fp4", _out_str, _tile_m, _tile_n2, _tile_k, "atomic"
-        )
-        kn1 = _base_kn1
-        kn2 = _base_kn2
-        if get_flydsl_kernel_params(kn1) is None:
-            raise NotImplementedError(f"missing FlyDSL W4A16 stage1 kernel {kn1}")
-        if get_flydsl_kernel_params(kn2) is None:
-            raise NotImplementedError(f"missing FlyDSL W4A16 stage2 kernel {kn2}")
-
-        logger.info(
-            f"[fused_moe] no tuned FlyDSL W4A16 config for {keys}, "
-            f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
-        )
-        enable_bias = _needs_swiglu_bias_support(dtype, q_type)
-        return MOEMetadata(
-            functools.partial(
-                _flydsl_stage1_wrapper,
-                kernelName=kn1,
-                activation=activation,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            ),
-            functools.partial(
-                _flydsl_stage2_wrapper,
-                kernelName=kn2,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            ),
-            _tile_m,
-            int(ksplit),
-            False,
-            has_bias=enable_bias,
-            stage2_has_bias=enable_bias,
-        )
-
     mxfp4_w4a8_flydsl = (
         dtype in [dtypes.bf16]
         and q_type == QuantType.per_1x32

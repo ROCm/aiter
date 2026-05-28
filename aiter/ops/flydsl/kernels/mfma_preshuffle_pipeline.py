@@ -353,57 +353,6 @@ def load_b_raw_w4a16(
     return packed32
 
 
-def load_b_raw_mxfp4_w4a16(
-    buffer_ops,
-    arith,
-    vector,
-    *,
-    arg_b,
-    b_rsrc,
-    layout_b,
-    base_k: ir.Value,
-    ku: int,
-    n_blk: ir.Value,
-    n_intra: ir.Value,
-    lane_div_16: ir.Value,
-    elem_type: ir.Type,
-    kpack_bytes: int = 16,
-):
-    """Load one MXFP4 W4A16 B operand chunk from the A16W4 preshuffle layout.
-
-    ``shuffle_weight_a16w4`` stores FP4 weights with a 16-byte KPack.  A BF16
-    MFMA K32 step needs eight B values per lane group, i.e. four packed bytes,
-    selected by ``lane_div_16`` within that 16-byte pack.
-    """
-    if kpack_bytes != 16:
-        raise ValueError(f"MXFP4 W4A16 requires kpack_bytes=16, got {kpack_bytes!r}")
-
-    global_k32 = (base_k // fx.Index(32)) + fx.Index(ku)
-    k0 = global_k32 // fx.Index(4)
-    k_lane = global_k32 % fx.Index(4)
-    kpack_offset = lane_div_16 * fx.Index(4)
-
-    coord_pack = (n_blk, k0, k_lane, n_intra, fx.Index(0))
-    idx_pack = crd2idx(coord_pack, layout_b)
-    idx_bytes = idx_pack + kpack_offset
-
-    b4 = _buffer_load_vec(
-        buffer_ops,
-        vector,
-        b_rsrc,
-        idx_bytes,
-        elem_type=elem_type,
-        vec_elems=4,
-        elem_bytes=1,
-        offset_in_bytes=True,
-    )
-    return vector.extract(
-        vector.bitcast(T.vec(1, T.i32), b4),
-        static_position=[0],
-        dynamic_position=[],
-    )
-
-
 def _int4_to_bf16x4_i64_gfx950(
     packed32, nibble_offsets, arith, vector, scale_val=None, defer_scale16=False
 ):
@@ -499,54 +448,6 @@ def unpack_b_w4a16(
     b0 = _i8x4_in_i32_to_bf16x4_i64(even, arith, vector, scale_val=scale_val)
     b1 = _i8x4_in_i32_to_bf16x4_i64(odd, arith, vector, scale_val=scale_val)
     return (b0, b1)
-
-
-def unpack_b_mxfp4_w4a16(packed32, scale_u8, arith, vector):
-    """Unpack MXFP4 E2M1 weights to BF16 for true W4A16 MFMA.
-
-    ``packed32`` contains eight E2M1 nibbles.  ``scale_u8`` is the UE8M0
-    per-32-K-element scale byte shared by those nibbles.  Returns two i64
-    values, each packing four BF16 operands, matching ``unpack_b_w4a16``.
-    """
-
-    c_0f = fx.Int32(0x0F)
-    c_07 = fx.Int32(0x07)
-    c_08 = fx.Int32(0x08)
-    c_01 = fx.Int32(0x01)
-    c_00 = fx.Int32(0)
-    c_02 = fx.Int32(2)
-    c_04 = fx.Int32(4)
-    c_06 = fx.Int32(6)
-    c_07_shift = fx.Int32(7)
-    c_08_shift = fx.Int32(8)
-    c_12_shift = fx.Int32(12)
-    c_16_shift = fx.Int32(16)
-    c_ffff = fx.Int32(0xFFFF)
-
-    def _decode_nibble(nibble):
-        mag = nibble & c_07
-        sign = (nibble & c_08) << c_12_shift
-        exp_bits = (scale_u8 + (mag >> c_01) - c_01) << c_07_shift
-        mant_bit = (mag & c_01) << c_06
-        has_mant = arith.cmpi(CmpIPredicate.ugt, mag, c_01)
-        mant_bits = arith.select(has_mant, mant_bit, c_00)
-        nonzero = arith.cmpi(CmpIPredicate.ne, mag, c_00)
-        value_bits = sign | exp_bits | mant_bits
-        return arith.select(nonzero, value_bits, sign) & c_ffff
-
-    bf16_bits = []
-    for nib in (0, 1, 2, 3, 4, 5, 6, 7):
-        shift = fx.Int32(nib * 4)
-        bf16_bits.append(_decode_nibble((packed32 >> shift) & c_0f))
-
-    def _pack4(i0, i1, i2, i3):
-        lo = bf16_bits[i0] | (bf16_bits[i1] << c_16_shift)
-        hi = bf16_bits[i2] | (bf16_bits[i3] << c_16_shift)
-        v2 = vector.from_elements(T.vec(2, T.i32), [lo, hi])
-        v64 = vector.bitcast(T.vec(1, T.i64), v2)
-        return vector.extract(v64, static_position=[0], dynamic_position=[])
-
-    return _pack4(0, 1, 2, 3), _pack4(4, 5, 6, 7)
 
 
 def load_b_pack_k32(
@@ -872,8 +773,6 @@ __all__ = [
     "make_preshuffle_scale_layout",
     "load_b_pack_k32",
     "load_b_raw_w4a16",
-    "load_b_raw_mxfp4_w4a16",
-    "unpack_b_mxfp4_w4a16",
     "unpack_b_w4a16",
     "load_b_raw_w4a16_groupwise",
     "unpack_b_w4a16_groupwise",
