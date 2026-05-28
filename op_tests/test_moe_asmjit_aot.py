@@ -16,7 +16,7 @@ import torch
 import aiter
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import fused_moe
-from aiter.fused_moe_ptpc_fp8 import fused_moe_ptpc_fp8
+from aiter.fused_moe_asmjit_aot import fused_moe_asmjit_aot
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import checkAllclose, run_perftest
 
@@ -121,7 +121,7 @@ def test_fused_moe_ptpc_fp8_hsaco(
     )
 
     hsaco_ret, dt_us = run_perftest(
-        fused_moe_ptpc_fp8,
+        fused_moe_asmjit_aot,
         hidden_states,
         w1,
         w2,
