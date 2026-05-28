@@ -585,20 +585,30 @@ struct opus_gemm_persistent_kargs_gfx950 {
 };
 #endif
 
+#ifndef OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
+#define OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
+// Indirection slot for the split-K fp32 workspace pointer. Captured HIP
+// graphs hold the slot address (stable), not the workspace ptr, so a
+// post-capture grow + hipFree of the old buffer doesn't dangle the graph.
+struct opus_splitk_ws_handle {
+    void*         ptr;    // current backing workspace; null until first grow
+    unsigned long bytes;  // current capacity in bytes
+};
+#endif
+
 #ifndef OPUS_GEMM_FLATMM_SPLITK_KARGS_DEFINED
 #define OPUS_GEMM_FLATMM_SPLITK_KARGS_DEFINED
 // Kernel arguments for the a16w16 flatmm split-K pipeline.
 //
-// Main kernel writes fp32 partial results into `ptr_workspace` laid out as
-// [split_k, B, padded_M, padded_N] (tile-aligned so no per-thread pred on the
-// store side); a separate reduce kernel consumes the workspace and writes
-// bf16 C[B, M, N].
+// Main kernel writes fp32 partial results to *ws_handle->ptr, laid out as
+// [split_k, B, padded_M, padded_N] (tile-aligned, no per-thread pred on
+// store). Reduce kernel consumes it and writes C[B, M, N].
 //
 // Host must satisfy split_k * pfk * B_K <= K (launcher auto-clamps otherwise).
 struct opus_gemm_flatmm_splitk_kargs_gfx950 {
     const void* __restrict__ ptr_a;         // bf16 [B, M, K]
     const void* __restrict__ ptr_b;         // bf16 [B, N, K] (pre-transposed)
-    void*       __restrict__ ptr_workspace; // fp32 [split_k, B, padded_M, padded_N]
+    const opus_splitk_ws_handle* __restrict__ ws_handle; // deref at kernel entry
     void*       __restrict__ ptr_c;         // bf16 [B, M, N] (filled by reduce kernel)
     // bias is consumed only by the reduce kernel (main kernel ignores it).
     // ptr_bias = nullptr when HAS_BIAS=false; dtype matches D_BIAS (== D_C

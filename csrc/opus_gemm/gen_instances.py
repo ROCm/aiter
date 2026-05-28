@@ -1999,56 +1999,52 @@ void
     int padded_M    = num_tiles_m * {k.B_M};
     int padded_N    = num_tiles_n * {k.B_N};
 
-    // Workspace allocation: thread-local cache that grows on demand.
-    // Replaces the original `hipMallocAsync` + `hipFreeAsync` pair
-    // (introduced when the launcher went torch-free), which is not
-    // graph-capturable on ROCm 7.2.2: hipgraph replay re-runs the
-    // alloc/free host-side every replay, costing ~120us / replay (vs
-    // ~30us of actual kernel work). The eager tuner also pays the
-    // alloc cost on every iter, distorting splitk's measured perf so
-    // badly that the tuner picks split-barrier kids for shapes where
-    // splitk would actually win.
-    //
-    // Cache is stream-agnostic: a single ptr is reused across all
-    // streams in the thread. Sync-on-grow uses `hipDeviceSynchronize`
-    // so we don't release memory another stream may still be writing.
-    // Inside graph capture the grow path is forbidden (hipMalloc /
-    // hipFree are stream-capture-illegal); callers that capture splitk
-    // are expected to warm up the cache once eagerly with the largest
-    // workspace they will use first.
+    // Thread-local growing workspace cache. Kernels see a stable handle
+    // slot (host-coherent, address never changes) and deref slot->ptr at
+    // entry; grow path swaps slot contents after a device sync. Captured
+    // graphs hold the slot, not the raw buffer, so a later grow doesn't
+    // dangle them. 4 MiB round-up absorbs near-miss shapes.
     auto stream = aiter::getCurrentHIPStream();
     size_t ws_bytes = (size_t)split_k * (size_t)batch
                     * (size_t)padded_M * (size_t)padded_N * sizeof(float);
-    static thread_local void*  ws_cached_ptr   = nullptr;
-    static thread_local size_t ws_cached_bytes = 0;
-    if (ws_cached_ptr == nullptr || ws_bytes > ws_cached_bytes)
+    static thread_local opus_splitk_ws_handle* ws_handle_ = []() {{
+        opus_splitk_ws_handle* h = nullptr;
+        HIP_CALL(hipHostMalloc(reinterpret_cast<void**>(&h),
+                               sizeof(opus_splitk_ws_handle),
+                               hipHostMallocCoherent));
+        h->ptr = nullptr;
+        h->bytes = 0;
+        return h;
+    }}();
+    if (ws_handle_->ptr == nullptr || ws_bytes > ws_handle_->bytes)
     {{
         hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
         HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
         AITER_CHECK(capture_status == hipStreamCaptureStatusNone,
-            "splitk workspace cache miss inside HIP graph capture is not "
-            "supported. Run the launcher once eagerly with the same shape "
-            "before capturing the graph (so the static thread_local "
-            "workspace cache is sized correctly).");
+            "splitk workspace grow inside HIP graph capture is not "
+            "supported (hipMalloc / hipFree are stream-capture-illegal). "
+            "Warm the cache once eagerly with the largest workspace before "
+            "capturing.");
 
-        if (ws_cached_ptr != nullptr)
-        {{
-            HIP_CALL(hipDeviceSynchronize());
-            HIP_CALL(hipFree(ws_cached_ptr));
-        }}
-        // Round up to 4 MiB granularity so small shape variations don't
-        // re-grow the buffer.
+        void* new_ptr = nullptr;
         const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
         size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
-        HIP_CALL(hipMalloc(&ws_cached_ptr, grow_bytes));
-        ws_cached_bytes = grow_bytes;
+        HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
+        if (ws_handle_->ptr != nullptr)
+        {{
+            // Drain anything still reading the old buffer (including any
+            // graph replay enqueued before this call) before we free it.
+            HIP_CALL(hipDeviceSynchronize());
+            HIP_CALL(hipFree(ws_handle_->ptr));
+        }}
+        ws_handle_->ptr = new_ptr;
+        ws_handle_->bytes = grow_bytes;
     }}
-    void* ptr_workspace_ = ws_cached_ptr;
 
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a         = XQ.data_ptr();
     kargs.ptr_b         = WQ.data_ptr();
-    kargs.ptr_workspace = ptr_workspace_;
+    kargs.ws_handle     = ws_handle_;
     kargs.ptr_c         = Y.data_ptr();
     kargs.ptr_bias      = ptr_bias_;          // populated by BIAS_HOST_VALIDATE
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
@@ -2083,7 +2079,7 @@ void
         if (bias.has_value()) {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    reinterpret_cast<const float*>(ptr_workspace_),
+                    ws_handle_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     reinterpret_cast<const __bf16*>(ptr_bias_),
@@ -2091,7 +2087,7 @@ void
         }}}} else {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    reinterpret_cast<const float*>(ptr_workspace_),
+                    ws_handle_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     nullptr, 0);
@@ -2101,7 +2097,7 @@ void
         if (bias.has_value()) {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    reinterpret_cast<const float*>(ptr_workspace_),
+                    ws_handle_,
                     reinterpret_cast<float*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     reinterpret_cast<const float*>(ptr_bias_),
@@ -2109,17 +2105,15 @@ void
         }}}} else {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    reinterpret_cast<const float*>(ptr_workspace_),
+                    ws_handle_,
                     reinterpret_cast<float*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     nullptr, 0);
         }}}}
     }}}}
 
-    // No free here: workspace is held by the static thread_local cache
-    // above and released on first cache resize / process exit. Avoids
-    // the per-call alloc/free overhead and makes the launcher
-    // graph-capturable (the cached pointer is constant across replays).
+    // No free: workspace is held by the thread_local handle (grow path
+    // above hipFrees the old buffer after a device sync).
 }}}}
 #endif // launcher only on regular host pass
 """
@@ -2460,11 +2454,13 @@ void
             "// Forward declaration only. Specialisations are instantiated\n"
             "// by every splitk device.cu so the linker always finds at\n"
             "// least one definition (weak symbols dedupe across TUs).\n"
+            "// Traits header brings in opus_splitk_ws_handle.\n"
+            '#include "gfx950/opus_gemm_traits_a16w16_gfx950.cuh"\n'
             "template<int VEC_, int BLOCK_, typename D_OUT,\n"
             "         bool HAS_BIAS_, typename D_BIAS_,\n"
             "         bool HAS_OOB_>\n"
             "__global__ void splitk_reduce_kernel(\n"
-            "    const float* workspace, D_OUT* c_out,\n"
+            "    const opus_splitk_ws_handle* ws_handle, D_OUT* c_out,\n"
             "    int split_k, int M, int N, int batch,\n"
             "    int padded_M, int padded_N,\n"
             "    const D_BIAS_* bias, int stride_bias_batch);\n"
@@ -2585,29 +2581,29 @@ void
             '#include "gfx950/splitk_reduce_gfx950.cuh"\n'
             "// HAS_OOB=true variants\n"
             "template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16, true>(\n"
-            "    const float*, __bf16*, int, int, int, int, int, int,\n"
+            "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int, int,\n"
             "    const __bf16*, int);\n"
             "template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16, true>(\n"
-            "    const float*, __bf16*, int, int, int, int, int, int,\n"
+            "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int, int,\n"
             "    const __bf16*, int);\n"
             "template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float,  true>(\n"
-            "    const float*, float*,  int, int, int, int, int, int,\n"
+            "    const opus_splitk_ws_handle*, float*,  int, int, int, int, int, int,\n"
             "    const float*,  int);\n"
             "template __global__ void splitk_reduce_kernel<16, 64, float,  false, float,  true>(\n"
-            "    const float*, float*,  int, int, int, int, int, int,\n"
+            "    const opus_splitk_ws_handle*, float*,  int, int, int, int, int, int,\n"
             "    const float*,  int);\n"
             "// HAS_OOB=false variants\n"
             "template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16, false>(\n"
-            "    const float*, __bf16*, int, int, int, int, int, int,\n"
+            "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int, int,\n"
             "    const __bf16*, int);\n"
             "template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16, false>(\n"
-            "    const float*, __bf16*, int, int, int, int, int, int,\n"
+            "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int, int,\n"
             "    const __bf16*, int);\n"
             "template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float,  false>(\n"
-            "    const float*, float*,  int, int, int, int, int, int,\n"
+            "    const opus_splitk_ws_handle*, float*,  int, int, int, int, int, int,\n"
             "    const float*,  int);\n"
             "template __global__ void splitk_reduce_kernel<16, 64, float,  false, float,  false>(\n"
-            "    const float*, float*,  int, int, int, int, int, int,\n"
+            "    const opus_splitk_ws_handle*, float*,  int, int, int, int, int, int,\n"
             "    const float*,  int);\n"
         )
         Path(os.path.join(self.instances_path, "splitk_reduce.device.cu")).write_text(
