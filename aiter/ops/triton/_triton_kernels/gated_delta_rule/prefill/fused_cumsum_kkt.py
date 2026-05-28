@@ -143,15 +143,31 @@ def fused_cumsum_kkt(
     return g_cumsum, A
 
 
+if IS_AMD:
+    _K12_CONFIGS = [
+        triton.Config({"BK": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BK": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BK": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BK": 32}, num_warps=2, num_stages=3),
+        triton.Config({"BK": 64}, num_warps=4, num_stages=2),
+    ]
+else:
+    _K12_CONFIGS = [
+        triton.Config({"BK": BK}, num_warps=nw, num_stages=ns)
+        for BK in [32, 64, 128]
+        for nw in [4, 8]
+        for ns in [2, 3, 4]
+    ]
+
+_K12_DEFAULT_CONFIG = triton.Config({"BK": 32}, num_warps=4, num_stages=2)
+
+
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=gated_delta_rule_autotune_configs(
-        [
-            triton.Config({"BK": BK}, num_warps=nw, num_stages=ns)
-            for BK in [32, 64]
-            for nw in [2, 4]
-            for ns in ([2, 3] if IS_AMD else [2, 3, 4])
-        ]
+        _K12_CONFIGS,
+        default_config=_K12_DEFAULT_CONFIG,
     ),
     key=["H", "K", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
