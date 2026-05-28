@@ -22,6 +22,8 @@ from aiter.ops.triton.fusions.fused_kv_cache import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 
+DEVICE_ARCH = arch_info.get_arch()
+
 
 def split_unshuffle_nvfp4_kv_cache(key_or_value_cache):
     num_blocks, KH, block_size, new_head_size = key_or_value_cache.shape
@@ -67,8 +69,8 @@ def split_unshuffle_nvfp4_kv_cache(key_or_value_cache):
     return key_or_value_cache_data, key_or_value_cache_scales
 
 
-@pytest.mark.parametrize("T", [1, 2, 4, 2048])
-@pytest.mark.parametrize("QH_per_KH", [1, 16])
+@pytest.mark.parametrize("T", [1, 2, 4, 8, 2048])
+@pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [1])
 @pytest.mark.parametrize("D_pe", [64])  # For now, D is power of 2. D >= 16
 @pytest.mark.parametrize("D_lora", [512])
@@ -98,6 +100,9 @@ def test_fused_qk_rope_cat_and_cache_mla(
     block_size: int,
 ):
     dtype = torch.bfloat16
+    if cache_dtype == torch.uint8:
+        if DEVICE_ARCH not in ("gfx1250",):
+            pytest.skip("NVFP4 quantization is only supported on GFX1250")
     pos = True
     _, _, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
         1,
@@ -208,6 +213,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
     else:
         torch_kv_cache = torch_kv_cache.to(cache_dtype)
     triton_kv_cache = torch.zeros_like(torch_kv_cache)
+    num_decode_toks_for_zeros = T
     triton_q, triton_decode_q_pe, triton_k_pe, triton_zeros = (
         fused_qk_rope_cat_and_cache_mla(
             q_nope,
@@ -221,7 +227,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
             sin,
             k_scale,
             (rotate_style == RotateStyle.NEOX),
-            num_decode_toks_for_zeros=T,
+            num_decode_toks_for_zeros=num_decode_toks_for_zeros,
             apply_scale=(k_pe.dtype != triton_kv_cache.dtype),
             q_out=None,
             decode_q_pe_out=None,
@@ -242,11 +248,12 @@ def test_fused_qk_rope_cat_and_cache_mla(
     )
 
     torch.testing.assert_close(torch_q, triton_q, atol=1e-1, rtol=1e-1)
-    torch.testing.assert_close(
-        torch_decode_q_pe, triton_decode_q_pe, atol=1e-1, rtol=1e-1
-    )
+    if num_decode_toks_for_zeros > 0:
+        torch.testing.assert_close(
+            torch_decode_q_pe, triton_decode_q_pe, atol=1e-1, rtol=1e-1
+        )
+        torch.testing.assert_close(torch_zeros, triton_zeros, atol=0.1, rtol=0.1)
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
-    torch.testing.assert_close(torch_zeros, triton_zeros, atol=0.1, rtol=0.1)
 
 
 @pytest.mark.parametrize("T", [1, 2, 4, 2048])

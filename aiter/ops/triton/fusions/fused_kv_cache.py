@@ -5,15 +5,21 @@ import torch
 import triton
 from typing import Tuple
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
-    _fused_qk_rope_cat_and_cache_mla_kernel,
+    _fused_qk_rope_cat_and_cache_mla_kernel as triton_fused_qk_rope_cat_and_cache_mla_kernel,
     _fused_qk_rope_reshape_and_cache_kernel,
     _fused_qk_rope_cosine_cache_llama_kernel,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
+    _fused_qk_rope_cat_and_cache_mla_kernel as gluon_fused_qk_rope_cat_and_cache_mla_kernel,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils._triton import arch_info
 
 _LOGGER = AiterTritonLogger()
+
+DEVICE_ARCH = arch_info.get_arch()
 
 
 def fused_qk_rope_cat_and_cache_mla_fake_tensor(
@@ -193,6 +199,13 @@ def fused_qk_rope_cat_and_cache_mla(
         assert (
             b == b_q_out and qh == qh_q_out and d_nope + d_pe == d_q_out
         ), "q_out shape mismatch"
+        # The gluon kernel reuses qn_smem/qpe_smem (sized in q_nope dtype) to
+        # stage the q_out async_store. That requires the q_out dtype to match
+        # the input q_nope/q_pe dtype.
+        assert q_out.dtype == q_nope.dtype == q_pe.dtype, (
+            f"q_out dtype ({q_out.dtype}) must match q_nope dtype ({q_nope.dtype})"
+            f" and q_pe dtype ({q_pe.dtype})"
+        )
 
     if decode_q_pe_out is None:
         decode_q_pe_out = torch.empty(
@@ -216,13 +229,11 @@ def fused_qk_rope_cat_and_cache_mla(
             bk == b_k_pe_out and kh == hk_k_pe_out and d_pe == d_k_pe_out
         ), "k_pe_out shape mismatch, expected (bk, kh, d_pe)"
 
-    q_nope_zeros_out = None
-    if num_decode_toks_for_zeros > 0:
-        q_nope_zeros_out = torch.empty(
-            (num_decode_toks_for_zeros, qh, d_nope),
-            dtype=q_nope.dtype,
-            device=q_nope.device,
-        )
+    q_nope_zeros_out = torch.empty(
+        (num_decode_toks_for_zeros, qh, d_nope),
+        dtype=q_nope.dtype,
+        device=q_nope.device,
+    )
 
     if shuffled_kv_cache:
         kv_cache_stride_b = kv_cache.stride(0)
@@ -239,7 +250,12 @@ def fused_qk_rope_cat_and_cache_mla(
 
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
-    _fused_qk_rope_cat_and_cache_mla_kernel[grid](
+    if DEVICE_ARCH == "gfx1250":
+        _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
+    else:
+        _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
+
+    _kernel[grid](
         q_nope,
         q_pe,
         k_nope,
@@ -266,9 +282,7 @@ def fused_qk_rope_cat_and_cache_mla(
         *q_out.stride(),
         *decode_q_pe_out.stride(),
         *k_pe_out.stride(),
-        q_nope_zeros_out.stride(0) if q_nope_zeros_out is not None else 0,
-        q_nope_zeros_out.stride(1) if q_nope_zeros_out is not None else 0,
-        q_nope_zeros_out.stride(2) if q_nope_zeros_out is not None else 0,
+        *q_nope_zeros_out.stride(),
         kv_cache_stride_b,
         kv_cache_stride_h,
         kv_cache_stride_d,
@@ -285,18 +299,11 @@ def fused_qk_rope_cat_and_cache_mla(
         SHUFFLED_KV_CACHE=shuffled_kv_cache,
         SCALE_K_WIDTH_NOPE=SCALE_K_WIDTH_NOPE,
         SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
-        OUTPUT_Q_NOPE_ZEROS=(q_nope_zeros_out is not None),
+        OUTPUT_Q_NOPE_ZEROS_AND_Q_PE=(num_decode_toks_for_zeros > 0),
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         num_warps=1,
     )
 
-    if q_nope_zeros_out is None:
-        # change q_nope_zeros_out from None to a tensor for torch compile
-        q_nope_zeros_out = torch.empty(
-            (num_decode_toks_for_zeros, qh, dk_nope),
-            dtype=q_nope.dtype,
-            device=q_nope.device,
-        )
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
 
 

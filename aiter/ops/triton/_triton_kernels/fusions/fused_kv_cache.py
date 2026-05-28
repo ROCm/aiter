@@ -298,7 +298,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     SHUFFLED_KV_CACHE: tl.constexpr = False,
     SCALE_K_WIDTH_NOPE: tl.constexpr = 4,
     SCALE_K_WIDTH_ROPE: tl.constexpr = 4,
-    OUTPUT_Q_NOPE_ZEROS: tl.constexpr = False,
+    OUTPUT_Q_NOPE_ZEROS_AND_Q_PE: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
@@ -362,19 +362,17 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             q_pe.to(q_out_ptr.dtype.element_ty),
         )
 
-        if pid < num_decode_toks_for_zeros * QH:
-            decode_q_pe_out_ptrs = (
-                decode_q_pe_out_ptr
-                + pid_b * decode_q_pe_out_stride_b
-                + pid_hq * decode_q_pe_out_stride_h
-            )
-            tl.store(
-                decode_q_pe_out_ptrs + d_pe_offs * decode_q_pe_out_stride_d,
-                q_pe.to(decode_q_pe_out_ptr.dtype.element_ty),
-            )
-
-        if OUTPUT_Q_NOPE_ZEROS:
+        if OUTPUT_Q_NOPE_ZEROS_AND_Q_PE:
             if pid < num_decode_toks_for_zeros * QH:
+                decode_q_pe_out_ptrs = (
+                    decode_q_pe_out_ptr
+                    + pid_b * decode_q_pe_out_stride_b
+                    + pid_hq * decode_q_pe_out_stride_h
+                )
+                tl.store(
+                    decode_q_pe_out_ptrs + d_pe_offs * decode_q_pe_out_stride_d,
+                    q_pe.to(decode_q_pe_out_ptr.dtype.element_ty),
+                )
                 z = tl.zeros(
                     (BLOCK_D_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty
                 )
