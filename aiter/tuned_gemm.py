@@ -31,6 +31,11 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.gemm_op_common import get_padded_m
 from torch import Tensor
 
+try:
+    from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
+except Exception:
+    _opus_tune = None
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -283,46 +288,25 @@ def gemm_a16w16(
         scaleAB=scale_a is not None or scale_b is not None,
         bpreshuffle=bpreshuffle,
     )
-    if config is not None and config["libtype"] == "flydsl":
-        flydsl_config = (
-            aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
-                config["kernelName"]
-            )
-        )
-        return flydsl_gemm(
-            inp_view,
-            B,
-            bias,
-            otype,
-            scale_a,
-            scale_b,
-            scale_c,
-            config=flydsl_config,
-        )
-
     gfx = get_gfx()
     _no_asm = gfx.startswith("gfx12")
-    if config is not None and config["libtype"] == "asm" and not _no_asm:
-        kernelName = config["kernelName"]
-        splitK = config["splitK"]
-        out = asm_gemm(inp_view, B, bias, otype, splitK, kernelName, bpreshuffle)
-    else:
-        libtype = config["libtype"]
-        if _no_asm and libtype in ("asm", "skinny", "hipblaslt"):
-            libtype = "torch"
-        solution_idx = config["solidx"] if libtype == config.get("libtype") else 0
-        solfunc = solMap[libtype]
-        out = solfunc(
-            inp_view,
-            B,
-            solution_idx,
-            bias,
-            otype,
-            scale_a,
-            scale_b,
-            scale_c,
-            bpreshuffle,
-        )
+    libtype = config["libtype"]
+    if _no_asm and libtype in ("asm", "skinny", "hipblaslt"):
+        libtype = "torch"
+    solution_idx = config["solidx"] if libtype == config.get("libtype") else 0
+    solfunc = solMap[libtype]
+    out = solfunc(
+        inp_view,
+        B,
+        solution_idx,
+        bias,
+        otype,
+        scale_a,
+        scale_b,
+        scale_c,
+        bpreshuffle,
+        config=config,
+    )
     if batched:
         out = out.view(*A.shape[:-1], B.shape[0])
     if otype is not None and out.dtype != otype:
@@ -350,6 +334,7 @@ def skinny_gemm(
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
     bpreshuffle=False,
+    config: Optional[dict] = None,
 ):
     import aiter as ops
 
@@ -384,6 +369,7 @@ def hipb_gemm(
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
     bpreshuffle=False,
+    config: Optional[dict] = None,
 ):
     if otype is None:
         otype = inp.dtype
@@ -406,6 +392,7 @@ def torch_gemm(
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
     bpreshuffle=False,
+    config: Optional[dict] = None,
 ):
     assert not bpreshuffle, "bpreshuffle is not supported in torch_gemm!"
     if inp.dtype == dtypes.fp8:
@@ -435,35 +422,44 @@ def torch_gemm(
 
 
 def asm_gemm(
-    inp,
-    weights,
-    bias=None,
-    otype=None,
-    splitK=None,
-    KernelName=None,
-    bpreshuffle=False,
-):
-    # just support bf16gemm_outFp32
-    out_asm = torch.empty(
-        inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
-    )
-    return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName, bpreshuffle)
-
-
-def flydsl_gemm(
     inp: Tensor,
     weights: Tensor,
+    solidx: int,
     bias: Optional[Tensor] = None,
     otype: Optional[torch.dtype] = None,
     scale_a: Optional[Tensor] = None,
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
-    config: dict = None,
+    bpreshuffle=False,
+    config: Optional[dict] = None,
+):
+    kernelName = config.get("kernelName") if config else None
+    splitK = config.get("splitK") if config else None
+    out_asm = torch.empty(
+        inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
+    )
+    return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, kernelName, bpreshuffle)
+
+
+def flydsl_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
+    bpreshuffle=False,
+    config: Optional[dict] = None,
 ):
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
-    stages = config.get("stages", config.get("stage", 2))
+    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+        config["kernelName"]
+    )
+    stages = flydsl_config.get("stages", flydsl_config.get("stage", 2))
     fused_bias = None
     if (
         bias is not None
@@ -475,22 +471,22 @@ def flydsl_gemm(
         inp,
         weights,
         bias=fused_bias,
-        kernel_family=config.get("kernel_family"),
-        tile_m=config["tile_m"],
-        tile_n=config["tile_n"],
-        tile_k=config["tile_k"],
-        split_k=config["split_k"],
-        block_m_warps=config["block_m_warps"],
-        block_n_warps=config["block_n_warps"],
-        n_tile_repeat=config.get("n_tile_repeat", 1),
-        persistent_n_tiles=config.get("persistent_n_tiles", 1),
-        waves_per_eu=config.get("waves_per_eu", 0),
-        b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
+        kernel_family=flydsl_config.get("kernel_family"),
+        tile_m=flydsl_config["tile_m"],
+        tile_n=flydsl_config["tile_n"],
+        tile_k=flydsl_config["tile_k"],
+        split_k=flydsl_config["split_k"],
+        block_m_warps=flydsl_config["block_m_warps"],
+        block_n_warps=flydsl_config["block_n_warps"],
+        n_tile_repeat=flydsl_config.get("n_tile_repeat", 1),
+        persistent_n_tiles=flydsl_config.get("persistent_n_tiles", 1),
+        waves_per_eu=flydsl_config.get("waves_per_eu", 0),
+        b_to_lds_unroll=flydsl_config.get("b_to_lds_unroll", 0),
         stages=stages,
-        async_copy=config.get("async_copy", False),
-        b_to_lds=config["b_to_lds"],
-        b_preshuffle=config.get("b_preshuffle", False),
-        c_to_lds=config.get("c_to_lds", False),
+        async_copy=flydsl_config.get("async_copy", False),
+        b_to_lds=flydsl_config["b_to_lds"],
+        b_preshuffle=flydsl_config.get("b_preshuffle", False),
+        c_to_lds=flydsl_config.get("c_to_lds", False),
     )
 
     if bias is not None and fused_bias is None:
@@ -498,6 +494,55 @@ def flydsl_gemm(
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
     return out
+
+
+def opus_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
+    bpreshuffle: Optional[bool] = False,
+    config: Optional[dict] = None,
+):
+    if _opus_tune is None:
+        logger.warning(
+            "opus tuned config found but opus is not available; falling back to torch"
+        )
+        return torch_gemm(
+            inp,
+            weights,
+            solidx,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            bpreshuffle,
+            config,
+        )
+    assert (
+        scale_a is None and scale_b is None and scale_c is None
+    ), "opus_gemm does not support scaling"
+    assert not bpreshuffle, "opus_gemm does not support bpreshuffle"
+    splitK = int(config.get("splitK", 0)) if config is not None else 0
+    m, k = inp.shape
+    n = weights.shape[0]
+    Y = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
+    _opus_tune(
+        inp.unsqueeze(0),
+        weights.unsqueeze(0),
+        Y.unsqueeze(0),
+        bias=bias,
+        kernelId=int(solidx),
+        splitK=splitK,
+    )
+    if bias is not None:
+        Y = Y + bias
+    return Y
 
 
 def triton_gemm(
@@ -510,6 +555,7 @@ def triton_gemm(
     scale_b: Optional[Tensor] = None,
     scale_c: Optional[Tensor] = None,
     bpreshuffle: Optional[bool] = False,
+    config: Optional[dict] = None,
 ):
     from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 
@@ -526,6 +572,8 @@ solMap = {
     "skinny": skinny_gemm,
     "asm": asm_gemm,
     "triton": triton_gemm,
+    "flydsl": flydsl_gemm,
+    "opus": opus_gemm,
 }
 
 
