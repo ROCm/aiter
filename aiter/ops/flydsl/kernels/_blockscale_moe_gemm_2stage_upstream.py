@@ -4,7 +4,7 @@
 """MoE Blockscale GEMM stage1/stage2 (FlyDSL MFMA FP8).
 
 Per-block scaling (ScaleBlockM=1, ScaleBlockN=128, ScaleBlockK=128).
-FP8-only, g1u1 (gate+up with SiLU).
+FP8-only, g1u1 (gate+up with SiLU or GeLU).
 
 Based on moe_gemm_2stage.py with blockscale compute_tile pattern
 from blockscale_preshuffle_gemm.py.
@@ -81,7 +81,10 @@ def compile_moe_blockscale_gemm1(
     out_dtype: str = "f16",
     use_cshuffle_epilog: bool | None = None,
     waves_per_eu: int | None = None,
+    act: str = "silu",
 ):
+    if act not in ("silu", "gelu"):
+        raise ValueError(f"act must be 'silu' or 'gelu', got {act!r}")
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
     in_dtype:
@@ -169,8 +172,8 @@ def compile_moe_blockscale_gemm1(
     if use_cshuffle_epilog is None:
         use_cshuffle_epilog = os.environ.get("FLYDSL_MOE_STAGE1_CSHUFFLE", "1") in ("1", "true", "True", "YES", "yes")
     use_cshuffle_epilog = bool(use_cshuffle_epilog)
-    if out_dtype != "f16" and use_cshuffle_epilog:
-        raise ValueError("stage1 cshuffle epilog currently supports only f16 output (out_dtype='f16')")
+    # cshuffle epilog now supports both f16 and bf16 (out_mlir() handles the type swap).
+    _out_is_bf16 = out_dtype == "bf16"
 
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
@@ -237,6 +240,36 @@ def compile_moe_blockscale_gemm1(
             sig = rocdl.rcp(T.f32, den)
             return x * sig
 
+        def gelu(x):
+            # CK parity: y = 0.5 * x * (1 + erf(x / sqrt(2))).
+            # rocdl exposes exp/exp2/rcp but no erf, so we use Abramowitz & Stegun
+            # 7.1.26 polynomial (max abs err ~1.5e-7) and a sign trick for erf.
+            #   z   = x * 1/sqrt(2)
+            #   a   = |z|
+            #   t   = 1 / (1 + 0.3275911 * a)            (rcp)
+            #   p   = ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
+            #   e   = exp(-z*z) = exp2(-z*z * log2(e))   (rocdl.exp2 fast path)
+            #   |erf(z)| = 1 - p * e
+            #   erf(z)   = copysign(|erf(z)|, z)
+            z = x * 0.70710678118654752440  # 1/sqrt(2)
+            a = math_dialect.absf(z)
+            den = 1.0 + 0.3275911 * a
+            t = rocdl.rcp(T.f32, den)
+            # Horner: ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
+            p = 1.061405429 * t + (-1.453152027)
+            p = p * t + 1.421413741
+            p = p * t + (-0.284496736)
+            p = p * t + 0.254829592
+            p = p * t
+            # exp(-z*z) = exp2(-z*z * log2e)
+            neg_z2_log2e = (z * z) * (-1.4426950408889634)
+            e = rocdl.exp2(T.f32, neg_z2_log2e)
+            erf_abs = 1.0 - p * e
+            erf_z = math_dialect.copysign(erf_abs, z)
+            return 0.5 * x * (1.0 + erf_z)
+
+        act_fn = gelu if act == "gelu" else silu
+
         acc_init = arith.constant_vector(0, T.i32x4) if is_int8 else arith.constant_vector(0.0, T.f32x4)
 
         # Layouts
@@ -289,9 +322,14 @@ def compile_moe_blockscale_gemm1(
                 shape=(lds_total_elems,),
             )
             lds_x = lds_x_ptr.get()
-            # Alias LDS bytes as fp16 for optional CShuffle epilogue.
+            # Alias LDS bytes as fp16/bf16 for optional CShuffle epilogue.
             lds_out = (
-                SmemPtr(base_ptr, lds_x_ptr.byte_offset, T.f16, shape=(tile_m * tile_n,)).get()
+                SmemPtr(
+                    base_ptr,
+                    lds_x_ptr.byte_offset,
+                    T.bf16 if _out_is_bf16 else T.f16,
+                    shape=(tile_m * tile_n,),
+                ).get()
                 if _use_cshuffle_epilog
                 else None
             )
@@ -1043,13 +1081,14 @@ def compile_moe_blockscale_gemm1(
                         vg = vector.extract(acc_gate[acc_idx], static_position=[ii], dynamic_position=[])
                         vu = vector.extract(acc_up[acc_idx], static_position=[ii], dynamic_position=[])
 
-                        y = silu(vg) * vu
+                        y = act_fn(vg) * vu
                         if const_expr(doweight_stage1):
                             y = y * tw
-                        y16 = arith.trunc_f(T.f16, y)
+                        _out_ty = out_mlir()
+                        y16 = arith.trunc_f(_out_ty, y)
 
                         lds_idx = row_base_lds + col_local
-                        v1 = vector.from_elements(T.vec(1, T.f16), [y16])
+                        v1 = vector.from_elements(T.vec(1, _out_ty), [y16])
                         vector.store(v1, lds_out, [lds_idx], alignment=2)
 
                 def precompute_row(*, row_local, row):
@@ -1091,6 +1130,7 @@ def compile_moe_blockscale_gemm1(
                     by_n=by_n,
                     n_tile_base=n_tile_base,
                     lds_out=lds_out,
+                    frag_elem_type=(T.bf16 if _out_is_bf16 else T.f16),
                     write_row_to_lds=write_row_to_lds,
                     precompute_row=precompute_row,
                     store_pair=store_pair,
@@ -1120,7 +1160,7 @@ def compile_moe_blockscale_gemm1(
                         vg = vector.extract(acc_gate[acc_idx], static_position=[ii], dynamic_position=[])
                         vu = vector.extract(acc_up[acc_idx], static_position=[ii], dynamic_position=[])
 
-                        y = silu(vg) * vu
+                        y = act_fn(vg) * vu
                         if const_expr(doweight_stage1):
                             y = y * tw
                         y = arith.trunc_f(out_mlir(), y)
