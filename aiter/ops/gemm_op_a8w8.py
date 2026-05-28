@@ -747,8 +747,8 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    zero_bias_buf: Optional[Tensor] = None,
     dtype: torch.dtype = dtypes.bf16,
+    zero_bias_buf: Optional[Tensor] = None,
 ) -> Tensor:
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
@@ -759,10 +759,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    zero_bias_buf: Optional[
-        Tensor
-    ] = None,  # which is used to asm kernel(asm always need a bias tensor)
     dtype: torch.dtype = dtypes.bf16,
+    zero_bias_buf: Optional[Tensor] = None,
 ) -> Tensor:
     assert dtype in [
         dtypes.bf16,
