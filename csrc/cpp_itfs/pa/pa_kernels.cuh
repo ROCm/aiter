@@ -12,7 +12,8 @@ template <typename scalar_t,
           int GQA_RATIO,
           int MTP,
           typename AttentionVariant,
-          bool SLIDING_WINDOW_ENABLED>
+          bool SLIDING_WINDOW_ENABLED,
+          int T_PAR_SIZE_PARAM = 256>
 __inline__ __device__ void
 _paged_attention_kernel(const int* block_table_seq,
                         const int64_t query_loc,
@@ -43,7 +44,7 @@ _paged_attention_kernel(const int* block_table_seq,
     const int seq_idx                = blockIdx.x;
     const int partition_idx          = blockIdx.y;
     const int kv_head_idx            = blockIdx.z;
-    constexpr int T_PAR_SIZE         = 256;
+    constexpr int T_PAR_SIZE         = T_PAR_SIZE_PARAM;
     constexpr int NWARPS             = NUM_THREADS / WARP_SIZE;
     constexpr int HEAD_LOOP          = DIVIDE_ROUND_UP(HEAD_SIZE, 128);
     constexpr int HEAD_SIZE_PER_LOOP = DIVIDE_ROUND_UP(HEAD_SIZE, HEAD_LOOP);
