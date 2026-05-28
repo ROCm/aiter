@@ -12,7 +12,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
     _mxfp4_quant_kernel,
     _moe_gemm_a4w4,
 )
-from aiter.ops.triton._gluon_kernels.moe.moe_op_gemm_a4w4 import (
+from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import (
     _moe_gemm_a4w4_gfx1250,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
