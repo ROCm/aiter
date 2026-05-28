@@ -38,6 +38,12 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>~5.33<br>TB/s</td><td>~0.69<br>TB/s</td><td>—</td>
 </tr>
 <tr>
+  <td><code>mla_decode_gluon_bh16_dcp</code></td><td>MLA Decode<br>(stage-1, DCP)</td><td>CDNA4</td>
+  <td nowrap>Q: bf16, KV: bf16<br>Out: bf16 acc + fp32 lse<br>nhead &le; 16<br>batch_size &ge; 1 (any)<br>NUM_KV_SPLITS=256//B<br>(B*splits &le; 256)<br>PAGE_SIZE=1<br>BLOCK_H=16, BLOCK_N=64<br>no intra-GPU reduce</td>
+  <td>python op_tests/test_mla.py \<br>-c 100000 -b 4 -n 16,1 \<br>-d bf16 -kvd bf16</td>
+  <td>~4.68<br>TB/s</td><td>—</td><td>—</td>
+</tr>
+<tr>
   <td><code>pa_decode_gluon</code></td><td>Paged Attn<br>Decode</td><td>CDNA3<br>CDNA4</td>
   <td nowrap>Q: fp8/bf16/fp16<br>KV: fp8/bf16/fp16<br>Out: bf16 or match<br>query_len &le; 4<br>query_len &times; group_size &le; 64<br>ctx_partition = 256</td>
   <td>python op_tests/triton_tests/<br>test_pa_decode_gluon.py</td>
@@ -154,6 +160,52 @@ python op_tests/test_mla.py -c 10000000 -b 1 -n 16,1 -d bf16 -kvd bf16
 | 1     | 16    | 0.69     | 5.33       | 7.71&times; |
 
 Gluon reaches ~82% of MI350's 6.5 TB/s HBM peak (wall-clock 2162 &mu;s vs ASM 16659 &mu;s).
+
+### `mla_decode_gluon_bh16_dcp` — Stage-1-only MLA Decode for DCP
+
+**Function:** `mla_decode_gluon_bh16_dcp(q_nope, q_pe, kv_c, attn_logits, lse, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1)`
+
+**Description:** Per-GPU stage-1 MLA decode for Decode-Context-Parallel (DCP) workloads where the KV cache is sharded across GPUs. Runs only stage-1 (`_mla_decode_gluon` with `REGIME='dcp_bh16'`) and returns per-split `(attn_logits, lse)` for the **host** to combine across GPUs. No intra-GPU stage-2 reduce is invoked.
+
+Reuses the existing `_mla_decode_gluon` kernel via a new REGIME constexpr branch that:
+1. Lifts `gl.assume(num_iter >= 3)` to `gl.assume(num_iter >= 1)` — allows splits with as few as 1 BLOCK_N iteration.
+2. Gates epilogue 1 with `if num_iter >= 2:` — skips the prologue-K-reuse epi for `num_iter == 1` (epi 2 alone handles the single iter using prologue's iter-0 K, with `gl.where` mask at qk-time turning OOB lanes to -inf).
+3. Adds a 2-D grid `(batch, split)` mapping for multi-batch shards.
+4. Writes `lse` to a **separate fp32 tensor** (instead of the bf16-packed trailing slot used by legacy regimes) — host-side cross-GPU LSE merge is precision-sensitive.
+
+| Parameter | Details |
+|-----------|---------|
+| Arch | gfx950 (CDNA4) |
+| Q dtype | bf16 |
+| KV dtype | bf16 |
+| `attn_logits` | `[B, nhead, NUM_KV_SPLITS, kv_lora_rank]` bf16, caller-allocated |
+| `lse` | `[B, nhead, NUM_KV_SPLITS]` fp32, caller-allocated |
+| batch_size | any `B >= 1` |
+| nhead | 1..16 |
+| NUM_KV_SPLITS | `256 // batch_size` (floor); total WGs `= B * NUM_KV_SPLITS <= 256`. When `B` divides 256, fills all MI350 CUs exactly; otherwise a few CUs idle for the wave (worst case ~1.5% at B=6) |
+| BLOCK_H | 16 |
+| BLOCK_N | 64 |
+| Seq constraint | `min_kv_seq_len >= NUM_KV_SPLITS` (every split gets &ge; 1 token; `num_iter` per WG &isin; {1..7} for the target operating range) |
+| Stage-2 reduce | not invoked &mdash; host does cross-GPU LSE merge |
+
+**Operating window:** `B * ctx_lens` in **10K..100K** total tokens. At the low end (B&middot;ctx=10K), `num_iter == 1` per WG is common.
+
+**Perf** (MI350, bf16 Q + bf16 KV; memory-bound; stage-1 only &mdash; not directly comparable to full-decode kernels):
+
+```
+python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16
+```
+
+| ctx_lens | batch | NUM_KV_SPLITS | num_iter / split | us | TB/s |
+|----------|-------|---------------|------------------|-----|------|
+| 10K      | 1     | 256           | 1                | 9.14  | 1.26 |
+| 10K      | 3     | 85            | 2                | 17.56 | 1.97 |
+| 10K      | 4     | 64            | 3                | 19.02 | 2.43 |
+| 100K     | 1     | 256           | 7                | 36.62 | 3.15 |
+| 100K     | 3     | 85            | 19               | 76.06 | 4.55 |
+| 100K     | 4     | 64            | 25               | 98.48 | 4.68 |
+
+`B=3` is the awkward case: total WGs = `3 * 85 = 255` (one CU idle for the wave). `B=4` divides 256 exactly (`4 * 64 = 256`). `num_iter` per WG scales as `ceil(ctx_lens / NUM_KV_SPLITS / BLOCK_N)`, so it grows quickly for larger B at fixed ctx.
 
 ### `pa_decode_gluon.py` — Paged Attention Decode
 

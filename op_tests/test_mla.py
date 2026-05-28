@@ -561,6 +561,72 @@ def test_mla(
         cal_diff(out_ref, out_gluon, f"out_gluon_{name}", use_fp8=(name == "bh16bn128"))
         return err, us_decode
 
+    def test_absorb_decode_gluon_bh16_dcp():
+        # DCP (Decode Context Parallel) wrapper: per-GPU stage-1 only, no
+        # intra-GPU reducev. Host-side LSE-merge over splits validates
+        # equivalence to the unified attention reference. Triggered for
+        # B in {1,2,4}, bf16, nhead<=16; min ctx_lens*B such that every
+        # split has >=1 token.
+        from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon_bh16_dcp
+
+        out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
+        q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
+        q_pe = q[:, :, v_head_dim:].view(batch_size, nhead, qk_head_dim - v_head_dim)
+        kv_c = kv_buffer.view(-1, qk_head_dim)
+
+        if not varlen:
+            page_table = kv_indices[:total_kv].view(batch_size, ctx_lens)
+            seq_info = seq_lens_kv
+            use_2d_view = True
+        else:
+            page_table = kv_indices
+            seq_info = kv_indptr
+            use_2d_view = False
+
+        NUM_KV_SPLITS = 256 // batch_size
+        Dckv = v_head_dim
+        attn_logits = torch.empty(
+            (batch_size, nhead, NUM_KV_SPLITS, Dckv),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        lse = torch.empty(
+            (batch_size, nhead, NUM_KV_SPLITS),
+            dtype=torch.float32,
+            device=q.device,
+        )
+
+        _, us_decode = run_perftest(
+            mla_decode_gluon_bh16_dcp,
+            q_nope,
+            q_pe,
+            kv_c,
+            attn_logits,
+            lse,
+            page_table,
+            seq_info,
+            sm_scale,
+            use_2d_view=use_2d_view,
+            kv_scale=1.0,
+            min_kv_seq_len=ctx_lens,
+        )
+
+        # Host-side log-sum-exp merge across splits:
+        #   final = sum_i acc_i * exp(lse_i - max_lse) / sum_i exp(lse_i - max_lse)
+        acc_f = attn_logits.float()
+        max_lse = lse.max(dim=-1, keepdim=True).values
+        w = torch.exp(lse - max_lse)
+        merged = (acc_f * w[..., None]).sum(dim=-2) / w.sum(dim=-1, keepdim=True)
+        out_gluon.copy_(merged.view(total_q, nhead, v_head_dim).to(out_dtype))
+
+        err = checkAllclose(
+            out_ref,
+            out_gluon,
+            msg=f"mla_decode-absorb    [golden vs gluon_dcp_bh16]: {us_decode:>8.2f} us......",
+        )
+        cal_diff(out_ref, out_gluon, "out_gluon_dcp_bh16")
+        return err, us_decode
+
     err = None
     us_asm_decode = 1e12
     if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
@@ -666,6 +732,31 @@ def test_mla(
         ret["decode:gluon_576"] = us_gluon_decode
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+
+    # Gluon MLA dcp_bh16 decode test (gfx950, bf16 Q + bf16 KV, nhead<=16,
+    # decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
+    # NUM_KV_SPLITS = 256 // batch_size (floor); for B not dividing 256
+    # (e.g., 3, 5, 6, 7) total WGs is slightly under 256 (a few CUs idle for
+    # the wave). Wrapper asserts min_kv_seq_len >= NUM_KV_SPLITS so num_iter
+    # >= 1 per split. Target operating window is B * ctx_lens in 10K..100K.
+    # Example: -c 10000 -b 1 -n 16,1 -d bf16 -kvd bf16  (num_iter=1 boundary).
+    if (
+        get_gfx() == "gfx950"
+        and dtype == torch.bfloat16
+        and kvtype == torch.bfloat16
+        and nhead <= 16
+        and decode_qlen == 1
+        and batch_size >= 1
+        and v_head_dim == 512
+        and (qk_head_dim - v_head_dim) == 64
+        and page_size == 1
+        and ctx_lens >= (256 // batch_size)
+    ):
+        err_gluon_dcp, us_gluon_dcp_decode = test_absorb_decode_gluon_bh16_dcp()
+        ret["decode:gluon_dcp_err"] = err_gluon_dcp
+        ret["decode:gluon_dcp_576"] = us_gluon_dcp_decode
+        ret["decode:gluon_dcp_TFLOPS"] = flops / us_gluon_dcp_decode / 1e6
+        ret["decode:gluon_dcp_TB/s"] = bytes / us_gluon_dcp_decode / 1e6
 
     return ret
 
