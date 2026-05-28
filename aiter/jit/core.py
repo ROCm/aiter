@@ -1687,9 +1687,6 @@ def compile_ops(
                         for k, v in kwargs.items()
                     }
 
-
-                    log_args(func, *args, **kwargs)
-
                 if develop:
                     module._set_current_hip_stream(
                         torch.cuda.current_stream().cuda_stream
