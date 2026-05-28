@@ -937,19 +937,27 @@ def _moe_gemm_a8w4_prefill(
             layout=x_scales_desc.layout,
         )
 
+    if GatherIndx is None:
+        x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            x_desc, add_offsets=[off_x_m, 0]
+        )
+    w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        w_desc, add_offsets=[off_w_n, 0]
+    )
+    w_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        w_scales_desc, add_offsets=[off_w_n_scale, 0]
+    )
+
     read_idx = 0
     write_idx = 0
     for _ in gl.static_range(NUM_BUFFERS):
-        idx_K = write_idx * BLOCK_K
-        idx_W = write_idx * PACKED_BLOCK_K_W
-        idx_MX = write_idx * PACKED_MX_BLOCK
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
-                [off_x_m, idx_K],
-                x_buffer.index(write_idx % NUM_BUFFERS),
+                dest=x_buffer.index(write_idx % NUM_BUFFERS),
             )
         else:
+            idx_K = write_idx * BLOCK_K
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
@@ -958,13 +966,11 @@ def _moe_gemm_a8w4_prefill(
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
-            [off_w_n, idx_W],
-            w_buffer.index(write_idx % NUM_BUFFERS),
+            dest=w_buffer.index(write_idx % NUM_BUFFERS),
         )
         gl.amd.gfx1250.tdm.async_load(
             w_scales_desc,
-            [off_w_n_scale, idx_MX],
-            w_scales_buffer.index(write_idx % NUM_BUFFERS),
+            dest=w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
             xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
@@ -973,6 +979,12 @@ def _moe_gemm_a8w4_prefill(
                 xs_ptrs_base + xs_k.to(index_type)[None, :],
             )
             async_copy.commit_group()
+        if GatherIndx is None:
+            x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(x_desc, add_offsets=[0, BLOCK_K])
+        w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(w_desc, add_offsets=[0, PACKED_BLOCK_K_W])
+        w_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            w_scales_desc, add_offsets=[0, PACKED_MX_BLOCK]
+        )
         write_idx += 1
 
     num_k_iter = tl.cdiv(K, BLOCK_K)
@@ -1018,16 +1030,13 @@ def _moe_gemm_a8w4_prefill(
                 cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc
             )
 
-        idx_K = write_idx * BLOCK_K
-        idx_W = write_idx * PACKED_BLOCK_K_W
-        idx_MX = write_idx * PACKED_MX_BLOCK
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
-                [off_x_m, idx_K],
-                x_buffer.index(write_idx % NUM_BUFFERS),
+                dest=x_buffer.index(write_idx % NUM_BUFFERS),
             )
         else:
+            idx_K = write_idx * BLOCK_K
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
                 offs_x_m,
@@ -1036,13 +1045,11 @@ def _moe_gemm_a8w4_prefill(
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
-            [off_w_n, idx_W],
-            w_buffer.index(write_idx % NUM_BUFFERS),
+            dest=w_buffer.index(write_idx % NUM_BUFFERS),
         )
         gl.amd.gfx1250.tdm.async_load(
             w_scales_desc,
-            [off_w_n_scale, idx_MX],
-            w_scales_buffer.index(write_idx % NUM_BUFFERS),
+            dest=w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
             xs_k = write_idx * MX_SCALE_BLOCK_K + offs_xs_k
@@ -1051,6 +1058,12 @@ def _moe_gemm_a8w4_prefill(
                 xs_ptrs_base + xs_k.to(index_type)[None, :],
             )
             async_copy.commit_group()
+        if GatherIndx is None:
+            x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(x_desc, add_offsets=[0, BLOCK_K])
+        w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(w_desc, add_offsets=[0, PACKED_BLOCK_K_W])
+        w_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            w_scales_desc, add_offsets=[0, PACKED_MX_BLOCK]
+        )
         write_idx += 1
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
