@@ -1014,18 +1014,8 @@ def main():
     parser.add_argument("--no-splitkv", action="store_true",
                         help="Force the CK single-launch path (disable the "
                              "transparent split-KV wrapper). Useful for "
-                             "measuring the kernel directly or working "
-                             "around split-KV bugs.")
-    parser.add_argument("--allow-splitkv", action="store_true",
-                        default=None,
-                        help="Force split-KV on. Mostly useful in "
-                             "--swa-fixtures mode where the default is "
-                             "single-launch (kernel-correctness gate) — "
-                             "pass this to switch fixtures into the "
-                             "production split-KV path for perf "
-                             "comparison. On the cartesian grid the "
-                             "default is already on, so this is a no-op "
-                             "unless paired with --no-splitkv.")
+                             "measuring the kernel directly without the "
+                             "combine overhead.")
     # SWA axes. `--window` extends the cartesian grid with one extra
     # dimension: each (window_size_left, window_size_right) pair adds
     # one row per other-axis cell. `(-1, -1)` is the no-SWA baseline,
@@ -1144,21 +1134,10 @@ def main():
     # @benchmark()-decorated driver runs it through the CK / Triton /
     # reference pipeline and the result lands in the same DataFrame.
     #
-    # Default-off split-KV for the fixture sweep: this mode is a kernel-
-    # correctness gate (ported from the standalone SWA file which forced
-    # single-launch for exactly this reason — "we want the kernel output,
-    # not the split-KV combine"). The cartesian-grid path keeps the
-    # production-typical split-KV default; users who want a split-KV
-    # SWA perf comparison should use `--window L,R ...` on the grid.
-    # `--no-splitkv` / explicit `--allow-splitkv` still wins on both
-    # paths.
+    # Split-KV is on by default on both paths (matches the production
+    # wrapper); `--no-splitkv` is the explicit force-off knob shared
+    # between fixture and grid mode.
     if args.swa_fixtures is not None:
-        # Fixture mode: single-launch by default (kernel-correctness gate,
-        # matches the old SWA file). `--allow-splitkv` opts into the
-        # production split-KV path for perf testing; `--no-splitkv` is
-        # the explicit "force off" override (a no-op given the default).
-        fixture_allow_splitkv = bool(args.allow_splitkv) and not args.no_splitkv
-
         fixtures = _expand_swa_fixtures(args.swa_fixtures)
         if args.swa_filter:
             fixtures = [f for f in fixtures if args.swa_filter in f.name]
@@ -1174,7 +1153,7 @@ def main():
                 seed=args.seed,
                 run_triton_backend=run_triton,
                 skip_reference=args.no_reference,
-                allow_splitkv=fixture_allow_splitkv,
+                allow_splitkv=not args.no_splitkv,
                 mask_type=fx.mask_type,
                 window_size_left=fx.window_size_left,
                 window_size_right=fx.window_size_right,
