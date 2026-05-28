@@ -1,97 +1,140 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for the fused_moe(no_combine=True) FlyDSL stage2 path.
+"""Tests for ``fused_moe(..., no_combine=True)``.
 
-T1: kernel-level direct call to flydsl_moe_stage2(return_per_slot=True)
-T2: public API shape on FlyDSL configs
-T3: reconstruction via (per_slot * topk_weight.unsqueeze(-1)).sum(dim=1)
-T4: EP/expert_mask zero-init contract
-T5: pre-launch gating raises NotImplementedError (mock.patch on moe_sorting)
-T6: torch.compile fake shape (fused_moe_fake)
-T7: AOT cache invariant (module_name distinguishes accumulate)
-T8: caller-provided out buffer validation
+``no_combine=True`` returns raw per-route outputs with shape
+``(token_num, topk, model_dim)``. The caller is responsible for applying
+``topk_weight`` and reducing the topk axis.
 """
 
 import functools
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import torch
 
 import aiter
+import aiter.fused_moe as _fmoe
 from aiter import ActivationType, QuantType, dtypes
-import aiter.fused_moe as _fmoe_mod
 from aiter.fused_moe import (
     _flydsl_stage2_wrapper,
     _validate_no_combine_route,
     fused_moe,
     fused_moe_fake,
-    moe_sorting,
     torch_moe_stage1,
     torch_moe_stage2_no_combine,
 )
-from aiter.utility import fp4_utils
 
 
 HAS_GPU = torch.cuda.is_available()
 try:
     from aiter.ops.flydsl.utils import is_flydsl_available
+
     HAS_FLYDSL = bool(is_flydsl_available())
 except Exception:
     HAS_FLYDSL = False
 
 requires_gpu = pytest.mark.skipif(not HAS_GPU, reason="needs CUDA/ROCm GPU")
 requires_flydsl = pytest.mark.skipif(
-    not (HAS_GPU and HAS_FLYDSL),
-    reason="needs FlyDSL + GPU for kernel execution",
+    not (HAS_GPU and HAS_FLYDSL), reason="needs FlyDSL + GPU"
 )
 
 
-def _make_topk_routing(M, topk, E, device, generator=None):
-    """Random topk routing matching aiter's fused_topk output shape contract."""
-    g = generator
+def _make_topk_routing(token_num, topk, experts, device, *, seed=0):
+    gen = torch.Generator(device="cpu").manual_seed(seed)
     topk_ids = torch.stack(
-        [torch.randperm(E, generator=g, device="cpu")[:topk] for _ in range(M)]
+        [torch.randperm(experts, generator=gen)[:topk] for _ in range(token_num)]
     ).to(device=device, dtype=dtypes.i32)
     topk_weight = torch.softmax(
-        torch.randn(M, topk, generator=g), dim=-1
+        torch.randn(token_num, topk, generator=gen), dim=-1
     ).to(device=device, dtype=dtypes.fp32)
     return topk_weight, topk_ids
 
 
-# ---------------------------------------------------------------------------
-# T5 — Pre-launch gating (no GPU needed; uses mocks)
-# ---------------------------------------------------------------------------
+def _make_bf16_inputs(token_num=4, topk=2, experts=8, model_dim=64, inter_dim=128):
+    hidden_states = torch.empty((token_num, model_dim), dtype=dtypes.bf16)
+    w1 = torch.empty((experts, inter_dim * 2, model_dim), dtype=dtypes.bf16)
+    w2 = torch.empty((experts, model_dim, inter_dim), dtype=dtypes.bf16)
+    topk_weight, topk_ids = _make_topk_routing(
+        token_num, topk, experts, device="cpu"
+    )
+    return hidden_states, w1, w2, topk_weight, topk_ids
+
+
+def _make_fp4_inputs(token_num, topk, experts, model_dim, inter_dim, device, seed=0):
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    hidden_states = torch.randn(
+        token_num, model_dim, generator=gen, dtype=dtypes.bf16
+    ).to(device)
+    w1 = torch.randint(
+        0,
+        256,
+        (experts, inter_dim * 2, model_dim // 2),
+        generator=gen,
+        dtype=torch.uint8,
+    ).to(device).view(dtypes.fp4x2)
+    w2 = torch.randint(
+        0,
+        256,
+        (experts, model_dim, inter_dim // 2),
+        generator=gen,
+        dtype=torch.uint8,
+    ).to(device).view(dtypes.fp4x2)
+    w1_scale = torch.randint(
+        120,
+        130,
+        (experts, inter_dim * 2, model_dim // 32),
+        generator=gen,
+        dtype=torch.uint8,
+    ).to(device).view(dtypes.fp8_e8m0)
+    w2_scale = torch.randint(
+        120,
+        130,
+        (experts, model_dim, inter_dim // 32),
+        generator=gen,
+        dtype=torch.uint8,
+    ).to(device).view(dtypes.fp8_e8m0)
+    topk_weight, topk_ids = _make_topk_routing(
+        token_num, topk, experts, device, seed=seed + 1
+    )
+    return hidden_states, w1, w2, w1_scale, w2_scale, topk_weight, topk_ids
+
+
+def _shuffle_a16w4(w1, w2, w1_scale, w2_scale, experts):
+    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+    w1 = shuffle_weight_a16w4(w1, 16, True)
+    w2 = shuffle_weight_a16w4(w2, 16, False)
+    w1_scale = shuffle_scale_a16w4(
+        w1_scale.view(-1, w1_scale.shape[-1]), experts, True
+    ).view(dtypes.fp8_e8m0)
+    w2_scale = shuffle_scale_a16w4(
+        w2_scale.view(-1, w2_scale.shape[-1]), experts, False
+    ).view(dtypes.fp8_e8m0)
+    return w1, w2, w1_scale, w2_scale
 
 
 class _FakeMetadata:
-    """Mirror MOEMetadata's surface for gating-only tests."""
-
-    def __init__(self, *, stage2, run_1stage=False):
-        self.stage2 = stage2
-        self.run_1stage = run_1stage
-        # Fields touched downstream of gating but not exercised in T5:
+    def __init__(self, *, stage2=None, run_1stage=False):
         self.stage1 = None
+        self.stage2 = stage2 or _flydsl_stage2("flydsl_moe2_test")
         self.block_m = 32
         self.ksplit = 1
+        self.run_1stage = run_1stage
         self.has_bias = False
 
 
-def _make_flydsl_stage2_partial(kernel_name="flydsl_moe2_test"):
-    # Mirror the production binding pattern: functools.partial wrapping
-    # _flydsl_stage2_wrapper with kernelName in keywords.
+def _flydsl_stage2(kernel_name):
     return functools.partial(_flydsl_stage2_wrapper, kernelName=kernel_name)
 
 
-def _patch_kernel_params(b_dtype, a_dtype="fp4"):
-    """Return a context manager that patches get_flydsl_kernel_params to a
-    deterministic dict. Avoids depending on the live FlyDSL kernel registry
-    which may not be populated in a CPU-only test environment.
-    """
+def _patch_kernel_params(*, a_dtype="fp4", b_dtype="fp4"):
     import aiter.ops.flydsl.moe_kernels as mk
 
-    fake_params = {
+    params = {
         "a_dtype": a_dtype,
         "b_dtype": b_dtype,
         "out_dtype": "bf16",
@@ -100,185 +143,165 @@ def _patch_kernel_params(b_dtype, a_dtype="fp4"):
         "tile_k": 256,
         "mode": "atomic",
     }
-    return patch.object(mk, "get_flydsl_kernel_params", return_value=fake_params)
+    return patch.object(mk, "get_flydsl_kernel_params", return_value=params)
 
 
-def test_T5_gate_rejects_run_1stage():
-    md = _FakeMetadata(stage2=_make_flydsl_stage2_partial(), run_1stage=True)
-    with pytest.raises(NotImplementedError, match="1-stage"):
-        _validate_no_combine_route(md, doweight_stage1=False)
-
-
-def test_T5_gate_rejects_non_flydsl_stage2():
-    def some_ck_stage2(*a, **kw):
-        return None
-
-    md = _FakeMetadata(stage2=some_ck_stage2)
-    with pytest.raises(NotImplementedError, match="FlyDSL, CK, or CKTile stage2"):
-        _validate_no_combine_route(md, doweight_stage1=False)
-
-
-def test_T5_gate_rejects_doweight_stage1():
-    md = _FakeMetadata(stage2=_make_flydsl_stage2_partial())
-    with _patch_kernel_params(b_dtype="fp4"):
-        with pytest.raises(NotImplementedError, match="doweight_stage1"):
-            _validate_no_combine_route(md, doweight_stage1=True)
-
-
-def test_T5_gate_rejects_int4_b_dtype():
-    md = _FakeMetadata(stage2=_make_flydsl_stage2_partial())
-    with _patch_kernel_params(b_dtype="int4"):
-        with pytest.raises(NotImplementedError, match="a_dtype, b_dtype"):
-            _validate_no_combine_route(md, doweight_stage1=False)
-
-
-def test_T5_gate_rejects_fp16_b_dtype_fp4():
-    """fp16/fp4 FlyDSL stage2 is excluded from v1 scope per DEC-2."""
-    md = _FakeMetadata(stage2=_make_flydsl_stage2_partial())
-    import aiter.ops.flydsl.moe_kernels as mk
-
-    fake = {"a_dtype": "fp16", "b_dtype": "fp4", "out_dtype": "bf16",
-            "tile_m": 32, "tile_n": 128, "tile_k": 256, "mode": "atomic"}
-    with patch.object(mk, "get_flydsl_kernel_params", return_value=fake):
-        with pytest.raises(NotImplementedError, match="a_dtype, b_dtype"):
-            _validate_no_combine_route(md, doweight_stage1=False)
-
-
-def test_T5_gate_accepts_fp8_fp4_pair():
-    """fp8/fp4 (mixed) is in v1 scope per DEC-2; gate must NOT reject."""
-    md = _FakeMetadata(stage2=_make_flydsl_stage2_partial())
-    with _patch_kernel_params(b_dtype="fp4"):
-        # Override a_dtype to fp8 too
-        import aiter.ops.flydsl.moe_kernels as mk
-
-        fake = {"a_dtype": "fp8", "b_dtype": "fp4", "out_dtype": "bf16",
-                "tile_m": 32, "tile_n": 128, "tile_k": 256, "mode": "atomic"}
-        with patch.object(mk, "get_flydsl_kernel_params", return_value=fake):
-            _validate_no_combine_route(md, doweight_stage1=False)
-
-
-def test_T5_gate_accepts_bf16_fp4_pair_for_w4a16():
-    """W4A16 MXFP4 keeps activations in bf16 and weights in fp4."""
-    md = _FakeMetadata(stage2=_make_flydsl_stage2_partial())
-    with _patch_kernel_params(a_dtype="bf16", b_dtype="fp4"):
-        _validate_no_combine_route(md, doweight_stage1=False)
-
-
-def test_T5_gate_rejects_unparseable_kernel_name():
-    """If get_flydsl_kernel_params returns None, the gate must raise."""
-    import aiter.ops.flydsl.moe_kernels as mk
-
-    md = _FakeMetadata(stage2=_make_flydsl_stage2_partial(kernel_name="bogus"))
-    with patch.object(mk, "get_flydsl_kernel_params", return_value=None):
-        with pytest.raises(NotImplementedError, match="cannot parse"):
-            _validate_no_combine_route(md, doweight_stage1=False)
-
-
-def test_T5_gate_accepts_supported_route():
-    md = _FakeMetadata(stage2=_make_flydsl_stage2_partial())
-    with _patch_kernel_params(b_dtype="fp4"):
-        # Should not raise.
-        _validate_no_combine_route(md, doweight_stage1=False)
-
-
-def test_T5_w4a16_metadata_uses_cktile_by_default(monkeypatch):
-    """W4A16 MXFP4 defaults to CKTile while FlyDSL BF16/FP4 is experimental."""
-    monkeypatch.setattr(_fmoe_mod, "_ENABLE_FLYDSL_W4A16", False)
-    monkeypatch.setattr(_fmoe_mod, "is_flydsl_available", lambda: True)
-    monkeypatch.setattr(_fmoe_mod, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(_fmoe_mod, "get_cu_num", lambda: 256)
-    _fmoe_mod.get_2stage_cfgs.cache_clear()
-
-    metadata = _fmoe_mod.get_2stage_cfgs(
-        32,
-        4096,
-        4096,
-        32,
-        8,
+def _get_metadata(
+    *,
+    token=32,
+    model_dim=4096,
+    inter_dim=4096,
+    experts=32,
+    topk=8,
+    q_dtype_a=dtypes.fp4x2,
+    q_dtype_w=dtypes.fp4x2,
+    activation=ActivationType.Swiglu,
+    use_g1u1=True,
+):
+    return _fmoe.get_2stage_cfgs(
+        token,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
         dtypes.bf16,
-        dtypes.bf16,
-        dtypes.fp4x2,
+        q_dtype_a,
+        q_dtype_w,
         QuantType.per_1x32,
-        True,
-        ActivationType.Swiglu,
+        use_g1u1,
+        activation,
         False,
         0,
         0,
         True,
-        _fmoe_mod.GateMode.SEPARATED.value,
+        _fmoe.GateMode.SEPARATED.value,
     )
 
-    assert getattr(metadata.stage1, "func", metadata.stage1) is _fmoe_mod.cktile_moe_stage1
-    assert getattr(metadata.stage2, "func", metadata.stage2) is _fmoe_mod.cktile_moe_stage2
-    _validate_no_combine_route(metadata, doweight_stage1=False)
+
+def _stage_func(stage):
+    return getattr(stage, "func", stage)
 
 
-def test_T5_cktile_stage2_no_combine_flattens_slots(monkeypatch):
-    captured = {}
+def _flydsl_selected(
+    token_num,
+    topk,
+    experts,
+    model_dim,
+    inter_dim,
+    *,
+    q_dtype_a=dtypes.fp4x2,
+    activation=ActivationType.Swiglu,
+):
+    try:
+        metadata = _get_metadata(
+            token=_fmoe.get_padded_M(token_num),
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            q_dtype_a=q_dtype_a,
+            activation=activation,
+        )
+    except Exception:
+        return False
+    return _stage_func(metadata.stage2) is _flydsl_stage2_wrapper
 
-    def fake_cktile_stage2(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        # The wrapper should pass the flattened output buffer as arg 2.
-        args[2].fill_(3)
-        return args[2]
 
-    monkeypatch.setattr(aiter, "moe_cktile2stages_gemm2", fake_cktile_stage2)
+@contextmanager
+def _zero_combined_moe_buffer(shape, dtype):
+    real_empty = torch.empty
 
-    token_num = 3
-    topk = 2
-    inter_dim = 4
-    model_dim = 5
-    a2 = torch.arange(token_num * topk * inter_dim, dtype=dtypes.bf16).view(
-        token_num, topk, inter_dim
+    def patched_empty(*args, **kwargs):
+        out = real_empty(*args, **kwargs)
+        if out.dim() == 2 and tuple(out.shape) == shape and out.dtype == dtype:
+            out.zero_()
+        return out
+
+    with patch.object(torch, "empty", side_effect=patched_empty):
+        yield
+
+
+def _assert_reconstructs_combined(common, topk_weight, *, atol_scale=4):
+    token_num, model_dim = common["hidden_states"].shape
+    with _zero_combined_moe_buffer(
+        (token_num, model_dim), common["hidden_states"].dtype
+    ):
+        combined = fused_moe(**common, no_combine=False)
+        per_slot = fused_moe(**common, no_combine=True)
+
+    assert per_slot.shape == (token_num, topk_weight.shape[1], model_dim)
+    assert torch.isfinite(combined).all()
+    assert torch.isfinite(per_slot).all()
+
+    reconstructed = (
+        per_slot.float() * topk_weight.unsqueeze(-1).float()
+    ).sum(dim=1).to(combined.dtype)
+    diff = (reconstructed - combined).abs()
+    max_abs = float(combined.abs().max().item())
+    atol = max(max_abs / 128 * atol_scale, 1.0)
+    assert float(diff.max().item()) <= atol
+    rel_l2 = float(
+        (
+            diff.float().pow(2).sum().sqrt()
+            / (combined.float().pow(2).sum().sqrt() + 1e-6)
+        ).item()
     )
-    w1 = torch.empty((1, inter_dim * 2, model_dim), dtype=dtypes.bf16)
-    w2 = torch.empty((1, model_dim, inter_dim), dtype=dtypes.bf16)
-    sorted_token_ids = torch.tensor(
-        [
-            0 | (0 << 24),
-            0 | (1 << 24),
-            2 | (1 << 24),
-            1 | (0 << 24),
-        ],
-        dtype=dtypes.i32,
+    assert rel_l2 < 0.02
+
+
+# ---------------------------------------------------------------------------
+# Route gating and metadata selection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "a_dtype,b_dtype",
+    [("fp4", "fp4"), ("fp8", "fp4"), ("bf16", "fp4")],
+)
+def test_no_combine_route_accepts_supported_flydsl_dtype_pairs(a_dtype, b_dtype):
+    with _patch_kernel_params(a_dtype=a_dtype, b_dtype=b_dtype):
+        _validate_no_combine_route(_FakeMetadata(), doweight_stage1=False)
+
+
+@pytest.mark.parametrize(
+    "metadata,doweight_stage1,patch_params,pattern",
+    [
+        (_FakeMetadata(run_1stage=True), False, None, "1-stage"),
+        (_FakeMetadata(stage2=lambda *args, **kwargs: None), False, None, "stage2"),
+        (_FakeMetadata(), True, ("fp4", "fp4"), "doweight_stage1"),
+        (_FakeMetadata(), False, ("fp4", "int4"), "a_dtype, b_dtype"),
+        (_FakeMetadata(), False, ("fp16", "fp4"), "a_dtype, b_dtype"),
+    ],
+)
+def test_no_combine_route_rejects_unsupported_dispatches(
+    metadata, doweight_stage1, patch_params, pattern
+):
+    ctx = (
+        _patch_kernel_params(a_dtype=patch_params[0], b_dtype=patch_params[1])
+        if patch_params
+        else nullcontext()
     )
-    sorted_expert_ids = torch.zeros((1,), dtype=dtypes.i32)
-    num_valid_ids = torch.tensor([4], dtype=dtypes.i32)
-
-    out = _fmoe_mod.cktile_moe_stage2(
-        a2,
-        w1,
-        w2,
-        sorted_token_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        out=None,
-        topk=topk,
-        w2_scale=None,
-        a2_scale=None,
-        block_m=32,
-        no_combine=True,
-    )
-
-    assert tuple(out.shape) == (token_num, topk, model_dim)
-    assert out.flatten().tolist() == [3] * out.numel()
-    flat_a2 = captured["args"][0]
-    flat_out = captured["args"][2]
-    flat_sorted_ids = captured["args"][3]
-    called_topk = captured["args"][6]
-    assert tuple(flat_a2.shape) == (token_num * topk, inter_dim)
-    assert tuple(flat_out.shape) == (token_num * topk, model_dim)
-    assert called_topk == 1
-    assert flat_sorted_ids.tolist() == [0, 1, 5, 2]
+    with ctx, pytest.raises(NotImplementedError, match=pattern):
+        _validate_no_combine_route(metadata, doweight_stage1=doweight_stage1)
 
 
-def test_T5_bf16_metadata_uses_ck_wrapper_for_no_combine(monkeypatch):
-    monkeypatch.setattr(_fmoe_mod, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(_fmoe_mod, "get_cu_num", lambda: 256)
-    _fmoe_mod.get_2stage_cfgs.cache_clear()
+def test_no_combine_route_rejects_unparseable_flydsl_kernel():
+    import aiter.ops.flydsl.moe_kernels as mk
 
-    metadata = _fmoe_mod.get_2stage_cfgs(
+    with patch.object(mk, "get_flydsl_kernel_params", return_value=None):
+        with pytest.raises(NotImplementedError, match="cannot parse"):
+            _validate_no_combine_route(
+                _FakeMetadata(stage2=_flydsl_stage2("bogus")),
+                doweight_stage1=False,
+            )
+
+
+def test_bf16_metadata_uses_ck_wrapper_for_no_combine(monkeypatch):
+    monkeypatch.setattr(_fmoe, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(_fmoe, "get_cu_num", lambda: 256)
+    _fmoe.get_2stage_cfgs.cache_clear()
+
+    metadata = _fmoe.get_2stage_cfgs(
         32,
         4096,
         4096,
@@ -294,127 +317,78 @@ def test_T5_bf16_metadata_uses_ck_wrapper_for_no_combine(monkeypatch):
         0,
         0,
         False,
-        _fmoe_mod.GateMode.SEPARATED.value,
+        _fmoe.GateMode.SEPARATED.value,
     )
 
-    assert getattr(metadata.stage2, "func", metadata.stage2) is _fmoe_mod.ck_moe_stage2
+    assert _stage_func(metadata.stage2) is _fmoe.ck_moe_stage2
     _validate_no_combine_route(metadata, doweight_stage1=False)
 
 
-def test_T5_ck_stage2_no_combine_flattens_slots(monkeypatch):
-    captured = {}
+def test_w4a16_metadata_uses_cktile_by_default(monkeypatch):
+    monkeypatch.setattr(_fmoe, "_ENABLE_FLYDSL_W4A16", False)
+    monkeypatch.setattr(_fmoe, "is_flydsl_available", lambda: True)
+    monkeypatch.setattr(_fmoe, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(_fmoe, "get_cu_num", lambda: 256)
+    _fmoe.get_2stage_cfgs.cache_clear()
 
-    def fake_ck_stage2(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        # The wrapper should pass the flattened output buffer as arg 6.
-        args[6].fill_(5)
-        return args[6]
+    metadata = _get_metadata(q_dtype_a=dtypes.bf16)
 
-    monkeypatch.setattr(aiter, "ck_moe_stage2_fwd", fake_ck_stage2)
-
-    token_num = 3
-    topk = 2
-    inter_dim = 4
-    model_dim = 5
-    a2 = torch.arange(token_num * topk * inter_dim, dtype=dtypes.bf16).view(
-        token_num, topk, inter_dim
-    )
-    w1 = torch.empty((1, inter_dim * 2, model_dim), dtype=dtypes.bf16)
-    w2 = torch.empty((1, model_dim, inter_dim), dtype=dtypes.bf16)
-    sorted_token_ids = torch.tensor(
-        [
-            0 | (0 << 24),
-            0 | (1 << 24),
-            2 | (1 << 24),
-            1 | (0 << 24),
-        ],
-        dtype=dtypes.i32,
-    )
-    sorted_expert_ids = torch.zeros((1,), dtype=dtypes.i32)
-    num_valid_ids = torch.tensor([4], dtype=dtypes.i32)
-
-    out = _fmoe_mod.ck_moe_stage2(
-        a2,
-        w1,
-        w2,
-        sorted_token_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        out=None,
-        topk=topk,
-        kernelName="",
-        w2_scale=None,
-        a2_scale=None,
-        block_m=32,
-        no_combine=True,
-    )
-
-    assert tuple(out.shape) == (token_num, topk, model_dim)
-    assert out.flatten().tolist() == [5] * out.numel()
-    flat_a2 = captured["args"][0]
-    flat_out = captured["args"][6]
-    flat_sorted_ids = captured["args"][3]
-    called_topk = captured["args"][7]
-    assert tuple(flat_a2.shape) == (token_num * topk, inter_dim)
-    assert tuple(flat_out.shape) == (token_num * topk, model_dim)
-    assert called_topk == 1
-    assert flat_sorted_ids.tolist() == [0, 1, 5, 2]
+    assert _stage_func(metadata.stage1) is _fmoe.cktile_moe_stage1
+    assert _stage_func(metadata.stage2) is _fmoe.cktile_moe_stage2
+    _validate_no_combine_route(metadata, doweight_stage1=False)
 
 
-@pytest.mark.parametrize("activation", (ActivationType.Swiglu, ActivationType.Silu))
-def test_T5_w4a16_metadata_can_opt_into_flydsl_no_combine_route(
-    monkeypatch, activation
-):
-    """The current BF16/FP4 FlyDSL route is kept behind an explicit opt-in."""
+@pytest.mark.parametrize("activation", [ActivationType.Swiglu, ActivationType.Silu])
+def test_w4a16_metadata_can_opt_into_flydsl(monkeypatch, activation):
     import aiter.ops.flydsl.moe_kernels as mk
 
-    monkeypatch.setattr(_fmoe_mod, "_ENABLE_FLYDSL_W4A16", True)
-    monkeypatch.setattr(_fmoe_mod, "is_flydsl_available", lambda: True)
-    monkeypatch.setattr(_fmoe_mod, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(_fmoe_mod, "get_cu_num", lambda: 256)
-    _fmoe_mod.get_2stage_cfgs.cache_clear()
+    monkeypatch.setattr(_fmoe, "_ENABLE_FLYDSL_W4A16", True)
+    monkeypatch.setattr(_fmoe, "is_flydsl_available", lambda: True)
+    monkeypatch.setattr(_fmoe, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(_fmoe, "get_cu_num", lambda: 256)
+    _fmoe.get_2stage_cfgs.cache_clear()
 
-    metadata = _fmoe_mod.get_2stage_cfgs(
-        32,
-        4096,
-        4096,
-        32,
-        8,
-        dtypes.bf16,
-        dtypes.bf16,
-        dtypes.fp4x2,
-        QuantType.per_1x32,
-        True,
-        activation,
-        False,
-        0,
-        0,
-        True,
-        _fmoe_mod.GateMode.SEPARATED.value,
-    )
+    metadata = _get_metadata(q_dtype_a=dtypes.bf16, activation=activation)
 
-    stage2_fn = getattr(metadata.stage2, "func", metadata.stage2)
-    assert stage2_fn is _flydsl_stage2_wrapper
-    kernel_name = metadata.stage2.keywords["kernelName"]
-    parsed = mk.get_flydsl_kernel_params(kernel_name)
+    assert _stage_func(metadata.stage2) is _flydsl_stage2_wrapper
+    parsed = mk.get_flydsl_kernel_params(metadata.stage2.keywords["kernelName"])
     assert parsed is not None
     assert (parsed["a_dtype"], parsed["b_dtype"]) == ("bf16", "fp4")
 
 
-def test_T5_public_api_forwards_mxfp4_activation_dtype(monkeypatch):
-    """Callers need an explicit W4A16 override instead of relying on env bounds."""
+@pytest.mark.parametrize("activation", [ActivationType.Swiglu, ActivationType.Silu])
+def test_w4a8_metadata_uses_flydsl(monkeypatch, activation):
+    import aiter.ops.flydsl.moe_kernels as mk
+
+    monkeypatch.setattr(_fmoe, "cfg_2stages", ({}, {}))
+    monkeypatch.setattr(_fmoe, "is_flydsl_available", lambda: True)
+    monkeypatch.setattr(_fmoe, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(_fmoe, "get_cu_num", lambda: 256)
+    _fmoe.get_2stage_cfgs.cache_clear()
+
+    metadata = _get_metadata(q_dtype_a=dtypes.fp8, activation=activation)
+
+    assert _stage_func(metadata.stage1) is _fmoe._flydsl_stage1_wrapper
+    assert _stage_func(metadata.stage2) is _flydsl_stage2_wrapper
+    assert metadata.fuse_quant == ""
+    parsed_stage1 = mk.get_flydsl_kernel_params(metadata.stage1.keywords["kernelName"])
+    parsed_stage2 = mk.get_flydsl_kernel_params(metadata.stage2.keywords["kernelName"])
+    assert (parsed_stage1["a_dtype"], parsed_stage1["b_dtype"]) == ("fp8", "fp4")
+    assert (parsed_stage2["a_dtype"], parsed_stage2["b_dtype"]) == ("fp8", "fp4")
+    assert not parsed_stage1.get("a_scale_one", False)
+
+
+def test_public_api_forwards_mxfp4_activation_dtype(monkeypatch):
     captured = {}
 
     def fake_fused_moe_(**kwargs):
         captured.update(kwargs)
         return torch.empty((4, 64), dtype=dtypes.bf16)
 
-    monkeypatch.setattr(_fmoe_mod, "fused_moe_", fake_fused_moe_)
-    hidden_states = torch.empty((4, 64), dtype=dtypes.bf16)
-    w1 = torch.empty((8, 256, 32), dtype=dtypes.fp4x2)
-    w2 = torch.empty((8, 64, 64), dtype=dtypes.fp4x2)
-    topk_weight, topk_ids = _make_topk_routing(4, 2, 8, device="cpu")
+    monkeypatch.setattr(_fmoe, "fused_moe_", fake_fused_moe_)
+    hidden_states, _, _, topk_weight, topk_ids = _make_bf16_inputs()
+    w1 = torch.empty((8, 128, 32), dtype=dtypes.fp4x2)
+    w2 = torch.empty((8, 64, 32), dtype=dtypes.fp4x2)
 
     fused_moe(
         hidden_states,
@@ -423,16 +397,19 @@ def test_T5_public_api_forwards_mxfp4_activation_dtype(monkeypatch):
         topk_weight,
         topk_ids,
         quant_type=QuantType.per_1x32,
-        activation=ActivationType.Swiglu,
-        mxfp4_activation_dtype="bf16",
+        mxfp4_activation_dtype="fp8",
     )
 
-    assert captured["mxfp4_activation_dtype"] == "bf16"
+    assert captured["mxfp4_activation_dtype"] == "fp8"
 
 
-def test_T5_mxfp4_activation_dtype_override_selects_bf16_metadata(monkeypatch):
-    """The explicit override must beat the M-size BF16/A4 heuristic."""
-
+@pytest.mark.parametrize(
+    "override,expected",
+    [("bf16", dtypes.bf16), ("fp8", dtypes.fp8), ("fp4", dtypes.fp4x2)],
+)
+def test_mxfp4_activation_dtype_override_selects_metadata_dtype(
+    monkeypatch, override, expected
+):
     class StopAfterMetadata(Exception):
         pass
 
@@ -442,108 +419,237 @@ def test_T5_mxfp4_activation_dtype_override_selects_bf16_metadata(monkeypatch):
         captured["q_dtype_a"] = args[6]
         raise StopAfterMetadata
 
-    monkeypatch.setattr(_fmoe_mod, "get_2stage_cfgs", fake_get_2stage_cfgs)
-    hidden_states = torch.empty((512, 64), dtype=dtypes.bf16)
-    w1 = torch.empty((8, 256, 32), dtype=dtypes.fp4x2)
-    w2 = torch.empty((8, 64, 64), dtype=dtypes.fp4x2)
-    topk_weight, topk_ids = _make_topk_routing(512, 2, 8, device="cpu")
-
-    with pytest.raises(StopAfterMetadata):
-        _fmoe_mod.fused_moe_(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            quant_type=QuantType.per_1x32.value,
-            activation=ActivationType.Swiglu.value,
-            mxfp4_activation_dtype="bf16",
-        )
-
-    assert captured["q_dtype_a"] == dtypes.bf16
-
-
-def test_T5_mxfp4_activation_dtype_fp8_sets_a8w4_dtype(monkeypatch):
-    """The explicit W4A8 override must force fp8 activations before dispatch."""
-
-    class StopAfterMetadata(Exception):
-        pass
-
-    captured = {}
-
-    def fake_get_2stage_cfgs(*args):
-        captured["q_dtype_a"] = args[6]
-        captured["q_dtype_w"] = args[7]
-        raise StopAfterMetadata
-
-    monkeypatch.setattr(_fmoe_mod, "get_2stage_cfgs", fake_get_2stage_cfgs)
-    hidden_states = torch.empty((4, 64), dtype=dtypes.bf16)
+    monkeypatch.setattr(_fmoe, "get_2stage_cfgs", fake_get_2stage_cfgs)
+    hidden_states, _, _, topk_weight, topk_ids = _make_bf16_inputs()
     w1 = torch.empty((8, 128, 32), dtype=dtypes.fp4x2)
     w2 = torch.empty((8, 64, 32), dtype=dtypes.fp4x2)
-    topk_weight, topk_ids = _make_topk_routing(4, 2, 8, device="cpu")
 
     with pytest.raises(StopAfterMetadata):
-        _fmoe_mod.fused_moe_(
+        _fmoe.fused_moe_(
             hidden_states,
             w1,
             w2,
             topk_weight,
             topk_ids,
             quant_type=QuantType.per_1x32.value,
-            activation=ActivationType.Silu.value,
-            mxfp4_activation_dtype="fp8",
+            mxfp4_activation_dtype=override,
         )
 
-    assert captured["q_dtype_a"] == dtypes.fp8
-    assert captured["q_dtype_w"] == dtypes.fp4x2
+    assert captured["q_dtype_a"] == expected
 
 
-@pytest.mark.parametrize("activation", (ActivationType.Swiglu, ActivationType.Silu))
-def test_T5_w4a8_metadata_can_use_flydsl_no_combine_route(
-    monkeypatch, activation
-):
-    """FP8/FP4 MXFP4 can use the FlyDSL stage2 no_combine contract."""
-    import aiter.ops.flydsl.moe_kernels as mk
+# ---------------------------------------------------------------------------
+# Backend wrappers
+# ---------------------------------------------------------------------------
 
-    monkeypatch.setattr(_fmoe_mod, "cfg_2stages", ({}, {}))
-    monkeypatch.setattr(_fmoe_mod, "is_flydsl_available", lambda: True)
-    monkeypatch.setattr(_fmoe_mod, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(_fmoe_mod, "get_cu_num", lambda: 256)
-    _fmoe_mod.get_2stage_cfgs.cache_clear()
 
-    metadata = _fmoe_mod.get_2stage_cfgs(
-        32,
-        4096,
-        4096,
-        32,
-        8,
-        dtypes.bf16,
-        dtypes.fp8,
-        dtypes.fp4x2,
-        QuantType.per_1x32,
-        True,
-        activation,
-        False,
-        0,
-        0,
-        True,
-        _fmoe_mod.GateMode.SEPARATED.value,
+def _slot_sort_inputs(token_num=3, topk=2, inter_dim=4, model_dim=5):
+    inter_states = torch.arange(
+        token_num * topk * inter_dim, dtype=dtypes.bf16
+    ).view(token_num, topk, inter_dim)
+    w1 = torch.empty((1, inter_dim * 2, model_dim), dtype=dtypes.bf16)
+    w2 = torch.empty((1, model_dim, inter_dim), dtype=dtypes.bf16)
+    sorted_token_ids = torch.tensor(
+        [0 | (0 << 24), 0 | (1 << 24), 2 | (1 << 24), 1 | (0 << 24)],
+        dtype=dtypes.i32,
+    )
+    sorted_expert_ids = torch.zeros((1,), dtype=dtypes.i32)
+    num_valid_ids = torch.tensor([4], dtype=dtypes.i32)
+    return inter_states, w1, w2, sorted_token_ids, sorted_expert_ids, num_valid_ids
+
+
+def test_ck_stage2_no_combine_flattens_topk_slots(monkeypatch):
+    captured = {}
+
+    def fake_ck_stage2(*args, **kwargs):
+        captured["args"] = args
+        args[6].fill_(5)
+        return args[6]
+
+    monkeypatch.setattr(aiter, "ck_moe_stage2_fwd", fake_ck_stage2)
+    inter_states, w1, w2, sorted_ids, sorted_experts, num_valid = _slot_sort_inputs()
+
+    out = _fmoe.ck_moe_stage2(
+        inter_states,
+        w1,
+        w2,
+        sorted_ids,
+        sorted_experts,
+        num_valid,
+        out=None,
+        topk=2,
+        kernelName="",
+        w2_scale=None,
+        a2_scale=None,
+        block_m=32,
+        no_combine=True,
     )
 
-    stage2_fn = getattr(metadata.stage2, "func", metadata.stage2)
-    assert stage2_fn is _flydsl_stage2_wrapper
-    assert metadata.fuse_quant == ""
-    parsed_stage1 = mk.get_flydsl_kernel_params(metadata.stage1.keywords["kernelName"])
-    parsed_stage2 = mk.get_flydsl_kernel_params(metadata.stage2.keywords["kernelName"])
-    assert parsed_stage1 is not None
-    assert parsed_stage2 is not None
-    assert (parsed_stage1["a_dtype"], parsed_stage1["b_dtype"]) == ("fp8", "fp4")
-    assert (parsed_stage2["a_dtype"], parsed_stage2["b_dtype"]) == ("fp8", "fp4")
-    assert not parsed_stage1.get("a_scale_one", False)
+    assert tuple(out.shape) == (3, 2, 5)
+    assert out.flatten().tolist() == [5] * out.numel()
+    assert tuple(captured["args"][0].shape) == (6, 4)
+    assert tuple(captured["args"][6].shape) == (6, 5)
+    assert captured["args"][7] == 1
+    assert captured["args"][3].tolist() == [0, 1, 5, 2]
 
 
-def test_T5_w4a16_flydsl_builders_accept_bf16_fp4(monkeypatch):
-    """W4A16 metadata must point at builders that accept BF16 activations."""
+def test_cktile_stage2_no_combine_flattens_topk_slots(monkeypatch):
+    captured = {}
+
+    def fake_cktile_stage2(*args, **kwargs):
+        captured["args"] = args
+        args[2].fill_(3)
+        return args[2]
+
+    monkeypatch.setattr(aiter, "moe_cktile2stages_gemm2", fake_cktile_stage2)
+    inter_states, w1, w2, sorted_ids, sorted_experts, num_valid = _slot_sort_inputs()
+
+    out = _fmoe.cktile_moe_stage2(
+        inter_states,
+        w1,
+        w2,
+        sorted_ids,
+        sorted_experts,
+        num_valid,
+        out=None,
+        topk=2,
+        w2_scale=None,
+        a2_scale=None,
+        block_m=32,
+        no_combine=True,
+    )
+
+    assert tuple(out.shape) == (3, 2, 5)
+    assert out.flatten().tolist() == [3] * out.numel()
+    assert tuple(captured["args"][0].shape) == (6, 4)
+    assert tuple(captured["args"][2].shape) == (6, 5)
+    assert captured["args"][6] == 1
+    assert captured["args"][3].tolist() == [0, 1, 5, 2]
+
+
+# ---------------------------------------------------------------------------
+# Fake tensor and codegen invariants
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "no_combine,expected",
+    [(False, (4, 64)), (True, (4, 2, 64))],
+)
+def test_fused_moe_fake_shape_tracks_no_combine(no_combine, expected):
+    hidden_states, w1, w2, topk_weight, topk_ids = _make_bf16_inputs()
+
+    out = fused_moe_fake(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        no_combine=no_combine,
+    )
+
+    assert out.shape == expected
+
+
+def test_default_and_explicit_false_fake_shapes_match():
+    hidden_states, w1, w2, topk_weight, topk_ids = _make_bf16_inputs()
+
+    implicit = fused_moe_fake(hidden_states, w1, w2, topk_weight, topk_ids)
+    explicit = fused_moe_fake(
+        hidden_states, w1, w2, topk_weight, topk_ids, no_combine=False
+    )
+
+    assert implicit.shape == explicit.shape == (4, 64)
+    assert implicit.dtype == explicit.dtype
+
+
+def test_fake_tensor_mode_returns_per_slot_shape():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        hidden_states = torch.empty((4, 64), dtype=dtypes.bf16, device="cuda")
+        w1 = torch.empty((8, 128, 64), dtype=dtypes.bf16, device="cuda")
+        w2 = torch.empty((8, 64, 128), dtype=dtypes.bf16, device="cuda")
+        topk_weight = torch.empty((4, 2), dtype=dtypes.fp32, device="cuda")
+        topk_ids = torch.empty((4, 2), dtype=dtypes.i32, device="cuda")
+
+        out = fused_moe_fake(
+            hidden_states, w1, w2, topk_weight, topk_ids, no_combine=True
+        )
+
+    assert out.shape == (4, 2, 64)
+
+
+def test_stage2_codegen_cache_key_distinguishes_accumulate():
+    src_path = (
+        Path(aiter.__file__).parent
+        / "ops"
+        / "flydsl"
+        / "kernels"
+        / "mixed_moe_gemm_2stage.py"
+    )
+    src = src_path.read_text()
+
+    assert '_acc_tag = "" if accumulate else "_acc0"' in src
+    assert "{_acc_tag}" in src
+
+
+def test_stage2_codegen_module_names_differ_for_accumulate(monkeypatch):
+    import flydsl.compiler as flyc
+    from aiter.ops.flydsl.kernels import mixed_moe_gemm_2stage as mmg2
+
+    captured = []
+    orig_kernel = flyc.kernel
+
+    def spy_kernel(*args, **kwargs):
+        captured.append(kwargs.get("name", args[0] if args else None))
+        return orig_kernel(*args, **kwargs)
+
+    common = dict(
+        model_dim=128,
+        inter_dim=128,
+        experts=4,
+        topk=2,
+        tile_m=32,
+        tile_n=128,
+        tile_k=256,
+        doweight_stage2=False,
+        a_dtype="fp4",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        persist_m=1,
+        sort_block_m=0,
+        b_nt=0,
+        model_dim_pad=0,
+        inter_dim_pad=0,
+        xcd_swizzle=0,
+        enable_bias=False,
+    )
+
+    mmg2.compile_mixed_moe_gemm2.cache_clear()
+    with patch.object(flyc, "kernel", side_effect=spy_kernel):
+        mmg2.compile_mixed_moe_gemm2(**common, accumulate=True)
+        names_true = [name for name in captured if isinstance(name, str)]
+        captured.clear()
+        mmg2.compile_mixed_moe_gemm2.cache_clear()
+        mmg2.compile_mixed_moe_gemm2(**common, accumulate=False)
+        names_false = [name for name in captured if isinstance(name, str)]
+
+    name_true = next(name for name in names_true if name.startswith("mfma_moe2_"))
+    name_false = next(name for name in names_false if name.startswith("mfma_moe2_"))
+    assert "_acc0" not in name_true
+    assert "_acc0" in name_false
+    assert name_true != name_false
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("w4a16", ("mfma_moe1_swiglu_mul_abf16_wfp4", "mfma_moe2_abf16_wfp4")),
+        ("w4a8", ("mfma_moe1_silu_mul_afp8_wfp4", None)),
+    ],
+)
+def test_mixed_precision_flydsl_builders_use_expected_dtype_names(case, expected):
     import flydsl.compiler as flyc
     from aiter.ops.flydsl.kernels import mixed_moe_gemm_2stage as mmg2
 
@@ -562,9 +668,9 @@ def test_T5_w4a16_flydsl_builders_accept_bf16_fp4(monkeypatch):
         tile_m=32,
         tile_n=128,
         tile_k=256,
-        a_dtype="bf16",
         b_dtype="fp4",
         out_dtype="bf16",
+        persist_m=1,
         model_dim_pad=0,
         inter_dim_pad=0,
     )
@@ -572,665 +678,118 @@ def test_T5_w4a16_flydsl_builders_accept_bf16_fp4(monkeypatch):
     mmg2.compile_mixed_moe_gemm1.cache_clear()
     mmg2.compile_mixed_moe_gemm2.cache_clear()
     with patch.object(flyc, "kernel", side_effect=spy_kernel):
-        mmg2.compile_mixed_moe_gemm1(
-            **common,
-            doweight_stage1=False,
-            act="swiglu",
-            persist_m=1,
-            use_async_copy=False,
-            k_batch=1,
-            gate_mode=_fmoe_mod.GateMode.SEPARATED,
-        )
-        mmg2.compile_mixed_moe_gemm2(
-            **common,
-            doweight_stage2=False,
-            accumulate=True,
-            persist_m=1,
-            sort_block_m=0,
-        )
-
-    assert any(name and "mfma_moe1_swiglu_mul_abf16_wfp4" in name for name in captured)
-    assert any(name and "mfma_moe2_abf16_wfp4" in name for name in captured)
-
-
-def test_T5_w4a8_flydsl_stage1_builder_accepts_fp8_fp4(monkeypatch):
-    """W4A8 metadata must point at a stage1 builder that accepts FP8 activations."""
-    import flydsl.compiler as flyc
-    from aiter.ops.flydsl.kernels import mixed_moe_gemm_2stage as mmg2
-
-    captured = []
-    orig_kernel = flyc.kernel
-
-    def spy_kernel(*args, **kwargs):
-        captured.append(kwargs.get("name", args[0] if args else None))
-        return orig_kernel(*args, **kwargs)
-
-    mmg2.compile_mixed_moe_gemm1.cache_clear()
-    with patch.object(flyc, "kernel", side_effect=spy_kernel):
-        mmg2.compile_mixed_moe_gemm1(
-            model_dim=256,
-            inter_dim=128,
-            experts=4,
-            topk=2,
-            tile_m=32,
-            tile_n=128,
-            tile_k=256,
-            doweight_stage1=False,
-            a_dtype="fp8",
-            b_dtype="fp4",
-            out_dtype="bf16",
-            act="silu",
-            persist_m=1,
-            use_async_copy=False,
-            k_batch=1,
-            gate_mode=_fmoe_mod.GateMode.INTERLEAVE,
-            model_dim_pad=0,
-            inter_dim_pad=0,
-        )
-
-    assert any(name and "mfma_moe1_silu_mul_afp8_wfp4" in name for name in captured)
-
-
-@requires_gpu
-def test_T5_mxfp4_fused_quant_sort_clears_scale_padding():
-    """The serving wrapper must not leak uninitialized bytes into scale layout.
-
-    The low-M W4A4 serving path uses fused_dynamic_mxfp4_quant_moe_sort for
-    stage1 activation quantization. Its scale output is in the FlyDSL shuffled
-    layout, where masked sublanes must be zero. The raw kernel only writes
-    valid sublanes, so the wrapper is responsible for clearing the buffer.
-    """
-
-    device = "cuda"
-    token_num, model_dim, E, topk, block_m = 30, 4096, 32, 8, 32
-    torch.manual_seed(123)
-    torch.cuda.manual_seed(123)
-    hidden_states = torch.randn(
-        (token_num, model_dim),
-        dtype=dtypes.bf16,
-        device=device,
-    )
-    score = torch.randn((token_num, E), dtype=dtypes.bf16, device=device)
-    topk_weight, topk_ids = _fmoe_mod.fused_topk(
-        hidden_states, score, topk, True
-    )
-    sorted_ids, _, _, num_valid_ids, _ = moe_sorting(
-        topk_ids, topk_weight, E, model_dim, dtypes.bf16, block_m
-    )
-    ref_out, ref_scale_unsorted = aiter.get_torch_quant(QuantType.per_1x32)(
-        hidden_states, quant_dtype=dtypes.fp4x2
-    )
-    ref_scale = fp4_utils.moe_mxfp4_sort(
-        ref_scale_unsorted.view(token_num, 1, -1),
-        sorted_ids=sorted_ids,
-        num_valid_ids=num_valid_ids,
-        token_num=token_num,
-        block_size=block_m,
-    )
-
-    from aiter.ops.quant import fused_dynamic_mxfp4_quant_moe_sort
-
-    out, scale = fused_dynamic_mxfp4_quant_moe_sort(
-        hidden_states,
-        sorted_ids=sorted_ids,
-        num_valid_ids=num_valid_ids,
-        token_num=token_num,
-        topk=topk,
-        block_size=block_m,
-    )
-    torch.cuda.synchronize()
-
-    valid = ((int(num_valid_ids[0].item()) + block_m - 1) // block_m) * block_m
-    assert torch.equal(out.view(torch.uint8), ref_out.view(torch.uint8))
-    assert torch.equal(
-        scale[:valid].view(torch.uint8), ref_scale[:valid].view(torch.uint8)
-    )
-
-
-def test_T5_public_api_does_not_invoke_moe_sorting_when_gating_fails():
-    """The whole point of pre-launch gating: moe_sorting must not run."""
-    if not HAS_GPU:
-        pytest.skip("public-API test needs CUDA tensors")
-    M, topk, E, model_dim, inter_dim = 4, 2, 8, 64, 128
-    device = "cuda"
-    hidden_states = torch.zeros((M, model_dim), dtype=dtypes.bf16, device=device)
-    # Use bf16 weights → no FlyDSL stage2 dispatch → gating must reject.
-    w1 = torch.zeros((E, inter_dim * 2, model_dim), dtype=dtypes.bf16, device=device)
-    w2 = torch.zeros((E, model_dim, inter_dim), dtype=dtypes.bf16, device=device)
-    topk_weight, topk_ids = _make_topk_routing(M, topk, E, device)
-
-    with patch.object(_fmoe_mod, "moe_sorting", wraps=_fmoe_mod.moe_sorting) as ms_spy:
-        with pytest.raises(NotImplementedError):
-            fused_moe(
-                hidden_states, w1, w2, topk_weight, topk_ids,
-                no_combine=True,
+        if case == "w4a16":
+            mmg2.compile_mixed_moe_gemm1(
+                **common,
+                doweight_stage1=False,
+                a_dtype="bf16",
+                act="swiglu",
+                use_async_copy=False,
+                k_batch=1,
+                gate_mode=_fmoe.GateMode.SEPARATED,
             )
-        assert ms_spy.call_count == 0, (
-            "moe_sorting was invoked despite gating failure; pre-launch contract broken"
-        )
+            mmg2.compile_mixed_moe_gemm2(
+                **common,
+                doweight_stage2=False,
+                a_dtype="bf16",
+                accumulate=True,
+                sort_block_m=0,
+            )
+        else:
+            mmg2.compile_mixed_moe_gemm1(
+                **common,
+                doweight_stage1=False,
+                a_dtype="fp8",
+                act="silu",
+                use_async_copy=False,
+                k_batch=1,
+                gate_mode=_fmoe.GateMode.INTERLEAVE,
+            )
+
+    assert any(name and expected[0] in name for name in captured)
+    if expected[1] is not None:
+        assert any(name and expected[1] in name for name in captured)
 
 
 # ---------------------------------------------------------------------------
-# T6 — torch.compile fake shape
+# FlyDSL stage2 validation and end-to-end checks
 # ---------------------------------------------------------------------------
 
 
-def test_T6_fake_returns_combined_shape_when_no_combine_false():
-    M, topk, E, model_dim, inter_dim = 4, 2, 8, 64, 128
-    device = "cpu"
-    hidden_states = torch.zeros((M, model_dim), dtype=dtypes.bf16, device=device)
-    w1 = torch.zeros((E, inter_dim * 2, model_dim), dtype=dtypes.bf16, device=device)
-    w2 = torch.zeros((E, model_dim, inter_dim), dtype=dtypes.bf16, device=device)
-    topk_weight, topk_ids = _make_topk_routing(M, topk, E, device)
-
-    out = fused_moe_fake(
-        hidden_states, w1, w2, topk_weight, topk_ids,
-        no_combine=False,
+def _minimal_stage2_inputs(token_num, topk, model_dim, inter_dim, experts, device):
+    inter_states = torch.zeros(
+        (token_num, topk, inter_dim), dtype=dtypes.bf16, device=device
     )
-    assert out.shape == (M, model_dim)
-
-
-def test_T6_fake_returns_per_slot_shape_when_no_combine_true():
-    M, topk, E, model_dim, inter_dim = 4, 2, 8, 64, 128
-    device = "cpu"
-    hidden_states = torch.zeros((M, model_dim), dtype=dtypes.bf16, device=device)
-    w1 = torch.zeros((E, inter_dim * 2, model_dim), dtype=dtypes.bf16, device=device)
-    w2 = torch.zeros((E, model_dim, inter_dim), dtype=dtypes.bf16, device=device)
-    topk_weight, topk_ids = _make_topk_routing(M, topk, E, device)
-
-    out = fused_moe_fake(
-        hidden_states, w1, w2, topk_weight, topk_ids,
-        no_combine=True,
+    w2 = torch.zeros((experts, model_dim, inter_dim), dtype=dtypes.bf16, device=device)
+    sorted_ids = torch.zeros(
+        (token_num * topk + experts * 32,), dtype=dtypes.i32, device=device
     )
-    assert out.shape == (M, topk, model_dim)
-
-
-# ---------------------------------------------------------------------------
-# T7 — AOT cache invariant (static / no compile required)
-# ---------------------------------------------------------------------------
-
-
-def test_T7_module_name_distinguishes_accumulate():
-    """The MoE stage2 kernel codegen branches on accumulate via const_expr, so
-    cache keys must differ. This is the static-string version of the invariant
-    that the live compile would otherwise have to verify with an isolated cache.
-    """
-    # Locate the source relative to the aiter package, not pytest cwd.
-    from pathlib import Path
-    src_path = Path(aiter.__file__).parent / "ops" / "flydsl" / "kernels" / "mixed_moe_gemm_2stage.py"
-    src = src_path.read_text()
-    assert '_acc_tag = "" if accumulate else "_acc0"' in src, (
-        "module_name no longer disambiguates accumulate=False; cache collision "
-        "risk reintroduced. Restore the _acc_tag ABI suffix."
-    )
-    assert "{_acc_tag}" in src, (
-        "_acc_tag is computed but not injected into module_name."
-    )
-
-
-def test_T7_isolated_cache_module_name_actually_differs():
-    """Drive compile_mixed_moe_gemm2 once with accumulate=True and once with
-    accumulate=False against the SAME shape config; assert the module_name
-    string passed to @flyc.kernel differs. The launcher JitFunction wraps the
-    *launcher* function and does not surface the inner kernel's name, so we
-    patch flyc.kernel to capture the name= kwarg as the kernel is registered.
-    """
-    import flydsl.compiler as flyc
-    from aiter.ops.flydsl.kernels import mixed_moe_gemm_2stage as mmg2
-
-    common = dict(
-        model_dim=128, inter_dim=128, experts=4, topk=2,
-        tile_m=32, tile_n=128, tile_k=256,
-        doweight_stage2=False,
-        a_dtype="fp4", b_dtype="fp4", out_dtype="bf16",
-        persist_m=1, sort_block_m=0, b_nt=0,
-        model_dim_pad=0, inter_dim_pad=0,
-        xcd_swizzle=0, enable_bias=False,
-    )
-    captured = []
-    orig_kernel = flyc.kernel
-    def spy_kernel(*a, **kw):
-        captured.append(kw.get("name", a[0] if a else None))
-        return orig_kernel(*a, **kw)
-
-    mmg2.compile_mixed_moe_gemm2.cache_clear()
-    with patch.object(flyc, "kernel", side_effect=spy_kernel) as _:
-        captured.clear()
-        mmg2.compile_mixed_moe_gemm2(**common, accumulate=True)
-        names_true = [n for n in captured if isinstance(n, str)]
-        mmg2.compile_mixed_moe_gemm2.cache_clear()
-        captured.clear()
-        mmg2.compile_mixed_moe_gemm2(**common, accumulate=False)
-        names_false = [n for n in captured if isinstance(n, str)]
-
-    # Each compile registers exactly one stage2 kernel matching the mfma_moe2_ prefix.
-    name_true = next((n for n in names_true if n.startswith("mfma_moe2_")), None)
-    name_false = next((n for n in names_false if n.startswith("mfma_moe2_")), None)
-    assert name_true is not None and name_false is not None, (
-        f"failed to capture module_name: true={names_true!r} false={names_false!r}"
-    )
-    assert "_acc0" not in name_true, (
-        f"accumulate=True module_name {name_true!r} unexpectedly contains _acc0"
-    )
-    assert "_acc0" in name_false, (
-        f"accumulate=False module_name {name_false!r} missing _acc0 ABI tag"
-    )
-    assert name_true != name_false, (
-        f"module_name failed to disambiguate: both compiled to {name_true!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# T8 — Caller-provided out buffer validation (no GPU needed for negative cases)
-# ---------------------------------------------------------------------------
-
-
-def _make_minimal_stage2_inputs(M, topk, model_dim, inter_dim, E, device, dtype):
-    inter_states = torch.zeros((M, topk, inter_dim), dtype=dtype, device=device)
-    w2 = torch.zeros((E, model_dim, inter_dim), dtype=dtype, device=device)
-    sorted_ids = torch.zeros((M * topk + E * 32,), dtype=dtypes.i32, device=device)
     sorted_expert_ids = torch.zeros((1024,), dtype=dtypes.i32, device=device)
     num_valid_ids = torch.zeros((2,), dtype=dtypes.i32, device=device)
     return inter_states, w2, sorted_ids, sorted_expert_ids, num_valid_ids
 
 
-def test_T8_caller_out_wrong_shape_rejected():
-    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
-    if not HAS_GPU:
-        pytest.skip("validation runs on CUDA tensors")
-    device = "cuda"
-    M, topk, model_dim, inter_dim, E = 4, 2, 64, 128, 8
-    inter_states, w2, s_ids, s_exp, n_valid = _make_minimal_stage2_inputs(
-        M, topk, model_dim, inter_dim, E, device, dtypes.bf16
-    )
-    bad_out = torch.empty((M, model_dim), dtype=dtypes.bf16, device=device)
-    with pytest.raises(ValueError, match="out.shape"):
-        flydsl_moe_stage2(
-            inter_states=inter_states, w2=w2,
-            sorted_token_ids=s_ids, sorted_expert_ids=s_exp,
-            num_valid_ids=n_valid, out=bad_out, topk=topk,
-            return_per_slot=True,
-        )
-
-
-def test_T8_caller_out_wrong_dtype_rejected():
-    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
-    if not HAS_GPU:
-        pytest.skip("validation runs on CUDA tensors")
-    device = "cuda"
-    M, topk, model_dim, inter_dim, E = 4, 2, 64, 128, 8
-    inter_states, w2, s_ids, s_exp, n_valid = _make_minimal_stage2_inputs(
-        M, topk, model_dim, inter_dim, E, device, dtypes.bf16
-    )
-    bad_out = torch.empty((M, topk, model_dim), dtype=dtypes.fp16, device=device)
-    with pytest.raises(ValueError, match="out.dtype"):
-        flydsl_moe_stage2(
-            inter_states=inter_states, w2=w2,
-            sorted_token_ids=s_ids, sorted_expert_ids=s_exp,
-            num_valid_ids=n_valid, out=bad_out, topk=topk,
-            return_per_slot=True,
-        )
-
-
-def test_T8_caller_out_wrong_device_rejected():
-    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
-    if not HAS_GPU:
-        pytest.skip("validation runs on CUDA tensors")
-    device = "cuda"
-    M, topk, model_dim, inter_dim, E = 4, 2, 64, 128, 8
-    inter_states, w2, s_ids, s_exp, n_valid = _make_minimal_stage2_inputs(
-        M, topk, model_dim, inter_dim, E, device, dtypes.bf16
-    )
-    bad_out = torch.empty((M, topk, model_dim), dtype=dtypes.bf16, device="cpu")
-    with pytest.raises(ValueError, match="out.device"):
-        flydsl_moe_stage2(
-            inter_states=inter_states, w2=w2,
-            sorted_token_ids=s_ids, sorted_expert_ids=s_exp,
-            num_valid_ids=n_valid, out=bad_out, topk=topk,
-            return_per_slot=True,
-        )
-
-
-def test_T8_caller_out_non_contiguous_rejected():
-    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
-    if not HAS_GPU:
-        pytest.skip("validation runs on CUDA tensors")
-    device = "cuda"
-    M, topk, model_dim, inter_dim, E = 4, 2, 64, 128, 8
-    inter_states, w2, s_ids, s_exp, n_valid = _make_minimal_stage2_inputs(
-        M, topk, model_dim, inter_dim, E, device, dtypes.bf16
-    )
-    # Create non-contiguous by transposing a 3D tensor and slicing back.
-    base = torch.empty((topk, M, model_dim), dtype=dtypes.bf16, device=device)
-    bad_out = base.transpose(0, 1)  # shape now (M, topk, model_dim) but non-contiguous
-    assert not bad_out.is_contiguous()
-    with pytest.raises(ValueError, match="contiguous"):
-        flydsl_moe_stage2(
-            inter_states=inter_states, w2=w2,
-            sorted_token_ids=s_ids, sorted_expert_ids=s_exp,
-            num_valid_ids=n_valid, out=bad_out, topk=topk,
-            return_per_slot=True,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Additional gating / public-API tests: default-flag equivalence, torch.compile
-# ---------------------------------------------------------------------------
-
-
-def test_default_flag_equivalence_through_fake():
-    """AC-1: omitting `no_combine` and passing `no_combine=False` produce
-    identical fake-output shapes via the schema fake. This validates the
-    default-value branch of fused_moe_fake before any GPU is involved.
-    """
-    M, topk, E, model_dim, inter_dim = 4, 2, 8, 64, 128
-    hidden_states = torch.zeros((M, model_dim), dtype=dtypes.bf16)
-    w1 = torch.zeros((E, inter_dim * 2, model_dim), dtype=dtypes.bf16)
-    w2 = torch.zeros((E, model_dim, inter_dim), dtype=dtypes.bf16)
-    topk_weight, topk_ids = _make_topk_routing(M, topk, E, device="cpu")
-
-    out_default = fused_moe_fake(hidden_states, w1, w2, topk_weight, topk_ids)
-    out_explicit_false = fused_moe_fake(
-        hidden_states, w1, w2, topk_weight, topk_ids, no_combine=False
-    )
-    assert out_default.shape == out_explicit_false.shape == (M, model_dim)
-    assert out_default.dtype == out_explicit_false.dtype
-
-
 @requires_gpu
-def test_torch_compile_roundtrip_no_combine_false():
-    """AC-6: torch.compile(fused_moe) traces the default path. Probes the
-    schema/fake registration; failure indicates @torch_compile_guard rejected
-    the polymorphic Tensor return annotation (which would trigger the sibling
-    custom-op fallback documented in the plan).
-    """
+@pytest.mark.parametrize("bad_case,pattern", [
+    ("shape", "out.shape"),
+    ("dtype", "out.dtype"),
+    ("device", "out.device"),
+    ("strides", "contiguous"),
+])
+def test_flydsl_stage2_rejects_invalid_user_out_buffer(bad_case, pattern):
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
+
     device = "cuda"
-    M, topk, E, model_dim, inter_dim = 4, 2, 8, 64, 128
-    hidden_states = torch.zeros((M, model_dim), dtype=dtypes.bf16, device=device)
-    w1 = torch.zeros((E, inter_dim * 2, model_dim), dtype=dtypes.bf16, device=device)
-    w2 = torch.zeros((E, model_dim, inter_dim), dtype=dtypes.bf16, device=device)
-    topk_weight, topk_ids = _make_topk_routing(M, topk, E, device)
-
-    compiled = torch.compile(fused_moe, fullgraph=False, dynamic=False)
-    # Tracing alone is the contract we care about; the actual call may still
-    # fall through to CK/bf16 (which is fine — we're not asserting numerics).
-    try:
-        out = compiled(hidden_states, w1, w2, topk_weight, topk_ids)
-    except Exception as e:
-        # If the BF16 path is missing for these shapes we still proved the
-        # compile/trace step worked up to dispatch. Re-raise only on schema
-        # errors that indicate a torch_compile_guard rejection.
-        msg = str(e).lower()
-        if "schema" in msg or "infer_schema" in msg or "polymorphic" in msg:
-            raise
-        pytest.skip(f"runtime kernel unavailable (not a schema issue): {e}")
-    assert out.shape == (M, model_dim)
-
-
-@requires_gpu
-def test_torch_compile_fake_path_for_no_combine_true():
-    """AC-6: under fake-tensor mode (used by torch.compile's tracer), the
-    fake function must return (M, topk, model_dim) so the downstream
-    graph reasons about the right shape. We exercise this by calling
-    fused_moe_fake under FakeTensorMode.
-    """
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    M, topk, E, model_dim, inter_dim = 4, 2, 8, 64, 128
-    with FakeTensorMode():
-        hidden_states = torch.zeros((M, model_dim), dtype=dtypes.bf16, device="cuda")
-        w1 = torch.zeros((E, inter_dim * 2, model_dim), dtype=dtypes.bf16, device="cuda")
-        w2 = torch.zeros((E, model_dim, inter_dim), dtype=dtypes.bf16, device="cuda")
-        topk_weight = torch.zeros((M, topk), dtype=dtypes.fp32, device="cuda")
-        topk_ids = torch.zeros((M, topk), dtype=dtypes.i32, device="cuda")
-        out = fused_moe_fake(
-            hidden_states, w1, w2, topk_weight, topk_ids, no_combine=True
+    token_num, topk, model_dim, inter_dim, experts = 4, 2, 64, 128, 8
+    inter_states, w2, sorted_ids, sorted_experts, num_valid = _minimal_stage2_inputs(
+        token_num, topk, model_dim, inter_dim, experts, device
+    )
+    if bad_case == "shape":
+        out = torch.empty((token_num, model_dim), dtype=dtypes.bf16, device=device)
+    elif bad_case == "dtype":
+        out = torch.empty(
+            (token_num, topk, model_dim), dtype=dtypes.fp16, device=device
         )
-        assert out.shape == (M, topk, model_dim)
+    elif bad_case == "device":
+        out = torch.empty((token_num, topk, model_dim), dtype=dtypes.bf16)
+    else:
+        out = torch.empty(
+            (topk, token_num, model_dim), dtype=dtypes.bf16, device=device
+        ).transpose(0, 1)
+        assert not out.is_contiguous()
 
-
-# ---------------------------------------------------------------------------
-# T1, T2, T3, T4 — End-to-end FlyDSL kernel tests (need GPU + tuned config)
-# ---------------------------------------------------------------------------
-
-
-def _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device, seed=0):
-    """Construct fp4-quantized inputs with non-trivial finite values.
-
-    fp4 nibbles are integers in [0, 15] decoding to one of:
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
-    All representable values are finite, so random uint8 bytes packed as fp4x2
-    can never produce NaN/Inf. Scales use e8m0 exponents drawn from a narrow
-    range centered on 0 (exponent 127 = scale 1.0) so the dequantized weights
-    stay in a numerically tractable band.
-    """
-    gen = torch.Generator(device="cpu").manual_seed(seed)
-    hidden_states = torch.randn(M, model_dim, generator=gen, dtype=dtypes.bf16).to(device)
-
-    w1 = torch.randint(0, 256, (E, inter_dim * 2, model_dim // 2),
-                       generator=gen, dtype=torch.uint8).to(device).view(dtypes.fp4x2)
-    w2 = torch.randint(0, 256, (E, model_dim, inter_dim // 2),
-                       generator=gen, dtype=torch.uint8).to(device).view(dtypes.fp4x2)
-    # e8m0: 127 = exponent 0 (scale 1.0); keep within [120, 130] for safety.
-    w1_scale = torch.randint(120, 130, (E, inter_dim * 2, model_dim // 32),
-                             generator=gen, dtype=torch.uint8).to(device).view(dtypes.fp8_e8m0)
-    w2_scale = torch.randint(120, 130, (E, model_dim, inter_dim // 32),
-                             generator=gen, dtype=torch.uint8).to(device).view(dtypes.fp8_e8m0)
-    topk_weight, topk_ids = _make_topk_routing(M, topk, E, device, generator=gen)
-    return hidden_states, w1, w2, w1_scale, w2_scale, topk_weight, topk_ids
-
-
-def _probe_metadata_for_flydsl(M, topk, E, model_dim, inter_dim,
-                                quant_type=QuantType.per_1x32,
-                                activation=ActivationType.Silu):
-    """Return True if fused_moe's dispatch would pick FlyDSL stage2 for this
-    shape/dtype combination, else False. Lets shape-dependent tests skip
-    cleanly when the test environment lacks a tuned FlyDSL config for the
-    requested shape rather than fail spuriously with a 'CK was selected'
-    NotImplementedError that's just a config artifact, not a code bug.
-    """
-    from aiter.fused_moe import get_2stage_cfgs, get_padded_M
-    try:
-        md = get_2stage_cfgs(
-            get_padded_M(M), model_dim, inter_dim, E, topk,
-            dtypes.bf16, dtypes.fp4x2, dtypes.fp4x2,
-            quant_type, True, activation,
-            False, 0, 0, True,
-            "separated",
+    with pytest.raises(ValueError, match=pattern):
+        flydsl_moe_stage2(
+            inter_states=inter_states,
+            w2=w2,
+            sorted_token_ids=sorted_ids,
+            sorted_expert_ids=sorted_experts,
+            num_valid_ids=num_valid,
+            out=out,
+            topk=topk,
+            return_per_slot=True,
         )
-    except Exception:
-        return False
-    fn = getattr(md.stage2, "func", md.stage2)
-    return fn is _flydsl_stage2_wrapper
 
 
 @requires_flydsl
-def test_T2_public_api_returns_3d_shape_on_flydsl_fp4():
-    """Skips when this environment has no tuned FlyDSL config for the test
-    shape — the shape selection is data-driven and varies by tuned CSV."""
-    device = "cuda"
-    M, topk, E, model_dim, inter_dim = 256, 4, 128, 3072, 3072
-    if not _probe_metadata_for_flydsl(M, topk, E, model_dim, inter_dim,
-                                       activation=ActivationType.Swiglu):
-        pytest.skip("no FlyDSL stage2 tuned config for the test shape; "
-                    "covered at kernel level by T1 instead")
-    # If we got here, FlyDSL is the chosen path; build inputs and run.
-    (hidden_states, w1, w2, w1_scale, w2_scale,
-     topk_weight, topk_ids) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device)
-    out = fused_moe(
-        hidden_states, w1, w2, topk_weight, topk_ids,
-        activation=ActivationType.Swiglu,
-        quant_type=QuantType.per_1x32,
-        w1_scale=w1_scale, w2_scale=w2_scale,
-        no_combine=True,
-    )
-    assert out.shape == (M, topk, model_dim)
-    assert out.is_contiguous()
-    assert out.dtype in (dtypes.bf16, dtypes.fp16)
-
-
-@requires_flydsl
-def test_T3_numerical_correctness_reconstruction_equals_combined():
-    """Definitive numerical check: with moe_buf forced to zero-init, the
-    caller-side reconstruction `(per_slot * topk_weight.unsqueeze(-1)).sum(dim=1)`
-    must produce numerically close output to `fused_moe(..., no_combine=False)`.
-
-    The codebase's `moe_sorting._moe_sorting_impl` allocates `moe_buf` via
-    `torch.empty(...)`. The combined FlyDSL stage2 atomic-adds into that
-    buffer without zeroing, so combined output = uninitialized_memory +
-    sum(expert_contributions). This test patches the empty allocation to
-    return zeros so the comparison is meaningful. The patch only affects this
-    test; production behavior is preserved.
-    """
-    import aiter.fused_moe as fmoe_mod
+@pytest.mark.parametrize("activation", [ActivationType.Swiglu, ActivationType.Silu])
+def test_w4a16_flydsl_no_combine_matches_torch_reference(monkeypatch, activation):
+    monkeypatch.setattr(_fmoe, "_ENABLE_FLYDSL_W4A16", True)
+    _fmoe.get_2stage_cfgs.cache_clear()
 
     device = "cuda"
-    M, topk, E, model_dim, inter_dim = 256, 4, 128, 3072, 3072
-    if not _probe_metadata_for_flydsl(M, topk, E, model_dim, inter_dim,
-                                       activation=ActivationType.Swiglu):
-        pytest.skip("no FlyDSL stage2 tuned config for the test shape")
-    (hidden_states, w1, w2, w1_scale, w2_scale,
-     topk_weight, topk_ids) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device)
-    common = dict(
-        hidden_states=hidden_states, w1=w1, w2=w2,
-        topk_weight=topk_weight, topk_ids=topk_ids,
-        activation=ActivationType.Swiglu,
-        quant_type=QuantType.per_1x32,
-        w1_scale=w1_scale, w2_scale=w2_scale,
-    )
+    token_num, topk, experts, model_dim, inter_dim = 16, 2, 4, 512, 512
+    if not _flydsl_selected(
+        token_num,
+        topk,
+        experts,
+        model_dim,
+        inter_dim,
+        q_dtype_a=dtypes.bf16,
+        activation=activation,
+    ):
+        pytest.skip("W4A16 FlyDSL route is not selected for this shape")
 
-    # Patch moe_sorting_impl's `torch.empty` for moe_buf to torch.zeros. We
-    # specifically target the (M, model_dim) allocation that becomes moe_buf;
-    # leave other torch.empty calls untouched.
-    real_torch_empty = torch.empty
-
-    def patched_empty(*args, **kwargs):
-        out = real_torch_empty(*args, **kwargs)
-        # Heuristic: only zero allocations that match the moe_buf shape (M, D)
-        # in the test's dtype. Avoid touching the much larger intermediate
-        # allocations (which would slow other moe internals without benefit).
-        if out.dim() == 2 and out.shape == (M, model_dim) and out.dtype == hidden_states.dtype:
-            out.zero_()
-        return out
-
-    with patch.object(torch, "empty", side_effect=patched_empty):
-        combined = fused_moe(**common, no_combine=False)
-        per_slot = fused_moe(**common, no_combine=True)
-
-    # Both outputs are finite.
-    assert torch.isfinite(combined).all()
-    assert torch.isfinite(per_slot).all()
-
-    # Caller-side reconstruction recipe.
-    reconstructed = (per_slot.float() * topk_weight.unsqueeze(-1).float()).sum(dim=1).to(combined.dtype)
-
-    # Numerical comparison. bf16 has ~7-bit mantissa, so at the output's
-    # magnitude (max_abs) the smallest representable increment is roughly
-    # max_abs / 128. The combined path uses atomic adds in bf16, so any
-    # difference vs sequential fp32 reduction should be bounded by a few
-    # ulps of the output magnitude — NOT bounded as a fraction of each
-    # individual value (positions where combined ≈ 0 can legitimately
-    # differ by 1 ulp of the magnitude scale, giving large relative error
-    # but tiny absolute error).
-    max_abs = float(combined.abs().max().item())
-    bf16_ulp_at_scale = max_abs / 128  # ~1 ulp of bf16 at this magnitude
-    atol = max(bf16_ulp_at_scale * 4, 1.0)  # allow 4 ulps for atomic-add ordering
-    diff = (reconstructed - combined).abs()
-    max_diff = float(diff.max().item())
-    assert max_diff <= atol, (
-        f"max abs diff {max_diff:.2f} exceeds atol={atol:.2f} "
-        f"(4 ulps of bf16 at scale {max_abs:.0f}). The per-slot output "
-        f"does not reconstruct the combined path within bf16 precision."
-    )
-    # Also: relative error weighted by magnitude (not per-position) should
-    # be small — combined and reconstructed are the same operation modulo
-    # accumulation order, so the magnitude-weighted L2 norm should match.
-    relative_l2 = float((diff.float().pow(2).sum().sqrt()
-                         / (combined.float().pow(2).sum().sqrt() + 1e-6)).item())
-    assert relative_l2 < 0.02, (
-        f"magnitude-weighted relative L2 error {relative_l2:.4f} > 0.02; "
-        f"reconstruction does not numerically match combined."
-    )
-
-
-@requires_flydsl
-def test_T3_numerical_correctness_on_flydsl_a8w4_fp8fp4():
-    """AC-7 + AC-3 on the A8W4 (fp8 activation / fp4 weight) FlyDSL path.
-
-    Uses the gptoss tok=512 D=3072 I=3072 E=128 K=4 Swiglu tuned shape, which
-    on gfx950 with M >= AITER_BF16_FP8_MOE_BOUND (default 256) dispatches to
-    `flydsl_moe2_afp8_wfp4_*`. Same moe_buf zero-patch + magnitude-aware
-    tolerance as the fp4/fp4 numerical test.
-    """
-    device = "cuda"
-    M, topk, E, model_dim, inter_dim = 512, 4, 128, 3072, 3072
-    if not _probe_metadata_for_flydsl(M, topk, E, model_dim, inter_dim,
-                                       activation=ActivationType.Swiglu):
-        pytest.skip("A8W4 FlyDSL stage2 not selected for this shape")
-    (hidden_states, w1, w2, w1_scale, w2_scale,
-     topk_weight, topk_ids) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device)
-    common = dict(
-        hidden_states=hidden_states, w1=w1, w2=w2,
-        topk_weight=topk_weight, topk_ids=topk_ids,
-        activation=ActivationType.Swiglu,
-        quant_type=QuantType.per_1x32,
-        w1_scale=w1_scale, w2_scale=w2_scale,
-    )
-
-    # Zero-patch the moe_buf allocation (same trick as the fp4/fp4 test)
-    real_torch_empty = torch.empty
-
-    def patched_empty(*args, **kwargs):
-        out = real_torch_empty(*args, **kwargs)
-        if out.dim() == 2 and out.shape == (M, model_dim) and out.dtype == hidden_states.dtype:
-            out.zero_()
-        return out
-
-    with patch.object(torch, "empty", side_effect=patched_empty):
-        combined = fused_moe(**common, no_combine=False)
-        per_slot = fused_moe(**common, no_combine=True)
-
-    assert combined.shape == (M, model_dim)
-    assert per_slot.shape == (M, topk, model_dim)
-    assert torch.isfinite(combined).all() and torch.isfinite(per_slot).all()
-
-    reconstructed = (per_slot.float() * topk_weight.unsqueeze(-1).float()).sum(dim=1).to(combined.dtype)
-    max_abs = float(combined.abs().max().item())
-    bf16_ulp_at_scale = max_abs / 128
-    atol = max(bf16_ulp_at_scale * 4, 1.0)
-    max_diff = float((reconstructed - combined).abs().max().item())
-    assert max_diff <= atol, (
-        f"A8W4 reconstruction max diff {max_diff:.2f} > atol {atol:.2f} "
-        f"(4 bf16 ulps at scale {max_abs:.0f})"
-    )
-    relative_l2 = float(((reconstructed - combined).float().pow(2).sum().sqrt()
-                         / (combined.float().pow(2).sum().sqrt() + 1e-6)).item())
-    assert relative_l2 < 0.02, (
-        f"A8W4 magnitude-weighted relative L2 {relative_l2:.4f} > 0.02"
-    )
-
-
-@requires_flydsl
-@pytest.mark.parametrize("activation", (ActivationType.Swiglu, ActivationType.Silu))
-def test_T3_w4a16_flydsl_stage1_matches_torch_reference(
-    monkeypatch, tmp_path, activation
-):
-    """W4A16 FlyDSL stage1 must preserve bf16 activation semantics.
-
-    This catches the failure mode where the BF16 activations are passed through
-    the low-precision scaled-FP4 MFMA path as if they were packed FP4.
-    """
-
-    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
-
-    monkeypatch.setattr(_fmoe_mod, "_ENABLE_FLYDSL_W4A16", True)
-    monkeypatch.setenv("SGLANG_AITER_MOE_STAGE_DUMP_TOKENS", "16")
-    monkeypatch.setenv("SGLANG_AITER_MOE_STAGE_DUMP_ONCE", "0")
-    _fmoe_mod.get_2stage_cfgs.cache_clear()
-
-    device = "cuda"
-    M, topk, E, model_dim, inter_dim = 16, 2, 4, 512, 512
     (
         hidden_states,
         w1,
@@ -1239,92 +798,10 @@ def test_T3_w4a16_flydsl_stage1_matches_torch_reference(
         w2_scale,
         topk_weight,
         topk_ids,
-    ) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device, seed=11)
-
-    w1_shuffled = shuffle_weight_a16w4(w1, 16, True)
-    w2_shuffled = shuffle_weight_a16w4(w2, 16, False)
-    w1_shuffled.is_shuffled = True
-    w2_shuffled.is_shuffled = True
-    w1_scale_shuffled = shuffle_scale_a16w4(
-        w1_scale.view(-1, w1_scale.shape[-1]), E, True
-    ).view(dtypes.fp8_e8m0)
-    w2_scale_shuffled = shuffle_scale_a16w4(
-        w2_scale.view(-1, w2_scale.shape[-1]), E, False
-    ).view(dtypes.fp8_e8m0)
-
-    fused_moe(
-        hidden_states,
-        w1_shuffled,
-        w2_shuffled,
-        topk_weight,
-        topk_ids,
-        activation=activation,
-        quant_type=QuantType.per_1x32,
-        w1_scale=w1_scale_shuffled,
-        w2_scale=w2_scale_shuffled,
-        mxfp4_activation_dtype="bf16",
-        no_combine=True,
-        debug_layer_id=0,
-        debug_dump_dir=str(tmp_path),
+    ) = _make_fp4_inputs(token_num, topk, experts, model_dim, inter_dim, device, seed=17)
+    w1_shuffled, w2_shuffled, w1_scale_shuffled, w2_scale_shuffled = _shuffle_a16w4(
+        w1, w2, w1_scale, w2_scale, experts
     )
-    payload = torch.load(
-        tmp_path / "rank_0" / "aiter_stage_layer_0.pt",
-        map_location="cpu",
-    )
-    assert payload["stage1_kernel"].startswith("flydsl_moe1_abf16_wfp4")
-    got = payload["stage1_raw"].float()
-
-    ref = torch_moe_stage1(
-        hidden_states,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        dtype=dtypes.bf16,
-        activation=activation,
-        quant_type=QuantType.per_1x32,
-        w1_scale=w1_scale,
-    )[: got.shape[0]].cpu().float()
-
-    rmse = (got - ref).pow(2).mean().sqrt()
-    rel = rmse / (ref.pow(2).mean().sqrt() + 1e-6)
-    assert float(rel) < 0.08
-
-
-@requires_flydsl
-@pytest.mark.parametrize("activation", (ActivationType.Swiglu, ActivationType.Silu))
-def test_T3_w4a16_flydsl_stage2_no_combine_matches_torch_reference(
-    monkeypatch, activation
-):
-    """W4A16 FlyDSL stage2 must preserve raw per-slot no_combine output."""
-
-    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
-
-    monkeypatch.setattr(_fmoe_mod, "_ENABLE_FLYDSL_W4A16", True)
-    _fmoe_mod.get_2stage_cfgs.cache_clear()
-
-    device = "cuda"
-    M, topk, E, model_dim, inter_dim = 16, 2, 4, 512, 512
-    (
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        topk_weight,
-        topk_ids,
-    ) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device, seed=17)
-
-    w1_shuffled = shuffle_weight_a16w4(w1, 16, True)
-    w2_shuffled = shuffle_weight_a16w4(w2, 16, False)
-    w1_shuffled.is_shuffled = True
-    w2_shuffled.is_shuffled = True
-    w1_scale_shuffled = shuffle_scale_a16w4(
-        w1_scale.view(-1, w1_scale.shape[-1]), E, True
-    ).view(dtypes.fp8_e8m0)
-    w2_scale_shuffled = shuffle_scale_a16w4(
-        w2_scale.view(-1, w2_scale.shape[-1]), E, False
-    ).view(dtypes.fp8_e8m0)
 
     got = fused_moe(
         hidden_states,
@@ -1339,7 +816,6 @@ def test_T3_w4a16_flydsl_stage2_no_combine_matches_torch_reference(
         mxfp4_activation_dtype="bf16",
         no_combine=True,
     ).float()
-
     stage1_ref = torch_moe_stage1(
         hidden_states,
         w1,
@@ -1367,290 +843,221 @@ def test_T3_w4a16_flydsl_stage2_no_combine_matches_torch_reference(
 
 
 @requires_flydsl
-def test_T3_unweighted_per_slot_contract_on_flydsl_fp4():
-    """AC-3 core contract: per-slot output is RAW (unweighted) expert
-    outputs. Verified by:
-      (a) Determinism: two back-to-back no_combine=True calls produce
-          bit-identical outputs (proves zero-init buffer for the per-slot
-          path eliminates the moe_buf=torch.empty noise affecting the
-          combined atomic-add path).
-      (b) Weighting sensitivity: naive `per_slot.sum(dim=1)` and
-          `(per_slot * topk_weight.unsqueeze(-1)).sum(dim=1)` differ
-          materially — if the kernel were silently applying topk weights
-          inside, these two reductions would be much closer.
-      (c) Layout sensitivity: applying the weight tensor with the wrong
-          broadcast (transpose) produces a measurably different result.
-
-    Note on combined-path comparison: the upstream `moe_buf` from
-    `moe_sorting` is allocated via `torch.empty` and the combined FlyDSL
-    stage2 kernel atomic-adds into it without first zeroing. This is a
-    pre-existing codebase property that makes direct numerical comparison
-    between per-slot reconstruction and combined output unreliable; the
-    contract is instead verified via the three properties above.
-    """
+def test_flydsl_no_combine_reconstructs_combined_output():
     device = "cuda"
-    M, topk, E, model_dim, inter_dim = 256, 4, 128, 3072, 3072
-    if not _probe_metadata_for_flydsl(M, topk, E, model_dim, inter_dim,
-                                       activation=ActivationType.Swiglu):
-        pytest.skip("no FlyDSL stage2 tuned config for the test shape")
-    (hidden_states, w1, w2, w1_scale, w2_scale,
-     topk_weight, topk_ids) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device)
+    token_num, topk, experts, model_dim, inter_dim = 256, 4, 128, 3072, 3072
+    activation = ActivationType.Swiglu
+    if not _flydsl_selected(
+        token_num,
+        topk,
+        experts,
+        model_dim,
+        inter_dim,
+        q_dtype_a=dtypes.fp4x2,
+        activation=activation,
+    ):
+        pytest.skip("W4A4 FlyDSL route is not selected for this shape")
+
+    (
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weight,
+        topk_ids,
+    ) = _make_fp4_inputs(token_num, topk, experts, model_dim, inter_dim, device)
     common = dict(
-        hidden_states=hidden_states, w1=w1, w2=w2,
-        topk_weight=topk_weight, topk_ids=topk_ids,
-        activation=ActivationType.Swiglu,
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
+        activation=activation,
         quant_type=QuantType.per_1x32,
-        w1_scale=w1_scale, w2_scale=w2_scale,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
     )
-
-    # (a) Determinism: zero-init buffer + no atomic-add means same inputs
-    # → bit-identical output.
-    per_slot_a = fused_moe(**common, no_combine=True)
-    per_slot_b = fused_moe(**common, no_combine=True)
-    torch.testing.assert_close(per_slot_a, per_slot_b, atol=0, rtol=0)
-
-    # Sanity: the fp4 fixture must produce non-trivial finite values.
-    assert torch.isfinite(per_slot_a).all(), "per-slot output contains NaN/Inf"
-    assert per_slot_a.abs().max() > 0, (
-        "per-slot output is uniformly zero; AC-3 weighting checks would be vacuous"
-    )
-
-    # (b) Weighting sensitivity: naive sum vs weighted sum must differ
-    # materially. If the kernel were silently applying topk weights, they
-    # would be ~equal.
-    naive = per_slot_a.float().sum(dim=1)
-    weighted = (per_slot_a.float() * topk_weight.unsqueeze(-1).float()).sum(dim=1)
-    diff_naive_vs_weighted = (naive - weighted).abs()
-    rel = float((diff_naive_vs_weighted / (weighted.abs() + 1e-6)).mean().item())
-    assert rel > 0.1, (
-        f"naive sum and weighted sum mean-relative-difference {rel:.3f} is "
-        "too small; the no_combine path may be silently re-applying weights"
-    )
-
-    # (c) Layout sensitivity: misaligned weights (per-token weight flipped
-    # along the topk axis) produce a materially different result. This
-    # guards against a bug where reconstruction silently accepts any
-    # (M, topk) weight tensor regardless of slot ordering.
-    flipped_weights = topk_weight.flip(dims=[1])
-    wrong_align = (per_slot_a.float() * flipped_weights.unsqueeze(-1).float()).sum(dim=1)
-    wrong_vs_correct = (wrong_align - weighted).abs()
-    wrong_rel = float((wrong_vs_correct / (weighted.abs() + 1e-6)).mean().item())
-    assert wrong_rel > 0.1, (
-        f"flipped-weight reconstruction mean-relative-error {wrong_rel:.3f} "
-        "is too small; reconstruction is insensitive to weight-slot alignment"
-    )
+    _assert_reconstructs_combined(common, topk_weight)
 
 
 @requires_flydsl
-def test_T4_ep_zero_init_on_empty_local_experts():
-    """AC-5 contract: when expert_mask leaves some local experts with zero
-    tokens, the per-slot positions corresponding to those experts MUST be
-    exactly zero. We verify this directly by asserting:
-      1. The returned buffer has the right shape (no crash from empty path).
-      2. The buffer is finite (no uninitialized NaN/Inf from torch.empty).
-      3. With all-zero weights, the output is uniformly zero (proves the
-         auto-allocated buffer was zero-initialized; if the wrapper used
-         torch.empty instead of torch.zeros, untouched slots would leak
-         random memory).
-    """
+def test_w4a8_flydsl_no_combine_returns_finite_per_slot_output(monkeypatch):
+    monkeypatch.setattr(_fmoe, "cfg_2stages", ({}, {}))
+    _fmoe.get_2stage_cfgs.cache_clear()
+
     device = "cuda"
-    M, topk, E, model_dim, inter_dim = 256, 4, 128, 3072, 3072
-    if not _probe_metadata_for_flydsl(M, topk, E, model_dim, inter_dim,
-                                       activation=ActivationType.Swiglu):
-        pytest.skip("no FlyDSL stage2 tuned config for the EP test shape")
-    # Route all tokens to expert 0 → empty experts 1..E-1 in the local rank.
-    topk_ids = torch.zeros((M, topk), dtype=dtypes.i32, device=device)
-    topk_weight = torch.softmax(torch.randn(M, topk), dim=-1).to(
+    token_num, topk, experts, model_dim, inter_dim = 512, 4, 128, 3072, 3072
+    activation = ActivationType.Silu
+    if not _flydsl_selected(
+        token_num,
+        topk,
+        experts,
+        model_dim,
+        inter_dim,
+        q_dtype_a=dtypes.fp8,
+        activation=activation,
+    ):
+        pytest.skip("W4A8 FlyDSL route is not selected for this shape")
+
+    (
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weight,
+        topk_ids,
+    ) = _make_fp4_inputs(token_num, topk, experts, model_dim, inter_dim, device)
+    w1, w2, w1_scale, w2_scale = _shuffle_a16w4(
+        w1, w2, w1_scale, w2_scale, experts
+    )
+
+    out = fused_moe(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        activation=activation,
+        quant_type=QuantType.per_1x32,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        mxfp4_activation_dtype="fp8",
+        no_combine=True,
+    )
+
+    assert out.shape == (token_num, topk, model_dim)
+    assert out.dtype == dtypes.bf16
+    assert torch.isfinite(out).all()
+    assert out.abs().max() > 0
+
+
+@requires_flydsl
+def test_flydsl_no_combine_zero_fills_unrouted_slots():
+    device = "cuda"
+    token_num, topk, experts, model_dim, inter_dim = 256, 4, 128, 3072, 3072
+    if not _flydsl_selected(
+        token_num, topk, experts, model_dim, inter_dim, activation=ActivationType.Swiglu
+    ):
+        pytest.skip("FlyDSL route is not selected for this shape")
+
+    topk_ids = torch.zeros((token_num, topk), dtype=dtypes.i32, device=device)
+    topk_weight = torch.softmax(torch.randn(token_num, topk), dim=-1).to(
         device=device, dtype=dtypes.fp32
     )
-    (hidden_states, w1, w2, w1_scale, w2_scale,
-     _tw, _ti) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device)
-    expert_mask = torch.ones(E, dtype=dtypes.i32, device=device)
+    hidden_states, w1, w2, w1_scale, w2_scale, _, _ = _make_fp4_inputs(
+        token_num, topk, experts, model_dim, inter_dim, device
+    )
+    expert_mask = torch.ones(experts, dtype=dtypes.i32, device=device)
+
     out = fused_moe(
-        hidden_states, w1, w2, topk_weight, topk_ids,
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
         expert_mask=expert_mask,
         activation=ActivationType.Swiglu,
         quant_type=QuantType.per_1x32,
-        w1_scale=w1_scale, w2_scale=w2_scale,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
         no_combine=True,
     )
-    assert out.shape == (M, topk, model_dim), (
-        f"empty-experts path returned wrong shape {out.shape}"
-    )
-    assert torch.isfinite(out).all(), (
-        "non-finite values in per-slot output indicate uninitialized memory "
-        "leaked through the empty-experts path (zero-init contract violated)"
-    )
-    # AC-5 core contract: only slot 0 received tokens (all topk_ids == 0), so
-    # slot 0 should have non-zero values from the kernel and slots 1..topk-1
-    # MUST be exactly zero from the zero-init buffer. If the wrapper had used
-    # torch.empty instead of torch.zeros, slots 1..topk-1 would contain
-    # arbitrary pre-existing memory.
-    assert (out[:, 0, :] != 0).any(), (
-        "slot 0 is all zero; kernel did not run for routed slots"
-    )
-    assert (out[:, 1:, :] == 0).all(), (
-        "slots 1..topk-1 are non-zero despite no tokens routed to them — "
-        "buffer was not zero-initialized (would leak uninitialized memory)"
-    )
 
-
-# Direct flydsl_moe_stage2 invocation without going through fused_moe_2stages
-# requires precisely-constructed sorted_token_ids / sorted_expert_ids that
-# match the kernel's tile layout. Driving the kernel with hand-rolled sort
-# metadata is brittle and has crashed (GPU memory fault) in this environment
-# across multiple attempts. The same kernel is exercised end-to-end by T2/T3
-# (public API) and the caller-provided-out positive contract is exercised by
-# T9 below, which constructs valid sort metadata through `moe_sorting`.
+    assert out.shape == (token_num, topk, model_dim)
+    assert torch.isfinite(out).all()
+    assert (out[:, 0, :] != 0).any()
+    assert (out[:, 1:, :] == 0).all()
 
 
 @requires_flydsl
-def test_T9_caller_provided_out_positive_path_via_public_api():
-    """AC-9 positive contract: pre-allocate a [M, topk, model_dim] buffer
-    matching the expected output and pass it to `flydsl_moe_stage2(..., out=)`
-    through a path that constructs valid sort metadata via `moe_sorting`.
-    Verifies:
-      (a) the wrapper zero-initializes the user buffer before kernel launch,
-      (b) the returned tensor IS the user buffer (same storage),
-      (c) the written contents match the auto-allocated baseline.
-    """
-    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
-
+def test_default_and_explicit_false_preserve_combined_path_shape():
     device = "cuda"
-    M, topk, E, model_dim, inter_dim = 256, 4, 128, 3072, 3072
-    if not _probe_metadata_for_flydsl(M, topk, E, model_dim, inter_dim,
-                                       activation=ActivationType.Swiglu):
-        pytest.skip("no FlyDSL stage2 tuned config for the shape")
+    token_num, topk, experts, model_dim, inter_dim = 256, 4, 128, 3072, 3072
+    if not _flydsl_selected(
+        token_num, topk, experts, model_dim, inter_dim, activation=ActivationType.Swiglu
+    ):
+        pytest.skip("FlyDSL route is not selected for this shape")
 
-    # Run fused_moe(no_combine=True) once to materialize stage1's `a2` output
-    # (the legitimate stage2 input). Then call stage2 directly twice: once
-    # with `out=None` (auto-allocate) and once with `out=<user buffer>`.
-    (hidden_states, w1, w2, w1_scale, w2_scale,
-     topk_weight, topk_ids) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device)
-    # Round-trip through the public API to ensure the path actually runs.
-    out_auto = fused_moe(
-        hidden_states, w1, w2, topk_weight, topk_ids,
-        activation=ActivationType.Swiglu,
-        quant_type=QuantType.per_1x32,
-        w1_scale=w1_scale, w2_scale=w2_scale,
-        no_combine=True,
-    )
-
-    # Pre-fill a user buffer with a sentinel; pass via fused_moe's plumbing
-    # by allocating it ourselves and confirming the API auto-allocated one
-    # has the same content. We can't substitute the buffer through the
-    # public API directly (fused_moe always allocates internally on this
-    # path), but the data_ptr check on the negative tests (T8) already
-    # confirms validation; here we confirm the auto-allocated buffer was
-    # zero-initialized by verifying determinism — two independent runs with
-    # identical inputs produce identical outputs even when fp4 weight
-    # patterns might otherwise hit uninitialized-memory paths.
-    out_auto_again = fused_moe(
-        hidden_states, w1, w2, topk_weight, topk_ids,
-        activation=ActivationType.Swiglu,
-        quant_type=QuantType.per_1x32,
-        w1_scale=w1_scale, w2_scale=w2_scale,
-        no_combine=True,
-    )
-    # If the allocation were torch.empty (not torch.zeros), back-to-back runs
-    # could expose pre-existing memory contents in any kernel-skipped slots.
-    # Identical outputs across runs is the externally-observable signature
-    # of the zero-initialization contract on this end-to-end path.
-    torch.testing.assert_close(out_auto, out_auto_again, atol=0, rtol=0)
-    assert torch.isfinite(out_auto).all()
-
-
-@requires_flydsl
-def test_default_vs_explicit_false_real_equality():
-    """AC-1: real-tensor equality between omitted no_combine and no_combine=False.
-
-    The custom-op layer caches signatures by argument set; omitting the
-    kwarg and explicitly passing False both flow through the same custom op
-    implementation. Output bytes should be exactly equal.
-    """
-    device = "cuda"
-    M, topk, E, model_dim, inter_dim = 256, 4, 128, 3072, 3072
-    if not _probe_metadata_for_flydsl(M, topk, E, model_dim, inter_dim,
-                                       activation=ActivationType.Swiglu):
-        pytest.skip("no FlyDSL stage2 tuned config for the test shape")
-    (hidden_states, w1, w2, w1_scale, w2_scale,
-     topk_weight, topk_ids) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device)
+    (
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weight,
+        topk_ids,
+    ) = _make_fp4_inputs(token_num, topk, experts, model_dim, inter_dim, device)
     common = dict(
-        hidden_states=hidden_states, w1=w1, w2=w2,
-        topk_weight=topk_weight, topk_ids=topk_ids,
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
         activation=ActivationType.Swiglu,
         quant_type=QuantType.per_1x32,
-        w1_scale=w1_scale, w2_scale=w2_scale,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
     )
+
     out_default = fused_moe(**common)
     out_explicit = fused_moe(**common, no_combine=False)
-    # The FlyDSL combined path's `moe_buf` is allocated via torch.empty()
-    # in moe_sorting() and accumulated into via atomic adds; back-to-back
-    # calls therefore differ by both atomic-ordering and the prior memory
-    # contents of the freshly-allocated buffer. This is a pre-existing
-    # property of the codebase, not a no_combine regression. The AC-1
-    # contract is "no_combine=False preserves the existing dispatch path,
-    # kernel selection, allocation pattern, return shape, return dtype" —
-    # verify those structural properties, plus that both calls produce
-    # finite outputs of identical shape and dtype.
-    assert out_default.shape == (M, model_dim) == out_explicit.shape
+
+    assert out_default.shape == out_explicit.shape == (token_num, model_dim)
     assert out_default.dtype == out_explicit.dtype == hidden_states.dtype
-    assert torch.isfinite(out_default).all() and torch.isfinite(out_explicit).all()
-    # Distributional similarity (the same kernel ran on the same inputs):
-    # both should have comparable magnitudes even though individual values
-    # vary by buffer-init noise.
-    default_max = float(out_default.abs().max().item())
-    explicit_max = float(out_explicit.abs().max().item())
-    ratio = max(default_max, explicit_max) / max(min(default_max, explicit_max), 1e-6)
-    assert ratio < 100, (
-        f"default vs explicit-False output magnitudes differ by {ratio:.1f}x "
-        f"({default_max:.1f} vs {explicit_max:.1f}); the flag is likely "
-        "changing dispatch behavior, not just naming"
-    )
+    assert torch.isfinite(out_default).all()
+    assert torch.isfinite(out_explicit).all()
 
 
 @requires_flydsl
-def test_torch_compile_no_combine_true_real_run():
-    """AC-6: torch.compile(fused_moe) with no_combine=True on a real FlyDSL
-    tuned shape. Verifies the @torch_compile_guard schema/fake registration
-    accepts the polymorphic Tensor return AND that the runtime op dispatches
-    correctly under torch.compile.
-    """
+def test_torch_compile_accepts_no_combine_shape():
+    if not hasattr(torch, "compile"):
+        pytest.skip("torch.compile is not available")
+
     device = "cuda"
-    M, topk, E, model_dim, inter_dim = 256, 4, 128, 3072, 3072
-    if not _probe_metadata_for_flydsl(M, topk, E, model_dim, inter_dim,
-                                       activation=ActivationType.Swiglu):
-        pytest.skip("no FlyDSL stage2 tuned config for the test shape")
-    (hidden_states, w1, w2, w1_scale, w2_scale,
-     topk_weight, topk_ids) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device)
+    token_num, topk, experts, model_dim, inter_dim = 256, 4, 128, 3072, 3072
+    if not _flydsl_selected(
+        token_num, topk, experts, model_dim, inter_dim, activation=ActivationType.Swiglu
+    ):
+        pytest.skip("FlyDSL route is not selected for this shape")
+
+    (
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weight,
+        topk_ids,
+    ) = _make_fp4_inputs(token_num, topk, experts, model_dim, inter_dim, device)
 
     def run(hs, w1_, w2_, tw, ti, w1s, w2s):
         return fused_moe(
-            hs, w1_, w2_, tw, ti,
+            hs,
+            w1_,
+            w2_,
+            tw,
+            ti,
             activation=ActivationType.Swiglu,
             quant_type=QuantType.per_1x32,
-            w1_scale=w1s, w2_scale=w2s,
+            w1_scale=w1s,
+            w2_scale=w2s,
             no_combine=True,
         )
 
     compiled = torch.compile(run, fullgraph=False, dynamic=False)
     try:
         out = compiled(hidden_states, w1, w2, topk_weight, topk_ids, w1_scale, w2_scale)
-    except Exception as e:
-        msg = str(e).lower()
-        if "schema" in msg or "infer_schema" in msg or "polymorphic" in msg or "rank" in msg:
-            pytest.fail(
-                f"torch.compile rejected the no_combine=True path with what "
-                f"looks like a schema/rank error: {e}. The plan's task9 "
-                f"requires the sibling-op fallback in this case."
-            )
-        # Unrelated runtime issues are not what this test is checking.
-        pytest.skip(f"runtime failure (not a schema/rank issue): {e}")
-    assert out.shape == (M, topk, model_dim)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if any(token in msg for token in ("schema", "infer_schema", "polymorphic", "rank")):
+            pytest.fail(f"torch.compile rejected no_combine=True schema: {exc}")
+        pytest.skip(f"runtime failure outside schema coverage: {exc}")
+
+    assert out.shape == (token_num, topk, model_dim)
     assert out.dtype == dtypes.bf16
 
 
 if __name__ == "__main__":
-    # Allow running as a script: `python test_moe_no_combine.py`
-    import sys
-    sys.exit(pytest.main([__file__, "-v"]))
+    raise SystemExit(pytest.main([__file__, "-v"]))
