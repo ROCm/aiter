@@ -327,10 +327,20 @@ def compile_moe_gemm1(
     _async_tag = "_async" if use_async_copy else ""
     _wpe_tag = f"_wpe{waves_per_eu}" if waves_per_eu >= 1 else ""
     _bnt_tag = f"_bnt{b_nt}" if b_nt != 2 else ""
+
+    _w_rows_per_expert_static = int(inter_dim) if not use_g1u1 else int(2 * inter_dim)
+    _w_storage_elem_bytes = 2 if is_f16_or_bf16 else 1
+    _w_physical_k_bytes_static = int(model_dim) * _w_storage_elem_bytes
+    _w_nbytes_static = (
+        int(experts) * _w_rows_per_expert_static * _w_physical_k_bytes_static
+    )
+    _use_wptr64 = _w_nbytes_static >= (1 << 31)
+    _wptr64_tag = "_wptr64" if _use_wptr64 else ""
+
     module_name = (
         f"mfma_moe1_{g1u_tag}_{in_dtype}_{out_dtype}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}"
-        f"_abi5_csh16"  # keep MFMA16 CShuffle isolated from MFMA32 epilogue scheduling
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_wptr64_tag}"
+        f"_abi6_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
@@ -561,6 +571,32 @@ def compile_moe_gemm1(
                 )
 
                 w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+
+                if _use_wptr64:
+                    from flydsl._mlir.dialects import fly as _fly
+
+                    _llvm_ptr_ty_as1 = ir.Type.parse("!llvm.ptr<1>")
+                    w_base_ptr = _fly.extract_aligned_pointer_as_index(
+                        _llvm_ptr_ty_as1, arg_w
+                    )
+                    _kpack_elems_b = int(kpack_bytes) // int(w_elem_bytes)
+                    _stride_nlane_b = arith.constant(_kpack_elems_b, index=True)
+                    _stride_klane_b = arith.constant(
+                        16 * _kpack_elems_b, index=True
+                    )
+                    _stride_k0_b = arith.constant(
+                        64 * _kpack_elems_b, index=True
+                    )
+                    _c_k_bytes_b = k_in * arith.constant(
+                        int(w_elem_bytes), index=True
+                    )
+                    _c_k0_b = _c_k_bytes_b // arith.constant(64, index=True)
+                    _stride_n0_b = _c_k0_b * _stride_k0_b
+                else:
+                    w_base_ptr = None
+                    _llvm_ptr_ty_as1 = None
+                    _stride_n0_b = _stride_k0_b = None
+                    _stride_klane_b = _stride_nlane_b = None
 
                 # OUT: [tokens, topk, inter] f16/bf16 -> bytes = tokens*topk*inter*out_elem_bytes
                 out_elem_bytes = 2  # f16/bf16
@@ -794,7 +830,71 @@ def compile_moe_gemm1(
                 _num_b_loads = _num_b_loads_gate * (2 if use_g1u1 else 1)
 
                 # --- B Load Logic (K64) - shared layout with preshuffle GEMM ---
+                def _load_b_gep_vec_i32(*, n_blk, k0, k1, n_intra, load_bytes):
+                    elem_idx_i = (
+                        n_blk * _stride_n0_b
+                        + k0 * _stride_k0_b
+                        + k1 * _stride_klane_b
+                        + n_intra * _stride_nlane_b
+                    )
+                    byte_idx = elem_idx_i * arith.constant(
+                        int(w_elem_bytes), index=True
+                    )
+                    ptr = llvm.GEPOp(
+                        _llvm_ptr_ty_as1,
+                        w_base_ptr,
+                        [arith.index_cast(T.i64, byte_idx)],
+                        [-2147483648],
+                        T.i8,
+                        llvm.GEPNoWrapFlags.none,
+                    ).result
+                    vec_width = load_bytes // 4
+                    return llvm.LoadOp(
+                        T.vec(vec_width, T.i32), ptr, alignment=load_bytes
+                    ).result
+
+                def _load_b_pack_k32_via_gep(*, base_k, ki_step, n_blk, n_intra):
+                    c64_idx = arith.constant(64, index=True)
+                    base_k_bytes = base_k * arith.constant(
+                        int(w_elem_bytes), index=True
+                    )
+                    k0_base = base_k_bytes // c64_idx
+                    k0 = k0_base + arith.constant(ki_step // 2, index=True)
+                    k1 = lane_div_16
+
+                    raw_vec = _load_b_gep_vec_i32(
+                        n_blk=n_blk, k0=k0, k1=k1, n_intra=n_intra,
+                        load_bytes=int(kpack_bytes),
+                    )
+                    half = ki_step % 2
+                    if half == 0:
+                        d0 = vector.extract(
+                            raw_vec, static_position=[0], dynamic_position=[]
+                        )
+                        d1 = vector.extract(
+                            raw_vec, static_position=[1], dynamic_position=[]
+                        )
+                    else:
+                        d0 = vector.extract(
+                            raw_vec, static_position=[2], dynamic_position=[]
+                        )
+                        d1 = vector.extract(
+                            raw_vec, static_position=[3], dynamic_position=[]
+                        )
+                    v2 = vector.from_elements(T.vec(2, T.i32), [d0, d1])
+                    v64 = vector.bitcast(T.vec(1, T.i64), v2)
+                    return vector.extract(
+                        v64, static_position=[0], dynamic_position=[]
+                    )
+
                 def load_b_pack(base_k, ki_step, ni, blk_list, intra_list):
+                    if _use_wptr64:
+                        return _load_b_pack_k32_via_gep(
+                            base_k=base_k,
+                            ki_step=ki_step,
+                            n_blk=blk_list[ni],
+                            n_intra=intra_list[ni],
+                        )
                     return load_b_pack_k32(
                         buffer_ops,
                         arith,
@@ -1977,10 +2077,19 @@ def compile_moe_gemm2(
     _async_tag2 = "_async" if use_async_copy else ""
     _wpe_tag2 = f"_wpe{waves_per_eu}" if waves_per_eu >= 1 else ""
     _bnt_tag2 = f"_bnt{b_nt}" if b_nt != 2 else ""
+
+    _w_storage_elem_bytes_s2 = 2 if is_f16_or_bf16 else 1
+    _w_physical_k_bytes_static_s2 = int(inter_dim) * _w_storage_elem_bytes_s2
+    _w_nbytes_static_s2 = (
+        int(experts) * int(model_dim) * _w_physical_k_bytes_static_s2
+    )
+    _use_wptr64 = _w_nbytes_static_s2 >= (1 << 31)
+    _wptr64_tag = "_wptr64" if _use_wptr64 else ""
+
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}"
-        f"_abi4"  # keep CShuffle block-size mapping aligned with dynamic thread count
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}"
+        f"_abi5_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
     ).replace("-", "_")
 
     # ── CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel
@@ -2149,6 +2258,32 @@ def compile_moe_gemm2(
             )
 
             w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
+
+            if _use_wptr64:
+                from flydsl._mlir.dialects import fly as _fly
+
+                _llvm_ptr_ty_as1 = ir.Type.parse("!llvm.ptr<1>")
+                w_base_ptr = _fly.extract_aligned_pointer_as_index(
+                    _llvm_ptr_ty_as1, arg_w
+                )
+                _kpack_elems_b = int(kpack_bytes) // int(w_elem_bytes)
+                _stride_nlane_b = arith.constant(_kpack_elems_b, index=True)
+                _stride_klane_b = arith.constant(
+                    16 * _kpack_elems_b, index=True
+                )
+                _stride_k0_b = arith.constant(
+                    64 * _kpack_elems_b, index=True
+                )
+                _c_k_bytes_b = k_in * arith.constant(
+                    int(w_elem_bytes), index=True
+                )
+                _c_k0_b = _c_k_bytes_b // arith.constant(64, index=True)
+                _stride_n0_b = _c_k0_b * _stride_k0_b
+            else:
+                w_base_ptr = None
+                _llvm_ptr_ty_as1 = None
+                _stride_n0_b = _stride_k0_b = None
+                _stride_klane_b = _stride_nlane_b = None
 
             # OUT: [tokens, model_dim] -> clamp to descriptor max (i32 bytes) to avoid overflow on huge tokens.
             out_elem_bytes = 4 if out_is_f32 else 2
@@ -2374,7 +2509,71 @@ def compile_moe_gemm2(
                 _num_b_loads2 = k_unroll * 2 * num_acc_n
 
                 # --- B Load Logic (K64) ---
+                def _load_b_gep_vec_i32(*, n_blk, k0, k1, n_intra, load_bytes):
+                    elem_idx_i = (
+                        n_blk * _stride_n0_b
+                        + k0 * _stride_k0_b
+                        + k1 * _stride_klane_b
+                        + n_intra * _stride_nlane_b
+                    )
+                    byte_idx = elem_idx_i * arith.constant(
+                        int(w_elem_bytes), index=True
+                    )
+                    ptr = llvm.GEPOp(
+                        _llvm_ptr_ty_as1,
+                        w_base_ptr,
+                        [arith.index_cast(T.i64, byte_idx)],
+                        [-2147483648],
+                        T.i8,
+                        llvm.GEPNoWrapFlags.none,
+                    ).result
+                    vec_width = load_bytes // 4
+                    return llvm.LoadOp(
+                        T.vec(vec_width, T.i32), ptr, alignment=load_bytes
+                    ).result
+
+                def _load_b_pack_k32_via_gep(*, base_k, ki_step, n_blk, n_intra):
+                    c64_idx = arith.constant(64, index=True)
+                    base_k_bytes = base_k * arith.constant(
+                        int(w_elem_bytes), index=True
+                    )
+                    k0_base = base_k_bytes // c64_idx
+                    k0 = k0_base + arith.constant(ki_step // 2, index=True)
+                    k1 = lane_div_16
+
+                    raw_vec = _load_b_gep_vec_i32(
+                        n_blk=n_blk, k0=k0, k1=k1, n_intra=n_intra,
+                        load_bytes=int(kpack_bytes),
+                    )
+                    half = ki_step % 2
+                    if half == 0:
+                        d0 = vector.extract(
+                            raw_vec, static_position=[0], dynamic_position=[]
+                        )
+                        d1 = vector.extract(
+                            raw_vec, static_position=[1], dynamic_position=[]
+                        )
+                    else:
+                        d0 = vector.extract(
+                            raw_vec, static_position=[2], dynamic_position=[]
+                        )
+                        d1 = vector.extract(
+                            raw_vec, static_position=[3], dynamic_position=[]
+                        )
+                    v2 = vector.from_elements(T.vec(2, T.i32), [d0, d1])
+                    v64 = vector.bitcast(T.vec(1, T.i64), v2)
+                    return vector.extract(
+                        v64, static_position=[0], dynamic_position=[]
+                    )
+
                 def load_b_pack(base_k, ki_step, ni):
+                    if _use_wptr64:
+                        return _load_b_pack_k32_via_gep(
+                            base_k=base_k,
+                            ki_step=ki_step,
+                            n_blk=n_blk_list[ni],
+                            n_intra=n_intra_list[ni],
+                        )
                     return load_b_pack_k32(
                         buffer_ops,
                         arith,
