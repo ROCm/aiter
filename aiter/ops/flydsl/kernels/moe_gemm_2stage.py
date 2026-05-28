@@ -3652,6 +3652,8 @@ def compile_moe_reduction(
         f"_{dtype_str}_topk{topk}_md{model_dim}"
     )
 
+    elem_bytes_c = (32 if dtype_str == "f32" else 16) // 8
+
     if True:
 
         @flyc.kernel(name=module_name)
@@ -3665,28 +3667,41 @@ def compile_moe_reduction(
             m_tokens = fx.Index(i32_m_tokens)
             c_topk = fx.Index(topk)
             c_model_dim = fx.Index(model_dim)
-            topk_ids_nbytes_idx = m_tokens * c_topk * fx.Index(4)
             elem_bits = 32 if dtype_str == "f32" else 16
             copy_vec_width = 128 // elem_bits  # 8 for f16/bf16, 4 for f32
             n_sub = VEC_WIDTH // copy_vec_width  # 1 for f16/bf16, 2 for f32
-            # Buffer-backed tensors via layout API (all dtypes)
-            X_buf = fx.rocdl.make_buffer_tensor(X)
-            Y_buf = fx.rocdl.make_buffer_tensor(Y)
-            # Scalar buffer resources for tail path and the fused EP gather
-            x_rsrc = buffer_ops.create_buffer_resource(X, max_size=True)
-            y_rsrc = buffer_ops.create_buffer_resource(Y, max_size=True)
-            # topk_ids: [tokens, topk] i32 ; expert_mask: [num_experts] i32
-            # (num_experts is not a compile-time constant — use max_size=True)
-            topk_ids_rsrc = buffer_ops.create_buffer_resource(
-                topk_ids, max_size=False, num_records_bytes=topk_ids_nbytes_idx
-            )
-            expert_mask_rsrc = buffer_ops.create_buffer_resource(
-                expert_mask, max_size=True
-            )
 
             token_idx = gpu.block_id("x")
             tile_idx = gpu.block_id("y")
             tid = gpu.thread_id("x")
+
+            # ── 64-bit base-offset folding ─────────────────────────────────
+            # X is [m_tokens, topk, model_dim]; total bytes can exceed 4 GiB
+            # for large batches (e.g. 131072 * 6 * 4096 * 2 = 6 GiB), which
+            # overflows the i32 voffset used by buffer_load. To stay i32-safe,
+            # fold the per-WG token offset into the descriptor's 48-bit base
+            # pointer via base_byte_offset (computed in i64). The in-kernel
+            # voffsets then only need to address one token's slab
+            # (topk*model_dim*elem_bytes ≤ a few hundred KiB).
+            slab_elems_x = c_topk * c_model_dim
+            x_base_off_i64 = fx.Int64(token_idx * slab_elems_x * fx.Index(elem_bytes_c))
+            y_base_off_i64 = fx.Int64(token_idx * c_model_dim * fx.Index(elem_bytes_c))
+
+            x_rsrc = buffer_ops.create_buffer_resource(
+                X, max_size=True, base_byte_offset=x_base_off_i64
+            )
+            y_rsrc = buffer_ops.create_buffer_resource(
+                Y, max_size=True, base_byte_offset=y_base_off_i64
+            )
+
+            if const_expr(use_mask):
+                tk_base_off_i64 = fx.Int64(token_idx * c_topk * fx.Index(4))
+                topk_ids_rsrc = buffer_ops.create_buffer_resource(
+                    topk_ids, max_size=True, base_byte_offset=tk_base_off_i64
+                )
+                expert_mask_rsrc = buffer_ops.create_buffer_resource(
+                    expert_mask, max_size=True
+                )
 
             # Guard: token in range (Index is unsigned → auto ult)
             tok_ok = token_idx < m_tokens
@@ -3706,12 +3721,10 @@ def compile_moe_reduction(
                     end_ok = col_base + c_vecw <= c_model_dim
                     _if_full = scf.IfOp(end_ok, has_else=True)
                     with _if_then(_if_full):
-                        # ── Vector path via layout API (all dtypes) ──
-                        # fx.copy auto-iterates when atom width < VEC_WIDTH
-                        # (e.g. f32: BufferCopy128b handles 4, fx.copy issues 2 calls for 8)
-                        copy_atom = fx.make_copy_atom(
-                            fx.rocdl.BufferCopy128b(), elem_bits
-                        )
+                        # ── Vector path via direct buffer_load ──
+                        # Use buffer_load with vec_width=copy_vec_width
+                        # (8 elems for bf16/f16 = 128b; 4 elems for f32 = 128b).
+                        # n_sub iterations cover the full VEC_WIDTH stride.
                         vec_type_c = T.vec(copy_vec_width, compute_type())
                         vec_type_e = T.vec(copy_vec_width, elem_type())
 
@@ -3719,31 +3732,17 @@ def compile_moe_reduction(
                             vector.broadcast(vec_type_c, fx.Float32(0.0).ir_value())
                             for _ in range(n_sub)
                         ]
-                        reg_ty = fx.MemRefType.get(
-                            elem_type(),
-                            fx.LayoutType.get(copy_vec_width, 1),
-                            fx.AddressSpace.Register,
-                        )
-                        reg_lay = fx.make_layout(copy_vec_width, 1)
-
-                        tok_i32 = fx.Int32(token_idx)
-                        tile_i32 = fx.Int32(tile_idx)
-                        tid_i32 = fx.Int32(tid)
 
                         for k in range_constexpr(topk):
-                            # X[token, k, :] → tile → thread's VEC_WIDTH slice
-                            x_row = X_buf[tok_i32, fx.Int32(k), None]
-                            x_tiled = fx.logical_divide(
-                                x_row, fx.make_layout(tile_cols, 1)
-                            )
-                            x_div = fx.logical_divide(
-                                x_tiled[None, tile_i32], fx.make_layout(VEC_WIDTH, 1)
-                            )
-                            x_thread = x_div[None, tid_i32]
+                            # X slab base for this (token, k) — within one token's
+                            # slab, k indexes the topk dim with stride model_dim.
+                            # elem offset = k*model_dim + col_base + si*copy_vec_width
+                            k_off_elems = fx.Index(k) * c_model_dim + col_base
 
                             if const_expr(use_mask):
                                 # Fused EP gather: valid = expert_mask[topk_ids[token, k]] != 0
-                                tk_idx_i32 = fx.Int32(token_idx * c_topk + fx.Index(k))
+                                # topk_ids_rsrc is already shifted by token_idx*topk
+                                tk_idx_i32 = fx.Int32(fx.Index(k))
                                 eid_i32 = buffer_ops.buffer_load(
                                     topk_ids_rsrc,
                                     tk_idx_i32,
@@ -3758,19 +3757,16 @@ def compile_moe_reduction(
                                 )
                                 mv_ok = valid_i32 != fx.Int32(0)
 
-                            if const_expr(n_sub > 1):
-                                x_inner = fx.logical_divide(
-                                    x_thread, fx.make_layout(copy_vec_width, 1)
-                                )
                             for si in range_constexpr(n_sub):
-                                src = (
-                                    x_inner[None, fx.Int32(si)]
-                                    if n_sub > 1
-                                    else x_thread
+                                off_elems_i32 = fx.Int32(
+                                    k_off_elems + fx.Index(si * copy_vec_width)
                                 )
-                                r = fx.memref_alloca(reg_ty, reg_lay)
-                                fx.copy_atom_call(copy_atom, src, r)
-                                vec_e = fx.memref_load_vec(r)
+                                vec_e = buffer_ops.buffer_load(
+                                    x_rsrc,
+                                    off_elems_i32,
+                                    vec_width=copy_vec_width,
+                                    dtype=elem_type(),
+                                )
 
                                 if const_expr(use_mask):
                                     zero_e = vector.broadcast(
@@ -3786,57 +3782,29 @@ def compile_moe_reduction(
                                 acc_vecs[si] = acc_vecs[si] + vec_c
 
                         # ── Store results ──
-                        if const_expr(n_sub > 1):
-                            y_row = Y_buf[tok_i32, None]
-                            y_tiled = fx.logical_divide(
-                                y_row, fx.make_layout(tile_cols, 1)
-                            )
-                            y_div = fx.logical_divide(
-                                y_tiled[None, tile_i32], fx.make_layout(VEC_WIDTH, 1)
-                            )
-                            y_inner = fx.logical_divide(
-                                y_div[None, tid_i32], fx.make_layout(copy_vec_width, 1)
-                            )
-
                         for si in range_constexpr(n_sub):
                             out_vec = acc_vecs[si]
                             if const_expr(elem_bits < 32):
                                 out_vec = out_vec.truncf(vec_type_e)
-
-                            if const_expr(n_sub > 1):
-                                dst = y_inner[None, fx.Int32(si)]
-                            else:
-                                y_row = Y_buf[tok_i32, None]
-                                y_tiled = fx.logical_divide(
-                                    y_row, fx.make_layout(tile_cols, 1)
-                                )
-                                y_div = fx.logical_divide(
-                                    y_tiled[None, tile_i32],
-                                    fx.make_layout(VEC_WIDTH, 1),
-                                )
-                                dst = y_div[None, tid_i32]
-
-                            r_out = fx.memref_alloca(reg_ty, reg_lay)
-                            fx.memref_store_vec(out_vec, r_out)
-                            fx.copy_atom_call(copy_atom, r_out, dst)
+                            y_off_elems_i32 = fx.Int32(
+                                col_base + fx.Index(si * copy_vec_width)
+                            )
+                            buffer_ops.buffer_store(out_vec, y_rsrc, y_off_elems_i32)
 
                     with _if_else(_if_full):
-                        # Tail path: scalar load/store per lane.
+                        # Tail path: scalar load/store per lane. All offsets
+                        # are now slab-local (token_idx folded into base ptr).
                         for lane in range_constexpr(VEC_WIDTH):
                             col = col_base + fx.Index(lane)
                             lane_ok = col < c_model_dim
                             _if_lane = scf.IfOp(lane_ok)
                             with _if_then(_if_lane):
                                 a = arith.constant(0.0, type=compute_type())
-                                token_base = token_idx * c_topk
                                 for k in range_constexpr(topk):
                                     k_idx = fx.Index(k)
-                                    x_idx_i32 = fx.Int32(
-                                        (token_base + k_idx) * c_model_dim + col
-                                    )
+                                    x_idx_i32 = fx.Int32(k_idx * c_model_dim + col)
                                     if const_expr(use_mask):
-                                        # Fused EP gather (tail): expert_mask[topk_ids[t,k]] != 0
-                                        tk_idx_i32 = fx.Int32(token_base + k_idx)
+                                        tk_idx_i32 = fx.Int32(k_idx)
                                         eid_i32 = buffer_ops.buffer_load(
                                             topk_ids_rsrc,
                                             tk_idx_i32,
@@ -3872,7 +3840,7 @@ def compile_moe_reduction(
                                 out = a
                                 if const_expr(dtype_str in ("f16", "bf16")):
                                     out = out.truncf(elem_type())
-                                y_idx_i32 = fx.Int32(token_idx * c_model_dim + col)
+                                y_idx_i32 = fx.Int32(col)
                                 buffer_ops.buffer_store(out, y_rsrc, y_idx_i32)
 
     # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
