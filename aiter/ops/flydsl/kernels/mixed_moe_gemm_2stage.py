@@ -2702,12 +2702,14 @@ def compile_mixed_moe_gemm1(
         tile2_pad = 0
         if const_expr(not gate_only):
             tile_k_stage2 = 256
-            tile2_pad = tile_k - (inter_dim - inter_dim_pad) % tile_k
+            tile2_pad = tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
 
         inter_in = arith.index_cast(ir.IndexType.get(), i32_inter_in.ir_value())
         tile_n_index = arith.constant(tile_n, index=True)
         if const_expr(mock_gate_only or gate_up_interleave):
-            gx = (inter_in - inter_dim_pad_total + tile2_pad + tile_n_index - 1) / tile_n_index
+            gx = (
+                inter_in - inter_dim_pad_total + tile2_pad + tile_n_index - 1
+            ) / tile_n_index
         else:
             gx = (
                 (inter_in - inter_dim_pad_total + tile2_pad + 2 * tile_n_index - 1)
