@@ -195,9 +195,6 @@ def compile_mixed_moe_gemm1(
     #   model_dim = model_dim_true + model_dim_pad   (K direction)
     #   inter_dim = inter_dim_true + inter_dim_pad   (N direction)
     # Tensor sizes use the padded dimensions (inter_dim, model_dim).
-    # Both pads are runtime SSA values: inter_dim_pad drives grid math;
-    # model_dim_pad is not consumed by stage1 (weight pad region is zero so
-    # running the full k_unroll is correct).
 
     # Split-K validation
     _is_splitk = k_batch > 1
@@ -523,10 +520,7 @@ def compile_mixed_moe_gemm1(
                 _c1_sw = arith.constant(1, index=True)
                 _c_tn_sw = arith.constant(tile_n, index=True)
                 _c2_idp_sw = arith.constant(2, index=True) * inter_dim_pad_idx
-                # Must match the launcher's `gx` formula exactly, including
-                # `_tile2_pad` (stage1 output rounded up to tile_k for stage2's
-                # K alignment). Otherwise the swizzle remap puts CTAs at wrong
-                # positions when xcd_swizzle > 0 and tile2_pad != 0.
+
                 if const_expr(not gate_only):
                     _c_tile_k_sw = arith.constant(tile_k, index=True)
                     _c_inter_dim_sw = arith.constant(inter_dim, index=True)
@@ -534,6 +528,7 @@ def compile_mixed_moe_gemm1(
                     _tile2_pad_sw = _c_tile_k_sw - (_inter_valid_sw % _c_tile_k_sw)
                 else:
                     _tile2_pad_sw = arith.constant(0, index=True)
+
                 if const_expr(mock_gate_only or gate_up_interleave):
                     _gx = (n_in - _c2_idp_sw + _tile2_pad_sw + _c_tn_sw - _c1_sw) / _c_tn_sw
                 else:
@@ -867,12 +862,6 @@ def compile_mixed_moe_gemm1(
                 m_repeat_packed = m_repeat // pack_M
                 num_acc_n_packed = num_acc_n // pack_N
 
-                # Runtime K-tail bound.
-                # Equivalent to the AOT computation:
-                #   _pad_k_elems = (model_dim_pad % tile_k) if not _is_splitk else 0
-                #   _pad_ku_skip = _pad_k_elems // _K_per_ku
-                #   _tail_ku     = k_unroll - _pad_ku_skip
-                # Now computed at runtime as an index SSA. None when split-K (no K-tail).
                 _K_per_ku = tile_k // k_unroll
                 if const_expr(_is_splitk):
                     _tail_ku_idx = None
@@ -1209,13 +1198,6 @@ def compile_mixed_moe_gemm1(
 
                 # Compute tile: gate + up MFMA interleaved, same A data, different B data.
                 # Two accumulator sets; after all K tiles, acc = acc_gate + acc_up (f32 add).
-                # K-tail handling: when called for the K-tail (last K-tile) and
-                # `runtime_tail_ku_idx` is provided, each mfma's accumulator update
-                # is wrapped in scf.if(k_idx < runtime_tail_ku_idx). This skips the
-                # mfma issue for K micro-blocks that fall entirely in K-padding
-                # region (model_dim_pad). When runtime_tail_ku_idx is None (hot
-                # loop's middle compute), no guards are inserted -- code path
-                # identical to original.
                 def compute_tile(
                     acc_gate_in,
                     acc_up_in,
@@ -1334,10 +1316,12 @@ def compile_mixed_moe_gemm1(
                             for ikxdl in range_constexpr(pack_K):
                                 k_idx = ku128 * pack_K + ikxdl
                                 if const_expr(k_idx < ku_count):
-                                    # Build per-k_idx runtime guard once. The
-                                    # `if const_expr(...)` wrap prevents flydsl's
-                                    # AST rewriter from converting this Python-time
-                                    # if into scf_if_dispatch.
+                                    # NOTE: `const_expr(... is None)` wrap is REQUIRED.
+                                    # Without it, flydsl's AST rewriter (see
+                                    # ast_rewriter.py::visit_If) turns Python-time
+                                    # `if`s into `scf_if_dispatch` + extracted then/else
+                                    # functions whose closure misses `_rt_guard` ->
+                                    # NameError at compile time.
                                     if const_expr(runtime_tail_ku_idx is None):
                                         _rt_guard = None
                                     else:
@@ -2794,12 +2778,6 @@ def compile_mixed_moe_gemm1(
             ir.IndexType.get(), i32_inter_dim_pad_in.ir_value()
         )
         inter_dim_pad_total = arith.constant(2, index=True) * _inter_dim_pad_idx
-        # tile2_pad rounds the valid output (inter_dim - inter_dim_pad) up to tile_k
-        # boundary so stage2 can consume it as K-aligned input. Computed at runtime
-        # since inter_dim_pad is now dynamic. inter_dim here is the compile-time
-        # padded inter_dim and matches i32_inter_in at runtime modulo fp4 doubling
-        # (which doesn't affect the (inter - pad) modulo arithmetic when used with
-        # tile_k since fp4 doubles both `inter_in` and tile_n consistently).
         if const_expr(not gate_only):
             _c_tile_k_l = arith.constant(tile_k, index=True)
             _c_inter_dim_l = arith.constant(inter_dim, index=True)
@@ -3652,9 +3630,7 @@ def compile_mixed_moe_gemm2(
                 num_acc_n_packed = num_acc_n // pack_N
 
                 _K_per_ku_s2 = tile_k // k_unroll
-                # Runtime K-tail bound (matches stage1's pattern).
-                # Stage2's K direction is inter_dim, so the K-tail skip is driven
-                # by inter_dim_pad.
+
                 _c_tile_k_ku_s2 = arith.constant(tile_k, index=True)
                 _c_K_per_ku_s2 = arith.constant(_K_per_ku_s2, index=True)
                 _c_k_unroll_idx_s2 = arith.constant(k_unroll, index=True)
@@ -3898,13 +3874,6 @@ def compile_mixed_moe_gemm2(
                     )
                     return a0, a1
 
-                # K-tail handling: when called for the K-tail (last K-tile) and
-                # `runtime_tail_ku_idx` is provided, each mfma's accumulator update
-                # is wrapped in scf.if(k_idx < runtime_tail_ku_idx). This skips the
-                # mfma issue for K micro-blocks that fall entirely in K-padding
-                # region (inter_dim_pad). When runtime_tail_ku_idx is None (hot
-                # loop's middle compute), no guards are inserted -- code path
-                # identical to original.
                 def compute_tile(
                     acc_in,
                     b_tile_in,
