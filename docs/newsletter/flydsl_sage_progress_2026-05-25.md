@@ -37,23 +37,23 @@ Port the Triton sage attention v1 kernel to FlyDSL and achieve ≥1.10× Triton 
 
 Benchmark command: `HIP_VISIBLE_DEVICES=0 python op_tests/flydsl_tests/bench_flydsl_sage.py --warmup 100 --rep 300 --speed-only`
 
-"Attn TFLOPS" = attention kernel only (pre-quantized inputs, no quant overhead).
+"Attn TFLOPS" = attention kernel only (pre-quantized inputs, no quant overhead). Causal shapes show N/A for Triton because Triton's causal path is unavailable on this build, so there are no Triton-causal pre-quantized tensors to benchmark against.
 
 | Shape | Triton TFLOPS | Triton attn TFLOPS | FlyDSL TFLOPS | FlyDSL attn TFLOPS | FlyDSL / Triton |
 |---|---|---|---|---|---|
-| B=1, S=1024, H=8, fwd | 35.48 | N/A | 52.70 | 146.59 | **1.49×** |
-| B=1, S=3000, H=8, fwd | 231.47 | N/A | 366.34 | 521.21 | **1.58×** |
-| B=1, S=4096, H=8, fwd | 364.50 | N/A | 549.13 | 741.04 | **1.51×** |
-| B=1, S=8192, H=8, fwd | 833.60 | 1213.10 | 946.28 | 1272.65 | **1.14×** |
-| B=1, S=4096, Hq=16/Hk=4, fwd | 705.33 | 1112.49 | 897.38 | 1228.53 | **1.27×** |
-| B=2, S=4096, Hq=16/Hk=4, fwd | 772.33 | 1177.78 | 1010.25 | 1261.94 | **1.31×** |
-| B=2, S=4096, H=8, fwd | 534.12 | 1103.03 | 817.24 | 1177.56 | **1.53×** |
-| B=1, S=16384, H=8, fwd | 1129.30 | 1323.03 | 1213.85 | 1386.77 | **1.07×** |
-| B=1, S=16384, H=24, fwd | 1198.58 | 1346.83 | 1233.87 | 1408.24 | **1.03×** |
-| B=1, S=75600, H=5, fwd | 1439.03 | 1488.34 | 1433.83 | 1493.33 | **1.00×** |
+| B=1, S=1024, H=8, fwd | 34.08 | 111.15 | 51.74 | 125.90 | **1.52×** |
+| B=1, S=3000, H=8, fwd | 231.28 | 408.63 | 365.45 | 456.22 | **1.58×** |
+| B=1, S=4096, H=8, fwd | 364.28 | 629.99 | 541.62 | 668.84 | **1.49×** |
+| B=1, S=8192, H=8, fwd | 829.98 | 1216.80 | 944.19 | 1274.42 | **1.14×** |
+| B=1, S=4096, Hq=16/Hk=4, fwd | 705.49 | 1118.66 | 896.45 | 1231.43 | **1.27×** |
+| B=2, S=4096, Hq=16/Hk=4, fwd | 772.82 | 1176.79 | 1013.17 | 1265.37 | **1.31×** |
+| B=2, S=4096, H=8, fwd | 532.63 | 1109.18 | 817.82 | 1182.69 | **1.54×** |
+| B=1, S=16384, H=8, fwd | 1130.76 | 1310.22 | 1210.87 | 1390.59 | **1.07×** |
+| B=1, S=16384, H=24, fwd | 1199.28 | 1338.58 | 1254.73 | 1415.35 | **1.05×** |
+| B=1, S=75600, H=5, fwd | 1443.87 | 1487.28 | 1436.70 | 1485.74 | **1.00×** |
 | **Geomean** | | | | | **~1.35× Triton** |
 
-Note: causal shapes (S=4096, S=8192) show FAILED for Triton in the bench — Triton's causal path is unavailable on this build; FlyDSL causal numbers (164 TFLOPS at S=4096, 374 TFLOPS at S=8192) are measured vs SDPA only. Triton attn TFLOPS for short-S shapes (S≤4096) also show N/A because Triton's causal path failure prevents pre-running the JIT warm-up needed to benchmark the raw attn kernel.
+Note: causal shapes (S=4096, S=8192) show FAILED for Triton end-to-end — Triton's causal path is unavailable on this build; FlyDSL causal numbers (164 TFLOPS at S=4096, 374 TFLOPS at S=8192) are measured vs SDPA only.
 
 All 15 tests pass.
 

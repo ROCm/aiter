@@ -266,7 +266,9 @@ def run_speed(shapes, device, warmup, rep):
         q, k, v = _make_qkv(B, S, Hq, Hk, D, device)
         flops = _attn_flops(B, Hq, S, D, causal)
         sm_scale = 1.0 / (D**0.5)
-        block_m = 128 if B * Hq * ((S + 255) // 256) < 256 else 256
+        # Attn-only pre-quant uses BLOCK_M=256 to match Triton's fav3_sage_func
+        # default config; end-to-end wrappers auto-select their own block_m.
+        ATTN_BLOCK_M = 256
 
         # SDPA (fp32 reference) — expand KV heads for GQA
         q_bhsd = q.float().transpose(1, 2).contiguous()
@@ -290,10 +292,10 @@ def run_speed(shapes, device, warmup, rep):
         if prequant_ok:
             try:
                 q_int8, q_scale, k_int8, k_scale, v_fp8, v_scale = _v1_prequant(
-                    q, k, v, sm_scale, block_m
+                    q, k, v, sm_scale, ATTN_BLOCK_M
                 )
-                # Pad seq dim to block_m multiple (mirrors flydsl_sage_attn_func)
-                seq_q_pad = ((S + block_m - 1) // block_m) * block_m
+                # Pad seq dim to ATTN_BLOCK_M multiple
+                seq_q_pad = ((S + ATTN_BLOCK_M - 1) // ATTN_BLOCK_M) * ATTN_BLOCK_M
                 n_pad = seq_q_pad - S
                 if n_pad > 0:
                     q_int8 = torch.nn.functional.pad(
@@ -409,7 +411,7 @@ def run_speed(shapes, device, warmup, rep):
                             seq_q=S,
                             seq_k=S,
                             causal=causal,
-                            block_m=block_m,
+                            block_m=ATTN_BLOCK_M,
                         )
                         torch.cuda.synchronize()
 
@@ -423,7 +425,7 @@ def run_speed(shapes, device, warmup, rep):
                             _sq=S,
                             _sk=S,
                             _c=causal,
-                            _bm=block_m,
+                            _bm=ATTN_BLOCK_M,
                         ):
                             return _flydsl_sage_raw_func(
                                 _qi,
