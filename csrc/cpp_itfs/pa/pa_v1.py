@@ -126,11 +126,7 @@ def paged_attention_v1(
     logits_soft_cap_enabled = logits_soft_cap > 0
     alibi_enabled = alibi_slopes is not None
     sliding_window_enabled = sliding_window > 0
-    # SWA-aware grid sizing: when ctx > sw, the dispatcher rebases each seq's
-    # partition_idx 0 to align_down(ctx_i - sw, partition_size). The worst-case
-    # in-window span across the batch is then sw + (partition_size - 1), so
-    # cdiv(sw, partition_size) + 1 partitions is always sufficient. Falls back
-    # to the original cdiv(ctx, partition_size) when SWA is off or ctx <= sw.
+
     if sliding_window_enabled and max_context_len > sliding_window:
         max_num_partitions = int(math.ceil(sliding_window / partition_size)) + 1
     else:

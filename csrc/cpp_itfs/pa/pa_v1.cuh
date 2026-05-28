@@ -79,12 +79,6 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     constexpr int T_PAR_SIZE = 256;
     const int context_len = context_lens[seq_idx];
 
-    // SWA-aware partition rebase: when SWA is on and context exceeds the
-    // window, partition_idx 0 is anchored at the window's lower bound
-    // (aligned down to T_PAR_SIZE) instead of token 0. This shrinks the
-    // partition grid from O(ctx) to O(sw), eliminating launch + reduce
-    // overhead on out-of-window partitions. Only the in-window partitions
-    // ever launch.
     int partition_offset_token = 0;
     if constexpr (SLIDING_WINDOW_ENABLED) {
         if (sliding_window > 0 && context_len > sliding_window) {

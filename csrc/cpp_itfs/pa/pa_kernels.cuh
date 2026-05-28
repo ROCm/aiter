@@ -95,13 +95,6 @@ _paged_attention_kernel(const int* block_table_seq,
     const int wg_start_kv_head_idx = kv_head_idx;
     const int total_num_heads      = gridDim.z * GQA_RATIO;
 
-    // Note: with SWA enabled, the dispatcher rebases partition_idx 0 to
-    // align_down(context_len - sliding_window, T_PAR_SIZE), so every launched
-    // partition has at least one in-window token. Out-of-window-only partitions
-    // are never launched. Token-level masking (further below in the QK loop)
-    // still handles the few OOW tokens that may live in partition 0 due to the
-    // align-down boundary.
-
     /// NOTICE: We don't support mask for this kernel, so just use a placeholder type/object here.
     using Mask = ck_tile::SimplifiedGenericAttentionMask</*IsMasking=*/false>;
     const Mask mask{/*seqlen_q=*/1, /*seqlen_k=*/context_len};
@@ -920,10 +913,6 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
     const auto MTP      = gridDim.z;
     const auto mtp      = blockIdx.z;
 
-    // SWA-aware effective partition count: partition_idx 0 in the QKV kernel
-    // is anchored at align_down(context_len - sliding_window, PARTITION_SIZE)
-    // when SWA is on and ctx > sw. Match that here so we only iterate over
-    // partitions that actually got launched and populated.
     const int partition_offset_token =
         (sliding_window > 0 && context_len > sliding_window)
             ? ((context_len - sliding_window) / PARTITION_SIZE) * PARTITION_SIZE
@@ -1228,11 +1217,6 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
         kv_head_idx * GQA_RATIO_PER_LOOP; // Jacob: kv_head_idx=0, GQA_RATIO_PER_LOOP=6
     const int wg_start_kv_head_idx = kv_head_idx;
     const int total_num_heads      = gridDim.z * GQA_RATIO;
-
-    // Note: with SWA enabled, the dispatcher rebases partition_idx 0 to
-    // align_down(context_len - sliding_window, T_PAR_SIZE), so every launched
-    // partition has at least one in-window token. Token-level masking handles
-    // OOW tokens that may live in partition 0 due to the align-down boundary.
 
     // HEAD_SIZE=128, cache_t=bf16, blockSize 16/64/256
     constexpr int BYTES_PER_WARP_FETCH = WARP_SIZE * 16; // 1024 bytes
