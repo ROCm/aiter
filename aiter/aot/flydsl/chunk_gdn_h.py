@@ -201,8 +201,7 @@ def _compile_chunk_gdn_h_to_cache(
 
     import torch
 
-    has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
-    dev = torch.device("cuda") if has_cuda else torch.device("cpu")
+    dev = torch.device("cpu")
     torch_dtype = _torch_dtype_for_kernel(dtype)
     state_dtype = torch.bfloat16 if state_bf16 else torch.float32
 
@@ -231,7 +230,7 @@ def _compile_chunk_gdn_h_to_cache(
     cu_seqlens = torch.zeros((N + 1,), device=dev, dtype=torch.int32)
     chunk_offsets = torch.zeros((N + 1,), device=dev, dtype=torch.int32)
 
-    stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
+    stream = fx.Stream(0)
 
     launch_fn = compile_chunk_gated_delta_h(
         K=K,
