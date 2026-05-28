@@ -3,6 +3,7 @@ import triton.experimental.gluon.language as gl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 SCALE_GROUP_ELEMS = 32
+PRESHUFFLE_FACTOR = 32  # rows packed per scale-preshuffle stripe
 
 
 def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
@@ -43,7 +44,20 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
         [[PAD_INTERVAL_A, 16]], [BLOCK_M, BLOCK_K_BYTES], [1, 0]
     )
     shared_B = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
-    shared_S = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+    # Scale staging in LDS — pad rows so parallel lane accesses miss bank conflicts.
+    # K_GROUPS * PRESHUFFLE_FACTOR = BLOCK_K bytes per row (1B per scale).
+    SCALE_ROW = K_GROUPS * PRESHUFFLE_FACTOR
+    PAD_INTERVAL_S = 256 if SCALE_ROW <= 256 else SCALE_ROW
+    shared_AS = gl.PaddedSharedLayout.with_identity_for(
+        [[PAD_INTERVAL_S, 16]],
+        [BLOCK_M // PRESHUFFLE_FACTOR, SCALE_ROW],
+        [1, 0],
+    )
+    shared_BS = gl.PaddedSharedLayout.with_identity_for(
+        [[PAD_INTERVAL_S, 16]],
+        [BLOCK_N // PRESHUFFLE_FACTOR, SCALE_ROW],
+        [1, 0],
+    )
     # Output staging layout for the TDM store (acc -> LDS -> HBM)
     shared_C = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
@@ -64,7 +78,8 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
         "wmma_acc_layout": wmma_acc_layout,
         "shared_A": shared_A,
         "shared_B": shared_B,
-        "shared_S": shared_S,
+        "shared_AS": shared_AS,
+        "shared_BS": shared_BS,
         "shared_C": shared_C,
         "dot_a_layout": dot_a,
         "dot_b_layout": dot_b,
@@ -157,7 +172,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
     wmma_acc_layout: gl.constexpr,
     shared_A: gl.constexpr,
     shared_B: gl.constexpr,
-    shared_S: gl.constexpr,
+    shared_AS: gl.constexpr,
+    shared_BS: gl.constexpr,
     shared_C: gl.constexpr,
     dot_a_layout: gl.constexpr,
     dot_b_layout: gl.constexpr,
@@ -222,7 +238,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
         ),
         strides=(stride_as_m, stride_as_k),
         block_shape=(BLOCK_SIZE_M // PRESHUFFLE_FACTOR, K_GROUPS * PRESHUFFLE_FACTOR),
-        layout=shared_S,
+        layout=shared_AS,
     )
 
     bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -234,7 +250,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
         ),
         strides=(stride_bs_n, stride_bs_k),
         block_shape=(BLOCK_SIZE_N // PRESHUFFLE_FACTOR, K_GROUPS * PRESHUFFLE_FACTOR),
-        layout=shared_S,
+        layout=shared_BS,
     )
 
     # =====================================================================
@@ -255,13 +271,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
     smem_AS = gl.allocate_shared_memory(
         a_scale_ptr.type.element_ty,
         [NUM_BUFFERS, BLOCK_SIZE_M // PRESHUFFLE_FACTOR, K_GROUPS * PRESHUFFLE_FACTOR],
-        layout=shared_S,
+        layout=shared_AS,
     )
 
     smem_BS = gl.allocate_shared_memory(
         b_scale_ptr.type.element_ty,
         [NUM_BUFFERS, BLOCK_SIZE_N // PRESHUFFLE_FACTOR, K_GROUPS * PRESHUFFLE_FACTOR],
-        layout=shared_S,
+        layout=shared_BS,
     )
 
     # Pipelining start
