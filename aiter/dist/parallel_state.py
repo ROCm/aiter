@@ -499,7 +499,7 @@ class GroupCoordinator:
             input_, residual_inp_, weight_, eps, group_size, prefill_support,
             emit_bf16=emit_bf16,
         )
-    
+
     def fused_qknorm_allreduce(
         self,
         qkv_in: torch.Tensor,
@@ -548,7 +548,7 @@ class GroupCoordinator:
             eps,
             prefill_support,
         )
-    
+
     def _fused_qknorm_allreduce_out_place(
         self,
         qkv_in: torch.Tensor,
@@ -590,28 +590,35 @@ class GroupCoordinator:
         use_custom: bool = True,
         dim: int = 0,
     ):
-        # return outplace_reduce_scatter(input_, group_name=self.unique_name, dim=dim)
         world_size = self.world_size
         assert world_size > 1, "error! world_size = 1"
-        assert (
-            input_.numel() % world_size == 0
-        ), "input shape error, input.numel() % world_size should equals to 0"
-        if input_.shape[0] % world_size == 0:
-            out_dim0 = input_.shape[0] // world_size
-            out_shape = (out_dim0,) + input_.shape[1:]
-        else:
-            out_shape = (input_.numel() // world_size,)
-
-        output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
+        if dim < 0:
+            dim += input_.dim()
+        assert input_.shape[dim] % world_size == 0, (
+            f"input.shape[{dim}]={input_.shape[dim]} not divisible by "
+            f"world_size={world_size}"
+        )
         if use_custom:
+            out_shape = list(input_.shape)
+            out_shape[dim] = input_.shape[dim] // world_size
+            output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
             outplace_reduce_scatter(
                 input_, output_, group_name=self.unique_name, dim=dim
             )
+            return output_
         else:
-            torch.distributed.reduce_scatter_tensor(
-                output_, input_, group=self.device_group
+            input_tensor = input_.movedim(dim, 0).contiguous()
+            chunk_size = input_tensor.shape[0] // world_size
+            output_shape = (chunk_size,) + input_tensor.shape[1:]
+            output_tensor = torch.empty(
+                output_shape,
+                dtype=input_tensor.dtype,
+                device=input_tensor.device,
             )
-        return output_
+            torch.distributed.reduce_scatter_tensor(
+                output_tensor, input_tensor, group=self.device_group
+            )
+            return output_tensor.movedim(0, dim).contiguous()
 
     def all_gather(
         self,
@@ -1138,9 +1145,9 @@ class CustomGroupConfig:
 
     Each group is defined by a rank list that can be:
     - 1D List[int]: all ranks form a single communication group,
-      e.g. [0,1,2,3,4,5,6,7] → one TP8 group
+      e.g. [0,1,2,3,4,5,6,7] -> one TP8 group
     - 2D List[List[int]]: multiple independent subgroups,
-      e.g. [[0,1,2,3],[4,5,6,7]] → two independent TP4 groups
+      e.g. [[0,1,2,3],[4,5,6,7]] -> two independent TP4 groups
 
     Usage:
         config = CustomGroupConfig()

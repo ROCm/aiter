@@ -287,7 +287,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         pre-quantization bf16/fp16 normed output.
 
         When ``emit_bf16=False`` returns ``(fp8, residual_out, scale)``.
-        When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` —
+        When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` --
         used by GDN-style layers that have both an FP8 projection and a bf16
         gating projection consuming the same normed activation, so they can
         skip the separate per-group quant kernel entirely (see Qwen3.5).
@@ -310,7 +310,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             try:
                 result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
-                    input_, res_inp_, weight_, eps, group_size, use_1stage,
+                    input_,
+                    res_inp_,
+                    weight_,
+                    eps,
+                    group_size,
+                    use_1stage,
                     emit_bf16=emit_bf16,
                 )
                 if emit_bf16:
@@ -335,7 +340,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert bf16_out is not None
             return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
-    
+
     def fused_qknorm_allreduce(
         self,
         qkv_in,
@@ -343,9 +348,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         k_w,
         eps,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_out, k_out, v_out = self.ca_comm.custom_fused_qknorm_ar(
-            qkv_in, q_w, k_w, eps
-        )
+        q_out, k_out, v_out = self.ca_comm.custom_fused_qknorm_ar(qkv_in, q_w, k_w, eps)
         assert q_out is not None
         assert k_out is not None
         assert v_out is not None
@@ -405,33 +408,43 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self, input_: torch.Tensor, output_: torch.Tensor, dim: int = -1
     ):
         world_size = self.world_size
+        if dim < 0:
+            dim += input_.dim()
         ca_comm = self.ca_comm
-        if (
+        use_ca = (
             ca_comm is not None
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
-        ):
-            ca_comm.custom_reduce_scatter(input_, output_)
-        else:
+        )
+        if not use_ca:
             pynccl_comm = self.pynccl_comm
             assert pynccl_comm is not None
-            if dim < 0:
-                # Convert negative dim to positive.
-                dim += input_.dim()
 
+        if dim == 0:
+            assert input_.shape[0] % world_size == 0, (
+                f"input_.shape[0]={input_.shape[0]} not divisible by "
+                f"world_size={world_size}"
+            )
+            if use_ca:
+                ca_comm.custom_reduce_scatter(input_, output_)
+            else:
+                input_tensor = input_.contiguous()
+                pynccl_comm.reduce_scatter(output_, input_tensor)
+        else:
             # Note: This will produce an incorrect answer if we don't make
             # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-            input_tensor = input_.movedim(0, dim).contiguous()
-
-            assert input_tensor.shape[0] % world_size == 0
-            chunk_size = input_tensor.shape[0] // world_size
-            output_shape = (chunk_size,) + input_tensor.shape[1:]
-            output_.reshape(output_shape)
-
-            pynccl_comm.reduce_scatter(output_, input_tensor)
-
-            # Reshape before returning
-            output_.movedim(0, dim).contiguous()
+            input_tensor = input_.movedim(dim, 0).contiguous()
+            tmp = torch.empty(
+                input_tensor.shape[0] // world_size,
+                *input_tensor.shape[1:],
+                dtype=input_tensor.dtype,
+                device=input_tensor.device,
+            )
+            if use_ca:
+                ca_comm.custom_reduce_scatter(input_tensor, tmp)
+            else:
+                pynccl_comm.reduce_scatter(tmp, input_tensor)
+            output_.copy_(tmp.movedim(0, dim))
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
