@@ -27,7 +27,7 @@ def get_sage_fwd_configs_mxfp4():
         "BLOCK_N": 128,
         "waves_per_eu": 2,
         "PRE_LOAD_V": False,
-        "num_stages": 3,
+        "num_stages": 2,
         "num_warps": 8,
     }
 
@@ -51,6 +51,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         R: torch.Tensor = None,
         BLOCK_R: int = 128,
         block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        smooth_scale: Optional[torch.Tensor] = None,
     ):
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         bhsd_map = [0, 2, 1, 3] if layout == "bshd" else [0, 1, 2, 3]
@@ -84,6 +85,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             R=R,
             BLOCK_R=BLOCK_R,
             q_smoothing=q_smooth,
+            smooth_scale=smooth_scale,
         )
         # TODO: fused quant has perf downgrade
         # fused_sage_quant_mxfp4(
@@ -143,7 +145,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
     def backward(ctx, dout: torch.Tensor):
         # Backward remains unimplemented
         assert False, "backward not implemented"
-        return (None,) * 10
+        return (None,) * 11
 
 
 def fav3_sage_mxfp4_wrapper(
@@ -158,8 +160,18 @@ def fav3_sage_mxfp4_wrapper(
     R: torch.Tensor = None,
     BLOCK_R: int = 128,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    smooth_scale: Optional[torch.Tensor] = None,
 ):
-    """High-precision entry point for MXFP4 SageAttention."""
+    """High-precision entry point for MXFP4 SageAttention.
+
+    Args:
+        smooth_scale: optional ``[num_heads, head_dim]`` float32 tensor produced
+            by ``compute_smoothquant_scale``. When supplied, ``Q`` is divided
+            by ``smooth_scale`` and ``K`` is multiplied by it before rotation
+            and MXFP4 quantization. This is exact w.r.t. ``Q @ K^T`` but
+            improves per-block magnitude balance for MXFP4 of activations with
+            per-channel outliers (typical of trained DiT/LLM attention).
+    """
     for tensor, name in zip([q, k, v], ["q", "k", "v"]):
         assert tensor.dtype in [
             torch.float16,
@@ -179,6 +191,7 @@ def fav3_sage_mxfp4_wrapper(
         R,
         BLOCK_R,
         block_lut,
+        smooth_scale,
     )
 
 

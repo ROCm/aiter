@@ -207,28 +207,22 @@ def _sage_fwd_no_mask_mxfp4(
         )
 
         if USE_BIAS:
-            bias_mask = kv_offs_n < seqlen_k
-            bias = tl.load(
-                bias_base_ptrs + start_n * stride_bn, mask=bias_mask, other=0.0
-            )
+            # No-mask path: kv_offs_n < seqlen_k always holds for every iteration,
+            # so the bias load needs no boundary mask.
+            bias = tl.load(bias_base_ptrs + start_n * stride_bn)
             qk += bias[None, :]
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
-        if USE_BIAS:
-            q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
-            )
-        else:
-            q_shifted = qk - m_ij[:, None]
+        # No-mask path: qk and bias are always finite, so m_ij (=max with prior m_i)
+        # is finite after the first iteration. The -inf guards in the masked path
+        # are unnecessary here.
+        q_shifted = qk - m_ij[:, None]
 
         p = tl.math.exp2(q_shifted)
         l_ij = tl.sum(p, 1)
 
-        if USE_BIAS:
-            m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
-        else:
-            m_diff = m_i - m_ij
+        m_diff = m_i - m_ij
 
         alpha = tl.math.exp2(m_diff)
         acc = acc * alpha[:, None]

@@ -104,6 +104,91 @@ def fused_sage_quant_mxfp4(
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
 
 
+def compute_smoothquant_scale(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    alpha: float = 0.5,
+    clip: float = 16.0,
+    layout: str = "bshd",
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Compute SmoothQuant-style per-(head, dim) rescale ``s`` for Q/K.
+
+    Uses the standard SmoothQuant formula ``s = max(|Q|)^alpha / max(|K|)^(1-alpha)``
+    applied as ``Q' = Q / s`` and ``K' = K * s``. This satisfies
+    ``(Q / s) @ ((K * s)^T) == Q @ K^T`` exactly, and balances per-channel
+    magnitude between Q and K so MXFP4 per-32-element block quantization
+    wastes less of its dynamic range on per-channel outliers.
+
+    Args:
+        q, k: high-precision activations in either ``bshd`` or ``bhsd`` layout.
+            For GQA the head counts must currently match.
+        alpha: migration strength. ``alpha=0`` shifts all Q-side outliers into
+            K (Q' = Q, K' = K * (q_max/k_max)). ``alpha=1`` shifts all K-side
+            outliers into Q. ``alpha=0.5`` is the symmetric choice and is the
+            usual default; the optimum is typically in ``[0.4, 0.6]``.
+        clip: ``s`` is clamped to ``[1/clip, clip]`` for numerical stability.
+        layout: layout of ``q``/``k``.
+        eps: floor for the per-channel max-abs before exponentiation.
+
+    Returns:
+        ``s`` of shape ``[num_heads, head_dim]`` in float32.
+    """
+    assert q.dim() == 4 and k.dim() == 4, "expected 4-D Q/K"
+    if layout == "bshd":
+        q_max = q.abs().amax(dim=(0, 1))
+        k_max = k.abs().amax(dim=(0, 1))
+    elif layout == "bhsd":
+        q_max = q.abs().amax(dim=(0, 2))
+        k_max = k.abs().amax(dim=(0, 2))
+    else:
+        raise ValueError(f"Unknown layout: {layout}")
+    if q_max.shape != k_max.shape:
+        raise ValueError(
+            "GQA (num_q_heads != num_kv_heads) is not yet supported for "
+            "SmoothQuant calibration; got "
+            f"q_max={tuple(q_max.shape)}, k_max={tuple(k_max.shape)}"
+        )
+
+    q_max = q_max.to(torch.float32).clamp_min(eps)
+    k_max = k_max.to(torch.float32).clamp_min(eps)
+    s = q_max.pow(alpha) / k_max.pow(1.0 - alpha)
+    return s.clamp(min=1.0 / clip, max=clip)
+
+
+def _apply_smoothquant(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    s: torch.Tensor,
+    layout: str,
+) -> tuple:
+    """Apply SmoothQuant: ``Q' = Q / s``, ``K' = K * s``, broadcasting over batch/seq.
+
+    The math identity ``(Q / s) @ ((K * s)^T) == Q @ K^T`` is preserved; only
+    the per-(head, dim) magnitude balance changes. The output dtype matches
+    ``q``/``k``.
+    """
+    if s.dim() != 2:
+        raise ValueError(f"smooth_scale must be 2-D [num_heads, head_dim], got {tuple(s.shape)}")
+    if layout == "bshd":
+        if s.shape != q.shape[-2:] or s.shape != k.shape[-2:]:
+            raise ValueError(
+                f"smooth_scale shape {tuple(s.shape)} does not match Q/K head/dim "
+                f"in bshd layout (q={tuple(q.shape)}, k={tuple(k.shape)})"
+            )
+        s_view = s.view(1, 1, *s.shape).to(q.dtype)
+    elif layout == "bhsd":
+        if s.shape[0] != q.shape[1] or s.shape[1] != q.shape[3]:
+            raise ValueError(
+                f"smooth_scale shape {tuple(s.shape)} does not match Q/K head/dim "
+                f"in bhsd layout (q={tuple(q.shape)}, k={tuple(k.shape)})"
+            )
+        s_view = s.view(1, s.shape[0], 1, s.shape[1]).to(q.dtype)
+    else:
+        raise ValueError(f"Unknown layout: {layout}")
+    return q / s_view, k * s_view
+
+
 def sage_quant_mxfp4(
     q,
     k,
@@ -118,7 +203,11 @@ def sage_quant_mxfp4(
     USE_RNE=False,
     R=None,
     BLOCK_R=32,
+    smooth_scale: torch.Tensor = None,
 ):
+    if smooth_scale is not None:
+        q, k = _apply_smoothquant(q, k, smooth_scale, layout)
+
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
     if layout == "bhsd":

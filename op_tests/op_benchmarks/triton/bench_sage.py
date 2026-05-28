@@ -33,6 +33,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
 )
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+    compute_smoothquant_scale,
     create_hadamard_matrix,
     sage_quant,
     sage_quant_mxfp4,
@@ -460,6 +461,35 @@ def make_torch_ref_runner(
     )
 
 
+def _resolve_smooth_scale(
+    args: argparse.Namespace,
+    q: torch.Tensor,
+    k: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Return a SmoothQuant scale tensor or None depending on CLI flags.
+
+    Precedence: ``--smooth-scale-file`` > on-the-fly calibration from
+    ``(q, k)``. The on-the-fly path is a useful smoke test but only produces
+    a meaningful ``s`` on real (non-iid) activations; for synthetic Gaussian
+    inputs the per-channel max-abs is approximately uniform across channels
+    so ``s ≈ 1`` and the path is a near-no-op.
+    """
+    if args.smooth_scale_file:
+        if not args.smooth_quant:
+            raise ValueError("--smooth-scale-file requires --smooth-quant")
+        s = torch.load(args.smooth_scale_file, map_location=q.device, weights_only=True)
+        if s.dim() != 2:
+            raise ValueError(
+                f"smooth_scale tensor must be 2-D [num_heads, head_dim]; got {tuple(s.shape)}"
+            )
+        return s.to(torch.float32)
+    if not args.smooth_quant:
+        return None
+    return compute_smoothquant_scale(
+        q, k, alpha=args.smooth_alpha, clip=args.smooth_clip, layout=args.layout,
+    )
+
+
 def make_kernel_runner(
     args: argparse.Namespace,
     q: torch.Tensor,
@@ -530,6 +560,8 @@ def make_kernel_runner(
             block_r**0.5
         )
 
+        smooth_scale = _resolve_smooth_scale(args, q, k)
+
         if args.e2e:
             return lambda: fav3_sage_mxfp4_wrapper(
                 q,
@@ -541,6 +573,7 @@ def make_kernel_runner(
                 hadamard_rotation=args.hadamard_rotate,
                 R=r,
                 block_lut=block_lut,
+                smooth_scale=smooth_scale,
             )
 
         cfg = get_sage_fwd_configs_mxfp4()
@@ -567,6 +600,7 @@ def make_kernel_runner(
             R=r,
             BLOCK_R=block_r,
             q_smoothing=args.qsmooth,
+            smooth_scale=smooth_scale,
         )
 
         kv_idx, lut_s, lut_c, sparse = _unpack_block_lut(block_lut)
@@ -1003,6 +1037,15 @@ def run_benchmark_generated(
     bench_mha.run(save_path="." if args.o else None, print_data=True)
 
 
+def _infer_captured_layout(q: torch.Tensor) -> str:
+    """Infer 'bshd' or 'bhsd' from a 4-D Q tensor by the heuristic that
+    the head dimension is much smaller than the sequence dimension."""
+    if q.ndim != 4:
+        raise ValueError(f"Expected 4-D captured Q, got shape {tuple(q.shape)}")
+    _, a, b, _ = q.shape
+    return "bhsd" if a <= b else "bshd"
+
+
 def run_benchmark_captured(
     args: argparse.Namespace,
     loaded_single_mask: Optional[LoadedMask],
@@ -1015,6 +1058,22 @@ def run_benchmark_captured(
         q = inp["q"].to(device)
         k = inp["k"].to(device)
         v = inp["v"].to(device)
+
+        captured_layout = _infer_captured_layout(q)
+        if captured_layout != args.layout:
+            logger.warning(
+                "Captured input %d has shape %s which looks like %s; "
+                "converting to requested layout %s. Pass --layout %s to skip "
+                "this conversion.",
+                INPUT_IDX,
+                tuple(q.shape),
+                captured_layout,
+                args.layout,
+                captured_layout,
+            )
+            q, k, v = layout_preprocess(
+                q, k, v, layout=captured_layout, target_layout=args.layout
+            )
 
         return benchmark_single_case(
             args,
@@ -1354,6 +1413,40 @@ def parse_args() -> argparse.Namespace:
         "--qsmooth",
         action="store_true",
         help="(MXFP4 only) Enable Q smoothing",
+    )
+    parser.add_argument(
+        "--smooth-quant",
+        action="store_true",
+        help=(
+            "(MXFP4 only) Enable SmoothQuant-style per-(head, dim) Q/K rescale "
+            "before rotation. Identity for Q @ K^T; helps when Q/K have "
+            "per-channel outliers."
+        ),
+    )
+    parser.add_argument(
+        "--smooth-alpha",
+        type=float,
+        default=0.5,
+        help=(
+            "SmoothQuant migration strength alpha in [0,1]. 0=no-op, "
+            "0.5=symmetric, 1=migrate all Q outliers into K."
+        ),
+    )
+    parser.add_argument(
+        "--smooth-clip",
+        type=float,
+        default=16.0,
+        help="Clamp s to [1/clip, clip] for numerical stability.",
+    )
+    parser.add_argument(
+        "--smooth-scale-file",
+        type=str,
+        default=None,
+        help=(
+            "Optional .pt file containing a pre-calibrated smooth_scale tensor "
+            "of shape [num_heads, head_dim]. When set, --smooth-quant must "
+            "also be enabled; takes precedence over on-the-fly calibration."
+        ),
     )
 
     parser.add_argument(
