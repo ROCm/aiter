@@ -747,6 +747,7 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
+    zero_bias_buf: Optional[Tensor] = None,
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
@@ -758,6 +759,9 @@ def gemm_a8w8_blockscale_bpreshuffle(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
+    zero_bias_buf: Optional[
+        Tensor
+    ] = None,  # which is used to asm kernel(asm always need a bias tensor)
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
     assert dtype in [
@@ -785,7 +789,14 @@ def gemm_a8w8_blockscale_bpreshuffle(
         elif libtype == "asm":
             splitK = config["splitK"]
             return gemm_a8w8_blockscale_bpreshuffle_asm(
-                XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
+                XQ,
+                WQ,
+                Y,
+                x_scale,
+                w_scale,
+                splitK=splitK,
+                kernelName=kernelName,
+                zero_bias_buf=zero_bias_buf,
             )
     try:
         return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
