@@ -1641,6 +1641,10 @@ def compile_ops(
                             )
                     return True
 
+                if AITER_LOG_MORE == 2:
+                    from ..test_common import log_args
+
+                    log_args(func, *args, **kwargs)
                 # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
                 if develop:
                     import torch
@@ -1662,11 +1666,6 @@ def compile_ops(
 
                 if not func.arg_checked:
                     func.arg_checked = check_args()
-
-                if AITER_LOG_MORE == 2:
-                    from ..test_common import log_args
-
-                    log_args(func, *args, **kwargs)
 
                 if develop:
                     module._set_current_hip_stream(
