@@ -22,7 +22,7 @@ from ..gated_delta_rule_utils import (
     USE_CUDA_GRAPH,
     autotune_cache_kwargs,
     check_shared_mem,
-    maybe_autotune,
+    gated_delta_rule_autotune_configs,
 )
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
@@ -41,13 +41,15 @@ RCP_LN2 = 1.4426950408889634
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@maybe_autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in NUM_STAGES_FWD
-        for BV in [32, 64]
-    ],
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in [2, 4]
+            for num_stages in NUM_STAGES_FWD
+            for BV in [32, 64]
+        ]
+    ),
     key=["H", "K", "V", "BT"],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
@@ -297,15 +299,17 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@maybe_autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in (
-            [3, 2] if IS_AMD else ([4, 3, 2] if check_shared_mem("ampere") else [1])
-        )
-        for BV in [64, 32]
-    ],
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in [2, 4]
+            for num_stages in (
+                [3, 2] if IS_AMD else ([4, 3, 2] if check_shared_mem("ampere") else [1])
+            )
+            for BV in [64, 32]
+        ]
+    ),
     key=["H", "K", "V", "BT", "BV", "USE_G"],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
@@ -655,13 +659,15 @@ def chunk_gated_delta_rule_fwd_h(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@maybe_autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in NUM_STAGES_FWD
-        for BV in [16, 32, 64]
-    ],
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in [2, 4]
+            for num_stages in NUM_STAGES_FWD
+            for BV in [16, 32, 64]
+        ]
+    ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
@@ -992,13 +998,15 @@ def chunk_gated_delta_rule_fwd_h_opt(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@maybe_autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in NUM_STAGES_FWD
-        for BV in [16, 32, 64]
-    ],
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in [2, 4]
+            for num_stages in NUM_STAGES_FWD
+            for BV in [16, 32, 64]
+        ]
+    ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
@@ -1077,6 +1085,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
         h0 = h0 + i_nh * V * K
     if STORE_FINAL_STATE:
         ht = ht + i_nh * V * K
+
+    if USE_G:
+        if IS_VARLEN:
+            g += (i_h * T_flat + bos).to(tl.int64)
+        else:
+            g += (((i_n * H + i_h) * T_flat)).to(tl.int64)
 
     if USE_INITIAL_STATE:
         p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
@@ -1157,10 +1171,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
         last_idx = min((i_t + 1) * BT, T) - 1
         if USE_G:
             m_t = (i_t * BT + tl.arange(0, BT)) < T
-            b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
-            p_g = tl.make_block_ptr(
-                g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-            )
+            b_g_last = tl.load(g + last_idx)
+            p_g = tl.make_block_ptr(g, (T,), (1,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,))
             if USE_EXP2:
                 b_v = b_v * tl.where(m_t, tl.math.exp2(b_g_last - b_g), 0)[:, None]
@@ -1281,6 +1293,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     initial_state/final_state: [N, H, V, K].
     h snapshots: [B, NT, H, V, K].
     v_new output is [B, H, T_flat, V].
+    `g` is expected in head-major layout [B, H, T].
     use_exp2 selects whether cumulative gates are interpreted in log2 space.
     """
     B, T, Hg, K = k.shape

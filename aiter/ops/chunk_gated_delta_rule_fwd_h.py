@@ -105,6 +105,7 @@ def chunk_gated_delta_rule_fwd_h_hip(
     output_final_state: bool,
     save_new_value: bool,
     use_exp2: bool,
+    g_head_major: bool,
 ) -> Tuple[Tensor, Tensor, Tensor]: ...
 
 
@@ -150,6 +151,39 @@ def _prepare_state_args(
     )
 
 
+def _normalize_g_tensor(
+    g: Optional[Tensor],
+    *,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    device: torch.device,
+    head_major: bool = False,
+) -> Tensor:
+    expected_shape = (
+        (batch_size, num_heads, seq_len)
+        if head_major
+        else (batch_size, seq_len, num_heads)
+    )
+    if g is None:
+        return torch.zeros(expected_shape, device=device, dtype=torch.float32)
+
+    if g.dtype != torch.float32:
+        g = g.to(torch.float32)
+
+    if g.dim() != 3:
+        raise ValueError(f"`g` must be 3-D, got shape {tuple(g.shape)}.")
+
+    if tuple(g.shape) == expected_shape:
+        return g.contiguous()
+
+    raise ValueError(
+        f"`g` shape mismatch, expected {expected_shape} for "
+        f"{'head-major [B, H, T]' if head_major else 'token-major [B, T, H]'} layout, "
+        f"got {tuple(g.shape)}."
+    )
+
+
 def chunk_gated_delta_rule_fwd_h_hip_fn(
     k: Tensor,
     w: Tensor,
@@ -164,6 +198,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     selected_bv: Optional[int] = None,
     state_dtype: Optional[torch.dtype] = None,
     use_exp2: bool = True,
+    g_head_major: bool = False,
 ) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     """
     HIP hidden state forward with h layout [V, K].
@@ -175,6 +210,8 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     initial_state/final_state: [N, H, V, K].
     h snapshots: [B, NT, H, V, K].
     v_new output: [B, H, T_flat, V].
+    `g` is expected as a 3-D tensor in token-major [B, T, H] or
+    head-major [B, H, T] layout according to `g_head_major`.
     use_exp2 selects whether cumulative gates are interpreted in log2 space.
     """
     if chunk_size != 64:
@@ -200,14 +237,14 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     w_hip = w.contiguous()
     u_hip = u.contiguous()
 
-    total_tokens = T_flat if is_varlen else B * T
-    if g is not None:
-        g_hip = g.reshape(total_tokens, H)
-        if g_hip.dtype != torch.float32:
-            g_hip = g_hip.to(torch.float32)
-        g_hip = g_hip.contiguous()
-    else:
-        g_hip = torch.zeros(total_tokens, H, dtype=torch.float32, device=k.device)
+    g_hip = _normalize_g_tensor(
+        g,
+        batch_size=B,
+        seq_len=T_flat,
+        num_heads=H,
+        device=k.device,
+        head_major=g_head_major,
+    )
 
     if is_varlen:
         from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
@@ -254,6 +291,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
         output_final_state,
         save_new_value,
         use_exp2,
+        g_head_major,
     )
 
     if not is_varlen:

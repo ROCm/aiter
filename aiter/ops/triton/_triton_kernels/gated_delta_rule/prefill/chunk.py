@@ -147,7 +147,7 @@ def chunk_gated_delta_rule_fwd_opt(
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:
-            - g_cumsum: Cumulative gate values [B, T, H]
+            - g_cumsum: Cumulative gate values [B, H, T]
             - o: Output tensor [B, T, H, V]
             - final_state: Final hidden state [N, H, K, V] if output_final_state=True, else None
     """
@@ -236,7 +236,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:
-            - g_cumsum: [B, T, H]
+            - g_cumsum: [B, H, T]
             - o: [B, T, H, V]
             - final_state: [N, H, V, K] if output_final_state=True, else None
     """
@@ -273,6 +273,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             cu_seqlens=cu_seqlens,
             state_dtype=state_dtype,
             use_exp2=use_exp2,
+            g_head_major=True,
         )
     else:
         if state_dtype is not None:

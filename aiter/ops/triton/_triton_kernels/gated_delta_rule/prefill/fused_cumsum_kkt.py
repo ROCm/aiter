@@ -2,7 +2,11 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import autotune_cache_kwargs, IS_AMD, maybe_autotune
+from ..gated_delta_rule_utils import (
+    IS_AMD,
+    autotune_cache_kwargs,
+    gated_delta_rule_autotune_configs,
+)
 from ..utils import prepare_chunk_indices
 from ..utils.op import exp
 
@@ -104,7 +108,7 @@ def fused_cumsum_kkt(
         beta: [B, T, H]
 
     Returns:
-        g_cumsum: [B, T, H]
+        g_cumsum: [B, H, T]
         A: [B, T, H, chunk_size], strictly lower triangular
     """
     B, T, H = g.shape
@@ -140,13 +144,15 @@ def fused_cumsum_kkt(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@maybe_autotune(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=nw, num_stages=ns)
-        for BK in [32, 64]
-        for nw in [2, 4]
-        for ns in ([2, 3] if IS_AMD else [2, 3, 4])
-    ],
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config({"BK": BK}, num_warps=nw, num_stages=ns)
+            for BK in [32, 64]
+            for nw in [2, 4]
+            for ns in ([2, 3] if IS_AMD else [2, 3, 4])
+        ]
+    ),
     key=["H", "K", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
@@ -171,6 +177,7 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
+    T_flat = T
     if IS_VARLEN:
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
@@ -193,9 +200,11 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     if G_SCALE != 1.0:
         b_g_cumsum = b_g_cumsum * G_SCALE
 
-    p_go = tl.make_block_ptr(
-        g_cumsum_out + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-    )
+    if IS_VARLEN:
+        g_out_base = g_cumsum_out + i_h * T_flat + bos
+    else:
+        g_out_base = g_cumsum_out + (i_b * H + i_h) * T_flat
+    p_go = tl.make_block_ptr(g_out_base, (T,), (1,), (i_t * BT,), (BT,), (0,))
     tl.store(p_go, b_g_cumsum.to(p_go.dtype.element_ty), boundary_check=(0,))
 
     p_beta = tl.make_block_ptr(
@@ -259,7 +268,7 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         use_exp2: when True, store cumulative gates in log2 space
 
     Returns:
-        g_cumsum: [B, T, H], cumulative gate in the selected exponent base
+        g_cumsum: [B, H, T], cumulative gate in the selected exponent base
         A_raw: [B, T, H, 64]
     """
     B, T, Hg, K = k.shape
@@ -273,7 +282,7 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         chunk_indices = None
         NT = triton.cdiv(T, BT)
 
-    g_cumsum_out = torch.empty(B, T, H, device=g.device, dtype=g_output_dtype)
+    g_cumsum_out = torch.empty(B, H, T, device=g.device, dtype=g_output_dtype)
     A_out = torch.empty(B, T, H, BT, device=k.device, dtype=A_output_dtype)
 
     fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel[(NT, B * H)](

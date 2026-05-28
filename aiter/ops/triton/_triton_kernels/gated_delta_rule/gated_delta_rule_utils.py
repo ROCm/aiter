@@ -42,32 +42,26 @@ autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
 
-FLA_USE_AUTOTUNE = False
+GATED_DELTA_RULE_TRITON_AUTOTUNE = os.environ.get(
+    "GATED_DELTA_RULE_TRITON_AUTOTUNE", "0"
+).lower() in ("1", "true", "yes", "on")
 
 
-def maybe_autotune(configs, default_config=None, **kwargs):
+def gated_delta_rule_autotune_configs(
+    configs: list[triton.Config], default_config: triton.Config | None = None
+) -> list[triton.Config]:
     """
-    Conditional autotune decorator.
+    Select Triton autotune configs based on the gated delta rule env flag.
 
-    When FLA_USE_AUTOTUNE is True, behaves identically to @triton.autotune.
-    When FLA_USE_AUTOTUNE is False (default), uses only the single default_config
-    (first config in the list if not specified), skipping all benchmark overhead.
-
-    Usage::
-
-        @maybe_autotune(
-            configs=[triton.Config(...), triton.Config(...), ...],
-            default_config=triton.Config({"BV": 64}, num_warps=4, num_stages=2),
-            key=[...],
-        )
-        @triton.jit
-        def my_kernel(...):
-            ...
+    When ``GATED_DELTA_RULE_TRITON_AUTOTUNE`` is enabled, return the full config
+    list so ``@triton.autotune`` benchmarks candidate kernels. When disabled,
+    return only ``default_config`` (or the first config) to skip tuning overhead
+    while keeping the decorator shape uniform across decode and prefill kernels.
     """
-    if FLA_USE_AUTOTUNE:
-        return triton.autotune(configs=configs, **kwargs)
+    if GATED_DELTA_RULE_TRITON_AUTOTUNE:
+        return configs
     cfg = default_config if default_config is not None else configs[0]
-    return triton.autotune(configs=[cfg], **kwargs)
+    return [cfg]
 
 
 @lru_cache(maxsize=1)
