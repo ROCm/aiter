@@ -74,6 +74,13 @@ def build_silu_and_mul_fq_module(
     VEC = max(ELEMS_PER_THREAD, 2)
     if VEC % 2 != 0:
         VEC += 1
+    # Cap VEC at 8 to avoid a 256-bit BUFFER_LOAD pattern that AMD LLVM 22
+    # (ROCm 7.2 + gfx950) fails to lower for inter_dim >= 4096
+    # ("LLVM ERROR: Cannot select: AMDGPUISD::BUFFER_LOAD (s256)").
+    # The kernel already loops over n_iter = ceil(inter_dim / (BLOCK_THREADS * VEC))
+    # so a smaller VEC just adds iterations without changing semantics.
+    if VEC > 8:
+        VEC = 8
     assert 32 % VEC == 0, f"VEC={VEC} must divide 32 evenly"
     if gui_layout:
         assert VEC <= 16, f"VEC={VEC} must be <=16 for block-interleave layout"

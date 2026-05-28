@@ -28,8 +28,10 @@ from aiter.fused_moe import (
     fused_moe,
     fused_moe_fake,
     moe_sorting,
+    torch_moe_stage1,
     torch_moe_stage2_no_combine,
 )
+from aiter.utility import fp4_utils
 
 
 HAS_GPU = torch.cuda.is_available()
@@ -82,7 +84,7 @@ def _make_flydsl_stage2_partial(kernel_name="flydsl_moe2_test"):
     return functools.partial(_flydsl_stage2_wrapper, kernelName=kernel_name)
 
 
-def _patch_kernel_params(b_dtype):
+def _patch_kernel_params(b_dtype, a_dtype="fp4"):
     """Return a context manager that patches get_flydsl_kernel_params to a
     deterministic dict. Avoids depending on the live FlyDSL kernel registry
     which may not be populated in a CPU-only test environment.
@@ -90,7 +92,7 @@ def _patch_kernel_params(b_dtype):
     import aiter.ops.flydsl.moe_kernels as mk
 
     fake_params = {
-        "a_dtype": "fp4",
+        "a_dtype": a_dtype,
         "b_dtype": b_dtype,
         "out_dtype": "bf16",
         "tile_m": 32,
@@ -112,7 +114,7 @@ def test_T5_gate_rejects_non_flydsl_stage2():
         return None
 
     md = _FakeMetadata(stage2=some_ck_stage2)
-    with pytest.raises(NotImplementedError, match="FlyDSL stage2"):
+    with pytest.raises(NotImplementedError, match="FlyDSL, CK, or CKTile stage2"):
         _validate_no_combine_route(md, doweight_stage1=False)
 
 
@@ -155,6 +157,13 @@ def test_T5_gate_accepts_fp8_fp4_pair():
             _validate_no_combine_route(md, doweight_stage1=False)
 
 
+def test_T5_gate_accepts_bf16_fp4_pair_for_w4a16():
+    """W4A16 MXFP4 keeps activations in bf16 and weights in fp4."""
+    md = _FakeMetadata(stage2=_make_flydsl_stage2_partial())
+    with _patch_kernel_params(a_dtype="bf16", b_dtype="fp4"):
+        _validate_no_combine_route(md, doweight_stage1=False)
+
+
 def test_T5_gate_rejects_unparseable_kernel_name():
     """If get_flydsl_kernel_params returns None, the gate must raise."""
     import aiter.ops.flydsl.moe_kernels as mk
@@ -170,6 +179,512 @@ def test_T5_gate_accepts_supported_route():
     with _patch_kernel_params(b_dtype="fp4"):
         # Should not raise.
         _validate_no_combine_route(md, doweight_stage1=False)
+
+
+def test_T5_w4a16_metadata_uses_cktile_by_default(monkeypatch):
+    """W4A16 MXFP4 defaults to CKTile while FlyDSL BF16/FP4 is experimental."""
+    monkeypatch.setattr(_fmoe_mod, "_ENABLE_FLYDSL_W4A16", False)
+    monkeypatch.setattr(_fmoe_mod, "is_flydsl_available", lambda: True)
+    monkeypatch.setattr(_fmoe_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(_fmoe_mod, "get_cu_num", lambda: 256)
+    _fmoe_mod.get_2stage_cfgs.cache_clear()
+
+    metadata = _fmoe_mod.get_2stage_cfgs(
+        32,
+        4096,
+        4096,
+        32,
+        8,
+        dtypes.bf16,
+        dtypes.bf16,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        ActivationType.Swiglu,
+        False,
+        0,
+        0,
+        True,
+        _fmoe_mod.GateMode.SEPARATED.value,
+    )
+
+    assert getattr(metadata.stage1, "func", metadata.stage1) is _fmoe_mod.cktile_moe_stage1
+    assert getattr(metadata.stage2, "func", metadata.stage2) is _fmoe_mod.cktile_moe_stage2
+    _validate_no_combine_route(metadata, doweight_stage1=False)
+
+
+def test_T5_cktile_stage2_no_combine_flattens_slots(monkeypatch):
+    captured = {}
+
+    def fake_cktile_stage2(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        # The wrapper should pass the flattened output buffer as arg 2.
+        args[2].fill_(3)
+        return args[2]
+
+    monkeypatch.setattr(aiter, "moe_cktile2stages_gemm2", fake_cktile_stage2)
+
+    token_num = 3
+    topk = 2
+    inter_dim = 4
+    model_dim = 5
+    a2 = torch.arange(token_num * topk * inter_dim, dtype=dtypes.bf16).view(
+        token_num, topk, inter_dim
+    )
+    w1 = torch.empty((1, inter_dim * 2, model_dim), dtype=dtypes.bf16)
+    w2 = torch.empty((1, model_dim, inter_dim), dtype=dtypes.bf16)
+    sorted_token_ids = torch.tensor(
+        [
+            0 | (0 << 24),
+            0 | (1 << 24),
+            2 | (1 << 24),
+            1 | (0 << 24),
+        ],
+        dtype=dtypes.i32,
+    )
+    sorted_expert_ids = torch.zeros((1,), dtype=dtypes.i32)
+    num_valid_ids = torch.tensor([4], dtype=dtypes.i32)
+
+    out = _fmoe_mod.cktile_moe_stage2(
+        a2,
+        w1,
+        w2,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        out=None,
+        topk=topk,
+        w2_scale=None,
+        a2_scale=None,
+        block_m=32,
+        no_combine=True,
+    )
+
+    assert tuple(out.shape) == (token_num, topk, model_dim)
+    assert out.flatten().tolist() == [3] * out.numel()
+    flat_a2 = captured["args"][0]
+    flat_out = captured["args"][2]
+    flat_sorted_ids = captured["args"][3]
+    called_topk = captured["args"][6]
+    assert tuple(flat_a2.shape) == (token_num * topk, inter_dim)
+    assert tuple(flat_out.shape) == (token_num * topk, model_dim)
+    assert called_topk == 1
+    assert flat_sorted_ids.tolist() == [0, 1, 5, 2]
+
+
+def test_T5_bf16_metadata_uses_ck_wrapper_for_no_combine(monkeypatch):
+    monkeypatch.setattr(_fmoe_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(_fmoe_mod, "get_cu_num", lambda: 256)
+    _fmoe_mod.get_2stage_cfgs.cache_clear()
+
+    metadata = _fmoe_mod.get_2stage_cfgs(
+        32,
+        4096,
+        4096,
+        32,
+        8,
+        dtypes.bf16,
+        dtypes.bf16,
+        dtypes.bf16,
+        QuantType.No,
+        True,
+        ActivationType.Swiglu,
+        False,
+        0,
+        0,
+        False,
+        _fmoe_mod.GateMode.SEPARATED.value,
+    )
+
+    assert getattr(metadata.stage2, "func", metadata.stage2) is _fmoe_mod.ck_moe_stage2
+    _validate_no_combine_route(metadata, doweight_stage1=False)
+
+
+def test_T5_ck_stage2_no_combine_flattens_slots(monkeypatch):
+    captured = {}
+
+    def fake_ck_stage2(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        # The wrapper should pass the flattened output buffer as arg 6.
+        args[6].fill_(5)
+        return args[6]
+
+    monkeypatch.setattr(aiter, "ck_moe_stage2_fwd", fake_ck_stage2)
+
+    token_num = 3
+    topk = 2
+    inter_dim = 4
+    model_dim = 5
+    a2 = torch.arange(token_num * topk * inter_dim, dtype=dtypes.bf16).view(
+        token_num, topk, inter_dim
+    )
+    w1 = torch.empty((1, inter_dim * 2, model_dim), dtype=dtypes.bf16)
+    w2 = torch.empty((1, model_dim, inter_dim), dtype=dtypes.bf16)
+    sorted_token_ids = torch.tensor(
+        [
+            0 | (0 << 24),
+            0 | (1 << 24),
+            2 | (1 << 24),
+            1 | (0 << 24),
+        ],
+        dtype=dtypes.i32,
+    )
+    sorted_expert_ids = torch.zeros((1,), dtype=dtypes.i32)
+    num_valid_ids = torch.tensor([4], dtype=dtypes.i32)
+
+    out = _fmoe_mod.ck_moe_stage2(
+        a2,
+        w1,
+        w2,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        out=None,
+        topk=topk,
+        kernelName="",
+        w2_scale=None,
+        a2_scale=None,
+        block_m=32,
+        no_combine=True,
+    )
+
+    assert tuple(out.shape) == (token_num, topk, model_dim)
+    assert out.flatten().tolist() == [5] * out.numel()
+    flat_a2 = captured["args"][0]
+    flat_out = captured["args"][6]
+    flat_sorted_ids = captured["args"][3]
+    called_topk = captured["args"][7]
+    assert tuple(flat_a2.shape) == (token_num * topk, inter_dim)
+    assert tuple(flat_out.shape) == (token_num * topk, model_dim)
+    assert called_topk == 1
+    assert flat_sorted_ids.tolist() == [0, 1, 5, 2]
+
+
+@pytest.mark.parametrize("activation", (ActivationType.Swiglu, ActivationType.Silu))
+def test_T5_w4a16_metadata_can_opt_into_flydsl_no_combine_route(
+    monkeypatch, activation
+):
+    """The current BF16/FP4 FlyDSL route is kept behind an explicit opt-in."""
+    import aiter.ops.flydsl.moe_kernels as mk
+
+    monkeypatch.setattr(_fmoe_mod, "_ENABLE_FLYDSL_W4A16", True)
+    monkeypatch.setattr(_fmoe_mod, "is_flydsl_available", lambda: True)
+    monkeypatch.setattr(_fmoe_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(_fmoe_mod, "get_cu_num", lambda: 256)
+    _fmoe_mod.get_2stage_cfgs.cache_clear()
+
+    metadata = _fmoe_mod.get_2stage_cfgs(
+        32,
+        4096,
+        4096,
+        32,
+        8,
+        dtypes.bf16,
+        dtypes.bf16,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        activation,
+        False,
+        0,
+        0,
+        True,
+        _fmoe_mod.GateMode.SEPARATED.value,
+    )
+
+    stage2_fn = getattr(metadata.stage2, "func", metadata.stage2)
+    assert stage2_fn is _flydsl_stage2_wrapper
+    kernel_name = metadata.stage2.keywords["kernelName"]
+    parsed = mk.get_flydsl_kernel_params(kernel_name)
+    assert parsed is not None
+    assert (parsed["a_dtype"], parsed["b_dtype"]) == ("bf16", "fp4")
+
+
+def test_T5_public_api_forwards_mxfp4_activation_dtype(monkeypatch):
+    """Callers need an explicit W4A16 override instead of relying on env bounds."""
+    captured = {}
+
+    def fake_fused_moe_(**kwargs):
+        captured.update(kwargs)
+        return torch.empty((4, 64), dtype=dtypes.bf16)
+
+    monkeypatch.setattr(_fmoe_mod, "fused_moe_", fake_fused_moe_)
+    hidden_states = torch.empty((4, 64), dtype=dtypes.bf16)
+    w1 = torch.empty((8, 256, 32), dtype=dtypes.fp4x2)
+    w2 = torch.empty((8, 64, 64), dtype=dtypes.fp4x2)
+    topk_weight, topk_ids = _make_topk_routing(4, 2, 8, device="cpu")
+
+    fused_moe(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        quant_type=QuantType.per_1x32,
+        activation=ActivationType.Swiglu,
+        mxfp4_activation_dtype="bf16",
+    )
+
+    assert captured["mxfp4_activation_dtype"] == "bf16"
+
+
+def test_T5_mxfp4_activation_dtype_override_selects_bf16_metadata(monkeypatch):
+    """The explicit override must beat the M-size BF16/A4 heuristic."""
+
+    class StopAfterMetadata(Exception):
+        pass
+
+    captured = {}
+
+    def fake_get_2stage_cfgs(*args):
+        captured["q_dtype_a"] = args[6]
+        raise StopAfterMetadata
+
+    monkeypatch.setattr(_fmoe_mod, "get_2stage_cfgs", fake_get_2stage_cfgs)
+    hidden_states = torch.empty((512, 64), dtype=dtypes.bf16)
+    w1 = torch.empty((8, 256, 32), dtype=dtypes.fp4x2)
+    w2 = torch.empty((8, 64, 64), dtype=dtypes.fp4x2)
+    topk_weight, topk_ids = _make_topk_routing(512, 2, 8, device="cpu")
+
+    with pytest.raises(StopAfterMetadata):
+        _fmoe_mod.fused_moe_(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            quant_type=QuantType.per_1x32.value,
+            activation=ActivationType.Swiglu.value,
+            mxfp4_activation_dtype="bf16",
+        )
+
+    assert captured["q_dtype_a"] == dtypes.bf16
+
+
+def test_T5_mxfp4_activation_dtype_fp8_sets_a8w4_dtype(monkeypatch):
+    """The explicit W4A8 override must force fp8 activations before dispatch."""
+
+    class StopAfterMetadata(Exception):
+        pass
+
+    captured = {}
+
+    def fake_get_2stage_cfgs(*args):
+        captured["q_dtype_a"] = args[6]
+        captured["q_dtype_w"] = args[7]
+        raise StopAfterMetadata
+
+    monkeypatch.setattr(_fmoe_mod, "get_2stage_cfgs", fake_get_2stage_cfgs)
+    hidden_states = torch.empty((4, 64), dtype=dtypes.bf16)
+    w1 = torch.empty((8, 128, 32), dtype=dtypes.fp4x2)
+    w2 = torch.empty((8, 64, 32), dtype=dtypes.fp4x2)
+    topk_weight, topk_ids = _make_topk_routing(4, 2, 8, device="cpu")
+
+    with pytest.raises(StopAfterMetadata):
+        _fmoe_mod.fused_moe_(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            quant_type=QuantType.per_1x32.value,
+            activation=ActivationType.Silu.value,
+            mxfp4_activation_dtype="fp8",
+        )
+
+    assert captured["q_dtype_a"] == dtypes.fp8
+    assert captured["q_dtype_w"] == dtypes.fp4x2
+
+
+@pytest.mark.parametrize("activation", (ActivationType.Swiglu, ActivationType.Silu))
+def test_T5_w4a8_metadata_can_use_flydsl_no_combine_route(
+    monkeypatch, activation
+):
+    """FP8/FP4 MXFP4 can use the FlyDSL stage2 no_combine contract."""
+    import aiter.ops.flydsl.moe_kernels as mk
+
+    monkeypatch.setattr(_fmoe_mod, "cfg_2stages", ({}, {}))
+    monkeypatch.setattr(_fmoe_mod, "is_flydsl_available", lambda: True)
+    monkeypatch.setattr(_fmoe_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(_fmoe_mod, "get_cu_num", lambda: 256)
+    _fmoe_mod.get_2stage_cfgs.cache_clear()
+
+    metadata = _fmoe_mod.get_2stage_cfgs(
+        32,
+        4096,
+        4096,
+        32,
+        8,
+        dtypes.bf16,
+        dtypes.fp8,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        activation,
+        False,
+        0,
+        0,
+        True,
+        _fmoe_mod.GateMode.SEPARATED.value,
+    )
+
+    stage2_fn = getattr(metadata.stage2, "func", metadata.stage2)
+    assert stage2_fn is _flydsl_stage2_wrapper
+    assert metadata.fuse_quant == ""
+    parsed_stage1 = mk.get_flydsl_kernel_params(metadata.stage1.keywords["kernelName"])
+    parsed_stage2 = mk.get_flydsl_kernel_params(metadata.stage2.keywords["kernelName"])
+    assert parsed_stage1 is not None
+    assert parsed_stage2 is not None
+    assert (parsed_stage1["a_dtype"], parsed_stage1["b_dtype"]) == ("fp8", "fp4")
+    assert (parsed_stage2["a_dtype"], parsed_stage2["b_dtype"]) == ("fp8", "fp4")
+    assert not parsed_stage1.get("a_scale_one", False)
+
+
+def test_T5_w4a16_flydsl_builders_accept_bf16_fp4(monkeypatch):
+    """W4A16 metadata must point at builders that accept BF16 activations."""
+    import flydsl.compiler as flyc
+    from aiter.ops.flydsl.kernels import mixed_moe_gemm_2stage as mmg2
+
+    captured = []
+    orig_kernel = flyc.kernel
+
+    def spy_kernel(*args, **kwargs):
+        captured.append(kwargs.get("name", args[0] if args else None))
+        return orig_kernel(*args, **kwargs)
+
+    common = dict(
+        model_dim=256,
+        inter_dim=128,
+        experts=4,
+        topk=2,
+        tile_m=32,
+        tile_n=128,
+        tile_k=256,
+        a_dtype="bf16",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        model_dim_pad=0,
+        inter_dim_pad=0,
+    )
+
+    mmg2.compile_mixed_moe_gemm1.cache_clear()
+    mmg2.compile_mixed_moe_gemm2.cache_clear()
+    with patch.object(flyc, "kernel", side_effect=spy_kernel):
+        mmg2.compile_mixed_moe_gemm1(
+            **common,
+            doweight_stage1=False,
+            act="swiglu",
+            persist_m=1,
+            use_async_copy=False,
+            k_batch=1,
+            gate_mode=_fmoe_mod.GateMode.SEPARATED,
+        )
+        mmg2.compile_mixed_moe_gemm2(
+            **common,
+            doweight_stage2=False,
+            accumulate=True,
+            persist_m=1,
+            sort_block_m=0,
+        )
+
+    assert any(name and "mfma_moe1_swiglu_mul_abf16_wfp4" in name for name in captured)
+    assert any(name and "mfma_moe2_abf16_wfp4" in name for name in captured)
+
+
+def test_T5_w4a8_flydsl_stage1_builder_accepts_fp8_fp4(monkeypatch):
+    """W4A8 metadata must point at a stage1 builder that accepts FP8 activations."""
+    import flydsl.compiler as flyc
+    from aiter.ops.flydsl.kernels import mixed_moe_gemm_2stage as mmg2
+
+    captured = []
+    orig_kernel = flyc.kernel
+
+    def spy_kernel(*args, **kwargs):
+        captured.append(kwargs.get("name", args[0] if args else None))
+        return orig_kernel(*args, **kwargs)
+
+    mmg2.compile_mixed_moe_gemm1.cache_clear()
+    with patch.object(flyc, "kernel", side_effect=spy_kernel):
+        mmg2.compile_mixed_moe_gemm1(
+            model_dim=256,
+            inter_dim=128,
+            experts=4,
+            topk=2,
+            tile_m=32,
+            tile_n=128,
+            tile_k=256,
+            doweight_stage1=False,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="bf16",
+            act="silu",
+            persist_m=1,
+            use_async_copy=False,
+            k_batch=1,
+            gate_mode=_fmoe_mod.GateMode.INTERLEAVE,
+            model_dim_pad=0,
+            inter_dim_pad=0,
+        )
+
+    assert any(name and "mfma_moe1_silu_mul_afp8_wfp4" in name for name in captured)
+
+
+@requires_gpu
+def test_T5_mxfp4_fused_quant_sort_clears_scale_padding():
+    """The serving wrapper must not leak uninitialized bytes into scale layout.
+
+    The low-M W4A4 serving path uses fused_dynamic_mxfp4_quant_moe_sort for
+    stage1 activation quantization. Its scale output is in the FlyDSL shuffled
+    layout, where masked sublanes must be zero. The raw kernel only writes
+    valid sublanes, so the wrapper is responsible for clearing the buffer.
+    """
+
+    device = "cuda"
+    token_num, model_dim, E, topk, block_m = 30, 4096, 32, 8, 32
+    torch.manual_seed(123)
+    torch.cuda.manual_seed(123)
+    hidden_states = torch.randn(
+        (token_num, model_dim),
+        dtype=dtypes.bf16,
+        device=device,
+    )
+    score = torch.randn((token_num, E), dtype=dtypes.bf16, device=device)
+    topk_weight, topk_ids = _fmoe_mod.fused_topk(
+        hidden_states, score, topk, True
+    )
+    sorted_ids, _, _, num_valid_ids, _ = moe_sorting(
+        topk_ids, topk_weight, E, model_dim, dtypes.bf16, block_m
+    )
+    ref_out, ref_scale_unsorted = aiter.get_torch_quant(QuantType.per_1x32)(
+        hidden_states, quant_dtype=dtypes.fp4x2
+    )
+    ref_scale = fp4_utils.moe_mxfp4_sort(
+        ref_scale_unsorted.view(token_num, 1, -1),
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token_num,
+        block_size=block_m,
+    )
+
+    from aiter.ops.quant import fused_dynamic_mxfp4_quant_moe_sort
+
+    out, scale = fused_dynamic_mxfp4_quant_moe_sort(
+        hidden_states,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token_num,
+        topk=topk,
+        block_size=block_m,
+    )
+    torch.cuda.synchronize()
+
+    valid = ((int(num_valid_ids[0].item()) + block_m - 1) // block_m) * block_m
+    assert torch.equal(out.view(torch.uint8), ref_out.view(torch.uint8))
+    assert torch.equal(
+        scale[:valid].view(torch.uint8), ref_scale[:valid].view(torch.uint8)
+    )
 
 
 def test_T5_public_api_does_not_invoke_moe_sorting_when_gating_fails():
@@ -694,6 +1209,161 @@ def test_T3_numerical_correctness_on_flydsl_a8w4_fp8fp4():
     assert relative_l2 < 0.02, (
         f"A8W4 magnitude-weighted relative L2 {relative_l2:.4f} > 0.02"
     )
+
+
+@requires_flydsl
+@pytest.mark.parametrize("activation", (ActivationType.Swiglu, ActivationType.Silu))
+def test_T3_w4a16_flydsl_stage1_matches_torch_reference(
+    monkeypatch, tmp_path, activation
+):
+    """W4A16 FlyDSL stage1 must preserve bf16 activation semantics.
+
+    This catches the failure mode where the BF16 activations are passed through
+    the low-precision scaled-FP4 MFMA path as if they were packed FP4.
+    """
+
+    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+    monkeypatch.setattr(_fmoe_mod, "_ENABLE_FLYDSL_W4A16", True)
+    monkeypatch.setenv("SGLANG_AITER_MOE_STAGE_DUMP_TOKENS", "16")
+    monkeypatch.setenv("SGLANG_AITER_MOE_STAGE_DUMP_ONCE", "0")
+    _fmoe_mod.get_2stage_cfgs.cache_clear()
+
+    device = "cuda"
+    M, topk, E, model_dim, inter_dim = 16, 2, 4, 512, 512
+    (
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weight,
+        topk_ids,
+    ) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device, seed=11)
+
+    w1_shuffled = shuffle_weight_a16w4(w1, 16, True)
+    w2_shuffled = shuffle_weight_a16w4(w2, 16, False)
+    w1_shuffled.is_shuffled = True
+    w2_shuffled.is_shuffled = True
+    w1_scale_shuffled = shuffle_scale_a16w4(
+        w1_scale.view(-1, w1_scale.shape[-1]), E, True
+    ).view(dtypes.fp8_e8m0)
+    w2_scale_shuffled = shuffle_scale_a16w4(
+        w2_scale.view(-1, w2_scale.shape[-1]), E, False
+    ).view(dtypes.fp8_e8m0)
+
+    fused_moe(
+        hidden_states,
+        w1_shuffled,
+        w2_shuffled,
+        topk_weight,
+        topk_ids,
+        activation=activation,
+        quant_type=QuantType.per_1x32,
+        w1_scale=w1_scale_shuffled,
+        w2_scale=w2_scale_shuffled,
+        mxfp4_activation_dtype="bf16",
+        no_combine=True,
+        debug_layer_id=0,
+        debug_dump_dir=str(tmp_path),
+    )
+    payload = torch.load(
+        tmp_path / "rank_0" / "aiter_stage_layer_0.pt",
+        map_location="cpu",
+    )
+    assert payload["stage1_kernel"].startswith("flydsl_moe1_abf16_wfp4")
+    got = payload["stage1_raw"].float()
+
+    ref = torch_moe_stage1(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        dtype=dtypes.bf16,
+        activation=activation,
+        quant_type=QuantType.per_1x32,
+        w1_scale=w1_scale,
+    )[: got.shape[0]].cpu().float()
+
+    rmse = (got - ref).pow(2).mean().sqrt()
+    rel = rmse / (ref.pow(2).mean().sqrt() + 1e-6)
+    assert float(rel) < 0.08
+
+
+@requires_flydsl
+@pytest.mark.parametrize("activation", (ActivationType.Swiglu, ActivationType.Silu))
+def test_T3_w4a16_flydsl_stage2_no_combine_matches_torch_reference(
+    monkeypatch, activation
+):
+    """W4A16 FlyDSL stage2 must preserve raw per-slot no_combine output."""
+
+    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+    monkeypatch.setattr(_fmoe_mod, "_ENABLE_FLYDSL_W4A16", True)
+    _fmoe_mod.get_2stage_cfgs.cache_clear()
+
+    device = "cuda"
+    M, topk, E, model_dim, inter_dim = 16, 2, 4, 512, 512
+    (
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        topk_weight,
+        topk_ids,
+    ) = _build_fp4_inputs(M, topk, E, model_dim, inter_dim, device, seed=17)
+
+    w1_shuffled = shuffle_weight_a16w4(w1, 16, True)
+    w2_shuffled = shuffle_weight_a16w4(w2, 16, False)
+    w1_shuffled.is_shuffled = True
+    w2_shuffled.is_shuffled = True
+    w1_scale_shuffled = shuffle_scale_a16w4(
+        w1_scale.view(-1, w1_scale.shape[-1]), E, True
+    ).view(dtypes.fp8_e8m0)
+    w2_scale_shuffled = shuffle_scale_a16w4(
+        w2_scale.view(-1, w2_scale.shape[-1]), E, False
+    ).view(dtypes.fp8_e8m0)
+
+    got = fused_moe(
+        hidden_states,
+        w1_shuffled,
+        w2_shuffled,
+        topk_weight,
+        topk_ids,
+        activation=activation,
+        quant_type=QuantType.per_1x32,
+        w1_scale=w1_scale_shuffled,
+        w2_scale=w2_scale_shuffled,
+        mxfp4_activation_dtype="bf16",
+        no_combine=True,
+    ).float()
+
+    stage1_ref = torch_moe_stage1(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        dtype=dtypes.bf16,
+        activation=activation,
+        quant_type=QuantType.per_1x32,
+        w1_scale=w1_scale,
+    )
+    ref = torch_moe_stage2_no_combine(
+        stage1_ref,
+        w1,
+        w2,
+        topk_ids,
+        dtype=dtypes.bf16,
+        quant_type=QuantType.per_1x32,
+        w2_scale=w2_scale,
+    ).float()
+
+    rmse = (got - ref).pow(2).mean().sqrt()
+    rel = rmse / (ref.pow(2).mean().sqrt() + 1e-6)
+    assert float(rel) < 0.08
 
 
 @requires_flydsl

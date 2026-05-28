@@ -780,7 +780,9 @@ def mxfp4_moe_sort_fwd(
     # Pad cols to multiple of 8 to match `mx_scale_shuffle_idx`'s
     # `scaleN_pad = pad8(scaleN)`. See note in `fused_dynamic_mx_quant_moe_sort`.
     scaleN_pad = ((cols + 31) // 32 + 7) // 8 * 8
-    out_scale = torch.empty(
+    # The HIP sort kernel only writes valid sublanes; padded sublanes must be
+    # deterministic because FlyDSL vector-loads the shuffled scale layout.
+    out_scale = torch.zeros(
         (sorted_ids.shape[0] + 31) // 32 * 32,
         scaleN_pad,
         dtype=dtypes.fp8_e8m0,
@@ -939,12 +941,11 @@ def fused_dynamic_mx_quant_moe_sort(
     # `scaleN_pad = pad8(scaleN)`. Without this, MX shapes with
     # `N/group_size` not divisible by 8 (e.g. inter_dim=384 -> scaleN=12)
     # trigger OOB writes in the kernel that uses the padded stride.
-    # Padding columns `[scaleN_valid, scaleN_pad)` are NOT written by the
-    # kernel (guarded by `scale_k < scaleN_valid`) and contain allocator
-    # garbage; production GEMM consumers don't read them so this is safe.
-    # Tests comparing byte-level equality must mask out those positions.
+    # Padding columns `[scaleN_valid, scaleN_pad)` are not written by the
+    # kernel (guarded by `scale_k < scaleN_valid`). Keep them zero-filled
+    # because FlyDSL vector-loads the shuffled scale layout.
     scaleN_pad = ((N + group_size - 1) // group_size + 7) // 8 * 8
-    scale = torch.empty(
+    scale = torch.zeros(
         (sorted_ids.shape[0] + 31) // 32 * 32,
         scaleN_pad,
         dtype=dtypes.fp8_e8m0,
