@@ -42,6 +42,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     int32_t scaleN_pad       = (std::is_same_v<DTYPE_O, opus::fp4_t> && shuffle_scale)
                                    ? (((scaleN + 7) / 8) * 8)
                                    : scaleN;
+    // V-60: SRD-bounded input buffer — hardware OOB clamp for excess lanes
+    auto input_buf = opus::make_gmem<DTYPE_I>(
+        input,
+        static_cast<unsigned int>(ori_rows * scaleN * group_size * sizeof(DTYPE_I)));
     int64_t x                = groupId / scaleN_pad;
     int32_t y                = groupId % scaleN_pad;
     if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
@@ -75,8 +79,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
     const int64_t oob_o = (ori_rows * ori_cols + ooba_o - 1) / ooba_o * ooba_o;
 
-    auto const* input_vecs = reinterpret_cast<vec_i const*>(input + row_offset);
-    vec_i thread_data = input_vecs[threadIdx.x % num_thread_per_group];
+    // V-60: SRD load replaces raw pointer — hardware clamps OOB to zero
+    int input_os = static_cast<int>(row_offset) +
+                   (threadIdx.x % num_thread_per_group) * thread_data_size;
+    vec_i thread_data = load_vector_nbytes<DTYPE_I, thread_data_size, 16>(input_buf, input_os);
     float absMax      = 1e-10f;
     for(size_t j = 0; j < thread_data_size; j++)
     {
