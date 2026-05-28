@@ -23,6 +23,7 @@ _fused_clamp_silu_mul_repr = make_kernel_repr(
     [
         "BLOCK_SIZE_N",
         "QUANT_BLOCK_SIZE",
+        "SCALE_FMT",
         "HAVE_WEIGHTS",
         "WEIGHT_BROADCAST",
         "HAVE_SWIGLU_CLAMP",
@@ -50,6 +51,7 @@ def _fused_clamp_silu_mul_kernel(
     swiglu_limit,
     BLOCK_SIZE_N: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
+    SCALE_FMT: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
     HAVE_WEIGHTS: tl.constexpr,
@@ -95,11 +97,34 @@ def _fused_clamp_silu_mul_kernel(
             out = out * w
 
     if HAS_QUANT:
-        out_q, block_scales = _fp8_quant_op(
-            out, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
-        )
-        out_q = tl.ravel(out_q)
-        block_scales = tl.ravel(block_scales)
+        if SCALE_FMT == "ue8m0":
+            # Per-1×QUANT_BLOCK_SIZE MXFP8 emit: fp8 e4m3 values + uint8 ue8m0
+            # biased-exponent scales. Mirrors the ue8m0 path used by moe_gemm_a8w4.
+            NUM_QB: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
+            out_3d = tl.reshape(out, [1, NUM_QB, QUANT_BLOCK_SIZE])
+            abs_3d = tl.abs(out_3d)
+            max_val = tl.max(abs_3d, axis=2, keep_dims=True)
+            dequant_scale = max_val / DTYPE_MAX
+            # ROUND_UP via exponent: 2 ** ceil(log2(dequant_scale))
+            dequant_scale_exp = (
+                dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF
+            ) & 0x7F800000
+            dequant_scale_rounded = dequant_scale_exp.to(tl.float32, bitcast=True)
+            quant_scale = tl.where(
+                dequant_scale_rounded == 0, 0.0, 1.0 / dequant_scale_rounded
+            )
+            quant_tensor = out_3d * quant_scale
+            quant_2d = tl.reshape(quant_tensor, [1, BLOCK_SIZE_N])
+            out_q = tl.ravel(quant_2d)
+            scale_exp = (dequant_scale_exp >> 23).to(tl.uint8)
+            scale_exp_2d = tl.reshape(scale_exp, [1, NUM_QB])
+            block_scales = tl.ravel(scale_exp_2d)
+        else:
+            out_q, block_scales = _fp8_quant_op(
+                out, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
+            )
+            out_q = tl.ravel(out_q)
+            block_scales = tl.ravel(block_scales)
 
         tl.store(
             out_ptr + m_pid * out_stride_m + n_offs * out_stride_n,
@@ -108,8 +133,8 @@ def _fused_clamp_silu_mul_kernel(
         )
 
         num_bs = tl.cdiv(n_half, QUANT_BLOCK_SIZE)
-        NUM_QB: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
-        g_offs = tl.arange(0, NUM_QB)
+        NUM_QB_S: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
+        g_offs = tl.arange(0, NUM_QB_S)
         tl.store(
             scale_ptr + m_pid * scale_stride_m + g_offs * scale_stride_n,
             block_scales.to(scale_ptr.dtype.element_ty),
