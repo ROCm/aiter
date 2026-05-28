@@ -4,7 +4,7 @@
 # Fused replacement for the multi-kernel "topk → routing data" chain that
 # bridges FusedMoE.select_experts to triton_kernels.matmul_ogs. See the
 # accompanying _triton_kernels/fused_routing_from_topk.py for the kernel.
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -30,6 +30,7 @@ def fused_routing_from_topk(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     n_expts_tot: int,
+    expert_map: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sort (token, slot) pairs by their expert id via a single Triton kernel.
 
@@ -41,9 +42,15 @@ def fused_routing_from_topk(
 
     Args:
         topk_weights: ``[n_tokens, n_expts_act]`` per-token routing weights.
+            Must be contiguous.
         topk_ids: ``[n_tokens, n_expts_act]`` selected expert ids; values
-            in ``[0, n_expts_tot)``.
+            in ``[0, n_expts_tot)``. Must be contiguous int32.
         n_expts_tot: Total number of routed experts (= ``E``).
+        expert_map: Optional global→local expert map. When provided,
+            ``topk_ids`` are treated as global ids and remapped inside fused
+            kernels. Entries mapped to ``< 0`` are masked to zero weight and
+            redirected to local expert ``0`` for routing safety. Must be
+            contiguous int32 when provided.
 
     Returns:
         Tuple ``(hist, topk_indx, gate_indx, gate_scal)``:
@@ -89,11 +96,21 @@ def fused_routing_from_topk(
     device = topk_weights.device
     weights_dtype = topk_weights.dtype
 
-    # Triton kernel needs flat int32 inputs. .reshape on a contiguous tensor
-    # is a view; .contiguous() / .to(int32) on already-canonical tensors
-    # are no-ops.
-    topk_ids_flat = topk_ids.contiguous().reshape(-1).to(torch.int32)
-    topk_weights_flat = topk_weights.contiguous().reshape(-1)
+    assert (
+        topk_ids.is_contiguous() and topk_ids.dtype == torch.int32
+    ), "topk_ids must be contiguous int32"
+    assert topk_weights.is_contiguous(), "topk_weights must be contiguous"
+    topk_ids_flat = topk_ids.reshape(-1)
+    topk_weights_flat = topk_weights.reshape(-1)
+    expert_map_numel = 0
+    expert_map_flat = topk_ids_flat
+    has_expert_map = expert_map is not None
+    if has_expert_map:
+        assert (
+            expert_map.is_contiguous() and expert_map.dtype == torch.int32
+        ), "expert_map must be contiguous int32"
+        expert_map_flat = expert_map.reshape(-1)
+        expert_map_numel = int(expert_map_flat.numel())
 
     topk_indx = torch.empty(n_gates_pad, dtype=torch.int32, device=device)
     gate_indx = torch.empty(n_gates_pad, dtype=torch.int32, device=device)
@@ -109,9 +126,12 @@ def fused_routing_from_topk(
     # single wave, matching the CTA-local design of the original kernel.
     _fused_routing_from_topk_hist_kernel[(1,)](
         topk_ids_flat,
+        expert_map_flat,
+        expert_map_numel,
         hist,
         n_gates_pad,
         E=n_expts_tot,
+        HAS_EXPERT_MAP=has_expert_map,
         BLOCK_NK=BLOCK_NK,
         BLOCK_E=BLOCK_E,
         num_warps=1,
@@ -132,11 +152,14 @@ def fused_routing_from_topk(
     _fused_routing_from_topk_place_kernel[(1,)](
         topk_ids_flat,
         topk_weights_flat,
+        expert_map_flat,
+        expert_map_numel,
         offset_scratch,
         topk_indx,
         gate_indx,
         gate_scal,
         n_gates_pad,
+        HAS_EXPERT_MAP=has_expert_map,
         BLOCK_NK=BLOCK_NK,
         num_warps=1,
     )

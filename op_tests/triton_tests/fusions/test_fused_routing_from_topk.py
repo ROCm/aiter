@@ -28,7 +28,7 @@ DEVICE = "cuda"
 # Returns ``(hist, topk_indx, gate_indx, gate_scal)`` for direct comparison
 # against the fused kernel.
 # ---------------------------------------------------------------------------
-def routing_from_topk_reference(topk_weights, topk_ids, n_expts_tot):
+def routing_from_topk_reference(topk_weights, topk_ids, n_expts_tot, expert_map=None):
     """Multi-kernel torch reference for fused_routing_from_topk.
 
     Per-row sort of ``topk_ids`` followed by a stable global argsort by
@@ -37,6 +37,12 @@ def routing_from_topk_reference(topk_weights, topk_ids, n_expts_tot):
     version), unlike the fused kernel which is non-deterministic at
     intra-expert ordering.
     """
+    if expert_map is not None:
+        local_ids = expert_map[topk_ids.long()]
+        invalid = local_ids < 0
+        topk_weights = topk_weights.masked_fill(invalid, 0.0)
+        topk_ids = local_ids.masked_fill(invalid, 0).to(torch.int32)
+
     expt_indx_sorted, sort_indices = torch.sort(topk_ids.int(), dim=1)
     expt_scal_sorted = torch.gather(topk_weights, 1, sort_indices.long())
 
@@ -183,35 +189,51 @@ def _compare_buckets(ref_buckets, test_buckets, atol=1e-6):
 # tests
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    "n_tokens, n_expts_act, n_expts_tot",
+    "n_tokens, n_expts_act, n_expts_tot, n_expts_global",
     [
-        # V4-Flash decode shapes (E=256, K=6).
-        (1, 6, 256),
-        (16, 6, 256),
-        (64, 6, 256),
-        (256, 6, 256),
+        # V4-Flash decode shapes (E=256, K=6). n_expts_global ignored when
+        # has_expert_map=False.
+        (1, 6, 256, 256),
+        (16, 6, 256, 256),
+        (64, 6, 256, 256),
+        (256, 6, 256, 256),
         # Generic decode shapes used by other MoE configs.
-        (1, 8, 384),
-        (4, 8, 384),
-        (64, 8, 384),
-        (256, 8, 384),
+        (1, 8, 384, 384),
+        (4, 8, 384, 384),
+        (64, 8, 384, 384),
+        (256, 8, 384, 384),
         # Edge: small E.
-        (32, 4, 16),
+        (32, 4, 16, 16),
         # Boundary: NK at the kernel's MAX_NK = 4096.
-        (512, 8, 384),
+        (512, 8, 384, 384),
+        # Expert-parallel shapes: n_expts_global > n_expts_tot, requires map.
+        (16, 6, 64, 256),
+        (64, 6, 128, 256),
     ],
 )
+@pytest.mark.parametrize("has_expert_map", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32])
-def test_fused_routing_from_topk(n_tokens, n_expts_act, n_expts_tot, dtype):
+def test_fused_routing_from_topk(
+    n_tokens, n_expts_act, n_expts_tot, n_expts_global, has_expert_map, dtype
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     torch.manual_seed(0)
+
+    id_range = n_expts_global if has_expert_map else n_expts_tot
     topk_ids, topk_weights = _make_inputs(
-        n_tokens, n_expts_act, n_expts_tot, dtype, DEVICE, seed=0
+        n_tokens, n_expts_act, id_range, dtype, DEVICE, seed=0
     )
 
+    expert_map = None
+    if has_expert_map:
+        expert_map = torch.full((n_expts_global,), -1, dtype=torch.int32, device=DEVICE)
+        expert_map[: n_expts_tot // 2] = torch.arange(
+            n_expts_tot // 2, dtype=torch.int32, device=DEVICE
+        )
+
     ref_hist, ref_topk_indx, ref_gate_indx, ref_gate_scal = routing_from_topk_reference(
-        topk_weights, topk_ids, n_expts_tot
+        topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
     )
     _check_routing_invariants(
         ref_hist,
@@ -222,14 +244,9 @@ def test_fused_routing_from_topk(n_tokens, n_expts_act, n_expts_tot, dtype):
         n_expts_tot,
         bucket_unsorted_layout=False,  # ref uses per-row-sorted layout
     )
-    ground_buckets = _ground_truth_buckets(topk_ids, topk_weights)
-    ref_buckets = _per_expert_triples(
-        ref_hist, ref_topk_indx, ref_gate_scal, n_expts_act
-    )
-    _compare_buckets(ground_buckets, ref_buckets)
 
     test_hist, test_topk_indx, test_gate_indx, test_gate_scal = fused_routing_from_topk(
-        topk_weights, topk_ids, n_expts_tot
+        topk_weights, topk_ids, n_expts_tot, expert_map=expert_map
     )
     _check_routing_invariants(
         test_hist,
@@ -238,7 +255,7 @@ def test_fused_routing_from_topk(n_tokens, n_expts_act, n_expts_tot, dtype):
         test_gate_scal,
         topk_ids,
         n_expts_tot,
-        bucket_unsorted_layout=True,  # fused uses unsorted topk_ids layout
+        bucket_unsorted_layout=not has_expert_map,
     )
 
     # hist must match the reference exactly.
@@ -246,8 +263,25 @@ def test_fused_routing_from_topk(n_tokens, n_expts_act, n_expts_tot, dtype):
         ref_hist, test_hist
     ), f"hist mismatch:\n  ref={ref_hist}\n  fused={test_hist}"
 
-    # Per-expert (token, weight) multisets match the reference.
-    test_buckets = _per_expert_triples(
-        test_hist, test_topk_indx, test_gate_scal, n_expts_act
-    )
-    _compare_buckets(ref_buckets, test_buckets)
+    if has_expert_map:
+        # Intra-expert ordering can differ between fused and reference,
+        # especially in expert-0 bucket where invalid experts are redirected.
+        # Compare zeroed-weight cardinality instead of elementwise positions.
+        ref_zero_count = int((ref_gate_scal == 0).sum().item())
+        test_zero_count = int((test_gate_scal == 0).sum().item())
+        assert ref_zero_count == test_zero_count, (
+            f"zero-masked count mismatch: "
+            f"ref={ref_zero_count}, fused={test_zero_count}"
+        )
+    else:
+        ground_buckets = _ground_truth_buckets(topk_ids, topk_weights)
+        ref_buckets = _per_expert_triples(
+            ref_hist, ref_topk_indx, ref_gate_scal, n_expts_act
+        )
+        _compare_buckets(ground_buckets, ref_buckets)
+
+        # Per-expert (token, weight) multisets match the reference.
+        test_buckets = _per_expert_triples(
+            test_hist, test_topk_indx, test_gate_scal, n_expts_act
+        )
+        _compare_buckets(ref_buckets, test_buckets)
