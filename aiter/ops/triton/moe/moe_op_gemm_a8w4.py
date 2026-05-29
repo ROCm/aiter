@@ -16,7 +16,6 @@ from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
@@ -103,18 +102,67 @@ def get_kernel_config_triton(m, n, k, routing_data):
             "kpack": tuned.get("kpack", 1),
         }
 
-    # Safe-default fallback: shape not in the tuned dispatch JSON. A single
-    # conservative tile, LDS-safe at ns=2 for every block_m the router produces
-    # ({16, 32, 64, 128}). Production-reachable shapes belong in the JSON; this
-    # is just the cold-tail default. ns==2 is asserted so we never silently
-    # degrade to ns=1 (which is what the old bn=512 heuristic did).
-    block_n = 128
-    block_k = 256
-    num_warps = 4
-    num_stages = pick_gemm_num_stages(
-        arch, block_m, block_n, block_k, 8, 4, use_async_padding=True
+    # Fallback for shapes not in the tuned dispatch JSON.
+    # Look for a tuned entry with the same (N, K) but any block_m — the tile
+    # geometry and num_stages from that entry are a better starting point than
+    # a generic default, and avoid regressing to num_stages=1 on gfx950.
+    dispatch = _get_a8w4_dispatch(arch)
+    proxy = next(
+        (
+            v
+            for bm in (16, 32, 64, 128)
+            if (v := dispatch.get(f"bm{bm}_n{n}_k{k}")) is not None
+        ),
+        None,
     )
-    ret = {
+    if proxy is not None:
+        return {
+            "block_m": block_m,
+            "block_n": proxy["BLOCK_SIZE_N"],
+            "block_k": proxy["BLOCK_SIZE_K"],
+            "num_warps": proxy["num_warps"],
+            "num_stages": proxy["num_stages"],
+            "group_m": group_m,
+            "xcd_swizzle": xcd_swizzle,
+            "w_cache_modifier": w_cache_modifier,
+            "split_k": split_k,
+            "waves_per_eu": proxy.get("waves_per_eu", 0),
+            "matrix_instr_nonkdim": proxy.get("matrix_instr_nonkdim", 16),
+            "kpack": proxy.get("kpack", 1),
+        }
+
+    # Last-resort: original shape-based heuristic, gated to gfx942 which has no
+    # tuned JSON. Other arches fall back to a conservative safe default.
+    block_k = 256
+    num_stages = 2
+
+    if arch == "gfx942":
+        if block_m == 16:
+            block_n = 128
+            num_warps = 4
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
+            while block_n >= 64 and grid < 256:
+                block_n = block_n // 2
+                grid_m = routing_data.n_blocks(m, block_m)
+                grid_n = triton.cdiv(n, block_n)
+                grid = grid_m * grid_n * split_k
+        elif block_m == 32:
+            if n <= 1024:
+                block_n = 128
+                num_warps = 4
+            else:
+                block_n = 256
+                num_warps = 8
+        else:
+            block_n = 128
+            num_warps = 4 if block_m == 128 else 8
+    else:
+        block_n = 128
+        num_warps = 4
+
+    return {
         "block_m": block_m,
         "block_n": block_n,
         "block_k": block_k,
@@ -128,7 +176,6 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
-    return ret
 
 
 def get_kernel_config_gluon(m, n, k, routing_data):
