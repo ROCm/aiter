@@ -1381,6 +1381,86 @@ def get_2stage_cfgs(
             has_bias=enable_bias,
             stage2_has_bias=enable_bias,
         )
+    silu_blockscale_fp8_flydsl = (
+        dtype == dtypes.bf16
+        and activation == ActivationType.Silu
+        and q_type == QuantType.per_1x128
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp8
+        and use_g1u1
+        and not doweight_stage1
+        and is_flydsl_available()
+    )
+    # Gate: only route to FlyDSL FP8-blockscale above this M (default 128).
+    # Below threshold the ASM/CK path is faster, so fall through to it.
+    _flydsl_bs_min_m = int(os.environ.get("FLYDSL_BLOCKSCALE_MIN_M", "128"))
+    if silu_blockscale_fp8_flydsl and token < _flydsl_bs_min_m:
+        logger.info(
+            f"[fused_moe] FP8-blockscale FlyDSL heuristic skipped: "
+            f"token={token} < FLYDSL_BLOCKSCALE_MIN_M={_flydsl_bs_min_m}; using CK/ASM"
+        )
+        silu_blockscale_fp8_flydsl = False
+    if silu_blockscale_fp8_flydsl:
+        # Heuristic FlyDSL dispatch for FP8 a8w8 blockscale + SiLU when no exact
+        # CSV row matches. Mirrors the MXFP4 swiglu fallback above. Tiles match
+        # the primaries seeded in flydsl_a8w8_blockscale_tuned_fmoe_ds_v3.csv.
+        from aiter.ops.flydsl.moe_kernels import (
+            flydsl_kernel_name,
+            get_flydsl_kernel_params,
+        )
+
+        _out_str = "bf16"
+        if token <= 64:
+            _tile_m, _tile_n, _tile_k = 16, 128, 256
+        else:
+            _tile_m, _tile_n, _tile_k = 64, 128, 128
+
+        _base_kn1 = flydsl_kernel_name(
+            1, "fp8", "fp8", _out_str, _tile_m, _tile_n, _tile_k
+        )
+        _base_kn2 = flydsl_kernel_name(
+            2, "fp8", "fp8", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
+        kn1 = f"{_base_kn1}_blkscale_w2"
+        kn2 = f"{_base_kn2}_blkscale"
+
+        if get_flydsl_kernel_params(kn1) is None:
+            kn1 = f"{_base_kn1}_blkscale"
+        if get_flydsl_kernel_params(kn2) is None:
+            kn2 = f"{_base_kn2}_blkscale"
+
+        if (
+            get_flydsl_kernel_params(kn1) is not None
+            and get_flydsl_kernel_params(kn2) is not None
+        ):
+            logger.warning(
+                f"[fused_moe] no tuned FlyDSL config for {keys}, "
+                f"using heuristic FlyDSL FP8-blockscale fallback "
+                f"({kn1=}, {kn2=})"
+            )
+            return MOEMetadata(
+                functools.partial(
+                    _flydsl_stage1_wrapper,
+                    kernelName=kn1,
+                    activation=activation,
+                    inter_dim_pad=intermediate_pad,
+                    model_dim_pad=hidden_pad,
+                ),
+                functools.partial(
+                    _flydsl_stage2_wrapper,
+                    kernelName=kn2,
+                    inter_dim_pad=intermediate_pad,
+                    model_dim_pad=hidden_pad,
+                ),
+                _tile_m,
+                int(ksplit),
+                False,
+            )
+        # else: kernels not registered for this dtype combo — fall through to CK
+        logger.warning(
+            f"[fused_moe] FP8-blockscale FlyDSL fallback unavailable for "
+            f"{keys} ({kn1=}, {kn2=}); using non-FlyDSL path"
+        )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
