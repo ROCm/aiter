@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import functools
 import logging
-import os
 
 from ._blockscale_moe_gemm_2stage_upstream import (
     compile_moe_blockscale_gemm1 as _upstream_compile_gemm1,
@@ -139,8 +138,7 @@ def _reject_tier_c(
     """
     if act not in ("silu", "gelu"):
         raise NotImplementedError(
-            f"blockscale {stage}: act={act!r} not supported "
-            "(only 'silu' or 'gelu')"
+            f"blockscale {stage}: act={act!r} not supported " "(only 'silu' or 'gelu')"
         )
     if enable_bias:
         raise NotImplementedError(
@@ -249,9 +247,7 @@ def compile_blockscale_moe_gemm1(
 
     upstream_out = _normalize_out_dtype(out_dtype)
     if upstream_out == "f32":
-        raise ValueError(
-            "blockscale stage1: out_dtype='f32' is only valid for stage2"
-        )
+        raise ValueError("blockscale stage1: out_dtype='f32' is only valid for stage2")
 
     # waves_per_eu == 0 (or negative) means "let the backend decide" in some
     # aiter callers. Forward None to upstream in that case so it can apply

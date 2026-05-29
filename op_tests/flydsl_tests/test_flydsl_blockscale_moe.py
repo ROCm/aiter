@@ -94,12 +94,7 @@ def _block_quant_expert(w_fp32: torch.Tensor, blk_n: int, blk_k: int):
         .reshape(nbn * nbk, blk_n * blk_k)
     )
     q, sc = _pertoken_quant_fp8(tmp)
-    q = (
-        q.view(nbn, nbk, blk_n, blk_k)
-        .permute(0, 2, 1, 3)
-        .reshape(n, k)
-        .contiguous()
-    )
+    q = q.view(nbn, nbk, blk_n, blk_k).permute(0, 2, 1, 3).reshape(n, k).contiguous()
     return q, sc.view(-1)
 
 
@@ -116,7 +111,9 @@ def _expand_blockscale(sc_flat, expert, nbn, nbk, blk_n, blk_k):
 # ---------------------------------------------------------------------------
 # Torch references
 # ---------------------------------------------------------------------------
-def _torch_stage1_ref(a_q, w1, topk_ids, a_scale, w1_scale, inter_dim, blk_n, blk_k, act: str = "silu"):
+def _torch_stage1_ref(
+    a_q, w1, topk_ids, a_scale, w1_scale, inter_dim, blk_n, blk_k, act: str = "silu"
+):
     """[token, topk, inter_dim] FP32 reference of stage1 (gate+up + activation)."""
     tokens, model_dim = a_q.shape
     topk = topk_ids.shape[1]
@@ -148,13 +145,26 @@ def _torch_stage1_ref(a_q, w1, topk_ids, a_scale, w1_scale, inter_dim, blk_n, bl
 
 
 def _torch_stage2_ref(
-    a2_q, w2, topk_ids, topk_weights, a2_scale, w2_scale, tokens, model_dim, inter_dim, topk, blk_n, blk_k
+    a2_q,
+    w2,
+    topk_ids,
+    topk_weights,
+    a2_scale,
+    w2_scale,
+    tokens,
+    model_dim,
+    inter_dim,
+    topk,
+    blk_n,
+    blk_k,
 ):
     """[token, model_dim] FP32 reference of stage2 (down + topk-weighted sum)."""
     expert = w2.shape[0]
     a = a2_q.float()
     if a2_scale is not None:
-        a = (a.view(-1, inter_dim // blk_k, blk_k) * a2_scale.unsqueeze(-1)).view(-1, inter_dim)
+        a = (a.view(-1, inter_dim // blk_k, blk_k) * a2_scale.unsqueeze(-1)).view(
+            -1, inter_dim
+        )
     w = w2.float()
     if w2_scale is not None:
         w = w * _expand_blockscale(
@@ -172,8 +182,17 @@ def _torch_stage2_ref(
 # ---------------------------------------------------------------------------
 # Shared data prep — mirrors upstream FlyDSL test exactly
 # ---------------------------------------------------------------------------
-def _prepare_data(tokens, model_dim, inter_dim, experts, topk, *, seed=0,
-                  blk_n=SCALE_BLOCK_N_DEFAULT, blk_k=SCALE_BLOCK_K_DEFAULT):
+def _prepare_data(
+    tokens,
+    model_dim,
+    inter_dim,
+    experts,
+    topk,
+    *,
+    seed=0,
+    blk_n=SCALE_BLOCK_N_DEFAULT,
+    blk_k=SCALE_BLOCK_K_DEFAULT,
+):
     """Build a self-consistent FP8 blockscale fixture.
 
     Single block-quantization pass: ``per_group_quant_hip`` produces both
@@ -205,22 +224,31 @@ def _prepare_data(tokens, model_dim, inter_dim, experts, topk, *, seed=0,
     topk_weights = torch.softmax(topk_vals, dim=1).float()
     topk_ids = topk_ids.to(torch.int32)
 
-    w1_bq = torch.empty(experts, 2 * inter_dim, model_dim, device=DEVICE, dtype=DTYPE_FP8)
+    w1_bq = torch.empty(
+        experts, 2 * inter_dim, model_dim, device=DEVICE, dtype=DTYPE_FP8
+    )
     w1_bscale_flat = torch.empty(
-        experts, ((2 * inter_dim) // blk_n) * (model_dim // blk_k),
-        device=DEVICE, dtype=torch.float32,
+        experts,
+        ((2 * inter_dim) // blk_n) * (model_dim // blk_k),
+        device=DEVICE,
+        dtype=torch.float32,
     )
     w2_bq = torch.empty(experts, model_dim, inter_dim, device=DEVICE, dtype=DTYPE_FP8)
     w2_bscale_flat = torch.empty(
-        experts, (model_dim // blk_n) * (inter_dim // blk_k),
-        device=DEVICE, dtype=torch.float32,
+        experts,
+        (model_dim // blk_n) * (inter_dim // blk_k),
+        device=DEVICE,
+        dtype=torch.float32,
     )
     for e in range(experts):
         w1e = torch.randn(2 * inter_dim, model_dim, device=DEVICE, generator=g) * s
         q, sc = _block_quant_expert(w1e, blk_n, blk_k)
         w1_bq[e], w1_bscale_flat[e] = q, sc
         w2e = torch.randn(
-            model_dim, inter_dim, device=DEVICE, generator=g,
+            model_dim,
+            inter_dim,
+            device=DEVICE,
+            generator=g,
         ) * (s / math.sqrt(inter_dim))
         q, sc = _block_quant_expert(w2e, blk_n, blk_k)
         w2_bq[e], w2_bscale_flat[e] = q, sc
@@ -231,17 +259,29 @@ def _prepare_data(tokens, model_dim, inter_dim, experts, topk, *, seed=0,
     w2_shuf = shuffle_weight(w2_bq, layout=(16, 16))
 
     return dict(
-        tokens=tokens, model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
-        topk_ids=topk_ids, topk_weights=topk_weights,
+        tokens=tokens,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
         # Single block-quantized activation. x_bq is the kernel buffer,
         # x_bscale_fly is the [nblk_k, tokens] layout the kernel consumes,
         # x_bscale_ref is the [tokens, nblk_k] layout the FP32 reference
         # and CK/ASM call sites expect.
-        x_bq=x_bq, x_bscale_fly=x_bscale_fly, x_bscale_ref=x_bscale_ref,
+        x_bq=x_bq,
+        x_bscale_fly=x_bscale_fly,
+        x_bscale_ref=x_bscale_ref,
         # Back-compat aliases for CK/ASM call sites that read a1_bscale.
-        a1_bq=x_bq, a1_bscale=x_bscale_ref,
-        w1_bq=w1_bq, w1_bq_shuf=w1_shuf, w1_bscale_flat=w1_bscale_flat,
-        w2_bq=w2_bq, w2_bq_shuf=w2_shuf, w2_bscale_flat=w2_bscale_flat,
+        a1_bq=x_bq,
+        a1_bscale=x_bscale_ref,
+        w1_bq=w1_bq,
+        w1_bq_shuf=w1_shuf,
+        w1_bscale_flat=w1_bscale_flat,
+        w2_bq=w2_bq,
+        w2_bq_shuf=w2_shuf,
+        w2_bscale_flat=w2_bscale_flat,
     )
 
 
@@ -250,6 +290,7 @@ def _prepare_data(tokens, model_dim, inter_dim, experts, topk, *, seed=0,
 # ---------------------------------------------------------------------------
 def test_imports():
     from aiter.ops.flydsl.kernels import blockscale_moe_gemm_2stage as m
+
     assert hasattr(m, "compile_blockscale_moe_gemm1")
     assert hasattr(m, "compile_blockscale_moe_gemm2")
     assert m.SCALE_BLOCK_N_DEFAULT == 128
@@ -258,10 +299,19 @@ def test_imports():
 
 def test_dispatcher_routes_fp8_fp8_to_blockscale():
     exe = compile_flydsl_moe_stage1(
-        model_dim=7168, inter_dim=512, experts=257, topk=9,
-        tile_m=64, tile_n=128, tile_k=128, doweight_stage1=False,
-        a_dtype="fp8", b_dtype="fp8", out_dtype="f16",
-        act="silu", waves_per_eu=2,
+        model_dim=7168,
+        inter_dim=512,
+        experts=257,
+        topk=9,
+        tile_m=64,
+        tile_n=128,
+        tile_k=128,
+        doweight_stage1=False,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        out_dtype="f16",
+        act="silu",
+        waves_per_eu=2,
     )
     assert exe is not None
     assert type(exe).__name__ == "JitFunction"
@@ -269,9 +319,17 @@ def test_dispatcher_routes_fp8_fp8_to_blockscale():
 
 def test_dispatcher_routes_fp8_fp8_stage2():
     exe = compile_flydsl_moe_stage2(
-        model_dim=7168, inter_dim=512, experts=257, topk=9,
-        tile_m=64, tile_n=128, tile_k=128, doweight_stage2=True,
-        a_dtype="fp8", b_dtype="fp8", out_dtype="f16",
+        model_dim=7168,
+        inter_dim=512,
+        experts=257,
+        topk=9,
+        tile_m=64,
+        tile_n=128,
+        tile_k=128,
+        doweight_stage2=True,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        out_dtype="f16",
     )
     assert exe is not None
     assert type(exe).__name__ == "JitFunction"
@@ -280,10 +338,19 @@ def test_dispatcher_routes_fp8_fp8_stage2():
 def test_dispatcher_routes_fp8_fp8_bf16_compiles():
     """Stage1 bf16 compiles via the fast cshuffle epilog (no f16-only guard)."""
     exe = compile_flydsl_moe_stage1(
-        model_dim=7168, inter_dim=512, experts=257, topk=9,
-        tile_m=64, tile_n=128, tile_k=128, doweight_stage1=False,
-        a_dtype="fp8", b_dtype="fp8", out_dtype="bf16",
-        act="silu", waves_per_eu=2,
+        model_dim=7168,
+        inter_dim=512,
+        experts=257,
+        topk=9,
+        tile_m=64,
+        tile_n=128,
+        tile_k=128,
+        doweight_stage1=False,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        out_dtype="bf16",
+        act="silu",
+        waves_per_eu=2,
     )
     assert exe is not None
     assert type(exe).__name__ == "JitFunction"
@@ -304,8 +371,14 @@ def test_dispatcher_routes_fp8_fp8_bf16_compiles():
 )
 def test_tier_c_kwargs_raise(kwarg, bad_value, expected_match):
     base = dict(
-        model_dim=7168, inter_dim=512, experts=257, topk=9,
-        tile_m=64, tile_n=128, tile_k=128, doweight_stage1=False,
+        model_dim=7168,
+        inter_dim=512,
+        experts=257,
+        topk=9,
+        tile_m=64,
+        tile_n=128,
+        tile_k=128,
+        doweight_stage1=False,
     )
     base[kwarg] = bad_value
     with pytest.raises(NotImplementedError, match=expected_match):
@@ -315,23 +388,39 @@ def test_tier_c_kwargs_raise(kwarg, bad_value, expected_match):
 def test_invalid_dtype_combo_raises():
     with pytest.raises(ValueError, match="only a_dtype='fp8' and b_dtype='fp8'"):
         compile_blockscale_moe_gemm1(
-            model_dim=7168, inter_dim=512, experts=257, topk=9,
-            tile_m=64, tile_n=128, tile_k=128, doweight_stage1=False,
-            a_dtype="fp4", b_dtype="fp4",
+            model_dim=7168,
+            inter_dim=512,
+            experts=257,
+            topk=9,
+            tile_m=64,
+            tile_n=128,
+            tile_k=128,
+            doweight_stage1=False,
+            a_dtype="fp4",
+            b_dtype="fp4",
         )
 
 
 # ---------------------------------------------------------------------------
 # Group 2: functional correctness — stage1, stage2, full pipeline
 # ---------------------------------------------------------------------------
-def _launch_flydsl_stage1(data, *, tile_m, tile_n, tile_k, waves_per_eu, act: str = "silu"):
+def _launch_flydsl_stage1(
+    data, *, tile_m, tile_n, tile_k, waves_per_eu, act: str = "silu"
+):
     """Compile + run FlyDSL stage1 via the aiter dispatcher; return (out, us)."""
-    tokens = data["tokens"]; model_dim = data["model_dim"]
-    inter_dim = data["inter_dim"]; experts = data["experts"]; topk = data["topk"]
+    tokens = data["tokens"]
+    model_dim = data["model_dim"]
+    inter_dim = data["inter_dim"]
+    experts = data["experts"]
+    topk = data["topk"]
 
     sorted_ids, sorted_w, sorted_e, num_valid, _ = aiter_moe_sorting(
-        data["topk_ids"], data["topk_weights"], experts, model_dim,
-        torch.bfloat16, tile_m,
+        data["topk_ids"],
+        data["topk_weights"],
+        experts,
+        model_dim,
+        torch.bfloat16,
+        tile_m,
     )
     size_expert_ids = sorted_e.numel()
 
@@ -344,26 +433,56 @@ def _launch_flydsl_stage1(data, *, tile_m, tile_n, tile_k, waves_per_eu, act: st
 
     out1 = torch.zeros(tokens, topk, inter_dim, device=DEVICE, dtype=torch.float16)
     exe1 = compile_flydsl_moe_stage1(
-        model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
-        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage1=False,
-        a_dtype="fp8", b_dtype="fp8", out_dtype="f16",
-        act=act, waves_per_eu=waves_per_eu,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage1=False,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        out_dtype="f16",
+        act=act,
+        waves_per_eu=waves_per_eu,
     )
     stream = torch.cuda.current_stream()
     w1_shuf_flat = data["w1_bq_shuf"].view(-1)
     compiled = flyc.compile(
-        exe1, out1.view(-1), a1_bq.view(-1), w1_shuf_flat,
-        a1_scale_fly, w1_scale_fly,
-        sorted_ids, sorted_e, sorted_w, num_valid,
-        tokens, inter_dim, model_dim, size_expert_ids, stream,
+        exe1,
+        out1.view(-1),
+        a1_bq.view(-1),
+        w1_shuf_flat,
+        a1_scale_fly,
+        w1_scale_fly,
+        sorted_ids,
+        sorted_e,
+        sorted_w,
+        num_valid,
+        tokens,
+        inter_dim,
+        model_dim,
+        size_expert_ids,
+        stream,
     )
 
     def _run():
         compiled(
-            out1.view(-1), a1_bq.view(-1), w1_shuf_flat,
-            a1_scale_fly, w1_scale_fly,
-            sorted_ids, sorted_e, sorted_w, num_valid,
-            tokens, inter_dim, model_dim, size_expert_ids, stream,
+            out1.view(-1),
+            a1_bq.view(-1),
+            w1_shuf_flat,
+            a1_scale_fly,
+            w1_scale_fly,
+            sorted_ids,
+            sorted_e,
+            sorted_w,
+            num_valid,
+            tokens,
+            inter_dim,
+            model_dim,
+            size_expert_ids,
+            stream,
         )
 
     _, us = run_perftest(_run, num_iters=10, num_warmup=3)
@@ -371,10 +490,24 @@ def _launch_flydsl_stage1(data, *, tile_m, tile_n, tile_k, waves_per_eu, act: st
     return out1, a1_bq, a1_bscale_ref, sorted_ids, sorted_w, sorted_e, num_valid, us
 
 
-def _launch_flydsl_stage2(data, out1, *, tile_m, tile_n, tile_k, waves_per_eu,
-                          sorted_ids, sorted_w, sorted_e, num_valid):
-    tokens = data["tokens"]; model_dim = data["model_dim"]
-    inter_dim = data["inter_dim"]; experts = data["experts"]; topk = data["topk"]
+def _launch_flydsl_stage2(
+    data,
+    out1,
+    *,
+    tile_m,
+    tile_n,
+    tile_k,
+    waves_per_eu,
+    sorted_ids,
+    sorted_w,
+    sorted_e,
+    num_valid,
+):
+    tokens = data["tokens"]
+    model_dim = data["model_dim"]
+    inter_dim = data["inter_dim"]
+    experts = data["experts"]
+    topk = data["topk"]
     size_expert_ids = sorted_e.numel()
 
     a2_bq, a2_scale_fly = per_group_quant_hip(
@@ -390,25 +523,54 @@ def _launch_flydsl_stage2(data, out1, *, tile_m, tile_n, tile_k, waves_per_eu,
 
     out2 = torch.zeros(tokens, model_dim, device=DEVICE, dtype=torch.float16)
     exe2 = compile_flydsl_moe_stage2(
-        model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
-        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage2=True,
-        a_dtype="fp8", b_dtype="fp8", out_dtype="f16",
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage2=True,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        out_dtype="f16",
     )
     stream = torch.cuda.current_stream()
     w2_shuf_flat = data["w2_bq_shuf"].view(-1)
     compiled = flyc.compile(
-        exe2, out2.view(-1), a2_bq.view(-1), w2_shuf_flat,
-        a2_scale_fly, w2_scale_fly,
-        sorted_ids, sorted_e, sorted_w, num_valid,
-        tokens, model_dim, inter_dim, size_expert_ids, stream,
+        exe2,
+        out2.view(-1),
+        a2_bq.view(-1),
+        w2_shuf_flat,
+        a2_scale_fly,
+        w2_scale_fly,
+        sorted_ids,
+        sorted_e,
+        sorted_w,
+        num_valid,
+        tokens,
+        model_dim,
+        inter_dim,
+        size_expert_ids,
+        stream,
     )
 
     def _run():
         compiled(
-            out2.view(-1), a2_bq.view(-1), w2_shuf_flat,
-            a2_scale_fly, w2_scale_fly,
-            sorted_ids, sorted_e, sorted_w, num_valid,
-            tokens, model_dim, inter_dim, size_expert_ids, stream,
+            out2.view(-1),
+            a2_bq.view(-1),
+            w2_shuf_flat,
+            a2_scale_fly,
+            w2_scale_fly,
+            sorted_ids,
+            sorted_e,
+            sorted_w,
+            num_valid,
+            tokens,
+            model_dim,
+            inter_dim,
+            size_expert_ids,
+            stream,
         )
 
     _, us = run_perftest(_run, num_iters=10, num_warmup=3)
@@ -429,7 +591,12 @@ def _launch_flydsl_stage2(data, out1, *, tile_m, tile_n, tile_k, waves_per_eu,
     ],
 )
 def test_blockscale_correctness_stage1_stage2_e2e(
-    tokens, model_dim, inter_dim, experts, topk, act,
+    tokens,
+    model_dim,
+    inter_dim,
+    experts,
+    topk,
+    act,
 ):
     """FlyDSL stage1 / stage2 / full pipeline within 10% rtol/atol of FP32 ref."""
     if not torch.cuda.is_available():
@@ -441,17 +608,32 @@ def test_blockscale_correctness_stage1_stage2_e2e(
     # ----- FlyDSL stage1 -----
     out1, a1_bq, a1_bscale_ref, sorted_ids, sorted_w, sorted_e, num_valid, us1 = (
         _launch_flydsl_stage1(
-            data, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, waves_per_eu=2, act=act,
+            data,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            waves_per_eu=2,
+            act=act,
         )
     )
     out1_ref = _torch_stage1_ref(
-        a1_bq, data["w1_bq"], data["topk_ids"], a1_bscale_ref,
-        data["w1_bscale_flat"], inter_dim,
-        SCALE_BLOCK_N_DEFAULT, SCALE_BLOCK_K_DEFAULT, act=act,
+        a1_bq,
+        data["w1_bq"],
+        data["topk_ids"],
+        a1_bscale_ref,
+        data["w1_bscale_flat"],
+        inter_dim,
+        SCALE_BLOCK_N_DEFAULT,
+        SCALE_BLOCK_K_DEFAULT,
+        act=act,
     )
     err_s1 = checkAllclose(
-        out1_ref.to(out1.dtype), out1, rtol=0.1, atol=0.1,
-        msg="flydsl-stage1 vs ref", printLog=False,
+        out1_ref.to(out1.dtype),
+        out1,
+        rtol=0.1,
+        atol=0.1,
+        msg="flydsl-stage1 vs ref",
+        printLog=False,
     )
     print(f"\n  [{tokens}t] stage1: {us1:.1f}us, err_ratio={err_s1:.4f}")
     # After the F3 single-block-quant fix, kernel and FP32 reference share
@@ -461,23 +643,44 @@ def test_blockscale_correctness_stage1_stage2_e2e(
 
     # ----- FlyDSL stage2 -----
     out2, a2_bq, a2_scale_2d, us2 = _launch_flydsl_stage2(
-        data, out1, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, waves_per_eu=2,
-        sorted_ids=sorted_ids, sorted_w=sorted_w, sorted_e=sorted_e,
+        data,
+        out1,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        waves_per_eu=2,
+        sorted_ids=sorted_ids,
+        sorted_w=sorted_w,
+        sorted_e=sorted_e,
         num_valid=num_valid,
     )
     out2_ref_s2 = _torch_stage2_ref(
-        a2_bq, data["w2_bq"], data["topk_ids"], data["topk_weights"],
-        a2_scale_2d, data["w2_bscale_flat"],
-        tokens, model_dim, inter_dim, topk,
-        SCALE_BLOCK_N_DEFAULT, SCALE_BLOCK_K_DEFAULT,
+        a2_bq,
+        data["w2_bq"],
+        data["topk_ids"],
+        data["topk_weights"],
+        a2_scale_2d,
+        data["w2_bscale_flat"],
+        tokens,
+        model_dim,
+        inter_dim,
+        topk,
+        SCALE_BLOCK_N_DEFAULT,
+        SCALE_BLOCK_K_DEFAULT,
     )
     n_nan = (~out2.isfinite()).sum().item()
     err_s2 = checkAllclose(
-        out2_ref_s2.to(out2.dtype), out2, rtol=0.05, atol=0.05,
-        msg="flydsl-stage2 vs ref", printLog=False,
+        out2_ref_s2.to(out2.dtype),
+        out2,
+        rtol=0.05,
+        atol=0.05,
+        msg="flydsl-stage2 vs ref",
+        printLog=False,
     )
-    print(f"  [{tokens}t] stage2: {us2:.1f}us, err_vs_ref={err_s2:.4f}, "
-          f"non-finite={n_nan}/{out2.numel()}")
+    print(
+        f"  [{tokens}t] stage2: {us2:.1f}us, err_vs_ref={err_s2:.4f}, "
+        f"non-finite={n_nan}/{out2.numel()}"
+    )
     assert n_nan == 0, f"stage2 produced {n_nan} non-finite values"
     assert err_s2 <= 0.05, f"stage2 numerics err_ratio={err_s2:.4f} > 0.05"
 
@@ -506,14 +709,32 @@ def test_perf_dsr1_e2e_vs_ck_and_asm():
     data = _prepare_data(tokens, model_dim, inter_dim, experts, topk)
 
     # ===== FlyDSL stage1+stage2 (via aiter dispatcher) =====
-    out1, a1_bq, _a1_bscale_ref, sorted_ids, sorted_w, sorted_e, num_valid, us_fly_s1 = (
-        _launch_flydsl_stage1(
-            data, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, waves_per_eu=2,
-        )
+    (
+        out1,
+        a1_bq,
+        _a1_bscale_ref,
+        sorted_ids,
+        sorted_w,
+        sorted_e,
+        num_valid,
+        us_fly_s1,
+    ) = _launch_flydsl_stage1(
+        data,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        waves_per_eu=2,
     )
     out2, a2_bq, a2_scale_2d, us_fly_s2 = _launch_flydsl_stage2(
-        data, out1, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, waves_per_eu=2,
-        sorted_ids=sorted_ids, sorted_w=sorted_w, sorted_e=sorted_e,
+        data,
+        out1,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        waves_per_eu=2,
+        sorted_ids=sorted_ids,
+        sorted_w=sorted_w,
+        sorted_e=sorted_e,
         num_valid=num_valid,
     )
     us_fly_total = us_fly_s1 + us_fly_s2
@@ -521,28 +742,43 @@ def test_perf_dsr1_e2e_vs_ck_and_asm():
     # ===== CK 2-stage (today's TP=8 baseline) =====
     ck_block_m = 32
     sorted_ids_a, sorted_w_a, sorted_e_a, num_valid_a, _ = aiter_moe_sorting(
-        data["topk_ids"], data["topk_weights"], experts, model_dim,
-        torch.bfloat16, ck_block_m,
+        data["topk_ids"],
+        data["topk_weights"],
+        experts,
+        model_dim,
+        torch.bfloat16,
+        ck_block_m,
     )
     out_ck_s1 = torch.zeros(tokens, topk, inter_dim, device=DEVICE, dtype=torch.float16)
     nblk_n_w1 = (2 * inter_dim) // blk_n
     nblk_n_w2 = model_dim // blk_n
     nblk_k_w1 = model_dim // blk_k
     nblk_k_w2 = inter_dim // blk_k
-    w1_scale_ck = data["w1_bscale_flat"].view(experts, nblk_n_w1, nblk_k_w1).contiguous()
-    w2_scale_ck = data["w2_bscale_flat"].view(experts, nblk_n_w2, nblk_k_w2).contiguous()
+    w1_scale_ck = (
+        data["w1_bscale_flat"].view(experts, nblk_n_w1, nblk_k_w1).contiguous()
+    )
+    w2_scale_ck = (
+        data["w2_bscale_flat"].view(experts, nblk_n_w2, nblk_k_w2).contiguous()
+    )
 
     def _run_ck_s1():
         out_ck_s1.zero_()
         ck_moe_stage1_fwd(
-            hidden_states=a1_bq, w1=data["w1_bq_shuf"], w2=data["w2_bq_shuf"],
+            hidden_states=a1_bq,
+            w1=data["w1_bq_shuf"],
+            w2=data["w2_bq_shuf"],
             sorted_token_ids=sorted_ids_a,
             sorted_expert_ids=sorted_e_a,
             num_valid_ids=num_valid_a,
-            out=out_ck_s1, topk=topk, kernelName="",
-            w1_scale=w1_scale_ck, a1_scale=data["a1_bscale"],
-            block_m=ck_block_m, sorted_weights=None,
-            quant_type=QuantType.per_1x128, activation=ActivationType.Silu,
+            out=out_ck_s1,
+            topk=topk,
+            kernelName="",
+            w1_scale=w1_scale_ck,
+            a1_scale=data["a1_bscale"],
+            block_m=ck_block_m,
+            sorted_weights=None,
+            quant_type=QuantType.per_1x128,
+            activation=ActivationType.Silu,
             dst_type=torch.float16,
         )
 
@@ -555,14 +791,20 @@ def test_perf_dsr1_e2e_vs_ck_and_asm():
         out_ck_s2.zero_()
         ck_moe_stage2_fwd(
             inter_states=a2_for_ck,
-            w1=data["w1_bq_shuf"], w2=data["w2_bq_shuf"],
+            w1=data["w1_bq_shuf"],
+            w2=data["w2_bq_shuf"],
             sorted_token_ids=sorted_ids_a,
             sorted_expert_ids=sorted_e_a,
             num_valid_ids=num_valid_a,
-            out=out_ck_s2, topk=topk, kernelName="",
-            w2_scale=w2_scale_ck, a2_scale=a2_scale_2d,
-            block_m=ck_block_m, sorted_weights=sorted_w_a,
-            quant_type=QuantType.per_1x128, activation=ActivationType.Silu,
+            out=out_ck_s2,
+            topk=topk,
+            kernelName="",
+            w2_scale=w2_scale_ck,
+            a2_scale=a2_scale_2d,
+            block_m=ck_block_m,
+            sorted_weights=sorted_w_a,
+            quant_type=QuantType.per_1x128,
+            activation=ActivationType.Silu,
         )
 
     _, us_ck_s2 = run_perftest(_run_ck_s2, num_iters=30, num_warmup=10)
@@ -578,10 +820,22 @@ def test_perf_dsr1_e2e_vs_ck_and_asm():
         def _run_asm():
             out_asm.zero_()
             aiter.fmoe_fp8_blockscale_g1u1(
-                out_asm, a1_bq, data["w1_bq_shuf"], data["w2_bq_shuf"],
-                sorted_ids_a, sorted_w_a, sorted_e_a, num_valid_a, topk,
-                a1_scale_aiter, data["w1_bscale_flat"], data["w2_bscale_flat"],
-                "", blk_n, blk_k, None,
+                out_asm,
+                a1_bq,
+                data["w1_bq_shuf"],
+                data["w2_bq_shuf"],
+                sorted_ids_a,
+                sorted_w_a,
+                sorted_e_a,
+                num_valid_a,
+                topk,
+                a1_scale_aiter,
+                data["w1_bscale_flat"],
+                data["w2_bscale_flat"],
+                "",
+                blk_n,
+                blk_k,
+                None,
             )
 
         _, us_asm = run_perftest(_run_asm, num_iters=30, num_warmup=10)
@@ -592,25 +846,45 @@ def test_perf_dsr1_e2e_vs_ck_and_asm():
     flops_s1 = 2 * tokens * topk * (2 * inter_dim) * model_dim
     flops_s2 = 2 * tokens * topk * model_dim * inter_dim
     flops_total = flops_s1 + flops_s2
-    tflops = lambda us: flops_total / (us / 1e6) / 1e12 if us > 0 else 0.0
-    print(f"\n  DSR1 e2e (M={tokens}, dim={model_dim}, idim={inter_dim}, E={experts}, k={topk}):")
+
+    def tflops(us):
+        return flops_total / (us / 1e6) / 1e12 if us > 0 else 0.0
+
+    print(
+        f"\n  DSR1 e2e (M={tokens}, dim={model_dim}, idim={inter_dim}, E={experts}, k={topk}):"
+    )
     print(f"    {'kernel':>20s} | {'us':>9s} | {'TFLOPS':>8s} | {'vs FlyDSL':>10s}")
     print(f"    {'-'*20}-+-{'-'*9}-+-{'-'*8}-+-{'-'*10}")
-    print(f"    {'FlyDSL s1':>20s} | {us_fly_s1:9.1f} | {flops_s1/(us_fly_s1/1e6)/1e12:8.2f} | {'-':>10s}")
-    print(f"    {'FlyDSL s2':>20s} | {us_fly_s2:9.1f} | {flops_s2/(us_fly_s2/1e6)/1e12:8.2f} | {'-':>10s}")
-    print(f"    {'FlyDSL total':>20s} | {us_fly_total:9.1f} | {tflops(us_fly_total):8.2f} | {1.0:>9.2f}x")
-    print(f"    {'CK s1':>20s} | {us_ck_s1:9.1f} | {flops_s1/(us_ck_s1/1e6)/1e12:8.2f} | {us_ck_s1/us_fly_s1:>9.2f}x")
-    print(f"    {'CK s2':>20s} | {us_ck_s2:9.1f} | {flops_s2/(us_ck_s2/1e6)/1e12:8.2f} | {us_ck_s2/us_fly_s2:>9.2f}x")
-    print(f"    {'CK total':>20s} | {us_ck_total:9.1f} | {tflops(us_ck_total):8.2f} | {us_ck_total/us_fly_total:>9.2f}x")
+    print(
+        f"    {'FlyDSL s1':>20s} | {us_fly_s1:9.1f} | {flops_s1/(us_fly_s1/1e6)/1e12:8.2f} | {'-':>10s}"
+    )
+    print(
+        f"    {'FlyDSL s2':>20s} | {us_fly_s2:9.1f} | {flops_s2/(us_fly_s2/1e6)/1e12:8.2f} | {'-':>10s}"
+    )
+    print(
+        f"    {'FlyDSL total':>20s} | {us_fly_total:9.1f} | {tflops(us_fly_total):8.2f} | {1.0:>9.2f}x"
+    )
+    print(
+        f"    {'CK s1':>20s} | {us_ck_s1:9.1f} | {flops_s1/(us_ck_s1/1e6)/1e12:8.2f} | {us_ck_s1/us_fly_s1:>9.2f}x"
+    )
+    print(
+        f"    {'CK s2':>20s} | {us_ck_s2:9.1f} | {flops_s2/(us_ck_s2/1e6)/1e12:8.2f} | {us_ck_s2/us_fly_s2:>9.2f}x"
+    )
+    print(
+        f"    {'CK total':>20s} | {us_ck_total:9.1f} | {tflops(us_ck_total):8.2f} | {us_ck_total/us_fly_total:>9.2f}x"
+    )
     if us_asm == us_asm:  # not NaN
-        print(f"    {'ASM fused':>20s} | {us_asm:9.1f} | {tflops(us_asm):8.2f} | {us_asm/us_fly_total:>9.2f}x")
+        print(
+            f"    {'ASM fused':>20s} | {us_asm:9.1f} | {tflops(us_asm):8.2f} | {us_asm/us_fly_total:>9.2f}x"
+        )
 
     # Assert: FlyDSL total must beat CK total by at least 5% (we measured 1.18x).
-    assert us_fly_total < us_ck_total * 0.98, (
-        f"FlyDSL total {us_fly_total:.1f}us not faster than CK {us_ck_total:.1f}us"
-    )
+    assert (
+        us_fly_total < us_ck_total * 0.98
+    ), f"FlyDSL total {us_fly_total:.1f}us not faster than CK {us_ck_total:.1f}us"
 
 
 if __name__ == "__main__":
     import sys
+
     pytest.main([__file__, "-v", "-s"] + sys.argv[1:])
