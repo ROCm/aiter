@@ -369,22 +369,24 @@ def test_fused_flatten_fp8_group_quant(M: int, N1: int, N2: int, dtype):
 @pytest.mark.parametrize("N1, N2", [(16, 128)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_flatten_fp8_group_quant_transpose_scale(M: int, N1: int, N2: int, dtype):
-    """Test that transpose_scale parameter returns scale with transposed memory layout."""
+    """transpose_scale=True returns the same logical (M, num_bs_cols) scale
+    tensor as the default path, but in column-major storage so consumers like
+    CK bpreshuffle GEMM can read the transposed layout without an extra
+    .transpose(-1, -2).contiguous() copy.
+    """
     torch.manual_seed(0)
     group_size = 128
     dtype_quant = aiter.dtypes.fp8
     x = torch.randn((N1, M, N2), dtype=dtype, device="cuda") / 10
     x = x.transpose(0, 1)
 
-    # Call with transpose_scale=False (original behavior)
-    y_q_orig, y_s_orig = fused_flatten_fp8_group_quant(
+    y_q_default, y_s_default = fused_flatten_fp8_group_quant(
         x,
         group_size=group_size,
         dtype_quant=dtype_quant,
         transpose_scale=False,
     )
 
-    # Call with transpose_scale=True
     y_q_transposed, y_s_transposed = fused_flatten_fp8_group_quant(
         x,
         group_size=group_size,
@@ -394,33 +396,27 @@ def test_fused_flatten_fp8_group_quant_transpose_scale(M: int, N1: int, N2: int,
 
     num_bs_cols = (N1 * N2 + group_size - 1) // group_size
 
-    # Verify that both outputs have the same shape
-    assert y_s_orig.shape == (
-        M,
-        num_bs_cols,
-    ), f"Expected shape (M, num_bs_cols), got {y_s_orig.shape}"
-    assert y_s_transposed.shape == (
-        M,
-        num_bs_cols,
-    ), f"Expected shape (M, num_bs_cols), got {y_s_transposed.shape}"
+    # Public shape is identical for both paths.
+    assert y_s_default.shape == (M, num_bs_cols)
+    assert y_s_transposed.shape == (M, num_bs_cols)
 
-    # Verify that transpose_scale=True version is equivalent to .transpose().contiguous().view()
-    y_s_expected = y_s_orig.transpose(0, 1).contiguous().view(*y_s_orig.shape)
+    # Default path is row-major contiguous: strides (num_bs_cols, 1).
+    assert y_s_default.stride() == (num_bs_cols, 1)
+    assert y_s_default.is_contiguous()
 
-    # Verify that both have the same shape and strides (row-major after view)
-    assert (
-        y_s_orig.stride() == y_s_transposed.stride()
-    ), "Both should have row-major strides"
-    assert (
-        y_s_orig.is_contiguous() and y_s_transposed.is_contiguous()
-    ), "Both should be contiguous"
+    # transpose_scale=True path is column-major: strides (1, M).
+    # Underlying (num_bs_cols, M) buffer is row-major (and therefore .T is
+    # contiguous), which is exactly the layout the CK bpreshuffle GEMM
+    # consumer can read directly.
+    assert y_s_transposed.stride() == (1, M)
+    assert y_s_transposed.T.is_contiguous()
 
-    # Verify numerical correctness - values should match the transpose().contiguous().view() pattern
-    torch.testing.assert_close(y_s_transposed, y_s_expected, atol=1e-6, rtol=1e-6)
+    # Logical values at [m, n] match between the two paths element-wise — the
+    # flag only changes physical layout, not the per-token-group scales.
+    torch.testing.assert_close(y_s_transposed, y_s_default, atol=0, rtol=0)
 
-    # Verify that the quantized fp8 tensor is identical
-    # For fp8 tensors, use exact bitwise comparison
-    torch.testing.assert_close(y_q_transposed, y_q_orig, atol=0, rtol=0)
+    # FP8 quantized tensor is bit-identical between the two paths.
+    torch.testing.assert_close(y_q_transposed, y_q_default, atol=0, rtol=0)
 
 
 def run_torch_reduce_act_mul_fp8_group_quant(

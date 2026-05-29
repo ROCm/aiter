@@ -505,14 +505,18 @@ def fused_flatten_fp8_group_quant(
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
     - transpose_scale: If True, return scale with shape (M, cdiv(N1*N2, group_size))
-                       but stored in column-major (transposed) memory layout.
-                       Equivalent to: scale.transpose(0, 1).contiguous().view(*scale.shape)
-                       Mirrors the same flag on fused_rms_fp8_group_quant.
+                       in column-major (transposed) memory layout, i.e. strides
+                       (1, M) instead of the default (num_bs_cols, 1). Element
+                       values at logical position [m, n] are unchanged; only the
+                       physical memory layout differs so downstream consumers
+                       (e.g. CK bpreshuffle GEMM) can skip an explicit
+                       .transpose(-1, -2).contiguous() before reading.
 
     Returns:
     - out: The output matrix with shape (M, N1 * N2).
     - out_block_scales: The output matrix with shape (M, cdiv((N1 * N2), group_size)).
-                        When transpose_scale=True, has column-major memory layout.
+                        When transpose_scale=True, strides are (1, M)
+                        (column-major); otherwise (num_bs_cols, 1) (row-major).
     """
     M, N1, N2 = x.shape
 
@@ -522,20 +526,19 @@ def fused_flatten_fp8_group_quant(
     out = torch.empty((M, N), dtype=dtype_quant, device=x.device)
 
     if transpose_scale:
-        # Allocate (num_bs_cols, M) row-major; pass swapped (1, M) strides so
-        # the kernel writes column-major into the (M, num_bs_cols) logical
-        # buffer. View back to (M, num_bs_cols) at the end so the public
-        # tensor is row-major contiguous and byte-equivalent to
-        # default.transpose(0, 1).contiguous().view(M, num_bs_cols).
+        # Physical buffer is (num_bs_cols, M) row-major; .T gives a
+        # (M, num_bs_cols) view with strides (1, M). The kernel writes
+        # at out_scales_ptr + m * stride_m + n * stride_n, so passing
+        # the natural strides of this view writes to the correct memory
+        # location regardless of layout — no special-case stride wiring
+        # or trailing .view() needed.
         out_block_scales = torch.empty(
             (num_bs_cols, M), dtype=torch.float32, device=x.device
-        )
-        out_bs_row_stride, out_bs_col_stride = 1, M
+        ).T
     else:
         out_block_scales = torch.empty(
             (M, num_bs_cols), dtype=torch.float32, device=x.device
         )
-        out_bs_row_stride, out_bs_col_stride = num_bs_cols, 1
 
     DTYPE_MAX = (
         torch.finfo(out.dtype).max
@@ -552,21 +555,13 @@ def fused_flatten_fp8_group_quant(
         out_block_scales,
         *x.stride(),
         *out.stride(),
-        out_bs_row_stride,
-        out_bs_col_stride,
+        *out_block_scales.stride(),
         N2,
         BLOCK_SIZE_N2=BLOCK_SIZE_N2,
         QUANT_BLOCK_SIZE=group_size,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
     )
-
-    if transpose_scale:
-        # Reinterpret the (num_bs_cols, M) row-major buffer back as
-        # (M, num_bs_cols) — same shape as default path, but data is now
-        # in column-major layout (consumers like CK bpreshuffle GEMM
-        # expect this layout when called with the new attribute marker).
-        out_block_scales = out_block_scales.view(M, num_bs_cols)
 
     return out, out_block_scales
 
