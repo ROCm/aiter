@@ -1221,6 +1221,7 @@ def flydsl_moe_stage2(
                 model_dim=model_dim,
                 dtype_str=_reduce_dtype_str,
                 use_mask=use_mask,
+                num_experts=E,
             )
             X = target.view(token_num, topk, model_dim)
             if use_mask:
@@ -1231,7 +1232,14 @@ def flydsl_moe_stage2(
                 em = torch.empty(0, device=out.device, dtype=torch.int32)
                 tk = torch.empty(0, device=out.device, dtype=torch.int32)
             stream = torch.cuda.current_stream()
-            reduce_exe(X, out, em, tk, token_num, stream)
+            reduce_exe(
+                _ptr_view_safe(X),
+                _ptr_view_safe(out),
+                _ptr_view_safe(em),
+                _ptr_view_safe(tk),
+                token_num,
+                stream,
+            )
         else:
             # Unsupported dtype for the masked kernel — fall back to torch.sum.
             # This drops the EP mask, so only valid for non-EP runs.
