@@ -918,8 +918,10 @@ void mla_decode_stage1_asm_fwd(
     } else if (gqa_ratio == 8){
         if (q_type == "bf16" && kv_type == "bf16"){
             if(!persistent){
-                config_max_seqlen_q = 1;
                 sub_Q = 8;
+                // qh8 bf16 kernels handle QSEQLEN internally (all tokens in one WG).
+                // s_MQA must be gqa_ratio only, not gqa_ratio*qseqlen.
+                args.s_MQA = gqa_ratio;
             }
         } else if (q_type == "fp8" && kv_type == "fp8"){
             if(!persistent && max_seqlen_q == 1){
@@ -970,7 +972,7 @@ void mla_decode_stage1_asm_fwd(
         ": unsupport current data type or shape. please refer to asm_mla.cu");
 
     int bdx = 256;
-    int gdx = (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
+    int gdx = (args.s_MQA + sub_Q - 1) / sub_Q;
     int gdy = batch;
     int gdz = kv_split;
 
