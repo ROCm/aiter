@@ -114,6 +114,21 @@ def fused_allreduce_rmsnorm_quant_per_group(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def fused_qknorm_allreduce(
+    _fa: int,
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    eps: float,
+    reg_ptr: int,
+    reg_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def dispose(_fa: int) -> None: ...
 
 

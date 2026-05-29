@@ -26,6 +26,8 @@ env:
   GPU_ARCH_LIST: "gfx942;gfx950"
   AITER_TEST: "op_tests"
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
+  AITER_PREBUILD_MAX_JOBS: "96"
+  TRITON_WHEEL_ARTIFACT_NAME: triton_wheelhouse
 
 jobs:
   check-signal:
@@ -35,7 +37,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download and check signal artifact
+      - name: Wait for Checks workflow
         run: ./.github/scripts/check_signal.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -93,24 +95,62 @@ jobs:
           set -euo pipefail
           docker run --rm \
             --network=host \
+            -e AITER_PREBUILD_MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
+            -e AITER_RUNNER_NAME="${RUNNER_NAME:-unknown}" \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash -lc '
+              set -euo pipefail
               git config --global --add safe.directory /workspace &&
               git -C /workspace rev-parse HEAD >/dev/null &&
               shopt -s nullglob &&
               rm -rf dist build aiter_meta ./*.egg-info &&
               pip install -r requirements.txt &&
-              pip install --upgrade pandas zmq einops numpy==1.26.2 &&
+              pip install --upgrade pandas pyzmq einops numpy==1.26.2 &&
               pip install --upgrade "pybind11>=3.0.1" &&
               pip install --upgrade "ninja>=1.11.1" &&
               pip install --upgrade setuptools_scm &&
               pip install tabulate &&
-              echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, and MAX_JOBS: 128" &&
-              PREBUILD_KERNELS=1 MAX_JOBS=128 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel &&
+              echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, and MAX_JOBS: ${AITER_PREBUILD_MAX_JOBS}" &&
+              export PREBUILD_KERNELS=1 &&
+              export MAX_JOBS="${AITER_PREBUILD_MAX_JOBS}" &&
+              export GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" &&
+              prebuild_start=$(date +%s) &&
+              set +e &&
+              python setup.py bdist_wheel 2>&1 | tee .aiter-prebuild.log
+              build_status=${PIPESTATUS[0]}
+              set -e
+              prebuild_end=$(date +%s)
+              {
+                echo "BUILD_STATUS=${build_status}"
+                echo "PREBUILD_START=${prebuild_start}"
+                echo "PREBUILD_END=${prebuild_end}"
+              } > .aiter-prebuild.env
+              if [ "${build_status}" -ne 0 ]; then
+                exit "${build_status}"
+              fi
               ls -lh dist/*.whl
             '
+
+      - name: Summarize Aiter prebuild
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [ ! -f .aiter-prebuild.env ]; then
+            echo "::warning::Aiter prebuild metadata was not generated"
+            exit 0
+          fi
+          . ./.aiter-prebuild.env
+          AITER_RUNNER_NAME="${RUNNER_NAME:-unknown}" \
+          GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" \
+          PREBUILD_KERNELS=1 \
+          MAX_JOBS="${{ env.AITER_PREBUILD_MAX_JOBS }}" \
+          python3 .github/scripts/aiter_prebuild_summary.py \
+            --log .aiter-prebuild.log \
+            --build-status "${BUILD_STATUS}" \
+            --start "${PREBUILD_START}" \
+            --end "${PREBUILD_END}"
 
       - name: Verify prebuilt kernels in wheel
         run: |
@@ -150,6 +190,7 @@ jobs:
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: dist/*.whl
+          compression-level: 0
           retention-days: 14
 
       - name: Configure AWS credentials
@@ -203,13 +244,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: [check-signal, build_aiter_wheels]
     outputs:
-      shard_count: 5
+      shard_count: 8
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Split Aiter Tests (5 shards)
-        run: ./.github/scripts/split_tests.sh --shards 5 --test-type aiter
+      - name: Split Aiter Tests (8 shards)
+        run: ./.github/scripts/split_tests.sh --shards 8 --test-type aiter
 
       - name: Upload test shard lists as artifact
         uses: actions/upload-artifact@v4
@@ -218,56 +259,89 @@ jobs:
           path: aiter_shard_*.list
           retention-days: 7
 
+  prepare_triton_wheel:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    needs: check-signal
+    uses: ./.github/workflows/prepare-triton-wheel.yaml
+    with:
+      docker-image: rocm/pytorch:latest
+      artifact-name: triton_wheelhouse
+      retention-days: 3
+
   standard:
     if: >-
       (!github.event.pull_request || github.event.pull_request.draft == false) &&
       github.event.action != 'labeled'
     name: Standard Tests (1 GPU)
-    needs: [build_aiter_wheels, split_aiter_tests]
+    needs: [build_aiter_wheels, split_aiter_tests, prepare_triton_wheel]
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: linux-aiter-mi35x-1
             label: MI35X
-            shard_total: 5
+            shard_total: 8
             shard_idx: 0
           - runner: linux-aiter-mi35x-1
             label: MI35X
-            shard_total: 5
+            shard_total: 8
             shard_idx: 1
           - runner: linux-aiter-mi35x-1
             label: MI35X
-            shard_total: 5
+            shard_total: 8
             shard_idx: 2
           - runner: linux-aiter-mi35x-1
             label: MI35X
-            shard_total: 5
+            shard_total: 8
             shard_idx: 3
           - runner: linux-aiter-mi35x-1
             label: MI35X
-            shard_total: 5
+            shard_total: 8
             shard_idx: 4
-          - runner: linux-aiter-mi300x-1
+          - runner: linux-aiter-mi35x-1
+            label: MI35X
+            shard_total: 8
+            shard_idx: 5
+          - runner: linux-aiter-mi35x-1
+            label: MI35X
+            shard_total: 8
+            shard_idx: 6
+          - runner: linux-aiter-mi35x-1
+            label: MI35X
+            shard_total: 8
+            shard_idx: 7
+          - runner: aiter-1gpu-runner
             label: MI300X
-            shard_total: 5
+            shard_total: 8
             shard_idx: 0
-          - runner: linux-aiter-mi300x-1
+          - runner: aiter-1gpu-runner
             label: MI300X
-            shard_total: 5
+            shard_total: 8
             shard_idx: 1
-          - runner: linux-aiter-mi300x-1
+          - runner: aiter-1gpu-runner
             label: MI300X
-            shard_total: 5
+            shard_total: 8
             shard_idx: 2
-          - runner: linux-aiter-mi300x-1
+          - runner: aiter-1gpu-runner
             label: MI300X
-            shard_total: 5
+            shard_total: 8
             shard_idx: 3
-          - runner: linux-aiter-mi300x-1
+          - runner: aiter-1gpu-runner
             label: MI300X
-            shard_total: 5
+            shard_total: 8
             shard_idx: 4
+          - runner: aiter-1gpu-runner
+            label: MI300X
+            shard_total: 8
+            shard_idx: 5
+          - runner: aiter-1gpu-runner
+            label: MI300X
+            shard_total: 8
+            shard_idx: 6
+          - runner: aiter-1gpu-runner
+            label: MI300X
+            shard_total: 8
+            shard_idx: 7
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -296,6 +370,13 @@ jobs:
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
+
+      - name: Download Triton wheel artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
+          path: triton_wheels
 
       - name: Docker login
         if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
@@ -335,10 +416,24 @@ jobs:
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -e AITER_TEST="${AITER_TEST}" \
+          -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
           $IMAGE_TAG
+
+      - name: Check GPU visibility
+        run: |
+          set -euo pipefail
+          if docker exec \
+            -w /workspace \
+            aiter_test \
+            bash -lc './.github/scripts/aiter_gpu_visibility_check.sh'; then
+            echo "GPU visibility check completed"
+          else
+            status=$?
+            echo "::warning::GPU visibility check failed with exit code ${status}; continuing"
+          fi
 
       - name: Sync CK submodule
         run: |
@@ -372,7 +467,7 @@ jobs:
           bash -lc "
             pip uninstall -y amd-aiter aiter || true
             pip install -r requirements.txt
-            pip install --upgrade pandas zmq einops numpy==1.26.2
+            pip install --upgrade pandas pyzmq einops numpy==1.26.2
             pip install --upgrade 'pybind11>=3.0.1'
             pip install --upgrade 'ninja>=1.11.1'
             pip install tabulate
@@ -380,10 +475,51 @@ jobs:
             pip show amd-aiter
           "
 
-      - name: Install amd-triton
+      - name: Sync prebuilt kernels into source tree
         run: |
+          set -euo pipefail
+          docker exec -i \
+          -w /workspace \
+          aiter_test \
+          python3 - <<'PY'
+          from importlib.metadata import distribution
+          from pathlib import Path
+          from shutil import copy2
+
+          dist = distribution("amd-aiter")
+          installed_jit = Path(dist.locate_file("aiter/jit")).resolve()
+          workspace_jit = Path("/workspace/aiter/jit").resolve()
+
+          kernels = sorted(installed_jit.glob("*.so"))
+          if not kernels:
+              raise SystemExit(f"No prebuilt kernels found in {installed_jit}")
+
+          workspace_jit.mkdir(parents=True, exist_ok=True)
+          for kernel in kernels:
+              copy2(kernel, workspace_jit / kernel.name)
+
+          print(
+              f"Synced {len(kernels)} prebuilt kernels from {installed_jit} "
+              f"to {workspace_jit}"
+          )
+          PY
+
+      - name: Install triton
+        run: |
+          # Ensure install_triton.sh is available even when the PR branch
+          # was created before the script was added to main (#2959).
+          # The workflow file always comes from the base branch, so we
+          # materialize the script from the base ref when missing.
+          if [ ! -f .github/scripts/install_triton.sh ]; then
+            BASE_REF="${{ github.event.pull_request.base.ref || github.ref_name }}"
+            mkdir -p .github/scripts
+            curl -fsSL \
+              "https://raw.githubusercontent.com/${{ github.repository }}/${BASE_REF}/.github/scripts/install_triton.sh" \
+              -o .github/scripts/install_triton.sh
+            chmod +x .github/scripts/install_triton.sh
+          fi
           docker exec -w /workspace aiter_test \
-            bash -c "./.github/scripts/install_triton.sh && pip show amd-triton"
+            bash -c "./.github/scripts/install_triton.sh && pip show triton"
 
       - name: Show Aiter version
         run: |
@@ -411,10 +547,13 @@ jobs:
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
-        if: success()
+        if: always()
         with:
           name: standard-test-log-${{ matrix.runner }}-shard-${{ matrix.shard_idx }}
-          path: latest_test.log
+          path: |
+            latest_test.log
+            tuned_op_bench.csv
+          if-no-files-found: warn
           retention-days: 7
 
       - name: Cleanup container
@@ -445,8 +584,8 @@ jobs:
           set -ex
           echo "Checking Standard Test Results..."
           all_passed=true
-          for shard in {0..4}; do
-            for runner in {linux-aiter-mi35x-1,linux-aiter-mi300x-1}; do
+          for shard in {0..7}; do
+            for runner in {linux-aiter-mi35x-1,aiter-1gpu-runner}; do
               if [ ! -f standard-test-log-${runner}-shard-${shard}/latest_test.log ]; then
                 echo "Test report for ${runner} shard ${shard} not found."
                 all_passed=false
@@ -471,7 +610,7 @@ jobs:
         include:
           - runner: linux-aiter-mi35x-8
             label: MI35X
-          - runner: linux-aiter-mi300x-8
+          - runner: aiter-8gpu-runner
             label: MI300X
     runs-on: ${{ matrix.runner }}
 
@@ -529,6 +668,19 @@ jobs:
           --name aiter_test \
           $IMAGE_TAG
 
+      - name: Check GPU visibility
+        run: |
+          set -euo pipefail
+          if docker exec \
+            -w /workspace \
+            aiter_test \
+            bash -lc './.github/scripts/aiter_gpu_visibility_check.sh'; then
+            echo "GPU visibility check completed"
+          else
+            status=$?
+            echo "::warning::GPU visibility check failed with exit code ${status}; continuing"
+          fi
+
       - name: Sync CK submodule
         run: |
           set -ex
@@ -561,7 +713,7 @@ jobs:
           bash -lc "
             pip uninstall -y amd-aiter aiter || true
             pip install -r requirements.txt
-            pip install --upgrade pandas zmq einops numpy==1.26.2
+            pip install --upgrade pandas pyzmq einops numpy==1.26.2
             pip install --upgrade 'pybind11>=3.0.1'
             pip install --upgrade 'ninja>=1.11.1'
             pip install tabulate
@@ -569,10 +721,51 @@ jobs:
             pip show amd-aiter
           "
 
-      - name: Install amd-triton
+      - name: Sync prebuilt kernels into source tree
         run: |
+          set -euo pipefail
+          docker exec -i \
+          -w /workspace \
+          aiter_test \
+          python3 - <<'PY'
+          from importlib.metadata import distribution
+          from pathlib import Path
+          from shutil import copy2
+
+          dist = distribution("amd-aiter")
+          installed_jit = Path(dist.locate_file("aiter/jit")).resolve()
+          workspace_jit = Path("/workspace/aiter/jit").resolve()
+
+          kernels = sorted(installed_jit.glob("*.so"))
+          if not kernels:
+              raise SystemExit(f"No prebuilt kernels found in {installed_jit}")
+
+          workspace_jit.mkdir(parents=True, exist_ok=True)
+          for kernel in kernels:
+              copy2(kernel, workspace_jit / kernel.name)
+
+          print(
+              f"Synced {len(kernels)} prebuilt kernels from {installed_jit} "
+              f"to {workspace_jit}"
+          )
+          PY
+
+      - name: Install triton
+        run: |
+          # Ensure install_triton.sh is available even when the PR branch
+          # was created before the script was added to main (#2959).
+          # The workflow file always comes from the base branch, so we
+          # materialize the script from the base ref when missing.
+          if [ ! -f .github/scripts/install_triton.sh ]; then
+            BASE_REF="${{ github.event.pull_request.base.ref || github.ref_name }}"
+            mkdir -p .github/scripts
+            curl -fsSL \
+              "https://raw.githubusercontent.com/${{ github.repository }}/${BASE_REF}/.github/scripts/install_triton.sh" \
+              -o .github/scripts/install_triton.sh
+            chmod +x .github/scripts/install_triton.sh
+          fi
           docker exec -w /workspace aiter_test \
-            bash -c "./.github/scripts/install_triton.sh && pip show amd-triton"
+            bash -c "./.github/scripts/install_triton.sh && pip show triton"
 
       - name: Show Aiter version
         run: |
@@ -609,3 +802,175 @@ jobs:
         if: always()
         run: |
           ./.github/scripts/clean_up_rocm.sh
+
+  tuned_op_bench:
+    # Tuned operator perf regression check.
+    # - PR: pull last main baseline CSV, compare current shard's CSV, warn-only
+    # - push to main / workflow_dispatch: publish current CSV as next baseline
+    # Only consumes csv from linux-aiter-mi35x-1 runner to avoid cross-arch noise.
+    name: Tuned Op Bench
+    if: >-
+      always() &&
+      !cancelled() &&
+      !github.event.pull_request.draft &&
+      github.event.action != 'labeled' &&
+      github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    needs: [standard]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download standard test logs (mi35x only)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: standard-test-log-linux-aiter-mi35x-1-shard-*
+          path: /tmp/logs/
+
+      - name: Locate current tuned_op_bench.csv
+        id: current
+        run: |
+          shopt -s nullglob
+          csv_files=(/tmp/logs/*/tuned_op_bench.csv)
+          if [[ ${#csv_files[@]} -eq 0 ]]; then
+              echo "::warning::No tuned op benchmark CSV found in any mi35x shard; skipping tuned_op_bench"
+              echo "found=false" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          echo "Merging tuned op benchmark CSVs:"
+          printf '  %s\n' "${csv_files[@]}"
+          python3 - "${csv_files[@]}" <<'PY'
+          import csv
+          import sys
+
+          rows = []
+          fieldnames = []
+          seen = set()
+          for path in sys.argv[1:]:
+              with open(path, newline="") as f:
+                  reader = csv.DictReader(f)
+                  if not reader.fieldnames:
+                      continue
+                  for name in reader.fieldnames:
+                      if name not in seen:
+                          fieldnames.append(name)
+                          seen.add(name)
+                  rows.extend(reader)
+
+          if "us" not in seen:
+              raise SystemExit("merged tuned op benchmark CSV is missing required `us` column")
+
+          with open("/tmp/current.csv", "w", newline="") as f:
+              writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+              writer.writeheader()
+              for row in rows:
+                  writer.writerow({name: row.get(name, "") for name in fieldnames})
+          print(f"Merged {len(rows)} row(s) into /tmp/current.csv")
+          PY
+          echo "Current merged CSV: /tmp/current.csv ($(wc -l < /tmp/current.csv) lines)"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      # ── PR path: compare vs baseline ──
+      - name: Fetch baseline from PR base.sha
+        if: steps.current.outputs.found == 'true' && github.event_name == 'pull_request'
+        id: baseline_pinned
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: aiter-test.yaml
+          commit: ${{ github.event.pull_request.base.sha }}
+          name: tuned-op-bench-${{ github.event.pull_request.base.sha }}
+          path: /tmp/baseline_pinned/
+          if_no_artifact_found: warn
+
+      - name: Fallback — fetch baseline from latest main
+        if: >-
+          steps.current.outputs.found == 'true' &&
+          github.event_name == 'pull_request'
+        id: baseline_main
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: aiter-test.yaml
+          branch: main
+          name_is_regexp: true
+          name: ^tuned-op-bench-[a-f0-9]+$
+          path: /tmp/baseline_main/
+          if_no_artifact_found: warn
+
+      - name: Compare
+        if: steps.current.outputs.found == 'true' && github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CURR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          baseline_csv=""
+          if [[ -f /tmp/baseline_pinned/tuned_op_bench.csv ]]; then
+              baseline_csv=/tmp/baseline_pinned/tuned_op_bench.csv
+              echo "Using baseline pinned to PR.base.sha=${BASE_SHA:0:7}"
+          else
+              # fallback: pick first match under /tmp/baseline_main/*
+              shopt -s nullglob
+              candidates=(/tmp/baseline_main/*/tuned_op_bench.csv /tmp/baseline_main/tuned_op_bench.csv)
+              for c in "${candidates[@]}"; do
+                  if [[ -f "$c" ]]; then
+                      baseline_csv="$c"
+                      echo "Using fallback baseline from latest main: $c"
+                      break
+                  fi
+              done
+          fi
+          if [[ -z "$baseline_csv" ]]; then
+              echo "::warning::No tuned op benchmark baseline found (neither pinned PR.base.sha nor latest main); skipping compare."
+              {
+                  echo "## Tuned Op Bench"
+                  echo
+                  echo "_No baseline available — first run on this branch or main hasn't published baseline yet._"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+          fi
+          echo "## Tuned Op Bench (vs baseline)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          bash .github/scripts/check_tuned_op_regression.sh \
+              "$baseline_csv" /tmp/current.csv \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # ── main push / workflow_dispatch path: publish baseline ──
+      - name: Stage baseline payload
+        if: >-
+          steps.current.outputs.found == 'true' &&
+          (github.event_name == 'push' && github.ref == 'refs/heads/main'
+           || github.event_name == 'workflow_dispatch')
+        run: |
+          mkdir -p /tmp/publish
+          cp /tmp/current.csv /tmp/publish/tuned_op_bench.csv
+          python3 -c "
+          import json, os, datetime
+          meta = {
+              'commit': os.environ['GITHUB_SHA'],
+              'ref': os.environ['GITHUB_REF'],
+              'event': os.environ['GITHUB_EVENT_NAME'],
+              'runner_pool': 'linux-aiter-mi35x-1',
+              'gpu_arch_list': os.environ.get('GPU_ARCH_LIST', ''),
+              'ran_at': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+          }
+          with open('/tmp/publish/metadata.json', 'w') as f:
+              json.dump(meta, f, indent=2)
+          print(json.dumps(meta, indent=2))
+          "
+          ls -la /tmp/publish/
+          wc -l /tmp/publish/tuned_op_bench.csv
+
+      - name: Publish baseline artifact
+        if: >-
+          steps.current.outputs.found == 'true' &&
+          (github.event_name == 'push' && github.ref == 'refs/heads/main'
+           || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuned-op-bench-${{ github.sha }}
+          path: /tmp/publish/
+          retention-days: 90

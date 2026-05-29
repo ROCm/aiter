@@ -28,6 +28,7 @@ def matmul_launch_metadata(grid, kernel, args):
     ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
     gindx = args.get("GatherIndx", None)
     if gindx is not None:
+        gindx = gindx.to(torch.int32)
         ret["name"] += "_layer1"
     else:
         ret["name"] += "_layer2"
@@ -40,7 +41,6 @@ def matmul_launch_metadata(grid, kernel, args):
     fK = K if K is not None else n_tokens
     ret[f"flops{nbits}"] = 2.0 * fM * N * fK
 
-    gindx = args.get("GatherIndx", None)
     n_x_bytes = X.numel() * X.element_size()
     n_y_bytes = Y.numel() * Y.element_size()
     if hist is not None:

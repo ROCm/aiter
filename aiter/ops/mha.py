@@ -1293,7 +1293,7 @@ def _flash_attn_forward(
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def is_fmha_v3_fp8():
-        ret = get_gfx() == "gfx942"
+        ret = get_gfx() in ("gfx942", "gfx950")
         ret = ret and (hdim_q == 128)
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
@@ -1319,6 +1319,11 @@ def _flash_attn_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table
+        # (1,2,4,8,16); arbitrary divisor ratios route to CK.
+        if is_fmha_v3_fp8():
+            gqa_ratio = nhead_q // nhead_k
+            ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2074,7 +2079,7 @@ def _flash_attn_varlen_forward(
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def is_fmha_v3_fp8():
-        ret = get_gfx() == "gfx942"
+        ret = get_gfx() in ("gfx942", "gfx950")
         ret = ret and (hdim_q == 128)
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
@@ -2100,6 +2105,11 @@ def _flash_attn_varlen_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and logits_soft_cap == 0.0
+        # FP8 ASM kernels assemble the GQA-shift from a fixed log2 table
+        # (1,2,4,8,16); arbitrary divisor ratios route to CK.
+        if is_fmha_v3_fp8():
+            gqa_ratio = nhead_q // nhead_k
+            ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]

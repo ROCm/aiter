@@ -1,13 +1,12 @@
 #!/bin/bash
 
-# This script downloads the pre-checks artifact produced by the Checks workflow.
-# It scopes artifact lookup to the matching workflow run for the current branch and
-# head SHA, which avoids repo-wide artifact pagination and GitHub API rate limits.
+# Gate a downstream workflow on the Checks workflow run for the current commit.
+# Exit 0 on success, 78 (neutral/skip) on any other conclusion, 1 if the run
+# cannot be located within the retry budget.
 
 set -euo pipefail
 
 CHECKS_WORKFLOW_NAME="${CHECKS_WORKFLOW_NAME:-Checks}"
-CHECKS_SIGNAL_ARTIFACT_PREFIX="${CHECKS_SIGNAL_ARTIFACT_PREFIX:-checks-signal}"
 MAX_RETRIES="${MAX_RETRIES:-5}"
 RETRY_INTERVAL_SECONDS="${RETRY_INTERVAL_SECONDS:-30}"
 REPO="${GITHUB_REPOSITORY:-}"
@@ -95,66 +94,50 @@ find_checks_run_id() {
     --jq "(map(select(.headSha == \"${target_head_sha}\")) | first | .databaseId) // empty"
 }
 
-find_signal_artifact_name() {
+# Echoes "<status>\t<conclusion>" for the given run.
+fetch_run_state() {
   local run_id="$1"
+  gh api "repos/${REPO}/actions/runs/${run_id}" \
+    --jq '[.status, (.conclusion // "")] | @tsv'
+}
 
-  gh api "repos/${REPO}/actions/runs/${run_id}/artifacts" | python3 -c '
-import json
-import sys
-
-prefix = sys.argv[1]
-data = json.load(sys.stdin)
-
-matching = sorted(
-    (
-        artifact
-        for artifact in data.get("artifacts", [])
-        if not artifact.get("expired")
-        and (
-            artifact.get("name") == prefix
-            or artifact.get("name", "").startswith(f"{prefix}-")
-        )
-    ),
-    key=lambda artifact: artifact.get("created_at", ""),
-)
-
-print(matching[-1]["name"] if matching else "")
-' "${CHECKS_SIGNAL_ARTIFACT_PREFIX}"
+print_failed_jobs() {
+  local run_id="$1"
+  gh api -X GET "repos/${REPO}/actions/runs/${run_id}/jobs" --paginate \
+    --jq '.jobs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped") | "FAILED: \(.name) (\(.conclusion))"' \
+    || true
 }
 
 for i in $(seq 1 "${MAX_RETRIES}"); do
   echo "Attempt ${i}: Locating ${CHECKS_WORKFLOW_NAME} workflow run..."
-  rm -f checks_signal.txt
 
   RUN_ID="$(find_checks_run_id || true)"
-  if [ -n "${RUN_ID}" ]; then
-    ARTIFACT_NAME="$(find_signal_artifact_name "${RUN_ID}" || true)"
-    if [ -z "${ARTIFACT_NAME}" ]; then
-      echo "Attempt ${i}: No ${CHECKS_SIGNAL_ARTIFACT_PREFIX} artifact found in run ${RUN_ID} yet."
-    else
-      echo "Attempt ${i}: Downloading artifact '${ARTIFACT_NAME}' from run ${RUN_ID}..."
-      if gh run download "${RUN_ID}" --repo "${REPO}" --name "${ARTIFACT_NAME}"; then
-        if [ -f checks_signal.txt ]; then
-          echo "Artifact ${ARTIFACT_NAME} downloaded successfully."
-          SIGNAL="$(head -n 1 checks_signal.txt)"
-          if [ "${SIGNAL}" = "success" ]; then
-            echo "Pre-checks passed, continuing workflow."
-            exit 0
-          fi
-
-          echo "Pre-checks failed, skipping workflow. Details:"
-          tail -n +2 checks_signal.txt
-          exit 78  # 78 = neutral/skip
-        fi
-      fi
-    fi
-  else
+  if [ -z "${RUN_ID}" ]; then
     echo "Attempt ${i}: Matching ${CHECKS_WORKFLOW_NAME} run not found yet."
+  else
+    STATE="$(fetch_run_state "${RUN_ID}" || true)"
+    STATUS="${STATE%%$'\t'*}"
+    CONCLUSION="${STATE#*$'\t'}"
+    # If STATE is unexpected treat that as "no conclusion yet".
+    [ "${CONCLUSION}" = "${STATE}" ] && CONCLUSION=""
+
+    echo "Attempt ${i}: run ${RUN_ID} status=${STATUS:-unknown} conclusion=${CONCLUSION:-<none>}"
+
+    if [ "${STATUS}" = "completed" ]; then
+      if [ "${CONCLUSION}" = "success" ]; then
+        echo "Pre-checks passed, continuing workflow."
+        exit 0
+      fi
+
+      echo "Pre-checks did not pass (conclusion: ${CONCLUSION:-unknown}), skipping workflow."
+      print_failed_jobs "${RUN_ID}"
+      exit 78  # 78 = neutral/skip
+    fi
   fi
 
-  echo "Artifact not ready yet, retrying in ${RETRY_INTERVAL_SECONDS}s..."
+  echo "Pre-checks not ready yet, retrying in ${RETRY_INTERVAL_SECONDS}s..."
   sleep "${RETRY_INTERVAL_SECONDS}"
 done
 
-echo "Failed to download pre-checks artifact after ${MAX_RETRIES} attempts. Exiting workflow."
+echo "Failed to read pre-checks status after ${MAX_RETRIES} attempts. Exiting workflow."
 exit 1

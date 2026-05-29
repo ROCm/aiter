@@ -70,26 +70,9 @@ def e8m0_to_f32(scale_e8m0_biased):
 
 
 def e8m0_shuffle(scale):
-    if scale is None:
-        return scale
-    if scale.dtype == torch.float32:
-        return scale
-    assert scale.ndim == 2, "scale must be a 2D tensor"
-    m, n = scale.shape
-    scale_padded = torch.empty(
-        (m + 255) // 256 * 256,
-        (n + 7) // 8 * 8,
-        dtype=scale.dtype,
-        device=scale.device,
-    )
+    from aiter.ops.shuffle import shuffle_scale
 
-    scale_padded[:m, :n] = scale
-    scale = scale_padded
-    sm, sn = scale.shape
-    scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
-    scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
-    scale = scale.view(sm, sn)
-    return scale
+    return shuffle_scale(scale)
 
 
 def down_size(size):

@@ -660,17 +660,36 @@ class CustomAllreduce:
         )
         return out
 
+    # Int dtypes have no fp counterpart in the C++ dispatch enum, but the
+    # all-gather kernel is pure memcpy parametrized only by sizeof(T). View
+    # ints as same-size floats so callers gathering token-id tensors work
+    # (e.g. DeepSeek-V4-Pro hash-gate gathers int32 across DP ranks).
+    _INT_TO_FP_VIEW = {
+        torch.int64: torch.float64,
+        torch.int32: torch.float32,
+        torch.int16: torch.float16,
+    }
+
     def custom_all_gather(
         self, inp: torch.Tensor, dim: int = 0
     ) -> Optional[torch.Tensor]:
+        orig_dtype = inp.dtype
+        view_dtype = self._INT_TO_FP_VIEW.get(orig_dtype)
+        if view_dtype is not None:
+            inp = inp.view(view_dtype)
+
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_gather_reg(inp, dim=dim)
+                out = self.all_gather_reg(inp, dim=dim)
             else:
                 print("allgather capture hipgraph error")
-                return torch.zeros_like(inp)
+                out = torch.zeros_like(inp)
         else:
-            return self.all_gather_unreg(inp, dim=dim)
+            out = self.all_gather_unreg(inp, dim=dim)
+
+        if view_dtype is not None and out is not None:
+            out = out.view(orig_dtype)
+        return out
 
     def fused_ar_rms(
         self,
@@ -856,6 +875,100 @@ class CustomAllreduce:
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
+
+    def fused_qknorm_ar(
+        self,
+        qkv_in: torch.Tensor,
+        q_w: torch.Tensor,
+        k_w: torch.Tensor,
+        eps: float,
+        registered: bool = False,
+    ):
+        dtype = qkv_in.dtype
+        device = qkv_in.device
+        hidden_dim_q = q_w.shape[-1]
+        hidden_dim_k = k_w.shape[-1]
+        token_num = qkv_in.shape[0]
+        hidden_dim_v = qkv_in.shape[1] - (hidden_dim_q + hidden_dim_k)
+        q_out = torch.empty((token_num, hidden_dim_q), dtype=dtype, device=device)
+        k_out = torch.empty((token_num, hidden_dim_k), dtype=dtype, device=device)
+        v_out = torch.empty((token_num, hidden_dim_v), dtype=dtype, device=device)
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        ops.fused_qknorm_allreduce(
+            self._ptr,
+            qkv_in,
+            q_w,
+            k_w,
+            q_out,
+            k_out,
+            v_out,
+            eps,
+            reg,
+            reg_bytes,
+        )
+        return q_out, k_out, v_out
+
+    def custom_fused_qknorm_ar(
+        self,
+        qkv_in: torch.Tensor,
+        q_w: torch.Tensor,
+        k_w: torch.Tensor,
+        eps: float,
+    ) -> [torch.Tensor, torch.Tensor, torch.Tensor]:
+        dtype = qkv_in.dtype
+        if self.disabled:
+            return (
+                torch.empty(
+                    (qkv_in.shape[0], q_w.shape[-1]), dtype=dtype, device=qkv_in.device
+                ),
+                torch.empty(
+                    (qkv_in.shape[0], k_w.shape[-1]), dtype=dtype, device=qkv_in.device
+                ),
+                torch.empty(
+                    (qkv_in.shape[0], qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1]),
+                    dtype=dtype,
+                    device=qkv_in.device,
+                ),
+            )
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_qknorm_ar(
+                    qkv_in,
+                    q_w,
+                    k_w,
+                    eps,
+                    registered=True,
+                )
+            else:
+                return (
+                    torch.empty(
+                        (qkv_in.shape[0], q_w.shape[-1]),
+                        dtype=dtype,
+                        device=qkv_in.device,
+                    ),
+                    torch.empty(
+                        (qkv_in.shape[0], k_w.shape[-1]),
+                        dtype=dtype,
+                        device=qkv_in.device,
+                    ),
+                    torch.empty(
+                        (
+                            qkv_in.shape[0],
+                            qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1],
+                        ),
+                        dtype=dtype,
+                        device=qkv_in.device,
+                    ),
+                )
+        else:
+            return self.fused_qknorm_ar(
+                qkv_in,
+                q_w,
+                k_w,
+                eps,
+                registered=False,
+            )
 
     def custom_fused_ar_rms_per_group_quant(
         self,

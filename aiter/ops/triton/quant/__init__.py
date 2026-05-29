@@ -7,11 +7,14 @@ from .quant import (
 )
 
 from .fused_fp8_quant import (
+    calc_rows_per_block,
     fused_rms_fp8_per_tensor_static_quant,
     fused_rms_fp8_group_quant,
+    fused_rms_gated_fp8_group_quant,
     fused_flatten_fp8_group_quant,
     fused_reduce_act_mul_fp8_group_quant,
     fused_reduce_rms_fp8_group_quant,
+    get_fp8_min_max_bounds,
 )
 
 from .fused_mxfp4_quant import (
@@ -30,8 +33,11 @@ __all__ = [
     "dynamic_mxfp4_quant",
     "_mxfp4_quant_op",
     # fused_fp8_quant.py exports
+    "calc_rows_per_block",
+    "get_fp8_min_max_bounds",
     "fused_rms_fp8_per_tensor_static_quant",
     "fused_rms_fp8_group_quant",
+    "fused_rms_gated_fp8_group_quant",
     "fused_flatten_fp8_group_quant",
     "fused_reduce_act_mul_fp8_group_quant",
     "fused_reduce_rms_fp8_group_quant",
