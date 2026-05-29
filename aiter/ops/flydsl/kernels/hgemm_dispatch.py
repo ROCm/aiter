@@ -36,7 +36,7 @@ def compile_flydsl_hgemm_kernel(
 ):
     """Build one FlyDSL HGEMM-family kernel from a unified config surface."""
 
-    del pack_n, stages, async_copy, c_to_lds
+    del pack_n, async_copy, c_to_lds
 
     if kernel_family in (None, KERNEL_FAMILY_HGEMM):
         if b_preshuffle:
@@ -50,6 +50,7 @@ def compile_flydsl_hgemm_kernel(
             TILE_M=tile_m,
             TILE_N=tile_n,
             TILE_K=tile_k,
+            STAGES=stages,
             SPLIT_K=split_k,
             BLOCK_M_WARPS=block_m_warps,
             BLOCK_N_WARPS=block_n_warps,
