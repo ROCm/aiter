@@ -54,9 +54,11 @@ def _pa_decode_sparse(
     unified_kv_ptr,  # [total_pages, D]
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
-    m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
-    l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
-    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
+    m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32 (unused when KV_SPLITS==1)
+    l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32 (unused when KV_SPLITS==1)
+    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32 (unused when KV_SPLITS==1)
+    attn_sink_ptr,  # [H] (only used when KV_SPLITS==1)
+    out_ptr,  # [N, H, D] (only used when KV_SPLITS==1)
     q_stride_t: tl.constexpr,
     q_stride_h: tl.constexpr,
     q_stride_d: tl.constexpr,
@@ -72,6 +74,9 @@ def _pa_decode_sparse(
     ap_stride_k: tl.constexpr,
     ap_stride_h: tl.constexpr,
     ap_stride_d: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    out_stride_d: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
     KV_SPLITS: tl.constexpr,
@@ -83,10 +88,17 @@ def _pa_decode_sparse(
     """3D split-K sparse paged-decode. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
 
     Each program owns one token, one head-block, and one slice of the token's
-    sparse K range. The attn_sink fold-in lives in the reduce kernel — splits
-    only emit (m_i, l_i, acc) in pre-sink form. ``BLOCK_H`` is widened so a
-    single head-block program can cover many heads, killing the MLA-style KV
-    re-fetch across head-block programs.
+    sparse K range. ``BLOCK_H`` is widened so a single head-block program can
+    cover many heads, killing the MLA-style KV re-fetch across head-block
+    programs.
+
+    When ``KV_SPLITS > 1``: only emits pre-sink (m_i, l_i, acc) partials; the
+    reduce kernel folds in ``attn_sink`` and normalises.
+
+    When ``KV_SPLITS == 1``: the whole softmax happens in one CTA, so we fold
+    the sink in as the initial running max (virtual K of weight 1) and divide
+    by L inline before writing the final result to ``out``. No partial
+    buffers, no reduce.
     """
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -121,8 +133,17 @@ def _pa_decode_sparse(
     tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
 
     neg_large = -3.4028234663852886e38
-    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
-    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    if KV_SPLITS == 1:
+        # Fold sink as initial running max so it participates in the softmax
+        # denom; sink contributes 0 to acc (virtual K with weight 1).
+        sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(
+            tl.float32
+        )
+        m_i = sink
+        l_i = tl.exp(sink - m_i)
+    else:
+        m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     k_offs = tl.arange(0, BLOCK_K)
@@ -159,29 +180,41 @@ def _pa_decode_sparse(
         m_i = m_new
         l_i = l_new
 
-    # Emit partials. The reduce reads (m, l, acc) per split and folds in the
-    # sink there, so we do *not* touch attn_sink here.
-    m_base = t * mp_stride_t + pid_k * mp_stride_k
-    tl.store(
-        m_partial_ptr + m_base + h_offs * mp_stride_h,
-        m_i,
-        mask=h_mask,
-    )
-    l_base = t * lp_stride_t + pid_k * lp_stride_k
-    tl.store(
-        l_partial_ptr + l_base + h_offs * lp_stride_h,
-        l_i,
-        mask=h_mask,
-    )
-    a_base = t * ap_stride_t + pid_k * ap_stride_k
-    tl.store(
-        acc_partial_ptr
-        + a_base
-        + h_offs[:, None] * ap_stride_h
-        + d_offs[None, :] * ap_stride_d,
-        acc,
-        mask=h_mask[:, None] & d_mask[None, :],
-    )
+    if KV_SPLITS == 1:
+        denom = tl.maximum(l_i, 1.0e-30)
+        out = tl.where(l_i[:, None] > 0.0, acc / denom[:, None], 0.0)
+        tl.store(
+            out_ptr
+            + t * out_stride_t
+            + h_offs[:, None] * out_stride_h
+            + d_offs[None, :] * out_stride_d,
+            out.to(out_ptr.dtype.element_ty),
+            mask=h_mask[:, None] & d_mask[None, :],
+        )
+    else:
+        # Emit partials. The reduce reads (m, l, acc) per split and folds in
+        # the sink there, so we do *not* touch attn_sink here.
+        m_base = t * mp_stride_t + pid_k * mp_stride_k
+        tl.store(
+            m_partial_ptr + m_base + h_offs * mp_stride_h,
+            m_i,
+            mask=h_mask,
+        )
+        l_base = t * lp_stride_t + pid_k * lp_stride_k
+        tl.store(
+            l_partial_ptr + l_base + h_offs * lp_stride_h,
+            l_i,
+            mask=h_mask,
+        )
+        a_base = t * ap_stride_t + pid_k * ap_stride_k
+        tl.store(
+            acc_partial_ptr
+            + a_base
+            + h_offs[:, None] * ap_stride_h
+            + d_offs[None, :] * ap_stride_d,
+            acc,
+            mask=h_mask[:, None] & d_mask[None, :],
+        )
 
 
 _pa_decode_sparse_reduce_repr = make_kernel_repr(
