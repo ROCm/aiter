@@ -569,7 +569,27 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if gate_mode not in (GateMode.SEPARATED, GateMode.INTERLEAVE):
         _grouped_dbg(f"unsupported gate_mode={gate_mode}")
         return None
-    stage1_weight_layout = "gugu" if gate_mode == GateMode.INTERLEAVE else "gguu"
+    # Default: derive stage1_weight_layout from gate_mode
+    #   SEPARATED -> GGUU, INTERLEAVE -> GUGU
+    # ``AITER_GROUPED_STAGE1_WEIGHT_LAYOUT={gguu,gugu}`` lets callers override
+    # this when the physical weight layout doesn't match the gate_mode
+    # convention (e.g. running gpt-oss GUGU weights through a SEPARATED
+    # dispatch path for diagnostics, or feeding GGUU weights into INTERLEAVE).
+    env_stage1_layout = os.environ.get(
+        "AITER_GROUPED_STAGE1_WEIGHT_LAYOUT", ""
+    ).strip().lower()
+    if env_stage1_layout:
+        if env_stage1_layout not in ("gguu", "gugu"):
+            raise ValueError(
+                "AITER_GROUPED_STAGE1_WEIGHT_LAYOUT must be 'gguu' or 'gugu', "
+                f"got {env_stage1_layout!r}"
+            )
+        stage1_weight_layout = env_stage1_layout
+        _grouped_dbg(
+            f"stage1_weight_layout overridden by env: {stage1_weight_layout!r}"
+        )
+    else:
+        stage1_weight_layout = "gugu" if gate_mode == GateMode.INTERLEAVE else "gguu"
     is_grouped_a4w4 = q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2
     is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and (q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8)
     if not (is_grouped_a4w4 or is_grouped_a8w4):
@@ -578,6 +598,113 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg(f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
         return None
+    _gfx_env = ";".join(
+        str(os.environ.get(k, "")).lower()
+        for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS", "AITER_FORCE_GFX1250")
+    )
+    if get_gfx() != "gfx1250" and "gfx1250" not in _gfx_env and "1" not in _gfx_env:
+        return None
+
+    if os.environ.get("AITER_GROUPED_CKTILE_MASKED", "0") not in ("0", "false", "False"):
+        token_num, topk = topk_ids.shape
+        metadata = get_2stage_cfgs(
+            get_padded_M(token_num),
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            quant_type,
+            isG1U1,
+            activation,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            getattr(w1, "is_shuffled", False),
+        )
+        block_size_M = int(metadata.block_m)
+        fast_all_experts = (
+            os.environ.get("AITER_GROUPED_FAST_ROUTE", "0") in ("1", "true", "True")
+            and topk == E
+        )
+        if fast_all_experts:
+            blocks_per_expert = (token_num + block_size_M - 1) // block_size_M
+            padded_per_expert = blocks_per_expert * block_size_M
+            total_padded = E * padded_per_expert
+            sorted_ids = torch.full(
+                (total_padded,), token_num, dtype=dtypes.i32, device=topk_ids.device
+            )
+            token_ids = torch.arange(token_num, dtype=dtypes.i32, device=topk_ids.device)
+            for expert_id in range(E):
+                base = expert_id * padded_per_expert
+                sorted_ids[base : base + token_num] = token_ids
+            sorted_weights = torch.zeros(
+                (total_padded,), dtype=dtypes.fp32, device=topk_ids.device
+            )
+            topk_weight_fp32 = topk_weight.to(dtypes.fp32)
+            for expert_id in range(E):
+                base = expert_id * padded_per_expert
+                expert_weight = torch.where(
+                    topk_ids == expert_id,
+                    topk_weight_fp32,
+                    torch.zeros((), dtype=dtypes.fp32, device=topk_ids.device),
+                ).sum(dim=1)
+                sorted_weights[base : base + token_num] = expert_weight
+            sorted_expert_ids = torch.arange(
+                E, dtype=dtypes.i32, device=topk_ids.device
+            ).repeat_interleave(blocks_per_expert)
+            num_valid_ids = torch.tensor(
+                [total_padded, token_num], dtype=dtypes.i32, device=topk_ids.device
+            )
+            moe_buf = torch.empty((token_num, model_dim), dtype=dtype, device=topk_ids.device)
+        else:
+            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+                topk_ids,
+                topk_weight,
+                E,
+                model_dim,
+                dtype,
+                block_size_M,
+                expert_mask,
+                None,
+                0,
+            )
+        out = fused_moe_2stages(
+            hidden_states,
+            w1,
+            w2,
+            topk,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            isG1U1,
+            block_size_M,
+            activation=activation,
+            quant_type=quant_type,
+            doweight_stage1=doweight_stage1,
+            q_dtype_a=q_dtype_a,
+            q_dtype_w=q_dtype_w,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=None,
+            a2_scale=None,
+            num_local_tokens=None,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            bias1=bias1,
+            bias2=bias2,
+        )
+        impl_name = "grouped_a4w4" if data_format == "fp4" else "grouped_a8w4"
+        os.environ["AITER_LAST_FUSED_MOE_IMPL"] = impl_name
+        logger.info(
+            f"[{impl_name}] used CKTile-style masked FlyDSL {data_format} path: "
+            f"tokens={token_num}, topk={topk}, E={E}, block_m={block_size_M}"
+        )
+        return out
 
     try:
         from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (
@@ -612,34 +739,17 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     flat_experts = topk_ids.reshape(-1).to(torch.long)
     if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
         raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
-    counts_dev = torch.bincount(flat_experts, minlength=E)
-    max_m = int(counts_dev.max().item()) if counts_dev.numel() else 0
+    counts = torch.bincount(flat_experts, minlength=E)
+    max_m = int(counts.max().item()) if counts.numel() else 0
     max_m = max(warp_tile_m, ((max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m)
     _grouped_dbg(f"routing counts done max_m={max_m}")
 
-    # Build slot tables mirroring `_mock_group_slots`: per-expert (token_id,
-    # rank_id) of each slot, with -1 sentinels in unused rows. The loop walks
-    # `topk_ids` on the host (small: tokens*topk), so the slot tables come out
-    # CPU-resident; we move them to the device once below.
-    topk_ids_cpu = topk_ids.detach().to("cpu")
-    counts_cpu = torch.zeros((E,), dtype=torch.int32)
-    slot_token_ids_cpu = torch.full((E, max_m), -1, dtype=torch.int32)
-    slot_rank_ids_cpu = torch.full((E, max_m), -1, dtype=torch.int32)
-    for _t in range(token_num):
-        for _r in range(topk):
-            _e = int(topk_ids_cpu[_t, _r].item())
-            _row = int(counts_cpu[_e].item())
-            if _row >= max_m:
-                raise ValueError(
-                    f"grouped a8w4 route overflow: expert={_e} needs > max_m={max_m}"
-                )
-            slot_token_ids_cpu[_e, _row] = _t
-            slot_rank_ids_cpu[_e, _row] = _r
-            counts_cpu[_e] += 1
-    masked_m = counts_cpu.to(torch.int32).to(device=device)
-    slot_token_ids = slot_token_ids_cpu.to(device=device, dtype=torch.int64)
-    slot_rank_ids = slot_rank_ids_cpu.to(device=device, dtype=torch.int64)
-    valid_mask = slot_token_ids >= 0  # (E, max_m) bool
+    flat_routes = torch.arange(token_num * topk, device=device, dtype=torch.long)
+    flat_tokens = flat_routes // topk
+    flat_weights = topk_weight.reshape(-1).to(dtype)
+    route_tokens = torch.empty((E, max_m), dtype=torch.long, device=device)
+    route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
+    masked_m = counts.to(torch.int32).to(device=device)
 
     if data_format == "fp4":
         if os.environ.get("AITER_GROUPED_FAST_ACT_QUANT", "0") in ("1", "true", "True"):
@@ -659,43 +769,92 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             _grouped_dbg("a1 fp4 quant done")
             a1_payload = a1_quant.view(torch.uint8).contiguous()
             a1_scale_token_u8 = a1_scale_token.view(torch.uint8).contiguous()
-        a1_cols = model_dim // 2
+        grouped_a1 = torch.zeros((E, max_m, model_dim // 2), dtype=torch.uint8, device=device)
         a1_scale_raw = torch.full(
             (E, max_m, model_dim // 32), 127, dtype=torch.uint8, device=device
         )
     else:
-        a1_payload = hidden_states.to(dtypes.fp8).view(torch.uint8).contiguous()
-        a1_scale_token_u8 = None
-        a1_cols = model_dim
+        # a8w4 stage1 input: per-block-32 mxfp8 quantization (matches the
+        # FlyDSL UT _per_1x32_fp8_quant). The legacy code did a direct
+        # ``hidden_states.to(fp8)`` + scale=127 (=2^0=1.0) which discards
+        # the activation magnitude and produces wrong stage1 output.
+        from aiter.utility import fp4_utils as _aiter_fp4u
+        BLOCK = 32
+        DTYPE_MAX = 240.0
+        a1_flat = hidden_states.contiguous().view(-1, model_dim).float()
+        Mtok = a1_flat.shape[0]
+        blk = a1_flat.view(-1, BLOCK)
+        blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
+        max_abs = blk.abs().amax(dim=1)
+        scale_e8m0 = _aiter_fp4u.f32_to_e8m0(max_abs / DTYPE_MAX)
+        scale_f32 = _aiter_fp4u.e8m0_to_f32(scale_e8m0)
+        scale_f32 = torch.nan_to_num(scale_f32, nan=1.0, posinf=1.0, neginf=1.0)
+        scale_f32[scale_f32 == 0] = 1.0
+        y_f32 = blk / scale_f32.unsqueeze(1)
+        y_f32 = torch.clamp(y_f32, min=-DTYPE_MAX, max=DTYPE_MAX)
+        a1_bytes = _aiter_fp4u._f32_to_floatx_unpacked(
+            y_f32.contiguous().view(-1), 4, 3
+        )
+        a1_payload = a1_bytes.view(torch.uint8).contiguous().view(Mtok, model_dim)
+        a1_scale_token_u8 = (
+            scale_e8m0.view(Mtok, model_dim // BLOCK).view(torch.uint8).contiguous()
+        )
+        grouped_a1 = torch.zeros((E, max_m, model_dim), dtype=torch.uint8, device=device)
+        # Initial fill with byte=127 (=2^0=1.0) so empty rows in inactive
+        # experts decode to scale=1.0 and don't trip the kernel.
         a1_scale_raw = torch.full(
             (E, max_m, model_dim // 32), 127, dtype=torch.uint8, device=device
         )
 
     _grouped_dbg("start route gather")
-    # Vectorized gather of activation rows into (E, max_m, cols) using slot
-    # tables. Invalid slots (rank=-1) are zero-filled by masking.
-    flat_tokens_dev = slot_token_ids.clamp(min=0).reshape(-1)
-    mask_u8 = valid_mask.to(torch.uint8)
-    grouped_a1 = (
-        a1_payload.index_select(0, flat_tokens_dev)
-        .view(E, max_m, a1_cols)
-        .mul(mask_u8.unsqueeze(-1))
-        .contiguous()
+    _fast_route = (
+        os.environ.get("AITER_GROUPED_FAST_ROUTE", "0") in ("1", "true", "True")
+        and topk == E
+        and max_m == token_num
     )
-    if a1_scale_token_u8 is not None:
-        a1_scale_raw = (
-            a1_scale_token_u8.index_select(0, flat_tokens_dev)
-            .view(E, max_m, model_dim // 32)
-            .mul(mask_u8.unsqueeze(-1))
-            .contiguous()
-        )
+    if _fast_route:
+        token_ids = torch.arange(token_num, device=device, dtype=torch.long)
+        for e in range(E):
+            grouped_a1[e].copy_(a1_payload)
+            if a1_scale_token_u8 is not None:
+                a1_scale_raw[e].copy_(a1_scale_token_u8)
+            route_tokens[e].copy_(token_ids)
+            route_weights[e].fill_(1.0 / topk)
+    else:
+        for e in range(E):
+            mask = flat_experts == e
+            n = int(counts[e].item())
+            if n == 0:
+                continue
+            toks = flat_tokens[mask]
+            grouped_a1[e, :n].copy_(a1_payload[toks])
+            if a1_scale_token_u8 is not None:
+                a1_scale_raw[e, :n].copy_(a1_scale_token_u8[toks])
+            route_tokens[e, :n].copy_(toks)
+            route_weights[e, :n].copy_(flat_weights[mask])
     _grouped_dbg("route gather done")
 
     grouped_w1 = (w1 if w1.dtype == torch.uint8 else w1.view(torch.uint8)).contiguous()
     grouped_w2 = (w2 if w2.dtype == torch.uint8 else w2.view(torch.uint8)).contiguous()
     _grouped_dbg("weight layout done")
-    grouped_w1_scale = w1_scale.view(torch.uint8).contiguous()
-    grouped_w2_scale = w2_scale.view(torch.uint8).contiguous()
+    grouped_w1_scale = _grouped_a8w4_prepare_scale_batch(
+        w1_scale,
+        experts=E,
+        rows=2 * inter_dim,
+        k_dim=model_dim,
+        warp_tile=warp_tile_n,
+        tile_k=tile_k,
+        device=device,
+    )
+    grouped_w2_scale = _grouped_a8w4_prepare_scale_batch(
+        w2_scale,
+        experts=E,
+        rows=model_dim,
+        k_dim=inter_dim,
+        warp_tile=warp_tile_n,
+        tile_k=tile_k,
+        device=device,
+    )
     grouped_a1_scale = torch.stack(
         [
             _grouped_a8w4_preshuffle_e8m0_scale(
@@ -730,6 +889,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         stage1_weight_layout=stage1_weight_layout,
     )
     _grouped_dbg("stage1 compile done; start launch")
+    _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
+    if _bias1_arg is not None and _bias1_arg.dtype != dtype:
+        _bias1_arg = _bias1_arg.to(dtype)
     stage1(
         grouped_a2,
         grouped_a1,
@@ -746,14 +908,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     )
     _grouped_dbg("stage1 launch returned")
     if doweight_stage1:
-        # Per-slot topk weights: gather topk_weight[token, rank] using slot
-        # tables, masking invalid slots to 0 so they leave grouped_a2 unchanged.
-        topk_weight_dev = topk_weight.to(device=device, dtype=dtype)
-        slot_weights = (
-            topk_weight_dev[slot_token_ids.clamp(min=0), slot_rank_ids.clamp(min=0)]
-            * valid_mask.to(dtype)
-        )
-        grouped_a2.mul_(slot_weights.unsqueeze(-1))
+        for e in range(E):
+            n = int(counts[e].item())
+            if n:
+                grouped_a2[e, :n].mul_(route_weights[e, :n].view(-1, 1))
 
     if data_format == "fp4":
         if os.environ.get("AITER_GROUPED_FAST_ACT_QUANT", "0") in ("1", "true", "True"):
@@ -811,6 +969,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         expert_sched_mode=False,
     )
     _grouped_dbg("stage2 compile done; start launch")
+    _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None
+    if _bias2_arg is not None and _bias2_arg.dtype != dtype:
+        _bias2_arg = _bias2_arg.to(dtype)
     stage2(
         grouped_out,
         grouped_a2_payload,
@@ -827,29 +988,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     )
     _grouped_dbg("stage2 launch returned")
 
+    moe_out = torch.zeros((token_num, model_dim), dtype=dtype, device=device)
     _grouped_dbg("start scatter output")
-    # Vectorized scatter mirroring `_run_mock_moe`: place each valid
-    # (expert, slot) row into (token, rank) slots of an (T, topk, D) buffer,
-    # then reduce along the topk dim. When weights were *not* applied in
-    # stage1 we fold them in here via the final weighted sum; when they were,
-    # we just sum.
-    topk_out = torch.zeros((token_num, topk, model_dim), dtype=dtype, device=device)
-    flat_mask = valid_mask.reshape(-1)
-    sel = torch.nonzero(flat_mask, as_tuple=False).flatten()
-    flat_y = grouped_out.view(E * max_m, model_dim)
-    flat_tok = slot_token_ids.reshape(-1)
-    flat_rnk = slot_rank_ids.reshape(-1)
-    if sel.numel() > 0:
-        vals = flat_y.index_select(0, sel)
-        topk_out[flat_tok.index_select(0, sel), flat_rnk.index_select(0, sel)] = vals
-    if doweight_stage1:
-        # topk weights already applied to grouped_a2 before stage2 -> sum only.
-        moe_out = topk_out.sum(dim=1).to(dtype)
-    else:
-        # Fold topk weights at scatter time, matching the original semantics
-        # of multiplying vals by route_weights before index_add_.
-        topk_weight_dev = topk_weight.to(device=device)
-        moe_out = (topk_out.float() * topk_weight_dev.float().unsqueeze(-1)).sum(dim=1).to(dtype)
+    for e in range(E):
+        n = int(counts[e].item())
+        if n == 0:
+            continue
+        vals = grouped_out[e, :n]
+        if not doweight_stage1:
+            vals = vals * route_weights[e, :n].view(-1, 1)
+        moe_out.index_add_(0, route_tokens[e, :n], vals)
     _grouped_dbg("scatter output done")
     impl_name = "grouped_a4w4" if data_format == "fp4" else "grouped_a8w4"
     os.environ["AITER_LAST_FUSED_MOE_IMPL"] = impl_name
