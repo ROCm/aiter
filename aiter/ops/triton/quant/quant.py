@@ -8,6 +8,7 @@ import torch
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_tensor_quant_fp8_i8_kernel,
+    _fused_dynamic_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_token_quant_fp8_i8_kernel,
     _dynamic_mxfp4_quant_kernel,
     _mxfp4_quant_op,
@@ -38,6 +39,12 @@ _MXFP8_LEGACY_BLOCK_SIZE = 128
 
 
 _LOGGER = AiterTritonLogger()
+
+# Below this element count the dynamic-per-tensor quant is launch / cuda-graph-node
+# bound (decode), so a single fused workgroup beats the 2-launch atomic-amax + quant
+# path. Above it the 2-launch path is used. Both produce byte-identical output.
+FUSED_PER_TENSOR_MAX_ELEMS = 40960
+_FUSED_PER_TENSOR_BLOCK = 16384
 
 
 def static_per_tensor_quant_fp8_i8(
@@ -83,6 +90,27 @@ def dynamic_per_tensor_quant_fp8_i8(
     - scale_out: Single scale value of shape (1,)
     """
     _LOGGER.info(f"DYNAMIC_PER_TENSOR_QUANT_FP8_I8: x={tuple(x_in.shape)}")
+
+    DTYPE_MAX = (
+        torch.finfo(qx.dtype).max
+        if torch.is_floating_point(qx)
+        else torch.iinfo(qx.dtype).max
+    )
+
+    # Decode regime: fuse amax + quantize into one launch (no atomic-max pass,
+    # no separate quant launch). Needs a contiguous input to address it flat.
+    N = x_in.numel()
+    if N <= FUSED_PER_TENSOR_MAX_ELEMS and x_in.is_contiguous():
+        _fused_dynamic_per_tensor_quant_fp8_i8_kernel[(1,)](
+            qx,
+            x_in,
+            scale_out,
+            N,
+            DTYPE_MAX=DTYPE_MAX,
+            BLOCK=min(triton.next_power_of_2(N), _FUSED_PER_TENSOR_BLOCK),
+        )
+        return qx, scale_out
+
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
@@ -93,11 +121,7 @@ def dynamic_per_tensor_quant_fp8_i8(
         cols,
         x_in.stride(0),
         NUM_COL_POW2=NUM_COL_POW2,
-        DTYPE_MAX=(
-            torch.finfo(qx.dtype).max
-            if torch.is_floating_point(qx)
-            else torch.iinfo(qx.dtype).max
-        ),
+        DTYPE_MAX=DTYPE_MAX,
     )
 
     _static_per_tensor_quant_fp8_i8_kernel[grid](
