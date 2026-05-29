@@ -3608,8 +3608,12 @@ class OManager32bitsV3
 
         if constexpr(std::is_same_v<out_t, float>)
         {
-            // Same vmcnt(0) hint as V2 (empirically helpful).
-            asm volatile("s_waitcnt vmcnt(0)");
+            // EXPERIMENT: removed the vmcnt(0) gate at the top of the call
+            // (was 30k+ cycle stall on b=8 c=23333 OMgr trace, ~27% of
+            // runtime across 8 calls). Should be safe -- prev call's
+            // buffer_store_dwordx4 reads from THIS function's earlier
+            // ds_read result, which is already drained via lgkmcnt(0) at
+            // the end of each call.
             constexpr uint32_t kMfmaByteStride = kMfmaCols * sizeof(out_t); // 64 B
             hkm::ds_write_b128<GPR_START + 0>(p_lds_warp + v_offset_lds_st,
                                               0u * kMfmaByteStride);
