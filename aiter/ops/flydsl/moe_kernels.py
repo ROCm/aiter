@@ -19,7 +19,9 @@ def _get_dtypes():
     return dtypes
 
 
-_SUFFIX_RE = re.compile(r"(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$")
+_SUFFIX_RE = re.compile(
+    r"(?P<blk>_blkscale)?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
+)
 
 
 def flydsl_kernel_name(
@@ -310,6 +312,86 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_fp8_blockscale(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for FP8/FP8 + per-1x128 FP32 blockscale stage1.
+
+    Mirrors the CK ``GridwiseMoeGemmBlockScale`` family used by aiter's
+    ``module_moe_ck2stages_f8_f8_preshuffle_on_b16_silu_per_1x128_*`` modules.
+    """
+    kernels: Dict[str, Dict] = {}
+    a_dtype, b_dtype = "fp8", "fp8"
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    tile_ks = [128, 256]
+    waves_per_eus = [1, 2, 3, 4]
+    # b_nt and xcd_swizzle are Tier-C in the adapter; only the defaults
+    # (bnt=2, xcd=0 for stage1) are reachable, so we don't enumerate them.
+    bnt = 2
+    xcd = 0
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for wpe in waves_per_eus:
+                    name = flydsl_kernel_name(
+                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                    )
+                    name += "_blkscale"
+                    if wpe != 1:
+                        name += f"_w{wpe}"
+                    kernels[name] = {
+                        "stage": 1,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "MPerBlock": tm,
+                        "waves_per_eu": wpe,
+                        "b_nt": bnt,
+                        "xcd_swizzle": xcd,
+                        "scale_scheme": "blockscale_1x128_fp32",
+                    }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_fp8_blockscale(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for FP8/FP8 + per-1x128 FP32 blockscale stage2."""
+    kernels: Dict[str, Dict] = {}
+    a_dtype, b_dtype = "fp8", "fp8"
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    tile_ks = [128, 256]
+    modes = ["atomic", "reduce"]
+    # b_nt, xcd_swizzle, and persist_m are Tier-C in the adapter; only the
+    # defaults (bnt=0, xcd=0, non-persistent for stage2) are reachable.
+    bnt = 0
+    xcd = 0
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    base_name += "_blkscale"
+                    kernels[base_name] = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "b_nt": bnt,
+                        "xcd_swizzle": xcd,
+                        "scale_scheme": "blockscale_1x128_fp32",
+                    }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
@@ -325,6 +407,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+    # FP8/FP8 per-1x128 FP32 blockscale configs (CK GridwiseMoeGemmBlockScale)
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_fp8_blockscale(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_fp8_blockscale(out))
 
 
 _register_all_configs()
@@ -410,6 +496,34 @@ def compile_flydsl_moe_stage1(
             scale_is_bf16=True,
             k_batch=k_batch,
         )
+    elif a_dtype == "fp8" and b_dtype == "fp8":
+        # FP8/FP8 with per-1x128 FP32 blockscale (CK GridwiseMoeGemmBlockScale).
+        from .kernels.blockscale_moe_gemm_2stage import compile_blockscale_moe_gemm1
+
+        return compile_blockscale_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype=out_dtype,
+            act=act,
+            persist_m=persist_m,
+            use_async_copy=use_async_copy,
+            k_batch=k_batch,
+            waves_per_eu=waves_per_eu,
+            b_nt=b_nt,
+            xcd_swizzle=xcd_swizzle,
+            model_dim_pad=model_dim_pad,
+            inter_dim_pad=inter_dim_pad,
+            enable_bias=enable_bias,
+            swiglu_limit=swiglu_limit,
+        )
     else:
         raise ValueError(
             f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
@@ -491,6 +605,31 @@ def compile_flydsl_moe_stage2(
             out_dtype=out_dtype,
             accumulate=accumulate,
             scale_is_bf16=True,
+        )
+    elif a_dtype == "fp8" and b_dtype == "fp8":
+        # FP8/FP8 with per-1x128 FP32 blockscale.
+        from .kernels.blockscale_moe_gemm_2stage import compile_blockscale_moe_gemm2
+
+        return compile_blockscale_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype=out_dtype,
+            accumulate=accumulate,
+            persist_m=persist_m,
+            sort_block_m=sort_block_m,
+            b_nt=b_nt,
+            model_dim_pad=model_dim_pad,
+            inter_dim_pad=inter_dim_pad,
+            xcd_swizzle=xcd_swizzle,
+            enable_bias=enable_bias,
         )
     else:
         raise ValueError(
