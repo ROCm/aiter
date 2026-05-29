@@ -5,9 +5,9 @@
 """
 Chunk-based hidden state computation for gated delta rule (Forward only).
 
-This module provides functions for computing hidden states in chunk mode.
-Note: Full kernel implementation is complex and requires careful optimization.
-This is a placeholder that documents the interface.
+This module computes the per-chunk hidden states and the recomputed value
+tensor (`v_new`) consumed by the chunked gated delta rule, supporting both
+the `[K, V]` and the transposed `[V, K]` hidden-state layouts.
 """
 
 import torch
@@ -1285,6 +1285,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     use_exp2: bool = True,
+    state_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Optimized hidden state forward with h layout [V, K].
@@ -1295,6 +1296,8 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     v_new output is [B, H, T_flat, V].
     `g` is expected in head-major layout [B, H, T].
     use_exp2 selects whether cumulative gates are interpreted in log2 space.
+    state_dtype selects the initial/final hidden-state dtype (`fp32` or `bf16`);
+    defaults to fp32. The kernel accumulates in fp32 and casts on store.
     """
     B, T, Hg, K = k.shape
     BT = chunk_size
@@ -1313,6 +1316,19 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
 
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
+    if state_dtype is not None and state_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(f"`state_dtype` must be fp32 or bf16, got {state_dtype}.")
+    _state_dtype = state_dtype if state_dtype is not None else torch.float32
+    if (
+        state_dtype is not None
+        and initial_state is not None
+        and initial_state.dtype != _state_dtype
+    ):
+        raise ValueError(
+            f"`initial_state.dtype` ({initial_state.dtype}) must match "
+            f"`state_dtype` ({_state_dtype})."
+        )
+
     if gk is not None:
         gk = gk.contiguous()
         if use_exp2:
@@ -1321,7 +1337,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
 
     h = k.new_empty(B, NT, H, V, K)
     final_state = (
-        k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
+        k.new_empty(N, H, V, K, dtype=_state_dtype) if output_final_state else None
     )
     v_new = k.new_empty(B, H, T_flat, V, dtype=u.dtype) if save_new_value else None
 

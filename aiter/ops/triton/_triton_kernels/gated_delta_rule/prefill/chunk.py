@@ -231,7 +231,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         output_final_state: bool
         cu_seqlens: [N+1] optional
         use_chunk_hip: bool — use HIP kernel for hidden state computation
-        state_dtype: optional output/input state dtype for HIP path (`fp32` or `bf16`)
+        state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
+            supported by both the HIP and Triton hidden-state paths
         use_exp2: bool — use exp2 instead of exp for gate computation
 
     Returns:
@@ -276,10 +277,6 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             g_head_major=True,
         )
     else:
-        if state_dtype is not None:
-            raise ValueError(
-                "`state_dtype` is only supported when `use_chunk_hip=True`."
-            )
         h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(
             k=k,
             w=w,
@@ -289,6 +286,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_exp2=use_exp2,
+            state_dtype=state_dtype,
         )
 
     o = chunk_fwd_o_opt_vk(

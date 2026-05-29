@@ -144,7 +144,7 @@ def fused_cumsum_kkt(
 
 
 if IS_AMD:
-    _K12_CONFIGS = [
+    _CUMSUM_KKT_CONFIGS = [
         triton.Config({"BK": 32}, num_warps=4, num_stages=2),
         triton.Config({"BK": 32}, num_warps=2, num_stages=2),
         triton.Config({"BK": 32}, num_warps=8, num_stages=2),
@@ -153,21 +153,21 @@ if IS_AMD:
         triton.Config({"BK": 64}, num_warps=4, num_stages=2),
     ]
 else:
-    _K12_CONFIGS = [
+    _CUMSUM_KKT_CONFIGS = [
         triton.Config({"BK": BK}, num_warps=nw, num_stages=ns)
-        for BK in [32, 64, 128]
-        for nw in [4, 8]
-        for ns in [2, 3, 4]
+        for BK in [32, 64]
+        for nw in [2, 4]
+        for ns in ([2, 3] if IS_AMD else [2, 3, 4])
     ]
 
-_K12_DEFAULT_CONFIG = triton.Config({"BK": 32}, num_warps=4, num_stages=2)
+_CUMSUM_KKT_DEFAULT_CONFIG = triton.Config({"BK": 32}, num_warps=4, num_stages=2)
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=gated_delta_rule_autotune_configs(
-        _K12_CONFIGS,
-        default_config=_K12_DEFAULT_CONFIG,
+        _CUMSUM_KKT_CONFIGS,
+        default_config=_CUMSUM_KKT_DEFAULT_CONFIG,
     ),
     key=["H", "K", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
@@ -212,10 +212,17 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
 
     p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
+    # Store g_cumsum in log2 space when downstream kernels consume it with
+    # exp2 (USE_EXP2); exp2(x * RCP_LN2) == exp(x), keeping results identical.
+    if USE_EXP2:
+        b_g = b_g * RCP_LN2
     b_g_cumsum = tl.cumsum(b_g, axis=0)
     if G_SCALE != 1.0:
         b_g_cumsum = b_g_cumsum * G_SCALE
 
+    # g_cumsum is stored head-major [B, H, T] (stride 1 along T) so the
+    # downstream solve/recompute, hidden-state and output kernels can read it
+    # contiguously per (batch, head).
     if IS_VARLEN:
         g_out_base = g_cumsum_out + i_h * T_flat + bos
     else:
@@ -244,10 +251,8 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
 
     b_g_diff = b_g_cumsum[:, None] - b_g_cumsum[None, :]
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
-    if USE_EXP2:
-        b_A = tl.where(m_A, b_A * tl.math.exp2(b_g_diff), 0.0)
-    else:
-        b_A = tl.where(m_A, b_A * exp(b_g_diff), 0.0)
+    b_gate = tl.math.exp2(b_g_diff) if USE_EXP2 else exp(b_g_diff)
+    b_A = tl.where(m_A, b_A * b_gate, 0.0)
 
     p_A = tl.make_block_ptr(
         A_out + (bos * H + i_h) * BT,
@@ -281,10 +286,11 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         chunk_size: int (must be 64)
         g_output_dtype: dtype for g_cumsum (default fp32)
         A_output_dtype: dtype for A_raw (default fp32)
-        use_exp2: when True, store cumulative gates in log2 space
+        use_exp2: when True, store g_cumsum in log2 space (scaled by RCP_LN2)
+            so downstream kernels can use exp2; A_raw is unaffected.
 
     Returns:
-        g_cumsum: [B, H, T], cumulative gate in the selected exponent base
+        g_cumsum: [B, H, T], head-major
         A_raw: [B, T, H, 64]
     """
     B, T, Hg, K = k.shape
