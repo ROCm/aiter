@@ -351,7 +351,6 @@ def _work_stealing_gmm(
     tl.device_assert(total_tiles > 0, "total_tiles <= 0")
 
     tile = tl.program_id(0).to(INT_TYPE)
-    tl.device_assert(tile < total_tiles, "tile >= total_tiles")
 
     while tile < total_tiles:
         g, m, num_m_tiles, last_m, tile_in_mm = _resolve_gmm_tile(
