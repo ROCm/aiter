@@ -1260,6 +1260,43 @@ def get_2stage_cfgs(
     )
     if (
         q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+        and gate_mode == GateMode.SEPARATED
+        and is_flydsl_available()
+    ):
+        # fp4_bf16 SEPARATED: MXFP4 weights (FP4 E2M1 + E8M0 scales) with bf16 activations.
+        # Uses our FlyDSL compile_moe_gemm1/2 with in_dtype="fp4_bf16".
+        _out_str = "bf16"
+        _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        _tile_n = 128
+        _tile_k = 128
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+        kn1 = flydsl_kernel_name(1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k)
+        kn2 = flydsl_kernel_name(
+            2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kn1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            _tile_m,
+            1,     # no split-K for fp4_bf16 (not yet tuned)
+            False,
+        )
+    if (
+        q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.i4x2
         and is_flydsl_available()
     ):
@@ -1610,6 +1647,14 @@ def fused_moe_2stages(
                 block_size=block_size_M,
             )
 
+    elif (
+        quant_type == QuantType.per_1x32
+        and w1.dtype == dtypes.fp4x2
+        and gate_mode == GateMode.SEPARATED
+    ):
+        # fp4_bf16 SEPARATED: MXFP4 weights, bf16 activations; no activation quantization needed
+        a1 = hidden_states.to(dtype)
+        a1_scale = None
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights; no activation quantization needed
         a1 = hidden_states.to(dtype)
@@ -1737,6 +1782,13 @@ def fused_moe_2stages(
         else:
             a2 = a2.to(dtypes.fp8)
             a2_scale = a1_scale
+    elif (
+        quant_type == QuantType.per_1x32
+        and w1.dtype == dtypes.fp4x2
+        and gate_mode == GateMode.SEPARATED
+    ):
+        # fp4_bf16 SEPARATED: stage1 output is bf16, no inter-stage quantization
+        a2_scale = None
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
         a2_scale = None
