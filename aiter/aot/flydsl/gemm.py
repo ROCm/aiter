@@ -197,6 +197,12 @@ def _compile_executable_to_cache(exe, *args) -> None:
         exe(*args)
 
 
+def _ptr_view_safe(t):
+    from aiter.ops.flydsl.gemm_kernels import _ptr_view_safe as _wrap
+
+    return _wrap(t)
+
+
 def _compile_hgemm_to_cache(
     *,
     m: int,
@@ -271,7 +277,15 @@ def _compile_hgemm_to_cache(
     # optional bias and split-K sync tensors.
     launch_bias = bias if has_bias else b
     _compile_executable_to_cache(
-        exe, out, a, b, launch_bias, m, semaphore, signal, stream
+        exe,
+        _ptr_view_safe(out),
+        _ptr_view_safe(a),
+        _ptr_view_safe(b),
+        _ptr_view_safe(launch_bias),
+        m,
+        _ptr_view_safe(semaphore),
+        _ptr_view_safe(signal),
+        stream,
     )
 
 
@@ -322,7 +336,18 @@ def _compile_preshuffle_to_cache(
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
         xcd_swizzle=xcd_swizzle,
     )
-    _compile_executable_to_cache(exe, out, a, b, scale_a, scale_b, bias, m, n, stream)
+    _compile_executable_to_cache(
+        exe,
+        _ptr_view_safe(out),
+        _ptr_view_safe(a),
+        _ptr_view_safe(b),
+        _ptr_view_safe(scale_a),
+        _ptr_view_safe(scale_b),
+        _ptr_view_safe(bias),
+        m,
+        n,
+        stream,
+    )
 
 
 def compile_one_config(

@@ -39,6 +39,7 @@ Python surface is deliberately per-dtype: a16w16 here, a8w8 in its own
 module when that lands.
 """
 
+import logging
 from typing import Optional
 
 import torch
@@ -46,6 +47,8 @@ from torch import Tensor
 
 from ...jit.core import compile_ops
 from . import common as _opus_common
+
+logger = logging.getLogger("aiter")
 
 # ---- Low-level pybind bindings --------------------------------------------
 
@@ -193,6 +196,26 @@ def opus_gemm_a16w16_tune(
         splitK = new_splitK
         bias = None
     _check_a16w16_tune_layout(XQ, WQ, Y)
+    # Mono-tile kid guard: the launcher requires N / K to be tile-aligned
+    # (the kernel has no N-tail mask and no K-tail mask; M-tail IS handled
+    # via the bounded gmem desc). A CSV winner picked through
+    # tuned_gemm.get_padded_m can surface a mono kid whose B_N / B_K does
+    # not divide the actual N / K -- the launcher would AITER_CHECK abort
+    # the process. Reroute to opus's own bf16 heuristic dispatch instead;
+    # it never returns a mono kid, so it always picks something that can
+    # run the shape.
+    _, _, N = Y.shape
+    _, _, K = XQ.shape
+    if not _opus_common.mono_kid_shape_ok(kernelId, N, K):
+        logger.warning(
+            "opus_gemm_a16w16_tune: mono-tile kid %d requires N/K aligned "
+            "to its tile; got N=%d K=%d -- rerouting to opus bf16 heuristic.",
+            kernelId,
+            N,
+            K,
+        )
+        _opus_gemm_bf16_dispatch(XQ, WQ, Y, None, None, None, bias)
+        return Y
     # C++ launcher is in-place on Y (returns void after PR #2932-style
     # refactor to aiter_tensor_t). Keep the wrapper's `return Y`
     # contract so callers that did `Y = opus_gemm_a16w16_tune(...)`

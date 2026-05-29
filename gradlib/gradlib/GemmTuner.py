@@ -138,7 +138,7 @@ def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
 # 32K x 2K x 7K), so running it on every iter of run_perftest's
 # num_iters=101 hot loop adds 100 * 8ms = 800ms of pure ref-compute
 # time to each candidate, AND inflates the reported per-iter latency
-# to (kernel + ref) ≈ kernel + ~8ms. That hides the true kernel
+# to (kernel + ref) ? kernel + ~8ms. That hides the true kernel
 # ranking (every candidate measures ~ref_time) and makes mp_tuner
 # pick a sub-optimal winner -- e.g. on 32K x 2K x 7K the tuner
 # reported kid=9 @ 108 TFLOPS while persistent kid=304 actually runs
@@ -743,17 +743,28 @@ class Gemm:
                             self.has_bias,
                         ),
                         run_opus_gemm_bf16,
-                        ([0, 1, 5, 3], kid, sk),
+                        (
+                            ["inp", "weights", "out_asm", "bias"],
+                            kid,
+                            sk,
+                        ),
                         {
                             "num_warmup": self.num_warmup,
                             "num_iters": 101,
                         },
                         get_gemm_ref,
-                        ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                        (
+                            ["inp", "weights", "bias", "x_scale", "w_scale"],
+                            self.indtype,
+                            self.outdtype,
+                        ),
                         {},
                         None,
                         2e-2,
                         1.0,
+                        None,  # compare_fn
+                        None,  # max_abs_delta
+                        ("out_asm",),  # output_keys: NaN-init the out tensor
                     )
                 )
         logger.info(
