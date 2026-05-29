@@ -1,8 +1,7 @@
-"""Quick benchmark for FP8 PER_TOKEN_HEAD batch_prefill on MI308X.
+"""Quick benchmark for FP8 PER_TOKEN_HEAD fmha_fwd on MI308X.
 
-Compares against:
-  - bf16 baseline (same shapes, no quant)
-  - kv_blockscale FP8 (existing path)
+Calls fmha_fwd (run_fwd_per_token_head) and compares the measured numbers
+against the H20 reference table baked into this script.
 
 Sequence lengths to bench can be passed as positional args. Default is all
 of {1024, 16384, 32768, 65536, 131072} (the H20 reference grid).
@@ -24,11 +23,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import op_tests.test_batch_prefill as _tbp
-from op_tests.test_batch_prefill import (
-    run_batch_prefill_per_token_head,
-    run_batch_prefill_kv_blockscale,
-    run_fwd_per_token_head,
-)
+from op_tests.test_batch_prefill import run_fwd_per_token_head
 
 # The pytest helpers skip causal+soft_cap=0.0 on ROCm 7.2 + gfx950 out of an
 # abundance of caution; the kernel actually runs fine in practice and we need
@@ -44,9 +39,8 @@ if int(os.environ.get("BENCH_BYPASS_ROCM72_SKIP", "1")):
 #   quant_type=QPERTOKEN_PERHEAD_KPERTOKEN_PERHEAD_VPERHEAD,
 #   q_len = kv_len, full causal prefill, batch (num_seqs) in {2, 4, 6, 8}.
 #
-# Page size is selectable via BENCH_PAGE_SIZE (default 64, matches H20).
-# Note: KV_BLOCKSCALE still requires page_size >= kN0 (=128), so its column
-# is skipped automatically when page_size < 128.
+# page_size is unused by fmha_fwd (non-paged) but kept here so the helper
+# signature stays the same as the paged path.
 PAGE_SIZE = int(os.environ.get("BENCH_PAGE_SIZE", "1024"))
 
 # Enable correctness verification against the FP32 reference. Default off because
@@ -83,9 +77,9 @@ H20_LAT_MS = {
 DEFAULT_SEQS = (1024, 16384, 32768, 65536, 131072)
 _parser = argparse.ArgumentParser(
     description=(
-        "Quick benchmark for FP8 PER_TOKEN_HEAD batch_prefill on MI308X.\n"
-        "Compares against the kv_blockscale FP8 path and the H20 reference\n"
-        "table baked into this script (TFLOPS + latency from the H20 PDF)."
+        "Quick benchmark for FP8 PER_TOKEN_HEAD fmha_fwd on MI308X.\n"
+        "Compares against the H20 reference table baked into this script\n"
+        "(TFLOPS + latency from the H20 PDF)."
     ),
     epilog=(
         "examples:\n"
@@ -93,42 +87,33 @@ _parser = argparse.ArgumentParser(
         "  python op_tests/bench_per_token_head.py 1024\n"
         "\n"
         "  # Bench a subset of seq lengths with the H20 reference next to\n"
-        "  # PER_TOKEN_HEAD for direct comparison.\n"
+        "  # fmha_fwd for direct comparison.\n"
         "  python op_tests/bench_per_token_head.py 1024 16384\n"
         "\n"
-        "  # Bench + correctness check (FP8 vs FP32 reference, BF16 vs FP32\n"
-        "  # reference). Use this when you change the kernel and want both\n"
-        "  # perf numbers AND a PASS/FAIL gate. Exits non-zero on failure,\n"
-        "  # so it can be wired into CI.\n"
+        "  # Bench + correctness check (FP8 vs FP32 reference). Use this when\n"
+        "  # you change the kernel and want both perf numbers AND a PASS/FAIL\n"
+        "  # gate. Exits non-zero on failure, so it can be wired into CI.\n"
         "  BENCH_VERIFY=1 python op_tests/bench_per_token_head.py 1024 16384\n"
         "\n"
         "  # Full H20 grid run (5 seqs * 4 batches = 20 shapes). Slow on\n"
         "  # the long seqs; expect minutes.\n"
         "  python op_tests/bench_per_token_head.py\n"
         "\n"
-        "  # Match the H20 PDF page_size=64 config (KV_BLOCKSCALE column\n"
-        "  # gets skipped because that path needs page_size >= 128).\n"
-        "  BENCH_PAGE_SIZE=64 python op_tests/bench_per_token_head.py 1024\n"
-        "\n"
         "sample output (one row, abbreviated):\n"
-        "  Config: nhq=8, nhk=1, hd=128, causal=True, soft_cap=0.0, page_size=1024\n"
-        "  batch | KV_BLOCKSCALE              vrf | PTH (batch_prefill)        vrf | PTH (fmha_fwd)             vrf | H20 (ref)              | H20/MI308 prefill | H20/MI308 fwd\n"
+        "  Config: nhq=8, nhk=1, hd=128, causal=True, soft_cap=0.0\n"
+        "  batch | PTH (fmha_fwd)             vrf | H20 (ref)              | H20/MI308\n"
         "  seq=1024\n"
-        "      8 |   113 us   107.77 TFLOPS PASS |   192 us    63.12 TFLOPS PASS |    94 us   129.63 TFLOPS PASS |    91 us   188.70 TFLOPS |             0.47x |         0.97x\n"
+        "      8 |    94 us   129.63 TFLOPS PASS |    91 us   188.70 TFLOPS |     0.97x\n"
         "  ...\n"
         "  Reading the row:\n"
-        "    KV_BLOCKSCALE / PTH (...) : measured on this MI308 (us + TFLOPS).\n"
-        "    vrf                       : PASS / FAIL only when BENCH_VERIFY=1.\n"
-        "    H20 (ref)                 : reference numbers from the H20 PDF.\n"
-        "    H20/MI308 prefill         : H20 us / batch_prefill us (>1 = MI308 faster).\n"
-        "    H20/MI308 fwd             : H20 us / fmha_fwd us       (>1 = MI308 faster).\n"
+        "    PTH (fmha_fwd) : measured on this MI308 (us + TFLOPS).\n"
+        "    vrf            : PASS / FAIL only when BENCH_VERIFY=1.\n"
+        "    H20 (ref)      : reference numbers from the H20 PDF.\n"
+        "    H20/MI308      : H20 us / fmha_fwd us  (>1 = MI308 faster).\n"
         "\n"
         "environment variables:\n"
         "  BENCH_VERIFY=0|1            verify outputs vs FP32 reference\n"
         "                              (default 0; slow on long seqs)\n"
-        "  BENCH_PAGE_SIZE=N           paged-KV page size (default 1024;\n"
-        "                              KV_BLOCKSCALE column is skipped if\n"
-        "                              page_size < 128)\n"
         "  BENCH_BYPASS_ROCM72_SKIP=1  bypass the causal+soft_cap=0 skip\n"
         "                              guard (default on; flip to 0 to\n"
         "                              honor the upstream guard)\n"
@@ -229,14 +214,7 @@ def _run_one(shape):
         contiguous_kv=True,
         seed=42,
     )
-    pth = call_kernel(run_batch_prefill_per_token_head, **common)
-    if PAGE_SIZE >= 128:
-        kvb = call_kernel(run_batch_prefill_kv_blockscale, **common)
-    else:
-        kvb = {"status": "skipped"}
-    # Non-paged fmha_fwd PER_TOKEN_HEAD (only wired for fp8bf16 + hdim=128 on gfx9).
-    fwd = call_kernel(run_fwd_per_token_head, **common)
-    return pth, kvb, fwd
+    return call_kernel(run_fwd_per_token_head, **common)
 
 
 def _lat_ratio(r, h20_us):
@@ -248,16 +226,15 @@ def _lat_ratio(r, h20_us):
     return f"{h20_us / r['time_us']:.2f}x"
 
 
-def _format_row(shape, pth, kvb, fwd):
+def _format_row(shape, fwd):
     b, qo, kv, nhq, nhk, hd, c, sc = shape
     h20_ms = H20_LAT_MS.get((b, kv))
     h20_us = h20_ms * 1000.0 if h20_ms is not None else None
     return (
         f"{b:>5} | "
-        f"{fmt(kvb):>27} {verify_str(kvb)} | {fmt(pth):>27} {verify_str(pth)} | "
         f"{fmt(fwd):>27} {verify_str(fwd)} | "
         f"{fmt_h20(b, kv):>27} | "
-        f"{_lat_ratio(pth, h20_us):>17} | {_lat_ratio(fwd, h20_us):>13}"
+        f"{_lat_ratio(fwd, h20_us):>9}"
     )
 
 
@@ -301,7 +278,7 @@ def _run_silent(shape):
 # Trigger one-time JIT imports + first-call warnings BEFORE drawing the table,
 # so the header and rows aren't split by aiter import lines / ROCTracer warnings.
 print("Warming up kernels (one-time JIT setup, may take a moment)...", flush=True)
-_pth0, _kvb0, _fwd0 = _run_silent(SHAPES[0])
+_fwd0 = _run_silent(SHAPES[0])
 
 # Constants are pulled out of the table to keep it narrow. nhq/nhk/hd/causal/
 # soft_cap are assumed constant across SHAPES; we sanity-check below.
@@ -313,19 +290,18 @@ for _s in SHAPES:
     )
 
 if VERIFY:
-    print("Verification: ON  (BENCH_VERIFY=1, FP8/BF16 outputs checked vs FP32 reference)")
+    print("Verification: ON  (BENCH_VERIFY=1, FP8 outputs checked vs FP32 reference)")
 else:
     print("Verification: OFF (set BENCH_VERIFY=1 to check outputs vs FP32 reference)")
 print(
     f"Config: nhq={_nhq}, nhk={_nhk}, hd={_hd}, "
-    f"causal={_causal}, soft_cap={_sc}, page_size={PAGE_SIZE}"
+    f"causal={_causal}, soft_cap={_sc}"
 )
 _HEADER = (
     f"{'batch':>5} | "
-    f"{'KV_BLOCKSCALE':>27} {'vrf':>6} | {'PTH (batch_prefill)':>27} {'vrf':>6} | "
     f"{'PTH (fmha_fwd)':>27} {'vrf':>6} | "
     f"{'H20 (ref)':>27} | "
-    f"{'H20/MI308 prefill':>17} | {'H20/MI308 fwd':>13}"
+    f"{'H20/MI308':>9}"
 )
 print(_HEADER)
 print("-" * len(_HEADER))
@@ -333,15 +309,10 @@ print("-" * len(_HEADER))
 failures = []
 
 
-def _record_failures(shape, pth, kvb, fwd):
+def _record_failures(shape, fwd):
     b, _qo, kv, *_ = shape
-    for label, r in (
-        ("PTH (batch_prefill)", pth),
-        ("KV_BLOCKSCALE", kvb),
-        ("PTH (fmha_fwd)", fwd),
-    ):
-        if r.get("verify") == "fail":
-            failures.append((b, kv, label, r.get("error", "")))
+    if fwd.get("verify") == "fail":
+        failures.append((b, kv, "PTH (fmha_fwd)", fwd.get("error", "")))
 
 
 # Group shapes by seq so we print one "seq=N" sub-header per group instead of
@@ -357,12 +328,12 @@ for _seq, _shapes in _groups.items():
     print(f"seq={_seq}")
     for shape in _shapes:
         if shape == SHAPES[0] and not _warmup_done:
-            pth, kvb, fwd = _pth0, _kvb0, _fwd0
+            fwd = _fwd0
             _warmup_done = True
         else:
-            pth, kvb, fwd = _run_one(shape)
-        print(_format_row(shape, pth, kvb, fwd), flush=True)
-        _record_failures(shape, pth, kvb, fwd)
+            fwd = _run_one(shape)
+        print(_format_row(shape, fwd), flush=True)
+        _record_failures(shape, fwd)
 
 if VERIFY:
     if failures:
