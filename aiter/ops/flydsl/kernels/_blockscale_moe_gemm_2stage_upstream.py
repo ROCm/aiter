@@ -169,8 +169,8 @@ def compile_moe_blockscale_gemm1(
     if use_cshuffle_epilog is None:
         use_cshuffle_epilog = os.environ.get("FLYDSL_MOE_STAGE1_CSHUFFLE", "1") in ("1", "true", "True", "YES", "yes")
     use_cshuffle_epilog = bool(use_cshuffle_epilog)
-    if out_dtype != "f16" and use_cshuffle_epilog:
-        raise ValueError("stage1 cshuffle epilog currently supports only f16 output (out_dtype='f16')")
+    # cshuffle epilog now supports both f16 and bf16 (out_mlir() handles the type swap).
+    _out_is_bf16 = out_dtype == "bf16"
 
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
@@ -289,9 +289,14 @@ def compile_moe_blockscale_gemm1(
                 shape=(lds_total_elems,),
             )
             lds_x = lds_x_ptr.get()
-            # Alias LDS bytes as fp16 for optional CShuffle epilogue.
+            # Alias LDS bytes as fp16/bf16 for optional CShuffle epilogue.
             lds_out = (
-                SmemPtr(base_ptr, lds_x_ptr.byte_offset, T.f16, shape=(tile_m * tile_n,)).get()
+                SmemPtr(
+                    base_ptr,
+                    lds_x_ptr.byte_offset,
+                    T.bf16 if _out_is_bf16 else T.f16,
+                    shape=(tile_m * tile_n,),
+                ).get()
                 if _use_cshuffle_epilog
                 else None
             )
@@ -1046,10 +1051,11 @@ def compile_moe_blockscale_gemm1(
                         y = silu(vg) * vu
                         if const_expr(doweight_stage1):
                             y = y * tw
-                        y16 = arith.trunc_f(T.f16, y)
+                        _out_ty = out_mlir()
+                        y16 = arith.trunc_f(_out_ty, y)
 
                         lds_idx = row_base_lds + col_local
-                        v1 = vector.from_elements(T.vec(1, T.f16), [y16])
+                        v1 = vector.from_elements(T.vec(1, _out_ty), [y16])
                         vector.store(v1, lds_out, [lds_idx], alignment=2)
 
                 def precompute_row(*, row_local, row):
@@ -1091,6 +1097,7 @@ def compile_moe_blockscale_gemm1(
                     by_n=by_n,
                     n_tile_base=n_tile_base,
                     lds_out=lds_out,
+                    frag_elem_type=(T.bf16 if _out_is_bf16 else T.f16),
                     write_row_to_lds=write_row_to_lds,
                     precompute_row=precompute_row,
                     store_pair=store_pair,
