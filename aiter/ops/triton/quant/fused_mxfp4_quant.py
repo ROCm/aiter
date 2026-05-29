@@ -4,8 +4,23 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton._triton_kernels.activation import (
     _get_activation_from_str,
+)
+from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
+    _fused_dynamic_mxfp4_quant_moe_sort_kernel,
+    _fused_flatten_mxfp4_quant,
+    _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
+    _fused_reduce_rms_mxfp4_quant_kernel,
+    _fused_dynamic_mxfp4_quant_moe_sort_kernel,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.fuse_mxfp4_quant import (
+    _gluon_fused_rms_mxfp4_quant_kernel,
+)
+from aiter.ops.triton._triton_kernels.activation import (
+    _get_activation_from_str,
+    _fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_dynamic_mxfp4_quant_moe_sort_kernel,
@@ -31,6 +46,7 @@ def fused_rms_mxfp4_quant(
     shuffle: bool | None = False,
     scale_shuffle_padding: bool | None = False,
     output_unquantized_inp1=False,
+    inargs: str = "auto",
 ):
     """
     This op contains several steps:
@@ -105,8 +121,26 @@ def fused_rms_mxfp4_quant(
         x2_stride_m = x2.stride(0)
         out2_stride_m = out2.stride(0)
 
+    # checks args for gluon or triton. Auto will default to best kernel based on hardware arch
+
+    if inargs == "auto":
+        if get_arch() == "gfx1250":
+            kernel = _gluon_fused_rms_mxfp4_quant_kernel
+        else:
+            kernel = _fused_rms_mxfp4_quant_kernel
+    elif inargs == "gluon":
+        if get_arch() != "gfx1250":
+            raise ValueError("Gluon kernel only supported on gfx1250")
+        kernel = _gluon_fused_rms_mxfp4_quant_kernel
+    elif inargs == "triton":
+        kernel = _fused_rms_mxfp4_quant_kernel
+    else:
+        raise ValueError(
+            f"Invalid argument: {inargs}. Chose from auto, gluon, or triton"
+        )
+
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * (2 if (x2 is not None) else 1),)
-    _fused_rms_mxfp4_quant_kernel[grid](
+    kernel[grid](
         x1,
         x1_weight,
         x2,
