@@ -839,6 +839,8 @@ def _fused_dynamic_mxfp4_quant_moe_sort_kernel(
     stride_o4,  #: tl.constexpr,
     token_num,  #: tl.constexpr,
     N_i,  #: tl.constexpr,
+    N_o,  # number of valid scale columns (= scaleN)
+    N_o_padded,  # scale columns per shuffle tile (multiple of BLOCK_SIZE_N)
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE_Mx: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -995,6 +997,7 @@ def _fused_dynamic_mxfp4_quant_moe_sort_kernel(
     offs_2 = pid_n  # // 2
     offs_3 = pid_m  # // 2
     offs_4 = tl.arange(0, 4)
+    # Position of each scale byte in the padded e8m0 shuffle layout.
     offs = (
         offs_0[:, None, None] * stride_o0
         + offs_1[None, :, None] * stride_o1  # * BLOCK_SIZE_M
@@ -1002,11 +1005,16 @@ def _fused_dynamic_mxfp4_quant_moe_sort_kernel(
         + offs_3 * stride_o3  # * BLOCK_SIZE_M * BLOCK_SIZE_N * N_i // BLOCK_SIZE_N
         + offs_4[None, None, :] * stride_o4
     )
-    # blockscale_e8m0_sorted_mask = (blockscale_e8m0_sorted_offs_m < M_o)[:, None] & (
-    #     blockscale_e8m0_sorted_offs_n < N_o
-    # )[None, :]
+    # Compact to N_o columns on store: the shuffle tiling spans N_o_padded
+    # columns, so drop the pad columns (>= N_o) and write directly into a
+    # contiguous (rows, N_o) buffer.  Equivalent to the previous
+    # `view(-1, N_o_padded)[:, :N_o].contiguous()` but without the extra copy.
+    col = offs % N_o_padded
+    row = offs // N_o_padded
+    dest = row * N_o + col
+    store_mask = col < N_o
     tl.store(
-        blockscale_e8m0_sorted_ptr + offs,
+        blockscale_e8m0_sorted_ptr + dest,
         out,
-        # mask=blockscale_e8m0_sorted_mask,
+        mask=store_mask,
     )

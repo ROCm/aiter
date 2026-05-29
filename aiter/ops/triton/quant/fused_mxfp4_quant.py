@@ -610,44 +610,55 @@ def fused_dynamic_mxfp4_quant_moe_sort(
 
     N_i = scaleN
     M_o, N_o = sorted_ids.shape[0], N_i
-    # Pad N_o to next multiple of BLOCK_SIZE_N so blockscale elements are
-    # evenly divisible when viewed as (-1, N_o_padded).  The extra columns
-    # are stripped before returning.
+    # The e8m0 shuffle tiling addresses scale columns in groups of BLOCK_SIZE_N,
+    # so a tile spans N_o_padded columns even when scaleN is not a multiple of
+    # BLOCK_SIZE_N (e.g. scaleN=6 at TP=8, scaleN=12 at TP=4).  The kernel
+    # computes each scale byte's position in that padded layout, then compacts
+    # to exactly N_o columns on store (masking the pad columns) so the returned
+    # tensor is already contiguous -- no post-hoc `[:, :N_o].contiguous()` copy.
     N_o_padded = triton.cdiv(N_o, BLOCK_SIZE_N) * BLOCK_SIZE_N
     # Note: the (N_i // 2) % 2 == 0 assertion was removed because the kernel
-    # handles non-aligned scaleN (e.g. scaleN=6 at TP=8) through load masking
-    # and output padding/slicing.  Only N % 4 == 0 is required (for fp4 packing).
+    # handles non-aligned scaleN through load masking and store-time column
+    # masking.  Only N % 4 == 0 is required (for fp4 packing).
     assert block_size % BLOCK_SIZE_M == 0
 
-    blockscale_e8m0_sorted = torch.empty(
-        (
-            triton.cdiv(M_o, BLOCK_SIZE_M),
-            triton.cdiv(N_o, BLOCK_SIZE_N),
-            BLOCK_SIZE_N_u32,
-            BLOCK_SIZE_M_u32,
-            4,
-        ),
-        dtype=torch.uint8,
-        device=x.device,
-    )  # .fill_(0)
+    n_block_m = triton.cdiv(M_o, BLOCK_SIZE_M)
+    n_block_n = triton.cdiv(N_o, BLOCK_SIZE_N)
+    rows_padded = n_block_m * BLOCK_SIZE_M
+    scale_out = torch.empty((rows_padded, N_o), dtype=torch.uint8, device=x.device)
 
-    num_pid = triton.cdiv(M, BLOCK_SIZE_Mx) * scaleN + triton.cdiv(
-        M_o, BLOCK_SIZE_M
-    ) * triton.cdiv(N_i, BLOCK_SIZE_N)
+    # Contiguous strides of the padded shuffle buffer
+    # (n_block_m, n_block_n, BLOCK_SIZE_N_u32, BLOCK_SIZE_M_u32, 4); the kernel
+    # uses these to derive the padded flat position of each scale byte before
+    # compacting it into scale_out.
+    blockscale_numel = BLOCK_SIZE_N_u32 * BLOCK_SIZE_M_u32 * 4  # 256
+    o_stride3 = n_block_n * blockscale_numel
+    o_stride2 = blockscale_numel
+    o_stride1 = BLOCK_SIZE_M_u32 * 4
+    o_stride0 = 4
+    o_stride4 = 1
+
+    num_pid = triton.cdiv(M, BLOCK_SIZE_Mx) * scaleN + n_block_m * n_block_n
     _fused_dynamic_mxfp4_quant_moe_sort_kernel[(num_pid,)](
         x,
         x_fp4,
         sorted_ids,
         num_valid_ids,
-        blockscale_e8m0_sorted,
+        scale_out,
         M,
         N,
         scaleN,
         *x.stride(),
         *x_fp4.stride(),
-        *blockscale_e8m0_sorted.stride(),
+        o_stride3,
+        o_stride2,
+        o_stride1,
+        o_stride0,
+        o_stride4,
         token_num=token_num,
         N_i=N_i,
+        N_o=N_o,
+        N_o_padded=N_o_padded,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         BLOCK_SIZE_Mx=BLOCK_SIZE_Mx,
         BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
@@ -655,12 +666,9 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         TOPK=topk,
     )
 
-    scale_out = blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o_padded)
-    if N_o_padded != N_o:
-        scale_out = scale_out[:, :N_o].contiguous()
     return (
         x_fp4.view(dtypes.fp4x2),
-        scale_out,
+        scale_out.view(dtypes.fp8_e8m0),
     )
 
 
