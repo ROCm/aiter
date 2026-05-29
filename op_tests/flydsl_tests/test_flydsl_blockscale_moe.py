@@ -171,13 +171,31 @@ def _torch_stage2_ref(
 # ---------------------------------------------------------------------------
 def _prepare_data(tokens, model_dim, inter_dim, experts, topk, *, seed=0,
                   blk_n=SCALE_BLOCK_N_DEFAULT, blk_k=SCALE_BLOCK_K_DEFAULT):
+    """Build a self-consistent FP8 blockscale fixture.
+
+    Single block-quantization pass: ``per_group_quant_hip`` produces both
+    the FP8 buffer the kernel consumes (``x_bq``) and the FP32 scale used
+    by both the kernel and the FP32 reference. Removing the prior
+    pertoken→block double-quant (which silently mismatched scales)
+    aligns numerics so the small-shape stage1/stage2 tests can use a
+    strict tolerance instead of being informational-only.
+    """
     g = torch.Generator(device=DEVICE).manual_seed(seed)
     s = 0.2
     x_fp32 = torch.randn(tokens, model_dim, device=DEVICE, generator=g) * s
-    # x_q is the per-token (NOT block) FP8 quantized activation. This is the
-    # tensor fed to `per_group_quant_hip` inside the launchers, exactly like
-    # upstream FlyDSL `tests/kernels/test_moe_blockscale.py` does.
-    x_q, _ = _pertoken_quant_fp8(x_fp32)
+    nblk_k_w1 = model_dim // blk_k
+
+    # Block-quantize x once. ``x_bscale_fly`` is the [nblk_k, tokens] layout
+    # the FlyDSL kernel expects directly; ``x_bscale_ref`` is the
+    # [tokens, nblk_k] layout the FP32 reference + CK kernels expect.
+    x_bq, x_bscale_fly = per_group_quant_hip(
+        x_fp32.to(torch.bfloat16),
+        quant_dtype=DTYPE_FP8,
+        group_size=blk_k,
+        transpose_scale=True,
+    )
+    x_bq = x_bq.view(tokens, model_dim)
+    x_bscale_ref = x_bscale_fly.view(nblk_k_w1, tokens).t().contiguous()
 
     score = torch.rand(tokens, experts, device=DEVICE, generator=g)
     topk_vals, topk_ids = torch.topk(score, k=topk, dim=1)
@@ -209,19 +227,16 @@ def _prepare_data(tokens, model_dim, inter_dim, experts, topk, *, seed=0,
     w1_shuf = shuffle_weight(w1_bq, layout=(16, 16))
     w2_shuf = shuffle_weight(w2_bq, layout=(16, 16))
 
-    a1_bq, a1_bscale = _pertoken_quant_fp8(
-        x_q.float().view(-1, model_dim // blk_k, blk_k)
-    )
-    a1_bq = a1_bq.view(tokens, model_dim)
-    a1_bscale = a1_bscale.squeeze(-1)  # [token, nblk_k_w1]
-
     return dict(
         tokens=tokens, model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
         topk_ids=topk_ids, topk_weights=topk_weights,
-        # x_q: per-token quantized FP8 activation (canonical kernel input).
-        # a1_bq / a1_bscale: block-requantized version, used by the FP32 ref.
-        x_q=x_q,
-        a1_bq=a1_bq, a1_bscale=a1_bscale,
+        # Single block-quantized activation. x_bq is the kernel buffer,
+        # x_bscale_fly is the [nblk_k, tokens] layout the kernel consumes,
+        # x_bscale_ref is the [tokens, nblk_k] layout the FP32 reference
+        # and CK/ASM call sites expect.
+        x_bq=x_bq, x_bscale_fly=x_bscale_fly, x_bscale_ref=x_bscale_ref,
+        # Back-compat aliases for CK/ASM call sites that read a1_bscale.
+        a1_bq=x_bq, a1_bscale=x_bscale_ref,
         w1_bq=w1_bq, w1_bq_shuf=w1_shuf, w1_bscale_flat=w1_bscale_flat,
         w2_bq=w2_bq, w2_bq_shuf=w2_shuf, w2_bscale_flat=w2_bscale_flat,
     )
@@ -305,19 +320,11 @@ def _launch_flydsl_stage1(data, *, tile_m, tile_n, tile_k, waves_per_eu):
     )
     size_expert_ids = sorted_e.numel()
 
-    # Match upstream FlyDSL test: feed `x_q` (per-token quantized FP8), let
-    # per_group_quant_hip do the block-quant + transposed scale write.
-    a1_bq, a1_scale_fly = per_group_quant_hip(
-        data["x_q"].to(torch.bfloat16),
-        quant_dtype=DTYPE_FP8,
-        group_size=SCALE_BLOCK_K_DEFAULT,
-        transpose_scale=True,
-    )
-    nblk_k_w1 = data["model_dim"] // SCALE_BLOCK_K_DEFAULT
-    # Reshape scale into [token, nblk_k] for the FP32 ref (which expects the
-    # original layout). Note: a1_scale_fly itself is stored as [nblk_k, token].
-    a1_bscale_ref = a1_scale_fly.view(nblk_k_w1, -1).t().contiguous()
-    a1_scale_fly = a1_scale_fly.view(-1)
+    # Use the single block-quantized activation prepared upfront so the
+    # FP32 reference and the kernel see identical (x_bq, x_bscale) inputs.
+    a1_bq = data["x_bq"]
+    a1_bscale_ref = data["x_bscale_ref"]
+    a1_scale_fly = data["x_bscale_fly"].view(-1)
     w1_scale_fly = data["w1_bscale_flat"].view(-1)
 
     out1 = torch.zeros(tokens, topk, inter_dim, device=DEVICE, dtype=torch.float16)
@@ -431,9 +438,10 @@ def test_blockscale_correctness_stage1_stage2_e2e(
         msg="flydsl-stage1 vs ref", printLog=False,
     )
     print(f"\n  [{tokens}t] stage1: {us1:.1f}us, err_ratio={err_s1:.4f}")
-    # Small shapes amplify quantization noise; loosen the threshold to 15%
-    # (upstream FlyDSL test reports ~0.0001 at DSR1 shape but does not assert).
-    assert err_s1 <= 0.15, f"stage1 numerics err_ratio={err_s1:.4f} > 0.15"
+    # After the F3 single-block-quant fix, kernel and FP32 reference share
+    # the same (x_bq, x_bscale) so small-shape numerics agree tightly.
+    assert torch.isfinite(out1).all(), "stage1 produced non-finite values"
+    assert err_s1 <= 0.02, f"stage1 numerics err_ratio={err_s1:.4f} > 0.02"
 
     # ----- FlyDSL stage2 -----
     out2, a2_bq, a2_scale_2d, us2 = _launch_flydsl_stage2(
@@ -447,27 +455,15 @@ def test_blockscale_correctness_stage1_stage2_e2e(
         tokens, model_dim, inter_dim, topk,
         SCALE_BLOCK_N_DEFAULT, SCALE_BLOCK_K_DEFAULT,
     )
-    # Stage2 numerics check is informational only at small shapes:
-    #   (a) The torch FP32 reference has a known per-(token,slot) scale path
-    #       mismatch (upstream FlyDSL test reports err_ratio=1.0 there too,
-    #       and prints without asserting).
-    #   (b) FP16 atomic accumulation in stage2 can overflow at small token
-    #       counts where the test seed concentrates routing weight; the
-    #       production DSR1 shape (M=8192) regime works cleanly. The
-    #       production-shape end-to-end run lives in
-    #       ``test_perf_dsr1_e2e_vs_ck_and_asm`` (gated by AITER_RUN_PERF=1)
-    #       and is the meaningful e2e validation for this PR.
     n_nan = (~out2.isfinite()).sum().item()
     err_s2 = checkAllclose(
-        out2_ref_s2.to(out2.dtype), out2, rtol=0.1, atol=0.1,
+        out2_ref_s2.to(out2.dtype), out2, rtol=0.05, atol=0.05,
         msg="flydsl-stage2 vs ref", printLog=False,
     )
-    print(
-        f"  [{tokens}t] stage2: {us2:.1f}us, "
-        f"err_vs_ref={err_s2:.4f}, non-finite={n_nan}/{out2.numel()} "
-        "(informational; see test_perf_dsr1_e2e_vs_ck_and_asm for the "
-        "production-shape e2e validation)"
-    )
+    print(f"  [{tokens}t] stage2: {us2:.1f}us, err_vs_ref={err_s2:.4f}, "
+          f"non-finite={n_nan}/{out2.numel()}")
+    assert n_nan == 0, f"stage2 produced {n_nan} non-finite values"
+    assert err_s2 <= 0.05, f"stage2 numerics err_ratio={err_s2:.4f} > 0.05"
 
     print(f"  [{tokens}t] e2e via aiter dispatcher: {us1 + us2:.1f}us total")
 
