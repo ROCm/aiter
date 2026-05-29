@@ -281,6 +281,29 @@ namespace py = pybind11;
           py::arg("x_scale") = std::nullopt, \
           py::arg("w_scale") = std::nullopt);
 
+#define OPUS_GEMM_PYBIND                          \
+    m.def("opus_gemm",                            \
+          &opus_gemm,                             \
+          "opus_gemm",                            \
+          py::arg("XQ"),                          \
+          py::arg("WQ"),                          \
+          py::arg("Y"),                           \
+          py::arg("group_layout") = std::nullopt, \
+          py::arg("x_scale") = std::nullopt,      \
+          py::arg("w_scale") = std::nullopt,      \
+          py::arg("bias") = std::nullopt);
+
+#define OPUS_GEMM_A16W16_TUNE_PYBIND             \
+    m.def("opus_gemm_a16w16_tune",               \
+          &opus_gemm_a16w16_tune,                \
+          "opus_gemm_a16w16_tune",               \
+          py::arg("XQ"),                          \
+          py::arg("WQ"),                          \
+          py::arg("Y"),                           \
+          py::arg("bias") = std::nullopt,         \
+          py::arg("kernelId") = 0,                \
+          py::arg("splitK")   = 0);
+
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
           &aiter::swap_blocks,                                                      \
@@ -1368,6 +1391,15 @@ namespace py = pybind11;
           py::arg("shuffle_scale")   = false,                            \
           py::arg("num_rows")        = std::nullopt,                     \
           py::arg("num_rows_factor") = 1);                               \
+    m.def("dynamic_per_group_scaled_quant",                              \
+          &aiter::dynamic_per_group_scaled_quant,                        \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("scales"),                                             \
+          py::arg("group_size")     = 32,                                \
+          py::arg("shuffle_scale")  = true,                              \
+          py::arg("num_rows")       = std::nullopt,                      \
+          py::arg("num_rows_factor") = 1);                               \
     m.def("dynamic_per_group_scaled_quant_fp4",                          \
           &aiter::dynamic_per_group_scaled_quant_fp4,                    \
           py::arg("out"),                                                \
@@ -2011,7 +2043,25 @@ namespace py = pybind11;
           py::arg("hc_pre_eps")         = 1e-6, \
           py::arg("hc_sinkhorn_eps")    = 1e-6, \
           py::arg("hc_post_mult_value") = 1.0,  \
-          py::arg("sinkhorn_repeat")    = 20);     \
+          py::arg("sinkhorn_repeat")    = 20);   \
+    m.def("mhc_pre_big_fuse_rmsnorm",            \
+          &aiter::mhc_pre_big_fuse_rmsnorm,      \
+          "mhc_pre_big_fuse_rmsnorm",            \
+          py::arg("post_mix"),                   \
+          py::arg("comb_mix"),                   \
+          py::arg("out"),                        \
+          py::arg("gemm_out_mul"),               \
+          py::arg("gemm_out_sqrsum"),            \
+          py::arg("hc_scale"),                   \
+          py::arg("hc_base"),                    \
+          py::arg("residual"),                   \
+          py::arg("norm_weight"),                \
+          py::arg("rms_eps")            = 1e-6,  \
+          py::arg("hc_pre_eps")         = 1e-6,  \
+          py::arg("hc_sinkhorn_eps")    = 1e-6,  \
+          py::arg("norm_eps")           = 1e-6,  \
+          py::arg("hc_post_mult_value") = 1.0,   \
+          py::arg("sinkhorn_repeat")    = 20);   \
     m.def("mhc_post",                           \
           &aiter::mhc_post,                     \
           "mhc_post",                           \
