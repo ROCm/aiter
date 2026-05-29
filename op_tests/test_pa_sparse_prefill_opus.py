@@ -411,7 +411,7 @@ def run_pa_sparse_prefill_opus(
 
 _PYTEST_SHAPES = [
     # (N, H, total_pages, total_tokens)
-    (64, 16, 256, 256),  # H <= 32 exercises the 16mx1_16nx4 variant
+    (64, 16, 256, 256),
     (128, 32, 256, 256),
     (64, 64, 1024, 1024),
     (256, 128, 2048, 2048),
@@ -468,7 +468,7 @@ parser.add_argument(
     type=int,
     nargs="*",
     default=[16, 32, 64, 128],
-    help="number of query heads H_Q (default: [64, 128])",
+    help="number of query heads H_Q (default: [16, 32, 64, 128])",
 )
 parser.add_argument(
     "-d",
