@@ -474,7 +474,8 @@ def chunk_gated_delta_rule_opt_vk(
         use_qk_l2norm_in_kernel (bool): Whether to use L2 normalization.
         cu_seqlens (torch.LongTensor, optional): Cumulative sequence lengths `[N+1]`.
         use_chunk_hip (bool): Use HIP kernel for hidden state computation.
-        state_dtype (torch.dtype, optional): State dtype for HIP path (`fp32` or `bf16`).
+        state_dtype (torch.dtype, optional): Initial/final state dtype
+            (`fp32` or `bf16`), supported by both the HIP and Triton paths.
         use_exp2 (bool): Use exp2 instead of exp for gate computation.
 
     Returns:

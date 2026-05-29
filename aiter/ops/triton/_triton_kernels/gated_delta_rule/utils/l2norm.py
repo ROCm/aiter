@@ -24,11 +24,8 @@ BT_LIST = [8, 16, 32, 64, 128]
 NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
 
 
-# Default forward-kernel tile config: matches the fastest FLA-style "kernel2"
-# (MBLOCK=32, num_warps=4). Robustly best for D in {64, 128, 256, 512} on
-# both ROCm CDNA3 and recent NVIDIA archs in our benchmarks; in-process
-# A/B ablation (see linear_attn_example/test/gy_test_l2norm_ablation.py)
-# confirms this config matches vLLM's hand-tuned kernel2 within 1us.
+# Default forward-kernel tile config (MBLOCK=32, num_warps=4): a robust
+# choice across the supported head dimensions D in {64, 128, 256, 512}.
 _L2NORM_FWD_BT = 32
 _L2NORM_FWD_NUM_WARPS = 4
 
@@ -105,14 +102,14 @@ def l2norm_fwd_kernel(
 
     Uses direct pointer arithmetic instead of ``tl.make_block_ptr`` because
     on small kernels the block_ptr codegen prologue adds non-trivial
-    overhead (~4 us / call observed on ROCm). ``STORE_RSTD`` is a
+    overhead. ``STORE_RSTD`` is a
     compile-time flag: when False the rstd store is DCE-eliminated and
     the caller may pass any tensor as the ``Rstd`` argument.
 
     ``BT`` and ``num_warps`` are fixed at the call site (defaults
     ``_L2NORM_FWD_BT=32`` / ``_L2NORM_FWD_NUM_WARPS=4``) rather than
-    autotuned: ablation showed autotune dispatch + per-NB specialization
-    costs ~10 us / call which dwarf any tile-size gains for this kernel.
+    autotuned: the autotune dispatch + per-NB specialization overhead
+    outweighs any tile-size gains for this small kernel.
     """
     xoffset = tl.program_id(0) * BT
     row_idx = xoffset + tl.arange(0, BT)[:, None]
@@ -184,8 +181,8 @@ def l2norm_fwd(
         need_rstd: If ``True``, also allocate and return the per-row
             reciprocal-std tensor required by ``l2norm_bwd`` for the
             autograd backward path. If ``False`` (default), both the
-            rstd allocation and the in-kernel rstd write are skipped --
-            saving ~7-10 us per call. ``L2NormFunction.forward`` passes
+            rstd allocation and the in-kernel rstd write are skipped.
+            ``L2NormFunction.forward`` passes
             ``need_rstd=True`` so autograd users get the correct
             behavior automatically; pure forward inference call sites
             should keep the default.

@@ -25,41 +25,26 @@ from ..utils.op import exp
 from ..utils.solve_tril import FLA_TRIL_PRECISION, solve_tril
 
 
-# Adaptive dispatch thresholds for K34 (triangular solve + recompute w, u).
-#
-# The fused kernel keeps Ai in registers but pays for it with high VGPR
-# pressure and ~2.5x more Phase-2 MFMAs than a plain matmul. The split path
-# (`solve_tril` + the head-major `recompute_w_u_head_major_kernel` below)
-# writes Ai to HBM (bf16) and uses tighter kernels.
-#
-# Empirically (MI35x, K=V=128, with K3 mask cleanup + K4_hm eager-load reorder
-# + Ai in k.dtype + solve_tril `empty_like` path):
-#   Short sequences (NT <= FUSE_NT_MAX, default 16 chunks ~= T <= 1K):
-#     fused wins by 5-15 us thanks to fewer launches.
-#   Long sequences (varlen and large contiguous):
-#     split wins for both MHA and GQA. The breakdown shows split K3+K4
-#     beats vllm K3+K4 in every T bucket (-0.3 to -15% per call), while
-#     fused K34 *loses* to vllm K3+K4 at 20K+ by ~2.8% per call.
-#
-# Env knobs (override the auto heuristic):
-#   AITER_K34_FUSE_NT_MAX      - max NT to keep on fused (default 16)
-#   AITER_K34_VARLEN_USE_SPLIT - "0"/"1" to force fused/split for varlen
-#                                (default: split)
-#   AITER_K34_FORCE            - "fused" or "split" to bypass all heuristics
-_K34_FUSE_NT_MAX = int(os.environ.get("AITER_K34_FUSE_NT_MAX", "16"))
-_K34_VARLEN_USE_SPLIT_OVERRIDE = os.environ.get("AITER_K34_VARLEN_USE_SPLIT")
-_K34_FORCE = os.environ.get("AITER_K34_FORCE", "").lower()  # "", "fused", "split"
+# solve_tril + recompute_w_u dispatch threshold in chunks (NT). At or below
+# this the single fused kernel is used; above it the split path
+# (solve_tril + recompute) is used.
+# The split path's small-NT cost is dominated by launch overhead, so the
+# crossover can shift under CUDA-graph/async capture -- re-tune via the env
+# var if needed.
+_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX = int(os.environ.get("AITER_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX", "32"))
+_SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT = os.environ.get("AITER_SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT")
+_SOLVE_TRIL_RECOMPUTE_FORCE = os.environ.get("AITER_SOLVE_TRIL_RECOMPUTE_FORCE", "").lower()  # "", "fused", "split"
 
 
 if IS_AMD:
-    _K34_CONFIGS = [
+    _SOLVE_TRIL_RECOMPUTE_CONFIGS = [
         triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=2),
         triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
         triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=3),
         triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=2),
     ]
 else:
-    _K34_CONFIGS = [
+    _SOLVE_TRIL_RECOMPUTE_CONFIGS = [
         triton.Config({"BK": BK, "BV": BV}, num_warps=nw, num_stages=ns)
         for BK in [32, 64]
         for BV in [32, 64]
@@ -67,14 +52,14 @@ else:
         for ns in [2, 3, 4]
     ]
 
-_K34_DEFAULT_CONFIG = triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=2)
+_SOLVE_TRIL_RECOMPUTE_DEFAULT_CONFIG = triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=2)
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=gated_delta_rule_autotune_configs(
-        _K34_CONFIGS,
-        default_config=_K34_DEFAULT_CONFIG,
+        _SOLVE_TRIL_RECOMPUTE_CONFIGS,
+        default_config=_SOLVE_TRIL_RECOMPUTE_DEFAULT_CONFIG,
     ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
@@ -406,36 +391,33 @@ def fused_solve_tril_recompute_w_u_kernel(
 # =============================================================================
 # Split path: head-major recompute_w_u kernel (consumes pre-inverted Ai).
 #
-# Used by the adaptive dispatcher for long sequences where the fused kernel's
-# high register pressure / Phase-2 MFMA count regresses against running
-# solve_tril + plain matmul. Output layout is [B, H, T, K/V] head-major so
-# downstream K5 (chunk_h) sees the same tensors as the fused path.
+# Used by the adaptive dispatcher for long sequences, where running
+# solve_tril + a plain matmul is cheaper than the single fused kernel.
+# Output layout is [B, H, T, K/V] head-major so the downstream hidden-state
+# kernel (chunk_delta_h) sees the same tensors as the fused path.
 # =============================================================================
 if IS_AMD:
-    # Mirror vllm's K4 search space (sans nw=8, which underperforms on MI35x):
-    # fixed BK=BV=64, autotune over num_warps x num_stages.
-    _K4_HM_CONFIGS = [
+    # Fixed BK=BV=64, autotune over num_warps x num_stages.
+    _RECOMPUTE_WU_HM_CONFIGS = [
         triton.Config({"BK": 64, "BV": 64}, num_warps=nw, num_stages=ns)
         for nw in [2, 4]
         for ns in [2, 3, 4]
     ]
 else:
-    _K4_HM_CONFIGS = [
+    _RECOMPUTE_WU_HM_CONFIGS = [
         triton.Config({"BK": 64, "BV": 64}, num_warps=nw, num_stages=ns)
         for nw in [2, 4, 8]
         for ns in [2, 3, 4]
     ]
 
-_K4_HM_DEFAULT_CONFIG = triton.Config(
-    {"BK": 64, "BV": 64}, num_warps=2, num_stages=2
-)
+_RECOMPUTE_WU_HM_DEFAULT_CONFIG = triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=2)
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=gated_delta_rule_autotune_configs(
-        _K4_HM_CONFIGS,
-        default_config=_K4_HM_DEFAULT_CONFIG,
+        _RECOMPUTE_WU_HM_CONFIGS,
+        default_config=_RECOMPUTE_WU_HM_DEFAULT_CONFIG,
     ),
     key=["H", "Hg", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
@@ -460,6 +442,7 @@ def recompute_w_u_head_major_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_EXP2: tl.constexpr = False,
 ):
     """
     Compute u = Ai @ (v * beta) and w = Ai @ (k * beta * exp(g)),
@@ -467,6 +450,8 @@ def recompute_w_u_head_major_kernel(
 
     Output layout: [B, H, T, K/V] head-major contiguous (matches fused path).
     Hg <= H supports GQA (k shared across H/Hg heads).
+    `g` is consumed in head-major layout [B, H, T], matching the fused kernel;
+    USE_EXP2 selects whether the cumulative gate is interpreted in log2 space.
     """
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -485,13 +470,16 @@ def recompute_w_u_head_major_kernel(
     else:
         bos = i_b * T
 
-    # Mirror vllm's wy_fast.recompute_w_u_fwd_kernel ordering: load beta,
-    # Ai (the inverted A), and the per-chunk gate eagerly so the compiler
-    # can hoist them out of the V/K loops and overlap their HBM latency.
+    # Load beta, Ai (the inverted A), and the per-chunk gate eagerly so the
+    # compiler can hoist them out of the V/K loops and overlap memory latency.
+    if IS_VARLEN:
+        g_base = g + i_h * T_flat + bos
+    else:
+        g_base = g + (i_b * H + i_h) * T_flat
     p_beta = tl.make_block_ptr(
         beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
     )
-    p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+    p_g = tl.make_block_ptr(g_base, (T,), (1,), (i_t * BT,), (BT,), (0,))
     p_Ai = tl.make_block_ptr(
         Ai + (bos * H + i_h) * BT,
         (T, BT),
@@ -502,7 +490,8 @@ def recompute_w_u_head_major_kernel(
     )
     b_beta = tl.load(p_beta, boundary_check=(0,))
     b_Ai = tl.load(p_Ai, boundary_check=(0, 1))
-    b_g = exp(tl.load(p_g, boundary_check=(0,)))
+    b_g_raw = tl.load(p_g, boundary_check=(0,))
+    b_g = tl.math.exp2(b_g_raw) if USE_EXP2 else exp(b_g_raw)
 
     # ---- u = Ai @ (v * beta) -> head-major store ----
     v_base = v + (bos * H + i_h) * V
@@ -538,7 +527,7 @@ def recompute_w_u_head_major_kernel(
             w_base, (T, K), (K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        # Single fused multiply-cast like vllm; default allow_tf32 (no-op on AMD).
+        # Single fused multiply-cast before the dot.
         b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
         b_w = tl.dot(b_Ai, b_kb)
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
@@ -560,12 +549,12 @@ def _run_split_path(
     K: int,
     V: int,
     BT: int,
+    use_exp2: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Long-sequence path: precompute Ai via solve_tril, then plain matmul.
 
-    Store Ai in k.dtype (bf16/fp16) to halve the HBM round-trip vs fp32 and
-    to allow `tl.dot(b_Ai, b_vb, allow_tf32=False)` in the K4 kernel (strict
-    same-dtype MFMA on AMD). Matches vllm's pipeline.
+    Ai is stored in k.dtype (bf16/fp16) to halve the memory round-trip vs
+    fp32 and to keep the recompute dot in a single dtype.
     """
     Ai = solve_tril(
         A_raw,
@@ -591,6 +580,7 @@ def _run_split_path(
         K=K,
         V=V,
         BT=BT,
+        USE_EXP2=use_exp2,
     )
     return w_out, u_out
 
@@ -605,15 +595,7 @@ def fused_solve_tril_recompute_w_u(
     use_exp2: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Adaptive dispatcher for K34 (triangular solve + recompute w, u).
-
-    Strategy:
-      - Short sequences (NT <= AITER_K34_FUSE_NT_MAX, default 64 chunks ~= T<=4096):
-          run the single fused kernel. Saves the Ai global round-trip and a
-          second launch; the per-chunk register pressure is tolerable.
-      - Long sequences:
-          run solve_tril + a plain head-major recompute_w_u kernel. Avoids the
-          fused kernel's Phase-2 ~2.5x MFMA blowup that dominates at large NT.
+    Fused triangular solve + recompute w, u in a single kernel.
 
     Args:
         A_raw: [B, T, H, BT=64], strictly lower triangular
@@ -625,8 +607,8 @@ def fused_solve_tril_recompute_w_u(
         use_exp2: when True, interpret g_cumsum in log2 space
 
     Returns:
-        w: [B, H, T, K], head-major contiguous
-        u: [B, H, T, V], head-major contiguous
+        w: [B, H, T, K], head-major contiguous layout
+        u: [B, H, T, V], head-major contiguous layout
     """
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
@@ -640,21 +622,18 @@ def fused_solve_tril_recompute_w_u(
         NT = triton.cdiv(T, BT)
 
     # Decide fused vs split.
-    if _K34_FORCE == "fused":
+    if _SOLVE_TRIL_RECOMPUTE_FORCE == "fused":
         use_split = False
-    elif _K34_FORCE == "split":
+    elif _SOLVE_TRIL_RECOMPUTE_FORCE == "split":
         use_split = True
     else:
-        # Auto: pick split for any non-trivial NT. Split's per-stage
-        # breakdown beats both fused K34 and vllm K3+K4 across all T
-        # buckets we benchmark, regardless of GQA / MHA (the empty_like
-        # K3 path eliminated the Ai memset that previously made split a
-        # loss on GQA).
-        if cu_seqlens is not None and _K34_VARLEN_USE_SPLIT_OVERRIDE is not None:
-            varlen_split = _K34_VARLEN_USE_SPLIT_OVERRIDE == "1"
-            use_split = varlen_split and NT > _K34_FUSE_NT_MAX
+        # Auto: use split once NT exceeds the threshold; below it the
+        # fused kernel's fewer launches win.
+        if cu_seqlens is not None and _SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT is not None:
+            varlen_split = _SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT == "1"
+            use_split = varlen_split and NT > _SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX
         else:
-            use_split = NT > _K34_FUSE_NT_MAX
+            use_split = NT > _SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX
 
     if use_split:
         return _run_split_path(
@@ -673,6 +652,7 @@ def fused_solve_tril_recompute_w_u(
             K,
             V,
             BT,
+            use_exp2=use_exp2,
         )
 
     u_out = v.new_empty(B, H, T, V)
