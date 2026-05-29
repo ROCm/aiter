@@ -509,6 +509,8 @@ def _parse_hgemm_kernel_params(name: str) -> Optional[Dict]:
         if m.group("small_m_suffix") is not None
         else KERNEL_FAMILY_HGEMM
     )
+    block_k_warps = m.group("block_k_warps")
+    block_k_warps = int(block_k_warps) if block_k_warps else 1
     config: Dict[str, object] = {
         "kernel_family": kernel_family,
         "stages": int(m.group("stages")),
@@ -518,7 +520,7 @@ def _parse_hgemm_kernel_params(name: str) -> Optional[Dict]:
         "split_k": int(m.group("split_k")),
         "block_m_warps": int(m.group("block_m_warps")),
         "block_n_warps": int(m.group("block_n_warps")),
-        "block_k_warps": int(m.group("block_k_warps")),
+        "block_k_warps": block_k_warps,
         "async_copy": m.group("async_copy") == "True",
         "b_to_lds": m.group("b_to_lds") == "True",
         "b_preshuffle": m.group("b_preshuffle") == "True",
