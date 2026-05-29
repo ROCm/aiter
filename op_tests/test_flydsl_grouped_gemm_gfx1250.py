@@ -33,6 +33,9 @@ from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (  # noqa:
     compile_moe_grouped_gemm2_a8w4_masked,
     compile_moe_grouped_gemm2_mxfp4_masked,
 )
+from aiter import ActivationType, QuantType  # noqa: E402
+from aiter.fused_moe import fused_moe  # noqa: E402
+from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402
 from aiter.test_common import run_perftest  # noqa: E402
 from aiter.utility import dtypes  # noqa: E402
 from aiter.jit.utils.chip_info import get_cu_num  # noqa: E402
@@ -235,7 +238,9 @@ def _kernel_kwargs(s: dict) -> dict:
 
 
 def _stage2_kernel_kwargs(s: dict) -> dict:
-    return _kernel_kwargs(s)
+    kwargs = _kernel_kwargs(s)
+    kwargs["split_k"] = 1
+    return kwargs
 
 
 def _masked_m(experts: int, max_m: int, *, mode: str = "mixed", override: int | None = None) -> torch.Tensor:
@@ -672,24 +677,6 @@ def _reference_mxscale_batched(
     return torch.matmul(a_scaled, b_scaled)
 
 
-def _apply_stage1_act_ref(gate: torch.Tensor, up: torch.Tensor, act: str) -> torch.Tensor:
-    if act == "swiglu":
-        gate = gate.clamp(max=7.0)
-        up = up.clamp(min=-7.0, max=7.0)
-        return gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
-    if act == "silu":
-        return torch.nn.functional.silu(gate) * up
-    raise ValueError(f"unknown stage1 act {act!r}")
-
-
-def _split_stage1_gate_up(gate_up: torch.Tensor, inter_dim: int, layout: str) -> tuple[torch.Tensor, torch.Tensor]:
-    if layout == "gugu":
-        return gate_up[..., 0::2], gate_up[..., 1::2]
-    if layout == "gguu":
-        return gate_up[..., :inter_dim], gate_up[..., inter_dim:]
-    raise ValueError(f"unknown stage1 weight layout {layout!r}")
-
-
 # Relative L2 distance is the canonical metric for low-precision GEMM checks:
 # entry-wise rtol/atol can flag legitimate per-element MXFP4 jitter while still
 # missing systematic bias. We bound ||actual-expected||_2 / ||expected||_2 instead.
@@ -979,9 +966,6 @@ def _run_stage1(
     bench_scope: str = "wrapper",
     rotate: int = 0,
     data_format: str = "fp4",
-    use_bias: bool = False,
-    act: str = "silu",
-    stage1_weight_layout: str = "gguu",
 ) -> dict[str, float]:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
@@ -996,15 +980,6 @@ def _run_stage1(
     x_scale = _prep_scale_batch(x_scale_raw, warp_tile=s["tile_m"] // s["m_warp"], tile_k=s["tile_k"])
     w_scale = _prep_scale_batch(w_scale_raw, warp_tile=s["tile_n"] // s["n_warp"], tile_k=s["tile_k"])
     y = torch.empty((E, max_m, inter_dim), device="cuda", dtype=torch.float16)
-    bias_cpu = None
-    bias = None
-    if use_bias:
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(91)
-        bias_cpu = (
-            torch.randn((E, 2 * inter_dim), generator=gen, dtype=torch.float32) * 1.0e-3
-        ).to(torch.float16)
-        bias = bias_cpu.cuda()
     timed_prefix = _make_m_tile_prefix_for_shape(masked_m, s) if persistent else None
     timed_map = _make_m_tile_map_for_shape(masked_m, s) if persistent else None
     _log(f"stage1 persistent={persistent}: compile")
@@ -1016,8 +991,7 @@ def _run_stage1(
     )
     kernel = compile_stage1(
         model_dim=model_dim, inter_dim=inter_dim, experts=E, max_m=max_m,
-        out_dtype="f16", grouped_persistent_m=persistent, act=act,
-        stage1_weight_layout=stage1_weight_layout,
+        out_dtype="bf16", grouped_persistent_m=persistent,
         **_kernel_kwargs(s),
     )
     _log(f"stage1 persistent={persistent}: compile done in {time.perf_counter() - compile_start:.2f}s")
@@ -1056,7 +1030,7 @@ def _run_stage1(
                    stream=torch.cuda.current_stream(),
                    _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                    _m_tile_prefix=timed_prefix,
-                   _m_tile_map=timed_map, bias=bias)
+                   _m_tile_map=timed_map)
     else:
         rotate_select = None
 
@@ -1065,7 +1039,7 @@ def _run_stage1(
                    stream=torch.cuda.current_stream(),
                    _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                    _m_tile_prefix=timed_prefix,
-                   _m_tile_map=timed_map, bias=bias)
+                   _m_tile_map=timed_map)
 
     perf_iter = [0]
     bench_prefix = timed_prefix if persistent else None
@@ -1096,7 +1070,6 @@ def _run_stage1(
                    stream=torch.cuda.current_stream(),
                    _m_tile_prefix=bench_prefix,
                    _m_tile_map=bench_map,
-                   bias=bias,
                    _tmp=bench_tmp,
                    _skip_epilogue=True)
         else:
@@ -1138,14 +1111,9 @@ def _run_stage1(
                 k=model_dim,
                 data_format=data_format,
             )  # (A, max_m, 2*inter_dim)
-            if bias_cpu is not None:
-                if s.get("split_k", 1) > 1:
-                    # Non-fused stage1 materializes the raw GEMM tmp as fp16
-                    # before the finalize+bias activation pass.
-                    gate_up_all = gate_up_all.to(torch.float16).float()
-                gate_up_all = gate_up_all + bias_cpu[active_t].to(gate_up_all.device).float().unsqueeze(1)
-            gate, up = _split_stage1_gate_up(gate_up_all, inter_dim, stage1_weight_layout)
-            expected_active = _apply_stage1_act_ref(gate, up, act).to(torch.float16).float()
+            gate = gate_up_all[..., :inter_dim]
+            up = gate_up_all[..., inter_dim:]
+            expected_active = (torch.nn.functional.silu(gate) * up).to(torch.float16).float()
             actual_active = y[active_t].float()
             check_name = f"stage1 persistent={persistent}"
             try:
@@ -1166,7 +1134,6 @@ def _run_stage1(
                     stream=torch.cuda.current_stream(),
                     _m_tile_prefix=timed_prefix,
                     _m_tile_map=timed_map,
-                    bias=bias,
                     _tmp=diag_tmp,
                 )
                 torch.cuda.synchronize()
@@ -1188,7 +1155,6 @@ def _run_stage1(
                 raise
     return timings
 
-
 def _run_stage2(
     s: dict[str, int],
     *,
@@ -1203,7 +1169,6 @@ def _run_stage2(
     bench_scope: str = "wrapper",
     rotate: int = 0,
     data_format: str = "fp4",
-    use_bias: bool = False,
 ) -> dict[str, float]:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
@@ -1218,15 +1183,6 @@ def _run_stage2(
     x_scale = _prep_scale_batch(x_scale_raw, warp_tile=s["tile_m"] // s["m_warp"], tile_k=s["tile_k"])
     w_scale = _prep_scale_batch(w_scale_raw, warp_tile=s["tile_n"] // s["n_warp"], tile_k=s["tile_k"])
     y = torch.empty((E, max_m, model_dim), device="cuda", dtype=torch.float16)
-    bias_cpu = None
-    bias = None
-    if use_bias:
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(97)
-        bias_cpu = (
-            torch.randn((E, model_dim), generator=gen, dtype=torch.float32) * 1.0e-3
-        ).to(torch.float16)
-        bias = bias_cpu.cuda()
     timed_prefix = _make_m_tile_prefix_for_shape(masked_m, s) if persistent else None
     timed_map = _make_m_tile_map_for_shape(masked_m, s) if persistent else None
     _log(f"stage2 persistent={persistent}: compile")
@@ -1277,7 +1233,7 @@ def _run_stage2(
                    stream=torch.cuda.current_stream(),
                    _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                    _m_tile_prefix=timed_prefix,
-                   _m_tile_map=timed_map, bias=bias)
+                   _m_tile_map=timed_map)
     else:
         rotate_select = None
 
@@ -1286,7 +1242,7 @@ def _run_stage2(
                    stream=torch.cuda.current_stream(),
                    _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                    _m_tile_prefix=timed_prefix,
-                   _m_tile_map=timed_map, bias=bias)
+                   _m_tile_map=timed_map)
 
     perf_iter = [0]
     bench_prefix = timed_prefix if persistent else None
@@ -1308,7 +1264,7 @@ def _run_stage2(
                    max_m, model_dim, inter_dim, E,
                    stream=torch.cuda.current_stream(),
                    _m_tile_prefix=bench_prefix,
-                   _m_tile_map=bench_map, bias=bias)
+                   _m_tile_map=bench_map)
         else:
             launch()
         return y
@@ -1332,7 +1288,7 @@ def _run_stage2(
         timings["run_perftest_us"] = us
         _log(f"stage2 persistent={persistent}: run_perftest done us={us:.2f}")
     if verify:
-        if bench_scope == "gemm" or rotate_select is not None or not timings:
+        if bench_scope == "gemm" or rotate_select is not None:
             if rotate_select is not None:
                 rotate_select(0)
             launch()
@@ -1346,10 +1302,7 @@ def _run_stage2(
                 x_scale_raw[active_t], w_scale_raw[active_t],
                 k=inter_dim,
                 data_format=data_format,
-            )
-            if bias_cpu is not None:
-                expected_active = expected_active + bias_cpu[active_t].to(expected_active.device).float().unsqueeze(1)
-            expected_active = expected_active.to(torch.float16).float()
+            ).to(torch.float16).float()
             actual_active = y[active_t].float()
             _assert_batched_close(
                 f"stage2 persistent={persistent}",
@@ -1374,9 +1327,6 @@ def _run_mock_moe(
     bench_mode: str = "event",
     bench_scope: str = "wrapper",
     data_format: str = "fp4",
-    use_bias: bool = False,
-    act: str = "silu",
-    stage1_weight_layout: str = "gguu",
 ) -> tuple[dict[str, float], dict[str, float]]:
     E, max_m = s["experts"], s["max_m"]
     model_dim, inter_dim = s["model_dim"], s["inter_dim"]
@@ -1423,15 +1373,6 @@ def _run_mock_moe(
     x1_scale = _prep_scale_batch(x1_scale_raw, warp_tile=s["tile_m"] // s["m_warp"], tile_k=s["tile_k"])
     w1_scale = _prep_scale_batch(w1_scale_raw, warp_tile=s["tile_n"] // s["n_warp"], tile_k=s["tile_k"])
     y1 = torch.empty((E, max_m, inter_dim), device="cuda", dtype=torch.float16)
-    bias1_cpu = None
-    bias1 = None
-    if use_bias:
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(91)
-        bias1_cpu = (
-            torch.randn((E, 2 * inter_dim), generator=gen, dtype=torch.float32) * 1.0e-3
-        ).to(torch.float16)
-        bias1 = bias1_cpu.cuda()
     timed_prefix_s1 = _make_m_tile_prefix_for_shape(masked_m, s) if persistent else None
     timed_map_s1 = _make_m_tile_map_for_shape(masked_m, s) if persistent else None
     _log(f"mock moe stage1 persistent={persistent}: compile")
@@ -1443,8 +1384,7 @@ def _run_mock_moe(
     )
     k1 = compile_stage1(
         model_dim=model_dim, inter_dim=inter_dim, experts=E, max_m=max_m,
-        out_dtype="f16", grouped_persistent_m=persistent, act=act,
-        stage1_weight_layout=stage1_weight_layout,
+        out_dtype="f16", grouped_persistent_m=persistent,
         **_kernel_kwargs(s),
     )
     _log(f"mock moe stage1 persistent={persistent}: compile done in {time.perf_counter() - compile_start:.2f}s")
@@ -1491,7 +1431,6 @@ def _run_mock_moe(
                _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                _m_tile_prefix=timed_prefix_s1,
                _m_tile_map=timed_map_s1,
-               bias=bias1,
                _debug_tmp_sentinel=_debug_tmp_sentinel,
                _debug_tmp_out=_debug_tmp_out)
     else:
@@ -1503,7 +1442,6 @@ def _run_mock_moe(
                _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                _m_tile_prefix=timed_prefix_s1,
                _m_tile_map=timed_map_s1,
-               bias=bias1,
                _debug_tmp_sentinel=_debug_tmp_sentinel,
                _debug_tmp_out=_debug_tmp_out)
 
@@ -1534,7 +1472,6 @@ def _run_mock_moe(
                stream=torch.cuda.current_stream(),
                _m_tile_prefix=bench_prefix_s1,
                _m_tile_map=bench_map_s1,
-               bias=bias1,
                _tmp=bench_tmp_s1,
                _skip_epilogue=True)
         else:
@@ -1590,14 +1527,9 @@ def _run_mock_moe(
                 k=model_dim,
                 data_format=data_format,
             )
-            if bias1_cpu is not None:
-                if s.get("split_k", 1) > 1:
-                    # Non-fused stage1 materializes the raw GEMM tmp as fp16
-                    # before the finalize+bias activation pass.
-                    gate_up_all = gate_up_all.to(torch.float16).float()
-                gate_up_all = gate_up_all + bias1_cpu[active_t].to(gate_up_all.device).float().unsqueeze(1)
-            gate, up = _split_stage1_gate_up(gate_up_all, inter_dim, stage1_weight_layout)
-            expected_active = _apply_stage1_act_ref(gate, up, act).to(torch.float16).float()
+            gate = gate_up_all[..., :inter_dim]
+            up = gate_up_all[..., inter_dim:]
+            expected_active = (torch.nn.functional.silu(gate) * up).to(torch.float16).float()
             actual_active = actual_active_raw.float()
             try:
                 _assert_batched_close(
@@ -1619,15 +1551,6 @@ def _run_mock_moe(
     x2_scale = _prep_scale_batch(x2_scale_raw, warp_tile=s["tile_m"] // s["m_warp"], tile_k=s["tile_k"])
     w2_scale = _prep_scale_batch(w2_scale_raw, warp_tile=s["tile_n"] // s["n_warp"], tile_k=s["tile_k"])
     y2 = torch.empty((E, max_m, model_dim), device="cuda", dtype=torch.float16)
-    bias2_cpu = None
-    bias2 = None
-    if use_bias:
-        gen = torch.Generator(device="cpu")
-        gen.manual_seed(97)
-        bias2_cpu = (
-            torch.randn((E, model_dim), generator=gen, dtype=torch.float32) * 1.0e-3
-        ).to(torch.float16)
-        bias2 = bias2_cpu.cuda()
     timed_prefix_s2 = _make_m_tile_prefix_for_shape(masked_m, s) if persistent else None
     timed_map_s2 = _make_m_tile_map_for_shape(masked_m, s) if persistent else None
     _log(f"mock moe stage2 persistent={persistent}: compile")
@@ -1680,8 +1603,7 @@ def _run_mock_moe(
                stream=torch.cuda.current_stream(),
                _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                _m_tile_prefix=timed_prefix_s2,
-               _m_tile_map=timed_map_s2,
-               bias=bias2)
+               _m_tile_map=timed_map_s2)
     else:
         rotate_select_s2 = None
 
@@ -1690,8 +1612,7 @@ def _run_mock_moe(
                stream=torch.cuda.current_stream(),
                _gemm_events=(start_ev, end_ev) if start_ev is not None else None,
                _m_tile_prefix=timed_prefix_s2,
-               _m_tile_map=timed_map_s2,
-               bias=bias2)
+               _m_tile_map=timed_map_s2)
 
     perf_iter_s2 = [0]
     bench_prefix_s2 = timed_prefix_s2 if persistent else None
@@ -1714,8 +1635,7 @@ def _run_mock_moe(
                masked_m, max_m, model_dim, inter_dim, E,
                stream=torch.cuda.current_stream(),
                _m_tile_prefix=bench_prefix_s2,
-               _m_tile_map=bench_map_s2,
-               bias=bias2)
+               _m_tile_map=bench_map_s2)
         else:
             launch_stage2()
         return y2
@@ -1739,9 +1659,6 @@ def _run_mock_moe(
         )
         timings2["run_perftest_us"] = us2
         _log(f"mock moe stage2 persistent={persistent}: run_perftest done us={us2:.2f}")
-    if not verify and bench_scope == "gemm":
-        _log("mock moe gemm-scope timing done; skip final scatter")
-        return timings1, timings2
     if verify:
         y2.fill_(_VERIFY_SENTINEL)
         if rotate_select_s2 is not None:
@@ -1768,10 +1685,7 @@ def _run_mock_moe(
                 x2_scale_raw[active_t], w2_scale_raw[active_t],
                 k=inter_dim,
                 data_format=data_format,
-            )  # (A, max_m, model_dim)
-            if bias2_cpu is not None:
-                expected_all = expected_all + bias2_cpu[active_t].to(expected_all.device).float().unsqueeze(1)
-            expected_all = expected_all.to(torch.float16).float()
+            ).to(torch.float16).float()  # (A, max_m, model_dim)
             actual_active = actual_active_raw.float()
             try:
                 _assert_batched_close(
@@ -1797,8 +1711,7 @@ def _run_mock_moe(
     row_idx = torch.arange(max_m, device="cuda").view(1, max_m)
     valid_mask = (row_idx < masked_m.view(E, 1))                      # (E, max_m)  bool, GPU
     flat_mask = valid_mask.view(-1)                                    # (E*max_m,)
-    # Avoid GPU bool reductions here: Tensor.any() on bool can hang on gfx1250.
-    if int(masked_m_cpu.sum().item()) > 0:
+    if flat_mask.any():
         flat_tokens = slot_token_ids.to("cuda").view(-1)               # (E*max_m,)
         flat_ranks = slot_rank_ids.to("cuda").view(-1)
         flat_y = y2.view(E * max_m, model_dim)                         # (E*max_m, model_dim)
@@ -1816,28 +1729,6 @@ def _run_mock_moe(
             _handle_verify_failure(check_name, exc)
     _log(f"mock moe scatter done: topk_out={tuple(topk_out.shape)} out={tuple(out.shape)}")
     return timings1, timings2
-
-
-def test_grouped_stage_bias_a4w4():
-    _require_gfx1250()
-    s = _shape(experts=3, max_m=16, model_dim=256, inter_dim=256)
-    _run_stage1(
-        s, persistent=True, verify=True, data="pattern", masked_mode="mixed",
-        warmup=0, iters=1, bench_mode="none", use_bias=True,
-    )
-    _run_stage2(
-        s, persistent=True, verify=True, data="pattern", masked_mode="mixed",
-        warmup=0, iters=1, bench_mode="none", use_bias=True,
-    )
-
-
-def test_grouped_stage2_bias_splitk_a4w4():
-    _require_gfx1250()
-    s = _shape(experts=3, max_m=16, model_dim=256, inter_dim=512, split_k=2)
-    _run_stage2(
-        s, persistent=True, verify=True, data="pattern", masked_mode="mixed",
-        warmup=0, iters=1, bench_mode="none", use_bias=True,
-    )
 
 
 def test_mock_moe_usage_a4w4():
@@ -1871,6 +1762,350 @@ def test_mock_moe_usage_a8w4():
     )
 
 
+def _load_real_layer_inputs(iter_dir: str, layer: int) -> dict[str, torch.Tensor]:
+    """Load hidden_in / hidden_out / router_logits dumped by the model trace."""
+    from pathlib import Path
+    root = Path(iter_dir)
+    prefix = f"model.layers.{layer}.mlp.experts."
+    return {
+        "hidden_in": torch.load(root / f"{prefix}hidden_in.pt", map_location="cpu", weights_only=False),
+        "hidden_out": torch.load(root / f"{prefix}hidden_out.pt", map_location="cpu", weights_only=False),
+        "router_logits": torch.load(root / f"{prefix}router_logits.pt", map_location="cpu", weights_only=False),
+    }
+
+
+def _load_real_layer_weights(weights_dir: str, layer: int) -> dict[str, torch.Tensor]:
+    from pathlib import Path
+    root = Path(weights_dir)
+    prefix_e = f"model.layers.{layer}.mlp.experts."
+    prefix_r = f"model.layers.{layer}.mlp.router."
+
+    def _opt(p):
+        return torch.load(p, map_location="cpu", weights_only=False) if p.exists() else None
+
+    return {
+        "gate_up_proj_blocks": torch.load(root / f"{prefix_e}gate_up_proj_blocks.pt", map_location="cpu", weights_only=False),
+        "gate_up_proj_scales": torch.load(root / f"{prefix_e}gate_up_proj_scales.pt", map_location="cpu", weights_only=False),
+        "gate_up_proj_bias": torch.load(root / f"{prefix_e}gate_up_proj_bias.pt", map_location="cpu", weights_only=False),
+        "down_proj_blocks": torch.load(root / f"{prefix_e}down_proj_blocks.pt", map_location="cpu", weights_only=False),
+        "down_proj_scales": torch.load(root / f"{prefix_e}down_proj_scales.pt", map_location="cpu", weights_only=False),
+        "down_proj_bias": torch.load(root / f"{prefix_e}down_proj_bias.pt", map_location="cpu", weights_only=False),
+        "router_weight": _opt(root / f"{prefix_r}weight.pt"),
+        "router_bias": _opt(root / f"{prefix_r}bias.pt"),
+    }
+
+
+def _diff_summary(name: str, got: torch.Tensor, ref: torch.Tensor) -> str:
+    a = got.detach().float()
+    b = ref.detach().float()
+    diff = (a - b).abs()
+    rel_l2 = float((a - b).norm() / b.norm().clamp(min=1e-12))
+    return (
+        f"{name}: shape={tuple(a.shape)} "
+        f"got_norm={float(a.norm()):.4e} ref_norm={float(b.norm()):.4e} "
+        f"diff_norm={float((a - b).norm()):.4e} rel_l2={rel_l2:.4e} "
+        f"max_abs={float(diff.max()):.4e} mean_abs={float(diff.mean()):.4e}"
+    )
+
+
+def _pad_dim(t: torch.Tensor, dim: int, target: int, fill: float = 0.0) -> torch.Tensor:
+    """Pad ``t`` along ``dim`` so its size becomes ``target`` (default fill 0)."""
+    cur = t.shape[dim]
+    if cur == target:
+        return t
+    if cur > target:
+        raise ValueError(f"cannot shrink dim {dim} from {cur} to {target}")
+    pad_shape = list(t.shape)
+    pad_shape[dim] = target - cur
+    pad = torch.full(pad_shape, fill, dtype=t.dtype, device=t.device)
+    return torch.cat([t, pad], dim=dim).contiguous()
+
+
+def _round_up(x: int, m: int) -> int:
+    return ((x + m - 1) // m) * m
+
+
+def _run_real_dump_grouped_vs_triton_vs_golden(
+    *,
+    dump_iter_dir: str,
+    dump_weights_dir: str,
+    layer: int = 0,
+    topk: int = 4,
+    swiglu_limit: float = 7.0,
+    debug: bool = True,
+    valid_hidden: int | None = None,
+    pad_align: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compare grouped GEMM vs Triton MoE vs golden ``hidden_out``.
+
+    Inputs come from a dump of gpt-oss-style MoE weights plus per-iteration
+    activations (hidden_in / hidden_out / router_logits). The MXFP4 packed
+    gate_up/down weights and their e8m0 scales feed both the grouped FlyDSL
+    path (``AITER_USE_GROUPED_GEMM=1``, native GUGU layout) and the
+    PyTorch / Triton MoE reference (``AITER_DISABLE_GFX1250_FLYDSL_MOE=1``,
+    GGUU-converted weights to match the reference's split assumption).
+    """
+    _require_gfx1250()
+
+    inputs = _load_real_layer_inputs(dump_iter_dir, layer)
+    weights = _load_real_layer_weights(dump_weights_dir, layer)
+
+    gate_up_blocks = weights["gate_up_proj_blocks"]
+    gate_up_scales = weights["gate_up_proj_scales"]
+    gate_up_bias = weights["gate_up_proj_bias"]
+    down_blocks = weights["down_proj_blocks"]
+    down_scales = weights["down_proj_scales"]
+    down_bias = weights["down_proj_bias"]
+
+    if gate_up_blocks.dim() == 4:
+        E, two_inter, k_blocks, byte_per_block = gate_up_blocks.shape
+        assert byte_per_block == 16, gate_up_blocks.shape
+        gate_up_packed = gate_up_blocks.reshape(E, two_inter, k_blocks * byte_per_block).contiguous()
+    else:
+        gate_up_packed = gate_up_blocks.contiguous()
+        E, two_inter = gate_up_packed.shape[:2]
+        k_blocks = gate_up_scales.shape[-1]
+
+    if down_blocks.dim() == 4:
+        Ed, hidden, k2_blocks, _ = down_blocks.shape
+        down_packed = down_blocks.reshape(Ed, hidden, k2_blocks * 16).contiguous()
+    else:
+        down_packed = down_blocks.contiguous()
+        Ed, hidden = down_packed.shape[:2]
+        k2_blocks = down_scales.shape[-1]
+
+    inter = two_inter // 2
+    real_hidden = k_blocks * SCALE_BLOCK
+    if valid_hidden is None:
+        valid_hidden = real_hidden
+    assert real_hidden == hidden, (real_hidden, hidden)
+    assert k2_blocks * SCALE_BLOCK == inter, (k2_blocks, inter)
+
+    hidden_pad = _round_up(real_hidden, pad_align)
+    inter_pad = _round_up(inter, pad_align)
+    two_inter_pad = 2 * inter_pad
+    k_pad_blocks = hidden_pad // SCALE_BLOCK
+    k2_pad_blocks = inter_pad // SCALE_BLOCK
+    print(
+        f"[real-dump] E={E} hidden={hidden} inter={inter} topk={topk} "
+        f"valid_hidden={valid_hidden} -> padded hidden={hidden_pad} inter={inter_pad}",
+        flush=True,
+    )
+
+    if hidden_pad != real_hidden or inter_pad != inter:
+        # IMPORTANT: pad scale tensors with 127 (= e8m0 byte for 2^0=1.0)
+        # so the GEMM kernel does NOT decode pad-region scales as NaN
+        # (OCP e8m0 spec maps byte=0 -> NaN, which then poisons the
+        # accumulator). Pad weight bytes / bias with 0 (mxfp4 nibble 0
+        # decodes to +0; bf16/fp32 zero is fine).
+        gate_up_packed = _pad_dim(_pad_dim(gate_up_packed, 1, two_inter_pad), 2, hidden_pad // 2)
+        gate_up_scales = _pad_dim(_pad_dim(gate_up_scales, 1, two_inter_pad, fill=127), 2, k_pad_blocks, fill=127)
+        gate_up_bias = _pad_dim(gate_up_bias, 1, two_inter_pad)
+        down_packed = _pad_dim(_pad_dim(down_packed, 1, hidden_pad), 2, inter_pad // 2)
+        down_scales = _pad_dim(_pad_dim(down_scales, 1, hidden_pad, fill=127), 2, k2_pad_blocks, fill=127)
+        down_bias = _pad_dim(down_bias, 1, hidden_pad)
+        hidden = hidden_pad
+        inter = inter_pad
+
+    # gpt-oss native layout is GUGU (gate_up[..., 0::2] / [..., 1::2]). The
+    # current grouped GEMM kernel only ships GGUU; convert here so we can
+    # call fused_moe with gate_mode=SEPARATED.
+    def _gugu_to_gguu_rows(t: torch.Tensor) -> torch.Tensor:
+        if t.dim() < 2 or t.shape[1] % 2 != 0:
+            raise ValueError(f"unexpected shape for GUGU axis: {tuple(t.shape)}")
+        E_, two_I = t.shape[:2]
+        I_ = two_I // 2
+        rest = t.shape[2:]
+        return (
+            t.contiguous()
+            .view(E_, I_, 2, *rest)
+            .permute(0, 2, 1, *range(3, 3 + len(rest)))
+            .contiguous()
+            .view(E_, two_I, *rest)
+        )
+
+    hidden_in = inputs["hidden_in"]
+    hidden_out = inputs["hidden_out"]
+    router_logits = inputs["router_logits"]
+    if hidden_in.shape[-1] != hidden:
+        if hidden_in.shape[-1] > hidden:
+            hidden_in = hidden_in[..., :hidden].contiguous()
+        else:
+            hidden_in = _pad_dim(hidden_in, -1, hidden)
+    if hidden_out.shape[-1] != hidden:
+        if hidden_out.shape[-1] > hidden:
+            hidden_out = hidden_out[..., :hidden].contiguous()
+        else:
+            hidden_out = _pad_dim(hidden_out, -1, hidden)
+    tokens = hidden_in.shape[0]
+    print(
+        f"[real-dump] tokens={tokens} hidden_in={tuple(hidden_in.shape)} "
+        f"router_logits={tuple(router_logits.shape)} golden={tuple(hidden_out.shape)}",
+        flush=True,
+    )
+
+    probs = torch.softmax(router_logits.float(), dim=-1)
+    topk_weights, topk_ids = probs.topk(k=topk, dim=-1, largest=True, sorted=True)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+    topk_weights = topk_weights.to(torch.bfloat16).cuda()
+    topk_ids = topk_ids.to(torch.int32).cuda()
+    if debug:
+        print(
+            f"[real-dump] topk_ids[0]={topk_ids[0].tolist()} "
+            f"topk_w[0]={[f'{v:.4f}' for v in topk_weights[0].float().tolist()]}",
+            flush=True,
+        )
+
+    hidden_cuda = hidden_in.contiguous().cuda().to(dtypes.bf16)
+    bias1_fp32 = gate_up_bias.float().cuda()
+    bias2_fp32 = down_bias.float().cuda()
+
+    # Grouped FlyDSL path: feed the native GUGU layout straight through.
+    # As of commit 1c40b2e56 ("update"), fused_moe no longer preshuffles
+    # ``w1_scale`` / ``w2_scale`` inside the grouped helper, so callers must
+    # pass already-preshuffled scales. Use the same helper the kernel
+    # launcher expects (warp_tile = tile_n // n_warp = 32, scale_k_per_tile
+    # = tile_k // 32 = 4) to match the canonical (128, 3072, 192) layout.
+    from aiter.fused_moe import _grouped_a8w4_prepare_scale_batch
+    w1_grouped = _preshuffle_b_n16_packed(gate_up_packed).cuda()
+    w2_grouped = _preshuffle_b_n16_packed(down_packed).cuda()
+    _GROUPED_TILE_N = 64
+    _GROUPED_TILE_K = 128
+    _GROUPED_N_WARP = 2
+    _GROUPED_WARP_TILE_N = _GROUPED_TILE_N // _GROUPED_N_WARP
+    w1_scale_cuda = _grouped_a8w4_prepare_scale_batch(
+        gate_up_scales.contiguous().cuda().view(dtypes.fp8_e8m0),
+        experts=E,
+        rows=2 * inter,
+        k_dim=hidden,
+        warp_tile=_GROUPED_WARP_TILE_N,
+        tile_k=_GROUPED_TILE_K,
+        device="cuda",
+    )
+    w2_scale_cuda = _grouped_a8w4_prepare_scale_batch(
+        down_scales.contiguous().cuda().view(dtypes.fp8_e8m0),
+        experts=E,
+        rows=hidden,
+        k_dim=inter,
+        warp_tile=_GROUPED_WARP_TILE_N,
+        tile_k=_GROUPED_TILE_K,
+        device="cuda",
+    )
+
+    saved = {
+        "AITER_USE_GROUPED_GEMM": os.environ.get("AITER_USE_GROUPED_GEMM"),
+        "AITER_GROUPED_STAGE1_WEIGHT_LAYOUT": os.environ.get("AITER_GROUPED_STAGE1_WEIGHT_LAYOUT"),
+        "AITER_DISABLE_GFX1250_FLYDSL_MOE": os.environ.get("AITER_DISABLE_GFX1250_FLYDSL_MOE"),
+    }
+
+    def _restore_env() -> None:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # The PyTorch / Triton MoE reference (running with
+    # AITER_DISABLE_GFX1250_FLYDSL_MOE=1) uses ``torch_moe_stage1`` which
+    # assumes a GGUU layout (``gate, up = a.split([inter, inter], dim=-1)``).
+    # Convert the GUGU dump weight/scale/bias to GGUU for the reference
+    # path so it sees its canonical layout, while grouped keeps native GUGU.
+    def _gugu_to_gguu_rows(t: torch.Tensor) -> torch.Tensor:
+        E_, two_I = t.shape[:2]
+        I_ = two_I // 2
+        rest = t.shape[2:]
+        return (
+            t.contiguous()
+            .view(E_, I_, 2, *rest)
+            .permute(0, 2, 1, *range(3, 3 + len(rest)))
+            .contiguous()
+            .view(E_, two_I, *rest)
+        )
+
+    w1_triton = _preshuffle_b_n16_packed(_gugu_to_gguu_rows(gate_up_packed)).cuda()
+    w1_scale_triton = (
+        _gugu_to_gguu_rows(gate_up_scales).contiguous().cuda().view(dtypes.fp8_e8m0)
+    )
+    bias1_fp32_triton = _gugu_to_gguu_rows(gate_up_bias.contiguous()).float().cuda()
+
+    try:
+        os.environ["AITER_USE_GROUPED_GEMM"] = "1"
+        os.environ["AITER_GROUPED_STAGE1_WEIGHT_LAYOUT"] = "gugu"
+        os.environ.pop("AITER_DISABLE_GFX1250_FLYDSL_MOE", None)
+        grouped_out = fused_moe(
+            hidden_cuda,
+            w1_grouped,
+            w2_grouped,
+            topk_weights,
+            topk_ids,
+            activation=ActivationType.Swiglu,
+            quant_type=QuantType.per_1x32,
+            w1_scale=w1_scale_cuda,
+            w2_scale=w2_scale_cuda,
+            bias1=bias1_fp32,
+            bias2=bias2_fp32,
+            gate_mode=GateMode.INTERLEAVE.value,
+            dtype=dtypes.bf16,
+            swiglu_limit=swiglu_limit,
+        )
+
+        os.environ["AITER_USE_GROUPED_GEMM"] = "0"
+        os.environ["AITER_DISABLE_GFX1250_FLYDSL_MOE"] = "1"
+        os.environ.pop("AITER_GROUPED_STAGE1_WEIGHT_LAYOUT", None)
+        triton_out = fused_moe(
+            hidden_cuda,
+            w1_triton,
+            w2_grouped,
+            topk_weights,
+            topk_ids,
+            activation=ActivationType.Swiglu,
+            quant_type=QuantType.per_1x32,
+            w1_scale=w1_scale_triton,
+            w2_scale=w2_scale_cuda,
+            bias1=bias1_fp32_triton,
+            bias2=bias2_fp32,
+            gate_mode=GateMode.SEPARATED.value,
+            dtype=dtypes.bf16,
+            swiglu_limit=swiglu_limit,
+        )
+    finally:
+        _restore_env()
+
+    golden = hidden_out.contiguous().cuda().to(dtypes.bf16)
+
+    print(_diff_summary("grouped vs golden ", grouped_out, golden), flush=True)
+    print(_diff_summary("triton  vs golden ", triton_out, golden), flush=True)
+    print(_diff_summary("grouped vs triton ", grouped_out, triton_out), flush=True)
+    # Sanity: split into the model's true valid hidden vs padded tail.
+    if valid_hidden < grouped_out.shape[-1]:
+        v = slice(0, valid_hidden)
+        p = slice(valid_hidden, grouped_out.shape[-1])
+        for name, t in (("grouped", grouped_out), ("triton", triton_out), ("golden", golden)):
+            print(
+                f"[real-dump]  {name} valid[:{valid_hidden}]_norm="
+                f"{float(t[..., v].float().norm()):.4e} "
+                f"pad[{valid_hidden}:]_max_abs={float(t[..., p].float().abs().max()):.4e}",
+                flush=True,
+            )
+        print(_diff_summary("grouped vs golden  (valid only)", grouped_out[..., v], golden[..., v]), flush=True)
+        print(_diff_summary("triton  vs golden  (valid only)", triton_out[..., v], golden[..., v]), flush=True)
+
+    if debug:
+        rows = min(2, grouped_out.shape[0])
+        for r in range(rows):
+            head = 8
+            print(
+                f"[real-dump] row{r} "
+                f"grouped[:{head}]={[f'{v:+.4e}' for v in grouped_out[r, :head].float().tolist()]} "
+                f"triton[:{head}] ={[f'{v:+.4e}' for v in triton_out[r, :head].float().tolist()]} "
+                f"golden[:{head}] ={[f'{v:+.4e}' for v in golden[r, :head].float().tolist()]}",
+                flush=True,
+            )
+
+    return grouped_out, triton_out, golden
+
+
+
 def _format_timing_summary(timings: dict[str, float]) -> str:
     fields = []
     if "run_perftest_us" in timings:
@@ -1883,7 +2118,23 @@ def _format_timing_summary(timings: dict[str, float]) -> str:
 def main() -> None:
     global DEFAULT_L2_TOL, DEFAULT_L2_ABS_TOL, _VERIFY_WARN_ONLY
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=("grouped", "moe"), default="grouped")
+    parser.add_argument("--scenario", choices=("grouped", "moe", "real-dump"), default="grouped")
+    parser.add_argument("--dump-iter-dir", default=None,
+                        help="Path to <dump>/rank0/decode/iterX containing "
+                             "model.layers.{L}.mlp.experts.{hidden_in,hidden_out,router_logits}.pt "
+                             "(used when --scenario real-dump).")
+    parser.add_argument("--dump-weights-dir", default=None,
+                        help="Path to <dump>/rank0/weights/model.layers.{L}.mlp.experts/ that "
+                             "contains gate_up_proj_blocks/scales/bias and down_proj_blocks/scales/bias .pt "
+                             "(used when --scenario real-dump).")
+    parser.add_argument("--dump-layer", type=int, default=0,
+                        help="Layer index to load from the dump (default: %(default)s).")
+    parser.add_argument("--dump-swiglu-limit", type=float, default=7.0,
+                        help="swiglu_limit forwarded to fused_moe (default: %(default)s).")
+    parser.add_argument("--dump-valid-hidden", type=int, default=None,
+                        help="Trim hidden_in/hidden_out to this many cols. "
+                             "Defaults to model's true hidden_size inferred from gate_up_proj_blocks.")
+    parser.add_argument("--dump-debug", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--stage", choices=("1", "2", "both"), default="both")
     parser.add_argument("--model-dim", type=int, default=7168)
     parser.add_argument("--inter-dim", type=int, default=256)
@@ -1945,22 +2196,6 @@ def main() -> None:
     parser.add_argument("--data-format", choices=("fp4", "a8w4"), default="fp4",
                         help="Activation/weight format under test. fp4 is MXFP4xMXFP4; "
                              "a8w4 uses FP8 activations with MXFP4 weights.")
-    parser.add_argument("--use-bias", action=argparse.BooleanOptionalAction, default=False,
-                        help="Pass per-expert bias into grouped GEMM stage1/stage2.")
-    parser.add_argument("--act", choices=("silu", "swiglu"), default="silu",
-                        help="Stage1 activation epilogue. Stage2 has no activation.")
-    stage1_weight_layout_default = os.environ.get(
-        "AITER_GROUPED_STAGE1_WEIGHT_LAYOUT", "gguu"
-    ).strip().lower()
-    if stage1_weight_layout_default not in ("gguu", "gugu"):
-        parser.error(
-            "AITER_GROUPED_STAGE1_WEIGHT_LAYOUT must be 'gguu' or 'gugu', "
-            f"got {stage1_weight_layout_default!r}"
-        )
-    parser.add_argument("--stage1-weight-layout", choices=("gguu", "gugu"),
-                        default=stage1_weight_layout_default,
-                        help="Logical row layout for stage1 gate/up weights and bias. "
-                             "Defaults to AITER_GROUPED_STAGE1_WEIGHT_LAYOUT or gguu.")
     parser.add_argument("--data", choices=("constant", "pattern", "randn"), default="constant")
     parser.add_argument("--masked-mode", choices=("mixed", "full", "descending"), default="mixed")
     parser.add_argument("--masked-m-override", type=int, default=None,
@@ -2019,12 +2254,26 @@ def main() -> None:
 
     print(
         f"[masked-grouped-moe-gemm] scenario={args.scenario} shape={s} stage={args.stage} "
-        f"verify={args.verify} data_format={args.data_format} use_bias={args.use_bias} "
-        f"act={args.act} stage1_weight_layout={args.stage1_weight_layout} "
-        f"data={args.data} masked_mode={args.masked_mode} "
+        f"verify={args.verify} data_format={args.data_format} data={args.data} masked_mode={args.masked_mode} "
         f"bench_mode={args.bench_mode} bench_scope={args.bench_scope} rotate={args.rotate}",
         flush=True,
     )
+    if args.scenario == "real-dump":
+        if not args.dump_iter_dir or not args.dump_weights_dir:
+            raise SystemExit(
+                "--scenario real-dump requires --dump-iter-dir and --dump-weights-dir"
+            )
+        _run_real_dump_grouped_vs_triton_vs_golden(
+            dump_iter_dir=args.dump_iter_dir,
+            dump_weights_dir=args.dump_weights_dir,
+            layer=args.dump_layer,
+            topk=args.topk,
+            swiglu_limit=args.dump_swiglu_limit,
+            debug=args.dump_debug,
+            valid_hidden=args.dump_valid_hidden,
+        )
+        return
+
     for persistent in persist_modes:
         if args.scenario == "moe":
             t1, t2 = _run_mock_moe(
@@ -2041,9 +2290,6 @@ def main() -> None:
                 bench_mode=args.bench_mode,
                 bench_scope=args.bench_scope,
                 data_format=args.data_format,
-                use_bias=args.use_bias,
-                act=args.act,
-                stage1_weight_layout=args.stage1_weight_layout,
             )
             print(
                 f"[masked-grouped-moe-gemm] mock_moe persistent={persistent} "
@@ -2066,9 +2312,6 @@ def main() -> None:
                 bench_scope=args.bench_scope,
                 rotate=args.rotate,
                 data_format=args.data_format,
-                use_bias=args.use_bias,
-                act=args.act,
-                stage1_weight_layout=args.stage1_weight_layout,
             )
             print(f"[masked-grouped-moe-gemm] stage1 persistent={persistent} {_format_timing_summary(timings)}", flush=True)
         if args.stage in ("2", "both"):
@@ -2085,7 +2328,6 @@ def main() -> None:
                 bench_scope=args.bench_scope,
                 rotate=args.rotate,
                 data_format=args.data_format,
-                use_bias=args.use_bias,
             )
             print(f"[masked-grouped-moe-gemm] stage2 persistent={persistent} {_format_timing_summary(timings)}", flush=True)
 
