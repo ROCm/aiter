@@ -262,7 +262,7 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
 
 
 def get_flydsl_stage1_kernels_fp4_bf16(out_dtype: str) -> Dict[str, Dict]:
-    """Return {kernelName: params} for all supported fp4_bf16 (MXFP4 SEPARATED) stage1 configs."""
+    """Return {kernelName: params} for all supported fp4_bf16 (MXFP4) stage1 configs."""
     kernels = {}
     a_dtype = "bf16"
     b_dtype = "fp4bf16"
@@ -271,28 +271,31 @@ def get_flydsl_stage1_kernels_fp4_bf16(out_dtype: str) -> Dict[str, Dict]:
     tile_ns = [64, 128]
     k_batches = [1, 2, 4, 7, 14]
 
-    for tm in tile_ms:
-        for tn in tile_ns:
-            for tk in tile_ks:
-                for kb in k_batches:
-                    name = flydsl_kernel_name(
-                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
-                    )
-                    if kb != 1:
-                        name += f"_kb{kb}"
-                    kernels[name] = {
-                        "stage": 1,
-                        "a_dtype": a_dtype,
-                        "b_dtype": b_dtype,
-                        "out_dtype": out_dtype,
-                        "tile_m": tm,
-                        "tile_n": tn,
-                        "tile_k": tk,
-                        "MPerBlock": tm,
-                        "in_dtype": "fp4_bf16",
-                        "k_batch": kb,
-                        "gate_mode": "separated",
-                    }
+    for gate_mode in ("separated", "interleave"):
+        for tm in tile_ms:
+            for tn in tile_ns:
+                for tk in tile_ks:
+                    for kb in k_batches:
+                        name = flydsl_kernel_name(
+                            1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                        )
+                        if kb != 1:
+                            name += f"_kb{kb}"
+                        if gate_mode == "interleave":
+                            name += "_gui"
+                        kernels[name] = {
+                            "stage": 1,
+                            "a_dtype": a_dtype,
+                            "b_dtype": b_dtype,
+                            "out_dtype": out_dtype,
+                            "tile_m": tm,
+                            "tile_n": tn,
+                            "tile_k": tk,
+                            "MPerBlock": tm,
+                            "in_dtype": "fp4_bf16",
+                            "k_batch": kb,
+                            "gate_mode": gate_mode,
+                        }
     return kernels
 
 
@@ -431,7 +434,8 @@ def compile_flydsl_moe_stage1(
             k_batch=k_batch,
         )
     elif a_dtype == "bf16" and b_dtype == "fp4bf16":
-        # fp4_bf16: MXFP4 weights (FP4 E2M1 + E8M0 block scales), bf16 activations, SEPARATED gate/up
+        # fp4_bf16: MXFP4 weights (FP4 E2M1 + E8M0 block scales), bf16 activations.
+        # Supports SEPARATED and INTERLEAVE gate modes.
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
 
         _use_cshuffle = None if k_batch > 1 else False
@@ -448,6 +452,7 @@ def compile_flydsl_moe_stage1(
             out_dtype=out_dtype,
             use_cshuffle_epilog=_use_cshuffle,
             k_batch=k_batch,
+            gate_mode=gate_mode,
         )
     else:
         raise ValueError(

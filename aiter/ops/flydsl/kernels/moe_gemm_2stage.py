@@ -109,6 +109,7 @@ def compile_moe_gemm1(
     use_cshuffle_epilog: bool | None = None,
     scale_is_bf16: bool = False,
     k_batch: int = 1,
+    gate_mode: str = "separated",
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -302,16 +303,25 @@ def compile_moe_gemm1(
             "stage1 cshuffle epilog currently supports only f16 output (out_dtype='f16')"
         )
 
+    # INTERLEAVE gate mode: gate and up weights are packed at alternating N positions.
+    # Only supported for fp4_bf16 (MXFP4) where the physical weight layout interleaves
+    # gate/up columns so a single B-tile covers both. For other dtypes, gate and up are
+    # loaded from separate row ranges (SEPARATED).
+    gate_up_interleave = is_fp4_bf16 and gate_mode == "interleave"
+    if gate_up_interleave and not is_fp4_bf16:
+        raise ValueError("gate_mode='interleave' is only supported for in_dtype='fp4_bf16'")
+
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
     # Keep an explicit ABI tag so signature changes can't accidentally reuse an old binary.
     _gs_tag = f"_g{group_size}" if use_groupwise_scale else ""
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     _split_k_tag = f"_splitk{k_batch}" if _is_splitk else ""
+    _gui_tag = "_gui" if gate_up_interleave else ""
     (
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"{_gs_tag}{scale_tag}{_split_k_tag}"
+        f"{_gs_tag}{scale_tag}{_split_k_tag}{_gui_tag}"
         f"_abi3"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
     ).replace("-", "_")
 
@@ -776,21 +786,25 @@ def compile_moe_gemm1(
                 layout_n_blk_intra = fx.make_layout((c_n0_static, 16), stride=(16, 1))
                 for ni in range_constexpr(num_acc_n):
                     offset = arith.index(ni * 16)
-                    col_g = by_n + n_tile_base
-                    col_g = col_g + offset
-                    col_g = col_g + lane_mod_16
+                    if const_expr(gate_up_interleave):
+                        # INTERLEAVE: physical N is halved — each position covers a gate+up pair.
+                        # by_n addresses the interleaved (gate0,up0,gate1,up1,...) layout,
+                        # so the actual column in the weight matrix is by_n//2 + ni*16.
+                        col_g = by_n // arith.index(2) + offset + lane_mod_16
+                    else:
+                        col_g = by_n + n_tile_base + offset + lane_mod_16
                     col_g_list.append(col_g)
 
                     row_gate = expert_off_idx + col_g
-                    row_up = row_gate + inter_idx
-
                     coord_gate = fx.idx2crd(row_gate, layout_n_blk_intra)
                     n_blk_gate.append(fx.get(coord_gate, 0))
                     n_intra_gate.append(fx.get(coord_gate, 1))
 
-                    coord_up = fx.idx2crd(row_up, layout_n_blk_intra)
-                    n_blk_up.append(fx.get(coord_up, 0))
-                    n_intra_up.append(fx.get(coord_up, 1))
+                    if const_expr(not gate_up_interleave):
+                        row_up = row_gate + inter_idx
+                        coord_up = fx.idx2crd(row_up, layout_n_blk_intra)
+                        n_blk_up.append(fx.get(coord_up, 0))
+                        n_intra_up.append(fx.get(coord_up, 1))
 
                 # MXFP4: precompute per-ni scale addressing (N-block index for E8M0 scale)
                 if const_expr(is_fp4_bf16):
@@ -799,16 +813,20 @@ def compile_moe_gemm1(
                     _mxfp4_scale_mni_up = []
                     _mxfp4_scale_n_pack_up = []
                     for ni in range_constexpr(num_acc_n):
-                        n_gate = expert_off_idx + by_n + n_tile_base + arith.index(ni * 16)
-                        n_up = n_gate + inter_idx
+                        if const_expr(gate_up_interleave):
+                            n_gate = expert_off_idx + by_n // arith.index(2) + arith.index(ni * 16)
+                        else:
+                            n_gate = expert_off_idx + by_n + n_tile_base + arith.index(ni * 16)
                         _mxfp4_scale_mni_gate.append(n_gate // fx.Index(32))
                         _mxfp4_scale_n_pack_gate.append(
                             (n_gate // fx.Index(16)) % fx.Index(2)
                         )
-                        _mxfp4_scale_mni_up.append(n_up // fx.Index(32))
-                        _mxfp4_scale_n_pack_up.append(
-                            (n_up // fx.Index(16)) % fx.Index(2)
-                        )
+                        if const_expr(not gate_up_interleave):
+                            n_up = n_gate + inter_idx
+                            _mxfp4_scale_mni_up.append(n_up // fx.Index(32))
+                            _mxfp4_scale_n_pack_up.append(
+                                (n_up // fx.Index(16)) % fx.Index(2)
+                            )
 
                 m_repeat = tile_m // 16
                 k_unroll = tile_k_bytes // 64  # K64-byte micro-step (2x MFMA)
@@ -874,9 +892,10 @@ def compile_moe_gemm1(
                     elif const_expr(is_fp4_bf16):
                         # MXFP4: load via load_b_pack_k32 (kpack=16), split i64→2×i32,
                         # pair each i32 with its E8M0 scale.
+                        # INTERLEAVE: blk_list is always gate (no up B-tile); use gate scale lists.
                         base_k_packed = base_k // fx.Index(2)
                         raw_data = []
-                        _is_gate_side = (id(blk_list) == id(n_blk_gate))
+                        _is_gate_side = gate_up_interleave or (id(blk_list) == id(n_blk_gate))
                         _mni_list = _mxfp4_scale_mni_gate if _is_gate_side else _mxfp4_scale_mni_up
                         _npk_list = _mxfp4_scale_n_pack_gate if _is_gate_side else _mxfp4_scale_n_pack_up
                         _sc_cache = {}
@@ -1142,10 +1161,10 @@ def compile_moe_gemm1(
                         )
 
                     if const_expr(is_fp4_bf16):
-                        # MXFP4: unpack FP4 E2M1 → bf16 with E8M0 scale, then MFMA
+                        # MXFP4: unpack FP4 E2M1 → bf16 with E8M0 scale, then MFMA.
+                        # INTERLEAVE: b_up_tile_in is None; gate_list[2i] = gate, gate_list[2i+1] = up.
                         for ku in range_constexpr(k_unroll):
                             b_gate_raw = b_gate_tile_in[ku]
-                            b_up_raw = b_up_tile_in[ku]
                             ki64 = arith.index(ku * 64)
                             col_base = col_offset_base_bytes + ki64
 
@@ -1164,22 +1183,42 @@ def compile_moe_gemm1(
                                         curr_row_a_lds, col_base, lds_base
                                     )
 
-                                for ni in range_constexpr(num_acc_n):
-                                    acc_idx = mi * num_acc_n + ni
-                                    raw_g, sc_g = b_gate_raw[ni]
-                                    raw_u, sc_u = b_up_raw[ni]
-                                    bg0, bg1 = unpack_b_mxfp4_bf16(
-                                        raw_g, arith, vector, scale_f32=sc_g
-                                    )
-                                    gate_list[acc_idx] = mfma_k64(
-                                        gate_list[acc_idx], a0, a1, bg0, bg1
-                                    )
-                                    bu0, bu1 = unpack_b_mxfp4_bf16(
-                                        raw_u, arith, vector, scale_f32=sc_u
-                                    )
-                                    up_list[acc_idx] = mfma_k64(
-                                        up_list[acc_idx], a0, a1, bu0, bu1
-                                    )
+                                if const_expr(gate_up_interleave):
+                                    # INTERLEAVE: b_gate_raw has 2*num_acc_n/2 entries covering
+                                    # pairs (gate[0],up[0], gate[1],up[1], ...).
+                                    # Even ni → gate accumulator, odd ni → up accumulator.
+                                    for ni in range_constexpr(num_acc_n):
+                                        acc_idx = mi * num_acc_n + ni
+                                        raw, sc = b_gate_raw[ni]
+                                        b0, b1 = unpack_b_mxfp4_bf16(
+                                            raw, arith, vector, scale_f32=sc
+                                        )
+                                        if ni % 2 == 0:
+                                            gate_list[acc_idx] = mfma_k64(
+                                                gate_list[acc_idx], a0, a1, b0, b1
+                                            )
+                                        else:
+                                            up_list[acc_idx] = mfma_k64(
+                                                up_list[acc_idx], a0, a1, b0, b1
+                                            )
+                                else:
+                                    b_up_raw = b_up_tile_in[ku]
+                                    for ni in range_constexpr(num_acc_n):
+                                        acc_idx = mi * num_acc_n + ni
+                                        raw_g, sc_g = b_gate_raw[ni]
+                                        raw_u, sc_u = b_up_raw[ni]
+                                        bg0, bg1 = unpack_b_mxfp4_bf16(
+                                            raw_g, arith, vector, scale_f32=sc_g
+                                        )
+                                        gate_list[acc_idx] = mfma_k64(
+                                            gate_list[acc_idx], a0, a1, bg0, bg1
+                                        )
+                                        bu0, bu1 = unpack_b_mxfp4_bf16(
+                                            raw_u, arith, vector, scale_f32=sc_u
+                                        )
+                                        up_list[acc_idx] = mfma_k64(
+                                            up_list[acc_idx], a0, a1, bu0, bu1
+                                        )
                     elif const_expr(is_int4_bf16 or is_int4_bf16_groupwise):
                         # W4A16: deferred dequant — unpack int4->bf16 right before MFMA
                         # to minimize VGPR lifetime of dequantized bf16 values.
@@ -1373,7 +1412,10 @@ def compile_moe_gemm1(
                 k0 = k_base_idx
                 x_regs0 = load_x_tile(k0)
                 b_gate_cur = load_b_tile(k0, n_blk_gate, n_intra_gate)
-                b_up_cur = load_b_tile(k0, n_blk_up, n_intra_up)
+                if const_expr(not gate_up_interleave):
+                    b_up_cur = load_b_tile(k0, n_blk_up, n_intra_up)
+                else:
+                    b_up_cur = None
                 store_x_tile_to_lds(x_regs0, lds_base_cur)
                 gpu.barrier()
 
@@ -1459,24 +1501,26 @@ def compile_moe_gemm1(
                             b_tile.append((packs_even, packs_odd))
                     return b_tile
 
+                # INTERLEAVE: b_up_cur is None; exclude it from loop-carried state.
+                _vals_per_b_tile_up = 0 if gate_up_interleave else _vals_per_b_tile
                 init_state = (
                     list(acc_gate)
                     + list(acc_up)
                     + _flatten_b_tile(b_gate_cur)
-                    + _flatten_b_tile(b_up_cur)
+                    + ([] if gate_up_interleave else _flatten_b_tile(b_up_cur))
                     + list(a0_prefetch_pong)
                 )
 
                 _n_acc = m_repeat * num_acc_n
                 _p_bg = 2 * _n_acc
                 _p_bu = _p_bg + _vals_per_b_tile
-                _p_a0 = _p_bu + _vals_per_b_tile
+                _p_a0 = _p_bu + _vals_per_b_tile_up
 
                 for pair_iv, state in range(0, pair_iters, 1, init=init_state):
                     _ag = list(state[:_n_acc])
                     _au = list(state[_n_acc:_p_bg])
                     _bg = _unflatten_b_tile(list(state[_p_bg:_p_bu]))
-                    _bu = _unflatten_b_tile(list(state[_p_bu:_p_a0]))
+                    _bu = None if gate_up_interleave else _unflatten_b_tile(list(state[_p_bu:_p_a0]))
                     _a0pf = (state[_p_a0], state[_p_a0 + 1])
 
                     k_iv = k_base_idx + pair_iv * (c_tile_k + c_tile_k)
@@ -1485,7 +1529,7 @@ def compile_moe_gemm1(
                     next_k1 = k_iv + c_tile_k
                     x_regs_ping = load_x_tile(next_k1)
                     _bg_ping = load_b_tile(next_k1, n_blk_gate, n_intra_gate)
-                    _bu_ping = load_b_tile(next_k1, n_blk_up, n_intra_up)
+                    _bu_ping = None if gate_up_interleave else load_b_tile(next_k1, n_blk_up, n_intra_up)
 
                     _ag, _au, _ = compute_tile(
                         _ag, _au, _bg, _bu, lds_base_pong, a0_prefetch=_a0pf
@@ -1502,7 +1546,7 @@ def compile_moe_gemm1(
                     next_k2 = k_iv + c_tile_k + c_tile_k
                     x_regs_pong = load_x_tile(next_k2)
                     _bg_next = load_b_tile(next_k2, n_blk_gate, n_intra_gate)
-                    _bu_next = load_b_tile(next_k2, n_blk_up, n_intra_up)
+                    _bu_next = None if gate_up_interleave else load_b_tile(next_k2, n_blk_up, n_intra_up)
 
                     _ag, _au, _ = compute_tile(
                         _ag,
@@ -1524,7 +1568,7 @@ def compile_moe_gemm1(
                         list(_ag)
                         + list(_au)
                         + _flatten_b_tile(_bg_next)
-                        + _flatten_b_tile(_bu_next)
+                        + ([] if gate_up_interleave else _flatten_b_tile(_bu_next))
                         + list(_a0pf_new)
                     )
 
@@ -1534,12 +1578,12 @@ def compile_moe_gemm1(
                     acc_gate = list(loop_results[:_n_acc])
                     acc_up = list(loop_results[_n_acc:_p_bg])
                     b_gate_cur = _unflatten_b_tile(list(loop_results[_p_bg:_p_bu]))
-                    b_up_cur = _unflatten_b_tile(list(loop_results[_p_bu:_p_a0]))
+                    b_up_cur = None if gate_up_interleave else _unflatten_b_tile(list(loop_results[_p_bu:_p_a0]))
                     a0_prefetch_pong = (loop_results[_p_a0], loop_results[_p_a0 + 1])
                 k_tail1 = k_base_idx + arith.index(_k_per_batch - tile_k)
                 x_regs_ping = load_x_tile(k_tail1)
                 b_gate_ping = load_b_tile(k_tail1, n_blk_gate, n_intra_gate)
-                b_up_ping = load_b_tile(k_tail1, n_blk_up, n_intra_up)
+                b_up_ping = None if gate_up_interleave else load_b_tile(k_tail1, n_blk_up, n_intra_up)
 
                 acc_gate, acc_up, _ = compute_tile(
                     acc_gate,
@@ -1931,37 +1975,65 @@ def compile_moe_gemm1(
                                 sorted_w_rsrc, row, vec_width=1, dtype=T.f32
                             )
 
-                        for ni in range_constexpr(num_acc_n):
-                            col_local = col_base_local + (ni * 16)
-                            sw_gate = sw_gate_vals[ni]
-                            sw_up = sw_up_vals[ni]
+                        if const_expr(gate_up_interleave):
+                            # INTERLEAVE: gate_list[2p] holds gate acc, up_list[2p+1] holds up acc.
+                            # Output column is halved: pair p maps to col_local at p*16 / 2.
+                            _gui_pairs = num_acc_n // 2
+                            for p in range_constexpr(_gui_pairs):
+                                g_idx = mi * num_acc_n + p * 2
+                                u_idx = mi * num_acc_n + p * 2 + 1
+                                col_local = col_base_local // 2 + (p * 16)
+                                vg = vector.extract(
+                                    acc_gate[g_idx],
+                                    static_position=[ii],
+                                    dynamic_position=[],
+                                )
+                                vu = vector.extract(
+                                    acc_up[u_idx],
+                                    static_position=[ii],
+                                    dynamic_position=[],
+                                )
+                                vg = vg * sx
+                                vu = vu * sx
+                                y = silu(vg) * vu
+                                if const_expr(doweight_stage1):
+                                    y = y * tw
+                                y16 = arith.trunc_f(T.f16, y)
+                                lds_idx = row_base_lds + col_local
+                                v1 = vector.from_elements(T.vec(1, T.f16), [y16])
+                                vector.store(v1, lds_out, [lds_idx], alignment=2)
+                        else:
+                            for ni in range_constexpr(num_acc_n):
+                                col_local = col_base_local + (ni * 16)
+                                sw_gate = sw_gate_vals[ni]
+                                sw_up = sw_up_vals[ni]
 
-                            acc_idx = mi * num_acc_n + ni
-                            vg = vector.extract(
-                                acc_gate[acc_idx],
-                                static_position=[ii],
-                                dynamic_position=[],
-                            )
-                            vu = vector.extract(
-                                acc_up[acc_idx],
-                                static_position=[ii],
-                                dynamic_position=[],
-                            )
+                                acc_idx = mi * num_acc_n + ni
+                                vg = vector.extract(
+                                    acc_gate[acc_idx],
+                                    static_position=[ii],
+                                    dynamic_position=[],
+                                )
+                                vu = vector.extract(
+                                    acc_up[acc_idx],
+                                    static_position=[ii],
+                                    dynamic_position=[],
+                                )
 
-                            if const_expr(is_int8):
-                                vg = arith.sitofp(T.f32, vg)
-                                vu = arith.sitofp(T.f32, vu)
-                            vg = vg * sx * sw_gate
-                            vu = vu * sx * sw_up
+                                if const_expr(is_int8):
+                                    vg = arith.sitofp(T.f32, vg)
+                                    vu = arith.sitofp(T.f32, vu)
+                                vg = vg * sx * sw_gate
+                                vu = vu * sx * sw_up
 
-                            y = silu(vg) * vu
-                            if const_expr(doweight_stage1):
-                                y = y * tw
-                            y16 = arith.trunc_f(T.f16, y)
+                                y = silu(vg) * vu
+                                if const_expr(doweight_stage1):
+                                    y = y * tw
+                                y16 = arith.trunc_f(T.f16, y)
 
-                            lds_idx = row_base_lds + col_local
-                            v1 = vector.from_elements(T.vec(1, T.f16), [y16])
-                            vector.store(v1, lds_out, [lds_idx], alignment=2)
+                                lds_idx = row_base_lds + col_local
+                                v1 = vector.from_elements(T.vec(1, T.f16), [y16])
+                                vector.store(v1, lds_out, [lds_idx], alignment=2)
 
                     def precompute_row(*, row_local, row):
                         fused2 = buffer_ops.buffer_load(
@@ -2066,35 +2138,61 @@ def compile_moe_gemm1(
 
                     _if_valid = scf.IfOp(t_valid)
                     with _if_then(_if_valid):
-                        for ni in range_constexpr(num_acc_n):
-                            col_i32 = col_i32_list[ni]
-                            sw_gate = sw_gate_vals[ni]
-                            sw_up = sw_up_vals[ni]
+                        if const_expr(gate_up_interleave):
+                            # INTERLEAVE: gate at even ni, up at odd ni; output is halved.
+                            _gui_pairs = num_acc_n // 2
+                            for p in range_constexpr(_gui_pairs):
+                                g_idx = mi * num_acc_n + p * 2
+                                u_idx = mi * num_acc_n + p * 2 + 1
+                                col_i32 = col_i32_list[p * 2]
+                                vg = vector.extract(
+                                    acc_gate[g_idx],
+                                    static_position=[ii],
+                                    dynamic_position=[],
+                                )
+                                vu = vector.extract(
+                                    acc_up[u_idx],
+                                    static_position=[ii],
+                                    dynamic_position=[],
+                                )
+                                vg = vg * sx
+                                vu = vu * sx
+                                y = silu(vg) * vu
+                                if const_expr(doweight_stage1):
+                                    y = y * tw
+                                y = arith.trunc_f(out_mlir(), y)
+                                idx_out0 = idx0 + col_i32
+                                buffer_ops.buffer_store(y, out_rsrc, idx_out0)
+                        else:
+                            for ni in range_constexpr(num_acc_n):
+                                col_i32 = col_i32_list[ni]
+                                sw_gate = sw_gate_vals[ni]
+                                sw_up = sw_up_vals[ni]
 
-                            acc_idx = mi * num_acc_n + ni
-                            vg = vector.extract(
-                                acc_gate[acc_idx],
-                                static_position=[ii],
-                                dynamic_position=[],
-                            )
-                            vu = vector.extract(
-                                acc_up[acc_idx],
-                                static_position=[ii],
-                                dynamic_position=[],
-                            )
+                                acc_idx = mi * num_acc_n + ni
+                                vg = vector.extract(
+                                    acc_gate[acc_idx],
+                                    static_position=[ii],
+                                    dynamic_position=[],
+                                )
+                                vu = vector.extract(
+                                    acc_up[acc_idx],
+                                    static_position=[ii],
+                                    dynamic_position=[],
+                                )
 
-                            if const_expr(is_int8):
-                                vg = arith.sitofp(T.f32, vg)
-                                vu = arith.sitofp(T.f32, vu)
-                            vg = vg * sx * sw_gate
-                            vu = vu * sx * sw_up
+                                if const_expr(is_int8):
+                                    vg = arith.sitofp(T.f32, vg)
+                                    vu = arith.sitofp(T.f32, vu)
+                                vg = vg * sx * sw_gate
+                                vu = vu * sx * sw_up
 
-                            y = silu(vg) * vu
-                            if const_expr(doweight_stage1):
-                                y = y * tw
-                            y = arith.trunc_f(out_mlir(), y)
-                            idx_out0 = idx0 + col_i32
-                            buffer_ops.buffer_store(y, out_rsrc, idx_out0)
+                                y = silu(vg) * vu
+                                if const_expr(doweight_stage1):
+                                    y = y * tw
+                                y = arith.trunc_f(out_mlir(), y)
+                                idx_out0 = idx0 + col_i32
+                                buffer_ops.buffer_store(y, out_rsrc, idx_out0)
 
                 mfma_epilog(
                     use_cshuffle=False,

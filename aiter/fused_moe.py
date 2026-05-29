@@ -1262,18 +1262,20 @@ def get_2stage_cfgs(
         q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
         and q_dtype_a in [dtypes.bf16, dtypes.fp16]
-        and gate_mode == GateMode.SEPARATED
+        and gate_mode in (GateMode.SEPARATED, GateMode.INTERLEAVE)
         and is_flydsl_available()
     ):
-        # fp4_bf16 SEPARATED: MXFP4 weights (FP4 E2M1 + E8M0 scales) with bf16 activations.
-        # Uses our FlyDSL compile_moe_gemm1/2 with in_dtype="fp4_bf16".
+        # fp4_bf16: MXFP4 weights (FP4 E2M1 + E8M0 scales) with bf16 activations.
+        # Supports both SEPARATED and INTERLEAVE gate modes.
+        # Uses FlyDSL compile_moe_gemm1/2 with in_dtype="fp4_bf16".
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
         _tile_n = 128
         _tile_k = 128
+        _gui_tag = "_gui" if gate_mode == GateMode.INTERLEAVE else ""
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
-        kn1 = flydsl_kernel_name(1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k)
+        kn1 = flydsl_kernel_name(1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k) + _gui_tag
         kn2 = flydsl_kernel_name(
             2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
         )
