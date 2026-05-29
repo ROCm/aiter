@@ -941,7 +941,8 @@ def flydsl_moe_stage1(
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
     is_fp4 = b_dtype == "fp4"
-    _n_in = inter_dim * 2 if is_fp4 else inter_dim
+    _is_fp4_bf16_interleave = b_dtype == "fp4bf16" and gate_mode == "interleave"
+    _n_in = inter_dim * 2 if (is_fp4 or _is_fp4_bf16_interleave) else inter_dim
     _k_in = model_dim
 
     if is_fp4:

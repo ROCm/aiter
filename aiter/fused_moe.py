@@ -1225,40 +1225,6 @@ def get_2stage_cfgs(
             stage2_has_bias=enable_bias and is_flydsl2,
         )
     if (
-        gate_mode != GateMode.SEPARATED
-        and dtype in [dtypes.bf16, dtypes.fp16]
-        and q_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
-    ):
-        return MOEMetadata(
-            functools.partial(
-                cktile_moe_stage1,
-                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
-                k_pad_zeros=hidden_pad // 128 * 128,
-                activation=activation,
-                split_k=1,
-                dtype=dtype,
-            ),
-            functools.partial(
-                cktile_moe_stage2,
-                n_pad_zeros=hidden_pad // 64 * 64,
-                k_pad_zeros=intermediate_pad // 128 * 128,
-                activation=activation,
-            ),
-            get_block_m(),
-            ksplit,
-            run_1stage=False,
-            has_bias=True,
-            stage2_has_bias=True,
-        )
-    swiglu_mxfp4_bf16_cktile = (
-        q_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
-        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
-        and q_dtype_w == dtypes.fp4x2
-        and is_shuffled
-    )
-    if (
         q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
         and q_dtype_a in [dtypes.bf16, dtypes.fp16]
@@ -1297,6 +1263,40 @@ def get_2stage_cfgs(
             1,     # no split-K for fp4_bf16 (not yet tuned)
             False,
         )
+    if (
+        gate_mode != GateMode.SEPARATED
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Swiglu
+    ):
+        return MOEMetadata(
+            functools.partial(
+                cktile_moe_stage1,
+                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
+                k_pad_zeros=hidden_pad // 128 * 128,
+                activation=activation,
+                split_k=1,
+                dtype=dtype,
+            ),
+            functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            ),
+            get_block_m(),
+            ksplit,
+            run_1stage=False,
+            has_bias=True,
+            stage2_has_bias=True,
+        )
+    swiglu_mxfp4_bf16_cktile = (
+        q_type == QuantType.per_1x32
+        and activation == ActivationType.Swiglu
+        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+    )
     if (
         q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.i4x2

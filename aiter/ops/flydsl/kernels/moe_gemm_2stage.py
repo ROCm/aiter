@@ -788,9 +788,9 @@ def compile_moe_gemm1(
                     offset = arith.index(ni * 16)
                     if const_expr(gate_up_interleave):
                         # INTERLEAVE: physical N is halved — each position covers a gate+up pair.
-                        # by_n addresses the interleaved (gate0,up0,gate1,up1,...) layout,
-                        # so the actual column in the weight matrix is by_n//2 + ni*16.
-                        col_g = by_n // arith.index(2) + offset + lane_mod_16
+                        # The block-grid and wave-tile base are halved to address into the
+                        # interleaved weight layout (gate0,up0,gate1,up1,...).
+                        col_g = (by_n + n_tile_base) // arith.index(2) + offset + lane_mod_16
                     else:
                         col_g = by_n + n_tile_base + offset + lane_mod_16
                     col_g_list.append(col_g)
@@ -814,7 +814,7 @@ def compile_moe_gemm1(
                     _mxfp4_scale_n_pack_up = []
                     for ni in range_constexpr(num_acc_n):
                         if const_expr(gate_up_interleave):
-                            n_gate = expert_off_idx + by_n // arith.index(2) + arith.index(ni * 16)
+                            n_gate = expert_off_idx + (by_n + n_tile_base) // arith.index(2) + arith.index(ni * 16)
                         else:
                             n_gate = expert_off_idx + by_n + n_tile_base + arith.index(ni * 16)
                         _mxfp4_scale_mni_gate.append(n_gate // fx.Index(32))
