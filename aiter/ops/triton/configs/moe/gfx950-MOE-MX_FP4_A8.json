@@ -2,7 +2,6 @@
     "bm128_n1440_k2880": {
         "BLOCK_SIZE_K": 128,
         "BLOCK_SIZE_N": 256,
-        "kpack": 1,
         "matrix_instr_nonkdim": 32,
         "num_stages": 1,
         "num_warps": 4,
@@ -11,7 +10,6 @@
     "bm128_n2880_k1440": {
         "BLOCK_SIZE_K": 256,
         "BLOCK_SIZE_N": 128,
-        "kpack": 1,
         "matrix_instr_nonkdim": 32,
         "num_stages": 2,
         "num_warps": 4,
@@ -20,7 +18,6 @@
     "bm128_n2880_k2880": {
         "BLOCK_SIZE_K": 256,
         "BLOCK_SIZE_N": 128,
-        "kpack": 1,
         "matrix_instr_nonkdim": 32,
         "num_stages": 2,
         "num_warps": 4,
@@ -29,7 +26,6 @@
     "bm128_n2880_k720": {
         "BLOCK_SIZE_K": 128,
         "BLOCK_SIZE_N": 128,
-        "kpack": 1,
         "matrix_instr_nonkdim": 32,
         "num_stages": 2,
         "num_warps": 8,
@@ -38,7 +34,6 @@
     "bm128_n5760_k2880": {
         "BLOCK_SIZE_K": 256,
         "BLOCK_SIZE_N": 128,
-        "kpack": 1,
         "matrix_instr_nonkdim": 32,
         "num_stages": 2,
         "num_warps": 4,
@@ -47,7 +42,6 @@
     "bm128_n720_k2880": {
         "BLOCK_SIZE_K": 128,
         "BLOCK_SIZE_N": 256,
-        "kpack": 1,
         "matrix_instr_nonkdim": 16,
         "num_stages": 3,
         "num_warps": 8,
@@ -56,7 +50,6 @@
     "bm16_n1440_k2880": {
         "BLOCK_SIZE_K": 512,
         "BLOCK_SIZE_N": 64,
-        "kpack": 1,
         "matrix_instr_nonkdim": 16,
         "num_stages": 2,
         "num_warps": 4,
@@ -65,7 +58,6 @@
     "bm16_n2880_k1440": {
         "BLOCK_SIZE_K": 512,
         "BLOCK_SIZE_N": 128,
-        "kpack": 1,
         "matrix_instr_nonkdim": 16,
         "num_stages": 2,
         "num_warps": 4,
@@ -74,7 +66,6 @@
     "bm16_n2880_k2880": {
         "BLOCK_SIZE_K": 512,
         "BLOCK_SIZE_N": 64,
-        "kpack": 1,
         "matrix_instr_nonkdim": 16,
         "num_stages": 2,
         "num_warps": 4,
@@ -83,7 +74,6 @@
     "bm16_n2880_k360": {
         "BLOCK_SIZE_K": 128,
         "BLOCK_SIZE_N": 64,
-        "kpack": 1,
         "matrix_instr_nonkdim": 16,
         "num_stages": 3,
         "num_warps": 4,
@@ -92,7 +82,6 @@
     "bm16_n5760_k2880": {
         "BLOCK_SIZE_K": 512,
         "BLOCK_SIZE_N": 64,
-        "kpack": 1,
         "matrix_instr_nonkdim": 16,
         "num_stages": 2,
         "num_warps": 4,
@@ -101,7 +90,6 @@
     "bm32_n2880_k2880": {
         "BLOCK_SIZE_K": 512,
         "BLOCK_SIZE_N": 64,
-        "kpack": 1,
         "matrix_instr_nonkdim": 16,
         "num_stages": 2,
         "num_warps": 4,
@@ -110,7 +98,6 @@
     "bm32_n5760_k2880": {
         "BLOCK_SIZE_K": 512,
         "BLOCK_SIZE_N": 256,
-        "kpack": 1,
         "matrix_instr_nonkdim": 32,
         "num_stages": 1,
         "num_warps": 4,
@@ -119,7 +106,6 @@
     "bm64_n1440_k2880": {
         "BLOCK_SIZE_K": 128,
         "BLOCK_SIZE_N": 64,
-        "kpack": 1,
         "matrix_instr_nonkdim": 16,
         "num_stages": 2,
         "num_warps": 4,
@@ -128,7 +114,6 @@
     "bm64_n2880_k1440": {
         "BLOCK_SIZE_K": 128,
         "BLOCK_SIZE_N": 128,
-        "kpack": 1,
         "matrix_instr_nonkdim": 32,
         "num_stages": 3,
         "num_warps": 8,
@@ -137,7 +122,6 @@
     "bm64_n2880_k2880": {
         "BLOCK_SIZE_K": 512,
         "BLOCK_SIZE_N": 128,
-        "kpack": 1,
         "matrix_instr_nonkdim": 32,
         "num_stages": 2,
         "num_warps": 8,
@@ -146,7 +130,6 @@
     "bm64_n2880_k360": {
         "BLOCK_SIZE_K": 64,
         "BLOCK_SIZE_N": 256,
-        "kpack": 1,
         "matrix_instr_nonkdim": 32,
         "num_stages": 2,
         "num_warps": 8,
@@ -155,7 +138,6 @@
     "bm64_n2880_k720": {
         "BLOCK_SIZE_K": 64,
         "BLOCK_SIZE_N": 64,
-        "kpack": 1,
         "matrix_instr_nonkdim": 32,
         "num_stages": 3,
         "num_warps": 4,
@@ -164,7 +146,6 @@
     "bm64_n5760_k2880": {
         "BLOCK_SIZE_K": 512,
         "BLOCK_SIZE_N": 128,
-        "kpack": 1,
         "matrix_instr_nonkdim": 32,
         "num_stages": 2,
         "num_warps": 8,
@@ -173,7 +154,6 @@
     "bm64_n720_k2880": {
         "BLOCK_SIZE_K": 256,
         "BLOCK_SIZE_N": 64,
-        "kpack": 1,
         "matrix_instr_nonkdim": 16,
         "num_stages": 3,
         "num_warps": 8,
