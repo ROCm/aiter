@@ -650,7 +650,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 hk::mma_ABt(p_comp_hi, kv_alt_bot, q_k1, p_comp_hi);
             }
 
-            __builtin_amdgcn_s_setprio(3);
+            __builtin_amdgcn_s_setprio(2);
 
             // ---- Phase B+C: wait + cvt + store NEXT tile to LDS ----
             // Sequenced after QK so the QK ds_reads from p_lds_kv_curr aren't
@@ -749,7 +749,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                                  : __builtin_amdgcn_exp2f((row_max - new_row_max) * log2e);
                 row_max = new_row_max;
 
-                __builtin_amdgcn_s_setprio(2);
+                __builtin_amdgcn_s_setprio(1);
 
                 // exp + sum + warp_reduce(add) -> row_sum_e. Updates p_comp in
                 // place to hold exp(p_comp - new_row_max).
@@ -786,20 +786,20 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             //   - vgprs [+2,+3] via 2x v_mul_f32; iter 0's 2 sub-tiles done
             //     in prologue, iters 1..N-1 interleaved between the 2 mfmas
             //     of iter i-1.
-            constexpr uint32_t k_o_num_sub = k_o_sz / 4u; // 32
+            //
+            // Prologue: scale only iter 0's 2 sub-tiles (both halves) via
+            // pk_mul_pair = 4 pk_mul_pair total. The remaining 30 sub-tiles
+            // (iters 1..15) are scaled in-loop by iter i in [0..14]:
+            //   - 2 mul_pair for +0/+1 after the 4 ds_loads (hide under
+            //     ds_read latency)
+            //   - 2 mul_pair for +2/+3 between mfma_a and mfma_b (existing
+            //     pattern)
+            // Both halves of next iter's 2 sub-tiles get scaled per slot.
             if constexpr((kSkipCompute == false) && (kIsFirstIter == false))
             {
-                // mul on +2/+3 of iter 0's 2 sub-tiles.
                 opus::static_for<2>([&](auto s) {
-                    pk_mul_pair(rescale, opus::number<k_o_begin + s.value * 4u + 2u>{});
-                });
-                // pk_mul on +0/+1 of all 32 sub-tiles.
-                opus::static_for<k_o_num_sub>([&](auto s) {
-                    if constexpr(s.value == 12)
-                    {
-                        __builtin_amdgcn_s_setprio(1);
-                    }
                     pk_mul_pair(rescale, opus::number<k_o_begin + s.value * 4u + 0u>{});
+                    pk_mul_pair(rescale, opus::number<k_o_begin + s.value * 4u + 2u>{});
                 });
             }
 
@@ -838,6 +838,16 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     kv_manager
                         .template load_transposed_v_to_gpr<16u, kColOffset + 16u, k_kv_begin + 6>(
                             p_lds_kv_curr);
+
+                    // Scale next iter's BOTH sub-tiles +0/+1 (moved from
+                    // prologue) -- 2 mul_pair = 4 v_mul_f32 hidden under
+                    // ds_read latency.
+                    // Skipped on kIsFirstIter and on the last iter (no next).
+                    if constexpr((kIsFirstIter == false) && has_next)
+                    {
+                        mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 0>{});
+                        mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 0>{});
+                    }
 
                     // Per-iter oaccu views: 2 adjacent 16x16 col_l base tiles
                     // (vgprs k_o_begin + iter*8 .. +7).
