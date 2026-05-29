@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 
 from ..gated_delta_rule_utils import (
+    RCP_LN2,
     IS_AMD,
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
@@ -10,7 +11,6 @@ from ..gated_delta_rule_utils import (
 from ..utils import prepare_chunk_indices
 from ..utils.op import exp
 
-RCP_LN2: float = 1.0 / 0.6931471805599453
 
 
 @triton.jit
@@ -212,11 +212,12 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
 
     p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
-    # Store g_cumsum in log2 space when downstream kernels consume it with
-    # exp2 (USE_EXP2); exp2(x * RCP_LN2) == exp(x), keeping results identical.
-    if USE_EXP2:
-        b_g = b_g * RCP_LN2
     b_g_cumsum = tl.cumsum(b_g, axis=0)
+    # Store g_cumsum in log2 space when downstream kernels consume it with exp2:
+    # exp2(x * RCP_LN2) == exp(x), keeping results identical. The scale arrives
+    # as the constexpr G_SCALE (RCP_LN2 when use_exp2 else 1.0) so the kernel
+    # never reads a module-level global; cumsum's linearity makes scaling before
+    # or after the cumsum equivalent.
     if G_SCALE != 1.0:
         b_g_cumsum = b_g_cumsum * G_SCALE
 
