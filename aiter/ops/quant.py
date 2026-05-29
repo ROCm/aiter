@@ -12,7 +12,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
 from ..utility import dtypes, fp4_utils
-from ..utility.mx_types import MX_DEFAULT_ROUND_MODE, MxScaleRoundMode
+from ..utility.mx_types import MX_DEFAULT_ROUND_MODE, MxDtype, MxScaleRoundMode
 from . import triton
 from .enum import ActivationType, QuantType
 from ..jit.utils.chip_info import get_cu_num, get_gfx
@@ -254,9 +254,19 @@ def per_1x32_f8_scale_f8_quant(
         scale_f32 = max_abs / dtypeMax
         scale_e8m0_biased = None
     else:
-        scale_e8m0_biased = fp4_utils.f32_to_e8m0(max_abs / dtypeMax)
+        # Route the e8m0 path through the centralized MX scale API so this
+        # reference honors MX_DEFAULT_ROUND_MODE (RoundUp / RCEIL =
+        # ceil_pow2(amax / max_pos)), matching the HIP kernel's
+        # fp_f32_to_e8m0_scale<kDefaultMxScaleRoundMode, FP8_E4M3{,_FNUZ}>.
+        # The legacy f32_to_e8m0(amax / floor_pow2(max)) bypassed the default
+        # and diverged by one exponent on ~1/8 of groups vs the RoundUp kernel.
+        fp8_mx_dtype = (
+            MxDtype.FP8_E4M3_FNUZ if get_gfx() == "gfx942" else MxDtype.FP8_E4M3
+        )
+        scale_e8m0_biased = fp4_utils.f32_to_mx_e8m0_scale(
+            max_abs, mode=MX_DEFAULT_ROUND_MODE, dtype=fp8_mx_dtype
+        )
         scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0_biased)
-        # scale_f32 = max_abs / dtypeMax
 
     y = x.float() / scale_f32.view(-1, 1)
     y = y.view(*shape_original[:-1], -1)
