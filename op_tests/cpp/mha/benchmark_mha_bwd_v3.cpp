@@ -1339,6 +1339,18 @@ bool run_bench(const ArgParser& arg)
                             : 1e-2;
     const double atol = rtol;
 
+    struct ErrAccum
+    {
+        double sum_sq_diff  = 0.0;
+        double sum_sq_ref   = 0.0;
+        double sum_abs_diff = 0.0;
+        double max_abs_diff = 0.0;
+        double max_abs_ref  = 0.0;
+        double max_rel_diff = 0.0;
+        std::size_t n       = 0;
+    };
+    ErrAccum acc_dq, acc_dk, acc_dv;
+
     for(int wb = 0; wb < batch; ++wb)
     {
         const int sq = seqlens_q[wb];
@@ -1485,78 +1497,50 @@ bool run_bench(const ArgParser& arg)
         bool dq_ok = check_err<DQ, DQ>(dq_got, dq_ref, "[dQ]", rtol, atol);
         bool dk_ok = check_err<DK, DK>(dk_got, dk_ref, "[dK]", rtol, atol);
         bool dv_ok = check_err<DV, DV>(dv_got, dv_ref, "[dV]", rtol, atol);
-        // Aggregate error stats (printed regardless of pass/fail).
-        // max_rel is gated to elements where |ref| >= 1e-3 * max|ref| to avoid
-        // blow-up near zero; nrmse = ||diff||_2 / ||ref||_2 is the global
-        // relative L2 error and is the most reliable single-number metric.
-        auto stats = [&](const char* label,
-                         auto&& got_at,
-                         auto&& ref_at,
-                         int total_rows,
-                         int total_cols) {
-            double sum_sq_diff  = 0.0;
-            double sum_sq_ref   = 0.0;
-            double sum_abs_diff = 0.0;
-            double max_abs_diff = 0.0;
-            double max_abs_ref  = 0.0;
-            std::size_t n = 0;
+        // Accumulate per-tensor error stats across all batches; final values
+        // are printed once after the batch loop. `max_rel` is gated to
+        // elements with |ref| >= atol to avoid blow-up near zero.
+        auto accumulate = [&](ErrAccum& a,
+                              auto&& got_at,
+                              auto&& ref_at,
+                              int total_rows,
+                              int total_cols) {
             for(int h = 0; h < nhead; ++h)
                 for(int r = 0; r < total_rows; ++r)
                     for(int c = 0; c < total_cols; ++c)
                     {
-                        const double a    = got_at(h, r, c);
+                        const double g    = got_at(h, r, c);
                         const double b    = ref_at(h, r, c);
-                        const double diff = std::fabs(a - b);
-                        sum_sq_diff  += diff * diff;
-                        sum_sq_ref   += b * b;
-                        sum_abs_diff += diff;
-                        if(diff > max_abs_diff)
-                            max_abs_diff = diff;
-                        if(std::fabs(b) > max_abs_ref)
-                            max_abs_ref = std::fabs(b);
-                        ++n;
+                        const double diff = std::fabs(g - b);
+                        a.sum_sq_diff  += diff * diff;
+                        a.sum_sq_ref   += b * b;
+                        a.sum_abs_diff += diff;
+                        if(diff > a.max_abs_diff)
+                            a.max_abs_diff = diff;
+                        const double abs_b = std::fabs(b);
+                        if(abs_b > a.max_abs_ref)
+                            a.max_abs_ref = abs_b;
+                        if(abs_b >= atol)
+                        {
+                            const double rel = diff / abs_b;
+                            if(rel > a.max_rel_diff)
+                                a.max_rel_diff = rel;
+                        }
+                        ++a.n;
                     }
-            const double rel_floor = std::max(1e-3 * max_abs_ref, 1e-12);
-            double max_rel_diff = 0.0;
-            for(int h = 0; h < nhead; ++h)
-                for(int r = 0; r < total_rows; ++r)
-                    for(int c = 0; c < total_cols; ++c)
-                    {
-                        const double b = ref_at(h, r, c);
-                        if(std::fabs(b) < rel_floor)
-                            continue;
-                        const double rel =
-                            std::fabs(got_at(h, r, c) - b) / std::fabs(b);
-                        if(rel > max_rel_diff)
-                            max_rel_diff = rel;
-                    }
-            const double denom_n  = static_cast<double>(std::max<std::size_t>(n, 1));
-            const double mean_abs = sum_abs_diff / denom_n;
-            const double rmse     = std::sqrt(sum_sq_diff / denom_n);
-            const double nrmse =
-                std::sqrt(sum_sq_diff) / std::max(std::sqrt(sum_sq_ref), 1e-30);
-            std::cerr << label << " stats: n=" << n
-                      << std::scientific << std::setprecision(3)
-                      << " max_abs=" << max_abs_diff
-                      << " mean_abs=" << mean_abs
-                      << " max_rel=" << max_rel_diff
-                      << " rmse=" << rmse
-                      << " nrmse=" << nrmse
-                      << " max|ref|=" << max_abs_ref
-                      << std::defaultfloat << std::endl;
         };
-        stats("[dQ]",
-              [&](int h, int r, int c) { return to_float<DQ>(dq_got(h, r, c)); },
-              [&](int h, int r, int c) { return to_float<DQ>(dq_ref(h, r, c)); },
-              sq, hdim_q);
-        stats("[dK]",
-              [&](int h, int r, int c) { return to_float<DK>(dk_got(h, r, c)); },
-              [&](int h, int r, int c) { return to_float<DK>(dk_ref(h, r, c)); },
-              sk, hdim_q);
-        stats("[dV]",
-              [&](int h, int r, int c) { return to_float<DV>(dv_got(h, r, c)); },
-              [&](int h, int r, int c) { return to_float<DV>(dv_ref(h, r, c)); },
-              sk, hdim_v);
+        accumulate(acc_dq,
+                   [&](int h, int r, int c) { return to_float<DQ>(dq_got(h, r, c)); },
+                   [&](int h, int r, int c) { return to_float<DQ>(dq_ref(h, r, c)); },
+                   sq, hdim_q);
+        accumulate(acc_dk,
+                   [&](int h, int r, int c) { return to_float<DK>(dk_got(h, r, c)); },
+                   [&](int h, int r, int c) { return to_float<DK>(dk_ref(h, r, c)); },
+                   sk, hdim_q);
+        accumulate(acc_dv,
+                   [&](int h, int r, int c) { return to_float<DV>(dv_got(h, r, c)); },
+                   [&](int h, int r, int c) { return to_float<DV>(dv_ref(h, r, c)); },
+                   sk, hdim_v);
         pass &= dq_ok && dk_ok && dv_ok;
         auto dump_per_row = [&](const char* label,
                                 auto&& got_at,
@@ -1634,6 +1618,27 @@ bool run_bench(const ArgParser& arg)
             break;
         }
     }
+
+    auto print_stats = [](const char* label, const ErrAccum& a) {
+        const double denom_n =
+            static_cast<double>(std::max<std::size_t>(a.n, 1));
+        const double mean_abs = a.sum_abs_diff / denom_n;
+        const double rmse     = std::sqrt(a.sum_sq_diff / denom_n);
+        const double nrmse    = std::sqrt(a.sum_sq_diff) /
+                             std::max(std::sqrt(a.sum_sq_ref), 1e-30);
+        std::cerr << label << " stats: n=" << a.n
+                  << std::scientific << std::setprecision(3)
+                  << " max_abs=" << a.max_abs_diff
+                  << " mean_abs=" << mean_abs
+                  << " max_rel=" << a.max_rel_diff
+                  << " rmse=" << rmse
+                  << " nrmse=" << nrmse
+                  << " max|ref|=" << a.max_abs_ref
+                  << std::defaultfloat << std::endl;
+    };
+    print_stats("[dQ]", acc_dq);
+    print_stats("[dK]", acc_dk);
+    print_stats("[dV]", acc_dv);
 
     std::cout << ", valid:" << (pass ? "y" : "n") << std::flush << std::endl;
     return pass;
