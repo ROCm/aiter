@@ -224,6 +224,10 @@ def gmm(
         warnings.warn(
             f"Overriding GMM grid dim with {grid_dim} (it was {config['GRID_DIM']})."
         )
+        # Copy before mutating: when `config` comes from `get_config` it's the
+        # dict cached by `@functools.lru_cache`, so an in-place write would leak
+        # the override into subsequent calls.
+        config = dict(config)
         config["GRID_DIM"] = grid_dim
 
     grid = _gmm_grid(
@@ -432,6 +436,10 @@ def ptgmm(
         warnings.warn(
             f"Overriding PTGMM grid dim with {grid_dim} (it was {config['GRID_DIM']})."
         )
+        # Copy before mutating: when `config` comes from `get_config` it's the
+        # dict cached by `@functools.lru_cache`, so an in-place write would leak
+        # the override into subsequent calls.
+        config = dict(config)
         config["GRID_DIM"] = grid_dim
 
     # Bias gradient handling.
