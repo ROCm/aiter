@@ -710,10 +710,11 @@ class SinkFixture:
     # gate in the CK kernel across split counts that the example 42 CLI
     # cannot reach today.
     force_num_splits: Optional[int] = None
-    # `expect_no_kernel`: the CK dispatcher fast-fails the fp8 + sink
-    # combo with `{false, -1.f}` because no fp8 sink instances are
-    # compiled yet. Mark those rows as expected-skip so the test reports
-    # SKIP instead of FAIL until the fp8 sink instances ship.
+    # `expect_no_kernel`: generic flag for fixtures whose (V, DType, mask,
+    # sink, ...) combination the CK dispatcher is expected to refuse with
+    # the `{false, -1.f}` trap. Marks the row as expected-SKIP so the
+    # test reports SKIP rather than FAIL. No currently-shipping fixture
+    # sets this — kept as scaffolding for future dispatcher restrictions.
     expect_no_kernel: bool = False
     # `expect_kernel_bug`: the CK kernel runs but the output is known
     # to disagree with the reference (Triton matches the reference on
@@ -880,44 +881,42 @@ _SPLITKV_SINK_FIXTURES: List[SinkFixture] = [
     for n in (2, 4, 8, 16)
 ]
 
-# FP8 + sink fixtures. The CK dispatcher fast-fails this combo today
-# (the `{false, -1.f}` trap added when the bf16/fp16 sink instances
-# first landed, mirroring the no-sink fp8 + SWA dispatcher prophylaxis
-# that predated the fp8 + SWA instances), so every row is marked
-# `expect_no_kernel=True` and SKIPs through the `_ck_dispatch_supported`
-# gate. Once the fp8 sink instances ship these flip to live correctness
-# checks (same atol/rtol envelope as the non-sink fp8 cases).
+# FP8 + sink fixtures. Live correctness checks against the host
+# reference; the dispatcher now routes both (sink, no-SWA) and (sink ×
+# SWA) to dedicated fp8 sink instances. The atol/rtol envelope is the
+# same as the non-sink fp8 cases (`_pick_tolerances` in the driver
+# below selects 0.15 / 0.15 for fp8).
 _FP8_SINK_FIXTURES: List[SinkFixture] = [
     SinkFixture("fp8 prefill d64  sink=random",
                 _SINK_BASE_B_SEQS, (8, 1), 64, 64, 2, -1, -1, "random",
-                q_dtype="fp8", category="fp8", expect_no_kernel=True),
+                q_dtype="fp8", category="fp8"),
     SinkFixture("fp8 prefill d128 sink=random",
                 _SINK_PRE128_SEQS, (8, 1), 128, 64, 2, -1, -1, "random",
-                q_dtype="fp8", category="fp8", expect_no_kernel=True),
+                q_dtype="fp8", category="fp8"),
     SinkFixture("fp8 decode d64  m16  sink=random",
                 _SINK_DECODE_D64_M16_SEQS, (8, 1), 64, 32, 2, -1, -1, "random",
-                q_dtype="fp8", category="fp8", expect_no_kernel=True),
+                q_dtype="fp8", category="fp8"),
     SinkFixture("fp8 decode d64  m64  sink=random",
                 _SINK_DECODE_D64_M64_SEQS, (8, 8), 64, 32, 2, -1, -1, "random",
-                q_dtype="fp8", category="fp8", expect_no_kernel=True),
+                q_dtype="fp8", category="fp8"),
     SinkFixture("fp8 decode d64  m128 sink=random",
                 [(128, 1024)] * 4, (8, 1), 64, 32, 2, -1, -1, "random",
-                q_dtype="fp8", category="fp8", expect_no_kernel=True),
+                q_dtype="fp8", category="fp8"),
     SinkFixture("fp8 decode d128 m16  sink=random",
                 _SINK_DECODE_D128_SEQS, (8, 8), 128, 64, 2, -1, -1, "random",
-                q_dtype="fp8", category="fp8", expect_no_kernel=True),
+                q_dtype="fp8", category="fp8"),
     SinkFixture("fp8 decode d128 m32  sink=random",
                 [(1, 256)] * 4, (32, 1), 128, 64, 2, -1, -1, "random",
-                q_dtype="fp8", category="fp8", expect_no_kernel=True),
+                q_dtype="fp8", category="fp8"),
     SinkFixture("fp8 decode d128 m128 sink=random",
                 [(16, 256)] * 4, (8, 1), 128, 64, 2, -1, -1, "random",
-                q_dtype="fp8", category="fp8", expect_no_kernel=True),
+                q_dtype="fp8", category="fp8"),
     SinkFixture("fp8 prefill d128 SWA-64 sink=random",
                 _SINK_PRE128_SEQS, (8, 1), 128, 64, 2, 64, 0, "random",
-                q_dtype="fp8", category="fp8", expect_no_kernel=True),
+                q_dtype="fp8", category="fp8"),
     SinkFixture("fp8 decode d64 m16 SWA-128 sink=random",
                 _SINK_DECODE_D64_M16_SEQS, (8, 1), 64, 32, 2, 128, 0, "random",
-                q_dtype="fp8", category="fp8", expect_no_kernel=True),
+                q_dtype="fp8", category="fp8"),
 ]
 
 SINK_FIXTURE_GROUPS: dict = {
@@ -1121,13 +1120,6 @@ def _ck_dispatch_supported(cfg: CaseConfig) -> Optional[str]:
         return "fp8 path requires block_size >= 32"
     if cfg.num_heads[0] % cfg.num_heads[1] != 0:
         return f"num_heads {cfg.num_heads} not divisible (GQA invariant)"
-    # fp8 + sink: the CK dispatcher fast-fails this combo today (no fp8 sink
-    # instances are compiled yet, so the dispatcher returns the {false, -1.f}
-    # error trap rather than silently routing to a non-sink instance). The
-    # bf16/fp16 + sink path is fully wired. When the fp8 sink instances ship
-    # this branch flips to live correctness checks.
-    if cfg.q_dtype == "fp8" and cfg.sinks_mode not in (None, "none"):
-        return "fp8 + sink instances not yet compiled (CK dispatcher trap)"
     return None
 
 
