@@ -566,13 +566,24 @@ def _precompile_to_cache(
                 else:
                     quant_mode = "fp4"
                     gui_layout = False
+                use_splitk_bias = enable_bias and _is_splitk
+                topk_ids_arg = (
+                    torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
+                    if use_splitk_bias
+                    else sorted_token_ids.view(-1)
+                )
+                bias_arg = (
+                    bias.contiguous().view(-1)
+                    if use_splitk_bias
+                    else torch.empty(0, device=dev, dtype=torch.float32)
+                )
                 silu_fused = _get_compiled_silu_fused(
                     inter_dim,
                     topk,
                     quant_mode,
                     gui_layout=gui_layout,
                     act=act,
-                    enable_bias=False,
+                    enable_bias=use_splitk_bias,
                     swiglu_limit=swiglu_limit,
                 )
                 _run_compiled(
@@ -583,8 +594,8 @@ def _precompile_to_cache(
                         _ptr_view_safe(out_scale_sorted_flat),
                         _ptr_view_safe(sorted_token_ids),
                         _ptr_view_safe(num_valid_ids),
-                        _ptr_view_safe(sorted_token_ids.view(-1)),
-                        _ptr_view_safe(torch.empty(0, device=dev, dtype=torch.float32)),
+                        _ptr_view_safe(topk_ids_arg),
+                        _ptr_view_safe(bias_arg),
                         tokens,
                         sorted_token_ids.shape[0],
                         0,
