@@ -565,9 +565,8 @@ def test_mla(
         # DCP (Decode Context Parallel) wrapper: per-GPU stage-1 only, no
         # intra-GPU reducev. Host-side LSE-merge over splits validates
         # equivalence to the unified attention reference. Triggered for
-        # B in {1,2,4}, bf16, nhead<=16; min ctx_lens*B such that every
-        # split has >=1 token.
-        from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon_bh16_dcp
+        # bf16, nhead<=16;
+        from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon_dcp
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
         q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
@@ -597,7 +596,7 @@ def test_mla(
         )
 
         _, us_decode = run_perftest(
-            mla_decode_gluon_bh16_dcp,
+            mla_decode_gluon_dcp,
             q_nope,
             q_pe,
             kv_c,
@@ -622,9 +621,9 @@ def test_mla(
         err = checkAllclose(
             out_ref,
             out_gluon,
-            msg=f"mla_decode-absorb    [golden vs gluon_dcp_bh16]: {us_decode:>8.2f} us......",
+            msg=f"mla_decode-absorb    [golden vs gluon_dcp]: {us_decode:>8.2f} us......",
         )
-        cal_diff(out_ref, out_gluon, "out_gluon_dcp_bh16")
+        cal_diff(out_ref, out_gluon, "out_gluon_dcp")
         return err, us_decode
 
     err = None
@@ -746,7 +745,7 @@ def test_mla(
         and kvtype == torch.bfloat16
         and nhead <= 16
         and decode_qlen == 1
-        and batch_size >= 1
+        and 1 <= batch_size <= 256  # NUM_KV_SPLITS = 256 // batch_size must be >= 1
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1

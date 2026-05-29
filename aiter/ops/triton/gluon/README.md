@@ -38,7 +38,7 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>~5.33<br>TB/s</td><td>~0.69<br>TB/s</td><td>—</td>
 </tr>
 <tr>
-  <td><code>mla_decode_gluon_bh16_dcp</code></td><td>MLA Decode<br>(stage-1, DCP)</td><td>CDNA4</td>
+  <td><code>mla_decode_gluon_dcp</code></td><td>MLA Decode<br>(stage-1, DCP)</td><td>CDNA4</td>
   <td nowrap>Q: bf16, KV: bf16<br>Out: bf16 acc + fp32 lse<br>nhead &le; 16<br>batch_size &ge; 1 (any)<br>NUM_KV_SPLITS=256//B<br>(B*splits &le; 256)<br>PAGE_SIZE=1<br>BLOCK_H=16, BLOCK_N=64<br>no intra-GPU reduce</td>
   <td>python op_tests/test_mla.py \<br>-c 100000 -b 4 -n 16,1 \<br>-d bf16 -kvd bf16</td>
   <td>~4.68<br>TB/s</td><td>—</td><td>—</td>
@@ -161,9 +161,9 @@ python op_tests/test_mla.py -c 10000000 -b 1 -n 16,1 -d bf16 -kvd bf16
 
 Gluon reaches ~82% of MI350's 6.5 TB/s HBM peak (wall-clock 2162 &mu;s vs ASM 16659 &mu;s).
 
-### `mla_decode_gluon_bh16_dcp` — Stage-1-only MLA Decode for DCP
+### `mla_decode_gluon_dcp` — Stage-1-only MLA Decode for DCP
 
-**Function:** `mla_decode_gluon_bh16_dcp(q_nope, q_pe, kv_c, attn_logits, lse, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1)`
+**Function:** `mla_decode_gluon_dcp(q_nope, q_pe, kv_c, attn_logits, lse, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1)`
 
 **Description:** Per-GPU stage-1 MLA decode for Decode-Context-Parallel (DCP) workloads where the KV cache is sharded across GPUs. Runs only stage-1 (`_mla_decode_gluon` with `REGIME='dcp_bh16'`) and returns per-split `(attn_logits, lse)` for the **host** to combine across GPUs. No intra-GPU stage-2 reduce is invoked.
 

@@ -545,7 +545,8 @@ def _mla_decode_gluon(
         if WITHIN_2GB:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv.index(async_idx), Kv_c_cache, offs_k_c, mask=offs_n_nope[None, :] < split_kv_end)
         else:
-            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv.index(async_idx), Kv_c_cache + offs_k_c, mask=offs_n_nope[None, :] < split_kv_end, other=0)
+            # No mask needed: out-of-range positions are discarded by the qk score mask
+            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv.index(async_idx), Kv_c_cache + offs_k_c)
         gl.amd.cdna4.async_copy.commit_group()
         # global load K_pe
         offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
@@ -554,7 +555,7 @@ def _mla_decode_gluon(
         if WITHIN_2GB:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
         else:
-            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end, other=0)
+            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe)
         gl.amd.cdna4.async_copy.commit_group()
 
         # dot, softmax, dot
@@ -891,7 +892,7 @@ def mla_decode_gluon(
     return o, None
 
 
-def mla_decode_gluon_bh16_dcp(
+def mla_decode_gluon_dcp(
     q_nope,  # [batch, nhead, kv_lora_rank]
     q_pe,  # [batch, nhead, qk_rope_head_dim]
     kv_c,  # shared layout: [N, kv_lora_rank + qk_rope_head_dim]
@@ -916,7 +917,7 @@ def mla_decode_gluon_bh16_dcp(
     Operating window:
       - gfx950 (CDNA4)
       - nhead in [1-16], bf16 KV
-      - batch_size >= 1 (any value)
+      - batch_size in [1, 256] (so NUM_KV_SPLITS = 256 // batch_size >= 1)
       - NUM_KV_SPLITS = 256 // batch_size (floor); total WGs = B * NUM_KV_SPLITS
         is <= 256. When B does not divide 256 (e.g., 3, 5, 6, 7) up to a few
         CUs are idle for the wave (worst case ~1.5% at B=6).
@@ -936,19 +937,19 @@ def mla_decode_gluon_bh16_dcp(
 
     assert (
         arch_info.get_arch() == "gfx950"
-    ), f"mla_decode_gluon_bh16_dcp requires gfx950 (CDNA4), got {arch_info.get_arch()}"
+    ), f"mla_decode_gluon_dcp requires gfx950 (CDNA4), got {arch_info.get_arch()}"
     assert (
         head_dim_ckv == 512
-    ), f"mla_decode_gluon_bh16_dcp requires head_dim_ckv=512, got {head_dim_ckv}"
+    ), f"mla_decode_gluon_dcp requires head_dim_ckv=512, got {head_dim_ckv}"
     assert (
         head_dim_kpe == 64
-    ), f"mla_decode_gluon_bh16_dcp requires head_dim_kpe=64, got {head_dim_kpe}"
+    ), f"mla_decode_gluon_dcp requires head_dim_kpe=64, got {head_dim_kpe}"
     assert (
         1 <= nhead <= 16
-    ), f"mla_decode_gluon_bh16_dcp requires nhead in [1, 16], got {nhead}"
+    ), f"mla_decode_gluon_dcp requires nhead in [1, 16], got {nhead}"
     assert (
-        batch_size >= 1
-    ), f"mla_decode_gluon_bh16_dcp requires batch_size >= 1, got {batch_size}"
+        1 <= batch_size <= 256
+    ), f"mla_decode_gluon_dcp requires batch_size in [1, 256] (NUM_KV_SPLITS = 256 // batch_size must be >= 1), got {batch_size}"
     assert (
         q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
     ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
@@ -965,7 +966,7 @@ def mla_decode_gluon_bh16_dcp(
 
     assert (
         min_kv_seq_len >= NUM_KV_SPLITS
-    ), f"mla_decode_gluon_bh16_dcp requires min_kv_seq_len >= NUM_KV_SPLITS (= 256/B = {NUM_KV_SPLITS}), got {min_kv_seq_len}"
+    ), f"mla_decode_gluon_dcp requires min_kv_seq_len >= NUM_KV_SPLITS (= 256/B = {NUM_KV_SPLITS}), got {min_kv_seq_len}"
     assert attn_logits.shape == (
         batch_size,
         nhead,
