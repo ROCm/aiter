@@ -21,7 +21,7 @@ CK feature surface coverage in this adapter (matched against
     - scale_block_m=1, scale_block_n=128 (CK production defaults)
 
   Tier B  (validated; required to be the default for DSR1 / TP=8 prefill):
-    - act == "silu"            (gelu not yet ported upstream)
+    - act in {"silu", "gelu"}  (gelu uses exact erf, CK parity)
     - enable_bias is False     (no bias path in upstream blockscale yet)
     - model_dim_pad == 0       (clean shapes only)
     - inter_dim_pad == 0
@@ -29,7 +29,7 @@ CK feature surface coverage in this adapter (matched against
     - sort_block_m: forwarded as a no-op (upstream encodes its own tile_m)
 
   Tier C  (raises NotImplementedError until upstream grows the knob):
-    - act != "silu"
+    - act not in {"silu", "gelu"}
     - enable_bias=True
     - k_batch > 1               (no split-K in upstream blockscale)
     - persist_m > 1             (no persistent kernel)
@@ -137,10 +137,10 @@ def _reject_tier_c(
     for every knob below; any deviation today means upstream has to grow
     that knob first. Each branch points the caller at the future-work item.
     """
-    if act != "silu":
+    if act not in ("silu", "gelu"):
         raise NotImplementedError(
             f"blockscale {stage}: act={act!r} not supported "
-            "(only 'silu'; gelu requires upstream change — Tier C)"
+            "(only 'silu' or 'gelu')"
         )
     if enable_bias:
         raise NotImplementedError(
@@ -270,6 +270,7 @@ def compile_blockscale_moe_gemm1(
         scale_block_k=sbk,
         out_dtype=upstream_out,
         waves_per_eu=wpe,
+        act=act,
     )
 
 
