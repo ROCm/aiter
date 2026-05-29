@@ -22,8 +22,6 @@ This module hosts:
 
 from __future__ import annotations
 
-import os
-
 import torch
 import triton
 
@@ -200,18 +198,6 @@ def _heuristic_bv(
     return _select_bv_for_grid(H=H, V=V, N=N, target_ctas=target_ctas)
 
 
-def _k5_exp2_prescaled_enabled() -> bool:
-    """Read FLYDSL_K5_EXP2_PRESCALED env var at every call (no caching).
-
-    When set to a truthy value (1/true/yes/on), the K5 kernel is compiled
-    with ``G_IS_LOG2_SCALED=True`` and ``_fast_exp`` drops the per-call
-    ``* log2(e)`` multiply. This is a PERF-ONLY probe: outputs are
-    incorrect unless K12 has been updated to pre-scale ``g_cumsum``.
-    """
-    val = os.environ.get("FLYDSL_K5_EXP2_PRESCALED", "")
-    return val.strip().lower() in ("1", "true", "yes", "on")
-
-
 def _get_or_compile(
     K,
     V,
@@ -227,8 +213,8 @@ def _get_or_compile(
     is_varlen,
     wu_contig,
     state_bf16=False,
+    use_exp2=False,
 ):
-    g_log2_scaled = _k5_exp2_prescaled_enabled()
     cache_key = (
         K,
         V,
@@ -244,7 +230,7 @@ def _get_or_compile(
         is_varlen,
         wu_contig,
         state_bf16,
-        g_log2_scaled,
+        use_exp2,
     )
     if cache_key not in _compiled_kernels:
         _compiled_kernels[cache_key] = compile_chunk_gated_delta_h(
@@ -262,7 +248,7 @@ def _get_or_compile(
             IS_VARLEN=is_varlen,
             WU_CONTIGUOUS=wu_contig,
             STATE_DTYPE_BF16=state_bf16,
-            G_IS_LOG2_SCALED=g_log2_scaled,
+            G_IS_LOG2_SCALED=use_exp2,
         )
     return _compiled_kernels[cache_key]
 
@@ -323,6 +309,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     state_dtype: torch.dtype | None = None,
+    use_exp2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
 
@@ -333,13 +320,18 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         k: [B, T, Hg, K] bf16.
         w: [B, H, T_flat, K] bf16, head-major contiguous layout.
         u: [B, H, T_flat, V] bf16, head-major contiguous layout.
-        g: [T_total, H] f32 cumulative gate, or None.
+        g: [B, H, T] f32 cumulative gate, [T_total, H] legacy standalone
+            layout, or None.
         gk: [T_total, H, K] f32 per-K cumulative gate, or None.
         initial_state: [N, H, V, K] f32, or None.
         output_final_state: whether to return the final hidden state.
         chunk_size: chunk size BT (default 64).
         save_new_value: whether to materialize ``v_new``.
         cu_seqlens: [N+1] LongTensor for variable-length batching, or None.
+        state_dtype: optional initial/final state dtype (float32 or bfloat16).
+        use_exp2: whether ``g`` is in log2 space. Standalone K5 callers pass
+            natural-log ``g`` by default; end-to-end prefill passes the Triton
+            K1 ``use_exp2`` setting through explicitly.
 
     Returns:
         (h, v_new, final_state) in VK-ordered layout (``[..., V, K]`` on the
@@ -432,8 +424,22 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     v_new_buf = k.new_empty(B, H, T_flat, V, dtype=u.dtype)
     v_new = v_new_buf if save_new_value else None
 
+    if g is not None:
+        if g.dim() == 2:
+            if cu_seqlens is not None:
+                g_k5 = g.transpose(0, 1).unsqueeze(0).contiguous()
+            else:
+                g_k5 = g.view(B, T, H).permute(0, 2, 1).contiguous()
+        elif g.dim() == 3 and g.shape[1] != H and g.shape[2] == H:
+            # Accept raw [B, T, H] for convenience; K5 consumes [B, H, T].
+            g_k5 = g.permute(0, 2, 1).contiguous()
+        else:
+            g_k5 = g.contiguous()
+    else:
+        g_k5 = None
+
     dummy = torch.empty(1, device=k.device, dtype=torch.float32)
-    g_arg = g if g is not None else dummy
+    g_arg = g_k5 if g_k5 is not None else dummy
     gk_arg = gk if gk is not None else dummy
     h0_arg = initial_state if initial_state is not None else dummy
     ht_arg = final_state if final_state is not None else dummy
@@ -486,6 +492,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         is_varlen,
         wu_contiguous,
         state_bf16=state_bf16,
+        use_exp2=use_exp2,
     )
     _launch_kernel(
         launch_fn,
@@ -526,6 +533,9 @@ def flydsl_gdr_prefill(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
+    use_chunk_hip: bool = False,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """End-to-end GDN forward where K5 runs on FlyDSL.
 
@@ -552,6 +562,10 @@ def flydsl_gdr_prefill(
         use_qk_l2norm_in_kernel: apply L2 normalization to ``q`` and ``k``
             before the chunk pipeline.
         cu_seqlens: ``[N+1]`` cumulative sequence lengths for varlen mode.
+        use_chunk_hip: accepted for signature parity with the Triton wrapper;
+            K5 is always dispatched through FlyDSL in this backend.
+        state_dtype: optional initial/final state dtype (float32 or bfloat16).
+        use_exp2: use exp2/log2-scaled gates across K1-K6, matching Triton.
 
     Returns:
         ``(o, final_state)`` where ``o`` is shape ``[B, T, H, V]`` and
@@ -570,6 +584,9 @@ def flydsl_gdr_prefill(
                 f"rather than {initial_state.shape[0]}."
             )
 
+    # Signature parity with Triton; this backend always dispatches K5 via FlyDSL.
+    del use_chunk_hip
+
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
@@ -583,6 +600,7 @@ def flydsl_gdr_prefill(
         beta=beta,
         g=g,
         cu_seqlens=cu_seqlens,
+        use_exp2=use_exp2,
     )
 
     # -- K3+K4 (Triton) : w (head-major), u (head-major) -------------------
@@ -593,6 +611,7 @@ def flydsl_gdr_prefill(
         beta=beta,
         g_cumsum=g_cumsum,
         cu_seqlens=cu_seqlens,
+        use_exp2=use_exp2,
     )
 
     # -- K5 (FlyDSL) : h, v_new, final_state -------------------------------
@@ -604,6 +623,8 @@ def flydsl_gdr_prefill(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
     )
 
     # -- K6 (Triton) : o = chunk_fwd_o_opt_vk(q, k, v_new, h, g_cumsum) ----
@@ -615,6 +636,7 @@ def flydsl_gdr_prefill(
         g=g_cumsum,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        use_exp2=use_exp2,
     )
 
     return o.to(q.dtype), final_state

@@ -552,7 +552,16 @@ def compile_chunk_gated_delta_h(
             # bookkeeping (slot_assignments, EXTRAS_PER_SLOT, etc.) was done
             # at compile-time in the enclosing compile_chunk_gated_delta_h
             # scope to avoid AST-rewriter interference.
-            g_last_off = (bos + last_idx_raw) * fx.Int32(H) + i_h
+            if const_expr(IS_VARLEN):
+                # g layout: [1, H, T_flat] for varlen prefill.
+                g_base = i_h * T_flat + bos
+                g_stride = fx.Int32(1)
+            else:
+                # g layout: [B, H, T].
+                g_base = (i_n * fx.Int32(H) + i_h) * T_val
+                g_stride = fx.Int32(1)
+
+            g_last_off = g_base + last_idx_raw * g_stride
             g_row_off_list = []
             g_row_in_bounds = []
             for elem_i in range_constexpr(4):
@@ -564,7 +573,7 @@ def compile_chunk_gated_delta_h(
                 )
                 in_bounds = abs_row < T_local
                 safe_row = in_bounds.select(abs_row, fx.Int32(0))
-                g_row_off = (bos + safe_row) * fx.Int32(H) + i_h
+                g_row_off = g_base + safe_row * g_stride
                 g_row_off_list.append(g_row_off)
                 g_row_in_bounds.append(in_bounds)
             g_last_prefetch_cell = [None]

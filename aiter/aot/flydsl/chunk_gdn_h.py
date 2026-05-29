@@ -220,7 +220,7 @@ def _compile_chunk_gdn_h_to_cache(
     v = torch.empty((B, H, T_flat, V), device=dev, dtype=torch_dtype)
     w = torch.empty((B, H, T_flat, K), device=dev, dtype=torch_dtype)
     v_new = torch.empty((B, H, T_flat, V), device=dev, dtype=torch_dtype)
-    g = torch.empty((B * T_flat, H), device=dev, dtype=torch.float32)
+    g = torch.empty((B, H, T_flat), device=dev, dtype=torch.float32)
     gk = torch.empty((B * T_flat, H, K), device=dev, dtype=torch.float32)
     h = torch.empty((B, max(T_flat // BT, 1), H, V, K), device=dev, dtype=torch_dtype)
     h0 = torch.empty((N, H, V, K), device=dev, dtype=state_dtype)
