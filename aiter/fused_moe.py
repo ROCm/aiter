@@ -873,6 +873,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         model_dim,
         E,
         stream=torch.cuda.current_stream(),
+        bias=bias1.to(dtype) if bias1 is not None else None,
     )
     _grouped_dbg("stage1 launch returned")
     if doweight_stage1:
@@ -949,6 +950,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         inter_dim,
         E,
         stream=torch.cuda.current_stream(),
+        bias=bias2.to(dtype) if bias2 is not None else None,
     )
     _grouped_dbg("stage2 launch returned")
 
