@@ -319,15 +319,13 @@ void mla_decode_stage1_asm_fwd(
                 sub_Q = 64;
             }
         }else if (q_type == "fp8" && kv_type == "fp8"){
-            bool fp8_ps_catchall_handles = (arch_id == "gfx950" && persistent
-                && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48);
             if((max_seqlen_q == 4) && persistent){
                 config_max_seqlen_q = 4;
                 sub_Q = 128;
             } else if((max_seqlen_q == 2) && persistent){
                 config_max_seqlen_q = 2;
                 sub_Q = 128;
-            } else if(!fp8_ps_catchall_handles){
+            } else {
                 AITER_CHECK(false, __func__,
                     ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=2,4 in persistent mode");
             }
@@ -343,13 +341,15 @@ void mla_decode_stage1_asm_fwd(
                 sub_Q = 64;
             }
         } else if (q_type == "fp8" && kv_type == "fp8"){
-            bool fp8_ps_catchall_handles = (arch_id == "gfx950" && persistent
-                && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48);
-            if (persistent && max_seqlen_q == 1){
-                config_max_seqlen_q = 1;
-            } else if(!fp8_ps_catchall_handles){
+            if (persistent){
+                if(max_seqlen_q == 1){
+                    config_max_seqlen_q = 1;
+                } else {
+                    config_max_seqlen_q = 4;
+                }
+            } else {
                 AITER_CHECK(false, __func__,
-                    ": fp8/fp8 with gqa_ratio=64 only supports decode_qlen=1 in persistent mode");
+                    ": fp8/fp8 with gqa_ratio=64 only supports persistent mode");
             }
         }
     } else if (gqa_ratio == 8){
@@ -374,7 +374,10 @@ void mla_decode_stage1_asm_fwd(
         config_max_seqlen_q = 1;
         config_gqa_ratio = 64;
         args.s_MQA = gqa_ratio;
-    } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
+    } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
+               && ((gqa_ratio == 32 && max_seqlen_q == 4)
+                   || (gqa_ratio == 64 && max_seqlen_q >= 2 && max_seqlen_q <= 4)
+                   || (gqa_ratio == 128))){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;

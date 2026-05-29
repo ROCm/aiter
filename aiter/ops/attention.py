@@ -957,16 +957,21 @@ def get_mla_metadata_info_v1(
         )
         or (
             get_gfx() == "gfx950"
-            and num_head_qo == 64
-            and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
-            and effective_seqlen_qo == 1
+            and q_dtype == dtypes.fp8
+            and (
+                (num_head_qo == 32 and effective_seqlen_qo == 4)
+                or (num_head_qo == 64)
+                or (num_head_qo == 128)
+            )
         )
     ):
         max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
     elif (
         get_gfx() == "gfx950"
         and ((num_head_qo * effective_seqlen_qo) >= 128 or num_head_qo > 64)
+        and kv_dtype == dtypes.bf16
+        and q_dtype == dtypes.bf16
         and num_head_qo != 48
     ):
         if num_head_qo * 2 > 128:
