@@ -3479,14 +3479,25 @@ class OManager16bitsV3
             static_assert(false, "Unsupported output type");
         }
 
+        // Reuse oaccu pinned VGPRs (GPR_START..GPR_START+7) as ds_read
+        // destinations: after the bf16 packs + ds_writes complete the
+        // GPR_START source range is dead (oaccu not read again this work_idx).
+        // Pinning the read targets keeps the compiler from allocating extra
+        // unpinned VGPRs that would risk leaking into pinned q_vgpr.
+        //
+        // Finer-grained lgkmcnt: drain reads one-at-a-time so the matching
+        // buffer_store_dwordx4 can issue as soon as its data is ready.
         asm volatile("s_waitcnt lgkmcnt(0)");
-        const v4ui data_0 = hkm::ds_read_b128(p_lds_warp + v_offset_lds_ld, 0);
-        const v4ui data_1 =
-            hkm::ds_read_b128(p_lds_warp + v_offset_lds_ld, kLdsLdOffsetDeltaInBytes);
+        hkm::ds_read_b128<GPR_START + 0>(
+            static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld), 0);
+        hkm::ds_read_b128<GPR_START + 4>(
+            static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld),
+            static_cast<int>(kLdsLdOffsetDeltaInBytes));
+        asm volatile("s_waitcnt lgkmcnt(1)");
+        hkm::buffer_store_dwordx4<GPR_START + 0>(out_br, v_offset_vram_st, 0, kOffsetInBytes);
         asm volatile("s_waitcnt lgkmcnt(0)");
-        hkm::buffer_store_dwordx4(data_0, out_br, v_offset_vram_st, 0, kOffsetInBytes);
-        hkm::buffer_store_dwordx4(
-            data_1, out_br, v_offset_vram_st + kVramStOffsetDeltaInBytes, 0, kOffsetInBytes);
+        hkm::buffer_store_dwordx4<GPR_START + 4>(
+            out_br, v_offset_vram_st + kVramStOffsetDeltaInBytes, 0, kOffsetInBytes);
     }
 };
 
@@ -3602,27 +3613,46 @@ class OManager32bitsV3
             static_assert(false, "Unsupported output type");
         }
 
+        // Reuse the oaccu pinned VGPRs (GPR_START..GPR_START+15) as ds_read
+        // destinations. After the ds_writes complete, oaccu is dead (we just
+        // wrote it to LDS, won't read it again until next work_idx which
+        // reinitializes). Using the pinned slots as read targets prevents
+        // the compiler from allocating extra unpinned VGPRs for the read
+        // results -- those allocations would otherwise leak into the pinned
+        // q_vgpr region under tighter scheduling.
+        //
+        // Finer-grained lgkmcnt: drain reads one-at-a-time so the matching
+        // buffer_store_dwordx4 can issue as soon as its data is ready,
+        // overlapping the remaining LDS latency with vmem store traffic.
+        // LDS reads complete in issue order, so lgkmcnt(N) means N reads
+        // remain in flight.
         asm volatile("s_waitcnt lgkmcnt(0)");
-        const v4ui data_0 = hkm::ds_read_b128(p_lds_warp + v_offset_lds_ld, 0);
-        const v4ui data_1 =
-            hkm::ds_read_b128(p_lds_warp + v_offset_lds_ld, 1u * kLdsLdOffsetDeltaInBytes);
-        const v4ui data_2 =
-            hkm::ds_read_b128(p_lds_warp + v_offset_lds_ld, 2u * kLdsLdOffsetDeltaInBytes);
-        const v4ui data_3 =
-            hkm::ds_read_b128(p_lds_warp + v_offset_lds_ld, 3u * kLdsLdOffsetDeltaInBytes);
-        asm volatile("s_waitcnt lgkmcnt(0)");
-        hkm::buffer_store_dwordx4(data_0, out_br, v_offset_vram_st, 0, kOffsetInBytes);
-        hkm::buffer_store_dwordx4(data_1,
-                                  out_br,
+        hkm::ds_read_b128<GPR_START + 0>(
+            static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld), 0);
+        hkm::ds_read_b128<GPR_START + 4>(
+            static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld),
+            static_cast<int>(1u * kLdsLdOffsetDeltaInBytes));
+        hkm::ds_read_b128<GPR_START + 8>(
+            static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld),
+            static_cast<int>(2u * kLdsLdOffsetDeltaInBytes));
+        hkm::ds_read_b128<GPR_START + 12>(
+            static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld),
+            static_cast<int>(3u * kLdsLdOffsetDeltaInBytes));
+        asm volatile("s_waitcnt lgkmcnt(3)");
+        hkm::buffer_store_dwordx4<GPR_START + 0>(out_br, v_offset_vram_st, 0, kOffsetInBytes);
+        asm volatile("s_waitcnt lgkmcnt(2)");
+        hkm::buffer_store_dwordx4<GPR_START + 4>(out_br,
                                   v_offset_vram_st + 1u * kVramStOffsetDeltaInBytes,
                                   0,
                                   kOffsetInBytes);
-        hkm::buffer_store_dwordx4(data_2,
+        asm volatile("s_waitcnt lgkmcnt(1)");
+        hkm::buffer_store_dwordx4<GPR_START + 8>(
                                   out_br,
                                   v_offset_vram_st + 2u * kVramStOffsetDeltaInBytes,
                                   0,
                                   kOffsetInBytes);
-        hkm::buffer_store_dwordx4(data_3,
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        hkm::buffer_store_dwordx4<GPR_START + 12>(
                                   out_br,
                                   v_offset_vram_st + 3u * kVramStOffsetDeltaInBytes,
                                   0,
