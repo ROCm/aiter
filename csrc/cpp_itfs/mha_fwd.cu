@@ -183,9 +183,9 @@ std::tuple<int, int, int> get_grid_dim(const mha_fwd_args& a, int ts_qo, const s
     {
         tg_div = 1; // do not merge the head and tail in seqlen_q direction
     }
-    if(arch_id == "gfx950")
+    if(arch_id == "gfx950" && a.data_type == "fp8bf16")
     {
-        tg_div = 1; // v2 asm kernel processes one Q tile per workgroup
+        tg_div = 1; // fp8 asm kernel processes one Q tile per workgroup
     }
     // batch
     int gdx = ((a.seqlen_q + ts_qo - 1) / ts_qo + tg_div - 1) / tg_div;
