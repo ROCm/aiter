@@ -19,7 +19,7 @@ jobs:
 
       - name: Verify 3rdparty commits
         if: github.ref != 'refs/heads/main'
-        run: echo "Temporarily skipping CK dependency check."
+        run: ./.github/scripts/check_deps.sh
 
       - name: Skip check on main branch
         if: github.ref == 'refs/heads/main'
