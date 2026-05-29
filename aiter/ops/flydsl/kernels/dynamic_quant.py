@@ -61,6 +61,7 @@ __all__ = [
     "build_per_1x32_fp4_quant_hadamard_module",
     "build_per_1x32_fp4_quant_block_rotation_module",
     "build_per_1x32_fp4_quant_block_rotation_mfma_module",
+    "build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module",
 ]
 
 # ----------------------------------------------------------------------------
@@ -1909,4 +1910,628 @@ def build_per_1x32_fp4_quant_block_rotation_mfma_module(
         )
 
     return launch_per_1x32_fp4_quant_block_rotation_mfma
+
+
+# ============================================================================
+# build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module
+#
+# True kernel-level fusion of:
+#   1. per-block rotation + per-1x32 MXFP4 quant (the MFMA kernel above)
+#   2. MoE scale-sort scatter into the MXFP4-shuffled destination layout
+#      (the no-rotation ``mxfp4_moe_sort_kernel`` in quant_kernels.cu)
+#
+# Mirrors the strategy used by ``fused_dynamic_mxfp4_quant_moe_sort_hip``
+# (also in quant_kernels.cu): iterate over **destination** sorted-row
+# blocks rather than source rows. Each lane reads ``sorted_ids[sorted_row]``
+# to discover its source ``(token_idx, topk_id)`` and re-loads the routed
+# token's activation. The per-block rotation + MFMA quant path is the
+# same as the no-sort kernel above; only the input gather address and
+# the two output store addresses change.
+#
+# Trade-off vs. the chained 2-kernel path (rotation+quant -> scale-sort
+# scatter):
+#   *  one launch instead of two; no intermediate ``(rows, scale_N)``
+#      scale buffer (saved HBM traffic ~ rows*scale_N bytes).
+#   *  for stage1 with topk > 1 the rotation MFMA work is duplicated
+#      (each source token row is fetched + rotated once per topk slot
+#      it appears in ``sorted_ids``). The CUDA fused kernel has the
+#      same property and treats it as an acceptable price for the
+#      single-launch fusion.
+#   *  stage2 (``M_src == token_num * topk``) has a 1:1 mapping from
+#      ``sorted_row`` to source row, so there's no MFMA duplication.
+# ============================================================================
+
+
+@functools.lru_cache(maxsize=None)
+def build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module(
+    cols: int,
+    in_dtype: str = "bf16",
+    rot_dtype: str = "bf16",
+    topk: int = 1,
+    rot_transposed: bool = False,
+):
+    """MFMA rotation + per-1x32 MXFP4 quant **fused with** MoE scale-sort.
+
+    Single FlyDSL kernel that:
+
+      1. Iterates over destination ``sorted_row`` blocks (grid X)
+         instead of source-row blocks.
+      2. Per lane: gathers ``sorted_ids[sorted_row]``, decodes
+         ``(token_idx, topk_id)``, picks the source row
+         ``src = token_idx * topk + topk_id``.
+      3. Runs the same MFMA-accelerated per-block rotation + per-1x32
+         MXFP4 quant path as
+         :func:`build_per_1x32_fp4_quant_block_rotation_mfma_module`
+         (cooperative LDS R[b] load + 4x2x2 MFMA + amax + E8M0 +
+         ``cvt_scalef32_pk_fp4_f32``).
+      4. Writes the fp4x2 packed bytes at row
+         ``token_idx * topk + topk_id`` of ``out`` (matching the
+         convention used by the no-rotation
+         ``fused_dynamic_mxfp4_quant_moe_sort_hip`` CUDA kernel).
+      5. Writes the E8M0 scale byte directly into the MXFP4-shuffled
+         MoE-sorted ``out_scale`` at
+         ``fp4_scale_shuffle_id(scaleN_pad, sorted_row, b)`` -- the
+         exact layout produced by ``mxfp4_moe_sort_kernel`` in
+         ``quant_kernels.cu``.
+
+    Launcher signature::
+
+        launch(inp, rot_R, sorted_ids, num_valid_ids,
+               out, out_scale, num_sorted_blocks, num_tokens, stream)
+
+    Parameters
+    ----------
+    cols : int
+        Activation last-dim (= ``model_dim`` for stage1 or
+        ``inter_dim`` for stage2). Compile-time constant.
+    in_dtype, rot_dtype : str
+        Element type for ``inp`` and ``rot_R``; must be equal and one of
+        ``bf16`` / ``fp16``. The fp32-``rot_R`` scalar fallback path is
+        not provided in the fused-sort variant (use the chained
+        2-kernel route there).
+    topk : int, default 1
+        Compile-time topk replication for source-row indexing. Pass
+        ``topk=1`` for the stage1 path (``M_src == token_num``) and the
+        real topk for the stage2 path (``M_src == token_num * topk``).
+        Each ``(cols, dtypes, topk, rot_transposed)`` combo gets its
+        own JIT-compiled kernel via ``lru_cache``.
+    rot_transposed : bool, default False
+        Selects the ``rot_R`` storage layout; see
+        :func:`build_per_1x32_fp4_quant_block_rotation_mfma_module` for
+        the full convention. Implementation reuses the same
+        cooperative LDS load with the same constexpr layout swap.
+
+    Returns
+    -------
+    A ``@flyc.jit`` launcher with the signature above. The grid is
+    ``(num_sorted_blocks, scale_N, 1)`` and the block is
+    ``(GROUP_QUANT_BLOCK_SIZE=64, 1, 1)``, matching the no-sort kernel.
+
+    See also
+    --------
+    :func:`aiter.ops.flydsl.flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace`
+        Thin Python wrapper that derives ``topk`` / grid and launches
+        this kernel into caller-provided ``out`` / ``out_scale`` buffers.
+    :func:`aiter.ops.flydsl.flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort`
+        Alloc-and-return convenience wrapper around the in-place form.
+    """
+    if cols <= 0 or (cols % FP4_GROUP_SIZE) != 0:
+        raise ValueError(
+            f"cols must be a positive multiple of FP4_GROUP_SIZE="
+            f"{FP4_GROUP_SIZE}, got cols={cols}"
+        )
+    if in_dtype not in ("bf16", "fp16", "f16"):
+        raise ValueError(f"unsupported input dtype: {in_dtype!r}")
+    if rot_dtype in ("f32", "fp32"):
+        raise ValueError(
+            "MFMA+sort path requires bf16/fp16 R; for fp32 R, use the "
+            "two-kernel chain (block_rotation + mxfp4_moe_sort)."
+        )
+    if rot_dtype not in ("bf16", "fp16", "f16"):
+        raise ValueError(f"unsupported R dtype: {rot_dtype!r}")
+    _norm_in = "bf16" if in_dtype == "bf16" else "fp16"
+    _norm_rot = "bf16" if rot_dtype == "bf16" else "fp16"
+    if _norm_in != _norm_rot:
+        raise ValueError(
+            f"MFMA+sort path requires in_dtype == rot_dtype (got "
+            f"in_dtype={in_dtype!r}, rot_dtype={rot_dtype!r})"
+        )
+    if topk < 1:
+        raise ValueError(f"topk must be >= 1, got {topk}")
+
+    PAIRS_PER_GROUP = FP4_GROUP_SIZE // 2       # 16
+    DWORDS_PER_GROUP = PAIRS_PER_GROUP // 4     # 4
+    scale_N = cols // FP4_GROUP_SIZE
+    g = FP4_GROUP_SIZE                          # 32
+
+    # ``scaleN_pad`` matches the CUDA reference's padded-to-8 layout
+    # used by ``fp4_scale_shuffle_id``; for any ``cols`` that is a
+    # multiple of 256 this collapses to ``scale_N`` itself.
+    scaleN_pad = ((scale_N + 7) // 8) * 8
+
+    # ----- MFMA tile geometry (16x16x16, gfx942 _1k op) - same as
+    # the no-sort variant.
+    M_TILE = 16
+    N_TILE = 16
+    K_TILE = 16
+    NUM_M_TILES = GROUP_QUANT_BLOCK_SIZE // M_TILE   # 4
+    NUM_N_TILES = FP4_GROUP_SIZE // N_TILE           # 2
+    NUM_K_TILES = FP4_GROUP_SIZE // K_TILE           # 2
+    WMMA_FRAG_VALS = 4
+
+    R_NUMEL_PER_BLOCK = g * g                        # 1024
+    R_LDS_BYTES = R_NUMEL_PER_BLOCK * 2              # 2 KB (bf16/fp16)
+    Y_LDS_BYTES = GROUP_QUANT_BLOCK_SIZE * FP4_GROUP_SIZE * 4  # 8 KB f32
+
+    R_ELEMS_PER_THREAD = R_NUMEL_PER_BLOCK // GROUP_QUANT_BLOCK_SIZE  # 16
+    R_LOAD_VEC = 8
+    R_LOAD_STEPS = R_ELEMS_PER_THREAD // R_LOAD_VEC  # 2
+
+    Y_READ_VEC = 4
+    Y_READ_STEPS = FP4_GROUP_SIZE // Y_READ_VEC      # 8
+
+    gpu_arch = get_hip_arch()
+    sym_tag = (
+        f"fp4_rot_mfma_sort_lds_{cols}_{in_dtype}_{rot_dtype}_"
+        f"t{topk}_rT{int(rot_transposed)}"
+    )
+    allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name=sym_tag)
+    R_lds_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = R_lds_offset + R_LDS_BYTES
+    Y_lds_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = Y_lds_offset + Y_LDS_BYTES
+
+    @flyc.kernel
+    def per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_kernel(
+        inp: fx.Tensor,            # (M_src, cols)               bf16 / fp16
+        rot_R: fx.Tensor,          # (scale_N, 32, 32)           bf16 / fp16
+        sorted_ids: fx.Tensor,     # (sorted_ids_len,)           int32
+        num_valid_ids: fx.Tensor,  # (1,)                        int32
+        out: fx.Tensor,            # (M_src, cols // 2)          uint8 (fp4x2)
+        out_scale: fx.Tensor,      # (sorted_pad, scale_N)       uint8 (e8m0)
+        num_tokens_dyn: Int32,
+    ):
+        from flydsl._mlir.dialects import memref as _memref
+
+        bid_x = fx.block_idx.x  # sorted-row chunk index
+        bid_y = fx.block_idx.y  # b in [0, scale_N)
+        tid = fx.thread_idx.x
+
+        f32 = T.f32
+        i32 = T.i32
+        i16 = T.i16
+        in_elem_ty = _input_elem_mlir_type(in_dtype)
+        rot_elem_ty = _input_elem_mlir_type(
+            "bf16" if rot_dtype == "bf16" else "fp16"
+        )
+
+        # ----- compile-time constants -----
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c2_i32 = arith.constant(2, type=i32)
+        c4_i32 = arith.constant(4, type=i32)
+        c15_i32 = arith.constant(15, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+        c_quarter_f32 = arith.constant(0.25, type=f32)
+        c_blksz_i32 = arith.constant(GROUP_QUANT_BLOCK_SIZE, type=i32)
+        scale_N_i32 = arith.constant(scale_N, type=i32)
+        group_size_i32 = arith.constant(FP4_GROUP_SIZE, type=i32)
+        cols_i32 = arith.constant(cols, type=i32)
+        out_bytes_per_group_i32 = arith.constant(DWORDS_PER_GROUP * 4, type=i32)
+        c_R_block_elems_i32 = arith.constant(R_NUMEL_PER_BLOCK, type=i32)
+        c_R_elems_per_thread_i32 = arith.constant(R_ELEMS_PER_THREAD, type=i32)
+        topk_i32 = arith.constant(topk, type=i32)
+        c_24_i32 = arith.constant(24, type=i32)
+        c_low24_mask_i32 = arith.constant(0xFFFFFF, type=i32)
+
+        in_rsrc = buffer_ops.create_buffer_resource(inp, max_size=True)
+        out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
+        out_scale_rsrc = buffer_ops.create_buffer_resource(
+            out_scale, max_size=True
+        )
+        rot_rsrc = buffer_ops.create_buffer_resource(rot_R, max_size=True)
+        sorted_ids_rsrc = buffer_ops.create_buffer_resource(
+            sorted_ids, max_size=True
+        )
+        num_valid_rsrc = buffer_ops.create_buffer_resource(
+            num_valid_ids, max_size=True
+        )
+
+        tid_i32 = ArithValue(tid)
+        bid_x_i32 = ArithValue(bid_x)
+        bid_y_i32 = ArithValue(bid_y)
+
+        m_base_i32 = bid_x_i32 * c_blksz_i32       # base sorted_row of this block
+        b_i32 = bid_y_i32
+
+        # num_valid_ids[0] (broadcast scalar): one i32 load per workgroup.
+        num_valid_v = buffer_ops.buffer_load(
+            num_valid_rsrc, c0_i32, vec_width=1, dtype=i32,
+        )
+        num_tokens_i32 = ArithValue(num_tokens_dyn)
+
+        # Lane decomposition for MFMA: lane t -> (t % 16, t // 16).
+        lane_mod_16 = tid_i32 & c15_i32
+        lane_div_16 = tid_i32 >> c4_i32
+        k_off_in_tile = lane_div_16 << c2_i32   # 0, 4, 8, 12
+
+        # ============================================================
+        # Per-thread sorted-row lookups
+        # ============================================================
+        # Each thread is responsible for:
+        #   * storage row tid_for_store = tid (sorted_row for scale +
+        #     ``token_idx*topk + topk_id`` for fp4 store).
+        #   * MFMA A-frag rows for m_tile=0..3 at sorted_row
+        #     ``m_base + m_tile*16 + (tid%16)``.
+        # We do 1 + NUM_M_TILES = 5 sorted_ids gathers per thread
+        # (4 bytes each), all gated by ``< num_valid_ids[0]``. OOR
+        # lanes clamp to sorted_row=0 for the load so the buffer_load
+        # always lands in-range; their results are discarded by the
+        # store predicate.
+        def _decode_token_info(token_info, sr_in_range):
+            """Return ``(src_row, valid)`` for a given sorted_row.
+
+            ``src_row = token_idx * topk + topk_id`` (compile-time
+            simplification when topk==1). ``valid`` is the per-thread
+            store/MFMA-load predicate matching the CUDA reference's
+            ``token_idx < num_tokens && (topk == 1 || topk_id < topk)``
+            gate, AND-ed with the in-range check.
+            """
+            # For OOR lanes (sr_in_range == False), the load address
+            # was clamped to 0; force token_info to the
+            # ``num_tokens_i32`` sentinel so the validity check below
+            # correctly rejects them.
+            ti = arith.select(sr_in_range, token_info, num_tokens_i32)
+            tok_idx = ti & c_low24_mask_i32
+            tok_idx_lt = arith.cmpi(CmpIPredicate.ult, tok_idx, num_tokens_i32)
+            if topk == 1:
+                src = tok_idx
+                valid = tok_idx_lt
+            else:
+                topk_id_v = ti >> c_24_i32
+                topk_id_lt = arith.cmpi(
+                    CmpIPredicate.ult, topk_id_v, topk_i32,
+                )
+                src = tok_idx * topk_i32 + topk_id_v
+                valid = arith.andi(tok_idx_lt, topk_id_lt)
+            src_safe = arith.select(valid, src, c0_i32)
+            return src_safe, valid
+
+        # ----- Per-(m_tile, lane) lookups for MFMA A-frag input rows -----
+        # Pre-compute the 4 source rows this thread will gather from
+        # for the 4 m-tiles, in row-major sorted_row order. The
+        # ``sorted_ids`` buffer is i32, so the buffer_load offset is
+        # just the element index (matching every other ``buffer_load``
+        # call in this file -- the ``offset_is_bytes`` kwarg only
+        # applies to ``buffer_store``).
+        src_row_for_mfma = []
+        for m_tile in range_constexpr(NUM_M_TILES):
+            sr = (
+                m_base_i32
+                + arith.constant(m_tile * 16, type=i32)
+                + lane_mod_16
+            )
+            sr_in_range = arith.cmpi(CmpIPredicate.ult, sr, num_valid_v)
+            safe_sr = arith.select(sr_in_range, sr, c0_i32)
+            ti = buffer_ops.buffer_load(
+                sorted_ids_rsrc, safe_sr, vec_width=1, dtype=i32,
+            )
+            src_safe, _ = _decode_token_info(ti, sr_in_range)
+            src_row_for_mfma.append(src_safe)
+
+        # ----- Per-thread lookup for the STORAGE sorted_row -----
+        sorted_row_store = m_base_i32 + tid_i32
+        store_sr_in_range = arith.cmpi(
+            CmpIPredicate.ult, sorted_row_store, num_valid_v,
+        )
+        safe_store_sr = arith.select(
+            store_sr_in_range, sorted_row_store, c0_i32,
+        )
+        store_token_info = buffer_ops.buffer_load(
+            sorted_ids_rsrc, safe_store_sr, vec_width=1, dtype=i32,
+        )
+        # ``src_row_store`` is ``token_idx * topk + topk_id`` -- the
+        # row index into the (topk-expanded) fp4 output buffer.
+        src_row_store, store_valid = _decode_token_info(
+            store_token_info, store_sr_in_range,
+        )
+
+        # ============================================================
+        # LDS views (same layout as the no-sort kernel).
+        # ============================================================
+        base_ptr = allocator.get_base()
+        R_lds_view = SmemPtr(
+            base_ptr, R_lds_offset, rot_elem_ty,
+            shape=(R_NUMEL_PER_BLOCK,),
+        ).get()
+        Y_lds_view = SmemPtr(
+            base_ptr, Y_lds_offset, f32,
+            shape=(GROUP_QUANT_BLOCK_SIZE * FP4_GROUP_SIZE,),
+        ).get()
+
+        # ============================================================
+        # Stage 1: cooperative LDS load of R[b]  (unchanged)
+        # ============================================================
+        R_b_elem_base = b_i32 * c_R_block_elems_i32
+        thread_elem_off = tid_i32 * c_R_elems_per_thread_i32
+        R_thread_elem_base = R_b_elem_base + thread_elem_off
+
+        for li in range_constexpr(R_LOAD_STEPS):
+            step_elem_off = R_thread_elem_base + arith.constant(
+                li * R_LOAD_VEC, type=i32
+            )
+            dw_off_li = step_elem_off >> c1_i32
+            raw_i32_4 = buffer_ops.buffer_load(
+                rot_rsrc, dw_off_li, vec_width=4, dtype=i32
+            )
+            r_vec_bf = vector.bitcast(
+                T.vec(R_LOAD_VEC, rot_elem_ty), raw_i32_4
+            )
+
+            if not rot_transposed:
+                lds_idx = thread_elem_off + arith.constant(
+                    li * R_LOAD_VEC, type=i32
+                )
+                lds_idx_index = arith.index_cast(T.index, lds_idx)
+                vector.store(
+                    r_vec_bf, R_lds_view, [lds_idx_index], alignment=16
+                )
+            else:
+                flat_base_i32 = thread_elem_off + arith.constant(
+                    li * R_LOAD_VEC, type=i32
+                )
+                g_src_i32 = flat_base_i32 >> arith.constant(5, type=i32)
+                h_src_base_i32 = flat_base_i32 & arith.constant(
+                    31, type=i32
+                )
+                dest_base_i32 = (
+                    h_src_base_i32 * group_size_i32 + g_src_i32
+                )
+                for j in range_constexpr(R_LOAD_VEC):
+                    elem_bf = vector.extract(
+                        r_vec_bf, static_position=[j], dynamic_position=[]
+                    )
+                    dest_off_i32 = dest_base_i32 + arith.constant(
+                        j * FP4_GROUP_SIZE, type=i32
+                    )
+                    dest_off_idx = arith.index_cast(T.index, dest_off_i32)
+                    _memref.store(elem_bf, R_lds_view, [dest_off_idx])
+
+        gpu.barrier()
+
+        # ============================================================
+        # Stage 2: MFMA loop -- identical to the no-sort variant
+        # except the input gather row uses the per-(m_tile, lane)
+        # ``src_row_for_mfma[m_tile]`` we resolved above (instead of
+        # the natural ``m_base + m_tile*16 + lane_mod_16`` source row).
+        # ============================================================
+        for m_tile in range_constexpr(NUM_M_TILES):
+            row_off_in_inp = (
+                src_row_for_mfma[m_tile] * cols_i32
+                + b_i32 * group_size_i32
+            )
+
+            for n_tile in range_constexpr(NUM_N_TILES):
+                acc = vector.from_elements(
+                    T.vec(WMMA_FRAG_VALS, f32),
+                    [c0_f32] * WMMA_FRAG_VALS,
+                )
+
+                for k_tile in range_constexpr(NUM_K_TILES):
+                    k_col_i32 = (
+                        arith.constant(k_tile * 16, type=i32) + k_off_in_tile
+                    )
+                    elem_off_a = row_off_in_inp + k_col_i32
+                    dw_off_a = elem_off_a >> c1_i32
+                    raw_a = buffer_ops.buffer_load(
+                        in_rsrc, dw_off_a, vec_width=2, dtype=i32
+                    )
+                    a_frag_bf = vector.bitcast(
+                        T.vec(WMMA_FRAG_VALS, in_elem_ty), raw_a
+                    )
+
+                    n_lds = (
+                        arith.constant(n_tile * 16, type=i32) + lane_mod_16
+                    )
+                    k_lds = (
+                        arith.constant(k_tile * 16, type=i32) + k_off_in_tile
+                    )
+                    lds_off_b = n_lds * group_size_i32 + k_lds
+                    lds_off_b_idx = arith.index_cast(T.index, lds_off_b)
+                    b_frag_bf = vector.load_op(
+                        T.vec(WMMA_FRAG_VALS, rot_elem_ty),
+                        R_lds_view,
+                        [lds_off_b_idx],
+                    )
+
+                    if in_dtype == "bf16":
+                        a_for_mfma = vector.bitcast(
+                            T.vec(WMMA_FRAG_VALS, i16), a_frag_bf
+                        )
+                        b_for_mfma = vector.bitcast(
+                            T.vec(WMMA_FRAG_VALS, i16), b_frag_bf
+                        )
+                        acc = rocdl.mfma_f32_16x16x16bf16_1k(
+                            T.vec(WMMA_FRAG_VALS, f32),
+                            [a_for_mfma, b_for_mfma, acc, 0, 0, 0],
+                        )
+                    else:
+                        acc = rocdl.mfma_f32_16x16x16f16(
+                            T.vec(WMMA_FRAG_VALS, f32),
+                            [a_frag_bf, b_frag_bf, acc, 0, 0, 0],
+                        )
+
+                m_local_base = (
+                    arith.constant(m_tile * 16, type=i32) + k_off_in_tile
+                )
+                n_local_i32 = (
+                    arith.constant(n_tile * 16, type=i32) + lane_mod_16
+                )
+                for i in range_constexpr(WMMA_FRAG_VALS):
+                    m_local_i32 = m_local_base + arith.constant(i, type=i32)
+                    y_lds_off = m_local_i32 * group_size_i32 + n_local_i32
+                    val = vector.extract(
+                        acc, static_position=[i], dynamic_position=[]
+                    )
+                    y_lds_off_idx = arith.index_cast(T.index, y_lds_off)
+                    _memref.store(val, Y_lds_view, [y_lds_off_idx])
+
+        gpu.barrier()
+
+        # ============================================================
+        # Stage 3: per-thread row readback + amax + E8M0 + cvt fp4
+        # (identical to the no-sort variant; thread tid owns row tid
+        # of the Y_LDS tile, i.e. the data for sorted_row
+        # ``m_base + tid``).
+        # ============================================================
+        y_vals = [None] * FP4_GROUP_SIZE
+        tid_row_base = tid_i32 * group_size_i32
+        for k in range_constexpr(Y_READ_STEPS):
+            lds_off = tid_row_base + arith.constant(
+                k * Y_READ_VEC, type=i32
+            )
+            lds_off_idx = arith.index_cast(T.index, lds_off)
+            v4 = vector.load_op(
+                T.vec(Y_READ_VEC, f32), Y_lds_view, [lds_off_idx],
+            )
+            for j in range_constexpr(Y_READ_VEC):
+                y_vals[k * Y_READ_VEC + j] = vector.extract(
+                    v4, static_position=[j], dynamic_position=[],
+                )
+
+        abs_max = c0_f32
+        for i in range_constexpr(FP4_GROUP_SIZE):
+            abs_v = _llvm.call_intrinsic(
+                f32, "llvm.fabs.f32", [y_vals[i]], [], [],
+            )
+            abs_max = arith.maximumf(abs_max, abs_v)
+
+        u_amax = abs_max.bitcast(i32)
+        c_exp_mask = arith.constant(0xFF, type=i32)
+        c_23 = arith.constant(23, type=i32)
+        c_22 = arith.constant(22, type=i32)
+        c_21 = arith.constant(21, type=i32)
+        c_lo21_mask = arith.constant(0x1FFFFF, type=i32)
+        c_inf_exp = arith.constant(0xFF, type=i32)
+
+        exp = (u_amax >> c_23) & c_exp_mask
+        bit22 = (u_amax >> c_22) & c1_i32
+        bit21 = (u_amax >> c_21) & c1_i32
+        lo21 = u_amax & c_lo21_mask
+
+        bit22_set = arith.cmpi(CmpIPredicate.ne, bit22, c0_i32)
+        bit21_set = arith.cmpi(CmpIPredicate.ne, bit21, c0_i32)
+        lo21_set = arith.cmpi(CmpIPredicate.ne, lo21, c0_i32)
+        exp_nz = arith.cmpi(CmpIPredicate.ne, exp, c0_i32)
+        any_low = arith.ori(arith.ori(bit21_set, lo21_set), exp_nz)
+        round_up = arith.andi(bit22_set, any_low)
+        exp_rounded = exp + arith.select(round_up, c1_i32, c0_i32)
+
+        is_inf_nan = arith.cmpi(CmpIPredicate.eq, exp, c_inf_exp)
+        exp_final = arith.select(is_inf_nan, c_inf_exp, exp_rounded)
+
+        next_pow2_i32 = exp_final << c_23
+        next_pow2_f32 = next_pow2_i32.bitcast(f32)
+        inv_scale = next_pow2_f32 * c_quarter_f32
+
+        inv_scale_u32 = inv_scale.bitcast(i32)
+        e8m0_byte_i32 = (inv_scale_u32 >> c_23) & c_exp_mask
+        e8m0_byte_i8 = arith.trunci(T.i8, e8m0_byte_i32)
+
+        # ----- cvt to fp4 -----
+        out_dwords = []
+        for dw in range_constexpr(DWORDS_PER_GROUP):
+            packed = c0_i32
+            for sel in range_constexpr(4):
+                idx = dw * 4 + sel
+                e0 = y_vals[idx * 2]
+                e1 = y_vals[idx * 2 + 1]
+                packed = rocdl.cvt_scalef32_pk_fp4_f32(
+                    i32, packed, e0, e1, inv_scale, sel,
+                )
+            out_dwords.append(packed)
+        out_vec = vector.from_elements(
+            T.vec(DWORDS_PER_GROUP, i32), out_dwords,
+        )
+
+        # ============================================================
+        # Stage 4: store outputs at the MoE-sorted addresses.
+        #
+        # *  fp4x2 ``out`` row index: ``src_row_store`` =
+        #    ``token_idx * topk + topk_id``. For stage1 (topk=1) this
+        #    folds to ``token_idx``, so multiple sorted_rows pointing
+        #    to the same token write the same fp4 bytes to the same
+        #    address -- idempotent (deterministic quant of the same
+        #    rotated input). For stage2 it's a 1:1 sorted_row ->
+        #    output row mapping.
+        #
+        # *  ``out_scale`` byte address: the
+        #    ``fp4_scale_shuffle_id(scaleN_pad, sorted_row, b)`` layout
+        #    consumed by the tile-quantised CK GEMM. See
+        #    ``mxfp4_moe_sort_kernel`` in
+        #    ``aiter/csrc/kernels/quant_kernels.cu``.
+        # ============================================================
+        sr = sorted_row_store
+        scale_shuf_off = (
+            (sr >> arith.constant(5, type=i32))
+                * arith.constant(scaleN_pad * 32, type=i32)
+            + (b_i32 >> arith.constant(3, type=i32))
+                * arith.constant(256, type=i32)
+            + (b_i32 & arith.constant(3, type=i32))
+                * arith.constant(64, type=i32)
+            + (sr & c15_i32) * c4_i32
+            + ((b_i32 & arith.constant(7, type=i32))
+               >> c2_i32) * c2_i32
+            + ((sr & arith.constant(31, type=i32))
+               >> c4_i32)
+        )
+
+        out_byte_off_i32 = (
+            src_row_store
+                * arith.constant(scale_N * DWORDS_PER_GROUP * 4, type=i32)
+            + b_i32 * out_bytes_per_group_i32
+        )
+
+        _if_store = _scf.IfOp(store_valid)
+        with ir.InsertionPoint(_if_store.then_block):
+            buffer_ops.buffer_store(
+                out_vec, out_rsrc, out_byte_off_i32,
+                offset_is_bytes=True,
+            )
+            buffer_ops.buffer_store(
+                e8m0_byte_i8, out_scale_rsrc, scale_shuf_off,
+                offset_is_bytes=True,
+            )
+            _scf.YieldOp([])
+
+    @flyc.jit
+    def launch_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting(
+        inp: fx.Tensor,
+        rot_R: fx.Tensor,
+        sorted_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        out: fx.Tensor,
+        out_scale: fx.Tensor,
+        num_sorted_blocks: Int32,
+        num_tokens: Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+
+        num_sorted_blocks_idx = arith.index_cast(T.index, num_sorted_blocks)
+        scale_N_idx = arith.constant(scale_N, type=T.index)
+
+        launcher = per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_kernel(
+            inp, rot_R, sorted_ids, num_valid_ids, out, out_scale, num_tokens,
+        )
+        launcher.launch(
+            grid=(num_sorted_blocks_idx, scale_N_idx, 1),
+            block=(GROUP_QUANT_BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return launch_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting
 

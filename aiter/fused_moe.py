@@ -20,9 +20,13 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 
 if is_flydsl_available():
-    from aiter.ops.flydsl import flydsl_per_1x32_fp4_quant_block_rotation_mfma
+    from aiter.ops.flydsl import (
+        flydsl_per_1x32_fp4_quant_block_rotation_mfma,
+        flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort,
+    )
 else:  # noqa: E501
     flydsl_per_1x32_fp4_quant_block_rotation_mfma = None  # type: ignore[assignment]
+    flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort = None  # type: ignore[assignment]
 
 BLOCK_SIZE_M = 32
 
@@ -179,29 +183,23 @@ def _flydsl_rotation_mxfp4_quant_moe_sort(
     quant. The rotation+quant runs in a single FlyDSL MFMA kernel; the
     scale-scatter then runs separately via :func:`mxfp4_moe_sort_fwd`.
     """
-    assert flydsl_per_1x32_fp4_quant_block_rotation_mfma is not None, (
+    assert flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort is not None, (
         "flydsl is not available; cannot apply block rotation via the "
-        "fused MFMA kernel"
+        "fused MFMA+sort kernel"
+    )
+    assert int(x.shape[-1]) == cols, (
+        f"_flydsl_rotation_mxfp4_quant_moe_sort: x.shape[-1]={x.shape[-1]} "
+        f"!= cols={cols}"
     )
     rot_transposed = _read_rot_transposed_attr(rot_R)
-    rows = int(x.shape[0])
-    if not x.is_contiguous():
-        x = x.contiguous()
-    if not rot_R.is_contiguous():
-        rot_R = rot_R.contiguous()
-    a = torch.empty(rows, cols // 2, dtype=torch.uint8, device=x.device)
-    a_scale = torch.empty(rows, cols // 32, dtype=torch.uint8, device=x.device)
-    flydsl_per_1x32_fp4_quant_block_rotation_mfma(
-        a, x, rot_R, a_scale, rot_transposed=rot_transposed
-    )
-    a_scale = mxfp4_moe_sort_fwd(
-        a_scale.view(dtypes.fp8_e8m0),
+    return flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort(
+        x,
+        rot_R,
         sorted_ids=sorted_ids,
         num_valid_ids=num_valid_ids,
         token_num=token_num,
-        cols=cols,
+        rot_transposed=rot_transposed,
     )
-    return a.view(dtypes.fp4x2), a_scale
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.

@@ -52,6 +52,8 @@ if is_flydsl_available():
         flydsl_per_1x32_fp4_quant_hadamard,
         flydsl_per_1x32_fp4_quant_block_rotation,
         flydsl_per_1x32_fp4_quant_block_rotation_mfma,
+        flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace,
+        flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort,
     )
 
     __all__ += [
@@ -65,4 +67,6 @@ if is_flydsl_available():
         "flydsl_per_1x32_fp4_quant_hadamard",
         "flydsl_per_1x32_fp4_quant_block_rotation",
         "flydsl_per_1x32_fp4_quant_block_rotation_mfma",
+        "flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace",
+        "flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort",
     ]
