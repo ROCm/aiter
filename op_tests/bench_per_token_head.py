@@ -1,19 +1,30 @@
 """Benchmark FP8 PER_TOKEN_HEAD batch_prefill kernel.
 
+Defaults exercise the production-target configuration: the decode-aligned
+VEC_K_COL_V_LAYOUT KV cache (5D vectorized K + 4D ColumnMajor V) plus the
+caller-supplied softmax-P scale fold. Both can be overridden via env vars.
+
 Sequence lengths can be passed as positional args.
 
 Examples:
     python op_tests/bench_per_token_head.py 1024
     python op_tests/bench_per_token_head.py 1024 16384
     BENCH_VERIFY=1 python op_tests/bench_per_token_head.py 1024
-    BENCH_KV_LAYOUT=vec_k_col_v python op_tests/bench_per_token_head.py 16384
+    BENCH_KV_LAYOUT=linear python op_tests/bench_per_token_head.py 16384
+    BENCH_P_SCALE=none python op_tests/bench_per_token_head.py 16384
 
 Environment variables:
     BENCH_VERIFY=0|1            verify outputs vs FP32 reference (default 0)
     BENCH_PAGE_SIZE=N           paged-KV page size (default 1024)
     BENCH_BYPASS_ROCM72_SKIP=1  bypass causal+soft_cap=0 skip guard (default 1)
-    BENCH_KV_LAYOUT=...         "linear" (default), "vectorized" (5D swizzled),
-                                or "vec_k_col_v" (decode-aligned: 5D K + 4D ColumnMajor V)
+    BENCH_KV_LAYOUT=...         "vec_k_col_v" (default; decode-aligned: 5D K +
+                                4D ColumnMajor V), "linear" (4D), or
+                                "vectorized" (5D swizzled)
+    BENCH_P_SCALE=...           "half" (default; constant 0.5 per q-head),
+                                "ones" (1.0 per q-head, exercises the path
+                                without changing magnitudes), "per_head_random"
+                                (uniform [0.25, 1.0] per q-head, fixed seed),
+                                or "none" (skip the p_scale fold)
 """
 
 import argparse
@@ -32,9 +43,33 @@ if int(os.environ.get("BENCH_BYPASS_ROCM72_SKIP", "1")):
 
 PAGE_SIZE = int(os.environ.get("BENCH_PAGE_SIZE", "1024"))
 VERIFY = bool(int(os.environ.get("BENCH_VERIFY", "0")))
-# KV cache memory layout: "linear" (4D), "vectorized" (5D swizzled), or
-# "vec_k_col_v" (decode-aligned: 5D vectorized K + 4D ColumnMajor V).
-KV_LAYOUT = os.environ.get("BENCH_KV_LAYOUT", "linear")
+# KV cache memory layout: "vec_k_col_v" (default; decode-aligned 5D K + 4D
+# ColumnMajor V), "linear" (4D), or "vectorized" (5D swizzled).
+KV_LAYOUT = os.environ.get("BENCH_KV_LAYOUT", "vec_k_col_v")
+# Softmax-P scale fold: see module docstring for modes.
+P_SCALE_MODE = os.environ.get("BENCH_P_SCALE", "half")
+_VALID_P_SCALE = ("none", "ones", "half", "per_head_random")
+if P_SCALE_MODE not in _VALID_P_SCALE:
+    raise SystemExit(
+        f"BENCH_P_SCALE={P_SCALE_MODE!r} is not one of {_VALID_P_SCALE}"
+    )
+
+
+def _build_p_scale(num_qo_heads):
+    """Build a [num_qo_heads] fp32 cuda tensor for the given mode, or None."""
+    if P_SCALE_MODE == "none":
+        return None
+    if P_SCALE_MODE == "ones":
+        return torch.ones(num_qo_heads, dtype=torch.float32, device="cuda")
+    if P_SCALE_MODE == "half":
+        return torch.full(
+            (num_qo_heads,), 0.5, dtype=torch.float32, device="cuda"
+        )
+    # per_head_random — fixed seed so successive runs are bit-identical.
+    g = torch.Generator(device="cuda").manual_seed(123)
+    return 0.25 + 0.75 * torch.rand(
+        num_qo_heads, dtype=torch.float32, device="cuda", generator=g
+    )
 
 DEFAULT_SEQS = (1024, 16384, 32768, 65536, 131072)
 _parser = argparse.ArgumentParser(
@@ -101,6 +136,7 @@ def _run_one(shape):
         dtype=torch.bfloat16,
         contiguous_kv=True,
         seed=42,
+        p_scale=_build_p_scale(nhq),
     )
     pth = _call_kernel(run_batch_prefill_per_token_head, **common)
     return pth
@@ -155,7 +191,7 @@ else:
 print(
     f"Config: nhq={_nhq}, nhk={_nhk}, hd={_hd}, "
     f"causal={_causal}, soft_cap={_sc}, page_size={PAGE_SIZE}, "
-    f"kv_layout={KV_LAYOUT}"
+    f"kv_layout={KV_LAYOUT}, p_scale={P_SCALE_MODE}"
 )
 _HEADER = f"{'batch':>5} | {'PER_TOKEN_HEAD':>27} {'vrf':>4}"
 print(_HEADER)

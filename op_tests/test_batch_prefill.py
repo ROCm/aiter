@@ -283,7 +283,27 @@ def construct_local_mask(
         )
 
 
-def ref_masked_attention(
+def _local_mask_rows(q_start, q_end, seqlen_q, seqlen_k, window_size, device):
+    """
+    Row-slice of construct_local_mask covering global Q indices [q_start, q_end).
+
+    This reproduces construct_local_mask semantics with key_padding_mask=None
+    and query_padding_mask=None (the only path the batch_prefill reference uses)
+    but only materializes [q_end - q_start, seqlen_k] booleans instead of the
+    full [seqlen_q, seqlen_k] mask, which would OOM at long sequences.
+    """
+    row_idx = torch.arange(q_start, q_end, device=device, dtype=torch.long).view(-1, 1)
+    col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
+    if window_size[0] < 0:
+        return col_idx > row_idx + seqlen_k - seqlen_q + window_size[1]
+    sk_t = torch.full_like(col_idx, seqlen_k)
+    return torch.logical_or(
+        col_idx > torch.minimum(row_idx + seqlen_k - seqlen_q + window_size[1], sk_t),
+        col_idx < row_idx + seqlen_k - seqlen_q - window_size[0],
+    )
+
+
+def _ref_masked_attention_unchunked(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -293,20 +313,10 @@ def ref_masked_attention(
     return_lse: bool = False,
 ) -> torch.Tensor:
     """
-    Reference implementation of masked attention.
-
-    Args:
-        query: [seqlen_q, num_heads, head_dim]
-        key: [seqlen_k, num_heads, head_dim]
-        value: [seqlen_k, num_heads, head_dim]
-        causal: whether to use causal mask
-        window_left: left window size for sliding window attention
-        logits_soft_cap: soft cap for logits (0.0 = disabled)
-        return_lse: whether to return log-sum-exp values
-
-    Returns:
-        If return_lse=False: output [seqlen_q, num_heads, head_dim]
-        If return_lse=True: (output, lse) where lse is [num_heads, seqlen_q]
+    Canonical (pre-chunking) reference implementation, kept verbatim as the
+    semantic anchor for the chunked path. Used by the equivalence test only;
+    do not call from production paths — peak memory is H * Q * K * 4 bytes
+    which OOMs at long sequences (e.g. 137 GB at H=8, Q=K=65536).
     """
     if causal:
         window_size = (window_left, 0)
@@ -318,7 +328,6 @@ def ref_masked_attention(
     seqlen_k = key.shape[0]
     scale = 1.0 / math.sqrt(head_dim)
 
-    # Compute scaled attention scores: [num_heads, seqlen_q, seqlen_k]
     attn_weights = scale * torch.einsum("qhd,khd->hqk", query.float(), key.float())
 
     if 0 < logits_soft_cap:
@@ -339,11 +348,8 @@ def ref_masked_attention(
         )
         attn_weights.masked_fill_(local_mask, float("-inf"))
 
-    # Compute LSE before softmax using torch.logsumexp
-    # This correctly handles fully-masked rows (all -inf) by returning -inf instead of nan
     if return_lse:
-        # attn_weights: [num_heads, seqlen_q, seqlen_k]
-        lse = torch.logsumexp(attn_weights, dim=-1)  # [H, Q]
+        lse = torch.logsumexp(attn_weights, dim=-1)
 
     attn_weights = torch.softmax(attn_weights, dim=-1)
     if window_size[0] >= 0 or window_size[1] >= 0:
@@ -353,6 +359,131 @@ def ref_masked_attention(
     out = torch.einsum("hqk,khd->qhd", attn_weights, value.float())
 
     if return_lse:
+        return out.to(query), lse.float()
+    return out.to(query)
+
+
+def ref_masked_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    causal: bool = False,
+    window_left: int = -1,
+    logits_soft_cap: float = 0.0,
+    return_lse: bool = False,
+    q_chunk_size: int = None,
+) -> torch.Tensor:
+    """
+    Reference implementation of masked attention with Q-dimension chunking.
+
+    Args:
+        query: [seqlen_q, num_heads, head_dim]
+        key: [seqlen_k, num_heads, head_dim]
+        value: [seqlen_k, num_heads, head_dim]
+        causal: whether to use causal mask
+        window_left: left window size for sliding window attention
+        logits_soft_cap: soft cap for logits (0.0 = disabled)
+        return_lse: whether to return log-sum-exp values
+        q_chunk_size: rows of Q processed per iteration. Default reads
+            BENCH_REF_Q_CHUNK env var (fallback 1024). Set <= 0 to disable
+            chunking (single shot over the entire Q dim).
+
+    Returns:
+        If return_lse=False: output [seqlen_q, num_heads, head_dim]
+        If return_lse=True: (output, lse) where lse is [num_heads, seqlen_q]
+
+    Memory notes:
+        Peak intermediate is the per-chunk attention matrix [H, Q_chunk, K] in
+        fp32. For H=8, K=131072, Q_chunk=1024 that's ~4 GB — fits on a 192 GB
+        MI308X with plenty of headroom. The unchunked version peaks at
+        H * seqlen_q * seqlen_k * 4 bytes which OOMs at seq=65536+ on long
+        contexts (137 GB at H=8, Q=K=65536; ~550 GB at Q=K=131072).
+    """
+    if causal:
+        window_size = (window_left, 0)
+    else:
+        window_size = (-1, -1)
+
+    head_dim = query.shape[2]
+    seqlen_q = query.shape[0]
+    seqlen_k = key.shape[0]
+    num_heads = query.shape[1]
+    scale = 1.0 / math.sqrt(head_dim)
+    device = query.device
+
+    has_local_mask = window_size[0] >= 0 or window_size[1] >= 0
+
+    # Empty-query fast path: preserve the shape behavior of the original.
+    if seqlen_q == 0:
+        out = torch.empty(0, num_heads, head_dim, device=device, dtype=query.dtype)
+        if return_lse:
+            lse = torch.empty(num_heads, 0, device=device, dtype=torch.float32)
+            return out, lse
+        return out
+
+    if q_chunk_size is None:
+        q_chunk = int(os.environ.get("BENCH_REF_Q_CHUNK", "1024"))
+    else:
+        q_chunk = int(q_chunk_size)
+    if q_chunk <= 0 or q_chunk > seqlen_q:
+        q_chunk = seqlen_q
+
+    # Materialize fp32 K/V once and reuse across all Q chunks. For H=8,
+    # K=131072, D=128 that's ~537 MB per tensor in fp32, well within budget.
+    key_f32 = key.float()
+    value_f32 = value.float()
+
+    out_chunks = []
+    lse_chunks = [] if return_lse else None
+
+    for q_start in range(0, seqlen_q, q_chunk):
+        q_end = min(q_start + q_chunk, seqlen_q)
+        q_block = query[q_start:q_end].float()
+
+        # [num_heads, q_chunk, seqlen_k]
+        attn = scale * torch.einsum("qhd,khd->hqk", q_block, key_f32)
+
+        if 0 < logits_soft_cap:
+            mode = int(os.environ.get("CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT", 0))
+            if mode == 0:
+                attn = logits_soft_cap * torch.tanh(attn / logits_soft_cap)
+            else:
+                attn = attn / (1.0 + torch.abs(attn / logits_soft_cap))
+
+        local_mask = None
+        if has_local_mask:
+            # Construct only the rows we need. Uses global Q indices so the
+            # causal/window boundary stays consistent with the unchunked path.
+            local_mask = _local_mask_rows(
+                q_start, q_end, seqlen_q, seqlen_k, window_size, device
+            )
+            attn.masked_fill_(local_mask, float("-inf"))
+
+        # LSE is computed on the post-mask, pre-softmax logits — matches the
+        # unchunked implementation. logsumexp of an all -inf row is -inf, which
+        # propagates cleanly through downstream consumers.
+        if return_lse:
+            lse_chunks.append(torch.logsumexp(attn, dim=-1))
+
+        attn = torch.softmax(attn, dim=-1)
+        if has_local_mask:
+            # Zero out fully-masked rows so softmax(all -inf) = nan becomes 0.
+            attn = attn.masked_fill(
+                torch.all(local_mask, dim=-1, keepdim=True), 0.0
+            )
+
+        # [q_chunk, num_heads, head_dim]
+        out_chunks.append(torch.einsum("hqk,khd->qhd", attn, value_f32))
+
+        # Drop chunk-local refs so the caching allocator can reuse the slot for
+        # the next iteration's [H, Q_chunk, K] tensor.
+        del attn
+        if local_mask is not None:
+            del local_mask
+
+    out = torch.cat(out_chunks, dim=0)
+    if return_lse:
+        lse = torch.cat(lse_chunks, dim=1)
         return out.to(query), lse.float()
     return out.to(query)
 
@@ -638,6 +769,89 @@ def assert_lse_matches_reference(
         rtol=rtol,
         atol=atol,
     )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("q_chunk_size", [256, 1000, 1024])
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
+def test_ref_masked_attention_chunking_equivalence(
+    causal, logits_soft_cap, return_lse, q_chunk_size, input_dtype
+):
+    """
+    Guard against silent semantic drift between the chunked
+    ref_masked_attention and the canonical unchunked implementation.
+
+    Runs at qlen=klen=4096, nhq=8, hd=128 — fits in either path. Exercises
+    causal/non-causal, soft_cap on/off, return_lse on/off, plus a couple of
+    chunk sizes including one (1000) that does not evenly divide seqlen_q so
+    the final partial chunk gets covered too.
+
+    Tolerances:
+        - fp32 input: 1e-5 (true fp32 round-off scale; chunking and unchunked
+          differ only because cuBLAS routes shape-dependent einsum kernels
+          with different reduction order in the head_dim sum).
+        - bf16 input: 1e-3 (~1 bf16 ULP at output magnitudes near 0.1, set by
+          the final out.to(query) cast back to bf16). The pre-cast fp32 math
+          is bit-identical to the fp32-input case.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA/HIP device for fp32 attention")
+
+    torch.manual_seed(0)
+    seqlen_q = seqlen_k = 4096
+    num_heads = 8
+    head_dim = 128
+    device = "cuda"
+
+    q = torch.randn(seqlen_q, num_heads, head_dim, device=device, dtype=input_dtype)
+    k = torch.randn(seqlen_k, num_heads, head_dim, device=device, dtype=input_dtype)
+    v = torch.randn(seqlen_k, num_heads, head_dim, device=device, dtype=input_dtype)
+
+    unchunked = _ref_masked_attention_unchunked(
+        q, k, v,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        return_lse=return_lse,
+    )
+    chunked = ref_masked_attention(
+        q, k, v,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        return_lse=return_lse,
+        q_chunk_size=q_chunk_size,
+    )
+
+    out_atol = 1e-5 if input_dtype == torch.float32 else 1e-3
+    # LSE is always fp32 in both paths (no output cast); use the fp32 bound.
+    lse_atol = 1e-5
+
+    if return_lse:
+        out_u, lse_u = unchunked
+        out_c, lse_c = chunked
+        out_diff = (out_u.float() - out_c.float()).abs().max().item()
+        lse_diff = (lse_u - lse_c).abs().max().item()
+        assert out_diff <= out_atol, (
+            f"chunked output diverged from unchunked: max-abs={out_diff} "
+            f"(dtype={input_dtype}, causal={causal}, "
+            f"soft_cap={logits_soft_cap}, return_lse={return_lse}, "
+            f"q_chunk_size={q_chunk_size})"
+        )
+        assert lse_diff <= lse_atol, (
+            f"chunked LSE diverged from unchunked: max-abs={lse_diff} "
+            f"(dtype={input_dtype}, causal={causal}, "
+            f"soft_cap={logits_soft_cap}, return_lse={return_lse}, "
+            f"q_chunk_size={q_chunk_size})"
+        )
+    else:
+        out_diff = (unchunked.float() - chunked.float()).abs().max().item()
+        assert out_diff <= out_atol, (
+            f"chunked output diverged from unchunked: max-abs={out_diff} "
+            f"(dtype={input_dtype}, causal={causal}, "
+            f"soft_cap={logits_soft_cap}, return_lse={return_lse}, "
+            f"q_chunk_size={q_chunk_size})"
+        )
 
 
 @pytest.mark.parametrize("input_dtype", ["bf16", "fp8"])
