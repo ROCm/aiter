@@ -274,6 +274,18 @@ def test_dispatcher_routes_fp8_fp8_stage2():
     assert type(exe).__name__ == "JitFunction"
 
 
+def test_dispatcher_routes_fp8_fp8_bf16_compiles():
+    """Stage1 bf16 compiles via the fast cshuffle epilog (no f16-only guard)."""
+    exe = compile_flydsl_moe_stage1(
+        model_dim=7168, inter_dim=512, experts=257, topk=9,
+        tile_m=64, tile_n=128, tile_k=128, doweight_stage1=False,
+        a_dtype="fp8", b_dtype="fp8", out_dtype="bf16",
+        act="silu", waves_per_eu=2,
+    )
+    assert exe is not None
+    assert type(exe).__name__ == "JitFunction"
+
+
 @pytest.mark.parametrize(
     "kwarg,bad_value,expected_match",
     [
