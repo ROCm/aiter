@@ -411,8 +411,9 @@ def run_pa_sparse_prefill_opus(
 
 _PYTEST_SHAPES = [
     # (N, H, total_pages, total_tokens)
-    (17, 64, 256, 256),
-    (64, 128, 1024, 1024),
+    (64, 16, 256, 256),  # H <= 32 exercises the 16mx1_16nx4 variant
+    (128, 32, 256, 256),
+    (64, 64, 1024, 1024),
     (256, 128, 2048, 2048),
 ]
 _PYTEST_DTYPES = [torch.bfloat16, torch.float16]
@@ -466,7 +467,7 @@ parser.add_argument(
     "--h_q",
     type=int,
     nargs="*",
-    default=[64, 128],
+    default=[16, 32, 64, 128],
     help="number of query heads H_Q (default: [64, 128])",
 )
 parser.add_argument(
@@ -480,7 +481,7 @@ parser.add_argument(
     "--total_pages",
     type=int,
     nargs="*",
-    default=[1024, 4096, 16384],
+    default=[4096, 16384],
     help=(
         "rows in unified_kv (default: [1024, 4096, 16384]). "
         "Pass 0 to mirror -n for that sweep point."
