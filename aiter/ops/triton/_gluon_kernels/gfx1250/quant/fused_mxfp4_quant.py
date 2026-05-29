@@ -110,9 +110,8 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
         w1_ptr.dtype.element_ty, [BLOCK_SIZE_N], sharedLayoutN
     )
 
-    # Load x1 and optionally res1 in parallel, then wait
+    # x1 load issued unconditionally for early latency hiding (OOB-safe for second-input programs)
     gl.amd.gfx1250.tdm.async_load(x1_desec, [start_pid * BLOCK_SIZE_M, 0], smemX1)
-    gl.amd.gfx1250.tdm.async_load(w1_desec, [0], smemW1)
 
     # Tensor descriptor and shared memory for optional residual input
     if FIRST_INPUT_RES:
@@ -154,7 +153,6 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
                 [BLOCK_SIZE_M, BLOCK_SIZE_N2],
                 sharedLayout2D,
             )
-            # Load x2 and w2 in parallel then wait for both
             w2_desec = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 w2_ptr,
                 [N2],
@@ -200,8 +198,58 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
             gl.amd.gfx1250.tdm.async_wait(0)
         return
 
-    # First input path
+    gl.amd.gfx1250.tdm.async_load(w1_desec, [0], smemW1)
+
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+
+    # Descriptor and smem for fp4 TDM async_store
+    out1_fp4_desec = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        out1_fp4_ptr,
+        [M, N1 // 2],
+        [out1_fp4_stride_m, 1],
+        [BLOCK_SIZE_M, BLOCK_SIZE_N // 2],
+        sharedLayout2D,
+    )
+    smemOutFp4 = gl.allocate_shared_memory(
+        out1_fp4_ptr.dtype.element_ty, [BLOCK_SIZE_M, BLOCK_SIZE_N // 2], sharedLayout2D
+    )
+
+    bs_offs_m = start_pid * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
+    bs_offs_n = gl.arange(0, NUM_QUANT_BLOCKS)
+    num_bs_cols = (N1 + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    if SHUFFLE:
+        bs_offs_0 = bs_offs_m[:, None] >> 5  # // 32
+        bs_offs_1 = bs_offs_m[:, None] & 31  # % 32
+        bs_offs_2 = bs_offs_1 & 15  # % 16
+        bs_offs_1 = bs_offs_1 >> 4  # // 16
+        bs_offs_3 = bs_offs_n[None, :] >> 3  # // 8
+        bs_offs_4 = bs_offs_n[None, :] & 7  # % 8
+        bs_offs_5 = bs_offs_4 & 3  # % 4
+        bs_offs_4 = bs_offs_4 >> 2  # // 4
+        bs_offs = (
+            bs_offs_1
+            + bs_offs_4 * 2
+            + bs_offs_2 * 2 * 2
+            + bs_offs_5 * 2 * 2 * 16
+            + bs_offs_3 * 2 * 2 * 16 * 4
+            + bs_offs_0 * 2 * 16 * SCALE_N_PAD
+        )
+        bs_mask_127 = (bs_offs_m < M)[:, None] & (bs_offs_n < num_bs_cols)[None, :]
+    else:
+        bs_offs = (
+            bs_offs_m[:, None] * out1_bs_stride_m
+            + bs_offs_n[None, :] * out1_bs_stride_n
+        )
+
+    bs_mask = None
+    if not EVEN_M_N:
+        if SHUFFLE_PAD:
+            bs_mask = (bs_offs_m < SCALE_M_PAD)[:, None] & (bs_offs_n < SCALE_N_PAD)[
+                None, :
+            ]
+        else:
+            bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < SCALE_N)[None, :]
+
     x1 = smemX1.load(gLayout2D).to(gl.float32)
 
     if FIRST_INPUT_RES:
@@ -237,59 +285,18 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
     out1_fp4, bs_e8m0 = _mxfp4_quant_op(
         norm1, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
     )
-    gl.amd.gfx1250.tdm.async_wait(0)
 
-    # out1_fp4 uses half-width (packed) offsets — keep as regular store
-    fp4_offs_m = start_pid * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-    half_x_offs_n = gl.arange(0, BLOCK_SIZE_N // 2)
-    out_mask1 = (half_x_offs_n < (N1 // 2))[None, :]
-    if not EVEN_M_N:
-        out_mask1 = out_mask1 & (fp4_offs_m < M)[:, None]
-
-    gl.store(
-        out1_fp4_ptr + fp4_offs_m[:, None] * out1_fp4_stride_m + half_x_offs_n[None, :],
-        out1_fp4,
-        mask=out_mask1,
-    )
-
-    # out1_bs uses non-linear shuffle offsets — keep as regular store
-    bs_offs_m = start_pid * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-    bs_offs_n = gl.arange(0, NUM_QUANT_BLOCKS)
-    num_bs_cols = (N1 + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    # Apply out-of-range scale mask
     if SHUFFLE:
-        bs_offs_0 = bs_offs_m[:, None] >> 5  # // 32
-        bs_offs_1 = bs_offs_m[:, None] & 31  # % 32
-        bs_offs_2 = bs_offs_1 & 15  # % 16
-        bs_offs_1 = bs_offs_1 >> 4  # // 16
-        bs_offs_3 = bs_offs_n[None, :] >> 3  # // 8
-        bs_offs_4 = bs_offs_n[None, :] & 7  # % 8
-        bs_offs_5 = bs_offs_4 & 3  # % 4
-        bs_offs_4 = bs_offs_4 >> 2  # // 4
-        bs_offs = (
-            bs_offs_1
-            + bs_offs_4 * 2
-            + bs_offs_2 * 2 * 2
-            + bs_offs_5 * 2 * 2 * 16
-            + bs_offs_3 * 2 * 2 * 16 * 4
-            + bs_offs_0 * 2 * 16 * SCALE_N_PAD
-        )
-        bs_mask_127 = (bs_offs_m < M)[:, None] & (bs_offs_n < num_bs_cols)[None, :]
         bs_e8m0 = gl.where(bs_mask_127, bs_e8m0, 127)
-    else:
-        bs_offs = (
-            bs_offs_m[:, None] * out1_bs_stride_m
-            + bs_offs_n[None, :] * out1_bs_stride_n
-        )
 
-    bs_mask = None
-    if not EVEN_M_N:
-        if SHUFFLE_PAD:
-            bs_mask = (bs_offs_m < SCALE_M_PAD)[:, None] & (bs_offs_n < SCALE_N_PAD)[
-                None, :
-            ]
-        else:
-            bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < SCALE_N)[None, :]
+    smemOutFp4.store(out1_fp4)
+    gl.amd.gfx1250.tdm.async_store(
+        out1_fp4_desec, [start_pid * BLOCK_SIZE_M, 0], smemOutFp4
+    )
 
     gl.store(
         out1_bs_ptr + bs_offs, bs_e8m0.to(out1_bs_ptr.type.element_ty), mask=bs_mask
     )
+
+    gl.amd.gfx1250.tdm.async_wait(0)

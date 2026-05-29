@@ -15,7 +15,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_reduce_rms_mxfp4_quant_kernel,
     _fused_dynamic_mxfp4_quant_moe_sort_kernel,
 )
-from aiter.ops.triton._gluon_kernels.gfx1250.quant.fuse_mxfp4_quant import (
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
     _gluon_fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton._triton_kernels.activation import (
@@ -28,9 +28,6 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
     _fused_reduce_rms_mxfp4_quant_kernel,
     _fused_rms_mxfp4_quant_kernel,
-)
-from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
-    _gluon_fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
