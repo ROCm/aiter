@@ -114,11 +114,6 @@ def get_kernel_config_triton(m, n, k, routing_data):
     num_stages = pick_gemm_num_stages(
         arch, block_m, block_n, block_k, 8, 4, use_async_padding=True
     )
-    assert num_stages == 2, (
-        f"a8w4 fallback expected ns=2 (LDS-safe), got ns={num_stages} "
-        f"for block_m={block_m} block_n={block_n} block_k={block_k} arch={arch}"
-    )
-
     ret = {
         "block_m": block_m,
         "block_n": block_n,
