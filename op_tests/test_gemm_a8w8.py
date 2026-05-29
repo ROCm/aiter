@@ -415,6 +415,44 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
 
 
+def _iter_flydsl_fp8_csv_cases():
+    """Yield ``test_gemm`` kwargs for every flydsl_fp8 row in the merged bpreshuffle tuned CSV.
+
+    Reuses ``test_gemm`` → ``run_gemm_ck_bpreshuffle`` (i.e. ``aiter.gemm_a8w8_bpreshuffle``);
+    the runtime dispatcher picks the FP8 row-scale 4-wave / 8-wave kernel based on
+    the tuned CSV row.
+    """
+    gfx, cu = get_gfx(), get_cu_num()
+    merged_csv = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+    if not os.path.exists(merged_csv):
+        return
+    df = pd.read_csv(merged_csv)
+    if "libtype" not in df.columns:
+        return
+    rows = df[
+        (df["gfx"] == gfx)
+        & (df["cu_num"] == cu)
+        & (df["libtype"] == "flydsl_fp8")
+    ]
+    aiter.logger.info(
+        "%d flydsl_fp8 rows for %s cu=%d from %s",
+        len(rows),
+        gfx,
+        cu,
+        os.path.basename(merged_csv),
+    )
+    for _, row in rows.iterrows():
+        yield dict(
+            dtype=dtypes.bf16,
+            m=int(row["M"]),
+            n=int(row["N"]),
+            k=int(row["K"]),
+            quantDtype=dtypes.fp8,
+            pad_a=128,
+            skip_ck=True,
+        )
+
+
 def _iter_flydsl_csv_cases():
     """Yield (test_gemm kwargs, bench metadata) for flydsl tuned CSV rows."""
     gfx, cu = get_gfx(), get_cu_num()
@@ -563,6 +601,11 @@ parser.add_argument(
     help="Skip validating flydsl shapes from tuned bpreshuffle CSVs.",
 )
 parser.add_argument(
+    "--no-flydsl-fp8-csv",
+    action="store_true",
+    help="Skip validating flydsl_fp8 (FP8 row-scale 4-wave / 8-wave) shapes from tuned bpreshuffle CSVs.",
+)
+parser.add_argument(
     "--no-legacy",
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
@@ -587,6 +630,10 @@ if not args.no_flydsl_csv:
                 written,
                 bench_csv,
             )
+
+if not args.no_flydsl_fp8_csv:
+    for kwargs in _iter_flydsl_fp8_csv_cases():
+        test_gemm(**kwargs)
 
 if not args.no_legacy:
     if args.csv is not None:

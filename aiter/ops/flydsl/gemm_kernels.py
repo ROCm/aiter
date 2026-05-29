@@ -1018,3 +1018,163 @@ def flydsl_preshuffle_gemm_a8(
         Out.copy_(out_contig)
 
     return Out
+
+
+# ---------------------------------------------------------------------------
+# FlyDSL FP8 row-scale GEMM (4-wave interleave / 8-wave ping-pong)
+# ---------------------------------------------------------------------------
+
+_flydsl_fp8_compile_fns: Optional[Dict[int, object]] = None
+_flydsl_fp8_import_done = False
+
+
+def _get_fp8_compile_fns():
+    """Lazy-import compile_fp8_gemm_{4w,8w} so the module loads even without FlyDSL."""
+    global _flydsl_fp8_compile_fns, _flydsl_fp8_import_done
+    if _flydsl_fp8_import_done:
+        return _flydsl_fp8_compile_fns
+    _flydsl_fp8_import_done = True
+    if not is_flydsl_available():
+        logger.info("[FlyDSL] not available, will fall back to CK/CKTile")
+        return None
+    try:
+        import functools as _ft
+
+        from .kernels.fp8_gemm_4wave import compile_fp8_gemm_4w
+        from .kernels.fp8_gemm_8wave import compile_fp8_gemm_8w
+        from .kernels.fp8_gemm_utils import preshuffle_b as _fp8_preshuffle_b
+
+        # FlyDSL upstream does not memoize these two compile entry points (other
+        # kernels in the same package do); without a per-(M,N,K,tile,...) cache
+        # every dispatch call re-JITs the kernel, collapsing measured TFLOPS by
+        # ~1000x. Wrap here so the dispatcher path picks up the already-compiled
+        # artifact on the second call onward.
+        _flydsl_fp8_compile_fns = {
+            4: _ft.lru_cache(maxsize=64)(compile_fp8_gemm_4w),
+            8: _ft.lru_cache(maxsize=64)(compile_fp8_gemm_8w),
+            "preshuffle_b": _fp8_preshuffle_b,
+        }
+        logger.info("[FlyDSL] loaded FP8 row-scale GEMM compilers (4-wave/8-wave)")
+    except Exception as e:
+        logger.info(
+            f"[FlyDSL] FP8 row-scale GEMM not available, will fall back to CK/CKTile: {e}"
+        )
+    return _flydsl_fp8_compile_fns
+
+
+def flydsl_fp8_gemm_rowscale(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    tile_m: int,
+    tile_n: int,
+    wave_variant: int = 8,
+    b_preshuffled: int = 0,
+    xcd_remap: int = 1,
+) -> Tensor:
+    """FP8 (e4m3fn) row-scale GEMM via FlyDSL — 4-wave interleave or 8-wave ping-pong.
+
+    Kernel constraints:
+      * gfx95* (CDNA4) only; BLOCK_K is fixed at 128.
+      * Inputs A/B: torch.float8_e4m3fn; Output: torch.bfloat16.
+      * Row scales: per-token (shape [M] for A, [N] for B), float32.
+      * 4-wave: tile_m, tile_n multiples of 16; ``xcd_remap`` selects XCD swizzle.
+      * 8-wave: tile_m >= 128 and % 128 == 0; tile_n >= 256 and % 256 == 0;
+        ``xcd_remap`` is ignored (kernel has no such knob).
+      * ``b_preshuffled``: 1 expects B in the preshuffled layout produced by
+        ``aiter.ops.flydsl.kernels.fp8_gemm_utils.preshuffle_b``.
+    """
+    fns = _get_fp8_compile_fns()
+    if fns is None:
+        raise RuntimeError("[FlyDSL] FP8 row-scale compile functions not available")
+    if wave_variant not in (4, 8):
+        raise ValueError(f"wave_variant must be 4 or 8, got {wave_variant}")
+
+    dtypes = _get_dtypes()
+    if XQ.dtype != dtypes.fp8 or WQ.dtype != dtypes.fp8:
+        raise ValueError(
+            f"[FlyDSL fp8 rowscale] A/B must be fp8 (e4m3fn); got {XQ.dtype}/{WQ.dtype}"
+        )
+    if Out.dtype != torch.bfloat16:
+        raise ValueError(
+            f"[FlyDSL fp8 rowscale] Out must be bfloat16; got {Out.dtype}"
+        )
+
+    m, k = XQ.shape[0], XQ.shape[-1]
+    # When ``b_preshuffled`` is set, the caller has already permuted B from
+    # (N, K) to the kernel layout (N/16, K/64, 4, 16, 16); recover N from
+    # WQ.shape[0] * 16 (= N) instead of taking shape[0] (= N/16) verbatim.
+    if b_preshuffled and WQ.dim() == 5:
+        n = WQ.shape[0] * WQ.shape[-2]
+        k_w = WQ.shape[1] * 64
+        if k_w != k:
+            raise RuntimeError(
+                f"[FlyDSL fp8 rowscale] inconsistent K: XQ.K={k} vs preshuffled WQ.K={k_w}"
+            )
+    else:
+        n = WQ.shape[0]
+        if WQ.shape[-1] != k:
+            raise RuntimeError(
+                f"[FlyDSL fp8 rowscale] inconsistent K: XQ.K={k} vs WQ.K={WQ.shape[-1]}"
+            )
+
+    BLOCK_K = 128
+    if k % BLOCK_K != 0:
+        raise RuntimeError(
+            f"[FlyDSL fp8 rowscale] K ({k}) must be a multiple of {BLOCK_K}"
+        )
+    if wave_variant == 8:
+        if tile_m < 128 or tile_m % 128 != 0 or tile_n < 256 or tile_n % 256 != 0:
+            raise RuntimeError(
+                f"[FlyDSL fp8 rowscale 8w] requires tile_m>=128 (mod 128) and "
+                f"tile_n>=256 (mod 256); got tile_m={tile_m}, tile_n={tile_n}"
+            )
+    else:
+        # See kernels/fp8_gemm_4wave.py:84 — BLOCK_M/N must be >= 64 and a
+        # multiple of 64 (the 2x2 wave layout + 16x16x128 MFMA atom needs at
+        # least one full 64-row/64-col wave partition per dim).
+        if tile_m < 64 or tile_m % 64 != 0 or tile_n < 64 or tile_n % 64 != 0:
+            raise RuntimeError(
+                f"[FlyDSL fp8 rowscale 4w] requires tile_m>=64 (mod 64) and "
+                f"tile_n>=64 (mod 64); got tile_m={tile_m}, tile_n={tile_n}"
+            )
+
+    if wave_variant == 8:
+        exe = fns[8](
+            M=m,
+            N=n,
+            K=k,
+            BLOCK_M=tile_m,
+            BLOCK_N=tile_n,
+            b_preshuffled=bool(b_preshuffled),
+        )
+    else:
+        exe = fns[4](
+            M=m,
+            N=n,
+            K=k,
+            BLOCK_M=tile_m,
+            BLOCK_N=tile_n,
+            use_xcd_remap=bool(xcd_remap),
+            b_preshuffled=bool(b_preshuffled),
+        )
+
+    def _as_i8(t):
+        return t.view(torch.int8) if "float8" in str(t.dtype) else t
+
+    out_contig = Out.contiguous()
+    _run_compiled(
+        exe,
+        _as_i8(XQ.contiguous()).view(-1),
+        _as_i8(WQ.contiguous()).view(-1),
+        out_contig.view(-1),
+        x_scale.contiguous().view(-1),
+        w_scale.contiguous().view(-1),
+        fx.Stream(torch.cuda.current_stream()),
+    )
+    if out_contig is not Out:
+        Out.copy_(out_contig)
+
+    return Out

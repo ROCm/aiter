@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import os
 from typing import Optional
 
 import pandas as pd
@@ -149,6 +150,151 @@ def gemm_a8w8_bpreshuffle_flydsl(
         acp,
         wpe,
         xcd,
+    )
+    return Out
+
+
+def _parse_flydsl_fp8_kernel_name(kernel_name: str):
+    """Parse tile config from a FlyDSL FP8 row-scale GEMM kernelName.
+
+    Format:
+      4-wave: ``flydsl_fp8_4w_<tm>x<tn>_<xcd|noxcd>``
+      8-wave: ``flydsl_fp8_8w_<tm>x<tn>``
+
+    Returns ``(wave_variant, tile_m, tile_n, xcd_remap)`` or ``None`` on
+    parse failure. ``xcd_remap`` is always 1 for 8-wave. B is always
+    delivered to the kernel in the ``preshuffle_b`` layout.
+    """
+    import re
+
+    m8 = re.match(r"^flydsl_fp8_8w_(\d+)x(\d+)$", kernel_name)
+    if m8 is not None:
+        return (8, int(m8.group(1)), int(m8.group(2)), 1)
+
+    m4 = re.match(r"^flydsl_fp8_4w_(\d+)x(\d+)_(xcd|noxcd)$", kernel_name)
+    if m4 is not None:
+        tm, tn, xcd = m4.group(1), m4.group(2), m4.group(3)
+        return (4, int(tm), int(tn), 1 if xcd == "xcd" else 0)
+
+    return None
+
+
+def _unshuffle_weight_16x16_fp8(w: Tensor) -> Tensor:
+    """Inverse of ``shuffle_weight(layout=(16, 16))`` for fp8 (1 byte/elem).
+
+    ``shuffle_weight`` reshapes (N, K) to (1, N/16, 16, K/32, 2, 16), permutes
+    (0, 1, 3, 4, 2, 5), and views back as (N, K). The inverse re-views the
+    shuffled storage as (1, N/16, K/32, 2, 16, 16) and applies permutation
+    (0, 1, 4, 2, 3, 5).
+    """
+    N, K_total = w.shape
+    assert N % 16 == 0 and K_total % 32 == 0, (
+        f"fp8 (16,16) un-shuffle needs N%16==0 and K%32==0, got N={N}, K={K_total}"
+    )
+    x = w.view(1, N // 16, K_total // 32, 2, 16, 16)
+    x = x.permute(0, 1, 4, 2, 3, 5).contiguous()
+    return x.view(N, K_total)
+
+
+# Per-WQ-identity cache of the (shuffle_weight((16,16)) -> row-major ->
+# preshuffle_b) round-trip. The transform is ~35 us for an N=7168 K=2048 FP8
+# weight on gfx950 and the result is consumed unmodified by the FlyDSL FP8
+# row-scale 4-wave / 8-wave kernels, so a per-tensor memoization eliminates the
+# repeated cost in the typical inference setting where ``WQ`` is a stable
+# ``nn.Module`` parameter.
+#
+# Key:   (data_ptr, shape, dtype-str) -- light, hashable, and stable while the
+#        underlying storage stays alive.
+# Value: (preshuffled_tensor, untyped_storage_ref) -- the held storage ref
+#        (i) keeps the allocator from re-using the data_ptr behind our back, and
+#        (ii) lets us cheaply re-check the storage identity on each lookup.
+#
+# Eviction is FIFO (dict insertion-order) with a max bounded by
+# ``AITER_FLYDSL_FP8_B_CACHE_SIZE`` (default 64). The cached tensor itself is
+# roughly N*K bytes (FP8 = 1 byte/elem), so 64 * 14 MB ~= 900 MB worst-case.
+_FLYDSL_FP8_B_CACHE: "dict" = {}
+
+
+def _flydsl_fp8_b_cache_max() -> int:
+    raw = os.environ.get("AITER_FLYDSL_FP8_B_CACHE_SIZE")
+    if not raw:
+        return 64
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 64
+
+
+def _get_flydsl_fp8_b(WQ: Tensor) -> Tensor:
+    """Return the FlyDSL ``preshuffle_b`` view of ``WQ``, cached per identity.
+
+    On hit the round-trip ``_unshuffle_weight_16x16_fp8 -> preshuffle_b`` is
+    skipped entirely; the held storage reference both prevents allocator reuse
+    of the same ``data_ptr`` for an unrelated tensor and is double-checked on
+    every lookup.
+    """
+    from .flydsl.kernels.fp8_gemm_utils import preshuffle_b
+
+    key = (WQ.data_ptr(), tuple(WQ.shape), str(WQ.dtype))
+    storage = WQ.untyped_storage()
+    hit = _FLYDSL_FP8_B_CACHE.get(key)
+    if hit is not None and hit[1].data_ptr() == storage.data_ptr():
+        return hit[0]
+
+    weight = _unshuffle_weight_16x16_fp8(WQ.contiguous())
+    weight = preshuffle_b(weight.contiguous()).contiguous()
+
+    cap = _flydsl_fp8_b_cache_max()
+    while len(_FLYDSL_FP8_B_CACHE) >= cap:
+        _FLYDSL_FP8_B_CACHE.pop(next(iter(_FLYDSL_FP8_B_CACHE)))
+    _FLYDSL_FP8_B_CACHE[key] = (weight, storage)
+    return weight
+
+
+def gemm_a8w8_rowscale_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    config: dict,
+) -> Tensor:
+    """Dispatch FP8 row-scale GEMM through a tuned FlyDSL 4-wave / 8-wave kernel.
+
+    ``WQ`` from the ``gemm_a8w8_bpreshuffle`` entry point is pre-shuffled via
+    ``shuffle_weight(layout=(16,16))``. The row-scale kernel always consumes
+    the ``preshuffle_b`` layout, so reconcile by inverse-shuffling back to
+    row-major and then applying ``preshuffle_b``. The per-WQ-identity cache in
+    ``_get_flydsl_fp8_b`` memoizes the result so the round-trip only runs on
+    the first call for each weight tensor.
+
+    Falls back to the CK preshuffle path on parse failure so callers always
+    get a result.
+    """
+    from .flydsl.gemm_kernels import flydsl_fp8_gemm_rowscale
+
+    kernel_name = config.get("kernelName", "")
+    parsed = _parse_flydsl_fp8_kernel_name(str(kernel_name))
+    if parsed is None:
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+    wave_variant, tm, tn, xcd_remap = parsed
+
+    weight = _get_flydsl_fp8_b(WQ)
+
+    x_scale_v = x_scale.squeeze().contiguous()
+    w_scale_v = w_scale.squeeze().contiguous()
+
+    flydsl_fp8_gemm_rowscale(
+        XQ.contiguous(),
+        weight,
+        x_scale_v,
+        w_scale_v,
+        Out,
+        tile_m=tm,
+        tile_n=tn,
+        wave_variant=wave_variant,
+        b_preshuffled=1,
+        xcd_remap=xcd_remap,
     )
     return Out
 
@@ -641,6 +787,8 @@ def gemm_a8w8_bpreshuffle(
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "flydsl" and is_flydsl_available():
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+        elif libtype == "flydsl_fp8" and is_flydsl_available():
+            return gemm_a8w8_rowscale_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
     try:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
     except RuntimeError as e:

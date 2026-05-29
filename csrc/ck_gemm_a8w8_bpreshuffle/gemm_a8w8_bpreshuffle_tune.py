@@ -41,10 +41,30 @@ except ImportError:
         return 1 << 30
 
 
+try:
+    from aiter.ops.flydsl.gemm_tune.flydsl_fp8_gemm_rowscale_common import (
+        kernels_list as kernels_list_flydsl_fp8,
+        kernel_instance_estimated_lds_bytes as flydsl_fp8_kernel_lds_bytes,
+        max_lds_bytes_for_tune as flydsl_fp8_max_lds_bytes,
+    )
+except ImportError:
+    print(
+        "[FlyDSL] flydsl_fp8_gemm_rowscale_common.py not found, flydsl_fp8 tuning disabled"
+    )
+    kernels_list_flydsl_fp8 = {}
+
+    def flydsl_fp8_kernel_lds_bytes(_ki):
+        return 0
+
+    def flydsl_fp8_max_lds_bytes():
+        return 1 << 30
+
+
 from aiter.ops.flydsl.utils import is_flydsl_available
 
 if is_flydsl_available():
     from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+    from aiter.ops.flydsl.gemm_kernels import flydsl_fp8_gemm_rowscale
 
 
 def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
@@ -155,6 +175,30 @@ def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
     return out
 
 
+def run_gemm_flydsl_fp8_rowscale(
+    x, weight_preshuffled, x_scale, w_scale, out, kernel_id
+):
+    """Runner for the FP8 row-scale 4-wave / 8-wave FlyDSL kernels.
+
+    B is always passed in the ``preshuffle_b`` layout — the row-major path
+    has been removed from the tune dimensions.
+    """
+    ki = kernels_list_flydsl_fp8[kernel_id]
+    flydsl_fp8_gemm_rowscale(
+        x,
+        weight_preshuffled,
+        x_scale,
+        w_scale,
+        out,
+        tile_m=ki.tile_m,
+        tile_n=ki.tile_n,
+        wave_variant=ki.wave_variant,
+        b_preshuffled=1,
+        xcd_remap=ki.xcd_remap,
+    )
+    return out
+
+
 def generate_data(
     m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8, is_asm=False, device="cuda"
 ):
@@ -181,10 +225,37 @@ def generate_data(
     return x, weight_shuffle, x_scale, w_scale, out, weight, bias_f32
 
 
+def generate_data_flydsl_fp8_rowscale(m, n, k, seed, dtype=dtypes.bf16, device="cuda"):
+    """Data generator for FP8 row-scale 4-wave/8-wave kernels.
+
+    Returns:
+        (x, weight_preshuffled, x_scale, w_scale, out, weight_ref, bias_f32)
+
+    B is always staged in the ``preshuffle_b`` layout — the row-major path
+    was removed from the tune dimensions.
+    """
+    from aiter.ops.flydsl.kernels.fp8_gemm_utils import preshuffle_b
+
+    torch.manual_seed(seed)
+    x = torch.randn((m, k), dtype=dtype, device=device)
+    weight = torch.randn((n, k), dtype=dtype, device=device)
+    x, x_scale = aiter.pertoken_quant(x, quant_dtype=dtypes.fp8)
+    weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=dtypes.fp8)
+    x = x.contiguous()
+    weight_preshuffled = preshuffle_b(weight.contiguous()).contiguous()
+    # Keep scale tensors as (M, 1) / (N, 1) so the shared ``run_torch`` ref can
+    # broadcast along K; ``flydsl_fp8_gemm_rowscale`` accepts either layout
+    # because it flattens scales via ``.view(-1)`` internally.
+    x_scale = x_scale.contiguous()
+    w_scale = w_scale.contiguous()
+    out = torch.empty(m, n, dtype=dtype, device=device)
+    return x, weight_preshuffled, x_scale, w_scale, out, weight, None
+
+
 def libtype_list(string):
     values = string.split(",")
     for value in values:
-        if value not in ["all", "asm", "ck", "cktile", "flydsl"]:
+        if value not in ["all", "asm", "ck", "cktile", "flydsl", "flydsl_fp8"]:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
 
@@ -212,7 +283,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             type=libtype_list,
             default=["all"],
             required=False,
-            help="choose libtype to be tuned, support ['all', 'asm', 'ck', 'cktile', 'flydsl']",
+            help="choose libtype to be tuned, support ['all', 'asm', 'ck', 'cktile', 'flydsl', 'flydsl_fp8']",
         )
 
         self.parser.add_argument(
@@ -240,6 +311,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             if kernelId not in kernels_list_flydsl:
                 return None
             return kernels_list_flydsl[kernelId].name
+        elif libtype == "flydsl_fp8":
+            if kernelId not in kernels_list_flydsl_fp8:
+                return None
+            return kernels_list_flydsl_fp8[kernelId].name
         else:
             return None
         return kernelList[kernelId].name
@@ -520,6 +595,82 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             )
         return tasks
 
+    def get_flydsl_fp8_rowscale_tune_task(
+        self,
+        info_keys,
+        seed,
+    ):
+        """Task generator for the FP8 row-scale 4-wave / 8-wave FlyDSL kernels.
+
+        Same shape filter logic as the preshuffle path: filter by tile divisibility
+        on N/K (M is padded), LDS budget, and a per-shape min CTA count to avoid
+        degenerate-tile candidates. xcd_remap is only meaningful for 4-wave.
+        """
+        gfx, cu_num, M, N, K, q_dtype_w = info_keys
+        q_dtype_eval = eval(q_dtype_w)
+        if q_dtype_eval != dtypes.fp8:
+            return []
+        if (not kernels_list_flydsl_fp8) or ("flydsl_fp8_gemm_rowscale" not in globals()):
+            return []
+
+        # generate_data_flydsl_fp8_rowscale returns:
+        # (x, weight_preshuffled, x_scale, w_scale, out, weight_ref, bias_f32)
+        # runner expects (x, weight_preshuffled, x_scale, w_scale, out)
+        kernel_data_idx = [0, 1, 2, 3, 4]
+        # torch ref expects (x, weight_ref, x_scale, w_scale, bias=None)
+        ref_data_idx = [0, 5, 2, 3, 6]
+
+        tasks = []
+        lds_limit = flydsl_fp8_max_lds_bytes()
+        padded_m = _get_padded_m(M)
+        min_ctas = max(4, min(16, N // 64))
+        for i in sorted(kernels_list_flydsl_fp8.keys()):
+            ki = kernels_list_flydsl_fp8[i]
+            # K is fixed at 128 in the kernel; reject misaligned shapes.
+            if K % ki.tile_k != 0:
+                continue
+            if N % ki.tile_n != 0:
+                continue
+            if padded_m % ki.tile_m != 0:
+                continue
+            if flydsl_fp8_kernel_lds_bytes(ki) > lds_limit:
+                continue
+            num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
+            if num_ctas < min_ctas:
+                continue
+            # xcd_remap is only meaningful for 4-wave; gate on enough CTAs.
+            if ki.wave_variant == 4 and ki.xcd_remap and num_ctas < 64:
+                continue
+
+            kernel_name = ki.name
+            info = (info_keys, i, 0, kernel_name, "flydsl_fp8")
+            tasks.append(
+                (
+                    info,
+                    generate_data_flydsl_fp8_rowscale,
+                    (M, N, K, seed, dtypes.bf16),
+                    run_gemm_flydsl_fp8_rowscale,
+                    (
+                        kernel_data_idx,
+                        i,
+                    ),
+                    {
+                        "num_warmup": args.warmup,
+                        "num_iters": args.iters,
+                    },
+                    run_torch,
+                    (
+                        ref_data_idx,
+                        dtypes.bf16,
+                    ),
+                    {},
+                    None,
+                    1e-2,
+                    0.01,
+                )
+            )
+        return tasks
+
     def tune(
         self,
         untunedf,
@@ -564,6 +715,13 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             if "all" in args.libtype or "flydsl" in args.libtype:
                 task.extend(
                     self.get_flydsl_gemm_a8w8_bpreshuffle_tune_task(
+                        info_keys,
+                        seed,
+                    )
+                )
+            if "all" in args.libtype or "flydsl_fp8" in args.libtype:
+                task.extend(
+                    self.get_flydsl_fp8_rowscale_tune_task(
                         info_keys,
                         seed,
                     )

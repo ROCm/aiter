@@ -1,0 +1,2 @@
+gfx,cu_num,M,N,K,q_dtype_w,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+gfx950,256,1024,7168,2048,torch.float8_e4m3fn,flydsl_fp8,8,0,22.4249,flydsl_fp8_4w_256x128_xcd,1340.69,1402.78,0.0

@@ -1,0 +1,2 @@
+M,N,K,q_dtype_w
+1024,7168,2048,torch.float8_e4m3fn
