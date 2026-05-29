@@ -159,7 +159,9 @@ class FmoeTuner(TunerCommon):
         return dtypes.str2bool(str(value).strip())
 
     def get_untuned_gemm_list(self, untuned_gemm_file):
-        return self._ensure_bias_column(super().get_untuned_gemm_list(untuned_gemm_file))
+        return self._ensure_bias_column(
+            super().get_untuned_gemm_list(untuned_gemm_file)
+        )
 
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
         return self._ensure_bias_column(
@@ -3130,9 +3132,7 @@ class FmoeTuner(TunerCommon):
                 )
                 if bias:
                     bias1_shape = (
-                        (expert, inter_dim * 2)
-                        if use_g1u1
-                        else (expert * inter_dim,)
+                        (expert, inter_dim * 2) if use_g1u1 else (expert * inter_dim,)
                     )
                     exp_bias1 = torch.clamp(
                         torch.randn(bias1_shape, dtype=dtype, device="cuda"),
