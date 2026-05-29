@@ -7,6 +7,7 @@ import triton.language as tl
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -170,6 +171,9 @@ def _moe_gemm_a8w4(
     stride_y_mx_m=0,
     stride_y_mx_n=0,
     HAS_MX_OUT: tl.constexpr = False,
+    # Kept for call-site compatibility. The MXFP8 emit path now derives the
+    # e8m0 scale via the shared `_mxfp8_quant_op`, which uses a power-of-two
+    # dtype-max (2**8) internally, so this value is no longer consulted.
     MX_OUT_DTYPE_MAX: tl.constexpr = 448.0,
 ):
     tl.assume(stride_y_k >= 0)
@@ -441,23 +445,14 @@ def _moe_gemm_a8w4(
         NUM_QB: tl.constexpr = OUT_BLOCK_N // 32
         out_safe = tl.where(mask, out, 0.0)
         out_3d = tl.reshape(out_safe, [BLOCK_M, NUM_QB, 32])
-        abs_3d = tl.abs(out_3d)
-        max_val = tl.max(abs_3d, axis=2, keep_dims=True)
-        dequant_scale = max_val / MX_OUT_DTYPE_MAX
-        # ROUND_UP via exponent: 2 ** ceil(log2(dequant_scale)).
-        dequant_scale_exponent = (
-            dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF
-        ) & 0x7F800000
-        dequant_scale_rounded = dequant_scale_exponent.to(tl.float32, bitcast=True)
-        quant_scale = tl.where(
-            dequant_scale_rounded == 0, 0.0, 1.0 / dequant_scale_rounded
-        )
+        # Reuse the shared MXFP8 (1x32 e8m0) scale derivation. It returns the
+        # per-group uint8 e8m0 scale and the matching fp32 multiplicative scale,
+        # both keeping the quant axis with size 1 so they broadcast over out_3d.
+        scale_e8m0, quant_scale = _mxfp8_quant_op(out_3d, QUANT_AXIS=2)
         quant_tensor = out_3d * quant_scale
         quant_2d = tl.reshape(quant_tensor, [BLOCK_M, OUT_BLOCK_N])
         tl.store(YPtrs, quant_2d.to(Y.dtype.element_ty), mask=mask)
-        # Extract biased exponent (top 8 bits >> 23) as uint8 ue8m0 scale.
-        scale_exp_3d = (dequant_scale_exponent >> 23).to(tl.uint8)
-        scale_exp_2d = tl.reshape(scale_exp_3d, [BLOCK_M, NUM_QB])
+        scale_exp_2d = tl.reshape(scale_e8m0, [BLOCK_M, NUM_QB])
         offs_s_n = NUM_QB * pid_n + tl.arange(0, NUM_QB)
         mask_s_n = offs_s_n < tl.cdiv(yN, 32)
         YMxScalePtrs = (
