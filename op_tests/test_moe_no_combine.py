@@ -853,6 +853,7 @@ def test_w4a8_flydsl_no_combine_returns_finite_per_slot_output(monkeypatch):
         quant_type=QuantType.per_1x32,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        mxfp4_activation_dtype="fp8",
         no_combine=True,
     )
 
