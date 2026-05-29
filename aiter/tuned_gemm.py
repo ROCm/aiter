@@ -327,6 +327,27 @@ def gemm_a16w16(
         out = out.view(*A.shape[:-1], B.shape[0])
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
+    if os.environ.get("AITER_GROUPED_DEBUG", "0") not in ("", "0", "false", "False"):
+        try:
+            _af = inp_view.float()
+            _bf = B.float()
+            _of = out.float()
+            _bi = None if bias is None else bias.float()
+            print(
+                f"[gemm-debug] M={m} N={n} K={k} libtype={config['libtype'] if config is not None else None} "
+                f"a.dtype={inp_view.dtype} a.ptr=0x{inp_view.data_ptr():x} "
+                f"a.finite={bool(torch.isfinite(_af).all().item())} "
+                f"a.min={float(_af.min().item())} a.max={float(_af.max().item())} "
+                f"b.dtype={B.dtype} b.finite={bool(torch.isfinite(_bf).all().item())} "
+                f"b.min={float(_bf.min().item())} b.max={float(_bf.max().item())} "
+                f"bias.finite={None if _bi is None else bool(torch.isfinite(_bi).all().item())} "
+                f"out.finite={bool(torch.isfinite(_of).all().item())} "
+                f"out.min={float(_of.min().item())} out.max={float(_of.max().item())} "
+                f"a.row0[:8]={_af.reshape(-1, k)[0, :8].tolist()}",
+                flush=True,
+            )
+        except Exception as _e:
+            print(f"[gemm-debug] err: {_e}", flush=True)
     save_shapes(
         m,
         n,

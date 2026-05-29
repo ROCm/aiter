@@ -554,12 +554,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("AITER_DISABLE_GROUPED_A8W4 enabled; skip grouped mode")
         return None
     os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "default"
-    if expert_mask is not None or bias1 is not None or bias2 is not None:
-        _grouped_dbg("bias1 and bias not none")
-        # return None
+    # if expert_mask is not None or bias1 is not None or bias2 is not None:
+    #     _grouped_dbg("bias1 and bias not none")
+    #     return None
     if hidden_pad != 0 or intermediate_pad != 0:
         _grouped_dbg("haspad")
-        return None
+        # return None
     if not isG1U1 or quant_type != QuantType.per_1x32:
         _grouped_dbg("not g1u1 or not 1x32")
         return None
@@ -726,8 +726,21 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     warp_tile_n = tile_n // n_warp
 
     flat_experts = topk_ids.reshape(-1).to(torch.long)
+    print(flat_experts)
     if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
-        raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
+        bad = flat_experts[(flat_experts < 0) | (flat_experts >= E)]
+        good_mask = (flat_experts >= 0) & (flat_experts < E)
+        good_vals = flat_experts[good_mask]
+        unique_good = torch.unique(good_vals)[:16].tolist() if good_vals.numel() else []
+        total = flat_experts.numel()
+        good = total - bad.numel()
+        raise ValueError(
+            f"grouped a8w4 path expects local expert ids in [0, {E}); "
+            f"topk_ids.shape={tuple(topk_ids.shape)}, total={total}, "
+            f"good={good}, bad={bad.numel()}, "
+            f"min={int(flat_experts.min())}, max={int(flat_experts.max())}, "
+            f"bad_sample={bad[:8].tolist()}, unique_good={unique_good}"
+        )
     counts = torch.bincount(flat_experts, minlength=E)
     max_m = int(counts.max().item()) if counts.numel() else 0
     max_m = max(warp_tile_m, ((max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m)
@@ -861,6 +874,27 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         stage1_weight_layout=stage1_weight_layout,
     )
     _grouped_dbg("stage1 compile done; start launch")
+    # Forward bias1 into the FlyDSL grouped stage1 kernel. The kernel
+    # accepts an optional ``bias`` keyword of shape (E, 2*inter_dim) with
+    # dtype matching the output tensor (bf16/f16). Upstream typically
+    # passes bias1 as fp32 in ``(E, 2*inter_dim)`` (gate||up under
+    # ``gguu`` layout, interleaved under ``gugu``); we cast/reshape here
+    # so the kernel's gate/up offsets line up with the weight layout
+    # selected above (see ``stage1_weight_layout``).
+    bias1_kernel = None
+    if bias1 is not None and bias1.numel() > 0:
+        bias1_kernel = bias1.to(device=device, dtype=dtype).contiguous()
+        if bias1_kernel.dim() != 2 or tuple(bias1_kernel.shape) != (E, 2 * inter_dim):
+            if bias1_kernel.numel() != E * 2 * inter_dim:
+                raise ValueError(
+                    f"bias1 has {bias1_kernel.numel()} elements, expected {E * 2 * inter_dim} "
+                    f"for grouped stage1 (E={E}, 2*inter_dim={2 * inter_dim})"
+                )
+            bias1_kernel = bias1_kernel.view(E, 2 * inter_dim)
+        _grouped_dbg(
+            f"stage1 bias attached: shape={tuple(bias1_kernel.shape)} "
+            f"dtype={bias1_kernel.dtype} layout={stage1_weight_layout}"
+        )
     stage1(
         grouped_a2,
         grouped_a1,
@@ -873,6 +907,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         model_dim,
         E,
         stream=torch.cuda.current_stream(),
+        bias=bias1_kernel,
     )
     _grouped_dbg("stage1 launch returned")
     if doweight_stage1:
@@ -937,6 +972,21 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         expert_sched_mode=False,
     )
     _grouped_dbg("stage2 compile done; start launch")
+    # Forward bias2 into the FlyDSL grouped stage2 kernel. Shape is
+    # (E, model_dim) with dtype matching the output (bf16/f16).
+    bias2_kernel = None
+    if bias2 is not None and bias2.numel() > 0:
+        bias2_kernel = bias2.to(device=device, dtype=dtype).contiguous()
+        if bias2_kernel.dim() != 2 or tuple(bias2_kernel.shape) != (E, model_dim):
+            if bias2_kernel.numel() != E * model_dim:
+                raise ValueError(
+                    f"bias2 has {bias2_kernel.numel()} elements, expected {E * model_dim} "
+                    f"for grouped stage2 (E={E}, model_dim={model_dim})"
+                )
+            bias2_kernel = bias2_kernel.view(E, model_dim)
+        _grouped_dbg(
+            f"stage2 bias attached: shape={tuple(bias2_kernel.shape)} dtype={bias2_kernel.dtype}"
+        )
     stage2(
         grouped_out,
         grouped_a2_payload,
@@ -949,6 +999,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         inter_dim,
         E,
         stream=torch.cuda.current_stream(),
+        bias=bias2_kernel,
     )
     _grouped_dbg("stage2 launch returned")
 
