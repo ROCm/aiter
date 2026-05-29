@@ -36,7 +36,6 @@ from aiter.aot.flydsl.common import (
     override_env,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.utility import dtypes
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
     _ptr_view_safe,
@@ -73,6 +72,15 @@ def _row_swiglu_limit(row: dict[str, str]) -> float:
     return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit") or 0.0
 
 
+def _parse_bool(value: str) -> bool:
+    value = value.strip()
+    if value in ("True", "1"):
+        return True
+    if value in ("False", "0"):
+        return False
+    raise ValueError(f"unsupported bool value: {value!r}")
+
+
 def parse_csv(csv_path: str):
     """Parse the CSV and return a list of unique compile jobs.
 
@@ -104,7 +112,7 @@ def parse_csv(csv_path: str):
                 else "silu"
             )
             swiglu_limit = _row_swiglu_limit(row)
-            enable_bias_options = [dtypes.str2bool(row.get("bias", "False").strip())]
+            enable_bias_options = [_parse_bool(row.get("bias", "False"))]
 
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
