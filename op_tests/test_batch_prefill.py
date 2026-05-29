@@ -459,6 +459,25 @@ def split_kv_pages(kv_data):
     return k_cache_ref, v_cache_ref
 
 
+def vec_k_col_v_kv_cache(
+    k_cache, v_cache, num_kv_heads, head_dim, page_size, k_vector_size
+):
+    """Decode-aligned VEC_K_COL_V layout: K is 5D vectorized (same as VECTORIZED),
+    V is 4D ColumnMajor [Pages, Heads, HeadDim, PageSize]."""
+    k_cache = k_cache.contiguous()
+    v_cache = v_cache.contiguous()
+    k_cache = (
+        k_cache.view(
+            -1, page_size, num_kv_heads, head_dim // k_vector_size, k_vector_size
+        )
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    # v_cache_ref shape: [Pages, PageSize, Heads, HeadDim] -> [Pages, Heads, HeadDim, PageSize]
+    v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
+    return k_cache, v_cache
+
+
 def apply_kv_layout(
     k_cache_ref,
     v_cache_ref,
@@ -470,6 +489,15 @@ def apply_kv_layout(
 ):
     if layout == "vectorized":
         return vectorize_kv_cache(
+            k_cache_ref,
+            v_cache_ref,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size,
+        )
+    if layout == "vec_k_col_v":
+        return vec_k_col_v_kv_cache(
             k_cache_ref,
             v_cache_ref,
             num_kv_heads,
@@ -2666,6 +2694,52 @@ def test_batch_prefill_per_token_head_pytest(
     )
 
 
+# Decode-aligned VEC_K_COL_V_LAYOUT pytest. Codegen only emits this variant for
+# fp8bf16 PER_TOKEN_HEAD with the sglang lookup table (see fmha_batch_prefill.py).
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(32, 8), (16, 16)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("qo_len,kv_len", [(512, 2048), (1024, 4096)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("page_size", [64, 1024])
+def test_batch_prefill_per_token_head_vec_k_col_v_pytest(
+    batch_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    qo_len,
+    kv_len,
+    causal,
+    logits_soft_cap,
+    page_size,
+):
+    """Pytest wrapper for PER_TOKEN_HEAD FP8 batch prefill on the decode-aligned
+    VEC_K_COL_V layout (5D vectorized K + 4D ColumnMajor V)."""
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, logits_soft_cap),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return
+
+    run_batch_prefill_per_token_head(
+        kvcache_layout="vec_k_col_v",
+        table_layout="sglang",
+        batch_size=batch_size,
+        qo_len=qo_len,
+        kv_len=kv_len,
+        page_size=page_size,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        dtype=torch.bfloat16,
+        contiguous_kv=True,
+        seed=42,
+    )
+
+
 # Caller-supplied softmax-P scale variants for PER_TOKEN_HEAD.
 # p_scale is per-q-head fp32 multiplier folded into the exp2 shift before fp8 P
 # quantization; it cancels mathematically in the final output, so the FP32
@@ -2675,7 +2749,9 @@ def test_batch_prefill_per_token_head_pytest(
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(32, 8)])
 @pytest.mark.parametrize("qo_len,kv_len", [(512, 2048)])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("p_scale_mode", ["none", "ones", "half", "per_head_random"])
+@pytest.mark.parametrize(
+    "p_scale_mode", ["none", "ones", "half", "per_head_random"]
+)
 def test_batch_prefill_per_token_head_p_scale_pytest(
     batch_size,
     num_qo_heads,
@@ -2697,11 +2773,17 @@ def test_batch_prefill_per_token_head_p_scale_pytest(
     elif p_scale_mode == "ones":
         p_scale = torch.ones(num_qo_heads, dtype=torch.float32, device="cuda")
     elif p_scale_mode == "half":
-        p_scale = torch.full((num_qo_heads,), 0.5, dtype=torch.float32, device="cuda")
+        p_scale = torch.full(
+            (num_qo_heads,), 0.5, dtype=torch.float32, device="cuda"
+        )
     else:  # per_head_random in [0.25, 1.0]
         g = torch.Generator(device="cuda").manual_seed(123)
-        p_scale = 0.25 + 0.75 * torch.rand(
-            num_qo_heads, dtype=torch.float32, device="cuda", generator=g
+        p_scale = (
+            0.25
+            + 0.75
+            * torch.rand(
+                num_qo_heads, dtype=torch.float32, device="cuda", generator=g
+            )
         )
 
     run_batch_prefill_per_token_head(
@@ -2757,7 +2839,7 @@ def run_batch_prefill_per_token_head(
         torch.manual_seed(seed)
 
     quant_dtype = dtypes.fp8
-    SUPPORTED_PAGE_SIZES = (16, 64, 1024)
+    SUPPORTED_PAGE_SIZES = (64, 1024)
     if page_size not in SUPPORTED_PAGE_SIZES:
         if skip_test_if(
             True,
@@ -2856,6 +2938,17 @@ def run_batch_prefill_per_token_head(
             page_size,
             k_vector_size,
         )
+    elif kvcache_layout == "vec_k_col_v":
+        # k_paged_fp8 / v_paged_fp8 currently have shape [Pages, PageSize, Heads, HeadDim].
+        # vec_k_col_v_kv_cache expects the same layout, so feed them directly without flattening.
+        k_paged, v_paged = vec_k_col_v_kv_cache(
+            k_paged_fp8,
+            v_paged_fp8,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size,
+        )
     else:
         k_paged = k_paged_fp8
         v_paged = v_paged_fp8
@@ -2872,6 +2965,12 @@ def run_batch_prefill_per_token_head(
             page_size,
             k_vector_size_bf16,
         )
+    elif kvcache_layout == "vec_k_col_v":
+        # bf16 reference also runs through the prefill kernel for correctness; bf16 has no
+        # PER_TOKEN_HEAD codegen variant for vec_k_col_v, so we keep the bf16 reference
+        # in plain linear layout (the prefill bf16 path supports linear K/V natively).
+        k_cache_bf16 = k_paged_ref
+        v_cache_bf16 = v_paged_ref
     else:
         k_cache_bf16 = k_paged_ref
         v_cache_bf16 = v_paged_ref

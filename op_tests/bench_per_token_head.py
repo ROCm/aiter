@@ -6,11 +6,14 @@ Examples:
     python op_tests/bench_per_token_head.py 1024
     python op_tests/bench_per_token_head.py 1024 16384
     BENCH_VERIFY=1 python op_tests/bench_per_token_head.py 1024
+    BENCH_KV_LAYOUT=vec_k_col_v python op_tests/bench_per_token_head.py 16384
 
 Environment variables:
     BENCH_VERIFY=0|1            verify outputs vs FP32 reference (default 0)
     BENCH_PAGE_SIZE=N           paged-KV page size (default 1024)
     BENCH_BYPASS_ROCM72_SKIP=1  bypass causal+soft_cap=0 skip guard (default 1)
+    BENCH_KV_LAYOUT=...         "linear" (default), "vectorized" (5D swizzled),
+                                or "vec_k_col_v" (decode-aligned: 5D K + 4D ColumnMajor V)
 """
 
 import argparse
@@ -29,8 +32,8 @@ if int(os.environ.get("BENCH_BYPASS_ROCM72_SKIP", "1")):
 
 PAGE_SIZE = int(os.environ.get("BENCH_PAGE_SIZE", "1024"))
 VERIFY = bool(int(os.environ.get("BENCH_VERIFY", "0")))
-# KV cache memory layout: "linear" (4D) or "vectorized" (5D swizzled).
-# Vectorized is the production layout used by serving frameworks.
+# KV cache memory layout: "linear" (4D), "vectorized" (5D swizzled), or
+# "vec_k_col_v" (decode-aligned: 5D vectorized K + 4D ColumnMajor V).
 KV_LAYOUT = os.environ.get("BENCH_KV_LAYOUT", "linear")
 
 DEFAULT_SEQS = (1024, 16384, 32768, 65536, 131072)

@@ -146,6 +146,70 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
         TORCH_CHECK(v_stride_batch % k_vector_size == 0,
                     "V batch stride must be a multiple of vector size");
     }
+    else if(kv_memory_layout ==
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VEC_K_COL_V_LAYOUT)
+    {
+        // Decode-aligned: K is 5D vectorized, V is 4D ColumnMajor.
+        TORCH_CHECK(k.dim() == 5,
+                    "K tensor must be 5D [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, "
+                    "kVectorSize] for VEC_K_COL_V layout");
+        TORCH_CHECK(v.dim() == 4,
+                    "V tensor must be 4D [NumBlocks, NumHeads, HeadDim, PageSize] for "
+                    "VEC_K_COL_V layout");
+
+        // K strides: identical to VECTORIZED branch above; stride_k carries the PageSize
+        // stride (= kVectorSize for vectorized K).
+        stride_k = k.stride(-2);
+        TORCH_CHECK(stride_k == k_vector_size,
+                    "stride_k (PageSize stride) must be ",
+                    k_vector_size,
+                    " in 5D vectorized K");
+        TORCH_CHECK(k.stride(4) == 1 && k.size(-1) == k_vector_size,
+                    "K last dim must be ",
+                    k_vector_size,
+                    " and contiguous");
+        TORCH_CHECK(k.stride(3) == k_vector_size,
+                    "K page stride must be ",
+                    k_vector_size,
+                    " in 5D vectorized layout");
+        TORCH_CHECK(k.stride(2) == static_cast<int64_t>(page_block_size) * k_vector_size,
+                    "K head-dim stride must be page_size * vector_size");
+        TORCH_CHECK(k.stride(1) >= static_cast<int64_t>(d) * page_block_size,
+                    "K head stride must be >= head_dim * page_size");
+        TORCH_CHECK(k.stride(0) >= static_cast<int64_t>(h_k) * k.stride(1),
+                    "K batch stride must be >= num_heads * head_stride");
+        TORCH_CHECK(k.stride(1) % k_vector_size == 0,
+                    "K head stride must be a multiple of vector size");
+        TORCH_CHECK(k.stride(0) % k_vector_size == 0,
+                    "K batch stride must be a multiple of vector size");
+
+        // V strides for [NumBlocks, NumHeads, HeadDim, PageSize]:
+        // - dim 3 (PageSize) is contiguous (stride 1)
+        // - dim 2 (HeadDim) stride = page_block_size — the kernel uses this directly via
+        //   make_naive_tensor_view (see fmha_batch_prefill_kernel.hpp)
+        // - dim 1 (NumHeads) is folded into v_ptr per-head (nhead_stride_v = HeadDim*PageSize)
+        // - dim 0 (NumBlocks) stride is the per-page stride (batch_stride_v)
+        // We pass `stride_v = 1` (the per-token stride for the kernel's V offset transform).
+        const int64_t v_stride_batch = v.stride(0);
+        const int64_t v_stride_head  = v.stride(1);
+        const int64_t v_stride_dim   = v.stride(2);
+        const int64_t v_stride_tok   = v.stride(3);
+
+        TORCH_CHECK(v_stride_tok == 1,
+                    "V innermost (PageSize) stride must be 1 in VEC_K_COL_V layout");
+        TORCH_CHECK(v_stride_dim == static_cast<int64_t>(page_block_size),
+                    "V HeadDim stride must equal page_block_size in VEC_K_COL_V layout");
+        TORCH_CHECK(v_stride_head >= static_cast<int64_t>(d_v) * page_block_size,
+                    "V head stride must be >= head_dim * page_size");
+        TORCH_CHECK(v_stride_batch >= static_cast<int64_t>(h_k) * v_stride_head,
+                    "V batch stride must be >= num_heads * head_stride");
+        TORCH_CHECK(v_stride_head % k_vector_size == 0,
+                    "V head stride must be a multiple of vector size");
+        TORCH_CHECK(v_stride_batch % k_vector_size == 0,
+                    "V batch stride must be a multiple of vector size");
+
+        stride_v = 1;
+    }
     else
     {
         if(k.dim() == 4)
@@ -242,13 +306,15 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     ck_tile::index_t stride_o       = out.stride(-3);
     ck_tile::index_t stride_randval = has_dropout_randval ? dropout_randval.stride(1) : 0;
 
-    ck_tile::index_t nhead_stride_q       = q.stride(-2);
+    ck_tile::index_t nhead_stride_q = q.stride(-2);
     const bool is_vectorized_layout =
         kv_memory_layout == ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT;
-    // Vectorized: head dim at index 1. Linear: head dim at index 2.
+    const bool is_vec_k_col_v_layout =
+        kv_memory_layout == ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VEC_K_COL_V_LAYOUT;
+    // Vectorized / VEC_K_COL_V: K head dim at index 1. Linear: head dim at index 2 (4D) or 1 (3D).
     ck_tile::index_t nhead_stride_k;
     ck_tile::index_t nhead_stride_v;
-    if(is_vectorized_layout)
+    if(is_vectorized_layout || is_vec_k_col_v_layout)
     {
         nhead_stride_k = k.stride(1);
         nhead_stride_v = v.stride(1);
@@ -340,6 +406,10 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.page_block_size   = page_block_size;
     args.kv_memory_layout  = kv_memory_layout;
     args.kv_lookup_table   = ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D;
+    // VEC_K_COL_V is the only layout in which V is logically transposed (ColumnMajor);
+    // every other layout keeps V as RowMajor.
+    args.is_v_rowmajor =
+        (kv_memory_layout != ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VEC_K_COL_V_LAYOUT);
     args.kv_indptr         = kv_indptr.data_ptr();
     args.kv_page_indices   = kv_page_indices.data_ptr();
     args.kv_last_page_lens = kv_last_page_lens_ptr;
@@ -625,12 +695,9 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     int head_size_v     = 0;
     int num_blocks      = 0;
 
-    if(k.dim() == 5)
+    if(k.dim() == 5 && v.dim() == 5)
     {
         kv_memory_layout = ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT;
-        TORCH_CHECK(
-            v.dim() == 5,
-            "V tensor must be 5D [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize]");
 
         // K: [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]
         num_heads_k     = k.size(1);
@@ -641,6 +708,32 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
 
         // V: [NumBlocks, NumHeads, PageSize/kVector_size, HeadDim, kVector_size]
         head_size_v = v.size(3);
+        num_blocks  = k.size(0);
+    }
+    else if(k.dim() == 5 && v.dim() == 4)
+    {
+        // Decode-aligned VEC_K_COL_V_LAYOUT: K is 5D vectorized (same as VECTORIZED_LAYOUT)
+        // and V is 4D ColumnMajor [NumBlocks, NumHeads, HeadDim, PageSize] — produced by
+        // aiter's reshape_and_cache_kernel and consumed by the decode paged-attention
+        // kernel without an intermediate reshape.
+        kv_memory_layout = ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VEC_K_COL_V_LAYOUT;
+
+        // K: [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]
+        num_heads_k     = k.size(1);
+        page_block_size = k.size(3);
+        TORCH_CHECK(page_block_size % k_vector_size == 0,
+                    "Vectorized KV requires page size divisible by ",
+                    k_vector_size);
+
+        // V: [NumBlocks, NumHeads, HeadDim, PageSize]; PageSize must match K.size(3).
+        TORCH_CHECK(v.size(0) == k.size(0),
+                    "V num_blocks must match K num_blocks for VEC_K_COL_V layout");
+        TORCH_CHECK(v.size(1) == num_heads_k,
+                    "V num_heads must match K num_heads for VEC_K_COL_V layout");
+        TORCH_CHECK(v.size(3) == page_block_size,
+                    "V innermost (PageSize) dim must equal K.size(3) (page_block_size) for "
+                    "VEC_K_COL_V layout");
+        head_size_v = v.size(2);
         num_blocks  = k.size(0);
     }
     else if(k.dim() == 4)
@@ -751,6 +844,18 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                     page_block_size / k_vector_size,
                     head_size_v,
                     k_vector_size);
+    }
+    else if(kv_memory_layout ==
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VEC_K_COL_V_LAYOUT)
+    {
+        // K: 5D vectorized (same as VECTORIZED); V: 4D ColumnMajor.
+        CHECK_SHAPE(k,
+                    num_blocks,
+                    num_heads_k,
+                    head_size_q / k_vector_size,
+                    page_block_size,
+                    k_vector_size);
+        CHECK_SHAPE(v, num_blocks, num_heads_k, head_size_v, page_block_size);
     }
     else
     {
