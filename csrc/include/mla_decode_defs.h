@@ -51,7 +51,7 @@ template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 32,
          int D_TILE_SIZE_ = 576,
          int V_D_TILE_SIZE_ = 512,
-         int NUM_WARPS_ = 4,
+         int NUM_WARPS_ = 8,
          typename D_ATTN_ = bf16_t>
 struct mla_decode_ps_traits {
     static constexpr int Q_TILE_SIZE   = Q_TILE_SIZE_;
@@ -99,18 +99,51 @@ struct mla_decode_ps_traits {
     static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
 
-    static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);
+    static constexpr int D_128B_SIZE        = 128 / sizeof(D_ATTN);
     static_assert(VEC_KV == 16 / sizeof(D_ATTN));
-    static constexpr int smem_linear_wave   = WARP_SIZE * 16 / sizeof(D_ATTN);
-    static constexpr int smem_n_per_wave    = smem_linear_wave / D_128B_SIZE;
-    static constexpr int smem_n_rpt         = KV_TILE_SIZE / smem_n_per_wave;
-    static constexpr int smem_d_rpt         = D_TILE_SIZE   / D_128B_SIZE; // K-side  (full row in smem)
-    static constexpr int smem_v_d_rpt       = V_D_TILE_SIZE / D_128B_SIZE; // V-side  (prefix only)
+    static constexpr int smem_linear_wave   = WARP_SIZE * 16 / sizeof(D_ATTN); // 64*16/2 = 512
+    static constexpr int smem_n_per_wave    = smem_linear_wave / D_128B_SIZE;  // 512/64 = 8
+    static constexpr int smem_n_rpt         = KV_TILE_SIZE / smem_n_per_wave;  // 32/8  = 4
+    static constexpr int smem_d_rpt         = D_TILE_SIZE   / D_128B_SIZE;     // K side full row -> 9 (D=576)
+    static constexpr int smem_v_d_rpt       = V_D_TILE_SIZE / D_128B_SIZE;     // V side prefix   -> 8 (V=512)
+    static constexpr int smem_d_rpt_tail    = smem_d_rpt - smem_v_d_rpt;       // rope tail chunks -> 1 (D-V=64)
     static constexpr int smem_padding_32B   = 32 / sizeof(D_ATTN);
     static constexpr int smem_kv_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
 
-    // We load the full KV row (D_TILE_SIZE) once per tile.
-    static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE)   / (BLOCK_SIZE * VEC_KV);
+    // ----- KV gmem->smem two-stage load -----
+    // The gmem->smem KV load partitions the D-axis across `warps_d` warp groups,
+    // and each thread issues `chunks_per_warp_d` chunk loads. For D=576 with
+    // NUM_WARPS=8 -> warps_d=2, 9/2=4.5 doesn't divide cleanly.  We split the
+    // load into two stages so every stage divides cleanly:
+    //
+    //   stage 1 (main):  KV_TILE x V_D_TILE_SIZE  (32x512) -- 8 chunks, 8 warps,
+    //                    chunks_per_warp_d = smem_v_d_rpt / warps_d = 8/2 = 4 ?
+    //                    every warp/thread participates.
+    //
+    //   stage 2 (tail):  KV_TILE x (D-V)         (32x64)  -- 1 chunk, only the
+    //                    first `smem_n_rpt` warps (warps 0..smem_n_rpt-1) issue
+    //                    the load; warps `[smem_n_rpt, NUM_WARPS)` skip the
+    //                    tail entirely. Each active thread issues 1 vec-load
+    //                    (active threads = smem_n_rpt x WARP_SIZE = 4x64 = 256;
+    //                     vec-loads needed = 32 rows x 64 dim / 8 vec = 256 ?).
+    static constexpr int warps_d_for_load   = NUM_WARPS / smem_n_rpt;
+    static_assert(warps_d_for_load * smem_n_rpt == NUM_WARPS,
+                  "NUM_WARPS must be a multiple of smem_n_rpt");
+    static_assert(smem_v_d_rpt % warps_d_for_load == 0,
+                  "V_D_TILE_SIZE/D_128B_SIZE must be divisible by warps_d (NUM_WARPS/smem_n_rpt) "
+                  "for the main-stage KV load to divide cleanly");
+    static_assert((D_TILE_SIZE - V_D_TILE_SIZE) == D_128B_SIZE,
+                  "rope tail must be exactly one 128B D-chunk");
+
+    static constexpr int kv_buffer_load_insts_main =
+        (KV_TILE_SIZE * V_D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
+    static constexpr int kv_buffer_load_insts_tail =
+        (KV_TILE_SIZE * (D_TILE_SIZE - V_D_TILE_SIZE)) / (smem_n_rpt * WARP_SIZE * VEC_KV);
+    // Per-active-thread total issue count = main + tail (used by waitcnt math).
+    // Warps in [smem_n_rpt, NUM_WARPS) only issue `kv_buffer_load_insts_main`,
+    // but vmcnt is per-thread and tracks each thread's own issued loads.
+    static constexpr int kv_buffer_load_insts = kv_buffer_load_insts_main + kv_buffer_load_insts_tail;
+
     static constexpr int k_ds_read_insts      = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts      = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
 

@@ -97,14 +97,19 @@ __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h) {
         opus::unfold_p_coord(o_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
 }
 
-// Create layout for loading K matrix from global memory
+// --- Two-stage gmem->smem KV load layouts -------------------------------------
+//
+// Stage 1 (main): KV_TILE x V_D_TILE_SIZE = 32x512 (= 8 D-chunks).
+//   All NUM_WARPS warps participate; chunks/warp_d = smem_v_d_rpt / warps_d
+//   = 8 / 2 = 4 divides cleanly.  Same shape pattern as `make_layout_gkv`,
+//   just with `smem_d_rpt -> smem_v_d_rpt`.
 template<typename T>
-__device__ inline auto make_layout_gkv(int warp_id, int lane_id) {
+__device__ inline auto make_layout_gkv_main(int warp_id, int lane_id) {
     constexpr int threads_d = T::D_128B_SIZE / T::VEC_KV;
-    constexpr int warps_d = T::NUM_WARPS / T::smem_n_rpt;
+    constexpr int warps_d   = T::warps_d_for_load;
 
     constexpr auto gk_block_shape = opus::make_tuple(
-        opus::number<T::smem_d_rpt / warps_d>{},
+        opus::number<T::smem_v_d_rpt / warps_d>{},
         opus::number<warps_d>{},
         opus::number<threads_d>{},
         opus::number<T::VEC_KV>{});
@@ -119,11 +124,37 @@ __device__ inline auto make_layout_gkv(int warp_id, int lane_id) {
         opus::unfold_p_coord(gk_block_dim, opus::tuple{warp_id / T::smem_n_rpt, lane_id % threads_d}));
 }
 
-// Create layout for storing K matrix to shared memory
+// Stage 2 (tail): KV_TILE x (D-V) = 32x64 = 1 D-chunk.  Only the first
+// `smem_n_rpt` warps (warps 0..smem_n_rpt-1) issue this load -- see the
+// `if (warp_id < T::smem_n_rpt)` gate at every call site. Warps in
+// [smem_n_rpt, NUM_WARPS) skip the tail entirely.
 template<typename T>
-__device__ inline auto make_layout_skv(int warp_id) {
+__device__ inline auto make_layout_gkv_tail(int /*warp_id*/, int lane_id) {
+    constexpr int threads_d = T::D_128B_SIZE / T::VEC_KV;
+
+    // shape ? (1 chunk_in_D, threads_d, VEC_KV) -- drop the warps_d dim because
+    // the tail is a single chunk handled by warp_d_group 0 only.
+    constexpr auto gk_tail_shape = opus::make_tuple(
+        opus::number<T::smem_d_rpt_tail>{},
+        opus::number<threads_d>{},
+        opus::number<T::VEC_KV>{});
+
+    constexpr auto gk_tail_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout(
+        gk_tail_shape,
+        opus::unfold_x_stride(gk_tail_dim, gk_tail_shape, opus::tuple{opus::number<T::D_128B_SIZE>{}, 1_I}),
+        opus::unfold_p_coord(gk_tail_dim, opus::tuple{lane_id % threads_d}));
+}
+
+// Smem-side store layout for stage 1 (main).
+//   chunks/warp = smem_v_d_rpt x smem_n_rpt / NUM_WARPS = 8x4/8 = 4 ?
+template<typename T>
+__device__ inline auto make_layout_skv_main(int warp_id) {
     constexpr auto sk_block_shape = opus::make_tuple(
-        opus::number<T::smem_d_rpt * T::smem_n_rpt / T::NUM_WARPS>{},
+        opus::number<T::smem_v_d_rpt * T::smem_n_rpt / T::NUM_WARPS>{},
         opus::number<T::NUM_WARPS>{},
         opus::number<T::VEC_KV>{});
 
@@ -137,23 +168,72 @@ __device__ inline auto make_layout_skv(int warp_id) {
         opus::unfold_p_coord(sk_block_dim, opus::tuple{warp_id}));
 }
 
+// Smem-side store layout for stage 2 (tail).  4 warps x 1 chunk x VEC_KV.
+// The caller adds a constant smem base offset of
+//   smem_v_d_rpt * (smem_linear_wave + smem_padding_32B)
+// so this layout places the tail chunk right after the main 8 chunks in the
+// per-tile smem region.
+template<typename T>
+__device__ inline auto make_layout_skv_tail(int warp_id) {
+    constexpr auto sk_tail_shape = opus::make_tuple(
+        opus::number<T::smem_d_rpt_tail>{},
+        opus::number<T::smem_n_rpt>{},
+        opus::number<T::VEC_KV>{});
+
+    constexpr auto sk_tail_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}));
+
+    return opus::make_layout(
+        sk_tail_shape,
+        opus::unfold_x_stride(sk_tail_dim, sk_tail_shape, opus::tuple{opus::number<T::smem_linear_wave + T::smem_padding_32B>{}, 1_I}),
+        opus::unfold_p_coord(sk_tail_dim, opus::tuple{warp_id}));
+}
+
+// Pipelined all-warp rope-tail (stage 2) smem store layout.
+//
+// Identical in shape to `make_layout_skv_tail` (VEC_KV=8, one chunk per wave)
+// but indexed by `warp_id % smem_n_rpt` instead of `warp_id`, so ALL NUM_WARPS
+// warps -- not just the first smem_n_rpt -- issue exactly one tail load each.
+// This keeps the per-thread vmem issue count uniform across every warp, which
+// the pipelined accumulator's hand-tuned `s_waitcnt_vmcnt` schedule relies on.
+// Warps `[smem_n_rpt, NUM_WARPS)` redundantly reload the same rows that warps
+// `[0, smem_n_rpt)` do (same token via make_layout_kv_indices's warp%smem_n_rpt
+// mapping, same smem destination) -- a benign same-data write.
+template<typename T>
+__device__ inline auto make_layout_skv_tail_pipe(int warp_id) {
+    constexpr auto sk_tail_shape = opus::make_tuple(
+        opus::number<T::smem_d_rpt_tail>{},
+        opus::number<T::smem_n_rpt>{},
+        opus::number<T::VEC_KV>{});
+
+    constexpr auto sk_tail_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}));
+
+    return opus::make_layout(
+        sk_tail_shape,
+        opus::unfold_x_stride(sk_tail_dim, sk_tail_shape, opus::tuple{opus::number<T::smem_linear_wave + T::smem_padding_32B>{}, 1_I}),
+        opus::unfold_p_coord(sk_tail_dim, opus::tuple{warp_id % T::smem_n_rpt}));
+}
+
 // Create layout for reading K matrix from shared memory to registers
 template<typename T>
 __device__ inline auto make_layout_rk(int lane_id) {
     constexpr auto rk_block_shape = opus::make_tuple(
-        opus::number<T::smem_n_rpt>{},
-        opus::number<T::GEMM0_E_N>{},
-        opus::number<T::W_N / T::smem_n_rpt>{},
-        opus::number<T::GEMM0_E_K>{},
-        opus::number<opus::get_warp_size() / T::W_N>{},
-        opus::number<T::VEC_KV>{});
+        opus::number<T::smem_n_rpt>{}, // 4
+        opus::number<T::GEMM0_E_N>{}, // 2
+        opus::number<T::W_N / T::smem_n_rpt>{}, // 16 / 4 = 4
+        opus::number<T::GEMM0_E_K>{}, // 1
+        opus::number<opus::get_warp_size() / T::W_N>{}, // 64 / 16 = 4
+        opus::number<T::VEC_KV>{}); // 8
 
     constexpr auto rk_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::p_dim{}), // 4
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}), // 2,4
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{})); // 1, 4, 8
 
-    auto lane_id_n = lane_id % T::W_N;
+    auto lane_id_n = lane_id % T::W_N; // lane_id % 16 / 4
 
     return opus::make_layout(
         rk_block_shape,
@@ -209,7 +289,7 @@ __device__ inline auto make_layout_kv_indices(int warp_id, int lane_id) {
         opus::number<T::smem_n_per_wave>{},
         opus::number<T::smem_n_rpt>{},
         1_I);
-    
+
     constexpr auto kv_indices_dim = opus::make_tuple(
         opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
 
@@ -366,7 +446,7 @@ __device__ void mla_decode_accum_le2_tiles(mla_decode_ps_kargs kargs,
     // The buffer rsrc MUST cover the WHOLE kv_ptr range (passed as kargs.kv_buffer_bytes):
     // each kv_indices entry is a *global* page id, so the load offsets can land
     // anywhere inside the cache.  Using `valid_kv_len * stride` here would trip
-    // the buffer-rsrc OOB guard and silently return 0 for K/V → output = 0.
+    // the buffer-rsrc OOB guard and silently return 0 for K/V -> output = 0.
     const int kv_row_stride = static_cast<int>(kargs.s_Bs / sizeof(D_ATTN));
     auto g_kv = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.kv_ptr), kargs.kv_buffer_bytes);
     auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
@@ -384,11 +464,24 @@ __device__ void mla_decode_accum_le2_tiles(mla_decode_ps_kargs kargs,
         seq<T::W_M, T::W_N, T::W_K>{},
         mfma_adaptor_swap_ab{});
 
-    auto u_gkv = make_layout_gkv<T>(warp_id, lane_id);
-    auto u_skv = make_layout_skv<T>(warp_id);
+    auto u_gkv_main = make_layout_gkv_main<T>(warp_id, lane_id);
+    auto u_gkv_tail = make_layout_gkv_tail<T>(warp_id, lane_id);
+    auto u_skv_main = make_layout_skv_main<T>(warp_id);
+    auto u_skv_tail = make_layout_skv_tail<T>(warp_id);
     auto u_rk = make_layout_rk<T>(lane_id);
     auto u_rv = make_layout_rv<T>(lane_id);
     auto u_kv_indices = make_layout_kv_indices<T>(warp_id, lane_id);
+
+    // Tail stage offsets:
+    //   gmem: starts at element offset V_D_TILE_SIZE inside each KV row (the
+    //         rope tail begins immediately after the V prefix).
+    //   smem: starts at chunk index `smem_v_d_rpt`.  Each physical chunk in
+    //         smem occupies `smem_n_rpt * (smem_linear_wave + smem_padding_32B)`
+    //         elements (4 N-group blocks x 528 elements = 2112), see
+    //         `skv_slice`. So the tail chunk's base is
+    //           smem_v_d_rpt x smem_n_rpt x (smem_linear_wave + padding).
+    constexpr auto tail_gmem_d_offset = number<T::V_D_TILE_SIZE>{};
+    constexpr auto tail_smem_d_offset = number<T::smem_v_d_rpt * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B)>{};
 
     typename decltype(mma0)::vtype_b v_k[2];
     typename decltype(mma0)::vtype_c v_s;
@@ -446,9 +539,21 @@ __device__ void mla_decode_accum_le2_tiles(mla_decode_ps_kargs kargs,
         }
     };
 
+    // Active in tail-stage only when this warp's warp_d_group is 0.
+    const bool tail_active = (warp_id / T::smem_n_rpt) == 0;
+
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const int kv_page = load_kv_page(tile_idx);
-        async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page), u_skv);
+        // Stage 1: 32 x 512 -- all warps participate.
+        async_load<T::VEC_KV>(g_kv, s_kv.ptr,
+                              u_gkv_main + kv_token_offset(kv_page),
+                              u_skv_main);
+        // Stage 2: 32 x 64 (rope tail) -- only warps with warp_d_group == 0.
+        if (tail_active) {
+            async_load<T::VEC_KV>(g_kv, s_kv.ptr,
+                                  u_gkv_tail + kv_token_offset(kv_page) + tail_gmem_d_offset,
+                                  u_skv_tail + tail_smem_d_offset);
+        }
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
 
@@ -498,7 +603,7 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     const int stagger = warp_id / 4;
 
-    // Global memory tensors. Buffer rsrc spans the entire kv_ptr range — see
+    // Global memory tensors. Buffer rsrc spans the entire kv_ptr range -- see
     // the matching comment in `mla_decode_accum_le2_tiles` for why.
     const int kv_row_stride = static_cast<int>(kargs.s_Bs / sizeof(D_ATTN));
     auto g_kv = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.kv_ptr), kargs.kv_buffer_bytes);
@@ -524,12 +629,22 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
         seq<T::W_M, T::W_N, T::W_K>{},
         mfma_adaptor_swap_ab{});
 
-    // Partition layouts
-    auto u_gkv = make_layout_gkv<T>(warp_id, lane_id);
-    auto u_skv = make_layout_skv<T>(warp_id);
+    // Partition layouts. The gmem->smem KV load is split into two stages so it
+    // works for D_TILE_SIZE=576 (smem_d_rpt=9 doesn't divide warps_d=2):
+    //   - main: 32x512 via the make_layout_gkv-style main layout (8 D-chunks).
+    //   - tail: 32x64 rope tail, loaded by ALL warps (one load each) so the
+    //           per-thread vmcnt issue count stays uniform with the main load.
+    auto u_gkv_main = make_layout_gkv_main<T>(warp_id, lane_id);
+    auto u_skv_main = make_layout_skv_main<T>(warp_id);
+    auto u_gkv_tail = make_layout_gkv_tail<T>(warp_id, lane_id);
+    auto u_skv_tail = make_layout_skv_tail_pipe<T>(warp_id);
     auto u_rk = make_layout_rk<T>(lane_id);
     auto u_rv = make_layout_rv<T>(lane_id);
     auto u_kv_indices = make_layout_kv_indices<T>(warp_id, lane_id);
+
+    // Tail-stage gmem/smem base offsets (see le2_tiles for the derivation).
+    constexpr auto tail_gmem_d_offset = number<T::V_D_TILE_SIZE>{};
+    constexpr auto tail_smem_d_offset = number<T::smem_v_d_rpt * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B)>{};
 
     // Register fragments
     typename decltype(mma0)::vtype_b v_k[2];
@@ -547,7 +662,7 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
     constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
     D_ACC rescale_m = 1.0f;
 
-    // Tile traversal helpers
+    // Tile traversal helpers.
     auto load_kv_page = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
     auto kv_token_offset = [&](int token_idx) { return token_idx * kv_row_stride; };
     auto skv_slice = [](auto slice_idx) {
@@ -555,6 +670,21 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
         return number<(s / 2) * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B) + (s % 2) * T::SLICE_D>{};
     };
     int kv_page[4];
+
+    // Issue both stages of a KV tile's gmem->smem load. `smem_off` selects the
+    // double-buffer slot (0 or kv_slot_offset). The main load contributes
+    // kv_buffer_load_insts_main vmem issues per thread and the all-warp tail one
+    // more, for a uniform kv_buffer_load_insts total across every warp. The tail
+    // reuses the main load's per-thread KV page because the (row) -> token
+    // mapping is identical (token = (lane/threads_d)*smem_n_rpt + warp%smem_n_rpt).
+    auto async_load_kv = [&](auto& s_buf, auto smem_off, int kv_page_id) {
+        async_load<T::VEC_KV>(g_kv, s_buf.ptr,
+                              u_gkv_main + kv_token_offset(kv_page_id),
+                              u_skv_main + smem_off);
+        async_load<T::VEC_KV>(g_kv, s_buf.ptr,
+                              u_gkv_tail + kv_token_offset(kv_page_id) + tail_gmem_d_offset,
+                              u_skv_tail + smem_off + tail_smem_d_offset);
+    };
 
     // QK: iterate the full K feature dim (NUM_K_SLICES = D_TILE_SIZE / SLICE_D, e.g. 18 for 576).
     auto compute_qk = [&](auto& s, const auto& q, auto& k, auto& sk, auto rk_offset) {
@@ -598,13 +728,13 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
 
     // Prologue
     kv_page[2] = load_kv_page(0);
-    async_load<T::VEC_KV>(g_kv, s_kv[0].ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv);
+    async_load_kv(s_kv[0], 0_I, kv_page[2]);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
     kv_page[0] = load_kv_page(1);
-    async_load<T::VEC_KV>(g_kv, s_kv[0].ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv + kv_slot_offset);
+    async_load_kv(s_kv[0], kv_slot_offset, kv_page[0]);
     __builtin_amdgcn_sched_barrier(0);
     kv_page[1] = load_kv_page(2);
     v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk);
@@ -613,7 +743,7 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
     s_waitcnt_vmcnt(1_I);
 
     compute_qk(v_s[0], v_q_slices, v_k, s_kv[0], 0_I);
-    
+
     if (stagger) {
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -641,7 +771,7 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
     for (int j = 1; j < num_kv_tiles - 3; j += 2) {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
+        async_load_kv(s_kv[1], 0_I, kv_page[1]);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[2] = load_kv_page(j + 2);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
@@ -698,7 +828,7 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
 
         // Cluster 4:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv + kv_slot_offset);
+        async_load_kv(s_kv[1], kv_slot_offset, kv_page[2]);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[3] = load_kv_page(j + 3);
         v_k[0] = load<T::VEC_KV>(s_kv[1], u_rk);
@@ -762,7 +892,7 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
     if constexpr (OddTail) {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
+        async_load_kv(s_kv[1], 0_I, kv_page[1]);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
         v_k[1] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
@@ -881,7 +1011,7 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
     } else {
         // Cluster 0:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
+        async_load_kv(s_kv[1], 0_I, kv_page[1]);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[2] = load_kv_page(num_kv_tiles - 1);
         v_k[0] = load<T::VEC_KV>(s_kv[0], u_rk + kv_slot_offset);
@@ -933,7 +1063,7 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
 
         // Cluster 4:
         s_waitcnt_vmcnt(0_I);
-        async_load<T::VEC_KV>(g_kv, s_kv[1].ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv + kv_slot_offset);
+        async_load_kv(s_kv[1], kv_slot_offset, kv_page[2]);
         v_k[0] = load<T::VEC_KV>(s_kv[1], u_rk);
         v_k[1] = load<T::VEC_KV>(s_kv[1], u_rk + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
@@ -1053,7 +1183,7 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 // MLA decode persistent kernel
 //
 // Layout summary:
@@ -1069,7 +1199,7 @@ __device__ void mla_decode_accum_pipelined(mla_decode_ps_kargs kargs,
 //      2 q_len_ptr_s   3 q_len_ptr_e  (Q token range)
 //      4 kv_ind_ptr_s  5 kv_ind_ptr_e (KV index range)
 //      6 kv_offset     7 (reserved)
-// ────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 #if defined(__gfx950__)
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2)
@@ -1083,7 +1213,7 @@ void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs kargs) {
     const int lane_id = thread_id_x() % T::WARP_SIZE;
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    // ─── Resolve persistent work range for this TG ───
+    // --- Resolve persistent work range for this TG ---
     const int* work_indptr    = kargs.work_indptr;
     const int* work_info_set  = kargs.work_info_set;
     const int  work_idx_start = work_indptr[work_id];
@@ -1095,7 +1225,7 @@ void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs kargs) {
     constexpr float LOG2_E = 1.44269504089f;
     const float temperature_scale = kargs.scalar * LOG2_E;
 
-    // ─── label_ps_start: iterate assigned work items ───
+    // --- label_ps_start: iterate assigned work items ---
     for (int w = work_idx_start; w < work_idx_end; ++w) {
         __builtin_amdgcn_s_barrier();
 
@@ -1116,7 +1246,7 @@ void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs kargs) {
         const int num_kv_tiles = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
         if (num_kv_tiles == 0) continue;
 
-        // ─── Load Q (Q-tile per TG) and pre-scale by softmax temperature ───
+        // --- Load Q (Q-tile per TG) and pre-scale by softmax temperature ---
         const int qo_gmem_offset = q_len_ptr_s * kargs.stride_qo_n;
         auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.q_ptr) + qo_gmem_offset,
                              q_len * kargs.stride_qo_n * sizeof(D_ATTN));
@@ -1131,12 +1261,16 @@ void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs kargs) {
         static_for<q_vec_len>([&](auto i) { v_q_f32[i.value] *= temperature_scale; });
         v_q = cast<D_ATTN>(v_q_f32);
 
-        // ─── Online softmax state ───
+        // --- Online softmax state ---
         clear(v_o);
         D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
         D_ACC l_row = 0.0f;
 
-        // ─── KV iteration (dispatch by tile count / parity) ───
+        // --- KV iteration (dispatch by tile count / parity) ---
+        // Both paths use the two-stage main(32x512)+tail(32x64) gmem->smem KV
+        // load so D_TILE_SIZE=576 works for NUM_WARPS=8:
+        //   <= 2 tiles : simple un-pipelined accumulator (le2_tiles).
+        //   >  2 tiles : 2-buffer pipelined accumulator (parity selects epilogue).
         if (num_kv_tiles <= 2) {
             mla_decode_accum_le2_tiles<Traits>(
                 kargs, kargs.kv_indices,
@@ -1154,7 +1288,7 @@ void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs kargs) {
                 smem_kv_buf, v_q, v_o, m_row, l_row);
         }
 
-        // ─── Normalize O ← O / l_row (R_div_L in SP3) ───
+        // --- Normalize O <- O / l_row (R_div_L in SP3) ---
         const D_ACC o_scale = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
         scale_output_tile<T>(v_o, o_scale);
 
@@ -1162,11 +1296,11 @@ void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs kargs) {
         int lane_id_o = thread_id_x() % T::WARP_SIZE;
         asm volatile("" : "+v"(lane_id_o));
         int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
-        // Output uses its own stride (D_v, not D_qk) — see kargs.stride_o_*.
+        // Output uses its own stride (D_v, not D_qk) -- see kargs.stride_o_*.
         auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
 
-        // ─── Output: ps_partial < 0  → bf16 final write
-        //            ps_partial >= 0  → fp32 split write + LSE (SP3 label_R_write_out) ───
+        // --- Output: ps_partial < 0  -> bf16 final write
+        //            ps_partial >= 0  -> fp32 split write + LSE (SP3 label_R_write_out) ---
         if (ps_partial < 0) {
             const int o_gmem_offset = q_len_ptr_s * kargs.stride_o_n;
             auto g_o = make_gmem(
@@ -1222,16 +1356,16 @@ void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs kargs) {
         }
     }
 }
-#else  // !__gfx950__ — keep symbol present for host pass / non-gfx950 device passes.
+#else  // !__gfx950__ -- keep symbol present for host pass / non-gfx950 device passes.
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2)
 void mla_decode_ps_a16w16_16mx8_32nx1_kernel(mla_decode_ps_kargs /*kargs*/) { assert(false); }
 #endif  // __gfx950__
 
-// ────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 // Host-side template launcher.  Builds `mla_decode_ps_kargs` from torch
 // tensors and launches a persistent grid (one TG per SM).
-// ────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 template<typename Traits>
 void mla_a16w16_16mx8_32nx1_ps_launch(torch::Tensor& query,
                                       torch::Tensor& kv_buffer,
@@ -1250,7 +1384,7 @@ void mla_a16w16_16mx8_32nx1_ps_launch(torch::Tensor& query,
     using T = Traits;
     constexpr int kBlockM = T::Q_TILE_SIZE * T::T_M;  // M tile per TG
 
-    // ─── Light shape / stride validation ───
+    // --- Light shape / stride validation ---
     TORCH_CHECK(query.dim() == 3,
                 "query must be 3-D [total_qlen, H, D_qk], got ndim=", query.dim());
     TORCH_CHECK(kv_buffer.dim() == 4 || kv_buffer.dim() == 3,
@@ -1274,7 +1408,7 @@ void mla_a16w16_16mx8_32nx1_ps_launch(torch::Tensor& query,
                 ". Try -n configs where nhead*max_seqlen_q==", kBlockM,
                 " (e.g. -n 16,4 / -n 32,2 / -n 64,1).");
 
-    // ─── Build kargs ───
+    // --- Build kargs ---
     mla_decode_ps_kargs kargs{};
     kargs.split_out_ptr      = split_output.data_ptr();
     kargs.split_lse_ptr      = split_lse.data_ptr();
@@ -1324,7 +1458,7 @@ void mla_a16w16_16mx8_32nx1_ps_launch(torch::Tensor& query,
     // work_info_set's kv_ind_ptr_s/e fields).
     (void)kv_indptr;
 
-    // ─── Launch ───
+    // --- Launch ---
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(final_output));
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -1339,11 +1473,11 @@ void mla_a16w16_16mx8_32nx1_ps_launch(torch::Tensor& query,
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
-// ────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 // Top-level entry: matches the signature of the existing hk_mla decode
 // launchers (see `mi35x_v32_fwd_decode_m16x8_fp8_fp8.cuh`) so it slots into
 // `hk_mla_decode_fwd` dispatch without API changes.
-// ────────────────────────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
 inline void hk_mla_a16w16_16mx8_32nx1_ps(torch::Tensor& query,
                                          torch::Tensor& kv_buffer,
                                          const torch::Tensor& qo_indptr,
@@ -1358,21 +1492,30 @@ inline void hk_mla_a16w16_16mx8_32nx1_ps(torch::Tensor& query,
                                          torch::Tensor& split_lse,
                                          torch::Tensor& final_output)
 {
-    // Dispatch by (BlockM, dtype). NUM_WARPS is fixed at 4 so that
-    // `smem_d_rpt / warps_d = 9 / 1 = 9` (= D_TILE_SIZE / D_128B_SIZE)
-    // divides cleanly for D_TILE_SIZE=576; with NUM_WARPS=8 the integer
-    // truncation 9/2=4 silently drops the rope tail and breaks QK^T.
-    // BlockM ∈ {64, 128} → Q_TILE_SIZE ∈ {16, 32}.
+    // Dispatch by dtype. This kernel only supports BlockM=128 (NUM_WARPS=8),
+    // i.e. nhead * max_seqlen_q == 128 (-n 32,4 / -n 64,2 / -n 128,1).
+    // Q_TILE_SIZE=16 keeps GEMM0_E_M=1 (the softmax helpers assume one m-row
+    // per thread in v_s) and kBlockM = Q_TILE_SIZE * NUM_WARPS = 128.
+    //
+    // NUM_WARPS=8 -> warps_d = NUM_WARPS / smem_n_rpt = 8/4 = 2; smem_d_rpt=9
+    // doesn't divide 2, so a single-stage gmem->smem load would silently drop
+    // the rope tail.  Both le2_tiles and the pipelined accumulator split the
+    // load into two stages:
+    //   stage 1 (main):  32 x 512  -- all 8 warps participate (8/2=4 chunks
+    //                                 per warp_d_group, divides cleanly)
+    //   stage 2 (tail):  32 x 64   -- in pipelined, all 8 warps issue one tail
+    //                                 load each (uniform vmcnt); le2_tiles uses
+    //                                 the 4-warp tail variant.
     const auto    q_dtype  = query.scalar_type();
     const int32_t block_m  = static_cast<int32_t>(query.size(1)) * max_seqlen_q;
 
-#define MLA_A16W16_LAUNCH(QT, DT) \
+#define MLA_A16W16_LAUNCH(NW, DT) \
     do { \
-        using Traits = mla_decode_ps_traits</*Q_TILE_SIZE  =*/ QT, \
+        using Traits = mla_decode_ps_traits</*Q_TILE_SIZE  =*/ 16, \
                                             /*KV_TILE_SIZE =*/ 32, \
                                             /*D_TILE_SIZE  =*/ 576, \
                                             /*V_D_TILE_SIZE=*/ 512, \
-                                            /*NUM_WARPS    =*/ 4, \
+                                            /*NUM_WARPS    =*/ NW, \
                                             /*D_ATTN       =*/ DT>; \
         mla_a16w16_16mx8_32nx1_ps_launch<Traits>(query, kv_buffer, qo_indptr, \
                                                  kv_indptr, kv_page_indices, \
@@ -1382,24 +1525,17 @@ inline void hk_mla_a16w16_16mx8_32nx1_ps(torch::Tensor& query,
                                                  split_lse, final_output); \
     } while (0)
 
-    // NOTE: BlockM=128 (Q_TILE_SIZE=32 → GEMM0_E_M=2) is **not yet correct**.
-    // The shared softmax helpers (attn_row_max / attn_row_sum / attn_sub_row)
-    // assume one m-row per thread in v_s; with E_M=2 the reductions mix two
-    // m-rows together → NaN.  Refactoring to per-m_repeat (m_row, l_row)
-    // vectors is the proper fix; until then only BlockM=64 is exposed.
     if (q_dtype == at::ScalarType::BFloat16)
     {
-        if (block_m == 64) MLA_A16W16_LAUNCH(16, bf16_t);
+        if   (block_m == 128) MLA_A16W16_LAUNCH(8, bf16_t);
         else TORCH_CHECK(false, "hk_mla_a16w16_16mx8_32nx1_ps: unsupported BlockM=",
-                                block_m, " (only 64 is currently correct; 128 "
-                                "needs E_M>1 softmax-helper refactor).");
+                                block_m, " (only 128 / nhead*max_seqlen_q==128 supported).");
     }
     else if (q_dtype == at::ScalarType::Half)
     {
-        if (block_m == 64) MLA_A16W16_LAUNCH(16, fp16_t);
+        if   (block_m == 128) MLA_A16W16_LAUNCH(8, fp16_t);
         else TORCH_CHECK(false, "hk_mla_a16w16_16mx8_32nx1_ps: unsupported BlockM=",
-                                block_m, " (only 64 is currently correct; 128 "
-                                "needs E_M>1 softmax-helper refactor).");
+                                block_m, " (only 128 / nhead*max_seqlen_q==128 supported).");
     }
     else
     {

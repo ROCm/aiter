@@ -466,29 +466,35 @@ def mla_decode_fwd(
         )
 
         use_hk = (
-            get_gfx() in ("gfx942", "gfx950")
-            and nhead * max_seqlen_q == 128
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and page_size in (1, 64)
-            and is_experimental_enabled()
-        ) or (
-            get_gfx() == "gfx950"
-            and nhead * max_seqlen_q == 64
-            and q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and page_size in (1, 64)
-            and is_experimental_enabled()
-        ) or (
-            # opus-based a16w16 MLA decode kernel (BlockM=64 only — see kernel
-            # hpp for why BlockM=128 / E_M>1 is not yet supported).
-            # Configs: -n 16,4 / -n 32,2 / -n 64,1 (nhead*max_seqlen_q == 64).
-            get_gfx() == "gfx950"
-            and nhead * max_seqlen_q == 64
-            and q.dtype in (dtypes.bf16, dtypes.fp16)
-            and kv_buffer.dtype == q.dtype
-            and page_size in (1, 64)
-            and is_experimental_enabled()
+            (
+                get_gfx() in ("gfx942", "gfx950")
+                and nhead * max_seqlen_q == 128
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and page_size in (1, 64)
+                and is_experimental_enabled()
+            )
+            or (
+                get_gfx() == "gfx950"
+                and nhead * max_seqlen_q == 64
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and page_size in (1, 64)
+                and is_experimental_enabled()
+            )
+            or (
+                # opus-based a16w16 MLA decode kernel (BlockM in {64, 128}).
+                #   BlockM=64  -> Q_TILE_SIZE=16, NUM_WARPS=4 (-n 16,4 / -n 32,2 / -n 64,1)
+                #   BlockM=128 -> Q_TILE_SIZE=16, NUM_WARPS=8 (-n 32,4 / -n 64,2 / -n 128,1)
+                # The kernel uses a two-stage gmem->smem KV load (32x512 main +
+                # 32x64 tail) so NUM_WARPS=8 with D=576 still divides cleanly.
+                get_gfx() == "gfx950"
+                and nhead * max_seqlen_q in (64, 128)
+                and q.dtype in (dtypes.bf16, dtypes.fp16)
+                and kv_buffer.dtype == q.dtype
+                and page_size in (1, 64)
+                and is_experimental_enabled()
+            )
         )
 
         if use_hk:
