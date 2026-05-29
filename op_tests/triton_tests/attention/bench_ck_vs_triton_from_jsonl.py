@@ -127,26 +127,29 @@ def _synth_q_lens(total: int, num_seqs: int) -> list[int]:
     return [base + (1 if i < rem else 0) for i in range(num_seqs)]
 
 
-def _timed(fn, warmup, iters, use_graph):
+def _timed(fn, warmup, iters, use_graph, kernels_per_graph=1):
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     if use_graph:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            fn()
+            for _ in range(kernels_per_graph):
+                fn()
         t0 = time.perf_counter()
         for _ in range(iters):
             graph.replay()
+        per_call_iters = iters * kernels_per_graph
     else:
         t0 = time.perf_counter()
         for _ in range(iters):
             fn()
+        per_call_iters = iters
     torch.cuda.synchronize()
-    return (time.perf_counter() - t0) * 1e3 / iters
+    return (time.perf_counter() - t0) * 1e3 / per_call_iters
 
 
-def bench_ck_ua(s, warmup, iters, inp, use_graph):
+def bench_ck_ua(s, warmup, iters, inp, use_graph, kernels_per_graph=1):
     q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = inp
     out = torch.empty_like(q)
     mask_type = 2 if s.window_size != (0, 0) else 0
@@ -156,10 +159,10 @@ def bench_ck_ua(s, warmup, iters, inp, use_graph):
             mask_type=mask_type, scale_s=scale,
             scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0,
             window_size_left=win_l, window_size_right=win_r)
-    return _timed(fn, warmup, iters, use_graph)
+    return _timed(fn, warmup, iters, use_graph, kernels_per_graph)
 
 
-def bench_ck_sk(s, warmup, iters, inp, use_graph):
+def bench_ck_sk(s, warmup, iters, inp, use_graph, kernels_per_graph=1):
     q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = inp
     out = torch.empty_like(q)
     cu_k = torch.nn.functional.pad(seq_lens_k.cumsum(0, dtype=torch.int32), (1, 0))
@@ -174,7 +177,7 @@ def bench_ck_sk(s, warmup, iters, inp, use_graph):
         out=out, block_table=block_tables)
     def fn():
         mha_varlen_fwd(**kw)
-    return _timed(fn, warmup, iters, use_graph)
+    return _timed(fn, warmup, iters, use_graph, kernels_per_graph)
 
 
 def _get_pagedkv_fn():
@@ -185,7 +188,7 @@ def _get_pagedkv_fn():
             return mod.mha_varlen_fwd_pagedkv
     return None
 
-def bench_ck_pk(s, warmup, iters, inp, use_graph):
+def bench_ck_pk(s, warmup, iters, inp, use_graph, kernels_per_graph=1):
     """CK FmhaFwdPagedKV: non-split, paged KV, single kernel."""
     pk_fn = _get_pagedkv_fn()
     if pk_fn is None:
@@ -203,10 +206,10 @@ def bench_ck_pk(s, warmup, iters, inp, use_graph):
               window_left, window_right, 0,
               out, block_tables)
 
-    return _timed(fn, warmup, iters, use_graph)
+    return _timed(fn, warmup, iters, use_graph, kernels_per_graph)
 
 
-def bench_triton(s, warmup, iters, force_2d, inp, use_graph):
+def bench_triton(s, warmup, iters, force_2d, inp, use_graph, kernels_per_graph=1):
     q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = inp
     out = torch.empty_like(q)
     saved_splitkv = getattr(ua_mod, '_try_ck_splitkv_attention', None)
@@ -224,14 +227,14 @@ def bench_triton(s, warmup, iters, force_2d, inp, use_graph):
     try:
         def fn():
             ua_mod.unified_attention(**kw)
-        return _timed(fn, warmup, iters, use_graph)
+        return _timed(fn, warmup, iters, use_graph, kernels_per_graph)
     finally:
         ua_mod.use_2d_kernel = saved_use2d
         if saved_splitkv: ua_mod._try_ck_splitkv_attention = saved_splitkv
         if saved_ua: ua_mod._try_ck_unified_attention = saved_ua
 
 
-def bench_auto(s, warmup, iters, inp, use_graph):
+def bench_auto(s, warmup, iters, inp, use_graph, kernels_per_graph=1):
     """Benchmark the production unified_attention dispatcher (with selector)."""
     q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = inp
     out = torch.empty_like(q)
@@ -243,7 +246,7 @@ def bench_auto(s, warmup, iters, inp, use_graph):
         alibi_slopes=None, output_scale=None, qq_bias=None, sinks=None)
     def fn():
         ua_mod.unified_attention(**kw)
-    return _timed(fn, warmup, iters, use_graph)
+    return _timed(fn, warmup, iters, use_graph, kernels_per_graph)
 
 
 def phase_label(s):
@@ -259,9 +262,20 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--no-graph", action="store_true")
+    ap.add_argument(
+        "--kernels-per-graph",
+        type=int,
+        default=1,
+        metavar="N",
+        help="When graph capture is on, bundle N back-to-back fn() calls per "
+        "CUDAGraph and report amortized per-kernel time (default: 1).",
+    )
     ap.add_argument("--decode-only", action="store_true")
     ap.add_argument("--out-csv", type=Path, default=None)
     args = ap.parse_args()
+
+    if args.kernels_per_graph < 1:
+        ap.error("--kernels-per-graph must be >= 1")
 
     if not torch.cuda.is_available():
         return 2
@@ -274,7 +288,13 @@ def main() -> int:
 
     total = sum(c for _, c in shapes)
     print(f"JSONL: {total} entries -> {len(shapes)} unique shapes")
-    print(f"warmup={args.warmup}  iters={args.iters}  graph={'off' if args.no_graph else 'on'}")
+    graph_label = "off" if args.no_graph else "on"
+    kpg_suffix = (
+        f"  kernels_per_graph={args.kernels_per_graph}"
+        if not args.no_graph and args.kernels_per_graph > 1
+        else ""
+    )
+    print(f"warmup={args.warmup}  iters={args.iters}  graph={graph_label}{kpg_suffix}")
 
     ok = [(s, c) for s, c in shapes if compatible(s)[0]]
     skip = [(s, c, compatible(s)[1]) for s, c in shapes if not compatible(s)[0]]
@@ -292,6 +312,7 @@ def main() -> int:
 
     csv_rows = []
     use_g = not args.no_graph
+    kpg = args.kernels_per_graph
     BACKENDS = ["ck_ua", "ck_pk", "ck_sk", "t_2d", "t_3d"]
 
     for i, (s, count) in enumerate(ok):
@@ -312,14 +333,14 @@ def main() -> int:
         results = {}
         mem_gb = estimate_mem_gb(s)
         if mem_gb > 128:
-            backends = [("t_2d", lambda: bench_triton(s, args.warmup, args.iters, True, inp, use_g))]
+            backends = [("t_2d", lambda: bench_triton(s, args.warmup, args.iters, True, inp, use_g, kpg))]
         else:
             backends = [
-                ("ck_ua", lambda: bench_ck_ua(s, args.warmup, args.iters, inp, use_g)),
-                ("ck_sk", lambda: bench_ck_sk(s, args.warmup, args.iters, inp, use_g)),
-                ("ck_pk", lambda: bench_ck_pk(s, args.warmup, args.iters, inp, use_g)),
-                ("t_2d",  lambda: bench_triton(s, args.warmup, args.iters, True, inp, use_g)),
-                ("t_3d",  lambda: bench_triton(s, args.warmup, args.iters, False, inp, use_g)),
+                ("ck_ua", lambda: bench_ck_ua(s, args.warmup, args.iters, inp, use_g, kpg)),
+                ("ck_sk", lambda: bench_ck_sk(s, args.warmup, args.iters, inp, use_g, kpg)),
+                ("ck_pk", lambda: bench_ck_pk(s, args.warmup, args.iters, inp, use_g, kpg)),
+                ("t_2d", lambda: bench_triton(s, args.warmup, args.iters, True, inp, use_g, kpg)),
+                ("t_3d", lambda: bench_triton(s, args.warmup, args.iters, False, inp, use_g, kpg)),
             ]
 
         for name, fn in backends:
