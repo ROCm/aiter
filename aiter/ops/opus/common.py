@@ -184,6 +184,38 @@ def _key_from_runtime(
     )
 
 
+# Mono-tile kid -> (B_M, B_N, B_K). Must stay in lock-step with
+# csrc/opus_gemm/opus_gemm_common.py:_MONO_TILE_TILES; the runtime guard
+# below uses it to validate (N, K) alignment for CSV-picked mono kids,
+# since tuned_gemm.get_padded_m pads the lookup key by M only and can
+# surface a kid whose B_N / B_K does not divide the actual N / K.
+_MONO_TILE_KID_TILES = {
+    1400: (192, 256, 64),
+    1401: (128, 256, 64),
+    1402: (192, 128, 64),
+    1403: (128, 128, 64),
+    1404: (64, 128, 64),
+}
+
+
+def mono_kid_shape_ok(kid: int, N: int, K: int) -> bool:
+    """Return True iff `kid` is a mono-tile kid whose B_N / B_K divides N / K.
+
+    Returns True for non-mono kids (out of range) so callers can use this
+    as an unconditional gate without having to special-case the kid range.
+    B_M is intentionally NOT checked: the mono-tile launcher now handles
+    M-tail via the bounded gmem descriptor (commit 41e2d482a), so M may
+    be non-tile-aligned. N and K must still be tile-aligned -- the kernel
+    has no N-tail mask (column writes would spill into the next row) and
+    no K-tail mask.
+    """
+    bm_bn_bk = _MONO_TILE_KID_TILES.get(int(kid))
+    if bm_bn_bk is None:
+        return True
+    _, B_N, B_K = bm_bn_bk
+    return (int(N) % B_N == 0) and (int(K) % B_K == 0)
+
+
 def lookup_tuned(
     M: int,
     N: int,
@@ -205,4 +237,5 @@ def lookup_tuned(
 __all__ = [
     "OPUS_TUNED_CSV_GLOB",
     "lookup_tuned",
+    "mono_kid_shape_ok",
 ]

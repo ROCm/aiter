@@ -185,12 +185,20 @@ __device__ __forceinline__ float fp4_f32_to_e8m0_scale(float amax)
     return fp_f32_to_e8m0_scale<kDefaultMxScaleRoundMode, MxDtype::FP4_E2M1>(amax);
 }
 
-// Compute the swizzled E8M0 scale index for tiled FP4 layout.
-// Used when shuffle_scale is enabled for MXFP4 quantization.
-__device__ __forceinline__ int fp4_scale_shuffle_idx(int scaleN_pad, int x, int y)
+// Compute the swizzled E8M0 scale index for the tiled MX layout.
+// Used by both MXFP4 and MXFP8 paths (the e8m0 byte layout is identical
+// regardless of the element dtype). Legacy `fp4_scale_shuffle_idx` kept as
+// an alias below.
+__device__ __forceinline__ int mx_scale_shuffle_idx(int scaleN_pad, int x, int y)
 {
     return (x / 32 * scaleN_pad) * 32 + (y / 8) * 256 + (y % 4) * 64 + (x % 16) * 4 +
            (y % 8) / 4 * 2 + (x % 32) / 16;
+}
+
+// Backward-compat alias. New code should call `mx_scale_shuffle_idx` directly.
+__device__ __forceinline__ int fp4_scale_shuffle_idx(int scaleN_pad, int x, int y)
+{
+    return mx_scale_shuffle_idx(scaleN_pad, x, y);
 }
 
 } // namespace aiter

@@ -60,7 +60,6 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
                 extra["out_dtype"] = "fp4"
             if m.group("fp8"):
                 extra["out_dtype"] = "fp8"
-                extra["a_scale_one"] = True
             if m.group("sbm") is not None:
                 extra["sort_block_m"] = int(m.group("sbm"))
             return {**params, **extra}
@@ -630,7 +629,7 @@ def _run_compiled(exe, args):
     except Exception:
         # JitFunction.__call__ leaks ir.Context on compilation failure,
         # causing all subsequent JitFunction calls to take a wrong code path
-        # (self.func(*args) without CompilationContext → gpu_module_body error).
+        # (self.func(*args) without CompilationContext -> gpu_module_body error).
         # Clean up leaked contexts to isolate failures.
         try:
             from flydsl._mlir import ir

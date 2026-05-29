@@ -62,13 +62,14 @@
 #pragma once
 
 #include "../opus_gemm_utils.cuh"
+#include "opus_gemm_traits_a16w16_gfx950.cuh"  // opus_splitk_ws_handle
 #include <cstdint>   // uint16_t / uint32_t used by the bias-fold and bf16 store paths
 
 template<int VEC_ = 16, int BLOCK_ = 64, typename D_OUT = __bf16,
          bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT,
          bool HAS_OOB_ = true>
 __global__ void splitk_reduce_kernel(
-    const float* __restrict__ workspace,
+    const opus_splitk_ws_handle* __restrict__ ws_handle,
     D_OUT*       __restrict__ c_out,
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
@@ -79,6 +80,10 @@ __global__ void splitk_reduce_kernel(
 #if defined(__gfx950__)
     // gfx950-only kernel body. See opus_gemm_pipeline_a16w16_gfx950.cuh for the
     // multi-arch wheel rationale.
+    //
+    // Deref the handle slot at entry; survives a post-capture grow.
+    const float* __restrict__ workspace =
+        reinterpret_cast<const float*>(ws_handle->ptr);
     constexpr int VEC   = VEC_;
     constexpr int BLOCK = BLOCK_;
     constexpr bool HAS_BIAS = HAS_BIAS_;
@@ -105,7 +110,7 @@ __global__ void splitk_reduce_kernel(
     const int b = bm_id / M;
     const int m = bm_id - b * M;
 
-    // ── Bias prefetch (per-N vector load) ──────────────────────────────────
+    // -- Bias prefetch (per-N vector load) ----------------------------------
     // Bias is per-output-feature [N] (F.linear convention). Each thread
     // loads VEC bias values at its own n_base. Fired before the split-K
     // accumulation so the vmem loads overlap.
@@ -195,7 +200,7 @@ __global__ void splitk_reduce_kernel(
                     c_idx + g * STEP);
             });
         } else if (n_base < N) {
-            // Tail path: decompose valid ∈ [1, VEC-1] into descending
+            // Tail path: decompose valid ? [1, VEC-1] into descending
             // power-of-2 chunks so we emit dwordx4/dwordx2/dword/short
             // instead of VEC scalar stores.
             // Ref: demon_gcn/opus_gemm/mxfp8_e8m0/gemm_mxfp_a8w8_1d1d.hpp
