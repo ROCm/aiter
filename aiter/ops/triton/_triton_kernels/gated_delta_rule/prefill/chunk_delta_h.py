@@ -17,6 +17,7 @@ import triton.language as tl
 from ..utils import prepare_chunk_indices, prepare_chunk_offsets
 from ..utils.op import exp
 from ..gated_delta_rule_utils import (
+    RCP_LN2,
     IS_AMD,
     IS_NVIDIA_HOPPER,
     USE_CUDA_GRAPH,
@@ -28,7 +29,6 @@ from ..gated_delta_rule_utils import (
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 # Workaround: AMD ROCm Triton compiler fails with num_stages=4 in stream pipeline
 NUM_STAGES_FWD = [2, 3] if IS_AMD else [2, 3, 4]
-RCP_LN2 = 1.4426950408889634
 
 
 @triton.heuristics(
