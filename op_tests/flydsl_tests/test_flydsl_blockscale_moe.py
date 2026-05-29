@@ -116,8 +116,8 @@ def _expand_blockscale(sc_flat, expert, nbn, nbk, blk_n, blk_k):
 # ---------------------------------------------------------------------------
 # Torch references
 # ---------------------------------------------------------------------------
-def _torch_stage1_ref(a_q, w1, topk_ids, a_scale, w1_scale, inter_dim, blk_n, blk_k):
-    """[token, topk, inter_dim] FP32 reference of stage1 (gate+up + SiLU)."""
+def _torch_stage1_ref(a_q, w1, topk_ids, a_scale, w1_scale, inter_dim, blk_n, blk_k, act: str = "silu"):
+    """[token, topk, inter_dim] FP32 reference of stage1 (gate+up + activation)."""
     tokens, model_dim = a_q.shape
     topk = topk_ids.shape[1]
     expert = w1.shape[0]
@@ -138,9 +138,12 @@ def _torch_stage1_ref(a_q, w1, topk_ids, a_scale, w1_scale, inter_dim, blk_n, bl
         mask = topk_ids == e
         if not mask.any():
             continue
-        act = a_rep[mask] @ w[e].T
-        gate, up = act.split([inter_dim, inter_dim], dim=-1)
-        out[mask] = F.silu(gate) * up
+        gu = a_rep[mask] @ w[e].T
+        gate, up = gu.split([inter_dim, inter_dim], dim=-1)
+        if act == "gelu":
+            out[mask] = F.gelu(gate, approximate="none") * up
+        else:
+            out[mask] = F.silu(gate) * up
     return out
 
 
@@ -289,7 +292,7 @@ def test_dispatcher_routes_fp8_fp8_bf16_compiles():
 @pytest.mark.parametrize(
     "kwarg,bad_value,expected_match",
     [
-        ("act", "gelu", "act='gelu'"),
+        ("act", "relu", "act='relu'"),
         ("enable_bias", True, "enable_bias=True"),
         ("k_batch", 4, "k_batch=4"),
         ("persist_m", 2, "persist_m=2"),
@@ -321,7 +324,7 @@ def test_invalid_dtype_combo_raises():
 # ---------------------------------------------------------------------------
 # Group 2: functional correctness — stage1, stage2, full pipeline
 # ---------------------------------------------------------------------------
-def _launch_flydsl_stage1(data, *, tile_m, tile_n, tile_k, waves_per_eu):
+def _launch_flydsl_stage1(data, *, tile_m, tile_n, tile_k, waves_per_eu, act: str = "silu"):
     """Compile + run FlyDSL stage1 via the aiter dispatcher; return (out, us)."""
     tokens = data["tokens"]; model_dim = data["model_dim"]
     inter_dim = data["inter_dim"]; experts = data["experts"]; topk = data["topk"]
@@ -344,7 +347,7 @@ def _launch_flydsl_stage1(data, *, tile_m, tile_n, tile_k, waves_per_eu):
         model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage1=False,
         a_dtype="fp8", b_dtype="fp8", out_dtype="f16",
-        act="silu", waves_per_eu=waves_per_eu,
+        act=act, waves_per_eu=waves_per_eu,
     )
     stream = torch.cuda.current_stream()
     w1_shuf_flat = data["w1_bq_shuf"].view(-1)
@@ -417,6 +420,7 @@ def _launch_flydsl_stage2(data, out1, *, tile_m, tile_n, tile_k, waves_per_eu,
     return out2, a2_bq, a2_scale_2d, us
 
 
+@pytest.mark.parametrize("act", ["silu", "gelu"])
 @pytest.mark.parametrize(
     "tokens, model_dim, inter_dim, experts, topk",
     [
@@ -425,7 +429,7 @@ def _launch_flydsl_stage2(data, out1, *, tile_m, tile_n, tile_k, waves_per_eu,
     ],
 )
 def test_blockscale_correctness_stage1_stage2_e2e(
-    tokens, model_dim, inter_dim, experts, topk,
+    tokens, model_dim, inter_dim, experts, topk, act,
 ):
     """FlyDSL stage1 / stage2 / full pipeline within 10% rtol/atol of FP32 ref."""
     if not torch.cuda.is_available():
@@ -437,13 +441,13 @@ def test_blockscale_correctness_stage1_stage2_e2e(
     # ----- FlyDSL stage1 -----
     out1, a1_bq, a1_bscale_ref, sorted_ids, sorted_w, sorted_e, num_valid, us1 = (
         _launch_flydsl_stage1(
-            data, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, waves_per_eu=2,
+            data, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, waves_per_eu=2, act=act,
         )
     )
     out1_ref = _torch_stage1_ref(
         a1_bq, data["w1_bq"], data["topk_ids"], a1_bscale_ref,
         data["w1_bscale_flat"], inter_dim,
-        SCALE_BLOCK_N_DEFAULT, SCALE_BLOCK_K_DEFAULT,
+        SCALE_BLOCK_N_DEFAULT, SCALE_BLOCK_K_DEFAULT, act=act,
     )
     err_s1 = checkAllclose(
         out1_ref.to(out1.dtype), out1, rtol=0.1, atol=0.1,

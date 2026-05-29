@@ -4,7 +4,7 @@
 """MoE Blockscale GEMM stage1/stage2 (FlyDSL MFMA FP8).
 
 Per-block scaling (ScaleBlockM=1, ScaleBlockN=128, ScaleBlockK=128).
-FP8-only, g1u1 (gate+up with SiLU).
+FP8-only, g1u1 (gate+up with SiLU or GeLU).
 
 Based on moe_gemm_2stage.py with blockscale compute_tile pattern
 from blockscale_preshuffle_gemm.py.
@@ -81,6 +81,7 @@ def compile_moe_blockscale_gemm1(
     out_dtype: str = "f16",
     use_cshuffle_epilog: bool | None = None,
     waves_per_eu: int | None = None,
+    act: str = "silu",
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -93,6 +94,8 @@ def compile_moe_blockscale_gemm1(
         have a distinct input scaling before quantization).
       - "int4": W4A8 path: X is int8, W is packed int4 (2 values per byte) unpacked to int8 in-kernel
     """
+    if act not in ("silu", "gelu"):
+        raise ValueError(f"act must be 'silu' or 'gelu', got {act!r}")
 
     gpu_arch = get_hip_arch()
     _is_gfx950 = str(gpu_arch).startswith("gfx95")
@@ -236,6 +239,36 @@ def compile_moe_blockscale_gemm1(
             den = 1.0 + emu
             sig = rocdl.rcp(T.f32, den)
             return x * sig
+
+        def gelu(x):
+            # CK parity: y = 0.5 * x * (1 + erf(x / sqrt(2))).
+            # rocdl exposes exp/exp2/rcp but no erf, so we use Abramowitz & Stegun
+            # 7.1.26 polynomial (max abs err ~1.5e-7) and a sign trick for erf.
+            #   z   = x * 1/sqrt(2)
+            #   a   = |z|
+            #   t   = 1 / (1 + 0.3275911 * a)            (rcp)
+            #   p   = ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
+            #   e   = exp(-z*z) = exp2(-z*z * log2(e))   (rocdl.exp2 fast path)
+            #   |erf(z)| = 1 - p * e
+            #   erf(z)   = copysign(|erf(z)|, z)
+            z = x * 0.70710678118654752440  # 1/sqrt(2)
+            a = math_dialect.absf(z)
+            den = 1.0 + 0.3275911 * a
+            t = rocdl.rcp(T.f32, den)
+            # Horner: ((((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
+            p = 1.061405429 * t + (-1.453152027)
+            p = p * t + 1.421413741
+            p = p * t + (-0.284496736)
+            p = p * t + 0.254829592
+            p = p * t
+            # exp(-z*z) = exp2(-z*z * log2e)
+            neg_z2_log2e = (z * z) * (-1.4426950408889634)
+            e = rocdl.exp2(T.f32, neg_z2_log2e)
+            erf_abs = 1.0 - p * e
+            erf_z = math_dialect.copysign(erf_abs, z)
+            return 0.5 * x * (1.0 + erf_z)
+
+        act_fn = gelu if act == "gelu" else silu
 
         acc_init = arith.constant_vector(0, T.i32x4) if is_int8 else arith.constant_vector(0.0, T.f32x4)
 
@@ -1048,7 +1081,7 @@ def compile_moe_blockscale_gemm1(
                         vg = vector.extract(acc_gate[acc_idx], static_position=[ii], dynamic_position=[])
                         vu = vector.extract(acc_up[acc_idx], static_position=[ii], dynamic_position=[])
 
-                        y = silu(vg) * vu
+                        y = act_fn(vg) * vu
                         if const_expr(doweight_stage1):
                             y = y * tw
                         _out_ty = out_mlir()
@@ -1127,7 +1160,7 @@ def compile_moe_blockscale_gemm1(
                         vg = vector.extract(acc_gate[acc_idx], static_position=[ii], dynamic_position=[])
                         vu = vector.extract(acc_up[acc_idx], static_position=[ii], dynamic_position=[])
 
-                        y = silu(vg) * vu
+                        y = act_fn(vg) * vu
                         if const_expr(doweight_stage1):
                             y = y * tw
                         y = arith.trunc_f(out_mlir(), y)
