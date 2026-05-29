@@ -315,13 +315,13 @@ def moe_gemm_a8w4(
             "out_mx_quant currently only supported for GEMM1-style (no scatter); "
             "scatter+combine would need fp8-aware reduce_grouped"
         )
-        out_dtype_actual = torch.float8_e4m3fn
+        out_dtype = torch.float8_e4m3fn
     else:
-        out_dtype_actual = out_dtype
+        out_dtype = out_dtype
     y, y_final = allocate_output(
         M,
         N,
-        out_dtype_actual,
+        out_dtype,
         reduction_n_matmul,
         reduction_n_reduction,
         routing_data,
