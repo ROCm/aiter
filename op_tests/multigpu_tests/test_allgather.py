@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 import argparse
 import pandas as pd
+import statistics
 from aiter.utility import dtypes
 
 if os.getenv("AITER_AOT_IMPORT") == "1":
@@ -127,6 +128,16 @@ def parse_dtype_list(value):
     return names
 
 
+def parse_dim_list(value):
+    dims = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        dims.append(int(item))
+    return dims
+
+
 def dtype_name(dtype):
     for name, torch_dtype in dtypes.d_dtypes.items():
         if torch_dtype == dtype:
@@ -134,7 +145,21 @@ def dtype_name(dtype):
     return str(dtype)
 
 
-def time_all_gather(x, use_custom, dim, warmup, iters, force_direct_custom=False):
+def unique_dims_for_shape(shape, dims):
+    ndim = len(shape)
+    seen = set()
+    unique_dims = []
+    for dim in dims:
+        assert -ndim <= dim < ndim, f"Invalid dim ({dim}) for shape {shape}"
+        normalized_dim = dim if dim >= 0 else ndim + dim
+        if normalized_dim in seen:
+            continue
+        seen.add(normalized_dim)
+        unique_dims.append(dim)
+    return unique_dims
+
+
+def _make_runner(x, dim, use_custom, force_direct_custom):
     custom_dim = dim if dim >= 0 else x.dim() + dim
 
     def run_once():
@@ -142,22 +167,82 @@ def time_all_gather(x, use_custom, dim, warmup, iters, force_direct_custom=False
             return get_tp_group()._all_gather_out_place(x, custom_dim)
         return tensor_model_parallel_all_gather(x, use_custom=use_custom, dim=dim)
 
-    for _ in range(warmup):
-        run_once()
-    torch.cuda.synchronize()
+    return run_once
 
+
+def _avg_across_ranks(local_us, device, group):
+    avg_us = torch.tensor([local_us], dtype=torch.float64, device=device)
+    dist.all_reduce(avg_us, op=dist.ReduceOp.AVG, group=group)
+    return avg_us.item()
+
+
+def time_one_iter(run_fn):
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    out = None
-    for _ in range(iters):
-        out = run_once()
+    out = run_fn()
     end.record()
     end.synchronize()
-    local_us = start.elapsed_time(end) * 1000.0 / iters
-    avg_us = torch.tensor([local_us], dtype=torch.float64, device=x.device)
-    dist.all_reduce(avg_us, op=dist.ReduceOp.AVG, group=get_tp_group().device_group)
-    return out, avg_us.item()
+    return out, start.elapsed_time(end) * 1000.0
+
+
+def time_all_gather(x, use_custom, dim, warmup, iters, force_direct_custom=False):
+    run_once = _make_runner(x, dim, use_custom, force_direct_custom)
+    group = get_tp_group().device_group
+
+    dist.barrier(group=group)
+    for _ in range(warmup):
+        run_once()
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+
+    out = None
+    samples = []
+    for _ in range(iters):
+        out, us = time_one_iter(run_once)
+        samples.append(us)
+    local_us = statistics.median(samples)
+    return out, _avg_across_ranks(local_us, x.device, group)
+
+
+def time_all_gather_pair(x, dim, warmup, iters, force_direct_custom=False):
+    """Interleave baseline (RCCL) and custom timing in a single loop.
+
+    Each iteration times baseline then custom back-to-back so both paths see the
+    same clock/thermal/link state, then reports the median of per-iteration
+    latencies. This removes ordering bias without rerunning slow rows.
+    """
+    baseline_run = _make_runner(x, dim, use_custom=False, force_direct_custom=False)
+    custom_run = _make_runner(
+        x, dim, use_custom=True, force_direct_custom=force_direct_custom
+    )
+    group = get_tp_group().device_group
+
+    dist.barrier(group=group)
+    for _ in range(warmup):
+        baseline_run()
+        custom_run()
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+
+    baseline_out = None
+    custom_out = None
+    baseline_samples = []
+    custom_samples = []
+    for _ in range(iters):
+        baseline_out, baseline_us = time_one_iter(baseline_run)
+        custom_out, custom_us = time_one_iter(custom_run)
+        baseline_samples.append(baseline_us)
+        custom_samples.append(custom_us)
+
+    baseline_local = statistics.median(baseline_samples)
+    custom_local = statistics.median(custom_samples)
+    return (
+        baseline_out,
+        _avg_across_ranks(baseline_local, x.device, group),
+        custom_out,
+        _avg_across_ranks(custom_local, x.device, group),
+    )
 
 
 def sweep_worker(
@@ -192,45 +277,6 @@ def sweep_worker(
                 make_input(shape, dtype, rank).to(device) for rank in range(tp_size)
             ]
             ref = torch.cat(ref_parts, dim=normalized_dim)
-
-            baseline_out = None
-            baseline_us = None
-            baseline_err = None
-            baseline_error = ""
-            try:
-                baseline_out, baseline_us = time_all_gather(
-                    x, use_custom=False, dim=dim, warmup=warmup, iters=iters
-                )
-                baseline_err = check_equal(
-                    ref,
-                    baseline_out.to(ref),
-                    msg=f"baseline allgather: {shape=} {dtype=} {dim=}",
-                )
-            except Exception as exc:
-                baseline_error = str(exc).replace("\n", " ")
-                logger.warning(
-                    "baseline allgather unsupported/failed: shape=%s dtype=%s dim=%s error=%s",
-                    shape,
-                    dtype,
-                    dim,
-                    baseline_error,
-                )
-
-            custom_out, custom_us = time_all_gather(
-                x,
-                use_custom=True,
-                dim=dim,
-                warmup=warmup,
-                iters=iters,
-                force_direct_custom=force_direct_custom,
-            )
-
-            custom_err = check_equal(
-                ref,
-                custom_out.to(ref),
-                msg=f"custom allgather: {shape=} {dtype=} {dim=}",
-            )
-
             input_bytes = x.numel() * x.element_size()
             direct_supported = input_bytes % 16 == 0 and (
                 normalized_dim == 0
@@ -239,10 +285,122 @@ def sweep_worker(
                     and x.shape[-1] * x.element_size() % 16 == 0
                 )
             )
-            custom_eligible = direct_supported
+            runtime_guarded = False
+            custom_eligible = direct_supported and not runtime_guarded
+
+            baseline_out = None
+            baseline_us = None
+            baseline_err = None
+            baseline_error = ""
+            custom_out = None
+            custom_us = None
+            custom_err = None
+            custom_error = ""
+
+            custom_runnable = not (force_direct_custom and not direct_supported)
+            if not custom_runnable:
+                custom_error = "direct custom all-gather unsupported for normalized_dim"
+
+            if custom_runnable:
+                # Interleave baseline and custom timing so both paths observe the
+                # same clock/thermal/link state each iteration.
+                try:
+                    (
+                        baseline_out,
+                        baseline_us,
+                        custom_out,
+                        custom_us,
+                    ) = time_all_gather_pair(
+                        x,
+                        dim=dim,
+                        warmup=warmup,
+                        iters=iters,
+                        force_direct_custom=force_direct_custom,
+                    )
+                    baseline_err = check_equal(
+                        ref,
+                        baseline_out.to(ref),
+                        msg=f"baseline allgather: {shape=} {dtype=} {dim=}",
+                    )
+                    custom_err = check_equal(
+                        ref,
+                        custom_out.to(ref),
+                        msg=f"custom allgather: {shape=} {dtype=} {dim=}",
+                    )
+                except Exception as exc:
+                    baseline_error = str(exc).replace("\n", " ")
+                    logger.warning(
+                        "interleaved allgather unsupported/failed: shape=%s dtype=%s dim=%s error=%s",
+                        shape,
+                        dtype,
+                        dim,
+                        baseline_error,
+                    )
+                    baseline_out = None
+                    baseline_us = None
+                    custom_out = None
+                    custom_us = None
+                    try:
+                        custom_out, custom_us = time_all_gather(
+                            x,
+                            use_custom=True,
+                            dim=dim,
+                            warmup=warmup,
+                            iters=iters,
+                            force_direct_custom=force_direct_custom,
+                        )
+                        custom_err = check_equal(
+                            ref,
+                            custom_out.to(ref),
+                            msg=f"custom allgather: {shape=} {dtype=} {dim=}",
+                        )
+                    except Exception as custom_exc:
+                        custom_error = str(custom_exc).replace("\n", " ")
+                        logger.warning(
+                            "custom allgather unsupported/failed: shape=%s dtype=%s dim=%s error=%s",
+                            shape,
+                            dtype,
+                            dim,
+                            custom_error,
+                        )
+            else:
+                # Custom path is unsupported for this dim; still time RCCL alone.
+                try:
+                    baseline_out, baseline_us = time_all_gather(
+                        x,
+                        use_custom=False,
+                        dim=dim,
+                        warmup=warmup,
+                        iters=iters,
+                    )
+                    baseline_err = check_equal(
+                        ref,
+                        baseline_out.to(ref),
+                        msg=f"baseline allgather: {shape=} {dtype=} {dim=}",
+                    )
+                except Exception as exc:
+                    baseline_error = str(exc).replace("\n", " ")
+                    logger.warning(
+                        "baseline allgather unsupported/failed: shape=%s dtype=%s dim=%s error=%s",
+                        shape,
+                        dtype,
+                        dim,
+                        baseline_error,
+                    )
             speedup = (
                 baseline_us / custom_us
-                if direct_supported and baseline_us is not None and custom_us > 0
+                if direct_supported
+                and baseline_us is not None
+                and custom_us is not None
+                and custom_us > 0
+                else None
+            )
+            api_speedup = (
+                baseline_us / custom_us
+                if custom_eligible
+                and baseline_us is not None
+                and custom_us is not None
+                and custom_us > 0
                 else None
             )
             rows.append(
@@ -251,15 +409,19 @@ def sweep_worker(
                     "shape": str(tuple(shape)),
                     "dtype": dtype_name_value,
                     "dim": dim,
+                    "normalized_dim": normalized_dim,
                     "input_bytes": input_bytes,
                     "direct_supported": direct_supported,
+                    "runtime_guarded": runtime_guarded,
                     "custom_eligible": custom_eligible,
                     "baseline_us": baseline_us,
                     "custom_us": custom_us,
                     "speedup": speedup,
+                    "api_speedup": api_speedup,
                     "baseline_err": baseline_err,
                     "custom_err": custom_err,
                     "baseline_error": baseline_error,
+                    "custom_error": custom_error,
                 }
             )
     finally:
@@ -285,7 +447,7 @@ def allgather_sweep(
         (shape, dtype_name_value, dim)
         for dtype_name_value in dtype_names
         for shape in shapes
-        for dim in dims
+        for dim in unique_dims_for_shape(shape, dims)
     ]
     pool = Pool(processes=tp_size)
     rets = [
@@ -558,6 +720,12 @@ parser.add_argument(
 parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations.")
 parser.add_argument("--iters", type=int, default=100, help="Timing iterations.")
 parser.add_argument(
+    "--dim",
+    type=str,
+    default="0,-1",
+    help="Dimension or comma-separated dimensions to gather. Duplicate normalized dims per shape are skipped.",
+)
+parser.add_argument(
     "--output-csv",
     type=str,
     default=None,
@@ -581,7 +749,7 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[key] for key in l_dtype_names]
     if args.shape is not None:
         l_shape = parse_shape_list(args.shape)
-    l_dim = [0, -1]
+    l_dim = parse_dim_list(args.dim)
     if args.fast_sweep:
         df = pd.DataFrame(
             allgather_sweep(
@@ -603,15 +771,19 @@ if __name__ == "__main__":
             "shape",
             "dtype",
             "dim",
+            "normalized_dim",
             "input_bytes",
             "direct_supported",
+            "runtime_guarded",
             "custom_eligible",
             "baseline_us",
             "custom_us",
             "speedup",
+            "api_speedup",
             "baseline_err",
             "custom_err",
             "baseline_error",
+            "custom_error",
         ]
         logger.info(
             "allgather fast sweep summary (markdown):\n%s",
@@ -624,7 +796,7 @@ if __name__ == "__main__":
     df = []
     for dtype in l_dtype:
         for shape in l_shape:
-            for dim in l_dim:
+            for dim in unique_dims_for_shape(shape, l_dim):
                 for use_custom in [False, True]:
                     ret = allgather_perftest(
                         args.tp_size,
