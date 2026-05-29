@@ -270,6 +270,44 @@ def fmha_v3_fwd(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
+def _gen_fmha_v3_fwd_sparse_fake_tensors(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    softmax_scale: float,
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]:
+    if out is not None:
+        return (out,)
+    return (torch.empty_like(q, dtype=dtypes.bf16),)
+
+
+@compile_ops(
+    "module_fmha_v3_fwd",
+    fc_name="fmha_v3_fwd_sparse",
+    gen_fake=_gen_fmha_v3_fwd_sparse_fake_tensors,
+)
+def fmha_v3_fwd_sparse(
+    q: Tensor,                    # [b, sq, hq, 128], int8
+    k: Tensor,                    # [b, sk, hk, 128], int8
+    v: Tensor,                    # [b, sk, hk, 128], fp8
+    q_descale: Tensor,            # [1] or [b, hk], fp32
+    k_descale: Tensor,            # [1] or [b, hk], fp32
+    v_descale: Tensor,            # [1] or [b, hk], fp32
+    kv_block_indices: Tensor,     # int32
+    lut_start: Tensor,            # int32 [b*hq*num_q_blocks]
+    lut_count: Tensor,            # int32 [b*hq*num_q_blocks]
+    softmax_scale: float,
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]: ...
+
+
 def cmdGenFunc_mha_varlen_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3164,6 +3202,70 @@ def flash_attn_i8fp8_pertensor_func(
         return_lse=False,
         return_softmax=False,
     )
+    out = out_padded[..., :head_size_v_og]
+    return out
+
+
+def flash_attn_i8fp8_sparse_pertensor_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    kv_block_indices: torch.Tensor,
+    lut_start: torch.Tensor,
+    lut_count: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+):
+    """Block-sparse Sage i8fp8 FMHA forward (hd=128, gfx950).
+
+    Sibling of flash_attn_i8fp8_pertensor_func that goes through the same
+    aiter v3 ASM host loader (module_fmha_v3_fwd) but routes to the
+    hand-written sparse kernel fwd_hd128_i8fp8_sparse.co.
+
+    Args:
+        q: int8 tensor [b, sq, hq, 128], bshd
+        k: int8 tensor [b, sk, hk, 128], bshd
+        v: fp8 tensor  [b, sk, hk, 128], bshd
+        q_descale, k_descale, v_descale: fp32 scalars or [b, hk]
+        kv_block_indices, lut_start, lut_count: int32 LUT produced by
+            aiter.ops.triton.attention.utils.block_attn_mask_to_ragged_lut
+            (return_none_if_dense=False; this kernel has no dense path).
+        softmax_scale: if None, defaults to head_dim**-0.5
+
+    Constraints (assert-checked C++-side):
+        sq % 256 == 0, sk % 128 == 0, hq % hk == 0, (hq/hk) is a power of 2,
+        head_dim == 128, batch mode, non-causal, gfx950.
+
+    Returns:
+        out: bf16 tensor [b, sq, hq, 128], bshd
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    head_size_q_og = q.size(3)
+    head_size_v_og = v.size(3)
+    # The kernel is hard-coded to hd=128; pad if the caller's tensors come in
+    # smaller (matches the pad-to-multiple-of-8 convention of the dense path).
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+    outs = fmha_v3_fwd_sparse(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+        float(softmax_scale),
+        None,
+    )
+    out_padded = outs[0]
     out = out_padded[..., :head_size_v_og]
     return out
 

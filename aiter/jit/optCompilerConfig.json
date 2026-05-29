@@ -1130,8 +1130,10 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_fwd_sparse.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_fwd_asm_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'"
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_sparse.cu'"
         ],
         "flags_extra_cc": [
             "'-DFAV3_ON=1'",
