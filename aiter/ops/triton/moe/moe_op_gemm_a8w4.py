@@ -1,7 +1,10 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
+import functools
 import itertools
+import json
+import os
 import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
@@ -12,9 +15,21 @@ from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_gluon,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.device_info import get_num_sms
+
+
+@functools.lru_cache
+def _get_a8w4_dispatch(arch: str) -> dict:
+    """Per-(block_m, N, K) dispatch table for moe_gemm_a8w4. Returns {} if no
+    tuned file is shipped for this arch (caller uses the safe-default fallback).
+    Mirrors get_moe_configs() in utils/moe_config_utils.py."""
+    fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-MOE-MX_FP4_A8.json"
+    if os.path.exists(fpath):
+        with open(fpath, "r") as f:
+            return json.load(f)
+    return {}
 
 
 def can_overflow_int32(tensor: torch.Tensor):
@@ -66,39 +81,42 @@ def get_kernel_config_triton(m, n, k, routing_data):
     w_cache_modifier = ".cg" if block_m <= 32 else None
     arch = get_arch()
     split_k = 1
+
+    # Tuned dispatch: per-(block_m, N, K) winners from a sweep tuner.
+    # Schema mirrors sister files like gfx950-MOE-FP8_W8A8.json (BLOCK_SIZE_N,
+    # BLOCK_SIZE_K, num_warps, …) except BLOCK_SIZE_M is omitted because block_m
+    # is the dispatch key, not a tunable (routing decides block_m for the layer).
+    tuned = _get_a8w4_dispatch(arch).get(f"bm{block_m}_n{n}_k{k}")
+    if tuned is not None:
+        return {
+            "block_m": block_m,
+            "block_n": tuned["BLOCK_SIZE_N"],
+            "block_k": tuned["BLOCK_SIZE_K"],
+            "num_warps": tuned["num_warps"],
+            "num_stages": tuned["num_stages"],
+            "group_m": group_m,
+            "xcd_swizzle": xcd_swizzle,
+            "w_cache_modifier": w_cache_modifier,
+            "split_k": split_k,
+            "waves_per_eu": tuned.get("waves_per_eu", 0),
+            "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 16),
+            "kpack": tuned.get("kpack", 1),
+        }
+
+    # Safe-default fallback: shape not in the tuned dispatch JSON. A single
+    # conservative tile, LDS-safe at ns=2 for every block_m the router produces
+    # ({16, 32, 64, 128}). Production-reachable shapes belong in the JSON; this
+    # is just the cold-tail default. ns==2 is asserted so we never silently
+    # degrade to ns=1 (which is what the old bn=512 heuristic did).
+    block_n = 128
     block_k = 256
-
-    if block_m == 16:
-        block_n = 128
-        num_warps = 4
-
-        grid_m = routing_data.n_blocks(m, block_m)
-        grid_n = triton.cdiv(n, block_n)
-        grid = grid_m * grid_n * split_k
-        while block_n >= 64 and grid < get_num_sms():
-            block_n = block_n // 2
-            grid_m = routing_data.n_blocks(m, block_m)
-            grid_n = triton.cdiv(n, block_n)
-            grid = grid_m * grid_n * split_k
-
-    elif block_m == 32:
-        if n <= 1024:
-            block_n = 128
-            num_warps = 4
-        elif n <= 4096:
-            block_n = 256
-            num_warps = 4
-        else:
-            block_n = 512
-            num_warps = 4
-
-    else:
-        block_n = 512
-        # routing caps block_m at 128; nw=4 wins ~2x at block_m=128 on gpt-oss
-        # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
-        num_warps = 4 if block_m == 128 else 8
+    num_warps = 4
     num_stages = pick_gemm_num_stages(
         arch, block_m, block_n, block_k, 8, 4, use_async_padding=True
+    )
+    assert num_stages == 2, (
+        f"a8w4 fallback expected ns=2 (LDS-safe), got ns={num_stages} "
+        f"for block_m={block_m} block_n={block_n} block_k={block_k} arch={arch}"
     )
 
     ret = {
