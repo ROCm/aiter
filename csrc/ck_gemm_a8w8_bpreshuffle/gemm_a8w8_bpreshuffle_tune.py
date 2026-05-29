@@ -614,6 +614,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                     ret,
                     slack_tol=args.post_verify_slack_tol,
                     max_fallback=args.post_verify_max_fallback,
+                    n_iters=args.post_verify_iters,
                     verbose=args.verbose,
                 )
 

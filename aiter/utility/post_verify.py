@@ -18,6 +18,7 @@ a single GPU; its synchronizations therefore cannot perturb any other
 worker's timing measurements.
 """
 
+import statistics
 from collections import defaultdict
 
 import torch
@@ -129,21 +130,27 @@ def _fill_nan_sentinel(real_args, arg_key_list, output_keys):
     torch.cuda.synchronize()
 
 
-def _run_and_compare(task, device) -> float:
-    """Re-execute one task once on ``device`` and return max per-element slack.
+def _run_and_compare(task, device, n_iters: int = 1) -> float:
+    """Re-execute one task ``n_iters`` times on ``device`` and return the
+    median per-iteration max slack.
 
-    Two failure modes are detected:
+    Median (not min/max) so that a borderline kernel which lies right at
+    ``slack_tol`` does not stochastically flip pass/fail across repeats
+    of the experiment: with n=3, two of three iters must concur. Cost
+    scales linearly in n_iters but verify is cheap (one kernel call per
+    iter), so even n=5 typically adds milliseconds per shape.
+
+    Two failure modes are detected (per iter):
 
     1. *Partial-write* kernels: output tensors are NaN-filled before the
        kernel runs (mirroring ``mp_tuner.worker``); any surviving NaN /
-       Inf in the output is treated as an infinite slack.
+       Inf in the output is treated as an infinite slack for that iter.
     2. *Wide-range* / wrong-value errors: per-element
-       ``|a-b| / (atol + rtol*|b|)`` is computed in fp32; the maximum
-       value is returned. The (atol, rtol) used are the ones the tune
-       task itself passed to ``checkAllclose`` (extracted from
-       ``task[10]``/``task[11]``), so this metric is on the same scale
-       as the tuner's tolerance: 1.0 means "exactly at the tune-time
-       isclose threshold", 10.0 means "10x past it".
+       ``|a-b| / (atol + rtol*|b|)`` is computed in fp32; the max value
+       is the iter's slack. The (atol, rtol) used are the ones the tune
+       task itself passed to ``checkAllclose`` (task[10] / task[11]),
+       so the metric is on the same scale as the tuner's tolerance:
+       1.0 == exactly at tune-time isclose threshold, 10.0 == 10x past.
 
     Note: ``task[5]`` (``kwargs``) is the dict that ``mp_tuner.worker``
     forwards to ``run_perftest``. ``run_perftest`` peels off its own
@@ -152,7 +159,6 @@ def _run_and_compare(task, device) -> float:
     that kernels which legitimately receive extra kwargs continue to
     work.
     """
-    real_args, ref, arg_key_list = _materialize_args(task, device)
     _func = task[3]
     raw_kwargs = task[5] or {}
     func_kwargs = {k: v for k, v in raw_kwargs.items() if k not in _PERFTEST_KWARGS}
@@ -162,26 +168,34 @@ def _run_and_compare(task, device) -> float:
         task[14] if len(task) > 14 and isinstance(task[14], (list, tuple)) else None
     )
 
-    _fill_nan_sentinel(real_args, arg_key_list, output_keys)
+    iter_slacks: list[float] = []
+    for _ in range(max(1, n_iters)):
+        real_args, ref, arg_key_list = _materialize_args(task, device)
+        _fill_nan_sentinel(real_args, arg_key_list, output_keys)
 
-    out = _func(*real_args, **func_kwargs)
-    torch.cuda.synchronize()
+        out = _func(*real_args, **func_kwargs)
+        torch.cuda.synchronize()
 
-    refs = ref if isinstance(ref, (list, tuple)) else [ref]
-    outs = out if isinstance(out, (list, tuple)) else [out]
-    tensor_pairs = [
-        (o, r)
-        for o, r in zip(outs, refs)
-        if isinstance(o, torch.Tensor) and isinstance(r, torch.Tensor)
-    ]
-    if not tensor_pairs:
-        return 0.0
+        refs = ref if isinstance(ref, (list, tuple)) else [ref]
+        outs = out if isinstance(out, (list, tuple)) else [out]
+        tensor_pairs = [
+            (o, r)
+            for o, r in zip(outs, refs)
+            if isinstance(o, torch.Tensor) and isinstance(r, torch.Tensor)
+        ]
+        if not tensor_pairs:
+            iter_slacks.append(0.0)
+            continue
 
-    for o, _ in tensor_pairs:
-        if not torch.isfinite(o).all():
-            return float("inf")
+        if any(not torch.isfinite(o).all() for o, _ in tensor_pairs):
+            iter_slacks.append(float("inf"))
+            continue
 
-    return max(_max_slack(o, r, atol=atol, rtol=rtol) for o, r in tensor_pairs)
+        iter_slacks.append(
+            max(_max_slack(o, r, atol=atol, rtol=rtol) for o, r in tensor_pairs)
+        )
+
+    return statistics.median(iter_slacks)
 
 
 def verify_top1(
@@ -190,6 +204,7 @@ def verify_top1(
     *,
     slack_tol: float = 10.0,
     max_fallback: int = 3,
+    n_iters: int = 1,
     gpu_id: int = 0,
     verbose: bool = False,
 ):
@@ -213,6 +228,11 @@ def verify_top1(
             (top-1, top-2, ..., top-max_fallback). Demoted entries
             have ``err_ratio`` set to ``1.0`` so the caller's sort
             naturally skips them.
+        n_iters: how many times to re-run each candidate; the median
+            slack over the iters is what gets compared to slack_tol.
+            Defaults to 1 (cheapest, but a borderline candidate can
+            flip pass/fail across repeats of the experiment). Use 3
+            or 5 for steadier accept/demote decisions; cost is linear.
         gpu_id: GPU index to run verification on (serial).
         verbose: print one line per demotion / late accept.
 
@@ -248,7 +268,7 @@ def verify_top1(
                     )
                 break
             try:
-                slack = _run_and_compare(task, device)
+                slack = _run_and_compare(task, device, n_iters=n_iters)
             except Exception as e:
                 if verbose:
                     print(f"[post-verify] {info}: verify crashed ({e}); demoting")

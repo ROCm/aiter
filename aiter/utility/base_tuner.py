@@ -225,6 +225,17 @@ class TunerCommon:
             help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
         self.parser.add_argument(
+            "--tune_tie_break_rel_tol",
+            type=float,
+            default=0.0,
+            help="When picking the per-shape top-1 kernel, treat any two "
+            "candidates whose us are within this relative tolerance as tied "
+            "and break the tie by smaller kernelId. Stabilizes picks across "
+            "repeated multi-GPU tune runs when many candidates have very "
+            "close timings (common on a8w8_bpreshuffle). Default 0 = off "
+            "(strict us ordering, current behavior).",
+        )
+        self.parser.add_argument(
             "--fast_tune",
             action="store_true",
             default=False,
@@ -263,6 +274,16 @@ class TunerCommon:
             default=3,
             help="With --post_verify, maximum number of top-N candidates to "
             "verify per shape before giving up (default 3).",
+        )
+        self.parser.add_argument(
+            "--post_verify_iters",
+            type=int,
+            default=1,
+            help="With --post_verify, how many times to re-execute each "
+            "candidate; the median slack across iters is compared to "
+            "--post_verify_slack_tol. Default 1 (cheapest); 3 or 5 makes "
+            "borderline accept/demote decisions reproducible across "
+            "experiment repeats at linear cost.",
         )
 
     def parse_args(self):
@@ -518,9 +539,23 @@ class TunerCommon:
 
         grouped_results = list(grouped_rets.items())
 
+        tie_rel_tol = getattr(args, "tune_tie_break_rel_tol", 0.0) or 0.0
         for info_key, time_list in grouped_results:
             tol_err_ratio = args.errRatio
             sorted_time = sorted(time_list, key=lambda x: x[1])
+            # Stability against multi-GPU timing noise: among kernels within
+            # `tie_rel_tol` of the best us, deterministically prefer the
+            # smaller kernelId so consecutive tune runs converge on the same
+            # pick rather than flipping between noise-equivalent kernels.
+            # info_ex[0] is the kernelId in every current tune script.
+            if tie_rel_tol > 0 and sorted_time:
+                best_us = next((us for _, us, _ in sorted_time if us > 0), None)
+                if best_us is not None and best_us > 0:
+                    cutoff = best_us * (1.0 + tie_rel_tol)
+                    near_best = [t for t in sorted_time if 0 < t[1] <= cutoff]
+                    rest = [t for t in sorted_time if not (0 < t[1] <= cutoff)]
+                    near_best.sort(key=lambda t: (t[0][0], t[1]))
+                    sorted_time = near_best + rest
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio)
                 for info_ex, us, max_err_ratio in sorted_time
