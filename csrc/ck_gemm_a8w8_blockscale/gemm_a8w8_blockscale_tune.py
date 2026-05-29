@@ -92,8 +92,9 @@ def run_gemm_a8w8_blockscale_cktile(
     Run gemm a8w8 blockscale tuned kernel for ck_tile type.
 
     When ``y_is_zeroed=True`` the kernel skips its internal ``Y.zero_()`` for
-    splitK>0; this models the producer-fused zero-init configuration so the
-    measured time reflects the GEMM-only cost the demo aims to deliver.
+    splitK>0; this models the configuration where an upstream producer kernel
+    has already pre-zeroed Y, so the measured time reflects the GEMM cost
+    without the redundant zero-init.
     """
 
     if preshuffleB:
@@ -204,9 +205,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
 
         super().__init__(name, keys, resultList, description)
         # CKTile-only flag: pass y_is_zeroed=True to the cktile tune entry so
-        # the kernel skips its internal Y.zero_() for splitK>0.  Used to model
-        # the producer-fused zero-init configuration when picking the best
-        # kernel for the splitK_fused demo path.
+        # the kernel skips its internal Y.zero_() for splitK>0.  Used to pick
+        # the best kernel for the configuration where an upstream producer
+        # pre-zeroes Y and the GEMM runs with y_is_zeroed=True.
         self.parser.add_argument(
             "--y_is_zeroed",
             action="store_true",

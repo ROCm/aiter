@@ -11,9 +11,9 @@
 #include "gemm_a8w8_blockscale_cktile_lookup.h"
 #include "gemm_a8w8_blockscale_cktile_manifest.h"
 
-// Raw fn-ptr value type (matches main's POD lookup style from PR #3255) with
-// y_is_zeroed plumbed as the trailing bool so the kernel can skip its internal
-// Y.zero_() when an upstream producer has already pre-zeroed Y.
+// Raw fn-ptr value type (matches main's POD lookup style) with y_is_zeroed
+// plumbed as the trailing bool so the kernel can skip its internal Y.zero_()
+// when an upstream producer has already pre-zeroed Y.
 using BlockwiseKernel = torch::Tensor (*)(
     torch::Tensor&,
     torch::Tensor&,

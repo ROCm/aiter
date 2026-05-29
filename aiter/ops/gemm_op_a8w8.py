@@ -713,7 +713,8 @@ def gemm_a8w8_blockscale(
     them: in current AITER main the C++ cktile dispatch is keyed by
     ``kernelName``, and an empty name falls back to a non-tuned default
     heuristic kernel.  Bypassing the CSV would therefore silently lose the
-    tuned kernel selection (the symptom that motivated this design choice).
+    tuned kernel selection, so this wrapper always resolves splitK and
+    ``kernelName`` from the CSV rather than accepting them as arguments.
     """
     assert dtype in [
         dtypes.bf16,
