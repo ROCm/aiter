@@ -1029,41 +1029,57 @@ def mla_decode_fwd_v4_nm(
 
     Routes through the canonical aiter JIT C-ABI module
     `module_mla_v4_asm` (csrc/py_itfs_cu/asm_mla_v4.cu). Returns
-    `(logits, attn_lse)` — both 5D
-    `[num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim]`
-    (and `[..., 1]` for attn_lse).
+    `(logits, attn_lse)` — both 4D, in **kernel-native layout**:
+        logits:   [total_q, num_kv_splits, num_heads, v_head_dim]   FP32
+        attn_lse: [total_q, num_kv_splits, num_heads, 1]            FP32
+    where `total_q = num_seqs * max_seqlen_q` and
+    `num_heads = num_kv_heads * gqa_ratio` (gqa-flattened, mirrors V3
+    convention).
+
+    NOTE on layout: V3 wrapper exposes the same kernel-native ordering as
+    its `mla_decode_fwd` (line 229-253). poc_kl host calls
+    `mla_reorder_gpuO` (poc_kl/common/mla.hpp:585) to transpose
+    `(max_seqlen_q, num_kv_splits)` so the dump shape becomes
+    `[num_seqs, num_kv_splits, num_kv_heads, max_seqlen_q*gqa_ratio, dv]`.
+    We deliberately keep the kernel-native shape here so the cross-split
+    merge can run with zero reorder copy.
 
     Single-pass mode (`num_kv_splits == 1`):
-      Caller can pre-allocate logits/attn_lse for sentinel testing, or leave
-      None and let us allocate. `output[total_q, num_heads, v_head_dim]` BF16
-      is only written by the kernel when `out_16_nosplit == 1`.
+      Returned `logits[:, 0]` already holds the per-token output (no merge
+      needed). `output[total_q, num_heads, v_head_dim]` BF16 is only written
+      by the kernel when `out_16_nosplit == 1`.
 
     Multi-pass mode (`num_kv_splits > 1`):
-      Following the V3 architecture (`mla_decode_fwd` non-persistent path):
-        1. If `split_indptr` is None, build a uniform one:
-           `[0, N, 2N, ..., bs*N]` so every seq uses all N passes.
-        2. Force `out_16_nosplit = 0` — the kernel's bf16-direct-write path
-           does not support multi-pass.
-        3. After the kernel returns 5D FP32 partials, do a FlashAttention
-           logsumexp merge across the splits axis in pytorch and overwrite
-           `logits[:, 0]` / `attn_lse[:, 0]` with the merged result. Caller
-           reads `logits[:, 0]` to get the post-reduce values regardless of
-           how many splits were used. The remaining `logits[:, 1:]` /
-           `attn_lse[:, 1:]` slots are left as the kernel wrote them.
+      1. If `split_indptr` is None, build a uniform one:
+         `[0, N, 2N, ..., bs*N]` so every seq uses all N passes.
+      2. Force `out_16_nosplit = 0` — the kernel's bf16-direct-write path
+         does not support multi-pass.
+      3. After the kernel returns FP32 partials, run V3's
+         `_fwd_kernel_stage2_asm` triton kernel which performs the
+         FlashAttention LSE merge across the `num_kv_splits` axis and
+         writes the merged result directly into the BF16 `output` tensor.
+         The kernel-native layout maps trivially onto stage2's expected
+         `Mid_O [total_s, splits, nhead, dv]` contract — no reorder copy
+         and no per-call buffer allocation. (mla_reduce_v1 was tried as
+         an alternative but is ~9us slower in run_perftest profiling
+         because it needs to build reduce_indptr / reduce_partial_map
+         arange tensors every call.)
 
-      The merge intentionally stays inside the 5D tensor — it does NOT touch
-      `output` BF16 because the in-memory ordering of (max_seqlen_q, gqa) inside
-      the q_seq_lens_internal dim is kernel-specific (poc_kl reorders via
-      `mla_reorder_gpuO` before BF16 export). Callers that need
-      `output[total_q, num_heads, v_head_dim]` must perform that reorder
-      themselves; integrating it into this wrapper is a follow-up.
+      For shapes where the GPU is already saturated by batch parallelism
+      (e.g. bs >= ~64 on MI350), `num_kv_splits > 1` is a *deceleration*:
+      the per-WG work-share decreases but extra HBM streaming + stage2
+      overhead net negative. kvsplit's win-region is small batch + long
+      KV (e.g. bs=1, kv >= 1024) where per-WG serialization dominates.
+
+      Caller reads the merged result from `output` (BF16); the FP32 partials
+      can be inspected via `logits` / `attn_lse` if desired (e.g., for
+      debugging or custom merge paths).
     """
     num_seqs = qo_indptr.shape[0] - 1
     num_heads = q.size(1)
     v_head_dim = output.size(2)
     num_kv_heads = kv_buffer.size(2)
     gqa_ratio = num_heads // num_kv_heads
-    q_seq_lens_internal = gqa_ratio * max_seqlen_q
 
     # ---- V3-style auto-fill of split_indptr (== num_kv_splits_indptr) ----
     # V3 `get_meta_param` builds this exact tensor when caller didn't provide
@@ -1086,17 +1102,60 @@ def mla_decode_fwd_v4_nm(
             f"supports passes==1). Got out_16_nosplit={out_16_nosplit}."
         )
 
+    # ---- Allocate splitData / splitLse in KERNEL-NATIVE layout --------------
+    # The qh64-recompile family v4 nm kernel writes splitData/splitLse with
+    # this byte ordering (poc_kl mla_v4.h, line 481-483 + mla_reorder_gpuO):
+    #   [num_seqs, max_seqlen_q, num_kv_splits, num_heads, v_head_dim]
+    # where num_heads = num_kv_heads * gqa_ratio (the gqa-flattened head dim
+    # used by V3's `_fwd_kernel_stage2_asm` triton merge).
+    #
+    # poc_kl host then calls mla_reorder_gpuO (poc_kl/common/mla.hpp:585) to
+    # transpose `(max_seqlen_q, num_kv_splits)` *before* host-side reduce so
+    # the public-facing dump shape becomes
+    #   [num_seqs, num_kv_splits, num_kv_heads, max_seqlen_q*gqa_ratio, v_head_dim]
+    # We *don't* do that reorder here. Instead we keep the kernel-native
+    # layout and feed it straight into V3's `_fwd_kernel_stage2_asm` which
+    # takes explicit per-axis stride args — saving the ~128MB permute+
+    # contiguous copy that an mla_reduce_v1-based path would otherwise need.
+    #
+    # The 4D contiguous view `[total_q, num_kv_splits, num_heads, dv]` is
+    # bit-equivalent to the kernel's native write order because:
+    #   total_q (= num_seqs * max_seqlen_q) is contiguous-row-major over
+    #   (batch, q_logical), exactly matching the kernel's outer two axes.
+    total_q = num_seqs * max_seqlen_q
+    num_heads = num_kv_heads * gqa_ratio  # gqa-flattened head dim
+
+    expected_logits_shape = (total_q, num_kv_splits, num_heads, v_head_dim)
+    expected_lse_shape = (total_q, num_kv_splits, num_heads, 1)
     if logits is None:
         logits = torch.empty(
-            (num_seqs, num_kv_splits, num_kv_heads, q_seq_lens_internal, v_head_dim),
+            expected_logits_shape,
             dtype=dtypes.fp32,
             device=q.device,
         )
+    elif tuple(logits.shape) != expected_logits_shape:
+        raise ValueError(
+            f"mla_decode_fwd_v4_nm: caller-provided `logits` has shape "
+            f"{tuple(logits.shape)}, expected {expected_logits_shape} "
+            f"(kernel-native layout: [total_q, num_kv_splits, num_heads, v_head_dim] "
+            f"with total_q=num_seqs*max_seqlen_q and num_heads=num_kv_heads*gqa_ratio). "
+            f"NOTE: this differs from the older 5D shape "
+            f"[num_seqs, num_kv_splits, num_kv_heads, max_seqlen_q*gqa_ratio, v_head_dim]; "
+            f"the wrapper now keeps the kernel-native layout to skip a permute+copy "
+            f"and feed `_fwd_kernel_stage2_asm` directly. Pass logits=None to let "
+            f"the wrapper allocate, or update your shape to the new layout."
+        )
     if attn_lse is None:
         attn_lse = torch.empty(
-            (num_seqs, num_kv_splits, num_kv_heads, q_seq_lens_internal, 1),
+            expected_lse_shape,
             dtype=dtypes.fp32,
             device=q.device,
+        )
+    elif tuple(attn_lse.shape) != expected_lse_shape:
+        raise ValueError(
+            f"mla_decode_fwd_v4_nm: caller-provided `attn_lse` has shape "
+            f"{tuple(attn_lse.shape)}, expected {expected_lse_shape}. See the "
+            f"note in the `logits` shape error above for details."
         )
 
     # softmax_scale is ignored by the v4 nm kernel (hardcodes 1/sqrt(512));
@@ -1122,48 +1181,49 @@ def mla_decode_fwd_v4_nm(
         output,
     )
 
-    # ---- FlashAttention-style merge across the splits axis ----------------
-    # Each (seq, split) WG wrote a `attn_lse[seq, split, ...]` scalar (log of
-    # the softmax denominator for that KV chunk) plus the partial value
-    # `logits[seq, split, ...]`. The merge over `K` chunks is:
-    #     m  = max_k lse[k]
-    #     w_k = exp(lse[k] - m)
-    #     V  = sum_k(w_k * V[k]) / sum_k(w_k)
-    #     lse_merged = m + log(sum_k(w_k))
-    # All slots `split >= split_indptr[seq+1] - split_indptr[seq]` are
-    # uninitialized memory; we mask them out via lse = -inf so their weights
-    # become 0 and they don't perturb the merge.
+    # ---- Cross-split FlashAttention merge via _fwd_kernel_stage2_asm ------
+    # Mirrors V3 non-persistent path (mla_decode_fwd line 308). Triton kernel
+    # walks Mid_O / Mid_lse using stride args (no contiguous-layout
+    # assumption) and writes the merged result directly into `output` BF16.
+    # Reuses `split_indptr` (already on device, allocated by caller or above)
+    # — no per-call arange overhead, which makes it ~9us faster than
+    # mla_reduce_v1 in run_perftest's GPU-only profile measurement at the
+    # bs=64 kv=384 splits=4 reference shape (mla_reduce_v1 needs to build
+    # reduce_indptr + reduce_partial_map every call, costing 2 extra arange
+    # kernel launches).
     if num_kv_splits > 1:
         device = logits.device
-        passes_per_seq = split_indptr[1:].to(torch.int32) - split_indptr[:-1].to(
-            torch.int32
-        )  # [num_seqs]
-        split_ids = torch.arange(num_kv_splits, device=device, dtype=torch.int32)
-        # mask[s, k] = True iff split k is valid for seq s
-        mask = split_ids.unsqueeze(0) < passes_per_seq.unsqueeze(1)  # [bs, splits]
-        # Broadcast to [bs, splits, 1, 1, 1] so it lines up with attn_lse.
-        mask_b = mask.view(num_seqs, num_kv_splits, 1, 1, 1)
-        neg_inf = torch.tensor(float("-inf"), device=device, dtype=attn_lse.dtype)
-        # Masked LSE: invalid slots → -inf so exp(-inf)=0 → weight=0.
-        lse_masked = torch.where(mask_b, attn_lse, neg_inf)
-        m = lse_masked.amax(dim=1, keepdim=True)  # [bs, 1, kv, m, 1]
-        # If a seq has zero valid passes (degenerate; shouldn't happen with
-        # uniform split_indptr) m is -inf — guard by clamping.
-        m_safe = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
-        w = torch.exp(lse_masked - m_safe)  # [bs, splits, kv, m, 1]
-        w_sum = w.sum(dim=1, keepdim=True)  # [bs, 1, kv, m, 1]
-        # Avoid 0/0 — fallback to uniform weight 1 over valid passes when
-        # everything was -inf. Edge case only; uniform split_indptr makes this
-        # unreachable in practice.
-        w_sum_safe = torch.where(w_sum > 0, w_sum, torch.ones_like(w_sum))
-        # Weighted sum of partials.
-        v_merged = (logits * w * mask_b.to(logits.dtype)).sum(
-            dim=1, keepdim=True
-        ) / w_sum_safe  # [bs, 1, kv, m, v]
-        lse_merged = m_safe + torch.log(w_sum_safe)  # [bs, 1, kv, m, 1]
-        # Overwrite the [:, 0] slot with the merged result so callers can read
-        # logits[:, 0] uniformly across single- and multi-split modes.
-        logits[:, 0:1].copy_(v_merged)
-        attn_lse[:, 0:1].copy_(lse_merged)
+        Lv = v_head_dim
+        BLOCK_DV = triton.next_power_of_2(Lv)
+        # mgc selection mirrors V3's recipe at the qh64/fp8/msq=4 config.
+        mgc = 64 if (max_seqlen_q == 1 and num_heads in (8, 16)) else 16
+
+        # final_lse output is not currently part of the wrapper's public API.
+        final_lse_buf = torch.empty((1,), dtype=dtypes.fp32, device=device)
+
+        _fwd_kernel_stage2_asm[(num_seqs, num_heads)](
+            logits,  # Mid_O   [total_q, num_kv_splits, num_heads, dv]
+            attn_lse,  # Mid_lse [total_q, num_kv_splits, num_heads, 1]
+            output,  # final O [total_q, num_heads, dv]   BF16
+            final_lse_buf,
+            qo_indptr,
+            kv_indptr,
+            split_indptr,  # num_kv_splits_indptr
+            attn_lse.stride(0),  # stride_mid_ob = num_kv_splits * num_heads
+            attn_lse.stride(2),  # stride_mid_oh = 1
+            attn_lse.stride(1),  # stride_mid_os = num_heads
+            output.stride(0),  # stride_obs    = num_heads * v_head_dim
+            output.stride(1),  # stride_oh     = v_head_dim
+            0,  # stride_lse_bs (unused, HAS_FINAL_LSE=False)
+            MAYBE_FINAL_OUT=True,
+            HAS_FINAL_LSE=False,
+            BATCH_NUM=num_seqs,
+            BLOCK_DV=BLOCK_DV,
+            Lv=Lv,
+            mgc=mgc,
+            num_warps=4,
+            num_stages=2,
+            waves_per_eu=4,
+        )
 
     return logits, attn_lse
