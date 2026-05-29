@@ -1016,11 +1016,14 @@ class TestCorrectness:
             context_lens, args=args
         )
 
+        # The VK kernel indexes g head-major ([H, T_flat], token stride 1) while
+        # _make_inputs produces token-major g ([T_flat, H]). Transpose to match.
+        g_vk = g.transpose(0, 1).contiguous()
         h_vk, vn_vk, fs_vk = chunk_gated_delta_rule_fwd_h_opt_vk(
             k,
             w_c,
             u_c,
-            g=g,
+            g=g_vk,
             initial_state=h0,
             output_final_state=args.output_final_state,
             cu_seqlens=cu,

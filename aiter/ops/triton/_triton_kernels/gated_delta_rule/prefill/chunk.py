@@ -172,12 +172,16 @@ def chunk_gated_delta_rule_fwd_opt(
         use_exp2=False,
     )
 
+    # k5_opt / k6_opt index g with token-major [B, T, H] strides, but the fused
+    # k12 returns g_cumsum head-major [B, H, T]. Convert to token-major here.
+    g_cumsum_tok = g_cumsum.transpose(1, 2).contiguous()
+
     # Step 3: Compute hidden states
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt(
         k=k,
         w=w,
         u=u,
-        g=g_cumsum,
+        g=g_cumsum_tok,
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
@@ -189,7 +193,7 @@ def chunk_gated_delta_rule_fwd_opt(
         k=k,
         v=v_new,
         h=h,
-        g=g_cumsum,
+        g=g_cumsum_tok,
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
