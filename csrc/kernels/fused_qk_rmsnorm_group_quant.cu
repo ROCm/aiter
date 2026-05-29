@@ -649,20 +649,21 @@ void fused_qk_rmsnorm_group_quant(
     int64_t group_size,
     bool transpose_scale,
     bool gemma_norm,
-    std::optional<torch::Tensor> gemm_out_zero_init)
+    std::optional<aiter_tensor_t> gemm_out_zero_init)
 {
     // SplitK GEMM zero-init fusion: optional buffer to zero-init at the start of
     // the kernel, in 16-byte chunks. We only forward the pointer/word count to
     // the kernel; everything below is the unmodified shape/dtype validation path.
     void* gemm_out_zero_init_ptr = nullptr;
     int64_t gemm_out_zero_init_num_uint4 = 0;
-    if(gemm_out_zero_init.has_value() && gemm_out_zero_init->defined())
+    if(gemm_out_zero_init.has_value())
     {
-        const auto& y = gemm_out_zero_init.value();
-        TORCH_CHECK(y.is_cuda(), __func__, " gemm_out_zero_init must be on CUDA/HIP device");
-        TORCH_CHECK(y.is_contiguous(), __func__, " gemm_out_zero_init must be contiguous");
+        const aiter_tensor_t& y = *gemm_out_zero_init;
+        AITER_CHECK(y.is_contiguous(),
+                    __func__,
+                    " gemm_out_zero_init must be contiguous");
         const int64_t total_bytes = y.numel() * y.element_size();
-        TORCH_CHECK(total_bytes % 16 == 0,
+        AITER_CHECK(total_bytes % 16 == 0,
                     __func__,
                     " gemm_out_zero_init total bytes must be a multiple of 16, got ",
                     total_bytes);

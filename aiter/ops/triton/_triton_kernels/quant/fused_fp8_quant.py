@@ -21,6 +21,36 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
 
 
 @triton.jit
+def _zero_init_prologue(
+    ptr,
+    n_int32,
+    pid_flat,
+    n_progs,
+    BLOCK: tl.constexpr,
+):
+    """SplitK fused-zero-init prologue.
+
+    Performs a grid-strided int32 zero fill of ``[ptr, ptr + n_int32)`` using
+    ``n_progs`` programs (caller flattens its launch grid into a single
+    1D program id ``pid_flat`` in ``[0, n_progs)``). The downstream SplitK
+    blockscale GEMM then consumes ``[ptr, ptr + n_int32)`` as its
+    pre-zeroed accumulator and skips its own ``Y.zero_()`` launch.
+
+    The buffer is treated as int32 (4-byte) words; the host wrapper is
+    responsible for passing a tensor view of the GEMM output buffer as
+    ``int32`` so the pointer type matches.
+    """
+    off = pid_flat * BLOCK
+    stride = n_progs * BLOCK
+    zeros = tl.zeros([BLOCK], dtype=tl.int32)
+    while off < n_int32:
+        idxs = off + tl.arange(0, BLOCK)
+        mask = idxs < n_int32
+        tl.store(ptr + idxs, zeros, mask=mask)
+        off += stride
+
+
+@triton.jit
 def _fp8_quant_op(
     x,
     BLOCK_SIZE_M: tl.constexpr,
@@ -160,11 +190,13 @@ def _fused_rms_fp8_group_quant_kernel(
     out2_ptr,
     out_res1_ptr,
     out1_ptr,
+    gemm_out_zero_init_ptr,
     eps1,
     eps2,
     n_rows,
     inp1_n_cols,
     inp2_n_cols,
+    gemm_out_zero_init_n_int32,
     inp1_row_stride,
     inp2_row_stride,
     inp1_col_stride,
@@ -188,8 +220,20 @@ def _fused_rms_fp8_group_quant_kernel(
     HAVE_SECOND_INPUT: tl.constexpr,
     FIRST_INPUT_RES: tl.constexpr,
     FIRST_INPUT_OUT: tl.constexpr,
+    HAS_ZERO_INIT: tl.constexpr,
+    ZERO_INIT_BLOCK: tl.constexpr,
 ):
     m_pid = tl.program_id(0)
+    # SplitK fused-zero-init prologue: dead-coded when HAS_ZERO_INIT=False
+    # so the non-fused path pays no runtime overhead.
+    if HAS_ZERO_INIT:
+        _zero_init_prologue(
+            gemm_out_zero_init_ptr,
+            gemm_out_zero_init_n_int32,
+            m_pid,
+            tl.num_programs(0),
+            ZERO_INIT_BLOCK,
+        )
     n_offs = tl.arange(0, BLOCK_SIZE_N)
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
 
@@ -787,6 +831,7 @@ def _fused_rms_gated_fp8_group_quant_kernel(
     Z,
     Y_quant,
     Scales,
+    gemm_out_zero_init_ptr,
     stride_x_row,
     stride_z_row,
     stride_y_row,
@@ -795,6 +840,7 @@ def _fused_rms_gated_fp8_group_quant_kernel(
     M,
     N: tl.constexpr,
     eps,
+    gemm_out_zero_init_n_int32,
     RMS_TILE: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
@@ -808,7 +854,18 @@ def _fused_rms_gated_fp8_group_quant_kernel(
     USE_UE8M0: tl.constexpr,
     FP8_MIN_SCALING_FACTOR: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    HAS_ZERO_INIT: tl.constexpr,
+    ZERO_INIT_BLOCK: tl.constexpr,
 ):
+    # SplitK fused-zero-init prologue: dead-coded when HAS_ZERO_INIT=False.
+    if HAS_ZERO_INIT:
+        _zero_init_prologue(
+            gemm_out_zero_init_ptr,
+            gemm_out_zero_init_n_int32,
+            tl.program_id(0),
+            tl.num_programs(0),
+            ZERO_INIT_BLOCK,
+        )
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
     rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
     row_mask_1d = rows < M

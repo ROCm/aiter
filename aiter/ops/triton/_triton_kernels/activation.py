@@ -1,5 +1,5 @@
 from .quant.quant import _mxfp4_quant_op
-from .quant.fused_fp8_quant import _fp8_quant_op
+from .quant.fused_fp8_quant import _fp8_quant_op, _zero_init_prologue
 import triton
 import triton.language as tl
 
@@ -243,6 +243,7 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
     x_ptr,
     x_fp8_ptr,
     x_bs_ptr,
+    gemm_out_zero_init_ptr,
     stride_x_m_in,
     stride_x_n_in,
     stride_x_fp8_m_in,
@@ -250,6 +251,7 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
     stride_bs_m_in,
     stride_bs_n_in,
     N,
+    gemm_out_zero_init_n_int32,
     ACTIVATION: tl.constexpr,
     scaleN: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -257,9 +259,25 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
     EVEN_N: tl.constexpr,
+    HAS_ZERO_INIT: tl.constexpr,
+    ZERO_INIT_BLOCK: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
+    # SplitK fused-zero-init prologue: flatten the 2D launch grid into a 1D
+    # program id so the prologue stripes the buffer uniformly across all
+    # active programs. Dead-coded when HAS_ZERO_INIT=False.
+    if HAS_ZERO_INIT:
+        n_progs_m = tl.num_programs(0)
+        n_progs_n = tl.num_programs(1)
+        pid_flat = pid_m * n_progs_n + pid_n
+        _zero_init_prologue(
+            gemm_out_zero_init_ptr,
+            gemm_out_zero_init_n_int32,
+            pid_flat,
+            n_progs_m * n_progs_n,
+            ZERO_INIT_BLOCK,
+        )
     # cast strides to int64, in case M*N > max int32
     stride_x_m = tl.cast(stride_x_m_in, tl.int64)
     stride_x_n = tl.cast(stride_x_n_in, tl.int64)

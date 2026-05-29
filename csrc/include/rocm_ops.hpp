@@ -561,17 +561,18 @@ namespace py = pybind11;
           py::arg("splitK")     = 0,    \
           py::arg("kernelName") = "");
 
-#define GEMM_A8W8_BLOCKSCALE_PYBIND     \
-    m.def("gemm_a8w8_blockscale",       \
-          &gemm_a8w8_blockscale,        \
-          "fp8 blockscale gemm",        \
-          py::arg("XQ"),                \
-          py::arg("WQ"),                \
-          py::arg("x_scale"),           \
-          py::arg("w_scale"),           \
-          py::arg("Out"),               \
-          py::arg("splitK")     = 0,    \
-          py::arg("kernelName") = "");
+#define GEMM_A8W8_BLOCKSCALE_PYBIND      \
+    m.def("gemm_a8w8_blockscale",        \
+          &gemm_a8w8_blockscale,         \
+          "fp8 blockscale gemm",         \
+          py::arg("XQ"),                 \
+          py::arg("WQ"),                 \
+          py::arg("x_scale"),            \
+          py::arg("w_scale"),            \
+          py::arg("Out"),                \
+          py::arg("splitK")      = 0,    \
+          py::arg("kernelName")  = "",   \
+          py::arg("y_is_zeroed") = false);
 
 #define GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_tune",   \
@@ -613,16 +614,17 @@ namespace py = pybind11;
           py::arg("preshuffleB") = false,       \
           py::arg("y_is_zeroed") = false);
 
-#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_PYBIND \
-    m.def("gemm_a8w8_blockscale_bpreshuffle",   \
-          &gemm_a8w8_blockscale_bpreshuffle,    \
-          "fp8 blockscale bpreshuffle gemm",    \
-          py::arg("XQ"),                        \
-          py::arg("WQ"),                        \
-          py::arg("x_scale"),                   \
-          py::arg("w_scale"),                   \
-          py::arg("Out"),                       \
-          py::arg("kernelName") = "");
+#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_PYBIND  \
+    m.def("gemm_a8w8_blockscale_bpreshuffle",    \
+          &gemm_a8w8_blockscale_bpreshuffle,     \
+          "fp8 blockscale bpreshuffle gemm",     \
+          py::arg("XQ"),                         \
+          py::arg("WQ"),                         \
+          py::arg("x_scale"),                    \
+          py::arg("w_scale"),                    \
+          py::arg("Out"),                        \
+          py::arg("kernelName")  = "",           \
+          py::arg("y_is_zeroed") = false);
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_bpreshuffle_tune",   \

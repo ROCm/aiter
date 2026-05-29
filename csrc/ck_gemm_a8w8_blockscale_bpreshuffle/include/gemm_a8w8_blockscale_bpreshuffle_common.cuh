@@ -119,7 +119,8 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_impl(torch::Tenso
                                                                     torch::Tensor& WQ,
                                                                     torch::Tensor& x_scale,
                                                                     torch::Tensor& w_scale,
-                                                                    torch::Tensor& Y)
+                                                                    torch::Tensor& Y,
+                                                                    bool y_is_zeroed = false)
 {
     int M = XQ.size(0);
     int N = WQ.size(0);
@@ -156,6 +157,20 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_impl(torch::Tenso
         a_element_op,
         b_element_op,
         cde_element_op);
+
+    // Take ownership of the Y zero-state to keep this wrapper symmetric
+    // with the non-bpreshuffle wrapper, even though splitK is not yet
+    // exposed by callers of this entry point (KBatch is effectively 1
+    // today, so the Y.zero_() branch is dead).  Once splitK gets plumbed
+    // through this path, flip `KBatch` to come from the caller and the
+    // gate will activate; the CK invoker already skips its own memset
+    // thanks to skip_zero_init=true.
+    const int KBatch         = 1;
+    argument.skip_zero_init  = true;
+    if(KBatch > 1 && !y_is_zeroed)
+    {
+        Y.zero_();
+    }
 
     TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 

@@ -7,7 +7,7 @@
 #include <string>
 
 using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool)>;
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -74,7 +74,7 @@ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_tune(torch::Tensor& XQ,
 
     if(Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockwise_dispatch<F32, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+        blockwise_dispatch<F32, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, /*y_is_zeroed=*/false);
     }
     else
     {

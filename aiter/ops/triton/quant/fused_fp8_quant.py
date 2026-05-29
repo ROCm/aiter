@@ -173,6 +173,7 @@ def fused_rms_fp8_group_quant(
     res1=None,
     output_unquantized_inp1=False,
     transpose_scale=False,
+    gemm_out_zero_init: Optional[torch.Tensor] = None,
 ):
     """
     This op contains several steps:
@@ -283,6 +284,30 @@ def fused_rms_fp8_group_quant(
         out1_bs_row_stride = out1_bs.stride(0)
         out1_bs_col_stride = out1_bs.stride(1)
 
+    # SplitK fused-zero-init plumbing. When the caller passes a
+    # ``gemm_out_zero_init`` buffer, the kernel pre-zeros it as a grid-strided
+    # prologue so the downstream SplitK blockscale GEMM can run with
+    # ``y_is_zeroed=True``; otherwise we pass a dummy 1-element int32 tensor
+    # and the constexpr-gated prologue is dead-coded away.
+    if gemm_out_zero_init is not None:
+        assert gemm_out_zero_init.is_contiguous(), (
+            "fused_rms_fp8_group_quant: gemm_out_zero_init must be contiguous"
+        )
+        total_bytes = gemm_out_zero_init.numel() * gemm_out_zero_init.element_size()
+        assert total_bytes % 4 == 0, (
+            "fused_rms_fp8_group_quant: gemm_out_zero_init total bytes must be a "
+            f"multiple of 4, got {total_bytes}"
+        )
+        gemm_out_zero_init_int32 = gemm_out_zero_init.view(torch.int32)
+        gemm_out_zero_init_n_int32 = total_bytes // 4
+        has_zero_init = True
+    else:
+        gemm_out_zero_init_int32 = torch.empty(
+            1, dtype=torch.int32, device=inp1.device
+        )
+        gemm_out_zero_init_n_int32 = 0
+        has_zero_init = False
+
     _fused_rms_fp8_group_quant_kernel[(M,)](
         inp1,
         inp1_weight,
@@ -294,11 +319,13 @@ def fused_rms_fp8_group_quant(
         out2,
         out_res1,
         out1,
+        gemm_out_zero_init_int32,
         inp1_epsilon,
         inp2_epsilon,
         M,
         N1,
         N2,
+        gemm_out_zero_init_n_int32,
         inp1.stride(0),
         inp2_row_stride,
         inp1.stride(1),
@@ -322,6 +349,8 @@ def fused_rms_fp8_group_quant(
         HAVE_SECOND_INPUT=(inp2 is not None),
         FIRST_INPUT_RES=(res1 is not None),
         FIRST_INPUT_OUT=output_unquantized_inp1,
+        HAS_ZERO_INIT=has_zero_init,
+        ZERO_INIT_BLOCK=256,
         num_warps=num_warps,
     )
     # When transpose_scale=True, view the transposed buffer back to original shape
@@ -375,6 +404,7 @@ def fused_rms_gated_fp8_group_quant(
     fp8_max: float | None = None,
     fp8_min_scaling_factor: float | None = None,
     group_size: int | None = None,
+    gemm_out_zero_init: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused RMSNorm (with optional bias), optional multiplicative gate from ``z``,
@@ -462,6 +492,24 @@ def fused_rms_gated_fp8_group_quant(
         stride_s_row, stride_s_g = (int(scales.stride(0)), int(scales.stride(1)))
 
     grid = (triton.cdiv(M, rows_per_block),)
+    # See ``fused_rms_fp8_group_quant`` for the SplitK fused-zero-init contract.
+    if gemm_out_zero_init is not None:
+        assert gemm_out_zero_init.is_contiguous(), (
+            "fused_rms_gated_fp8_group_quant: gemm_out_zero_init must be contiguous"
+        )
+        total_bytes = gemm_out_zero_init.numel() * gemm_out_zero_init.element_size()
+        assert total_bytes % 4 == 0, (
+            "fused_rms_gated_fp8_group_quant: gemm_out_zero_init total bytes "
+            f"must be a multiple of 4, got {total_bytes}"
+        )
+        gemm_out_zero_init_int32 = gemm_out_zero_init.view(torch.int32)
+        gemm_out_zero_init_n_int32 = total_bytes // 4
+        has_zero_init = True
+    else:
+        gemm_out_zero_init_int32 = torch.empty(1, dtype=torch.int32, device=x.device)
+        gemm_out_zero_init_n_int32 = 0
+        has_zero_init = False
+
     _fused_rms_gated_fp8_group_quant_kernel[grid](
         x,
         weight,
@@ -469,6 +517,7 @@ def fused_rms_gated_fp8_group_quant(
         z,
         x_quant,
         scales,
+        gemm_out_zero_init_int32,
         x.stride(0),
         z.stride(0),
         x_quant.stride(0),
@@ -477,6 +526,7 @@ def fused_rms_gated_fp8_group_quant(
         M,
         N,
         eps,
+        gemm_out_zero_init_n_int32,
         RMS_TILE=rms_tile,
         ROWS_PER_BLOCK=rows_per_block,
         GROUP_SIZE=effective_gs,
@@ -489,6 +539,8 @@ def fused_rms_gated_fp8_group_quant(
         FP8_MIN_SCALING_FACTOR=fp8_min_scaling_factor,
         num_warps=num_warps,
         ACTIVATION=activation,
+        HAS_ZERO_INIT=has_zero_init,
+        ZERO_INIT_BLOCK=256,
     )
     return x_quant, scales
 

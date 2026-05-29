@@ -133,6 +133,7 @@ def act_mul_and_fp8_group_quant(
     activation: Literal["silu", "gelu", "gelu_tanh"],
     group_size,
     dtype_quant=fp8_dtype,
+    gemm_out_zero_init: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply the activation function and quantize the result to MX FP4 format.
@@ -178,20 +179,45 @@ def act_mul_and_fp8_group_quant(
         M,
         triton.cdiv(N_half, BLOCK_SIZE_N),
     )
+    # See ``fused_rms_fp8_group_quant`` for the SplitK fused-zero-init
+    # contract; the kernel pre-zeros ``gemm_out_zero_init`` as a grid-strided
+    # prologue (int32 writes) so the downstream blockscale SplitK GEMM can
+    # skip its own ``Y.zero_()`` launch.
+    if gemm_out_zero_init is not None:
+        assert gemm_out_zero_init.is_contiguous(), (
+            "act_mul_and_fp8_group_quant: gemm_out_zero_init must be contiguous"
+        )
+        total_bytes = gemm_out_zero_init.numel() * gemm_out_zero_init.element_size()
+        assert total_bytes % 4 == 0, (
+            "act_mul_and_fp8_group_quant: gemm_out_zero_init total bytes must "
+            f"be a multiple of 4, got {total_bytes}"
+        )
+        gemm_out_zero_init_int32 = gemm_out_zero_init.view(torch.int32)
+        gemm_out_zero_init_n_int32 = total_bytes // 4
+        has_zero_init = True
+    else:
+        gemm_out_zero_init_int32 = torch.empty(1, dtype=torch.int32, device=x.device)
+        gemm_out_zero_init_n_int32 = 0
+        has_zero_init = False
+
     _act_mul_and_dynamic_fp8_group_quant_kernel[grid](
         x,
         x_fp8,
         out_bs,
+        gemm_out_zero_init_int32,
         *x.stride(),
         *x_fp8.stride(),
         *out_bs.stride(),
         N=N_half,
+        gemm_out_zero_init_n_int32=gemm_out_zero_init_n_int32,
         ACTIVATION=activation,
         scaleN=scaleN,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         QUANT_BLOCK_SIZE=group_size,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
+        HAS_ZERO_INIT=has_zero_init,
+        ZERO_INIT_BLOCK=256,
         # num_warps=NUM_WARPS,
         # waves_per_eu=0,
         # num_stages=1,

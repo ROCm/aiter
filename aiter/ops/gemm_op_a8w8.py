@@ -225,6 +225,7 @@ def gemm_a8w8_blockscale_ck(
     Out: torch.Tensor,
     splitK: int = 0,
     kernelName: str = "",
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -258,6 +259,7 @@ def gemm_a8w8_blockscale_bpreshuffle_ck(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     kernelName: str = "",
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -318,6 +320,7 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
     kernelName: Optional[str] = None,
     bpreshuffle: int = 1,
     zero_bias_buf: Optional[Tensor] = None,
+    y_is_zeroed: int = 0,
 ) -> None: ...
 
 
@@ -332,6 +335,7 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     kernelName: Optional[str] = None,
     bpreshuffle: Optional[bool] = True,
     zero_bias_buf: Optional[Tensor] = None,
+    y_is_zeroed: bool = False,
 ) -> Tensor:
     if bias is None and zero_bias_buf is None:
         zero_bias_buf = torch.zeros(1, B.shape[0], dtype=torch.float32, device=A.device)
@@ -346,6 +350,7 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
         kernelName,
         int(bpreshuffle) if bpreshuffle is not None else 1,
         zero_bias_buf,
+        int(y_is_zeroed),
     )
     return out
 
@@ -693,10 +698,15 @@ def gemm_a8w8_blockscale(
     Optional kwargs (used by vLLM's zero-init SplitK fusion):
       - out:          caller-provided output buffer. If None, allocated here.
       - y_is_zeroed:  when True, caller guarantees ``out`` is pre-zeroed and
-                      the kernel skips its internal Y.zero_() before the
-                      SplitK atomic-add. Only honored by the cktile branch
-                      today; the legacy CK invoker ignores this flag (its
-                      kernel always zeros internally).
+                      the kernel/wrapper skips its zero-init step before the
+                      SplitK atomic-add. Honored by both cktile and legacy
+                      CK branches: cktile's QuantGemmHostArgs passes the
+                      flag down to the kernel; legacy CK gates aiter's
+                      ``Y.zero_()`` while telling the invoker to skip its
+                      own ``hipMemsetAsync`` via ``skip_zero_init=true``.
+                      Has no effect when the chosen kernel runs with
+                      KBatch == 1 (no SplitK atomic-add => no zero-init
+                      required).
 
     SplitK and kernel-name selection are *always* driven by the tuned CSV
     (``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE``).  Callers cannot override
@@ -732,12 +742,6 @@ def gemm_a8w8_blockscale(
             splitK = int(config.get("splitK", 0))
             kernelName = str(config.get("kernelName", ""))
             if libtype == "ck":
-                # Legacy CK invoker doesn't honor y_is_zeroed; the kernel
-                # zeros Y internally.  We ignore the flag silently rather
-                # than re-routing to cktile, because the CK CSV row's
-                # kernelName is not in the cktile registry (cktile would
-                # then fall back to the default heuristic kernel and lose
-                # the per-shape tune).
                 return gemm_a8w8_blockscale_ck(
                     XQ,
                     WQ,
@@ -746,6 +750,7 @@ def gemm_a8w8_blockscale(
                     Y,
                     splitK=splitK,
                     kernelName=kernelName,
+                    y_is_zeroed=y_is_zeroed,
                 )
             elif libtype == "cktile":
                 return gemm_a8w8_blockscale_cktile(
@@ -761,7 +766,7 @@ def gemm_a8w8_blockscale(
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
         try:
-            return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y, y_is_zeroed=y_is_zeroed)
         except RuntimeError as e:
             raise RuntimeError(
                 f"gemm_a8w8_blockscale failed for shape M={m}, N={n}, K={k}, "
@@ -823,9 +828,13 @@ def gemm_a8w8_blockscale_bpreshuffle(
         out: optional pre-allocated output tensor (shape (M, N), dtype `dtype`).
             When provided, the GEMM writes into this tensor instead of allocating a new one.
         y_is_zeroed: when True, the caller has already zeroed `out`, so the
-            kernel will skip its internal Y.zero_() before the SplitK atomic_add.
-            This is used by the producer-fused zero-init path.  Has no effect
-            when splitK == 0.  Only honored by the cktile branch today.
+            kernel will skip its internal Y.zero_() / hipMemsetAsync before
+            the SplitK atomic_add.  Honored by all libtypes (cktile, ck,
+            asm).  Has no effect on the libtype=='ck' branch today because
+            that wrapper does not yet expose splitK from the CSV (KBatch
+            stays at 1, so the zero-init is a no-op regardless of this
+            flag); plumbing is forward-compatible for when splitK is
+            exposed there.
         tuned_file: optional path to a tuned CSV to consult for kernel/splitK
             selection.  When None, uses the default
             ``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE``.  Useful
@@ -865,14 +874,29 @@ def gemm_a8w8_blockscale_bpreshuffle(
             )
         elif libtype == "ck":
             return gemm_a8w8_blockscale_bpreshuffle_ck(
-                XQ, WQ, x_scale, w_scale, Y, kernelName=kernelName
+                XQ,
+                WQ,
+                x_scale,
+                w_scale,
+                Y,
+                kernelName=kernelName,
+                y_is_zeroed=y_is_zeroed,
             )
         elif libtype == "asm":
             return gemm_a8w8_blockscale_bpreshuffle_asm(
-                XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
+                XQ,
+                WQ,
+                Y,
+                x_scale,
+                w_scale,
+                splitK=splitK,
+                kernelName=kernelName,
+                y_is_zeroed=y_is_zeroed,
             )
     try:
-        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+        return gemm_a8w8_blockscale_bpreshuffle_ck(
+            XQ, WQ, x_scale, w_scale, Y, y_is_zeroed=y_is_zeroed
+        )
     except RuntimeError as e:
         raise RuntimeError(
             f"gemm_a8w8_blockscale_bpreshuffle failed for shape M={m}, N={n}, K={k}, "

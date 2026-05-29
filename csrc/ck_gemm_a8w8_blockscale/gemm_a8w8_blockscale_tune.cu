@@ -12,7 +12,7 @@
 #include "gemm_a8w8_blockscale_manifest.h"
 
 using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int, bool)>;
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -71,11 +71,11 @@ torch::Tensor gemm_a8w8_blockscale_tune(torch::Tensor& XQ,
 
     if(Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockwise_dispatch<FP32, BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+        blockwise_dispatch<FP32, BF16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, KBatch, /*y_is_zeroed=*/false);
     }
     else if(Y.dtype() == at::ScalarType::Half)
     {
-        blockwise_dispatch<FP32, FP16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+        blockwise_dispatch<FP32, FP16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, KBatch, /*y_is_zeroed=*/false);
     }
     else
     {

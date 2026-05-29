@@ -125,7 +125,8 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
                                                         torch::Tensor& x_scale,
                                                         torch::Tensor& w_scale,
                                                         torch::Tensor& Y,
-                                                        int KBatch = 1)
+                                                        int KBatch      = 1,
+                                                        bool y_is_zeroed = false)
 {
     int M = XQ.size(0);
     int N = WQ.size(0);
@@ -166,6 +167,18 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
     if(KBatch > 1)
     {
         device_gemm.SetKBatch(&argument, KBatch);
+    }
+
+    // aiter owns the Y zero-state for the SplitK atomic_add path.  Tell the
+    // CK invoker to skip its internal hipMemsetAsync, then perform the zero
+    // ourselves via Y.zero_() (only when needed).  This mirrors the cktile
+    // path and lets producer kernels fuse the zero-init.  Using Y.zero_()
+    // (rather than memset) handles padded leading-dimension strides
+    // correctly (e.g. vLLM's _maybe_pad_fp8_weight).
+    argument.skip_zero_init = true;
+    if(KBatch > 1 && !y_is_zeroed)
+    {
+        Y.zero_();
     }
 
     TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
