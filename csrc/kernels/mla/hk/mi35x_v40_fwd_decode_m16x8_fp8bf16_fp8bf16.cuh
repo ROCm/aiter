@@ -417,16 +417,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             // until the wait+cvt+store sequence below; the gap in between
             // hides vmcnt latency under QK MFMAs.
             typename KvManager8to16bitsV1<T>::KvTilePrefetch p0, p1;
-            if constexpr(kIsGlobalLast == false)
-            {
-                constexpr uint32_t kTileCols = 256u;
-                kv_manager.template prefetch_kv_tile<0u, 0u, kCheckBoundaryNext>(
-                    p_lds_kv_next, warp_idx, params.kv_buffer, params.kv_buffer_rope,
-                    row_kv_ld_next, p0);
-                kv_manager.template prefetch_kv_tile<0u, kTileCols, kCheckBoundaryNext>(
-                    p_lds_kv_next, warp_idx, params.kv_buffer, params.kv_buffer_rope,
-                    row_kv_ld_next, p1);
-            }
+            // prefetch_kv_tile calls moved into the QK-GEMM body below to
+            // hide their vmcnt latency under the QK MFMAs:
+            //   - tile 0 (offset 0):       just after P0's 4 ds_read prologue
+            //   - tile 1 (offset kTileCols): just before P1's first mfma
 
             // ---- QK GEMM ----
             constexpr uint32_t kNumQkVgprIter = 8;
@@ -477,6 +471,17 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_r31> qP3_1;
                 constexpr uint32_t kBK = T::kBlockK;
 
+                constexpr uint32_t kTileCols = 256u;
+
+                // Prefetch NEXT KV tile 0 into next-pong; vmcnt latency hides
+                // under the upcoming MFMAs.
+                if constexpr(kIsGlobalLast == false)
+                {
+                    kv_manager.template prefetch_kv_tile<0u, 0u, kCheckBoundaryNext>(
+                        p_lds_kv_next, warp_idx, params.kv_buffer, params.kv_buffer_rope,
+                        row_kv_ld_next, p0);
+                }
+
                 // --- Pair P0 ---
                 // Prologue inline reads (P0 has nothing prefetched at entry).
                 kv_manager.template load_k_to_gpr<0u,  0u * kBK>(kv_top, p_lds_kv_curr);
@@ -484,8 +489,19 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 // Pair body: 2 more k-reads, then mfmas with next-pair prefetch interleaved.
                 kv_manager.template load_k_to_gpr<0u,  1u * kBK>(kv_alt_top, p_lds_kv_curr);
                 kv_manager.template load_k_to_gpr<16u, 1u * kBK>(kv_alt_bot, p_lds_kv_curr);
+
+                // Prefetch NEXT KV tile 1 into next-pong; vmcnt latency hides
+                // under P1's MFMAs.
+                if constexpr(kIsGlobalLast == false)
+                {
+                    kv_manager.template prefetch_kv_tile<0u, kTileCols, kCheckBoundaryNext>(
+                        p_lds_kv_next, warp_idx, params.kv_buffer, params.kv_buffer_rope,
+                        row_kv_ld_next, p1);
+                }
+
                 __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(2, -1));
                 hk::mma_ABt(p_comp_lo, kv_top,     qP0_0);  // 3-arg init (P0 only)
+                __builtin_amdgcn_s_setprio(3);
                 kv_manager.template load_k_to_gpr<0u,  2u * kBK>(kv_top, p_lds_kv_curr); // P1 prefetch k0_top
                 __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(2, -1));
                 hk::mma_ABt(p_comp_hi, kv_bot,     qP0_0);
@@ -634,17 +650,48 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 hk::mma_ABt(p_comp_hi, kv_alt_bot, q_k1, p_comp_hi);
             }
 
+            __builtin_amdgcn_s_setprio(3);
+
             // ---- Phase B+C: wait + cvt + store NEXT tile to LDS ----
             // Sequenced after QK so the QK ds_reads from p_lds_kv_curr aren't
             // delayed by the cvt+store traffic on p_lds_kv_next.
             if constexpr(kIsGlobalLast == false)
             {
                 constexpr uint32_t kTileCols = 256u;
-                kv_manager.template wait_kv_loads<0u, 0u>(warp_idx);
-                kv_manager.template cvt_and_store_kv_tile<0u, 0u>(p_lds_kv_next, warp_idx, p0);
-                kv_manager.template wait_kv_loads<0u, kTileCols>(warp_idx);
-                kv_manager.template cvt_and_store_kv_tile<0u, kTileCols>(
-                    p_lds_kv_next, warp_idx, p1);
+                if constexpr(kSkipCompute)
+                {
+                    // No QK GEMM ran -> prefetches weren't issued inline.
+                    // Full prefetch + wait + cvt + store via async_load_k.
+                    kv_manager.template async_load_k<kCheckBoundaryNext>(
+                        p_lds_kv_next, warp_idx, params.kv_buffer,
+                        params.kv_buffer_rope, row_kv_ld_next);
+                }
+                else
+                {
+                    // Prefetches already issued mid-QK-body. Just drain +
+                    // cvt + store. 4 vmem ops in flight; first wait drains
+                    // tile-0 (leave tile-1's 2 in flight); second drains tile-1.
+                    hk::u32x4 dw;
+                    kv_manager.template wait_kv_loads<0u, 0u, /*kVmCnt=*/2>(warp_idx);
+                    const float scale_f0 = kv_manager.kv_tile_scale_f(p0);
+                    kv_manager.template cvt_kv_tile_step<0>(dw, p0, scale_f0);
+                    kv_manager.template cvt_kv_tile_step<1>(dw, p0, scale_f0);
+                    kv_manager.template store_kv_tile_step<0u, 0u, 0>(p_lds_kv_next, warp_idx, dw);
+                    kv_manager.template cvt_kv_tile_step<2>(dw, p0, scale_f0);
+                    kv_manager.template cvt_kv_tile_step<3>(dw, p0, scale_f0);
+                    kv_manager.template store_kv_tile_step<0u, 0u, 1>(p_lds_kv_next, warp_idx, dw);
+
+                    kv_manager.template wait_kv_loads<0u, kTileCols, /*kVmCnt=*/0>(warp_idx);
+                    const float scale_f1 = kv_manager.kv_tile_scale_f(p1);
+                    kv_manager.template cvt_kv_tile_step<0>(dw, p1, scale_f1);
+                    kv_manager.template cvt_kv_tile_step<1>(dw, p1, scale_f1);
+                    kv_manager.template store_kv_tile_step<0u, kTileCols, 0>(
+                        p_lds_kv_next, warp_idx, dw);
+                    kv_manager.template cvt_kv_tile_step<2>(dw, p1, scale_f1);
+                    kv_manager.template cvt_kv_tile_step<3>(dw, p1, scale_f1);
+                    kv_manager.template store_kv_tile_step<0u, kTileCols, 1>(
+                        p_lds_kv_next, warp_idx, dw);
+                }
             }
 
             // ---- Update row_kv_ld_next_next for the call AFTER this one ----
@@ -702,6 +749,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                                  : __builtin_amdgcn_exp2f((row_max - new_row_max) * log2e);
                 row_max = new_row_max;
 
+                __builtin_amdgcn_s_setprio(2);
+
                 // exp + sum + warp_reduce(add) -> row_sum_e. Updates p_comp in
                 // place to hold exp(p_comp - new_row_max).
                 softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
@@ -746,13 +795,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 });
                 // pk_mul on +0/+1 of all 32 sub-tiles.
                 opus::static_for<k_o_num_sub>([&](auto s) {
-                    if constexpr(s.value % 8 == 0)
+                    if constexpr(s.value == 12)
                     {
-                        __builtin_amdgcn_s_setprio(3 - s.value / 8);
+                        __builtin_amdgcn_s_setprio(1);
                     }
                     pk_mul_pair(rescale, opus::number<k_o_begin + s.value * 4u + 0u>{});
                 });
             }
+
+            __builtin_amdgcn_s_setprio(0);
 
             // ---- PV GEMM ----
             //
