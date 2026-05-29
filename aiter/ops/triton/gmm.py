@@ -42,6 +42,22 @@ from aiter.ops.triton._triton_kernels.gmm import (
 # ------------------------------------------------------------------------------
 
 
+# Per-(device, stream) cache for the work stealing tile counter. A single `int32`
+# scratch buffer is reused across launches to avoid an allocator round-trip plus
+# 4-byte host to device copy on every call.
+_GMM_TILE_COUNTER_CACHE: dict[tuple[torch.device, int], Tensor] = {}
+
+
+def _get_gmm_tile_counter(device: torch.device, grid_dim: int) -> Tensor:
+    stream = torch.cuda.current_stream(device=device).cuda_stream
+    tile_counter = _GMM_TILE_COUNTER_CACHE.get((device, stream))
+    if tile_counter is None:
+        tile_counter = torch.empty(1, dtype=torch.int32, device=device)
+        _GMM_TILE_COUNTER_CACHE[(device, stream)] = tile_counter
+    tile_counter.fill_(grid_dim)
+    return tile_counter
+
+
 def _gmm_grid(
     N: int,
     block_size_m: int,
@@ -238,10 +254,8 @@ def gmm(
         config["GRID_DIM"],
     )
 
-    tile_counter: torch.Tensor | None = (
-        torch.tensor((config["GRID_DIM"],), dtype=torch.int32, device=lhs.device)
-        if work_stealing
-        else None
+    tile_counter: Tensor | None = (
+        _get_gmm_tile_counter(lhs.device, config["GRID_DIM"]) if work_stealing else None
     )
 
     # fmt: off
