@@ -5,7 +5,6 @@ import triton.language as tl
 from typing import Optional
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.utility import dtypes
-from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_rms_mxfp4_quant_kernel,
     _fused_flatten_mxfp4_quant,
@@ -13,14 +12,11 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_reduce_rms_mxfp4_quant_kernel,
     _fused_dynamic_mxfp4_quant_moe_sort_kernel,
 )
-from aiter.ops.triton._gluon_kernels.gfx1250.quant.fuse_mxfp4_quant import (
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
     _gluon_fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton._triton_kernels.activation import (
     _get_activation_from_str,
-)
-from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
-    _gluon_fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
