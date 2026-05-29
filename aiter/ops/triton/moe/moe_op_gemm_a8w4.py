@@ -30,8 +30,8 @@ def should_upcast_indices(*args):
 
 
 def allocate_output(
-    x,
-    w,
+    M,
+    N,
     out_dtype,
     reduction_n_matmul,
     reduction_n_reduction,
@@ -42,10 +42,6 @@ def allocate_output(
     split_k,
     device,
 ):
-    # ---- output ------
-    N = w.shape[-1]
-    # by default - M is number of rows in the activations
-    M = x.shape[-2]
     # if the activations are gathered, then M is number of gather indices
     if gather_indx is not None:
         M = gather_indx.shape[0]
@@ -64,14 +60,6 @@ def allocate_output(
     else:
         final_output = None
     return matmul_output, final_output
-
-
-def recommend_block_m(m: int) -> int:
-    """
-    Recommend block_m for moe_gemm_a8w4 based on M.
-    Prefill (M >= 256) → 64. Decode (M < 256) → 32.
-    """
-    return 64 if m >= 256 else 16
 
 
 def get_kernel_config_triton(m, n, k, routing_data):
@@ -331,8 +319,8 @@ def moe_gemm_a8w4(
     else:
         out_dtype_actual = out_dtype
     y, y_final = allocate_output(
-        x,
-        w,
+        M,
+        N,
         out_dtype_actual,
         reduction_n_matmul,
         reduction_n_reduction,
