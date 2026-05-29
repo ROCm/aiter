@@ -329,9 +329,9 @@ def _moe_gemm_a4w4_gfx1250(
     # A scale pointers
     if GatherIndx is None:
         XMxScale += start_m * stride_x_mx_m
-        offs_x_m_scales = offs_x_m + gl.arange(
+        offs_x_m_scales = (offs_x_m + gl.arange(
             0, PACKED_BLOCK_M_X, layout=gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES)
-        )
+        )) % M
     else:
         offs_x_m_scales = gl.convert_layout(offs_x_m, gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES))
     offs_x_k_scales = gl.arange(
