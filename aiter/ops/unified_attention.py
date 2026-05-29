@@ -136,6 +136,7 @@ def _gen_unified_attention_fwd_kernel_fake(
     max_seqlen_q_override: int = 0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    sinks: Optional[torch.Tensor] = None,
 ) -> None:
     return None
 
@@ -169,6 +170,7 @@ def _unified_attention_fwd_kernel(
     max_seqlen_q_override: int = 0,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    sinks: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 
@@ -429,6 +431,15 @@ def unified_attention_fwd(
     # is_top_left=false)`
     window_size_left: int = -1,
     window_size_right: int = -1,
+    # Per-query-head learnable attention sinks (GPT-OSS / vLLM convention).
+    # When provided, the softmax denominator gains one virtual key per Q
+    # head with logit `sinks[h]` and an all-zero V row — the sink absorbs
+    # softmax mass but contributes nothing to the V accumulator. Shape:
+    # 1-D `[num_query_heads]`, dtype bf16/fp16/fp32 (the C++ wrapper
+    # promotes to fp32 once per call; the kernel always reads fp32).
+    # None → no sink (the classic softmax path; bit-identical to the
+    # pre-sink ABI).
+    sinks: Optional[torch.Tensor] = None,
 ) -> None:
     explicit_override = (
         num_splits > 1
@@ -462,6 +473,7 @@ def unified_attention_fwd(
             max_seqlen_q,
             window_size_left,
             window_size_right,
+            sinks,
         )
         return
 
@@ -493,6 +505,7 @@ def unified_attention_fwd(
             max_seqlen_q,
             window_size_left,
             window_size_right,
+            sinks,
         )
         return
 
@@ -533,5 +546,6 @@ def unified_attention_fwd(
         max_seqlen_q,
         window_size_left,
         window_size_right,
+        sinks,
     )
     _combine_splits(output, o_acc, lse_acc)

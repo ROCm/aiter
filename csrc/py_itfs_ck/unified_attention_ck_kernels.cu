@@ -44,7 +44,13 @@ void unified_attention_fwd(
     // The mapping into the kernel's (window_size_left, window_size_right,
     // is_top_left) triple lives below — see the "Mask + SWA plumbing" block.
     int window_size_left,
-    int window_size_right)
+    int window_size_right,
+    // Per-query-head learnable attention sinks. See the header comment in
+    // `unified_attention_ck.h` for the contract. `std::nullopt` means no
+    // sink — the wrapper sets `args.sink_ptr = nullptr` and the dispatcher
+    // routes to a kHasSink=false instance, bit-identical to the pre-sink
+    // path.
+    std::optional<torch::Tensor> sinks)
 {
     auto dtype = query.dtype();
     // FP8 path: Q is FP8E4M3 (e4m3fn on gfx950 / e4m3fnuz on gfx942). The
@@ -194,6 +200,53 @@ void unified_attention_fwd(
         args.split_stride_o_acc    = oacc.stride(1);
         args.nhead_stride_lse_acc  = lacc.stride(0);
         args.split_stride_lse_acc  = lacc.stride(1);
+    }
+
+    // Sink plumbing. The kernel always reads fp32 — we promote bf16/fp16
+    // sinks to fp32 here once per call. `sinks_fp32_keepalive` keeps the
+    // promoted tensor live across the kernel launch (the `.to(fp32)` path
+    // returns a freshly-allocated tensor whose storage we need to outlive
+    // the in-flight kernel).
+    //
+    // The tensor is O(num_head_q) (typically < 1 KB) so the host-side
+    // .to() is negligible — far cheaper than wiring a per-instance bf16
+    // sink ABI through the dispatcher. The kernel's
+    // `kHasSink=true` instances are compiled bf16/fp16-only today; fp8
+    // + sink is not yet wired and stays gated at the dispatcher level
+    // (`dispatch_variant` short-circuits `(is_sink && DT::fp8)` →
+    // {false, -1.f} in the same way the no-sink fp8 + SWA combo did
+    // when it was still un-instantiated).
+    at::Tensor sinks_fp32_keepalive;
+    if (sinks.has_value())
+    {
+        auto& s = *sinks;
+        TORCH_CHECK(s.is_cuda(), "unified_attention: sinks must be a CUDA tensor");
+        TORCH_CHECK(s.dim() == 1,
+                    "unified_attention: sinks must be 1-D [num_query_heads], got dim=",
+                    s.dim());
+        TORCH_CHECK(s.size(0) == num_head_q,
+                    "unified_attention: sinks.size(0) (", s.size(0),
+                    ") must equal num_query_heads (", num_head_q, ")");
+        TORCH_CHECK(s.dtype() == torch::kBFloat16 ||
+                        s.dtype() == torch::kFloat16 ||
+                        s.dtype() == torch::kFloat32,
+                    "unified_attention: sinks dtype must be bf16/fp16/fp32, got ",
+                    s.dtype());
+        if (s.dtype() != torch::kFloat32)
+        {
+            sinks_fp32_keepalive = s.to(torch::kFloat32);
+        }
+        else
+        {
+            // Already fp32 — but the kernel expects a contiguous buffer.
+            // `.contiguous()` is a no-op when the layout already is.
+            sinks_fp32_keepalive = s.contiguous();
+        }
+        args.sink_ptr = sinks_fp32_keepalive.data_ptr<float>();
+    }
+    else
+    {
+        args.sink_ptr = nullptr;
     }
 
     auto [launched, elapsed] = ck_tile::unified_attention(args, {stream});

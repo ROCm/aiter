@@ -39,4 +39,20 @@ void unified_attention_fwd(
     // Sliding-window attention bounds in vLLM/Flash-Attention semantics. A
     // value of -1 means "unbounded" on that side.
     int window_size_left  = -1,
-    int window_size_right = -1);
+    int window_size_right = -1,
+    // Per-query-head learnable attention sinks (GPT-OSS / vLLM convention).
+    // When provided, the softmax denominator gains one virtual key per Q
+    // head with logit `sinks[h]` and an all-zero V row, so the sink
+    // absorbs softmax mass but contributes nothing to the V accumulator.
+    //
+    //   shape : [num_query_heads]                         (no leading dims)
+    //   dtype : bf16 / fp16 / fp32 (promoted to fp32 in the wrapper if
+    //           needed; the kernel always reads fp32). Bigger payloads are
+    //           not worth quantizing — the tensor is typically < 1 KB.
+    //   None / std::nullopt → no sink (the classic softmax path; matches
+    //                                  the pre-sink ABI bit-for-bit).
+    //
+    // The kernel dispatcher routes to a kHasSink=true instance only when
+    // this pointer is non-null; otherwise the existing kHasSink=false
+    // instances run unchanged.
+    std::optional<torch::Tensor> sinks = std::nullopt);
