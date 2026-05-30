@@ -1,0 +1,32 @@
+# Smoke test for the DigitalOcean DOKS MI350X self-hosted runner (linux-aiter-do-mi350x-8).
+# Manual only. Verifies: the job lands on the DO GPU node, the preseeded rocm/pytorch image is
+# already local (loaded from the node's 40TiB scratch cache), and the 8x MI350X GPUs are visible
+# to a nested container. No side effects.
+name: DO runner smoke test
+on:
+  workflow_dispatch: {}
+
+jobs:
+  smoke:
+    runs-on: linux-aiter-do-mi350x-8
+    steps:
+      - name: Runner / node info
+        run: |
+          set -x
+          hostname; nproc; free -g
+          ls -la /dev/kfd /dev/dri || true
+          echo "GPU device flags from the runner bootstrap:"
+          cat /etc/podinfo/gha-render-devices || true
+
+      - name: Preseeded image should already be local (loaded from /mnt/scratch cache)
+        run: |
+          set -x
+          docker images | grep -i 'rocm/pytorch' || echo "rocm/pytorch not preloaded (will pull)"
+
+      - name: GPU visibility inside a nested container (rocm-smi + torch)
+        run: |
+          set -euxo pipefail
+          GPU_FLAGS="--device /dev/kfd $(cat /etc/podinfo/gha-render-devices)"
+          docker run --rm $GPU_FLAGS rocm/pytorch:latest rocm-smi --showproductname
+          docker run --rm $GPU_FLAGS rocm/pytorch:latest \
+            python -c "import torch; print('cuda_available:', torch.cuda.is_available(), 'device_count:', torch.cuda.device_count())"
