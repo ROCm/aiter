@@ -193,6 +193,27 @@ def fp8_einsum_qz_kernel(x_fp8, y_pre, sx_i32, sy_i32, transpose_scale):
     )
 
 
+def _torch_bf16_einsum(x_bf16, y_bf16):
+    """Pure-torch bf16 einsum baseline — what callers would use without fp8."""
+    return torch.einsum("bhr,hdr->bhd", x_bf16, y_bf16)
+
+
+def bench_torch_bf16_einsum(x_bf16, y_bf16, H, D, R, B):
+    """Bench torch.einsum on bf16 tensors at the same shape as the fp8 kernel.
+
+    Uses the same `run_perftest` machinery so timing methodology matches the
+    fp8 kernel bench (priming + multiple-iter avg).
+
+    Returns: (torch_us, torch_tf) where torch_tf = 2*B*H*D*R / (us*1e-6) / 1e12.
+    """
+    # Prime once outside profiled region (parity with the fp8 kernel bench).
+    _ = _torch_bf16_einsum(x_bf16, y_bf16)
+    _, torch_us = run_perftest(_torch_bf16_einsum, x_bf16, y_bf16)
+    flops = 2 * B * H * D * R
+    torch_tf = flops / (torch_us * 1e-6) / 1e12
+    return torch_us, torch_tf
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-shape tests
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,6 +270,18 @@ def test_fp8_einsum_bf16(H, D, R, B):
     det = (z_kernel.view(torch.int16) == z_kernel_2.view(torch.int16)).all().item()
     aiter.logger.info(f"  bf16 determinism: {'PASS' if det else 'FAIL'}")
 
+    # Baseline: torch.einsum on bf16 tensors at the same shape. This is what
+    # a caller would use without fp8 — speedup measures the fp8 kernel's
+    # end-to-end perf win INCLUDING the cost of the input fp8 quant (which
+    # is done outside this measurement, but the bench compares the inner
+    # einsum loops only).
+    torch_us, torch_tf = bench_torch_bf16_einsum(x_bf16, y_bf16, H, D, R, B)
+    speedup = torch_us / kernel_us if kernel_us > 0 else 0.0
+    aiter.logger.info(
+        f"  bf16 torch.einsum baseline: {torch_us:.1f} us  {torch_tf:.1f} TF  "
+        f"→ fp8 speedup: {speedup:.2f}x"
+    )
+
     flops = 2 * B * H * D * R
     tf = flops / (kernel_us * 1e-6) / 1e12
     return {
@@ -257,6 +290,9 @@ def test_fp8_einsum_bf16(H, D, R, B):
         "strict": strict_pass,
         "kernel_us": kernel_us,
         "TFLOPS": tf,
+        "torch_us": torch_us,
+        "torch_TF": torch_tf,
+        "speedup": speedup,
         "det": det,
     }
 
@@ -302,8 +338,9 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
     # Normalize the kernel's scale layout to (B, H, D/128) to match
     # per_group_quant_hip's output layout for direct comparison.
     if transpose_scale:
-        # Kernel produced (D/128, B, H); permute back to (B, H, D/128).
-        sz_bhd = sz.permute(1, 2, 0).contiguous()
+        # Kernel produced (H, D/128, B) = (G, D/128, S); permute back to
+        # (B, H, D/128) for comparison with per_group_quant_hip's layout.
+        sz_bhd = sz.permute(2, 0, 1).contiguous()
     else:
         sz_bhd = sz
 
@@ -362,6 +399,17 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
     det_sz = (sz == sz_2).all().item()
     aiter.logger.info(f"  qz determinism: z={det_z}  sz={det_sz}")
 
+    # Baseline: torch.einsum on bf16 tensors (matches the bf16 sweep so qz
+    # speedup is directly comparable). qz adds an output-quant cost that
+    # bf16 doesn't have — speedup here measures the fully-quantized
+    # pipeline vs the unquantized torch reference.
+    torch_us, torch_tf = bench_torch_bf16_einsum(x_bf16, y_bf16, H, D, R, B)
+    speedup = torch_us / kernel_us if kernel_us > 0 else 0.0
+    aiter.logger.info(
+        f"  qz torch.einsum baseline: {torch_us:.1f} us  {torch_tf:.1f} TF  "
+        f"→ fp8 speedup: {speedup:.2f}x"
+    )
+
     flops = 2 * B * H * D * R
     tf = flops / (kernel_us * 1e-6) / 1e12
     return {
@@ -371,6 +419,9 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
         "strict": strict_pass,
         "kernel_us": kernel_us,
         "TFLOPS": tf,
+        "torch_us": torch_us,
+        "torch_TF": torch_tf,
+        "speedup": speedup,
         "det_z": det_z,
         "det_sz": det_sz,
         "sz_pos": sz_pos,
@@ -385,13 +436,25 @@ def test_fp8_einsum_qz(H, D, R, B, transpose_scale=False):
 # auto-dispatched kernel will raise ValueError.
 TUNED_SHAPES = [
     # (H, D, R, label)
-    (16, 1024, 4096, "decode-like"),
+    # V4-Pro wo_a grouped LoRA: H = G = 16 / tp_size, D=1024, R=4096.
+    (16, 1024, 4096, "tp1"),
+    (8, 1024, 4096, "tp2"),
+    (4, 1024, 4096, "tp4"),
+    (2, 1024, 4096, "tp8"),
+    # DSV3 prefill (not V4): H=8, D=R=8192.
     (8, 8192, 8192, "prefill-like"),
+    # Back-compat aliases for the older shape labels.
+    (16, 1024, 4096, "decode-like"),  # alias for tp1
 ]
-# Default B sweep — subset of the tuned B set per shape, picked to cover
-# latency/mid/compute regimes. Override with -m.
+# Default B sweep — covers latency / mid / compute regimes per shape. The
+# H=16/8/4/2 D=1024 R=4096 shapes share the same tuned-B set (from
+# _AUTOTUNE_WINNERS_BF16 in fp8_einsum.py). Override with -m.
+_V4_WOA_BS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096, 8192, 16384]
 DEFAULT_BS = {
-    (16, 1024, 4096): [1, 16, 256, 1024, 16384],
+    (16, 1024, 4096): _V4_WOA_BS,
+    (8, 1024, 4096): _V4_WOA_BS,
+    (4, 1024, 4096): _V4_WOA_BS,
+    (2, 1024, 4096): _V4_WOA_BS,
     (8, 8192, 8192): [128, 512, 2048],
 }
 
@@ -426,9 +489,20 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-# Build the shape list.
-labels = args.shape if args.shape else [lbl for *_, lbl in TUNED_SHAPES]
-shapes = [(h, d, r, lbl) for (h, d, r, lbl) in TUNED_SHAPES if lbl in labels]
+# Build the shape list. Dedup by (H, D, R) — the alias `decode-like` and the
+# canonical `tp1` map to the same shape; running both wastes time.
+labels = args.shape if args.shape else [
+    lbl for *_, lbl in TUNED_SHAPES if lbl != "decode-like"
+]
+_seen = set()
+shapes = []
+for (h, d, r, lbl) in TUNED_SHAPES:
+    if lbl not in labels:
+        continue
+    if (h, d, r) in _seen:
+        continue
+    _seen.add((h, d, r))
+    shapes.append((h, d, r, lbl))
 
 
 # Build the per-shape B list.

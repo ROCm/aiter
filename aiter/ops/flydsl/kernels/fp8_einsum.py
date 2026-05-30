@@ -126,21 +126,26 @@ _AUTOTUNE_WINNERS_BF16 = {
     (4, 1024, 4096, 4096): (64, 256, 128, 2),    # 1759 TF
     (4, 1024, 4096, 8192): (128, 128, 128, 4),   # 1815 TF
     (4, 1024, 4096, 16384): (128, 128, 128, 4),  # 1681 TF
-    # H=2 D=1024 R=4096  (TP=8)
-    (2, 1024, 4096, 1): (32, 128, 128, 2),       # 1 TF
-    (2, 1024, 4096, 2): (32, 128, 512, 2),       # 2 TF
-    (2, 1024, 4096, 4): (32, 128, 128, 8),       # 5 TF
-    (2, 1024, 4096, 8): (64, 128, 128, 0),       # 10 TF
-    (2, 1024, 4096, 16): (32, 128, 128, 2),      # 19 TF
-    (2, 1024, 4096, 32): (32, 128, 128, 2),      # 38 TF
-    (2, 1024, 4096, 64): (32, 128, 128, 8),      # 75 TF
-    (2, 1024, 4096, 128): (32, 128, 512, 8),     # 153 TF
-    (2, 1024, 4096, 256): (32, 128, 512, 4),     # 308 TF
-    (2, 1024, 4096, 512): (32, 128, 256, 4),     # 614 TF
-    (2, 1024, 4096, 1024): (64, 128, 512, 4),    # 1048 TF
-    (2, 1024, 4096, 4096): (128, 128, 128, 0),   # 1832 TF
-    (2, 1024, 4096, 8192): (64, 256, 128, 4),    # 1823 TF
-    (2, 1024, 4096, 16384): (128, 128, 256, 8),  # 1771 TF
+    # H=2 D=1024 R=4096  (TP=8). Re-tuned 2026-05-28 with a wider grid
+    # (tile_m ∈ {16, 32, 64, 128}, tile_k ∈ {128, 256, 512}, bsw ∈ {0, 2, 4, 8}).
+    # Small-B values (B ≤ ~128) are LAUNCH-BOUND on this shape (kernel launch
+    # floor ≈ 13-14 μs > compute time), so tile choice barely moves the needle
+    # there — the listed config is the marginal winner within bench noise.
+    # The real wins are at B ≥ 1024 where compute dominates.
+    (2, 1024, 4096, 1): (64, 128, 512, 8),       # 1 TF (launch-bound)
+    (2, 1024, 4096, 2): (32, 128, 128, 2),       # 2 TF
+    (2, 1024, 4096, 4): (64, 128, 128, 2),       # 5 TF
+    (2, 1024, 4096, 8): (64, 128, 256, 8),       # 9 TF
+    (2, 1024, 4096, 16): (32, 128, 256, 0),      # 18 TF
+    (2, 1024, 4096, 32): (32, 128, 256, 8),      # 36 TF
+    (2, 1024, 4096, 64): (32, 128, 128, 2),      # 72 TF
+    (2, 1024, 4096, 128): (32, 128, 128, 2),     # 141 TF
+    (2, 1024, 4096, 256): (64, 128, 512, 0),     # 285 TF
+    (2, 1024, 4096, 512): (32, 128, 512, 2),     # 576 TF
+    (2, 1024, 4096, 1024): (64, 128, 256, 4),    # 1038 TF
+    (2, 1024, 4096, 4096): (128, 128, 256, 0),   # 1857 TF (was 1832 TF)
+    (2, 1024, 4096, 8192): (128, 128, 256, 8),   # 1815 TF (was 1823 TF; tile changed)
+    (2, 1024, 4096, 16384): (128, 128, 256, 8),  # 2036 TF (was 1771 TF; +15%)
     # H=8 D=R=8192 peak shapes (not a V4 shape; DSV3 prefill)
     (8, 8192, 8192, 128): (128, 128, 256, 0),
     (8, 8192, 8192, 512): (128, 256, 128, 0),
@@ -377,9 +382,11 @@ def fp8_einsum(
                                            fp32 scale.
       transpose_scale: only meaningful when ``out_dtype == torch.float8_e4m3fn``.
                        When True the scale tensor is laid out as
-                       ``(D // 128, B, H)`` instead of the default
-                       ``(B, H, D // 128)``. Mirrors
-                       ``aiter.ops.quant.per_group_quant_hip``'s option.
+                       ``(H, D // 128, B)`` instead of the default
+                       ``(B, H, D // 128)``. Memory is ``(H*D/128, B)``
+                       contiguous (the H and D-128-group axes lead, batch
+                       innermost), so a consumer that wants a column-major
+                       ``(B, H*D/128)`` scale can ``.view()`` it with no copy.
       stream: CUDA stream; defaults to the current stream.
 
     Returns:
@@ -459,7 +466,10 @@ def fp8_einsum(
     if is_qz:
         z = torch.empty(B, H, D, dtype=torch.float8_e4m3fn, device=device)
         if transpose_scale:
-            sz = torch.empty(D // 128, B, H, dtype=torch.float32, device=device)
+            # (H, D//128, B): H and D-128-group axes lead, batch innermost.
+            # Memory is (H*D/128, B) contiguous → a column-major (B, H*D/128)
+            # scale view with no copy for downstream blockscale-GEMM consumers.
+            sz = torch.empty(H, D // 128, B, dtype=torch.float32, device=device)
         else:
             sz = torch.empty(B, H, D // 128, dtype=torch.float32, device=device)
     else:
@@ -501,11 +511,12 @@ def compile_fp8_einsum_clean_ue8m0(
         `compile_fp8_einsum_clean_ue8m0_qz()` simply calls this factory
         with `quant_output=True`.
       quant_transpose_scale: when True with `quant_output=True`, the scale
-        tensor `arg_sz` is laid out as `(D // 128, B, H)` fp32 (the D-128
-        group axis is leading) rather than the default `(B, H, D//128)`.
-        Mirrors `aiter.ops.quant.per_group_quant_hip`'s `transpose_scale`
-        option — useful when the scale will feed a downstream kernel that
-        expects the scale-group axis on the outside. Requires `quant_output=True`.
+        tensor `arg_sz` is laid out as `(H, D // 128, B)` fp32 (H and the
+        D-128-group axis lead, batch innermost) rather than the default
+        `(B, H, D//128)`. Memory is `(H*D/128, B)` contiguous, so a downstream
+        blockscale GEMM can read it directly as a column-major `(B, H*D/128)`
+        `x_scale` with no `permute().contiguous()` copy. Requires
+        `quant_output=True`.
 
     Returns: launcher with signature
       bf16 mode: launch(z_bf16, x_fp8, y_pre, sx_i32, sy_i32, B, stream)
@@ -542,7 +553,6 @@ def compile_fp8_einsum_clean_ue8m0(
             f"R={R} must be divisible by 512 (packed UE8M0 needs 4 K-128 "
             f"blocks per i32)."
         )
-
     gpu_arch = get_hip_arch()
     if not str(gpu_arch).startswith("gfx95"):
         raise RuntimeError(f"clean ue8m0 kernel targets gfx950 only, got {gpu_arch}")
@@ -1547,9 +1557,13 @@ def compile_fp8_einsum_clean_ue8m0(
                     else:  # tile_n == 256
                         d128_global = by * fx.Index(2) + d128_owner_v
                     if quant_transpose_scale:
-                        # Layout (D//128, B, H) — sz_idx = d128*(B*H) + b*H + h
+                        # Layout (H, D//128, B): memory (H*D/128, B) contiguous,
+                        # for a no-copy column-major (B, H*D/128) scale view
+                        # downstream. sz_idx = h*(D//128 * B) + d128*B + b.
                         sz_idx = (
-                            d128_global * (c_b * fx.Index(H)) + row * fx.Index(H) + bx_h
+                            bx_h * (fx.Index(D // 128) * c_b)
+                            + d128_global * c_b
+                            + row
                         )
                     else:
                         # Layout (B, H, D//128) — sz_idx = b*(H*D//128) + h*(D//128) + d128
@@ -1632,7 +1646,11 @@ def compile_fp8_einsum_clean_ue8m0(
 
         Vec_init = fx.Vector.filled(4, 0.0, fx.Float32)
         accs = [Vec_init] * (num_acc_n * m_repeat)
+        # Per-WG K-tile loop length: R / tile_k.
         num_tiles = R // tile_k
+
+        def _k_off(base_elem_int):
+            return fx.Index(base_elem_int)
 
         # 1896 TF reference: B is gmem→regs (sync), A is gmem→LDS (async).
         # Per-iter pattern:
@@ -1642,8 +1660,8 @@ def compile_fp8_einsum_clean_ue8m0(
         #   s_waitcnt(vmcnt=N_b, lgkmcnt=0) + barrier
         load_sx_to_lds()
         load_sy_to_lds()
-        load_a_tile_to_lds_async(fx.Index(0), lds_a_pong)
-        b_pong = load_b_tile(fx.Index(0))
+        load_a_tile_to_lds_async(_k_off(0), lds_a_pong)
+        b_pong = load_b_tile(_k_off(0))
         gpu.barrier()
         sx_pong = prefetch_sx_tile(0)
         sy_pong = prefetch_sy_tile(0)
@@ -1666,7 +1684,7 @@ def compile_fp8_einsum_clean_ue8m0(
                 _loop_end_excl = num_tiles - 2
 
             for kt_base in range_constexpr(0, _loop_end_excl, 2):
-                next_k1 = fx.Index((kt_base + 1) * tile_k)
+                next_k1 = _k_off((kt_base + 1) * tile_k)
                 load_a_tile_to_lds_async(next_k1, lds_a_ping)
                 b_ping = load_b_tile(next_k1)
                 sx_ping = prefetch_sx_tile(kt_base + 1)
@@ -1686,7 +1704,7 @@ def compile_fp8_einsum_clean_ue8m0(
                 gpu.barrier()
                 a0_ping = lds_a0_prefetch(lds_a_ping)
 
-                next_k2 = fx.Index((kt_base + 2) * tile_k)
+                next_k2 = _k_off((kt_base + 2) * tile_k)
                 load_a_tile_to_lds_async(next_k2, lds_a_pong)
                 b_pong = load_b_tile(next_k2)
                 sx_pong = prefetch_sx_tile(kt_base + 2)
@@ -1717,7 +1735,7 @@ def compile_fp8_einsum_clean_ue8m0(
                     a0_prefetch=a0_pong,
                 )
             else:
-                next_k1 = fx.Index((_loop_end_excl + 1) * tile_k)
+                next_k1 = _k_off((_loop_end_excl + 1) * tile_k)
                 load_a_tile_to_lds_async(next_k1, lds_a_ping)
                 b_ping = load_b_tile(next_k1)
                 sx_ping = prefetch_sx_tile(_loop_end_excl + 1)
@@ -1856,7 +1874,7 @@ def compile_fp8_einsum_clean_ue8m0_qz(
       arg_z : fp8 e4m3 (B, H, D)            (was bf16 in the non-qz variant)
       arg_sz: fp32     scale tensor — layout depends on `transpose_scale`:
                        False (default): (B, H, D // 128)
-                       True:            (D // 128, B, H)
+                       True:            (H, D // 128, B)
       arg_x : fp8 e4m3 (B, H, R)
       arg_y : fp8 e4m3 preshuffled (per-head packed)
       arg_sx: int32 (B, H, R // 512)        — packed UE8M0
@@ -1870,7 +1888,7 @@ def compile_fp8_einsum_clean_ue8m0_qz(
     instruction does NOT saturate — it produces NaN above 448).
 
     Args:
-      transpose_scale: when True, scale is stored in `(D // 128, B, H)` layout
+      transpose_scale: when True, scale is stored in `(H, D // 128, B)` layout
         instead of the default `(B, H, D // 128)`. Mirrors the
         `transpose_scale` option of `aiter.ops.quant.per_group_quant_hip` —
         useful when the scale will be re-consumed by a downstream kernel
