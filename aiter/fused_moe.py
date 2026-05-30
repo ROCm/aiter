@@ -733,7 +733,6 @@ def _needs_swiglu_bias_support(dtype, quant_type):
 
 def _normalize_bias_for_kernel(
     bias: Optional[torch.Tensor],
-    a_dtype="fp8",
 ) -> Optional[torch.Tensor]:
     if bias is None:
         return bias
@@ -742,11 +741,11 @@ def _normalize_bias_for_kernel(
     return bias
 
 
-# TODO: remove this function once kernel handles padding int the runtime
+# TODO: remove this function once kernel handles padding in the runtime
 def _get_padding_for_flydsl(
     inter_dim_pad,
     model_dim_pad,
-    bias: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor] = None,
 ):
     if bias is not None:
         return 0, 0
