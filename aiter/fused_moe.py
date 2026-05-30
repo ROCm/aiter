@@ -389,7 +389,6 @@ def fused_moe_(
         intermediate_pad,
         isShuffled,
         gate_mode,
-        bias=(bias1 is not None or bias2 is not None),
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -784,6 +783,17 @@ def _normalize_bias_for_kernel(
     return bias
 
 
+# TODO: remove this function once kernel handles padding in the runtime
+def _get_padding_for_flydsl(
+    inter_dim_pad,
+    model_dim_pad,
+    bias: Optional[torch.Tensor] = None,
+):
+    if bias is not None:
+        return 0, 0
+    return inter_dim_pad, model_dim_pad
+
+
 def _flydsl_stage1_wrapper(
     hidden_states,
     w1,
@@ -807,6 +817,9 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     **_kwargs,
 ):
+    inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
+        inter_dim_pad, model_dim_pad, bias1
+    )
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
@@ -864,6 +877,9 @@ def _flydsl_stage2_wrapper(
     **_kwargs,
 ):
 
+    inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
+        inter_dim_pad, model_dim_pad, bias2
+    )
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
@@ -913,7 +929,6 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
-    bias=False,
 ):
     gate_mode = GateMode(gate_mode)
     _INDEX_COLS = [
@@ -930,23 +945,12 @@ def get_2stage_cfgs(
         "q_type",
         "use_g1u1",
         "doweight_stage1",
-        "bias",
     ]
-
-    def _normalize_lookup_cols(df):
-        if "bias" in df.columns:
-            df["bias"] = df["bias"].map(
-                lambda value: dtypes.str2bool(str(value).strip())
-            )
-        else:
-            df["bias"] = False
-        return df
 
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
         df = pd.read_csv(tune_file)
-        df = _normalize_lookup_cols(df)
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
 
@@ -993,7 +997,6 @@ def get_2stage_cfgs(
             return {}
         if "act_type" in df.columns:
             df["act_type"] = _ACT_TYPE_DISABLED_KEY
-        df = _normalize_lookup_cols(df)
         fb_df = df[df["_tag"] == "flydsl_fallback"]
         if fb_df.empty:
             _flydsl_fallback_cache[tune_file] = {}
@@ -1017,7 +1020,6 @@ def get_2stage_cfgs(
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
-    bias_key = bool(bias)
     keys = (
         cu_num,
         token,
@@ -1032,7 +1034,6 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
-        bias_key,
     )
     keys_disabled = (
         cu_num,
@@ -1048,39 +1049,17 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
-        bias_key,
     )
 
     def MainFunc():
-        header = "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,bias"
-        # Migrate legacy untuned CSVs (no `bias` column) so appended rows stay aligned.
-        if os.path.exists(untune_file) and os.path.getsize(untune_file) > 0:
-            with open(untune_file, "r") as f:
-                lines = f.read().splitlines()
-            if lines and "bias" not in lines[0].split(","):
-                old_cols = lines[0].split(",")
-                try:
-                    insert_at = old_cols.index("doweight_stage1") + 1
-                except ValueError:
-                    insert_at = len(old_cols)
-                new_lines = [
-                    ",".join(old_cols[:insert_at] + ["bias"] + old_cols[insert_at:])
-                ]
-                for line in lines[1:]:
-                    if not line.strip():
-                        new_lines.append(line)
-                        continue
-                    parts = line.split(",")
-                    parts = parts[:insert_at] + ["False"] + parts[insert_at:]
-                    new_lines.append(",".join(parts))
-                with open(untune_file, "w") as f:
-                    f.write("\n".join(new_lines))
         with open(untune_file, "a") as f:
             if os.path.getsize(untune_file) == 0:
-                f.write(header)
+                f.write(
+                    "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
+                )
             q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
             f.write(
-                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)},{bool(bias)}"
+                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
             )
         logger.info("\033[34m Start tuning fmoe")
         os.system(
@@ -1653,7 +1632,6 @@ def fused_moe_2stages(
         intermediate_pad,
         is_shuffled,
         gate_mode,
-        bias=(bias1 is not None or bias2 is not None),
     )
     if (
         quant_type == QuantType.per_1x32
