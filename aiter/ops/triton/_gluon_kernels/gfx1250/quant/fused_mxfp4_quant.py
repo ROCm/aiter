@@ -1,4 +1,5 @@
 import triton
+import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
