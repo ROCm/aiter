@@ -131,28 +131,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
-    # Env-driven overrides split by regime: block_m>=64 → PREFILL_*, else DECODE_*.
-    # Generic AITER_A8W4_* still works as a fallback when the regime-specific var is unset.
-    _regime = "PREFILL" if block_m >= 64 else "DECODE"
-    _knobs = (
-        "block_n",
-        "block_k",
-        "num_warps",
-        "num_stages",
-        "group_m",
-        "waves_per_eu",
-        "matrix_instr_nonkdim",
-        "split_k",
-    )
-    for key in _knobs:
-        env_specific = f"AITER_A8W4_{_regime}_{key.upper()}"
-        env_generic = f"AITER_A8W4_{key.upper()}"
-        v = os.environ.get(env_specific, os.environ.get(env_generic))
-        if v is not None:
-            try:
-                ret[key] = int(v)
-            except ValueError:
-                pass
+
     return ret
 
 
