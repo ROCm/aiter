@@ -1322,6 +1322,13 @@ def get_2stage_cfgs(
                 kernelName=kernelName1,
                 activation=activation,
             )
+        elif kernelName1 and "ck2stages" not in kernelName1:
+            stage1_func = functools.partial(
+                asm_stage1,
+                kernelName=kernelName1,
+                activation=activation,
+                quant_type=q_type,
+            )
         else:
             stage1_func = functools.partial(
                 ck_moe_stage1,
