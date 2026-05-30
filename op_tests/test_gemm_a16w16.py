@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import os
 import random
 from functools import lru_cache
 
@@ -11,10 +12,18 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes, hipb_create_extension, hipb_mm
-from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.tuned_gemm import tgemm, triton_gemm
+
+try:
+    from tuned_op_bench_utils import append_tuned_op_bench_rows
+except ModuleNotFoundError as e:
+    if e.name != "tuned_op_bench_utils":
+        raise
+    from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 
 # TEST_NUM_ITERS = 10
 TEST_NUM_ITERS = 100
@@ -428,6 +437,53 @@ def test_skinny_gemm():
     return df
 
 
+def _csv_dtype(value):
+    value = str(value).strip()
+    if value.startswith("torch."):
+        value = value.split(".", 1)[1]
+    if value == "bfloat16":
+        return torch.bfloat16
+    if value == "float16":
+        return torch.float16
+    if value == "float32":
+        return torch.float32
+    return dtypes.str2Dtype(value)
+
+
+def _iter_flydsl_csv_cases():
+    """Yield (test_gemm kwargs, bench metadata) for bf16 FlyDSL tuned CSV rows."""
+    gfx, cu = get_gfx(), get_cu_num()
+    merged_csv = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
+    df = pd.read_csv(merged_csv)
+    rows = df[(df["gfx"] == gfx) & (df["cu_num"] == cu) & (df["libtype"] == "flydsl")]
+    aiter.logger.info(
+        "%d bf16 flydsl rows for %s cu=%d from %s",
+        len(rows),
+        gfx,
+        cu,
+        os.path.basename(merged_csv),
+    )
+    for _, row in rows.iterrows():
+        scale_ab = dtypes.str2bool(str(row.get("scaleAB", "False")))
+        yield (
+            dict(
+                dtype=_csv_dtype(row["dtype"]),
+                m=int(row["M"]),
+                n=int(row["N"]),
+                k=int(row["K"]),
+                bias=dtypes.str2bool(str(row.get("bias", "False"))),
+                otype=_csv_dtype(row["outdtype"]),
+                scaleA=1.0 if scale_ab else None,
+                scaleB=1.0 if scale_ab else None,
+            ),
+            {
+                "source": "bf16_flydsl_csv",
+                "libtype": str(row.get("libtype", "")),
+                "kernelName1": str(row.get("kernelName", "")),
+            },
+        )
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -495,29 +551,58 @@ parser.add_argument(
     help="""Scale B.
     e.g.: -sb 0.5""",
 )
+parser.add_argument(
+    "--no-flydsl-csv",
+    action="store_true",
+    help="Skip validating FlyDSL rows from the merged bf16 tuned GEMM CSV.",
+)
+parser.add_argument(
+    "--no-legacy",
+    action="store_true",
+    help="Skip the original hardcoded normal/skinny shape tests.",
+)
 args = parser.parse_args()
 
 df = []
-for test in args.test:
-    if test == "normal":
-        for dtype in args.dtype:
-            for otype in args.otype:
-                for m, n, k in args.mnk:
-                    ret = test_gemm(
-                        dtype,
-                        m,
-                        n,
-                        k,
-                        bias=args.bias,
-                        otype=otype,
-                        scaleA=args.scale_a,
-                        scaleB=args.scale_b,
-                    )
-                    df.append(ret)
+if not args.no_flydsl_csv:
+    bench_csv = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
+    for kwargs, extras in _iter_flydsl_csv_cases():
+        ret = test_gemm(**kwargs)
+        ret.update(extras)
+        df.append(ret)
+        written = append_tuned_op_bench_rows(
+            bench_csv,
+            [ret],
+            op_name="gemm_a16w16",
+        )
+        if written:
+            aiter.logger.info(
+                "gemm_a16w16: appended %d tuned op bench row(s) to %s",
+                written,
+                bench_csv,
+            )
 
-    elif test == "skinny":
-        ret = test_skinny_gemm()
-        df += ret
+if not args.no_legacy:
+    for test in args.test:
+        if test == "normal":
+            for dtype in args.dtype:
+                for otype in args.otype:
+                    for m, n, k in args.mnk:
+                        ret = test_gemm(
+                            dtype,
+                            m,
+                            n,
+                            k,
+                            bias=args.bias,
+                            otype=otype,
+                            scaleA=args.scale_a,
+                            scaleB=args.scale_b,
+                        )
+                        df.append(ret)
+
+        elif test == "skinny":
+            ret = test_skinny_gemm()
+            df += ret
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)

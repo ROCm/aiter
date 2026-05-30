@@ -15,6 +15,7 @@ AITER_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 CONFIGS_DIR = os.path.join(AITER_ROOT, "aiter", "configs")
+MODEL_CONFIGS_DIR = os.path.join(CONFIGS_DIR, "model_configs")
 
 
 class TestCSVValidation(unittest.TestCase):
@@ -173,6 +174,41 @@ class TestCSVValidation(unittest.TestCase):
             with self.subTest(file=f):
                 path = os.path.join(CONFIGS_DIR, f)
                 self.assertTrue(os.path.exists(path), f"Missing: {f}")
+
+    def test_bf16_flydsl_kernel_names_are_cataloged(self):
+        """Every tuned bf16 FlyDSL GEMM row should name a current catalog entry."""
+        from aiter.ops.flydsl.gemm_kernels import get_flydsl_splitk_hgemm_kernel_params
+
+        csv_paths = [
+            os.path.join(CONFIGS_DIR, f)
+            for f in os.listdir(CONFIGS_DIR)
+            if f.endswith("bf16_tuned_gemm.csv")
+        ]
+        if os.path.isdir(MODEL_CONFIGS_DIR):
+            csv_paths.extend(
+                os.path.join(MODEL_CONFIGS_DIR, f)
+                for f in os.listdir(MODEL_CONFIGS_DIR)
+                if f.endswith("bf16_tuned_gemm.csv")
+            )
+
+        bad = []
+        for path in sorted(csv_paths):
+            df = pd.read_csv(path)
+            if "kernelName" not in df.columns or "libtype" not in df.columns:
+                continue
+            flydsl_rows = df[df["libtype"].astype(str).str.strip() == "flydsl"]
+            for idx, row in flydsl_rows.iterrows():
+                kernel_name = str(row["kernelName"]).strip()
+                if get_flydsl_splitk_hgemm_kernel_params(kernel_name) is None:
+                    bad.append(
+                        f"{os.path.relpath(path, AITER_ROOT)}:{idx + 2}: {kernel_name}"
+                    )
+
+        self.assertEqual(
+            bad,
+            [],
+            "Unrecognized FlyDSL bf16 GEMM kernelName entries:\n" + "\n".join(bad[:20]),
+        )
 
 
 if __name__ == "__main__":
