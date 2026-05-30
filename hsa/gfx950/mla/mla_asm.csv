@@ -1,6 +1,7 @@
 qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,knl_name,co_name
 bf16,bf16,128,0,0,0,0,0,_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E,mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co
 bf16,bf16,16,1,4,0,0,0,_ZN5aiter42mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_psE,mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_ps.co
+bf16,bf16,16,1,4,0,0,1,_ZN5aiter46mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_lse_psE,mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_lse_ps.co
 bf16,bf16,16,0,1,0,0,0,_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E,mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co
 bf16,bf16,16,0,4,0,0,0,_ZN5aiter39mla_a16w16_qh16_m16x4_n16x1_coex0_mask1E,mla_a16w16_qh16_m16x4_n16x1_coex0_mask1.co
 bf16,bf16,16,0,8,0,0,0,_ZN5aiter39mla_a16w16_qh16_m32x4_n16x1_coex0_mask1E,mla_a16w16_qh16_m32x4_n16x1_coex0_mask1.co
@@ -36,5 +37,6 @@ fp8,fp8,8,0,1,0,0,0,_ZN5aiter34mla_a8w8_qh8_qseqlen1_gqaratio8_v3E,mla_a8w8_qh8_
 fp8,fp8,8,1,4,0,0,0,_ZN5aiter35mla_a8w8_qh32_qseqlen4_gqaratio8_psE,mla_a8w8_qh32_qseqlen4_gqaratio8_ps.co
 fp8,fp8,8,1,4,0,0,1,_ZN5aiter39mla_a8w8_qh32_qseqlen4_gqaratio8_lse_psE,mla_a8w8_qh32_qseqlen4_gqaratio8_lse_ps.co
 bf16,bf16,32,1,4,0,0,0,_ZN5aiter38mla_a16w16_qh32_qseqlen4_gqaratio32_psE,mla_a16w16_qh32_qseqlen4_gqaratio32_ps.co
+bf16,bf16,32,1,4,0,0,1,_ZN5aiter42mla_a16w16_qh32_qseqlen4_gqaratio32_lse_psE,mla_a16w16_qh32_qseqlen4_gqaratio32_lse_ps.co
 bf16,bf16,64,1,1,0,0,0,_ZN5aiter41mla_a16w16_qh64_qseqlen1_gqaratio64_v3_psE,mla_a16w16_qh64_qseqlen1_gqaratio64_v3_ps.co
 bf16,bf16,64,1,1,0,0,1,_ZN5aiter45mla_a16w16_qh64_qseqlen1_gqaratio64_lse_v3_psE,mla_a16w16_qh64_qseqlen1_gqaratio64_lse_v3_ps.co
