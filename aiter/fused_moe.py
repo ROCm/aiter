@@ -733,12 +733,24 @@ def _needs_swiglu_bias_support(dtype, quant_type):
 
 def _normalize_bias_for_kernel(
     bias: Optional[torch.Tensor],
+    a_dtype="fp8",
 ) -> Optional[torch.Tensor]:
     if bias is None:
         return bias
     if bias.dtype != torch.float32:
         raise TypeError(f"MoE bias must be fp32, got {bias.dtype}")
     return bias
+
+
+# TODO: remove this function once FlyDSL handles padding internally
+def _get_padding_for_flydsl(
+    inter_dim_pad,
+    model_dim_pad,
+    bias: Optional[torch.Tensor],
+):
+    if bias is not None:
+        return 0, 0
+    return inter_dim_pad, model_dim_pad
 
 
 def _flydsl_stage1_wrapper(
@@ -764,6 +776,9 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     **_kwargs,
 ):
+    inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
+        inter_dim_pad, model_dim_pad, bias1
+    )
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
@@ -821,6 +836,9 @@ def _flydsl_stage2_wrapper(
     **_kwargs,
 ):
 
+    inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
+        inter_dim_pad, model_dim_pad, bias2
+    )
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
