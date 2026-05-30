@@ -50,16 +50,9 @@ jobs:
         run: |
           set -euxo pipefail
           GPU_FLAGS="--device /dev/kfd $(cat /etc/podinfo/gha-render-devices)"
-          docker run --rm $GPU_FLAGS -e EXPECT="$EXPECT" rocm/pytorch:latest bash -lc '
-            set -euxo pipefail
-            rocm-smi --showproductname
-            python - <<PY
-import os, torch
-n = torch.cuda.device_count()
-exp = int(os.environ["EXPECT"])
-print("device_count:", n, "expected:", exp)
-assert n == exp, f"expected {exp} GPU(s) for this label, got {n}"
-PY'
+          docker run --rm $GPU_FLAGS rocm/pytorch:latest rocm-smi --showproductname
+          docker run --rm $GPU_FLAGS -e EXPECT="$EXPECT" rocm/pytorch:latest \
+            python -c 'import os, torch; n = torch.cuda.device_count(); exp = int(os.environ["EXPECT"]); print("device_count:", n, "expected:", exp); assert n == exp'
 
       - name: Resolve the existing aiter wheel (no build)
         id: whl
@@ -71,7 +64,7 @@ PY'
             URL="$OVERRIDE"
           else
             URL=$(curl -fsSL "$LATEST_MAIN_MANIFEST" \
-              | python3 -c "import sys, json; print(json.load(sys.stdin)['wheel_url'])")
+              | python3 -c 'import sys, json; print(json.load(sys.stdin)["wheel_url"])')
           fi
           echo "wheel_url=$URL" >> "$GITHUB_OUTPUT"
           echo "Using existing wheel: $URL"
@@ -82,11 +75,5 @@ PY'
         run: |
           set -euxo pipefail
           GPU_FLAGS="--device /dev/kfd $(cat /etc/podinfo/gha-render-devices)"
-          docker run --rm $GPU_FLAGS -e WHL_URL="$WHL_URL" rocm/pytorch:latest bash -lc '
-            set -euxo pipefail
-            pip install --no-cache-dir "$WHL_URL"
-            python - <<PY
-import aiter, torch
-print("aiter imported OK; torch sees", torch.cuda.device_count(), "GPU(s)")
-print("aiter version:", getattr(aiter, "__version__", "n/a"))
-PY'
+          docker run --rm $GPU_FLAGS -e WHL_URL="$WHL_URL" rocm/pytorch:latest \
+            sh -c 'pip install --no-cache-dir "$WHL_URL" && python -c "import aiter, torch; print(torch.cuda.device_count())" && echo aiter-import-OK'
