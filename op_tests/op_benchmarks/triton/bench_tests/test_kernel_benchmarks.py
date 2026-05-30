@@ -138,9 +138,7 @@ def test_kimi_k2_model_shapes_entry():
 
     # MLA projection GEMMs (q_b, kv_b, o_proj) — these differ from DSR1
     # because Kimi K2 halves the head count.
-    dense_gemm_kernels = [
-        k for k in kimi if k.startswith("gemm_") and "moe" not in k
-    ]
+    dense_gemm_kernels = [k for k in kimi if k.startswith("gemm_") and "moe" not in k]
     assert dense_gemm_kernels, "Kimi-K2 must exercise at least one dense GEMM"
     for k in dense_gemm_kernels:
         nk = {(s["N"], s["K"]) for s in kimi[k]}
