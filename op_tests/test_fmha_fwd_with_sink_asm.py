@@ -51,6 +51,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 #
 # )  # noqa: F401  (kept for easy swap-back; see doc-block below)
 
+
 def _is_gfx1250_host() -> bool:
     """True only on a gfx1250 GPU host.
 
@@ -685,19 +686,32 @@ def test_fmha_fwd_with_sink_asm_multi_gpu_dispatch(head_dim):
     torch.manual_seed(0)
     batch, hq, hk, sq, sk = 1, 4, 1, 128, 1024
     scale = 1.0 / math.sqrt(head_dim)
-    dev_q = "cuda:1"   # tensors live here
-    dev_other = 0      # caller's current_device when we invoke the API
+    dev_q = "cuda:1"  # tensors live here
+    dev_other = 0  # caller's current_device when we invoke the API
 
     # Allocate everything on dev_q with current_device set to dev_q so the
     # baseline run goes through the "current == q" path.
     with torch.cuda.device(dev_q):
         q1, k1, v1 = make_qkv_bshd(
-            layout=0, sq=sq, sk=sk, batch=batch, hq=hq, hk=hk, d=head_dim,
-            dtype=torch.bfloat16, device=dev_q,
+            layout=0,
+            sq=sq,
+            sk=sk,
+            batch=batch,
+            hq=hq,
+            hk=hk,
+            d=head_dim,
+            dtype=torch.bfloat16,
+            device=dev_q,
         )
         sink1 = _d64_sink(hq, dev_q) if head_dim == 64 else None
         out_baseline, lse_baseline = run_kernel(
-            q1, k1, v1, scale=scale, is_causal=True, sink=sink1, via="public",
+            q1,
+            k1,
+            v1,
+            scale=scale,
+            is_causal=True,
+            sink=sink1,
+            via="public",
         )
     # Clone so the next run can't alias-overwrite us (defensive; the kernel
     # writes to a fresh `out` tensor each call, but we want to be 100% sure
@@ -708,20 +722,26 @@ def test_fmha_fwd_with_sink_asm_multi_gpu_dispatch(head_dim):
     # Now switch current_device to dev_other and re-run with the SAME dev_q
     # tensors.  Pre-fix this is the crash / wrong-device path.
     with torch.cuda.device(dev_other):
-        assert torch.cuda.current_device() == dev_other, (
-            "test setup error: failed to switch current_device"
-        )
+        assert (
+            torch.cuda.current_device() == dev_other
+        ), "test setup error: failed to switch current_device"
         out_xdev, lse_xdev = run_kernel(
-            q1, k1, v1, scale=scale, is_causal=True, sink=sink1, via="public",
+            q1,
+            k1,
+            v1,
+            scale=scale,
+            is_causal=True,
+            sink=sink1,
+            via="public",
         )
 
     # Outputs must land on q.device(), not on the caller's current_device.
-    assert out_xdev.device == q1.device, (
-        f"out landed on {out_xdev.device}, expected {q1.device}"
-    )
-    assert lse_xdev.device == q1.device, (
-        f"lse landed on {lse_xdev.device}, expected {q1.device}"
-    )
+    assert (
+        out_xdev.device == q1.device
+    ), f"out landed on {out_xdev.device}, expected {q1.device}"
+    assert (
+        lse_xdev.device == q1.device
+    ), f"lse landed on {lse_xdev.device}, expected {q1.device}"
 
     # Same inputs + same (deterministic) kernel -> bit-exact match across
     # current_device contexts.  If the guard or stream picker regresses,
