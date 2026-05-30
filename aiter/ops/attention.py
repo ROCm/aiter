@@ -711,6 +711,11 @@ def mla_decode_v4_asm(
     kv_last_page_lens: torch.Tensor,
     # [num_seqs+1]
     split_indptr: torch.Tensor,
+    # [num_heads] FP32 — attention sink logit. Loaded by the kernel via
+    # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
+    # tensor; there is no nullable-sink convention on the C ABI. Pass
+    # torch.full((num_heads,), float("-inf")) for "no sink" math.
+    sink: torch.Tensor,
     max_seqlen_q: int,
     # ignored on v4 nm; kernel hardcodes 1/sqrt(kV4DimNope+kV4DimRope)=1/sqrt(512)
     softmax_scale: float,

@@ -38,9 +38,14 @@
 AITER_CTYPES_ERROR_DEF
 
 // ----------------------------------------------------------------------------
-// 18-slot kernarg buffer (288 bytes). Layout MUST match poc_kl's
-// MlaV4HipKernelArgs in mla_execute_v4_hip.inl slot-by-slot — verified by
+// 19-slot kernarg buffer (304 bytes).verified by
 // op_tests/test_mla_v4_nm.py::test_v4_nm_kernarg_scalar_slots.
+//
+// `ptr_sink` (slot 18, byte offset 0x120) is the attention-sink logit
+// pointer. Pass `torch.full((num_heads,), -inf)` for "no sink"
+// math (exp(-inf - max) = 0 → no contribution); the wrapper does NOT
+// substitute a -1e9 sentinel for you — pure -inf works because the kernel
+// writes its running max in fp32 with no rescaling at the sink merge site.
 // ----------------------------------------------------------------------------
 struct __attribute__((packed)) MlaV4KernelArgs
 {
@@ -62,9 +67,14 @@ struct __attribute__((packed)) MlaV4KernelArgs
     unsigned int out_16_nosplit;  p3 _p_o16;    // 15: 0 = fp32 split, 1 = bf16 nosplit
     void *ptr_QROPE;      p2 _p_qrope; // 16
     void *ptr_KVROPE;     p2 _p_kvrope;// 17
+    void *ptr_sink;       p2 _p_sink;  // 18: [num_heads] FP32 attention sink logit
+                                       //     loaded by 3_13.s @ kernarg+0x120
 };
-static_assert(sizeof(MlaV4KernelArgs) == 288,
-              "MLA v4 kernarg pack must be 18 * 16 bytes");
+static_assert(sizeof(MlaV4KernelArgs) == 304,
+              "MLA v4 kernarg pack must be 19 * 16 bytes (sink slot at 0x120)");
+static_assert(offsetof(MlaV4KernelArgs, ptr_sink) == 0x120,
+              "ptr_sink must land at kernarg byte offset 0x120 "
+              "(matches 3_13.s `s_load_dwordx2 s[..], s[0:1], 0x120`)");
 
 // ----------------------------------------------------------------------------
 // kV4DimNope + kV4DimRope = 448 + 64 = 512. The kernel hardcodes
@@ -150,6 +160,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* kv_page_indices,    // [num_page_used]
      aiter_tensor_t* kv_last_page_lens,  // [num_seqs]
      aiter_tensor_t* split_indptr,       // [num_seqs+1]
+     aiter_tensor_t* sink,               // [num_heads] FP32 — see "ptr_sink" note above
      int max_seqlen_q,
      float softmax_scale,                // ignored; v4 hardcodes 1/sqrt(512). Kept for API parity.
      int out_16_nosplit,
@@ -160,10 +171,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* output,             // [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
      hipStream_t stream),
     (Q, qrope, KV, kvrope, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens,
-     split_indptr, max_seqlen_q, softmax_scale, out_16_nosplit, num_kv_splits,
+     split_indptr, sink, max_seqlen_q, softmax_scale, out_16_nosplit, num_kv_splits,
      splitData, splitLse, output, stream))
 {
     (void)softmax_scale;
+    AITER_CHECK(sink != nullptr, __func__, ": `sink` must not be NULL");
+    AITER_CHECK(sink->data_ptr() != nullptr,
+                __func__, ": `sink` data_ptr is NULL — caller must allocate "
+                          "even when no sink is desired (use torch.full(-inf))");
     AITER_CHECK(Q->is_contiguous(),    __func__, ": only support Q.is_contiguous() for now");
     AITER_CHECK(KV->is_contiguous(),   __func__, ": only support KV.is_contiguous() for now");
     AITER_CHECK(qrope->is_contiguous(),  __func__, ": only support qrope.is_contiguous()");
@@ -180,32 +195,20 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(Q->size(2) == dim_qk_packed,
                 __func__, ": Q head_size must equal KV head_size (= dim_qk_packed)");
 
-    // Derive per-seq KV length from kv_indptr (uniform-batch assumption; for
-    // true varlen the kernel reads LTP/LTD/LTL directly and total_kv is only
-    // used for the stride math).
-    int total_pages = 0;
-    if(kv_indptr->size(0) >= 2)
-    {
-        // kv_indptr is int32 on the device; read the last element via H2D copy.
-        int last = 0;
-        const HipDeviceGuard guard(kv_indptr->device_id);
-        HIP_CALL(hipMemcpyAsync(&last,
-                                static_cast<int*>(kv_indptr->data_ptr()) + (kv_indptr->size(0) - 1),
-                                sizeof(int), hipMemcpyDeviceToHost, stream));
-        HIP_CALL(hipStreamSynchronize(stream));
-        total_pages = last;
-    }
-    const int kv_seq_lens = (num_seqs > 0) ? (total_pages * page_size) / num_seqs : 0;
-    const int total_kv    = kv_seq_lens * num_seqs;
-
     const HipDeviceGuard device_guard(Q->device_id);
 
     // Kernel-hardcoded constants (q_dtype-independent on v4 nm).
     constexpr int qk_elem_dim = kV4DimNope + kV4DimRope;  // 448 + 64 = 512 elems
     const float   scalar_f    = 1.0f / std::sqrt(static_cast<float>(qk_elem_dim));
-    const unsigned int stride_page = static_cast<unsigned int>(page_size * dim_qk_packed);
     const unsigned int log2_page   = static_cast<unsigned int>(__builtin_ctz(page_size));
 
+    // ---- Dead kernarg slots ---------------------------------------------------
+    // Disassembling slot 10 (s_total_kv) at offset 0xA0 and slot 11 (s_stride_page) at
+    // offset 0xB0 are NEVER read. They were carried over from earlier kernel
+    // variants for ABI parity; computing s_total_kv used to require a per-call
+    // 4-byte D2H readback of `kv_indptr[-1]` plus `hipStreamSynchronize`,
+    // which created a host-side stall that cost ~5-7us on every launch.
+    //
     MlaV4KernelArgs args = {};
     size_t arg_size = sizeof(args);
     args.ptr_R          = splitData->data_ptr();
@@ -218,14 +221,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.scalar_f       = scalar_f;
     args.s_gqa_ratio    = static_cast<unsigned int>(gqa_ratio);
     args.s_kv_split     = static_cast<unsigned int>(num_kv_splits);
-    args.s_total_kv     = static_cast<unsigned int>(total_kv);
-    args.s_stride_page  = stride_page;
+    // args.s_total_kv     left as 0 — kernel never reads slot 10 (offset 0xA0)
+    // args.s_stride_page  left as 0 — kernel never reads slot 11 (offset 0xB0)
     args.s_log2_page    = log2_page;
     args.ptr_QTP        = qo_indptr->data_ptr();
     args.ptr_STP        = split_indptr->data_ptr();
     args.out_16_nosplit = static_cast<unsigned int>(out_16_nosplit);
     args.ptr_QROPE      = qrope->data_ptr();
     args.ptr_KVROPE     = kvrope->data_ptr();
+    args.ptr_sink       = sink->data_ptr();
 
     // dtype dispatch
     auto q_dtype  = Q->dtype();
@@ -334,14 +338,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int gdy = num_seqs;
     const int gdz = num_kv_splits;
 
-    // ----- DEBUG: env-gated 288B kernarg dump for cross-check vs poc_kl. -----
+    // ----- DEBUG: env-gated 304B kernarg dump for cross-check vs poc_kl. -----
     // Used by op_tests/test_mla_v4_nm.py::test_v4_nm_kernarg_scalar_slots to
-    // lock in the 18-slot layout. Has no runtime cost when env unset.
+    // lock in the 19-slot layout. Has no runtime cost when env unset.
     if(const char* dbg = std::getenv("AITER_V4_NM_DUMP_KERNARG"))
     {
         if(dbg[0] == '1')
         {
-            fprintf(stderr, "[aiter kernarg 288B]\n");
+            fprintf(stderr, "[aiter kernarg 304B]\n");
             const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&args);
             for(size_t i = 0; i < sizeof(args); ++i)
             {

@@ -1018,6 +1018,8 @@ def mla_decode_fwd_v4_nm(
     kv_page_indices,  # [num_page_used]
     kv_last_page_lens,  # [num_seqs]
     max_seqlen_q,
+    *,
+    sink,  # REQUIRED [num_heads] FP32 — attention sink logit
     split_indptr=None,  # [num_seqs+1]; auto-built uniform if None (matches V3 get_meta_param)
     sm_scale=None,  # ignored on v4 nm; kernel hardcodes 1/sqrt(512)
     out_16_nosplit=0,
@@ -1074,12 +1076,48 @@ def mla_decode_fwd_v4_nm(
       Caller reads the merged result from `output` (BF16); the FP32 partials
       can be inspected via `logits` / `attn_lse` if desired (e.g., for
       debugging or custom merge paths).
+
+    `sink` (REQUIRED, keyword-only):
+      Per-(q_token, head) attention sink logit, total
+      `num_heads * max_seqlen_q` FP32 values. Adds a virtual K-column of
+      logit `sink[t, h]` (or flat `sink[t * num_heads + h]`) to the
+      softmax denominator for the (q_token=t, head=h) slot.
     """
     num_seqs = qo_indptr.shape[0] - 1
     num_heads = q.size(1)
     v_head_dim = output.size(2)
     num_kv_heads = kv_buffer.size(2)
     gqa_ratio = num_heads // num_kv_heads
+
+    # ---- sink shape / dtype validation -----------------------------------
+    # Layout: 1D `(num_heads * max_seqlen_q,)`
+    expected_sink_size = num_heads * max_seqlen_q
+    if sink.dtype != dtypes.fp32:
+        raise ValueError(
+            f"mla_decode_fwd_v4_nm: `sink` must be FP32, got {sink.dtype}."
+        )
+    if not sink.is_contiguous():
+        raise ValueError(
+            f"mla_decode_fwd_v4_nm: `sink` must be contiguous (the kernel "
+            f"reads it as a flat fp32 buffer). Got strides={sink.stride()}."
+        )
+    if sink.numel() != expected_sink_size:
+        raise ValueError(
+            f"mla_decode_fwd_v4_nm: `sink` numel {sink.numel()} != expected "
+            f"{expected_sink_size} (= num_heads({num_heads}) * "
+            f"max_seqlen_q({max_seqlen_q})). kernel reads it as a flat fp32 buffer."
+            f"`num_heads * max_seqlen_q` fp32 entries; under-sized buffers "
+            f"silently OOB into HBM padding. Accepted shapes: "
+            f"({expected_sink_size},) flat, or "
+            f"({max_seqlen_q}, {num_heads}) 2D row-major. "
+            f"Pass torch.full(({expected_sink_size},), float('-inf'), "
+            f"dtype=fp32) for 'no sink' semantics."
+        )
+    if sink.device != q.device:
+        raise ValueError(
+            f"mla_decode_fwd_v4_nm: `sink` must live on the same device as "
+            f"`q` (got sink={sink.device}, q={q.device})."
+        )
 
     # ---- V3-style auto-fill of split_indptr (== num_kv_splits_indptr) ----
     # V3 `get_meta_param` builds this exact tensor when caller didn't provide
@@ -1103,9 +1141,7 @@ def mla_decode_fwd_v4_nm(
         )
 
     # ---- Allocate splitData / splitLse in KERNEL-NATIVE layout --------------
-    # The qh64-recompile family v4 nm kernel writes splitData/splitLse with
-    # this byte ordering (poc_kl mla_v4.h, line 481-483 + mla_reorder_gpuO):
-    #   [num_seqs, max_seqlen_q, num_kv_splits, num_heads, v_head_dim]
+    # kernel-native layout:   [num_seqs, max_seqlen_q, num_kv_splits, num_heads, v_head_dim]
     # where num_heads = num_kv_heads * gqa_ratio (the gqa-flattened head dim
     # used by V3's `_fwd_kernel_stage2_asm` triton merge).
     #
@@ -1172,6 +1208,7 @@ def mla_decode_fwd_v4_nm(
         kv_page_indices,
         kv_last_page_lens,
         split_indptr,
+        sink,
         max_seqlen_q,
         sm_scale_arg,
         int(out_16_nosplit),
