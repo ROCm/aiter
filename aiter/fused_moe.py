@@ -742,7 +742,7 @@ def _normalize_bias_for_kernel(
     return bias
 
 
-# TODO: remove this function once FlyDSL handles padding internally
+# TODO: remove this function once kernel handles padding int the runtime
 def _get_padding_for_flydsl(
     inter_dim_pad,
     model_dim_pad,
