@@ -72,15 +72,6 @@ def _row_swiglu_limit(row: dict[str, str]) -> float:
     return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit") or 0.0
 
 
-def _parse_bool(value: str) -> bool:
-    value = value.strip()
-    if value in ("True", "1"):
-        return True
-    if value in ("False", "0"):
-        return False
-    raise ValueError(f"unsupported bool value: {value!r}")
-
-
 def parse_csv(csv_path: str):
     """Parse the CSV and return a list of unique compile jobs.
 
@@ -111,8 +102,19 @@ def parse_csv(csv_path: str):
                 if act_type.strip().split(".")[-1].lower() == "swiglu"
                 else "silu"
             )
+            q_type = row.get("q_type", "")
+            dtype = row.get("dtype", "")
+            q_dtype_w = row.get("q_dtype_w", "")
             swiglu_limit = _row_swiglu_limit(row)
-            enable_bias_options = [_parse_bool(row.get("bias", "False"))]
+            # Cover both runtime bias choices for fp4-weight MoE. Model configs
+            # share kernel families, and runtime bias selection can vary by
+            # activation dtype/model semantics.
+            bias_supported = (
+                q_type.strip().split(".")[-1] == "per_1x32"
+                and dtype in ("torch.bfloat16", "torch.float16")
+                and "float4_e2m1fn_x2" in q_dtype_w
+            )
+            enable_bias_options = [False, True] if bias_supported else [False]
 
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
@@ -566,24 +568,13 @@ def _precompile_to_cache(
                 else:
                     quant_mode = "fp4"
                     gui_layout = False
-                use_splitk_bias = enable_bias and _is_splitk
-                topk_ids_arg = (
-                    torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
-                    if use_splitk_bias
-                    else sorted_token_ids.view(-1)
-                )
-                bias_arg = (
-                    bias.contiguous().view(-1)
-                    if use_splitk_bias
-                    else torch.empty(0, device=dev, dtype=torch.float32)
-                )
                 silu_fused = _get_compiled_silu_fused(
                     inter_dim,
                     topk,
                     quant_mode,
                     gui_layout=gui_layout,
                     act=act,
-                    enable_bias=use_splitk_bias,
+                    enable_bias=False,
                     swiglu_limit=swiglu_limit,
                 )
                 _run_compiled(
@@ -594,8 +585,8 @@ def _precompile_to_cache(
                         _ptr_view_safe(out_scale_sorted_flat),
                         _ptr_view_safe(sorted_token_ids),
                         _ptr_view_safe(num_valid_ids),
-                        _ptr_view_safe(topk_ids_arg),
-                        _ptr_view_safe(bias_arg),
+                        _ptr_view_safe(sorted_token_ids.view(-1)),
+                        _ptr_view_safe(torch.empty(0, device=dev, dtype=torch.float32)),
                         tokens,
                         sorted_token_ids.shape[0],
                         0,

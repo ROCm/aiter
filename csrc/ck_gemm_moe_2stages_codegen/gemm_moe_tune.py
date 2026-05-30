@@ -161,31 +161,6 @@ class FmoeTuner(TunerCommon):
         )
 
     @staticmethod
-    def _ensure_bias_column(df):
-        if "bias" not in df.columns:
-            df["bias"] = False
-        return df
-
-    @staticmethod
-    def _parse_bool(value):
-        return dtypes.str2bool(str(value).strip())
-
-    def get_untuned_gemm_list(self, untuned_gemm_file):
-        return self._ensure_bias_column(
-            super().get_untuned_gemm_list(untuned_gemm_file)
-        )
-
-    def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
-        return self._ensure_bias_column(
-            super().get_tuned_gemm_list(tuned_gemm_file, columns)
-        )
-
-    def get_retune_gemm_list(self, args):
-        super().get_retune_gemm_list(args)
-        self.untunedf = self._ensure_bias_column(self.untunedf)
-        self.tunedf = self._ensure_bias_column(self.tunedf)
-
-    @staticmethod
     def weight_quant(
         weight,
         qType,
@@ -1611,8 +1586,6 @@ class FmoeTuner(TunerCommon):
         a1_scale=None,
         w1_scale=None,
         w2_scale=None,
-        w1_bias=None,
-        w2_bias=None,
         dtype=dtypes.fp16,
         activation=ActivationType.Silu,
         quant_type=QuantType.No,
@@ -1629,7 +1602,6 @@ class FmoeTuner(TunerCommon):
             quant_type=quant_type,
             a1_scale=a1_scale,
             w1_scale=w1_scale,
-            w1_bias=w1_bias,
             doweight=doweight_stage1,
         )
         AQDType = hidden_states.dtype
@@ -1653,7 +1625,6 @@ class FmoeTuner(TunerCommon):
             quant_type=quant_type,
             a2_scale=a2_scale,
             w2_scale=w2_scale,
-            w2_bias=w2_bias,
             doweight=not doweight_stage1,
         )
         return ref2
@@ -1754,7 +1725,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
         ) = key
         if us == self.INVALID_TIME or us == self.INF_TIME:
             return 0, 0
@@ -1865,7 +1835,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
         ) = info
         ## asm moe 1 stage tuning
         get_gfx()
@@ -2118,7 +2087,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
         ) = info
         kernels_list_csv = f"{get_asm_dir()}/fmoe_2stages/fmoe_stage1_bf16_pertoken{{quantDtype}}{{extraInfo}}_g1u1.csv"
         extraInfo = ""
@@ -2230,7 +2198,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
         ) = info
 
         _is_a8w4 = (
@@ -2462,7 +2429,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
         ) = info
 
         _gen_data_args_s1 = (
@@ -2622,7 +2588,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
         ) = info
 
         if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
@@ -2888,7 +2853,6 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
-            bias,
         ) = info
 
         if not (q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2):
@@ -3126,12 +3090,11 @@ class FmoeTuner(TunerCommon):
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
-            bias = self._parse_bool(row.get("bias", False))
             shape_str = (
                 f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
                 f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
                 f"{row['q_dtype_w']}, {row['q_type']}, g1u1={use_g1u1}, "
-                f"dw_s1={doweight_stage1}, bias={bias})"
+                f"dw_s1={doweight_stage1})"
             )
             allowed_err_ratio, allowed_err_ratio_desc = (
                 self._get_run_config_err_ratio_limit(row, args)
@@ -3166,27 +3129,6 @@ class FmoeTuner(TunerCommon):
                 w2 = torch.randn(
                     (expert, model_dim, inter_dim), dtype=dtype, device="cuda"
                 )
-                if bias:
-                    bias1_shape = (
-                        (expert, inter_dim * 2) if use_g1u1 else (expert * inter_dim,)
-                    )
-                    exp_bias1 = torch.clamp(
-                        torch.randn(bias1_shape, dtype=dtype, device="cuda"),
-                        -1.0,
-                        1.0,
-                    )
-                    exp_bias2 = torch.clamp(
-                        torch.randn((expert, model_dim), dtype=dtype, device="cuda"),
-                        -1.0,
-                        1.0,
-                    )
-                    exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
-                    exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
-                else:
-                    exp_bias1 = None
-                    exp_bias2 = None
-                    exp_bias1_aiter = None
-                    exp_bias2_aiter = None
                 w1_qt, w1_scale = self.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
                 w2_qt, w2_scale = self.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
                 if q_dtype_w is not dtypes.fp4x2:
@@ -3315,8 +3257,6 @@ class FmoeTuner(TunerCommon):
                     w1_scale=w1_scale_fmoe,
                     w2_scale=w2_scale_fmoe,
                     dtype=dtype,
-                    bias1=exp_bias1_aiter,
-                    bias2=exp_bias2_aiter,
                     num_warmup=args.warmup,
                     num_iters=args.iters,
                 )
@@ -3329,8 +3269,6 @@ class FmoeTuner(TunerCommon):
                     a1_scale=a1_scale,
                     w1_scale=w1_scale,
                     w2_scale=w2_scale,
-                    w1_bias=exp_bias1,
-                    w2_bias=exp_bias2,
                     dtype=dtype,
                     activation=act_type,
                     quant_type=q_type,
@@ -3439,7 +3377,6 @@ class FmoeTuner(TunerCommon):
                 q_type,
                 use_g1u1,
                 doweight_stage1,
-                bias,
             ) = line
             dtype = eval(dtype)
             q_dtype_a = eval(q_dtype_a)
@@ -3468,7 +3405,6 @@ class FmoeTuner(TunerCommon):
                 q_type,
                 use_g1u1,
                 doweight_stage1,
-                bias,
             )
             tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
             tasks_ck.extend(self.gen_2stages_task(info, blockMs))
@@ -3614,7 +3550,6 @@ class FmoeTuner(TunerCommon):
                 q_type,
                 use_g1u1,
                 doweight_stage1,
-                bias,
             ) = key
             import re
 
@@ -3646,7 +3581,6 @@ class FmoeTuner(TunerCommon):
                         q_type,
                         use_g1u1,
                         doweight_stage1,
-                        bias,
                         block_m,
                         row_ksplit,
                         us,
@@ -3797,7 +3731,6 @@ class FmoeTuner(TunerCommon):
                         q_type,
                         use_g1u1,
                         doweight_stage1,
-                        bias,
                         0,
                         0,
                         self.INVALID_TIME,
@@ -4302,7 +4235,6 @@ if __name__ == "__main__":
         "q_type",
         "use_g1u1",
         "doweight_stage1",
-        "bias",
     ]
     resultList = [
         "block_m",
