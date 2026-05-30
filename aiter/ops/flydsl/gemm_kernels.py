@@ -1029,3 +1029,163 @@ def flydsl_preshuffle_gemm_a8(
         Out.copy_(out_contig)
 
     return Out
+
+
+# ---------------------------------------------------------------------------
+# Blockscale (fp32_post_mfma) preshuffle GEMM
+# ---------------------------------------------------------------------------
+_flydsl_blockscale_compile_fn = None
+_flydsl_blockscale_import_done = False
+
+
+def _get_blockscale_compile_fn():
+    """Lazy-import compile_preshuffle_gemm_blockscaled so the module loads even without FlyDSL."""
+    global _flydsl_blockscale_compile_fn, _flydsl_blockscale_import_done
+    if _flydsl_blockscale_import_done:
+        return _flydsl_blockscale_compile_fn
+    _flydsl_blockscale_import_done = True
+    if not is_flydsl_available():
+        logger.info("[FlyDSL] not available, blockscale preshuffle GEMM disabled")
+        return None
+    try:
+        from .kernels.preshuffle_gemm_blockscaled import (
+            compile_preshuffle_gemm_blockscaled,
+        )
+
+        _flydsl_blockscale_compile_fn = compile_preshuffle_gemm_blockscaled
+        logger.info("[FlyDSL] loaded preshuffle blockscale GEMM compiler")
+    except Exception as e:
+        logger.info(
+            f"[FlyDSL] preshuffle blockscale GEMM not available: {e}"
+        )
+    return _flydsl_blockscale_compile_fn
+
+
+import functools as _functools
+
+
+@_functools.lru_cache(maxsize=None)
+def _compile_blockscale_cached(
+    M_key: int,
+    N: int,
+    K: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    block_swizzle_n: int,
+    scale_format: str,
+    scale_layout: str,
+):
+    compile_fn = _get_blockscale_compile_fn()
+    if compile_fn is None:
+        raise RuntimeError("[FlyDSL] blockscale compile function not available")
+    return compile_fn(
+        M=M_key,
+        N=N,
+        K=K,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        block_swizzle_n=block_swizzle_n,
+        scale_format=scale_format,
+        scale_layout=scale_layout,
+    )
+
+
+def flydsl_preshuffle_gemm_blockscale_a8(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    block_swizzle_n: int = 0,
+    scale_format: str = "fp32_post_mfma",
+) -> Tensor:
+    """Compile (cached) and run the FlyDSL fp8 blockscale preshuffle-B GEMM.
+
+    Arguments
+    ---------
+    XQ          : fp8 (M, K)
+    WQ          : fp8 (N, K) row-major (from ``shuffle_weight(weight, layout=(16,16))``);
+                  reshape-viewed to (N//16, K//64, 4, 16, 16) before launch.
+    x_scale     : fp32 (M, K//128) row-major.
+    w_scale     : fp32 (N//128, K//128) row-major.
+    Out         : bf16 (M, N).
+    tile_m/n/k  : tile sizes (tile_k must be a multiple of 128, tile_n a multiple of 128).
+    block_swizzle_n : L2 supergroup swizzle (0 disables).
+    scale_format : ``"fp32_post_mfma"`` is the only CK-equivalent option (true blockscale).
+    """
+    compile_fn = _get_blockscale_compile_fn()
+    if compile_fn is None:
+        raise RuntimeError("[FlyDSL] blockscale compile function not available")
+
+    M, K = int(XQ.shape[0]), int(XQ.shape[-1])
+    N = int(WQ.shape[0])
+
+    if K % 128 != 0:
+        raise RuntimeError(
+            f"[FlyDSL blockscale] K ({K}) must be a multiple of 128, got K={K}"
+        )
+    if K % 512 != 0:
+        raise RuntimeError(
+            f"[FlyDSL blockscale] K ({K}) must be a multiple of 512 (kernel constraint)"
+        )
+    if N % tile_n != 0:
+        raise RuntimeError(
+            f"[FlyDSL blockscale] N ({N}) is not a multiple of tile_n ({tile_n})."
+        )
+    if K % tile_k != 0:
+        raise RuntimeError(
+            f"[FlyDSL blockscale] K ({K}) is not a multiple of tile_k ({tile_k})."
+        )
+    if M % tile_m != 0:
+        raise RuntimeError(
+            f"[FlyDSL blockscale] M ({M}) is not a multiple of tile_m ({tile_m})."
+        )
+    if N % 16 != 0 or K % 64 != 0:
+        raise RuntimeError(
+            f"[FlyDSL blockscale] preshuffled WQ requires N % 16 == 0 and "
+            f"K % 64 == 0 (got N={N}, K={K})"
+        )
+
+    # M is compile-time in the factory (for autotune lookup) but runtime via
+    # i32_m at launch. Use M as the cache key so distinct M's get distinct
+    # compiled kernels (matches the bench harness pattern).
+    exe = _compile_blockscale_cached(
+        M_key=M,
+        N=N,
+        K=K,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        block_swizzle_n=int(block_swizzle_n),
+        scale_format=scale_format,
+        scale_layout="row",
+    )
+
+    def _as_i8(t):
+        return t.view(torch.int8) if "float8" in str(t.dtype) else t
+
+    # WQ comes in shape (N, K) (byte-equivalent to (N//16, K//64, 4, 16, 16)).
+    # Reshape-view to 5D without a copy.
+    wq_contig = WQ.contiguous()
+    wq_5d = wq_contig.view(N // 16, K // 64, 4, 16, 16)
+
+    out_contig = Out.contiguous()
+    stream = torch.cuda.current_stream().cuda_stream
+    exe(
+        out_contig,
+        _as_i8(XQ.contiguous()),
+        _as_i8(wq_5d),
+        x_scale.contiguous(),
+        w_scale.contiguous(),
+        M,
+        stream,
+    )
+    if out_contig is not Out:
+        Out.copy_(out_contig)
+
+    return Out
