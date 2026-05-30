@@ -24,6 +24,7 @@
 //                   the kernel never reads its contents.  Pass a zero buffer.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
+#include "aiter_hip_common.h"   // HipDeviceGuard, AiterAsmKernel, ...
 #include "asm_fmha_fwd_bf16_configs.hpp"
 #include <hip/hip_runtime.h>
 #include <cmath>
@@ -147,13 +148,33 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      hipStream_t     stream),
     (q, k, v, out, lse, sink, softmax_scale, is_causal, return_lse, stream))
 {
+    // ---- null + multi-GPU safety -----------------------------------------
+    // Validate pointers BEFORE touching anything on the device, so the
+    // device_guard below can safely read q->device_id.
+    AITER_CHECK(q && k && v && out && lse && sink,
+                "fmha_fwd_with_sink_asm: q/k/v/out/lse/sink must all be non-null");
+
+    // Pin current HIP device to q.device() for the duration of this call.
+    //
+    // Even though the ctypes layer (aiter/jit/core.py) already picks the
+    // stream via `torch.cuda.current_stream(tensor_device).cuda_stream`, the
+    // launch path inside AiterAsmKernelFast::launch_kernel does
+    // `hipGetFuncBySymbol(...)` which resolves the kernel handle against the
+    // *current* HIP device of the calling thread.  If the caller's
+    // current_device differs from q.device() (common in multi-GPU code that
+    // sets a default device once and then operates on tensors in several
+    // devices), we would either resolve to the wrong device's module table
+    // (returning a stale / null hipFunction_t) or submit a launch that
+    // mismatches the stream's device.  This guard mirrors what the other ASM
+    // MHA paths achieve with at::hip::OptionalHIPGuardMasqueradingAsCUDA;
+    // we use the torch-free HipDeviceGuard so this TU stays no-torch-dep.
+    HipDeviceGuard device_guard{q->device_id};
+
     // ---- arch + dtype validation ------------------------------------------
     const std::string arch_id = get_gpu_arch();
     AITER_CHECK(arch_id == "gfx1250",
                 "fmha_fwd_with_sink_asm: only supported on gfx1250, got ", arch_id);
 
-    AITER_CHECK(q && k && v && out && lse && sink,
-                "fmha_fwd_with_sink_asm: q/k/v/out/lse/sink must all be non-null");
     AITER_CHECK(q->dtype() == AITER_DTYPE_bf16 &&
                 k->dtype() == AITER_DTYPE_bf16 &&
                 v->dtype() == AITER_DTYPE_bf16,

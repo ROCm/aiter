@@ -51,9 +51,35 @@ from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 #
 # )  # noqa: F401  (kept for easy swap-back; see doc-block below)
 
+def _is_gfx1250_host() -> bool:
+    """True only on a gfx1250 GPU host.
+
+    The fmha_fwd_with_sink_asm ASM kernels are the only ones shipped in
+    hsa/gfx1250/fmha_fwd_bf16/*.co — there are no gfx942 / gfx950 / etc.
+    binaries.  On any other arch the ops-layer call raises
+    'no kernel for arch=...' at launch, so without this guard the tests
+    would FAIL (not skip) on non-gfx1250 CI runners.  Computed once here so
+    every test (current and future) is covered at the module level, instead
+    of relying on each test remembering a per-test guard.
+
+    Robust against the no-GPU case: get_gfx() queries the runtime and can
+    raise when no device is present, so we short-circuit on
+    torch.cuda.is_available() first and swallow any probe error.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return get_gfx() == "gfx1250"
+    except Exception:
+        return False
+
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="ROCm/HIP GPU not available",
+    not _is_gfx1250_host(),
+    reason=(
+        "fmha_fwd_with_sink_asm ASM kernels are only shipped for gfx1250 "
+        "(hsa/gfx1250/fmha_fwd_bf16/*.co); no GPU or a different arch — skip"
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -347,8 +373,6 @@ def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
     ],
 )
 def test_fmha_fwd_with_sink_asm_correctness(head_dim, hq, hk, sq, sk, batch, is_causal):
-    if get_gfx() not in ["gfx1250"]:
-        return
     device = "cuda"
     torch.manual_seed(0)
 
@@ -447,8 +471,6 @@ def test_fmha_fwd_with_sink_asm_ops_layer():
     CSV (mask=1 rows).  The test purpose is to exercise the low-level ops
     entry point with a D64+sink call; causal vs nocausal is orthogonal here.
     """
-    if get_gfx() not in ["gfx1250"]:
-        return
     device = "cuda"
     torch.manual_seed(0)
 
@@ -485,12 +507,14 @@ def test_fmha_fwd_with_sink_asm_ops_layer():
 def test_fmha_fwd_with_sink_asm_d64_requires_sink():
     """Direct ops-layer call without sink on D64 must raise the C++ check.
 
-    Note: when going through aiter.flash_attn_func, the dispatcher auto-fills
-    a zero sink for D64, so this error path is unreachable from the public
-    API — we exercise it via the lower-level ops stub.
+    Note: through aiter.flash_attn_func, can_impl_fmha_fwd_with_sink_asm()
+    routes D64 + sink_ptr=None to the CK fallback (the D64 _rxy_sink kernel
+    compiles ENABLE_SINK=1 and has no "skip sink" mode; auto-filling a
+    zero sink would change "no sink" semantics by adding an extra
+    exp(-max*scale) term to the softmax denominator).  So this error path
+    is unreachable from the public API — we exercise it via the
+    lower-level ops stub here.
     """
-    if get_gfx() not in ["gfx1250"]:
-        return
     device = "cuda"
     q, k, v = make_qkv_bshd(
         layout=0,
@@ -520,8 +544,6 @@ def test_fmha_fwd_with_sink_asm_d64_requires_sink():
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("layout", [0, 1, 2])
 def test_fmha_fwd_with_sink_asm_layout(layout, head_dim):
-    if get_gfx() not in ["gfx1250"]:
-        return
     device = "cuda"
     torch.manual_seed(0)
     batch, hq, hk, sq, sk = 1, 8, 1, 128, 2048
@@ -581,8 +603,6 @@ def test_fmha_fwd_with_sink_asm_layout(layout, head_dim):
 # Only causal kernels are shipped (see test_fmha_fwd_with_sink_asm_correctness comment).
 @pytest.mark.parametrize("is_causal", [True])
 def test_fmha_fwd_with_sink_asm_via_flash_attn_func(head_dim, is_causal):
-    if get_gfx() not in ["gfx1250"]:
-        return
     device = "cuda"
     torch.manual_seed(0)
     batch, hq, hk, sq, sk = 1, 8, 1, 128, 2048
@@ -632,6 +652,94 @@ def test_fmha_fwd_with_sink_asm_via_flash_attn_func(head_dim, is_causal):
     assert dl == 0.0, (
         f"lse via flash_attn_func != direct "
         f"(d={head_dim}, causal={is_causal})  max|dLSE|={dl}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU dispatch test.
+#
+# Regression for: `flash_attn_func` must launch on q.device(), not on the
+# Python thread's current_device.
+#
+# Two correctness layers are exercised:
+#   (1) Python ctypes layer (aiter/jit/core.py) picks the stream via
+#       torch.cuda.current_stream(tensor_device).cuda_stream — should be
+#       q.device()'s stream regardless of current_device.
+#   (2) C++ launch path (asm_fmha_fwd_with_sink.cu) installs a HipDeviceGuard
+#       pinned to q->device_id, so AiterAsmKernelFast::launch_kernel ->
+#       hipGetFuncBySymbol(...) resolves the kernel handle against the
+#       correct device's module table.
+#
+# Without either fix, calling with current_device != q.device() would
+# either crash in hipGetFuncBySymbol (nullptr handle) or submit on the
+# wrong device.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_fmha_fwd_with_sink_asm_multi_gpu_dispatch(head_dim):
+    """flash_attn_func on a non-current device must dispatch correctly."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("multi-GPU dispatch test needs >=2 ROCm GPUs")
+
+    torch.manual_seed(0)
+    batch, hq, hk, sq, sk = 1, 4, 1, 128, 1024
+    scale = 1.0 / math.sqrt(head_dim)
+    dev_q = "cuda:1"   # tensors live here
+    dev_other = 0      # caller's current_device when we invoke the API
+
+    # Allocate everything on dev_q with current_device set to dev_q so the
+    # baseline run goes through the "current == q" path.
+    with torch.cuda.device(dev_q):
+        q1, k1, v1 = make_qkv_bshd(
+            layout=0, sq=sq, sk=sk, batch=batch, hq=hq, hk=hk, d=head_dim,
+            dtype=torch.bfloat16, device=dev_q,
+        )
+        sink1 = _d64_sink(hq, dev_q) if head_dim == 64 else None
+        out_baseline, lse_baseline = run_kernel(
+            q1, k1, v1, scale=scale, is_causal=True, sink=sink1, via="public",
+        )
+    # Clone so the next run can't alias-overwrite us (defensive; the kernel
+    # writes to a fresh `out` tensor each call, but we want to be 100% sure
+    # the second comparison is against a stable snapshot).
+    out_baseline = out_baseline.clone()
+    lse_baseline = lse_baseline.clone()
+
+    # Now switch current_device to dev_other and re-run with the SAME dev_q
+    # tensors.  Pre-fix this is the crash / wrong-device path.
+    with torch.cuda.device(dev_other):
+        assert torch.cuda.current_device() == dev_other, (
+            "test setup error: failed to switch current_device"
+        )
+        out_xdev, lse_xdev = run_kernel(
+            q1, k1, v1, scale=scale, is_causal=True, sink=sink1, via="public",
+        )
+
+    # Outputs must land on q.device(), not on the caller's current_device.
+    assert out_xdev.device == q1.device, (
+        f"out landed on {out_xdev.device}, expected {q1.device}"
+    )
+    assert lse_xdev.device == q1.device, (
+        f"lse landed on {lse_xdev.device}, expected {q1.device}"
+    )
+
+    # Same inputs + same (deterministic) kernel -> bit-exact match across
+    # current_device contexts.  If the guard or stream picker regresses,
+    # we'll either be here with a numerical mismatch (silent wrong-device
+    # launch) or we'll have already crashed before reaching this point.
+    _cmp(
+        out_xdev,
+        out_baseline,
+        rtol=0.0,
+        atol=0.0,
+        msg=f"out differs across current_device (d={head_dim})",
+    )
+    _cmp(
+        lse_xdev,
+        lse_baseline,
+        rtol=0.0,
+        atol=0.0,
+        msg=f"lse differs across current_device (d={head_dim})",
     )
 
 
@@ -693,8 +801,6 @@ def _make_qkv_perf(init: str, *, layout, sq, sk, batch, hq, hk, d, dtype, device
 # Only causal kernels are shipped (see test_fmha_fwd_with_sink_asm_correctness comment).
 @pytest.mark.parametrize("is_causal", [True])
 def test_fmha_fwd_with_sink_asm_perf(head_dim, is_causal, init):
-    if get_gfx() not in ["gfx1250"]:
-        return
     device = "cuda"
     torch.manual_seed(0)
 

@@ -1440,9 +1440,25 @@ def _flash_attn_forward(
         ret = ret and (dropout_p == 0.0)
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
-        # D128 kernel ignores sink; if user passed sink_ptr, fall back to CK
-        # (which honors it) so semantics are preserved.
-        ret = ret and (sink_ptr is None or hdim_q == 64)
+        # Per-hdim sink eligibility:
+        #
+        #   D128 kernels (`_rxy`) compile ENABLE_SINK=0 -- the kernel ignores
+        #   any sink buffer.  Routing a caller's sink_ptr to it would silently
+        #   drop the sink term, so we fall back to CK whenever sink_ptr is set.
+        #
+        #   D64 kernels (`_rxy_sink`) compile ENABLE_SINK=1 -- the kernel
+        #   ALWAYS reads SINK and adds `exp((sink_raw - max) * scale)` to the
+        #   softmax denominator.  There is no "skip sink" mode on this kernel,
+        #   so calling it without an explicit sink_ptr would either (a) crash
+        #   in the wrapper (it raises when sink is None for D64) or (b) if we
+        #   silently fill in zeros, change the no-sink result by an extra
+        #   exp(-max * scale) term in every q-tile.  Either way the documented
+        #   `sink_ptr is None` semantics of flash_attn_func are violated, so
+        #   we require an explicit sink and fall back to CK otherwise.
+        if hdim_q == 128:
+            ret = ret and (sink_ptr is None)
+        elif hdim_q == 64:
+            ret = ret and (sink_ptr is not None)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -1463,14 +1479,13 @@ def _flash_attn_forward(
         # gfx1250 ASM bf16 path: q/k/v are bshd; kernel reads strides directly,
         # no API-side permute.  softmax_scale is forwarded as-is (kernel applies
         # it internally to Q·K^T).  sink_ptr is in AITER post-scale convention;
-        # the public `fmha_fwd_with_sink_asm` wrapper multiplies it by
-        # sqrt(qk_head_dim) and auto-fills the D64 zero-sink case internally,
-        # so we just forward the user's sink_ptr here.
-        sink_for_kernel = sink_ptr
-        if hdim_q == 64 and sink_for_kernel is None:
-            # D64 kernels always read SINK; pass an explicit zero-logit so the
-            # wrapper does not raise on us.
-            sink_for_kernel = torch.zeros(nhead_q, dtype=torch.float32, device=q.device)
+        # `fmha_fwd_with_sink_asm` multiplies it by sqrt(qk_head_dim) before
+        # launch.
+        #
+        # `can_impl_fmha_fwd_with_sink_asm` already enforces the
+        # (hdim, sink_ptr) compatibility matrix (D128 requires sink_ptr is
+        # None; D64 requires sink_ptr is not None), so we can forward the
+        # caller's sink_ptr unmodified here -- no zero-fill, no None-coercion.
         out_, softmax_lse = fmha_fwd_with_sink_asm(
             q,
             k,
@@ -1478,7 +1493,7 @@ def _flash_attn_forward(
             float(softmax_scale),
             bool(causal),
             True,
-            sink_for_kernel,
+            sink_ptr,
             out,
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
