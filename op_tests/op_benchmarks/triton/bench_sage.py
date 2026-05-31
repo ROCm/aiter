@@ -74,7 +74,6 @@ KernelName = Literal[
 ALL_KERNELS: List[str] = [
     "sage_fp8",
     "sage_mxfp4",
-    "fav3_fp8",
     "aiter_fp8",
     "aiter_i8fp8",
     "aiter_bf16",
