@@ -932,14 +932,19 @@ def quant_mxfp4_hip(
             "expected int in {0,1,2,3} or MxScaleRoundMode."
         ) from e
 
-    # RoundUp (NV / DSv4 default) without a16w4/gate_up/shuffle_weight ->
-    # route to dynamic_per_group_scaled_quant_fp4 (the default FP4 quant path
-    # which uses fp_f32_to_e8m0_scale<RoundUp, FP4_E2M1> = ceil_pow2(amax/6)).
+    # Default-mode fast path: per_1x32_f4_quant_hip ->
+    # dynamic_per_group_scaled_quant_fp4 derives its scale via
+    # fp_f32_to_e8m0_scale<kDefaultMxScaleRoundMode, FP4_E2M1>, so it is only
+    # valid when the *requested* round_mode equals the project-wide default
+    # (MX_DEFAULT_ROUND_MODE). Comparing against MX_DEFAULT_ROUND_MODE (not a
+    # hard-coded RoundUp) keeps this routing correct if the default is ever
+    # changed in lockstep with C++ kDefaultMxScaleRoundMode. Any non-default
+    # mode falls through to the quant_mxfp4 kernel's explicit 4-way dispatch.
     # Skip on gfx942: dynamic_per_group_scaled_quant_fp4 requires
     # __Float4_e2m1fn_x2 which is not available on gfx942; fall through
     # to the quant_mxfp4 kernel instead.
     if (
-        round_mode_int == int(MxScaleRoundMode.RoundUp)
+        round_mode_int == int(MX_DEFAULT_ROUND_MODE)
         and not a16w4_shuffle
         and not gate_up
         and not shuffle_weight

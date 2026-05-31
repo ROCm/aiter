@@ -60,30 +60,31 @@ def _rope_tail_ref(x, cos2d, sin2d, pos, *, D, RD):
     return torch.cat([x[..., :NOPE], tail_new], dim=-1)
 
 
-# fp32 reciprocal of FP8_MAX, matching the kernel's ``inv_max_pos`` constant
-# (round-trip through float32 to capture the same 1-ULP rounding the kernel
-# would see at codegen time).
-_INV_FP8_MAX_F32 = torch.tensor(1.0 / _FP8_MAX, dtype=torch.float32).item()
-
-
 def _e8m0_encode_ref(amax_safe):
-    """Mirror the kernel's MX E8M0 RoundUp encoding.
+    """E8M0 block-scale reference, following the project default round mode.
 
-    NV ROUND_UP / torchao RCEIL: ``scale = ceil_pow2(amax / FP8_MAX)``.
-    Returns ``(byte_uint8, factor_fp32)``. ``factor`` is the multiplier
-    applied to ``x_norm`` so that ``out = x_norm * factor`` lands in fp8
-    range. ``byte`` is the MX e8m0 stored byte; dequant scale = 2^(byte-127).
+    Delegates the e8m0-byte derivation to the shared CPU helper
+    ``fp4_utils.f32_to_mx_e8m0_scale(mode=MX_DEFAULT_ROUND_MODE,
+    dtype=FP8_E4M3)`` -- the single source the HIP / FlyDSL kernels mirror --
+    so the test follows the project-wide default instead of hard-coding
+    RoundUp. (moe_sorting confirms this CPU helper matches the reciprocal-
+    multiply HIP kernel byte-for-byte; qk_norm only compares dequant output
+    under a loose tolerance, so any rare 1-ULP boundary case is absorbed.)
 
-    ``working = amax * inv_max_pos_f32`` mirrors the kernel exactly --
-    using ``amax / FP8_MAX`` instead would diverge by 1 ULP at fp32
-    boundaries.
+    Returns ``(byte_uint8, factor_fp32)`` where ``factor = 1 / dequant_scale
+    = 2^(127 - byte)`` is the multiplier applied to ``x_norm`` so
+    ``out = x_norm * factor`` lands in fp8 range.
     """
-    af = amax_safe.float().contiguous()
-    working = (af * _INV_FP8_MAX_F32).view(torch.int32).to(torch.int64) & 0xFFFFFFFF
-    biased_exp = (working >> 23) & 0xFF
-    mantissa = working & 0x7FFFFF
-    exp_field = torch.where(mantissa != 0, biased_exp + 1, biased_exp)
-    e8m0_biased = exp_field.clamp(0, 255)
+    from aiter.utility import fp4_utils
+    from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE, MxDtype
+
+    e8m0_biased = (
+        fp4_utils.f32_to_mx_e8m0_scale(
+            amax_safe.float(), mode=MX_DEFAULT_ROUND_MODE, dtype=MxDtype.FP8_E4M3
+        )
+        .view(torch.uint8)
+        .to(torch.int64)
+    )
     quant_exp = (254 - e8m0_biased).to(torch.int32)
     factor = (quant_exp << 23).view(torch.float32)
     return e8m0_biased.to(torch.uint8), factor
