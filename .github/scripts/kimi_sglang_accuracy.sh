@@ -4,8 +4,26 @@
 # PR's AITER already installed. Launches sglang.launch_server, runs lm_eval
 # gsm8k 3-shot, prints `KIMI_FLEX_EXTRACT=<value>`.
 #
-# NOTE: SGLang currently fails to load AMD Quark MXFP4 per-expert weights
-# (loader bug). This gate is wired non-blocking until that is fixed upstream.
+# Two launcher flags are REQUIRED to serve the Quark MXFP4 checkpoint on MI350X
+# (gfx950). Both work around upstream-SGLang bugs, not AITER:
+#
+# 1) --disable-shared-experts-fusion
+#    With fusion ON (SGLang default for DeepseekV3-style models) the MoE weight
+#    loader crashes during load:
+#      fused_moe_triton/layer.py:490 _load_w13 -> expert_data.copy_(loaded_weight)
+#      RuntimeError: The size of tensor a (3584) must match the size of tensor b
+#      (7168) at non-singleton dimension 1
+#    The fusion concatenates the shared-expert gate/up into the routed-expert w13
+#    tensor, but the per-expert Quark MXFP4 shards have the unfused (half) shape.
+#
+# 2) --attention-backend aiter   (and DO NOT use --kv-cache-dtype fp8_e4m3)
+#    The default SGLang triton/MLA path for this model is broken on gfx950:
+#      forward_mla_fused_rope_rocm.py:75 torch.bmm(q_nope, w_kc)
+#      RuntimeError: Expected ... batch2 ... [8,128] but got [8,64]
+#    (head-dim mismatch, fires at CUDA-graph capture). With fp8 KV cache it slips
+#    past capture and instead dies in decode with the upstream triton dot
+#    rejecting fp8 lhs ("Unsupported lhs dtype fp8e4nv"). Routing attention
+#    through AITER's MLA backend + bf16 KV cache avoids both and serves cleanly.
 set -uo pipefail
 
 MODEL_PATH=${MODEL_PATH:-amd/Kimi-K2.5-MXFP4}
@@ -33,10 +51,11 @@ python3 -m sglang.launch_server \
     --host 127.0.0.1 --port "$PORT" \
     --tensor-parallel-size "$TP" \
     --trust-remote-code \
-    --kv-cache-dtype fp8_e4m3 \
+    --attention-backend aiter \
     --mem-fraction-static 0.8 \
     --page-size 1 \
     --disable-radix-cache \
+    --disable-shared-experts-fusion \
     > "$SLOG" 2>&1 &
 SVPID=$!
 

@@ -9,8 +9,10 @@ name: Kimi Downstream Test
 # self-contained launcher runs gsm8k. The ATOM (in-tree) path is covered in
 # atom-test.yaml.
 #
-# Verified on MI355X (gfx950) 2026-05-30 (aiter ef114b0d4), vllm serve TP8:
-# gsm8k 3-shot flexible-extract 0.9409. Threshold 0.92 leaves margin.
+# Verified on MI350X (gfx950) TP8, gsm8k 3-shot flexible-extract, threshold 0.92:
+#   vLLM   2026-05-30 aiter ef114b0d4  -> 0.9409
+#   SGLang 2026-05-31 aiter 1ec891b44  -> 0.9272  (--attention-backend aiter +
+#          --disable-shared-experts-fusion; see kimi_sglang_accuracy.sh header)
 
 on:
   pull_request:
@@ -50,9 +52,20 @@ jobs:
             # periodically. See https://hub.docker.com/r/lmsysorg/sglang-rocm/tags
             base_image: lmsysorg/sglang-rocm:v0.5.12.post1-rocm720-mi35x-20260531
             script: kimi_sglang_accuracy.sh
-            # Non-blocking: SGLang can't yet load AMD Quark MXFP4 per-expert
-            # weights (loader bug). Visible signal that greens on the fix.
-            continue_on_error: true
+            # Blocking. Two SGLang-side bugs in this Kimi-K2.5 path on MI350X
+            # (gfx950) are worked around in the launcher (kimi_sglang_accuracy.sh):
+            #  1) MoE loader: shared-experts fusion vs unfused per-expert Quark
+            #     MXFP4 shard shape -> _load_w13 copy_ mismatch 3584 vs 7168.
+            #     Fixed with --disable-shared-experts-fusion.
+            #  2) MLA forward: SGLang's default triton/fused-MLA path
+            #     (forward_mla_fused_rope_rocm.py) crashes on Kimi-K2.5 head dims
+            #     ("batch2 ... [8,128] but got [8,64]"); fp8 KV cache instead dies
+            #     in decode on the triton fp8 dot. Fixed by routing attention
+            #     through AITER's MLA backend (--attention-backend aiter) + bf16
+            #     KV cache. This exercises the PR's AITER kernels end to end.
+            # Verified on MI350X (gfx950) TP8, aiter 1ec891b44: gsm8k 3-shot
+            # flexible-extract 0.9272 (strict 0.9265). Threshold 0.92.
+            continue_on_error: false
     runs-on: linux-aiter-do-mi350x-8
     continue-on-error: ${{ matrix.continue_on_error }}
     timeout-minutes: 180

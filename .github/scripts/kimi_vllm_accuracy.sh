@@ -26,10 +26,17 @@ command -v lm_eval >/dev/null 2>&1 || pip install -q "lm-eval[api]"
 if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then echo "ERROR: port $PORT busy"; exit 3; fi
 
 echo "== launching vllm serve =="
+# NOTE: do NOT pass `--load-format fastsafetensors` here. The official
+# rocm/vllm-dev:nightly image does not bundle the `fastsafetensors` package, so
+# that flag makes every TP worker die during weight load with
+# `ImportError: Please install vllm[fastsafetensors] for fastsafetensors support`
+# (surfaced only as "WorkerProc initialization failed" in the parent). The
+# default safetensors loader loads this 521GB checkpoint in ~27s/worker on
+# MI355X, so fastsafetensors buys nothing here. The reference 0.9409 run used it
+# only because the ATOM image happened to ship the package.
 vllm serve "$MODEL" \
     --host 127.0.0.1 --port "$PORT" \
     --async-scheduling \
-    --load-format fastsafetensors \
     --tensor-parallel-size "$TP" \
     --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
