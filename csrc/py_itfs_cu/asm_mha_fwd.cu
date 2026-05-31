@@ -235,7 +235,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     bool is_i8fp8 = is_qk_int8 && is_v_fp8;
 
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || is_qkv_fp8 || is_i8fp8,
-                "FlashAttention only support fp16, bf16, fp8_e4m3 and int8(q/k)+fp8(v) data type");
+                "FlashAttention only support fp16, bf16, fp8_e4m3, and int8(q/k)+fp8(v) data type");
 
     if (is_i8fp8) {
         TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype (int8)");
@@ -269,7 +269,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     if(is_qkv_fp8 || is_i8fp8)
     {
         TORCH_CHECK(q_descale_.has_value(),
-                    "q_descale, k_descale, v_descale must be provided for asm fp8");
+                    "q_descale, k_descale, v_descale must be provided for asm quantized attention");
         TORCH_CHECK(q_descale_.value().dtype() == torch::kFloat32 &&
                         k_descale_.value().dtype() == torch::kFloat32 &&
                         v_descale_.value().dtype() == torch::kFloat32,
