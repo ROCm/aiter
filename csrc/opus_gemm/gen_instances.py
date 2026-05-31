@@ -128,7 +128,7 @@ VALID_FLATMM_SPLITK_MFMA = {(16, 16, 32)}
 # Persistent pipeline ports the mouter reference which only validated
 # 16x16x32 BF16 MFMA. Add 32x32x16 later if needed.
 VALID_PERSISTENT_MFMA = {(16, 16, 32)}
-# Mono-tile pipeline: same MFMA lock as persistent (16x16x32 BF16) -- the
+# Mono-tile pipeline: same MFMA lock as persistent (16x16x32 BF16) — the
 # kernel template hard-codes T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32.
 VALID_MONO_TILE_MFMA = {(16, 16, 32)}
 
@@ -173,7 +173,7 @@ class opus_gemm_codegen:
         # device TU only).
         self._kid_pipeline_header = {}
 
-    # -- a16w16 compile-time + VGPR spill validator --
+    # ── a16w16 compile-time + VGPR spill validator ──
 
     @staticmethod
     def _validate_a16w16(k: OpusGemmInstance):
@@ -187,26 +187,26 @@ class opus_gemm_codegen:
         num_waves = k.T_M * k.T_N * T_K
         smem_linear_wave = WARP_SIZE * 16 // sizeof_da  # 512
 
-        # -- Hardware --
+        # ── Hardware ──
         if k.BLOCK_SIZE > 512:
             errors.append(f"BLOCK_SIZE={k.BLOCK_SIZE} exceeds 512")
 
-        # -- Pipeline: T_M must be 2 (split-barrier) --
+        # ── Pipeline: T_M must be 2 (split-barrier) ──
         if k.T_M != 2:
             errors.append(f"T_M={k.T_M} must be 2")
 
-        # -- Traits: BLOCK_SIZE = T_M * T_N * T_K * WARP_SIZE --
+        # ── Traits: BLOCK_SIZE = T_M * T_N * T_K * WARP_SIZE ──
         if k.BLOCK_SIZE != num_waves * WARP_SIZE:
             errors.append(
                 f"BLOCK_SIZE={k.BLOCK_SIZE} != "
                 f"{k.T_M}*{k.T_N}*{T_K}*{WARP_SIZE}={num_waves * WARP_SIZE}"
             )
 
-        # -- Layout: T_N % T_M == 0 (rb: T_N/T_M) --
+        # ── Layout: T_N % T_M == 0 (rb: T_N/T_M) ──
         if k.T_N % k.T_M != 0:
             errors.append(f"T_N={k.T_N} not divisible by T_M={k.T_M}")
 
-        # -- MFMA validity --
+        # ── MFMA validity ──
         if (k.W_M, k.W_N, k.W_K) not in VALID_BF16_MFMA:
             errors.append(f"WAVE=({k.W_M},{k.W_N},{k.W_K}) not in {VALID_BF16_MFMA}")
         if WARP_SIZE % k.W_M != 0:
@@ -218,12 +218,12 @@ class opus_gemm_codegen:
         if k.W_N % k.T_N != 0:
             errors.append(f"W_N={k.W_N} not divisible by T_N={k.T_N}")
 
-        # -- VEC --
+        # ── VEC ──
         expected_vec = 16 // sizeof_da
         if k.VEC_A != expected_vec:
             errors.append(f"VEC_A={k.VEC_A} must be {expected_vec}")
 
-        # -- Block tile divisibility --
+        # ── Block tile divisibility ──
         if k.B_M % 2 != 0 or k.B_N % 2 != 0:
             errors.append(f"B_M={k.B_M}, B_N={k.B_N} must be even")
         if HALF_B_M % (k.W_M * k.T_M) != 0:
@@ -237,7 +237,7 @@ class opus_gemm_codegen:
         E_N = HALF_B_N // (k.W_N * k.T_N) if (k.W_N * k.T_N) else 0
         E_K = k.B_K // k.W_K if k.W_K else 0
 
-        # -- smem layout --
+        # ── smem layout ──
         if smem_linear_wave % k.B_K != 0:
             errors.append(f"smem_linear_wave={smem_linear_wave} not div by B_K={k.B_K}")
         else:
@@ -247,7 +247,7 @@ class opus_gemm_codegen:
             if HALF_B_N % smem_sub != 0:
                 errors.append(f"HALF_B_N={HALF_B_N} not div by smem_sub={smem_sub}")
 
-        # -- buffer/ds instruction counts >= 1 and integer --
+        # ── buffer/ds instruction counts ≥ 1 and integer ──
         for name, num, den in [
             ("a_buffer_load_insts", HALF_B_M * k.B_K, k.BLOCK_SIZE * k.VEC_A),
             ("b_buffer_load_insts", HALF_B_N * k.B_K, k.BLOCK_SIZE * k.VEC_B),
@@ -257,7 +257,7 @@ class opus_gemm_codegen:
             if den == 0 or num % den != 0 or num // den < 1:
                 errors.append(f"{name}={num}/{den} invalid")
 
-        # -- ra/rb: W_M*W_K / (WARP_SIZE*VEC_A) >= 1 --
+        # ── ra/rb: W_M*W_K / (WARP_SIZE*VEC_A) >= 1 ──
         for tag, ww, vec in [
             ("ra", k.W_M * k.W_K, k.VEC_A),
             ("rb", k.W_N * k.W_K, k.VEC_B),
@@ -266,7 +266,7 @@ class opus_gemm_codegen:
             if ww < denom or ww % denom != 0:
                 errors.append(f"{tag}: W*W_K={ww} must be >= and div by {denom}")
 
-        # -- gb: exact division (not ceil_div) --
+        # ── gb: exact division (not ceil_div) ──
         if k.VEC_B and k.B_K % k.VEC_B == 0:
             threads_k_b = k.B_K // k.VEC_B
             if k.BLOCK_SIZE % threads_k_b == 0:
@@ -274,7 +274,7 @@ class opus_gemm_codegen:
                 if HALF_B_N % thr_n != 0:
                     errors.append(f"gb: HALF_B_N={HALF_B_N} not div by {thr_n}")
 
-        # -- sb: exact division --
+        # ── sb: exact division ──
         if smem_linear_wave % k.B_K == 0:
             smem_sub = smem_linear_wave // k.B_K
             if smem_sub and HALF_B_N % smem_sub == 0:
@@ -282,18 +282,18 @@ class opus_gemm_codegen:
                 if smem_n_rep % num_waves != 0:
                     errors.append(f"sb: smem_n_rep={smem_n_rep} not div by {num_waves}")
 
-        # -- threads_k <= WARP_SIZE --
+        # ── threads_k <= WARP_SIZE ──
         for tag, vec in [("ga", k.VEC_A), ("gb", k.VEC_B)]:
             if vec and k.B_K // vec > WARP_SIZE:
                 errors.append(f"{tag}: B_K/VEC={k.B_K // vec} > WARP_SIZE")
 
-        # -- AGPR < 256 --
+        # ── AGPR < 256 ──
         agpr_per_mfma = (k.W_M * k.W_N) // WARP_SIZE
         total_agprs = 4 * E_M * E_N * agpr_per_mfma
         if total_agprs >= 256:
             errors.append(f"AGPR={total_agprs} must be < 256")
 
-        # -- LDS <= 160 KiB --
+        # ── LDS <= 160 KiB ──
         if smem_linear_wave % k.B_K == 0:
             smem_sub = smem_linear_wave // k.B_K
             smem_m_rep = (
@@ -309,7 +309,7 @@ class opus_gemm_codegen:
             if total_lds > 160 * 1024:
                 errors.append(f"LDS={total_lds // 1024}KiB exceeds 160KiB")
 
-        # -- VGPR spill estimate --
+        # ── VGPR spill estimate ──
         vgpr_ops = 4 * E_K * (E_M + 2 * E_N)
         vgpr_est = vgpr_ops + 80
         if vgpr_est > 256:
@@ -317,7 +317,7 @@ class opus_gemm_codegen:
         if vgpr_est + total_agprs > 512:
             errors.append(f"VGPR+AGPR={vgpr_est + total_agprs} exceeds 512")
 
-        # -- ra/rb layout constraint: B_K must equal T_N * W_K / 2 --
+        # ── ra/rb layout constraint: B_K must equal T_N * W_K / 2 ──
         # The ra/rb LDS read layouts couple E_K with T_N through the T_M
         # partition stride in group 2. When (W_M/T_N) * E_K * 32 >= 512
         # (smem_linear_wave), the T_M partition offset exceeds the LDS row
@@ -345,7 +345,7 @@ class opus_gemm_codegen:
             "min_k": 2 * k.B_K,
         }
 
-    # -- a16w16_flatmm validator --
+    # ── a16w16_flatmm validator ──
 
     @staticmethod
     def _validate_a16w16_flatmm(k: OpusGemmInstance):
@@ -358,7 +358,7 @@ class opus_gemm_codegen:
         errors = []
         sizeof_da = 2  # bf16 locked
 
-        # -- Locked config (traits enforces these via templates) --
+        # ── Locked config (traits enforces these via templates) ──
         if k.BLOCK_SIZE != 256:
             errors.append(f"BLOCK_SIZE={k.BLOCK_SIZE} must be 256 (4-wave warp-spec)")
         if k.T_M != 2:
@@ -366,7 +366,7 @@ class opus_gemm_codegen:
         if k.T_N != 1:
             errors.append(f"T_N={k.T_N} must be 1")
 
-        # -- MFMA: only W_M<32 path supported (LOAD_GROUP_M_LANE=1) --
+        # ── MFMA: only W_M<32 path supported (LOAD_GROUP_M_LANE=1) ──
         if (k.W_M, k.W_N, k.W_K) not in VALID_FLATMM_MFMA:
             errors.append(
                 f"WAVE=({k.W_M},{k.W_N},{k.W_K}) not in {VALID_FLATMM_MFMA} "
@@ -375,14 +375,14 @@ class opus_gemm_codegen:
         if k.W_M >= 32:
             errors.append(f"W_M={k.W_M}: flatmm LGML=4 path not implemented")
 
-        # -- VEC --
+        # ── VEC ──
         expected_vec = 16 // sizeof_da
         if k.VEC_A != expected_vec or k.VEC_B != expected_vec:
             errors.append(f"VEC_A={k.VEC_A}, VEC_B={k.VEC_B} must be {expected_vec}")
         if k.VEC_C != 4:
             errors.append(f"VEC_C={k.VEC_C} must be 4")
 
-        # -- Tile geometry (LOAD_GROUP_K = W_K * 2 = 64 for W_K=32) --
+        # ── Tile geometry (LOAD_GROUP_K = W_K * 2 = 64 for W_K=32) ──
         LOAD_GROUP_M = 64 if k.W_M >= 32 else 32
         LOAD_GROUP_N = 64 if k.W_N >= 32 else 32
         LOAD_GROUP_K = k.W_K * 2
@@ -397,18 +397,18 @@ class opus_gemm_codegen:
         num_load_groups_per_bn = k.B_N // LOAD_GROUP_N
         num_load_groups_per_bk = k.B_K // LOAD_GROUP_K
 
-        # -- LDS per-group-load size --
+        # ── LDS per-group-load size ──
         smem_linear_wave = WARP_SIZE * 16 // sizeof_da  # 512 for bf16
         smem_sub = smem_linear_wave // LOAD_GROUP_K
         slots = LOAD_GROUP_M // smem_sub
         smem_padding = 16 // sizeof_da if k.W_M >= 32 else 2 * 16 // sizeof_da
         smem_per_group_load_size = slots * (smem_linear_wave + smem_padding) * sizeof_da
 
-        # -- WG_PER_CU --
+        # ── WG_PER_CU ──
         if k.WG_PER_CU not in (1, 2):
             errors.append(f"WG_PER_CU={k.WG_PER_CU} must be 1 or 2")
 
-        # -- pfk derivation (match traits formula) --
+        # ── pfk derivation (match traits formula) ──
         lds_total = 163840  # gfx950 budget; host-side constant for validation only
         max_lds_per_wg = lds_total // max(k.WG_PER_CU, 1)
         per_block_iter = (
@@ -442,7 +442,7 @@ class opus_gemm_codegen:
             "groups_bk": num_load_groups_per_bk,
         }
 
-    # -- a16w16_flatmm_splitk validator --
+    # ── a16w16_flatmm_splitk validator ──
 
     @staticmethod
     def _validate_a16w16_flatmm_splitk(k: OpusGemmInstance):
@@ -589,12 +589,12 @@ class opus_gemm_codegen:
           * smem_n_rep = B_N / smem_sub >= 8 and divisible by 8
           * E_N = B_N / (W_N*T_N) divisible by (T_N/T_M) = 2  ->  B_N % 128 == 0
           * E_M divisible by smem_sub / (W_M/T_N)
-        Plus a user-imposed B_M <= 192 cap.
+        Plus a user-imposed B_M ≤ 192 cap.
         """
         errors = []
         sizeof_da = 2  # bf16 locked
 
-        # -- Locked config --
+        # ── Locked config ──
         if k.BLOCK_SIZE != 512:
             errors.append(
                 f"BLOCK_SIZE={k.BLOCK_SIZE} must be 512 (mono-tile 8-wave WG)"
@@ -608,7 +608,7 @@ class opus_gemm_codegen:
                 f"WAVE=({k.W_M},{k.W_N},{k.W_K}) not in {VALID_MONO_TILE_MFMA}"
             )
 
-        # -- VEC --
+        # ── VEC ──
         expected_vec = 16 // sizeof_da  # 8 for bf16
         if (
             k.VEC_A != expected_vec
@@ -619,15 +619,15 @@ class opus_gemm_codegen:
                 f"VEC=({k.VEC_A},{k.VEC_B},{k.VEC_C}) must all be {expected_vec}"
             )
 
-        # -- User cap: B_M <= 192 --
+        # ── User cap: B_M ≤ 192 ──
         if k.B_M > 192:
             errors.append(f"B_M={k.B_M} exceeds mono-tile cap of 192")
 
-        # -- Mono-tile must be non-OOB (intrinsic; launcher rejects unaligned) --
+        # ── Mono-tile must be non-OOB (intrinsic; launcher rejects unaligned) ──
         if k.has_oob:
             errors.append("mono-tile is intrinsically non-OOB; has_oob must be False")
 
-        # -- Block tile divisibility --
+        # ── Block tile divisibility ──
         if k.B_M % (k.W_M * k.T_M) != 0:
             errors.append(f"B_M={k.B_M} not div by W_M*T_M={k.W_M * k.T_M}")
         if k.B_N % (k.W_N * k.T_N) != 0:
@@ -639,14 +639,14 @@ class opus_gemm_codegen:
         E_N = k.B_N // (k.W_N * k.T_N) if (k.W_N * k.T_N) else 0
         E_K = k.B_K // k.W_K if k.W_K else 0
 
-        # -- E_N divisibility (rb layout grouping by T_N/T_M = 2) --
+        # ── E_N divisibility (rb layout grouping by T_N/T_M = 2) ──
         if k.T_M and (E_N * k.T_M) % k.T_N != 0:
             errors.append(
                 f"E_N={E_N} not div by T_N/T_M={k.T_N // k.T_M} "
                 f"(mono-tile rb layout grouping; needs B_N % 128 == 0)"
             )
 
-        # -- LDS layout --
+        # ── LDS layout ──
         smem_linear_wave = WARP_SIZE * 16 // sizeof_da  # 512 for bf16
         if k.B_K and smem_linear_wave % k.B_K != 0:
             errors.append(
@@ -691,7 +691,7 @@ class opus_gemm_codegen:
                             f"(ra layout)"
                         )
 
-            # -- LDS footprint --
+            # ── LDS footprint ──
             # Mono-tile pipeline allocates `smem_a[2]` (double-buffered:
             # one compute slot + one fetch slot) and `smem_b[3]` (two
             # read slots sb_r0/sb_r1 plus a write slot sb_w; B is
@@ -720,7 +720,7 @@ class opus_gemm_codegen:
             "min_k": 2 * k.B_K,
         }
 
-    # -- Instance generation --
+    # ── Instance generation ──
 
     def gen_instance(self, k: OpusGemmInstance):
         if k.kernel_tag == "a16w16":
@@ -1142,7 +1142,7 @@ void
         # nullptr / 0 assignments.
         kargs_init_extra = ""
 
-        # -- Compile-time split: host pass vs device pass --
+        # ── Compile-time split: host pass vs device pass ──
         #
         # The .cuh file contains the heavy host-side launcher (AITER_CHECK,
         # `<<<...>>>` launch, kargs marshalling). Wrapping the host includes
@@ -1727,7 +1727,7 @@ void
         has_bias_str = "true" if False else "false"  # HAS_BIAS hardcoded false
 
         # Kid-specific runtime K-bound check per INTEGRATION.md "Runtime
-        # ????" item 1: K >= Traits::prefetch_k_iter * Traits::B_K.
+        # 前置约束" item 1: K >= Traits::prefetch_k_iter * Traits::B_K.
         # pfk is a compile-time member so the effective bound is inlined.
         k_check = f"""
     int loops_ = (K + {k.B_K} - 1) / {k.B_K};
@@ -2128,7 +2128,7 @@ void
         # Now they live in a single dedicated TU emitted by
         # _emit_splitk_reduce_tu, so each splitk kid's device.cu only
         # carries its own main-kernel instantiation. See
-        # aiter/ops/opus/README.md ?7.6 for the wall-time impact.
+        # aiter/ops/opus/README.md §7.6 for the wall-time impact.
         for CDtype in k.output_dtypes:
             host_decl = (
                 f"template void\n"
@@ -2150,7 +2150,7 @@ void
                 {"kid_name": k.name, "dtype": CDtype, "device_decl": device_decl}
             )
 
-    # -- Lookup / manifest generation --
+    # ── Lookup / manifest generation ──
 
     def gen_lookup_dict(self, kernels_dict):
         """Emit opus_gemm_lookup.h with two (M,N,K)->kernel macros.
@@ -2407,15 +2407,15 @@ void
                 else:
                     f.write(MANIFEST_SCALE.format(kernel_name=k.name))
 
-    # -- Per-pass TU emission --
+    # ── Per-pass TU emission ──
     #
     # Replaces the old "one .cpp per (kid, dtype)" scheme. The wall-time
     # math:
     #   Old: 38 .cpp TUs each pay full <torch/extension.h> + <hip/...>
     #        parse on host pass (~13s) + a small device pass (~2s, after
-    #        the .cuh #ifndef split). Total parallel wall ? host pass.
+    #        the .cuh #ifndef split). Total parallel wall ≈ host pass.
     #   New: 1 fused host TU does the heavy host parse exactly once
-    #        (~13s) + N device TUs each ~2s. Parallel wall ? max(13s,
+    #        (~13s) + N device TUs each ~2s. Parallel wall ≈ max(13s,
     #        slowest device TU). The 38 host parses collapse into one,
     #        so the critical path shrinks to roughly the single host
     #        TU's compile time.
@@ -2778,7 +2778,7 @@ if __name__ == "__main__":
 
     # --- Compute the subset-compile set S ------------------------------------
     #
-    # S = (CSV opus rows' kids) ? (previous sidecar contents) ? HEURISTIC_DEFAULT_KIDS
+    # S = (CSV opus rows' kids) ∪ (previous sidecar contents) ∪ HEURISTIC_DEFAULT_KIDS
     # Intersected with kernels_list.keys() to guard against stale kids in CSV.
     #
     # When --kernel_tag is specified, we honor that filter as a developer
@@ -2922,7 +2922,7 @@ if __name__ == "__main__":
                     # Find the kid for this entry by reverse-lookup against S.
                     # Easier: just keep the entry; the launcher symbol is
                     # only resolvable if v.name's kid is in S, which we've
-                    # already guaranteed via valid_kids ? S.
+                    # already guaranteed via valid_kids ∩ S.
                     filtered[k] = v
                 else:
                     filtered[k] = v  # default_kernels_dict negative-int entries

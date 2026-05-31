@@ -110,7 +110,7 @@ __global__ void splitk_reduce_kernel(
     const int b = bm_id / M;
     const int m = bm_id - b * M;
 
-    // -- Bias prefetch (per-N vector load) ----------------------------------
+    // ── Bias prefetch (per-N vector load) ──────────────────────────────────
     // Bias is per-output-feature [N] (F.linear convention). Each thread
     // loads VEC bias values at its own n_base. Fired before the split-K
     // accumulation so the vmem loads overlap.
@@ -200,7 +200,7 @@ __global__ void splitk_reduce_kernel(
                     c_idx + g * STEP);
             });
         } else if (n_base < N) {
-            // Tail path: decompose valid ? [1, VEC-1] into descending
+            // Tail path: decompose valid ∈ [1, VEC-1] into descending
             // power-of-2 chunks so we emit dwordx4/dwordx2/dword/short
             // instead of VEC scalar stores.
             // Ref: demon_gcn/opus_gemm/mxfp8_e8m0/gemm_mxfp_a8w8_1d1d.hpp

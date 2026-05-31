@@ -620,7 +620,7 @@ def _moe_gemm_a8w4(
     else:
         out = out.to(tl.bfloat16)
 
-    # TDM Store: accumulator -> shared memory -> global memory
+    # TDM Store: accumulator → shared memory → global memory
     Y += start_m * stride_y_m
     y_buffer = gl.allocate_shared_memory(
         Y.type.element_ty,

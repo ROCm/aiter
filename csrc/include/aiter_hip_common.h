@@ -197,7 +197,7 @@ class AiterAsmKernelFast
                                             nullptr,
                                             nullptr);
         // Verify registration succeeded. __hipRegisterFunction returns void so
-        // we probe via hipGetFuncBySymbol -- if it returns null the runtime silently
+        // we probe via hipGetFuncBySymbol — if it returns null the runtime silently
         // rejected the kernel (e.g. resource limits, arch mismatch). This runs
         // once per kernel variant at init time, not on every launch.
         hipFunction_t probe = nullptr;
@@ -228,7 +228,7 @@ class AiterAsmKernelFast
                                      HIP_LAUNCH_PARAM_END};
         hipFunction_t kernel_func = nullptr;
         // TODO Ask runtime folks to provide an API for hipLaunchKernel with extra arg
-        // Don't error check here -- registration is validated once in init().
+        // Don't error check here — registration is validated once in init().
         (void)hipGetFuncBySymbol(&kernel_func, reinterpret_cast<void*>(this));
 
         HIP_CALL_LAUNCH(hipModuleLaunchKernel(kernel_func,
@@ -256,7 +256,7 @@ class AiterAsmKernel: private AiterAsmKernelFast
                                    const char* data,
                                    size_t size)
     {
-        // The AMDGPU metadata is stored as msgpack in an ELF .note section -- not as
+        // The AMDGPU metadata is stored as msgpack in an ELF .note section — not as
         // raw ASCII. We scan for the amdhsa kernel descriptor's group_segment_fixed_size
         // field in the binary kernel descriptor block instead. In the AMDHSA kernel
         // descriptor (64 bytes at the start of the .text symbol), byte offset 0 is a

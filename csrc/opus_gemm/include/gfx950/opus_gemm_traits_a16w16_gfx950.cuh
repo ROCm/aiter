@@ -203,7 +203,7 @@ struct opus_gemm_a16w16_flatmm_traits_gfx950 {
     static constexpr int T_N = 1; // compute-wave count along N
     static constexpr int T_K = 1; // compute-wave count along K
 
-    // -- Warp-spec 4-wave pipeline constraints --
+    // ── Warp-spec 4-wave pipeline constraints ──
     static_assert(T_K == 1, "flatmm requires T_K=1");
     static_assert(T_M == 2, "flatmm requires T_M=2 (ra layout depends on it)");
     static_assert(T_N == 1, "flatmm requires T_N=1 (consumer waves share N slab)");
@@ -447,7 +447,7 @@ struct opus_flatmm_splitk_traits_gfx950 {
 // Pipeline: opus_gemm_pipeline_a16w16_persistent_gfx950.cuh (ported from the
 // standalone reference kernel gemm_a16w16_8wave_mouter.cc).
 //
-// Layout: each WG handles m_per_wg tile_m x 1 tile_n (M outer loop). Within
+// Layout: each WG handles m_per_wg tile_m × 1 tile_n (M outer loop). Within
 // one XCD, consecutive launch-wave WGs share the same m_grp and span all 8
 // tile_n stripes; this lets the A tile stay resident in L2 across 8 N tiles
 // for the duration of one m_grp.
@@ -690,7 +690,7 @@ struct opus_gemm_a16w16_mono_tile_traits_gfx950 {
     static constexpr int VEC_B = opus::get<1>(VEC{});
     static constexpr int VEC_C = opus::get<2>(VEC{});
 
-    // -- Locked tile/wave geometry (kernel-internal constants) --
+    // ── Locked tile/wave geometry (kernel-internal constants) ──
     static constexpr int T_M = 2;
     static constexpr int T_N = 4;
     static constexpr int T_K = 1;
@@ -702,13 +702,13 @@ struct opus_gemm_a16w16_mono_tile_traits_gfx950 {
     static_assert(BLOCK_SIZE == 512,
                   "mono_tile requires BLOCK_SIZE = 512 (8 waves * 64 lanes)");
 
-    // -- Locked vector widths --
+    // ── Locked vector widths ──
     static_assert(VEC_A == 8 && VEC_B == 8 && VEC_C == 8,
                   "mono_tile requires VEC_A = VEC_B = VEC_C = 8");
     static_assert(VEC_A == 16 / sizeof(D_A),
                   "mono_tile VEC_A must equal 16 / sizeof(D_A) (= 8 for bf16)");
 
-    // -- Block tile divisibility --
+    // ── Block tile divisibility ──
     static_assert(B_M % (W_M * T_M) == 0,
                   "mono_tile requires B_M divisible by W_M * T_M = 32");
     static_assert(B_N % (W_N * T_N) == 0,
@@ -716,7 +716,7 @@ struct opus_gemm_a16w16_mono_tile_traits_gfx950 {
     static_assert(B_K % (W_K * T_K) == 0,
                   "mono_tile requires B_K divisible by W_K * T_K = 32");
 
-    // -- Derived MMA repeat counts --
+    // ── Derived MMA repeat counts ──
     static constexpr int E_M = B_M / (W_M * T_M);
     static constexpr int E_N = B_N / (W_N * T_N);
     static constexpr int E_K = B_K / (W_K * T_K);
@@ -726,7 +726,7 @@ struct opus_gemm_a16w16_mono_tile_traits_gfx950 {
                   "mono_tile requires E_N divisible by (T_N / T_M) = 2 "
                   "-> B_N % 128 == 0 with the locked T_M=2,T_N=4 geometry");
 
-    // -- LDS layout --
+    // ── LDS layout ──
     static constexpr int smem_linear_wave = 64 * 16 / sizeof(D_A); // 512 for bf16
     static_assert(smem_linear_wave % B_K == 0,
                   "mono_tile requires B_K to divide smem_linear_wave (=512 for bf16)");
@@ -752,8 +752,8 @@ struct opus_gemm_a16w16_mono_tile_traits_gfx950 {
     static_assert(smem_sub_e_m > 0 && (E_M % smem_sub_e_m) == 0,
                   "mono_tile: E_M must be divisible by smem_sub / (W_M/T_N)");
 
-    // -- Buffer / ds_read instruction counts (mirror kernel_traits<UT> in the
-    //    upstream template; recomputed here so codegen can sanity-print). --
+    // ── Buffer / ds_read instruction counts (mirror kernel_traits<UT> in the
+    //    upstream template; recomputed here so codegen can sanity-print). ──
     static constexpr int a_buffer_load_insts = B_M * B_K / (BLOCK_SIZE * VEC_A);
     static constexpr int b_buffer_load_insts = B_N * B_K / (BLOCK_SIZE * VEC_B);
     static constexpr int a_ds_read_insts = (E_M * E_K * W_M * W_K) / (64 * VEC_A);

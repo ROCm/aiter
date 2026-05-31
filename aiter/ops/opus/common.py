@@ -184,7 +184,7 @@ def _key_from_runtime(
     )
 
 
-# Mono-tile kid -> (B_M, B_N, B_K). Must stay in lock-step with
+# Mono-tile kid → (B_M, B_N, B_K). Must stay in lock-step with
 # csrc/opus_gemm/opus_gemm_common.py:_MONO_TILE_TILES; the runtime guard
 # below uses it to validate (N, K) alignment for CSV-picked mono kids,
 # since tuned_gemm.get_padded_m pads the lookup key by M only and can

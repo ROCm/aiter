@@ -384,7 +384,7 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
             _CKGEMM_HAS_GFX[tuned_file] = True
         else:
             logger.warning(
-                f"{tuned_file} has no 'gfx' column -- falling back to cu_num-only key. "
+                f"{tuned_file} has no 'gfx' column — falling back to cu_num-only key. "
                 "Re-run the tuner or migrate the CSV to add a gfx column."
             )
             _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
@@ -440,7 +440,7 @@ def get_GEMM_config_with_quant_type(
             _GEMM_QUANT_TYPE_HAS_GFX[tuned_file] = True
         else:
             logger.warning(
-                f"{tuned_file} has no 'gfx' column -- falling back to cu_num-only key. "
+                f"{tuned_file} has no 'gfx' column — falling back to cu_num-only key. "
                 "Re-run the tuner or migrate the CSV to add a gfx column."
             )
             _GEMM_QUANT_TYPE_CACHE[tuned_file] = asmGemmDictDf.set_index(
