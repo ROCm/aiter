@@ -78,6 +78,15 @@ jobs:
               # Kimi-K2.5 ATOM (in-tree) downstream gate. Config (model_path,
               # extraArgs -tp4, threshold) is pulled from ATOM models_accuracy.json.
               {"model_name": "Kimi-K2.5-MXFP4"},
+              # Expanded coverage to match the InferenceX (SemiAnalysisAI) MI355X
+              # frontier set. All configs (model_path, extraArgs, threshold) come
+              # from ATOM models_accuracy.json; runners pinned below to the MI350X
+              # pool. GLM-5.1 is used instead of GLM-5 (GLM-5 has a known ATOM
+              # sparse-attn-indexer crash around the gsm8k request count).
+              {"model_name": "DeepSeek-V4-Pro"},
+              {"model_name": "Qwen3.5-397B-A17B-FP8"},
+              {"model_name": "MiniMax-M2.7"},
+              {"model_name": "GLM-5.1-FP8"},
           ]
 
           labels_raw = os.environ.get("LABELS_JSON") or "[]"
@@ -98,6 +107,10 @@ jobs:
           # runs the downstream gate on the AITER MI350X pool (TP4 -> 4 GPUs).
           model_runner_overrides = {
               "Kimi-K2.5-MXFP4": "linux-aiter-do-mi350x-4",
+              "DeepSeek-V4-Pro": "linux-aiter-do-mi350x-8",       # -tp 8
+              "Qwen3.5-397B-A17B-FP8": "linux-aiter-do-mi350x-4",  # -tp 4
+              "MiniMax-M2.7": "linux-aiter-do-mi350x-2",           # -tp 2
+              "GLM-5.1-FP8": "linux-aiter-do-mi350x-8",            # -tp 8
           }
 
           def prepare_model(model):
