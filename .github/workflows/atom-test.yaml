@@ -75,6 +75,9 @@ jobs:
           default_models = [
               {"model_name": "DeepSeek-R1-0528"},
               {"model_name": "gpt-oss-120b"},
+              # Kimi-K2.5 ATOM (in-tree) downstream gate. Config (model_path,
+              # extraArgs -tp4, threshold) is pulled from ATOM models_accuracy.json.
+              {"model_name": "Kimi-K2.5-MXFP4"},
           ]
 
           labels_raw = os.environ.get("LABELS_JSON") or "[]"
@@ -91,9 +94,16 @@ jobs:
               "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
           }
 
+          # Per-model runner pin (overrides the generic mapping above). Kimi-K2.5
+          # runs the downstream gate on the AITER MI350X pool (TP4 -> 4 GPUs).
+          model_runner_overrides = {
+              "Kimi-K2.5-MXFP4": "linux-aiter-do-mi350x-4",
+          }
+
           def prepare_model(model):
               model = dict(model)
               model["runner"] = runner_overrides.get(model["runner"], model["runner"])
+              model["runner"] = model_runner_overrides.get(model["model_name"], model["runner"])
               model["label"] = model.get("runner", "")
               model["accuracy_test_threshold"] = str(model.get("accuracy_threshold", 0))
               model["run_on_pr"] = True
