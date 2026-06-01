@@ -35,6 +35,7 @@ fp16,fp8,16,1,0,0,16,_ZN5aiter41pa_fp16_pertokenFp8_gqa16_1tg_4w_mtp_msk0E,pa_fp
 bf16,fp8,8,0,0,2,16,_ZN5aiter35pa_bf16_pertokenFp8_gqa8_2tg_4w_uhpE,pa_bf16_pertokenFp8_gqa8_2tg_4w_uhp.co,0,0,0
 bf16,bf16,8,0,0,0,16,_ZN5aiter27pa_bf16_noquant_gqa8_1tg_4wE,pa_bf16_noquant_gqa8_1tg_4w.co,0,0,0
 bf16,fp8,8,0,0,1,16,_ZN5aiter34pa_bf16_pertokenFp8_gqa8_2tg_4w_hpE,pa_bf16_pertokenFp8_gqa8_2tg_4w_hp.co,0,0,0
+bf16,fp8,8,0,0,1,32,_ZN5aiter40pa_bf16_pertokenFp8_gqa8_2tg_4w_hp_blk32E,pa_bf16_pertokenFp8_gqa8_2tg_4w_hp_blk32.co,0,0,0
 fp16,fp8,8,1,1,0,16,_ZN5aiter40pa_fp16_pertokenFp8_gqa8_1tg_4w_mtp_msk1E,pa_fp16_pertokenFp8_gqa8_1tg_4w_mtp_msk1.co,0,0,0
 fp16,int8,8,1,1,0,16,_ZN5aiter41pa_fp16_pertokenInt8_gqa8_1tg_4w_mtp_msk1E,pa_fp16_pertokenInt8_gqa8_1tg_4w_mtp_msk1.co,0,0,0
 fp16,fp8,16,1,1,0,16,_ZN5aiter41pa_fp16_pertokenFp8_gqa16_1tg_4w_mtp_msk1E,pa_fp16_pertokenFp8_gqa16_1tg_4w_mtp_msk1.co,0,0,0

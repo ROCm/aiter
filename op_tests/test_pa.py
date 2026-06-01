@@ -671,7 +671,7 @@ def test_paged_attention(
     # tensor_dump(out_aiter, 'out_aiter')
 
     time_aiter_asm = None
-    if dtype == dtypes.bf16:
+    if dtype == dtypes.bf16 and block_size == 16:
         out_aiter_asm, time_aiter_asm = run_aiter_asm(
             query.contiguous(),  # this kernel need contiguous buffer
             k_cache,
@@ -696,7 +696,7 @@ def test_paged_attention(
     # Test paged_attention_common which automatically switches between ASM and HIP
     # The routing is internal, so we just test the common API regardless of which path it takes
     time_aiter_common = None
-    if dtype == dtypes.bf16:
+    if dtype == dtypes.bf16 and block_size == 16:
         try:
             out_aiter_common, time_aiter_common = run_aiter_common(
                 query.contiguous(),
@@ -815,7 +815,7 @@ def test_paged_attention(
         # )
         # checkAllclose(out_aiter_asm, out_aiter_naive,
         #             msg=f'golden vs ck_naive(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_}):{time_aiter_naive:>8.2f} us......')
-        if quant_algo_ != 0:
+        if quant_algo_ != 0 and block_size == 16:
             out_aiter_asm, time_aiter_asm = run_aiter_asm(
                 query,
                 k_quant_,
@@ -837,7 +837,8 @@ def test_paged_attention(
                 msg=f"golden vs aiter_asm:{time_aiter_asm:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
             )
 
-            if quant_algo_ == 4:
+        if quant_algo_ != 0:
+            if quant_algo_ == 4 and block_size == 16:
                 # Test paged_attention_common with quantized cache
                 out_aiter_common, time_aiter_common = run_aiter_common(
                     query.contiguous(),
@@ -867,7 +868,7 @@ def test_paged_attention(
                 and quant_algo_ == 2
                 and cache_type_ == dtypes.fp8
             ):
-                if dtype == dtypes.bf16:
+                if dtype == dtypes.bf16 and block_size == 16:
                     high_precision_list = [1, 2]
                 else:
                     high_precision_list = [1]
@@ -1006,15 +1007,25 @@ parser.add_argument(
     help="""Context length.
     e.g. -c 128""",
 )
+parser.add_argument(
+    "-b",
+    "--block_size",
+    type=int,
+    nargs="*",
+    default=[16],
+    help="""KV cache block size.
+    e.g. -b 16 32""",
+)
 args = parser.parse_args()
 
 for num_heads in args.num_heads:
     for ctx_len in args.ctx_len:
-        for dtype in args.dtype:
-            ret = test_paged_attention(
-                ctx_len, 128, num_heads, 128, False, 16, dtype, "auto", 0, "cuda:0"
-            )
-            df.append(ret)
+        for block_size in args.block_size:
+            for dtype in args.dtype:
+                ret = test_paged_attention(
+                    ctx_len, 128, num_heads, 128, False, block_size, dtype, "auto", 0, "cuda:0"
+                )
+                df.append(ret)
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("pa summary (markdown):\n%s", df_md)
