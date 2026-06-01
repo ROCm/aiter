@@ -304,13 +304,33 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         }
     }
 
+    // ---- CSV lookup-key normalization ---------------------------------------
+    // The shipped .co/symbol below the "qseqlen4_gqaratio16" name *also* serves
+    // the (gqa=64, qSeqLen=1) case because the kernel tile invariant
+    // `gqa * q_seq_logical = 64` is satisfied by both (16,4) and (64,1).
+    // hsa/codegen.py builds an unordered_map keyed by (arch + knl_name); a
+    // second CSV row for the gqa=64 variant would collide on that key and get
+    // silently dropped at init-list time, so the CSV ships only the (16,4)
+    // row. Normalize the lookup keys here so the (64,1) caller still finds
+    // the same .co. `sub_Q` and the per-launch geometry stay set to the
+    // gqa=64-correct values from the heuristic above — this remap only
+    // affects which CSV row identifies the binary to load.
+    int csv_gqa     = gqa_ratio;
+    int csv_qseqlen = config_max_seqlen_q;
+    if(gqa_ratio == 64 && q_type == "fp8" && kv_type == "fp8" &&
+       config_max_seqlen_q == 1)
+    {
+        csv_gqa     = 16;
+        csv_qseqlen = 4;
+    }
+
     // Kernel lookup (cached across calls).
     std::string arch_id  = get_gpu_arch();
     CFG* config_map      = &cfg_mla_v4_asm;
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     std::string kernelName = get_heuristic_kernel_mla_v4(
-        q_type, kv_type, gqa_ratio, ps, prefill, causal, config_max_seqlen_q,
+        q_type, kv_type, csv_gqa, ps, prefill, causal, csv_qseqlen,
         lse_flag, arch_id, config_map);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
 

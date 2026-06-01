@@ -31,7 +31,18 @@
 // supports any value at runtime — slot 9 of the kernarg packet carries it
 // per launch. Host only sizes splitData/splitLse's split dim to match.
 //
+// NOTE on (Gqa=64, qSeqLen=1): the same .co/symbol below ALSO serves the
+// (gqa=64, qSeqLen=1) variant, because the kernel tile invariant is
+// `gqa * q_seq_logical = 64` which is satisfied by both (16, 4) and
+// (64, 1). We deliberately do NOT add a second CSV row for that variant —
+// hsa/codegen.py builds an std::unordered_map keyed by
+// (arch + knl_name) so two rows with the same kernel symbol would collide
+// and one would be silently dropped at init-list insertion time. Instead
+// the dispatcher (csrc/py_itfs_cu/asm_mla_v4.cu) normalizes the CSV
+// lookup keys for the gqa=64 case to (gqa=16, qSeqLen=4); see the
+// "csv_lookup_*" block there. This keeps the codegen contract simple at
+// the cost of one extra branch in the dispatcher.
+//
 // Required columns last (per codegen.py convention): knl_name, co_name.
 qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,knl_name,co_name
 fp8,fp8,16,0,4,0,0,0,_ZN5aiter42mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmpE,mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmp.co
-fp8,fp8,64,0,1,0,0,0,_ZN5aiter42mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmpE,mla_a8w8_qh64_qseqlen4_gqaratio16_nm_recmp.co
