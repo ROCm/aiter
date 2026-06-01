@@ -908,9 +908,32 @@ template<typename T>
 DINLINE T shfl_xor(T var, int mask, int width = opus::get_warp_size())
 {
     static_assert(sizeof(T) == 4); 
+    int v = __builtin_bit_cast(int, var);
+    switch(mask)
+    {
+    case 1:
+        return __builtin_bit_cast(T, __builtin_amdgcn_mov_dpp(v, 0xb1, 0xf, 0xf, true));
+    case 2:
+        return __builtin_bit_cast(T, __builtin_amdgcn_mov_dpp(v, 0x4e, 0xf, 0xf, true));
+    case 4:
+    {
+        int r = __builtin_amdgcn_update_dpp(v, v, 0x104, 0xf, 0x5, true);
+        r     = __builtin_amdgcn_update_dpp(r, v, 0x114, 0xf, 0xa, true);
+        return __builtin_bit_cast(T, r);
+    }
+    case 8:
+    {
+        int r = __builtin_amdgcn_update_dpp(v, v, 0x108, 0xf, 0x3, true);
+        r     = __builtin_amdgcn_update_dpp(r, v, 0x118, 0xf, 0xc, true);
+        return __builtin_bit_cast(T, r);
+    }
+    default:
+        break;
+    }
+    // fallback
     int self = opus::lane_id();
     int index = (self & ~(width - 1)) + ((self ^ mask) & (width - 1));
-    return __builtin_bit_cast(T, __builtin_amdgcn_ds_bpermute(index << 2, __builtin_bit_cast(int, var)));
+    return __builtin_bit_cast(T, __builtin_amdgcn_ds_bpermute(index << 2, v));
 }
 
 // shfl_xor support 4bytes dtype only
