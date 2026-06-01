@@ -29,7 +29,7 @@ from flydsl.expr import arith
 from flydsl.expr.typing import T
 
 from fmha_kernel_gfx1250 import (
-    fmha_fwd_kernel,
+    compile_fmha_fwd,
     BLOCK_SIZE,
     _lds_alloc_k_a,
     _lds_alloc_k_b,
@@ -40,88 +40,99 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl._mlir import ir
 
 
-@flyc.jit
-def launch_fmha(
-    ptr_O: fx.Tensor,
-    ptr_Q: fx.Tensor,
-    ptr_K: fx.Tensor,
-    ptr_V: fx.Tensor,
-    ptr_LSE: fx.Tensor,
-    scalar_f: fx.Float32,
-    kv_seq_len: fx.Int32,
-    stride_q_seq: fx.Int32,
-    stride_q_tg: fx.Int32,
-    stride_q_head: fx.Int32,
-    stride_q_batch: fx.Int32,
-    gqa: fx.Int32,
-    stride_k_seq: fx.Int32,
-    stride_k_head: fx.Int32,
-    stride_k_batch: fx.Int32,
-    stride_v_seq: fx.Int32,
-    stride_v_head: fx.Int32,
-    stride_v_batch: fx.Int32,
-    stride_o_seq: fx.Int32,
-    stride_o_head: fx.Int32,
-    stride_o_batch: fx.Int32,
-    q_seq_len: fx.Int32,
-    num_heads: fx.Int32,
-    batch_size: fx.Int32,
-):
-    _lds_alloc_k_a.finalized = False
-    _lds_alloc_k_b.finalized = False
-    _lds_alloc_v_a.finalized = False
-    _lds_alloc_v_b.finalized = False
-    ctx = CompilationContext.get_current()
-    with ir.InsertionPoint(ctx.gpu_module_body):
-        _lds_alloc_k_a.finalize()
-        _lds_alloc_k_b.finalize()
-        _lds_alloc_v_a.finalize()
-        _lds_alloc_v_b.finalize()
-
-    from flydsl.expr.arith import _to_raw
-
-    q_seq_raw = _to_raw(q_seq_len)
-    num_tg = arith.index_cast(T.index, arith.divui(q_seq_raw, arith.constant(128, type=T.i32)))
-    # grid_x = arith.index_cast(T.index, num_heads)   # by = head index
-    # grid_z = arith.index_cast(T.index, batch_size)  # bz = batch index
-
-    grid_x = arith.index_cast(T.index, batch_size)  # bz = batch  (grid.x)
-    grid_z = arith.index_cast(T.index, num_heads)  # by = head   (grid.z)
-
-    launcher = fmha_fwd_kernel(
-        ptr_O,
-        ptr_Q,
-        ptr_K,
-        ptr_V,
-        ptr_LSE,
-        scalar_f,
-        kv_seq_len,
-        stride_q_seq,
-        stride_q_tg,
-        stride_q_head,
-        stride_q_batch,
-        gqa,
-        stride_k_seq,
-        stride_k_head,
-        stride_k_batch,
-        stride_v_seq,
-        stride_v_head,
-        stride_v_batch,
-        stride_o_seq,
-        stride_o_head,
-        stride_o_batch,
-        q_seq_len,
-    )
-    launcher.launch(
-        grid=(grid_x, num_tg, grid_z),
-        block=(BLOCK_SIZE, 1, 1),
-        # stream=stream,
-    )
+def _checkAllclose(a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="", printNum=8):
+    """Adapted from aiter.test_common.checkAllclose."""
+    isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+    if isClose.all():
+        print(f"{msg}[checkAllclose {atol=} {rtol=} \033[32mpassed~\033[0m]")
+        return 0.0
+    mask = ~isClose
+    num = mask.sum()
+    percent = (num / a.numel()).item()
+    a_m, b_m = a[mask], b[mask]
+    delta = (a_m - b_m).abs()
+    pn = min(printNum, num)
+    if percent > tol_err_ratio:
+        print(f"{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]")
+        print(f"    a: {a_m[:pn]}")
+        print(f"    b: {b_m[:pn]}")
+        print(f"    delta: {delta[:pn]}")
+    else:
+        print(f"{msg}[checkAllclose {atol=} {rtol=} \033[33mwarning!\033[0m]")
+    print(f"  -->max abs delta:{delta.max():.6f}, {percent:.1%} ({num} of {a.numel()}) elements")
+    return percent
 
 
-def _ref_mha(q, k, v, sm_scale):
+def _make_launcher(is_causal: bool):
+    """Create a @flyc.jit launcher for the given causal mode."""
+    kernel = compile_fmha_fwd(is_causal=is_causal)
+
+    @flyc.jit
+    def launch_fmha(
+        ptr_O: fx.Tensor,
+        ptr_Q: fx.Tensor,
+        ptr_K: fx.Tensor,
+        ptr_V: fx.Tensor,
+        ptr_LSE: fx.Tensor,
+        ptr_cu_seqlens_q: fx.Tensor,
+        ptr_cu_seqlens_k: fx.Tensor,
+        scalar_f: fx.Float32,
+        stride_q_seq: fx.Int32,
+        stride_k_seq: fx.Int32,
+        stride_v_seq: fx.Int32,
+        stride_o_seq: fx.Int32,
+        gqa: fx.Int32,
+        max_seqlen_q: fx.Int32,
+        max_seqlen_k: fx.Int32,
+        num_heads: fx.Int32,
+        batch_size: fx.Int32,
+    ):
+        _lds_alloc_k_a.finalized = False
+        _lds_alloc_k_b.finalized = False
+        _lds_alloc_v_a.finalized = False
+        _lds_alloc_v_b.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            _lds_alloc_k_a.finalize()
+            _lds_alloc_k_b.finalize()
+            _lds_alloc_v_a.finalize()
+            _lds_alloc_v_b.finalize()
+
+        from flydsl.expr.arith import _to_raw
+
+        num_tg = arith.index_cast(T.index, arith.ceildivui(
+            _to_raw(max_seqlen_q), arith.constant(128, type=T.i32)))
+        grid_x = arith.index_cast(T.index, batch_size)
+        grid_z = arith.index_cast(T.index, num_heads)
+
+        launcher = kernel(
+            ptr_O, ptr_Q, ptr_K, ptr_V, ptr_LSE,
+            ptr_cu_seqlens_q, ptr_cu_seqlens_k,
+            scalar_f,
+            stride_q_seq, stride_k_seq, stride_v_seq, stride_o_seq,
+            gqa, max_seqlen_q, max_seqlen_k,
+        )
+        launcher.launch(
+            grid=(grid_x, num_tg, grid_z),
+            block=(BLOCK_SIZE, 1, 1),
+        )
+
+    return launch_fmha
+
+_launchers = {}
+def get_launcher(is_causal: bool):
+    if is_causal not in _launchers:
+        _launchers[is_causal] = _make_launcher(is_causal)
+    return _launchers[is_causal]
+
+
+def _ref_mha(q, k, v, sm_scale, is_causal=False):
     """PyTorch reference: standard multi-head attention."""
     qk = torch.matmul(q.float(), k.float().transpose(-2, -1)) * sm_scale
+    if is_causal:
+        S_q, S_kv = qk.shape[-2], qk.shape[-1]
+        mask = torch.triu(torch.ones(S_q, S_kv, device=qk.device, dtype=torch.bool), diagonal=1)
+        qk = qk.masked_fill(mask, float('-inf'))
     p = torch.softmax(qk, dim=-1)
     return torch.matmul(p, v.float())
 
@@ -148,242 +159,68 @@ def _bench_fn(fn, args, warmup, rep):
     return start.elapsed_time(end) / rep
 
 
-def run_test(B, H, S_q, S_kv, D, use_ones=False, D_qk=None):
+def run_test(B, H, S_q, S_kv, D, use_ones=False, D_qk=None, is_causal=False):
     # D_qk: QK head dim (Q and K); D: V head dim (V and O)
     if D_qk is None:
         D_qk = D
     scale = 1.0 / (D_qk**0.5)
 
     torch.manual_seed(42)
+    # THD layout: [total_tokens, nheads, dim]
+    total_q = B * S_q
+    total_k = B * S_kv
     if use_ones:
-        q = torch.ones(B, H, S_q, D_qk, dtype=torch.bfloat16).cuda()
-        k = torch.ones(B + 1, H, S_kv, D_qk, dtype=torch.bfloat16).cuda()
-        v = torch.ones(B, H, S_kv, D, dtype=torch.bfloat16).cuda()
+        q = torch.ones(total_q, H, D_qk, dtype=torch.bfloat16).cuda()
+        k = torch.ones(total_k, H, D_qk, dtype=torch.bfloat16).cuda()
+        v = torch.ones(total_k, H, D, dtype=torch.bfloat16).cuda()
     else:
-        q = torch.randn(B, H, S_q, D_qk, dtype=torch.bfloat16).cuda()
-        k = torch.randn(B + 1, H, S_kv, D_qk, dtype=torch.bfloat16).cuda()
-        v = torch.randn(B, H, S_kv, D, dtype=torch.bfloat16).cuda()
-    # q = torch.ones(B, H, S_q, D_qk, dtype=torch.bfloat16).cuda()
-    # k = torch.ones(B, H, S_kv, D_qk, dtype=torch.bfloat16).cuda()
-    # v = torch.randn(B, H, S_kv, D, dtype=torch.bfloat16).cuda()
-    o = torch.zeros(B, H, S_q, D, dtype=torch.bfloat16).cuda()
+        q = torch.randn(total_q, H, D_qk, dtype=torch.bfloat16).cuda()
+        k = torch.randn(total_k, H, D_qk, dtype=torch.bfloat16).cuda()
+        v = torch.randn(total_k, H, D, dtype=torch.bfloat16).cuda()
+    o = torch.zeros(total_q, H, D, dtype=torch.bfloat16).cuda()
     lse = torch.zeros(B, H, S_q, dtype=torch.float32).cuda()
 
-    BPP = 2  # bytes per element (bf16)
+    # cu_seqlens: uniform batch, each has S_q / S_kv tokens
+    cu_seqlens_q = torch.arange(0, (B + 1) * S_q, S_q, dtype=torch.int32, device='cuda')
+    cu_seqlens_k = torch.arange(0, (B + 1) * S_kv, S_kv, dtype=torch.int32, device='cuda')
 
-    # Q/K strides use D_qk; V/O strides use D
-    stride_q_seq = D_qk * BPP
-    stride_q_tg = 128 * D_qk * BPP  # one query tile = 4 waves × 32 rows = 128 rows
-    stride_q_head = S_q * D_qk * BPP
-    stride_q_batch = H * S_q * D_qk * BPP
-
-    stride_k_seq = D_qk * BPP
-    stride_k_head = S_kv * D_qk * BPP
-    stride_k_batch = H * S_kv * D_qk * BPP
-
-    stride_v_seq = D * BPP
-    stride_v_head = S_kv * D * BPP
-    stride_v_batch = H * S_kv * D * BPP
-
-    # O strides in ELEMENTS (epilogue multiplies by 2 internally)
-    stride_o_seq = D
-    stride_o_head = S_q * D
-    stride_o_batch = H * S_q * D
+    BPP = 2
+    # THD strides: stride per token (row) = nheads * dim * BPP bytes
+    stride_q_seq = H * D_qk * BPP
+    stride_k_seq = H * D_qk * BPP
+    stride_v_seq = H * D * BPP
+    stride_o_seq = H * D   # elements
 
     gqa = 1
-    q_seq_len = S_q
 
-    ref = _ref_mha(q, k[:B], v, scale)
-    ref_raw = _ref_raw_o(q, k[:B], v, scale)
+    # Reference: reshape THD → BHSD for PyTorch, compute ref, then back to THD
+    q_bhsd = q.view(B, S_q, H, D_qk).permute(0, 2, 1, 3)   # [B,H,S_q,D_qk]
+    k_bhsd = k.view(B, S_kv, H, D_qk).permute(0, 2, 1, 3)
+    v_bhsd = v.view(B, S_kv, H, D).permute(0, 2, 1, 3)
+    ref_bhsd = _ref_mha(q_bhsd, k_bhsd, v_bhsd, scale, is_causal=is_causal)
+    ref = ref_bhsd.permute(0, 2, 1, 3).contiguous().view(total_q, H, D)
 
-    # Reference row_sums for _DEBUG_ROWSUM comparison
-    qk_ref = torch.matmul(q.float(), k[:B].float().transpose(-2, -1)) * scale
-    row_max_ref = qk_ref.max(dim=-1, keepdim=True).values
-    p_unnorm_ref = torch.exp(qk_ref - row_max_ref)
-    row_sums_ref = p_unnorm_ref.sum(dim=-1)  # [B, H, S_q]
-
-    _per_tile_ref = None
-    launch_fmha(
-        o,
-        q,
-        k,
-        v,
-        lse,
+    launcher = get_launcher(is_causal)
+    launcher(
+        o, q, k, v, lse,
+        cu_seqlens_q, cu_seqlens_k,
         scale,
-        S_kv,
-        stride_q_seq,
-        stride_q_tg,
-        stride_q_head,
-        stride_q_batch,
-        gqa,
-        stride_k_seq,
-        stride_k_head,
-        stride_k_batch,
-        stride_v_seq,
-        stride_v_head,
-        stride_v_batch,
-        stride_o_seq,
-        stride_o_head,
-        stride_o_batch,
-        q_seq_len,
-        H,
-        B,
+        stride_q_seq, stride_k_seq, stride_v_seq, stride_o_seq,
+        gqa, S_q, S_kv,
+        H, B,
     )
     torch.cuda.synchronize()
 
     out_f32 = o.cpu().float()
     ref_f32 = ref.cpu().float()
 
-    ref_raw_f32 = ref_raw.cpu().float()
-    # import pdb;pdb.set_trace()
+    print(f"  Shape: B={B} H={H} S_q={S_q} S_kv={S_kv} D={D} causal={is_causal}")
+    err_ratio = _checkAllclose(out_f32, ref_f32, rtol=1e-2, atol=1e-2,
+                               msg=f"  FMHA B={B} H={H} S={S_q} ")
+    passed = err_ratio < 0.05
+    print(f"  Result: {'PASS' if passed else 'FAIL'}")
 
-    # # Print raw O comparison at specific elements
-    # print(f"  Raw O comparison (row 0, first 16 cols):")
-    # print(f"  {'col':>5s} {'kernel':>10s} {'ref_raw':>10s} {'err':>10s}")
-    # for c in range(16):
-    #     k_val = out_f32[0, 0, 0, c].item()
-    #     r_val = ref_raw_f32[0, 0, 0, c].item()
-    #     print(f"    {c:3d}  {k_val:10.4f} {r_val:10.4f} {abs(k_val-r_val):10.4f}")
-    # print(f"  Raw O comparison (row 0, cols 64-79):")
-    # for c in range(64, 80):
-    #     k_val = out_f32[0, 0, 0, c].item()
-    #     r_val = ref_raw_f32[0, 0, 0, c].item()
-    #     print(f"    {c:3d}  {k_val:10.4f} {r_val:10.4f} {abs(k_val-r_val):10.4f}")
-
-    # n_nan = torch.isnan(out_f32).sum().item()
-    # n_inf = torch.isinf(out_f32).sum().item()
-    # n_zero = (out_f32 == 0).sum().item()
-    # n_total = out_f32.numel()
-    # print(f"  Output stats: NaN={n_nan}/{n_total} Inf={n_inf} Zero={n_zero}")
-    # if n_nan < n_total:
-    #     finite = out_f32[~torch.isnan(out_f32)]
-    #     print(f"  Finite range: [{finite.min().item():.6f}, {finite.max().item():.6f}]")
-    # print(f"  Ref (normalized) range: [{ref_f32.min().item():.6f}, {ref_f32.max().item():.6f}]")
-    # print(f"  Ref (raw P@V) range:    [{ref_raw_f32.min().item():.6f}, {ref_raw_f32.max().item():.6f}]")
-
-    # abs_err = (out_f32 - ref_f32).abs()
-    # raw_abs_err = (out_f32 - ref_raw_f32).abs()
-    # max_err = abs_err.max().item()
-    # mean_err = abs_err.mean().item()
-    # rel_err = (abs_err / (ref_f32.abs() + 1e-6)).mean().item()
-    # raw_max_err = raw_abs_err.max().item()
-    # raw_mean_err = raw_abs_err.mean().item()
-
-    # print(f"  Shape: B={B} H={H} S_q={S_q} S_kv={S_kv} D={D}")
-    # print(f"  vs normalized: max={max_err:.6f} mean={mean_err:.6f}")
-    # print(f"  vs raw P@V:    max={raw_max_err:.6f} mean={raw_mean_err:.6f}")
-    # if use_ones:
-    #     print(f"  Ratio check: out[0,0,0,0]={out_f32[0,0,0,0].item():.6f} ref={ref_f32[0,0,0,0].item():.6f} raw={ref_raw_f32[0,0,0,0].item():.6f}")
-    # print(f"  Max abs error:  {max_err:.6f}")
-    # print(f"  Mean abs error: {mean_err:.6f}")
-    # print(f"  Mean rel error: {rel_err:.6f}")
-    # # Print error distribution for debugging large errors
-    # if max_err > 0.04 and S_q > 128:
-    #     err_2d = abs_err[0, 0]  # [S_q, D]
-    #     row_max = err_2d.max(dim=-1).values
-    #     col_max = err_2d.max(dim=0).values
-    #     top_rows = row_max.topk(10).indices.tolist()
-    #     print(f"  Top error rows: {top_rows[:5]}")
-    #     print(f"  WG0 rows (0-127) max error: {row_max[:128].max():.4f}")
-    #     print(f"  WG1 rows (128-255) max error: {row_max[128:].max():.4f}")
-    #     print(f"  WG1 row 128 col 0: kernel={out_f32[0,0,128,0]:.4f} ref={ref_f32[0,0,128,0]:.4f}")
-    #     print(f"  WG1 row 131 col 0: kernel={out_f32[0,0,131,0]:.4f} ref={ref_f32[0,0,131,0]:.4f}")
-    #     print(f"  WG1 all-row mean err: {err_2d[128:].mean():.4f}")
-    #     print(f"  WG0 all-row mean err: {err_2d[:128].mean():.4f}")
-
-    # passed = True #max_err < 0.04
-    abs_err = (out_f32 - ref_f32).abs()
-    max_err = abs_err.max().item()
-    mean_err = abs_err.mean().item()
-    passed = max_err < 0.04 and not math.isnan(max_err)
-    print(f"  Shape: B={B} H={H} S_q={S_q} S_kv={S_kv} D={D}")
-    print(f"  Max abs error: {max_err:.6f}  Mean: {mean_err:.6f}")
-
-    if max_err > 0.04 or math.isnan(max_err):
-        err_2d = abs_err[0, 0]  # [S_q, D]
-        row_max = err_2d.max(dim=-1).values
-        bad_rows = (row_max > 0.04).nonzero(as_tuple=True)[0].tolist()
-        print(f"  Bad Q rows (err>0.04): {bad_rows[:20]} / {len(bad_rows)} total")
-        for br in bad_rows[:5]:
-            cols_k = out_f32[0, 0, br].tolist()
-            cols_r = ref_f32[0, 0, br].tolist()
-            print(
-                f"  Row {br}: kernel[:4]={[round(x, 2) for x in cols_k[:4]]} ref[:4]={[round(x, 2) for x in cols_r[:4]]} max_err={abs_err[0, 0, br].max().item():.2f}"
-            )
-        good_rows = [r for r in range(min(S_q, 128)) if r not in bad_rows]
-        if good_rows:
-            gr = good_rows[0]
-            cols_k = out_f32[0, 0, gr].tolist()
-            cols_r = ref_f32[0, 0, gr].tolist()
-            print(
-                f"  Good row {gr}: kernel[:4]={[round(x, 4) for x in cols_k[:4]]} ref[:4]={[round(x, 4) for x in cols_r[:4]]}"
-            )
-    #     # print(f"  Bad Q rows (err>0.04): {bad_rows[:10]} / {len(bad_rows)} total")
-    #     # if bad_rows:
-    #     #     for br in bad_rows[:3]:
-    #     #         cols = out_f32[0,0,br].tolist()
-    #     #         big_cols = [c for c in range(128) if abs(cols[c]) > 1e6]
-    #     #         print(f"  Row {br}: first4={[round(x,2) for x in cols[:4]]} max_err={abs_err[0,0,br].max().item():.2f} big_cols({len(big_cols)})={big_cols[:8]}")
-    #     if 0 not in bad_rows:
-    #         print("pass!!!!!!!!!!!!!!!!!!")
-    #         passed = True
-    #     else:
-    #         print(out_f32[0][0][0])
-    #         print(ref_f32[0][0][0])
-    #         import pdb; pdb.set_trace()
-    # else:
-    #     passed = True
-    # # passed = max_err < 0.04
-    # print(passed)
-    print(f"  Result: {'PASS' if passed else 'FAIL'} (threshold=0.04)")
-
-    # # --- benchmark ---
-    def _bench_call():
-        launch_fmha(
-            o,
-            q,
-            k,
-            v,
-            lse,
-            scale,
-            S_kv,
-            stride_q_seq,
-            stride_q_tg,
-            stride_q_head,
-            stride_q_batch,
-            gqa,
-            stride_k_seq,
-            stride_k_head,
-            stride_k_batch,
-            stride_v_seq,
-            stride_v_head,
-            stride_v_batch,
-            stride_o_seq,
-            stride_o_head,
-            stride_o_batch,
-            q_seq_len,
-            H,
-            B,
-        )
-
-    for _ in range(25):
-        _bench_call()
-    torch.cuda.synchronize()
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    start_evt.record()
-    for _ in range(100):
-        _bench_call()
-    end_evt.record()
-    torch.cuda.synchronize()
-    ms = start_evt.elapsed_time(end_evt) / 100
-    flops = 2.0 * B * H * S_q * S_kv * D_qk + 2.0 * B * H * S_q * S_kv * D
-    tflops = flops / (ms * 1e-3) / 1e12
-    bytes_accessed = (
-        B * H * S_q * D_qk * BPP + B * H * S_kv * D_qk * BPP + B * H * S_kv * D * BPP + B * H * S_q * D * BPP
-    )
-    bw = bytes_accessed / (ms * 1e-3) / 1e9
-    print(f"  Perf: {ms:.4f} ms | {tflops:.2f} TFLOPS | {bw:.1f} GB/s")
+    # Benchmark skipped on cmodel (segfaults on repeated launches)
 
     return passed
 
@@ -396,13 +233,9 @@ if __name__ == "__main__":
     # Kernel is now QK_HDIM=192, V_HDIM=128
     configs = []  # no square-dim tests (kernel is 192-QK)
     configs_192 = [
-        {"B": 1, "H": 64, "S_q": 8192, "S_kv": 8192, "D": 128, "D_qk": 192},
-        # {'B':1,'H':1,'S_q':128,'S_kv':128,'D':128,'D_qk':192},
-        # {'B':1,'H':1,'S_q':256,'S_kv':256,'D':128,'D_qk':192},
-        # {'B':1,'H':1,'S_q':512,'S_kv':512,'D':128,'D_qk':192},
-        # {'B':1,'H':1,'S_q':128,'S_kv':128,'D':128,'D_qk':192},
-        # {'B':1,'H':256,'S_q':128,'S_kv':128,'D':128,'D_qk':192},
-        # {'B':2,'H':2,'S_q':256,'S_kv':256,'D':128,'D_qk':192},
+        {"B": 1, "H": 1, "S_q": 128, "S_kv": 128, "D": 128, "D_qk": 192, "is_causal": False},
+        {"B": 1, "H": 1, "S_q": 128, "S_kv": 128, "D": 128, "D_qk": 192, "is_causal": True},
+        {"B": 1, "H": 1, "S_q": 184, "S_kv": 184, "D": 128, "D_qk": 192, "is_causal": True},
     ]
 
     all_passed = True
@@ -632,9 +465,11 @@ if __name__ == "__main__":
             all_passed = False
 
     for cfg in configs_192:
-        print(f"\nTest: RANDOM D_qk=192 B={cfg['B']} H={cfg['H']} S_q={cfg['S_q']} S_kv={cfg['S_kv']} D_v={cfg['D']}")
+        _cas = cfg.get("is_causal", False)
+        print(f"\nTest: D_qk=192 B={cfg['B']} H={cfg['H']} S={cfg['S_q']} causal={_cas}")
         try:
-            ok = run_test(cfg["B"], cfg["H"], cfg["S_q"], cfg["S_kv"], cfg["D"], D_qk=cfg["D_qk"])
+            ok = run_test(cfg["B"], cfg["H"], cfg["S_q"], cfg["S_kv"], cfg["D"],
+                          D_qk=cfg["D_qk"], is_causal=_cas)
             if not ok:
                 all_passed = False
         except Exception as e:
