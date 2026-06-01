@@ -27,7 +27,7 @@ fp8bf16,128,128,0,0,1,0,256,64,_ZN5aiter18fmha_fwd_hd128_fp8E,fwd_hd128_fp8.co
 fp8bf16,128,128,2,0,1,0,256,64,_ZN5aiter25fmha_fwd_hd128_fp8_causalE,fwd_hd128_fp8_causal.co
 fp8bf16,128,128,0,1,1,0,256,64,_ZN5aiter24fmha_fwd_hd128_fp8_groupE,fwd_hd128_fp8_group.co
 fp8bf16,128,128,2,1,1,0,256,64,_ZN5aiter31fmha_fwd_hd128_fp8_causal_groupE,fwd_hd128_fp8_causal_group.co
-fp8bf16,128,128,0,0,1,1,256,64,_ZN5aiter29fmha_fwd_hd128_fp8_qkptph_vphE,fwd_hd128_fp8_qkptph_vph.co
-fp8bf16,128,128,2,0,1,1,256,64,_ZN5aiter36fmha_fwd_hd128_fp8_causal_qkptph_vphE,fwd_hd128_fp8_causal_qkptph_vph.co
-fp8bf16,128,128,0,1,1,1,256,64,_ZN5aiter35fmha_fwd_hd128_fp8_qkptph_vph_groupE,fwd_hd128_fp8_qkptph_vph_group.co
-fp8bf16,128,128,2,1,1,1,256,64,_ZN5aiter42fmha_fwd_hd128_fp8_causal_qkptph_vph_groupE,fwd_hd128_fp8_causal_qkptph_vph_group.co
+fp8bf16,128,128,0,0,4,1,256,64,_ZN5aiter29fmha_fwd_hd128_fp8_qkptph_vphE,fwd_hd128_fp8_qkptph_vph.co
+fp8bf16,128,128,2,0,4,1,256,64,_ZN5aiter36fmha_fwd_hd128_fp8_causal_qkptph_vphE,fwd_hd128_fp8_causal_qkptph_vph.co
+fp8bf16,128,128,0,1,4,1,256,64,_ZN5aiter35fmha_fwd_hd128_fp8_qkptph_vph_groupE,fwd_hd128_fp8_qkptph_vph_group.co
+fp8bf16,128,128,2,1,4,1,256,64,_ZN5aiter42fmha_fwd_hd128_fp8_causal_qkptph_vph_groupE,fwd_hd128_fp8_causal_qkptph_vph_group.co

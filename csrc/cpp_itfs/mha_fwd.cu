@@ -106,12 +106,15 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
     args.ptr_q_descale    = nullptr;
     args.ptr_k_descale    = nullptr;
     args.ptr_v_descale    = nullptr;
+    args.ptr_p_scale      = nullptr;
     args.s_descale_q_Bs   = 0;
     args.s_descale_q_Hs   = 0;
     args.s_descale_k_Bs   = 0;
     args.s_descale_k_Hs   = 0;
     args.s_descale_v_Bs   = 0;
     args.s_descale_v_Hs   = 0;
+    args.s_p_scale_Bs     = 0;
+    args.s_p_scale_Hs     = 0;
 
     int in_bpe = 2;
     int out_bpe = 2;
@@ -127,6 +130,9 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
         args.s_descale_k_Hs = a.nhead_stride_k_descale * 4;
         args.s_descale_v_Bs = a.batch_stride_v_descale * 4;
         args.s_descale_v_Hs = a.nhead_stride_v_descale * 4;
+        args.ptr_p_scale    = a.p_scale_ptr;
+        args.s_p_scale_Bs   = a.batch_stride_p_scale * 4;
+        args.s_p_scale_Hs   = a.nhead_stride_p_scale * 4;
     }
 
     args.scalar           = a.scale_s;

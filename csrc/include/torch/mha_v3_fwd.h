@@ -22,6 +22,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                     std::optional<const at::Tensor> q_descale,    // [1] or [b, h_k]
                                     std::optional<const at::Tensor> k_descale,    // [1] or [b, h_k]
                                     std::optional<const at::Tensor> v_descale,    // [1] or [b, h_k]
+                                    std::optional<const at::Tensor> p_scale,
                                     std::optional<at::Generator> gen_);
 } // namespace torch_itfs
 } // namespace aiter
