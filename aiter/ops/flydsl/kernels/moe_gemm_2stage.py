@@ -58,6 +58,7 @@ from .mfma_preshuffle_pipeline import (
     load_b_raw_w4a16_groupwise,
     extract_bf16_scale,
     unpack_b_mxfp4_bf16,
+    load_b_raw_mxfp4_dwordx4,
     tile_chunk_coord_i32,
     swizzle_xor16,
     crd2idx,
@@ -834,7 +835,7 @@ def compile_moe_gemm1(
                             )
 
                 m_repeat = tile_m // 16
-                k_unroll = tile_k_bytes // 64  # K64-byte micro-step (2x MFMA)
+                k_unroll = tile_k_bytes // 64  # K64-byte micro-step (2x MFMA on gfx942, 1x K32 on gfx950)
 
                 # --- B Load Logic (K64) - shared layout with preshuffle GEMM ---
                 def load_b_pack(base_k, ki_step, ni, blk_list, intra_list):
