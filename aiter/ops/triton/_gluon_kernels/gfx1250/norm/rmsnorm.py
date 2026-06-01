@@ -1,7 +1,7 @@
-# Quant-free fused RMSNorm (and RMS+residual-add) gluon kernel for gfx1250.
-# Mirrors the TDM load/async-wait overlap structure of
-# _gluon_fused_rms_mxfp4_quant_kernel but outputs bf16 (no MXFP4 quant),
-# for models with 16-bit activations (e.g. gpt-oss w4a16).
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+# RMSNorm + residual add.
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
