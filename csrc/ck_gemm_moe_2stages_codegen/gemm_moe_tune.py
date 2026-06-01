@@ -1928,6 +1928,34 @@ class FmoeTuner(TunerCommon):
         )
         if fmoe_func is None:
             return task_1stage
+        _sparse_keys = [
+            "input",
+            "a1_qt",
+            "w1_qt_shffle",
+            "w2_qt_shffle",
+            "sorted_ids",
+            "sorted_weights",
+            "sorted_expert_ids",
+            "num_valid_ids",
+            "a1_scale_t",
+            "w1_scale",
+            "w2_scale",
+            "fc2_smooth_scale",
+        ]
+        _flat_keys = [
+            "input",
+            "a1_qt",
+            "w1_qt_shffle",
+            "w2_qt_shffle",
+            "topk_ids",
+            "topk_weights",
+            "topk_ids",
+            "topk_ids",
+            "a1_scale_t",
+            "w1_scale",
+            "w2_scale",
+            "fc2_smooth_scale",
+        ]
         for tile_m, tile_n, smf in asm_kernels_1stage.keys():
             if inter_dim % tile_n != 0 or smf != 0:
                 continue
@@ -1935,10 +1963,7 @@ class FmoeTuner(TunerCommon):
             for el in asm_kernels_1stage.get((tile_m, tile_n, 0), []):
                 # Per-kernel ``flat`` in asm manifest (FLAT == raw topk, no host sort).
                 flat_flag = int(asm_1stage_flat.get(el, 0))
-                if flat_flag:
-                    _data_idx = [0, 1, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
-                else:
-                    _data_idx = [0, 1, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
+                data_keys = _flat_keys if flat_flag else _sparse_keys
                 task_1stage.append(
                     (
                         (info, "asm_1stage", el, tile_m, flat_flag),
@@ -1959,7 +1984,7 @@ class FmoeTuner(TunerCommon):
                         ),
                         fmoe_func,
                         (
-                            _data_idx,
+                            data_keys,
                             [
                                 "input",
                                 "a1_qt",
@@ -2052,10 +2077,8 @@ class FmoeTuner(TunerCommon):
                 for el in xbf16_kernels.get((tile_m, tile_n, 0), []):
                     # xbf16: internal quant; FLAT kernels (manifest flat=1) take raw topk.
                     flat_flag = int(xbf16_flat.get(el, 0))
-                    if flat_flag:
-                        _data_idx = [0, 0, 2, 3, 15, 14, 15, 15, 18, 10, 11, 17]
-                    else:
-                        _data_idx = [0, 0, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17]
+                    data_keys = list(_flat_keys if flat_flag else _sparse_keys)
+                    data_keys[1] = "input"
                     task_1stage.append(
                         (
                             (info, "asm_1stage_xbf16", el, tile_m, flat_flag),
@@ -2076,7 +2099,7 @@ class FmoeTuner(TunerCommon):
                             ),
                             fmoe_func,
                             (
-                                _data_idx,
+                                data_keys,
                                 [
                                     "input",
                                     "input",
@@ -3711,13 +3734,25 @@ class FmoeTuner(TunerCommon):
             )
         all_tasks = tasks + tasks_ck + task_1stage
         # Record dispatched cases
+        def _describe_task_tag(tag):
+            if isinstance(tag, tuple) and len(tag) >= 4:
+                stage = tag[1]
+                kname = tag[2]
+                blockM = tag[3]
+                extra = f" flat={tag[4]}" if len(tag) > 4 else ""
+                return stage, kname, blockM, extra
+            return "unknown", str(tag), "unknown", ""
+
         dispatched = {}
         for i, task in enumerate(all_tasks):
             tag = task[0]  # (info, stage, kname, blockM)
             dispatched[i] = tag
             if args.verbose:
-                _, stage, kname, blockM = tag
-                print(f"  [dispatch] task {i}: {stage} {kname} blockM={blockM}")
+                stage, kname, blockM, extra = _describe_task_tag(tag)
+                print(
+                    f"  [dispatch] task {i}: {stage} {kname} "
+                    f"blockM={blockM}{extra}"
+                )
 
         in_data.append((len(all_tasks), ()))
         rets = []
@@ -3744,9 +3779,12 @@ class FmoeTuner(TunerCommon):
             if failed_cases:
                 print(f"\n[tune] {len(failed_cases)} of {len(rets)} tasks failed:")
                 for i, tag, us, err in failed_cases:
-                    _, stage, kname, blockM = tag
+                    stage, kname, blockM, extra = _describe_task_tag(tag)
                     reason = "timeout/hang" if us == float("inf") else "crash/error"
-                    print(f"  task {i}: {stage} {kname} blockM={blockM} -> {reason}")
+                    print(
+                        f"  task {i}: {stage} {kname} blockM={blockM}{extra}"
+                        f" -> {reason}"
+                    )
             else:
                 print(f"\n[tune] all {len(rets)} tasks completed successfully")
 
@@ -3909,6 +3947,17 @@ class FmoeTuner(TunerCommon):
                 & (profileDF["us"] != -1)
                 & (profileDF["err"] <= args.errRatio)
             ]
+            if q_type == QuantType.per_1x128:
+                stage1_flydsl = (profileDF["stage"] == "stage1") & profileDF[
+                    "kernelName"
+                ].astype(str).str.startswith("flydsl_")
+                exact_stage1 = stage1_flydsl & (profileDF["err"] == 0)
+                if exact_stage1.any():
+                    # Stage1 writes the quantized activation consumed by stage2.
+                    # Small byte-level mismatches can pass standalone tolerance but
+                    # amplify in the fused 2-stage path, so prefer exact stage1
+                    # candidates whenever the search space contains one.
+                    profileDF = profileDF[(~stage1_flydsl) | exact_stage1]
             # Keep best non-flydsl per (stage, block_m, flat) for FLAT dedup.
             _non_flydsl = profileDF[
                 ~profileDF["kernelName"].astype(str).str.startswith("flydsl_")
