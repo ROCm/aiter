@@ -294,6 +294,10 @@ def moe_gemm_a8w4(
     num_tokens = x.shape[-2]
     M = num_tokens if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
+    # Output buffer must be sized to the PADDED N: the kernel writes full
+    # block_n columns per tile (grid_n * block_n cols total), which can exceed
+    # unpadded_N when block_n doesn't divide it evenly → OOB on the y buffer.
+    padded_N = N
     block_m = routing_data.block_m
     if unpadded_N and block_m == 16:
         N = unpadded_N
@@ -325,7 +329,7 @@ def moe_gemm_a8w4(
     # allocate output memory
     y, y_final = allocate_output(
         M,
-        N,
+        padded_N,
         out_dtype,
         reduction_n_matmul,
         reduction_n_reduction,
