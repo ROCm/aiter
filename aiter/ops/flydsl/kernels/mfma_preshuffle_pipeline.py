@@ -109,7 +109,6 @@ class PreshuffleScaleLayout:
 
 
 def make_preshuffle_scale_layout(
-    arith,
     *,
     c_mn: ir.Value,
     c_k: ir.Value,
@@ -138,11 +137,11 @@ def make_preshuffle_scale_layout(
     stride_k0 = c4 * stride_klane
     stride_n0 = c_k1 * stride_k0
 
-    c_mn1_i32 = arith.index_cast(T.i32, c_mn1)
-    c_k1_i32 = arith.index_cast(T.i32, c_k1)
-    stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
-    stride_k0_i32 = arith.index_cast(T.i32, stride_k0)
-    stride_klane_i32 = arith.index_cast(T.i32, stride_klane)
+    c_mn1_i32 = _arith.index_cast(T.i32, c_mn1)
+    c_k1_i32 = _arith.index_cast(T.i32, c_k1)
+    stride_n0_i32 = _arith.index_cast(T.i32, stride_n0)
+    stride_k0_i32 = _arith.index_cast(T.i32, stride_k0)
+    stride_klane_i32 = _arith.index_cast(T.i32, stride_klane)
 
     layout_scale = fx.make_layout(
         (c_mn1_i32, c_k1_i32, 4, 16),

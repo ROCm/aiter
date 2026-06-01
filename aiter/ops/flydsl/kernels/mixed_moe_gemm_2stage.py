@@ -476,11 +476,11 @@ def compile_mixed_moe_gemm1(
             # Same as stage2: indexed by sorted_row position, not by token_id.
             sorted_m = size_expert_ids_in * sort_block_m
             layout_a_scale = make_preshuffle_scale_layout(
-                arith, c_mn=sorted_m, c_k=fx.Index(model_dim)
+                c_mn=sorted_m, c_k=fx.Index(model_dim)
             )
             # B-scale: [E*2*inter_dim, K/32]
             layout_b_scale = make_preshuffle_scale_layout(
-                arith, c_mn=c_n_total, c_k=fx.Index(model_dim)
+                c_mn=c_n_total, c_k=fx.Index(model_dim)
             )
 
             _eff_lds_stride = lds_stride
@@ -2868,10 +2868,10 @@ def compile_mixed_moe_gemm2(
             # For fp4, k_in is already packed (inter_dim // a_elem_vec_pack), so we need original inter_dim
             c_k_orig = fx.Index(inter_dim)
             layout_a_scale = make_preshuffle_scale_layout(
-                arith, c_mn=m_in, c_k=c_k_orig
+                c_mn=m_in, c_k=c_k_orig
             )
             layout_b_scale = make_preshuffle_scale_layout(
-                arith, c_mn=c_n_total, c_k=c_k_orig
+                c_mn=c_n_total, c_k=c_k_orig
             )
 
             shape_lds = fx.make_shape(tile_m, _eff_lds_stride)
@@ -3129,7 +3129,6 @@ def compile_mixed_moe_gemm2(
                     )
                 num_x_loads = bytes_per_thread_x // x_load_bytes
                 chunk_i32 = x_load_bytes // 4  # dwords per chunk (1/2/4)
-                vec4_i32 = T.vec(4, i32)
 
                 c_k_div4 = _div_pow2(
                     _div_pow2(k_in, int(a_elem_vec_pack))
@@ -3159,12 +3158,6 @@ def compile_mixed_moe_gemm2(
                         layout_tile_div4=layout_x_tile_div4,
                         chunk_i32=chunk_i32,
                     )
-
-                vec1_i32 = T.vec(1, i32)
-                vec2_i32 = T.vec(2, i32)
-                x_load_vec_elems = (
-                    x_load_bytes if a_elem_bytes == 1 else x_load_bytes // a_elem_bytes
-                )
 
                 # decode routed token once (per thread's M-slice) and build a base offset.
                 x_row_base_div4 = []
