@@ -847,38 +847,28 @@ def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False):
         **hip_kwargs,
     )
 
-    ret = {"fuse_rmsnorm": fuse_rmsnorm}
-    ret["ref_unfused_post_mix_err"] = checkAllclose(
-        post_mix_ref, post_mix_unfused, msg="unfused/post_mix"
-    )
-    ret["ref_unfused_comb_mix_err"] = checkAllclose(
-        comb_mix_ref, comb_mix_unfused, msg="unfused/comb_mix"
-    )
-    ret["ref_unfused_layer_input_err"] = checkAllclose(
+    checkAllclose(post_mix_ref, post_mix_unfused, msg="unfused/post_mix")
+    checkAllclose(comb_mix_ref, comb_mix_unfused, msg="unfused/comb_mix")
+    hip_unfused_err = checkAllclose(
         layer_input_ref, layer_input_unfused, msg="unfused/layer_input"
     )
-    ret["ref_unfused_next_residual_err"] = checkAllclose(
-        next_residual_ref, next_residual_unfused, msg="unfused/next_residual"
-    )
-    ret["ref_fused_post_mix_err"] = checkAllclose(
-        post_mix_ref, post_mix_fused, msg="fused/post_mix"
-    )
-    ret["ref_fused_comb_mix_err"] = checkAllclose(
-        comb_mix_ref, comb_mix_fused, msg="fused/comb_mix"
-    )
-    ret["ref_fused_layer_input_err"] = checkAllclose(
+    checkAllclose(next_residual_ref, next_residual_unfused, msg="unfused/next_residual")
+    checkAllclose(post_mix_ref, post_mix_fused, msg="fused/post_mix")
+    checkAllclose(comb_mix_ref, comb_mix_fused, msg="fused/comb_mix")
+    hip_fused_err = checkAllclose(
         layer_input_ref, layer_input_fused, msg="fused/layer_input"
     )
-    ret["ref_fused_next_residual_err"] = checkAllclose(
-        next_residual_ref, next_residual_fused, msg="fused/next_residual"
-    )
+    checkAllclose(next_residual_ref, next_residual_fused, msg="fused/next_residual")
+    ret = {"fuse_rmsnorm": fuse_rmsnorm}
     ret["unfused_us"] = unfused_us
+    ret["hip_unfused_err"] = hip_unfused_err
     ret["fused_us"] = fused_us
+    ret["hip_fused_err"] = hip_fused_err
+    # print(f"next_residual_ref: {next_residual_ref}")
+    # print(f"next_residual_fused: {next_residual_fused}")
 
     run_triton = (
-        _HAS_TRITON_MHC_POST_PRE
-        and not fuse_rmsnorm
-        and m <= TRITON_MHC_POST_PRE_MAX_M
+        _HAS_TRITON_MHC_POST_PRE and not fuse_rmsnorm and m <= TRITON_MHC_POST_PRE_MAX_M
     )
     if fuse_rmsnorm:
         aiter.logger.info(
@@ -895,7 +885,8 @@ def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False):
         # phi layout (K, N) = (n*C, hc_mult3); fp32 matches HIP ``fn`` for exp-domain SK.
         phi = fn.T.contiguous()
         post_mix_2d = post_layer_mix.squeeze(-1)
-        h_post_t, h_res_t, layer_input_t, residual_out_t = triton_mhc_post_pre(
+        (h_post_t, h_res_t, layer_input_t, residual_out_t), triton_us = run_perftest(
+            triton_mhc_post_pre,
             layer_input,
             residual_in,
             post_mix_2d,
@@ -911,30 +902,17 @@ def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False):
             asymmetric_exp_domain=True,
             hc_sinkhorn_eps=extra_args["hc_sinkhorn_eps"],
         )
-        ret["triton_vs_ref_post_mix_err"] = checkAllclose(
-            post_mix_ref, h_post_t, msg="triton/post_mix"
-        )
-        ret["triton_vs_ref_comb_mix_err"] = checkAllclose(
-            comb_mix_ref, h_res_t, msg="triton/comb_mix"
-        )
-        ret["triton_vs_ref_layer_input_err"] = checkAllclose(
+        h_post_t = h_post_t.to(post_mix_ref.dtype)
+        h_res_t = h_res_t.to(comb_mix_ref.dtype)
+        layer_input_t = layer_input_t.to(layer_input_ref.dtype)
+        residual_out_t = residual_out_t.to(next_residual_ref.dtype)
+        ret["triton_us"] = triton_us
+        checkAllclose(post_mix_ref, h_post_t, msg="triton/post_mix")
+        checkAllclose(comb_mix_ref, h_res_t, msg="triton/comb_mix")
+        ret["triton_fused_err"] = checkAllclose(
             layer_input_ref, layer_input_t, msg="triton/layer_input", rtol=2e-2
         )
-        ret["triton_vs_ref_next_residual_err"] = checkAllclose(
-            next_residual_ref, residual_out_t, msg="triton/next_residual"
-        )
-        ret["triton_vs_fused_post_mix_err"] = checkAllclose(
-            post_mix_fused, h_post_t, msg="triton_vs_fused/post_mix"
-        )
-        ret["triton_vs_fused_comb_mix_err"] = checkAllclose(
-            comb_mix_fused, h_res_t, msg="triton_vs_fused/comb_mix"
-        )
-        ret["triton_vs_fused_layer_input_err"] = checkAllclose(
-            layer_input_fused, layer_input_t, msg="triton_vs_fused/layer_input", rtol=2e-2
-        )
-        ret["triton_vs_fused_next_residual_err"] = checkAllclose(
-            next_residual_fused, residual_out_t, msg="triton_vs_fused/next_residual"
-        )
+        checkAllclose(next_residual_ref, residual_out_t, msg="triton/next_residual")
     elif not _HAS_TRITON_MHC_POST_PRE:
         aiter.logger.info("skip Triton mhc_post_pre: import unavailable")
 
@@ -960,7 +938,7 @@ parser.add_argument(
     "-m",
     type=int,
     nargs="*",
-    default=[1, 32, 64, 128, 256, 512, 1024, 2048, 8192, 65536],
+    default=[1, 32, 64, 128, 256, 512, 1024, 2048, 8192],
     help="""M.
     e.g.: -m 32""",
 )
@@ -988,34 +966,34 @@ _mode_group.add_argument(
 
 args = parser.parse_args()
 
-# df = []
-# for dtype in args.dtype:
-#     for hidden_size in args.hidden_size:
-#         for m in args.m:
-#             for hc_mult in [4]:
-#                 ret = test_mhc_pre(
-#                     m=m,
-#                     hidden_size=hidden_size,
-#                     hc_mult=hc_mult,
-#                     test_hc_head=args.hc_head,
-#                     fuse_rmsnorm=args.fuse_rmsnorm,
-#                 )
-#                 df.append(ret)
-# df = pd.DataFrame(df)
-# df_md = df.to_markdown(index=False)
-# aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
+df = []
+for dtype in args.dtype:
+    for hidden_size in args.hidden_size:
+        for m in args.m:
+            for hc_mult in [4]:
+                ret = test_mhc_pre(
+                    m=m,
+                    hidden_size=hidden_size,
+                    hc_mult=hc_mult,
+                    test_hc_head=args.hc_head,
+                    fuse_rmsnorm=args.fuse_rmsnorm,
+                )
+                df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
 
 if not args.hc_head:
-    # df = []
-    # for dtype in args.dtype:
-    #     for hidden_size in args.hidden_size:
-    #         for m in args.m:
-    #             for hc_mult in [4]:
-    #                 ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
-    #                 df.append(ret)
-    # df = pd.DataFrame(df)
-    # df_md = df.to_markdown(index=False)
-    # aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
+    df = []
+    for dtype in args.dtype:
+        for hidden_size in args.hidden_size:
+            for m in args.m:
+                for hc_mult in [4]:
+                    ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
+                    df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
 
     df = []
     for dtype in args.dtype:

@@ -1651,7 +1651,7 @@ namespace aiter {
             static constexpr int threads_per_row = tile_k / x_async_load_vec;
             if(threadIdx.x < x_async_load_threads) {
                 DTYPE_I* s_x_wr_ptr = s_x + (k & 1) * tile_mk;
-                int offset_base = threadIdx.x / threads_per_row * x_stride + threadIdx.x % threads_per_row * x_async_load_vec + k_split_offset;
+                int offset_base = threadIdx.x / threads_per_row * x_stride + threadIdx.x % threads_per_row * x_async_load_vec + k_split_offset + k * tile_k;
                 static constexpr int s_offset_i = x_async_load_threads * x_async_load_vec;
                 for(int i = 0; i < x_load_waitcnt; i++) {
                     int s_offset = i * s_offset_i + threadIdx.x * x_async_load_vec;
@@ -1672,7 +1672,7 @@ namespace aiter {
             static constexpr int threads_per_row = tile_k / r_async_load_vec;
             DTYPE_I* s_residual_wr_ptr = s_residual + (k & 1) * (hc_mult * tile_mk);
             int offset_base = lane_id / threads_per_row * hc_hidden_size + warp_id * hidden_size
-                + lane_id % threads_per_row * r_async_load_vec + k_split_offset;
+                + lane_id % threads_per_row * r_async_load_vec + k_split_offset + k * tile_k;
             static constexpr int s_offset_i = warp_size * r_async_load_vec;
             int s_offset = warp_id * tile_mk + lane_id * r_async_load_vec;
             for(int i = 0; i < residual_load_waitcnt; i++) {
@@ -1686,7 +1686,7 @@ namespace aiter {
         using fp32xfntile = opus::array<fp32xtile, repeat_n>;
         auto vgpr_load_fn_tile = [&](int k) {
             fp32xfntile v_fn;
-            int offset_base = lane_id / mfma_n * fn_stride + warp_id * hidden_size + lane_id % mfma_n * vec_tile
+            int offset_base = lane_id % mfma_n * fn_stride + warp_id * hidden_size + lane_id / mfma_n * vec_tile
                 + k * tile_k + k_split_offset;
             for(int n = 0; n < repeat_n; n++) {
                 v_fn[n] = load_vector_nbytes<float, vec_tile, 16, 0, false>(g_fn, offset_base + n * mfma_n * fn_stride);
@@ -1694,11 +1694,11 @@ namespace aiter {
             return v_fn;
         };
 
-        float post_mix_v = post_layer_mix[(lane_id % tile_m + idx) * hc_mult + warp_id];
+        float post_mix_v = lane_id % tile_m < m_oob ? post_layer_mix[(lane_id % tile_m + idx) * hc_mult + warp_id] : 0.0f;
         using float_hc_mult = opus::vector_t<float, hc_mult>;
         float_hc_mult comb_mix;
         for(int h = 0; h < hc_mult; h++) {
-            comb_mix[h] = comb_res_mix[(lane_id % tile_m + idx) * hc_mult2 + h * hc_mult + warp_id];
+            comb_mix[h] = lane_id % tile_m < m_oob ? comb_res_mix[(lane_id % tile_m + idx) * hc_mult2 + h * hc_mult + warp_id] : 0.0f;
         }
 
         const int k_loop = hidden_size / (split_k * tile_k);
@@ -1724,7 +1724,7 @@ namespace aiter {
             DTYPE_I* s_x_rd_ptr = s_x + (i & 1) * tile_mk;
             DTYPE_I* s_residual_rd_ptr = s_residual + (i & 1) * (hc_mult * tile_mk);
             static constexpr int ds_read_vec = 16 / sizeof(DTYPE_I);
-            static constexpr int step = ds_read_vec * warp_size / mfma_m;
+            static constexpr int step = ds_read_vec;
             int s_offset = lane_id % mfma_m * tile_k + lane_id / mfma_m * vec_tile;
             for(int j = 0; j < tile_mk / (warp_size * ds_read_vec); j++) {
                 opus::vector_t<float, ds_read_vec> res;
@@ -1734,7 +1734,7 @@ namespace aiter {
                 for(int h = 0; h < hc_mult; h++) {
                     residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset + h * tile_mk));
                 }
-                opus::s_waitcnt_lgkmcnt(opus::number<hc_mult>{});
+                opus::s_waitcnt_lgkmcnt(opus::number<0>{});
                 for(int k = 0; k < ds_read_vec; k++) {
                     res[k] = static_cast<float>(x_vec[k]) * post_mix_v;
                 }
@@ -1748,20 +1748,20 @@ namespace aiter {
                         sqrsum_part += res[t] * res[t];
                     }
                 }
-                store_vector<DTYPE_I, float, ds_read_vec, store_policy>(
-                    g_nres, res, warp_id * hidden_size + i * tile_k + s_offset % tile_k + k_split_offset);
+                store_vector<DTYPE_I, float, ds_read_vec, store_policy, false>(
+                    g_nres, res, (lane_id % mfma_m) * residual_stride + warp_id * hidden_size + i * tile_k + 
+                    (s_offset % tile_k) + k_split_offset);
                 s_offset += step;
                 for(int n = 0; n < repeat_n; n++) {
                     for(int k = 0; k < ds_read_vec; k++) {
                         v_cf[n] = __builtin_amdgcn_mfma_f32_16x16x4f32(
-                            v_fn[n][k], res[k], v_cf[n], 0, 0, 0);
+                            v_fn[n][k + j * ds_read_vec], res[k], v_cf[n], 0, 0, 0);
                     }
                 }
             }
         };
 
-        int i = 0;
-        for(; i + 3 < k_loop ; i += 2) {
+        auto wait_load_cnt = [&]() {
             if(threadIdx.x < x_async_load_threads) {
                 opus::s_waitcnt_vmcnt(opus::number<x_load_waitcnt + residual_load_waitcnt + fn_load_waitcnt*2>{});
             }
@@ -1775,40 +1775,48 @@ namespace aiter {
             else {
                 opus::s_waitcnt_vmcnt(opus::number<residual_load_waitcnt + fn_load_waitcnt>{});
             }
+        };
+
+        int i = 0;
+        for(; i + 3 < k_loop ; i += 2) {
+            wait_load_cnt();
             compute_store_tile(i, v_fn0);
+            __builtin_amdgcn_s_barrier();
             lds_load_x_tile(i + 2);
             lds_load_residual_tile(i + 2);
             v_fn0 = vgpr_load_fn_tile(i + 2);
             __builtin_amdgcn_sched_barrier(0);
-            if(threadIdx.x < x_async_load_threads) {
-                opus::s_waitcnt_vmcnt(opus::number<x_load_waitcnt + residual_load_waitcnt + fn_load_waitcnt*2>{});
-            }
-            else {
-                opus::s_waitcnt_vmcnt(opus::number<residual_load_waitcnt + fn_load_waitcnt*2>{});
-            }
-            __builtin_amdgcn_s_barrier();
-            if(threadIdx.x < x_async_load_threads) {
-                opus::s_waitcnt_vmcnt(opus::number<x_load_waitcnt + residual_load_waitcnt + fn_load_waitcnt>{});
-            }
-            else {
-                opus::s_waitcnt_vmcnt(opus::number<residual_load_waitcnt + fn_load_waitcnt>{});
-            }
+            wait_load_cnt();
             compute_store_tile(i + 1, v_fn1);
+            __builtin_amdgcn_s_barrier();
             lds_load_x_tile(i + 3);
             lds_load_residual_tile(i + 3);
             v_fn1 = vgpr_load_fn_tile(i + 3);
         }
 
         if (i + 1 < k_loop) {
+            wait_load_cnt();
             compute_store_tile(i, v_fn0);
             if (i + 2 < k_loop) {
+                __builtin_amdgcn_s_barrier();
+                lds_load_x_tile(i + 2);
+                lds_load_residual_tile(i + 2);
                 v_fn0 = vgpr_load_fn_tile(i + 2);
+                wait_load_cnt();
+            }
+            else {
+                opus::s_waitcnt_vmcnt(opus::number<0>{});
+                __builtin_amdgcn_s_barrier();
             }
             compute_store_tile(i + 1, v_fn1);
             if (i + 2 < k_loop) {
+                opus::s_waitcnt_vmcnt(opus::number<0>{});
+                __builtin_amdgcn_s_barrier();
                 compute_store_tile(i + 2, v_fn0);
             }
         } else if (i < k_loop) {
+            opus::s_waitcnt_vmcnt(opus::number<0>{});
+            __builtin_amdgcn_s_barrier();
             compute_store_tile(i, v_fn0);
         }
 
