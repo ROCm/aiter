@@ -2,6 +2,7 @@ import warnings
 import torch
 import triton
 import triton.language as tl
+from triton import knobs
 from typing import Literal, Optional
 from .common import compute_alibi_block, compute_fp8_scaling_factors, apply_rotary
 from .utils import (
@@ -13,6 +14,15 @@ from .utils import (
     is_fp8,
     remap_xcd,
 )
+
+# gfx1151 (Strix Halo / RDNA3.5): enable Triton's in-thread transpose for the
+# prefill FMHA kernels. It is only enabled by default for gfx1151 on Triton's
+# main branch (the upcoming 3.8); the Triton version in use here still gates it
+# to gfx942, so enable it explicitly. It is a consistent win (e.g. ~11% faster
+# on ViT-style d=72, sq=sk>=3200 shapes). Only set it when the user has not made
+# an explicit choice via TRITON_HIP_USE_IN_THREAD_TRANSPOSE.
+if knobs.amd.use_in_thread_transpose is None and get_arch().name == "gfx1151":
+    knobs.amd.use_in_thread_transpose = True
 
 FWD_PREFILL_AUTOTUNE_KEYS = [
     "IS_CAUSAL",
