@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-
 """gfx1250 MoE 2-stage mxscale kernels (fp4/fp8/a8w4).
 
 Implements stage1/stage2 single-kernel inline paths using the
@@ -66,14 +65,7 @@ def _compile_stage1_mxscale_kernel_impl(
     cluster_m: int = 1,
     cluster_n: int = 1,
     k_batch: int = 1,
-    # ── Bias / activation ────────────────────────────────────────────
-    # ``enable_bias``: when True, the kernel signature includes an
-    # ``arg_bias`` operand of shape (E * 2*inter_dim,) f32. Stage1 adds
-    # ``bias[eid, gate_col]`` and ``bias[eid, inter_dim + up_col]``
-    # before activation. Layout matches torch's ``w1_bias`` (gate||up
-    # concatenation per expert).
-    # ``act``: ``"silu"`` (default) for ``silu(g)*u``; ``"swiglu"`` for
-    # GPT-OSS SwiGLU (``alpha=1.702``, ``limit=7.0``, hardcoded).
+
     enable_bias: bool = False,
     act: str = "silu",
 ):
@@ -131,16 +123,6 @@ def _compile_stage1_mxscale_kernel_impl(
 
     N = int(inter_dim)
 
-    # ── Split-K validation / setup ────────────────────────────────────
-    # When k_batch > 1 the K dimension (model_dim) is split across the
-    # grid z-dim. Each CTA computes a K-slice and atomically accumulates
-    # gate / up partial sums into a [tokens*topk, 2*inter_dim] output.
-    # silu/mul fusion, doweight_stage1 and TDM store must be disabled for
-    # split-K; a separate reduction kernel fuses silu*mul and folds in
-    # the per-slot routing weight.
-    # Activation kind: 'silu' (default; matches the historical kernel
-    # that fuses ``silu(gate) * up`` in epilogue) or 'swiglu' (GPT-OSS
-    # gated-linear-unit; emits clamp + Swish_alpha + (up+1) in epilogue).
     _act_kind = str(act).strip().lower()
     if _act_kind not in ("silu", "swiglu"):
         raise ValueError(
@@ -165,9 +147,7 @@ def _compile_stage1_mxscale_kernel_impl(
             raise ValueError(
                 "split-K stage1 does not support fused doweight_stage1; "
                 "apply routing weight in the external reduction kernel")
-        # split-K stage1 atomically accumulates raw gate/up partials and
-        # fuses silu/mul in an external reduction kernel; SwiGLU would
-        # have to be applied there too, which is not currently wired.
+
         if _act_kind != "silu":
             raise ValueError(
                 "split-K stage1 fuses activation in the external reduction "
@@ -199,10 +179,6 @@ def _compile_stage1_mxscale_kernel_impl(
         wmma_m_rep=wmma_m_rep, wmma_n_rep=wmma_n_rep, WMMA_M=WMMA_M, is_fp4=is_fp4
     )
 
-    # A-scale TDM gather gating: requires A-side TDM gather (for _a_tok_ids
-    # SGPR caches), a row-major LDS scale layout (fp4 path is always row-major;
-    # non-fp4 is row-major only when wmma_m_rep == 1), and a gather row width
-    # of at least 4 bytes (TDM gather hardware constraint: row_width * elem_bytes % 4 == 0 and > 0).
     _as_layout_rowmajor = bool(is_fp4) or (int(wmma_m_rep) == 1)
     _as_row_bytes_ok = int(scale_k_per_tile) >= 4 and (int(scale_k_per_tile) % 4 == 0)
     _use_tdm_gather_as = (
@@ -212,7 +188,6 @@ def _compile_stage1_mxscale_kernel_impl(
         and _as_row_bytes_ok
     )
 
-    # Pipeline calculations for multi-buffer
     _use_pipeline = int(num_buffers) >= 2
     if _use_pipeline:
         from kernels.gemm_common_gfx1250 import (
@@ -268,11 +243,6 @@ def _compile_stage1_mxscale_kernel_impl(
             _o = alloc._align(alloc.ptr, 16); alloc.ptr = _o + lds_b_data_bytes; off_bu_list.append(_o)
             _o = alloc._align(alloc.ptr, 16); alloc.ptr = _o + lds_b_scale_bytes; off_bsu_list.append(_o)
 
-    # lds_tid: preloaded sorted_token_ids for current M-tile (tile_m entries, i32).
-    # Used to replace per-thread buffer_load(sorted_rsrc, ...) in the K-loop A-data/A-scale
-    # loaders and the epilogue. Invalid rows are pre-filled with sentinel 0xFFFFFFFF so
-    # that downstream tok/slot checks naturally reject them without needing row_in_route
-    # or row_in_valid masks.
     lds_tid_bytes = int(tile_m) * 4
     off_tid = alloc._align(alloc.ptr, 16)
     alloc.ptr = off_tid + lds_tid_bytes
@@ -307,10 +277,7 @@ def _compile_stage1_mxscale_kernel_impl(
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
         arg_num_valid_ids: fx.Tensor,
-        # ``arg_bias`` (f32, flat E*2*inter_dim) is unused when
-        # ``enable_bias=False`` at compile time but is always present in
-        # the kernel signature so the runtime tuple shape is stable.
-        # Callers should pass an empty tensor when bias is disabled.
+
         arg_bias: fx.Tensor,
         i32_tokens_in: fx.Int32,
         i32_inter_in: fx.Int32,
@@ -318,14 +285,8 @@ def _compile_stage1_mxscale_kernel_impl(
         i32_size_expert_ids_in: fx.Int32,
     ):
         _ = i32_k_in
-        # ASTRewriter strips ``const_expr(...)`` from ``if`` tests, which would
-        # otherwise eliminate every reference to ``const_expr`` from the
-        # rewritten function body and shrink ``co_freevars`` by one — causing
-        # CPython to reject ``f.__code__ = new_f_code_o`` because the original
-        # ``__closure__`` length no longer matches. Keep one explicit reference
-        # so the rewritten code object's free-vars list still includes
-        # ``const_expr``.
-        _keep_const_expr_ref = const_expr  # noqa: F841
+
+        _keep_const_expr_ref = const_expr
         if const_expr(inst_prefetch):
             if arith.cmpi(arith.CmpIPredicate.eq, rocdl.wave_id(),
                           arith.constant(0, type=T.i32)):
@@ -349,10 +310,8 @@ def _compile_stage1_mxscale_kernel_impl(
         bx = gpu.block_id("x")
         by = gpu.block_id("y")
 
-        # Split-K: bz identifies the K-slice; k_base_idx is the starting
-        # K offset (in data elements, pre-pack) for this CTA.
         if _is_splitk:
-            bz = gpu.block_id("z")  # already index type
+            bz = gpu.block_id("z")
             k_base_idx = bz * arith.index(int(_k_per_batch))
         else:
             k_base_idx = arith.index(0)
@@ -383,10 +342,7 @@ def _compile_stage1_mxscale_kernel_impl(
         sw_rsrc = buffer_ops.create_buffer_resource(arg_scale_w, max_size=False, num_records_bytes=sw_nbytes)
         out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
         tw_rsrc = buffer_ops.create_buffer_resource(arg_sorted_weights, max_size=True)
-        # bias resource: only meaningful when ``_enable_bias=True``. We
-        # always create it (with max_size=True so an empty tensor is
-        # tolerated) so the kernel signature stays stable; the epilogue
-        # only issues buffer_load on it when the constexpr flag is set.
+
         bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
 
         eid_i32 = buffer_ops.buffer_load(eid_rsrc, arith.index_cast(T.i32, by), vec_width=1, dtype=T.i32)
@@ -467,11 +423,6 @@ def _compile_stage1_mxscale_kernel_impl(
                 (wave_id_idx_s1 % arith.index(int(n_warp)))
                 * arith.index(warp_tile_n)
             )
-            # TDM store for MoE stage1 uses gather-store mode because the
-            # output rows are not contiguous — each sorted row maps to
-            # out[tok * topk + slot, :] which is a scattered layout.
-            # d_desc_s1 is built lazily in the epilogue after sorted_ids
-            # are decoded (see _emit_tdm_gather_store_s1 below).
 
         def silu(x):
             t = x * (-1.4426950408889634)
@@ -483,7 +434,6 @@ def _compile_stage1_mxscale_kernel_impl(
         def make_desc_a(k_base):
             return k_base / arith.index(PACK_FACTOR_A)
 
-        # TDM gather for A data
         _use_tdm_gather_a = bool(use_tdm_gather)
 
         def issue_a_load(k_packed_base, target_lds):
@@ -496,9 +446,7 @@ def _compile_stage1_mxscale_kernel_impl(
                 with ir.InsertionPoint(_if_elem.then_block):
                     row = elem // arith.index(int(packed_tile_k_a))
                     col = elem % arith.index(int(packed_tile_k_a))
-                    # Use preloaded lds_tid instead of per-thread buffer_load(sorted_rsrc, ...).
-                    # Invalid rows were pre-filled with sentinel 0xFFFFFFFF at preload, so
-                    # tok=0xFFFFFF will make tok_ok=false for them.
+
                     fused = _load_fused_from_lds(row)
                     tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
                     tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
@@ -511,9 +459,6 @@ def _compile_stage1_mxscale_kernel_impl(
                     vector.store(v1, target_lds, [lds_idx], alignment=1)
                     scf.YieldOp([])
 
-        # Pre-compute token row indices for ALL tile_m rows (once, outside K-loop).
-        # _a_tok_ids[i] = token_id for TDM gather A load
-        # _a_out_row_ids[i] = tok * topk + slot for TDM gather store output
         _a_tok_ids = []
         _a_out_row_ids = []
         _a_load_valids = []
@@ -556,7 +501,7 @@ def _compile_stage1_mxscale_kernel_impl(
                     _row_valid, _sorted_i32, block_row_start)
                 _raw = buffer_ops.buffer_load(
                     sorted_rsrc, _row_safe_i32, vec_width=1, dtype=T.i32)
-                _sentinel = arith.constant(-1, type=T.i32)  # 0xFFFFFFFF
+                _sentinel = arith.constant(-1, type=T.i32)
                 _val = arith.select(_row_valid, _raw, _sentinel)
                 _vec1 = vector.from_elements(T.vec(1, T.i32), [_val])
                 vector.store(_vec1, lds_tid, [tx], alignment=4)
@@ -632,19 +577,6 @@ def _compile_stage1_mxscale_kernel_impl(
                 _a_tokens_topk_sgpr = rocdl.readfirstlane(T.i32, _m_i32)
             return _a_tokens_topk_sgpr
 
-        # Cache of K-invariant pieces of the TDM gather descriptor:
-        #   "desc"[_gi][buf_idx] — full TDMGatherDescriptor with addr_lo = base
-        #                          (built at global_byte_offset=None),
-        #   "pred"[_gi]          — issue predicate (valid_count > 0, wave owner),
-        #   "base_addr_lo"[_gi]  — dgroup0.lane2 at global_byte_offset=0,
-        #   "base_addr_hi"[_gi]  — dgroup0.lane3 at global_byte_offset=0
-        #                          (with the descriptor's type-field bits intact;
-        #                          consumed by tdm_ops.add_addr_with_carry to
-        #                          propagate the lo-32-bit overflow into hi).
-        # populated once by ``_build_a_gather_base_descs()`` before the K loop
-        # so the hot path (``issue_a_load_tdm_gather``) only advances the
-        # base address via the carry-safe ``update_*_addr64`` helper each
-        # iteration.
         _a_gather_cache = {}
 
         def _build_a_gather_base_descs(lds_bufs):
@@ -675,11 +607,7 @@ def _compile_stage1_mxscale_kernel_impl(
 
                 _lds_off = fx.Index(_start * lds_a_stride_bytes)
                 _per_buf = []
-                # NOTE: must use range_constexpr here. The AST rewriter
-                # (InsertEmptyYieldForSCFFor) turns a plain `range` inside a
-                # kernel body into scf_range -> scf.ForOp, making the loop
-                # variable an MLIR induction value (ArithValue) and breaking
-                # Python list indexing below.
+
                 for _buf_i in range_constexpr(len(lds_bufs)):
                     _base_desc = tdm_ops.make_tensor_gather_descriptor(
                         global_ptr=arg_x,
@@ -699,9 +627,7 @@ def _compile_stage1_mxscale_kernel_impl(
                     )
                     _per_buf.append(_base_desc)
                 _descs.append(_per_buf)
-                # addr_lo / addr_hi are independent of buf_idx (only lds_addr
-                # differs), so we can extract them from any buffer's base
-                # descriptor.
+
                 _base_addr_lo.append(vector.extract(
                     _per_buf[0].dgroup0,
                     static_position=[2],
@@ -748,19 +674,6 @@ def _compile_stage1_mxscale_kernel_impl(
                     )
                     scf.YieldOp([])
 
-        # Cache of K-invariant 2D B / B-scale descriptors used by
-        # ``_issue_b_tdm_only``. Each entry stores a base TDMDescriptor2D
-        # built at k_base=0 plus its extracted scalar addr_lo / addr_hi, so
-        # the hot path can call the carry-safe
-        # ``update_tensor_descriptor_2d_addr64`` directly and avoid the
-        # silent i32-wraparound bug that the addr-lo-only shortcut has on
-        # large MoE expert-weight buffers (~3.5 GiB fp4 tensors with E=257
-        # experts on gfx1250 reliably trigger the overflow). Mirrors the
-        # hoist that wave_specialized_tdm already does internally via
-        # ``_active_stage_desc_base``. ``_build_b_base_descs()`` is closed
-        # over later-defined names (``_stage1_pair_row_base``, the
-        # ``make_desc_b*`` helpers, and the various ``lds_b*_bufs`` lists);
-        # those names are resolved at *call* time inside ``_if_blk``.
         _b_desc_cache = {}
 
         def _extract_desc_addr_lo(desc):
@@ -843,11 +756,7 @@ def _compile_stage1_mxscale_kernel_impl(
             _b_desc_cache["ready"] = True
 
         def _b_data_k_byte_off(k_base):
-            # Byte offset along the fastest axis for a B-data descriptor:
-            #   non-fp4 / merged pair : (k_base / PACK_FACTOR_B) * 16 bytes
-            #   fp4                   : (k_base / PACK_FACTOR_B) bytes
-            # Matches `make_desc_b` / `make_desc_b_pair` global_offset math
-            # (elem_bytes=1 there, so element offset == byte offset).
+
             _k_packed_b = (
                 k_base if PACK_FACTOR_B == 1
                 else k_base // fx.Index(PACK_FACTOR_B)
@@ -858,7 +767,7 @@ def _compile_stage1_mxscale_kernel_impl(
                 T.i32, _k_packed_b * fx.Index(16))
 
         def _b_scale_k_byte_off(k_base):
-            # B-scale fastest-axis offset: k_base / SCALE_BLOCK bytes.
+
             return arith.index_cast(
                 T.i32, k_base // fx.Index(SCALE_BLOCK))
 
@@ -963,8 +872,7 @@ def _compile_stage1_mxscale_kernel_impl(
                             scf.YieldOp([])
                         scf.YieldOp([])
             else:
-                # Rare fallback: keep per-byte loop for scale widths not aligned
-                # to 4 bytes (should not happen for gfx1250 MoE MX configs).
+
                 total = int(tile_m * scale_k_per_tile)
                 rounds = (total + block_threads - 1) // block_threads
                 for it in range(rounds):
@@ -1186,7 +1094,6 @@ def _compile_stage1_mxscale_kernel_impl(
                 + _a_scale_ds_loads
             )
 
-            # ── compute-tile helper (gate + up) ──────────────────────
             def _load_gate_up_b_and_scales(buf_idx, ks):
                 if const_expr(_merge_gate_up_tdm):
                     _gate_b_buf = lds_bg_pair_bufs[buf_idx]
@@ -1597,14 +1504,6 @@ def _compile_stage1_mxscale_kernel_impl(
                         _scale_adv_i32,
                     )
 
-                # Pre-build per-stage TDMDescriptor2D bases. dgroup0 lanes 2/3
-                # carry placeholder addr_lo / addr_hi values that the hot path
-                # overwrites every iteration via the carry-safe
-                # ``update_tensor_descriptor_2d_addr_lo_hi`` helper, so the
-                # lane-3 placeholder here is only there to keep the descriptor
-                # well-typed -- ``_active_addr_hi`` is still consulted as the
-                # initial state of the hi register tracked through the pipeline
-                # so its type-field bits feed back into the carry helper.
                 _tdm_zero_addr_lo = arith.constant(0, type=T.i32)
                 _active_stage_desc_base = [
                     tdm_ops.TDMDescriptor2D(
@@ -1641,10 +1540,7 @@ def _compile_stage1_mxscale_kernel_impl(
                     _next_addr_lo, _next_addr_hi = tdm_ops.add_addr_with_carry(
                         curr_addr_lo, curr_addr_hi, _active_adv_i32,
                     )
-                    # Only loader waves advance the running address; non-loader
-                    # waves keep the current pair so the tracked SGPR state
-                    # stays in lockstep across waves (matching the original
-                    # addr-lo-only behaviour).
+
                     return (
                         arith.select(
                             _is_loader_wave, _next_addr_lo, curr_addr_lo),
@@ -1654,24 +1550,12 @@ def _compile_stage1_mxscale_kernel_impl(
 
             if const_expr(_use_tdm_gather_a):
                 _build_a_gather_base_descs(lds_ag_bufs)
-            # Hoist K-invariant parts of B / B-scale 2D descriptors so the
-            # hot K loop only has to advance addr_lo per tile. In
-            # wave-specialized mode the hot path goes through
-            # ``_issue_active_b_tdm_only`` (which is already hoisted via
-            # ``_active_stage_desc_base``) and ``_issue_b_tdm_only`` is only
-            # reachable from the tail/non-pipelined paths; skip the build
-            # there to avoid emitting dead IR.
+
             if const_expr(not wave_specialized_tdm):
                 _build_b_base_descs()
 
-            # ── pipeline load helpers ─────────────────────────────────
             def _issue_b_tdm_only(k_base, buf_idx):
-                # Carry-safe: ``update_tensor_descriptor_2d_addr64`` performs
-                # ``(addr_lo : addr_hi) += k_off`` in i64 so an i32 wrap of
-                # ``base_addr_lo + k_off`` (common with ~3.5 GiB fp4 expert
-                # buffers on E=257 / gfx1250) propagates into addr_hi rather
-                # than silently redirecting the descriptor to a wrong 4 GiB
-                # page and deadlocking the GPU.
+
                 _k_data_off = _b_data_k_byte_off(k_base)
                 _k_scale_off = _b_scale_k_byte_off(k_base)
                 if const_expr(_merge_gate_up_tdm):
@@ -1744,15 +1628,11 @@ def _compile_stage1_mxscale_kernel_impl(
                     mid_compute_callback=mid_load_callback,
                 )
 
-            # Helper: apply split-K K-base offset. For non-splitk the
-            # compile-time constant expression is returned unchanged so
-            # the non-splitk code path is identical.
             def _k_off(static_offset_val):
                 if _is_splitk:
                     return k_base_idx + static_offset_val
                 return static_offset_val
 
-            # ── main K-dimension reduction ────────────────────────────
             if const_expr(not _use_pipeline):
                 if const_expr(wave_specialized_tdm):
                     active_b_addr_lo = _active_addr_lo
@@ -1777,7 +1657,7 @@ def _compile_stage1_mxscale_kernel_impl(
                         acc_g, acc_u = _compute_k_tile(acc_g, acc_u, 0)
                         workgroup_barrier(use_cluster=use_cluster)
             else:
-                # ── prologue ──
+
                 if const_expr(wave_specialized_tdm):
                     active_b_addr_lo = _active_addr_lo
                     active_b_addr_hi = _active_addr_hi
@@ -1794,12 +1674,9 @@ def _compile_stage1_mxscale_kernel_impl(
                             _k_off(fx.Index(_pi * int(tile_k))), _pi)
                 pipeline_fence(outstanding=0, use_cluster=use_cluster)
 
-                # ── main pipelined loop ──
                 if const_expr(loop_iters > 0):
                     if const_expr(wave_specialized_tdm):
-                        # Carry the (addr_lo, addr_hi) pair through the
-                        # pipeline state so the carry chain survives across
-                        # iterations.
+
                         _init = (
                             list(acc_g) + list(acc_u)
                             + [active_b_addr_lo, active_b_addr_hi]
@@ -1880,13 +1757,11 @@ def _compile_stage1_mxscale_kernel_impl(
                         acc_g = list(_res[:n_accs])
                         acc_u = list(_res[n_accs:2 * n_accs])
 
-                # ── post-loop fence ──
                 if const_expr(loop_iters > 0):
                     pipeline_fence(outstanding=0, use_cluster=use_cluster)
                 elif const_expr(use_cluster):
                     gpu.cluster_barrier()
 
-                # ── tail ──
                 _tail_li = 0
                 _tail_had_load = False
                 for _ls, _cs, _out in _tail_plan:
@@ -1949,7 +1824,7 @@ def _compile_stage1_mxscale_kernel_impl(
             out_elem_ty = _moe_out_elem_ty(out_dtype, T)
 
             if const_expr(bool(use_tdm_store)):
-                # ── TDM store epilogue: silu(gate)*up → LDS → global (contiguous sorted output) ──
+
                 _scale_per_wm_s1 = []
                 for _wm in range_constexpr(wmma_m_rep):
                     _m_off_val = _wm * WMMA_M
@@ -1981,10 +1856,6 @@ def _compile_stage1_mxscale_kernel_impl(
                     pipeline_fence(outstanding=0, use_cluster=use_cluster)
                 rocdl.sched_barrier(0)
 
-                # TDM-store path also needs bias / SwiGLU. Per-tile column
-                # base (used to load gate/up bias from the per-expert slab)
-                # is the tile's N origin in the (blk_n + warp_n_base + wn*WMMA_N
-                # + lane_kgrp*8 + vi) coordinate system.
                 if const_expr(_enable_bias):
                     _c2_n_i32 = arith.constant(2, type=T.i32)
                     _bias_row_base_i32_s1 = eid_i32 * (i32_inter_in * _c2_n_i32)
@@ -2041,27 +1912,19 @@ def _compile_stage1_mxscale_kernel_impl(
                         _fused_sub8, out_elem=out_elem_ty)
 
                 rocdl.s_wait_dscnt(0)
-                # TDM gather store: each warp stores its warp_tile_m rows
-                # to scattered output positions tok*topk+slot.
+
                 _warp_row_start = arith.index_cast(T.i32, warp_m_base)
                 _warp_row_start_py = rocdl.readfirstlane(T.i32, _warp_row_start)
-                _d_store_chunk = 8  # 32-bit gather mode
+                _d_store_chunk = 8
                 _d_store_groups = (warp_tile_m + _d_store_chunk - 1) // _d_store_chunk
                 _tokens_topk_dim1 = _get_tokens_topk_sgpr()
                 for _dsi in range_constexpr(_d_store_groups):
                     _ds_start = _dsi * _d_store_chunk
                     _ds_cnt = min(_d_store_chunk, warp_tile_m - _ds_start)
-                    # Global output row indices for this group
+
                     _ds_start_in_tile = _dsi * _d_store_chunk + rocdl.readfirstlane(
                         T.i32, arith.index_cast(T.i32, warp_m_base))
-                    # Can't do runtime add on SGPR easily; use compile-time
-                    # warp offset from wave_id. But warp_m_base is runtime.
-                    # Instead, index _a_out_row_ids which is tile-global.
-                    # warp_m_base = wave_m_idx * warp_tile_m (runtime index)
-                    # We need _a_out_row_ids[warp_m_base + _ds_start + i]
-                    # Since warp_m_base depends on wave_id, we use scf.if
-                    # per warp to select the correct slice.
-                    # Simpler: for num_warps_m = m_warp, unroll per warp:
+
                     _ds_indices = []
                     _ds_valids = []
                     for _wi in range_constexpr(int(m_warp)):
@@ -2076,7 +1939,7 @@ def _compile_stage1_mxscale_kernel_impl(
                                 arith.CmpIPredicate.eq,
                                 rocdl.wave_id() % fx.Int32(int(n_warp * m_warp) // int(n_warp)),
                                 fx.Int32(_wi))
-                            # Actually wave_m_idx is the M warp index
+
                             _is_this_warp = arith.cmpi(
                                 arith.CmpIPredicate.eq,
                                 arith.index_cast(T.i32, wave_m_idx),
@@ -2090,15 +1953,12 @@ def _compile_stage1_mxscale_kernel_impl(
                                     _is_this_warp,
                                     _warp_valids[_ii],
                                     _ds_valids[_ii])
-                    # LDS offset within D buffer for this group
+
                     _ds_lds_off = arith.index(
                         _ds_start * lds_d_row_stride_s1) + d_warp_off_sgpr_s1
-                    # Column offset in output
+
                     _col_byte_off = (blk_n + warp_n_off_sgpr_s1) * arith.index(elem_bytes_d_s1)
-                    # For store direction: TDM ignores pad_enable, so we
-                    # expand tile_dim0 to include padding so LDS read
-                    # addresses align. tensor_dim0 stays at warp_tile_n so
-                    # the extra pad elements hit OOB and are dropped.
+
                     _pad_elems = LDS_PAD_D_BYTES_s1 // elem_bytes_d_s1
                     _store_tile_w = warp_tile_n + _pad_elems
                     _ds_valid_count = _sum_i32_values(_ds_valids)
@@ -2137,9 +1997,7 @@ def _compile_stage1_mxscale_kernel_impl(
                     )
 
                 if _is_splitk:
-                    # Split-K: atomic-fadd gate/up partials into a
-                    # [tokens*topk, 2*inter_dim] buffer. silu/mul and the
-                    # routing weight fold in via the external reduction.
+
                     _emit_stage1_gate_up_splitk_epilogue(
                         sub_tiles=_sub_tiles,
                         by=by,
@@ -2268,7 +2126,6 @@ def _compile_stage1_mxscale_kernel_impl(
 
     return launch_mxscale_stage1_single
 
-
 @functools.lru_cache(maxsize=64)
 def _compile_stage2_mxscale_kernel_impl(
     *,
@@ -2296,11 +2153,7 @@ def _compile_stage2_mxscale_kernel_impl(
     wave_specialized_tdm: bool = False,
     cluster_m: int = 1,
     cluster_n: int = 1,
-    # ── Bias ────────────────────────────────────────────────────────
-    # Per-expert bias of shape (E, model_dim) applied after the GEMM.
-    # In atomic-accumulate mode the per-slot bias is divided by ``topk``
-    # in the epilogue so the sum across the ``topk`` per-token atomic
-    # adds reproduces a single ``+ bias`` per token (matches torch ref).
+
     enable_bias: bool = False,
 ):
     """Compile mxscale stage2 single kernel (route-pack + TDM + WMMA_SCALE + epilog).
@@ -2326,10 +2179,7 @@ def _compile_stage2_mxscale_kernel_impl(
         raise ValueError("use_tdm_store is not compatible with accumulate=True in moe mxscale stage2")
     _enable_bias = bool(enable_bias)
     if _enable_bias and bool(use_tdm_store):
-        # The TDM-store epilogue writes packed gather rows to LDS then to
-        # global memory, with no intermediate scalar add point matching
-        # how the standard epilogue applies bias. Disabling avoids
-        # silently dropping bias on this path.
+
         raise ValueError(
             "stage2 mxscale: enable_bias=True is not supported with "
             "use_tdm_store=True; use the standard scatter-store path.")
@@ -2379,9 +2229,6 @@ def _compile_stage2_mxscale_kernel_impl(
     if use_cluster and effective_waves_per_eu is None:
         effective_waves_per_eu = 2
 
-    # A-scale TDM gather gating mirrors stage1: requires A-side TDM gather
-    # (for _a_tok_ids SGPRs), a row-major LDS scale layout, and a row width
-    # that is a positive multiple of 4 bytes (TDM gather hardware constraint).
     _as_layout_rowmajor = bool(is_fp4) or (int(wmma_m_rep) == 1)
     _as_row_bytes_ok = int(scale_k_per_tile) >= 4 and (int(scale_k_per_tile) % 4 == 0)
     _use_tdm_gather_as = (
@@ -2440,7 +2287,6 @@ def _compile_stage2_mxscale_kernel_impl(
         alloc.ptr = _obs + lds_b_scale_bytes
         off_bs_list.append(_obs)
 
-    # lds_tid: preloaded sorted_token_ids for current M-tile (see stage1 comments).
     lds_tid_bytes = int(tile_m) * 4
     off_tid = alloc._align(alloc.ptr, 16)
     alloc.ptr = off_tid + lds_tid_bytes
@@ -2479,9 +2325,7 @@ def _compile_stage2_mxscale_kernel_impl(
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
         arg_num_valid_ids: fx.Tensor,
-        # Per-expert bias slab (E*model_dim, f32 flat). Pass an empty
-        # tensor when ``enable_bias=False``; only read when the
-        # constexpr flag is set.
+
         arg_bias: fx.Tensor,
         i32_tokens_in: fx.Int32,
         i32_n_in: fx.Int32,
@@ -2489,14 +2333,8 @@ def _compile_stage2_mxscale_kernel_impl(
         i32_size_expert_ids_in: fx.Int32,
     ):
         _ = i32_k_in
-        # ASTRewriter strips ``const_expr(...)`` from ``if`` tests, which would
-        # otherwise eliminate every reference to ``const_expr`` from the
-        # rewritten function body and shrink ``co_freevars`` by one — causing
-        # CPython to reject ``f.__code__ = new_f_code_o`` because the original
-        # ``__closure__`` length no longer matches. Keep one explicit reference
-        # so the rewritten code object's free-vars list still includes
-        # ``const_expr``.
-        _keep_const_expr_ref = const_expr  # noqa: F841
+
+        _keep_const_expr_ref = const_expr
         if const_expr(inst_prefetch):
             if arith.cmpi(arith.CmpIPredicate.eq, rocdl.wave_id(),
                           arith.constant(0, type=T.i32)):
@@ -2552,8 +2390,7 @@ def _compile_stage2_mxscale_kernel_impl(
         sw_rsrc = buffer_ops.create_buffer_resource(arg_scale_w, max_size=False, num_records_bytes=sw_nbytes)
         out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=False, num_records_bytes=out_nbytes)
         tw_rsrc = buffer_ops.create_buffer_resource(arg_sorted_weights, max_size=True)
-        # bias: per-expert (E, model_dim) f32 slab, only read when
-        # ``_enable_bias`` constexpr is True (epilogue gates the load).
+
         bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
 
         eid_i32 = buffer_ops.buffer_load(eid_rsrc, arith.index_cast(T.i32, by), vec_width=1, dtype=T.i32)
@@ -2691,7 +2528,7 @@ def _compile_stage2_mxscale_kernel_impl(
                     _row_valid, _sorted_i32, block_row_start)
                 _raw = buffer_ops.buffer_load(
                     sorted_rsrc, _row_safe_i32, vec_width=1, dtype=T.i32)
-                _sentinel = arith.constant(-1, type=T.i32)  # 0xFFFFFFFF
+                _sentinel = arith.constant(-1, type=T.i32)
                 _val = arith.select(_row_valid, _raw, _sentinel)
                 _vec1 = vector.from_elements(T.vec(1, T.i32), [_val])
                 vector.store(_vec1, lds_tid, [tx], alignment=4)
@@ -2736,7 +2573,7 @@ def _compile_stage2_mxscale_kernel_impl(
                 with ir.InsertionPoint(_if_elem.then_block):
                     row = elem // arith.index(int(packed_tile_k_a))
                     col = elem % arith.index(int(packed_tile_k_a))
-                    # Use preloaded lds_tid instead of per-thread buffer_load(sorted_rsrc, ...).
+
                     fused = _load_fused_from_lds(row)
                     tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
                     slot = fused >> arith.constant(24, type=T.i32)
@@ -2754,11 +2591,6 @@ def _compile_stage2_mxscale_kernel_impl(
                     vector.store(v1, target_lds, [lds_idx], alignment=1)
                     scf.YieldOp([])
 
-        # Cache of K-invariant pieces of the stage2 TDM gather descriptor.
-        # See the stage1 equivalent for the field-by-field rationale; the
-        # only stage2 differences are using ``_a_row_ids`` /
-        # ``_a_row_valids`` and ``_get_tokens_topk_sgpr`` (rows already encode
-        # token*topk slots) instead of the stage1 row sources.
         _a_gather_cache = {}
 
         def _build_a_gather_base_descs(lds_bufs):
@@ -2789,8 +2621,7 @@ def _compile_stage2_mxscale_kernel_impl(
 
                 _lds_off = fx.Index(_start * lds_a_stride_bytes)
                 _per_buf = []
-                # See stage1 note: range_constexpr is mandatory here so the
-                # AST rewriter does not turn this into an scf.ForOp.
+
                 for _buf_i in range_constexpr(len(lds_bufs)):
                     _base_desc = tdm_ops.make_tensor_gather_descriptor(
                         global_ptr=arg_x,
@@ -3097,18 +2928,6 @@ def _compile_stage2_mxscale_kernel_impl(
                 elem_bytes=1, pad_interval=0, pad_amount=0,
                 num_warps=tdm_desc_num_warps, workgroup_mask=b_mcast_mask)
 
-        # Cache of K-invariant 2D B / B-scale descriptors used by stage2's
-        # ``_issue_b_tdm_only``. Stage2 has no merge_gate_up_tdm path, so the
-        # cache is single-branched. Each entry stores the base descriptor
-        # plus its addr_lo / addr_hi extracted into SGPRs; the hot path then
-        # uses ``update_tensor_descriptor_2d_addr64`` so a per-K-tile delta
-        # that overflows base_addr_lo carries into addr_hi instead of
-        # silently wrapping into a wrong 4 GiB page (which deadlocks the GPU
-        # in ``amdgpu_mes_reg_write_reg_wait``). Mirrors the stage1 helper
-        # pair; closed over ``make_desc_b``, ``make_desc_bs``,
-        # ``lds_b_bufs``, ``lds_bs_bufs`` and
-        # ``eid_i32`` / ``n_idx`` / ``blk_n``, all resolved at call time
-        # inside ``_if_blk``.
         _b_desc_cache = {}
 
         def _extract_desc_addr_lo(desc):
@@ -3148,10 +2967,7 @@ def _compile_stage2_mxscale_kernel_impl(
             _b_desc_cache["ready"] = True
 
         def _b_data_k_byte_off(k_base):
-            # Fastest-axis byte offset for stage2 B data descriptor:
-            #   non-fp4 : (k_base / PACK_FACTOR_B) * 16 bytes
-            #   fp4     : (k_base / PACK_FACTOR_B) bytes
-            # Matches make_desc_b global_offset math (elem_bytes=1).
+
             _k_packed_b = (
                 k_base if PACK_FACTOR_B == 1
                 else k_base // fx.Index(PACK_FACTOR_B)
@@ -3213,7 +3029,6 @@ def _compile_stage2_mxscale_kernel_impl(
                 + _a_scale_ds_loads
             )
 
-            # ── compute-tile helper ──────────────────────────────────
             def emit_wmma(accs, wm, wn, a_frag, b_frags, a_scales, b_scales):
                 _mxscale_emit_wmma(
                     accs=accs, wm=wm, wn=wn,
@@ -3510,12 +3325,6 @@ def _compile_stage2_mxscale_kernel_impl(
                     _scale_adv_i32,
                 )
 
-                # See stage1 for rationale: pre-build per-stage TDMDescriptor2D
-                # bases so the hot path can splice in lanes 2 / 3 cheaply via
-                # ``update_tensor_descriptor_2d_addr_lo_hi``. The lane-3
-                # placeholder mirrors ``_active_addr_hi``, but the actual hi
-                # used at issue time comes from the (lo, hi) pair tracked
-                # through the pipeline state.
                 _tdm_zero_addr_lo = arith.constant(0, type=T.i32)
                 _active_stage_desc_base = [
                     tdm_ops.TDMDescriptor2D(
@@ -3554,20 +3363,12 @@ def _compile_stage2_mxscale_kernel_impl(
 
             if const_expr(_use_tdm_gather_a):
                 _build_a_gather_base_descs(lds_a_bufs)
-            # See stage1 for the rationale of guarding on wave_specialized_tdm:
-            # in wave-specialized mode the hot path goes through
-            # ``_issue_active_b_tdm_only``; ``_issue_b_tdm_only`` is only used
-            # in non-pipelined / tail paths, so skip the cache build to avoid
-            # emitting dead IR.
+
             if const_expr(not wave_specialized_tdm):
                 _build_b_base_descs()
 
-            # ── pipeline load helpers ─────────────────────────────────
             def _issue_b_tdm_only(k_base, buf_idx):
-                # Carry-safe variant: ``update_tensor_descriptor_2d_addr64``
-                # adds the K-tile delta in i64 so an i32 wrap of base_addr_lo
-                # propagates into addr_hi rather than silently corrupting the
-                # descriptor address.
+
                 _k_data_off = _b_data_k_byte_off(k_base)
                 _k_scale_off = _b_scale_k_byte_off(k_base)
                 tdm_ops.tensor_load_2d(
@@ -3610,9 +3411,8 @@ def _compile_stage2_mxscale_kernel_impl(
                     mid_compute_callback=mid_load_callback,
                 )
 
-            # ── main K-dimension reduction ────────────────────────────
             if const_expr(not _use_pipeline):
-                # Single-buffer path (num_buffers=1)
+
                 if const_expr(wave_specialized_tdm):
                     active_b_addr_lo = _active_addr_lo
                     active_b_addr_hi = _active_addr_hi
@@ -3636,8 +3436,7 @@ def _compile_stage2_mxscale_kernel_impl(
                         acc = _compute_k_tile(acc, 0)
                         workgroup_barrier(use_cluster=use_cluster)
             else:
-                # Multi-buffer pipeline
-                # ── prologue: pre-load first `pre_loaded` stages ──
+
                 if const_expr(wave_specialized_tdm):
                     active_b_addr_lo = _active_addr_lo
                     active_b_addr_hi = _active_addr_hi
@@ -3652,12 +3451,9 @@ def _compile_stage2_mxscale_kernel_impl(
                         _issue_all_loads(fx.Index(_pi * int(tile_k)), _pi)
                 pipeline_fence(outstanding=0, use_cluster=use_cluster)
 
-                # ── main pipelined loop ──
                 if const_expr(loop_iters > 0):
                     if const_expr(wave_specialized_tdm):
-                        # Carry the (addr_lo, addr_hi) pair through the
-                        # pipeline state so the carry chain survives across
-                        # iterations.
+
                         _init = (
                             list(acc)
                             + [active_b_addr_lo, active_b_addr_hi]
@@ -3734,13 +3530,11 @@ def _compile_stage2_mxscale_kernel_impl(
                             _res = yield list(_acc)
                         acc = list(_res[:n_accs]) if isinstance(_res, (list, tuple)) else [_res]
 
-                # ── post-loop fence ──
                 if const_expr(loop_iters > 0):
                     pipeline_fence(outstanding=0, use_cluster=use_cluster)
                 elif const_expr(use_cluster):
                     gpu.cluster_barrier()
 
-                # ── tail ──
                 _tail_li = 0
                 _tail_had_load = False
                 for _ls, _cs, _out in _tail_plan:
@@ -3799,8 +3593,7 @@ def _compile_stage2_mxscale_kernel_impl(
             out_elem_ty = _moe_out_elem_ty(out_dtype, T)
 
             if const_expr(bool(use_tdm_store)):
-                # ── TDM store epilogue: acc → LDS → global (contiguous sorted output) ──
-                # Pre-compute per-wm row scale (weight × validity mask)
+
                 _scale_per_wm = []
                 for _wm in range_constexpr(wmma_m_rep):
                     _m_off_val = _wm * WMMA_M
@@ -3954,11 +3747,6 @@ def _compile_stage2_mxscale_kernel_impl(
 
     return launch_mxscale_stage2_single
 
-
-# ---------------------------------------------------------------------------
-# Public API entry points for fp4/fp8/a8w4
-# ---------------------------------------------------------------------------
-
 @functools.lru_cache(maxsize=1024)
 def _compile_moe_mxscale_gemm(
     *,
@@ -3985,7 +3773,7 @@ def _compile_moe_mxscale_gemm(
     cluster_m: int = 1,
     cluster_n: int = 1,
     k_batch: int = 1,
-    # ── bias / activation (stage1 only consumes ``act``) ─────────────
+
     enable_bias: bool = False,
     act: str = "silu",
 ):
@@ -4037,12 +3825,11 @@ def _compile_moe_mxscale_gemm(
     if int(k_batch) != 1:
         raise ValueError(
             "split-K (k_batch>1) is only supported on stage1 for MXScale MoE")
-    # ``act`` is stage1-only; stage2 has no fused activation.
+
     return _compile_stage2_mxscale_kernel_impl(
         doweight_stage2=bool(doweight), accumulate=bool(accumulate),
         enable_bias=bool(enable_bias), **common,
     )
-
 
 def compile_moe_gemm1(*, doweight_stage1, group_size=-1, use_cshuffle_epilog=None,
                       k_batch=1, enable_bias=False, act="silu", **kw):
@@ -4050,13 +3837,11 @@ def compile_moe_gemm1(*, doweight_stage1, group_size=-1, use_cshuffle_epilog=Non
         stage=1, doweight=doweight_stage1, k_batch=int(k_batch),
         enable_bias=bool(enable_bias), act=str(act), **kw)
 
-
 def compile_moe_gemm2(*, doweight_stage2, accumulate=True, group_size=-1,
                       use_cshuffle_epilog=None, enable_bias=False, **kw):
     return _compile_moe_mxscale_gemm(
         stage=2, doweight=doweight_stage2, accumulate=accumulate,
         enable_bias=bool(enable_bias), **kw)
-
 
 def compile_moe_gemm2_ex(*, mode=MoeGemm2Mode.ATOMIC, valid_mask=None, zero_intermediate=True, **kw):
     if mode == MoeGemm2Mode.REDUCE:
