@@ -118,7 +118,8 @@ def pa_decode_sparse(
     # the reduce masks their stale partial-buffer slots).
     if kv_splits is None:
         max_kv_len = kv_indices.shape[0]
-        max_num_wg = 64
+        max_num_wg = 512
+        # max_num_wg = 64
         max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)

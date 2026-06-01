@@ -118,6 +118,9 @@ def _pa_decode_sparse(
         mask=h_mask[:, None] & d_mask[None, :],
         other=0.0,
     )
+    # Fold softmax_scale into q once (mirrors the gluon port) so the per-tile
+    # QK dot drops its trailing `* softmax_scale`.
+    q = (q.to(tl.float32) * softmax_scale).to(q_ptr.dtype.element_ty)
 
     kv_start = tl.load(kv_indptr_ptr + t)
     kv_end = tl.load(kv_indptr_ptr + t + 1)
@@ -166,12 +169,16 @@ def _pa_decode_sparse(
             other=0.0,
         )
 
-        scores = tl.dot(q, tl.trans(kv)) * softmax_scale
+        scores = tl.dot(q, tl.trans(kv))
         scores = tl.where(h_mask[:, None] & valid[None, :], scores, float("-inf"))
 
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
-        alpha = tl.exp(m_i - m_new)
+        # A tile with no valid key (all sentinels / out-of-range) leaves
+        # m_new == -inf, so exp(m_i - m_new) = exp(-inf + inf) = NaN. With
+        # l_i/acc still 0 that NaN survives as 0*NaN = NaN and poisons the
+        # split's partials (and the reduce). Treat such a tile as a no-op.
+        alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp(m_i - m_new))
         p = tl.exp(scores - m_new[:, None])
         p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
@@ -311,7 +318,12 @@ def _pa_decode_sparse_reduce(
 
     # Pre-sink combine across splits.
     m_max = tl.max(m_p, axis=0)  # [BLOCK_H]
-    alpha_split = tl.exp(m_p - m_max[None, :])  # [KV_SPLITS, BLOCK_H]
+    # Empty/stale splits carry m_p == -inf. Force their weight to 0 rather than
+    # evaluating exp(m_p - m_max): when a token has *no* valid key at all,
+    # m_max is also -inf and exp(-inf + inf) = NaN would corrupt the output.
+    alpha_split = tl.where(
+        m_p == float("-inf"), 0.0, tl.exp(m_p - m_max[None, :])
+    )  # [KV_SPLITS, BLOCK_H]
     l_combined = tl.sum(l_p * alpha_split, axis=0)  # [BLOCK_H]
     acc_combined = tl.sum(a_p * alpha_split[:, :, None], axis=0)  # [BLOCK_H, BLOCK_D]
 
