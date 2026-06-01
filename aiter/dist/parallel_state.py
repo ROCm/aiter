@@ -193,9 +193,17 @@ def fused_qknorm_allreduce_fake(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     dtype = qkv_in.dtype
     return (
-        torch.empty((qkv_in.shape[0], q_w.shape[-1]), dtype=dtype, device=qkv_in.device),
-        torch.empty((qkv_in.shape[0], k_w.shape[-1]), dtype=dtype, device=qkv_in.device),
-        torch.empty((qkv_in.shape[0], qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1]), dtype=dtype, device=qkv_in.device),
+        torch.empty(
+            (qkv_in.shape[0], q_w.shape[-1]), dtype=dtype, device=qkv_in.device
+        ),
+        torch.empty(
+            (qkv_in.shape[0], k_w.shape[-1]), dtype=dtype, device=qkv_in.device
+        ),
+        torch.empty(
+            (qkv_in.shape[0], qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1]),
+            dtype=dtype,
+            device=qkv_in.device,
+        ),
     )
 
 
@@ -496,10 +504,15 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
-            input_, residual_inp_, weight_, eps, group_size, prefill_support,
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_size,
+            prefill_support,
             emit_bf16=emit_bf16,
         )
-    
+
     def fused_qknorm_allreduce(
         self,
         qkv_in: torch.Tensor,
@@ -509,9 +522,7 @@ class GroupCoordinator:
     ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.fused_qknorm_allreduce(
-            qkv_in, q_w, k_w, eps
-        )
+        return self.device_communicator.fused_qknorm_allreduce(qkv_in, q_w, k_w, eps)
 
     def _fused_allreduce_rmsnorm_out_place(
         self,
@@ -548,7 +559,7 @@ class GroupCoordinator:
             eps,
             prefill_support,
         )
-    
+
     def _fused_qknorm_allreduce_out_place(
         self,
         qkv_in: torch.Tensor,
