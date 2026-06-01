@@ -18,7 +18,7 @@ from ..gated_delta_rule_utils import (
     check_shared_mem,
     gated_delta_rule_autotune_configs,
 )
-from ..utils import prepare_chunk_indices
+from ..utils import prepare_chunk_indices, prepare_rebased_cu_seqlens
 from ..utils.op import exp
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -947,12 +947,15 @@ def chunk_fwd_o_opt_vk(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    o: torch.Tensor,
     h: torch.Tensor,
     g: torch.Tensor | None = None,
     scale: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> torch.Tensor:
     """
     Optimized output forward with h layout [V, K].
@@ -976,14 +979,24 @@ def chunk_fwd_o_opt_vk(
     T_flat = v.shape[2]
     V = v.shape[-1]
     BT = chunk_size
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    # Chunk indices from the ORIGINAL (cache-stable) cu_seqlens + decode ints
+    # (cached, no per-forward D2H); the kernel walks pre-sliced prefill data
+    # via the rebased cu_seqlens.
+    if cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(
+            cu_seqlens, BT, num_decodes, num_decode_tokens
+        )
+        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+            cu_seqlens, num_decodes, num_decode_tokens
+        )
+    else:
+        chunk_indices = None
+        kernel_cu_seqlens = None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = v.new_empty(B, T, H, V)
+    # o = v.new_empty(B, T, H, V)
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
@@ -995,7 +1008,7 @@ def chunk_fwd_o_opt_vk(
         h=h,
         g=g,
         o=o,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=kernel_cu_seqlens,
         chunk_indices=chunk_indices,
         scale=scale,
         T=T,

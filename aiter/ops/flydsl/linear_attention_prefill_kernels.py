@@ -291,7 +291,9 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     state_dtype: torch.dtype | None = None,
-    use_exp2: bool = True,
+    use_exp2: bool = False,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
 
@@ -386,6 +388,14 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
             .cumsum(-1)
             .to(torch.int32)
         )
+        NT = prepare_num_chunks(cu_seqlens, BT, num_decodes, num_decode_tokens)
+        # Rebased kernel-facing cu_seqlens (matches the pre-sliced prefill
+        # data). N is the prefill sequence count (len() is a shape read, no
+        # sync).
+        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+            cu_seqlens, num_decodes, num_decode_tokens
+        )
+        N = len(kernel_cu_seqlens) - 1
 
     assert K <= 256
 
@@ -431,10 +441,20 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     h0_arg = initial_state if initial_state is not None else dummy
     ht_arg = final_state if final_state is not None else dummy
     vn_arg = v_new_buf
+    # cu_arg / co_arg are the kernel-facing (rebased) offsets, narrowed to
+    # int32. `.to(torch.int32)` is a device-to-device cast (no host sync); the
+    # resulting fresh objects are consumed only by the kernel launch, so their
+    # identity does not matter for the @tensor_cache helpers above.
     cu_arg = (
-        cu_seqlens.to(torch.int32) if cu_seqlens is not None else dummy.to(torch.int32)
+        kernel_cu_seqlens.to(torch.int32)
+        if kernel_cu_seqlens is not None
+        else dummy.to(torch.int32)
     )
-    co_arg = chunk_offsets if chunk_offsets is not None else dummy.to(torch.int32)
+    co_arg = (
+        chunk_offsets.to(torch.int32)
+        if chunk_offsets is not None
+        else dummy.to(torch.int32)
+    )
     stream = torch.cuda.current_stream()
 
     use_g = g is not None
