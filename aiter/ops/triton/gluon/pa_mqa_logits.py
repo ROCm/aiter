@@ -194,6 +194,65 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         + gl.arange(0, ChunkQ, layout=layout_scale),
     )
 
+    if IS_GFX1250:
+        # gfx1250 TDM block-load path (1:1: one ChunkK tile == one paged block).
+        # K for a block is physically contiguous (token stride = HiddenDim); blocks
+        # jump by stride_k_seq (includes the per-block scale gap). We async_load the
+        # block into LDS, then read it transposed via ds_read_tr8 (the .permute load).
+        gl.static_assert(
+            ChunkK == KVBlockSize,
+            "gfx1250 TDM block-load path currently requires ChunkK == KVBlockSize",
+        )
+        # PaddedSharedLayout with interval 8 keeps fp8 ds_read_tr8 (tileSize=8) eligible.
+        KV_SHARED: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[HiddenDim, 8]], [KVBlockSize, HiddenDim], [1, 0]
+        )
+        kv_shared = gl.allocate_shared_memory(
+            KV_buffer.type.element_ty, [KVBlockSize, HiddenDim], KV_SHARED
+        )
+        mfma_q = gl.convert_layout(q, mfma_layout_a)
+        zero_acc = gl.zeros((ChunkQ, ChunkK), dtype=tl.float32, layout=mfma_layout)
+        col = gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+
+        n_tiles = tl.cdiv(split_context_length, ChunkK)
+        cblk_base = split_context_start // KVBlockSize
+        for t in range(0, n_tiles):
+            context_idx = split_context_start + t * ChunkK
+            blk = gl.load(kv_indices + pid_batch * max_block_len + cblk_base + t)
+            kv_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=KV_buffer + blk * stride_k_seq,
+                shape=(KVBlockSize, HiddenDim),
+                strides=(HiddenDim, 1),
+                block_shape=(KVBlockSize, HiddenDim),
+                layout=KV_SHARED,
+            )
+            gl.amd.gfx1250.tdm.async_load(kv_desc, [0, 0], kv_shared)
+            gl.amd.gfx1250.tdm.async_wait(0)
+            mfma_k = kv_shared.permute([1, 0]).load(layout=mfma_layout_b)
+            o = gl.amd.gfx1250.wmma(mfma_q, mfma_k, zero_acc)
+
+            k_scale_f = gl.amd.cdna3.buffer_load(
+                ptr=scale_buffer,
+                offsets=blk * stride_scale_seq + col,
+            )
+            o = o * k_scale_f[None, :]
+            o = gl.maximum(o, 0.0)
+            o = o * scale_weight[:, None]
+
+            valid = (context_idx + col) <= (context_length - next_n + pid_next_n)
+            o = tl.where(valid[None, :], o, float("-inf"))
+            logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
+
+            store_off = context_idx + col
+            gl.amd.cdna3.buffer_store(
+                logits,
+                ptr=OutLogits_buffer,
+                offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
+                + store_off,
+                mask=(store_off >= 0) & (store_off < max_model_len),
+            )
+        return
+
     mask_kv_next = (
         split_context_start
         - residual_context
