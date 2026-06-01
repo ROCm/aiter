@@ -332,6 +332,8 @@ def _fwd_kernel_splitK(
     stride_vn_d,
     stride_bt_b,
     stride_bt_s,
+    stride_kb,  # paged K block stride (k_cache.stride(0)); supports non-contiguous cache
+    stride_vb,  # paged V block stride (v_cache.stride(0))
     stride_az,
     stride_ah,
     stride_q_descale_z,  # FP8 descale strides
@@ -377,6 +379,8 @@ def _fwd_kernel_splitK(
     stride_qd_i64 = tl.cast(stride_qd, tl.int64)
     stride_kz_i64 = tl.cast(stride_kz, tl.int64)
     stride_kn_i64 = tl.cast(stride_kn, tl.int64)
+    stride_kb_i64 = tl.cast(stride_kb, tl.int64)
+    stride_vb_i64 = tl.cast(stride_vb, tl.int64)
     stride_kg_i64 = tl.cast(stride_kg, tl.int64)
     stride_kh_i64 = tl.cast(stride_kh, tl.int64)
     stride_kd_i64 = tl.cast(stride_kd, tl.int64)
@@ -556,13 +560,13 @@ def _fwd_kernel_splitK(
                     # Calculate base addresses for K and V in this physical block
                     k_base = (
                         K
-                        + physical_block * BLOCK_SIZE_K * stride_kn_i64
+                        + physical_block * stride_kb_i64
                         + hk_id * stride_kh_i64
                         + g_id * stride_kg_i64
                     )
                     v_base = (
                         V
-                        + physical_block * BLOCK_SIZE_K * stride_vn_i64
+                        + physical_block * stride_vb_i64
                         + hv_id * stride_vh_i64
                         + g_id * stride_vg_i64
                     )
@@ -1372,6 +1376,11 @@ def attention_forward_decode_triton_impl(
         # block table strides
         stride_bt_b=stride_bt_b,
         stride_bt_s=stride_bt_s,
+        # paged KV block strides (real k/v_cache.stride(0)); lets the kernel
+        # index a non-contiguous paged cache instead of assuming the block
+        # stride equals BLOCK_SIZE_K * stride_kn (contiguous-only).
+        stride_kb=(k_cache.stride(0) if use_block_table else 0),
+        stride_vb=(v_cache.stride(0) if use_block_table else 0),
         # alibi strides
         stride_az=stride_az,
         stride_ah=stride_ah,
