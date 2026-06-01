@@ -215,6 +215,9 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     use_chunk_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
+    o: torch.Tensor | None = None,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ):
     """
     Optimized chunk gated delta rule forward with h layout [V, K].
@@ -241,6 +244,15 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
         use_exp2: bool — use exp2 instead of exp for gate computation
+        o: optional pre-allocated [B, T, H, V] output buffer (written in
+            place by K6). If None, a fresh buffer is allocated.
+        num_decodes / num_decode_tokens: skip a leading decode-only prefix in
+            the ORIGINAL cu_seqlens (data tensors are expected pre-sliced).
+            Threaded into every stage; the cached prologue helpers
+            (prepare_chunk_indices / prepare_chunk_offsets /
+            prepare_rebased_cu_seqlens) key on the original cu_seqlens identity,
+            so chunk-index / offset builds stay cache-warm across forwards
+            (no per-forward .tolist() D2H).
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:
@@ -259,6 +271,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         g=g,
         cu_seqlens=cu_seqlens,
         use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
 
     w, u = fused_solve_tril_recompute_w_u(
@@ -269,6 +283,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         g_cumsum=g_cumsum,
         cu_seqlens=cu_seqlens,
         use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
 
     if use_chunk_hip:
@@ -319,17 +335,26 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             cu_seqlens=cu_seqlens,
             use_exp2=use_exp2,
             state_dtype=state_dtype,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
         )
+
+    if o is None:
+        # Output matches v's [B, T, H, V] layout.
+        o = v.new_empty(v.shape)
 
     o = chunk_fwd_o_opt_vk(
         q=q,
         k=k,
         v=v_new,
+        o=o,
         h=h,
         g=g_cumsum,
         scale=scale,
         cu_seqlens=cu_seqlens,
         use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
 
     return g_cumsum, o, final_state
