@@ -5,6 +5,7 @@
 #include "py_itfs_common.h"
 #include "aiter_opus_plus.h"
 #include "dispatch_utils.h"
+#include "fp4_quant_utils.h"
 #include "rocprim/rocprim.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
@@ -143,7 +144,18 @@ __global__ void add_rmsnorm_quant_kernel(
             vec2_f* thread_data_float2 = reinterpret_cast<vec2_f*>(&thread_data_float);
             for(int i = 0; i < thread_data_size / 2; i++)
             {
-                asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(rcp));
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
+                asm volatile("v_pk_mul_f32 %0, %1, %2"
+                             : "=v"(thread_data_float2[i])
+                             : "v"(thread_data_float2[i]), "v"(rcp));
+#else
+                // RDNA archs lack `v_pk_mul_f32`; fall back to portable
+                // element-wise multiplies (compiler emits two v_mul_f32).
+                thread_data_float2[i][0] *= rcp[0];
+                thread_data_float2[i][1] *= rcp[1];
+#endif
             }
             
             float* thread_data_weight2 = reinterpret_cast<float*>(&thread_data_weight);
@@ -170,7 +182,18 @@ __global__ void add_rmsnorm_quant_kernel(
                 //         : "v"(thread_data_weight2[i])
                 //     );
                 // }
-                asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(thread_data_weight_float2));
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
+                asm volatile("v_pk_mul_f32 %0, %1, %2"
+                             : "=v"(thread_data_float2[i])
+                             : "v"(thread_data_float2[i]),
+                               "v"(thread_data_weight_float2));
+#else
+                // RDNA archs lack `v_pk_mul_f32`; portable fallback.
+                thread_data_float2[i][0] *= thread_data_weight_float2[0];
+                thread_data_float2[i][1] *= thread_data_weight_float2[1];
+#endif
             }
 
             if constexpr(FUSE_QUANT)
@@ -194,21 +217,6 @@ __global__ void add_rmsnorm_quant_kernel(
                         thread_max = fmaxf(thread_max, fabsf(static_cast<float>(thread_data_float[i])));
                     }
                 }
-                auto fp4_scale = [](float tmp) {
-                    uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-                    uint32_t exponent = (u32 >> 23) & 0b11111111;
-                    if(exponent == 0b11111111)
-                    {
-                        return __builtin_bit_cast(float, exponent << 23);
-                    }
-                    if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-                        exponent += 1;
-                    return __builtin_bit_cast(float, exponent << 23);
-                };
-                auto fp4_scale_shuffle_id = [](int32_t scaleN_pad, int32_t x, int32_t y) {
-                    return (x / 32 * scaleN_pad) * 32 + (y / 8) * 256 + (y % 4) * 64 + (x % 16) * 4 +
-                        (y % 8) / 4 * 2 + (x % 32) / 16;
-                };
                 float quant_scale;
                 if(group_size ==  0)
                 {
@@ -225,7 +233,7 @@ __global__ void add_rmsnorm_quant_kernel(
                     float max= multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
                     if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
                     {
-                        max = fp4_scale(max);
+                        max = aiter::fp4_f32_to_e8m0_scale(max);
                     }
                     quant_scale = max * inverted_DTYPE_MAX;
                     if(threadIdx.x % reduce_thread_size == 0 && (threadIdx.x * thread_data_size) < n)
@@ -240,7 +248,7 @@ __global__ void add_rmsnorm_quant_kernel(
                             if(shuffle_scale)
                             {
                                 scaleN_pad = (scaleN_pad + 7) / 8 * 8;
-                                x = fp4_scale_shuffle_id(scaleN_pad, x, y);
+                                x = aiter::fp4_scale_shuffle_idx(scaleN_pad, x, y);
                             }
                             else
                             {

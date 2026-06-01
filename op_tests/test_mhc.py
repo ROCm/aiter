@@ -12,6 +12,7 @@ import aiter
 from aiter import dtypes
 import argparse
 import pandas as pd
+from typing import Optional
 
 torch.set_default_device("cuda")
 # torch.cuda.manual_seed_all(0)
@@ -348,6 +349,9 @@ def mhc_pre_ref(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    test_hc_head: bool = False,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
 
@@ -356,41 +360,53 @@ def mhc_pre_ref(
     out = residual_flat @ fn.T
     mixes = out * (sqrsum.unsqueeze(-1) / fn.shape[-1] + rms_eps).rsqrt()
 
-    hc_scale = torch.cat(
-        [
-            hc_scale[0].expand(hc_mult),
-            hc_scale[1].expand(hc_mult),
-            hc_scale[2].expand(hc_mult * hc_mult),
-        ],
-    )
-    mixes = mixes * hc_scale + hc_base
+    if not test_hc_head:
+        hc_scale = torch.cat(
+            [
+                hc_scale[0].expand(hc_mult),
+                hc_scale[1].expand(hc_mult),
+                hc_scale[2].expand(hc_mult * hc_mult),
+            ],
+        )
+        mixes = mixes * hc_scale + hc_base
 
-    pre_mix = mixes[:, :hc_mult].sigmoid().unsqueeze(-1) + hc_pre_eps
-    post_mix = (
-        mixes[:, hc_mult : 2 * hc_mult].sigmoid() * hc_post_mult_value
-    ).unsqueeze(-1)
-    res_mix = mixes[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult)
+        pre_mix = mixes[:, :hc_mult].sigmoid().unsqueeze(-1) + hc_pre_eps
+        post_mix = (
+            mixes[:, hc_mult : 2 * hc_mult].sigmoid() * hc_post_mult_value
+        ).unsqueeze(-1)
+        res_mix = mixes[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult)
 
-    def sinkhorn_normalize_ref(
-        x: torch.Tensor, repeat: int, eps: float
-    ) -> torch.Tensor:
-        x = x.softmax(-1) + eps
-        x = x / (x.sum(-2, keepdim=True) + eps)
-        for _ in range(repeat - 1):
-            x = x / (x.sum(-1, keepdim=True) + eps)
+        def sinkhorn_normalize_ref(
+            x: torch.Tensor, repeat: int, eps: float
+        ) -> torch.Tensor:
+            x = x.softmax(-1) + eps
             x = x / (x.sum(-2, keepdim=True) + eps)
-        return x
+            for _ in range(repeat - 1):
+                x = x / (x.sum(-1, keepdim=True) + eps)
+                x = x / (x.sum(-2, keepdim=True) + eps)
+            return x
 
-    res_mix = sinkhorn_normalize_ref(
-        res_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps
-    )
+        res_mix = sinkhorn_normalize_ref(
+            res_mix, repeat=sinkhorn_repeat, eps=hc_sinkhorn_eps
+        )
+    else:
+        hc_scale = hc_scale[0].expand(hc_mult)
+        mixes = mixes * hc_scale + hc_base
+        pre_mix = mixes[:, :hc_mult].sigmoid().unsqueeze(-1) + hc_pre_eps
+        post_mix = None
+        res_mix = None
 
-    layer_input = (residual * pre_mix).sum(-2).bfloat16()
+    layer_input = (residual * pre_mix).sum(-2)
 
-    return post_mix, res_mix, layer_input
+    if norm_weight is not None:
+        x = layer_input
+        rms = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + norm_eps)
+        layer_input = (x.float() * rms * norm_weight.float()).bfloat16()
+
+    return post_mix, res_mix, layer_input.bfloat16()
 
 
-def mhc_pre_hip(
+def mhc_pre_norm_split_hip(
     residual: torch.Tensor,
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -400,8 +416,10 @@ def mhc_pre_hip(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return aiter.mhc_pre(
+    post_mix, res_mix, layer_input = aiter.mhc_pre(
         residual,
         fn,
         hc_scale,
@@ -412,12 +430,15 @@ def mhc_pre_hip(
         hc_post_mult_value,
         sinkhorn_repeat,
     )
+    out = torch.empty_like(layer_input)
+    aiter.rmsnorm(out, layer_input, norm_weight, norm_eps)
+    return post_mix, res_mix, out
 
 
 @benchmark()
-def test_mhc_pre(m, hidden_size, hc_mult):
+def test_mhc_pre(m, hidden_size, hc_mult, test_hc_head=False):
     hc_mult2 = hc_mult * hc_mult
-    hc_mult3 = hc_mult * 2 + hc_mult2
+    hc_mult3 = hc_mult * 2 + hc_mult2 if not test_hc_head else hc_mult
     hc_hidden_size = hc_mult * hidden_size
     residual = torch.randn(m, hc_mult, hidden_size, dtype=dtypes.bf16)
     fn = torch.randn(hc_mult3, hc_hidden_size, dtype=dtypes.fp32)
@@ -428,23 +449,28 @@ def test_mhc_pre(m, hidden_size, hc_mult):
         "hc_pre_eps": 1e-6,
         "hc_sinkhorn_eps": 1e-6,
         "hc_post_mult_value": 1.0,
-        "sinkhorn_repeat": 20,
+        "sinkhorn_repeat": 20 if not test_hc_head else 0,
     }
 
     post_mix_ref, comb_mix_ref, layer_input_ref = mhc_pre_ref(
-        residual, fn, hc_scale, hc_base, **extra_args
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        **extra_args,
+        test_hc_head=test_hc_head,
     )
     (post_mix_hip, comb_mix_hip, layer_input_hip), hip_us = run_perftest(
-        mhc_pre_hip,
+        aiter.mhc_pre,
         residual,
         fn,
         hc_scale,
         hc_base,
         **extra_args,
     )
-
-    checkAllclose(post_mix_ref, post_mix_hip, msg="post_mix")
-    checkAllclose(comb_mix_ref, comb_mix_hip, msg="comb_mix")
+    if not test_hc_head:
+        checkAllclose(post_mix_ref, post_mix_hip, msg="post_mix")
+        checkAllclose(comb_mix_ref, comb_mix_hip, msg="comb_mix")
     hip_err = checkAllclose(layer_input_ref, layer_input_hip, msg="layer_input")
     ret = {}
     ret["hip_err"] = hip_err
@@ -462,6 +488,81 @@ def test_mhc_pre(m, hidden_size, hc_mult):
     #     tilelang_err = str(e)
     #     print(f"tilelang error: {tilelang_err}")
 
+    return ret
+
+
+@benchmark()
+def test_mhc_pre_fuse_rmsnorm(m, hidden_size, hc_mult):
+    hc_mult2 = hc_mult * hc_mult
+    hc_mult3 = hc_mult * 2 + hc_mult2
+    hc_hidden_size = hc_mult * hidden_size
+    residual = torch.randn(m, hc_mult, hidden_size, dtype=dtypes.bf16)
+    fn = torch.randn(hc_mult3, hc_hidden_size, dtype=dtypes.fp32)
+    hc_scale = torch.randn((3,), dtype=dtypes.fp32) * 0.1
+    hc_base = torch.randn((hc_mult3,), dtype=dtypes.fp32) * 0.1
+    norm_weight = torch.randn(hidden_size, dtype=dtypes.bf16)
+    extra_args = {
+        "rms_eps": 1e-6,
+        "hc_pre_eps": 1e-6,
+        "hc_sinkhorn_eps": 1e-6,
+        "norm_eps": 1e-6,
+        "hc_post_mult_value": 1.0,
+        "sinkhorn_repeat": 20,
+    }
+
+    post_mix_ref, comb_mix_ref, out_ref = mhc_pre_ref(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight=norm_weight,
+        rms_eps=extra_args["rms_eps"],
+        hc_pre_eps=extra_args["hc_pre_eps"],
+        hc_sinkhorn_eps=extra_args["hc_sinkhorn_eps"],
+        hc_post_mult_value=extra_args["hc_post_mult_value"],
+        sinkhorn_repeat=extra_args["sinkhorn_repeat"],
+    )
+
+    _, hip_split_us = run_perftest(
+        mhc_pre_norm_split_hip,
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=extra_args["rms_eps"],
+        hc_pre_eps=extra_args["hc_pre_eps"],
+        hc_sinkhorn_eps=extra_args["hc_sinkhorn_eps"],
+        hc_post_mult_value=extra_args["hc_post_mult_value"],
+        sinkhorn_repeat=extra_args["sinkhorn_repeat"],
+        norm_weight=norm_weight,
+        norm_eps=extra_args["norm_eps"],
+    )
+
+    (post_mix_hip, comb_mix_hip, out_hip), hip_us = run_perftest(
+        aiter.mhc_pre,
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight=norm_weight,
+        **extra_args,
+    )
+    checkAllclose(post_mix_ref, post_mix_hip, msg="post_mix")
+    checkAllclose(comb_mix_ref, comb_mix_hip, msg="comb_mix")
+    hip_err = checkAllclose(out_ref, out_hip, msg="out")
+    ret = {}
+    ret["hip_err"] = hip_err
+    ret["hip_us"] = hip_us
+    ret["hip_nofuse_us"] = hip_split_us
+    ret["TB/s"] = (
+        (
+            out_ref.numel() * out_ref.dtype.itemsize
+            + residual.numel() * residual.dtype.itemsize
+            + norm_weight.numel() * norm_weight.dtype.itemsize
+        )
+        / 1e6
+        / hip_us
+    )
     return ret
 
 
@@ -641,27 +742,53 @@ parser.add_argument(
     help="""hidden_size.
     e.g.: -hidden_size 1024""",
 )
+parser.add_argument(
+    "--hc_head",
+    action="store_true",
+    help="""Test mhc_pre for hc_head only.""",
+)
 
 args = parser.parse_args()
-
-df = []
-for dtype in args.dtype:
-    for m in args.m:
-        for hidden_size in args.hidden_size:
-            for hc_mult in [4]:
-                ret = test_mhc_pre(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
-                df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
 
 df = []
 for dtype in args.dtype:
     for hidden_size in args.hidden_size:
         for m in args.m:
             for hc_mult in [4]:
-                ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
+                ret = test_mhc_pre(
+                    m=m,
+                    hidden_size=hidden_size,
+                    hc_mult=hc_mult,
+                    test_hc_head=args.hc_head,
+                )
                 df.append(ret)
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
-aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
+aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
+
+if not args.hc_head:
+    df = []
+    for dtype in args.dtype:
+        for hidden_size in args.hidden_size:
+            for m in args.m:
+                for hc_mult in [4]:
+                    ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
+                    df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
+
+    df = []
+    for dtype in args.dtype:
+        for hidden_size in args.hidden_size:
+            for m in args.m:
+                for hc_mult in [4]:
+                    ret = test_mhc_pre_fuse_rmsnorm(
+                        m=m,
+                        hidden_size=hidden_size,
+                        hc_mult=hc_mult,
+                    )
+                    df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("mhc_pre_fuse_rmsnorm summary (markdown):\n%s", df_md)

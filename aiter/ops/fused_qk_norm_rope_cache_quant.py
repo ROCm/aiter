@@ -7,9 +7,15 @@ from ..jit.core import compile_ops
 from typing import Optional
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
-def fused_qk_norm_rope_cache_quant_shuffle(
-    qkv: Tensor,
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="fused_qk_norm_rope_cache_quant_shuffle",
+    develop=True,
+)
+def _fused_qk_norm_rope_cache_quant_shuffle_hip(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
     num_heads_q: int,
     num_heads_k: int,
     num_heads_v: int,
@@ -29,27 +35,55 @@ def fused_qk_norm_rope_cache_quant_shuffle(
 ) -> None: ...
 
 
-def gen_fused_qk_rmsnorm_fake_tensor(
+def fused_qk_norm_rope_cache_quant_shuffle(
     q: Tensor,
-    q_weight: Tensor,
-    q_eps: float,
     k: Tensor,
-    k_weight: Tensor,
-    k_eps: float,
-    q_out: Optional[Tensor],
-    k_out: Optional[Tensor],
-) -> tuple[Tensor, Tensor]:
-    if q_out is None:
-        q_out = torch.empty_like(q, dtype=q.dtype, device=q.device)
-    if k_out is None:
-        k_out = torch.empty_like(k, dtype=k.dtype, device=k.device)
-    return q_out, k_out
+    v: Tensor,
+    *,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    qw: Tensor,
+    kw: Tensor,
+    cos_sin_cache: Tensor,
+    is_neox_style: bool,
+    pos_ids: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    slot_mapping: Tensor,
+    kv_cache_dtype: str,
+    k_scale: Tensor,
+    v_scale: Tensor,
+) -> None:
+    _fused_qk_norm_rope_cache_quant_shuffle_hip(
+        q,
+        k,
+        v,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        qw,
+        kw,
+        cos_sin_cache,
+        is_neox_style,
+        pos_ids,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
 
 
 @compile_ops(
     "module_fused_qk_norm_rope_cache_quant_shuffle",
     fc_name="fused_qk_rmsnorm",
-    gen_fake=gen_fused_qk_rmsnorm_fake_tensor,
+    develop=True,
 )
 def _fused_qk_rmsnorm_kernel(
     q: Tensor,
@@ -58,34 +92,41 @@ def _fused_qk_rmsnorm_kernel(
     k: Tensor,
     k_weight: Tensor,
     k_eps: float,
-    q_out: Optional[Tensor],
-    k_out: Optional[Tensor],
-) -> tuple[Tensor, Tensor]: ...
+    q_out: Tensor,
+    k_out: Tensor,
+) -> None: ...
 
 
 _FUSED_QK_FALLBACK_M = 16384
 
 
-def fused_qk_rmsnorm(
+def _fused_qk_rmsnorm(
+    q_out: Optional[Tensor],
     q: Tensor,
     q_weight: Tensor,
     q_eps: float,
+    k_out: Optional[Tensor],
     k: Tensor,
     k_weight: Tensor,
     k_eps: float,
 ) -> tuple[Tensor, Tensor]:
+    if q_out is None:
+        q_out = torch.empty_like(q, dtype=q.dtype, device=q.device)
+    if k_out is None:
+        k_out = torch.empty_like(k, dtype=k.dtype, device=k.device)
+
     m = q.size(0)
     if m >= _FUSED_QK_FALLBACK_M:
-        from .rmsnorm import rmsnorm2d_fwd
+        from .rmsnorm import rmsnorm
 
-        return rmsnorm2d_fwd(q, q_weight, q_eps), rmsnorm2d_fwd(k, k_weight, k_eps)
+        rmsnorm(q_out, q, q_weight, q_eps)
+        rmsnorm(k_out, k, k_weight, k_eps)
     else:
-        return _fused_qk_rmsnorm_kernel(
-            q, q_weight, q_eps, k, k_weight, k_eps, None, None
-        )
+        _fused_qk_rmsnorm_kernel(q, q_weight, q_eps, k, k_weight, k_eps, q_out, k_out)
+    return q_out, k_out
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
 def fused_qk_norm_rope_cache_block_quant_shuffle(
     qkv: Tensor,
     num_heads_q: int,
@@ -109,7 +150,7 @@ def fused_qk_norm_rope_cache_block_quant_shuffle(
 ) -> None: ...
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
 def fused_qk_norm_rope_cache_pts_quant_shuffle(
     qkv: Tensor,
     qw: Tensor,
@@ -139,7 +180,7 @@ def fused_qk_norm_rope_cache_pts_quant_shuffle(
 ) -> None: ...
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
 def fused_qk_norm_rope_2way(
     q0: Tensor,
     k0: Tensor,
@@ -162,3 +203,33 @@ def fused_qk_norm_rope_2way(
     out_q01: Tensor,
     out_k01: Tensor,
 ) -> None: ...
+
+
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
+def fused_qk_norm_rope_1way(
+    q: Tensor,
+    k: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    cos_sin: Tensor,
+    batch_size: int,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+    out_q: Tensor,
+    out_k: Tensor,
+) -> None:
+    """Fused per-head RMSNorm + RoPE on q/k for the 1way (single-stream) layout.
+
+    Dtype contract:
+        q, k, w_q, w_k, out_q, out_k : torch.bfloat16 or torch.float16 (same dtype)
+        cos_sin                      : torch.float32  (REQUIRED)
+
+    cos_sin must be float32 to match the diffusers / qwen-image-edit reference
+    (RoPE freqs are computed in fp32 there and the precision is consumed by the
+    fp32 rope multiply). Passing bf16/fp16 cos_sin will raise inside the kernel.
+    """
+    ...

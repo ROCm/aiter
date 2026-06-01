@@ -133,6 +133,7 @@ def run_top_k_per_row_prefill(
     num_rows: int,
     stride_row: int,
     stride_col: int,
+    k: int = 2048,
 ) -> None:
     """
     Run the top_k_per_row kernel.
@@ -146,6 +147,7 @@ def run_top_k_per_row_prefill(
         num_rows,
         stride_row,
         stride_col,
+        k=k,
     )
 
 
@@ -159,11 +161,17 @@ def run_top_k_per_row_decode(
     stride0: int,
     stride1: int,
     fast: bool,
+    k: int = 2048,
 ) -> None:
     """
     Run the top_k_per_row kernel.
+
+    Note: the `_fast` ASM-kernel variant has `kTopK=2048` baked into its
+    precompiled `.co`; it ignores any caller-supplied `k`. The dispatch
+    here only allows `_fast` when k == 2048.
     """
     if fast:
+        assert k == 2048, "top_k_per_row_decode_fast only supports k=2048"
         return aiter.top_k_per_row_decode_fast(
             logits,
             next_n,
@@ -182,6 +190,7 @@ def run_top_k_per_row_decode(
             numRows,
             stride0,
             stride1,
+            k=k,
         )
 
 
@@ -216,6 +225,7 @@ def test_top_k_per_row_prefill(
         num_rows,
         logits.stride(0),
         logits.stride(1),
+        k=top_k,
     )
 
     # Run reference implementation
@@ -277,6 +287,7 @@ def test_top_k_per_row_decode(
         logits.stride(0),
         logits.stride(1),
         fast,
+        k=top_k,
     )
 
     torch.cuda.synchronize()
@@ -319,10 +330,12 @@ parser.add_argument(
     "-k",
     "--top_k",
     type=int,
-    default=[2048],
+    default=[512, 1024, 2048],
     nargs="+",
-    help="""top-k elements per row.
-    e.g.: -k 2048""",
+    help="""top-k elements per row. The radix backend supports any positive
+    int; the `_fast` ASM-kernel path only supports 2048 and is skipped
+    for other values.
+    e.g.: -k 512 1024 2048""",
 )
 
 parser.add_argument(
@@ -391,7 +404,8 @@ for data_generation in args.data_generation:
                         m, ctx, k, n, data_generation, False
                     )
                     df.append(ret)
-                    if get_gfx() == "gfx942":
+                    # `_fast` ASM kernel hardcodes k=2048; skip otherwise.
+                    if get_gfx() == "gfx942" and k == 2048:
                         ret = test_top_k_per_row_decode(
                             m, ctx, k, n, data_generation, True
                         )

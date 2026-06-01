@@ -231,7 +231,7 @@ def fav3_sage_mxfp4_func(
     # delta s is the bias
     if bias is not None:
         USE_BIAS = True
-        stride_bz, stride_bm, stride_bh, stride_bn = map_dims(bias.stride(), bshd_map)
+        stride_bz, stride_bh, stride_bm, stride_bn = bias.stride()
     else:
         USE_BIAS = False
         stride_bz, stride_bm, stride_bh, stride_bn = 0, 0, 0, 0

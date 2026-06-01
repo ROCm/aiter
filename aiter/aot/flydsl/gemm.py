@@ -46,7 +46,10 @@ from aiter.aot.flydsl.common import (
     override_env,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.ops.flydsl.gemm_kernels import get_flydsl_splitk_hgemm_kernel_params
+from aiter.ops.flydsl.gemm_kernels import (
+    SPLIT_K_SEMAPHORE_MAX_LEN,
+    get_flydsl_splitk_hgemm_kernel_params,
+)
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 
@@ -67,8 +70,9 @@ _PRESHUFFLE_RE = re.compile(
     r"^flydsl_bpreshuflle_"
     r"(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
-    r"(?P<lds_stage>\d+)x(?P<cshuffle>\d+)x(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)_"
-    r"(?P<scheduler>[A-Za-z0-9_]+)$"
+    r"(?P<lds_stage>\d+)x(?P<cshuffle>\d+)x(?P<async_copy>\d+)x"
+    r"(?P<waves_per_eu>\d+)x(?P<xcd_swizzle>\d+)_"
+    r"(?P<scheduler>[A-Za-z][A-Za-z0-9]*)$"
 )
 _SHORT_DTYPE = {
     "F8": "fp8",
@@ -118,6 +122,7 @@ def _parse_preshuffle_kernel_name(name: str) -> Optional[Dict]:
         "use_async_copy": int(m.group("async_copy")),
         "waves_per_eu": int(m.group("waves_per_eu")),
         "scheduler": m.group("scheduler"),
+        "xcd_swizzle": int(m.group("xcd_swizzle")),
     }
 
 
@@ -192,6 +197,12 @@ def _compile_executable_to_cache(exe, *args) -> None:
         exe(*args)
 
 
+def _ptr_view_safe(t):
+    from aiter.ops.flydsl.gemm_kernels import _ptr_view_safe as _wrap
+
+    return _wrap(t)
+
+
 def _compile_hgemm_to_cache(
     *,
     m: int,
@@ -202,9 +213,11 @@ def _compile_hgemm_to_cache(
     tile_m: int,
     tile_n: int,
     tile_k: int,
+    stages: int,
     split_k: int,
     block_m_warps: int,
     block_n_warps: int,
+    block_k_warps: int,
     n_tile_repeat: int = 1,
     persistent_n_tiles: int = 1,
     waves_per_eu: int = 0,
@@ -222,20 +235,24 @@ def _compile_hgemm_to_cache(
 
     import torch
 
-    has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
-    dev = torch.device("cuda") if has_cuda else torch.device("cpu")
+    dev = torch.device("cpu")
     torch_dtype = _torch_dtype_for_kernel(dtype)
 
     out = torch.empty((m, n), device=dev, dtype=torch_dtype)
     a = torch.empty((m, k), device=dev, dtype=torch_dtype)
     b = torch.empty((n, k), device=dev, dtype=torch_dtype)
     bias = torch.empty((n,), device=dev, dtype=torch_dtype)
-    counter = torch.zeros(
-        (128 * 3,),
+    semaphore = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,),
         device=dev,
         dtype=torch.int32,
     )
-    stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
+    signal = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,),
+        device=dev,
+        dtype=torch.int32,
+    )
+    stream = fx.Stream(0)
 
     exe = compile_flydsl_hgemm_kernel(
         dtype,
@@ -245,9 +262,11 @@ def _compile_hgemm_to_cache(
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,
+        stages=stages,
         split_k=split_k,
         block_m_warps=block_m_warps,
         block_n_warps=block_n_warps,
+        block_k_warps=block_k_warps,
         n_tile_repeat=n_tile_repeat,
         persistent_n_tiles=persistent_n_tiles,
         waves_per_eu=waves_per_eu,
@@ -258,9 +277,20 @@ def _compile_hgemm_to_cache(
         c_to_lds=c_to_lds,
         has_bias=has_bias,
     )
-    # FlyDSL JIT does not accept None for tensor slots; pass a real buffer when
-    # bias fusion is disabled (matches runtime launcher dummy tensor behavior).
-    _compile_executable_to_cache(exe, out, a, b, bias, m, counter, 0, stream)
+    # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
+    # optional bias and split-K sync tensors.
+    launch_bias = bias if has_bias else b
+    _compile_executable_to_cache(
+        exe,
+        _ptr_view_safe(out),
+        _ptr_view_safe(a),
+        _ptr_view_safe(b),
+        _ptr_view_safe(launch_bias),
+        m,
+        _ptr_view_safe(semaphore),
+        _ptr_view_safe(signal),
+        stream,
+    )
 
 
 def _compile_preshuffle_to_cache(
@@ -277,14 +307,14 @@ def _compile_preshuffle_to_cache(
     use_cshuffle_epilog: int,
     use_async_copy: int,
     waves_per_eu: int,
+    xcd_swizzle: int = 0,
     **kwargs,
 ):
     del kwargs
 
     import torch
 
-    has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
-    dev = torch.device("cuda") if has_cuda else torch.device("cpu")
+    dev = torch.device("cpu")
     out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
 
     # FlyDSL preshuffle kernels consume raw quantized bytes for fp8/int8 paths.
@@ -293,7 +323,8 @@ def _compile_preshuffle_to_cache(
     out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
-    stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
+    bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
+    stream = fx.Stream(0)
 
     exe = compile_preshuffle_gemm_a8(
         N=n,
@@ -307,14 +338,28 @@ def _compile_preshuffle_to_cache(
         use_cshuffle_epilog=bool(use_cshuffle_epilog),
         use_async_copy=bool(use_async_copy),
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
+        xcd_swizzle=xcd_swizzle,
     )
-    _compile_executable_to_cache(exe, out, a, b, scale_a, scale_b, m, n, stream)
+    _compile_executable_to_cache(
+        exe,
+        _ptr_view_safe(out),
+        _ptr_view_safe(a),
+        _ptr_view_safe(b),
+        _ptr_view_safe(scale_a),
+        _ptr_view_safe(scale_b),
+        _ptr_view_safe(bias),
+        m,
+        n,
+        stream,
+    )
 
 
 def compile_one_config(
     kernel_name: str, kind: str, m: int, n: int, k: int, cu_num: int = 0, **kwargs
 ) -> dict:
     """Compile one GEMM kernel configuration and save it to cache."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
     aot_arch = cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
@@ -327,7 +372,9 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        with override_env("ARCH", aot_arch), override_env("FLYDSL_GPU_ARCH", aot_arch):
+        with override_env("ARCH", aot_arch), override_env(
+            "FLYDSL_GPU_ARCH", aot_arch
+        ), FakeTensorMode():
             if kind == "hgemm":
                 hgemm_kwargs = dict(kwargs)
                 hgemm_kwargs["target_gfx"] = aot_arch
