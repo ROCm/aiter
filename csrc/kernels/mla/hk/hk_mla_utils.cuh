@@ -136,18 +136,18 @@ struct HkMlaV40DecodeFwdTraits
     //   - PV consumes the *full* d_qk slice (NOPE bf16 + ROPE bf16), so
     //     kVoHeadDim = kQkNopeHeadDim + kQkRopeHeadDim = 512 (vs V3.2 where
     //     V was the 512-wide NOPE-only slice).
-    static constexpr int32_t kKvNumHead          = 1;
-    static constexpr int32_t kKvLoraRank         = 448;
-    static constexpr int32_t kQkNopeHeadDim      = kKvLoraRank;
-    static constexpr int32_t kQkRopeHeadDim      = 64;
-    static constexpr int32_t kQkHeadDim          = kQkNopeHeadDim + kQkRopeHeadDim;
-    static constexpr int32_t kVoHeadDim          = kQkHeadDim;
+    static constexpr int32_t kKvNumHead     = 1;
+    static constexpr int32_t kKvLoraRank    = 448;
+    static constexpr int32_t kQkNopeHeadDim = kKvLoraRank;
+    static constexpr int32_t kQkRopeHeadDim = 64;
+    static constexpr int32_t kQkHeadDim     = kQkNopeHeadDim + kQkRopeHeadDim;
+    static constexpr int32_t kVoHeadDim     = kQkHeadDim;
     // V4 NOPE on-disk packing: NOPE 448 FP8 + dup-E8M0 16 + zero pad 112 = 576
     // bytes per token. Stored in a buffer whose element type is q_nope_t_, so
     // the trailing-axis element count = 576 / sizeof(q_nope_t_). For FP8 that
     // is 576 elements; for any future widening we still express the layout as
     // a byte budget here.
-    static constexpr int32_t kQkPackedNopeBytes  = 576;
+    static constexpr int32_t kQkPackedNopeBytes = 576;
     static_assert(kQkPackedNopeBytes % sizeof(q_nope_t_) == 0,
                   "kQkPackedNopeBytes must be a multiple of sizeof(q_nope_t_).");
     static_assert(kQkPackedNopeBytes % sizeof(kv_nope_t_) == 0,
@@ -190,10 +190,8 @@ struct HkMlaV40DecodeFwdTraits
     using gl_slse = hk::gl<float, 1, -1, kBlockM, 1>;
 
     // lds tiles
-    static_assert(std::is_same_v<kv_nope_t, hk::fp8e4m3>,
-                  "v4.0: kv_nope_t must be fp8e4m3.");
-    static_assert(std::is_same_v<kv_rope_t, hk::bf16>,
-                  "v4.0: kv_rope_t must be bf16.");
+    static_assert(std::is_same_v<kv_nope_t, hk::fp8e4m3>, "v4.0: kv_nope_t must be fp8e4m3.");
+    static_assert(std::is_same_v<kv_rope_t, hk::bf16>, "v4.0: kv_rope_t must be bf16.");
     using st_kv_nope = hk::st_fp8e4m3<kBlockN, kKvLoraRank, hk::st_16x16_s>;
     using st_kv_rope = hk::st_bf<kBlockN, kQkRopeHeadDim, hk::st_16x16_s>;
 };
@@ -286,13 +284,13 @@ __device__ __forceinline__ float e8m0_to_f32(uint32_t b)
 //   encode_s_waitcnt( 0, -1) -> "lgkmcnt(0)" only (drain all LDS).
 constexpr int encode_s_waitcnt(int lgkmcnt, int vmcnt, int expcnt = -1)
 {
-    constexpr int kExpMax  = 0x7;     // 3 bits
-    constexpr int kLgkmMax = 0xF;     // 4 bits
-    constexpr int kVmMax   = 0x3F;    // 6 bits
+    constexpr int kExpMax  = 0x7;  // 3 bits
+    constexpr int kLgkmMax = 0xF;  // 4 bits
+    constexpr int kVmMax   = 0x3F; // 6 bits
 
-    const int e = (expcnt  < 0) ? kExpMax  : ((expcnt  > kExpMax)  ? kExpMax  : expcnt);
+    const int e = (expcnt < 0) ? kExpMax : ((expcnt > kExpMax) ? kExpMax : expcnt);
     const int l = (lgkmcnt < 0) ? kLgkmMax : ((lgkmcnt > kLgkmMax) ? kLgkmMax : lgkmcnt);
-    const int v = (vmcnt   < 0) ? kVmMax   : ((vmcnt   > kVmMax)   ? kVmMax   : vmcnt);
+    const int v = (vmcnt < 0) ? kVmMax : ((vmcnt > kVmMax) ? kVmMax : vmcnt);
 
     return (v & 0xF) | (e << 4) | (l << 8) | (((v >> 4) & 0x3) << 14);
 }
@@ -412,10 +410,10 @@ __device__ __forceinline__ uint32_t float_2_bf16_pair(uint32_t src_0, uint32_t s
 #if defined(__gfx950__)
     asm volatile("v_cvt_pk_bf16_f32 %0, v[%1], v[%2]" : "=v"(result) : "i"(src_0), "i"(src_1));
 #elif defined(__gfx942__)
-    static constexpr uint32_t FP32_NAN = 0x7fff0000;
+    static constexpr uint32_t FP32_NAN            = 0x7fff0000;
     static constexpr uint32_t ROUND_BIAS_FOR_BF16 = 0x7fff;
-    static constexpr uint32_t MERGE_MASK = 0xffff0000;
-    static constexpr uint32_t PERM = 0x07060302;
+    static constexpr uint32_t MERGE_MASK          = 0xffff0000;
+    static constexpr uint32_t PERM                = 0x07060302;
 
     using uint32x2_t = uint32_t __attribute__((ext_vector_type(2)));
     uint32x2_t check_nan;

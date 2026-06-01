@@ -32,10 +32,9 @@ void get_mla_metadata_v1(const torch::Tensor& seqlens_qo_indptr,
                          const std::optional<at::ScalarType> dtype_q,
                          const std::optional<at::ScalarType> dtype_kv);
 
-std::vector<torch::Tensor>
-get_mla_metadata_v1_no_redundant(const torch::Tensor& seqlens_qo_indptr,
-                                 const torch::Tensor& seqlens_kv_indptr,
-                                 const int32_t num_heads_per_head_k,
-                                 const int32_t num_heads_k,
-                                 const bool is_causal,
-                                 const int32_t kv_granularity);
+std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(const torch::Tensor& seqlens_qo_indptr,
+                                                            const torch::Tensor& seqlens_kv_indptr,
+                                                            const int32_t num_heads_per_head_k,
+                                                            const int32_t num_heads_k,
+                                                            const bool is_causal,
+                                                            const int32_t kv_granularity);

@@ -254,9 +254,7 @@ class QManager8bitsV3
     __device__ QManager8bitsV3() {}
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
-    {
-        return T::kNumWarps * get_lds_size_per_warp_in_byte();
-    }
+    { return T::kNumWarps * get_lds_size_per_warp_in_byte(); }
 
     template <uint32_t GPR_NOPE_START, uint32_t GPR_ROPE_START>
     __device__ __forceinline__ void load_q_to_gpr(const typename T::gl_q& q_buffer,
@@ -437,9 +435,7 @@ class QManager8bitsV4
     __device__ QManager8bitsV4() {}
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
-    {
-        return T::kNumWarps * get_lds_size_per_block_in_byte();
-    }
+    { return T::kNumWarps * get_lds_size_per_block_in_byte(); }
 
     template <uint32_t GPR_NOPE_START, uint32_t GPR_ROPE_START>
     __device__ __forceinline__ void load_q_to_gpr(const typename T::gl_q& q_buffer,
@@ -579,9 +575,7 @@ class KvManager8bitsV1
     // Layout is sliced into kQkHeadDim/kNumColsPerWarp = 72 (576/8) per-warp 32x8 strips,
     // each strip occupying kWarpOffset(=272) bytes including 2 DW padding.
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
-    {
-        return kWarpOffset * (T::kQkHeadDim / kNumColsPerWarp);
-    }
+    { return kWarpOffset * (T::kQkHeadDim / kNumColsPerWarp); }
 
     __device__ __forceinline__ static uint32_t get_kv_ld_row_base_idx(const int32_t warp_idx)
     {
@@ -597,9 +591,7 @@ class KvManager8bitsV1
 
     __device__ __forceinline__ static uintptr_t get_p_lds_kv_warp_base(const int32_t warp_idx,
                                                                        const uintptr_t p_lds_kv)
-    {
-        return p_lds_kv + warp_idx * kWarpOffset;
-    }
+    { return p_lds_kv + warp_idx * kWarpOffset; }
 
     // Load 32x64 elements from VRAM to LDS
     // Each warp loads 32x8 elements. Padding 2DW between 32x8 blocks.
@@ -820,9 +812,7 @@ class KvManager8bitsV2
 
     __device__ __forceinline__ static uintptr_t get_p_lds_kv_warp_base(const int32_t warp_idx,
                                                                        const uintptr_t p_lds_kv)
-    {
-        return p_lds_kv + warp_idx * kNumBytesPerSubBlock;
-    }
+    { return p_lds_kv + warp_idx * kNumBytesPerSubBlock; }
 
     // Load 32x64 elements from VRAM to LDS
     // Each warp loads 4x64 elements. Padding 2DW between 4x64 blocks.
@@ -953,11 +943,11 @@ class KvManager8bitsV2
         // kRowOffset/kColOffset terms are constexpr-folded into kFixedOffset.
         // kRowOffset==16 shifts row_phy by +2 (always lands in row_phy%4),
         // contributing +(kRowOffset/16) * 2 * kNumBytesPerRow.
-        const uint32_t lane_idx       = opus::lane_id();
-        const uint32_t row            = lane_idx % kMfmaRows;
-        const uint32_t col            = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
-        const uintptr_t p_lds_kv_lane = p_lds_kv + (row / 2) * kNumBytesPerSubBlock +
-                                        (row % 2) * kNumBytesPerRow + col * sizeof(kv_t);
+        const uint32_t lane_idx         = opus::lane_id();
+        const uint32_t row              = lane_idx % kMfmaRows;
+        const uint32_t col              = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
+        const uintptr_t p_lds_kv_lane   = p_lds_kv + (row / 2) * kNumBytesPerSubBlock +
+                                          (row % 2) * kNumBytesPerRow + col * sizeof(kv_t);
         constexpr uint32_t kFixedOffset = (kRowOffset / 16) * 2 * kNumBytesPerRow +
                                           (kColOffset / kNumCols) * kNumBytesPerBlock +
                                           (kColOffset % kNumCols) * sizeof(kv_t);
@@ -1124,9 +1114,7 @@ class KvManager8bitsV3
     // 2-sub-block-with-padding).
     __device__ __forceinline__ static uintptr_t get_p_lds_kv_warp_base(const int32_t warp_idx,
                                                                        const uintptr_t p_lds_kv)
-    {
-        return p_lds_kv + warp_idx * kNumBytesPer2SubBlocksWithPadding;
-    }
+    { return p_lds_kv + warp_idx * kNumBytesPer2SubBlocksWithPadding; }
 
     // Load 32x64 elements from VRAM to LDS
     // Each warp loads two 4x32 elements. Padding 2DW between warps.
@@ -1404,7 +1392,6 @@ class KvManager8bitsV3
 #endif
     }
 };
-
 
 template <typename T>
 class VtManager8bitsV1
@@ -1915,5 +1902,3 @@ class OManager32bitsV2
 // perm on bits [5:3] of the col-element index) to dodge Site C ds_write_b128 bank
 // conflicts. The PV mfma therefore produces oaccu in that same permuted col order
 // (V's col axis == O's col axis). These V3 OManagers cover a full 64-col wave-tile
-
-

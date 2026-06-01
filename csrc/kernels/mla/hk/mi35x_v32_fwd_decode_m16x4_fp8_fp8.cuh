@@ -1329,13 +1329,13 @@ void hk_mi35x_mla_v32_fwd_decode_m16x4_fp8_fp8(aiter_tensor_t& query,
 #define DISPATCH_PAGE_SIZE(PageSize)                                      \
     case PageSize: {                                                      \
         using Traits = HkMlaV32DecodeFwdTraits<hk::fp8e4m3,               \
-                                            hk::fp8e4m3,                  \
-                                            hk::bf16,                     \
-                                            /*kBlockN_=*/64,              \
-                                            /*kNumWarps_=*/4,             \
-                                            /*kOccupancy_=*/2,            \
-                                            /*kBlockM_=*/64,              \
-                                            /*kPageSize_=*/PageSize>;     \
+                                               hk::fp8e4m3,               \
+                                               hk::bf16,                  \
+                                               /*kBlockN_=*/64,           \
+                                               /*kNumWarps_=*/4,          \
+                                               /*kOccupancy_=*/2,         \
+                                               /*kBlockM_=*/64,           \
+                                               /*kPageSize_=*/PageSize>;  \
         mi35x_mla_v32_fwd_decode_m16x4_fp8_fp8<Traits>(query,             \
                                                        kv_buffer,         \
                                                        qo_indptr,         \

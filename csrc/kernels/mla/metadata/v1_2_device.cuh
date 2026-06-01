@@ -316,9 +316,8 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
 
                     auto fill_work_info = [&]() {
                         const int32_t curr_batch_kv =
-                            Traits::kIsSparse
-                                ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
-                                : curr_batch;
+                            Traits::kIsSparse ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
+                                              : curr_batch;
                         MlaWorkInfo work_info{};
                         work_info.batch_idx = curr_batch_kv;
                         work_info.qo_start =
@@ -491,8 +490,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     // occupancy slot actually receives work. Detection mirrors hk_decode_fwd
     // dispatch (num_heads * max_seqlen_qo == 64) and uses ORIGINAL
     // num_heads/max_seqlen_qo (pre-fold).
-    const bool is_hk_m16x4 = (arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
-                             (num_heads * max_seqlen_qo == 64) && enable_experimental;
+    const bool is_hk_m16x4           = (arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
+                                       (num_heads * max_seqlen_qo == 64) && enable_experimental;
     const int32_t cluster_multiplier = is_hk_m16x4 ? 2 : 1;
     const int32_t num_clusters = (dev_prop.multiProcessorCount * cluster_multiplier) / num_heads_k;
 
@@ -570,10 +569,9 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.tail_done_threshold          = max_seqlen_qo;
 
     int32_t kPackedQoLenPerWg = 128;
-    if ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8 &&
-        (num_heads * max_seqlen_qo >= 64) && (num_heads <= 64) &&
-        (((num_heads * max_seqlen_qo) < 128) ||
-         (num_heads == 48))) {
+    if((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8 && (num_heads * max_seqlen_qo >= 64) &&
+       (num_heads <= 64) && (((num_heads * max_seqlen_qo) < 128) || (num_heads == 48)))
+    {
         kPackedQoLenPerWg = 64;
     }
 

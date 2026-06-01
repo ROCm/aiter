@@ -24,23 +24,23 @@ void hk_mla_v40_decode_fwd(aiter_tensor_t& query,
     const int32_t num_head = query.size(1);
     const std::string gfx  = get_gpu_arch();
 
-    if ((num_head * max_seqlen_q == 128) && (gfx == "gfx950"))
+    if((num_head * max_seqlen_q == 128) && (gfx == "gfx950"))
     {
         hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(query,
-                                                          query_rope,
-                                                          kv_buffer,
-                                                          kv_buffer_rope,
-                                                          qo_indptr,
-                                                          kv_indptr,
-                                                          kv_page_indices,
-                                                          kv_last_page_lens,
-                                                          work_indptr,
-                                                          work_info_set,
-                                                          max_seqlen_q,
-                                                          softmax_scale,
-                                                          split_output,
-                                                          split_lse,
-                                                          final_output);
+                                                               query_rope,
+                                                               kv_buffer,
+                                                               kv_buffer_rope,
+                                                               qo_indptr,
+                                                               kv_indptr,
+                                                               kv_page_indices,
+                                                               kv_last_page_lens,
+                                                               work_indptr,
+                                                               work_info_set,
+                                                               max_seqlen_q,
+                                                               softmax_scale,
+                                                               split_output,
+                                                               split_lse,
+                                                               final_output);
     }
     else
     {

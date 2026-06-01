@@ -648,18 +648,23 @@ def mla_v40_decode_fwd(
             o,
         )
         import os as _os
+
         if _os.environ.get("V40_PROBE", ""):
             _l = logits.float()
             _a = attn_lse.float()
             print(f"[V40_PROBE] logits shape={tuple(_l.shape)} dtype={_l.dtype}")
-            print(f"[V40_PROBE] logits nan%={(_l.isnan().float().mean().item()*100):.2f} "
-                  f"inf%={(_l.isinf().float().mean().item()*100):.2f} "
-                  f"min={_l[~_l.isnan()&~_l.isinf()].min().item() if (~_l.isnan()&~_l.isinf()).any() else float('nan'):.4g} "
-                  f"max={_l[~_l.isnan()&~_l.isinf()].max().item() if (~_l.isnan()&~_l.isinf()).any() else float('nan'):.4g}")
-            print(f"[V40_PROBE] lse nan%={(_a.isnan().float().mean().item()*100):.2f} "
-                  f"inf%={(_a.isinf().float().mean().item()*100):.2f} "
-                  f"min={_a[~_a.isnan()&~_a.isinf()].min().item() if (~_a.isnan()&~_a.isinf()).any() else float('nan'):.4g} "
-                  f"max={_a[~_a.isnan()&~_a.isinf()].max().item() if (~_a.isnan()&~_a.isinf()).any() else float('nan'):.4g}")
+            print(
+                f"[V40_PROBE] logits nan%={(_l.isnan().float().mean().item()*100):.2f} "
+                f"inf%={(_l.isinf().float().mean().item()*100):.2f} "
+                f"min={_l[~_l.isnan()&~_l.isinf()].min().item() if (~_l.isnan()&~_l.isinf()).any() else float('nan'):.4g} "
+                f"max={_l[~_l.isnan()&~_l.isinf()].max().item() if (~_l.isnan()&~_l.isinf()).any() else float('nan'):.4g}"
+            )
+            print(
+                f"[V40_PROBE] lse nan%={(_a.isnan().float().mean().item()*100):.2f} "
+                f"inf%={(_a.isinf().float().mean().item()*100):.2f} "
+                f"min={_a[~_a.isnan()&~_a.isinf()].min().item() if (~_a.isnan()&~_a.isinf()).any() else float('nan'):.4g} "
+                f"max={_a[~_a.isnan()&~_a.isinf()].max().item() if (~_a.isnan()&~_a.isinf()).any() else float('nan'):.4g}"
+            )
             print(f"[V40_PROBE] logits[0,0,0,:8] = {_l[0,0,0,:8].cpu().tolist()}")
             print(f"[V40_PROBE] lse[0,0,:8,0]    = {_a[0,0,:8,0].cpu().tolist()}")
     else:

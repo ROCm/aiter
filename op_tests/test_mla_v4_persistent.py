@@ -849,15 +849,17 @@ def test_mla_v4(
         total_kv = int(seq_lens_kv.sum().item())
         flops = decode_qlen * total_kv * nhead * (V4_DIM_QK + V4_DIM_V) * 2
 
-        kv_bytes = total_kv * nhead_kv * (
-            V4_DIM_NOPE * 1            # FP8 NoPE
-            + V4_NUM_TILES * 1         # E8M0 scales actually consumed (7 B/token)
-            + V4_DIM_ROPE * 2          # BF16 RoPE
+        kv_bytes = (
+            total_kv
+            * nhead_kv
+            * (
+                V4_DIM_NOPE * 1  # FP8 NoPE
+                + V4_NUM_TILES * 1  # E8M0 scales actually consumed (7 B/token)
+                + V4_DIM_ROPE * 2  # BF16 RoPE
+            )
         )
-        q_bytes = total_q * nhead * (
-            V4_DIM_NOPE * 1
-            + V4_NUM_TILES * 1
-            + V4_DIM_ROPE * 2
+        q_bytes = (
+            total_q * nhead * (V4_DIM_NOPE * 1 + V4_NUM_TILES * 1 + V4_DIM_ROPE * 2)
         )
         out_bytes = total_q * nhead * V4_DIM_V * out_v40.element_size()
         bytes_v40 = kv_bytes + q_bytes + out_bytes

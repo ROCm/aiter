@@ -36,26 +36,21 @@ using namespace hk_mla;
 //   LDS  position : 0 4 1 5 2 6 3 7      <- store it at this LDS slot
 //                                           (= inverse, used by sb8_perm)
 //
-__device__ __forceinline__ static constexpr uint32_t
-sb8_perm_col_elems(uint32_t p)
+__device__ __forceinline__ static constexpr uint32_t sb8_perm_col_elems(uint32_t p)
 {
     // data -> LDS (forward). Operates on bits [5:3] of p.
     //   p_bit3 (LSB of sub_d) -> L_bit5 (MSB of sub_L)
     //   p_bit4,5 (high 2 bits of sub_d) -> L_bit3,4 (low 2 bits of sub_L)
-    return (p & 0x7u) | (((p >> 3) & 0x1u) << 5) | (((p >> 3) & 0x6u) << 2) |
-           (p & ~0x3Fu);
+    return (p & 0x7u) | (((p >> 3) & 0x1u) << 5) | (((p >> 3) & 0x6u) << 2) | (p & ~0x3Fu);
 }
 
-__device__ __forceinline__ static constexpr uint32_t
-sb8_inv_perm_col_elems(uint32_t L)
+__device__ __forceinline__ static constexpr uint32_t sb8_inv_perm_col_elems(uint32_t L)
 {
     // LDS -> data (inverse).
     //   L_bit5 -> p_bit3
     //   L_bit3,4 -> p_bit4,5
-    return (L & 0x7u) | (((L >> 5) & 0x1u) << 3) | ((L & 0x18u) << 1) |
-           (L & ~0x3Fu);
+    return (L & 0x7u) | (((L >> 5) & 0x1u) << 3) | ((L & 0x18u) << 1) | (L & ~0x3Fu);
 }
-
 
 // V4.0 Q manager: separate FP8 NoPE + BF16 RoPE buffers. Q is split: Q[:, 0:256]
 // lives pinned in VGPR after fp8->bf16 cvt+scale; Q[:, 256:512] is converted to
@@ -112,8 +107,7 @@ class QManager8to16bitsV1
                   "QManager8to16bitsV1: q_rope_t must be bf16.");
     static_assert(T::kQkNopeHeadDim == 448, "QManager8to16bitsV1: NOPE width must be 448.");
     static_assert(T::kQkRopeHeadDim == 64, "QManager8to16bitsV1: ROPE width must be 64.");
-    static_assert(T::kQkHeadDim == 512,
-                  "QManager8to16bitsV1: kQkHeadDim must be 512 (NOPE+ROPE).");
+    static_assert(T::kQkHeadDim == 512, "QManager8to16bitsV1: kQkHeadDim must be 512 (NOPE+ROPE).");
     static_assert(T::kBlockM == 128, "QManager8to16bitsV1: kBlockM must be 128.");
     static_assert(T::kNumWarps == 8, "QManager8to16bitsV1: requires 8 warps.");
     static_assert(T::kTileM == 16, "QManager8to16bitsV1: kTileM must be 16.");
@@ -134,63 +128,58 @@ class QManager8to16bitsV1
     static_assert(kLdsHalfNopeCols + kLdsHalfRopeCols == kLdsHalfCols,
                   "QManager8to16bitsV1: LDS half geometry mismatch.");
 
-    static constexpr uint32_t kFinalLdsRows     = T::kBlockM;                       // 128
-    static constexpr uint32_t kFinalLdsRowTiles = kFinalLdsRows / kSubBlockRows;    // 8
-    static constexpr uint32_t kFinalLdsColTiles = kLdsHalfCols / kSubBlockCols;     // 8
+    static constexpr uint32_t kFinalLdsRows     = T::kBlockM;                    // 128
+    static constexpr uint32_t kFinalLdsRowTiles = kFinalLdsRows / kSubBlockRows; // 8
+    static constexpr uint32_t kFinalLdsColTiles = kLdsHalfCols / kSubBlockCols;  // 8
     static constexpr uint32_t kFinalLdsBytes =
-        kFinalLdsRows * kLdsHalfCols * sizeof(hk::bf16);                            // 64 KB
+        kFinalLdsRows * kLdsHalfCols * sizeof(hk::bf16); // 64 KB
     // Wave-major contiguous layout: each wave owns 16 rows x 256 cols of bf16
     // = 8 KB exclusively, contiguous within the 64 KB final region. This is the
     // KEY invariant for race-freedom: wave w's Phase 1 staging aliases the
     // first 2 KB of wave w's OWN 8 KB final region, so Phase 2 stores from
     // OTHER waves never touch wave w's staging bytes (and vice versa).
     // No inter-wave barrier needed between Phase 1 (staging) and Phase 2 (final).
-    static constexpr uint32_t kWarpFinalBytes =
-        kFinalLdsColTiles * kSubBlockBytes;                                          // 8192
+    static constexpr uint32_t kWarpFinalBytes = kFinalLdsColTiles * kSubBlockBytes; // 8192
 
     // Phase 1 chunking (VGPR half, 4 chunks of 64 cols each).
-    static constexpr uint32_t kP1ChunkCols          = 64;
-    static constexpr uint32_t kP1NumChunks          = kVgprHalfCols / kP1ChunkCols;       // 4
-    static constexpr uint32_t kP1StagingBytesPerWarp = T::kTileM * kP1ChunkCols * sizeof(q_nope_t); // 1024
-    static constexpr uint32_t kP1NumStagingBuffers  = 2;                                  // double-buffer
+    static constexpr uint32_t kP1ChunkCols = 64;
+    static constexpr uint32_t kP1NumChunks = kVgprHalfCols / kP1ChunkCols; // 4
+    static constexpr uint32_t kP1StagingBytesPerWarp =
+        T::kTileM * kP1ChunkCols * sizeof(q_nope_t);    // 1024
+    static constexpr uint32_t kP1NumStagingBuffers = 2; // double-buffer
     static constexpr uint32_t kP1StagingBytesPerWarpTotal =
-        kP1NumStagingBuffers * kP1StagingBytesPerWarp;                                    // 2048
+        kP1NumStagingBuffers * kP1StagingBytesPerWarp; // 2048
     static_assert(kWarpFinalBytes >= kP1StagingBytesPerWarpTotal,
                   "QManager8to16bitsV1: per-warp Phase 1 staging must fit within the "
                   "wave's OWN Phase 2 final region (wave-major contiguous layout).");
 
     // Phase 2 chunking (LDS half, 3 NoPE chunks of 64 cols + 1 RoPE chunk of 64 cols).
-    static constexpr uint32_t kP2ChunkCols      = 64;
-    static constexpr uint32_t kP2NumNopeChunks  = kLdsHalfNopeCols / kP2ChunkCols;        // 3
+    static constexpr uint32_t kP2ChunkCols     = 64;
+    static constexpr uint32_t kP2NumNopeChunks = kLdsHalfNopeCols / kP2ChunkCols; // 3
     static_assert(kLdsHalfRopeCols == kP2ChunkCols,
                   "QManager8to16bitsV1: RoPE chunk currently assumed to be one full chunk.");
 
     // Per-row record byte stride for the packed fp8 NoPE + scale + pad input.
-    static constexpr uint32_t kPackedNopeStride =
-        T::kQkPackedNopeQElems * sizeof(q_nope_t);                                        // 576
-    static constexpr uint32_t kRopeStride = T::kQkRopeHeadDim * sizeof(q_rope_t);         // 128
-    static constexpr uint32_t kScaleBaseOff = 448u; // E8M0 scales start at byte 448 of record.
+    static constexpr uint32_t kPackedNopeStride = T::kQkPackedNopeQElems * sizeof(q_nope_t); // 576
+    static constexpr uint32_t kRopeStride       = T::kQkRopeHeadDim * sizeof(q_rope_t);      // 128
+    static constexpr uint32_t kScaleBaseOff     = 448u; // E8M0 scales start at byte 448 of record.
 
     // Sub-block byte offset inside the 64 KB final region (wave-major layout).
     // Wave w owns the contiguous 8 KB region [w*8192, (w+1)*8192); inside that,
     // col_tile c occupies [c*1024, (c+1)*1024). Signature takes warp_idx (not
     // row_tile) because row_tile == warp_idx everywhere this is called: each
     // warp owns one of the 8 row-tiles of the 128-row Q block.
-    __device__ __forceinline__ static constexpr uint32_t
-        sub_block_byte_offset(uint32_t warp_idx, uint32_t col_tile)
-    {
-        return warp_idx * kWarpFinalBytes + col_tile * kSubBlockBytes;
-    }
+    __device__ __forceinline__ static constexpr uint32_t sub_block_byte_offset(uint32_t warp_idx,
+                                                                               uint32_t col_tile)
+    { return warp_idx * kWarpFinalBytes + col_tile * kSubBlockBytes; }
 
     // Per-warp staging base. Aliases the first 2 KB of the wave's OWN 8 KB
     // final region. After Phase 2 begins overwriting these bytes (with the
     // bf16-cvt'd cols 256..512 of Q), no other wave touches them -- so the
     // intra-wave overwrite is safely sequenced by per-wave program order.
-    __device__ __forceinline__ static uintptr_t
-        p1_warp_staging_base(uintptr_t p_lds_q, uint32_t warp_idx)
-    {
-        return p_lds_q + warp_idx * kWarpFinalBytes;
-    }
+    __device__ __forceinline__ static uintptr_t p1_warp_staging_base(uintptr_t p_lds_q,
+                                                                     uint32_t warp_idx)
+    { return p_lds_q + warp_idx * kWarpFinalBytes; }
 
     // ---- Inline-asm v_cvt_scalef32_pk_bf16_fp8 with a compile-time pinned
     //      destination VGPR. The clang builtin allocates a fresh VGPR for the
@@ -200,8 +189,8 @@ class QManager8to16bitsV1
     //      (lanes 0,1 of the 4-element source dword), opsel=true picks the high
     //      pair (lanes 2,3). ----
     template <uint32_t DST_GPR, bool kOpSelHigh>
-    __device__ __forceinline__ static void
-        cvt_scalef32_pk_bf16_fp8_pinned(uint32_t fp8_dw, float scale_f)
+    __device__ __forceinline__ static void cvt_scalef32_pk_bf16_fp8_pinned(uint32_t fp8_dw,
+                                                                           float scale_f)
     {
         static_assert(DST_GPR < 256, "Pinned dst must be a VGPR (id < 256).");
         if constexpr(kOpSelHigh)
@@ -234,26 +223,23 @@ class QManager8to16bitsV1
     // just drains vmcnt and reads from the cached dwords.
     template <uint32_t kChunkIdx, uint32_t kBufIdx>
     __device__ __forceinline__ static void p1_vmem_to_staging_chunk(
-        const q_nope_t* p_q_warp,
-        const uintptr_t p_lds_warp_staging,
-        uint32_t&       s_dw)
+        const q_nope_t* p_q_warp, const uintptr_t p_lds_warp_staging, uint32_t& s_dw)
     {
         static_assert(kChunkIdx < kP1NumChunks, "p1_vmem_to_staging_chunk: bad kChunkIdx.");
-        static_assert(kBufIdx   < kP1NumStagingBuffers, "p1_vmem_to_staging_chunk: bad kBufIdx.");
+        static_assert(kBufIdx < kP1NumStagingBuffers, "p1_vmem_to_staging_chunk: bad kBufIdx.");
 
-        constexpr uint32_t kColInRecord    = kChunkIdx * kP1ChunkCols;          // 0,64,128,192
-        constexpr int      kVOffI          = static_cast<int>(kColInRecord);
-        constexpr uint32_t kStagingI       = kBufIdx * kP1StagingBytesPerWarp;
+        constexpr uint32_t kColInRecord = kChunkIdx * kP1ChunkCols; // 0,64,128,192
+        constexpr int kVOffI            = static_cast<int>(kColInRecord);
+        constexpr uint32_t kStagingI    = kBufIdx * kP1StagingBytesPerWarp;
         // V4 packs ONE E8M0 scale per 64-col tile, duplicated to 2 bytes for
         // 16-bit alignment. Chunk == tile (both 64 cols), so each chunk has
         // exactly ONE scale shared across its 2 mfma A-tiles (cols [0,32) and
         // [32,64) of the chunk). Tile T's dup pair lives at bytes [448+2T, +2T+1].
-        constexpr uint32_t kScaleByteInRec =
-            kScaleBaseOff + 2u * kChunkIdx;                                     // 448 + 2*kChunkIdx
+        constexpr uint32_t kScaleByteInRec = kScaleBaseOff + 2u * kChunkIdx; // 448 + 2*kChunkIdx
 
-        const uint32_t lane_idx     = opus::lane_id();
-        const uint32_t row_in_warp  = lane_idx >> 2;                            // 0..15
-        const uint32_t col_quad     = lane_idx & 3u;                            // 0..3
+        const uint32_t lane_idx    = opus::lane_id();
+        const uint32_t row_in_warp = lane_idx >> 2; // 0..15
+        const uint32_t col_quad    = lane_idx & 3u; // 0..3
         // Swizzle: 16x64 chunk tiled into 4x4 sub-tiles (4 rows x 16 cols).
         // On the sub-tile-row band selected by S = (row_in_warp>>2)&1 (rows
         // 4..7 and 12..15), swap the upper/lower pair of col sub-tiles
@@ -266,16 +252,16 @@ class QManager8to16bitsV1
         // quads. LDS-write side is conflict-free regardless: the HW-fixed
         // buffer_load_dwordx4_lds destination is lane T -> T*16, independent
         // of the data permutation.
-        const uint32_t S            = (lane_idx >> 4) & 1u;                     // = (row_in_warp>>2)&1
-        const uint32_t col_quad_swz = col_quad ^ (S << 1);                      // 0..3 (physical)
+        const uint32_t S            = (lane_idx >> 4) & 1u; // = (row_in_warp>>2)&1
+        const uint32_t col_quad_swz = col_quad ^ (S << 1);  // 0..3 (physical)
         const uint32_t v_off        = row_in_warp * kPackedNopeStride + col_quad_swz * 16u;
         // Scale must be loaded for the row that the CONSUMER attributes to this
         // lane (consumer uses lane & 15, NOT lane >> 2 -- see
         // p1_staging_to_vgpr_chunk). Otherwise each lane scales row R's fp8 data
         // by row (R/4)'s scale, which is silently wrong on near-uniform data and
         // catastrophic on outliers.
-        const uint32_t scale_row    = lane_idx & 15u;
-        const uint32_t v_off_scale  = scale_row * kPackedNopeStride;
+        const uint32_t scale_row   = lane_idx & 15u;
+        const uint32_t v_off_scale = scale_row * kPackedNopeStride;
 
         // `buffer_load_dwordx4 lds:` adds i_offset to BOTH the vmem source AND
         // the LDS destination. V32-style trick: keep the column stride in the
@@ -302,11 +288,8 @@ class QManager8to16bitsV1
             0);
 
         const hk::buffer_resource br = hk::make_buffer_resource(
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_q_warp)),
-            0xffffffff,
-            0x00020000);
-        s_dw = hkm::buffer_load_ubyte(
-            br, v_off_scale, /*s_off=*/0u, /*i_off=*/kScaleByteInRec);
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_q_warp)), 0xffffffff, 0x00020000);
+        s_dw = hkm::buffer_load_ubyte(br, v_off_scale, /*s_off=*/0u, /*i_off=*/kScaleByteInRec);
     }
 
     // ---- Phase 1: 1 fp8 chunk in staging -> 2 mfma A-tiles in VGPR ----
@@ -323,18 +306,17 @@ class QManager8to16bitsV1
     // earlier (no waitcnt in between is fine; this helper drains vmcnt first
     // to ensure the staging bytes and scale dwords are valid before the cvt).
     template <uint32_t kChunkIdx, uint32_t kBufIdx, uint32_t GPR_NOPE_VGPR_START>
-    __device__ __forceinline__ static void p1_staging_to_vgpr_chunk(
-        const uintptr_t p_lds_warp_staging,
-        const uint32_t  s_dw)
+    __device__ __forceinline__ static void
+    p1_staging_to_vgpr_chunk(const uintptr_t p_lds_warp_staging, const uint32_t s_dw)
     {
         static_assert(kChunkIdx < kP1NumChunks, "p1_staging_to_vgpr_chunk: bad kChunkIdx.");
-        static_assert(kBufIdx   < kP1NumStagingBuffers, "p1_staging_to_vgpr_chunk: bad kBufIdx.");
+        static_assert(kBufIdx < kP1NumStagingBuffers, "p1_staging_to_vgpr_chunk: bad kBufIdx.");
 
         constexpr uint32_t kStagingI      = kBufIdx * kP1StagingBytesPerWarp;
         constexpr uint32_t kVgprChunkBase = GPR_NOPE_VGPR_START + 8u * kChunkIdx;
 
         const uint32_t lane_idx    = opus::lane_id();
-        const uint32_t row_in_warp = lane_idx & 15u;                           // 0..15 (= row in warp tile)
+        const uint32_t row_in_warp = lane_idx & 15u; // 0..15 (= row in warp tile)
 
         // Swizzle-aware addressing (mirror of p1_vmem_to_staging_chunk writer).
         // Logical col sub-tile within chunk indexes a 16-col slot.
@@ -355,11 +337,11 @@ class QManager8to16bitsV1
         //   C_log = cb ;  byte_off = j * 8.
         // Both iters share C_phys, so the +8 byte delta from iter 0 to iter 1
         // folds into the ds_read_b64 imm offset -- no second addr VGPR.
-        const uint32_t S            = (lane_idx >> 2) & 1u;                    // = (row_in_warp>>2)&1
-        const uint32_t cb           = (lane_idx >> 4) & 3u;                    // 0..3
-        const uint32_t C_log        = cb;                                      // 0..3
-        const uint32_t C_phys       = C_log ^ (S << 1);
-        const uint32_t byte_off     = 0u;                                      // iter 0 base
+        const uint32_t S        = (lane_idx >> 2) & 1u; // = (row_in_warp>>2)&1
+        const uint32_t cb       = (lane_idx >> 4) & 3u; // 0..3
+        const uint32_t C_log    = cb;                   // 0..3
+        const uint32_t C_phys   = C_log ^ (S << 1);
+        const uint32_t byte_off = 0u; // iter 0 base
 
         // kStagingI is still folded into the ds_read imm `offset:` field so
         // the two staging buffers share these per-lane address computations.
@@ -375,8 +357,7 @@ class QManager8to16bitsV1
         //    buffer_load_lds increments lgkmcnt for its LDS-store half; ds_read
         //    of that LDS region can see stale data unless lgkmcnt is drained
         //    first. Phase 1 is a one-shot warmup -- the lost pipelining is fine.
-        __builtin_amdgcn_s_waitcnt(
-            hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/0));
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/0));
         __builtin_amdgcn_sched_barrier(0);
 
         // 16 fp8/lane (both iters) via a single ds_read_b128. The two iters
@@ -385,8 +366,8 @@ class QManager8to16bitsV1
         // (addr>>4)&15 = (row&3)*4 + C_phys. With C_phys = cb ^ (S<<1) the
         // 16 lanes per non-linear b128 cycle land on distinct quads in
         // {0..15} -- conflict-free on all 4 cycles.
-        const hk::u32x4 fp8 = hkm::ds_read_b128<hk::u32x4>(
-            static_cast<uint32_t>(addr_base), static_cast<int>(kStagingI));
+        const hk::u32x4 fp8 = hkm::ds_read_b128<hk::u32x4>(static_cast<uint32_t>(addr_base),
+                                                           static_cast<int>(kStagingI));
 
         // V4 shares one E8M0 scale across the full 64-col chunk -> single
         // scale_f for both 32-col mfma A-tiles (iter0 cols [0,32), iter1
@@ -397,21 +378,20 @@ class QManager8to16bitsV1
         // consumes them. Pair with sched_barrier(0) -- the cvt is a pure-SSA
         // intrinsic and is otherwise free to be hoisted past a bare s_waitcnt
         // (verified by ISA inspection on KvManager8to16bitsV1).
-        __builtin_amdgcn_s_waitcnt(
-            hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
         __builtin_amdgcn_sched_barrier(0);
 
         // Direct cvt into the caller-pinned VGPR slots (no v_mov trampoline).
         // Per iter: dword 0 -> bf16 dw[0,1] (cols 0..3), dword 1 -> bf16
         // dw[2,3] (cols 4..7). opsel false/true selects low/high fp8 pair.
         cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 0u, false>(fp8[0], scale_f);
-        cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 1u, true >(fp8[0], scale_f);
+        cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 1u, true>(fp8[0], scale_f);
         cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 2u, false>(fp8[1], scale_f);
-        cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 3u, true >(fp8[1], scale_f);
+        cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 3u, true>(fp8[1], scale_f);
         cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 4u, false>(fp8[2], scale_f);
-        cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 5u, true >(fp8[2], scale_f);
+        cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 5u, true>(fp8[2], scale_f);
         cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 6u, false>(fp8[3], scale_f);
-        cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 7u, true >(fp8[3], scale_f);
+        cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 7u, true>(fp8[3], scale_f);
     }
 
     // ---- Phase 2: NoPE fp8 chunk -> bf16 LDS (cvt-at-store, mirrors KvManager) ----
@@ -424,54 +404,44 @@ class QManager8to16bitsV1
     //   p2_vmem_to_vgpr_nope_chunk : issues the 2 vmem ops, returns dwords
     //   p2_cvt_store_nope_chunk    : drains vmcnt, cvts, ds_writes
     template <uint32_t kChunkIdx>
-    __device__ __forceinline__ static void p2_vmem_to_vgpr_nope_chunk(
-        const q_nope_t* p_q_warp,
-        hk::u32x4&      nope_dw,
-        uint32_t&       scale_dw)
+    __device__ __forceinline__ static void
+    p2_vmem_to_vgpr_nope_chunk(const q_nope_t* p_q_warp, hk::u32x4& nope_dw, uint32_t& scale_dw)
     {
-        static_assert(kChunkIdx < kP2NumNopeChunks,
-                      "p2_vmem_to_vgpr_nope_chunk: bad kChunkIdx.");
-        constexpr uint32_t kColInRecord   = kVgprHalfCols + kChunkIdx * kP2ChunkCols;   // 256,320,384
+        static_assert(kChunkIdx < kP2NumNopeChunks, "p2_vmem_to_vgpr_nope_chunk: bad kChunkIdx.");
+        constexpr uint32_t kColInRecord = kVgprHalfCols + kChunkIdx * kP2ChunkCols; // 256,320,384
         constexpr uint32_t kScaleByteBase =
-            kScaleBaseOff + kColInRecord / kSubBlockCols;                               // 456,458,460
+            kScaleBaseOff + kColInRecord / kSubBlockCols; // 456,458,460
 
         const hk::buffer_resource br = hk::make_buffer_resource(
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_q_warp)),
-            0xffffffff,
-            0x00020000);
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_q_warp)), 0xffffffff, 0x00020000);
 
         const uint32_t lane_idx    = opus::lane_id();
-        const uint32_t row_in_warp = lane_idx >> 2;                                    // 0..15
-        const uint32_t col_group   = lane_idx & 3u;                                    // 0..3
+        const uint32_t row_in_warp = lane_idx >> 2; // 0..15
+        const uint32_t col_group   = lane_idx & 3u; // 0..3
 
         // Bank-conflict swizzle lives on the LDS-write side (see
         // p2_cvt_store_nope_chunk) to mirror KvManager8to16bitsV1's
         // cvt_and_store_kv_tile pattern. vmem-load address is straight.
-        const uint32_t v_off_nope = row_in_warp * kPackedNopeStride + col_group * 16u;
-        const uint32_t v_off_scale =
-            row_in_warp * kPackedNopeStride + (col_group >> 1);                        // +0/+1
+        const uint32_t v_off_nope  = row_in_warp * kPackedNopeStride + col_group * 16u;
+        const uint32_t v_off_scale = row_in_warp * kPackedNopeStride + (col_group >> 1); // +0/+1
 
-        nope_dw  = hkm::buffer_load_dwordx4(
-            br, v_off_nope, /*s_off=*/0u, /*i_off=*/kColInRecord);
-        scale_dw = hkm::buffer_load_ubyte(
-            br, v_off_scale, /*s_off=*/0u, /*i_off=*/kScaleByteBase);
+        nope_dw  = hkm::buffer_load_dwordx4(br, v_off_nope, /*s_off=*/0u, /*i_off=*/kColInRecord);
+        scale_dw = hkm::buffer_load_ubyte(br, v_off_scale, /*s_off=*/0u, /*i_off=*/kScaleByteBase);
     }
 
     template <uint32_t kChunkIdx>
-    __device__ __forceinline__ static void p2_cvt_store_nope_chunk(
-        const uintptr_t  p_lds_q,
-        const uint32_t   warp_idx,
-        const hk::u32x4& nope_dw,
-        const uint32_t   scale_dw)
+    __device__ __forceinline__ static void p2_cvt_store_nope_chunk(const uintptr_t p_lds_q,
+                                                                   const uint32_t warp_idx,
+                                                                   const hk::u32x4& nope_dw,
+                                                                   const uint32_t scale_dw)
     {
-        static_assert(kChunkIdx < kP2NumNopeChunks,
-                      "p2_cvt_store_nope_chunk: bad kChunkIdx.");
-        constexpr uint32_t kColInLds    = kChunkIdx * kP2ChunkCols;                    // 0,64,128
-        constexpr uint32_t kColTileBase = kColInLds / kSubBlockCols;                   // 0,2,4
+        static_assert(kChunkIdx < kP2NumNopeChunks, "p2_cvt_store_nope_chunk: bad kChunkIdx.");
+        constexpr uint32_t kColInLds    = kChunkIdx * kP2ChunkCols;  // 0,64,128
+        constexpr uint32_t kColTileBase = kColInLds / kSubBlockCols; // 0,2,4
 
         const uint32_t lane_idx    = opus::lane_id();
-        const uint32_t row_in_warp = lane_idx >> 2;                                    // 0..15
-        const uint32_t col_group   = lane_idx & 3u;                                    // 0..3
+        const uint32_t row_in_warp = lane_idx >> 2; // 0..15
+        const uint32_t col_group   = lane_idx & 3u; // 0..3
 
         // Sub-tile-of-8 swizzle [0,2,4,6,1,3,5,7] on the LDS dst side -- mirror
         // of Site 2 in KvManager8to16bitsV1::cvt_and_store_kv_tile. Each lane's
@@ -485,7 +455,7 @@ class QManager8to16bitsV1
         // (delta = kSubBlockBytes = 1024 B, fits in ds imm offset). Existing
         // Method-1 row-XOR on bit 5 of byte_in_sb (sub-tile-rows 1&3) operates
         // on a disjoint bit range and still composes.
-        const uint32_t byte_in_sb  = col_group << 4;                                   // 0/16/32/48
+        const uint32_t byte_in_sb = col_group << 4; // 0/16/32/48
 
         // Drain vmcnt before cvt: both the dwordx4 fp8 load and the ubyte
         // scale load (issued in p2_vmem_to_vgpr_nope_chunk) must complete.
@@ -495,15 +465,14 @@ class QManager8to16bitsV1
         // for chunks 0 and 1 together. (cvt is a pure-SSA intrinsic, free to
         // be hoisted past a bare s_waitcnt; intrinsic+sched_barrier is the
         // true scheduling barrier.)
-        __builtin_amdgcn_s_waitcnt(
-            hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/0));
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/0));
         __builtin_amdgcn_sched_barrier(0);
 
         const float scale_f = hk_mla::e8m0_to_f32(scale_dw);
 
         using bf16x2_v = __attribute__((__vector_size__(4))) short;
         hk::u32x4 lo_dw, hi_dw;
-        bf16x2_v  r;
+        bf16x2_v r;
         r        = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(nope_dw[0], scale_f, false);
         lo_dw[0] = __builtin_bit_cast(uint32_t, r);
         r        = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(nope_dw[0], scale_f, true);
@@ -529,9 +498,9 @@ class QManager8to16bitsV1
         // bits from the sub-tile-of-8 perm above, so the two compose.
         const uint32_t row_bank_swap  = ((row_in_warp >> 2) & 1u) << 5;
         const uint32_t byte_in_sb_swz = byte_in_sb ^ row_bank_swap;
-        const uintptr_t p_dst_lane =
-            p_lds_q + sub_block_byte_offset(warp_idx, kColTileBase) +
-            row_in_warp * (kSubBlockCols * sizeof(hk::bf16)) + byte_in_sb_swz;
+        const uintptr_t p_dst_lane    = p_lds_q + sub_block_byte_offset(warp_idx, kColTileBase) +
+                                        row_in_warp * (kSubBlockCols * sizeof(hk::bf16)) +
+                                        byte_in_sb_swz;
 
         // lo -> sub_block kColTileBase (+0), hi -> sub_block kColTileBase+1
         // (+kSubBlockBytes = 1024). Carried via the ds_write_b128 imm offset
@@ -547,19 +516,18 @@ class QManager8to16bitsV1
     // ds_read_b128 expects): lane T writes 16 B = 8 bf16 to row T/4, cols
     // (T%4)*8..+8 of one 16x32 sub-block. Two buffer_load_lds_b128 instructions
     // cover both 32-col halves of the 64-col RoPE region.
-    __device__ __forceinline__ static void p2_load_rope_chunk(
-        const q_rope_t* p_q_rope_warp,
-        const uintptr_t p_lds_q,
-        const uint32_t  warp_idx)
+    __device__ __forceinline__ static void p2_load_rope_chunk(const q_rope_t* p_q_rope_warp,
+                                                              const uintptr_t p_lds_q,
+                                                              const uint32_t warp_idx)
     {
-        constexpr uint32_t kColTileLo = kLdsHalfNopeCols / kSubBlockCols;          // 6
-        constexpr uint32_t kColTileHi = kColTileLo + 1u;                           // 7
+        constexpr uint32_t kColTileLo = kLdsHalfNopeCols / kSubBlockCols; // 6
+        constexpr uint32_t kColTileHi = kColTileLo + 1u;                  // 7
 
-        const uint32_t lane_idx     = opus::lane_id();
-        const uint32_t row_in_warp  = lane_idx >> 2;                               // 0..15
-        const uint32_t col_quad     = lane_idx & 3u;                               // 0..3
+        const uint32_t lane_idx    = opus::lane_id();
+        const uint32_t row_in_warp = lane_idx >> 2; // 0..15
+        const uint32_t col_quad    = lane_idx & 3u; // 0..3
 
-        constexpr uint32_t kVStride = kSubBlockCols * sizeof(q_rope_t);            // 64
+        constexpr uint32_t kVStride = kSubBlockCols * sizeof(q_rope_t); // 64
 
         // Row-conditional half-swap (vmem-load side, RoPE): swap col_quad
         // halves (XOR bit 1) on sub-tile-rows 1 & 3 (rows 4..7 and 12..15).
@@ -582,18 +550,20 @@ class QManager8to16bitsV1
 
         const uint32_t lds_off = lane_idx * 16u;
 
-        const uintptr_t p_dst_lo =
-            p_lds_q + sub_block_byte_offset(warp_idx, kColTileLo) + lds_off;
+        const uintptr_t p_dst_lo = p_lds_q + sub_block_byte_offset(warp_idx, kColTileLo) + lds_off;
         const uintptr_t p_dst_hi_adj =
-            p_lds_q + sub_block_byte_offset(warp_idx, kColTileHi) + lds_off
-            - 16u;
+            p_lds_q + sub_block_byte_offset(warp_idx, kColTileHi) + lds_off - 16u;
 
         const hk::i32x4 srsrc = hk::make_srsrc(p_q_rope_warp, 0xffffffff);
         hk::llvm_amdgcn_raw_buffer_load_lds(
             srsrc, (hk::as3_uint32_ptr)(p_dst_lo), 16, v_off_lo, 0, 0, 0);
-        hk::llvm_amdgcn_raw_buffer_load_lds(
-            srsrc, (hk::as3_uint32_ptr)(p_dst_hi_adj), 16, v_off_lo, 0,
-            /*i_off=*/16, 0);
+        hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                            (hk::as3_uint32_ptr)(p_dst_hi_adj),
+                                            16,
+                                            v_off_lo,
+                                            0,
+                                            /*i_off=*/16,
+                                            0);
     }
 
     public:
@@ -612,9 +582,7 @@ class QManager8to16bitsV1
     // staging region is overlapped with (and overwritten by) the final region,
     // the manager's persistent footprint is just kFinalLdsBytes = 64 KB.
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
-    {
-        return kFinalLdsBytes;
-    }
+    { return kFinalLdsBytes; }
 
     // Loads Q from VRAM into pinned VGPRs (NoPE half 0:256) and the bf16 LDS
     // region (NoPE half 256:448 + RoPE 0:64, each 192/64 cols of bf16).
@@ -628,20 +596,17 @@ class QManager8to16bitsV1
     //                         uses the first 16 KB as per-warp staging, then
     //                         Phase 2 overwrites the whole region.
     template <uint32_t GPR_NOPE_VGPR_START>
-    __device__ __forceinline__ void load_q(
-        const typename T::gl_q_nope& q_buffer_nope,
-        const typename T::gl_q_rope& q_buffer_rope,
-        const int32_t warp_idx,
-        const int32_t qo_start,
-        const uintptr_t p_lds_q)
+    __device__ __forceinline__ void load_q(const typename T::gl_q_nope& q_buffer_nope,
+                                           const typename T::gl_q_rope& q_buffer_rope,
+                                           const int32_t warp_idx,
+                                           const int32_t qo_start,
+                                           const uintptr_t p_lds_q)
     {
         // Per-warp base pointers in vmem (each warp owns kTileM=16 rows).
         const q_nope_t* p_q_warp =
-            &q_buffer_nope[{qo_start, 0, 0, 0}] +
-            warp_idx * T::kTileM * T::kQkPackedNopeQElems;
+            &q_buffer_nope[{qo_start, 0, 0, 0}] + warp_idx * T::kTileM * T::kQkPackedNopeQElems;
         const q_rope_t* p_q_rope_warp =
-            &q_buffer_rope[{qo_start, 0, 0, 0}] +
-            warp_idx * T::kTileM * T::kQkRopeHeadDim;
+            &q_buffer_rope[{qo_start, 0, 0, 0}] + warp_idx * T::kTileM * T::kQkRopeHeadDim;
 
         const uintptr_t p_lds_warp_staging = p1_warp_staging_base(p_lds_q, warp_idx);
 
@@ -679,7 +644,7 @@ class QManager8to16bitsV1
         // & process. This keeps 2 vmem ops in flight for chunks 0 and 1.
         const uint32_t warp_idx_u = static_cast<uint32_t>(warp_idx);
         hk::u32x4 nope_dw_0, nope_dw_1, nope_dw_2;
-        uint32_t  scale_dw_0, scale_dw_1, scale_dw_2;
+        uint32_t scale_dw_0, scale_dw_1, scale_dw_2;
 
         p2_vmem_to_vgpr_nope_chunk<0>(p_q_warp, nope_dw_0, scale_dw_0);
         p2_vmem_to_vgpr_nope_chunk<1>(p_q_warp, nope_dw_1, scale_dw_1);
@@ -703,10 +668,9 @@ class QManager8to16bitsV1
     // bytes (kColTile * 1024) fold via the 16-bit ds_read offset:.
     template <uint32_t kColTile, hkdart::all RT>
     __device__ __forceinline__ static void
-        load_q_lds_to_gpr(RT& dst, const uintptr_t p_lds_q, const uint32_t warp_idx)
+    load_q_lds_to_gpr(RT& dst, const uintptr_t p_lds_q, const uint32_t warp_idx)
     {
-        static_assert(kColTile < kFinalLdsColTiles,
-                      "load_q_lds_to_gpr: kColTile out of range.");
+        static_assert(kColTile < kFinalLdsColTiles, "load_q_lds_to_gpr: kColTile out of range.");
 
         constexpr uint32_t kMfmaRows       = 16;
         constexpr uint32_t kMfmaElemPerThr = 8;
@@ -721,7 +685,7 @@ class QManager8to16bitsV1
         // (load_k_to_gpr, load_transposed_v_to_gpr) so both managers share
         // one bank-arithmetic invariant. Writers mirror the swap so the
         // bf16 LDS contents match what the reader pulls.
-        const uint32_t swz       = ((row >> 2) & 1u) << 5;
+        const uint32_t swz = ((row >> 2) & 1u) << 5;
         const uint32_t in_sb_byte =
             row * (kSubBlockCols * sizeof(hk::bf16)) + (col * sizeof(hk::bf16) ^ swz);
 
@@ -799,38 +763,36 @@ class KvManager8to16bitsV1
     public:
     // ---- Sub-block geometry ------------------------------------------------
     // Each LDS sub-block is 16 rows x 32 cols of bf16 = 1024 B.
-    static constexpr uint32_t kSubBlockRows  = 16;
-    static constexpr uint32_t kSubBlockCols  = 32;
-    static constexpr uint32_t kSubBlockBytes = kSubBlockRows * kSubBlockCols * sizeof(hk::bf16);
-    static constexpr uint32_t kNumRowTiles   = T::kBlockN / kSubBlockRows;       // 2
-    static constexpr uint32_t kNumColTiles   = T::kQkHeadDim / kSubBlockCols;    // 16
+    static constexpr uint32_t kSubBlockRows    = 16;
+    static constexpr uint32_t kSubBlockCols    = 32;
+    static constexpr uint32_t kSubBlockBytes   = kSubBlockRows * kSubBlockCols * sizeof(hk::bf16);
+    static constexpr uint32_t kNumRowTiles     = T::kBlockN / kSubBlockRows;        // 2
+    static constexpr uint32_t kNumColTiles     = T::kQkHeadDim / kSubBlockCols;     // 16
     static constexpr uint32_t kNumColTilesNope = T::kQkNopeHeadDim / kSubBlockCols; // 14
     static constexpr uint32_t kNumColTilesRope =
-        (T::kQkHeadDim - T::kQkNopeHeadDim) / kSubBlockCols;                     // 2
+        (T::kQkHeadDim - T::kQkNopeHeadDim) / kSubBlockCols; // 2
 
     // ---- Tile geometry -----------------------------------------------------
     // Two 32x256 half-tiles cover the full 32x512 KV pong. Tile 0 = cols [0,256)
     // (all FP8 NoPE). Tile 1 = cols [256,512) (FP8 NoPE for waves 0..4,6 in
     // cols [256,448); BF16 RoPE for waves 5,7 in cols [448,512)).
-    static constexpr uint32_t kNumTiles         = 2;
-    static constexpr uint32_t kTileCols         = T::kQkHeadDim / kNumTiles;      // 256
-    static constexpr uint32_t kColTilesPerTile  = kTileCols / kSubBlockCols;      // 8
-    static constexpr uint32_t kWaveColTilesPerWaveTile = 2u;                      // 16x64 = 2x(16x32)
-    static constexpr uint32_t kWaveTileCols     = kWaveColTilesPerWaveTile * kSubBlockCols; // 64
+    static constexpr uint32_t kNumTiles                = 2;
+    static constexpr uint32_t kTileCols                = T::kQkHeadDim / kNumTiles; // 256
+    static constexpr uint32_t kColTilesPerTile         = kTileCols / kSubBlockCols; // 8
+    static constexpr uint32_t kWaveColTilesPerWaveTile = 2u; // 16x64 = 2x(16x32)
+    static constexpr uint32_t kWaveTileCols = kWaveColTilesPerWaveTile * kSubBlockCols; // 64
 
     // Total bf16 bytes in LDS for one pong.
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     {
-        return T::kBlockN * T::kQkHeadDim * sizeof(hk::bf16);                    // 32 KB
+        return T::kBlockN * T::kQkHeadDim * sizeof(hk::bf16); // 32 KB
     }
 
     // Byte offset of LDS sub-block (row_tile, col_tile) inside one pong.
     // Col-major sub-block order: (0,0),(1,0),(0,1),(1,1),...,(0,15),(1,15).
     __device__ __forceinline__ static constexpr uint32_t
-        sub_block_byte_offset(const uint32_t row_tile, const uint32_t col_tile)
-    {
-        return (col_tile * kNumRowTiles + row_tile) * kSubBlockBytes;
-    }
+    sub_block_byte_offset(const uint32_t row_tile, const uint32_t col_tile)
+    { return (col_tile * kNumRowTiles + row_tile) * kSubBlockBytes; }
 
     // ---- Wave -> sub-tile map (spec section 4.2 Option 2, branchless) ------
     // Per 32x256 half-tile, the 8 waves partition the 2 row-tiles x 4 col-tiles
@@ -840,24 +802,17 @@ class KvManager8to16bitsV1
     // Waves 5 and 7 always land on col_tile == 3 (the last 16x64 sub-tile), which
     // for tile 1 is the BF16 RoPE region [448,512) and is loaded by a different
     // path. See load_kv_tile_to_lds() for the merged dispatch.
+    __device__ __forceinline__ static constexpr uint32_t wave_row_tile(const uint32_t warp_idx)
+    { return (warp_idx >> 1) & 1u; }
     __device__ __forceinline__ static constexpr uint32_t
-        wave_row_tile(const uint32_t warp_idx)
-    {
-        return (warp_idx >> 1) & 1u;
-    }
-    __device__ __forceinline__ static constexpr uint32_t
-        wave_col_tile_in_tile(const uint32_t warp_idx)
-    {
-        return ((warp_idx >> 1) & 2u) | (warp_idx & 1u);
-    }
+    wave_col_tile_in_tile(const uint32_t warp_idx)
+    { return ((warp_idx >> 1) & 2u) | (warp_idx & 1u); }
 
     // True for the two waves that issue RoPE buffer_loads in tile 1.
     // Wave 5 covers row_tile 0 (rows 0..15) RoPE; wave 7 covers row_tile 1 RoPE.
     // Each wave does 2 x dwordx4/lane (32 B/lane) = full 16 x 64 bf16 patch.
     __device__ __forceinline__ static constexpr bool wave_is_rope_owner(const uint32_t warp_idx)
-    {
-        return (warp_idx == 5u) || (warp_idx == 7u);
-    }
+    { return (warp_idx == 5u) || (warp_idx == 7u); }
 
     // ---- Public API: addressing helpers used by the kernel body ------------
     // Per-warp logical row inside the 32-row KV tile (range [0, 31]).
@@ -887,7 +842,6 @@ class KvManager8to16bitsV1
     }
 
     public:
-
     // Per-lane prefetch carrier for one 32x256 half-tile (NoPE branch only).
     // Lives in VGPRs across the gap between prefetch_kv_tile() and
     // cvt_and_store_kv_tile(); the gap is where the kernel body hides vmem
@@ -896,8 +850,8 @@ class KvManager8to16bitsV1
     // dwordx4 lds direct to LDS during prefetch.
     struct KvTilePrefetch
     {
-        hk::u32x4 nope_dw;       // 16 fp8 = 4 dw
-        uint32_t  scale_dw;      // E8M0 scale byte, zero-extended to dw
+        hk::u32x4 nope_dw; // 16 fp8 = 4 dw
+        uint32_t scale_dw; // E8M0 scale byte, zero-extended to dw
     };
 
     // ---- Phase A: prefetch (issue VRAM loads) ------------------------------
@@ -911,12 +865,12 @@ class KvManager8to16bitsV1
     // the gap between prefetch and cvt_and_store to be filled with mfmas.
     template <uint32_t kRowOffset, uint32_t kColOffset, bool kCheckBoundary>
     __device__ __forceinline__ static void
-        prefetch_kv_tile(const uintptr_t p_lds_kv,
-                         const uint32_t warp_idx,
-                         const typename T::gl_kv_nope& kv_buf_nope,
-                         const typename T::gl_kv_rope& kv_buf_rope,
-                         const int32_t row_kv_ld,
-                         KvTilePrefetch& prefetch_out)
+    prefetch_kv_tile(const uintptr_t p_lds_kv,
+                     const uint32_t warp_idx,
+                     const typename T::gl_kv_nope& kv_buf_nope,
+                     const typename T::gl_kv_rope& kv_buf_rope,
+                     const int32_t row_kv_ld,
+                     KvTilePrefetch& prefetch_out)
     {
         static_assert(kRowOffset == 0u,
                       "prefetch_kv_tile: kRowOffset must be 0 -- a tile spans all 32 rows.");
@@ -925,22 +879,19 @@ class KvManager8to16bitsV1
         constexpr uint32_t kTileIdx = kColOffset / kTileCols;
 
         const uint32_t lane_idx         = opus::lane_id();
-        const uint32_t col_group        = lane_idx & 3u;            // 0..3
+        const uint32_t col_group        = lane_idx & 3u; // 0..3
         const uint32_t col_tile_in_tile = wave_col_tile_in_tile(warp_idx);
-        const bool     in_bounds        = (kCheckBoundary == false) || (row_kv_ld >= 0);
-        const bool     is_rope_path     = (kTileIdx == 1u) && wave_is_rope_owner(warp_idx);
+        const bool in_bounds            = (kCheckBoundary == false) || (row_kv_ld >= 0);
+        const bool is_rope_path         = (kTileIdx == 1u) && wave_is_rope_owner(warp_idx);
 
         if(is_rope_path == false)
         {
             // ---------------- NoPE prefetch ----------------
-            constexpr uint32_t kPackedStride =
-                T::kQkPackedNopeKvElems * sizeof(kv_nope_t);                 // 576
+            constexpr uint32_t kPackedStride = T::kQkPackedNopeKvElems * sizeof(kv_nope_t); // 576
 
             const kv_nope_t* p_kv_nope = &kv_buf_nope[{0, 0, 0, 0}];
-            const uint64_t   as_u64 =
-                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_kv_nope));
-            const hk::buffer_resource br =
-                hk::make_buffer_resource(as_u64, 0xffffffff, 0x00020000);
+            const uint64_t as_u64 = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_kv_nope));
+            const hk::buffer_resource br = hk::make_buffer_resource(as_u64, 0xffffffff, 0x00020000);
 
             // Address split (NoPE): row_kv_ld is *per-lane* (each lane covers a
             // distinct row of the 32-row KV tile, see get_kv_ld_row_base_idx),
@@ -958,12 +909,10 @@ class KvManager8to16bitsV1
             // straight -- same pattern QManager8to16bitsV1 ships.
             const uint32_t col_group_swz = col_group ^ (((lane_idx >> 4) & 1u) << 1);
             const uint32_t v_off_nope =
-                in_bounds
-                    ? (static_cast<uint32_t>(row_kv_ld) * kPackedStride +
-                       col_group_swz * 16u)
-                    : 0u;
+                in_bounds ? (static_cast<uint32_t>(row_kv_ld) * kPackedStride + col_group_swz * 16u)
+                          : 0u;
             const uint32_t s_off_nope = col_tile_in_tile * kWaveTileCols;
-            constexpr int  i_off_nope = static_cast<int>(kTileIdx * kTileCols);
+            constexpr int i_off_nope  = static_cast<int>(kTileIdx * kTileCols);
 
             // Address split (scale): also per-lane (each lane consumes the scale
             // for its own row in cvt_and_store_kv_tile). 1 byte zero-extended.
@@ -975,10 +924,8 @@ class KvManager8to16bitsV1
             // 2 bytes (duplicated), so skip 4*2 = 8 = kColTilesPerTile bytes per
             // kTileIdx (since 1 sub-block-col is half a scale tile = 1 dup byte).
             constexpr uint32_t kScaleBaseOff = 448u;
-            const uint32_t     v_off_scale =
-                in_bounds
-                    ? static_cast<uint32_t>(row_kv_ld) * kPackedStride
-                    : 0u;
+            const uint32_t v_off_scale =
+                in_bounds ? static_cast<uint32_t>(row_kv_ld) * kPackedStride : 0u;
             // col_tile_in_tile is wave-uniform -> route via s_offset so it
             // doesn't sit in the per-lane v_offset (saves one v_add).
             const uint32_t s_off_scale = col_tile_in_tile * 2u;
@@ -1018,20 +965,17 @@ class KvManager8to16bitsV1
             // and i_off=16, which is broken: the same M0 means Call 2 writes
             // each lane T at M0+T*16+16 = M0+(T+1)*16, overlapping Call 1's
             // lane (T+1) slot and leaving sub-block 15 entirely unwritten.
-            constexpr uint32_t kRopeStride =
-                T::kQkRopeHeadDim * sizeof(hk::bf16);                        // 128
-            constexpr uint32_t kRopeColTileLo =
-                T::kQkNopeHeadDim / kSubBlockCols;                           // 14
-            constexpr uint32_t kRopeColTileHi = kRopeColTileLo + 1u;         // 15
-            constexpr uint32_t kVStride       =
-                kSubBlockCols * sizeof(hk::bf16);                            // 64
+            constexpr uint32_t kRopeStride    = T::kQkRopeHeadDim * sizeof(hk::bf16); // 128
+            constexpr uint32_t kRopeColTileLo = T::kQkNopeHeadDim / kSubBlockCols;    // 14
+            constexpr uint32_t kRopeColTileHi = kRopeColTileLo + 1u;                  // 15
+            constexpr uint32_t kVStride       = kSubBlockCols * sizeof(hk::bf16);     // 64
 
             const uint32_t row_tile = wave_row_tile(warp_idx);
 
             if(in_bounds)
             {
                 const kv_rope_t* p_kv_rope = &kv_buf_rope[{0, 0, 0, 0}];
-                const hk::i32x4  srsrc     = hk::make_srsrc(p_kv_rope, 0xffffffff);
+                const hk::i32x4 srsrc      = hk::make_srsrc(p_kv_rope, 0xffffffff);
 
                 // Per-lane vmem voffset for the lo half (sub-block 14, RoPE
                 // cols 0..31). row_kv_ld already encodes the lane's row
@@ -1046,8 +990,7 @@ class KvManager8to16bitsV1
                 // the *data* landing at LDS (row, col_group) for swizzled
                 // rows is what would logically belong at (row, col_group ^ 2).
                 // row_in_sb = lane_idx>>2; sub-tile-row bit = (lane_idx>>4)&1.
-                const uint32_t col_group_swz =
-                    col_group ^ (((lane_idx >> 4) & 1u) << 1);
+                const uint32_t col_group_swz = col_group ^ (((lane_idx >> 4) & 1u) << 1);
 
                 // Sub-tile-of-8 perm [0,2,4,6,1,3,5,7] (vmem-src side; LDS dst
                 // is HW-fixed). Mirror of QM p2_load_rope_chunk: each LDS
@@ -1057,21 +1000,23 @@ class KvManager8to16bitsV1
                 // Overlap the +16 with the LDS advance to kRopeColTileHi by
                 // pre-subtracting 16 from p_dst_hi_adj and using i_off=16.
                 const uint32_t v_off_lo =
-                    static_cast<uint32_t>(row_kv_ld) * kRopeStride +
-                    col_group_swz * 32u;
+                    static_cast<uint32_t>(row_kv_ld) * kRopeStride + col_group_swz * 32u;
 
                 const uintptr_t p_dst_lo =
-                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileLo) +
-                    lane_idx * 16u;
-                const uintptr_t p_dst_hi_adj =
-                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileHi) +
-                    lane_idx * 16u - 16u;
+                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileLo) + lane_idx * 16u;
+                const uintptr_t p_dst_hi_adj = p_lds_kv +
+                                               sub_block_byte_offset(row_tile, kRopeColTileHi) +
+                                               lane_idx * 16u - 16u;
 
                 hk::llvm_amdgcn_raw_buffer_load_lds(
                     srsrc, (hk::as3_uint32_ptr)(p_dst_lo), 16, v_off_lo, 0, 0, 0);
-                hk::llvm_amdgcn_raw_buffer_load_lds(
-                    srsrc, (hk::as3_uint32_ptr)(p_dst_hi_adj), 16, v_off_lo, 0,
-                    /*i_off=*/16, 0);
+                hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                                    (hk::as3_uint32_ptr)(p_dst_hi_adj),
+                                                    16,
+                                                    v_off_lo,
+                                                    0,
+                                                    /*i_off=*/16,
+                                                    0);
             }
             else
             {
@@ -1080,16 +1025,14 @@ class KvManager8to16bitsV1
                 // (rt, 15) are kNumRowTiles*kSubBlockBytes = 2048 B apart --
                 // fits the ds_write_b128 imm-offset field, so we reuse a
                 // single addr VGPR for both writes.
-                constexpr uint32_t kInterSbStride =
-                    kNumRowTiles * kSubBlockBytes;                           // 2048
+                constexpr uint32_t kInterSbStride = kNumRowTiles * kSubBlockBytes; // 2048
                 const hk::u32x4 zero{0u, 0u, 0u, 0u};
-                const uint32_t  addr_lo = static_cast<uint32_t>(
-                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileLo) +
-                    lane_idx * 16u);
+                const uint32_t addr_lo = static_cast<uint32_t>(
+                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileLo) + lane_idx * 16u);
                 hkm::ds_write_b128(zero, addr_lo, 0);
                 hkm::ds_write_b128(zero, addr_lo, static_cast<int>(kInterSbStride));
             }
-            (void)prefetch_out;     // RoPE branch does not consume the carrier.
+            (void)prefetch_out; // RoPE branch does not consume the carrier.
         }
     }
 
@@ -1116,8 +1059,7 @@ class KvManager8to16bitsV1
         const bool skip = (kTileIdx == 1u) && wave_is_rope_owner(warp_idx);
         if(skip == false)
         {
-            __builtin_amdgcn_s_waitcnt(
-                hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/kVmCnt));
+            __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/kVmCnt));
             __builtin_amdgcn_sched_barrier(0);
         }
     }
@@ -1139,11 +1081,8 @@ class KvManager8to16bitsV1
     // the value before cvt step 2/3 overwrites it.
 
     // Compute the e8m0 -> fp32 scale for this tile (1 ALU op, hoist once).
-    __device__ __forceinline__ static float
-    kv_tile_scale_f(const KvTilePrefetch& prefetch_in)
-    {
-        return hk_mla::e8m0_to_f32(prefetch_in.scale_dw);
-    }
+    __device__ __forceinline__ static float kv_tile_scale_f(const KvTilePrefetch& prefetch_in)
+    { return hk_mla::e8m0_to_f32(prefetch_in.scale_dw); }
 
     // kStep in [0,4): each does 2 cvts feeding 2 dwords of `dw`.
     //   kStep 0,2 -> dw[0],dw[1]   (sources nope_dw[2*(kStep&1) + 0 or 2])
@@ -1153,13 +1092,13 @@ class KvManager8to16bitsV1
     cvt_kv_tile_step(hk::u32x4& dw, const KvTilePrefetch& prefetch_in, float scale_f)
     {
         static_assert(kStep < 4u, "cvt_kv_tile_step: kStep must be 0..3");
-        constexpr uint32_t kSrc       = kStep;            // nope_dw index
-        constexpr uint32_t kDstLo     = (kStep & 1u) * 2u; // 0 or 2
-        constexpr uint32_t kDstHi     = kDstLo + 1u;
+        constexpr uint32_t kSrc   = kStep;             // nope_dw index
+        constexpr uint32_t kDstLo = (kStep & 1u) * 2u; // 0 or 2
+        constexpr uint32_t kDstHi = kDstLo + 1u;
 
         using bf16x2_v           = __attribute__((__vector_size__(4))) short;
         const hk::u32x4& nope_dw = prefetch_in.nope_dw;
-        bf16x2_v         r;
+        bf16x2_v r;
         r          = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(nope_dw[kSrc], scale_f, false);
         dw[kDstLo] = __builtin_bit_cast(uint32_t, r);
         r          = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(nope_dw[kSrc], scale_f, true);
@@ -1170,9 +1109,7 @@ class KvManager8to16bitsV1
     // kNumRowTiles * kSubBlockBytes = 2048).
     template <uint32_t kRowOffset, uint32_t kColOffset, uint32_t kStep>
     __device__ __forceinline__ static void
-    store_kv_tile_step(const uintptr_t p_lds_kv,
-                       const uint32_t warp_idx,
-                       const hk::u32x4& dw)
+    store_kv_tile_step(const uintptr_t p_lds_kv, const uint32_t warp_idx, const hk::u32x4& dw)
     {
         static_assert(kRowOffset == 0u,
                       "store_kv_tile_step: kRowOffset must be 0 -- a tile spans all 32 rows.");
@@ -1197,11 +1134,11 @@ class KvManager8to16bitsV1
             kTileIdx * kColTilesPerTile + col_tile_in_tile * kWaveColTilesPerWaveTile;
         const uint32_t byte_in_sb = col_group << 4;
 
-        const uintptr_t p_dst_lane =
-            p_lds_kv + sub_block_byte_offset(row_tile, col_tile_global_lo) +
-            row_in_tile * (kSubBlockCols * sizeof(hk::bf16)) + byte_in_sb;
+        const uintptr_t p_dst_lane = p_lds_kv +
+                                     sub_block_byte_offset(row_tile, col_tile_global_lo) +
+                                     row_in_tile * (kSubBlockCols * sizeof(hk::bf16)) + byte_in_sb;
 
-        const uint32_t addr = static_cast<uint32_t>(p_dst_lane);
+        const uint32_t addr        = static_cast<uint32_t>(p_dst_lane);
         constexpr uint32_t kImmOff = kStep * (kNumRowTiles * kSubBlockBytes);
         hkm::ds_write_b128(dw, addr, kImmOff);
     }
@@ -1275,8 +1212,7 @@ class KvManager8to16bitsV1
         // conflict; the reader applies the same XOR on the col-byte component.
         const uint32_t row_bank_swap = ((row >> 2) & 1u) << 5;
         const uint32_t in_sb_byte =
-            row * (kSubBlockCols * sizeof(hk::bf16)) +
-            ((col * sizeof(hk::bf16)) ^ row_bank_swap);
+            row * (kSubBlockCols * sizeof(hk::bf16)) + ((col * sizeof(hk::bf16)) ^ row_bank_swap);
 
         // Constexpr sub-block selector (compiles to immediate offset).
         constexpr uint32_t kFixedOffset =
@@ -1326,11 +1262,12 @@ class KvManager8to16bitsV1
     {
         static_assert((kRowOffset % kSubBlockRows == 0u) && (kRowOffset < T::kBlockN),
                       "load_transposed_v_to_gpr: kRowOffset must be 0 or 16.");
-        static_assert((kColOffset % 16u == 0u) && (kColOffset < T::kVoHeadDim),
-                      "load_transposed_v_to_gpr: kColOffset must be a multiple of 16, < kVoHeadDim.");
+        static_assert(
+            (kColOffset % 16u == 0u) && (kColOffset < T::kVoHeadDim),
+            "load_transposed_v_to_gpr: kColOffset must be a multiple of 16, < kVoHeadDim.");
 
-        constexpr uint32_t kRowTile      = kRowOffset / kSubBlockRows;            // 0 or 1
-        constexpr uint32_t kColTile      = kColOffset / kSubBlockCols;            // 0..15
+        constexpr uint32_t kRowTile      = kRowOffset / kSubBlockRows; // 0 or 1
+        constexpr uint32_t kColTile      = kColOffset / kSubBlockCols; // 0..15
         constexpr uint32_t kColInSbBytes = (kColOffset % kSubBlockCols) * sizeof(hk::bf16);
         // Bank-swizzle re-expressed as a conditional ±32 delta so that
         // (kFixedOffset + kColInSbBytes) stays fully constexpr in the
@@ -1340,16 +1277,14 @@ class KvManager8to16bitsV1
         // boolean `is_swz` (1 bit per lane) is runtime. Avoids materialising
         // kColInSbBytes as a runtime VGPR (vs. the plain XOR formulation),
         // which freed 2 unpinned VGPRs in the audit.
-        constexpr int32_t  kSwzDelta    = (kColInSbBytes & 32u) ? -32 : +32;
-        constexpr uint32_t kFixedOffset =
-            sub_block_byte_offset(kRowTile, kColTile) + kColInSbBytes;
+        constexpr int32_t kSwzDelta     = (kColInSbBytes & 32u) ? -32 : +32;
+        constexpr uint32_t kFixedOffset = sub_block_byte_offset(kRowTile, kColTile) + kColInSbBytes;
 
         const uint32_t lane_idx  = opus::lane_id();
         const uint32_t row_in_sb = lane_idx >> 2;
         const uint32_t is_swz    = (row_in_sb >> 2) & 1u;
-        const uint32_t in_sb     =
-            row_in_sb * (kSubBlockCols * sizeof(hk::bf16)) +
-            (lane_idx & 3u) * 8u + is_swz * static_cast<uint32_t>(kSwzDelta);
+        const uint32_t in_sb     = row_in_sb * (kSubBlockCols * sizeof(hk::bf16)) +
+                                   (lane_idx & 3u) * 8u + is_swz * static_cast<uint32_t>(kSwzDelta);
         const uint32_t addr      = static_cast<uint32_t>(p_lds_v) + in_sb;
 
         hkm::ds_read_b64_tr_b16<GPR>(addr, kFixedOffset);
@@ -1388,7 +1323,7 @@ class OManager16bitsV3
         4 * sizeof(uint32_t) / sizeof(out_t); // buffer_store_dwordx4 = 8 bf16
     static constexpr uint32_t kVramStLanePerRow = kNumCols / kVramStElemPerLane; // 64/8=8
     static constexpr uint32_t kVramStRowsPerRnd =
-        opus::get_warp_size() / kVramStLanePerRow; // 64/8=8
+        opus::get_warp_size() / kVramStLanePerRow;                           // 64/8=8
     static constexpr uint32_t kVramStNumRnds = kNumRows / kVramStRowsPerRnd; // 16/8=2
     static constexpr uint32_t kLdsLdOffsetDeltaInBytes =
         (kVramStRowsPerRnd / 2u) * kNumElemPerPadded2Rows * sizeof(out_t); // (8/2)*132*2=1056
@@ -1399,7 +1334,7 @@ class OManager16bitsV3
     static constexpr uint32_t kMfmaRows        = 16;
     static constexpr uint32_t kMfmaCols        = 16;
     static constexpr uint32_t kMfmaElemPerLane = kMfmaRows * kMfmaCols / opus::get_warp_size(); // 4
-    static constexpr uint32_t kNumMfmasPerCall = kNumCols / kMfmaCols; // 4
+    static constexpr uint32_t kNumMfmasPerCall = kNumCols / kMfmaCols;                          // 4
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_per_warp_in_byte()
     {
@@ -1438,10 +1373,9 @@ class OManager16bitsV3
         // ---- LDS store side ----
         const uint32_t row_lds_st      = lane_idx % kNumRows;
         const uint32_t col_lds_st_base = (lane_idx / kNumRows) * kMfmaElemPerLane; // 0/4/8/12
-        const uint32_t v_offset_lds_st =
-            ((row_lds_st / 2u) * kNumElemPerPadded2Rows + (row_lds_st % 2u) * kNumCols +
-             col_lds_st_base) *
-            sizeof(out_t);
+        const uint32_t v_offset_lds_st = ((row_lds_st / 2u) * kNumElemPerPadded2Rows +
+                                          (row_lds_st % 2u) * kNumCols + col_lds_st_base) *
+                                         sizeof(out_t);
 
         // ---- LDS read side: undo perm on sub-tile field ----
         // Lane wants VRAM col = lane_in_row*8. That data lives in LDS sub-tile
@@ -1466,9 +1400,8 @@ class OManager16bitsV3
         const uint32_t num_records =
             kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
                       : 0xFFFFFFFFu;
-        const hk::buffer_resource out_br =
-            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
-                                     num_records, 0x00020000);
+        const hk::buffer_resource out_br = hk::make_buffer_resource(
+            static_cast<uint64_t>(p_output_batch), num_records, 0x00020000);
 
         if constexpr(std::is_same_v<out_t, hk::bf16>)
         {
@@ -1483,7 +1416,7 @@ class OManager16bitsV3
             b16_pair_m3[1] = float_2_bf16_pair<T::kRoundMode>(GPR_START + 14, GPR_START + 15);
 
             constexpr uint32_t kMfmaByteStride = kMfmaCols * sizeof(out_t); // 32 B
-            const uintptr_t addr_st = p_lds_warp + v_offset_lds_st;
+            const uintptr_t addr_st            = p_lds_warp + v_offset_lds_st;
             hkm::ds_write_b64(b16_pair_m0, addr_st, 0u * kMfmaByteStride);
             hkm::ds_write_b64(b16_pair_m1, addr_st, 1u * kMfmaByteStride);
             hkm::ds_write_b64(b16_pair_m2, addr_st, 2u * kMfmaByteStride);
@@ -1503,11 +1436,9 @@ class OManager16bitsV3
         // Finer-grained lgkmcnt: drain reads one-at-a-time so the matching
         // buffer_store_dwordx4 can issue as soon as its data is ready.
         asm volatile("s_waitcnt lgkmcnt(0)");
-        hkm::ds_read_b128<GPR_START + 0>(
-            static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld), 0);
-        hkm::ds_read_b128<GPR_START + 4>(
-            static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld),
-            static_cast<int>(kLdsLdOffsetDeltaInBytes));
+        hkm::ds_read_b128<GPR_START + 0>(static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld), 0);
+        hkm::ds_read_b128<GPR_START + 4>(static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld),
+                                         static_cast<int>(kLdsLdOffsetDeltaInBytes));
         asm volatile("s_waitcnt lgkmcnt(1)");
         hkm::buffer_store_dwordx4<GPR_START + 0>(out_br, v_offset_vram_st, 0, kOffsetInBytes);
         asm volatile("s_waitcnt lgkmcnt(0)");
@@ -1530,10 +1461,10 @@ class OManager32bitsV3
     static constexpr uint32_t kNumPaddingElemPerRow = 4;
     static constexpr uint32_t kNumElemPerPaddedRow  = kNumCols + kNumPaddingElemPerRow; // 68
     static constexpr uint32_t kVramStElemPerLane =
-        4 * sizeof(uint32_t) / sizeof(out_t); // dwordx4 = 4 fp32
+        4 * sizeof(uint32_t) / sizeof(out_t);                                    // dwordx4 = 4 fp32
     static constexpr uint32_t kVramStLanePerRow = kNumCols / kVramStElemPerLane; // 64/4=16
     static constexpr uint32_t kVramStRowsPerRnd =
-        opus::get_warp_size() / kVramStLanePerRow; // 64/16=4
+        opus::get_warp_size() / kVramStLanePerRow;                           // 64/16=4
     static constexpr uint32_t kVramStNumRnds = kNumRows / kVramStRowsPerRnd; // 4
     static constexpr uint32_t kLdsLdOffsetDeltaInBytes =
         kVramStRowsPerRnd * kNumElemPerPaddedRow * sizeof(out_t); // 4*68*4=1088
@@ -1543,7 +1474,7 @@ class OManager32bitsV3
     static constexpr uint32_t kMfmaRows        = 16;
     static constexpr uint32_t kMfmaCols        = 16;
     static constexpr uint32_t kMfmaElemPerLane = kMfmaRows * kMfmaCols / opus::get_warp_size(); // 4
-    static constexpr uint32_t kNumMfmasPerCall = kNumCols / kMfmaCols; // 4
+    static constexpr uint32_t kNumMfmasPerCall = kNumCols / kMfmaCols;                          // 4
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_per_warp_in_byte()
     {
@@ -1584,13 +1515,12 @@ class OManager32bitsV3
         // ---- LDS read side: perm-undo on sub-tile field ----
         // Lane wants VRAM col = lane_in_row*4. data sub-tile = lane_in_row >> 1;
         // LDS sub-tile = sb8_perm_subtile(data sub-tile); intra = (lane_in_row & 1)*4.
-        const uint32_t row_lds_ld    = lane_idx / kVramStLanePerRow; // 0..3
-        const uint32_t lane_in_row   = lane_idx % kVramStLanePerRow; // 0..15
-        const uint32_t data_subtile  = lane_in_row >> 1;             // 0..7
-        const uint32_t lds_subtile =
-            ((data_subtile & 0x1u) << 2) | ((data_subtile & 0x6u) >> 1);
-        const uint32_t intra_off       = (lane_in_row & 0x1u) * 4u;
-        const uint32_t col_lds_ld      = lds_subtile * 8u + intra_off;
+        const uint32_t row_lds_ld   = lane_idx / kVramStLanePerRow; // 0..3
+        const uint32_t lane_in_row  = lane_idx % kVramStLanePerRow; // 0..15
+        const uint32_t data_subtile = lane_in_row >> 1;             // 0..7
+        const uint32_t lds_subtile  = ((data_subtile & 0x1u) << 2) | ((data_subtile & 0x6u) >> 1);
+        const uint32_t intra_off    = (lane_in_row & 0x1u) * 4u;
+        const uint32_t col_lds_ld   = lds_subtile * 8u + intra_off;
         const uint32_t v_offset_lds_ld = get_v_offset_lds(row_lds_ld, col_lds_ld);
 
         // ---- VRAM store: straight ----
@@ -1605,9 +1535,8 @@ class OManager32bitsV3
         const uint32_t num_records =
             kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
                       : 0xFFFFFFFFu;
-        const hk::buffer_resource out_br =
-            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
-                                     num_records, 0x00020000);
+        const hk::buffer_resource out_br = hk::make_buffer_resource(
+            static_cast<uint64_t>(p_output_batch), num_records, 0x00020000);
 
         if constexpr(std::is_same_v<out_t, float>)
         {
@@ -1618,14 +1547,10 @@ class OManager32bitsV3
             // ds_read result, which is already drained via lgkmcnt(0) at
             // the end of each call.
             constexpr uint32_t kMfmaByteStride = kMfmaCols * sizeof(out_t); // 64 B
-            hkm::ds_write_b128<GPR_START + 0>(p_lds_warp + v_offset_lds_st,
-                                              0u * kMfmaByteStride);
-            hkm::ds_write_b128<GPR_START + 4>(p_lds_warp + v_offset_lds_st,
-                                              1u * kMfmaByteStride);
-            hkm::ds_write_b128<GPR_START + 8>(p_lds_warp + v_offset_lds_st,
-                                              2u * kMfmaByteStride);
-            hkm::ds_write_b128<GPR_START + 12>(p_lds_warp + v_offset_lds_st,
-                                               3u * kMfmaByteStride);
+            hkm::ds_write_b128<GPR_START + 0>(p_lds_warp + v_offset_lds_st, 0u * kMfmaByteStride);
+            hkm::ds_write_b128<GPR_START + 4>(p_lds_warp + v_offset_lds_st, 1u * kMfmaByteStride);
+            hkm::ds_write_b128<GPR_START + 8>(p_lds_warp + v_offset_lds_st, 2u * kMfmaByteStride);
+            hkm::ds_write_b128<GPR_START + 12>(p_lds_warp + v_offset_lds_st, 3u * kMfmaByteStride);
         }
         else
         {
@@ -1646,36 +1571,24 @@ class OManager32bitsV3
         // LDS reads complete in issue order, so lgkmcnt(N) means N reads
         // remain in flight.
         asm volatile("s_waitcnt lgkmcnt(0)");
-        hkm::ds_read_b128<GPR_START + 0>(
-            static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld), 0);
-        hkm::ds_read_b128<GPR_START + 4>(
-            static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld),
-            static_cast<int>(1u * kLdsLdOffsetDeltaInBytes));
-        hkm::ds_read_b128<GPR_START + 8>(
-            static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld),
-            static_cast<int>(2u * kLdsLdOffsetDeltaInBytes));
-        hkm::ds_read_b128<GPR_START + 12>(
-            static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld),
-            static_cast<int>(3u * kLdsLdOffsetDeltaInBytes));
+        hkm::ds_read_b128<GPR_START + 0>(static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld), 0);
+        hkm::ds_read_b128<GPR_START + 4>(static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld),
+                                         static_cast<int>(1u * kLdsLdOffsetDeltaInBytes));
+        hkm::ds_read_b128<GPR_START + 8>(static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld),
+                                         static_cast<int>(2u * kLdsLdOffsetDeltaInBytes));
+        hkm::ds_read_b128<GPR_START + 12>(static_cast<uint32_t>(p_lds_warp + v_offset_lds_ld),
+                                          static_cast<int>(3u * kLdsLdOffsetDeltaInBytes));
         asm volatile("s_waitcnt lgkmcnt(3)");
         hkm::buffer_store_dwordx4<GPR_START + 0>(out_br, v_offset_vram_st, 0, kOffsetInBytes);
         asm volatile("s_waitcnt lgkmcnt(2)");
-        hkm::buffer_store_dwordx4<GPR_START + 4>(out_br,
-                                  v_offset_vram_st + 1u * kVramStOffsetDeltaInBytes,
-                                  0,
-                                  kOffsetInBytes);
+        hkm::buffer_store_dwordx4<GPR_START + 4>(
+            out_br, v_offset_vram_st + 1u * kVramStOffsetDeltaInBytes, 0, kOffsetInBytes);
         asm volatile("s_waitcnt lgkmcnt(1)");
         hkm::buffer_store_dwordx4<GPR_START + 8>(
-                                  out_br,
-                                  v_offset_vram_st + 2u * kVramStOffsetDeltaInBytes,
-                                  0,
-                                  kOffsetInBytes);
+            out_br, v_offset_vram_st + 2u * kVramStOffsetDeltaInBytes, 0, kOffsetInBytes);
         asm volatile("s_waitcnt lgkmcnt(0)");
         hkm::buffer_store_dwordx4<GPR_START + 12>(
-                                  out_br,
-                                  v_offset_vram_st + 3u * kVramStOffsetDeltaInBytes,
-                                  0,
-                                  kOffsetInBytes);
+            out_br, v_offset_vram_st + 3u * kVramStOffsetDeltaInBytes, 0, kOffsetInBytes);
     }
 };
 
@@ -1707,10 +1620,7 @@ class OManager32bitsV3NoStage
     static constexpr uint32_t kNumMfmas = kNumCols / kMfmaCols; // 4
 
     public:
-    __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
-    {
-        return 0;
-    }
+    __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte() { return 0; }
 
     // See OManager16bitsV1 for the kCheckOOB contract.
     template <uint32_t GPR_START, uint32_t kWaveTileColOff, bool kCheckOOB>
@@ -1726,12 +1636,11 @@ class OManager32bitsV3NoStage
         constexpr uint32_t kColOffBytes = kWaveTileColOff * sizeof(out_t);
 
         const uint32_t lane_idx = opus::lane_id();
-        const uint32_t row      = lane_idx % kNumRows;          // 0..15
-        const uint32_t col_quad = lane_idx / kNumRows;          // 0..3
+        const uint32_t row      = lane_idx % kNumRows; // 0..15
+        const uint32_t col_quad = lane_idx / kNumRows; // 0..3
 
-        const uint32_t vram_row = row + warp_idx * kNumRows;
-        const uint32_t row_base_bytes =
-            vram_row * T::kVoHeadDim * sizeof(out_t);
+        const uint32_t vram_row       = row + warp_idx * kNumRows;
+        const uint32_t row_base_bytes = vram_row * T::kVoHeadDim * sizeof(out_t);
 
         const uintptr_t p_output_batch =
             reinterpret_cast<uintptr_t>(p_output) +
@@ -1739,22 +1648,20 @@ class OManager32bitsV3NoStage
         const uint32_t num_records =
             kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
                       : 0xFFFFFFFFu;
-        const hk::buffer_resource out_br =
-            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
-                                     num_records, 0x00020000);
+        const hk::buffer_resource out_br = hk::make_buffer_resource(
+            static_cast<uint64_t>(p_output_batch), num_records, 0x00020000);
 
         if constexpr(std::is_same_v<out_t, float>)
         {
             asm volatile("s_waitcnt vmcnt(0)");
             opus::static_for<kNumMfmas>([&](auto im) {
-                constexpr uint32_t m = im.value;
-                const uint32_t lds_subtile  = m * 2u + (col_quad >> 1);
+                constexpr uint32_t m       = im.value;
+                const uint32_t lds_subtile = m * 2u + (col_quad >> 1);
                 const uint32_t data_subtile =
                     ((lds_subtile & 0x4u) >> 2) | ((lds_subtile & 0x3u) << 1);
                 const uint32_t intra_half = col_quad & 0x1u;
                 const uint32_t data_col   = data_subtile * 8u + intra_half * 4u;
-                const uint32_t v_offset =
-                    row_base_bytes + data_col * sizeof(out_t);
+                const uint32_t v_offset   = row_base_bytes + data_col * sizeof(out_t);
                 hkm::buffer_store_dwordx4<GPR_START + m * 4u>(
                     out_br, v_offset, /*s_off=*/0, /*i_off=*/kColOffBytes);
             });
@@ -1765,4 +1672,3 @@ class OManager32bitsV3NoStage
         }
     }
 };
-
