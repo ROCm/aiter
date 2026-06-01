@@ -12,6 +12,10 @@
 
 using namespace hk_mla;
 
+// Toggle the slim dispatch ladder (fewer mla_main instantiations, always
+// boundary-checked prefetch). Comment out to fall back to the full ladder.
+#define MLA_SLIM_DISPATCH 1
+
 // V4.0 mi35x m16x8 decode kernel: separate FP8 NOPE + BF16 ROPE buffers for
 // both Q and KV. End-to-end body (Phases 4a..4g) in place: prologue (Q load +
 // first KV tile) -> per-warp dispatch ladder over mla_main (QK GEMM + softmax
@@ -695,11 +699,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
 
             // ---- Update row_kv_ld_next_next for the call AFTER this one ----
-            // Only meaningful when (a) this iter has a next tile (kIsGlobalLast
-            // == false) and (b) the next tile is not the partial last
-            // (kCheckBoundaryNext == false). In the kCheckBoundaryNext case
-            // there's no tile-after-next, so leave the carry untouched.
-            if constexpr((kIsGlobalLast == false) && (kCheckBoundaryNext == false))
+            // When there's a next iter (kIsGlobalLast == false), compute the
+            // tile-after-next row index so the next iter's prefetch has it
+            // ready. resolve_row_kv_ld returns -1 if past the global end --
+            // the subsequent iter's boundary-checked prefetch will then
+            // suppress that load.
+            if constexpr(kIsGlobalLast == false)
             {
                 row_kv_ld_next_next = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN);
             }
@@ -981,6 +986,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         // Per-warp causal_offset < kBlockN (qseqlen <= 8, kBlockN = 32) means
         // num_iters_eff in {0, num_iters - 1, num_iters}: at most 1 trailing
         // skip iter. Same ladder shape as V32 m16x8.
+#if !defined(MLA_SLIM_DISPATCH)
         if(kv_len_eff <= 0)
         {
             // Warp fully idle. num_iters == 1. One skip iter on the global
@@ -1174,6 +1180,122 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 }
             }
         }
+#else // MLA_SLIM_DISPATCH
+        // Slim dispatch: always use kCheckBoundaryNext=true. This drops the
+        // kv_len%kBlockN==0 / kv_len_eff%kBlockN==0 fast-path
+        // instantiations (rare in practice with random kv seqlens), halving
+        // the number of template instantiations of mla_main. Cost: 1 cmp +
+        // 1 cmov per K-iter for in_bounds check inside prefetch_kv_tile.
+        if(kv_len_eff <= 0)
+        {
+            // Warp fully idle. Single skip iter, no epilogue.
+            mla_main.template operator()<false, true, PvGemmEpilogueType::None, false>(
+                kv_start, kv_end);
+        }
+        else if(kv_len_eff <= T::kBlockN)
+        {
+            // Warp has exactly 1 real tile (full or partial).
+            const bool tile_is_global_last = (kv_start + T::kBlockN) >= kv_end;
+            if(tile_is_global_last)
+            {
+                // Real iter is also the epilogue iter; no next tile.
+                if(partial_qo_loc < 0)
+                {
+                    mla_main.template operator()<true,
+                                                 false,
+                                                 PvGemmEpilogueType::OutputFinal,
+                                                 false>(kv_start, kv_end);
+                }
+                else
+                {
+                    mla_main.template operator()<true,
+                                                 false,
+                                                 PvGemmEpilogueType::OutputSplit,
+                                                 false>(kv_start, kv_end);
+                }
+            }
+            else
+            {
+                // Real iter prefetches the global last tile (boundary-checked).
+                mla_main.template operator()<true, false, PvGemmEpilogueType::None, true>(
+                    kv_start, kv_start + T::kBlockN);
+                // Trailing skip + epilogue.
+                if(partial_qo_loc < 0)
+                {
+                    mla_main.template operator()<false,
+                                                 true,
+                                                 PvGemmEpilogueType::OutputFinal,
+                                                 false>(kv_start + T::kBlockN, kv_end);
+                }
+                else
+                {
+                    mla_main.template operator()<false,
+                                                 true,
+                                                 PvGemmEpilogueType::OutputSplit,
+                                                 false>(kv_start + T::kBlockN, kv_end);
+                }
+            }
+        }
+        else // kv_len_eff > kBlockN: >= 2 real tiles
+        {
+            const int32_t kv_1st_end = kv_start + T::kBlockN;
+
+            // First real iter; next prefetch boundary-checked.
+            mla_main.template operator()<true, false, PvGemmEpilogueType::None, true>(
+                kv_start, kv_1st_end);
+
+            int32_t kv_idx = kv_1st_end;
+            // Middle real tiles: while next tile is not warp's last real.
+            while((kv_idx + T::kBlockN) < kv_end_eff)
+            {
+                mla_main.template operator()<false, false, PvGemmEpilogueType::None, true>(
+                    kv_idx, kv_idx + T::kBlockN);
+                kv_idx += T::kBlockN;
+            }
+
+            // Warp's last real tile starts at kv_idx.
+            const bool tile_is_global_last = ((kv_idx + T::kBlockN) >= kv_end);
+            if(tile_is_global_last)
+            {
+                // Warp's last real == global last -> real iter with epilogue.
+                if(partial_qo_loc < 0)
+                {
+                    mla_main.template operator()<false,
+                                                 false,
+                                                 PvGemmEpilogueType::OutputFinal,
+                                                 false>(kv_idx, kv_end);
+                }
+                else
+                {
+                    mla_main.template operator()<false,
+                                                 false,
+                                                 PvGemmEpilogueType::OutputSplit,
+                                                 false>(kv_idx, kv_end);
+                }
+            }
+            else
+            {
+                // Last real iter prefetches the global last tile (boundary-checked).
+                mla_main.template operator()<false, false, PvGemmEpilogueType::None, true>(
+                    kv_idx, kv_idx + T::kBlockN);
+                // Skip + epilogue on the global last tile.
+                if(partial_qo_loc < 0)
+                {
+                    mla_main.template operator()<false,
+                                                 true,
+                                                 PvGemmEpilogueType::OutputFinal,
+                                                 false>(kv_idx + T::kBlockN, kv_end);
+                }
+                else
+                {
+                    mla_main.template operator()<false,
+                                                 true,
+                                                 PvGemmEpilogueType::OutputSplit,
+                                                 false>(kv_idx + T::kBlockN, kv_end);
+                }
+            }
+        }
+#endif // MLA_SLIM_DISPATCH
 
         (void)out_br;
         (void)split_out_br;
