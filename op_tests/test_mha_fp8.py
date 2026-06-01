@@ -175,6 +175,78 @@ def test_flash_attn_output(
     benchmark["fwd_gb_per_sec"] = (fwd_num_bytes) / 1.0e3 / us_fwd
 
 
+def _per_token_per_head_quant(x, quant_dtype):
+    fp8_max = torch.finfo(quant_dtype).max
+    scale = x.float().abs().amax(dim=-1).clamp(min=1.0e-6) / fp8_max
+    x_quant = (x.float() / scale.unsqueeze(-1)).to(quant_dtype)
+    return x_quant, scale.float()
+
+
+def _v_per_head_quant(v, quant_dtype):
+    fp8_max = torch.finfo(quant_dtype).max
+    scale = v.float().abs().amax(dim=(0, 1, 3)).clamp(min=1.0e-6) / fp8_max
+    v_quant = (v.float() / scale.view(1, 1, -1, 1)).to(quant_dtype)
+    return v_quant, scale.float()
+
+
+def _ref_fp8_ptph_attention(q, k, v, qscale, kscale, vscale, causal):
+    _, _, nheads, d = q.shape
+    nheads_k = k.shape[2]
+    num_group = nheads // nheads_k
+
+    q_deq = q.float() * qscale.permute(0, 2, 1).unsqueeze(-1)
+    k_deq = k.float() * kscale.permute(0, 2, 1).unsqueeze(-1)
+    v_deq = v.float() * vscale.view(1, 1, nheads_k, 1)
+    k_deq = k_deq.repeat_interleave(num_group, dim=2)
+    v_deq = v_deq.repeat_interleave(num_group, dim=2)
+
+    scores = torch.einsum("bqhd,bkhd->bhqk", q_deq, k_deq) / math.sqrt(d)
+    if causal:
+        seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+        mask = torch.tril(
+            torch.ones((seqlen_k, seqlen_k), device=q.device, dtype=torch.bool)
+        )[(seqlen_k - seqlen_q) :, :]
+        scores = scores.masked_fill(~mask.view(1, 1, seqlen_q, seqlen_k), float("-inf"))
+
+    p = torch.exp(scores - scores.max(dim=-1, keepdim=True).values)
+    rowsum = p.sum(dim=-1, keepdim=True)
+    p = p.to(dtypes.fp8).float()
+    out = torch.einsum("bhqk,bkhd->bqhd", p, v_deq) / rowsum.permute(0, 2, 1, 3)
+    return out.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_fp8_qk_per_token_per_head_v_per_head(causal):
+    if torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] not in ("gfx942", "gfx950"):
+        pytest.skip("ASM v3 FP8 PTPH path is only enabled on gfx942/gfx950")
+
+    torch.random.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k = 1, 256, 256
+    nheads, nheads_k = 4, 2
+    d = d_v = 128
+    dtype = torch.bfloat16
+    quant_dtype = dtypes.fp8
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_k, d_v, device="cuda", dtype=dtype)
+
+    q_quant, qscale_bsqh = _per_token_per_head_quant(q, quant_dtype)
+    k_quant, kscale_bskh = _per_token_per_head_quant(k, quant_dtype)
+    v_quant, vscale = _v_per_head_quant(v, quant_dtype)
+    qscale = qscale_bsqh.permute(0, 2, 1).contiguous()
+    kscale = kscale_bskh.permute(0, 2, 1).contiguous()
+
+    out = flash_attn_fp8_pertensor_func(
+        q_quant, k_quant, v_quant, qscale, kscale, vscale, causal=causal
+    )
+    out_ref = _ref_fp8_ptph_attention(q_quant, k_quant, v_quant, qscale, kscale, vscale, causal)
+
+    abs_diff = (out - out_ref).abs()
+    max_diff = abs_diff.max().item()
+    assert max_diff < 0.08
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",

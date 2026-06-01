@@ -29,6 +29,7 @@ std::string get_kernel_name_key(const std::string& arch_id,
                                 int hdim_v,
                                 int mask_type,
                                 int bf16_cvt,
+                                int qscale_type,
                                 bool mode,
                                 const CFG* cfgs)
 {
@@ -42,7 +43,7 @@ std::string get_kernel_name_key(const std::string& arch_id,
         }
 
         if(cfg.dtype == data_type && cfg.hdim_q == hdim_q && cfg.hdim_v == hdim_v &&
-           cfg.mask == mask_type && cfg.mode == mode)
+           cfg.mask == mask_type && cfg.qscale == qscale_type && cfg.mode == mode)
         {
             if(arch_id == "gfx950")
             {
@@ -105,12 +106,15 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
     args.ptr_q_descale    = nullptr;
     args.ptr_k_descale    = nullptr;
     args.ptr_v_descale    = nullptr;
+    args.ptr_p_scale      = nullptr;
     args.s_descale_q_Bs   = 0;
     args.s_descale_q_Hs   = 0;
     args.s_descale_k_Bs   = 0;
     args.s_descale_k_Hs   = 0;
     args.s_descale_v_Bs   = 0;
     args.s_descale_v_Hs   = 0;
+    args.s_p_scale_Bs     = 0;
+    args.s_p_scale_Hs     = 0;
 
     int in_bpe = 2;
     int out_bpe = 2;
@@ -126,6 +130,9 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
         args.s_descale_k_Hs = a.nhead_stride_k_descale * 4;
         args.s_descale_v_Bs = a.batch_stride_v_descale * 4;
         args.s_descale_v_Hs = a.nhead_stride_v_descale * 4;
+        args.ptr_p_scale    = a.p_scale_ptr;
+        args.s_p_scale_Bs   = a.batch_stride_p_scale * 4;
+        args.s_p_scale_Hs   = a.nhead_stride_p_scale * 4;
     }
 
     args.scalar           = a.scale_s;
@@ -228,6 +235,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
                                                       a.hdim_v,
                                                       cfg_mask_type,
                                                       a.how_v3_bf16_cvt,
+                                                      a.qscale_type,
                                                       a.is_group_mode,
                                                       fwd_cfgs);
     auto it                     = fwd_cfgs->find(kernel_name_key);
@@ -370,7 +378,7 @@ float mha_fwd(mha_fwd_args args, const ck_tile::stream_config& s)
 #endif
 
 #if FAV2_ON
-    if(ret == -1 && !args.v3_api_check)
+    if(ret == -1 && !args.v3_api_check && args.qscale_type == 0)
     {
         ret = fmha_fwd_ck(args, s);
     }

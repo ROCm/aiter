@@ -924,6 +924,7 @@ namespace py = pybind11;
           py::arg("q_descale")    = std::nullopt, \
           py::arg("k_descale")    = std::nullopt, \
           py::arg("v_descale")    = std::nullopt, \
+          py::arg("p_scale")      = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
 #define MHA_FWD_PYBIND                             \
@@ -1003,6 +1004,7 @@ namespace py = pybind11;
           py::arg("q_descale")           = std::nullopt, \
           py::arg("k_descale")           = std::nullopt, \
           py::arg("v_descale")           = std::nullopt, \
+          py::arg("p_scale")             = std::nullopt, \
           py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt);

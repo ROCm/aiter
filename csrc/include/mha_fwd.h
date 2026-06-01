@@ -137,6 +137,7 @@ struct mha_fwd_args
     const void* q_descale_ptr;
     const void* k_descale_ptr;
     const void* v_descale_ptr;
+    const void* p_scale_ptr;
     void* rand_val_ptr;
     void* lse_ptr;
     void* o_ptr;
@@ -227,6 +228,8 @@ struct mha_fwd_args
     ck_tile::index_t batch_stride_q_descale;
     ck_tile::index_t batch_stride_k_descale;
     ck_tile::index_t batch_stride_v_descale;
+    ck_tile::index_t batch_stride_p_scale;
+    ck_tile::index_t nhead_stride_p_scale;
 
     ck_tile::index_t window_size_left;
     ck_tile::index_t window_size_right;
@@ -355,6 +358,12 @@ struct __attribute__((packed)) fmha_fwd_v3_args
     p3 _p39;
     unsigned int s_descale_v_Hs;
     p3 _p40;
+    const void* ptr_p_scale;
+    p2 _p41;
+    unsigned int s_p_scale_Bs;
+    p3 _p42;
+    unsigned int s_p_scale_Hs;
+    p3 _p43;
 };
 
 __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,

@@ -117,6 +117,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         q_descale_ptr,
                         k_descale_ptr,
                         v_descale_ptr,
+                        nullptr, // p_scale_ptr
                         has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                         has_lse ? softmax_lse.data_ptr() : nullptr,
                         out.data_ptr(),
@@ -165,6 +166,8 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                         0, // batch_stride_q_descale
                         0, // batch_stride_k_descale
                         0, // batch_stride_v_descale
+                        0, // batch_stride_p_scale
+                        0, // nhead_stride_p_scale
                         mask.left,
                         mask.right,
                         mask.sink,

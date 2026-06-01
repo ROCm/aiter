@@ -238,6 +238,7 @@ def gen_fmha_v3_fwd_fake_tensors(
     q_descale: Optional[Tensor] = None,
     k_descale: Optional[Tensor] = None,
     v_descale: Optional[Tensor] = None,
+    p_scale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return common_mha_fwd_fake_tensors(
@@ -266,6 +267,7 @@ def fmha_v3_fwd(
     q_descale: Optional[Tensor] = None,
     k_descale: Optional[Tensor] = None,
     v_descale: Optional[Tensor] = None,
+    p_scale: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
@@ -529,6 +531,7 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     q_descale: Optional[Tensor] = None,
     k_descale: Optional[Tensor] = None,
     v_descale: Optional[Tensor] = None,
+    p_scale: Optional[Tensor] = None,
     gen: Optional[torch.Generator] = None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
@@ -597,6 +600,7 @@ def fmha_v3_varlen_fwd(
     q_descale: Optional[Tensor] = None,
     k_descale: Optional[Tensor] = None,
     v_descale: Optional[Tensor] = None,
+    p_scale: Optional[Tensor] = None,
     gen: Optional[torch.Generator] = None,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
@@ -1276,6 +1280,7 @@ def _flash_attn_forward(
     cu_seqlens_kv: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    p_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     batch_size, seqlen_q, nhead_q, hdim_q = q.shape
@@ -1299,12 +1304,26 @@ def _flash_attn_forward(
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
         )
-        # support per tensor and per head quant scale
-        ret = ret and (
-            q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
+        pertensor = (
+            q_descale.shape == (1,)
+            and k_descale.shape == (1,)
+            and v_descale.shape == (1,)
         )
+        perhead = (
+            q_descale.shape == (batch_size, nhead_q)
+            and k_descale.shape == (batch_size, nhead_k)
+            and v_descale.shape == (batch_size, nhead_k)
+        )
+        qkptph_vph = (
+            q_descale.shape == (batch_size, nhead_q, seqlen_q)
+            and k_descale.shape == (batch_size, nhead_k, seqlen_k)
+            and v_descale.shape in ((nhead_k,), (batch_size, nhead_k))
+        )
+        ret = ret and (pertensor or perhead or qkptph_vph)
         ret = ret and (
-            q_descale.shape == k_descale.shape and q_descale.shape == v_descale.shape
+            p_scale is None
+            or p_scale.shape == (nhead_q,)
+            or p_scale.shape == (batch_size, nhead_q)
         )
         return ret
 
@@ -1359,6 +1378,7 @@ def _flash_attn_forward(
             q_descale,
             k_descale,
             v_descale,
+            p_scale,
             None,
         )
     else:
@@ -2049,6 +2069,7 @@ def _flash_attn_varlen_forward(
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
+    p_scale: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     return_softmax: bool = False,
     how_v3_bf16_cvt: Optional[int] = 1,
@@ -2085,12 +2106,26 @@ def _flash_attn_varlen_forward(
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
         )
-        # support per tensor and per head quant scale
+        # support per tensor/per head and qk per-token-per-head + v per-head scale
         ret = ret and (
-            q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
+            q_descale.shape == (1,)
+            or q_descale.shape == (batch_size, nhead_q)
+            or q_descale.shape == (batch_size, nhead_q, max_seqlen_q)
         )
         ret = ret and (
-            q_descale.shape == k_descale.shape and q_descale.shape == v_descale.shape
+            k_descale.shape == (1,)
+            or k_descale.shape == (batch_size, nhead_k)
+            or k_descale.shape == (batch_size, nhead_k, max_seqlen_k)
+        )
+        ret = ret and (
+            v_descale.shape == (1,)
+            or v_descale.shape == (nhead_k,)
+            or v_descale.shape == (batch_size, nhead_k)
+        )
+        ret = ret and (
+            p_scale is None
+            or p_scale.shape == (nhead_q,)
+            or p_scale.shape == (batch_size, nhead_q)
         )
         return ret
 
@@ -2141,6 +2176,7 @@ def _flash_attn_varlen_forward(
             q_descale,
             k_descale,
             v_descale,
+            p_scale,
             None,
             cu_seqlens_q_padded,
             cu_seqlens_k_padded,
@@ -3052,7 +3088,15 @@ def flash_attn_fp8_pertensor_func(
     window_size=(-1, -1, 0),  # -1 means infinite context window, 0 means no sink
     softmax_scale=None,
     sink_ptr=None,
+    p_scale=None,
+    scale_mode=0,
 ):
+    # scale_mode selects the asm v3 fp8 kernel binary explicitly (no shape
+    # inference): 0 = per-tensor / per-head descale (default), 1 = qkptph_vph
+    # (QK per-token-per-head, V per-head, P per-Q-head). It maps to the
+    # how_v3_bf16_cvt dispatch field (bf16_cvt==4 sentinel) which selects the
+    # separate qkptph_vph .co; fp8 ignores bf16_cvt for codegen.
+    how_v3_bf16_cvt = 4 if scale_mode == 1 else 1
     if not ENABLE_CK and sink_ptr is None:
         from .triton.attention.mha_v3 import (
             flash_attn_func as flash_attn_func_v3_triton,
@@ -3093,6 +3137,8 @@ def flash_attn_fp8_pertensor_func(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+        p_scale=p_scale,
+        how_v3_bf16_cvt=how_v3_bf16_cvt,
         return_lse=False,
         return_softmax=False,
         sink_ptr=sink_ptr,
@@ -3118,6 +3164,7 @@ def flash_attn_varlen_fp8_pertensor_func(
     window_size=(-1, -1, 0),  # -1 means infinite context window
     softmax_scale=None,
     sink_ptr=None,
+    p_scale=None,
 ):
     if not ENABLE_CK and sink_ptr is None:
         from .triton.attention.mha_v3 import (
@@ -3171,6 +3218,7 @@ def flash_attn_varlen_fp8_pertensor_func(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+        p_scale=p_scale,
         return_lse=False,
         return_softmax=False,
         sink_ptr=sink_ptr,

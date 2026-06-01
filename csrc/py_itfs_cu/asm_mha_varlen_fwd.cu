@@ -35,6 +35,7 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                                           std::optional<const at::Tensor> &q_descale_,
                                           std::optional<const at::Tensor> &k_descale_,
                                           std::optional<const at::Tensor> &v_descale_,
+                                          std::optional<const at::Tensor> &p_scale_,
                                           at::Tensor out,
                                           at::Tensor softmax_lse,
                                           at::Tensor dropout_randval,
@@ -130,12 +131,20 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
     void *q_descale_ptr = nullptr;
     void *k_descale_ptr = nullptr;
     void *v_descale_ptr = nullptr;
+    void *p_scale_ptr = nullptr;
+    ck_tile::index_t batch_stride_p_scale = 0;
+    ck_tile::index_t nhead_stride_p_scale = 0;
 
     if (q_descale_.has_value()) {
         auto q_descale = q_descale_.value();
         CHECK_DEVICE(q_descale);
-        TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({1}) || q_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({1}) ||
+                    q_descale.sizes() == torch::IntArrayRef({b, h}) ||
+                    q_descale.sizes() == torch::IntArrayRef({b, h, max_seqlen_q}));
         if (q_descale.dim() == 2) {
+            batch_stride_descale_q = q_descale.stride(0);
+            nhead_stride_descale_q = q_descale.stride(1);
+        } else if (q_descale.dim() == 3) {
             batch_stride_descale_q = q_descale.stride(0);
             nhead_stride_descale_q = q_descale.stride(1);
         }
@@ -144,8 +153,13 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
     if (k_descale_.has_value()) {
         auto k_descale = k_descale_.value();
         CHECK_DEVICE(k_descale);
-        TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef({1}) || k_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef({1}) ||
+                    k_descale.sizes() == torch::IntArrayRef({b, h_k}) ||
+                    k_descale.sizes() == torch::IntArrayRef({b, h_k, max_seqlen_k}));
         if (k_descale.dim() == 2) {
+            batch_stride_descale_k = k_descale.stride(0);
+            nhead_stride_descale_k = k_descale.stride(1);
+        } else if (k_descale.dim() == 3) {
             batch_stride_descale_k = k_descale.stride(0);
             nhead_stride_descale_k = k_descale.stride(1);
         }
@@ -154,12 +168,30 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
     if (v_descale_.has_value()) {
         auto v_descale = v_descale_.value();
         CHECK_DEVICE(v_descale);
-        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({1}) || v_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({1}) ||
+                    v_descale.sizes() == torch::IntArrayRef({h_k}) ||
+                    v_descale.sizes() == torch::IntArrayRef({b, h_k}));
         if (v_descale.dim() == 2) {
             batch_stride_descale_v = v_descale.stride(0);
             nhead_stride_descale_v = v_descale.stride(1);
+        } else if (v_descale.dim() == 1 && v_descale.size(0) == h_k) {
+            nhead_stride_descale_v = v_descale.stride(0);
         }
         v_descale_ptr = v_descale.data_ptr();
+    }
+    if (p_scale_.has_value()) {
+        auto p_scale = p_scale_.value();
+        CHECK_DEVICE(p_scale);
+        TORCH_CHECK(p_scale.dtype() == torch::kFloat32, "p_scale must be float32");
+        TORCH_CHECK(p_scale.sizes() == torch::IntArrayRef({h}) ||
+                    p_scale.sizes() == torch::IntArrayRef({b, h}));
+        if (p_scale.dim() == 2) {
+            batch_stride_p_scale = p_scale.stride(0);
+            nhead_stride_p_scale = p_scale.stride(1);
+        } else {
+            nhead_stride_p_scale = p_scale.stride(0);
+        }
+        p_scale_ptr = p_scale.data_ptr();
     }
 
     return mha_fwd_args{true, // use_asm_v3
@@ -178,6 +210,7 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                         q_descale_ptr,
                         k_descale_ptr,
                         v_descale_ptr,
+                        p_scale_ptr,
                         has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                         has_lse ? softmax_lse.data_ptr() : nullptr,
                         out.data_ptr(),
@@ -226,6 +259,8 @@ mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                         batch_stride_descale_q,
                         batch_stride_descale_k,
                         batch_stride_descale_v,
+                        batch_stride_p_scale,
+                        nhead_stride_p_scale,
                         mask.left,
                         mask.right,
                         0,              // sink_size
@@ -265,6 +300,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                std::optional<const at::Tensor> q_descale_,    // [1] or [b, h_k]
                std::optional<const at::Tensor> k_descale_,    // [1] or [b, h_k]
                std::optional<const at::Tensor> v_descale_,    // [1] or [b, h_k]
+               std::optional<const at::Tensor> p_scale_,
                std::optional<at::Generator> gen_,
                std::optional<const at::Tensor> cu_seqlens_q_padded,   // [b+1]
                std::optional<const at::Tensor> cu_seqlens_k_padded)   // [b+1])
@@ -480,6 +516,7 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 q_descale_,
                 k_descale_,
                 v_descale_,
+                p_scale_,
                 out,
                 softmax_lse,
                 p,
