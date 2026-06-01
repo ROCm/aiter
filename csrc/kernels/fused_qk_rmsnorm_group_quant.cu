@@ -651,9 +651,9 @@ void fused_qk_rmsnorm_group_quant(
     bool gemma_norm,
     std::optional<aiter_tensor_t> gemm_out_zero_init)
 {
-    // SplitK GEMM zero-init fusion: optional buffer to zero-init at the start of
-    // the kernel, in 16-byte chunks. We only forward the pointer/word count to
-    // the kernel; everything below is the unmodified shape/dtype validation path.
+    // SplitK GEMM zero-init fusion: an optional buffer the kernel zero-inits at
+    // its start, in 16-byte chunks. Only the pointer/word count are forwarded to
+    // the kernel here; the shape/dtype validation below is independent of it.
     void* gemm_out_zero_init_ptr = nullptr;
     int64_t gemm_out_zero_init_num_uint4 = 0;
     if(gemm_out_zero_init.has_value())

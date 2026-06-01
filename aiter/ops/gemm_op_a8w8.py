@@ -695,7 +695,7 @@ def gemm_a8w8_blockscale(
 ) -> torch.Tensor:
     """FP8 a8w8 blockscale GEMM (non-bpreshuffle).
 
-    Optional kwargs (used by vLLM's zero-init SplitK fusion):
+    Optional kwargs (used by the zero-init SplitK fusion):
       - out:          caller-provided output buffer. If None, allocated here.
       - y_is_zeroed:  when True, caller guarantees ``out`` is pre-zeroed and
                       the kernel/wrapper skips its zero-init step before the
@@ -710,11 +710,11 @@ def gemm_a8w8_blockscale(
 
     SplitK and kernel-name selection are *always* driven by the tuned CSV
     (``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE``).  Callers cannot override
-    them: in current AITER main the C++ cktile dispatch is keyed by
-    ``kernelName``, and an empty name falls back to a non-tuned default
-    heuristic kernel.  Bypassing the CSV would therefore silently lose the
-    tuned kernel selection, so this wrapper always resolves splitK and
-    ``kernelName`` from the CSV rather than accepting them as arguments.
+    them: the C++ cktile dispatch is keyed by ``kernelName``, and an empty
+    name falls back to a non-tuned default heuristic kernel.  Bypassing the
+    CSV would therefore silently lose the tuned kernel selection, so this
+    wrapper always resolves splitK and ``kernelName`` from the CSV rather
+    than accepting them as arguments.
     """
     assert dtype in [
         dtypes.bf16,
@@ -831,11 +831,10 @@ def gemm_a8w8_blockscale_bpreshuffle(
         y_is_zeroed: when True, the caller has already zeroed `out`, so the
             kernel will skip its internal Y.zero_() / hipMemsetAsync before
             the SplitK atomic_add.  Honored by all libtypes (cktile, ck,
-            asm).  Has no effect on the libtype=='ck' branch today because
-            that wrapper does not yet expose splitK from the CSV (KBatch
-            stays at 1, so the zero-init is a no-op regardless of this
-            flag); plumbing is forward-compatible for when splitK is
-            exposed there.
+            asm).  Has no effect on the libtype=='ck' branch, which does not
+            expose splitK from the CSV (KBatch stays at 1, so the zero-init
+            is a no-op regardless of this flag); the plumbing is in place for
+            when splitK is exposed there.
         tuned_file: optional path to a tuned CSV to consult for kernel/splitK
             selection.  When None, uses the default
             ``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE``.  Useful

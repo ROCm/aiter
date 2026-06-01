@@ -158,13 +158,12 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_impl(torch::Tenso
         b_element_op,
         cde_element_op);
 
-    // Take ownership of the Y zero-state to keep this wrapper symmetric
-    // with the non-bpreshuffle wrapper, even though splitK is not yet
-    // exposed by callers of this entry point (KBatch is effectively 1
-    // today, so the Y.zero_() branch is dead).  Once splitK gets plumbed
-    // through this path, flip `KBatch` to come from the caller and the
-    // gate will activate; the CK invoker already skips its own memset
-    // thanks to skip_zero_init=true.
+    // Take ownership of the Y zero-state to keep this wrapper symmetric with
+    // the non-bpreshuffle wrapper.  This entry point does not expose splitK,
+    // so KBatch is fixed at 1 and the Y.zero_() branch below is inactive (it
+    // guards only the splitK atomic_add path).  skip_zero_init=true tells the
+    // CK invoker not to run its own memset; sourcing KBatch from the caller
+    // would activate the gate if splitK is plumbed through this path.
     const int KBatch         = 1;
     argument.skip_zero_init  = true;
     if(KBatch > 1 && !y_is_zeroed)

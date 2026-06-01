@@ -174,7 +174,8 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
     // ourselves via Y.zero_() (only when needed).  This mirrors the cktile
     // path and lets producer kernels fuse the zero-init.  Using Y.zero_()
     // (rather than memset) handles padded leading-dimension strides
-    // correctly (e.g. vLLM's _maybe_pad_fp8_weight).
+    // correctly (e.g. an output view whose row stride exceeds its column
+    // count).
     argument.skip_zero_init = true;
     if(KBatch > 1 && !y_is_zeroed)
     {

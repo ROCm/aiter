@@ -266,7 +266,7 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
     pid_n = tl.program_id(1)
     # SplitK fused-zero-init prologue: flatten the 2D launch grid into a 1D
     # program id so the prologue stripes the buffer uniformly across all
-    # active programs. Dead-coded when HAS_ZERO_INIT=False.
+    # active programs. Compile-time disabled (constexpr) when HAS_ZERO_INIT=False.
     if HAS_ZERO_INIT:
         n_progs_m = tl.num_programs(0)
         n_progs_n = tl.num_programs(1)

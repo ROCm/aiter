@@ -288,7 +288,7 @@ def fused_rms_fp8_group_quant(
     # ``gemm_out_zero_init`` buffer, the kernel pre-zeros it as a grid-strided
     # prologue so the downstream SplitK blockscale GEMM can run with
     # ``y_is_zeroed=True``; otherwise we pass a dummy 1-element int32 tensor
-    # and the constexpr-gated prologue is dead-coded away.
+    # and the constexpr-gated prologue is compiled out.
     if gemm_out_zero_init is not None:
         assert gemm_out_zero_init.is_contiguous(), (
             "fused_rms_fp8_group_quant: gemm_out_zero_init must be contiguous"

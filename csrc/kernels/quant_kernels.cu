@@ -716,9 +716,9 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
     // Optional fused zero-init of a downstream SplitK GEMM output buffer.
-    // Only the per-group (per_1x128) path supports this fusion today; for
-    // other paths the kernel zero-init is a no-op pointer and any caller
-    // that requested it must fall back to an explicit Y.zero_() upstream.
+    // Only the per-group (per_1x128) path supports this fusion; on other
+    // paths the kernel zero-init pointer stays null and a caller that
+    // requested it must fall back to an explicit Y.zero_() upstream.
     void* gemm_out_zero_init_ptr   = nullptr;
     int64_t gemm_out_zero_init_n_u4 = 0;
     if(gemm_out_zero_init.has_value())

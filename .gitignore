@@ -84,7 +84,3 @@ scripts/results/*.csv
 # vim swaps
 *.swo
 *.swp
-
-# zero-init splitK demo results (timestamped run dirs only; keep README)
-op_tests/zero_init_demo_results/[0-9]*/
-op_tests/zero_init_demo_results/trace_*/

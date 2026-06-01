@@ -224,8 +224,8 @@ def _fused_rms_fp8_group_quant_kernel(
     ZERO_INIT_BLOCK: tl.constexpr,
 ):
     m_pid = tl.program_id(0)
-    # SplitK fused-zero-init prologue: dead-coded when HAS_ZERO_INIT=False
-    # so the non-fused path pays no runtime overhead.
+    # SplitK fused-zero-init prologue: compile-time disabled (constexpr) when
+    # HAS_ZERO_INIT=False, so the non-fused path pays no runtime overhead.
     if HAS_ZERO_INIT:
         _zero_init_prologue(
             gemm_out_zero_init_ptr,
@@ -857,7 +857,7 @@ def _fused_rms_gated_fp8_group_quant_kernel(
     HAS_ZERO_INIT: tl.constexpr,
     ZERO_INIT_BLOCK: tl.constexpr,
 ):
-    # SplitK fused-zero-init prologue: dead-coded when HAS_ZERO_INIT=False.
+    # SplitK fused-zero-init prologue: compile-time disabled (constexpr) when HAS_ZERO_INIT=False.
     if HAS_ZERO_INIT:
         _zero_init_prologue(
             gemm_out_zero_init_ptr,
