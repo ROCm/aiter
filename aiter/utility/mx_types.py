@@ -120,8 +120,11 @@ def __getattr__(name):
     factory, int_mirror = pair
     # Use the first known int value from the mirror class (not a hard-coded 0)
     # so this survives future enum reorderings where 0 may not be valid.
-    first_val = next(v for k, v in vars(int_mirror).items()
-                     if not k.startswith("_") and isinstance(v, int))
+    first_val = next(
+        v
+        for k, v in vars(int_mirror).items()
+        if not k.startswith("_") and isinstance(v, int)
+    )
     cls = type(factory(first_val))
     # Guard against C++/Python enum drift: every named member of the int
     # mirror must round-trip through ``int(cls.<NAME>)``.

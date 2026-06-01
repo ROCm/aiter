@@ -14,7 +14,6 @@ from ..jit.core import compile_ops
 from ..utility import dtypes, fp4_utils
 from ..utility.mx_types import (
     MX_DEFAULT_ROUND_MODE,
-    MxDtype,
     MxDtypeInt,
     MxScaleRoundMode,
     MxScaleRoundModeInt,
